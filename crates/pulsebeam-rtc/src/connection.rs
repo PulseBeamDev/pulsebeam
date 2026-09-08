@@ -41,6 +41,9 @@ impl Connection {
         entropy: ConnectionEntropy,
     ) -> Result<AcceptedConnection, AcceptError> {
         let config = config.validate()?;
+        if config.local_candidates.is_empty() {
+            return Err(AcceptError::InvalidConfiguration);
+        }
         let mut entropy = EntropyConsumer::new(entropy);
         let negotiated = negotiation::negotiate(&config, &offer, at, &mut entropy)?;
         let session = negotiated.session.clone();

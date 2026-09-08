@@ -13,8 +13,8 @@ use sha2::{Digest, Sha256};
 use str0m::sdp::{MediaAttribute, MediaType, Proto, Sdp, SessionAttribute, Setup};
 
 use crate::{
-    AcceptError, ConnectionConfig, ConnectionLimits, PacketFeedbackKind, SdpAnswer, SdpOffer,
-    SenderId, SenderInfo, SessionInfo, TimePoint, connection::EntropyConsumer,
+    AcceptError, ConnectionConfig, ConnectionLimits, LocalCandidate, PacketFeedbackKind, SdpAnswer,
+    SdpOffer, SenderId, SenderInfo, SessionInfo, TimePoint, connection::EntropyConsumer,
 };
 
 const MAX_SDP_BYTES: usize = 256 * 1024;
@@ -47,6 +47,7 @@ pub(crate) struct NegotiationResult {
 )]
 pub(crate) struct NegotiatedSessionFacts {
     local_ice: IceCredentials,
+    local_candidates: Box<[is::Candidate]>,
     remote_ice: IceCredentials,
     remote_candidates: Box<[String]>,
     local_fingerprint: Fingerprint,
@@ -76,12 +77,36 @@ enum DtlsRole {
     Passive,
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Direction {
     SendOnly,
     ReceiveOnly,
     Bidirectional,
     Inactive,
+}
+
+impl Direction {
+    const fn allows_send(self) -> bool {
+        matches!(self, Self::SendOnly | Self::Bidirectional)
+    }
+
+    const fn is_subset_of(self, other: Self) -> bool {
+        matches!(
+            (self, other),
+            (Self::Inactive, _)
+                | (Self::SendOnly, Self::SendOnly | Self::Bidirectional)
+                | (Self::ReceiveOnly, Self::ReceiveOnly | Self::Bidirectional)
+                | (Self::Bidirectional, Self::Bidirectional)
+        )
+    }
+}
+
+const fn inherited_extension_direction(media: Direction) -> Direction {
+    if matches!(media, Direction::Inactive) {
+        Direction::Bidirectional
+    } else {
+        media
+    }
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -106,6 +131,7 @@ struct HeaderExtensionFacts {
     id: u8,
     uri: String,
     direction: Direction,
+    attributes: Option<String>,
 }
 
 struct SsrcGroupFacts {
@@ -135,6 +161,7 @@ struct SectionBuild {
     facts: NegotiatedMediaSection,
     accepted_payloads: Vec<u8>,
     twcc: bool,
+    twcc_sendable: bool,
     rfc8888: bool,
 }
 
@@ -258,13 +285,26 @@ fn negotiate_inner(
     } else {
         &outbound
     };
-    let feedback = if checked.iter().all(|section| section.twcc) {
+    let feedback = if checked
+        .iter()
+        .all(|section| section.twcc && (outbound.is_empty() || section.twcc_sendable))
+    {
         PacketFeedbackKind::TransportWide
     } else if checked.iter().all(|section| section.rfc8888) {
         PacketFeedbackKind::Rfc8888
     } else {
         return Err(NegotiationError(AcceptError::MissingPacketFeedback));
     };
+    if feedback == PacketFeedbackKind::Rfc8888 {
+        for section in &mut builds {
+            section.facts.extensions = std::mem::take(&mut section.facts.extensions)
+                .into_vec()
+                .into_iter()
+                .filter(|extension| !TWCC_URIS.contains(&extension.uri.as_str()))
+                .collect::<Vec<_>>()
+                .into_boxed_slice();
+        }
+    }
 
     let (dtls_identity, local_fingerprint) = dtls_identity(entropy)?;
     let local_ice = IceCredentials {
@@ -272,6 +312,7 @@ fn negotiate_inner(
         password: token(&entropy.take::<24>(b"ice password")),
     };
     let protocol_randomness = entropy.take::<32>(b"protocol randomness");
+    let local_candidates = local_candidates(config)?;
     let remote_candidates = remote_candidates(offer.as_str())?;
 
     let mut senders = Vec::new();
@@ -326,6 +367,7 @@ fn negotiate_inner(
                 section,
                 &local_ice,
                 &local_fingerprint,
+                &local_candidates,
                 answer_setup,
                 index == 0,
                 feedback,
@@ -344,6 +386,7 @@ fn negotiate_inner(
         session,
         facts: NegotiatedSessionFacts {
             local_ice,
+            local_candidates: local_candidates.into_boxed_slice(),
             remote_ice,
             remote_candidates: remote_candidates.into_boxed_slice(),
             local_fingerprint,
@@ -545,7 +588,7 @@ fn parse_section(
     let extensions = if line.disabled || kind == SectionKind::Application {
         Vec::new()
     } else {
-        parse_extensions(raw, allow_mixed)?
+        parse_extensions(raw, allow_mixed, direction)?
     };
     if kind != SectionKind::Application
         && !line.disabled
@@ -556,6 +599,7 @@ fn parse_section(
         return Err(NegotiationError::conflict());
     }
     let rids = parse_rids(raw, kind)?;
+    validate_simulcast(raw, kind)?;
     let (ssrcs, groups) = parse_ssrcs(raw, kind)?;
     let sctp = parse_sctp(line, raw, kind, line.disabled)?;
     let accepted = accepted_payloads.iter().copied().collect::<HashSet<_>>();
@@ -575,6 +619,9 @@ fn parse_section(
         && extensions
             .iter()
             .any(|extension| TWCC_URIS.contains(&extension.uri.as_str()));
+    let twcc_sendable = extensions.iter().any(|extension| {
+        TWCC_URIS.contains(&extension.uri.as_str()) && extension.direction.allows_send()
+    });
     let rfc8888 = has_feedback("ccfb");
     Ok(SectionBuild {
         facts: NegotiatedMediaSection {
@@ -590,6 +637,7 @@ fn parse_section(
         },
         accepted_payloads,
         twcc,
+        twcc_sendable,
         rfc8888,
     })
 }
@@ -711,6 +759,7 @@ fn fmtp_parameter<'a>(
 fn parse_extensions(
     raw: &[String],
     allow_mixed: bool,
+    media_direction: Direction,
 ) -> Result<Vec<HeaderExtensionFacts>, NegotiationError> {
     let mut ids = HashSet::new();
     let mut uris = HashSet::new();
@@ -719,8 +768,12 @@ fn parse_extensions(
         if result.len() >= MAX_EXTENSIONS {
             return Err(NegotiationError::limit());
         }
-        let Some((id, uri)) = value.split_once(char::is_whitespace) else {
+        let Some((id, value)) = value.split_once(char::is_whitespace) else {
             return Err(NegotiationError::invalid());
+        };
+        let (uri, attributes) = match value.split_once(char::is_whitespace) {
+            Some((uri, attributes)) => (uri, Some(attributes.trim().to_owned())),
+            None => (value, None),
         };
         let mut parts = id.split('/');
         let id = parts
@@ -729,12 +782,16 @@ fn parse_extensions(
             .filter(|id| *id != 0 && (*id <= 14 || allow_mixed))
             .ok_or_else(NegotiationError::invalid)?;
         let direction = match parts.next() {
-            None | Some("sendrecv") => Direction::Bidirectional,
+            None => inherited_extension_direction(media_direction),
+            Some("sendrecv") => Direction::Bidirectional,
             Some("sendonly") => Direction::ReceiveOnly,
             Some("recvonly") => Direction::SendOnly,
             Some("inactive") => Direction::Inactive,
             Some(_) => return Err(NegotiationError::invalid()),
         };
+        if media_direction != Direction::Inactive && !direction.is_subset_of(media_direction) {
+            return Err(NegotiationError::invalid());
+        }
         if parts.next().is_some() || !ids.insert(id) || !uris.insert(uri) {
             return Err(NegotiationError::conflict());
         }
@@ -743,6 +800,7 @@ fn parse_extensions(
                 id,
                 uri: uri.to_owned(),
                 direction,
+                attributes,
             });
         }
     }
@@ -770,19 +828,46 @@ fn parse_rids(raw: &[String], kind: SectionKind) -> Result<Vec<String>, Negotiat
         if kind != SectionKind::Video || result.len() >= MAX_RIDS {
             return Err(NegotiationError::limit());
         }
-        let id = value.split_whitespace().next().unwrap_or_default();
+        let mut fields = value.split_whitespace();
+        let id = fields.next().unwrap_or_default();
+        let direction = fields.next().unwrap_or_default();
         if id.is_empty()
             || id.len() > MAX_RID_TOKEN_BYTES
             || !id
                 .bytes()
                 .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
             || !seen.insert(id)
+            || !matches!(direction, "send" | "recv")
         {
             return Err(NegotiationError::invalid());
         }
         result.push(id.to_owned());
     }
     Ok(result)
+}
+
+fn validate_simulcast(raw: &[String], kind: SectionKind) -> Result<(), NegotiationError> {
+    for value in raw
+        .iter()
+        .filter_map(|line| line.strip_prefix("a=simulcast:"))
+    {
+        if kind != SectionKind::Video {
+            return Err(NegotiationError::invalid());
+        }
+        let fields = value.split_whitespace().collect::<Vec<_>>();
+        if fields.is_empty()
+            || fields.len() % 2 != 0
+            || fields.chunks_exact(2).any(|pair| {
+                let [direction, alternatives] = pair else {
+                    return true;
+                };
+                !matches!(*direction, "send" | "recv") || alternatives.is_empty()
+            })
+        {
+            return Err(NegotiationError::invalid());
+        }
+    }
+    Ok(())
 }
 
 fn parse_ssrcs(
@@ -935,6 +1020,69 @@ fn validate_bundle_namespaces(sections: &[SectionBuild]) -> Result<(), Negotiati
     Ok(())
 }
 
+fn local_candidates(config: &ConnectionConfig) -> Result<Vec<is::Candidate>, NegotiationError> {
+    config
+        .local_candidates
+        .iter()
+        .map(|candidate| match candidate {
+            LocalCandidate::Udp(std::net::SocketAddr::V4(address))
+                if address.ip().is_link_local() =>
+            {
+                Ok(ipv4_link_local_candidate(
+                    std::net::SocketAddr::V4(*address),
+                    *address.ip(),
+                    false,
+                ))
+            }
+            LocalCandidate::Udp(address) => is::Candidate::builder().udp().host(*address).build(),
+            LocalCandidate::TcpPassive(std::net::SocketAddr::V4(address))
+                if address.ip().is_link_local() =>
+            {
+                Ok(ipv4_link_local_candidate(
+                    std::net::SocketAddr::V4(*address),
+                    *address.ip(),
+                    true,
+                ))
+            }
+            LocalCandidate::TcpPassive(address) => is::Candidate::builder()
+                .tcp()
+                .host(*address)
+                .tcptype(str0m::net::TcpType::Passive)
+                .build(),
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| NegotiationError(AcceptError::InvalidConfiguration))
+}
+
+fn ipv4_link_local_candidate(
+    address: std::net::SocketAddr,
+    ip: std::net::Ipv4Addr,
+    tcp: bool,
+) -> is::Candidate {
+    let (protocol, tcp_type, type_preference, transport) = if tcp {
+        (
+            str0m::net::Protocol::Tcp,
+            Some(str0m::net::TcpType::Passive),
+            90_u32,
+            "tcp",
+        )
+    } else {
+        (str0m::net::Protocol::Udp, None, 126_u32, "udp")
+    };
+    let priority = type_preference << 24 | 65_534 << 8 | 255;
+    is::Candidate::from_parts(
+        format!("pb-{transport}-{:08x}", u32::from(ip)),
+        1,
+        protocol,
+        priority,
+        address,
+        is::CandidateKind::Host,
+        None,
+        tcp_type,
+        None,
+    )
+}
+
 fn remote_candidates(offer: &str) -> Result<Vec<String>, NegotiationError> {
     let mut result = Vec::new();
     let mut seen = HashSet::new();
@@ -1011,6 +1159,7 @@ fn format_answer_section(
     section: &SectionBuild,
     ice: &IceCredentials,
     fingerprint: &Fingerprint,
+    local_candidates: &[is::Candidate],
     setup: Setup,
     bundle_tag: bool,
     feedback: PacketFeedbackKind,
@@ -1097,6 +1246,15 @@ fn format_answer_section(
         if keep {
             let copied = if line == "a=rtcp-mux-only" {
                 "a=rtcp-mux".to_owned()
+            } else if line.starts_with("a=extmap:") {
+                let uri = line.split_whitespace().nth(1).unwrap_or_default();
+                section
+                    .facts
+                    .extensions
+                    .iter()
+                    .find(|extension| extension.uri == uri)
+                    .map(|extension| format_extension(extension, section.facts.direction))
+                    .unwrap_or_else(|| line.clone())
             } else if line.starts_with("a=rid:") || line.starts_with("a=simulcast:") {
                 invert_direction(line)
             } else {
@@ -1126,15 +1284,73 @@ fn format_answer_section(
         Direction::Inactive => "a=inactive\r\n",
     });
     if bundle_tag {
+        for candidate in local_candidates {
+            output.push_str("a=");
+            output.push_str(&candidate.to_sdp_string());
+            output.push_str("\r\n");
+        }
         output.push_str("a=end-of-candidates\r\n");
     }
     output
 }
 
 fn invert_direction(line: &str) -> String {
-    line.replacen(" send", " __direction", 1)
-        .replacen(" recv", " send", 1)
-        .replacen(" __direction", " recv", 1)
+    if let Some(value) = line.strip_prefix("a=rid:") {
+        let mut fields = value.split_whitespace();
+        let id = fields.next().unwrap_or_default();
+        let direction = invert_direction_token(fields.next().unwrap_or_default());
+        let restrictions = fields.collect::<Vec<_>>().join(" ");
+        return if restrictions.is_empty() {
+            format!("a=rid:{id} {direction}")
+        } else {
+            format!("a=rid:{id} {direction} {restrictions}")
+        };
+    }
+    let value = line.strip_prefix("a=simulcast:").unwrap_or_default();
+    let fields = value.split_whitespace().collect::<Vec<_>>();
+    let mut output = String::from("a=simulcast:");
+    for (index, pair) in fields.chunks_exact(2).enumerate() {
+        let [direction, alternatives] = pair else {
+            continue;
+        };
+        if index != 0 {
+            output.push(' ');
+        }
+        output.push_str(invert_direction_token(direction));
+        output.push(' ');
+        output.push_str(alternatives);
+    }
+    output
+}
+
+fn invert_direction_token(direction: &str) -> &str {
+    match direction {
+        "send" => "recv",
+        "recv" => "send",
+        _ => direction,
+    }
+}
+
+fn format_extension(extension: &HeaderExtensionFacts, media_direction: Direction) -> String {
+    let direction = if extension.direction == inherited_extension_direction(media_direction) {
+        ""
+    } else {
+        match extension.direction {
+            Direction::SendOnly => "/sendonly",
+            Direction::ReceiveOnly => "/recvonly",
+            Direction::Bidirectional => "/sendrecv",
+            Direction::Inactive => "/inactive",
+        }
+    };
+    let attributes = extension
+        .attributes
+        .as_deref()
+        .map(|value| format!(" {value}"))
+        .unwrap_or_default();
+    format!(
+        "a=extmap:{}{} {}{}",
+        extension.id, direction, extension.uri, attributes
+    )
 }
 
 fn format_answer(mids: &[String], sections: &[String], allow_mixed: bool) -> String {
@@ -1155,12 +1371,22 @@ fn format_answer(mids: &[String], sections: &[String], allow_mixed: bool) -> Str
 mod tests {
     use super::*;
     use crate::{Connection, ConnectionEntropy, GlobalMediaTime};
-    use std::time::Instant;
+    use std::{net::SocketAddr, time::Instant};
 
     fn at() -> TimePoint {
         TimePoint {
             monotonic: Instant::now(),
             global: GlobalMediaTime::from_micros(7),
+        }
+    }
+
+    fn config() -> ConnectionConfig {
+        ConnectionConfig {
+            local_candidates: vec![LocalCandidate::Udp(SocketAddr::from((
+                [192, 0, 2, 1],
+                5000,
+            )))],
+            ..ConnectionConfig::default()
         }
     }
     fn fixture(name: &str) -> SdpOffer {
@@ -1175,7 +1401,7 @@ mod tests {
     fn representative_browser_offers_are_accepted() {
         for name in ["chrome", "firefox"] {
             let result = Connection::accept(
-                ConnectionConfig::default(),
+                config(),
                 fixture(name),
                 at(),
                 ConnectionEntropy::new([7; 32]),
@@ -1194,9 +1420,365 @@ mod tests {
     }
 
     #[test]
+    fn acceptance_requires_candidates_before_offer_parsing() {
+        assert_eq!(
+            Connection::accept(
+                ConnectionConfig::default(),
+                SdpOffer::new("not an SDP offer"),
+                at(),
+                ConnectionEntropy::new([7; 32]),
+            )
+            .err(),
+            Some(AcceptError::InvalidConfiguration)
+        );
+    }
+
+    #[test]
+    fn local_candidates_are_converted_once_retained_and_advertised_in_order() {
+        let configured = vec![
+            LocalCandidate::Udp(SocketAddr::from(([192, 0, 2, 10], 5000))),
+            LocalCandidate::TcpPassive(SocketAddr::from((
+                "2001:db8::10".parse::<std::net::Ipv6Addr>().unwrap(),
+                5001,
+            ))),
+            LocalCandidate::Udp(SocketAddr::from((
+                "2001:db8::11".parse::<std::net::Ipv6Addr>().unwrap(),
+                5002,
+            ))),
+            LocalCandidate::TcpPassive(SocketAddr::from(([169, 254, 1, 1], 5003))),
+        ];
+        let mixed_config = ConnectionConfig {
+            local_candidates: configured.clone(),
+            ..ConnectionConfig::default()
+        };
+        let mut entropy = EntropyConsumer::new(ConnectionEntropy::new([8; 32]));
+        let result =
+            negotiate_inner(&mixed_config, &fixture("firefox"), at(), &mut entropy).unwrap();
+        assert_eq!(result.facts.local_candidates.len(), configured.len());
+
+        let advertised = result
+            .answer
+            .as_str()
+            .lines()
+            .filter_map(|line| line.strip_prefix("a=candidate:"))
+            .map(|line| format!("candidate:{line}"))
+            .collect::<Vec<_>>();
+        let retained = result
+            .facts
+            .local_candidates
+            .iter()
+            .map(is::Candidate::to_sdp_string)
+            .collect::<Vec<_>>();
+        assert_eq!(advertised, retained);
+        let (before_end, after_end) = result
+            .answer
+            .as_str()
+            .split_once("a=end-of-candidates")
+            .unwrap();
+        assert!(before_end.contains("a=candidate:"));
+        assert!(!after_end.contains("a=candidate:"));
+
+        for (candidate, configured) in result
+            .facts
+            .local_candidates
+            .iter()
+            .zip(configured.iter().copied())
+        {
+            assert_eq!(candidate.kind(), is::CandidateKind::Host);
+            assert_eq!(
+                candidate.to_sdp_string().split_whitespace().nth(1),
+                Some("1")
+            );
+            assert_eq!(candidate.addr(), configured.address());
+            match configured {
+                LocalCandidate::Udp(_) => {
+                    assert_eq!(candidate.proto(), str0m::net::Protocol::Udp);
+                    assert_eq!(candidate.tcptype(), None);
+                }
+                LocalCandidate::TcpPassive(_) => {
+                    assert_eq!(candidate.proto(), str0m::net::Protocol::Tcp);
+                    assert_eq!(candidate.tcptype(), Some(str0m::net::TcpType::Passive));
+                }
+            }
+        }
+        let ufrag = format!("a=ice-ufrag:{}", result.facts.local_ice.ufrag);
+        let password = format!("a=ice-pwd:{}", result.facts.local_ice.password);
+        assert_eq!(result.answer.as_str().matches(ufrag.as_str()).count(), 3);
+        assert_eq!(result.answer.as_str().matches(password.as_str()).count(), 3);
+
+        let tcp_only = ConnectionConfig {
+            local_candidates: vec![configured[1]],
+            ..ConnectionConfig::default()
+        };
+        let accepted = Connection::accept(
+            tcp_only,
+            fixture("chrome"),
+            at(),
+            ConnectionEntropy::new([8; 32]),
+        )
+        .unwrap();
+        assert!(accepted.answer.as_str().contains(" tcptype passive"));
+
+        let sixteen = ConnectionConfig {
+            local_candidates: (0..16)
+                .map(|offset| {
+                    LocalCandidate::Udp(SocketAddr::from(([192, 0, 2, 20], 6000 + offset)))
+                })
+                .collect(),
+            ..ConnectionConfig::default()
+        };
+        let accepted = Connection::accept(
+            sixteen,
+            fixture("firefox"),
+            at(),
+            ConnectionEntropy::new([8; 32]),
+        )
+        .unwrap();
+        assert_eq!(
+            accepted
+                .answer
+                .as_str()
+                .lines()
+                .filter(|line| line.starts_with("a=candidate:"))
+                .count(),
+            16
+        );
+
+        let relay_offer = SdpOffer::new(fixture("chrome").as_str().replace(
+            "a=candidate:1 1 UDP 2130706431 192.0.2.1 50000 typ host",
+            "a=candidate:2 1 udp 16777215 203.0.113.10 3478 typ relay raddr 192.0.2.1 rport 50000",
+        ));
+        let mut entropy = EntropyConsumer::new(ConnectionEntropy::new([8; 32]));
+        let result = negotiate_inner(&config(), &relay_offer, at(), &mut entropy).unwrap();
+        assert!(
+            result.facts.remote_candidates[0]
+                .split_whitespace()
+                .any(|field| field == "relay")
+        );
+    }
+
+    #[test]
+    fn extension_directions_control_twcc_and_answer_serialization() {
+        let mut entropy = EntropyConsumer::new(ConnectionEntropy::new([9; 32]));
+        let inherited =
+            negotiate_inner(&config(), &fixture("firefox"), at(), &mut entropy).unwrap();
+        assert!(
+            inherited.facts.media[0]
+                .extensions
+                .iter()
+                .all(|extension| extension.direction == Direction::ReceiveOnly)
+        );
+        assert!(
+            inherited.facts.media[1]
+                .extensions
+                .iter()
+                .all(|extension| extension.direction == Direction::SendOnly)
+        );
+
+        let base = fixture("firefox").as_str().replace(
+            "a=recvonly\na=rtcp-mux\na=rtpmap:120",
+            "a=sendrecv\na=rtcp-mux\na=rtpmap:120",
+        );
+        let direction_base = base
+            .replace(
+                "a=rtcp-fb:109 transport-cc",
+                "a=rtcp-fb:109 transport-cc\na=rtcp-fb:109 ccfb",
+            )
+            .replace(
+                "a=rtcp-fb:120 transport-cc",
+                "a=rtcp-fb:120 transport-cc\na=rtcp-fb:120 ccfb",
+            );
+        for (offered, answered, expected) in [
+            ("", "", Direction::Bidirectional),
+            ("/sendrecv", "", Direction::Bidirectional),
+            ("/sendonly", "/recvonly", Direction::ReceiveOnly),
+            ("/recvonly", "/sendonly", Direction::SendOnly),
+            ("/inactive", "/inactive", Direction::Inactive),
+        ] {
+            let offer = SdpOffer::new(direction_base.replace(
+                "a=extmap:5 http://www.webrtc.org/experiments/rtp-hdrext/video-dependency-descriptor",
+                &format!("a=extmap:5{offered} http://www.webrtc.org/experiments/rtp-hdrext/video-dependency-descriptor"),
+            ));
+            let mut entropy = EntropyConsumer::new(ConnectionEntropy::new([9; 32]));
+            let result = negotiate_inner(&config(), &offer, at(), &mut entropy).unwrap();
+            let extension = result.facts.media[1]
+                .extensions
+                .iter()
+                .find(|extension| {
+                    extension.uri
+                        == "http://www.webrtc.org/experiments/rtp-hdrext/video-dependency-descriptor"
+                })
+                .unwrap();
+            assert_eq!(extension.direction, expected);
+            assert!(
+                result.answer.as_str().contains(&format!(
+                    "a=extmap:5{answered} http://www.webrtc.org/experiments/rtp-hdrext/video-dependency-descriptor"
+                )),
+                "offered {offered}, answered {answered}: {}",
+                result.answer.as_str()
+            );
+        }
+
+        for direction in ["sendonly", "inactive"] {
+            let without_fallback = SdpOffer::new(base.replace(
+                "a=extmap:3 http://www.webrtc.org/experiments/rtp-hdrext/transport-wide-cc-01",
+                &format!("a=extmap:3/{direction} http://www.webrtc.org/experiments/rtp-hdrext/transport-wide-cc-01"),
+            ));
+            assert_eq!(
+                Connection::accept(
+                    config(),
+                    without_fallback,
+                    at(),
+                    ConnectionEntropy::new([10; 32])
+                )
+                .err(),
+                Some(AcceptError::MissingPacketFeedback)
+            );
+
+            let with_fallback = SdpOffer::new(
+                base.replace(
+                    "a=rtcp-fb:109 transport-cc",
+                    "a=rtcp-fb:109 transport-cc\na=rtcp-fb:109 ccfb",
+                )
+                .replace(
+                    "a=rtcp-fb:120 transport-cc",
+                    "a=rtcp-fb:120 transport-cc\na=rtcp-fb:120 ccfb",
+                )
+                .replace(
+                    "a=extmap:3 http://www.webrtc.org/experiments/rtp-hdrext/transport-wide-cc-01",
+                    &format!("a=extmap:3/{direction} http://www.webrtc.org/experiments/rtp-hdrext/transport-wide-cc-01"),
+                ),
+            );
+            let accepted = Connection::accept(
+                config(),
+                with_fallback,
+                at(),
+                ConnectionEntropy::new([10; 32]),
+            )
+            .unwrap();
+            assert_eq!(accepted.session.feedback, Some(PacketFeedbackKind::Rfc8888));
+        }
+
+        let incompatible = SdpOffer::new(fixture("firefox").as_str().replace(
+            "a=extmap:3 http://www.webrtc.org/experiments/rtp-hdrext/transport-wide-cc-01",
+            "a=extmap:3/sendonly http://www.webrtc.org/experiments/rtp-hdrext/transport-wide-cc-01",
+        ));
+        assert_eq!(
+            Connection::accept(
+                config(),
+                incompatible,
+                at(),
+                ConnectionEntropy::new([10; 32])
+            )
+            .err(),
+            Some(AcceptError::InvalidOffer)
+        );
+
+        let one_ineligible = SdpOffer::new(
+            base.replace("a=sendonly\na=rtcp-mux", "a=recvonly\na=rtcp-mux")
+                .replace(
+                    "a=rtcp-fb:109 transport-cc",
+                    "a=rtcp-fb:109 transport-cc\na=rtcp-fb:109 ccfb",
+                )
+                .replace(
+                    "a=rtcp-fb:120 transport-cc",
+                    "a=rtcp-fb:120 transport-cc\na=rtcp-fb:120 ccfb",
+                )
+                .replacen(
+                    "a=extmap:2 http://www.webrtc.org/experiments/rtp-hdrext/abs-capture-time",
+                    "a=extmap:2 http://www.webrtc.org/experiments/rtp-hdrext/abs-capture-time\na=extmap:3/inactive http://www.webrtc.org/experiments/rtp-hdrext/transport-wide-cc-01",
+                    1,
+                ),
+        );
+        let accepted = Connection::accept(
+            config(),
+            one_ineligible,
+            at(),
+            ConnectionEntropy::new([10; 32]),
+        )
+        .unwrap();
+        assert_eq!(accepted.session.feedback, Some(PacketFeedbackKind::Rfc8888));
+
+        let no_active_rtp = SdpOffer::new(
+            fixture("chrome")
+                .as_str()
+                .replace("a=sendonly", "a=inactive"),
+        );
+        assert_eq!(
+            Connection::accept(
+                config(),
+                no_active_rtp,
+                at(),
+                ConnectionEntropy::new([10; 32])
+            )
+            .err(),
+            Some(AcceptError::MissingPacketFeedback)
+        );
+
+        let inactive_inheritance = SdpOffer::new(fixture("firefox").as_str().replacen(
+            "a=sendonly",
+            "a=inactive",
+            1,
+        ));
+        let mut entropy = EntropyConsumer::new(ConnectionEntropy::new([10; 32]));
+        let result = negotiate_inner(&config(), &inactive_inheritance, at(), &mut entropy).unwrap();
+        assert_eq!(
+            result.facts.media[0].extensions[0].direction,
+            Direction::Bidirectional
+        );
+    }
+
+    #[test]
+    fn rid_and_every_simulcast_direction_group_are_inverted_by_syntax() {
+        let chrome = Connection::accept(
+            config(),
+            fixture("chrome"),
+            at(),
+            ConnectionEntropy::new([11; 32]),
+        )
+        .unwrap();
+        assert!(chrome.answer.as_str().contains("a=rid:q recv"));
+        assert!(chrome.answer.as_str().contains("a=simulcast:recv q;h;f"));
+
+        let firefox = fixture("firefox");
+        let two_directions = SdpOffer::new(
+            firefox
+                .as_str()
+                .replace("a=rid:low recv", "a=rid:sender_recv recv max-width=1280")
+                .replace("a=rid:high recv", "a=rid:receiver_send send max-width=640")
+                .replace(
+                    "a=simulcast:recv low;high",
+                    "a=simulcast:recv sender_recv;~receiver_send send ~receiver_send,sender_recv",
+                ),
+        );
+        let accepted = Connection::accept(
+            config(),
+            two_directions,
+            at(),
+            ConnectionEntropy::new([12; 32]),
+        )
+        .unwrap();
+        assert!(
+            accepted
+                .answer
+                .as_str()
+                .contains("a=rid:sender_recv send max-width=1280")
+        );
+        assert!(
+            accepted
+                .answer
+                .as_str()
+                .contains("a=rid:receiver_send recv max-width=640")
+        );
+        assert!(accepted.answer.as_str().contains(
+            "a=simulcast:send sender_recv;~receiver_send recv ~receiver_send,sender_recv"
+        ));
+    }
+
+    #[test]
     fn deterministic_entropy_produces_deterministic_secret_safe_answers() {
         let first_result = Connection::accept(
-            ConnectionConfig::default(),
+            config(),
             fixture("chrome"),
             at(),
             ConnectionEntropy::new([11; 32]),
@@ -1206,7 +1788,7 @@ mod tests {
             Err(error) => panic!("first acceptance failed: {error}"),
         };
         let second_result = Connection::accept(
-            ConnectionConfig::default(),
+            config(),
             fixture("chrome"),
             at(),
             ConnectionEntropy::new([11; 32]),
@@ -1216,7 +1798,7 @@ mod tests {
             Err(error) => panic!("second acceptance failed: {error}"),
         };
         let different_result = Connection::accept(
-            ConnectionConfig::default(),
+            config(),
             fixture("chrome"),
             at(),
             ConnectionEntropy::new([12; 32]),
@@ -1238,12 +1820,7 @@ mod tests {
             "a=rtcp-fb:120 transport-cc",
             "a=rtcp-fb:120 transport-cc\r\na=rtcp-fb:120 ccfb",
         ));
-        let both_result = Connection::accept(
-            ConnectionConfig::default(),
-            both,
-            at(),
-            ConnectionEntropy::new([1; 32]),
-        );
+        let both_result = Connection::accept(config(), both, at(), ConnectionEntropy::new([1; 32]));
         let accepted = match both_result {
             Ok(accepted) => accepted,
             Err(error) => panic!("both modes failed: {error}"),
@@ -1257,12 +1834,7 @@ mod tests {
                 .as_str()
                 .replace("a=rtcp-fb:120 transport-cc", "a=rtcp-fb:120 ccfb"),
         );
-        let rfc_result = Connection::accept(
-            ConnectionConfig::default(),
-            rfc,
-            at(),
-            ConnectionEntropy::new([2; 32]),
-        );
+        let rfc_result = Connection::accept(config(), rfc, at(), ConnectionEntropy::new([2; 32]));
         let accepted = match rfc_result {
             Ok(accepted) => accepted,
             Err(error) => panic!("RFC 8888 failed: {error}"),
@@ -1281,23 +1853,12 @@ mod tests {
                 .replace("a=rtcp-fb:102 transport-cc", ""),
         );
         assert_eq!(
-            Connection::accept(
-                ConnectionConfig::default(),
-                no_feedback,
-                at(),
-                ConnectionEntropy::new([3; 32])
-            )
-            .err(),
+            Connection::accept(config(), no_feedback, at(), ConnectionEntropy::new([3; 32])).err(),
             Some(AcceptError::MissingPacketFeedback)
         );
         let no_bundle = SdpOffer::new(source.as_str().replace("a=group:BUNDLE 0 1 2", ""));
         assert!(matches!(
-            Connection::accept(
-                ConnectionConfig::default(),
-                no_bundle,
-                at(),
-                ConnectionEntropy::new([3; 32])
-            ),
+            Connection::accept(config(), no_bundle, at(), ConnectionEntropy::new([3; 32])),
             Err(AcceptError::InvalidOffer)
         ));
         let remote_lite = SdpOffer::new(
@@ -1306,12 +1867,7 @@ mod tests {
                 .replace("a=setup:actpass", "a=setup:actpass\r\na=ice-lite"),
         );
         assert!(matches!(
-            Connection::accept(
-                ConnectionConfig::default(),
-                remote_lite,
-                at(),
-                ConnectionEntropy::new([3; 32])
-            ),
+            Connection::accept(config(), remote_lite, at(), ConnectionEntropy::new([3; 32])),
             Err(AcceptError::UnsupportedSessionProfile)
         ));
     }
@@ -1320,12 +1876,7 @@ mod tests {
     fn input_bounds_are_enforced() {
         let oversized = SdpOffer::new("x".repeat(MAX_SDP_BYTES + 1));
         assert!(matches!(
-            Connection::accept(
-                ConnectionConfig::default(),
-                oversized,
-                at(),
-                ConnectionEntropy::new([0; 32])
-            ),
+            Connection::accept(config(), oversized, at(), ConnectionEntropy::new([0; 32])),
             Err(AcceptError::SessionLimitExceeded)
         ));
     }
@@ -1335,13 +1886,7 @@ mod tests {
         let source = fixture("chrome");
         let no_mux = SdpOffer::new(source.as_str().replacen("a=rtcp-mux", "", 1));
         assert_eq!(
-            Connection::accept(
-                ConnectionConfig::default(),
-                no_mux,
-                at(),
-                ConnectionEntropy::new([4; 32])
-            )
-            .err(),
+            Connection::accept(config(), no_mux, at(), ConnectionEntropy::new([4; 32])).err(),
             Some(AcceptError::InvalidOffer)
         );
         let no_fingerprint = SdpOffer::new(
@@ -1351,7 +1896,7 @@ mod tests {
         );
         assert_eq!(
             Connection::accept(
-                ConnectionConfig::default(),
+                config(),
                 no_fingerprint,
                 at(),
                 ConnectionEntropy::new([4; 32])
@@ -1363,7 +1908,7 @@ mod tests {
 
     #[test]
     fn immutable_facts_retain_sctp_and_selected_limits() {
-        let config = ConnectionConfig::default();
+        let config = config();
         let mut entropy = EntropyConsumer::new(ConnectionEntropy::new([5; 32]));
         let result = match negotiate_inner(&config, &fixture("firefox"), at(), &mut entropy) {
             Ok(result) => result,
