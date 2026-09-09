@@ -1,0 +1,1 @@
+(async () => { globalThis.__pulsebeamUnhandledRejections = []; addEventListener("unhandledrejection", (event) => globalThis.__pulsebeamUnhandledRejections.push(String(event.reason))); globalThis.pulsebeam = await import("/dist/index.js"); return null; })()

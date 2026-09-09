@@ -17,7 +17,8 @@
     "build:web": "just --justfile ../pulsebeam-agent-web/Justfile build",
     "build": "pnpm run build:web && tsc -p tsconfig.json",
     "check": "pnpm run build:web && tsc -p tsconfig.json --noEmit && tsc -p tsconfig.contracts.json",
-    "test": "pnpm run test:consumer && node --test tests/contracts/public-react-contract.test.js",
+    "test": "pnpm run test:consumer",
+    "build:browser": "pnpm run build && node tests/browser/build.mjs",
     "test:consumer": "rm -rf ../pulsebeam-agent-web/dist && pnpm run build && pnpm --dir tests/consumer install --offline --frozen-lockfile && pnpm --dir tests/consumer run check"
   },
   "dependencies": {
@@ -28,9 +29,9 @@
   },
   "devDependencies": {
     "@types/react": "^18.3.24",
-    "@types/react-test-renderer": "^18.3.1",
     "react": "^18.3.1",
-    "react-test-renderer": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "esbuild": "^0.25.0",
     "typescript": "~5.9.3"
   }
 }

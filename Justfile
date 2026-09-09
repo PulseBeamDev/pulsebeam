@@ -34,6 +34,12 @@ test:
     just --justfile agents/pulsebeam-agent-web/Justfile test
     just --justfile agents/react/Justfile test
 
+# Build browser fixtures in package ownership order, then run every Rust-owned
+# BiDi contract serially. This intentionally fails when Chrome is unavailable.
+browser: prepare
+    just --justfile agents/react/Justfile browser-fixture
+    just --justfile agents/pulsebeam-agent-web/Justfile browser
+
 # Build the static Meet export.
 meet-build:
     just prepare

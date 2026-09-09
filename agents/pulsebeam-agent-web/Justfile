@@ -31,10 +31,12 @@ check:
     cargo check -p pulsebeam-agent-web --target wasm32-unknown-unknown
     PNPM_HOME=/tmp/pulsebeam-pnpm-home PNPM_STORE_DIR=/tmp/pulsebeam-pnpm-store XDG_CACHE_HOME=/tmp/pulsebeam-pnpm-cache XDG_CONFIG_HOME=/tmp/pulsebeam-pnpm-config pnpm run check
 
-# Run browser-runtime unit and deterministic host-boundary tests.
+# Run deterministic host-boundary tests. Browser contracts are opt-in.
 test: build uniffi-browser-build
     cargo test -p pulsebeam-agent-web
-    cargo test -p pulsebeam-agent-web --features browser-tests --test browser
+
+browser: build uniffi-browser-build
+    cargo test -p pulsebeam-agent-web --features browser-tests --test browser -- --test-threads=1
 
 # Serve the generated package and local example.
 serve:

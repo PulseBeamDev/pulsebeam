@@ -14,9 +14,13 @@ prepare:
 check:
     PNPM_HOME=/tmp/pulsebeam-pnpm-home PNPM_STORE_DIR=/tmp/pulsebeam-pnpm-store XDG_CACHE_HOME=/tmp/pulsebeam-pnpm-cache XDG_CONFIG_HOME=/tmp/pulsebeam-pnpm-config pnpm run check
 
-# Run the React runtime contract tests.
+# Run React compile and package-resolution checks only.
 test:
     PNPM_HOME=/tmp/pulsebeam-pnpm-home PNPM_STORE_DIR=/tmp/pulsebeam-pnpm-store XDG_CACHE_HOME=/tmp/pulsebeam-pnpm-cache XDG_CONFIG_HOME=/tmp/pulsebeam-pnpm-config pnpm run test
+
+# Build the standalone, Rust-driven browser fixture.
+browser-fixture: prepare
+    PNPM_HOME=/tmp/pulsebeam-pnpm-home PNPM_STORE_DIR=/tmp/pulsebeam-pnpm-store XDG_CACHE_HOME=/tmp/pulsebeam-pnpm-cache XDG_CONFIG_HOME=/tmp/pulsebeam-pnpm-config pnpm run build:browser
 
 # Build a React-only consumer after preparing the local runtime and its assets.
 consumer:
