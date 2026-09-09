@@ -1,6 +1,67 @@
+#![allow(
+    dead_code,
+    reason = "typed RTCP views are retained for the bounded Plan 07 feedback handoff"
+)]
+
 use crate::packet::{PacketError, RtcpCompound, RtcpPacket};
 
-pub use crate::packet::{RtcpCompound as Compound, RtcpPacket as Packet};
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum Fact {
+    SenderReport {
+        ssrc: u32,
+        ntp_seconds: u32,
+        ntp_fraction: u32,
+        rtp_timestamp: u32,
+    },
+    Cname {
+        ssrc: u32,
+        cname: Box<str>,
+    },
+    Bye {
+        ssrc: u32,
+    },
+    Feedback,
+}
+
+pub(crate) fn facts(bytes: &[u8]) -> Result<Vec<Fact>, PacketError> {
+    let mut facts = Vec::new();
+    for packet in RtcpCompound::parse(bytes)? {
+        let packet = packet?;
+        typed(packet)?;
+        if let Some(report) = packet.sender_report()? {
+            facts.push(Fact::SenderReport {
+                ssrc: report.sender_ssrc(),
+                ntp_seconds: report.ntp_seconds(),
+                ntp_fraction: report.ntp_fraction(),
+                rtp_timestamp: report.rtp_timestamp(),
+            });
+        }
+        if let Some(sdes) = packet.sdes()? {
+            for chunk in sdes.chunks() {
+                for item in chunk.items() {
+                    if item.kind() == 1 {
+                        let cname = std::str::from_utf8(item.value())
+                            .ok()
+                            .filter(|value| !value.is_empty())
+                            .map(Box::<str>::from)
+                            .ok_or(PacketError::InvalidValue)?;
+                        facts.push(Fact::Cname {
+                            ssrc: chunk.ssrc(),
+                            cname,
+                        });
+                    }
+                }
+            }
+        }
+        if let Some(bye) = packet.bye()? {
+            facts.extend(bye.ssrcs().map(|ssrc| Fact::Bye { ssrc }));
+        }
+        if matches!(packet.packet_type(), 205 | 206) {
+            facts.push(Fact::Feedback);
+        }
+    }
+    Ok(facts)
+}
 
 const REPORT_BLOCK_BYTES: usize = 24;
 

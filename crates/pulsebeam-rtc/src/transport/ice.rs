@@ -164,4 +164,13 @@ impl IceLayer {
             .iter()
             .any(|candidate| candidate.addr() == address && candidate.proto() == proto)
     }
+
+    pub(crate) fn smoothed_rtt(&self) -> Option<std::time::Duration> {
+        let total = self.agent.nominated_pair_total_rtt()?;
+        let responses = self.agent.nominated_pair_responses_received()?;
+        u32::try_from(responses)
+            .ok()
+            .filter(|responses| *responses != 0)
+            .and_then(|responses| total.checked_div(responses))
+    }
 }

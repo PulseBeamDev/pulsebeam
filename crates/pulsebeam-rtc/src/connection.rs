@@ -204,7 +204,11 @@ impl Connection {
                 self._subsystems.ingress.poll_event().map(Output::Event)
             }
             TransportEvent::Rtcp { arrival, bytes } => {
-                self._subsystems.ingress.retain_rtcp(arrival, bytes);
+                self._subsystems.ingress.accept_rtcp(
+                    arrival,
+                    bytes,
+                    self._subsystems.transport.smoothed_rtt(),
+                );
                 None
             }
             TransportEvent::Data(bytes) => {

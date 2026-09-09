@@ -10,7 +10,7 @@ mod srtp;
 use std::collections::VecDeque;
 use std::fmt;
 use std::net::SocketAddr;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use is::{Candidate, IceConnectionState, IceCreds};
 use str0m::crypto::Fingerprint;
@@ -405,6 +405,10 @@ impl Transport {
 
     pub(crate) fn poll_event(&mut self) -> Option<TransportEvent> {
         self.events.pop_front()
+    }
+
+    pub(crate) fn smoothed_rtt(&self) -> Option<Duration> {
+        self.ice.smoothed_rtt()
     }
 
     #[cfg(test)]

@@ -170,6 +170,9 @@ pub enum DataChannelEvent {
 #[non_exhaustive]
 pub enum ConnectionWarning {
     ClockRegression,
+    MediaClockSynchronized,
+    MediaClockStale,
+    MediaClockDiscontinuous,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]

@@ -14,18 +14,23 @@ use std::{collections::VecDeque, ops::Range, sync::Arc};
 use bytes::Bytes;
 
 use crate::{
-    EncodingId, EncodingInfo, Event, GlobalMediaTime, MediaKind, MediaPacket, TimePoint,
-    negotiation::IngressMediaFacts, packet::RtpPacket,
+    ConnectionWarning, EncodingId, EncodingInfo, EncodingRetireReason, Event, MediaKind,
+    MediaPacket, TimePoint,
+    clock::{ClockMapper, ClockWarning, ntp_micros},
+    negotiation::IngressMediaFacts,
+    packet::RtpPacket,
+    rtcp::{self, Fact},
 };
 
 const MAX_RECORDS: usize = 256;
-const REORDER_WINDOW: i64 = 2_048;
 
 pub(crate) struct IngressOwner {
     media: Box<[MediaFacts]>,
     encodings: Vec<Encoding>,
     events: VecDeque<Event>,
     rtcp: VecDeque<TimedRecord>,
+    cname_by_ssrc: Vec<(u32, Box<str>)>,
+    groups: Vec<(Box<str>, i128)>,
     max_unsignaled: usize,
     max_bytes: usize,
     queued_media_bytes: usize,
@@ -54,15 +59,8 @@ struct Encoding {
     ssrc: Option<u32>,
     rid: Option<Box<str>>,
     unsignaled: bool,
-    mapper: ProvisionalMapper,
-}
-
-struct ProvisionalMapper {
-    first_global: GlobalMediaTime,
-    first_timestamp: u32,
-    frontier_sequence: i64,
-    frontier_timestamp: i64,
-    clock_rate: u32,
+    retired: bool,
+    mapper: ClockMapper,
 }
 
 impl IngressOwner {
@@ -87,6 +85,8 @@ impl IngressOwner {
             encodings: Vec::new(),
             events: VecDeque::new(),
             rtcp: VecDeque::new(),
+            cname_by_ssrc: Vec::new(),
+            groups: Vec::new(),
             max_unsignaled: usize::from(max_unsignaled),
             max_bytes,
             queued_media_bytes: 0,
@@ -148,7 +148,8 @@ impl IngressOwner {
                     ssrc: Some(packet.ssrc()),
                     rid: rid.map(Box::<str>::from),
                     unsignaled,
-                    mapper: ProvisionalMapper::new(
+                    retired: false,
+                    mapper: ClockMapper::new(
                         arrival.global,
                         packet.sequence(),
                         packet.timestamp(),
@@ -166,7 +167,7 @@ impl IngressOwner {
                 index
             }
         };
-        let (encoding, global_media_at) = {
+        let (encoding, global_media_at, warning) = {
             let encoding = &mut self.encodings[encoding];
             if encoding.ssrc.is_none() {
                 encoding.ssrc = Some(packet.ssrc());
@@ -174,23 +175,46 @@ impl IngressOwner {
             if encoding.rid.is_none() {
                 encoding.rid = rid.map(Box::<str>::from);
             }
-            let Some(global_media_at) = encoding.mapper.map(packet.sequence(), packet.timestamp())
+            if encoding.retired {
+                self.drop();
+                return;
+            }
+            let Some((global_media_at, warning)) =
+                encoding
+                    .mapper
+                    .map(packet.sequence(), packet.timestamp(), arrival.monotonic)
             else {
                 self.drop();
                 return;
             };
-            (encoding.id, global_media_at)
+            (encoding.id, global_media_at, warning)
         };
+        if let Some(warning) = warning {
+            self.push_clock_warning(warning);
+        }
         let extensions = self.extensions_for(media, &packet);
         let packet = MediaPacket::new(Bytes::from(bytes), global_media_at, extensions);
         self.queued_media_bytes = self.queued_media_bytes.saturating_add(packet.bytes().len());
         self.events.push_back(Event::Media { encoding, packet });
     }
 
-    pub(crate) fn retain_rtcp(&mut self, arrival: TimePoint, bytes: Vec<u8>) {
+    pub(crate) fn accept_rtcp(
+        &mut self,
+        arrival: TimePoint,
+        bytes: Vec<u8>,
+        smoothed_rtt: Option<std::time::Duration>,
+    ) {
         if self.rtcp.len() >= MAX_RECORDS
             || bytes.len() > self.max_bytes.saturating_sub(self.queued_rtcp_bytes)
         {
+            self.drop();
+            return;
+        }
+        let Ok(facts) = rtcp::facts(&bytes) else {
+            self.drop();
+            return;
+        };
+        if facts.len() > MAX_RECORDS.saturating_sub(self.events.len()) {
             self.drop();
             return;
         }
@@ -199,6 +223,9 @@ impl IngressOwner {
             _arrival: arrival,
             _bytes: bytes,
         });
+        for fact in facts {
+            self.apply_rtcp_fact(arrival, smoothed_rtt, fact);
+        }
     }
 
     pub(crate) fn poll_event(&mut self) -> Option<Event> {
@@ -271,6 +298,108 @@ impl IngressOwner {
     fn drop(&mut self) {
         self.dropped = self.dropped.saturating_add(1);
     }
+
+    fn apply_rtcp_fact(
+        &mut self,
+        arrival: TimePoint,
+        smoothed_rtt: Option<std::time::Duration>,
+        fact: Fact,
+    ) {
+        match fact {
+            Fact::Cname { ssrc, cname } => {
+                if let Some((_, known)) = self
+                    .cname_by_ssrc
+                    .iter_mut()
+                    .find(|(known, _)| *known == ssrc)
+                {
+                    *known = cname;
+                } else if self.cname_by_ssrc.len() < MAX_RECORDS {
+                    self.cname_by_ssrc.push((ssrc, cname));
+                }
+            }
+            Fact::Bye { ssrc } => {
+                if let Some(encoding) = self
+                    .encodings
+                    .iter_mut()
+                    .find(|encoding| encoding.ssrc == Some(ssrc))
+                    && !encoding.retired
+                {
+                    encoding.retired = true;
+                    self.events.push_back(Event::EncodingRetired {
+                        encoding: encoding.id,
+                        reason: EncodingRetireReason::RemoteBye,
+                    });
+                }
+            }
+            Fact::SenderReport {
+                ssrc,
+                ntp_seconds,
+                ntp_fraction,
+                rtp_timestamp,
+            } => {
+                let Some(ntp) = ntp_micros(ntp_seconds, ntp_fraction) else {
+                    self.drop();
+                    return;
+                };
+                let Some(index) = self
+                    .encodings
+                    .iter()
+                    .position(|encoding| encoding.ssrc == Some(ssrc) && !encoding.retired)
+                else {
+                    return;
+                };
+                let cname = self
+                    .cname_by_ssrc
+                    .iter()
+                    .find(|(known, _)| *known == ssrc)
+                    .map(|(_, cname)| cname.clone());
+                let relation = self.encodings[index].mapper.relation_at(rtp_timestamp, ntp);
+                let group_offset = cname
+                    .as_ref()
+                    .and_then(|cname| {
+                        self.groups
+                            .iter()
+                            .find(|(known, _)| known == cname)
+                            .map(|(_, offset)| *offset)
+                    })
+                    .or(relation);
+                let Some(group_offset) = group_offset else {
+                    return;
+                };
+                if let Some(cname) = cname
+                    && !self.groups.iter().any(|(known, _)| known == &cname)
+                    && self.groups.len() < MAX_RECORDS
+                {
+                    self.groups.push((cname, group_offset));
+                }
+                if let Some(warning) = self.encodings[index].mapper.observe_sender_report(
+                    rtp_timestamp,
+                    ntp,
+                    arrival.monotonic,
+                    smoothed_rtt,
+                    group_offset,
+                ) {
+                    self.push_clock_warning(warning);
+                }
+            }
+            Fact::Feedback => {}
+        }
+    }
+
+    fn push_clock_warning(&mut self, warning: ClockWarning) {
+        let warning = match warning {
+            ClockWarning::Synchronized => ConnectionWarning::MediaClockSynchronized,
+            ClockWarning::Stale => ConnectionWarning::MediaClockStale,
+            ClockWarning::Discontinuous => ConnectionWarning::MediaClockDiscontinuous,
+        };
+        if !self
+            .events
+            .iter()
+            .any(|event| matches!(event, Event::Warning(known) if *known == warning))
+        {
+            self.events.push_back(Event::Warning(warning));
+        }
+    }
 }
 
 fn extension_value<'a>(
@@ -292,53 +421,12 @@ fn extension_value<'a>(
         .filter(|value| !value.is_empty())
 }
 
-impl ProvisionalMapper {
-    fn new(first_global: GlobalMediaTime, sequence: u16, timestamp: u32, clock_rate: u32) -> Self {
-        Self {
-            first_global,
-            first_timestamp: timestamp,
-            frontier_sequence: i64::from(sequence),
-            frontier_timestamp: 0,
-            clock_rate,
-        }
-    }
-
-    fn map(&mut self, sequence: u16, timestamp: u32) -> Option<GlobalMediaTime> {
-        let sequence = self.frontier_sequence
-            + i64::from(i16::from_be_bytes(
-                sequence
-                    .wrapping_sub(self.frontier_sequence as u16)
-                    .to_be_bytes(),
-            ));
-        if sequence < self.frontier_sequence - REORDER_WINDOW {
-            return None;
-        }
-        let timestamp = self.frontier_timestamp
-            + i64::from(i32::from_be_bytes(
-                timestamp
-                    .wrapping_sub(self.wrapped_frontier_timestamp())
-                    .to_be_bytes(),
-            ));
-        if sequence > self.frontier_sequence {
-            self.frontier_sequence = sequence;
-            self.frontier_timestamp = timestamp;
-        }
-        let delta = i128::from(timestamp) * 1_000_000 / i128::from(self.clock_rate);
-        let mapped = i128::from(self.first_global.as_micros()) + delta;
-        u64::try_from(mapped).ok().map(GlobalMediaTime::from_micros)
-    }
-
-    fn wrapped_frontier_timestamp(&self) -> u32 {
-        self.first_timestamp
-            .wrapping_add(self.frontier_timestamp as u32)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::time::Instant;
 
     use super::*;
+    use crate::GlobalMediaTime;
 
     fn owner() -> IngressOwner {
         IngressOwner::new(
@@ -402,16 +490,21 @@ mod tests {
 
     #[test]
     fn old_reordered_packets_map_earlier_without_moving_the_frontier() {
-        let mut mapper =
-            ProvisionalMapper::new(GlobalMediaTime::from_micros(1_000), 10, 90_000, 90_000);
+        let mut mapper = ClockMapper::new(GlobalMediaTime::from_micros(1_000), 10, 90_000, 90_000);
         assert_eq!(
-            mapper.map(11, 180_000),
+            mapper
+                .map(11, 180_000, Instant::now())
+                .map(|(time, _)| time),
             Some(GlobalMediaTime::from_micros(1_001_000))
         );
         assert_eq!(
-            mapper.map(10, 90_000),
+            mapper.map(10, 90_000, Instant::now()).map(|(time, _)| time),
             Some(GlobalMediaTime::from_micros(1_000))
         );
-        assert!(mapper.map(10_u16.wrapping_sub(2_049), 0).is_none());
+        assert!(
+            mapper
+                .map(10_u16.wrapping_sub(2_049), 0, Instant::now())
+                .is_none()
+        );
     }
 }
