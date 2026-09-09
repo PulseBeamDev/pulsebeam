@@ -4,10 +4,11 @@
   "version": "0.1.1",
   "scripts": {
     "dev": "next dev",
-    "build": "just --justfile ../../agents/react/Justfile build && next build",
+    "build": "just --justfile ../../agents/react/Justfile build && next build && pnpm run artifact",
     "start": "serve out",
     "check": "pnpm run boundary && tsc --noEmit && eslint",
-    "boundary": "node scripts/check-boundary.mjs"
+    "boundary": "node scripts/check-boundary.mjs",
+    "artifact": "node scripts/check-artifact.mjs"
   },
   "dependencies": {
     "@pulsebeam/react": "link:../../agents/react",

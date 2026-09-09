@@ -24,8 +24,15 @@ export function useTopics() {
   };
   useEffect(() => {
     const unsubscribe = subscribeEvents((event) => {
-      if (event.type === "topic-send-dropped" || event.type === "topic-channel-failed") {
-        setError(event.type === "topic-send-dropped" ? `Unable to send ${event.topic}: ${event.reason}` : event.message);
+      if (event.type === "topic-send-dropped") {
+        const index = pending.current.findIndex((item) => item.topic === event.topic);
+        if (index >= 0) pending.current.splice(index, 1);
+        setError(`Unable to send ${event.topic}: ${event.reason}`);
+        return;
+      }
+      if (event.type === "topic-channel-failed") {
+        if (event.direction === "publish") pending.current = pending.current.filter((item) => item.topic !== event.topic);
+        setError(event.message);
         return;
       }
       if (event.type === "topic-send-admitted") {

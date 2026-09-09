@@ -33,11 +33,11 @@ export interface VideoSelection {
 }
 
 /** Keep slots stable for retained publications while choosing deterministic new ones. */
-export function allocateVideo(publicationIds: readonly string[], pinned: string | null, previous: readonly VideoSelection[], heights: Readonly<Record<string, number>>): VideoSelection[] {
+export function allocateVideo(publicationIds: readonly string[], pinned: string | null, previous: readonly VideoSelection[], heights: Readonly<Record<string, number>>, spotlightHeight: number): VideoSelection[] {
   const eligible = [...new Set(publicationIds)].sort();
   const spotlight = pinned && eligible.includes(pinned) ? pinned : eligible[0] ?? null;
   const ranked = eligible
-    .map((id) => ({ id, priority: id === spotlight ? 200 : 10, height: quantizeHeight(Math.max(id === spotlight ? 360 : 90, heights[id] ?? 0)) }))
+    .map((id) => ({ id, priority: id === spotlight ? 200 : 10, height: quantizeHeight(Math.max(id === spotlight ? 360 : 90, id === spotlight ? spotlightHeight : heights[id] ?? 0)) }))
     .sort((a, b) => b.priority - a.priority || b.height - a.height || a.id.localeCompare(b.id))
     .slice(0, 7);
   const retained = new Map(previous.filter((entry) => ranked.some((candidate) => candidate.id === entry.id)).map((entry) => [entry.id, entry.slot]));

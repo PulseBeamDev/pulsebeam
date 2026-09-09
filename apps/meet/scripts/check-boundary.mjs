@@ -21,3 +21,6 @@ const pulsebeam = Object.keys(manifest.dependencies).filter((name) => name.start
 if (pulsebeam.length !== 1 || pulsebeam[0] !== "@pulsebeam/react") {
   throw new Error("Meet must directly depend only on @pulsebeam/react");
 }
+if (/^  (?:'@playwright\/test'|playwright(?:-core)?)@\d/m.test(readFileSync("pnpm-lock.yaml", "utf8"))) {
+  throw new Error("Meet lockfile must not resolve Playwright");
+}
