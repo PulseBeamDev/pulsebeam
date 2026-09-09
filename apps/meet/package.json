@@ -2,6 +2,7 @@
   "name": "pulsebeam-meet",
   "private": true,
   "version": "0.1.1",
+  "license": "Apache-2.0",
   "scripts": {
     "dev": "next dev",
     "build": "next build && pnpm run artifact",

@@ -6,7 +6,7 @@ edition.workspace = true
 documentation.workspace = true
 homepage.workspace = true
 repository.workspace = true
-license.workspace = true
+license = "Apache-2.0"
 
 [lib]
 crate-type = ["cdylib", "rlib", "staticlib"]

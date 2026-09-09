@@ -3,7 +3,7 @@ name = "pulsebeam-agent-web"
 version = "0.1.0"
 edition = "2024"
 description = "Browser host runtime for the PulseBeam SANS-I/O agent"
-license.workspace = true
+license = "Apache-2.0"
 repository.workspace = true
 
 [features]
