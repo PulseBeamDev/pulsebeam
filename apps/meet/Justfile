@@ -1,0 +1,16 @@
+set shell := ["bash", "-euc"]
+
+dev:
+    pnpm run dev
+
+build:
+    pnpm run build
+
+check:
+    pnpm run check
+
+test:
+    pnpm run test
+
+test-browser:
+    pnpm run test-browser

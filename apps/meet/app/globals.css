@@ -1,0 +1,225 @@
+@import "tailwindcss";
+
+@custom-variant dark (&:is(.dark *));
+
+:root {
+  --background: oklch(1 0 0);
+  --foreground: oklch(0.13 0.02 265);
+  --card: oklch(1 0 0);
+  --card-foreground: oklch(0.13 0.02 265);
+  --primary: oklch(0.45 0.24 275);
+  --primary-foreground: oklch(0.98 0 0);
+  --secondary: oklch(0.96 0.01 265);
+  --secondary-foreground: oklch(0.21 0.02 265);
+  --muted: oklch(0.96 0.01 265);
+  --muted-foreground: oklch(0.50 0.02 265);
+  --destructive: oklch(0.58 0.22 27);
+  --border: oklch(0.92 0.01 265);
+  --input: oklch(0.92 0.01 265);
+  --ring: oklch(0.45 0.24 275);
+}
+
+.dark {
+  --background: oklch(0.12 0.02 265);
+  --foreground: oklch(0.98 0 0);
+  --card: oklch(0.15 0.02 265);
+  --card-foreground: oklch(0.98 0 0);
+  --primary: oklch(0.55 0.22 275);
+  --primary-foreground: oklch(0.98 0 0);
+  --secondary: oklch(0.20 0.02 265);
+  --secondary-foreground: oklch(0.98 0 0);
+  --muted: oklch(0.20 0.02 265);
+  --muted-foreground: oklch(0.65 0.02 265);
+  --destructive: oklch(0.60 0.20 27);
+  --border: oklch(0.25 0.02 265);
+  --input: oklch(0.25 0.02 265);
+  --ring: oklch(0.55 0.22 275);
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-destructive: var(--destructive);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --font-sans: "Manrope", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", monospace;
+}
+
+* {
+  border-color: var(--border);
+  outline-color: color-mix(in oklab, var(--ring) 50%, transparent);
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  margin: 0;
+  overscroll-behavior: none;
+}
+
+button,
+[role="button"],
+input,
+select {
+  touch-action: manipulation;
+}
+
+select,
+select option,
+select optgroup {
+  color: var(--foreground);
+  background-color: var(--background);
+}
+
+.mirror {
+  transform: scaleX(-1);
+}
+
+/* Portrait/mobile: prioritize vertical room for the spotlight and use a
+   swipeable filmstrip beneath it. */
+.meet-room-main {
+  flex-direction: column;
+  gap: 0.75rem;
+  padding: 0.5rem;
+}
+
+.meet-room-header {
+  min-height: 3.5rem;
+  flex-wrap: wrap;
+  padding: 0.5rem;
+}
+
+.meet-room-name {
+  max-width: 7rem;
+}
+
+.meet-room-actions {
+  width: 100%;
+  justify-content: space-between;
+}
+
+.meet-latency-label,
+.meet-reconnect {
+  display: none;
+}
+
+.meet-spotlight-frame {
+  height: 100%;
+}
+
+.meet-spotlight {
+  gap: 0;
+  padding-block: 0;
+}
+
+.meet-participants {
+  height: 7rem;
+  gap: 0.5rem;
+}
+
+.meet-participant-scroll {
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+
+.meet-participant-list,
+.meet-participant-tile {
+  height: 100%;
+}
+
+/* Wide layout: header, stage, and participant rail switch together so an
+   intermediate viewport can never combine mobile and desktop structures. */
+@media (min-width: 768px) {
+  .meet-room-header {
+    height: 3.5rem;
+    min-height: 3.5rem;
+    flex-wrap: nowrap;
+    padding: 0 1rem;
+  }
+
+  .meet-room-name {
+    max-width: none;
+  }
+
+  .meet-connection-status {
+    display: flex;
+  }
+
+  .meet-room-actions {
+    width: auto;
+    flex-shrink: 0;
+    justify-content: flex-end;
+  }
+
+  .meet-latency-label {
+    display: inline;
+  }
+
+  .meet-reconnect {
+    display: inline-flex;
+  }
+
+  .meet-room-main {
+    flex-direction: row;
+    gap: 1rem;
+    padding: 1rem;
+  }
+
+  .meet-spotlight {
+    flex: 3 1 0%;
+  }
+
+  .meet-spotlight-frame {
+    height: 100%;
+  }
+
+  .meet-participants {
+    height: auto;
+    width: min(280px, 25vw);
+    gap: 0.75rem;
+  }
+
+  .meet-participant-scroll {
+    margin-right: -0.5rem;
+    overflow-x: hidden;
+    overflow-y: auto;
+    padding-right: 0.5rem;
+  }
+
+  .meet-participant-list {
+    height: auto;
+    flex-direction: column;
+  }
+
+  .meet-participant-tile {
+    width: 100%;
+    height: auto;
+  }
+}
+
+@keyframes floatUp {
+  0%   { opacity: 1; transform: translateY(0) scale(1); }
+  80%  { opacity: 0.8; transform: translateY(-120px) scale(1.2); }
+  100% { opacity: 0; transform: translateY(-160px) scale(0.9); }
+}
+
+@media (min-width: 640px) and (max-width: 767px) {
+  .meet-room-main {
+    padding: 0.75rem;
+  }
+
+  .meet-participants {
+    height: 9rem;
+  }
+}
+
