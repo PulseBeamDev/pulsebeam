@@ -1,20 +1,29 @@
-use std::{cell::Cell, marker::PhantomData};
+#![allow(
+    clippy::disallowed_types,
+    reason = "the public transmit contract requires immutable Bytes payloads"
+)]
 
+use std::{cell::Cell, collections::VecDeque, marker::PhantomData, time::Instant};
+
+use bytes::Bytes;
 use sha2::{Digest, Sha256};
 
 use crate::{
-    AcceptError, ConnectionConfig, ConnectionEntropy, NetworkInput, ReceiveError, SdpAnswer,
-    SdpOffer, SessionInfo, TimePoint,
+    AcceptError, CloseReason, ConnectionConfig, ConnectionEntropy, ConnectionWarning, Event,
+    NetworkInput, Output, ReceiveError, SdpAnswer, SdpOffer, SessionInfo, TimePoint, Transmit,
     negotiation::{self, NegotiatedSessionFacts},
     time::MonotonicObserver,
-    transport::Transport,
+    transport::{PreparedTransmit, Transport, TransportError, TransportEvent, TransportState},
 };
+
+const MAX_INGRESS_PACKETS: usize = 256;
 
 pub struct Connection {
     _config: ConnectionConfig,
     _session: NegotiatedSessionFacts,
     _time: MonotonicObserver,
     _subsystems: SubsystemSlots,
+    runtime: Runtime,
     _not_sync: PhantomData<Cell<()>>,
 }
 
@@ -24,7 +33,93 @@ pub struct Connection {
 )]
 struct SubsystemSlots {
     transport: Transport,
-    sctp: Option<()>,
+}
+
+trait RuntimeSubsystem: Send {
+    fn poll(&mut self, at: TimePoint) -> Option<Output>;
+
+    fn next_deadline(&self) -> Option<Instant>;
+}
+
+struct Runtime {
+    ingress: IngressQueues,
+    feedback: Option<Box<dyn RuntimeSubsystem>>,
+    controller: Option<Box<dyn RuntimeSubsystem>>,
+    scheduler: Option<Box<dyn RuntimeSubsystem>>,
+    sctp: Option<Box<dyn RuntimeSubsystem>>,
+    commit: CommitCoordinator,
+    closed: bool,
+}
+
+impl Runtime {
+    fn new() -> Self {
+        Self {
+            ingress: IngressQueues::default(),
+            feedback: None,
+            controller: None,
+            scheduler: None,
+            sctp: None,
+            commit: CommitCoordinator,
+            closed: false,
+        }
+    }
+
+    fn poll_subsystems(&mut self, at: TimePoint) -> Option<Output> {
+        [
+            &mut self.feedback,
+            &mut self.controller,
+            &mut self.scheduler,
+            &mut self.sctp,
+        ]
+        .into_iter()
+        .flatten()
+        .find_map(|subsystem| subsystem.poll(at))
+    }
+
+    fn next_deadline(&self) -> Option<Instant> {
+        [
+            &self.feedback,
+            &self.controller,
+            &self.scheduler,
+            &self.sctp,
+        ]
+        .into_iter()
+        .flatten()
+        .filter_map(|subsystem| subsystem.next_deadline())
+        .min()
+    }
+}
+
+#[derive(Default)]
+struct IngressQueues {
+    rtp: VecDeque<Vec<u8>>,
+    rtcp: VecDeque<Vec<u8>>,
+    data: VecDeque<Vec<u8>>,
+}
+
+impl IngressQueues {
+    fn push(queue: &mut VecDeque<Vec<u8>>, bytes: Vec<u8>) {
+        if queue.len() < MAX_INGRESS_PACKETS {
+            queue.push_back(bytes);
+        }
+    }
+}
+
+struct CommitCoordinator;
+
+impl CommitCoordinator {
+    fn commit_transport(&mut self, prepared: PreparedTransmit) -> Transmit {
+        let PreparedTransmit {
+            target,
+            bytes,
+            kind: _,
+            wire_len: _,
+        } = prepared;
+        Transmit {
+            target,
+            payload: Bytes::from(bytes),
+        }
+    }
 }
 
 pub struct AcceptedConnection {
@@ -34,15 +129,7 @@ pub struct AcceptedConnection {
 }
 
 impl Connection {
-    #[allow(
-        dead_code,
-        reason = "the public receive lifecycle is introduced after transport preparation"
-    )]
-    pub(crate) fn receive(
-        &mut self,
-        at: TimePoint,
-        input: NetworkInput,
-    ) -> Result<(), ReceiveError> {
+    pub fn receive(&mut self, at: TimePoint, input: NetworkInput) -> Result<(), ReceiveError> {
         let at = self._time.observe(at);
         self._subsystems
             .transport
@@ -52,6 +139,88 @@ impl Connection {
                 crate::transport::TransportError::QueueFull => ReceiveError::InputLimitExceeded,
                 _ => ReceiveError::InvalidNetworkEnvelope,
             })
+    }
+
+    pub fn poll(&mut self, at: TimePoint) -> Output {
+        let at = self._time.observe(at);
+
+        if self._time.take_warning() {
+            return Output::Event(Event::Warning(ConnectionWarning::ClockRegression));
+        }
+
+        if !self.runtime.closed
+            && self
+                ._subsystems
+                .transport
+                .next_deadline()
+                .is_some_and(|deadline| at.monotonic >= deadline)
+            && let Err(error) = self._subsystems.transport.handle_timeout(at.monotonic)
+            && !matches!(error, TransportError::NotDue)
+        {
+            self.runtime.closed = true;
+            return Output::Closed(close_reason(error));
+        }
+
+        if let Some(event) = self._subsystems.transport.poll_event()
+            && let Some(output) = self.handle_transport_event(event)
+        {
+            return output;
+        }
+
+        if !self.runtime.closed
+            && let Some(prepared) = self._subsystems.transport.poll_prepared()
+        {
+            return Output::Transmit(self.runtime.commit.commit_transport(prepared));
+        }
+
+        if !self.runtime.closed
+            && let Some(output) = self.runtime.poll_subsystems(at)
+        {
+            return output;
+        }
+
+        Output::Idle {
+            next_wakeup: (!self.runtime.closed)
+                .then(|| {
+                    [
+                        self._subsystems.transport.next_deadline(),
+                        self.runtime.next_deadline(),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .min()
+                })
+                .flatten(),
+        }
+    }
+
+    fn handle_transport_event(&mut self, event: TransportEvent) -> Option<Output> {
+        match event {
+            TransportEvent::StateChanged(TransportState::Connected) => {
+                Some(Output::Event(Event::Connected))
+            }
+            TransportEvent::StateChanged(TransportState::Failed) => {
+                self.runtime.closed = true;
+                Some(Output::Closed(CloseReason::TransportFailure))
+            }
+            TransportEvent::StateChanged(_) | TransportEvent::IceStateChanged(_) => None,
+            TransportEvent::Rtp { bytes, metadata: _ } => {
+                IngressQueues::push(&mut self.runtime.ingress.rtp, bytes);
+                None
+            }
+            TransportEvent::Rtcp(bytes) => {
+                IngressQueues::push(&mut self.runtime.ingress.rtcp, bytes);
+                None
+            }
+            TransportEvent::Data(bytes) => {
+                IngressQueues::push(&mut self.runtime.ingress.data, bytes);
+                None
+            }
+            TransportEvent::Closed => {
+                self.runtime.closed = true;
+                Some(Output::Closed(CloseReason::Graceful))
+            }
+        }
     }
     pub fn accept(
         config: ConnectionConfig,
@@ -72,10 +241,8 @@ impl Connection {
             _config: config,
             _session: negotiated.facts,
             _time: MonotonicObserver::starting_at(at),
-            _subsystems: SubsystemSlots {
-                transport,
-                sctp: None,
-            },
+            _subsystems: SubsystemSlots { transport },
+            runtime: Runtime::new(),
             _not_sync: PhantomData,
         };
         Ok(AcceptedConnection {
@@ -83,6 +250,13 @@ impl Connection {
             answer: negotiated.answer,
             session,
         })
+    }
+}
+
+fn close_reason(error: TransportError) -> CloseReason {
+    match error {
+        TransportError::Timeout => CloseReason::Timeout,
+        _ => CloseReason::TransportFailure,
     }
 }
 
