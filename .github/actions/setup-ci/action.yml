@@ -1,0 +1,43 @@
+name: Set up CI dependencies
+description: Install the common CI toolchain, with optional web build tooling.
+
+inputs:
+  web:
+    description: Install the Node.js and WebAssembly toolchain.
+    required: false
+    default: "false"
+
+runs:
+  using: composite
+  steps:
+    - name: Install system dependencies
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y protobuf-compiler clang nasm pkg-config
+
+    - name: Run sccache
+      uses: mozilla-actions/sccache-action@v0.0.11
+
+    - uses: taiki-e/install-action@v2
+      with:
+        tool: just
+
+    - if: inputs.web == 'true'
+      uses: actions/setup-node@v5
+      with:
+        node-version: 22
+
+    - if: inputs.web == 'true'
+      uses: pnpm/action-setup@v4
+      with:
+        version: 11
+
+    - if: inputs.web == 'true'
+      uses: jetli/wasm-pack-action@v0.4.0
+      with:
+        version: v0.13.1
+
+    - if: inputs.web == 'true'
+      shell: bash
+      run: rustup target add wasm32-unknown-unknown

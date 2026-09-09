@@ -22,32 +22,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler clang nasm pkg-config
-
-      - uses: actions/setup-node@v5
+      - uses: ./.github/actions/setup-ci
         with:
-          node-version: 22
-
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 10
-
-      - uses: jetli/wasm-pack-action@v0.4.0
-        with:
-          version: v0.13.1
-
-      - run: rustup target add wasm32-unknown-unknown
-
-      - name: Run sccache
-        uses: mozilla-actions/sccache-action@v0.0.11
-
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: just
+          web: "true"
 
       - run: rustup component add clippy rustfmt
 
@@ -59,36 +36,13 @@ jobs:
 
     steps:
       - uses: actions/checkout@v5
-
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler clang nasm pkg-config
-
-      - uses: actions/setup-node@v5
+      - uses: ./.github/actions/setup-ci
         with:
-          node-version: 22
-
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 10
-
-      - uses: jetli/wasm-pack-action@v0.4.0
-        with:
-          version: v0.13.1
-
-      - run: rustup target add wasm32-unknown-unknown
-
-      - name: Run sccache
-        uses: mozilla-actions/sccache-action@v0.0.11
+          web: "true"
 
       - uses: taiki-e/install-action@v2
         with:
           tool: nextest
-
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: just
 
       - name: Run tests
         run: just test
@@ -100,21 +54,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler clang nasm pkg-config
-
-      - name: Run sccache
-        uses: mozilla-actions/sccache-action@v0.0.11
+      - uses: ./.github/actions/setup-ci
 
       - name: Install nightly for eBPF build-std
         run: rustup toolchain install nightly --component rust-src --profile minimal
-
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: just
 
       - name: Build and attach eBPF program
         run: just ebpf
