@@ -1,4 +1,4 @@
-(async () => {
+globalThis.__pulsebeamPublic = (async () => {
   const exports = Object.keys(window.pulsebeam).sort();
   let endpointReads = 0;
   let roomReads = 0;

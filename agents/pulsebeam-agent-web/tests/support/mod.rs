@@ -99,6 +99,27 @@ impl Drop for StaticServer {
 }
 
 pub fn capabilities() -> TestResult<ChromeCapabilities> {
+    if let Some(binary) = env::var_os("PULSEBEAM_BROWSER_BINARY") {
+        if !Path::new(&binary).is_file() {
+            return Err(format!(
+                "PULSEBEAM_BROWSER_BINARY does not name a readable Chrome/Chromium executable: {}",
+                binary.to_string_lossy()
+            )
+            .into());
+        }
+    } else if !["google-chrome", "chromium", "chromium-browser"]
+        .iter()
+        .any(|name| {
+            Command::new(name)
+                .arg("--version")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok()
+        })
+    {
+        return Err("no compatible Chrome/Chromium was found; install one or set PULSEBEAM_BROWSER_BINARY=/path/to/chrome".into());
+    }
     let mut capabilities = DesiredCapabilities::chrome();
     capabilities.set_headless()?;
     capabilities.set_no_sandbox()?;
@@ -126,19 +147,46 @@ pub async fn evaluate_json<T: DeserializeOwned>(
     context: &BrowsingContextId,
     expression: &str,
 ) -> TestResult<T> {
-    let source = include_str!("evaluate.js").replace("__PULSEBEAM_EXPRESSION__", expression);
     let result = bidi
         .script()
-        .evaluate(context.clone(), source, true)
+        .evaluate(context.clone(), expression.to_owned(), true)
         .await?;
     let value = result
         .ok_value()
         .ok_or_else(|| format!("browser expression raised an exception: {result:?}"))?;
-    let json = value
-        .get("value")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| format!("browser expression did not return a JSON string: {value}"))?;
-    Ok(serde_json::from_str(json)?)
+    Ok(serde_json::from_value(remote_value(value))?)
+}
+
+fn remote_value(value: &serde_json::Value) -> serde_json::Value {
+    let Some(kind) = value.get("type").and_then(serde_json::Value::as_str) else {
+        return value.clone();
+    };
+    let inner = value.get("value").unwrap_or(&serde_json::Value::Null);
+    match kind {
+        "object" => inner.as_array().map_or_else(
+            || inner.clone(),
+            |entries| {
+                serde_json::Value::Object(
+                    entries
+                        .iter()
+                        .filter_map(|entry| {
+                            let pair = entry.as_array()?;
+                            Some((
+                                pair.first()?.as_str()?.to_owned(),
+                                remote_value(pair.get(1)?),
+                            ))
+                        })
+                        .collect(),
+                )
+            },
+        ),
+        "array" => inner.as_array().map_or_else(
+            || inner.clone(),
+            |items| serde_json::Value::Array(items.iter().map(remote_value).collect()),
+        ),
+        "null" | "undefined" => serde_json::Value::Null,
+        _ => inner.clone(),
+    }
 }
 async fn serve(
     mut stream: TcpStream,

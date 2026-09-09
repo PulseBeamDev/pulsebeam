@@ -7,7 +7,8 @@ use support::{DestinationServer, StaticServer, TestResult, capabilities, evaluat
 use thirtyfour::prelude::WebDriver;
 use thirtyfour::testing::run_browser_test;
 
-const PUBLIC: &str = include_str!("contracts/public-agent-contract.js");
+const PUBLIC: &str = include_str!("contracts/observe-public.js");
+const START_PUBLIC: &str = include_str!("contracts/start-public.js");
 const LIVE: &str = include_str!("contracts/live-agent-contract.js");
 const UNIFFI: &str = include_str!("contracts/uniffi-media-contract.js");
 const LOAD: &str = include_str!("contracts/load-web.js");
@@ -90,6 +91,7 @@ async fn web(server: &StaticServer, failure: bool) -> TestResult<()> {
             assert!(persisted);
             assert_eq!(rejections, 0);
         } else {
+            let _: () = evaluate_json(&bidi, &context, START_PUBLIC).await?;
             let result: Public = evaluate_json(&bidi, &context, PUBLIC).await?;
             assert_eq!(result.exports, ["createAgent"]);
             assert!(
