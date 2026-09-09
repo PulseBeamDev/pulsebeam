@@ -1,0 +1,71 @@
+name: Deploy Meet to GitHub Pages
+
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: meet-pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler clang nasm pkg-config
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install 1.92.0 --profile minimal --component rust-src
+          rustup default 1.92.0
+          rustup target add wasm32-unknown-unknown
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: jetli/wasm-pack-action@v0.4.0
+        with:
+          version: v0.13.1
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just
+
+      - name: Build Meet
+        env:
+          NEXT_PUBLIC_PULSEBEAM_API_URL: ${{ vars.PULSEBEAM_API_URL }}
+        run: just meet-build
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: apps/meet/out
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
