@@ -30,8 +30,10 @@ use web_sys::{
 use crate::engine::{
     ActorHandle, Host, PublicCommand, TopicCommand, Turn, TurnErrorSource, spawn_actor,
 };
+use crate::logger::{BrowserLogger, LogLevel};
 
 const SIGNALING_LABEL: &str = "v1/sys/signaling";
+const LOG_TARGET: &str = "pulsebeam_agent_web::browser";
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -41,6 +43,8 @@ struct RuntimeConfig {
     #[serde(default)]
     request_headers: BTreeMap<String, String>,
     topology: TopologyConfig,
+    #[serde(default)]
+    log_level: LogLevel,
 }
 
 #[derive(Deserialize)]
@@ -355,6 +359,7 @@ impl Host for BrowserHost {
 
 struct RuntimeInner {
     actor: RefCell<Option<ActorHandle>>,
+    logger: BrowserLogger,
     local_slots: BTreeMap<String, MediaKind>,
     local_operation_gates: BTreeMap<String, LocalOperationGate>,
     local_tracks: RefCell<BTreeMap<String, LocalTrackState>>,
@@ -405,7 +410,7 @@ pub struct BrowserRuntime {
 #[wasm_bindgen]
 impl BrowserRuntime {
     #[wasm_bindgen(constructor)]
-    pub fn new(config: JsValue) -> Result<BrowserRuntime, JsValue> {
+    pub fn new(config: JsValue, log_sink: Option<Function>) -> Result<BrowserRuntime, JsValue> {
         let config: RuntimeConfig = serde_wasm_bindgen::from_value(config)
             .map_err(|error| js_error(format!("invalid browser runtime config: {error}")))?;
         let request_headers = config
@@ -447,6 +452,7 @@ impl BrowserRuntime {
         };
         let inner = Rc::new(RuntimeInner {
             actor: RefCell::new(None),
+            logger: BrowserLogger::new(config.log_level, log_sink),
             local_slots,
             local_operation_gates,
             local_tracks: RefCell::new(BTreeMap::new()),
@@ -784,7 +790,7 @@ impl RuntimeInner {
             })
             .collect();
         for sender in senders {
-            apply_sender_state(&sender, state.as_ref()).await?;
+            apply_sender_state(&self.logger, &sender, state.as_ref()).await?;
         }
         Ok(())
     }
@@ -1295,11 +1301,14 @@ impl RuntimeInner {
                     .borrow_mut()
                     .insert(operation.get(), controller);
                 debug_assert!(previous.is_none(), "operation must own one fetch");
-                log::debug!(
-                    "starting browser HTTP request operation={} generation={:?} method={:?}",
-                    operation.get(),
-                    generation.map(Generation::get),
-                    request.method,
+                self.logger.debug(
+                    LOG_TARGET,
+                    format!(
+                        "starting browser HTTP request operation={} generation={:?} method={:?}",
+                        operation.get(),
+                        generation.map(Generation::get),
+                        request.method,
+                    ),
                 );
                 let weak = Rc::downgrade(self);
                 spawn_local(async move {
@@ -1431,7 +1440,7 @@ impl RuntimeInner {
     }
 
     fn report_error(&self, message: String) {
-        log::warn!("{message}");
+        self.logger.warn(LOG_TARGET, &message);
         *self.last_error.borrow_mut() = Some(message.clone());
         let listener = self.error_listener.borrow().clone();
         if let Some(listener) = listener {
@@ -1440,7 +1449,7 @@ impl RuntimeInner {
     }
 
     fn report_classified_error(&self, error: LocalOperationError) {
-        log::warn!("{}", error.message);
+        self.logger.warn(LOG_TARGET, &error.message);
         *self.last_error.borrow_mut() = Some(error.message.clone());
         let listener = self.error_listener.borrow().clone();
         if let Some(listener) = listener {
@@ -1470,7 +1479,8 @@ impl RuntimeInner {
         self.snapshot_listener.borrow_mut().take();
         self.event_listener.borrow_mut().take();
         self.error_listener.borrow_mut().take();
-        log::info!("browser agent runtime aborted");
+        self.logger
+            .info(LOG_TARGET, "browser agent runtime aborted");
     }
 }
 
@@ -1624,6 +1634,7 @@ fn validate_sender_config(kind: MediaKind, config: &SenderConfig) -> Result<(), 
 }
 
 async fn apply_sender_state(
+    logger: &BrowserLogger,
     sender: &RtcRtpSender,
     state: Option<&LocalTrackState>,
 ) -> Result<(), String> {
@@ -1647,7 +1658,10 @@ async fn apply_sender_state(
         .any(|encoding| encoding.scalability_mode.is_some())
         && let Err(error) = apply_sender_parameters(sender, state, true).await
     {
-        log::warn!("browser rejected sender scalability mode: {error}");
+        logger.warn(
+            LOG_TARGET,
+            &format!("browser rejected sender scalability mode: {error}"),
+        );
     }
     Ok(())
 }

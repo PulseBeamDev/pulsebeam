@@ -1,5 +1,7 @@
 globalThis.__pulsebeamPublic = (async () => {
   const exports = Object.keys(window.pulsebeam).sort();
+  const firstLogs = [];
+  const silentLogs = [];
   let endpointReads = 0;
   let roomReads = 0;
   const config = {
@@ -18,12 +20,27 @@ globalThis.__pulsebeamPublic = (async () => {
       remoteVideo: 1,
       remoteAudio: 1,
     },
+    logging: {
+      level: "debug",
+      sink: (level, target, message) =>
+        firstLogs.push({ level, target, message }),
+    },
   };
   const first = window.pulsebeam.createAgent(config);
   const second = window.pulsebeam.createAgent({
     endpoint: location.origin,
     roomId: "closed",
     topology: {},
+  });
+  const silent = window.pulsebeam.createAgent({
+    endpoint: location.origin,
+    roomId: "silent",
+    topology: {},
+    logging: {
+      level: "off",
+      sink: (level, target, message) =>
+        silentLogs.push({ level, target, message }),
+    },
   });
   const initial = first.getSnapshot();
   const initialStable = initial === first.getSnapshot();
@@ -106,6 +123,33 @@ globalThis.__pulsebeamPublic = (async () => {
     () => false,
     () => true,
   );
+  const silentValidationRejected = await silent
+    .setLocalMuted("missing", true)
+    .then(
+      () => false,
+      () => true,
+    );
+  silent.setState({
+    connected: false,
+    video: [
+      {
+        slot: 0,
+        trackId: "silent-duplicate-a",
+        height: 720,
+        minHeight: 180,
+        minFps: 15,
+        priority: 100,
+      },
+      {
+        slot: 0,
+        trackId: "silent-duplicate-b",
+        height: 720,
+        minHeight: 180,
+        minFps: 15,
+        priority: 100,
+      },
+    ],
+  });
   first.sendTopic("presence", "latest", new Uint8Array([1, 2, 3]));
   await new Promise((resolve) => setTimeout(resolve, 20));
   removeEvents();
@@ -118,6 +162,7 @@ globalThis.__pulsebeamPublic = (async () => {
   remove();
   remove();
   first.close();
+  silent.close();
   const closed = first.getSnapshot();
   first.close();
   first.setState({ connected: true });
@@ -140,6 +185,15 @@ globalThis.__pulsebeamPublic = (async () => {
     closeBeforeSettlement: second.getSnapshot().connection === "disconnected",
     localOperations: muted && unmuted,
     validationRejected,
+    scopedLogging:
+      silentValidationRejected &&
+      silentLogs.length === 0 &&
+      firstLogs.some(
+        (entry) =>
+          entry.level === "warn" &&
+          entry.target === "pulsebeam_agent_web::browser" &&
+          entry.message.startsWith("core rejected input:"),
+      ),
     serializationFailureNonterminal,
     failureEvent: events.some(
       (event) => event.type === "failure" && event.class === "validation",

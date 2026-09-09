@@ -79,6 +79,7 @@ export function Room({
         remoteVideo: 7,
         remoteAudio: 3,
       },
+      logging: { level: "debug" },
     });
     // eslint-disable-next-line react-hooks/set-state-in-effect -- an agent is effect-owned to prevent Strict Mode reuse after close.
     setAgent(fresh);

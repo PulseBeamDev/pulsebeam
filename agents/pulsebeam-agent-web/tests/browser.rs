@@ -18,7 +18,7 @@ const RUNTIME_LOCAL_OPERATIONS: &str =
     include_str!("contracts/runtime-local-operation-contract.js");
 const REACT: &str = include_str!("../../react/tests/browser/observe.js");
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Public {
     exports: Vec<String>,
@@ -31,6 +31,7 @@ struct Public {
     close_before_settlement: bool,
     local_operations: bool,
     validation_rejected: bool,
+    scoped_logging: bool,
     serialization_failure_nonterminal: bool,
     failure_event: bool,
     core_validation_event: bool,
@@ -114,12 +115,14 @@ async fn web(server: &StaticServer, failure: bool) -> TestResult<()> {
                     && result.close_before_settlement
                     && result.local_operations
                     && result.validation_rejected
+                    && result.scoped_logging
                     && result.serialization_failure_nonterminal
                     && result.failure_event
                     && result.core_validation_event
                     && result.caller_owns_track
                     && result.no_removed_listener_calls
-                    && result.post_close
+                    && result.post_close,
+                "public contract result: {result:?}",
             );
             assert_eq!(result.initial, "disconnected");
             assert_eq!(result.closed, "disconnected");

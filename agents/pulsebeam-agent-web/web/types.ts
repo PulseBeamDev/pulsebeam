@@ -1,5 +1,18 @@
 export type MediaKind = "audio" | "video";
 export type TopicMode = "latest" | "ordered";
+export type LogLevel = "off" | "error" | "warn" | "info" | "debug" | "trace";
+export type AgentLogSink = (
+  level: Exclude<LogLevel, "off">,
+  target: string,
+  message: string,
+) => void;
+
+export interface AgentLogging {
+  /** Maximum verbosity emitted by this Agent. Defaults to `warn`. */
+  readonly level?: LogLevel;
+  /** Receives this Agent's logs instead of the browser console. */
+  readonly sink?: AgentLogSink;
+}
 
 export interface MediaTopology {
   readonly localVideo?: readonly string[];
@@ -14,6 +27,7 @@ export interface AgentConfig {
   readonly roomId: string;
   readonly requestHeaders?: Readonly<Record<string, string>>;
   readonly topology: MediaTopology;
+  readonly logging?: AgentLogging;
 }
 
 export interface PublicationIntent {

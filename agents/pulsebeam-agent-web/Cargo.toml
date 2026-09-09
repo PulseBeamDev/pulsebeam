@@ -18,7 +18,6 @@ agent_core = { package = "pulsebeam-agent-core", version = "0.1.0", path = "../p
 futures-channel = "0.3.33"
 js-sys = "0.3.104"
 spin = "0.10.0"
-log = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde-wasm-bindgen = "0.6"
 thiserror.workspace = true

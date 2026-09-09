@@ -7,6 +7,7 @@ import {
   type AgentConfig,
   type AgentEvent,
   type AgentFailure,
+  type AgentLogSink,
   type AgentState,
   type UseAgentResult,
   type RemoteTrack,
@@ -17,6 +18,9 @@ import type { ReactElement, ReactNode } from "react";
 
 declare const children: ReactNode;
 declare const media: MediaStreamTrack;
+const logSink: AgentLogSink = (level, target, message) => {
+  void [level, target, message];
+};
 
 const config: AgentConfig = {
   endpoint: "https://pulsebeam.example",
@@ -27,6 +31,7 @@ const config: AgentConfig = {
     remoteVideo: 9,
     remoteAudio: 9,
   },
+  logging: { level: "info", sink: logSink },
 };
 const agent: Agent = createAgent(config);
 const state: AgentState = {

@@ -1,5 +1,6 @@
 import {
   createAgent,
+  type AgentLogSink,
   type AgentEvent,
   type AgentFailure,
   type AgentSnapshot,
@@ -8,6 +9,9 @@ import {
 } from "../../web/index.js";
 
 declare const audioTrack: MediaStreamTrack;
+const logSink: AgentLogSink = (level, target, message) => {
+  void [level, target, message];
+};
 
 const agent = createAgent({
   endpoint: "https://pulsebeam.example",
@@ -19,6 +23,7 @@ const agent = createAgent({
     remoteAudio: 3,
     remoteVideo: 7,
   },
+  logging: { level: "debug", sink: logSink },
 });
 
 const desired: AgentState = {

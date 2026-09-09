@@ -15,6 +15,7 @@ const agent = createAgent({
     remoteAudio: 3,
     remoteVideo: 7,
   },
+  logging: { level: "debug" },
 });
 
 agent.setState({
@@ -60,6 +61,12 @@ a `null` track. Capture tracks remain owned by the caller: replacement and
 `close()` detach them but never stop them.
 Local-track operations are serialized per slot so an older replacement cannot
 become the final attachment after a newer one.
+
+Logging is configured independently for each agent with `logging.level`.
+Messages use the browser console by default; set `logging.sink` to route that
+agent's `(level, target, message)` entries elsewhere. The default level is
+`warn`. Chrome hides `debug` and `trace` console messages unless Verbose output
+is enabled.
 
 Snapshots contain participants and discoverable publications independently of
 whether media is currently bound. Available remote `MediaStreamTrack` objects

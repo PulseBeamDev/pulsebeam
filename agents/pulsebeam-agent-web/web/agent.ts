@@ -3,10 +3,13 @@ import type {
   AgentConfig,
   AgentEvent,
   AgentFailure,
+  AgentLogSink,
   AgentSnapshot,
   AgentState,
   AudioBinding,
   ConnectionState,
+  LogLevel,
+  MediaTopology,
   Participant,
   Publication,
   RemoteTrack,
@@ -35,6 +38,19 @@ interface RuntimeSnapshot {
   })[];
   readonly topics: TopicSnapshot;
   readonly failure?: AgentFailure;
+}
+
+interface RuntimeConfig {
+  readonly endpoint: string;
+  readonly roomId: string;
+  readonly requestHeaders: Readonly<Record<string, string>>;
+  readonly topology: Required<MediaTopology>;
+  readonly logLevel: LogLevel;
+}
+
+interface CopiedConfig {
+  readonly runtime: RuntimeConfig;
+  readonly logSink: AgentLogSink | undefined;
 }
 
 const EMPTY_ARRAY: readonly never[] = Object.freeze([]);
@@ -69,17 +85,21 @@ function emptySnapshot(connection: ConnectionState): AgentSnapshot {
   });
 }
 
-function copyConfig(config: AgentConfig): AgentConfig {
+function copyConfig(config: AgentConfig): CopiedConfig {
   return Object.freeze({
-    endpoint: config.endpoint,
-    roomId: config.roomId,
-    requestHeaders: Object.freeze({ ...(config.requestHeaders ?? {}) }),
-    topology: Object.freeze({
-      localVideo: Object.freeze([...(config.topology.localVideo ?? [])]),
-      localAudio: Object.freeze([...(config.topology.localAudio ?? [])]),
-      remoteVideo: config.topology.remoteVideo ?? 0,
-      remoteAudio: config.topology.remoteAudio ?? 0,
+    runtime: Object.freeze({
+      endpoint: config.endpoint,
+      roomId: config.roomId,
+      requestHeaders: Object.freeze({ ...(config.requestHeaders ?? {}) }),
+      topology: Object.freeze({
+        localVideo: Object.freeze([...(config.topology.localVideo ?? [])]),
+        localAudio: Object.freeze([...(config.topology.localAudio ?? [])]),
+        remoteVideo: config.topology.remoteVideo ?? 0,
+        remoteAudio: config.topology.remoteAudio ?? 0,
+      }),
+      logLevel: config.logging?.level ?? "warn",
     }),
+    logSink: config.logging?.sink,
   });
 }
 
@@ -163,7 +183,7 @@ class AgentFacade implements Agent {
   readonly #ready: Promise<Runtime>;
 
   constructor(config: AgentConfig) {
-    const runtimeConfig = copyConfig(config);
+    const { runtime: runtimeConfig, logSink } = copyConfig(config);
     this.#ready = whenInitialized()
       .catch((error: unknown) => {
         this.#terminalFailure("initialization", message(error));
@@ -173,7 +193,7 @@ class AgentFacade implements Agent {
         if (this.#closed) throw new Error("agent is closed");
         let runtime: Runtime;
         try {
-          runtime = new BrowserRuntime(runtimeConfig);
+          runtime = new BrowserRuntime(runtimeConfig, logSink);
         } catch (error) {
           this.#terminalFailure("invalid-configuration", message(error));
           throw error;

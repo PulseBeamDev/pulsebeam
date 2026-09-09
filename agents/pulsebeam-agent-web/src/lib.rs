@@ -25,8 +25,6 @@ mod ffi;
 
 #[cfg(target_arch = "wasm32")]
 pub use browser::BrowserRuntime;
-#[cfg(target_arch = "wasm32")]
-pub use logger::configure_logging;
 
 #[cfg(feature = "uniffi")]
 uniffi::setup_scaffolding!();
