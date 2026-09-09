@@ -229,7 +229,6 @@ pub(crate) struct Transport {
     max_events: usize,
     max_transmissions: usize,
     tcp_flows: Vec<(IceTcpFlowId, SocketAddr, SocketAddr)>,
-    current_tcp_flow: Option<(IceTcpFlowId, SocketAddr, SocketAddr)>,
     dropped_inputs: u64,
 }
 
@@ -370,7 +369,6 @@ impl Transport {
             max_events: config.max_events,
             max_transmissions: config.max_transmissions,
             tcp_flows: Vec::new(),
-            current_tcp_flow: None,
             dropped_inputs: 0,
         };
         transport.push_event(TransportEvent::StateChanged(TransportState::Checking))?;
@@ -495,22 +493,23 @@ impl Transport {
                     self.drop_input();
                     return Ok(());
                 }
-                if self
+                match self
                     .ice
                     .handle_packet(now, source, destination, proto, &bytes)
-                    .is_ok()
                 {
-                    let provider = str0m::crypto::from_feature_flags();
-                    self.drain_ice(now, &provider)?;
+                    Ok(()) => {
+                        self.bind_current_tcp_flow(path);
+                        let provider = str0m::crypto::from_feature_flags();
+                        self.drain_ice(now, &provider)?;
+                    }
+                    Err(_) => self.drop_input(),
                 }
             }
             DatagramKind::Dtls => {
                 let provider = str0m::crypto::from_feature_flags();
                 self.drain_ice(now, &provider)?;
-                if !self.ice.accepts_tuple(source, destination, proto) {
-                    if self.ice.can_queue_tuple(source, destination, proto)
-                        && self.pending_dtls.len() < MAX_PENDING_DTLS
-                    {
+                if !self.accepts_path(&path) {
+                    if self.can_queue_path(&path) && self.pending_dtls.len() < MAX_PENDING_DTLS {
                         self.pending_dtls.push_back((path, bytes));
                     } else {
                         self.drop_input();
@@ -520,9 +519,7 @@ impl Transport {
                 self.handle_dtls_packet(now, path, bytes, &provider)?;
             }
             DatagramKind::Rtp | DatagramKind::Rtcp => {
-                if self.state != TransportState::Connected
-                    || !self.ice.accepts_tuple(source, destination, proto)
-                {
+                if self.state != TransportState::Connected || !self.accepts_path(&path) {
                     self.drop_input();
                     return Ok(());
                 }
@@ -608,33 +605,7 @@ impl Transport {
                 )
             }
         };
-        let is_tcp = matches!(envelope, NetworkEnvelope::IceTcp { .. });
-        if let NetworkEnvelope::IceTcp {
-            flow,
-            local,
-            remote,
-        } = envelope
-        {
-            self.current_tcp_flow = Some((flow, local, remote));
-        }
-        self.handle_envelope(now, SelectedPath(envelope.clone()), bytes)?;
-        if is_tcp
-            && self.ice.can_queue_tuple(
-                envelope.source(),
-                envelope.destination(),
-                is::Protocol::Tcp,
-            )
-            && let NetworkEnvelope::IceTcp {
-                flow,
-                local,
-                remote,
-            } = envelope
-            && !self.tcp_flows.iter().any(|(id, _, _)| *id == flow)
-        {
-            self.tcp_flows.push((flow, local, remote));
-        }
-        self.current_tcp_flow = None;
-        Ok(())
+        self.handle_envelope(now, SelectedPath(envelope), bytes)
     }
 
     fn local_candidates_contains(&self, address: SocketAddr, proto: is::Protocol) -> bool {
@@ -967,21 +938,65 @@ impl Transport {
                         local,
                         remote,
                     })
-                })
-                .or_else(|| {
-                    self.current_tcp_flow
-                        .filter(|(_, bound_local, bound_remote)| {
-                            *bound_local == local && *bound_remote == remote
-                        })
-                        .map(|(flow, _, _)| {
-                            SelectedPath(NetworkEnvelope::IceTcp {
-                                flow,
-                                local,
-                                remote,
-                            })
-                        })
                 }),
             _ => None,
+        }
+    }
+
+    fn accepts_path(&self, path: &SelectedPath) -> bool {
+        if !self
+            .ice
+            .accepts_tuple(path.source(), path.destination(), path.protocol())
+        {
+            return false;
+        }
+        match path.0 {
+            NetworkEnvelope::Udp { .. } => true,
+            NetworkEnvelope::IceTcp {
+                flow,
+                local,
+                remote,
+            } => self
+                .tcp_flows
+                .iter()
+                .any(|(bound_flow, bound_local, bound_remote)| {
+                    *bound_flow == flow && *bound_local == local && *bound_remote == remote
+                }),
+        }
+    }
+
+    fn can_queue_path(&self, path: &SelectedPath) -> bool {
+        self.ice
+            .can_queue_tuple(path.source(), path.destination(), path.protocol())
+            && match path.0 {
+                NetworkEnvelope::Udp { .. } => true,
+                NetworkEnvelope::IceTcp {
+                    flow,
+                    local,
+                    remote,
+                } => self
+                    .tcp_flows
+                    .iter()
+                    .any(|(bound_flow, bound_local, bound_remote)| {
+                        *bound_flow == flow && *bound_local == local && *bound_remote == remote
+                    }),
+            }
+    }
+
+    fn bind_current_tcp_flow(&mut self, path: SelectedPath) {
+        let NetworkEnvelope::IceTcp {
+            flow,
+            local,
+            remote,
+        } = path.0
+        else {
+            return;
+        };
+        if self.tcp_flows.iter().any(|(id, _, _)| *id == flow) {
+            return;
+        }
+        if self.tcp_flows.len() < MAX_TCP_FLOWS {
+            self.tcp_flows.push((flow, local, remote));
         }
     }
 
@@ -1047,6 +1062,11 @@ fn error_to_transport(error: dtls::DtlsError) -> TransportError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(
+        clippy::disallowed_types,
+        reason = "NetworkInput is intentionally Bytes-backed"
+    )]
+    use bytes::Bytes;
     use std::net::{Ipv4Addr, SocketAddrV4};
     use std::time::Duration;
 
@@ -1113,19 +1133,45 @@ mod tests {
         .with_ice_role(active, if active { 2 } else { 1 })
     }
 
+    #[allow(
+        clippy::disallowed_types,
+        reason = "NetworkInput is intentionally Bytes-backed"
+    )]
     fn connect(left: &mut Transport, right: &mut Transport, now: &mut Instant) {
         for _ in 0..400 {
             let mut progress = false;
-            while let Some(transmit) = left.poll_transmit() {
+            while let Some(transmit) = left.poll_prepared() {
                 progress = true;
+                let TransmitTarget::Udp { local, remote, .. } = transmit.target else {
+                    panic!("UDP fixture only routes UDP transmissions");
+                };
                 right
-                    .handle_datagram(*now, transmit.source, transmit.destination, transmit.bytes)
+                    .receive(
+                        *now,
+                        NetworkInput::Udp {
+                            local: remote,
+                            remote: local,
+                            ecn: None,
+                            payload: Bytes::from(transmit.bytes),
+                        },
+                    )
                     .expect("right accepts deterministic datagram");
             }
-            while let Some(transmit) = right.poll_transmit() {
+            while let Some(transmit) = right.poll_prepared() {
                 progress = true;
-                left.handle_datagram(*now, transmit.source, transmit.destination, transmit.bytes)
-                    .expect("left accepts deterministic datagram");
+                let TransmitTarget::Udp { local, remote, .. } = transmit.target else {
+                    panic!("UDP fixture only routes UDP transmissions");
+                };
+                left.receive(
+                    *now,
+                    NetworkInput::Udp {
+                        local: remote,
+                        remote: local,
+                        ecn: None,
+                        payload: Bytes::from(transmit.bytes),
+                    },
+                )
+                .expect("left accepts deterministic datagram");
             }
             if left.state() == TransportState::Connected
                 && right.state() == TransportState::Connected
@@ -1389,6 +1435,48 @@ mod tests {
             .expect("bounded drop");
         assert_eq!(transport.tcp_flows.len(), MAX_TCP_FLOWS);
         assert_eq!(transport.dropped_inputs, 1);
+    }
+
+    #[test]
+    #[allow(
+        clippy::disallowed_types,
+        reason = "NetworkInput is intentionally Bytes-backed"
+    )]
+    fn rejected_stun_is_counted_once_without_progress() {
+        let left_certificate = certificate();
+        let right_certificate = certificate();
+        let now = Instant::now();
+        let mut transport = Transport::new(
+            config(
+                address(6400),
+                address(6401),
+                left_certificate,
+                &right_certificate,
+                true,
+            ),
+            now,
+        )
+        .expect("transport");
+        let events = transport.events.len();
+        let dropped = transport.dropped_inputs;
+        let mut malformed_stun = vec![0; 20];
+        malformed_stun[4..8].copy_from_slice(&[0x21, 0x12, 0xa4, 0x42]);
+
+        transport
+            .receive(
+                now,
+                NetworkInput::Udp {
+                    local: address(6400),
+                    remote: address(6401),
+                    ecn: None,
+                    payload: Bytes::from(malformed_stun),
+                },
+            )
+            .expect("malformed STUN is dropped");
+
+        assert_eq!(transport.dropped_inputs, dropped + 1);
+        assert_eq!(transport.events.len(), events);
+        assert_eq!(transport.state(), TransportState::Checking);
     }
 
     #[test]
