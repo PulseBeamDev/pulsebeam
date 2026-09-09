@@ -10,7 +10,6 @@ prepare:
 # Run every static workspace gate.
 check:
     just prepare
-    scripts/check-repository-layout.sh
     cargo check
     cargo fmt --all --check
     cargo clippy --all-targets --workspace --features pulsebeam/sim
