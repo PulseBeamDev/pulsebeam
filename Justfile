@@ -4,6 +4,11 @@ set tempdir := "/tmp"
 default:
     @just --list
 
+# Prepare local JavaScript packages in direct-dependency order.  A writable
+# transient pnpm state keeps frozen installs independent of host caches.
+prepare:
+    PNPM_HOME=/tmp/pulsebeam-pnpm-home PNPM_STORE_DIR=/tmp/pulsebeam-pnpm-store XDG_CACHE_HOME=/tmp/pulsebeam-pnpm-cache XDG_CONFIG_HOME=/tmp/pulsebeam-pnpm-config just --justfile apps/meet/Justfile prepare
+
 # Run every static workspace gate.
 check:
     scripts/check-repository-layout.sh
@@ -12,6 +17,7 @@ check:
     cargo clippy --all-targets --workspace --features pulsebeam/sim
     just --justfile agents/pulsebeam-agent-web/Justfile check
     just --justfile agents/react/Justfile check
+    just prepare
     just --justfile apps/meet/Justfile check
     just --fmt --check
     @for file in agents/pulsebeam-agent-native/Justfile agents/pulsebeam-agent-web/Justfile agents/react/Justfile apps/meet/Justfile crates/pulsebeam/Justfile crates/pulsebeam-ebpf/Justfile crates/pulsebeam-simulator/Justfile crates/pulsebeam-testdata/Justfile tools/Justfile; do just --justfile "$file" --fmt --check; done
@@ -26,15 +32,11 @@ test:
     cargo nextest run --cargo-profile sim -p pulsebeam-simulator --no-fail-fast
     just --justfile agents/pulsebeam-agent-web/Justfile test
     just --justfile agents/react/Justfile test
-    just --justfile apps/meet/Justfile test
 
 # Build the static Meet export.
 meet-build:
+    just prepare
     just --justfile apps/meet/Justfile build
-
-# Run Meet browser acceptance tests.
-meet-browser:
-    just --justfile apps/meet/Justfile test-browser
 
 # Build, load, and attach the eBPF steering programs.
 ebpf:

@@ -9,8 +9,7 @@ build:
 check:
     pnpm run check
 
-test:
-    pnpm run test
-
-test-browser:
-    pnpm run test-browser
+# Install only after the direct React dependency has prepared its owned assets.
+prepare:
+    just --justfile ../../agents/react/Justfile prepare
+    pnpm install --frozen-lockfile --ignore-scripts

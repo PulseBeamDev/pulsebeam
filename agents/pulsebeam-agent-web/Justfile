@@ -5,6 +5,10 @@ set tempdir := "/tmp"
 build:
     pnpm run build
 
+# The web package owns its lockfile and install.
+prepare:
+    pnpm install --frozen-lockfile --ignore-scripts
+
 # Regenerate the UniFFI web proof and its WASM package.
 uniffi-generate:
     pnpm run build:uniffi

@@ -2,8 +2,13 @@ set shell := ["bash", "-euc"]
 set tempdir := "/tmp"
 
 # Build the React adapter and its declarations.
-build:
+build: prepare
     pnpm run build
+
+# The React package owns preparation of its direct web dependency.
+prepare:
+    just --justfile ../pulsebeam-agent-web/Justfile prepare
+    pnpm install --frozen-lockfile --ignore-scripts
 
 # Check the implementation and public type contract.
 check:
