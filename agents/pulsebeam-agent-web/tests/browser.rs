@@ -186,8 +186,24 @@ async fn generated_media_types_run_through_bidi() -> TestResult<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn react_provider_contract_runs_through_bidi() -> TestResult<()> {
     let fixture = root().join("../react/tests/browser/dist");
-    if !fixture.join("index.html").is_file() {
-        return Err("React browser fixture is missing or stale; run `just browser` from the repository root".into());
+    let manifest = fixture.join("fixture-manifest.json");
+    if !fixture.join("index.html").is_file() || !manifest.is_file() {
+        return Err(
+            "React browser fixture is missing; run `just browser` from the repository root".into(),
+        );
+    }
+    let manifest_time = std::fs::metadata(&manifest)?.modified()?;
+    for source in [
+        root().join("../react/tests/browser/fixture.tsx"),
+        root().join("../react/tests/browser/index.html"),
+        root().join("dist/index.js"),
+    ] {
+        if std::fs::metadata(source)?.modified()? > manifest_time {
+            return Err(
+                "React browser fixture is stale; run `just browser` from the repository root"
+                    .into(),
+            );
+        }
     }
     let server = StaticServer::start(fixture).await?;
     let url = server.url("index.html");

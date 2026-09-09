@@ -23,6 +23,9 @@ pub struct DestinationServer {
 }
 impl DestinationServer {
     pub fn start() -> TestResult<Self> {
+        if std::net::TcpStream::connect("127.0.0.1:7070").is_ok() {
+            return Err("refusing to use an existing PulseBeam listener on 127.0.0.1:7070; browser contracts require an owned destination server".into());
+        }
         let package = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let root = package
             .parent()
@@ -35,6 +38,12 @@ impl DestinationServer {
             .stderr(Stdio::null())
             .spawn()?;
         for _ in 0..300 {
+            if let Some(status) = child.try_wait()? {
+                return Err(format!(
+                    "owned PulseBeam development server exited before readiness with {status}"
+                )
+                .into());
+            }
             if std::net::TcpStream::connect("127.0.0.1:7070").is_ok() {
                 return Ok(Self { child });
             }
