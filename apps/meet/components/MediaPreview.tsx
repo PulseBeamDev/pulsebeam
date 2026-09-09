@@ -44,10 +44,13 @@ export function MediaPreview({
         {/* Floating Controls Overlay */}
         <div className="absolute bottom-3 left-1/2 z-10 flex -translate-x-1/2 gap-3 sm:bottom-4">
           <Button
-            type="button" // Important: prevents form submission
+            type="button"
             size="icon"
             variant={isMicOn ? "secondary" : "destructive"}
             className="h-11 w-11 rounded-full shadow-lg transition-transform hover:scale-105 sm:h-12 sm:w-12"
+            aria-label={isMicOn ? "Mute microphone" : "Unmute microphone"}
+            title={isMicOn ? "Mute microphone" : "Unmute microphone"}
+            disabled={!hasStream}
             onClick={onToggleMic}
           >
             {isMicOn ? (
@@ -62,6 +65,9 @@ export function MediaPreview({
             size="icon"
             variant={isCamOn ? "secondary" : "destructive"}
             className="h-11 w-11 rounded-full shadow-lg transition-transform hover:scale-105 sm:h-12 sm:w-12"
+            aria-label={isCamOn ? "Turn camera off" : "Turn camera on"}
+            title={isCamOn ? "Turn camera off" : "Turn camera on"}
+            disabled={!hasStream}
             onClick={onToggleCam}
           >
             {isCamOn ? (

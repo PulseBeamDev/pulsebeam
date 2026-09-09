@@ -13,10 +13,10 @@ export function DeviceSelector({
 }: DeviceSelectorProps) {
   return (
     <div className="space-y-2">
-      <label className="flex text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+      <label className="block text-xs font-semibold tracking-wider text-muted-foreground uppercase">
         {label}
         <select
-          className="mt-2 h-9 w-full rounded-md border border-border bg-background px-2.5 text-sm shadow-xs outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 disabled:opacity-50"
+          className="mt-2 h-11 w-full rounded-md border border-border bg-background px-2.5 text-sm font-normal tracking-normal normal-case shadow-xs outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 disabled:opacity-50 sm:h-9"
           value={value}
           onChange={(event) => onValueChange(event.target.value)}
           disabled={devices.length === 0}

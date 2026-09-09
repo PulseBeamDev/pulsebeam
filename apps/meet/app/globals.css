@@ -65,6 +65,7 @@ body {
   color: var(--foreground);
   margin: 0;
   overscroll-behavior: none;
+  text-rendering: optimizeLegibility;
 }
 
 button,
@@ -108,9 +109,12 @@ select optgroup {
   justify-content: space-between;
 }
 
-.meet-latency-label,
-.meet-reconnect {
+.meet-latency-label {
   display: none;
+}
+
+.meet-reconnect {
+  display: inline-flex;
 }
 
 .meet-spotlight-frame {
@@ -135,6 +139,13 @@ select optgroup {
 .meet-participant-list,
 .meet-participant-tile {
   height: 100%;
+}
+
+.meet-chat {
+  position: absolute;
+  inset: 0;
+  z-index: 10;
+  width: 100%;
 }
 
 /* Wide layout: header, stage, and participant rail switch together so an
@@ -163,10 +174,6 @@ select optgroup {
 
   .meet-latency-label {
     display: inline;
-  }
-
-  .meet-reconnect {
-    display: inline-flex;
   }
 
   .meet-room-main {
@@ -204,6 +211,11 @@ select optgroup {
   .meet-participant-tile {
     width: 100%;
     height: auto;
+  }
+
+  .meet-chat {
+    position: static;
+    width: 18rem;
   }
 }
 
