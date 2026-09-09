@@ -17,14 +17,17 @@ export function RemoteMedia({
     const element = ref.current;
     if (!element) return;
     const retry = () => {
-      void element
-        .play()
-        .catch((reason) =>
-          onBlocked(
-            reason instanceof Error ? reason.message : "Playback was blocked",
-            retry,
-          ),
+      void element.play().catch((reason) => {
+        // React can move a publication between the rail and spotlight while
+        // play() is still pending. Cleanup pauses the old element, which is
+        // expected and does not require user recovery.
+        if (reason instanceof DOMException && reason.name === "AbortError")
+          return;
+        onBlocked(
+          reason instanceof Error ? reason.message : "Playback was blocked",
+          retry,
         );
+      });
     };
     element.srcObject = new MediaStream([track.media]);
     retry();

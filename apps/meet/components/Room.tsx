@@ -336,7 +336,7 @@ function RoomSession({
                 />
               )}
               {spotlight && (
-                <Badge className="absolute top-3 left-3 h-7 max-w-48 gap-2 truncate rounded-lg border border-white/10 bg-black/60 px-2.5 py-1 text-[9px] font-bold tracking-wider text-white uppercase backdrop-blur-md">
+                <Badge className="absolute top-3 left-3 h-7 max-w-48 gap-2 truncate rounded-lg border border-white/10 bg-black/60 px-2.5 py-1 text-[9px] font-medium text-white backdrop-blur-md">
                   <span className="h-1.5 w-1.5 rounded-full bg-primary" />
                   {label(spotlight)}
                 </Badge>
@@ -420,61 +420,57 @@ function RoomSession({
             </div>
             <div className="meet-participant-scroll min-h-0 flex-1">
               <div className="meet-participant-list flex gap-2">
-                <button
-                  className={cn(
-                    "meet-participant-tile relative aspect-video shrink-0 overflow-hidden rounded-lg border-2 bg-muted transition-colors hover:border-primary",
-                    !spotlight ? "border-primary" : "border-transparent",
-                  )}
-                  aria-label="Spotlight your camera"
-                  onClick={() => setPin(null)}
-                >
-                  <LocalVideo
-                    stream={stream}
-                    mirror
-                    className="h-full w-full object-cover"
-                  />
-                  <Badge
-                    variant="secondary"
-                    className="absolute bottom-1.5 left-1.5 h-4 border-0 bg-black/50 text-[9px] text-white backdrop-blur-sm"
-                  >
-                    You
-                  </Badge>
-                </button>
-                {remotePublications.map((publication) => (
+                {spotlight && (
                   <button
-                    key={publication.id}
-                    ref={(element) => {
-                      if (element) tiles.current.set(publication.id, element);
-                      else tiles.current.delete(publication.id);
-                    }}
-                    data-publication={publication.id}
-                    className={cn(
-                      "meet-participant-tile relative aspect-video shrink-0 overflow-hidden rounded-lg border-2 bg-muted transition-colors hover:border-primary",
-                      spotlight === publication.id
-                        ? "border-primary"
-                        : "border-transparent",
-                    )}
-                    aria-label={`Spotlight ${publication.participantId}`}
-                    onClick={() => setPin(publication.id)}
+                    className="meet-participant-tile relative aspect-video shrink-0 overflow-hidden rounded-lg border-2 border-transparent bg-muted transition-colors hover:border-primary"
+                    aria-label="Spotlight your camera"
+                    onClick={() => setPin("local")}
                   >
-                    {agent.tracks[publication.id]?.kind === "video" ? (
-                      <RemoteMedia
-                        track={agent.tracks[publication.id]}
-                        onBlocked={onBlocked}
-                      />
-                    ) : (
-                      <span className="grid h-full place-items-center text-xs">
-                        Waiting for video
-                      </span>
-                    )}
+                    <LocalVideo
+                      stream={stream}
+                      mirror
+                      className="h-full w-full object-cover"
+                    />
                     <Badge
                       variant="secondary"
-                      className="absolute bottom-1.5 left-1.5 h-4 max-w-[calc(100%-0.75rem)] truncate border-0 bg-black/50 text-[9px] text-white backdrop-blur-sm"
+                      className="absolute bottom-1.5 left-1.5 h-4 border-0 bg-black/50 text-[9px] text-white backdrop-blur-sm"
                     >
-                      {publication.participantId}
+                      You
                     </Badge>
                   </button>
-                ))}
+                )}
+                {remotePublications
+                  .filter((publication) => publication.id !== spotlight)
+                  .map((publication) => (
+                    <button
+                      key={publication.id}
+                      ref={(element) => {
+                        if (element) tiles.current.set(publication.id, element);
+                        else tiles.current.delete(publication.id);
+                      }}
+                      data-publication={publication.id}
+                      className="meet-participant-tile relative aspect-video shrink-0 overflow-hidden rounded-lg border-2 border-transparent bg-muted transition-colors hover:border-primary"
+                      aria-label={`Spotlight ${publication.participantId}`}
+                      onClick={() => setPin(publication.id)}
+                    >
+                      {agent.tracks[publication.id]?.kind === "video" ? (
+                        <RemoteMedia
+                          track={agent.tracks[publication.id]}
+                          onBlocked={onBlocked}
+                        />
+                      ) : (
+                        <span className="grid h-full place-items-center text-xs">
+                          Waiting for video
+                        </span>
+                      )}
+                      <Badge
+                        variant="secondary"
+                        className="absolute bottom-1.5 left-1.5 h-4 max-w-[calc(100%-0.75rem)] truncate border-0 bg-black/50 text-[9px] text-white backdrop-blur-sm"
+                      >
+                        {publication.participantId}
+                      </Badge>
+                    </button>
+                  ))}
               </div>
             </div>
           </aside>

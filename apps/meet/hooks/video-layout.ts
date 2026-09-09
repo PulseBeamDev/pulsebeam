@@ -6,7 +6,7 @@ export function useVideoLayout(
   publications: readonly Publication[],
   participantId: string | null,
 ) {
-  const [pin, setPin] = useState<string | null>(null);
+  const [pin, setPin] = useState<string | "local" | null>(null);
   const [selection, setSelection] = useState<VideoSelection[]>([]);
   const [thumbnailHeights, setThumbnailHeights] = useState<
     Record<string, number>
@@ -38,7 +38,11 @@ export function useVideoLayout(
     [remotePublications],
   );
   const spotlight =
-    pin && publicationById.has(pin) ? pin : (remoteIds[0] ?? null);
+    pin === "local"
+      ? null
+      : pin && publicationById.has(pin)
+        ? pin
+        : (remoteIds[0] ?? null);
   const selected = useMemo(
     () =>
       allocateVideo(
@@ -64,7 +68,7 @@ export function useVideoLayout(
         ? previous
         : selected,
     );
-    if (pin && !publicationById.has(pin)) setPin(null);
+    if (pin && pin !== "local" && !publicationById.has(pin)) setPin(null);
   }, [pin, publicationById, selected]);
 
   useEffect(() => {
@@ -80,7 +84,7 @@ export function useVideoLayout(
     );
     for (const element of tiles.current.values()) observer.observe(element);
     return () => observer.disconnect();
-  }, [remoteIds]);
+  }, [remoteIds, spotlight]);
 
   useEffect(() => {
     const element = spotlightFrame.current;
