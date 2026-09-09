@@ -47,8 +47,6 @@ jobs:
           tool: just
 
       - name: Build Meet
-        env:
-          NEXT_PUBLIC_PULSEBEAM_API_URL: ${{ vars.PULSEBEAM_API_URL }}
         run: just meet-build
 
       - name: Upload Pages artifact
