@@ -100,6 +100,23 @@ package pulsebeam.media.v1;
 //       commonly used controls.
 //
 // This convention should be preserved when extending option messages.
+//
+// Wire encoding:
+//
+// Each data-channel message contains exactly one signaling message.
+//
+// The message payload is:
+//
+//   protobuf -> LZ4
+//
+// Both endpoints MUST encode every ClientMessage and ServerMessage with LZ4
+// after protobuf serialization and MUST decompress before protobuf decoding.
+//
+// Compression state is scoped to the signaling transport as defined by the LZ4
+// implementation used by the protocol.
+//
+// Receivers MUST enforce the protocol's maximum uncompressed signaling-message
+// size before accepting decompressed data.
 
 
 // ============================================================================
