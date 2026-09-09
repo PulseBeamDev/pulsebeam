@@ -15,7 +15,7 @@ SANS-I/O PulseBeam client agent.
 * Effects describing required I/O
 * Events representing completed I/O
 * Snapshots and notifications
-* Production diagnostics through the `log` facade
+* Production diagnostics and per-agent filtering through the `log` facade
 * Shared UniFFI-compatible domain types
 
 ## Does not own
@@ -26,7 +26,7 @@ SANS-I/O PulseBeam client agent.
 * Media devices
 * Threads or executors
 * Browser or native platform APIs
-* Logger installation, filtering, or output sinks
+* Logger installation or output sinks
 
 ```text
 desired state + events

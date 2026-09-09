@@ -1620,6 +1620,7 @@ mod tests {
             },
             manual_subscriptions: true,
             retry: agent_core::RetryPolicy::default(),
+            log_level: agent_core::LogLevel::default(),
         };
         let mut config = Config::new(session);
         config

@@ -22,6 +22,14 @@ const CONTENT_TYPE: &str = "Content-Type";
 const SDP_CONTENT_TYPE: &str = "application/sdp";
 const SIGNAL_RETRY_DELAY: Duration = Duration::from_millis(100);
 
+macro_rules! agent_log {
+    ($agent:expr, $level:ident, $($message:tt)*) => {
+        if $agent.config.log_level.allows(log::Level::$level) {
+            log::log!(log::Level::$level, $($message)*);
+        }
+    };
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AgentCommand {
     ReplaceDesired(DesiredState),
@@ -128,6 +136,7 @@ pub struct Agent {
 impl Agent {
     pub fn new(mut config: AgentConfig) -> Result<Self, AgentError> {
         config.validate()?;
+        let log_level = config.log_level;
         Ok(Self {
             config,
             desired: DesiredState::default(),
@@ -144,7 +153,7 @@ impl Agent {
             intent_dirty: false,
             closing: None,
             orphaned_creates: BTreeSet::new(),
-            topics: Topics::default(),
+            topics: Topics::new(log_level),
         })
     }
 
@@ -163,7 +172,7 @@ impl Agent {
                 .map_err(AgentError::from),
         };
         if let Err(error) = &result {
-            log::warn!("agent command rejected: {error}");
+            agent_log!(self, Warn, "agent command rejected: {error}");
         }
         result
     }
@@ -176,7 +185,7 @@ impl Agent {
             HostEvent::DataChannel(event) => self.handle_data_channel(event),
         };
         if let Err(error) = &result {
-            log::warn!("host event rejected: {error}");
+            agent_log!(self, Warn, "host event rejected: {error}");
         }
         result
     }
@@ -225,7 +234,9 @@ impl Agent {
         self.desired = desired;
         self.snapshot.desired_revision = self.desired.revision;
         self.bump_snapshot();
-        log::debug!(
+        agent_log!(
+            self,
+            Debug,
             "accepted desired state revision={} connected={} publications={} video_subscriptions={} pinned_audio={}",
             self.desired.revision,
             self.desired.connected,
@@ -274,7 +285,9 @@ impl Agent {
         debug_assert!(self.attempt.is_none());
         let generation = self.ids.generation();
         let topic_registrations = self.desired.topics.clone();
-        log::info!(
+        agent_log!(
+            self,
+            Info,
             "starting connection attempt mode={mode:?} generation={}",
             generation.get()
         );
@@ -430,7 +443,9 @@ impl Agent {
             attempt.resources = Some(resources);
             attempt.request = Some(operation);
         }
-        log::debug!(
+        agent_log!(
+            self,
+            Debug,
             "requesting participant session mode={mode:?} generation={} operation={}",
             generation.get(),
             operation.get(),
@@ -499,7 +514,9 @@ impl Agent {
         if let Some(attempt) = self.attempt.as_mut() {
             attempt.request = None;
         }
-        log::debug!(
+        agent_log!(
+            self,
+            Debug,
             "received participant response mode={mode:?} generation={} operation={} status={}",
             generation.get(),
             operation.get(),
@@ -693,7 +710,9 @@ impl Agent {
                     &active.mids,
                 )? {
                     ServerOutput::StateChanged => {
-                        log::debug!(
+                        agent_log!(
+                            self,
+                            Debug,
                             "applied signaling state generation={} participants={} publications={} video_bindings={} audio_bindings={}",
                             generation.get(),
                             self.snapshot.participants.len(),
@@ -703,7 +722,9 @@ impl Agent {
                         );
                     }
                     ServerOutput::ServerError(message) => {
-                        log::warn!(
+                        agent_log!(
+                            self,
+                            Warn,
                             "server reported signaling error generation={}",
                             generation.get()
                         );
@@ -722,7 +743,9 @@ impl Agent {
                         && pending.generation == generation
                         && pending.channel == channel
                 }) {
-                    log::debug!(
+                    agent_log!(
+                        self,
+                        Debug,
                         "signaling intent sent generation={} operation={} channel={}",
                         generation.get(),
                         operation.get(),
@@ -753,7 +776,9 @@ impl Agent {
                         && pending.generation == generation
                         && pending.channel == channel
                 }) {
-                    log::warn!(
+                    agent_log!(
+                        self,
+                        Warn,
                         "signaling send failed generation={} operation={} channel={}",
                         generation.get(),
                         operation.get(),
@@ -828,7 +853,9 @@ impl Agent {
                 generation: previous.generation,
             }));
         }
-        log::info!(
+        agent_log!(
+            self,
+            Info,
             "activated connection generation={} replaced_generation={:?}",
             attempt.generation.get(),
             previous_generation.map(Generation::get),
@@ -883,7 +910,9 @@ impl Agent {
         let Some(mut attempt) = self.attempt.take() else {
             return;
         };
-        log::warn!(
+        agent_log!(
+            self,
+            Warn,
             "connection attempt failed mode={:?} generation={} class={:?}",
             attempt.mode,
             attempt.generation.get(),
@@ -930,7 +959,9 @@ impl Agent {
                 class: FailureClass::RetryExhausted,
                 message: "connection retry budget exhausted".to_string(),
             };
-            log::error!(
+            agent_log!(
+                self,
+                Error,
                 "connection retry budget exhausted attempts={}",
                 self.retry_attempts.saturating_sub(1)
             );
@@ -949,7 +980,9 @@ impl Agent {
             .unwrap_or(self.config.retry.maximum_delay)
             .min(self.config.retry.maximum_delay);
         let timer = self.ids.timer();
-        log::info!(
+        agent_log!(
+            self,
+            Info,
             "scheduled connection retry mode={mode:?} attempt={} timer={} delay_ms={}",
             self.retry_attempts,
             timer.get(),
@@ -978,7 +1011,11 @@ impl Agent {
                 Ok(payload) => payload,
                 Err(error) => {
                     let failure = Failure::protocol(error.to_string());
-                    log::error!("failed to encode desired signaling intent: {error}");
+                    agent_log!(
+                        self,
+                        Error,
+                        "failed to encode desired signaling intent: {error}"
+                    );
                     self.notify_failure(failure.clone());
                     self.snapshot.terminal_failure = Some(failure);
                     self.set_connection_state(ConnectionState::TerminalFailure);
@@ -988,7 +1025,9 @@ impl Agent {
         let operation = self.ids.operation();
         let generation = active.generation;
         let channel = active.signaling_channel;
-        log::debug!(
+        agent_log!(
+            self,
+            Debug,
             "sending desired signaling intent revision={} generation={} operation={} channel={} bytes={}",
             self.desired.revision,
             generation.get(),
@@ -1017,7 +1056,9 @@ impl Agent {
             return;
         }
         let timer = self.ids.timer();
-        log::info!(
+        agent_log!(
+            self,
+            Info,
             "scheduled signaling retry timer={} delay_ms={}",
             timer.get(),
             SIGNAL_RETRY_DELAY.as_millis(),
@@ -1040,7 +1081,9 @@ impl Agent {
         if self.closing.is_some() {
             return;
         }
-        log::info!(
+        agent_log!(
+            self,
+            Info,
             "closing agent session active={} candidate={} retry_pending={}",
             self.active.is_some(),
             self.attempt.is_some(),
@@ -1138,7 +1181,7 @@ impl Agent {
     }
 
     fn finish_disconnected(&mut self) {
-        log::info!("agent session disconnected");
+        agent_log!(self, Info, "agent session disconnected");
         self.active = None;
         self.attempt = None;
         self.retry = None;
@@ -1210,7 +1253,11 @@ impl Agent {
             return;
         }
         let from = self.snapshot.connection.clone();
-        log::debug!("connection state changed from={from:?} to={state:?}");
+        agent_log!(
+            self,
+            Debug,
+            "connection state changed from={from:?} to={state:?}"
+        );
         self.snapshot.connection = state.clone();
         self.snapshot.version = self.snapshot.version.saturating_add(1);
         self.notifications

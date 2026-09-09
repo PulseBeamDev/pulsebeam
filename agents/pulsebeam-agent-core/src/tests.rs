@@ -32,7 +32,17 @@ fn config() -> AgentConfig {
         },
         manual_subscriptions: true,
         retry: RetryPolicy::default(),
+        log_level: LogLevel::default(),
     }
+}
+
+#[test]
+fn log_level_applies_per_agent_verbosity() {
+    assert!(LogLevel::Error.allows(log::Level::Error));
+    assert!(!LogLevel::Error.allows(log::Level::Warn));
+    assert!(LogLevel::Debug.allows(log::Level::Debug));
+    assert!(!LogLevel::Debug.allows(log::Level::Trace));
+    assert!(!LogLevel::Off.allows(log::Level::Error));
 }
 
 fn desired(revision: u64) -> DesiredState {

@@ -147,6 +147,7 @@ async fn run_peer(
         },
         manual_subscriptions: true,
         retry: pulsebeam_agent_core::RetryPolicy::default(),
+        log_level: pulsebeam_agent_core::LogLevel::default(),
     };
     let mut config = Config::new(session);
     config.local_ips.push(ip);

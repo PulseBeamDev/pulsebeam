@@ -16,7 +16,6 @@ export type {
   AgentEvent,
   AgentFailure,
   AgentLogging,
-  AgentLogSink,
   AgentSnapshot,
   AgentState,
   AudioBinding,

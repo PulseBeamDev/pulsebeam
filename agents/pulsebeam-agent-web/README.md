@@ -63,10 +63,8 @@ Local-track operations are serialized per slot so an older replacement cannot
 become the final attachment after a newer one.
 
 Logging is configured independently for each agent with `logging.level`.
-Messages use the browser console by default; set `logging.sink` to route that
-agent's `(level, target, message)` entries elsewhere. The default level is
-`warn`. Chrome hides `debug` and `trace` console messages unless Verbose output
-is enabled.
+Messages use the browser console. The default level is `warn`. Chrome hides
+`debug` and `trace` console messages unless Verbose output is enabled.
 
 Snapshots contain participants and discoverable publications independently of
 whether media is currently bound. Available remote `MediaStreamTrack` objects

@@ -943,6 +943,7 @@ mod tests {
             },
             manual_subscriptions: true,
             retry: core_ffi::RetryPolicy::default(),
+            log_level: core_ffi::LogLevel::default(),
         }
     }
 

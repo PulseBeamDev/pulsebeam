@@ -1,6 +1,9 @@
-use js_sys::Function;
 use serde::Deserialize;
 use wasm_bindgen::JsValue;
+
+struct CoreConsoleLogger;
+
+static CORE_CONSOLE_LOGGER: CoreConsoleLogger = CoreConsoleLogger;
 
 #[derive(Clone, Copy, Default, Deserialize, PartialEq, PartialOrd)]
 #[serde(rename_all = "lowercase")]
@@ -16,12 +19,13 @@ pub(crate) enum LogLevel {
 
 pub(crate) struct BrowserLogger {
     level: LogLevel,
-    sink: Option<Function>,
 }
 
 impl BrowserLogger {
-    pub(crate) fn new(level: LogLevel, sink: Option<Function>) -> Self {
-        Self { level, sink }
+    pub(crate) fn new(level: LogLevel) -> Self {
+        let _ = log::set_logger(&CORE_CONSOLE_LOGGER);
+        log::set_max_level(log::LevelFilter::Trace);
+        Self { level }
     }
 
     pub(crate) fn debug(&self, target: &str, message: String) {
@@ -41,18 +45,6 @@ impl BrowserLogger {
             return;
         }
         let message = message.as_ref();
-        let delivered = self.sink.as_ref().is_some_and(|sink| {
-            sink.call3(
-                &JsValue::UNDEFINED,
-                &JsValue::from_str(level.as_str()),
-                &JsValue::from_str(target),
-                &JsValue::from_str(message),
-            )
-            .is_ok()
-        });
-        if delivered {
-            return;
-        }
         let rendered = JsValue::from_str(&format!("[{target}] {message}"));
         match level {
             LogLevel::Off => {}
@@ -64,15 +56,36 @@ impl BrowserLogger {
     }
 }
 
-impl LogLevel {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Off => "off",
-            Self::Error => "error",
-            Self::Warn => "warn",
-            Self::Info => "info",
-            Self::Debug => "debug",
-            Self::Trace => "trace",
+impl log::Log for CoreConsoleLogger {
+    fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+        metadata.target().starts_with("pulsebeam_agent_core")
+    }
+
+    fn log(&self, record: &log::Record<'_>) {
+        if !self.enabled(record.metadata()) {
+            return;
+        }
+        let rendered = JsValue::from_str(&format!("[{}] {}", record.target(), record.args()));
+        match record.level() {
+            log::Level::Error => web_sys::console::error_1(&rendered),
+            log::Level::Warn => web_sys::console::warn_1(&rendered),
+            log::Level::Info => web_sys::console::info_1(&rendered),
+            log::Level::Debug | log::Level::Trace => web_sys::console::debug_1(&rendered),
+        }
+    }
+
+    fn flush(&self) {}
+}
+
+impl From<LogLevel> for agent_core::LogLevel {
+    fn from(value: LogLevel) -> Self {
+        match value {
+            LogLevel::Off => Self::Off,
+            LogLevel::Error => Self::Error,
+            LogLevel::Warn => Self::Warn,
+            LogLevel::Info => Self::Info,
+            LogLevel::Debug => Self::Debug,
+            LogLevel::Trace => Self::Trace,
         }
     }
 }

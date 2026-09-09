@@ -22,6 +22,30 @@ pub struct AgentConfig {
     pub topology: MediaTopology,
     pub manual_subscriptions: bool,
     pub retry: RetryPolicy,
+    pub log_level: LogLevel,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum LogLevel {
+    Off,
+    Error,
+    #[default]
+    Warn,
+    Info,
+    Debug,
+    Trace,
+}
+
+impl LogLevel {
+    pub(crate) fn allows(self, level: log::Level) -> bool {
+        match level {
+            log::Level::Error => self >= Self::Error,
+            log::Level::Warn => self >= Self::Warn,
+            log::Level::Info => self >= Self::Info,
+            log::Level::Debug => self >= Self::Debug,
+            log::Level::Trace => self >= Self::Trace,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

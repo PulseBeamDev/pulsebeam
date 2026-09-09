@@ -304,6 +304,7 @@ impl SimClientBuilder {
             topology,
             manual_subscriptions: self.manual_subscriptions,
             retry: Default::default(),
+            log_level: Default::default(),
         };
         let mut config = Config::new(session);
         config.local_ips.push(self.ip);

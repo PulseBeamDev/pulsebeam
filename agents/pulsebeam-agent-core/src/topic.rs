@@ -12,7 +12,8 @@ use pulsebeam_proto::{
 
 use crate::{
     ChannelId, DataChannelBinding, DataChannelEffect, DataChannelReliability, DataChannelSpec,
-    Effect, Generation, Notification, OperationId, Snapshot, ValidationError, id::IdGenerator,
+    Effect, Generation, LogLevel, Notification, OperationId, Snapshot, ValidationError,
+    id::IdGenerator,
 };
 
 pub const MAX_TOPIC_CHANNELS: usize = 64;
@@ -23,6 +24,14 @@ pub const TOPIC_SEND_QUEUE_CAPACITY: usize = 256;
 
 const MAX_TOPIC_LABEL_BYTES: usize = 96;
 const MAX_TOPIC_FRAME_BYTES: usize = MAX_TOPIC_PAYLOAD_BYTES.saturating_add(512);
+
+macro_rules! topic_log {
+    ($topics:expr, $level:ident, $($message:tt)*) => {
+        if $topics.log_level.allows(log::Level::$level) {
+            log::log!(log::Level::$level, $($message)*);
+        }
+    };
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum TopicMode {
@@ -229,6 +238,7 @@ struct AuxiliarySend {
 
 #[derive(Default)]
 pub(crate) struct Topics {
+    log_level: LogLevel,
     publishers: BTreeMap<TopicPublisher, PublisherState>,
     subscribers: BTreeMap<TopicSubscriber, SubscriberState>,
     active: Option<ActiveTopics>,
@@ -313,6 +323,13 @@ impl TopicRegistrations {
 }
 
 impl Topics {
+    pub(crate) fn new(log_level: LogLevel) -> Self {
+        Self {
+            log_level,
+            ..Self::default()
+        }
+    }
+
     pub(crate) fn has_channel(&self, generation: Generation, channel: ChannelId) -> bool {
         self.active.as_ref().is_some_and(|active| {
             active.generation == generation && active.channels.contains_key(&channel)
@@ -386,7 +403,9 @@ impl Topics {
                     }
                 });
         }
-        log::info!(
+        topic_log!(
+            self,
+            Info,
             "reconciled topic registrations publishers={} subscribers={}",
             self.publishers.len(),
             self.subscribers.len(),
@@ -462,7 +481,9 @@ impl Topics {
             participant_id,
             channels,
         });
-        log::info!(
+        topic_log!(
+            self,
+            Info,
             "bound topic channels generation={} publishers={} subscribers={}",
             generation.get(),
             registrations.publishers.len(),
@@ -624,7 +645,9 @@ impl Topics {
             state.next_sequence = state.next_sequence.saturating_add(1);
         }
         self.accepted_sends = self.accepted_sends.saturating_add(1);
-        log::debug!(
+        topic_log!(
+            self,
+            Debug,
             "topic send admitted mode={:?} topic={} generation={} operation={} stream={:?} sequence={:?}",
             publisher.mode,
             publisher.topic,
@@ -892,7 +915,9 @@ impl Topics {
             sequence,
             payload,
         });
-        log::debug!(
+        topic_log!(
+            self,
+            Debug,
             "dispatching topic send mode={:?} topic={} generation={} operation={} channel={} bytes={}",
             publisher.mode,
             publisher.topic,
@@ -1032,7 +1057,9 @@ impl Topics {
         let result = state.accept(message)?;
         if result.resynchronized {
             self.resynchronizations = self.resynchronizations.saturating_add(1);
-            log::warn!(
+            topic_log!(
+                self,
+                Warn,
                 "ordered topic resynchronized topic={} generation={} stream={} next_sequence={}",
                 subscriber.topic,
                 generation.get(),
@@ -1129,7 +1156,9 @@ impl Topics {
         notifications: &mut VecDeque<Notification>,
     ) {
         self.dropped_sends = self.dropped_sends.saturating_add(1);
-        log::warn!(
+        topic_log!(
+            self,
+            Warn,
             "topic send dropped mode={:?} topic={} reason={reason:?}",
             publisher.mode,
             publisher.topic,
@@ -1147,7 +1176,7 @@ impl Topics {
         notifications: &mut VecDeque<Notification>,
     ) {
         self.channel_failures = self.channel_failures.saturating_add(1);
-        log::warn!("topic channel failed channel={channel:?}");
+        topic_log!(self, Warn, "topic channel failed channel={channel:?}");
         notifications.push_back(Notification::Topic(TopicNotification::ChannelFailed {
             channel,
             message,

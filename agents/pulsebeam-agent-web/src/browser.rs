@@ -410,7 +410,7 @@ pub struct BrowserRuntime {
 #[wasm_bindgen]
 impl BrowserRuntime {
     #[wasm_bindgen(constructor)]
-    pub fn new(config: JsValue, log_sink: Option<Function>) -> Result<BrowserRuntime, JsValue> {
+    pub fn new(config: JsValue) -> Result<BrowserRuntime, JsValue> {
         let config: RuntimeConfig = serde_wasm_bindgen::from_value(config)
             .map_err(|error| js_error(format!("invalid browser runtime config: {error}")))?;
         let request_headers = config
@@ -449,10 +449,11 @@ impl BrowserRuntime {
             topology,
             manual_subscriptions: true,
             retry: RetryPolicy::default(),
+            log_level: config.log_level.into(),
         };
         let inner = Rc::new(RuntimeInner {
             actor: RefCell::new(None),
-            logger: BrowserLogger::new(config.log_level, log_sink),
+            logger: BrowserLogger::new(config.log_level),
             local_slots,
             local_operation_gates,
             local_tracks: RefCell::new(BTreeMap::new()),

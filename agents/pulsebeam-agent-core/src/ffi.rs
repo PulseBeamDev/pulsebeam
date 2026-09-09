@@ -47,6 +47,18 @@ pub struct AgentConfig {
     pub topology: MediaTopology,
     pub manual_subscriptions: bool,
     pub retry: RetryPolicy,
+    pub log_level: LogLevel,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, uniffi::Enum)]
+pub enum LogLevel {
+    Off,
+    Error,
+    #[default]
+    Warn,
+    Info,
+    Debug,
+    Trace,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
@@ -371,6 +383,7 @@ impl AgentConfig {
             topology: self.topology.into(),
             manual_subscriptions: self.manual_subscriptions,
             retry: self.retry.into(),
+            log_level: self.log_level.into(),
         };
         config.validate().map_err(|error| AgentError {
             code: ErrorCode::InvalidConfiguration,
@@ -500,6 +513,33 @@ impl From<model::AgentConfig> for AgentConfig {
             topology: value.topology.into(),
             manual_subscriptions: value.manual_subscriptions,
             retry: value.retry.into(),
+            log_level: value.log_level.into(),
+        }
+    }
+}
+
+impl From<LogLevel> for model::LogLevel {
+    fn from(value: LogLevel) -> Self {
+        match value {
+            LogLevel::Off => Self::Off,
+            LogLevel::Error => Self::Error,
+            LogLevel::Warn => Self::Warn,
+            LogLevel::Info => Self::Info,
+            LogLevel::Debug => Self::Debug,
+            LogLevel::Trace => Self::Trace,
+        }
+    }
+}
+
+impl From<model::LogLevel> for LogLevel {
+    fn from(value: model::LogLevel) -> Self {
+        match value {
+            model::LogLevel::Off => Self::Off,
+            model::LogLevel::Error => Self::Error,
+            model::LogLevel::Warn => Self::Warn,
+            model::LogLevel::Info => Self::Info,
+            model::LogLevel::Debug => Self::Debug,
+            model::LogLevel::Trace => Self::Trace,
         }
     }
 }
@@ -981,6 +1021,7 @@ mod tests {
             },
             manual_subscriptions: true,
             retry: RetryPolicy::default(),
+            log_level: LogLevel::default(),
         }
     }
 
@@ -1265,6 +1306,16 @@ mod tests {
 
     #[test]
     fn every_portable_enum_variant_survives_uniffi_serialization() {
+        for value in [
+            LogLevel::Off,
+            LogLevel::Error,
+            LogLevel::Warn,
+            LogLevel::Info,
+            LogLevel::Debug,
+            LogLevel::Trace,
+        ] {
+            assert_ffi_round_trip(value);
+        }
         for value in [
             PlayoutDelay::Adaptive,
             PlayoutDelay::Fixed {

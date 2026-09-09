@@ -356,6 +356,7 @@ async fn spawn_agent(
         },
         manual_subscriptions: true,
         retry: Default::default(),
+        log_level: Default::default(),
     };
     let mut config = Config::new(session);
     let encodings = if simulcast {
