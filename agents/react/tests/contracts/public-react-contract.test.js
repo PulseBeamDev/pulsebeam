@@ -214,7 +214,7 @@ test("Strict Mode releases caller subscriptions without closing its agent", () =
     return null;
   }
 
-  act(() => {
+  const mount = () => {
     renderer = TestRenderer.create(
       createElement(
         StrictMode,
@@ -222,7 +222,19 @@ test("Strict Mode releases caller subscriptions without closing its agent", () =
         createElement(AgentProvider, { agent }, createElement(EventProbe)),
       ),
     );
-  });
+  };
+
+  act(mount);
+  assert.equal(agent.listeners.size, 1);
+  assert.equal(agent.eventListeners.size, 1);
+
+  // react-test-renderer does not replay Strict Mode effects, so explicitly
+  // exercise the setup/cleanup/setup sequence that Strict Mode requires.
+  act(() => renderer.unmount());
+  assert.equal(agent.listeners.size, 0);
+  assert.equal(agent.eventListeners.size, 0);
+
+  act(mount);
   assert.equal(agent.listeners.size, 1);
   assert.equal(agent.eventListeners.size, 1);
 
