@@ -18,7 +18,7 @@ fi
 while IFS= read -r task_file; do
     echo "legacy task file: $task_file" >&2
     failed=1
-done < <(find . -path ./target -prune -o -type f \( -iname makefile -o -name justfile \) -print)
+done < <(find . -path ./target -prune -o -name node_modules -type d -prune -o -type f \( -iname makefile -o -name justfile \) -print)
 
 if rg -n --hidden \
     'make (lint-check|test-unit|test-sim-seed|test-sim|test-browser|test-routing|build-ebpf|sim-sweep|bwe-baseline|test|lint|release)' \
