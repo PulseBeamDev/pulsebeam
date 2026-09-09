@@ -1,4 +1,10 @@
-import type { ButtonHTMLAttributes, HTMLAttributes, InputHTMLAttributes, ReactElement, ReactNode } from "react";
+import type {
+  ButtonHTMLAttributes,
+  HTMLAttributes,
+  InputHTMLAttributes,
+  ReactElement,
+  ReactNode,
+} from "react";
 
 type ClassName = string | false | null | undefined;
 
@@ -55,7 +61,11 @@ const badgeVariants = {
   outline: "border-border text-foreground",
 };
 
-export function Badge({ className, variant = "default", ...props }: BadgeProps) {
+export function Badge({
+  className,
+  variant = "default",
+  ...props
+}: BadgeProps) {
   return (
     <span
       className={cn(
@@ -80,11 +90,18 @@ export function Card({ className, ...props }: HTMLAttributes<HTMLDivElement>) {
   );
 }
 
-export function CardContent({ className, ...props }: HTMLAttributes<HTMLDivElement>) {
+export function CardContent({
+  className,
+  ...props
+}: HTMLAttributes<HTMLDivElement>) {
   return <div className={cn("px-6", className)} {...props} />;
 }
 
-export function Input({ className, type, ...props }: InputHTMLAttributes<HTMLInputElement>) {
+export function Input({
+  className,
+  type,
+  ...props
+}: InputHTMLAttributes<HTMLInputElement>) {
   return (
     <input
       type={type}
@@ -101,7 +118,9 @@ export function Separator({
   className,
   orientation = "horizontal",
   ...props
-}: HTMLAttributes<HTMLDivElement> & { orientation?: "horizontal" | "vertical" }) {
+}: HTMLAttributes<HTMLDivElement> & {
+  orientation?: "horizontal" | "vertical";
+}) {
   return (
     <div
       role="separator"
@@ -116,8 +135,13 @@ export function Separator({
   );
 }
 
-export function ScrollArea({ className, ...props }: HTMLAttributes<HTMLDivElement>) {
-  return <div className={cn("relative overflow-y-auto", className)} {...props} />;
+export function ScrollArea({
+  className,
+  ...props
+}: HTMLAttributes<HTMLDivElement>) {
+  return (
+    <div className={cn("relative overflow-y-auto", className)} {...props} />
+  );
 }
 
 export function TooltipProvider({ children }: { children: ReactNode }) {
@@ -128,11 +152,19 @@ export function Tooltip({ children }: { children: ReactNode }) {
   return <span className="group/tooltip relative inline-flex">{children}</span>;
 }
 
-export function TooltipTrigger({ children }: { children: ReactElement; asChild?: boolean }) {
+export function TooltipTrigger({
+  children,
+}: {
+  children: ReactElement;
+  asChild?: boolean;
+}) {
   return children;
 }
 
-export function TooltipContent({ className, children }: HTMLAttributes<HTMLSpanElement> & { side?: "bottom" | "top" }) {
+export function TooltipContent({
+  className,
+  children,
+}: HTMLAttributes<HTMLSpanElement> & { side?: "bottom" | "top" }) {
   return (
     <span
       role="tooltip"
@@ -145,4 +177,3 @@ export function TooltipContent({ className, children }: HTMLAttributes<HTMLSpanE
     </span>
   );
 }
-

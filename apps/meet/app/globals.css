@@ -12,7 +12,7 @@
   --secondary: oklch(0.96 0.01 265);
   --secondary-foreground: oklch(0.21 0.02 265);
   --muted: oklch(0.96 0.01 265);
-  --muted-foreground: oklch(0.50 0.02 265);
+  --muted-foreground: oklch(0.5 0.02 265);
   --destructive: oklch(0.58 0.22 27);
   --border: oklch(0.92 0.01 265);
   --input: oklch(0.92 0.01 265);
@@ -26,11 +26,11 @@
   --card-foreground: oklch(0.98 0 0);
   --primary: oklch(0.55 0.22 275);
   --primary-foreground: oklch(0.98 0 0);
-  --secondary: oklch(0.20 0.02 265);
+  --secondary: oklch(0.2 0.02 265);
   --secondary-foreground: oklch(0.98 0 0);
-  --muted: oklch(0.20 0.02 265);
+  --muted: oklch(0.2 0.02 265);
   --muted-foreground: oklch(0.65 0.02 265);
-  --destructive: oklch(0.60 0.20 27);
+  --destructive: oklch(0.6 0.2 27);
   --border: oklch(0.25 0.02 265);
   --input: oklch(0.25 0.02 265);
   --ring: oklch(0.55 0.22 275);
@@ -208,9 +208,18 @@ select optgroup {
 }
 
 @keyframes floatUp {
-  0%   { opacity: 1; transform: translateY(0) scale(1); }
-  80%  { opacity: 0.8; transform: translateY(-120px) scale(1.2); }
-  100% { opacity: 0; transform: translateY(-160px) scale(0.9); }
+  0% {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+  80% {
+    opacity: 0.8;
+    transform: translateY(-120px) scale(1.2);
+  }
+  100% {
+    opacity: 0;
+    transform: translateY(-160px) scale(0.9);
+  }
 }
 
 @media (min-width: 640px) and (max-width: 767px) {
@@ -222,4 +231,3 @@ select optgroup {
     height: 9rem;
   }
 }
-

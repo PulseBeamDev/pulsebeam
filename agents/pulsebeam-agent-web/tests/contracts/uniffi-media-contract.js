@@ -1,10 +1,17 @@
 (async () => {
-  const wasm = await import("/dist/uniffi-proof/generated/bindings/wasm-bindgen/index.js");
+  const wasm = await import(
+    "/dist/uniffi-proof/generated/bindings/wasm-bindgen/index.js"
+  );
   await wasm.default({
-    module_or_path: "/dist/uniffi-proof/generated/bindings/wasm-bindgen/index_bg.wasm",
+    module_or_path:
+      "/dist/uniffi-proof/generated/bindings/wasm-bindgen/index_bg.wasm",
   });
-  const core = await import("/dist/uniffi-proof/generated/bindings/pulsebeam_agent_core.js");
-  const web = await import("/dist/uniffi-proof/generated/bindings/pulsebeam_agent_web.js");
+  const core = await import(
+    "/dist/uniffi-proof/generated/bindings/pulsebeam_agent_core.js"
+  );
+  const web = await import(
+    "/dist/uniffi-proof/generated/bindings/pulsebeam_agent_web.js"
+  );
   const registry = await import("/dist/uniffi-proof/web/media-registry.js");
   core.default.initialize();
   web.default.initialize();
@@ -30,16 +37,24 @@
   const releaseCanvas = document.createElement("canvas");
   const releaseTrack = releaseCanvas.captureStream(5).getVideoTracks()[0];
   const releaseHandle = registry.lowerMediaStreamTrack(releaseTrack);
-  const retainedBeforeTrackRelease = globalThis.__pulsebeamMediaRegistry.size().toString();
+  const retainedBeforeTrackRelease = globalThis.__pulsebeamMediaRegistry
+    .size()
+    .toString();
   registry.invalidateMediaForTest(releaseTrack);
-  const retainedAfterTrackRelease = globalThis.__pulsebeamMediaRegistry.size().toString();
+  const retainedAfterTrackRelease = globalThis.__pulsebeamMediaRegistry
+    .size()
+    .toString();
 
   const stream = new MediaStream();
   const streamHandle = registry.lowerMediaStream(stream);
   const streamIdentity = registry.liftMediaStream(streamHandle) === stream;
-  const retainedBeforeStreamRelease = globalThis.__pulsebeamMediaRegistry.size().toString();
+  const retainedBeforeStreamRelease = globalThis.__pulsebeamMediaRegistry
+    .size()
+    .toString();
   registry.invalidateMediaForTest(stream);
-  const retainedAfterStreamRelease = globalThis.__pulsebeamMediaRegistry.size().toString();
+  const retainedAfterStreamRelease = globalThis.__pulsebeamMediaRegistry
+    .size()
+    .toString();
 
   registry.exhaustMediaHandlesForTest();
   const exhaustedCanvas = document.createElement("canvas");
@@ -65,4 +80,4 @@
     retainedBeforeStreamRelease,
     retainedAfterStreamRelease,
   };
-})()
+})();

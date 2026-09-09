@@ -153,7 +153,29 @@
       (event) => event.type === "failure" && event.class === "runtime",
     );
 
+  let enterPendingOperation;
+  const pendingOperationEntered = new Promise(
+    (resolve) => (enterPendingOperation = resolve),
+  );
+  let releasePendingOperation;
+  const pendingOperationGate = new Promise(
+    (resolve) => (releasePendingOperation = resolve),
+  );
+  RTCRtpSender.prototype.setParameters = () => {
+    enterPendingOperation();
+    return pendingOperationGate;
+  };
+  const pendingReplacement = sender.replaceLocalTrack("camera", localTrack, {
+    contentHint: "motion",
+  });
+  await pendingOperationEntered;
   sender.close();
+  releasePendingOperation();
+  const closeDuringLocalOperation = await pendingReplacement.then(
+    () => false,
+    (error) => error instanceof Error && error.message === "agent is closed",
+  );
+  RTCRtpSender.prototype.setParameters = originalSetParameters;
   receiver.close();
   const callerOwnsTrack = localTrack.readyState === "live";
   localTrack.stop();
@@ -170,6 +192,7 @@
       receivedTopic.sequence >= 0 &&
       receivedTopic.payload.join(",") === "7,8,9",
     runtimeFailureEvent,
+    closeDuringLocalOperation,
     callerOwnsTrack,
   };
-})()
+})();

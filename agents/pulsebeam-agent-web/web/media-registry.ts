@@ -26,10 +26,14 @@ function matches(value: unknown, kind: MediaKind): value is MediaValue {
 
 const registry: Registry = Object.freeze({
   retain(value: MediaValue, kind: MediaKind) {
-    if (!matches(value, kind)) throw new TypeError(`expected a MediaStream${kind === "track" ? "Track" : ""}`);
+    if (!matches(value, kind))
+      throw new TypeError(
+        `expected a MediaStream${kind === "track" ? "Track" : ""}`,
+      );
     const current = handles.get(value);
     if (current !== undefined && values.has(current)) return current;
-    if (nextHandle > MAX_HANDLE) throw new RangeError("browser media handle space exhausted");
+    if (nextHandle > MAX_HANDLE)
+      throw new RangeError("browser media handle space exhausted");
     const handle = nextHandle;
     nextHandle += 1n;
     values.set(handle, { kind, value });
@@ -65,7 +69,8 @@ export function lowerMediaStreamTrack(value: MediaStreamTrack): bigint {
 
 export function liftMediaStreamTrack(handle: bigint): MediaStreamTrack {
   const value = registry.get(handle, "track");
-  if (!(value instanceof MediaStreamTrack)) throw new ReferenceError("stale browser media track handle");
+  if (!(value instanceof MediaStreamTrack))
+    throw new ReferenceError("stale browser media track handle");
   return value;
 }
 
@@ -75,14 +80,19 @@ export function lowerMediaStream(value: MediaStream): bigint {
 
 export function liftMediaStream(handle: bigint): MediaStream {
   const value = registry.get(handle, "stream");
-  if (!(value instanceof MediaStream)) throw new ReferenceError("stale browser media stream handle");
+  if (!(value instanceof MediaStream))
+    throw new ReferenceError("stale browser media stream handle");
   return value;
 }
 
 export function invalidateMediaForTest(value: MediaValue): boolean {
   const handle = handles.get(value);
   const entry = handle === undefined ? undefined : values.get(handle);
-  return handle !== undefined && entry !== undefined && registry.release(handle, entry.kind);
+  return (
+    handle !== undefined &&
+    entry !== undefined &&
+    registry.release(handle, entry.kind)
+  );
 }
 
 export function exhaustMediaHandlesForTest(): void {

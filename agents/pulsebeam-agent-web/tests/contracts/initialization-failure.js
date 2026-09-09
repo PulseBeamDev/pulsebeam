@@ -1,1 +1,22 @@
-new Promise((resolve, reject) => { const agent = window.pulsebeam.createAgent({ endpoint: location.origin, roomId: "room", topology: {} }); const timeout = setTimeout(() => reject(new Error("initialization did not fail")), 5000); agent.subscribe(() => { if (agent.getSnapshot().connection !== "terminal-failure") return; clearTimeout(timeout); const failure = agent.getSnapshot().failure; agent.setState({ connected: false }); const after = agent.getSnapshot(); resolve(after.connection === "terminal-failure" && after.failure === failure); }); agent.setState({ connected: true }); })
+new Promise((resolve, reject) => {
+  const agent = window.pulsebeam.createAgent({
+    endpoint: location.origin,
+    roomId: "room",
+    topology: {},
+  });
+  const timeout = setTimeout(
+    () => reject(new Error("initialization did not fail")),
+    5000,
+  );
+  agent.subscribe(() => {
+    if (agent.getSnapshot().connection !== "terminal-failure") return;
+    clearTimeout(timeout);
+    const failure = agent.getSnapshot().failure;
+    agent.setState({ connected: false });
+    const after = agent.getSnapshot();
+    resolve(
+      after.connection === "terminal-failure" && after.failure === failure,
+    );
+  });
+  agent.setState({ connected: true });
+});

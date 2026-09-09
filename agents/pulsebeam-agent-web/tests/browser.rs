@@ -14,6 +14,8 @@ const UNIFFI: &str = include_str!("contracts/uniffi-media-contract.js");
 const LOAD: &str = include_str!("contracts/load-web.js");
 const FAILURE: &str = include_str!("contracts/initialization-failure.js");
 const REJECTIONS: &str = include_str!("contracts/unhandled-rejections.js");
+const RUNTIME_LOCAL_OPERATIONS: &str =
+    include_str!("contracts/runtime-local-operation-contract.js");
 const REACT: &str = include_str!("../../react/tests/browser/observe.js");
 
 #[derive(Deserialize)]
@@ -46,7 +48,16 @@ struct Live {
     reconnected: bool,
     topic_metadata: bool,
     runtime_failure_event: bool,
+    close_during_local_operation: bool,
     caller_owns_track: bool,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RuntimeLocalOperations {
+    serialized_before_release: bool,
+    final_track_wins: bool,
+    close_fenced: bool,
+    post_close_fenced: bool,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -127,6 +138,27 @@ async fn public_agent_contract_runs_through_bidi() -> TestResult<()> {
     Ok(())
 }
 #[tokio::test(flavor = "multi_thread")]
+async fn runtime_local_operations_are_serialized_and_close_fenced() -> TestResult<()> {
+    let server = StaticServer::start(root()).await?;
+    let url = server.url("tests/fixture.html");
+    run_browser_test(WebDriver::managed(capabilities()?), |driver| async move {
+        let bidi = driver.bidi().await?;
+        let context = bidi.browsing_context().top_level().await?;
+        navigate(&bidi, &context, url).await?;
+        let result: RuntimeLocalOperations =
+            evaluate_json(&bidi, &context, RUNTIME_LOCAL_OPERATIONS).await?;
+        assert!(
+            result.serialized_before_release
+                && result.final_track_wins
+                && result.close_fenced
+                && result.post_close_fenced
+        );
+        Ok::<_, Box<dyn Error + Send + Sync>>(())
+    })
+    .await
+    .map_err(|error| format!("runtime local operation contract failed: {error}").into())
+}
+#[tokio::test(flavor = "multi_thread")]
 async fn initialization_failure_is_private_and_deterministic() -> TestResult<()> {
     let server = StaticServer::start_with_wasm_failure(root(), true).await?;
     web(&server, true).await?;
@@ -151,6 +183,7 @@ async fn public_agent_connects_and_delivers_remote_media() -> TestResult<()> {
                 && r.reconnected
                 && r.topic_metadata
                 && r.runtime_failure_event
+                && r.close_during_local_operation
                 && r.caller_owns_track
         );
         Ok::<_, Box<dyn Error + Send + Sync>>(())

@@ -23,6 +23,8 @@
     "build:ts": "tsc -p tsconfig.json",
     "build": "pnpm run build:wasm && pnpm run build:ts",
     "check": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.public-contract.json",
+    "format": "prettier --write \"web/**/*.ts\" \"tests/**/*.{js,ts}\" \"*.{json,mjs}\" ubrn.config.yaml pnpm-workspace.yaml",
+    "format:check": "prettier --check \"web/**/*.ts\" \"tests/**/*.{js,ts}\" \"*.{json,mjs}\" ubrn.config.yaml pnpm-workspace.yaml",
     "test": "just test"
   },
   "dependencies": {

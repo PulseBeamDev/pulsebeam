@@ -1,27 +1,35 @@
 set shell := ["bash", "-euc"]
-set tempdir := "/tmp"
 
 # Build the React adapter and its declarations.
 build: prepare
-    PNPM_HOME=/tmp/pulsebeam-pnpm-home PNPM_STORE_DIR=/tmp/pulsebeam-pnpm-store XDG_CACHE_HOME=/tmp/pulsebeam-pnpm-cache XDG_CONFIG_HOME=/tmp/pulsebeam-pnpm-config pnpm run build
+    just --justfile ../pulsebeam-agent-web/Justfile build
+    pnpm run build
 
 # The React package owns preparation of its direct web dependency.
 prepare:
     just --justfile ../pulsebeam-agent-web/Justfile prepare
-    PNPM_HOME=/tmp/pulsebeam-pnpm-home PNPM_STORE_DIR=/tmp/pulsebeam-pnpm-store XDG_CACHE_HOME=/tmp/pulsebeam-pnpm-cache XDG_CONFIG_HOME=/tmp/pulsebeam-pnpm-config pnpm install --frozen-lockfile --ignore-scripts
+    pnpm install --frozen-lockfile --ignore-scripts
+
+# Format package and browser-contract sources.
+fix: prepare
+    pnpm run format
+
+format-check: prepare
+    pnpm run format:check
 
 # Check the implementation and public type contract.
-check:
-    PNPM_HOME=/tmp/pulsebeam-pnpm-home PNPM_STORE_DIR=/tmp/pulsebeam-pnpm-store XDG_CACHE_HOME=/tmp/pulsebeam-pnpm-cache XDG_CONFIG_HOME=/tmp/pulsebeam-pnpm-config pnpm run check
+check: format-check
+    just --justfile ../pulsebeam-agent-web/Justfile build
+    pnpm run check
 
 # Run React compile and package-resolution checks only.
-test:
-    PNPM_HOME=/tmp/pulsebeam-pnpm-home PNPM_STORE_DIR=/tmp/pulsebeam-pnpm-store XDG_CACHE_HOME=/tmp/pulsebeam-pnpm-cache XDG_CONFIG_HOME=/tmp/pulsebeam-pnpm-config pnpm run test
+test: build
+    pnpm run test
 
 # Build the standalone, Rust-driven browser fixture.
-browser-fixture: prepare
-    PNPM_HOME=/tmp/pulsebeam-pnpm-home PNPM_STORE_DIR=/tmp/pulsebeam-pnpm-store XDG_CACHE_HOME=/tmp/pulsebeam-pnpm-cache XDG_CONFIG_HOME=/tmp/pulsebeam-pnpm-config pnpm run build:browser
+browser-fixture: build
+    pnpm run build:browser
 
 # Build a React-only consumer after preparing the local runtime and its assets.
-consumer:
-    PNPM_HOME=/tmp/pulsebeam-pnpm-home PNPM_STORE_DIR=/tmp/pulsebeam-pnpm-store XDG_CACHE_HOME=/tmp/pulsebeam-pnpm-cache XDG_CONFIG_HOME=/tmp/pulsebeam-pnpm-config pnpm run test:consumer
+consumer: build
+    pnpm run test:consumer

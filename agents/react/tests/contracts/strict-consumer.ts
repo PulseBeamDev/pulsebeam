@@ -21,7 +21,12 @@ declare const media: MediaStreamTrack;
 const config: AgentConfig = {
   endpoint: "https://pulsebeam.example",
   roomId: "standup",
-  topology: { localVideo: ["camera", "screen"], localAudio: ["mic"], remoteVideo: 9, remoteAudio: 9 },
+  topology: {
+    localVideo: ["camera", "screen"],
+    localAudio: ["mic"],
+    remoteVideo: 9,
+    remoteAudio: 9,
+  },
 };
 const agent: Agent = createAgent(config);
 const state: AgentState = {
@@ -31,7 +36,16 @@ const state: AgentState = {
     { slot: "mic", active: true },
     { slot: "screen", active: true },
   ],
-  video: [{ slot: 0, trackId: "remote-camera", height: 720, minHeight: 360, minFps: 24, priority: 1 }],
+  video: [
+    {
+      slot: 0,
+      trackId: "remote-camera",
+      height: 720,
+      minHeight: 360,
+      minFps: 24,
+      priority: 1,
+    },
+  ],
   audio: { automatic: true },
   playoutDelay: { mode: "fixed", minMs: 50, maxMs: 100 },
   topics: [

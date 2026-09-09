@@ -1,1 +1,1 @@
-globalThis.__pulsebeamPublic
+globalThis.__pulsebeamPublic;

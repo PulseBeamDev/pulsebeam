@@ -264,6 +264,7 @@ class AgentFacade implements Agent {
     });
     return this.#queueLocal(slot, async (runtime) => {
       await runtime.replace_local_track(slot, track, sender);
+      this.#requireCurrentRuntime(runtime);
       if (track) {
         this.#localTracks.set(slot, track);
       } else {
@@ -328,8 +329,12 @@ class AgentFacade implements Agent {
           throw new Error("agent is closed");
         }
         await operation(runtime);
+        this.#requireCurrentRuntime(runtime);
       })
       .catch((error: unknown) => {
+        if (this.#closed) {
+          throw new Error("agent is closed");
+        }
         if (!this.#closed && this.#snapshot.failure === null) {
           this.#emitFailure(localFailureClass(error), message(error));
         }
@@ -344,6 +349,12 @@ class AgentFacade implements Agent {
       })
       .catch(() => {});
     return current;
+  }
+
+  #requireCurrentRuntime(runtime: Runtime): void {
+    if (this.#closed || runtime !== this.#runtime) {
+      throw new Error("agent is closed");
+    }
   }
 
   #runtimeSnapshot(runtime: Runtime, raw: RuntimeSnapshot): void {

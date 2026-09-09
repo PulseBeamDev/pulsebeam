@@ -1,25 +1,300 @@
-import { StrictMode, useEffect } from "react";
+import { Component, StrictMode, useEffect, useState } from "react";
+import type { ErrorInfo, ReactNode } from "react";
 import { createRoot } from "react-dom/client";
 import { AgentProvider, useAgent } from "@pulsebeam/react";
+import type { AgentSnapshot } from "@pulsebeam/react";
 
-declare global { var __pulsebeamReactObservation: typeof observation | undefined; }
+const disconnected: AgentSnapshot = Object.freeze({
+  version: 0,
+  desiredRevision: 0,
+  connection: "disconnected",
+  generation: null,
+  participantId: null,
+  participants: [],
+  publications: [],
+  video: [],
+  audio: [],
+  tracks: {},
+  topics: {
+    publishers: [],
+    subscribers: [],
+    acceptedSends: 0,
+    droppedSends: 0,
+    deliveredMessages: 0,
+    resynchronizations: 0,
+    channelFailures: 0,
+  },
+  failure: null,
+});
 
-const disconnected = Object.freeze({ version: 0, desiredRevision: 0, connection: "disconnected", generation: null, participantId: null, participants: [], publications: [], video: [], audio: [], tracks: {}, topics: { publishers: [], subscribers: [], acceptedSends: 0, droppedSends: 0, deliveredMessages: 0, resynchronizations: 0, channelFailures: 0 }, failure: null });
+type Call = { method: string; arguments: unknown[] };
+
 class FakeAgent {
-  snapshot = disconnected; listeners = new Set<() => void>(); events = new Set<(event: unknown) => void>(); calls: string[] = []; subscriptions = 0; unsubscriptions = 0; closed = 0;
+  snapshot = disconnected;
+  listeners = new Set<() => void>();
+  events = new Set<(event: unknown) => void>();
+  calls: Call[] = [];
+  subscriptions = 0;
+  unsubscriptions = 0;
+  eventSubscriptions = 0;
+  eventUnsubscriptions = 0;
+  closed = 0;
+
   getSnapshot = () => this.snapshot;
-  subscribe = (listener: () => void) => { this.subscriptions += 1; this.listeners.add(listener); return () => { if (this.listeners.delete(listener)) this.unsubscriptions += 1; }; };
-  setState = () => { this.calls.push("state"); };
-  replaceLocalTrack = async () => { this.calls.push("replace"); };
-  setLocalMuted = async () => { this.calls.push("mute"); };
-  reconnect = () => { this.calls.push("reconnect"); };
-  sendTopic = () => { this.calls.push("topic"); };
-  subscribeEvents = (listener: (event: unknown) => void) => { this.events.add(listener); return () => this.events.delete(listener); };
-  close = () => { this.closed += 1; };
-  emit() { this.snapshot = Object.freeze({ ...disconnected, version: 1, connection: "connected" }); this.listeners.forEach((listener) => listener()); }
+
+  subscribe = (listener: () => void) => {
+    this.subscriptions += 1;
+    this.listeners.add(listener);
+    return () => {
+      if (this.listeners.delete(listener)) this.unsubscriptions += 1;
+    };
+  };
+
+  setState = (...arguments_: unknown[]) => {
+    this.calls.push({ method: "setState", arguments: arguments_ });
+  };
+
+  replaceLocalTrack = async (...arguments_: unknown[]) => {
+    this.calls.push({ method: "replaceLocalTrack", arguments: arguments_ });
+  };
+
+  setLocalMuted = async (...arguments_: unknown[]) => {
+    this.calls.push({ method: "setLocalMuted", arguments: arguments_ });
+  };
+
+  reconnect = (...arguments_: unknown[]) => {
+    this.calls.push({ method: "reconnect", arguments: arguments_ });
+  };
+
+  sendTopic = (...arguments_: unknown[]) => {
+    this.calls.push({ method: "sendTopic", arguments: arguments_ });
+  };
+
+  subscribeEvents = (listener: (event: unknown) => void) => {
+    this.eventSubscriptions += 1;
+    this.events.add(listener);
+    return () => {
+      if (this.events.delete(listener)) this.eventUnsubscriptions += 1;
+    };
+  };
+
+  close = () => {
+    this.closed += 1;
+  };
+
+  emitSame() {
+    this.listeners.forEach((listener) => listener());
+  }
+
+  emitNext(version: number) {
+    this.snapshot = Object.freeze({
+      ...disconnected,
+      version,
+      connection: "connected",
+    });
+    this.listeners.forEach((listener) => listener());
+  }
+
+  emitEvent(event: unknown) {
+    this.events.forEach((listener) => listener(event));
+  }
 }
-const first = new FakeAgent(); const second = new FakeAgent(); const observation = { snapshotIdentity: false, updates: false, forwarding: false, topicSubscription: false, replacement: false, missingProvider: false, unmount: false, callerOwned: false, strictMode: false };
-function Probe() { const agent = useAgent() as any; useEffect(() => agent.subscribeEvents(() => {}), [agent]); queueMicrotask(() => { first.emit(); observation.updates = true; observation.snapshotIdentity = true; }); return <button id="forward" onClick={() => { agent.setState({}); agent.reconnect(); agent.sendTopic("chat", "ordered", new Uint8Array([1])); observation.forwarding = true; }}>forward</button>; }
-function App() { return <StrictMode><AgentProvider agent={first as never}><Probe /></AgentProvider></StrictMode>; }
-const root = createRoot(document.getElementById("root")!); root.render(<App />);
-queueMicrotask(() => { document.getElementById("forward")?.click(); observation.topicSubscription = first.events.size > 0; observation.replacement = second !== first; observation.strictMode = first.subscriptions >= 1 && first.unsubscriptions >= 0; observation.missingProvider = true; root.unmount(); observation.unmount = first.listeners.size === 0 && first.events.size === 0; observation.callerOwned = first.closed === 0; globalThis.__pulsebeamReactObservation = observation; });
+
+const first = new FakeAgent();
+const second = new FakeAgent();
+const observation = {
+  snapshotIdentity: false,
+  updates: false,
+  forwarding: false,
+  topicSubscription: false,
+  replacement: false,
+  missingProvider: false,
+  unmount: false,
+  callerOwned: false,
+  strictMode: false,
+};
+
+declare global {
+  var __pulsebeamReactObservation: typeof observation | undefined;
+}
+
+let renders = 0;
+let current: ReturnType<typeof useAgent> | undefined;
+let receivedEvent: unknown;
+
+function Probe() {
+  const agent = useAgent();
+  renders += 1;
+  current = agent;
+  useEffect(
+    () => agent.subscribeEvents((event) => (receivedEvent = event)),
+    [agent.subscribeEvents],
+  );
+  return (
+    <button
+      id="forward"
+      onClick={() => {
+        const state = { connected: true, publications: [], video: [] };
+        const track = { id: "sentinel-track" } as MediaStreamTrack;
+        agent.setState(state);
+        void agent.replaceLocalTrack("camera", track, {
+          contentHint: "motion",
+        });
+        void agent.setLocalMuted("camera", true);
+        agent.reconnect();
+        agent.sendTopic("chat", "ordered", new Uint8Array([1, 2, 3]));
+      }}
+    >
+      forward
+    </button>
+  );
+}
+
+function App() {
+  const [agent, setAgent] = useState(first);
+  return (
+    <StrictMode>
+      <AgentProvider agent={agent as never}>
+        <Probe />
+      </AgentProvider>
+      <button id="replace" onClick={() => setAgent(second)}>
+        replace
+      </button>
+    </StrictMode>
+  );
+}
+
+let missingProviderMessage: string | undefined;
+
+class ErrorBoundary extends Component<
+  { children: ReactNode },
+  { failed: boolean }
+> {
+  state = { failed: false };
+
+  static getDerivedStateFromError() {
+    return { failed: true };
+  }
+
+  componentDidCatch(error: Error, _info: ErrorInfo) {
+    missingProviderMessage = error.message;
+  }
+
+  render() {
+    return this.state.failed ? (
+      <span id="missing-provider" />
+    ) : (
+      this.props.children
+    );
+  }
+}
+
+function MissingProviderProbe() {
+  useAgent();
+  return null;
+}
+
+const waitFor = async (condition: () => boolean) => {
+  const deadline = Date.now() + 2_000;
+  while (!condition()) {
+    if (Date.now() >= deadline)
+      throw new Error("React contract step timed out");
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+};
+
+const root = createRoot(document.getElementById("root")!);
+root.render(<App />);
+
+void (async () => {
+  await waitFor(
+    () =>
+      first.listeners.size === 1 &&
+      first.events.size === 1 &&
+      current !== undefined,
+  );
+
+  const snapshotBeforeSame = current;
+  const rendersBeforeSameSnapshot = renders;
+  first.emitSame();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  observation.snapshotIdentity =
+    Object.is(current, snapshotBeforeSame) &&
+    renders === rendersBeforeSameSnapshot;
+
+  first.emitNext(1);
+  await waitFor(() => current?.version === 1);
+  observation.updates = current?.connection === "connected";
+
+  document.getElementById("forward")!.click();
+  await waitFor(() => first.calls.length === 5);
+  const [setState, replace, mute, reconnect, topic] = first.calls;
+  observation.forwarding =
+    setState.method === "setState" &&
+    (setState.arguments[0] as { connected?: boolean }).connected === true &&
+    replace.method === "replaceLocalTrack" &&
+    replace.arguments[0] === "camera" &&
+    (replace.arguments[1] as { id?: string }).id === "sentinel-track" &&
+    (replace.arguments[2] as { contentHint?: string }).contentHint ===
+      "motion" &&
+    mute.method === "setLocalMuted" &&
+    mute.arguments[0] === "camera" &&
+    mute.arguments[1] === true &&
+    reconnect.method === "reconnect" &&
+    topic.method === "sendTopic" &&
+    topic.arguments[0] === "chat" &&
+    topic.arguments[1] === "ordered" &&
+    topic.arguments[2] instanceof Uint8Array &&
+    (topic.arguments[2] as Uint8Array).join(",") === "1,2,3";
+
+  const event = { type: "sentinel-event" };
+  first.emitEvent(event);
+  observation.topicSubscription = receivedEvent === event;
+
+  second.emitNext(2);
+  document.getElementById("replace")!.click();
+  await waitFor(
+    () =>
+      current?.version === 2 &&
+      first.listeners.size === 0 &&
+      first.events.size === 0 &&
+      second.listeners.size === 1 &&
+      second.events.size === 1,
+  );
+  observation.replacement = true;
+
+  const missingHost = document.createElement("div");
+  document.body.append(missingHost);
+  const missingRoot = createRoot(missingHost);
+  missingRoot.render(
+    <ErrorBoundary>
+      <MissingProviderProbe />
+    </ErrorBoundary>,
+  );
+  await waitFor(
+    () => missingProviderMessage === "useAgent requires AgentProvider",
+  );
+  observation.missingProvider = true;
+  missingRoot.unmount();
+  missingHost.remove();
+
+  const strictModeReplayed =
+    first.subscriptions > 1 &&
+    first.unsubscriptions > 0 &&
+    first.eventSubscriptions > 1 &&
+    first.eventUnsubscriptions > 0;
+  root.unmount();
+  observation.unmount =
+    first.listeners.size === 0 &&
+    first.events.size === 0 &&
+    second.listeners.size === 0 &&
+    second.events.size === 0;
+  observation.strictMode =
+    strictModeReplayed &&
+    first.subscriptions === first.unsubscriptions &&
+    first.eventSubscriptions === first.eventUnsubscriptions &&
+    second.subscriptions === second.unsubscriptions &&
+    second.eventSubscriptions === second.eventUnsubscriptions;
+  observation.callerOwned = first.closed === 0 && second.closed === 0;
+  globalThis.__pulsebeamReactObservation = observation;
+})();

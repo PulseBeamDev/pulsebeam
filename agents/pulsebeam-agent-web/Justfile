@@ -1,43 +1,57 @@
 set shell := ["bash", "-euc"]
-set tempdir := "/tmp"
 
 # Build the private WASM artifact and public TypeScript package.
-build:
-    PNPM_HOME=/tmp/pulsebeam-pnpm-home PNPM_STORE_DIR=/tmp/pulsebeam-pnpm-store XDG_CACHE_HOME=/tmp/pulsebeam-pnpm-cache XDG_CONFIG_HOME=/tmp/pulsebeam-pnpm-config pnpm run build
+build: prepare
+    pnpm run build
 
 # The web package owns its lockfile and install.
 prepare:
-    PNPM_HOME=/tmp/pulsebeam-pnpm-home PNPM_STORE_DIR=/tmp/pulsebeam-pnpm-store XDG_CACHE_HOME=/tmp/pulsebeam-pnpm-cache XDG_CONFIG_HOME=/tmp/pulsebeam-pnpm-config pnpm install --frozen-lockfile --ignore-scripts
+    pnpm install --frozen-lockfile --ignore-scripts
+
+# Format handwritten TypeScript and JavaScript sources.
+fix: prepare
+    pnpm run format
+
+format-check: prepare
+    pnpm run format:check
 
 # Regenerate the UniFFI web proof and its WASM package.
 uniffi-generate:
-    PNPM_HOME=/tmp/pulsebeam-pnpm-home PNPM_STORE_DIR=/tmp/pulsebeam-pnpm-store XDG_CACHE_HOME=/tmp/pulsebeam-pnpm-cache XDG_CONFIG_HOME=/tmp/pulsebeam-pnpm-config pnpm run build:uniffi
-    PNPM_HOME=/tmp/pulsebeam-pnpm-home PNPM_STORE_DIR=/tmp/pulsebeam-pnpm-store XDG_CACHE_HOME=/tmp/pulsebeam-pnpm-cache XDG_CONFIG_HOME=/tmp/pulsebeam-pnpm-config pnpm exec prettier --write "generated/**/*.ts"
+    pnpm run build:uniffi
+    pnpm exec prettier --write "generated/**/*.ts"
 
 # Transpile generated bindings for the Rust-authored browser proof.
 uniffi-browser-build: uniffi-generate
-    PNPM_HOME=/tmp/pulsebeam-pnpm-home PNPM_STORE_DIR=/tmp/pulsebeam-pnpm-store XDG_CACHE_HOME=/tmp/pulsebeam-pnpm-cache XDG_CONFIG_HOME=/tmp/pulsebeam-pnpm-config pnpm exec tsc -p tsconfig.uniffi.browser.json
+    pnpm exec tsc -p tsconfig.uniffi.browser.json
     mkdir -p dist/uniffi-proof/generated/bindings/wasm-bindgen
     cp generated/bindings/wasm-bindgen/index_bg.wasm dist/uniffi-proof/generated/bindings/wasm-bindgen/index_bg.wasm
 
 # Regenerate and reject checked-in binding drift.
 uniffi-check: uniffi-generate
-    PNPM_HOME=/tmp/pulsebeam-pnpm-home PNPM_STORE_DIR=/tmp/pulsebeam-pnpm-store XDG_CACHE_HOME=/tmp/pulsebeam-pnpm-cache XDG_CONFIG_HOME=/tmp/pulsebeam-pnpm-config pnpm exec tsc -p tsconfig.uniffi.json
+    pnpm exec tsc -p tsconfig.uniffi.json
     cargo test -p pulsebeam-agent-web --test uniffi_contract
     git diff --exit-code -- generated
 
 # Check Rust/WASM and the handwritten TypeScript boundary.
-check:
+check: format-check
     cargo check -p pulsebeam-agent-web --target wasm32-unknown-unknown
-    PNPM_HOME=/tmp/pulsebeam-pnpm-home PNPM_STORE_DIR=/tmp/pulsebeam-pnpm-store XDG_CACHE_HOME=/tmp/pulsebeam-pnpm-cache XDG_CONFIG_HOME=/tmp/pulsebeam-pnpm-config pnpm run check
+    pnpm run check
 
 # Run deterministic host-boundary tests. Browser contracts are opt-in.
 test: build uniffi-browser-build
     cargo test -p pulsebeam-agent-web
 
-browser: build uniffi-browser-build
+# Build every Web-owned browser artifact without running Chrome.
+browser-fixture: build uniffi-browser-build
+
+browser: browser-fixture
+    cargo test -p pulsebeam-agent-web --features browser-tests --test browser -- --test-threads=1
+
+# Run already-built browser artifacts. Root orchestration uses this after the
+# React fixture records the final Web package build.
+browser-run:
     cargo test -p pulsebeam-agent-web --features browser-tests --test browser -- --test-threads=1
 
 # Serve the generated package and local example.
-serve:
+dev: build
     python3 -m http.server 4173 --bind 127.0.0.1

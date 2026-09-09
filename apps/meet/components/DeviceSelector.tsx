@@ -9,7 +9,7 @@ export function DeviceSelector({
   label,
   value,
   devices,
-  onValueChange
+  onValueChange,
 }: DeviceSelectorProps) {
   return (
     <div className="space-y-2">
@@ -38,4 +38,3 @@ export function DeviceSelector({
     </div>
   );
 }
-

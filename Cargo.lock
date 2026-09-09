@@ -3294,6 +3294,7 @@ dependencies = [
 name = "pulsebeam-agent-web"
 version = "0.1.0"
 dependencies = [
+ "futures-channel",
  "js-sys",
  "log",
  "pulsebeam-agent-core",

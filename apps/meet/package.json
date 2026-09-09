@@ -4,9 +4,11 @@
   "version": "0.1.1",
   "scripts": {
     "dev": "next dev",
-    "build": "just --justfile ../../agents/react/Justfile build && next build && pnpm run artifact",
+    "build": "next build && pnpm run artifact",
     "start": "serve out",
     "check": "pnpm run boundary && tsc --noEmit && eslint",
+    "format": "prettier --write \"app/**/*.{css,ts,tsx}\" \"components/**/*.{ts,tsx}\" \"hooks/**/*.ts\" \"lib/**/*.ts\" \"scripts/**/*.mjs\" \"*.{json,mjs,ts}\"",
+    "format:check": "prettier --check \"app/**/*.{css,ts,tsx}\" \"components/**/*.{ts,tsx}\" \"hooks/**/*.ts\" \"lib/**/*.ts\" \"scripts/**/*.mjs\" \"*.{json,mjs,ts}\"",
     "boundary": "node scripts/check-boundary.mjs",
     "artifact": "node scripts/check-artifact.mjs"
   },
@@ -25,6 +27,7 @@
     "@types/react-dom": "^19",
     "eslint": "^9",
     "eslint-config-next": "16.1.6",
+    "prettier": "3.6.2",
     "tailwindcss": "^4",
     "typescript": "^5"
   }

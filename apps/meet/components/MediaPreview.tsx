@@ -17,7 +17,7 @@ export function MediaPreview({
   isMicOn,
   onToggleCam,
   onToggleMic,
-  hasStream
+  hasStream,
 }: MediaPreviewProps) {
   return (
     <div className="space-y-4">
@@ -50,7 +50,11 @@ export function MediaPreview({
             className="h-11 w-11 rounded-full shadow-lg transition-transform hover:scale-105 sm:h-12 sm:w-12"
             onClick={onToggleMic}
           >
-            {isMicOn ? <Mic className="w-5 h-5" /> : <MicOff className="w-5 h-5" />}
+            {isMicOn ? (
+              <Mic className="w-5 h-5" />
+            ) : (
+              <MicOff className="w-5 h-5" />
+            )}
           </Button>
 
           <Button
@@ -60,11 +64,14 @@ export function MediaPreview({
             className="h-11 w-11 rounded-full shadow-lg transition-transform hover:scale-105 sm:h-12 sm:w-12"
             onClick={onToggleCam}
           >
-            {isCamOn ? <VideoIcon className="w-5 h-5" /> : <VideoOff className="w-5 h-5" />}
+            {isCamOn ? (
+              <VideoIcon className="w-5 h-5" />
+            ) : (
+              <VideoOff className="w-5 h-5" />
+            )}
           </Button>
         </div>
       </div>
     </div>
   );
 }
-

@@ -1,13 +1,11 @@
 set shell := ["bash", "-euc"]
-set tempdir := "/tmp"
 
 default:
     @just --list
 
-# Prepare local JavaScript packages in direct-dependency order.  A writable
-# transient pnpm state keeps frozen installs independent of host caches.
+# Prepare local JavaScript packages in direct-dependency order.
 prepare:
-    PNPM_HOME=/tmp/pulsebeam-pnpm-home PNPM_STORE_DIR=/tmp/pulsebeam-pnpm-store XDG_CACHE_HOME=/tmp/pulsebeam-pnpm-cache XDG_CONFIG_HOME=/tmp/pulsebeam-pnpm-config just --justfile apps/meet/Justfile prepare
+    just --justfile apps/meet/Justfile prepare
 
 # Run every static workspace gate.
 check:
@@ -25,6 +23,9 @@ check:
 fix:
     cargo fmt --all
     cargo clippy --fix --allow-dirty --allow-staged --all-targets --workspace --features pulsebeam/sim
+    just --justfile agents/pulsebeam-agent-web/Justfile fix
+    just --justfile agents/react/Justfile fix
+    just --justfile apps/meet/Justfile fix
 
 # Run workspace unit tests and deterministic simulation plans.
 test:
@@ -37,13 +38,17 @@ test:
 # Build browser fixtures in package ownership order, then run every Rust-owned
 # BiDi contract serially. This intentionally fails when Chrome is unavailable.
 browser: prepare
+    just --justfile agents/pulsebeam-agent-web/Justfile browser-fixture
     just --justfile agents/react/Justfile browser-fixture
-    just --justfile agents/pulsebeam-agent-web/Justfile browser
+    just --justfile agents/pulsebeam-agent-web/Justfile browser-run
 
 # Build the static Meet export.
 meet-build:
-    just prepare
     just --justfile apps/meet/Justfile build
+
+# Build local packages and start the Meet development server.
+dev:
+    just --justfile apps/meet/Justfile dev
 
 # Build, load, and attach the eBPF steering programs.
 ebpf:

@@ -15,6 +15,7 @@ crate-type = ["cdylib", "rlib", "staticlib"]
 
 [dependencies]
 agent_core = { package = "pulsebeam-agent-core", version = "0.1.0", path = "../pulsebeam-agent-core" }
+futures-channel = "0.3.33"
 js-sys = "0.3.104"
 spin = "0.10.0"
 log = "0.4"

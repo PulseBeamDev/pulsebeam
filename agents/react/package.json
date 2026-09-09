@@ -6,7 +6,10 @@
     "url": "https://github.com/PulseBeamDev/pulsebeam.git"
   },
   "type": "module",
-  "files": ["dist/**/*.js", "dist/**/*.d.ts"],
+  "files": [
+    "dist/**/*.js",
+    "dist/**/*.d.ts"
+  ],
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
@@ -14,12 +17,13 @@
     }
   },
   "scripts": {
-    "build:web": "just --justfile ../pulsebeam-agent-web/Justfile build",
-    "build": "pnpm run build:web && tsc -p tsconfig.json",
-    "check": "pnpm run build:web && tsc -p tsconfig.json --noEmit && tsc -p tsconfig.contracts.json",
+    "build": "tsc -p tsconfig.json",
+    "check": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.contracts.json && tsc -p tsconfig.browser.json",
+    "format": "prettier --write \"src/**/*.ts\" \"tests/browser/{build.mjs,fixture.tsx,observe.js}\" \"tests/contracts/**/*.ts\" \"tests/consumer/src/**/*.ts\" \"*.json\"",
+    "format:check": "prettier --check \"src/**/*.ts\" \"tests/browser/{build.mjs,fixture.tsx,observe.js}\" \"tests/contracts/**/*.ts\" \"tests/consumer/src/**/*.ts\" \"*.json\"",
     "test": "pnpm run test:consumer",
-    "build:browser": "pnpm run build && node tests/browser/build.mjs",
-    "test:consumer": "rm -rf ../pulsebeam-agent-web/dist && pnpm run build && pnpm --dir tests/consumer install --offline --frozen-lockfile && pnpm --dir tests/consumer run check"
+    "build:browser": "node tests/browser/build.mjs",
+    "test:consumer": "pnpm --dir tests/consumer install --offline --frozen-lockfile && pnpm --dir tests/consumer run check"
   },
   "dependencies": {
     "@pulsebeam/web": "^0.1.0"
@@ -29,6 +33,8 @@
   },
   "devDependencies": {
     "@types/react": "^18.3.24",
+    "@types/react-dom": "^18.3.7",
+    "prettier": "3.6.2",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "esbuild": "^0.25.0",

@@ -1,1 +1,6 @@
-new Promise((resolve) => setTimeout(() => resolve(globalThis.__pulsebeamUnhandledRejections.length), 20))
+new Promise((resolve) =>
+  setTimeout(
+    () => resolve(globalThis.__pulsebeamUnhandledRejections.length),
+    20,
+  ),
+);

@@ -14,6 +14,7 @@ use agent_core::{
     TopicNotification, TopicPublisher, TopicRegistrations, TopicSend, TopicSubscriber,
     VideoSubscription,
 };
+use futures_channel::oneshot;
 use js_sys::{Array, Function, Object, Reflect, Uint8Array};
 use serde::Deserialize;
 use wasm_bindgen::{JsCast, JsValue, closure::Closure, prelude::wasm_bindgen};
@@ -355,6 +356,7 @@ impl Host for BrowserHost {
 struct RuntimeInner {
     actor: RefCell<Option<ActorHandle>>,
     local_slots: BTreeMap<String, MediaKind>,
+    local_operation_gates: BTreeMap<String, LocalOperationGate>,
     local_tracks: RefCell<BTreeMap<String, LocalTrackState>>,
     peers: RefCell<BTreeMap<u64, Peer>>,
     requests: RefCell<BTreeMap<u64, AbortController>>,
@@ -363,7 +365,36 @@ struct RuntimeInner {
     event_listener: RefCell<Option<Function>>,
     error_listener: RefCell<Option<Function>>,
     last_error: RefCell<Option<String>>,
+    closing: Cell<bool>,
     closed: Cell<bool>,
+}
+
+#[derive(Default)]
+struct LocalOperationGate {
+    tail: RefCell<Option<oneshot::Receiver<()>>>,
+}
+
+impl LocalOperationGate {
+    async fn enter(&self) -> LocalOperationPermit {
+        let (done, next) = oneshot::channel();
+        let previous = self.tail.replace(Some(next));
+        if let Some(previous) = previous {
+            let _ = previous.await;
+        }
+        LocalOperationPermit { done: Some(done) }
+    }
+}
+
+struct LocalOperationPermit {
+    done: Option<oneshot::Sender<()>>,
+}
+
+impl Drop for LocalOperationPermit {
+    fn drop(&mut self) {
+        if let Some(done) = self.done.take() {
+            let _ = done.send(());
+        }
+    }
 }
 
 #[wasm_bindgen]
@@ -388,7 +419,7 @@ impl BrowserRuntime {
             remote_video: config.topology.remote_video,
             remote_audio: config.topology.remote_audio,
         };
-        let local_slots = topology
+        let local_slots: BTreeMap<String, MediaKind> = topology
             .local_video
             .iter()
             .cloned()
@@ -401,6 +432,11 @@ impl BrowserRuntime {
                     .map(|slot| (slot, MediaKind::Audio)),
             )
             .collect();
+        let local_operation_gates = local_slots
+            .keys()
+            .cloned()
+            .map(|slot| (slot, LocalOperationGate::default()))
+            .collect();
         let core_config = AgentConfig {
             endpoint: config.endpoint,
             room_id: config.room_id,
@@ -412,6 +448,7 @@ impl BrowserRuntime {
         let inner = Rc::new(RuntimeInner {
             actor: RefCell::new(None),
             local_slots,
+            local_operation_gates,
             local_tracks: RefCell::new(BTreeMap::new()),
             peers: RefCell::new(BTreeMap::new()),
             requests: RefCell::new(BTreeMap::new()),
@@ -420,6 +457,7 @@ impl BrowserRuntime {
             event_listener: RefCell::new(None),
             error_listener: RefCell::new(None),
             last_error: RefCell::new(None),
+            closing: Cell::new(false),
             closed: Cell::new(false),
         });
         let actor = spawn_actor(core_config, BrowserHost::new(&inner))
@@ -467,18 +505,16 @@ impl BrowserRuntime {
             LocalOperationError::validation(format!("invalid sender configuration: {error}"))
                 .into_js()
         })?;
-        self.inner
-            .replace_local_track(slot, track, config)
-            .await
-            .map_err(LocalOperationError::into_js)
+        let result = self.inner.replace_local_track(slot, track, config).await;
+        self.inner.ensure_open()?;
+        result.map_err(LocalOperationError::into_js)
     }
 
     pub async fn set_local_muted(&self, slot: String, muted: bool) -> Result<(), JsValue> {
         self.inner.ensure_open()?;
-        self.inner
-            .set_local_muted(slot, muted)
-            .await
-            .map_err(LocalOperationError::into_js)
+        let result = self.inner.set_local_muted(slot, muted).await;
+        self.inner.ensure_open()?;
+        result.map_err(LocalOperationError::into_js)
     }
 
     pub fn remote_track(&self, mid: &str) -> Option<MediaStreamTrack> {
@@ -531,7 +567,7 @@ impl BrowserRuntime {
     }
 
     pub fn close(&self) {
-        if self.inner.closed.get() {
+        if self.inner.is_closed() {
             return;
         }
         self.inner.request_close();
@@ -550,7 +586,7 @@ impl BrowserRuntime {
         set(&value, "peers", self.inner.peers.borrow().len());
         set(&value, "requests", self.inner.requests.borrow().len());
         set(&value, "timers", self.inner.timers.borrow().len());
-        set(&value, "closed", self.inner.closed.get());
+        set(&value, "closed", self.inner.is_closed());
         set(&value, "lastError", self.inner.last_error.borrow().clone());
         value.into()
     }
@@ -563,9 +599,21 @@ impl Drop for BrowserRuntime {
 }
 
 impl RuntimeInner {
+    fn is_closed(&self) -> bool {
+        self.closing.get() || self.closed.get()
+    }
+
     fn ensure_open(&self) -> Result<(), JsValue> {
-        if self.closed.get() {
+        if self.is_closed() {
             Err(js_error("browser runtime is closed"))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn ensure_local_operation_open(&self) -> Result<(), LocalOperationError> {
+        if self.is_closed() {
+            Err(LocalOperationError::runtime("browser runtime is closed"))
         } else {
             Ok(())
         }
@@ -606,6 +654,7 @@ impl RuntimeInner {
     }
 
     fn request_close(&self) {
+        self.closing.set(true);
         let actor = self.actor.borrow();
         let Some(actor) = actor.as_ref() else {
             return;
@@ -616,6 +665,7 @@ impl RuntimeInner {
     }
 
     fn request_abort(&self) {
+        self.closing.set(true);
         let actor = self.actor.borrow();
         let Some(actor) = actor.as_ref() else {
             self.shutdown();
@@ -643,6 +693,13 @@ impl RuntimeInner {
         let kind = self.local_slots.get(&slot).copied().ok_or_else(|| {
             LocalOperationError::validation(format!("unknown local publication slot: {slot}"))
         })?;
+        let gate = self.local_operation_gates.get(&slot).ok_or_else(|| {
+            LocalOperationError::runtime(format!(
+                "local publication slot has no operation gate: {slot}"
+            ))
+        })?;
+        let _permit = gate.enter().await;
+        self.ensure_local_operation_open()?;
         if let Some(track) = &track {
             let config =
                 normalize_sender_config(kind, config).map_err(LocalOperationError::validation)?;
@@ -678,7 +735,8 @@ impl RuntimeInner {
         }
         self.sync_local_slot(&slot)
             .await
-            .map_err(LocalOperationError::runtime)
+            .map_err(LocalOperationError::runtime)?;
+        self.ensure_local_operation_open()
     }
 
     async fn set_local_muted(
@@ -686,6 +744,11 @@ impl RuntimeInner {
         slot: String,
         muted: bool,
     ) -> Result<(), LocalOperationError> {
+        let gate = self.local_operation_gates.get(&slot).ok_or_else(|| {
+            LocalOperationError::validation(format!("unknown local publication slot: {slot}"))
+        })?;
+        let _permit = gate.enter().await;
+        self.ensure_local_operation_open()?;
         let track = {
             let mut tracks = self.local_tracks.borrow_mut();
             let state = tracks.get_mut(&slot).ok_or_else(|| {
@@ -702,7 +765,8 @@ impl RuntimeInner {
         track.set_enabled(!muted);
         self.sync_local_slot(&slot)
             .await
-            .map_err(LocalOperationError::runtime)
+            .map_err(LocalOperationError::runtime)?;
+        self.ensure_local_operation_open()
     }
 
     async fn sync_local_slot(&self, slot: &str) -> Result<(), String> {
@@ -728,6 +792,17 @@ impl RuntimeInner {
     async fn prepare_peer(self: &Rc<Self>, generation: Generation) {
         let slots: Vec<String> = self.local_slots.keys().cloned().collect();
         for slot in slots {
+            let Some(gate) = self.local_operation_gates.get(&slot) else {
+                self.rtc_failed(
+                    generation,
+                    format!("local publication slot has no operation gate: {slot}"),
+                );
+                return;
+            };
+            let _permit = gate.enter().await;
+            if self.is_closed() {
+                return;
+            }
             if let Err(error) = self.sync_local_slot(&slot).await {
                 self.rtc_failed(generation, error);
                 return;
@@ -1374,6 +1449,7 @@ impl RuntimeInner {
     }
 
     fn shutdown(&self) {
+        self.closing.set(true);
         if self.closed.replace(true) {
             return;
         }
