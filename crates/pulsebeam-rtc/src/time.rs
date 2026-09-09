@@ -36,7 +36,7 @@ impl GlobalMediaTime {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TimePoint {
     pub monotonic: Instant,
     pub global: GlobalMediaTime,

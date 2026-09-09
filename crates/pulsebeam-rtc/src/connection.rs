@@ -11,6 +11,7 @@ use sha2::{Digest, Sha256};
 use crate::{
     AcceptError, CloseReason, ConnectionConfig, ConnectionEntropy, ConnectionWarning, Event,
     NetworkInput, Output, ReceiveError, SdpAnswer, SdpOffer, SessionInfo, TimePoint, Transmit,
+    ingress::IngressOwner,
     negotiation::{self, NegotiatedSessionFacts},
     time::MonotonicObserver,
     transport::{PreparedTransmit, Transport, TransportError, TransportEvent, TransportState},
@@ -33,6 +34,7 @@ pub struct Connection {
 )]
 struct SubsystemSlots {
     transport: Transport,
+    ingress: IngressOwner,
 }
 
 trait RuntimeSubsystem: Send {
@@ -42,7 +44,7 @@ trait RuntimeSubsystem: Send {
 }
 
 struct Runtime {
-    ingress: IngressQueues,
+    data: VecDeque<Vec<u8>>,
     feedback: Option<Box<dyn RuntimeSubsystem>>,
     controller: Option<Box<dyn RuntimeSubsystem>>,
     scheduler: Option<Box<dyn RuntimeSubsystem>>,
@@ -54,7 +56,7 @@ struct Runtime {
 impl Runtime {
     fn new() -> Self {
         Self {
-            ingress: IngressQueues::default(),
+            data: VecDeque::new(),
             feedback: None,
             controller: None,
             scheduler: None,
@@ -90,21 +92,6 @@ impl Runtime {
     }
 }
 
-#[derive(Default)]
-struct IngressQueues {
-    rtp: VecDeque<Vec<u8>>,
-    rtcp: VecDeque<Vec<u8>>,
-    data: VecDeque<Vec<u8>>,
-}
-
-impl IngressQueues {
-    fn push(queue: &mut VecDeque<Vec<u8>>, bytes: Vec<u8>) {
-        if queue.len() < MAX_INGRESS_PACKETS {
-            queue.push_back(bytes);
-        }
-    }
-}
-
 struct CommitCoordinator;
 
 impl CommitCoordinator {
@@ -133,7 +120,7 @@ impl Connection {
         let at = self._time.observe(at);
         self._subsystems
             .transport
-            .receive(at.monotonic, input)
+            .receive_at(at, input)
             .map_err(|error| match error {
                 crate::transport::TransportError::Closed => ReceiveError::Closed,
                 crate::transport::TransportError::QueueFull => ReceiveError::InputLimitExceeded,
@@ -165,6 +152,10 @@ impl Connection {
             && let Some(output) = self.handle_transport_event(event)
         {
             return output;
+        }
+
+        if let Some(event) = self._subsystems.ingress.poll_event() {
+            return Output::Event(event);
         }
 
         if !self.runtime.closed
@@ -204,16 +195,22 @@ impl Connection {
                 Some(Output::Closed(CloseReason::TransportFailure))
             }
             TransportEvent::StateChanged(_) | TransportEvent::IceStateChanged(_) => None,
-            TransportEvent::Rtp { bytes, metadata: _ } => {
-                IngressQueues::push(&mut self.runtime.ingress.rtp, bytes);
-                None
+            TransportEvent::Rtp {
+                arrival,
+                bytes,
+                metadata: _,
+            } => {
+                self._subsystems.ingress.accept_rtp(arrival, bytes);
+                self._subsystems.ingress.poll_event().map(Output::Event)
             }
-            TransportEvent::Rtcp(bytes) => {
-                IngressQueues::push(&mut self.runtime.ingress.rtcp, bytes);
+            TransportEvent::Rtcp { arrival, bytes } => {
+                self._subsystems.ingress.retain_rtcp(arrival, bytes);
                 None
             }
             TransportEvent::Data(bytes) => {
-                IngressQueues::push(&mut self.runtime.ingress.data, bytes);
+                if self.runtime.data.len() < MAX_INGRESS_PACKETS {
+                    self.runtime.data.push_back(bytes);
+                }
                 None
             }
             TransportEvent::Closed => {
@@ -237,11 +234,16 @@ impl Connection {
         let session = negotiated.session.clone();
         let transport = Transport::from_session(&negotiated.facts, at.monotonic)
             .map_err(|_| AcceptError::CryptographicFailure)?;
+        let ingress = IngressOwner::new(
+            negotiated.facts.ingress_media(),
+            config.limits.max_unsignaled_encodings,
+            config.limits.max_queued_media_bytes,
+        );
         let connection = Self {
             _config: config,
             _session: negotiated.facts,
             _time: MonotonicObserver::starting_at(at),
-            _subsystems: SubsystemSlots { transport },
+            _subsystems: SubsystemSlots { transport, ingress },
             runtime: Runtime::new(),
             _not_sync: PhantomData,
         };

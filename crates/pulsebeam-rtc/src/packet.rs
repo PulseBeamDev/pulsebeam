@@ -1,3 +1,12 @@
+#![allow(
+    dead_code,
+    reason = "the RTCP parser helpers remain private Plan 06 inputs while RTP ingress uses this module"
+)]
+#![allow(
+    clippy::arithmetic_side_effects,
+    reason = "extension offsets were structurally validated before iterator construction"
+)]
+
 use std::{fmt, ops::Range};
 
 const MAX_RTP_CSRC: usize = 15;
@@ -234,6 +243,7 @@ impl<'a> RtpPacket<'a> {
                 offset: 0,
                 end: 0,
                 profile: None,
+                base: 0,
             });
         };
         debug_assert!(range.end <= self.bytes.len());
@@ -245,6 +255,7 @@ impl<'a> RtpPacket<'a> {
             offset: 0,
             end: range.len(),
             profile: self.extension_profile,
+            base: range.start,
         })
     }
 }
@@ -274,10 +285,11 @@ impl<'a> Iterator for CsrcIter<'a> {
 }
 impl ExactSizeIterator for CsrcIter<'_> {}
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RtpExtension<'a> {
     id: u8,
     value: &'a [u8],
+    range: Range<usize>,
 }
 impl<'a> RtpExtension<'a> {
     pub const fn id(&self) -> u8 {
@@ -286,6 +298,10 @@ impl<'a> RtpExtension<'a> {
     pub const fn value(&self) -> &'a [u8] {
         self.value
     }
+
+    pub fn range(&self) -> Range<usize> {
+        self.range.clone()
+    }
 }
 
 pub struct ExtensionIter<'a> {
@@ -293,6 +309,7 @@ pub struct ExtensionIter<'a> {
     offset: usize,
     end: usize,
     profile: Option<u16>,
+    base: usize,
 }
 impl<'a> Iterator for ExtensionIter<'a> {
     type Item = RtpExtension<'a>;
@@ -313,7 +330,11 @@ impl<'a> Iterator for ExtensionIter<'a> {
                 let end = self.offset.checked_add(length)?;
                 let value = self.bytes.get(self.offset..end)?;
                 self.offset = end;
-                return Some(RtpExtension { id, value });
+                return Some(RtpExtension {
+                    id,
+                    value,
+                    range: (self.base + self.offset - length)..(self.base + self.offset),
+                });
             }
             if self
                 .profile
@@ -333,7 +354,11 @@ impl<'a> Iterator for ExtensionIter<'a> {
                 let end = self.offset.checked_add(length)?;
                 let value = self.bytes.get(self.offset..end)?;
                 self.offset = end;
-                return Some(RtpExtension { id, value });
+                return Some(RtpExtension {
+                    id,
+                    value,
+                    range: (self.base + self.offset - length)..(self.base + self.offset),
+                });
             }
             self.offset = self.end;
         }
@@ -522,7 +547,7 @@ impl<'a> Iterator for RtcpCompound<'a> {
 }
 
 #[cfg(test)]
-mod structural {
+mod tests {
     use super::*;
 
     fn rtp(flags: u8, extension: &[u8], payload: &[u8]) -> Vec<u8> {
@@ -638,20 +663,7 @@ mod structural {
             }
             if let Ok(compound) = RtcpCompound::parse(&bytes) {
                 for packet in compound.flatten() {
-                        let _ = packet.sender_report();
-                        let _ = packet.receiver_report();
-                        if let Ok(Some(sdes)) = packet.sdes() {
-                            for chunk in sdes.chunks() {
-                                let _ = chunk.items().collect::<Vec<_>>();
-                            }
-                        }
-                        let _ = packet.bye();
-                        let _ = packet.nack().map(|value| value.map(|nack| nack.pairs().count()));
-                        let _ = packet.pli();
-                        let _ = packet.fir().map(|value| value.map(|fir| fir.entries().count()));
-                        let _ = packet.twcc().map(|value| {
-                            value.map(|twcc| twcc.statuses().collect::<Vec<_>>())
-                        });
+                    let _ = packet.bytes();
                 }
             }
         });

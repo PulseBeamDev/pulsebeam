@@ -17,7 +17,7 @@ use str0m::crypto::Fingerprint;
 use str0m::crypto::dtls::DtlsCert;
 
 use crate::negotiation::{DtlsRole, NegotiatedSessionFacts};
-use crate::{IceTcpFlowId, NetworkInput, TransmitTarget};
+use crate::{GlobalMediaTime, IceTcpFlowId, NetworkInput, TimePoint, TransmitTarget};
 
 use srtp::{RtpMetadata, SrtpError};
 
@@ -50,10 +50,14 @@ pub(crate) enum TransportEvent {
     StateChanged(TransportState),
     IceStateChanged(IceConnectionState),
     Rtp {
+        arrival: TimePoint,
         bytes: Vec<u8>,
         metadata: RtpMetadata,
     },
-    Rtcp(Vec<u8>),
+    Rtcp {
+        arrival: TimePoint,
+        bytes: Vec<u8>,
+    },
     Data(Vec<u8>),
     Closed,
 }
@@ -461,6 +465,10 @@ impl Transport {
     ) -> Result<(), TransportError> {
         self.handle_envelope(
             now,
+            TimePoint {
+                monotonic: now,
+                global: GlobalMediaTime::from_micros(0),
+            },
             SelectedPath(NetworkEnvelope::Udp {
                 local: destination,
                 remote: source,
@@ -472,6 +480,7 @@ impl Transport {
     fn handle_envelope(
         &mut self,
         now: Instant,
+        arrival: TimePoint,
         path: SelectedPath,
         bytes: Vec<u8>,
     ) -> Result<(), TransportError> {
@@ -530,7 +539,11 @@ impl Transport {
                     DatagramKind::Rtp => match srtp.unprotect_rtp(&bytes) {
                         Ok((bytes, metadata)) => {
                             if self.accepts_payload_type(metadata.payload_type) {
-                                self.push_event(TransportEvent::Rtp { bytes, metadata })?;
+                                self.push_event(TransportEvent::Rtp {
+                                    arrival,
+                                    bytes,
+                                    metadata,
+                                })?;
                             }
                         }
                         Err(SrtpError::Replay | SrtpError::InvalidPacket) => self.drop_input(),
@@ -540,7 +553,7 @@ impl Transport {
                         }
                     },
                     DatagramKind::Rtcp => match srtp.unprotect_rtcp(&bytes) {
-                        Ok(bytes) => self.push_event(TransportEvent::Rtcp(bytes))?,
+                        Ok(bytes) => self.push_event(TransportEvent::Rtcp { arrival, bytes })?,
                         Err(SrtpError::Replay | SrtpError::InvalidPacket) => self.drop_input(),
                         Err(SrtpError::Crypto) => self.fail(TransportError::Crypto)?,
                         Err(SrtpError::OutputFull | SrtpError::UnsupportedProfile) => {
@@ -557,6 +570,20 @@ impl Transport {
     pub(crate) fn receive(
         &mut self,
         now: Instant,
+        input: NetworkInput,
+    ) -> Result<(), TransportError> {
+        self.receive_at(
+            TimePoint {
+                monotonic: now,
+                global: GlobalMediaTime::from_micros(0),
+            },
+            input,
+        )
+    }
+
+    pub(crate) fn receive_at(
+        &mut self,
+        arrival: TimePoint,
         input: NetworkInput,
     ) -> Result<(), TransportError> {
         let (envelope, bytes) = match input {
@@ -587,13 +614,11 @@ impl Transport {
                         self.drop_input();
                         return Ok(());
                     }
-                    Some(_) => {}
-                    None => {
-                        if self.tcp_flows.len() >= MAX_TCP_FLOWS {
-                            self.drop_input();
-                            return Ok(());
-                        }
+                    None if self.tcp_flows.len() >= MAX_TCP_FLOWS => {
+                        self.drop_input();
+                        return Ok(());
                     }
+                    Some(_) | None => {}
                 }
                 (
                     NetworkEnvelope::IceTcp {
@@ -605,7 +630,7 @@ impl Transport {
                 )
             }
         };
-        self.handle_envelope(now, SelectedPath(envelope), bytes)
+        self.handle_envelope(arrival.monotonic, arrival, SelectedPath(envelope), bytes)
     }
 
     fn local_candidates_contains(&self, address: SocketAddr, proto: is::Protocol) -> bool {
@@ -1583,7 +1608,10 @@ mod tests {
         let event = std::iter::from_fn(|| right.poll_event())
             .find(|event| matches!(event, TransportEvent::Rtp { .. }))
             .expect("authenticated RTP event");
-        if let TransportEvent::Rtp { bytes, metadata } = event {
+        if let TransportEvent::Rtp {
+            bytes, metadata, ..
+        } = event
+        {
             assert_eq!(bytes, rtp);
             assert_eq!(metadata.ssrc, 7);
         }
@@ -1598,7 +1626,7 @@ mod tests {
             .handle_datagram(now, transmit.source, transmit.destination, transmit.bytes)
             .expect("right handles padded RTP");
         assert!(std::iter::from_fn(|| right.poll_event()).any(
-            |event| matches!(event, TransportEvent::Rtp { bytes, metadata } if bytes == padded_rtp && metadata.ssrc == 8)
+            |event| matches!(event, TransportEvent::Rtp { bytes, metadata, .. } if bytes == padded_rtp && metadata.ssrc == 8)
         ));
 
         let mut wrapped_rtp = padded_rtp;
@@ -1621,7 +1649,7 @@ mod tests {
             .expect("right handles RTCP");
         assert!(
             std::iter::from_fn(|| right.poll_event())
-                .any(|event| matches!(event, TransportEvent::Rtcp(value) if value == rtcp))
+                .any(|event| matches!(event, TransportEvent::Rtcp { bytes, .. } if bytes == rtcp))
         );
 
         rtp[3] = 1;

@@ -61,6 +61,53 @@ pub(crate) struct NegotiatedSessionFacts {
     accepted_at: TimePoint,
 }
 
+pub(crate) struct IngressMediaFacts {
+    pub(crate) kind: crate::MediaKind,
+    pub(crate) mid: Box<str>,
+    pub(crate) payloads: Box<[(u8, u32)]>,
+    pub(crate) ssrcs: Box<[u32]>,
+    pub(crate) rids: Box<[Box<str>]>,
+    pub(crate) extensions: Box<[(u8, Box<str>)]>,
+}
+
+impl NegotiatedSessionFacts {
+    pub(crate) fn ingress_media(&self) -> Box<[IngressMediaFacts]> {
+        self.media
+            .iter()
+            .filter(|section| section.direction.allows_receive())
+            .filter_map(|section| {
+                let kind = match section.kind {
+                    SectionKind::Audio => crate::MediaKind::Audio,
+                    SectionKind::Video => crate::MediaKind::Video,
+                    SectionKind::Application => return None,
+                };
+                Some(IngressMediaFacts {
+                    kind,
+                    mid: section.mid.clone().into_boxed_str(),
+                    payloads: section
+                        .codecs
+                        .iter()
+                        .map(|codec| (codec.payload_type, codec.clock_rate))
+                        .collect(),
+                    ssrcs: section.ssrcs.clone(),
+                    rids: section
+                        .rids
+                        .iter()
+                        .cloned()
+                        .map(String::into_boxed_str)
+                        .collect(),
+                    extensions: section
+                        .extensions
+                        .iter()
+                        .filter(|extension| extension.direction.allows_receive())
+                        .map(|extension| (extension.id, extension.uri.clone().into_boxed_str()))
+                        .collect(),
+                })
+            })
+            .collect()
+    }
+}
+
 pub(crate) struct IceCredentials {
     pub(crate) ufrag: String,
     pub(crate) password: String,
@@ -88,6 +135,10 @@ enum Direction {
 impl Direction {
     const fn allows_send(self) -> bool {
         matches!(self, Self::SendOnly | Self::Bidirectional)
+    }
+
+    const fn allows_receive(self) -> bool {
+        matches!(self, Self::ReceiveOnly | Self::Bidirectional)
     }
 
     const fn is_subset_of(self, other: Self) -> bool {
