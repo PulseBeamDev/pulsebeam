@@ -7,7 +7,7 @@ use std::{
 use pulsebeam_rtc::{
     AcceptError, Connection, ConnectionConfig, ConnectionLimits, DataChannelId, FrameDependencies,
     FrameId, GlobalMediaTime, IceTcpFlowId, LocalCandidate, MediaPacket, MediaPriority,
-    PlayoutDelay, PolicyError,
+    NetworkInput, Output, PlayoutDelay, PolicyError, ReceiveError, TimePoint,
 };
 
 fn assert_send<T: Send>() {}
@@ -37,6 +37,13 @@ assert_not_impl!(MediaPacket, Sync);
 fn facade_values_are_send_but_connection_owned_values_are_not_sync() {
     assert_send::<Connection>();
     assert_send::<MediaPacket>();
+}
+
+#[test]
+fn connection_runtime_methods_have_the_public_sans_io_signatures() {
+    let _: fn(&mut Connection, TimePoint, NetworkInput) -> Result<(), ReceiveError> =
+        Connection::receive;
+    let _: fn(&mut Connection, TimePoint) -> Output = Connection::poll;
 }
 
 #[test]
