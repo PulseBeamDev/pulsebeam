@@ -1,12 +1,13 @@
 # `pulsebeam`
 
 The PulseBeam WebRTC SFU server. The control plane owns topology and compiles
-owned routing updates; thread-per-core shards own participants, transports,
+owned routing updates; work-stealing shards own participants, transports,
 packet buffers, routes, and forwarding state outright.
 
 Read these contracts before changing the corresponding subsystem:
 
-- [Thread-per-core ownership](docs/thread-per-core.md)
+- [Naming boundaries](docs/naming.md)
+- [Shard-owned work-stealing dataplane](docs/shard-owned-dataplane.md)
 - [Routing and compiled plans](docs/routing.md)
 - [Linux and eBPF requirements](docs/linux-only.md)
 - [Architecture diagram](docs/architecture.svg)

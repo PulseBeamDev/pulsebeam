@@ -1,5 +1,8 @@
 # Shard-Owned Work-Stealing Dataplane
 
+Read `docs/naming.md` before adding or renaming identities, lookup types,
+shard-local references, or routing destinations.
+
 Read `docs/shard-owned-dataplane.md` before changing dataplane ownership, scheduling, routing, fanout, packet movement, metrics, or cross-shard coordination.
 
 * **The shard is the unit of mutable dataplane ownership.** A shard owns its ingress, participant and transport state, routing, fanout, packet state, and egress. Ownership does not belong to a worker thread or CPU core.
