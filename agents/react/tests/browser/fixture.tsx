@@ -1,7 +1,7 @@
-import { Component, StrictMode, useEffect, useState } from "react";
+import { Component, StrictMode, useEffect, useRef, useState } from "react";
 import type { ErrorInfo, ReactNode } from "react";
 import { createRoot } from "react-dom/client";
-import { AgentProvider, useAgent } from "@pulsebeam/react";
+import { AgentProvider, useAgent, useRemoteMedia } from "@pulsebeam/react";
 import type { AgentSnapshot } from "@pulsebeam/react";
 
 const disconnected: AgentSnapshot = Object.freeze({
@@ -98,6 +98,11 @@ class FakeAgent {
   emitEvent(event: unknown) {
     this.events.forEach((listener) => listener(event));
   }
+
+  emitTracks(tracks: AgentSnapshot["tracks"]) {
+    this.snapshot = Object.freeze({ ...this.snapshot, tracks });
+    this.listeners.forEach((listener) => listener());
+  }
 }
 
 const first = new FakeAgent();
@@ -112,6 +117,12 @@ const observation = {
   unmount: false,
   callerOwned: false,
   strictMode: false,
+  playbackRetained: false,
+  playbackSelection: false,
+  playbackLatestCallback: false,
+  playbackReplacement: false,
+  playbackUnmount: false,
+  playbackStrictMode: false,
 };
 
 declare global {
@@ -194,6 +205,53 @@ function MissingProviderProbe() {
   return null;
 }
 
+const playbackFirst = new FakeAgent();
+const playbackSecond = new FakeAgent();
+let playbackVideo: HTMLVideoElement | null = null;
+let playbackRetry: (() => Promise<void>) | undefined;
+let blockedCallbackVersion = 0;
+let rejectPlayback = false;
+let playAttempts = 0;
+
+function PlaybackProbe() {
+  const [agent, setAgent] = useState(playbackFirst);
+  const [publicationIds, setPublicationIds] = useState(["first"]);
+  const [callbackVersion, setCallbackVersion] = useState(1);
+  const [elementVersion, setElementVersion] = useState(1);
+  const element = useRef<HTMLVideoElement>(null);
+  const { retryPlayback } = useRemoteMedia(agent as never, element, {
+    publicationIds,
+    onPlaybackBlocked: () => {
+      blockedCallbackVersion = callbackVersion;
+    },
+  });
+  useEffect(() => {
+    playbackVideo = element.current;
+    playbackRetry = retryPlayback;
+  });
+
+  return (
+    <>
+      <video key={elementVersion} ref={element} />
+      <button
+        id="playback-select"
+        onClick={() => setPublicationIds(["second"])}
+      >
+        select
+      </button>
+      <button id="playback-callback" onClick={() => setCallbackVersion(2)}>
+        callback
+      </button>
+      <button id="playback-element" onClick={() => setElementVersion(2)}>
+        element
+      </button>
+      <button id="playback-agent" onClick={() => setAgent(playbackSecond)}>
+        agent
+      </button>
+    </>
+  );
+}
+
 const waitFor = async (condition: () => boolean) => {
   const deadline = Date.now() + 2_000;
   while (!condition()) {
@@ -205,6 +263,21 @@ const waitFor = async (condition: () => boolean) => {
 
 const root = createRoot(document.getElementById("root")!);
 root.render(<App />);
+const playbackHost = document.createElement("div");
+document.body.append(playbackHost);
+const playbackRoot = createRoot(playbackHost);
+const originalPlay = HTMLMediaElement.prototype.play;
+HTMLMediaElement.prototype.play = function () {
+  playAttempts += 1;
+  return rejectPlayback
+    ? Promise.reject(new Error("blocked playback"))
+    : Promise.resolve();
+};
+playbackRoot.render(
+  <StrictMode>
+    <PlaybackProbe />
+  </StrictMode>,
+);
 
 void (async () => {
   await waitFor(
@@ -277,6 +350,84 @@ void (async () => {
   observation.missingProvider = true;
   missingRoot.unmount();
   missingHost.remove();
+
+  await waitFor(
+    () => playbackFirst.listeners.size === 1 && playbackVideo !== null,
+  );
+  const canvas = document.createElement("canvas");
+  const [firstTrack] = canvas.captureStream().getVideoTracks();
+  const [secondTrack] = canvas.captureStream().getVideoTracks();
+  playbackFirst.emitTracks({
+    first: {
+      publicationId: "first",
+      participantId: "participant",
+      mid: "0",
+      kind: "video",
+      paused: false,
+      media: firstTrack,
+    },
+    second: {
+      publicationId: "second",
+      participantId: "participant",
+      mid: "1",
+      kind: "video",
+      paused: false,
+      media: secondTrack,
+    },
+  });
+  await waitFor(() => playbackVideo?.srcObject instanceof MediaStream);
+  const stream = playbackVideo!.srcObject as MediaStream;
+  const retry = playbackRetry;
+  const subscriptions = playbackFirst.subscriptions;
+  const playAttemptsBeforeRender = playAttempts;
+  document.getElementById("playback-callback")!.click();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  observation.playbackRetained =
+    playbackVideo!.srcObject === stream &&
+    playbackRetry === retry &&
+    playbackFirst.subscriptions === subscriptions &&
+    playAttempts === playAttemptsBeforeRender;
+
+  rejectPlayback = true;
+  document.getElementById("playback-select")!.click();
+  await waitFor(() => blockedCallbackVersion === 2);
+  observation.playbackSelection =
+    stream.getTracks().length === 1 && stream.getTracks()[0] === secondTrack;
+  await playbackRetry!();
+  observation.playbackLatestCallback = blockedCallbackVersion === 2;
+  rejectPlayback = false;
+
+  document.getElementById("playback-element")!.click();
+  await waitFor(
+    () =>
+      playbackVideo?.srcObject instanceof MediaStream &&
+      playbackVideo.srcObject !== stream &&
+      playbackFirst.listeners.size === 1,
+  );
+  const replacementStream = playbackVideo!.srcObject;
+  playbackSecond.emitTracks(playbackFirst.snapshot.tracks);
+  document.getElementById("playback-agent")!.click();
+  await waitFor(
+    () =>
+      playbackFirst.listeners.size === 0 &&
+      playbackSecond.listeners.size === 1 &&
+      playbackVideo?.srcObject instanceof MediaStream,
+  );
+  observation.playbackReplacement =
+    replacementStream !== stream &&
+    playbackVideo!.srcObject !== replacementStream;
+
+  const playbackStrictModeReplayed =
+    playbackFirst.subscriptions > 1 && playbackFirst.unsubscriptions > 0;
+  playbackRoot.unmount();
+  playbackHost.remove();
+  HTMLMediaElement.prototype.play = originalPlay;
+  observation.playbackUnmount =
+    playbackFirst.listeners.size === 0 && playbackSecond.listeners.size === 0;
+  observation.playbackStrictMode =
+    playbackStrictModeReplayed &&
+    playbackFirst.subscriptions === playbackFirst.unsubscriptions &&
+    playbackSecond.subscriptions === playbackSecond.unsubscriptions;
 
   const strictModeReplayed =
     first.subscriptions > 1 &&

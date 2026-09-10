@@ -101,6 +101,12 @@ struct React {
     unmount: bool,
     caller_owned: bool,
     strict_mode: bool,
+    playback_retained: bool,
+    playback_selection: bool,
+    playback_latest_callback: bool,
+    playback_replacement: bool,
+    playback_unmount: bool,
+    playback_strict_mode: bool,
 }
 fn root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -303,6 +309,12 @@ async fn react_provider_contract_runs_through_bidi() -> TestResult<()> {
                 && r.unmount
                 && r.caller_owned
                 && r.strict_mode
+                && r.playback_retained
+                && r.playback_selection
+                && r.playback_latest_callback
+                && r.playback_replacement
+                && r.playback_unmount
+                && r.playback_strict_mode
         );
         Ok::<_, Box<dyn Error + Send + Sync>>(())
     })

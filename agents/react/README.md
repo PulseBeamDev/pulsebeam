@@ -16,18 +16,23 @@ builds the internal web runtime and WASM assets; applications do not need a web
 SDK dependency, runtime override, or private asset path.
 
 ```tsx
-import { AgentProvider, createAgent, useAgent, type Agent } from "@pulsebeam/react";
-import { useEffect, useState } from "react";
+import { AgentProvider, createAgent, useAgent, useRemoteMedia, type Agent } from "@pulsebeam/react";
+import { useEffect, useRef, useState } from "react";
 
-function Status() {
+function Status({ agent }: { agent: Agent }) {
   const { connection, tracks, topics, subscribeEvents } = useAgent();
+  const remoteVideo = useRef<HTMLVideoElement>(null);
+  useRemoteMedia(agent, remoteVideo, {
+    publicationIds: Object.values(tracks)
+      .filter((track) => track.kind === "video")
+      .map((track) => track.publicationId),
+    onPlaybackBlocked: (failure) => console.warn(failure.message),
+  });
   useEffect(() => subscribeEvents((event) => {
     if (event.type === "topic-message") console.log(event.topic, event.payload);
   }), [subscribeEvents]);
   return (
-    <>{connection} {Object.values(tracks).map((track) =>
-      track.kind === "video" ? <video key={track.publicationId} ref={(node) => node && (node.srcObject = new MediaStream([track.media]))} autoPlay /> : null
-    )} {topics.deliveredMessages}</>
+    <>{connection} <video ref={remoteVideo} autoPlay /> {topics.deliveredMessages}</>
   );
 }
 
@@ -39,11 +44,13 @@ function App() {
     setAgent(current);
     return () => { setAgent(null); current.close(); };
   }, []);
-  return agent && <AgentProvider agent={agent}><Status /></AgentProvider>;
+  return agent && <AgentProvider agent={agent}><Status agent={agent} /></AgentProvider>;
 }
 
 ```
 
-The web agent owns the browser runtime. The React adapter only subscribes to
-its immutable snapshots and forwards complete desired-state updates. Attach
-remote media to DOM elements and choose visible tracks in the application.
+The web agent owns browser attachment and playback. `useRemoteMedia` binds
+selected remote publication IDs to a caller-owned audio or video element; the
+hook retains the attachment across ordinary renders and returns a stable retry
+operation for blocked-playback UI. The application still chooses the element
+and visible tracks.

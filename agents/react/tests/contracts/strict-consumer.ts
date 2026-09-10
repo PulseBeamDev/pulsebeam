@@ -2,21 +2,26 @@ import {
   AgentProvider,
   createAgent,
   useAgent,
+  useRemoteMedia,
   type AgentProviderProps,
   type Agent,
   type AgentConfig,
   type AgentEvent,
   type AgentFailure,
   type AgentState,
+  type PlaybackFailure,
+  type RemoteMediaAttachment,
+  type RemoteMediaAttachmentOptions,
   type UseAgentResult,
   type RemoteTrack,
   type TopicMode,
   type VideoSenderConfig,
 } from "@pulsebeam/react";
-import type { ReactElement, ReactNode } from "react";
+import type { ReactElement, ReactNode, RefObject } from "react";
 
 declare const children: ReactNode;
 declare const media: MediaStreamTrack;
+declare const element: RefObject<HTMLMediaElement | null>;
 const config: AgentConfig = {
   endpoint: "https://pulsebeam.example",
   roomId: "standup",
@@ -57,6 +62,15 @@ const state: AgentState = {
 const props: AgentProviderProps = { agent, children };
 const provider: ReactElement = AgentProvider(props);
 const result: UseAgentResult = useAgent();
+const playbackOptions: RemoteMediaAttachmentOptions = {
+  publicationIds: ["remote-camera"],
+  onPlaybackBlocked: (failure: PlaybackFailure, retry) => {
+    void failure;
+    void retry();
+  },
+};
+const playback = useRemoteMedia(agent, element, playbackOptions);
+declare const attachment: RemoteMediaAttachment;
 
 const connection = result.connection;
 const participantId = result.participantId;
@@ -75,6 +89,8 @@ const unsubscribe = result.subscribeEvents((event: AgentEvent) => {
   }
 });
 unsubscribe();
+void playback.retryPlayback();
+void attachment.retryPlayback();
 agent.close();
 
 void provider;
