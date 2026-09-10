@@ -8,10 +8,11 @@
 mod support;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use pulsebeam_rtc::{
     Command, CommandError, ConnectionConfig, ForwardedMedia, FrameBoundary, FrameDependencies,
-    FrameId, FrameMetadata,
+    FrameId, FrameMetadata, MediaPayloadBitrate,
 };
 use support::{PeerFixture, second_negotiated_sender};
 
@@ -96,12 +97,78 @@ fn public_send_media_reaches_a_standards_peer_with_stable_continuity() {
 }
 
 #[test]
+fn public_fragmented_frame_uses_one_timestamp_and_continuous_sequences() {
+    let mut fixture = PeerFixture::connected();
+    let source = fixture.send_source(b"fragment");
+    for boundary in [
+        FrameBoundary::Start,
+        FrameBoundary::Middle,
+        FrameBoundary::End,
+    ] {
+        let mut media = forwarded(source.clone(), 77);
+        media.frame.boundary = boundary;
+        fixture
+            .connection
+            .command(
+                fixture.at(),
+                Command::SendMedia {
+                    sender: fixture.sender,
+                    media,
+                },
+            )
+            .expect("fragment admitted");
+    }
+    let (first, _) = fixture.receive_egress();
+    let (middle, _) = fixture.receive_egress();
+    let (last, _) = fixture.receive_egress();
+    assert_eq!(first.timestamp, middle.timestamp);
+    assert_eq!(middle.timestamp, last.timestamp);
+    assert_eq!(
+        middle.sequence_number,
+        first.sequence_number.wrapping_add(1)
+    );
+    assert_eq!(last.sequence_number, middle.sequence_number.wrapping_add(1));
+}
+
+#[test]
+fn authenticated_feedback_keeps_controller_governed_egress_live() {
+    let mut fixture = PeerFixture::connected();
+    let first = fixture.send_source(b"first");
+    fixture
+        .connection
+        .command(
+            fixture.at(),
+            Command::SendMedia {
+                sender: fixture.sender,
+                media: forwarded(first, 1),
+            },
+        )
+        .expect("first media admitted");
+    assert_eq!(fixture.receive_egress().1, b"first");
+    fixture.drive_for(Duration::from_millis(250));
+    assert!(fixture.twcc_sent() > 0, "standards peer returned TWCC");
+
+    let second = fixture.send_source(b"second");
+    fixture
+        .connection
+        .command(
+            fixture.at(),
+            Command::SendMedia {
+                sender: fixture.sender,
+                media: forwarded(second, 2),
+            },
+        )
+        .expect("feedback-governed media admitted");
+    assert_eq!(fixture.receive_egress().1, b"second");
+}
+
+#[test]
 fn public_command_rejects_invalid_work_without_mutating_sender_continuity() {
     let mut fixture = PeerFixture::connected();
     let source = fixture.send_source(b"payload");
     let unknown = second_negotiated_sender();
     let mut invalid = forwarded(source.clone(), 1);
-    invalid.frame.boundary = FrameBoundary::Start;
+    invalid.frame.boundary = FrameBoundary::Middle;
     assert_eq!(
         fixture.connection.command(
             fixture.at(),
@@ -122,15 +189,17 @@ fn public_command_rejects_invalid_work_without_mutating_sender_continuity() {
         ),
         Err(CommandError::UnknownSender(unknown))
     );
+    let mut policy = ConnectionConfig::default().default_audio_policy;
+    policy.desired_bitrate = MediaPayloadBitrate::from_bps(1_000_000);
     assert_eq!(
         fixture.connection.command(
             fixture.at(),
             Command::SetSenderPolicy {
                 sender: fixture.sender,
-                policy: ConnectionConfig::default().default_audio_policy,
+                policy,
             },
         ),
-        Err(CommandError::InvalidState)
+        Ok(())
     );
 
     fixture
@@ -193,7 +262,7 @@ fn public_send_media_uses_passive_ice_tcp_framing() {
 }
 
 #[test]
-fn public_media_fifo_enforces_exact_packet_and_payload_bounds() {
+fn public_media_admission_enforces_exact_configured_payload_bound() {
     let mut source = PeerFixture::connected();
     let packet = source.send_source(b"x");
 
@@ -215,31 +284,7 @@ fn public_media_fifo_enforces_exact_packet_and_payload_bounds() {
             bytes.at(),
             Command::SendMedia {
                 sender: bytes.sender,
-                media: forwarded(packet.clone(), 3),
-            },
-        ),
-        Err(CommandError::WouldBlock)
-    );
-
-    let mut packets = PeerFixture::connected();
-    for id in 1..=8_192 {
-        assert_eq!(
-            packets.connection.command(
-                packets.at(),
-                Command::SendMedia {
-                    sender: packets.sender,
-                    media: forwarded(packet.clone(), id),
-                },
-            ),
-            Ok(())
-        );
-    }
-    assert_eq!(
-        packets.connection.command(
-            packets.at(),
-            Command::SendMedia {
-                sender: packets.sender,
-                media: forwarded(packet, 8_193),
+                media: forwarded(packet, 3),
             },
         ),
         Err(CommandError::WouldBlock)

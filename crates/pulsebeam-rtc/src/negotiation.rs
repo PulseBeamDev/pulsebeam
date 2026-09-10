@@ -77,6 +77,7 @@ pub(crate) struct EgressSenderFacts {
     pub(crate) kind: crate::MediaKind,
     pub(crate) mid: Box<str>,
     pub(crate) payload_type: u8,
+    pub(crate) retransmission_payload_type: Option<u8>,
     pub(crate) clock_rate: u32,
     pub(crate) mid_extension_id: Option<u8>,
     pub(crate) twcc_extension_id: Option<u8>,
@@ -162,6 +163,7 @@ impl NegotiatedSessionFacts {
                     },
                     mid: section.mid.clone().into_boxed_str(),
                     payload_type: codec.payload_type,
+                    retransmission_payload_type: codec.retransmission_payload_type,
                     clock_rate: codec.clock_rate,
                     mid_extension_id: extension_id(MID_URI),
                     twcc_extension_id: TWCC_URIS.iter().find_map(|uri| extension_id(uri)),
@@ -173,7 +175,9 @@ impl NegotiatedSessionFacts {
     pub(crate) fn outbound_payload_types(&self) -> Box<[u8]> {
         self.egress_senders()
             .iter()
-            .map(|sender| sender.payload_type)
+            .flat_map(|sender| {
+                std::iter::once(sender.payload_type).chain(sender.retransmission_payload_type)
+            })
             .collect()
     }
 

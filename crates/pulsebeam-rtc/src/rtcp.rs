@@ -85,6 +85,13 @@ pub(crate) enum ArrivalOffset {
 pub(crate) struct ParsedRtcp {
     pub(crate) lifecycle: Vec<LifecycleFact>,
     pub(crate) feedback: Vec<FeedbackBatch>,
+    pub(crate) repair: Vec<RepairRequest>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RepairRequest {
+    pub(crate) media_ssrc: u32,
+    pub(crate) sequence: u16,
 }
 
 pub(crate) fn parse(
@@ -95,6 +102,7 @@ pub(crate) fn parse(
 ) -> Result<ParsedRtcp, PacketError> {
     let mut lifecycle = Vec::new();
     let mut feedback = Vec::new();
+    let mut repair = Vec::new();
     let mut status_count = 0usize;
     for packet in RtcpCompound::parse(bytes)? {
         let packet = packet?;
@@ -182,13 +190,34 @@ pub(crate) fn parse(
                     });
                 }
             }
-            (205, 1) | (206, 1) | (206, 4) => typed(packet)?,
+            (205, 1) => {
+                let nack = packet.nack()?.ok_or(PacketError::InvalidValue)?;
+                for (packet_id, lost) in nack.pairs() {
+                    repair.push(RepairRequest {
+                        media_ssrc: nack.media_ssrc(),
+                        sequence: packet_id,
+                    });
+                    for bit in 0_u16..16 {
+                        if lost & (1 << bit) != 0 {
+                            repair.push(RepairRequest {
+                                media_ssrc: nack.media_ssrc(),
+                                sequence: packet_id.wrapping_add(bit.saturating_add(1)),
+                            });
+                        }
+                    }
+                    if repair.len() > MAX_FEEDBACK_STATUSES {
+                        return Err(PacketError::TooManyItems);
+                    }
+                }
+            }
+            (206, 1) | (206, 4) => typed(packet)?,
             _ => {}
         }
     }
     Ok(ParsedRtcp {
         lifecycle,
         feedback,
+        repair,
     })
 }
 
@@ -1276,6 +1305,35 @@ mod tests {
         let mut nonzero = fir;
         nonzero[11] = 1;
         assert!(RtcpPacket::parse(&nonzero).unwrap().fir().is_err());
+    }
+
+    #[test]
+    fn authenticated_nack_expands_bounded_repair_requests() {
+        let nack = [0x81, 205, 0, 3, 0, 0, 0, 9, 0, 0, 0, 7, 0, 100, 0, 5];
+        let parsed = parse(
+            &nack,
+            at(),
+            PathEpoch::from_value(1),
+            PacketFeedbackKind::TransportWide,
+        )
+        .expect("valid Generic NACK");
+        assert_eq!(
+            parsed.repair,
+            [
+                RepairRequest {
+                    media_ssrc: 7,
+                    sequence: 100,
+                },
+                RepairRequest {
+                    media_ssrc: 7,
+                    sequence: 101,
+                },
+                RepairRequest {
+                    media_ssrc: 7,
+                    sequence: 103,
+                },
+            ]
+        );
     }
 
     #[test]

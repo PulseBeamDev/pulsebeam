@@ -53,6 +53,10 @@ impl PathEpoch {
         Self(value)
     }
 
+    pub(crate) const fn value(self) -> u64 {
+        self.0
+    }
+
     fn next(self) -> Option<Self> {
         self.0.checked_add(1).map(Self)
     }
@@ -69,6 +73,8 @@ pub(crate) struct PreparedRtpIdentity {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RtpService {
     Original,
+    Repair,
+    Padding,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -753,11 +759,19 @@ impl Transport {
     }
 
     pub(crate) fn send_rtp(&mut self, packet: &[u8]) -> Result<(), TransportError> {
-        self.send_secure(packet, DatagramKind::Rtp)
+        self.send_rtp_with_service(packet, RtpService::Original)
+    }
+
+    pub(crate) fn send_rtp_with_service(
+        &mut self,
+        packet: &[u8],
+        service: RtpService,
+    ) -> Result<(), TransportError> {
+        self.send_secure(packet, DatagramKind::Rtp, service)
     }
 
     pub(crate) fn send_rtcp(&mut self, packet: &[u8]) -> Result<(), TransportError> {
-        self.send_secure(packet, DatagramKind::Rtcp)
+        self.send_secure(packet, DatagramKind::Rtcp, RtpService::Original)
     }
 
     pub(crate) fn close(&mut self, now: Instant) -> Result<(), TransportError> {
@@ -782,7 +796,12 @@ impl Transport {
         Ok(())
     }
 
-    fn send_secure(&mut self, packet: &[u8], kind: DatagramKind) -> Result<(), TransportError> {
+    fn send_secure(
+        &mut self,
+        packet: &[u8],
+        kind: DatagramKind,
+        service: RtpService,
+    ) -> Result<(), TransportError> {
         if self.state != TransportState::Connected {
             return Err(
                 if matches!(self.state, TransportState::Closed | TransportState::Failed) {
@@ -822,7 +841,7 @@ impl Transport {
                 ssrc: metadata.ssrc,
                 sequence: metadata.sequence,
                 twcc_sequence,
-                service: RtpService::Original,
+                service,
             })
         } else {
             None

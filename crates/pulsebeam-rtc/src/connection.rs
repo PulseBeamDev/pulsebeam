@@ -109,7 +109,11 @@ pub(crate) struct TransmitCommitContext {
 }
 
 pub(crate) trait CommitParticipant: Send {
-    fn commit(&mut self, context: TransmitCommitContext) -> Result<(), HistoryError>;
+    fn preflight(&self, _context: TransmitCommitContext) -> Result<(), HistoryError> {
+        Ok(())
+    }
+
+    fn commit_preflighted(&mut self, context: TransmitCommitContext);
 }
 
 struct CommitCoordinator {
@@ -127,19 +131,33 @@ impl CommitCoordinator {
 
     fn commit_transport(
         &mut self,
-        at: Instant,
+        at: TimePoint,
         prepared: PreparedTransmit,
+        egress: Option<&mut MediaEgress>,
     ) -> Result<Transmit, HistoryError> {
         let context = TransmitCommitContext {
-            at,
+            at: at.monotonic,
             kind: prepared.kind,
             wire_len: prepared.wire_len,
             path_epoch: prepared.path_epoch,
             rtp: prepared.rtp,
         };
-        CommitParticipant::commit(&mut self.history, context)?;
+        CommitParticipant::preflight(&self.history, context)?;
+        for participant in &self.participants {
+            participant.preflight(context)?;
+        }
+        if egress
+            .as_deref()
+            .is_some_and(|egress| !egress.preflight_commit(&prepared))
+        {
+            return Err(HistoryError::InvalidCommit);
+        }
+        self.history.commit_preflighted(context);
         for participant in &mut self.participants {
-            participant.commit(context)?;
+            participant.commit_preflighted(context);
+        }
+        if let Some(egress) = egress {
+            egress.commit(at, &prepared);
         }
         let PreparedTransmit { target, bytes, .. } = prepared;
         Ok(Transmit {
@@ -172,10 +190,12 @@ impl Connection {
                     | TransportState::Connecting
                     | TransportState::Draining => return Err(CommandError::InvalidState),
                 }
-                self._subsystems.egress.admit(sender, media)
+                self._subsystems.egress.admit(at, sender, media)
             }
-            Command::SetSenderPolicy { .. }
-            | Command::RequestKeyframe { .. }
+            Command::SetSenderPolicy { sender, policy } => {
+                self._subsystems.egress.set_policy(sender, policy, at)
+            }
+            Command::RequestKeyframe { .. }
             | Command::RetireEncoding { .. }
             | Command::OpenDataChannel(_)
             | Command::SendData { .. }
@@ -235,11 +255,55 @@ impl Connection {
         if let Some(feedback) = self._subsystems.ingress.poll_feedback() {
             self.runtime.commit.history.process_feedback(feedback);
         }
+        if let Some(repair) = self._subsystems.ingress.poll_repair() {
+            self._subsystems
+                .egress
+                .request_repair(repair.media_ssrc, repair.sequence);
+        }
+
+        let (path_change, feedback, feedback_hold, bytes_in_flight) = {
+            let inputs = self.runtime.commit.history.controller_inputs();
+            let received_at = inputs
+                .timing
+                .map_or(at.monotonic, |timing| timing.received_at);
+            let origin = self._subsystems.egress.controller_origin();
+            (
+                inputs
+                    .path_change
+                    .map(|change| (change.epoch.value(), change.available)),
+                inputs
+                    .feedback
+                    .iter()
+                    .map(|feedback| feedback.controller_sample(received_at, origin))
+                    .collect::<Vec<_>>(),
+                inputs
+                    .timing
+                    .and_then(|timing| timing.feedback_hold)
+                    .unwrap_or_default(),
+                inputs.bytes_in_flight,
+            )
+        };
+        let application_limited = self._subsystems.egress.update_controller(
+            at,
+            path_change,
+            &feedback,
+            feedback_hold,
+            bytes_in_flight,
+        );
+        self.runtime.commit.history.clear_controller_inputs();
+        self.runtime
+            .commit
+            .history
+            .set_application_limited(application_limited);
+
+        if let Some(event) = self._subsystems.egress.poll_event() {
+            return Output::Event(event);
+        }
 
         if !self.runtime.closed
             && let Some(prepared) = self._subsystems.transport.poll_prepared()
         {
-            return match self.runtime.commit.commit_transport(at.monotonic, prepared) {
+            return match self.runtime.commit.commit_transport(at, prepared, None) {
                 Ok(transmit) => Output::Transmit(transmit),
                 Err(_) => {
                     self.runtime.closed = true;
@@ -249,17 +313,21 @@ impl Connection {
         }
 
         if !self.runtime.closed {
-            match self
-                ._subsystems
-                .egress
-                .prepare_one(&mut self._subsystems.transport)
-            {
+            match self._subsystems.egress.prepare_one(
+                at,
+                bytes_in_flight,
+                &mut self._subsystems.transport,
+            ) {
                 PrepareResult::Prepared => {
                     let Some(prepared) = self._subsystems.transport.poll_prepared() else {
                         self.runtime.closed = true;
                         return Output::Closed(CloseReason::TransportFailure);
                     };
-                    return match self.runtime.commit.commit_transport(at.monotonic, prepared) {
+                    return match self.runtime.commit.commit_transport(
+                        at,
+                        prepared,
+                        Some(&mut self._subsystems.egress),
+                    ) {
                         Ok(transmit) => Output::Transmit(transmit),
                         Err(_) => {
                             self.runtime.closed = true;
@@ -288,6 +356,7 @@ impl Connection {
                         self._subsystems.transport.next_deadline(),
                         self.runtime.next_deadline(),
                         self.runtime.commit.history.next_deadline(),
+                        self._subsystems.egress.next_deadline(),
                     ]
                     .into_iter()
                     .flatten()
@@ -373,8 +442,10 @@ impl Connection {
             negotiated.facts.egress_senders(),
             negotiated.facts.protocol_randomness(),
             config.limits.max_queued_media_bytes,
+            config.limits.max_retransmission_bytes,
             config.default_audio_policy,
             config.default_video_policy,
+            at.monotonic,
         );
         let feedback = negotiated.facts.feedback();
         let connection = Self {
@@ -452,15 +523,30 @@ mod tests {
     struct Observer(Arc<Mutex<Option<TransmitCommitContext>>>);
 
     impl CommitParticipant for Observer {
-        fn commit(&mut self, context: TransmitCommitContext) -> Result<(), HistoryError> {
+        fn commit_preflighted(&mut self, context: TransmitCommitContext) {
             *self.0.lock().expect("observer lock") = Some(context);
-            Ok(())
+        }
+    }
+
+    struct RejectingParticipant(Arc<Mutex<bool>>);
+
+    impl CommitParticipant for RejectingParticipant {
+        fn preflight(&self, _context: TransmitCommitContext) -> Result<(), HistoryError> {
+            Err(HistoryError::Exhausted)
+        }
+
+        fn commit_preflighted(&mut self, _context: TransmitCommitContext) {
+            *self.0.lock().expect("participant lock") = true;
         }
     }
 
     #[test]
     fn commit_preserves_finalized_wire_context() {
-        let at = Instant::now();
+        let monotonic = Instant::now();
+        let at = TimePoint {
+            monotonic,
+            global: crate::GlobalMediaTime::from_micros(1),
+        };
         let mut coordinator = CommitCoordinator::new(PacketFeedbackKind::TransportWide);
         coordinator
             .history
@@ -487,13 +573,14 @@ mod tests {
                         service: crate::transport::RtpService::Original,
                     }),
                 },
+                None,
             )
             .expect("valid RTP commit");
         assert_eq!(transmit.payload, Bytes::from_static(&[0, 3, 1, 2, 3]));
         assert_eq!(
             *observed.lock().expect("observer lock"),
             Some(TransmitCommitContext {
-                at,
+                at: monotonic,
                 kind: DatagramKind::Rtp,
                 wire_len: 5,
                 path_epoch: Some(PathEpoch::from_value(3)),
@@ -505,6 +592,47 @@ mod tests {
                 }),
             })
         );
+    }
+
+    #[test]
+    fn failed_commit_preflight_mutates_no_participant() {
+        let monotonic = Instant::now();
+        let at = TimePoint {
+            monotonic,
+            global: crate::GlobalMediaTime::from_micros(1),
+        };
+        let mut coordinator = CommitCoordinator::new(PacketFeedbackKind::TransportWide);
+        coordinator
+            .history
+            .path_changed(PathEpoch::from_value(3), true);
+        let touched = Arc::new(Mutex::new(false));
+        coordinator
+            .participants
+            .push(Box::new(RejectingParticipant(Arc::clone(&touched))));
+        assert_eq!(
+            coordinator.commit_transport(
+                at,
+                PreparedTransmit {
+                    target: TransmitTarget::IceTcp {
+                        flow: crate::IceTcpFlowId::from_value(11),
+                    },
+                    bytes: vec![0, 3, 1, 2, 3],
+                    kind: DatagramKind::Rtp,
+                    wire_len: 5,
+                    path_epoch: Some(PathEpoch::from_value(3)),
+                    rtp: Some(PreparedRtpIdentity {
+                        ssrc: 7,
+                        sequence: 9,
+                        twcc_sequence: Some(13),
+                        service: crate::transport::RtpService::Original,
+                    }),
+                },
+                None,
+            ),
+            Err(HistoryError::Exhausted)
+        );
+        assert_eq!(coordinator.history.controller_inputs().bytes_in_flight, 0);
+        assert!(!*touched.lock().expect("participant lock"));
     }
 
     #[test]

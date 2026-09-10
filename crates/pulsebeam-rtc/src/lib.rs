@@ -1,3 +1,4 @@
+mod allocator;
 mod clock;
 mod congestion;
 mod connection;
@@ -7,8 +8,10 @@ mod ingress;
 mod io;
 mod media_packet;
 mod negotiation;
+mod pacer;
 mod packet;
 mod rtcp;
+mod scheduler;
 mod sent_history;
 mod session;
 mod time;

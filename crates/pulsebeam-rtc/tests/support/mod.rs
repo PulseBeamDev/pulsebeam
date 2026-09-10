@@ -18,8 +18,8 @@ use std::{
 use bytes::Bytes;
 use pulsebeam_rtc::{
     Connection, ConnectionConfig, ConnectionEntropy, Event as ConnectionEvent, GlobalMediaTime,
-    IceTcpFlowId, LocalCandidate, MediaPacket, NetworkInput, Output as ConnectionOutput, SdpOffer,
-    SenderId, TimePoint, TransmitTarget,
+    IceTcpFlowId, LocalCandidate, MediaPacket, MediaPayloadBitrate, NetworkInput,
+    Output as ConnectionOutput, SdpOffer, SenderId, TimePoint, TransmitTarget,
 };
 use str0m_reference::{
     Candidate, Event, Input, Output, Rtc,
@@ -102,6 +102,7 @@ impl PeerFixture {
             }],
             ..ConnectionConfig::default()
         };
+        config.default_audio_policy.desired_bitrate = MediaPayloadBitrate::from_bps(1_000_000);
         if let Some(limit) = media_limit {
             config.limits.max_queued_media_bytes = limit;
         }

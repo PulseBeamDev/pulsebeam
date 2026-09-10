@@ -19,7 +19,7 @@ use crate::{
     clock::{ClockMapper, ClockWarning, ntp_micros},
     negotiation::IngressMediaFacts,
     packet::RtpPacket,
-    rtcp::{self, FeedbackBatch, LifecycleFact},
+    rtcp::{self, FeedbackBatch, LifecycleFact, RepairRequest},
     transport::PathEpoch,
 };
 
@@ -30,6 +30,7 @@ pub(crate) struct IngressOwner {
     encodings: Vec<Encoding>,
     events: VecDeque<Event>,
     feedback: VecDeque<FeedbackBatch>,
+    repair: VecDeque<RepairRequest>,
     cname_by_ssrc: Vec<(u32, Box<str>)>,
     groups: Vec<(Box<str>, i128)>,
     max_unsignaled: usize,
@@ -80,6 +81,7 @@ impl IngressOwner {
             encodings: Vec::new(),
             events: VecDeque::new(),
             feedback: VecDeque::new(),
+            repair: VecDeque::new(),
             cname_by_ssrc: Vec::new(),
             groups: Vec::new(),
             max_unsignaled: usize::from(max_unsignaled),
@@ -210,6 +212,7 @@ impl IngressOwner {
         };
         if parsed.lifecycle.len() > MAX_RECORDS.saturating_sub(self.events.len())
             || parsed.feedback.len() > MAX_RECORDS.saturating_sub(self.feedback.len())
+            || parsed.repair.len() > MAX_RECORDS.saturating_sub(self.repair.len())
         {
             self.drop();
             return;
@@ -218,6 +221,7 @@ impl IngressOwner {
             self.apply_rtcp_fact(arrival, smoothed_rtt, fact);
         }
         self.feedback.extend(parsed.feedback);
+        self.repair.extend(parsed.repair);
     }
 
     #[allow(
@@ -226,6 +230,10 @@ impl IngressOwner {
     )]
     pub(crate) fn poll_feedback(&mut self) -> Option<FeedbackBatch> {
         self.feedback.pop_front()
+    }
+
+    pub(crate) fn poll_repair(&mut self) -> Option<RepairRequest> {
+        self.repair.pop_front()
     }
 
     pub(crate) fn poll_event(&mut self) -> Option<Event> {

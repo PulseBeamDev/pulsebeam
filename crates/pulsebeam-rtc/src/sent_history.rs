@@ -181,6 +181,7 @@ impl SentHistory {
     }
 
     fn commit_context(&mut self, context: TransmitCommitContext) -> Result<(), HistoryError> {
+        self.preflight_commit(context)?;
         if context.kind != DatagramKind::Rtp {
             return Ok(());
         }
@@ -250,6 +251,45 @@ impl SentHistory {
         self.bytes_in_flight = next_bytes_in_flight;
         self.inputs.bytes_in_flight = self.bytes_in_flight;
         self.next_sent_id = next_sent_id;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn commit(&mut self, context: TransmitCommitContext) -> Result<(), HistoryError> {
+        self.commit_context(context)
+    }
+
+    pub(crate) fn preflight_commit(
+        &self,
+        context: TransmitCommitContext,
+    ) -> Result<(), HistoryError> {
+        if context.kind != DatagramKind::Rtp {
+            return Ok(());
+        }
+        let (Some(epoch), Some(rtp)) = (context.path_epoch, context.rtp) else {
+            return Err(HistoryError::InvalidCommit);
+        };
+        if self.active_epoch != Some(epoch)
+            || context.wire_len == 0
+            || !matches!(
+                (self.mode, rtp.twcc_sequence),
+                (PacketFeedbackKind::TransportWide, Some(_)) | (PacketFeedbackKind::Rfc8888, None)
+            )
+            || self.next_sent_id == u64::MAX
+            || self
+                .bytes_in_flight
+                .checked_add(context.wire_len as u64)
+                .is_none()
+        {
+            return Err(HistoryError::InvalidCommit);
+        }
+        let slot = ring_index(self.next_sent_id);
+        if let Some(previous) = self.entries[slot]
+            && !previous.acknowledgment.is_terminal()
+            && previous.path_epoch == epoch
+        {
+            return Err(HistoryError::Exhausted);
+        }
         Ok(())
     }
 
@@ -654,8 +694,13 @@ impl PacketFeedback {
 }
 
 impl CommitParticipant for SentHistory {
-    fn commit(&mut self, context: TransmitCommitContext) -> Result<(), HistoryError> {
-        self.commit_context(context)
+    fn preflight(&self, context: TransmitCommitContext) -> Result<(), HistoryError> {
+        self.preflight_commit(context)
+    }
+
+    fn commit_preflighted(&mut self, context: TransmitCommitContext) {
+        let result = self.commit_context(context);
+        debug_assert_eq!(result, Ok(()));
     }
 }
 
