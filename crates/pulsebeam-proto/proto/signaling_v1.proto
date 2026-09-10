@@ -20,7 +20,7 @@ package pulsebeam.media.v1;
 //   └── ReceiveIntent
 //       ├── VideoIntent
 //       │   └── tracks[]
-//       │       ├── track
+//       │       ├── track_id
 //       │       └── options
 //       │           ├── height
 //       │           ├── min_height
@@ -30,7 +30,7 @@ package pulsebeam.media.v1;
 //       │
 //       └── AudioIntent
 //           ├── tracks[]
-//           │   ├── track
+//           │   ├── track_id
 //           │   └── options
 //           │       └── playout_delay
 //           └── mode
@@ -47,10 +47,10 @@ package pulsebeam.media.v1;
 //     sender 1, VIDEO, "camera"
 //
 //   RemoteTrack:
-//     participant "alice", VIDEO, "camera"
+//     track vid_A, participant pa_A, VIDEO, "camera"
 //
 //   Video receive intent:
-//     alice/VIDEO/camera
+//     track vid_A
 //       height       = 720
 //       min_height   = 360
 //       min_fps      = 15
@@ -58,21 +58,24 @@ package pulsebeam.media.v1;
 //       playout_delay = [0ms, 50ms]
 //
 //   Audio receive intent with three negotiated audio receivers:
-//     tracks = [alice/AUDIO/microphone]
+//     tracks = [aud_A]
 //     mode   = AUDIO_MODE_AUTO
 //
 //   The server selects Alice first and may automatically fill the remaining
 //   receivers.
 //
 //   Mapping:
-//     audio receiver 0 -> alice/AUDIO/microphone
-//     audio receiver 1 -> bob/AUDIO/microphone
-//     audio receiver 2 -> carol/AUDIO/microphone
+//     audio receiver 0 -> aud_A
+//     audio receiver 1 -> aud_B
+//     audio receiver 2 -> aud_C
 //
 // Track identity:
 //
 //   LocalTrack  = (kind, label)
-//   RemoteTrack = (participant_id, kind, label)
+//   RemoteTrack = TrackId
+//
+// The client SDK resolves application-facing selectors such as
+// (participant_external_id, kind, label) to TrackId using Catalog.
 //
 // `sender_id` and `receiver_id` are connection-local identifiers equal to the
 // zero-based SDP media-section index of the corresponding negotiated RTP
@@ -132,10 +135,13 @@ enum TrackKind {
 
 // One participant visible in the room.
 //
+// `id` is the canonical ParticipantId.
+// `external_id` is the application-supplied ParticipantExternalId.
 // Application metadata such as display name or avatar belongs to application
 // signaling.
 message Participant {
   string id = 1;
+  string external_id = 2;
 }
 
 // A track owned by this participant.
@@ -150,11 +156,13 @@ message LocalTrack {
 
 // A track visible from the room.
 //
-// Unique by (participant_id, kind, label).
+// `id` is the canonical TrackId.
+// (participant_id, kind, label) describes the application-facing track.
 message RemoteTrack {
-  string participant_id = 1;
-  TrackKind kind = 2;
-  string label = 3;
+  string id = 1;
+  string participant_id = 2;
+  TrackKind kind = 3;
+  string label = 4;
 }
 
 
@@ -195,7 +203,7 @@ message SendIntent {
 // Otherwise:
 //   min_ms MUST be <= max_ms.
 //
-// The control applies only to the stream carrying the associated RemoteTrack.
+// The control applies only to the stream carrying the associated TrackId.
 message PlayoutDelay {
   uint32 min_ms = 1;
   uint32 max_ms = 2;
@@ -234,7 +242,7 @@ message VideoOptions {
 
 // Desired state for one remote video track.
 message VideoTrackIntent {
-  RemoteTrack track = 1;
+  string track_id = 1;
   VideoOptions options = 2;
 }
 
@@ -257,7 +265,7 @@ message AudioOptions {
 
 // Desired state for one explicitly requested remote audio track.
 message AudioTrackIntent {
-  RemoteTrack track = 1;
+  string track_id = 1;
   AudioOptions options = 2;
 }
 
@@ -316,7 +324,7 @@ message ReceiveIntent {
 // `revision` is client-owned, monotonically increasing, and scoped to this
 // signaling connection. It correlates Mapping and errors.
 //
-// Receive intent may reference tracks that are not currently present in Catalog.
+// Receive intent references canonical TrackIds.
 message Intent {
   uint64 revision = 1;
   SendIntent send = 2;
@@ -337,10 +345,10 @@ message Intent {
 //   receiver_id
 //       -> RTCRtpReceiver
 //       -> MediaStreamTrack
-//       -> RemoteTrack
+//       -> TrackId
 message TrackMapping {
   uint32 receiver_id = 1;
-  RemoteTrack track = 2;
+  string track_id = 2;
 }
 
 // Complete current mapping for one media kind.
