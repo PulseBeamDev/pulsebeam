@@ -1,13 +1,17 @@
 import {
   createAgent,
+  attachRemoteMedia,
   type AgentEvent,
   type AgentFailure,
   type AgentSnapshot,
   type AgentState,
   type FailureClass,
+  type PlaybackFailure,
+  type RemoteMediaAttachment,
 } from "../../web/index.js";
 
 declare const audioTrack: MediaStreamTrack;
+declare const audioElement: HTMLAudioElement;
 const agent = createAgent({
   endpoint: "https://pulsebeam.example",
   roomId: "meet",
@@ -72,6 +76,20 @@ const replacement: Promise<void> = agent.replaceLocalTrack(
   { contentHint: "speech", encodings: [] },
 );
 const muted: Promise<void> = agent.setLocalMuted("microphone", true);
+const attachment: RemoteMediaAttachment = attachRemoteMedia(
+  agent,
+  audioElement,
+  {
+    publicationIds: ["publication-audio"],
+    onPlaybackBlocked: (failure: PlaybackFailure, retry) => {
+      void failure.message;
+      void retry();
+    },
+  },
+);
+attachment.setPublicationIds(["publication-audio"]);
+void attachment.retryPlayback();
+attachment.close();
 agent.sendTopic("presence", "latest", new Uint8Array([1]));
 agent.sendTopic("chat", "ordered", new Uint8Array([2]));
 agent.reconnect();

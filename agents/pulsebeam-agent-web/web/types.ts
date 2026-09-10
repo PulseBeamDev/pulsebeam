@@ -295,3 +295,22 @@ export interface Agent {
   ) => () => void;
   close(): void;
 }
+
+export type PlaybackFailure = Readonly<{
+  message: string;
+  cause?: unknown;
+}>;
+
+export type RemoteMediaAttachmentOptions = Readonly<{
+  publicationIds: readonly string[];
+  onPlaybackBlocked?: (
+    failure: PlaybackFailure,
+    retry: () => Promise<void>,
+  ) => void;
+}>;
+
+export interface RemoteMediaAttachment {
+  setPublicationIds(publicationIds: readonly string[]): void;
+  retryPlayback(): Promise<void>;
+  close(): void;
+}

@@ -1,4 +1,5 @@
 export { createAgent } from "./agent.js";
+export { attachRemoteMedia } from "./remote-media.js";
 export type {
   Agent,
   AgentConfig,
@@ -17,9 +18,12 @@ export type {
   MediaTopology,
   LogLevel,
   Participant,
+  PlaybackFailure,
   Publication,
   PublicationIntent,
   RemoteAudioTrack,
+  RemoteMediaAttachment,
+  RemoteMediaAttachmentOptions,
   RemoteTrack,
   RemoteVideoTrack,
   SenderConfig,

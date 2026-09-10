@@ -16,6 +16,7 @@ const FAILURE: &str = include_str!("contracts/initialization-failure.js");
 const REJECTIONS: &str = include_str!("contracts/unhandled-rejections.js");
 const RUNTIME_LOCAL_OPERATIONS: &str =
     include_str!("contracts/runtime-local-operation-contract.js");
+const REMOTE_MEDIA: &str = include_str!("contracts/remote-media-contract.js");
 const REACT: &str = include_str!("../../react/tests/browser/observe.js");
 
 #[derive(Debug, Deserialize)]
@@ -59,6 +60,21 @@ struct RuntimeLocalOperations {
     final_track_wins: bool,
     close_fenced: bool,
     post_close_fenced: bool,
+}
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RemoteMedia {
+    first_available: bool,
+    unchanged: bool,
+    combined: bool,
+    replaced: bool,
+    removed: bool,
+    restored: bool,
+    isolated: bool,
+    terminal: bool,
+    reported: bool,
+    retried: bool,
+    pending_suppressed: bool,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -160,6 +176,35 @@ async fn runtime_local_operations_are_serialized_and_close_fenced() -> TestResul
     })
     .await
     .map_err(|error| format!("runtime local operation contract failed: {error}").into())
+}
+#[tokio::test(flavor = "multi_thread")]
+async fn remote_media_attachment_is_stable_and_terminal() -> TestResult<()> {
+    let server = StaticServer::start(root()).await?;
+    let url = server.url("tests/fixture.html");
+    run_browser_test(WebDriver::managed(capabilities()?), |driver| async move {
+        let bidi = driver.bidi().await?;
+        let context = bidi.browsing_context().top_level().await?;
+        navigate(&bidi, &context, url).await?;
+        let _: () = evaluate_json(&bidi, &context, LOAD).await?;
+        let result: RemoteMedia = evaluate_json(&bidi, &context, REMOTE_MEDIA).await?;
+        assert!(
+            result.first_available
+                && result.unchanged
+                && result.combined
+                && result.replaced
+                && result.removed
+                && result.restored
+                && result.isolated
+                && result.terminal
+                && result.reported
+                && result.retried
+                && result.pending_suppressed,
+            "remote media contract result: {result:?}",
+        );
+        Ok::<_, Box<dyn Error + Send + Sync>>(())
+    })
+    .await
+    .map_err(|error| format!("remote media contract failed: {error}").into())
 }
 #[tokio::test(flavor = "multi_thread")]
 async fn initialization_failure_is_private_and_deterministic() -> TestResult<()> {
