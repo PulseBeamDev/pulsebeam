@@ -1,43 +1,29 @@
-import { useEffect, useRef } from "react";
+import { useRef } from "react";
 import type React from "react";
-import type { RemoteTrack } from "@pulsebeam/react";
+import { useRemoteMedia } from "@pulsebeam/react";
+import type { Agent } from "@pulsebeam/react";
 
-export type PlaybackRetry = () => void;
+export type PlaybackRetry = () => Promise<void>;
 
 export function RemoteMedia({
-  track,
+  agent,
+  publicationId,
+  kind,
   onBlocked,
 }: {
-  track: RemoteTrack;
+  agent: Agent;
+  publicationId: string;
+  kind: "audio" | "video";
   onBlocked(reason: string, retry: PlaybackRetry): void;
 }) {
   const ref = useRef<HTMLMediaElement>(null);
 
-  useEffect(() => {
-    const element = ref.current;
-    if (!element) return;
-    const retry = () => {
-      void element.play().catch((reason) => {
-        // React can move a publication between the rail and spotlight while
-        // play() is still pending. Cleanup pauses the old element, which is
-        // expected and does not require user recovery.
-        if (reason instanceof DOMException && reason.name === "AbortError")
-          return;
-        onBlocked(
-          reason instanceof Error ? reason.message : "Playback was blocked",
-          retry,
-        );
-      });
-    };
-    element.srcObject = new MediaStream([track.media]);
-    retry();
-    return () => {
-      element.pause();
-      element.srcObject = null;
-    };
-  }, [onBlocked, track]);
+  useRemoteMedia(agent, ref, {
+    publicationIds: [publicationId],
+    onPlaybackBlocked: (failure, retry) => onBlocked(failure.message, retry),
+  });
 
-  return track.kind === "video" ? (
+  return kind === "video" ? (
     <video
       ref={ref as React.RefObject<HTMLVideoElement>}
       autoPlay

@@ -90,7 +90,12 @@ export function Room({
   }, [endpoint, roomId, stream]);
   return agent ? (
     <AgentProvider agent={agent}>
-      <RoomSession roomId={roomId} stream={stream} onLeave={onLeave} />
+      <RoomSession
+        agent={agent}
+        roomId={roomId}
+        stream={stream}
+        onLeave={onLeave}
+      />
     </AgentProvider>
   ) : (
     <main className="grid h-dvh place-items-center">Joining room…</main>
@@ -98,10 +103,12 @@ export function Room({
 }
 
 function RoomSession({
+  agent: playbackAgent,
   roomId,
   stream,
   onLeave,
 }: {
+  agent: Agent;
   roomId: string;
   stream: MediaStream;
   onLeave(): void;
@@ -326,7 +333,9 @@ function RoomSession({
             >
               {spotlight && agent.tracks[spotlight]?.kind === "video" ? (
                 <RemoteMedia
-                  track={agent.tracks[spotlight]}
+                  agent={playbackAgent}
+                  publicationId={spotlight}
+                  kind="video"
                   onBlocked={onBlocked}
                 />
               ) : (
@@ -456,7 +465,9 @@ function RoomSession({
                     >
                       {agent.tracks[publication.id]?.kind === "video" ? (
                         <RemoteMedia
-                          track={agent.tracks[publication.id]}
+                          agent={playbackAgent}
+                          publicationId={publication.id}
+                          kind="video"
                           onBlocked={onBlocked}
                         />
                       ) : (
@@ -552,8 +563,10 @@ function RoomSession({
         </main>
         {audioTracks.map((track) => (
           <RemoteMedia
+            agent={playbackAgent}
             key={track.publicationId}
-            track={track}
+            publicationId={track.publicationId}
+            kind="audio"
             onBlocked={onBlocked}
           />
         ))}
