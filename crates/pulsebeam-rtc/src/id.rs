@@ -60,6 +60,12 @@ caller_id!(DataChannelId, u16);
 caller_id!(IceTcpFlowId, u64);
 caller_id!(FrameId, u64);
 
+impl SenderId {
+    pub(crate) const fn value(self) -> u16 {
+        self.0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

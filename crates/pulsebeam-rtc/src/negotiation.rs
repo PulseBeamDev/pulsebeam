@@ -9,6 +9,7 @@
 
 use std::{collections::HashSet, sync::Arc};
 
+use p256::ecdsa::{DerSignature, SigningKey, signature::Signer};
 use sha2::{Digest, Sha256};
 use str0m::sdp::{MediaAttribute, MediaType, Proto, Sdp, SessionAttribute, Setup};
 
@@ -34,6 +35,7 @@ const TWCC_URIS: [&str; 2] = [
     "http://www.webrtc.org/experiments/rtp-hdrext/transport-wide-cc-01",
 ];
 const PLAYOUT_DELAY_URI: &str = "http://www.webrtc.org/experiments/rtp-hdrext/playout-delay";
+const MID_URI: &str = "urn:ietf:params:rtp-hdrext:sdes:mid";
 
 pub(crate) struct NegotiationResult {
     pub(crate) answer: SdpAnswer,
@@ -68,6 +70,16 @@ pub(crate) struct IngressMediaFacts {
     pub(crate) ssrcs: Box<[u32]>,
     pub(crate) rids: Box<[Box<str>]>,
     pub(crate) extensions: Box<[(u8, Box<str>)]>,
+}
+
+pub(crate) struct EgressSenderFacts {
+    pub(crate) id: SenderId,
+    pub(crate) kind: crate::MediaKind,
+    pub(crate) mid: Box<str>,
+    pub(crate) payload_type: u8,
+    pub(crate) clock_rate: u32,
+    pub(crate) mid_extension_id: Option<u8>,
+    pub(crate) twcc_extension_id: Option<u8>,
 }
 
 impl NegotiatedSessionFacts {
@@ -121,6 +133,63 @@ impl NegotiatedSessionFacts {
                 })
             })
             .collect()
+    }
+
+    pub(crate) fn egress_senders(&self) -> Box<[EgressSenderFacts]> {
+        let mut next_id = 1_u16;
+        self.media
+            .iter()
+            .filter(|section| {
+                section.kind != SectionKind::Application && section.direction.allows_send()
+            })
+            .filter_map(|section| {
+                let codec = section.codecs.first()?;
+                let id = SenderId::new(next_id)?;
+                next_id = next_id.checked_add(1).unwrap_or(next_id);
+                let extension_id = |uri: &str| {
+                    section
+                        .extensions
+                        .iter()
+                        .find(|extension| extension.direction.allows_send() && extension.uri == uri)
+                        .map(|extension| extension.id)
+                };
+                Some(EgressSenderFacts {
+                    id,
+                    kind: match section.kind {
+                        SectionKind::Audio => crate::MediaKind::Audio,
+                        SectionKind::Video => crate::MediaKind::Video,
+                        SectionKind::Application => return None,
+                    },
+                    mid: section.mid.clone().into_boxed_str(),
+                    payload_type: codec.payload_type,
+                    clock_rate: codec.clock_rate,
+                    mid_extension_id: extension_id(MID_URI),
+                    twcc_extension_id: TWCC_URIS.iter().find_map(|uri| extension_id(uri)),
+                })
+            })
+            .collect()
+    }
+
+    pub(crate) fn outbound_payload_types(&self) -> Box<[u8]> {
+        self.egress_senders()
+            .iter()
+            .map(|sender| sender.payload_type)
+            .collect()
+    }
+
+    pub(crate) fn outbound_twcc_payload_map(&self) -> Box<[(u8, u8)]> {
+        self.egress_senders()
+            .iter()
+            .filter_map(|sender| {
+                sender
+                    .twcc_extension_id
+                    .map(|extension_id| (sender.payload_type, extension_id))
+            })
+            .collect()
+    }
+
+    pub(crate) const fn protocol_randomness(&self) -> &[u8; 32] {
+        &self.protocol_randomness
     }
 }
 
@@ -1187,21 +1256,69 @@ fn token(bytes: &[u8]) -> String {
         .collect()
 }
 
+struct DeterministicP256Key {
+    signing_key: SigningKey,
+    public_key: Box<[u8]>,
+}
+
+impl DeterministicP256Key {
+    fn new(seed: &[u8; 32]) -> Result<Self, NegotiationError> {
+        let signing_key = SigningKey::from_slice(seed)
+            .map_err(|_| NegotiationError(AcceptError::CryptographicFailure))?;
+        let public_key = signing_key
+            .verifying_key()
+            .to_encoded_point(false)
+            .as_bytes()
+            .into();
+        Ok(Self {
+            signing_key,
+            public_key,
+        })
+    }
+}
+
+impl rcgen::PublicKeyData for DeterministicP256Key {
+    fn der_bytes(&self) -> &[u8] {
+        &self.public_key
+    }
+
+    fn algorithm(&self) -> &'static rcgen::SignatureAlgorithm {
+        &rcgen::PKCS_ECDSA_P256_SHA256
+    }
+}
+
+impl rcgen::SigningKey for DeterministicP256Key {
+    fn sign(&self, message: &[u8]) -> Result<Vec<u8>, rcgen::Error> {
+        let signature: DerSignature = self.signing_key.sign(message);
+        Ok(signature.as_bytes().to_vec())
+    }
+}
+
 fn dtls_identity(
     entropy: &mut EntropyConsumer,
 ) -> Result<(str0m::crypto::dtls::DtlsCert, Fingerprint), NegotiationError> {
-    const ED25519_PKCS8_PREFIX: [u8; 16] = [
-        0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04,
-        0x20,
+    const P256_PKCS8_PREFIX: [u8; 35] = [
+        0x30, 0x41, 0x02, 0x01, 0x00, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02,
+        0x01, 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x04, 0x27, 0x30, 0x25,
+        0x02, 0x01, 0x01, 0x04, 0x20,
     ];
-    let seed = entropy.take::<32>(b"dtls identity");
-    let mut private_key = Vec::with_capacity(48);
-    private_key.extend_from_slice(&ED25519_PKCS8_PREFIX);
+    let mut seed = entropy.take::<32>(b"dtls identity");
+    if let Some(first) = seed.first_mut() {
+        *first &= 0x7f;
+    }
+    if seed.iter().all(|byte| *byte == 0)
+        && let Some(last) = seed.last_mut()
+    {
+        *last = 1;
+    }
+    let mut private_key = Vec::with_capacity(P256_PKCS8_PREFIX.len().saturating_add(seed.len()));
+    private_key.extend_from_slice(&P256_PKCS8_PREFIX);
     private_key.extend_from_slice(&seed);
     let key_pair = rcgen::KeyPair::try_from(private_key)
         .map_err(|_| NegotiationError(AcceptError::CryptographicFailure))?;
+    let signing_key = DeterministicP256Key::new(&seed)?;
     let certificate = rcgen::CertificateParams::default()
-        .self_signed(&key_pair)
+        .self_signed(&signing_key)
         .map_err(|_| NegotiationError(AcceptError::CryptographicFailure))?;
     let certificate = certificate.der().to_vec();
     let fingerprint = Fingerprint {

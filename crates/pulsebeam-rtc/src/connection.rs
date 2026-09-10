@@ -9,8 +9,10 @@ use bytes::Bytes;
 use sha2::{Digest, Sha256};
 
 use crate::{
-    AcceptError, CloseReason, ConnectionConfig, ConnectionEntropy, ConnectionWarning, Event,
-    NetworkInput, Output, ReceiveError, SdpAnswer, SdpOffer, SessionInfo, TimePoint, Transmit,
+    AcceptError, CloseReason, Command, CommandError, ConnectionConfig, ConnectionEntropy,
+    ConnectionWarning, Event, NetworkInput, Output, ReceiveError, SdpAnswer, SdpOffer, SessionInfo,
+    TimePoint, Transmit,
+    egress::{MediaEgress, PrepareResult},
     ingress::IngressOwner,
     negotiation::{self, NegotiatedSessionFacts},
     time::MonotonicObserver,
@@ -38,6 +40,7 @@ pub struct Connection {
 struct SubsystemSlots {
     transport: Transport,
     ingress: IngressOwner,
+    egress: MediaEgress,
 }
 
 trait RuntimeSubsystem: Send {
@@ -145,6 +148,35 @@ pub struct AcceptedConnection {
 }
 
 impl Connection {
+    pub fn command(&mut self, at: TimePoint, command: Command) -> Result<(), CommandError> {
+        let _ = self._time.observe(at);
+        if self.runtime.closed {
+            return Err(CommandError::Closed);
+        }
+        match command {
+            Command::SendMedia { sender, media } => {
+                match self._subsystems.transport.state() {
+                    TransportState::Closed | TransportState::Failed => {
+                        return Err(CommandError::Closed);
+                    }
+                    TransportState::Connected => {}
+                    TransportState::Checking
+                    | TransportState::Connecting
+                    | TransportState::Draining => return Err(CommandError::InvalidState),
+                }
+                self._subsystems.egress.admit(sender, media)
+            }
+            Command::SetSenderPolicy { .. }
+            | Command::RequestKeyframe { .. }
+            | Command::RetireEncoding { .. }
+            | Command::OpenDataChannel(_)
+            | Command::SendData { .. }
+            | Command::CloseDataChannel { .. }
+            | Command::CloseGracefully { .. }
+            | Command::Abort => Err(CommandError::InvalidState),
+        }
+    }
+
     pub fn receive(&mut self, at: TimePoint, input: NetworkInput) -> Result<(), ReceiveError> {
         let at = self._time.observe(at);
         self._subsystems
@@ -191,6 +223,29 @@ impl Connection {
             && let Some(prepared) = self._subsystems.transport.poll_prepared()
         {
             return Output::Transmit(self.runtime.commit.commit_transport(at.monotonic, prepared));
+        }
+
+        if !self.runtime.closed {
+            match self
+                ._subsystems
+                .egress
+                .prepare_one(&mut self._subsystems.transport)
+            {
+                PrepareResult::Prepared => {
+                    let Some(prepared) = self._subsystems.transport.poll_prepared() else {
+                        self.runtime.closed = true;
+                        return Output::Closed(CloseReason::TransportFailure);
+                    };
+                    return Output::Transmit(
+                        self.runtime.commit.commit_transport(at.monotonic, prepared),
+                    );
+                }
+                PrepareResult::Fatal => {
+                    self.runtime.closed = true;
+                    return Output::Closed(CloseReason::TransportFailure);
+                }
+                PrepareResult::Blocked => {}
+            }
         }
 
         if !self.runtime.closed
@@ -281,11 +336,22 @@ impl Connection {
             config.limits.max_unsignaled_encodings,
             config.limits.max_queued_media_bytes,
         );
+        let egress = MediaEgress::new(
+            negotiated.facts.egress_senders(),
+            negotiated.facts.protocol_randomness(),
+            config.limits.max_queued_media_bytes,
+            config.default_audio_policy,
+            config.default_video_policy,
+        );
         let connection = Self {
             _config: config,
             session: negotiated.facts,
             _time: MonotonicObserver::starting_at(at),
-            _subsystems: SubsystemSlots { transport, ingress },
+            _subsystems: SubsystemSlots {
+                transport,
+                ingress,
+                egress,
+            },
             runtime: Runtime::new(),
             _not_sync: PhantomData,
         };

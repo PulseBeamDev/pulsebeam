@@ -158,6 +158,7 @@ pub(crate) struct TransportConfig {
     pub max_transmissions: usize,
     rtp_payload_types: Box<[u8]>,
     twcc_extension_id: Option<u8>,
+    twcc_payload_map: Box<[(u8, u8)]>,
 }
 
 impl TransportConfig {
@@ -205,6 +206,7 @@ impl TransportConfig {
             max_transmissions: MAX_TRANSMISSIONS,
             rtp_payload_types: Box::new([]),
             twcc_extension_id: None,
+            twcc_payload_map: Box::new([]),
         }
     }
 
@@ -221,6 +223,11 @@ impl TransportConfig {
 
     fn with_twcc_extension_id(mut self, twcc_extension_id: Option<u8>) -> Self {
         self.twcc_extension_id = twcc_extension_id;
+        self
+    }
+
+    fn with_twcc_payload_map(mut self, twcc_payload_map: Box<[(u8, u8)]>) -> Self {
+        self.twcc_payload_map = twcc_payload_map;
         self
     }
 
@@ -270,6 +277,7 @@ pub(crate) struct Transport {
     dtls_role: DtlsRole,
     rtp_payload_types: Box<[u8]>,
     twcc_extension_id: Option<u8>,
+    twcc_payload_map: Box<[(u8, u8)]>,
     events: VecDeque<TransportEvent>,
     transmissions: VecDeque<PreparedTransmit>,
     pending_dtls: VecDeque<(SelectedPath, Vec<u8>)>,
@@ -384,6 +392,8 @@ impl Transport {
             },
             facts.local_dtls_role,
         )
+        .with_rtp_payload_types(facts.outbound_payload_types())
+        .with_twcc_payload_map(facts.outbound_twcc_payload_map())
         .with_twcc_extension_id(facts.outbound_twcc_extension_id());
         Self::new(config, now)
     }
@@ -422,6 +432,7 @@ impl Transport {
             dtls_role: config.dtls_role,
             rtp_payload_types: config.rtp_payload_types,
             twcc_extension_id: config.twcc_extension_id,
+            twcc_payload_map: config.twcc_payload_map,
             events: VecDeque::new(),
             transmissions: VecDeque::new(),
             pending_dtls: VecDeque::new(),
@@ -793,11 +804,24 @@ impl Transport {
         let rtp = if kind == DatagramKind::Rtp {
             let metadata =
                 outbound_rtp_metadata(packet).map_err(|_| TransportError::InvalidInput)?;
+            let twcc_sequence = self
+                .twcc_payload_map
+                .iter()
+                .filter(|(payload_type, _)| *payload_type == metadata.payload_type)
+                .find_map(|(_, extension_id)| {
+                    outbound_twcc_sequence(packet, Some(*extension_id))
+                        .ok()
+                        .flatten()
+                })
+                .or_else(|| {
+                    outbound_twcc_sequence(packet, self.twcc_extension_id)
+                        .ok()
+                        .flatten()
+                });
             Some(PreparedRtpIdentity {
                 ssrc: metadata.ssrc,
                 sequence: metadata.sequence,
-                twcc_sequence: outbound_twcc_sequence(packet, self.twcc_extension_id)
-                    .map_err(|_| TransportError::InvalidInput)?,
+                twcc_sequence,
                 service: RtpService::Original,
             })
         } else {

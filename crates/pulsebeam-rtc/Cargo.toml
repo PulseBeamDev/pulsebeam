@@ -12,6 +12,7 @@ license.workspace = true
 bytes.workspace = true
 dcsctp = "=0.1.14"
 is = { git = "https://github.com/PulseBeamDev/str0m.git", branch = "patch/0.23.1" }
+p256 = { version = "0.13.2", default-features = false, features = ["ecdsa", "std"] }
 rcgen = { version = "0.14.7", default-features = false, features = ["aws_lc_rs"] }
 sha2.workspace = true
 str0m = { git = "https://github.com/PulseBeamDev/str0m.git", branch = "patch/0.23.1", default-features = false, features = ["aws-lc-rs"] }

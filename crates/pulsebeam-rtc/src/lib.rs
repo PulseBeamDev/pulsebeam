@@ -1,5 +1,6 @@
 mod clock;
 mod connection;
+mod egress;
 mod id;
 mod ingress;
 mod io;
