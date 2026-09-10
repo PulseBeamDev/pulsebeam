@@ -14,7 +14,10 @@ use crate::{
     ingress::IngressOwner,
     negotiation::{self, NegotiatedSessionFacts},
     time::MonotonicObserver,
-    transport::{PreparedTransmit, Transport, TransportError, TransportEvent, TransportState},
+    transport::{
+        DatagramKind, PathEpoch, PreparedRtpIdentity, PreparedTransmit, Transport, TransportError,
+        TransportEvent, TransportState,
+    },
 };
 
 const MAX_INGRESS_PACKETS: usize = 256;
@@ -61,7 +64,7 @@ impl Runtime {
             controller: None,
             scheduler: None,
             sctp: None,
-            commit: CommitCoordinator,
+            commit: CommitCoordinator::new(),
             closed: false,
         }
     }
@@ -92,16 +95,42 @@ impl Runtime {
     }
 }
 
-struct CommitCoordinator;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct TransmitCommitContext {
+    pub(crate) at: Instant,
+    pub(crate) kind: DatagramKind,
+    pub(crate) wire_len: usize,
+    pub(crate) path_epoch: Option<PathEpoch>,
+    pub(crate) rtp: Option<PreparedRtpIdentity>,
+}
+
+trait CommitParticipant: Send {
+    fn commit(&mut self, context: TransmitCommitContext);
+}
+
+struct CommitCoordinator {
+    participants: Vec<Box<dyn CommitParticipant>>,
+}
 
 impl CommitCoordinator {
-    fn commit_transport(&mut self, prepared: PreparedTransmit) -> Transmit {
-        let PreparedTransmit {
-            target,
-            bytes,
-            kind: _,
-            wire_len: _,
-        } = prepared;
+    fn new() -> Self {
+        Self {
+            participants: Vec::new(),
+        }
+    }
+
+    fn commit_transport(&mut self, at: Instant, prepared: PreparedTransmit) -> Transmit {
+        let context = TransmitCommitContext {
+            at,
+            kind: prepared.kind,
+            wire_len: prepared.wire_len,
+            path_epoch: prepared.path_epoch,
+            rtp: prepared.rtp,
+        };
+        for participant in &mut self.participants {
+            participant.commit(context);
+        }
+        let PreparedTransmit { target, bytes, .. } = prepared;
         Transmit {
             target,
             payload: Bytes::from(bytes),
@@ -161,7 +190,7 @@ impl Connection {
         if !self.runtime.closed
             && let Some(prepared) = self._subsystems.transport.poll_prepared()
         {
-            return Output::Transmit(self.runtime.commit.commit_transport(prepared));
+            return Output::Transmit(self.runtime.commit.commit_transport(at.monotonic, prepared));
         }
 
         if !self.runtime.closed
@@ -194,16 +223,23 @@ impl Connection {
                 self.runtime.closed = true;
                 Some(Output::Closed(CloseReason::TransportFailure))
             }
-            TransportEvent::StateChanged(_) | TransportEvent::IceStateChanged(_) => None,
+            TransportEvent::StateChanged(_)
+            | TransportEvent::IceStateChanged(_)
+            | TransportEvent::SelectedPathChanged { .. } => None,
             TransportEvent::Rtp {
                 arrival,
+                path_epoch: _,
                 bytes,
                 metadata: _,
             } => {
                 self._subsystems.ingress.accept_rtp(arrival, bytes);
                 self._subsystems.ingress.poll_event().map(Output::Event)
             }
-            TransportEvent::Rtcp { arrival, bytes } => {
+            TransportEvent::Rtcp {
+                arrival,
+                path_epoch: _,
+                bytes,
+            } => {
                 self._subsystems.ingress.accept_rtcp(
                     arrival,
                     bytes,
@@ -300,5 +336,64 @@ impl EntropyConsumer {
 impl Drop for EntropyConsumer {
     fn drop(&mut self) {
         self.seed.fill(0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::TransmitTarget;
+    use std::sync::{Arc, Mutex};
+
+    struct Observer(Arc<Mutex<Option<TransmitCommitContext>>>);
+
+    impl CommitParticipant for Observer {
+        fn commit(&mut self, context: TransmitCommitContext) {
+            *self.0.lock().expect("observer lock") = Some(context);
+        }
+    }
+
+    #[test]
+    fn commit_preserves_finalized_wire_context() {
+        let at = Instant::now();
+        let mut coordinator = CommitCoordinator::new();
+        let observed = Arc::new(Mutex::new(None));
+        coordinator
+            .participants
+            .push(Box::new(Observer(Arc::clone(&observed))));
+        let transmit = coordinator.commit_transport(
+            at,
+            PreparedTransmit {
+                target: TransmitTarget::IceTcp {
+                    flow: crate::IceTcpFlowId::from_value(11),
+                },
+                bytes: vec![0, 3, 1, 2, 3],
+                kind: DatagramKind::Rtp,
+                wire_len: 5,
+                path_epoch: Some(PathEpoch::from_value(3)),
+                rtp: Some(PreparedRtpIdentity {
+                    ssrc: 7,
+                    sequence: 9,
+                    twcc_sequence: Some(13),
+                    service: crate::transport::RtpService::Original,
+                }),
+            },
+        );
+        assert_eq!(transmit.payload, Bytes::from_static(&[0, 3, 1, 2, 3]));
+        assert_eq!(
+            *observed.lock().expect("observer lock"),
+            Some(TransmitCommitContext {
+                at,
+                kind: DatagramKind::Rtp,
+                wire_len: 5,
+                path_epoch: Some(PathEpoch::from_value(3)),
+                rtp: Some(PreparedRtpIdentity {
+                    ssrc: 7,
+                    sequence: 9,
+                    twcc_sequence: Some(13),
+                    service: crate::transport::RtpService::Original,
+                }),
+            })
+        );
     }
 }

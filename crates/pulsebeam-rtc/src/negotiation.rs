@@ -71,6 +71,18 @@ pub(crate) struct IngressMediaFacts {
 }
 
 impl NegotiatedSessionFacts {
+    pub(crate) fn outbound_twcc_extension_id(&self) -> Option<u8> {
+        self.media.iter().find_map(|section| {
+            section
+                .extensions
+                .iter()
+                .find(|extension| {
+                    extension.direction.allows_send() && TWCC_URIS.contains(&extension.uri.as_str())
+                })
+                .map(|extension| extension.id)
+        })
+    }
+
     pub(crate) fn ingress_media(&self) -> Box<[IngressMediaFacts]> {
         self.media
             .iter()

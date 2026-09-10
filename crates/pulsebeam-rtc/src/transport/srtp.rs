@@ -3,6 +3,8 @@ use str0m::crypto::dtls::{KeyingMaterial, SrtpProfile};
 use str0m::rtp::RtpHeader;
 use str0m::rtp_::{SrtpContext, extend_u16};
 
+use crate::packet::RtpPacket;
+
 const MAX_SSRC_STATES: usize = 512;
 const MAX_RTP_EXTENSION_BYTES: usize = 16 * 1024;
 const SRTCP_INDEX_MASK: u64 = 0x7fff_ffff;
@@ -26,6 +28,34 @@ pub struct RtpMetadata {
     pub payload_type: u8,
     pub marker: bool,
     pub header_len: usize,
+}
+
+pub(crate) fn outbound_rtp_metadata(packet: &[u8]) -> Result<RtpMetadata, SrtpError> {
+    let parsed = RtpPacket::parse(packet).map_err(|_| SrtpError::InvalidPacket)?;
+    Ok(RtpMetadata {
+        sequence: parsed.sequence(),
+        timestamp: parsed.timestamp(),
+        ssrc: parsed.ssrc(),
+        payload_type: parsed.payload_type(),
+        marker: parsed.marker(),
+        header_len: parsed.payload_range().start,
+    })
+}
+
+pub(crate) fn outbound_twcc_sequence(
+    packet: &[u8],
+    twcc_extension_id: Option<u8>,
+) -> Result<Option<u16>, SrtpError> {
+    let Some(id) = twcc_extension_id else {
+        return Ok(None);
+    };
+    let parsed = RtpPacket::parse(packet).map_err(|_| SrtpError::InvalidPacket)?;
+    Ok(parsed
+        .extensions()
+        .map_err(|_| SrtpError::InvalidPacket)?
+        .find(|extension| extension.id() == id && extension.value().len() == 2)
+        .and_then(|extension| extension.value().try_into().ok())
+        .map(u16::from_be_bytes))
 }
 
 struct RtpHeaderFacts {

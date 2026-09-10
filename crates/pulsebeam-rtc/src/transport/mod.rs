@@ -19,7 +19,7 @@ use str0m::crypto::dtls::DtlsCert;
 use crate::negotiation::{DtlsRole, NegotiatedSessionFacts};
 use crate::{GlobalMediaTime, IceTcpFlowId, NetworkInput, TimePoint, TransmitTarget};
 
-use srtp::{RtpMetadata, SrtpError};
+use srtp::{RtpMetadata, SrtpError, outbound_rtp_metadata, outbound_twcc_sequence};
 
 const MAX_EVENTS: usize = 256;
 const MAX_TRANSMISSIONS: usize = 256;
@@ -45,18 +45,51 @@ pub(crate) enum DatagramKind {
     Rtcp,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub(crate) struct PathEpoch(u64);
+
+impl PathEpoch {
+    pub(crate) const fn from_value(value: u64) -> Self {
+        Self(value)
+    }
+
+    fn next(self) -> Option<Self> {
+        self.0.checked_add(1).map(Self)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PreparedRtpIdentity {
+    pub(crate) ssrc: u32,
+    pub(crate) sequence: u16,
+    pub(crate) twcc_sequence: Option<u16>,
+    pub(crate) service: RtpService,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RtpService {
+    Original,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum TransportEvent {
     StateChanged(TransportState),
     IceStateChanged(IceConnectionState),
     Rtp {
         arrival: TimePoint,
+        path_epoch: PathEpoch,
         bytes: Vec<u8>,
         metadata: RtpMetadata,
     },
     Rtcp {
         arrival: TimePoint,
+        path_epoch: PathEpoch,
         bytes: Vec<u8>,
+    },
+    SelectedPathChanged {
+        previous: Option<NetworkEnvelope>,
+        current: Option<NetworkEnvelope>,
+        epoch: PathEpoch,
     },
     Data(Vec<u8>),
     Closed,
@@ -77,6 +110,8 @@ pub(crate) struct PreparedTransmit {
     pub(crate) bytes: Vec<u8>,
     pub(crate) kind: DatagramKind,
     pub(crate) wire_len: usize,
+    pub(crate) path_epoch: Option<PathEpoch>,
+    pub(crate) rtp: Option<PreparedRtpIdentity>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -122,6 +157,7 @@ pub(crate) struct TransportConfig {
     pub max_events: usize,
     pub max_transmissions: usize,
     rtp_payload_types: Box<[u8]>,
+    twcc_extension_id: Option<u8>,
 }
 
 impl TransportConfig {
@@ -168,6 +204,7 @@ impl TransportConfig {
             max_events: MAX_EVENTS,
             max_transmissions: MAX_TRANSMISSIONS,
             rtp_payload_types: Box::new([]),
+            twcc_extension_id: None,
         }
     }
 
@@ -179,6 +216,11 @@ impl TransportConfig {
 
     pub(crate) fn with_rtp_payload_types(mut self, payload_types: Box<[u8]>) -> Self {
         self.rtp_payload_types = payload_types;
+        self
+    }
+
+    fn with_twcc_extension_id(mut self, twcc_extension_id: Option<u8>) -> Self {
+        self.twcc_extension_id = twcc_extension_id;
         self
     }
 
@@ -216,6 +258,7 @@ impl TransportConfig {
 
 pub(crate) struct Transport {
     selected: Option<SelectedPath>,
+    next_path_epoch: PathEpoch,
     state: TransportState,
     last_now: Option<Instant>,
     ice: ice::IceLayer,
@@ -226,6 +269,7 @@ pub(crate) struct Transport {
     remote_fingerprint: Fingerprint,
     dtls_role: DtlsRole,
     rtp_payload_types: Box<[u8]>,
+    twcc_extension_id: Option<u8>,
     events: VecDeque<TransportEvent>,
     transmissions: VecDeque<PreparedTransmit>,
     pending_dtls: VecDeque<(SelectedPath, Vec<u8>)>,
@@ -281,20 +325,29 @@ impl NetworkEnvelope {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct SelectedPath(NetworkEnvelope);
+pub(crate) struct SelectedPath {
+    envelope: NetworkEnvelope,
+    epoch: Option<PathEpoch>,
+}
 
 impl SelectedPath {
+    fn unselected(envelope: NetworkEnvelope) -> Self {
+        Self {
+            envelope,
+            epoch: None,
+        }
+    }
     fn source(&self) -> SocketAddr {
-        self.0.source()
+        self.envelope.source()
     }
     fn destination(&self) -> SocketAddr {
-        self.0.destination()
+        self.envelope.destination()
     }
     fn protocol(&self) -> is::Protocol {
-        self.0.protocol()
+        self.envelope.protocol()
     }
     fn target(&self) -> TransmitTarget {
-        self.0.target()
+        self.envelope.target()
     }
 }
 
@@ -330,7 +383,8 @@ impl Transport {
                 bytes: facts.remote_fingerprint.value.to_vec(),
             },
             facts.local_dtls_role,
-        );
+        )
+        .with_twcc_extension_id(facts.outbound_twcc_extension_id());
         Self::new(config, now)
     }
 
@@ -356,6 +410,7 @@ impl Transport {
         );
         let mut transport = Self {
             selected: None,
+            next_path_epoch: PathEpoch(0),
             state: TransportState::Checking,
             last_now: Some(now),
             ice,
@@ -366,6 +421,7 @@ impl Transport {
             remote_fingerprint,
             dtls_role: config.dtls_role,
             rtp_payload_types: config.rtp_payload_types,
+            twcc_extension_id: config.twcc_extension_id,
             events: VecDeque::new(),
             transmissions: VecDeque::new(),
             pending_dtls: VecDeque::new(),
@@ -473,7 +529,7 @@ impl Transport {
                 monotonic: now,
                 global: GlobalMediaTime::from_micros(0),
             },
-            SelectedPath(NetworkEnvelope::Udp {
+            SelectedPath::unselected(NetworkEnvelope::Udp {
                 local: destination,
                 remote: source,
             }),
@@ -543,8 +599,14 @@ impl Transport {
                     DatagramKind::Rtp => match srtp.unprotect_rtp(&bytes) {
                         Ok((bytes, metadata)) => {
                             if self.accepts_payload_type(metadata.payload_type) {
+                                let path_epoch = self
+                                    .selected
+                                    .as_ref()
+                                    .and_then(|selected| selected.epoch)
+                                    .ok_or(TransportError::Protocol)?;
                                 self.push_event(TransportEvent::Rtp {
                                     arrival,
+                                    path_epoch,
                                     bytes,
                                     metadata,
                                 })?;
@@ -557,7 +619,18 @@ impl Transport {
                         }
                     },
                     DatagramKind::Rtcp => match srtp.unprotect_rtcp(&bytes) {
-                        Ok(bytes) => self.push_event(TransportEvent::Rtcp { arrival, bytes })?,
+                        Ok(bytes) => {
+                            let path_epoch = self
+                                .selected
+                                .as_ref()
+                                .and_then(|selected| selected.epoch)
+                                .ok_or(TransportError::Protocol)?;
+                            self.push_event(TransportEvent::Rtcp {
+                                arrival,
+                                path_epoch,
+                                bytes,
+                            })?;
+                        }
                         Err(SrtpError::Replay | SrtpError::InvalidPacket) => self.drop_input(),
                         Err(SrtpError::Crypto) => self.fail(TransportError::Crypto)?,
                         Err(SrtpError::OutputFull | SrtpError::UnsupportedProfile) => {
@@ -634,7 +707,12 @@ impl Transport {
                 )
             }
         };
-        self.handle_envelope(arrival.monotonic, arrival, SelectedPath(envelope), bytes)
+        self.handle_envelope(
+            arrival.monotonic,
+            arrival,
+            SelectedPath::unselected(envelope),
+            bytes,
+        )
     }
 
     fn local_candidates_contains(&self, address: SocketAddr, proto: is::Protocol) -> bool {
@@ -712,6 +790,19 @@ impl Transport {
                 return Err(TransportError::InvalidInput);
             }
         }
+        let rtp = if kind == DatagramKind::Rtp {
+            let metadata =
+                outbound_rtp_metadata(packet).map_err(|_| TransportError::InvalidInput)?;
+            Some(PreparedRtpIdentity {
+                ssrc: metadata.ssrc,
+                sequence: metadata.sequence,
+                twcc_sequence: outbound_twcc_sequence(packet, self.twcc_extension_id)
+                    .map_err(|_| TransportError::InvalidInput)?,
+                service: RtpService::Original,
+            })
+        } else {
+            None
+        };
         let Some(srtp) = self.srtp.as_mut() else {
             return Err(TransportError::Protocol);
         };
@@ -721,7 +812,7 @@ impl Transport {
             _ => Err(SrtpError::InvalidPacket),
         }
         .map_err(|_| TransportError::Crypto)?;
-        self.prepare_transmit(path, bytes, kind)
+        self.prepare_transmit(path, bytes, kind, rtp)
     }
 
     fn drain_ice(
@@ -734,7 +825,7 @@ impl Transport {
                 self.drop_input();
                 continue;
             };
-            self.prepare_transmit(path, bytes, DatagramKind::Stun)?;
+            self.prepare_transmit(path, bytes, DatagramKind::Stun, None)?;
         }
         while let Some(event) = self.ice.poll_event() {
             match event {
@@ -753,7 +844,7 @@ impl Transport {
                         self.drop_input();
                         continue;
                     };
-                    self.selected = Some(path);
+                    self.select_path(path)?;
                     self.state = TransportState::Connecting;
                     self.push_event(TransportEvent::StateChanged(TransportState::Connecting))?;
                     self.start_dtls(now, provider)?;
@@ -762,7 +853,7 @@ impl Transport {
                     if self.dtls.is_some() {
                         self.fail(TransportError::Protocol)?;
                     }
-                    self.selected = None;
+                    self.clear_selected_path()?;
                     self.srtp = None;
                     self.pending_dtls.clear();
                     self.state = TransportState::Checking;
@@ -826,7 +917,7 @@ impl Transport {
         let _ = dtls;
         let path = self.selected.clone().ok_or(TransportError::Protocol)?;
         for bytes in packets {
-            self.prepare_transmit(path.clone(), bytes, DatagramKind::Dtls)?;
+            self.prepare_transmit(path.clone(), bytes, DatagramKind::Dtls, None)?;
         }
         for event in events {
             match event {
@@ -873,7 +964,7 @@ impl Transport {
         provider: &str0m::crypto::CryptoProvider,
     ) -> Result<(), TransportError> {
         if self.dtls.is_none() {
-            self.selected = Some(path);
+            self.select_path(path)?;
             self.state = TransportState::Connecting;
             self.start_dtls(now, provider)?;
         }
@@ -896,7 +987,7 @@ impl Transport {
         };
         let mut pending = std::mem::take(&mut self.pending_dtls);
         while let Some((path, bytes)) = pending.pop_front() {
-            if path == selected
+            if path.envelope == selected.envelope
                 && self
                     .ice
                     .accepts_tuple(path.source(), path.destination(), path.protocol())
@@ -923,18 +1014,26 @@ impl Transport {
         path: SelectedPath,
         mut bytes: Vec<u8>,
         kind: DatagramKind,
+        rtp: Option<PreparedRtpIdentity>,
     ) -> Result<(), TransportError> {
-        if matches!(path.0, NetworkEnvelope::IceTcp { .. }) {
+        if matches!(path.envelope, NetworkEnvelope::IceTcp { .. }) {
             let length = u16::try_from(bytes.len()).map_err(|_| TransportError::Protocol)?;
             let mut frame = length.to_be_bytes().to_vec();
             frame.extend_from_slice(&bytes);
             bytes = frame;
+        }
+        if (kind == DatagramKind::Rtp) != rtp.is_some()
+            || (kind == DatagramKind::Rtp && path.epoch.is_none())
+        {
+            return Err(TransportError::Protocol);
         }
         let transmission = PreparedTransmit {
             target: path.target(),
             wire_len: bytes.len(),
             bytes,
             kind,
+            path_epoch: path.epoch,
+            rtp,
         };
         if transmission.bytes.is_empty() || self.transmissions.len() >= self.max_transmissions {
             let _ = self.fail(TransportError::QueueFull);
@@ -952,9 +1051,13 @@ impl Transport {
         remote: SocketAddr,
     ) -> Option<SelectedPath> {
         match proto {
-            is::Protocol::Udp => self
-                .local_candidates_contains(local, proto)
-                .then_some(SelectedPath(NetworkEnvelope::Udp { local, remote })),
+            is::Protocol::Udp => {
+                self.local_candidates_contains(local, proto)
+                    .then_some(SelectedPath::unselected(NetworkEnvelope::Udp {
+                        local,
+                        remote,
+                    }))
+            }
             is::Protocol::Tcp => self
                 .tcp_flows
                 .iter()
@@ -962,7 +1065,7 @@ impl Transport {
                     *bound_local == local && *bound_remote == remote
                 })
                 .map(|(flow, _, _)| {
-                    SelectedPath(NetworkEnvelope::IceTcp {
+                    SelectedPath::unselected(NetworkEnvelope::IceTcp {
                         flow: *flow,
                         local,
                         remote,
@@ -979,7 +1082,7 @@ impl Transport {
         {
             return false;
         }
-        match path.0 {
+        match path.envelope {
             NetworkEnvelope::Udp { .. } => true,
             NetworkEnvelope::IceTcp {
                 flow,
@@ -994,10 +1097,53 @@ impl Transport {
         }
     }
 
+    fn select_path(&mut self, mut path: SelectedPath) -> Result<(), TransportError> {
+        let previous = self
+            .selected
+            .as_ref()
+            .map(|selected| selected.envelope.clone());
+        let epoch = self.advance_path_epoch()?;
+        path.epoch = Some(epoch);
+        self.selected = Some(path);
+        self.transmissions.retain(|prepared| {
+            prepared.kind != DatagramKind::Rtp || prepared.path_epoch == Some(epoch)
+        });
+        self.push_event(TransportEvent::SelectedPathChanged {
+            previous,
+            current: self
+                .selected
+                .as_ref()
+                .map(|selected| selected.envelope.clone()),
+            epoch,
+        })
+    }
+
+    fn clear_selected_path(&mut self) -> Result<(), TransportError> {
+        let Some(previous) = self.selected.take() else {
+            return Ok(());
+        };
+        let epoch = self.advance_path_epoch()?;
+        self.transmissions
+            .retain(|prepared| prepared.kind != DatagramKind::Rtp);
+        self.push_event(TransportEvent::SelectedPathChanged {
+            previous: Some(previous.envelope),
+            current: None,
+            epoch,
+        })
+    }
+
+    fn advance_path_epoch(&mut self) -> Result<PathEpoch, TransportError> {
+        let Some(epoch) = self.next_path_epoch.next() else {
+            return self.fail(TransportError::Protocol).map(|()| PathEpoch(0));
+        };
+        self.next_path_epoch = epoch;
+        Ok(epoch)
+    }
+
     fn can_queue_path(&self, path: &SelectedPath) -> bool {
         self.ice
             .can_queue_tuple(path.source(), path.destination(), path.protocol())
-            && match path.0 {
+            && match path.envelope {
                 NetworkEnvelope::Udp { .. } => true,
                 NetworkEnvelope::IceTcp {
                     flow,
@@ -1017,7 +1163,7 @@ impl Transport {
             flow,
             local,
             remote,
-        } = path.0
+        } = path.envelope
         else {
             return;
         };
@@ -1385,13 +1531,14 @@ mod tests {
         transport.transmissions.clear();
         transport
             .prepare_transmit(
-                SelectedPath(NetworkEnvelope::IceTcp {
+                SelectedPath::unselected(NetworkEnvelope::IceTcp {
                     flow: IceTcpFlowId::from_value(9),
                     local,
                     remote,
                 }),
                 vec![1, 2, 3],
                 DatagramKind::Dtls,
+                None,
             )
             .expect("prepared frame");
         let prepared = transport.poll_prepared().expect("prepared output");
@@ -1403,6 +1550,78 @@ mod tests {
         );
         assert_eq!(prepared.bytes, vec![0, 3, 1, 2, 3]);
         assert_eq!(prepared.wire_len, prepared.bytes.len());
+        assert_eq!(prepared.path_epoch, None);
+        assert_eq!(prepared.rtp, None);
+    }
+
+    #[test]
+    fn selected_path_epochs_do_not_reuse_tuples_and_drop_stale_rtp() {
+        let local_certificate = certificate();
+        let remote_certificate = certificate();
+        let local = address(6250);
+        let remote = address(6251);
+        let mut transport = Transport::new(
+            config(local, remote, local_certificate, &remote_certificate, true),
+            Instant::now(),
+        )
+        .expect("transport");
+        transport.events.clear();
+        transport.transmissions.clear();
+
+        let path = || SelectedPath::unselected(NetworkEnvelope::Udp { local, remote });
+        transport.select_path(path()).expect("first selection");
+        let first = transport.selected.clone().expect("selected path");
+        assert_eq!(first.epoch, Some(PathEpoch(1)));
+        assert!(matches!(
+            transport.poll_event(),
+            Some(TransportEvent::SelectedPathChanged {
+                previous: None,
+                current: Some(NetworkEnvelope::Udp { local: event_local, remote: event_remote }),
+                epoch: PathEpoch(1),
+            }) if event_local == local && event_remote == remote
+        ));
+
+        transport
+            .prepare_transmit(
+                first,
+                vec![0x80; 12],
+                DatagramKind::Rtp,
+                Some(PreparedRtpIdentity {
+                    ssrc: 7,
+                    sequence: 9,
+                    twcc_sequence: None,
+                    service: RtpService::Original,
+                }),
+            )
+            .expect("queued RTP");
+        transport
+            .select_path(path())
+            .expect("same tuple replacement");
+        assert!(transport.poll_prepared().is_none());
+        assert!(matches!(
+            transport.poll_event(),
+            Some(TransportEvent::SelectedPathChanged {
+                epoch: PathEpoch(2),
+                ..
+            })
+        ));
+
+        transport
+            .clear_selected_path()
+            .expect("clear selected path");
+        assert!(matches!(
+            transport.poll_event(),
+            Some(TransportEvent::SelectedPathChanged {
+                current: None,
+                epoch: PathEpoch(3),
+                ..
+            })
+        ));
+        transport.select_path(path()).expect("reselect tuple");
+        assert_eq!(
+            transport.selected.and_then(|selected| selected.epoch),
+            Some(PathEpoch(4))
+        );
     }
 
     #[test]
@@ -1604,10 +1823,24 @@ mod tests {
 
         let mut rtp = vec![0x80, 96, 0, 1, 0, 0, 0, 1, 0, 0, 0, 7, 1, 2, 3];
         left.send_rtp(&rtp).expect("left protects RTP");
-        let transmit = left.poll_transmit().expect("protected RTP transmit");
+        let transmit = left.poll_prepared().expect("protected RTP transmit");
         assert_eq!(transmit.kind, DatagramKind::Rtp);
+        assert_eq!(transmit.wire_len, transmit.bytes.len());
+        assert_eq!(transmit.path_epoch, Some(PathEpoch(1)));
+        assert_eq!(
+            transmit.rtp,
+            Some(PreparedRtpIdentity {
+                ssrc: 7,
+                sequence: 1,
+                twcc_sequence: None,
+                service: RtpService::Original,
+            })
+        );
+        let TransmitTarget::Udp { local, remote, .. } = transmit.target else {
+            panic!("UDP fixture routes UDP transmissions");
+        };
         right
-            .handle_datagram(now, transmit.source, transmit.destination, transmit.bytes)
+            .handle_datagram(now, local, remote, transmit.bytes)
             .expect("right handles RTP");
         let event = std::iter::from_fn(|| right.poll_event())
             .find(|event| matches!(event, TransportEvent::Rtp { .. }))
