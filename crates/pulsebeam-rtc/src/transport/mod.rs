@@ -485,6 +485,10 @@ impl Transport {
         self.ice.smoothed_rtt()
     }
 
+    pub(crate) const fn dropped_inputs(&self) -> u64 {
+        self.dropped_inputs
+    }
+
     #[cfg(test)]
     pub(crate) fn poll_transmit(&mut self) -> Option<TransportTransmit> {
         let item = self.poll_prepared()?;
@@ -806,6 +810,17 @@ impl Transport {
             self.push_event(TransportEvent::Closed)?;
         }
         Ok(())
+    }
+
+    pub(crate) fn abort(&mut self) {
+        self.state = TransportState::Closed;
+        self.next_deadline = None;
+        self.transmissions.clear();
+        self.events.clear();
+        self.pending_dtls.clear();
+        self.dtls = None;
+        self.srtp = None;
+        self.certificate = None;
     }
 
     fn send_secure(

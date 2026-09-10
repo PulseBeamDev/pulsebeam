@@ -27,9 +27,9 @@ mod test_support;
 pub use connection::{AcceptedConnection, Connection};
 pub use id::{DataChannelId, EncodingId, FrameId, IceTcpFlowId, SenderId};
 pub use io::{
-    AcceptError, AllocationSnapshot, CloseReason, Command, CommandError, ConnectionStats,
-    ConnectionWarning, DataChannelEvent, DataChannelStats, EcnCodepoint, EncodingInfo,
-    EncodingRetireReason, EncodingStats, Event, NetworkInput, Output, ReceiveError,
+    AcceptError, AllocationSnapshot, CloseReason, Command, CommandError, ConnectionState,
+    ConnectionStats, ConnectionWarning, DataChannelEvent, DataChannelStats, EcnCodepoint,
+    EncodingInfo, EncodingRetireReason, EncodingStats, Event, NetworkInput, Output, ReceiveError,
     SenderAllocation, SenderStats, StatsSnapshot, Transmit, TransmitTarget,
 };
 pub use media_packet::{

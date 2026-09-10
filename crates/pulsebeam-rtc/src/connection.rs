@@ -10,8 +10,9 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     AcceptError, CloseReason, Command, CommandError, ConnectionConfig, ConnectionEntropy,
-    ConnectionWarning, Event, NetworkInput, Output, PacketFeedbackKind, ReceiveError, SdpAnswer,
-    SdpOffer, SessionInfo, TimePoint, Transmit,
+    ConnectionState, ConnectionStats, ConnectionWarning, Event, MediaPayloadBitrate, NetworkInput,
+    Output, PacketFeedbackKind, ReceiveError, SdpAnswer, SdpOffer, SessionInfo, StatsSnapshot,
+    TimePoint, Transmit,
     egress::{MediaEgress, PrepareResult},
     ingress::IngressOwner,
     negotiation::{self, NegotiatedSessionFacts},
@@ -20,8 +21,8 @@ use crate::{
     sent_history::{HistoryError, MAX_EXPIRATIONS_PER_POLL, SentHistory},
     time::MonotonicObserver,
     transport::{
-        DatagramKind, PathEpoch, PreparedRtpIdentity, PreparedTransmit, Transport, TransportError,
-        TransportEvent, TransportState,
+        DatagramKind, PathEpoch, PreparedRtpIdentity, PreparedTransmit, RtpService, Transport,
+        TransportError, TransportEvent, TransportState,
     },
 };
 
@@ -57,7 +58,15 @@ struct Runtime {
     scheduler: Option<Box<dyn RuntimeSubsystem>>,
     service: ServiceArbiter,
     commit: CommitCoordinator,
-    closed: bool,
+    lifecycle: Lifecycle,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Lifecycle {
+    Open,
+    Closing { deadline: Instant },
+    ClosedPending(CloseReason),
+    Closed(CloseReason),
 }
 
 impl Runtime {
@@ -68,7 +77,7 @@ impl Runtime {
             scheduler: None,
             service: ServiceArbiter::default(),
             commit: CommitCoordinator::new(feedback),
-            closed: false,
+            lifecycle: Lifecycle::Open,
         }
     }
 
@@ -112,6 +121,16 @@ pub(crate) trait CommitParticipant: Send {
 struct CommitCoordinator {
     history: SentHistory,
     participants: Vec<Box<dyn CommitParticipant>>,
+    counters: CommitCounters,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct CommitCounters {
+    rtp_bytes: u64,
+    rtcp_bytes: u64,
+    sctp_bytes: u64,
+    protocol_bytes: u64,
+    padding_bytes: u64,
 }
 
 impl CommitCoordinator {
@@ -119,6 +138,7 @@ impl CommitCoordinator {
         Self {
             history: SentHistory::new(feedback),
             participants: Vec::new(),
+            counters: CommitCounters::default(),
         }
     }
 
@@ -152,6 +172,28 @@ impl CommitCoordinator {
         if let Some(egress) = egress {
             egress.commit(at, &prepared);
         }
+        let bytes = u64::try_from(context.wire_len).unwrap_or(u64::MAX);
+        match context.kind {
+            DatagramKind::Rtp
+                if context
+                    .rtp
+                    .is_some_and(|rtp| rtp.service == RtpService::Padding) =>
+            {
+                self.counters.padding_bytes = self.counters.padding_bytes.saturating_add(bytes);
+            }
+            DatagramKind::Rtp => {
+                self.counters.rtp_bytes = self.counters.rtp_bytes.saturating_add(bytes);
+            }
+            DatagramKind::Rtcp => {
+                self.counters.rtcp_bytes = self.counters.rtcp_bytes.saturating_add(bytes);
+            }
+            DatagramKind::Sctp => {
+                self.counters.sctp_bytes = self.counters.sctp_bytes.saturating_add(bytes);
+            }
+            DatagramKind::Stun | DatagramKind::Dtls => {
+                self.counters.protocol_bytes = self.counters.protocol_bytes.saturating_add(bytes);
+            }
+        }
         let PreparedTransmit { target, bytes, .. } = prepared;
         Ok(Transmit {
             target,
@@ -168,9 +210,22 @@ pub struct AcceptedConnection {
 
 impl Connection {
     pub fn command(&mut self, at: TimePoint, command: Command) -> Result<(), CommandError> {
-        let _ = self._time.observe(at);
-        if self.runtime.closed {
+        let at = self._time.observe(at);
+        if matches!(
+            self.runtime.lifecycle,
+            Lifecycle::ClosedPending(_) | Lifecycle::Closed(_)
+        ) {
             return Err(CommandError::Closed);
+        }
+        if matches!(self.runtime.lifecycle, Lifecycle::Closing { .. }) {
+            return match command {
+                Command::CloseGracefully { .. } => Ok(()),
+                Command::Abort => {
+                    self.abort();
+                    Ok(())
+                }
+                _ => Err(CommandError::InvalidState),
+            };
         }
         match command {
             Command::SendMedia { sender, media } => {
@@ -206,15 +261,37 @@ impl Connection {
                 .as_mut()
                 .ok_or(CommandError::UnknownDataChannel(channel))?
                 .close_channel(at, channel),
-            Command::RequestKeyframe { .. }
-            | Command::RetireEncoding { .. }
-            | Command::CloseGracefully { .. }
-            | Command::Abort => Err(CommandError::InvalidState),
+            Command::RequestKeyframe { encoding } => {
+                let packet = self._subsystems.ingress.keyframe_request(encoding)?;
+                self._subsystems
+                    .transport
+                    .send_rtcp(&packet)
+                    .map_err(|_| CommandError::InvalidState)
+            }
+            Command::RetireEncoding { encoding } => self._subsystems.ingress.retire(encoding),
+            Command::CloseGracefully { deadline } => {
+                self.runtime.lifecycle = Lifecycle::Closing { deadline };
+                self._subsystems.egress.begin_shutdown();
+                if let Some(sctp) = self._subsystems.sctp.as_mut() {
+                    sctp.begin_shutdown(at, deadline);
+                }
+                Ok(())
+            }
+            Command::Abort => {
+                self.abort();
+                Ok(())
+            }
         }
     }
 
     pub fn receive(&mut self, at: TimePoint, input: NetworkInput) -> Result<(), ReceiveError> {
         let at = self._time.observe(at);
+        if matches!(
+            self.runtime.lifecycle,
+            Lifecycle::ClosedPending(_) | Lifecycle::Closed(_)
+        ) {
+            return Err(ReceiveError::Closed);
+        }
         self._subsystems
             .transport
             .receive_at(at, input)
@@ -228,6 +305,15 @@ impl Connection {
     pub fn poll(&mut self, at: TimePoint) -> Output {
         let at = self._time.observe(at);
 
+        match self.runtime.lifecycle {
+            Lifecycle::Closed(_) => return Output::Idle { next_wakeup: None },
+            Lifecycle::ClosedPending(reason) => {
+                self.runtime.lifecycle = Lifecycle::Closed(reason);
+                return Output::Closed(reason);
+            }
+            Lifecycle::Open | Lifecycle::Closing { .. } => {}
+        }
+
         self.runtime
             .commit
             .history
@@ -237,17 +323,20 @@ impl Connection {
             return Output::Event(Event::Warning(ConnectionWarning::ClockRegression));
         }
 
-        if !self.runtime.closed
-            && self
-                ._subsystems
-                .transport
-                .next_deadline()
-                .is_some_and(|deadline| at.monotonic >= deadline)
+        if !matches!(
+            self.runtime.lifecycle,
+            Lifecycle::ClosedPending(_) | Lifecycle::Closed(_)
+        ) && self
+            ._subsystems
+            .transport
+            .next_deadline()
+            .is_some_and(|deadline| at.monotonic >= deadline)
             && let Err(error) = self._subsystems.transport.handle_timeout(at.monotonic)
             && !matches!(error, TransportError::NotDue)
         {
-            self.runtime.closed = true;
-            return Output::Closed(close_reason(error));
+            let reason = close_reason(error);
+            self.runtime.lifecycle = Lifecycle::Closed(reason);
+            return Output::Closed(reason);
         }
 
         if let Some(event) = self._subsystems.transport.poll_event()
@@ -317,8 +406,40 @@ impl Connection {
             return Output::Event(event);
         }
 
-        if !self.runtime.closed
-            && let Some(prepared) = self._subsystems.transport.poll_prepared()
+        if let Lifecycle::Closing { deadline } = self.runtime.lifecycle {
+            let sctp_stopped = self
+                ._subsystems
+                .sctp
+                .as_ref()
+                .is_none_or(Association::is_stopped);
+            if sctp_stopped || at.monotonic >= deadline {
+                if let Some(sctp) = self._subsystems.sctp.as_mut() {
+                    sctp.abort();
+                }
+                let _ = self._subsystems.transport.close(at.monotonic);
+                if let Some(prepared) = self._subsystems.transport.poll_prepared() {
+                    return match self.runtime.commit.commit_transport(at, prepared, None) {
+                        Ok(transmit) => {
+                            self.runtime.lifecycle =
+                                Lifecycle::ClosedPending(CloseReason::Graceful);
+                            Output::Transmit(transmit)
+                        }
+                        Err(_) => {
+                            self.runtime.lifecycle =
+                                Lifecycle::Closed(CloseReason::TransportFailure);
+                            Output::Closed(CloseReason::TransportFailure)
+                        }
+                    };
+                }
+                self.runtime.lifecycle = Lifecycle::Closed(CloseReason::Graceful);
+                return Output::Closed(CloseReason::Graceful);
+            }
+        }
+
+        if !matches!(
+            self.runtime.lifecycle,
+            Lifecycle::ClosedPending(_) | Lifecycle::Closed(_)
+        ) && let Some(prepared) = self._subsystems.transport.poll_prepared()
         {
             let sctp_wire_len = (prepared.kind == DatagramKind::Sctp).then_some(prepared.wire_len);
             return match self.runtime.commit.commit_transport(at, prepared, None) {
@@ -331,7 +452,7 @@ impl Connection {
                     Output::Transmit(transmit)
                 }
                 Err(_) => {
-                    self.runtime.closed = true;
+                    self.runtime.lifecycle = Lifecycle::Closed(CloseReason::TransportFailure);
                     Output::Closed(CloseReason::TransportFailure)
                 }
             };
@@ -343,14 +464,16 @@ impl Connection {
             .as_ref()
             .is_some_and(Association::has_packet);
         let selected_lane = self.runtime.service.select(true, sctp_ready);
-        if !self.runtime.closed
-            && selected_lane == Some(UserLane::Sctp)
+        if !matches!(
+            self.runtime.lifecycle,
+            Lifecycle::ClosedPending(_) | Lifecycle::Closed(_)
+        ) && selected_lane == Some(UserLane::Sctp)
             && let Some(output) = self.prepare_sctp(at)
         {
             return output;
         }
 
-        if !self.runtime.closed {
+        if matches!(self.runtime.lifecycle, Lifecycle::Open) {
             match self._subsystems.egress.prepare_one(
                 at,
                 bytes_in_flight,
@@ -358,7 +481,7 @@ impl Connection {
             ) {
                 PrepareResult::Prepared => {
                     let Some(prepared) = self._subsystems.transport.poll_prepared() else {
-                        self.runtime.closed = true;
+                        self.runtime.lifecycle = Lifecycle::Closed(CloseReason::TransportFailure);
                         return Output::Closed(CloseReason::TransportFailure);
                     };
                     return match self.runtime.commit.commit_transport(
@@ -368,35 +491,40 @@ impl Connection {
                     ) {
                         Ok(transmit) => Output::Transmit(transmit),
                         Err(_) => {
-                            self.runtime.closed = true;
+                            self.runtime.lifecycle =
+                                Lifecycle::Closed(CloseReason::TransportFailure);
                             Output::Closed(CloseReason::TransportFailure)
                         }
                     };
                 }
                 PrepareResult::Fatal => {
-                    self.runtime.closed = true;
+                    self.runtime.lifecycle = Lifecycle::Closed(CloseReason::TransportFailure);
                     return Output::Closed(CloseReason::TransportFailure);
                 }
                 PrepareResult::Blocked => {}
             }
         }
 
-        if !self.runtime.closed
-            && selected_lane != Some(UserLane::Sctp)
+        if !matches!(
+            self.runtime.lifecycle,
+            Lifecycle::ClosedPending(_) | Lifecycle::Closed(_)
+        ) && selected_lane != Some(UserLane::Sctp)
             && sctp_ready
             && let Some(output) = self.prepare_sctp(at)
         {
             return output;
         }
 
-        if !self.runtime.closed
-            && let Some(output) = self.runtime.poll_subsystems(at)
+        if !matches!(
+            self.runtime.lifecycle,
+            Lifecycle::ClosedPending(_) | Lifecycle::Closed(_)
+        ) && let Some(output) = self.runtime.poll_subsystems(at)
         {
             return output;
         }
 
         Output::Idle {
-            next_wakeup: (!self.runtime.closed)
+            next_wakeup: (!matches!(self.runtime.lifecycle, Lifecycle::Closed(_)))
                 .then(|| {
                     [
                         self._subsystems.transport.next_deadline(),
@@ -407,6 +535,10 @@ impl Connection {
                             .sctp
                             .as_ref()
                             .and_then(Association::next_deadline),
+                        match self.runtime.lifecycle {
+                            Lifecycle::Closing { deadline } => Some(deadline),
+                            _ => None,
+                        },
                     ]
                     .into_iter()
                     .flatten()
@@ -425,7 +557,7 @@ impl Connection {
                 Some(Output::Event(Event::Connected))
             }
             TransportEvent::StateChanged(TransportState::Failed) => {
-                self.runtime.closed = true;
+                self.runtime.lifecycle = Lifecycle::Closed(CloseReason::TransportFailure);
                 Some(Output::Closed(CloseReason::TransportFailure))
             }
             TransportEvent::StateChanged(_) | TransportEvent::IceStateChanged(_) => None,
@@ -466,7 +598,7 @@ impl Connection {
                 None
             }
             TransportEvent::Closed => {
-                self.runtime.closed = true;
+                self.runtime.lifecycle = Lifecycle::Closed(CloseReason::Graceful);
                 Some(Output::Closed(CloseReason::Graceful))
             }
         }
@@ -480,11 +612,11 @@ impl Connection {
             .send_sctp(&packet, at.monotonic)
             .is_err()
         {
-            self.runtime.closed = true;
+            self.runtime.lifecycle = Lifecycle::Closed(CloseReason::TransportFailure);
             return Some(Output::Closed(CloseReason::TransportFailure));
         }
         let Some(prepared) = self._subsystems.transport.poll_prepared() else {
-            self.runtime.closed = true;
+            self.runtime.lifecycle = Lifecycle::Closed(CloseReason::TransportFailure);
             return Some(Output::Closed(CloseReason::TransportFailure));
         };
         let wire_len = prepared.wire_len;
@@ -496,11 +628,75 @@ impl Connection {
                 Some(Output::Transmit(transmit))
             }
             Err(_) => {
-                self.runtime.closed = true;
+                self.runtime.lifecycle = Lifecycle::Closed(CloseReason::TransportFailure);
                 Some(Output::Closed(CloseReason::TransportFailure))
             }
         }
     }
+
+    pub fn stats(&self) -> StatsSnapshot {
+        let (egress, senders) = self._subsystems.egress.stats();
+        let history = self.runtime.commit.history.counters();
+        let sctp = self._subsystems.sctp.as_ref().map(Association::stats);
+        let (state, close_reason) = match self.runtime.lifecycle {
+            Lifecycle::Open => (ConnectionState::Open, None),
+            Lifecycle::Closing { .. } => (ConnectionState::Closing, None),
+            Lifecycle::ClosedPending(reason) | Lifecycle::Closed(reason) => {
+                (ConnectionState::Closed, Some(reason))
+            }
+        };
+        let committed = self.runtime.commit.counters;
+        StatsSnapshot {
+            connection: ConnectionStats {
+                state,
+                feedback: Some(self.session.feedback()),
+                close_reason,
+                clock_regressions: self._time.regressions(),
+                rtp_bytes_in_flight: self
+                    .runtime
+                    .commit
+                    .history
+                    .controller_inputs()
+                    .bytes_in_flight,
+                target_media_bitrate: MediaPayloadBitrate::from_bps(egress.target_media_bitrate),
+                pacing_bitrate: egress.pacing_bitrate,
+                queued_media_bytes: egress.queued_transport_bytes,
+                buffered_data_bytes: sctp.map_or(0, |stats| stats.buffered_payload_bytes),
+                transmitted_rtp_bytes: committed.rtp_bytes,
+                transmitted_rtcp_bytes: committed.rtcp_bytes,
+                transmitted_sctp_bytes: committed.sctp_bytes,
+                transmitted_protocol_bytes: committed.protocol_bytes,
+                transmitted_padding_bytes: committed.padding_bytes,
+                dropped_network_inputs: self
+                    ._subsystems
+                    .transport
+                    .dropped_inputs()
+                    .saturating_add(self._subsystems.ingress.dropped()),
+                unknown_feedback: history.unknown_feedback,
+                duplicate_feedback: history.duplicate_feedback,
+                stale_feedback: history.stale_feedback,
+                wrong_path_feedback: history.wrong_path_feedback,
+            },
+            senders,
+            encodings: self._subsystems.ingress.stats(),
+            data_channels: self
+                ._subsystems
+                .sctp
+                .as_ref()
+                .map_or_else(Vec::new, Association::channel_stats),
+        }
+    }
+
+    fn abort(&mut self) {
+        self._subsystems.transport.abort();
+        self._subsystems.ingress.abort();
+        self._subsystems.egress.abort();
+        if let Some(sctp) = self._subsystems.sctp.as_mut() {
+            sctp.abort();
+        }
+        self.runtime.lifecycle = Lifecycle::ClosedPending(CloseReason::Aborted);
+    }
+
     pub fn accept(
         config: ConnectionConfig,
         offer: SdpOffer,

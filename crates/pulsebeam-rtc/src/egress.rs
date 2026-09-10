@@ -14,7 +14,7 @@ use sha2::{Digest, Sha256};
 use crate::{
     AllocationSnapshot, CommandError, Event, ForwardedMedia, FrameBoundary, FrameDependencies,
     FrameId, GlobalMediaTime, MediaKind, MediaPayloadBitrate, SenderAllocation, SenderId,
-    SenderPolicy, TimePoint,
+    SenderPolicy, SenderStats, TimePoint,
     allocator::{AllocationInput, weighted_max_min},
     congestion::{
         ControllerInput, EcnValidation, FeedbackSample, LatencyGovernor, SafeRtpEnvelope,
@@ -134,6 +134,13 @@ pub(crate) enum PrepareResult {
     Prepared,
     Blocked,
     Fatal,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct EgressStats {
+    pub(crate) queued_transport_bytes: usize,
+    pub(crate) target_media_bitrate: u64,
+    pub(crate) pacing_bitrate: u64,
 }
 
 impl MediaEgress {
@@ -356,6 +363,66 @@ impl MediaEgress {
 
     pub(crate) fn poll_event(&mut self) -> Option<Event> {
         self.events.pop_front()
+    }
+
+    pub(crate) fn abort(&mut self) {
+        self.begin_shutdown();
+        self.events.clear();
+    }
+
+    pub(crate) fn begin_shutdown(&mut self) {
+        self.queue.clear();
+        self.queued_frames.clear();
+        self.queued_payload_bytes = 0;
+        self.queued_transport_bytes = 0;
+        self.retained.clear();
+        self.retained_bytes = 0;
+        self.repair_requests.clear();
+        self.pending = None;
+        self.probe_remaining = 0;
+    }
+
+    pub(crate) fn stats(&self) -> (EgressStats, Vec<SenderStats>) {
+        let senders = self
+            .senders
+            .iter()
+            .enumerate()
+            .map(|(index, sender)| {
+                let (queued_packets, queued_payload_bytes) = self
+                    .queue
+                    .iter()
+                    .filter(|queued| queued.sender == index)
+                    .fold((0_usize, 0_usize), |(packets, bytes), queued| {
+                        (
+                            packets.saturating_add(1),
+                            bytes.saturating_add(queued.payload_bytes),
+                        )
+                    });
+                SenderStats {
+                    sender: sender.facts.id,
+                    policy: sender.policy,
+                    allocation: MediaPayloadBitrate::from_bps(
+                        self.allocations.get(index).copied().unwrap_or_default(),
+                    ),
+                    queued_packets,
+                    queued_payload_bytes,
+                    transmitted_packets: sender.committed_packets,
+                    transmitted_payload_bytes: sender.committed_payload_bytes,
+                }
+            })
+            .collect();
+        (
+            EgressStats {
+                queued_transport_bytes: self.queued_transport_bytes,
+                target_media_bitrate: self
+                    .envelope
+                    .map_or(0, |envelope| envelope.target_media_payload_rate),
+                pacing_bitrate: self
+                    .envelope
+                    .map_or(0, |envelope| envelope.pacing_transport_rate),
+            },
+            senders,
+        )
     }
 
     pub(crate) fn prepare_one(

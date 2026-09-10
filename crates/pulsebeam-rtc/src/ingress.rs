@@ -14,8 +14,8 @@ use std::{collections::VecDeque, ops::Range, sync::Arc};
 use bytes::Bytes;
 
 use crate::{
-    ConnectionWarning, EncodingId, EncodingInfo, EncodingRetireReason, Event, MediaKind,
-    MediaPacket, PacketFeedbackKind, TimePoint,
+    ConnectionWarning, EncodingId, EncodingInfo, EncodingRetireReason, EncodingStats, Event,
+    MediaKind, MediaPacket, PacketFeedbackKind, TimePoint,
     clock::{ClockMapper, ClockWarning, ntp_micros},
     negotiation::IngressMediaFacts,
     packet::RtpPacket,
@@ -56,6 +56,7 @@ struct Encoding {
     rid: Option<Box<str>>,
     unsignaled: bool,
     retired: bool,
+    received_packets: u64,
     mapper: ClockMapper,
 }
 
@@ -145,6 +146,7 @@ impl IngressOwner {
                     rid: rid.map(Box::<str>::from),
                     unsignaled,
                     retired: false,
+                    received_packets: 0,
                     mapper: ClockMapper::new(
                         arrival.global,
                         packet.sequence(),
@@ -175,6 +177,7 @@ impl IngressOwner {
                 self.drop();
                 return;
             }
+            encoding.received_packets = encoding.received_packets.saturating_add(1);
             let Some((global_media_at, warning)) =
                 encoding
                     .mapper
@@ -242,6 +245,58 @@ impl IngressOwner {
             self.queued_media_bytes = self.queued_media_bytes.saturating_sub(packet.bytes().len());
         }
         Some(event)
+    }
+
+    pub(crate) fn retire(&mut self, id: EncodingId) -> Result<(), crate::CommandError> {
+        let encoding = self
+            .encodings
+            .iter_mut()
+            .find(|encoding| encoding.id == id)
+            .ok_or(crate::CommandError::UnknownEncoding(id))?;
+        if !encoding.retired {
+            encoding.retired = true;
+            self.events.push_back(Event::EncodingRetired {
+                encoding: id,
+                reason: EncodingRetireReason::Retired,
+            });
+        }
+        Ok(())
+    }
+
+    pub(crate) fn keyframe_request(&self, id: EncodingId) -> Result<[u8; 12], crate::CommandError> {
+        let ssrc = self
+            .encodings
+            .iter()
+            .find(|encoding| encoding.id == id && !encoding.retired)
+            .and_then(|encoding| encoding.ssrc)
+            .ok_or(crate::CommandError::UnknownEncoding(id))?;
+        let mut packet = [0_u8; 12];
+        packet[..4].copy_from_slice(&[0x81, 206, 0, 2]);
+        packet[8..].copy_from_slice(&ssrc.to_be_bytes());
+        Ok(packet)
+    }
+
+    pub(crate) fn abort(&mut self) {
+        self.events.clear();
+        self.feedback.clear();
+        self.repair.clear();
+        self.queued_media_bytes = 0;
+    }
+
+    pub(crate) fn stats(&self) -> Vec<EncodingStats> {
+        self.encodings
+            .iter()
+            .map(|encoding| EncodingStats {
+                encoding: encoding.id,
+                kind: self.media[encoding.media].kind,
+                received_packets: encoding.received_packets,
+                retired: encoding.retired,
+            })
+            .collect()
+    }
+
+    pub(crate) const fn dropped(&self) -> u64 {
+        self.dropped
     }
 
     fn resolve<'a>(&self, packet: &'a RtpPacket<'a>) -> Option<(usize, u32, Option<&'a str>)> {

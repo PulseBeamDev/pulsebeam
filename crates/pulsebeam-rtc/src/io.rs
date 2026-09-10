@@ -10,8 +10,9 @@ use thiserror::Error;
 
 use crate::IceTcpFlowId;
 use crate::{
-    DataChannelConfig, DataChannelId, DataMessage, EncodingId, ForwardedMedia, MediaKind,
-    MediaPacket, MediaPayloadBitrate, PolicyError, SenderId, SenderPolicy,
+    DataChannelConfig, DataChannelId, DataChannelPriority, DataMessage, DataReliability,
+    EncodingId, ForwardedMedia, MediaKind, MediaPacket, MediaPayloadBitrate, PolicyError, SenderId,
+    SenderPolicy,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -230,7 +231,16 @@ pub enum CommandError {
     WouldBlock,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum ConnectionState {
+    #[default]
+    Open,
+    Closing,
+    Closed,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct StatsSnapshot {
     pub connection: ConnectionStats,
     pub senders: Vec<SenderStats>,
@@ -238,22 +248,54 @@ pub struct StatsSnapshot {
     pub data_channels: Vec<DataChannelStats>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ConnectionStats {
-    _private: (),
+    pub state: ConnectionState,
+    pub feedback: Option<crate::PacketFeedbackKind>,
+    pub close_reason: Option<CloseReason>,
+    pub clock_regressions: u64,
+    pub rtp_bytes_in_flight: u64,
+    pub target_media_bitrate: MediaPayloadBitrate,
+    pub pacing_bitrate: u64,
+    pub queued_media_bytes: usize,
+    pub buffered_data_bytes: usize,
+    pub transmitted_rtp_bytes: u64,
+    pub transmitted_rtcp_bytes: u64,
+    pub transmitted_sctp_bytes: u64,
+    pub transmitted_protocol_bytes: u64,
+    pub transmitted_padding_bytes: u64,
+    pub dropped_network_inputs: u64,
+    pub unknown_feedback: u64,
+    pub duplicate_feedback: u64,
+    pub stale_feedback: u64,
+    pub wrong_path_feedback: u64,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SenderStats {
-    _private: (),
+    pub sender: SenderId,
+    pub policy: SenderPolicy,
+    pub allocation: MediaPayloadBitrate,
+    pub queued_packets: usize,
+    pub queued_payload_bytes: usize,
+    pub transmitted_packets: u64,
+    pub transmitted_payload_bytes: u64,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EncodingStats {
-    _private: (),
+    pub encoding: EncodingId,
+    pub kind: MediaKind,
+    pub received_packets: u64,
+    pub retired: bool,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DataChannelStats {
-    _private: (),
+    pub channel: DataChannelId,
+    pub priority: DataChannelPriority,
+    pub reliability: DataReliability,
+    pub buffered_amount: usize,
+    pub sent_messages: u64,
+    pub received_messages: u64,
 }

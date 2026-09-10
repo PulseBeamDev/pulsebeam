@@ -14,7 +14,7 @@ use dcsctp::api::{
 
 use crate::{
     CommandError, ConnectionLimits, DataChannelConfig, DataChannelEvent, DataChannelId,
-    DataChannelPriority, DataMessage, DataReliability, Event, TimePoint,
+    DataChannelPriority, DataChannelStats, DataMessage, DataReliability, Event, TimePoint,
     negotiation::{DtlsRole, SctpSessionFacts},
 };
 
@@ -63,6 +63,8 @@ struct Channel {
     state: ChannelState,
     opened_emitted: bool,
     closed_emitted: bool,
+    sent_messages: u64,
+    received_messages: u64,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -74,6 +76,7 @@ enum ChannelState {
 
 struct BufferedMessage {
     lifecycle: u64,
+    stream: StreamId,
     bytes: usize,
 }
 
@@ -207,6 +210,8 @@ impl Association {
             },
             opened_emitted: false,
             closed_emitted: false,
+            sent_messages: 0,
+            received_messages: 0,
         });
         self.advance_time(at.monotonic);
         if negotiated {
@@ -275,8 +280,12 @@ impl Association {
         self.buffered_payload_bytes += payload_bytes;
         self.lifecycles.push_back(BufferedMessage {
             lifecycle,
+            stream,
             bytes: payload_bytes,
         });
+        if let Some(channel) = self.channel_mut(stream) {
+            channel.sent_messages = channel.sent_messages.saturating_add(1);
+        }
         self.drain_socket();
         Ok(())
     }
@@ -381,6 +390,10 @@ impl Association {
         self.stopped = true;
     }
 
+    pub(crate) const fn is_stopped(&self) -> bool {
+        self.stopped
+    }
+
     pub(crate) fn commit_transport_bytes(&mut self, bytes: usize) {
         self.committed_transport_bytes = self
             .committed_transport_bytes
@@ -394,6 +407,25 @@ impl Association {
             committed_transport_bytes: self.committed_transport_bytes,
             channels: self.channels.len(),
         }
+    }
+
+    pub(crate) fn channel_stats(&self) -> Vec<DataChannelStats> {
+        self.channels
+            .iter()
+            .map(|channel| DataChannelStats {
+                channel: channel.id,
+                priority: channel.config.priority,
+                reliability: channel.config.reliability,
+                buffered_amount: self
+                    .lifecycles
+                    .iter()
+                    .filter(|message| message.stream == channel.stream)
+                    .map(|message| message.bytes)
+                    .fold(0_usize, usize::saturating_add),
+                sent_messages: channel.sent_messages,
+                received_messages: channel.received_messages,
+            })
+            .collect()
     }
 
     fn allocate_stream(&self) -> Option<StreamId> {
@@ -510,6 +542,9 @@ impl Association {
                     return;
                 }
                 let id = channel.id;
+                if let Some(channel) = self.channel_mut(stream) {
+                    channel.received_messages = channel.received_messages.saturating_add(1);
+                }
                 let bytes = if empty {
                     Bytes::new()
                 } else {
@@ -569,6 +604,8 @@ impl Association {
                     state: ChannelState::Open,
                     opened_emitted: false,
                     closed_emitted: false,
+                    sent_messages: 0,
+                    received_messages: 0,
                 });
                 let _ = self.socket.send(
                     Message::new(stream, DCEP_PPID, vec![DCEP_ACK]),
