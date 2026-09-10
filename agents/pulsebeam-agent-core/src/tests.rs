@@ -6,6 +6,7 @@ use alloc::{
     vec::Vec,
 };
 use core::time::Duration;
+use std::sync::{Mutex, Once, OnceLock};
 
 use pulsebeam_proto::{
     prelude::Message,
@@ -18,6 +19,46 @@ use crate::*;
 const PARTICIPANT_URI: &str = "https://sfu.test/api/v1/rooms/room/participants/p1?manual_sub=true";
 const LOCAL_PUBLISHER: &str = "pa_00000000000000000000000000";
 const REMOTE_PUBLISHER: &str = "pa_11111111111111111111111111";
+const VIDEO_INTENT_LOG_PREFIX: &str = "desired video subscriptions changed";
+
+struct TestLogger;
+
+static TEST_LOGGER: TestLogger = TestLogger;
+static TEST_LOGGER_INIT: Once = Once::new();
+static TEST_LOG_RECORDS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+static TEST_LOG_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+impl log::Log for TestLogger {
+    fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+        metadata.target().starts_with("pulsebeam_agent_core")
+    }
+
+    fn log(&self, record: &log::Record<'_>) {
+        if self.enabled(record.metadata()) {
+            TEST_LOG_RECORDS
+                .get_or_init(|| Mutex::new(Vec::new()))
+                .lock()
+                .unwrap()
+                .push(record.args().to_string());
+        }
+    }
+
+    fn flush(&self) {}
+}
+
+fn take_video_intent_logs() -> Vec<String> {
+    TEST_LOGGER_INIT.call_once(|| {
+        log::set_logger(&TEST_LOGGER).unwrap();
+        log::set_max_level(log::LevelFilter::Trace);
+    });
+    TEST_LOG_RECORDS
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap()
+        .drain(..)
+        .filter(|record| record.starts_with(VIDEO_INTENT_LOG_PREFIX))
+        .collect()
+}
 
 fn config() -> AgentConfig {
     AgentConfig {
@@ -43,6 +84,107 @@ fn log_level_applies_per_agent_verbosity() {
     assert!(LogLevel::Debug.allows(log::Level::Debug));
     assert!(!LogLevel::Debug.allows(log::Level::Trace));
     assert!(!LogLevel::Off.allows(log::Level::Error));
+}
+
+#[test]
+fn desired_video_intent_logs_only_accepted_semantic_changes() {
+    let _log_test_lock = TEST_LOG_TEST_LOCK.lock().unwrap();
+    let mut debug_config = config();
+    debug_config.log_level = LogLevel::Debug;
+    let mut agent = Agent::new(debug_config).unwrap();
+    let initial = desired(1);
+
+    let _ = take_video_intent_logs();
+    agent
+        .command(AgentCommand::ReplaceDesired(initial.clone()))
+        .unwrap();
+    assert_eq!(
+        take_video_intent_logs(),
+        vec![format!(
+            "desired video subscriptions changed revision=1 previous={:?} current={:?}",
+            Vec::<VideoSubscription>::new(),
+            initial.video,
+        )]
+    );
+
+    let mut unrelated_change = initial.clone();
+    unrelated_change.revision = 2;
+    unrelated_change.audio.automatic = false;
+    agent
+        .command(AgentCommand::ReplaceDesired(unrelated_change.clone()))
+        .unwrap();
+    assert!(take_video_intent_logs().is_empty());
+
+    let mut changed_video = unrelated_change.clone();
+    changed_video.revision = 3;
+    changed_video.video[0].track_id = "replacement-video-track".to_string();
+    changed_video.video[0].height = 1080;
+    agent
+        .command(AgentCommand::ReplaceDesired(changed_video.clone()))
+        .unwrap();
+    assert_eq!(
+        take_video_intent_logs(),
+        vec![format!(
+            "desired video subscriptions changed revision=3 previous={:?} current={:?}",
+            unrelated_change.video, changed_video.video,
+        )]
+    );
+
+    let mut conflicting = changed_video.clone();
+    conflicting.video[0].min_fps = 30;
+    assert_eq!(
+        agent.command(AgentCommand::ReplaceDesired(conflicting)),
+        Err(AgentError::ConflictingDesiredRevision(3))
+    );
+    let mut stale = changed_video;
+    stale.revision = 2;
+    assert!(matches!(
+        agent.command(AgentCommand::ReplaceDesired(stale)),
+        Err(AgentError::StaleDesiredRevision { .. })
+    ));
+    assert!(take_video_intent_logs().is_empty());
+}
+
+#[test]
+fn desired_video_intent_logs_do_not_follow_signaling_resends_or_reconnects() {
+    let _log_test_lock = TEST_LOG_TEST_LOCK.lock().unwrap();
+    let mut debug_config = config();
+    debug_config.log_level = LogLevel::Debug;
+    let mut agent = Agent::new(debug_config).unwrap();
+    let cid = channel(12);
+    let (generation, operation) = begin_connect(&mut agent, desired(1), cid);
+    let send = finish_connect(&mut agent, generation, operation, cid);
+    let _ = take_video_intent_logs();
+
+    agent
+        .handle(HostEvent::DataChannel(DataChannelEvent::SendFailed {
+            operation: send,
+            generation,
+            channel: cid,
+            message: "full".to_string(),
+        }))
+        .unwrap();
+    let timer = match next_effect(&mut agent) {
+        Effect::Timer(TimerEffect::Schedule { timer, .. }) => timer,
+        effect => panic!("expected signaling retry, got {effect:?}"),
+    };
+    agent
+        .handle(HostEvent::Timer(TimerEvent::Fired { timer }))
+        .unwrap();
+    assert!(matches!(
+        next_effect(&mut agent),
+        Effect::DataChannel(DataChannelEffect::Send { .. })
+    ));
+    assert!(take_video_intent_logs().is_empty());
+
+    agent
+        .handle(HostEvent::Rtc(RtcEvent::Disconnected { generation }))
+        .unwrap();
+    assert!(matches!(
+        next_effect(&mut agent),
+        Effect::Rtc(RtcEffect::CreateOffer { .. })
+    ));
+    assert!(take_video_intent_logs().is_empty());
 }
 
 fn desired(revision: u64) -> DesiredState {

@@ -226,14 +226,25 @@ impl Agent {
             return Err(AgentError::AdaptiveAfterFixed);
         }
 
+        let video_changed = self.desired.video != desired.video;
         let intent_changed = self.desired.publications != desired.publications
-            || self.desired.video != desired.video
+            || video_changed
             || self.desired.audio != desired.audio
             || self.desired.playout_delay != desired.playout_delay;
         let topics_changed = self.desired.topics != desired.topics;
-        self.desired = desired;
+        let previous_desired = core::mem::replace(&mut self.desired, desired);
         self.snapshot.desired_revision = self.desired.revision;
         self.bump_snapshot();
+        if video_changed {
+            agent_log!(
+                self,
+                Debug,
+                "desired video subscriptions changed revision={} previous={:?} current={:?}",
+                self.desired.revision,
+                previous_desired.video,
+                self.desired.video,
+            );
+        }
         agent_log!(
             self,
             Debug,
