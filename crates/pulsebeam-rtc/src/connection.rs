@@ -3,7 +3,7 @@
     reason = "the public transmit contract requires immutable Bytes payloads"
 )]
 
-use std::{cell::Cell, collections::VecDeque, marker::PhantomData, time::Instant};
+use std::{cell::Cell, marker::PhantomData, time::Instant};
 
 use bytes::Bytes;
 use sha2::{Digest, Sha256};
@@ -15,6 +15,8 @@ use crate::{
     egress::{MediaEgress, PrepareResult},
     ingress::IngressOwner,
     negotiation::{self, NegotiatedSessionFacts},
+    scheduler::{ServiceArbiter, UserLane},
+    sctp::Association,
     sent_history::{HistoryError, MAX_EXPIRATIONS_PER_POLL, SentHistory},
     time::MonotonicObserver,
     transport::{
@@ -22,8 +24,6 @@ use crate::{
         TransportEvent, TransportState,
     },
 };
-
-const MAX_INGRESS_PACKETS: usize = 256;
 
 pub struct Connection {
     _config: ConnectionConfig,
@@ -42,6 +42,7 @@ struct SubsystemSlots {
     transport: Transport,
     ingress: IngressOwner,
     egress: MediaEgress,
+    sctp: Option<Association>,
 }
 
 trait RuntimeSubsystem: Send {
@@ -51,11 +52,10 @@ trait RuntimeSubsystem: Send {
 }
 
 struct Runtime {
-    data: VecDeque<Vec<u8>>,
     feedback: Option<Box<dyn RuntimeSubsystem>>,
     controller: Option<Box<dyn RuntimeSubsystem>>,
     scheduler: Option<Box<dyn RuntimeSubsystem>>,
-    sctp: Option<Box<dyn RuntimeSubsystem>>,
+    service: ServiceArbiter,
     commit: CommitCoordinator,
     closed: bool,
 }
@@ -63,11 +63,10 @@ struct Runtime {
 impl Runtime {
     fn new(feedback: PacketFeedbackKind) -> Self {
         Self {
-            data: VecDeque::new(),
             feedback: None,
             controller: None,
             scheduler: None,
-            sctp: None,
+            service: ServiceArbiter::default(),
             commit: CommitCoordinator::new(feedback),
             closed: false,
         }
@@ -78,7 +77,6 @@ impl Runtime {
             &mut self.feedback,
             &mut self.controller,
             &mut self.scheduler,
-            &mut self.sctp,
         ]
         .into_iter()
         .flatten()
@@ -86,16 +84,11 @@ impl Runtime {
     }
 
     fn next_deadline(&self) -> Option<Instant> {
-        [
-            &self.feedback,
-            &self.controller,
-            &self.scheduler,
-            &self.sctp,
-        ]
-        .into_iter()
-        .flatten()
-        .filter_map(|subsystem| subsystem.next_deadline())
-        .min()
+        [&self.feedback, &self.controller, &self.scheduler]
+            .into_iter()
+            .flatten()
+            .filter_map(|subsystem| subsystem.next_deadline())
+            .min()
     }
 }
 
@@ -195,11 +188,26 @@ impl Connection {
             Command::SetSenderPolicy { sender, policy } => {
                 self._subsystems.egress.set_policy(sender, policy, at)
             }
+            Command::OpenDataChannel(config) => self
+                ._subsystems
+                .sctp
+                .as_mut()
+                .ok_or(CommandError::InvalidState)?
+                .open(at, config),
+            Command::SendData { channel, message } => self
+                ._subsystems
+                .sctp
+                .as_mut()
+                .ok_or(CommandError::UnknownDataChannel(channel))?
+                .send(at, channel, message),
+            Command::CloseDataChannel { channel } => self
+                ._subsystems
+                .sctp
+                .as_mut()
+                .ok_or(CommandError::UnknownDataChannel(channel))?
+                .close_channel(at, channel),
             Command::RequestKeyframe { .. }
             | Command::RetireEncoding { .. }
-            | Command::OpenDataChannel(_)
-            | Command::SendData { .. }
-            | Command::CloseDataChannel { .. }
             | Command::CloseGracefully { .. }
             | Command::Abort => Err(CommandError::InvalidState),
         }
@@ -243,12 +251,21 @@ impl Connection {
         }
 
         if let Some(event) = self._subsystems.transport.poll_event()
-            && let Some(output) = self.handle_transport_event(event)
+            && let Some(output) = self.handle_transport_event(at, event)
         {
             return output;
         }
 
         if let Some(event) = self._subsystems.ingress.poll_event() {
+            return Output::Event(event);
+        }
+
+        if let Some(event) = self
+            ._subsystems
+            .sctp
+            .as_mut()
+            .and_then(|sctp| sctp.poll_event(at))
+        {
             return Output::Event(event);
         }
 
@@ -303,13 +320,34 @@ impl Connection {
         if !self.runtime.closed
             && let Some(prepared) = self._subsystems.transport.poll_prepared()
         {
+            let sctp_wire_len = (prepared.kind == DatagramKind::Sctp).then_some(prepared.wire_len);
             return match self.runtime.commit.commit_transport(at, prepared, None) {
-                Ok(transmit) => Output::Transmit(transmit),
+                Ok(transmit) => {
+                    if let (Some(sctp), Some(wire_len)) =
+                        (self._subsystems.sctp.as_mut(), sctp_wire_len)
+                    {
+                        sctp.commit_transport_bytes(wire_len);
+                    }
+                    Output::Transmit(transmit)
+                }
                 Err(_) => {
                     self.runtime.closed = true;
                     Output::Closed(CloseReason::TransportFailure)
                 }
             };
+        }
+
+        let sctp_ready = self
+            ._subsystems
+            .sctp
+            .as_ref()
+            .is_some_and(Association::has_packet);
+        let selected_lane = self.runtime.service.select(true, sctp_ready);
+        if !self.runtime.closed
+            && selected_lane == Some(UserLane::Sctp)
+            && let Some(output) = self.prepare_sctp(at)
+        {
+            return output;
         }
 
         if !self.runtime.closed {
@@ -344,6 +382,14 @@ impl Connection {
         }
 
         if !self.runtime.closed
+            && selected_lane != Some(UserLane::Sctp)
+            && sctp_ready
+            && let Some(output) = self.prepare_sctp(at)
+        {
+            return output;
+        }
+
+        if !self.runtime.closed
             && let Some(output) = self.runtime.poll_subsystems(at)
         {
             return output;
@@ -357,6 +403,10 @@ impl Connection {
                         self.runtime.next_deadline(),
                         self.runtime.commit.history.next_deadline(),
                         self._subsystems.egress.next_deadline(),
+                        self._subsystems
+                            .sctp
+                            .as_ref()
+                            .and_then(Association::next_deadline),
                     ]
                     .into_iter()
                     .flatten()
@@ -366,9 +416,12 @@ impl Connection {
         }
     }
 
-    fn handle_transport_event(&mut self, event: TransportEvent) -> Option<Output> {
+    fn handle_transport_event(&mut self, at: TimePoint, event: TransportEvent) -> Option<Output> {
         match event {
             TransportEvent::StateChanged(TransportState::Connected) => {
+                if let Some(sctp) = self._subsystems.sctp.as_mut() {
+                    sctp.connect(at);
+                }
                 Some(Output::Event(Event::Connected))
             }
             TransportEvent::StateChanged(TransportState::Failed) => {
@@ -407,14 +460,44 @@ impl Connection {
                 None
             }
             TransportEvent::Data(bytes) => {
-                if self.runtime.data.len() < MAX_INGRESS_PACKETS {
-                    self.runtime.data.push_back(bytes);
+                if let Some(sctp) = self._subsystems.sctp.as_mut() {
+                    sctp.handle_input(at, &bytes);
                 }
                 None
             }
             TransportEvent::Closed => {
                 self.runtime.closed = true;
                 Some(Output::Closed(CloseReason::Graceful))
+            }
+        }
+    }
+
+    fn prepare_sctp(&mut self, at: TimePoint) -> Option<Output> {
+        let packet = self._subsystems.sctp.as_mut()?.poll_packet()?;
+        if self
+            ._subsystems
+            .transport
+            .send_sctp(&packet, at.monotonic)
+            .is_err()
+        {
+            self.runtime.closed = true;
+            return Some(Output::Closed(CloseReason::TransportFailure));
+        }
+        let Some(prepared) = self._subsystems.transport.poll_prepared() else {
+            self.runtime.closed = true;
+            return Some(Output::Closed(CloseReason::TransportFailure));
+        };
+        let wire_len = prepared.wire_len;
+        match self.runtime.commit.commit_transport(at, prepared, None) {
+            Ok(transmit) => {
+                if let Some(sctp) = self._subsystems.sctp.as_mut() {
+                    sctp.commit_transport_bytes(wire_len);
+                }
+                Some(Output::Transmit(transmit))
+            }
+            Err(_) => {
+                self.runtime.closed = true;
+                Some(Output::Closed(CloseReason::TransportFailure))
             }
         }
     }
@@ -448,6 +531,10 @@ impl Connection {
             at.monotonic,
         );
         let feedback = negotiated.facts.feedback();
+        let sctp = negotiated
+            .facts
+            .sctp()
+            .map(|facts| Association::new(facts, config.limits, at.monotonic));
         let connection = Self {
             _config: config,
             session: negotiated.facts,
@@ -456,6 +543,7 @@ impl Connection {
                 transport,
                 ingress,
                 egress,
+                sctp,
             },
             runtime: Runtime::new(feedback),
             _not_sync: PhantomData,
@@ -678,6 +766,73 @@ mod tests {
                 .ingress
                 .poll_feedback()
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn data_channel_commits_are_excluded_from_rtp_history_and_bytes_in_flight() {
+        use crate::test_support::FixtureDataEvent;
+
+        let mut fixture = crate::test_support::PeerFixture::connected_datachannels();
+        let mut connection_channel = None;
+        let mut peer_opened = false;
+        while connection_channel.is_none() || !peer_opened {
+            match fixture.next_data_event() {
+                FixtureDataEvent::ConnectionOpened(channel) => connection_channel = Some(channel),
+                FixtureDataEvent::PeerOpened => peer_opened = true,
+                _ => {}
+            }
+        }
+        let before_counters = fixture.connection.runtime.commit.history.counters();
+        let before_bif = fixture
+            .connection
+            .runtime
+            .commit
+            .history
+            .controller_inputs()
+            .bytes_in_flight;
+        let before_sctp = fixture
+            .connection
+            ._subsystems
+            .sctp
+            .as_ref()
+            .expect("negotiated SCTP")
+            .stats()
+            .committed_transport_bytes;
+
+        fixture.command(Command::SendData {
+            channel: connection_channel.expect("connection channel"),
+            message: crate::DataMessage::Binary(Bytes::from_static(b"separate accounting")),
+        });
+        while !matches!(
+            fixture.next_data_event(),
+            FixtureDataEvent::PeerMessage { .. }
+        ) {}
+
+        assert_eq!(
+            fixture.connection.runtime.commit.history.counters(),
+            before_counters
+        );
+        assert_eq!(
+            fixture
+                .connection
+                .runtime
+                .commit
+                .history
+                .controller_inputs()
+                .bytes_in_flight,
+            before_bif
+        );
+        assert!(
+            fixture
+                .connection
+                ._subsystems
+                .sctp
+                .as_ref()
+                .expect("negotiated SCTP")
+                .stats()
+                .committed_transport_bytes
+                > before_sctp
         );
     }
 }

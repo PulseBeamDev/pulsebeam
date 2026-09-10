@@ -17,9 +17,10 @@ use std::{
 
 use bytes::Bytes;
 use pulsebeam_rtc::{
-    Connection, ConnectionConfig, ConnectionEntropy, Event as ConnectionEvent, GlobalMediaTime,
-    IceTcpFlowId, LocalCandidate, MediaPacket, MediaPayloadBitrate, NetworkInput,
-    Output as ConnectionOutput, SdpOffer, SenderId, TimePoint, TransmitTarget,
+    Command, Connection, ConnectionConfig, ConnectionEntropy, DataChannelEvent, DataChannelId,
+    DataMessage, Event as ConnectionEvent, GlobalMediaTime, IceTcpFlowId, LocalCandidate,
+    MediaPacket, MediaPayloadBitrate, NetworkInput, Output as ConnectionOutput, SdpOffer, SenderId,
+    TimePoint, TransmitTarget,
 };
 use str0m_reference::{
     Candidate, Event, Input, Output, Rtc,
@@ -45,27 +46,36 @@ pub struct PeerFixture {
     peer_connected: bool,
     connection_connected: bool,
     twcc_sent: usize,
+    peer_channel: Option<str0m_reference::channel::ChannelId>,
 }
 
 impl PeerFixture {
     pub fn connected() -> Self {
-        Self::connected_with(FixtureTransport::Udp, None)
+        Self::connected_with(FixtureTransport::Udp, None, false)
     }
 
     pub fn connected_tcp() -> Self {
-        Self::connected_with(FixtureTransport::Tcp, None)
+        Self::connected_with(FixtureTransport::Tcp, None, false)
     }
 
     pub fn connected_with_media_limit(max_queued_media_bytes: usize) -> Self {
-        Self::connected_with(FixtureTransport::Udp, Some(max_queued_media_bytes))
+        Self::connected_with(FixtureTransport::Udp, Some(max_queued_media_bytes), false)
+    }
+
+    pub fn connected_datachannels() -> Self {
+        Self::connected_with(FixtureTransport::Udp, None, true)
     }
 
     pub fn unconnected() -> Self {
-        Self::new_with(FixtureTransport::Udp, None)
+        Self::new_with(FixtureTransport::Udp, None, false)
     }
 
-    fn connected_with(transport: FixtureTransport, media_limit: Option<usize>) -> Self {
-        let mut fixture = Self::new_with(transport, media_limit);
+    fn connected_with(
+        transport: FixtureTransport,
+        media_limit: Option<usize>,
+        datachannels: bool,
+    ) -> Self {
+        let mut fixture = Self::new_with(transport, media_limit, datachannels);
         for _ in 0..2_000 {
             let _ = fixture.step();
             if fixture.peer_connected && fixture.connection_connected {
@@ -75,7 +85,11 @@ impl PeerFixture {
         panic!("standards peer did not connect");
     }
 
-    fn new_with(transport: FixtureTransport, media_limit: Option<usize>) -> Self {
+    fn new_with(
+        transport: FixtureTransport,
+        media_limit: Option<usize>,
+        datachannels: bool,
+    ) -> Self {
         let start = Instant::now();
         str0m_reference::crypto::from_feature_flags().install_process_default();
         let connection_addr = SocketAddr::from(([127, 0, 0, 1], 41000));
@@ -94,6 +108,7 @@ impl PeerFixture {
         drain_peer(&mut peer);
         let mut change = peer.sdp_api();
         let mid = change.add_media(MediaKind::Audio, Direction::SendRecv, None, None, None);
+        let peer_channel = datachannels.then(|| change.add_channel("peer-opened".into()));
         let (offer, pending) = change.apply().expect("peer offer");
         let mut config = ConnectionConfig {
             local_candidates: vec![match transport {
@@ -140,6 +155,7 @@ impl PeerFixture {
             peer_connected: false,
             connection_connected: false,
             twcc_sent: 0,
+            peer_channel,
         }
     }
 
@@ -221,6 +237,45 @@ impl PeerFixture {
         self.twcc_sent
     }
 
+    pub fn command(&mut self, command: Command) {
+        self.connection
+            .command(self.at(), command)
+            .expect("connection command");
+        self.connection_idle = false;
+    }
+
+    pub fn peer_send(&mut self, binary: bool, payload: &[u8]) {
+        let id = self.peer_channel.expect("fixture peer channel");
+        let accepted = self
+            .peer
+            .channel(id)
+            .expect("peer channel open")
+            .write(binary, payload)
+            .expect("peer channel write");
+        assert!(accepted, "peer accepts data channel payload");
+        self.peer_drained = false;
+    }
+
+    pub fn next_data_event(&mut self) -> FixtureDataEvent {
+        for _ in 0..4_000 {
+            if let Some(event) = self.step().and_then(PeerEvent::into_data) {
+                return event;
+            }
+        }
+        panic!("data channel event was not produced");
+    }
+
+    pub fn next_coexistence_event(&mut self) -> FixtureCoexistenceEvent {
+        for _ in 0..8_000 {
+            match self.step() {
+                Some(PeerEvent::Outbound(_, _)) => return FixtureCoexistenceEvent::Rtp,
+                Some(PeerEvent::PeerMessage { .. }) => return FixtureCoexistenceEvent::Data,
+                _ => {}
+            }
+        }
+        panic!("coexistence traffic made no progress");
+    }
+
     fn step(&mut self) -> Option<PeerEvent> {
         if !self.peer_drained {
             match self.peer.poll_output().expect("peer poll") {
@@ -275,6 +330,18 @@ impl PeerFixture {
                     self.peer_connected = true;
                     return Some(PeerEvent::Connected);
                 }
+                Output::Event(Event::ChannelOpen(_, _)) => {
+                    return Some(PeerEvent::PeerOpened);
+                }
+                Output::Event(Event::ChannelData(data)) => {
+                    return Some(PeerEvent::PeerMessage {
+                        binary: data.binary,
+                        payload: data.data,
+                    });
+                }
+                Output::Event(Event::ChannelClose(_)) => {
+                    return Some(PeerEvent::PeerClosed);
+                }
                 Output::Event(_) => return None,
                 Output::Timeout(_) => self.peer_drained = true,
             }
@@ -310,6 +377,9 @@ impl PeerFixture {
                 }
                 ConnectionOutput::Event(ConnectionEvent::Media { packet, .. }) => {
                     return Some(PeerEvent::Inbound(packet));
+                }
+                ConnectionOutput::Event(ConnectionEvent::DataChannel(event)) => {
+                    return Some(PeerEvent::ConnectionData(event));
                 }
                 ConnectionOutput::Event(_) => return None,
                 ConnectionOutput::Idle { .. } => self.connection_idle = true,
@@ -364,6 +434,54 @@ enum PeerEvent {
     Connected,
     Inbound(MediaPacket),
     Outbound(RtpHeader, Vec<u8>),
+    ConnectionData(DataChannelEvent),
+    PeerOpened,
+    PeerMessage { binary: bool, payload: Vec<u8> },
+    PeerClosed,
+}
+
+impl PeerEvent {
+    fn into_data(self) -> Option<FixtureDataEvent> {
+        match self {
+            Self::ConnectionData(DataChannelEvent::Opened { channel }) => {
+                Some(FixtureDataEvent::ConnectionOpened(channel))
+            }
+            Self::ConnectionData(DataChannelEvent::Message { channel, message }) => {
+                Some(FixtureDataEvent::ConnectionMessage { channel, message })
+            }
+            Self::ConnectionData(DataChannelEvent::Closed { channel }) => {
+                Some(FixtureDataEvent::ConnectionClosed(channel))
+            }
+            Self::PeerOpened => Some(FixtureDataEvent::PeerOpened),
+            Self::PeerMessage { binary, payload } => {
+                Some(FixtureDataEvent::PeerMessage { binary, payload })
+            }
+            Self::PeerClosed => Some(FixtureDataEvent::PeerClosed),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum FixtureDataEvent {
+    ConnectionOpened(DataChannelId),
+    ConnectionMessage {
+        channel: DataChannelId,
+        message: DataMessage,
+    },
+    ConnectionClosed(DataChannelId),
+    PeerOpened,
+    PeerMessage {
+        binary: bool,
+        payload: Vec<u8>,
+    },
+    PeerClosed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FixtureCoexistenceEvent {
+    Rtp,
+    Data,
 }
 
 #[derive(Clone, Copy)]

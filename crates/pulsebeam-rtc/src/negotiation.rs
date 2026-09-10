@@ -83,9 +83,28 @@ pub(crate) struct EgressSenderFacts {
     pub(crate) twcc_extension_id: Option<u8>,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct SctpSessionFacts {
+    pub(crate) port: u16,
+    pub(crate) max_message_size: Option<usize>,
+    pub(crate) unlimited_message_size: bool,
+    pub(crate) local_dtls_role: DtlsRole,
+}
+
 impl NegotiatedSessionFacts {
     pub(crate) const fn feedback(&self) -> PacketFeedbackKind {
         self.feedback
+    }
+
+    pub(crate) fn sctp(&self) -> Option<SctpSessionFacts> {
+        self.media.iter().find_map(|section| {
+            section.sctp.as_ref().map(|sctp| SctpSessionFacts {
+                port: sctp.port,
+                max_message_size: sctp.max_message_size,
+                unlimited_message_size: sctp.unlimited_message_size,
+                local_dtls_role: self.local_dtls_role,
+            })
+        })
     }
 
     pub(crate) fn outbound_twcc_extension_id(&self) -> Option<u8> {

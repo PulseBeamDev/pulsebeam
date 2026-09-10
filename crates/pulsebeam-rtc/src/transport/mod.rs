@@ -43,6 +43,7 @@ pub(crate) enum DatagramKind {
     Dtls,
     Rtp,
     Rtcp,
+    Sctp,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -657,6 +658,7 @@ impl Transport {
                     _ => {}
                 }
             }
+            DatagramKind::Sctp => self.drop_input(),
         }
         Ok(())
     }
@@ -755,7 +757,7 @@ impl Transport {
         }
         let provider = str0m::crypto::from_feature_flags();
         self.drain_ice(now, &provider)?;
-        self.drain_dtls(now)
+        self.drain_dtls(now, DatagramKind::Dtls)
     }
 
     pub(crate) fn send_rtp(&mut self, packet: &[u8]) -> Result<(), TransportError> {
@@ -774,6 +776,16 @@ impl Transport {
         self.send_secure(packet, DatagramKind::Rtcp, RtpService::Original)
     }
 
+    pub(crate) fn send_sctp(&mut self, packet: &[u8], now: Instant) -> Result<(), TransportError> {
+        if self.state != TransportState::Connected {
+            return Err(TransportError::InvalidInput);
+        }
+        let dtls = self.dtls.as_mut().ok_or(TransportError::InvalidInput)?;
+        dtls.send_application_data(packet, now)
+            .map_err(error_to_transport)?;
+        self.drain_dtls(now, DatagramKind::Sctp)
+    }
+
     pub(crate) fn close(&mut self, now: Instant) -> Result<(), TransportError> {
         if matches!(self.state, TransportState::Closed | TransportState::Failed) {
             return Err(TransportError::Closed);
@@ -784,7 +796,7 @@ impl Transport {
         if let Some(dtls) = self.dtls.as_mut() {
             dtls.clear_pending();
             dtls.close(now).map_err(error_to_transport)?;
-            self.drain_dtls(now)?;
+            self.drain_dtls(now, DatagramKind::Dtls)?;
         }
         self.dtls = None;
         self.srtp = None;
@@ -940,10 +952,14 @@ impl Transport {
             (left, None) | (None, left) => left,
         };
         self.dtls = Some(dtls);
-        self.drain_dtls(now)
+        self.drain_dtls(now, DatagramKind::Dtls)
     }
 
-    fn drain_dtls(&mut self, _now: Instant) -> Result<(), TransportError> {
+    fn drain_dtls(
+        &mut self,
+        _now: Instant,
+        packet_kind: DatagramKind,
+    ) -> Result<(), TransportError> {
         let Some(dtls) = self.dtls.as_mut() else {
             return Ok(());
         };
@@ -960,7 +976,7 @@ impl Transport {
         let _ = dtls;
         let path = self.selected.clone().ok_or(TransportError::Protocol)?;
         for bytes in packets {
-            self.prepare_transmit(path.clone(), bytes, DatagramKind::Dtls, None)?;
+            self.prepare_transmit(path.clone(), bytes, packet_kind, None)?;
         }
         for event in events {
             match event {
@@ -1017,7 +1033,7 @@ impl Transport {
         if let Err(error) = dtls.handle_packet(&bytes, now) {
             self.fail(error_to_transport(error))?;
         }
-        self.drain_dtls(now)
+        self.drain_dtls(now, DatagramKind::Dtls)
     }
 
     fn drain_pending_dtls(

@@ -12,6 +12,7 @@ mod pacer;
 mod packet;
 mod rtcp;
 mod scheduler;
+mod sctp;
 mod sent_history;
 mod session;
 mod time;

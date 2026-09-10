@@ -121,6 +121,20 @@ impl DtlsLayer {
         self.drive(now)
     }
 
+    pub(crate) fn send_application_data(
+        &mut self,
+        data: &[u8],
+        now: Instant,
+    ) -> Result<(), DtlsError> {
+        if !self.connected || self.closing || self.closed {
+            return Err(DtlsError::InvalidState);
+        }
+        self.instance
+            .send_application_data(data)
+            .map_err(|_| DtlsError::Crypto)?;
+        self.drive(now)
+    }
+
     pub(crate) fn poll_packet(&mut self) -> Option<Vec<u8>> {
         let packet = self.packets.pop_front();
         debug_assert!(self.packets.len() <= MAX_OUTPUT);
