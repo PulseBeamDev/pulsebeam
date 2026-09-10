@@ -71,6 +71,10 @@ pub(crate) struct IngressMediaFacts {
 }
 
 impl NegotiatedSessionFacts {
+    pub(crate) const fn feedback(&self) -> PacketFeedbackKind {
+        self.feedback
+    }
+
     pub(crate) fn outbound_twcc_extension_id(&self) -> Option<u8> {
         self.media.iter().find_map(|section| {
             section

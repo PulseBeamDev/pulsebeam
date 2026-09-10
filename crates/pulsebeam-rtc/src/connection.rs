@@ -24,7 +24,7 @@ const MAX_INGRESS_PACKETS: usize = 256;
 
 pub struct Connection {
     _config: ConnectionConfig,
-    _session: NegotiatedSessionFacts,
+    session: NegotiatedSessionFacts,
     _time: MonotonicObserver,
     _subsystems: SubsystemSlots,
     runtime: Runtime,
@@ -237,12 +237,14 @@ impl Connection {
             }
             TransportEvent::Rtcp {
                 arrival,
-                path_epoch: _,
+                path_epoch,
                 bytes,
             } => {
                 self._subsystems.ingress.accept_rtcp(
                     arrival,
                     bytes,
+                    path_epoch,
+                    self.session.feedback(),
                     self._subsystems.transport.smoothed_rtt(),
                 );
                 None
@@ -281,7 +283,7 @@ impl Connection {
         );
         let connection = Self {
             _config: config,
-            _session: negotiated.facts,
+            session: negotiated.facts,
             _time: MonotonicObserver::starting_at(at),
             _subsystems: SubsystemSlots { transport, ingress },
             runtime: Runtime::new(),

@@ -3,10 +3,17 @@
     reason = "typed RTCP views are retained for the bounded Plan 07 feedback handoff"
 )]
 
-use crate::packet::{PacketError, RtcpCompound, RtcpPacket};
+use crate::{
+    PacketFeedbackKind, TimePoint,
+    packet::{PacketError, RtcpCompound, RtcpPacket},
+    transport::PathEpoch,
+};
+
+const MAX_FEEDBACK_STATUSES: usize = 8_192;
+const MAX_RFC8888_REPORTS: usize = 16_384;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum Fact {
+pub(crate) enum LifecycleFact {
     SenderReport {
         ssrc: u32,
         ntp_seconds: u32,
@@ -20,16 +27,79 @@ pub(crate) enum Fact {
     Bye {
         ssrc: u32,
     },
-    Feedback,
 }
 
-pub(crate) fn facts(bytes: &[u8]) -> Result<Vec<Fact>, PacketError> {
-    let mut facts = Vec::new();
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct FeedbackBatch {
+    pub(crate) received_at: TimePoint,
+    pub(crate) path_epoch: PathEpoch,
+    pub(crate) sender_ssrc: u32,
+    pub(crate) report: FeedbackReport,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum FeedbackReport {
+    Twcc {
+        media_ssrc: u32,
+        base_sequence: u16,
+        reference_time: u32,
+        feedback_count: u8,
+        statuses: Box<[TwccStatus]>,
+    },
+    Rfc8888 {
+        reports: Box<[Rfc8888Report]>,
+        report_timestamp: u32,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TwccStatus {
+    NotReceived,
+    Received { delta_250us: i16 },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct Rfc8888Report {
+    pub(crate) ssrc: u32,
+    pub(crate) begin_sequence: u16,
+    pub(crate) report_count: u16,
+    pub(crate) statuses: Box<[Rfc8888Status]>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Rfc8888Status {
+    NotReceived,
+    Received {
+        ecn: u8,
+        arrival_offset: ArrivalOffset,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ArrivalOffset {
+    Ticks(u16),
+    OverRange,
+    Unavailable,
+}
+
+pub(crate) struct ParsedRtcp {
+    pub(crate) lifecycle: Vec<LifecycleFact>,
+    pub(crate) feedback: Vec<FeedbackBatch>,
+}
+
+pub(crate) fn parse(
+    bytes: &[u8],
+    received_at: TimePoint,
+    path_epoch: PathEpoch,
+    mode: PacketFeedbackKind,
+) -> Result<ParsedRtcp, PacketError> {
+    let mut lifecycle = Vec::new();
+    let mut feedback = Vec::new();
+    let mut status_count = 0usize;
     for packet in RtcpCompound::parse(bytes)? {
         let packet = packet?;
-        typed(packet)?;
         if let Some(report) = packet.sender_report()? {
-            facts.push(Fact::SenderReport {
+            lifecycle.push(LifecycleFact::SenderReport {
                 ssrc: report.sender_ssrc(),
                 ntp_seconds: report.ntp_seconds(),
                 ntp_fraction: report.ntp_fraction(),
@@ -45,7 +115,7 @@ pub(crate) fn facts(bytes: &[u8]) -> Result<Vec<Fact>, PacketError> {
                             .filter(|value| !value.is_empty())
                             .map(Box::<str>::from)
                             .ok_or(PacketError::InvalidValue)?;
-                        facts.push(Fact::Cname {
+                        lifecycle.push(LifecycleFact::Cname {
                             ssrc: chunk.ssrc(),
                             cname,
                         });
@@ -54,13 +124,72 @@ pub(crate) fn facts(bytes: &[u8]) -> Result<Vec<Fact>, PacketError> {
             }
         }
         if let Some(bye) = packet.bye()? {
-            facts.extend(bye.ssrcs().map(|ssrc| Fact::Bye { ssrc }));
+            lifecycle.extend(bye.ssrcs().map(|ssrc| LifecycleFact::Bye { ssrc }));
         }
-        if matches!(packet.packet_type(), 205 | 206) {
-            facts.push(Fact::Feedback);
+        match (packet.packet_type(), packet.count()) {
+            (201, _) => {
+                packet.receiver_report()?;
+            }
+            (205, 15) => {
+                let twcc = packet.twcc()?.ok_or(PacketError::InvalidValue)?;
+                if mode == PacketFeedbackKind::TransportWide {
+                    let statuses = twcc
+                        .statuses()
+                        .map(|status| match status? {
+                            TwccPacketStatus::NotReceived { .. } => Ok(TwccStatus::NotReceived),
+                            TwccPacketStatus::Received { delta, .. } => Ok(TwccStatus::Received {
+                                delta_250us: delta.ticks(),
+                            }),
+                        })
+                        .collect::<Result<Vec<_>, PacketError>>()?;
+                    status_count = status_count
+                        .checked_add(statuses.len())
+                        .ok_or(PacketError::TooManyItems)?;
+                    if status_count > MAX_FEEDBACK_STATUSES {
+                        return Err(PacketError::TooManyItems);
+                    }
+                    feedback.push(FeedbackBatch {
+                        received_at,
+                        path_epoch,
+                        sender_ssrc: twcc.sender_ssrc(),
+                        report: FeedbackReport::Twcc {
+                            media_ssrc: twcc.media_ssrc(),
+                            base_sequence: twcc.base_sequence(),
+                            reference_time: twcc.reference_time().ticks(),
+                            feedback_count: twcc.feedback_count(),
+                            statuses: statuses.into(),
+                        },
+                    });
+                }
+            }
+            (205, 11) => {
+                let report = rfc8888(packet)?.ok_or(PacketError::InvalidValue)?;
+                if mode == PacketFeedbackKind::Rfc8888 {
+                    status_count = status_count
+                        .checked_add(report.status_count())
+                        .ok_or(PacketError::TooManyItems)?;
+                    if status_count > MAX_FEEDBACK_STATUSES {
+                        return Err(PacketError::TooManyItems);
+                    }
+                    feedback.push(FeedbackBatch {
+                        received_at,
+                        path_epoch,
+                        sender_ssrc: report.sender_ssrc,
+                        report: FeedbackReport::Rfc8888 {
+                            reports: report.reports.into(),
+                            report_timestamp: report.report_timestamp,
+                        },
+                    });
+                }
+            }
+            (205, 1) | (206, 1) | (206, 4) => typed(packet)?,
+            _ => {}
         }
     }
-    Ok(facts)
+    Ok(ParsedRtcp {
+        lifecycle,
+        feedback,
+    })
 }
 
 const REPORT_BLOCK_BYTES: usize = 24;
@@ -583,6 +712,107 @@ pub struct TwccStatuses<'a> {
     chunk_remaining: u16,
     current_slot: u16,
 }
+
+struct ParsedRfc8888 {
+    sender_ssrc: u32,
+    reports: Vec<Rfc8888Report>,
+    report_timestamp: u32,
+}
+
+impl ParsedRfc8888 {
+    fn status_count(&self) -> usize {
+        self.reports
+            .iter()
+            .map(|report| report.statuses.len())
+            .sum()
+    }
+}
+
+fn rfc8888(packet: RtcpPacket<'_>) -> Result<Option<ParsedRfc8888>, PacketError> {
+    if packet.packet_type() != 205 || packet.count() != 11 {
+        return Ok(None);
+    }
+    let body = packet.body();
+    if body.len() < 12 {
+        return Err(PacketError::InvalidLength);
+    }
+    let sender_ssrc = u32_at(body, 0)?;
+    let mut offset = 4usize;
+    let end = body
+        .len()
+        .checked_sub(4)
+        .ok_or(PacketError::InvalidLength)?;
+    let mut reports = Vec::new();
+    while offset < end {
+        let ssrc = u32_at(body, offset)?;
+        let begin_sequence = u16_at(
+            body,
+            offset.checked_add(4).ok_or(PacketError::InvalidLength)?,
+        )?;
+        let report_count = u16_at(
+            body,
+            offset.checked_add(6).ok_or(PacketError::InvalidLength)?,
+        )?;
+        let count = usize::from(report_count);
+        if count > MAX_RFC8888_REPORTS {
+            return Err(PacketError::TooManyItems);
+        }
+        offset = offset.checked_add(8).ok_or(PacketError::InvalidLength)?;
+        let metrics_end = offset
+            .checked_add(count.checked_mul(2).ok_or(PacketError::InvalidLength)?)
+            .ok_or(PacketError::InvalidLength)?;
+        if metrics_end > end {
+            return Err(PacketError::InvalidLength);
+        }
+        let mut statuses = Vec::with_capacity(count);
+        let metrics = body
+            .get(offset..metrics_end)
+            .ok_or(PacketError::InvalidLength)?;
+        for metric in metrics.chunks_exact(2) {
+            let metric =
+                u16::from_be_bytes(metric.try_into().map_err(|_| PacketError::InvalidLength)?);
+            if metric & 0x8000 == 0 {
+                if metric != 0 {
+                    return Err(PacketError::InvalidValue);
+                }
+                statuses.push(Rfc8888Status::NotReceived);
+                continue;
+            }
+            let ecn = ((metric >> 13) & 3) as u8;
+            let offset = metric & 0x1fff;
+            let arrival_offset = match offset {
+                0x1ffe => ArrivalOffset::OverRange,
+                0x1fff => ArrivalOffset::Unavailable,
+                value => ArrivalOffset::Ticks(value),
+            };
+            statuses.push(Rfc8888Status::Received {
+                ecn,
+                arrival_offset,
+            });
+        }
+        offset = metrics_end;
+        if count % 2 != 0 {
+            if u16_at(body, offset)? != 0 {
+                return Err(PacketError::InvalidValue);
+            }
+            offset = offset.checked_add(2).ok_or(PacketError::InvalidLength)?;
+        }
+        reports.push(Rfc8888Report {
+            ssrc,
+            begin_sequence,
+            report_count,
+            statuses: statuses.into(),
+        });
+    }
+    if offset != end {
+        return Err(PacketError::InvalidLength);
+    }
+    Ok(Some(ParsedRfc8888 {
+        sender_ssrc,
+        reports,
+        report_timestamp: u32_at(body, end)?,
+    }))
+}
 #[allow(
     clippy::arithmetic_side_effects,
     reason = "the validated TWCC iterator advances only within bounded chunks and delta bytes"
@@ -885,6 +1115,7 @@ pub fn typed(packet: RtcpPacket<'_>) -> Result<(), PacketError> {
         203 => Bye::parse(packet).map(|_| ()),
         205 if packet.count() == 1 => Nack::parse(packet).map(|_| ()),
         205 if packet.count() == 15 => Twcc::parse(packet).map(|_| ()),
+        205 if packet.count() == 11 => rfc8888(packet).map(|_| ()),
         206 if packet.count() == 1 => Pli::parse(packet).map(|_| ()),
         206 if packet.count() == 4 => Fir::parse(packet).map(|_| ()),
         _ => Ok(()),
@@ -901,7 +1132,45 @@ pub fn validate_compound(bytes: &[u8]) -> Result<(), PacketError> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
+
     use super::*;
+    use crate::GlobalMediaTime;
+
+    fn at() -> TimePoint {
+        TimePoint {
+            monotonic: Instant::now(),
+            global: GlobalMediaTime::from_micros(7),
+        }
+    }
+
+    fn rfc8888(blocks: &[(u32, u16, Vec<u16>)], timestamp: u32) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&9u32.to_be_bytes());
+        for (ssrc, begin, metrics) in blocks {
+            body.extend_from_slice(&ssrc.to_be_bytes());
+            body.extend_from_slice(&begin.to_be_bytes());
+            body.extend_from_slice(&(u16::try_from(metrics.len()).unwrap()).to_be_bytes());
+            for metric in metrics {
+                body.extend_from_slice(&metric.to_be_bytes());
+            }
+            if !metrics.len().is_multiple_of(2) {
+                body.extend_from_slice(&0u16.to_be_bytes());
+            }
+        }
+        body.extend_from_slice(&timestamp.to_be_bytes());
+        let words = body
+            .len()
+            .checked_add(4)
+            .and_then(|length| length.checked_div(4))
+            .and_then(|words| words.checked_sub(1))
+            .and_then(|words| u16::try_from(words).ok())
+            .expect("bounded test packet has a valid RTCP length");
+        let mut packet = vec![0x8b, 205];
+        packet.extend_from_slice(&words.to_be_bytes());
+        packet.extend_from_slice(&body);
+        packet
+    }
     #[test]
     fn validates_sender_and_receiver_reports() {
         let mut sr = vec![0x80, 200, 0, 6];
@@ -916,6 +1185,75 @@ mod tests {
     fn rejects_short_typed_feedback() {
         let bytes = [0x81, 205, 0, 1, 0, 0, 0, 0];
         assert!(validate_compound(&bytes).is_err());
+    }
+
+    #[test]
+    fn rfc8888_preserves_reports_sentinels_and_path_epoch() {
+        let bytes = rfc8888(&[(7, u16::MAX, vec![0, 0xe001, 0xbffe])], 11);
+        let parsed = parse(
+            &bytes,
+            at(),
+            PathEpoch::from_value(3),
+            PacketFeedbackKind::Rfc8888,
+        )
+        .unwrap();
+        assert!(parsed.lifecycle.is_empty());
+        assert_eq!(parsed.feedback.len(), 1);
+        let batch = &parsed.feedback[0];
+        assert_eq!(batch.path_epoch, PathEpoch::from_value(3));
+        assert_eq!(batch.sender_ssrc, 9);
+        let FeedbackReport::Rfc8888 {
+            reports,
+            report_timestamp,
+        } = &batch.report
+        else {
+            panic!("RFC 8888 mode publishes RFC 8888 facts");
+        };
+        assert_eq!(*report_timestamp, 11);
+        assert_eq!(reports[0].ssrc, 7);
+        assert_eq!(reports[0].begin_sequence, u16::MAX);
+        assert_eq!(reports[0].report_count, 3);
+        assert_eq!(
+            reports[0].statuses.as_ref(),
+            [
+                Rfc8888Status::NotReceived,
+                Rfc8888Status::Received {
+                    ecn: 3,
+                    arrival_offset: ArrivalOffset::Ticks(1),
+                },
+                Rfc8888Status::Received {
+                    ecn: 1,
+                    arrival_offset: ArrivalOffset::OverRange,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn feedback_mode_filtering_and_input_limit_are_all_or_nothing() {
+        let valid = rfc8888(&[(7, 1, vec![0])], 0);
+        assert!(
+            parse(
+                &valid,
+                at(),
+                PathEpoch::from_value(1),
+                PacketFeedbackKind::TransportWide,
+            )
+            .unwrap()
+            .feedback
+            .is_empty()
+        );
+
+        let oversized = rfc8888(&[(7, 1, vec![0; 8_192]), (8, 1, vec![0])], 0);
+        assert!(matches!(
+            parse(
+                &oversized,
+                at(),
+                PathEpoch::from_value(1),
+                PacketFeedbackKind::Rfc8888,
+            ),
+            Err(PacketError::TooManyItems)
+        ));
     }
 
     #[test]

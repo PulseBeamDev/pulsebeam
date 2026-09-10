@@ -15,11 +15,12 @@ use bytes::Bytes;
 
 use crate::{
     ConnectionWarning, EncodingId, EncodingInfo, EncodingRetireReason, Event, MediaKind,
-    MediaPacket, TimePoint,
+    MediaPacket, PacketFeedbackKind, TimePoint,
     clock::{ClockMapper, ClockWarning, ntp_micros},
     negotiation::IngressMediaFacts,
     packet::RtpPacket,
-    rtcp::{self, Fact},
+    rtcp::{self, FeedbackBatch, LifecycleFact},
+    transport::PathEpoch,
 };
 
 const MAX_RECORDS: usize = 256;
@@ -28,13 +29,12 @@ pub(crate) struct IngressOwner {
     media: Box<[MediaFacts]>,
     encodings: Vec<Encoding>,
     events: VecDeque<Event>,
-    rtcp: VecDeque<TimedRecord>,
+    feedback: VecDeque<FeedbackBatch>,
     cname_by_ssrc: Vec<(u32, Box<str>)>,
     groups: Vec<(Box<str>, i128)>,
     max_unsignaled: usize,
     max_bytes: usize,
     queued_media_bytes: usize,
-    queued_rtcp_bytes: usize,
     next_encoding: u32,
     dropped: u64,
 }
@@ -46,11 +46,6 @@ struct MediaFacts {
     ssrcs: Box<[u32]>,
     rids: Box<[Box<str>]>,
     extensions: Box<[(u8, Box<str>)]>,
-}
-
-struct TimedRecord {
-    _arrival: TimePoint,
-    _bytes: Vec<u8>,
 }
 
 struct Encoding {
@@ -84,13 +79,12 @@ impl IngressOwner {
                 .collect(),
             encodings: Vec::new(),
             events: VecDeque::new(),
-            rtcp: VecDeque::new(),
+            feedback: VecDeque::new(),
             cname_by_ssrc: Vec::new(),
             groups: Vec::new(),
             max_unsignaled: usize::from(max_unsignaled),
             max_bytes,
             queued_media_bytes: 0,
-            queued_rtcp_bytes: 0,
             next_encoding: 1,
             dropped: 0,
         }
@@ -202,30 +196,36 @@ impl IngressOwner {
         &mut self,
         arrival: TimePoint,
         bytes: Vec<u8>,
+        path_epoch: PathEpoch,
+        mode: PacketFeedbackKind,
         smoothed_rtt: Option<std::time::Duration>,
     ) {
-        if self.rtcp.len() >= MAX_RECORDS
-            || bytes.len() > self.max_bytes.saturating_sub(self.queued_rtcp_bytes)
+        if bytes.len() > self.max_bytes {
+            self.drop();
+            return;
+        }
+        let Ok(parsed) = rtcp::parse(&bytes, arrival, path_epoch, mode) else {
+            self.drop();
+            return;
+        };
+        if parsed.lifecycle.len() > MAX_RECORDS.saturating_sub(self.events.len())
+            || parsed.feedback.len() > MAX_RECORDS.saturating_sub(self.feedback.len())
         {
             self.drop();
             return;
         }
-        let Ok(facts) = rtcp::facts(&bytes) else {
-            self.drop();
-            return;
-        };
-        if facts.len() > MAX_RECORDS.saturating_sub(self.events.len()) {
-            self.drop();
-            return;
-        }
-        self.queued_rtcp_bytes = self.queued_rtcp_bytes.saturating_add(bytes.len());
-        self.rtcp.push_back(TimedRecord {
-            _arrival: arrival,
-            _bytes: bytes,
-        });
-        for fact in facts {
+        for fact in parsed.lifecycle {
             self.apply_rtcp_fact(arrival, smoothed_rtt, fact);
         }
+        self.feedback.extend(parsed.feedback);
+    }
+
+    #[allow(
+        dead_code,
+        reason = "Plan 08 consumes authenticated, mode-filtered feedback through this owner seam"
+    )]
+    pub(crate) fn poll_feedback(&mut self) -> Option<FeedbackBatch> {
+        self.feedback.pop_front()
     }
 
     pub(crate) fn poll_event(&mut self) -> Option<Event> {
@@ -303,10 +303,10 @@ impl IngressOwner {
         &mut self,
         arrival: TimePoint,
         smoothed_rtt: Option<std::time::Duration>,
-        fact: Fact,
+        fact: LifecycleFact,
     ) {
         match fact {
-            Fact::Cname { ssrc, cname } => {
+            LifecycleFact::Cname { ssrc, cname } => {
                 if let Some((_, known)) = self
                     .cname_by_ssrc
                     .iter_mut()
@@ -317,7 +317,7 @@ impl IngressOwner {
                     self.cname_by_ssrc.push((ssrc, cname));
                 }
             }
-            Fact::Bye { ssrc } => {
+            LifecycleFact::Bye { ssrc } => {
                 if let Some(encoding) = self
                     .encodings
                     .iter_mut()
@@ -331,7 +331,7 @@ impl IngressOwner {
                     });
                 }
             }
-            Fact::SenderReport {
+            LifecycleFact::SenderReport {
                 ssrc,
                 ntp_seconds,
                 ntp_fraction,
@@ -382,7 +382,6 @@ impl IngressOwner {
                     self.push_clock_warning(warning);
                 }
             }
-            Fact::Feedback => {}
         }
     }
 
