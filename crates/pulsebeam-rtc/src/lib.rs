@@ -8,9 +8,16 @@ mod media_packet;
 mod negotiation;
 mod packet;
 mod rtcp;
+mod sent_history;
 mod session;
 mod time;
 mod transport;
+
+#[cfg(test)]
+extern crate self as pulsebeam_rtc;
+#[cfg(test)]
+#[path = "../tests/support/mod.rs"]
+mod test_support;
 
 pub use connection::{AcceptedConnection, Connection};
 pub use id::{DataChannelId, EncodingId, FrameId, IceTcpFlowId, SenderId};

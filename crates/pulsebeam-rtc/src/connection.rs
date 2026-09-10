@@ -10,11 +10,12 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     AcceptError, CloseReason, Command, CommandError, ConnectionConfig, ConnectionEntropy,
-    ConnectionWarning, Event, NetworkInput, Output, ReceiveError, SdpAnswer, SdpOffer, SessionInfo,
-    TimePoint, Transmit,
+    ConnectionWarning, Event, NetworkInput, Output, PacketFeedbackKind, ReceiveError, SdpAnswer,
+    SdpOffer, SessionInfo, TimePoint, Transmit,
     egress::{MediaEgress, PrepareResult},
     ingress::IngressOwner,
     negotiation::{self, NegotiatedSessionFacts},
+    sent_history::{HistoryError, MAX_EXPIRATIONS_PER_POLL, SentHistory},
     time::MonotonicObserver,
     transport::{
         DatagramKind, PathEpoch, PreparedRtpIdentity, PreparedTransmit, Transport, TransportError,
@@ -60,14 +61,14 @@ struct Runtime {
 }
 
 impl Runtime {
-    fn new() -> Self {
+    fn new(feedback: PacketFeedbackKind) -> Self {
         Self {
             data: VecDeque::new(),
             feedback: None,
             controller: None,
             scheduler: None,
             sctp: None,
-            commit: CommitCoordinator::new(),
+            commit: CommitCoordinator::new(feedback),
             closed: false,
         }
     }
@@ -107,22 +108,28 @@ pub(crate) struct TransmitCommitContext {
     pub(crate) rtp: Option<PreparedRtpIdentity>,
 }
 
-trait CommitParticipant: Send {
-    fn commit(&mut self, context: TransmitCommitContext);
+pub(crate) trait CommitParticipant: Send {
+    fn commit(&mut self, context: TransmitCommitContext) -> Result<(), HistoryError>;
 }
 
 struct CommitCoordinator {
+    history: SentHistory,
     participants: Vec<Box<dyn CommitParticipant>>,
 }
 
 impl CommitCoordinator {
-    fn new() -> Self {
+    fn new(feedback: PacketFeedbackKind) -> Self {
         Self {
+            history: SentHistory::new(feedback),
             participants: Vec::new(),
         }
     }
 
-    fn commit_transport(&mut self, at: Instant, prepared: PreparedTransmit) -> Transmit {
+    fn commit_transport(
+        &mut self,
+        at: Instant,
+        prepared: PreparedTransmit,
+    ) -> Result<Transmit, HistoryError> {
         let context = TransmitCommitContext {
             at,
             kind: prepared.kind,
@@ -130,14 +137,15 @@ impl CommitCoordinator {
             path_epoch: prepared.path_epoch,
             rtp: prepared.rtp,
         };
+        CommitParticipant::commit(&mut self.history, context)?;
         for participant in &mut self.participants {
-            participant.commit(context);
+            participant.commit(context)?;
         }
         let PreparedTransmit { target, bytes, .. } = prepared;
-        Transmit {
+        Ok(Transmit {
             target,
             payload: Bytes::from(bytes),
-        }
+        })
     }
 }
 
@@ -192,6 +200,11 @@ impl Connection {
     pub fn poll(&mut self, at: TimePoint) -> Output {
         let at = self._time.observe(at);
 
+        self.runtime
+            .commit
+            .history
+            .expire(at.monotonic, MAX_EXPIRATIONS_PER_POLL);
+
         if self._time.take_warning() {
             return Output::Event(Event::Warning(ConnectionWarning::ClockRegression));
         }
@@ -219,10 +232,20 @@ impl Connection {
             return Output::Event(event);
         }
 
+        if let Some(feedback) = self._subsystems.ingress.poll_feedback() {
+            self.runtime.commit.history.process_feedback(feedback);
+        }
+
         if !self.runtime.closed
             && let Some(prepared) = self._subsystems.transport.poll_prepared()
         {
-            return Output::Transmit(self.runtime.commit.commit_transport(at.monotonic, prepared));
+            return match self.runtime.commit.commit_transport(at.monotonic, prepared) {
+                Ok(transmit) => Output::Transmit(transmit),
+                Err(_) => {
+                    self.runtime.closed = true;
+                    Output::Closed(CloseReason::TransportFailure)
+                }
+            };
         }
 
         if !self.runtime.closed {
@@ -236,9 +259,13 @@ impl Connection {
                         self.runtime.closed = true;
                         return Output::Closed(CloseReason::TransportFailure);
                     };
-                    return Output::Transmit(
-                        self.runtime.commit.commit_transport(at.monotonic, prepared),
-                    );
+                    return match self.runtime.commit.commit_transport(at.monotonic, prepared) {
+                        Ok(transmit) => Output::Transmit(transmit),
+                        Err(_) => {
+                            self.runtime.closed = true;
+                            Output::Closed(CloseReason::TransportFailure)
+                        }
+                    };
                 }
                 PrepareResult::Fatal => {
                     self.runtime.closed = true;
@@ -260,6 +287,7 @@ impl Connection {
                     [
                         self._subsystems.transport.next_deadline(),
                         self.runtime.next_deadline(),
+                        self.runtime.commit.history.next_deadline(),
                     ]
                     .into_iter()
                     .flatten()
@@ -278,9 +306,14 @@ impl Connection {
                 self.runtime.closed = true;
                 Some(Output::Closed(CloseReason::TransportFailure))
             }
-            TransportEvent::StateChanged(_)
-            | TransportEvent::IceStateChanged(_)
-            | TransportEvent::SelectedPathChanged { .. } => None,
+            TransportEvent::StateChanged(_) | TransportEvent::IceStateChanged(_) => None,
+            TransportEvent::SelectedPathChanged { current, epoch, .. } => {
+                self.runtime
+                    .commit
+                    .history
+                    .path_changed(epoch, current.is_some());
+                None
+            }
             TransportEvent::Rtp {
                 arrival,
                 path_epoch: _,
@@ -343,6 +376,7 @@ impl Connection {
             config.default_audio_policy,
             config.default_video_policy,
         );
+        let feedback = negotiated.facts.feedback();
         let connection = Self {
             _config: config,
             session: negotiated.facts,
@@ -352,7 +386,7 @@ impl Connection {
                 ingress,
                 egress,
             },
-            runtime: Runtime::new(),
+            runtime: Runtime::new(feedback),
             _not_sync: PhantomData,
         };
         Ok(AcceptedConnection {
@@ -410,43 +444,51 @@ impl Drop for EntropyConsumer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::TransmitTarget;
+    use crate::{
+        ForwardedMedia, FrameBoundary, FrameDependencies, FrameId, FrameMetadata, TransmitTarget,
+    };
     use std::sync::{Arc, Mutex};
 
     struct Observer(Arc<Mutex<Option<TransmitCommitContext>>>);
 
     impl CommitParticipant for Observer {
-        fn commit(&mut self, context: TransmitCommitContext) {
+        fn commit(&mut self, context: TransmitCommitContext) -> Result<(), HistoryError> {
             *self.0.lock().expect("observer lock") = Some(context);
+            Ok(())
         }
     }
 
     #[test]
     fn commit_preserves_finalized_wire_context() {
         let at = Instant::now();
-        let mut coordinator = CommitCoordinator::new();
+        let mut coordinator = CommitCoordinator::new(PacketFeedbackKind::TransportWide);
+        coordinator
+            .history
+            .path_changed(PathEpoch::from_value(3), true);
         let observed = Arc::new(Mutex::new(None));
         coordinator
             .participants
             .push(Box::new(Observer(Arc::clone(&observed))));
-        let transmit = coordinator.commit_transport(
-            at,
-            PreparedTransmit {
-                target: TransmitTarget::IceTcp {
-                    flow: crate::IceTcpFlowId::from_value(11),
+        let transmit = coordinator
+            .commit_transport(
+                at,
+                PreparedTransmit {
+                    target: TransmitTarget::IceTcp {
+                        flow: crate::IceTcpFlowId::from_value(11),
+                    },
+                    bytes: vec![0, 3, 1, 2, 3],
+                    kind: DatagramKind::Rtp,
+                    wire_len: 5,
+                    path_epoch: Some(PathEpoch::from_value(3)),
+                    rtp: Some(PreparedRtpIdentity {
+                        ssrc: 7,
+                        sequence: 9,
+                        twcc_sequence: Some(13),
+                        service: crate::transport::RtpService::Original,
+                    }),
                 },
-                bytes: vec![0, 3, 1, 2, 3],
-                kind: DatagramKind::Rtp,
-                wire_len: 5,
-                path_epoch: Some(PathEpoch::from_value(3)),
-                rtp: Some(PreparedRtpIdentity {
-                    ssrc: 7,
-                    sequence: 9,
-                    twcc_sequence: Some(13),
-                    service: crate::transport::RtpService::Original,
-                }),
-            },
-        );
+            )
+            .expect("valid RTP commit");
         assert_eq!(transmit.payload, Bytes::from_static(&[0, 3, 1, 2, 3]));
         assert_eq!(
             *observed.lock().expect("observer lock"),
@@ -462,6 +504,52 @@ mod tests {
                     service: crate::transport::RtpService::Original,
                 }),
             })
+        );
+    }
+
+    #[test]
+    fn authenticated_twcc_feedback_drains_through_the_public_runtime() {
+        let mut fixture = crate::test_support::PeerFixture::connected();
+        let packet = fixture.send_source(b"feedback");
+        for id in 1..=2 {
+            fixture
+                .connection
+                .command(
+                    fixture.at(),
+                    Command::SendMedia {
+                        sender: fixture.sender,
+                        media: ForwardedMedia {
+                            packet: packet.clone(),
+                            frame: FrameMetadata {
+                                id: FrameId::from_value(id),
+                                boundary: FrameBoundary::Complete,
+                                random_access: true,
+                                discardable: false,
+                                dependencies: FrameDependencies::Known(Arc::from([])),
+                            },
+                        },
+                    },
+                )
+                .expect("media admitted through public command");
+            let (header, payload) = fixture.receive_egress();
+            assert_eq!(payload, b"feedback");
+            assert!(header.ext_vals.transport_cc.is_some());
+        }
+        fixture.drive_for(std::time::Duration::from_secs(2));
+
+        let counters = fixture.connection.runtime.commit.history.counters();
+        assert!(
+            counters.received > 0,
+            "authenticated peer TWCC must acknowledge the public RTP commit: {counters:?}, peer generated {}",
+            fixture.twcc_sent()
+        );
+        assert!(
+            fixture
+                .connection
+                ._subsystems
+                .ingress
+                .poll_feedback()
+                .is_none()
         );
     }
 }

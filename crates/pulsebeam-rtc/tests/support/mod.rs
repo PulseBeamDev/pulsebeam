@@ -6,6 +6,7 @@
     clippy::indexing_slicing,
     clippy::large_enum_variant,
     clippy::panic,
+    unreachable_patterns,
     reason = "deterministic test fixture failures should stop at their violated invariant"
 )]
 
@@ -25,7 +26,7 @@ use str0m_reference::{
     change::SdpAnswer,
     media::{Direction, MediaKind, Mid},
     net::{Protocol, Receive, TcpType},
-    rtp::{RawPacket, RtpHeader},
+    rtp::{RawPacket, RtpHeader, rtcp::Rtcp},
 };
 
 pub struct PeerFixture {
@@ -43,6 +44,7 @@ pub struct PeerFixture {
     connection_idle: bool,
     peer_connected: bool,
     connection_connected: bool,
+    twcc_sent: usize,
 }
 
 impl PeerFixture {
@@ -120,6 +122,7 @@ impl PeerFixture {
         peer.sdp_api()
             .accept_answer(pending, answer)
             .expect("peer accepts PulseBeam answer");
+        peer.direct_api().enable_twcc_feedback();
         Self {
             connection: accepted.connection,
             sender,
@@ -135,6 +138,7 @@ impl PeerFixture {
             connection_idle: false,
             peer_connected: false,
             connection_connected: false,
+            twcc_sent: 0,
         }
     }
 
@@ -205,6 +209,17 @@ impl PeerFixture {
         }
     }
 
+    pub fn drive_for(&mut self, duration: Duration) {
+        let deadline = self.now.checked_add(duration).expect("fixture deadline");
+        while self.now < deadline {
+            let _ = self.step();
+        }
+    }
+
+    pub fn twcc_sent(&self) -> usize {
+        self.twcc_sent
+    }
+
     fn step(&mut self) -> Option<PeerEvent> {
         if !self.peer_drained {
             match self.peer.poll_output().expect("peer poll") {
@@ -244,8 +259,14 @@ impl PeerFixture {
                     return None;
                 }
                 Output::Event(Event::RawPacket(packet)) => {
-                    if let RawPacket::RtpRx(header, payload) = *packet {
-                        return Some(PeerEvent::Outbound(header, payload));
+                    match *packet {
+                        RawPacket::RtpRx(header, payload) => {
+                            return Some(PeerEvent::Outbound(header, payload));
+                        }
+                        RawPacket::RtcpTx(Rtcp::Twcc(_)) => {
+                            self.twcc_sent = self.twcc_sent.saturating_add(1);
+                        }
+                        _ => {}
                     }
                     return None;
                 }
