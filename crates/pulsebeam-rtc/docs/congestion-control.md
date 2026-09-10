@@ -19,8 +19,12 @@ pinned to revision `01`. The source artifact used by the implementation review
 has SHA-256:
 
 ```text
-UNAVAILABLE: download the pinned draft before implementation review
+7beb2ff371106fa81a1678607ab3a1eb439ac9b0843d0d7fb64dab671132667f
 ```
+
+The review artifact is the 100,016-byte archive copy. Run
+`scripts/verify-scream-profile.sh` to retrieve that exact URL and verify both
+properties before reviewing controller changes.
 
 A later Internet-Draft revision, RFC, Ericsson commit, or libwebrtc commit MUST
 NOT silently change production behavior. Adopting one requires a new documented

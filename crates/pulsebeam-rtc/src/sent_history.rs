@@ -16,6 +16,7 @@ use std::{
 
 use crate::{
     PacketFeedbackKind,
+    congestion::{EcnMark as ControllerEcnMark, FeedbackSample},
     connection::{CommitParticipant, TransmitCommitContext},
     rtcp::{ArrivalOffset, FeedbackBatch, FeedbackReport, Rfc8888Status, TwccStatus},
     transport::{DatagramKind, PathEpoch, RtpService},
@@ -48,6 +49,9 @@ pub(crate) enum EcnMark {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct PacketFeedback {
     pub(crate) sent_id: SentPacketId,
+    pub(crate) committed_at: Instant,
+    pub(crate) transport_bytes: u32,
+    pub(crate) service: RtpService,
     pub(crate) received: bool,
     pub(crate) receiver_arrival: Option<ReceiverTime>,
     pub(crate) ecn: Option<EcnMark>,
@@ -72,6 +76,7 @@ pub(crate) struct ControllerInputs {
     pub(crate) timing: Option<FeedbackTiming>,
     pub(crate) path_change: Option<PathChange>,
     pub(crate) application_limited: bool,
+    pub(crate) bytes_in_flight: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -146,6 +151,7 @@ pub(crate) struct SentHistory {
     active_epoch: Option<PathEpoch>,
     inputs: ControllerInputs,
     counters: HistoryCounters,
+    bytes_in_flight: u64,
 }
 
 impl SentHistory {
@@ -170,6 +176,7 @@ impl SentHistory {
                 ..ControllerInputs::default()
             },
             counters: HistoryCounters::default(),
+            bytes_in_flight: 0,
         }
     }
 
@@ -192,6 +199,10 @@ impl SentHistory {
         let next_sent_id = self
             .next_sent_id
             .checked_add(1)
+            .ok_or(HistoryError::Exhausted)?;
+        let next_bytes_in_flight = self
+            .bytes_in_flight
+            .checked_add(context.wire_len as u64)
             .ok_or(HistoryError::Exhausted)?;
         let sent_id = SentPacketId(self.next_sent_id);
         let slot = ring_index(sent_id.0);
@@ -236,6 +247,8 @@ impl SentHistory {
             service: rtp.service,
             acknowledgment: Acknowledgment::Pending,
         });
+        self.bytes_in_flight = next_bytes_in_flight;
+        self.inputs.bytes_in_flight = self.bytes_in_flight;
         self.next_sent_id = next_sent_id;
         Ok(())
     }
@@ -250,8 +263,10 @@ impl SentHistory {
                 && self.active_epoch != Some(entry.path_epoch)
             {
                 entry.acknowledgment = Acknowledgment::Retired;
+                self.bytes_in_flight = self.bytes_in_flight.saturating_sub(entry.wire_len as u64);
             }
         }
+        self.inputs.bytes_in_flight = self.bytes_in_flight;
         self.inputs.path_change = Some(PathChange { epoch, available });
         self.twcc_reference = None;
         self.twcc_feedback_count = None;
@@ -327,10 +342,16 @@ impl SentHistory {
                 && entry.acknowledgment == Acknowledgment::Pending
             {
                 entry.acknowledgment = Acknowledgment::NotReceived;
+                let entry = *entry;
+                self.bytes_in_flight = self.bytes_in_flight.saturating_sub(entry.wire_len as u64);
+                self.inputs.bytes_in_flight = self.bytes_in_flight;
                 self.counters.expired = self.counters.expired.saturating_add(1);
                 if self.inputs.feedback.len() < MAX_FEEDBACK_STATUSES {
                     self.inputs.feedback.push(PacketFeedback {
                         sent_id: id,
+                        committed_at: entry.committed_at,
+                        transport_bytes: u32::try_from(entry.wire_len).unwrap_or(u32::MAX),
+                        service: entry.service,
                         received: false,
                         receiver_arrival: None,
                         ecn: None,
@@ -512,6 +533,9 @@ impl SentHistory {
         } else {
             Acknowledgment::NotReceived
         };
+        let entry = *entry;
+        self.bytes_in_flight = self.bytes_in_flight.saturating_sub(entry.wire_len as u64);
+        self.inputs.bytes_in_flight = self.bytes_in_flight;
         if received {
             self.counters.received = self.counters.received.saturating_add(1);
         } else {
@@ -519,6 +543,9 @@ impl SentHistory {
         }
         self.inputs.feedback.push(PacketFeedback {
             sent_id,
+            committed_at: entry.committed_at,
+            transport_bytes: u32::try_from(entry.wire_len).unwrap_or(u32::MAX),
+            service: entry.service,
             received,
             receiver_arrival,
             ecn,
@@ -602,6 +629,27 @@ impl SentHistory {
 
     pub(crate) fn set_application_limited(&mut self, application_limited: bool) {
         self.inputs.application_limited = application_limited;
+    }
+}
+
+impl PacketFeedback {
+    pub(crate) fn controller_sample(self, received_at: Instant, origin: Instant) -> FeedbackSample {
+        FeedbackSample {
+            sent_at: self.committed_at.saturating_duration_since(origin),
+            received_at: received_at.saturating_duration_since(origin),
+            transport_bytes: self.transport_bytes,
+            received: self.received,
+            receiver_arrival_micros: match self.receiver_arrival {
+                Some(ReceiverTime::Micros(value)) => Some(value),
+                Some(ReceiverTime::OverRange | ReceiverTime::Unavailable) | None => None,
+            },
+            ecn: self.ecn.map(|mark| match mark {
+                EcnMark::NotEct => ControllerEcnMark::NotEct,
+                EcnMark::Ect1 => ControllerEcnMark::Ect1,
+                EcnMark::Ect0 => ControllerEcnMark::Ect0,
+                EcnMark::Ce => ControllerEcnMark::Ce,
+            }),
+        }
     }
 }
 
@@ -737,9 +785,35 @@ mod tests {
         };
         history.process_feedback(batch.clone());
         assert_eq!(history.inputs.feedback.len(), 2);
+        assert_eq!(history.inputs.bytes_in_flight, 0);
+        let sample =
+            history.inputs.feedback[0].controller_sample(now + Duration::from_millis(20), now);
+        assert_eq!(sample.transport_bytes, 1_200);
+        assert_eq!(sample.sent_at, Duration::ZERO);
+        assert!(sample.received);
         history.process_feedback(batch);
         assert!(history.inputs.feedback.is_empty());
         assert_eq!(history.counters.duplicate_feedback, 2);
+    }
+
+    #[test]
+    fn non_rtp_transport_never_enters_controller_bytes_in_flight() {
+        let now = Instant::now();
+        let epoch = PathEpoch::from_value(11);
+        let mut history = SentHistory::new(PacketFeedbackKind::TransportWide);
+        history.path_changed(epoch, true);
+        history
+            .commit(TransmitCommitContext {
+                at: now,
+                kind: DatagramKind::Dtls,
+                wire_len: 4_096,
+                path_epoch: Some(epoch),
+                rtp: None,
+            })
+            .unwrap();
+        assert_eq!(history.inputs.bytes_in_flight, 0);
+        history.commit(context(now, epoch, 7, 1, Some(1))).unwrap();
+        assert_eq!(history.inputs.bytes_in_flight, 1_200);
     }
 
     #[test]
