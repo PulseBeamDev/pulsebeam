@@ -11,14 +11,17 @@
 )]
 
 use std::{
+    collections::VecDeque,
     net::SocketAddr,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
 use bytes::Bytes;
 use pulsebeam_rtc::{
-    Command, Connection, ConnectionConfig, ConnectionEntropy, DataChannelEvent, DataChannelId,
-    DataMessage, Event as ConnectionEvent, GlobalMediaTime, IceTcpFlowId, LocalCandidate,
+    Command, Connection, ConnectionConfig, ConnectionEntropy, ConnectionLimits, DataChannelEvent,
+    DataChannelId, DataMessage, Event as ConnectionEvent, ForwardedMedia, FrameBoundary,
+    FrameDependencies, FrameId, FrameMetadata, GlobalMediaTime, IceTcpFlowId, LocalCandidate,
     MediaPacket, MediaPayloadBitrate, NetworkInput, Output as ConnectionOutput, SdpOffer, SenderId,
     TimePoint, TransmitTarget,
 };
@@ -33,6 +36,7 @@ use str0m_reference::{
 pub struct PeerFixture {
     pub connection: Connection,
     pub sender: SenderId,
+    pub senders: Vec<SenderId>,
     pub sender_mid: String,
     peer: Rtc,
     mid: Mid,
@@ -47,6 +51,118 @@ pub struct PeerFixture {
     connection_connected: bool,
     twcc_sent: usize,
     peer_channel: Option<str0m_reference::channel::ChannelId>,
+    network: DeterministicNetwork,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NetworkPolicy {
+    pub delay: Duration,
+    pub drop_every: Option<u64>,
+    pub duplicate_every: Option<u64>,
+    pub reorder_every: Option<u64>,
+}
+
+#[derive(Clone, Debug)]
+enum PendingPacket {
+    Connection {
+        due: Instant,
+        input: NetworkInput,
+    },
+    Peer {
+        due: Instant,
+        protocol: Protocol,
+        source: SocketAddr,
+        destination: SocketAddr,
+        payload: Vec<u8>,
+    },
+}
+
+impl PendingPacket {
+    fn due(&self) -> Instant {
+        match self {
+            Self::Connection { due, .. } | Self::Peer { due, .. } => *due,
+        }
+    }
+
+    fn delay_by(&mut self, delay: Duration) {
+        match self {
+            Self::Connection { due, .. } | Self::Peer { due, .. } => *due += delay,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct DeterministicNetwork {
+    policy: NetworkPolicy,
+    seed: u64,
+    packets: u64,
+    dropped: u64,
+    duplicated: u64,
+    reordered: u64,
+    pending: VecDeque<PendingPacket>,
+    trace: Vec<&'static str>,
+}
+
+impl DeterministicNetwork {
+    const MAX_PENDING: usize = 8_192;
+    const MAX_TRACE: usize = 256;
+
+    fn configure(&mut self, seed: u64, policy: NetworkPolicy) {
+        self.policy = policy;
+        self.seed = seed;
+        self.packets = 0;
+        self.dropped = 0;
+        self.duplicated = 0;
+        self.reordered = 0;
+        self.trace.clear();
+    }
+
+    fn enqueue(&mut self, mut packet: PendingPacket) {
+        self.packets = self.packets.saturating_add(1);
+        let ordinal = self.packets.saturating_add(self.seed);
+        if self.pending.len() >= Self::MAX_PENDING {
+            self.dropped = self.dropped.saturating_add(1);
+            self.record("queue-full");
+            return;
+        }
+        if self
+            .policy
+            .drop_every
+            .is_some_and(|period| period != 0 && ordinal.is_multiple_of(period))
+        {
+            self.dropped = self.dropped.saturating_add(1);
+            self.record("drop");
+            return;
+        }
+        let duplicate = self
+            .policy
+            .duplicate_every
+            .is_some_and(|period| period != 0 && ordinal.is_multiple_of(period));
+        let reorder = self
+            .policy
+            .reorder_every
+            .is_some_and(|period| period != 0 && ordinal.is_multiple_of(period));
+        let duplicate_packet = duplicate.then(|| packet.clone());
+        if reorder {
+            self.reordered = self.reordered.saturating_add(1);
+            self.record("reorder");
+            packet.delay_by(self.policy.delay.max(Duration::from_millis(1)));
+        }
+        self.pending.push_back(packet);
+        if let Some(packet) = duplicate_packet {
+            self.duplicated = self.duplicated.saturating_add(1);
+            self.record("duplicate");
+            if self.pending.len() < Self::MAX_PENDING {
+                self.pending.push_back(packet);
+            }
+        }
+    }
+
+    fn record(&mut self, action: &'static str) {
+        if self.trace.len() < Self::MAX_TRACE {
+            self.trace.push(action);
+        }
+    }
 }
 
 impl PeerFixture {
@@ -59,7 +175,19 @@ impl PeerFixture {
     }
 
     pub fn connected_with_media_limit(max_queued_media_bytes: usize) -> Self {
-        Self::connected_with(FixtureTransport::Udp, Some(max_queued_media_bytes), false)
+        let limits = ConnectionLimits {
+            max_queued_media_bytes,
+            ..ConnectionLimits::default()
+        };
+        Self::connected_with(FixtureTransport::Udp, Some(limits), false)
+    }
+
+    pub fn connected_with_limits(limits: ConnectionLimits, datachannels: bool) -> Self {
+        Self::connected_with(FixtureTransport::Udp, Some(limits), datachannels)
+    }
+
+    pub fn connected_with_senders(sender_count: usize) -> Self {
+        Self::connect(FixtureTransport::Udp, None, false, sender_count)
     }
 
     pub fn connected_datachannels() -> Self {
@@ -67,15 +195,24 @@ impl PeerFixture {
     }
 
     pub fn unconnected() -> Self {
-        Self::new_with(FixtureTransport::Udp, None, false)
+        Self::new_with(FixtureTransport::Udp, None, false, 1)
     }
 
     fn connected_with(
         transport: FixtureTransport,
-        media_limit: Option<usize>,
+        limits: Option<ConnectionLimits>,
         datachannels: bool,
     ) -> Self {
-        let mut fixture = Self::new_with(transport, media_limit, datachannels);
+        Self::connect(transport, limits, datachannels, 1)
+    }
+
+    fn connect(
+        transport: FixtureTransport,
+        limits: Option<ConnectionLimits>,
+        datachannels: bool,
+        sender_count: usize,
+    ) -> Self {
+        let mut fixture = Self::new_with(transport, limits, datachannels, sender_count);
         for _ in 0..2_000 {
             let _ = fixture.step();
             if fixture.peer_connected && fixture.connection_connected {
@@ -87,8 +224,9 @@ impl PeerFixture {
 
     fn new_with(
         transport: FixtureTransport,
-        media_limit: Option<usize>,
+        limits: Option<ConnectionLimits>,
         datachannels: bool,
+        sender_count: usize,
     ) -> Self {
         let start = Instant::now();
         str0m_reference::crypto::from_feature_flags().install_process_default();
@@ -107,7 +245,11 @@ impl PeerFixture {
         peer.add_local_candidate(candidate);
         drain_peer(&mut peer);
         let mut change = peer.sdp_api();
-        let mid = change.add_media(MediaKind::Audio, Direction::SendRecv, None, None, None);
+        assert!((1..=128).contains(&sender_count), "fixture sender bound");
+        let mids = (0..sender_count)
+            .map(|_| change.add_media(MediaKind::Audio, Direction::SendRecv, None, None, None))
+            .collect::<Vec<_>>();
+        let mid = mids[0];
         let peer_channel = datachannels.then(|| change.add_channel("peer-opened".into()));
         let (offer, pending) = change.apply().expect("peer offer");
         let mut config = ConnectionConfig {
@@ -118,8 +260,8 @@ impl PeerFixture {
             ..ConnectionConfig::default()
         };
         config.default_audio_policy.desired_bitrate = MediaPayloadBitrate::from_bps(1_000_000);
-        if let Some(limit) = media_limit {
-            config.limits.max_queued_media_bytes = limit;
+        if let Some(limits) = limits {
+            config.limits = limits;
         }
         let accepted = Connection::accept(
             config,
@@ -131,7 +273,13 @@ impl PeerFixture {
             ConnectionEntropy::new([11; 32]),
         )
         .expect("PulseBeam accepts standards peer offer");
-        let sender = accepted.session.senders[0].id;
+        let senders = accepted
+            .session
+            .senders
+            .iter()
+            .map(|sender| sender.id)
+            .collect::<Vec<_>>();
+        let sender = senders[0];
         let sender_mid = accepted.session.senders[0].mid.to_string();
         let answer = SdpAnswer::from_sdp_string(accepted.answer.as_str())
             .expect("peer parses PulseBeam answer");
@@ -142,6 +290,7 @@ impl PeerFixture {
         Self {
             connection: accepted.connection,
             sender,
+            senders,
             sender_mid,
             peer,
             mid,
@@ -156,7 +305,26 @@ impl PeerFixture {
             connection_connected: false,
             twcc_sent: 0,
             peer_channel,
+            network: DeterministicNetwork::default(),
         }
+    }
+
+    pub fn configure_network(&mut self, seed: u64, policy: NetworkPolicy) {
+        assert!(self.network.pending.is_empty(), "network must be drained");
+        self.network.configure(seed, policy);
+    }
+
+    pub fn network_counters(&self) -> (u64, u64, u64, u64) {
+        (
+            self.network.packets,
+            self.network.dropped,
+            self.network.duplicated,
+            self.network.reordered,
+        )
+    }
+
+    pub fn network_trace(&self) -> &[&'static str] {
+        &self.network.trace
     }
 
     pub fn expire_connection(&mut self) {
@@ -277,6 +445,36 @@ impl PeerFixture {
     }
 
     fn step(&mut self) -> Option<PeerEvent> {
+        if let Some(index) = self
+            .network
+            .pending
+            .iter()
+            .position(|packet| packet.due() <= self.now)
+        {
+            match self.network.pending.remove(index).expect("due packet") {
+                PendingPacket::Connection { input, .. } => {
+                    self.connection
+                        .receive(self.at(), input)
+                        .expect("PulseBeam receives peer datagram");
+                    self.connection_idle = false;
+                }
+                PendingPacket::Peer {
+                    protocol,
+                    source,
+                    destination,
+                    payload,
+                    ..
+                } => {
+                    let receive = Receive::new(protocol, source, destination, &payload)
+                        .expect("peer classifies PulseBeam datagram");
+                    self.peer
+                        .handle_input(Input::Receive(self.now, receive))
+                        .expect("peer receives PulseBeam datagram");
+                    self.peer_drained = false;
+                }
+            }
+            return None;
+        }
         if !self.peer_drained {
             match self.peer.poll_output().expect("peer poll") {
                 Output::Transmit(transmit) => {
@@ -292,26 +490,24 @@ impl PeerFixture {
                             Bytes::from(frame)
                         }
                     };
-                    self.connection
-                        .receive(
-                            self.at(),
-                            match self.transport {
-                                FixtureTransport::Udp => NetworkInput::Udp {
-                                    local: transmit.destination,
-                                    remote: transmit.source,
-                                    ecn: None,
-                                    payload,
-                                },
-                                FixtureTransport::Tcp => NetworkInput::IceTcp {
-                                    flow: IceTcpFlowId::from_value(1),
-                                    local: transmit.destination,
-                                    remote: transmit.source,
-                                    frame: payload,
-                                },
-                            },
-                        )
-                        .expect("PulseBeam receives peer datagram");
-                    self.connection_idle = false;
+                    let input = match self.transport {
+                        FixtureTransport::Udp => NetworkInput::Udp {
+                            local: transmit.destination,
+                            remote: transmit.source,
+                            ecn: None,
+                            payload,
+                        },
+                        FixtureTransport::Tcp => NetworkInput::IceTcp {
+                            flow: IceTcpFlowId::from_value(1),
+                            local: transmit.destination,
+                            remote: transmit.source,
+                            frame: payload,
+                        },
+                    };
+                    self.network.enqueue(PendingPacket::Connection {
+                        due: self.now + self.network.policy.delay,
+                        input,
+                    });
                     return None;
                 }
                 Output::Event(Event::RawPacket(packet)) => {
@@ -363,12 +559,13 @@ impl PeerFixture {
                             )
                         }
                     };
-                    let receive = Receive::new(protocol, source, destination, payload)
-                        .expect("peer classifies PulseBeam datagram");
-                    self.peer
-                        .handle_input(Input::Receive(self.now, receive))
-                        .expect("peer receives PulseBeam datagram");
-                    self.peer_drained = false;
+                    self.network.enqueue(PendingPacket::Peer {
+                        due: self.now + self.network.policy.delay,
+                        protocol,
+                        source,
+                        destination,
+                        payload: payload.to_vec(),
+                    });
                     return None;
                 }
                 ConnectionOutput::Event(ConnectionEvent::Connected) => {
@@ -389,7 +586,18 @@ impl PeerFixture {
         }
         self.now = self
             .now
-            .checked_add(Duration::from_millis(10))
+            .checked_add(
+                self.network
+                    .pending
+                    .iter()
+                    .min_by_key(|packet| packet.due())
+                    .map_or(Duration::from_millis(10), |packet| {
+                        packet
+                            .due()
+                            .saturating_duration_since(self.now)
+                            .max(Duration::from_millis(1))
+                    }),
+            )
             .expect("fixture clock");
         self.peer
             .handle_input(Input::Timeout(self.now))
@@ -428,6 +636,19 @@ pub fn second_negotiated_sender() -> SenderId {
     .session
     .senders[1]
         .id
+}
+
+pub fn forwarded(packet: MediaPacket, id: u64) -> ForwardedMedia {
+    ForwardedMedia {
+        packet,
+        frame: FrameMetadata {
+            id: FrameId::from_value(id),
+            boundary: FrameBoundary::Complete,
+            random_access: true,
+            discardable: false,
+            dependencies: FrameDependencies::Known(Arc::from([])),
+        },
+    }
 }
 
 enum PeerEvent {
