@@ -165,10 +165,10 @@ mod tests {
     // Convenience only: a test is not a shard, so nothing here is
     // cross-core. See crates/pulsebeam/docs/thread-per-core.md.
     use super::*;
-    use crate::entity::ExternalRoomId;
+    use crate::entity::RoomExternalId;
 
     fn room_id(s: &str) -> RoomId {
-        RoomId::from_external(&ExternalRoomId::new(s).unwrap())
+        RoomId::from_external(&RoomExternalId::new(s).unwrap())
     }
 
     fn participant_id() -> ParticipantId {

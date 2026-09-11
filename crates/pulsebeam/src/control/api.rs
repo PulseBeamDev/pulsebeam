@@ -23,7 +23,7 @@ use crate::{
 };
 use crate::{
     control::controller::{ControllerHandle, ParticipantState},
-    entity::{ExternalRoomId, IdValidationError, ParticipantId, RoomId},
+    entity::{IdValidationError, ParticipantId, RoomExternalId, RoomId},
 };
 pub enum HeaderExt {
     ParticipantId,
@@ -45,6 +45,7 @@ pub struct ParticipantResponseHeaders {
     pub location: String,
 
     #[serde(rename = "ETag")]
+    #[schema(value_type = String)]
     pub etag: ConnectionId,
 }
 
@@ -193,7 +194,7 @@ pub struct CreateParticipantQuery {
 )]
 #[axum::debug_handler]
 async fn create_participant(
-    Path(external_room_id): Path<ExternalRoomId>,
+    Path(external_room_id): Path<RoomExternalId>,
     Query(query): Query<CreateParticipantQuery>,
     State(s): State<AppState>,
     TypedHeader(_content_type): TypedHeader<ContentType>,
@@ -265,7 +266,7 @@ async fn create_participant(
 )]
 #[axum::debug_handler]
 async fn delete_participant(
-    Path((external_room_id, participant_id)): Path<(ExternalRoomId, ParticipantId)>,
+    Path((external_room_id, participant_id)): Path<(RoomExternalId, ParticipantId)>,
     State(s): State<AppState>,
 ) -> Result<impl IntoResponse, ApiError> {
     let room_id = RoomId::from_external(&external_room_id);
@@ -317,7 +318,7 @@ pub struct PatchParticipantQuery {
 )]
 #[axum::debug_handler]
 async fn patch_participant(
-    Path((external_room_id, participant_id)): Path<(ExternalRoomId, ParticipantId)>,
+    Path((external_room_id, participant_id)): Path<(RoomExternalId, ParticipantId)>,
     Query(query): Query<PatchParticipantQuery>,
     State(s): State<AppState>,
     TypedHeader(_content_type): TypedHeader<ContentType>,
@@ -482,7 +483,7 @@ mod tests {
     }
 
     fn state(manual_sub: bool) -> ParticipantState {
-        let room = ExternalRoomId::new("room").unwrap();
+        let room = RoomExternalId::new("room").unwrap();
         ParticipantState {
             manual_sub,
             room_id: RoomId::from_external(&room),

@@ -1835,9 +1835,9 @@ mod assignment_tests {
     }
 
     fn test_ctx() -> LogCtx {
-        use crate::entity::{ExternalRoomId, RoomId};
+        use crate::entity::{RoomExternalId, RoomId};
         LogCtx {
-            room_id: RoomId::from_external(&ExternalRoomId::new("test").unwrap()),
+            room_id: RoomId::from_external(&RoomExternalId::new("test").unwrap()),
             participant_id: ParticipantId::new(),
         }
     }
@@ -2681,9 +2681,9 @@ mod slot_switch_tests {
     use str0m::media::SimulcastLayer;
 
     fn test_ctx() -> LogCtx {
-        use crate::entity::{ExternalRoomId, RoomId};
+        use crate::entity::{RoomExternalId, RoomId};
         LogCtx {
-            room_id: RoomId::from_external(&ExternalRoomId::new("test").unwrap()),
+            room_id: RoomId::from_external(&RoomExternalId::new("test").unwrap()),
             participant_id: ParticipantId::new(),
         }
     }

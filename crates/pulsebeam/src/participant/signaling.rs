@@ -546,7 +546,7 @@ mod tests {
 
     #[test]
     fn snapshots_are_requested_only_while_signaling_can_emit() {
-        let room = crate::entity::ExternalRoomId::new("room").expect("valid room");
+        let room = crate::entity::RoomExternalId::new("room").expect("valid room");
         let ctx = LogCtx {
             room_id: crate::entity::RoomId::from_external(&room),
             participant_id: crate::entity::ParticipantId::new(),

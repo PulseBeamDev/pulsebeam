@@ -1042,7 +1042,7 @@ mod tests {
     use slotmap::KeyData;
 
     use crate::{
-        entity::{ExternalRoomId, TrackKind},
+        entity::{RoomExternalId, TrackKind},
         track::{DataLane, Topic, TrackMeta},
     };
 
@@ -1080,7 +1080,7 @@ mod tests {
             2 => "lifecycle-2",
             _ => "lifecycle-other",
         };
-        RoomId::from_external(&ExternalRoomId::new(name).unwrap())
+        RoomId::from_external(&RoomExternalId::new(name).unwrap())
     }
 
     fn participant(seed: u8) -> ParticipantId {

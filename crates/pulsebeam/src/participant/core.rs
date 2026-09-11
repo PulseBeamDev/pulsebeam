@@ -965,9 +965,11 @@ impl Participant {
     fn handle_media_added(&mut self, media: MediaAdded, _events: &mut impl ParticipantSink) {
         match media.direction {
             Direction::RecvOnly => {
-                let track_id = self
-                    .participant_id
-                    .derive_track_id(media.kind.into(), &media.mid);
+                let kind = match media.kind {
+                    MediaKind::Audio => TrackKind::Audio,
+                    MediaKind::Video => TrackKind::Video,
+                };
+                let track_id = self.participant_id.derive_track_id(kind, &media.mid);
                 let track_meta = track::TrackMeta {
                     room_id: self.room_id,
                     shard_id: self.shard_id,

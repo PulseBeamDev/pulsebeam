@@ -411,9 +411,9 @@ mod tests {
     use str0m::rtp::Ssrc;
 
     fn test_ctx() -> LogCtx {
-        use crate::entity::{ExternalRoomId, ParticipantId, RoomId};
+        use crate::entity::{ParticipantId, RoomExternalId, RoomId};
         LogCtx {
-            room_id: RoomId::from_external(&ExternalRoomId::new("test").unwrap()),
+            room_id: RoomId::from_external(&RoomExternalId::new("test").unwrap()),
             participant_id: ParticipantId::new(),
         }
     }

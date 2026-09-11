@@ -925,7 +925,7 @@ pub mod test_utils {
         let track_id = participant_id.derive_track_id(TrackKind::Video, &mid);
         let meta = TrackMeta {
             room_id: crate::entity::RoomId::from_external(
-                &crate::entity::ExternalRoomId::new("test-room").unwrap(),
+                &crate::entity::RoomExternalId::new("test-room").unwrap(),
             ),
             shard_id: ShardId::new(0),
             id: track_id,
@@ -938,7 +938,7 @@ pub mod test_utils {
         let track_id = participant_id.derive_track_id(TrackKind::Audio, &mid);
         let meta = TrackMeta {
             room_id: crate::entity::RoomId::from_external(
-                &crate::entity::ExternalRoomId::new("test-room").unwrap(),
+                &crate::entity::RoomExternalId::new("test-room").unwrap(),
             ),
             shard_id: ShardId::new(0),
             id: track_id,

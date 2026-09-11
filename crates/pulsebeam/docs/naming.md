@@ -85,7 +85,8 @@ canonical PulseBeam text form:
 
 The contract version is exactly one Crockford Base32 character using the same
 canonical uppercase alphabet as the UUID portion. It versions the complete
-`Id` construction contract: `0` is reserved and `1` through `31` are usable.
+`Id` construction contract: `0` is the implemented V0 contract; incompatible
+future contracts use a different version character.
 Only server-owned identity code may derive or mint an `Id`. Call sites must use
 each concrete `Id` type's parser and formatter rather than constructing text
 manually. SDK-side parsers and formatters operate only on IDs received from the

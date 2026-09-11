@@ -7,6 +7,10 @@ records latency and transport snapshots as CSV.
 
 This binary is a client only; it does not run or administer the SFU.
 
+Canonical entity IDs can be derived for log lookup with `id room`,
+`id participant`, and `id track`. Each command requires a canonical
+`--project-id` and the external identity chain for the requested entity.
+
 ```text
 cargo run --release -p pulsebeam-cli -- \
   --api-url http://127.0.0.1:7070 bench \

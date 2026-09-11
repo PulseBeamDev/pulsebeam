@@ -290,7 +290,7 @@ impl TopicRegistrations {
                 return Err(ValidationError::TopicScope(subscriber.topic.clone()));
             }
             if let Some(publisher_id) = subscriber.publisher_id.as_deref() {
-                validate_publisher_id(publisher_id)
+                validate_opaque_publisher_id(publisher_id)
                     .map_err(|()| ValidationError::TopicScope(publisher_id.to_string()))?;
             }
             let channel_label = subscriber_label(subscriber);
@@ -1030,7 +1030,8 @@ impl Topics {
             return Err(TopicError::MalformedMessage);
         }
         let delivery = RelDelivery::decode(payload).map_err(|_| TopicError::MalformedMessage)?;
-        validate_publisher_id(&delivery.publisher_id).map_err(|()| TopicError::InvalidPublisher)?;
+        validate_opaque_publisher_id(&delivery.publisher_id)
+            .map_err(|()| TopicError::InvalidPublisher)?;
         let message =
             RelMsg::decode(delivery.frame.as_slice()).map_err(|_| TopicError::MalformedMessage)?;
         if message.stream_id == 0 || message.seq == u64::MAX {
@@ -1342,22 +1343,8 @@ fn validate_topic(topic: &str) -> Result<(), ValidationError> {
     Ok(())
 }
 
-fn validate_publisher_id(publisher_id: &str) -> Result<(), ()> {
-    let Some(encoded) = publisher_id.strip_prefix("pa_") else {
-        return Err(());
-    };
-    if encoded.len() != 26
-        || !encoded.bytes().all(|byte| {
-            byte.is_ascii_digit()
-                || matches!(
-                    byte.to_ascii_uppercase(),
-                    b'A'..=b'H' | b'J'..=b'K' | b'M'..=b'N' | b'P'..=b'T' | b'V'..=b'Z'
-                )
-        })
-    {
-        return Err(());
-    }
-    Ok(())
+fn validate_opaque_publisher_id(publisher_id: &str) -> Result<(), ()> {
+    (!publisher_id.is_empty()).then_some(()).ok_or(())
 }
 
 fn publisher_spec(publisher: &TopicPublisher) -> DataChannelSpec {
@@ -1463,6 +1450,13 @@ mod tests {
         assert_eq!(ordered.label, "v1/rel/sub/chat");
         assert!(ordered.ordered);
         assert_eq!(ordered.reliability, DataChannelReliability::Reliable);
+    }
+
+    #[test]
+    fn publisher_identity_is_opaque_to_the_agent() {
+        assert!(validate_opaque_publisher_id("pa_0server-issued").is_ok());
+        assert!(validate_opaque_publisher_id("future-format").is_ok());
+        assert!(validate_opaque_publisher_id("").is_err());
     }
 
     #[test]

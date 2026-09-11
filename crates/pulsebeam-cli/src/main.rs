@@ -10,7 +10,7 @@
 #![cfg_attr(test, allow(clippy::expect_used, clippy::panic, clippy::unwrap_used))]
 
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use pulsebeam_agent_native::agent_core::{
     AgentConfig, ConnectionState, DesiredState, MediaKind, MediaTopology, PublicationIntent,
     Snapshot, VideoSubscription,
@@ -20,6 +20,10 @@ use pulsebeam_agent_native::{
 };
 use pulsebeam_agent_native::{clock::clock_anchor, wallclock_at};
 use pulsebeam_core::net::UdpSocket;
+use pulsebeam_proto::identity::{
+    AudioTrackId, DataTrackId, ParticipantExternalId, ParticipantId, ProjectId, RoomExternalId,
+    RoomId, VideoTrackId,
+};
 use std::{collections::HashSet, sync::Arc, time::Duration};
 use tachyonix as mpsc;
 use tokio::sync::{broadcast, watch};
@@ -164,6 +168,56 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     Bench(BenchConfig),
+    Id {
+        #[command(subcommand)]
+        command: IdCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum IdCommand {
+    Room(RoomIdConfig),
+    Participant(ParticipantIdConfig),
+    Track(TrackIdConfig),
+}
+
+#[derive(Args)]
+struct RoomIdConfig {
+    #[arg(long)]
+    project_id: ProjectId,
+    #[arg(long)]
+    room_external_id: RoomExternalId,
+}
+
+#[derive(Args)]
+struct ParticipantIdConfig {
+    #[arg(long)]
+    project_id: ProjectId,
+    #[arg(long)]
+    room_external_id: RoomExternalId,
+    #[arg(long)]
+    participant_external_id: ParticipantExternalId,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum TrackKindArg {
+    Audio,
+    Video,
+    Data,
+}
+
+#[derive(Args)]
+struct TrackIdConfig {
+    #[arg(long)]
+    project_id: ProjectId,
+    #[arg(long)]
+    room_external_id: RoomExternalId,
+    #[arg(long)]
+    participant_external_id: ParticipantExternalId,
+    #[arg(long, value_enum)]
+    kind: TrackKindArg,
+    #[arg(long)]
+    label: String,
 }
 
 #[derive(Parser, Clone)]
@@ -232,9 +286,31 @@ fn main() -> Result<()> {
             Commands::Bench(config) => {
                 run_bench(cli.api_url, config).await?;
             }
+            Commands::Id { command } => println!("{}", derive_id(command)),
         }
         anyhow::Ok(())
     })
+}
+
+fn derive_id(command: IdCommand) -> String {
+    match command {
+        IdCommand::Room(config) => {
+            RoomId::derive(&config.project_id, &config.room_external_id).as_str()
+        }
+        IdCommand::Participant(config) => {
+            let room = RoomId::derive(&config.project_id, &config.room_external_id);
+            ParticipantId::derive(&room, &config.participant_external_id).as_str()
+        }
+        IdCommand::Track(config) => {
+            let room = RoomId::derive(&config.project_id, &config.room_external_id);
+            let participant = ParticipantId::derive(&room, &config.participant_external_id);
+            match config.kind {
+                TrackKindArg::Audio => AudioTrackId::derive(&participant, &config.label).as_str(),
+                TrackKindArg::Video => VideoTrackId::derive(&participant, &config.label).as_str(),
+                TrackKindArg::Data => DataTrackId::derive(&participant, &config.label).as_str(),
+            }
+        }
+    }
 }
 
 async fn run_bench(api_url: String, config: BenchConfig) -> Result<()> {
@@ -695,11 +771,78 @@ mod tests {
             "--simulcast",
         ])
         .expect("documented benchmark arguments must parse");
-        let Commands::Bench(config) = cli.command;
+        let Commands::Bench(config) = cli.command else {
+            panic!("bench command must parse as bench");
+        };
         assert_eq!(config.rooms, 2);
         assert_eq!(config.users_per_room, 3);
         assert_eq!(config.max_rooms, 8);
         assert!(config.simulcast);
+    }
+
+    #[test]
+    fn identity_commands_use_the_canonical_proto_derivation() {
+        let project = ProjectId::from_bytes([0, 0, 0, 0, 0, 0, 0x70, 0, 0x80, 0, 0, 0, 0, 0, 0, 1]);
+        let project_text = project.as_str();
+        let track_cli = Cli::try_parse_from([
+            "pulsebeam-cli",
+            "id",
+            "track",
+            "--project-id",
+            &project_text,
+            "--room-external-id",
+            "general",
+            "--participant-external-id",
+            "alice",
+            "--kind",
+            "video",
+            "--label",
+            "camera",
+        ])
+        .expect("documented identity arguments must parse");
+        let Commands::Id { command } = track_cli.command else {
+            panic!("id command must parse as id");
+        };
+
+        let room = RoomId::derive(&project, &RoomExternalId::new("general").unwrap());
+        let participant =
+            ParticipantId::derive(&room, &ParticipantExternalId::new("alice").unwrap());
+        assert_eq!(
+            derive_id(command),
+            VideoTrackId::derive(&participant, "camera").as_str()
+        );
+
+        let room_cli = Cli::try_parse_from([
+            "pulsebeam-cli",
+            "id",
+            "room",
+            "--project-id",
+            &project_text,
+            "--room-external-id",
+            "general",
+        ])
+        .expect("room identity arguments must parse");
+        let Commands::Id { command } = room_cli.command else {
+            panic!("room command must parse as id");
+        };
+        assert_eq!(derive_id(command), room.as_str());
+
+        let participant_cli = Cli::try_parse_from([
+            "pulsebeam-cli",
+            "id",
+            "participant",
+            "--project-id",
+            &project_text,
+            "--room-external-id",
+            "general",
+            "--participant-external-id",
+            "alice",
+        ])
+        .expect("participant identity arguments must parse");
+        let Commands::Id { command } = participant_cli.command else {
+            panic!("participant command must parse as id");
+        };
+        assert_eq!(derive_id(command), participant.as_str());
     }
 
     #[test]

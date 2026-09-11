@@ -664,7 +664,7 @@ impl TrackAllocator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::entity::ExternalRoomId;
+    use crate::entity::RoomExternalId;
 
     fn room(seed: u8) -> RoomId {
         let name = match seed {
@@ -672,7 +672,7 @@ mod tests {
             2 => "topology-2",
             _ => "topology-other",
         };
-        RoomId::from_external(&ExternalRoomId::new(name).unwrap())
+        RoomId::from_external(&RoomExternalId::new(name).unwrap())
     }
 
     fn participant(seed: u8) -> ParticipantId {

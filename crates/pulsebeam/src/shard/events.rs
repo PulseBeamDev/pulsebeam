@@ -251,12 +251,12 @@ mod tests {
     // Convenience only: a test is not a shard, so nothing here is
     // cross-core. See crates/pulsebeam/docs/thread-per-core.md.
     use super::*;
-    use crate::entity::ExternalRoomId;
+    use crate::entity::RoomExternalId;
     use crate::rtp::RtpPacket;
     use crate::track::DataLane;
 
     fn identity() -> SinkIdentity {
-        let room = ExternalRoomId::new("room").unwrap();
+        let room = RoomExternalId::new("room").unwrap();
         SinkIdentity {
             id: ParticipantId::new(),
             key: ParticipantKey::default(),

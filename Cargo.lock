@@ -3409,6 +3409,7 @@ dependencies = [
  "mimalloc",
  "pulsebeam-agent-native",
  "pulsebeam-core",
+ "pulsebeam-proto",
  "pulsebeam-testdata",
  "rand 0.10.2",
  "reqwest",
@@ -3448,9 +3449,16 @@ dependencies = [
 name = "pulsebeam-proto"
 version = "0.3.2"
 dependencies = [
+ "arrayvec",
+ "proptest",
  "prost 0.14.4",
  "prost-build 0.14.4",
  "prost-types 0.14.4",
+ "serde",
+ "serde_json",
+ "sha3",
+ "thiserror 2.0.20",
+ "uuid",
 ]
 
 [[package]]
