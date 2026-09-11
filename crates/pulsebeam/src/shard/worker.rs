@@ -213,6 +213,7 @@ pub(crate) enum ShardEvent {
     },
     ParticipantClosed {
         participant: ParticipantId,
+        connection_id: crate::entity::ConnectionId,
     },
     TrackSubscribed {
         subscriber: ParticipantId,

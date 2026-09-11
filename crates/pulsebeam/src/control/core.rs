@@ -106,52 +106,23 @@ impl ControllerCore {
         self.transport.retire(address, now);
     }
 
-    pub fn create_participant(
-        &mut self,
-        rtc: Rtc,
-        state: ParticipantState,
-        shard: ShardId,
-        transport: NodeTransportAddress,
-    ) -> ParticipantConfig {
-        self.registry
-            .add_participant(state.participant_id, state.room_id, shard, Some(transport));
-        self.registry
-            .set_connection_id(&state.participant_id, state.connection_id);
+    pub fn prepare_participant(&self, rtc: Rtc, state: ParticipantState) -> ParticipantConfig {
         ParticipantConfig {
             manual_sub: state.manual_sub,
             room_id: state.room_id,
             participant_id: state.participant_id,
+            connection_id: state.connection_id,
             rtc,
         }
     }
 
-    pub fn delete_participant(&mut self, participant: &ParticipantId) -> Option<ParticipantMeta> {
-        let meta = self.registry.get_participant(participant)?;
-        let result = self.participant_meta(meta);
-        self.registry.remove_participant(participant);
-        Some(result)
-    }
-
-    pub fn disconnect_participant(
+    pub fn remove_incarnation(
         &mut self,
         participant: &ParticipantId,
-    ) -> Option<ParticipantMeta> {
-        let meta = self.registry.get_participant(participant)?;
-        let result = self.participant_meta(meta);
-        let _ = self.registry.disconnect_participant(participant);
-        Some(result)
+        connection_id: crate::entity::ConnectionId,
+    ) -> bool {
+        self.registry
+            .remove_incarnation(participant, connection_id)
+            .is_some()
     }
-
-    fn participant_meta(&self, meta: &super::registry::ParticipantMeta) -> ParticipantMeta {
-        ParticipantMeta {
-            shard: meta.shard_id,
-            transport: meta.transport,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct ParticipantMeta {
-    pub shard: ShardId,
-    pub transport: Option<NodeTransportAddress>,
 }

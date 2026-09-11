@@ -62,6 +62,7 @@ pub struct CreateParticipantReply {
 pub struct DeleteParticipant {
     pub room_id: RoomId,
     pub participant_id: ParticipantId,
+    pub connection_id: ConnectionId,
 }
 
 #[derive(Debug)]
@@ -81,8 +82,8 @@ pub enum ControllerError {
     OfferRejected(#[from] NegotiatorError),
     #[error("server is busy, please try again later.")]
     ServiceUnavailable,
-    #[error("participant connection generation is stale")]
-    StaleConnection,
+    #[error("participant connection was superseded")]
+    Superseded,
     #[error("IO error: {0}")]
     IOError(#[from] io::Error),
     #[error("unknown error: {0}")]
@@ -101,6 +102,8 @@ struct PendingMaterialization {
     command: Option<ShardCommand>,
     ack: Option<oneshot::Receiver<bool>>,
     participant: ParticipantId,
+    connection_id: ConnectionId,
+    transport: crate::route::NodeTransportAddress,
     room_id: RoomId,
     answer: SdpAnswer,
 }
@@ -300,7 +303,14 @@ impl ControllerActor {
                 }
             }
             ControllerCommand::DeleteParticipant(message) => {
-                self.remove_participant(message.participant_id);
+                if self
+                    .core
+                    .registry
+                    .get_participant(&message.participant_id)
+                    .is_some_and(|meta| meta.room_id == message.room_id)
+                {
+                    self.remove_incarnation(message.participant_id, message.connection_id);
+                }
                 None
             }
             ControllerCommand::PatchParticipant(message, reply) => {
@@ -331,14 +341,28 @@ impl ControllerActor {
                 let Some(command) = pending.command.take() else {
                     pulsebeam_runtime::fatal!("materialization must retain its shard command");
                 };
+                if !self.candidate_is_newer(pending.participant, pending.connection_id) {
+                    self.core
+                        .release_transport(pending.transport, tokio::time::Instant::now());
+                    match reply {
+                        MaterializationReply::Create(reply) => {
+                            let _ = reply.send(Err(ControllerError::Superseded));
+                        }
+                        MaterializationReply::Patch(reply) => {
+                            let _ = reply.send(Err(ControllerError::Superseded));
+                        }
+                    }
+                    return;
+                }
                 let materialized = self.router.send(pending.shard, command).await.is_ok()
                     && ack.await.unwrap_or(false);
                 metrics::histogram!("control_materialization_wait_us")
                     .record(started.elapsed().as_micros() as f64);
                 let result = if materialized {
-                    Ok(self.complete_materialization(pending))
+                    self.complete_materialization(pending)
                 } else {
-                    self.abort_materialization(pending.participant);
+                    self.core
+                        .release_transport(pending.transport, tokio::time::Instant::now());
                     Err(ControllerError::ServiceUnavailable)
                 };
                 let commands_ready = self.flush_command_backlog();
@@ -456,8 +480,11 @@ impl ControllerActor {
                 ));
                 self.emit_placeholder(owner_shard);
             }
-            ShardEvent::ParticipantClosed { participant, .. } => {
-                self.remove_participant_with_mode(participant, true);
+            ShardEvent::ParticipantClosed {
+                participant,
+                connection_id,
+            } => {
+                self.remove_incarnation(participant, connection_id);
             }
         }
     }
@@ -726,7 +753,8 @@ impl ControllerActor {
                 return Err(error.into());
             }
         };
-        let config = self.core.create_participant(rtc, state, shard, address);
+        let connection_id = state.connection_id;
+        let config = self.core.prepare_participant(rtc, state);
         let room_id = config.room_id;
         let (ack_tx, ack_rx) = oneshot::channel();
         Ok(PendingMaterialization {
@@ -738,15 +766,33 @@ impl ControllerActor {
             }),
             ack: Some(ack_rx),
             participant: participant_id,
+            connection_id,
+            transport: address,
             room_id,
             answer,
         })
     }
 
-    fn complete_materialization(&mut self, pending: PendingMaterialization) -> SdpAnswer {
+    fn complete_materialization(
+        &mut self,
+        pending: PendingMaterialization,
+    ) -> Result<SdpAnswer, ControllerError> {
         let participant_id = pending.participant;
         let room_id = pending.room_id;
-        self.core.registry.mark_materialized(&participant_id);
+        let previous = self
+            .core
+            .registry
+            .commit_candidate(
+                participant_id,
+                room_id,
+                pending.shard,
+                pending.transport,
+                pending.connection_id,
+            )
+            .map_err(|_| ControllerError::Superseded)?;
+        if let Some(previous) = previous {
+            self.terminate_incarnation(participant_id, previous, false);
+        }
         let generation = self.lifecycle.next_generation();
         self.stage_participant_change_at(room_id, generation, Some(participant_id), None);
         if let Some(meta) = self.core.registry.get_participant(&participant_id) {
@@ -781,11 +827,15 @@ impl ControllerActor {
         for outcome in outcomes {
             self.publish_track_lifecycle(outcome);
         }
-        pending.answer
+        Ok(pending.answer)
     }
 
-    fn abort_materialization(&mut self, participant: ParticipantId) {
-        self.remove_participant(participant);
+    fn candidate_is_newer(&self, participant: ParticipantId, connection_id: ConnectionId) -> bool {
+        self.core
+            .registry
+            .get_participant(&participant)
+            .map(|meta| meta.connection_id)
+            .is_none_or(|current| connection_id > current)
     }
 
     fn begin_patch_participant(
@@ -797,30 +847,32 @@ impl ControllerActor {
             .core
             .registry
             .get_participant(&state.participant_id)
-            .and_then(|meta| meta.connection_id);
+            .map(|meta| meta.connection_id);
         if current != state.old_connection_id {
-            return Err(ControllerError::StaleConnection);
+            return Err(ControllerError::Superseded);
         }
-        self.remove_participant_with_mode(state.participant_id, true);
         self.begin_create_participant(state, offer)
     }
 
-    fn remove_participant(&mut self, participant: ParticipantId) {
-        self.remove_participant_with_mode(participant, false);
-    }
-
-    fn remove_participant_with_mode(&mut self, participant: ParticipantId, retain_identity: bool) {
+    fn remove_incarnation(&mut self, participant: ParticipantId, connection_id: ConnectionId) {
         let Some(meta) = self
             .core
             .registry
             .get_participant(&participant)
-            .map(|meta| crate::control::core::ParticipantMeta {
-                shard: meta.shard_id,
-                transport: meta.transport,
-            })
+            .copied()
+            .filter(|meta| meta.connection_id == connection_id)
         else {
             return;
         };
+        self.terminate_incarnation(participant, meta, true);
+    }
+
+    fn terminate_incarnation(
+        &mut self,
+        participant: ParticipantId,
+        meta: crate::control::registry::ParticipantMeta,
+        remove_current: bool,
+    ) {
         let mut outcomes = self.lifecycle.remove_participant(
             participant,
             &self.core.registry,
@@ -836,18 +888,11 @@ impl ControllerActor {
             let outcome = outcomes.remove(0);
             self.apply_track_lifecycle(outcome);
         }
-        let room_id = self
-            .core
-            .registry
-            .get_participant(&participant)
-            .map(|meta| meta.room_id);
-        if let Some(room_id) = room_id {
-            self.stage_participant_change_at(room_id, generation, None, Some(participant));
-        }
-        if retain_identity {
-            let _ = self.core.disconnect_participant(&participant);
-        } else {
-            let _ = self.core.delete_participant(&participant);
+        self.stage_participant_change_at(meta.room_id, generation, None, Some(participant));
+        if remove_current {
+            let _ = self
+                .core
+                .remove_incarnation(&participant, meta.connection_id);
         }
         self.publish_staged();
         for outcome in outcomes {
@@ -857,7 +902,7 @@ impl ControllerActor {
             return;
         };
         let generation = self.lifecycle.next_generation();
-        if let Some(update) = self.updates.get_mut(meta.shard.index()) {
+        if let Some(update) = self.updates.get_mut(meta.shard_id.index()) {
             update.stage(
                 generation,
                 crate::shard_update::ShardUpdateOp::RetireTransport { address },
@@ -869,7 +914,7 @@ impl ControllerActor {
                     address,
                 },
             );
-            self.mark_update_touched(meta.shard);
+            self.mark_update_touched(meta.shard_id);
             self.publish_staged();
         }
         self.core
@@ -895,3 +940,129 @@ fn describe_controller_metrics() {
 }
 
 pub type ControllerHandle = mailbox::Sender<ControllerCommand>;
+
+#[cfg(test)]
+mod replacement_tests {
+    use super::*;
+    use crate::{
+        control::registry::CommitCandidateError, entity::RoomExternalId,
+        shard::metrics::ShardMetrics, shard_update::new_shard_update,
+    };
+
+    #[allow(
+        clippy::disallowed_types,
+        reason = "the production ShardContext owns the sanctioned shared occupancy counters"
+    )]
+    fn actor() -> ControllerActor {
+        let (command_tx, _command_rx) = mailbox::new(4);
+        let context = ShardContext {
+            command_tx,
+            metrics: std::sync::Arc::new(ShardMetrics::new()),
+        };
+        let (update, _update_rx) = new_shard_update(ShardId::new(0));
+        ControllerActor {
+            router: crate::control::router::ShardRouter::new(vec![context]),
+            core: ControllerCore::with_shards(1, 1, RoomPlacement::Hashed),
+            negotiator: Negotiator::new(Vec::new()),
+            tcp_listener: None,
+            cluster_id: 0,
+            node_id: 0,
+            updates: vec![update],
+            update_touched: vec![false],
+            pending_updates: VecDeque::new(),
+            update_queued: vec![false],
+            egress_ready: false,
+            lifecycle: TrackLifecycle::new(1),
+            command_backlog: VecDeque::new(),
+            steering: None,
+        }
+    }
+
+    fn connection_id(sequence: u8) -> ConnectionId {
+        ConnectionId::from_bytes([0, 0, 0, 0, 0, 0, 0x70, 0, 0x80, 0, 0, 0, 0, 0, 0, sequence])
+    }
+
+    #[test]
+    fn controller_orders_commits_and_fences_every_stale_teardown_source() {
+        let mut actor = actor();
+        let room_id = RoomId::from_external(&RoomExternalId::new("replacement").unwrap());
+        let participant_id = ParticipantId::new();
+        let old = connection_id(1);
+        let current = connection_id(2);
+        let old_transport = actor
+            .core
+            .reserve_transport(ShardId::new(0), tokio::time::Instant::now());
+        let current_transport = actor
+            .core
+            .reserve_transport(ShardId::new(0), tokio::time::Instant::now());
+        actor
+            .core
+            .registry
+            .commit_candidate(participant_id, room_id, ShardId::new(0), old_transport, old)
+            .unwrap();
+        actor
+            .core
+            .registry
+            .commit_candidate(
+                participant_id,
+                room_id,
+                ShardId::new(0),
+                current_transport,
+                current,
+            )
+            .unwrap();
+
+        assert_eq!(
+            actor.core.registry.commit_candidate(
+                participant_id,
+                room_id,
+                ShardId::new(0),
+                old_transport,
+                old,
+            ),
+            Err(CommitCandidateError::Superseded)
+        );
+
+        actor.process_command(
+            DeleteParticipant {
+                room_id,
+                participant_id,
+                connection_id: old,
+            }
+            .into(),
+        );
+        for _ in 0..3 {
+            actor.handle_shard_event((
+                ShardId::new(0),
+                ShardEvent::ParticipantClosed {
+                    participant: participant_id,
+                    connection_id: old,
+                },
+            ));
+        }
+        assert_eq!(
+            actor
+                .core
+                .registry
+                .get_participant(&participant_id)
+                .unwrap()
+                .connection_id,
+            current
+        );
+
+        actor.handle_shard_event((
+            ShardId::new(0),
+            ShardEvent::ParticipantClosed {
+                participant: participant_id,
+                connection_id: current,
+            },
+        ));
+        assert!(
+            actor
+                .core
+                .registry
+                .get_participant(&participant_id)
+                .is_none()
+        );
+    }
+}

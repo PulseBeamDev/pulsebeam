@@ -571,10 +571,12 @@ impl ShardExecution {
                 }
                 ParticipantEvent::Lifecycle(ParticipantLifecycleEvent::Exited {
                     participant_id,
+                    connection_id,
                 }) => {
                     self.pipeline
                         .push_shard_event(ShardEvent::ParticipantClosed {
                             participant: participant_id,
+                            connection_id,
                         });
                 }
                 ParticipantEvent::Control(ev) => {
@@ -767,6 +769,7 @@ impl ShardExecution {
             participant.queued_dirty = false;
             let who = crate::shard::events::ParticipantBinding {
                 participant_id: participant.participant_id,
+                connection_id: participant.connection_id,
                 handle: key,
                 room_id: participant.room_id,
             };

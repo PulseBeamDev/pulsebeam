@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 
 use super::worker::ShardEvent;
-use crate::entity::{ParticipantId, RoomId, TrackId};
+use crate::entity::{ConnectionId, ParticipantId, RoomId, TrackId};
 use crate::keys::ParticipantHandle;
 use crate::keys::TrackHandle;
 use crate::participant::TrackPacket;
@@ -17,6 +17,7 @@ use crate::track::{SelectionPolicy, Track, TrackMeta, TrackSelector};
 #[derive(Clone, Copy)]
 pub(crate) struct ParticipantBinding {
     pub participant_id: ParticipantId,
+    pub connection_id: ConnectionId,
     pub handle: ParticipantHandle,
     pub room_id: RoomId,
 }
@@ -48,6 +49,7 @@ pub enum ParticipantLifecycleEvent {
     },
     Exited {
         participant_id: ParticipantId,
+        connection_id: ConnectionId,
     },
 }
 
@@ -78,6 +80,7 @@ impl EventPipeline {
     pub fn participant_sink(&mut self, who: ParticipantBinding) -> PipelineSinkRef<'_> {
         PipelineSinkRef {
             id: who.participant_id,
+            connection_id: who.connection_id,
             key: who.handle,
             room_id: who.room_id,
             pipeline: self,
@@ -120,6 +123,7 @@ impl EventPipeline {
 
 pub struct PipelineSinkRef<'a> {
     id: ParticipantId,
+    connection_id: ConnectionId,
     key: ParticipantHandle,
     room_id: RoomId,
     pipeline: &'a mut EventPipeline,
@@ -233,6 +237,7 @@ impl<'a> ParticipantSink for PipelineSinkRef<'a> {
             .push_back(ParticipantEvent::Lifecycle(
                 ParticipantLifecycleEvent::Exited {
                     participant_id: self.id,
+                    connection_id: self.connection_id,
                 },
             ));
     }
@@ -259,6 +264,7 @@ mod tests {
         let room = RoomExternalId::new("room").unwrap();
         ParticipantBinding {
             participant_id: ParticipantId::new(),
+            connection_id: ConnectionId::new(),
             handle: ParticipantHandle::default(),
             room_id: RoomId::from_external(&room),
         }
@@ -307,6 +313,24 @@ mod tests {
 
         assert!(pipeline.pop_packet().is_none(), "and nothing crossed");
         assert!(pipeline.pop_packet().is_none());
+    }
+
+    #[test]
+    fn exit_carries_the_exact_connection_incarnation() {
+        let mut pipeline = EventPipeline::with_capacity(1);
+        let who = identity();
+
+        pipeline.participant_sink(who).exit();
+
+        assert!(matches!(
+            pipeline.pop_participant_event(),
+            Some(ParticipantEvent::Lifecycle(
+                ParticipantLifecycleEvent::Exited {
+                    participant_id,
+                    connection_id,
+                }
+            )) if participant_id == who.participant_id && connection_id == who.connection_id
+        ));
     }
 
     /// Queues drain in the order they were filled. Media is a sequence, and reordering it here
@@ -399,6 +423,7 @@ mod tests {
 
         pipeline.push_shard_event(ShardEvent::ParticipantClosed {
             participant: who.participant_id,
+            connection_id: who.connection_id,
         });
         assert!(pipeline.has_pending(), "a shard event is work");
         assert!(pipeline.pop_shard_event().is_some());

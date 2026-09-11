@@ -148,7 +148,7 @@ impl IntoResponse for ApiError {
             | ApiError::BadRequest(_) => StatusCode::BAD_REQUEST,
             ApiError::JoinError(controller::ControllerError::ServiceUnavailable)
             | ApiError::ServiceUnavailable => StatusCode::SERVICE_UNAVAILABLE,
-            ApiError::JoinError(controller::ControllerError::StaleConnection) => {
+            ApiError::JoinError(controller::ControllerError::Superseded) => {
                 StatusCode::PRECONDITION_FAILED
             }
             ApiError::RateLimited => StatusCode::TOO_MANY_REQUESTS,
@@ -321,7 +321,8 @@ async fn create_participant(
     path = "/rooms/{external_room_id}/participants/{participant_id}",
     params(
         ("external_room_id" = String, Path, description = "External room identifier"),
-        ("participant_id" = String, Path, description = "Participant identifier")
+        ("participant_id" = String, Path, description = "Participant identifier"),
+        ("If-Match" = String, Header, description = "Exact connection incarnation")
     ),
     responses(
         (status = 204, description = "Participant deleted successfully"),
@@ -333,13 +334,21 @@ async fn create_participant(
 async fn delete_participant(
     Path((external_room_id, participant_id)): Path<(RoomExternalId, ParticipantId)>,
     State(s): State<AppState>,
+    headers: HeaderMap,
 ) -> Result<impl IntoResponse, ApiError> {
     let room_id = RoomId::from_external(&external_room_id);
+    let connection_id = headers
+        .get(IF_MATCH)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.trim_matches('"'))
+        .ok_or_else(|| ApiError::BadRequest("If-Match header required".into()))?
+        .try_into()?;
     s.controller
         .try_send(
             controller::DeleteParticipant {
                 room_id,
                 participant_id,
+                connection_id,
             }
             .into(),
         )

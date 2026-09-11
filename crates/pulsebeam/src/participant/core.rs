@@ -95,6 +95,7 @@ pub struct ParticipantConfig {
     pub manual_sub: bool,
     pub room_id: entity::RoomId,
     pub participant_id: entity::ParticipantId,
+    pub connection_id: entity::ConnectionId,
     pub rtc: Rtc,
 }
 
@@ -130,6 +131,7 @@ pub struct Participant {
     // Warm: touched per poll cycle
     upstream: UpstreamAllocator,
     pub(crate) participant_id: entity::ParticipantId,
+    pub(crate) connection_id: entity::ConnectionId,
     last_keyframe_request: HashMap<(Mid, Option<str0m::media::Rid>), Instant>,
     pending_keyframe_requests: HashSet<(Mid, Option<str0m::media::Rid>)>,
 
@@ -193,6 +195,7 @@ impl Participant {
             ),
             stream_writer: StreamWriter::new(),
             participant_id: cfg.participant_id,
+            connection_id: cfg.connection_id,
             upstream: UpstreamAllocator::new(ctx),
             downstream: DownstreamAllocator::new(ctx, cfg.manual_sub),
             disconnect_reason: None,
