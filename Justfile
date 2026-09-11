@@ -6,6 +6,7 @@ default:
 # Prepare local JavaScript packages in direct-dependency order.
 prepare:
     just --justfile apps/meet/Justfile prepare
+    just --justfile docs/Justfile prepare
 
 # Run every static workspace gate.
 check:
@@ -16,8 +17,9 @@ check:
     just --justfile agents/pulsebeam-agent-web/Justfile check
     just --justfile agents/react/Justfile check
     just --justfile apps/meet/Justfile check
+    just --justfile docs/Justfile check
     just --fmt --check
-    @for file in agents/pulsebeam-agent-native/Justfile agents/pulsebeam-agent-web/Justfile agents/react/Justfile apps/meet/Justfile crates/pulsebeam/Justfile crates/pulsebeam-ebpf/Justfile crates/pulsebeam-simulator/Justfile crates/pulsebeam-testdata/Justfile tools/Justfile; do just --justfile "$file" --fmt --check; done
+    @for file in agents/pulsebeam-agent-native/Justfile agents/pulsebeam-agent-web/Justfile agents/react/Justfile apps/meet/Justfile crates/pulsebeam/Justfile crates/pulsebeam-ebpf/Justfile crates/pulsebeam-simulator/Justfile crates/pulsebeam-testdata/Justfile docs/Justfile tools/Justfile; do just --justfile "$file" --fmt --check; done
 
 fix:
     cargo fmt --all
@@ -34,7 +36,7 @@ test:
     cargo nextest run --cargo-profile sim -p pulsebeam-simulator --no-fail-fast
     just --justfile agents/pulsebeam-agent-web/Justfile test
     just --justfile agents/react/Justfile test
-    PULSEBEAM_BROWSER_BINARY="{{justfile_directory()}}/target/pulsebeam-rtc-browsers/linux-x86_64/bin/chrome" just browser
+    PULSEBEAM_BROWSER_BINARY="{{ justfile_directory() }}/target/pulsebeam-rtc-browsers/linux-x86_64/bin/chrome" just browser
 
 # Build browser fixtures in package ownership order, then run every Rust-owned
 # BiDi contract serially. This intentionally fails when Chrome is unavailable.

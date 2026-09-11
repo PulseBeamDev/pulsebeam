@@ -1,0 +1,13 @@
+set shell := ["bash", "-euc"]
+
+dev: prepare
+    pnpm run dev
+
+build: prepare
+    pnpm run build
+
+check: prepare
+    pnpm run check
+
+prepare:
+    pnpm install --frozen-lockfile --ignore-scripts
