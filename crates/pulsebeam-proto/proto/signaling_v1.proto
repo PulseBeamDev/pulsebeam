@@ -92,8 +92,8 @@ package pulsebeam.media.v1;
 //   Mapping:
 //
 //     audio receiver_index 0 -> aud_0...
-//     audio receiver_index 1 -> aud_0...
-//     audio receiver_index 2 -> aud_0...
+//     audio receiver_index 1 -> aud_1...
+//     audio receiver_index 2 -> aud_2...
 //
 // Track identity:
 //
@@ -134,18 +134,20 @@ package pulsebeam.media.v1;
 //
 // Each data-channel message contains exactly one signaling message.
 //
-// The message payload is:
+// The data-channel message is:
 //
-//   protobuf -> LZ4
+//   uint32 little-endian uncompressed length || one LZ4 block
 //
 // Both endpoints MUST encode every ClientMessage and ServerMessage with LZ4
 // after protobuf serialization and MUST decompress before protobuf decoding.
 //
-// Compression state is scoped to the signaling transport as defined by the LZ4
-// implementation used by the protocol.
+// Every data-channel message is an independent block. Compression state is
+// never shared between messages.
 //
-// Receivers MUST enforce the protocol's maximum uncompressed signaling-message
-// size before accepting decompressed data.
+// Both the complete encoded data-channel message and the advertised/actual
+// uncompressed protobuf are limited to 262,144 bytes. Receivers MUST validate
+// the encoded length and advertised length before allocating output, and MUST
+// reject blocks whose actual output length differs from the advertised length.
 
 
 // ============================================================================
@@ -156,7 +158,8 @@ enum TrackKind {
   TRACK_KIND_UNSPECIFIED = 0;
   AUDIO = 1;
   VIDEO = 2;
-  DATA = 3;
+  reserved 3;
+  reserved "DATA";
 }
 
 
@@ -221,6 +224,10 @@ message RemoteTrack {
 // Participants and tracks carry canonical PulseBeam IDs. SDKs may retain,
 // compare, hash, and protocol-forward these values, but MUST treat their
 // canonical encoding as opaque.
+//
+// Participant IDs and TrackIds are unique. Tracks also have a unique
+// `(participant_id, kind, label)` selector and MUST reference a participant in
+// this same Catalog. The Catalog contains no tracks owned by its recipient.
 message Catalog {
   repeated Participant participants = 1;
   repeated RemoteTrack tracks = 2;
@@ -235,6 +242,9 @@ message Catalog {
 //
 // Each entry identifies one negotiated local sender through its connection-local
 // sender_index and gives that sender its application-facing `(kind, label)`.
+//
+// Sender indices are unique, and `(kind, label)` is unique within this Intent.
+// An empty list unpublishes every local track.
 //
 // Accepted state is interpreted together with the enclosing Intent.
 message SendIntent {
@@ -298,7 +308,7 @@ message VideoOptions {
 // Desired state for one canonical remote video track.
 //
 // `track_id` MUST refer to a TrackId visible in Catalog and MUST identify a
-// video track.
+// video track. If `options` is absent, protobuf/default video options apply.
 message VideoTrackIntent {
   string track_id = 1;
   VideoOptions options = 2;
@@ -307,7 +317,8 @@ message VideoTrackIntent {
 
 // Complete desired remote video state.
 //
-// Each entry explicitly references one canonical TrackId.
+// Each entry explicitly references one canonical TrackId, at most once. An
+// empty list requests no video tracks.
 message VideoIntent {
   repeated VideoTrackIntent tracks = 1;
 }
@@ -329,7 +340,7 @@ message AudioOptions {
 // Desired state for one explicitly requested canonical remote audio track.
 //
 // `track_id` MUST refer to a TrackId visible in Catalog and MUST identify an
-// audio track.
+// audio track. If `options` is absent, protobuf/default audio options apply.
 message AudioTrackIntent {
   string track_id = 1;
   AudioOptions options = 2;
@@ -349,7 +360,7 @@ enum AudioMode {
 // Complete desired remote audio state.
 //
 // `tracks` contains explicitly requested canonical audio TrackIds in preference
-// order.
+// order. Each TrackId occurs at most once. An empty list is valid.
 //
 // In AUDIO_MODE_AUTO:
 //
@@ -381,6 +392,9 @@ message AudioIntent {
 //
 //   video = explicit video TrackIds with per-track receive options
 //   audio = explicit audio TrackIds with per-track options plus selection policy
+//
+// Both `video` and `audio` MUST be present, including when their track lists are
+// empty.
 message ReceiveIntent {
   VideoIntent video = 1;
   AudioIntent audio = 2;
@@ -396,6 +410,11 @@ message ReceiveIntent {
 // intent-specific errors.
 //
 // Receive intent references canonical TrackIds supplied by PulseBeam.
+//
+// `send` and `receive` MUST be present. A newer valid revision is accepted. An
+// identical replay of the current revision is accepted and acknowledged with
+// its Mapping; an older revision or a conflicting replay is rejected without
+// changing accepted state.
 message Intent {
   uint64 revision = 1;
   SendIntent send = 2;
@@ -433,7 +452,8 @@ message TrackMapping {
 //
 // Receivers without an assigned track are omitted.
 //
-// Entry ordering has no semantic meaning.
+// Entry ordering has no semantic meaning. Receiver indices and TrackIds are
+// each unique within one media kind.
 message TrackMappings {
   repeated TrackMapping tracks = 1;
 }
@@ -444,12 +464,17 @@ message TrackMappings {
 // Each Mapping atomically replaces the previous Mapping.
 //
 // `intent_revision` is the latest Intent revision accepted by the server.
+// Every accepted Intent receives a complete Mapping carrying its revision,
+// even when receiver assignments did not change. Later Mapping replacements
+// continue to carry the latest accepted revision; zero means no accepted
+// Intent.
 //
 // It is a correlation value scoped to this signaling connection, not a
 // PulseBeam entity Id.
 //
 // Mapping changes when an actual receiver-to-TrackId assignment changes, not
 // merely because audio activity, congestion, bitrate, or video layer changes.
+// Both `video` and `audio` MUST be present, including when empty.
 message Mapping {
   uint64 intent_revision = 1;
   TrackMappings video = 2;

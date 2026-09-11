@@ -34,6 +34,12 @@ bytes = "1.11.1"
 derive_more = { version = "2.1.1", features = ["full"] }
 fastrand = "2.3.0"
 futures-lite = "2.6.1"
+lz4_flex = { version = "0.14.0", default-features = false, features = [
+  "alloc",
+  "checked-decode",
+  "safe-decode",
+  "safe-encode",
+] }
 more-asserts = "0.3.1"
 openh264 = "=0.9.8"
 opus = "=0.4.0"

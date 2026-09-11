@@ -12,7 +12,11 @@
 fn main() {
     prost_build::Config::new()
         .compile_protos(
-            &["proto/signaling.proto", "proto/reliable.proto"],
+            &[
+                "proto/signaling.proto",
+                "proto/signaling_v1.proto",
+                "proto/reliable.proto",
+            ],
             &["proto"],
         )
         .expect("Failed to compile .proto files");
