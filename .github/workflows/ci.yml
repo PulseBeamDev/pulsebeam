@@ -21,7 +21,7 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-ci
         with:
           web: "true"
@@ -35,7 +35,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-ci
         with:
           web: "true"
@@ -49,7 +49,7 @@ jobs:
 
       - name: Upload RTC browser evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: pulsebeam-rtc-browser-evidence
           path: target/pulsebeam-rtc-browser-artifacts
@@ -61,7 +61,7 @@ jobs:
   ebpf-smoke:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-ci
 
       - name: Install nightly for eBPF build-std
