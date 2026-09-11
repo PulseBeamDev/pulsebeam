@@ -16,6 +16,7 @@
 pub mod dd;
 pub mod framing;
 pub mod h264;
+pub mod identity;
 pub mod net;
 pub mod simulcast;
 

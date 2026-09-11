@@ -1,4 +1,4 @@
-pub use pulsebeam_proto::identity::{
+pub use pulsebeam_core::identity::{
     AudioTrackId, ConnectionId, DataTrackId, IdValidationError, ParticipantExternalId,
     ParticipantId, ProjectId, RoomExternalId, RoomId, TrackId, TrackKind, VideoTrackId,
 };

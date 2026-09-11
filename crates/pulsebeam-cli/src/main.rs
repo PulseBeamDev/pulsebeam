@@ -19,11 +19,11 @@ use pulsebeam_agent_native::{
     Agent, AgentEvent, Config, Host, LocalMedia, MediaFrame, MediaTime, RemoteMedia, SimulcastLayer,
 };
 use pulsebeam_agent_native::{clock::clock_anchor, wallclock_at};
-use pulsebeam_core::net::UdpSocket;
-use pulsebeam_proto::identity::{
+use pulsebeam_core::identity::{
     AudioTrackId, DataTrackId, ParticipantExternalId, ParticipantId, ProjectId, RoomExternalId,
     RoomId, VideoTrackId,
 };
+use pulsebeam_core::net::UdpSocket;
 use std::{collections::HashSet, sync::Arc, time::Duration};
 use tachyonix as mpsc;
 use tokio::sync::{broadcast, watch};
@@ -781,7 +781,7 @@ mod tests {
     }
 
     #[test]
-    fn identity_commands_use_the_canonical_proto_derivation() {
+    fn identity_commands_use_the_canonical_core_derivation() {
         let project = ProjectId::from_bytes([0, 0, 0, 0, 0, 0, 0x70, 0, 0x80, 0, 0, 0, 0, 0, 0, 1]);
         let project_text = project.as_str();
         let track_cli = Cli::try_parse_from([

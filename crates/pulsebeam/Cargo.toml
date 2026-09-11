@@ -41,7 +41,7 @@ pprof = { version = "0.15.0", features = [
   "protobuf",
 ] }
 pulsebeam-core = { path = "../pulsebeam-core", features = ["str0m"] }
-pulsebeam-proto = { path = "../pulsebeam-proto", features = ["identity"] }
+pulsebeam-proto = { path = "../pulsebeam-proto" }
 pulsebeam-routing = { path = "../pulsebeam-routing" }
 pulsebeam-runtime = { path = "../pulsebeam-runtime" }
 rand = { workspace = true }

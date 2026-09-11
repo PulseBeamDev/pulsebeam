@@ -1,16 +1,14 @@
 //! Canonical PulseBeam entity identities.
 
-use alloc::string::String;
-use arrayvec::ArrayString;
-use core::{fmt, str::FromStr};
+use base32::Alphabet;
 use serde::{Deserialize, Serialize};
 use sha3::{Digest, Sha3_256};
+use std::{fmt, str::FromStr};
 use uuid::{Uuid, Variant, Version};
 
 const UUID_TEXT_LEN: usize = 26;
 const EXTERNAL_ID_MAX_LEN: usize = 36;
 const VERSION: u8 = b'0';
-const ALPHABET: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 
 // These domain bytes and TrackKind discriminants are part of the V0 transcript.
 const ROOM_DOMAIN: &[u8] = b"pulsebeam.identity.room.v0";
@@ -43,45 +41,7 @@ pub enum IdValidationError {
 }
 
 fn encode_uuid(uuid: Uuid) -> String {
-    let mut value = uuid.as_u128();
-    let mut encoded = [b'0'; UUID_TEXT_LEN];
-    for byte in encoded.iter_mut().rev() {
-        let digit = u8::try_from(value & 0x1f).unwrap_or_default();
-        *byte = ALPHABET.get(usize::from(digit)).copied().unwrap_or(b'0');
-        value >>= 5;
-    }
-    String::from_utf8(encoded.into()).unwrap_or_default()
-}
-
-fn decode_digit(byte: u8) -> Option<u8> {
-    match byte.to_ascii_uppercase() {
-        b'0' | b'O' => Some(0),
-        b'1' | b'I' | b'L' => Some(1),
-        b'2'..=b'9' => Some(byte.to_ascii_uppercase().wrapping_sub(b'0')),
-        b'A' => Some(10),
-        b'B' => Some(11),
-        b'C' => Some(12),
-        b'D' => Some(13),
-        b'E' => Some(14),
-        b'F' => Some(15),
-        b'G' => Some(16),
-        b'H' => Some(17),
-        b'J' => Some(18),
-        b'K' => Some(19),
-        b'M' => Some(20),
-        b'N' => Some(21),
-        b'P' => Some(22),
-        b'Q' => Some(23),
-        b'R' => Some(24),
-        b'S' => Some(25),
-        b'T' => Some(26),
-        b'V' => Some(27),
-        b'W' => Some(28),
-        b'X' => Some(29),
-        b'Y' => Some(30),
-        b'Z' => Some(31),
-        _ => None,
-    }
+    base32::encode(Alphabet::Crockford, uuid.as_bytes())
 }
 
 fn decode_uuid(value: &str) -> Result<Uuid, IdValidationError> {
@@ -91,18 +51,25 @@ fn decode_uuid(value: &str) -> Result<Uuid, IdValidationError> {
             actual: value.len(),
         });
     }
-    let mut decoded = 0u128;
-    for (position, byte) in value.bytes().enumerate() {
-        let digit = decode_digit(byte).ok_or(IdValidationError::InvalidEncoding)?;
-        if position == 0 && digit > 7 {
-            return Err(IdValidationError::InvalidEncoding);
-        }
-        decoded = decoded
-            .checked_shl(5)
-            .and_then(|shifted| shifted.checked_add(u128::from(digit)))
-            .ok_or(IdValidationError::InvalidEncoding)?;
+    if !value.is_ascii() {
+        return Err(IdValidationError::InvalidEncoding);
     }
-    Ok(Uuid::from_u128(decoded))
+    let normalized: String = value
+        .bytes()
+        .map(|byte| match byte.to_ascii_uppercase() {
+            b'O' => '0',
+            b'I' | b'L' => '1',
+            byte => char::from(byte),
+        })
+        .collect();
+    let decoded = base32::decode(Alphabet::Crockford, &normalized)
+        .and_then(|bytes| <[u8; 16]>::try_from(bytes).ok())
+        .ok_or(IdValidationError::InvalidEncoding)?;
+    let uuid = Uuid::from_bytes(decoded);
+    if encode_uuid(uuid) != normalized {
+        return Err(IdValidationError::InvalidEncoding);
+    }
+    Ok(uuid)
 }
 
 fn format_id(prefix: &str, uuid: Uuid) -> String {
@@ -190,14 +157,12 @@ macro_rules! external_id {
     ($name:ident) => {
         #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
         #[serde(try_from = "&str")]
-        pub struct $name(ArrayString<EXTERNAL_ID_MAX_LEN>);
+        pub struct $name(String);
 
         impl $name {
             pub fn new(value: &str) -> Result<Self, IdValidationError> {
                 validate_external(value)?;
-                ArrayString::from(value)
-                    .map(Self)
-                    .map_err(|_| IdValidationError::TooLong(EXTERNAL_ID_MAX_LEN))
+                Ok(Self(value.to_owned()))
             }
 
             pub fn as_str(&self) -> &str {
@@ -555,7 +520,6 @@ mod tests {
     )]
 
     use super::*;
-    use alloc::format;
     use proptest::prelude::*;
 
     fn project(mut bytes: [u8; 16]) -> ProjectId {
@@ -586,14 +550,14 @@ mod tests {
             "p_0", "rm_0", "pa_0", "c_0", "kid_0", "aud_0", "vid_0", "dat_0",
         ];
         let expected = [
-            "p_00000000000E008000000000000",
-            "rm_06XKDP6TGMDH6K8MFCQQAZW98WN",
-            "pa_04RM56METD3HQQAJHD5NSW6SS8S",
-            "c_00000000000E008000000000001",
-            "kid_00000000000E008000000000002",
-            "aud_077X3X91AZMGFHSEX4A9Q9CJ8AG",
-            "vid_007AJJZCAYSGSJAWCGQN2MEJ71H",
-            "dat_05VB0YQV5DRHM9RS07Q859FE55M",
+            "p_00000000001R010000000000000",
+            "rm_0VPDPRVA2HP4TD2HXJYXBZH53JM",
+            "pa_0K2GMTHV9ME6YXAA5MPQ7GV7534",
+            "c_00000000001R010000000000004",
+            "kid_00000000001R010000000000008",
+            "aud_0WZMFN45BYJ1Y75VMH96X5J91A0",
+            "vid_00XAABXHBV6369BHJ2YMAHT8W64",
+            "dat_0QDC3TZCNQ26H7340YX0N5XRMPG",
         ];
         for ((value, prefix), expected) in values.iter().zip(prefixes).zip(expected) {
             assert!(value.starts_with(prefix));
@@ -648,12 +612,13 @@ mod tests {
             valid.strip_suffix('0').unwrap().parse::<ProjectId>(),
             Err(IdValidationError::InvalidLength { .. })
         ));
+        let invalid_padding = format!("{}Z", valid.strip_suffix('0').unwrap());
         assert!(matches!(
-            format!("p_0Z{}", "0".repeat(25)).parse::<ProjectId>(),
+            invalid_padding.parse::<ProjectId>(),
             Err(IdValidationError::InvalidEncoding)
         ));
         assert!(matches!(
-            valid.replacen('E', "U", 1).parse::<ProjectId>(),
+            valid.replacen('R', "U", 1).parse::<ProjectId>(),
             Err(IdValidationError::InvalidEncoding)
         ));
         let wrong_version = format_id("p", Uuid::from_bytes([0; 16]));
