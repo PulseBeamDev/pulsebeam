@@ -12,7 +12,7 @@ use crate::{
         core::{ControllerCore, RoomPlacement},
         lifecycle::{TrackLifecycle, TrackLifecycleOperation, TrackLifecycleOutcome},
         negotiator::{Negotiator, NegotiatorError},
-        tcp_acceptor::{PendingTcpConn, TcpAcceptorHandle},
+        tcp_acceptor::{PendingTcpConn, TcpAcceptor},
         ufrag::IceUfrag,
     },
     entity::{ConnectionId, ParticipantId, RoomId},
@@ -271,7 +271,7 @@ impl ControllerActor {
         let Some(listener) = self.tcp_listener.take() else {
             pulsebeam_runtime::fatal!("ControllerActor::run called twice")
         };
-        let acceptor = TcpAcceptorHandle::spawn(
+        let acceptor = TcpAcceptor::spawn(
             listener,
             crate::control::tcp_acceptor::TcpAcceptorConfig {
                 cluster_id: self.cluster_id,
@@ -1157,7 +1157,7 @@ fn describe_controller_metrics() {
     );
 }
 
-pub type ControllerHandle = mailbox::Sender<ControllerCommand>;
+pub type ControllerSender = mailbox::Sender<ControllerCommand>;
 
 #[cfg(test)]
 mod replacement_tests {

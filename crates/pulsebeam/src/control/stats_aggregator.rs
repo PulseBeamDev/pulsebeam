@@ -12,7 +12,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::id::ShardId;
 use crate::shard::recorder::{
-    Description, HistSnapshot, MetricKey, Schema, ShardStatsReport, bucket_le_label, hist_buckets,
+    Description, HistSnapshot, MetricSeries, Schema, ShardStatsReport, bucket_le_label,
+    hist_buckets,
 };
 
 const PREFIX: &str = "pulsebeam_shard_";
@@ -226,7 +227,7 @@ impl StatsAggregator {
 fn merge(
     groups: &mut BTreeMap<String, Group>,
     schema: &Schema,
-    key: &MetricKey,
+    key: &MetricSeries,
     shard: ShardId,
     kind: Kind,
     value: Agg,
@@ -365,8 +366,8 @@ mod tests {
         }
     }
 
-    fn key(name: &str) -> MetricKey {
-        MetricKey {
+    fn key(name: &str) -> MetricSeries {
+        MetricSeries {
             name: name.to_string(),
             labels: Vec::new(),
         }
@@ -544,11 +545,11 @@ mod tests {
     fn labels_from_the_call_site_group_series_separately() {
         let mut s = schema(&[], &[]);
         s.counters = vec![
-            MetricKey {
+            MetricSeries {
                 name: "drops".to_string(),
                 labels: vec![("reason".to_string(), "late".to_string())],
             },
-            MetricKey {
+            MetricSeries {
                 name: "drops".to_string(),
                 labels: vec![("reason".to_string(), "full".to_string())],
             },

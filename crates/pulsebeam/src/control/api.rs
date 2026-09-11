@@ -22,7 +22,7 @@ use utoipa_swagger_ui::SwaggerUi;
 
 use crate::{
     control::controller::{
-        self, ConnectionProfile, ControllerHandle, CreateParticipantReply, ParticipantState,
+        self, ConnectionProfile, ControllerSender, CreateParticipantReply, ParticipantState,
     },
     entity::{ConnectionId, IdValidationError, ParticipantId, RoomId},
 };
@@ -33,7 +33,7 @@ const ACCEPT_POST: hyper::header::HeaderName =
 
 #[derive(Clone)]
 struct AppState {
-    controller: ControllerHandle,
+    controller: ControllerSender,
     api_config: ApiConfig,
     project_registry: ProjectRegistry,
 }
@@ -792,7 +792,7 @@ fn build_openapi(base_path: &str) -> utoipa::openapi::OpenApi {
 struct ApiDoc;
 
 pub fn router(
-    controller: ControllerHandle,
+    controller: ControllerSender,
     cfg: ApiConfig,
     project_registry: ProjectRegistry,
 ) -> Router {
@@ -1413,10 +1413,9 @@ mod tests {
             ),
         ] {
             let operations = document["paths"][path].as_object().unwrap();
-            assert_eq!(
-                operations.keys().map(String::as_str).collect::<Vec<_>>(),
-                methods
-            );
+            let mut actual_methods = operations.keys().map(String::as_str).collect::<Vec<_>>();
+            actual_methods.sort_unstable();
+            assert_eq!(actual_methods, methods);
         }
         for profile in ["whip", "whep"] {
             let post = &document["paths"][format!("/{profile}")]["post"];

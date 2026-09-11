@@ -11,7 +11,7 @@ use crate::{
 };
 
 new_key_type! {
-    pub(crate) struct SubscriptionId;
+    pub(crate) struct SubscriptionKey;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -37,7 +37,7 @@ impl TrackAncestry {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Subscription {
-    pub id: SubscriptionId,
+    pub id: SubscriptionKey,
     pub subscriber: ParticipantId,
     pub selector: TrackSelector,
     pub selection: SelectionPolicy,
@@ -64,14 +64,14 @@ struct RoomTrackTopology {
     by_publisher: HashMap<ParticipantId, HashSet<TrackId>>,
     by_kind: HashMap<TrackKind, HashSet<TrackId>>,
     by_label: HashMap<String, HashSet<TrackId>>,
-    subscriptions: SlotMap<SubscriptionId, Subscription>,
-    by_track: HashMap<TrackId, HashSet<SubscriptionId>>,
-    by_subscriber_publisher: HashMap<ParticipantId, HashSet<SubscriptionId>>,
-    by_subscription_kind: HashMap<TrackKind, HashSet<SubscriptionId>>,
-    by_subscription_label: HashMap<String, HashSet<SubscriptionId>>,
-    unconstrained: HashSet<SubscriptionId>,
-    candidate_reasons: HashMap<(ParticipantId, TrackId), HashSet<SubscriptionId>>,
-    automatic_reasons: HashMap<(ParticipantId, TrackId), HashSet<SubscriptionId>>,
+    subscriptions: SlotMap<SubscriptionKey, Subscription>,
+    by_track: HashMap<TrackId, HashSet<SubscriptionKey>>,
+    by_subscriber_publisher: HashMap<ParticipantId, HashSet<SubscriptionKey>>,
+    by_subscription_kind: HashMap<TrackKind, HashSet<SubscriptionKey>>,
+    by_subscription_label: HashMap<String, HashSet<SubscriptionKey>>,
+    unconstrained: HashSet<SubscriptionKey>,
+    candidate_reasons: HashMap<(ParticipantId, TrackId), HashSet<SubscriptionKey>>,
+    automatic_reasons: HashMap<(ParticipantId, TrackId), HashSet<SubscriptionKey>>,
     allocated: HashSet<(ParticipantId, TrackId)>,
 }
 
@@ -132,7 +132,7 @@ impl TrackTopology {
         subscriber: ParticipantId,
         selector: TrackSelector,
         selection: SelectionPolicy,
-    ) -> SubscriptionId {
+    ) -> SubscriptionKey {
         let room = self.rooms.entry(room_id).or_default();
         let id = room.subscriptions.insert_with_key(|id| Subscription {
             id,
@@ -361,7 +361,7 @@ impl RoomTrackTopology {
         }
     }
 
-    fn index_subscription(&mut self, selector: &TrackSelector, id: SubscriptionId) {
+    fn index_subscription(&mut self, selector: &TrackSelector, id: SubscriptionKey) {
         let inserted = match Self::anchor(selector) {
             SubscriptionAnchor::Track(track) => self.by_track.entry(track).or_default().insert(id),
             SubscriptionAnchor::Publisher(publisher) => self
@@ -384,7 +384,7 @@ impl RoomTrackTopology {
         debug_assert!(inserted);
     }
 
-    fn unindex_subscription(&mut self, selector: &TrackSelector, id: SubscriptionId) {
+    fn unindex_subscription(&mut self, selector: &TrackSelector, id: SubscriptionKey) {
         let removed = match Self::anchor(selector) {
             SubscriptionAnchor::Track(track) => remove_indexed(&mut self.by_track, track, id),
             SubscriptionAnchor::Publisher(publisher) => {
@@ -404,7 +404,7 @@ impl RoomTrackTopology {
         );
     }
 
-    fn matching_subscription_ids(&self, identity: TrackAncestry) -> HashSet<SubscriptionId> {
+    fn matching_subscription_keys(&self, identity: TrackAncestry) -> HashSet<SubscriptionKey> {
         let Some(publication) = self.tracks.get(&identity.track_id) else {
             return HashSet::new();
         };
@@ -438,18 +438,18 @@ impl RoomTrackTopology {
         &self,
         identity: TrackAncestry,
     ) -> impl Iterator<Item = Subscription> + '_ {
-        self.matching_subscription_ids(identity)
+        self.matching_subscription_keys(identity)
             .into_iter()
             .filter_map(|id| self.subscriptions.get(id).cloned())
     }
 
     fn add_publication_reasons(&mut self, identity: TrackAncestry) {
-        for id in self.matching_subscription_ids(identity) {
+        for id in self.matching_subscription_keys(identity) {
             self.add_reason(identity.track_id, id);
         }
     }
 
-    fn add_subscription_reasons(&mut self, id: SubscriptionId) {
+    fn add_subscription_reasons(&mut self, id: SubscriptionKey) {
         let Some(subscription) = self.subscriptions.get(id).cloned() else {
             debug_assert!(false, "new subscription must be live");
             return;
@@ -459,7 +459,7 @@ impl RoomTrackTopology {
         }
     }
 
-    fn add_reason(&mut self, track: TrackId, id: SubscriptionId) {
+    fn add_reason(&mut self, track: TrackId, id: SubscriptionKey) {
         let Some(subscription) = self.subscriptions.get(id) else {
             debug_assert!(false, "reason must reference a live subscription");
             return;
@@ -480,7 +480,7 @@ impl RoomTrackTopology {
         }
     }
 
-    fn unsubscribe(&mut self, id: SubscriptionId) -> Option<Subscription> {
+    fn unsubscribe(&mut self, id: SubscriptionKey) -> Option<Subscription> {
         let subscription = self.subscriptions.remove(id)?;
         self.unindex_subscription(&subscription.selector, id);
         let affected = self.selector_tracks(&subscription.selector);
@@ -586,9 +586,9 @@ fn remove_indexed<K: Eq + std::hash::Hash, V: Eq + std::hash::Hash + Copy>(
 }
 
 fn remove_reason(
-    reasons: &mut HashMap<(ParticipantId, TrackId), HashSet<SubscriptionId>>,
+    reasons: &mut HashMap<(ParticipantId, TrackId), HashSet<SubscriptionKey>>,
     key: (ParticipantId, TrackId),
-    id: SubscriptionId,
+    id: SubscriptionKey,
 ) -> bool {
     let Some(ids) = reasons.get_mut(&key) else {
         return false;

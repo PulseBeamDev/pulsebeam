@@ -278,7 +278,7 @@ impl AudioAllocator {
             plog_warn!(
                 self.ctx,
                 target: crate::log::TARGET_AUDIO,
-                track = ?origin.track,
+                track_id = %origin.track,
                 "audio packet dropped for want of an RFC 6464 level"
             );
             return None;
@@ -363,7 +363,7 @@ impl AudioAllocator {
         plog_debug!(
             self.ctx,
             target: crate::log::TARGET_AUDIO,
-            track = ?origin.track,
+            track_id = %origin.track,
             incoming_power = power,
             quietest_power = quietest.last_power,
             "audio packet dropped in contention"

@@ -178,7 +178,7 @@ impl VideoAllocator {
             debug_assert!(false, "a TrackId must have one installed TrackHandle");
             return;
         }
-        plog_info!(self.ctx, track = %track.meta().id, "video track added");
+        plog_info!(self.ctx, track_id = %track.meta().id, "video track added");
         let previous = self.tracks.insert(key, track);
         debug_assert!(previous.is_none(), "a TrackHandle must be installed once");
         self.rebalance();
@@ -213,7 +213,7 @@ impl VideoAllocator {
         self.active_track_handles.remove(track_id);
         let removed = self.tracks.remove(key);
         debug_assert!(removed.is_some(), "track index must resolve to catalog");
-        plog_info!(self.ctx, track = %track_id, "video track removed");
+        plog_info!(self.ctx, %track_id, "video track removed");
         // Stop any slot currently targeting the removed track so reconcile_routes
         // fires StreamUnsubscribed and cleans up the routing table.
         for slot in self.slots.values_mut() {
@@ -565,7 +565,7 @@ impl VideoAllocator {
         };
         let track_id = track.id();
         let Some(slot) = self.slots.get_mut(slot_key) else {
-            plog_warn!(self.ctx, "no slot found for track {:?}", track_handle);
+            plog_warn!(self.ctx, ?track_handle, "no slot found for track");
             return false;
         };
         slot.on_rtp(track_id, arrival_ts, cache, writer)
@@ -728,7 +728,7 @@ impl VideoAllocator {
                 if first_slot.is_some() {
                     plog_error!(
                         self.ctx,
-                        track = %layer.meta.id,
+                        track_id = %layer.meta.id,
                         first_slot = ?first_slot,
                         second_slot = ?slot_key,
                         "duplicate track assigned to multiple slots"

@@ -933,12 +933,10 @@ fn a_rejoining_publisher_is_shown_to_an_existing_viewer_test() {
         ]);
 }
 
-/// A connection that drops and recovers is the same participant throughout.
+/// A transport that drops and recovers remains the same admitted connection throughout.
 ///
-/// The path a real client takes after a network blip. Every other churn plan tears the client down
-/// and joins again, which mints a *new* participant id and is a different thing entirely. A
-/// reconnect keeps the id and changes only the connection generation: the server does this over
-/// `PATCH` with `If-Match: <etag>`.
+/// This models media transport recovery without a new signaling request. A new signaling POST
+/// would mint a new `ConnectionId`; matching JWT claims would still derive the same `ParticipantId`.
 ///
 #[test]
 fn a_dropped_connection_recovers_as_the_same_participant_test() {

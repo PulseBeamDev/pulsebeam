@@ -487,7 +487,7 @@ impl Participant {
 
     fn enqueue_remote_keyframe(&mut self, stream_id: StreamId, kind: KeyframeRequestKind) {
         let Some(mid) = self.upstream.mid_for_track_id(stream_id.0) else {
-            plog_warn!(self.log_ctx(), track = ?stream_id.0, "unknown upstream track for keyframe request");
+            plog_warn!(self.log_ctx(), stream_id = ?stream_id.0, "unknown upstream track for keyframe request");
             return;
         };
         let key = (mid, stream_id.1);

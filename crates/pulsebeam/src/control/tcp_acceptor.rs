@@ -3,7 +3,7 @@
 //!
 //! Architecture
 //! ------------
-//! [`TcpAcceptorHandle::spawn`] starts the accept loop on the current
+//! [`TcpAcceptor::spawn`] starts the accept loop on the current
 //! `LocalSet` / `LocalRuntime` (via `tokio::task::spawn_local`).  For each
 //! accepted stream it spawns a second inner task that reads the first RFC 4571
 //! frame within a timeout, decodes the ICE ufrag, and validates it against
@@ -74,14 +74,14 @@ pub struct TcpAcceptorConfig {
     pub shard_count: usize,
 }
 
-/// Opaque handle returned by [`TcpAcceptorHandle::spawn`].
+/// Acceptor task endpoint returned by [`TcpAcceptor::spawn`].
 ///
 /// The controller holds `event_rx` and drains it each loop iteration.
-pub struct TcpAcceptorHandle {
+pub struct TcpAcceptor {
     pub event_rx: mailbox::Receiver<TcpAcceptorEvent>,
 }
 
-impl TcpAcceptorHandle {
+impl TcpAcceptor {
     /// Spawn the acceptor loop onto the current `LocalSet` / `LocalRuntime`.
     pub fn spawn(
         listener: TcpListener,
@@ -303,8 +303,7 @@ mod tests {
                 .unwrap();
             let addr = listener.local_addr().unwrap();
 
-            let handle =
-                TcpAcceptorHandle::spawn(listener, test_config(), CancellationToken::new());
+            let handle = TcpAcceptor::spawn(listener, test_config(), CancellationToken::new());
             let mut event_rx = handle.event_rx;
 
             // Connect MAX_PENDING_TCP clients and hold them open.
@@ -344,8 +343,7 @@ mod tests {
                 .unwrap();
             let addr = listener.local_addr().unwrap();
 
-            let handle =
-                TcpAcceptorHandle::spawn(listener, test_config(), CancellationToken::new());
+            let handle = TcpAcceptor::spawn(listener, test_config(), CancellationToken::new());
             let mut event_rx = handle.event_rx;
 
             // Fill to the limit with clients that immediately close (EOF → None result).
@@ -385,7 +383,7 @@ mod tests {
                 .await
                 .unwrap();
             let shutdown = CancellationToken::new();
-            let handle = TcpAcceptorHandle::spawn(listener, test_config(), shutdown.clone());
+            let handle = TcpAcceptor::spawn(listener, test_config(), shutdown.clone());
             let mut event_rx = handle.event_rx;
 
             shutdown.cancel();
@@ -410,8 +408,7 @@ mod tests {
                 .unwrap();
             let addr = listener.local_addr().unwrap();
 
-            let handle =
-                TcpAcceptorHandle::spawn(listener, test_config(), CancellationToken::new());
+            let handle = TcpAcceptor::spawn(listener, test_config(), CancellationToken::new());
             let mut event_rx = handle.event_rx;
 
             // Open MAX_PENDING_TCP_PER_IP + 1 connections from the same IP.
@@ -524,7 +521,7 @@ mod tests {
                 .unwrap();
             let addr = listener.local_addr().unwrap();
             let config = test_config();
-            let handle = TcpAcceptorHandle::spawn(listener, config, CancellationToken::new());
+            let handle = TcpAcceptor::spawn(listener, config, CancellationToken::new());
             let mut event_rx = handle.event_rx;
 
             let transport = TransportRoute::new(ShardId::new(2), 7);
@@ -555,7 +552,7 @@ mod tests {
                 .unwrap();
             let addr = listener.local_addr().unwrap();
             let config = test_config();
-            let handle = TcpAcceptorHandle::spawn(listener, config, CancellationToken::new());
+            let handle = TcpAcceptor::spawn(listener, config, CancellationToken::new());
             let mut event_rx = handle.event_rx;
 
             let transport = TransportRoute::new(ShardId::new(1), 9);
@@ -580,7 +577,7 @@ mod tests {
                 .unwrap();
             let addr = listener.local_addr().unwrap();
             let config = test_config();
-            let handle = TcpAcceptorHandle::spawn(listener, config, CancellationToken::new());
+            let handle = TcpAcceptor::spawn(listener, config, CancellationToken::new());
             let mut event_rx = handle.event_rx;
 
             let transport = TransportRoute::new(ShardId::new(1), 0);
@@ -608,7 +605,7 @@ mod tests {
                 .unwrap();
             let addr = listener.local_addr().unwrap();
             let config = test_config();
-            let handle = TcpAcceptorHandle::spawn(listener, config, CancellationToken::new());
+            let handle = TcpAcceptor::spawn(listener, config, CancellationToken::new());
             let mut event_rx = handle.event_rx;
 
             let transport = TransportRoute::new(ShardId::new(1), 0);
@@ -636,7 +633,7 @@ mod tests {
                 .unwrap();
             let addr = listener.local_addr().unwrap();
             let config = test_config();
-            let handle = TcpAcceptorHandle::spawn(listener, config, CancellationToken::new());
+            let handle = TcpAcceptor::spawn(listener, config, CancellationToken::new());
             let mut event_rx = handle.event_rx;
 
             let out_of_range = TransportRoute::new(ShardId::new(config.shard_count), 0);
@@ -657,8 +654,7 @@ mod tests {
                 .await
                 .unwrap();
             let addr = listener.local_addr().unwrap();
-            let handle =
-                TcpAcceptorHandle::spawn(listener, test_config(), CancellationToken::new());
+            let handle = TcpAcceptor::spawn(listener, test_config(), CancellationToken::new());
             let mut event_rx = handle.event_rx;
 
             let _client =
@@ -678,8 +674,7 @@ mod tests {
                 .await
                 .unwrap();
             let addr = listener.local_addr().unwrap();
-            let handle =
-                TcpAcceptorHandle::spawn(listener, test_config(), CancellationToken::new());
+            let handle = TcpAcceptor::spawn(listener, test_config(), CancellationToken::new());
             let mut event_rx = handle.event_rx;
 
             let _client =
@@ -699,8 +694,7 @@ mod tests {
                 .await
                 .unwrap();
             let addr = listener.local_addr().unwrap();
-            let handle =
-                TcpAcceptorHandle::spawn(listener, test_config(), CancellationToken::new());
+            let handle = TcpAcceptor::spawn(listener, test_config(), CancellationToken::new());
             let mut event_rx = handle.event_rx;
 
             let garbage = vec![0xAAu8; 32];

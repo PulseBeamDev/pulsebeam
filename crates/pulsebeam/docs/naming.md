@@ -1,98 +1,73 @@
 # Naming boundaries
 
-PulseBeam names values by the boundary at which they are valid, not by the
-container that stores them. The suffix is a contract: changing it changes where
-the value may be used.
+PulseBeam names values by who owns them and how long they remain valid. A
+suffix is a boundary contract, not a description of the container holding the
+value.
 
-This is the target contract for the identity and addressing migration. Existing
-legacy names do not weaken it and must not be copied into new interfaces.
-
-| Suffix | Meaning | Valid scope |
+| Suffix | Owner and lifetime | Meaning |
 | --- | --- | --- |
-| `ExternalId` | Opaque identity supplied by an application or SDK user | Its documented application scope |
-| `Id` | Stable identity issued by the PulseBeam server | PulseBeam and authorized consumers, across nodes and restarts |
-| `Address` | Routable destination for a live placement | Its named routing scope |
-| `Handle` | Reference to live shard-owned state | One shard incarnation |
-| `Key` | Lookup value owned by one component | The owning collection or component |
+| `ExternalId` | User application/backend | Public opaque identity supplied to PulseBeam. |
+| `Id` | PulseBeam | Stable canonical entity identity minted or derived by PulseBeam. |
+| `Address` | PulseBeam control plane | Routable placement information that may cross nodes. |
+| `Handle` | One runtime shard | Ephemeral incarnation valid only in its owning shard. |
+| `Key` | One private component | Internal lookup discriminator with no public or cross-component identity meaning. |
 
-The boundary rules are:
+An `Id` answers **which entity?** PulseBeam always owns it, even when an SDK
+carries it. Clients and SDKs may retain, compare, and return an `Id` received
+from PulseBeam, but they never mint or derive one.
 
-- An `ExternalId` enters through an API or SDK configuration and may be scoped
-  by a parent. The application or SDK user owns its value. It is never a
-  routing destination or the canonical entity value in production logs.
-- An `Id` answers **which PulseBeam entity?** The PulseBeam server is the sole
-  authority that derives or mints it. It is serializable, stable, and
-  independent of current placement. Use it for cluster correlation and
-  canonical entity fields in production logs.
-- An SDK may receive, retain, compare, and send an `Id` back when a PulseBeam
-  protocol asks it to reference an entity. Receiving or using an `Id` does not
-  transfer issuance authority: clients and SDKs must never mint or derive one.
-- An `Address` answers **where is its current live destination?** It is minted
-  by the destination owner and may contain node, shard, private slot, and epoch
-  information. Migration produces a new address without changing the entity's
-  `Id`.
-- A `Handle` directly references live state owned by one shard. It must not be
-  sent to the controller, another shard, or another node.
-- A `Key` exists only to perform a component-owned lookup. It has no independent
-  entity, routing, logging, or stability contract outside that owner.
+The agent crates intentionally define same-named opaque string wrappers such as
+`RoomId`, `ParticipantId`, `ConnectionId`, and `TrackId`. Those wrappers allow
+cloning, exact equality, hashing, string access, and protocol forwarding. They
+do not parse, validate, format, derive, mint, or expose the canonical encoding.
 
-Semantic meaning wins over storage mechanics. An `Id` stored in a `HashMap`
-remains an `Id`; a shard `Handle` implemented with `slotmap` remains a
-`Handle`. Conversely, a private lookup type may be a vector index, reusable
-slot, generational slot, or composite value and is still named `Key`.
+An `ExternalId` enters the server through the `room` and `sub` JWT claims. The
+user backend owns these values; PulseBeam validates them and derives the
+corresponding canonical IDs. External IDs are not routing destinations or the
+entity identity used in production logs.
 
-`index` and `slot` are ordinary representation terms, not PulseBeam identity
-suffixes. Keep them as private fields or local variables. If a component needs
-a distinct lookup type, use `Key` rather than exposing whether its current
-implementation uses an index or slot. Natural domain nouns such as
-`MetricSeries`, `TrackPlan`, and `RouteEnvelope` need no artificial suffix.
+An `Address` answers **where is the entity's current placement?** It may cross
+nodes and can change without changing the entity's `Id`. A `Handle` directly
+references live shard-owned state and must not leave that shard incarnation. A
+`Key` exists only for its component's lookup and has no independent routing,
+logging, or stability contract.
+
+Semantic meaning wins over storage mechanics. An `Id` stored in a map remains
+an `Id`; a shard `Handle` implemented with a slot map remains a `Handle`.
+Private indices and slots remain representation details unless the component
+needs a distinct `Key`. Natural domain nouns such as `MetricSeries`,
+`TrackPlan`, and `RouteEnvelope` need no suffix.
 
 ## Identity and routing flow
 
 ```text
-application / SDK user
-    supplies RoomExternalId and ParticipantExternalId
+JWT claims: room + sub
+    -> RoomExternalId + ParticipantExternalId
 
-PulseBeam server
-    RoomExternalId
-        -> derives RoomId
+ProjectId + RoomExternalId
+    -> RoomId
 
-    (RoomId, ParticipantExternalId)
-        -> derives ParticipantId
+RoomId + ParticipantExternalId
+    -> ParticipantId
 
-    (ParticipantId, TrackKind, TrackLabel)
-        -> derives TrackId
+ParticipantId + TrackKind + TrackLabel
+    -> TrackId
 
-    connection creation
-        -> mints ConnectionId
+connection admission
+    -> ConnectionId
 
-server-issued Id
-    -> may be published to an SDK
-    -> may be referenced by that SDK in later protocol messages
-
-server-owned TrackId + current placement
-    -> destination owner mints RouteAddress
+TrackId + current placement
+    -> RouteAddress
     -> destination shard resolves TrackHandle
 ```
 
-`RoomId`, `ParticipantId`, and `TrackId` are deterministic hierarchical
-UUIDv8 identities. `ConnectionId` is a minted UUIDv7 identity. All use the
-canonical PulseBeam text form:
+`RoomId`, `ParticipantId`, and `TrackId` are deterministic hierarchical UUIDv8
+identities. `ConnectionId` is a minted UUIDv7 identity. Their V0 text encodings
+are `rm_0...`, `pa_0...`, `aud_0...` / `vid_0...` / `dat_0...`, and `c_0...`.
+Only the canonical identity implementation may derive, mint, parse, or format
+these values.
 
-```text
-<entity-prefix>_<1 Crockford Base32 version character><26 Crockford Base32 UUID characters>
-```
-
-The contract version is exactly one Crockford Base32 character using the same
-canonical uppercase alphabet as the UUID portion. It versions the complete
-`Id` construction contract: `0` is the implemented V0 contract; incompatible
-future contracts use a different version character.
-Only server-owned identity code may derive or mint an `Id`. Call sites must use
-each concrete `Id` type's parser and formatter rather than constructing text
-manually. SDK-side parsers and formatters operate only on IDs received from the
-server; they do not provide derivation or minting authority.
-
-Address scope must be explicit when more than one scope exists:
+Address scope is explicit:
 
 ```text
 NodeRouteAddress       = shard + private slot + epoch
@@ -101,43 +76,27 @@ NodeTransportAddress   = shard + private slot + epoch
 TransportAddress       = cluster + node + NodeTransportAddress
 ```
 
-## Naming examples
-
-Use:
+Use private lookup and non-identity nouns for their actual roles:
 
 ```text
-RoomExternalId         ParticipantExternalId
-RoomId                 ParticipantId          TrackId
-ConnectionId
-ParticipantHandle      TrackHandle
-NodeRouteAddress       RouteAddress
-NodeTransportAddress   TransportAddress
-SubscriptionKey        UpstreamSlotKey        DownstreamSlotKey
-FlowKey                MetricSeries
+SubscriptionKey       UpstreamSlotKey       DownstreamSlotKey
+FlowKey               MetricSeries
+ControllerSender      TcpAcceptor           TransportAddressAllocator
 ```
 
-Avoid names that cross these meanings:
+## HTTP signaling
+
+Native, WHIP, and WHEP create connection resources at:
 
 ```text
-ParticipantKey   # live shard state is a Handle
-TrackKey         # live shard state is a Handle
-RouteHandle      # a routable destination is an Address
-TransportHandle  # a routable destination is an Address
-RouteId          # placement is not entity identity
-MetricKey        # a metric series is shared domain data, not a private lookup
-EntityId         # use the concrete entity type
+POST /api/v1/native
+POST /api/v1/whip
+POST /api/v1/whep
 ```
 
-At HTTP boundaries, make external ownership explicit in both paths and code:
-
-```text
-/api/v1/rooms/{room_external_id}/participants/{participant_external_id}
-```
-
-Server responses and signaling protocols may expose canonical PulseBeam IDs
-when an SDK must refer to a server-owned entity. For example, a server catalog
-may publish `ParticipantId` and `TrackId` values that later client intents
-reference. The SDK treats those values as opaque server-issued identities.
-
-Signaling and other protocols migrate independently; do not rename their
-fields implicitly as part of an HTTP API change.
+Each successful request returns an absolute `Location` ending in a canonical
+V0 `ConnectionId`, for example `/api/v1/native/c_0...`. Native JSON exposes
+canonical room, participant, and connection IDs where the agent needs to carry
+them; WHIP and WHEP clients treat the complete returned `Location` as opaque.
+The Utoipa annotations in `control/api.rs` are the source of truth for generated
+API documentation.

@@ -242,14 +242,14 @@ impl Arena {
     }
 }
 
-/// One metric's identity, as a value the control plane can keep.
+/// One metric series description, as a value the control plane can keep.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MetricKey {
+pub struct MetricSeries {
     pub name: String,
     pub labels: Vec<(String, String)>,
 }
 
-impl MetricKey {
+impl MetricSeries {
     fn from_key(key: &Key) -> Self {
         Self {
             name: key.name().to_string(),
@@ -270,9 +270,9 @@ pub struct Description {
 /// The names behind a report's values, sent only when they change.
 #[derive(Debug, Clone, Default)]
 pub struct Schema {
-    pub counters: Vec<MetricKey>,
-    pub gauges: Vec<MetricKey>,
-    pub histograms: Vec<MetricKey>,
+    pub counters: Vec<MetricSeries>,
+    pub gauges: Vec<MetricSeries>,
+    pub histograms: Vec<MetricSeries>,
     pub descriptions: Vec<(String, Description)>,
 }
 
@@ -436,7 +436,7 @@ impl Recorder for ShardRecorder {
         };
         let slot = Arc::new(slot);
         reg.counters.insert(key.clone(), Arc::clone(&slot));
-        reg.schema.counters.push(MetricKey::from_key(key));
+        reg.schema.counters.push(MetricSeries::from_key(key));
         reg.bump_epoch();
         Counter::from_arc(slot)
     }
@@ -452,7 +452,7 @@ impl Recorder for ShardRecorder {
         };
         let slot = Arc::new(slot);
         reg.gauges.insert(key.clone(), Arc::clone(&slot));
-        reg.schema.gauges.push(MetricKey::from_key(key));
+        reg.schema.gauges.push(MetricSeries::from_key(key));
         reg.bump_epoch();
         Gauge::from_arc(slot)
     }
@@ -465,7 +465,7 @@ impl Recorder for ShardRecorder {
         let hist = Arc::new(BucketHist::new());
         reg.histograms.insert(key.clone(), Arc::clone(&hist));
         reg.hist_handles.push(Arc::clone(&hist));
-        reg.schema.histograms.push(MetricKey::from_key(key));
+        reg.schema.histograms.push(MetricSeries::from_key(key));
         reg.bump_epoch();
         Histogram::from_arc(hist)
     }
@@ -490,7 +490,7 @@ mod tests {
 
     const SHARD: ShardId = ShardId::new(0);
 
-    fn find(keys: &[MetricKey], name: &str) -> Option<usize> {
+    fn find(keys: &[MetricSeries], name: &str) -> Option<usize> {
         // A plain loop, not `.position`: the architecture guard scans this
         // directory textually for discovery scans on the hot path.
         for (idx, key) in keys.iter().enumerate() {

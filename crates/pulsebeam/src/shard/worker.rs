@@ -662,9 +662,9 @@ impl ShardWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::shard::recorder::MetricKey;
+    use crate::shard::recorder::MetricSeries;
 
-    fn find(keys: &[MetricKey], name: &str) -> usize {
+    fn find(keys: &[MetricSeries], name: &str) -> usize {
         for (idx, key) in keys.iter().enumerate() {
             if key.name == name {
                 return idx;
