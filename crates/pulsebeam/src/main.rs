@@ -128,6 +128,7 @@ fn main() {
         rtc_port,
         args.iface,
         args.shards,
+        registry,
     )) {
         pulsebeam_runtime::fatal!("server failed: {err:#}");
     }
@@ -162,6 +163,7 @@ pub async fn run(
     rtc_port: u16,
     network_interface: Option<String>,
     shards_per_worker: usize,
+    project_registry: ProjectRegistry,
 ) -> Result<()> {
     let external_ips =
         pulsebeam_runtime::system::select_host_addresses(network_interface.as_deref());
@@ -187,6 +189,7 @@ pub async fn run(
         .rng(rng)
         .work_stealing(shards_per_worker)
         .with_http_api(http_api_addr)
+        .with_project_registry(project_registry)
         .with_internal_metrics(metrics_addr);
 
     let node = node_builder.run(shutdown.child_token());

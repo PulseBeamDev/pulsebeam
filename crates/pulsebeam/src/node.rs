@@ -3,6 +3,7 @@
 
 use anyhow::{Context, Result};
 use core_affinity::get_core_ids;
+use pulsebeam_core::auth::ProjectRegistry;
 use pulsebeam_core::net::TcpListener;
 use pulsebeam_runtime::mailbox;
 use pulsebeam_runtime::net;
@@ -418,6 +419,7 @@ pub struct NodeBuilder {
 
     // Services
     http_api: Option<ListenerSource>,
+    project_registry: Option<ProjectRegistry>,
     internal_metrics: Option<ListenerSource>,
 
     ebpf: bool,
@@ -452,6 +454,7 @@ impl NodeBuilder {
             rng: None,
             udp_mode: UdpMode::Batch,
             http_api: None,
+            project_registry: None,
             internal_metrics: None,
             ebpf: true,
             tcp_only: false,
@@ -573,6 +576,11 @@ impl NodeBuilder {
     /// Configure the HTTP Signaling API to bind to the specified address.
     pub fn with_http_api(mut self, addr: SocketAddr) -> Self {
         self.http_api = Some(ListenerSource::Bind(addr));
+        self
+    }
+
+    pub fn with_project_registry(mut self, project_registry: ProjectRegistry) -> Self {
+        self.project_registry = Some(project_registry);
         self
     }
 
@@ -922,10 +930,7 @@ impl NodeBuilder {
             let cors = CorsLayer::new()
                 .allow_origin(Any)
                 .allow_methods([
-                    hyper::Method::GET,
                     hyper::Method::POST,
-                    hyper::Method::PATCH,
-                    hyper::Method::PUT,
                     hyper::Method::DELETE,
                     hyper::Method::OPTIONS,
                 ])
@@ -933,13 +938,15 @@ impl NodeBuilder {
                     hyper::header::AUTHORIZATION,
                     hyper::header::CONTENT_TYPE,
                     hyper::header::CONTENT_ENCODING,
-                    hyper::header::IF_MATCH,
                     hyper::header::ACCEPT,
                 ])
-                .expose_headers([hyper::header::LOCATION, hyper::header::ETAG])
+                .expose_headers([hyper::header::LOCATION])
                 .max_age(Duration::from_secs(86400));
 
-            let router = api::router(controller_command_tx, api_cfg)
+            let project_registry = self
+                .project_registry
+                .context("HTTP signaling requires a project registry")?;
+            let router = api::router(controller_command_tx, api_cfg, project_registry)
                 .layer(CompressionLayer::new().zstd(true))
                 .layer(RequestDecompressionLayer::new().zstd(true).gzip(true))
                 .layer(cors);

@@ -8,6 +8,10 @@ pub use harness::{
     MAX_TIME_TO_FIRST_FRAME, Participant, Property, Reorder, Room, Step, VideoQuality,
 };
 
+use pulsebeam_core::auth::{
+    DEVELOPMENT_API_KEY_ID, DEVELOPMENT_API_VERIFYING_KEY, DEVELOPMENT_PROJECT_ID, ProjectKey,
+    ProjectKeys, ProjectRegistry,
+};
 use pulsebeam_runtime::net::UdpMode;
 use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
@@ -125,6 +129,16 @@ pub async fn start_sfu_node_with(
         .rng(rng)
         .with_udp_mode(DEFAULT_SIM_UDP_MODE)
         .with_http_api(http_api_addr)
+        .with_project_registry(
+            ProjectRegistry::new(vec![ProjectKeys {
+                project_id: DEVELOPMENT_PROJECT_ID,
+                keys: vec![ProjectKey {
+                    key_id: DEVELOPMENT_API_KEY_ID,
+                    verifying_key: DEVELOPMENT_API_VERIFYING_KEY,
+                }],
+            }])
+            .expect("development registry is valid"),
+        )
         .with_current_runtime();
     if shards > 1 {
         builder = builder.room_shard_slot(1).round_robin_rooms();

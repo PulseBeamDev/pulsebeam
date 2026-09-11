@@ -39,6 +39,14 @@ pub struct ParticipantState {
     pub connection_id: ConnectionId,
     pub old_connection_id: Option<ConnectionId>,
     pub authorization: Option<AuthorizationLease>,
+    pub profile: ConnectionProfile,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConnectionProfile {
+    Native,
+    Whip,
+    Whep,
 }
 
 const AUTHORIZATION_TIMER_HORIZON: Duration = Duration::from_secs(365 * 24 * 60 * 60);
@@ -127,6 +135,7 @@ pub struct DeleteParticipant {
     pub room_id: RoomId,
     pub participant_id: ParticipantId,
     pub connection_id: ConnectionId,
+    pub profile: ConnectionProfile,
 }
 
 #[derive(Debug)]
@@ -170,6 +179,7 @@ struct PendingMaterialization {
     participant: ParticipantId,
     connection_id: ConnectionId,
     authorization: Option<AuthorizationLease>,
+    profile: ConnectionProfile,
     transport: crate::route::NodeTransportAddress,
     room_id: RoomId,
     answer: SdpAnswer,
@@ -384,7 +394,9 @@ impl ControllerActor {
                     .core
                     .registry
                     .get_participant(&message.participant_id)
-                    .is_some_and(|meta| meta.room_id == message.room_id)
+                    .is_some_and(|meta| {
+                        meta.room_id == message.room_id && meta.profile == message.profile
+                    })
                 {
                     self.remove_incarnation(message.participant_id, message.connection_id);
                 }
@@ -869,6 +881,7 @@ impl ControllerActor {
         };
         let connection_id = state.connection_id;
         let authorization = state.authorization;
+        let profile = state.profile;
         let config = self.core.prepare_participant(rtc, state);
         let room_id = config.room_id;
         let (ack_tx, ack_rx) = oneshot::channel();
@@ -883,6 +896,7 @@ impl ControllerActor {
             participant: participant_id,
             connection_id,
             authorization,
+            profile,
             transport: address,
             room_id,
             answer,
@@ -903,6 +917,7 @@ impl ControllerActor {
             pending.transport,
             pending.connection_id,
             pending.authorization,
+            pending.profile,
             wall_now,
         )?;
         if let Some(previous) = previous {
@@ -957,6 +972,7 @@ impl ControllerActor {
         transport: crate::route::NodeTransportAddress,
         connection_id: ConnectionId,
         authorization: Option<AuthorizationLease>,
+        profile: ConnectionProfile,
         wall_now: SystemTime,
     ) -> Result<Option<crate::control::registry::ParticipantMeta>, ControllerError> {
         if authorization.is_some_and(|lease| lease.is_expired_at(wall_now)) {
@@ -965,7 +981,14 @@ impl ControllerActor {
         let previous = self
             .core
             .registry
-            .commit_candidate(participant_id, room_id, shard, transport, connection_id)
+            .commit_candidate(
+                participant_id,
+                room_id,
+                shard,
+                transport,
+                connection_id,
+                profile,
+            )
             .map_err(|_| ControllerError::Superseded)?;
         if let Some(lease) = authorization {
             self.core
@@ -1207,6 +1230,7 @@ mod replacement_tests {
             transport,
             connection_id(1),
             Some(lease),
+            ConnectionProfile::Native,
             UNIX_EPOCH + Duration::from_secs(10),
         );
 
@@ -1237,6 +1261,7 @@ mod replacement_tests {
                 transport,
                 connection_id(1),
                 Some(lease),
+                ConnectionProfile::Native,
                 UNIX_EPOCH,
             )
             .unwrap();
@@ -1275,6 +1300,7 @@ mod replacement_tests {
                 old_transport,
                 old_id,
                 Some(old_lease),
+                ConnectionProfile::Native,
                 UNIX_EPOCH,
             )
             .unwrap();
@@ -1289,6 +1315,7 @@ mod replacement_tests {
                 current_transport,
                 current_id,
                 Some(current_lease),
+                ConnectionProfile::Native,
                 UNIX_EPOCH,
             )
             .unwrap()
@@ -1331,6 +1358,7 @@ mod replacement_tests {
                     transport,
                     connection_id(sequence),
                     Some(lease),
+                    ConnectionProfile::Native,
                     UNIX_EPOCH,
                 )
                 .unwrap();
@@ -1365,7 +1393,14 @@ mod replacement_tests {
         actor
             .core
             .registry
-            .commit_candidate(participant_id, room_id, ShardId::new(0), old_transport, old)
+            .commit_candidate(
+                participant_id,
+                room_id,
+                ShardId::new(0),
+                old_transport,
+                old,
+                ConnectionProfile::Native,
+            )
             .unwrap();
         actor
             .core
@@ -1376,6 +1411,7 @@ mod replacement_tests {
                 ShardId::new(0),
                 current_transport,
                 current,
+                ConnectionProfile::Native,
             )
             .unwrap();
 
@@ -1386,6 +1422,7 @@ mod replacement_tests {
                 ShardId::new(0),
                 old_transport,
                 old,
+                ConnectionProfile::Native,
             ),
             Err(CommitCandidateError::Superseded)
         );
@@ -1395,6 +1432,7 @@ mod replacement_tests {
                 room_id,
                 participant_id,
                 connection_id: old,
+                profile: ConnectionProfile::Native,
             }
             .into(),
         );
@@ -1417,13 +1455,32 @@ mod replacement_tests {
             current
         );
 
-        actor.handle_shard_event((
-            ShardId::new(0),
-            ShardEvent::ParticipantClosed {
-                participant: participant_id,
+        actor.process_command(
+            DeleteParticipant {
+                room_id,
+                participant_id,
                 connection_id: current,
-            },
-        ));
+                profile: ConnectionProfile::Whip,
+            }
+            .into(),
+        );
+        assert!(
+            actor
+                .core
+                .registry
+                .get_participant(&participant_id)
+                .is_some()
+        );
+
+        actor.process_command(
+            DeleteParticipant {
+                room_id,
+                participant_id,
+                connection_id: current,
+                profile: ConnectionProfile::Native,
+            }
+            .into(),
+        );
         assert!(
             actor
                 .core

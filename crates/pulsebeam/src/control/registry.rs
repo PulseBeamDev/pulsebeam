@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use crate::{
+    control::controller::ConnectionProfile,
     control::room::Room,
     entity::{ConnectionId, ParticipantId, RoomId},
     id::ShardId,
@@ -22,6 +23,7 @@ pub struct ParticipantMeta {
     /// to.
     pub transport: Option<NodeTransportAddress>,
     pub connection_id: ConnectionId,
+    pub profile: ConnectionProfile,
     pub authorization: Option<super::controller::AuthorizationLease>,
     pub materialized: bool,
 }
@@ -58,6 +60,7 @@ impl RoomRegistry {
                 room_id,
                 transport,
                 connection_id: ConnectionId::new(),
+                profile: ConnectionProfile::Native,
                 authorization: None,
                 materialized: false,
             },
@@ -91,6 +94,7 @@ impl RoomRegistry {
         shard_id: ShardId,
         transport: NodeTransportAddress,
         connection_id: ConnectionId,
+        profile: ConnectionProfile,
     ) -> Result<Option<ParticipantMeta>, CommitCandidateError> {
         if let Some(current) = self.participants.get(&participant_id)
             && current.connection_id >= connection_id
@@ -105,6 +109,7 @@ impl RoomRegistry {
                 room_id,
                 transport: Some(transport),
                 connection_id,
+                profile,
                 authorization: None,
                 materialized: true,
             },
@@ -338,8 +343,15 @@ mod tests {
         let room = room_id("prepare");
         let participant = participant_id();
         let current = connection_id(1);
-        reg.commit_candidate(participant, room, ShardId::new(0), transport(0, 1), current)
-            .unwrap();
+        reg.commit_candidate(
+            participant,
+            room,
+            ShardId::new(0),
+            transport(0, 1),
+            current,
+            ConnectionProfile::Native,
+        )
+        .unwrap();
 
         let _prepared = (connection_id(2), transport(0, 2));
 
@@ -355,8 +367,15 @@ mod tests {
         let room = room_id("failed-prepare");
         let participant = participant_id();
         let current = connection_id(1);
-        reg.commit_candidate(participant, room, ShardId::new(0), transport(0, 1), current)
-            .unwrap();
+        reg.commit_candidate(
+            participant,
+            room,
+            ShardId::new(0),
+            transport(0, 1),
+            current,
+            ConnectionProfile::Native,
+        )
+        .unwrap();
 
         let _failed_candidate = (connection_id(2), transport(0, 2));
 
@@ -374,10 +393,24 @@ mod tests {
         let older = connection_id(1);
         let newer = connection_id(2);
 
-        reg.commit_candidate(participant, room, ShardId::new(0), transport(0, 2), newer)
-            .unwrap();
+        reg.commit_candidate(
+            participant,
+            room,
+            ShardId::new(0),
+            transport(0, 2),
+            newer,
+            ConnectionProfile::Native,
+        )
+        .unwrap();
         assert_eq!(
-            reg.commit_candidate(participant, room, ShardId::new(0), transport(0, 1), older,),
+            reg.commit_candidate(
+                participant,
+                room,
+                ShardId::new(0),
+                transport(0, 1),
+                older,
+                ConnectionProfile::Native,
+            ),
             Err(CommitCandidateError::Superseded)
         );
 
@@ -394,10 +427,24 @@ mod tests {
         let participant = participant_id();
         let old = connection_id(1);
         let current = connection_id(2);
-        reg.commit_candidate(participant, room, ShardId::new(0), transport(0, 1), old)
-            .unwrap();
-        reg.commit_candidate(participant, room, ShardId::new(0), transport(0, 2), current)
-            .unwrap();
+        reg.commit_candidate(
+            participant,
+            room,
+            ShardId::new(0),
+            transport(0, 1),
+            old,
+            ConnectionProfile::Native,
+        )
+        .unwrap();
+        reg.commit_candidate(
+            participant,
+            room,
+            ShardId::new(0),
+            transport(0, 2),
+            current,
+            ConnectionProfile::Native,
+        )
+        .unwrap();
 
         // DELETE, close, transport failure, and expiry all converge on this
         // exact-incarnation operation in the controller.
@@ -423,6 +470,7 @@ mod tests {
                 ShardId::new(0),
                 transport(0, 1),
                 connection_id(1),
+                ConnectionProfile::Native,
             )
             .unwrap();
 

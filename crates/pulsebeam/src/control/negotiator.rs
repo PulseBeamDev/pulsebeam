@@ -156,14 +156,15 @@ impl Negotiator {
         let mut data_channel_count = 0usize;
 
         for m in &answer.media_lines {
+            if m.disabled {
+                continue;
+            }
             let kind = m.typ.to_string();
             let dir = m.direction();
             let media_type = kind.as_str().into();
 
             if (dir == Direction::SendRecv || dir == Direction::Inactive) && kind != "application" {
-                return Err(NegotiatorError::DirectionNotSupported(
-                    MediaType::Application,
-                ));
+                return Err(NegotiatorError::DirectionNotSupported(media_type));
             }
 
             match (media_type, dir) {
@@ -284,6 +285,23 @@ mod tests {
             .create_answer(chrome_like_offer(), IceCreds::new())
             .unwrap();
         answer.to_sdp_string()
+    }
+
+    #[test]
+    fn port_zero_rtp_sections_do_not_fail_direction_validation() {
+        let mut rtc = RtcConfig::new().build(std::time::Instant::now());
+        let mut change = rtc.sdp_api();
+        change.add_media(MediaKind::Audio, Direction::SendOnly, None, None, None);
+        change.add_media(MediaKind::Video, Direction::SendOnly, None, None, None);
+        let offer = change
+            .apply()
+            .unwrap()
+            .0
+            .to_sdp_string()
+            .replacen("m=video 9", "m=video 0", 1);
+        let offer = SdpOffer::from_sdp_string(&offer).unwrap();
+        let mut negotiator = Negotiator::new(Vec::new());
+        assert!(negotiator.create_answer(offer, IceCreds::new()).is_ok());
     }
 
     #[test]
