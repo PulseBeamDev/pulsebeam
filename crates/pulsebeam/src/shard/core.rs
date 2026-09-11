@@ -88,7 +88,7 @@ pub(crate) struct ShardExecution {
     pub(crate) shard_id: crate::id::ShardId,
     registry: ParticipantRegistry,
     pub(super) runtime: ShardRuntime,
-    plans: SecondaryMap<crate::keys::TrackKey, crate::shard::router::InstalledTrackPlan>,
+    plans: SecondaryMap<crate::keys::TrackHandle, crate::shard::router::InstalledTrackPlan>,
     timers: TimerWheel,
     dirty: DirtyTracker,
     udp_send_batch: GsoSendBatch,
@@ -258,7 +258,19 @@ impl ShardExecution {
         debug_assert!(op.is_owned_by(self.shard_id));
         match op {
             crate::shard_update::ShardUpdateOp::InstallRoute { address, action } => {
-                self.runtime.routes.install_action(*address, *action);
+                let Some(handle) = self.runtime.track_handle(action.track_id()) else {
+                    debug_assert!(false, "a route must target a live shard track");
+                    return;
+                };
+                let action = match action {
+                    crate::shard_update::TrackRouteAction::Forward { .. } => {
+                        crate::route::RouteAction::Forward { target: handle }
+                    }
+                    crate::shard_update::TrackRouteAction::Reverse { .. } => {
+                        crate::route::RouteAction::Reverse { target: handle }
+                    }
+                };
+                self.runtime.routes.install_action(*address, action);
             }
             crate::shard_update::ShardUpdateOp::RetireRoute { address } => {
                 let _ = self.runtime.routes.retire(*address);
@@ -273,15 +285,16 @@ impl ShardExecution {
                 }
                 let _ = self.registry.remove(*address);
             }
-            crate::shard_update::ShardUpdateOp::InsertTrackRuntime { key, runtime } => {
+            crate::shard_update::ShardUpdateOp::InsertTrackRuntime { track_id, runtime } => {
                 let descriptor = runtime.descriptor.as_ref();
                 let origin =
                     descriptor.and_then(|descriptor| self.registry.resolve(&descriptor.origin));
                 let publisher = runtime
                     .publisher
                     .and_then(|publisher| self.registry.resolve(&publisher));
-                self.runtime
-                    .install_track(*key, descriptor, origin, publisher);
+                let track_handle = self
+                    .runtime
+                    .install_track(*track_id, descriptor, origin, publisher);
                 if let (Some(publisher), Some(effect)) =
                     (runtime.publisher, runtime.publisher_effect.as_ref())
                 {
@@ -297,11 +310,11 @@ impl ShardExecution {
                         debug_assert!(false, "a resolved participant handle must be live");
                         return;
                     };
-                    meta.apply(effect.clone());
+                    meta.apply(effect.clone(), Some(track_handle));
                 }
             }
-            crate::shard_update::ShardUpdateOp::RemoveTrackRuntime { key } => {
-                self.runtime.retire_track(*key);
+            crate::shard_update::ShardUpdateOp::RemoveTrackRuntime { track_id } => {
+                self.runtime.retire_track(*track_id);
             }
         }
     }
@@ -311,18 +324,27 @@ impl ShardExecution {
         participant: crate::entity::ParticipantId,
         effect: crate::participant::ParticipantEffect,
     ) -> bool {
+        let track_id = effect.track_id();
+        let track_handle = track_id.and_then(|track_id| self.runtime.track_handle(track_id));
+        if track_id.is_some() && track_handle.is_none() {
+            return false;
+        }
         let Some(handle) = self.registry.resolve(&participant) else {
             return false;
         };
         let Some(meta) = self.registry.resolve_mut(handle) else {
             return false;
         };
-        meta.apply(effect);
+        meta.apply(effect, track_handle);
         self.dirty.mark(handle, meta);
         true
     }
 
     pub(super) fn apply_plan(&mut self, operation: &crate::shard_update::TrackPlanUpdate) -> usize {
+        let Some(track_handle) = self.runtime.track_handle(operation.track_id) else {
+            debug_assert!(false, "a track plan must target a live shard track");
+            return 0;
+        };
         match &operation.plan {
             Some(plan) => {
                 debug_assert!(plan.is_valid());
@@ -339,7 +361,7 @@ impl ShardExecution {
                     })
                     .collect();
                 self.plans.insert(
-                    operation.key,
+                    track_handle,
                     crate::shard::router::InstalledTrackPlan {
                         local,
                         remote: plan.remote.clone(),
@@ -352,8 +374,8 @@ impl ShardExecution {
                     .saturating_add(usize::from(plan.reverse_route.is_some()))
             }
             None => {
-                debug_assert!(self.plans.contains_key(operation.key));
-                usize::from(self.plans.remove(operation.key).is_some())
+                debug_assert!(self.plans.contains_key(track_handle));
+                usize::from(self.plans.remove(track_handle).is_some())
             }
         }
     }
@@ -386,12 +408,15 @@ impl ShardExecution {
             debug_assert!(false, "a media envelope must resolve to a forward route");
             return;
         };
+        if self.runtime.track_id(key) != Some(payload.track_id) {
+            record_routing_drop("packet", "identity", "remote");
+            return;
+        }
         let Some(plan) = self.plans.get(key) else {
             record_routing_drop("packet", "plan", "remote");
             return;
         };
         let mut payload = payload;
-        payload.key = key;
         payload.set_remote_timing(self.wall.to_instant(playout), now);
         let mut ctx = crate::shard::router::ForwardingContext {
             registry: &mut self.registry,
@@ -400,7 +425,7 @@ impl ShardExecution {
             router,
         };
         self.runtime
-            .route_packet_with_plan(key, Origin::Remote, payload, plan, &mut ctx);
+            .route_packet_with_plan(key, Origin::Remote, payload.packet, plan, &mut ctx);
     }
 
     #[cfg(test)]
@@ -476,12 +501,11 @@ impl ShardExecution {
         let plans = &self.plans;
         let mut processed = 0;
         while processed < budget {
-            let Some(packet) = self.pipeline.pop_packet() else {
+            let Some((track_handle, packet)) = self.pipeline.pop_packet() else {
                 break;
             };
             processed = processed.saturating_add(1);
-            let key = packet.key;
-            let Some(plan) = plans.get(key) else {
+            let Some(plan) = plans.get(track_handle) else {
                 record_routing_drop("packet", "plan", "local");
                 continue;
             };
@@ -491,8 +515,13 @@ impl ShardExecution {
                 wall: &self.wall,
                 router,
             };
-            self.runtime
-                .route_packet_with_plan(key, Origin::Local, packet, plan, &mut ctx);
+            self.runtime.route_packet_with_plan(
+                track_handle,
+                Origin::Local,
+                packet,
+                plan,
+                &mut ctx,
+            );
         }
         processed
     }
@@ -736,9 +765,9 @@ impl ShardExecution {
                 continue;
             };
             participant.queued_dirty = false;
-            let who = crate::shard::events::SinkIdentity {
-                id: participant.participant_id,
-                key,
+            let who = crate::shard::events::ParticipantBinding {
+                participant_id: participant.participant_id,
+                handle: key,
                 room_id: participant.room_id,
             };
             let mut sink = self.pipeline.participant_sink(who);
@@ -897,19 +926,26 @@ mod wrong_owner_tests {
             WallAnchor::new(std::time::SystemTime::UNIX_EPOCH, Instant::now()),
             update_rx,
         );
-        let mut track_keys = slotmap::SlotMap::<crate::keys::TrackKey, ()>::with_key();
-        let track = track_keys.insert(());
+        let track_id = crate::entity::ParticipantId::new()
+            .derive_track_id(crate::entity::TrackKind::Audio, "consistent");
         let route = crate::route::NodeRouteAddress::new(crate::route::RouteId::new(shard, 7), 1);
 
         writer.stage(
             1,
+            crate::shard_update::ShardUpdateOp::InsertTrackRuntime {
+                track_id,
+                runtime: crate::shard_update::TrackRuntime::default(),
+            },
+        );
+        writer.stage(
+            1,
             crate::shard_update::ShardUpdateOp::InstallRoute {
                 address: route,
-                action: crate::route::RouteAction::Forward { target: track },
+                action: crate::shard_update::TrackRouteAction::Forward { track_id },
             },
         );
         let plans = vec![crate::shard_update::TrackPlanUpdate {
-            key: track,
+            track_id,
             plan: Some(crate::shard_update::TrackPlan::default()),
         }];
         writer.stage_plans(1, plans);
@@ -918,7 +954,8 @@ mod wrong_owner_tests {
         assert_eq!(core.apply_updates(1), 1);
         assert!(core.execution.runtime.routes.resolve(route).is_some());
         let plans = &core.execution.plans;
-        assert!(plans.get(track).is_some());
+        let track_handle = core.execution.runtime.track_handle(track_id).unwrap();
+        assert!(plans.get(track_handle).is_some());
     }
 
     #[tokio::test(start_paused = true)]
@@ -933,10 +970,25 @@ mod wrong_owner_tests {
             update_rx,
         );
         let route = crate::route::NodeRouteAddress::new(crate::route::RouteId::new(shard, 8), 1);
-        let mut track_keys = slotmap::SlotMap::<crate::keys::TrackKey, ()>::with_key();
-        let plans = (0..=crate::shard::worker::SHARD_PLAN_OPERATION_BUDGET)
-            .map(|_| crate::shard_update::TrackPlanUpdate {
-                key: track_keys.insert(()),
+        let participant = crate::entity::ParticipantId::new();
+        let track_ids = (0..=crate::shard::worker::SHARD_PLAN_OPERATION_BUDGET)
+            .map(|index| {
+                participant.derive_track_id(crate::entity::TrackKind::Audio, &index.to_string())
+            })
+            .collect::<Vec<_>>();
+        for track_id in &track_ids {
+            writer.stage(
+                1,
+                crate::shard_update::ShardUpdateOp::InsertTrackRuntime {
+                    track_id: *track_id,
+                    runtime: crate::shard_update::TrackRuntime::default(),
+                },
+            );
+        }
+        let plans = track_ids
+            .iter()
+            .map(|track_id| crate::shard_update::TrackPlanUpdate {
+                track_id: *track_id,
                 plan: Some(crate::shard_update::TrackPlan::default()),
             })
             .collect();
@@ -945,8 +997,8 @@ mod wrong_owner_tests {
             1,
             crate::shard_update::ShardUpdateOp::InstallRoute {
                 address: route,
-                action: crate::route::RouteAction::Forward {
-                    target: track_keys.insert(()),
+                action: crate::shard_update::TrackRouteAction::Forward {
+                    track_id: track_ids[0],
                 },
             },
         );

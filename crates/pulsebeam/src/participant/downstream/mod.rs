@@ -8,7 +8,7 @@ use crate::entity::AudioOrigin;
 use crate::entity::ParticipantId;
 use crate::entity::TrackId;
 use crate::entity::TrackKind;
-use crate::keys::TrackKey;
+use crate::keys::TrackHandle;
 use crate::log::LogCtx;
 use crate::participant::downstream::video::START_BANDWIDTH;
 use crate::participant::event::ParticipantSink;
@@ -221,7 +221,7 @@ pub struct Downstream {
     pub video: DownstreamVideo,
     pub(crate) audio: DownstreamAudio,
     pub(crate) data: DownstreamData,
-    catalog: SecondaryMap<TrackKey, TrackCatalogEntry>,
+    catalog: SecondaryMap<TrackHandle, TrackCatalogEntry>,
     /// Audio publications in the room, whether or not anyone is hearing them.
     ///
     /// The allocator claims slots dynamically and needs no registration to do
@@ -270,7 +270,7 @@ impl Downstream {
 
     pub(crate) fn add_track_candidate(
         &mut self,
-        key: TrackKey,
+        key: TrackHandle,
         track: &Track,
         channels: &[(str0m::channel::ChannelId, crate::track::DataTopicChannel)],
     ) -> bool {
@@ -284,17 +284,17 @@ impl Downstream {
             return false;
         }
         let previous = self.catalog.insert(key, entry);
-        debug_assert!(previous.is_none(), "a TrackKey must be installed once");
+        debug_assert!(previous.is_none(), "a TrackHandle must be installed once");
         self.data.add_candidate(key, track, channels);
         true
     }
 
-    pub(crate) fn remove_track_candidate(&mut self, key: TrackKey) -> Option<TrackCatalogEntry> {
+    pub(crate) fn remove_track_candidate(&mut self, key: TrackHandle) -> Option<TrackCatalogEntry> {
         self.data.remove_candidate(key);
         self.catalog.remove(key)
     }
 
-    pub(crate) fn track_candidate(&self, key: TrackKey) -> Option<TrackCatalogEntry> {
+    pub(crate) fn track_candidate(&self, key: TrackHandle) -> Option<TrackCatalogEntry> {
         self.catalog.get(key).copied()
     }
 
@@ -350,7 +350,7 @@ impl Downstream {
         }
     }
 
-    pub(crate) fn install_track(&mut self, key: TrackKey, track: Track) {
+    pub(crate) fn install_track(&mut self, key: TrackHandle, track: Track) {
         if track.kind() == TrackKind::Video {
             self.video.install_track(key, track);
             self.dirty_allocation = true;
@@ -362,13 +362,13 @@ impl Downstream {
         self.audio_tracks.insert(id, track.meta().clone());
     }
 
-    pub(crate) fn activate_track_binding(&mut self, key: TrackKey, track_id: TrackId) {
+    pub(crate) fn activate_track_binding(&mut self, key: TrackHandle, track_id: TrackId) {
         if track_id.kind() == TrackKind::Video {
             self.video.activate_track_binding(key, track_id);
         }
     }
 
-    pub(crate) fn deactivate_track_binding(&mut self, key: TrackKey, track_id: TrackId) {
+    pub(crate) fn deactivate_track_binding(&mut self, key: TrackHandle, track_id: TrackId) {
         if track_id.kind() == TrackKind::Video {
             self.video.deactivate_track_binding(key, track_id);
         }
@@ -548,12 +548,12 @@ impl Downstream {
 
     pub fn on_forward_rtp(
         &mut self,
-        track_key: TrackKey,
+        track_handle: TrackHandle,
         arrival_ts: Instant,
         cache: Option<&crate::rtp::cache::TrackStreamCache>,
         writer: &mut StreamWriter,
     ) -> bool {
-        self.video.on_rtp(track_key, arrival_ts, cache, writer)
+        self.video.on_rtp(track_handle, arrival_ts, cache, writer)
     }
 
     /// Forward an audio packet through the per-subscriber slot gate.
@@ -580,7 +580,7 @@ impl Downstream {
     pub fn handle_keyframe_request(
         &mut self,
         req: KeyframeRequest,
-    ) -> Option<(TrackKey, &TrackLayer)> {
+    ) -> Option<(TrackHandle, &TrackLayer)> {
         self.video.handle_keyframe_request(req)
     }
 }

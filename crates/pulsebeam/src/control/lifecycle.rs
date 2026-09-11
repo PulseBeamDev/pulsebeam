@@ -5,14 +5,15 @@ use tokio::time::Instant;
 use crate::{
     control::{
         registry::RoomRegistry,
-        topology::{TrackAllocation, TrackAllocator, TrackIdentity, TrackTopology},
+        topology::{TrackAncestry, TrackPlacement, TrackPlacementAllocator, TrackTopology},
     },
     entity::{ParticipantId, RoomId, TrackId},
     id::ShardId,
-    keys::TrackKey,
     participant::ParticipantEffect,
-    route::{NodeRouteAddress, RouteAction},
-    shard_update::{ShardUpdateOp, TrackDescriptor, TrackPlan, TrackPlanUpdate, TrackRuntime},
+    route::NodeRouteAddress,
+    shard_update::{
+        ShardUpdateOp, TrackDescriptor, TrackPlan, TrackPlanUpdate, TrackRouteAction, TrackRuntime,
+    },
     track::{SelectionPolicy, Track, TrackSelector},
 };
 
@@ -54,24 +55,23 @@ struct BoundParticipantLocation {
     participant: ParticipantId,
 }
 
-/// Shard-local allocation held for one track.
+/// Routable placement held for one track on one shard.
 ///
-/// Candidate shards reserve an allocation before they become active so participant
-/// effects can refer to a stable shard-local TrackKey. `resident` means the shard
-/// currently has the track runtime/plan installed. `route_installed` tracks the
-/// route table separately because an origin shard only needs a route for tracks
-/// with a reverse path.
+/// Candidate shards reserve a placement before they become active. `resident`
+/// means the shard currently has the track runtime/plan installed.
+/// `route_installed` tracks the route table separately because an origin shard
+/// only needs a route for tracks with a reverse path.
 #[derive(Debug, Clone, Copy)]
 struct TrackDestination {
-    allocation: TrackAllocation,
+    placement: TrackPlacement,
     resident: bool,
     route_installed: bool,
 }
 
 impl TrackDestination {
-    fn reserved(allocation: TrackAllocation) -> Self {
+    fn reserved(placement: TrackPlacement) -> Self {
         Self {
-            allocation,
+            placement,
             resident: false,
             route_installed: false,
         }
@@ -124,8 +124,8 @@ impl TrackLifecycleStager {
         }
     }
 
-    fn plan(&mut self, shard: ShardId, key: TrackKey, plan: Option<TrackPlan>) {
-        self.plans(shard, vec![TrackPlanUpdate { key, plan }]);
+    fn plan(&mut self, shard: ShardId, track_id: TrackId, plan: Option<TrackPlan>) {
+        self.plans(shard, vec![TrackPlanUpdate { track_id, plan }]);
     }
 
     fn participant(
@@ -211,7 +211,7 @@ struct RuntimePlan<'a> {
     shard: ShardId,
     origin: ParticipantId,
     track: &'a Track,
-    key: TrackKey,
+    track_id: TrackId,
     local: Vec<ParticipantId>,
     remote: Vec<NodeRouteAddress>,
     reverse: Option<NodeRouteAddress>,
@@ -219,10 +219,10 @@ struct RuntimePlan<'a> {
 
 pub(crate) struct TrackLifecycle {
     topology: TrackTopology,
-    allocator: TrackAllocator,
-    allocations: HashMap<(TrackIdentity, ShardId), TrackDestination>,
-    candidates: HashMap<TrackIdentity, HashSet<ParticipantId>>,
-    bindings: HashMap<TrackIdentity, HashSet<ParticipantId>>,
+    allocator: TrackPlacementAllocator,
+    placements: HashMap<(TrackAncestry, ShardId), TrackDestination>,
+    candidates: HashMap<TrackAncestry, HashSet<ParticipantId>>,
+    bindings: HashMap<TrackAncestry, HashSet<ParticipantId>>,
     generation: u64,
 }
 
@@ -230,8 +230,8 @@ impl TrackLifecycle {
     pub(crate) fn new(shard_count: usize) -> Self {
         Self {
             topology: TrackTopology::default(),
-            allocator: TrackAllocator::new(shard_count),
-            allocations: HashMap::new(),
+            allocator: TrackPlacementAllocator::new(shard_count),
+            placements: HashMap::new(),
             candidates: HashMap::new(),
             bindings: HashMap::new(),
             generation: 0,
@@ -268,10 +268,10 @@ impl TrackLifecycle {
         now: Instant,
     ) -> Option<TrackLifecycleOutcome> {
         let room_id = ParticipantLocation::lookup(registry, &origin)?.room_id;
-        let identity = TrackIdentity {
+        let identity = TrackAncestry {
             room_id,
             publisher: origin,
-            id: track_id,
+            track_id,
         };
 
         if !self.topology.contains(identity) {
@@ -287,7 +287,7 @@ impl TrackLifecycle {
             "published track disappeared during unpublish"
         );
 
-        self.release_allocations(identity, now);
+        self.release_placements(identity, now);
         Some(stager.finish())
     }
 
@@ -300,10 +300,10 @@ impl TrackLifecycle {
         registry: &RoomRegistry,
         now: Instant,
     ) -> TrackLifecycleOutcome {
-        let identity = TrackIdentity {
+        let identity = TrackAncestry {
             room_id,
             publisher,
-            id: track_id,
+            track_id,
         };
         let _ = self.topology.activate(identity, subscriber);
         self.reconcile(identity, registry, now)
@@ -318,10 +318,10 @@ impl TrackLifecycle {
         registry: &RoomRegistry,
         now: Instant,
     ) -> TrackLifecycleOutcome {
-        let identity = TrackIdentity {
+        let identity = TrackAncestry {
             room_id,
             publisher,
-            id: track_id,
+            track_id,
         };
         let _ = self.topology.deactivate(identity, subscriber);
         self.reconcile(identity, registry, now)
@@ -424,7 +424,7 @@ impl TrackLifecycle {
                 !self.topology.contains(identity),
                 "participant removal must remove every published track"
             );
-            self.release_allocations(identity, now);
+            self.release_placements(identity, now);
         }
 
         affected.retain(|identity| self.topology.contains(*identity));
@@ -434,7 +434,7 @@ impl TrackLifecycle {
 
     fn reconcile_all(
         &mut self,
-        identities: impl IntoIterator<Item = TrackIdentity>,
+        identities: impl IntoIterator<Item = TrackAncestry>,
         registry: &RoomRegistry,
         now: Instant,
     ) -> Vec<TrackLifecycleOutcome> {
@@ -446,7 +446,7 @@ impl TrackLifecycle {
 
     fn reconcile(
         &mut self,
-        identity: TrackIdentity,
+        identity: TrackAncestry,
         registry: &RoomRegistry,
         now: Instant,
     ) -> TrackLifecycleOutcome {
@@ -454,7 +454,7 @@ impl TrackLifecycle {
         let mut desired = self.desired_state(identity, registry);
 
         let origin = self.ensure_destination(identity, desired.origin.shard, now);
-        self.ensure_reverse_route(identity, &mut desired.track, origin.allocation.route);
+        self.ensure_reverse_route(identity, &mut desired.track, origin.placement.route);
         self.reserve_candidate_destinations(identity, &desired, now);
 
         self.stage_participant_transitions(identity, &desired, registry, &mut stager);
@@ -471,7 +471,7 @@ impl TrackLifecycle {
         clippy::expect_used,
         reason = "reconciliation only runs for a published track whose publisher remains bound"
     )]
-    fn desired_state(&self, identity: TrackIdentity, registry: &RoomRegistry) -> DesiredTrackState {
+    fn desired_state(&self, identity: TrackAncestry, registry: &RoomRegistry) -> DesiredTrackState {
         let track = self
             .topology
             .track(identity)
@@ -511,20 +511,20 @@ impl TrackLifecycle {
 
     fn ensure_destination(
         &mut self,
-        identity: TrackIdentity,
+        identity: TrackAncestry,
         shard: ShardId,
         now: Instant,
     ) -> TrackDestination {
-        if let Some(destination) = self.allocations.get(&(identity, shard)).copied() {
+        if let Some(destination) = self.placements.get(&(identity, shard)).copied() {
             return destination;
         }
 
-        // Track allocation is an internal capacity invariant. Supported shard
-        // capacity must be lower than the route/key space, so exhaustion is not
-        // a recoverable lifecycle state and is asserted inside TrackAllocator.
-        let allocation = self.allocator.allocate(shard, identity, now);
-        let destination = TrackDestination::reserved(allocation);
-        self.allocations.insert((identity, shard), destination);
+        // Track placement is an internal capacity invariant. Supported shard
+        // capacity must be lower than the route space, so exhaustion is not
+        // a recoverable lifecycle state and is asserted inside TrackPlacementAllocator.
+        let placement = self.allocator.allocate(shard, identity, now);
+        let destination = TrackDestination::reserved(placement);
+        self.placements.insert((identity, shard), destination);
         destination
     }
 
@@ -534,7 +534,7 @@ impl TrackLifecycle {
     )]
     fn ensure_reverse_route(
         &mut self,
-        identity: TrackIdentity,
+        identity: TrackAncestry,
         desired_track: &mut Track,
         route: NodeRouteAddress,
     ) {
@@ -551,7 +551,7 @@ impl TrackLifecycle {
 
     fn reserve_candidate_destinations(
         &mut self,
-        identity: TrackIdentity,
+        identity: TrackAncestry,
         desired: &DesiredTrackState,
         now: Instant,
     ) {
@@ -562,7 +562,7 @@ impl TrackLifecycle {
 
     fn stage_participant_transitions(
         &self,
-        identity: TrackIdentity,
+        identity: TrackAncestry,
         desired: &DesiredTrackState,
         registry: &RoomRegistry,
         stager: &mut TrackLifecycleStager,
@@ -578,12 +578,15 @@ impl TrackLifecycle {
             .collect::<Vec<_>>();
         removed_bindings.sort();
         for participant in removed_bindings {
-            self.stage_track_effect(identity, participant, registry, stager, |key| {
+            self.stage_track_effect(
+                identity,
+                participant,
+                registry,
+                stager,
                 ParticipantEffect::TrackUnsubscribed {
-                    key,
-                    track_id: identity.id,
-                }
-            });
+                    track_id: identity.track_id,
+                },
+            );
         }
 
         let mut removed_candidates = previous_candidates
@@ -592,12 +595,15 @@ impl TrackLifecycle {
             .collect::<Vec<_>>();
         removed_candidates.sort();
         for participant in removed_candidates {
-            self.stage_track_effect(identity, participant, registry, stager, |key| {
+            self.stage_track_effect(
+                identity,
+                participant,
+                registry,
+                stager,
                 ParticipantEffect::TrackCandidateRemoved {
-                    key,
-                    track_id: identity.id,
-                }
-            });
+                    track_id: identity.track_id,
+                },
+            );
         }
 
         // Establish candidate state before activating it.
@@ -608,12 +614,15 @@ impl TrackLifecycle {
             .collect::<Vec<_>>();
         added_candidates.sort();
         for participant in added_candidates {
-            self.stage_track_effect(identity, participant, registry, stager, |key| {
+            self.stage_track_effect(
+                identity,
+                participant,
+                registry,
+                stager,
                 ParticipantEffect::TrackCandidateAdded {
-                    key,
                     track: desired.track.clone(),
-                }
-            });
+                },
+            );
         }
 
         let mut added_bindings = desired
@@ -624,18 +633,21 @@ impl TrackLifecycle {
         added_bindings.sort();
         for participant in added_bindings {
             debug_assert!(desired.candidates.contains(&participant));
-            self.stage_track_effect(identity, participant, registry, stager, |key| {
+            self.stage_track_effect(
+                identity,
+                participant,
+                registry,
+                stager,
                 ParticipantEffect::TrackSubscribed {
-                    key,
-                    track_id: identity.id,
-                }
-            });
+                    track_id: identity.track_id,
+                },
+            );
         }
     }
 
     fn reconcile_remote_residency(
         &mut self,
-        identity: TrackIdentity,
+        identity: TrackAncestry,
         desired: &DesiredTrackState,
         stager: &mut TrackLifecycleStager,
     ) {
@@ -650,9 +662,9 @@ impl TrackLifecycle {
                     stager.update(
                         shard,
                         ShardUpdateOp::InstallRoute {
-                            address: destination.allocation.route,
-                            action: RouteAction::Forward {
-                                target: destination.allocation.key,
+                            address: destination.placement.route,
+                            action: TrackRouteAction::Forward {
+                                track_id: destination.placement.track_id,
                             },
                         },
                     );
@@ -675,19 +687,19 @@ impl TrackLifecycle {
 
     #[allow(
         clippy::expect_used,
-        reason = "active views are staged only after their origin and remote allocations are reserved"
+        reason = "active views are staged only after their origin and remote placements are reserved"
     )]
     fn stage_active_views(
         &mut self,
-        identity: TrackIdentity,
+        identity: TrackAncestry,
         desired: &DesiredTrackState,
         stager: &mut TrackLifecycleStager,
     ) {
         let origin = self
-            .allocations
+            .placements
             .get(&(identity, desired.origin.shard))
             .copied()
-            .expect("origin allocation must exist before staging its track view");
+            .expect("origin placement must exist before staging its track view");
         let origin_was_resident = origin.resident;
 
         if desired.track.requires_reverse_route() {
@@ -695,9 +707,9 @@ impl TrackLifecycle {
                 stager.update(
                     desired.origin.shard,
                     ShardUpdateOp::InstallRoute {
-                        address: origin.allocation.route,
-                        action: RouteAction::Reverse {
-                            target: origin.allocation.key,
+                        address: origin.placement.route,
+                        action: TrackRouteAction::Reverse {
+                            track_id: origin.placement.track_id,
                         },
                     },
                 );
@@ -714,10 +726,10 @@ impl TrackLifecycle {
             .active_remote_shards()
             .into_iter()
             .map(|shard| {
-                self.allocations
+                self.placements
                     .get(&(identity, shard))
-                    .expect("active remote shard must have a reserved allocation")
-                    .allocation
+                    .expect("active remote shard must have a reserved placement")
+                    .placement
                     .route
             })
             .collect();
@@ -728,7 +740,7 @@ impl TrackLifecycle {
                 shard: desired.origin.shard,
                 origin: desired.origin.participant,
                 track: &desired.track,
-                key: origin.allocation.key,
+                track_id: origin.placement.track_id,
                 local: desired.local_bindings(desired.origin.shard),
                 remote,
                 reverse: desired.track.reverse(),
@@ -741,18 +753,17 @@ impl TrackLifecycle {
                 desired.origin.shard,
                 desired.origin.participant,
                 ParticipantEffect::TrackPublished {
-                    key: origin.allocation.key,
-                    track_id: identity.id,
+                    track_id: identity.track_id,
                 },
             );
         }
 
         for shard in desired.active_remote_shards() {
             let destination = self
-                .allocations
+                .placements
                 .get(&(identity, shard))
                 .copied()
-                .expect("active remote shard must have a reserved allocation");
+                .expect("active remote shard must have a reserved placement");
             debug_assert!(destination.route_installed);
 
             self.stage_runtime_and_plan(
@@ -761,7 +772,7 @@ impl TrackLifecycle {
                     shard,
                     origin: desired.origin.participant,
                     track: &desired.track,
-                    key: destination.allocation.key,
+                    track_id: destination.placement.track_id,
                     local: desired.local_bindings(shard),
                     remote: Vec::new(),
                     reverse: desired.track.reverse(),
@@ -775,7 +786,7 @@ impl TrackLifecycle {
         stager.update(
             runtime.shard,
             ShardUpdateOp::InsertTrackRuntime {
-                key: runtime.key,
+                track_id: runtime.track_id,
                 runtime: TrackRuntime {
                     descriptor: Some(TrackDescriptor {
                         origin: runtime.origin,
@@ -797,7 +808,7 @@ impl TrackLifecycle {
         stager.update(runtime.shard, ShardUpdateOp::Placeholder);
         stager.plan(
             runtime.shard,
-            runtime.key,
+            runtime.track_id,
             Some(TrackPlan::new(
                 runtime.local,
                 runtime.remote,
@@ -815,19 +826,19 @@ impl TrackLifecycle {
         debug_assert!(destination.resident);
 
         // Stop publishing the view before retiring anything it references.
-        stager.plan(shard, destination.allocation.key, None);
+        stager.plan(shard, destination.placement.track_id, None);
         if destination.route_installed {
             stager.update(
                 shard,
                 ShardUpdateOp::RetireRoute {
-                    address: destination.allocation.route,
+                    address: destination.placement.route,
                 },
             );
         }
         stager.update(
             shard,
             ShardUpdateOp::RemoveTrackRuntime {
-                key: destination.allocation.key,
+                track_id: destination.placement.track_id,
             },
         );
     }
@@ -838,11 +849,11 @@ impl TrackLifecycle {
     )]
     fn stage_track_effect(
         &self,
-        identity: TrackIdentity,
+        identity: TrackAncestry,
         participant: ParticipantId,
         registry: &RoomRegistry,
         stager: &mut TrackLifecycleStager,
-        effect: impl FnOnce(TrackKey) -> ParticipantEffect,
+        effect: ParticipantEffect,
     ) {
         let Some(location) = ParticipantLocation::lookup(registry, &participant) else {
             // The participant may already have been removed from the registry;
@@ -852,21 +863,20 @@ impl TrackLifecycle {
         if !location.materialized {
             return;
         }
-        let destination = self
-            .allocations
-            .get(&(identity, location.shard))
-            .expect("a live lifecycle participant must have a shard-local track allocation");
+        if !self.placements.contains_key(&(identity, location.shard)) {
+            debug_assert!(
+                false,
+                "a live lifecycle participant must have a track placement"
+            );
+            return;
+        }
 
-        stager.participant(
-            location.shard,
-            participant,
-            effect(destination.allocation.key),
-        );
+        stager.participant(location.shard, participant, effect);
     }
 
     fn stage_track_removal(
         &mut self,
-        identity: TrackIdentity,
+        identity: TrackAncestry,
         registry: &RoomRegistry,
         stager: &mut TrackLifecycleStager,
     ) {
@@ -876,50 +886,55 @@ impl TrackLifecycle {
         let mut bindings = bindings.into_iter().collect::<Vec<_>>();
         bindings.sort();
         for participant in bindings {
-            self.stage_track_effect(identity, participant, registry, stager, |key| {
+            self.stage_track_effect(
+                identity,
+                participant,
+                registry,
+                stager,
                 ParticipantEffect::TrackUnsubscribed {
-                    key,
-                    track_id: identity.id,
-                }
-            });
+                    track_id: identity.track_id,
+                },
+            );
         }
 
         let mut candidates = candidates.into_iter().collect::<Vec<_>>();
         candidates.sort();
         for participant in candidates {
-            self.stage_track_effect(identity, participant, registry, stager, |key| {
+            self.stage_track_effect(
+                identity,
+                participant,
+                registry,
+                stager,
                 ParticipantEffect::TrackCandidateRemoved {
-                    key,
-                    track_id: identity.id,
-                }
-            });
+                    track_id: identity.track_id,
+                },
+            );
         }
 
         if let Some(origin) = ParticipantLocation::lookup(registry, &identity.publisher)
             && origin.materialized
-            && let Some(destination) = self.allocations.get(&(identity, origin.shard))
+            && let Some(destination) = self.placements.get(&(identity, origin.shard))
             && destination.resident
         {
             stager.participant(
                 origin.shard,
                 identity.publisher,
                 ParticipantEffect::TrackUnpublished {
-                    key: destination.allocation.key,
-                    track_id: identity.id,
+                    track_id: identity.track_id,
                 },
             );
         }
 
-        let mut allocations = self
-            .allocations
+        let mut placements = self
+            .placements
             .iter()
             .filter_map(|((held, shard), destination)| {
                 (*held == identity).then_some((*shard, *destination))
             })
             .collect::<Vec<_>>();
-        allocations.sort_by_key(|(shard, _)| shard.index());
+        placements.sort_by_key(|(shard, _)| shard.index());
 
-        for (shard, destination) in allocations {
+        for (shard, destination) in placements {
             if destination.resident {
                 self.stage_shard_withdrawal(shard, destination, stager);
             } else {
@@ -933,7 +948,7 @@ impl TrackLifecycle {
 
     fn release_unused_destinations(
         &mut self,
-        identity: TrackIdentity,
+        identity: TrackAncestry,
         desired: &DesiredTrackState,
         now: Instant,
     ) {
@@ -947,21 +962,21 @@ impl TrackLifecycle {
         for (shard, destination) in unused {
             debug_assert!(!destination.resident);
             debug_assert!(!destination.route_installed);
-            let removed = self.allocations.remove(&(identity, shard));
+            let removed = self.placements.remove(&(identity, shard));
             debug_assert!(removed.is_some());
-            self.allocator.release(destination.allocation, now);
+            self.allocator.release(destination.placement, now);
         }
     }
 
-    fn release_allocations(&mut self, identity: TrackIdentity, now: Instant) {
-        let allocations = self
-            .allocations
+    fn release_placements(&mut self, identity: TrackAncestry, now: Instant) {
+        let placements = self
+            .placements
             .extract_if(|(held, _), _| *held == identity)
-            .map(|(_, destination)| destination.allocation)
+            .map(|(_, destination)| destination.placement)
             .collect::<Vec<_>>();
 
-        for allocation in allocations {
-            self.allocator.release(allocation, now);
+        for placement in placements {
+            self.allocator.release(placement, now);
         }
 
         self.candidates.remove(&identity);
@@ -970,11 +985,11 @@ impl TrackLifecycle {
 
     fn remote_destinations(
         &self,
-        identity: TrackIdentity,
+        identity: TrackAncestry,
         origin_shard: ShardId,
     ) -> Vec<(ShardId, TrackDestination)> {
         let mut destinations = self
-            .allocations
+            .placements
             .iter()
             .filter_map(|((held, shard), destination)| {
                 (*held == identity && *shard != origin_shard).then_some((*shard, *destination))
@@ -986,11 +1001,11 @@ impl TrackLifecycle {
 
     #[allow(
         clippy::expect_used,
-        reason = "route state is changed only for an allocation reserved by this lifecycle"
+        reason = "route state is changed only for a placement reserved by this lifecycle"
     )]
-    fn set_route_installed(&mut self, identity: TrackIdentity, shard: ShardId, installed: bool) {
+    fn set_route_installed(&mut self, identity: TrackAncestry, shard: ShardId, installed: bool) {
         let destination = self
-            .allocations
+            .placements
             .get_mut(&(identity, shard))
             .expect("track destination disappeared during reconciliation");
         destination.route_installed = installed;
@@ -998,11 +1013,11 @@ impl TrackLifecycle {
 
     #[allow(
         clippy::expect_used,
-        reason = "residency is changed only for an allocation reserved by this lifecycle"
+        reason = "residency is changed only for a placement reserved by this lifecycle"
     )]
-    fn set_resident(&mut self, identity: TrackIdentity, shard: ShardId, resident: bool) {
+    fn set_resident(&mut self, identity: TrackAncestry, shard: ShardId, resident: bool) {
         let destination = self
-            .allocations
+            .placements
             .get_mut(&(identity, shard))
             .expect("track destination disappeared during reconciliation");
         destination.resident = resident;
@@ -1010,17 +1025,17 @@ impl TrackLifecycle {
 
     #[allow(
         clippy::expect_used,
-        reason = "destination state is changed only for an allocation reserved by this lifecycle"
+        reason = "destination state is changed only for a placement reserved by this lifecycle"
     )]
     fn set_destination_state(
         &mut self,
-        identity: TrackIdentity,
+        identity: TrackAncestry,
         shard: ShardId,
         resident: bool,
         route_installed: bool,
     ) {
         let destination = self
-            .allocations
+            .placements
             .get_mut(&(identity, shard))
             .expect("track destination disappeared during reconciliation");
         destination.resident = resident;
@@ -1163,8 +1178,8 @@ mod tests {
                 }
                 TrackLifecycleOperation::Update { op, .. } => match op {
                     ShardUpdateOp::InstallRoute { action, .. } => match action {
-                        RouteAction::Forward { .. } => kinds.push(OpKind::InstallForward),
-                        RouteAction::Reverse { .. } => kinds.push(OpKind::InstallReverse),
+                        TrackRouteAction::Forward { .. } => kinds.push(OpKind::InstallForward),
+                        TrackRouteAction::Reverse { .. } => kinds.push(OpKind::InstallReverse),
                     },
                     ShardUpdateOp::RetireRoute { .. } => kinds.push(OpKind::RetireRoute),
                     ShardUpdateOp::InsertTrackRuntime { .. } => kinds.push(OpKind::InsertRuntime),
@@ -1209,8 +1224,8 @@ mod tests {
                 }
                 TrackLifecycleOperation::Update { shard: held, op } if *held == shard => match op {
                     ShardUpdateOp::InstallRoute { action, .. } => match action {
-                        RouteAction::Forward { .. } => kinds.push(OpKind::InstallForward),
-                        RouteAction::Reverse { .. } => kinds.push(OpKind::InstallReverse),
+                        TrackRouteAction::Forward { .. } => kinds.push(OpKind::InstallForward),
+                        TrackRouteAction::Reverse { .. } => kinds.push(OpKind::InstallReverse),
                     },
                     ShardUpdateOp::RetireRoute { .. } => kinds.push(OpKind::RetireRoute),
                     ShardUpdateOp::InsertTrackRuntime { .. } => kinds.push(OpKind::InsertRuntime),
@@ -1224,7 +1239,7 @@ mod tests {
         kinds
     }
 
-    fn plan_updates_on(outcome: &TrackLifecycleOutcome, shard: usize) -> Vec<(TrackKey, bool)> {
+    fn plan_updates_on(outcome: &TrackLifecycleOutcome, shard: usize) -> Vec<(TrackId, bool)> {
         let shard = ShardId::new(shard);
         outcome
             .operations
@@ -1233,7 +1248,7 @@ mod tests {
                 TrackLifecycleOperation::Plans { shard: held, plans } if *held == shard => Some(
                     plans
                         .iter()
-                        .map(|update| (update.key, update.plan.is_some())),
+                        .map(|update| (update.track_id, update.plan.is_some())),
                 ),
                 _ => None,
             })
@@ -1244,7 +1259,7 @@ mod tests {
     fn forward_install_on(
         outcome: &TrackLifecycleOutcome,
         shard: usize,
-    ) -> Option<(NodeRouteAddress, TrackKey)> {
+    ) -> Option<(NodeRouteAddress, TrackId)> {
         let shard = ShardId::new(shard);
         outcome
             .operations
@@ -1255,9 +1270,9 @@ mod tests {
                     op:
                         ShardUpdateOp::InstallRoute {
                             address,
-                            action: RouteAction::Forward { target },
+                            action: TrackRouteAction::Forward { track_id },
                         },
-                } if *held == shard => Some((*address, *target)),
+                } if *held == shard => Some((*address, *track_id)),
                 _ => None,
             })
     }
@@ -1265,7 +1280,7 @@ mod tests {
     fn reverse_install_on(
         outcome: &TrackLifecycleOutcome,
         shard: usize,
-    ) -> Option<(NodeRouteAddress, TrackKey)> {
+    ) -> Option<(NodeRouteAddress, TrackId)> {
         let shard = ShardId::new(shard);
         outcome
             .operations
@@ -1276,35 +1291,35 @@ mod tests {
                     op:
                         ShardUpdateOp::InstallRoute {
                             address,
-                            action: RouteAction::Reverse { target },
+                            action: TrackRouteAction::Reverse { track_id },
                         },
-                } if *held == shard => Some((*address, *target)),
+                } if *held == shard => Some((*address, *track_id)),
                 _ => None,
             })
     }
 
-    fn published_key(outcome: &TrackLifecycleOutcome) -> Option<TrackKey> {
+    fn published_track_id(outcome: &TrackLifecycleOutcome) -> Option<TrackId> {
         outcome
             .operations
             .iter()
             .find_map(|operation| match operation {
                 TrackLifecycleOperation::ParticipantEffect {
-                    effect: ParticipantEffect::TrackPublished { key, .. },
+                    effect: ParticipantEffect::TrackPublished { track_id },
                     ..
-                } => Some(*key),
+                } => Some(*track_id),
                 _ => None,
             })
     }
 
     fn destination(
         lifecycle: &TrackLifecycle,
-        identity: TrackIdentity,
+        identity: TrackAncestry,
         shard: usize,
     ) -> TrackDestination {
         *lifecycle
-            .allocations
+            .placements
             .get(&(identity, ShardId::new(shard)))
-            .expect("destination allocation must exist")
+            .expect("destination placement must exist")
     }
 
     fn assert_internal_invariants(lifecycle: &TrackLifecycle, registry: &RoomRegistry) {
@@ -1326,17 +1341,17 @@ mod tests {
                         .expect("retained candidate must remain bound in the track room");
                 assert!(
                     lifecycle
-                        .allocations
+                        .placements
                         .contains_key(&(*identity, location.shard)),
-                    "every retained candidate shard must have an allocation"
+                    "every retained candidate shard must have a placement"
                 );
             }
         }
 
-        for ((identity, shard), destination) in &lifecycle.allocations {
+        for ((identity, shard), destination) in &lifecycle.placements {
             assert!(
                 lifecycle.topology.contains(*identity),
-                "allocations must only be retained for published tracks"
+                "placements must only be retained for published tracks"
             );
             if destination.route_installed {
                 assert!(
@@ -1351,7 +1366,7 @@ mod tests {
                 let track = lifecycle
                     .topology
                     .track(*identity)
-                    .expect("allocation identity must still resolve to its track");
+                    .expect("placement identity must still resolve to its track");
                 assert_eq!(
                     destination.route_installed,
                     track.requires_reverse_route(),
@@ -1370,9 +1385,9 @@ mod tests {
                 ParticipantLocation::bound_in_room(registry, &identity.publisher, identity.room_id)
                     .expect("published track must retain a bound publisher");
             let destination = lifecycle
-                .allocations
+                .placements
                 .get(&(identity, origin.shard))
-                .expect("published track must retain its origin allocation");
+                .expect("published track must retain its origin placement");
             assert!(destination.resident, "origin runtime must remain resident");
         }
     }
@@ -1382,9 +1397,9 @@ mod tests {
         registry: &RoomRegistry,
         publisher: u8,
         room_seed: u8,
-    ) -> (TrackIdentity, TrackLifecycleOutcome) {
+    ) -> (TrackAncestry, TrackLifecycleOutcome) {
         let track = track(TrackKind::Audio, publisher, room_seed, "audio");
-        let identity = TrackIdentity::from_track(&track);
+        let identity = TrackAncestry::from_track(&track);
         let outcome = lifecycle
             .publish(track, registry, Instant::now())
             .expect("publication must be new");
@@ -1420,13 +1435,16 @@ mod tests {
         let (identity, outcome) = publish_audio(&mut lifecycle, &registry, 1, 1);
 
         assert_eq!(effect_kinds(&outcome), vec![EffectKind::Published]);
-        assert_eq!(lifecycle.allocations.len(), 1);
+        assert_eq!(lifecycle.placements.len(), 1);
         assert!(lifecycle.candidates[&identity].is_empty());
         assert!(lifecycle.bindings[&identity].is_empty());
 
         let origin = destination(&lifecycle, identity, 0);
         assert!(origin.resident);
-        assert_eq!(published_key(&outcome), Some(origin.allocation.key));
+        assert_eq!(
+            published_track_id(&outcome),
+            Some(origin.placement.track_id)
+        );
         assert!(operations_on(&outcome, 0).contains(&OpKind::InsertRuntime));
         assert!(operations_on(&outcome, 0).contains(&OpKind::PlanSet));
         assert_internal_invariants(&lifecycle, &registry);
@@ -1483,7 +1501,7 @@ mod tests {
         assert!(lifecycle.candidates[&identity].contains(&participant(2)));
         assert!(lifecycle.bindings[&identity].contains(&participant(2)));
         assert!(forward_install_on(&outcome, 0).is_none());
-        assert_eq!(lifecycle.allocations.len(), 1);
+        assert_eq!(lifecycle.placements.len(), 1);
         assert_internal_invariants(&lifecycle, &registry);
     }
 
@@ -1510,7 +1528,7 @@ mod tests {
         let activate = lifecycle.activate(
             room(1),
             participant(1),
-            identity.id,
+            identity.track_id,
             participant(2),
             &registry,
             Instant::now(),
@@ -1521,7 +1539,7 @@ mod tests {
         let deactivate = lifecycle.deactivate(
             room(1),
             participant(1),
-            identity.id,
+            identity.track_id,
             participant(2),
             &registry,
             Instant::now(),
@@ -1533,7 +1551,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_candidate_reserves_a_key_without_installing_a_route_or_runtime() {
+    fn remote_candidate_reserves_a_placement_without_installing_a_route_or_runtime() {
         let (mut lifecycle, registry) = setup(2, &[(1, 1, 0), (2, 1, 1)]);
         let (identity, _) = publish_audio(&mut lifecycle, &registry, 1, 1);
 
@@ -1555,7 +1573,7 @@ mod tests {
         assert!(!remote.route_installed);
         assert!(forward_install_on(&outcome, 1).is_none());
         assert!(!operations_on(&outcome, 1).contains(&OpKind::InsertRuntime));
-        assert_eq!(lifecycle.allocations.len(), 2);
+        assert_eq!(lifecycle.placements.len(), 2);
         assert_internal_invariants(&lifecycle, &registry);
     }
 
@@ -1575,7 +1593,7 @@ mod tests {
         let outcome = lifecycle.activate(
             room(1),
             participant(1),
-            identity.id,
+            identity.track_id,
             participant(2),
             &registry,
             Instant::now(),
@@ -1586,7 +1604,7 @@ mod tests {
         assert!(remote.route_installed);
         assert_eq!(
             forward_install_on(&outcome, 1),
-            Some((remote.allocation.route, remote.allocation.key))
+            Some((remote.placement.route, remote.placement.track_id))
         );
         assert_eq!(
             operations_on(&outcome, 1),
@@ -1600,13 +1618,13 @@ mod tests {
         );
         assert_eq!(
             plan_updates_on(&outcome, 1),
-            vec![(remote.allocation.key, true)]
+            vec![(remote.placement.track_id, true)]
         );
         assert_internal_invariants(&lifecycle, &registry);
     }
 
     #[test]
-    fn remote_deactivation_withdraws_view_but_keeps_candidate_allocation() {
+    fn remote_deactivation_withdraws_view_but_keeps_candidate_placement() {
         let (mut lifecycle, registry) = setup(2, &[(1, 1, 0), (2, 1, 1)]);
         let (identity, _) = publish_audio(&mut lifecycle, &registry, 1, 1);
         let _ = lifecycle.subscribe(
@@ -1620,24 +1638,24 @@ mod tests {
         let _ = lifecycle.activate(
             room(1),
             participant(1),
-            identity.id,
+            identity.track_id,
             participant(2),
             &registry,
             Instant::now(),
         );
-        let held = destination(&lifecycle, identity, 1).allocation;
+        let held = destination(&lifecycle, identity, 1).placement;
 
         let outcome = lifecycle.deactivate(
             room(1),
             participant(1),
-            identity.id,
+            identity.track_id,
             participant(2),
             &registry,
             Instant::now(),
         );
 
         let remote = destination(&lifecycle, identity, 1);
-        assert_eq!(remote.allocation, held);
+        assert_eq!(remote.placement, held);
         assert!(!remote.resident);
         assert!(!remote.route_installed);
         assert!(lifecycle.candidates[&identity].contains(&participant(2)));
@@ -1655,7 +1673,7 @@ mod tests {
     }
 
     #[test]
-    fn removing_last_remote_candidate_releases_its_reserved_allocation() {
+    fn removing_last_remote_candidate_releases_its_reserved_placement() {
         let (mut lifecycle, registry) = setup(2, &[(1, 1, 0), (2, 1, 1)]);
         let (identity, _) = publish_audio(&mut lifecycle, &registry, 1, 1);
         let _ = lifecycle.subscribe(
@@ -1666,7 +1684,7 @@ mod tests {
             &registry,
             Instant::now(),
         );
-        let remote_key = destination(&lifecycle, identity, 1).allocation.key;
+        let remote_track_id = destination(&lifecycle, identity, 1).placement.track_id;
 
         let outcome = lifecycle
             .unsubscribe(
@@ -1682,11 +1700,11 @@ mod tests {
         assert_eq!(effect_kinds(&outcome), vec![EffectKind::CandidateRemoved]);
         assert!(
             !lifecycle
-                .allocations
+                .placements
                 .contains_key(&(identity, ShardId::new(1)))
         );
         assert!(lifecycle.candidates[&identity].is_empty());
-        assert!(!plan_updates_on(&outcome, 1).contains(&(remote_key, false)));
+        assert!(!plan_updates_on(&outcome, 1).contains(&(remote_track_id, false)));
         assert_internal_invariants(&lifecycle, &registry);
     }
 
@@ -1726,7 +1744,7 @@ mod tests {
         );
         assert!(
             !lifecycle
-                .allocations
+                .placements
                 .contains_key(&(identity, ShardId::new(1)))
         );
         assert_internal_invariants(&lifecycle, &registry);
@@ -1745,7 +1763,7 @@ mod tests {
             &registry,
             Instant::now(),
         );
-        let first = destination(&lifecycle, identity, 1).allocation;
+        let first = destination(&lifecycle, identity, 1).placement;
         let _ = lifecycle.subscribe(
             room(1),
             participant(3),
@@ -1754,10 +1772,10 @@ mod tests {
             &registry,
             Instant::now(),
         );
-        let second = destination(&lifecycle, identity, 1).allocation;
+        let second = destination(&lifecycle, identity, 1).placement;
 
         assert_eq!(first, second);
-        assert_eq!(lifecycle.allocations.len(), 2);
+        assert_eq!(lifecycle.placements.len(), 2);
 
         let first_remove = lifecycle
             .unsubscribe(
@@ -1785,7 +1803,7 @@ mod tests {
         assert!(operations_on(&second_remove, 1).contains(&OpKind::RetireRoute));
         assert!(
             !lifecycle
-                .allocations
+                .placements
                 .contains_key(&(identity, ShardId::new(1)))
         );
         assert_internal_invariants(&lifecycle, &registry);
@@ -1830,7 +1848,7 @@ mod tests {
         assert!(!operations_on(&outcome, 2).contains(&OpKind::RetireRoute));
         assert!(
             !lifecycle
-                .allocations
+                .placements
                 .contains_key(&(identity, ShardId::new(1)))
         );
         assert!(destination(&lifecycle, identity, 2).resident);
@@ -1841,7 +1859,7 @@ mod tests {
     fn overlapping_subscriptions_do_not_duplicate_candidate_or_binding_state() {
         let (mut lifecycle, registry) = setup(1, &[(1, 1, 0), (2, 1, 0)]);
         let (identity, _) = publish_audio(&mut lifecycle, &registry, 1, 1);
-        let exact = TrackSelector::track(identity.id);
+        let exact = TrackSelector::track(identity.track_id);
 
         let first = lifecycle
             .subscribe(
@@ -1941,7 +1959,7 @@ mod tests {
         assert!(lifecycle.candidates[&identity].is_empty());
         assert!(
             !lifecycle
-                .allocations
+                .placements
                 .contains_key(&(identity, ShardId::new(1)))
         );
         assert_internal_invariants(&lifecycle, &registry);
@@ -1971,7 +1989,7 @@ mod tests {
         assert!(lifecycle.candidates[&identity].is_empty());
         assert!(
             !lifecycle
-                .allocations
+                .placements
                 .contains_key(&(identity, ShardId::new(1)))
         );
     }
@@ -1986,7 +2004,7 @@ mod tests {
         ] {
             let (mut lifecycle, registry) = setup(1, &[(1, 1, 0), (2, 1, 0)]);
             let publication = track(kind, 1, 1, label);
-            let identity = TrackIdentity::from_track(&publication);
+            let identity = TrackAncestry::from_track(&publication);
             let requires_reverse = publication.requires_reverse_route();
             let publish = lifecycle
                 .publish(publication, &registry, Instant::now())
@@ -2004,7 +2022,7 @@ mod tests {
                 .subscribe(
                     room(1),
                     participant(2),
-                    TrackSelector::track(identity.id),
+                    TrackSelector::track(identity.track_id),
                     SelectionPolicy::All,
                     &registry,
                     Instant::now(),
@@ -2034,7 +2052,7 @@ mod tests {
         let origin = destination(&lifecycle, identity, 0);
 
         let outcome = lifecycle
-            .unpublish(participant(1), identity.id, &registry, Instant::now())
+            .unpublish(participant(1), identity.track_id, &registry, Instant::now())
             .unwrap();
 
         let origin_ops = operations_on(&outcome, 0);
@@ -2071,7 +2089,7 @@ mod tests {
             assert!(plan_clear < retire && retire < runtime_remove);
         }
         assert!(!lifecycle.topology.contains(identity));
-        assert!(lifecycle.allocations.is_empty());
+        assert!(lifecycle.placements.is_empty());
         assert!(!lifecycle.candidates.contains_key(&identity));
         assert!(!lifecycle.bindings.contains_key(&identity));
     }
@@ -2090,7 +2108,7 @@ mod tests {
         );
 
         let outcome = lifecycle
-            .unpublish(participant(1), identity.id, &registry, Instant::now())
+            .unpublish(participant(1), identity.track_id, &registry, Instant::now())
             .unwrap();
 
         assert_eq!(
@@ -2111,7 +2129,7 @@ mod tests {
                 OpKind::RemoveRuntime,
             ]
         );
-        assert!(lifecycle.allocations.is_empty());
+        assert!(lifecycle.placements.is_empty());
         assert!(!lifecycle.topology.contains(identity));
     }
 
@@ -2136,7 +2154,7 @@ mod tests {
         );
         assert!(
             !lifecycle
-                .allocations
+                .placements
                 .contains_key(&(identity, ShardId::new(1)))
         );
         assert!(lifecycle.candidates[&identity].is_empty());
@@ -2149,7 +2167,7 @@ mod tests {
         let (mut lifecycle, registry) = setup(2, &[(1, 1, 0), (2, 1, 1)]);
         let audio = publish_audio(&mut lifecycle, &registry, 1, 1).0;
         let video = track(TrackKind::Video, 1, 1, "video");
-        let video_identity = TrackIdentity::from_track(&video);
+        let video_identity = TrackAncestry::from_track(&video);
         let _ = lifecycle.publish(video, &registry, Instant::now()).unwrap();
         let _ = lifecycle.subscribe(
             room(1),
@@ -2177,7 +2195,7 @@ mod tests {
         );
         assert!(!lifecycle.topology.contains(audio));
         assert!(!lifecycle.topology.contains(video_identity));
-        assert!(lifecycle.allocations.is_empty());
+        assert!(lifecycle.placements.is_empty());
         assert!(lifecycle.candidates.is_empty());
         assert!(lifecycle.bindings.is_empty());
     }
@@ -2213,7 +2231,7 @@ mod tests {
         assert!(effect_kinds(&outcomes[0]).is_empty());
         assert!(
             !lifecycle
-                .allocations
+                .placements
                 .contains_key(&(identity, ShardId::new(1)))
         );
         assert!(lifecycle.candidates[&identity].is_empty());
@@ -2226,7 +2244,7 @@ mod tests {
         let (mut lifecycle, registry) = setup(1, &[(1, 1, 0), (2, 1, 0)]);
         let audio = publish_audio(&mut lifecycle, &registry, 1, 1).0;
         let video = track(TrackKind::Video, 1, 1, "video");
-        let video_identity = TrackIdentity::from_track(&video);
+        let video_identity = TrackAncestry::from_track(&video);
         let _ = lifecycle.publish(video, &registry, Instant::now()).unwrap();
 
         let outcomes = lifecycle.subscribe_defaults(
@@ -2285,7 +2303,7 @@ mod tests {
         let first_activate = lifecycle.activate(
             room(1),
             participant(1),
-            identity.id,
+            identity.track_id,
             participant(2),
             &registry,
             Instant::now(),
@@ -2296,7 +2314,7 @@ mod tests {
         let second_activate = lifecycle.activate(
             room(1),
             participant(1),
-            identity.id,
+            identity.track_id,
             participant(2),
             &registry,
             Instant::now(),
@@ -2307,7 +2325,7 @@ mod tests {
         let first_deactivate = lifecycle.deactivate(
             room(1),
             participant(1),
-            identity.id,
+            identity.track_id,
             participant(2),
             &registry,
             Instant::now(),
@@ -2321,7 +2339,7 @@ mod tests {
         let second_deactivate = lifecycle.deactivate(
             room(1),
             participant(1),
-            identity.id,
+            identity.track_id,
             participant(2),
             &registry,
             Instant::now(),
@@ -2404,9 +2422,9 @@ mod tests {
             );
         }
 
-        let allocations = [
-            destination(&lifecycle, identity, 1).allocation,
-            destination(&lifecycle, identity, 2).allocation,
+        let placements = [
+            destination(&lifecycle, identity, 1).placement,
+            destination(&lifecycle, identity, 2).placement,
         ];
         let mut active = HashSet::<ParticipantId>::new();
         let mut state = 0x9e37_79b9_u32;
@@ -2421,7 +2439,7 @@ mod tests {
                 let _ = lifecycle.activate(
                     room(1),
                     participant(1),
-                    identity.id,
+                    identity.track_id,
                     subscriber,
                     &registry,
                     Instant::now(),
@@ -2431,7 +2449,7 @@ mod tests {
                 let _ = lifecycle.deactivate(
                     room(1),
                     participant(1),
-                    identity.id,
+                    identity.track_id,
                     subscriber,
                     &registry,
                     Instant::now(),
@@ -2441,12 +2459,12 @@ mod tests {
 
             assert_eq!(&lifecycle.bindings[&identity], &active);
             assert_eq!(
-                destination(&lifecycle, identity, 1).allocation,
-                allocations[0]
+                destination(&lifecycle, identity, 1).placement,
+                placements[0]
             );
             assert_eq!(
-                destination(&lifecycle, identity, 2).allocation,
-                allocations[1]
+                destination(&lifecycle, identity, 2).placement,
+                placements[1]
             );
 
             for shard in [1_usize, 2] {
@@ -2463,7 +2481,7 @@ mod tests {
     }
 
     #[test]
-    fn long_activation_churn_preserves_allocation_and_state_invariants() {
+    fn long_activation_churn_preserves_placement_and_state_invariants() {
         let (mut lifecycle, registry) = setup(2, &[(1, 1, 0), (2, 1, 1)]);
         let (identity, _) = publish_audio(&mut lifecycle, &registry, 1, 1);
         let _ = lifecycle.subscribe(
@@ -2474,31 +2492,31 @@ mod tests {
             &registry,
             Instant::now(),
         );
-        let allocation = destination(&lifecycle, identity, 1).allocation;
+        let placement = destination(&lifecycle, identity, 1).placement;
 
         for _ in 0..1_000 {
             let activate = lifecycle.activate(
                 room(1),
                 participant(1),
-                identity.id,
+                identity.track_id,
                 participant(2),
                 &registry,
                 Instant::now(),
             );
             assert_eq!(effect_kinds(&activate), vec![EffectKind::Subscribed]);
-            assert_eq!(destination(&lifecycle, identity, 1).allocation, allocation);
+            assert_eq!(destination(&lifecycle, identity, 1).placement, placement);
             assert_internal_invariants(&lifecycle, &registry);
 
             let deactivate = lifecycle.deactivate(
                 room(1),
                 participant(1),
-                identity.id,
+                identity.track_id,
                 participant(2),
                 &registry,
                 Instant::now(),
             );
             assert_eq!(effect_kinds(&deactivate), vec![EffectKind::Unsubscribed]);
-            assert_eq!(destination(&lifecycle, identity, 1).allocation, allocation);
+            assert_eq!(destination(&lifecycle, identity, 1).placement, placement);
             assert_internal_invariants(&lifecycle, &registry);
         }
     }
@@ -2525,7 +2543,7 @@ mod tests {
             assert!(remote.route_installed);
             assert_eq!(
                 forward_install_on(&outcome, shard),
-                Some((remote.allocation.route, remote.allocation.key))
+                Some((remote.placement.route, remote.placement.track_id))
             );
             assert_internal_invariants(&lifecycle, &registry);
         }
@@ -2571,7 +2589,7 @@ mod tests {
     }
 
     #[test]
-    fn every_candidate_effect_uses_the_destination_shards_track_key() {
+    fn every_candidate_effect_carries_the_stable_track_id() {
         let (mut lifecycle, registry) = setup(2, &[(1, 1, 0), (2, 1, 1)]);
         let (identity, _) = publish_audio(&mut lifecycle, &registry, 1, 1);
 
@@ -2587,22 +2605,22 @@ mod tests {
             .pop()
             .unwrap();
         let remote = destination(&lifecycle, identity, 1);
-        let effect_key = outcome
+        let effect_track_id = outcome
             .operations
             .iter()
             .find_map(|operation| match operation {
                 TrackLifecycleOperation::ParticipantEffect {
                     shard,
-                    effect: ParticipantEffect::TrackCandidateAdded { key, .. },
+                    effect: ParticipantEffect::TrackCandidateAdded { track },
                     ..
-                } if *shard == ShardId::new(1) => Some(*key),
+                } if *shard == ShardId::new(1) => Some(track.id()),
                 _ => None,
             });
 
-        assert_eq!(effect_key, Some(remote.allocation.key));
-        assert_ne!(
-            remote.allocation.key,
-            destination(&lifecycle, identity, 0).allocation.key
+        assert_eq!(effect_track_id, Some(remote.placement.track_id));
+        assert_eq!(
+            remote.placement.track_id,
+            destination(&lifecycle, identity, 0).placement.track_id
         );
     }
 
@@ -2622,7 +2640,7 @@ mod tests {
         let outcome = lifecycle.activate(
             room(1),
             participant(1),
-            identity.id,
+            identity.track_id,
             participant(2),
             &registry,
             Instant::now(),

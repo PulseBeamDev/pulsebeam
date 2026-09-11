@@ -381,7 +381,7 @@ fn from_wire_route(route: pulsebeam_routing::RouteId) -> RouteId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RouteAction {
     Forward {
-        target: crate::keys::TrackKey,
+        target: crate::keys::TrackHandle,
     },
     /// The reverse path for one published stream, resolving at the shard that
     /// owns the publisher.
@@ -396,7 +396,7 @@ pub(crate) enum RouteAction {
     /// No `origin` field: the track key resolves to
     /// an arena entry that already knows its own publisher.
     Reverse {
-        target: crate::keys::TrackKey,
+        target: crate::keys::TrackHandle,
     },
 }
 
@@ -667,7 +667,7 @@ impl RouteRuntime {
         *slot = Some(RouteRuntimeEntry {
             epoch: address.epoch,
             action: RouteAction::Forward {
-                target: crate::keys::TrackKey::default(),
+                target: crate::keys::TrackHandle::default(),
             },
             expander: NtpExpander::new(ntp_ref),
             last_link_seq: None,
@@ -1097,7 +1097,7 @@ mod tests {
         runtime.install_action(
             route,
             RouteAction::Forward {
-                target: crate::keys::TrackKey::default(),
+                target: crate::keys::TrackHandle::default(),
             },
         );
         {
@@ -1110,7 +1110,7 @@ mod tests {
         runtime.install_action(
             route,
             RouteAction::Reverse {
-                target: crate::keys::TrackKey::default(),
+                target: crate::keys::TrackHandle::default(),
             },
         );
 
@@ -1118,7 +1118,7 @@ mod tests {
         assert_eq!(
             entry.action,
             RouteAction::Reverse {
-                target: crate::keys::TrackKey::default()
+                target: crate::keys::TrackHandle::default()
             }
         );
         assert_eq!(entry.stats, before);
@@ -1133,7 +1133,7 @@ mod tests {
         runtime.install_action(
             route,
             RouteAction::Reverse {
-                target: crate::keys::TrackKey::default(),
+                target: crate::keys::TrackHandle::default(),
             },
         );
         let packet = crate::participant::reverse::ReversePacket::reliable_control(vec![4, 5]);
@@ -1152,7 +1152,7 @@ mod tests {
         runtime.install_action(
             old,
             RouteAction::Forward {
-                target: crate::keys::TrackKey::default(),
+                target: crate::keys::TrackHandle::default(),
             },
         );
         runtime.entry_mut(old).unwrap().observe(100);
@@ -1161,7 +1161,7 @@ mod tests {
         runtime.install_action(
             replacement,
             RouteAction::Forward {
-                target: crate::keys::TrackKey::default(),
+                target: crate::keys::TrackHandle::default(),
             },
         );
 

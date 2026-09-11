@@ -1,7 +1,7 @@
 use super::packet::TrackPacket;
 use super::reverse::ReversePacket;
 use crate::entity::TrackId;
-use crate::keys::TrackKey;
+use crate::keys::TrackHandle;
 use crate::track::{SelectionPolicy, Track, TrackMeta, TrackSelector};
 
 pub(crate) trait ParticipantSink {
@@ -17,10 +17,10 @@ pub(crate) trait ParticipantSink {
     fn unpublish_track(&mut self, track_id: TrackId);
     fn subscribe_tracks(&mut self, selector: TrackSelector, selection: SelectionPolicy);
     fn unsubscribe_tracks(&mut self, selector: TrackSelector);
-    fn request_reverse(&mut self, stream: TrackKey, packet: ReversePacket);
+    fn request_reverse(&mut self, stream: TrackHandle, packet: ReversePacket);
     fn exit(&mut self);
 
-    fn publish_track_packet(&mut self, fanout: Option<TrackKey>, packet: TrackPacket);
+    fn publish_track_packet(&mut self, fanout: Option<TrackHandle>, packet: TrackPacket);
 }
 
 #[cfg(test)]
@@ -35,9 +35,9 @@ pub mod test_utils {
         pub deactivate_track_calls: Vec<TrackMeta>,
         pub publish_track_calls: Vec<TrackId>,
         pub unpublish_track_calls: Vec<TrackId>,
-        pub reverse_requests: Vec<TrackKey>,
+        pub reverse_requests: Vec<TrackHandle>,
         pub exit_count: usize,
-        pub publish_track_packet_calls: Vec<TrackKey>,
+        pub publish_track_packet_calls: Vec<TrackHandle>,
     }
 
     impl MockParticipantSink {
@@ -75,7 +75,7 @@ pub mod test_utils {
 
         fn unsubscribe_tracks(&mut self, _selector: TrackSelector) {}
 
-        fn request_reverse(&mut self, stream: TrackKey, _packet: ReversePacket) {
+        fn request_reverse(&mut self, stream: TrackHandle, _packet: ReversePacket) {
             self.reverse_requests.push(stream);
         }
 
@@ -83,7 +83,7 @@ pub mod test_utils {
             self.exit_count = self.exit_count.saturating_add(1);
         }
 
-        fn publish_track_packet(&mut self, fanout: Option<TrackKey>, _packet: TrackPacket) {
+        fn publish_track_packet(&mut self, fanout: Option<TrackHandle>, _packet: TrackPacket) {
             if let Some(key) = fanout {
                 self.publish_track_packet_calls.push(key);
             }

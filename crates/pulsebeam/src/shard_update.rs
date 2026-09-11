@@ -3,10 +3,9 @@
 
 use std::collections::{HashSet, VecDeque};
 
-use crate::entity::ParticipantId;
+use crate::entity::{ParticipantId, TrackId};
 use crate::id::ShardId;
-use crate::keys::TrackKey;
-use crate::route::{NodeRouteAddress, NodeTransportAddress, RouteAction};
+use crate::route::{NodeRouteAddress, NodeTransportAddress};
 use pulsebeam_runtime::mailbox;
 use str0m::media::Rid;
 
@@ -58,8 +57,22 @@ where
 
 #[derive(Debug, Clone)]
 pub(crate) struct TrackPlanUpdate {
-    pub key: TrackKey,
+    pub track_id: TrackId,
     pub plan: Option<TrackPlan>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum TrackRouteAction {
+    Forward { track_id: TrackId },
+    Reverse { track_id: TrackId },
+}
+
+impl TrackRouteAction {
+    pub(crate) fn track_id(self) -> TrackId {
+        match self {
+            Self::Forward { track_id } | Self::Reverse { track_id } => track_id,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -84,7 +97,7 @@ pub(crate) struct TrackRuntime {
 pub(crate) enum ShardUpdateOp {
     InstallRoute {
         address: NodeRouteAddress,
-        action: RouteAction,
+        action: TrackRouteAction,
     },
     RetireRoute {
         address: NodeRouteAddress,
@@ -97,11 +110,11 @@ pub(crate) enum ShardUpdateOp {
         address: NodeTransportAddress,
     },
     InsertTrackRuntime {
-        key: TrackKey,
+        track_id: TrackId,
         runtime: TrackRuntime,
     },
     RemoveTrackRuntime {
-        key: TrackKey,
+        track_id: TrackId,
     },
     Placeholder,
 }
@@ -301,16 +314,15 @@ impl ShardUpdateOp {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::keys::TrackKey;
 
-    fn track_plan() -> (TrackKey, Vec<TrackPlanUpdate>) {
-        let mut keys = slotmap::SlotMap::<TrackKey, ()>::with_key();
-        let key = keys.insert(());
+    fn track_plan() -> (TrackId, Vec<TrackPlanUpdate>) {
+        let track_id = crate::entity::ParticipantId::new()
+            .derive_track_id(crate::entity::TrackKind::Audio, "audio");
         let plans = vec![TrackPlanUpdate {
-            key,
+            track_id,
             plan: Some(TrackPlan::default()),
         }];
-        (key, plans)
+        (track_id, plans)
     }
 
     #[test]

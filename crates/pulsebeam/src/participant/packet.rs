@@ -1,4 +1,3 @@
-use crate::keys::TrackKey;
 use crate::rtp::RtpPacket;
 use crate::track::DataLane;
 
@@ -28,7 +27,7 @@ impl TrackPacket {
 
 #[derive(Debug, Clone)]
 pub struct RoutedTrackPacket {
-    pub key: TrackKey,
+    pub track_id: crate::entity::TrackId,
     pub packet: TrackPacket,
 }
 

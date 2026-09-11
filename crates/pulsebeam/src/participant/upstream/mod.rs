@@ -2,7 +2,7 @@ mod audio;
 mod data;
 mod video;
 
-use crate::keys::TrackKey;
+use crate::keys::TrackHandle;
 use crate::{
     entity::{TrackId, TrackKind},
     log::{LogCtx, plog_warn},
@@ -29,7 +29,7 @@ pub(crate) struct IncomingRtpRoute {
     pub(crate) rid: Option<str0m::media::Rid>,
     pub(crate) upstream_slot: UpstreamSlotKey,
     pub(crate) track_id: TrackId,
-    pub(crate) fanout: Option<TrackKey>,
+    pub(crate) fanout: Option<TrackHandle>,
 }
 
 #[derive(Default)]
@@ -94,7 +94,7 @@ impl UpstreamRouteTable {
         }
         debug_assert_eq!(self.ssrcs.len(), self.routes.len());
     }
-    pub(crate) fn bind_fanout(&mut self, track_id: TrackId, fanout: TrackKey) {
+    pub(crate) fn bind_fanout(&mut self, track_id: TrackId, fanout: TrackHandle) {
         for route in &mut self.routes {
             if route.track_id == track_id {
                 route.fanout = Some(fanout);
@@ -206,7 +206,7 @@ pub struct Upstream {
     pub(crate) video: UpstreamVideo,
     pub(crate) data: UpstreamData,
     pub(crate) routes: UpstreamRouteTable,
-    track_keys: HashMap<TrackId, TrackKey>,
+    track_handles: HashMap<TrackId, TrackHandle>,
 }
 pub type UpstreamAllocator = Upstream;
 
@@ -217,7 +217,7 @@ impl Upstream {
             video: UpstreamVideo::new(ctx),
             data: UpstreamData::new(),
             routes: UpstreamRouteTable::default(),
-            track_keys: HashMap::new(),
+            track_handles: HashMap::new(),
         }
     }
     pub fn add_published_track(
@@ -276,21 +276,21 @@ impl Upstream {
         self.video.poll_slow(now);
     }
 
-    pub(crate) fn track_fanout(&self, track_id: TrackId) -> Option<TrackKey> {
-        self.track_keys.get(&track_id).copied()
+    pub(crate) fn track_fanout(&self, track_id: TrackId) -> Option<TrackHandle> {
+        self.track_handles.get(&track_id).copied()
     }
-    pub(crate) fn track_for_fanout(&self, fanout: TrackKey) -> Option<TrackId> {
-        self.track_keys
+    pub(crate) fn track_for_fanout(&self, fanout: TrackHandle) -> Option<TrackId> {
+        self.track_handles
             .iter()
             .find_map(|(track_id, key)| (*key == fanout).then_some(*track_id))
     }
-    pub(crate) fn bind_track_key(&mut self, track_id: TrackId, key: TrackKey) {
-        self.track_keys.insert(track_id, key);
+    pub(crate) fn bind_track_handle(&mut self, track_id: TrackId, key: TrackHandle) {
+        self.track_handles.insert(track_id, key);
         self.routes.bind_fanout(track_id, key);
     }
-    pub(crate) fn unbind_track_key(&mut self, track_id: TrackId, key: TrackKey) {
-        if self.track_keys.get(&track_id) == Some(&key) {
-            self.track_keys.remove(&track_id);
+    pub(crate) fn unbind_track_handle(&mut self, track_id: TrackId, key: TrackHandle) {
+        if self.track_handles.get(&track_id) == Some(&key) {
+            self.track_handles.remove(&track_id);
             self.routes.remove_track(track_id);
         }
     }

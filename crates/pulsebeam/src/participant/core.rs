@@ -14,7 +14,7 @@ use tokio::time::Instant;
 
 use crate::entity::{self, TrackId, TrackKind};
 use crate::id::ShardId;
-use crate::keys::TrackKey;
+use crate::keys::TrackHandle;
 use crate::log::{LogCtx, plog_debug, plog_info, plog_trace, plog_warn};
 use crate::participant::data::{DataOpenError, DataState};
 use crate::participant::downstream::SlotConfig;
@@ -105,12 +105,12 @@ pub(crate) enum ParticipantInput<'a> {
     },
     Timeout(Instant),
     Track {
-        key: TrackKey,
+        key: TrackHandle,
         packet: TrackPacketRef<'a>,
         cache: Option<&'a TrackStreamCache>,
     },
     Reverse {
-        stream: TrackKey,
+        stream: TrackHandle,
         packet: ReversePacket,
     },
 }
@@ -213,31 +213,55 @@ impl Participant {
         }
     }
 
-    pub fn apply(&mut self, effect: ParticipantEffect) {
+    pub fn apply(&mut self, effect: ParticipantEffect, track_handle: Option<TrackHandle>) {
         match effect {
             ParticipantEffect::ParticipantsChanged { added, removed } => {
                 self.signaling.apply_participants(added, removed);
             }
-            ParticipantEffect::TrackCandidateAdded { key, track } => {
+            ParticipantEffect::TrackCandidateAdded { track } => {
+                let Some(key) = track_handle else {
+                    debug_assert!(false, "a track effect must resolve to a local handle");
+                    return;
+                };
                 self.add_track_candidate(key, track);
             }
-            ParticipantEffect::TrackCandidateRemoved { key, track_id } => {
+            ParticipantEffect::TrackCandidateRemoved { track_id } => {
+                let Some(key) = track_handle else {
+                    debug_assert!(false, "a track effect must resolve to a local handle");
+                    return;
+                };
                 self.remove_track_candidate(key, track_id);
             }
-            ParticipantEffect::TrackSubscribed { key, track_id } => {
+            ParticipantEffect::TrackSubscribed { track_id } => {
+                let Some(key) = track_handle else {
+                    debug_assert!(false, "a track effect must resolve to a local handle");
+                    return;
+                };
                 self.activate_track_binding(key, track_id);
             }
-            ParticipantEffect::TrackUnsubscribed { key, track_id } => {
+            ParticipantEffect::TrackUnsubscribed { track_id } => {
+                let Some(key) = track_handle else {
+                    debug_assert!(false, "a track effect must resolve to a local handle");
+                    return;
+                };
                 self.deactivate_track_binding(key, track_id);
             }
-            ParticipantEffect::TrackPublished { key, track_id } => {
-                self.upstream.bind_track_key(track_id, key);
+            ParticipantEffect::TrackPublished { track_id } => {
+                let Some(key) = track_handle else {
+                    debug_assert!(false, "a track effect must resolve to a local handle");
+                    return;
+                };
+                self.upstream.bind_track_handle(track_id, key);
                 if track_id.kind() == TrackKind::Data {
                     self.upstream.data.bind_source(track_id, key);
                 }
             }
-            ParticipantEffect::TrackUnpublished { key, track_id } => {
-                self.upstream.unbind_track_key(track_id, key);
+            ParticipantEffect::TrackUnpublished { track_id } => {
+                let Some(key) = track_handle else {
+                    debug_assert!(false, "a track effect must resolve to a local handle");
+                    return;
+                };
+                self.upstream.unbind_track_handle(track_id, key);
                 if track_id.kind() == TrackKind::Data {
                     self.upstream.data.unpublish(track_id);
                 }
@@ -259,7 +283,7 @@ impl Participant {
         }
     }
 
-    fn add_track_candidate(&mut self, key: TrackKey, track: Track) {
+    fn add_track_candidate(&mut self, key: TrackHandle, track: Track) {
         let track_id = track.id();
         let participant_id = track.meta().origin;
         debug_assert_eq!(track_id.kind(), track.kind());
@@ -275,7 +299,7 @@ impl Participant {
         }
     }
 
-    fn activate_track_binding(&mut self, key: TrackKey, track_id: TrackId) {
+    fn activate_track_binding(&mut self, key: TrackHandle, track_id: TrackId) {
         let Some(candidate) = self.downstream.track_candidate(key) else {
             debug_assert!(false, "binding activation requires a candidate");
             return;
@@ -286,7 +310,7 @@ impl Participant {
         }
     }
 
-    fn deactivate_track_binding(&mut self, key: TrackKey, track_id: TrackId) {
+    fn deactivate_track_binding(&mut self, key: TrackHandle, track_id: TrackId) {
         let Some(candidate) = self.downstream.track_candidate(key) else {
             debug_assert!(false, "binding deactivation requires a candidate");
             return;
@@ -297,7 +321,7 @@ impl Participant {
         }
     }
 
-    fn remove_track_candidate(&mut self, key: TrackKey, track_id: TrackId) {
+    fn remove_track_candidate(&mut self, key: TrackHandle, track_id: TrackId) {
         let Some(candidate) = self.downstream.remove_track_candidate(key) else {
             return;
         };
@@ -310,7 +334,7 @@ impl Participant {
 
     fn on_track_packet(
         &mut self,
-        key: TrackKey,
+        key: TrackHandle,
         packet: TrackPacketRef<'_>,
         cache: Option<&TrackStreamCache>,
     ) {
@@ -394,7 +418,7 @@ impl Participant {
         self.transport.enqueue_timeout(now);
     }
 
-    fn on_track_published(&mut self, key: TrackKey, track: Track) {
+    fn on_track_published(&mut self, key: TrackHandle, track: Track) {
         if track.meta().origin == self.participant_id {
             debug_assert!(false, "the controller must not install a loopback track");
             return;
@@ -430,7 +454,7 @@ impl Participant {
         self.transport.enqueue_mutation(work)
     }
 
-    fn on_reverse(&mut self, stream: TrackKey, packet: ReversePacket) {
+    fn on_reverse(&mut self, stream: TrackHandle, packet: ReversePacket) {
         match packet.decode() {
             Some(ReverseInput::Keyframe { rid, kind }) => {
                 let Some(track_id) = self.upstream.track_for_fanout(stream) else {

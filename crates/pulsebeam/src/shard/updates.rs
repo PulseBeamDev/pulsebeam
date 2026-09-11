@@ -66,7 +66,16 @@ impl ShardUpdateApplication {
                             .push_back((*participant, effect.clone()));
                     }
                 }
-                for op in delta.lifecycle.iter().filter(|op| !is_retire(op)) {
+                for op in delta
+                    .lifecycle
+                    .iter()
+                    .filter(|op| matches!(op, ShardUpdateOp::InsertTrackRuntime { .. }))
+                {
+                    self.apply_lifecycle_op(execution, op);
+                }
+                for op in delta.lifecycle.iter().filter(|op| {
+                    !is_retire(op) && !matches!(op, ShardUpdateOp::InsertTrackRuntime { .. })
+                }) {
                     self.apply_lifecycle_op(execution, op);
                 }
                 self.pending_update_lifecycle = true;

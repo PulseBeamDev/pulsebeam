@@ -5,11 +5,12 @@ use crate::participant::reverse::ReversePacket;
 use crate::participant::{ParticipantInput, RoutedTrackPacket, TrackPacket, TrackPacketRef};
 use crate::route::{Envelope, RouteAction, RouteRuntime};
 use crate::rtp::{RtpPacket, cache::TrackStreamCache};
-use slotmap::SecondaryMap;
+use slotmap::SlotMap;
+use std::collections::HashMap;
 
 use super::worker::{MediaPayload, ShardFrame};
 
-pub(crate) use crate::keys::TrackKey;
+pub(crate) use crate::keys::TrackHandle;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Origin {
@@ -36,6 +37,7 @@ pub(crate) struct ForwardingContext<'a, R> {
 }
 
 struct TrackRuntime {
+    id: crate::entity::TrackId,
     origin: Option<ParticipantHandle>,
     cache: Option<TrackStreamCache>,
     publisher: Option<ParticipantHandle>,
@@ -75,7 +77,7 @@ fn fanout_remote(
 fn forward_track(
     ctx: &mut ForwardingContext<'_, impl ShardTransport>,
     subscriber: ParticipantHandle,
-    fanout: TrackKey,
+    fanout: TrackHandle,
     pkt: TrackPacketRef<'_>,
     cache: Option<&TrackStreamCache>,
 ) {
@@ -92,64 +94,76 @@ fn forward_track(
 }
 
 pub(crate) struct ShardRuntime {
-    tracks: SecondaryMap<TrackKey, TrackRuntime>,
+    tracks: SlotMap<TrackHandle, TrackRuntime>,
+    track_handles: HashMap<crate::entity::TrackId, TrackHandle>,
     pub(crate) routes: RouteRuntime,
 }
 
 impl ShardRuntime {
     pub fn new(shard_id: ShardId) -> Self {
         Self {
-            tracks: SecondaryMap::new(),
+            tracks: SlotMap::with_key(),
+            track_handles: HashMap::new(),
             routes: RouteRuntime::new(shard_id),
         }
     }
 
-    pub(crate) fn retire_track(&mut self, key: TrackKey) {
-        let _ = self.tracks.remove(key);
+    pub(crate) fn track_handle(&self, track_id: crate::entity::TrackId) -> Option<TrackHandle> {
+        self.track_handles.get(&track_id).copied()
+    }
+
+    pub(crate) fn track_id(&self, handle: TrackHandle) -> Option<crate::entity::TrackId> {
+        self.tracks.get(handle).map(|runtime| runtime.id)
+    }
+
+    pub(crate) fn retire_track(&mut self, track_id: crate::entity::TrackId) {
+        let Some(handle) = self.track_handles.remove(&track_id) else {
+            return;
+        };
+        let _ = self.tracks.remove(handle);
     }
 
     pub(crate) fn install_track(
         &mut self,
-        key: TrackKey,
+        track_id: crate::entity::TrackId,
         descriptor: Option<&crate::shard_update::TrackDescriptor>,
         origin: Option<ParticipantHandle>,
         publisher: Option<ParticipantHandle>,
-    ) {
+    ) -> TrackHandle {
         let cache = descriptor
             .filter(|descriptor| descriptor.kind == crate::entity::TrackKind::Video)
             .map(|descriptor| {
                 debug_assert!(descriptor.encodings.len() <= 3);
                 TrackStreamCache::new()
             });
-        if let Some(previous) = self.tracks.get(key) {
-            debug_assert_eq!(
-                previous.origin, origin,
-                "a runtime key cannot change its publisher binding"
-            );
-        }
-        let previous = self.tracks.insert(
-            key,
-            TrackRuntime {
-                origin,
-                cache,
-                publisher,
-                link_seq: 0,
-            },
-        );
-        if let Some(previous) = previous {
-            let Some(current) = self.tracks.get_mut(key) else {
-                debug_assert!(false, "inserted track runtime must remain addressable");
-                return;
+        if let Some(handle) = self.track_handles.get(&track_id).copied() {
+            let Some(runtime) = self.tracks.get_mut(handle) else {
+                debug_assert!(false, "a track identity must resolve to its shard handle");
+                return handle;
             };
-            current.cache = previous.cache;
-            current.link_seq = previous.link_seq;
+            debug_assert_eq!(
+                runtime.origin, origin,
+                "a runtime handle cannot change its publisher binding"
+            );
+            runtime.origin = origin;
+            runtime.publisher = publisher;
+            return handle;
         }
+        let handle = self.tracks.insert(TrackRuntime {
+            id: track_id,
+            origin,
+            cache,
+            publisher,
+            link_seq: 0,
+        });
+        self.track_handles.insert(track_id, handle);
+        handle
     }
 
     #[inline]
     pub fn route_rtp_with_plan(
         &mut self,
-        key: TrackKey,
+        key: TrackHandle,
         origin: Origin,
         pkt: RtpPacket,
         plan: &InstalledTrackPlan,
@@ -180,12 +194,13 @@ impl ShardRuntime {
         });
         if origin.is_local() {
             let playout = ctx.wall.to_ntp(packet.playout_time);
+            let track_id = runtime.id;
             fanout_remote(
                 plan,
                 &mut runtime.link_seq,
                 playout.middle32(),
                 || RoutedTrackPacket {
-                    key,
+                    track_id,
                     packet: TrackPacket::Rtp(packet.to_transit()),
                 },
                 ctx.router,
@@ -195,14 +210,13 @@ impl ShardRuntime {
 
     pub fn route_packet_with_plan(
         &mut self,
-        key: TrackKey,
+        key: TrackHandle,
         origin: Origin,
-        packet: RoutedTrackPacket,
+        packet: TrackPacket,
         plan: &InstalledTrackPlan,
         ctx: &mut ForwardingContext<'_, impl ShardTransport>,
     ) {
-        debug_assert_eq!(packet.key, key);
-        match packet.packet {
+        match packet {
             TrackPacket::Rtp(packet) => self.route_rtp_with_plan(key, origin, packet, plan, ctx),
             TrackPacket::Data { lane, bytes } => {
                 self.route_data_with_plan(key, origin, lane, bytes, plan, ctx);
@@ -212,7 +226,7 @@ impl ShardRuntime {
 
     pub fn route_data_with_plan(
         &mut self,
-        stream: TrackKey,
+        stream: TrackHandle,
         origin: Origin,
         lane: crate::track::DataLane,
         packet: Vec<u8>,
@@ -237,12 +251,13 @@ impl ShardRuntime {
         });
         if origin.is_local() {
             let playout = ctx.wall.ntp();
+            let track_id = runtime.id;
             fanout_remote(
                 plan,
                 &mut runtime.link_seq,
                 playout.middle32(),
                 || RoutedTrackPacket {
-                    key: stream,
+                    track_id,
                     packet: TrackPacket::Data {
                         lane,
                         bytes: packet.clone(),
@@ -272,7 +287,7 @@ impl ShardRuntime {
         );
     }
 
-    pub fn resolve_reverse(&self, action: RouteAction) -> Option<(ParticipantHandle, TrackKey)> {
+    pub fn resolve_reverse(&self, action: RouteAction) -> Option<(ParticipantHandle, TrackHandle)> {
         let RouteAction::Reverse { target } = action else {
             debug_assert!(false, "reverse frame resolved a non-reverse route");
             return None;
@@ -302,12 +317,14 @@ mod tests {
         }
     }
 
+    fn track_id(kind: crate::entity::TrackKind, label: &str) -> crate::entity::TrackId {
+        crate::entity::ParticipantId::new().derive_track_id(kind, label)
+    }
+
     #[test]
     fn reinserting_a_live_track_runtime_preserves_its_forwarding_state() {
         let _rng = pulsebeam_runtime::rand::seeded_rng(1);
         let mut runtime = ShardRuntime::new(ShardId::new(0));
-        let mut track_keys = SlotMap::<TrackKey, ()>::with_key();
-        let key = track_keys.insert(());
         let mut participant_keys = SlotMap::<ParticipantHandle, ()>::with_key();
         let origin_key = participant_keys.insert(());
         let descriptor = crate::shard_update::TrackDescriptor {
@@ -315,14 +332,18 @@ mod tests {
             kind: crate::entity::TrackKind::Video,
             encodings: vec![Some(str0m::media::Rid::from("q"))],
         };
-        runtime.install_track(key, Some(&descriptor), Some(origin_key), None);
+        let track_id = track_id(crate::entity::TrackKind::Video, "video");
+        let key = runtime.install_track(track_id, Some(&descriptor), Some(origin_key), None);
         runtime.tracks.get_mut(key).unwrap().link_seq = 7;
         let descriptor = crate::shard_update::TrackDescriptor {
             origin: descriptor.origin,
             kind: crate::entity::TrackKind::Video,
             encodings: vec![Some(str0m::media::Rid::from("f"))],
         };
-        runtime.install_track(key, Some(&descriptor), Some(origin_key), None);
+        assert_eq!(
+            runtime.install_track(track_id, Some(&descriptor), Some(origin_key), None),
+            key
+        );
 
         assert_eq!(runtime.tracks.get(key).unwrap().link_seq, 7);
     }
@@ -331,8 +352,6 @@ mod tests {
     fn an_empty_encoding_descriptor_still_allocates_stream_cache() {
         let _rng = pulsebeam_runtime::rand::seeded_rng(1);
         let mut runtime = ShardRuntime::new(ShardId::new(0));
-        let mut track_keys = SlotMap::<TrackKey, ()>::with_key();
-        let key = track_keys.insert(());
         let mut participant_keys = SlotMap::<ParticipantHandle, ()>::with_key();
         let origin_key = participant_keys.insert(());
 
@@ -341,7 +360,12 @@ mod tests {
             kind: crate::entity::TrackKind::Video,
             encodings: Vec::new(),
         };
-        runtime.install_track(key, Some(&descriptor), Some(origin_key), None);
+        let key = runtime.install_track(
+            track_id(crate::entity::TrackKind::Video, "empty"),
+            Some(&descriptor),
+            Some(origin_key),
+            None,
+        );
 
         assert!(
             runtime
@@ -355,8 +379,6 @@ mod tests {
     fn an_audio_track_descriptor_does_not_allocate_a_stream_cache() {
         let _rng = pulsebeam_runtime::rand::seeded_rng(1);
         let mut runtime = ShardRuntime::new(ShardId::new(0));
-        let mut track_keys = SlotMap::<TrackKey, ()>::with_key();
-        let key = track_keys.insert(());
         let mut participant_keys = SlotMap::<ParticipantHandle, ()>::with_key();
         let origin_key = participant_keys.insert(());
 
@@ -365,7 +387,12 @@ mod tests {
             kind: crate::entity::TrackKind::Audio,
             encodings: Vec::new(),
         };
-        runtime.install_track(key, Some(&descriptor), Some(origin_key), None);
+        let key = runtime.install_track(
+            track_id(crate::entity::TrackKind::Audio, "audio"),
+            Some(&descriptor),
+            Some(origin_key),
+            None,
+        );
 
         assert!(
             runtime
@@ -378,12 +405,11 @@ mod tests {
     #[test]
     fn reinserting_a_live_data_runtime_preserves_hop_state() {
         let mut runtime = ShardRuntime::new(ShardId::new(0));
-        let mut keys = SlotMap::<TrackKey, ()>::with_key();
-        let key = keys.insert(());
-        runtime.install_track(key, None, None, None);
+        let track_id = track_id(crate::entity::TrackKind::Data, "data");
+        let key = runtime.install_track(track_id, None, None, None);
         runtime.tracks.get_mut(key).unwrap().link_seq = 17;
         runtime.tracks.get_mut(key).unwrap().cache = Some(TrackStreamCache::new());
-        runtime.install_track(key, None, None, None);
+        assert_eq!(runtime.install_track(track_id, None, None, None), key);
 
         assert_eq!(runtime.tracks.get(key).unwrap().link_seq, 17);
         assert!(runtime.tracks.get(key).unwrap().cache.is_some());

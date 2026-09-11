@@ -28,7 +28,7 @@ or media kind.
 
                            data plane
 
-  packet + TrackKey
+  packet + TrackHandle
           │
           ▼
   TrackPlan { local participants, remote routes, reverse route }
@@ -41,7 +41,7 @@ or media kind.
                             RouteAction::Forward
                                       │
                                       ▼
-                              destination TrackKey
+                              destination TrackHandle
                                       │
                                       ▼
                          destination-local TrackPlan
@@ -55,10 +55,10 @@ The invariant is:
 
 ## Publish Track, subscribe Track
 
-Every routable publication has one `TrackIdentity`:
+Every routable publication has one `TrackAncestry`:
 
 ```text
-TrackIdentity = RoomId + publisher ParticipantId + TrackId
+TrackAncestry = RoomId + publisher ParticipantId + TrackId
 ```
 
 `TrackKind` remains semantic information for signaling and participant-local
@@ -111,16 +111,17 @@ An audio wildcard cannot match a data publication because the selector includes
 video because only data publications carry a matching publication label.
 
 Selectors belong entirely to the controller. A shard never sees a wildcard,
-topic, room id or stable participant id while forwarding a packet.
+topic or room id while forwarding a packet. Stable IDs cross shard boundaries
+only to resolve or validate shard-local handles.
 
 ## The unified compiled plan
 
 For each track, the controller groups candidates and active bindings by their
-owning shard. It allocates one shard-local `TrackKey` on the publisher shard and
-reserves one destination `TrackKey` plus `NodeRouteAddress` on every remote shard
-that has candidates. A candidate-only destination remains dormant: it has no
-forward route, runtime, plan or origin remote entry. Those are installed only
-while the shard has at least one active binding.
+owning shard. It reserves a `TrackPlacement` containing `TrackId` plus
+`NodeRouteAddress` on every required shard. The destination shard allocates its
+own `TrackHandle` when the runtime becomes resident. A candidate-only placement
+remains dormant: it has no handle, forward route, runtime, plan or origin remote
+entry. Those are installed only while the shard has at least one active binding.
 
 Controller-to-shard updates name local recipients by `ParticipantId`. Every
 resident copy resolves those identities into the same installed plan shape:
@@ -139,22 +140,22 @@ TrackPlan {
 - `reverse_route` addresses feedback or reliable control toward the publisher.
 
 There is no generic destination type and no audio, video, realtime-data or
-reliable-data plan image. A shard has one `SecondaryMap<TrackKey, TrackPlan>`.
+reliable-data plan image. A shard has one `SecondaryMap<TrackHandle, TrackPlan>`.
 It also has only two endpoint actions:
 
 ```text
-RouteAction::Forward { target: TrackKey }
-RouteAction::Reverse { target: TrackKey }
+RouteAction::Forward { target: TrackHandle }
+RouteAction::Reverse { target: TrackHandle }
 ```
 
 `Forward` maps an arriving envelope to the destination shard's local track
-key. `Reverse` maps feedback to the publisher-side track key, whose runtime
+handle. `Reverse` maps feedback to the publisher-side track handle, whose runtime
 already identifies the publishing participant. Both actions are `Copy` values
 containing dense keys; neither ends in a hash lookup by a stable name.
 
 The participant boundary owns the remaining semantics. A routed packet is
-delivered as a track packet plus `TrackKey`. Participant-local state maps that
-key to negotiated audio/video slots or data channels and performs allocation,
+delivered as a track packet plus `TrackHandle`. Participant-local state maps that
+handle to negotiated audio/video slots or data channels and performs allocation,
 codec handling and reliability work. The shard does not need those decisions
 to fan out the track.
 
@@ -163,17 +164,17 @@ to fan out the track.
 ### Local origin
 
 When a participant emits a packet, the shard pipeline already carries its
-compiled `TrackKey`.
+compiled `TrackHandle`.
 
-1. Resolve the track runtime and `TrackPlan` by `TrackKey`.
+1. Resolve the track runtime and `TrackPlan` by `TrackHandle`.
 2. Deliver the packet to every `ParticipantHandle` in `plan.local`.
 3. If the packet originated locally, emit one copy for every route in
    `plan.remote`.
 
 Each remote copy has a fixed envelope and an owned payload. The envelope route
-selects the destination shard. The payload contains the destination-independent
-track packet; the receiving shard replaces its source key with the key compiled
-into the destination route.
+selects the destination shard. The payload contains `TrackId` plus the
+destination-independent track packet; the receiving shard validates the ID
+against the `TrackHandle` compiled into the destination route.
 
 ### Remote arrival
 
@@ -194,7 +195,7 @@ by the destination shard and is not part of the controller's plan.
 ### Reverse traffic
 
 Keyframe requests and reliable data acknowledgements use the same reverse
-shape. The route identifies the publisher-side `TrackKey`; the small body
+shape. The route identifies the publisher-side `TrackHandle`; the small body
 carries only information that cannot be derived from the track, such as an
 encoding index or acknowledgement bytes.
 
@@ -254,7 +255,7 @@ The forwarding path is:
 
 | Operation | Cost | Reason |
 | --- | ---: | --- |
-| resolve `TrackKey` | O(1) | dense slot-map lookup |
+| resolve `TrackHandle` | O(1) | dense slot-map lookup |
 | resolve route and epoch | O(1) | dense route-table index |
 | local fanout | O(L) | one delivery per required recipient |
 | remote fanout | O(D) | one copy per required destination shard |
@@ -361,7 +362,7 @@ A change that breaks one of these is an architectural regression even when its
 tests pass:
 
 1. The controller owns rooms, track identities, selectors and placement.
-2. The shard routes only by `TrackKey`, `ParticipantHandle` and node route address.
+2. The shard routes only by `TrackHandle`, `ParticipantHandle` and node route address.
 3. Every track kind uses the same `TrackPlan` and `Forward` action.
 4. A plan contains exact outputs, never selectors or stable application ids.
 5. A remote origin sends one copy per destination shard; that shard performs

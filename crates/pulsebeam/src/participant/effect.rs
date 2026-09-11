@@ -1,5 +1,4 @@
 use crate::entity::ParticipantId;
-use crate::keys::TrackKey;
 use crate::track::Track;
 
 #[derive(Debug, Clone)]
@@ -9,27 +8,35 @@ pub enum ParticipantEffect {
         removed: Vec<ParticipantId>,
     },
     TrackCandidateAdded {
-        key: TrackKey,
         track: Track,
     },
     TrackCandidateRemoved {
-        key: TrackKey,
         track_id: crate::entity::TrackId,
     },
     TrackSubscribed {
-        key: TrackKey,
         track_id: crate::entity::TrackId,
     },
     TrackUnsubscribed {
-        key: TrackKey,
         track_id: crate::entity::TrackId,
     },
     TrackPublished {
-        key: TrackKey,
         track_id: crate::entity::TrackId,
     },
     TrackUnpublished {
-        key: TrackKey,
         track_id: crate::entity::TrackId,
     },
+}
+
+impl ParticipantEffect {
+    pub(crate) fn track_id(&self) -> Option<crate::entity::TrackId> {
+        match self {
+            Self::ParticipantsChanged { .. } => None,
+            Self::TrackCandidateAdded { track } => Some(track.id()),
+            Self::TrackCandidateRemoved { track_id }
+            | Self::TrackSubscribed { track_id }
+            | Self::TrackUnsubscribed { track_id }
+            | Self::TrackPublished { track_id }
+            | Self::TrackUnpublished { track_id } => Some(*track_id),
+        }
+    }
 }

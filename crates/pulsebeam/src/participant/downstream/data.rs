@@ -3,13 +3,13 @@ use std::collections::VecDeque;
 use str0m::channel::ChannelId;
 
 use crate::{
-    keys::TrackKey,
+    keys::TrackHandle,
     track::{DataTopicChannel, DataTrackDirection, Track},
 };
 
 pub struct DownstreamData {
-    delivered: VecDeque<(TrackKey, usize)>,
-    forwarding: SecondaryMap<TrackKey, ChannelId>,
+    delivered: VecDeque<(TrackHandle, usize)>,
+    forwarding: SecondaryMap<TrackHandle, ChannelId>,
 }
 
 impl DownstreamData {
@@ -22,7 +22,7 @@ impl DownstreamData {
 
     pub(crate) fn add_candidate(
         &mut self,
-        key: TrackKey,
+        key: TrackHandle,
         track: &Track,
         channels: &[(ChannelId, DataTopicChannel)],
     ) {
@@ -44,15 +44,15 @@ impl DownstreamData {
         }
     }
 
-    pub(crate) fn remove_candidate(&mut self, key: TrackKey) {
+    pub(crate) fn remove_candidate(&mut self, key: TrackHandle) {
         self.forwarding.remove(key);
     }
 
-    pub(crate) fn forwarding(&self, key: TrackKey) -> Option<ChannelId> {
+    pub(crate) fn forwarding(&self, key: TrackHandle) -> Option<ChannelId> {
         self.forwarding.get(key).copied()
     }
 
-    pub(crate) fn subscribed_stream(&self, cid: ChannelId) -> Option<TrackKey> {
+    pub(crate) fn subscribed_stream(&self, cid: ChannelId) -> Option<TrackHandle> {
         self.forwarding
             .iter()
             .find_map(|(key, channel)| (*channel == cid).then_some(key))
@@ -62,7 +62,7 @@ impl DownstreamData {
         self.forwarding.retain(|_, bound| *bound != cid);
     }
 
-    pub(crate) fn record_delivery(&mut self, key: TrackKey, bytes: usize) {
+    pub(crate) fn record_delivery(&mut self, key: TrackHandle, bytes: usize) {
         debug_assert!(bytes > 0);
         if self.delivered.len() == 32 {
             self.delivered.pop_front();

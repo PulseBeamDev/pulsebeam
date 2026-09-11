@@ -3,21 +3,21 @@ use std::collections::VecDeque;
 use super::worker::ShardEvent;
 use crate::entity::{ParticipantId, RoomId, TrackId};
 use crate::keys::ParticipantHandle;
-use crate::keys::TrackKey;
+use crate::keys::TrackHandle;
+use crate::participant::TrackPacket;
 use crate::participant::event::ParticipantSink;
 use crate::participant::reverse::ReversePacket;
-use crate::participant::{RoutedTrackPacket, TrackPacket};
 use crate::track::{SelectionPolicy, Track, TrackMeta, TrackSelector};
 
-/// The compiled identity of the participant emitting into the pipeline.
+/// The shard-local binding of the participant emitting into the pipeline.
 ///
 /// A sink is built per participant in the dirty loop, which already holds
-/// both the key and the name, so carrying both costs nothing and lets the
-/// hot events use keys while the lifecycle events keep using names.
+/// both the handle and stable identity, so carrying both costs nothing and
+/// lets hot events use the handle while lifecycle events keep using the ID.
 #[derive(Clone, Copy)]
-pub(crate) struct SinkIdentity {
-    pub id: ParticipantId,
-    pub key: ParticipantHandle,
+pub(crate) struct ParticipantBinding {
+    pub participant_id: ParticipantId,
+    pub handle: ParticipantHandle,
     pub room_id: RoomId,
 }
 
@@ -53,14 +53,14 @@ pub enum ParticipantLifecycleEvent {
 
 pub enum ShardInternalEvent {
     ReverseRequested {
-        stream: TrackKey,
+        stream: TrackHandle,
         packet: ReversePacket,
     },
 }
 
 pub(crate) struct EventPipeline {
     participant_events: VecDeque<ParticipantEvent>,
-    track_queue: VecDeque<RoutedTrackPacket>,
+    track_queue: VecDeque<(TrackHandle, TrackPacket)>,
     shard_events: VecDeque<ShardEvent>,
     packet_capacity: usize,
 }
@@ -75,10 +75,10 @@ impl EventPipeline {
         }
     }
 
-    pub fn participant_sink(&mut self, who: SinkIdentity) -> PipelineSinkRef<'_> {
+    pub fn participant_sink(&mut self, who: ParticipantBinding) -> PipelineSinkRef<'_> {
         PipelineSinkRef {
-            id: who.id,
-            key: who.key,
+            id: who.participant_id,
+            key: who.handle,
             room_id: who.room_id,
             pipeline: self,
         }
@@ -88,7 +88,7 @@ impl EventPipeline {
         self.participant_events.pop_front()
     }
 
-    fn push_packet(&mut self, packet: RoutedTrackPacket) -> bool {
+    fn push_packet(&mut self, packet: (TrackHandle, TrackPacket)) -> bool {
         if self.track_queue.len() >= self.packet_capacity {
             metrics::counter!("routing_drop", "lane" => "packet", "stage" => "pipeline", "origin" => "local").increment(1);
             #[cfg(feature = "sim")]
@@ -103,7 +103,7 @@ impl EventPipeline {
         self.shard_events.push_back(ev);
     }
 
-    pub fn pop_packet(&mut self) -> Option<RoutedTrackPacket> {
+    pub fn pop_packet(&mut self) -> Option<(TrackHandle, TrackPacket)> {
         self.track_queue.pop_front()
     }
 
@@ -218,7 +218,7 @@ impl<'a> ParticipantSink for PipelineSinkRef<'a> {
     }
 
     #[inline]
-    fn request_reverse(&mut self, stream: TrackKey, packet: ReversePacket) {
+    fn request_reverse(&mut self, stream: TrackHandle, packet: ReversePacket) {
         self.pipeline
             .participant_events
             .push_back(ParticipantEvent::Internal(
@@ -238,11 +238,11 @@ impl<'a> ParticipantSink for PipelineSinkRef<'a> {
     }
 
     #[inline]
-    fn publish_track_packet(&mut self, fanout: Option<TrackKey>, packet: TrackPacket) {
+    fn publish_track_packet(&mut self, fanout: Option<TrackHandle>, packet: TrackPacket) {
         let Some(key) = fanout else {
             return;
         };
-        self.pipeline.push_packet(RoutedTrackPacket { key, packet });
+        self.pipeline.push_packet((key, packet));
     }
 }
 
@@ -255,16 +255,16 @@ mod tests {
     use crate::rtp::RtpPacket;
     use crate::track::DataLane;
 
-    fn identity() -> SinkIdentity {
+    fn identity() -> ParticipantBinding {
         let room = RoomExternalId::new("room").unwrap();
-        SinkIdentity {
-            id: ParticipantId::new(),
-            key: ParticipantHandle::default(),
+        ParticipantBinding {
+            participant_id: ParticipantId::new(),
+            handle: ParticipantHandle::default(),
             room_id: RoomId::from_external(&room),
         }
     }
 
-    /// RTP from every track kind uses the same queue and carries only its TrackKey.
+    /// RTP from every track kind uses the same queue and carries only its TrackHandle.
     #[test]
     fn every_event_lands_in_its_own_queue() {
         let mut pipeline = EventPipeline::with_capacity(4);
@@ -272,15 +272,15 @@ mod tests {
 
         let mut sink = pipeline.participant_sink(who);
         sink.publish_track_packet(
-            Some(TrackKey::default()),
+            Some(TrackHandle::default()),
             TrackPacket::Rtp(RtpPacket::default()),
         );
         sink.publish_track_packet(
-            Some(TrackKey::default()),
+            Some(TrackHandle::default()),
             TrackPacket::Rtp(RtpPacket::default()),
         );
         sink.publish_track_packet(
-            Some(TrackKey::default()),
+            Some(TrackHandle::default()),
             TrackPacket::Data {
                 lane: DataLane::Realtime,
                 bytes: vec![1],
@@ -318,7 +318,7 @@ mod tests {
         let mut sink = pipeline.participant_sink(who);
         for n in 0..3u8 {
             sink.publish_track_packet(
-                Some(TrackKey::default()),
+                Some(TrackHandle::default()),
                 TrackPacket::Data {
                     lane: DataLane::Realtime,
                     bytes: vec![n],
@@ -327,7 +327,7 @@ mod tests {
         }
 
         let drained: Vec<Vec<u8>> = std::iter::from_fn(|| pipeline.pop_packet())
-            .map(|event| match event.packet {
+            .map(|event| match event.1 {
                 TrackPacket::Data { bytes, .. } => bytes,
                 _ => unreachable!(),
             })
@@ -339,7 +339,7 @@ mod tests {
     fn the_generic_packet_pipeline_is_bounded_for_both_data_lanes() {
         let mut pipeline = EventPipeline::with_capacity(2);
         let who = identity();
-        let key = TrackKey::default();
+        let key = TrackHandle::default();
         let mut sink = pipeline.participant_sink(who);
         sink.publish_track_packet(
             Some(key),
@@ -369,14 +369,14 @@ mod tests {
         drop(sink);
 
         assert!(matches!(
-            pipeline.pop_packet().unwrap().packet,
+            pipeline.pop_packet().unwrap().1,
             TrackPacket::Data {
                 lane: DataLane::Realtime,
                 ..
             }
         ));
         assert!(matches!(
-            pipeline.pop_packet().unwrap().packet,
+            pipeline.pop_packet().unwrap().1,
             TrackPacket::Data {
                 lane: DataLane::Reliable,
                 ..
@@ -398,14 +398,14 @@ mod tests {
         assert!(!pipeline.has_pending(), "an empty pipeline has no work");
 
         pipeline.push_shard_event(ShardEvent::ParticipantClosed {
-            participant: who.id,
+            participant: who.participant_id,
         });
         assert!(pipeline.has_pending(), "a shard event is work");
         assert!(pipeline.pop_shard_event().is_some());
         assert!(!pipeline.has_pending());
 
         pipeline.participant_sink(who).publish_track_packet(
-            Some(TrackKey::default()),
+            Some(TrackHandle::default()),
             TrackPacket::Rtp(RtpPacket::default()),
         );
         assert!(pipeline.has_pending(), "so is a track packet");

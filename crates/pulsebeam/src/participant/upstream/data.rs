@@ -2,12 +2,12 @@ use ahash::{HashMap, HashMapExt};
 use slotmap::SecondaryMap;
 use str0m::channel::ChannelId;
 
-use crate::{entity::TrackId, keys::TrackKey, track::Track};
+use crate::{entity::TrackId, keys::TrackHandle, track::Track};
 
 pub(crate) struct UpstreamData {
-    sources: SecondaryMap<TrackKey, ChannelId>,
+    sources: SecondaryMap<TrackHandle, ChannelId>,
     published: HashMap<TrackId, ChannelId>,
-    pending_sources: HashMap<TrackId, TrackKey>,
+    pending_sources: HashMap<TrackId, TrackHandle>,
 }
 
 impl UpstreamData {
@@ -19,7 +19,7 @@ impl UpstreamData {
         }
     }
 
-    pub(crate) fn bind_source(&mut self, track_id: TrackId, key: TrackKey) {
+    pub(crate) fn bind_source(&mut self, track_id: TrackId, key: TrackHandle) {
         if let Some(channel) = self.published.get(&track_id).copied() {
             let previous = self.sources.insert(key, channel);
             debug_assert!(previous.is_none() || previous == Some(channel));
@@ -47,11 +47,11 @@ impl UpstreamData {
         self.published.retain(|_, bound| *bound != cid);
     }
 
-    pub(crate) fn source(&self, key: TrackKey) -> Option<ChannelId> {
+    pub(crate) fn source(&self, key: TrackHandle) -> Option<ChannelId> {
         self.sources.get(key).copied()
     }
 
-    pub(crate) fn published_stream(&self, cid: ChannelId) -> Option<TrackKey> {
+    pub(crate) fn published_stream(&self, cid: ChannelId) -> Option<TrackHandle> {
         self.sources
             .iter()
             .find_map(|(key, channel)| (*channel == cid).then_some(key))

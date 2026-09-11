@@ -19,7 +19,7 @@ use str0m::rtp::Ssrc;
 use tokio::time::Instant;
 
 use crate::entity::TrackId;
-use crate::keys::{DownstreamSlotKey, TrackKey};
+use crate::keys::{DownstreamSlotKey, TrackHandle};
 use crate::log::{LogCtx, plog_debug, plog_error, plog_info, plog_trace, plog_warn};
 use crate::participant::intent::VideoIntent as Intent;
 use crate::track::{LayerQuality, StreamId, StreamWriter, Track, TrackLayer, TrackMeta};
@@ -102,20 +102,20 @@ pub const MAX_BANDWIDTH: Bitrate = Bitrate::mbps(5);
 pub const INITIAL_BANDWIDTH: Bitrate = Bitrate::mbps(2);
 
 pub struct VideoAllocator {
-    routes: SecondaryMap<TrackKey, DownstreamSlotKey>,
+    routes: SecondaryMap<TrackHandle, DownstreamSlotKey>,
     slots: SlotMap<DownstreamSlotKey, Slot>,
 
     // Cold
     ctx: LogCtx,
     manual_sub: bool,
-    tracks: SecondaryMap<TrackKey, Track>,
-    track_keys: HashMap<TrackId, TrackKey>,
-    active_track_keys: HashMap<TrackId, TrackKey>,
-    last_reconciled: HashSet<(TrackKey, DownstreamSlotKey)>,
+    tracks: SecondaryMap<TrackHandle, Track>,
+    track_handles: HashMap<TrackId, TrackHandle>,
+    active_track_handles: HashMap<TrackId, TrackHandle>,
+    last_reconciled: HashSet<(TrackHandle, DownstreamSlotKey)>,
     desired_ctrl: BitrateController,
     current_allocation: Bitrate,
     #[cfg(test)]
-    test_keys: SlotMap<TrackKey, ()>,
+    test_keys: SlotMap<TrackHandle, ()>,
     #[cfg(test)]
     test_layer_states: LayerStates,
 }
@@ -159,8 +159,8 @@ impl VideoAllocator {
             ctx,
             manual_sub,
             tracks: SecondaryMap::new(),
-            track_keys: HashMap::new(),
-            active_track_keys: HashMap::new(),
+            track_handles: HashMap::new(),
+            active_track_handles: HashMap::new(),
             slots: slotmap::SlotMap::with_capacity_and_key(VIDEO_MAX_SLOTS),
             routes: SecondaryMap::new(),
             last_reconciled: HashSet::new(),
@@ -173,27 +173,27 @@ impl VideoAllocator {
         }
     }
 
-    pub(crate) fn install_track(&mut self, key: TrackKey, track: Track) {
-        if self.track_keys.insert(track.id(), key).is_some() {
-            debug_assert!(false, "a TrackId must have one installed TrackKey");
+    pub(crate) fn install_track(&mut self, key: TrackHandle, track: Track) {
+        if self.track_handles.insert(track.id(), key).is_some() {
+            debug_assert!(false, "a TrackId must have one installed TrackHandle");
             return;
         }
         plog_info!(self.ctx, track = %track.meta().id, "video track added");
         let previous = self.tracks.insert(key, track);
-        debug_assert!(previous.is_none(), "a TrackKey must be installed once");
+        debug_assert!(previous.is_none(), "a TrackHandle must be installed once");
         self.rebalance();
     }
 
-    pub(crate) fn activate_track_binding(&mut self, key: TrackKey, track_id: TrackId) {
-        debug_assert_eq!(self.track_keys.get(&track_id), Some(&key));
-        let previous = self.active_track_keys.insert(track_id, key);
+    pub(crate) fn activate_track_binding(&mut self, key: TrackHandle, track_id: TrackId) {
+        debug_assert_eq!(self.track_handles.get(&track_id), Some(&key));
+        let previous = self.active_track_handles.insert(track_id, key);
         debug_assert!(previous.is_none() || previous == Some(key));
     }
 
-    pub(crate) fn deactivate_track_binding(&mut self, key: TrackKey, track_id: TrackId) {
-        debug_assert_eq!(self.active_track_keys.get(&track_id), Some(&key));
-        if self.active_track_keys.get(&track_id) == Some(&key) {
-            self.active_track_keys.remove(&track_id);
+    pub(crate) fn deactivate_track_binding(&mut self, key: TrackHandle, track_id: TrackId) {
+        debug_assert_eq!(self.active_track_handles.get(&track_id), Some(&key));
+        if self.active_track_handles.get(&track_id) == Some(&key) {
+            self.active_track_handles.remove(&track_id);
         }
     }
 
@@ -206,11 +206,11 @@ impl VideoAllocator {
     }
 
     pub fn remove_track(&mut self, track_id: &TrackId) -> bool {
-        let Some(key) = self.track_keys.remove(track_id) else {
+        let Some(key) = self.track_handles.remove(track_id) else {
             return false;
         };
-        debug_assert!(!self.active_track_keys.contains_key(track_id));
-        self.active_track_keys.remove(track_id);
+        debug_assert!(!self.active_track_handles.contains_key(track_id));
+        self.active_track_handles.remove(track_id);
         let removed = self.tracks.remove(key);
         debug_assert!(removed.is_some(), "track index must resolve to catalog");
         plog_info!(self.ctx, track = %track_id, "video track removed");
@@ -238,12 +238,12 @@ impl VideoAllocator {
     pub fn configure(&mut self, intents: &HashMap<Mid, Intent>) {
         let slots = &mut self.slots;
         let tracks = &self.tracks;
-        let track_keys = &self.track_keys;
+        let track_handles = &self.track_handles;
         for (_key, slot) in slots {
             if let Some(intent) = intents.get(&slot.mid) {
-                Self::configure_slot(tracks, track_keys, slot, Some(intent));
+                Self::configure_slot(tracks, track_handles, slot, Some(intent));
             } else {
-                Self::configure_slot(tracks, track_keys, slot, None);
+                Self::configure_slot(tracks, track_handles, slot, None);
             }
         }
     }
@@ -251,8 +251,8 @@ impl VideoAllocator {
     /// Routes this slot to the given track at the specified QoS, or stops
     /// routing if `track_id` is `None` or `intent.max_height` is 0.
     fn configure_slot(
-        tracks: &SecondaryMap<TrackKey, Track>,
-        track_keys: &HashMap<TrackId, TrackKey>,
+        tracks: &SecondaryMap<TrackHandle, Track>,
+        track_handles: &HashMap<TrackId, TrackHandle>,
         slot: &mut Slot,
         intent: Option<&Intent>,
     ) -> Option<()> {
@@ -260,13 +260,13 @@ impl VideoAllocator {
             && intent.target_height > 0
         {
             let track_id = &intent.track_id;
-            let Some(&track_key) = track_keys.get(track_id) else {
+            let Some(&track_handle) = track_handles.get(track_id) else {
                 plog_warn!(slot.ctx, track_id=%track_id, mid=%slot.mid, "configure_slot: requested track missing");
                 slot.max_height = 0;
                 slot.stop();
                 return None;
             };
-            let Some(track_state) = tracks.get(track_key) else {
+            let Some(track_state) = tracks.get(track_handle) else {
                 debug_assert!(false, "track index must resolve to catalog");
                 slot.stop();
                 return None;
@@ -434,8 +434,8 @@ impl VideoAllocator {
             .iter()
             .filter_map(|(key, s)| {
                 let current = s.target()?;
-                let track_key = *self.track_keys.get(&current.meta.id)?;
-                let track = self.tracks.get(track_key)?;
+                let track_handle = *self.track_handles.get(&current.meta.id)?;
+                let track = self.tracks.get(track_handle)?;
                 let current_quality = current.quality;
                 Some(SlotView {
                     key,
@@ -527,11 +527,14 @@ impl VideoAllocator {
         self.current_allocation
     }
 
-    pub fn handle_keyframe_request(&self, req: KeyframeRequest) -> Option<(TrackKey, &TrackLayer)> {
+    pub fn handle_keyframe_request(
+        &self,
+        req: KeyframeRequest,
+    ) -> Option<(TrackHandle, &TrackLayer)> {
         for slot in self.slots.values() {
             if slot.mid == req.mid && slot.rid == req.rid {
                 let layer = slot.target()?;
-                let fanout = self.active_track_keys.get(&layer.meta.id).copied()?;
+                let fanout = self.active_track_handles.get(&layer.meta.id).copied()?;
                 return Some((fanout, layer));
             }
         }
@@ -541,7 +544,7 @@ impl VideoAllocator {
     #[inline]
     pub fn on_rtp(
         &mut self,
-        track_key: TrackKey,
+        track_handle: TrackHandle,
         arrival_ts: Instant,
         cache: Option<&TrackStreamCache>,
         writer: &mut StreamWriter,
@@ -553,16 +556,16 @@ impl VideoAllocator {
         // monitor, so caching the first one was enough — the values behind it
         // kept moving. They are values now, so a first-write-wins cache would
         // freeze the allocator on whatever it happened to see first.
-        let Some(&slot_key) = self.routes.get(track_key) else {
+        let Some(&slot_key) = self.routes.get(track_handle) else {
             return false;
         };
-        let Some(track) = self.tracks.get(track_key) else {
+        let Some(track) = self.tracks.get(track_handle) else {
             debug_assert!(false, "route key must resolve to an installed track");
             return false;
         };
         let track_id = track.id();
         let Some(slot) = self.slots.get_mut(slot_key) else {
-            plog_warn!(self.ctx, "no slot found for track {:?}", track_key);
+            plog_warn!(self.ctx, "no slot found for track {:?}", track_handle);
             return false;
         };
         slot.on_rtp(track_id, arrival_ts, cache, writer)
@@ -579,9 +582,11 @@ impl VideoAllocator {
     }
 
     fn retry_keyframe_requests(&mut self, now: Instant, events: &mut impl ParticipantSink) {
-        let track_keys = &self.active_track_keys;
+        let track_handles = &self.active_track_handles;
         for (_, slot) in &mut self.slots {
-            slot.pli_retry(now, events, |track_id| track_keys.get(&track_id).copied());
+            slot.pli_retry(now, events, |track_id| {
+                track_handles.get(&track_id).copied()
+            });
         }
     }
 
@@ -600,24 +605,27 @@ impl VideoAllocator {
             .into_iter()
             .flatten()
             {
-                let Some(&track_key) = self.track_keys.get(&stream.0) else {
+                let Some(&track_handle) = self.track_handles.get(&stream.0) else {
                     continue;
                 };
-                current.insert((track_key, slot_key));
+                current.insert((track_handle, slot_key));
             }
             if let Some(desired) = slot.desired.as_ref()
-                && let Some(&track_key) = self.track_keys.get(&desired.meta.id)
+                && let Some(&track_handle) = self.track_handles.get(&desired.meta.id)
             {
-                current.insert((track_key, slot_key));
+                current.insert((track_handle, slot_key));
             }
         }
 
         let previous_tracks: HashSet<_> = self
             .last_reconciled
             .iter()
-            .map(|(track_key, _)| *track_key)
+            .map(|(track_handle, _)| *track_handle)
             .collect();
-        let current_tracks: HashSet<_> = current.iter().map(|(track_key, _)| *track_key).collect();
+        let current_tracks: HashSet<_> = current
+            .iter()
+            .map(|(track_handle, _)| *track_handle)
+            .collect();
         let old_routes = std::mem::take(&mut self.routes);
         for (track_id, slot_key) in old_routes {
             if current.contains(&(track_id, slot_key)) {
@@ -625,19 +633,19 @@ impl VideoAllocator {
             }
         }
 
-        for (track_key, slot_key) in &current {
-            if self.routes.get(*track_key) != Some(slot_key) {
-                self.routes.insert(*track_key, *slot_key);
+        for (track_handle, slot_key) in &current {
+            if self.routes.get(*track_handle) != Some(slot_key) {
+                self.routes.insert(*track_handle, *slot_key);
             }
         }
 
-        for track_key in previous_tracks.difference(&current_tracks) {
-            if let Some(track) = self.tracks.get(*track_key) {
+        for track_handle in previous_tracks.difference(&current_tracks) {
+            if let Some(track) = self.tracks.get(*track_handle) {
                 events.deactivate_track(track.meta().clone());
             }
         }
-        for track_key in current_tracks.difference(&previous_tracks) {
-            if let Some(track) = self.tracks.get(*track_key) {
+        for track_handle in current_tracks.difference(&previous_tracks) {
+            if let Some(track) = self.tracks.get(*track_handle) {
                 events.activate_track(track.meta().clone());
             }
         }
@@ -651,10 +659,10 @@ impl VideoAllocator {
     }
 
     fn routes_consistent(&self) -> bool {
-        self.routes.iter().all(|(track_key, slot_key)| {
+        self.routes.iter().all(|(track_handle, slot_key)| {
             self.slots.get(*slot_key).is_some_and(|slot| {
                 self.tracks
-                    .get(track_key)
+                    .get(track_handle)
                     .is_some_and(|track| slot.matches_track_id(&track.id()))
             })
         })
@@ -662,20 +670,20 @@ impl VideoAllocator {
 
     #[cfg(test)]
     fn has_route(&self, track_id: &TrackId) -> bool {
-        self.track_keys
+        self.track_handles
             .get(track_id)
             .is_some_and(|key| self.routes.contains_key(*key))
     }
 
     #[cfg(test)]
     fn set_route(&mut self, track_id: TrackId, slot_key: DownstreamSlotKey) {
-        let key = *self.track_keys.get(&track_id).unwrap();
+        let key = *self.track_handles.get(&track_id).unwrap();
         self.routes.insert(key, slot_key);
     }
 
     #[cfg(test)]
     fn route_slot(&self, track_id: &TrackId) -> Option<DownstreamSlotKey> {
-        self.track_keys
+        self.track_handles
             .get(track_id)
             .and_then(|key| self.routes.get(*key).copied())
     }
@@ -689,7 +697,7 @@ impl VideoAllocator {
         cache: Option<&TrackStreamCache>,
         writer: &mut StreamWriter,
     ) -> bool {
-        let Some(&key) = self.track_keys.get(&track_id) else {
+        let Some(&key) = self.track_handles.get(&track_id) else {
             return false;
         };
         self.on_rtp(key, pkt.arrival_ts, cache, writer)
@@ -733,7 +741,7 @@ impl VideoAllocator {
     }
 
     fn track(&self, track_id: &TrackId) -> Option<&Track> {
-        self.track_keys
+        self.track_handles
             .get(track_id)
             .and_then(|key| self.tracks.get(*key))
     }
@@ -864,7 +872,7 @@ impl Slot {
         &mut self,
         now: Instant,
         events: &mut impl ParticipantSink,
-        fanout_for: impl Fn(TrackId) -> Option<TrackKey>,
+        fanout_for: impl Fn(TrackId) -> Option<TrackHandle>,
     ) {
         if self.paused {
             return;
@@ -2109,7 +2117,7 @@ mod assignment_tests {
             .expect("an active downstream target must resolve its reverse route");
         assert_eq!(
             fanout,
-            allocator.active_track_keys[&requested_layer.meta.id]
+            allocator.active_track_handles[&requested_layer.meta.id]
         );
         assert_eq!(requested_layer.stream_id(), low.stream_id());
 
@@ -2132,7 +2140,7 @@ mod assignment_tests {
         slot.set_roles_for_test(None, Some(&low));
         slot.paused = false;
         fresh.reconcile_routes(&mut unbound);
-        fresh.active_track_keys.clear();
+        fresh.active_track_handles.clear();
         fresh.retry_keyframe_requests(now, &mut unbound);
         assert_eq!(
             unbound.reverse_requests.len(),
@@ -2204,7 +2212,7 @@ mod assignment_tests {
             .stream_id();
         let slot_key = allocator.slots.keys().next().unwrap();
         allocator.set_route(old_stream_id.0, slot_key);
-        let old_key = *allocator.track_keys.get(&old_stream_id.0).unwrap();
+        let old_key = *allocator.track_handles.get(&old_stream_id.0).unwrap();
         allocator.last_reconciled.insert((old_key, slot_key));
 
         let slot = allocator.slots.values_mut().next().unwrap();
@@ -2292,7 +2300,7 @@ mod assignment_tests {
         let tracks = add_tracks(&mut allocator, 1);
         add_slots(&mut allocator, 1);
         assert_eq!(allocator.slots().count(), 1);
-        let key = allocator.track_keys[&tracks.ids[0]];
+        let key = allocator.track_handles[&tracks.ids[0]];
         allocator.deactivate_track_binding(key, tracks.ids[0]);
         allocator.remove_track(&tracks.ids[0]);
         assert_eq!(allocator.slots().count(), 0);
@@ -2609,7 +2617,7 @@ mod assignment_tests {
         let mut allocator = setup_allocator();
         let mut tracks = add_tracks(&mut allocator, 3);
         add_slots(&mut allocator, 3);
-        let key = allocator.track_keys[&tracks.ids[1]];
+        let key = allocator.track_handles[&tracks.ids[1]];
         allocator.deactivate_track_binding(key, tracks.ids[1]);
         allocator.remove_track(&tracks.ids[1]);
         let pid = ParticipantId::new();
@@ -2844,8 +2852,8 @@ mod slot_switch_tests {
         // it: without one the shard can only drop the request, so `pli_retry`
         // withholds it rather than burning a retry on a request that cannot land.
         let mut sink = crate::participant::event::test_utils::MockParticipantSink::new();
-        let mut keys: SlotMap<TrackKey, ()> = SlotMap::with_key();
-        let fanouts: HashMap<TrackId, TrackKey> =
+        let mut keys: SlotMap<TrackHandle, ()> = SlotMap::with_key();
+        let fanouts: HashMap<TrackId, TrackHandle> =
             [(low.stream_id().0, keys.insert(()))].into_iter().collect();
         fx.slot.pli_retry(Instant::now(), &mut sink, |track_id| {
             fanouts.get(&track_id).copied()

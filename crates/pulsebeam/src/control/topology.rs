@@ -15,23 +15,23 @@ new_key_type! {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) struct TrackIdentity {
+pub(crate) struct TrackAncestry {
     pub room_id: RoomId,
     pub publisher: ParticipantId,
-    pub id: TrackId,
+    pub track_id: TrackId,
 }
 
-impl TrackIdentity {
+impl TrackAncestry {
     pub(crate) fn from_track(track: &Track) -> Self {
         Self {
             room_id: track.meta().room_id,
             publisher: track.meta().origin,
-            id: track.id(),
+            track_id: track.id(),
         }
     }
 
     pub(crate) fn kind(self) -> TrackKind {
-        self.id.kind()
+        self.track_id.kind()
     }
 }
 
@@ -81,47 +81,48 @@ pub(crate) struct TrackTopology {
 }
 
 impl TrackTopology {
-    pub(crate) fn publish(&mut self, track: Track) -> Option<TrackIdentity> {
-        let identity = TrackIdentity::from_track(&track);
+    pub(crate) fn publish(&mut self, track: Track) -> Option<TrackAncestry> {
+        let identity = TrackAncestry::from_track(&track);
         let label = track.publication_label();
         let room = self.rooms.entry(identity.room_id).or_default();
-        if room.tracks.contains_key(&identity.id) {
+        if room.tracks.contains_key(&identity.track_id) {
             debug_assert!(false, "a track identity must be published once");
             return None;
         }
         room.index_track(identity, label.as_deref());
         room.tracks
-            .insert(identity.id, Publication { track, label });
+            .insert(identity.track_id, Publication { track, label });
         room.add_publication_reasons(identity);
         Some(identity)
     }
 
-    pub(crate) fn unpublish(&mut self, identity: TrackIdentity) -> Option<Track> {
+    pub(crate) fn unpublish(&mut self, identity: TrackAncestry) -> Option<Track> {
         let room = self.rooms.get_mut(&identity.room_id)?;
-        let publication = room.tracks.remove(&identity.id)?;
-        debug_assert_eq!(TrackIdentity::from_track(&publication.track), identity);
+        let publication = room.tracks.remove(&identity.track_id)?;
+        debug_assert_eq!(TrackAncestry::from_track(&publication.track), identity);
         room.unindex_track(identity, publication.label.as_deref());
         room.candidate_reasons
-            .retain(|(_, track), _| *track != identity.id);
+            .retain(|(_, track), _| *track != identity.track_id);
         room.automatic_reasons
-            .retain(|(_, track), _| *track != identity.id);
-        room.allocated.retain(|(_, track)| *track != identity.id);
+            .retain(|(_, track), _| *track != identity.track_id);
+        room.allocated
+            .retain(|(_, track)| *track != identity.track_id);
         Some(publication.track)
     }
 
-    pub(crate) fn track(&self, identity: TrackIdentity) -> Option<&Track> {
+    pub(crate) fn track(&self, identity: TrackAncestry) -> Option<&Track> {
         self.rooms
             .get(&identity.room_id)?
             .tracks
-            .get(&identity.id)
+            .get(&identity.track_id)
             .map(|publication| &publication.track)
     }
 
-    pub(crate) fn track_mut(&mut self, identity: TrackIdentity) -> Option<&mut Track> {
+    pub(crate) fn track_mut(&mut self, identity: TrackAncestry) -> Option<&mut Track> {
         self.rooms
             .get_mut(&identity.room_id)?
             .tracks
-            .get_mut(&identity.id)
+            .get_mut(&identity.track_id)
             .map(|publication| &mut publication.track)
     }
 
@@ -162,7 +163,7 @@ impl TrackTopology {
     #[cfg(test)]
     pub(crate) fn matches(
         &self,
-        identity: TrackIdentity,
+        identity: TrackAncestry,
     ) -> impl Iterator<Item = Subscription> + '_ {
         self.rooms
             .get(&identity.room_id)
@@ -172,53 +173,53 @@ impl TrackTopology {
 
     pub(crate) fn candidate_subscribers(
         &self,
-        identity: TrackIdentity,
+        identity: TrackAncestry,
     ) -> impl Iterator<Item = ParticipantId> + '_ {
         self.rooms
             .get(&identity.room_id)
             .into_iter()
-            .flat_map(move |room| room.candidate_subscribers(identity.id))
+            .flat_map(move |room| room.candidate_subscribers(identity.track_id))
     }
 
     pub(crate) fn active_subscribers(
         &self,
-        identity: TrackIdentity,
+        identity: TrackAncestry,
     ) -> impl Iterator<Item = ParticipantId> + '_ {
         self.rooms
             .get(&identity.room_id)
             .into_iter()
-            .flat_map(move |room| room.active_subscribers(identity.id))
+            .flat_map(move |room| room.active_subscribers(identity.track_id))
     }
 
-    pub(crate) fn activate(&mut self, identity: TrackIdentity, subscriber: ParticipantId) -> bool {
+    pub(crate) fn activate(&mut self, identity: TrackAncestry, subscriber: ParticipantId) -> bool {
         let Some(room) = self.rooms.get_mut(&identity.room_id) else {
             debug_assert!(false, "activation must target a live room catalog");
             return false;
         };
-        room.activate(identity.id, subscriber)
+        room.activate(identity.track_id, subscriber)
     }
 
     pub(crate) fn deactivate(
         &mut self,
-        identity: TrackIdentity,
+        identity: TrackAncestry,
         subscriber: ParticipantId,
     ) -> bool {
         self.rooms
             .get_mut(&identity.room_id)
-            .is_some_and(|room| room.allocated.remove(&(subscriber, identity.id)))
+            .is_some_and(|room| room.allocated.remove(&(subscriber, identity.track_id)))
     }
 
-    pub(crate) fn contains(&self, identity: TrackIdentity) -> bool {
+    pub(crate) fn contains(&self, identity: TrackAncestry) -> bool {
         self.rooms
             .get(&identity.room_id)
-            .is_some_and(|room| room.tracks.contains_key(&identity.id))
+            .is_some_and(|room| room.tracks.contains_key(&identity.track_id))
     }
 
     pub(crate) fn matching_tracks(
         &self,
         room_id: RoomId,
         selector: &TrackSelector,
-    ) -> Vec<TrackIdentity> {
+    ) -> Vec<TrackAncestry> {
         self.rooms.get(&room_id).map_or_else(Vec::new, |room| {
             room.selector_tracks(selector)
                 .into_iter()
@@ -227,7 +228,7 @@ impl TrackTopology {
         })
     }
 
-    pub(crate) fn identities(&self) -> impl Iterator<Item = TrackIdentity> + '_ {
+    pub(crate) fn identities(&self) -> impl Iterator<Item = TrackAncestry> + '_ {
         self.rooms.iter().flat_map(|(room_id, room)| {
             room.tracks
                 .keys()
@@ -253,47 +254,51 @@ impl TrackTopology {
 }
 
 impl RoomTrackTopology {
-    fn identity(&self, room_id: RoomId, track: TrackId) -> Option<TrackIdentity> {
+    fn identity(&self, room_id: RoomId, track: TrackId) -> Option<TrackAncestry> {
         let publication = self.tracks.get(&track)?;
-        Some(TrackIdentity {
+        Some(TrackAncestry {
             room_id,
             publisher: publication.track.meta().origin,
-            id: track,
+            track_id: track,
         })
     }
 
-    fn index_track(&mut self, identity: TrackIdentity, label: Option<&str>) {
-        debug_assert!(!self.tracks.contains_key(&identity.id));
+    fn index_track(&mut self, identity: TrackAncestry, label: Option<&str>) {
+        debug_assert!(!self.tracks.contains_key(&identity.track_id));
         let publisher_inserted = self
             .by_publisher
             .entry(identity.publisher)
             .or_default()
-            .insert(identity.id);
+            .insert(identity.track_id);
         debug_assert!(publisher_inserted);
         let kind_inserted = self
             .by_kind
             .entry(identity.kind())
             .or_default()
-            .insert(identity.id);
+            .insert(identity.track_id);
         debug_assert!(kind_inserted);
         if let Some(label) = label {
             let label_inserted = self
                 .by_label
                 .entry(label.to_owned())
                 .or_default()
-                .insert(identity.id);
+                .insert(identity.track_id);
             debug_assert!(label_inserted);
         }
     }
 
-    fn unindex_track(&mut self, identity: TrackIdentity, label: Option<&str>) {
-        let publisher_removed =
-            remove_indexed(&mut self.by_publisher, identity.publisher, identity.id);
+    fn unindex_track(&mut self, identity: TrackAncestry, label: Option<&str>) {
+        let publisher_removed = remove_indexed(
+            &mut self.by_publisher,
+            identity.publisher,
+            identity.track_id,
+        );
         debug_assert!(publisher_removed);
-        let kind_removed = remove_indexed(&mut self.by_kind, identity.kind(), identity.id);
+        let kind_removed = remove_indexed(&mut self.by_kind, identity.kind(), identity.track_id);
         debug_assert!(kind_removed);
         if let Some(label) = label {
-            let label_removed = remove_indexed(&mut self.by_label, label.to_owned(), identity.id);
+            let label_removed =
+                remove_indexed(&mut self.by_label, label.to_owned(), identity.track_id);
             debug_assert!(label_removed);
         }
     }
@@ -399,14 +404,14 @@ impl RoomTrackTopology {
         );
     }
 
-    fn matching_subscription_ids(&self, identity: TrackIdentity) -> HashSet<SubscriptionId> {
-        let Some(publication) = self.tracks.get(&identity.id) else {
+    fn matching_subscription_ids(&self, identity: TrackAncestry) -> HashSet<SubscriptionId> {
+        let Some(publication) = self.tracks.get(&identity.track_id) else {
             return HashSet::new();
         };
-        debug_assert_eq!(TrackIdentity::from_track(&publication.track), identity);
+        debug_assert_eq!(TrackAncestry::from_track(&publication.track), identity);
         let mut candidates = self.unconstrained.clone();
         for ids in [
-            self.by_track.get(&identity.id),
+            self.by_track.get(&identity.track_id),
             self.by_subscriber_publisher.get(&identity.publisher),
             self.by_subscription_kind.get(&identity.kind()),
         ]
@@ -431,16 +436,16 @@ impl RoomTrackTopology {
     #[cfg(test)]
     fn matching_subscriptions(
         &self,
-        identity: TrackIdentity,
+        identity: TrackAncestry,
     ) -> impl Iterator<Item = Subscription> + '_ {
         self.matching_subscription_ids(identity)
             .into_iter()
             .filter_map(|id| self.subscriptions.get(id).cloned())
     }
 
-    fn add_publication_reasons(&mut self, identity: TrackIdentity) {
+    fn add_publication_reasons(&mut self, identity: TrackAncestry) {
         for id in self.matching_subscription_ids(identity) {
-            self.add_reason(identity.id, id);
+            self.add_reason(identity.track_id, id);
         }
     }
 
@@ -555,7 +560,7 @@ impl RoomTrackTopology {
             debug_assert!(false, "participant publication must remain indexed");
             return;
         };
-        let identity = TrackIdentity::from_track(&publication.track);
+        let identity = TrackAncestry::from_track(&publication.track);
         self.unindex_track(identity, publication.label.as_deref());
         self.candidate_reasons
             .retain(|(_, candidate), _| *candidate != track);
@@ -596,21 +601,19 @@ fn remove_reason(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct TrackAllocation {
-    pub key: crate::keys::TrackKey,
+pub(crate) struct TrackPlacement {
+    pub track_id: TrackId,
     pub route: NodeRouteAddress,
 }
 
 #[derive(Debug)]
-pub(crate) struct TrackAllocator {
-    keys: SlotMap<crate::keys::TrackKey, TrackIdentity>,
+pub(crate) struct TrackPlacementAllocator {
     routes: Vec<SlotAllocator>,
 }
 
-impl TrackAllocator {
+impl TrackPlacementAllocator {
     pub(crate) fn new(shard_count: usize) -> Self {
         Self {
-            keys: SlotMap::with_key(),
             routes: (0..shard_count)
                 .map(|index| {
                     SlotAllocator::with_max_slots(
@@ -624,40 +627,33 @@ impl TrackAllocator {
 
     #[allow(
         clippy::expect_used,
-        reason = "a track allocation for an unconfigured shard is a lifecycle invariant violation"
+        reason = "a track placement for an unconfigured shard is a lifecycle invariant violation"
     )]
     pub(crate) fn allocate(
         &mut self,
         shard: ShardId,
-        identity: TrackIdentity,
+        identity: TrackAncestry,
         now: Instant,
-    ) -> TrackAllocation {
+    ) -> TrackPlacement {
         let allocator = self
             .routes
             .get_mut(shard.index())
-            .expect("track allocation must target a configured shard");
+            .expect("track placement must target a configured shard");
 
         let (slot, epoch) = allocator.allocate(now);
 
-        let key = self.keys.insert(identity);
-
-        TrackAllocation {
-            key,
+        TrackPlacement {
+            track_id: identity.track_id,
             route: NodeRouteAddress::new(RouteId::new(shard, slot), epoch),
         }
     }
 
-    pub(crate) fn release(&mut self, allocation: TrackAllocation, now: Instant) {
-        let removed = self.keys.remove(allocation.key);
-        debug_assert!(
-            removed.is_some(),
-            "track allocation must be live at release"
-        );
-        let Some(allocator) = self.routes.get_mut(allocation.route.shard().index()) else {
+    pub(crate) fn release(&mut self, placement: TrackPlacement, now: Instant) {
+        let Some(allocator) = self.routes.get_mut(placement.route.shard().index()) else {
             debug_assert!(false, "track release targeted an unknown shard");
             return;
         };
-        allocator.retire(allocation.route.route.slot(), now);
+        allocator.retire(placement.route.route.slot(), now);
     }
 }
 
@@ -754,7 +750,7 @@ mod tests {
             .publish(track(TrackKind::Audio, 1, 1, "audio"))
             .unwrap();
         let subscriber = participant(3);
-        let exact = TrackSelector::track(identity.id);
+        let exact = TrackSelector::track(identity.track_id);
         let _ = topology.subscribe(
             room(1),
             subscriber,
@@ -808,13 +804,13 @@ mod tests {
 
     #[test]
     fn a_retired_destination_gets_a_fresh_track_route() {
-        let mut allocator = TrackAllocator::new(2);
-        let track = TrackIdentity::from_track(&track(TrackKind::Audio, 1, 1, "audio"));
+        let mut allocator = TrackPlacementAllocator::new(2);
+        let track = TrackAncestry::from_track(&track(TrackKind::Audio, 1, 1, "audio"));
         let first = allocator.allocate(ShardId::new(1), track, Instant::now());
         allocator.release(first, Instant::now());
         let replacement = allocator.allocate(ShardId::new(1), track, Instant::now());
 
-        assert_ne!(first.key, replacement.key);
+        assert_eq!(first.track_id, replacement.track_id);
         assert_ne!(first.route, replacement.route);
     }
 
@@ -828,7 +824,7 @@ mod tests {
         let _ = topology.subscribe(
             room(1),
             owner,
-            TrackSelector::track(identity.id),
+            TrackSelector::track(identity.track_id),
             SelectionPolicy::All,
         );
 
