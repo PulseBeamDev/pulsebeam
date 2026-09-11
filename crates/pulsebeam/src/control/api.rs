@@ -110,7 +110,9 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
         if matches!(
             &self,
-            ApiError::AuthorizationRequired | ApiError::Authorization(_)
+            ApiError::AuthorizationRequired
+                | ApiError::Authorization(_)
+                | ApiError::JoinError(controller::ControllerError::AuthorizationExpired)
         ) {
             #[derive(Serialize)]
             struct Problem {
@@ -119,10 +121,10 @@ impl IntoResponse for ApiError {
                 status: u16,
             }
 
-            let challenge = if matches!(&self, ApiError::Authorization(_)) {
-                HeaderValue::from_static("Bearer error=\"invalid_token\"")
-            } else {
+            let challenge = if matches!(&self, ApiError::AuthorizationRequired) {
                 HeaderValue::from_static("Bearer")
+            } else {
+                HeaderValue::from_static("Bearer error=\"invalid_token\"")
             };
             let mut response = (
                 StatusCode::UNAUTHORIZED,
@@ -139,7 +141,9 @@ impl IntoResponse for ApiError {
         }
 
         let status = match self {
-            ApiError::AuthorizationRequired | ApiError::Authorization(_) => {
+            ApiError::AuthorizationRequired
+            | ApiError::Authorization(_)
+            | ApiError::JoinError(controller::ControllerError::AuthorizationExpired) => {
                 StatusCode::UNAUTHORIZED
             }
             ApiError::IdValidation(_)
@@ -278,6 +282,7 @@ async fn create_participant(
         participant_id,
         connection_id,
         old_connection_id: None,
+        authorization: None,
     };
     let msg = controller::CreateParticipant {
         state: state.clone(),
@@ -424,6 +429,7 @@ async fn patch_participant(
         participant_id,
         connection_id,
         old_connection_id: Some(old_connection_id),
+        authorization: None,
     };
     let location_url = build_location(&headers, &s.api_config, &path, &state)?;
     let response_headers = ParticipantResponseHeaders {
@@ -591,6 +597,7 @@ mod tests {
             participant_id: ParticipantId::new(),
             connection_id: ConnectionId::new(),
             old_connection_id: None,
+            authorization: None,
         }
     }
 
@@ -703,6 +710,17 @@ mod tests {
         assert_eq!(authorization.project_id, DEVELOPMENT_PROJECT_ID);
         assert_eq!(authorization.room_external_id, room);
         assert_eq!(authorization.participant_external_id, participant);
+        let runtime_now = tokio::time::Instant::now();
+        let lease = controller::AuthorizationLease::from_expiry(
+            authorization.expiry,
+            std::time::UNIX_EPOCH + std::time::Duration::from_millis(1_999_500),
+            runtime_now,
+        )
+        .unwrap();
+        assert_eq!(
+            lease.deadline(),
+            runtime_now + std::time::Duration::from_millis(500)
+        );
         assert!(!format!("{authorization:?}").contains(&token));
     }
 

@@ -250,7 +250,24 @@ pub struct VerifiedAuthorization {
     pub room_id: RoomId,
     pub participant_external_id: ParticipantExternalId,
     pub participant_id: ParticipantId,
-    pub exp: u64,
+    pub expiry: AuthorizationExpiry,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AuthorizationExpiry(u64);
+
+impl AuthorizationExpiry {
+    pub fn from_unix_seconds(unix_seconds: u64) -> Self {
+        Self(unix_seconds)
+    }
+
+    pub fn unix_seconds(self) -> u64 {
+        self.0
+    }
+
+    pub fn is_expired_at(self, now: u64) -> bool {
+        self.0 <= now
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
@@ -424,7 +441,8 @@ pub fn verify_participant_token(
         Some(UniqueJson::Number(value)) => value.as_u64().ok_or(TokenError::Invalid)?,
         _ => return Err(TokenError::Invalid),
     };
-    if exp <= now {
+    let expiry = AuthorizationExpiry::from_unix_seconds(exp);
+    if expiry.is_expired_at(now) {
         return Err(TokenError::Expired);
     }
 
@@ -450,7 +468,7 @@ pub fn verify_participant_token(
         room_id,
         participant_external_id,
         participant_id,
-        exp,
+        expiry,
     })
 }
 
@@ -923,7 +941,7 @@ mod tests {
                 &authorization.participant_external_id
             )
         );
-        assert_eq!(authorization.exp, 2_000);
+        assert_eq!(authorization.expiry.unix_seconds(), 2_000);
         assert!(!format!("{authorization:?}").contains(&token));
     }
 

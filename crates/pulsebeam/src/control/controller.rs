@@ -1,4 +1,9 @@
-use std::{collections::VecDeque, io, time::Duration};
+use std::{
+    collections::{BTreeSet, VecDeque},
+    future::Future,
+    io,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use crate::control::steering::Steering;
 use crate::track::{SelectionPolicy, TrackSelector};
@@ -17,6 +22,7 @@ use crate::{
         worker::{ShardCommand, ShardEvent, ShardEventMessage},
     },
 };
+use pulsebeam_core::auth::{AuthorizationExpiry, TokenError};
 use pulsebeam_runtime::mailbox;
 use str0m::{
     Candidate,
@@ -32,6 +38,64 @@ pub struct ParticipantState {
     pub participant_id: ParticipantId,
     pub connection_id: ConnectionId,
     pub old_connection_id: Option<ConnectionId>,
+    pub authorization: Option<AuthorizationLease>,
+}
+
+const AUTHORIZATION_TIMER_HORIZON: Duration = Duration::from_secs(365 * 24 * 60 * 60);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AuthorizationLease {
+    expiry: AuthorizationExpiry,
+    deadline: tokio::time::Instant,
+}
+
+impl AuthorizationLease {
+    pub fn from_expiry(
+        expiry: AuthorizationExpiry,
+        wall_now: SystemTime,
+        runtime_now: tokio::time::Instant,
+    ) -> Result<Self, TokenError> {
+        let unix_now = wall_now
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO);
+        if expiry.is_expired_at(unix_now.as_secs()) {
+            return Err(TokenError::Expired);
+        }
+        let remaining =
+            Duration::from_secs(expiry.unix_seconds().saturating_sub(unix_now.as_secs()))
+                .saturating_sub(Duration::from_nanos(u64::from(unix_now.subsec_nanos())));
+        let delay = remaining.min(AUTHORIZATION_TIMER_HORIZON);
+        Ok(Self {
+            expiry,
+            deadline: runtime_now.checked_add(delay).unwrap_or(runtime_now),
+        })
+    }
+
+    fn is_expired_at(self, wall_now: SystemTime) -> bool {
+        let unix_now = wall_now
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO);
+        self.expiry.is_expired_at(unix_now.as_secs())
+    }
+
+    fn refresh_at(
+        self,
+        wall_now: SystemTime,
+        runtime_now: tokio::time::Instant,
+    ) -> Result<Self, TokenError> {
+        Self::from_expiry(self.expiry, wall_now, runtime_now)
+    }
+
+    pub(crate) fn deadline(self) -> tokio::time::Instant {
+        self.deadline
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct AuthorizationExpiryWork {
+    deadline: tokio::time::Instant,
+    participant_id: ParticipantId,
+    connection_id: ConnectionId,
 }
 
 #[derive(Debug, derive_more::From)]
@@ -84,6 +148,8 @@ pub enum ControllerError {
     ServiceUnavailable,
     #[error("participant connection was superseded")]
     Superseded,
+    #[error("participant authorization expired")]
+    AuthorizationExpired,
     #[error("IO error: {0}")]
     IOError(#[from] io::Error),
     #[error("unknown error: {0}")]
@@ -103,6 +169,7 @@ struct PendingMaterialization {
     ack: Option<oneshot::Receiver<bool>>,
     participant: ParticipantId,
     connection_id: ConnectionId,
+    authorization: Option<AuthorizationLease>,
     transport: crate::route::NodeTransportAddress,
     room_id: RoomId,
     answer: SdpAnswer,
@@ -134,6 +201,7 @@ pub struct ControllerActor {
     egress_ready: bool,
     lifecycle: TrackLifecycle,
     command_backlog: VecDeque<(ShardId, ShardCommand)>,
+    authorization_expiries: BTreeSet<AuthorizationExpiryWork>,
     steering: Option<Box<dyn Steering>>,
 }
 
@@ -163,6 +231,7 @@ impl ControllerActor {
             updates,
             lifecycle: TrackLifecycle::new(shard_count),
             command_backlog: VecDeque::new(),
+            authorization_expiries: BTreeSet::new(),
             steering: None,
         }
     }
@@ -208,12 +277,19 @@ impl ControllerActor {
         describe_controller_metrics();
 
         loop {
+            let authorization_deadline = self
+                .authorization_expiries
+                .first()
+                .map(|work| work.deadline);
             let maintenance_due = if self.has_ready_egress() {
                 false
             } else {
                 tokio::select! {
                     biased;
                     _ = shutdown.cancelled() => break,
+                    _ = tokio::time::sleep_until(
+                        authorization_deadline.unwrap_or_else(tokio::time::Instant::now)
+                    ), if authorization_deadline.is_some() => false,
                     Some(_) = shard_event_rx.readable() => false,
                     _ = poll_interval.tick() => true,
                     Some(_) = pending_rx.readable() => false,
@@ -241,6 +317,7 @@ impl ControllerActor {
         maintenance_due: bool,
     ) -> Option<RequiredAction> {
         let started = tokio::time::Instant::now();
+        self.expire_authorizations(started, SystemTime::now());
         let mut shard_events: usize = 0;
         for _ in 0..SHARD_EVENT_BUDGET {
             let Ok(event) = shard_event_rx.try_recv() else {
@@ -354,12 +431,26 @@ impl ControllerActor {
                     }
                     return;
                 }
-                let materialized = self.router.send(pending.shard, command).await.is_ok()
-                    && ack.await.unwrap_or(false);
+                let shard = self.router.sender(pending.shard);
+                let sent = self
+                    .wait_with_authorization_expiries(shard.send(command))
+                    .await
+                    .is_ok();
+                let materialized = sent
+                    && self
+                        .wait_with_authorization_expiries(ack)
+                        .await
+                        .unwrap_or(false);
                 metrics::histogram!("control_materialization_wait_us")
                     .record(started.elapsed().as_micros() as f64);
                 let result = if materialized {
-                    self.complete_materialization(pending)
+                    let transport = pending.transport;
+                    let result = self.complete_materialization(pending, SystemTime::now());
+                    if result.is_err() {
+                        self.core
+                            .release_transport(transport, tokio::time::Instant::now());
+                    }
+                    result
                 } else {
                     self.core
                         .release_transport(pending.transport, tokio::time::Instant::now());
@@ -485,6 +576,29 @@ impl ControllerActor {
                 connection_id,
             } => {
                 self.remove_incarnation(participant, connection_id);
+            }
+        }
+    }
+
+    async fn wait_with_authorization_expiries<F>(&mut self, future: F) -> F::Output
+    where
+        F: Future,
+    {
+        tokio::pin!(future);
+        loop {
+            let Some(deadline) = self
+                .authorization_expiries
+                .first()
+                .map(|work| work.deadline)
+            else {
+                return future.await;
+            };
+            tokio::select! {
+                biased;
+                _ = tokio::time::sleep_until(deadline) => {
+                    self.expire_authorizations(tokio::time::Instant::now(), SystemTime::now());
+                }
+                result = &mut future => return result,
             }
         }
     }
@@ -754,6 +868,7 @@ impl ControllerActor {
             }
         };
         let connection_id = state.connection_id;
+        let authorization = state.authorization;
         let config = self.core.prepare_participant(rtc, state);
         let room_id = config.room_id;
         let (ack_tx, ack_rx) = oneshot::channel();
@@ -767,6 +882,7 @@ impl ControllerActor {
             ack: Some(ack_rx),
             participant: participant_id,
             connection_id,
+            authorization,
             transport: address,
             room_id,
             answer,
@@ -776,20 +892,19 @@ impl ControllerActor {
     fn complete_materialization(
         &mut self,
         pending: PendingMaterialization,
+        wall_now: SystemTime,
     ) -> Result<SdpAnswer, ControllerError> {
         let participant_id = pending.participant;
         let room_id = pending.room_id;
-        let previous = self
-            .core
-            .registry
-            .commit_candidate(
-                participant_id,
-                room_id,
-                pending.shard,
-                pending.transport,
-                pending.connection_id,
-            )
-            .map_err(|_| ControllerError::Superseded)?;
+        let previous = self.commit_candidate(
+            participant_id,
+            room_id,
+            pending.shard,
+            pending.transport,
+            pending.connection_id,
+            pending.authorization,
+            wall_now,
+        )?;
         if let Some(previous) = previous {
             self.terminate_incarnation(participant_id, previous, false);
         }
@@ -828,6 +943,41 @@ impl ControllerActor {
             self.publish_track_lifecycle(outcome);
         }
         Ok(pending.answer)
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the commit fence checks one complete prepared connection incarnation"
+    )]
+    fn commit_candidate(
+        &mut self,
+        participant_id: ParticipantId,
+        room_id: RoomId,
+        shard: ShardId,
+        transport: crate::route::NodeTransportAddress,
+        connection_id: ConnectionId,
+        authorization: Option<AuthorizationLease>,
+        wall_now: SystemTime,
+    ) -> Result<Option<crate::control::registry::ParticipantMeta>, ControllerError> {
+        if authorization.is_some_and(|lease| lease.is_expired_at(wall_now)) {
+            return Err(ControllerError::AuthorizationExpired);
+        }
+        let previous = self
+            .core
+            .registry
+            .commit_candidate(participant_id, room_id, shard, transport, connection_id)
+            .map_err(|_| ControllerError::Superseded)?;
+        if let Some(lease) = authorization {
+            self.core
+                .registry
+                .update_authorization(&participant_id, connection_id, lease);
+            self.authorization_expiries.insert(AuthorizationExpiryWork {
+                deadline: lease.deadline(),
+                participant_id,
+                connection_id,
+            });
+        }
+        Ok(previous)
     }
 
     fn candidate_is_newer(&self, participant: ParticipantId, connection_id: ConnectionId) -> bool {
@@ -873,6 +1023,14 @@ impl ControllerActor {
         meta: crate::control::registry::ParticipantMeta,
         remove_current: bool,
     ) {
+        if let Some(lease) = meta.authorization {
+            self.authorization_expiries
+                .remove(&AuthorizationExpiryWork {
+                    deadline: lease.deadline(),
+                    participant_id: participant,
+                    connection_id: meta.connection_id,
+                });
+        }
         let mut outcomes = self.lifecycle.remove_participant(
             participant,
             &self.core.registry,
@@ -919,6 +1077,43 @@ impl ControllerActor {
         }
         self.core
             .release_transport(address, tokio::time::Instant::now());
+    }
+
+    fn expire_authorizations(&mut self, runtime_now: tokio::time::Instant, wall_now: SystemTime) {
+        while self
+            .authorization_expiries
+            .first()
+            .is_some_and(|work| work.deadline <= runtime_now)
+        {
+            let Some(work) = self.authorization_expiries.pop_first() else {
+                break;
+            };
+            let Some(meta) = self
+                .core
+                .registry
+                .get_participant(&work.participant_id)
+                .copied()
+                .filter(|meta| meta.connection_id == work.connection_id)
+            else {
+                continue;
+            };
+            let Some(lease) = meta.authorization else {
+                continue;
+            };
+            if lease.is_expired_at(wall_now) {
+                self.remove_incarnation(work.participant_id, work.connection_id);
+            } else if let Ok(lease) = lease.refresh_at(wall_now, runtime_now) {
+                self.core.registry.update_authorization(
+                    &work.participant_id,
+                    work.connection_id,
+                    lease,
+                );
+                self.authorization_expiries.insert(AuthorizationExpiryWork {
+                    deadline: lease.deadline(),
+                    ..work
+                });
+            }
+        }
     }
 }
 
@@ -974,12 +1169,184 @@ mod replacement_tests {
             egress_ready: false,
             lifecycle: TrackLifecycle::new(1),
             command_backlog: VecDeque::new(),
+            authorization_expiries: BTreeSet::new(),
             steering: None,
         }
     }
 
     fn connection_id(sequence: u8) -> ConnectionId {
         ConnectionId::from_bytes([0, 0, 0, 0, 0, 0, 0x70, 0, 0x80, 0, 0, 0, 0, 0, 0, sequence])
+    }
+
+    fn authorization_lease(
+        expiry: u64,
+        wall_now: SystemTime,
+        runtime_now: tokio::time::Instant,
+    ) -> AuthorizationLease {
+        AuthorizationLease::from_expiry(
+            AuthorizationExpiry::from_unix_seconds(expiry),
+            wall_now,
+            runtime_now,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn preparation_crossing_authorization_expiry_cannot_commit() {
+        let mut actor = actor();
+        let room_id = RoomId::from_external(&RoomExternalId::new("expired-prepare").unwrap());
+        let participant_id = ParticipantId::new();
+        let runtime_now = tokio::time::Instant::now();
+        let transport = actor.core.reserve_transport(ShardId::new(0), runtime_now);
+        let lease = authorization_lease(10, UNIX_EPOCH, runtime_now);
+
+        let result = actor.commit_candidate(
+            participant_id,
+            room_id,
+            ShardId::new(0),
+            transport,
+            connection_id(1),
+            Some(lease),
+            UNIX_EPOCH + Duration::from_secs(10),
+        );
+
+        assert!(matches!(result, Err(ControllerError::AuthorizationExpired)));
+        assert!(
+            actor
+                .core
+                .registry
+                .get_participant(&participant_id)
+                .is_none()
+        );
+        assert!(actor.authorization_expiries.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn current_connection_closes_at_authorization_deadline_without_grace() {
+        let mut actor = actor();
+        let room_id = RoomId::from_external(&RoomExternalId::new("expiry").unwrap());
+        let participant_id = ParticipantId::new();
+        let runtime_now = tokio::time::Instant::now();
+        let transport = actor.core.reserve_transport(ShardId::new(0), runtime_now);
+        let lease = authorization_lease(10, UNIX_EPOCH, runtime_now);
+        actor
+            .commit_candidate(
+                participant_id,
+                room_id,
+                ShardId::new(0),
+                transport,
+                connection_id(1),
+                Some(lease),
+                UNIX_EPOCH,
+            )
+            .unwrap();
+
+        tokio::time::advance(Duration::from_secs(10)).await;
+        actor.expire_authorizations(
+            tokio::time::Instant::now(),
+            UNIX_EPOCH + Duration::from_secs(10),
+        );
+
+        assert!(
+            actor
+                .core
+                .registry
+                .get_participant(&participant_id)
+                .is_none()
+        );
+        assert!(actor.authorization_expiries.is_empty());
+    }
+
+    #[test]
+    fn old_expiry_work_cannot_close_replacement() {
+        let mut actor = actor();
+        let room_id = RoomId::from_external(&RoomExternalId::new("expiry-fence").unwrap());
+        let participant_id = ParticipantId::new();
+        let runtime_now = tokio::time::Instant::now();
+        let old_id = connection_id(1);
+        let current_id = connection_id(2);
+        let old_lease = authorization_lease(10, UNIX_EPOCH, runtime_now);
+        let old_transport = actor.core.reserve_transport(ShardId::new(0), runtime_now);
+        actor
+            .commit_candidate(
+                participant_id,
+                room_id,
+                ShardId::new(0),
+                old_transport,
+                old_id,
+                Some(old_lease),
+                UNIX_EPOCH,
+            )
+            .unwrap();
+        let old_work = *actor.authorization_expiries.first().unwrap();
+        let current_lease = authorization_lease(20, UNIX_EPOCH, runtime_now);
+        let current_transport = actor.core.reserve_transport(ShardId::new(0), runtime_now);
+        let previous = actor
+            .commit_candidate(
+                participant_id,
+                room_id,
+                ShardId::new(0),
+                current_transport,
+                current_id,
+                Some(current_lease),
+                UNIX_EPOCH,
+            )
+            .unwrap()
+            .unwrap();
+        actor.terminate_incarnation(participant_id, previous, false);
+
+        actor.authorization_expiries.insert(old_work);
+        actor.expire_authorizations(
+            runtime_now + Duration::from_secs(10),
+            UNIX_EPOCH + Duration::from_secs(10),
+        );
+
+        assert_eq!(
+            actor
+                .core
+                .registry
+                .get_participant(&participant_id)
+                .unwrap()
+                .connection_id,
+            current_id
+        );
+        assert_eq!(actor.authorization_expiries.len(), 1);
+    }
+
+    #[test]
+    fn distant_expiry_and_replacement_keep_bounded_live_state() {
+        let mut actor = actor();
+        let room_id = RoomId::from_external(&RoomExternalId::new("bounded-expiry").unwrap());
+        let participant_id = ParticipantId::new();
+        let runtime_now = tokio::time::Instant::now();
+
+        for sequence in 1..=100 {
+            let transport = actor.core.reserve_transport(ShardId::new(0), runtime_now);
+            let lease = authorization_lease(u64::MAX, UNIX_EPOCH, runtime_now);
+            let previous = actor
+                .commit_candidate(
+                    participant_id,
+                    room_id,
+                    ShardId::new(0),
+                    transport,
+                    connection_id(sequence),
+                    Some(lease),
+                    UNIX_EPOCH,
+                )
+                .unwrap();
+            if let Some(previous) = previous {
+                actor.terminate_incarnation(participant_id, previous, false);
+            }
+        }
+
+        let current = actor
+            .core
+            .registry
+            .get_participant(&participant_id)
+            .unwrap();
+        assert_eq!(current.connection_id, connection_id(100));
+        assert!(current.authorization.is_some());
+        assert_eq!(actor.authorization_expiries.len(), 1);
     }
 
     #[test]

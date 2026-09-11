@@ -152,12 +152,8 @@ impl ShardRouter {
         self.get_mut(shard_id).try_send(cmd).map_err(Box::new)
     }
 
-    pub async fn send(
-        &self,
-        shard_id: ShardId,
-        cmd: ShardCommand,
-    ) -> Result<(), mailbox::SendError<ShardCommand>> {
-        self.get(shard_id).send(cmd).await
+    pub fn sender(&self, shard_id: ShardId) -> mailbox::Sender<ShardCommand> {
+        self.get(shard_id).clone()
     }
 
     fn get_mut(&mut self, shard_id: ShardId) -> &mut mailbox::Sender<ShardCommand> {

@@ -22,6 +22,7 @@ pub struct ParticipantMeta {
     /// to.
     pub transport: Option<NodeTransportAddress>,
     pub connection_id: ConnectionId,
+    pub authorization: Option<super::controller::AuthorizationLease>,
     pub materialized: bool,
 }
 
@@ -57,6 +58,7 @@ impl RoomRegistry {
                 room_id,
                 transport,
                 connection_id: ConnectionId::new(),
+                authorization: None,
                 materialized: false,
             },
         ) {
@@ -103,6 +105,7 @@ impl RoomRegistry {
                 room_id,
                 transport: Some(transport),
                 connection_id,
+                authorization: None,
                 materialized: true,
             },
         );
@@ -148,6 +151,19 @@ impl RoomRegistry {
         let meta = self.participants.remove(participant_id)?;
         self.remove_from_room(&meta.room_id, participant_id, meta.shard_id);
         Some(meta)
+    }
+
+    pub fn update_authorization(
+        &mut self,
+        participant_id: &ParticipantId,
+        connection_id: ConnectionId,
+        authorization: super::controller::AuthorizationLease,
+    ) {
+        if let Some(meta) = self.participants.get_mut(participant_id)
+            && meta.connection_id == connection_id
+        {
+            meta.authorization = Some(authorization);
+        }
     }
 
     fn remove_from_room(
@@ -361,7 +377,7 @@ mod tests {
         reg.commit_candidate(participant, room, ShardId::new(0), transport(0, 2), newer)
             .unwrap();
         assert_eq!(
-            reg.commit_candidate(participant, room, ShardId::new(0), transport(0, 1), older),
+            reg.commit_candidate(participant, room, ShardId::new(0), transport(0, 1), older,),
             Err(CommitCandidateError::Superseded)
         );
 
