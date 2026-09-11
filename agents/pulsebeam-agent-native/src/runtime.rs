@@ -7,7 +7,7 @@ use agent_core::{
     AgentCommand, ChannelId, DataChannelBinding, DataChannelEffect, DataChannelReliability,
     DataChannelSpec, DesiredState, Effect, Generation, HostEvent, HttpEffect, HttpEvent,
     HttpHeader, HttpMethod, MediaSlot, Notification, OfferResources, OperationId, RtcEffect,
-    RtcEvent, SlotBinding, Snapshot, TimerEffect, TimerEvent, TimerId, TopicSend,
+    RtcEvent, Snapshot, TimerEffect, TimerEvent, TimerId, TopicSend,
 };
 use pulsebeam_core::net::{AsyncHttpClient, UdpSocket};
 use pulsebeam_proto::rtp_extensions;
@@ -985,14 +985,10 @@ impl Actor {
                 "RTC topology did not produce an SDP offer".into(),
             ));
         };
+        let offer = offer.to_sdp_string();
         let resources = OfferResources {
-            slots: mids
-                .iter()
-                .map(|(slot, mid)| SlotBinding {
-                    slot: slot.clone(),
-                    mid: mid.to_string(),
-                })
-                .collect(),
+            slots: negotiated_media_slots(&offer, &mids)
+                .map_err(|error| Error::Rtc(error.into()))?,
             signaling_channel,
             data_channels: channel_bindings,
         };
@@ -1006,7 +1002,7 @@ impl Actor {
             packetizers,
             timeout: None,
         };
-        Ok((peer, offer.to_sdp_string(), resources))
+        Ok((peer, offer, resources))
     }
 
     fn execute_http(&mut self, effect: HttpEffect) -> Result<(), Error> {
@@ -1540,6 +1536,17 @@ fn topology_slots(topology: &agent_core::MediaTopology) -> Vec<MediaSlot> {
         .collect()
 }
 
+fn negotiated_media_slots(
+    offer: &str,
+    mids: &BTreeMap<MediaSlot, Mid>,
+) -> Result<Vec<agent_core::SlotBinding>, &'static str> {
+    agent_core::negotiated_slot_bindings(
+        offer,
+        mids.iter()
+            .map(|(slot, mid)| (slot.clone(), mid.to_string())),
+    )
+}
+
 fn channel_config(spec: &DataChannelSpec) -> ChannelConfig {
     let reliability = match spec.reliability {
         DataChannelReliability::Reliable => Reliability::Reliable,
@@ -1681,6 +1688,30 @@ mod tests {
                 Direction::RecvOnly,
                 Direction::RecvOnly,
             ]
+        );
+    }
+
+    #[test]
+    fn native_resources_use_offer_media_section_coordinates() {
+        let config = config();
+        let mut rtc = Rtc::builder().build(Instant::now().into());
+        let mut sdp = rtc.sdp_api();
+        sdp.add_channel("signal".to_owned());
+        let mut mids = BTreeMap::new();
+        for slot in topology_slots(&config.session.topology) {
+            let (kind, direction, simulcast) = media_description(&config, &slot);
+            let mid = sdp.add_media(kind, direction, None, None, simulcast);
+            mids.insert(slot, mid);
+        }
+        let offer = sdp.apply().unwrap().0.to_sdp_string();
+        let resources = negotiated_media_slots(&offer, &mids).unwrap();
+
+        assert_eq!(
+            resources
+                .iter()
+                .map(|resource| resource.media_index)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 4]
         );
     }
 

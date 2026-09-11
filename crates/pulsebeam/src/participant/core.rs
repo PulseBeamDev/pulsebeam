@@ -12,6 +12,7 @@ use str0m::{
 };
 use tokio::time::Instant;
 
+use crate::control::NegotiatedResources;
 use crate::entity::{self, TrackId, TrackKind};
 use crate::id::ShardId;
 use crate::keys::TrackHandle;
@@ -97,6 +98,7 @@ pub struct ParticipantConfig {
     pub participant_id: entity::ParticipantId,
     pub connection_id: entity::ConnectionId,
     pub rtc: Rtc,
+    pub resources: NegotiatedResources,
 }
 
 pub(crate) enum ParticipantInput<'a> {
@@ -130,6 +132,7 @@ pub struct Participant {
     stream_writer: StreamWriter,
     // Warm: touched per poll cycle
     upstream: UpstreamAllocator,
+    negotiated: NegotiatedResources,
     pub(crate) participant_id: entity::ParticipantId,
     pub(crate) connection_id: entity::ConnectionId,
     last_keyframe_request: HashMap<(Mid, Option<str0m::media::Rid>), Instant>,
@@ -197,6 +200,7 @@ impl Participant {
             participant_id: cfg.participant_id,
             connection_id: cfg.connection_id,
             upstream: UpstreamAllocator::new(ctx),
+            negotiated: cfg.resources,
             downstream: DownstreamAllocator::new(ctx, cfg.manual_sub),
             disconnect_reason: None,
             signaling,
@@ -214,6 +218,22 @@ impl Participant {
             room_id: self.room_id,
             participant_id: self.participant_id,
         }
+    }
+
+    #[allow(
+        dead_code,
+        reason = "the replacement signaling path consumes negotiated sender coordinates in Plan 07"
+    )]
+    pub(crate) fn track_for_sender_index(&self, sender_index: u32) -> Option<TrackId> {
+        self.upstream.track_for_sender_index(sender_index)
+    }
+
+    #[allow(
+        dead_code,
+        reason = "the replacement signaling path consumes negotiated receiver coordinates in Plan 07"
+    )]
+    pub(crate) fn receiver_index(&self, kind: MediaKind, mid: Mid) -> Option<u32> {
+        self.downstream.receiver_index(kind, mid)
     }
 
     pub fn apply(&mut self, effect: ParticipantEffect, track_handle: Option<TrackHandle>) {
@@ -990,6 +1010,14 @@ impl Participant {
     }
 
     fn handle_media_added(&mut self, media: MediaAdded, _events: &mut impl ParticipantSink) {
+        let Some(resource) = self.negotiated.media(media.mid) else {
+            self.disconnect(DisconnectReason::InvalidMediaDirection);
+            return;
+        };
+        if resource.kind != media.kind || resource.direction != media.direction {
+            self.disconnect(DisconnectReason::InvalidMediaDirection);
+            return;
+        }
         match media.direction {
             Direction::RecvOnly => {
                 let kind = match media.kind {
@@ -1006,7 +1034,12 @@ impl Participant {
                 match media.kind {
                     MediaKind::Audio => {
                         let (tx, track) = track::new_audio(media.mid, track_meta);
-                        if !self.upstream.add_published_track(media.mid, tx, track) {
+                        if !self.upstream.add_published_track(
+                            resource.media_index,
+                            media.mid,
+                            tx,
+                            track,
+                        ) {
                             self.disconnect(DisconnectReason::TooManyUpstreamTracks);
                         }
                     }
@@ -1016,14 +1049,19 @@ impl Participant {
                             track_meta,
                             media.simulcast.map(|s| s.recv).unwrap_or_default(),
                         );
-                        if !self.upstream.add_published_track(media.mid, tx, track) {
+                        if !self.upstream.add_published_track(
+                            resource.media_index,
+                            media.mid,
+                            tx,
+                            track,
+                        ) {
                             self.disconnect(DisconnectReason::TooManyUpstreamTracks);
                         }
                     }
                 }
             }
             Direction::SendOnly => {
-                self.try_add_downstream_slot(media.mid, media.kind);
+                self.try_add_downstream_slot(resource.media_index, media.mid, media.kind);
                 // Update signaling slot count AFTER adding the slot so the
                 // server accepts ClientIntent requests up to the actual slot
                 // count (previously this was called before add_slot, so the
@@ -1041,7 +1079,7 @@ impl Participant {
         self.transport.preferred_send_pt(mid, kind)
     }
 
-    fn try_add_downstream_slot(&mut self, mid: Mid, kind: MediaKind) {
+    fn try_add_downstream_slot(&mut self, media_index: u32, mid: Mid, kind: MediaKind) {
         if self.downstream.has_slot(kind, mid) {
             return;
         }
@@ -1058,6 +1096,7 @@ impl Participant {
         };
 
         self.downstream.add_slot(SlotConfig {
+            media_index,
             mid,
             // TODO: don't ignore simulcast receivers
             rid: None,

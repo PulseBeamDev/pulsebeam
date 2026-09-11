@@ -329,6 +329,13 @@ impl VideoAllocator {
         self.slots.values().any(|s| s.mid == mid)
     }
 
+    pub(crate) fn receiver_index(&self, mid: Mid) -> Option<u32> {
+        self.slots
+            .values()
+            .find(|slot| slot.mid == mid)
+            .map(|slot| slot.media_index)
+    }
+
     pub fn refresh_ssrc(&mut self, mid: Mid, rid: Option<Rid>, ssrc: Ssrc) -> bool {
         for slot in self.slots.values_mut() {
             if slot.mid == mid && slot.rid == rid {
@@ -806,6 +813,7 @@ struct Slot {
     switcher: Switcher,
 
     mid: Mid,
+    media_index: u32,
     rid: Option<Rid>,
     max_height: u32,
     min_height: u32,
@@ -826,6 +834,7 @@ impl Slot {
         Self {
             ctx,
             mid: cfg.mid,
+            media_index: cfg.media_index,
             rid: cfg.rid,
             ssrc: cfg.ssrc,
             pt: cfg.pt,

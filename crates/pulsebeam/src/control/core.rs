@@ -1,7 +1,9 @@
 use tokio::time::Instant;
 
 use crate::{
-    control::{controller::ParticipantState, registry::RoomRegistry},
+    control::{
+        controller::ParticipantState, negotiator::NegotiatedResources, registry::RoomRegistry,
+    },
     entity::{ParticipantId, RoomId},
     id::ShardId,
     participant::ParticipantConfig,
@@ -106,13 +108,19 @@ impl ControllerCore {
         self.transport.retire(address, now);
     }
 
-    pub fn prepare_participant(&self, rtc: Rtc, state: ParticipantState) -> ParticipantConfig {
+    pub fn prepare_participant(
+        &self,
+        rtc: Rtc,
+        resources: NegotiatedResources,
+        state: ParticipantState,
+    ) -> ParticipantConfig {
         ParticipantConfig {
             manual_sub: state.manual_sub,
             room_id: state.room_id,
             participant_id: state.participant_id,
             connection_id: state.connection_id,
             rtc,
+            resources,
         }
     }
 

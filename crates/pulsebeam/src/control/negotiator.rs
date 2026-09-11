@@ -6,7 +6,7 @@ use str0m::{
     Candidate, IceCreds, Rtc, RtcConfig, RtcError,
     change::{SdpAnswer, SdpOffer},
     format::{Codec, CodecConfig, FormatParams},
-    media::{Direction, Frequency, MediaKind, Pt},
+    media::{Direction, Frequency, MediaKind, Mid, Pt},
     rtp::Extension,
 };
 use tokio::time::Instant;
@@ -74,6 +74,32 @@ pub enum NegotiatorError {
     SlotsLimit(MediaType, Direction, usize),
     #[error("SendRecv direction is not supported for {0}")]
     DirectionNotSupported(MediaType),
+    #[error("negotiated media resources are inconsistent")]
+    InvalidResources,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NegotiatedMedia {
+    pub media_index: u32,
+    pub mid: Mid,
+    pub kind: MediaKind,
+    pub direction: Direction,
+}
+
+#[derive(Debug)]
+pub struct NegotiatedResources {
+    media: Vec<NegotiatedMedia>,
+}
+
+impl NegotiatedResources {
+    pub fn media(&self, mid: Mid) -> Option<NegotiatedMedia> {
+        self.media.iter().find(|media| media.mid == mid).copied()
+    }
+
+    #[cfg(test)]
+    fn as_slice(&self) -> &[NegotiatedMedia] {
+        &self.media
+    }
 }
 
 pub struct Negotiator {
@@ -89,7 +115,7 @@ impl Negotiator {
         &mut self,
         offer: SdpOffer,
         creds: IceCreds,
-    ) -> Result<(Rtc, SdpAnswer), NegotiatorError> {
+    ) -> Result<(Rtc, SdpAnswer, NegotiatedResources), NegotiatorError> {
         tracing::debug!("{offer}");
         let mut rtc_config = RtcConfig::new()
             .clear_codecs()
@@ -143,9 +169,44 @@ impl Negotiator {
             .accept_offer(offer)
             .map_err(NegotiatorError::Rtc)?;
         Self::enforce_media_lines(&answer)?;
+        let resources = Self::negotiated_resources(&answer)?;
 
         tracing::debug!("{answer}");
-        Ok((rtc, answer))
+        Ok((rtc, answer, resources))
+    }
+
+    fn negotiated_resources(answer: &SdpAnswer) -> Result<NegotiatedResources, NegotiatorError> {
+        let mut media = Vec::new();
+        for (index, section) in answer.media_lines.iter().enumerate() {
+            if section.disabled {
+                continue;
+            }
+            let kind = match section.typ.to_string().as_str() {
+                "video" => MediaKind::Video,
+                "audio" => MediaKind::Audio,
+                _ => continue,
+            };
+            let direction = section.direction();
+            if !matches!(direction, Direction::SendOnly | Direction::RecvOnly) {
+                return Err(NegotiatorError::InvalidResources);
+            }
+            let media_index =
+                u32::try_from(index).map_err(|_| NegotiatorError::InvalidResources)?;
+            let mid = section.mid();
+            if media
+                .iter()
+                .any(|resource: &NegotiatedMedia| resource.mid == mid)
+            {
+                return Err(NegotiatorError::InvalidResources);
+            }
+            media.push(NegotiatedMedia {
+                media_index,
+                mid,
+                kind,
+                direction,
+            });
+        }
+        Ok(NegotiatedResources { media })
     }
 
     fn enforce_media_lines(answer: &SdpAnswer) -> Result<(), NegotiatorError> {
@@ -281,7 +342,7 @@ mod tests {
 
     fn answer_sdp() -> String {
         let mut negotiator = Negotiator::new(Vec::new());
-        let (_, answer) = negotiator
+        let (_, answer, _) = negotiator
             .create_answer(chrome_like_offer(Direction::SendOnly), IceCreds::new())
             .unwrap();
         answer.to_sdp_string()
@@ -294,11 +355,35 @@ mod tests {
             (Direction::RecvOnly, "a=sendonly"),
         ] {
             let mut negotiator = Negotiator::new(Vec::new());
-            let (_, answer) = negotiator
+            let (_, answer, _) = negotiator
                 .create_answer(chrome_like_offer(offer_direction), IceCreds::new())
                 .unwrap();
             assert!(answer.to_sdp_string().contains(answer_direction));
         }
+    }
+
+    #[test]
+    fn resources_preserve_media_positions_across_data_sections() {
+        let mut rtc = RtcConfig::new().build(std::time::Instant::now());
+        let mut change = rtc.sdp_api();
+        change.add_media(MediaKind::Audio, Direction::SendOnly, None, None, None);
+        change.add_channel("signal".to_owned());
+        change.add_media(MediaKind::Video, Direction::RecvOnly, None, None, None);
+        let offer = change.apply().unwrap().0;
+        let mut negotiator = Negotiator::new(Vec::new());
+        let (_, _, resources) = negotiator.create_answer(offer, IceCreds::new()).unwrap();
+
+        assert_eq!(
+            resources
+                .as_slice()
+                .iter()
+                .map(|resource| (resource.media_index, resource.kind, resource.direction))
+                .collect::<Vec<_>>(),
+            vec![
+                (0, MediaKind::Audio, Direction::RecvOnly),
+                (2, MediaKind::Video, Direction::SendOnly),
+            ]
+        );
     }
 
     #[test]

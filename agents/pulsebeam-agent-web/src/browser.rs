@@ -9,10 +9,9 @@ use agent_core::{
     DataChannelEffect, DataChannelEvent, DataChannelReliability, DataChannelSpec, DesiredState,
     Effect, Failure, FailureClass, Generation, HostEvent, HttpEffect, HttpEvent, HttpHeader,
     HttpMethod, HttpResponse, MediaKind, MediaSlot, MediaTopology, Notification, OfferResources,
-    OperationId, PlayoutDelay, PublicationIntent, RetryPolicy, RtcEffect, RtcEvent, SlotBinding,
-    TimerEffect, TimerEvent, TopicChannel, TopicDropReason, TopicMessage, TopicMode,
-    TopicNotification, TopicPublisher, TopicRegistrations, TopicSend, TopicSubscriber,
-    VideoSubscription,
+    OperationId, PlayoutDelay, PublicationIntent, RetryPolicy, RtcEffect, RtcEvent, TimerEffect,
+    TimerEvent, TopicChannel, TopicDropReason, TopicMessage, TopicMode, TopicNotification,
+    TopicPublisher, TopicRegistrations, TopicSend, TopicSubscriber, VideoSubscription,
 };
 use futures_channel::oneshot;
 use js_sys::{Array, Function, Object, Reflect, Uint8Array};
@@ -1165,7 +1164,7 @@ impl RuntimeInner {
                     return;
                 }
                 match result {
-                    Ok(offer) => match inner.offer_resources(generation) {
+                    Ok(offer) => match inner.offer_resources(generation, &offer) {
                         Ok(resources) => {
                             inner.send_event(HostEvent::Rtc(RtcEvent::OfferCreated {
                                 generation,
@@ -1181,21 +1180,23 @@ impl RuntimeInner {
         });
     }
 
-    fn offer_resources(&self, generation: Generation) -> Result<OfferResources, String> {
+    fn offer_resources(
+        &self,
+        generation: Generation,
+        offer: &str,
+    ) -> Result<OfferResources, String> {
         let peers = self.peers.borrow();
         let peer = peers
             .get(&generation.get())
             .ok_or_else(|| "offer completed for an obsolete generation".to_owned())?;
-        let mut slots = Vec::with_capacity(peer.transceivers.len());
+        let mut slot_mids = Vec::with_capacity(peer.transceivers.len());
         for (slot, transceiver) in &peer.transceivers {
             let mid = transceiver
                 .mid()
                 .ok_or_else(|| "browser did not assign a MID after local description".to_owned())?;
-            slots.push(SlotBinding {
-                slot: slot.clone(),
-                mid,
-            });
+            slot_mids.push((slot.clone(), mid));
         }
+        let slots = agent_core::negotiated_slot_bindings(offer, slot_mids)?;
         let signaling_channel = peer
             .channels
             .iter()

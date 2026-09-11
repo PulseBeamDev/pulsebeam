@@ -28,6 +28,7 @@ pub use video::{DownstreamVideo, INITIAL_BANDWIDTH};
 
 #[derive(Clone)]
 pub struct SlotConfig {
+    pub media_index: u32,
     pub mid: Mid,
     pub rid: Option<Rid>,
     pub ssrc: Ssrc,
@@ -38,6 +39,7 @@ pub struct SlotConfig {
 impl Default for SlotConfig {
     fn default() -> Self {
         Self {
+            media_index: 0,
             mid: Mid::from("0"),
             rid: None,
             ssrc: 0u32.into(),
@@ -461,6 +463,13 @@ impl Downstream {
         match kind {
             MediaKind::Video => self.video.has_slot(mid),
             MediaKind::Audio => self.audio.has_slot(mid),
+        }
+    }
+
+    pub(crate) fn receiver_index(&self, kind: MediaKind, mid: Mid) -> Option<u32> {
+        match kind {
+            MediaKind::Video => self.video.receiver_index(mid),
+            MediaKind::Audio => self.audio.receiver_index(mid),
         }
     }
 

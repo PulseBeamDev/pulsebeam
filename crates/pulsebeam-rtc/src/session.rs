@@ -83,12 +83,36 @@ pub enum PacketFeedbackKind {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionInfo {
     pub feedback: Option<PacketFeedbackKind>,
+    pub inbound_media: Arc<[InboundMediaInfo]>,
     pub senders: Arc<[SenderInfo]>,
+}
+
+impl SessionInfo {
+    pub fn inbound_for_sender_index(&self, sender_index: u32) -> Option<&InboundMediaInfo> {
+        self.inbound_media
+            .iter()
+            .find(|media| media.sender_index == sender_index)
+    }
+
+    pub fn receiver_index_for_sender(&self, sender: SenderId) -> Option<u32> {
+        self.senders
+            .iter()
+            .find(|info| info.id == sender)
+            .map(|info| info.receiver_index)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InboundMediaInfo {
+    pub sender_index: u32,
+    pub kind: MediaKind,
+    pub mid: Arc<str>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SenderInfo {
     pub id: SenderId,
+    pub receiver_index: u32,
     pub kind: MediaKind,
     pub mid: Arc<str>,
     pub rtp_clock_rate: u32,

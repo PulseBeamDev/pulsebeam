@@ -37,7 +37,7 @@ pub use media_packet::{
 };
 pub use session::{
     ConnectionConfig, ConnectionLimits, DataChannelConfig, DataChannelConfigError,
-    DataChannelPriority, DataMessage, DataReliability, LocalCandidate, MediaKind,
+    DataChannelPriority, DataMessage, DataReliability, InboundMediaInfo, LocalCandidate, MediaKind,
     MediaPayloadBitrate, MediaPriority, PacketFeedbackKind, PlayoutDelay, PolicyError, SdpAnswer,
     SdpOffer, SenderInfo, SenderPolicy, SessionCapabilities, SessionInfo, UnknownExtensionPolicy,
 };

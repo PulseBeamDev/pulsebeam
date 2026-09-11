@@ -234,29 +234,85 @@ fn channel(value: u64) -> ChannelId {
     ChannelId::new(value).unwrap()
 }
 
+fn offer() -> String {
+    [
+        "v=0",
+        "m=application 9 UDP/DTLS/SCTP webrtc-datachannel",
+        "a=mid:data-channel",
+        "m=video 9 UDP/TLS/RTP/SAVPF 102",
+        "a=mid:lv0",
+        "a=sendonly",
+        "m=audio 9 UDP/TLS/RTP/SAVPF 111",
+        "a=mid:ra0",
+        "a=recvonly",
+        "m=audio 9 UDP/TLS/RTP/SAVPF 111",
+        "a=mid:la0",
+        "a=sendonly",
+        "m=video 9 UDP/TLS/RTP/SAVPF 102",
+        "a=mid:rv0",
+        "a=recvonly",
+    ]
+    .join("\r\n")
+}
+
 fn resources(channel: ChannelId) -> OfferResources {
     OfferResources {
-        slots: vec![
-            SlotBinding {
-                slot: MediaSlot::LocalVideo("camera".to_string()),
-                mid: "lv0".to_string(),
-            },
-            SlotBinding {
-                slot: MediaSlot::LocalAudio("microphone".to_string()),
-                mid: "la0".to_string(),
-            },
-            SlotBinding {
-                slot: MediaSlot::RemoteVideo(0),
-                mid: "rv0".to_string(),
-            },
-            SlotBinding {
-                slot: MediaSlot::RemoteAudio(0),
-                mid: "ra0".to_string(),
-            },
-        ],
+        slots: negotiated_slot_bindings(
+            &offer(),
+            [
+                (
+                    MediaSlot::LocalVideo("camera".to_string()),
+                    "lv0".to_string(),
+                ),
+                (
+                    MediaSlot::LocalAudio("microphone".to_string()),
+                    "la0".to_string(),
+                ),
+                (MediaSlot::RemoteVideo(0), "rv0".to_string()),
+                (MediaSlot::RemoteAudio(0), "ra0".to_string()),
+            ],
+        )
+        .unwrap(),
         signaling_channel: channel,
         data_channels: vec![],
     }
+}
+
+#[test]
+fn negotiated_coordinates_follow_sdp_sections_including_data() {
+    assert_eq!(
+        resources(channel(1)).slots,
+        vec![
+            SlotBinding {
+                slot: MediaSlot::LocalVideo("camera".into()),
+                mid: "lv0".into(),
+                media_index: 1,
+                kind: MediaKind::Video,
+                direction: MediaDirection::SendOnly,
+            },
+            SlotBinding {
+                slot: MediaSlot::LocalAudio("microphone".into()),
+                mid: "la0".into(),
+                media_index: 3,
+                kind: MediaKind::Audio,
+                direction: MediaDirection::SendOnly,
+            },
+            SlotBinding {
+                slot: MediaSlot::RemoteVideo(0),
+                mid: "rv0".into(),
+                media_index: 4,
+                kind: MediaKind::Video,
+                direction: MediaDirection::ReceiveOnly,
+            },
+            SlotBinding {
+                slot: MediaSlot::RemoteAudio(0),
+                mid: "ra0".into(),
+                media_index: 2,
+                kind: MediaKind::Audio,
+                direction: MediaDirection::ReceiveOnly,
+            },
+        ]
+    );
 }
 
 fn publisher(topic: &str, mode: TopicMode) -> TopicPublisher {
@@ -309,7 +365,7 @@ fn connect_with_topics(
     agent
         .handle(HostEvent::Rtc(RtcEvent::OfferCreated {
             generation,
-            offer: "topic-offer".to_string(),
+            offer: offer(),
             resources: offer_resources,
         }))
         .unwrap();
@@ -432,7 +488,7 @@ fn begin_connect(
     agent
         .handle(HostEvent::Rtc(RtcEvent::OfferCreated {
             generation,
-            offer: "offer".to_string(),
+            offer: offer(),
             resources: resources(cid),
         }))
         .unwrap();
@@ -447,7 +503,7 @@ fn begin_connect(
             assert_eq!(request.uri, "https://sfu.test/api/v1/native");
             assert_eq!(
                 serde_json::from_slice::<serde_json::Value>(&request.body).unwrap(),
-                serde_json::json!({"offer": "offer", "manual": true}),
+                serde_json::json!({"offer": offer(), "manual": true}),
             );
             assert!(request.headers.iter().any(|header| {
                 header.name == "Authorization" && header.value == "Bearer private-token"
@@ -609,7 +665,7 @@ fn construction_and_desired_state_validate_complete_external_input() {
     agent
         .handle(HostEvent::Rtc(RtcEvent::OfferCreated {
             generation,
-            offer: "offer".to_string(),
+            offer: offer(),
             resources: resources(channel(99)),
         }))
         .unwrap();
@@ -735,7 +791,7 @@ fn malformed_offer_resources_are_rejected_without_consuming_the_attempt() {
     assert_eq!(
         agent.handle(HostEvent::Rtc(RtcEvent::OfferCreated {
             generation,
-            offer: "offer".to_string(),
+            offer: offer(),
             resources: OfferResources {
                 slots: vec![],
                 signaling_channel: channel(3),
@@ -752,7 +808,7 @@ fn malformed_offer_resources_are_rejected_without_consuming_the_attempt() {
     agent
         .handle(HostEvent::Rtc(RtcEvent::OfferCreated {
             generation,
-            offer: "corrected-offer".to_string(),
+            offer: offer(),
             resources: resources(channel(3)),
         }))
         .unwrap();
@@ -760,6 +816,41 @@ fn malformed_offer_resources_are_rejected_without_consuming_the_attempt() {
         next_effect(&mut agent),
         Effect::Http(HttpEffect::Request { .. })
     ));
+}
+
+#[test]
+fn malformed_negotiated_coordinates_are_rejected_transactionally() {
+    let mut duplicate = resources(channel(3));
+    duplicate.slots[1].media_index = duplicate.slots[0].media_index;
+    let mut out_of_range = resources(channel(3));
+    out_of_range.slots[0].media_index = 99;
+    let mut wrong_kind = resources(channel(3));
+    wrong_kind.slots[0].kind = MediaKind::Audio;
+    let mut wrong_direction = resources(channel(3));
+    wrong_direction.slots[0].direction = MediaDirection::ReceiveOnly;
+
+    for malformed in [duplicate, out_of_range, wrong_kind, wrong_direction] {
+        let mut agent = Agent::new(config()).unwrap();
+        agent
+            .command(AgentCommand::ReplaceDesired(desired(1)))
+            .unwrap();
+        let generation = match next_effect(&mut agent) {
+            Effect::Rtc(RtcEffect::CreateOffer { generation, .. }) => generation,
+            effect => panic!("expected offer, got {effect:?}"),
+        };
+        assert_eq!(
+            agent.handle(HostEvent::Rtc(RtcEvent::OfferCreated {
+                generation,
+                offer: offer(),
+                resources: malformed,
+            })),
+            Err(AgentError::InvalidOffer(
+                "negotiated media coordinates do not match the SDP offer"
+            ))
+        );
+        assert_eq!(agent.snapshot().connection, ConnectionState::CreatingOffer);
+        assert!(agent.next_effect().is_none());
+    }
 }
 
 #[test]
@@ -883,7 +974,7 @@ fn reconnect_posts_a_new_resource_and_swaps_only_after_the_candidate_is_ready() 
     agent
         .handle(HostEvent::Rtc(RtcEvent::OfferCreated {
             generation: replacement_generation,
-            offer: "replacement-offer".to_string(),
+            offer: offer(),
             resources: resources(replacement_cid),
         }))
         .unwrap();
@@ -958,7 +1049,7 @@ fn rejected_reconnect_is_terminal_without_a_legacy_fallback() {
     agent
         .handle(HostEvent::Rtc(RtcEvent::OfferCreated {
             generation: replacement_generation,
-            offer: "replacement-offer".to_string(),
+            offer: offer(),
             resources: resources(channel(11)),
         }))
         .unwrap();
@@ -1876,7 +1967,7 @@ fn reconnect_rotates_ordered_streams_without_replaying_accepted_history() {
     agent
         .handle(HostEvent::Rtc(RtcEvent::OfferCreated {
             generation,
-            offer: "replacement-topic-offer".to_string(),
+            offer: offer(),
             resources: replacement_resources,
         }))
         .unwrap();

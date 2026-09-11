@@ -14,8 +14,9 @@ use sha2::{Digest, Sha256};
 use str0m::sdp::{MediaAttribute, MediaType, Proto, Sdp, SessionAttribute, Setup};
 
 use crate::{
-    AcceptError, ConnectionConfig, ConnectionLimits, LocalCandidate, PacketFeedbackKind, SdpAnswer,
-    SdpOffer, SenderId, SenderInfo, SessionInfo, TimePoint, connection::EntropyConsumer,
+    AcceptError, ConnectionConfig, ConnectionLimits, InboundMediaInfo, LocalCandidate,
+    PacketFeedbackKind, SdpAnswer, SdpOffer, SenderId, SenderInfo, SessionInfo, TimePoint,
+    connection::EntropyConsumer,
 };
 
 const MAX_SDP_BYTES: usize = 256 * 1024;
@@ -305,6 +306,7 @@ struct SctpFacts {
 }
 
 struct NegotiatedMediaSection {
+    media_index: u32,
     mid: String,
     kind: SectionKind,
     direction: Direction,
@@ -414,8 +416,15 @@ fn negotiate_inner(
     });
 
     let mut builds = Vec::with_capacity(raw.sections.len());
-    for ((line, section), mid) in parsed.media_lines.iter().zip(&raw.sections).zip(&mids) {
-        builds.push(parse_section(line, section, mid, allow_mixed)?);
+    for (index, ((line, section), mid)) in parsed
+        .media_lines
+        .iter()
+        .zip(&raw.sections)
+        .zip(&mids)
+        .enumerate()
+    {
+        let media_index = u32::try_from(index).map_err(|_| NegotiationError::limit())?;
+        builds.push(parse_section(line, section, mid, media_index, allow_mixed)?);
     }
     validate_bundle_namespaces(&builds)?;
 
@@ -474,6 +483,25 @@ fn negotiate_inner(
     let local_candidates = local_candidates(config)?;
     let remote_candidates = remote_candidates(offer.as_str())?;
 
+    let inbound_media = builds
+        .iter()
+        .filter(|section| {
+            section.facts.kind != SectionKind::Application
+                && section.facts.direction.allows_receive()
+        })
+        .filter_map(|section| {
+            let kind = match section.facts.kind {
+                SectionKind::Audio => crate::MediaKind::Audio,
+                SectionKind::Video => crate::MediaKind::Video,
+                SectionKind::Application => return None,
+            };
+            Some(InboundMediaInfo {
+                sender_index: section.facts.media_index,
+                kind,
+                mid: Arc::from(section.facts.mid.as_str()),
+            })
+        })
+        .collect::<Vec<_>>();
     let mut senders = Vec::new();
     for section in &builds {
         if section.facts.kind == SectionKind::Application
@@ -501,6 +529,7 @@ fn negotiate_inner(
         };
         senders.push(SenderInfo {
             id: SenderId::new(id).ok_or_else(NegotiationError::limit)?,
+            receiver_index: section.facts.media_index,
             kind,
             mid: Arc::from(section.facts.mid.as_str()),
             rtp_clock_rate: codec.clock_rate,
@@ -514,6 +543,7 @@ fn negotiate_inner(
     }
     let session = SessionInfo {
         feedback: Some(feedback),
+        inbound_media: Arc::from(inbound_media),
         senders: Arc::from(senders),
     };
     let answer_sections = builds
@@ -697,6 +727,7 @@ fn parse_section(
     line: &str0m::sdp::MediaLine,
     raw: &[String],
     mid: &str,
+    media_index: u32,
     allow_mixed: bool,
 ) -> Result<SectionBuild, NegotiationError> {
     let disabled = line.disabled && !raw.iter().any(|value| value == "a=bundle-only");
@@ -785,6 +816,7 @@ fn parse_section(
     let rfc8888 = has_feedback("ccfb");
     Ok(SectionBuild {
         facts: NegotiatedMediaSection {
+            media_index,
             mid: mid.to_owned(),
             kind,
             direction,
@@ -1627,6 +1659,41 @@ mod tests {
             assert!(accepted.answer.as_str().contains("a=setup:passive"));
             assert!(accepted.answer.as_str().contains("a=end-of-candidates"));
         }
+    }
+
+    #[test]
+    fn session_resources_use_global_media_section_coordinates() {
+        let offer = SdpOffer::new(
+            fixture("firefox")
+                .as_str()
+                .replace(
+                    "a=group:BUNDLE 0 1 2",
+                    "a=group:BUNDLE audioIn videoOut data",
+                )
+                .replace("a=mid:0", "a=mid:audioIn")
+                .replace("a=mid:1", "a=mid:videoOut")
+                .replace("a=mid:2", "a=mid:data"),
+        );
+        let accepted =
+            Connection::accept(config(), offer, at(), ConnectionEntropy::new([8; 32])).unwrap();
+
+        assert_eq!(accepted.session.inbound_media.len(), 1);
+        assert_eq!(
+            accepted.session.inbound_for_sender_index(0),
+            Some(&InboundMediaInfo {
+                sender_index: 0,
+                kind: crate::MediaKind::Audio,
+                mid: Arc::from("audioIn"),
+            })
+        );
+        let sender = accepted.session.senders.first().unwrap();
+        assert_eq!(sender.mid.as_ref(), "videoOut");
+        assert_eq!(sender.receiver_index, 1);
+        assert_eq!(
+            accepted.session.receiver_index_for_sender(sender.id),
+            Some(1)
+        );
+        assert_eq!(accepted.answer.as_str().matches("\nm=").count(), 3);
     }
 
     #[test]

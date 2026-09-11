@@ -104,6 +104,7 @@ impl UpstreamRouteTable {
 }
 
 pub(crate) struct UpstreamSlot {
+    media_index: u32,
     mid: Mid,
     track: UpstreamTrack,
     descriptor: crate::track::Track,
@@ -126,6 +127,7 @@ impl UpstreamMedia {
     }
     fn add_published_track(
         &mut self,
+        media_index: u32,
         mid: Mid,
         track: UpstreamTrack,
         descriptor: crate::track::Track,
@@ -139,6 +141,7 @@ impl UpstreamMedia {
             return false;
         }
         self.published_tracks.push(UpstreamSlot {
+            media_index,
             mid,
             track,
             descriptor,
@@ -152,6 +155,12 @@ impl UpstreamMedia {
             .enumerate()
             .find(|(_, slot)| slot.mid == mid)
             .map(|(index, slot)| (index, slot.track.meta.id))
+    }
+    fn track_for_sender_index(&self, media_index: u32) -> Option<TrackId> {
+        self.published_tracks
+            .iter()
+            .find(|slot| slot.media_index == media_index)
+            .map(|slot| slot.track.meta.id)
     }
     fn handle_incoming_rtp(
         &mut self,
@@ -222,17 +231,27 @@ impl Upstream {
     }
     pub fn add_published_track(
         &mut self,
+        media_index: u32,
         mid: Mid,
         track: UpstreamTrack,
         descriptor: crate::track::Track,
     ) -> bool {
         match track.meta.id.kind() {
-            TrackKind::Audio => self.audio.add_published_track(mid, track, descriptor),
-            TrackKind::Video => self.video.add_published_track(mid, track, descriptor),
+            TrackKind::Audio => self
+                .audio
+                .add_published_track(media_index, mid, track, descriptor),
+            TrackKind::Video => self
+                .video
+                .add_published_track(media_index, mid, track, descriptor),
             TrackKind::Data => {
                 pulsebeam_runtime::fatal!("a data channel reached upstream track construction")
             }
         }
+    }
+    pub(crate) fn track_for_sender_index(&self, media_index: u32) -> Option<TrackId> {
+        self.audio
+            .track_for_sender_index(media_index)
+            .or_else(|| self.video.track_for_sender_index(media_index))
     }
     pub fn slot_for_mid(&self, mid: Mid) -> Option<(UpstreamSlotKey, TrackId)> {
         self.audio

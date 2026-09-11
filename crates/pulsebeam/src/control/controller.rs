@@ -872,7 +872,7 @@ impl ControllerActor {
         let address = self.core.reserve_transport(shard, now);
         let creds = IceUfrag::new(self.cluster_id, self.node_id, address.route, address.epoch)
             .into_ice_creds();
-        let (rtc, answer) = match self.negotiator.create_answer(offer, creds) {
+        let (rtc, answer, resources) = match self.negotiator.create_answer(offer, creds) {
             Ok(value) => value,
             Err(error) => {
                 self.core.release_transport(address, now);
@@ -882,7 +882,7 @@ impl ControllerActor {
         let connection_id = state.connection_id;
         let authorization = state.authorization;
         let profile = state.profile;
-        let config = self.core.prepare_participant(rtc, state);
+        let config = self.core.prepare_participant(rtc, resources, state);
         let room_id = config.room_id;
         let (ack_tx, ack_rx) = oneshot::channel();
         Ok(PendingMaterialization {

@@ -15,11 +15,16 @@ impl UpstreamVideo {
     }
     pub(super) fn add_published_track(
         &mut self,
+        media_index: u32,
         mid: Mid,
         track: UpstreamTrack,
         descriptor: crate::track::Track,
     ) -> bool {
-        self.media.add_published_track(mid, track, descriptor)
+        self.media
+            .add_published_track(media_index, mid, track, descriptor)
+    }
+    pub(super) fn track_for_sender_index(&self, media_index: u32) -> Option<TrackId> {
+        self.media.track_for_sender_index(media_index)
     }
     pub(super) fn slot_for_mid(&self, mid: Mid) -> Option<(usize, TrackId)> {
         self.media.slot_for_mid(mid)

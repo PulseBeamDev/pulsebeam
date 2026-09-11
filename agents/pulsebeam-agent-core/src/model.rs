@@ -162,12 +162,37 @@ pub enum MediaSlot {
 pub struct SlotBinding {
     pub slot: MediaSlot,
     pub mid: String,
+    pub media_index: u32,
+    pub kind: MediaKind,
+    pub direction: MediaDirection,
 }
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub enum MediaKind {
     Video,
     Audio,
+}
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
+pub enum MediaDirection {
+    SendOnly,
+    ReceiveOnly,
+}
+
+impl MediaSlot {
+    pub const fn kind(&self) -> MediaKind {
+        match self {
+            Self::LocalVideo(_) | Self::RemoteVideo(_) => MediaKind::Video,
+            Self::LocalAudio(_) | Self::RemoteAudio(_) => MediaKind::Audio,
+        }
+    }
+
+    pub const fn direction(&self) -> MediaDirection {
+        match self {
+            Self::LocalVideo(_) | Self::LocalAudio(_) => MediaDirection::SendOnly,
+            Self::RemoteVideo(_) | Self::RemoteAudio(_) => MediaDirection::ReceiveOnly,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

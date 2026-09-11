@@ -66,6 +66,11 @@ struct Session {
     _opaque_participant_id: ParticipantId,
     _connection_id: ConnectionId,
     mids: BTreeMap<MediaSlot, String>,
+    #[allow(
+        dead_code,
+        reason = "replacement signaling resolves sender and receiver indices in Plan 07"
+    )]
+    coordinates: BTreeMap<MediaSlot, SlotBinding>,
     signaling_channel: ChannelId,
 }
 
@@ -845,10 +850,14 @@ impl Agent {
             return;
         };
         let topic_bindings = resources.data_channels.clone();
-        let mids = resources
+        let coordinates: BTreeMap<_, _> = resources
             .slots
             .into_iter()
-            .map(|binding| (binding.slot, binding.mid))
+            .map(|binding| (binding.slot.clone(), binding))
+            .collect();
+        let mids = coordinates
+            .iter()
+            .map(|(slot, binding)| (slot.clone(), binding.mid.clone()))
             .collect();
         let previous_generation = self.active.as_ref().map(|session| session.generation);
         if let Some(previous) = self.active.replace(Session {
@@ -861,6 +870,7 @@ impl Agent {
             _opaque_participant_id: candidate.opaque_participant_id,
             _connection_id: candidate.connection_id,
             mids,
+            coordinates,
             signaling_channel: resources.signaling_channel,
         }) && previous.generation != attempt.generation
         {
@@ -1295,7 +1305,7 @@ fn validate_offer(
     let expected: BTreeSet<MediaSlot> = config.topology.slots().into_iter().collect();
     let mut actual = BTreeSet::new();
     let mut mids = BTreeSet::new();
-    for SlotBinding { slot, mid } in &resources.slots {
+    for SlotBinding { slot, mid, .. } in &resources.slots {
         if mid.is_empty()
             || mid.len() > crate::MAX_MID_BYTES
             || mid.chars().any(char::is_control)
@@ -1313,6 +1323,27 @@ fn validate_offer(
     if actual != expected {
         return Err(AgentError::InvalidOffer(
             "slot mapping does not match configured topology",
+        ));
+    }
+    let actual_bindings = crate::negotiated_slot_bindings(
+        offer,
+        resources
+            .slots
+            .iter()
+            .map(|binding| (binding.slot.clone(), binding.mid.clone())),
+    )
+    .map_err(AgentError::InvalidOffer)?;
+    let expected_bindings: BTreeMap<_, _> = actual_bindings
+        .into_iter()
+        .map(|binding| (binding.slot.clone(), binding))
+        .collect();
+    if resources
+        .slots
+        .iter()
+        .any(|binding| expected_bindings.get(&binding.slot) != Some(binding))
+    {
+        return Err(AgentError::InvalidOffer(
+            "negotiated media coordinates do not match the SDP offer",
         ));
     }
     let expected_labels = Topics::expected_labels(registrations);

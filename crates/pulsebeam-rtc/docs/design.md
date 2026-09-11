@@ -195,11 +195,19 @@ pub enum PacketFeedbackKind {
 
 pub struct SessionInfo {
     pub feedback: Option<PacketFeedbackKind>,
+    pub inbound_media: Arc<[InboundMediaInfo]>,
     pub senders: Arc<[SenderInfo]>,
+}
+
+pub struct InboundMediaInfo {
+    pub sender_index: u32,
+    pub kind: MediaKind,
+    pub mid: Arc<str>,
 }
 
 pub struct SenderInfo {
     pub id: SenderId,
+    pub receiver_index: u32,
     pub kind: MediaKind,
     pub mid: Arc<str>,
     pub rtp_clock_rate: u32,
@@ -216,9 +224,12 @@ pub enum EcnCodepoint {
 }
 ```
 
-`SessionInfo` is immutable. It reports only stable negotiated facts needed by the
-SFU; payload types, SSRCs, ICE credentials, fingerprints, RTCP parser values, and
-extension wire IDs remain connection internals.
+`SessionInfo` is immutable. `sender_index` and `receiver_index` are the remote
+endpoint's zero-based SDP media-section positions, including non-RTP sections in
+the count. They resolve signaling coordinates to inbound media and stable
+`SenderId` resources without making MID public signaling identity. Payload types,
+SSRCs, ICE credentials, fingerprints, RTCP parser values, and extension wire IDs
+remain connection internals.
 
 ### Network input and output
 

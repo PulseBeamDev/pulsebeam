@@ -71,6 +71,7 @@ impl DerefMut for DownstreamAudio {
 
 /// A subscriber's audio selection policy.
 pub struct Slot {
+    media_index: u32,
     pt: Pt,
     mid: Mid,
     ssrc: Ssrc,
@@ -165,6 +166,7 @@ impl AudioAllocator {
         for entry in &mut self.slots {
             if entry.is_none() {
                 *entry = Some(Slot {
+                    media_index: slot.media_index,
                     mid: slot.mid,
                     pt: slot.pt,
                     ssrc: slot.ssrc,
@@ -216,6 +218,14 @@ impl AudioAllocator {
 
     pub fn has_slot(&self, mid: Mid) -> bool {
         self.slots.iter().flatten().any(|slot| slot.mid == mid)
+    }
+
+    pub(crate) fn receiver_index(&self, mid: Mid) -> Option<u32> {
+        self.slots
+            .iter()
+            .flatten()
+            .find(|slot| slot.mid == mid)
+            .map(|slot| slot.media_index)
     }
 
     pub fn refresh_ssrc(&mut self, mid: Mid, ssrc: Ssrc) -> bool {
@@ -442,6 +452,7 @@ mod tests {
 
     fn slot_config(mid: &'static str, ssrc: u32) -> SlotConfig {
         SlotConfig {
+            media_index: ssrc,
             mid: Mid::from(mid),
             rid: None,
             ssrc: Ssrc::from(ssrc),

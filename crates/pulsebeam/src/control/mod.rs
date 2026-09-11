@@ -13,3 +13,4 @@ pub(crate) mod topology;
 pub mod ufrag;
 
 pub use negotiator::MAX_SEND_AUDIO_SLOTS;
+pub(crate) use negotiator::NegotiatedResources;
