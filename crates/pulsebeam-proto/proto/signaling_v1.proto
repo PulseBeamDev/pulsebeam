@@ -2,11 +2,11 @@ syntax = "proto3";
 
 package pulsebeam.media.v1;
 
-// Live signaling over a reliable, ordered data channel.
+// Live media signaling over a reliable, ordered data channel.
 //
-// HTTP owns WebRTC participant creation and destruction. This protocol owns:
+// HTTP owns connection-resource creation and destruction. This protocol owns:
 //
-//   Catalog       — what exists remotely.
+//   Catalog       — canonical remote media entities visible to this participant.
 //   Intent        — what this participant wants to send and receive.
 //   Mapping       — which remote tracks are assigned to local receivers.
 //   Authorization — refresh of the participant JWT.
@@ -41,33 +41,59 @@ package pulsebeam.media.v1;
 //   └── audio
 //       └── tracks[]
 //
+// Identity boundaries:
+//
+//   ParticipantExternalId
+//       User-application identity supplied through authorization.
+//
+//   ParticipantId
+//       Stable canonical participant identity owned by PulseBeam.
+//
+//   TrackId
+//       Stable canonical track identity owned by PulseBeam.
+//
+//   sender_index / receiver_index
+//       Connection-local SDP media-section indices. They are protocol
+//       coordinates, not entity identities.
+//
+// Clients and SDKs may retain, compare, and return canonical IDs received from
+// PulseBeam, but MUST NOT mint, derive, parse, validate, or format their
+// canonical representation.
+//
 // Examples:
 //
 //   LocalTrack:
-//     sender 1, VIDEO, "camera"
+//     sender_index = 1
+//     kind         = VIDEO
+//     label        = "camera"
 //
 //   RemoteTrack:
-//     track vid_A, participant pa_A, VIDEO, "camera"
+//     track_id       = "vid_0..."
+//     participant_id = "pa_0..."
+//     kind           = VIDEO
+//     label          = "camera"
 //
 //   Video receive intent:
-//     track vid_A
-//       height       = 720
-//       min_height   = 360
-//       min_fps      = 15
-//       priority     = 10
+//     track vid_0...
+//       height        = 720
+//       min_height    = 360
+//       min_fps       = 15
+//       priority      = 10
 //       playout_delay = [0ms, 50ms]
 //
 //   Audio receive intent with three negotiated audio receivers:
-//     tracks = [aud_A]
+//
+//     tracks = [aud_0...]
 //     mode   = AUDIO_MODE_AUTO
 //
-//   The server selects Alice first and may automatically fill the remaining
-//   receivers.
+//   The server selects the explicitly requested track first and may
+//   automatically fill the remaining receivers.
 //
 //   Mapping:
-//     audio receiver 0 -> aud_A
-//     audio receiver 1 -> aud_B
-//     audio receiver 2 -> aud_C
+//
+//     audio receiver_index 0 -> aud_0...
+//     audio receiver_index 1 -> aud_0...
+//     audio receiver_index 2 -> aud_0...
 //
 // Track identity:
 //
@@ -77,11 +103,11 @@ package pulsebeam.media.v1;
 // The client SDK resolves application-facing selectors such as
 // (participant_external_id, kind, label) to TrackId using Catalog.
 //
-// `sender_id` and `receiver_id` are connection-local identifiers equal to the
-// zero-based SDP media-section index of the corresponding negotiated RTP
+// `sender_index` and `receiver_index` are connection-local identifiers equal
+// to the zero-based SDP media-section index of the corresponding negotiated RTP
 // sender or receiver.
 //
-// They MUST NOT be used as application identity.
+// They MUST NOT be used as application or PulseBeam entity identity.
 //
 // Catalog, Intent, and Mapping are complete replacement state, not patches.
 // An invalid Intent is rejected atomically.
@@ -133,33 +159,51 @@ enum TrackKind {
   DATA = 3;
 }
 
+
 // One participant visible in the room.
 //
-// `id` is the canonical ParticipantId.
-// `external_id` is the application-supplied ParticipantExternalId.
+// `participant_id` is the canonical ParticipantId owned by PulseBeam.
+//
+// `participant_external_id` is the application-supplied ParticipantExternalId
+// from the participant's authorization.
+//
 // Application metadata such as display name or avatar belongs to application
 // signaling.
 message Participant {
-  string id = 1;
-  string external_id = 2;
+  string participant_id = 1;
+  string participant_external_id = 2;
 }
 
-// A track owned by this participant.
+
+// A local track owned by this participant.
 //
-// `sender_id` identifies its negotiated local sender.
+// A LocalTrack does not carry a TrackId. Its application-facing identity is
+// `(kind, label)` until PulseBeam derives the corresponding canonical TrackId.
+//
+// `sender_index` identifies the negotiated local RTP sender by the zero-based
+// SDP media-section index.
+//
+// `sender_index` is scoped to this connection. It is not an Id, Address,
+// Handle, or application identity.
+//
 // `kind` MUST match the negotiated media section.
 message LocalTrack {
-  uint32 sender_id = 1;
+  uint32 sender_index = 1;
   TrackKind kind = 2;
   string label = 3;
 }
 
-// A track visible from the room.
+
+// A remote track visible to this participant.
 //
-// `id` is the canonical TrackId.
-// (participant_id, kind, label) describes the application-facing track.
+// `track_id` is the canonical TrackId owned by PulseBeam.
+//
+// `participant_id` is the canonical ParticipantId of the owning participant.
+//
+// `(participant_id, kind, label)` describes the application-facing track and
+// allows SDKs to associate the canonical TrackId with application selectors.
 message RemoteTrack {
-  string id = 1;
+  string track_id = 1;
   string participant_id = 2;
   TrackKind kind = 3;
   string label = 4;
@@ -167,12 +211,16 @@ message RemoteTrack {
 
 
 // ============================================================================
-// 1. Catalog — what exists remotely
+// 1. Catalog — canonical remote media entities visible to this participant
 // ============================================================================
 
-// Complete remote room state.
+// Complete server-authoritative remote room state visible to this participant.
 //
-// Each Catalog replaces the previous Catalog.
+// Each Catalog atomically replaces the previous Catalog.
+//
+// Participants and tracks carry canonical PulseBeam IDs. SDKs may retain,
+// compare, hash, and protocol-forward these values, but MUST treat their
+// canonical encoding as opaque.
 message Catalog {
   repeated Participant participants = 1;
   repeated RemoteTrack tracks = 2;
@@ -184,6 +232,11 @@ message Catalog {
 // ============================================================================
 
 // Complete desired local sending state.
+//
+// Each entry identifies one negotiated local sender through its connection-local
+// sender_index and gives that sender its application-facing `(kind, label)`.
+//
+// Accepted state is interpreted together with the enclosing Intent.
 message SendIntent {
   repeated LocalTrack tracks = 1;
 }
@@ -198,7 +251,7 @@ message SendIntent {
 // Values are milliseconds.
 //
 // min_ms == 0 && max_ms == 0:
-//   request minimum possible buffering.
+//   Request minimum possible buffering.
 //
 // Otherwise:
 //   min_ms MUST be <= max_ms.
@@ -208,6 +261,7 @@ message PlayoutDelay {
   uint32 min_ms = 1;
   uint32 max_ms = 2;
 }
+
 
 // Receive options for one remote video track.
 //
@@ -240,13 +294,20 @@ message VideoOptions {
   optional PlayoutDelay playout_delay = 15;
 }
 
-// Desired state for one remote video track.
+
+// Desired state for one canonical remote video track.
+//
+// `track_id` MUST refer to a TrackId visible in Catalog and MUST identify a
+// video track.
 message VideoTrackIntent {
   string track_id = 1;
   VideoOptions options = 2;
 }
 
+
 // Complete desired remote video state.
+//
+// Each entry explicitly references one canonical TrackId.
 message VideoIntent {
   repeated VideoTrackIntent tracks = 1;
 }
@@ -258,16 +319,22 @@ message VideoIntent {
 
 // Receive options for one explicitly requested remote audio track.
 //
-// `playout_delay` uses tag 15 for the same numbering convention as VideoOptions.
+// `playout_delay` uses tag 15 for the same numbering convention as
+// VideoOptions.
 message AudioOptions {
   optional PlayoutDelay playout_delay = 15;
 }
 
-// Desired state for one explicitly requested remote audio track.
+
+// Desired state for one explicitly requested canonical remote audio track.
+//
+// `track_id` MUST refer to a TrackId visible in Catalog and MUST identify an
+// audio track.
 message AudioTrackIntent {
   string track_id = 1;
   AudioOptions options = 2;
 }
+
 
 enum AudioMode {
   // Select explicit tracks first, then automatically fill remaining negotiated
@@ -278,9 +345,11 @@ enum AudioMode {
   AUDIO_MODE_EXPLICIT_ONLY = 1;
 }
 
+
 // Complete desired remote audio state.
 //
-// `tracks` contains explicitly requested audio tracks in preference order.
+// `tracks` contains explicitly requested canonical audio TrackIds in preference
+// order.
 //
 // In AUDIO_MODE_AUTO:
 //
@@ -310,21 +379,23 @@ message AudioIntent {
 //
 // VideoIntent and AudioIntent are peers:
 //
-//   video = explicit video tracks with per-track receive options
-//   audio = explicit audio tracks with per-track options plus selection policy
+//   video = explicit video TrackIds with per-track receive options
+//   audio = explicit audio TrackIds with per-track options plus selection policy
 message ReceiveIntent {
   VideoIntent video = 1;
   AudioIntent audio = 2;
 }
+
 
 // Complete desired media state.
 //
 // Every accepted Intent atomically replaces the previous Intent.
 //
 // `revision` is client-owned, monotonically increasing, and scoped to this
-// signaling connection. It correlates Mapping and errors.
+// signaling connection. It is not an entity Id. It correlates Mapping and
+// intent-specific errors.
 //
-// Receive intent references canonical TrackIds.
+// Receive intent references canonical TrackIds supplied by PulseBeam.
 message Intent {
   uint64 revision = 1;
   SendIntent send = 2;
@@ -333,44 +404,56 @@ message Intent {
 
 
 // ============================================================================
-// 3. Mapping — where remote tracks are delivered
+// 3. Mapping — where canonical remote tracks are delivered locally
 // ============================================================================
 
-// One remote track assigned to one negotiated local receiver.
+// One canonical remote track assigned to one negotiated local receiver.
 //
-// `receiver_id` is the zero-based SDP media-section index of that receiver.
+// `receiver_index` is the zero-based SDP media-section index of that receiver.
+//
+// It is a connection-local protocol coordinate, not a PulseBeam entity Id,
+// Address, Handle, or application identity.
 //
 // The client resolves:
 //
-//   receiver_id
+//   receiver_index
 //       -> RTCRtpReceiver
 //       -> MediaStreamTrack
 //       -> TrackId
+//
+// `track_id` is the canonical TrackId currently delivered through that
+// receiver.
 message TrackMapping {
-  uint32 receiver_id = 1;
+  uint32 receiver_index = 1;
   string track_id = 2;
 }
 
-// Complete current mapping for one media kind.
+
+// Complete current set of track mappings for one media kind.
 //
 // Receivers without an assigned track are omitted.
+//
 // Entry ordering has no semantic meaning.
-message MediaMapping {
+message TrackMappings {
   repeated TrackMapping tracks = 1;
 }
 
+
 // Complete current receive mapping.
 //
-// Each Mapping replaces the previous Mapping.
+// Each Mapping atomically replaces the previous Mapping.
 //
-// `intent_revision` is the latest Intent accepted by the server.
+// `intent_revision` is the latest Intent revision accepted by the server.
 //
-// Mapping changes when an actual receiver-to-track assignment changes, not
+// It is a correlation value scoped to this signaling connection, not a
+// PulseBeam entity Id.
+//
+// Mapping changes when an actual receiver-to-TrackId assignment changes, not
 // merely because audio activity, congestion, bitrate, or video layer changes.
 message Mapping {
   uint64 intent_revision = 1;
-  MediaMapping video = 2;
-  MediaMapping audio = 3;
+  TrackMappings video = 2;
+  TrackMappings audio = 3;
 }
 
 
@@ -380,7 +463,11 @@ message Mapping {
 
 // Presents a fresh customer-signed JWT for this live participant.
 //
-// The token MUST authorize the same participant and room.
+// The token MUST authorize the same canonical participant and room as the
+// existing connection.
+//
+// The application-owned `room` and `sub` claims therefore MUST resolve to the
+// same RoomId and ParticipantId.
 //
 // Accepted renewal extends authorization only. It does not modify SDP,
 // Catalog, Intent, or Mapping.
@@ -389,6 +476,7 @@ message Mapping {
 message RenewAuthorization {
   string token = 1;
 }
+
 
 // Current server-authoritative authorization deadline.
 //
@@ -419,6 +507,7 @@ enum ErrorCode {
   INTERNAL = 8;
 }
 
+
 // Machine-readable protocol failure.
 //
 // `message` is diagnostic only and MUST NOT be parsed.
@@ -440,6 +529,10 @@ message Error {
 // Transport
 // ============================================================================
 
+// One client-to-server signaling message.
+//
+// Exactly one payload is present before protobuf serialization and LZ4
+// compression.
 message ClientMessage {
   oneof payload {
     Intent intent = 1;
@@ -447,6 +540,11 @@ message ClientMessage {
   }
 }
 
+
+// One server-to-client signaling message.
+//
+// Exactly one payload is present before protobuf serialization and LZ4
+// compression.
 message ServerMessage {
   oneof payload {
     Catalog catalog = 1;
