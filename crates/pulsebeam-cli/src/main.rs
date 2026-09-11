@@ -9,7 +9,7 @@
 )]
 #![cfg_attr(test, allow(clippy::expect_used, clippy::panic, clippy::unwrap_used))]
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use pulsebeam_agent_native::agent_core::{
     AgentConfig, ConnectionState, DesiredState, MediaKind, MediaTopology, PublicationIntent,
@@ -19,12 +19,21 @@ use pulsebeam_agent_native::{
     Agent, AgentEvent, Config, Host, LocalMedia, MediaFrame, MediaTime, RemoteMedia, SimulcastLayer,
 };
 use pulsebeam_agent_native::{clock::clock_anchor, wallclock_at};
+use pulsebeam_core::auth::{
+    ApiSigningKey, PrivateSigningBundle, ProjectKey, ProjectKeys, ProjectRegistry,
+};
 use pulsebeam_core::identity::{
-    AudioTrackId, DataTrackId, ParticipantExternalId, ParticipantId, ProjectId, RoomExternalId,
-    RoomId, VideoTrackId,
+    ApiKeyId, AudioTrackId, DataTrackId, ParticipantExternalId, ParticipantId, ProjectId,
+    RoomExternalId, RoomId, VideoTrackId,
 };
 use pulsebeam_core::net::UdpSocket;
-use std::{collections::HashSet, sync::Arc, time::Duration};
+use std::{
+    collections::HashSet,
+    io::Write,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 use tachyonix as mpsc;
 use tokio::sync::{broadcast, watch};
 use tokio::{fs::File, io::BufWriter};
@@ -167,11 +176,25 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    AuthKey(AuthKeyConfig),
     Bench(BenchConfig),
     Id {
         #[command(subcommand)]
         command: IdCommand,
     },
+}
+
+#[derive(Args)]
+struct AuthKeyConfig {
+    /// Existing project to create a rotation key for
+    #[arg(long)]
+    project_id: Option<ProjectId>,
+    /// New public registry JSON output
+    #[arg(long)]
+    public_registry: PathBuf,
+    /// New private signing bundle JSON output
+    #[arg(long)]
+    private_signing_bundle: PathBuf,
 }
 
 #[derive(Subcommand)]
@@ -283,6 +306,7 @@ fn main() -> Result<()> {
     let runtime = builder.build()?;
     runtime.block_on(async move {
         match cli.command {
+            Commands::AuthKey(config) => generate_auth_key(config)?,
             Commands::Bench(config) => {
                 run_bench(cli.api_url, config).await?;
             }
@@ -290,6 +314,90 @@ fn main() -> Result<()> {
         }
         anyhow::Ok(())
     })
+}
+
+fn generate_auth_key(config: AuthKeyConfig) -> Result<()> {
+    let mut seed = [0u8; 32];
+    let mut rng: rand::rngs::StdRng = rand::make_rng();
+    rand::Rng::fill_bytes(&mut rng, &mut seed);
+    write_auth_key(config, ApiSigningKey::from_seed(seed))
+}
+
+fn write_auth_key(config: AuthKeyConfig, signing_key: ApiSigningKey) -> Result<()> {
+    if config.public_registry.try_exists()? {
+        anyhow::bail!(
+            "refusing to overwrite public registry {}",
+            config.public_registry.display()
+        );
+    }
+    if config.private_signing_bundle.try_exists()? {
+        anyhow::bail!(
+            "refusing to overwrite private signing bundle {}",
+            config.private_signing_bundle.display()
+        );
+    }
+
+    let project_id = config.project_id.unwrap_or_default();
+    let key_id = ApiKeyId::new();
+    let registry = ProjectRegistry::new(vec![ProjectKeys {
+        project_id,
+        keys: vec![ProjectKey {
+            key_id,
+            verifying_key: signing_key.verifying_key(),
+        }],
+    }])?;
+    let public_json = format!("{}\n", registry.to_pretty_json()?);
+    let private_json = format!(
+        "{}\n",
+        serde_json::to_string_pretty(&PrivateSigningBundle {
+            project_id,
+            key_id,
+            signing_key,
+        })?
+    );
+
+    create_new_file(
+        &config.private_signing_bundle,
+        private_json.as_bytes(),
+        true,
+    )
+    .with_context(|| "cannot create private signing bundle")?;
+    if let Err(error) = create_new_file(&config.public_registry, public_json.as_bytes(), false) {
+        let _ = std::fs::remove_file(&config.private_signing_bundle);
+        return Err(error).with_context(|| "cannot create public project registry");
+    }
+
+    println!("project_id={project_id}");
+    println!("key_id={key_id}");
+    println!("public_registry={}", config.public_registry.display());
+    println!(
+        "private_signing_bundle={}",
+        config.private_signing_bundle.display()
+    );
+    Ok(())
+}
+
+fn create_new_file(path: &Path, contents: &[u8], private: bool) -> std::io::Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        if private {
+            options.mode(0o600);
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = private;
+
+    let result = options.open(path).and_then(|mut file| {
+        file.write_all(contents)?;
+        file.sync_all()
+    });
+    if result.is_err() {
+        let _ = std::fs::remove_file(path);
+    }
+    result
 }
 
 fn derive_id(command: IdCommand) -> String {
@@ -755,6 +863,27 @@ mod tests {
     use clap::Parser;
     use pulsebeam_agent_native::agent_core::Publication;
 
+    fn auth_paths(label: &str) -> (PathBuf, PathBuf) {
+        let suffix = ApiKeyId::new().as_str();
+        let directory = std::env::temp_dir();
+        (
+            directory.join(format!("pulsebeam-{label}-{suffix}-public.json")),
+            directory.join(format!("pulsebeam-{label}-{suffix}-private.json")),
+        )
+    }
+
+    fn auth_config(
+        project_id: Option<ProjectId>,
+        public_registry: PathBuf,
+        private_signing_bundle: PathBuf,
+    ) -> AuthKeyConfig {
+        AuthKeyConfig {
+            project_id,
+            public_registry,
+            private_signing_bundle,
+        }
+    }
+
     #[test]
     fn benchmark_arguments_keep_the_documented_surface() {
         let cli = Cli::try_parse_from([
@@ -843,6 +972,109 @@ mod tests {
             panic!("participant command must parse as id");
         };
         assert_eq!(derive_id(command), participant.as_str());
+    }
+
+    #[test]
+    fn auth_key_initial_and_rotation_outputs_are_separate_and_public_safe() {
+        let signing = ApiSigningKey::from_seed([7; 32]);
+        let (initial_public, initial_private) = auth_paths("initial");
+        write_auth_key(
+            auth_config(None, initial_public.clone(), initial_private.clone()),
+            signing.clone(),
+        )
+        .unwrap();
+
+        let initial_public_json = std::fs::read_to_string(&initial_public).unwrap();
+        let initial_registry = ProjectRegistry::parse_json(&initial_public_json).unwrap();
+        let initial_project = initial_registry.only_project().unwrap();
+        assert_eq!(initial_project.keys.len(), 1);
+        assert!(!initial_public_json.contains("signing_key"));
+        assert!(!initial_public_json.contains("sk_0"));
+
+        let initial_private_json = std::fs::read_to_string(&initial_private).unwrap();
+        let initial_bundle: PrivateSigningBundle =
+            serde_json::from_str(&initial_private_json).unwrap();
+        assert_eq!(initial_bundle.project_id, initial_project.project_id);
+        assert_eq!(initial_bundle.key_id, initial_project.keys[0].key_id);
+        assert_eq!(initial_bundle.signing_key, signing);
+
+        let (rotation_public, rotation_private) = auth_paths("rotation");
+        write_auth_key(
+            auth_config(
+                Some(initial_project.project_id),
+                rotation_public.clone(),
+                rotation_private.clone(),
+            ),
+            ApiSigningKey::from_seed([8; 32]),
+        )
+        .unwrap();
+        let rotation_registry =
+            ProjectRegistry::parse_json(&std::fs::read_to_string(&rotation_public).unwrap())
+                .unwrap();
+        let rotation_project = rotation_registry.only_project().unwrap();
+        assert_eq!(rotation_project.project_id, initial_project.project_id);
+        assert_ne!(
+            rotation_project.keys[0].key_id,
+            initial_project.keys[0].key_id
+        );
+
+        for path in [
+            initial_public,
+            initial_private,
+            rotation_public,
+            rotation_private,
+        ] {
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn auth_key_refuses_to_overwrite_either_output() {
+        let (public, private) = auth_paths("overwrite");
+        std::fs::write(&public, "existing").unwrap();
+        let error = write_auth_key(
+            auth_config(None, public.clone(), private.clone()),
+            ApiSigningKey::from_seed([9; 32]),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("refusing to overwrite"));
+        assert_eq!(std::fs::read_to_string(&public).unwrap(), "existing");
+        assert!(!private.exists());
+        std::fs::remove_file(public).unwrap();
+
+        let (public, private) = auth_paths("overwrite-private");
+        std::fs::write(&private, "existing-secret").unwrap();
+        let error = write_auth_key(
+            auth_config(None, public.clone(), private.clone()),
+            ApiSigningKey::from_seed([9; 32]),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("refusing to overwrite"));
+        assert!(!public.exists());
+        assert_eq!(
+            std::fs::read_to_string(&private).unwrap(),
+            "existing-secret"
+        );
+        std::fs::remove_file(private).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auth_key_private_output_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (public, private) = auth_paths("permissions");
+        write_auth_key(
+            auth_config(None, public.clone(), private.clone()),
+            ApiSigningKey::from_seed([10; 32]),
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::metadata(&private).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        std::fs::remove_file(public).unwrap();
+        std::fs::remove_file(private).unwrap();
     }
 
     #[test]

@@ -5,7 +5,17 @@ Headless load and benchmark client for a running PulseBeam server. The current
 encoded fixtures, automatically subscribes each peer to remote video, and
 records latency and transport snapshots as CSV.
 
-This binary is a client only; it does not run or administer the SFU.
+This binary does not run the SFU. Its `auth-key` command creates production
+authentication material without issuing production bearer tokens:
+
+```text
+pulsebeam-cli auth-key \
+  --public-registry project-registry.json \
+  --private-signing-bundle signing-key.json
+```
+
+Pass `--project-id p_0...` to generate a rotation key for an existing project.
+Both outputs must be new files; the private output is owner-only on Unix.
 
 Canonical entity IDs can be derived for log lookup with `id room`,
 `id participant`, and `id track`. Each command requires a canonical

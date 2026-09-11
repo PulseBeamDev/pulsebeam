@@ -23,6 +23,7 @@ pulsebeam-proto.workspace = true
 pulsebeam-testdata = { path = "../pulsebeam-testdata" }
 rand.workspace = true
 reqwest = "0.13.4"
+serde_json = "1.0.150"
 tachyonix = "0.3.1"
 tokio = { workspace = true }
 tracing = { workspace = true }

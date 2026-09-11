@@ -13,6 +13,7 @@
     )
 )]
 
+pub mod auth;
 pub mod dd;
 pub mod framing;
 pub mod h264;

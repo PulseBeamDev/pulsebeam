@@ -2,8 +2,9 @@
 
 Portable protocol and media helpers shared by the PulseBeam server, clients,
 and simulator. It contains Dependency Descriptor parsing, H.264 and simulcast
-helpers, canonical server identity types, framing, and the abstract network
-interfaces used by real and simulated transports.
+helpers, canonical server identity and authentication types, the public project
+registry, framing, and the abstract network interfaces used by real and
+simulated transports.
 
 The crate must remain independent of the server's shard runtime. Types here may
 be used on either side of the wire, so parsing must validate hostile input and
