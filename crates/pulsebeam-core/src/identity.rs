@@ -1,6 +1,7 @@
 //! Canonical PulseBeam entity identities.
 
-use base32::Alphabet;
+use data_encoding::Encoding;
+use data_encoding_macro::new_encoding;
 use serde::{Deserialize, Serialize};
 use sha3::{Digest, Sha3_256};
 use std::{fmt, str::FromStr};
@@ -9,6 +10,11 @@ use uuid::{Uuid, Variant, Version};
 const UUID_TEXT_LEN: usize = 26;
 const EXTERNAL_ID_MAX_LEN: usize = 36;
 const VERSION: u8 = b'0';
+const CROCKFORD: Encoding = new_encoding! {
+    symbols: "0123456789ABCDEFGHJKMNPQRSTVWXYZ",
+    translate_from: "abcdefghjkmnpqrstvwxyzIiLlOo",
+    translate_to: "ABCDEFGHJKMNPQRSTVWXYZ111100",
+};
 
 // These domain bytes and TrackKind discriminants are part of the V0 transcript.
 const ROOM_DOMAIN: &[u8] = b"pulsebeam.identity.room.v0";
@@ -41,7 +47,7 @@ pub enum IdValidationError {
 }
 
 fn encode_uuid(uuid: Uuid) -> String {
-    base32::encode(Alphabet::Crockford, uuid.as_bytes())
+    CROCKFORD.encode(uuid.as_bytes())
 }
 
 fn decode_uuid(value: &str) -> Result<Uuid, IdValidationError> {
@@ -51,25 +57,12 @@ fn decode_uuid(value: &str) -> Result<Uuid, IdValidationError> {
             actual: value.len(),
         });
     }
-    if !value.is_ascii() {
-        return Err(IdValidationError::InvalidEncoding);
-    }
-    let normalized: String = value
-        .bytes()
-        .map(|byte| match byte.to_ascii_uppercase() {
-            b'O' => '0',
-            b'I' | b'L' => '1',
-            byte => char::from(byte),
-        })
-        .collect();
-    let decoded = base32::decode(Alphabet::Crockford, &normalized)
+    let decoded = CROCKFORD
+        .decode(value.as_bytes())
+        .ok()
         .and_then(|bytes| <[u8; 16]>::try_from(bytes).ok())
         .ok_or(IdValidationError::InvalidEncoding)?;
-    let uuid = Uuid::from_bytes(decoded);
-    if encode_uuid(uuid) != normalized {
-        return Err(IdValidationError::InvalidEncoding);
-    }
-    Ok(uuid)
+    Ok(Uuid::from_bytes(decoded))
 }
 
 fn format_id(prefix: &str, uuid: Uuid) -> String {
