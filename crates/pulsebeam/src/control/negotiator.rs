@@ -261,7 +261,7 @@ mod tests {
     // cross-core. See crates/pulsebeam/docs/thread-per-core.md.
     use super::*;
 
-    fn chrome_like_offer() -> SdpOffer {
+    fn chrome_like_offer(direction: Direction) -> SdpOffer {
         let mut config = RtcConfig::new()
             .clear_codecs()
             // Chrome's usual ids: dependency descriptor collides with str0m's
@@ -275,16 +275,30 @@ mod tests {
         let mut rtc = config.build(std::time::Instant::now());
 
         let mut change = rtc.sdp_api();
-        change.add_media(MediaKind::Video, Direction::SendOnly, None, None, None);
+        change.add_media(MediaKind::Video, direction, None, None, None);
         change.apply().unwrap().0
     }
 
     fn answer_sdp() -> String {
         let mut negotiator = Negotiator::new(Vec::new());
         let (_, answer) = negotiator
-            .create_answer(chrome_like_offer(), IceCreds::new())
+            .create_answer(chrome_like_offer(Direction::SendOnly), IceCreds::new())
             .unwrap();
         answer.to_sdp_string()
+    }
+
+    #[test]
+    fn answers_invert_strict_unidirectional_offers() {
+        for (offer_direction, answer_direction) in [
+            (Direction::SendOnly, "a=recvonly"),
+            (Direction::RecvOnly, "a=sendonly"),
+        ] {
+            let mut negotiator = Negotiator::new(Vec::new());
+            let (_, answer) = negotiator
+                .create_answer(chrome_like_offer(offer_direction), IceCreds::new())
+                .unwrap();
+            assert!(answer.to_sdp_string().contains(answer_direction));
+        }
     }
 
     #[test]

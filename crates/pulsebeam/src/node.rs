@@ -930,6 +930,8 @@ impl NodeBuilder {
             let cors = CorsLayer::new()
                 .allow_origin(Any)
                 .allow_methods([
+                    hyper::Method::GET,
+                    hyper::Method::HEAD,
                     hyper::Method::POST,
                     hyper::Method::DELETE,
                     hyper::Method::OPTIONS,
@@ -940,7 +942,11 @@ impl NodeBuilder {
                     hyper::header::CONTENT_ENCODING,
                     hyper::header::ACCEPT,
                 ])
-                .expose_headers([hyper::header::LOCATION])
+                .expose_headers([
+                    hyper::header::LOCATION,
+                    hyper::header::ALLOW,
+                    hyper::header::HeaderName::from_static("accept-post"),
+                ])
                 .max_age(Duration::from_secs(86400));
 
             let project_registry = self
