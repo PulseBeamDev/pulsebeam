@@ -6,7 +6,7 @@ use slotmap::SecondaryMap;
 use tokio::time::Instant;
 
 use crate::clock::WallAnchor;
-use crate::route::{Envelope, TransportHandle};
+use crate::route::{Envelope, NodeTransportAddress};
 use crate::shard::events::{ParticipantBindingEvent, ParticipantEvent, ParticipantLifecycleEvent};
 use crate::{
     keys::ParticipantKey,
@@ -259,17 +259,17 @@ impl ShardExecution {
     pub(super) fn apply_lifecycle_op(&mut self, op: &crate::shard_update::ShardUpdateOp) {
         debug_assert!(op.is_owned_by(self.shard_id));
         match op {
-            crate::shard_update::ShardUpdateOp::InstallRoute { handle, action } => {
-                self.runtime.routes.install_action(*handle, *action);
+            crate::shard_update::ShardUpdateOp::InstallRoute { address, action } => {
+                self.runtime.routes.install_action(*address, *action);
             }
-            crate::shard_update::ShardUpdateOp::RetireRoute { handle } => {
-                let _ = self.runtime.routes.retire(*handle);
+            crate::shard_update::ShardUpdateOp::RetireRoute { address } => {
+                let _ = self.runtime.routes.retire(*address);
             }
             crate::shard_update::ShardUpdateOp::InstallTransport { binding } => {
                 self.transports.install(*binding);
             }
-            crate::shard_update::ShardUpdateOp::RetireTransport { handle } => {
-                self.transports.retire(*handle);
+            crate::shard_update::ShardUpdateOp::RetireTransport { address } => {
+                self.transports.retire(*address);
             }
             crate::shard_update::ShardUpdateOp::InsertParticipant
             | crate::shard_update::ShardUpdateOp::Placeholder => {}
@@ -341,13 +341,13 @@ impl ShardExecution {
         let link_seq = (env.extension >> 32) as u32;
         #[allow(clippy::cast_possible_truncation)]
         let playout_ntp32 = env.extension as u32;
-        let handle = env.handle;
-        let Some(action) = self.runtime.routes.resolve(handle) else {
+        let address = env.address;
+        let Some(action) = self.runtime.routes.resolve(address) else {
             return;
         };
         #[cfg(feature = "sim")]
         crate::sim_metrics::record_cross_shard_media();
-        let entry = self.runtime.routes.accounting_mut(handle, self.wall.ntp());
+        let entry = self.runtime.routes.accounting_mut(address, self.wall.ntp());
         entry.observe(link_seq);
         let Ok(playout) = entry.expander.expand(playout_ntp32) else {
             return;
@@ -376,20 +376,20 @@ impl ShardExecution {
 
     #[cfg(test)]
     pub(crate) fn on_udp_batch(&mut self, batch: net::RecvPacketBatch) {
-        let Some(handle) = self.registry.demux(&batch) else {
+        let Some(address) = self.registry.demux(&batch) else {
             return;
         };
         // Not an error: SO_REUSEPORT picks the receiving socket by hashing the
         // 4-tuple, which has nothing to do with which shard owns the route, so
         // a datagram for another shard arriving here is ordinary. Resolving a
         // route is not a claim to own it.
-        if handle.shard() != self.shard_id {
+        if address.shard() != self.shard_id {
             metrics::counter!("shard_wrong_owner_drop").increment(1);
             #[cfg(feature = "sim")]
             crate::sim_metrics::record_routing_counter("shard_wrong_owner_drop");
             return;
         }
-        self.on_owned_udp_batch(batch, handle, self.shard_id);
+        self.on_owned_udp_batch(batch, address, self.shard_id);
     }
 
     pub(crate) fn on_udp_batch_routed(
@@ -397,15 +397,15 @@ impl ShardExecution {
         batch: net::RecvPacketBatch,
         router: &impl ShardTransport,
     ) {
-        let Some(handle) = self.registry.demux(&batch) else {
+        let Some(address) = self.registry.demux(&batch) else {
             return;
         };
-        if handle.shard() != self.shard_id {
+        if address.shard() != self.shard_id {
             router.send_frame(
-                handle.shard(),
+                address.shard(),
                 ShardFrame::Ingress {
                     batch,
-                    handle,
+                    address,
                     source_shard: self.shard_id,
                 },
             );
@@ -414,17 +414,17 @@ impl ShardExecution {
             crate::sim_metrics::record_routing_counter("shard_wrong_owner_forward");
             return;
         }
-        self.on_owned_udp_batch(batch, handle, self.shard_id);
+        self.on_owned_udp_batch(batch, address, self.shard_id);
     }
 
     fn on_owned_udp_batch(
         &mut self,
         batch: net::RecvPacketBatch,
-        handle: TransportHandle,
+        address: NodeTransportAddress,
         source_shard: crate::id::ShardId,
     ) {
-        debug_assert_eq!(handle.shard(), self.shard_id);
-        let Some(key) = self.transports.resolve(handle) else {
+        debug_assert_eq!(address.shard(), self.shard_id);
+        let Some(key) = self.transports.resolve(address) else {
             return;
         };
         let Some(participant) = self.registry.resolve_mut(key) else {
@@ -497,17 +497,17 @@ impl ShardExecution {
                     destination,
                     source_shard,
                 }) => {
-                    let Some(handle) = self.registry.authenticated_handle(participant_key) else {
+                    let Some(address) = self.registry.authenticated_address(participant_key) else {
                         debug_assert!(false, "authenticated participant must still be registered");
                         continue;
                     };
-                    self.registry.authenticate_addr(source, handle);
+                    self.registry.authenticate_addr(source, address);
                     self.pipeline
                         .push_shard_event(ShardEvent::TransportAuthenticated {
                             source,
                             destination,
                             source_shard,
-                            handle,
+                            address,
                             shard: self.shard_id,
                         });
                 }
@@ -571,8 +571,8 @@ impl ShardExecution {
             ShardCommand::AdoptTcpConnection { .. } => {
                 debug_assert!(false, "TCP handoff is consumed by the worker");
             }
-            ShardCommand::AuthenticateTransport { source, handle } => {
-                self.registry.authenticate_addr(source, handle);
+            ShardCommand::AuthenticateTransport { source, address } => {
+                self.registry.authenticate_addr(source, address);
                 metrics::counter!("demux_flow_authenticated").increment(1);
                 #[cfg(feature = "sim")]
                 crate::sim_metrics::record_routing_counter("demux_flow_authenticated");
@@ -597,7 +597,7 @@ impl ShardExecution {
         match frame {
             ShardFrame::Ingress {
                 batch,
-                handle,
+                address,
                 source_shard,
             } => {
                 // A datagram that reached the node on another shard's socket.
@@ -612,10 +612,10 @@ impl ShardExecution {
                 metrics::counter!("shard_ingress_forwarded").increment(1);
                 #[cfg(feature = "sim")]
                 crate::sim_metrics::record_routing_counter("shard_ingress_forwarded");
-                if self.transports.resolve(handle).is_some() {
-                    self.registry.learn_addr(batch.src, handle);
+                if self.transports.resolve(address).is_some() {
+                    self.registry.learn_addr(batch.src, address);
                 }
-                self.on_owned_udp_batch(batch, handle, source_shard);
+                self.on_owned_udp_batch(batch, address, source_shard);
             }
             ShardFrame::Media { env, payload } => {
                 self.on_media_frame(env, payload, now, router);
@@ -634,11 +634,11 @@ impl ShardExecution {
         if !self
             .runtime
             .routes
-            .accept_reverse(env.handle, packet.dedup(), now)
+            .accept_reverse(env.address, packet.dedup(), now)
         {
             return;
         }
-        let Some(action) = self.runtime.routes.resolve(env.handle) else {
+        let Some(action) = self.runtime.routes.resolve(env.address) else {
             return;
         };
         let Some((origin, target)) = self.runtime.resolve_reverse(action) else {
@@ -656,7 +656,7 @@ impl ShardExecution {
     fn add_participant(
         &mut self,
         key: ParticipantKey,
-        transport: crate::route::TransportHandle,
+        transport: crate::route::NodeTransportAddress,
         cfg: ParticipantConfig,
     ) -> bool {
         debug_assert_eq!(transport.shard(), self.shard_id);
@@ -871,12 +871,12 @@ mod wrong_owner_tests {
         );
         let mut track_keys = slotmap::SlotMap::<crate::keys::TrackKey, ()>::with_key();
         let track = track_keys.insert(());
-        let route = crate::route::RouteHandle::new(crate::route::RouteId::new(shard, 7), 1);
+        let route = crate::route::NodeRouteAddress::new(crate::route::RouteId::new(shard, 7), 1);
 
         writer.stage(
             1,
             crate::shard_update::ShardUpdateOp::InstallRoute {
-                handle: route,
+                address: route,
                 action: crate::route::RouteAction::Forward { target: track },
             },
         );
@@ -904,7 +904,7 @@ mod wrong_owner_tests {
             WallAnchor::new(std::time::SystemTime::UNIX_EPOCH, Instant::now()),
             update_rx,
         );
-        let route = crate::route::RouteHandle::new(crate::route::RouteId::new(shard, 8), 1);
+        let route = crate::route::NodeRouteAddress::new(crate::route::RouteId::new(shard, 8), 1);
         let mut track_keys = slotmap::SlotMap::<crate::keys::TrackKey, ()>::with_key();
         let plans = (0..=crate::shard::worker::SHARD_PLAN_OPERATION_BUDGET)
             .map(|_| crate::shard_update::TrackPlanUpdate {
@@ -916,7 +916,7 @@ mod wrong_owner_tests {
         writer.stage(
             1,
             crate::shard_update::ShardUpdateOp::InstallRoute {
-                handle: route,
+                address: route,
                 action: crate::route::RouteAction::Forward {
                     target: track_keys.insert(()),
                 },
@@ -925,7 +925,7 @@ mod wrong_owner_tests {
         writer.stage_plans(1, plans);
         writer.stage(
             1,
-            crate::shard_update::ShardUpdateOp::RetireRoute { handle: route },
+            crate::shard_update::ShardUpdateOp::RetireRoute { address: route },
         );
         assert_eq!(writer.publish(), Some(1));
 

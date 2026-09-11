@@ -5,10 +5,10 @@
 The controller is a compiler. A shard is a packet executor.
 
 The controller owns semantic state: rooms, participants, published tracks and
-subscriptions. It resolves that state into shard-local keys, route handles and
-one forwarding plan per resident track. The shard installs those values and
-executes them without evaluating room policy, subscription selectors or media
-kind.
+subscriptions. It resolves that state into shard-local keys, route addresses
+and one forwarding plan per resident track. The shard installs those values
+and executes them without evaluating room policy, subscription selectors or
+media kind.
 
 ```text
                          control plane
@@ -116,7 +116,7 @@ topic, room id or stable participant id while forwarding a packet.
 
 For each track, the controller groups candidates and active bindings by their
 owning shard. It allocates one shard-local `TrackKey` on the publisher shard and
-reserves one destination `TrackKey` plus `RouteHandle` on every remote shard
+reserves one destination `TrackKey` plus `NodeRouteAddress` on every remote shard
 that has candidates. A candidate-only destination remains dormant: it has no
 forward route, runtime, plan or origin remote entry. Those are installed only
 while the shard has at least one active binding.
@@ -126,8 +126,8 @@ Every resident copy uses the same plan:
 ```text
 TrackPlan {
     local:         [ParticipantKey]
-    remote:        [RouteHandle]
-    reverse_route: optional RouteHandle
+    remote:        [NodeRouteAddress]
+    reverse_route: optional NodeRouteAddress
 }
 ```
 
@@ -300,9 +300,9 @@ Stable names are control-plane identities. Packets use compiled addresses.
 The packed layout supports 4096 shard ids and 1,048,576 slots per shard. Two
 semantic route families wrap it and use separate allocator namespaces:
 
-- `TransportHandle = TransportRoute + epoch` addresses client ICE, DTLS and
+- `NodeTransportAddress = TransportRoute + epoch` addresses client ICE, DTLS and
   SRTP state;
-- `RouteHandle = RouteId + epoch` addresses a forwarded or reverse track
+- `NodeRouteAddress = RouteId + epoch` addresses a forwarded or reverse track
   endpoint.
 
 The types are intentionally not interchangeable even though their packed bits
@@ -359,7 +359,7 @@ A change that breaks one of these is an architectural regression even when its
 tests pass:
 
 1. The controller owns rooms, track identities, selectors and placement.
-2. The shard routes only by `TrackKey`, `ParticipantKey` and route handle.
+2. The shard routes only by `TrackKey`, `ParticipantKey` and node route address.
 3. Every track kind uses the same `TrackPlan` and `Forward` action.
 4. A plan contains exact outputs, never selectors or stable application ids.
 5. A remote origin sends one copy per destination shard; that shard performs

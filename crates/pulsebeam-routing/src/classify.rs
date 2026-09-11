@@ -5,7 +5,7 @@
 
 use crate::envelope::{Envelope, EnvelopeError};
 use crate::ufrag::{self, UfragDecodeError};
-use crate::{TransportHandle, stun};
+use crate::{NodeTransportAddress, stun};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DropReason {
@@ -29,7 +29,7 @@ pub enum ClientVerdict {
     Drop(DropReason),
     /// First STUN of a connection: steer by the ufrag's transport route.
     Bootstrap {
-        handle: TransportHandle,
+        address: NodeTransportAddress,
         cluster_id: u16,
         node_id: u16,
     },
@@ -47,7 +47,7 @@ pub fn classify_client(payload: &[u8]) -> ClientVerdict {
     };
     match decode_ufrag_token(username) {
         Ok(u) => ClientVerdict::Bootstrap {
-            handle: TransportHandle {
+            address: NodeTransportAddress {
                 route: u.transport,
                 epoch: u.epoch,
             },
@@ -68,7 +68,7 @@ pub fn classify_client_for_node(
 ) -> ClientVerdict {
     match classify_client(payload) {
         ClientVerdict::Bootstrap {
-            handle,
+            address,
             cluster_id: got_cluster,
             node_id: got_node,
         } => {
@@ -78,11 +78,11 @@ pub fn classify_client_for_node(
             if got_node != node_id {
                 return ClientVerdict::Drop(DropReason::WrongNode);
             }
-            if handle.route.shard() >= shard_count {
+            if address.route.shard() >= shard_count {
                 return ClientVerdict::Drop(DropReason::InvalidShard);
             }
             ClientVerdict::Bootstrap {
-                handle,
+                address,
                 cluster_id: got_cluster,
                 node_id: got_node,
             }
@@ -186,13 +186,13 @@ mod tests {
     }
 
     #[test]
-    fn valid_bootstrap_ufrag_resolves_transport_handle() {
+    fn valid_bootstrap_ufrag_resolves_node_transport_address() {
         let u = IceUfrag::new(3, 5, TransportRoute::new(2, 100), 7);
         let msg = build_stun_with_username(&ufrag_username(&u));
         assert_eq!(
             classify_client(&msg),
             ClientVerdict::Bootstrap {
-                handle: TransportHandle {
+                address: NodeTransportAddress {
                     route: u.transport,
                     epoch: u.epoch,
                 },
@@ -247,7 +247,7 @@ mod tests {
         assert_eq!(
             classify_client_for_node(&msg, 3, 5, 10),
             ClientVerdict::Bootstrap {
-                handle: TransportHandle {
+                address: NodeTransportAddress {
                     route: u.transport,
                     epoch: u.epoch,
                 },

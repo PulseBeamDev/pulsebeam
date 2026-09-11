@@ -335,8 +335,8 @@ pub fn install_steering_flow(source: SocketAddr, destination: SocketAddr, shard:
 
 fn route_owner(payload: &[u8]) -> Option<u16> {
     match pulsebeam_routing::classify::classify_client(payload) {
-        pulsebeam_routing::classify::ClientVerdict::Bootstrap { handle, .. } => {
-            Some(handle.route.shard())
+        pulsebeam_routing::classify::ClientVerdict::Bootstrap { address, .. } => {
+            Some(address.route.shard())
         }
         _ => None,
     }

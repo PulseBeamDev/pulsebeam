@@ -260,6 +260,16 @@ mod tests {
     }
 
     #[test]
+    fn v0_wire_value_is_stable() {
+        let u = IceUfrag::new(0x0ABC, 0x1234, transport(7, 12_345), 42);
+        assert_eq!(
+            u.encode_raw(),
+            [0x0A, 0xBC, 0x12, 0x34, 0x00, 0x70, 0x30, 0x39, 0x00, 0x2A]
+        );
+        assert_eq!(&u.encode_ascii(), b"1AY14D00E0R3J01A");
+    }
+
+    #[test]
     fn decode_ascii_rejects_wrong_length() {
         assert!(IceUfrag::decode_ascii(b"TOOSHORT").is_none());
         assert!(IceUfrag::decode_ascii(b"WAYTOOLONGTOBEAVALIDUFRAGSTRING").is_none());

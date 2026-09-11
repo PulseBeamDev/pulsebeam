@@ -536,7 +536,7 @@ pub enum Track {
 #[derive(Debug, Clone)]
 pub struct AudioTrack {
     pub meta: TrackMeta,
-    pub reverse: Option<crate::route::RouteHandle>,
+    pub reverse: Option<crate::route::NodeRouteAddress>,
 }
 
 #[derive(Debug, Clone)]
@@ -544,7 +544,7 @@ pub struct VideoTrack {
     pub meta: TrackMeta,
     pub layers: Vec<TrackLayer>,
     stats: VideoStats,
-    pub reverse: Option<crate::route::RouteHandle>,
+    pub reverse: Option<crate::route::NodeRouteAddress>,
 }
 
 #[derive(Debug, Clone)]
@@ -552,7 +552,7 @@ pub struct DataTrack {
     pub meta: TrackMeta,
     pub topic: crate::track::Topic,
     pub lane: crate::track::DataLane,
-    pub reverse: Option<crate::route::RouteHandle>,
+    pub reverse: Option<crate::route::NodeRouteAddress>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -619,14 +619,14 @@ impl NullStats {
 }
 
 impl Track {
-    pub fn audio(meta: TrackMeta, reverse: Option<crate::route::RouteHandle>) -> Self {
+    pub fn audio(meta: TrackMeta, reverse: Option<crate::route::NodeRouteAddress>) -> Self {
         Self::Audio(AudioTrack { meta, reverse })
     }
 
     pub fn video(
         meta: TrackMeta,
         layers: Vec<TrackLayer>,
-        reverse: Option<crate::route::RouteHandle>,
+        reverse: Option<crate::route::NodeRouteAddress>,
     ) -> Self {
         Self::Video(VideoTrack {
             meta,
@@ -640,7 +640,7 @@ impl Track {
         meta: TrackMeta,
         topic: Topic,
         lane: DataLane,
-        reverse: Option<crate::route::RouteHandle>,
+        reverse: Option<crate::route::NodeRouteAddress>,
     ) -> Self {
         Self::Data(DataTrack {
             meta,
@@ -674,7 +674,7 @@ impl Track {
         self.id().kind()
     }
 
-    pub fn reverse(&self) -> Option<crate::route::RouteHandle> {
+    pub fn reverse(&self) -> Option<crate::route::NodeRouteAddress> {
         match self {
             Self::Audio(track) => track.reverse,
             Self::Video(track) => track.reverse,
@@ -682,7 +682,7 @@ impl Track {
         }
     }
 
-    pub fn set_reverse(&mut self, reverse: Option<crate::route::RouteHandle>) {
+    pub fn set_reverse(&mut self, reverse: Option<crate::route::NodeRouteAddress>) {
         match self {
             Self::Audio(track) => track.reverse = reverse,
             Self::Video(track) => track.reverse = reverse,

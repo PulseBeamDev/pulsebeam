@@ -1,4 +1,4 @@
-use crate::route::{TransportHandle, TransportRoute};
+use crate::route::{NodeTransportAddress, TransportRoute};
 use str0m::IceCreds;
 
 /// Wire layout — 10 bytes → 16 Crockford base32 chars (80 bits / 5 = 16, exact):
@@ -75,8 +75,8 @@ impl IceUfrag {
     }
 
     /// The `(route, epoch)` pair the receiver validates against.
-    pub const fn handle(&self) -> TransportHandle {
-        TransportHandle::new(self.transport, self.epoch)
+    pub const fn node_address(&self) -> NodeTransportAddress {
+        NodeTransportAddress::new(self.transport, self.epoch)
     }
 
     fn to_shared(self) -> pulsebeam_routing::ufrag::IceUfrag {

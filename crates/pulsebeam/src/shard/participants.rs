@@ -8,7 +8,7 @@ use slotmap::SecondaryMap;
 use crate::{
     id::ShardId,
     participant::{ParticipantConfig, ParticipantCore},
-    route::TransportHandle,
+    route::NodeTransportAddress,
     shard::demux::Demuxer,
 };
 
@@ -17,7 +17,7 @@ pub(crate) use crate::keys::ParticipantKey;
 pub(crate) struct ParticipantMeta {
     core: ParticipantCore,
     pub(super) queued_dirty: bool,
-    pub(super) ingress: TransportHandle,
+    pub(super) ingress: NodeTransportAddress,
 }
 
 impl Deref for ParticipantMeta {
@@ -75,7 +75,7 @@ impl ParticipantRegistry {
         &mut self,
         key: ParticipantKey,
         cfg: ParticipantConfig,
-        ingress: TransportHandle,
+        ingress: NodeTransportAddress,
     ) -> bool {
         debug_assert_eq!(ingress.shard(), self.shard_id);
         let participant_id = cfg.participant_id;
@@ -108,7 +108,7 @@ impl ParticipantRegistry {
         self.participants.get_mut(key).map(Box::as_mut)
     }
 
-    pub fn demux(&mut self, batch: &RecvPacketBatch) -> Option<TransportHandle> {
+    pub fn demux(&mut self, batch: &RecvPacketBatch) -> Option<NodeTransportAddress> {
         self.demuxer.demux(batch)
     }
 
@@ -119,19 +119,19 @@ impl ParticipantRegistry {
     /// seen the flow's STUN and so cannot classify anything that follows it.
     /// Learning the address while forwarding is still happening is what makes
     /// that handover lossless.
-    pub fn learn_addr(&mut self, src: SocketAddr, handle: TransportHandle) {
-        self.demuxer.learn(src, handle);
+    pub fn learn_addr(&mut self, src: SocketAddr, address: NodeTransportAddress) {
+        self.demuxer.learn(src, address);
     }
 
-    pub fn authenticate_addr(&mut self, src: SocketAddr, handle: TransportHandle) {
-        self.demuxer.authenticate(src, handle);
+    pub fn authenticate_addr(&mut self, src: SocketAddr, address: NodeTransportAddress) {
+        self.demuxer.authenticate(src, address);
     }
 
     /// The route a participant's authenticated address belongs to.
     ///
-    /// Reports the route handle so the shard can tell control which flow to
+    /// Reports the route address so the shard can tell control which flow to
     /// pin in the steering map.
-    pub fn authenticated_handle(&self, key: ParticipantKey) -> Option<TransportHandle> {
+    pub fn authenticated_address(&self, key: ParticipantKey) -> Option<NodeTransportAddress> {
         let Some(meta) = self.participants.get(key) else {
             debug_assert!(false, "authenticated participant must still be registered");
             return None;

@@ -103,9 +103,9 @@ impl ShardRuntime {
 
     pub(crate) fn apply_update_op(&mut self, op: &crate::shard_update::ShardUpdateOp) {
         match op {
-            crate::shard_update::ShardUpdateOp::RetireRoute { handle } => {
-                let retired = self.routes.retire(*handle);
-                debug_assert!(retired || self.routes.entry(*handle).is_none());
+            crate::shard_update::ShardUpdateOp::RetireRoute { address } => {
+                let retired = self.routes.retire(*address);
+                debug_assert!(retired || self.routes.entry(*address).is_none());
             }
             crate::shard_update::ShardUpdateOp::InsertTrackRuntime { key, runtime } => {
                 let descriptor = runtime.descriptor.as_ref();
@@ -148,8 +148,8 @@ impl ShardRuntime {
             crate::shard_update::ShardUpdateOp::RemoveTrackRuntime { key, .. } => {
                 self.retire_track(*key);
             }
-            crate::shard_update::ShardUpdateOp::InstallRoute { handle, action } => {
-                self.routes.install_action(*handle, *action);
+            crate::shard_update::ShardUpdateOp::InstallRoute { address, action } => {
+                self.routes.install_action(*address, *action);
             }
             crate::shard_update::ShardUpdateOp::InstallTransport { .. }
             | crate::shard_update::ShardUpdateOp::RetireTransport { .. }
@@ -437,7 +437,7 @@ mod tests {
             frames: RefCell::new(Vec::new()),
         };
         let target =
-            crate::route::RouteHandle::new(crate::route::RouteId::new(ShardId::new(2), 9), 1);
+            crate::route::NodeRouteAddress::new(crate::route::RouteId::new(ShardId::new(2), 9), 1);
         let plan = crate::shard_update::TrackPlan {
             reverse_route: Some(target),
             ..Default::default()

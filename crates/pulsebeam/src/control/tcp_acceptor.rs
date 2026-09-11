@@ -29,7 +29,7 @@ use tokio::sync::mpsc::Sender;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    control::ufrag::IceUfrag, route::TransportHandle, shard::demux::extract_stun_server_ufrag,
+    control::ufrag::IceUfrag, route::NodeTransportAddress, shard::demux::extract_stun_server_ufrag,
 };
 
 /// How long to wait for the first STUN frame on a fresh TCP connection.
@@ -56,12 +56,12 @@ pub struct TcpAcceptorEvent {
 }
 
 /// A validated pending TCP connection, ready for a one-time handoff to the
-/// shard named by `handle`. The controller must not re-validate the ufrag —
+/// shard named by `address`. The controller must not re-validate the ufrag —
 /// this is the only place that decision is made.
 pub struct PendingTcpConn {
     pub stream: BufferedTcpStream,
     pub peer_addr: SocketAddr,
-    pub handle: TransportHandle,
+    pub address: NodeTransportAddress,
 }
 
 /// Routing parameters this node validates every ufrag against before handing
@@ -197,7 +197,7 @@ async fn first_frame_task(
 /// Decode the initial STUN frame's ufrag and validate it names this node and
 /// a shard it actually has, before the connection is ever handed to the
 /// controller. This is the only validation this connection ever receives —
-/// the shard that ends up owning `stream` trusts `handle` without
+/// the shard that ends up owning `stream` trusts `address` without
 /// re-checking it.
 ///
 /// Every rejection branch drops `stream` on return, closing the OS socket;
@@ -238,8 +238,8 @@ fn validate_and_route(
         return None; // stream dropped here, OS socket closed
     }
 
-    let handle = ufrag.handle();
-    let shard = handle.shard();
+    let address = ufrag.node_address();
+    let shard = address.shard();
     if shard.index() >= config.shard_count {
         tracing::warn!(
             %peer_addr,
@@ -252,14 +252,14 @@ fn validate_and_route(
 
     debug_assert_eq!(
         shard,
-        handle.shard(),
+        address.shard(),
         "the shard validated against shard_count must be the shard the handoff targets"
     );
 
     Some(PendingTcpConn {
         stream,
         peer_addr,
-        handle,
+        address,
     })
 }
 
@@ -534,8 +534,8 @@ mod tests {
             let conn = recv_event(&mut event_rx)
                 .await
                 .expect("valid same-node ufrag must hand off");
-            assert_eq!(conn.handle.shard(), ShardId::new(2));
-            assert_eq!(conn.handle, TransportHandle::new(transport, 3));
+            assert_eq!(conn.address.shard(), ShardId::new(2));
+            assert_eq!(conn.address, NodeTransportAddress::new(transport, 3));
 
             // The handoff happens once: no further event ever arrives for this
             // connection, even though the OS socket is still open.
@@ -567,7 +567,7 @@ mod tests {
             let conn = recv_event(&mut event_rx)
                 .await
                 .expect("a valid large RFC 4571 frame must hand off");
-            assert_eq!(conn.handle, TransportHandle::new(transport, 4));
+            assert_eq!(conn.address, NodeTransportAddress::new(transport, 4));
             assert!(conn.stream.has_pending());
         });
     }

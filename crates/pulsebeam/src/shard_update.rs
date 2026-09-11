@@ -5,22 +5,22 @@ use std::collections::{HashSet, VecDeque};
 
 use crate::id::ShardId;
 use crate::keys::{ParticipantKey, TrackKey};
-use crate::route::{RouteAction, RouteHandle, TransportHandle};
+use crate::route::{NodeRouteAddress, NodeTransportAddress, RouteAction};
 use pulsebeam_runtime::mailbox;
 use str0m::media::Rid;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct TrackPlan {
     pub local: Vec<ParticipantKey>,
-    pub remote: Vec<RouteHandle>,
-    pub reverse_route: Option<RouteHandle>,
+    pub remote: Vec<NodeRouteAddress>,
+    pub reverse_route: Option<NodeRouteAddress>,
 }
 
 impl TrackPlan {
     pub(crate) fn new(
         local: impl IntoIterator<Item = ParticipantKey>,
-        remote: impl IntoIterator<Item = RouteHandle>,
-        reverse_route: Option<RouteHandle>,
+        remote: impl IntoIterator<Item = NodeRouteAddress>,
+        reverse_route: Option<NodeRouteAddress>,
     ) -> Self {
         Self {
             local: unique(local, "local"),
@@ -82,20 +82,20 @@ pub(crate) struct TransportImage {
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct TransportBinding {
-    pub handle: TransportHandle,
+    pub address: NodeTransportAddress,
     pub participant: ParticipantKey,
 }
 
 impl TransportImage {
-    pub fn resolve(&self, handle: TransportHandle) -> Option<ParticipantKey> {
-        match self.slots.get(handle.route.index()) {
-            Some(Some(binding)) if binding.handle == handle => Some(binding.participant),
+    pub fn resolve(&self, address: NodeTransportAddress) -> Option<ParticipantKey> {
+        match self.slots.get(address.route.index()) {
+            Some(Some(binding)) if binding.address == address => Some(binding.participant),
             _ => None,
         }
     }
 
     pub(crate) fn install(&mut self, binding: TransportBinding) {
-        let idx = binding.handle.route.index();
+        let idx = binding.address.route.index();
         if idx >= self.slots.len() {
             self.slots.resize_with(idx.saturating_add(1), || None);
         }
@@ -106,11 +106,11 @@ impl TransportImage {
         *slot = Some(binding);
     }
 
-    pub(crate) fn retire(&mut self, handle: TransportHandle) {
-        let Some(slot) = self.slots.get_mut(handle.route.index()) else {
+    pub(crate) fn retire(&mut self, address: NodeTransportAddress) {
+        let Some(slot) = self.slots.get_mut(address.route.index()) else {
             return;
         };
-        if slot.is_some_and(|binding| binding.handle == handle) {
+        if slot.is_some_and(|binding| binding.address == address) {
             *slot = None;
         }
     }
@@ -123,17 +123,17 @@ impl TransportImage {
 #[derive(Debug, Clone)]
 pub(crate) enum ShardUpdateOp {
     InstallRoute {
-        handle: RouteHandle,
+        address: NodeRouteAddress,
         action: RouteAction,
     },
     RetireRoute {
-        handle: RouteHandle,
+        address: NodeRouteAddress,
     },
     InstallTransport {
         binding: TransportBinding,
     },
     RetireTransport {
-        handle: TransportHandle,
+        address: NodeTransportAddress,
     },
     InsertParticipant,
     RemoveParticipant {
@@ -328,11 +328,11 @@ pub(crate) fn new_shard_update(
 impl ShardUpdateOp {
     pub(crate) fn is_owned_by(&self, shard: ShardId) -> bool {
         match self {
-            Self::InstallRoute { handle, .. } | Self::RetireRoute { handle } => {
-                handle.shard() == shard
+            Self::InstallRoute { address, .. } | Self::RetireRoute { address } => {
+                address.shard() == shard
             }
-            Self::InstallTransport { binding } => binding.handle.shard() == shard,
-            Self::RetireTransport { handle } => handle.shard() == shard,
+            Self::InstallTransport { binding } => binding.address.shard() == shard,
+            Self::RetireTransport { address } => address.shard() == shard,
             Self::InsertParticipant { .. }
             | Self::RemoveParticipant { .. }
             | Self::InsertTrackRuntime { .. }

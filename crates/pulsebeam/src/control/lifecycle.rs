@@ -11,7 +11,7 @@ use crate::{
     id::ShardId,
     keys::{ParticipantKey, TrackKey},
     participant::ParticipantEffect,
-    route::{RouteAction, RouteHandle},
+    route::{NodeRouteAddress, RouteAction},
     shard_update::{ShardUpdateOp, TrackDescriptor, TrackPlan, TrackPlanUpdate, TrackRuntime},
     track::{SelectionPolicy, Track, TrackSelector},
 };
@@ -221,8 +221,8 @@ struct RuntimePlan<'a> {
     track: &'a Track,
     key: TrackKey,
     local: Vec<ParticipantKey>,
-    remote: Vec<RouteHandle>,
-    reverse: Option<RouteHandle>,
+    remote: Vec<NodeRouteAddress>,
+    reverse: Option<NodeRouteAddress>,
 }
 
 pub(crate) struct TrackLifecycle {
@@ -544,7 +544,7 @@ impl TrackLifecycle {
         &mut self,
         identity: TrackIdentity,
         desired_track: &mut Track,
-        route: RouteHandle,
+        route: NodeRouteAddress,
     ) {
         if !desired_track.requires_reverse_route() || desired_track.reverse().is_some() {
             return;
@@ -658,7 +658,7 @@ impl TrackLifecycle {
                     stager.update(
                         shard,
                         ShardUpdateOp::InstallRoute {
-                            handle: destination.allocation.route,
+                            address: destination.allocation.route,
                             action: RouteAction::Forward {
                                 target: destination.allocation.key,
                             },
@@ -703,7 +703,7 @@ impl TrackLifecycle {
                 stager.update(
                     desired.origin.shard,
                     ShardUpdateOp::InstallRoute {
-                        handle: origin.allocation.route,
+                        address: origin.allocation.route,
                         action: RouteAction::Reverse {
                             target: origin.allocation.key,
                         },
@@ -828,7 +828,7 @@ impl TrackLifecycle {
             stager.update(
                 shard,
                 ShardUpdateOp::RetireRoute {
-                    handle: destination.allocation.route,
+                    address: destination.allocation.route,
                 },
             );
         }
@@ -1258,7 +1258,7 @@ mod tests {
     fn forward_install_on(
         outcome: &TrackLifecycleOutcome,
         shard: usize,
-    ) -> Option<(RouteHandle, TrackKey)> {
+    ) -> Option<(NodeRouteAddress, TrackKey)> {
         let shard = ShardId::new(shard);
         outcome
             .operations
@@ -1268,10 +1268,10 @@ mod tests {
                     shard: held,
                     op:
                         ShardUpdateOp::InstallRoute {
-                            handle,
+                            address,
                             action: RouteAction::Forward { target },
                         },
-                } if *held == shard => Some((*handle, *target)),
+                } if *held == shard => Some((*address, *target)),
                 _ => None,
             })
     }
@@ -1279,7 +1279,7 @@ mod tests {
     fn reverse_install_on(
         outcome: &TrackLifecycleOutcome,
         shard: usize,
-    ) -> Option<(RouteHandle, TrackKey)> {
+    ) -> Option<(NodeRouteAddress, TrackKey)> {
         let shard = ShardId::new(shard);
         outcome
             .operations
@@ -1289,10 +1289,10 @@ mod tests {
                     shard: held,
                     op:
                         ShardUpdateOp::InstallRoute {
-                            handle,
+                            address,
                             action: RouteAction::Reverse { target },
                         },
-                } if *held == shard => Some((*handle, *target)),
+                } if *held == shard => Some((*address, *target)),
                 _ => None,
             })
     }

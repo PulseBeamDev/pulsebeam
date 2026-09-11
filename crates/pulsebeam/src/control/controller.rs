@@ -12,7 +12,7 @@ use crate::{
     },
     entity::{ConnectionId, ParticipantId, RoomId},
     id::ShardId,
-    route::TransportHandle,
+    route::NodeTransportAddress,
     shard::{
         ShardContext,
         worker::{ShardCommand, ShardEvent, ShardEventMessage},
@@ -442,7 +442,7 @@ impl ControllerActor {
                 source,
                 destination,
                 source_shard,
-                handle,
+                address,
                 shard: owner_shard,
                 ..
             } => {
@@ -453,7 +453,7 @@ impl ControllerActor {
                 self.pin_flow_to_owner(source, destination, owner);
                 self.command_backlog.push_back((
                     source_shard,
-                    ShardCommand::AuthenticateTransport { source, handle },
+                    ShardCommand::AuthenticateTransport { source, address },
                 ));
                 self.emit_placeholder(owner_shard);
             }
@@ -685,9 +685,9 @@ impl ControllerActor {
     }
 
     fn route_tcp_connection(&mut self, connection: PendingTcpConn) {
-        debug_assert!(connection.handle.shard().index() < self.router.shard_count());
+        debug_assert!(connection.address.shard().index() < self.router.shard_count());
         self.command_backlog.push_back((
-            connection.handle.shard(),
+            connection.address.shard(),
             ShardCommand::AdoptTcpConnection {
                 stream: connection.stream,
                 peer_addr: connection.peer_addr,
@@ -698,7 +698,7 @@ impl ControllerActor {
     fn publish_transport(
         &mut self,
         shard: ShardId,
-        handle: TransportHandle,
+        address: NodeTransportAddress,
         key: crate::keys::ParticipantKey,
     ) -> bool {
         let generation = self.lifecycle.next_generation();
@@ -713,7 +713,7 @@ impl ControllerActor {
             generation,
             crate::shard_update::ShardUpdateOp::InstallTransport {
                 binding: crate::shard_update::TransportBinding {
-                    handle,
+                    address,
                     participant: key,
                 },
             },
@@ -745,34 +745,36 @@ impl ControllerActor {
             }
         };
         let now = tokio::time::Instant::now();
-        let handle = self.core.reserve_transport(shard, now);
+        let address = self.core.reserve_transport(shard, now);
         let key = self
             .core
             .mint_participant(shard, state.participant_id)
             .ok_or(ControllerError::ServiceUnavailable)?;
-        let creds = IceUfrag::new(self.cluster_id, self.node_id, handle.route, handle.epoch)
+        let creds = IceUfrag::new(self.cluster_id, self.node_id, address.route, address.epoch)
             .into_ice_creds();
         let (rtc, answer) = match self.negotiator.create_answer(offer, creds) {
             Ok(value) => value,
             Err(error) => {
                 self.core.remove_participant_key(shard, key);
-                self.core.release_transport(handle, now);
+                self.core.release_transport(address, now);
                 return Err(error.into());
             }
         };
-        if !self.publish_transport(shard, handle, key) {
+        if !self.publish_transport(shard, address, key) {
             self.core.remove_participant_key(shard, key);
-            self.core.release_transport(handle, now);
+            self.core.release_transport(address, now);
             return Err(ControllerError::ServiceUnavailable);
         }
-        let config = self.core.create_participant(rtc, state, shard, handle, key);
+        let config = self
+            .core
+            .create_participant(rtc, state, shard, address, key);
         let room_id = config.room_id;
         let (ack_tx, ack_rx) = oneshot::channel();
         Ok(PendingMaterialization {
             shard,
             command: Some(ShardCommand::MaterializeParticipant {
                 key,
-                transport: handle,
+                transport: address,
                 config: Box::new(config),
                 ack: ack_tx,
             }),
@@ -895,12 +897,14 @@ impl ControllerActor {
         for outcome in outcomes {
             self.publish_track_lifecycle(outcome);
         }
-        let Some(handle) = meta.transport else { return };
+        let Some(address) = meta.transport else {
+            return;
+        };
         let generation = self.lifecycle.next_generation();
         if let Some(update) = self.updates.get_mut(meta.shard.index()) {
             update.stage(
                 generation,
-                crate::shard_update::ShardUpdateOp::RetireTransport { handle },
+                crate::shard_update::ShardUpdateOp::RetireTransport { address },
             );
             if let Some(key) = meta.binding {
                 update.stage(
@@ -915,7 +919,7 @@ impl ControllerActor {
             self.core.remove_participant_key(meta.shard, key);
         }
         self.core
-            .release_transport(handle, tokio::time::Instant::now());
+            .release_transport(address, tokio::time::Instant::now());
     }
 }
 

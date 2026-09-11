@@ -142,7 +142,7 @@ route_family!(
 /// The `(route, epoch)` pair a receiver validates a client transport packet
 /// against.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TransportHandle {
+pub struct NodeTransportAddress {
     pub route: TransportRoute,
     pub epoch: u16,
 }
@@ -150,7 +150,7 @@ pub struct TransportHandle {
 /// The `(route, epoch)` pair a receiver validates an inter-node Envelope
 /// against.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RouteHandle {
+pub struct NodeRouteAddress {
     pub route: RouteId,
     pub epoch: u16,
 }
@@ -210,19 +210,19 @@ mod tests {
     }
 
     #[test]
-    fn handles_carry_route_and_epoch() {
-        let handle = TransportHandle {
+    fn node_addresses_carry_route_and_epoch() {
+        let address = NodeTransportAddress {
             route: TransportRoute::new(1, 2),
             epoch: 42,
         };
-        assert_eq!(handle.route.shard(), 1);
-        assert_eq!(handle.epoch, 42);
+        assert_eq!(address.route.shard(), 1);
+        assert_eq!(address.epoch, 42);
 
-        let handle = RouteHandle {
+        let address = NodeRouteAddress {
             route: RouteId::new(1, 2),
             epoch: 42,
         };
-        assert_eq!(handle.route.shard(), 1);
-        assert_eq!(handle.epoch, 42);
+        assert_eq!(address.route.shard(), 1);
+        assert_eq!(address.epoch, 42);
     }
 }

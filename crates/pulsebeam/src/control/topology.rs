@@ -6,7 +6,7 @@ use tokio::time::Instant;
 use crate::{
     entity::{ParticipantId, RoomId, TrackId, TrackKind},
     id::ShardId,
-    route::{PackedRoute, RouteHandle, RouteId, SlotAllocator},
+    route::{NodeRouteAddress, PackedRoute, RouteId, SlotAllocator},
     track::{SelectionPolicy, Track, TrackSelector},
 };
 
@@ -598,7 +598,7 @@ fn remove_reason(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TrackAllocation {
     pub key: crate::keys::TrackKey,
-    pub route: RouteHandle,
+    pub route: NodeRouteAddress,
 }
 
 #[derive(Debug)]
@@ -643,7 +643,7 @@ impl TrackAllocator {
 
         TrackAllocation {
             key,
-            route: RouteHandle::new(RouteId::new(shard, slot), epoch),
+            route: NodeRouteAddress::new(RouteId::new(shard, slot), epoch),
         }
     }
 

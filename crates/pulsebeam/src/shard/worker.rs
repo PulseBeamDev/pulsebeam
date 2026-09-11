@@ -155,7 +155,7 @@ pub(crate) enum ShardError {
 pub(crate) enum ShardCommand {
     MaterializeParticipant {
         key: crate::shard::participants::ParticipantKey,
-        transport: crate::route::TransportHandle,
+        transport: crate::route::NodeTransportAddress,
         config: Box<ParticipantConfig>,
         ack: tokio::sync::oneshot::Sender<bool>,
     },
@@ -165,7 +165,7 @@ pub(crate) enum ShardCommand {
     },
     AuthenticateTransport {
         source: std::net::SocketAddr,
-        handle: crate::route::TransportHandle,
+        address: crate::route::NodeTransportAddress,
     },
 }
 
@@ -183,7 +183,7 @@ pub(crate) type MediaPayload = RoutedTrackPacket;
 pub(crate) enum ShardFrame {
     Ingress {
         batch: RecvPacketBatch,
-        handle: crate::route::TransportHandle,
+        address: crate::route::NodeTransportAddress,
         source_shard: ShardId,
     },
     /// Forward payload, addressed by the destination's own route. Carries no
@@ -209,7 +209,7 @@ pub(crate) enum ShardEvent {
         source: std::net::SocketAddr,
         destination: std::net::SocketAddr,
         source_shard: ShardId,
-        handle: crate::route::TransportHandle,
+        address: crate::route::NodeTransportAddress,
         shard: ShardId,
     },
     ParticipantClosed {

@@ -4,7 +4,7 @@ use crate::{
     control::room::Room,
     entity::{ConnectionId, ParticipantId, RoomId},
     id::ShardId,
-    route::TransportHandle,
+    route::NodeTransportAddress,
     shard::participants::ParticipantKey,
 };
 
@@ -20,7 +20,7 @@ pub struct ParticipantMeta {
     /// route outlives the negotiation that produced it, so something has to
     /// remember it, and this is the record that already knows who it belongs
     /// to.
-    pub transport: Option<TransportHandle>,
+    pub transport: Option<NodeTransportAddress>,
     /// The owning shard's own arena key, opaque here. Stored only long enough
     /// to compile into that shard's view; never dereferenced.
     pub binding: Option<ParticipantKey>,
@@ -50,7 +50,7 @@ impl RoomRegistry {
         participant_id: ParticipantId,
         room_id: RoomId,
         shard_id: ShardId,
-        transport: Option<TransportHandle>,
+        transport: Option<NodeTransportAddress>,
     ) {
         let binding = self
             .participants
@@ -130,7 +130,11 @@ impl RoomRegistry {
     pub fn disconnect_participant(
         &mut self,
         participant_id: &ParticipantId,
-    ) -> Option<(ShardId, Option<TransportHandle>, Option<ParticipantKey>)> {
+    ) -> Option<(
+        ShardId,
+        Option<NodeTransportAddress>,
+        Option<ParticipantKey>,
+    )> {
         let (result, room_id, shard_id) = {
             let meta = self.participants.get_mut(participant_id)?;
             let result = (meta.shard_id, meta.transport.take(), meta.binding.take());

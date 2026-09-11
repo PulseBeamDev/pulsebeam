@@ -6,7 +6,7 @@ use crate::{
     entity::{ParticipantId, RoomId},
     id::ShardId,
     participant::ParticipantConfig,
-    route::{PackedRoute, SlotAllocator, TransportHandle, TransportRoute},
+    route::{NodeTransportAddress, PackedRoute, SlotAllocator, TransportRoute},
     shard::participants::ParticipantKey,
 };
 use str0m::Rtc;
@@ -19,11 +19,11 @@ pub enum RoomPlacement {
     RoundRobin,
 }
 
-struct TransportAllocators {
+struct TransportAddressAllocator {
     shards: Vec<SlotAllocator>,
 }
 
-impl TransportAllocators {
+impl TransportAddressAllocator {
     fn new(shard_count: usize) -> Self {
         Self {
             shards: (0..shard_count)
@@ -41,21 +41,21 @@ impl TransportAllocators {
         clippy::expect_used,
         reason = "a transport allocation for an unconfigured shard is a controller invariant violation"
     )]
-    fn allocate(&mut self, shard: ShardId, now: Instant) -> TransportHandle {
+    fn allocate(&mut self, shard: ShardId, now: Instant) -> NodeTransportAddress {
         let allocator = self
             .shards
             .get_mut(shard.index())
             .expect("transport allocation must target a configured shard");
         let (slot, epoch) = allocator.allocate_transport(now);
-        TransportHandle::new(TransportRoute::new(shard, slot), epoch)
+        NodeTransportAddress::new(TransportRoute::new(shard, slot), epoch)
     }
 
-    fn retire(&mut self, handle: TransportHandle, now: Instant) {
-        let Some(allocator) = self.shards.get_mut(handle.shard().index()) else {
+    fn retire(&mut self, address: NodeTransportAddress, now: Instant) {
+        let Some(allocator) = self.shards.get_mut(address.shard().index()) else {
             debug_assert!(false, "transport retirement targeted an unknown shard");
             return;
         };
-        allocator.retire(handle.route.slot(), now);
+        allocator.retire(address.route.slot(), now);
     }
 }
 
@@ -63,7 +63,7 @@ pub struct ControllerCore {
     pub(crate) registry: RoomRegistry,
     room_shard_slot: usize,
     placement: RoomPlacement,
-    transport: TransportAllocators,
+    transport: TransportAddressAllocator,
     participants: Vec<SlotMap<ParticipantKey, ParticipantId>>,
 }
 
@@ -74,7 +74,7 @@ impl ControllerCore {
             registry: RoomRegistry::new(),
             room_shard_slot,
             placement,
-            transport: TransportAllocators::new(0),
+            transport: TransportAddressAllocator::new(0),
             participants: Vec::new(),
         }
     }
@@ -86,7 +86,7 @@ impl ControllerCore {
     ) -> Self {
         debug_assert!(shard_count > 0);
         let mut core = Self::with_placement(room_shard_slot, placement);
-        core.transport = TransportAllocators::new(shard_count);
+        core.transport = TransportAddressAllocator::new(shard_count);
         core.participants = (0..shard_count).map(|_| SlotMap::with_key()).collect();
         core
     }
@@ -103,12 +103,12 @@ impl ControllerCore {
         )
     }
 
-    pub fn reserve_transport(&mut self, shard: ShardId, now: Instant) -> TransportHandle {
+    pub fn reserve_transport(&mut self, shard: ShardId, now: Instant) -> NodeTransportAddress {
         self.transport.allocate(shard, now)
     }
 
-    pub fn release_transport(&mut self, handle: TransportHandle, now: Instant) {
-        self.transport.retire(handle, now);
+    pub fn release_transport(&mut self, address: NodeTransportAddress, now: Instant) {
+        self.transport.retire(address, now);
     }
 
     pub fn mint_participant(
@@ -137,7 +137,7 @@ impl ControllerCore {
         rtc: Rtc,
         state: ParticipantState,
         shard: ShardId,
-        transport: TransportHandle,
+        transport: NodeTransportAddress,
         key: ParticipantKey,
     ) -> ParticipantConfig {
         self.registry
@@ -183,5 +183,5 @@ impl ControllerCore {
 pub struct ParticipantMeta {
     pub shard: ShardId,
     pub binding: Option<ParticipantKey>,
-    pub transport: Option<TransportHandle>,
+    pub transport: Option<NodeTransportAddress>,
 }

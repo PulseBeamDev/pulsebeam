@@ -1,7 +1,7 @@
 use arrayvec::ArrayVec;
 use pulsebeam_runtime::net;
 
-use crate::route::{TransportHandle, TransportRoute};
+use crate::route::{NodeTransportAddress, TransportRoute};
 
 use ahash::{HashMap, HashMapExt};
 use std::net::SocketAddr;
@@ -18,7 +18,7 @@ struct LruList {
 
 #[derive(Debug, Clone, Copy)]
 struct CachedRoute {
-    handle: TransportHandle,
+    address: NodeTransportAddress,
     authenticated: bool,
     global_prev: Option<SocketAddr>,
     global_next: Option<SocketAddr>,
@@ -221,15 +221,15 @@ impl Demuxer {
             return;
         };
         self.unlink_global(addr);
-        self.unlink_route(addr, entry.handle.route);
+        self.unlink_route(addr, entry.address.route);
         self.link_global_front(addr, entry.authenticated);
-        self.link_route_front(addr, entry.handle.route, entry.authenticated);
+        self.link_route_front(addr, entry.address.route, entry.authenticated);
     }
 
     fn remove_entry(&mut self, addr: SocketAddr) -> Option<CachedRoute> {
         let entry = self.addr_map.get(&addr).copied()?;
         self.unlink_global(addr);
-        self.unlink_route(addr, entry.handle.route);
+        self.unlink_route(addr, entry.address.route);
         let removed = self.addr_map.remove(&addr);
         debug_assert!(removed.is_some());
         removed
@@ -287,7 +287,7 @@ impl Demuxer {
         freed.into_iter().collect()
     }
 
-    pub fn demux(&mut self, batch: &net::RecvPacketBatch) -> Option<TransportHandle> {
+    pub fn demux(&mut self, batch: &net::RecvPacketBatch) -> Option<NodeTransportAddress> {
         let src = batch.src;
         #[cfg(test)]
         {
@@ -311,63 +311,63 @@ impl Demuxer {
             self.node_id,
             self.shard_count,
         ) {
-            pulsebeam_routing::classify::ClientVerdict::Bootstrap { handle, .. } => {
-                let handle = to_local_handle(handle);
+            pulsebeam_routing::classify::ClientVerdict::Bootstrap { address, .. } => {
+                let address = to_local_address(address);
                 if self
                     .addr_map
                     .get(&src)
-                    .is_some_and(|entry| entry.handle == handle)
+                    .is_some_and(|entry| entry.address == address)
                 {
                     self.touch(src);
-                    return Some(handle);
+                    return Some(address);
                 }
                 self.forget(src);
-                self.admit(src, handle, false);
-                Some(handle)
+                self.admit(src, address, false);
+                Some(address)
             }
             pulsebeam_routing::classify::ClientVerdict::Established
             | pulsebeam_routing::classify::ClientVerdict::Drop(_) => self.cached(src),
         }
     }
 
-    fn cached(&mut self, src: SocketAddr) -> Option<TransportHandle> {
-        let handle = self.addr_map.get(&src).map(|entry| entry.handle)?;
+    fn cached(&mut self, src: SocketAddr) -> Option<NodeTransportAddress> {
+        let address = self.addr_map.get(&src).map(|entry| entry.address)?;
         self.touch(src);
-        Some(handle)
+        Some(address)
     }
 
-    pub fn learn(&mut self, src: SocketAddr, handle: TransportHandle) {
+    pub fn learn(&mut self, src: SocketAddr, address: NodeTransportAddress) {
         match self.addr_map.get(&src).copied() {
-            Some(entry) if entry.handle.route == handle.route => {
-                let authenticated = entry.authenticated && entry.handle.epoch == handle.epoch;
+            Some(entry) if entry.address.route == address.route => {
+                let authenticated = entry.authenticated && entry.address.epoch == address.epoch;
                 self.unlink_global(src);
-                self.unlink_route(src, handle.route);
+                self.unlink_route(src, address.route);
                 if let Some(entry) = self.addr_map.get_mut(&src) {
-                    entry.handle = handle;
+                    entry.address = address;
                     entry.authenticated = authenticated;
                 }
                 self.link_global_front(src, authenticated);
-                self.link_route_front(src, handle.route, authenticated);
+                self.link_route_front(src, address.route, authenticated);
             }
             Some(_) => {
                 self.forget(src);
-                self.admit(src, handle, false);
+                self.admit(src, address, false);
             }
-            None => self.admit(src, handle, false),
+            None => self.admit(src, address, false),
         }
     }
 
-    pub fn authenticate(&mut self, src: SocketAddr, handle: TransportHandle) {
+    pub fn authenticate(&mut self, src: SocketAddr, address: NodeTransportAddress) {
         match self.addr_map.get(&src).copied() {
-            Some(entry) if entry.handle == handle => {
+            Some(entry) if entry.address == address => {
                 if !entry.authenticated {
                     self.unlink_global(src);
-                    self.unlink_route(src, handle.route);
+                    self.unlink_route(src, address.route);
                     if let Some(entry) = self.addr_map.get_mut(&src) {
                         entry.authenticated = true;
                     }
                     self.link_global_front(src, true);
-                    self.link_route_front(src, handle.route, true);
+                    self.link_route_front(src, address.route, true);
                 } else {
                     self.touch(src);
                 }
@@ -383,20 +383,20 @@ impl Demuxer {
         let _ = self.remove_entry(src);
     }
 
-    fn admit(&mut self, src: SocketAddr, handle: TransportHandle, authenticated: bool) {
+    fn admit(&mut self, src: SocketAddr, address: NodeTransportAddress, authenticated: bool) {
         if self.addr_map.len() >= MAX_ADDR_ENTRIES {
             self.evict_global();
         }
-        let route_len = self.route_addrs.get(&handle.route).map_or(0, |lists| {
+        let route_len = self.route_addrs.get(&address.route).map_or(0, |lists| {
             lists
                 .unauthenticated
                 .len
                 .saturating_add(lists.authenticated.len)
         });
         if route_len >= MAX_ADDRS_PER_ROUTE {
-            self.evict_route(handle.route);
+            self.evict_route(address.route);
         }
-        let route_len = self.route_addrs.get(&handle.route).map_or(0, |lists| {
+        let route_len = self.route_addrs.get(&address.route).map_or(0, |lists| {
             lists
                 .unauthenticated
                 .len
@@ -409,7 +409,7 @@ impl Demuxer {
         let previous = self.addr_map.insert(
             src,
             CachedRoute {
-                handle,
+                address,
                 authenticated,
                 global_prev: None,
                 global_next: None,
@@ -419,7 +419,7 @@ impl Demuxer {
         );
         debug_assert!(previous.is_none());
         self.link_global_front(src, authenticated);
-        self.link_route_front(src, handle.route, authenticated);
+        self.link_route_front(src, address.route, authenticated);
     }
 }
 
@@ -429,14 +429,14 @@ impl Default for Demuxer {
     }
 }
 
-fn to_local_handle(handle: pulsebeam_routing::TransportHandle) -> TransportHandle {
-    let route = TransportRoute::from_raw(handle.route.get());
+fn to_local_address(address: pulsebeam_routing::NodeTransportAddress) -> NodeTransportAddress {
+    let route = TransportRoute::from_raw(address.route.get());
     debug_assert_eq!(
         route.shard().index(),
-        usize::from(handle.route.shard()),
+        usize::from(address.route.shard()),
         "shard must survive the pulsebeam-routing <-> pulsebeam TransportRoute conversion"
     );
-    TransportHandle::new(route, handle.epoch)
+    NodeTransportAddress::new(route, address.epoch)
 }
 
 pub(crate) fn extract_stun_server_ufrag(data: &[u8]) -> Option<String> {
@@ -486,19 +486,19 @@ mod tests {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), port)
     }
 
-    fn handle(slot: u32) -> (IceUfrag, TransportHandle) {
+    fn address(slot: u32) -> (IceUfrag, NodeTransportAddress) {
         let route = TransportRoute::new(ShardId::new(3), slot);
         let epoch = 7;
         (
             IceUfrag::new(0, 0, route, epoch),
-            TransportHandle::new(route, epoch),
+            NodeTransportAddress::new(route, epoch),
         )
     }
 
     #[test]
     fn established_cache_hits_do_not_parse_stun() {
         let mut demux = Demuxer::new();
-        let (ufrag, expected) = handle(1);
+        let (ufrag, expected) = address(1);
         let client = src(1234);
         assert_eq!(
             demux.demux(&batch(client, stun_with_ufrag(&ufrag.encode()))),
@@ -516,8 +516,8 @@ mod tests {
     #[test]
     fn a_rebound_source_clears_authentication() {
         let mut demux = Demuxer::new();
-        let (first_ufrag, first) = handle(1);
-        let (_, second) = handle(2);
+        let (first_ufrag, first) = address(1);
+        let (_, second) = address(2);
         let client = src(1234);
         assert_eq!(
             demux.demux(&batch(client, stun_with_ufrag(&first_ufrag.encode()))),
@@ -526,7 +526,7 @@ mod tests {
         demux.authenticate(client, first);
         demux.learn(client, second);
         assert_eq!(
-            demux.addr_map.get(&client).map(|entry| entry.handle),
+            demux.addr_map.get(&client).map(|entry| entry.address),
             Some(second)
         );
         assert!(!demux.addr_map.get(&client).unwrap().authenticated);
@@ -535,13 +535,13 @@ mod tests {
     #[test]
     fn stale_authentication_does_not_create_an_authenticated_cache_entry() {
         let mut demux = Demuxer::new();
-        let (first_ufrag, first) = handle(1);
-        let (_, second) = handle(2);
+        let (first_ufrag, first) = address(1);
+        let (_, second) = address(2);
         let client = src(1234);
         let _ = demux.demux(&batch(client, stun_with_ufrag(&first_ufrag.encode())));
         demux.authenticate(client, second);
         assert_eq!(
-            demux.addr_map.get(&client).map(|entry| entry.handle),
+            demux.addr_map.get(&client).map(|entry| entry.address),
             Some(first)
         );
         assert!(!demux.addr_map.get(&client).unwrap().authenticated);
@@ -551,7 +551,7 @@ mod tests {
     fn cache_eviction_does_not_scan_the_cache() {
         let mut demux = Demuxer::new();
         for slot in 0..MAX_ADDR_ENTRIES / MAX_ADDRS_PER_ROUTE {
-            let (ufrag, _) = handle(u32::try_from(slot).unwrap());
+            let (ufrag, _) = address(u32::try_from(slot).unwrap());
             for offset in 0..MAX_ADDRS_PER_ROUTE {
                 let address = SocketAddr::new(
                     IpAddr::V4(Ipv4Addr::from(
@@ -563,7 +563,7 @@ mod tests {
             }
         }
         let before = demux.work.cache_entries_examined;
-        let (ufrag, _) = handle(9000);
+        let (ufrag, _) = address(9000);
         let _ = demux.demux(&batch(src(65000), stun_with_ufrag(&ufrag.encode())));
         assert_eq!(demux.work.cache_entries_examined, before + 1);
     }
@@ -571,7 +571,7 @@ mod tests {
     #[test]
     fn unregister_removes_all_route_entries() {
         let mut demux = Demuxer::new();
-        let (ufrag, expected) = handle(1);
+        let (ufrag, expected) = address(1);
         for port in 1000..1004 {
             let _ = demux.demux(&batch(src(port), stun_with_ufrag(&ufrag.encode())));
         }

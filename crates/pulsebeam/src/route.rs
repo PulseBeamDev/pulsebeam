@@ -220,12 +220,12 @@ route_family!(
 /// addressed to the previous tenant fail closed instead of being delivered to
 /// the current one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct RouteHandle {
+pub struct NodeRouteAddress {
     pub route: RouteId,
     pub epoch: u16,
 }
 
-impl RouteHandle {
+impl NodeRouteAddress {
     pub const fn new(route: RouteId, epoch: u16) -> Self {
         Self { route, epoch }
     }
@@ -235,20 +235,20 @@ impl RouteHandle {
     }
 }
 
-impl std::fmt::Display for RouteHandle {
+impl std::fmt::Display for NodeRouteAddress {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}e{}", self.route, self.epoch)
     }
 }
 
-/// [`RouteHandle`]'s transport-side twin — see [`TransportRoute`].
+/// [`NodeRouteAddress`]'s transport-side twin — see [`TransportRoute`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct TransportHandle {
+pub struct NodeTransportAddress {
     pub route: TransportRoute,
     pub epoch: u16,
 }
 
-impl TransportHandle {
+impl NodeTransportAddress {
     pub const fn new(route: TransportRoute, epoch: u16) -> Self {
         Self { route, epoch }
     }
@@ -258,7 +258,7 @@ impl TransportHandle {
     }
 }
 
-impl std::fmt::Display for TransportHandle {
+impl std::fmt::Display for NodeTransportAddress {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}e{}", self.route, self.epoch)
     }
@@ -280,7 +280,7 @@ pub fn peek_shard(buf: &[u8]) -> Option<ShardId> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Envelope {
     pub ty: EnvelopeType,
-    pub handle: RouteHandle,
+    pub address: NodeRouteAddress,
     pub extension: u64,
 }
 
@@ -293,26 +293,26 @@ pub enum FrameBody {
 }
 
 impl Envelope {
-    pub fn media(handle: RouteHandle, link_seq: u32, playout_ntp32: u32) -> Self {
+    pub fn media(address: NodeRouteAddress, link_seq: u32, playout_ntp32: u32) -> Self {
         Self {
             ty: EnvelopeType::Media,
-            handle,
+            address,
             extension: (u64::from(link_seq) << 32) | u64::from(playout_ntp32),
         }
     }
 
-    pub fn feedback(handle: RouteHandle) -> Self {
+    pub fn feedback(address: NodeRouteAddress) -> Self {
         Self {
             ty: EnvelopeType::Feedback,
-            handle,
+            address,
             extension: 0,
         }
     }
 
-    pub fn telemetry(handle: RouteHandle) -> Self {
+    pub fn telemetry(address: NodeRouteAddress) -> Self {
         Self {
             ty: EnvelopeType::Telemetry,
-            handle,
+            address,
             extension: 0,
         }
     }
@@ -320,8 +320,8 @@ impl Envelope {
     pub fn encode(self) -> [u8; ENVELOPE_LEN] {
         pulsebeam_routing::envelope::Envelope {
             ty: self.ty,
-            epoch: self.handle.epoch,
-            route: to_wire_route(self.handle.route),
+            epoch: self.address.epoch,
+            route: to_wire_route(self.address.route),
             extension: self.extension,
         }
         .encode()
@@ -331,7 +331,7 @@ impl Envelope {
         let wire = pulsebeam_routing::envelope::Envelope::decode(buf)?;
         Ok(Self {
             ty: wire.ty,
-            handle: RouteHandle::new(from_wire_route(wire.route), wire.epoch),
+            address: NodeRouteAddress::new(from_wire_route(wire.route), wire.epoch),
             extension: wire.extension,
         })
     }
@@ -629,18 +629,18 @@ impl RouteRuntime {
     /// no retirement message either.
     pub fn accounting_mut(
         &mut self,
-        handle: RouteHandle,
+        address: NodeRouteAddress,
         ntp_ref: NtpTime,
     ) -> &mut RouteRuntimeEntry {
-        let idx = handle.route.index();
+        let idx = address.route.index();
         self.ensure_slot(idx);
         let stale = self
             .slots
             .get(idx)
             .and_then(Option::as_ref)
-            .is_none_or(|entry| entry.epoch != handle.epoch);
+            .is_none_or(|entry| entry.epoch != address.epoch);
         if stale {
-            self.install(handle, ntp_ref);
+            self.install(address, ntp_ref);
         }
         let Some(Some(entry)) = self.slots.get_mut(idx) else {
             pulsebeam_runtime::fatal!("route accounting must exist after installing it")
@@ -652,20 +652,20 @@ impl RouteRuntime {
     }
 
     /// Build the accounting behind an address the control plane granted.
-    pub fn install(&mut self, handle: RouteHandle, ntp_ref: NtpTime) {
+    pub fn install(&mut self, address: NodeRouteAddress, ntp_ref: NtpTime) {
         debug_assert_eq!(
-            handle.shard(),
+            address.shard(),
             self.shard_id,
             "a route's accounting only exists at the shard that owns it"
         );
-        let idx = handle.route.index();
+        let idx = address.route.index();
         self.ensure_slot(idx);
         let Some(slot) = self.slots.get_mut(idx) else {
             debug_assert!(false, "the resize above guarantees this slot exists");
             return;
         };
         *slot = Some(RouteRuntimeEntry {
-            epoch: handle.epoch,
+            epoch: address.epoch,
             action: RouteAction::Forward {
                 target: crate::keys::TrackKey::default(),
             },
@@ -675,20 +675,20 @@ impl RouteRuntime {
         });
     }
 
-    pub fn install_action(&mut self, handle: RouteHandle, action: RouteAction) {
+    pub fn install_action(&mut self, address: NodeRouteAddress, action: RouteAction) {
         debug_assert_eq!(
-            handle.shard(),
+            address.shard(),
             self.shard_id,
             "a route's action only exists at the shard that owns it"
         );
-        let idx = handle.route.index();
+        let idx = address.route.index();
         self.ensure_slot(idx);
         let Some(slot) = self.slots.get_mut(idx) else {
             debug_assert!(false, "the resize above guarantees this slot exists");
             return;
         };
         if let Some(entry) = slot.as_mut()
-            && entry.epoch == handle.epoch
+            && entry.epoch == address.epoch
         {
             if entry.action != action
                 && let Some(cache) = self.reverse_dedup.get_mut(idx)
@@ -702,7 +702,7 @@ impl RouteRuntime {
             *cache = None;
         }
         *slot = Some(RouteRuntimeEntry {
-            epoch: handle.epoch,
+            epoch: address.epoch,
             action,
             expander: NtpExpander::new(NtpTime::ZERO),
             last_link_seq: None,
@@ -712,16 +712,16 @@ impl RouteRuntime {
 
     /// Idempotent, and epoch-checked: a redelivered teardown must not drop the
     /// accounting of the incarnation that replaced the one it names.
-    pub fn retire(&mut self, handle: RouteHandle) -> bool {
-        let Some(slot) = self.slots.get_mut(handle.route.index()) else {
+    pub fn retire(&mut self, address: NodeRouteAddress) -> bool {
+        let Some(slot) = self.slots.get_mut(address.route.index()) else {
             return false;
         };
         match slot {
-            Some(entry) if entry.epoch == handle.epoch => {}
+            Some(entry) if entry.epoch == address.epoch => {}
             _ => return false,
         }
         *slot = None;
-        if let Some(cache) = self.reverse_dedup.get_mut(handle.route.index()) {
+        if let Some(cache) = self.reverse_dedup.get_mut(address.route.index()) {
             *cache = None;
         }
         #[cfg(feature = "sim")]
@@ -730,35 +730,35 @@ impl RouteRuntime {
     }
 
     #[cfg(test)]
-    pub fn entry_mut(&mut self, handle: RouteHandle) -> Option<&mut RouteRuntimeEntry> {
-        match self.slots.get_mut(handle.route.index()) {
-            Some(Some(entry)) if entry.epoch == handle.epoch => Some(entry),
+    pub fn entry_mut(&mut self, address: NodeRouteAddress) -> Option<&mut RouteRuntimeEntry> {
+        match self.slots.get_mut(address.route.index()) {
+            Some(Some(entry)) if entry.epoch == address.epoch => Some(entry),
             _ => None,
         }
     }
 
-    pub fn entry(&self, handle: RouteHandle) -> Option<&RouteRuntimeEntry> {
-        match self.slots.get(handle.route.index()) {
-            Some(Some(entry)) if entry.epoch == handle.epoch => Some(entry),
+    pub fn entry(&self, address: NodeRouteAddress) -> Option<&RouteRuntimeEntry> {
+        match self.slots.get(address.route.index()) {
+            Some(Some(entry)) if entry.epoch == address.epoch => Some(entry),
             _ => None,
         }
     }
 
-    pub fn resolve(&self, handle: RouteHandle) -> Option<RouteAction> {
-        self.entry(handle).map(|entry| entry.action)
+    pub fn resolve(&self, address: NodeRouteAddress) -> Option<RouteAction> {
+        self.entry(address).map(|entry| entry.action)
     }
 
     pub(crate) fn accept_reverse(
         &mut self,
-        handle: RouteHandle,
+        address: NodeRouteAddress,
         dedup: crate::participant::reverse::ReverseDedup,
         now: Instant,
     ) -> bool {
-        let Some(RouteAction::Reverse { .. }) = self.resolve(handle) else {
+        let Some(RouteAction::Reverse { .. }) = self.resolve(address) else {
             debug_assert!(false, "a reverse envelope must resolve to a reverse route");
             return false;
         };
-        let index = handle.route.index();
+        let index = address.route.index();
         let Some(cache_slot) = self.reverse_dedup.get_mut(index) else {
             debug_assert!(
                 false,
@@ -832,7 +832,7 @@ mod tests {
     use super::*;
 
     fn envelope(route: RouteId, epoch: u16) -> Envelope {
-        Envelope::media(RouteHandle::new(route, epoch), 0, 0)
+        Envelope::media(NodeRouteAddress::new(route, epoch), 0, 0)
     }
 
     #[test]
@@ -882,7 +882,7 @@ mod tests {
     fn envelope_encodes_big_endian_at_documented_offsets() {
         let env = Envelope {
             ty: EnvelopeType::Media,
-            handle: RouteHandle::new(RouteId::from_raw(0x3344_5566), 0x1122),
+            address: NodeRouteAddress::new(RouteId::from_raw(0x3344_5566), 0x1122),
             extension: (u64::from(0x7788_99AAu32) << 32) | u64::from(0xBBCC_DDEE_u32),
         };
         let bytes = env.encode();
@@ -915,7 +915,7 @@ mod tests {
     /// route offset on the wire for the steering program to read.
     #[test]
     fn a_timeline_free_frame_uses_the_same_sixteen_byte_header() {
-        let encoded = Envelope::feedback(RouteHandle::new(RouteId::from_raw(1), 1)).encode();
+        let encoded = Envelope::feedback(NodeRouteAddress::new(RouteId::from_raw(1), 1)).encode();
         assert_eq!(encoded.len(), ENVELOPE_LEN);
         assert_eq!(
             crate::route::peek_shard(&encoded),
@@ -927,8 +927,8 @@ mod tests {
     #[test]
     fn reverse_envelope_round_trips() {
         for env in [
-            Envelope::feedback(RouteHandle::new(RouteId::from_raw(u32::MAX), u16::MAX)),
-            Envelope::telemetry(RouteHandle::new(RouteId::from_raw(0), 0)),
+            Envelope::feedback(NodeRouteAddress::new(RouteId::from_raw(u32::MAX), u16::MAX)),
+            Envelope::telemetry(NodeRouteAddress::new(RouteId::from_raw(0), 0)),
         ] {
             assert_eq!(Envelope::decode(&env.encode()).unwrap(), env);
         }
@@ -941,8 +941,9 @@ mod tests {
     #[test]
     fn the_payload_families_are_distinguishable_on_the_wire() {
         let media = envelope(RouteId::from_raw(3), 4).encode();
-        let feedback = Envelope::feedback(RouteHandle::new(RouteId::from_raw(3), 4)).encode();
-        let telemetry = Envelope::telemetry(RouteHandle::new(RouteId::from_raw(3), 4)).encode();
+        let feedback = Envelope::feedback(NodeRouteAddress::new(RouteId::from_raw(3), 4)).encode();
+        let telemetry =
+            Envelope::telemetry(NodeRouteAddress::new(RouteId::from_raw(3), 4)).encode();
 
         assert_eq!(peek_type(&media).unwrap(), EnvelopeType::Media);
         assert_eq!(peek_type(&feedback).unwrap(), EnvelopeType::Feedback);
@@ -971,7 +972,7 @@ mod tests {
     fn envelope_round_trips() {
         let env = Envelope {
             ty: EnvelopeType::Media,
-            handle: RouteHandle::new(RouteId::from_raw(u32::MAX), 65_535),
+            address: NodeRouteAddress::new(RouteId::from_raw(u32::MAX), 65_535),
             extension: u64::MAX,
         };
         assert_eq!(Envelope::decode(&env.encode()).unwrap(), env);
@@ -1014,8 +1015,8 @@ mod tests {
         SlotAllocator::with_max_slots(ShardId::new(shard), PackedRoute::MAX_SLOT.saturating_add(1))
     }
 
-    fn handle(shard: usize, slot: u32, epoch: u16) -> RouteHandle {
-        RouteHandle::new(RouteId::new(ShardId::new(shard), slot), epoch)
+    fn address(shard: usize, slot: u32, epoch: u16) -> NodeRouteAddress {
+        NodeRouteAddress::new(RouteId::new(ShardId::new(shard), slot), epoch)
     }
 
     /// An address handed out for a shard must carry that shard, so a
@@ -1044,7 +1045,7 @@ mod tests {
 
     /// A slot only comes back once no datagram addressed to its previous
     /// incarnation could still be in flight, and it comes back as a new
-    /// epoch so the old handle cannot reach the new tenant.
+    /// epoch so the old address cannot reach the new tenant.
     #[tokio::test(start_paused = true)]
     async fn a_recycled_slot_comes_back_under_a_new_epoch() {
         let mut allocator = alloc(0);
@@ -1076,15 +1077,15 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn accounting_is_scoped_to_one_incarnation() {
         let mut runtime = RouteRuntime::new(ShardId::new(0));
-        runtime.install(handle(0, 0, 1), NtpTime::ZERO);
+        runtime.install(address(0, 0, 1), NtpTime::ZERO);
 
-        assert!(runtime.entry_mut(handle(0, 0, 1)).is_some());
+        assert!(runtime.entry_mut(address(0, 0, 1)).is_some());
         assert!(
-            runtime.entry_mut(handle(0, 0, 2)).is_none(),
+            runtime.entry_mut(address(0, 0, 2)).is_none(),
             "a different epoch is a different route"
         );
         assert!(
-            runtime.entry_mut(handle(0, 9, 1)).is_none(),
+            runtime.entry_mut(address(0, 9, 1)).is_none(),
             "a slot that was never installed has no accounting"
         );
     }
@@ -1092,7 +1093,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn same_epoch_action_updates_preserve_packet_accounting() {
         let mut runtime = RouteRuntime::new(ShardId::new(0));
-        let route = handle(0, 0, 7);
+        let route = address(0, 0, 7);
         runtime.install_action(
             route,
             RouteAction::Forward {
@@ -1128,7 +1129,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn reverse_deduplication_expires_without_retaining_payloads() {
         let mut runtime = RouteRuntime::new(ShardId::new(0));
-        let route = handle(0, 0, 7);
+        let route = address(0, 0, 7);
         runtime.install_action(
             route,
             RouteAction::Reverse {
@@ -1147,7 +1148,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_new_epoch_restarts_packet_accounting() {
         let mut runtime = RouteRuntime::new(ShardId::new(0));
-        let old = handle(0, 0, 7);
+        let old = address(0, 0, 7);
         runtime.install_action(
             old,
             RouteAction::Forward {
@@ -1156,7 +1157,7 @@ mod tests {
         );
         runtime.entry_mut(old).unwrap().observe(100);
 
-        let replacement = handle(0, 0, 8);
+        let replacement = address(0, 0, 8);
         runtime.install_action(
             replacement,
             RouteAction::Forward {
@@ -1173,17 +1174,17 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn retiring_accounting_is_idempotent_and_epoch_checked() {
         let mut runtime = RouteRuntime::new(ShardId::new(0));
-        runtime.install(handle(0, 0, 4), NtpTime::ZERO);
+        runtime.install(address(0, 0, 4), NtpTime::ZERO);
 
         assert!(
-            !runtime.retire(handle(0, 0, 3)),
+            !runtime.retire(address(0, 0, 3)),
             "a teardown for a superseded incarnation must not touch this one"
         );
-        assert!(runtime.entry(handle(0, 0, 4)).is_some());
+        assert!(runtime.entry(address(0, 0, 4)).is_some());
 
-        assert!(runtime.retire(handle(0, 0, 4)));
+        assert!(runtime.retire(address(0, 0, 4)));
         assert!(
-            !runtime.retire(handle(0, 0, 4)),
+            !runtime.retire(address(0, 0, 4)),
             "a redelivered teardown is a no-op"
         );
         assert_eq!(runtime.len(), 0);
@@ -1192,7 +1193,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn link_seq_detects_loss_duplication_and_reorder() {
         let mut runtime = RouteRuntime::new(ShardId::new(0));
-        let route = handle(0, 0, 0);
+        let route = address(0, 0, 0);
         runtime.install(route, NtpTime::ZERO);
 
         for seq in [10u32, 11, 14, 14, 13] {
