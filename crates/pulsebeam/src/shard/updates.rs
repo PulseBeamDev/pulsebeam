@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 
 use pulsebeam_runtime::mailbox;
 
-use crate::keys::ParticipantKey;
+use crate::entity::ParticipantId;
 use crate::participant::ParticipantEffect;
 use crate::shard_update::{ShardUpdate, ShardUpdateOp};
 
@@ -16,7 +16,7 @@ pub(crate) struct ShardUpdateApplication {
     pending_update: Option<Box<ShardUpdate>>,
     pending_update_lifecycle: bool,
     pending_plan_index: usize,
-    pending_participant_effects: VecDeque<(ParticipantKey, ParticipantEffect)>,
+    pending_participant_effects: VecDeque<(ParticipantId, ParticipantEffect)>,
 }
 
 impl ShardUpdateApplication {
@@ -59,13 +59,6 @@ impl ShardUpdateApplication {
                 continue;
             }
             if !self.pending_update_lifecycle {
-                for op in delta
-                    .lifecycle
-                    .iter()
-                    .filter(|op| matches!(op, ShardUpdateOp::InsertParticipant))
-                {
-                    self.apply_lifecycle_op(execution, op);
-                }
                 self.apply_pending_participant_effects(execution);
                 for (participant, effect) in &delta.participant_effects {
                     if !execution.apply_participant_effect(*participant, effect.clone()) {
@@ -73,11 +66,7 @@ impl ShardUpdateApplication {
                             .push_back((*participant, effect.clone()));
                     }
                 }
-                for op in delta
-                    .lifecycle
-                    .iter()
-                    .filter(|op| !is_retire(op) && !matches!(op, ShardUpdateOp::InsertParticipant))
-                {
+                for op in delta.lifecycle.iter().filter(|op| !is_retire(op)) {
                     self.apply_lifecycle_op(execution, op);
                 }
                 self.pending_update_lifecycle = true;
@@ -129,9 +118,9 @@ impl ShardUpdateApplication {
 
     fn apply_lifecycle_op(&mut self, execution: &mut ShardExecution, op: &ShardUpdateOp) {
         execution.apply_lifecycle_op(op);
-        if let ShardUpdateOp::RemoveParticipant { key } = op {
+        if let ShardUpdateOp::RemoveParticipant { participant, .. } = op {
             self.pending_participant_effects
-                .retain(|(participant, _)| *participant != *key);
+                .retain(|(pending, _)| *pending != *participant);
         }
     }
 

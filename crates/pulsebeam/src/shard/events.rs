@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 
 use super::worker::ShardEvent;
 use crate::entity::{ParticipantId, RoomId, TrackId};
-use crate::keys::ParticipantKey;
+use crate::keys::ParticipantHandle;
 use crate::keys::TrackKey;
 use crate::participant::event::ParticipantSink;
 use crate::participant::reverse::ReversePacket;
@@ -17,7 +17,7 @@ use crate::track::{SelectionPolicy, Track, TrackMeta, TrackSelector};
 #[derive(Clone, Copy)]
 pub(crate) struct SinkIdentity {
     pub id: ParticipantId,
-    pub key: ParticipantKey,
+    pub key: ParticipantHandle,
     pub room_id: RoomId,
 }
 
@@ -41,7 +41,7 @@ pub enum ParticipantBindingEvent {
 
 pub enum ParticipantLifecycleEvent {
     Connected {
-        participant_key: ParticipantKey,
+        participant_key: ParticipantHandle,
         source: std::net::SocketAddr,
         destination: std::net::SocketAddr,
         source_shard: crate::id::ShardId,
@@ -120,7 +120,7 @@ impl EventPipeline {
 
 pub struct PipelineSinkRef<'a> {
     id: ParticipantId,
-    key: ParticipantKey,
+    key: ParticipantHandle,
     room_id: RoomId,
     pipeline: &'a mut EventPipeline,
 }
@@ -259,7 +259,7 @@ mod tests {
         let room = RoomExternalId::new("room").unwrap();
         SinkIdentity {
             id: ParticipantId::new(),
-            key: ParticipantKey::default(),
+            key: ParticipantHandle::default(),
             room_id: RoomId::from_external(&room),
         }
     }

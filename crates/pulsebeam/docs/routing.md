@@ -5,10 +5,11 @@
 The controller is a compiler. A shard is a packet executor.
 
 The controller owns semantic state: rooms, participants, published tracks and
-subscriptions. It resolves that state into shard-local keys, route addresses
-and one forwarding plan per resident track. The shard installs those values
-and executes them without evaluating room policy, subscription selectors or
-media kind.
+subscriptions. It resolves that state into stable participant identities,
+route addresses and one forwarding plan per resident track. The destination
+shard resolves participant identities to its own handles while installing the
+plan, then executes it without evaluating room policy, subscription selectors
+or media kind.
 
 ```text
                          control plane
@@ -32,7 +33,7 @@ media kind.
           ▼
   TrackPlan { local participants, remote routes, reverse route }
           │
-          ├─► local ParticipantKey ─► participant
+          ├─► local ParticipantHandle ─► participant
           │
           └─► one envelope per destination shard
                                       │
@@ -121,11 +122,12 @@ that has candidates. A candidate-only destination remains dormant: it has no
 forward route, runtime, plan or origin remote entry. Those are installed only
 while the shard has at least one active binding.
 
-Every resident copy uses the same plan:
+Controller-to-shard updates name local recipients by `ParticipantId`. Every
+resident copy resolves those identities into the same installed plan shape:
 
 ```text
 TrackPlan {
-    local:         [ParticipantKey]
+    local:         [ParticipantHandle]
     remote:        [NodeRouteAddress]
     reverse_route: optional NodeRouteAddress
 }
@@ -164,7 +166,7 @@ When a participant emits a packet, the shard pipeline already carries its
 compiled `TrackKey`.
 
 1. Resolve the track runtime and `TrackPlan` by `TrackKey`.
-2. Deliver the packet to every `ParticipantKey` in `plan.local`.
+2. Deliver the packet to every `ParticipantHandle` in `plan.local`.
 3. If the packet originated locally, emit one copy for every route in
    `plan.remote`.
 
@@ -359,7 +361,7 @@ A change that breaks one of these is an architectural regression even when its
 tests pass:
 
 1. The controller owns rooms, track identities, selectors and placement.
-2. The shard routes only by `TrackKey`, `ParticipantKey` and node route address.
+2. The shard routes only by `TrackKey`, `ParticipantHandle` and node route address.
 3. Every track kind uses the same `TrackPlan` and `Forward` action.
 4. A plan contains exact outputs, never selectors or stable application ids.
 5. A remote origin sends one copy per destination shard; that shard performs

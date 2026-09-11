@@ -2,7 +2,7 @@ use slotmap::SecondaryMap;
 use std::time::Duration;
 use tokio::time::Instant;
 
-use super::participants::ParticipantKey;
+use super::participants::ParticipantHandle;
 
 const SLOT_COUNT: usize = 256;
 const OCCUPANCY_WORDS: usize = SLOT_COUNT / u64::BITS as usize;
@@ -38,8 +38,8 @@ fn duration_for_ticks(ticks: u64) -> Duration {
 #[derive(Clone, Copy)]
 struct TimerNode {
     deadline_tick: u64,
-    prev: Option<ParticipantKey>,
-    next: Option<ParticipantKey>,
+    prev: Option<ParticipantHandle>,
+    next: Option<ParticipantHandle>,
     location: u16,
 }
 
@@ -62,10 +62,10 @@ pub struct TimerWheel {
     epoch: Instant,
     last_now: Instant,
     current_tick: u64,
-    heads: Box<[Option<ParticipantKey>]>,
-    due_head: Option<ParticipantKey>,
+    heads: Box<[Option<ParticipantHandle>]>,
+    due_head: Option<ParticipantHandle>,
     occupied: [u64; OCCUPANCY_WORDS],
-    nodes: SecondaryMap<ParticipantKey, TimerNode>,
+    nodes: SecondaryMap<ParticipantHandle, TimerNode>,
 }
 
 impl TimerWheel {
@@ -82,7 +82,7 @@ impl TimerWheel {
         }
     }
 
-    pub fn schedule(&mut self, key: ParticipantKey, deadline: Instant) {
+    pub fn schedule(&mut self, key: ParticipantHandle, deadline: Instant) {
         let (location, deadline_tick) = if deadline <= self.last_now {
             (DUE_LOCATION, self.current_tick)
         } else {
@@ -114,7 +114,7 @@ impl TimerWheel {
         self.link(key, location, deadline_tick);
     }
 
-    pub fn cancel(&mut self, key: ParticipantKey) {
+    pub fn cancel(&mut self, key: ParticipantHandle) {
         let Some(node) = self.nodes.get(key) else {
             return;
         };
@@ -140,7 +140,7 @@ impl TimerWheel {
         )
     }
 
-    pub fn drain_expired(&mut self, now: Instant, mut f: impl FnMut(ParticipantKey)) {
+    pub fn drain_expired(&mut self, now: Instant, mut f: impl FnMut(ParticipantHandle)) {
         debug_assert!(now >= self.last_now, "timer clock moved backwards");
         self.drain_location(DUE_LOCATION, &mut f);
 
@@ -160,7 +160,7 @@ impl TimerWheel {
         self.last_now = now;
     }
 
-    fn drain_location(&mut self, location: u16, f: &mut impl FnMut(ParticipantKey)) {
+    fn drain_location(&mut self, location: u16, f: &mut impl FnMut(ParticipantHandle)) {
         loop {
             let id = if location == DUE_LOCATION {
                 self.due_head
@@ -186,7 +186,7 @@ impl TimerWheel {
         }
     }
 
-    fn link(&mut self, id: ParticipantKey, location: u16, deadline_tick: u64) {
+    fn link(&mut self, id: ParticipantHandle, location: u16, deadline_tick: u64) {
         debug_assert!(location <= DUE_LOCATION);
         let old_head = if location == DUE_LOCATION {
             self.due_head
@@ -230,7 +230,7 @@ impl TimerWheel {
         }
     }
 
-    fn unlink(&mut self, id: ParticipantKey) {
+    fn unlink(&mut self, id: ParticipantHandle) {
         let Some(&node) = self.nodes.get(id) else {
             pulsebeam_runtime::fatal!("unlinking a timer the wheel does not hold")
         };
@@ -431,10 +431,12 @@ mod tests {
     // Convenience only: a test is not a shard, so nothing here is
     // cross-core. See crates/pulsebeam/docs/thread-per-core.md.
     use super::*;
-    fn keys(count: u8) -> Vec<ParticipantKey> {
+    fn keys(count: u8) -> Vec<ParticipantHandle> {
         (0..count)
             .map(|index| {
-                ParticipantKey::from(slotmap::KeyData::from_ffi((1_u64 << 32) | u64::from(index)))
+                ParticipantHandle::from(slotmap::KeyData::from_ffi(
+                    (1_u64 << 32) | u64::from(index),
+                ))
             })
             .collect()
     }

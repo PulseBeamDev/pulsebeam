@@ -12,7 +12,6 @@ use crate::{
     },
     entity::{ConnectionId, ParticipantId, RoomId},
     id::ShardId,
-    route::NodeTransportAddress,
     shard::{
         ShardContext,
         worker::{ShardCommand, ShardEvent, ShardEventMessage},
@@ -520,7 +519,7 @@ impl ControllerActor {
         &mut self,
         shard: ShardId,
         generation: u64,
-        participant: crate::keys::ParticipantKey,
+        participant: ParticipantId,
         effect: crate::participant::ParticipantEffect,
     ) {
         let Some(update) = self.updates.get_mut(shard.index()) else {
@@ -549,13 +548,13 @@ impl ControllerActor {
             let Some(meta) = self.core.registry.get_participant(&participant) else {
                 continue;
             };
-            let Some(key) = meta.binding else {
+            if !meta.materialized {
                 continue;
-            };
+            }
             self.stage_participant_at(
                 meta.shard_id,
                 generation,
-                key,
+                participant,
                 crate::participant::ParticipantEffect::ParticipantsChanged {
                     added: added.into_iter().collect(),
                     removed: removed.into_iter().collect(),
@@ -695,34 +694,6 @@ impl ControllerActor {
         ));
     }
 
-    fn publish_transport(
-        &mut self,
-        shard: ShardId,
-        address: NodeTransportAddress,
-        key: crate::keys::ParticipantKey,
-    ) -> bool {
-        let generation = self.lifecycle.next_generation();
-        let Some(update) = self.updates.get_mut(shard.index()) else {
-            return false;
-        };
-        update.stage(
-            generation,
-            crate::shard_update::ShardUpdateOp::InsertParticipant,
-        );
-        update.stage(
-            generation,
-            crate::shard_update::ShardUpdateOp::InstallTransport {
-                binding: crate::shard_update::TransportBinding {
-                    address,
-                    participant: key,
-                },
-            },
-        );
-        self.mark_update_touched(shard);
-        self.publish_staged();
-        true
-    }
-
     fn begin_create_participant(
         &mut self,
         state: ParticipantState,
@@ -746,34 +717,21 @@ impl ControllerActor {
         };
         let now = tokio::time::Instant::now();
         let address = self.core.reserve_transport(shard, now);
-        let key = self
-            .core
-            .mint_participant(shard, state.participant_id)
-            .ok_or(ControllerError::ServiceUnavailable)?;
         let creds = IceUfrag::new(self.cluster_id, self.node_id, address.route, address.epoch)
             .into_ice_creds();
         let (rtc, answer) = match self.negotiator.create_answer(offer, creds) {
             Ok(value) => value,
             Err(error) => {
-                self.core.remove_participant_key(shard, key);
                 self.core.release_transport(address, now);
                 return Err(error.into());
             }
         };
-        if !self.publish_transport(shard, address, key) {
-            self.core.remove_participant_key(shard, key);
-            self.core.release_transport(address, now);
-            return Err(ControllerError::ServiceUnavailable);
-        }
-        let config = self
-            .core
-            .create_participant(rtc, state, shard, address, key);
+        let config = self.core.create_participant(rtc, state, shard, address);
         let room_id = config.room_id;
         let (ack_tx, ack_rx) = oneshot::channel();
         Ok(PendingMaterialization {
             shard,
             command: Some(ShardCommand::MaterializeParticipant {
-                key,
                 transport: address,
                 config: Box::new(config),
                 ack: ack_tx,
@@ -788,11 +746,10 @@ impl ControllerActor {
     fn complete_materialization(&mut self, pending: PendingMaterialization) -> SdpAnswer {
         let participant_id = pending.participant;
         let room_id = pending.room_id;
+        self.core.registry.mark_materialized(&participant_id);
         let generation = self.lifecycle.next_generation();
         self.stage_participant_change_at(room_id, generation, Some(participant_id), None);
-        if let Some(meta) = self.core.registry.get_participant(&participant_id)
-            && let Some(key) = meta.binding
-        {
+        if let Some(meta) = self.core.registry.get_participant(&participant_id) {
             let participants = self
                 .core
                 .registry
@@ -803,7 +760,7 @@ impl ControllerActor {
             self.stage_participant_at(
                 meta.shard_id,
                 generation,
-                key,
+                participant_id,
                 crate::participant::ParticipantEffect::ParticipantsChanged {
                     added: participants,
                     removed: Vec::new(),
@@ -859,7 +816,6 @@ impl ControllerActor {
             .get_participant(&participant)
             .map(|meta| crate::control::core::ParticipantMeta {
                 shard: meta.shard_id,
-                binding: meta.binding,
                 transport: meta.transport,
             })
         else {
@@ -906,17 +862,15 @@ impl ControllerActor {
                 generation,
                 crate::shard_update::ShardUpdateOp::RetireTransport { address },
             );
-            if let Some(key) = meta.binding {
-                update.stage(
-                    generation,
-                    crate::shard_update::ShardUpdateOp::RemoveParticipant { key },
-                );
-            }
+            update.stage(
+                generation,
+                crate::shard_update::ShardUpdateOp::RemoveParticipant {
+                    participant,
+                    address,
+                },
+            );
             self.mark_update_touched(meta.shard);
             self.publish_staged();
-        }
-        if let Some(key) = meta.binding {
-            self.core.remove_participant_key(meta.shard, key);
         }
         self.core
             .release_transport(address, tokio::time::Instant::now());

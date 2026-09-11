@@ -1,18 +1,19 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::ops::{Deref, DerefMut};
 
 use pulsebeam_runtime::net::RecvPacketBatch;
-use slotmap::SecondaryMap;
+use slotmap::SlotMap;
 
 use crate::{
+    entity::ParticipantId,
     id::ShardId,
     participant::{ParticipantConfig, ParticipantCore},
     route::NodeTransportAddress,
     shard::demux::Demuxer,
 };
 
-pub(crate) use crate::keys::ParticipantKey;
+pub(crate) use crate::keys::ParticipantHandle;
 
 pub(crate) struct ParticipantMeta {
     core: ParticipantCore,
@@ -39,7 +40,7 @@ pub(crate) struct ParticipantRegistry {
     max_gso_segments: usize,
     /// Boxed, and that is the point.
     ///
-    /// `SecondaryMap` is a dense `Vec` indexed by the key, so its element size
+    /// `SlotMap` is a dense `Vec` indexed by the handle, so its element size
     /// is its stride. `ParticipantMeta` is ~10.9KB — three quarters of it
     /// str0m's `Rtc` — and growing the map `Vec::extend`s, which reallocates
     /// and memcpies every participant already in it. On a shard filling to 500
@@ -50,7 +51,9 @@ pub(crate) struct ParticipantRegistry {
     /// The indirection is free where it matters: resolving a participant always
     /// missed on a 10.9KB object anyway, and the pointer array it now goes
     /// through is dense enough to stay resident (500 participants = 8KB).
-    participants: SecondaryMap<ParticipantKey, Box<ParticipantMeta>>,
+    participants: SlotMap<ParticipantHandle, Box<ParticipantMeta>>,
+    by_id: HashMap<ParticipantId, ParticipantHandle>,
+    transports: Vec<Option<(NodeTransportAddress, ParticipantHandle)>>,
     demuxer: Demuxer,
     pending_close: VecDeque<SocketAddr>,
 }
@@ -65,7 +68,9 @@ impl ParticipantRegistry {
         Self {
             shard_id,
             max_gso_segments,
-            participants: SecondaryMap::new(),
+            participants: SlotMap::with_key(),
+            by_id: HashMap::new(),
+            transports: Vec::new(),
             demuxer: Demuxer::for_node(0, 0, shard_count),
             pending_close: VecDeque::new(),
         }
@@ -73,39 +78,77 @@ impl ParticipantRegistry {
 
     pub fn insert(
         &mut self,
-        key: ParticipantKey,
         cfg: ParticipantConfig,
         ingress: NodeTransportAddress,
-    ) -> bool {
+    ) -> ParticipantHandle {
         debug_assert_eq!(ingress.shard(), self.shard_id);
         let participant_id = cfg.participant_id;
-        let core = ParticipantCore::new(cfg, self.shard_id, self.max_gso_segments, 1);
-        if self.participants.contains_key(key) {
-            debug_assert!(false, "duplicate participant materialization");
-            return false;
+        if let Some(previous) = self.by_id.get(&participant_id).copied() {
+            let _ = self.remove_handle(previous);
         }
-        let previous = self.participants.insert(
-            key,
-            Box::new(ParticipantMeta {
-                core,
-                queued_dirty: false,
-                ingress,
-            }),
-        );
-        debug_assert!(previous.is_none());
+        let core = ParticipantCore::new(cfg, self.shard_id, self.max_gso_segments, 1);
+        let handle = self.participants.insert(Box::new(ParticipantMeta {
+            core,
+            queued_dirty: false,
+            ingress,
+        }));
+        self.by_id.insert(participant_id, handle);
+        self.install_transport(ingress, handle);
         tracing::info!(%participant_id, "participant added to shard");
-        true
+        handle
     }
 
-    pub fn remove_key(&mut self, key: ParticipantKey) -> Option<Box<ParticipantMeta>> {
-        let meta = self.participants.remove(key)?;
+    pub fn remove(&mut self, address: NodeTransportAddress) -> Option<Box<ParticipantMeta>> {
+        let handle = self.resolve_transport(address)?;
+        self.remove_handle(handle)
+    }
+
+    fn remove_handle(&mut self, handle: ParticipantHandle) -> Option<Box<ParticipantMeta>> {
+        let meta = self.participants.remove(handle)?;
+        if self.by_id.get(&meta.participant_id) == Some(&handle) {
+            self.by_id.remove(&meta.participant_id);
+        }
+        self.retire_transport(meta.ingress);
         let addrs = self.demuxer.unregister(meta.ingress.route);
         self.pending_close.extend(addrs);
         Some(meta)
     }
 
-    pub fn resolve_mut(&mut self, key: ParticipantKey) -> Option<&mut ParticipantMeta> {
+    pub fn resolve(&self, participant_id: &ParticipantId) -> Option<ParticipantHandle> {
+        self.by_id.get(participant_id).copied()
+    }
+
+    pub fn resolve_mut(&mut self, key: ParticipantHandle) -> Option<&mut ParticipantMeta> {
         self.participants.get_mut(key).map(Box::as_mut)
+    }
+
+    pub fn resolve_transport(&self, address: NodeTransportAddress) -> Option<ParticipantHandle> {
+        match self.transports.get(address.route.index()) {
+            Some(Some((installed, handle))) if *installed == address => Some(*handle),
+            _ => None,
+        }
+    }
+
+    fn install_transport(&mut self, address: NodeTransportAddress, handle: ParticipantHandle) {
+        let index = address.route.index();
+        if index >= self.transports.len() {
+            self.transports
+                .resize_with(index.saturating_add(1), || None);
+        }
+        let Some(slot) = self.transports.get_mut(index) else {
+            debug_assert!(false, "transport slot must exist after resize");
+            return;
+        };
+        *slot = Some((address, handle));
+    }
+
+    pub fn retire_transport(&mut self, address: NodeTransportAddress) {
+        let Some(slot) = self.transports.get_mut(address.route.index()) else {
+            return;
+        };
+        if slot.is_some_and(|(installed, _)| installed == address) {
+            *slot = None;
+        }
     }
 
     pub fn demux(&mut self, batch: &RecvPacketBatch) -> Option<NodeTransportAddress> {
@@ -131,7 +174,7 @@ impl ParticipantRegistry {
     ///
     /// Reports the route address so the shard can tell control which flow to
     /// pin in the steering map.
-    pub fn authenticated_address(&self, key: ParticipantKey) -> Option<NodeTransportAddress> {
+    pub fn authenticated_address(&self, key: ParticipantHandle) -> Option<NodeTransportAddress> {
         let Some(meta) = self.participants.get(key) else {
             debug_assert!(false, "authenticated participant must still be registered");
             return None;
@@ -150,13 +193,13 @@ mod tests {
     // cross-core. See crates/pulsebeam/docs/thread-per-core.md.
     use super::*;
 
-    fn value_size<K: slotmap::Key, V>(_: &SecondaryMap<K, V>) -> usize {
+    fn value_size<K: slotmap::Key, V>(_: &SlotMap<K, V>) -> usize {
         std::mem::size_of::<V>()
     }
 
     /// The registry's element stride is a pointer, not a participant.
     ///
-    /// `SecondaryMap` is a dense `Vec` indexed by the key, so whatever it holds
+    /// `SlotMap` is a dense `Vec` indexed by the handle, so whatever it holds
     /// is what gets memcpied every time the map grows — on the shard's
     /// `SCHED_FIFO` thread, with media flowing. Storing the participant inline
     /// made that ~2.7MB in one go at 500 participants; a pointer makes it 8KB.
@@ -175,6 +218,27 @@ mod tests {
         assert!(
             std::mem::size_of::<ParticipantMeta>() > 4096,
             "a participant is small enough to inline now; revisit the Box and this test"
+        );
+    }
+
+    #[test]
+    fn stale_transport_retirement_cannot_remove_a_replacement_handle() {
+        let shard = ShardId::new(0);
+        let route = crate::route::TransportRoute::new(shard, 7);
+        let old_address = NodeTransportAddress::new(route, 1);
+        let replacement_address = NodeTransportAddress::new(route, 2);
+        let mut handles = SlotMap::<ParticipantHandle, ()>::with_key();
+        let old_handle = handles.insert(());
+        let replacement_handle = handles.insert(());
+        let mut registry = ParticipantRegistry::new(shard, 1, 1);
+
+        registry.install_transport(old_address, old_handle);
+        registry.install_transport(replacement_address, replacement_handle);
+        registry.retire_transport(old_address);
+
+        assert_eq!(
+            registry.resolve_transport(replacement_address),
+            Some(replacement_handle)
         );
     }
 }

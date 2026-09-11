@@ -1,10 +1,10 @@
 #[cfg(test)]
 use crate::entity::ParticipantId;
 
-use super::participants::{ParticipantKey, ParticipantMeta};
+use super::participants::{ParticipantHandle, ParticipantMeta};
 
 pub(crate) struct DirtyTracker {
-    participants: Vec<ParticipantKey>,
+    participants: Vec<ParticipantHandle>,
     cursor: usize,
     #[cfg(debug_assertions)]
     active: bool,
@@ -25,7 +25,7 @@ impl DirtyTracker {
     /// A `&mut ParticipantMeta` obtained through `ParticipantRegistry` is
     /// already proof the key is current; there is nothing left here for a
     /// generation field to guard.
-    pub fn mark(&mut self, key: ParticipantKey, participant: &mut ParticipantMeta) {
+    pub fn mark(&mut self, key: ParticipantHandle, participant: &mut ParticipantMeta) {
         #[cfg(debug_assertions)]
         debug_assert!(!self.active, "cannot dirty a participant during polling");
         if participant.queued_dirty {
@@ -44,7 +44,7 @@ impl DirtyTracker {
         }
     }
 
-    pub fn next(&mut self) -> Option<ParticipantKey> {
+    pub fn next(&mut self) -> Option<ParticipantHandle> {
         #[cfg(debug_assertions)]
         debug_assert!(self.active);
         let entry = self.participants.get(self.cursor).copied()?;
@@ -94,8 +94,8 @@ mod tests {
         ParticipantId::from_bytes([value; 16])
     }
 
-    fn key(index: u32, version: u32) -> ParticipantKey {
-        ParticipantKey::from(slotmap::KeyData::from_ffi(
+    fn key(index: u32, version: u32) -> ParticipantHandle {
+        ParticipantHandle::from(slotmap::KeyData::from_ffi(
             (u64::from(version) << 32) | u64::from(index),
         ))
     }

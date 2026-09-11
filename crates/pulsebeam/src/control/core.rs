@@ -1,4 +1,3 @@
-use slotmap::SlotMap;
 use tokio::time::Instant;
 
 use crate::{
@@ -7,7 +6,6 @@ use crate::{
     id::ShardId,
     participant::ParticipantConfig,
     route::{NodeTransportAddress, PackedRoute, SlotAllocator, TransportRoute},
-    shard::participants::ParticipantKey,
 };
 use str0m::Rtc;
 
@@ -64,7 +62,6 @@ pub struct ControllerCore {
     room_shard_slot: usize,
     placement: RoomPlacement,
     transport: TransportAddressAllocator,
-    participants: Vec<SlotMap<ParticipantKey, ParticipantId>>,
 }
 
 impl ControllerCore {
@@ -75,7 +72,6 @@ impl ControllerCore {
             room_shard_slot,
             placement,
             transport: TransportAddressAllocator::new(0),
-            participants: Vec::new(),
         }
     }
 
@@ -87,7 +83,6 @@ impl ControllerCore {
         debug_assert!(shard_count > 0);
         let mut core = Self::with_placement(room_shard_slot, placement);
         core.transport = TransportAddressAllocator::new(shard_count);
-        core.participants = (0..shard_count).map(|_| SlotMap::with_key()).collect();
         core
     }
 
@@ -111,40 +106,17 @@ impl ControllerCore {
         self.transport.retire(address, now);
     }
 
-    pub fn mint_participant(
-        &mut self,
-        shard: ShardId,
-        participant: ParticipantId,
-    ) -> Option<ParticipantKey> {
-        let key = self
-            .participants
-            .get_mut(shard.index())?
-            .insert(participant);
-        Some(key)
-    }
-
-    pub fn remove_participant_key(&mut self, shard: ShardId, key: ParticipantKey) {
-        let Some(arena) = self.participants.get_mut(shard.index()) else {
-            debug_assert!(false, "participant key targeted an unknown shard");
-            return;
-        };
-        let removed = arena.remove(key);
-        debug_assert!(removed.is_some(), "participant key must be live at removal");
-    }
-
     pub fn create_participant(
         &mut self,
         rtc: Rtc,
         state: ParticipantState,
         shard: ShardId,
         transport: NodeTransportAddress,
-        key: ParticipantKey,
     ) -> ParticipantConfig {
         self.registry
             .add_participant(state.participant_id, state.room_id, shard, Some(transport));
         self.registry
             .set_connection_id(&state.participant_id, state.connection_id);
-        self.registry.bind_participant(&state.participant_id, key);
         ParticipantConfig {
             manual_sub: state.manual_sub,
             room_id: state.room_id,
@@ -173,7 +145,6 @@ impl ControllerCore {
     fn participant_meta(&self, meta: &super::registry::ParticipantMeta) -> ParticipantMeta {
         ParticipantMeta {
             shard: meta.shard_id,
-            binding: meta.binding,
             transport: meta.transport,
         }
     }
@@ -182,6 +153,5 @@ impl ControllerCore {
 #[derive(Debug, Clone, Copy)]
 pub struct ParticipantMeta {
     pub shard: ShardId,
-    pub binding: Option<ParticipantKey>,
     pub transport: Option<NodeTransportAddress>,
 }

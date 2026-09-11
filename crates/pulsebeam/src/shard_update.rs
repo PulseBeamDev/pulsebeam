@@ -3,22 +3,23 @@
 
 use std::collections::{HashSet, VecDeque};
 
+use crate::entity::ParticipantId;
 use crate::id::ShardId;
-use crate::keys::{ParticipantKey, TrackKey};
+use crate::keys::TrackKey;
 use crate::route::{NodeRouteAddress, NodeTransportAddress, RouteAction};
 use pulsebeam_runtime::mailbox;
 use str0m::media::Rid;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct TrackPlan {
-    pub local: Vec<ParticipantKey>,
+    pub local: Vec<ParticipantId>,
     pub remote: Vec<NodeRouteAddress>,
     pub reverse_route: Option<NodeRouteAddress>,
 }
 
 impl TrackPlan {
     pub(crate) fn new(
-        local: impl IntoIterator<Item = ParticipantKey>,
+        local: impl IntoIterator<Item = ParticipantId>,
         remote: impl IntoIterator<Item = NodeRouteAddress>,
         reverse_route: Option<NodeRouteAddress>,
     ) -> Self {
@@ -63,7 +64,7 @@ pub(crate) struct TrackPlanUpdate {
 
 #[derive(Debug, Clone)]
 pub(crate) struct TrackDescriptor {
-    pub origin_key: ParticipantKey,
+    pub origin: ParticipantId,
     pub kind: crate::entity::TrackKind,
     pub encodings: Vec<Option<Rid>>,
 }
@@ -71,49 +72,8 @@ pub(crate) struct TrackDescriptor {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct TrackRuntime {
     pub descriptor: Option<TrackDescriptor>,
-    pub publisher: Option<ParticipantKey>,
+    pub publisher: Option<ParticipantId>,
     pub publisher_effect: Option<crate::participant::ParticipantEffect>,
-}
-
-#[derive(Debug, Default)]
-pub(crate) struct TransportImage {
-    slots: Vec<Option<TransportBinding>>,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct TransportBinding {
-    pub address: NodeTransportAddress,
-    pub participant: ParticipantKey,
-}
-
-impl TransportImage {
-    pub fn resolve(&self, address: NodeTransportAddress) -> Option<ParticipantKey> {
-        match self.slots.get(address.route.index()) {
-            Some(Some(binding)) if binding.address == address => Some(binding.participant),
-            _ => None,
-        }
-    }
-
-    pub(crate) fn install(&mut self, binding: TransportBinding) {
-        let idx = binding.address.route.index();
-        if idx >= self.slots.len() {
-            self.slots.resize_with(idx.saturating_add(1), || None);
-        }
-        let Some(slot) = self.slots.get_mut(idx) else {
-            debug_assert!(false, "transport slot must exist after resize");
-            return;
-        };
-        *slot = Some(binding);
-    }
-
-    pub(crate) fn retire(&mut self, address: NodeTransportAddress) {
-        let Some(slot) = self.slots.get_mut(address.route.index()) else {
-            return;
-        };
-        if slot.is_some_and(|binding| binding.address == address) {
-            *slot = None;
-        }
-    }
 }
 
 #[allow(
@@ -129,15 +89,12 @@ pub(crate) enum ShardUpdateOp {
     RetireRoute {
         address: NodeRouteAddress,
     },
-    InstallTransport {
-        binding: TransportBinding,
-    },
     RetireTransport {
         address: NodeTransportAddress,
     },
-    InsertParticipant,
     RemoveParticipant {
-        key: ParticipantKey,
+        participant: ParticipantId,
+        address: NodeTransportAddress,
     },
     InsertTrackRuntime {
         key: TrackKey,
@@ -153,7 +110,7 @@ pub(crate) enum ShardUpdateOp {
 pub(crate) struct ShardUpdate {
     pub shard: ShardId,
     pub generation: u64,
-    pub participant_effects: Vec<(ParticipantKey, crate::participant::ParticipantEffect)>,
+    pub participant_effects: Vec<(ParticipantId, crate::participant::ParticipantEffect)>,
     pub lifecycle: Vec<ShardUpdateOp>,
     pub plans: Vec<TrackPlanUpdate>,
 }
@@ -202,7 +159,7 @@ impl ShardUpdateWriter {
     pub fn stage_participant_effect(
         &mut self,
         generation: u64,
-        participant: ParticipantKey,
+        participant: ParticipantId,
         effect: crate::participant::ParticipantEffect,
     ) {
         let commit = self
@@ -331,11 +288,10 @@ impl ShardUpdateOp {
             Self::InstallRoute { address, .. } | Self::RetireRoute { address } => {
                 address.shard() == shard
             }
-            Self::InstallTransport { binding } => binding.address.shard() == shard,
-            Self::RetireTransport { address } => address.shard() == shard,
-            Self::InsertParticipant { .. }
-            | Self::RemoveParticipant { .. }
-            | Self::InsertTrackRuntime { .. }
+            Self::RetireTransport { address } | Self::RemoveParticipant { address, .. } => {
+                address.shard() == shard
+            }
+            Self::InsertTrackRuntime { .. }
             | Self::RemoveTrackRuntime { .. }
             | Self::Placeholder => true,
         }
@@ -362,7 +318,7 @@ mod tests {
         let shard = ShardId::new(1);
         let (mut writer, mut rx) = new_shard_update(shard);
         let (_, plans) = track_plan();
-        writer.stage(7, ShardUpdateOp::InsertParticipant);
+        writer.stage(7, ShardUpdateOp::Placeholder);
         writer.stage_plans(7, plans);
         assert_eq!(writer.publish(), Some(7));
 
@@ -378,7 +334,7 @@ mod tests {
         let shard = ShardId::new(0);
         let (mut writer, mut rx) = new_shard_update(shard);
         for generation in 1..=(crate::shard::worker::SHARD_UPDATE_CAPACITY + 1) as u64 {
-            writer.stage(generation, ShardUpdateOp::InsertParticipant);
+            writer.stage(generation, ShardUpdateOp::Placeholder);
             assert_eq!(writer.publish(), Some(generation));
         }
         for expected in 1..=crate::shard::worker::SHARD_UPDATE_CAPACITY as u64 {
@@ -395,9 +351,9 @@ mod tests {
     fn one_flush_attempt_never_drains_multiple_generations() {
         let shard = ShardId::new(0);
         let (mut writer, mut rx) = new_shard_update(shard);
-        writer.stage(1, ShardUpdateOp::InsertParticipant);
+        writer.stage(1, ShardUpdateOp::Placeholder);
         assert_eq!(writer.enqueue(), Some(1));
-        writer.stage(2, ShardUpdateOp::InsertParticipant);
+        writer.stage(2, ShardUpdateOp::Placeholder);
         assert_eq!(writer.enqueue(), Some(2));
 
         assert!(writer.flush_one());

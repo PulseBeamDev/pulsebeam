@@ -9,7 +9,7 @@ use crate::clock::WallAnchor;
 use crate::route::{Envelope, NodeTransportAddress};
 use crate::shard::events::{ParticipantBindingEvent, ParticipantEvent, ParticipantLifecycleEvent};
 use crate::{
-    keys::ParticipantKey,
+    keys::ParticipantHandle,
     participant::{
         ParticipantConfig,
         batcher::{AppendStatus, Batcher, GsoSendBatch, NetworkEgress, OwnedPacketQueue},
@@ -86,10 +86,9 @@ pub(crate) struct ShardCore {
 
 pub(crate) struct ShardExecution {
     pub(crate) shard_id: crate::id::ShardId,
-    transports: crate::shard_update::TransportImage,
     registry: ParticipantRegistry,
     pub(super) runtime: ShardRuntime,
-    plans: SecondaryMap<crate::keys::TrackKey, crate::shard_update::TrackPlan>,
+    plans: SecondaryMap<crate::keys::TrackKey, crate::shard::router::InstalledTrackPlan>,
     timers: TimerWheel,
     dirty: DirtyTracker,
     udp_send_batch: GsoSendBatch,
@@ -222,7 +221,6 @@ impl ShardExecution {
         let runtime = ShardRuntime::new(shard_id);
         Self {
             shard_id,
-            transports: Default::default(),
             registry: ParticipantRegistry::new(shard_id, max_gso_segments, shard_count),
             runtime,
             plans: SecondaryMap::new(),
@@ -237,7 +235,7 @@ impl ShardExecution {
 
     fn drain_participant_network(
         &mut self,
-        key: ParticipantKey,
+        key: ParticipantHandle,
         udp_socket: &mut UnifiedSocket,
         tcp_socket: &mut net::tcp::TcpTransport,
     ) {
@@ -265,50 +263,62 @@ impl ShardExecution {
             crate::shard_update::ShardUpdateOp::RetireRoute { address } => {
                 let _ = self.runtime.routes.retire(*address);
             }
-            crate::shard_update::ShardUpdateOp::InstallTransport { binding } => {
-                self.transports.install(*binding);
-            }
             crate::shard_update::ShardUpdateOp::RetireTransport { address } => {
-                self.transports.retire(*address);
+                self.registry.retire_transport(*address);
             }
-            crate::shard_update::ShardUpdateOp::InsertParticipant
-            | crate::shard_update::ShardUpdateOp::Placeholder => {}
-            crate::shard_update::ShardUpdateOp::RemoveParticipant { key } => {
-                self.timers.cancel(*key);
-                let _ = self.registry.remove_key(*key);
+            crate::shard_update::ShardUpdateOp::Placeholder => {}
+            crate::shard_update::ShardUpdateOp::RemoveParticipant { address, .. } => {
+                if let Some(handle) = self.registry.resolve_transport(*address) {
+                    self.timers.cancel(handle);
+                }
+                let _ = self.registry.remove(*address);
             }
-            crate::shard_update::ShardUpdateOp::InsertTrackRuntime { runtime, .. } => {
-                self.runtime.apply_update_op(op);
+            crate::shard_update::ShardUpdateOp::InsertTrackRuntime { key, runtime } => {
+                let descriptor = runtime.descriptor.as_ref();
+                let origin =
+                    descriptor.and_then(|descriptor| self.registry.resolve(&descriptor.origin));
+                let publisher = runtime
+                    .publisher
+                    .and_then(|publisher| self.registry.resolve(&publisher));
+                self.runtime
+                    .install_track(*key, descriptor, origin, publisher);
                 if let (Some(publisher), Some(effect)) =
                     (runtime.publisher, runtime.publisher_effect.as_ref())
                 {
-                    let Some(meta) = self.registry.resolve_mut(publisher) else {
+                    let Some(handle) = self.registry.resolve(&publisher) else {
                         debug_assert!(
                             false,
-                            "a published topic must be live shard={} key={:?}",
-                            self.shard_id, publisher
+                            "a published topic must be live shard={} participant={publisher}",
+                            self.shard_id
                         );
+                        return;
+                    };
+                    let Some(meta) = self.registry.resolve_mut(handle) else {
+                        debug_assert!(false, "a resolved participant handle must be live");
                         return;
                     };
                     meta.apply(effect.clone());
                 }
             }
-            crate::shard_update::ShardUpdateOp::RemoveTrackRuntime { .. } => {
-                self.runtime.apply_update_op(op);
+            crate::shard_update::ShardUpdateOp::RemoveTrackRuntime { key } => {
+                self.runtime.retire_track(*key);
             }
         }
     }
 
     pub(super) fn apply_participant_effect(
         &mut self,
-        participant: ParticipantKey,
+        participant: crate::entity::ParticipantId,
         effect: crate::participant::ParticipantEffect,
     ) -> bool {
-        let Some(meta) = self.registry.resolve_mut(participant) else {
+        let Some(handle) = self.registry.resolve(&participant) else {
+            return false;
+        };
+        let Some(meta) = self.registry.resolve_mut(handle) else {
             return false;
         };
         meta.apply(effect);
-        self.dirty.mark(participant, meta);
+        self.dirty.mark(handle, meta);
         true
     }
 
@@ -316,7 +326,26 @@ impl ShardExecution {
         match &operation.plan {
             Some(plan) => {
                 debug_assert!(plan.is_valid());
-                self.plans.insert(operation.key, plan.clone());
+                let local = plan
+                    .local
+                    .iter()
+                    .filter_map(|participant| {
+                        let handle = self.registry.resolve(participant);
+                        debug_assert!(
+                            handle.is_some(),
+                            "a track plan must name a live participant"
+                        );
+                        handle
+                    })
+                    .collect();
+                self.plans.insert(
+                    operation.key,
+                    crate::shard::router::InstalledTrackPlan {
+                        local,
+                        remote: plan.remote.clone(),
+                        reverse_route: plan.reverse_route,
+                    },
+                );
                 plan.local
                     .len()
                     .saturating_add(plan.remote.len())
@@ -424,7 +453,7 @@ impl ShardExecution {
         source_shard: crate::id::ShardId,
     ) {
         debug_assert_eq!(address.shard(), self.shard_id);
-        let Some(key) = self.transports.resolve(address) else {
+        let Some(key) = self.registry.resolve_transport(address) else {
             return;
         };
         let Some(participant) = self.registry.resolve_mut(key) else {
@@ -554,7 +583,6 @@ impl ShardExecution {
     ) -> Option<()> {
         match cmd {
             ShardCommand::MaterializeParticipant {
-                key,
                 transport,
                 config,
                 ack,
@@ -565,7 +593,7 @@ impl ShardExecution {
                     let _ = ack.send(false);
                     return Some(());
                 }
-                let materialized = self.add_participant(key, transport, *config);
+                let materialized = self.add_participant(transport, *config);
                 let _ = ack.send(materialized);
             }
             ShardCommand::AdoptTcpConnection { .. } => {
@@ -612,7 +640,7 @@ impl ShardExecution {
                 metrics::counter!("shard_ingress_forwarded").increment(1);
                 #[cfg(feature = "sim")]
                 crate::sim_metrics::record_routing_counter("shard_ingress_forwarded");
-                if self.transports.resolve(address).is_some() {
+                if self.registry.resolve_transport(address).is_some() {
                     self.registry.learn_addr(batch.src, address);
                 }
                 self.on_owned_udp_batch(batch, address, source_shard);
@@ -655,14 +683,14 @@ impl ShardExecution {
 
     fn add_participant(
         &mut self,
-        key: ParticipantKey,
         transport: crate::route::NodeTransportAddress,
         cfg: ParticipantConfig,
     ) -> bool {
         debug_assert_eq!(transport.shard(), self.shard_id);
-        if !self.registry.insert(key, cfg, transport) {
-            return false;
+        if let Some(previous) = self.registry.resolve(&cfg.participant_id) {
+            self.timers.cancel(previous);
         }
+        let key = self.registry.insert(cfg, transport);
         if let Some(participant) = self.registry.resolve_mut(key) {
             self.dirty.mark(key, participant);
         }

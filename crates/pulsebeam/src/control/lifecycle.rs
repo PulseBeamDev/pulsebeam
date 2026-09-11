@@ -9,7 +9,7 @@ use crate::{
     },
     entity::{ParticipantId, RoomId, TrackId},
     id::ShardId,
-    keys::{ParticipantKey, TrackKey},
+    keys::TrackKey,
     participant::ParticipantEffect,
     route::{NodeRouteAddress, RouteAction},
     shard_update::{ShardUpdateOp, TrackDescriptor, TrackPlan, TrackPlanUpdate, TrackRuntime},
@@ -20,7 +20,7 @@ use crate::{
 struct ParticipantLocation {
     shard: ShardId,
     room_id: RoomId,
-    binding: Option<ParticipantKey>,
+    materialized: bool,
 }
 
 impl ParticipantLocation {
@@ -28,7 +28,7 @@ impl ParticipantLocation {
         registry.get_participant(participant).map(|meta| Self {
             shard: meta.shard_id,
             room_id: meta.room_id,
-            binding: meta.binding,
+            materialized: meta.materialized,
         })
     }
 
@@ -38,12 +38,12 @@ impl ParticipantLocation {
         room_id: RoomId,
     ) -> Option<BoundParticipantLocation> {
         let location = Self::lookup(registry, participant)?;
-        if location.room_id != room_id {
+        if location.room_id != room_id || !location.materialized {
             return None;
         }
         Some(BoundParticipantLocation {
             shard: location.shard,
-            key: location.binding?,
+            participant: *participant,
         })
     }
 }
@@ -51,7 +51,7 @@ impl ParticipantLocation {
 #[derive(Debug, Clone, Copy)]
 struct BoundParticipantLocation {
     shard: ShardId,
-    key: ParticipantKey,
+    participant: ParticipantId,
 }
 
 /// Shard-local allocation held for one track.
@@ -89,7 +89,7 @@ pub(crate) enum TrackLifecycleOperation {
     },
     ParticipantEffect {
         shard: ShardId,
-        participant: ParticipantKey,
+        participant: ParticipantId,
         effect: ParticipantEffect,
     },
 }
@@ -131,7 +131,7 @@ impl TrackLifecycleStager {
     fn participant(
         &mut self,
         shard: ShardId,
-        participant: ParticipantKey,
+        participant: ParticipantId,
         effect: ParticipantEffect,
     ) {
         self.operations
@@ -191,7 +191,7 @@ impl DesiredTrackState {
         clippy::expect_used,
         reason = "bindings are filtered from the same location map they are read from"
     )]
-    fn local_bindings(&self, shard: ShardId) -> Vec<ParticipantKey> {
+    fn local_bindings(&self, shard: ShardId) -> Vec<ParticipantId> {
         let mut participants = self
             .bindings
             .iter()
@@ -203,24 +203,16 @@ impl DesiredTrackState {
             })
             .collect::<Vec<_>>();
         participants.sort();
-        participants
-            .into_iter()
-            .map(|participant| {
-                self.locations
-                    .get(&participant)
-                    .expect("sorted binding must retain its location")
-                    .key
-            })
-            .collect()
+        participants.into_iter().collect()
     }
 }
 
 struct RuntimePlan<'a> {
     shard: ShardId,
-    origin_key: ParticipantKey,
+    origin: ParticipantId,
     track: &'a Track,
     key: TrackKey,
-    local: Vec<ParticipantKey>,
+    local: Vec<ParticipantId>,
     remote: Vec<NodeRouteAddress>,
     reverse: Option<NodeRouteAddress>,
 }
@@ -734,7 +726,7 @@ impl TrackLifecycle {
             stager,
             RuntimePlan {
                 shard: desired.origin.shard,
-                origin_key: desired.origin.key,
+                origin: desired.origin.participant,
                 track: &desired.track,
                 key: origin.allocation.key,
                 local: desired.local_bindings(desired.origin.shard),
@@ -747,7 +739,7 @@ impl TrackLifecycle {
         if !origin_was_resident {
             stager.participant(
                 desired.origin.shard,
-                desired.origin.key,
+                desired.origin.participant,
                 ParticipantEffect::TrackPublished {
                     key: origin.allocation.key,
                     track_id: identity.id,
@@ -767,7 +759,7 @@ impl TrackLifecycle {
                 stager,
                 RuntimePlan {
                     shard,
-                    origin_key: desired.origin.key,
+                    origin: desired.origin.participant,
                     track: &desired.track,
                     key: destination.allocation.key,
                     local: desired.local_bindings(shard),
@@ -786,7 +778,7 @@ impl TrackLifecycle {
                 key: runtime.key,
                 runtime: TrackRuntime {
                     descriptor: Some(TrackDescriptor {
-                        origin_key: runtime.origin_key,
+                        origin: runtime.origin,
                         kind: runtime.track.kind(),
                         encodings: runtime
                             .track
@@ -857,9 +849,9 @@ impl TrackLifecycle {
             // there is no local participant state left to update in that case.
             return;
         };
-        let Some(participant_key) = location.binding else {
+        if !location.materialized {
             return;
-        };
+        }
         let destination = self
             .allocations
             .get(&(identity, location.shard))
@@ -867,7 +859,7 @@ impl TrackLifecycle {
 
         stager.participant(
             location.shard,
-            participant_key,
+            participant,
             effect(destination.allocation.key),
         );
     }
@@ -904,13 +896,13 @@ impl TrackLifecycle {
         }
 
         if let Some(origin) = ParticipantLocation::lookup(registry, &identity.publisher)
-            && let Some(participant) = origin.binding
+            && origin.materialized
             && let Some(destination) = self.allocations.get(&(identity, origin.shard))
             && destination.resident
         {
             stager.participant(
                 origin.shard,
-                participant,
+                identity.publisher,
                 ParticipantEffect::TrackUnpublished {
                     key: destination.allocation.key,
                     track_id: identity.id,
@@ -1039,8 +1031,6 @@ impl TrackLifecycle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use slotmap::KeyData;
-
     use crate::{
         entity::{RoomExternalId, TrackKind},
         track::{DataLane, Topic, TrackMeta},
@@ -1087,14 +1077,10 @@ mod tests {
         ParticipantId::from_bytes([seed; 16])
     }
 
-    fn participant_key(seed: u8) -> ParticipantKey {
-        ParticipantKey::from(KeyData::from_ffi((1_u64 << 32) | u64::from(seed)))
-    }
-
     fn register(registry: &mut RoomRegistry, seed: u8, room_id: RoomId, shard: usize) {
         let participant = participant(seed);
         registry.add_participant(participant, room_id, ShardId::new(shard), None);
-        registry.bind_participant(&participant, participant_key(seed));
+        registry.mark_materialized(&participant);
     }
 
     fn track(kind: TrackKind, publisher: u8, room_seed: u8, label: &str) -> Track {
@@ -2398,7 +2384,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        assert_eq!(targets, vec![participant_key(2), participant_key(3)]);
+        assert_eq!(targets, vec![participant(2), participant(3)]);
         assert_internal_invariants(&lifecycle, &registry);
     }
 

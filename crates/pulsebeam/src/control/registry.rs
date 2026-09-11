@@ -5,7 +5,6 @@ use crate::{
     entity::{ConnectionId, ParticipantId, RoomId},
     id::ShardId,
     route::NodeTransportAddress,
-    shard::participants::ParticipantKey,
 };
 
 /// Everything the control plane knows about one participant.
@@ -21,11 +20,9 @@ pub struct ParticipantMeta {
     /// remember it, and this is the record that already knows who it belongs
     /// to.
     pub transport: Option<NodeTransportAddress>,
-    /// The owning shard's own arena key, opaque here. Stored only long enough
-    /// to compile into that shard's view; never dereferenced.
-    pub binding: Option<ParticipantKey>,
     pub connection_id: Option<ConnectionId>,
     pub connected: bool,
+    pub materialized: bool,
 }
 
 pub struct RoomRegistry {
@@ -52,19 +49,15 @@ impl RoomRegistry {
         shard_id: ShardId,
         transport: Option<NodeTransportAddress>,
     ) {
-        let binding = self
-            .participants
-            .get(&participant_id)
-            .and_then(|meta| meta.binding);
         if let Some(previous) = self.participants.insert(
             participant_id,
             ParticipantMeta {
                 shard_id,
                 room_id,
                 transport,
-                binding,
                 connection_id: None,
                 connected: true,
+                materialized: false,
             },
         ) {
             self.remove_from_room(&previous.room_id, &participant_id, previous.shard_id);
@@ -101,22 +94,16 @@ impl RoomRegistry {
         meta.connection_id = Some(connection_id);
     }
 
-    /// Record the arena key the owning shard reported for this participant.
-    /// Idempotent: a retry after a lost acknowledgement must not create a
-    /// second binding.
-    pub fn bind_participant(&mut self, participant_id: &ParticipantId, binding: ParticipantKey) {
+    pub fn mark_materialized(&mut self, participant_id: &ParticipantId) {
         let Some(meta) = self.participants.get_mut(participant_id) else {
+            debug_assert!(false, "a materialized participant must be registered");
             return;
         };
-        debug_assert!(meta.connected, "a disconnected participant cannot be bound");
-        if let Some(existing) = meta.binding {
-            debug_assert_eq!(
-                existing, binding,
-                "a repeated prepare must report the same binding"
-            );
-            return;
-        }
-        meta.binding = Some(binding);
+        debug_assert!(
+            meta.connected,
+            "a disconnected participant cannot materialize"
+        );
+        meta.materialized = true;
     }
 
     /// The transport route to retire when this participant goes away.
@@ -130,15 +117,12 @@ impl RoomRegistry {
     pub fn disconnect_participant(
         &mut self,
         participant_id: &ParticipantId,
-    ) -> Option<(
-        ShardId,
-        Option<NodeTransportAddress>,
-        Option<ParticipantKey>,
-    )> {
+    ) -> Option<(ShardId, Option<NodeTransportAddress>)> {
         let (result, room_id, shard_id) = {
             let meta = self.participants.get_mut(participant_id)?;
-            let result = (meta.shard_id, meta.transport.take(), meta.binding.take());
+            let result = (meta.shard_id, meta.transport.take());
             meta.connected = false;
+            meta.materialized = false;
             (result, meta.room_id, meta.shard_id)
         };
         self.remove_from_room(&room_id, participant_id, shard_id);
@@ -296,24 +280,5 @@ mod tests {
         reg.remove_participant(&pid1);
         assert!(reg.get_room(&rid1).is_none());
         assert!(reg.get_room(&rid2).is_some());
-    }
-
-    /// A repeated prepare must report the same key rather than minting a
-    /// second endpoint for the same participant.
-    #[test]
-    fn binding_a_participant_twice_keeps_the_first_key() {
-        use slotmap::KeyData;
-        let mut reg = RoomRegistry::new();
-        let participant = participant_id();
-        reg.add_participant(participant, room_id("bind-twice"), ShardId::new(0), None);
-
-        let first = ParticipantKey::from(KeyData::from_ffi(1 | (1 << 32)));
-        reg.bind_participant(&participant, first);
-        reg.bind_participant(&participant, first);
-
-        assert_eq!(
-            reg.get_participant(&participant).and_then(|m| m.binding),
-            Some(first)
-        );
     }
 }

@@ -154,7 +154,6 @@ pub(crate) enum ShardError {
 #[derive(Debug)]
 pub(crate) enum ShardCommand {
     MaterializeParticipant {
-        key: crate::shard::participants::ParticipantKey,
         transport: crate::route::NodeTransportAddress,
         config: Box<ParticipantConfig>,
         ack: tokio::sync::oneshot::Sender<bool>,
