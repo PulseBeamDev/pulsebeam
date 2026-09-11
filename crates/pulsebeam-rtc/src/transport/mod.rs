@@ -466,6 +466,17 @@ impl Transport {
         &self.local_fingerprint
     }
 
+    #[cfg(test)]
+    fn negotiated_security(
+        &self,
+    ) -> Option<(
+        str0m::crypto::dtls::ProtocolVersion,
+        str0m::crypto::dtls::SrtpProfile,
+    )> {
+        let dtls = self.dtls.as_ref()?;
+        Some((dtls.protocol_version()?, dtls.negotiated_profile()?))
+    }
+
     pub(crate) fn next_deadline(&self) -> Option<Instant> {
         if matches!(
             self.state,
@@ -1890,6 +1901,14 @@ mod tests {
         .expect("right transport");
         let mut now = Instant::now();
         connect(&mut left, &mut right, &mut now);
+        assert_eq!(
+            left.negotiated_security(),
+            Some((
+                str0m::crypto::dtls::ProtocolVersion::DTLS1_3,
+                str0m::crypto::dtls::SrtpProfile::AEAD_AES_256_GCM,
+            ))
+        );
+        assert_eq!(left.negotiated_security(), right.negotiated_security());
         assert_eq!(left.next_deadline(), None);
         assert_eq!(right.next_deadline(), None);
 

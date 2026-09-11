@@ -462,6 +462,26 @@ fn extend_sequence(previous: Option<u64>, sequence: u16) -> u64 {
 mod tests {
     use super::*;
 
+    fn assert_profile_protects_media(profile: SrtpProfile) {
+        let provider = str0m::crypto::from_feature_flags();
+        let material = vec![7; profile.keying_material_len()];
+        let mut sender = SrtpLayer::new(KeyingMaterial::new(&material), profile, true, &provider)
+            .expect("sender profile");
+        let mut receiver =
+            SrtpLayer::new(KeyingMaterial::new(&material), profile, false, &provider)
+                .expect("receiver profile");
+        let rtp = [0x80, 96, 0, 1, 0, 0, 0, 1, 0, 0, 0, 7, 1, 2, 3];
+        let protected = sender.protect_rtp(&rtp).expect("protected RTP");
+        assert_ne!(protected, rtp);
+        assert_eq!(
+            receiver
+                .unprotect_rtp(&protected)
+                .expect("authenticated RTP")
+                .0,
+            rtp
+        );
+    }
+
     fn rtcp_header(ssrc: u32) -> [u8; 8] {
         let bytes = ssrc.to_be_bytes();
         [0x80, 201, 0, 1, bytes[0], bytes[1], bytes[2], bytes[3]]
@@ -481,5 +501,33 @@ mod tests {
             Ok(SRTCP_INDEX_MODULUS)
         );
         assert_eq!(raw_srtcp_index(0, &packet_b, &windows), Ok(0));
+    }
+
+    #[test]
+    fn modern_and_legacy_profiles_protect_media() {
+        assert_profile_protects_media(SrtpProfile::AEAD_AES_128_GCM);
+        assert_profile_protects_media(SrtpProfile::AES128_CM_SHA1_80);
+    }
+
+    #[test]
+    fn aead_128_outranks_legacy_and_legacy_remains_a_fallback() {
+        let select = |offered: &[SrtpProfile]| {
+            SrtpProfile::ALL
+                .iter()
+                .copied()
+                .find(|profile| offered.contains(profile))
+        };
+        assert_eq!(
+            select(&[
+                SrtpProfile::AES128_CM_SHA1_80,
+                SrtpProfile::AEAD_AES_128_GCM,
+            ]),
+            Some(SrtpProfile::AEAD_AES_128_GCM)
+        );
+        assert_eq!(
+            select(&[SrtpProfile::AES128_CM_SHA1_80]),
+            Some(SrtpProfile::AES128_CM_SHA1_80)
+        );
+        assert_eq!(select(&[]), None);
     }
 }

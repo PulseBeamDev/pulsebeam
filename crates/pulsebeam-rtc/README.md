@@ -98,6 +98,11 @@ parsing and must carry opaque or SFrame-protected media.
 * A fresh ephemeral DTLS identity is generated from caller-supplied
   cryptographic entropy for each connection. Its private key is neither exported
   nor reused.
+* DTLS 1.3 is preferred and negotiates `TLS_AES_128_GCM_SHA256` with capable
+  peers; DTLS 1.2 remains an in-handshake compatibility fallback. AEAD-GCM SRTP
+  profiles are preferred, with `SRTP_AEAD_AES_128_GCM` as the modern baseline.
+  `SRTP_AES128_CM_HMAC_SHA1_80` remains supported for compatibility and is never
+  preferred when a mutually supported AEAD-GCM profile is available.
 * Codecs and RTP header extensions are negotiated from SFU configuration.
 * Every accepted outbound RTP session, including audio-only RTP, requires one
   supported packet-feedback mode: transport-wide congestion-control feedback or
