@@ -3,7 +3,7 @@ import { DeviceSelector } from "./DeviceSelector";
 import { MediaPreview } from "./MediaPreview";
 import { Button, Card, CardContent, Input } from "./ui";
 import { useMediaDevices } from "@/hooks/media";
-import { defaultApiUrl } from "@/lib/config";
+import { defaultServerUrl } from "@/lib/config";
 import { normalizeEndpoint } from "@/lib/model";
 import { Radio, RefreshCw } from "lucide-react";
 
@@ -13,7 +13,7 @@ export function Lobby({
   onJoin(token: string, endpoint: string, stream: MediaStream): void;
 }) {
   const [token, setToken] = useState("");
-  const [apiURL, setApiURL] = useState(defaultApiUrl);
+  const [serverURL, setServerURL] = useState(defaultServerUrl);
   const videoRef = useRef<HTMLVideoElement>(null);
   const {
     stream,
@@ -30,7 +30,7 @@ export function Lobby({
     setVideoDeviceId,
     setAudioDeviceId,
   } = useMediaDevices();
-  const endpoint = normalizeEndpoint(apiURL);
+  const endpoint = normalizeEndpoint(serverURL);
   useEffect(() => {
     void startMedia();
   }, [startMedia]);
@@ -128,8 +128,8 @@ export function Lobby({
               </span>
               <Input
                 className="h-11 sm:h-9"
-                value={apiURL}
-                onChange={(event) => setApiURL(event.target.value)}
+                value={serverURL}
+                onChange={(event) => setServerURL(event.target.value)}
                 placeholder="https://demo.pulsebeam.dev"
                 inputMode="url"
                 spellCheck={false}

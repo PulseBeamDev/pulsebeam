@@ -7,10 +7,11 @@
     "dev": "next dev",
     "build": "next build && pnpm run artifact",
     "start": "serve out",
-    "check": "pnpm run boundary && tsc --noEmit && eslint",
+    "check": "pnpm run boundary && pnpm run identity-contract && tsc --noEmit && eslint",
     "format": "prettier --write \"app/**/*.{css,ts,tsx}\" \"components/**/*.{ts,tsx}\" \"hooks/**/*.ts\" \"lib/**/*.ts\" \"scripts/**/*.mjs\" \"*.{json,mjs,ts}\"",
     "format:check": "prettier --check \"app/**/*.{css,ts,tsx}\" \"components/**/*.{ts,tsx}\" \"hooks/**/*.ts\" \"lib/**/*.ts\" \"scripts/**/*.mjs\" \"*.{json,mjs,ts}\"",
     "boundary": "node scripts/check-boundary.mjs",
+    "identity-contract": "node scripts/check-identity-contract.mjs",
     "artifact": "node scripts/check-artifact.mjs"
   },
   "dependencies": {

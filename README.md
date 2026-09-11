@@ -60,9 +60,14 @@ docker run --rm --net=host ghcr.io/pulsebeamdev/pulsebeam:pulsebeam-v0.4.5 --dev
 
 ### Step 2. Publish a video
 
-Run the following snippet in the browser console:
+Mint a development token, then paste it into the browser-console snippet below:
+
+```bash
+cargo run -q -p pulsebeam-cli -- token --room demo --participant publisher
+```
 
 ```javascript
+const token = "paste the development token here";
 const pc = new RTCPeerConnection();
 const stream = await navigator.mediaDevices.getUserMedia({ video: true });
 const transceiver = pc.addTransceiver("video", {
@@ -79,18 +84,23 @@ transceiver.sender.replaceTrack(stream.getVideoTracks()[0]);
 const offer = await pc.createOffer();
 await pc.setLocalDescription(offer);
 
-const res = await fetch("http://localhost:7070/api/v1/rooms/demo/participants", {
+const res = await fetch("http://localhost:7070/api/v1/native", {
   method: "POST",
-  headers: { "Content-Type": "application/sdp" },
-  body: offer.sdp,
+  headers: {
+    Authorization: `Bearer ${token}`,
+    "Content-Type": "application/json",
+  },
+  body: JSON.stringify({ offer: offer.sdp, manual: true }),
 });
 
-await pc.setRemoteDescription({ type: "answer", sdp: await res.text() });
+const session = await res.json();
+await pc.setRemoteDescription({ type: "answer", sdp: session.answer });
 ```
 
 ### Step 3. View the video stream
 
-Go to <https://codepen.io/lherman-cs/pen/pvgVZar>, then put "demo" as the room to connect to.
+Mint a second token with a distinct participant and connect another client to
+the same `demo` room.
 
 ## Profiling & Metrics
 

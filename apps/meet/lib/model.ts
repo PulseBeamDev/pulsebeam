@@ -2,8 +2,7 @@ export function normalizeEndpoint(input: string): string | null {
   try {
     const url = new URL(input);
     if (!/^https?:$/.test(url.protocol) || url.search || url.hash) return null;
-    let path = url.pathname.replace(/\/+$/, "");
-    if (path.endsWith("/api/v1")) path = path.slice(0, -7);
+    const path = url.pathname.replace(/\/+$/, "");
     return `${url.origin}${path}`;
   } catch {
     return null;

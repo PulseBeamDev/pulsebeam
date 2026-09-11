@@ -562,22 +562,8 @@ async fn spawn_agent(
     duration: Duration,
 ) -> Result<()> {
     let socket = UdpSocket::bind("0.0.0.0:0").await?;
-    let room = RoomExternalId::new(&room_name)?;
-    let participant = ParticipantExternalId::new(&format!("bench-{}", ctx.agent_id))?;
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-    let exp = now.saturating_add(duration.as_secs()).saturating_add(60);
-    let session = AgentConfig {
-        endpoint: ctx.api_url.clone(),
-        token: mint_development_token(&room, &participant, exp)?,
-        topology: MediaTopology {
-            local_video: vec!["camera".into()],
-            local_audio: vec!["microphone".into()],
-            remote_video: REMOTE_VIDEO_SLOTS,
-            remote_audio: REMOTE_AUDIO_SLOTS,
-        },
-        retry: Default::default(),
-        log_level: Default::default(),
-    };
+    let session = benchmark_agent_config(&ctx.api_url, &room_name, ctx.agent_id, duration, now)?;
     let mut config = Config::new(session);
     let encodings = if simulcast {
         vec![
@@ -706,6 +692,30 @@ async fn spawn_agent(
         );
     }
     Ok(())
+}
+
+fn benchmark_agent_config(
+    api_url: &str,
+    room_name: &str,
+    agent_id: usize,
+    duration: Duration,
+    now: u64,
+) -> Result<AgentConfig> {
+    let room = RoomExternalId::new(room_name)?;
+    let participant = ParticipantExternalId::new(&format!("bench-{agent_id}"))?;
+    let exp = now.saturating_add(duration.as_secs()).saturating_add(60);
+    Ok(AgentConfig {
+        endpoint: api_url.to_string(),
+        token: mint_development_token(&room, &participant, exp)?,
+        topology: MediaTopology {
+            local_video: vec!["camera".into()],
+            local_audio: vec!["microphone".into()],
+            remote_video: REMOTE_VIDEO_SLOTS,
+            remote_audio: REMOTE_AUDIO_SLOTS,
+        },
+        retry: Default::default(),
+        log_level: Default::default(),
+    })
 }
 
 async fn handle_receiving(
@@ -924,6 +934,17 @@ mod tests {
         }
     }
 
+    fn development_registry() -> ProjectRegistry {
+        ProjectRegistry::new(vec![ProjectKeys {
+            project_id: DEVELOPMENT_PROJECT_ID,
+            keys: vec![ProjectKey {
+                key_id: DEVELOPMENT_API_KEY_ID,
+                verifying_key: DEVELOPMENT_API_VERIFYING_KEY,
+            }],
+        }])
+        .unwrap()
+    }
+
     #[test]
     fn benchmark_arguments_keep_the_documented_surface() {
         let cli = Cli::try_parse_from([
@@ -950,6 +971,41 @@ mod tests {
     }
 
     #[test]
+    fn benchmark_participants_get_distinct_development_tokens() {
+        let duration = Duration::from_secs(120);
+        let alice = benchmark_agent_config(
+            "http://127.0.0.1:7070",
+            "bench-room-7",
+            7_000,
+            duration,
+            1_000,
+        )
+        .unwrap();
+        let bob = benchmark_agent_config(
+            "http://127.0.0.1:7070",
+            "bench-room-7",
+            7_001,
+            duration,
+            1_000,
+        )
+        .unwrap();
+
+        assert_eq!(alice.endpoint, "http://127.0.0.1:7070");
+        assert_ne!(alice.token, bob.token);
+        let alice_auth =
+            verify_participant_token(&development_registry(), &alice.token, 1_000).unwrap();
+        let bob_auth =
+            verify_participant_token(&development_registry(), &bob.token, 1_000).unwrap();
+        assert_eq!(alice_auth.room_external_id.as_str(), "bench-room-7");
+        assert_eq!(bob_auth.room_external_id.as_str(), "bench-room-7");
+        assert_eq!(alice_auth.participant_external_id.as_str(), "bench-7000");
+        assert_eq!(bob_auth.participant_external_id.as_str(), "bench-7001");
+        assert_ne!(alice_auth.participant_id, bob_auth.participant_id);
+        assert_eq!(alice_auth.expiry.unix_seconds(), 1_180);
+        assert_eq!(bob_auth.expiry.unix_seconds(), 1_180);
+    }
+
+    #[test]
     fn token_command_mints_only_the_development_profile() {
         let cli = Cli::try_parse_from([
             "pulsebeam-cli",
@@ -970,14 +1026,7 @@ mod tests {
             token,
             "eyJhbGciOiJFZERTQSIsImtpZCI6ImtpZF8wMDAwMDAwMDAwMVIwMTAwMDAwMDAwMDAwMDgiLCJ0eXAiOiJwYitqd3QifQ.eyJpc3MiOiJwXzAwMDAwMDAwMDAxUjAxMDAwMDAwMDAwMDAwNCIsImF1ZCI6InBiIiwic3ViIjoiYWxpY2UiLCJyb29tIjoiZ2VuZXJhbCIsImV4cCI6MjAwMH0.Bp8UJVINeP0cqUiG_0qSk4wjqDg5MGZqRcBel3Qy176HoTy0OQvTpTp5Uuav5k2Wlsgdd58rPt6DLiWVt0U1AQ"
         );
-        let registry = ProjectRegistry::new(vec![ProjectKeys {
-            project_id: DEVELOPMENT_PROJECT_ID,
-            keys: vec![ProjectKey {
-                key_id: DEVELOPMENT_API_KEY_ID,
-                verifying_key: DEVELOPMENT_API_VERIFYING_KEY,
-            }],
-        }])
-        .unwrap();
+        let registry = development_registry();
         assert!(verify_participant_token(&registry, &token, 1_999).is_ok());
 
         let default_cli = Cli::try_parse_from([
