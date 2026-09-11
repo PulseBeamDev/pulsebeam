@@ -9,7 +9,10 @@ use axum::{
     routing::{patch, post},
 };
 use axum_extra::{TypedHeader, headers::ContentType};
-use hyper::header::{ETAG, IF_MATCH, LOCATION};
+use hyper::header::{AUTHORIZATION, CONTENT_TYPE, ETAG, IF_MATCH, LOCATION, WWW_AUTHENTICATE};
+use pulsebeam_core::auth::{
+    ProjectRegistry, TokenError, VerifiedAuthorization, verify_participant_token,
+};
 use pulsebeam_runtime::mailbox::TrySendError;
 use serde::Serialize;
 use str0m::{change::SdpOffer, error::SdpError};
@@ -81,6 +84,10 @@ pub struct ApiConfig {
 /// Error type for api operations
 #[derive(thiserror::Error, Debug)]
 pub enum ApiError {
+    #[error("authorization bearer token required")]
+    AuthorizationRequired,
+    #[error(transparent)]
+    Authorization(#[from] TokenError),
     #[error("invalid entity id format: {0}")]
     IdValidation(#[from] IdValidationError),
     #[error("sdp offer is invalid: {0}")]
@@ -101,7 +108,40 @@ pub enum ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
+        if matches!(
+            &self,
+            ApiError::AuthorizationRequired | ApiError::Authorization(_)
+        ) {
+            #[derive(Serialize)]
+            struct Problem {
+                r#type: &'static str,
+                title: &'static str,
+                status: u16,
+            }
+
+            let challenge = if matches!(&self, ApiError::Authorization(_)) {
+                HeaderValue::from_static("Bearer error=\"invalid_token\"")
+            } else {
+                HeaderValue::from_static("Bearer")
+            };
+            let mut response = (
+                StatusCode::UNAUTHORIZED,
+                [(CONTENT_TYPE, "application/problem+json")],
+                axum::Json(Problem {
+                    r#type: "about:blank",
+                    title: "Unauthorized",
+                    status: StatusCode::UNAUTHORIZED.as_u16(),
+                }),
+            )
+                .into_response();
+            response.headers_mut().insert(WWW_AUTHENTICATE, challenge);
+            return response;
+        }
+
         let status = match self {
+            ApiError::AuthorizationRequired | ApiError::Authorization(_) => {
+                StatusCode::UNAUTHORIZED
+            }
             ApiError::IdValidation(_)
             | ApiError::OfferInvalid(_)
             | ApiError::JoinError(controller::ControllerError::OfferRejected(_))
@@ -120,6 +160,31 @@ impl IntoResponse for ApiError {
 
         (status, self.to_string()).into_response()
     }
+}
+
+#[allow(
+    dead_code,
+    reason = "JWT verification precedes the authenticated HTTP route families"
+)]
+pub(crate) fn verify_bearer(
+    headers: &HeaderMap,
+    registry: &ProjectRegistry,
+    now: u64,
+) -> Result<VerifiedAuthorization, ApiError> {
+    let mut values = headers.get_all(AUTHORIZATION).iter();
+    let value = values.next().ok_or(ApiError::AuthorizationRequired)?;
+    if values.next().is_some() {
+        return Err(TokenError::Malformed.into());
+    }
+    let value = value.to_str().map_err(|_| TokenError::Malformed)?;
+    let (scheme, token) = value.split_once(' ').ok_or(TokenError::Malformed)?;
+    if !scheme.eq_ignore_ascii_case("Bearer")
+        || token.is_empty()
+        || token.bytes().any(|byte| byte.is_ascii_whitespace())
+    {
+        return Err(TokenError::Malformed.into());
+    }
+    verify_participant_token(registry, token, now).map_err(Into::into)
 }
 
 /// Build an absolute URL for Location header
@@ -474,6 +539,33 @@ mod tests {
     // Convenience only: a test is not a shard, so nothing here is
     // cross-core. See crates/pulsebeam/docs/thread-per-core.md.
     use super::*;
+    use pulsebeam_core::{
+        auth::{
+            DEVELOPMENT_API_KEY_ID, DEVELOPMENT_API_VERIFYING_KEY, DEVELOPMENT_PROJECT_ID,
+            ProjectKey, ProjectKeys, mint_development_token,
+        },
+        identity::ParticipantExternalId,
+    };
+
+    fn auth_registry() -> ProjectRegistry {
+        ProjectRegistry::new(vec![ProjectKeys {
+            project_id: DEVELOPMENT_PROJECT_ID,
+            keys: vec![ProjectKey {
+                key_id: DEVELOPMENT_API_KEY_ID,
+                verifying_key: DEVELOPMENT_API_VERIFYING_KEY,
+            }],
+        }])
+        .unwrap()
+    }
+
+    fn authorization_headers(token: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+        );
+        headers
+    }
 
     fn cfg() -> ApiConfig {
         ApiConfig {
@@ -588,6 +680,68 @@ mod tests {
 
         for (error, want, why) in cases {
             assert_eq!(error.into_response().status(), want, "{why}");
+        }
+    }
+
+    #[test]
+    fn bearer_verification_uses_the_shared_profile_and_golden_key() {
+        let room = RoomExternalId::new("general").unwrap();
+        let participant = ParticipantExternalId::new("alice").unwrap();
+        let token = mint_development_token(&room, &participant, 2_000).unwrap();
+        let authorization =
+            verify_bearer(&authorization_headers(&token), &auth_registry(), 1_999).unwrap();
+
+        assert_eq!(authorization.project_id, DEVELOPMENT_PROJECT_ID);
+        assert_eq!(authorization.room_external_id, room);
+        assert_eq!(authorization.participant_external_id, participant);
+        assert!(!format!("{authorization:?}").contains(&token));
+    }
+
+    #[tokio::test]
+    async fn authorization_failures_are_secret_safe_rfc_9457_responses() {
+        let token = mint_development_token(
+            &RoomExternalId::new("general").unwrap(),
+            &ParticipantExternalId::new("alice").unwrap(),
+            2_000,
+        )
+        .unwrap();
+        let missing = verify_bearer(&HeaderMap::new(), &auth_registry(), 1_000).unwrap_err();
+        assert!(matches!(missing, ApiError::AuthorizationRequired));
+        let cases = [
+            (missing, "Bearer"),
+            (
+                verify_bearer(
+                    &authorization_headers("not-a-token"),
+                    &auth_registry(),
+                    1_000,
+                )
+                .unwrap_err(),
+                "Bearer error=\"invalid_token\"",
+            ),
+            (
+                verify_bearer(&authorization_headers(&token), &auth_registry(), 2_000).unwrap_err(),
+                "Bearer error=\"invalid_token\"",
+            ),
+            (
+                ApiError::Authorization(TokenError::Invalid),
+                "Bearer error=\"invalid_token\"",
+            ),
+        ];
+
+        for (error, challenge) in cases {
+            assert!(!format!("{error:?}").contains(&token));
+            let response = error.into_response();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            assert_eq!(response.headers()[WWW_AUTHENTICATE], challenge);
+            assert_eq!(response.headers()[CONTENT_TYPE], "application/problem+json");
+            let body = axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap();
+            let problem: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(problem["type"], "about:blank");
+            assert_eq!(problem["title"], "Unauthorized");
+            assert_eq!(problem["status"], 401);
+            assert!(!String::from_utf8(body.to_vec()).unwrap().contains(&token));
         }
     }
 

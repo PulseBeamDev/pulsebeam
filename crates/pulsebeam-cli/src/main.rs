@@ -21,6 +21,7 @@ use pulsebeam_agent_native::{
 use pulsebeam_agent_native::{clock::clock_anchor, wallclock_at};
 use pulsebeam_core::auth::{
     ApiSigningKey, PrivateSigningBundle, ProjectKey, ProjectKeys, ProjectRegistry,
+    mint_development_token,
 };
 use pulsebeam_core::identity::{
     ApiKeyId, AudioTrackId, DataTrackId, ParticipantExternalId, ParticipantId, ProjectId,
@@ -32,7 +33,7 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     sync::Arc,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tachyonix as mpsc;
 use tokio::sync::{broadcast, watch};
@@ -182,6 +183,8 @@ enum Commands {
         #[command(subcommand)]
         command: IdCommand,
     },
+    /// Mint a bearer token for a local development server
+    Token(TokenConfig),
 }
 
 #[derive(Args)]
@@ -195,6 +198,17 @@ struct AuthKeyConfig {
     /// New private signing bundle JSON output
     #[arg(long)]
     private_signing_bundle: PathBuf,
+}
+
+#[derive(Args)]
+struct TokenConfig {
+    #[arg(long)]
+    room: RoomExternalId,
+    #[arg(long)]
+    participant: ParticipantExternalId,
+    /// Token lifetime in seconds
+    #[arg(long, default_value_t = 3_600)]
+    ttl: u64,
 }
 
 #[derive(Subcommand)]
@@ -311,9 +325,29 @@ fn main() -> Result<()> {
                 run_bench(cli.api_url, config).await?;
             }
             Commands::Id { command } => println!("{}", derive_id(command)),
+            Commands::Token(config) => println!("{}", development_token(config)?),
         }
         anyhow::Ok(())
     })
+}
+
+fn development_token(config: TokenConfig) -> Result<String> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before the Unix epoch")?
+        .as_secs();
+    development_token_at(config, now)
+}
+
+fn development_token_at(config: TokenConfig, now: u64) -> Result<String> {
+    if config.ttl == 0 {
+        anyhow::bail!("--ttl must be greater than zero");
+    }
+    let exp = now
+        .checked_add(config.ttl)
+        .context("token expiration exceeds the supported timestamp range")?;
+    mint_development_token(&config.room, &config.participant, exp)
+        .context("cannot mint development token")
 }
 
 fn generate_auth_key(config: AuthKeyConfig) -> Result<()> {
@@ -862,6 +896,10 @@ mod tests {
     use super::*;
     use clap::Parser;
     use pulsebeam_agent_native::agent_core::Publication;
+    use pulsebeam_core::auth::{
+        DEVELOPMENT_API_KEY_ID, DEVELOPMENT_API_VERIFYING_KEY, DEVELOPMENT_PROJECT_ID, ProjectKey,
+        ProjectKeys, verify_participant_token,
+    };
 
     fn auth_paths(label: &str) -> (PathBuf, PathBuf) {
         let suffix = ApiKeyId::new().as_str();
@@ -907,6 +945,81 @@ mod tests {
         assert_eq!(config.users_per_room, 3);
         assert_eq!(config.max_rooms, 8);
         assert!(config.simulcast);
+    }
+
+    #[test]
+    fn token_command_mints_only_the_development_profile() {
+        let cli = Cli::try_parse_from([
+            "pulsebeam-cli",
+            "token",
+            "--room",
+            "general",
+            "--participant",
+            "alice",
+            "--ttl",
+            "1000",
+        ])
+        .unwrap();
+        let Commands::Token(config) = cli.command else {
+            panic!("token command must parse as token");
+        };
+        let token = development_token_at(config, 1_000).unwrap();
+        assert_eq!(
+            token,
+            "eyJhbGciOiJFZERTQSIsImtpZCI6ImtpZF8wMDAwMDAwMDAwMVIwMTAwMDAwMDAwMDAwMDgiLCJ0eXAiOiJwYitqd3QifQ.eyJpc3MiOiJwXzAwMDAwMDAwMDAxUjAxMDAwMDAwMDAwMDAwNCIsImF1ZCI6InBiIiwic3ViIjoiYWxpY2UiLCJyb29tIjoiZ2VuZXJhbCIsImV4cCI6MjAwMH0.Bp8UJVINeP0cqUiG_0qSk4wjqDg5MGZqRcBel3Qy176HoTy0OQvTpTp5Uuav5k2Wlsgdd58rPt6DLiWVt0U1AQ"
+        );
+        let registry = ProjectRegistry::new(vec![ProjectKeys {
+            project_id: DEVELOPMENT_PROJECT_ID,
+            keys: vec![ProjectKey {
+                key_id: DEVELOPMENT_API_KEY_ID,
+                verifying_key: DEVELOPMENT_API_VERIFYING_KEY,
+            }],
+        }])
+        .unwrap();
+        assert!(verify_participant_token(&registry, &token, 1_999).is_ok());
+
+        let default_cli = Cli::try_parse_from([
+            "pulsebeam-cli",
+            "token",
+            "--room",
+            "general",
+            "--participant",
+            "alice",
+        ])
+        .unwrap();
+        let Commands::Token(config) = default_cli.command else {
+            panic!("token command must parse as token");
+        };
+        assert_eq!(config.ttl, 3_600);
+        assert!(
+            Cli::try_parse_from([
+                "pulsebeam-cli",
+                "token",
+                "--room",
+                "general",
+                "--participant",
+                "alice",
+                "--signing-key",
+                "secret",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn token_command_rejects_zero_or_overflowing_ttl() {
+        let config = TokenConfig {
+            room: RoomExternalId::new("general").unwrap(),
+            participant: ParticipantExternalId::new("alice").unwrap(),
+            ttl: 0,
+        };
+        assert!(development_token_at(config, 1_000).is_err());
+        let config = TokenConfig {
+            room: RoomExternalId::new("general").unwrap(),
+            participant: ParticipantExternalId::new("alice").unwrap(),
+            ttl: 1,
+        };
+        assert!(development_token_at(config, u64::MAX).is_err());
     }
 
     #[test]

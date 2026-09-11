@@ -17,6 +17,16 @@ pulsebeam-cli auth-key \
 Pass `--project-id p_0...` to generate a rotation key for an existing project.
 Both outputs must be new files; the private output is owner-only on Unix.
 
+For a local `pulsebeam --dev` server, mint a one-hour development bearer token
+with fixed development credentials:
+
+```text
+pulsebeam-cli token --room general --participant alice
+```
+
+Use `--ttl SECONDS` to select a different positive lifetime. This command does
+not accept production signing material.
+
 Canonical entity IDs can be derived for log lookup with `id room`,
 `id participant`, and `id track`. Each command requires a canonical
 `--project-id` and the external identity chain for the requested entity.
