@@ -5,7 +5,7 @@ use alloc::{
 };
 use core::time::Duration;
 
-use crate::{Generation, HttpHeader, TopicNotification, TopicRegistrations, TopicSnapshot};
+use crate::{Generation, TopicNotification, TopicRegistrations, TopicSnapshot};
 
 pub const MAX_LOCAL_VIDEO_SLOTS: usize = 2;
 pub const MAX_LOCAL_AUDIO_SLOTS: usize = 2;
@@ -14,15 +14,26 @@ pub const MAX_REMOTE_AUDIO_SLOTS: u8 = 3;
 pub const MAX_MID_BYTES: usize = 16;
 pub const MAX_PLAYOUT_DELAY_MS: u32 = 40_950;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct AgentConfig {
     pub endpoint: String,
-    pub room_id: String,
-    pub request_headers: Vec<HttpHeader>,
+    pub token: String,
     pub topology: MediaTopology,
-    pub manual_subscriptions: bool,
     pub retry: RetryPolicy,
     pub log_level: LogLevel,
+}
+
+impl core::fmt::Debug for AgentConfig {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("AgentConfig")
+            .field("endpoint", &self.endpoint)
+            .field("token", &"[REDACTED]")
+            .field("topology", &self.topology)
+            .field("retry", &self.retry)
+            .field("log_level", &self.log_level)
+            .finish()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
@@ -273,6 +284,8 @@ pub enum Notification {
 pub enum ValidationError {
     #[error("endpoint must be an absolute HTTP(S) URL")]
     Endpoint,
+    #[error("token must be a non-empty HTTP bearer value")]
+    Token,
     #[error("{field} is invalid")]
     Identifier { field: &'static str },
     #[error("duplicate {field}: {value}")]
@@ -293,8 +306,6 @@ pub enum ValidationError {
     PlayoutDelay,
     #[error("retry policy is invalid")]
     RetryPolicy,
-    #[error("request header is invalid or protocol-owned: {0}")]
-    RequestHeader(String),
     #[error("topic name is invalid: {0}")]
     Topic(String),
     #[error("topic publisher scope is invalid: {0}")]
@@ -320,9 +331,13 @@ impl AgentConfig {
         {
             return Err(ValidationError::Endpoint);
         }
-        validate_identifier("room_id", &self.room_id, 256, false)?;
-        for header in &self.request_headers {
-            validate_request_header(header)?;
+        if self.token.is_empty()
+            || self
+                .token
+                .bytes()
+                .any(|byte| !(b'!'..=b'~').contains(&byte))
+        {
+            return Err(ValidationError::Token);
         }
         self.topology.validate()?;
         if self.retry.maximum_attempts == 0
@@ -333,46 +348,6 @@ impl AgentConfig {
         }
         Ok(())
     }
-}
-
-fn validate_request_header(header: &HttpHeader) -> Result<(), ValidationError> {
-    let name = header.name.as_str();
-    let protocol_owned = ["content-type", "content-length", "host", "if-match"];
-    let valid_name = !name.is_empty()
-        && name.is_ascii()
-        && name.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric()
-                || matches!(
-                    byte,
-                    b'!' | b'#'
-                        | b'$'
-                        | b'%'
-                        | b'&'
-                        | b'\''
-                        | b'*'
-                        | b'+'
-                        | b'-'
-                        | b'.'
-                        | b'^'
-                        | b'_'
-                        | b'`'
-                        | b'|'
-                        | b'~'
-                )
-        });
-    let valid_value = header
-        .value
-        .bytes()
-        .all(|byte| byte == b'\t' || (b' '..=b'~').contains(&byte));
-    if !valid_name
-        || !valid_value
-        || protocol_owned
-            .iter()
-            .any(|owned| name.eq_ignore_ascii_case(owned))
-    {
-        return Err(ValidationError::RequestHeader(header.name.clone()));
-    }
-    Ok(())
 }
 
 impl MediaTopology {

@@ -17,7 +17,6 @@ pub struct HttpHeader {
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum HttpMethod {
     Post,
-    Patch,
     Delete,
 }
 

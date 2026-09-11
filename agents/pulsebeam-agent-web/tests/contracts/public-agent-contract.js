@@ -4,17 +4,16 @@ globalThis.__pulsebeamPublic = (async () => {
   const consoleWarn = console.warn;
   console.warn = (...values) => warnings.push(values.map(String).join(" "));
   let endpointReads = 0;
-  let roomReads = 0;
+  let tokenReads = 0;
   const config = {
     get endpoint() {
       endpointReads += 1;
       return location.origin;
     },
-    get roomId() {
-      roomReads += 1;
-      return "contract";
+    get token() {
+      tokenReads += 1;
+      return "contract-token";
     },
-    requestHeaders: { "x-contract": "public-agent" },
     topology: {
       localVideo: ["camera"],
       localAudio: ["microphone"],
@@ -26,12 +25,12 @@ globalThis.__pulsebeamPublic = (async () => {
   const first = window.pulsebeam.createAgent(config);
   const second = window.pulsebeam.createAgent({
     endpoint: location.origin,
-    roomId: "closed",
+    token: "closed-token",
     topology: {},
   });
   const silent = window.pulsebeam.createAgent({
     endpoint: location.origin,
-    roomId: "silent",
+    token: "silent-token",
     topology: {},
     logging: { level: "off" },
   });
@@ -168,7 +167,7 @@ globalThis.__pulsebeamPublic = (async () => {
   return {
     exports,
     independent: first !== second,
-    configCopied: endpointReads === 1 && roomReads === 1,
+    configCopied: endpointReads === 1 && tokenReads === 1,
     initialStable,
     initialFrozen,
     initial: initial.connection,

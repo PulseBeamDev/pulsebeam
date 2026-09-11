@@ -72,51 +72,6 @@ const stringConverter = (() => {
 })();
 const FfiConverterString = uniffiCreateFfiConverterString(stringConverter);
 
-export type HttpHeader = {
-  name: string;
-  value: string;
-};
-
-/**
- * Generated factory for {@link HttpHeader} record objects.
- */
-export const HttpHeader = (() => {
-  const defaults = () => ({});
-  const create = (() => {
-    return uniffiCreateRecord<HttpHeader, ReturnType<typeof defaults>>(
-      defaults,
-    );
-  })();
-  return Object.freeze({
-    create,
-    new: create,
-    defaults: () => Object.freeze(defaults()) as Partial<HttpHeader>,
-  });
-})();
-
-const FfiConverterTypeHttpHeader = (() => {
-  type TypeName = HttpHeader;
-  class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
-    readFromCursor(c: Cursor): TypeName {
-      return {
-        name: FfiConverterString.readFromCursor(c),
-        value: FfiConverterString.readFromCursor(c),
-      };
-    }
-    writeIntoCursor(value: TypeName, c: Cursor): void {
-      FfiConverterString.writeIntoCursor(value.name, c);
-      FfiConverterString.writeIntoCursor(value.value, c);
-    }
-    allocationSize(value: TypeName): number {
-      return (
-        FfiConverterString.allocationSize(value.name) +
-        FfiConverterString.allocationSize(value.value)
-      );
-    }
-  }
-  return new FFIConverter();
-})();
-
 export type MediaTopology = {
   localVideo: Array<string>;
   localAudio: Array<string>;
@@ -219,13 +174,65 @@ const FfiConverterTypeRetryPolicy = (() => {
   return new FFIConverter();
 })();
 
+export enum LogLevel {
+  Off,
+  Error,
+  Warn,
+  Info,
+  Debug,
+  Trace,
+}
+
+const FfiConverterTypeLogLevel = (() => {
+  type TypeName = LogLevel;
+  class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
+    readFromCursor(c: Cursor): TypeName {
+      switch (c.readI32()) {
+        case 1:
+          return LogLevel.Off;
+        case 2:
+          return LogLevel.Error;
+        case 3:
+          return LogLevel.Warn;
+        case 4:
+          return LogLevel.Info;
+        case 5:
+          return LogLevel.Debug;
+        case 6:
+          return LogLevel.Trace;
+        default:
+          throw new UniffiInternalError.UnexpectedEnumCase();
+      }
+    }
+    writeIntoCursor(value: TypeName, c: Cursor): void {
+      switch (value) {
+        case LogLevel.Off:
+          return c.writeI32(1);
+        case LogLevel.Error:
+          return c.writeI32(2);
+        case LogLevel.Warn:
+          return c.writeI32(3);
+        case LogLevel.Info:
+          return c.writeI32(4);
+        case LogLevel.Debug:
+          return c.writeI32(5);
+        case LogLevel.Trace:
+          return c.writeI32(6);
+      }
+    }
+    allocationSize(value: TypeName): number {
+      return 4;
+    }
+  }
+  return new FFIConverter();
+})();
+
 export type AgentConfig = {
   endpoint: string;
-  roomId: string;
-  requestHeaders: Array<HttpHeader>;
+  token: string;
   topology: MediaTopology;
-  manualSubscriptions: boolean;
   retry: RetryPolicy;
+  logLevel: LogLevel;
 };
 
 /**
@@ -251,34 +258,26 @@ const FfiConverterTypeAgentConfig = (() => {
     readFromCursor(c: Cursor): TypeName {
       return {
         endpoint: FfiConverterString.readFromCursor(c),
-        roomId: FfiConverterString.readFromCursor(c),
-        requestHeaders: FfiConverterSequenceTypeHttpHeader.readFromCursor(c),
+        token: FfiConverterString.readFromCursor(c),
         topology: FfiConverterTypeMediaTopology.readFromCursor(c),
-        manualSubscriptions: FfiConverterBool.readFromCursor(c),
         retry: FfiConverterTypeRetryPolicy.readFromCursor(c),
+        logLevel: FfiConverterTypeLogLevel.readFromCursor(c),
       };
     }
     writeIntoCursor(value: TypeName, c: Cursor): void {
       FfiConverterString.writeIntoCursor(value.endpoint, c);
-      FfiConverterString.writeIntoCursor(value.roomId, c);
-      FfiConverterSequenceTypeHttpHeader.writeIntoCursor(
-        value.requestHeaders,
-        c,
-      );
+      FfiConverterString.writeIntoCursor(value.token, c);
       FfiConverterTypeMediaTopology.writeIntoCursor(value.topology, c);
-      FfiConverterBool.writeIntoCursor(value.manualSubscriptions, c);
       FfiConverterTypeRetryPolicy.writeIntoCursor(value.retry, c);
+      FfiConverterTypeLogLevel.writeIntoCursor(value.logLevel, c);
     }
     allocationSize(value: TypeName): number {
       return (
         FfiConverterString.allocationSize(value.endpoint) +
-        FfiConverterString.allocationSize(value.roomId) +
-        FfiConverterSequenceTypeHttpHeader.allocationSize(
-          value.requestHeaders,
-        ) +
+        FfiConverterString.allocationSize(value.token) +
         FfiConverterTypeMediaTopology.allocationSize(value.topology) +
-        FfiConverterBool.allocationSize(value.manualSubscriptions) +
-        FfiConverterTypeRetryPolicy.allocationSize(value.retry)
+        FfiConverterTypeRetryPolicy.allocationSize(value.retry) +
+        FfiConverterTypeLogLevel.allocationSize(value.logLevel)
       );
     }
   }
@@ -3273,11 +3272,6 @@ const FfiConverterTypeNotification = (() => {
   return new FFIConverter();
 })();
 
-// FfiConverter for Array<HttpHeader>
-const FfiConverterSequenceTypeHttpHeader = new FfiConverterArray(
-  FfiConverterTypeHttpHeader,
-);
-
 // FfiConverter for Array<string>
 const FfiConverterSequenceString = new FfiConverterArray(FfiConverterString);
 
@@ -3410,7 +3404,7 @@ export default Object.freeze({
     FfiConverterTypeErrorCode,
     FfiConverterTypeFailure,
     FfiConverterTypeFailureClass,
-    FfiConverterTypeHttpHeader,
+    FfiConverterTypeLogLevel,
     FfiConverterTypeMediaFrame,
     FfiConverterTypeMediaKind,
     FfiConverterTypeMediaTopology,

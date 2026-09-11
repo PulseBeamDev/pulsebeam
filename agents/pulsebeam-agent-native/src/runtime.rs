@@ -944,7 +944,7 @@ impl Actor {
         let mut reverse_mids = HashMap::new();
         let mut packetizers = BTreeMap::new();
         for slot in topology_slots(topology) {
-            let (kind, direction, simulcast) = self.media_description(&slot);
+            let (kind, direction, simulcast) = media_description(&self.config, &slot);
             let mid = sdp.add_media(kind, direction, None, None, simulcast.clone());
             mids.insert(slot.clone(), mid);
             reverse_mids.insert(mid, slot.clone());
@@ -1007,27 +1007,6 @@ impl Actor {
             timeout: None,
         };
         Ok((peer, offer.to_sdp_string(), resources))
-    }
-
-    fn media_description(&self, slot: &MediaSlot) -> (MediaKind, Direction, Option<Simulcast>) {
-        match slot {
-            MediaSlot::LocalVideo(name) => {
-                let simulcast = self
-                    .config
-                    .video_encodings
-                    .get(name)
-                    .filter(|layers| !layers.is_empty())
-                    .cloned()
-                    .map(|send| Simulcast {
-                        send,
-                        recv: Vec::new(),
-                    });
-                (MediaKind::Video, Direction::SendOnly, simulcast)
-            }
-            MediaSlot::LocalAudio(_) => (MediaKind::Audio, Direction::SendOnly, None),
-            MediaSlot::RemoteVideo(_) => (MediaKind::Video, Direction::RecvOnly, None),
-            MediaSlot::RemoteAudio(_) => (MediaKind::Audio, Direction::RecvOnly, None),
-        }
     }
 
     fn execute_http(&mut self, effect: HttpEffect) -> Result<(), Error> {
@@ -1580,10 +1559,32 @@ fn channel_config(spec: &DataChannelSpec) -> ChannelConfig {
     }
 }
 
+fn media_description(
+    config: &Config,
+    slot: &MediaSlot,
+) -> (MediaKind, Direction, Option<Simulcast>) {
+    match slot {
+        MediaSlot::LocalVideo(name) => {
+            let simulcast = config
+                .video_encodings
+                .get(name)
+                .filter(|layers| !layers.is_empty())
+                .cloned()
+                .map(|send| Simulcast {
+                    send,
+                    recv: Vec::new(),
+                });
+            (MediaKind::Video, Direction::SendOnly, simulcast)
+        }
+        MediaSlot::LocalAudio(_) => (MediaKind::Audio, Direction::SendOnly, None),
+        MediaSlot::RemoteVideo(_) => (MediaKind::Video, Direction::RecvOnly, None),
+        MediaSlot::RemoteAudio(_) => (MediaKind::Audio, Direction::RecvOnly, None),
+    }
+}
+
 fn http_request(request: agent_core::HttpRequest) -> Result<http::Request<Vec<u8>>, Error> {
     let method = match request.method {
         HttpMethod::Post => http::Method::POST,
-        HttpMethod::Patch => http::Method::PATCH,
         HttpMethod::Delete => http::Method::DELETE,
     };
     let mut builder = http::Request::builder().method(method).uri(request.uri);
@@ -1610,15 +1611,13 @@ mod tests {
     fn config() -> Config {
         let session = agent_core::AgentConfig {
             endpoint: "http://pulsebeam.test".into(),
-            room_id: "room".into(),
-            request_headers: Vec::new(),
+            token: "token".into(),
             topology: agent_core::MediaTopology {
                 local_video: vec!["camera".into()],
                 local_audio: vec!["microphone".into()],
                 remote_video: 1,
                 remote_audio: 1,
             },
-            manual_subscriptions: true,
             retry: agent_core::RetryPolicy::default(),
             log_level: agent_core::LogLevel::default(),
         };
@@ -1662,6 +1661,25 @@ mod tests {
                 MediaSlot::LocalAudio("microphone".into()),
                 MediaSlot::RemoteVideo(0),
                 MediaSlot::RemoteAudio(0),
+            ]
+        );
+    }
+
+    #[test]
+    fn every_rtp_slot_is_unidirectional() {
+        let config = config();
+        let directions: Vec<_> = topology_slots(&config.session.topology)
+            .iter()
+            .map(|slot| media_description(&config, slot).1)
+            .collect();
+
+        assert_eq!(
+            directions,
+            vec![
+                Direction::SendOnly,
+                Direction::SendOnly,
+                Direction::RecvOnly,
+                Direction::RecvOnly,
             ]
         );
     }

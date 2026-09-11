@@ -8,12 +8,6 @@ use crate as model;
 
 uniffi::setup_scaffolding!();
 
-#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
-pub struct HttpHeader {
-    pub name: String,
-    pub value: String,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct RetryPolicy {
     pub initial_delay_ms: u64,
@@ -39,15 +33,26 @@ pub struct MediaTopology {
     pub remote_audio: u8,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+#[derive(Clone, PartialEq, Eq, uniffi::Record)]
 pub struct AgentConfig {
     pub endpoint: String,
-    pub room_id: String,
-    pub request_headers: Vec<HttpHeader>,
+    pub token: String,
     pub topology: MediaTopology,
-    pub manual_subscriptions: bool,
     pub retry: RetryPolicy,
     pub log_level: LogLevel,
+}
+
+impl core::fmt::Debug for AgentConfig {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("AgentConfig")
+            .field("endpoint", &self.endpoint)
+            .field("token", &"[REDACTED]")
+            .field("topology", &self.topology)
+            .field("retry", &self.retry)
+            .field("log_level", &self.log_level)
+            .finish()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, uniffi::Enum)]
@@ -378,10 +383,8 @@ impl AgentConfig {
     pub fn into_core(self) -> Result<model::AgentConfig, AgentError> {
         let mut config = model::AgentConfig {
             endpoint: self.endpoint,
-            room_id: self.room_id,
-            request_headers: self.request_headers.into_iter().map(Into::into).collect(),
+            token: self.token,
             topology: self.topology.into(),
-            manual_subscriptions: self.manual_subscriptions,
             retry: self.retry.into(),
             log_level: self.log_level.into(),
         };
@@ -444,24 +447,6 @@ impl From<model::DesiredState> for DesiredState {
     }
 }
 
-impl From<HttpHeader> for model::HttpHeader {
-    fn from(value: HttpHeader) -> Self {
-        Self {
-            name: value.name,
-            value: value.value,
-        }
-    }
-}
-
-impl From<model::HttpHeader> for HttpHeader {
-    fn from(value: model::HttpHeader) -> Self {
-        Self {
-            name: value.name,
-            value: value.value,
-        }
-    }
-}
-
 impl From<RetryPolicy> for model::RetryPolicy {
     fn from(value: RetryPolicy) -> Self {
         Self {
@@ -508,10 +493,8 @@ impl From<model::AgentConfig> for AgentConfig {
     fn from(value: model::AgentConfig) -> Self {
         Self {
             endpoint: value.endpoint,
-            room_id: value.room_id,
-            request_headers: value.request_headers.into_iter().map(Into::into).collect(),
+            token: value.token,
             topology: value.topology.into(),
-            manual_subscriptions: value.manual_subscriptions,
             retry: value.retry.into(),
             log_level: value.log_level.into(),
         }
@@ -1008,18 +991,13 @@ mod tests {
     fn config() -> AgentConfig {
         AgentConfig {
             endpoint: "https://sfu.example.com/".to_string(),
-            room_id: "room".to_string(),
-            request_headers: vec![HttpHeader {
-                name: "Authorization".to_string(),
-                value: "Bearer private".to_string(),
-            }],
+            token: "private".to_string(),
             topology: MediaTopology {
                 local_video: vec!["camera".to_string()],
                 local_audio: vec!["microphone".to_string()],
                 remote_video: 2,
                 remote_audio: 1,
             },
-            manual_subscriptions: true,
             retry: RetryPolicy::default(),
             log_level: LogLevel::default(),
         }
@@ -1028,6 +1006,9 @@ mod tests {
     #[test]
     fn config_round_trip_preserves_the_portable_contract() {
         let original = config();
+        let debug = alloc::format!("{original:?}");
+        assert!(!debug.contains("private"));
+        assert!(debug.contains("[REDACTED]"));
         let core = original.clone().into_core().expect("valid boundary config");
         assert_eq!(core.endpoint, "https://sfu.example.com");
         let mut normalized = original;
@@ -1204,10 +1185,6 @@ mod tests {
             channel_failures: 1,
         };
 
-        assert_ffi_round_trip(HttpHeader {
-            name: "X-Test".to_string(),
-            value: "value".to_string(),
-        });
         assert_ffi_round_trip(RetryPolicy::default());
         assert_ffi_round_trip(config().topology);
         assert_ffi_round_trip(config());

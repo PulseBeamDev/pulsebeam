@@ -6,7 +6,7 @@
 
   const runtime = new BrowserRuntime({
     endpoint: location.origin,
-    roomId: "runtime-local-operation-contract",
+    token: "runtime-local-operation-contract",
     topology: { localVideo: ["camera"] },
   });
   runtime.connect();

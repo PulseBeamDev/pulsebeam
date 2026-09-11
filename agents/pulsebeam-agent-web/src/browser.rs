@@ -39,9 +39,7 @@ const LOG_TARGET: &str = "pulsebeam_agent_web::browser";
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct RuntimeConfig {
     endpoint: String,
-    room_id: String,
-    #[serde(default)]
-    request_headers: BTreeMap<String, String>,
+    token: String,
     topology: TopologyConfig,
     #[serde(default)]
     log_level: LogLevel,
@@ -413,11 +411,6 @@ impl BrowserRuntime {
     pub fn new(config: JsValue) -> Result<BrowserRuntime, JsValue> {
         let config: RuntimeConfig = serde_wasm_bindgen::from_value(config)
             .map_err(|error| js_error(format!("invalid browser runtime config: {error}")))?;
-        let request_headers = config
-            .request_headers
-            .into_iter()
-            .map(|(name, value)| HttpHeader { name, value })
-            .collect();
         let topology = MediaTopology {
             local_video: config.topology.local_video,
             local_audio: config.topology.local_audio,
@@ -444,10 +437,8 @@ impl BrowserRuntime {
             .collect();
         let core_config = AgentConfig {
             endpoint: config.endpoint,
-            room_id: config.room_id,
-            request_headers,
+            token: config.token,
             topology,
-            manual_subscriptions: true,
             retry: RetryPolicy::default(),
             log_level: config.log_level.into(),
         };
@@ -1778,7 +1769,6 @@ fn browser_request(
     let init = RequestInit::new();
     let method = match request.method {
         HttpMethod::Post => "POST",
-        HttpMethod::Patch => "PATCH",
         HttpMethod::Delete => "DELETE",
     };
     init.set_method(method);
@@ -1806,7 +1796,7 @@ async fn fetch(request: Request) -> Result<HttpResponse, String> {
         .dyn_into()
         .map_err(|value| format!("fetch returned a non-Response value: {}", js_message(value)))?;
     let mut headers = Vec::new();
-    for name in ["location", "etag", "pb-participant-id", "content-type"] {
+    for name in ["location", "content-type"] {
         if let Some(value) = response.headers().get(name).map_err(js_message)? {
             headers.push(HttpHeader {
                 name: name.to_owned(),

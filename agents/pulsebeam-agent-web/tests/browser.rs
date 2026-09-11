@@ -1,5 +1,9 @@
 mod support;
 
+use pulsebeam_core::{
+    auth::mint_development_token,
+    identity::{ParticipantExternalId, RoomExternalId},
+};
 use serde::Deserialize;
 use std::error::Error;
 use std::path::PathBuf;
@@ -224,12 +228,23 @@ async fn public_agent_connects_and_delivers_remote_media() -> TestResult<()> {
     let _destination = DestinationServer::start()?;
     let server = StaticServer::start(root()).await?;
     let url = server.url("tests/fixture.html");
+    let room = RoomExternalId::new("public-web-contract")?;
+    let sender =
+        mint_development_token(&room, &ParticipantExternalId::new("web-sender")?, u64::MAX)?;
+    let receiver = mint_development_token(
+        &room,
+        &ParticipantExternalId::new("web-receiver")?,
+        u64::MAX,
+    )?;
+    let live = LIVE
+        .replace("__SENDER_TOKEN__", &sender)
+        .replace("__RECEIVER_TOKEN__", &receiver);
     run_browser_test(WebDriver::managed(capabilities()?), |driver| async move {
         let bidi = driver.bidi().await?;
         let context = bidi.browsing_context().top_level().await?;
         navigate(&bidi, &context, url).await?;
         let _: () = evaluate_json(&bidi, &context, LOAD).await?;
-        let r: Live = evaluate_json(&bidi, &context, LIVE).await?;
+        let r: Live = evaluate_json(&bidi, &context, &live).await?;
         assert!(
             r.connected
                 && r.discovered

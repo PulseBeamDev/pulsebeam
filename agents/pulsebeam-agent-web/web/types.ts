@@ -17,8 +17,8 @@ export interface MediaTopology {
 export interface AgentConfig {
   /** Absolute HTTP(S) server endpoint. Core appends `/api/v1`. */
   readonly endpoint: string;
-  readonly roomId: string;
-  readonly requestHeaders?: Readonly<Record<string, string>>;
+  /** Opaque bearer token issued by the application backend. */
+  readonly token: string;
   readonly topology: MediaTopology;
   readonly logging?: AgentLogging;
 }

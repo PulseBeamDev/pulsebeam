@@ -1,7 +1,7 @@
 new Promise((resolve, reject) => {
   const agent = window.pulsebeam.createAgent({
     endpoint: location.origin,
-    roomId: "room",
+    token: "token",
     topology: {},
   });
   const timeout = setTimeout(

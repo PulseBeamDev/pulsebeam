@@ -7,8 +7,7 @@ import { createAgent } from "@pulsebeam/web";
 
 const agent = createAgent({
   endpoint: "https://pulsebeam.example",
-  roomId: "standup",
-  requestHeaders: { "x-session": "session-id" },
+  token,
   topology: {
     localAudio: ["microphone"],
     localVideo: ["camera", "screen"],
@@ -48,7 +47,7 @@ publication, video, audio-pinning, and topic collections are empty, retracting
 their previous desired values.
 
 The endpoint is the absolute HTTP(S) PulseBeam server endpoint; the core adds
-`/api/v1`. Only explicitly supplied request headers are forwarded. Local slots
+`/api/v1/native`. The opaque token is sent only as bearer authorization. Local slots
 are named by the topology and are limited to two audio and two video slots;
 remote capacities are limited to three audio and seven video slots.
 

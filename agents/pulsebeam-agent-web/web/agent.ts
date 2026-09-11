@@ -41,8 +41,7 @@ interface RuntimeSnapshot {
 
 interface RuntimeConfig {
   readonly endpoint: string;
-  readonly roomId: string;
-  readonly requestHeaders: Readonly<Record<string, string>>;
+  readonly token: string;
   readonly topology: Required<MediaTopology>;
   readonly logLevel: LogLevel;
 }
@@ -82,8 +81,7 @@ function emptySnapshot(connection: ConnectionState): AgentSnapshot {
 function copyConfig(config: AgentConfig): RuntimeConfig {
   return Object.freeze({
     endpoint: config.endpoint,
-    roomId: config.roomId,
-    requestHeaders: Object.freeze({ ...(config.requestHeaders ?? {}) }),
+    token: config.token,
     topology: Object.freeze({
       localVideo: Object.freeze([...(config.topology.localVideo ?? [])]),
       localAudio: Object.freeze([...(config.topology.localAudio ?? [])]),

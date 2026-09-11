@@ -44,6 +44,11 @@ fn generated_package_has_strict_portable_boundaries() {
             "{boundary} contains an untyped policy/state field"
         );
     }
+    let config = record_definition(&core, "AgentConfig");
+    assert!(config.contains("token: string"));
+    assert!(!config.contains("roomId"));
+    assert!(!config.contains("requestHeaders"));
+    assert!(!config.contains("manualSubscriptions"));
 
     let consumer = root.join("target/uniffi-strict-consumer.ts");
     fs::create_dir_all(consumer.parent().expect("consumer has parent"))

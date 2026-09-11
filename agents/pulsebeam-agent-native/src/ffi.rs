@@ -933,15 +933,13 @@ mod tests {
     fn portable_config() -> core_ffi::AgentConfig {
         core_ffi::AgentConfig {
             endpoint: "http://pulsebeam.test".into(),
-            room_id: "room".into(),
-            request_headers: Vec::new(),
+            token: "token".into(),
             topology: core_ffi::MediaTopology {
                 local_video: vec!["camera".into()],
                 local_audio: vec!["microphone".into()],
                 remote_video: 1,
                 remote_audio: 1,
             },
-            manual_subscriptions: true,
             retry: core_ffi::RetryPolicy::default(),
             log_level: core_ffi::LogLevel::default(),
         }

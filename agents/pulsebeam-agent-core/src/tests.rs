@@ -16,7 +16,7 @@ use pulsebeam_proto::{
 
 use crate::*;
 
-const PARTICIPANT_URI: &str = "https://sfu.test/api/v1/rooms/room/participants/p1?manual_sub=true";
+const PARTICIPANT_URI: &str = "https://other-origin.test/an%20opaque/path?value=%2Fexact";
 const LOCAL_PUBLISHER: &str = "pa_00000000000000000000000000";
 const REMOTE_PUBLISHER: &str = "pa_11111111111111111111111111";
 const VIDEO_INTENT_LOG_PREFIX: &str = "desired video subscriptions changed";
@@ -63,15 +63,13 @@ fn take_video_intent_logs() -> Vec<String> {
 fn config() -> AgentConfig {
     AgentConfig {
         endpoint: "https://sfu.test/".to_string(),
-        room_id: "room".to_string(),
-        request_headers: vec![],
+        token: "private-token".to_string(),
         topology: MediaTopology {
             local_video: vec!["camera".to_string()],
             local_audio: vec!["microphone".to_string()],
             remote_video: 1,
             remote_audio: 1,
         },
-        manual_subscriptions: true,
         retry: RetryPolicy::default(),
         log_level: LogLevel::default(),
     }
@@ -84,6 +82,14 @@ fn log_level_applies_per_agent_verbosity() {
     assert!(LogLevel::Debug.allows(log::Level::Debug));
     assert!(!LogLevel::Debug.allows(log::Level::Trace));
     assert!(!LogLevel::Off.allows(log::Level::Error));
+}
+
+#[test]
+fn configuration_debug_redacts_the_bearer_token() {
+    let debug = format!("{:?}", config());
+
+    assert!(debug.contains("[REDACTED]"));
+    assert!(!debug.contains("private-token"));
 }
 
 #[test]
@@ -357,36 +363,35 @@ fn ordered_delivery(publisher_id: &str, stream_id: u64, seq: u64, payload: &[u8]
     .encode_to_vec()
 }
 
-fn create_response(participant: &str, etag: &str, uri: &str) -> HttpResponse {
+fn create_response(participant: &str, _etag: &str, uri: &str) -> HttpResponse {
     HttpResponse {
         status: 201,
-        headers: vec![
-            HttpHeader {
-                name: "location".to_string(),
-                value: uri.to_string(),
-            },
-            HttpHeader {
-                name: "ETAG".to_string(),
-                value: format!("\"{etag}\""),
-            },
-            HttpHeader {
-                name: "pb-participant-id".to_string(),
-                value: participant.to_string(),
-            },
-        ],
-        body: b"answer".to_vec(),
+        headers: vec![HttpHeader {
+            name: "location".to_string(),
+            value: uri.to_string(),
+        }],
+        body: serde_json::to_vec(&serde_json::json!({
+            "room_external_id": "room",
+            "room_id": "opaque room",
+            "participant_external_id": "participant",
+            "participant_id": participant,
+            "connection_id": "not-canonical",
+            "answer": "answer",
+        }))
+        .unwrap(),
     }
 }
 
-fn update_response(etag: &str) -> HttpResponse {
-    HttpResponse {
-        status: 200,
-        headers: vec![HttpHeader {
-            name: "etag".to_string(),
-            value: etag.to_string(),
-        }],
-        body: b"replacement-answer".to_vec(),
-    }
+fn update_response(participant: &str) -> HttpResponse {
+    let mut response = create_response(participant, "unused", PARTICIPANT_URI);
+    let value: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+    let mut value = value.as_object().unwrap().clone();
+    value.insert(
+        "answer".to_string(),
+        serde_json::Value::String("replacement-answer".to_string()),
+    );
+    response.body = serde_json::to_vec(&value).unwrap();
+    response
 }
 
 fn next_effect(agent: &mut Agent) -> Effect {
@@ -427,7 +432,14 @@ fn begin_connect(
         }) => {
             assert_eq!(actual_generation, generation);
             assert_eq!(request.method, HttpMethod::Post);
-            assert!(request.uri.ends_with("/participants?manual_sub=true"));
+            assert_eq!(request.uri, "https://sfu.test/api/v1/native");
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&request.body).unwrap(),
+                serde_json::json!({"offer": "offer", "manual": true}),
+            );
+            assert!(request.headers.iter().any(|header| {
+                header.name == "Authorization" && header.value == "Bearer private-token"
+            }));
             operation
         }
         effect => panic!("expected create request, got {effect:?}"),
@@ -559,34 +571,21 @@ fn construction_and_desired_state_validate_complete_external_input() {
     ));
 
     let mut protocol_header = config();
-    protocol_header.request_headers.push(HttpHeader {
-        name: "Content-Type".to_string(),
-        value: "text/plain".to_string(),
-    });
+    protocol_header.token.clear();
     assert!(matches!(
         Agent::new(protocol_header),
-        Err(AgentError::InvalidConfiguration(
-            ValidationError::RequestHeader(_)
-        ))
+        Err(AgentError::InvalidConfiguration(ValidationError::Token))
     ));
 
     let mut control_header = config();
-    control_header.request_headers.push(HttpHeader {
-        name: "X-Test".to_string(),
-        value: "invalid\u{1}".to_string(),
-    });
+    control_header.token = "invalid\u{1}".to_string();
     assert!(matches!(
         Agent::new(control_header),
-        Err(AgentError::InvalidConfiguration(
-            ValidationError::RequestHeader(_)
-        ))
+        Err(AgentError::InvalidConfiguration(ValidationError::Token))
     ));
 
     let mut injected_header = config();
-    injected_header.request_headers.push(HttpHeader {
-        name: "Authorization".to_string(),
-        value: "Bearer redacted".to_string(),
-    });
+    injected_header.token = "redacted".to_string();
     let mut agent = Agent::new(injected_header).unwrap();
     agent
         .command(AgentCommand::ReplaceDesired(desired(1)))
@@ -778,6 +777,13 @@ fn connection_waits_for_every_host_boundary_and_closes_both_resources() {
         }) => {
             assert_eq!(request.method, HttpMethod::Delete);
             assert_eq!(request.uri, PARTICIPANT_URI);
+            assert_eq!(
+                request.headers,
+                vec![HttpHeader {
+                    name: "Authorization".to_string(),
+                    value: "Bearer private-token".to_string(),
+                }]
+            );
             operation
         }
         effect => panic!("expected delete, got {effect:?}"),
@@ -848,7 +854,7 @@ fn transient_failure_schedules_a_bounded_retry_that_disconnect_cancels() {
 }
 
 #[test]
-fn replacement_uses_etag_and_swaps_only_after_the_candidate_is_ready() {
+fn reconnect_posts_a_new_resource_and_swaps_only_after_the_candidate_is_ready() {
     let (mut agent, old_generation, old_cid, send) = connected_agent();
     acknowledge_send(&mut agent, old_generation, old_cid, send);
     agent
@@ -873,24 +879,16 @@ fn replacement_uses_etag_and_swaps_only_after_the_candidate_is_ready() {
         Effect::Http(HttpEffect::Request {
             operation, request, ..
         }) => {
-            assert_eq!(request.method, HttpMethod::Patch);
-            assert_eq!(request.uri, PARTICIPANT_URI);
-            assert_eq!(
-                request
-                    .headers
-                    .iter()
-                    .find(|header| header.name == "If-Match")
-                    .map(|header| header.value.as_str()),
-                Some("etag-1")
-            );
+            assert_eq!(request.method, HttpMethod::Post);
+            assert_eq!(request.uri, "https://sfu.test/api/v1/native");
             operation
         }
-        effect => panic!("expected PATCH, got {effect:?}"),
+        effect => panic!("expected POST, got {effect:?}"),
     };
     agent
         .handle(HostEvent::Http(HttpEvent::Response {
             operation: update,
-            response: update_response("etag-2"),
+            response: update_response("p1"),
         }))
         .unwrap();
     assert!(matches!(
@@ -933,7 +931,7 @@ fn replacement_uses_etag_and_swaps_only_after_the_candidate_is_ready() {
 }
 
 #[test]
-fn expired_replacement_falls_back_to_a_fresh_participant() {
+fn rejected_reconnect_is_terminal_without_a_legacy_fallback() {
     let (mut agent, old_generation, old_cid, send) = connected_agent();
     acknowledge_send(&mut agent, old_generation, old_cid, send);
     agent
@@ -972,17 +970,16 @@ fn expired_replacement_falls_back_to_a_fresh_participant() {
             generation: replacement_generation,
         })
     );
-    assert!(matches!(
-        next_effect(&mut agent),
-        Effect::Rtc(RtcEffect::CreateOffer { .. })
-    ));
     assert_eq!(agent.snapshot().generation, Some(old_generation));
-    assert_eq!(agent.snapshot().connection, ConnectionState::Reconnecting);
+    assert_eq!(
+        agent.snapshot().connection,
+        ConnectionState::TerminalFailure
+    );
     assert!(drain_notifications(&mut agent).iter().any(|notification| {
         matches!(
             notification,
             Notification::Failure(Failure {
-                class: FailureClass::ResourceExpired,
+                class: FailureClass::InvalidConfiguration,
                 ..
             })
         )
@@ -1878,7 +1875,7 @@ fn reconnect_rotates_ordered_streams_without_replaying_accepted_history() {
     agent
         .handle(HostEvent::Http(HttpEvent::Response {
             operation: update,
-            response: update_response("etag-2"),
+            response: update_response(LOCAL_PUBLISHER),
         }))
         .unwrap();
     assert!(matches!(

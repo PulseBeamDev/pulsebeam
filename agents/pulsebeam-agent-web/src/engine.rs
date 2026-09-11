@@ -488,18 +488,13 @@ mod tests {
     fn config() -> agent_core::AgentConfig {
         agent_core::AgentConfig {
             endpoint: "https://example.com".into(),
-            room_id: "room".into(),
-            request_headers: vec![agent_core::HttpHeader {
-                name: "x-test".into(),
-                value: "unit".into(),
-            }],
+            token: "token".into(),
             topology: agent_core::MediaTopology {
                 local_video: vec!["cam".into()],
                 local_audio: vec!["mic".into()],
                 remote_video: 1,
                 remote_audio: 1,
             },
-            manual_subscriptions: true,
             retry: agent_core::RetryPolicy::default(),
             log_level: agent_core::LogLevel::default(),
         }

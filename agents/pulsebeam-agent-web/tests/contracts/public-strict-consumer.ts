@@ -14,8 +14,7 @@ declare const audioTrack: MediaStreamTrack;
 declare const audioElement: HTMLAudioElement;
 const agent = createAgent({
   endpoint: "https://pulsebeam.example",
-  roomId: "meet",
-  requestHeaders: { "x-session": "example" },
+  token: "opaque-token",
   topology: {
     localAudio: ["microphone"],
     localVideo: ["camera", "screen"],
@@ -24,6 +23,12 @@ const agent = createAgent({
   },
   logging: { level: "debug" },
 });
+
+declare const legacyConfig: import("../../web/index.js").AgentConfig;
+// @ts-expect-error room identity is owned by the bearer token
+legacyConfig.roomId;
+// @ts-expect-error arbitrary request headers are not part of the public API
+legacyConfig.requestHeaders;
 
 const desired: AgentState = {
   connected: true,

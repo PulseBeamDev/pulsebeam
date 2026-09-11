@@ -11,6 +11,10 @@ use pulsebeam_agent_native::agent_core::{
 use pulsebeam_agent_native::{Agent, AgentEvent, Config, Host, MediaFrame, SimulcastLayer};
 use pulsebeam_core::net::UdpSocket;
 use pulsebeam_core::net::{AsyncHttpClient, HttpError, HttpRequest, HttpResult};
+use pulsebeam_core::{
+    auth::mint_development_token,
+    identity::{ParticipantExternalId, RoomExternalId},
+};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
@@ -297,12 +301,16 @@ impl SimClientBuilder {
             remote_video: u8::try_from(self.video_slots)?,
             remote_audio: u8::try_from(self.audio_slots)?,
         };
+        let participant = match self.ip {
+            IpAddr::V4(ip) => format!("sim-{}", u32::from(ip)),
+            IpAddr::V6(ip) => format!("sim-{ip:032X}", ip = u128::from(ip)),
+        };
+        let room = RoomExternalId::new(room)?;
+        let participant = ParticipantExternalId::new(&participant)?;
         let session = AgentConfig {
             endpoint: self.endpoint,
-            room_id: room.to_owned(),
-            request_headers: Vec::new(),
+            token: mint_development_token(&room, &participant, u64::MAX)?,
             topology,
-            manual_subscriptions: self.manual_subscriptions,
             retry: Default::default(),
             log_level: Default::default(),
         };

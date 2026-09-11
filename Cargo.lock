@@ -3433,6 +3433,8 @@ version = "0.1.0"
 dependencies = [
  "log",
  "pulsebeam-proto",
+ "serde",
+ "serde_json",
  "thiserror 2.0.20",
  "uniffi",
 ]
@@ -3465,6 +3467,7 @@ dependencies = [
  "js-sys",
  "log",
  "pulsebeam-agent-core",
+ "pulsebeam-core",
  "serde",
  "serde-wasm-bindgen",
  "serde_json",

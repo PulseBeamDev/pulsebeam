@@ -562,17 +562,19 @@ async fn spawn_agent(
     duration: Duration,
 ) -> Result<()> {
     let socket = UdpSocket::bind("0.0.0.0:0").await?;
+    let room = RoomExternalId::new(&room_name)?;
+    let participant = ParticipantExternalId::new(&format!("bench-{}", ctx.agent_id))?;
+    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+    let exp = now.saturating_add(duration.as_secs()).saturating_add(60);
     let session = AgentConfig {
         endpoint: ctx.api_url.clone(),
-        room_id: room_name,
-        request_headers: Vec::new(),
+        token: mint_development_token(&room, &participant, exp)?,
         topology: MediaTopology {
             local_video: vec!["camera".into()],
             local_audio: vec!["microphone".into()],
             remote_video: REMOTE_VIDEO_SLOTS,
             remote_audio: REMOTE_AUDIO_SLOTS,
         },
-        manual_subscriptions: true,
         retry: Default::default(),
         log_level: Default::default(),
     };

@@ -5,6 +5,8 @@ use std::time::Duration;
 use pulsebeam_agent_core::ffi as core_ffi;
 use pulsebeam_agent_native::ffi::{Agent, EventUpdate, MediaUpdate, NativeEvent, SnapshotUpdate};
 use pulsebeam_agent_native::{Agent as RuntimeAgent, Config, Host};
+use pulsebeam_core::auth::mint_development_token;
+use pulsebeam_core::identity::{ParticipantExternalId, RoomExternalId};
 use pulsebeam_core::net::UdpSocket;
 
 use super::common::client::create_http_client;
@@ -135,17 +137,17 @@ async fn run_peer(
     before_close: Arc<tokio::sync::Barrier>,
 ) -> anyhow::Result<PeerReport> {
     let endpoint = format!("http://{server_ip}:7070");
+    let room = RoomExternalId::new("native-vertical")?;
+    let participant = ParticipantExternalId::new(name)?;
     let session = pulsebeam_agent_core::AgentConfig {
         endpoint,
-        room_id: "native-vertical".into(),
-        request_headers: Vec::new(),
+        token: mint_development_token(&room, &participant, u64::MAX)?,
         topology: pulsebeam_agent_core::MediaTopology {
             local_video: vec!["camera".into()],
             local_audio: vec!["microphone".into()],
             remote_video: 1,
             remote_audio: 1,
         },
-        manual_subscriptions: true,
         retry: pulsebeam_agent_core::RetryPolicy::default(),
         log_level: pulsebeam_agent_core::LogLevel::default(),
     };

@@ -10,6 +10,8 @@ license = "Apache-2.0"
 
 [dependencies]
 log = { version = "0.4", default-features = false }
+serde = { version = "1", default-features = false, features = ["derive"] }
+serde_json = { version = "1", default-features = false, features = ["alloc"] }
 thiserror = { version = "2.0.20", default-features = false }
 pulsebeam-proto.workspace = true
 uniffi = { version = "=0.31.0", default-features = false }

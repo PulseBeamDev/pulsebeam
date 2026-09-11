@@ -7,12 +7,12 @@
   };
   const sender = window.pulsebeam.createAgent({
     endpoint,
-    roomId: "public-web-contract",
+    token: "__SENDER_TOKEN__",
     topology,
   });
   const receiver = window.pulsebeam.createAgent({
     endpoint,
-    roomId: "public-web-contract",
+    token: "__RECEIVER_TOKEN__",
     topology,
   });
 

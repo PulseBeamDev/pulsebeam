@@ -4,22 +4,23 @@ use alloc::{
     string::{String, ToString},
     vec,
 };
-use core::{str, time::Duration};
+use core::time::Duration;
+use serde::{Deserialize, Serialize};
 
 use crate::{
-    AgentConfig, ChannelId, ConnectionState, DataChannelEffect, DataChannelEvent,
+    AgentConfig, ChannelId, ConnectionId, ConnectionState, DataChannelEffect, DataChannelEvent,
     DataChannelReliability, DataChannelSpec, DesiredState, Effect, Failure, FailureClass,
     Generation, HostEvent, HttpEffect, HttpEvent, HttpHeader, HttpMethod, HttpRequest,
-    HttpResponse, MediaSlot, Notification, OfferResources, OperationId, PlayoutDelay, RtcEffect,
-    RtcEvent, SlotBinding, Snapshot, TimerEffect, TimerEvent, TimerId, TopicDropReason, TopicError,
-    TopicSend, ValidationError,
+    HttpResponse, MediaSlot, Notification, OfferResources, OperationId, ParticipantId,
+    PlayoutDelay, RoomId, RtcEffect, RtcEvent, SlotBinding, Snapshot, TimerEffect, TimerEvent,
+    TimerId, TopicDropReason, TopicError, TopicSend, ValidationError,
     id::IdGenerator,
     signaling::{self, ServerOutput, SignalingError},
     topic::Topics,
 };
 
 const CONTENT_TYPE: &str = "Content-Type";
-const SDP_CONTENT_TYPE: &str = "application/sdp";
+const JSON_CONTENT_TYPE: &str = "application/json";
 const SIGNAL_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 macro_rules! agent_log {
@@ -59,7 +60,11 @@ struct Session {
     generation: Generation,
     resource_uri: String,
     participant_id: String,
-    etag: String,
+    _room_external_id: String,
+    _room_id: RoomId,
+    _participant_external_id: String,
+    _opaque_participant_id: ParticipantId,
+    _connection_id: ConnectionId,
     mids: BTreeMap<MediaSlot, String>,
     signaling_channel: ChannelId,
 }
@@ -79,8 +84,28 @@ enum AttemptStage {
 
 struct Candidate {
     resource_uri: String,
+    room_external_id: String,
+    room_id: RoomId,
+    participant_external_id: String,
     participant_id: String,
-    etag: String,
+    opaque_participant_id: ParticipantId,
+    connection_id: ConnectionId,
+}
+
+#[derive(Serialize)]
+struct NativeRequest<'a> {
+    offer: &'a str,
+    manual: bool,
+}
+
+#[derive(Deserialize)]
+struct NativeResponse {
+    room_external_id: String,
+    room_id: String,
+    participant_external_id: String,
+    participant_id: String,
+    connection_id: String,
+    answer: String,
 }
 
 struct Attempt {
@@ -439,16 +464,7 @@ impl Agent {
         )?;
         let mode = attempt.mode;
         let operation = self.ids.operation();
-        let request = match mode {
-            AttemptMode::Fresh => self.create_request(&offer),
-            AttemptMode::Replace => {
-                let Some(active) = self.active.as_ref() else {
-                    debug_assert!(false, "replacement requires an active session");
-                    return Ok(());
-                };
-                update_request(active, &offer, &self.config.request_headers)
-            }
-        };
+        let request = self.create_request(&offer)?;
         if let Some(attempt) = self.attempt.as_mut() {
             attempt.stage = AttemptStage::Requesting;
             attempt.resources = Some(resources);
@@ -457,7 +473,7 @@ impl Agent {
         agent_log!(
             self,
             Debug,
-            "requesting participant session mode={mode:?} generation={} operation={}",
+            "requesting native session mode={mode:?} generation={} operation={}",
             generation.get(),
             operation.get(),
         );
@@ -507,7 +523,7 @@ impl Agent {
         }
         if self.orphaned_creates.remove(&operation) {
             if response.status / 100 == 2
-                && let Ok(candidate) = parse_create_response(&response)
+                && let Ok((candidate, _)) = parse_create_response(&response)
             {
                 self.emit_untracked_delete(candidate.resource_uri);
             }
@@ -528,46 +544,30 @@ impl Agent {
         agent_log!(
             self,
             Debug,
-            "received participant response mode={mode:?} generation={} operation={} status={}",
+            "received native response mode={mode:?} generation={} operation={} status={}",
             generation.get(),
             operation.get(),
             response.status,
         );
-        let failure = classify_http_failure(response.status, mode);
+        let failure = classify_http_failure(response.status);
         if let Some(failure) = failure {
             self.fail_attempt(failure);
             return Ok(());
         }
-        let candidate = match mode {
-            AttemptMode::Fresh => parse_create_response(&response),
-            AttemptMode::Replace => {
-                let Some(active) = self.active.as_ref() else {
-                    debug_assert!(false, "replacement response requires active session");
-                    return Ok(());
-                };
-                parse_update_response(&response, active)
-            }
-        };
-        let candidate = match candidate {
-            Ok(candidate) => candidate,
+        let (candidate, answer) = match parse_create_response(&response) {
+            Ok(parsed) => parsed,
             Err(message) => {
                 self.fail_attempt(Failure::protocol(message));
                 return Ok(());
             }
-        };
-        let Some(answer) = response_body(&response) else {
-            self.fail_attempt(Failure::protocol("missing SDP answer"));
-            return Ok(());
         };
         if let Some(attempt) = self.attempt.as_mut() {
             attempt.stage = AttemptStage::ApplyingAnswer;
             attempt.request = None;
             attempt.candidate = Some(candidate);
         }
-        self.effects.push_back(Effect::Rtc(RtcEffect::ApplyAnswer {
-            generation,
-            answer: answer.to_string(),
-        }));
+        self.effects
+            .push_back(Effect::Rtc(RtcEffect::ApplyAnswer { generation, answer }));
         self.update_attempt_state();
         Ok(())
     }
@@ -855,7 +855,11 @@ impl Agent {
             generation: attempt.generation,
             resource_uri: candidate.resource_uri,
             participant_id: candidate.participant_id,
-            etag: candidate.etag,
+            _room_external_id: candidate.room_external_id,
+            _room_id: candidate.room_id,
+            _participant_external_id: candidate.participant_external_id,
+            _opaque_participant_id: candidate.opaque_participant_id,
+            _connection_id: candidate.connection_id,
             mids,
             signaling_channel: resources.signaling_channel,
         }) && previous.generation != attempt.generation
@@ -935,22 +939,15 @@ impl Agent {
         if let Some(operation) = attempt.request.take() {
             self.effects
                 .push_back(Effect::Http(HttpEffect::Cancel { operation }));
-            if attempt.mode == AttemptMode::Fresh {
-                let _ = self.orphaned_creates.insert(operation);
-            }
+            let _ = self.orphaned_creates.insert(operation);
         }
-        if attempt.mode == AttemptMode::Fresh
-            && let Some(candidate) = attempt.candidate.take()
-        {
+        if let Some(candidate) = attempt.candidate.take() {
             self.emit_untracked_delete(candidate.resource_uri);
         }
         self.pending_signal = None;
         self.intent_dirty = true;
         self.notify_failure(failure.clone());
         match failure.class {
-            FailureClass::ResourceExpired if attempt.mode == AttemptMode::Replace => {
-                self.start_attempt(AttemptMode::Fresh);
-            }
             FailureClass::Transient => self.schedule_retry(attempt.mode),
             FailureClass::InvalidConfiguration
             | FailureClass::Authorization
@@ -1123,13 +1120,9 @@ impl Agent {
             if let Some(operation) = attempt.request.take() {
                 self.effects
                     .push_back(Effect::Http(HttpEffect::Cancel { operation }));
-                if attempt.mode == AttemptMode::Fresh {
-                    let _ = self.orphaned_creates.insert(operation);
-                }
+                let _ = self.orphaned_creates.insert(operation);
             }
-            if attempt.mode == AttemptMode::Fresh
-                && let Some(candidate) = attempt.candidate.take()
-            {
+            if let Some(candidate) = attempt.candidate.take() {
                 self.track_delete(candidate.resource_uri, &mut closing);
             }
         }
@@ -1156,7 +1149,7 @@ impl Agent {
         self.effects.push_back(Effect::Http(HttpEffect::Request {
             operation,
             generation: None,
-            request: delete_request(resource_uri, &self.config.request_headers),
+            request: delete_request(resource_uri, &self.config.token),
         }));
     }
 
@@ -1165,7 +1158,7 @@ impl Agent {
         self.effects.push_back(Effect::Http(HttpEffect::Request {
             operation,
             generation: None,
-            request: delete_request(resource_uri, &self.config.request_headers),
+            request: delete_request(resource_uri, &self.config.token),
         }));
     }
 
@@ -1234,25 +1227,18 @@ impl Agent {
         self.bump_snapshot();
     }
 
-    fn create_request(&self, offer: &str) -> HttpRequest {
-        let mut uri = format!(
-            "{}/api/v1/rooms/{}/participants",
-            self.config.endpoint, self.config.room_id
-        );
-        if self.config.manual_subscriptions {
-            uri.push_str("?manual_sub=true");
-        }
-        let mut headers = self.config.request_headers.clone();
-        headers.push(HttpHeader {
-            name: CONTENT_TYPE.to_string(),
-            value: SDP_CONTENT_TYPE.to_string(),
-        });
-        HttpRequest {
+    fn create_request(&self, offer: &str) -> Result<HttpRequest, AgentError> {
+        let body = serde_json::to_vec(&NativeRequest {
+            offer,
+            manual: true,
+        })
+        .map_err(|_| AgentError::InvalidOffer("SDP offer could not be encoded"))?;
+        Ok(HttpRequest {
             method: HttpMethod::Post,
-            uri,
-            headers,
-            body: offer.as_bytes().to_vec(),
-        }
+            uri: format!("{}/api/v1/native", self.config.endpoint),
+            headers: request_headers(&self.config.token, true),
+            body,
+        })
     }
 
     fn notify_failure(&mut self, failure: Failure) {
@@ -1353,45 +1339,35 @@ fn validate_offer(
     Ok(())
 }
 
-fn update_request(active: &Session, offer: &str, request_headers: &[HttpHeader]) -> HttpRequest {
-    let mut headers = request_headers.to_vec();
-    headers.extend([
-        HttpHeader {
-            name: CONTENT_TYPE.to_string(),
-            value: SDP_CONTENT_TYPE.to_string(),
-        },
-        HttpHeader {
-            name: "If-Match".to_string(),
-            value: active.etag.clone(),
-        },
-    ]);
-    HttpRequest {
-        method: HttpMethod::Patch,
-        uri: active.resource_uri.clone(),
-        headers,
-        body: offer.as_bytes().to_vec(),
-    }
-}
-
-fn delete_request(resource_uri: String, request_headers: &[HttpHeader]) -> HttpRequest {
+fn delete_request(resource_uri: String, token: &str) -> HttpRequest {
     HttpRequest {
         method: HttpMethod::Delete,
         uri: resource_uri,
-        headers: request_headers.to_vec(),
+        headers: request_headers(token, false),
         body: vec![],
     }
 }
 
-fn classify_http_failure(status: u16, mode: AttemptMode) -> Option<Failure> {
-    if status / 100 == 2 {
+fn request_headers(token: &str, json: bool) -> Vec<HttpHeader> {
+    let mut headers = vec![HttpHeader {
+        name: "Authorization".to_string(),
+        value: format!("Bearer {token}"),
+    }];
+    if json {
+        headers.push(HttpHeader {
+            name: CONTENT_TYPE.to_string(),
+            value: JSON_CONTENT_TYPE.to_string(),
+        });
+    }
+    headers
+}
+
+fn classify_http_failure(status: u16) -> Option<Failure> {
+    if status == 201 {
         return None;
     }
     let (class, message) = match status {
         401 | 403 => (FailureClass::Authorization, "server rejected authorization"),
-        404 | 410 | 412 if mode == AttemptMode::Replace => (
-            FailureClass::ResourceExpired,
-            "participant resource expired",
-        ),
         408 | 425 | 429 | 500..=599 => (FailureClass::Transient, "transient HTTP failure"),
         400 | 404 | 409 | 410 | 412 | 422 => (
             FailureClass::InvalidConfiguration,
@@ -1405,56 +1381,37 @@ fn classify_http_failure(status: u16, mode: AttemptMode) -> Option<Failure> {
     })
 }
 
-fn parse_create_response(response: &HttpResponse) -> Result<Candidate, String> {
+fn parse_create_response(response: &HttpResponse) -> Result<(Candidate, String), String> {
     let resource_uri = unique_header(response, "Location")?
         .ok_or_else(|| "create response is missing Location".to_string())?;
     validate_resource_uri(resource_uri)?;
-    let etag = parse_etag(response)?;
-    let participant_id = unique_header(response, "pb-participant-id")?
-        .map(ToString::to_string)
-        .or_else(|| participant_id_from_uri(resource_uri))
-        .ok_or_else(|| "create response is missing participant ID".to_string())?;
-    crate::validate_identifier("participant_id", &participant_id, 256, true)
-        .map_err(|_| "create response participant ID is invalid".to_string())?;
-    if response_body(response).is_none() {
+    const MAX_RESPONSE_BYTES: usize = 1_064_960;
+    if response.body.is_empty() || response.body.len() > MAX_RESPONSE_BYTES {
+        return Err("create response contains invalid JSON".to_string());
+    }
+    let body: NativeResponse = serde_json::from_slice(&response.body)
+        .map_err(|_| "create response contains invalid JSON".to_string())?;
+    validate_answer(&body.answer)?;
+    Ok((
+        Candidate {
+            resource_uri: resource_uri.to_string(),
+            room_external_id: body.room_external_id,
+            room_id: RoomId::from_server(body.room_id),
+            participant_external_id: body.participant_external_id,
+            participant_id: body.participant_id.clone(),
+            opaque_participant_id: ParticipantId::from_server(body.participant_id),
+            connection_id: ConnectionId::from_server(body.connection_id),
+        },
+        body.answer,
+    ))
+}
+
+fn validate_answer(answer: &str) -> Result<(), String> {
+    const MAX_SDP_BYTES: usize = 1_048_576;
+    if answer.is_empty() || answer.len() > MAX_SDP_BYTES {
         return Err("create response contains invalid SDP".to_string());
     }
-    Ok(Candidate {
-        resource_uri: resource_uri.to_string(),
-        participant_id,
-        etag,
-    })
-}
-
-fn parse_update_response(response: &HttpResponse, active: &Session) -> Result<Candidate, String> {
-    let etag = parse_etag(response)?;
-    if response_body(response).is_none() {
-        return Err("update response contains invalid SDP".to_string());
-    }
-    Ok(Candidate {
-        resource_uri: active.resource_uri.clone(),
-        participant_id: active.participant_id.clone(),
-        etag,
-    })
-}
-
-fn response_body(response: &HttpResponse) -> Option<&str> {
-    const MAX_SDP_BYTES: usize = 1_048_576;
-    if response.body.is_empty() || response.body.len() > MAX_SDP_BYTES {
-        return None;
-    }
-    str::from_utf8(&response.body)
-        .ok()
-        .filter(|body| !body.is_empty())
-}
-
-fn parse_etag(response: &HttpResponse) -> Result<String, String> {
-    let etag = unique_header(response, "ETag")?
-        .ok_or_else(|| "response is missing ETag".to_string())?
-        .trim_matches('"');
-    crate::validate_identifier("etag", etag, 256, true)
-        .map_err(|_| "response ETag is invalid".to_string())?;
-    Ok(etag.to_string())
+    Ok(())
 }
 
 fn unique_header<'a>(response: &'a HttpResponse, name: &str) -> Result<Option<&'a str>, String> {
@@ -1473,19 +1430,87 @@ fn unique_header<'a>(response: &'a HttpResponse, name: &str) -> Result<Option<&'
 }
 
 fn validate_resource_uri(uri: &str) -> Result<(), String> {
-    if !(uri.starts_with("http://") || uri.starts_with("https://"))
+    let authority = uri
+        .strip_prefix("http://")
+        .or_else(|| uri.strip_prefix("https://"))
+        .and_then(|rest| rest.split(['/', '?', '#']).next());
+    if authority.is_none_or(str::is_empty)
         || uri.len() > 2048
-        || uri.chars().any(char::is_control)
+        || uri.chars().any(char::is_whitespace)
     {
         return Err("response Location is invalid".to_string());
     }
     Ok(())
 }
 
-fn participant_id_from_uri(uri: &str) -> Option<String> {
-    uri.split('?')
-        .next()
-        .and_then(|path| path.rsplit('/').next())
-        .filter(|segment| !segment.is_empty())
-        .map(ToString::to_string)
+#[cfg(test)]
+mod response_tests {
+    use alloc::{string::ToString, vec};
+
+    use super::*;
+
+    fn response(body: serde_json::Value) -> HttpResponse {
+        HttpResponse {
+            status: 201,
+            headers: vec![HttpHeader {
+                name: "Location".to_string(),
+                value: "https://elsewhere.test/exact%2Fopaque?x=a%2Fb".to_string(),
+            }],
+            body: serde_json::to_vec(&body).unwrap(),
+        }
+    }
+
+    #[test]
+    fn native_response_requires_fields_and_types_but_keeps_values_opaque() {
+        let complete = serde_json::json!({
+            "room_external_id": "room",
+            "room_id": "not canonical / room",
+            "participant_external_id": "participant",
+            "participant_id": "not canonical / participant",
+            "connection_id": "not canonical / connection",
+            "answer": "v=0\r\n",
+            "future": {"ignored": true},
+        });
+        let (candidate, answer) = parse_create_response(&response(complete.clone())).unwrap();
+        assert_eq!(
+            candidate.resource_uri,
+            "https://elsewhere.test/exact%2Fopaque?x=a%2Fb"
+        );
+        assert_eq!(candidate.room_id.as_str(), "not canonical / room");
+        assert_eq!(candidate.participant_id, "not canonical / participant");
+        assert_eq!(
+            candidate.opaque_participant_id.as_str(),
+            "not canonical / participant"
+        );
+        assert_eq!(
+            candidate.connection_id.as_str(),
+            "not canonical / connection"
+        );
+        assert_eq!(answer, "v=0\r\n");
+
+        for field in [
+            "room_external_id",
+            "room_id",
+            "participant_external_id",
+            "participant_id",
+            "connection_id",
+            "answer",
+        ] {
+            let mut missing = complete.as_object().unwrap().clone();
+            let _ = missing.remove(field);
+            assert!(parse_create_response(&response(missing.into())).is_err());
+        }
+
+        let mut wrong_type = complete.as_object().unwrap().clone();
+        wrong_type.insert("connection_id".to_string(), serde_json::Value::Bool(true));
+        assert!(parse_create_response(&response(wrong_type.into())).is_err());
+
+        let mut missing_location = response(complete.clone());
+        missing_location.headers.clear();
+        assert!(parse_create_response(&missing_location).is_err());
+
+        let mut relative_location = response(complete);
+        relative_location.headers[0].value = "/api/v1/native/relative".to_string();
+        assert!(parse_create_response(&relative_location).is_err());
+    }
 }
