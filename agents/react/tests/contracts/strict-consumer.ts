@@ -24,7 +24,7 @@ declare const media: MediaStreamTrack;
 declare const element: RefObject<HTMLMediaElement | null>;
 const config: AgentConfig = {
   endpoint: "https://pulsebeam.example",
-  roomId: "standup",
+  token: "opaque-token",
   topology: {
     localVideo: ["camera", "screen"],
     localAudio: ["mic"],

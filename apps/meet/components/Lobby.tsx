@@ -10,9 +10,9 @@ import { Radio, RefreshCw } from "lucide-react";
 export function Lobby({
   onJoin,
 }: {
-  onJoin(roomId: string, endpoint: string, stream: MediaStream): void;
+  onJoin(token: string, endpoint: string, stream: MediaStream): void;
 }) {
-  const [roomId, setRoomId] = useState("");
+  const [token, setToken] = useState("");
   const [apiURL, setApiURL] = useState(defaultApiUrl);
   const videoRef = useRef<HTMLVideoElement>(null);
   const {
@@ -102,19 +102,20 @@ export function Lobby({
               event.preventDefault();
               const activeStream = takeStream();
               if (activeStream && endpoint)
-                onJoin(roomId, endpoint, activeStream);
+                onJoin(token, endpoint, activeStream);
             }}
             className="space-y-3 border-t pt-4"
           >
             <label className="block space-y-2">
               <span className="text-xs font-semibold tracking-wider text-muted-foreground uppercase">
-                Room ID
+                Token
               </span>
               <Input
                 className="h-11 sm:h-9"
-                value={roomId}
-                onChange={(event) => setRoomId(event.target.value)}
-                placeholder="Enter a room ID"
+                type="password"
+                value={token}
+                onChange={(event) => setToken(event.target.value)}
+                placeholder="Enter a bearer token"
                 autoComplete="off"
                 autoCapitalize="none"
                 spellCheck={false}

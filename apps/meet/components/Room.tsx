@@ -56,12 +56,12 @@ const latencyModes = [
 const reactionEmojis = ["👍", "❤️", "😂", "😮", "👏", "🔥"];
 
 export function Room({
-  roomId,
+  token,
   endpoint,
   stream,
   onLeave,
 }: {
-  roomId: string;
+  token: string;
   endpoint: string;
   stream: MediaStream;
   onLeave(): void;
@@ -72,7 +72,7 @@ export function Room({
     if (stopTimer.current) clearTimeout(stopTimer.current);
     const fresh = createAgent({
       endpoint,
-      roomId,
+      token,
       topology: {
         localVideo: ["camera", "screen"],
         localAudio: ["microphone"],
@@ -87,15 +87,10 @@ export function Room({
       fresh.close();
       stopTimer.current = setTimeout(() => stopMedia(stream), 0);
     };
-  }, [endpoint, roomId, stream]);
+  }, [endpoint, token, stream]);
   return agent ? (
     <AgentProvider agent={agent}>
-      <RoomSession
-        agent={agent}
-        roomId={roomId}
-        stream={stream}
-        onLeave={onLeave}
-      />
+      <RoomSession agent={agent} stream={stream} onLeave={onLeave} />
     </AgentProvider>
   ) : (
     <main className="grid h-dvh place-items-center">Joining room…</main>
@@ -104,12 +99,10 @@ export function Room({
 
 function RoomSession({
   agent: playbackAgent,
-  roomId,
   stream,
   onLeave,
 }: {
   agent: Agent;
-  roomId: string;
   stream: MediaStream;
   onLeave(): void;
 }) {
@@ -187,7 +180,10 @@ function RoomSession({
                 )}
               />
               <span className="meet-room-name truncate text-xs font-medium text-muted-foreground">
-                Room: <span className="text-foreground">{roomId}</span>
+                Participant:{" "}
+                <span className="text-foreground">
+                  {agent.participantId ?? "connecting"}
+                </span>
                 <span className="sr-only">, {agent.connection}</span>
               </span>
             </Badge>

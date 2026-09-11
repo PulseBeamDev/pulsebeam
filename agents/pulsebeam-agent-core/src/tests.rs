@@ -6,7 +6,6 @@ use alloc::{
     vec::Vec,
 };
 use core::time::Duration;
-use std::sync::{Mutex, Once, OnceLock};
 
 use pulsebeam_proto::{
     prelude::Message,
@@ -21,44 +20,57 @@ const LOCAL_PUBLISHER: &str = "pa_00000000000000000000000000";
 const REMOTE_PUBLISHER: &str = "pa_11111111111111111111111111";
 const VIDEO_INTENT_LOG_PREFIX: &str = "desired video subscriptions changed";
 
-struct TestLogger;
+#[allow(clippy::disallowed_types)] // The process-global test logger serializes capture across tests.
+mod test_log_capture {
+    use std::sync::{Mutex, MutexGuard, Once, OnceLock};
 
-static TEST_LOGGER: TestLogger = TestLogger;
-static TEST_LOGGER_INIT: Once = Once::new();
-static TEST_LOG_RECORDS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
-static TEST_LOG_TEST_LOCK: Mutex<()> = Mutex::new(());
+    use super::*;
 
-impl log::Log for TestLogger {
-    fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
-        metadata.target().starts_with("pulsebeam_agent_core")
-    }
+    struct TestLogger;
 
-    fn log(&self, record: &log::Record<'_>) {
-        if self.enabled(record.metadata()) {
-            TEST_LOG_RECORDS
-                .get_or_init(|| Mutex::new(Vec::new()))
-                .lock()
-                .unwrap()
-                .push(record.args().to_string());
+    static TEST_LOGGER: TestLogger = TestLogger;
+    static TEST_LOGGER_INIT: Once = Once::new();
+    static TEST_LOG_RECORDS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+    static TEST_LOG_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    impl log::Log for TestLogger {
+        fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+            metadata.target().starts_with("pulsebeam_agent_core")
         }
+
+        fn log(&self, record: &log::Record<'_>) {
+            if self.enabled(record.metadata()) {
+                TEST_LOG_RECORDS
+                    .get_or_init(|| Mutex::new(Vec::new()))
+                    .lock()
+                    .unwrap()
+                    .push(record.args().to_string());
+            }
+        }
+
+        fn flush(&self) {}
     }
 
-    fn flush(&self) {}
+    pub(super) fn serial() -> MutexGuard<'static, ()> {
+        TEST_LOG_TEST_LOCK.lock().unwrap()
+    }
+
+    pub(super) fn take_video_intent_logs() -> Vec<String> {
+        TEST_LOGGER_INIT.call_once(|| {
+            log::set_logger(&TEST_LOGGER).unwrap();
+            log::set_max_level(log::LevelFilter::Trace);
+        });
+        TEST_LOG_RECORDS
+            .get_or_init(|| Mutex::new(Vec::new()))
+            .lock()
+            .unwrap()
+            .drain(..)
+            .filter(|record| record.starts_with(VIDEO_INTENT_LOG_PREFIX))
+            .collect()
+    }
 }
 
-fn take_video_intent_logs() -> Vec<String> {
-    TEST_LOGGER_INIT.call_once(|| {
-        log::set_logger(&TEST_LOGGER).unwrap();
-        log::set_max_level(log::LevelFilter::Trace);
-    });
-    TEST_LOG_RECORDS
-        .get_or_init(|| Mutex::new(Vec::new()))
-        .lock()
-        .unwrap()
-        .drain(..)
-        .filter(|record| record.starts_with(VIDEO_INTENT_LOG_PREFIX))
-        .collect()
-}
+use test_log_capture::{serial as serialize_log_test, take_video_intent_logs};
 
 fn config() -> AgentConfig {
     AgentConfig {
@@ -94,7 +106,7 @@ fn configuration_debug_redacts_the_bearer_token() {
 
 #[test]
 fn desired_video_intent_logs_only_accepted_semantic_changes() {
-    let _log_test_lock = TEST_LOG_TEST_LOCK.lock().unwrap();
+    let _log_test_lock = serialize_log_test();
     let mut debug_config = config();
     debug_config.log_level = LogLevel::Debug;
     let mut agent = Agent::new(debug_config).unwrap();
@@ -113,7 +125,7 @@ fn desired_video_intent_logs_only_accepted_semantic_changes() {
         )]
     );
 
-    let mut unrelated_change = initial.clone();
+    let mut unrelated_change = initial;
     unrelated_change.revision = 2;
     unrelated_change.audio.automatic = false;
     agent
@@ -153,7 +165,7 @@ fn desired_video_intent_logs_only_accepted_semantic_changes() {
 
 #[test]
 fn desired_video_intent_logs_do_not_follow_signaling_resends_or_reconnects() {
-    let _log_test_lock = TEST_LOG_TEST_LOCK.lock().unwrap();
+    let _log_test_lock = serialize_log_test();
     let mut debug_config = config();
     debug_config.log_level = LogLevel::Debug;
     let mut agent = Agent::new(debug_config).unwrap();

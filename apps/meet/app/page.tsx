@@ -6,7 +6,7 @@ import { Room } from "@/components/Room";
 
 export default function Home() {
   const [session, setSession] = useState<{
-    roomId: string;
+    token: string;
     endpoint: string;
     stream: MediaStream;
   } | null>(null);
@@ -15,8 +15,8 @@ export default function Home() {
     <Room {...session} onLeave={leave} />
   ) : (
     <Lobby
-      onJoin={(roomId, endpoint, stream) =>
-        setSession({ roomId, endpoint, stream })
+      onJoin={(token, endpoint, stream) =>
+        setSession({ token, endpoint, stream })
       }
     />
   );
