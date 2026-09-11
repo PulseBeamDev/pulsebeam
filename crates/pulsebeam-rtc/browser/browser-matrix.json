@@ -1,0 +1,49 @@
+{
+  "schema_version": 1,
+  "platforms": {
+    "linux-x86_64": {
+      "artifacts": [
+        {
+          "name": "chrome",
+          "version": "153.0.8010.36",
+          "url": "https://storage.googleapis.com/chrome-for-testing-public/153.0.8010.36/linux64/chrome-linux64.zip",
+          "bytes": 195711476,
+          "sha256": "167a098c4fdec156b58a9f678c90a84f9072d789f9c6e7b35496a6987b8b7ef8",
+          "archive": "zip",
+          "executable": "chrome-linux64/chrome",
+          "probe": "Google Chrome for Testing 153.0.8010.36"
+        },
+        {
+          "name": "chromedriver",
+          "version": "153.0.8010.36",
+          "url": "https://storage.googleapis.com/chrome-for-testing-public/153.0.8010.36/linux64/chromedriver-linux64.zip",
+          "bytes": 11813432,
+          "sha256": "c05f3bfb501b37b12b7fa2a54b8b30b51d089a64389898362aeb2785f12ac83f",
+          "archive": "zip",
+          "executable": "chromedriver-linux64/chromedriver",
+          "probe": "ChromeDriver 153.0.8010.36"
+        },
+        {
+          "name": "firefox",
+          "version": "140.15.0esr",
+          "url": "https://archive.mozilla.org/pub/firefox/releases/140.15.0esr/linux-x86_64/en-US/firefox-140.15.0esr.tar.xz",
+          "bytes": 75872668,
+          "sha256": "c93aae610f1177df7ada7823bdef433ded4ff6bfe4e6baeda6941abf4e992f3f",
+          "archive": "tar.xz",
+          "executable": "firefox/firefox",
+          "probe": "Mozilla Firefox 140.15.0esr"
+        },
+        {
+          "name": "geckodriver",
+          "version": "0.36.0",
+          "url": "https://github.com/mozilla/geckodriver/releases/download/v0.36.0/geckodriver-v0.36.0-linux64.tar.gz",
+          "bytes": 2306404,
+          "sha256": "0bde38707eb0a686a20c6bd50f4adcc7d60d4f73c60eb83ee9e0db8f65823e04",
+          "archive": "tar.gz",
+          "executable": "geckodriver",
+          "probe": "geckodriver 0.36.0"
+        }
+      ]
+    }
+  }
+}

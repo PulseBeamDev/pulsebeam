@@ -503,39 +503,21 @@ pub struct StatsSnapshot {
 
 Required connection observations include:
 
-- connection state, selected path kind, negotiated packet-feedback kind, and
-  close reason;
-- RTP media-payload desired, allocated, admitted, and transmitted rates;
-- emitted transport-byte rate split into RTP/RTCP, SCTP, DTLS/ICE, and padding;
-- controller target media-payload rate, governed media capacity, allowed and
-  actual RTP bytes-in-flight, and pacing rate;
-- paced queue bytes/packets, predicted pacer delay, and oldest queued media age;
-- baseline delay, queue delay, smoothed RTT, feedback hold, delivery rate, loss,
-  and estimator confidence;
-- application-limited, feedback-stale, probing, and congestion classification;
-- probe attempts, useful observations, bytes, aborts, and reasons;
-- pre-admission frame drops, post-admission packet drops, deadline misses, RTX
-  sent/skipped/recovered, and dependency-caused shedding;
-- clock regressions, RTP-clock discontinuities, synchronization state counts, and
-  global-media-time uncertainty;
-- malformed/authentication/replay/unknown feedback counters;
-- current and peak bounded-resource use.
+- connection state, negotiated packet-feedback kind, and close reason;
+- caller clock regressions, RTP bytes in flight, target media-payload bitrate,
+  pacing bitrate, and queued media/data bytes;
+- transmitted RTP, RTCP, SCTP, other protocol, and padding bytes;
+- dropped network inputs and unknown, duplicate, stale, and wrong-path feedback.
 
 Required per-sender observations include:
 
-- playout range, whether the current signaled value is acknowledged, priority,
-  desired media-payload rate, governed demand, allocation, and actual rate;
-- active/application-limited classification;
-- queue bytes/packets, oldest media age, private effective admission and RTX
-  horizons, service balance, and allocation-change reason;
-- source switches, timestamp-clamp drops, frame/dependency drops, deadline misses,
-  and RTX outcomes.
+- sender identifier and policy, current allocation, queued packets/payload bytes,
+  and transmitted packet/payload totals.
 
-Required per-encoding observations include RTP/RTCP packet/rate/loss data,
-`GlobalMediaTime` mapping state, clock-segment count, synchronization group/status,
-and discovery/retirement reason. Required per-channel observations include state,
-priority, reliability, buffered amount, message counts/sizes, SCTP service delay,
-and head-of-line blocking.
+Required per-encoding observations are the encoding identifier and media kind,
+received packet count, and retirement state. Required per-DataChannel
+observations are identifier, priority, reliability, buffered amount, and sent
+and received message counts.
 
 Private controller names and mutable internal objects are not returned.
 
@@ -1040,9 +1022,9 @@ traffic is dropped and counted.
 
 ## Validation boundary
 
-All implementation checks, tests, fixtures, benchmarks, and browser harnesses for
-this project live under `crates/pulsebeam-rtc`. Workspace-wide tests are outside
-this implementation project.
+Crate-local deterministic and live-browser sources live under
+`crates/pulsebeam-rtc`. The repository gate additionally validates workspace
+consumers without changing their behavior.
 
 Acceptance requires:
 
@@ -1058,10 +1040,30 @@ Acceptance requires:
   policy monotonicity;
 - parameterized many-connection/many-stream benchmarks with one wakeup per
   connection and no global scans;
-- live pinned Chrome and Firefox sessions proving offer/answer, UDP and fallback
-  ICE-TCP, TWCC, RTP/RTX, pre-media padding on negotiated SSRCs, independent
-  playout-delay updates, priority reallocation, source switching, pause/resume,
-  VBR forwarding, DataChannels, and graceful close.
+- live Chrome/ChromeDriver `153.0.8010.36` and Firefox ESR `140.15.0esr` with
+  geckodriver `0.36.0`, provisioned from the immutable Linux x86_64 artifact
+  manifest;
+- version/hash assertions before offer creation and BiDi-only navigation,
+  script, network-event, log-event, synchronization, and assertion control after
+  classic WebDriver session bootstrap;
+- compact per-browser evidence for offer/answer, UDP, feedback, RTP/RTCP,
+  negotiated sender identity, policy/admission behavior, DataChannel reliability
+  and backpressure, malformed/overload handling, path observations, graceful
+  close, and abort. Standards/profile differences such as unavailable ICE-TCP or
+  mutually exclusive RFC 8888/TWCC negotiation are explicit `unsupported`
+  records, never silent skips.
+
+Normal `cargo test` is browser-free. The canonical local and CI command is:
+
+```sh
+crates/pulsebeam-rtc/scripts/run-browser-matrix.sh --platform linux-x86_64 --include-root-tests
+```
+
+It provisions/verifies the fixed cache, runs both exact ignored matrices, and
+then invokes root `just test` with the same Chrome binary for existing consumer
+browser regression tests. Logs, exact offer inputs, and JSON reports are emitted
+under `target/pulsebeam-rtc-browser-artifacts` and uploaded by CI. Other
+platforms, ICE restart, and renegotiation remain outside the v3 profile.
 
 Stored SDP cannot prove runtime interoperability. Differential checks against
 `str0m`, Ericsson SCReAM, or libwebrtc are component evidence only and never

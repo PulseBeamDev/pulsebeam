@@ -45,7 +45,15 @@ jobs:
           tool: nextest
 
       - name: Run tests
-        run: just test
+        run: crates/pulsebeam-rtc/scripts/run-browser-matrix.sh --platform linux-x86_64 --include-root-tests
+
+      - name: Upload RTC browser evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pulsebeam-rtc-browser-evidence
+          path: target/pulsebeam-rtc-browser-artifacts
+          if-no-files-found: error
 
   # eBPF attach/load needs elevated kernel privileges, which the normal `build`
   # job does not have and should not gain. Keep the behavioural smoke test in

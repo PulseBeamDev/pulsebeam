@@ -600,12 +600,17 @@ impl Transport {
                 let provider = str0m::crypto::from_feature_flags();
                 self.drain_ice(now, &provider)?;
                 if !self.accepts_path(&path) {
-                    if self.can_queue_path(&path) && self.pending_dtls.len() < MAX_PENDING_DTLS {
+                    if self.state == TransportState::Connecting && self.can_queue_path(&path) {
+                        self.select_path(path.clone())?;
+                    } else if self.can_queue_path(&path)
+                        && self.pending_dtls.len() < MAX_PENDING_DTLS
+                    {
                         self.pending_dtls.push_back((path, bytes));
+                        return Ok(());
                     } else {
                         self.drop_input();
+                        return Ok(());
                     }
-                    return Ok(());
                 }
                 self.handle_dtls_packet(now, path, bytes, &provider)?;
             }
@@ -1150,9 +1155,15 @@ impl Transport {
     }
 
     fn accepts_path(&self, path: &SelectedPath) -> bool {
-        if !self
-            .ice
-            .accepts_tuple(path.source(), path.destination(), path.protocol())
+        let selected_after_validated_dtls = self.state == TransportState::Connected
+            && self
+                .selected
+                .as_ref()
+                .is_some_and(|selected| selected.envelope == path.envelope);
+        if !selected_after_validated_dtls
+            && !self
+                .ice
+                .accepts_tuple(path.source(), path.destination(), path.protocol())
         {
             return false;
         }

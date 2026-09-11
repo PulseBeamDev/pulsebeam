@@ -405,8 +405,8 @@ fn negotiate_inner(
     let remote_fingerprint = remote_fingerprint(&parsed)?;
     let setup = parsed.setup().ok_or_else(NegotiationError::invalid)?;
     let (answer_setup, local_dtls_role) = match setup {
-        Setup::ActPass | Setup::Passive => (Setup::Active, DtlsRole::Active),
-        Setup::Active => (Setup::Passive, DtlsRole::Passive),
+        Setup::Passive => (Setup::Active, DtlsRole::Active),
+        Setup::ActPass | Setup::Active => (Setup::Passive, DtlsRole::Passive),
     };
     let allow_mixed = parsed.session.attrs.iter().any(|attribute| {
         matches!(attribute, SessionAttribute::AllowMixedExts)
@@ -699,13 +699,14 @@ fn parse_section(
     mid: &str,
     allow_mixed: bool,
 ) -> Result<SectionBuild, NegotiationError> {
+    let disabled = line.disabled && !raw.iter().any(|value| value == "a=bundle-only");
     let kind = match line.typ {
         MediaType::Audio => SectionKind::Audio,
         MediaType::Video => SectionKind::Video,
         MediaType::Application => SectionKind::Application,
         MediaType::Unknown(_) => return Err(NegotiationError::unsupported()),
     };
-    let direction = if line.disabled {
+    let direction = if disabled {
         Direction::Inactive
     } else if kind == SectionKind::Application {
         Direction::Bidirectional
@@ -725,11 +726,11 @@ fn parse_section(
         };
         *direction
     };
-    if kind != SectionKind::Application && !line.disabled && line.proto != Proto::Srtp {
+    if kind != SectionKind::Application && !disabled && line.proto != Proto::Srtp {
         return Err(NegotiationError::unsupported());
     }
     if kind != SectionKind::Application
-        && !line.disabled
+        && !disabled
         && !line.attrs.iter().any(|attribute| {
             matches!(
                 attribute,
@@ -739,18 +740,18 @@ fn parse_section(
     {
         return Err(NegotiationError::invalid());
     }
-    let (codecs, accepted_payloads) = if line.disabled || kind == SectionKind::Application {
+    let (codecs, accepted_payloads) = if disabled || kind == SectionKind::Application {
         (Vec::new(), Vec::new())
     } else {
         parse_codecs(line, raw, kind)?
     };
-    let extensions = if line.disabled || kind == SectionKind::Application {
+    let extensions = if disabled || kind == SectionKind::Application {
         Vec::new()
     } else {
         parse_extensions(raw, allow_mixed, direction)?
     };
     if kind != SectionKind::Application
-        && !line.disabled
+        && !disabled
         && !extensions
             .iter()
             .any(|extension| extension.uri == "urn:ietf:params:rtp-hdrext:sdes:mid")
@@ -760,7 +761,7 @@ fn parse_section(
     let rids = parse_rids(raw, kind)?;
     validate_simulcast(raw, kind)?;
     let (ssrcs, groups) = parse_ssrcs(raw, kind)?;
-    let sctp = parse_sctp(line, raw, kind, line.disabled)?;
+    let sctp = parse_sctp(line, raw, kind, disabled)?;
     let accepted = accepted_payloads.iter().copied().collect::<HashSet<_>>();
     let has_feedback = |name: &str| {
         raw.iter().any(|value| {
@@ -1371,7 +1372,8 @@ fn format_answer_section(
     bundle_tag: bool,
     feedback: PacketFeedbackKind,
 ) -> String {
-    let disabled = raw.first().and_then(|line| line.split_whitespace().nth(1)) == Some("0");
+    let disabled = raw.first().and_then(|line| line.split_whitespace().nth(1)) == Some("0")
+        && !raw.iter().any(|line| line == "a=bundle-only");
     let fields = raw
         .first()
         .and_then(|line| line.strip_prefix("m="))
@@ -1622,6 +1624,7 @@ mod tests {
                 Some(PacketFeedbackKind::TransportWide)
             );
             assert!(accepted.answer.as_str().contains("a=ice-lite"));
+            assert!(accepted.answer.as_str().contains("a=setup:passive"));
             assert!(accepted.answer.as_str().contains("a=end-of-candidates"));
         }
     }
@@ -2047,6 +2050,22 @@ mod tests {
             Err(error) => panic!("RFC 8888 failed: {error}"),
         };
         assert_eq!(accepted.session.feedback, Some(PacketFeedbackKind::Rfc8888));
+    }
+
+    #[test]
+    fn accepts_zero_port_bundle_only_sections() {
+        let offer = SdpOffer::new(fixture("firefox").as_str().replace(
+            "m=application 9 UDP/DTLS/SCTP webrtc-datachannel\nc=IN IP4 0.0.0.0",
+            "m=application 0 UDP/DTLS/SCTP webrtc-datachannel\nc=IN IP4 0.0.0.0\na=bundle-only",
+        ));
+        let accepted = Connection::accept(config(), offer, at(), ConnectionEntropy::new([13; 32]))
+            .expect("BUNDLE-only sections use the shared transport despite port zero");
+        assert!(
+            accepted
+                .answer
+                .as_str()
+                .contains("m=application 9 UDP/DTLS/SCTP webrtc-datachannel")
+        );
     }
 
     #[test]

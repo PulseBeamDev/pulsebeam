@@ -1,0 +1,123 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>pulsebeam-rtc browser interoperability</title>
+<script>
+  "use strict";
+
+  window.__pulsebeam = { trace: [], channels: [], browserReceivedData: false };
+
+  window.startPulseBeam = async () => {
+    const state = window.__pulsebeam;
+    const pc = new RTCPeerConnection({ bundlePolicy: "max-bundle" });
+    state.pc = pc;
+    const notify = () => {
+      for (const waiter of state.waiters || []) waiter();
+    };
+    const trace = (event) => {
+      state.trace.push(event);
+      console.log(`pulsebeam-rtc:${event}`);
+      notify();
+    };
+    pc.addEventListener("connectionstatechange", () => trace(`connection:${pc.connectionState}`));
+    pc.addEventListener("iceconnectionstatechange", () => trace(`ice:${pc.iceConnectionState}`));
+    pc.addEventListener("track", (event) => {
+      state.remoteTrack = event.track;
+      event.track.addEventListener("unmute", () => {
+        state.remoteTrackUnmuted = true;
+        trace("remote-track-unmuted");
+      });
+      trace("remote-track");
+    });
+    pc.addEventListener("datachannel", (event) => {
+      state.channels.push(event.channel);
+      event.channel.addEventListener("message", () => {
+        state.browserReceivedData = true;
+        trace(`data:${event.channel.label}`);
+      });
+      trace(`channel:${event.channel.label}`);
+    });
+
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    state.stream = stream;
+    pc.addTrack(stream.getAudioTracks()[0], stream);
+    const channel = pc.createDataChannel("browser-reliable", { ordered: true });
+    state.browserChannel = channel;
+    channel.addEventListener("open", () => {
+      channel.send("browser-data");
+      trace("browser-channel-open");
+    });
+    channel.addEventListener("message", () => {
+      state.browserReceivedData = true;
+      trace("data:browser-reliable");
+    });
+
+    const offer = await pc.createOffer();
+    const audio = offer.sdp.match(/m=audio[^\r\n]*\r?\n[\s\S]*?(?=m=|$)/)?.[0] || "";
+    let feedbackOfferAdjusted = false;
+    if (!audio.includes(" transport-cc")) {
+      const opus = audio.match(/a=rtpmap:(\d+) opus\/48000\/2/i)?.[1];
+      if (!opus) throw new Error("browser offer has no Opus payload");
+      offer.sdp = offer.sdp.replace(
+        `a=rtpmap:${opus} opus/48000/2`,
+        `a=rtpmap:${opus} opus/48000/2\r\na=rtcp-fb:${opus} transport-cc\r\na=extmap:14 http://www.webrtc.org/experiments/rtp-hdrext/transport-wide-cc-01`,
+      );
+      feedbackOfferAdjusted = true;
+    }
+    await pc.setLocalDescription(offer);
+    if (pc.iceGatheringState !== "complete") {
+      await new Promise((resolve) => pc.addEventListener("icegatheringstatechange", () => {
+        if (pc.iceGatheringState === "complete") resolve();
+      }));
+    }
+    const sdp = pc.localDescription.sdp;
+    const candidateTypes = [...sdp.matchAll(/ typ (host|srflx|relay|prflx)/g)].map((match) => match[1]);
+    const candidateProtocols = [...sdp.matchAll(/a=candidate:[^\r\n]*? (UDP|TCP) /gi)].map((match) => match[1].toLowerCase());
+    trace("offer-ready");
+    return { sdp, candidateTypes, candidateProtocols, feedbackOfferAdjusted };
+  };
+
+  window.applyPulseBeamAnswer = async (sdp) => {
+    await window.__pulsebeam.pc.setRemoteDescription({ type: "answer", sdp });
+    window.__pulsebeam.trace.push("answer-applied");
+    return true;
+  };
+
+  window.waitForPulseBeamEvidence = async () => {
+    const state = window.__pulsebeam;
+    await new Promise((resolve, reject) => {
+      const deadline = setTimeout(() => reject(new Error(`evidence timeout: ${state.trace.join(",")}`)), 20000);
+      const check = () => {
+        if (state.pc.connectionState === "connected" && state.browserReceivedData && state.remoteTrackUnmuted) {
+          clearTimeout(deadline);
+          resolve();
+        }
+      };
+      state.waiters = [...(state.waiters || []), check];
+      check();
+    });
+    const stats = await state.pc.getStats();
+    let inboundPackets = 0;
+    let outboundPackets = 0;
+    let selectedCandidatePairChanges = 0;
+    for (const report of stats.values()) {
+      if (report.type === "inbound-rtp") inboundPackets += report.packetsReceived || 0;
+      if (report.type === "outbound-rtp") outboundPackets += report.packetsSent || 0;
+      if (report.type === "candidate-pair" && report.state === "succeeded") selectedCandidatePairChanges += 1;
+    }
+    return {
+      connectionState: state.pc.connectionState,
+      inboundPackets,
+      outboundPackets,
+      browserReceivedData: state.browserReceivedData,
+      serverChannels: state.channels.length,
+      selectedCandidatePairChanges,
+      trace: state.trace,
+    };
+  };
+
+  window.closePulseBeam = () => {
+    window.__pulsebeam.pc.close();
+    for (const track of window.__pulsebeam.stream.getTracks()) track.stop();
+    return true;
+  };
+</script>

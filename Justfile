@@ -28,11 +28,13 @@ fix:
 
 # Run workspace unit tests and deterministic simulation plans.
 test:
+    crates/pulsebeam-rtc/scripts/provision-browsers.sh --platform linux-x86_64 --verify-only
     just prepare
     cargo test --workspace --exclude pulsebeam-simulator --features pulsebeam/sim
     cargo nextest run --cargo-profile sim -p pulsebeam-simulator --no-fail-fast
     just --justfile agents/pulsebeam-agent-web/Justfile test
     just --justfile agents/react/Justfile test
+    PULSEBEAM_BROWSER_BINARY="{{justfile_directory()}}/target/pulsebeam-rtc-browsers/linux-x86_64/bin/chrome" just browser
 
 # Build browser fixtures in package ownership order, then run every Rust-owned
 # BiDi contract serially. This intentionally fails when Chrome is unavailable.

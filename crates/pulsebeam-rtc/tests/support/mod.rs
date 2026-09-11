@@ -232,26 +232,39 @@ impl PeerFixture {
         str0m_reference::crypto::from_feature_flags().install_process_default();
         let connection_addr = SocketAddr::from(([127, 0, 0, 1], 41000));
         let peer_addr = SocketAddr::from(([127, 0, 0, 1], 41001));
-        let mut peer = Rtc::builder().enable_raw_packets(true).build(start);
-        let candidate = match transport {
-            FixtureTransport::Udp => Candidate::host(peer_addr, "udp").expect("peer candidate"),
-            FixtureTransport::Tcp => Candidate::builder()
-                .tcp()
-                .host(peer_addr)
-                .tcptype(TcpType::Active)
-                .build()
-                .expect("active peer candidate"),
-        };
-        peer.add_local_candidate(candidate);
-        drain_peer(&mut peer);
-        let mut change = peer.sdp_api();
         assert!((1..=128).contains(&sender_count), "fixture sender bound");
-        let mids = (0..sender_count)
-            .map(|_| change.add_media(MediaKind::Audio, Direction::SendRecv, None, None, None))
-            .collect::<Vec<_>>();
-        let mid = mids[0];
-        let peer_channel = datachannels.then(|| change.add_channel("peer-opened".into()));
-        let (offer, pending) = change.apply().expect("peer offer");
+        let mut offer_attempts = 0;
+        let (mut peer, mid, peer_channel, offer, pending) = loop {
+            offer_attempts += 1;
+            assert!(offer_attempts <= 16, "str0m generated duplicate MIDs");
+            let mut peer = Rtc::builder().enable_raw_packets(true).build(start);
+            let candidate = match transport {
+                FixtureTransport::Udp => Candidate::host(peer_addr, "udp").expect("peer candidate"),
+                FixtureTransport::Tcp => Candidate::builder()
+                    .tcp()
+                    .host(peer_addr)
+                    .tcptype(TcpType::Active)
+                    .build()
+                    .expect("active peer candidate"),
+            };
+            peer.add_local_candidate(candidate);
+            drain_peer(&mut peer);
+            let mut change = peer.sdp_api();
+            let mids = (0..sender_count)
+                .map(|_| change.add_media(MediaKind::Audio, Direction::SendRecv, None, None, None))
+                .collect::<Vec<_>>();
+            if mids
+                .iter()
+                .enumerate()
+                .any(|(index, mid)| mids[..index].contains(mid))
+            {
+                continue;
+            }
+            let mid = mids[0];
+            let peer_channel = datachannels.then(|| change.add_channel("peer-opened".into()));
+            let (offer, pending) = change.apply().expect("peer offer");
+            break (peer, mid, peer_channel, offer, pending);
+        };
         let mut config = ConnectionConfig {
             local_candidates: vec![match transport {
                 FixtureTransport::Udp => LocalCandidate::Udp(connection_addr),

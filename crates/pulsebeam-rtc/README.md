@@ -213,14 +213,17 @@ Only unrecoverable authenticated transport state, mandatory resource exhaustion
 required for correctness, cryptographic failure, or timeout is terminal.
 
 Statistics are coherent snapshots with connection, sender, encoding, and
-DataChannel detail. The crate has no metrics-framework dependency and does not
-expose mutable controller internals.
+DataChannel counters. They expose negotiated feedback, queue and in-flight
+state, target/pacing rates, transmitted byte classes, drop/feedback counters,
+sender allocation and traffic totals, encoding receive/retirement state, and
+DataChannel buffering/message totals. The crate has no metrics-framework
+dependency and does not expose mutable controller internals.
 
 ## Validation boundary
 
-All implementation checks, tests, fixtures, benchmarks, and browser harnesses
-for this project are isolated to `crates/pulsebeam-rtc`. Workspace-wide tests
-are outside this implementation project.
+Crate checks, fixtures, deterministic tests, benchmarks, browser sources, and
+browser evidence are owned by `crates/pulsebeam-rtc`. The root `just test` gate
+also runs workspace consumers and their existing browser regression suite.
 
 Required evidence includes deterministic crate-local tests and simulation for
 negotiation, media-clock normalization, source switching, RTP/RTCP continuity,
@@ -234,6 +237,24 @@ Live pinned Chrome and Firefox sessions are required interoperability evidence.
 Differential checks against `str0m`, Ericsson SCReAM, or libwebrtc are useful
 component evidence but do not replace the documented contract or live-browser
 tests.
+
+The binding Linux x86_64 matrix is Chrome/ChromeDriver `153.0.8010.36` and
+Firefox ESR `140.15.0esr` with geckodriver `0.36.0`. Exact URLs, lengths, hashes,
+and version probes live in `browser/browser-matrix.json`. Normal `cargo test`
+runs are offline and never provision or launch a browser. Run the complete local
+and CI browser gate with:
+
+```sh
+crates/pulsebeam-rtc/scripts/run-browser-matrix.sh --platform linux-x86_64 --include-root-tests
+```
+
+The command provisions into `target/pulsebeam-rtc-browsers/linux-x86_64`, runs
+the exact ignored Chrome and Firefox RTC matrices, and then invokes the literal
+root `just test` with the same Chrome binary. Browser/driver logs, offer inputs,
+and compact JSON scenario reports are written under
+`target/pulsebeam-rtc-browser-artifacts`. Other platforms, ICE restart, and
+renegotiation are not part of the accepted v3 profile. Unsupported browser
+profile differences are recorded in each matrix report rather than skipped.
 
 Detailed public types, ownership decisions, alternatives considered, and their
 rationale are specified in [docs/design.md](docs/design.md). Detailed

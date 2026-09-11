@@ -40,7 +40,7 @@ Normative precedence is:
 5. pinned Ericsson and libwebrtc revisions as comparison oracles only.
 
 Where the pinned draft gives an equation, ordering rule, or numeric constant, the
-private `ScreamDraft01` implementation MUST transcribe it unchanged unless the
+private `ScreamController` implementation MUST transcribe it unchanged unless the
 complete deviation is listed below. The implementation keeps a source citation
 beside each transcribed equation or constant. No undocumented local tuning
 constant is allowed.
@@ -1064,44 +1064,27 @@ codes, not mutable controller objects.
 
 ### Connection-level observations
 
-- packet-feedback mode and ECN usability;
-- raw controller target and governed available RTP media-payload rates;
-- aggregate desired, allocated, admitted, and transmitted media-payload rates;
-- RTP, RTCP, SCTP, ICE/DTLS, and padding transport rates;
-- payload-efficiency values and conversion overhead;
-- native/effective queue targets, reference window, allowed/actual RTP
-  bytes-in-flight, and pacing rate;
-- paced queue bytes/packets, predicted delay, and oldest media age;
-- baseline/queue delay, variation, smoothed RTT, feedback hold, delivery rate,
-  loss classes, and confidence;
-- controller classifications and transition reasons;
-- SCTP acknowledged/admitted reserve and observed total transport rate;
-- probe attempts, successes, transport bytes, aborts, and abort reasons;
-- pre-admission frame drops, post-admission packet damage, deadline misses,
-  dependency drops, RTX outcomes, and padding;
-- unknown/duplicate/reordered feedback and every hard-bound high-water mark;
-- caller clock regressions and global-time/deadline arithmetic saturation.
+- negotiated packet-feedback mode and connection lifecycle state;
+- current target media-payload bitrate, pacing bitrate, RTP bytes in flight, and
+  queued media/DataChannel bytes;
+- transmitted RTP, RTCP, SCTP, protocol-control, and padding byte totals;
+- caller clock regressions, dropped network inputs, and
+  unknown/duplicate/stale/wrong-path feedback counters.
 
 ### Per-sender observations
 
-- requested playout range and extension acknowledgment state;
-- priority weight, desired media-payload rate, utilization, governed demand,
-  allocation, admitted rate, and transmitted rate;
-- queue-delay ceiling, pacer horizon, private latest useful horizon, and RTX
-  allowance;
-- active/application-limited classification and service balance;
-- queue bytes/packets, oldest global media age, source switches, timestamp-stale
-  drops, whole-frame drops, dependency drops, deadline misses, and RTX outcomes;
-- allocation-change reason and hysteresis state.
+- the public sender policy and current allocation;
+- queued packet/payload counts and transmitted packet/payload totals.
 
-The snapshot may use stable public enums for reason categories, but no field is
-named after a private SCReAM C++/draft variable except where the semantic concept
-itself is useful (`reference_window`, for example).
+Encoding and DataChannel snapshots contain their identifiers and the bounded
+receive/retirement or reliability/buffering/message counters documented in
+`design.md`. Private controller variables and mutable controller state are not
+public statistics.
 
 ## Validation
 
 Acceptance uses deterministic crate-local simulation, property tests, component
-comparison, and live browsers. Workspace-wide tests are outside this project.
+comparison, the pinned live-browser matrix, and the root workspace gates.
 
 ### Property tests
 
