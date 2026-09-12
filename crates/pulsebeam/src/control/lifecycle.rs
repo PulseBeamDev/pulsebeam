@@ -651,36 +651,37 @@ impl TrackLifecycle {
         desired: &DesiredTrackState,
         stager: &mut TrackLifecycleStager,
     ) {
+        let candidate_shards = desired.candidate_remote_shards();
         let active_shards = desired.active_remote_shards();
         let destinations = self.remote_destinations(identity, desired.origin.shard);
 
         for (shard, destination) in destinations {
-            let should_be_resident = active_shards.contains(&shard);
-            match (destination.resident, should_be_resident) {
-                (false, true) => {
-                    debug_assert!(!destination.route_installed);
-                    stager.update(
-                        shard,
-                        ShardUpdateOp::InstallRoute {
-                            address: destination.placement.route,
-                            action: TrackRouteAction::Forward {
-                                track_id: destination.placement.track_id,
-                            },
+            let should_be_resident = candidate_shards.contains(&shard);
+            let should_have_route = active_shards.contains(&shard);
+            if destination.resident && !should_be_resident {
+                self.stage_shard_withdrawal(shard, destination, stager);
+                self.set_destination_state(identity, shard, false, false);
+                continue;
+            }
+            if !destination.route_installed && should_have_route {
+                stager.update(
+                    shard,
+                    ShardUpdateOp::InstallRoute {
+                        address: destination.placement.route,
+                        action: TrackRouteAction::Forward {
+                            track_id: destination.placement.track_id,
                         },
-                    );
-                    self.set_route_installed(identity, shard, true);
-                }
-                (true, false) => {
-                    debug_assert!(destination.route_installed);
-                    self.stage_shard_withdrawal(shard, destination, stager);
-                    self.set_destination_state(identity, shard, false, false);
-                }
-                (true, true) => {
-                    debug_assert!(destination.route_installed);
-                }
-                (false, false) => {
-                    debug_assert!(!destination.route_installed);
-                }
+                    },
+                );
+                self.set_route_installed(identity, shard, true);
+            } else if destination.route_installed && !should_have_route {
+                stager.update(
+                    shard,
+                    ShardUpdateOp::RetireRoute {
+                        address: destination.placement.route,
+                    },
+                );
+                self.set_route_installed(identity, shard, false);
             }
         }
     }
@@ -758,13 +759,16 @@ impl TrackLifecycle {
             );
         }
 
-        for shard in desired.active_remote_shards() {
+        for shard in desired.candidate_remote_shards() {
             let destination = self
                 .placements
                 .get(&(identity, shard))
                 .copied()
-                .expect("active remote shard must have a reserved placement");
-            debug_assert!(destination.route_installed);
+                .expect("candidate remote shard must have a reserved placement");
+            debug_assert_eq!(
+                destination.route_installed,
+                desired.active_remote_shards().contains(&shard)
+            );
 
             self.stage_runtime_and_plan(
                 stager,
@@ -843,10 +847,6 @@ impl TrackLifecycle {
         );
     }
 
-    #[allow(
-        clippy::expect_used,
-        reason = "a live bound participant has a destination reserved during reconciliation"
-    )]
     fn stage_track_effect(
         &self,
         identity: TrackAncestry,
@@ -863,11 +863,19 @@ impl TrackLifecycle {
         if !location.materialized {
             return;
         }
+        let requires_placement = matches!(
+            effect,
+            ParticipantEffect::TrackCandidateAdded { .. }
+                | ParticipantEffect::TrackSubscribed { .. }
+        );
         if !self.placements.contains_key(&(identity, location.shard)) {
-            debug_assert!(
-                false,
-                "a live lifecycle participant must have a track placement"
-            );
+            if requires_placement {
+                debug_assert!(
+                    false,
+                    "a live lifecycle participant must have a track placement: identity={identity:?} participant={participant:?} shard={:?} effect={effect:?}",
+                    location.shard,
+                );
+            }
             return;
         }
 
@@ -1372,10 +1380,22 @@ mod tests {
                     track.requires_reverse_route(),
                     "origin route residency must exactly match reverse-route semantics"
                 );
-            } else if destination.resident {
-                assert!(
-                    destination.route_installed,
-                    "remote resident runtime must have its forward route installed"
+            } else {
+                let has_candidate = lifecycle.candidates[identity].iter().any(|participant| {
+                    ParticipantLocation::bound_in_room(registry, participant, identity.room_id)
+                        .is_some_and(|location| location.shard == *shard)
+                });
+                let has_binding = lifecycle.bindings[identity].iter().any(|participant| {
+                    ParticipantLocation::bound_in_room(registry, participant, identity.room_id)
+                        .is_some_and(|location| location.shard == *shard)
+                });
+                assert_eq!(
+                    destination.resident, has_candidate,
+                    "remote runtime residency must exactly match candidate state"
+                );
+                assert_eq!(
+                    destination.route_installed, has_binding,
+                    "remote forward-route residency must exactly match active binding state"
                 );
             }
         }
@@ -1551,7 +1571,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_candidate_reserves_a_placement_without_installing_a_route_or_runtime() {
+    fn remote_candidate_installs_a_catalog_runtime_without_a_forward_route() {
         let (mut lifecycle, registry) = setup(2, &[(1, 1, 0), (2, 1, 1)]);
         let (identity, _) = publish_audio(&mut lifecycle, &registry, 1, 1);
 
@@ -1569,10 +1589,11 @@ mod tests {
 
         assert_eq!(effect_kinds(&outcome), vec![EffectKind::CandidateAdded]);
         let remote = destination(&lifecycle, identity, 1);
-        assert!(!remote.resident);
+        assert!(remote.resident);
         assert!(!remote.route_installed);
         assert!(forward_install_on(&outcome, 1).is_none());
-        assert!(!operations_on(&outcome, 1).contains(&OpKind::InsertRuntime));
+        assert!(operations_on(&outcome, 1).contains(&OpKind::InsertRuntime));
+        assert!(plan_updates_on(&outcome, 1).contains(&(remote.placement.track_id, true)));
         assert_eq!(lifecycle.placements.len(), 2);
         assert_internal_invariants(&lifecycle, &registry);
     }
@@ -1656,7 +1677,7 @@ mod tests {
 
         let remote = destination(&lifecycle, identity, 1);
         assert_eq!(remote.placement, held);
-        assert!(!remote.resident);
+        assert!(remote.resident);
         assert!(!remote.route_installed);
         assert!(lifecycle.candidates[&identity].contains(&participant(2)));
         assert!(!lifecycle.bindings[&identity].contains(&participant(2)));
@@ -1664,9 +1685,10 @@ mod tests {
             operations_on(&outcome, 1),
             vec![
                 OpKind::Unsubscribed,
-                OpKind::PlanClear,
                 OpKind::RetireRoute,
-                OpKind::RemoveRuntime,
+                OpKind::InsertRuntime,
+                OpKind::Placeholder,
+                OpKind::PlanSet,
             ]
         );
         assert_internal_invariants(&lifecycle, &registry);
@@ -1704,7 +1726,7 @@ mod tests {
                 .contains_key(&(identity, ShardId::new(1)))
         );
         assert!(lifecycle.candidates[&identity].is_empty());
-        assert!(!plan_updates_on(&outcome, 1).contains(&(remote_track_id, false)));
+        assert!(plan_updates_on(&outcome, 1).contains(&(remote_track_id, false)));
         assert_internal_invariants(&lifecycle, &registry);
     }
 
@@ -2334,7 +2356,7 @@ mod tests {
             effect_kinds(&first_deactivate),
             vec![EffectKind::Unsubscribed]
         );
-        assert!(operations_on(&first_deactivate, 1).contains(&OpKind::PlanClear));
+        assert!(operations_on(&first_deactivate, 1).contains(&OpKind::RetireRoute));
 
         let second_deactivate = lifecycle.deactivate(
             room(1),
@@ -2345,7 +2367,7 @@ mod tests {
             Instant::now(),
         );
         assert!(effect_kinds(&second_deactivate).is_empty());
-        assert!(!operations_on(&second_deactivate, 1).contains(&OpKind::PlanClear));
+        assert!(!operations_on(&second_deactivate, 1).contains(&OpKind::RetireRoute));
         assert_internal_invariants(&lifecycle, &registry);
     }
 
@@ -2473,7 +2495,7 @@ mod tests {
                     candidate_shard == shard && active.contains(&participant(candidate))
                 });
                 let destination = destination(&lifecycle, identity, shard);
-                assert_eq!(destination.resident, shard_active);
+                assert!(destination.resident);
                 assert_eq!(destination.route_installed, shard_active);
             }
             assert_internal_invariants(&lifecycle, &registry);

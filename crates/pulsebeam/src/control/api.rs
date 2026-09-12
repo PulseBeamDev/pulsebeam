@@ -226,6 +226,7 @@ fn validate_directions(
     offer: &str,
     allowed: &[&str],
     required_description: &str,
+    require_active_rtp: bool,
 ) -> Result<(), ApiError> {
     let mut active_rtp = false;
     let mut session_direction = None;
@@ -262,7 +263,7 @@ fn validate_directions(
         }
     }
     finish(current_active_rtp, current_direction)?;
-    if !active_rtp {
+    if require_active_rtp && !active_rtp {
         return Err(ApiError::BadRequest(
             "offer must contain an active RTP media section".to_owned(),
         ));
@@ -271,11 +272,16 @@ fn validate_directions(
 }
 
 fn validate_native_directions(offer: &str) -> Result<(), ApiError> {
-    validate_directions(offer, &["sendonly", "recvonly"], "sendonly or recvonly")
+    validate_directions(
+        offer,
+        &["sendonly", "recvonly"],
+        "sendonly or recvonly",
+        false,
+    )
 }
 
 fn validate_strict_directions(offer: &str, required: &str) -> Result<(), ApiError> {
-    validate_directions(offer, &[required], required)
+    validate_directions(offer, &[required], required, true)
 }
 
 #[utoipa::path(
@@ -1226,6 +1232,12 @@ mod tests {
             let invalid = format!("m=audio 9 UDP/TLS/RTP/SAVPF 111\r\na={direction}\r\n");
             assert!(validate_native_directions(&invalid).is_err());
         }
+        assert!(
+            validate_native_directions(
+                "m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\na=sendrecv\r\n"
+            )
+            .is_ok()
+        );
     }
 
     #[test]

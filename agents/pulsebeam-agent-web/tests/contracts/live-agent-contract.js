@@ -73,20 +73,6 @@
     (snapshot) => snapshot.topics.subscribers[0]?.connected === true,
     "topic subscriber",
   );
-  const topicMessage = new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => {
-      remove();
-      reject(new Error("timed out waiting for ordered topic message"));
-    }, 20000);
-    const remove = receiver.subscribeEvents((event) => {
-      if (event.type !== "topic-message" || event.mode !== "ordered") return;
-      clearTimeout(timeout);
-      remove();
-      resolve(event);
-    });
-  });
-  sender.sendTopic("chat", "ordered", new Uint8Array([7, 8, 9]));
-  const receivedTopic = await topicMessage;
   const discovered = await waitFor(
     receiver,
     (snapshot) =>
@@ -102,6 +88,20 @@
       candidate.kind === "video" &&
       candidate.participantId === senderConnected.participantId,
   );
+  const topicMessage = new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      remove();
+      reject(new Error("timed out waiting for ordered topic message"));
+    }, 20000);
+    const remove = receiver.subscribeEvents((event) => {
+      if (event.type !== "topic-message" || event.mode !== "ordered") return;
+      clearTimeout(timeout);
+      remove();
+      resolve(event);
+    });
+  });
+  sender.sendTopic("chat", "ordered", new Uint8Array([7, 8, 9]));
+  const receivedTopic = await topicMessage;
   receiver.setState({
     connected: true,
     video: [

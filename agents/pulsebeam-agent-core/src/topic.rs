@@ -330,6 +330,18 @@ impl Topics {
         }
     }
 
+    pub(crate) fn retain_remote_publishers<'a>(
+        &mut self,
+        participants: impl IntoIterator<Item = &'a str>,
+    ) {
+        let participants = participants.into_iter().collect::<BTreeSet<_>>();
+        for subscriber in self.subscribers.values_mut() {
+            subscriber
+                .publishers
+                .retain(|publisher, _| participants.contains(publisher.as_str()));
+        }
+    }
+
     pub(crate) fn has_channel(&self, generation: Generation, channel: ChannelId) -> bool {
         self.active.as_ref().is_some_and(|active| {
             active.generation == generation && active.channels.contains_key(&channel)
@@ -1501,5 +1513,33 @@ mod tests {
             delivery.accept(message(3, 10)),
             Err(TopicError::StaleStream)
         ));
+    }
+
+    #[test]
+    fn departed_publishers_release_ordered_delivery_state() {
+        let subscriber = TopicSubscriber {
+            topic: "chat".to_string(),
+            mode: TopicMode::Ordered,
+            publisher_id: None,
+        };
+        let mut publishers = BTreeMap::new();
+        publishers.insert(
+            "present".to_string(),
+            PublisherDelivery::new(&message(3, 0)),
+        );
+        publishers.insert(
+            "departed".to_string(),
+            PublisherDelivery::new(&message(4, 0)),
+        );
+        let mut topics = Topics::default();
+        topics
+            .subscribers
+            .insert(subscriber.clone(), SubscriberState { publishers });
+
+        topics.retain_remote_publishers(["present"]);
+
+        let publishers = &topics.subscribers[&subscriber].publishers;
+        assert!(publishers.contains_key("present"));
+        assert!(!publishers.contains_key("departed"));
     }
 }

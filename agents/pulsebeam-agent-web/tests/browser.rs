@@ -57,7 +57,7 @@ struct Live {
     close_during_local_operation: bool,
     caller_owns_track: bool,
 }
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RuntimeLocalOperations {
     serialized_before_release: bool,
@@ -131,7 +131,7 @@ async fn web(server: &StaticServer, failure: bool) -> TestResult<()> {
         } else {
             let _: () = evaluate_json(&bidi, &context, START_PUBLIC).await?;
             let result: Public = evaluate_json(&bidi, &context, PUBLIC).await?;
-            assert_eq!(result.exports, ["createAgent"]);
+            assert_eq!(result.exports, ["attachRemoteMedia", "createAgent"]);
             assert!(
                 result.independent
                     && result.config_copied
@@ -180,7 +180,8 @@ async fn runtime_local_operations_are_serialized_and_close_fenced() -> TestResul
             result.serialized_before_release
                 && result.final_track_wins
                 && result.close_fenced
-                && result.post_close_fenced
+                && result.post_close_fenced,
+            "runtime local operation result: {result:?}",
         );
         Ok::<_, Box<dyn Error + Send + Sync>>(())
     })

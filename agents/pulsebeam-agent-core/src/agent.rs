@@ -726,6 +726,9 @@ impl Agent {
                     &active.mids,
                 )? {
                     ServerOutput::StateChanged => {
+                        self.topics.retain_remote_publishers(
+                            self.snapshot.participants.keys().map(String::as_str),
+                        );
                         agent_log!(
                             self,
                             Debug,

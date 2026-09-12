@@ -33,6 +33,14 @@ struct PeerReport {
     ordered_messages: u64,
 }
 
+#[derive(Clone)]
+struct PeerBarriers {
+    before_media: Arc<tokio::sync::Barrier>,
+    before_reconnect: Arc<tokio::sync::Barrier>,
+    after_reconnect: Arc<tokio::sync::Barrier>,
+    before_close: Arc<tokio::sync::Barrier>,
+}
+
 #[test]
 fn native_agents_prove_media_topics_reconnect_and_close() {
     let seed = std::env::var("PULSEBEAM_SIM_SEED")
@@ -64,35 +72,21 @@ fn native_agents_prove_media_topics_reconnect_and_close() {
     });
 
     let (reports_tx, mut reports_rx) = tokio::sync::mpsc::channel(2);
-    let before_reconnect = Arc::new(tokio::sync::Barrier::new(2));
-    let after_reconnect = Arc::new(tokio::sync::Barrier::new(2));
-    let before_close = Arc::new(tokio::sync::Barrier::new(2));
+    let barriers = PeerBarriers {
+        before_media: Arc::new(tokio::sync::Barrier::new(2)),
+        before_reconnect: Arc::new(tokio::sync::Barrier::new(2)),
+        after_reconnect: Arc::new(tokio::sync::Barrier::new(2)),
+        before_close: Arc::new(tokio::sync::Barrier::new(2)),
+    };
     let alice_reports = reports_tx.clone();
-    let alice_before = Arc::clone(&before_reconnect);
-    let alice_after = Arc::clone(&after_reconnect);
-    let alice_close = Arc::clone(&before_close);
+    let alice_barriers = barriers.clone();
     sim.client(alice_ip, async move {
-        let report = run_peer(
-            "alice",
-            alice_ip,
-            server_ip,
-            false,
-            alice_before,
-            alice_after,
-            alice_close,
-        )
-        .await?;
+        let report = run_peer("alice", alice_ip, server_ip, false, alice_barriers).await?;
         alice_reports.send(report).await?;
         Ok(())
     });
-    let bob_before = Arc::clone(&before_reconnect);
-    let bob_after = Arc::clone(&after_reconnect);
-    let bob_close = Arc::clone(&before_close);
     sim.client(bob_ip, async move {
-        let report = run_peer(
-            "bob", bob_ip, server_ip, true, bob_before, bob_after, bob_close,
-        )
-        .await?;
+        let report = run_peer("bob", bob_ip, server_ip, true, barriers).await?;
         reports_tx.send(report).await?;
         Ok(())
     });
@@ -132,9 +126,7 @@ async fn run_peer(
     ip: IpAddr,
     server_ip: IpAddr,
     reconnect: bool,
-    before_reconnect: Arc<tokio::sync::Barrier>,
-    after_reconnect: Arc<tokio::sync::Barrier>,
-    before_close: Arc<tokio::sync::Barrier>,
+    barriers: PeerBarriers,
 ) -> anyhow::Result<PeerReport> {
     let endpoint = format!("http://{server_ip}:7070");
     let room = RoomExternalId::new("native-vertical")?;
@@ -160,7 +152,6 @@ async fn run_peer(
     let audio = agent.local_audio("microphone".into());
     let remote_video = agent.remote_video(0).await?;
     let remote_audio = agent.remote_audio(0).await?;
-    let events = agent.events();
 
     let latest = core_ffi::TopicPublisher {
         name: "latest-state".into(),
@@ -199,7 +190,10 @@ async fn run_peer(
     };
     agent.replace_desired(desired.clone()).await?;
 
-    let initial = wait_ready(&agent, None).await?;
+    wait_connected(&agent, None).await?;
+    barriers.before_media.wait().await;
+    let initial = wait_remote_media(&agent, &video).await?;
+    barriers.before_media.wait().await;
     let participant = initial
         .participant_id
         .clone()
@@ -236,6 +230,10 @@ async fn run_peer(
     }];
     desired.audio.pinned = vec![remote_audio_id.clone()];
     agent.replace_desired(desired.clone()).await?;
+    wait_video_binding(&agent, &remote_video_id).await?;
+    prime_ordered_topic(&agent, &ordered).await?;
+    barriers.before_media.wait().await;
+    let events = agent.events();
 
     let first = exchange(
         &agent,
@@ -250,10 +248,11 @@ async fn run_peer(
     )
     .await?;
 
-    before_reconnect.wait().await;
+    barriers.before_reconnect.wait().await;
     let final_generation = if reconnect {
         agent.reconnect().await?;
-        let replacement = wait_ready(&agent, Some(first_generation)).await?;
+        wait_connected(&agent, Some(first_generation)).await?;
+        let replacement = wait_remote_media(&agent, &video).await?;
         if replacement.participant_id.as_deref() != Some(participant.as_str()) {
             anyhow::bail!("{name} participant identity changed across reconnect");
         }
@@ -263,7 +262,7 @@ async fn run_peer(
     } else {
         first_generation
     };
-    after_reconnect.wait().await;
+    barriers.after_reconnect.wait().await;
     if !reconnect {
         let replacement = wait_remote_replacement(&agent, &participant, &remote_video_id).await?;
         let replacement_video = replacement
@@ -286,8 +285,12 @@ async fn run_peer(
             .ok_or_else(|| anyhow::anyhow!("{name} did not rediscover remote audio"))?;
         desired.video[0].publication_id = replacement_video;
         desired.audio.pinned = vec![replacement_audio];
-        agent.replace_desired(desired).await?;
+        agent.replace_desired(desired.clone()).await?;
     }
+    wait_video_binding(&agent, &desired.video[0].publication_id).await?;
+    prime_ordered_topic(&agent, &ordered).await?;
+    barriers.after_reconnect.wait().await;
+    let events = agent.events();
 
     let second = exchange(
         &agent,
@@ -301,7 +304,7 @@ async fn run_peer(
         2,
     )
     .await?;
-    before_close.wait().await;
+    barriers.before_close.wait().await;
     agent.close().await?;
 
     Ok(PeerReport {
@@ -345,7 +348,10 @@ async fn wait_remote_replacement(
     .map_err(|_| anyhow::anyhow!("native peer did not observe replacement publications"))?
 }
 
-async fn wait_ready(agent: &Agent, previous: Option<u64>) -> anyhow::Result<core_ffi::Snapshot> {
+async fn wait_connected(
+    agent: &Agent,
+    previous: Option<u64>,
+) -> anyhow::Result<core_ffi::Snapshot> {
     let snapshots = agent.snapshots();
     tokio::time::timeout(Duration::from_secs(20), async {
         loop {
@@ -365,6 +371,124 @@ async fn wait_ready(agent: &Agent, previous: Option<u64>) -> anyhow::Result<core
                     .subscribers
                     .iter()
                     .all(|subscriber| subscriber.connected);
+            if snapshot.connection == core_ffi::ConnectionState::Connected
+                && generation_ready
+                && topics_ready
+            {
+                return Ok(snapshot);
+            }
+        }
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("native agent did not connect"))?
+}
+
+async fn wait_ordered_send(
+    agent: &Agent,
+    publisher: &core_ffi::TopicPublisher,
+    previous: u64,
+) -> anyhow::Result<()> {
+    let snapshots = agent.snapshots();
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let SnapshotUpdate::Snapshot { snapshot } = snapshots.next().await else {
+                anyhow::bail!("native snapshot stream closed")
+            };
+            if snapshot.topics.publishers.iter().any(|state| {
+                state.publisher == *publisher
+                    && state.next_sequence.is_some_and(|next| next > previous)
+            }) {
+                return Ok(());
+            }
+        }
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("native ordered topic send was not admitted"))?
+}
+
+async fn wait_video_binding(agent: &Agent, video_id: &str) -> anyhow::Result<core_ffi::Snapshot> {
+    let snapshots = agent.snapshots();
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let SnapshotUpdate::Snapshot { snapshot } = snapshots.next().await else {
+                anyhow::bail!("native snapshot stream closed")
+            };
+            let video_ready = snapshot
+                .video
+                .iter()
+                .any(|binding| binding.publication_id == video_id);
+            if video_ready {
+                return Ok(snapshot);
+            }
+        }
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("native video binding did not become ready"))?
+}
+
+async fn prime_ordered_topic(
+    agent: &Agent,
+    publisher: &core_ffi::TopicPublisher,
+) -> anyhow::Result<()> {
+    let snapshot = agent.snapshots().next().await;
+    let SnapshotUpdate::Snapshot { snapshot } = snapshot else {
+        anyhow::bail!("native snapshot stream closed")
+    };
+    let mut next_sequence = snapshot
+        .topics
+        .publishers
+        .iter()
+        .find(|state| state.publisher == *publisher)
+        .and_then(|state| state.next_sequence)
+        .ok_or_else(|| anyhow::anyhow!("native ordered topic publisher is not connected"))?;
+    for sequence in 0..2 {
+        agent
+            .send_topic(publisher.clone(), format!("route-{sequence}").into_bytes())
+            .await?;
+        wait_ordered_send(agent, publisher, next_sequence).await?;
+        next_sequence = next_sequence.saturating_add(1);
+    }
+
+    let snapshots = agent.snapshots();
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let SnapshotUpdate::Snapshot { snapshot } = snapshots.next().await else {
+                anyhow::bail!("native snapshot stream closed")
+            };
+            if snapshot.topics.subscribers.iter().any(|subscriber| {
+                subscriber.subscriber.mode == core_ffi::TopicMode::Ordered
+                    && subscriber.publishers > 0
+            }) {
+                return Ok(());
+            }
+        }
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("native ordered topic route did not become ready"))?
+}
+
+async fn wait_remote_media(
+    agent: &Agent,
+    video: &pulsebeam_agent_native::ffi::LocalMediaSender,
+) -> anyhow::Result<core_ffi::Snapshot> {
+    let snapshots = agent.snapshots();
+    let mut tick = tokio::time::interval(Duration::from_millis(20));
+    let mut frame_number = 0u64;
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let snapshot = tokio::select! {
+                _ = tick.tick() => {
+                    video.send(video_frame(frame_number)).await?;
+                    frame_number = frame_number.saturating_add(1);
+                    continue;
+                }
+                update = snapshots.next() => {
+                    let SnapshotUpdate::Snapshot { snapshot } = update else {
+                        anyhow::bail!("native snapshot stream closed")
+                    };
+                    snapshot
+                }
+            };
             let remote_media = snapshot.participant_id.as_ref().is_some_and(|participant| {
                 let remote: Vec<_> = snapshot
                     .publications
@@ -378,17 +502,34 @@ async fn wait_ready(agent: &Agent, previous: Option<u64>) -> anyhow::Result<core
                         .iter()
                         .any(|publication| publication.kind == core_ffi::MediaKind::Audio)
             });
-            if snapshot.connection == core_ffi::ConnectionState::Connected
-                && generation_ready
-                && topics_ready
-                && remote_media
-            {
+            if remote_media {
                 return Ok(snapshot);
             }
         }
     })
     .await
-    .map_err(|_| anyhow::anyhow!("native agent did not become ready"))?
+    .map_err(|_| anyhow::anyhow!("native agent did not discover remote media"))?
+}
+
+fn video_frame(frame_number: u64) -> core_ffi::MediaFrame {
+    core_ffi::MediaFrame {
+        timestamp: frame_number.saturating_mul(3_000),
+        clock_rate: 90_000,
+        data: KEYFRAME.to_vec(),
+        absolute_capture_time_unix_us: unix_micros(
+            pulsebeam_agent_native::clock::capture_wallclock(),
+        ),
+        contiguous: true,
+        keyframe: true,
+        audio_level_dbov: None,
+        voice_activity: None,
+        target_bitrate_bps: Some(250_000),
+        width: Some(320),
+        height: Some(180),
+        frames_per_second: Some(30),
+        dependency_descriptor: None,
+        temporal_layers: None,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -409,14 +550,25 @@ async fn exchange(
     agent
         .send_topic(latest.clone(), format!("latest-{round}").into_bytes())
         .await?;
-    for sequence in 0..2 {
-        agent
-            .send_topic(
-                ordered.clone(),
-                format!("ordered-{round}-{sequence}").into_bytes(),
-            )
-            .await?;
-    }
+    let snapshot = agent.snapshots().next().await;
+    let SnapshotUpdate::Snapshot { snapshot } = snapshot else {
+        anyhow::bail!("native snapshot stream closed")
+    };
+    let next_sequence = snapshot
+        .topics
+        .publishers
+        .iter()
+        .find(|state| state.publisher == *ordered)
+        .and_then(|state| state.next_sequence)
+        .ok_or_else(|| anyhow::anyhow!("native ordered topic publisher is not connected"))?;
+    agent
+        .send_topic(ordered.clone(), format!("ordered-{round}-0").into_bytes())
+        .await?;
+    wait_ordered_send(agent, ordered, next_sequence).await?;
+    agent
+        .send_topic(ordered.clone(), format!("ordered-{round}-1").into_bytes())
+        .await?;
+    wait_ordered_send(agent, ordered, next_sequence.saturating_add(1)).await?;
 
     let mut video_frames = 0u64;
     let mut audio_frames = 0u64;
@@ -438,23 +590,7 @@ async fn exchange(
                             .send_topic(latest.clone(), format!("latest-{round}").into_bytes())
                             .await?;
                     }
-                    let video_frame = core_ffi::MediaFrame {
-                        timestamp: frame_number.saturating_mul(3_000),
-                        clock_rate: 90_000,
-                        data: KEYFRAME.to_vec(),
-                        absolute_capture_time_unix_us: unix_micros(pulsebeam_agent_native::clock::capture_wallclock()),
-                        contiguous: true,
-                        keyframe: true,
-                        audio_level_dbov: None,
-                        voice_activity: None,
-                        target_bitrate_bps: Some(250_000),
-                        width: Some(320),
-                        height: Some(180),
-                        frames_per_second: Some(30),
-                        dependency_descriptor: None,
-                        temporal_layers: None,
-                    };
-                    video.send(video_frame).await?;
+                    video.send(video_frame(frame_number)).await?;
                     let audio_frame = core_ffi::MediaFrame {
                         timestamp: frame_number.saturating_mul(960),
                         clock_rate: 48_000,
@@ -523,9 +659,9 @@ async fn exchange(
     })
     .await
     .map_err(|_| {
-        anyhow::anyhow!(
-            "native media/topic exchange timed out: video={video_frames} audio={audio_frames} latest={latest_messages} ordered={ordered_messages}"
-        )
+            anyhow::anyhow!(
+                "native media/topic exchange {round} timed out: video={video_frames} audio={audio_frames} latest={latest_messages} ordered={ordered_messages}"
+            )
     })??;
 
     Ok((

@@ -35,6 +35,7 @@ uniffi-check: uniffi-generate
 # Check Rust/WASM and the handwritten TypeScript boundary.
 check: format-check
     cargo check -p pulsebeam-agent-web --target wasm32-unknown-unknown
+    pnpm run build:wasm
     pnpm run check
 
 # Run deterministic host-boundary tests. Browser contracts are opt-in.

@@ -79,7 +79,11 @@ verify_install() {
     return 1
   }
   local actual
-  actual="$("$stable" --version 2>&1 | head -n 1 | sed 's/[[:space:]]*$//')"
+  if ! actual="$("$stable" --version)"; then
+    echo "$name version probe failed" >&2
+    return 1
+  fi
+  actual="$(printf '%s\n' "$actual" | head -n 1 | sed 's/[[:space:]]*$//')"
   [[ "$actual" == "$probe"* ]] || {
     echo "$name version mismatch: expected '$probe', got '$actual'" >&2
     return 1

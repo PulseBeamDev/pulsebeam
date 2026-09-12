@@ -315,10 +315,6 @@ function __wbg_get_imports() {
         __wbg_clearTimeout_4e61cface6c91ad9: function(arg0, arg1) {
             arg0.clearTimeout(arg1);
         },
-        __wbg_clone_20de5fff79713788: function(arg0) {
-            const ret = arg0.clone();
-            return ret;
-        },
         __wbg_close_415158389967b124: function(arg0) {
             arg0.close();
         },

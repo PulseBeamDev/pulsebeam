@@ -2177,12 +2177,11 @@ fn a_reordering_path_does_not_churn_keyframes_test() {
 /// approximately, since any tolerance here would hide the very drift it exists to catch.
 #[test]
 fn a_plan_measures_identically_when_replayed_test() {
-    let first = deterministic_probe_plan(0x5EED_0001);
-    let second = deterministic_probe_plan(0x5EED_0001);
+    let first = deterministic_probe_process(0x5EED_0001);
+    let second = deterministic_probe_process(0x5EED_0001);
 
     assert_eq!(
-        deterministic_core(&first),
-        deterministic_core(&second),
+        first, second,
         "the same plan under the same seed produced different measurements, so the simulation is \
          reading a clock or an entropy source it does not control; every threshold in this suite \
          is unreliable until that is fixed"
@@ -2228,12 +2227,11 @@ fn deterministic_core(report: &LinkReport) -> String {
 /// two different networks.
 #[test]
 fn a_different_seed_is_a_different_network_test() {
-    let first = deterministic_probe_plan(0x5EED_0001);
-    let second = deterministic_probe_plan(0x5EED_0002);
+    let first = deterministic_probe_process(0x5EED_0001);
+    let second = deterministic_probe_process(0x5EED_0002);
 
     assert_ne!(
-        deterministic_core(&first),
-        deterministic_core(&second),
+        first, second,
         "two seeds produced byte-identical measurements, so the seed is not reaching the \
          simulation and running plans under several of them proves nothing"
     );
@@ -2241,6 +2239,48 @@ fn a_different_seed_is_a_different_network_test() {
 
 /// A plan with enough going on - loss, reordering, contention, an allocation decision - that any
 /// uncontrolled input would move at least one of the numbers it reports.
+const DETERMINISTIC_PROBE_MARKER: &str = "PULSEBEAM_DETERMINISTIC_PROBE=";
+const DETERMINISTIC_PROBE_TEST: &str = "tests::bwe::deterministic_probe_subprocess_test";
+
+fn deterministic_probe_process(seed: u64) -> String {
+    let output = std::process::Command::new(
+        std::env::current_exe().expect("the simulator test executable must have a path"),
+    )
+    .args([
+        "--exact",
+        DETERMINISTIC_PROBE_TEST,
+        "--ignored",
+        "--nocapture",
+    ])
+    .env("PULSEBEAM_DETERMINISTIC_PROBE_SEED", seed.to_string())
+    .env("RUST_LOG", "off")
+    .output()
+    .expect("the deterministic probe subprocess must start");
+    assert!(
+        output.status.success(),
+        "deterministic probe subprocess failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .find_map(|line| line.strip_prefix(DETERMINISTIC_PROBE_MARKER))
+        .map(ToOwned::to_owned)
+        .expect("deterministic probe subprocess did not report measurements")
+}
+
+#[test]
+#[ignore = "subprocess fixture for the determinism assertions"]
+fn deterministic_probe_subprocess_test() {
+    let seed = std::env::var("PULSEBEAM_DETERMINISTIC_PROBE_SEED")
+        .expect("the deterministic probe subprocess requires a seed")
+        .parse()
+        .expect("the deterministic probe seed must be a u64");
+    println!(
+        "{DETERMINISTIC_PROBE_MARKER}{}",
+        deterministic_core(&deterministic_probe_plan(seed))
+    );
+}
+
 fn deterministic_probe_plan(seed: u64) -> LinkReport {
     LocalNodeSim::new()
         .with_rng_seed(seed)

@@ -521,7 +521,7 @@ impl BrowserRuntime {
             .borrow()
             .get(&generation.get())
             .and_then(|peer| peer.remote_tracks.get(mid))
-            .map(|state| state.track.clone())
+            .map(|state| Clone::clone(&state.track))
     }
 
     pub async fn statistics(&self) -> Result<JsValue, JsValue> {
@@ -722,7 +722,7 @@ impl RuntimeInner {
             self.local_tracks.borrow_mut().insert(
                 slot.clone(),
                 LocalTrackState {
-                    track: track.clone(),
+                    track: Clone::clone(track),
                     config,
                     muted,
                 },
@@ -757,7 +757,7 @@ impl RuntimeInner {
                 return Ok(());
             }
             state.muted = muted;
-            state.track.clone()
+            Clone::clone(&state.track)
         };
         track.set_enabled(!muted);
         self.sync_local_slot(&slot)
@@ -984,7 +984,7 @@ impl RuntimeInner {
             let remote_track = event.track();
             let ended_weak = Rc::downgrade(&inner);
             let ended_mid = mid.clone();
-            let ended_track = remote_track.clone();
+            let ended_track = Clone::clone(&remote_track);
             let ended = Closure::wrap(Box::new(move |_event: Event| {
                 let Some(inner) = ended_weak.upgrade() else {
                     return;

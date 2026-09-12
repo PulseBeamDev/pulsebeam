@@ -31,6 +31,17 @@ impl DestinationServer {
             .parent()
             .and_then(Path::parent)
             .ok_or("web package must be inside the workspace")?;
+        let build = Command::new("cargo")
+            .args(["build", "--release", "-p", "pulsebeam"])
+            .current_dir(root)
+            .output()?;
+        if !build.status.success() {
+            return Err(format!(
+                "failed to build the owned PulseBeam development server:\n{}",
+                String::from_utf8_lossy(&build.stderr)
+            )
+            .into());
+        }
         let mut child = Command::new("cargo")
             .args(["run", "--release", "-p", "pulsebeam", "--", "--dev"])
             .current_dir(root)
