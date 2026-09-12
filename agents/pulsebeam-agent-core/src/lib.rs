@@ -11,6 +11,7 @@
 extern crate alloc;
 
 mod agent;
+mod catalog;
 mod effect;
 mod event;
 mod http;
@@ -25,6 +26,7 @@ pub mod ffi;
 pub use ffi::UniFfiTag;
 
 pub use agent::*;
+pub use catalog::*;
 pub use effect::*;
 pub use event::*;
 pub use http::*;

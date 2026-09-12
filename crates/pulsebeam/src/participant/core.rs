@@ -859,6 +859,7 @@ impl Participant {
                                             .participant_id
                                             .derive_track_id(TrackKind::Data, &label),
                                         origin: self.participant_id,
+                                        label: None,
                                     },
                                     channel.topic,
                                     channel.lane,
@@ -1030,6 +1031,7 @@ impl Participant {
                     shard_id: self.shard_id,
                     id: track_id,
                     origin: self.participant_id,
+                    label: None,
                 };
                 match media.kind {
                     MediaKind::Audio => {

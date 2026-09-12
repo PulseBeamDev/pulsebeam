@@ -109,6 +109,31 @@ pub struct TrackMeta {
     pub shard_id: ShardId,
     pub id: crate::entity::TrackId,
     pub origin: crate::entity::ParticipantId,
+    /// Application-facing media identity. Legacy signaling publications have
+    /// no label and are intentionally ineligible for the replacement catalog.
+    pub label: Option<String>,
+}
+
+impl TrackMeta {
+    #[allow(
+        dead_code,
+        reason = "candidate replacement signaling is intentionally not routed in this slice"
+    )]
+    pub(crate) fn labeled_media(
+        room_id: crate::entity::RoomId,
+        shard_id: ShardId,
+        origin: ParticipantId,
+        kind: TrackKind,
+        label: String,
+    ) -> Self {
+        Self {
+            room_id,
+            shard_id,
+            id: origin.derive_track_id(kind, &label),
+            origin,
+            label: Some(label),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -693,7 +718,8 @@ impl Track {
     pub fn publication_label(&self) -> Option<String> {
         match self {
             Self::Data(track) => Some(publication_label(track.lane, &track.topic)),
-            Self::Audio(_) | Self::Video(_) => None,
+            Self::Audio(track) => track.meta.label.clone(),
+            Self::Video(track) => track.meta.label.clone(),
         }
     }
 
@@ -930,6 +956,7 @@ pub mod test_utils {
             shard_id: ShardId::new(0),
             id: track_id,
             origin: participant_id,
+            label: None,
         };
         crate::track::new_video(mid, meta, layers)
     }
@@ -943,6 +970,7 @@ pub mod test_utils {
             shard_id: ShardId::new(0),
             id: track_id,
             origin: participant_id,
+            label: None,
         };
         crate::track::new_audio(mid, meta)
     }

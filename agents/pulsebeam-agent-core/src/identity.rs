@@ -3,7 +3,7 @@ use alloc::string::String;
 macro_rules! opaque_id {
     ($(#[$attribute:meta])* $name:ident) => {
         $(#[$attribute])*
-        #[derive(Clone, Hash, PartialEq, Eq)]
+        #[derive(Clone, Debug, Hash, PartialEq, Eq)]
         pub struct $name(String);
 
         impl $name {

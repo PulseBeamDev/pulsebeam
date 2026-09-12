@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use crate::{
     control::controller::ConnectionProfile,
     control::room::Room,
-    entity::{ConnectionId, ParticipantId, RoomId},
+    entity::{ConnectionId, ParticipantExternalId, ParticipantId, RoomId},
     id::ShardId,
     route::NodeTransportAddress,
 };
@@ -13,10 +13,11 @@ use crate::{
 /// The single owner of `participant -> (shard, room)`. It used to be three
 /// indexes — this registry, the lifecycle state, and a copy on every shard —
 /// which is three chances for them to disagree about where somebody is.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ParticipantMeta {
     pub shard_id: ShardId,
     pub room_id: RoomId,
+    pub participant_external_id: ParticipantExternalId,
     /// The client's ICE association, kept so teardown can retire it. The
     /// route outlives the negotiation that produced it, so something has to
     /// remember it, and this is the record that already knows who it belongs
@@ -58,6 +59,8 @@ impl RoomRegistry {
             ParticipantMeta {
                 shard_id,
                 room_id,
+                participant_external_id: ParticipantExternalId::new("test-participant")
+                    .expect("test participant external ID is valid"),
                 transport,
                 connection_id: ConnectionId::new(),
                 profile: ConnectionProfile::Native,
@@ -84,12 +87,30 @@ impl RoomRegistry {
             .collect()
     }
 
+    pub fn participant_identities_in_room(
+        &self,
+        room_id: &RoomId,
+    ) -> Vec<crate::participant::RoomParticipant> {
+        self.participant_ids_in_room(room_id)
+            .into_iter()
+            .filter_map(|id| {
+                let external_id = self.participants.get(&id)?.participant_external_id.clone();
+                Some(crate::participant::RoomParticipant { id, external_id })
+            })
+            .collect()
+    }
+
     /// Atomically installs a prepared local incarnation when it wins UUIDv7
     /// ordering. The ordering is only a local convergence discriminator: this
     /// registry is neither replicated nor durable across process restarts.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the registry atomically commits one complete participant identity, placement, and connection incarnation"
+    )]
     pub fn commit_candidate(
         &mut self,
         participant_id: ParticipantId,
+        participant_external_id: ParticipantExternalId,
         room_id: RoomId,
         shard_id: ShardId,
         transport: NodeTransportAddress,
@@ -107,6 +128,7 @@ impl RoomRegistry {
             ParticipantMeta {
                 shard_id,
                 room_id,
+                participant_external_id,
                 transport: Some(transport),
                 connection_id,
                 profile,
@@ -114,7 +136,7 @@ impl RoomRegistry {
                 materialized: true,
             },
         );
-        if let Some(previous) = previous {
+        if let Some(ref previous) = previous {
             self.remove_from_room(&previous.room_id, &participant_id, previous.shard_id);
         }
         self.rooms
@@ -200,7 +222,14 @@ mod tests {
     // Convenience only: a test is not a shard, so nothing here is
     // cross-core. See crates/pulsebeam/docs/thread-per-core.md.
     use super::*;
-    use crate::{entity::RoomExternalId, route::TransportRoute};
+    use crate::{
+        entity::{ParticipantExternalId, RoomExternalId},
+        route::TransportRoute,
+    };
+
+    fn external_id() -> ParticipantExternalId {
+        ParticipantExternalId::new("participant").unwrap()
+    }
 
     fn room_id(s: &str) -> RoomId {
         RoomId::from_external(&RoomExternalId::new(s).unwrap())
@@ -345,6 +374,7 @@ mod tests {
         let current = connection_id(1);
         reg.commit_candidate(
             participant,
+            external_id(),
             room,
             ShardId::new(0),
             transport(0, 1),
@@ -369,6 +399,7 @@ mod tests {
         let current = connection_id(1);
         reg.commit_candidate(
             participant,
+            external_id(),
             room,
             ShardId::new(0),
             transport(0, 1),
@@ -395,6 +426,7 @@ mod tests {
 
         reg.commit_candidate(
             participant,
+            external_id(),
             room,
             ShardId::new(0),
             transport(0, 2),
@@ -405,6 +437,7 @@ mod tests {
         assert_eq!(
             reg.commit_candidate(
                 participant,
+                external_id(),
                 room,
                 ShardId::new(0),
                 transport(0, 1),
@@ -429,6 +462,7 @@ mod tests {
         let current = connection_id(2);
         reg.commit_candidate(
             participant,
+            ParticipantExternalId::new("old-identity").unwrap(),
             room,
             ShardId::new(0),
             transport(0, 1),
@@ -438,6 +472,7 @@ mod tests {
         .unwrap();
         reg.commit_candidate(
             participant,
+            ParticipantExternalId::new("current-identity").unwrap(),
             room,
             ShardId::new(0),
             transport(0, 2),
@@ -455,6 +490,13 @@ mod tests {
             reg.get_participant(&participant).unwrap().connection_id,
             current
         );
+        assert_eq!(
+            reg.get_participant(&participant)
+                .unwrap()
+                .participant_external_id
+                .as_str(),
+            "current-identity"
+        );
         assert!(reg.remove_incarnation(&participant, current).is_some());
     }
 
@@ -466,6 +508,7 @@ mod tests {
         before_restart
             .commit_candidate(
                 participant,
+                external_id(),
                 room,
                 ShardId::new(0),
                 transport(0, 1),

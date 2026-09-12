@@ -15,7 +15,7 @@ use crate::{
         tcp_acceptor::{PendingTcpConn, TcpAcceptor},
         ufrag::IceUfrag,
     },
-    entity::{ConnectionId, ParticipantId, RoomId},
+    entity::{ConnectionId, ParticipantExternalId, ParticipantId, RoomId},
     id::ShardId,
     shard::{
         ShardContext,
@@ -36,6 +36,7 @@ pub struct ParticipantState {
     pub manual_sub: bool,
     pub room_id: RoomId,
     pub participant_id: ParticipantId,
+    pub participant_external_id: ParticipantExternalId,
     pub connection_id: ConnectionId,
     pub old_connection_id: Option<ConnectionId>,
     pub authorization: Option<AuthorizationLease>,
@@ -177,6 +178,7 @@ struct PendingMaterialization {
     command: Option<ShardCommand>,
     ack: Option<oneshot::Receiver<bool>>,
     participant: ParticipantId,
+    participant_external_id: ParticipantExternalId,
     connection_id: ConnectionId,
     authorization: Option<AuthorizationLease>,
     profile: ConnectionProfile,
@@ -687,7 +689,7 @@ impl ControllerActor {
         &mut self,
         room_id: crate::entity::RoomId,
         generation: u64,
-        added: Option<ParticipantId>,
+        added: Option<crate::participant::RoomParticipant>,
         removed: Option<ParticipantId>,
     ) {
         let participants: Vec<_> = self
@@ -695,7 +697,10 @@ impl ControllerActor {
             .registry
             .participant_ids_in_room(&room_id)
             .into_iter()
-            .filter(|participant| Some(*participant) != added && Some(*participant) != removed)
+            .filter(|participant| {
+                added.as_ref().map(|added| added.id) != Some(*participant)
+                    && Some(*participant) != removed
+            })
             .collect();
         for participant in participants {
             let Some(meta) = self.core.registry.get_participant(&participant) else {
@@ -709,7 +714,7 @@ impl ControllerActor {
                 generation,
                 participant,
                 crate::participant::ParticipantEffect::ParticipantsChanged {
-                    added: added.into_iter().collect(),
+                    added: added.clone().into_iter().collect(),
                     removed: removed.into_iter().collect(),
                 },
             );
@@ -853,6 +858,7 @@ impl ControllerActor {
         offer: SdpOffer,
     ) -> Result<PendingMaterialization, ControllerError> {
         let participant_id = state.participant_id;
+        let participant_external_id = state.participant_external_id.clone();
         let (slot, placement) = self.core.room_slot(&state.room_id);
         let shard = match placement {
             RoomPlacement::Hashed => self
@@ -894,6 +900,7 @@ impl ControllerActor {
             }),
             ack: Some(ack_rx),
             participant: participant_id,
+            participant_external_id,
             connection_id,
             authorization,
             profile,
@@ -912,6 +919,7 @@ impl ControllerActor {
         let room_id = pending.room_id;
         let previous = self.commit_candidate(
             participant_id,
+            pending.participant_external_id,
             room_id,
             pending.shard,
             pending.transport,
@@ -924,14 +932,22 @@ impl ControllerActor {
             self.terminate_incarnation(participant_id, previous, false);
         }
         let generation = self.lifecycle.next_generation();
-        self.stage_participant_change_at(room_id, generation, Some(participant_id), None);
+        let added = self
+            .core
+            .registry
+            .get_participant(&participant_id)
+            .map(|meta| crate::participant::RoomParticipant {
+                id: participant_id,
+                external_id: meta.participant_external_id.clone(),
+            });
+        self.stage_participant_change_at(room_id, generation, added, None);
         if let Some(meta) = self.core.registry.get_participant(&participant_id) {
             let participants = self
                 .core
                 .registry
-                .participant_ids_in_room(&room_id)
+                .participant_identities_in_room(&room_id)
                 .into_iter()
-                .filter(|participant| *participant != participant_id)
+                .filter(|participant| participant.id != participant_id)
                 .collect();
             self.stage_participant_at(
                 meta.shard_id,
@@ -967,6 +983,7 @@ impl ControllerActor {
     fn commit_candidate(
         &mut self,
         participant_id: ParticipantId,
+        participant_external_id: ParticipantExternalId,
         room_id: RoomId,
         shard: ShardId,
         transport: crate::route::NodeTransportAddress,
@@ -983,6 +1000,7 @@ impl ControllerActor {
             .registry
             .commit_candidate(
                 participant_id,
+                participant_external_id,
                 room_id,
                 shard,
                 transport,
@@ -1032,7 +1050,7 @@ impl ControllerActor {
             .core
             .registry
             .get_participant(&participant)
-            .copied()
+            .cloned()
             .filter(|meta| meta.connection_id == connection_id)
         else {
             return;
@@ -1115,7 +1133,7 @@ impl ControllerActor {
                 .core
                 .registry
                 .get_participant(&work.participant_id)
-                .copied()
+                .cloned()
                 .filter(|meta| meta.connection_id == work.connection_id)
             else {
                 continue;
@@ -1201,6 +1219,10 @@ mod replacement_tests {
         ConnectionId::from_bytes([0, 0, 0, 0, 0, 0, 0x70, 0, 0x80, 0, 0, 0, 0, 0, 0, sequence])
     }
 
+    fn participant_external_id() -> ParticipantExternalId {
+        ParticipantExternalId::new("participant").unwrap()
+    }
+
     fn authorization_lease(
         expiry: u64,
         wall_now: SystemTime,
@@ -1225,6 +1247,7 @@ mod replacement_tests {
 
         let result = actor.commit_candidate(
             participant_id,
+            participant_external_id(),
             room_id,
             ShardId::new(0),
             transport,
@@ -1256,6 +1279,7 @@ mod replacement_tests {
         actor
             .commit_candidate(
                 participant_id,
+                participant_external_id(),
                 room_id,
                 ShardId::new(0),
                 transport,
@@ -1295,6 +1319,7 @@ mod replacement_tests {
         actor
             .commit_candidate(
                 participant_id,
+                participant_external_id(),
                 room_id,
                 ShardId::new(0),
                 old_transport,
@@ -1310,6 +1335,7 @@ mod replacement_tests {
         let previous = actor
             .commit_candidate(
                 participant_id,
+                participant_external_id(),
                 room_id,
                 ShardId::new(0),
                 current_transport,
@@ -1353,6 +1379,7 @@ mod replacement_tests {
             let previous = actor
                 .commit_candidate(
                     participant_id,
+                    participant_external_id(),
                     room_id,
                     ShardId::new(0),
                     transport,
@@ -1395,6 +1422,7 @@ mod replacement_tests {
             .registry
             .commit_candidate(
                 participant_id,
+                participant_external_id(),
                 room_id,
                 ShardId::new(0),
                 old_transport,
@@ -1407,6 +1435,7 @@ mod replacement_tests {
             .registry
             .commit_candidate(
                 participant_id,
+                participant_external_id(),
                 room_id,
                 ShardId::new(0),
                 current_transport,
@@ -1418,6 +1447,7 @@ mod replacement_tests {
         assert_eq!(
             actor.core.registry.commit_candidate(
                 participant_id,
+                participant_external_id(),
                 room_id,
                 ShardId::new(0),
                 old_transport,

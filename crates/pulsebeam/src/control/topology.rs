@@ -682,6 +682,7 @@ mod tests {
             shard_id: ShardId::new(0),
             id: publisher.derive_track_id(kind, label),
             origin: publisher,
+            label: (kind != TrackKind::Data).then(|| label.to_owned()),
         };
         match kind {
             TrackKind::Data => {

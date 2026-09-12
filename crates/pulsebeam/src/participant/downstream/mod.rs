@@ -15,7 +15,6 @@ use crate::participant::event::ParticipantSink;
 pub use crate::participant::intent::AudioIntent;
 use crate::rtp::RtpPacket;
 use crate::track::{StreamWriter, Track, TrackLayer, TrackMeta};
-use ahash::HashSetExt;
 pub use audio::DownstreamAudio;
 pub(crate) use data::DownstreamData;
 use indexmap::IndexMap;
@@ -408,7 +407,7 @@ impl Downstream {
                 .chain(self.audio_tracks.values())
                 .cloned()
                 .collect(),
-            participants: ahash::HashSet::new(),
+            participants: ahash::HashMap::default(),
             video: self
                 .video
                 .slots()

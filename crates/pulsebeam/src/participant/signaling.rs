@@ -5,6 +5,7 @@ use crate::log::{LogCtx, plog_info, plog_warn};
 use crate::participant::intent::{AudioIntent, VideoIntent as Intent};
 use pulsebeam_proto::prelude::*;
 use pulsebeam_proto::signaling;
+use pulsebeam_proto::signaling_v1 as media_signaling;
 use str0m::channel::ChannelId;
 use str0m::media::Mid;
 
@@ -40,9 +41,87 @@ pub(crate) struct SignalingAudioBinding {
 
 pub(crate) struct SignalingSnapshot {
     pub(crate) publications: Vec<crate::track::TrackMeta>,
-    pub(crate) participants: HashSet<String>,
+    pub(crate) participants: HashMap<String, String>,
     pub(crate) video: Vec<SignalingVideoBinding>,
     pub(crate) audio: Vec<SignalingAudioBinding>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[allow(
+    dead_code,
+    reason = "candidate replacement signaling is intentionally not routed in this slice"
+)]
+pub(crate) enum CatalogBuildError {
+    #[error("catalog publication has no application label")]
+    MissingLabel,
+    #[error("catalog publication references a participant outside the room view")]
+    UnknownParticipant,
+    #[error("catalog contains duplicate application identity")]
+    DuplicateIdentity,
+}
+
+#[allow(
+    dead_code,
+    reason = "candidate replacement signaling is intentionally not routed in this slice"
+)]
+pub(crate) fn build_catalog(
+    recipient: crate::entity::ParticipantId,
+    snapshot: &SignalingSnapshot,
+) -> Result<media_signaling::Catalog, CatalogBuildError> {
+    let mut external_ids = HashSet::new();
+    let mut participants: Vec<_> = snapshot
+        .participants
+        .iter()
+        .filter(|(id, _)| id.as_str() != recipient.as_str())
+        .map(|(id, external_id)| {
+            if !external_ids.insert(external_id.clone()) {
+                return Err(CatalogBuildError::DuplicateIdentity);
+            }
+            Ok(media_signaling::Participant {
+                participant_id: id.clone(),
+                participant_external_id: external_id.clone(),
+            })
+        })
+        .collect::<Result<_, _>>()?;
+    participants.sort_by(|left, right| left.participant_id.cmp(&right.participant_id));
+
+    let mut track_ids = HashSet::new();
+    let mut selectors = HashSet::new();
+    let mut tracks = Vec::new();
+    for meta in &snapshot.publications {
+        if meta.origin == recipient || meta.id.kind() == crate::entity::TrackKind::Data {
+            continue;
+        }
+        let participant_id = meta.origin.as_str();
+        if !snapshot.participants.contains_key(&participant_id) {
+            return Err(CatalogBuildError::UnknownParticipant);
+        }
+        let Some(label) = meta.label.clone() else {
+            return Err(CatalogBuildError::MissingLabel);
+        };
+        let kind = match meta.id.kind() {
+            crate::entity::TrackKind::Audio => media_signaling::TrackKind::Audio,
+            crate::entity::TrackKind::Video => media_signaling::TrackKind::Video,
+            crate::entity::TrackKind::Data => continue,
+        };
+        if !track_ids.insert(meta.id)
+            || !selectors.insert((meta.origin, kind as i32, label.clone()))
+        {
+            return Err(CatalogBuildError::DuplicateIdentity);
+        }
+        tracks.push(media_signaling::RemoteTrack {
+            track_id: meta.id.as_str(),
+            participant_id,
+            kind: kind.into(),
+            label,
+        });
+    }
+    tracks.sort_by(|left, right| left.track_id.cmp(&right.track_id));
+
+    Ok(media_signaling::Catalog {
+        participants,
+        tracks,
+    })
 }
 
 pub(crate) struct SignalingIntents {
@@ -97,7 +176,7 @@ pub struct Signaling {
     /// is the large set; the bindings are bounded by the subscriber's slots and
     /// are sent whole, so only their shape is kept, to skip an unchanged group.
     previous_participants: HashSet<String>,
-    participants: HashSet<String>,
+    participants: HashMap<String, String>,
     previous_publications: HashSet<String>,
     previous_video: Vec<signaling::VideoBinding>,
     previous_audio: Vec<(String, String)>,
@@ -117,7 +196,7 @@ impl Signaling {
             dirty_bindings: true,
             full_state_retries: 0,
             previous_participants: HashSet::new(),
-            participants: HashSet::new(),
+            participants: HashMap::new(),
             previous_publications: HashSet::new(),
             previous_video: Vec::new(),
             previous_audio: Vec::new(),
@@ -271,7 +350,7 @@ impl Signaling {
         self.dirty_bindings = true;
     }
 
-    pub(crate) fn participants_snapshot(&self) -> HashSet<String> {
+    pub(crate) fn participants_snapshot(&self) -> HashMap<String, String> {
         self.participants.clone()
     }
 
@@ -283,11 +362,14 @@ impl Signaling {
 
     pub fn apply_participants(
         &mut self,
-        added: impl IntoIterator<Item = crate::entity::ParticipantId>,
+        added: impl IntoIterator<Item = crate::participant::RoomParticipant>,
         removed: impl IntoIterator<Item = crate::entity::ParticipantId>,
     ) {
         for participant in added {
-            self.participants.insert(participant.as_str());
+            self.participants.insert(
+                participant.id.as_str(),
+                participant.external_id.as_str().to_owned(),
+            );
         }
         for participant in removed {
             self.participants.remove(&participant.as_str());
@@ -308,7 +390,7 @@ impl Signaling {
         // name an audio track before anybody has heard it.
         let mut publications = Vec::new();
         let mut participants = Vec::new();
-        let seen_participants = snapshot.participants.clone();
+        let seen_participant_ids: HashSet<String> = snapshot.participants.keys().cloned().collect();
         for meta in &snapshot.publications {
             let participant_id = meta.origin.as_str();
             publications.push(signaling::Publication {
@@ -323,7 +405,7 @@ impl Signaling {
                 .into(),
             });
         }
-        participants.extend(seen_participants.iter().cloned());
+        participants.extend(seen_participant_ids.iter().cloned());
 
         let current_publication_ids: HashSet<String> = publications
             .iter()
@@ -341,7 +423,7 @@ impl Signaling {
             .collect();
         let participants_removed: Vec<String> = self
             .previous_participants
-            .difference(&seen_participants)
+            .difference(&seen_participant_ids)
             .cloned()
             .collect();
         let publications_added: Vec<signaling::Publication> = publications
@@ -412,7 +494,7 @@ impl Signaling {
         let buf = msg.encode_to_vec();
 
         self.pending_commit = Some(SignalingCommit {
-            participants: seen_participants,
+            participants: seen_participant_ids,
             publications: current_publication_ids,
             video: current_video,
             audio: current_audio_shape,
@@ -554,7 +636,7 @@ mod tests {
         let mut signaling = Signaling::new(ctx);
         let snapshot = SignalingSnapshot {
             publications: Vec::new(),
-            participants: HashSet::new(),
+            participants: HashMap::new(),
             video: Vec::new(),
             audio: Vec::new(),
         };
@@ -582,5 +664,113 @@ mod tests {
         assert!(signaling.poll(&snapshot).is_some(), "second retry emits");
         signaling.commit_sent();
         assert!(!signaling.needs_poll(), "a clean state needs no snapshot");
+    }
+
+    #[test]
+    fn replacement_catalog_is_complete_labeled_remote_state() {
+        let room = crate::entity::RoomId::from_external(
+            &crate::entity::RoomExternalId::new("room").unwrap(),
+        );
+        let recipient = crate::entity::ParticipantId::derive(
+            &room,
+            &crate::entity::ParticipantExternalId::new("self").unwrap(),
+        );
+        let remote = crate::entity::ParticipantId::derive(
+            &room,
+            &crate::entity::ParticipantExternalId::new("alice").unwrap(),
+        );
+        let video = crate::track::TrackMeta::labeled_media(
+            room,
+            crate::id::ShardId::new(1),
+            remote,
+            crate::entity::TrackKind::Video,
+            "camera".to_owned(),
+        );
+        let audio = crate::track::TrackMeta::labeled_media(
+            room,
+            crate::id::ShardId::new(2),
+            remote,
+            crate::entity::TrackKind::Audio,
+            "camera".to_owned(),
+        );
+        let self_track = crate::track::TrackMeta::labeled_media(
+            room,
+            crate::id::ShardId::new(0),
+            recipient,
+            crate::entity::TrackKind::Audio,
+            "mic".to_owned(),
+        );
+        let snapshot = SignalingSnapshot {
+            publications: vec![self_track, video.clone(), audio.clone()],
+            participants: HashMap::from_iter([
+                (remote.as_str(), "alice".to_owned()),
+                (recipient.as_str(), "self".to_owned()),
+            ]),
+            video: Vec::new(),
+            audio: Vec::new(),
+        };
+
+        let catalog = build_catalog(recipient, &snapshot).unwrap();
+
+        assert_eq!(catalog.participants.len(), 1);
+        assert_eq!(catalog.participants[0].participant_external_id, "alice");
+        assert_eq!(catalog.tracks.len(), 2);
+        assert!(
+            catalog
+                .tracks
+                .iter()
+                .all(|track| track.participant_id == remote.as_str())
+        );
+        assert!(catalog.tracks.iter().any(|track| {
+            track.kind == media_signaling::TrackKind::Audio as i32 && track.label == "camera"
+        }));
+        assert!(catalog.tracks.iter().any(|track| {
+            track.kind == media_signaling::TrackKind::Video as i32 && track.label == "camera"
+        }));
+        assert_eq!(
+            video.id,
+            remote.derive_track_id(crate::entity::TrackKind::Video, "camera")
+        );
+        assert_eq!(
+            audio.id,
+            remote.derive_track_id(crate::entity::TrackKind::Audio, "camera")
+        );
+
+        let republished = crate::track::TrackMeta::labeled_media(
+            room,
+            crate::id::ShardId::new(9),
+            remote,
+            crate::entity::TrackKind::Video,
+            "camera".to_owned(),
+        );
+        let renamed = crate::track::TrackMeta::labeled_media(
+            room,
+            crate::id::ShardId::new(9),
+            remote,
+            crate::entity::TrackKind::Video,
+            "screen".to_owned(),
+        );
+        assert_eq!(republished.id, video.id);
+        assert_ne!(renamed.id, video.id);
+    }
+
+    #[test]
+    fn unlabeled_legacy_media_cannot_enter_replacement_catalog() {
+        let participant = crate::entity::ParticipantId::new();
+        let (upstream, _) = crate::track::test_utils::make_audio_track(
+            participant,
+            str0m::media::Mid::from("legacy-mid"),
+        );
+        let snapshot = SignalingSnapshot {
+            publications: vec![upstream.meta],
+            participants: HashMap::from_iter([(participant.as_str(), "legacy".to_owned())]),
+            video: Vec::new(),
+            audio: Vec::new(),
+        };
+
+        assert_eq!(
+            build_catalog(crate::entity::ParticipantId::new(), &snapshot),
+            Err(CatalogBuildError::MissingLabel)
+        );
     }
 }
