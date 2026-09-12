@@ -12,5 +12,5 @@ pub(crate) mod transport;
 mod upstream;
 
 pub use core::*;
-pub use effect::ParticipantEffect;
+pub use effect::{ParticipantEffect, RoomParticipant};
 pub use packet::{RoutedTrackPacket, TrackPacket, TrackPacketRef};
