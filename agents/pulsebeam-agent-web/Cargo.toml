@@ -18,11 +18,11 @@ agent_core = { package = "pulsebeam-agent-core", version = "0.1.0", path = "../p
 futures-channel = "0.3.33"
 js-sys = "0.3.104"
 log = "0.4"
-spin = "0.10.0"
+spin = "0.12.3"
 serde = { version = "1", features = ["derive"] }
 serde-wasm-bindgen = "0.6"
 thiserror.workspace = true
-uniffi = { version = "=0.31.0", default-features = false, features = ["wasm-unstable-single-threaded"] }
+uniffi = { version = "=0.32.0", default-features = false, features = ["wasm-unstable-single-threaded"] }
 wasm-bindgen = "0.2.127"
 wasm-bindgen-futures = "0.4.77"
 web-sys = { version = "0.3.104", features = [
