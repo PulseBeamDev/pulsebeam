@@ -29,4 +29,4 @@ aya-ebpf = { workspace = true }
 pulsebeam-routing = { path = "../pulsebeam-routing" }
 
 [build-dependencies]
-sha2 = "0.10"
+sha2 = "0.11"
