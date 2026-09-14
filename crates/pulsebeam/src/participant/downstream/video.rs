@@ -392,7 +392,12 @@ impl VideoAllocator {
         }
 
         let mut requested = requests.to_vec();
-        requested.sort_by_key(|request| request.intent.track_id.as_str());
+        requested.sort_by_key(|request| {
+            (
+                matches!(request.playout, PlayoutPolicy::Fixed(..)),
+                request.intent.track_id.as_str(),
+            )
+        });
         if requested.windows(2).any(
             |pair| matches!(pair, [first, second] if first.intent.track_id == second.intent.track_id),
         )
@@ -2217,6 +2222,51 @@ mod assignment_tests {
     }
 
     #[test]
+    fn receiver_preview_reserves_fresh_receiver_for_default_playout() {
+        let mut allocator = setup_allocator();
+        let tracks = add_tracks(&mut allocator, 2);
+        add_slots(&mut allocator, 2);
+        let fixed = PlayoutPolicy::fixed((25, 75));
+        let locked = allocator
+            .slots
+            .values_mut()
+            .find(|slot| slot.media_index == 1)
+            .unwrap();
+        assert!(locked.playout.set_policy(fixed));
+        locked
+            .playout
+            .record_stamp(locked.playout.to_stamp().unwrap(), 1_u64.into());
+
+        let mut track_ids = tracks.ids;
+        track_ids.sort_by_key(TrackId::as_str);
+        let fixed_track = track_ids[0];
+        let default_track = track_ids[1];
+        let preview = allocator
+            .preview_receiver_assignments(&[
+                receiver_request(fixed_track, 0, fixed),
+                receiver_request(default_track, 0, PlayoutPolicy::Default),
+            ])
+            .unwrap();
+
+        assert_eq!(
+            preview
+                .assignments()
+                .iter()
+                .map(|assignment| (
+                    assignment.receiver_index,
+                    assignment.request.intent.track_id
+                ))
+                .collect::<Vec<_>>(),
+            vec![(0, default_track), (1, fixed_track)]
+        );
+        assert!(allocator.commit_receiver_assignments(preview).unwrap());
+        assert_eq!(
+            allocator.receiver_assignments(),
+            vec![(0, default_track), (1, fixed_track)]
+        );
+    }
+
+    #[test]
     fn locked_receiver_refuses_default_but_accepts_fixed_replacement() {
         let mut allocator = setup_allocator();
         let tracks = add_tracks(&mut allocator, 2);
@@ -2239,6 +2289,7 @@ mod assignment_tests {
             .unwrap();
         allocator.commit_receiver_assignments(replacement).unwrap();
         assert_eq!(allocator.receiver_assignments(), vec![(0, tracks.ids[1])]);
+        let before = allocator.receiver_assignments();
         assert!(matches!(
             allocator.preview_receiver_assignments(&[receiver_request(
                 tracks.ids[0],
@@ -2247,6 +2298,7 @@ mod assignment_tests {
             )]),
             Err(VideoReceiverAdmissionError::PlayoutResetRequired)
         ));
+        assert_eq!(allocator.receiver_assignments(), before);
     }
 
     #[test]
