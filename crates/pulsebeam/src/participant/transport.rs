@@ -515,9 +515,210 @@ impl Transport {
 
 #[cfg(test)]
 mod tests {
-    use super::egress_extension_values;
+    use super::*;
+    use std::collections::VecDeque;
+    use std::net::{Ipv4Addr, SocketAddr};
+    use std::time::{Duration, Instant as StdInstant};
     use str0m::media::{Mid, Rid};
-    use str0m::rtp::ExtensionValues;
+    use str0m::rtp::{ExtensionValues, Ssrc};
+    use str0m::{Candidate, Input};
+
+    struct Peer {
+        rtc: Rtc,
+        next: StdInstant,
+        inbound: VecDeque<(StdInstant, SocketAddr, SocketAddr, Vec<u8>)>,
+        events: Vec<Event>,
+    }
+
+    impl Peer {
+        fn new(rtc: Rtc, now: StdInstant) -> Self {
+            Self {
+                rtc,
+                next: now,
+                inbound: VecDeque::new(),
+                events: Vec::new(),
+            }
+        }
+    }
+
+    fn poll_peer(peer: &mut Peer, other: &mut Peer, now: StdInstant) {
+        loop {
+            match peer.rtc.poll_output().expect("RTC remains usable") {
+                Output::Timeout(deadline) => {
+                    peer.next = if deadline == now {
+                        now + Duration::from_millis(1)
+                    } else {
+                        deadline
+                    };
+                    break;
+                }
+                Output::Transmit(tx) => {
+                    other
+                        .inbound
+                        .push_back((now, tx.source, tx.destination, tx.contents.to_vec()));
+                }
+                Output::Event(event) => peer.events.push(event),
+            }
+        }
+    }
+
+    fn progress(left: &mut Peer, right: &mut Peer) {
+        for _ in 0..10_000 {
+            let left_input = left.inbound.front().map(|(at, ..)| *at);
+            let right_input = right.inbound.front().map(|(at, ..)| *at);
+            let mut next = (left.next, true, false);
+            if right.next < next.0 {
+                next = (right.next, false, false);
+            }
+            if let Some(at) = left_input.filter(|at| *at < next.0) {
+                next = (at, true, true);
+            }
+            if let Some(at) = right_input.filter(|at| *at < next.0) {
+                next = (at, false, true);
+            }
+            let (at, is_left, is_input) = next;
+            let (peer, other) = if is_left {
+                (&mut *left, &mut *right)
+            } else {
+                (&mut *right, &mut *left)
+            };
+            if is_input {
+                let (_, source, destination, contents) =
+                    peer.inbound.pop_front().expect("selected input");
+                peer.rtc
+                    .handle_input(Input::Receive(
+                        at,
+                        str0m::net::Receive {
+                            proto: Protocol::Udp,
+                            source,
+                            destination,
+                            contents: contents.as_slice().try_into().expect("packet is bounded"),
+                        },
+                    ))
+                    .expect("valid packet");
+            } else {
+                peer.rtc
+                    .handle_input(Input::Timeout(at))
+                    .expect("valid timeout");
+            }
+            poll_peer(peer, other, at);
+            if left.rtc.is_connected() && right.rtc.is_connected() {
+                return;
+            }
+        }
+        panic!("RTC peers did not connect");
+    }
+
+    fn connected_transport() -> (Transport, Peer, Mid, Pt, Ssrc) {
+        str0m::crypto::from_feature_flags().install_process_default();
+        let now = StdInstant::now();
+        let mut left = Peer::new(
+            Rtc::builder()
+                .set_rtp_mode(true)
+                .enable_raw_packets(true)
+                .build(now),
+            now,
+        );
+        let mut right = Peer::new(
+            Rtc::builder()
+                .set_rtp_mode(true)
+                .enable_raw_packets(true)
+                .build(now),
+            now,
+        );
+        let left_address = SocketAddr::from((Ipv4Addr::new(1, 1, 1, 1), 1000));
+        let right_address = SocketAddr::from((Ipv4Addr::new(2, 2, 2, 2), 2000));
+        let left_candidate = Candidate::host(left_address, "udp").unwrap();
+        let right_candidate = Candidate::host(right_address, "udp").unwrap();
+        left.rtc
+            .add_local_candidate(left_candidate.clone())
+            .unwrap();
+        left.rtc.add_remote_candidate(right_candidate.clone());
+        right.rtc.add_local_candidate(right_candidate).unwrap();
+        right.rtc.add_remote_candidate(left_candidate);
+        let left_fingerprint = left.rtc.direct_api().local_dtls_fingerprint().clone();
+        let right_fingerprint = right.rtc.direct_api().local_dtls_fingerprint().clone();
+        left.rtc
+            .direct_api()
+            .set_remote_fingerprint(right_fingerprint);
+        right
+            .rtc
+            .direct_api()
+            .set_remote_fingerprint(left_fingerprint);
+        let left_credentials = left.rtc.direct_api().local_ice_credentials();
+        let right_credentials = right.rtc.direct_api().local_ice_credentials();
+        left.rtc
+            .direct_api()
+            .set_remote_ice_credentials(right_credentials);
+        right
+            .rtc
+            .direct_api()
+            .set_remote_ice_credentials(left_credentials);
+        left.rtc.direct_api().set_ice_controlling(true);
+        right.rtc.direct_api().set_ice_controlling(false);
+        left.rtc.direct_api().start_dtls(true).unwrap();
+        right.rtc.direct_api().start_dtls(false).unwrap();
+        progress(&mut left, &mut right);
+
+        let mid = Mid::from("audio");
+        let ssrc = Ssrc::from(42_u32);
+        left.rtc.direct_api().declare_media(mid, MediaKind::Audio);
+        left.rtc
+            .direct_api()
+            .declare_stream_tx(ssrc, None, mid, None);
+        right.rtc.direct_api().declare_media(mid, MediaKind::Audio);
+        let pt = left
+            .rtc
+            .codec_config()
+            .find(|params| params.spec().codec == Codec::Opus)
+            .unwrap()
+            .pt();
+        let transport = Transport::new(
+            left.rtc,
+            16,
+            16,
+            tokio::time::Instant::now(),
+            #[cfg(feature = "sim")]
+            tracing::Span::none(),
+        );
+        (transport, right, mid, pt, ssrc)
+    }
+
+    fn emitted_playout_delay(
+        playout_delay: Option<(MediaTime, MediaTime)>,
+    ) -> Option<(MediaTime, MediaTime)> {
+        let (mut transport, mut receiver, mid, pt, ssrc) = connected_transport();
+        let mut packet = RtpPacket::default();
+        packet.seq_no = 7_u64.into();
+        let result = transport.apply_rtp_command(RtpWriteCommand {
+            pkt: packet,
+            mid,
+            rid: None,
+            ssrc,
+            pt,
+            kind: MediaKind::Audio,
+            now: tokio::time::Instant::now(),
+            playout_delay,
+        });
+        assert!(matches!(result, AppliedMutation::RtpWritten));
+        let mut sender = Peer {
+            rtc: transport.rtc,
+            next: StdInstant::now(),
+            inbound: VecDeque::new(),
+            events: Vec::new(),
+        };
+        progress(&mut sender, &mut receiver);
+        sender.events.into_iter().find_map(|event| match event {
+            Event::RawPacket(raw) => match *raw {
+                str0m::rtp::RawPacket::RtpTx(header, _) => header
+                    .ext_vals
+                    .play_delay_min
+                    .zip(header.ext_vals.play_delay_max),
+                _ => None,
+            },
+            _ => None,
+        })
+    }
 
     #[test]
     fn ingress_stream_identity_is_not_reused_on_egress() {
@@ -529,5 +730,16 @@ mod tests {
 
         assert_eq!(egress.mid, None);
         assert_eq!(egress.rid, None);
+    }
+
+    #[test]
+    fn emitted_rtp_carries_fixed_playout_delay() {
+        let expected = (MediaTime::from_hundredths(3), MediaTime::from_hundredths(8));
+        assert_eq!(emitted_playout_delay(Some(expected)), Some(expected));
+    }
+
+    #[test]
+    fn emitted_rtp_omits_default_playout_delay() {
+        assert_eq!(emitted_playout_delay(None), None);
     }
 }
