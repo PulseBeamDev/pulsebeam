@@ -2774,7 +2774,7 @@ mod assignment_tests {
                     writes.push(playout_delay);
                 }
             }
-            assert!(writes.iter().any(|playout| *playout == expected_playout));
+            assert!(writes.contains(&expected_playout));
         }
 
         assert!(writes.contains(&ReceiverPlayout::with_policy(first_fixed).to_stamp()));
