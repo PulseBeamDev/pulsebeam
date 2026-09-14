@@ -8,3 +8,10 @@ index f5f99d2d4609cdc39d563c070d710fa9fa9af4ec..e537422c83ab3f69f385e2a662118a02
  walrus = "0.23"
 -wasm-bindgen-cli-support = "=0.2.100"
 +wasm-bindgen-cli-support = "=0.2.127"
+diff --git a/crates/ubrn_cli/templates/wasm/Cargo.toml.txt b/crates/ubrn_cli/templates/wasm/Cargo.toml.txt
+index 5f9cdb3fea916f89ad2c5e54b1e58c10e3217b08..d7ae5242c1c2107949461858142efa2d95251103 100644
+--- a/crates/ubrn_cli/templates/wasm/Cargo.toml.txt
++++ b/crates/ubrn_cli/templates/wasm/Cargo.toml.txt
+@@ -29 +29 @@
+-wasm-bindgen = "*"
++wasm-bindgen = "=0.2.127"

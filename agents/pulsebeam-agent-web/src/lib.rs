@@ -28,3 +28,6 @@ pub use browser::BrowserRuntime;
 
 #[cfg(feature = "uniffi")]
 uniffi::setup_scaffolding!();
+
+#[cfg(feature = "uniffi")]
+agent_core::uniffi_reexport_scaffolding!();

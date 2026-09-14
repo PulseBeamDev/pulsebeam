@@ -25,6 +25,9 @@ pub mod ffi;
 
 pub use ffi::UniFfiTag;
 
+#[doc(hidden)]
+pub use ffi::uniffi_reexport_hack;
+
 pub use agent::*;
 pub use catalog::*;
 pub use effect::*;

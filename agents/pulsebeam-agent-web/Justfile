@@ -16,7 +16,7 @@ format-check: prepare
     pnpm run format:check
 
 # Regenerate the UniFFI web proof and its WASM package.
-uniffi-generate:
+uniffi-generate: prepare
     pnpm run build:uniffi
     pnpm exec prettier --write "generated/**/*.ts"
 
