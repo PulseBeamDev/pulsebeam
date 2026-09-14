@@ -553,20 +553,24 @@ impl Participant {
 
     fn apply_one_rtc_mutation(&mut self, now: Instant) -> bool {
         if let Some(write) = self.stream_writer.pop() {
-            let (pkt, mid, rid, ssrc, pt, kind) = match write {
+            let (pkt, mid, rid, ssrc, pt, kind, playout_delay) = match write {
                 StreamWrite::Video {
                     pkt,
                     mid,
                     rid,
                     ssrc,
                     pt,
-                } => (pkt, mid, rid, ssrc, pt, MediaKind::Video),
-                StreamWrite::Audio { pkt, mid, ssrc, pt } => {
-                    (pkt, mid, None, ssrc, pt, MediaKind::Audio)
-                }
+                    playout_delay,
+                } => (pkt, mid, rid, ssrc, pt, MediaKind::Video, playout_delay),
+                StreamWrite::Audio {
+                    pkt,
+                    mid,
+                    ssrc,
+                    pt,
+                    playout_delay,
+                } => (pkt, mid, None, ssrc, pt, MediaKind::Audio, playout_delay),
             };
             let seq_no = pkt.seq_no;
-            let playout_delay = self.downstream.playout_delay_to_stamp();
             let result = self.transport.apply_rtp_command(RtpWriteCommand {
                 pkt,
                 mid,
@@ -587,11 +591,13 @@ impl Participant {
                     let refreshed = self.downstream.refresh_ssrc(kind, mid, rid, ssrc);
                     debug_assert!(refreshed, "recovered stream has no downstream slot");
                     if playout_delay.is_some() {
-                        self.downstream.record_playout_delay_stamp(mid, rid, seq_no);
+                        self.downstream
+                            .record_playout_delay_stamp(kind, mid, rid, seq_no);
                     }
                 }
                 AppliedMutation::RtpWritten if playout_delay.is_some() => {
-                    self.downstream.record_playout_delay_stamp(mid, rid, seq_no);
+                    self.downstream
+                        .record_playout_delay_stamp(kind, mid, rid, seq_no);
                 }
                 AppliedMutation::KeyframeUnavailable { mid, rid } => {
                     debug_assert!(self.pending_keyframe_requests.remove(&(mid, rid)));

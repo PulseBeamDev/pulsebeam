@@ -2,13 +2,13 @@ use std::array;
 use std::time::Duration;
 
 use str0m::media::{Mid, Pt};
-use str0m::rtp::Ssrc;
+use str0m::rtp::{SeqNo, Ssrc};
 use tokio::time::Instant;
 
 use crate::control::MAX_SEND_AUDIO_SLOTS;
 use crate::entity::{AudioOrigin, TrackId};
 use crate::log::{LogCtx, plog_debug, plog_warn};
-use crate::participant::downstream::SlotConfig;
+use crate::participant::downstream::{PlayoutPolicy, ReceiverPlayout, SlotConfig};
 use crate::participant::intent::AudioIntent;
 use crate::rtp::{AUDIO_FREQUENCY, RtpPacket, timeline::Timeline};
 use crate::track::StreamWriter;
@@ -92,6 +92,7 @@ pub struct Slot {
     last_power: f32,
     /// Every occupant is rewritten onto this, so a steal does not tear the stream.
     timeline: Timeline,
+    playout: ReceiverPlayout,
 }
 
 impl Slot {
@@ -153,7 +154,12 @@ impl AudioAllocator {
             .is_some_and(|occupant| self.is_pinned(occupant.origin.track))
     }
 
+    #[cfg(test)]
     pub fn add_slot(&mut self, slot: SlotConfig) {
+        self.add_slot_with_policy(slot, PlayoutPolicy::Default);
+    }
+
+    pub(crate) fn add_slot_with_policy(&mut self, slot: SlotConfig, playout: PlayoutPolicy) {
         if self.has_slot(slot.mid) {
             plog_debug!(
                 self.ctx,
@@ -176,6 +182,7 @@ impl AudioAllocator {
                     immunity_expiry: Instant::now(),
                     last_power: 0.0,
                     timeline: Timeline::new(AUDIO_FREQUENCY),
+                    playout: ReceiverPlayout::with_policy(playout),
                 });
                 return;
             }
@@ -333,7 +340,7 @@ impl AudioAllocator {
             pkt.marker = true;
             slot.pending_marker = false;
         }
-        writer.write_audio_owned(pkt, slot.mid, slot.ssrc, slot.pt);
+        writer.write_audio_owned(pkt, slot.mid, slot.ssrc, slot.pt, slot.playout.to_stamp());
         Some(())
     }
 
@@ -386,6 +393,24 @@ impl AudioAllocator {
             .iter()
             .enumerate()
             .filter_map(|(idx, slot)| slot.as_ref().map(|slot| (idx, slot)))
+    }
+
+    pub(crate) fn set_playout_policy_all(&mut self, policy: PlayoutPolicy) {
+        for slot in self.slots.iter_mut().flatten() {
+            let _ = slot.playout.set_policy(policy);
+        }
+    }
+
+    pub(crate) fn record_playout_delay_stamp(&mut self, mid: Mid, seq: SeqNo) {
+        if let Some(slot) = self.slots.iter_mut().flatten().find(|slot| slot.mid == mid) {
+            slot.playout.record_stamp(seq);
+        }
+    }
+
+    pub(crate) fn handle_egress_stats(&mut self, mid: Mid, remote_max_seq: SeqNo) {
+        if let Some(slot) = self.slots.iter_mut().flatten().find(|slot| slot.mid == mid) {
+            slot.playout.confirm(remote_max_seq);
+        }
     }
 }
 

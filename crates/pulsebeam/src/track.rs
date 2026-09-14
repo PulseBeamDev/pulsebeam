@@ -47,12 +47,14 @@ pub enum StreamWrite {
         rid: Option<Rid>,
         ssrc: Ssrc,
         pt: Pt,
+        playout_delay: Option<(str0m::media::MediaTime, str0m::media::MediaTime)>,
     },
     Audio {
         pkt: RtpPacket,
         mid: Mid,
         ssrc: Ssrc,
         pt: Pt,
+        playout_delay: Option<(str0m::media::MediaTime, str0m::media::MediaTime)>,
     },
 }
 
@@ -82,6 +84,7 @@ impl StreamWriter {
         rid: Option<Rid>,
         ssrc: Ssrc,
         pt: Pt,
+        playout_delay: Option<(str0m::media::MediaTime, str0m::media::MediaTime)>,
     ) {
         self.pending.push_back(StreamWrite::Video {
             pkt,
@@ -89,16 +92,65 @@ impl StreamWriter {
             rid,
             ssrc,
             pt,
+            playout_delay,
         });
     }
 
-    pub fn write_audio_owned(&mut self, pkt: RtpPacket, mid: Mid, ssrc: Ssrc, pt: Pt) {
-        self.pending
-            .push_back(StreamWrite::Audio { pkt, mid, ssrc, pt });
+    pub fn write_audio_owned(
+        &mut self,
+        pkt: RtpPacket,
+        mid: Mid,
+        ssrc: Ssrc,
+        pt: Pt,
+        playout_delay: Option<(str0m::media::MediaTime, str0m::media::MediaTime)>,
+    ) {
+        self.pending.push_back(StreamWrite::Audio {
+            pkt,
+            mid,
+            ssrc,
+            pt,
+            playout_delay,
+        });
     }
 
     pub fn pop(&mut self) -> Option<StreamWrite> {
         self.pending.pop_front()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use str0m::media::MediaTime;
+
+    #[test]
+    fn queued_writes_keep_their_audio_and_video_playout_snapshots() {
+        let mut writer = StreamWriter::new();
+        let audio = Some((MediaTime::from_hundredths(2), MediaTime::from_hundredths(4)));
+        let video = Some((MediaTime::from_hundredths(6), MediaTime::from_hundredths(9)));
+
+        writer.write_audio_owned(
+            RtpPacket::default(),
+            Mid::from("audio"),
+            Ssrc::from(1_u32),
+            Pt::from(111_u8),
+            audio,
+        );
+        writer.write_video_owned(
+            RtpPacket::default(),
+            Mid::from("video"),
+            None,
+            Ssrc::from(2_u32),
+            Pt::from(96_u8),
+            video,
+        );
+
+        assert!(
+            matches!(writer.pop(), Some(StreamWrite::Audio { playout_delay, .. }) if playout_delay == audio)
+        );
+        assert!(
+            matches!(writer.pop(), Some(StreamWrite::Video { playout_delay, .. }) if playout_delay == video)
+        );
     }
 }
 

@@ -211,10 +211,84 @@ impl BweFilter {
     }
 }
 
-struct PlayoutDelayConfirm {
-    mid: Mid,
-    rid: Option<Rid>,
-    seq: SeqNo,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PlayoutPolicy {
+    Default,
+    Fixed(MediaTime, MediaTime),
+}
+
+impl PlayoutPolicy {
+    pub(crate) fn fixed(bounds: (u32, u32)) -> Self {
+        const MAX_HUNDREDTHS: u64 = 0xfff;
+        let to_hundredths = |ms: u32| ((ms as u64).saturating_add(5) / 10).min(MAX_HUNDREDTHS);
+        let max = to_hundredths(bounds.1);
+        Self::Fixed(
+            MediaTime::from_hundredths(to_hundredths(bounds.0).min(max)),
+            MediaTime::from_hundredths(max),
+        )
+    }
+}
+
+/// Playout extension state belongs to one negotiated receiver.  It deliberately
+/// does not outlive its slot: recreating the transport recreates this value.
+pub(crate) struct ReceiverPlayout {
+    policy: PlayoutPolicy,
+    locked: bool,
+    pending: bool,
+    confirm: Option<SeqNo>,
+}
+
+impl ReceiverPlayout {
+    #[cfg(test)]
+    pub(crate) fn new() -> Self {
+        Self::with_policy(PlayoutPolicy::Default)
+    }
+
+    pub(crate) fn with_policy(policy: PlayoutPolicy) -> Self {
+        Self {
+            policy,
+            locked: false,
+            pending: matches!(policy, PlayoutPolicy::Fixed(..)),
+            confirm: None,
+        }
+    }
+
+    pub(crate) fn can_admit(&self, policy: PlayoutPolicy) -> bool {
+        !matches!(policy, PlayoutPolicy::Default) || !self.locked
+    }
+
+    pub(crate) fn set_policy(&mut self, policy: PlayoutPolicy) -> bool {
+        if !self.can_admit(policy) {
+            return false;
+        }
+        if self.policy != policy {
+            self.policy = policy;
+            self.pending = matches!(policy, PlayoutPolicy::Fixed(..));
+            self.confirm = None;
+        }
+        true
+    }
+
+    pub(crate) fn to_stamp(&self) -> Option<(MediaTime, MediaTime)> {
+        match (self.pending, self.policy) {
+            (true, PlayoutPolicy::Fixed(min, max)) => Some((min, max)),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn record_stamp(&mut self, seq: SeqNo) {
+        if self.to_stamp().is_some() {
+            self.locked = true;
+            self.confirm.get_or_insert(seq);
+        }
+    }
+
+    pub(crate) fn confirm(&mut self, remote_max_seq: SeqNo) {
+        if self.confirm.is_some_and(|seq| remote_max_seq >= seq) {
+            self.pending = false;
+            self.confirm = None;
+        }
+    }
 }
 
 pub struct Downstream {
@@ -237,9 +311,10 @@ pub struct Downstream {
     /// exists, and the estimate it was at then.
     starved_since: Option<StarvationWatch>,
 
-    playout_delay: Option<(MediaTime, MediaTime)>,
-    playout_delay_pending: bool,
-    playout_delay_confirm: Option<PlayoutDelayConfirm>,
+    // Legacy signaling configures a participant-wide fixed policy before
+    // negotiated receiver slots necessarily exist.  This is only a creation
+    // template: each slot owns its live policy and queued packets carry it.
+    legacy_playout_policy: PlayoutPolicy,
 }
 
 #[derive(Clone, Copy)]
@@ -263,9 +338,7 @@ impl Downstream {
             available_bandwidth: BweFilter::new(START_BANDWIDTH),
             last_desired: video::START_BANDWIDTH,
             starved_since: None,
-            playout_delay: None,
-            playout_delay_pending: false,
-            playout_delay_confirm: None,
+            legacy_playout_policy: PlayoutPolicy::Default,
         }
     }
 
@@ -300,54 +373,37 @@ impl Downstream {
     }
 
     pub fn set_playout_delay(&mut self, bounds: Option<(u32, u32)>) {
-        const MAX_HUNDREDTHS: u64 = 0xfff;
-        let to_hundredths = |ms: u32| ((ms as u64).saturating_add(5) / 10).min(MAX_HUNDREDTHS);
         let Some(bounds) = bounds else {
             return;
         };
-        let max = to_hundredths(bounds.1);
-        let min = to_hundredths(bounds.0).min(max);
-        let delay = (
-            MediaTime::from_hundredths(min),
-            MediaTime::from_hundredths(max),
-        );
-        if self.playout_delay == Some(delay) {
-            return;
-        }
-        self.playout_delay = Some(delay);
-        self.playout_delay_pending = true;
-        self.playout_delay_confirm = None;
+        let policy = PlayoutPolicy::fixed(bounds);
+        self.legacy_playout_policy = policy;
+        self.video.set_playout_policy_all(policy);
+        self.audio.set_playout_policy_all(policy);
     }
 
-    /// Returns the playout delay to stamp if the receiver has not yet confirmed
-    /// receipt. Returns `None` once confirmed — extension is sticky so no need
-    /// to keep sending unchanged values.
-    #[inline]
-    pub fn playout_delay_to_stamp(&self) -> Option<(MediaTime, MediaTime)> {
-        if self.playout_delay_pending {
-            self.playout_delay
-        } else {
-            None
+    pub(crate) fn record_playout_delay_stamp(
+        &mut self,
+        kind: MediaKind,
+        mid: Mid,
+        rid: Option<Rid>,
+        seq: SeqNo,
+    ) {
+        match kind {
+            MediaKind::Video => self.video.record_playout_delay_stamp(mid, rid, seq),
+            MediaKind::Audio => self.audio.record_playout_delay_stamp(mid, seq),
         }
     }
 
-    /// Record that a packet with the current playout delay values was stamped.
-    /// Tracks the first such packet per change for RTCP confirmation.
-    pub fn record_playout_delay_stamp(&mut self, mid: Mid, rid: Option<Rid>, seq: SeqNo) {
-        if self.playout_delay_confirm.is_none() {
-            self.playout_delay_confirm = Some(PlayoutDelayConfirm { mid, rid, seq });
-        }
-    }
-
-    /// Called when RTCP receiver report stats arrive for a stream. Clears the
-    /// pending flag once the remote has acknowledged receipt past our tracked seq.
-    pub fn handle_egress_stats(&mut self, mid: Mid, rid: Option<Rid>, remote_max_seq: SeqNo) {
-        let Some(confirm) = &self.playout_delay_confirm else {
-            return;
-        };
-        if confirm.mid == mid && confirm.rid == rid && remote_max_seq >= confirm.seq {
-            self.playout_delay_pending = false;
-            self.playout_delay_confirm = None;
+    pub(crate) fn handle_egress_stats(
+        &mut self,
+        mid: Mid,
+        rid: Option<Rid>,
+        remote_max_seq: SeqNo,
+    ) {
+        self.video.handle_egress_stats(mid, rid, remote_max_seq);
+        if rid.is_none() {
+            self.audio.handle_egress_stats(mid, remote_max_seq);
         }
     }
 
@@ -449,10 +505,12 @@ impl Downstream {
     pub fn add_slot(&mut self, slot: SlotConfig) {
         match slot.kind {
             MediaKind::Video => {
-                self.video.add_slot(slot);
+                self.video
+                    .add_slot_with_policy(slot, self.legacy_playout_policy);
             }
             MediaKind::Audio => {
-                self.audio.add_slot(slot);
+                self.audio
+                    .add_slot_with_policy(slot, self.legacy_playout_policy);
             }
         }
         self.dirty_allocation = true;
@@ -598,6 +656,51 @@ mod tests {
     // Convenience only: a test is not a shard, so nothing here is
     // cross-core. See crates/pulsebeam/docs/thread-per-core.md.
     use super::*;
+
+    #[test]
+    fn receiver_playout_isolated_and_rearms_after_confirmation() {
+        let mut first = ReceiverPlayout::new();
+        let second = ReceiverPlayout::new();
+        let fixed = PlayoutPolicy::fixed((25, 75));
+        let replacement = PlayoutPolicy::fixed((40, 90));
+
+        assert_eq!(first.to_stamp(), None);
+        assert!(first.set_policy(fixed));
+        assert_eq!(
+            first.to_stamp(),
+            Some((MediaTime::from_hundredths(3), MediaTime::from_hundredths(8)))
+        );
+        first.record_stamp(10_u64.into());
+        assert!(!first.can_admit(PlayoutPolicy::Default));
+        assert!(second.can_admit(PlayoutPolicy::Default));
+
+        first.confirm(9_u64.into());
+        assert!(
+            first.to_stamp().is_some(),
+            "a nonmatching receiver report cannot confirm"
+        );
+        first.confirm(10_u64.into());
+        assert_eq!(first.to_stamp(), None);
+        assert!(
+            first.set_policy(replacement),
+            "fixed replacement stays legal after lock"
+        );
+        assert_eq!(
+            first.to_stamp(),
+            Some((MediaTime::from_hundredths(4), MediaTime::from_hundredths(9)))
+        );
+    }
+
+    #[test]
+    fn receiver_playout_does_not_lock_without_a_fixed_write() {
+        let mut receiver = ReceiverPlayout::new();
+        receiver.record_stamp(1_u64.into());
+        assert!(receiver.can_admit(PlayoutPolicy::Default));
+
+        assert!(receiver.set_policy(PlayoutPolicy::fixed((0, 0))));
+        receiver.record_stamp(2_u64.into());
+        assert!(!receiver.can_admit(PlayoutPolicy::Default));
+    }
 
     fn expected(initial: f64, target: f64, elapsed: Duration, time_constant: Duration) -> f64 {
         let alpha = (-elapsed.as_secs_f64() / time_constant.as_secs_f64()).exp();

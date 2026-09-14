@@ -1,5 +1,5 @@
 use crate::bitrate::{BitrateController, BitrateControllerConfig};
-use crate::participant::downstream::SlotConfig;
+use crate::participant::downstream::{PlayoutPolicy, ReceiverPlayout, SlotConfig};
 use crate::participant::event::ParticipantSink;
 use crate::rtp;
 #[cfg(test)]
@@ -15,7 +15,7 @@ use std::ops::{Deref, DerefMut};
 use std::time::Duration;
 use str0m::bwe::Bitrate;
 use str0m::media::{KeyframeRequest, Mid, Pt, Rid};
-use str0m::rtp::Ssrc;
+use str0m::rtp::{SeqNo, Ssrc};
 use tokio::time::Instant;
 
 use crate::entity::TrackId;
@@ -336,6 +336,37 @@ impl VideoAllocator {
             .map(|slot| slot.media_index)
     }
 
+    pub(crate) fn set_playout_policy_all(&mut self, policy: PlayoutPolicy) {
+        for slot in self.slots.values_mut() {
+            let _ = slot.playout.set_policy(policy);
+        }
+    }
+
+    pub(crate) fn record_playout_delay_stamp(&mut self, mid: Mid, rid: Option<Rid>, seq: SeqNo) {
+        if let Some(slot) = self
+            .slots
+            .values_mut()
+            .find(|slot| slot.mid == mid && slot.rid == rid)
+        {
+            slot.playout.record_stamp(seq);
+        }
+    }
+
+    pub(crate) fn handle_egress_stats(
+        &mut self,
+        mid: Mid,
+        rid: Option<Rid>,
+        remote_max_seq: SeqNo,
+    ) {
+        if let Some(slot) = self
+            .slots
+            .values_mut()
+            .find(|slot| slot.mid == mid && slot.rid == rid)
+        {
+            slot.playout.confirm(remote_max_seq);
+        }
+    }
+
     pub fn refresh_ssrc(&mut self, mid: Mid, rid: Option<Rid>, ssrc: Ssrc) -> bool {
         for slot in self.slots.values_mut() {
             if slot.mid == mid && slot.rid == rid {
@@ -346,12 +377,17 @@ impl VideoAllocator {
         false
     }
 
+    #[cfg(test)]
     pub fn add_slot(&mut self, config: SlotConfig) {
+        self.add_slot_with_policy(config, PlayoutPolicy::Default);
+    }
+
+    pub(crate) fn add_slot_with_policy(&mut self, config: SlotConfig, playout: PlayoutPolicy) {
         if self.has_slot(config.mid) {
             plog_debug!(self.ctx, mid = %config.mid, "video slot already provisioned; skipping duplicate");
             return;
         }
-        let slot = Slot::new(self.ctx, config);
+        let slot = Slot::new(self.ctx, config, playout);
         self.slots.insert(slot);
         self.rebalance();
     }
@@ -827,10 +863,11 @@ struct Slot {
     staging_keyframe_last_at: Option<Instant>,
     /// Current retry interval for PLI probes while waiting for the staging keyframe.
     staging_keyframe_interval: Duration,
+    playout: ReceiverPlayout,
 }
 
 impl Slot {
-    fn new(ctx: LogCtx, cfg: SlotConfig) -> Self {
+    fn new(ctx: LogCtx, cfg: SlotConfig, playout: PlayoutPolicy) -> Self {
         Self {
             ctx,
             mid: cfg.mid,
@@ -852,6 +889,7 @@ impl Slot {
             staging_keyframe_retries: 0,
             staging_keyframe_last_at: None,
             staging_keyframe_interval: KEYFRAME_FIRST_RETRY,
+            playout: ReceiverPlayout::with_policy(playout),
         }
     }
 
@@ -1065,8 +1103,9 @@ impl Slot {
         // change in the active stream means a switch was promoted this tick.
         let (mid, rid, ssrc, pt) = (self.mid, self.rid, self.ssrc, self.pt);
         let before = self.switcher.active_stream();
+        let playout_delay = self.playout.to_stamp();
         self.switcher.feed(track_id, cache, arrival_ts, &mut |out| {
-            writer.write_video_owned(out, mid, rid, ssrc, pt);
+            writer.write_video_owned(out, mid, rid, ssrc, pt, playout_delay);
         });
         self.switcher.active_stream() != before
     }
@@ -2730,7 +2769,7 @@ mod slot_switch_tests {
             let high = track.by_quality(LayerQuality::High).unwrap().clone();
             let low = track.by_quality(LayerQuality::Low).unwrap().clone();
 
-            let mut slot = Slot::new(test_ctx(), SlotConfig::default());
+            let mut slot = Slot::new(test_ctx(), SlotConfig::default(), PlayoutPolicy::Default);
             slot.paused = false;
 
             Self {
