@@ -276,9 +276,9 @@ impl ReceiverPlayout {
         }
     }
 
-    pub(crate) fn record_stamp(&mut self, seq: SeqNo) {
-        if self.to_stamp().is_some() {
-            self.locked = true;
+    pub(crate) fn record_stamp(&mut self, stamped: (MediaTime, MediaTime), seq: SeqNo) {
+        self.locked = true;
+        if self.to_stamp() == Some(stamped) {
             self.confirm.get_or_insert(seq);
         }
     }
@@ -387,11 +387,19 @@ impl Downstream {
         kind: MediaKind,
         mid: Mid,
         rid: Option<Rid>,
+        playout_delay: Option<(MediaTime, MediaTime)>,
         seq: SeqNo,
     ) {
+        let Some(playout_delay) = playout_delay else {
+            return;
+        };
         match kind {
-            MediaKind::Video => self.video.record_playout_delay_stamp(mid, rid, seq),
-            MediaKind::Audio => self.audio.record_playout_delay_stamp(mid, seq),
+            MediaKind::Video => self
+                .video
+                .record_playout_delay_stamp(mid, rid, playout_delay, seq),
+            MediaKind::Audio => self
+                .audio
+                .record_playout_delay_stamp(mid, playout_delay, seq),
         }
     }
 
@@ -670,7 +678,7 @@ mod tests {
             first.to_stamp(),
             Some((MediaTime::from_hundredths(3), MediaTime::from_hundredths(8)))
         );
-        first.record_stamp(10_u64.into());
+        first.record_stamp(first.to_stamp().unwrap(), 10_u64.into());
         assert!(!first.can_admit(PlayoutPolicy::Default));
         assert!(second.can_admit(PlayoutPolicy::Default));
 
@@ -694,11 +702,37 @@ mod tests {
     #[test]
     fn receiver_playout_does_not_lock_without_a_fixed_write() {
         let mut receiver = ReceiverPlayout::new();
-        receiver.record_stamp(1_u64.into());
-        assert!(receiver.can_admit(PlayoutPolicy::Default));
-
         assert!(receiver.set_policy(PlayoutPolicy::fixed((0, 0))));
-        receiver.record_stamp(2_u64.into());
+        receiver.record_stamp(receiver.to_stamp().unwrap(), 2_u64.into());
+        assert!(!receiver.can_admit(PlayoutPolicy::Default));
+    }
+
+    #[test]
+    fn queued_playout_stamp_does_not_confirm_a_fixed_replacement() {
+        let mut receiver = ReceiverPlayout::with_policy(PlayoutPolicy::fixed((25, 75)));
+        let first = receiver.to_stamp().unwrap();
+        let replacement = PlayoutPolicy::fixed((40, 90));
+
+        assert!(receiver.set_policy(replacement));
+        let replacement_bounds = receiver.to_stamp().unwrap();
+        receiver.record_stamp(first, 10_u64.into());
+        receiver.confirm(10_u64.into());
+
+        assert!(!receiver.can_admit(PlayoutPolicy::Default));
+        assert_eq!(receiver.to_stamp(), Some(replacement_bounds));
+        receiver.record_stamp(replacement_bounds, 11_u64.into());
+        receiver.confirm(11_u64.into());
+        assert_eq!(receiver.to_stamp(), None);
+    }
+
+    #[test]
+    fn queued_fixed_playout_stamp_locks_a_later_default_policy() {
+        let mut receiver = ReceiverPlayout::with_policy(PlayoutPolicy::fixed((25, 75)));
+        let stamped = receiver.to_stamp().unwrap();
+
+        assert!(receiver.set_policy(PlayoutPolicy::Default));
+        receiver.record_stamp(stamped, 10_u64.into());
+
         assert!(!receiver.can_admit(PlayoutPolicy::Default));
     }
 

@@ -342,13 +342,19 @@ impl VideoAllocator {
         }
     }
 
-    pub(crate) fn record_playout_delay_stamp(&mut self, mid: Mid, rid: Option<Rid>, seq: SeqNo) {
+    pub(crate) fn record_playout_delay_stamp(
+        &mut self,
+        mid: Mid,
+        rid: Option<Rid>,
+        playout_delay: (str0m::media::MediaTime, str0m::media::MediaTime),
+        seq: SeqNo,
+    ) {
         if let Some(slot) = self
             .slots
             .values_mut()
             .find(|slot| slot.mid == mid && slot.rid == rid)
         {
-            slot.playout.record_stamp(seq);
+            slot.playout.record_stamp(playout_delay, seq);
         }
     }
 

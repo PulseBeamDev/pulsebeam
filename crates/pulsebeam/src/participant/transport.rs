@@ -21,6 +21,8 @@ fn egress_extension_values(
     ext_vals
         .user_values
         .remove::<str0m::rtp::vla::VideoLayersAllocation>();
+    ext_vals.play_delay_min = None;
+    ext_vals.play_delay_max = None;
     if let Some((min, max)) = playout_delay {
         ext_vals.play_delay_min = Some(min);
         ext_vals.play_delay_max = Some(max);
@@ -686,10 +688,15 @@ mod tests {
 
     fn emitted_playout_delay(
         playout_delay: Option<(MediaTime, MediaTime)>,
+        upstream_playout_delay: Option<(MediaTime, MediaTime)>,
     ) -> Option<(MediaTime, MediaTime)> {
         let (mut transport, mut receiver, mid, pt, ssrc) = connected_transport();
         let mut packet = RtpPacket::default();
         packet.seq_no = 7_u64.into();
+        if let Some((min, max)) = upstream_playout_delay {
+            packet.ext_vals.play_delay_min = Some(min);
+            packet.ext_vals.play_delay_max = Some(max);
+        }
         let result = transport.apply_rtp_command(RtpWriteCommand {
             pkt: packet,
             mid,
@@ -735,11 +742,12 @@ mod tests {
     #[test]
     fn emitted_rtp_carries_fixed_playout_delay() {
         let expected = (MediaTime::from_hundredths(3), MediaTime::from_hundredths(8));
-        assert_eq!(emitted_playout_delay(Some(expected)), Some(expected));
+        assert_eq!(emitted_playout_delay(Some(expected), None), Some(expected));
     }
 
     #[test]
-    fn emitted_rtp_omits_default_playout_delay() {
-        assert_eq!(emitted_playout_delay(None), None);
+    fn default_egress_omits_upstream_playout_delay() {
+        let upstream = (MediaTime::from_hundredths(3), MediaTime::from_hundredths(8));
+        assert_eq!(emitted_playout_delay(None, Some(upstream)), None);
     }
 }
