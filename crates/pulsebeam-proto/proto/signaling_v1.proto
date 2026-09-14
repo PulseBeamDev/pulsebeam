@@ -530,6 +530,7 @@ enum ErrorCode {
 
   PROTOCOL_ERROR = 7;
   INTERNAL = 8;
+  PLAYOUT_RESET_REQUIRED = 9;
 }
 
 

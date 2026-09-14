@@ -1,6 +1,7 @@
 use std::array;
 use std::time::Duration;
 
+use ahash::{HashSet, HashSetExt};
 use str0m::media::{Mid, Pt};
 use str0m::rtp::{SeqNo, Ssrc};
 use tokio::time::Instant;
@@ -41,6 +42,39 @@ pub struct AudioAllocator {
     /// What the client asked for. Auto with no pins until it says otherwise,
     /// which is what the SFU did before a client could say anything about audio.
     intent: AudioIntent,
+    receiver_assignment_revision: u64,
+    playout_reset_required: bool,
+}
+
+#[derive(Clone)]
+pub(crate) struct AudioReceiverRequest {
+    pub(crate) track_id: TrackId,
+    pub(crate) playout: PlayoutPolicy,
+}
+
+#[derive(Clone)]
+pub(crate) struct AudioReceiverAssignment {
+    pub(crate) receiver_index: u32,
+    pub(crate) request: AudioReceiverRequest,
+}
+
+pub(crate) struct AudioReceiverPreview {
+    revision: u64,
+    assignments: Vec<AudioReceiverAssignment>,
+}
+
+impl AudioReceiverPreview {
+    pub(crate) fn assignments(&self) -> &[AudioReceiverAssignment] {
+        &self.assignments
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AudioReceiverAdmissionError {
+    Capacity,
+    DuplicateTrack,
+    PlayoutResetRequired,
+    Stale,
 }
 
 pub struct DownstreamAudio {
@@ -93,6 +127,9 @@ pub struct Slot {
     /// Every occupant is rewritten onto this, so a steal does not tear the stream.
     timeline: Timeline,
     playout: ReceiverPlayout,
+    logical_track_id: Option<TrackId>,
+    /// Explicit assignments are protected from the packet-driven selector.
+    explicit: bool,
 }
 
 impl Slot {
@@ -137,11 +174,136 @@ impl AudioAllocator {
                 pinned: Vec::new(),
                 auto: !manual_sub,
             },
+            receiver_assignment_revision: 0,
+            playout_reset_required: false,
         }
     }
 
     pub fn set_intent(&mut self, intent: AudioIntent) {
         self.intent = intent;
+    }
+
+    fn invalidate_receiver_previews(&mut self) {
+        self.receiver_assignment_revision = self.receiver_assignment_revision.wrapping_add(1);
+    }
+
+    /// Preview explicit audio placement without changing the packet selector or
+    /// receiver policy.  The caller supplies the already catalog-validated
+    /// preference list; duplicates are checked before the capacity prefix is
+    /// selected so an overlong malformed request cannot hide one.
+    pub(crate) fn preview_receiver_assignments(
+        &self,
+        requests: &[AudioReceiverRequest],
+    ) -> Result<AudioReceiverPreview, AudioReceiverAdmissionError> {
+        let mut seen = HashSet::with_capacity(requests.len());
+        if requests
+            .iter()
+            .any(|request| !seen.insert(request.track_id))
+        {
+            return Err(AudioReceiverAdmissionError::DuplicateTrack);
+        }
+        let capacity = self.slot_count();
+        let selected = requests
+            .get(..requests.len().min(capacity))
+            .unwrap_or(requests);
+        let mut slots: Vec<_> = self.slots.iter().flatten().collect();
+        slots.sort_by_key(|slot| slot.media_index);
+        let Some(chosen) = best_audio_matching(selected, &slots) else {
+            return Err(AudioReceiverAdmissionError::PlayoutResetRequired);
+        };
+        let assignments = chosen
+            .into_iter()
+            .zip(selected.iter().cloned())
+            .filter_map(|(slot_index, request)| {
+                slots.get(slot_index).map(|slot| AudioReceiverAssignment {
+                    receiver_index: slot.media_index,
+                    request,
+                })
+            })
+            .collect();
+        Ok(AudioReceiverPreview {
+            revision: self.receiver_assignment_revision,
+            assignments,
+        })
+    }
+
+    /// Commit a still-current preview in one pass.  No fallible operation
+    /// follows the stale/compatibility checks, which lets the caller combine
+    /// this with the video preview in a transaction.
+    pub(crate) fn commit_receiver_assignments(
+        &mut self,
+        preview: AudioReceiverPreview,
+    ) -> Result<bool, AudioReceiverAdmissionError> {
+        if preview.revision != self.receiver_assignment_revision {
+            return Err(AudioReceiverAdmissionError::Stale);
+        }
+        if preview.assignments.iter().any(|assignment| {
+            self.slots
+                .iter()
+                .flatten()
+                .find(|slot| slot.media_index == assignment.receiver_index)
+                .is_none_or(|slot| !slot.playout.can_admit(assignment.request.playout))
+        }) {
+            return Err(AudioReceiverAdmissionError::Stale);
+        }
+        let changed = self.slots.iter().flatten().any(|slot| {
+            preview
+                .assignments
+                .iter()
+                .find(|assignment| assignment.receiver_index == slot.media_index)
+                .map(|assignment| assignment.request.track_id)
+                != slot.logical_track_id
+        });
+        for slot in self.slots.iter_mut().flatten() {
+            let assignment = preview
+                .assignments
+                .iter()
+                .find(|assignment| assignment.receiver_index == slot.media_index);
+            if let Some(assignment) = assignment {
+                if slot.logical_track_id != Some(assignment.request.track_id) {
+                    slot.occupant = None;
+                    slot.pending_marker = true;
+                }
+                let _ = slot.playout.set_policy(assignment.request.playout);
+                slot.logical_track_id = Some(assignment.request.track_id);
+                slot.explicit = true;
+            } else {
+                slot.explicit = false;
+                if slot.logical_track_id.is_some_and(|track| {
+                    preview
+                        .assignments
+                        .iter()
+                        .all(|assignment| assignment.request.track_id != track)
+                }) {
+                    slot.logical_track_id = None;
+                    slot.occupant = None;
+                    slot.pending_marker = true;
+                }
+            }
+        }
+        self.invalidate_receiver_previews();
+        Ok(changed)
+    }
+
+    pub(crate) fn receiver_assignments(&self) -> Vec<(u32, TrackId)> {
+        let mut assignments: Vec<_> = self
+            .slots
+            .iter()
+            .flatten()
+            .filter_map(|slot| {
+                slot.logical_track_id
+                    .map(|track_id| (slot.media_index, track_id))
+            })
+            .collect();
+        assignments.sort_by_key(|(receiver_index, _)| *receiver_index);
+        assignments
+    }
+
+    /// A packet-path admission blocked only by fixed receiver locks.  This is
+    /// edge-triggered so a packet storm cannot create an unbounded outcome
+    /// queue; the signaling transaction consumes and correlates it later.
+    pub(crate) fn take_playout_reset_required(&mut self) -> bool {
+        std::mem::take(&mut self.playout_reset_required)
     }
 
     fn is_pinned(&self, track: TrackId) -> bool {
@@ -183,7 +345,10 @@ impl AudioAllocator {
                     last_power: 0.0,
                     timeline: Timeline::new(AUDIO_FREQUENCY),
                     playout: ReceiverPlayout::with_policy(playout),
+                    logical_track_id: None,
+                    explicit: false,
                 });
+                self.invalidate_receiver_previews();
                 return;
             }
         }
@@ -206,13 +371,22 @@ impl AudioAllocator {
     /// Returns whether this slot was carrying them.
     pub fn remove_track(&mut self, track_id: &TrackId) -> bool {
         let mut removed = false;
+        let mut assignment_changed = false;
         for slot in self.slots.iter_mut().flatten() {
+            if slot.logical_track_id == Some(*track_id) {
+                slot.logical_track_id = None;
+                slot.explicit = false;
+                assignment_changed = true;
+            }
             if slot.occupant.is_some_and(|o| o.origin.track == *track_id) {
                 slot.occupant = None;
                 // The next speaker to take this slot starts a talk spurt, whoever they are.
                 slot.pending_marker = true;
                 removed = true;
             }
+        }
+        if assignment_changed {
+            self.invalidate_receiver_previews();
         }
         removed
     }
@@ -313,6 +487,11 @@ impl AudioAllocator {
         let previous = slot.occupant;
         let switched = previous.map(|o| o.origin) != Some(origin);
         self.speakers_changed |= switched;
+        let assignment_changed = slot.logical_track_id != Some(origin.track);
+        if assignment_changed {
+            debug_assert!(!slot.explicit);
+            slot.logical_track_id = Some(origin.track);
+        }
         slot.occupant = Some(Occupant { origin, level_dbov });
         slot.last_arrival_ts = Some(now);
         // Peak-hold with decay: one quiet packet must not instantly demote a talker's rank.
@@ -341,37 +520,53 @@ impl AudioAllocator {
             slot.pending_marker = false;
         }
         writer.write_audio_owned(pkt, slot.mid, slot.ssrc, slot.pt, slot.playout.to_stamp());
+        if assignment_changed {
+            self.invalidate_receiver_previews();
+        }
         Some(())
     }
 
     /// Which slot this speaker gets, if any.
-    fn slot_for(&self, origin: AudioOrigin, power: f32, now: Instant) -> Option<usize> {
+    fn slot_for(&mut self, origin: AudioOrigin, power: f32, now: Instant) -> Option<usize> {
         let pinned = self.is_pinned(origin.track);
         if !pinned && !self.intent.auto {
             return None;
         }
         if let Some((idx, _)) = self
             .provisioned()
-            .find(|(_, slot)| slot.occupant.map(|o| o.origin) == Some(origin))
+            .find(|(_, slot)| slot.logical_track_id == Some(origin.track))
         {
             return Some(idx);
         }
+        // A logical explicit receiver belongs solely to its selected track.
+        // Automatic traffic can only use fresh default-policy receivers or
+        // replace another automatic occupant.
+        let can_auto =
+            |slot: &Slot| !slot.explicit && slot.playout.can_admit(PlayoutPolicy::Default);
         if let Some((idx, _)) = self
             .provisioned()
-            .find(|(_, slot)| slot.is_dead(now) && !slot.is_immune(now))
+            .find(|(_, slot)| can_auto(slot) && slot.is_dead(now) && !slot.is_immune(now))
         {
             return Some(idx);
         }
         // A pinned occupant is never displaced, so it is not a candidate however
         // quiet it goes - that is what pinning means.
-        let (idx, quietest) = self
+        let Some((idx, quietest)) = self
             .provisioned()
-            .filter(|(_, slot)| !slot.is_immune(now) && !self.holds_pin(slot))
+            .filter(|(_, slot)| can_auto(slot) && !slot.is_immune(now) && !self.holds_pin(slot))
             .min_by(|(_, a), (_, b)| {
                 a.last_power
                     .partial_cmp(&b.last_power)
                     .unwrap_or(std::cmp::Ordering::Equal)
-            })?;
+            })
+        else {
+            if self.provisioned().any(|(_, slot)| !slot.explicit)
+                && !self.provisioned().any(|(_, slot)| can_auto(slot))
+            {
+                self.playout_reset_required = true;
+            }
+            return None;
+        };
         // A pin takes its slot on arrival; loudness only decides between the
         // tracks competing for what pinning left over.
         if pinned || power > quietest.last_power {
@@ -399,6 +594,7 @@ impl AudioAllocator {
         for slot in self.slots.iter_mut().flatten() {
             let _ = slot.playout.set_policy(policy);
         }
+        self.invalidate_receiver_previews();
     }
 
     pub(crate) fn record_playout_delay_stamp(
@@ -409,6 +605,7 @@ impl AudioAllocator {
     ) {
         if let Some(slot) = self.slots.iter_mut().flatten().find(|slot| slot.mid == mid) {
             slot.playout.record_stamp(playout_delay, seq);
+            self.invalidate_receiver_previews();
         }
     }
 
@@ -417,6 +614,74 @@ impl AudioAllocator {
             slot.playout.confirm(remote_max_seq);
         }
     }
+}
+
+fn best_audio_matching(requests: &[AudioReceiverRequest], slots: &[&Slot]) -> Option<Vec<usize>> {
+    fn search(
+        request_index: usize,
+        requests: &[AudioReceiverRequest],
+        slots: &[&Slot],
+        used: &mut [bool],
+        current: &mut Vec<usize>,
+        best: &mut Option<(usize, Vec<usize>)>,
+    ) {
+        if request_index == requests.len() {
+            let preserved = current
+                .iter()
+                .enumerate()
+                .filter(|(index, slot_index)| {
+                    slots.get(**slot_index).is_some_and(|slot| {
+                        requests
+                            .get(*index)
+                            .is_some_and(|request| slot.logical_track_id == Some(request.track_id))
+                    })
+                })
+                .count();
+            if best.as_ref().is_none_or(|(best_preserved, best_slots)| {
+                preserved > *best_preserved
+                    || (preserved == *best_preserved && current.as_slice() < best_slots.as_slice())
+            }) {
+                *best = Some((preserved, current.clone()));
+            }
+            return;
+        }
+        let Some(request) = requests.get(request_index) else {
+            return;
+        };
+        for (slot_index, slot) in slots.iter().enumerate() {
+            if used.get(slot_index).copied().unwrap_or(true)
+                || !slot.playout.can_admit(request.playout)
+            {
+                continue;
+            }
+            let Some(used_slot) = used.get_mut(slot_index) else {
+                continue;
+            };
+            *used_slot = true;
+            current.push(slot_index);
+            search(
+                request_index.saturating_add(1),
+                requests,
+                slots,
+                used,
+                current,
+                best,
+            );
+            let _ = current.pop();
+            if let Some(used_slot) = used.get_mut(slot_index) {
+                *used_slot = false;
+            }
+        }
+    }
+
+    if requests.len() > slots.len() {
+        return None;
+    }
+    let mut used = vec![false; slots.len()];
+    let mut current = Vec::with_capacity(requests.len());
+    let mut best = None;
+    search(0, requests, slots, &mut used, &mut current, &mut best);
+    best.map(|(_, slots)| slots)
 }
 
 #[inline(always)]
@@ -504,6 +769,117 @@ mod tests {
 
     fn heard_origins(alloc: &AudioAllocator) -> Vec<AudioOrigin> {
         alloc.assignments().into_iter().map(|h| h.origin).collect()
+    }
+
+    #[test]
+    fn receiver_preview_rejects_duplicates_before_selecting_the_capacity_prefix() {
+        let alloc = allocator_with(1);
+        let track = origin(1).track;
+        let request = AudioReceiverRequest {
+            track_id: track,
+            playout: PlayoutPolicy::Default,
+        };
+        assert!(matches!(
+            alloc.preview_receiver_assignments(&[request.clone(), request]),
+            Err(AudioReceiverAdmissionError::DuplicateTrack)
+        ));
+    }
+
+    #[test]
+    fn receiver_preview_commits_a_unique_logical_assignment() {
+        let mut alloc = allocator_with(2);
+        let first = origin(1).track;
+        let second = origin(2).track;
+        let preview = alloc
+            .preview_receiver_assignments(&[
+                AudioReceiverRequest {
+                    track_id: first,
+                    playout: PlayoutPolicy::Default,
+                },
+                AudioReceiverRequest {
+                    track_id: second,
+                    playout: PlayoutPolicy::Default,
+                },
+            ])
+            .unwrap();
+        assert!(alloc.commit_receiver_assignments(preview).unwrap());
+        assert_eq!(
+            alloc.receiver_assignments(),
+            vec![(1000, first), (1001, second)]
+        );
+    }
+
+    #[test]
+    fn explicit_receivers_are_not_stolen_and_auto_fills_only_the_remainder() {
+        let mut alloc = allocator_with(2);
+        let explicit = origin(1);
+        let automatic = origin(2);
+        let preview = alloc
+            .preview_receiver_assignments(&[AudioReceiverRequest {
+                track_id: explicit.track,
+                playout: PlayoutPolicy::Default,
+            }])
+            .unwrap();
+        alloc.commit_receiver_assignments(preview).unwrap();
+
+        let mut writer = StreamWriter::new();
+        assert!(
+            alloc
+                .on_rtp(automatic, &speaking(-20), &mut writer)
+                .is_some()
+        );
+        assert!(
+            alloc
+                .on_rtp(explicit, &speaking(-20), &mut writer)
+                .is_some()
+        );
+        assert_eq!(
+            alloc.receiver_assignments(),
+            vec![(1000, explicit.track), (1001, automatic.track)]
+        );
+    }
+
+    #[test]
+    fn a_locked_receiver_reports_one_reset_required_outcome_without_assignment() {
+        let mut alloc = AudioAllocator::new(test_ctx(), false);
+        let fixed = PlayoutPolicy::fixed((25, 75));
+        alloc.add_slot_with_policy(slot_config("a0", 1000), fixed);
+        let slot = alloc.slots[0].as_mut().unwrap();
+        let stamp = slot.playout.to_stamp().unwrap();
+        slot.playout.record_stamp(stamp, 1_u64.into());
+
+        assert!(
+            alloc
+                .on_rtp(origin(1), &speaking(-20), &mut StreamWriter::new())
+                .is_none()
+        );
+        assert!(alloc.take_playout_reset_required());
+        assert!(!alloc.take_playout_reset_required());
+        assert!(alloc.receiver_assignments().is_empty());
+    }
+
+    #[test]
+    fn stale_receiver_preview_preserves_committed_assignment() {
+        let mut alloc = allocator_with(1);
+        let stale = alloc
+            .preview_receiver_assignments(&[AudioReceiverRequest {
+                track_id: origin(1).track,
+                playout: PlayoutPolicy::Default,
+            }])
+            .unwrap();
+        let current_track = origin(2).track;
+        let current = alloc
+            .preview_receiver_assignments(&[AudioReceiverRequest {
+                track_id: current_track,
+                playout: PlayoutPolicy::Default,
+            }])
+            .unwrap();
+        alloc.commit_receiver_assignments(current).unwrap();
+        assert!(matches!(
+            alloc.commit_receiver_assignments(stale),
+            Err(AudioReceiverAdmissionError::Stale)
+        ));
+        assert_eq!(alloc.receiver_assignments(), vec![(1000, current_track)]);
     }
 
     #[test]
