@@ -114,6 +114,7 @@ pub struct VideoAllocator {
     last_reconciled: HashSet<(TrackHandle, DownstreamSlotKey)>,
     desired_ctrl: BitrateController,
     current_allocation: Bitrate,
+    receiver_assignment_revision: u64,
     #[cfg(test)]
     test_keys: SlotMap<TrackHandle, ()>,
     #[cfg(test)]
@@ -122,6 +123,37 @@ pub struct VideoAllocator {
 
 pub struct DownstreamVideo {
     allocator: VideoAllocator,
+}
+
+#[derive(Clone)]
+pub(crate) struct VideoReceiverRequest {
+    pub(crate) intent: Intent,
+    pub(crate) playout: PlayoutPolicy,
+}
+
+#[derive(Clone)]
+pub(crate) struct VideoReceiverAssignment {
+    pub(crate) receiver_index: u32,
+    pub(crate) request: VideoReceiverRequest,
+}
+
+pub(crate) struct VideoReceiverPreview {
+    revision: u64,
+    assignments: Vec<VideoReceiverAssignment>,
+}
+
+impl VideoReceiverPreview {
+    pub(crate) fn assignments(&self) -> &[VideoReceiverAssignment] {
+        &self.assignments
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum VideoReceiverAdmissionError {
+    Capacity,
+    DuplicateTrack,
+    PlayoutResetRequired,
+    Stale,
 }
 
 impl DownstreamVideo {
@@ -147,6 +179,10 @@ impl DerefMut for DownstreamVideo {
 }
 
 impl VideoAllocator {
+    fn invalidate_receiver_previews(&mut self) {
+        self.receiver_assignment_revision = self.receiver_assignment_revision.wrapping_add(1);
+    }
+
     pub(crate) fn new(ctx: LogCtx, manual_sub: bool) -> Self {
         let desired_ctrl = BitrateControllerConfig {
             min_bitrate: START_BANDWIDTH,
@@ -166,6 +202,7 @@ impl VideoAllocator {
             last_reconciled: HashSet::new(),
             desired_ctrl,
             current_allocation: Bitrate::ZERO,
+            receiver_assignment_revision: 0,
             #[cfg(test)]
             test_keys: SlotMap::with_key(),
             #[cfg(test)]
@@ -221,6 +258,7 @@ impl VideoAllocator {
                 slot.stop();
             }
         }
+        self.invalidate_receiver_previews();
         self.rebalance();
         true
     }
@@ -246,6 +284,7 @@ impl VideoAllocator {
                 Self::configure_slot(tracks, track_handles, slot, None);
             }
         }
+        self.invalidate_receiver_previews();
     }
 
     /// Routes this slot to the given track at the specified QoS, or stops
@@ -340,6 +379,132 @@ impl VideoAllocator {
         for slot in self.slots.values_mut() {
             let _ = slot.playout.set_policy(policy);
         }
+        self.invalidate_receiver_previews();
+    }
+
+    /// Evaluate every requested receiver without changing allocator state.
+    pub(crate) fn preview_receiver_assignments(
+        &self,
+        requests: &[VideoReceiverRequest],
+    ) -> Result<VideoReceiverPreview, VideoReceiverAdmissionError> {
+        if requests.len() > self.slots.len() {
+            return Err(VideoReceiverAdmissionError::Capacity);
+        }
+
+        let mut requested = requests.to_vec();
+        requested.sort_by_key(|request| request.intent.track_id.as_str());
+        if requested.windows(2).any(
+            |pair| matches!(pair, [first, second] if first.intent.track_id == second.intent.track_id),
+        )
+        {
+            return Err(VideoReceiverAdmissionError::DuplicateTrack);
+        }
+
+        let mut slots: Vec<_> = self.slots.values().collect();
+        slots.sort_by_key(|slot| (slot.media_index, slot.mid.to_string()));
+        let mut assigned = HashSet::new();
+        let mut assignments = Vec::with_capacity(requested.len());
+
+        for request in &requested {
+            if let Some(slot) = slots.iter().find(|slot| {
+                slot.logical_track_id == Some(request.intent.track_id)
+                    && slot.playout.can_admit(request.playout)
+            }) {
+                assigned.insert(slot.media_index);
+                assignments.push(VideoReceiverAssignment {
+                    receiver_index: slot.media_index,
+                    request: request.clone(),
+                });
+            }
+        }
+
+        for request in &requested {
+            if assignments
+                .iter()
+                .any(|assignment| assignment.request.intent.track_id == request.intent.track_id)
+            {
+                continue;
+            }
+            let Some(slot) = slots.iter().find(|slot| {
+                !assigned.contains(&slot.media_index) && slot.playout.can_admit(request.playout)
+            }) else {
+                return Err(VideoReceiverAdmissionError::PlayoutResetRequired);
+            };
+            assigned.insert(slot.media_index);
+            assignments.push(VideoReceiverAssignment {
+                receiver_index: slot.media_index,
+                request: request.clone(),
+            });
+        }
+
+        assignments.sort_by_key(|assignment| assignment.receiver_index);
+        Ok(VideoReceiverPreview {
+            revision: self.receiver_assignment_revision,
+            assignments,
+        })
+    }
+
+    /// Apply an accepted preview only if it still describes this allocator.
+    pub(crate) fn commit_receiver_assignments(
+        &mut self,
+        preview: VideoReceiverPreview,
+    ) -> Result<bool, VideoReceiverAdmissionError> {
+        if preview.revision != self.receiver_assignment_revision {
+            return Err(VideoReceiverAdmissionError::Stale);
+        }
+        if preview.assignments.iter().any(|assignment| {
+            self.slots
+                .values()
+                .find(|slot| slot.media_index == assignment.receiver_index)
+                .is_none_or(|slot| !slot.playout.can_admit(assignment.request.playout))
+        }) {
+            return Err(VideoReceiverAdmissionError::Stale);
+        }
+
+        let logical_changed = self.slots.values().any(|slot| {
+            preview
+                .assignments
+                .iter()
+                .find(|assignment| assignment.receiver_index == slot.media_index)
+                .map(|assignment| assignment.request.intent.track_id)
+                != slot.logical_track_id
+        });
+
+        for slot in self.slots.values_mut() {
+            let Some(assignment) = preview
+                .assignments
+                .iter()
+                .find(|assignment| assignment.receiver_index == slot.media_index)
+            else {
+                slot.logical_track_id = None;
+                slot.stop();
+                continue;
+            };
+            debug_assert!(slot.playout.set_policy(assignment.request.playout));
+            slot.logical_track_id = Some(assignment.request.intent.track_id);
+            Self::configure_slot(
+                &self.tracks,
+                &self.track_handles,
+                slot,
+                Some(&assignment.request.intent),
+            );
+        }
+        self.invalidate_receiver_previews();
+        Ok(logical_changed)
+    }
+
+    /// The logical map is independent from active, staging, and draining RTP.
+    pub(crate) fn receiver_assignments(&self) -> Vec<(u32, TrackId)> {
+        let mut assignments: Vec<_> = self
+            .slots
+            .values()
+            .filter_map(|slot| {
+                slot.logical_track_id
+                    .map(|track_id| (slot.media_index, track_id))
+            })
+            .collect();
+        assignments.sort_by_key(|(receiver_index, _)| *receiver_index);
+        assignments
     }
 
     pub(crate) fn record_playout_delay_stamp(
@@ -355,6 +520,7 @@ impl VideoAllocator {
             .find(|slot| slot.mid == mid && slot.rid == rid)
         {
             slot.playout.record_stamp(playout_delay, seq);
+            self.invalidate_receiver_previews();
         }
     }
 
@@ -395,6 +561,7 @@ impl VideoAllocator {
         }
         let slot = Slot::new(self.ctx, config, playout);
         self.slots.insert(slot);
+        self.invalidate_receiver_previews();
         self.rebalance();
     }
 
@@ -870,6 +1037,7 @@ struct Slot {
     /// Current retry interval for PLI probes while waiting for the staging keyframe.
     staging_keyframe_interval: Duration,
     playout: ReceiverPlayout,
+    logical_track_id: Option<TrackId>,
 }
 
 impl Slot {
@@ -896,6 +1064,7 @@ impl Slot {
             staging_keyframe_last_at: None,
             staging_keyframe_interval: KEYFRAME_FIRST_RETRY,
             playout: ReceiverPlayout::with_policy(playout),
+            logical_track_id: None,
         }
     }
 
@@ -1932,9 +2101,181 @@ mod assignment_tests {
         for i in 0..count {
             allocator.add_slot(SlotConfig {
                 mid: Mid::from(&format!("s{i}")[..]),
+                media_index: u32::try_from(i).unwrap_or(u32::MAX),
                 ..SlotConfig::default()
             });
         }
+    }
+
+    fn receiver_request(
+        track_id: TrackId,
+        height: u32,
+        playout: PlayoutPolicy,
+    ) -> VideoReceiverRequest {
+        VideoReceiverRequest {
+            intent: Intent {
+                track_id,
+                target_height: height,
+                min_height: 0,
+                min_fps: 0,
+                priority: 0,
+            },
+            playout,
+        }
+    }
+
+    #[test]
+    fn receiver_preview_is_deterministic_and_preserves_compatible_occupants() {
+        let mut allocator = setup_allocator();
+        let tracks = add_tracks(&mut allocator, 2);
+        add_slots(&mut allocator, 2);
+        let first = receiver_request(tracks.ids[0], 0, PlayoutPolicy::Default);
+        let second = receiver_request(tracks.ids[1], 0, PlayoutPolicy::Default);
+
+        let preview = allocator
+            .preview_receiver_assignments(&[second.clone(), first.clone()])
+            .unwrap();
+        let reordered = allocator
+            .preview_receiver_assignments(&[first.clone(), second.clone()])
+            .unwrap();
+        assert_eq!(
+            preview
+                .assignments()
+                .iter()
+                .map(|assignment| (
+                    assignment.receiver_index,
+                    assignment.request.intent.track_id
+                ))
+                .collect::<Vec<_>>(),
+            reordered
+                .assignments()
+                .iter()
+                .map(|assignment| (
+                    assignment.receiver_index,
+                    assignment.request.intent.track_id
+                ))
+                .collect::<Vec<_>>()
+        );
+        assert!(allocator.commit_receiver_assignments(preview).unwrap());
+
+        let preserved = allocator
+            .preview_receiver_assignments(&[first, second])
+            .unwrap();
+        assert_eq!(
+            preserved
+                .assignments()
+                .iter()
+                .map(|assignment| assignment.receiver_index)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        assert_eq!(allocator.receiver_assignments().len(), 2);
+    }
+
+    #[test]
+    fn receiver_preview_rejects_capacity_and_duplicate_tracks_without_mutation() {
+        let mut allocator = setup_allocator();
+        let tracks = add_tracks(&mut allocator, 3);
+        add_slots(&mut allocator, 2);
+        let request = receiver_request(tracks.ids[0], 0, PlayoutPolicy::Default);
+        let before = allocator.receiver_assignments();
+
+        assert!(matches!(
+            allocator.preview_receiver_assignments(&[
+                request.clone(),
+                receiver_request(tracks.ids[1], 0, PlayoutPolicy::Default),
+                receiver_request(tracks.ids[2], 0, PlayoutPolicy::Default),
+            ]),
+            Err(VideoReceiverAdmissionError::Capacity)
+        ));
+        assert!(matches!(
+            allocator.preview_receiver_assignments(&[request.clone(), request]),
+            Err(VideoReceiverAdmissionError::DuplicateTrack)
+        ));
+        assert_eq!(allocator.receiver_assignments(), before);
+    }
+
+    #[test]
+    fn height_zero_receiver_assignment_survives_forwarding_suppression() {
+        let mut allocator = setup_allocator();
+        let tracks = add_tracks(&mut allocator, 1);
+        add_slots(&mut allocator, 1);
+        let preview = allocator
+            .preview_receiver_assignments(&[receiver_request(
+                tracks.ids[0],
+                0,
+                PlayoutPolicy::Default,
+            )])
+            .unwrap();
+        allocator.commit_receiver_assignments(preview).unwrap();
+
+        assert_eq!(allocator.receiver_assignments(), vec![(0, tracks.ids[0])]);
+        assert!(matches!(
+            allocator.slots.values().next().unwrap().state(),
+            SlotState::Idle
+        ));
+    }
+
+    #[test]
+    fn locked_receiver_refuses_default_but_accepts_fixed_replacement() {
+        let mut allocator = setup_allocator();
+        let tracks = add_tracks(&mut allocator, 2);
+        add_slots(&mut allocator, 1);
+        let fixed = PlayoutPolicy::fixed((25, 75));
+        let initial = allocator
+            .preview_receiver_assignments(&[receiver_request(tracks.ids[0], 0, fixed)])
+            .unwrap();
+        allocator.commit_receiver_assignments(initial).unwrap();
+        let slot = allocator.slots.values_mut().next().unwrap();
+        slot.playout
+            .record_stamp(slot.playout.to_stamp().unwrap(), 1_u64.into());
+
+        let replacement = allocator
+            .preview_receiver_assignments(&[receiver_request(
+                tracks.ids[1],
+                0,
+                PlayoutPolicy::fixed((40, 90)),
+            )])
+            .unwrap();
+        allocator.commit_receiver_assignments(replacement).unwrap();
+        assert_eq!(allocator.receiver_assignments(), vec![(0, tracks.ids[1])]);
+        assert!(matches!(
+            allocator.preview_receiver_assignments(&[receiver_request(
+                tracks.ids[0],
+                0,
+                PlayoutPolicy::Default,
+            )]),
+            Err(VideoReceiverAdmissionError::PlayoutResetRequired)
+        ));
+    }
+
+    #[test]
+    fn stale_receiver_preview_does_not_change_assignments() {
+        let mut allocator = setup_allocator();
+        let tracks = add_tracks(&mut allocator, 2);
+        add_slots(&mut allocator, 1);
+        let stale = allocator
+            .preview_receiver_assignments(&[receiver_request(
+                tracks.ids[0],
+                0,
+                PlayoutPolicy::Default,
+            )])
+            .unwrap();
+        let current = allocator
+            .preview_receiver_assignments(&[receiver_request(
+                tracks.ids[1],
+                0,
+                PlayoutPolicy::Default,
+            )])
+            .unwrap();
+        allocator.commit_receiver_assignments(current).unwrap();
+        let before = allocator.receiver_assignments();
+
+        assert!(matches!(
+            allocator.commit_receiver_assignments(stale),
+            Err(VideoReceiverAdmissionError::Stale)
+        ));
+        assert_eq!(allocator.receiver_assignments(), before);
     }
 
     #[test]
