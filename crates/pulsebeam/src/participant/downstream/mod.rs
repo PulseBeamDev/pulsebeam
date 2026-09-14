@@ -16,6 +16,10 @@ pub use crate::participant::intent::AudioIntent;
 use crate::rtp::RtpPacket;
 use crate::track::{StreamWriter, Track, TrackLayer, TrackMeta};
 pub use audio::DownstreamAudio;
+pub(crate) use audio::{
+    AudioReceiverAdmissionError, AudioReceiverAssignment, AudioReceiverPreview,
+    AudioReceiverRequest,
+};
 pub(crate) use data::DownstreamData;
 use indexmap::IndexMap;
 use slotmap::SecondaryMap;
@@ -568,6 +572,34 @@ impl Downstream {
     #[allow(dead_code)] // Crate-private 04B transaction seam; intentionally unrouted in 04A2.
     pub(crate) fn video_receiver_assignments(&self) -> Vec<(u32, TrackId)> {
         self.video.receiver_assignments()
+    }
+
+    pub(crate) fn preview_audio_receiver_assignments(
+        &self,
+        requests: &[AudioReceiverRequest],
+    ) -> Result<AudioReceiverPreview, AudioReceiverAdmissionError> {
+        self.audio.preview_receiver_assignments(requests)
+    }
+
+    pub(crate) fn commit_audio_receiver_assignments(
+        &mut self,
+        preview: AudioReceiverPreview,
+    ) -> Result<bool, AudioReceiverAdmissionError> {
+        self.audio.commit_receiver_assignments(preview)
+    }
+
+    pub(crate) fn previewed_audio_receiver_assignments(
+        preview: &AudioReceiverPreview,
+    ) -> &[AudioReceiverAssignment] {
+        preview.assignments()
+    }
+
+    pub(crate) fn audio_receiver_assignments(&self) -> Vec<(u32, TrackId)> {
+        self.audio.receiver_assignments()
+    }
+
+    pub(crate) fn take_audio_playout_reset_required(&mut self) -> bool {
+        self.audio.take_playout_reset_required()
     }
 
     pub fn refresh_ssrc(
