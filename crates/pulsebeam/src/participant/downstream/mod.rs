@@ -24,6 +24,10 @@ use str0m::media::{KeyframeRequest, MediaKind, MediaTime, Mid, Pt, Rid};
 use str0m::rtp::{SeqNo, Ssrc};
 use tokio::time::Instant;
 pub use video::{DownstreamVideo, INITIAL_BANDWIDTH};
+pub(crate) use video::{
+    VideoReceiverAdmissionError, VideoReceiverAssignment, VideoReceiverPreview,
+    VideoReceiverRequest,
+};
 
 #[derive(Clone)]
 pub struct SlotConfig {
@@ -536,6 +540,34 @@ impl Downstream {
             MediaKind::Video => self.video.receiver_index(mid),
             MediaKind::Audio => self.audio.receiver_index(mid),
         }
+    }
+
+    #[allow(dead_code)] // Crate-private 04B transaction seam; intentionally unrouted in 04A2.
+    pub(crate) fn preview_video_receiver_assignments(
+        &self,
+        requests: &[VideoReceiverRequest],
+    ) -> Result<VideoReceiverPreview, VideoReceiverAdmissionError> {
+        self.video.preview_receiver_assignments(requests)
+    }
+
+    #[allow(dead_code)] // Crate-private 04B transaction seam; intentionally unrouted in 04A2.
+    pub(crate) fn commit_video_receiver_assignments(
+        &mut self,
+        preview: VideoReceiverPreview,
+    ) -> Result<bool, VideoReceiverAdmissionError> {
+        self.video.commit_receiver_assignments(preview)
+    }
+
+    #[allow(dead_code)] // Crate-private 04B transaction seam; intentionally unrouted in 04A2.
+    pub(crate) fn previewed_video_receiver_assignments(
+        preview: &VideoReceiverPreview,
+    ) -> &[VideoReceiverAssignment] {
+        preview.assignments()
+    }
+
+    #[allow(dead_code)] // Crate-private 04B transaction seam; intentionally unrouted in 04A2.
+    pub(crate) fn video_receiver_assignments(&self) -> Vec<(u32, TrackId)> {
+        self.video.receiver_assignments()
     }
 
     pub fn refresh_ssrc(
