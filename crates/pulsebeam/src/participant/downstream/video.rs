@@ -391,6 +391,14 @@ impl VideoAllocator {
             return Err(VideoReceiverAdmissionError::Capacity);
         }
 
+        let mut track_ids = HashSet::with_capacity(requests.len());
+        if requests
+            .iter()
+            .any(|request| !track_ids.insert(request.intent.track_id))
+        {
+            return Err(VideoReceiverAdmissionError::DuplicateTrack);
+        }
+
         let mut requested = requests.to_vec();
         requested.sort_by_key(|request| {
             (
@@ -398,12 +406,6 @@ impl VideoAllocator {
                 request.intent.track_id.as_str(),
             )
         });
-        if requested.windows(2).any(
-            |pair| matches!(pair, [first, second] if first.intent.track_id == second.intent.track_id),
-        )
-        {
-            return Err(VideoReceiverAdmissionError::DuplicateTrack);
-        }
 
         let mut slots: Vec<_> = self.slots.values().collect();
         slots.sort_by_key(|slot| (slot.media_index, slot.mid.to_string()));
@@ -2198,6 +2200,89 @@ mod assignment_tests {
             Err(VideoReceiverAdmissionError::DuplicateTrack)
         ));
         assert_eq!(allocator.receiver_assignments(), before);
+    }
+
+    #[test]
+    fn receiver_preview_rejects_mixed_policy_duplicate_tracks_in_every_order_without_mutation() {
+        let mut allocator = setup_allocator();
+        let tracks = add_tracks(&mut allocator, 3);
+        add_slots(&mut allocator, 3);
+        let fixed = PlayoutPolicy::fixed((25, 75));
+        let initial = allocator
+            .preview_receiver_assignments(&[receiver_request(tracks.ids[2], 0, fixed)])
+            .unwrap();
+        allocator.commit_receiver_assignments(initial).unwrap();
+        let slot = allocator.slots.values_mut().next().unwrap();
+        slot.playout
+            .record_stamp(slot.playout.to_stamp().unwrap(), 1_u64.into());
+
+        let before = allocator.receiver_assignments();
+        let receiver_state = allocator
+            .slots
+            .values()
+            .map(|slot| {
+                (
+                    slot.media_index,
+                    slot.logical_track_id,
+                    slot.playout.policy,
+                    slot.playout.locked,
+                    slot.playout.pending,
+                    slot.playout.confirm,
+                    slot.state(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let revision = allocator.receiver_assignment_revision;
+        let requests = [
+            receiver_request(tracks.ids[0], 0, PlayoutPolicy::Default),
+            receiver_request(tracks.ids[1], 0, PlayoutPolicy::Default),
+            receiver_request(tracks.ids[0], 0, fixed),
+        ];
+
+        for permutation in [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ] {
+            let request_set = permutation.map(|index| requests[index].clone());
+            assert!(matches!(
+                allocator.preview_receiver_assignments(&request_set),
+                Err(VideoReceiverAdmissionError::DuplicateTrack)
+            ));
+        }
+
+        assert_eq!(allocator.receiver_assignments(), before);
+        assert_eq!(allocator.receiver_assignment_revision, revision);
+        assert!(
+            allocator
+                .slots
+                .values()
+                .map(|slot| {
+                    (
+                        slot.media_index,
+                        slot.logical_track_id,
+                        slot.playout.policy,
+                        slot.playout.locked,
+                        slot.playout.pending,
+                        slot.playout.confirm,
+                        slot.state(),
+                    )
+                })
+                .collect::<Vec<_>>()
+                == receiver_state
+        );
+
+        assert!(
+            allocator
+                .preview_receiver_assignments(&[
+                    receiver_request(tracks.ids[0], 0, PlayoutPolicy::Default),
+                    receiver_request(tracks.ids[1], 0, fixed),
+                ])
+                .is_ok()
+        );
     }
 
     #[test]
