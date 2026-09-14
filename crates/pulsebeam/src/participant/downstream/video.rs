@@ -2556,49 +2556,102 @@ mod assignment_tests {
     #[test]
     fn receiver_preview_matches_independent_bounded_matching_oracle() {
         let policies = [PlayoutPolicy::Default, PlayoutPolicy::fixed((25, 75))];
-        for locked_receivers in 0_u8..4 {
-            for occupant in [None, Some(0), Some(1)] {
-                for request_policies in [
-                    [policies[0], policies[0]],
-                    [policies[0], policies[1]],
-                    [policies[1], policies[1]],
-                ] {
-                    let mut allocator = setup_allocator();
-                    let tracks = add_tracks(&mut allocator, 2);
-                    add_slots(&mut allocator, 2);
-                    for slot in allocator.slots.values_mut() {
-                        if locked_receivers & (1_u8 << slot.media_index) != 0 {
-                            assert!(slot.playout.set_policy(policies[1]));
-                            slot.playout
-                                .record_stamp(slot.playout.to_stamp().unwrap(), 1_u64.into());
+        let request_orders: &[&[usize]] = &[
+            &[],
+            &[0],
+            &[1],
+            &[2],
+            &[0, 1],
+            &[1, 0],
+            &[0, 2],
+            &[2, 0],
+            &[1, 2],
+            &[2, 1],
+            &[0, 1, 2],
+            &[0, 2, 1],
+            &[1, 0, 2],
+            &[1, 2, 0],
+            &[2, 0, 1],
+            &[2, 1, 0],
+        ];
+        for locked_receivers in 0_u8..8 {
+            for occupants in [
+                [None, None, None],
+                [Some(0), None, None],
+                [None, Some(0), None],
+                [None, None, Some(0)],
+                [Some(1), None, None],
+                [None, Some(1), None],
+                [None, None, Some(1)],
+                [Some(2), None, None],
+                [None, Some(2), None],
+                [None, None, Some(2)],
+                [Some(0), Some(1), None],
+                [Some(1), Some(0), None],
+                [Some(0), None, Some(1)],
+                [Some(1), None, Some(0)],
+                [None, Some(0), Some(1)],
+                [None, Some(1), Some(0)],
+                [Some(0), Some(1), Some(2)],
+                [Some(0), Some(2), Some(1)],
+                [Some(1), Some(0), Some(2)],
+                [Some(1), Some(2), Some(0)],
+                [Some(2), Some(0), Some(1)],
+                [Some(2), Some(1), Some(0)],
+            ] {
+                for request_indices in request_orders {
+                    for request_policies in [
+                        [policies[0], policies[0], policies[0]],
+                        [policies[0], policies[0], policies[1]],
+                        [policies[0], policies[1], policies[0]],
+                        [policies[0], policies[1], policies[1]],
+                        [policies[1], policies[0], policies[0]],
+                        [policies[1], policies[0], policies[1]],
+                        [policies[1], policies[1], policies[0]],
+                        [policies[1], policies[1], policies[1]],
+                    ] {
+                        let mut allocator = setup_allocator();
+                        let tracks = add_tracks(&mut allocator, 3);
+                        add_slots(&mut allocator, 3);
+                        for slot in allocator.slots.values_mut() {
+                            if locked_receivers & (1_u8 << slot.media_index) != 0 {
+                                assert!(slot.playout.set_policy(policies[1]));
+                                slot.playout
+                                    .record_stamp(slot.playout.to_stamp().unwrap(), 1_u64.into());
+                            }
+                            slot.logical_track_id = occupants
+                                [usize::try_from(slot.media_index).unwrap_or(usize::MAX)]
+                            .map(|index| tracks.ids[index]);
                         }
-                        if slot.media_index == 0 {
-                            slot.logical_track_id = occupant.map(|index| tracks.ids[index]);
-                        }
-                    }
-                    let requests = [
-                        receiver_request(tracks.ids[0], 0, request_policies[0]),
-                        receiver_request(tracks.ids[1], 0, request_policies[1]),
-                    ];
-                    let mut slots: Vec<_> = allocator.slots.values().collect();
-                    slots.sort_by_key(|slot| slot.media_index);
-                    let expected = oracle_assignment(&requests, &slots);
-                    let actual =
-                        allocator
-                            .preview_receiver_assignments(&requests)
-                            .ok()
-                            .map(|preview| {
-                                let mut assignments =
-                                    preview.assignments().iter().collect::<Vec<_>>();
-                                assignments.sort_by_key(|assignment| {
-                                    assignment.request.intent.track_id.as_str()
+                        let all_requests = [
+                            receiver_request(tracks.ids[0], 0, request_policies[0]),
+                            receiver_request(tracks.ids[1], 0, request_policies[1]),
+                            receiver_request(tracks.ids[2], 0, request_policies[2]),
+                        ];
+                        let requests = request_indices
+                            .iter()
+                            .map(|index| all_requests[*index].clone())
+                            .collect::<Vec<_>>();
+                        let mut slots: Vec<_> = allocator.slots.values().collect();
+                        slots.sort_by_key(|slot| slot.media_index);
+                        let expected = oracle_assignment(&requests, &slots);
+                        let actual =
+                            allocator
+                                .preview_receiver_assignments(&requests)
+                                .ok()
+                                .map(|preview| {
+                                    let mut assignments =
+                                        preview.assignments().iter().collect::<Vec<_>>();
+                                    assignments.sort_by_key(|assignment| {
+                                        assignment.request.intent.track_id.as_str()
+                                    });
+                                    assignments
+                                        .into_iter()
+                                        .map(|assignment| assignment.receiver_index)
+                                        .collect::<Vec<_>>()
                                 });
-                                assignments
-                                    .into_iter()
-                                    .map(|assignment| assignment.receiver_index)
-                                    .collect::<Vec<_>>()
-                            });
-                    assert_eq!(actual, expected);
+                        assert_eq!(actual, expected);
+                    }
                 }
             }
         }
@@ -2640,6 +2693,96 @@ mod assignment_tests {
     }
 
     #[test]
+    fn receiver_lock_survives_unmapping_an_occupant() {
+        let mut allocator = setup_allocator();
+        let tracks = add_tracks(&mut allocator, 2);
+        add_slots(&mut allocator, 1);
+        let fixed = PlayoutPolicy::fixed((25, 75));
+        let preview = allocator
+            .preview_receiver_assignments(&[receiver_request(tracks.ids[0], 0, fixed)])
+            .unwrap();
+        allocator.commit_receiver_assignments(preview).unwrap();
+        let slot = allocator.slots.values_mut().next().unwrap();
+        slot.playout
+            .record_stamp(slot.playout.to_stamp().unwrap(), 1_u64.into());
+
+        let unmap = allocator.preview_receiver_assignments(&[]).unwrap();
+        allocator.commit_receiver_assignments(unmap).unwrap();
+        assert!(allocator.receiver_assignments().is_empty());
+        assert!(matches!(
+            allocator.preview_receiver_assignments(&[receiver_request(
+                tracks.ids[1],
+                0,
+                PlayoutPolicy::Default,
+            )]),
+            Err(VideoReceiverAdmissionError::PlayoutResetRequired)
+        ));
+    }
+
+    #[test]
+    fn committed_receiver_playout_is_captured_in_video_writes() {
+        let mut allocator = setup_allocator();
+        let tracks = add_tracks(&mut allocator, 3);
+        add_slots(&mut allocator, 3);
+        let first_fixed = PlayoutPolicy::fixed((25, 75));
+        let second_fixed = PlayoutPolicy::fixed((40, 90));
+        let preview = allocator
+            .preview_receiver_assignments(&[
+                receiver_request(tracks.ids[0], 0, first_fixed),
+                receiver_request(tracks.ids[1], 0, second_fixed),
+                receiver_request(tracks.ids[2], 0, PlayoutPolicy::Default),
+            ])
+            .unwrap();
+        allocator.commit_receiver_assignments(preview).unwrap();
+
+        let targets = allocator
+            .slots
+            .iter()
+            .map(|(key, slot)| {
+                let track_id = slot.logical_track_id.unwrap();
+                let layer = allocator
+                    .track(&track_id)
+                    .unwrap()
+                    .lowest_quality()
+                    .unwrap()
+                    .clone();
+                (key, track_id, layer, slot.playout.to_stamp())
+            })
+            .collect::<Vec<_>>();
+        let mut writer = StreamWriter::new();
+        let mut writes = Vec::new();
+        for (slot_key, track_id, layer, expected_playout) in targets {
+            let slot = allocator.slots.get_mut(slot_key).unwrap();
+            assert!(slot.switch_to(&layer, false));
+            slot.paused = false;
+            allocator.set_route(track_id, slot_key);
+
+            let mut cache = TrackStreamCache::new();
+            let mut builder = crate::rtp::test_utils::H264StreamBuilder::new(
+                1,
+                1000,
+                90_000,
+                tokio::time::Instant::now(),
+            );
+            for mut packet in builder.keyframe(4) {
+                packet.ext_vals.rid = layer.rid;
+                cache.push(packet.clone());
+                allocator.on_rtp_slot(slot_key, track_id, &packet, Some(&cache), &mut writer);
+            }
+            while let Some(write) = writer.pop() {
+                if let crate::track::StreamWrite::Video { playout_delay, .. } = write {
+                    writes.push(playout_delay);
+                }
+            }
+            assert!(writes.iter().any(|playout| *playout == expected_playout));
+        }
+
+        assert!(writes.contains(&ReceiverPlayout::with_policy(first_fixed).to_stamp()));
+        assert!(writes.contains(&ReceiverPlayout::with_policy(second_fixed).to_stamp()));
+        assert!(writes.contains(&None));
+    }
+
+    #[test]
     fn stale_receiver_preview_does_not_change_assignments() {
         let mut allocator = setup_allocator();
         let tracks = add_tracks(&mut allocator, 2);
@@ -2660,12 +2803,55 @@ mod assignment_tests {
             .unwrap();
         allocator.commit_receiver_assignments(current).unwrap();
         let before = allocator.receiver_assignments();
+        let receiver_state = allocator
+            .slots
+            .values()
+            .map(|slot| {
+                (
+                    slot.media_index,
+                    slot.logical_track_id,
+                    slot.playout.policy,
+                    slot.playout.locked,
+                    slot.playout.pending,
+                    slot.playout.confirm,
+                    slot.desired.as_ref().map(TrackLayer::stream_id),
+                    slot.switcher.active_stream(),
+                    slot.switcher.staging_stream(),
+                    slot.switcher.draining_stream(),
+                    slot.paused,
+                )
+            })
+            .collect::<Vec<_>>();
+        let revision = allocator.receiver_assignment_revision;
 
         assert!(matches!(
             allocator.commit_receiver_assignments(stale),
             Err(VideoReceiverAdmissionError::Stale)
         ));
         assert_eq!(allocator.receiver_assignments(), before);
+        assert_eq!(allocator.receiver_assignment_revision, revision);
+        assert_eq!(
+            allocator
+                .slots
+                .values()
+                .map(|slot| {
+                    (
+                        slot.media_index,
+                        slot.logical_track_id,
+                        slot.playout.policy,
+                        slot.playout.locked,
+                        slot.playout.pending,
+                        slot.playout.confirm,
+                        slot.desired.as_ref().map(TrackLayer::stream_id),
+                        slot.switcher.active_stream(),
+                        slot.switcher.staging_stream(),
+                        slot.switcher.draining_stream(),
+                        slot.paused,
+                    )
+                })
+                .collect::<Vec<_>>(),
+            receiver_state
+        );
     }
 
     #[test]
