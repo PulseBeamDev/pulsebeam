@@ -1213,13 +1213,17 @@ impl Slot {
         self.desired.as_ref()
     }
 
-    /// Whether changing this floor-constrained target must first stop an
-    /// active lower stream (or replace an incompatible pending stage).
+    /// Whether a floor-constrained target must first clear an incompatible
+    /// active, staging, or draining stream.
     fn needs_floor_barrier(&self, layer: &TrackLayer) -> bool {
-        match self.switcher.active_stream() {
-            Some(active) => active != layer.stream_id(),
-            None => self.switcher.staging_stream() != Some(layer.stream_id()),
-        }
+        [
+            self.switcher.active_stream(),
+            self.switcher.staging_stream(),
+            self.switcher.draining_stream(),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|stream| stream != layer.stream_id())
     }
 
     fn state(&self) -> SlotState {
@@ -3144,6 +3148,49 @@ mod assignment_tests {
         let packet = RtpPacket::default();
         assert!(!slot.on_rtp(track_id, packet.arrival_ts, None, &mut writer));
         assert!(writer.pop().is_none(), "360p must not emit while 720p is pending");
+    }
+
+    #[test]
+    fn raising_a_floor_clears_a_draining_lower_video_tail() {
+        let mut allocator = setup_allocator();
+        let pid = ParticipantId::new();
+        let (tx, track, states) = video_track_with_states(
+            pid,
+            Mid::from("v0"),
+            vec![SimulcastLayer::new("h"), SimulcastLayer::new("f")],
+        );
+        allocator.seed_layer_states(&states);
+        let track_id = tx.meta.id;
+        allocator.add_track(Track::video(tx.meta, track.layers().to_vec(), None));
+        add_slots(&mut allocator, 1);
+
+        let track = allocator.track(&track_id).unwrap();
+        let medium = track.by_quality(LayerQuality::Medium).unwrap().clone();
+        let high = track.by_quality(LayerQuality::High).unwrap().clone();
+        let slot = allocator.slots.values_mut().next().unwrap();
+        slot.set_roles_for_test(Some(&medium), Some(&high));
+        slot.test_promote();
+        slot.paused = false;
+        assert_eq!(slot.switcher.draining_stream(), Some(medium.stream_id()));
+
+        let mut intents = HashMap::new();
+        intents.insert(
+            Mid::from("s0"),
+            Intent {
+                track_id,
+                target_height: 360,
+                min_height: 720,
+                min_fps: 0,
+                priority: 0,
+            },
+        );
+        allocator.configure(&intents);
+
+        let slot = allocator.slots.values().next().unwrap();
+        assert!(slot.paused);
+        assert!(slot.test_active().is_none());
+        assert_eq!(slot.test_staging(), Some(high.stream_id()));
+        assert_eq!(slot.switcher.draining_stream(), None);
     }
 
     #[test]
