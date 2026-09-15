@@ -622,6 +622,15 @@ impl Downstream {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn v1_test_reallocate_video_quality(
+        &mut self,
+        available_bandwidth: Bitrate,
+    ) -> Option<crate::track::LayerQuality> {
+        let _ = self.video.update_allocations(available_bandwidth);
+        self.video.v1_test_selected_layer()
+    }
+
     pub fn refresh_ssrc(
         &mut self,
         kind: MediaKind,

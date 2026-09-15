@@ -242,8 +242,9 @@ mod v1_intent_tests {
     use crate::participant::core::{Participant, ParticipantConfig};
     use crate::participant::downstream::SlotConfig;
     use crate::participant::event::test_utils::MockParticipantSink;
+    use crate::track::LayerQuality;
     use crate::track::test_utils::{make_audio_track, make_video_track};
-    use str0m::media::MediaKind;
+    use str0m::media::{MediaKind, SimulcastLayer};
     use str0m::{Rtc, media::Mid};
 
     struct V1IntentFixture {
@@ -323,6 +324,21 @@ mod v1_intent_tests {
             id
         }
 
+        fn video_with_layers(&mut self, mid: &str) -> String {
+            let (_, track) = make_video_track(
+                crate::entity::ParticipantId::new(),
+                Mid::from(mid),
+                vec![
+                    SimulcastLayer::new("q"),
+                    SimulcastLayer::new("h"),
+                    SimulcastLayer::new("f"),
+                ],
+            );
+            let id = track.id().as_str();
+            self.participant.add_v1_test_track(track);
+            id
+        }
+
         fn apply(&mut self, intent: media_signaling::Intent) -> V1IntentResult {
             self.participant.apply_v1_intent(intent, &mut self.sink)
         }
@@ -340,8 +356,9 @@ mod v1_intent_tests {
             self.participant.v1_test_forward_audio(origin);
         }
 
-        fn update_media_quality(&mut self) {
-            self.participant.v1_test_update_media_quality();
+        fn reallocate_video_quality(&mut self, bitrate_bps: u64) -> Option<LayerQuality> {
+            self.participant
+                .v1_test_reallocate_video_quality(bitrate_bps)
         }
 
         fn sender(&mut self, index: u32, kind: TrackKind, mid: &str) -> TrackId {
@@ -826,17 +843,30 @@ mod v1_intent_tests {
     fn media_quality_changes_do_not_change_the_mapping() {
         let mut fixture = V1IntentFixture::new();
         fixture.receiver(7, "video", MediaKind::Video);
-        let video_id = fixture.video("remote-video");
+        let video_id = fixture.video_with_layers("remote-video");
         let V1IntentResult::Mapping(before) = fixture.apply(media_signaling::Intent {
             revision: 1,
             send: None,
-            receive: receive(vec![video(video_id)], vec![], 0),
+            receive: receive(
+                vec![media_signaling::VideoTrackIntent {
+                    track_id: video_id,
+                    options: Some(media_signaling::VideoOptions {
+                        height: 720,
+                        ..Default::default()
+                    }),
+                }],
+                vec![],
+                0,
+            ),
         }) else {
             panic!("expected mapping")
         };
 
-        fixture.update_media_quality();
+        let constrained = fixture.reallocate_video_quality(100_000);
+        let unconstrained = fixture.reallocate_video_quality(3_000_000);
 
+        assert_eq!(constrained, Some(LayerQuality::Low));
+        assert_eq!(unconstrained, Some(LayerQuality::High));
         assert_eq!(fixture.participant.v1_test_mapping(), before);
     }
 

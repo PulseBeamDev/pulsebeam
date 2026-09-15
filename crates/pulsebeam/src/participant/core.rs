@@ -587,9 +587,12 @@ impl Participant {
     }
 
     #[cfg(test)]
-    pub(crate) fn v1_test_update_media_quality(&mut self) {
+    pub(crate) fn v1_test_reallocate_video_quality(
+        &mut self,
+        bitrate_bps: u64,
+    ) -> Option<crate::track::LayerQuality> {
         self.downstream
-            .update_bitrate(Instant::now(), str0m::bwe::Bitrate::from(50_000));
+            .v1_test_reallocate_video_quality(str0m::bwe::Bitrate::from(bitrate_bps))
     }
 
     pub fn apply(&mut self, effect: ParticipantEffect, track_handle: Option<TrackHandle>) {

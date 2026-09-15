@@ -187,6 +187,13 @@ impl VideoAllocator {
             .is_some_and(|slot| slot.playout.is_locked())
     }
 
+    #[cfg(test)]
+    pub(crate) fn v1_test_selected_layer(&self) -> Option<LayerQuality> {
+        self.slots
+            .values()
+            .find_map(|slot| slot.target().map(|layer| layer.quality))
+    }
+
     fn invalidate_receiver_previews(&mut self) {
         self.receiver_assignment_revision = self.receiver_assignment_revision.wrapping_add(1);
     }
