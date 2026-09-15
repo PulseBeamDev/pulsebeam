@@ -228,10 +228,13 @@ pub(crate) enum PlayoutPolicy {
 impl PlayoutPolicy {
     pub(crate) fn fixed(bounds: (u32, u32)) -> Self {
         const MAX_HUNDREDTHS: u64 = 0xfff;
+        const MAX_DELAY_MS: u32 = 2_000;
+        let min = bounds.0.min(MAX_DELAY_MS);
+        let max = bounds.1.min(MAX_DELAY_MS).max(min);
         let to_hundredths = |ms: u32| ((ms as u64).saturating_add(5) / 10).min(MAX_HUNDREDTHS);
-        let max = to_hundredths(bounds.1);
+        let max = to_hundredths(max);
         Self::Fixed(
-            MediaTime::from_hundredths(to_hundredths(bounds.0).min(max)),
+            MediaTime::from_hundredths(to_hundredths(min).min(max)),
             MediaTime::from_hundredths(max),
         )
     }
@@ -728,6 +731,32 @@ mod tests {
     // Convenience only: a test is not a shard, so nothing here is
     // cross-core. See crates/pulsebeam/docs/thread-per-core.md.
     use super::*;
+
+    #[test]
+    fn playout_fixed_normalizes_bounds_before_extension_rounding() {
+        let hundredths = |bounds| match PlayoutPolicy::fixed(bounds) {
+            PlayoutPolicy::Fixed(min, max) => (min, max),
+            PlayoutPolicy::Default => unreachable!(),
+        };
+
+        assert_eq!(
+            hundredths((10, 20)),
+            (MediaTime::from_hundredths(1), MediaTime::from_hundredths(2))
+        );
+        assert_eq!(
+            hundredths((3_000, 500)),
+            (MediaTime::from_hundredths(200), MediaTime::from_hundredths(200))
+        );
+        assert_eq!(
+            hundredths((500, 3_000)),
+            (MediaTime::from_hundredths(50), MediaTime::from_hundredths(200))
+        );
+        assert_eq!(
+            hundredths((14, 15)),
+            (MediaTime::from_hundredths(1), MediaTime::from_hundredths(2))
+        );
+        assert_ne!(PlayoutPolicy::Default, PlayoutPolicy::fixed((0, 0)));
+    }
 
     #[test]
     fn receiver_playout_isolated_and_rearms_after_confirmation() {
