@@ -887,6 +887,7 @@ impl NodeBuilder {
             tune_current_control_thread();
         }
 
+        let controller_project_registry = self.project_registry.clone();
         let mut controller = ControllerActor::with_placement(
             controller_rng,
             shard_contexts,
@@ -895,6 +896,7 @@ impl NodeBuilder {
             self.room_shard_slot,
             self.room_placement,
             view_writers,
+            controller_project_registry,
         );
         controller.set_steering(steering);
         // intentionally small so backpressure is applied early

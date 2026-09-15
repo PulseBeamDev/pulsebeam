@@ -339,6 +339,8 @@ async fn create_native(
     let participant_state = ParticipantState {
         manual_sub: request.manual,
         room_id: authorization.room_id,
+        project_id: authorization.project_id,
+        room_external_id: authorization.room_external_id.clone(),
         participant_id: authorization.participant_id,
         participant_external_id: authorization.participant_external_id.clone(),
         connection_id,
@@ -467,6 +469,8 @@ async fn create_sdp_profile(
                     state: ParticipantState {
                         manual_sub: false,
                         room_id: authorization.room_id,
+                        project_id: authorization.project_id,
+                        room_external_id: authorization.room_external_id.clone(),
                         participant_id: authorization.participant_id,
                         participant_external_id: authorization.participant_external_id.clone(),
                         connection_id,

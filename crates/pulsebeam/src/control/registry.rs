@@ -3,7 +3,9 @@ use std::collections::HashMap;
 use crate::{
     control::controller::ConnectionProfile,
     control::room::Room,
-    entity::{ConnectionId, ParticipantExternalId, ParticipantId, RoomId},
+    entity::{
+        ConnectionId, ParticipantExternalId, ParticipantId, ProjectId, RoomExternalId, RoomId,
+    },
     id::ShardId,
     route::NodeTransportAddress,
 };
@@ -17,6 +19,8 @@ use crate::{
 pub struct ParticipantMeta {
     pub shard_id: ShardId,
     pub room_id: RoomId,
+    pub project_id: ProjectId,
+    pub room_external_id: RoomExternalId,
     pub participant_external_id: ParticipantExternalId,
     /// The client's ICE association, kept so teardown can retire it. The
     /// route outlives the negotiation that produced it, so something has to
@@ -59,6 +63,9 @@ impl RoomRegistry {
             ParticipantMeta {
                 shard_id,
                 room_id,
+                project_id: ProjectId::new(),
+                room_external_id: RoomExternalId::new("test-room")
+                    .expect("test room external ID is valid"),
                 participant_external_id: ParticipantExternalId::new("test-participant")
                     .expect("test participant external ID is valid"),
                 transport,
@@ -117,6 +124,35 @@ impl RoomRegistry {
         connection_id: ConnectionId,
         profile: ConnectionProfile,
     ) -> Result<Option<ParticipantMeta>, CommitCandidateError> {
+        self.commit_candidate_with_identity(
+            participant_id,
+            participant_external_id,
+            ProjectId::new(),
+            RoomExternalId::new("test-room").expect("test room external ID is valid"),
+            room_id,
+            shard_id,
+            transport,
+            connection_id,
+            profile,
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the identity is committed atomically with its connection"
+    )]
+    pub fn commit_candidate_with_identity(
+        &mut self,
+        participant_id: ParticipantId,
+        participant_external_id: ParticipantExternalId,
+        project_id: ProjectId,
+        room_external_id: RoomExternalId,
+        room_id: RoomId,
+        shard_id: ShardId,
+        transport: NodeTransportAddress,
+        connection_id: ConnectionId,
+        profile: ConnectionProfile,
+    ) -> Result<Option<ParticipantMeta>, CommitCandidateError> {
         if let Some(current) = self.participants.get(&participant_id)
             && current.connection_id >= connection_id
         {
@@ -128,6 +164,8 @@ impl RoomRegistry {
             ParticipantMeta {
                 shard_id,
                 room_id,
+                project_id,
+                room_external_id,
                 participant_external_id,
                 transport: Some(transport),
                 connection_id,

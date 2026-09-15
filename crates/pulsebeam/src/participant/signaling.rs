@@ -1159,6 +1159,7 @@ struct V1OutputState {
     history: V1CatalogHistory,
     scheduler: V1OutputScheduler,
     authorization_to_send: Option<i64>,
+    authorization_rejected: bool,
     pending_authorization: Option<Vec<u8>>,
 }
 
@@ -1520,6 +1521,7 @@ impl Signaling {
             history: V1CatalogHistory::default(),
             scheduler: V1OutputScheduler::default(),
             authorization_to_send: None,
+            authorization_rejected: false,
             pending_authorization: None,
         });
         signaling
@@ -1530,6 +1532,13 @@ impl Signaling {
             return;
         };
         output.authorization_to_send = Some(expires_at_unix_seconds);
+    }
+
+    pub(crate) fn stage_authorization_rejected(&mut self) {
+        let Some(output) = &mut self.v1_output else {
+            return;
+        };
+        output.authorization_rejected = true;
     }
 
     pub(crate) fn stage_v1_output(
@@ -1728,6 +1737,7 @@ impl Signaling {
             return self.cid.is_some()
                 && (output.pending_authorization.is_some()
                     || output.authorization_to_send.is_some()
+                    || output.authorization_rejected
                     || self.dirty_roster
                     || self.dirty_bindings);
         }
@@ -1780,6 +1790,21 @@ impl Signaling {
                     payload: Some(media_signaling::server_message::Payload::Authorization(
                         media_signaling::Authorization {
                             expires_at_unix_seconds,
+                        },
+                    )),
+                };
+                let bytes = pulsebeam_proto::codec::encode_server(&message).ok()?;
+                output.pending_authorization = Some(bytes.clone());
+                return Some(SignalingOutput { cid, bytes });
+            }
+            if std::mem::take(&mut output.authorization_rejected) {
+                let message = media_signaling::ServerMessage {
+                    payload: Some(media_signaling::server_message::Payload::Error(
+                        media_signaling::Error {
+                            code: media_signaling::ErrorCode::AuthorizationRejected.into(),
+                            message: "authorization renewal rejected".to_owned(),
+                            fatal: false,
+                            intent_revision: None,
                         },
                     )),
                 };
@@ -2525,6 +2550,51 @@ mod authorization_tests {
             signaling.poll(&snapshot).is_none(),
             "commit drains authorization"
         );
+    }
+
+    #[test]
+    fn rejected_renewal_waits_for_inflight_catalog() {
+        let room = crate::entity::RoomId::from_external(
+            &crate::entity::RoomExternalId::new("room").unwrap(),
+        );
+        let ctx = LogCtx {
+            room_id: room,
+            participant_id: crate::entity::ParticipantId::new(),
+        };
+        let mut signaling = Signaling::new_v1(ctx, "self".to_owned());
+        let mut rtc = str0m::Rtc::new(std::time::Instant::now());
+        signaling.set_cid(rtc.direct_api().create_data_channel(Default::default()));
+        let snapshot = SignalingSnapshot {
+            publications: Vec::new(),
+            participants: HashMap::new(),
+            video: Vec::new(),
+            audio: Vec::new(),
+        };
+        signaling
+            .stage_v1_output(
+                &snapshot,
+                media_signaling::Mapping {
+                    intent_revision: 0,
+                    video: Some(media_signaling::TrackMappings { tracks: Vec::new() }),
+                    audio: Some(media_signaling::TrackMappings { tracks: Vec::new() }),
+                },
+            )
+            .unwrap();
+        let catalog = signaling.poll(&snapshot).expect("catalog output");
+        signaling.stage_authorization_rejected();
+        assert_eq!(
+            signaling
+                .poll(&snapshot)
+                .expect("catalog remains pending")
+                .bytes,
+            catalog.bytes
+        );
+        signaling.commit_sent();
+        assert!(matches!(
+            pulsebeam_proto::codec::decode_server(&signaling.poll(&snapshot).expect("rejection follows catalog").bytes),
+            Ok(media_signaling::ServerMessage { payload: Some(media_signaling::server_message::Payload::Error(media_signaling::Error { code, fatal: false, .. })) })
+                if code == media_signaling::ErrorCode::AuthorizationRejected as i32
+        ));
     }
 }
 

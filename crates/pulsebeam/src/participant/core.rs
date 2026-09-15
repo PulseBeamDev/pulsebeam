@@ -180,6 +180,8 @@ pub struct Participant {
     pub(crate) connection_id: entity::ConnectionId,
     profile: ConnectionProfile,
     initial_authorization_expiry: Option<i64>,
+    next_authorization_request: u64,
+    pending_authorization_request: Option<crate::participant::effect::AuthorizationRequestId>,
     last_keyframe_request: HashMap<(Mid, Option<str0m::media::Rid>), Instant>,
     pending_keyframe_requests: HashSet<(Mid, Option<str0m::media::Rid>)>,
 
@@ -247,6 +249,8 @@ impl Participant {
             connection_id: cfg.connection_id,
             profile: cfg.profile,
             initial_authorization_expiry: cfg.initial_authorization_expiry,
+            next_authorization_request: 1,
+            pending_authorization_request: None,
             upstream: UpstreamAllocator::new(ctx),
             negotiated: cfg.resources,
             downstream: DownstreamAllocator::new(ctx, cfg.manual_sub),
@@ -396,6 +400,41 @@ impl Participant {
             });
         self.signaling.accept_v1_intent(intent);
         signaling::V1IntentResult::Mapping(self.v1_mapping())
+    }
+
+    /// Inactive v1 input seam. Task 8 owns connecting this to ChannelData.
+    pub(crate) fn handle_v1_input(
+        &mut self,
+        bytes: &[u8],
+        events: &mut impl ParticipantSink,
+    ) -> Result<(), signaling::SignalingError> {
+        let message = pulsebeam_proto::codec::decode_client(bytes)
+            .map_err(|_| signaling::SignalingError::DecodeFailed)?;
+        match message.payload {
+            Some(pulsebeam_proto::signaling_v1::client_message::Payload::Intent(intent)) => {
+                let _ = self.apply_v1_intent(intent, events);
+            }
+            Some(pulsebeam_proto::signaling_v1::client_message::Payload::RenewAuthorization(
+                renew,
+            )) => {
+                let Some(token) = crate::participant::effect::RenewalToken::new(renew.token) else {
+                    self.signaling.stage_authorization_rejected();
+                    return Ok(());
+                };
+                if self.pending_authorization_request.is_some() {
+                    self.signaling.stage_authorization_rejected();
+                    return Ok(());
+                }
+                let request_id = crate::participant::effect::AuthorizationRequestId::new(
+                    self.next_authorization_request,
+                );
+                self.next_authorization_request = self.next_authorization_request.wrapping_add(1);
+                self.pending_authorization_request = Some(request_id);
+                events.renew_authorization(request_id, token);
+            }
+            None => return Err(signaling::SignalingError::DecodeFailed),
+        }
+        Ok(())
     }
 
     /// Reconcile retained v1 receive desire when the visible catalog changes.
@@ -688,6 +727,33 @@ impl Participant {
                 self.upstream.unbind_track_handle(track_id, key);
                 if track_id.kind() == TrackKind::Data {
                     self.upstream.data.unpublish(track_id);
+                }
+            }
+            ParticipantEffect::AuthorizationRenewed {
+                participant_id,
+                connection_id,
+                request_id,
+                expires_at_unix_seconds,
+            } => {
+                if participant_id == self.participant_id
+                    && connection_id == self.connection_id
+                    && self.pending_authorization_request == Some(request_id)
+                {
+                    self.pending_authorization_request = None;
+                    self.signaling.stage_authorization(expires_at_unix_seconds);
+                }
+            }
+            ParticipantEffect::AuthorizationRejected {
+                participant_id,
+                connection_id,
+                request_id,
+            } => {
+                if participant_id == self.participant_id
+                    && connection_id == self.connection_id
+                    && self.pending_authorization_request == Some(request_id)
+                {
+                    self.pending_authorization_request = None;
+                    self.signaling.stage_authorization_rejected();
                 }
             }
         }
@@ -1682,6 +1748,8 @@ mod authorization_tests {
         let state = ParticipantState {
             manual_sub: true,
             room_id,
+            project_id: crate::entity::ProjectId::new(),
+            room_external_id: crate::entity::RoomExternalId::new("room").unwrap(),
             participant_id,
             participant_external_id: participant_external_id.clone(),
             connection_id: entity::ConnectionId::new(),
@@ -1712,6 +1780,45 @@ mod authorization_tests {
             participant.initial_authorization_expiry,
             Some(expiry as i64)
         );
+    }
+
+    #[test]
+    fn inactive_v1_renewal_seam_bounds_duplicate_requests() {
+        let room_external_id = RoomExternalId::new("room").unwrap();
+        let mut rtc = Rtc::new(std::time::Instant::now());
+        let cid = rtc.direct_api().create_data_channel(Default::default());
+        let mut participant = Participant::new(
+            ParticipantConfig {
+                manual_sub: true,
+                room_id: entity::RoomId::from_external(&room_external_id),
+                participant_id: entity::ParticipantId::new(),
+                participant_external_id: ParticipantExternalId::new("alice").unwrap(),
+                connection_id: entity::ConnectionId::new(),
+                profile: ConnectionProfile::Native,
+                initial_authorization_expiry: None,
+                rtc,
+                resources: NegotiatedResources::empty_for_test(),
+            },
+            ShardId::new(0),
+            1_200,
+            1_200,
+        );
+        participant.enable_v1_test_output("alice".to_owned(), cid);
+        let wire =
+            pulsebeam_proto::codec::encode_client(&pulsebeam_proto::signaling_v1::ClientMessage {
+                payload: Some(
+                    pulsebeam_proto::signaling_v1::client_message::Payload::RenewAuthorization(
+                        pulsebeam_proto::signaling_v1::RenewAuthorization {
+                            token: "secret-token".to_owned(),
+                        },
+                    ),
+                ),
+            })
+            .unwrap();
+        let mut sink = crate::participant::event::test_utils::MockParticipantSink::new();
+        participant.handle_v1_input(&wire, &mut sink).unwrap();
+        participant.handle_v1_input(&wire, &mut sink).unwrap();
+        assert_eq!(sink.renewal_requests, 1);
     }
 }
 

@@ -2,6 +2,7 @@ use super::packet::TrackPacket;
 use super::reverse::ReversePacket;
 use crate::entity::TrackId;
 use crate::keys::TrackHandle;
+use crate::participant::effect::{AuthorizationRequestId, RenewalToken};
 use crate::track::{SelectionPolicy, Track, TrackMeta, TrackSelector};
 
 pub(crate) trait ParticipantSink {
@@ -19,6 +20,7 @@ pub(crate) trait ParticipantSink {
     fn unsubscribe_tracks(&mut self, selector: TrackSelector);
     fn request_reverse(&mut self, stream: TrackHandle, packet: ReversePacket);
     fn exit(&mut self);
+    fn renew_authorization(&mut self, request_id: AuthorizationRequestId, token: RenewalToken);
 
     fn publish_track_packet(&mut self, fanout: Option<TrackHandle>, packet: TrackPacket);
 }
@@ -37,6 +39,7 @@ pub mod test_utils {
         pub unpublish_track_calls: Vec<TrackId>,
         pub reverse_requests: Vec<TrackHandle>,
         pub exit_count: usize,
+        pub renewal_requests: usize,
         pub publish_track_packet_calls: Vec<TrackHandle>,
     }
 
@@ -81,6 +84,14 @@ pub mod test_utils {
 
         fn exit(&mut self) {
             self.exit_count = self.exit_count.saturating_add(1);
+        }
+
+        fn renew_authorization(
+            &mut self,
+            _request_id: AuthorizationRequestId,
+            _token: RenewalToken,
+        ) {
+            self.renewal_requests = self.renewal_requests.saturating_add(1);
         }
 
         fn publish_track_packet(&mut self, fanout: Option<TrackHandle>, _packet: TrackPacket) {
