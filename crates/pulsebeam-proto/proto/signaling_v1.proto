@@ -2,16 +2,110 @@ syntax = "proto3";
 
 package pulsebeam.media.v1;
 
-// Live media signaling over a reliable, ordered data channel.
+// Live media signaling for PulseBeam native WebRTC connections over a reliable,
+// ordered binary data channel.
 //
-// HTTP owns connection-resource creation and destruction. This protocol owns:
+// Normative language:
 //
-//   Catalog       — canonical remote media entities visible to this participant.
-//   Intent        — what this participant wants to send and receive.
-//   Mapping       — which remote tracks are assigned to local receivers.
-//   Authorization — refresh of the participant JWT.
+//   MUST, MUST NOT, REQUIRED, SHOULD, SHOULD NOT, and MAY are normative
+//   requirements in this file. An implementation that intentionally chooses a
+//   different wire or state-machine behavior is not implementing this protocol.
+//
+// Protocol ownership:
+//
+//   HTTP owns connection-resource creation and destruction and the SDP exchange
+//   that creates the WebRTC transport. This protocol owns live media state after
+//   a native connection is established:
+//
+//     Catalog       — server-authoritative remote media entities visible to this
+//                     participant.
+//     Intent        — client-authoritative desired send/receive media state.
+//     Mapping       — server-authoritative assignment of remote TrackIds to
+//                     negotiated local RTP receivers.
+//     Authorization — refresh of the participant JWT and its accepted deadline.
+//     Reconnect     — explicit instruction to discard this connection and create
+//                     a fresh one through the HTTP connection-resource flow.
+//
+// Native state ownership:
+//
+//   - The client owns desired Intent.
+//   - The server owns authoritative Catalog and Mapping state.
+//   - Catalog is established by a complete snapshot and then advances through
+//     ordered deltas. A later snapshot may replace state for resynchronization.
+//   - Intent and Mapping are complete replacement state, not patches.
+//   - The SDK applies server state exactly according to message semantics. It
+//     MUST NOT infer hidden transitions, synthesize correction reasons, mutate
+//     application desired state, or infer Reconnect from missing mappings.
+//   - A valid desired state that requires fresh negotiated receiver structure MAY
+//     cause an explicit Reconnect. Insufficient receiver structure alone is not an
+//     invalid Intent.
+//
+// Protocol applicability — WHIP and WHEP:
+//
+//   This protobuf protocol is ONLY for PulseBeam native signaling connections.
+//   WHIP and WHEP clients do not speak this protocol and MUST NOT be required to
+//   create the signaling data channel, protobuf-encode these messages, use LZ4,
+//   consume Catalog/Mapping/Reconnect, or send Intent/RenewAuthorization.
+//
+//   WHIP ingest:
+//
+//     - WHIP session setup, SDP, authorization, and teardown are handled by the
+//       WHIP HTTP protocol (RFC 9725), not by these protobuf messages.
+//     - Accepted WHIP RTP senders become ordinary PulseBeam-published tracks and
+//       therefore appear to native participants through Catalog.
+//     - WHIP does not define a PulseBeam application-facing LocalTrack label.
+//       PulseBeam MUST synthesize the exact label "audio" for the accepted audio
+//       track and "video" for the accepted video track.
+//     - SDP `mid`, `msid`, MediaStream identifiers, and MediaStreamTrack IDs are
+//       negotiation identifiers and MUST NOT be promoted to PulseBeam labels.
+//     - RFC 9725 currently permits at most one MediaStreamTrack of each media kind
+//       in a WHIP session. A PulseBeam WHIP implementation MUST reject an offer it
+//       cannot represent rather than inventing additional label conventions. If a
+//       future WHIP revision permits multiple same-kind tracks, PulseBeam requires
+//       an explicit protocol/API rule before supporting that shape.
+//     - PulseBeam still owns ParticipantId and TrackId. WHIP clients do not mint
+//       or observe those IDs through this protobuf protocol.
+//
+//   WHEP egress:
+//
+//     - WHEP session setup, SDP, authorization, track/content selection, and
+//       teardown are handled by the WHEP HTTP/API contract, not by these protobuf
+//       messages. At the time of this v1 specification, WHEP is
+//       draft-ietf-wish-whep-04; that draft permits at most one received
+//       MediaStreamTrack of each media kind.
+//     - A WHEP client receives only the media selected for the WHEP resource and
+//       accepted by SDP. The implementation MUST NOT choose media by relying on
+//       incidental Catalog ordering.
+//     - Native-only receive controls have no WHEP wire representation. When the
+//       WHEP API supplies no equivalent control, use receiver defaults: no
+//       explicit playout-delay override, no minimum height or frame-rate
+//       guarantee, and normal/default contention priority. Lack of a native
+//       viewport constraint MUST NOT be translated to VideoOptions.height = 0;
+//       in this protocol height = 0 means hidden/off-screen. The WHEP adapter may
+//       therefore forward the best source layer allowed by source availability,
+//       negotiated codecs, and congestion control.
+//     - Reconnect is native-only. Any WHEP renegotiation or session recreation is
+//       expressed through the supported WHEP HTTP/SDP lifecycle, never by sending
+//       this protobuf message.
+//
+//   WHIP/WHEP SDP may contain data-channel m-lines where their external protocol
+//   permits them, but such a data channel MUST NOT be interpreted as the
+//   PulseBeam native media-signaling channel unless the connection was explicitly
+//   created as a native PulseBeam connection.
 //
 // State shape:
+//
+//   Catalog
+//   ├── revision
+//   └── oneof state
+//       ├── CatalogSnapshot
+//       │   ├── participants[]
+//       │   └── tracks[]
+//       └── CatalogDelta
+//           ├── added_participants[]
+//           ├── removed_participant_ids[]
+//           ├── added_tracks[]
+//           └── removed_track_ids[]
 //
 //   Intent
 //   ├── SendIntent
@@ -41,10 +135,16 @@ package pulsebeam.media.v1;
 //   └── audio
 //       └── tracks[]
 //
-// Identity boundaries:
+// Identity terminology and invariants:
 //
 //   ParticipantExternalId
-//       User-application identity supplied through authorization.
+//       Application-owned participant identity supplied through authorization.
+//       It is unique among active participants in one room. The server MUST
+//       resolve a duplicate active identity by terminating/rejecting one of the
+//       conflicting connections before exposing both as active room state. Which
+//       connection wins is an admission-policy decision outside this protobuf;
+//       duplicate ParticipantExternalIds MUST never appear in one logical room
+//       state.
 //
 //   ParticipantId
 //       Stable canonical participant identity owned by PulseBeam.
@@ -56,9 +156,34 @@ package pulsebeam.media.v1;
 //       Connection-local SDP media-section indices. They are protocol
 //       coordinates, not entity identities.
 //
-// Clients and SDKs may retain, compare, and return canonical IDs received from
-// PulseBeam, but MUST NOT mint, derive, parse, validate, or format their
-// canonical representation.
+// Canonical IDs received from PulseBeam are opaque. Clients and SDKs may retain,
+// compare, hash, and protocol-forward them, but MUST NOT mint, derive, parse,
+// validate their internal format, or depend on their textual representation.
+//
+// Canonical identity is immutable:
+//
+//   - A ParticipantId MUST NOT later identify a different
+//     ParticipantExternalId.
+//   - A TrackId MUST NOT later identify a different participant_id, kind, or
+//     label.
+//   - Changing a published track's label, kind, or owner creates a different
+//     logical track and MUST use a different TrackId. In particular, changing a
+//     label never mutates the identity represented by an existing TrackId.
+//   - A canonical ID MUST NOT be reassigned to a different entity after removal.
+//
+// Track identity:
+//
+//   LocalTrack  = (kind, label) within one participant's desired send state.
+//   RemoteTrack = TrackId.
+//
+// The client SDK resolves application-facing selectors such as
+// (participant_external_id, kind, label) to TrackId using Catalog. This selector
+// is unambiguous because ParticipantExternalId is room-unique and
+// (participant_id, kind, label) is unique in Catalog.
+//
+// `sender_index` and `receiver_index` equal the zero-based SDP media-section
+// index of the corresponding negotiated RTP sender or receiver. They MUST NOT be
+// used as application identity or as a PulseBeam Id, Address, Handle, or Key.
 //
 // Examples:
 //
@@ -82,35 +207,38 @@ package pulsebeam.media.v1;
 //       playout_delay = [0ms, 50ms]
 //
 //   Audio receive intent with three negotiated audio receivers:
-//
 //     tracks = [aud_0...]
 //     mode   = AUDIO_MODE_AUTO
 //
-//   The server selects the explicitly requested track first and may
-//   automatically fill the remaining receivers.
+//   The server selects explicitly requested tracks first and may automatically
+//   fill remaining audio receiver capacity.
 //
 //   Mapping:
-//
 //     audio receiver_index 0 -> aud_0...
 //     audio receiver_index 1 -> aud_1...
 //     audio receiver_index 2 -> aud_2...
 //
-// Track identity:
+// Global protocol resource limits:
 //
-//   LocalTrack  = (kind, label)
-//   RemoteTrack = TrackId
+//   uncompressed protobuf message        <= 32,768 bytes
+//   raw LZ4 data-channel message         <= 32,912 bytes
+//   ParticipantId or TrackId             <= 128 UTF-8 bytes
+//   ParticipantExternalId                <= 256 UTF-8 bytes
+//   LocalTrack / RemoteTrack label       <= 64 UTF-8 bytes
+//   RenewAuthorization JWT               <= 16,384 UTF-8 bytes
 //
-// The client SDK resolves application-facing selectors such as
-// (participant_external_id, kind, label) to TrackId using Catalog.
+// IDs and labels MUST be non-empty. String equality for IDs and labels is exact
+// and case-sensitive; implementations MUST NOT apply Unicode normalization or
+// case folding before comparison. These limits are checked before a value is
+// inserted into long-lived protocol state.
 //
-// `sender_index` and `receiver_index` are connection-local identifiers equal
-// to the zero-based SDP media-section index of the corresponding negotiated RTP
-// sender or receiver.
-//
-// They MUST NOT be used as application or PulseBeam entity identity.
-//
-// Catalog, Intent, and Mapping are complete replacement state, not patches.
-// An invalid Intent is rejected atomically.
+// Repeated protocol lists MUST also be bounded by the logical state they refer
+// to: sender indices must exist in the negotiated transport, requested TrackIds
+// must be unique and visible in Catalog, and Mapping entries must refer to
+// negotiated receivers. Implementations MUST additionally bound per-connection
+// signaling queue depth and processing rate so a peer cannot monopolize a
+// dataplane worker with a stream of individually valid maximum-size messages.
+// Queue/rate thresholds are deployment policy and do not change wire semantics.
 //
 // Option field numbering:
 //
@@ -130,24 +258,58 @@ package pulsebeam.media.v1;
 //
 // This convention should be preserved when extending option messages.
 //
-// Wire encoding:
+// Wire encoding — native connections only:
 //
-// Each data-channel message contains exactly one signaling message.
+// Each binary data-channel message contains exactly one ClientMessage or
+// ServerMessage. No additional PulseBeam framing is used and there is no
+// application-level fragmentation above the data-channel message boundary.
 //
-// The data-channel message is:
+// The complete protobuf message is serialized first and then compressed as
+// exactly one raw LZ4 block. The data-channel message consists only of that
+// block.
 //
-//   uint32 little-endian uncompressed length || one LZ4 block
+// The block MUST conform to the LZ4 Block Format. It is not an LZ4 Frame and
+// therefore carries no LZ4 frame magic, frame descriptor, block-size field,
+// checksum, end mark, or concatenated frame data.
 //
-// Both endpoints MUST encode every ClientMessage and ServerMessage with LZ4
-// after protobuf serialization and MUST decompress before protobuf decoding.
+// Every data-channel message is independently compressible and decompressible.
+// The block MUST NOT use a preset dictionary or reference bytes from any
+// previous message. Compression state is never shared between messages.
 //
-// Every data-channel message is an independent block. Compression state is
-// never shared between messages.
+// The data-channel message boundary supplies the compressed block length. A raw
+// LZ4 block does not carry its uncompressed length. Receivers MUST decompress
+// with a bounded output capacity of 32,768 bytes; the number of bytes
+// successfully produced by the LZ4 decoder is the serialized protobuf length.
+// Those bytes are then protobuf-decoded.
 //
-// Both the complete encoded data-channel message and the advertised/actual
-// uncompressed protobuf are limited to 262,144 bytes. Receivers MUST validate
-// the encoded length and advertised length before allocating output, and MUST
-// reject blocks whose actual output length differs from the advertised length.
+// A conforming sender never needs more than 32,912 bytes for the raw LZ4 block,
+// using the LZ4 worst-case bound n + floor(n / 255) + 16 for n = 32,768.
+// Receivers MUST reject a data-channel message larger than 32,912 bytes before
+// decompression, MUST use a bounds-checked LZ4 decoder, and MUST reject malformed
+// blocks or blocks whose decoded output would exceed 32,768 bytes.
+//
+// Malformed/oversized LZ4 or undecodable protobuf is a wire-protocol violation.
+// The receiver SHOULD terminate the signaling connection without attempting to
+// interpret partial state. Implementations SHOULD use bounded/reusable scratch
+// storage so wire decoding itself cannot cause an unbounded dataplane allocation.
+//
+// Compression parameters such as acceleration level are not part of the wire
+// protocol. Any encoder producing a conforming independent raw LZ4 block within
+// these limits is valid.
+//
+// Protocol evolution:
+//
+//   `pulsebeam.media.v1` fixes protobuf + independent raw LZ4 block as the native
+//   wire representation. Changing serialization, compression, message-size
+//   limits in an incompatible way, or other outer wire semantics requires a new
+//   negotiated/versioned protocol; there is no per-message encoding discriminator.
+//
+//   Protobuf unknown fields inside an otherwise understood message follow normal
+//   protobuf compatibility rules. Top-level ClientMessage/ServerMessage oneof
+//   alternatives are different: an older peer cannot act on an unknown payload.
+//   Adding a top-level payload within v1 therefore requires an independently
+//   negotiated capability or a new protocol version. A decoded top-level envelope
+//   with no recognized payload is a protocol error.
 
 
 // ============================================================================
@@ -165,13 +327,18 @@ enum TrackKind {
 
 // One participant visible in the room.
 //
-// `participant_id` is the canonical ParticipantId owned by PulseBeam.
+// `participant_id` is the canonical ParticipantId owned by PulseBeam. It MUST be
+// non-empty and no longer than 128 UTF-8 bytes.
 //
-// `participant_external_id` is the application-supplied ParticipantExternalId
-// from the participant's authorization.
+// `participant_external_id` is the application-owned ParticipantExternalId from
+// authorization. It MUST be non-empty and no longer than 256 UTF-8 bytes.
+// ParticipantExternalId is unique among active participants in one room; server
+// admission MUST resolve a duplicate before both connections become visible.
+//
+// For a given ParticipantId, participant_external_id is immutable.
 //
 // Application metadata such as display name or avatar belongs to application
-// signaling.
+// signaling and MUST NOT be inferred from either identifier.
 message Participant {
   string participant_id = 1;
   string participant_external_id = 2;
@@ -180,16 +347,24 @@ message Participant {
 
 // A local track owned by this participant.
 //
-// A LocalTrack does not carry a TrackId. Its application-facing identity is
-// `(kind, label)` until PulseBeam derives the corresponding canonical TrackId.
+// A LocalTrack does not carry a TrackId. Its application-facing identity is the
+// `(kind, label)` pair until PulseBeam associates the published logical track
+// with a canonical TrackId.
 //
-// `sender_index` identifies the negotiated local RTP sender by the zero-based
-// SDP media-section index.
+// `sender_index` is the zero-based SDP media-section index of an existing
+// negotiated local RTP sender. It is connection-local. It MUST identify exactly
+// one negotiated sender, MUST be unique within SendIntent, and `kind` MUST match
+// the media kind of that negotiated section.
 //
-// `sender_index` is scoped to this connection. It is not an Id, Address,
-// Handle, or application identity.
+// `kind` MUST be AUDIO or VIDEO; TRACK_KIND_UNSPECIFIED is invalid here.
 //
-// `kind` MUST match the negotiated media section.
+// `label` is application-owned, case-sensitive UTF-8. It MUST be non-empty and
+// no longer than 64 UTF-8 bytes. `(kind, label)` MUST be unique within the
+// participant's SendIntent.
+//
+// A label/kind change changes logical track identity. The server MUST NOT mutate
+// the identity tuple of an existing TrackId to represent it; a differently
+// labeled/kinded published track receives a different TrackId.
 message LocalTrack {
   uint32 sender_index = 1;
   TrackKind kind = 2;
@@ -197,14 +372,23 @@ message LocalTrack {
 }
 
 
-// A remote track visible to this participant.
+// A canonical remote track visible to this participant.
 //
-// `track_id` is the canonical TrackId owned by PulseBeam.
+// `track_id` is the opaque canonical TrackId owned by PulseBeam. It MUST be
+// non-empty and no longer than 128 UTF-8 bytes.
 //
-// `participant_id` is the canonical ParticipantId of the owning participant.
+// `participant_id` is the canonical ParticipantId of the owning participant and
+// MUST reference a Participant in the same resulting Catalog state.
 //
-// `(participant_id, kind, label)` describes the application-facing track and
-// allows SDKs to associate the canonical TrackId with application selectors.
+// `kind` MUST be AUDIO or VIDEO.
+//
+// `label` is the application-facing track label. It MUST be non-empty and no
+// longer than 64 UTF-8 bytes. `(participant_id, kind, label)` is unique in the
+// resulting Catalog state.
+//
+// For a given TrackId, participant_id, kind, and label are immutable. Changing
+// any of them requires a different TrackId; implementations MUST NOT preserve a
+// TrackId across an identity change merely for convenience.
 message RemoteTrack {
   string track_id = 1;
   string participant_id = 2;
@@ -219,18 +403,107 @@ message RemoteTrack {
 
 // Complete server-authoritative remote room state visible to this participant.
 //
-// Each Catalog atomically replaces the previous Catalog.
+// Applying a snapshot atomically replaces the receiver's previous Catalog
+// state. Empty participants/tracks lists are valid (for example, a participant
+// alone in a room).
 //
-// Participants and tracks carry canonical PulseBeam IDs. SDKs may retain,
-// compare, hash, and protocol-forward these values, but MUST treat their
-// canonical encoding as opaque.
-//
-// Participant IDs and TrackIds are unique. Tracks also have a unique
-// `(participant_id, kind, label)` selector and MUST reference a participant in
-// this same Catalog. The Catalog contains no tracks owned by its recipient.
-message Catalog {
+// The first Catalog message on a native signaling connection MUST be a snapshot.
+message CatalogSnapshot {
   repeated Participant participants = 1;
   repeated RemoteTrack tracks = 2;
+}
+
+
+// One atomic incremental change to server-authoritative Catalog state.
+//
+// Additions are additions, not mutable upserts:
+//
+//   - every added ParticipantId MUST be absent from the pre-delta Catalog;
+//   - every added TrackId MUST be absent from the pre-delta Catalog;
+//   - every removed ID MUST exist in the pre-delta Catalog;
+//   - IDs in each repeated field MUST be unique;
+//   - an ID MUST NOT be both added and removed in the same delta.
+//
+// Removing a participant also removes every track owned by that participant.
+// Such tracks MUST NOT also be redundantly listed in `removed_track_ids`.
+//
+// An added track may reference a participant already present before the delta or
+// a participant added by the same delta. It MUST NOT reference a participant
+// removed by the same delta.
+//
+// At least one of the four fields MUST be non-empty. Empty deltas are invalid;
+// Catalog revision is state versioning, not a heartbeat mechanism.
+//
+// The delta is applied atomically. Only the resulting state is observable and
+// it MUST satisfy all Catalog invariants documented on Catalog below.
+message CatalogDelta {
+  repeated Participant added_participants = 1;
+  repeated string removed_participant_ids = 2;
+  repeated RemoteTrack added_tracks = 3;
+  repeated string removed_track_ids = 4;
+}
+
+
+// Server-authoritative remote room state visible to this participant.
+//
+// `revision` is server-owned, scoped to this signaling connection, and MUST be
+// nonzero. Revision values MUST NOT wrap.
+//
+// Revision/state rules:
+//
+//   - The first Catalog message MUST contain `snapshot`.
+//   - A delta MUST have revision exactly previous_revision + 1.
+//   - A later snapshot is an explicit resynchronization and MUST have revision
+//     greater than the previously applied revision; it may skip revision values.
+//   - A non-consecutive delta, non-increasing snapshot, revision 0, or absent
+//     `state` is a protocol error. The client MUST NOT guess missing deltas.
+//
+// Resulting-state invariants:
+//
+//   - ParticipantId is unique.
+//   - ParticipantExternalId is unique among active room participants, including
+//     the Catalog recipient even though the recipient is omitted from its own
+//     Catalog.
+//   - TrackId is unique.
+//   - `(participant_id, kind, label)` is unique.
+//   - Every track references a participant in the same resulting Catalog.
+//   - The Catalog contains no tracks owned by its recipient.
+//   - Canonical identity immutability described at the top of this file holds
+//     across snapshots and deltas; resynchronization does not permit ID reuse for
+//     a different identity.
+//
+// Catalog/Mapping causal ordering:
+//
+//   Catalog and Mapping are separate messages but form one server-authoritative
+//   observed state. After every successfully applied ServerMessage, every TrackId
+//   referenced by Mapping MUST already exist in Catalog and have the matching
+//   media kind.
+//
+//   Therefore, when introducing a mapped track, the server MUST send/apply the
+//   Catalog message that introduces the track before the Mapping that references
+//   it. When removing a mapped track (directly or by removing its participant),
+//   the server MUST first send a Mapping replacement that no longer references
+//   it, then send the Catalog removal. The same rule applies to a resynchronizing
+//   snapshot that omits a previously mapped track.
+//
+// Recoverability/size invariant:
+//
+//   The complete current Catalog state MUST always be representable as one
+//   CatalogSnapshot within the 32,768-byte uncompressed protobuf limit. A server
+//   MUST NOT grow a native participant's visible Catalog beyond that bound merely
+//   because incremental deltas still fit. Admission/publication/visibility policy
+//   must prevent that state, or native connection creation must fail through the
+//   HTTP control plane. This protocol does not define chunked Catalog snapshots.
+//
+// Native clients MUST NOT infer reconnect or transport failure from Catalog
+// changes; connection recreation is requested only by Reconnect.
+message Catalog {
+  uint64 revision = 1;
+
+  oneof state {
+    CatalogSnapshot snapshot = 2;
+    CatalogDelta delta = 3;
+  }
 }
 
 
@@ -238,15 +511,18 @@ message Catalog {
 // 2. Intent — what this participant wants
 // ============================================================================
 
-// Complete desired local sending state.
+// Complete desired local sending state for this connection.
 //
-// Each entry identifies one negotiated local sender through its connection-local
-// sender_index and gives that sender its application-facing `(kind, label)`.
+// Each entry names one already-negotiated local RTP sender by sender_index and
+// assigns that sender its application-facing `(kind, label)` identity.
 //
-// Sender indices are unique, and `(kind, label)` is unique within this Intent.
-// An empty list unpublishes every local track.
+// Sender indices are unique. `(kind, label)` pairs are unique. Every sender_index
+// MUST exist in the negotiated transport and its media kind MUST match `kind`.
+// An empty list unpublishes every local track from this participant.
 //
-// Accepted state is interpreted together with the enclosing Intent.
+// Accepted state is interpreted together with the enclosing Intent. This message
+// cannot create new SDP media sections; transport structure changes occur through
+// connection recreation/negotiation, not by inventing sender indices here.
 message SendIntent {
   repeated LocalTrack tracks = 1;
 }
@@ -307,8 +583,13 @@ message VideoOptions {
 
 // Desired state for one canonical remote video track.
 //
-// `track_id` MUST refer to a TrackId visible in Catalog and MUST identify a
-// video track. If `options` is absent, protobuf/default video options apply.
+// `track_id` MUST identify a VIDEO TrackId visible in the client's currently
+// observed Catalog. Because Catalog and Intent travel in opposite directions, a
+// TrackId can disappear on the server after the client legitimately observed it
+// and before this Intent arrives. That race is handled as INVALID_TRACK according
+// to the Intent stale-Catalog rules below; it is not inherently a protocol bug.
+//
+// If `options` is absent, protobuf/default video options apply.
 message VideoTrackIntent {
   string track_id = 1;
   VideoOptions options = 2;
@@ -317,8 +598,8 @@ message VideoTrackIntent {
 
 // Complete desired remote video state.
 //
-// Each entry explicitly references one canonical TrackId, at most once. An
-// empty list requests no video tracks.
+// Each entry explicitly references one canonical VIDEO TrackId, at most once.
+// Entry ordering has no semantic meaning. An empty list requests no video tracks.
 message VideoIntent {
   repeated VideoTrackIntent tracks = 1;
 }
@@ -339,8 +620,11 @@ message AudioOptions {
 
 // Desired state for one explicitly requested canonical remote audio track.
 //
-// `track_id` MUST refer to a TrackId visible in Catalog and MUST identify an
-// audio track. If `options` is absent, protobuf/default audio options apply.
+// `track_id` MUST identify an AUDIO TrackId visible in the client's currently
+// observed Catalog. A concurrent Catalog removal is handled as INVALID_TRACK as
+// described on Intent; it is not inherently a protocol bug.
+//
+// If `options` is absent, protobuf/default audio options apply.
 message AudioTrackIntent {
   string track_id = 1;
   AudioOptions options = 2;
@@ -349,7 +633,8 @@ message AudioTrackIntent {
 
 enum AudioMode {
   // Select explicit tracks first, then automatically fill remaining negotiated
-  // audio receiver capacity.
+  // audio receiver capacity. This is intentionally value 0 so an omitted mode
+  // has useful AUTO semantics.
   AUDIO_MODE_AUTO = 0;
 
   // Select only explicit tracks. Remaining audio receivers stay unused.
@@ -359,7 +644,7 @@ enum AudioMode {
 
 // Complete desired remote audio state.
 //
-// `tracks` contains explicitly requested canonical audio TrackIds in preference
+// `tracks` contains explicitly requested canonical AUDIO TrackIds in preference
 // order. Each TrackId occurs at most once. An empty list is valid.
 //
 // In AUDIO_MODE_AUTO:
@@ -401,20 +686,44 @@ message ReceiveIntent {
 }
 
 
-// Complete desired media state.
+// Complete client-authoritative desired media state for this connection.
 //
-// Every accepted Intent atomically replaces the previous Intent.
+// Every accepted Intent atomically replaces the previous accepted Intent.
+// `send` and `receive` MUST both be present.
 //
-// `revision` is client-owned, monotonically increasing, and scoped to this
-// signaling connection. It is not an entity Id. It correlates Mapping and
-// intent-specific errors.
+// `revision` is client-owned, scoped to this signaling connection, and MUST be
+// nonzero. It correlates Mapping and intent-specific errors; it is not an entity
+// identity. Revision values MUST NOT wrap.
 //
-// Receive intent references canonical TrackIds supplied by PulseBeam.
+// A candidate Intent MUST have revision strictly greater than the latest accepted
+// Intent revision. An accepted revision is never replayed/idempotently accepted:
+// an Intent whose revision is less than or equal to the latest accepted revision
+// is rejected as INVALID_INTENT without changing accepted state. A rejected
+// candidate does not change the latest accepted revision.
 //
-// `send` and `receive` MUST be present. A newer valid revision is accepted. An
-// identical replay of the current revision is accepted and acknowledged with
-// its Mapping; an older revision or a conflicting replay is rejected without
-// changing accepted state.
+// The data channel is reliable and ordered, so this protocol deliberately avoids
+// same-revision replay semantics and does not define protobuf-byte canonicality.
+// A new connection has a new revision namespace; an SDK reconstructing desired
+// state after Reconnect MUST use a fresh nonzero revision rather than replaying
+// the old connection's revision.
+//
+// Receive TrackIds are validated against the server's current Catalog. Catalog
+// and Intent travel in opposite directions, so a client can legitimately send an
+// Intent for a TrackId that was visible when it constructed the Intent but was
+// concurrently removed by the server. In that case:
+//
+//   - the server rejects the whole candidate atomically with INVALID_TRACK and
+//     the candidate `intent_revision`;
+//   - the previous accepted Intent remains unchanged;
+//   - before sending that Error, the server MUST order the Catalog change that
+//     made the TrackId invalid earlier on the server->client message stream;
+//   - INVALID_TRACK in this race is normal stale-state reconciliation, not proof
+//     of a programmer error.
+//
+// A structurally valid Intent that cannot be represented by the currently
+// negotiated receiver structure (for example, fresh receiver m-sections are
+// required) MAY cause Reconnect instead of acceptance. The server MUST NOT label
+// such an Intent invalid solely because the current transport lacks capacity.
 message Intent {
   uint64 revision = 1;
   SendIntent send = 2;
@@ -426,12 +735,12 @@ message Intent {
 // 3. Mapping — where canonical remote tracks are delivered locally
 // ============================================================================
 
-// One canonical remote track assigned to one negotiated local receiver.
+// One canonical remote track assigned to one negotiated local RTP receiver.
 //
 // `receiver_index` is the zero-based SDP media-section index of that receiver.
-//
-// It is a connection-local protocol coordinate, not a PulseBeam entity Id,
-// Address, Handle, or application identity.
+// It MUST identify an existing negotiated receive-capable RTP media section.
+// It is connection-local and is not a PulseBeam entity Id, Address, Handle, or
+// application identity.
 //
 // The client resolves:
 //
@@ -440,41 +749,57 @@ message Intent {
 //       -> MediaStreamTrack
 //       -> TrackId
 //
-// `track_id` is the canonical TrackId currently delivered through that
-// receiver.
+// `track_id` is the canonical TrackId currently delivered through that receiver.
+// It MUST already be present in the currently applied Catalog.
 message TrackMapping {
   uint32 receiver_index = 1;
   string track_id = 2;
 }
 
 
-// Complete current set of track mappings for one media kind.
+// Complete current mappings for one media kind.
 //
-// Receivers without an assigned track are omitted.
-//
-// Entry ordering has no semantic meaning. Receiver indices and TrackIds are
-// each unique within one media kind.
+// Receivers without an assigned track are omitted. Entry ordering has no
+// semantic meaning.
 message TrackMappings {
   repeated TrackMapping tracks = 1;
 }
 
 
-// Complete current receive mapping.
+// Complete current receive mapping for this connection.
 //
-// Each Mapping atomically replaces the previous Mapping.
+// Each Mapping atomically replaces the previous Mapping; it is never a patch.
+// `video` and `audio` MUST both be present, including when their track lists are
+// empty.
 //
-// `intent_revision` is the latest Intent revision accepted by the server.
-// Every accepted Intent receives a complete Mapping carrying its revision,
-// even when receiver assignments did not change. Later Mapping replacements
-// continue to carry the latest accepted revision; zero means no accepted
-// Intent.
+// `intent_revision` is the latest Intent revision accepted by the server. Every
+// accepted Intent receives a complete Mapping carrying its revision, even when
+// assignments did not change. Later server-initiated Mapping replacements carry
+// that same latest accepted revision until another Intent is accepted. Zero means
+// that no Intent has yet been accepted; Intent revision 0 is invalid.
 //
-// It is a correlation value scoped to this signaling connection, not a
-// PulseBeam entity Id.
+// Global Mapping invariants (across BOTH `video` and `audio` lists):
 //
-// Mapping changes when an actual receiver-to-TrackId assignment changes, not
-// merely because audio activity, congestion, bitrate, or video layer changes.
-// Both `video` and `audio` MUST be present, including when empty.
+//   - receiver_index values are unique across the entire Mapping;
+//   - TrackIds are unique across the entire Mapping;
+//   - every receiver_index exists in the negotiated transport;
+//   - a video entry's receiver is a negotiated video receiver and its TrackId is
+//     a VIDEO track in the currently applied Catalog;
+//   - an audio entry's receiver is a negotiated audio receiver and its TrackId is
+//     an AUDIO track in the currently applied Catalog;
+//   - every mapped TrackId already exists in Catalog when this Mapping is applied.
+//
+// The server MUST obey the Catalog/Mapping causal-ordering rules documented on
+// Catalog. In particular, it may not create a transient Mapping reference to an
+// unknown/removed TrackId at any server-message boundary.
+//
+// Mapping changes only when an actual receiver-to-TrackId assignment changes or
+// when an accepted Intent must be acknowledged with its revision. Audio activity,
+// congestion, bitrate adaptation, video layer changes, or an unused receiver do
+// not by themselves create a different mapping.
+//
+// A missing mapping means only "this negotiated receiver currently has no TrackId
+// assigned." It MUST NOT be interpreted as an instruction to reconnect.
 message Mapping {
   uint64 intent_revision = 1;
   TrackMappings video = 2;
@@ -486,18 +811,21 @@ message Mapping {
 // 4. Authorization — refresh the participant JWT
 // ============================================================================
 
-// Presents a fresh customer-signed JWT for this live participant.
+// Presents a fresh customer-signed JWT for this live native participant.
 //
 // The token MUST authorize the same canonical participant and room as the
-// existing connection.
+// existing connection. The application-owned `room` and `sub` claims therefore
+// MUST resolve to the same RoomId and ParticipantId.
 //
-// The application-owned `room` and `sub` claims therefore MUST resolve to the
-// same RoomId and ParticipantId.
+// `token` MUST be non-empty and no longer than 16,384 UTF-8 bytes. Tokens are
+// secrets and MUST NOT be logged.
 //
-// Accepted renewal extends authorization only. It does not modify SDP,
-// Catalog, Intent, or Mapping.
+// Accepted renewal extends authorization only. It does not modify SDP, Catalog,
+// Intent, or Mapping. Rejected renewal leaves the existing authorization in force
+// until its current deadline unless the connection is otherwise terminated.
 //
-// Tokens are secrets and MUST NOT be logged.
+// WHIP/WHEP authorization refresh, if supported, belongs to their HTTP protocol
+// and MUST NOT use this message.
 message RenewAuthorization {
   string token = 1;
 }
@@ -517,6 +845,22 @@ message Authorization {
 // Errors
 // ============================================================================
 
+// Machine-readable failure categories.
+//
+// ErrorCode values describe a failure; `fatal` on Error determines whether this
+// particular failure terminates safe signaling. The following combinations are
+// normative:
+//
+//   INVALID_MESSAGE          fatal = true
+//   INVALID_INTENT           fatal = false
+//   INVALID_SENDER           fatal = false
+//   INVALID_TRACK            fatal = false
+//   AUTHORIZATION_REJECTED   fatal = false
+//   AUTHORIZATION_EXPIRED    fatal = true
+//   PROTOCOL_ERROR           fatal = true
+//   INTERNAL                 fatal = implementation-dependent
+//
+// ERROR_CODE_UNSPECIFIED MUST NOT be sent.
 enum ErrorCode {
   ERROR_CODE_UNSPECIFIED = 0;
 
@@ -530,19 +874,27 @@ enum ErrorCode {
 
   PROTOCOL_ERROR = 7;
   INTERNAL = 8;
-  PLAYOUT_RESET_REQUIRED = 9;
 }
 
 
 // Machine-readable protocol failure.
 //
-// `message` is diagnostic only and MUST NOT be parsed.
+// `message` is diagnostic only. It MUST NOT be parsed, branched on, or treated as
+// stable API. It SHOULD be safe for developer diagnostics and MUST NOT contain
+// secrets such as JWTs.
 //
-// `intent_revision` is present when a specific Intent was rejected.
+// `intent_revision` MUST be present when an Error rejects a specific candidate
+// Intent and MUST be absent when the error is unrelated to one candidate Intent.
+// A rejected Intent never modifies the previously accepted Intent or Mapping.
 //
-// A rejected Intent never modifies the previously accepted Intent.
+// INVALID_TRACK may represent normal stale-Catalog reconciliation caused by a
+// concurrent server-side track removal; clients MUST NOT assume it always means
+// application programmer error.
 //
-// `fatal` means safe signaling cannot continue.
+// If `fatal` is true, the connection is terminal for this protocol: the server
+// MUST NOT send subsequent Catalog/Mapping/Authorization state, and the client
+// MUST stop sending new ClientMessages. Messages already crossing in the opposite
+// direction may be ignored/rejected but MUST NOT mutate authoritative state.
 message Error {
   ErrorCode code = 1;
   string message = 2;
@@ -555,10 +907,53 @@ message Error {
 // Transport
 // ============================================================================
 
-// One client-to-server signaling message.
+// Explicitly requests that the client recreate this native PulseBeam connection.
 //
-// Exactly one payload is present before protobuf serialization and LZ4
-// compression.
+// Reconnect is lifecycle control, not an Error and not inferred from Catalog or
+// Mapping contents. Typical use includes a valid desired state that requires
+// fresh negotiated receiver media sections. Transient congestion, layer changes,
+// or an unused/missing Mapping entry are not by themselves reasons to infer or
+// synthesize Reconnect.
+//
+// Reconnect is terminal for the old signaling connection:
+//
+//   Server:
+//     - after sending Reconnect, MUST NOT send further Catalog, Mapping,
+//       Authorization, Error, or Reconnect state on this connection;
+//     - MUST NOT apply later-arriving ClientMessages to durable/authoritative
+//       media state. Messages already in flight MAY be ignored while teardown
+//       proceeds.
+//
+//   SDK/client:
+//     - after receiving Reconnect, MUST stop sending new ClientMessages on this
+//       connection and tear it down through the normal reconnect path;
+//     - MUST create a fresh connection through the HTTP connection-resource and
+//       SDP negotiation flow;
+//     - retains the application's desired media state, but MUST reconstruct a new
+//       connection-scoped Intent using fresh sender indices and a fresh nonzero
+//       Intent revision;
+//     - MUST NOT replay old sender/receiver indices, old Intent revision, old
+//       Mapping, or old Catalog as authoritative state.
+//
+// The fresh connection establishes a fresh Catalog beginning with a snapshot and
+// fresh Mapping state. Desired receive selectors are re-resolved against that new
+// Catalog before being encoded as TrackIds in a new Intent.
+//
+// The server SHOULD send Reconnect only when creating a fresh connection can
+// reasonably change the relevant negotiated/lifecycle condition. It MUST NOT use
+// Reconnect as an unbounded retry loop for a condition that connection recreation
+// cannot change.
+//
+// WHIP/WHEP clients never receive this message; their lifecycle is governed by
+// their respective HTTP/SDP protocols.
+message Reconnect {}
+
+
+// One native client-to-server signaling message.
+//
+// Exactly one recognized payload MUST be present before protobuf serialization
+// and raw LZ4 block compression. An envelope with no recognized payload is an
+// INVALID_MESSAGE/protocol-version failure, not an empty no-op.
 message ClientMessage {
   oneof payload {
     Intent intent = 1;
@@ -567,15 +962,17 @@ message ClientMessage {
 }
 
 
-// One server-to-client signaling message.
+// One native server-to-client signaling message.
 //
-// Exactly one payload is present before protobuf serialization and LZ4
-// compression.
+// Exactly one recognized payload MUST be present before protobuf serialization
+// and raw LZ4 block compression. An envelope with no recognized payload is a
+// protocol/version error and MUST NOT be silently ignored as an empty message.
 message ServerMessage {
   oneof payload {
     Catalog catalog = 1;
     Mapping mapping = 2;
     Authorization authorization = 3;
     Error error = 4;
+    Reconnect reconnect = 5;
   }
 }
