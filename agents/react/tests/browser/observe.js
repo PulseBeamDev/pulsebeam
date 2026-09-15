@@ -6,7 +6,7 @@ new Promise((resolve, reject) => {
       : Date.now() >= deadline
         ? reject(
             new Error(
-              "React fixture did not publish observations; run `just browser` to rebuild it",
+              "React fixture did not publish observations; run `just --justfile agents/react/Justfile browser-fixture` to rebuild it",
             ),
           )
         : setTimeout(poll, 10);

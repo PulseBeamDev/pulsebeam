@@ -23,8 +23,11 @@ check: format-check
     pnpm run check
 
 # Run React compile and package-resolution checks only.
-test: build
+test-fast: build
     pnpm run test
+
+# Browser contracts are run by the Web-owned Rust runner.
+test-slow:
 
 # Build the standalone, Rust-driven browser fixture.
 browser-fixture: build

@@ -26,7 +26,7 @@
     "check": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.public-contract.json",
     "format": "prettier --write \"web/**/*.ts\" \"tests/**/*.{js,ts}\" \"*.{json,mjs}\" ubrn.config.yaml pnpm-workspace.yaml",
     "format:check": "prettier --check \"web/**/*.ts\" \"tests/**/*.{js,ts}\" \"*.{json,mjs}\" ubrn.config.yaml pnpm-workspace.yaml",
-    "test": "just test"
+    "test": "just test-fast"
   },
   "dependencies": {
     "@ubjs/core": "0.31.0-5"

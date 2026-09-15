@@ -87,5 +87,7 @@ idempotent.
 
 `just --justfile agents/pulsebeam-agent-web/Justfile check` checks the WASM
 runtime and strict public TypeScript contract. `just --justfile
-agents/pulsebeam-agent-web/Justfile test` builds the package and runs the Rust
-and browser boundary tests.
+agents/pulsebeam-agent-web/Justfile test-fast` builds the package and runs the
+deterministic Rust boundary tests. `just --justfile
+agents/pulsebeam-agent-web/Justfile test-slow` verifies the pinned browser,
+rebuilds the Web and React fixtures, and runs the browser contracts.

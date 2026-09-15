@@ -39,8 +39,15 @@ check: format-check
     pnpm run check
 
 # Run deterministic host-boundary tests. Browser contracts are opt-in.
-test: build uniffi-browser-build
+test-fast: build uniffi-browser-build
     cargo test -p pulsebeam-agent-web
+
+# Run browser contracts after rebuilding every Web and React fixture.
+test-slow:
+    ../../crates/pulsebeam-rtc/scripts/provision-browsers.sh --platform linux-x86_64 --verify-only
+    just browser-fixture
+    just --justfile ../react/Justfile browser-fixture
+    PULSEBEAM_BROWSER_BINARY="{{ justfile_directory() }}/../../target/pulsebeam-rtc-browsers/linux-x86_64/bin/chrome" just browser-run
 
 # Build every Web-owned browser artifact without running Chrome.
 browser-fixture: build uniffi-browser-build

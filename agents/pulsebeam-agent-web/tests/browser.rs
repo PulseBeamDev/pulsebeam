@@ -292,7 +292,8 @@ async fn react_provider_contract_runs_through_bidi() -> TestResult<()> {
     let manifest = fixture.join("fixture-manifest.json");
     if !fixture.join("index.html").is_file() || !manifest.is_file() {
         return Err(
-            "React browser fixture is missing; run `just browser` from the repository root".into(),
+            "React browser fixture is missing; run `just --justfile agents/react/Justfile browser-fixture`"
+                .into(),
         );
     }
     let manifest_time = std::fs::metadata(&manifest)?.modified()?;
@@ -303,7 +304,7 @@ async fn react_provider_contract_runs_through_bidi() -> TestResult<()> {
     ] {
         if std::fs::metadata(source)?.modified()? > manifest_time {
             return Err(
-                "React browser fixture is stale; run `just browser` from the repository root"
+                "React browser fixture is stale; run `just --justfile agents/react/Justfile browser-fixture`"
                     .into(),
             );
         }
