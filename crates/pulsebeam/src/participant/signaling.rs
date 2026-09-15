@@ -20,8 +20,6 @@ pub enum SignalingError {
     DecodeFailed,
     #[error("Request complexity limit exceeded")]
     ComplexityExceeded,
-    #[error("invalid v1 signaling output: {0}")]
-    V1Output(String),
 }
 
 pub enum SignalingInputEvent {
@@ -444,8 +442,6 @@ mod v1_intent_tests {
                         manual_sub: true,
                         room_id: crate::entity::RoomId::from_external(&room),
                         participant_id: crate::entity::ParticipantId::new(),
-                        participant_external_id: crate::entity::ParticipantExternalId::new("self")
-                            .unwrap(),
                         connection_id: crate::entity::ConnectionId::new(),
                         profile: ConnectionProfile::Native,
                         rtc: Rtc::new(std::time::Instant::now()),
@@ -1146,6 +1142,7 @@ pub(crate) struct V1OutputScheduler {
     delivered_mapping: Option<media_signaling::Mapping>,
     catalog_revision: u64,
     pending: Option<V1Pending>,
+    resnapshot_requested: bool,
 }
 
 #[derive(Clone)]
@@ -1186,6 +1183,7 @@ enum V1Commit {
     Catalog {
         catalog: media_signaling::CatalogSnapshot,
         revision: u64,
+        resnapshot: bool,
     },
     Mapping(media_signaling::Mapping),
 }
@@ -1207,6 +1205,12 @@ impl V1OutputScheduler {
     )]
     pub(crate) fn stage_validated(&mut self, desired: V1DesiredState) {
         self.desired = Some(desired);
+    }
+
+    /// Request a complete Catalog snapshot after the current in-flight write.
+    /// The current desired state is selected only when that snapshot is staged.
+    pub(crate) fn request_resnapshot(&mut self) {
+        self.resnapshot_requested = true;
     }
 
     pub(crate) fn poll(&mut self) -> Option<Vec<u8>> {
@@ -1232,6 +1236,7 @@ impl V1OutputScheduler {
                     V1Commit::Catalog {
                         catalog: desired.catalog.clone(),
                         revision,
+                        resnapshot: false,
                     },
                 )
             }
@@ -1247,16 +1252,35 @@ impl V1OutputScheduler {
                 } else {
                     let revision = self.catalog_revision.checked_add(1)?;
                     (
-                        catalog_delta_message(revision, delivered_catalog, &desired.catalog),
+                        if self.resnapshot_requested {
+                            catalog_snapshot_message(revision, desired.catalog.clone())
+                        } else {
+                            catalog_delta_message(revision, delivered_catalog, &desired.catalog)
+                        },
                         V1Commit::Catalog {
                             catalog: desired.catalog.clone(),
                             revision,
+                            resnapshot: self.resnapshot_requested,
                         },
                     )
                 }
             }
+            Some(_) if self.resnapshot_requested => {
+                let revision = self.catalog_revision.checked_add(1)?;
+                (
+                    catalog_snapshot_message(revision, desired.catalog.clone()),
+                    V1Commit::Catalog {
+                        catalog: desired.catalog.clone(),
+                        revision,
+                        resnapshot: true,
+                    },
+                )
+            }
             Some(_) if self.delivered_mapping.as_ref() != Some(&desired.mapping) => {
-                if self.delivered_mapping.is_none() && mapping_is_empty(&desired.mapping) {
+                if self.delivered_mapping.is_none()
+                    && mapping_is_empty(&desired.mapping)
+                    && desired.mapping.intent_revision == 0
+                {
                     return None;
                 }
                 (
@@ -1280,9 +1304,16 @@ impl V1OutputScheduler {
             return None;
         };
         match pending.commit {
-            V1Commit::Catalog { catalog, revision } => {
+            V1Commit::Catalog {
+                catalog,
+                revision,
+                resnapshot,
+            } => {
                 self.delivered_catalog = Some(catalog.clone());
                 self.catalog_revision = revision;
+                if resnapshot {
+                    self.resnapshot_requested = false;
+                }
                 Some(catalog)
             }
             V1Commit::Mapping(mapping) => {
@@ -1295,6 +1326,20 @@ impl V1OutputScheduler {
     /// Reliable ordered channels retry the one retained encoded message. No
     /// state is rolled back: a later `poll` returns the same bytes.
     pub(crate) fn retry_pending(&mut self) {}
+}
+
+fn catalog_snapshot_message(
+    revision: u64,
+    catalog: media_signaling::CatalogSnapshot,
+) -> media_signaling::ServerMessage {
+    media_signaling::ServerMessage {
+        payload: Some(media_signaling::server_message::Payload::Catalog(
+            media_signaling::Catalog {
+                revision,
+                state: Some(media_signaling::catalog::State::Snapshot(catalog)),
+            },
+        )),
+    }
 }
 
 fn mapping_message(mapping: media_signaling::Mapping) -> media_signaling::ServerMessage {
@@ -1488,7 +1533,11 @@ impl Signaling {
     }
 
     pub fn set_cid(&mut self, cid: ChannelId) {
-        self.cid = Some(cid);
+        if self.cid.replace(cid).is_some()
+            && let Some(output) = &mut self.v1_output
+        {
+            output.scheduler.request_resnapshot();
+        }
         self.dirty_roster = true;
         self.dirty_bindings = true;
         self.full_state_retries = 2;
@@ -1983,6 +2032,129 @@ mod v1_output_tests {
     }
 
     #[test]
+    fn accepted_empty_mapping_is_not_suppressed() {
+        let mut scheduler = V1OutputScheduler::default();
+        scheduler.stage(catalog(&[]), mapping(""));
+        let _ = next(&mut scheduler);
+        scheduler.commit_sent();
+
+        let mut acknowledged = mapping("");
+        acknowledged.intent_revision = 1;
+        scheduler.stage(catalog(&[]), acknowledged);
+        let message = next(&mut scheduler);
+        assert!(matches!(
+            message.payload,
+            Some(media_signaling::server_message::Payload::Mapping(
+                media_signaling::Mapping {
+                    intent_revision: 1,
+                    ..
+                }
+            ))
+        ));
+    }
+
+    #[test]
+    fn mixed_replacement_clears_then_deltas_then_maps() {
+        let mut scheduler = V1OutputScheduler::default();
+        scheduler.stage(catalog(&[("track-a", "camera")]), mapping("track-a"));
+        let _ = next(&mut scheduler);
+        scheduler.commit_sent();
+        let _ = next(&mut scheduler);
+        scheduler.commit_sent();
+
+        scheduler.stage(catalog(&[("track-b", "screen")]), mapping("track-b"));
+        assert!(matches!(
+            next(&mut scheduler).payload,
+            Some(media_signaling::server_message::Payload::Mapping(_))
+        ));
+        scheduler.commit_sent();
+        assert!(matches!(
+            next(&mut scheduler).payload,
+            Some(media_signaling::server_message::Payload::Catalog(
+                media_signaling::Catalog {
+                    state: Some(media_signaling::catalog::State::Delta(_)),
+                    ..
+                }
+            ))
+        ));
+        scheduler.commit_sent();
+        assert!(matches!(
+            next(&mut scheduler).payload,
+            Some(media_signaling::server_message::Payload::Mapping(_))
+        ));
+    }
+
+    #[test]
+    fn resnapshot_uses_a_higher_revision_after_commits() {
+        let mut scheduler = V1OutputScheduler::default();
+        scheduler.stage(catalog(&[]), mapping(""));
+        let _ = next(&mut scheduler);
+        scheduler.commit_sent();
+
+        scheduler.request_resnapshot();
+        let message = next(&mut scheduler);
+        let Some(media_signaling::server_message::Payload::Catalog(catalog)) = message.payload
+        else {
+            panic!("resynchronization must emit a catalog snapshot");
+        };
+        assert_eq!(catalog.revision, 2);
+        assert!(matches!(
+            catalog.state,
+            Some(media_signaling::catalog::State::Snapshot(_))
+        ));
+    }
+
+    #[test]
+    fn coalesces_updates_behind_an_in_flight_catalog() {
+        let mut scheduler = V1OutputScheduler::default();
+        scheduler.stage(catalog(&[]), mapping(""));
+        let _ = next(&mut scheduler);
+        scheduler.commit_sent();
+
+        scheduler.stage(catalog(&[("track-a", "camera")]), mapping("track-a"));
+        let _in_flight = next(&mut scheduler);
+        scheduler.stage(catalog(&[("track-b", "screen")]), mapping("track-b"));
+        scheduler.commit_sent();
+
+        let message = next(&mut scheduler);
+        let Some(media_signaling::server_message::Payload::Catalog(catalog)) = message.payload
+        else {
+            panic!("latest desired catalog must follow the committed in-flight bytes");
+        };
+        let Some(media_signaling::catalog::State::Delta(delta)) = catalog.state else {
+            panic!("coalesced replacement must be a delta");
+        };
+        assert_eq!(delta.added_tracks[0].track_id, "track-b");
+        assert_eq!(delta.removed_track_ids, ["track-a"]);
+    }
+
+    #[test]
+    fn unavailable_track_can_return_before_its_removal_commits() {
+        let mut scheduler = V1OutputScheduler::default();
+        scheduler.stage(catalog(&[("track-a", "camera")]), mapping("track-a"));
+        let _ = next(&mut scheduler);
+        scheduler.commit_sent();
+        let _ = next(&mut scheduler);
+        scheduler.commit_sent();
+
+        scheduler.stage(catalog(&[]), mapping(""));
+        let _clear = next(&mut scheduler);
+        scheduler.commit_sent();
+        scheduler.stage(catalog(&[("track-a", "camera")]), mapping("track-a"));
+
+        let message = next(&mut scheduler);
+        assert!(matches!(
+            message.payload,
+            Some(media_signaling::server_message::Payload::Mapping(
+                media_signaling::Mapping {
+                    video: Some(media_signaling::TrackMappings { tracks }),
+                    ..
+                }
+            )) if tracks[0].track_id == "track-a"
+        ));
+    }
+
+    #[test]
     fn validated_desired_state_rejects_unknown_mapping_tracks() {
         let snapshot = SignalingSnapshot {
             publications: Vec::new(),
@@ -2259,6 +2431,12 @@ mod tests {
             .expect("valid desired state");
 
         let first = signaling.poll(&snapshot).expect("catalog output");
+        signaling.retry_pending();
+        assert_eq!(
+            signaling.poll(&snapshot).expect("retry output").bytes,
+            first.bytes,
+            "a failed local write retains the exact catalog bytes"
+        );
         assert!(matches!(
             pulsebeam_proto::codec::decode_server(&first.bytes),
             Ok(media_signaling::ServerMessage {
@@ -2273,6 +2451,25 @@ mod tests {
             Ok(media_signaling::ServerMessage {
                 payload: Some(media_signaling::server_message::Payload::Mapping(_)),
             })
+        ));
+        signaling.commit_sent();
+        assert!(
+            signaling.poll(&snapshot).is_none(),
+            "causal sequence is drained"
+        );
+
+        signaling.set_cid(rtc.direct_api().create_data_channel(Default::default()));
+        let resnapshot = signaling.poll(&snapshot).expect("replacement CID snapshot");
+        let Ok(media_signaling::ServerMessage {
+            payload: Some(media_signaling::server_message::Payload::Catalog(catalog)),
+        }) = pulsebeam_proto::codec::decode_server(&resnapshot.bytes)
+        else {
+            panic!("replacement CID must resynchronize with a Catalog");
+        };
+        assert_eq!(catalog.revision, 2);
+        assert!(matches!(
+            catalog.state,
+            Some(media_signaling::catalog::State::Snapshot(_))
         ));
     }
 

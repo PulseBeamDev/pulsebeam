@@ -133,7 +133,6 @@ pub struct ParticipantConfig {
     pub manual_sub: bool,
     pub room_id: entity::RoomId,
     pub participant_id: entity::ParticipantId,
-    pub participant_external_id: entity::ParticipantExternalId,
     pub connection_id: entity::ConnectionId,
     pub profile: ConnectionProfile,
     pub rtc: Rtc,
@@ -219,12 +218,7 @@ impl Participant {
             room_id: cfg.room_id,
             participant_id: cfg.participant_id,
         };
-        let signaling = match cfg.profile {
-            ConnectionProfile::Native => {
-                Signaling::new_v1(ctx, cfg.participant_external_id.as_str().to_owned())
-            }
-            ConnectionProfile::Whip | ConnectionProfile::Whep => Signaling::new(ctx),
-        };
+        let signaling = Signaling::new(ctx);
         let now = Instant::now();
         #[cfg(feature = "sim")]
         let sim_span = tracing::info_span!(
@@ -393,7 +387,6 @@ impl Participant {
                 auto: intent.audio_auto,
             });
         self.signaling.accept_v1_intent(intent);
-        self.signaling.mark_assignments_dirty();
         signaling::V1IntentResult::Mapping(self.v1_mapping())
     }
 
@@ -1077,13 +1070,6 @@ impl Participant {
             if self.signaling.needs_poll() {
                 let mut snapshot = self.downstream.signaling_snapshot();
                 snapshot.participants = self.signaling.participants_snapshot();
-                if let Err(error) = self.signaling.stage_v1_output(&snapshot, self.v1_mapping()) {
-                    plog_warn!(self.log_ctx(), %error, "Fatal: invalid v1 signaling output");
-                    self.disconnect(DisconnectReason::SignalingError(
-                        signaling::SignalingError::V1Output(error.to_string()),
-                    ));
-                    continue;
-                }
                 if let Some(output) = self.signaling.poll(&snapshot) {
                     if self
                         .transport
@@ -1814,7 +1800,6 @@ mod v1_catalog_reconciliation_tests {
                 manual_sub: true,
                 room_id: crate::entity::RoomId::from_external(&room),
                 participant_id: crate::entity::ParticipantId::new(),
-                participant_external_id: crate::entity::ParticipantExternalId::new("self").unwrap(),
                 connection_id: crate::entity::ConnectionId::new(),
                 profile: ConnectionProfile::Native,
                 rtc: Rtc::new(std::time::Instant::now()),

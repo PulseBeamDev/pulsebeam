@@ -118,7 +118,6 @@ impl ControllerCore {
             manual_sub: state.manual_sub,
             room_id: state.room_id,
             participant_id: state.participant_id,
-            participant_external_id: state.participant_external_id,
             connection_id: state.connection_id,
             profile: state.profile,
             rtc,
