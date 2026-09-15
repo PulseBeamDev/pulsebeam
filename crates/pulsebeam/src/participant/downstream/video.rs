@@ -350,10 +350,15 @@ impl VideoAllocator {
             slot.min_height = intent.min_height;
             slot.min_fps = intent.min_fps;
             slot.priority = intent.priority;
-            if meets_floor(&layer) {
-                slot.switch_to(&layer, false);
-            } else {
+            if !meets_floor(&layer) {
                 slot.pause_at(&layer);
+            } else if intent.min_height > 0 && slot.needs_floor_barrier(&layer) {
+                // An old lower layer may still be active or draining while the
+                // floor-compatible layer awaits a keyframe. Stop it before the
+                // new stage is exposed so no packet slips through below floor.
+                slot.pause_at(&layer);
+            } else {
+                slot.switch_to(&layer, false);
             }
         } else {
             slot.max_height = 0;
@@ -765,10 +770,16 @@ impl VideoAllocator {
 
             match decision {
                 AllocationDecision::Forward(layer, _) => {
+                    if slot.min_height > 0 && slot.needs_floor_barrier(layer) {
+                        changed |= slot.pause_at(layer);
+                    }
                     changed |= slot.switch_to(layer, false);
                     changed |= slot.set_decode_target(DecodeTargetSelection::Full);
                 }
                 AllocationDecision::ForwardTarget(layer, target, _) => {
+                    if slot.min_height > 0 && slot.needs_floor_barrier(layer) {
+                        changed |= slot.pause_at(layer);
+                    }
                     changed |= slot.switch_to(layer, false);
                     changed |= slot.set_decode_target(*target);
                 }
@@ -1200,6 +1211,15 @@ impl Slot {
 
     fn target(&self) -> Option<&TrackLayer> {
         self.desired.as_ref()
+    }
+
+    /// Whether changing this floor-constrained target must first stop an
+    /// active lower stream (or replace an incompatible pending stage).
+    fn needs_floor_barrier(&self, layer: &TrackLayer) -> bool {
+        match self.switcher.active_stream() {
+            Some(active) => active != layer.stream_id(),
+            None => self.switcher.staging_stream() != Some(layer.stream_id()),
+        }
     }
 
     fn state(&self) -> SlotState {
@@ -3022,7 +3042,7 @@ mod assignment_tests {
         let view = SlotView {
             key,
             mid: Mid::from("s0"),
-            max_height: 0,
+            max_height: 360,
             min_height: 720,
             min_fps: 0,
             priority: 0,
@@ -3079,6 +3099,51 @@ mod assignment_tests {
             engine.run_compute(Bitrate::from(2_000_000), std::slice::from_ref(&view)).get(key),
             Some(AllocationDecision::Forward(layer, _)) if *layer == high
         ));
+    }
+
+    #[test]
+    fn raising_a_floor_stops_active_lower_video_before_720p_is_staged() {
+        let mut allocator = setup_allocator();
+        let pid = ParticipantId::new();
+        let (tx, track, states) = video_track_with_states(
+            pid,
+            Mid::from("v0"),
+            vec![SimulcastLayer::new("h"), SimulcastLayer::new("f")],
+        );
+        allocator.seed_layer_states(&states);
+        let track_id = tx.meta.id;
+        allocator.add_track(Track::video(tx.meta, track.layers().to_vec(), None));
+        add_slots(&mut allocator, 1);
+
+        let track = allocator.track(&track_id).unwrap();
+        let medium = track.by_quality(LayerQuality::Medium).unwrap().clone();
+        let high = track.by_quality(LayerQuality::High).unwrap().clone();
+        let slot = allocator.slots.values_mut().next().unwrap();
+        slot.set_roles_for_test(Some(&medium), None);
+        slot.paused = false;
+
+        let mut intents = HashMap::new();
+        intents.insert(
+            Mid::from("s0"),
+            Intent {
+                track_id,
+                target_height: 360,
+                min_height: 720,
+                min_fps: 0,
+                priority: 0,
+            },
+        );
+        allocator.configure(&intents);
+
+        let slot = allocator.slots.values_mut().next().unwrap();
+        assert!(slot.paused);
+        assert!(slot.test_active().is_none());
+        assert_eq!(slot.test_staging(), Some(high.stream_id()));
+
+        let mut writer = StreamWriter::new();
+        let packet = RtpPacket::default();
+        assert!(!slot.on_rtp(track_id, packet.arrival_ts, None, &mut writer));
+        assert!(writer.pop().is_none(), "360p must not emit while 720p is pending");
     }
 
     #[test]
