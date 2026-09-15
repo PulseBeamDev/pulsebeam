@@ -13,6 +13,7 @@ use str0m::{
 use tokio::time::Instant;
 
 use crate::control::NegotiatedResources;
+use crate::control::controller::ConnectionProfile;
 use crate::entity::{self, TrackId, TrackKind};
 use crate::id::ShardId;
 use crate::keys::TrackHandle;
@@ -35,7 +36,10 @@ use crate::participant::{
         AppliedMutation, IngressResult, RtpWriteCommand, Transport, TransportMutation,
         TransportPollOutput,
     },
-    upstream::{IncomingRtpRoute, UpstreamAllocator},
+    upstream::{
+        IncomingRtpRoute, NativePublicationError, NativePublicationEvent, NativePublicationPreview,
+        UpstreamAllocator,
+    },
 };
 use crate::rtp::cache::TrackStreamCache;
 use crate::track::{
@@ -53,6 +57,37 @@ fn inline_rtc_timeout(deadline: Instant, wall_now: Instant) -> Option<Instant> {
         .checked_add(pulsebeam_runtime::SHARD_TIMER_QUANTUM)
         .unwrap_or(wall_now);
     (deadline <= latest).then_some(deadline.max(wall_now))
+}
+
+fn upstream_track_meta(
+    profile: ConnectionProfile,
+    room_id: entity::RoomId,
+    shard_id: ShardId,
+    participant_id: entity::ParticipantId,
+    kind: TrackKind,
+    mid: &Mid,
+) -> track::TrackMeta {
+    match profile {
+        ConnectionProfile::Whip => track::TrackMeta::labeled_media(
+            room_id,
+            shard_id,
+            participant_id,
+            kind,
+            match kind {
+                TrackKind::Audio => "audio",
+                TrackKind::Video => "video",
+                TrackKind::Data => unreachable!("RTP media cannot be data"),
+            }
+            .to_owned(),
+        ),
+        ConnectionProfile::Native | ConnectionProfile::Whep => track::TrackMeta {
+            room_id,
+            shard_id,
+            id: participant_id.derive_track_id(kind, mid),
+            origin: participant_id,
+            label: None,
+        },
+    }
 }
 
 pub struct TrackMapping {
@@ -97,6 +132,7 @@ pub struct ParticipantConfig {
     pub room_id: entity::RoomId,
     pub participant_id: entity::ParticipantId,
     pub connection_id: entity::ConnectionId,
+    pub profile: ConnectionProfile,
     pub rtc: Rtc,
     pub resources: NegotiatedResources,
 }
@@ -135,6 +171,7 @@ pub struct Participant {
     negotiated: NegotiatedResources,
     pub(crate) participant_id: entity::ParticipantId,
     pub(crate) connection_id: entity::ConnectionId,
+    profile: ConnectionProfile,
     last_keyframe_request: HashMap<(Mid, Option<str0m::media::Rid>), Instant>,
     pending_keyframe_requests: HashSet<(Mid, Option<str0m::media::Rid>)>,
 
@@ -199,6 +236,7 @@ impl Participant {
             stream_writer: StreamWriter::new(),
             participant_id: cfg.participant_id,
             connection_id: cfg.connection_id,
+            profile: cfg.profile,
             upstream: UpstreamAllocator::new(ctx),
             negotiated: cfg.resources,
             downstream: DownstreamAllocator::new(ctx, cfg.manual_sub),
@@ -226,6 +264,37 @@ impl Participant {
     )]
     pub(crate) fn track_for_sender_index(&self, sender_index: u32) -> Option<TrackId> {
         self.upstream.track_for_sender_index(sender_index)
+    }
+
+    #[allow(
+        dead_code,
+        reason = "the replacement signaling transaction invokes this seam in Plan 07"
+    )]
+    pub(crate) fn preview_native_publications(
+        &self,
+        publications: &[crate::participant::intent::NativePublication],
+    ) -> Result<NativePublicationPreview, NativePublicationError> {
+        if self.profile != ConnectionProfile::Native {
+            return Err(NativePublicationError::NotNative);
+        }
+        self.upstream.preview_native_publications(publications)
+    }
+
+    #[allow(
+        dead_code,
+        reason = "the replacement signaling transaction invokes this seam in Plan 07"
+    )]
+    pub(crate) fn commit_native_publications(
+        &mut self,
+        preview: NativePublicationPreview,
+        events: &mut impl ParticipantSink,
+    ) {
+        for event in self.upstream.commit_native_publications(preview) {
+            match event {
+                NativePublicationEvent::Publish(track) => events.publish_track(track),
+                NativePublicationEvent::Unpublish(track_id) => events.unpublish_track(track_id),
+            }
+        }
     }
 
     #[allow(
@@ -993,6 +1062,9 @@ impl Participant {
         active: bool,
         events: &mut impl ParticipantSink,
     ) {
+        if self.profile == ConnectionProfile::Native {
+            return;
+        }
         if active {
             let Some((descriptor, in_topology)) = self.upstream.announce_state_mut(mid) else {
                 return;
@@ -1021,7 +1093,7 @@ impl Participant {
         // Treat unpaused as an implicit publish signal from str0m.
         // We intentionally do not unpublish on paused=true here; explicit
         // client intent is authoritative for stop/unpublish transitions.
-        if !paused {
+        if self.profile == ConnectionProfile::Whip && !paused {
             self.handle_upstream_track_state(mid, true, events);
         }
     }
@@ -1041,14 +1113,14 @@ impl Participant {
                     MediaKind::Audio => TrackKind::Audio,
                     MediaKind::Video => TrackKind::Video,
                 };
-                let track_id = self.participant_id.derive_track_id(kind, &media.mid);
-                let track_meta = track::TrackMeta {
-                    room_id: self.room_id,
-                    shard_id: self.shard_id,
-                    id: track_id,
-                    origin: self.participant_id,
-                    label: None,
-                };
+                let track_meta = upstream_track_meta(
+                    self.profile,
+                    self.room_id,
+                    self.shard_id,
+                    self.participant_id,
+                    kind,
+                    &media.mid,
+                );
                 match media.kind {
                     MediaKind::Audio => {
                         let (tx, track) = track::new_audio(media.mid, track_meta);
@@ -1219,6 +1291,38 @@ mod rtc_clock_tests {
         }
 
         assert_eq!(rtc, wall);
+    }
+}
+
+#[cfg(test)]
+mod native_profile_tests {
+    use super::*;
+
+    #[test]
+    fn whip_synthesizes_only_exact_media_labels() {
+        let room_id = entity::RoomId::from_external(&entity::RoomExternalId::new("test").unwrap());
+        let participant_id = entity::ParticipantId::new();
+        for (kind, label) in [(TrackKind::Audio, "audio"), (TrackKind::Video, "video")] {
+            let meta = upstream_track_meta(
+                ConnectionProfile::Whip,
+                room_id,
+                ShardId::from(0),
+                participant_id,
+                kind,
+                &Mid::from("negotiated-mid"),
+            );
+            assert_eq!(meta.label.as_deref(), Some(label));
+            assert_eq!(meta.id, participant_id.derive_track_id(kind, label));
+        }
+        let native = upstream_track_meta(
+            ConnectionProfile::Native,
+            room_id,
+            ShardId::from(0),
+            participant_id,
+            TrackKind::Audio,
+            &Mid::from("negotiated-mid"),
+        );
+        assert_eq!(native.label, None);
     }
 }
 

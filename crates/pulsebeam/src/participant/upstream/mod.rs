@@ -3,6 +3,7 @@ mod data;
 mod video;
 
 use crate::keys::TrackHandle;
+use crate::participant::intent::NativePublication;
 use crate::{
     entity::{TrackId, TrackKind},
     log::{LogCtx, plog_warn},
@@ -109,6 +110,57 @@ pub(crate) struct UpstreamSlot {
     track: UpstreamTrack,
     descriptor: crate::track::Track,
     in_topology: bool,
+    #[allow(
+        dead_code,
+        reason = "the replacement signaling transaction consumes native sender bindings in Plan 07"
+    )]
+    native_binding: Option<NativeSenderBinding>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(
+    dead_code,
+    reason = "the replacement signaling transaction consumes native sender bindings in Plan 07"
+)]
+struct NativeSenderBinding {
+    kind: TrackKind,
+    label: String,
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[allow(
+    dead_code,
+    reason = "the replacement signaling transaction consumes native sender bindings in Plan 07"
+)]
+pub(crate) enum NativePublicationError {
+    #[error("publication replacement is only available to native connections")]
+    NotNative,
+    #[error("native sender {sender_index} cannot change its established identity")]
+    Relabel { sender_index: u32 },
+    #[error("native identity {kind:?}/{label} cannot move to sender {sender_index}")]
+    Move {
+        sender_index: u32,
+        kind: TrackKind,
+        label: String,
+    },
+}
+
+#[derive(Debug, PartialEq, Eq)]
+#[allow(
+    dead_code,
+    reason = "the replacement signaling transaction consumes native sender bindings in Plan 07"
+)]
+pub(crate) struct NativePublicationPreview {
+    publications: Vec<NativePublication>,
+}
+
+#[allow(
+    dead_code,
+    reason = "the replacement signaling transaction consumes native sender bindings in Plan 07"
+)]
+pub(crate) enum NativePublicationEvent {
+    Publish(crate::track::Track),
+    Unpublish(TrackId),
 }
 
 pub(crate) struct UpstreamMedia {
@@ -146,6 +198,7 @@ impl UpstreamMedia {
             track,
             descriptor,
             in_topology: false,
+            native_binding: None,
         });
         true
     }
@@ -325,6 +378,175 @@ impl Upstream {
     pub(crate) fn clear_routes(&mut self) {
         self.routes.clear();
     }
+
+    #[allow(
+        dead_code,
+        reason = "the replacement signaling transaction consumes native sender bindings in Plan 07"
+    )]
+    pub(crate) fn preview_native_publications(
+        &self,
+        publications: &[NativePublication],
+    ) -> Result<NativePublicationPreview, NativePublicationError> {
+        let mut accepted = Vec::new();
+        let mut sender_indices = std::collections::HashSet::new();
+        let mut identities = std::collections::HashSet::new();
+
+        for publication in publications {
+            let Some(sender_index) = publication.sender_index else {
+                continue;
+            };
+            let Some(kind @ (TrackKind::Audio | TrackKind::Video)) = publication.kind else {
+                continue;
+            };
+            if publication.label.is_empty() || publication.label.len() > 64 {
+                continue;
+            }
+            let Some(slot) = self.native_slot(sender_index) else {
+                continue;
+            };
+            if slot.track.meta.id.kind() != kind {
+                continue;
+            }
+            let identity = (kind, publication.label.as_str());
+            if !sender_indices.insert(sender_index) || !identities.insert(identity) {
+                continue;
+            }
+
+            if let Some(binding) = &slot.native_binding
+                && (binding.kind != kind || binding.label != publication.label)
+            {
+                return Err(NativePublicationError::Relabel { sender_index });
+            }
+            if self
+                .native_binding_for(kind, &publication.label)
+                .is_some_and(|index| index != sender_index)
+            {
+                return Err(NativePublicationError::Move {
+                    sender_index,
+                    kind,
+                    label: publication.label.clone(),
+                });
+            }
+            accepted.push(publication.clone());
+        }
+
+        Ok(NativePublicationPreview {
+            publications: accepted,
+        })
+    }
+
+    #[allow(
+        dead_code,
+        reason = "the replacement signaling transaction consumes native sender bindings in Plan 07"
+    )]
+    pub(crate) fn commit_native_publications(
+        &mut self,
+        preview: NativePublicationPreview,
+    ) -> Vec<NativePublicationEvent> {
+        let active: std::collections::HashSet<_> = preview
+            .publications
+            .iter()
+            .filter_map(|publication| publication.sender_index)
+            .collect();
+        let mut events = Vec::new();
+        let mut bound = false;
+
+        for slot in self
+            .audio
+            .media
+            .published_tracks
+            .iter_mut()
+            .chain(self.video.media.published_tracks.iter_mut())
+        {
+            if slot.in_topology && !active.contains(&slot.media_index) {
+                slot.in_topology = false;
+                events.push(NativePublicationEvent::Unpublish(slot.descriptor.id()));
+            }
+        }
+
+        for publication in preview.publications {
+            let sender_index = publication
+                .sender_index
+                .expect("previewed publication has sender");
+            let kind = publication
+                .kind
+                .expect("previewed publication has media kind");
+            let slot = self
+                .native_slot_mut(sender_index, kind)
+                .expect("previewed publication resolves to native slot");
+            if slot.native_binding.is_none() {
+                let meta = crate::track::TrackMeta::labeled_media(
+                    slot.track.meta.room_id,
+                    slot.track.meta.shard_id,
+                    slot.track.meta.origin,
+                    kind,
+                    publication.label.clone(),
+                );
+                slot.track.meta = meta.clone();
+                slot.descriptor.replace_meta(meta);
+                slot.native_binding = Some(NativeSenderBinding {
+                    kind,
+                    label: publication.label,
+                });
+                bound = true;
+            }
+            if !slot.in_topology {
+                slot.in_topology = true;
+                events.push(NativePublicationEvent::Publish(slot.descriptor.clone()));
+            }
+        }
+        if bound {
+            self.routes.clear();
+        }
+        events
+    }
+
+    #[allow(
+        dead_code,
+        reason = "the replacement signaling transaction consumes native sender bindings in Plan 07"
+    )]
+    fn native_slot(&self, sender_index: u32) -> Option<&UpstreamSlot> {
+        self.audio
+            .media
+            .published_tracks
+            .iter()
+            .chain(self.video.media.published_tracks.iter())
+            .find(|slot| slot.media_index == sender_index)
+    }
+
+    #[allow(
+        dead_code,
+        reason = "the replacement signaling transaction consumes native sender bindings in Plan 07"
+    )]
+    fn native_slot_mut(&mut self, sender_index: u32, kind: TrackKind) -> Option<&mut UpstreamSlot> {
+        let media = match kind {
+            TrackKind::Audio => &mut self.audio.media,
+            TrackKind::Video => &mut self.video.media,
+            TrackKind::Data => return None,
+        };
+        media
+            .published_tracks
+            .iter_mut()
+            .find(|slot| slot.media_index == sender_index)
+    }
+
+    #[allow(
+        dead_code,
+        reason = "the replacement signaling transaction consumes native sender bindings in Plan 07"
+    )]
+    fn native_binding_for(&self, kind: TrackKind, label: &str) -> Option<u32> {
+        self.audio
+            .media
+            .published_tracks
+            .iter()
+            .chain(self.video.media.published_tracks.iter())
+            .find(|slot| {
+                slot.native_binding
+                    .as_ref()
+                    .is_some_and(|binding| binding.kind == kind && binding.label == label)
+            })
+            .map(|slot| slot.media_index)
+    }
 }
 
 #[cfg(test)]
@@ -332,6 +554,44 @@ mod tests {
     use super::*;
     use crate::entity::{ParticipantId, RoomExternalId, RoomId, TrackKind};
     use crate::track::{self, TrackMeta};
+
+    fn upstream_with_slots() -> (Upstream, ParticipantId, RoomId) {
+        let participant_id = ParticipantId::new();
+        let room_id = RoomId::from_external(&RoomExternalId::new("test").unwrap());
+        let mut upstream = Upstream::new(LogCtx {
+            room_id,
+            participant_id,
+        });
+        for (index, kind) in [
+            (0, TrackKind::Audio),
+            (1, TrackKind::Video),
+            (2, TrackKind::Audio),
+        ] {
+            let mid = Mid::from(format!("{kind:?}-{index}").as_str());
+            let meta = TrackMeta {
+                room_id,
+                shard_id: crate::id::ShardId::from(0),
+                id: participant_id.derive_track_id(kind, &mid),
+                origin: participant_id,
+                label: None,
+            };
+            let (sender, descriptor) = match kind {
+                TrackKind::Audio => track::new_audio(mid, meta),
+                TrackKind::Video => track::new_video(mid, meta, Vec::new()),
+                TrackKind::Data => unreachable!(),
+            };
+            assert!(upstream.add_published_track(index, mid, sender, descriptor));
+        }
+        (upstream, participant_id, room_id)
+    }
+
+    fn publication(sender_index: u32, kind: TrackKind, label: &str) -> NativePublication {
+        NativePublication {
+            sender_index: Some(sender_index),
+            kind: Some(kind),
+            label: label.to_owned(),
+        }
+    }
 
     #[test]
     fn sender_coordinates_round_trip_at_32_slots() {
@@ -362,6 +622,204 @@ mod tests {
 
         let (media_index, track_id) = last.unwrap();
         assert_eq!(upstream.track_for_sender_index(media_index), Some(track_id));
+    }
+
+    #[test]
+    fn native_sender_bindings_first_commit_derives_labeled_track_id() {
+        let participant_id = ParticipantId::new();
+        let room_id = RoomId::from_external(&RoomExternalId::new("test").unwrap());
+        let mut upstream = Upstream::new(LogCtx {
+            room_id,
+            participant_id,
+        });
+        let mid = Mid::from("audio-0");
+        let initial_id = participant_id.derive_track_id(TrackKind::Audio, &mid);
+        let (sender, descriptor) = track::new_audio(
+            mid,
+            TrackMeta {
+                room_id,
+                shard_id: crate::id::ShardId::from(0),
+                id: initial_id,
+                origin: participant_id,
+                label: None,
+            },
+        );
+        assert!(upstream.add_published_track(0, mid, sender, descriptor));
+
+        let preview = upstream
+            .preview_native_publications(&[crate::participant::intent::NativePublication {
+                sender_index: Some(0),
+                kind: Some(TrackKind::Audio),
+                label: "microphone".to_owned(),
+            }])
+            .unwrap();
+        assert_eq!(upstream.track_for_sender_index(0), Some(initial_id));
+
+        let events = upstream.commit_native_publications(preview);
+        let track_id = participant_id.derive_track_id(TrackKind::Audio, "microphone");
+        assert_eq!(upstream.track_for_sender_index(0), Some(track_id));
+        assert!(
+            matches!(events.as_slice(), [NativePublicationEvent::Publish(track)] if track.id() == track_id && track.meta().label.as_deref() == Some("microphone"))
+        );
+    }
+
+    #[test]
+    fn native_sender_bindings_republish_after_omission_keeps_track_id() {
+        let (mut upstream, participant_id, _) = upstream_with_slots();
+        let first = upstream
+            .preview_native_publications(&[publication(0, TrackKind::Audio, "mic")])
+            .unwrap();
+        upstream.commit_native_publications(first);
+        let id = participant_id.derive_track_id(TrackKind::Audio, "mic");
+
+        assert!(
+            matches!(upstream.commit_native_publications(upstream.preview_native_publications(&[]).unwrap()).as_slice(), [NativePublicationEvent::Unpublish(track_id)] if *track_id == id)
+        );
+        assert!(
+            matches!(upstream.commit_native_publications(upstream.preview_native_publications(&[publication(0, TrackKind::Audio, "mic")]).unwrap()).as_slice(), [NativePublicationEvent::Publish(track)] if track.id() == id)
+        );
+        assert_eq!(upstream.track_for_sender_index(0), Some(id));
+    }
+
+    #[test]
+    fn native_sender_bindings_allow_same_label_across_kinds_and_64_bytes() {
+        let (mut upstream, participant_id, _) = upstream_with_slots();
+        let label = "x".repeat(64);
+        let preview = upstream
+            .preview_native_publications(&[
+                publication(0, TrackKind::Audio, &label),
+                publication(1, TrackKind::Video, &label),
+            ])
+            .unwrap();
+        assert_eq!(upstream.commit_native_publications(preview).len(), 2);
+        assert_eq!(
+            upstream.track_for_sender_index(0),
+            Some(participant_id.derive_track_id(TrackKind::Audio, &label))
+        );
+        assert_eq!(
+            upstream.track_for_sender_index(1),
+            Some(participant_id.derive_track_id(TrackKind::Video, &label))
+        );
+
+        let too_long = publication(0, TrackKind::Audio, &"x".repeat(65));
+        assert!(
+            upstream
+                .preview_native_publications(&[too_long])
+                .unwrap()
+                .publications
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn native_sender_bindings_skip_invalid_and_later_candidate_duplicates() {
+        let (upstream, _, _) = upstream_with_slots();
+        let preview = upstream
+            .preview_native_publications(&[
+                NativePublication {
+                    sender_index: None,
+                    kind: Some(TrackKind::Audio),
+                    label: "missing".to_owned(),
+                },
+                publication(0, TrackKind::Video, "wrong-kind"),
+                publication(0, TrackKind::Audio, "first"),
+                publication(0, TrackKind::Audio, "later-index"),
+                publication(1, TrackKind::Video, "first"),
+                publication(2, TrackKind::Audio, "first"),
+                NativePublication {
+                    sender_index: Some(1),
+                    kind: Some(TrackKind::Data),
+                    label: "data".to_owned(),
+                },
+            ])
+            .unwrap();
+        assert_eq!(
+            preview.publications,
+            vec![
+                publication(0, TrackKind::Audio, "first"),
+                publication(1, TrackKind::Video, "first"),
+            ]
+        );
+    }
+
+    #[test]
+    fn native_sender_bindings_relabel_and_move_are_atomic_after_unpublish() {
+        let (mut upstream, _, _) = upstream_with_slots();
+        let preview = upstream
+            .preview_native_publications(&[publication(0, TrackKind::Audio, "mic")])
+            .unwrap();
+        upstream.commit_native_publications(preview);
+        upstream.commit_native_publications(upstream.preview_native_publications(&[]).unwrap());
+        let bindings_before: Vec<_> = upstream
+            .audio
+            .media
+            .published_tracks
+            .iter()
+            .chain(upstream.video.media.published_tracks.iter())
+            .map(|slot| {
+                (
+                    slot.media_index,
+                    slot.native_binding.clone(),
+                    slot.in_topology,
+                )
+            })
+            .collect();
+        let routes_before = upstream.routes.routes.len();
+
+        assert_eq!(
+            upstream.preview_native_publications(&[publication(0, TrackKind::Audio, "other")]),
+            Err(NativePublicationError::Relabel { sender_index: 0 })
+        );
+        assert_eq!(
+            upstream.preview_native_publications(&[publication(2, TrackKind::Audio, "mic")]),
+            Err(NativePublicationError::Move {
+                sender_index: 2,
+                kind: TrackKind::Audio,
+                label: "mic".to_owned()
+            })
+        );
+        assert_eq!(
+            bindings_before,
+            upstream
+                .audio
+                .media
+                .published_tracks
+                .iter()
+                .chain(upstream.video.media.published_tracks.iter())
+                .map(|slot| (
+                    slot.media_index,
+                    slot.native_binding.clone(),
+                    slot.in_topology
+                ))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(routes_before, upstream.routes.routes.len());
+    }
+
+    #[test]
+    fn native_sender_bindings_clear_routes_and_are_idempotent() {
+        let (mut upstream, _, _) = upstream_with_slots();
+        upstream.cache_route(IncomingRtpRoute {
+            ssrc: Ssrc::from(7),
+            mid: Mid::from("Audio-0"),
+            rid: None,
+            upstream_slot: UpstreamSlotKey::Audio(0),
+            track_id: upstream.track_for_sender_index(0).unwrap(),
+            fanout: None,
+        });
+        let input = [publication(0, TrackKind::Audio, "mic")];
+        assert_eq!(
+            upstream
+                .commit_native_publications(upstream.preview_native_publications(&input).unwrap())
+                .len(),
+            1
+        );
+        assert!(upstream.routes.routes.is_empty());
+        assert!(
+            upstream
+                .commit_native_publications(upstream.preview_native_publications(&input).unwrap())
+                .is_empty()
+        );
     }
 }
 

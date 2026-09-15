@@ -119,6 +119,7 @@ impl ControllerCore {
             room_id: state.room_id,
             participant_id: state.participant_id,
             connection_id: state.connection_id,
+            profile: state.profile,
             rtc,
             resources,
         }

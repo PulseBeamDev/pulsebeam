@@ -5,7 +5,7 @@ use str0m::rtp::rtcp::SenderInfo;
 use tokio::time::Instant;
 
 pub(crate) struct UpstreamVideo {
-    media: UpstreamMedia,
+    pub(super) media: UpstreamMedia,
 }
 impl UpstreamVideo {
     pub(super) fn new(ctx: LogCtx) -> Self {

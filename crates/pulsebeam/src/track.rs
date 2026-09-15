@@ -743,6 +743,23 @@ impl Track {
         }
     }
 
+    #[allow(
+        dead_code,
+        reason = "the replacement signaling transaction updates native publication metadata in Plan 07"
+    )]
+    pub(crate) fn replace_meta(&mut self, meta: TrackMeta) {
+        match self {
+            Self::Audio(track) => track.meta = meta,
+            Self::Video(track) => {
+                track.meta = meta.clone();
+                for layer in &mut track.layers {
+                    layer.meta = meta.clone();
+                }
+            }
+            Self::Data(track) => track.meta = meta,
+        }
+    }
+
     pub fn id(&self) -> TrackId {
         self.meta().id
     }
