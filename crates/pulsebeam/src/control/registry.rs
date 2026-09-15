@@ -231,6 +231,21 @@ impl RoomRegistry {
         }
     }
 
+    /// Fences a lease while retaining the incarnation for its matching close.
+    pub fn invalidate_authorization(
+        &mut self,
+        participant_id: &ParticipantId,
+        connection_id: ConnectionId,
+        authorization: super::controller::AuthorizationLease,
+    ) -> Option<ParticipantMeta> {
+        let meta = self.participants.get_mut(participant_id)?;
+        if meta.connection_id != connection_id || meta.authorization != Some(authorization) {
+            return None;
+        }
+        meta.authorization = None;
+        Some(meta.clone())
+    }
+
     fn remove_from_room(
         &mut self,
         room_id: &RoomId,

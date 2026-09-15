@@ -1162,6 +1162,7 @@ struct V1OutputState {
     scheduler: V1OutputScheduler,
     authorization_responses: VecDeque<AuthorizationResponse>,
     pending_authorization: Option<Vec<u8>>,
+    authorization_expired: Option<Vec<u8>>,
 }
 
 enum AuthorizationResponse {
@@ -1530,6 +1531,7 @@ impl Signaling {
             scheduler: V1OutputScheduler::default(),
             authorization_responses: VecDeque::new(),
             pending_authorization: None,
+            authorization_expired: None,
         });
         signaling
     }
@@ -1557,6 +1559,35 @@ impl Signaling {
         output
             .authorization_responses
             .push_back(AuthorizationResponse::Rejected);
+        true
+    }
+
+    pub(crate) fn stage_authorization_expired(&mut self) -> bool {
+        if self.cid.is_none() {
+            return false;
+        }
+        let Some(output) = &mut self.v1_output else {
+            return false;
+        };
+        let message = media_signaling::ServerMessage {
+            payload: Some(media_signaling::server_message::Payload::Error(
+                media_signaling::Error {
+                    code: media_signaling::ErrorCode::AuthorizationExpired.into(),
+                    message: "authorization expired".to_owned(),
+                    fatal: true,
+                    intent_revision: None,
+                },
+            )),
+        };
+        let Some(bytes) = pulsebeam_proto::codec::encode_server(&message).ok() else {
+            return false;
+        };
+        output.scheduler = V1OutputScheduler::default();
+        output.authorization_responses.clear();
+        output.pending_authorization = None;
+        output.authorization_expired = Some(bytes);
+        self.dirty_roster = false;
+        self.dirty_bindings = false;
         true
     }
 
@@ -1754,7 +1785,8 @@ impl Signaling {
     pub(crate) fn needs_poll(&self) -> bool {
         if let Some(output) = &self.v1_output {
             return self.cid.is_some()
-                && (output.pending_authorization.is_some()
+                && (output.authorization_expired.is_some()
+                    || output.pending_authorization.is_some()
                     || !output.authorization_responses.is_empty()
                     || self.dirty_roster
                     || self.dirty_bindings);
@@ -1790,6 +1822,12 @@ impl Signaling {
         let cid = self.cid?;
 
         if let Some(output) = &mut self.v1_output {
+            if let Some(bytes) = &output.authorization_expired {
+                return Some(SignalingOutput {
+                    cid,
+                    bytes: bytes.clone(),
+                });
+            }
             if let Some(bytes) = &output.pending_authorization {
                 return Some(SignalingOutput {
                     cid,
@@ -1958,6 +1996,9 @@ impl Signaling {
 
     pub(crate) fn commit_sent(&mut self) {
         if let Some(output) = &mut self.v1_output {
+            if output.authorization_expired.take().is_some() {
+                return;
+            }
             if output.pending_authorization.take().is_some() {
                 return;
             }
@@ -2871,6 +2912,73 @@ mod authorization_tests {
     }
 
     #[test]
+    fn authorization_expiry_discards_pending_output_and_retries_one_fatal_error() {
+        let room = crate::entity::RoomId::from_external(
+            &crate::entity::RoomExternalId::new("expiry").unwrap(),
+        );
+        let ctx = LogCtx {
+            room_id: room,
+            participant_id: crate::entity::ParticipantId::new(),
+        };
+        let mut signaling = Signaling::new_v1(ctx, "self".to_owned());
+        let mut rtc = str0m::Rtc::new(std::time::Instant::now());
+        signaling.set_cid(rtc.direct_api().create_data_channel(Default::default()));
+        let snapshot = SignalingSnapshot {
+            publications: Vec::new(),
+            participants: HashMap::new(),
+            video: Vec::new(),
+            audio: Vec::new(),
+        };
+        signaling
+            .stage_v1_output(
+                &snapshot,
+                media_signaling::Mapping {
+                    intent_revision: 7,
+                    video: Some(media_signaling::TrackMappings { tracks: Vec::new() }),
+                    audio: Some(media_signaling::TrackMappings { tracks: Vec::new() }),
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            pulsebeam_proto::codec::decode_server(&signaling.poll(&snapshot).unwrap().bytes),
+            Ok(media_signaling::ServerMessage {
+                payload: Some(media_signaling::server_message::Payload::Catalog(_)),
+            })
+        ));
+
+        assert!(signaling.stage_authorization_expired());
+        let fatal = signaling.poll(&snapshot).expect("fatal output");
+        signaling.retry_pending();
+        assert_eq!(
+            signaling.poll(&snapshot).expect("fatal retry").bytes,
+            fatal.bytes
+        );
+        assert!(matches!(
+            pulsebeam_proto::codec::decode_server(&fatal.bytes),
+            Ok(media_signaling::ServerMessage {
+                payload: Some(media_signaling::server_message::Payload::Error(
+                    media_signaling::Error { code, fatal: true, intent_revision: None, .. }
+                )),
+            }) if code == media_signaling::ErrorCode::AuthorizationExpired as i32
+        ));
+        signaling.commit_sent();
+        assert!(signaling.poll(&snapshot).is_none());
+    }
+
+    #[test]
+    fn authorization_expiry_without_a_signaling_channel_cannot_be_staged() {
+        let room = crate::entity::RoomId::from_external(
+            &crate::entity::RoomExternalId::new("no-channel").unwrap(),
+        );
+        let ctx = LogCtx {
+            room_id: room,
+            participant_id: crate::entity::ParticipantId::new(),
+        };
+        let mut signaling = Signaling::new_v1(ctx, "self".to_owned());
+        assert!(!signaling.stage_authorization_expired());
+    }
+
+    #[test]
     fn authorization_response_capacity_refuses_unstaged_outcomes_until_a_commit() {
         let room = crate::entity::RoomId::from_external(
             &crate::entity::RoomExternalId::new("room").unwrap(),
@@ -3017,6 +3125,51 @@ mod authorization_tests {
         assert_eq!(
             fixture.participant.v1_test_pending_authorization_request(),
             None
+        );
+        assert_eq!(fixture.snapshot(), before);
+    }
+
+    #[test]
+    fn authorization_expiry_is_connection_fenced_and_terminal() {
+        let mut fixture = RenewalFixture::new();
+        let before = fixture.snapshot();
+        let wrong_connection =
+            ConnectionId::from_bytes([0, 0, 0, 0, 0, 0, 0x70, 0, 0x80, 0, 0, 0, 0, 0, 0, 3]);
+        fixture.participant.apply(
+            ParticipantEffect::AuthorizationExpired {
+                connection_id: wrong_connection,
+            },
+            None,
+        );
+        assert_eq!(fixture.snapshot(), before);
+
+        fixture.participant.apply(
+            ParticipantEffect::AuthorizationExpired {
+                connection_id: fixture.connection_id,
+            },
+            None,
+        );
+        let fatal = fixture
+            .participant
+            .take_v1_test_output()
+            .expect("fatal expiry output");
+        assert!(matches!(
+            pulsebeam_proto::codec::decode_server(&fatal),
+            Ok(media_signaling::ServerMessage {
+                payload: Some(media_signaling::server_message::Payload::Error(
+                    media_signaling::Error { code, fatal: true, intent_revision: None, .. }
+                )),
+            }) if code == media_signaling::ErrorCode::AuthorizationExpired as i32
+        ));
+        fixture.participant.apply(
+            ParticipantEffect::ParticipantsChanged {
+                added: vec![RoomParticipant {
+                    id: ParticipantId::new(),
+                    external_id: ParticipantExternalId::new("later").unwrap(),
+                }],
+                removed: Vec::new(),
+            },
+            None,
         );
         assert_eq!(fixture.snapshot(), before);
     }

@@ -73,6 +73,9 @@ pub enum ParticipantEffect {
         connection_id: ConnectionId,
         request_id: AuthorizationRequestId,
     },
+    AuthorizationExpired {
+        connection_id: ConnectionId,
+    },
 }
 
 impl ParticipantEffect {
@@ -85,7 +88,9 @@ impl ParticipantEffect {
             | Self::TrackUnsubscribed { track_id }
             | Self::TrackPublished { track_id }
             | Self::TrackUnpublished { track_id } => Some(*track_id),
-            Self::AuthorizationRenewed { .. } | Self::AuthorizationRejected { .. } => None,
+            Self::AuthorizationRenewed { .. }
+            | Self::AuthorizationRejected { .. }
+            | Self::AuthorizationExpired { .. } => None,
         }
     }
 }

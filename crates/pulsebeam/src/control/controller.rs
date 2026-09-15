@@ -1301,8 +1301,27 @@ impl ControllerActor {
             let Some(lease) = meta.authorization else {
                 continue;
             };
+            if lease.deadline() != work.deadline {
+                continue;
+            }
             if lease.is_expired_at(wall_now) {
-                self.remove_incarnation(work.participant_id, work.connection_id);
+                let Some(meta) = self.core.registry.invalidate_authorization(
+                    &work.participant_id,
+                    work.connection_id,
+                    lease,
+                ) else {
+                    continue;
+                };
+                let generation = self.lifecycle.next_generation();
+                self.stage_participant_at(
+                    meta.shard_id,
+                    generation,
+                    work.participant_id,
+                    crate::participant::ParticipantEffect::AuthorizationExpired {
+                        connection_id: work.connection_id,
+                    },
+                );
+                self.publish_staged();
             } else if let Ok(lease) = lease.refresh_at(wall_now, runtime_now) {
                 self.core.registry.update_authorization(
                     &work.participant_id,
@@ -1712,8 +1731,8 @@ mod authorization_tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn current_connection_closes_at_authorization_deadline_without_grace() {
-        let mut actor = actor();
+    async fn current_connection_is_fenced_at_authorization_deadline_without_grace() {
+        let (mut actor, mut update_rx) = actor_with_updates();
         let room_id = RoomId::from_external(&RoomExternalId::new("expiry").unwrap());
         let participant_id = ParticipantId::new();
         let runtime_now = tokio::time::Instant::now();
@@ -1739,12 +1758,81 @@ mod authorization_tests {
             UNIX_EPOCH + Duration::from_secs(10),
         );
 
+        let meta = actor
+            .core
+            .registry
+            .get_participant(&participant_id)
+            .expect("expiry leaves teardown to ParticipantClosed");
+        assert_eq!(meta.connection_id, connection_id(1));
+        assert!(meta.authorization.is_none());
+        assert!(actor.authorization_expiries.is_empty());
+        let update = update_rx.try_recv().expect("expiry effect is staged");
+        assert!(matches!(
+            update.participant_effects.as_slice(),
+            [(
+                participant,
+                crate::participant::ParticipantEffect::AuthorizationExpired { connection_id: expired },
+            )] if *participant == participant_id && *expired == connection_id(1)
+        ));
+        actor.handle_shard_event((
+            ShardId::new(0),
+            ShardEvent::ParticipantClosed {
+                participant: participant_id,
+                connection_id: connection_id(1),
+            },
+        ));
         assert!(
             actor
                 .core
                 .registry
                 .get_participant(&participant_id)
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn stale_expiry_work_after_renewal_cannot_fence_the_renewed_lease() {
+        let mut actor = actor();
+        let room_id = RoomId::from_external(&RoomExternalId::new("renewed-expiry").unwrap());
+        let participant_id = ParticipantId::new();
+        let runtime_now = tokio::time::Instant::now();
+        let old_lease = authorization_lease(10, UNIX_EPOCH, runtime_now);
+        let transport = actor.core.reserve_transport(ShardId::new(0), runtime_now);
+        actor
+            .commit_candidate(
+                participant_id,
+                participant_external_id(),
+                room_id,
+                ShardId::new(0),
+                transport,
+                connection_id(1),
+                Some(old_lease),
+                ConnectionProfile::Native,
+                UNIX_EPOCH,
+            )
+            .unwrap();
+        let stale_work = *actor.authorization_expiries.first().unwrap();
+        let renewed_lease = authorization_lease(20, UNIX_EPOCH, runtime_now);
+        actor.authorization_expiries.clear();
+        actor
+            .core
+            .registry
+            .update_authorization(&participant_id, connection_id(1), renewed_lease);
+        actor.authorization_expiries.insert(stale_work);
+
+        actor.expire_authorizations(
+            runtime_now + Duration::from_secs(10),
+            UNIX_EPOCH + Duration::from_secs(10),
+        );
+
+        assert_eq!(
+            actor
+                .core
+                .registry
+                .get_participant(&participant_id)
+                .unwrap()
+                .authorization,
+            Some(renewed_lease)
         );
         assert!(actor.authorization_expiries.is_empty());
     }

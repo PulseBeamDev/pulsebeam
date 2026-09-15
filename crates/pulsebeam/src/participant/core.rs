@@ -128,6 +128,8 @@ pub enum DisconnectReason {
     RoomClosed,
     #[error("System terminated")]
     SystemTerminated,
+    #[error("Authorization expired")]
+    AuthorizationExpired,
 }
 
 #[derive(Debug)]
@@ -182,6 +184,7 @@ pub struct Participant {
     initial_authorization_expiry: Option<i64>,
     next_authorization_request: u64,
     pending_authorization_request: Option<crate::participant::effect::AuthorizationRequestId>,
+    authorization_expired: bool,
     last_keyframe_request: HashMap<(Mid, Option<str0m::media::Rid>), Instant>,
     pending_keyframe_requests: HashSet<(Mid, Option<str0m::media::Rid>)>,
 
@@ -251,6 +254,7 @@ impl Participant {
             initial_authorization_expiry: cfg.initial_authorization_expiry,
             next_authorization_request: 1,
             pending_authorization_request: None,
+            authorization_expired: false,
             upstream: UpstreamAllocator::new(ctx),
             negotiated: cfg.resources,
             downstream: DownstreamAllocator::new(ctx, cfg.manual_sub),
@@ -408,6 +412,9 @@ impl Participant {
         bytes: &[u8],
         events: &mut impl ParticipantSink,
     ) -> Result<(), signaling::SignalingError> {
+        if self.authorization_expired {
+            return Ok(());
+        }
         let message = pulsebeam_proto::codec::decode_client(bytes)
             .map_err(|_| signaling::SignalingError::DecodeFailed)?;
         match message.payload {
@@ -716,6 +723,9 @@ impl Participant {
     }
 
     pub fn apply(&mut self, effect: ParticipantEffect, track_handle: Option<TrackHandle>) {
+        if self.authorization_expired {
+            return;
+        }
         match effect {
             ParticipantEffect::ParticipantsChanged { added, removed } => {
                 self.signaling.apply_participants(added, removed);
@@ -797,6 +807,16 @@ impl Participant {
                     }
                 }
             }
+            ParticipantEffect::AuthorizationExpired { connection_id } => {
+                if connection_id != self.connection_id {
+                    return;
+                }
+                self.authorization_expired = true;
+                self.pending_authorization_request = None;
+                if !self.signaling.stage_authorization_expired() {
+                    self.disconnect(DisconnectReason::AuthorizationExpired);
+                }
+            }
         }
     }
 
@@ -830,13 +850,17 @@ impl Participant {
                 self.pending_authorization_request = None;
             }
             ParticipantEffect::AuthorizationRenewed { .. }
-            | ParticipantEffect::AuthorizationRejected { .. } => {}
+            | ParticipantEffect::AuthorizationRejected { .. }
+            | ParticipantEffect::AuthorizationExpired { .. } => {}
             _ => return true,
         }
         true
     }
 
     pub(crate) fn input<'a>(&mut self, input: ParticipantInput<'a>) {
+        if self.authorization_expired {
+            return;
+        }
         match input {
             ParticipantInput::Network {
                 batch,
@@ -1261,6 +1285,9 @@ impl Participant {
                         .write_channel(output.cid, true, &output.bytes)
                     {
                         self.signaling.commit_sent();
+                        if self.authorization_expired && !self.signaling.needs_poll() {
+                            self.disconnect(DisconnectReason::AuthorizationExpired);
+                        }
                     } else {
                         self.signaling.retry_pending();
                     }
