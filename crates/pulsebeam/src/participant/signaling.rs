@@ -463,16 +463,37 @@ mod v1_intent_tests {
         let mut fixture = V1IntentFixture::new();
         fixture.receiver(7, "video", MediaKind::Video);
         let available = fixture.video("remote-video");
+        let _sender = fixture.sender(0, TrackKind::Audio, "send-audio");
+        let _new_sender = fixture.sender(1, TrackKind::Audio, "send-audio-2");
         let _ = fixture.apply(media_signaling::Intent {
             revision: 1,
-            send: None,
+            send: Some(media_signaling::SendIntent {
+                tracks: vec![media_signaling::LocalTrack {
+                    sender_index: 0,
+                    kind: media_signaling::TrackKind::Audio.into(),
+                    label: "microphone".into(),
+                }],
+            }),
             receive: receive(vec![video(available.clone())], vec![], 0),
         });
         let before = fixture.snapshot();
 
         let result = fixture.apply(media_signaling::Intent {
             revision: 2,
-            send: None,
+            send: Some(media_signaling::SendIntent {
+                tracks: vec![
+                    media_signaling::LocalTrack {
+                        sender_index: 0,
+                        kind: media_signaling::TrackKind::Audio.into(),
+                        label: "microphone".into(),
+                    },
+                    media_signaling::LocalTrack {
+                        sender_index: 1,
+                        kind: media_signaling::TrackKind::Audio.into(),
+                        label: "auxiliary".into(),
+                    },
+                ],
+            }),
             receive: receive(
                 vec![video(available), video("unavailable".into())],
                 vec![],
@@ -489,13 +510,66 @@ mod v1_intent_tests {
     fn unavailable_and_wrong_kind_requests_are_retained_but_unassigned() {
         let mut fixture = V1IntentFixture::new();
         fixture.receiver(7, "video", MediaKind::Video);
+        fixture.receiver(9, "video-2", MediaKind::Video);
         fixture.receiver(8, "audio", MediaKind::Audio);
         let audio_id = fixture.audio("remote-audio");
+        let video_id = fixture.video("remote-video");
         let wrong_kind = audio_id.clone();
+        let audio_wrong_kind = video_id.clone();
         let result = fixture.apply(media_signaling::Intent {
             revision: 1,
             send: None,
-            receive: receive(vec![video(audio_id)], vec![audio("unavailable".into())], 0),
+            receive: receive(
+                vec![
+                    media_signaling::VideoTrackIntent {
+                        track_id: audio_id,
+                        options: Some(media_signaling::VideoOptions {
+                            height: 720,
+                            min_height: 360,
+                            min_fps: 30,
+                            priority: 9,
+                            playout_delay: Some(media_signaling::PlayoutDelay {
+                                min_ms: 10,
+                                max_ms: 20,
+                            }),
+                        }),
+                    },
+                    media_signaling::VideoTrackIntent {
+                        track_id: "unavailable-video".into(),
+                        options: Some(media_signaling::VideoOptions {
+                            height: 180,
+                            min_height: 90,
+                            min_fps: 15,
+                            priority: 1,
+                            playout_delay: Some(media_signaling::PlayoutDelay {
+                                min_ms: 30,
+                                max_ms: 40,
+                            }),
+                        }),
+                    },
+                ],
+                vec![
+                    media_signaling::AudioTrackIntent {
+                        track_id: video_id,
+                        options: Some(media_signaling::AudioOptions {
+                            playout_delay: Some(media_signaling::PlayoutDelay {
+                                min_ms: 50,
+                                max_ms: 60,
+                            }),
+                        }),
+                    },
+                    media_signaling::AudioTrackIntent {
+                        track_id: "unavailable-audio".into(),
+                        options: Some(media_signaling::AudioOptions {
+                            playout_delay: Some(media_signaling::PlayoutDelay {
+                                min_ms: 70,
+                                max_ms: 80,
+                            }),
+                        }),
+                    },
+                ],
+                0,
+            ),
         });
         let V1IntentResult::Mapping(mapping) = result else {
             panic!("expected mapping")
@@ -503,8 +577,55 @@ mod v1_intent_tests {
         assert!(mapping.video.is_some_and(|video| video.tracks.is_empty()));
         assert!(mapping.audio.is_some_and(|audio| audio.tracks.is_empty()));
         let intent = fixture.participant.v1_test_intent().unwrap();
-        assert_eq!(intent.video[0].track_id, wrong_kind);
-        assert_eq!(intent.audio[0].track_id, "unavailable");
+        assert_eq!(
+            intent
+                .video
+                .iter()
+                .map(|request| (
+                    request.track_id.as_str(),
+                    request.target_height,
+                    request.min_height,
+                    request.min_fps,
+                    request.priority,
+                    request.playout,
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    wrong_kind.as_str(),
+                    720,
+                    360,
+                    30,
+                    9,
+                    crate::participant::downstream::PlayoutPolicy::fixed((10, 20)),
+                ),
+                (
+                    "unavailable-video",
+                    180,
+                    90,
+                    15,
+                    1,
+                    crate::participant::downstream::PlayoutPolicy::fixed((30, 40)),
+                ),
+            ]
+        );
+        assert_eq!(
+            intent
+                .audio
+                .iter()
+                .map(|request| (request.track_id.as_str(), request.playout))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    audio_wrong_kind.as_str(),
+                    crate::participant::downstream::PlayoutPolicy::fixed((50, 60)),
+                ),
+                (
+                    "unavailable-audio",
+                    crate::participant::downstream::PlayoutPolicy::fixed((70, 80)),
+                ),
+            ]
+        );
     }
 
     #[test]
@@ -628,6 +749,7 @@ mod v1_intent_tests {
                 },
             ]
         );
+        assert!(mapping.video.is_some_and(|video| video.tracks.is_empty()));
     }
 
     #[test]
