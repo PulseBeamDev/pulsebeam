@@ -1818,7 +1818,51 @@ mod authorization_tests {
         let mut sink = crate::participant::event::test_utils::MockParticipantSink::new();
         participant.handle_v1_input(&wire, &mut sink).unwrap();
         participant.handle_v1_input(&wire, &mut sink).unwrap();
+        let empty =
+            pulsebeam_proto::codec::encode_client(&pulsebeam_proto::signaling_v1::ClientMessage {
+                payload: Some(
+                    pulsebeam_proto::signaling_v1::client_message::Payload::RenewAuthorization(
+                        pulsebeam_proto::signaling_v1::RenewAuthorization {
+                            token: String::new(),
+                        },
+                    ),
+                ),
+            })
+            .unwrap();
+        let oversized =
+            pulsebeam_proto::codec::encode_client(&pulsebeam_proto::signaling_v1::ClientMessage {
+                payload: Some(
+                    pulsebeam_proto::signaling_v1::client_message::Payload::RenewAuthorization(
+                        pulsebeam_proto::signaling_v1::RenewAuthorization {
+                            token: "x".repeat(16_385),
+                        },
+                    ),
+                ),
+            })
+            .unwrap();
+        participant.handle_v1_input(&empty, &mut sink).unwrap();
+        participant.handle_v1_input(&oversized, &mut sink).unwrap();
         assert_eq!(sink.renewal_requests, 1);
+        let snapshot = participant.downstream.signaling_snapshot();
+        let responses: Vec<_> = (0..3)
+            .map(|_| {
+                let response = participant
+                    .signaling
+                    .poll(&snapshot)
+                    .expect("rejection output")
+                    .bytes;
+                participant.signaling.commit_sent();
+                response
+            })
+            .collect();
+        assert!(responses.iter().all(|bytes| matches!(
+            pulsebeam_proto::codec::decode_server(bytes),
+            Ok(pulsebeam_proto::signaling_v1::ServerMessage {
+                payload: Some(pulsebeam_proto::signaling_v1::server_message::Payload::Error(
+                    pulsebeam_proto::signaling_v1::Error { code, fatal: false, .. }
+                ))
+            }) if code == pulsebeam_proto::signaling_v1::ErrorCode::AuthorizationRejected as i32
+        )));
     }
 }
 

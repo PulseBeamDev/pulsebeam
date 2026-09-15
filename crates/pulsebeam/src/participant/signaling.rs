@@ -6,7 +6,7 @@ use crate::participant::intent::{AudioIntent, VideoIntent as Intent};
 use pulsebeam_proto::prelude::*;
 use pulsebeam_proto::signaling;
 use pulsebeam_proto::signaling_v1 as media_signaling;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use str0m::channel::ChannelId;
 use str0m::media::Mid;
 
@@ -1158,10 +1158,16 @@ struct V1OutputState {
     recipient_external_id: String,
     history: V1CatalogHistory,
     scheduler: V1OutputScheduler,
-    authorization_to_send: Option<i64>,
-    authorization_rejected: bool,
+    authorization_responses: VecDeque<AuthorizationResponse>,
     pending_authorization: Option<Vec<u8>>,
 }
+
+enum AuthorizationResponse {
+    Accepted(i64),
+    Rejected,
+}
+
+const MAX_PENDING_AUTHORIZATION_RESPONSES: usize = 64;
 
 #[allow(
     dead_code,
@@ -1520,8 +1526,7 @@ impl Signaling {
             recipient_external_id,
             history: V1CatalogHistory::default(),
             scheduler: V1OutputScheduler::default(),
-            authorization_to_send: None,
-            authorization_rejected: false,
+            authorization_responses: VecDeque::new(),
             pending_authorization: None,
         });
         signaling
@@ -1531,14 +1536,22 @@ impl Signaling {
         let Some(output) = &mut self.v1_output else {
             return;
         };
-        output.authorization_to_send = Some(expires_at_unix_seconds);
+        if output.authorization_responses.len() < MAX_PENDING_AUTHORIZATION_RESPONSES {
+            output
+                .authorization_responses
+                .push_back(AuthorizationResponse::Accepted(expires_at_unix_seconds));
+        }
     }
 
     pub(crate) fn stage_authorization_rejected(&mut self) {
         let Some(output) = &mut self.v1_output else {
             return;
         };
-        output.authorization_rejected = true;
+        if output.authorization_responses.len() < MAX_PENDING_AUTHORIZATION_RESPONSES {
+            output
+                .authorization_responses
+                .push_back(AuthorizationResponse::Rejected);
+        }
     }
 
     pub(crate) fn stage_v1_output(
@@ -1736,8 +1749,7 @@ impl Signaling {
         if let Some(output) = &self.v1_output {
             return self.cid.is_some()
                 && (output.pending_authorization.is_some()
-                    || output.authorization_to_send.is_some()
-                    || output.authorization_rejected
+                    || !output.authorization_responses.is_empty()
                     || self.dirty_roster
                     || self.dirty_bindings);
         }
@@ -1785,28 +1797,26 @@ impl Signaling {
                     .expect("pending scheduler bytes exist");
                 return Some(SignalingOutput { cid, bytes });
             }
-            if let Some(expires_at_unix_seconds) = output.authorization_to_send.take() {
-                let message = media_signaling::ServerMessage {
-                    payload: Some(media_signaling::server_message::Payload::Authorization(
-                        media_signaling::Authorization {
-                            expires_at_unix_seconds,
-                        },
-                    )),
-                };
-                let bytes = pulsebeam_proto::codec::encode_server(&message).ok()?;
-                output.pending_authorization = Some(bytes.clone());
-                return Some(SignalingOutput { cid, bytes });
-            }
-            if std::mem::take(&mut output.authorization_rejected) {
-                let message = media_signaling::ServerMessage {
-                    payload: Some(media_signaling::server_message::Payload::Error(
-                        media_signaling::Error {
+            if let Some(response) = output.authorization_responses.pop_front() {
+                let payload = match response {
+                    AuthorizationResponse::Accepted(expires_at_unix_seconds) => {
+                        media_signaling::server_message::Payload::Authorization(
+                            media_signaling::Authorization {
+                                expires_at_unix_seconds,
+                            },
+                        )
+                    }
+                    AuthorizationResponse::Rejected => {
+                        media_signaling::server_message::Payload::Error(media_signaling::Error {
                             code: media_signaling::ErrorCode::AuthorizationRejected.into(),
                             message: "authorization renewal rejected".to_owned(),
                             fatal: false,
                             intent_revision: None,
-                        },
-                    )),
+                        })
+                    }
+                };
+                let message = media_signaling::ServerMessage {
+                    payload: Some(payload),
                 };
                 let bytes = pulsebeam_proto::codec::encode_server(&message).ok()?;
                 output.pending_authorization = Some(bytes.clone());
@@ -2594,6 +2604,61 @@ mod authorization_tests {
             pulsebeam_proto::codec::decode_server(&signaling.poll(&snapshot).expect("rejection follows catalog").bytes),
             Ok(media_signaling::ServerMessage { payload: Some(media_signaling::server_message::Payload::Error(media_signaling::Error { code, fatal: false, .. })) })
                 if code == media_signaling::ErrorCode::AuthorizationRejected as i32
+        ));
+    }
+
+    #[test]
+    fn queued_renewal_responses_keep_order_and_retry_exact_bytes() {
+        let room = crate::entity::RoomId::from_external(
+            &crate::entity::RoomExternalId::new("room").unwrap(),
+        );
+        let ctx = LogCtx {
+            room_id: room,
+            participant_id: crate::entity::ParticipantId::new(),
+        };
+        let mut signaling = Signaling::new_v1(ctx, "self".to_owned());
+        let mut rtc = str0m::Rtc::new(std::time::Instant::now());
+        signaling.set_cid(rtc.direct_api().create_data_channel(Default::default()));
+        let snapshot = SignalingSnapshot {
+            publications: Vec::new(),
+            participants: HashMap::new(),
+            video: Vec::new(),
+            audio: Vec::new(),
+        };
+        signaling.stage_authorization(101);
+        signaling.stage_authorization_rejected();
+        signaling.stage_authorization(303);
+
+        let first = signaling.poll(&snapshot).expect("first response");
+        assert!(matches!(
+            pulsebeam_proto::codec::decode_server(&first.bytes),
+            Ok(media_signaling::ServerMessage {
+                payload: Some(media_signaling::server_message::Payload::Authorization(
+                    media_signaling::Authorization {
+                        expires_at_unix_seconds: 101
+                    }
+                ))
+            })
+        ));
+        assert_eq!(signaling.poll(&snapshot).expect("retry").bytes, first.bytes);
+        signaling.commit_sent();
+        assert!(
+            matches!(pulsebeam_proto::codec::decode_server(&signaling.poll(&snapshot).expect("second response").bytes), Ok(media_signaling::ServerMessage {
+            payload: Some(media_signaling::server_message::Payload::Error(media_signaling::Error { code, fatal: false, .. }))
+        }) if code == media_signaling::ErrorCode::AuthorizationRejected as i32)
+        );
+        signaling.commit_sent();
+        assert!(matches!(
+            pulsebeam_proto::codec::decode_server(
+                &signaling.poll(&snapshot).expect("third response").bytes
+            ),
+            Ok(media_signaling::ServerMessage {
+                payload: Some(media_signaling::server_message::Payload::Authorization(
+                    media_signaling::Authorization {
+                        expires_at_unix_seconds: 303
+                    }
+                ))
+            })
         ));
     }
 }

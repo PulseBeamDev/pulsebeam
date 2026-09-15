@@ -1461,6 +1461,50 @@ mod authorization_tests {
             now + 120,
         );
         assert_eq!(actor.authorization_expiries.len(), 1);
+
+        let renewed_deadline = actor
+            .core
+            .registry
+            .get_participant(&participant_id)
+            .unwrap()
+            .authorization
+            .unwrap()
+            .deadline();
+        let cases = [
+            "bad-signature".to_owned(),
+            mint_development_token(&room_external_id, &participant_external_id, now + 120).unwrap(),
+            mint_development_token(&room_external_id, &participant_external_id, u64::MAX).unwrap(),
+            mint_development_token(
+                &RoomExternalId::new("different-room").unwrap(),
+                &participant_external_id,
+                now + 240,
+            )
+            .unwrap(),
+            mint_development_token(
+                &room_external_id,
+                &ParticipantExternalId::new("different-participant").unwrap(),
+                now + 240,
+            )
+            .unwrap(),
+        ];
+        for (request, token) in cases.into_iter().enumerate() {
+            actor.renew_authorization(
+                participant_id,
+                connection_id(1),
+                crate::participant::effect::AuthorizationRequestId::new(request as u64 + 2),
+                crate::participant::effect::RenewalToken::new(token).unwrap(),
+            );
+            let lease = actor
+                .core
+                .registry
+                .get_participant(&participant_id)
+                .unwrap()
+                .authorization
+                .unwrap();
+            assert_eq!(lease.expires_at_unix_seconds(), now + 120);
+            assert_eq!(lease.deadline(), renewed_deadline);
+            assert_eq!(actor.authorization_expiries.len(), 1);
+        }
     }
 
     #[test]
