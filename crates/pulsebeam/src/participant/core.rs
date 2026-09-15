@@ -1468,6 +1468,12 @@ impl Participant {
                 }
             }
             Event::ChannelClose(cid) => {
+                if self.signaling.clear_cid(cid) {
+                    if self.authorization_expired {
+                        self.disconnect(DisconnectReason::AuthorizationExpired);
+                    }
+                    return;
+                }
                 let Some(channel) = self.data.close(cid) else {
                     return;
                 };
@@ -1990,6 +1996,80 @@ mod authorization_tests {
                 )
             })
         ));
+    }
+
+    #[test]
+    fn expiry_after_signaling_channel_close_disconnects_through_participant_poll() {
+        let room_external_id = RoomExternalId::new("expired-channel").unwrap();
+        let participant_id = entity::ParticipantId::new();
+        let connection_id = entity::ConnectionId::new();
+        let mut rtc = Rtc::new(std::time::Instant::now());
+        let cid = rtc.direct_api().create_data_channel(Default::default());
+        let mut participant = Participant::new(
+            ParticipantConfig {
+                manual_sub: true,
+                room_id: entity::RoomId::from_external(&room_external_id),
+                participant_id,
+                participant_external_id: ParticipantExternalId::new("alice").unwrap(),
+                connection_id,
+                profile: ConnectionProfile::Native,
+                initial_authorization_expiry: None,
+                rtc,
+                resources: NegotiatedResources::empty_for_test(),
+            },
+            ShardId::new(0),
+            1_200,
+            1_200,
+        );
+        participant.enable_v1_test_output("alice".to_owned(), cid);
+        let mut sink = crate::participant::event::test_utils::MockParticipantSink::new();
+        participant.handle_event(Instant::now(), Event::ChannelClose(cid), &mut sink);
+        participant.apply(
+            ParticipantEffect::AuthorizationExpired { connection_id },
+            None,
+        );
+
+        assert!(matches!(
+            participant.disconnect_reason,
+            Some(DisconnectReason::AuthorizationExpired)
+        ));
+        let _ = participant.poll(Instant::now(), &mut sink);
+        assert_eq!(sink.exit_count, 1);
+    }
+
+    #[test]
+    fn expiry_retries_when_an_opened_signaling_channel_is_backpressured() {
+        let room_external_id = RoomExternalId::new("expiry-send").unwrap();
+        let participant_id = entity::ParticipantId::new();
+        let connection_id = entity::ConnectionId::new();
+        let mut rtc = Rtc::new(std::time::Instant::now());
+        let cid = rtc.direct_api().create_data_channel(Default::default());
+        let mut participant = Participant::new(
+            ParticipantConfig {
+                manual_sub: true,
+                room_id: entity::RoomId::from_external(&room_external_id),
+                participant_id,
+                participant_external_id: ParticipantExternalId::new("alice").unwrap(),
+                connection_id,
+                profile: ConnectionProfile::Native,
+                initial_authorization_expiry: None,
+                rtc,
+                resources: NegotiatedResources::empty_for_test(),
+            },
+            ShardId::new(0),
+            1_200,
+            1_200,
+        );
+        participant.enable_v1_test_output("alice".to_owned(), cid);
+        participant.apply(
+            ParticipantEffect::AuthorizationExpired { connection_id },
+            None,
+        );
+
+        let mut sink = crate::participant::event::test_utils::MockParticipantSink::new();
+        let _ = participant.poll(Instant::now(), &mut sink);
+        assert_eq!(sink.exit_count, 0);
+        assert!(participant.signaling.needs_poll());
     }
 }
 

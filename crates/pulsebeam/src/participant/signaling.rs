@@ -1627,6 +1627,14 @@ impl Signaling {
         self.full_state_retries = 2;
     }
 
+    pub fn clear_cid(&mut self, cid: ChannelId) -> bool {
+        if self.cid != Some(cid) {
+            return false;
+        }
+        self.cid = None;
+        true
+    }
+
     pub fn set_slot_count(&mut self, slot_count: usize) {
         self.slot_count = slot_count;
     }
