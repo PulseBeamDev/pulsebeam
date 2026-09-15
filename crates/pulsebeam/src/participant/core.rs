@@ -135,10 +135,10 @@ pub struct ParticipantConfig {
     pub manual_sub: bool,
     pub room_id: entity::RoomId,
     pub participant_id: entity::ParticipantId,
-    pub participant_external_id: entity::ParticipantExternalId,
+    pub(crate) participant_external_id: entity::ParticipantExternalId,
     pub connection_id: entity::ConnectionId,
     pub profile: ConnectionProfile,
-    pub initial_authorization_expiry: Option<i64>,
+    pub(crate) initial_authorization_expiry: Option<i64>,
     pub rtc: Rtc,
     pub resources: NegotiatedResources,
 }
