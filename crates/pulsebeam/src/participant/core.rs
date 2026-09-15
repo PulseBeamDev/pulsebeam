@@ -79,7 +79,7 @@ pub enum DisconnectReason {
     InvalidDataTrackIntent(#[from] DataTrackIntentError),
     #[error("Duplicate data channel label for same direction: {0}")]
     DuplicateDataChannelLabel(DataTopicChannel),
-    #[error("Exceeded maximum upstream tracks: only 2 video and 2 audio allowed")]
+    #[error("Exceeded maximum upstream tracks: only 32 video and 32 audio allowed")]
     TooManyUpstreamTracks,
     #[error(
         "Exceeded maximum data topic channels: only 64 channels (across all topics/scopes) allowed"

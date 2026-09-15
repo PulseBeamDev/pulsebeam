@@ -11,11 +11,7 @@ use str0m::{
 };
 use tokio::time::Instant;
 
-pub const MAX_RECV_VIDEO_SLOTS: usize = 2;
-pub const MAX_RECV_AUDIO_SLOTS: usize = 2;
-// https://github.com/PulseBeamDev/pulsebeam/issues/133
-pub const MAX_SEND_VIDEO_SLOTS: usize = 7;
-pub const MAX_SEND_AUDIO_SLOTS: usize = 3;
+pub const MAX_RTP_SLOTS_PER_TYPE: usize = 32;
 pub const MAX_DATA_CHANNELS: usize = 1;
 
 #[derive(Debug)]
@@ -231,41 +227,41 @@ impl Negotiator {
             match (media_type, dir) {
                 (MediaType::Video, Direction::RecvOnly) => {
                     video_recv_count = video_recv_count.saturating_add(1);
-                    if video_recv_count > MAX_RECV_VIDEO_SLOTS {
+                    if video_recv_count > MAX_RTP_SLOTS_PER_TYPE {
                         return Err(NegotiatorError::SlotsLimit(
                             MediaType::Video,
                             Direction::SendOnly,
-                            MAX_RECV_VIDEO_SLOTS,
+                            MAX_RTP_SLOTS_PER_TYPE,
                         ));
                     }
                 }
                 (MediaType::Video, Direction::SendOnly) => {
                     video_send_count = video_send_count.saturating_add(1);
-                    if video_send_count > MAX_SEND_VIDEO_SLOTS {
+                    if video_send_count > MAX_RTP_SLOTS_PER_TYPE {
                         return Err(NegotiatorError::SlotsLimit(
                             MediaType::Video,
                             Direction::RecvOnly,
-                            MAX_SEND_VIDEO_SLOTS,
+                            MAX_RTP_SLOTS_PER_TYPE,
                         ));
                     }
                 }
                 (MediaType::Audio, Direction::RecvOnly) => {
                     audio_recv_count = audio_recv_count.saturating_add(1);
-                    if audio_recv_count > MAX_RECV_AUDIO_SLOTS {
+                    if audio_recv_count > MAX_RTP_SLOTS_PER_TYPE {
                         return Err(NegotiatorError::SlotsLimit(
                             MediaType::Audio,
                             Direction::SendOnly,
-                            MAX_RECV_AUDIO_SLOTS,
+                            MAX_RTP_SLOTS_PER_TYPE,
                         ));
                     }
                 }
                 (MediaType::Audio, Direction::SendOnly) => {
                     audio_send_count = audio_send_count.saturating_add(1);
-                    if audio_send_count > MAX_SEND_AUDIO_SLOTS {
+                    if audio_send_count > MAX_RTP_SLOTS_PER_TYPE {
                         return Err(NegotiatorError::SlotsLimit(
                             MediaType::Audio,
                             Direction::RecvOnly,
-                            MAX_SEND_AUDIO_SLOTS,
+                            MAX_RTP_SLOTS_PER_TYPE,
                         ));
                     }
                 }
@@ -383,6 +379,78 @@ mod tests {
                 (0, MediaKind::Audio, Direction::RecvOnly),
                 (2, MediaKind::Video, Direction::SendOnly),
             ]
+        );
+    }
+
+    #[test]
+    fn admits_32_and_rejects_33_rtp_sections_per_kind_and_direction() {
+        for (kind, server_direction) in [
+            (MediaKind::Audio, Direction::RecvOnly),
+            (MediaKind::Audio, Direction::SendOnly),
+            (MediaKind::Video, Direction::RecvOnly),
+            (MediaKind::Video, Direction::SendOnly),
+        ] {
+            let offer_direction = match server_direction {
+                Direction::RecvOnly => Direction::SendOnly,
+                Direction::SendOnly => Direction::RecvOnly,
+                _ => unreachable!(),
+            };
+
+            for (sections, accepted) in [(32, true), (33, false)] {
+                let mut rtc = RtcConfig::new().build(std::time::Instant::now());
+                let mut change = rtc.sdp_api();
+                for _ in 0..sections {
+                    change.add_media(kind, offer_direction, None, None, None);
+                }
+                let offer = change.apply().unwrap().0;
+                let mut negotiator = Negotiator::new(Vec::new());
+                let result = negotiator.create_answer(offer, IceCreds::new());
+
+                assert_eq!(
+                    result.is_ok(),
+                    accepted,
+                    "{kind:?} {server_direction:?} {sections}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn resources_keep_global_positions_with_nonnumeric_mids_and_disabled_sections() {
+        let mut rtc = RtcConfig::new().build(std::time::Instant::now());
+        let mut change = rtc.sdp_api();
+        change.add_media(MediaKind::Audio, Direction::SendOnly, None, None, None);
+        change.add_channel("signal".to_owned());
+        change.add_media(MediaKind::Video, Direction::SendOnly, None, None, None);
+        change.add_media(MediaKind::Video, Direction::RecvOnly, None, None, None);
+        let offer = change
+            .apply()
+            .unwrap()
+            .0
+            .to_sdp_string()
+            .replacen("m=video 9", "m=video 0", 1);
+        let offer = SdpOffer::from_sdp_string(&offer).unwrap();
+        let mut negotiator = Negotiator::new(Vec::new());
+        let (_, _, resources) = negotiator.create_answer(offer, IceCreds::new()).unwrap();
+
+        assert_eq!(
+            resources
+                .as_slice()
+                .iter()
+                .map(|resource| (resource.media_index, resource.kind, resource.direction))
+                .collect::<Vec<_>>(),
+            vec![
+                (0, MediaKind::Audio, Direction::RecvOnly),
+                (2, MediaKind::Video, Direction::RecvOnly),
+                (3, MediaKind::Video, Direction::SendOnly),
+            ]
+        );
+        assert!(
+            resources.as_slice().iter().all(|resource| resource
+                .mid
+                .to_string()
+                .parse::<u32>()
+                .is_err())
         );
     }
 

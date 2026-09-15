@@ -18,7 +18,7 @@ use str0m::rtp::rtcp::SenderInfo;
 use tokio::time::Instant;
 pub(crate) use video::UpstreamVideo;
 
-pub(crate) const MAX_UPSTREAM_SLOT_PER_TYPE: usize = 2;
+pub(crate) const MAX_UPSTREAM_SLOT_PER_TYPE: usize = crate::control::MAX_RTP_SLOTS_PER_TYPE;
 pub(crate) const MAX_UPSTREAM_ENCODED_STREAMS: usize =
     MAX_UPSTREAM_SLOT_PER_TYPE * (1 + crate::track::MAX_SIMULCAST_LAYERS);
 
@@ -324,6 +324,44 @@ impl Upstream {
     }
     pub(crate) fn clear_routes(&mut self) {
         self.routes.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::entity::{ParticipantId, RoomExternalId, RoomId, TrackKind};
+    use crate::track::{self, TrackMeta};
+
+    #[test]
+    fn sender_coordinates_round_trip_at_32_slots() {
+        let participant_id = ParticipantId::new();
+        let room_id = RoomId::from_external(&RoomExternalId::new("test").unwrap());
+        let mut upstream = Upstream::new(LogCtx {
+            room_id,
+            participant_id,
+        });
+
+        let mut last = None;
+        for media_index in 100..132 {
+            let mid = Mid::from(format!("audio-{media_index}").as_str());
+            let track_id = participant_id.derive_track_id(TrackKind::Audio, &mid);
+            let (sender, descriptor) = track::new_audio(
+                mid,
+                TrackMeta {
+                    room_id,
+                    shard_id: crate::id::ShardId::from(0),
+                    id: track_id,
+                    origin: participant_id,
+                    label: None,
+                },
+            );
+            assert!(upstream.add_published_track(media_index, mid, sender, descriptor));
+            last = Some((media_index, track_id));
+        }
+
+        let (media_index, track_id) = last.unwrap();
+        assert_eq!(upstream.track_for_sender_index(media_index), Some(track_id));
     }
 }
 

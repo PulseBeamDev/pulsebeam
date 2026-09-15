@@ -6,7 +6,7 @@ use str0m::media::{Mid, Pt};
 use str0m::rtp::{SeqNo, Ssrc};
 use tokio::time::Instant;
 
-use crate::control::MAX_SEND_AUDIO_SLOTS;
+use crate::control::MAX_RTP_SLOTS_PER_TYPE;
 use crate::entity::{AudioOrigin, TrackId};
 use crate::log::{LogCtx, plog_debug, plog_warn};
 use crate::participant::downstream::{PlayoutPolicy, ReceiverPlayout, SlotConfig};
@@ -24,7 +24,7 @@ use std::ops::{Deref, DerefMut};
 /// see `tests::room_isolation::audio_selection_does_not_cross_rooms_test`. A listener only ever
 /// ranks the streams forwarded to it, which are its own room's, so scoping is a property here
 /// rather than a check.
-pub const SELECTOR_SLOTS: usize = MAX_SEND_AUDIO_SLOTS;
+pub const SELECTOR_SLOTS: usize = MAX_RTP_SLOTS_PER_TYPE;
 
 /// A slot is dead if no packet has arrived within this window.
 const DEAD_TIMEOUT: Duration = Duration::from_millis(2000);
@@ -765,6 +765,25 @@ mod tests {
             alloc.add_slot(slot_config(mid, ssrc));
         }
         alloc
+    }
+
+    #[test]
+    fn receiver_coordinates_round_trip_at_32_slots() {
+        let mut alloc = AudioAllocator::new(test_ctx(), false);
+        for media_index in 200..232 {
+            let mid = Mid::from(format!("audio-{media_index}").as_str());
+            alloc.add_slot(SlotConfig {
+                media_index,
+                mid,
+                rid: None,
+                ssrc: Ssrc::from(media_index),
+                pt: Pt::from(111_u8),
+                kind: MediaKind::Audio,
+            });
+        }
+
+        assert_eq!(alloc.slot_count(), 32);
+        assert_eq!(alloc.receiver_index(Mid::from("audio-231")), Some(231));
     }
 
     fn heard_origins(alloc: &AudioAllocator) -> Vec<AudioOrigin> {
