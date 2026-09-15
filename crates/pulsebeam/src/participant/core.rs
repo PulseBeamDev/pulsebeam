@@ -524,11 +524,6 @@ impl Participant {
     }
 
     #[cfg(test)]
-    pub(crate) fn set_v1_test_output_cid(&mut self, cid: ChannelId) {
-        self.signaling.set_cid(cid);
-    }
-
-    #[cfg(test)]
     pub(crate) fn set_v1_test_write_channel_result(&mut self, result: bool) {
         self.transport.set_test_write_channel_result(result);
     }
@@ -545,21 +540,15 @@ impl Participant {
         self.signaling.stage_v1_output(&snapshot, self.v1_mapping())
     }
 
-    /// Exercises the production channel-write commit/retry decision without
-    /// routing v1 signaling through the native lifecycle before Task 8.
     #[cfg(test)]
-    pub(crate) fn flush_v1_test_output(&mut self) -> Option<(Vec<u8>, bool)> {
-        let mut snapshot = self.downstream.signaling_snapshot();
-        snapshot.participants = self.signaling.participants_snapshot();
-        let output = self.signaling.poll(&snapshot)?;
-        let bytes = output.bytes;
-        let committed = self.transport.write_channel(output.cid, true, &bytes);
-        if committed {
-            self.signaling.commit_sent();
-        } else {
-            self.signaling.retry_pending();
-        }
-        Some((bytes, committed))
+    pub(crate) fn poll_v1_test_output(&mut self) {
+        let mut sink = crate::participant::event::test_utils::MockParticipantSink::new();
+        let _ = self.poll(Instant::now(), &mut sink);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn v1_test_channel_write_attempts(&self) -> &[Vec<u8>] {
+        self.transport.test_channel_write_attempts()
     }
 
     #[cfg(test)]

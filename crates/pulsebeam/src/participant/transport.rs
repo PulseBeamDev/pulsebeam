@@ -110,6 +110,8 @@ pub(crate) struct Transport {
     exited: bool,
     #[cfg(test)]
     write_channel_result: Option<bool>,
+    #[cfg(test)]
+    channel_write_attempts: Vec<Vec<u8>>,
     #[cfg(debug_assertions)]
     egress_guard: crate::rtp::egress_guard::EgressGuard,
     #[cfg(feature = "sim")]
@@ -139,6 +141,8 @@ impl Transport {
             exited: false,
             #[cfg(test)]
             write_channel_result: None,
+            #[cfg(test)]
+            channel_write_attempts: Vec::new(),
             #[cfg(debug_assertions)]
             egress_guard: crate::rtp::egress_guard::EgressGuard::new(),
             #[cfg(feature = "sim")]
@@ -230,6 +234,8 @@ impl Transport {
 
     pub(crate) fn write_channel(&mut self, cid: ChannelId, binary: bool, bytes: &[u8]) -> bool {
         #[cfg(test)]
+        self.channel_write_attempts.push(bytes.to_vec());
+        #[cfg(test)]
         if let Some(result) = self.write_channel_result.take() {
             return result;
         }
@@ -242,6 +248,11 @@ impl Transport {
     #[cfg(test)]
     pub(crate) fn set_test_write_channel_result(&mut self, result: bool) {
         self.write_channel_result = Some(result);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_channel_write_attempts(&self) -> &[Vec<u8>] {
+        &self.channel_write_attempts
     }
 
     pub(crate) fn channel_config(

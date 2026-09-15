@@ -1983,19 +1983,28 @@ mod v1_output_tests {
         participant.stage_v1_test_output().unwrap();
         participant.set_v1_test_write_channel_result(false);
 
-        let (failed, committed) = participant.flush_v1_test_output().unwrap();
+        participant.poll_v1_test_output();
+        let failed = participant.v1_test_channel_write_attempts().to_vec();
         assert!(
-            !committed,
-            "forced transport backpressure must retain the pending output"
+            !failed.is_empty(),
+            "the actual participant drain branch must write"
         );
+        assert!(failed.iter().all(|bytes| bytes == &failed[0]));
         assert_eq!(participant.v1_test_catalog_revision(), 0);
 
-        participant.set_v1_test_output_cid(cid);
         participant.set_v1_test_write_channel_result(true);
-        let (retried, committed) = participant.flush_v1_test_output().unwrap();
-        assert!(committed);
-        assert_eq!(retried, failed);
+        participant.poll_v1_test_output();
+        let attempts = participant.v1_test_channel_write_attempts();
+        assert_eq!(attempts.len(), failed.len() + 1);
+        assert_eq!(attempts.last(), failed.first());
         assert_eq!(participant.v1_test_catalog_revision(), 1);
+        let attempt_count = attempts.len();
+
+        participant.poll_v1_test_output();
+        assert_eq!(
+            participant.v1_test_channel_write_attempts().len(),
+            attempt_count
+        );
     }
 
     #[test]
