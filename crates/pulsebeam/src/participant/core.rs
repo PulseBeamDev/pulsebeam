@@ -19,7 +19,10 @@ use crate::id::ShardId;
 use crate::keys::TrackHandle;
 use crate::log::{LogCtx, plog_debug, plog_info, plog_trace, plog_warn};
 use crate::participant::data::{DataOpenError, DataState};
-use crate::participant::downstream::SlotConfig;
+use crate::participant::downstream::{
+    AudioReceiverAdmissionError, AudioReceiverRequest, SlotConfig, VideoReceiverAdmissionError,
+    VideoReceiverRequest,
+};
 use crate::participant::effect::ParticipantEffect;
 use crate::participant::event::ParticipantSink;
 use crate::participant::reverse::{ReverseInput, ReversePacket};
@@ -299,6 +302,155 @@ impl Participant {
     )]
     pub(crate) fn receiver_index(&self, kind: MediaKind, mid: Mid) -> Option<u32> {
         self.downstream.receiver_index(kind, mid)
+    }
+
+    /// Apply one decoded native v1 Intent as a single preview-then-commit
+    /// transaction.  The production channel deliberately does not route this
+    /// seam until the v1 signaling lifecycle is installed.
+    pub(crate) fn apply_v1_intent(
+        &mut self,
+        wire: pulsebeam_proto::signaling_v1::Intent,
+        events: &mut impl ParticipantSink,
+    ) -> signaling::V1IntentResult {
+        if !self.signaling.v1_is_fresh(wire.revision) {
+            return signaling::V1IntentResult::Mapping(self.v1_mapping());
+        }
+
+        let intent = signaling::normalize_v1_intent(wire);
+        if intent.video.len() > self.downstream.video_slot_count() {
+            return Self::v1_protocol_error(intent.revision, "video receiver capacity exceeded");
+        }
+
+        let snapshot = self.downstream.signaling_snapshot();
+        let track = |id: &str| {
+            snapshot
+                .publications
+                .iter()
+                .find(|meta| meta.id.as_str() == id)
+        };
+        let video: Vec<_> = intent
+            .video
+            .iter()
+            .filter_map(|request| {
+                let meta = track(&request.track_id)?;
+                (meta.id.kind() == TrackKind::Video).then(|| VideoReceiverRequest {
+                    intent: crate::participant::intent::VideoIntent {
+                        track_id: meta.id,
+                        target_height: request.target_height,
+                        min_height: request.min_height,
+                        min_fps: request.min_fps,
+                        priority: request.priority,
+                    },
+                    playout: request.playout,
+                })
+            })
+            .collect();
+        let audio: Vec<_> = intent
+            .audio
+            .iter()
+            .filter_map(|request| {
+                let meta = track(&request.track_id)?;
+                (meta.id.kind() == TrackKind::Audio).then(|| AudioReceiverRequest {
+                    track_id: meta.id,
+                    playout: request.playout,
+                })
+            })
+            .collect();
+
+        let publications = match self.preview_native_publications(&intent.publications) {
+            Ok(preview) => preview,
+            Err(_) => {
+                return Self::v1_protocol_error(intent.revision, "native sender binding changed");
+            }
+        };
+        let video_preview = match self.downstream.preview_video_receiver_assignments(&video) {
+            Ok(preview) => preview,
+            Err(VideoReceiverAdmissionError::PlayoutResetRequired) => {
+                return signaling::V1IntentResult::Reconnect;
+            }
+            Err(
+                VideoReceiverAdmissionError::Capacity | VideoReceiverAdmissionError::DuplicateTrack,
+            ) => {
+                return Self::v1_protocol_error(
+                    intent.revision,
+                    "invalid video receiver assignment",
+                );
+            }
+            Err(VideoReceiverAdmissionError::Stale) => {
+                debug_assert!(false, "a transaction preview cannot be stale before commit");
+                return signaling::V1IntentResult::Reconnect;
+            }
+        };
+        let audio_preview = match self.downstream.preview_audio_receiver_assignments(&audio) {
+            Ok(preview) => preview,
+            Err(AudioReceiverAdmissionError::PlayoutResetRequired) => {
+                return signaling::V1IntentResult::Reconnect;
+            }
+            Err(
+                AudioReceiverAdmissionError::Capacity | AudioReceiverAdmissionError::DuplicateTrack,
+            ) => {
+                return Self::v1_protocol_error(
+                    intent.revision,
+                    "invalid audio receiver assignment",
+                );
+            }
+            Err(AudioReceiverAdmissionError::Stale) => {
+                debug_assert!(false, "a transaction preview cannot be stale before commit");
+                return signaling::V1IntentResult::Reconnect;
+            }
+        };
+
+        // The previews are current and commits have no remaining fallible work.
+        // A stale result here would be an internal ordering bug, not input state.
+        self.commit_native_publications(publications, events);
+        if self
+            .downstream
+            .commit_video_receiver_assignments(video_preview)
+            .is_err()
+            || self
+                .downstream
+                .commit_audio_receiver_assignments(audio_preview)
+                .is_err()
+        {
+            debug_assert!(false, "a current transaction preview must commit");
+            return signaling::V1IntentResult::Reconnect;
+        }
+        self.downstream
+            .set_audio_intent(crate::participant::intent::AudioIntent {
+                pinned: audio.iter().map(|request| request.track_id).collect(),
+                auto: intent.audio_auto,
+            });
+        self.signaling.accept_v1_intent(intent);
+        signaling::V1IntentResult::Mapping(self.v1_mapping())
+    }
+
+    fn v1_protocol_error(revision: u64, message: &str) -> signaling::V1IntentResult {
+        signaling::V1IntentResult::ProtocolError(pulsebeam_proto::signaling_v1::Error {
+            code: pulsebeam_proto::signaling_v1::ErrorCode::ProtocolError.into(),
+            message: message.to_owned(),
+            fatal: true,
+            intent_revision: Some(revision),
+        })
+    }
+
+    fn v1_mapping(&self) -> pulsebeam_proto::signaling_v1::Mapping {
+        let mappings =
+            |assignments: Vec<(u32, TrackId)>| pulsebeam_proto::signaling_v1::TrackMappings {
+                tracks: assignments
+                    .into_iter()
+                    .map(
+                        |(receiver_index, track_id)| pulsebeam_proto::signaling_v1::TrackMapping {
+                            receiver_index,
+                            track_id: track_id.as_str(),
+                        },
+                    )
+                    .collect(),
+            };
+        pulsebeam_proto::signaling_v1::Mapping {
+            intent_revision: self.signaling.v1_revision(),
+            video: Some(mappings(self.downstream.video_receiver_assignments())),
+            audio: Some(mappings(self.downstream.audio_receiver_assignments())),
+        }
     }
 
     pub fn apply(&mut self, effect: ParticipantEffect, track_handle: Option<TrackHandle>) {

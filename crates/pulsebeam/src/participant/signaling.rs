@@ -124,6 +124,133 @@ pub(crate) fn build_catalog(
     })
 }
 
+/// A decoded v1 Intent after omission/default and first-occurrence handling.
+/// Track identities deliberately remain wire strings here: unavailable and
+/// wrong-kind entries are retained until a later catalog reconciliation.
+#[derive(Clone)]
+pub(crate) struct V1Intent {
+    pub(crate) revision: u64,
+    pub(crate) publications: Vec<crate::participant::intent::NativePublication>,
+    pub(crate) video: Vec<V1VideoIntent>,
+    pub(crate) audio: Vec<V1AudioIntent>,
+    pub(crate) audio_auto: bool,
+}
+
+#[derive(Clone)]
+pub(crate) struct V1VideoIntent {
+    pub(crate) track_id: String,
+    pub(crate) target_height: u32,
+    pub(crate) min_height: u32,
+    pub(crate) min_fps: u32,
+    pub(crate) priority: u32,
+    pub(crate) playout: crate::participant::downstream::PlayoutPolicy,
+}
+
+#[derive(Clone)]
+pub(crate) struct V1AudioIntent {
+    pub(crate) track_id: String,
+    pub(crate) playout: crate::participant::downstream::PlayoutPolicy,
+}
+
+pub(crate) enum V1IntentResult {
+    Mapping(media_signaling::Mapping),
+    ProtocolError(media_signaling::Error),
+    Reconnect,
+}
+
+fn v1_playout(
+    delay: Option<media_signaling::PlayoutDelay>,
+) -> crate::participant::downstream::PlayoutPolicy {
+    delay
+        .map(|delay| {
+            crate::participant::downstream::PlayoutPolicy::fixed((delay.min_ms, delay.max_ms))
+        })
+        .unwrap_or(crate::participant::downstream::PlayoutPolicy::Default)
+}
+
+pub(crate) fn normalize_v1_intent(intent: media_signaling::Intent) -> V1Intent {
+    let publications = intent
+        .send
+        .unwrap_or_default()
+        .tracks
+        .into_iter()
+        .map(|track| crate::participant::intent::NativePublication {
+            sender_index: Some(track.sender_index),
+            kind: match media_signaling::TrackKind::try_from(track.kind) {
+                Ok(media_signaling::TrackKind::Audio) => Some(crate::entity::TrackKind::Audio),
+                Ok(media_signaling::TrackKind::Video) => Some(crate::entity::TrackKind::Video),
+                Ok(media_signaling::TrackKind::Unspecified) | Err(_) => None,
+            },
+            label: track.label,
+        })
+        .collect();
+    let receive = intent.receive.unwrap_or_default();
+    let mut video_ids = HashSet::new();
+    let video = receive
+        .video
+        .unwrap_or_default()
+        .tracks
+        .into_iter()
+        .filter_map(|track| {
+            video_ids.insert(track.track_id.clone()).then(|| {
+                let options = track.options.unwrap_or_default();
+                V1VideoIntent {
+                    track_id: track.track_id,
+                    target_height: options.height,
+                    min_height: options.min_height,
+                    min_fps: options.min_fps,
+                    priority: options.priority,
+                    playout: v1_playout(options.playout_delay),
+                }
+            })
+        })
+        .collect();
+    let audio = receive.audio.unwrap_or_default();
+    let audio_auto = !matches!(
+        media_signaling::AudioMode::try_from(audio.mode),
+        Ok(media_signaling::AudioMode::ExplicitOnly)
+    );
+    let mut audio_ids = HashSet::new();
+    let audio = audio
+        .tracks
+        .into_iter()
+        .filter_map(|track| {
+            audio_ids
+                .insert(track.track_id.clone())
+                .then(|| V1AudioIntent {
+                    track_id: track.track_id,
+                    playout: v1_playout(track.options.and_then(|options| options.playout_delay)),
+                })
+        })
+        .collect();
+    V1Intent {
+        revision: intent.revision,
+        publications,
+        video,
+        audio,
+        audio_auto,
+    }
+}
+
+#[cfg(test)]
+mod v1_intent_tests {
+    use super::*;
+
+    #[test]
+    fn omission_replaces_every_section_with_defaults() {
+        let normalized = normalize_v1_intent(media_signaling::Intent {
+            revision: 1,
+            send: None,
+            receive: None,
+        });
+
+        assert!(normalized.publications.is_empty());
+        assert!(normalized.video.is_empty());
+        assert!(normalized.audio.is_empty());
+        assert!(normalized.audio_auto);
+    }
+}
+
 pub(crate) struct SignalingIntents {
     pub(crate) video: Option<HashMap<Mid, Intent>>,
     pub(crate) audio: Option<AudioIntent>,
@@ -185,6 +312,8 @@ pub struct Signaling {
     last_audio_intent: Option<AudioIntent>,
     last_playout_delay: Option<(u32, u32)>,
     pending_commit: Option<SignalingCommit>,
+    v1_revision: u64,
+    v1_intent: Option<V1Intent>,
 }
 
 impl Signaling {
@@ -204,6 +333,8 @@ impl Signaling {
             last_audio_intent: None,
             last_playout_delay: None,
             pending_commit: None,
+            v1_revision: 0,
+            v1_intent: None,
 
             slot_count: 0,
             audio_slot_count: 0,
@@ -223,6 +354,20 @@ impl Signaling {
 
     pub fn set_audio_slot_count(&mut self, slot_count: usize) {
         self.audio_slot_count = slot_count;
+    }
+
+    pub(crate) fn v1_is_fresh(&self, revision: u64) -> bool {
+        revision != 0 && revision > self.v1_revision
+    }
+
+    pub(crate) fn accept_v1_intent(&mut self, intent: V1Intent) {
+        debug_assert!(self.v1_is_fresh(intent.revision));
+        self.v1_revision = intent.revision;
+        self.v1_intent = Some(intent);
+    }
+
+    pub(crate) fn v1_revision(&self) -> u64 {
+        self.v1_revision
     }
 
     pub(crate) fn reconcile(&self) -> SignalingIntents {

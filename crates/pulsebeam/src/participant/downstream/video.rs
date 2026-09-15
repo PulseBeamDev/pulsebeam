@@ -337,7 +337,12 @@ impl VideoAllocator {
                                 .get(&layer.stream_id())
                                 .is_some_and(crate::rtp::monitor::StreamStats::is_healthy)
                     })
-                    .or_else(|| track_state.layers().iter().max_by_key(|layer| layer.quality));
+                    .or_else(|| {
+                        track_state
+                            .layers()
+                            .iter()
+                            .max_by_key(|layer| layer.quality)
+                    });
                 let Some(layer) = layer else {
                     slot.stop();
                     return None;
@@ -3007,8 +3012,12 @@ mod assignment_tests {
         let track = Track::video(tx.meta, built.layers().to_vec(), None);
         let medium = track.by_quality(LayerQuality::Medium).unwrap();
         let high = track.by_quality(LayerQuality::High).unwrap();
-        state_of_mut(&mut states, medium).set_height(360).bitrate(200_000);
-        state_of_mut(&mut states, high).set_height(720).bitrate(900_000);
+        state_of_mut(&mut states, medium)
+            .set_height(360)
+            .bitrate(200_000);
+        state_of_mut(&mut states, high)
+            .set_height(720)
+            .bitrate(900_000);
 
         let mut keys: SlotMap<DownstreamSlotKey, ()> = SlotMap::with_key();
         let key = keys.insert(());
@@ -3026,7 +3035,9 @@ mod assignment_tests {
         let engine = AllocationEngine::new(std::slice::from_ref(&view), &states);
 
         assert!(matches!(
-            engine.run_compute(Bitrate::from(500_000), std::slice::from_ref(&view)).get(key),
+            engine
+                .run_compute(Bitrate::from(500_000), std::slice::from_ref(&view))
+                .get(key),
             Some(AllocationDecision::Pause(_, _))
         ));
     }
@@ -3034,11 +3045,8 @@ mod assignment_tests {
     #[test]
     fn positive_floor_without_a_matching_layer_pauses_at_the_assignment() {
         let pid = ParticipantId::new();
-        let (tx, built, states) = video_track_with_states(
-            pid,
-            Mid::from("v0"),
-            vec![SimulcastLayer::new("h")],
-        );
+        let (tx, built, states) =
+            video_track_with_states(pid, Mid::from("v0"), vec![SimulcastLayer::new("h")]);
         let track = Track::video(tx.meta, built.layers().to_vec(), None);
         let medium = track.by_quality(LayerQuality::Medium).unwrap();
         let mut keys: SlotMap<DownstreamSlotKey, ()> = SlotMap::with_key();
@@ -3093,7 +3101,8 @@ mod assignment_tests {
         let engine = AllocationEngine::new(std::slice::from_ref(&view), &states);
 
         let degraded = engine.run_compute(Bitrate::from(500_000), std::slice::from_ref(&view));
-        assert!(matches!(
+        assert!(
+            matches!(
             degraded.get(key),
             Some(AllocationDecision::ForwardTarget(layer, DecodeTargetSelection::Target(_), _))
                 if *layer == high),
@@ -3147,7 +3156,10 @@ mod assignment_tests {
         let mut writer = StreamWriter::new();
         let packet = RtpPacket::default();
         assert!(!slot.on_rtp(track_id, packet.arrival_ts, None, &mut writer));
-        assert!(writer.pop().is_none(), "360p must not emit while 720p is pending");
+        assert!(
+            writer.pop().is_none(),
+            "360p must not emit while 720p is pending"
+        );
     }
 
     #[test]

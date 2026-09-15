@@ -508,6 +508,10 @@ impl Downstream {
         self.audio.slot_count()
     }
 
+    pub(crate) fn video_slot_count(&self) -> usize {
+        self.video.slot_count()
+    }
+
     pub(super) fn remove_track(&mut self, track_id: &TrackId) -> bool {
         let removed = self.video.remove_track(track_id);
         if removed {
