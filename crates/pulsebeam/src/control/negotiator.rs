@@ -423,12 +423,18 @@ mod tests {
         change.add_channel("signal".to_owned());
         change.add_media(MediaKind::Video, Direction::SendOnly, None, None, None);
         change.add_media(MediaKind::Video, Direction::RecvOnly, None, None, None);
-        let offer = change
-            .apply()
-            .unwrap()
-            .0
-            .to_sdp_string()
-            .replacen("m=video 9", "m=video 0", 1);
+        let mut offer = change.apply().unwrap().0.to_sdp_string();
+        let disabled_mid = offer
+            .lines()
+            .filter_map(|line| line.strip_prefix("a=mid:"))
+            .nth(2)
+            .expect("third media section MID")
+            .to_owned();
+        offer = offer.replacen("m=video 9", "m=video 0", 1).replacen(
+            &format!(" {disabled_mid}"),
+            "",
+            1,
+        );
         let offer = SdpOffer::from_sdp_string(&offer).unwrap();
         let mut negotiator = Negotiator::new(Vec::new());
         let (_, _, resources) = negotiator.create_answer(offer, IceCreds::new()).unwrap();
@@ -441,7 +447,6 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![
                 (0, MediaKind::Audio, Direction::RecvOnly),
-                (2, MediaKind::Video, Direction::RecvOnly),
                 (3, MediaKind::Video, Direction::SendOnly),
             ]
         );
