@@ -13,9 +13,11 @@ package pulsebeam.media.v1;
 //
 // Protocol ownership:
 //
-//   HTTP owns connection-resource creation and destruction and the SDP exchange
-//   that creates the WebRTC transport. This protocol owns live media state after
-//   a native connection is established:
+//   HTTP owns connection-resource creation and destruction and the initial SDP
+//   exchange. Native renegotiation and ICE restart are not supported. Negotiated
+//   topology is fixed for the lifetime of a connection; fresh topology requires
+//   creating a new connection through HTTP. This protocol owns live media state
+//   after a native connection is established:
 //
 //     Catalog       — server-authoritative remote media entities visible to this
 //                     participant.
@@ -37,8 +39,14 @@ package pulsebeam.media.v1;
 //     MUST NOT infer hidden transitions, synthesize correction reasons, mutate
 //     application desired state, or infer Reconnect from missing mappings.
 //   - A valid desired state that requires fresh negotiated receiver structure MAY
-//     cause an explicit Reconnect. Insufficient receiver structure alone is not an
-//     invalid Intent.
+//     cause an explicit Reconnect, subject to the video request-count invariant
+//     documented on VideoIntent.
+//   - Intent is reconciled to feasible, authorized media state. Only permission
+//     failures cause non-fatal Intent rejection. Exceeding the VideoIntent
+//     receiver-count limit or changing an established SendIntent label binding
+//     is a fatal PROTOCOL_ERROR. Other intent-level faults are reconciled and
+//     answered with complete Mapping state.
+//     Mapping does not rewrite the client's application-owned desired Intent.
 //
 // Protocol applicability — WHIP and WHEP:
 //
@@ -218,6 +226,58 @@ package pulsebeam.media.v1;
 //     audio receiver_index 1 -> aud_1...
 //     audio receiver_index 2 -> aud_2...
 //
+// Native negotiated capacity and SDK defaults:
+//
+// The server imposes four independent hard limits per native connection,
+// measured from the client's perspective:
+//
+//   audio senders   <= 32 negotiated RTP media sections
+//   video senders   <= 32 negotiated RTP media sections
+//   audio receivers <= 32 negotiated RTP media sections
+//   video receivers <= 32 negotiated RTP media sections
+//
+// The cap is per media kind AND direction, not shared between audio and video
+// or between sending and receiving. It applies whenever a connection is
+// created. Reserved capacity counts even when no track is published or
+// mapped; an empty slot does not release negotiated capacity. Non-RTP data
+// channel sections do not consume these RTP limits, but still count when
+// determining zero-based SDP media-section indices. For example, 32 audio
+// receivers plus 32 video receivers are permitted; 33 video receivers are
+// not, even when no audio receivers are negotiated.
+//
+// Intent MUST fit the resources negotiated for its connection. Capacity cannot
+// be increased on an existing connection by sending a new Intent.
+// Local logical sender creation beyond configured capacity MUST fail early
+// with a synchronous SDK capacity error. Existing immutable bindings remain.
+// React Video render demand is virtual. Exceeding receiver capacity is a
+// programmer/configuration error: excess demand stays unmapped and emits a
+// warning log, not a thrown error. The SDK runtime prefers unused receivers
+// before reclaiming capacity from hidden/off-screen video for another demand.
+// A track still rendered by a relevant visible consumer is not hidden merely
+// because another consumer of the same source is hidden. Hidden tracks' stored
+// receive policy does not reserve receiver capacity; when their demand is
+// withdrawn for reuse, omit them from the replacement wire VideoIntent.
+// While a track remains selected, its hard minimum still applies. Reclamation
+// changes selection; it does not lower that minimum. Actual receiver bindings
+// remain server-authoritative through Mapping, including playout compatibility.
+// Do not add priority admission or eviction of useful visible demand. Receive
+// priority controls media quality contention, not SDK receiver-pool admission.
+// The SDK MUST keep wire VideoIntent within negotiated capacity and follow
+// server Mapping for actual receiver bindings. It MUST NOT automatically
+// recreate the connection to grow capacity. Virtual render demand does not
+// allocate topology.
+// Audio preference-list length alone is not receiver demand: the server may
+// select from a preference list longer than receiver capacity.
+// SDK initial/default capacities, measured from the client perspective:
+//
+//   audio senders    2
+//   video senders    2
+//   audio receivers  8
+//   video receivers 16
+//
+// These defaults target avoiding capacity growth for 99.99% of use cases;
+// that percentage is a design goal, not a measured coverage guarantee.
+//
 // Global protocol resource limits:
 //
 //   uncompressed protobuf message        <= 32,768 bytes
@@ -288,9 +348,10 @@ package pulsebeam.media.v1;
 // decompression, MUST use a bounds-checked LZ4 decoder, and MUST reject malformed
 // blocks or blocks whose decoded output would exceed 32,768 bytes.
 //
-// Malformed/oversized LZ4 or undecodable protobuf is a wire-protocol violation.
-// The receiver SHOULD terminate the signaling connection without attempting to
-// interpret partial state. Implementations SHOULD use bounded/reusable scratch
+// Malformed/oversized LZ4 or undecodable protobuf is a fatal wire-protocol
+// violation. The receiver MUST terminate the signaling connection without
+// interpreting partial state or attempting recovery through a Mapping reply.
+// Implementations SHOULD use bounded/reusable scratch
 // storage so wire decoding itself cannot cause an unbounded dataplane allocation.
 //
 // Compression parameters such as acceleration level are not part of the wire
@@ -361,10 +422,23 @@ message Participant {
 // `label` is application-owned, case-sensitive UTF-8. It MUST be non-empty and
 // no longer than 64 UTF-8 bytes. `(kind, label)` MUST be unique within the
 // participant's SendIntent.
+// An empty label or a label exceeding 64 UTF-8 bytes makes this send entry
+// unusable: the server skips it without rejecting the Intent. It MUST NOT
+// invent or truncate a label. The remaining send list still replaces the
+// previous publication state according to SendIntent reconciliation rules.
 //
-// A label/kind change changes logical track identity. The server MUST NOT mutate
-// the identity tuple of an existing TrackId to represent it; a differently
-// labeled/kinded published track receives a different TrackId.
+// SDK local label bindings are immutable for the Agent lifetime. The first
+// lookup/creation of (kind, label) permanently reserves one logical sender slot;
+// repeated lookup returns the same handle and consumes no additional capacity.
+// The SDK MUST fail synchronously on attempts to relabel/rebind that slot or
+// create a new label beyond configured sender capacity. Capacity errors identify
+// at least media kind, requested label, and configured capacity.
+//
+// Replacing or clearing a borrowed physical source does not release the label
+// or sender slot. Disconnect/reconnect preserves these logical bindings; only
+// destroying the Agent releases them. SDP sender_index remains connection-local
+// and MUST be resolved against the negotiated transport on a fresh connection.
+// Audio and video label namespaces are separate.
 message LocalTrack {
   uint32 sender_index = 1;
   TrackKind kind = 2;
@@ -519,10 +593,38 @@ message Catalog {
 // Sender indices are unique. `(kind, label)` pairs are unique. Every sender_index
 // MUST exist in the negotiated transport and its media kind MUST match `kind`.
 // An empty list unpublishes every local track from this participant.
+// Publication activity is replaceable; label-to-sender bindings are immutable.
+// Omitting an entry stops its publication but MUST NOT release or relabel its
+// reserved sender binding. Later publication on that binding uses the same
+// (kind, label). New labels may only occupy previously unbound sender slots.
+//
+// An otherwise usable entry that changes an established sender's label or
+// moves an established (kind, label) to another sender is a relabel/rebind
+// violation. The server MUST report PROTOCOL_ERROR with fatal = true and the
+// candidate intent_revision, terminate signaling, and apply no part of that
+// Intent. Prior omission/unpublication does not release the binding. This rule
+// concerns bindings established by earlier accepted Intent; duplicate entries
+// within a candidate still follow the first-usable-entry rule below.
+//
+// If an entry does not identify an existing negotiated local RTP sender, or
+// its kind does not match that sender, the server skips that entry without
+// rejecting the Intent. The remaining send list is a complete replacement;
+// previous publications absent from the resulting list are unpublished.
+// Skipping an entry does not preserve its previous publication or invent a
+// sender or media kind.
+//
+// Reconcile entries in list order. Keep the first usable entry for each sender
+// index and (kind, label) pair; skip later entries conflicting with either
+// coordinate or identity of a kept entry. Skipped unusable or conflicting
+// entries create no new reservation of their sender index or (kind, label)
+// pair; reservations established earlier remain immutable.
+// Such conflicts do not reject the Intent.
 //
 // Accepted state is interpreted together with the enclosing Intent. This message
 // cannot create new SDP media sections; transport structure changes occur through
-// connection recreation/negotiation, not by inventing sender indices here.
+// connection recreation, not by inventing sender indices
+// here. A client MUST finish negotiation of added senders before referencing
+// their indices in Intent.
 message SendIntent {
   repeated LocalTrack tracks = 1;
 }
@@ -534,13 +636,20 @@ message SendIntent {
 
 // Receiver playout-delay bounds for one remote stream.
 //
-// Values are milliseconds.
+// Values are milliseconds. The system's practical limit is 2,000 ms per bound.
+// The server clamps each bound to [0, 2000], then raises max_ms to the clamped
+// min_ms if necessary. Reversed or excessive bounds do not reject an Intent.
+// For example, [100, 50] becomes [100, 100], [3000, 500] becomes [2000, 2000],
+// and [0, 5000] becomes [0, 2000] for application of the receiver policy.
 //
-// min_ms == 0 && max_ms == 0:
-//   Request minimum possible buffering.
+// Client desired Intent retains its original millisecond values; normalization
+// does not rewrite application desire. SDKs MUST NOT quantize desired values
+// to RTP precision. Only when encoding the RTP playout-delay extension, round
+// the normalized bounds to the nearest 10 ms, with halfway values rounded
+// upward (14 ms -> 10 ms, 15 ms -> 20 ms).
 //
-// Otherwise:
-//   min_ms MUST be <= max_ms.
+// min_ms == 0 && max_ms == 0 requests minimum possible buffering. An absent
+// PlayoutDelay requests receiver-default policy, which is distinct from [0, 0].
 //
 // The control applies only to the stream carrying the associated TrackId.
 message PlayoutDelay {
@@ -558,11 +667,16 @@ message PlayoutDelay {
 message VideoOptions {
   // Target rendered height in physical pixels.
   //
-  // 0 means hidden/off-screen and permits forwarding to stop.
+  // The effective target is max(height, min_height). The target is a hint,
+  // not a ceiling. Zero permits off-screen stopping only when min_height is
+  // also zero; height = 0 with min_height = 720 has effective target 720.
   uint32 height = 1;
 
   // Lowest useful rendered height under contention.
   //
+  // This is a hard floor. If no available, affordable layer meets it, keep
+  // an assigned track mapped and pause forwarding until one does. Reduce
+  // temporal layers first when min_fps allows; never lower this spatial floor.
   // 0 means fully droppable.
   uint32 min_height = 2;
 
@@ -586,8 +700,8 @@ message VideoOptions {
 // `track_id` MUST identify a VIDEO TrackId visible in the client's currently
 // observed Catalog. Because Catalog and Intent travel in opposite directions, a
 // TrackId can disappear on the server after the client legitimately observed it
-// and before this Intent arrives. That race is handled as INVALID_TRACK according
-// to the Intent stale-Catalog rules below; it is not inherently a protocol bug.
+// and before this Intent arrives. The server reconciles that race as described
+// on Intent below; it does not reject the Intent.
 //
 // If `options` is absent, protobuf/default video options apply.
 message VideoTrackIntent {
@@ -599,7 +713,20 @@ message VideoTrackIntent {
 // Complete desired remote video state.
 //
 // Each entry explicitly references one canonical VIDEO TrackId, at most once.
-// Entry ordering has no semantic meaning. An empty list requests no video tracks.
+// For duplicate TrackIds, the server keeps the first occurrence and its
+// options and ignores later occurrences; duplicates do not reject the Intent.
+// After deduplication, entry ordering has no semantic meaning. An empty list
+// requests no video tracks.
+// The SDK MUST ensure that the number of distinct requested video tracks
+// does not exceed the number of negotiated video RTP receivers on this
+// connection. Exceeding that capacity violates the client protocol contract;
+// conforming SDKs MUST prevent such an Intent from being sent.
+// Additional receiver capacity requires a newly created connection with that
+// capacity; an Intent cannot expand the existing connection's receiver set.
+// If received, the server MUST report PROTOCOL_ERROR with fatal = true and
+// the candidate intent_revision, and terminate signaling. It MUST NOT apply
+// any part of that Intent, select a capacity-limited subset, or use Reconnect
+// to recover from this violation. Duplicate occurrences count as one TrackId.
 message VideoIntent {
   repeated VideoTrackIntent tracks = 1;
 }
@@ -621,8 +748,8 @@ message AudioOptions {
 // Desired state for one explicitly requested canonical remote audio track.
 //
 // `track_id` MUST identify an AUDIO TrackId visible in the client's currently
-// observed Catalog. A concurrent Catalog removal is handled as INVALID_TRACK as
-// described on Intent; it is not inherently a protocol bug.
+// observed Catalog. A concurrent Catalog removal is reconciled as described on
+// Intent; it does not reject the Intent.
 //
 // If `options` is absent, protobuf/default audio options apply.
 message AudioTrackIntent {
@@ -631,6 +758,9 @@ message AudioTrackIntent {
 }
 
 
+// An unrecognized numeric AudioMode value is reconciled as AUDIO_MODE_AUTO,
+// matching the omission default. It does not reject the Intent or rewrite
+// application-owned desired state.
 enum AudioMode {
   // Select explicit tracks first, then automatically fill remaining negotiated
   // audio receiver capacity. This is intentionally value 0 so an omitted mode
@@ -645,7 +775,10 @@ enum AudioMode {
 // Complete desired remote audio state.
 //
 // `tracks` contains explicitly requested canonical AUDIO TrackIds in preference
-// order. Each TrackId occurs at most once. An empty list is valid.
+// order. Clients should list each TrackId at most once. For duplicate TrackIds,
+// the server keeps the first occurrence and its options and ignores later
+// occurrences, preserving preference order. Duplicates do not reject the Intent.
+// An empty list is valid.
 //
 // In AUDIO_MODE_AUTO:
 //
@@ -678,8 +811,9 @@ message AudioIntent {
 //   video = explicit video TrackIds with per-track receive options
 //   audio = explicit audio TrackIds with per-track options plus selection policy
 //
-// Both `video` and `audio` MUST be present, including when their track lists are
-// empty.
+// Missing `video` means an empty video track list. Missing `audio` means an
+// empty audio preference list with AUDIO_MODE_AUTO. Neither omission preserves
+// previous receive state.
 message ReceiveIntent {
   VideoIntent video = 1;
   AudioIntent audio = 2;
@@ -689,41 +823,51 @@ message ReceiveIntent {
 // Complete client-authoritative desired media state for this connection.
 //
 // Every accepted Intent atomically replaces the previous accepted Intent.
-// `send` and `receive` MUST both be present.
+// Missing `send` means an empty send track list and unpublishes all local
+// tracks. Missing `receive` means default ReceiveIntent: no explicit video and
+// an empty audio preference list with AUDIO_MODE_AUTO. Omission never preserves
+// a section of the previous Intent. In particular, an otherwise empty Intent
+// with a fresh nonzero revision may still receive automatically selected audio.
 //
 // `revision` is client-owned, scoped to this signaling connection, and MUST be
 // nonzero. It correlates Mapping and intent-specific errors; it is not an entity
 // identity. Revision values MUST NOT wrap.
 //
-// A candidate Intent MUST have revision strictly greater than the latest accepted
-// Intent revision. An accepted revision is never replayed/idempotently accepted:
-// an Intent whose revision is less than or equal to the latest accepted revision
-// is rejected as INVALID_INTENT without changing accepted state. A rejected
-// candidate does not change the latest accepted revision.
+// Clients MUST send increasing revisions. A non-increasing revision MUST NOT
+// roll back accepted state or cause an intent-rejection Error. The server
+// preserves its current accepted state and replies with a complete Mapping
+// carrying its latest accepted revision. Revision zero is handled the same way.
 //
-// The data channel is reliable and ordered, so this protocol deliberately avoids
-// same-revision replay semantics and does not define protobuf-byte canonicality.
-// A new connection has a new revision namespace; an SDK reconstructing desired
-// state after Reconnect MUST use a fresh nonzero revision rather than replaying
-// the old connection's revision.
+// The data channel is reliable and ordered; clients MUST NOT retry unchanged
+// Intent merely because Mapping differs from their desired state. A new
+// connection has a new revision namespace and reconstructs connection-local
+// Intent from application desire.
 //
-// Receive TrackIds are validated against the server's current Catalog. Catalog
-// and Intent travel in opposite directions, so a client can legitimately send an
-// Intent for a TrackId that was visible when it constructed the Intent but was
-// concurrently removed by the server. In that case:
+// Receive TrackIds can disappear between the client's Catalog observation and
+// server reconciliation. An unavailable TrackId remains desired but unassigned;
+// it MUST NOT reject the complete Intent or prevent other feasible assignments.
+// If the same TrackId becomes available again, the server reconciles it again.
+// A receive TrackId listed under the wrong media kind remains unassigned
+// for that entry. The server MUST NOT move the entry between audio and video
+// or reject the Intent; it continues reconciling the other entries. Catalog
+// remains authoritative for the track's media kind.
 //
-//   - the server rejects the whole candidate atomically with INVALID_TRACK and
-//     the candidate `intent_revision`;
-//   - the previous accepted Intent remains unchanged;
-//   - before sending that Error, the server MUST order the Catalog change that
-//     made the TrackId invalid earlier on the server->client message stream;
-//   - INVALID_TRACK in this race is normal stale-state reconciliation, not proof
-//     of a programmer error.
+// Mapping MUST only reference currently visible tracks and MUST obey Catalog
+// causal ordering. The reply is complete Mapping state, not correction reasons.
 //
-// A structurally valid Intent that cannot be represented by the currently
-// negotiated receiver structure (for example, fresh receiver m-sections are
-// required) MAY cause Reconnect instead of acceptance. The server MUST NOT label
-// such an Intent invalid solely because the current transport lacks capacity.
+// Only permission failures cause non-fatal Intent rejection. Exceeding the
+// VideoIntent receiver-count limit or violating established SendIntent label
+// bindings is a fatal PROTOCOL_ERROR, as specified on those messages. Other
+// structural and option faults in a decoded Intent are
+// reconciliation inputs, not intent-rejection errors.
+// The server MUST preserve authorization, resource limits, and authoritative
+// state invariants while reconciling. Sender-side MUST requirements describe
+// conforming inputs; they do not imply additional fatal or rejection rules.
+//
+// An Intent within the VideoIntent receiver-count limit that requires fresh
+// receivers to restore receiver-default playout MAY cause Reconnect instead
+// of acceptance. This lifecycle condition is distinct from exceeding the
+// negotiated video receiver count.
 message Intent {
   uint64 revision = 1;
   SendIntent send = 2;
@@ -852,9 +996,6 @@ message Authorization {
 // normative:
 //
 //   INVALID_MESSAGE          fatal = true
-//   INVALID_INTENT           fatal = false
-//   INVALID_SENDER           fatal = false
-//   INVALID_TRACK            fatal = false
 //   AUTHORIZATION_REJECTED   fatal = false
 //   AUTHORIZATION_EXPIRED    fatal = true
 //   PROTOCOL_ERROR           fatal = true
@@ -865,9 +1006,8 @@ enum ErrorCode {
   ERROR_CODE_UNSPECIFIED = 0;
 
   INVALID_MESSAGE = 1;
-  INVALID_INTENT = 2;
-  INVALID_SENDER = 3;
-  INVALID_TRACK = 4;
+  reserved 2, 3, 4;
+  reserved "INVALID_INTENT", "INVALID_SENDER", "INVALID_TRACK";
 
   AUTHORIZATION_REJECTED = 5;
   AUTHORIZATION_EXPIRED = 6;
@@ -885,11 +1025,12 @@ enum ErrorCode {
 //
 // `intent_revision` MUST be present when an Error rejects a specific candidate
 // Intent and MUST be absent when the error is unrelated to one candidate Intent.
-// A rejected Intent never modifies the previously accepted Intent or Mapping.
-//
-// INVALID_TRACK may represent normal stale-Catalog reconciliation caused by a
-// concurrent server-side track removal; clients MUST NOT assume it always means
-// application programmer error.
+// Only AUTHORIZATION_REJECTED may non-fatally reject a candidate Intent. Such
+// a permission rejection never modifies accepted Intent or Mapping. Exceeding
+// the VideoIntent receiver-count limit or changing an established SendIntent
+// label binding requires fatal PROTOCOL_ERROR without applying the candidate. Other intent-level faults are reconciled and answered
+// with complete Mapping state, not relabeled as protocol or internal failures.
+// Wire decoding failures are distinct from faults inside a decoded Intent.
 //
 // If `fatal` is true, the connection is terminal for this protocol: the server
 // MUST NOT send subsequent Catalog/Mapping/Authorization state, and the client
@@ -940,9 +1081,15 @@ message Error {
 // Catalog before being encoded as TrackIds in a new Intent.
 //
 // The server SHOULD send Reconnect only when creating a fresh connection can
-// reasonably change the relevant negotiated/lifecycle condition. It MUST NOT use
-// Reconnect as an unbounded retry loop for a condition that connection recreation
-// cannot change.
+// reasonably change the relevant negotiated/lifecycle condition.
+//
+// While application desired connection state is connected, the SDK MUST retry
+// indefinitely using exponential backoff with jitter, with the actual delay
+// capped at 10 seconds. Successful reconciliation MUST reset the backoff;
+// transport establishment or changes in desired media state alone MUST NOT.
+// There is no attempt-count or per-Intent-revision retry limit. Disconnect or
+// Agent destruction MUST cancel pending retries. Retrying does not bypass
+// authorization or extend an expired authorization lease.
 //
 // WHIP/WHEP clients never receive this message; their lifecycle is governed by
 // their respective HTTP/SDP protocols.
