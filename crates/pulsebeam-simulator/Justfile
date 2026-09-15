@@ -3,14 +3,11 @@ set tempdir := "/tmp"
 
 root := "../.."
 
-# Run deterministic simulation plans, optionally filtered.
-test filter="":
-    #!/usr/bin/env bash
-    set -euo pipefail
-    cd "{{ root }}"
-    args=(nextest run --cargo-profile sim -p pulsebeam-simulator --no-fail-fast)
-    if [[ -n "{{ filter }}" ]]; then args+=("{{ filter }}"); fi
-    cargo "${args[@]}"
+test-fast:
+    cargo nextest run --cargo-profile sim -p pulsebeam-simulator --no-fail-fast -E 'not test(/::slow::/)'
+
+test-slow:
+    cargo nextest run --cargo-profile sim -p pulsebeam-simulator --no-fail-fast -E 'test(/::slow::/)'
 
 # Replay one exact simulation seed.
 replay seed filter="":

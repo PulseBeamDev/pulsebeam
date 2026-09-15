@@ -233,10 +233,13 @@ fn screen_camera_viewer_room() -> Room {
 /// (Both streams reaching quality 3 is impossible here on purpose: camera f (1.25M) + screen
 /// (2.5M) = 3.75M exceeds the ~3.0 Mbit/s estimate on a 3.5 Mbit/s link. The focused camera wins;
 /// the background screen pauses.)
-#[test]
-fn priority_reconfiguration_quality_churn_test() {
-    for seed in QOS_SEEDS {
-        LocalNodeSim::new()
+mod slow {
+    use super::*;
+
+    #[test]
+    fn priority_reconfiguration_quality_churn_test() {
+        for seed in QOS_SEEDS {
+            LocalNodeSim::new()
             .with_rng_seed(seed)
             .with_bandwidth(3_500_000)
             .with_room(screen_camera_viewer_room())
@@ -307,20 +310,20 @@ fn priority_reconfiguration_quality_churn_test() {
                     },
                 },
             ]);
+        }
     }
-}
 
-/// `priority` gates `min_height`: a lower-priority stream's floor must not preempt a
-/// higher-priority stream's target when the two cannot both fit.
-///
-/// SPEC / RED under today's allocator (same root cause as the reconfiguration test, isolated to a
-/// single static subscription). The background screen's oversized 2.5 Mbit/s floor is guaranteed
-/// ahead of the focused camera's 720p target, capping the camera at the middle layer. Under the
-/// ruled priority-gate contract the focused camera reaches its top layer and the screen yields.
-#[test]
-fn low_priority_floor_yields_to_high_priority_target_test() {
-    for seed in QOS_SEEDS {
-        LocalNodeSim::new()
+    /// `priority` gates `min_height`: a lower-priority stream's floor must not preempt a
+    /// higher-priority stream's target when the two cannot both fit.
+    ///
+    /// SPEC / RED under today's allocator (same root cause as the reconfiguration test, isolated to a
+    /// single static subscription). The background screen's oversized 2.5 Mbit/s floor is guaranteed
+    /// ahead of the focused camera's 720p target, capping the camera at the middle layer. Under the
+    /// ruled priority-gate contract the focused camera reaches its top layer and the screen yields.
+    #[test]
+    fn low_priority_floor_yields_to_high_priority_target_test() {
+        for seed in QOS_SEEDS {
+            LocalNodeSim::new()
             .with_rng_seed(seed)
             .with_bandwidth(3_500_000)
             .with_room(screen_camera_viewer_room())
@@ -348,17 +351,17 @@ fn low_priority_floor_yields_to_high_priority_target_test() {
                     min_quality: 3,
                 },
             ]);
+        }
     }
-}
 
-/// The droppable counterpart to `low_priority_floor_yields_to_high_priority_target`: with the
-/// screen explicitly droppable (`min_height=0`), Pass 1 skips it and the focused camera reaches its
-/// top layer today. This isolates the bug to `min_height`: the same scenario differing only in the
-/// floor is green here and red there.
-#[test]
-fn droppable_background_yields_to_focused_camera_test() {
-    for seed in QOS_SEEDS {
-        LocalNodeSim::new()
+    /// The droppable counterpart to `low_priority_floor_yields_to_high_priority_target`: with the
+    /// screen explicitly droppable (`min_height=0`), Pass 1 skips it and the focused camera reaches its
+    /// top layer today. This isolates the bug to `min_height`: the same scenario differing only in the
+    /// floor is green here and red there.
+    #[test]
+    fn droppable_background_yields_to_focused_camera_test() {
+        for seed in QOS_SEEDS {
+            LocalNodeSim::new()
             .with_rng_seed(seed)
             .with_bandwidth(3_500_000)
             .with_room(screen_camera_viewer_room())
@@ -390,18 +393,18 @@ fn droppable_background_yields_to_focused_camera_test() {
                     },
                 },
             ]);
+        }
     }
-}
 
-/// `target_height=0` means off: the server forwards nothing for a hidden stream and frees its
-/// bandwidth for the streams that are actually on screen. The link fits only one camera at its top
-/// layer, so the visible camera reaches `f` only if the hidden one is truly off. A second plain
-/// (constant-rate) camera stands in for the hidden stream so the check turns on the target-0
-/// semantics, not on a variable-bitrate source.
-#[test]
-fn hidden_stream_frees_its_bandwidth_test() {
-    for seed in QOS_SEEDS {
-        LocalNodeSim::new()
+    /// `target_height=0` means off: the server forwards nothing for a hidden stream and frees its
+    /// bandwidth for the streams that are actually on screen. The link fits only one camera at its top
+    /// layer, so the visible camera reaches `f` only if the hidden one is truly off. A second plain
+    /// (constant-rate) camera stands in for the hidden stream so the check turns on the target-0
+    /// semantics, not on a variable-bitrate source.
+    #[test]
+    fn hidden_stream_frees_its_bandwidth_test() {
+        for seed in QOS_SEEDS {
+            LocalNodeSim::new()
             .with_rng_seed(seed)
             .with_bandwidth(4_000_000)
             .with_room(
@@ -438,18 +441,79 @@ fn hidden_stream_frees_its_bandwidth_test() {
                     },
                 },
             ]);
+        }
     }
-}
 
-/// A settled allocation holds its layer: once the viewer's request stops changing and the link is
-/// steady, the forwarded layer must not oscillate. This is the instability guard that the endpoint
-/// and byte-count checks cannot see.
-#[test]
-fn steady_state_allocation_does_not_churn_test() {
-    for seed in QOS_SEEDS {
-        LocalNodeSim::new()
+    /// A settled allocation holds its layer: once the viewer's request stops changing and the link is
+    /// steady, the forwarded layer must not oscillate. This is the instability guard that the endpoint
+    /// and byte-count checks cannot see.
+    #[test]
+    fn steady_state_allocation_does_not_churn_test() {
+        for seed in QOS_SEEDS {
+            LocalNodeSim::new()
+                .with_rng_seed(seed)
+                .with_bandwidth(3_500_000)
+                .with_room(
+                    Room::new("room1")
+                        .with_participant(Participant::publisher("camera", &["q", "h", "f"]))
+                        .with_participant(Participant::manual_subscriber("viewer", 1)),
+                )
+                .run(vec![
+                    Step::Run {
+                        description: "Establish connection and discover the camera",
+                        duration: Duration::from_secs(5),
+                    },
+                    Step::SubscribeToQos {
+                        description: "Camera at 720p with room to spare",
+                        participant: "viewer",
+                        targets: &[("camera", 720, 360, 100)],
+                    },
+                    Step::Run {
+                        description: "Let the allocation reach steady state",
+                        duration: Duration::from_secs(20),
+                    },
+                    Step::CheckForwardedQuality {
+                        description: "The camera settles on its top layer",
+                        origin: "camera",
+                        min_quality: 3,
+                    },
+                    Step::Run {
+                        description: "Soak the steady allocation",
+                        duration: Duration::from_secs(60),
+                    },
+                    Step::CheckForwardedQuality {
+                        description: "The camera holds its top layer through the soak",
+                        origin: "camera",
+                        min_quality: 3,
+                    },
+                    Step::Expect {
+                        description: "A settled stream does not oscillate on a steady link",
+                        participant: "viewer",
+                        property: Property::QualityReversalsBelow {
+                            origin: "camera",
+                            max: 0,
+                        },
+                    },
+                ]);
+        }
+    }
+
+    /// Congestion control is a closed loop, and the return half of it is a network path too.
+    ///
+    /// Every plan that came before this one configured impairment only on the SFU-to-participant
+    /// direction, so transport feedback arrived perfectly however bad the forward path was. An
+    /// estimator validated that way has been tested against half of a real network: it has never seen
+    /// a TWCC report vanish, arrive out of order, or arrive twice. This asserts the estimate still
+    /// converges and the stream still holds a layer when the feedback path is as lossy as the media
+    /// path - which on a mobile uplink it usually is, and worse.
+    #[test]
+    fn estimate_converges_when_feedback_is_lossy_test() {
+        for seed in QOS_SEEDS {
+            let mut link = LinkProfile::cellular();
+            link.bandwidth_bps = Some(3_000_000);
+            LocalNodeSim::new()
             .with_rng_seed(seed)
-            .with_bandwidth(3_500_000)
+            .with_link(link)
             .with_room(
                 Room::new("room1")
                     .with_participant(Participant::publisher("camera", &["q", "h", "f"]))
@@ -461,37 +525,102 @@ fn steady_state_allocation_does_not_churn_test() {
                     duration: Duration::from_secs(5),
                 },
                 Step::SubscribeToQos {
-                    description: "Camera at 720p with room to spare",
+                    description: "Viewer asks for 720p",
                     participant: "viewer",
-                    targets: &[("camera", 720, 360, 100)],
+                    targets: &[("camera", 720, 180, 100)],
                 },
                 Step::Run {
-                    description: "Let the allocation reach steady state",
-                    duration: Duration::from_secs(20),
-                },
-                Step::CheckForwardedQuality {
-                    description: "The camera settles on its top layer",
-                    origin: "camera",
-                    min_quality: 3,
-                },
-                Step::Run {
-                    description: "Soak the steady allocation",
+                    description: "Converge with feedback that is itself being lost and reordered",
                     duration: Duration::from_secs(60),
                 },
-                Step::CheckForwardedQuality {
-                    description: "The camera holds its top layer through the soak",
-                    origin: "camera",
-                    min_quality: 3,
+                Step::Expect {
+                    description: "The estimate still finds most of the link through lossy feedback",
+                    participant: "viewer",
+                    property: Property::EstimateMeetsNeed { percent: 60 },
                 },
                 Step::Expect {
-                    description: "A settled stream does not oscillate on a steady link",
+                    description: "Degraded feedback does not drive the sender into congestion",
+                    participant: "viewer",
+                    property: Property::CongestionLossBelow(5),
+                },
+                // Looser than the clean-link plans on purpose. Burst loss in both directions
+                // makes shedding a layer and climbing back the *correct* response, and each such
+                // cycle is a reversal, so demanding near-zero would assert the link is quiet
+                // rather than that the allocator is stable. What must not happen is churn without
+                // end; the convergence and congestion claims above pin the rest.
+                Step::Expect {
+                    description: "The forwarded layer settles rather than churning without end",
                     participant: "viewer",
                     property: Property::QualityReversalsBelow {
                         origin: "camera",
-                        max: 0,
+                        max: 5,
                     },
                 },
             ]);
+        }
+    }
+
+    /// Reordering is a normal internet condition, not a fault, and it is the one this suite has never
+    /// modelled: packets arriving late enough to overtake their successors.
+    ///
+    /// The failure it provokes is specific - a receiver that treats a gap as loss will request a
+    /// keyframe for a packet that was merely late, and a stream that does that repeatedly never holds
+    /// a decodable run. So the assertions here are about *not over-reacting*: the stream keeps
+    /// delivering frames and keeps its layer, rather than churning keyframes.
+    #[test]
+    fn a_reordering_path_does_not_churn_keyframes_test() {
+        for seed in QOS_SEEDS {
+            let mut link = LinkProfile::fiber();
+            link.bandwidth_bps = Some(3_000_000);
+            // Markedly worse than the wifi default, so the assertion is about tolerating reordering rather
+            // than about whether it happened to occur.
+            link.reorder = Reorder {
+                probability: 0.03,
+                delay: Duration::from_millis(40),
+            };
+            link.duplicate = 0.01;
+            LocalNodeSim::new()
+                .with_rng_seed(seed)
+                .with_link(link)
+                .with_room(
+                    Room::new("room1")
+                        .with_participant(Participant::publisher("camera", &["q", "h", "f"]))
+                        .with_participant(Participant::manual_subscriber("viewer", 1)),
+                )
+                .run(vec![
+                    Step::Run {
+                        description: "Establish connection and discover the camera",
+                        duration: Duration::from_secs(5),
+                    },
+                    Step::SubscribeToQos {
+                        description: "Viewer asks for 720p",
+                        participant: "viewer",
+                        targets: &[("camera", 720, 180, 100)],
+                    },
+                    Step::Run {
+                        description: "Run on a path that reorders and duplicates",
+                        duration: Duration::from_secs(60),
+                    },
+                    Step::CheckForwardedQualityReached {
+                        description: "The camera still reaches its top layer despite reordering",
+                        origin: "camera",
+                        min_quality: 3,
+                    },
+                    Step::Expect {
+                        description: "Late packets are not mistaken for congestion",
+                        participant: "viewer",
+                        property: Property::CongestionLossBelow(5),
+                    },
+                    Step::Expect {
+                        description: "A late packet does not cost the stream its layer",
+                        participant: "viewer",
+                        property: Property::QualityReversalsBelow {
+                            origin: "camera",
+                            max: 1,
+                        },
+                    },
+                ]);
+        }
     }
 }
 
@@ -2038,131 +2167,6 @@ fn a_stream_returns_after_a_total_outage_test() {
                 property: Property::EstimateMeetsNeed { percent: 70 },
             },
         ]);
-}
-
-/// Congestion control is a closed loop, and the return half of it is a network path too.
-///
-/// Every plan that came before this one configured impairment only on the SFU-to-participant
-/// direction, so transport feedback arrived perfectly however bad the forward path was. An
-/// estimator validated that way has been tested against half of a real network: it has never seen
-/// a TWCC report vanish, arrive out of order, or arrive twice. This asserts the estimate still
-/// converges and the stream still holds a layer when the feedback path is as lossy as the media
-/// path - which on a mobile uplink it usually is, and worse.
-#[test]
-fn estimate_converges_when_feedback_is_lossy_test() {
-    for seed in QOS_SEEDS {
-        let mut link = LinkProfile::cellular();
-        link.bandwidth_bps = Some(3_000_000);
-        LocalNodeSim::new()
-            .with_rng_seed(seed)
-            .with_link(link)
-            .with_room(
-                Room::new("room1")
-                    .with_participant(Participant::publisher("camera", &["q", "h", "f"]))
-                    .with_participant(Participant::manual_subscriber("viewer", 1)),
-            )
-            .run(vec![
-                Step::Run {
-                    description: "Establish connection and discover the camera",
-                    duration: Duration::from_secs(5),
-                },
-                Step::SubscribeToQos {
-                    description: "Viewer asks for 720p",
-                    participant: "viewer",
-                    targets: &[("camera", 720, 180, 100)],
-                },
-                Step::Run {
-                    description: "Converge with feedback that is itself being lost and reordered",
-                    duration: Duration::from_secs(60),
-                },
-                Step::Expect {
-                    description: "The estimate still finds most of the link through lossy feedback",
-                    participant: "viewer",
-                    property: Property::EstimateMeetsNeed { percent: 60 },
-                },
-                Step::Expect {
-                    description: "Degraded feedback does not drive the sender into congestion",
-                    participant: "viewer",
-                    property: Property::CongestionLossBelow(5),
-                },
-                // Looser than the clean-link plans on purpose. Burst loss in both directions
-                // makes shedding a layer and climbing back the *correct* response, and each such
-                // cycle is a reversal, so demanding near-zero would assert the link is quiet
-                // rather than that the allocator is stable. What must not happen is churn without
-                // end; the convergence and congestion claims above pin the rest.
-                Step::Expect {
-                    description: "The forwarded layer settles rather than churning without end",
-                    participant: "viewer",
-                    property: Property::QualityReversalsBelow {
-                        origin: "camera",
-                        max: 5,
-                    },
-                },
-            ]);
-    }
-}
-
-/// Reordering is a normal internet condition, not a fault, and it is the one this suite has never
-/// modelled: packets arriving late enough to overtake their successors.
-///
-/// The failure it provokes is specific - a receiver that treats a gap as loss will request a
-/// keyframe for a packet that was merely late, and a stream that does that repeatedly never holds
-/// a decodable run. So the assertions here are about *not over-reacting*: the stream keeps
-/// delivering frames and keeps its layer, rather than churning keyframes.
-#[test]
-fn a_reordering_path_does_not_churn_keyframes_test() {
-    for seed in QOS_SEEDS {
-        let mut link = LinkProfile::fiber();
-        link.bandwidth_bps = Some(3_000_000);
-        // Markedly worse than the wifi default, so the assertion is about tolerating reordering rather
-        // than about whether it happened to occur.
-        link.reorder = Reorder {
-            probability: 0.03,
-            delay: Duration::from_millis(40),
-        };
-        link.duplicate = 0.01;
-        LocalNodeSim::new()
-            .with_rng_seed(seed)
-            .with_link(link)
-            .with_room(
-                Room::new("room1")
-                    .with_participant(Participant::publisher("camera", &["q", "h", "f"]))
-                    .with_participant(Participant::manual_subscriber("viewer", 1)),
-            )
-            .run(vec![
-                Step::Run {
-                    description: "Establish connection and discover the camera",
-                    duration: Duration::from_secs(5),
-                },
-                Step::SubscribeToQos {
-                    description: "Viewer asks for 720p",
-                    participant: "viewer",
-                    targets: &[("camera", 720, 180, 100)],
-                },
-                Step::Run {
-                    description: "Run on a path that reorders and duplicates",
-                    duration: Duration::from_secs(60),
-                },
-                Step::CheckForwardedQualityReached {
-                    description: "The camera still reaches its top layer despite reordering",
-                    origin: "camera",
-                    min_quality: 3,
-                },
-                Step::Expect {
-                    description: "Late packets are not mistaken for congestion",
-                    participant: "viewer",
-                    property: Property::CongestionLossBelow(5),
-                },
-                Step::Expect {
-                    description: "A late packet does not cost the stream its layer",
-                    participant: "viewer",
-                    property: Property::QualityReversalsBelow {
-                        origin: "camera",
-                        max: 1,
-                    },
-                },
-            ]);
-    }
 }
 
 /// Determinism is the guarantee every other plan in this suite rests on.
