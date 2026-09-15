@@ -301,6 +301,17 @@ mod v1_intent_tests {
             id
         }
 
+        fn audio_origin(&mut self, mid: &str) -> crate::entity::AudioOrigin {
+            let participant = crate::entity::ParticipantId::new();
+            let (_, track) = make_audio_track(participant, Mid::from(mid));
+            let origin = crate::entity::AudioOrigin {
+                participant,
+                track: track.id(),
+            };
+            self.participant.add_v1_test_track(track);
+            origin
+        }
+
         fn video(&mut self, mid: &str) -> String {
             let (_, track) = make_video_track(
                 crate::entity::ParticipantId::new(),
@@ -319,6 +330,18 @@ mod v1_intent_tests {
         fn lock_video_playout(&mut self, mid: &str) {
             self.participant
                 .lock_v1_test_playout(MediaKind::Video, Mid::from(mid));
+        }
+
+        fn remove_track(&mut self, track_id: TrackId) {
+            self.participant.v1_test_remove_track(track_id);
+        }
+
+        fn forward_audio(&mut self, origin: crate::entity::AudioOrigin) {
+            self.participant.v1_test_forward_audio(origin);
+        }
+
+        fn update_media_quality(&mut self) {
+            self.participant.v1_test_update_media_quality();
         }
 
         fn sender(&mut self, index: u32, kind: TrackKind, mid: &str) -> TrackId {
@@ -750,6 +773,71 @@ mod v1_intent_tests {
             ]
         );
         assert!(mapping.video.is_some_and(|video| video.tracks.is_empty()));
+    }
+
+    #[test]
+    fn auto_audio_reassigns_after_a_retained_preference_becomes_unavailable() {
+        let mut fixture = V1IntentFixture::new();
+        fixture.receiver(8, "audio", MediaKind::Audio);
+        let retained = fixture.audio_origin("retained");
+        let automatic = fixture.audio_origin("automatic");
+
+        let V1IntentResult::Mapping(mapping) = fixture.apply(media_signaling::Intent {
+            revision: 1,
+            send: None,
+            receive: receive(vec![], vec![audio(retained.track.as_str())], 0),
+        }) else {
+            panic!("expected mapping")
+        };
+        assert_eq!(
+            mapping.audio.unwrap().tracks,
+            vec![media_signaling::TrackMapping {
+                receiver_index: 8,
+                track_id: retained.track.as_str(),
+            }]
+        );
+
+        fixture.remove_track(retained.track);
+        assert!(
+            fixture
+                .participant
+                .v1_test_mapping()
+                .audio
+                .is_some_and(|audio| audio.tracks.is_empty())
+        );
+        fixture.forward_audio(automatic);
+
+        let mapping = fixture.participant.v1_test_mapping();
+        assert_eq!(mapping.intent_revision, 1);
+        assert_eq!(
+            mapping.audio.unwrap().tracks,
+            vec![media_signaling::TrackMapping {
+                receiver_index: 8,
+                track_id: automatic.track.as_str(),
+            }]
+        );
+        assert_eq!(
+            fixture.participant.v1_test_intent().unwrap().audio[0].track_id,
+            retained.track.as_str()
+        );
+    }
+
+    #[test]
+    fn media_quality_changes_do_not_change_the_mapping() {
+        let mut fixture = V1IntentFixture::new();
+        fixture.receiver(7, "video", MediaKind::Video);
+        let video_id = fixture.video("remote-video");
+        let V1IntentResult::Mapping(before) = fixture.apply(media_signaling::Intent {
+            revision: 1,
+            send: None,
+            receive: receive(vec![video(video_id)], vec![], 0),
+        }) else {
+            panic!("expected mapping")
+        };
+
+        fixture.update_media_quality();
+
+        assert_eq!(fixture.participant.v1_test_mapping(), before);
     }
 
     #[test]

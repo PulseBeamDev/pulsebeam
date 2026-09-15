@@ -573,6 +573,25 @@ impl Participant {
         self.signaling.v1_intent()
     }
 
+    #[cfg(test)]
+    pub(crate) fn v1_test_remove_track(&mut self, track_id: TrackId) {
+        assert!(self.on_tracks_unpublished(&[track_id]));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn v1_test_forward_audio(&mut self, origin: crate::entity::AudioOrigin) {
+        let mut packet = crate::rtp::RtpPacket::default();
+        packet.ext_vals.audio_level = Some(-20);
+        self.downstream
+            .on_forward_audio_rtp(origin, &packet, &mut self.stream_writer);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn v1_test_update_media_quality(&mut self) {
+        self.downstream
+            .update_bitrate(Instant::now(), str0m::bwe::Bitrate::from(50_000));
+    }
+
     pub fn apply(&mut self, effect: ParticipantEffect, track_handle: Option<TrackHandle>) {
         match effect {
             ParticipantEffect::ParticipantsChanged { added, removed } => {
