@@ -6,6 +6,7 @@ use crate::participant::intent::{AudioIntent, VideoIntent as Intent};
 use pulsebeam_proto::prelude::*;
 use pulsebeam_proto::signaling;
 use pulsebeam_proto::signaling_v1 as media_signaling;
+use std::collections::{BTreeMap, BTreeSet};
 use str0m::channel::ChannelId;
 use str0m::media::Mid;
 
@@ -964,6 +965,240 @@ fn audio_shape(items: &[signaling::AudioBinding]) -> Vec<(String, String)> {
         .collect()
 }
 
+/// Schedules validated v1 state as the shortest sequence which preserves the
+/// Catalog/Mapping causal invariant at every committed message boundary.
+#[derive(Default)]
+pub(crate) struct V1OutputScheduler {
+    desired: Option<V1DesiredState>,
+    delivered_catalog: Option<media_signaling::CatalogSnapshot>,
+    delivered_mapping: Option<media_signaling::Mapping>,
+    catalog_revision: u64,
+    pending: Option<V1Pending>,
+}
+
+#[derive(Clone)]
+struct V1DesiredState {
+    catalog: media_signaling::CatalogSnapshot,
+    mapping: media_signaling::Mapping,
+}
+
+struct V1Pending {
+    bytes: Vec<u8>,
+    commit: V1Commit,
+}
+
+enum V1Commit {
+    Catalog {
+        catalog: media_signaling::CatalogSnapshot,
+        revision: u64,
+    },
+    Mapping(media_signaling::Mapping),
+}
+
+impl V1OutputScheduler {
+    /// The caller supplies complete, already validated desired state. Replacing
+    /// it while bytes are in flight intentionally does not alter those bytes.
+    pub(crate) fn stage(
+        &mut self,
+        catalog: media_signaling::CatalogSnapshot,
+        mapping: media_signaling::Mapping,
+    ) {
+        self.desired = Some(V1DesiredState { catalog, mapping });
+    }
+
+    pub(crate) fn poll(&mut self) -> Option<Vec<u8>> {
+        if let Some(pending) = &self.pending {
+            return Some(pending.bytes.clone());
+        }
+
+        let desired = self.desired.as_ref()?;
+        let (message, commit) = match &self.delivered_catalog {
+            None => {
+                let revision = self.catalog_revision.checked_add(1)?;
+                (
+                    media_signaling::ServerMessage {
+                        payload: Some(media_signaling::server_message::Payload::Catalog(
+                            media_signaling::Catalog {
+                                revision,
+                                state: Some(media_signaling::catalog::State::Snapshot(
+                                    desired.catalog.clone(),
+                                )),
+                            },
+                        )),
+                    },
+                    V1Commit::Catalog {
+                        catalog: desired.catalog.clone(),
+                        revision,
+                    },
+                )
+            }
+            Some(delivered_catalog) if delivered_catalog != &desired.catalog => {
+                let cleared = self
+                    .delivered_mapping
+                    .as_ref()
+                    .map(|mapping| clear_tracks_absent_from(&desired.catalog, mapping));
+                if let Some(cleared) =
+                    cleared.filter(|mapping| self.delivered_mapping.as_ref() != Some(mapping))
+                {
+                    (mapping_message(cleared.clone()), V1Commit::Mapping(cleared))
+                } else {
+                    let revision = self.catalog_revision.checked_add(1)?;
+                    (
+                        catalog_delta_message(revision, delivered_catalog, &desired.catalog),
+                        V1Commit::Catalog {
+                            catalog: desired.catalog.clone(),
+                            revision,
+                        },
+                    )
+                }
+            }
+            Some(_) if self.delivered_mapping.as_ref() != Some(&desired.mapping) => {
+                if self.delivered_mapping.is_none() && mapping_is_empty(&desired.mapping) {
+                    return None;
+                }
+                (
+                    mapping_message(desired.mapping.clone()),
+                    V1Commit::Mapping(desired.mapping.clone()),
+                )
+            }
+            Some(_) => return None,
+        };
+        let bytes = pulsebeam_proto::codec::encode_server(&message).ok()?;
+        self.pending = Some(V1Pending {
+            bytes: bytes.clone(),
+            commit,
+        });
+        Some(bytes)
+    }
+
+    pub(crate) fn commit_sent(&mut self) {
+        let Some(pending) = self.pending.take() else {
+            debug_assert!(false, "v1 output commit requires a pending message");
+            return;
+        };
+        match pending.commit {
+            V1Commit::Catalog { catalog, revision } => {
+                self.delivered_catalog = Some(catalog);
+                self.catalog_revision = revision;
+            }
+            V1Commit::Mapping(mapping) => self.delivered_mapping = Some(mapping),
+        }
+    }
+
+    /// Reliable ordered channels retry the one retained encoded message. No
+    /// state is rolled back: a later `poll` returns the same bytes.
+    pub(crate) fn retry_pending(&mut self) {}
+}
+
+fn mapping_message(mapping: media_signaling::Mapping) -> media_signaling::ServerMessage {
+    media_signaling::ServerMessage {
+        payload: Some(media_signaling::server_message::Payload::Mapping(mapping)),
+    }
+}
+
+fn mapping_is_empty(mapping: &media_signaling::Mapping) -> bool {
+    mapping
+        .video
+        .as_ref()
+        .is_none_or(|tracks| tracks.tracks.is_empty())
+        && mapping
+            .audio
+            .as_ref()
+            .is_none_or(|tracks| tracks.tracks.is_empty())
+}
+
+fn clear_tracks_absent_from(
+    catalog: &media_signaling::CatalogSnapshot,
+    mapping: &media_signaling::Mapping,
+) -> media_signaling::Mapping {
+    let known: BTreeSet<_> = catalog.tracks.iter().map(|track| &track.track_id).collect();
+    let retain = |tracks: &Option<media_signaling::TrackMappings>| {
+        tracks.as_ref().and_then(|tracks| {
+            let tracks: Vec<_> = tracks
+                .tracks
+                .iter()
+                .filter(|track| known.contains(&track.track_id))
+                .cloned()
+                .collect();
+            (!tracks.is_empty()).then_some(media_signaling::TrackMappings { tracks })
+        })
+    };
+    media_signaling::Mapping {
+        intent_revision: mapping.intent_revision,
+        video: retain(&mapping.video),
+        audio: retain(&mapping.audio),
+    }
+}
+
+fn catalog_delta_message(
+    revision: u64,
+    delivered: &media_signaling::CatalogSnapshot,
+    desired: &media_signaling::CatalogSnapshot,
+) -> media_signaling::ServerMessage {
+    let old_participants: BTreeMap<_, _> = delivered
+        .participants
+        .iter()
+        .map(|participant| (&participant.participant_id, participant))
+        .collect();
+    let new_participants: BTreeMap<_, _> = desired
+        .participants
+        .iter()
+        .map(|participant| (&participant.participant_id, participant))
+        .collect();
+    let old_tracks: BTreeMap<_, _> = delivered
+        .tracks
+        .iter()
+        .map(|track| (&track.track_id, track))
+        .collect();
+    let new_tracks: BTreeMap<_, _> = desired
+        .tracks
+        .iter()
+        .map(|track| (&track.track_id, track))
+        .collect();
+    let removed_participant_ids: Vec<_> = old_participants
+        .keys()
+        .filter(|id| !new_participants.contains_key(*id))
+        .map(|id| (*id).clone())
+        .collect();
+    let removed_participants: BTreeSet<_> = removed_participant_ids.iter().cloned().collect();
+    let delta = media_signaling::CatalogDelta {
+        added_participants: new_participants
+            .iter()
+            .filter(|(id, _)| !old_participants.contains_key(*id))
+            .map(|(_, participant)| (*participant).clone())
+            .collect(),
+        removed_participant_ids,
+        added_tracks: new_tracks
+            .iter()
+            .filter(|(id, _)| !old_tracks.contains_key(*id))
+            .map(|(_, track)| (*track).clone())
+            .collect(),
+        removed_track_ids: old_tracks
+            .iter()
+            .filter(|(id, track)| {
+                !new_tracks.contains_key(*id)
+                    && !removed_participants.contains(&track.participant_id)
+            })
+            .map(|(id, _)| (*id).clone())
+            .collect(),
+    };
+    debug_assert!(
+        !delta.added_participants.is_empty()
+            || !delta.removed_participant_ids.is_empty()
+            || !delta.added_tracks.is_empty()
+            || !delta.removed_track_ids.is_empty(),
+        "catalog delta must not be empty"
+    );
+    media_signaling::ServerMessage {
+        payload: Some(media_signaling::server_message::Payload::Catalog(
+            media_signaling::Catalog {
+                revision,
+                state: Some(media_signaling::catalog::State::Delta(delta)),
+            },
+        )),
+    }
+}
+
 pub struct Signaling {
     ctx: LogCtx,
     pub cid: Option<ChannelId>,
@@ -1352,6 +1587,135 @@ impl Signaling {
 
     pub(crate) fn retry_pending(&mut self) {
         let _ = self.pending_commit.take();
+    }
+}
+
+#[cfg(test)]
+mod v1_output_tests {
+    use super::*;
+
+    fn catalog(tracks: &[(&str, &str)]) -> media_signaling::CatalogSnapshot {
+        media_signaling::CatalogSnapshot {
+            participants: vec![media_signaling::Participant {
+                participant_id: "participant".to_owned(),
+                participant_external_id: "alice".to_owned(),
+            }],
+            tracks: tracks
+                .iter()
+                .map(|(track_id, label)| media_signaling::RemoteTrack {
+                    track_id: (*track_id).to_owned(),
+                    participant_id: "participant".to_owned(),
+                    kind: media_signaling::TrackKind::Video.into(),
+                    label: (*label).to_owned(),
+                })
+                .collect(),
+        }
+    }
+
+    fn mapping(track_id: &str) -> media_signaling::Mapping {
+        media_signaling::Mapping {
+            intent_revision: 0,
+            video: (!track_id.is_empty()).then(|| media_signaling::TrackMappings {
+                tracks: vec![media_signaling::TrackMapping {
+                    receiver_index: 0,
+                    track_id: track_id.to_owned(),
+                }],
+            }),
+            audio: None,
+        }
+    }
+
+    fn next(scheduler: &mut V1OutputScheduler) -> media_signaling::ServerMessage {
+        let bytes = scheduler.poll().expect("scheduled output");
+        pulsebeam_proto::codec::decode_server(&bytes).expect("valid server output")
+    }
+
+    #[test]
+    fn first_output_is_a_nonzero_catalog_snapshot() {
+        let mut scheduler = V1OutputScheduler::default();
+        scheduler.stage(catalog(&[("track-a", "camera")]), mapping("track-a"));
+
+        let message = next(&mut scheduler);
+        let Some(media_signaling::server_message::Payload::Catalog(catalog)) = message.payload
+        else {
+            panic!("first output must be catalog");
+        };
+        assert_eq!(catalog.revision, 1);
+        assert!(matches!(
+            catalog.state,
+            Some(media_signaling::catalog::State::Snapshot(_))
+        ));
+    }
+
+    #[test]
+    fn additions_are_catalogued_before_the_mapping_references_them() {
+        let mut scheduler = V1OutputScheduler::default();
+        scheduler.stage(catalog(&[]), mapping(""));
+        let _ = next(&mut scheduler);
+        scheduler.commit_sent();
+
+        scheduler.stage(catalog(&[("track-a", "camera")]), mapping("track-a"));
+        let message = next(&mut scheduler);
+        let Some(media_signaling::server_message::Payload::Catalog(catalog)) = message.payload
+        else {
+            panic!("addition must begin with catalog");
+        };
+        assert_eq!(catalog.revision, 2);
+        let Some(media_signaling::catalog::State::Delta(delta)) = catalog.state else {
+            panic!("addition must be a delta");
+        };
+        assert_eq!(delta.added_tracks.len(), 1);
+        assert_eq!(delta.added_tracks[0].track_id, "track-a");
+        assert!(delta.removed_track_ids.is_empty());
+        scheduler.commit_sent();
+
+        let message = next(&mut scheduler);
+        assert!(matches!(
+            message.payload,
+            Some(media_signaling::server_message::Payload::Mapping(_))
+        ));
+    }
+
+    #[test]
+    fn mapped_removals_clear_mapping_before_catalog_delta() {
+        let mut scheduler = V1OutputScheduler::default();
+        scheduler.stage(catalog(&[("track-a", "camera")]), mapping("track-a"));
+        let _ = next(&mut scheduler);
+        scheduler.commit_sent();
+        let _ = next(&mut scheduler);
+        scheduler.commit_sent();
+
+        scheduler.stage(catalog(&[]), mapping(""));
+        let message = next(&mut scheduler);
+        let Some(media_signaling::server_message::Payload::Mapping(mapping)) = message.payload
+        else {
+            panic!("removal must first clear mapping");
+        };
+        assert!(mapping.video.is_none());
+        scheduler.commit_sent();
+
+        let message = next(&mut scheduler);
+        let Some(media_signaling::server_message::Payload::Catalog(catalog)) = message.payload
+        else {
+            panic!("clear must be followed by catalog removal");
+        };
+        let Some(media_signaling::catalog::State::Delta(delta)) = catalog.state else {
+            panic!("removal must be a delta");
+        };
+        assert_eq!(delta.removed_track_ids, ["track-a"]);
+    }
+
+    #[test]
+    fn failed_write_retries_identical_bytes_without_advancing_state() {
+        let mut scheduler = V1OutputScheduler::default();
+        scheduler.stage(catalog(&[]), mapping(""));
+
+        let first = scheduler.poll().expect("first write");
+        scheduler.retry_pending();
+        let retry = scheduler.poll().expect("retry write");
+        assert_eq!(first, retry);
+        scheduler.commit_sent();
+        assert!(scheduler.poll().is_none());
     }
 }
 
