@@ -45,7 +45,7 @@ jobs:
           tool: nextest
 
       - name: Run tests
-        run: crates/pulsebeam-rtc/scripts/run-browser-matrix.sh --platform linux-x86_64 --include-root-tests
+        run: just test
 
       - name: Upload RTC browser evidence
         if: always()

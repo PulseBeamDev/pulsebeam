@@ -19,7 +19,7 @@ check:
     just --justfile apps/meet/Justfile check
     just --justfile docs/Justfile check
     just --fmt --check
-    @for file in agents/pulsebeam-agent-native/Justfile agents/pulsebeam-agent-web/Justfile agents/react/Justfile apps/meet/Justfile crates/pulsebeam/Justfile crates/pulsebeam-ebpf/Justfile crates/pulsebeam-simulator/Justfile crates/pulsebeam-testdata/Justfile docs/Justfile tools/Justfile; do just --justfile "$file" --fmt --check; done
+    @for file in agents/pulsebeam-agent-core/Justfile agents/pulsebeam-agent-native/Justfile agents/pulsebeam-agent-web/Justfile agents/react/Justfile apps/meet/Justfile crates/pulsebeam/Justfile crates/pulsebeam-cli/Justfile crates/pulsebeam-core/Justfile crates/pulsebeam-ebpf/Justfile crates/pulsebeam-proto/Justfile crates/pulsebeam-routing/Justfile crates/pulsebeam-rtc/Justfile crates/pulsebeam-runtime/Justfile crates/pulsebeam-simulator/Justfile crates/pulsebeam-testdata/Justfile docs/Justfile tools/Justfile; do just --justfile "$file" --fmt --check; done
 
 fix:
     cargo fmt --all
@@ -28,22 +28,48 @@ fix:
     just --justfile agents/react/Justfile fix
     just --justfile apps/meet/Justfile fix
 
-# Run workspace unit tests and deterministic simulation plans.
-test:
-    crates/pulsebeam-rtc/scripts/provision-browsers.sh --platform linux-x86_64 --verify-only
-    just prepare
-    cargo test --workspace --exclude pulsebeam-simulator --features pulsebeam/sim
-    cargo nextest run --cargo-profile sim -p pulsebeam-simulator --no-fail-fast
-    just --justfile agents/pulsebeam-agent-web/Justfile test
-    just --justfile agents/react/Justfile test
-    PULSEBEAM_BROWSER_BINARY="{{ justfile_directory() }}/target/pulsebeam-rtc-browsers/linux-x86_64/bin/chrome" just browser
+# Run every owner fast gate.
+test-fast:
+    just --justfile agents/pulsebeam-agent-core/Justfile test-fast
+    just --justfile agents/pulsebeam-agent-native/Justfile test-fast
+    just --justfile agents/pulsebeam-agent-web/Justfile test-fast
+    just --justfile agents/react/Justfile test-fast
+    just --justfile apps/meet/Justfile test-fast
+    just --justfile crates/pulsebeam/Justfile test-fast
+    just --justfile crates/pulsebeam-cli/Justfile test-fast
+    just --justfile crates/pulsebeam-core/Justfile test-fast
+    just --justfile crates/pulsebeam-ebpf/Justfile test-fast
+    just --justfile crates/pulsebeam-proto/Justfile test-fast
+    just --justfile crates/pulsebeam-routing/Justfile test-fast
+    just --justfile crates/pulsebeam-rtc/Justfile test-fast
+    just --justfile crates/pulsebeam-runtime/Justfile test-fast
+    just --justfile crates/pulsebeam-simulator/Justfile test-fast
+    just --justfile crates/pulsebeam-testdata/Justfile test-fast
+    just --justfile docs/Justfile test-fast
+    just --justfile tools/Justfile test-fast
 
-# Build browser fixtures in package ownership order, then run every Rust-owned
-# BiDi contract serially. This intentionally fails when Chrome is unavailable.
-browser: prepare
-    just --justfile agents/pulsebeam-agent-web/Justfile browser-fixture
-    just --justfile agents/react/Justfile browser-fixture
-    just --justfile agents/pulsebeam-agent-web/Justfile browser-run
+# Run every owner slow gate. RTC precedes Web to provision the shared browser cache.
+test-slow:
+    just --justfile agents/pulsebeam-agent-core/Justfile test-slow
+    just --justfile agents/pulsebeam-agent-native/Justfile test-slow
+    just --justfile agents/react/Justfile test-slow
+    just --justfile apps/meet/Justfile test-slow
+    just --justfile crates/pulsebeam/Justfile test-slow
+    just --justfile crates/pulsebeam-cli/Justfile test-slow
+    just --justfile crates/pulsebeam-core/Justfile test-slow
+    just --justfile crates/pulsebeam-ebpf/Justfile test-slow
+    just --justfile crates/pulsebeam-proto/Justfile test-slow
+    just --justfile crates/pulsebeam-routing/Justfile test-slow
+    just --justfile crates/pulsebeam-rtc/Justfile test-slow
+    just --justfile agents/pulsebeam-agent-web/Justfile test-slow
+    just --justfile crates/pulsebeam-runtime/Justfile test-slow
+    just --justfile crates/pulsebeam-simulator/Justfile test-slow
+    just --justfile crates/pulsebeam-testdata/Justfile test-slow
+    just --justfile docs/Justfile test-slow
+    just --justfile tools/Justfile test-slow
+
+# Run all non-privileged owner test gates, with fast gates before slow gates.
+test: test-fast test-slow
 
 # Build the static Meet export.
 meet-build:

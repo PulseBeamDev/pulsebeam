@@ -17,3 +17,11 @@
 
 * Prefer names, types, structure, and tests over narration. Keep comments for non-obvious constraints or workarounds, and do not add TODOs unless requested.
 * Iterate with the narrowest verification exposed by the owning package or `Justfile`, then use the repository gates exposed by the root `Justfile` before handoff.
+
+## Test routing
+
+* When practical, run the exact affected test, then the nearest owner's fast gate while iterating. Use aggregate slow only for final acceptance; run an exact slow test only while actively debugging that boundary.
+* Root `just test` is the complete non-privileged final gate. Run it once, not per slice or review.
+* Builders report actual evidence. Reviewers reuse it unless it is missing, stale, contradictory, or needed to reproduce a finding; orchestrators request missing owning evidence rather than duplicating broad runs.
+* Final slow evidence is reusable until a repair invalidates it. At renewed final acceptance, rerun affected slow owners, including every affected browser boundary for shared changes, and reuse unaffected passing evidence.
+* Privileged eBPF and advisory seed sweeps remain outside ordinary test routing.
