@@ -418,12 +418,18 @@ impl Participant {
                 renew,
             )) => {
                 let Some(token) = crate::participant::effect::RenewalToken::new(renew.token) else {
-                    self.signaling.stage_authorization_rejected();
-                    return Ok(());
+                    return self
+                        .signaling
+                        .stage_authorization_rejected()
+                        .then_some(())
+                        .ok_or(signaling::SignalingError::ResponseBackpressured);
                 };
                 if self.pending_authorization_request.is_some() {
-                    self.signaling.stage_authorization_rejected();
-                    return Ok(());
+                    return self
+                        .signaling
+                        .stage_authorization_rejected()
+                        .then_some(())
+                        .ok_or(signaling::SignalingError::ResponseBackpressured);
                 }
                 let request_id = crate::participant::effect::AuthorizationRequestId::new(
                     self.next_authorization_request,
@@ -1901,6 +1907,29 @@ mod authorization_tests {
                 ))
             }) if code == pulsebeam_proto::signaling_v1::ErrorCode::AuthorizationRejected as i32
         )));
+
+        for expiry in 0..signaling::MAX_PENDING_AUTHORIZATION_RESPONSES {
+            assert!(participant.signaling.stage_authorization(expiry as i64));
+        }
+        assert!(matches!(
+            participant.handle_v1_input(&empty, &mut sink),
+            Err(signaling::SignalingError::ResponseBackpressured)
+        ));
+        let queued = participant
+            .signaling
+            .poll(&snapshot)
+            .expect("queued authorization")
+            .bytes;
+        participant.signaling.commit_sent();
+        participant.handle_v1_input(&empty, &mut sink).unwrap();
+        assert!(matches!(
+            pulsebeam_proto::codec::decode_server(&queued),
+            Ok(pulsebeam_proto::signaling_v1::ServerMessage {
+                payload: Some(
+                    pulsebeam_proto::signaling_v1::server_message::Payload::Authorization(_)
+                )
+            })
+        ));
     }
 }
 

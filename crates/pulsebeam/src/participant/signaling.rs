@@ -20,6 +20,8 @@ pub enum SignalingError {
     DecodeFailed,
     #[error("Request complexity limit exceeded")]
     ComplexityExceeded,
+    #[error("Signaling response queue is full")]
+    ResponseBackpressured,
 }
 
 pub enum SignalingInputEvent {
@@ -1167,7 +1169,7 @@ enum AuthorizationResponse {
     Rejected,
 }
 
-const MAX_PENDING_AUTHORIZATION_RESPONSES: usize = 64;
+pub(crate) const MAX_PENDING_AUTHORIZATION_RESPONSES: usize = 64;
 
 #[allow(
     dead_code,
