@@ -321,41 +321,7 @@ impl Participant {
             return Self::v1_protocol_error(intent.revision, "video receiver capacity exceeded");
         }
 
-        let snapshot = self.downstream.signaling_snapshot();
-        let track = |id: &str| {
-            snapshot
-                .publications
-                .iter()
-                .find(|meta| meta.id.as_str() == id)
-        };
-        let video: Vec<_> = intent
-            .video
-            .iter()
-            .filter_map(|request| {
-                let meta = track(&request.track_id)?;
-                (meta.id.kind() == TrackKind::Video).then(|| VideoReceiverRequest {
-                    intent: crate::participant::intent::VideoIntent {
-                        track_id: meta.id,
-                        target_height: request.target_height,
-                        min_height: request.min_height,
-                        min_fps: request.min_fps,
-                        priority: request.priority,
-                    },
-                    playout: request.playout,
-                })
-            })
-            .collect();
-        let audio: Vec<_> = intent
-            .audio
-            .iter()
-            .filter_map(|request| {
-                let meta = track(&request.track_id)?;
-                (meta.id.kind() == TrackKind::Audio).then(|| AudioReceiverRequest {
-                    track_id: meta.id,
-                    playout: request.playout,
-                })
-            })
-            .collect();
+        let (video, audio) = self.v1_receiver_requests(&intent);
 
         let publications = match self.preview_native_publications(&intent.publications) {
             Ok(preview) => preview,
@@ -422,6 +388,83 @@ impl Participant {
             });
         self.signaling.accept_v1_intent(intent);
         signaling::V1IntentResult::Mapping(self.v1_mapping())
+    }
+
+    /// Reconcile retained v1 receive desire when the visible catalog changes.
+    /// This intentionally does not consult legacy signaling intent fields.
+    fn reconcile_v1_catalog(&mut self) {
+        let Some(intent) = self.signaling.v1_intent().cloned() else {
+            return;
+        };
+        let (video, audio) = self.v1_receiver_requests(&intent);
+        let Ok(video_preview) = self.downstream.preview_video_receiver_assignments(&video) else {
+            return;
+        };
+        let Ok(audio_preview) = self.downstream.preview_audio_receiver_assignments(&audio) else {
+            return;
+        };
+        if self
+            .downstream
+            .commit_video_receiver_assignments(video_preview)
+            .is_err()
+            || self
+                .downstream
+                .commit_audio_receiver_assignments(audio_preview)
+                .is_err()
+        {
+            debug_assert!(
+                false,
+                "a current catalog reconciliation preview must commit"
+            );
+            return;
+        }
+        self.downstream
+            .set_audio_intent(crate::participant::intent::AudioIntent {
+                pinned: audio.iter().map(|request| request.track_id).collect(),
+                auto: intent.audio_auto,
+            });
+    }
+
+    fn v1_receiver_requests(
+        &self,
+        intent: &signaling::V1Intent,
+    ) -> (Vec<VideoReceiverRequest>, Vec<AudioReceiverRequest>) {
+        let snapshot = self.downstream.signaling_snapshot();
+        let track = |id: &str| {
+            snapshot
+                .publications
+                .iter()
+                .find(|meta| meta.id.as_str() == id)
+        };
+        let video = intent
+            .video
+            .iter()
+            .filter_map(|request| {
+                let meta = track(&request.track_id)?;
+                (meta.id.kind() == TrackKind::Video).then(|| VideoReceiverRequest {
+                    intent: crate::participant::intent::VideoIntent {
+                        track_id: meta.id,
+                        target_height: request.target_height,
+                        min_height: request.min_height,
+                        min_fps: request.min_fps,
+                        priority: request.priority,
+                    },
+                    playout: request.playout,
+                })
+            })
+            .collect();
+        let audio = intent
+            .audio
+            .iter()
+            .filter_map(|request| {
+                let meta = track(&request.track_id)?;
+                (meta.id.kind() == TrackKind::Audio).then(|| AudioReceiverRequest {
+                    track_id: meta.id,
+                    playout: request.playout,
+                })
+            })
+            .collect();
+        (video, audio)
     }
 
     fn v1_protocol_error(revision: u64, message: &str) -> signaling::V1IntentResult {
@@ -674,6 +717,7 @@ impl Participant {
         self.signaling.mark_assignments_dirty();
         let intents = self.signaling.reconcile();
         self.downstream.apply_signaling_intents(intents);
+        self.reconcile_v1_catalog();
     }
 
     fn on_tracks_unpublished(&mut self, tracks: &[TrackId]) -> bool {
@@ -686,6 +730,7 @@ impl Participant {
             self.signaling.mark_assignments_dirty();
             let intents = self.signaling.reconcile();
             self.downstream.apply_signaling_intents(intents);
+            self.reconcile_v1_catalog();
         }
         removed
     }
@@ -1640,5 +1685,81 @@ mod upstream_route_table_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod v1_catalog_reconciliation_tests {
+    use super::*;
+    use crate::participant::event::test_utils::MockParticipantSink;
+    use crate::track::test_utils::make_audio_track;
+
+    fn participant() -> Participant {
+        let room = crate::entity::RoomExternalId::new("room").unwrap();
+        Participant::new(
+            ParticipantConfig {
+                manual_sub: true,
+                room_id: crate::entity::RoomId::from_external(&room),
+                participant_id: crate::entity::ParticipantId::new(),
+                connection_id: crate::entity::ConnectionId::new(),
+                profile: ConnectionProfile::Native,
+                rtc: Rtc::new(std::time::Instant::now()),
+                resources: NegotiatedResources::empty_for_test(),
+            },
+            ShardId::new(0),
+            1_200,
+            1_200,
+        )
+    }
+
+    #[test]
+    fn retained_unavailable_audio_is_mapped_when_published_and_unmapped_when_removed() {
+        let mut participant = participant();
+        participant.downstream.add_slot(SlotConfig {
+            media_index: 7,
+            mid: Mid::from("receive-audio"),
+            kind: MediaKind::Audio,
+            ..SlotConfig::default()
+        });
+        let remote = crate::entity::ParticipantId::new();
+        let (upstream, track) = make_audio_track(remote, Mid::from("remote-audio"));
+        let track_id = track.id().as_str();
+        let mut sink = MockParticipantSink::new();
+
+        let accepted = participant.apply_v1_intent(
+            pulsebeam_proto::signaling_v1::Intent {
+                revision: 1,
+                send: None,
+                receive: Some(pulsebeam_proto::signaling_v1::ReceiveIntent {
+                    video: None,
+                    audio: Some(pulsebeam_proto::signaling_v1::AudioIntent {
+                        tracks: vec![pulsebeam_proto::signaling_v1::AudioTrackIntent {
+                            track_id: track_id.clone(),
+                            options: None,
+                        }],
+                        mode: pulsebeam_proto::signaling_v1::AudioMode::ExplicitOnly.into(),
+                    }),
+                }),
+            },
+            &mut sink,
+        );
+        assert!(
+            matches!(accepted, signaling::V1IntentResult::Mapping(ref mapping) if mapping.audio.as_ref().is_some_and(|audio| audio.tracks.is_empty()))
+        );
+
+        participant.on_track_published(TrackHandle::default(), track);
+        assert_eq!(
+            participant.v1_mapping().audio.unwrap().tracks,
+            vec![pulsebeam_proto::signaling_v1::TrackMapping {
+                receiver_index: 7,
+                track_id: track_id.clone(),
+            }]
+        );
+
+        assert!(participant.on_tracks_unpublished(&[upstream.meta.id]));
+        let mapping = participant.v1_mapping();
+        assert_eq!(mapping.intent_revision, 1);
+        assert!(mapping.video.is_some_and(|video| video.tracks.is_empty()));
+        assert!(mapping.audio.is_some_and(|audio| audio.tracks.is_empty()));
     }
 }

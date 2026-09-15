@@ -88,6 +88,11 @@ pub struct NegotiatedResources {
 }
 
 impl NegotiatedResources {
+    #[cfg(test)]
+    pub(crate) fn empty_for_test() -> Self {
+        Self { media: Vec::new() }
+    }
+
     pub fn media(&self, mid: Mid) -> Option<NegotiatedMedia> {
         self.media.iter().find(|media| media.mid == mid).copied()
     }

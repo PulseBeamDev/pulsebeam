@@ -370,6 +370,10 @@ impl Signaling {
         self.v1_revision
     }
 
+    pub(crate) fn v1_intent(&self) -> Option<&V1Intent> {
+        self.v1_intent.as_ref()
+    }
+
     pub(crate) fn reconcile(&self) -> SignalingIntents {
         SignalingIntents {
             video: self.last_client_intents.clone(),
