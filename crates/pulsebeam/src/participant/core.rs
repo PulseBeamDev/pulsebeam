@@ -1247,33 +1247,7 @@ impl Participant {
         }
 
         if self.signaling_terminated {
-            if self.transport.needs_drain() {
-                let Some(rtc_deadline) = self.poll_rtc(now, events) else {
-                    self.transport.set_drain_result(None);
-                    events.exit();
-                    return None;
-                };
-                self.transport.set_drain_result(Some(rtc_deadline));
-            }
-            if self.transport.is_exited() {
-                return None;
-            }
-            if self.signaling.needs_poll() {
-                if let Some(output) = self.signaling.poll(&self.downstream.signaling_snapshot()) {
-                    if self
-                        .transport
-                        .write_channel(output.cid, true, &output.bytes)
-                        && self.signaling.commit_sent()
-                    {
-                        self.disconnect(if self.authorization_expired {
-                            DisconnectReason::AuthorizationExpired
-                        } else {
-                            DisconnectReason::SignalingTerminated
-                        });
-                    }
-                }
-            }
-            return self.transport.deadline();
+            return self.poll_terminal(now, events);
         }
 
         // Entered once per poll cycle rather than per packet, so every str0m line produced by
@@ -1303,6 +1277,9 @@ impl Participant {
                     return None;
                 };
                 self.transport.set_drain_result(Some(rtc_deadline));
+            }
+            if self.signaling_terminated {
+                return self.poll_terminal(now, events);
             }
             debug_assert!(self.transport.deadline().is_some());
 
@@ -1402,6 +1379,38 @@ impl Participant {
 
             return Some(deadline);
         }
+    }
+
+    fn poll_terminal(
+        &mut self,
+        now: Instant,
+        events: &mut impl ParticipantSink,
+    ) -> Option<Instant> {
+        if self.transport.needs_drain() {
+            let Some(rtc_deadline) = self.poll_rtc(now, events) else {
+                self.transport.set_drain_result(None);
+                events.exit();
+                return None;
+            };
+            self.transport.set_drain_result(Some(rtc_deadline));
+        }
+        if self.transport.is_exited() {
+            return None;
+        }
+        if self.signaling.needs_poll()
+            && let Some(output) = self.signaling.poll(&self.downstream.signaling_snapshot())
+            && self
+                .transport
+                .write_channel(output.cid, true, &output.bytes)
+            && self.signaling.commit_sent()
+        {
+            self.disconnect(if self.authorization_expired {
+                DisconnectReason::AuthorizationExpired
+            } else {
+                DisconnectReason::SignalingTerminated
+            });
+        }
+        self.transport.deadline()
     }
 
     fn advance_rtc_clock(&mut self, candidate: Instant, wall_now: Instant) {
@@ -2365,6 +2374,68 @@ mod v1_server_integration_tests {
             }) if code == pulsebeam_proto::signaling_v1::ErrorCode::InvalidMessage as i32
         ));
         assert_eq!(sink.exit_count, 1);
+    }
+
+    #[test]
+    fn in_poll_terminal_event_fences_later_rtc_slow_and_media_work() {
+        let (mut participant, cid) = participant();
+        let now = Instant::now();
+        participant.last_slow_poll = now - SLOW_POLL_INTERVAL;
+        participant.set_v1_test_write_channel_result(false);
+        participant
+            .transport
+            .enqueue_test_rtc_event(Event::ChannelData(ChannelData {
+                id: cid,
+                binary: true,
+                data: vec![0xff],
+            }));
+        let intent =
+            pulsebeam_proto::codec::encode_client(&pulsebeam_proto::signaling_v1::ClientMessage {
+                payload: Some(
+                    pulsebeam_proto::signaling_v1::client_message::Payload::Intent(
+                        pulsebeam_proto::signaling_v1::Intent {
+                            revision: 1,
+                            send: None,
+                            receive: None,
+                        },
+                    ),
+                ),
+            })
+            .unwrap();
+        participant
+            .transport
+            .enqueue_test_rtc_event(Event::ChannelData(ChannelData {
+                id: cid,
+                binary: true,
+                data: intent,
+            }));
+        participant
+            .transport
+            .enqueue_mutation(TransportMutation::Data {
+                channel: cid,
+                bytes: b"later media work".to_vec(),
+            });
+        let previous_slow_poll = participant.last_slow_poll;
+        let mut sink = MockParticipantSink::new();
+
+        participant.poll(now, &mut sink);
+
+        let attempts = participant.v1_test_channel_write_attempts();
+        assert_eq!(attempts.len(), 1);
+        assert!(matches!(
+            pulsebeam_proto::codec::decode_server(&attempts[0]),
+            Ok(pulsebeam_proto::signaling_v1::ServerMessage {
+                payload: Some(
+                    pulsebeam_proto::signaling_v1::server_message::Payload::Error(
+                        pulsebeam_proto::signaling_v1::Error { fatal: true, .. }
+                    )
+                )
+            })
+        ));
+        assert_eq!(participant.v1_test_mapping().intent_revision, 0);
+        assert_eq!(participant.last_slow_poll, previous_slow_poll);
+        assert_eq!(participant.transport.test_pending_mutation_count(), 1);
+        assert_eq!(sink.exit_count, 0);
     }
 }
 

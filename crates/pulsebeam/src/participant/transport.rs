@@ -112,6 +112,8 @@ pub(crate) struct Transport {
     write_channel_result: Option<bool>,
     #[cfg(test)]
     channel_write_attempts: Vec<Vec<u8>>,
+    #[cfg(test)]
+    test_rtc_events: VecDeque<Event>,
     #[cfg(debug_assertions)]
     egress_guard: crate::rtp::egress_guard::EgressGuard,
     #[cfg(feature = "sim")]
@@ -143,6 +145,8 @@ impl Transport {
             write_channel_result: None,
             #[cfg(test)]
             channel_write_attempts: Vec::new(),
+            #[cfg(test)]
+            test_rtc_events: VecDeque::new(),
             #[cfg(debug_assertions)]
             egress_guard: crate::rtp::egress_guard::EgressGuard::new(),
             #[cfg(feature = "sim")]
@@ -213,6 +217,10 @@ impl Transport {
     }
 
     pub(crate) fn poll_output(&mut self) -> Result<Option<TransportPollOutput>, RtcError> {
+        #[cfg(test)]
+        if let Some(event) = self.test_rtc_events.pop_front() {
+            return Ok(Some(TransportPollOutput::Event(Box::new(event))));
+        }
         if !self.rtc.is_alive() {
             return Ok(None);
         }
@@ -253,6 +261,16 @@ impl Transport {
     #[cfg(test)]
     pub(crate) fn test_channel_write_attempts(&self) -> &[Vec<u8>] {
         &self.channel_write_attempts
+    }
+
+    #[cfg(test)]
+    pub(crate) fn enqueue_test_rtc_event(&mut self, event: Event) {
+        self.test_rtc_events.push_back(event);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_pending_mutation_count(&self) -> usize {
+        self.pending_mutations.len()
     }
 
     pub(crate) fn channel_config(

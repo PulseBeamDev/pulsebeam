@@ -368,6 +368,22 @@ struct Scheduler {
 }
 impl Scheduler {
     fn stage(&mut self, desired: Desired) {
+        let desired_changed = self.desired.as_ref().is_some_and(|current| {
+            current.catalog != desired.catalog || current.mapping != desired.mapping
+        });
+        if desired_changed
+            && self.pending.as_ref().is_some_and(|pending| {
+                matches!(
+                    pending.commit,
+                    Commit::Mapping {
+                        stale_ack: true,
+                        ..
+                    }
+                )
+            })
+        {
+            self.pending = None;
+        }
         self.desired = Some(desired)
     }
     fn request_resnapshot(&mut self) {
@@ -1016,6 +1032,29 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_mapping_retries_exact_bytes_after_desired_state_changes() {
+        let catalog = v1::CatalogSnapshot {
+            participants: Vec::new(),
+            tracks: Vec::new(),
+        };
+        let mut scheduler = Scheduler::default();
+        scheduler.stage(Desired {
+            catalog: catalog.clone(),
+            mapping: mapping(1),
+        });
+        scheduler.poll();
+        scheduler.commit_sent();
+        let rejected = scheduler.poll().expect("ordinary mapping");
+
+        scheduler.stage(Desired {
+            catalog,
+            mapping: mapping(2),
+        });
+
+        assert_eq!(scheduler.poll().as_deref(), Some(rejected.as_slice()));
+    }
+
+    #[test]
     fn stale_acknowledgement_waits_for_removal_causality_and_uses_current_mapping() {
         let track = v1::RemoteTrack {
             track_id: "track".to_owned(),
@@ -1040,13 +1079,20 @@ mod tests {
                 participants: Vec::new(),
                 tracks: vec![track],
             },
-            mapping: mapped,
+            mapping: mapped.clone(),
         });
         scheduler.poll();
         scheduler.commit_sent();
         scheduler.poll();
         scheduler.commit_sent();
         scheduler.request_stale_ack();
+
+        let rejected = scheduler.poll().expect("rejected stale acknowledgement");
+        assert!(matches!(
+            pulsebeam_proto::codec::decode_server(&rejected),
+            Ok(v1::ServerMessage { payload: Some(v1::server_message::Payload::Mapping(mapping)) })
+                if mapping == mapped
+        ));
         scheduler.stage(Desired {
             catalog: v1::CatalogSnapshot {
                 participants: Vec::new(),
@@ -1056,6 +1102,7 @@ mod tests {
         });
 
         let clear = scheduler.poll().expect("clear removed mapping");
+        assert_ne!(clear, rejected);
         assert!(matches!(
             pulsebeam_proto::codec::decode_server(&clear),
             Ok(v1::ServerMessage { payload: Some(v1::server_message::Payload::Mapping(mapping)) })
@@ -1076,5 +1123,7 @@ mod tests {
             Ok(v1::ServerMessage { payload: Some(v1::server_message::Payload::Mapping(mapping)) })
                 if mapping == empty
         ));
+        scheduler.commit_sent();
+        assert!(scheduler.poll().is_none());
     }
 }
