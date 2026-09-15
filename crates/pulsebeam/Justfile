@@ -3,6 +3,12 @@ set tempdir := "/tmp"
 
 root := "../.."
 
+test-fast:
+    cargo test -p pulsebeam --features sim
+
+test-slow:
+    @:
+
 # Build the server with dev, release, or profiling settings.
 build profile="dev":
     #!/usr/bin/env bash

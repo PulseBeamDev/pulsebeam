@@ -3,6 +3,12 @@ set tempdir := "/tmp"
 
 root := "../.."
 
+test-fast:
+    cd {{ root }} && cargo test -p pulsebeam-ebpf
+
+test-slow:
+    @:
+
 # Build the BPF programs with the verifier target.
 build:
     cd {{ root }} && cargo +nightly build -Z build-std=core --target bpfel-unknown-none -p pulsebeam-ebpf --release

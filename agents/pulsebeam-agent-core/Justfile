@@ -1,0 +1,7 @@
+set shell := ["bash", "-euc"]
+
+test-fast:
+    cargo test -p pulsebeam-agent-core
+
+test-slow:
+    @:

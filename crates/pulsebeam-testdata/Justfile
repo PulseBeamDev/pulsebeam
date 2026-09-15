@@ -1,6 +1,12 @@
 set shell := ["bash", "-euc"]
 set tempdir := "/tmp"
 
+test-fast:
+    cargo test -p pulsebeam-testdata
+
+test-slow:
+    @:
+
 # Generate the three CBR H.264 fixtures from a local source video.
 fixtures source="src/driving.mp4":
     scripts/generate-fixtures.sh "{{ source }}"

@@ -9,8 +9,11 @@ check:
     cd {{ root }} && cargo check -p pulsebeam-agent-native --all-targets
 
 # Run native runtime and generated-facing contract tests.
-test:
+test-fast:
     cd {{ root }} && cargo test -p pulsebeam-agent-native
+
+test-slow:
+    @:
 
 # Generate Swift and Kotlin sources from the core and native namespaces.
 bindings:

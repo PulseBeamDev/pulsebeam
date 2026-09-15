@@ -50,7 +50,7 @@ Rust / Swift / Kotlin / other hosts
 Focused commands are:
 
 * `just --justfile agents/pulsebeam-agent-native/Justfile check`;
-* `just --justfile agents/pulsebeam-agent-native/Justfile test`;
+* `just --justfile agents/pulsebeam-agent-native/Justfile test-fast`;
 * `just --justfile agents/pulsebeam-agent-native/Justfile bindings` to write Swift and Kotlin build artifacts under `target/uniffi/native`.
 
 Binding generation reads the native dynamic library and emits both the `pulsebeam_agent_core` and `pulsebeam_agent_native` namespaces; native bindings reference core-owned records instead of redefining them in the native namespace. Generated sources are build artifacts, not hand-edited repository source.

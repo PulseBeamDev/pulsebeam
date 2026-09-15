@@ -9,5 +9,11 @@ build: prepare
 check: prepare
     pnpm run check
 
+test-fast:
+    @:
+
+test-slow:
+    @:
+
 prepare:
     pnpm install --frozen-lockfile --ignore-scripts

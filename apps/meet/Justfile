@@ -18,6 +18,12 @@ check: format-check
     just --justfile ../../agents/react/Justfile build
     pnpm run check
 
+test-fast:
+    @:
+
+test-slow:
+    @:
+
 # Install only after the direct React dependency has prepared its owned assets.
 prepare:
     just --justfile ../../agents/react/Justfile prepare

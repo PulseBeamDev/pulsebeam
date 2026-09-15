@@ -3,6 +3,12 @@ set tempdir := "/tmp"
 
 root := ".."
 
+test-fast:
+    @:
+
+test-slow:
+    @:
+
 # Apply automated Rust fixes and formatting, then run the static gate.
 fix:
     cd {{ root }} && cargo fix --allow-dirty
