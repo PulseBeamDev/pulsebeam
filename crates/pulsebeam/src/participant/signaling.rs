@@ -1,59 +1,25 @@
 use ahash::{HashMap, HashMapExt, HashSet, HashSetExt};
-
-use crate::entity::TrackId;
-use crate::log::{LogCtx, plog_info, plog_warn};
-use crate::participant::intent::{AudioIntent, VideoIntent as Intent};
-use pulsebeam_proto::prelude::*;
-use pulsebeam_proto::signaling;
-use pulsebeam_proto::signaling_v1 as media_signaling;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use str0m::channel::ChannelId;
-use str0m::media::Mid;
 
-const MAX_SIGNALING_MSG_SIZE: usize = 16 * 1024; // 16 KB (Signaling shouldn't be huge)
+use crate::log::LogCtx;
+use pulsebeam_proto::prelude::*;
+use pulsebeam_proto::signaling_v1 as v1;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SignalingError {
-    #[error("Packet too large")]
-    OversizedPacket,
-    #[error("Invalid Protobuf format")]
+    #[error("Invalid v1 signaling message")]
     DecodeFailed,
-    #[error("Request complexity limit exceeded")]
-    ComplexityExceeded,
     #[error("Signaling response queue is full")]
     ResponseBackpressured,
-}
-
-pub enum SignalingInputEvent {
-    UpstreamTrackState { mid: Mid, active: bool },
-}
-
-#[derive(Clone)]
-pub(crate) struct SignalingVideoBinding {
-    pub(crate) mid: String,
-    pub(crate) track_id: String,
-    pub(crate) paused: bool,
-}
-
-#[derive(Clone)]
-pub(crate) struct SignalingAudioBinding {
-    pub(crate) mid: String,
-    pub(crate) track_id: String,
-    pub(crate) level_dbov: i32,
 }
 
 pub(crate) struct SignalingSnapshot {
     pub(crate) publications: Vec<crate::track::TrackMeta>,
     pub(crate) participants: HashMap<String, String>,
-    pub(crate) video: Vec<SignalingVideoBinding>,
-    pub(crate) audio: Vec<SignalingAudioBinding>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[allow(
-    dead_code,
-    reason = "candidate replacement signaling is intentionally not routed in this slice"
-)]
 pub(crate) enum CatalogBuildError {
     #[error("catalog publication has no application label")]
     MissingLabel,
@@ -69,17 +35,15 @@ pub(crate) enum CatalogBuildError {
     IdentityMismatch,
 }
 
-#[allow(
-    dead_code,
-    reason = "candidate replacement signaling is intentionally not routed in this slice"
-)]
+fn valid_protocol_string(value: &str, max_bytes: usize) -> bool {
+    !value.is_empty() && value.len() <= max_bytes
+}
+
 pub(crate) fn build_catalog(
     recipient: crate::entity::ParticipantId,
     recipient_external_id: &str,
     snapshot: &SignalingSnapshot,
-) -> Result<media_signaling::CatalogSnapshot, CatalogBuildError> {
-    // The recipient is omitted from its own Catalog, but its external ID still
-    // participates in the room-wide uniqueness invariant.
+) -> Result<v1::CatalogSnapshot, CatalogBuildError> {
     if !valid_protocol_string(recipient_external_id, 256) {
         return Err(CatalogBuildError::ValueOutOfBounds);
     }
@@ -99,13 +63,13 @@ pub(crate) fn build_catalog(
         .participants
         .iter()
         .filter(|(id, _)| id.as_str() != recipient.as_str())
-        .map(|(id, external_id)| {
-            Ok(media_signaling::Participant {
-                participant_id: id.clone(),
-                participant_external_id: external_id.clone(),
-            })
-        })
-        .collect::<Result<_, _>>()?;
+        .map(
+            |(participant_id, participant_external_id)| v1::Participant {
+                participant_id: participant_id.clone(),
+                participant_external_id: participant_external_id.clone(),
+            },
+        )
+        .collect();
     participants.sort_by(|left, right| left.participant_id.cmp(&right.participant_id));
 
     let mut track_ids = HashSet::new();
@@ -126,8 +90,8 @@ pub(crate) fn build_catalog(
             return Err(CatalogBuildError::ValueOutOfBounds);
         }
         let kind = match meta.id.kind() {
-            crate::entity::TrackKind::Audio => media_signaling::TrackKind::Audio,
-            crate::entity::TrackKind::Video => media_signaling::TrackKind::Video,
+            crate::entity::TrackKind::Audio => v1::TrackKind::Audio,
+            crate::entity::TrackKind::Video => v1::TrackKind::Video,
             crate::entity::TrackKind::Data => continue,
         };
         if meta.id != meta.origin.derive_track_id(meta.id.kind(), &label) {
@@ -138,7 +102,7 @@ pub(crate) fn build_catalog(
         {
             return Err(CatalogBuildError::DuplicateIdentity);
         }
-        tracks.push(media_signaling::RemoteTrack {
+        tracks.push(v1::RemoteTrack {
             track_id: meta.id.as_str(),
             participant_id,
             kind: kind.into(),
@@ -146,35 +110,23 @@ pub(crate) fn build_catalog(
         });
     }
     tracks.sort_by(|left, right| left.track_id.cmp(&right.track_id));
-
-    let catalog = media_signaling::CatalogSnapshot {
+    let catalog = v1::CatalogSnapshot {
         participants,
         tracks,
     };
-    let message = media_signaling::ServerMessage {
-        payload: Some(media_signaling::server_message::Payload::Catalog(
-            media_signaling::Catalog {
-                revision: 1,
-                state: Some(media_signaling::catalog::State::Snapshot(catalog.clone())),
-            },
-        )),
+    let message = v1::ServerMessage {
+        payload: Some(v1::server_message::Payload::Catalog(v1::Catalog {
+            revision: 1,
+            state: Some(v1::catalog::State::Snapshot(catalog.clone())),
+        })),
     };
     if message.encoded_len() > pulsebeam_proto::codec::MAX_MESSAGE_SIZE {
         return Err(CatalogBuildError::SnapshotTooLarge);
     }
-
     Ok(catalog)
 }
 
-fn valid_protocol_string(value: &str, max_bytes: usize) -> bool {
-    !value.is_empty() && value.len() <= max_bytes
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[allow(
-    dead_code,
-    reason = "the replacement signaling transport installs this validated state in the next unit"
-)]
 pub(crate) enum V1OutputBuildError {
     #[error(transparent)]
     Catalog(#[from] CatalogBuildError),
@@ -192,32 +144,19 @@ pub(crate) enum V1OutputBuildError {
     DuplicateMapping,
 }
 
-/// Retains immutable identities across complete Catalog snapshots, including
-/// identities removed from the currently visible room state.
 #[derive(Default)]
-#[allow(
-    dead_code,
-    reason = "the replacement signaling transport owns commit-time history installation in the next unit"
-)]
-pub(crate) struct V1CatalogHistory {
+struct V1CatalogHistory {
     participants: HashMap<String, String>,
     tracks: HashMap<String, (String, i32, String)>,
 }
 
-#[allow(
-    dead_code,
-    reason = "the replacement signaling transport owns commit-time history installation in the next unit"
-)]
 impl V1CatalogHistory {
-    fn validate(
-        &self,
-        catalog: &media_signaling::CatalogSnapshot,
-    ) -> Result<(), V1OutputBuildError> {
+    fn validate(&self, catalog: &v1::CatalogSnapshot) -> Result<(), V1OutputBuildError> {
         for participant in &catalog.participants {
             if self
                 .participants
                 .get(&participant.participant_id)
-                .is_some_and(|external_id| external_id != &participant.participant_external_id)
+                .is_some_and(|known| known != &participant.participant_external_id)
             {
                 return Err(V1OutputBuildError::ParticipantIdentityChanged);
             }
@@ -239,8 +178,7 @@ impl V1CatalogHistory {
         Ok(())
     }
 
-    /// Record only after the corresponding Catalog state has been committed.
-    pub(crate) fn commit(&mut self, catalog: &media_signaling::CatalogSnapshot) {
+    fn commit(&mut self, catalog: &v1::CatalogSnapshot) {
         for participant in &catalog.participants {
             self.participants.insert(
                 participant.participant_id.clone(),
@@ -261,8 +199,8 @@ impl V1CatalogHistory {
 }
 
 fn validate_mapping(
-    catalog: &media_signaling::CatalogSnapshot,
-    mapping: &media_signaling::Mapping,
+    catalog: &v1::CatalogSnapshot,
+    mapping: &v1::Mapping,
 ) -> Result<(), V1OutputBuildError> {
     let tracks: BTreeMap<_, _> = catalog
         .tracks
@@ -271,8 +209,8 @@ fn validate_mapping(
         .collect();
     let mut receiver_indices = HashSet::new();
     for (mappings, expected_kind) in [
-        (&mapping.video, media_signaling::TrackKind::Video),
-        (&mapping.audio, media_signaling::TrackKind::Audio),
+        (&mapping.video, v1::TrackKind::Video),
+        (&mapping.audio, v1::TrackKind::Audio),
     ] {
         let Some(mappings) = mappings else {
             return Err(V1OutputBuildError::IncompleteMapping);
@@ -295,9 +233,6 @@ fn validate_mapping(
     Ok(())
 }
 
-/// A decoded v1 Intent after omission/default and first-occurrence handling.
-/// Track identities deliberately remain wire strings here: unavailable and
-/// wrong-kind entries are retained until a later catalog reconciliation.
 #[derive(Clone)]
 pub(crate) struct V1Intent {
     pub(crate) revision: u64,
@@ -306,7 +241,6 @@ pub(crate) struct V1Intent {
     pub(crate) audio: Vec<V1AudioIntent>,
     pub(crate) audio_auto: bool,
 }
-
 #[derive(Clone)]
 pub(crate) struct V1VideoIntent {
     pub(crate) track_id: String,
@@ -316,22 +250,18 @@ pub(crate) struct V1VideoIntent {
     pub(crate) priority: u32,
     pub(crate) playout: crate::participant::downstream::PlayoutPolicy,
 }
-
 #[derive(Clone)]
 pub(crate) struct V1AudioIntent {
     pub(crate) track_id: String,
     pub(crate) playout: crate::participant::downstream::PlayoutPolicy,
 }
-
 pub(crate) enum V1IntentResult {
-    Mapping(media_signaling::Mapping),
-    ProtocolError(media_signaling::Error),
+    Mapping(v1::Mapping),
+    ProtocolError(v1::Error),
     Reconnect,
 }
 
-fn v1_playout(
-    delay: Option<media_signaling::PlayoutDelay>,
-) -> crate::participant::downstream::PlayoutPolicy {
+fn playout(delay: Option<v1::PlayoutDelay>) -> crate::participant::downstream::PlayoutPolicy {
     delay
         .map(|delay| {
             crate::participant::downstream::PlayoutPolicy::fixed((delay.min_ms, delay.max_ms))
@@ -339,7 +269,7 @@ fn v1_playout(
         .unwrap_or(crate::participant::downstream::PlayoutPolicy::Default)
 }
 
-pub(crate) fn normalize_v1_intent(intent: media_signaling::Intent) -> V1Intent {
+pub(crate) fn normalize_v1_intent(intent: v1::Intent) -> V1Intent {
     let publications = intent
         .send
         .unwrap_or_default()
@@ -347,10 +277,10 @@ pub(crate) fn normalize_v1_intent(intent: media_signaling::Intent) -> V1Intent {
         .into_iter()
         .map(|track| crate::participant::intent::NativePublication {
             sender_index: Some(track.sender_index),
-            kind: match media_signaling::TrackKind::try_from(track.kind) {
-                Ok(media_signaling::TrackKind::Audio) => Some(crate::entity::TrackKind::Audio),
-                Ok(media_signaling::TrackKind::Video) => Some(crate::entity::TrackKind::Video),
-                Ok(media_signaling::TrackKind::Unspecified) | Err(_) => None,
+            kind: match v1::TrackKind::try_from(track.kind) {
+                Ok(v1::TrackKind::Audio) => Some(crate::entity::TrackKind::Audio),
+                Ok(v1::TrackKind::Video) => Some(crate::entity::TrackKind::Video),
+                _ => None,
             },
             label: track.label,
         })
@@ -371,15 +301,15 @@ pub(crate) fn normalize_v1_intent(intent: media_signaling::Intent) -> V1Intent {
                     min_height: options.min_height,
                     min_fps: options.min_fps,
                     priority: options.priority,
-                    playout: v1_playout(options.playout_delay),
+                    playout: playout(options.playout_delay),
                 }
             })
         })
         .collect();
     let audio = receive.audio.unwrap_or_default();
     let audio_auto = !matches!(
-        media_signaling::AudioMode::try_from(audio.mode),
-        Ok(media_signaling::AudioMode::ExplicitOnly)
+        v1::AudioMode::try_from(audio.mode),
+        Ok(v1::AudioMode::ExplicitOnly)
     );
     let mut audio_ids = HashSet::new();
     let audio = audio
@@ -390,7 +320,7 @@ pub(crate) fn normalize_v1_intent(intent: media_signaling::Intent) -> V1Intent {
                 .insert(track.track_id.clone())
                 .then(|| V1AudioIntent {
                     track_id: track.track_id,
-                    playout: v1_playout(track.options.and_then(|options| options.playout_delay)),
+                    playout: playout(track.options.and_then(|options| options.playout_delay)),
                 })
         })
         .collect();
@@ -403,987 +333,136 @@ pub(crate) fn normalize_v1_intent(intent: media_signaling::Intent) -> V1Intent {
     }
 }
 
-#[cfg(test)]
-mod v1_intent_tests {
-    use super::*;
-    use crate::control::NegotiatedResources;
-    use crate::control::controller::ConnectionProfile;
-    use crate::entity::TrackKind;
-    use crate::id::ShardId;
-    use crate::participant::core::{Participant, ParticipantConfig};
-    use crate::participant::downstream::SlotConfig;
-    use crate::participant::event::test_utils::MockParticipantSink;
-    use crate::track::LayerQuality;
-    use crate::track::test_utils::{make_audio_track, make_video_track};
-    use str0m::media::{MediaKind, SimulcastLayer};
-    use str0m::{Rtc, media::Mid};
-
-    struct V1IntentFixture {
-        participant: Participant,
-        sink: MockParticipantSink,
-    }
-
-    #[derive(Debug, PartialEq)]
-    struct V1IntentFixtureSnapshot {
-        mapping: media_signaling::Mapping,
-        revision: u64,
-        desire: Option<(u64, Vec<String>, Vec<String>, Vec<String>, bool)>,
-        publications: Vec<(u32, TrackId, bool)>,
-        published: Vec<TrackId>,
-        unpublished: Vec<TrackId>,
-        video_locked: bool,
-        audio_locked: bool,
-    }
-
-    impl V1IntentFixture {
-        fn new() -> Self {
-            let room = crate::entity::RoomExternalId::new("room").unwrap();
-            Self {
-                participant: Participant::new(
-                    ParticipantConfig {
-                        manual_sub: true,
-                        room_id: crate::entity::RoomId::from_external(&room),
-                        participant_id: crate::entity::ParticipantId::new(),
-                        participant_external_id: crate::entity::ParticipantExternalId::new("self")
-                            .unwrap(),
-                        connection_id: crate::entity::ConnectionId::new(),
-                        profile: ConnectionProfile::Native,
-                        initial_authorization_expiry: None,
-                        rtc: Rtc::new(std::time::Instant::now()),
-                        resources: NegotiatedResources::empty_for_test(),
-                    },
-                    ShardId::new(0),
-                    1_200,
-                    1_200,
-                ),
-                sink: MockParticipantSink::new(),
-            }
-        }
-
-        fn receiver(&mut self, index: u32, mid: &str, kind: MediaKind) {
-            self.participant.add_v1_test_receiver(SlotConfig {
-                media_index: index,
-                mid: Mid::from(mid),
-                kind,
-                ..SlotConfig::default()
-            });
-        }
-
-        fn audio(&mut self, mid: &str) -> String {
-            let (_, track) = make_audio_track(crate::entity::ParticipantId::new(), Mid::from(mid));
-            let id = track.id().as_str();
-            self.participant.add_v1_test_track(track);
-            id
-        }
-
-        fn audio_origin(&mut self, mid: &str) -> crate::entity::AudioOrigin {
-            let participant = crate::entity::ParticipantId::new();
-            let (_, track) = make_audio_track(participant, Mid::from(mid));
-            let origin = crate::entity::AudioOrigin {
-                participant,
-                track: track.id(),
-            };
-            self.participant.add_v1_test_track(track);
-            origin
-        }
-
-        fn video(&mut self, mid: &str) -> String {
-            let (_, track) = make_video_track(
-                crate::entity::ParticipantId::new(),
-                Mid::from(mid),
-                Vec::new(),
-            );
-            let id = track.id().as_str();
-            self.participant.add_v1_test_track(track);
-            id
-        }
-
-        fn video_with_layers(&mut self, mid: &str) -> String {
-            let (_, track) = make_video_track(
-                crate::entity::ParticipantId::new(),
-                Mid::from(mid),
-                vec![
-                    SimulcastLayer::new("q"),
-                    SimulcastLayer::new("h"),
-                    SimulcastLayer::new("f"),
-                ],
-            );
-            let id = track.id().as_str();
-            self.participant.add_v1_test_track(track);
-            id
-        }
-
-        fn apply(&mut self, intent: media_signaling::Intent) -> V1IntentResult {
-            self.participant.apply_v1_intent(intent, &mut self.sink)
-        }
-
-        fn lock_video_playout(&mut self, mid: &str) {
-            self.participant
-                .lock_v1_test_playout(MediaKind::Video, Mid::from(mid));
-        }
-
-        fn remove_track(&mut self, track_id: TrackId) {
-            self.participant.v1_test_remove_track(track_id);
-        }
-
-        fn forward_audio(&mut self, origin: crate::entity::AudioOrigin) {
-            self.participant.v1_test_forward_audio(origin);
-        }
-
-        fn reallocate_video_quality(&mut self, bitrate_bps: u64) -> Option<LayerQuality> {
-            self.participant
-                .v1_test_reallocate_video_quality(bitrate_bps)
-        }
-
-        fn sender(&mut self, index: u32, kind: TrackKind, mid: &str) -> TrackId {
-            self.participant
-                .add_v1_test_sender(index, kind, Mid::from(mid))
-        }
-
-        fn snapshot(&self) -> V1IntentFixtureSnapshot {
-            let desire = self.participant.v1_test_intent().map(|intent| {
-                (
-                    intent.revision,
-                    intent
-                        .publications
-                        .iter()
-                        .map(|track| track.label.clone())
-                        .collect(),
-                    intent
-                        .video
-                        .iter()
-                        .map(|track| track.track_id.clone())
-                        .collect(),
-                    intent
-                        .audio
-                        .iter()
-                        .map(|track| track.track_id.clone())
-                        .collect(),
-                    intent.audio_auto,
-                )
-            });
-            V1IntentFixtureSnapshot {
-                mapping: self.participant.v1_test_mapping(),
-                revision: self.participant.v1_test_mapping().intent_revision,
-                desire,
-                publications: self.participant.v1_test_publications(),
-                published: self.sink.publish_track_calls.clone(),
-                unpublished: self.sink.unpublish_track_calls.clone(),
-                video_locked: self
-                    .participant
-                    .v1_test_receiver_locked(MediaKind::Video, 7),
-                audio_locked: self
-                    .participant
-                    .v1_test_receiver_locked(MediaKind::Audio, 8),
-            }
-        }
-    }
-
-    fn receive(
-        video: Vec<media_signaling::VideoTrackIntent>,
-        audio: Vec<media_signaling::AudioTrackIntent>,
-        mode: i32,
-    ) -> Option<media_signaling::ReceiveIntent> {
-        Some(media_signaling::ReceiveIntent {
-            video: Some(media_signaling::VideoIntent { tracks: video }),
-            audio: Some(media_signaling::AudioIntent {
-                tracks: audio,
-                mode,
-            }),
-        })
-    }
-
-    fn video(track_id: String) -> media_signaling::VideoTrackIntent {
-        media_signaling::VideoTrackIntent {
-            track_id,
-            options: None,
-        }
-    }
-
-    fn audio(track_id: String) -> media_signaling::AudioTrackIntent {
-        media_signaling::AudioTrackIntent {
-            track_id,
-            options: None,
-        }
-    }
-
-    #[test]
-    fn omission_replaces_every_section_with_defaults() {
-        let normalized = normalize_v1_intent(media_signaling::Intent {
-            revision: 1,
-            send: None,
-            receive: None,
-        });
-
-        assert!(normalized.publications.is_empty());
-        assert!(normalized.video.is_empty());
-        assert!(normalized.audio.is_empty());
-        assert!(normalized.audio_auto);
-    }
-
-    #[test]
-    fn transaction_maps_both_kinds_and_rejects_stale_conflicts_without_mutation() {
-        let mut fixture = V1IntentFixture::new();
-        fixture.receiver(7, "video", MediaKind::Video);
-        fixture.receiver(8, "audio", MediaKind::Audio);
-        let video_id = fixture.video("remote-video");
-        let audio_id = fixture.audio("remote-audio");
-
-        let accepted = fixture.apply(media_signaling::Intent {
-            revision: 1,
-            send: None,
-            receive: receive(
-                vec![video(video_id.clone())],
-                vec![audio(audio_id.clone())],
-                0,
-            ),
-        });
-        let V1IntentResult::Mapping(mapping) = accepted else {
-            panic!("expected mapping")
-        };
-        assert_eq!(
-            mapping.video.as_ref().unwrap().tracks,
-            vec![media_signaling::TrackMapping {
-                receiver_index: 7,
-                track_id: video_id,
-            }]
-        );
-        assert_eq!(
-            mapping.audio.as_ref().unwrap().tracks,
-            vec![media_signaling::TrackMapping {
-                receiver_index: 8,
-                track_id: audio_id,
-            }]
-        );
-        assert!(mapping.video.is_some());
-        assert!(mapping.audio.is_some());
-        let before = fixture.snapshot();
-
-        let stale = fixture.apply(media_signaling::Intent {
-            revision: 1,
-            send: None,
-            receive: receive(
-                vec![],
-                vec![],
-                media_signaling::AudioMode::ExplicitOnly.into(),
-            ),
-        });
-        assert!(matches!(stale, V1IntentResult::Mapping(mapping) if mapping == before.mapping));
-        assert_eq!(fixture.snapshot(), before);
-    }
-
-    #[test]
-    fn prefilter_video_capacity_is_fatal_and_leaves_the_mapping_unchanged() {
-        let mut fixture = V1IntentFixture::new();
-        fixture.receiver(7, "video", MediaKind::Video);
-        let available = fixture.video("remote-video");
-        let _sender = fixture.sender(0, TrackKind::Audio, "send-audio");
-        let _new_sender = fixture.sender(1, TrackKind::Audio, "send-audio-2");
-        let _ = fixture.apply(media_signaling::Intent {
-            revision: 1,
-            send: Some(media_signaling::SendIntent {
-                tracks: vec![media_signaling::LocalTrack {
-                    sender_index: 0,
-                    kind: media_signaling::TrackKind::Audio.into(),
-                    label: "microphone".into(),
-                }],
-            }),
-            receive: receive(vec![video(available.clone())], vec![], 0),
-        });
-        let before = fixture.snapshot();
-
-        let result = fixture.apply(media_signaling::Intent {
-            revision: 2,
-            send: Some(media_signaling::SendIntent {
-                tracks: vec![
-                    media_signaling::LocalTrack {
-                        sender_index: 0,
-                        kind: media_signaling::TrackKind::Audio.into(),
-                        label: "microphone".into(),
-                    },
-                    media_signaling::LocalTrack {
-                        sender_index: 1,
-                        kind: media_signaling::TrackKind::Audio.into(),
-                        label: "auxiliary".into(),
-                    },
-                ],
-            }),
-            receive: receive(
-                vec![video(available), video("unavailable".into())],
-                vec![],
-                0,
-            ),
-        });
-        assert!(
-            matches!(result, V1IntentResult::ProtocolError(error) if error.intent_revision == Some(2))
-        );
-        assert_eq!(fixture.snapshot(), before);
-    }
-
-    #[test]
-    fn unavailable_and_wrong_kind_requests_are_retained_but_unassigned() {
-        let mut fixture = V1IntentFixture::new();
-        fixture.receiver(7, "video", MediaKind::Video);
-        fixture.receiver(9, "video-2", MediaKind::Video);
-        fixture.receiver(8, "audio", MediaKind::Audio);
-        let audio_id = fixture.audio("remote-audio");
-        let video_id = fixture.video("remote-video");
-        let wrong_kind = audio_id.clone();
-        let audio_wrong_kind = video_id.clone();
-        let result = fixture.apply(media_signaling::Intent {
-            revision: 1,
-            send: None,
-            receive: receive(
-                vec![
-                    media_signaling::VideoTrackIntent {
-                        track_id: audio_id,
-                        options: Some(media_signaling::VideoOptions {
-                            height: 720,
-                            min_height: 360,
-                            min_fps: 30,
-                            priority: 9,
-                            playout_delay: Some(media_signaling::PlayoutDelay {
-                                min_ms: 10,
-                                max_ms: 20,
-                            }),
-                        }),
-                    },
-                    media_signaling::VideoTrackIntent {
-                        track_id: "unavailable-video".into(),
-                        options: Some(media_signaling::VideoOptions {
-                            height: 180,
-                            min_height: 90,
-                            min_fps: 15,
-                            priority: 1,
-                            playout_delay: Some(media_signaling::PlayoutDelay {
-                                min_ms: 30,
-                                max_ms: 40,
-                            }),
-                        }),
-                    },
-                ],
-                vec![
-                    media_signaling::AudioTrackIntent {
-                        track_id: video_id,
-                        options: Some(media_signaling::AudioOptions {
-                            playout_delay: Some(media_signaling::PlayoutDelay {
-                                min_ms: 50,
-                                max_ms: 60,
-                            }),
-                        }),
-                    },
-                    media_signaling::AudioTrackIntent {
-                        track_id: "unavailable-audio".into(),
-                        options: Some(media_signaling::AudioOptions {
-                            playout_delay: Some(media_signaling::PlayoutDelay {
-                                min_ms: 70,
-                                max_ms: 80,
-                            }),
-                        }),
-                    },
-                ],
-                0,
-            ),
-        });
-        let V1IntentResult::Mapping(mapping) = result else {
-            panic!("expected mapping")
-        };
-        assert!(mapping.video.is_some_and(|video| video.tracks.is_empty()));
-        assert!(mapping.audio.is_some_and(|audio| audio.tracks.is_empty()));
-        let intent = fixture.participant.v1_test_intent().unwrap();
-        assert_eq!(
-            intent
-                .video
-                .iter()
-                .map(|request| (
-                    request.track_id.as_str(),
-                    request.target_height,
-                    request.min_height,
-                    request.min_fps,
-                    request.priority,
-                    request.playout,
-                ))
-                .collect::<Vec<_>>(),
-            vec![
-                (
-                    wrong_kind.as_str(),
-                    720,
-                    360,
-                    30,
-                    9,
-                    crate::participant::downstream::PlayoutPolicy::fixed((10, 20)),
-                ),
-                (
-                    "unavailable-video",
-                    180,
-                    90,
-                    15,
-                    1,
-                    crate::participant::downstream::PlayoutPolicy::fixed((30, 40)),
-                ),
-            ]
-        );
-        assert_eq!(
-            intent
-                .audio
-                .iter()
-                .map(|request| (request.track_id.as_str(), request.playout))
-                .collect::<Vec<_>>(),
-            vec![
-                (
-                    audio_wrong_kind.as_str(),
-                    crate::participant::downstream::PlayoutPolicy::fixed((50, 60)),
-                ),
-                (
-                    "unavailable-audio",
-                    crate::participant::downstream::PlayoutPolicy::fixed((70, 80)),
-                ),
-            ]
-        );
-    }
-
-    #[test]
-    fn unknown_audio_mode_defaults_to_auto_and_first_occurrence_wins() {
-        let first = normalize_v1_intent(media_signaling::Intent {
-            revision: 1,
-            send: None,
-            receive: receive(
-                vec![
-                    media_signaling::VideoTrackIntent {
-                        track_id: "video".into(),
-                        options: Some(media_signaling::VideoOptions {
-                            height: 720,
-                            ..Default::default()
-                        }),
-                    },
-                    media_signaling::VideoTrackIntent {
-                        track_id: "video".into(),
-                        options: Some(media_signaling::VideoOptions {
-                            height: 360,
-                            ..Default::default()
-                        }),
-                    },
-                ],
-                vec![
-                    media_signaling::AudioTrackIntent {
-                        track_id: "audio".into(),
-                        options: Some(media_signaling::AudioOptions {
-                            playout_delay: Some(media_signaling::PlayoutDelay {
-                                min_ms: 10,
-                                max_ms: 20,
-                            }),
-                        }),
-                    },
-                    audio("audio".into()),
-                ],
-                99,
-            ),
-        });
-        assert!(first.audio_auto);
-        assert_eq!(first.video.len(), 1);
-        assert_eq!(first.audio.len(), 1);
-        assert_eq!(first.video[0].target_height, 720);
-        assert_eq!(
-            first.audio[0].playout,
-            crate::participant::downstream::PlayoutPolicy::fixed((10, 20))
-        );
-    }
-
-    #[test]
-    fn a_fresh_omission_replaces_existing_receiver_assignments() {
-        let mut fixture = V1IntentFixture::new();
-        fixture.receiver(7, "video", MediaKind::Video);
-        fixture.receiver(8, "audio", MediaKind::Audio);
-        let video_id = fixture.video("remote-video");
-        let audio_id = fixture.audio("remote-audio");
-        let _sender = fixture.sender(0, TrackKind::Audio, "send-audio");
-        let _ = fixture.apply(media_signaling::Intent {
-            revision: 1,
-            send: Some(media_signaling::SendIntent {
-                tracks: vec![media_signaling::LocalTrack {
-                    sender_index: 0,
-                    kind: media_signaling::TrackKind::Audio.into(),
-                    label: "microphone".into(),
-                }],
-            }),
-            receive: receive(vec![video(video_id)], vec![audio(audio_id)], 0),
-        });
-        let published = fixture.sink.publish_track_calls[0];
-
-        let V1IntentResult::Mapping(mapping) = fixture.apply(media_signaling::Intent {
-            revision: 2,
-            send: None,
-            receive: None,
-        }) else {
-            panic!("expected mapping")
-        };
-        assert_eq!(mapping.intent_revision, 2);
-        assert!(mapping.video.is_some_and(|video| video.tracks.is_empty()));
-        assert!(mapping.audio.is_some_and(|audio| audio.tracks.is_empty()));
-        assert!(fixture.sink.unpublish_track_calls.contains(&published));
-        let desire = fixture.participant.v1_test_intent().unwrap();
-        assert!(desire.publications.is_empty());
-        assert!(desire.video.is_empty());
-        assert!(desire.audio.is_empty());
-        assert!(desire.audio_auto);
-    }
-
-    #[test]
-    fn audio_preferences_assign_the_feasible_capacity_prefix() {
-        let mut fixture = V1IntentFixture::new();
-        fixture.receiver(8, "audio-a", MediaKind::Audio);
-        fixture.receiver(9, "audio-b", MediaKind::Audio);
-        let ids = [
-            fixture.audio("remote-a"),
-            fixture.audio("remote-b"),
-            fixture.audio("remote-c"),
-        ];
-
-        let V1IntentResult::Mapping(mapping) = fixture.apply(media_signaling::Intent {
-            revision: 1,
-            send: None,
-            receive: receive(
-                vec![],
-                ids.clone().into_iter().map(audio).collect(),
-                media_signaling::AudioMode::ExplicitOnly.into(),
-            ),
-        }) else {
-            panic!("expected mapping")
-        };
-        assert_eq!(
-            mapping.audio.unwrap().tracks,
-            vec![
-                media_signaling::TrackMapping {
-                    receiver_index: 8,
-                    track_id: ids[0].clone()
-                },
-                media_signaling::TrackMapping {
-                    receiver_index: 9,
-                    track_id: ids[1].clone()
-                },
-            ]
-        );
-        assert!(mapping.video.is_some_and(|video| video.tracks.is_empty()));
-    }
-
-    #[test]
-    fn auto_audio_reassigns_after_a_retained_preference_becomes_unavailable() {
-        let mut fixture = V1IntentFixture::new();
-        fixture.receiver(8, "audio", MediaKind::Audio);
-        let retained = fixture.audio_origin("retained");
-        let automatic = fixture.audio_origin("automatic");
-
-        let V1IntentResult::Mapping(mapping) = fixture.apply(media_signaling::Intent {
-            revision: 1,
-            send: None,
-            receive: receive(vec![], vec![audio(retained.track.as_str())], 0),
-        }) else {
-            panic!("expected mapping")
-        };
-        assert_eq!(
-            mapping.audio.unwrap().tracks,
-            vec![media_signaling::TrackMapping {
-                receiver_index: 8,
-                track_id: retained.track.as_str(),
-            }]
-        );
-
-        fixture.remove_track(retained.track);
-        assert!(
-            fixture
-                .participant
-                .v1_test_mapping()
-                .audio
-                .is_some_and(|audio| audio.tracks.is_empty())
-        );
-        fixture.forward_audio(automatic);
-
-        let mapping = fixture.participant.v1_test_mapping();
-        assert_eq!(mapping.intent_revision, 1);
-        assert_eq!(
-            mapping.audio.unwrap().tracks,
-            vec![media_signaling::TrackMapping {
-                receiver_index: 8,
-                track_id: automatic.track.as_str(),
-            }]
-        );
-        assert_eq!(
-            fixture.participant.v1_test_intent().unwrap().audio[0].track_id,
-            retained.track.as_str()
-        );
-    }
-
-    #[test]
-    fn media_quality_changes_do_not_change_the_mapping() {
-        let mut fixture = V1IntentFixture::new();
-        fixture.receiver(7, "video", MediaKind::Video);
-        let video_id = fixture.video_with_layers("remote-video");
-        let V1IntentResult::Mapping(before) = fixture.apply(media_signaling::Intent {
-            revision: 1,
-            send: None,
-            receive: receive(
-                vec![media_signaling::VideoTrackIntent {
-                    track_id: video_id,
-                    options: Some(media_signaling::VideoOptions {
-                        height: 720,
-                        ..Default::default()
-                    }),
-                }],
-                vec![],
-                0,
-            ),
-        }) else {
-            panic!("expected mapping")
-        };
-
-        let constrained = fixture.reallocate_video_quality(100_000);
-        let unconstrained = fixture.reallocate_video_quality(3_000_000);
-
-        assert_eq!(constrained, Some(LayerQuality::Low));
-        assert_eq!(unconstrained, Some(LayerQuality::High));
-        assert_eq!(fixture.participant.v1_test_mapping(), before);
-    }
-
-    #[test]
-    fn reset_preview_returns_reconnect_without_replacing_the_mapping() {
-        let mut fixture = V1IntentFixture::new();
-        fixture.receiver(7, "video", MediaKind::Video);
-        let video_id = fixture.video("remote-video");
-        let fixed = media_signaling::VideoTrackIntent {
-            track_id: video_id.clone(),
-            options: Some(media_signaling::VideoOptions {
-                playout_delay: Some(media_signaling::PlayoutDelay {
-                    min_ms: 10,
-                    max_ms: 10,
-                }),
-                ..Default::default()
-            }),
-        };
-        let _sender = fixture.sender(0, TrackKind::Audio, "send-audio");
-        let _new_sender = fixture.sender(1, TrackKind::Audio, "send-audio-2");
-        let _ = fixture.apply(media_signaling::Intent {
-            revision: 1,
-            send: Some(media_signaling::SendIntent {
-                tracks: vec![media_signaling::LocalTrack {
-                    sender_index: 0,
-                    kind: media_signaling::TrackKind::Audio.into(),
-                    label: "microphone".into(),
-                }],
-            }),
-            receive: receive(vec![fixed], vec![], 0),
-        });
-        fixture.lock_video_playout("video");
-        let before = fixture.snapshot();
-
-        assert!(matches!(
-            fixture.apply(media_signaling::Intent {
-                revision: 2,
-                send: Some(media_signaling::SendIntent {
-                    tracks: vec![
-                        media_signaling::LocalTrack {
-                            sender_index: 0,
-                            kind: media_signaling::TrackKind::Audio.into(),
-                            label: "microphone".into(),
-                        },
-                        media_signaling::LocalTrack {
-                            sender_index: 1,
-                            kind: media_signaling::TrackKind::Audio.into(),
-                            label: "auxiliary".into(),
-                        },
-                    ]
-                }),
-                receive: receive(vec![video(video_id)], vec![], 0),
-            }),
-            V1IntentResult::Reconnect
-        ));
-        assert_eq!(fixture.snapshot(), before);
-        assert_eq!(before.published.len(), 1);
-    }
-}
-
-pub(crate) struct SignalingIntents {
-    pub(crate) video: Option<HashMap<Mid, Intent>>,
-    pub(crate) audio: Option<AudioIntent>,
-    pub(crate) playout_delay: Option<(u32, u32)>,
-}
-
 pub(crate) struct SignalingOutput {
     pub(crate) cid: ChannelId,
     pub(crate) bytes: Vec<u8>,
 }
-
-struct SignalingCommit {
-    participants: HashSet<String>,
-    publications: HashSet<String>,
-    video: Vec<signaling::VideoBinding>,
-    audio: Vec<(String, String)>,
-    video_changed: bool,
-    audio_changed: bool,
-    force_full: bool,
+struct Desired {
+    catalog: v1::CatalogSnapshot,
+    mapping: v1::Mapping,
 }
-
-/// The shape of the audio group, for deciding whether to resend it.
-///
-/// Loudness is deliberately absent: it moves with every packet, so including it
-/// would make every packet a change. The client gets a fresh level whenever the
-/// set or ordering of speakers moves, which is when it has something to redraw.
-fn audio_shape(items: &[signaling::AudioBinding]) -> Vec<(String, String)> {
-    items
-        .iter()
-        .map(|binding| {
-            debug_assert!(!binding.mid.is_empty());
-            debug_assert!(!binding.track_id.is_empty());
-            (binding.track_id.clone(), binding.mid.clone())
-        })
-        .collect()
-}
-
-/// Schedules validated v1 state as the shortest sequence which preserves the
-/// Catalog/Mapping causal invariant at every committed message boundary.
-#[derive(Default)]
-pub(crate) struct V1OutputScheduler {
-    desired: Option<V1DesiredState>,
-    delivered_catalog: Option<media_signaling::CatalogSnapshot>,
-    delivered_mapping: Option<media_signaling::Mapping>,
-    catalog_revision: u64,
-    pending: Option<V1Pending>,
-    resnapshot_requested: bool,
-}
-
-#[derive(Clone)]
-pub(crate) struct V1DesiredState {
-    catalog: media_signaling::CatalogSnapshot,
-    mapping: media_signaling::Mapping,
-}
-
-struct V1OutputState {
-    recipient_external_id: String,
-    history: V1CatalogHistory,
-    scheduler: V1OutputScheduler,
-    authorization_responses: VecDeque<AuthorizationResponse>,
-    pending_authorization: Option<Vec<u8>>,
-    authorization_expired: Option<Vec<u8>>,
-}
-
-enum AuthorizationResponse {
-    Accepted(i64),
-    Rejected,
-}
-
-pub(crate) const MAX_PENDING_AUTHORIZATION_RESPONSES: usize = 64;
-
-#[allow(
-    dead_code,
-    reason = "the replacement signaling transport supplies this state to the scheduler in the next unit"
-)]
-pub(crate) fn build_v1_desired_state(
-    history: &V1CatalogHistory,
-    recipient: crate::entity::ParticipantId,
-    recipient_external_id: &str,
-    snapshot: &SignalingSnapshot,
-    mapping: media_signaling::Mapping,
-) -> Result<V1DesiredState, V1OutputBuildError> {
-    let catalog = build_catalog(recipient, recipient_external_id, snapshot)?;
-    history.validate(&catalog)?;
-    validate_mapping(&catalog, &mapping)?;
-    Ok(V1DesiredState { catalog, mapping })
-}
-
-struct V1Pending {
+struct Pending {
     bytes: Vec<u8>,
-    commit: V1Commit,
+    commit: Commit,
 }
-
-enum V1Commit {
+enum Commit {
     Catalog {
-        catalog: media_signaling::CatalogSnapshot,
+        catalog: v1::CatalogSnapshot,
         revision: u64,
-        resnapshot: bool,
     },
-    Mapping(media_signaling::Mapping),
+    Mapping(v1::Mapping),
 }
 
-impl V1OutputScheduler {
-    /// The caller supplies complete, already validated desired state. Replacing
-    /// it while bytes are in flight intentionally does not alter those bytes.
-    pub(crate) fn stage(
-        &mut self,
-        catalog: media_signaling::CatalogSnapshot,
-        mapping: media_signaling::Mapping,
-    ) {
-        self.stage_validated(V1DesiredState { catalog, mapping });
+#[derive(Default)]
+struct Scheduler {
+    desired: Option<Desired>,
+    delivered_catalog: Option<v1::CatalogSnapshot>,
+    delivered_mapping: Option<v1::Mapping>,
+    catalog_revision: u64,
+    pending: Option<Pending>,
+    resnapshot: bool,
+}
+impl Scheduler {
+    fn stage(&mut self, desired: Desired) {
+        self.desired = Some(desired)
     }
-
-    #[allow(
-        dead_code,
-        reason = "the replacement signaling transport supplies validated desired state in the next unit"
-    )]
-    pub(crate) fn stage_validated(&mut self, desired: V1DesiredState) {
-        self.desired = Some(desired);
+    fn request_resnapshot(&mut self) {
+        self.resnapshot = true
     }
-
-    /// Request a complete Catalog snapshot after the current in-flight write.
-    /// The current desired state is selected only when that snapshot is staged.
-    pub(crate) fn request_resnapshot(&mut self) {
-        self.resnapshot_requested = true;
-    }
-
-    fn has_pending(&self) -> bool {
-        self.pending.is_some()
-    }
-
-    pub(crate) fn poll(&mut self) -> Option<Vec<u8>> {
+    fn poll(&mut self) -> Option<Vec<u8>> {
         if let Some(pending) = &self.pending {
             return Some(pending.bytes.clone());
         }
-
         let desired = self.desired.as_ref()?;
         let (message, commit) = match &self.delivered_catalog {
             None => {
                 let revision = self.catalog_revision.checked_add(1)?;
                 (
-                    media_signaling::ServerMessage {
-                        payload: Some(media_signaling::server_message::Payload::Catalog(
-                            media_signaling::Catalog {
-                                revision,
-                                state: Some(media_signaling::catalog::State::Snapshot(
-                                    desired.catalog.clone(),
-                                )),
-                            },
-                        )),
-                    },
-                    V1Commit::Catalog {
+                    catalog_snapshot(revision, desired.catalog.clone()),
+                    Commit::Catalog {
                         catalog: desired.catalog.clone(),
                         revision,
-                        resnapshot: false,
                     },
                 )
             }
-            Some(delivered_catalog) if delivered_catalog != &desired.catalog => {
+            Some(delivered) if delivered != &desired.catalog => {
                 let cleared = self
                     .delivered_mapping
                     .as_ref()
-                    .map(|mapping| clear_tracks_absent_from(&desired.catalog, mapping));
-                if let Some(cleared) =
+                    .map(|mapping| clear_absent(&desired.catalog, mapping));
+                if let Some(mapping) =
                     cleared.filter(|mapping| self.delivered_mapping.as_ref() != Some(mapping))
                 {
-                    (mapping_message(cleared.clone()), V1Commit::Mapping(cleared))
+                    (mapping_message(mapping.clone()), Commit::Mapping(mapping))
                 } else {
                     let revision = self.catalog_revision.checked_add(1)?;
                     (
-                        if self.resnapshot_requested {
-                            catalog_snapshot_message(revision, desired.catalog.clone())
+                        if self.resnapshot {
+                            catalog_snapshot(revision, desired.catalog.clone())
                         } else {
-                            catalog_delta_message(revision, delivered_catalog, &desired.catalog)
+                            catalog_delta(revision, delivered, &desired.catalog)
                         },
-                        V1Commit::Catalog {
+                        Commit::Catalog {
                             catalog: desired.catalog.clone(),
                             revision,
-                            resnapshot: self.resnapshot_requested,
                         },
                     )
                 }
             }
-            Some(_) if self.resnapshot_requested => {
+            Some(_) if self.resnapshot => {
                 let revision = self.catalog_revision.checked_add(1)?;
                 (
-                    catalog_snapshot_message(revision, desired.catalog.clone()),
-                    V1Commit::Catalog {
+                    catalog_snapshot(revision, desired.catalog.clone()),
+                    Commit::Catalog {
                         catalog: desired.catalog.clone(),
                         revision,
-                        resnapshot: true,
                     },
                 )
             }
-            Some(_) if self.delivered_mapping.as_ref() != Some(&desired.mapping) => {
-                if self.delivered_mapping.is_none()
-                    && mapping_is_empty(&desired.mapping)
-                    && desired.mapping.intent_revision == 0
-                {
-                    return None;
-                }
-                (
-                    mapping_message(desired.mapping.clone()),
-                    V1Commit::Mapping(desired.mapping.clone()),
-                )
-            }
+            Some(_) if self.delivered_mapping.as_ref() != Some(&desired.mapping) => (
+                mapping_message(desired.mapping.clone()),
+                Commit::Mapping(desired.mapping.clone()),
+            ),
             Some(_) => return None,
         };
         let bytes = pulsebeam_proto::codec::encode_server(&message).ok()?;
-        self.pending = Some(V1Pending {
+        self.pending = Some(Pending {
             bytes: bytes.clone(),
             commit,
         });
         Some(bytes)
     }
-
-    pub(crate) fn commit_sent(&mut self) -> Option<media_signaling::CatalogSnapshot> {
-        let Some(pending) = self.pending.take() else {
-            debug_assert!(false, "v1 output commit requires a pending message");
-            return None;
-        };
-        match pending.commit {
-            V1Commit::Catalog {
-                catalog,
-                revision,
-                resnapshot,
-            } => {
+    fn commit_sent(&mut self) -> Option<v1::CatalogSnapshot> {
+        match self.pending.take()?.commit {
+            Commit::Catalog { catalog, revision } => {
                 self.delivered_catalog = Some(catalog.clone());
                 self.catalog_revision = revision;
-                if resnapshot {
-                    self.resnapshot_requested = false;
-                }
+                self.resnapshot = false;
                 Some(catalog)
             }
-            V1Commit::Mapping(mapping) => {
+            Commit::Mapping(mapping) => {
                 self.delivered_mapping = Some(mapping);
                 None
             }
         }
     }
-
-    /// Reliable ordered channels retry the one retained encoded message. No
-    /// state is rolled back: a later `poll` returns the same bytes.
-    pub(crate) fn retry_pending(&mut self) {}
 }
-
-fn catalog_snapshot_message(
-    revision: u64,
-    catalog: media_signaling::CatalogSnapshot,
-) -> media_signaling::ServerMessage {
-    media_signaling::ServerMessage {
-        payload: Some(media_signaling::server_message::Payload::Catalog(
-            media_signaling::Catalog {
-                revision,
-                state: Some(media_signaling::catalog::State::Snapshot(catalog)),
-            },
-        )),
+fn catalog_snapshot(revision: u64, catalog: v1::CatalogSnapshot) -> v1::ServerMessage {
+    v1::ServerMessage {
+        payload: Some(v1::server_message::Payload::Catalog(v1::Catalog {
+            revision,
+            state: Some(v1::catalog::State::Snapshot(catalog)),
+        })),
     }
 }
-
-fn mapping_message(mapping: media_signaling::Mapping) -> media_signaling::ServerMessage {
-    media_signaling::ServerMessage {
-        payload: Some(media_signaling::server_message::Payload::Mapping(mapping)),
+fn mapping_message(mapping: v1::Mapping) -> v1::ServerMessage {
+    v1::ServerMessage {
+        payload: Some(v1::server_message::Payload::Mapping(mapping)),
     }
 }
-
-fn mapping_is_empty(mapping: &media_signaling::Mapping) -> bool {
-    mapping
-        .video
-        .as_ref()
-        .is_none_or(|tracks| tracks.tracks.is_empty())
-        && mapping
-            .audio
-            .as_ref()
-            .is_none_or(|tracks| tracks.tracks.is_empty())
-}
-
-fn clear_tracks_absent_from(
-    catalog: &media_signaling::CatalogSnapshot,
-    mapping: &media_signaling::Mapping,
-) -> media_signaling::Mapping {
+fn clear_absent(catalog: &v1::CatalogSnapshot, mapping: &v1::Mapping) -> v1::Mapping {
     let known: BTreeSet<_> = catalog.tracks.iter().map(|track| &track.track_id).collect();
-    let retain = |tracks: &Option<media_signaling::TrackMappings>| media_signaling::TrackMappings {
+    let retain = |tracks: &Option<v1::TrackMappings>| v1::TrackMappings {
         tracks: tracks
             .as_ref()
             .into_iter()
@@ -1392,37 +471,36 @@ fn clear_tracks_absent_from(
             .cloned()
             .collect(),
     };
-    media_signaling::Mapping {
+    v1::Mapping {
         intent_revision: mapping.intent_revision,
         video: Some(retain(&mapping.video)),
         audio: Some(retain(&mapping.audio)),
     }
 }
-
-fn catalog_delta_message(
+fn catalog_delta(
     revision: u64,
-    delivered: &media_signaling::CatalogSnapshot,
-    desired: &media_signaling::CatalogSnapshot,
-) -> media_signaling::ServerMessage {
-    let old_participants: BTreeMap<_, _> = delivered
+    old: &v1::CatalogSnapshot,
+    new: &v1::CatalogSnapshot,
+) -> v1::ServerMessage {
+    let old_participants: BTreeMap<_, _> = old
         .participants
         .iter()
-        .map(|participant| (&participant.participant_id, participant))
+        .map(|value| (&value.participant_id, value))
         .collect();
-    let new_participants: BTreeMap<_, _> = desired
+    let new_participants: BTreeMap<_, _> = new
         .participants
         .iter()
-        .map(|participant| (&participant.participant_id, participant))
+        .map(|value| (&value.participant_id, value))
         .collect();
-    let old_tracks: BTreeMap<_, _> = delivered
+    let old_tracks: BTreeMap<_, _> = old
         .tracks
         .iter()
-        .map(|track| (&track.track_id, track))
+        .map(|value| (&value.track_id, value))
         .collect();
-    let new_tracks: BTreeMap<_, _> = desired
+    let new_tracks: BTreeMap<_, _> = new
         .tracks
         .iter()
-        .map(|track| (&track.track_id, track))
+        .map(|value| (&value.track_id, value))
         .collect();
     let removed_participant_ids: Vec<_> = old_participants
         .keys()
@@ -1430,203 +508,103 @@ fn catalog_delta_message(
         .map(|id| (*id).clone())
         .collect();
     let removed_participants: BTreeSet<_> = removed_participant_ids.iter().cloned().collect();
-    let delta = media_signaling::CatalogDelta {
-        added_participants: new_participants
-            .iter()
-            .filter(|(id, _)| !old_participants.contains_key(*id))
-            .map(|(_, participant)| (*participant).clone())
-            .collect(),
-        removed_participant_ids,
-        added_tracks: new_tracks
-            .iter()
-            .filter(|(id, _)| !old_tracks.contains_key(*id))
-            .map(|(_, track)| (*track).clone())
-            .collect(),
-        removed_track_ids: old_tracks
-            .iter()
-            .filter(|(id, track)| {
-                !new_tracks.contains_key(*id)
-                    && !removed_participants.contains(&track.participant_id)
-            })
-            .map(|(id, _)| (*id).clone())
-            .collect(),
-    };
-    debug_assert!(
-        !delta.added_participants.is_empty()
-            || !delta.removed_participant_ids.is_empty()
-            || !delta.added_tracks.is_empty()
-            || !delta.removed_track_ids.is_empty(),
-        "catalog delta must not be empty"
-    );
-    media_signaling::ServerMessage {
-        payload: Some(media_signaling::server_message::Payload::Catalog(
-            media_signaling::Catalog {
-                revision,
-                state: Some(media_signaling::catalog::State::Delta(delta)),
-            },
-        )),
+    v1::ServerMessage {
+        payload: Some(v1::server_message::Payload::Catalog(v1::Catalog {
+            revision,
+            state: Some(v1::catalog::State::Delta(v1::CatalogDelta {
+                added_participants: new_participants
+                    .iter()
+                    .filter(|(id, _)| !old_participants.contains_key(*id))
+                    .map(|(_, value)| (*value).clone())
+                    .collect(),
+                removed_participant_ids,
+                added_tracks: new_tracks
+                    .iter()
+                    .filter(|(id, _)| !old_tracks.contains_key(*id))
+                    .map(|(_, value)| (*value).clone())
+                    .collect(),
+                removed_track_ids: old_tracks
+                    .iter()
+                    .filter(|(id, track)| {
+                        !new_tracks.contains_key(*id)
+                            && !removed_participants.contains(&track.participant_id)
+                    })
+                    .map(|(id, _)| (*id).clone())
+                    .collect(),
+            })),
+        })),
     }
+}
+
+enum AuthorizationResponse {
+    Accepted(i64),
+    Rejected,
+}
+pub(crate) const MAX_PENDING_AUTHORIZATION_RESPONSES: usize = 64;
+struct Output {
+    recipient_external_id: String,
+    history: V1CatalogHistory,
+    scheduler: Scheduler,
+    authorization_responses: VecDeque<AuthorizationResponse>,
+    pending_authorization: Option<Vec<u8>>,
+    terminal: Option<Vec<u8>>,
 }
 
 pub struct Signaling {
     ctx: LogCtx,
     pub cid: Option<ChannelId>,
-    slot_count: usize,
-    audio_slot_count: usize,
-
-    // Batch updates and only serialize when something moved.
-    dirty_roster: bool,
-    dirty_bindings: bool,
-    full_state_retries: u8,
-
-    /// What the client has been told. The roster is carried as a diff because it
-    /// is the large set; the bindings are bounded by the subscriber's slots and
-    /// are sent whole, so only their shape is kept, to skip an unchanged group.
-    previous_participants: HashSet<String>,
+    dirty: bool,
     participants: HashMap<String, String>,
-    previous_publications: HashSet<String>,
-    previous_video: Vec<signaling::VideoBinding>,
-    previous_audio: Vec<(String, String)>,
-
-    last_client_intents: Option<HashMap<Mid, Intent>>,
-    last_audio_intent: Option<AudioIntent>,
-    last_playout_delay: Option<(u32, u32)>,
-    pending_commit: Option<SignalingCommit>,
-    v1_output: Option<V1OutputState>,
+    output: Option<Output>,
     v1_revision: u64,
     v1_intent: Option<V1Intent>,
 }
-
 impl Signaling {
     pub(crate) fn new(ctx: LogCtx) -> Self {
         Self {
             ctx,
             cid: None,
-            dirty_roster: true,
-            dirty_bindings: true,
-            full_state_retries: 0,
-            previous_participants: HashSet::new(),
+            dirty: false,
             participants: HashMap::new(),
-            previous_publications: HashSet::new(),
-            previous_video: Vec::new(),
-            previous_audio: Vec::new(),
-            last_client_intents: None,
-            last_audio_intent: None,
-            last_playout_delay: None,
-            pending_commit: None,
-            v1_output: None,
+            output: None,
             v1_revision: 0,
             v1_intent: None,
-
-            slot_count: 0,
-            audio_slot_count: 0,
         }
     }
-
     pub(crate) fn new_v1(ctx: LogCtx, recipient_external_id: String) -> Self {
-        let mut signaling = Self::new(ctx);
-        signaling.v1_output = Some(V1OutputState {
-            recipient_external_id,
-            history: V1CatalogHistory::default(),
-            scheduler: V1OutputScheduler::default(),
-            authorization_responses: VecDeque::new(),
-            pending_authorization: None,
-            authorization_expired: None,
-        });
-        signaling
-    }
-
-    pub(crate) fn stage_authorization(&mut self, expires_at_unix_seconds: i64) -> bool {
-        let Some(output) = &mut self.v1_output else {
-            return true;
-        };
-        if output.authorization_responses.len() >= MAX_PENDING_AUTHORIZATION_RESPONSES {
-            return false;
+        Self {
+            ctx,
+            cid: None,
+            dirty: true,
+            participants: HashMap::new(),
+            output: Some(Output {
+                recipient_external_id,
+                history: V1CatalogHistory::default(),
+                scheduler: Scheduler::default(),
+                authorization_responses: VecDeque::new(),
+                pending_authorization: None,
+                terminal: None,
+            }),
+            v1_revision: 0,
+            v1_intent: None,
         }
-        output
-            .authorization_responses
-            .push_back(AuthorizationResponse::Accepted(expires_at_unix_seconds));
-        true
     }
-
-    pub(crate) fn stage_authorization_rejected(&mut self) -> bool {
-        let Some(output) = &mut self.v1_output else {
-            return true;
-        };
-        if output.authorization_responses.len() >= MAX_PENDING_AUTHORIZATION_RESPONSES {
-            return false;
-        }
-        output
-            .authorization_responses
-            .push_back(AuthorizationResponse::Rejected);
-        true
+    pub(crate) fn is_v1(&self) -> bool {
+        self.output.is_some()
     }
-
-    pub(crate) fn stage_authorization_expired(&mut self) -> bool {
-        if self.cid.is_none() {
-            return false;
-        }
-        let Some(output) = &mut self.v1_output else {
-            return false;
-        };
-        let message = media_signaling::ServerMessage {
-            payload: Some(media_signaling::server_message::Payload::Error(
-                media_signaling::Error {
-                    code: media_signaling::ErrorCode::AuthorizationExpired.into(),
-                    message: "authorization expired".to_owned(),
-                    fatal: true,
-                    intent_revision: None,
-                },
-            )),
-        };
-        let Some(bytes) = pulsebeam_proto::codec::encode_server(&message).ok() else {
-            return false;
-        };
-        output.scheduler = V1OutputScheduler::default();
-        output.authorization_responses.clear();
-        output.pending_authorization = None;
-        output.authorization_expired = Some(bytes);
-        self.dirty_roster = false;
-        self.dirty_bindings = false;
-        true
-    }
-
-    pub(crate) fn stage_v1_output(
-        &mut self,
-        snapshot: &SignalingSnapshot,
-        mapping: media_signaling::Mapping,
-    ) -> Result<(), V1OutputBuildError> {
-        let Some(output) = &mut self.v1_output else {
-            return Ok(());
-        };
-        output.scheduler.stage_validated(build_v1_desired_state(
-            &output.history,
-            self.ctx.participant_id,
-            &output.recipient_external_id,
-            snapshot,
-            mapping,
-        )?);
-        Ok(())
-    }
-
-    #[cfg(test)]
-    pub(crate) fn v1_test_catalog_revision(&self) -> u64 {
-        self.v1_output
+    pub(crate) fn is_terminal(&self) -> bool {
+        self.output
             .as_ref()
-            .map_or(0, |output| output.scheduler.catalog_revision)
+            .is_some_and(|output| output.terminal.is_some())
     }
-
     pub fn set_cid(&mut self, cid: ChannelId) {
-        if self.cid.replace(cid).is_some()
-            && let Some(output) = &mut self.v1_output
-        {
-            output.scheduler.request_resnapshot();
+        if self.cid.replace(cid).is_some() {
+            if let Some(output) = &mut self.output {
+                output.scheduler.request_resnapshot()
+            }
         }
-        self.dirty_roster = true;
-        self.dirty_bindings = true;
-        self.full_state_retries = 2;
+        self.dirty = true;
     }
-
     pub fn clear_cid(&mut self, cid: ChannelId) -> bool {
         if self.cid != Some(cid) {
             return false;
@@ -1634,176 +612,28 @@ impl Signaling {
         self.cid = None;
         true
     }
-
-    pub fn set_slot_count(&mut self, slot_count: usize) {
-        self.slot_count = slot_count;
-    }
-
-    pub fn set_audio_slot_count(&mut self, slot_count: usize) {
-        self.audio_slot_count = slot_count;
-    }
-
     pub(crate) fn v1_is_fresh(&self, revision: u64) -> bool {
         revision != 0 && revision > self.v1_revision
     }
-
     pub(crate) fn accept_v1_intent(&mut self, intent: V1Intent) {
-        debug_assert!(self.v1_is_fresh(intent.revision));
         self.v1_revision = intent.revision;
-        self.v1_intent = Some(intent);
+        self.v1_intent = Some(intent)
     }
-
     pub(crate) fn v1_revision(&self) -> u64 {
         self.v1_revision
     }
-
     pub(crate) fn v1_intent(&self) -> Option<&V1Intent> {
         self.v1_intent.as_ref()
     }
-
-    pub(crate) fn reconcile(&self) -> SignalingIntents {
-        SignalingIntents {
-            video: self.last_client_intents.clone(),
-            audio: self.last_audio_intent.clone(),
-            playout_delay: self.last_playout_delay,
-        }
-    }
-
-    pub fn handle_input(
-        &mut self,
-        data: &[u8],
-    ) -> Result<Vec<SignalingInputEvent>, SignalingError> {
-        let mut events = Vec::new();
-        if data.len() > MAX_SIGNALING_MSG_SIZE {
-            plog_warn!(
-                self.ctx,
-                len = data.len(),
-                "Fatal: Oversized signaling message"
-            );
-            return Err(SignalingError::OversizedPacket);
-        }
-
-        let Ok(msg) = signaling::ClientMessage::decode(data) else {
-            plog_warn!(self.ctx, "Fatal: Invalid Protobuf");
-            return Err(SignalingError::DecodeFailed);
-        };
-
-        match msg.payload {
-            Some(signaling::client_message::Payload::Intent(intent)) => {
-                if intent.video.len() > self.slot_count {
-                    plog_warn!(self.ctx, "Fatal: Complexity limit exceeded");
-                    return Err(SignalingError::ComplexityExceeded);
-                }
-                for state in &intent.publish {
-                    events.push(SignalingInputEvent::UpstreamTrackState {
-                        mid: Mid::from(state.mid.as_str()),
-                        active: state.active,
-                    });
-                }
-                plog_info!(self.ctx, "received client intent: {:?}", intent);
-                self.apply_client_intent(intent);
-                self.dirty_bindings = true;
-            }
-            None => {}
-        }
-
-        Ok(events)
-    }
-
-    fn apply_client_intent(&mut self, intent: signaling::ClientIntent) {
-        let mut intents = HashMap::with_capacity(intent.video.len());
-        for req in intent.video {
-            let track_id_str = req.track_id.clone();
-            let Ok(track_id) = TrackId::try_from(track_id_str.clone()) else {
-                plog_warn!(self.ctx, track_id = %track_id_str, "invalid track_id in client intent");
-                continue;
-            };
-
-            // `Mid` is a fixed-size (16-byte) identifier and will truncate longer strings.
-            let mid = Mid::from(req.mid.as_str());
-
-            if req.height == 0 {
-                continue;
-            }
-
-            intents.insert(
-                mid,
-                Intent {
-                    track_id,
-                    target_height: req.height,
-                    min_height: req.min_height.min(req.height),
-                    min_fps: req.min_fps,
-                    priority: req.priority,
-                },
-            );
-        }
-        if let Some(audio) = intent.audio {
-            let audio = self.decode_audio_intent(audio);
-            self.last_audio_intent = Some(audio);
-        }
-        self.last_playout_delay = intent
-            .ext
-            .and_then(|ext| ext.playout_delay)
-            .map(|p| (p.min_ms, p.max_ms));
-        self.last_client_intents = Some(intents);
-    }
-
-    /// Pins past the negotiated slot count are dropped rather than rejected.
-    ///
-    /// A client cannot hear more speakers than it has audio mids for, so the
-    /// extras could never be honoured; failing the whole intent over them would
-    /// take the client's video requests down with it.
-    fn decode_audio_intent(&self, audio: signaling::AudioIntent) -> AudioIntent {
-        let mut pinned = Vec::with_capacity(audio.pinned.len().min(self.audio_slot_count));
-        for id in audio.pinned {
-            if pinned.len() >= self.audio_slot_count {
-                plog_warn!(
-                    self.ctx,
-                    slots = self.audio_slot_count,
-                    "audio intent pins more tracks than there are slots; ignoring the rest"
-                );
-                break;
-            }
-            match TrackId::try_from(id.clone()) {
-                Ok(track_id) => pinned.push(track_id),
-                Err(_) => {
-                    plog_warn!(self.ctx, track_id = %id, "invalid track_id in audio intent");
-                }
-            }
-        }
-        AudioIntent {
-            pinned,
-            auto: audio.auto,
-        }
-    }
-
     pub fn mark_tracks_dirty(&mut self) {
-        self.dirty_roster = true;
-        self.full_state_retries = 2;
+        self.dirty = true
     }
-
     pub fn mark_assignments_dirty(&mut self) {
-        self.dirty_bindings = true;
+        self.dirty = true
     }
-
     pub(crate) fn participants_snapshot(&self) -> HashMap<String, String> {
         self.participants.clone()
     }
-
-    pub(crate) fn needs_poll(&self) -> bool {
-        if let Some(output) = &self.v1_output {
-            return self.cid.is_some()
-                && (output.authorization_expired.is_some()
-                    || output.pending_authorization.is_some()
-                    || !output.authorization_responses.is_empty()
-                    || self.dirty_roster
-                    || self.dirty_bindings);
-        }
-        self.cid.is_some()
-            && self.pending_commit.is_none()
-            && (self.dirty_roster || self.dirty_bindings)
-    }
-
     pub fn apply_participants(
         &mut self,
         added: impl IntoIterator<Item = crate::participant::RoomParticipant>,
@@ -1818,1828 +648,200 @@ impl Signaling {
         for participant in removed {
             self.participants.remove(&participant.as_str());
         }
-        self.dirty_roster = true;
-        self.full_state_retries = 2;
+        self.dirty = true;
     }
-
-    pub(crate) fn poll(&mut self, snapshot: &SignalingSnapshot) -> Option<SignalingOutput> {
-        if !self.needs_poll() {
-            return None;
+    pub(crate) fn stage_v1_output(
+        &mut self,
+        snapshot: &SignalingSnapshot,
+        mapping: v1::Mapping,
+    ) -> Result<(), V1OutputBuildError> {
+        let Some(output) = &mut self.output else {
+            return Ok(());
+        };
+        let catalog = build_catalog(
+            self.ctx.participant_id,
+            &output.recipient_external_id,
+            snapshot,
+        )?;
+        output.history.validate(&catalog)?;
+        validate_mapping(&catalog, &mapping)?;
+        output.scheduler.stage(Desired { catalog, mapping });
+        Ok(())
+    }
+    pub(crate) fn stage_authorization(&mut self, expiry: i64) -> bool {
+        let Some(output) = &mut self.output else {
+            return false;
+        };
+        if output.authorization_responses.len() >= MAX_PENDING_AUTHORIZATION_RESPONSES {
+            return false;
         }
-
+        output
+            .authorization_responses
+            .push_back(AuthorizationResponse::Accepted(expiry));
+        true
+    }
+    pub(crate) fn stage_authorization_rejected(&mut self) -> bool {
+        let Some(output) = &mut self.output else {
+            return false;
+        };
+        if output.authorization_responses.len() >= MAX_PENDING_AUTHORIZATION_RESPONSES {
+            return false;
+        }
+        output
+            .authorization_responses
+            .push_back(AuthorizationResponse::Rejected);
+        true
+    }
+    pub(crate) fn stage_authorization_expired(&mut self) -> bool {
+        self.cid.is_some() && self.output.is_some() && {
+            self.stage_v1_terminal_error(v1::Error {
+                code: v1::ErrorCode::AuthorizationExpired.into(),
+                message: "authorization expired".to_owned(),
+                fatal: true,
+                intent_revision: None,
+            });
+            true
+        }
+    }
+    pub(crate) fn stage_v1_invalid_message(&mut self) {
+        self.stage_v1_terminal_error(v1::Error {
+            code: v1::ErrorCode::InvalidMessage.into(),
+            message: "invalid signaling message".to_owned(),
+            fatal: true,
+            intent_revision: None,
+        });
+    }
+    pub(crate) fn stage_v1_terminal_error(&mut self, error: v1::Error) {
+        self.stage_terminal(v1::ServerMessage {
+            payload: Some(v1::server_message::Payload::Error(error)),
+        })
+    }
+    pub(crate) fn stage_v1_reconnect(&mut self) {
+        self.stage_terminal(v1::ServerMessage {
+            payload: Some(v1::server_message::Payload::Reconnect(v1::Reconnect {})),
+        })
+    }
+    fn stage_terminal(&mut self, message: v1::ServerMessage) {
+        let Some(output) = &mut self.output else {
+            return;
+        };
+        let Ok(bytes) = pulsebeam_proto::codec::encode_server(&message) else {
+            return;
+        };
+        output.scheduler = Scheduler::default();
+        output.authorization_responses.clear();
+        output.pending_authorization = None;
+        output.terminal = Some(bytes);
+        self.dirty = false;
+    }
+    pub(crate) fn needs_poll(&self) -> bool {
+        self.cid.is_some()
+            && self.output.as_ref().is_some_and(|output| {
+                output.terminal.is_some()
+                    || output.pending_authorization.is_some()
+                    || !output.authorization_responses.is_empty()
+                    || self.dirty
+            })
+    }
+    pub(crate) fn poll(&mut self, _snapshot: &SignalingSnapshot) -> Option<SignalingOutput> {
         let cid = self.cid?;
-
-        if let Some(output) = &mut self.v1_output {
-            if let Some(bytes) = &output.authorization_expired {
-                return Some(SignalingOutput {
-                    cid,
-                    bytes: bytes.clone(),
-                });
-            }
-            if let Some(bytes) = &output.pending_authorization {
-                return Some(SignalingOutput {
-                    cid,
-                    bytes: bytes.clone(),
-                });
-            }
-            if output.scheduler.has_pending() {
-                let bytes = output
-                    .scheduler
-                    .poll()
-                    .expect("pending scheduler bytes exist");
-                return Some(SignalingOutput { cid, bytes });
-            }
-            if let Some(response) = output.authorization_responses.pop_front() {
-                let payload = match response {
-                    AuthorizationResponse::Accepted(expires_at_unix_seconds) => {
-                        media_signaling::server_message::Payload::Authorization(
-                            media_signaling::Authorization {
-                                expires_at_unix_seconds,
-                            },
-                        )
-                    }
-                    AuthorizationResponse::Rejected => {
-                        media_signaling::server_message::Payload::Error(media_signaling::Error {
-                            code: media_signaling::ErrorCode::AuthorizationRejected.into(),
-                            message: "authorization renewal rejected".to_owned(),
-                            fatal: false,
-                            intent_revision: None,
-                        })
-                    }
-                };
-                let message = media_signaling::ServerMessage {
-                    payload: Some(payload),
-                };
-                let bytes = pulsebeam_proto::codec::encode_server(&message).ok()?;
-                output.pending_authorization = Some(bytes.clone());
-                return Some(SignalingOutput { cid, bytes });
-            }
-            let Some(bytes) = output.scheduler.poll() else {
-                self.dirty_roster = false;
-                self.dirty_bindings = false;
-                return None;
+        let output = self.output.as_mut()?;
+        if let Some(bytes) = &output.terminal {
+            return Some(SignalingOutput {
+                cid,
+                bytes: bytes.clone(),
+            });
+        }
+        if let Some(bytes) = &output.pending_authorization {
+            return Some(SignalingOutput {
+                cid,
+                bytes: bytes.clone(),
+            });
+        }
+        if let Some(response) = output.authorization_responses.pop_front() {
+            let payload = match response {
+                AuthorizationResponse::Accepted(expires_at_unix_seconds) => {
+                    v1::server_message::Payload::Authorization(v1::Authorization {
+                        expires_at_unix_seconds,
+                    })
+                }
+                AuthorizationResponse::Rejected => v1::server_message::Payload::Error(v1::Error {
+                    code: v1::ErrorCode::AuthorizationRejected.into(),
+                    message: "authorization renewal rejected".to_owned(),
+                    fatal: false,
+                    intent_revision: None,
+                }),
             };
+            let bytes = pulsebeam_proto::codec::encode_server(&v1::ServerMessage {
+                payload: Some(payload),
+            })
+            .ok()?;
+            output.pending_authorization = Some(bytes.clone());
             return Some(SignalingOutput { cid, bytes });
         }
-
-        // The roster: every publication the client could ask for, and the people
-        // behind them. Video and audio both, because a pin has to be able to
-        // name an audio track before anybody has heard it.
-        let mut publications = Vec::new();
-        let mut participants = Vec::new();
-        let seen_participant_ids: HashSet<String> = snapshot.participants.keys().cloned().collect();
-        for meta in &snapshot.publications {
-            let participant_id = meta.origin.as_str();
-            publications.push(signaling::Publication {
-                track_id: meta.id.as_str(),
-                participant_id,
-                kind: match meta.id.kind() {
-                    crate::entity::TrackKind::Video => signaling::TrackKind::Video,
-                    crate::entity::TrackKind::Audio => signaling::TrackKind::Audio,
-                    // Data does not travel as a track; it has its own lanes.
-                    crate::entity::TrackKind::Data => continue,
-                }
-                .into(),
-            });
+        let bytes = output.scheduler.poll()?;
+        Some(SignalingOutput { cid, bytes })
+    }
+    pub(crate) fn commit_sent(&mut self) -> bool {
+        let Some(output) = &mut self.output else {
+            return false;
+        };
+        if output.terminal.take().is_some() {
+            return true;
         }
-        participants.extend(seen_participant_ids.iter().cloned());
-
-        let current_publication_ids: HashSet<String> = publications
-            .iter()
-            .map(|publication| publication.track_id.clone())
-            .collect();
-        debug_assert_eq!(current_publication_ids.len(), publications.len());
-
-        let force_full = self.full_state_retries != 0;
-        let participants_added: Vec<signaling::Participant> = participants
-            .iter()
-            .filter(|id| force_full || !self.previous_participants.contains(*id))
-            .map(|id| signaling::Participant {
-                participant_id: id.clone(),
-            })
-            .collect();
-        let participants_removed: Vec<String> = self
-            .previous_participants
-            .difference(&seen_participant_ids)
-            .cloned()
-            .collect();
-        let publications_added: Vec<signaling::Publication> = publications
-            .into_iter()
-            .filter(|publication| {
-                force_full || !self.previous_publications.contains(&publication.track_id)
-            })
-            .collect();
-        let publications_removed: Vec<String> = self
-            .previous_publications
-            .difference(&current_publication_ids)
-            .cloned()
-            .collect();
-
-        // The bindings: bounded by the subscriber's slots, so each group is sent
-        // whole or not at all. Audio moves an order of magnitude more often than
-        // video, which is why they are separate groups.
-        let current_video: Vec<signaling::VideoBinding> = snapshot
-            .video
-            .iter()
-            .map(|s| signaling::VideoBinding {
-                mid: s.mid.clone(),
-                track_id: s.track_id.clone(),
-                paused: s.paused,
-            })
-            .collect();
-        let current_audio: Vec<signaling::AudioBinding> = snapshot
-            .audio
-            .iter()
-            .map(|h| signaling::AudioBinding {
-                mid: h.mid.clone(),
-                track_id: h.track_id.clone(),
-                level_dbov: h.level_dbov,
-            })
-            .collect();
-        let current_audio_shape = audio_shape(&current_audio);
-
-        let video_changed = force_full || current_video != self.previous_video;
-        let audio_changed = force_full || current_audio_shape != self.previous_audio;
-
-        let roster_changed = !participants_added.is_empty()
-            || !participants_removed.is_empty()
-            || !publications_added.is_empty()
-            || !publications_removed.is_empty();
-        if !force_full && !roster_changed && !video_changed && !audio_changed {
-            self.dirty_roster = false;
-            self.dirty_bindings = false;
-            return None;
+        if output.pending_authorization.take().is_some() {
+            return false;
         }
-
-        let state = signaling::ServerState {
-            participants_added,
-            participants_removed,
-            publications_added,
-            publications_removed,
-            video: video_changed.then(|| signaling::VideoBindings {
-                items: current_video.clone(),
-            }),
-            audio: audio_changed.then_some(signaling::AudioBindings {
-                items: current_audio,
-            }),
-            snapshot: force_full,
-        };
-
-        let msg = signaling::ServerMessage {
-            payload: Some(signaling::server_message::Payload::State(state)),
-        };
-        let buf = msg.encode_to_vec();
-
-        self.pending_commit = Some(SignalingCommit {
-            participants: seen_participant_ids,
-            publications: current_publication_ids,
-            video: current_video,
-            audio: current_audio_shape,
-            video_changed,
-            audio_changed,
-            force_full,
-        });
-        Some(SignalingOutput { cid, bytes: buf })
-    }
-
-    pub(crate) fn commit_sent(&mut self) {
-        if let Some(output) = &mut self.v1_output {
-            if output.authorization_expired.take().is_some() {
-                return;
-            }
-            if output.pending_authorization.take().is_some() {
-                return;
-            }
-            if let Some(catalog) = output.scheduler.commit_sent() {
-                output.history.commit(&catalog);
-            }
-            // Keep polling until the staged causal sequence is exhausted.
-            self.dirty_roster = true;
-            self.dirty_bindings = true;
-            return;
+        if let Some(catalog) = output.scheduler.commit_sent() {
+            output.history.commit(&catalog)
         }
-        let Some(commit) = self.pending_commit.take() else {
-            debug_assert!(false, "signaling commit requires a pending output");
-            return;
-        };
-        self.previous_participants = commit.participants;
-        self.previous_publications = commit.publications;
-        if commit.video_changed {
-            self.previous_video = commit.video;
-        }
-        if commit.audio_changed {
-            self.previous_audio = commit.audio;
-        }
-        if commit.force_full {
-            self.full_state_retries = self.full_state_retries.saturating_sub(1);
-        }
-        self.dirty_roster = self.full_state_retries != 0;
-        self.dirty_bindings = self.full_state_retries != 0;
+        self.dirty = true;
+        false
     }
-
-    pub(crate) fn retry_pending(&mut self) {
-        if let Some(output) = &mut self.v1_output {
-            output.scheduler.retry_pending();
-            return;
-        }
-        let _ = self.pending_commit.take();
-    }
-}
-
-#[cfg(test)]
-mod v1_output_tests {
-    use super::*;
-    use crate::control::NegotiatedResources;
-    use crate::control::controller::ConnectionProfile;
-    use crate::id::ShardId;
-    use crate::participant::core::{Participant, ParticipantConfig};
-
-    fn catalog(tracks: &[(&str, &str)]) -> media_signaling::CatalogSnapshot {
-        media_signaling::CatalogSnapshot {
-            participants: vec![media_signaling::Participant {
-                participant_id: "participant".to_owned(),
-                participant_external_id: "alice".to_owned(),
-            }],
-            tracks: tracks
-                .iter()
-                .map(|(track_id, label)| media_signaling::RemoteTrack {
-                    track_id: (*track_id).to_owned(),
-                    participant_id: "participant".to_owned(),
-                    kind: media_signaling::TrackKind::Video.into(),
-                    label: (*label).to_owned(),
-                })
-                .collect(),
-        }
-    }
-
-    fn mapping(track_id: &str) -> media_signaling::Mapping {
-        media_signaling::Mapping {
-            intent_revision: 0,
-            video: Some(media_signaling::TrackMappings {
-                tracks: (!track_id.is_empty())
-                    .then(|| media_signaling::TrackMapping {
-                        receiver_index: 0,
-                        track_id: track_id.to_owned(),
-                    })
-                    .into_iter()
-                    .collect(),
-            }),
-            audio: Some(media_signaling::TrackMappings { tracks: Vec::new() }),
-        }
-    }
-
-    fn next(scheduler: &mut V1OutputScheduler) -> media_signaling::ServerMessage {
-        let bytes = scheduler.poll().expect("scheduled output");
-        pulsebeam_proto::codec::decode_server(&bytes).expect("valid server output")
-    }
-
-    fn participant_with_v1_channel() -> (Participant, ChannelId) {
-        let room = crate::entity::RoomExternalId::new("room").unwrap();
-        let mut rtc = str0m::Rtc::new(std::time::Instant::now());
-        let cid = rtc.direct_api().create_data_channel(Default::default());
-        (
-            Participant::new(
-                ParticipantConfig {
-                    manual_sub: true,
-                    room_id: crate::entity::RoomId::from_external(&room),
-                    participant_id: crate::entity::ParticipantId::new(),
-                    participant_external_id: crate::entity::ParticipantExternalId::new("self")
-                        .unwrap(),
-                    connection_id: crate::entity::ConnectionId::new(),
-                    profile: ConnectionProfile::Native,
-                    initial_authorization_expiry: None,
-                    rtc,
-                    resources: NegotiatedResources::empty_for_test(),
-                },
-                ShardId::new(0),
-                1_200,
-                1_200,
-            ),
-            cid,
-        )
-    }
-
-    #[test]
-    fn participant_transport_retries_v1_bytes_before_committing_catalog() {
-        let (mut participant, cid) = participant_with_v1_channel();
-        participant.enable_v1_test_output("self".to_owned(), cid);
-        participant.stage_v1_test_output().unwrap();
-        participant.set_v1_test_write_channel_result(false);
-
-        participant.poll_v1_test_output();
-        let failed = participant.v1_test_channel_write_attempts().to_vec();
-        assert!(
-            !failed.is_empty(),
-            "the actual participant drain branch must write"
-        );
-        assert!(failed.iter().all(|bytes| bytes == &failed[0]));
-        assert_eq!(participant.v1_test_catalog_revision(), 0);
-
-        participant.set_v1_test_write_channel_result(true);
-        participant.poll_v1_test_output();
-        let attempts = participant.v1_test_channel_write_attempts();
-        assert_eq!(attempts.len(), failed.len() + 1);
-        assert_eq!(attempts.last(), failed.first());
-        assert_eq!(participant.v1_test_catalog_revision(), 1);
-        let attempt_count = attempts.len();
-
-        participant.poll_v1_test_output();
-        assert_eq!(
-            participant.v1_test_channel_write_attempts().len(),
-            attempt_count
-        );
-    }
-
-    #[test]
-    fn first_output_is_a_nonzero_catalog_snapshot() {
-        let mut scheduler = V1OutputScheduler::default();
-        scheduler.stage(catalog(&[("track-a", "camera")]), mapping("track-a"));
-
-        let message = next(&mut scheduler);
-        let Some(media_signaling::server_message::Payload::Catalog(catalog)) = message.payload
-        else {
-            panic!("first output must be catalog");
-        };
-        assert_eq!(catalog.revision, 1);
-        assert!(matches!(
-            catalog.state,
-            Some(media_signaling::catalog::State::Snapshot(_))
-        ));
-    }
-
-    #[test]
-    fn additions_are_catalogued_before_the_mapping_references_them() {
-        let mut scheduler = V1OutputScheduler::default();
-        scheduler.stage(catalog(&[]), mapping(""));
-        let _ = next(&mut scheduler);
-        scheduler.commit_sent();
-
-        scheduler.stage(catalog(&[("track-a", "camera")]), mapping("track-a"));
-        let message = next(&mut scheduler);
-        let Some(media_signaling::server_message::Payload::Catalog(catalog)) = message.payload
-        else {
-            panic!("addition must begin with catalog");
-        };
-        assert_eq!(catalog.revision, 2);
-        let Some(media_signaling::catalog::State::Delta(delta)) = catalog.state else {
-            panic!("addition must be a delta");
-        };
-        assert_eq!(delta.added_tracks.len(), 1);
-        assert_eq!(delta.added_tracks[0].track_id, "track-a");
-        assert!(delta.removed_track_ids.is_empty());
-        scheduler.commit_sent();
-
-        let message = next(&mut scheduler);
-        assert!(matches!(
-            message.payload,
-            Some(media_signaling::server_message::Payload::Mapping(_))
-        ));
-    }
-
-    #[test]
-    fn mapped_removals_clear_mapping_before_catalog_delta() {
-        let mut scheduler = V1OutputScheduler::default();
-        scheduler.stage(catalog(&[("track-a", "camera")]), mapping("track-a"));
-        let _ = next(&mut scheduler);
-        scheduler.commit_sent();
-        let _ = next(&mut scheduler);
-        scheduler.commit_sent();
-
-        scheduler.stage(catalog(&[]), mapping(""));
-        let message = next(&mut scheduler);
-        let Some(media_signaling::server_message::Payload::Mapping(mapping)) = message.payload
-        else {
-            panic!("removal must first clear mapping");
-        };
-        assert!(mapping.video.is_some_and(|video| video.tracks.is_empty()));
-        assert!(mapping.audio.is_some_and(|audio| audio.tracks.is_empty()));
-        scheduler.commit_sent();
-
-        let message = next(&mut scheduler);
-        let Some(media_signaling::server_message::Payload::Catalog(catalog)) = message.payload
-        else {
-            panic!("clear must be followed by catalog removal");
-        };
-        let Some(media_signaling::catalog::State::Delta(delta)) = catalog.state else {
-            panic!("removal must be a delta");
-        };
-        assert_eq!(delta.removed_track_ids, ["track-a"]);
-    }
-
-    #[test]
-    fn failed_write_retries_identical_bytes_without_advancing_state() {
-        let mut scheduler = V1OutputScheduler::default();
-        scheduler.stage(catalog(&[]), mapping(""));
-
-        let first = scheduler.poll().expect("first write");
-        scheduler.retry_pending();
-        let retry = scheduler.poll().expect("retry write");
-        assert_eq!(first, retry);
-        scheduler.commit_sent();
-        assert!(scheduler.poll().is_none());
-    }
-
-    #[test]
-    fn accepted_empty_mapping_is_not_suppressed() {
-        let mut scheduler = V1OutputScheduler::default();
-        scheduler.stage(catalog(&[]), mapping(""));
-        let _ = next(&mut scheduler);
-        scheduler.commit_sent();
-
-        let mut acknowledged = mapping("");
-        acknowledged.intent_revision = 1;
-        scheduler.stage(catalog(&[]), acknowledged);
-        let message = next(&mut scheduler);
-        assert!(matches!(
-            message.payload,
-            Some(media_signaling::server_message::Payload::Mapping(
-                media_signaling::Mapping {
-                    intent_revision: 1,
-                    ..
-                }
-            ))
-        ));
-    }
-
-    #[test]
-    fn mixed_replacement_clears_then_deltas_then_maps() {
-        let mut scheduler = V1OutputScheduler::default();
-        scheduler.stage(catalog(&[("track-a", "camera")]), mapping("track-a"));
-        let _ = next(&mut scheduler);
-        scheduler.commit_sent();
-        let _ = next(&mut scheduler);
-        scheduler.commit_sent();
-
-        scheduler.stage(catalog(&[("track-b", "screen")]), mapping("track-b"));
-        assert!(matches!(
-            next(&mut scheduler).payload,
-            Some(media_signaling::server_message::Payload::Mapping(_))
-        ));
-        scheduler.commit_sent();
-        assert!(matches!(
-            next(&mut scheduler).payload,
-            Some(media_signaling::server_message::Payload::Catalog(
-                media_signaling::Catalog {
-                    state: Some(media_signaling::catalog::State::Delta(_)),
-                    ..
-                }
-            ))
-        ));
-        scheduler.commit_sent();
-        assert!(matches!(
-            next(&mut scheduler).payload,
-            Some(media_signaling::server_message::Payload::Mapping(_))
-        ));
-    }
-
-    #[test]
-    fn resnapshot_uses_a_higher_revision_after_commits() {
-        let mut scheduler = V1OutputScheduler::default();
-        scheduler.stage(catalog(&[]), mapping(""));
-        let _ = next(&mut scheduler);
-        scheduler.commit_sent();
-
-        scheduler.request_resnapshot();
-        let message = next(&mut scheduler);
-        let Some(media_signaling::server_message::Payload::Catalog(catalog)) = message.payload
-        else {
-            panic!("resynchronization must emit a catalog snapshot");
-        };
-        assert_eq!(catalog.revision, 2);
-        assert!(matches!(
-            catalog.state,
-            Some(media_signaling::catalog::State::Snapshot(_))
-        ));
-    }
-
-    #[test]
-    fn coalesces_updates_behind_an_in_flight_catalog() {
-        let mut scheduler = V1OutputScheduler::default();
-        scheduler.stage(catalog(&[]), mapping(""));
-        let _ = next(&mut scheduler);
-        scheduler.commit_sent();
-
-        scheduler.stage(catalog(&[("track-a", "camera")]), mapping("track-a"));
-        let _in_flight = next(&mut scheduler);
-        scheduler.stage(catalog(&[("track-b", "screen")]), mapping("track-b"));
-        scheduler.commit_sent();
-
-        let message = next(&mut scheduler);
-        let Some(media_signaling::server_message::Payload::Catalog(catalog)) = message.payload
-        else {
-            panic!("latest desired catalog must follow the committed in-flight bytes");
-        };
-        let Some(media_signaling::catalog::State::Delta(delta)) = catalog.state else {
-            panic!("coalesced replacement must be a delta");
-        };
-        assert_eq!(delta.added_tracks[0].track_id, "track-b");
-        assert_eq!(delta.removed_track_ids, ["track-a"]);
-    }
-
-    #[test]
-    fn unavailable_track_can_return_before_its_removal_commits() {
-        let mut scheduler = V1OutputScheduler::default();
-        scheduler.stage(catalog(&[("track-a", "camera")]), mapping("track-a"));
-        let _ = next(&mut scheduler);
-        scheduler.commit_sent();
-        let _ = next(&mut scheduler);
-        scheduler.commit_sent();
-
-        scheduler.stage(catalog(&[]), mapping(""));
-        let _clear = next(&mut scheduler);
-        scheduler.commit_sent();
-        scheduler.stage(catalog(&[("track-a", "camera")]), mapping("track-a"));
-
-        let message = next(&mut scheduler);
-        assert!(matches!(
-            message.payload,
-            Some(media_signaling::server_message::Payload::Mapping(
-                media_signaling::Mapping {
-                    video: Some(media_signaling::TrackMappings { tracks }),
-                    ..
-                }
-            )) if tracks[0].track_id == "track-a"
-        ));
-    }
-
-    #[test]
-    fn validated_desired_state_rejects_unknown_mapping_tracks() {
-        let snapshot = SignalingSnapshot {
-            publications: Vec::new(),
-            participants: HashMap::new(),
-            video: Vec::new(),
-            audio: Vec::new(),
-        };
-
-        assert!(matches!(
-            build_v1_desired_state(
-                &V1CatalogHistory::default(),
-                crate::entity::ParticipantId::new(),
-                "self",
-                &snapshot,
-                mapping("unknown-track"),
-            ),
-            Err(V1OutputBuildError::MappingUnknownTrack)
-        ));
-    }
-
-    #[test]
-    fn validated_desired_state_requires_complete_mapping_groups() {
-        let mut incomplete = mapping("");
-        incomplete.video = None;
-
-        assert_eq!(
-            validate_mapping(&catalog(&[]), &incomplete),
-            Err(V1OutputBuildError::IncompleteMapping)
-        );
-
-        incomplete.video = Some(media_signaling::TrackMappings { tracks: Vec::new() });
-        incomplete.audio = None;
-        assert_eq!(
-            validate_mapping(&catalog(&[]), &incomplete),
-            Err(V1OutputBuildError::IncompleteMapping)
-        );
-    }
-
-    #[test]
-    fn validated_desired_state_rejects_receiver_reused_across_mapping_groups() {
-        let catalog = media_signaling::CatalogSnapshot {
-            participants: vec![media_signaling::Participant {
-                participant_id: "participant".to_owned(),
-                participant_external_id: "alice".to_owned(),
-            }],
-            tracks: vec![
-                media_signaling::RemoteTrack {
-                    track_id: "video".to_owned(),
-                    participant_id: "participant".to_owned(),
-                    kind: media_signaling::TrackKind::Video.into(),
-                    label: "camera".to_owned(),
-                },
-                media_signaling::RemoteTrack {
-                    track_id: "audio".to_owned(),
-                    participant_id: "participant".to_owned(),
-                    kind: media_signaling::TrackKind::Audio.into(),
-                    label: "mic".to_owned(),
-                },
-            ],
-        };
-        let mapping = media_signaling::Mapping {
-            intent_revision: 0,
-            video: Some(media_signaling::TrackMappings {
-                tracks: vec![media_signaling::TrackMapping {
-                    receiver_index: 0,
-                    track_id: "video".to_owned(),
-                }],
-            }),
-            audio: Some(media_signaling::TrackMappings {
-                tracks: vec![media_signaling::TrackMapping {
-                    receiver_index: 0,
-                    track_id: "audio".to_owned(),
-                }],
-            }),
-        };
-
-        assert_eq!(
-            validate_mapping(&catalog, &mapping),
-            Err(V1OutputBuildError::DuplicateMapping)
-        );
-    }
-
-    #[test]
-    fn catalog_history_rejects_reused_track_identity() {
-        let mut history = V1CatalogHistory::default();
-        let original = catalog(&[("track-a", "camera")]);
-        history.commit(&original);
-
-        let changed = catalog(&[("track-a", "screen")]);
-        assert_eq!(
-            history.validate(&changed),
-            Err(V1OutputBuildError::TrackIdentityChanged)
-        );
-    }
-}
-
-#[cfg(test)]
-mod authorization_tests {
-    use super::*;
-    use crate::control::NegotiatedResources;
-    use crate::control::controller::ConnectionProfile;
-    use crate::entity::{
-        ConnectionId, ParticipantExternalId, ParticipantId, RoomExternalId, TrackKind,
-    };
-    use crate::id::ShardId;
-    use crate::participant::core::{Participant, ParticipantConfig};
-    use crate::participant::downstream::SlotConfig;
-    use crate::participant::effect::AuthorizationRequestId;
-    use crate::participant::event::test_utils::MockParticipantSink;
-    use crate::participant::{ParticipantEffect, RoomParticipant};
-    use crate::track::{Track, TrackMeta};
-    use str0m::Rtc;
-    use str0m::media::{MediaKind, Mid};
-
-    struct RenewalFixture {
-        participant: Participant,
-        sink: MockParticipantSink,
-        participant_id: ParticipantId,
-        connection_id: ConnectionId,
-    }
-
-    #[derive(Debug, PartialEq)]
-    struct RenewalStateSnapshot {
-        catalog: media_signaling::CatalogSnapshot,
-        intent: Option<(u64, Vec<String>, Vec<String>, Vec<String>, bool)>,
-        mapping: media_signaling::Mapping,
-        media_publications: Vec<(u32, TrackId, bool)>,
-        video_playout_locked: bool,
-        audio_playout_locked: bool,
-    }
-
-    impl RenewalFixture {
-        fn new() -> Self {
-            let room_external_id = RoomExternalId::new("renewal-room").unwrap();
-            let participant_id = ParticipantId::new();
-            let connection_id =
-                ConnectionId::from_bytes([0, 0, 0, 0, 0, 0, 0x70, 0, 0x80, 0, 0, 0, 0, 0, 0, 2]);
-            let mut rtc = Rtc::new(std::time::Instant::now());
-            let cid = rtc.direct_api().create_data_channel(Default::default());
-            let mut participant = Participant::new(
-                ParticipantConfig {
-                    manual_sub: true,
-                    room_id: crate::entity::RoomId::from_external(&room_external_id),
-                    participant_id,
-                    participant_external_id: ParticipantExternalId::new("self").unwrap(),
-                    connection_id,
-                    profile: ConnectionProfile::Native,
-                    initial_authorization_expiry: Some(100),
-                    rtc,
-                    resources: NegotiatedResources::empty_for_test(),
-                },
-                ShardId::new(0),
-                1_200,
-                1_200,
-            );
-            participant.enable_v1_test_output("self".to_owned(), cid);
-            participant.add_v1_test_receiver(SlotConfig {
-                media_index: 7,
-                mid: Mid::from("video"),
-                kind: MediaKind::Video,
-                ..SlotConfig::default()
-            });
-            participant.add_v1_test_receiver(SlotConfig {
-                media_index: 8,
-                mid: Mid::from("audio"),
-                kind: MediaKind::Audio,
-                ..SlotConfig::default()
-            });
-            let peer_id = ParticipantId::new();
-            participant.apply(
-                ParticipantEffect::ParticipantsChanged {
-                    added: vec![RoomParticipant {
-                        id: peer_id,
-                        external_id: ParticipantExternalId::new("peer").unwrap(),
-                    }],
-                    removed: Vec::new(),
-                },
-                None,
-            );
-            let video_track = Track::video(
-                TrackMeta::labeled_media(
-                    participant.room_id,
-                    ShardId::new(0),
-                    peer_id,
-                    TrackKind::Video,
-                    "camera".to_owned(),
-                ),
-                Vec::new(),
-                None,
-            );
-            let video_track_id = video_track.id().as_str();
-            participant.add_v1_test_track(video_track);
-            let audio_track = Track::audio(
-                TrackMeta::labeled_media(
-                    participant.room_id,
-                    ShardId::new(0),
-                    peer_id,
-                    TrackKind::Audio,
-                    "microphone".to_owned(),
-                ),
-                None,
-            );
-            let audio_track_id = audio_track.id().as_str();
-            participant.add_v1_test_track(audio_track);
-            let intent = media_signaling::ClientMessage {
-                payload: Some(media_signaling::client_message::Payload::Intent(
-                    media_signaling::Intent {
-                        revision: 1,
-                        send: None,
-                        receive: Some(media_signaling::ReceiveIntent {
-                            video: Some(media_signaling::VideoIntent {
-                                tracks: vec![media_signaling::VideoTrackIntent {
-                                    track_id: video_track_id,
-                                    options: None,
-                                }],
-                            }),
-                            audio: Some(media_signaling::AudioIntent {
-                                tracks: vec![media_signaling::AudioTrackIntent {
-                                    track_id: audio_track_id,
-                                    options: None,
-                                }],
-                                mode: media_signaling::AudioMode::ExplicitOnly.into(),
-                            }),
-                        }),
-                    },
-                )),
-            };
-            let mut sink = MockParticipantSink::new();
-            participant
-                .handle_v1_input(
-                    &pulsebeam_proto::codec::encode_client(&intent).unwrap(),
-                    &mut sink,
-                )
-                .unwrap();
-            participant.lock_v1_test_playout(MediaKind::Video, Mid::from("video"));
-            participant.lock_v1_test_playout(MediaKind::Audio, Mid::from("audio"));
-            Self {
-                participant,
-                sink,
-                participant_id,
-                connection_id,
-            }
-        }
-
-        fn request(&mut self) -> AuthorizationRequestId {
-            let renewal = media_signaling::ClientMessage {
-                payload: Some(
-                    media_signaling::client_message::Payload::RenewAuthorization(
-                        media_signaling::RenewAuthorization {
-                            token: "secret-token".to_owned(),
-                        },
-                    ),
-                ),
-            };
-            self.participant
-                .handle_v1_input(
-                    &pulsebeam_proto::codec::encode_client(&renewal).unwrap(),
-                    &mut self.sink,
-                )
-                .unwrap();
-            self.participant
-                .v1_test_pending_authorization_request()
-                .expect("renewal request is pending")
-        }
-
-        fn snapshot(&self) -> RenewalStateSnapshot {
-            let intent = self.participant.v1_test_intent().map(|intent| {
-                (
-                    intent.revision,
-                    intent
-                        .publications
-                        .iter()
-                        .map(|track| track.label.clone())
-                        .collect(),
-                    intent
-                        .video
-                        .iter()
-                        .map(|track| track.track_id.clone())
-                        .collect(),
-                    intent
-                        .audio
-                        .iter()
-                        .map(|track| track.track_id.clone())
-                        .collect(),
-                    intent.audio_auto,
-                )
-            });
-            RenewalStateSnapshot {
-                catalog: self.participant.v1_test_catalog().unwrap(),
-                intent,
-                mapping: self.participant.v1_test_mapping(),
-                media_publications: self.participant.v1_test_publications(),
-                video_playout_locked: self
-                    .participant
-                    .v1_test_receiver_locked(MediaKind::Video, 7),
-                audio_playout_locked: self
-                    .participant
-                    .v1_test_receiver_locked(MediaKind::Audio, 8),
-            }
-        }
-    }
-
-    #[test]
-    fn readiness_stages_authorization_before_catalog() {
-        let room = crate::entity::RoomId::from_external(
-            &crate::entity::RoomExternalId::new("room").unwrap(),
-        );
-        let ctx = LogCtx {
-            room_id: room,
-            participant_id: crate::entity::ParticipantId::new(),
-        };
-        let mut signaling = Signaling::new_v1(ctx, "self".to_owned());
-        let mut rtc = str0m::Rtc::new(std::time::Instant::now());
-        signaling.set_cid(rtc.direct_api().create_data_channel(Default::default()));
-        let snapshot = SignalingSnapshot {
-            publications: Vec::new(),
-            participants: HashMap::new(),
-            video: Vec::new(),
-            audio: Vec::new(),
-        };
-        signaling
-            .stage_v1_output(
-                &snapshot,
-                media_signaling::Mapping {
-                    intent_revision: 0,
-                    video: Some(media_signaling::TrackMappings { tracks: Vec::new() }),
-                    audio: Some(media_signaling::TrackMappings { tracks: Vec::new() }),
-                },
-            )
-            .unwrap();
-        signaling.stage_authorization(1_700_000_000);
-
-        let output = signaling
-            .poll(&snapshot)
-            .expect("ready native signaling emits authorization");
-        assert!(matches!(
-            pulsebeam_proto::codec::decode_server(&output.bytes),
-            Ok(media_signaling::ServerMessage {
-                payload: Some(media_signaling::server_message::Payload::Authorization(
-                    media_signaling::Authorization {
-                        expires_at_unix_seconds: 1_700_000_000,
-                    }
-                )),
-            })
-        ));
-        signaling.commit_sent();
-        assert!(matches!(
-            pulsebeam_proto::codec::decode_server(
-                &signaling
-                    .poll(&snapshot)
-                    .expect("catalog follows authorization")
-                    .bytes
-            ),
-            Ok(media_signaling::ServerMessage {
-                payload: Some(media_signaling::server_message::Payload::Catalog(_)),
-            })
-        ));
-    }
-
-    #[test]
-    fn authorization_waits_for_an_inflight_catalog_and_retries_it_unchanged() {
-        let room = crate::entity::RoomId::from_external(
-            &crate::entity::RoomExternalId::new("room").unwrap(),
-        );
-        let ctx = LogCtx {
-            room_id: room,
-            participant_id: crate::entity::ParticipantId::new(),
-        };
-        let mut signaling = Signaling::new_v1(ctx, "self".to_owned());
-        let mut rtc = str0m::Rtc::new(std::time::Instant::now());
-        signaling.set_cid(rtc.direct_api().create_data_channel(Default::default()));
-        let snapshot = SignalingSnapshot {
-            publications: Vec::new(),
-            participants: HashMap::new(),
-            video: Vec::new(),
-            audio: Vec::new(),
-        };
-        signaling
-            .stage_v1_output(
-                &snapshot,
-                media_signaling::Mapping {
-                    intent_revision: 0,
-                    video: Some(media_signaling::TrackMappings { tracks: Vec::new() }),
-                    audio: Some(media_signaling::TrackMappings { tracks: Vec::new() }),
-                },
-            )
-            .unwrap();
-        let catalog = signaling.poll(&snapshot).expect("catalog is in flight");
-        signaling.stage_authorization(1_700_000_000);
-
-        assert_eq!(
-            signaling
-                .poll(&snapshot)
-                .expect("catalog remains in flight")
-                .bytes,
-            catalog.bytes
-        );
-        signaling.retry_pending();
-        assert_eq!(
-            signaling
-                .poll(&snapshot)
-                .expect("catalog retry remains exact")
-                .bytes,
-            catalog.bytes
-        );
-        signaling.commit_sent();
-
-        assert!(matches!(
-            pulsebeam_proto::codec::decode_server(
-                &signaling
-                    .poll(&snapshot)
-                    .expect("authorization follows catalog")
-                    .bytes
-            ),
-            Ok(media_signaling::ServerMessage {
-                payload: Some(media_signaling::server_message::Payload::Authorization(_)),
-            })
-        ));
-    }
-
-    #[test]
-    fn authorization_retries_identical_bytes_until_commit() {
-        let room = crate::entity::RoomId::from_external(
-            &crate::entity::RoomExternalId::new("room").unwrap(),
-        );
-        let ctx = LogCtx {
-            room_id: room,
-            participant_id: crate::entity::ParticipantId::new(),
-        };
-        let mut signaling = Signaling::new_v1(ctx, "self".to_owned());
-        let mut rtc = str0m::Rtc::new(std::time::Instant::now());
-        signaling.set_cid(rtc.direct_api().create_data_channel(Default::default()));
-        signaling.stage_authorization(1_700_000_000);
-        let snapshot = SignalingSnapshot {
-            publications: Vec::new(),
-            participants: HashMap::new(),
-            video: Vec::new(),
-            audio: Vec::new(),
-        };
-
-        let first = signaling.poll(&snapshot).expect("authorization output");
-        signaling.retry_pending();
-        assert_eq!(
-            signaling
-                .poll(&snapshot)
-                .expect("authorization retry")
-                .bytes,
-            first.bytes
-        );
-        signaling.commit_sent();
-        assert!(
-            signaling.poll(&snapshot).is_none(),
-            "commit drains authorization"
-        );
-    }
-
-    #[test]
-    fn rejected_renewal_waits_for_inflight_catalog() {
-        let room = crate::entity::RoomId::from_external(
-            &crate::entity::RoomExternalId::new("room").unwrap(),
-        );
-        let ctx = LogCtx {
-            room_id: room,
-            participant_id: crate::entity::ParticipantId::new(),
-        };
-        let mut signaling = Signaling::new_v1(ctx, "self".to_owned());
-        let mut rtc = str0m::Rtc::new(std::time::Instant::now());
-        signaling.set_cid(rtc.direct_api().create_data_channel(Default::default()));
-        let snapshot = SignalingSnapshot {
-            publications: Vec::new(),
-            participants: HashMap::new(),
-            video: Vec::new(),
-            audio: Vec::new(),
-        };
-        signaling
-            .stage_v1_output(
-                &snapshot,
-                media_signaling::Mapping {
-                    intent_revision: 0,
-                    video: Some(media_signaling::TrackMappings { tracks: Vec::new() }),
-                    audio: Some(media_signaling::TrackMappings { tracks: Vec::new() }),
-                },
-            )
-            .unwrap();
-        let catalog = signaling.poll(&snapshot).expect("catalog output");
-        signaling.stage_authorization_rejected();
-        assert_eq!(
-            signaling
-                .poll(&snapshot)
-                .expect("catalog remains pending")
-                .bytes,
-            catalog.bytes
-        );
-        signaling.commit_sent();
-        assert!(matches!(
-            pulsebeam_proto::codec::decode_server(&signaling.poll(&snapshot).expect("rejection follows catalog").bytes),
-            Ok(media_signaling::ServerMessage { payload: Some(media_signaling::server_message::Payload::Error(media_signaling::Error { code, fatal: false, .. })) })
-                if code == media_signaling::ErrorCode::AuthorizationRejected as i32
-        ));
-    }
-
-    #[test]
-    fn queued_renewal_responses_keep_order_and_retry_exact_bytes() {
-        let room = crate::entity::RoomId::from_external(
-            &crate::entity::RoomExternalId::new("room").unwrap(),
-        );
-        let ctx = LogCtx {
-            room_id: room,
-            participant_id: crate::entity::ParticipantId::new(),
-        };
-        let mut signaling = Signaling::new_v1(ctx, "self".to_owned());
-        let mut rtc = str0m::Rtc::new(std::time::Instant::now());
-        signaling.set_cid(rtc.direct_api().create_data_channel(Default::default()));
-        let snapshot = SignalingSnapshot {
-            publications: Vec::new(),
-            participants: HashMap::new(),
-            video: Vec::new(),
-            audio: Vec::new(),
-        };
-        signaling.stage_authorization(101);
-        signaling.stage_authorization_rejected();
-        signaling.stage_authorization(303);
-
-        let first = signaling.poll(&snapshot).expect("first response");
-        assert!(matches!(
-            pulsebeam_proto::codec::decode_server(&first.bytes),
-            Ok(media_signaling::ServerMessage {
-                payload: Some(media_signaling::server_message::Payload::Authorization(
-                    media_signaling::Authorization {
-                        expires_at_unix_seconds: 101
-                    }
-                ))
-            })
-        ));
-        assert_eq!(signaling.poll(&snapshot).expect("retry").bytes, first.bytes);
-        signaling.commit_sent();
-        assert!(
-            matches!(pulsebeam_proto::codec::decode_server(&signaling.poll(&snapshot).expect("second response").bytes), Ok(media_signaling::ServerMessage {
-            payload: Some(media_signaling::server_message::Payload::Error(media_signaling::Error { code, fatal: false, .. }))
-        }) if code == media_signaling::ErrorCode::AuthorizationRejected as i32)
-        );
-        signaling.commit_sent();
-        assert!(matches!(
-            pulsebeam_proto::codec::decode_server(
-                &signaling.poll(&snapshot).expect("third response").bytes
-            ),
-            Ok(media_signaling::ServerMessage {
-                payload: Some(media_signaling::server_message::Payload::Authorization(
-                    media_signaling::Authorization {
-                        expires_at_unix_seconds: 303
-                    }
-                ))
-            })
-        ));
-    }
-
-    #[test]
-    fn authorization_expiry_discards_pending_output_and_retries_one_fatal_error() {
-        let room = crate::entity::RoomId::from_external(
-            &crate::entity::RoomExternalId::new("expiry").unwrap(),
-        );
-        let ctx = LogCtx {
-            room_id: room,
-            participant_id: crate::entity::ParticipantId::new(),
-        };
-        let mut signaling = Signaling::new_v1(ctx, "self".to_owned());
-        let mut rtc = str0m::Rtc::new(std::time::Instant::now());
-        signaling.set_cid(rtc.direct_api().create_data_channel(Default::default()));
-        let snapshot = SignalingSnapshot {
-            publications: Vec::new(),
-            participants: HashMap::new(),
-            video: Vec::new(),
-            audio: Vec::new(),
-        };
-        signaling
-            .stage_v1_output(
-                &snapshot,
-                media_signaling::Mapping {
-                    intent_revision: 7,
-                    video: Some(media_signaling::TrackMappings { tracks: Vec::new() }),
-                    audio: Some(media_signaling::TrackMappings { tracks: Vec::new() }),
-                },
-            )
-            .unwrap();
-        assert!(matches!(
-            pulsebeam_proto::codec::decode_server(&signaling.poll(&snapshot).unwrap().bytes),
-            Ok(media_signaling::ServerMessage {
-                payload: Some(media_signaling::server_message::Payload::Catalog(_)),
-            })
-        ));
-
-        assert!(signaling.stage_authorization_expired());
-        let fatal = signaling.poll(&snapshot).expect("fatal output");
-        signaling.retry_pending();
-        assert_eq!(
-            signaling.poll(&snapshot).expect("fatal retry").bytes,
-            fatal.bytes
-        );
-        assert!(matches!(
-            pulsebeam_proto::codec::decode_server(&fatal.bytes),
-            Ok(media_signaling::ServerMessage {
-                payload: Some(media_signaling::server_message::Payload::Error(
-                    media_signaling::Error { code, fatal: true, intent_revision: None, .. }
-                )),
-            }) if code == media_signaling::ErrorCode::AuthorizationExpired as i32
-        ));
-        signaling.commit_sent();
-        assert!(signaling.poll(&snapshot).is_none());
-    }
-
-    #[test]
-    fn authorization_expiry_without_a_signaling_channel_cannot_be_staged() {
-        let room = crate::entity::RoomId::from_external(
-            &crate::entity::RoomExternalId::new("no-channel").unwrap(),
-        );
-        let ctx = LogCtx {
-            room_id: room,
-            participant_id: crate::entity::ParticipantId::new(),
-        };
-        let mut signaling = Signaling::new_v1(ctx, "self".to_owned());
-        assert!(!signaling.stage_authorization_expired());
-    }
-
-    #[test]
-    fn authorization_response_capacity_refuses_unstaged_outcomes_until_a_commit() {
-        let room = crate::entity::RoomId::from_external(
-            &crate::entity::RoomExternalId::new("room").unwrap(),
-        );
-        let ctx = LogCtx {
-            room_id: room,
-            participant_id: crate::entity::ParticipantId::new(),
-        };
-        let mut signaling = Signaling::new_v1(ctx, "self".to_owned());
-        let mut rtc = str0m::Rtc::new(std::time::Instant::now());
-        signaling.set_cid(rtc.direct_api().create_data_channel(Default::default()));
-        let snapshot = SignalingSnapshot {
-            publications: Vec::new(),
-            participants: HashMap::new(),
-            video: Vec::new(),
-            audio: Vec::new(),
-        };
-        for expiry in 0..MAX_PENDING_AUTHORIZATION_RESPONSES {
-            assert!(signaling.stage_authorization(expiry as i64));
-        }
-        assert!(!signaling.stage_authorization(999));
-        let first = signaling.poll(&snapshot).expect("first queued output");
-        assert_eq!(
-            signaling.poll(&snapshot).expect("exact retry").bytes,
-            first.bytes
-        );
-        signaling.commit_sent();
-        assert!(signaling.stage_authorization(999));
-    }
-
-    #[test]
-    fn authorization_results_are_fenced_backpressured_and_media_invariant() {
-        let mut fixture = RenewalFixture::new();
-        let before = fixture.snapshot();
-        let request_id = fixture.request();
-        assert_eq!(fixture.snapshot(), before);
-
-        assert!(fixture.participant.apply_authorization_result(
-            ParticipantEffect::AuthorizationRenewed {
-                participant_id: fixture.participant_id,
-                connection_id: fixture.connection_id,
-                request_id: AuthorizationRequestId::new(999),
-                expires_at_unix_seconds: 200,
-            }
-        ));
-        assert_eq!(
-            fixture.participant.v1_test_pending_authorization_request(),
-            Some(request_id)
-        );
-        assert_eq!(fixture.snapshot(), before);
-
-        let retired_connection =
-            ConnectionId::from_bytes([0, 0, 0, 0, 0, 0, 0x70, 0, 0x80, 0, 0, 0, 0, 0, 0, 1]);
-        assert!(fixture.participant.apply_authorization_result(
-            ParticipantEffect::AuthorizationRejected {
-                participant_id: fixture.participant_id,
-                connection_id: retired_connection,
-                request_id,
-            }
-        ));
-        assert_eq!(
-            fixture.participant.v1_test_pending_authorization_request(),
-            Some(request_id)
-        );
-        assert_eq!(fixture.snapshot(), before);
-
-        assert!(fixture.participant.apply_authorization_result(
-            ParticipantEffect::AuthorizationRejected {
-                participant_id: fixture.participant_id,
-                connection_id: fixture.connection_id,
-                request_id,
-            }
-        ));
-        assert_eq!(
-            fixture.participant.v1_test_pending_authorization_request(),
-            None
-        );
-        let rejection = fixture.participant.take_v1_test_output().unwrap();
-        assert!(matches!(
-            pulsebeam_proto::codec::decode_server(&rejection),
-            Ok(media_signaling::ServerMessage {
-                payload: Some(media_signaling::server_message::Payload::Error(
-                    media_signaling::Error { code, fatal: false, .. }
-                ))
-            }) if code == media_signaling::ErrorCode::AuthorizationRejected as i32
-        ));
-        assert_eq!(fixture.snapshot(), before);
-
-        let request_id = fixture.request();
-        assert!(fixture.participant.apply_authorization_result(
-            ParticipantEffect::AuthorizationRenewed {
-                participant_id: fixture.participant_id,
-                connection_id: fixture.connection_id,
-                request_id,
-                expires_at_unix_seconds: 300,
-            }
-        ));
-        assert_eq!(
-            fixture.participant.v1_test_pending_authorization_request(),
-            None
-        );
-        let renewed = fixture.participant.take_v1_test_output().unwrap();
-        assert!(matches!(
-            pulsebeam_proto::codec::decode_server(&renewed),
-            Ok(media_signaling::ServerMessage {
-                payload: Some(media_signaling::server_message::Payload::Authorization(
-                    media_signaling::Authorization {
-                        expires_at_unix_seconds: 300,
-                    }
-                ))
-            })
-        ));
-        assert_eq!(fixture.snapshot(), before);
-
-        let request_id = fixture.request();
-        for expiry in 0..MAX_PENDING_AUTHORIZATION_RESPONSES {
-            assert!(
-                fixture
-                    .participant
-                    .stage_v1_test_authorization(expiry as i64)
-            );
-        }
-        assert!(!fixture.participant.apply_authorization_result(
-            ParticipantEffect::AuthorizationRejected {
-                participant_id: fixture.participant_id,
-                connection_id: fixture.connection_id,
-                request_id,
-            }
-        ));
-        assert_eq!(
-            fixture.participant.v1_test_pending_authorization_request(),
-            Some(request_id)
-        );
-        assert_eq!(fixture.snapshot(), before);
-
-        fixture.participant.take_v1_test_output().unwrap();
-        assert!(fixture.participant.apply_authorization_result(
-            ParticipantEffect::AuthorizationRejected {
-                participant_id: fixture.participant_id,
-                connection_id: fixture.connection_id,
-                request_id,
-            }
-        ));
-        assert_eq!(
-            fixture.participant.v1_test_pending_authorization_request(),
-            None
-        );
-        assert_eq!(fixture.snapshot(), before);
-    }
-
-    #[test]
-    fn authorization_expiry_is_connection_fenced_and_terminal() {
-        let mut fixture = RenewalFixture::new();
-        let before = fixture.snapshot();
-        let wrong_connection =
-            ConnectionId::from_bytes([0, 0, 0, 0, 0, 0, 0x70, 0, 0x80, 0, 0, 0, 0, 0, 0, 3]);
-        fixture.participant.apply(
-            ParticipantEffect::AuthorizationExpired {
-                connection_id: wrong_connection,
-            },
-            None,
-        );
-        assert_eq!(fixture.snapshot(), before);
-
-        fixture.participant.apply(
-            ParticipantEffect::AuthorizationExpired {
-                connection_id: fixture.connection_id,
-            },
-            None,
-        );
-        let fatal = fixture
-            .participant
-            .take_v1_test_output()
-            .expect("fatal expiry output");
-        assert!(matches!(
-            pulsebeam_proto::codec::decode_server(&fatal),
-            Ok(media_signaling::ServerMessage {
-                payload: Some(media_signaling::server_message::Payload::Error(
-                    media_signaling::Error { code, fatal: true, intent_revision: None, .. }
-                )),
-            }) if code == media_signaling::ErrorCode::AuthorizationExpired as i32
-        ));
-        fixture.participant.apply(
-            ParticipantEffect::ParticipantsChanged {
-                added: vec![RoomParticipant {
-                    id: ParticipantId::new(),
-                    external_id: ParticipantExternalId::new("later").unwrap(),
-                }],
-                removed: Vec::new(),
-            },
-            None,
-        );
-        assert_eq!(fixture.snapshot(), before);
+    pub(crate) fn retry_pending(&mut self) {}
+    #[cfg(test)]
+    pub(crate) fn v1_test_catalog_revision(&self) -> u64 {
+        self.output
+            .as_ref()
+            .map_or(0, |output| output.scheduler.catalog_revision)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    // Convenience only: a test is not a shard, so nothing here is
-    // cross-core. See crates/pulsebeam/docs/thread-per-core.md.
     use super::*;
 
-    fn audio(mid: &str, track_id: &str, level_dbov: i32) -> signaling::AudioBinding {
-        signaling::AudioBinding {
-            mid: mid.to_owned(),
-            track_id: track_id.to_owned(),
-            level_dbov,
-        }
-    }
-
-    fn video(mid: &str, track_id: &str, paused: bool) -> signaling::VideoBinding {
-        signaling::VideoBinding {
-            mid: mid.to_owned(),
-            track_id: track_id.to_owned(),
-            paused,
-        }
-    }
-
-    /// A slot steal has to reach the client: the mid and the SSRC do not move, so
-    /// nothing else tells it the voice it is hearing belongs to someone new.
     #[test]
-    fn a_new_speaker_in_a_slot_is_an_audio_change() {
-        assert_ne!(
-            audio_shape(&[audio("a0", "audio-a", -30)]),
-            audio_shape(&[audio("a0", "audio-b", -30)])
-        );
-    }
-
-    /// Reordering is what a UI draws, so it counts even when nobody was replaced.
-    /// The list order is the rank, so this is the only thing that carries it.
-    #[test]
-    fn a_reordering_is_an_audio_change() {
-        let louder_first = [audio("a0", "audio-a", -20), audio("a1", "audio-b", -40)];
-        let swapped = [audio("a1", "audio-b", -20), audio("a0", "audio-a", -40)];
-        assert_ne!(audio_shape(&louder_first), audio_shape(&swapped));
-    }
-
-    /// Loudness moves with every packet. If it were a trigger, a room with two
-    /// people talking would produce a signalling message per packet - so it rides
-    /// along on updates caused by something else and never causes one itself.
-    #[test]
-    fn loudness_alone_is_not_an_audio_change() {
-        assert_eq!(
-            audio_shape(&[audio("a0", "audio-a", -30)]),
-            audio_shape(&[audio("a0", "audio-a", -12)])
-        );
-    }
-
-    #[test]
-    fn a_first_sighting_is_an_audio_change() {
-        assert_ne!(
-            audio_shape(&[]),
-            audio_shape(&[audio("a0", "audio-a", -30)])
-        );
-    }
-
-    /// A speaker falling silent empties the group, and an empty group is still
-    /// sent - present-but-empty is how the client is told nothing is bound.
-    #[test]
-    fn a_slot_falling_silent_is_an_audio_change() {
-        assert_ne!(
-            audio_shape(&[audio("a0", "audio-a", -30)]),
-            audio_shape(&[])
-        );
-    }
-
-    /// Video bindings are compared whole, so both halves of an assignment count.
-    #[test]
-    fn track_replacement_is_a_video_change() {
-        assert_ne!(
-            vec![video("7", "track-a", false)],
-            vec![video("7", "track-b", false)]
-        );
-    }
-
-    #[test]
-    fn paused_transition_is_a_video_change() {
-        assert_ne!(
-            vec![video("7", "track-a", true)],
-            vec![video("7", "track-a", false)]
-        );
-    }
-
-    /// The default is what a client that has never mentioned audio gets, and it
-    /// has to be what the SFU did before the message existed.
-    #[test]
-    fn the_default_audio_intent_is_auto_with_no_pins() {
-        let intent = AudioIntent::default();
-        assert!(intent.auto);
-        assert!(intent.pinned.is_empty());
-    }
-
-    #[test]
-    fn snapshots_are_requested_only_while_signaling_can_emit() {
-        let room = crate::entity::RoomExternalId::new("room").expect("valid room");
-        let ctx = LogCtx {
-            room_id: crate::entity::RoomId::from_external(&room),
-            participant_id: crate::entity::ParticipantId::new(),
+    fn v1_scheduler_emits_catalog_before_mapping() {
+        let catalog = v1::CatalogSnapshot {
+            participants: Vec::new(),
+            tracks: Vec::new(),
         };
-        let mut signaling = Signaling::new(ctx);
-        let snapshot = SignalingSnapshot {
-            publications: Vec::new(),
-            participants: HashMap::new(),
-            video: Vec::new(),
-            audio: Vec::new(),
+        let expected_mapping = v1::Mapping {
+            intent_revision: 1,
+            video: Some(v1::TrackMappings { tracks: Vec::new() }),
+            audio: Some(v1::TrackMappings { tracks: Vec::new() }),
         };
+        let mut scheduler = Scheduler::default();
+        scheduler.stage(Desired {
+            catalog,
+            mapping: expected_mapping.clone(),
+        });
 
-        assert!(!signaling.needs_poll(), "a channel is required");
-
-        let mut rtc = str0m::Rtc::new(std::time::Instant::now());
-        let cid = rtc.direct_api().create_data_channel(Default::default());
-        signaling.set_cid(cid);
-        assert!(signaling.needs_poll(), "a dirty channel needs a snapshot");
-
-        assert!(signaling.poll(&snapshot).is_some(), "initial state emits");
-        assert!(
-            !signaling.needs_poll(),
-            "the pending commit owns the snapshot"
-        );
-
-        signaling.retry_pending();
-        assert!(signaling.needs_poll(), "a failed write retries the state");
-
-        assert!(signaling.poll(&snapshot).is_some(), "first retry emits");
-        signaling.commit_sent();
-        assert!(signaling.needs_poll(), "full state is retried once more");
-
-        assert!(signaling.poll(&snapshot).is_some(), "second retry emits");
-        signaling.commit_sent();
-        assert!(!signaling.needs_poll(), "a clean state needs no snapshot");
-    }
-
-    #[test]
-    fn native_v1_transport_commits_catalog_before_mapping() {
-        let room = crate::entity::RoomId::from_external(
-            &crate::entity::RoomExternalId::new("room").unwrap(),
-        );
-        let ctx = LogCtx {
-            room_id: room,
-            participant_id: crate::entity::ParticipantId::new(),
-        };
-        let mut signaling = Signaling::new_v1(ctx, "self".to_owned());
-        let remote = crate::entity::ParticipantId::new();
-        let track = crate::track::TrackMeta::labeled_media(
-            room,
-            crate::id::ShardId::new(0),
-            remote,
-            crate::entity::TrackKind::Video,
-            "camera".to_owned(),
-        );
-        let track_id = track.id.as_str();
-        let snapshot = SignalingSnapshot {
-            publications: vec![track],
-            participants: HashMap::from_iter([(remote.as_str(), "alice".to_owned())]),
-            video: Vec::new(),
-            audio: Vec::new(),
-        };
-        let mut rtc = str0m::Rtc::new(std::time::Instant::now());
-        signaling.set_cid(rtc.direct_api().create_data_channel(Default::default()));
-        signaling
-            .stage_v1_output(
-                &snapshot,
-                media_signaling::Mapping {
-                    intent_revision: 0,
-                    video: Some(media_signaling::TrackMappings {
-                        tracks: vec![media_signaling::TrackMapping {
-                            receiver_index: 0,
-                            track_id,
-                        }],
-                    }),
-                    audio: Some(media_signaling::TrackMappings { tracks: Vec::new() }),
-                },
-            )
-            .expect("valid desired state");
-
-        let first = signaling.poll(&snapshot).expect("catalog output");
-        signaling.retry_pending();
-        assert_eq!(
-            signaling.poll(&snapshot).expect("retry output").bytes,
-            first.bytes,
-            "a failed local write retains the exact catalog bytes"
-        );
+        let catalog = scheduler.poll().expect("initial catalog");
         assert!(matches!(
-            pulsebeam_proto::codec::decode_server(&first.bytes),
-            Ok(media_signaling::ServerMessage {
-                payload: Some(media_signaling::server_message::Payload::Catalog(_)),
+            pulsebeam_proto::codec::decode_server(&catalog),
+            Ok(v1::ServerMessage {
+                payload: Some(v1::server_message::Payload::Catalog(_))
             })
         ));
-        signaling.commit_sent();
-
-        let second = signaling.poll(&snapshot).expect("mapping output");
+        scheduler.commit_sent();
+        let mapping = scheduler.poll().expect("mapping after catalog commit");
         assert!(matches!(
-            pulsebeam_proto::codec::decode_server(&second.bytes),
-            Ok(media_signaling::ServerMessage {
-                payload: Some(media_signaling::server_message::Payload::Mapping(_)),
-            })
+            pulsebeam_proto::codec::decode_server(&mapping),
+            Ok(v1::ServerMessage {
+                payload: Some(v1::server_message::Payload::Mapping(value))
+            }) if value == expected_mapping
         ));
-        signaling.commit_sent();
-        assert!(
-            signaling.poll(&snapshot).is_none(),
-            "causal sequence is drained"
-        );
-
-        signaling.set_cid(rtc.direct_api().create_data_channel(Default::default()));
-        let resnapshot = signaling.poll(&snapshot).expect("replacement CID snapshot");
-        let Ok(media_signaling::ServerMessage {
-            payload: Some(media_signaling::server_message::Payload::Catalog(catalog)),
-        }) = pulsebeam_proto::codec::decode_server(&resnapshot.bytes)
-        else {
-            panic!("replacement CID must resynchronize with a Catalog");
-        };
-        assert_eq!(catalog.revision, 2);
-        assert!(matches!(
-            catalog.state,
-            Some(media_signaling::catalog::State::Snapshot(_))
-        ));
-    }
-
-    #[test]
-    fn replacement_catalog_is_complete_labeled_remote_state() {
-        let room = crate::entity::RoomId::from_external(
-            &crate::entity::RoomExternalId::new("room").unwrap(),
-        );
-        let recipient = crate::entity::ParticipantId::derive(
-            &room,
-            &crate::entity::ParticipantExternalId::new("self").unwrap(),
-        );
-        let remote = crate::entity::ParticipantId::derive(
-            &room,
-            &crate::entity::ParticipantExternalId::new("alice").unwrap(),
-        );
-        let video = crate::track::TrackMeta::labeled_media(
-            room,
-            crate::id::ShardId::new(1),
-            remote,
-            crate::entity::TrackKind::Video,
-            "camera".to_owned(),
-        );
-        let audio = crate::track::TrackMeta::labeled_media(
-            room,
-            crate::id::ShardId::new(2),
-            remote,
-            crate::entity::TrackKind::Audio,
-            "camera".to_owned(),
-        );
-        let self_track = crate::track::TrackMeta::labeled_media(
-            room,
-            crate::id::ShardId::new(0),
-            recipient,
-            crate::entity::TrackKind::Audio,
-            "mic".to_owned(),
-        );
-        let snapshot = SignalingSnapshot {
-            publications: vec![self_track, video.clone(), audio.clone()],
-            participants: HashMap::from_iter([(remote.as_str(), "alice".to_owned())]),
-            video: Vec::new(),
-            audio: Vec::new(),
-        };
-
-        let catalog = build_catalog(recipient, "self", &snapshot).unwrap();
-
-        assert_eq!(catalog.participants.len(), 1);
-        assert_eq!(catalog.participants[0].participant_external_id, "alice");
-        assert_eq!(catalog.tracks.len(), 2);
-        assert!(
-            catalog
-                .tracks
-                .iter()
-                .all(|track| track.participant_id == remote.as_str())
-        );
-        assert!(catalog.tracks.iter().any(|track| {
-            track.kind == media_signaling::TrackKind::Audio as i32 && track.label == "camera"
-        }));
-        assert!(catalog.tracks.iter().any(|track| {
-            track.kind == media_signaling::TrackKind::Video as i32 && track.label == "camera"
-        }));
-        assert_eq!(
-            video.id,
-            remote.derive_track_id(crate::entity::TrackKind::Video, "camera")
-        );
-        assert_eq!(
-            audio.id,
-            remote.derive_track_id(crate::entity::TrackKind::Audio, "camera")
-        );
-
-        let republished = crate::track::TrackMeta::labeled_media(
-            room,
-            crate::id::ShardId::new(9),
-            remote,
-            crate::entity::TrackKind::Video,
-            "camera".to_owned(),
-        );
-        let renamed = crate::track::TrackMeta::labeled_media(
-            room,
-            crate::id::ShardId::new(9),
-            remote,
-            crate::entity::TrackKind::Video,
-            "screen".to_owned(),
-        );
-        assert_eq!(republished.id, video.id);
-        assert_ne!(renamed.id, video.id);
-    }
-
-    #[test]
-    fn unlabeled_legacy_media_cannot_enter_replacement_catalog() {
-        let participant = crate::entity::ParticipantId::new();
-        let (upstream, _) = crate::track::test_utils::make_audio_track(
-            participant,
-            str0m::media::Mid::from("legacy-mid"),
-        );
-        let snapshot = SignalingSnapshot {
-            publications: vec![upstream.meta],
-            participants: HashMap::from_iter([(participant.as_str(), "legacy".to_owned())]),
-            video: Vec::new(),
-            audio: Vec::new(),
-        };
-
-        assert_eq!(
-            build_catalog(crate::entity::ParticipantId::new(), "self", &snapshot),
-            Err(CatalogBuildError::MissingLabel)
-        );
-    }
-
-    #[test]
-    fn replacement_catalog_rejects_recipient_external_id_collision() {
-        let room = crate::entity::RoomId::from_external(
-            &crate::entity::RoomExternalId::new("room").unwrap(),
-        );
-        let recipient = crate::entity::ParticipantId::derive(
-            &room,
-            &crate::entity::ParticipantExternalId::new("self").unwrap(),
-        );
-        let remote = crate::entity::ParticipantId::derive(
-            &room,
-            &crate::entity::ParticipantExternalId::new("alice").unwrap(),
-        );
-        let snapshot = SignalingSnapshot {
-            publications: Vec::new(),
-            participants: HashMap::from_iter([(remote.as_str(), "same-external-id".to_owned())]),
-            video: Vec::new(),
-            audio: Vec::new(),
-        };
-
-        assert_eq!(
-            build_catalog(recipient, "same-external-id", &snapshot),
-            Err(CatalogBuildError::DuplicateIdentity)
-        );
-    }
-
-    #[test]
-    fn replacement_catalog_validates_recipient_external_id_input() {
-        let snapshot = SignalingSnapshot {
-            publications: Vec::new(),
-            participants: HashMap::new(),
-            video: Vec::new(),
-            audio: Vec::new(),
-        };
-
-        assert_eq!(
-            build_catalog(crate::entity::ParticipantId::new(), "", &snapshot),
-            Err(CatalogBuildError::ValueOutOfBounds)
-        );
-        assert_eq!(
-            build_catalog(
-                crate::entity::ParticipantId::new(),
-                &"x".repeat(257),
-                &snapshot,
-            ),
-            Err(CatalogBuildError::ValueOutOfBounds)
-        );
-    }
-
-    #[test]
-    fn replacement_catalog_rejects_overlong_labels_before_staging() {
-        let room = crate::entity::RoomId::from_external(
-            &crate::entity::RoomExternalId::new("room").unwrap(),
-        );
-        let remote = crate::entity::ParticipantId::derive(
-            &room,
-            &crate::entity::ParticipantExternalId::new("alice").unwrap(),
-        );
-        let mut track = crate::track::TrackMeta::labeled_media(
-            room,
-            crate::id::ShardId::new(1),
-            remote,
-            crate::entity::TrackKind::Video,
-            "camera".to_owned(),
-        );
-        track.label = Some("x".repeat(65));
-        let snapshot = SignalingSnapshot {
-            publications: vec![track],
-            participants: HashMap::from_iter([(remote.as_str(), "alice".to_owned())]),
-            video: Vec::new(),
-            audio: Vec::new(),
-        };
-
-        assert!(build_catalog(crate::entity::ParticipantId::new(), "self", &snapshot).is_err());
-    }
-
-    #[test]
-    fn replacement_catalog_rejects_track_id_with_changed_label() {
-        let room = crate::entity::RoomId::from_external(
-            &crate::entity::RoomExternalId::new("room").unwrap(),
-        );
-        let remote = crate::entity::ParticipantId::derive(
-            &room,
-            &crate::entity::ParticipantExternalId::new("alice").unwrap(),
-        );
-        let mut track = crate::track::TrackMeta::labeled_media(
-            room,
-            crate::id::ShardId::new(1),
-            remote,
-            crate::entity::TrackKind::Video,
-            "camera".to_owned(),
-        );
-        track.label = Some("screen".to_owned());
-        let snapshot = SignalingSnapshot {
-            publications: vec![track],
-            participants: HashMap::from_iter([(remote.as_str(), "alice".to_owned())]),
-            video: Vec::new(),
-            audio: Vec::new(),
-        };
-
-        assert!(build_catalog(crate::entity::ParticipantId::new(), "self", &snapshot).is_err());
-    }
-
-    #[test]
-    fn replacement_catalog_rejects_snapshot_that_exceeds_codec_limit() {
-        let room = crate::entity::RoomId::from_external(
-            &crate::entity::RoomExternalId::new("room").unwrap(),
-        );
-        let remote = crate::entity::ParticipantId::derive(
-            &room,
-            &crate::entity::ParticipantExternalId::new("alice").unwrap(),
-        );
-        let publications = (0..400)
-            .map(|index| {
-                crate::track::TrackMeta::labeled_media(
-                    room,
-                    crate::id::ShardId::new(1),
-                    remote,
-                    crate::entity::TrackKind::Video,
-                    format!("{index:0>61}"),
-                )
-            })
-            .collect();
-        let snapshot = SignalingSnapshot {
-            publications,
-            participants: HashMap::from_iter([(remote.as_str(), "alice".to_owned())]),
-            video: Vec::new(),
-            audio: Vec::new(),
-        };
-
-        assert!(build_catalog(crate::entity::ParticipantId::new(), "self", &snapshot).is_err());
     }
 }

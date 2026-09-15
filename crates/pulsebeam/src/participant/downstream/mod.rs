@@ -460,26 +460,8 @@ impl Downstream {
         self.audio.set_intent(intent);
     }
 
-    pub(crate) fn apply_signaling_intents(
-        &mut self,
-        intents: crate::participant::signaling::SignalingIntents,
-    ) {
-        if let Some(video) = intents.video {
-            self.video.configure(&video);
-        }
-        if let Some(audio) = intents.audio {
-            self.set_audio_intent(audio);
-        }
-        if intents.playout_delay.is_some() {
-            self.set_playout_delay(intents.playout_delay);
-        }
-        self.dirty_allocation = true;
-    }
-
     pub(crate) fn signaling_snapshot(&self) -> crate::participant::signaling::SignalingSnapshot {
-        use crate::participant::signaling::{
-            SignalingAudioBinding, SignalingSnapshot, SignalingVideoBinding,
-        };
+        use crate::participant::signaling::SignalingSnapshot;
         SignalingSnapshot {
             publications: self
                 .video
@@ -488,24 +470,6 @@ impl Downstream {
                 .cloned()
                 .collect(),
             participants: ahash::HashMap::default(),
-            video: self
-                .video
-                .slots()
-                .map(|slot| SignalingVideoBinding {
-                    mid: slot.mid.to_string(),
-                    track_id: slot.track.id.as_str(),
-                    paused: slot.paused,
-                })
-                .collect(),
-            audio: self
-                .audio_assignments()
-                .iter()
-                .map(|heard| SignalingAudioBinding {
-                    mid: heard.mid.to_string(),
-                    track_id: heard.origin.track.as_str(),
-                    level_dbov: i32::from(heard.level_dbov),
-                })
-                .collect(),
         }
     }
 
@@ -771,11 +735,17 @@ mod tests {
         );
         assert_eq!(
             hundredths((3_000, 500)),
-            (MediaTime::from_hundredths(200), MediaTime::from_hundredths(200))
+            (
+                MediaTime::from_hundredths(200),
+                MediaTime::from_hundredths(200)
+            )
         );
         assert_eq!(
             hundredths((500, 3_000)),
-            (MediaTime::from_hundredths(50), MediaTime::from_hundredths(200))
+            (
+                MediaTime::from_hundredths(50),
+                MediaTime::from_hundredths(200)
+            )
         );
         assert_eq!(
             hundredths((14, 15)),

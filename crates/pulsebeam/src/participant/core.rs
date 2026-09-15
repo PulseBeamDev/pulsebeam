@@ -110,6 +110,8 @@ pub enum DisconnectReason {
     RtcError(#[from] RtcError),
     #[error("Signaling error")]
     SignalingError(#[from] signaling::SignalingError),
+    #[error("Media signaling terminated")]
+    SignalingTerminated,
     #[error("ICE connection disconnected")]
     IceDisconnected,
     #[error("Unsupported media direction (must be SendOnly or RecvOnly)")]
@@ -229,7 +231,12 @@ impl Participant {
             room_id: cfg.room_id,
             participant_id: cfg.participant_id,
         };
-        let signaling = Signaling::new(ctx);
+        let signaling = match cfg.profile {
+            ConnectionProfile::Native => {
+                Signaling::new_v1(ctx, cfg.participant_external_id.as_str().to_owned())
+            }
+            ConnectionProfile::Whip | ConnectionProfile::Whep => Signaling::new(ctx),
+        };
         let now = Instant::now();
         #[cfg(feature = "sim")]
         let sim_span = tracing::info_span!(
@@ -406,20 +413,31 @@ impl Participant {
         signaling::V1IntentResult::Mapping(self.v1_mapping())
     }
 
-    /// Inactive v1 input seam. Task 8 owns connecting this to ChannelData.
     pub(crate) fn handle_v1_input(
         &mut self,
         bytes: &[u8],
         events: &mut impl ParticipantSink,
     ) -> Result<(), signaling::SignalingError> {
-        if self.authorization_expired {
+        if self.authorization_expired || self.signaling.is_terminal() {
             return Ok(());
         }
         let message = pulsebeam_proto::codec::decode_client(bytes)
             .map_err(|_| signaling::SignalingError::DecodeFailed)?;
         match message.payload {
             Some(pulsebeam_proto::signaling_v1::client_message::Payload::Intent(intent)) => {
-                let _ = self.apply_v1_intent(intent, events);
+                match self.apply_v1_intent(intent, events) {
+                    signaling::V1IntentResult::Mapping(mapping) => {
+                        let mut snapshot = self.downstream.signaling_snapshot();
+                        snapshot.participants = self.signaling.participants_snapshot();
+                        self.signaling
+                            .stage_v1_output(&snapshot, mapping)
+                            .map_err(|_| signaling::SignalingError::DecodeFailed)?;
+                    }
+                    signaling::V1IntentResult::ProtocolError(error) => {
+                        self.signaling.stage_v1_terminal_error(error);
+                    }
+                    signaling::V1IntentResult::Reconnect => self.signaling.stage_v1_reconnect(),
+                }
             }
             Some(pulsebeam_proto::signaling_v1::client_message::Payload::RenewAuthorization(
                 renew,
@@ -723,7 +741,7 @@ impl Participant {
     }
 
     pub fn apply(&mut self, effect: ParticipantEffect, track_handle: Option<TrackHandle>) {
-        if self.authorization_expired {
+        if self.authorization_expired || self.signaling.is_terminal() {
             return;
         }
         match effect {
@@ -858,7 +876,7 @@ impl Participant {
     }
 
     pub(crate) fn input<'a>(&mut self, input: ParticipantInput<'a>) {
-        if self.authorization_expired {
+        if self.authorization_expired || self.signaling.is_terminal() {
             return;
         }
         match input {
@@ -1023,8 +1041,6 @@ impl Participant {
         self.downstream.install_track(key, track);
         self.signaling.mark_tracks_dirty();
         self.signaling.mark_assignments_dirty();
-        let intents = self.signaling.reconcile();
-        self.downstream.apply_signaling_intents(intents);
         self.reconcile_v1_catalog();
     }
 
@@ -1036,8 +1052,6 @@ impl Participant {
         if removed {
             self.signaling.mark_tracks_dirty();
             self.signaling.mark_assignments_dirty();
-            let intents = self.signaling.reconcile();
-            self.downstream.apply_signaling_intents(intents);
             self.reconcile_v1_catalog();
         }
         removed
@@ -1279,14 +1293,25 @@ impl Participant {
             if self.signaling.needs_poll() {
                 let mut snapshot = self.downstream.signaling_snapshot();
                 snapshot.participants = self.signaling.participants_snapshot();
+                if self.signaling.is_v1()
+                    && self
+                        .signaling
+                        .stage_v1_output(&snapshot, self.v1_mapping())
+                        .is_err()
+                {
+                    self.signaling.stage_v1_invalid_message();
+                }
                 if let Some(output) = self.signaling.poll(&snapshot) {
                     if self
                         .transport
                         .write_channel(output.cid, true, &output.bytes)
                     {
-                        self.signaling.commit_sent();
-                        if self.authorization_expired && !self.signaling.needs_poll() {
-                            self.disconnect(DisconnectReason::AuthorizationExpired);
+                        if self.signaling.commit_sent() {
+                            self.disconnect(if self.authorization_expired {
+                                DisconnectReason::AuthorizationExpired
+                            } else {
+                                DisconnectReason::SignalingTerminated
+                            });
                         }
                     } else {
                         self.signaling.retry_pending();
@@ -1417,8 +1442,17 @@ impl Participant {
 
                 match intent {
                     DataTrackIntent::InternalSignaling => {
+                        if self.profile != ConnectionProfile::Native {
+                            self.disconnect(DisconnectReason::InvalidMediaDirection);
+                            return;
+                        }
                         plog_info!(self.log_ctx(), "internal media signaling is opened");
                         self.signaling.set_cid(cid);
+                        if let Some(expiry) = self.initial_authorization_expiry {
+                            if !self.signaling.stage_authorization(expiry) {
+                                self.disconnect(DisconnectReason::SignalingTerminated);
+                            }
+                        }
                     }
 
                     DataTrackIntent::UserTopic(channel) => {
@@ -1482,16 +1516,10 @@ impl Participant {
                 self.release_data_channel(channel, events);
             }
             Event::ChannelData(data) => {
-                if Some(data.id) == self.signaling.cid
-                    && let Err(err) = self.signaling.handle_input(&data.data).map(|input_events| {
-                        for input_event in input_events {
-                            self.handle_signaling_input(input_event, events);
-                        }
-                        let intents = self.signaling.reconcile();
-                        self.downstream.apply_signaling_intents(intents);
-                    })
-                {
-                    self.disconnect(err.into());
+                if Some(data.id) == self.signaling.cid {
+                    if !data.binary || self.handle_v1_input(&data.data, events).is_err() {
+                        self.signaling.stage_v1_invalid_message();
+                    }
                     return;
                 }
 
@@ -1533,18 +1561,6 @@ impl Participant {
             }
             _ => {
                 // tracing::warn!("unhandled event: {e:?}");
-            }
-        }
-    }
-
-    fn handle_signaling_input(
-        &mut self,
-        event: signaling::SignalingInputEvent,
-        events: &mut impl ParticipantSink,
-    ) {
-        match event {
-            signaling::SignalingInputEvent::UpstreamTrackState { mid, active } => {
-                self.handle_upstream_track_state(mid, active, events);
             }
         }
     }
@@ -1662,14 +1678,6 @@ impl Participant {
             }
             Direction::SendOnly => {
                 self.try_add_downstream_slot(resource.media_index, media.mid, media.kind);
-                // Update signaling slot count AFTER adding the slot so the
-                // server accepts ClientIntent requests up to the actual slot
-                // count (previously this was called before add_slot, so the
-                // count was always one behind and every intent was rejected).
-                self.signaling
-                    .set_slot_count(self.downstream.video.slot_count());
-                self.signaling
-                    .set_audio_slot_count(self.downstream.audio_slot_count());
             }
             _ => self.disconnect(DisconnectReason::InvalidMediaDirection),
         }
@@ -1847,6 +1855,39 @@ mod authorization_tests {
     use crate::entity::{ParticipantExternalId, RoomExternalId};
     use pulsebeam_core::auth::AuthorizationExpiry;
     use std::time::UNIX_EPOCH;
+
+    #[test]
+    fn native_participant_constructs_v1_output() {
+        let room_external_id = RoomExternalId::new("v1-construction").unwrap();
+        let mut rtc = Rtc::new(std::time::Instant::now());
+        let cid = rtc.direct_api().create_data_channel(Default::default());
+        let mut participant = Participant::new(
+            ParticipantConfig {
+                manual_sub: true,
+                room_id: entity::RoomId::from_external(&room_external_id),
+                participant_id: entity::ParticipantId::new(),
+                participant_external_id: ParticipantExternalId::new("alice").unwrap(),
+                connection_id: entity::ConnectionId::new(),
+                profile: ConnectionProfile::Native,
+                initial_authorization_expiry: None,
+                rtc,
+                resources: NegotiatedResources::empty_for_test(),
+            },
+            ShardId::new(0),
+            1_200,
+            1_200,
+        );
+
+        participant.signaling.set_cid(cid);
+        participant.stage_v1_test_output().unwrap();
+        let bytes = participant.take_v1_test_output().expect("initial output");
+        assert!(matches!(
+            pulsebeam_proto::codec::decode_server(&bytes),
+            Ok(pulsebeam_proto::signaling_v1::ServerMessage {
+                payload: Some(pulsebeam_proto::signaling_v1::server_message::Payload::Catalog(_))
+            })
+        ));
+    }
 
     #[test]
     fn native_config_retains_external_identity_and_wire_expiry() {
@@ -2113,6 +2154,122 @@ mod authorization_tests {
         let attempts = participant.v1_test_channel_write_attempts();
         assert_eq!(attempts.len(), failed.len() + 1);
         assert_eq!(attempts.last(), failed.first());
+        assert_eq!(sink.exit_count, 1);
+    }
+}
+
+#[cfg(test)]
+mod v1_server_integration_tests {
+    use super::*;
+    use crate::entity::{ParticipantExternalId, RoomExternalId};
+    use crate::participant::event::test_utils::MockParticipantSink;
+    use str0m::channel::ChannelData;
+
+    fn participant() -> (Participant, ChannelId) {
+        let room = RoomExternalId::new("v1-integration").unwrap();
+        let mut rtc = Rtc::new(std::time::Instant::now());
+        let cid = rtc.direct_api().create_data_channel(Default::default());
+        let mut participant = Participant::new(
+            ParticipantConfig {
+                manual_sub: true,
+                room_id: entity::RoomId::from_external(&room),
+                participant_id: entity::ParticipantId::new(),
+                participant_external_id: ParticipantExternalId::new("alice").unwrap(),
+                connection_id: entity::ConnectionId::new(),
+                profile: ConnectionProfile::Native,
+                initial_authorization_expiry: None,
+                rtc,
+                resources: NegotiatedResources::empty_for_test(),
+            },
+            ShardId::new(0),
+            1_200,
+            1_200,
+        );
+        participant.signaling.set_cid(cid);
+        participant.set_v1_test_write_channel_result(true);
+        (participant, cid)
+    }
+
+    #[test]
+    fn channel_data_uses_compressed_v1_and_emits_catalog_before_mapping() {
+        let (mut participant, cid) = participant();
+        let mut sink = MockParticipantSink::new();
+
+        participant.poll(Instant::now(), &mut sink);
+        let initial = participant.v1_test_channel_write_attempts().last().unwrap();
+        assert!(matches!(
+            pulsebeam_proto::codec::decode_server(initial),
+            Ok(pulsebeam_proto::signaling_v1::ServerMessage {
+                payload: Some(pulsebeam_proto::signaling_v1::server_message::Payload::Catalog(_))
+            })
+        ));
+
+        let intent =
+            pulsebeam_proto::codec::encode_client(&pulsebeam_proto::signaling_v1::ClientMessage {
+                payload: Some(
+                    pulsebeam_proto::signaling_v1::client_message::Payload::Intent(
+                        pulsebeam_proto::signaling_v1::Intent {
+                            revision: 1,
+                            send: None,
+                            receive: None,
+                        },
+                    ),
+                ),
+            })
+            .unwrap();
+        participant.handle_event(
+            Instant::now(),
+            Event::ChannelData(ChannelData {
+                id: cid,
+                binary: true,
+                data: intent,
+            }),
+            &mut sink,
+        );
+        participant.poll(Instant::now(), &mut sink);
+
+        let mapping = participant.v1_test_channel_write_attempts().last().unwrap();
+        assert!(matches!(
+            pulsebeam_proto::codec::decode_server(mapping),
+            Ok(pulsebeam_proto::signaling_v1::ServerMessage {
+                payload: Some(
+                    pulsebeam_proto::signaling_v1::server_message::Payload::Mapping(
+                        pulsebeam_proto::signaling_v1::Mapping {
+                            intent_revision: 1,
+                            ..
+                        }
+                    )
+                )
+            })
+        ));
+    }
+
+    #[test]
+    fn malformed_channel_data_emits_terminal_invalid_message() {
+        let (mut participant, cid) = participant();
+        let mut sink = MockParticipantSink::new();
+        participant.handle_event(
+            Instant::now(),
+            Event::ChannelData(ChannelData {
+                id: cid,
+                binary: true,
+                data: vec![0xff],
+            }),
+            &mut sink,
+        );
+        participant.poll(Instant::now(), &mut sink);
+
+        assert!(matches!(
+            participant
+                .v1_test_channel_write_attempts()
+                .last()
+                .and_then(|bytes| pulsebeam_proto::codec::decode_server(bytes).ok()),
+            Some(pulsebeam_proto::signaling_v1::ServerMessage {
+                payload: Some(pulsebeam_proto::signaling_v1::server_message::Payload::Error(
+                    pulsebeam_proto::signaling_v1::Error { code, fatal: true, .. }
+                ))
+            }) if code == pulsebeam_proto::signaling_v1::ErrorCode::InvalidMessage as i32
+        ));
         assert_eq!(sink.exit_count, 1);
     }
 }
