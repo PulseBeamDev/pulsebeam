@@ -2071,6 +2071,50 @@ mod authorization_tests {
         assert_eq!(sink.exit_count, 0);
         assert!(participant.signaling.needs_poll());
     }
+
+    #[test]
+    fn expiry_retries_fatal_bytes_then_commits_and_exits_through_participant_poll() {
+        let room_external_id = RoomExternalId::new("expiry-retry").unwrap();
+        let connection_id = entity::ConnectionId::new();
+        let mut rtc = Rtc::new(std::time::Instant::now());
+        let cid = rtc.direct_api().create_data_channel(Default::default());
+        let mut participant = Participant::new(
+            ParticipantConfig {
+                manual_sub: true,
+                room_id: entity::RoomId::from_external(&room_external_id),
+                participant_id: entity::ParticipantId::new(),
+                participant_external_id: ParticipantExternalId::new("alice").unwrap(),
+                connection_id,
+                profile: ConnectionProfile::Native,
+                initial_authorization_expiry: None,
+                rtc,
+                resources: NegotiatedResources::empty_for_test(),
+            },
+            ShardId::new(0),
+            1_200,
+            1_200,
+        );
+        participant.enable_v1_test_output("alice".to_owned(), cid);
+        participant.apply(
+            ParticipantEffect::AuthorizationExpired { connection_id },
+            None,
+        );
+        let mut sink = crate::participant::event::test_utils::MockParticipantSink::new();
+
+        participant.set_v1_test_write_channel_result(false);
+        let _ = participant.poll(Instant::now(), &mut sink);
+        let failed = participant.v1_test_channel_write_attempts().to_vec();
+        assert!(!failed.is_empty());
+        assert!(failed.iter().all(|bytes| bytes == &failed[0]));
+        assert_eq!(sink.exit_count, 0);
+
+        participant.set_v1_test_write_channel_result(true);
+        let _ = participant.poll(Instant::now(), &mut sink);
+        let attempts = participant.v1_test_channel_write_attempts();
+        assert_eq!(attempts.len(), failed.len() + 1);
+        assert_eq!(attempts.last(), failed.first());
+        assert_eq!(sink.exit_count, 1);
+    }
 }
 
 #[cfg(test)]

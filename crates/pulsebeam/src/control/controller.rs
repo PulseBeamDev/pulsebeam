@@ -1790,39 +1790,72 @@ mod authorization_tests {
         );
     }
 
-    #[test]
-    fn stale_expiry_work_after_renewal_cannot_fence_the_renewed_lease() {
-        let mut actor = actor();
-        let room_id = RoomId::from_external(&RoomExternalId::new("renewed-expiry").unwrap());
-        let participant_id = ParticipantId::new();
+    #[tokio::test(start_paused = true)]
+    async fn renewal_before_deadline_removes_stale_expiry_work() {
+        use pulsebeam_core::auth::{
+            DEVELOPMENT_API_KEY_ID, DEVELOPMENT_API_VERIFYING_KEY, DEVELOPMENT_PROJECT_ID,
+            ProjectKey, ProjectKeys, mint_development_token,
+        };
+
+        let (mut actor, mut update_rx) = actor_with_updates();
+        actor.project_registry = Some(
+            ProjectRegistry::new(vec![ProjectKeys {
+                project_id: DEVELOPMENT_PROJECT_ID,
+                keys: vec![ProjectKey {
+                    key_id: DEVELOPMENT_API_KEY_ID,
+                    verifying_key: DEVELOPMENT_API_VERIFYING_KEY,
+                }],
+            }])
+            .unwrap(),
+        );
+        let room_external_id = RoomExternalId::new("renewed-expiry").unwrap();
+        let room_id = RoomId::derive(&DEVELOPMENT_PROJECT_ID, &room_external_id);
+        let participant_external_id = participant_external_id();
+        let participant_id = ParticipantId::derive(&room_id, &participant_external_id);
+        let wall_now = SystemTime::now();
+        let unix_now = wall_now.duration_since(UNIX_EPOCH).unwrap().as_secs();
         let runtime_now = tokio::time::Instant::now();
-        let old_lease = authorization_lease(10, UNIX_EPOCH, runtime_now);
+        let old_lease = authorization_lease(unix_now + 10, wall_now, runtime_now);
         let transport = actor.core.reserve_transport(ShardId::new(0), runtime_now);
         actor
-            .commit_candidate(
+            .commit_candidate_with_identity(
                 participant_id,
-                participant_external_id(),
+                participant_external_id.clone(),
+                DEVELOPMENT_PROJECT_ID,
+                room_external_id.clone(),
                 room_id,
                 ShardId::new(0),
                 transport,
                 connection_id(1),
                 Some(old_lease),
                 ConnectionProfile::Native,
-                UNIX_EPOCH,
+                wall_now,
             )
             .unwrap();
-        let stale_work = *actor.authorization_expiries.first().unwrap();
-        let renewed_lease = authorization_lease(20, UNIX_EPOCH, runtime_now);
-        actor.authorization_expiries.clear();
-        actor
-            .core
-            .registry
-            .update_authorization(&participant_id, connection_id(1), renewed_lease);
-        actor.authorization_expiries.insert(stale_work);
 
+        tokio::time::advance(Duration::from_secs(9)).await;
+        let token =
+            mint_development_token(&room_external_id, &participant_external_id, unix_now + 30)
+                .unwrap();
+        actor.renew_authorization(
+            participant_id,
+            connection_id(1),
+            crate::participant::effect::AuthorizationRequestId::new(1),
+            crate::participant::effect::RenewalToken::new(token).unwrap(),
+        );
+        let renewal = update_rx.try_recv().expect("renewal is staged");
+        assert!(matches!(
+            renewal.participant_effects.as_slice(),
+            [(
+                _,
+                crate::participant::ParticipantEffect::AuthorizationRenewed { .. }
+            )]
+        ));
+
+        tokio::time::advance(Duration::from_secs(1)).await;
         actor.expire_authorizations(
-            runtime_now + Duration::from_secs(10),
-            UNIX_EPOCH + Duration::from_secs(10),
+            tokio::time::Instant::now(),
+            wall_now + Duration::from_secs(10),
         );
 
         assert_eq!(
@@ -1831,10 +1864,12 @@ mod authorization_tests {
                 .registry
                 .get_participant(&participant_id)
                 .unwrap()
-                .authorization,
-            Some(renewed_lease)
+                .authorization
+                .unwrap()
+                .expires_at_unix_seconds(),
+            unix_now + 30
         );
-        assert!(actor.authorization_expiries.is_empty());
+        assert_eq!(actor.authorization_expiries.len(), 1);
     }
 
     #[test]
