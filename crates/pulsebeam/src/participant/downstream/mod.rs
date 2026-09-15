@@ -300,6 +300,11 @@ impl ReceiverPlayout {
             self.confirm = None;
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn is_locked(&self) -> bool {
+        self.locked
+    }
 }
 
 pub struct Downstream {
@@ -607,6 +612,14 @@ impl Downstream {
 
     pub(crate) fn take_audio_playout_reset_required(&mut self) -> bool {
         self.audio.take_playout_reset_required()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn v1_test_receiver_locked(&self, kind: MediaKind, receiver_index: u32) -> bool {
+        match kind {
+            MediaKind::Video => self.video.v1_test_receiver_locked(receiver_index),
+            MediaKind::Audio => self.audio.v1_test_receiver_locked(receiver_index),
+        }
     }
 
     pub fn refresh_ssrc(

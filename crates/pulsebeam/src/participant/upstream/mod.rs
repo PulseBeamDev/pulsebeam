@@ -283,6 +283,20 @@ pub struct Upstream {
 pub type UpstreamAllocator = Upstream;
 
 impl Upstream {
+    #[cfg(test)]
+    pub(crate) fn v1_test_publications(&self) -> Vec<(u32, TrackId, bool)> {
+        let mut publications: Vec<_> = self
+            .audio
+            .media
+            .published_tracks
+            .iter()
+            .chain(self.video.media.published_tracks.iter())
+            .map(|slot| (slot.media_index, slot.descriptor.id(), slot.in_topology))
+            .collect();
+        publications.sort_by_key(|(index, _, _)| *index);
+        publications
+    }
+
     pub(crate) fn new(ctx: LogCtx) -> Self {
         Self {
             audio: UpstreamAudio::new(ctx),

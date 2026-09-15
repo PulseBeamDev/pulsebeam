@@ -530,6 +530,49 @@ impl Participant {
         );
     }
 
+    #[cfg(test)]
+    pub(crate) fn add_v1_test_sender(
+        &mut self,
+        sender_index: u32,
+        kind: TrackKind,
+        mid: Mid,
+    ) -> TrackId {
+        let track_id = self.participant_id.derive_track_id(kind, &mid);
+        let meta = crate::track::TrackMeta {
+            room_id: self.room_id,
+            shard_id: self.shard_id,
+            id: track_id,
+            origin: self.participant_id,
+            label: None,
+        };
+        let (sender, descriptor) = match kind {
+            TrackKind::Audio => track::new_audio(mid, meta),
+            TrackKind::Video => track::new_video(mid, meta, Vec::new()),
+            TrackKind::Data => unreachable!("native v1 has no data sender"),
+        };
+        assert!(
+            self.upstream
+                .add_published_track(sender_index, mid, sender, descriptor)
+        );
+        track_id
+    }
+
+    #[cfg(test)]
+    pub(crate) fn v1_test_publications(&self) -> Vec<(u32, TrackId, bool)> {
+        self.upstream.v1_test_publications()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn v1_test_receiver_locked(&self, kind: MediaKind, receiver_index: u32) -> bool {
+        self.downstream
+            .v1_test_receiver_locked(kind, receiver_index)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn v1_test_intent(&self) -> Option<&signaling::V1Intent> {
+        self.signaling.v1_intent()
+    }
+
     pub fn apply(&mut self, effect: ParticipantEffect, track_handle: Option<TrackHandle>) {
         match effect {
             ParticipantEffect::ParticipantsChanged { added, removed } => {

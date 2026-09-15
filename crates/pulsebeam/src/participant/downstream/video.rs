@@ -179,6 +179,14 @@ impl DerefMut for DownstreamVideo {
 }
 
 impl VideoAllocator {
+    #[cfg(test)]
+    pub(crate) fn v1_test_receiver_locked(&self, receiver_index: u32) -> bool {
+        self.slots
+            .values()
+            .find(|slot| slot.media_index == receiver_index)
+            .is_some_and(|slot| slot.playout.is_locked())
+    }
+
     fn invalidate_receiver_previews(&mut self) {
         self.receiver_assignment_revision = self.receiver_assignment_revision.wrapping_add(1);
     }

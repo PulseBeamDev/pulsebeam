@@ -162,6 +162,15 @@ pub struct Heard {
 }
 
 impl AudioAllocator {
+    #[cfg(test)]
+    pub(crate) fn v1_test_receiver_locked(&self, receiver_index: u32) -> bool {
+        self.slots
+            .iter()
+            .flatten()
+            .find(|slot| slot.media_index == receiver_index)
+            .is_some_and(|slot| slot.playout.is_locked())
+    }
+
     pub(crate) fn new(ctx: LogCtx, manual_sub: bool) -> Self {
         Self {
             ctx,
