@@ -5,6 +5,8 @@ use pulsebeam_proto::reliable::{RelControl, rel_control};
 use pulsebeam_runtime::net::{self};
 use std::time::Duration;
 use str0m::bwe::BweKind;
+#[cfg(test)]
+use str0m::channel::ChannelId;
 use str0m::media::{KeyframeRequestKind, MediaKind, Mid};
 use str0m::{
     Event, Rtc, RtcError,
@@ -513,6 +515,51 @@ impl Participant {
     #[cfg(test)]
     pub(crate) fn v1_test_mapping(&self) -> pulsebeam_proto::signaling_v1::Mapping {
         self.v1_mapping()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn enable_v1_test_output(&mut self, recipient_external_id: String, cid: ChannelId) {
+        self.signaling = Signaling::new_v1(self.log_ctx(), recipient_external_id);
+        self.signaling.set_cid(cid);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_v1_test_output_cid(&mut self, cid: ChannelId) {
+        self.signaling.set_cid(cid);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_v1_test_write_channel_result(&mut self, result: bool) {
+        self.transport.set_test_write_channel_result(result);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn v1_test_catalog_revision(&self) -> u64 {
+        self.signaling.v1_test_catalog_revision()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn stage_v1_test_output(&mut self) -> Result<(), signaling::V1OutputBuildError> {
+        let mut snapshot = self.downstream.signaling_snapshot();
+        snapshot.participants = self.signaling.participants_snapshot();
+        self.signaling.stage_v1_output(&snapshot, self.v1_mapping())
+    }
+
+    /// Exercises the production channel-write commit/retry decision without
+    /// routing v1 signaling through the native lifecycle before Task 8.
+    #[cfg(test)]
+    pub(crate) fn flush_v1_test_output(&mut self) -> Option<(Vec<u8>, bool)> {
+        let mut snapshot = self.downstream.signaling_snapshot();
+        snapshot.participants = self.signaling.participants_snapshot();
+        let output = self.signaling.poll(&snapshot)?;
+        let bytes = output.bytes;
+        let committed = self.transport.write_channel(output.cid, true, &bytes);
+        if committed {
+            self.signaling.commit_sent();
+        } else {
+            self.signaling.retry_pending();
+        }
+        Some((bytes, committed))
     }
 
     #[cfg(test)]

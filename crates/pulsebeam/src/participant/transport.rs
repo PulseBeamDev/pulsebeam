@@ -108,6 +108,8 @@ pub(crate) struct Transport {
     rtc_clock: Instant,
     rtc_needs_drain: bool,
     exited: bool,
+    #[cfg(test)]
+    write_channel_result: Option<bool>,
     #[cfg(debug_assertions)]
     egress_guard: crate::rtp::egress_guard::EgressGuard,
     #[cfg(feature = "sim")]
@@ -135,6 +137,8 @@ impl Transport {
             rtc_clock: now,
             rtc_needs_drain: true,
             exited: false,
+            #[cfg(test)]
+            write_channel_result: None,
             #[cfg(debug_assertions)]
             egress_guard: crate::rtp::egress_guard::EgressGuard::new(),
             #[cfg(feature = "sim")]
@@ -225,10 +229,19 @@ impl Transport {
     }
 
     pub(crate) fn write_channel(&mut self, cid: ChannelId, binary: bool, bytes: &[u8]) -> bool {
+        #[cfg(test)]
+        if let Some(result) = self.write_channel_result.take() {
+            return result;
+        }
         let Some(mut channel) = self.rtc.channel(cid) else {
             return false;
         };
         channel.write(binary, bytes).is_ok()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_test_write_channel_result(&mut self, result: bool) {
+        self.write_channel_result = Some(result);
     }
 
     pub(crate) fn channel_config(

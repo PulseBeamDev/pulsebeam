@@ -1532,6 +1532,13 @@ impl Signaling {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(crate) fn v1_test_catalog_revision(&self) -> u64 {
+        self.v1_output
+            .as_ref()
+            .map_or(0, |output| output.scheduler.catalog_revision)
+    }
+
     pub fn set_cid(&mut self, cid: ChannelId) {
         if self.cid.replace(cid).is_some()
             && let Some(output) = &mut self.v1_output
@@ -1902,6 +1909,10 @@ impl Signaling {
 #[cfg(test)]
 mod v1_output_tests {
     use super::*;
+    use crate::control::NegotiatedResources;
+    use crate::control::controller::ConnectionProfile;
+    use crate::id::ShardId;
+    use crate::participant::core::{Participant, ParticipantConfig};
 
     fn catalog(tracks: &[(&str, &str)]) -> media_signaling::CatalogSnapshot {
         media_signaling::CatalogSnapshot {
@@ -1940,6 +1951,51 @@ mod v1_output_tests {
     fn next(scheduler: &mut V1OutputScheduler) -> media_signaling::ServerMessage {
         let bytes = scheduler.poll().expect("scheduled output");
         pulsebeam_proto::codec::decode_server(&bytes).expect("valid server output")
+    }
+
+    fn participant_with_v1_channel() -> (Participant, ChannelId) {
+        let room = crate::entity::RoomExternalId::new("room").unwrap();
+        let mut rtc = str0m::Rtc::new(std::time::Instant::now());
+        let cid = rtc.direct_api().create_data_channel(Default::default());
+        (
+            Participant::new(
+                ParticipantConfig {
+                    manual_sub: true,
+                    room_id: crate::entity::RoomId::from_external(&room),
+                    participant_id: crate::entity::ParticipantId::new(),
+                    connection_id: crate::entity::ConnectionId::new(),
+                    profile: ConnectionProfile::Native,
+                    rtc,
+                    resources: NegotiatedResources::empty_for_test(),
+                },
+                ShardId::new(0),
+                1_200,
+                1_200,
+            ),
+            cid,
+        )
+    }
+
+    #[test]
+    fn participant_transport_retries_v1_bytes_before_committing_catalog() {
+        let (mut participant, cid) = participant_with_v1_channel();
+        participant.enable_v1_test_output("self".to_owned(), cid);
+        participant.stage_v1_test_output().unwrap();
+        participant.set_v1_test_write_channel_result(false);
+
+        let (failed, committed) = participant.flush_v1_test_output().unwrap();
+        assert!(
+            !committed,
+            "forced transport backpressure must retain the pending output"
+        );
+        assert_eq!(participant.v1_test_catalog_revision(), 0);
+
+        participant.set_v1_test_output_cid(cid);
+        participant.set_v1_test_write_channel_result(true);
+        let (retried, committed) = participant.flush_v1_test_output().unwrap();
+        assert!(committed);
+        assert_eq!(retried, failed);
+        assert_eq!(participant.v1_test_catalog_revision(), 1);
     }
 
     #[test]
