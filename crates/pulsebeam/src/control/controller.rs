@@ -1914,24 +1914,15 @@ mod authorization_tests {
                 if participant == participant_id && connection_id == old_connection
         ));
 
-        let replacement_transport = actor
-            .core
-            .reserve_transport(ShardId::new(0), tokio::time::Instant::now());
-        let previous = actor
-            .commit_candidate(
-                participant_id,
-                participant_external_id(),
-                room_id,
-                ShardId::new(0),
-                replacement_transport,
-                replacement_connection,
-                None,
-                ConnectionProfile::Native,
-                UNIX_EPOCH + Duration::from_secs(10),
-            )
-            .unwrap()
-            .expect("replacement retires the expired incarnation");
-        actor.terminate_incarnation(participant_id, previous, false);
+        actor.handle_shard_event((ShardId::new(0), close));
+        assert!(
+            actor
+                .core
+                .registry
+                .get_participant(&participant_id)
+                .is_none(),
+            "the real matching close removes the expired controller incarnation"
+        );
         let mut applied = Vec::new();
         for _ in 0..4 {
             let count = shard.apply_updates(8);
@@ -1940,9 +1931,61 @@ mod authorization_tests {
                 break;
             }
         }
-        assert_eq!(shard.participant_count(), 0, "applied updates: {applied:?}");
+        assert_eq!(
+            shard.participant_count(),
+            0,
+            "the matching close tears down participant media; applied updates: {applied:?}"
+        );
 
-        actor.handle_shard_event((ShardId::new(0), close));
+        let replacement_transport = actor
+            .core
+            .reserve_transport(ShardId::new(0), tokio::time::Instant::now());
+        assert!(
+            actor
+                .commit_candidate(
+                    participant_id,
+                    participant_external_id(),
+                    room_id,
+                    ShardId::new(0),
+                    replacement_transport,
+                    replacement_connection,
+                    None,
+                    ConnectionProfile::Native,
+                    UNIX_EPOCH + Duration::from_secs(10),
+                )
+                .unwrap()
+                .is_none(),
+            "the matching close removed the old controller incarnation"
+        );
+        let (replacement_ack_tx, replacement_ack_rx) = oneshot::channel();
+        shard.on_command(
+            ShardCommand::MaterializeParticipant {
+                transport: replacement_transport,
+                config: Box::new(ParticipantConfig {
+                    manual_sub: true,
+                    room_id,
+                    participant_id,
+                    participant_external_id: participant_external_id(),
+                    connection_id: replacement_connection,
+                    profile: ConnectionProfile::Native,
+                    initial_authorization_expiry: None,
+                    rtc: Rtc::new(tokio::time::Instant::now().into()),
+                    resources: NegotiatedResources::empty_for_test(),
+                }),
+                ack: replacement_ack_tx,
+            },
+            &router,
+        );
+        assert_eq!(replacement_ack_rx.await, Ok(true));
+        assert_eq!(shard.participant_count(), 1);
+
+        actor.handle_shard_event((
+            ShardId::new(0),
+            ShardEvent::ParticipantClosed {
+                participant: participant_id,
+                connection_id: old_connection,
+            },
+        ));
         assert_eq!(
             actor
                 .core
@@ -1952,6 +1995,12 @@ mod authorization_tests {
                 .connection_id,
             replacement_connection
         );
+        assert_eq!(
+            shard.apply_updates(8),
+            0,
+            "a replayed old close must not stage replacement teardown"
+        );
+        assert_eq!(shard.participant_count(), 1);
     }
 
     #[tokio::test(start_paused = true)]
