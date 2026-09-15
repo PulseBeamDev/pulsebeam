@@ -496,6 +496,40 @@ impl Participant {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn add_v1_test_receiver(&mut self, slot: SlotConfig) {
+        self.downstream.add_slot(slot);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn add_v1_test_track(&mut self, track: Track) {
+        if track.kind() == TrackKind::Video {
+            self.downstream.video.add_track(track);
+        } else {
+            self.on_track_published(TrackHandle::default(), track);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn v1_test_mapping(&self) -> pulsebeam_proto::signaling_v1::Mapping {
+        self.v1_mapping()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn lock_v1_test_playout(&mut self, kind: MediaKind, mid: Mid) {
+        self.downstream.set_playout_delay(Some((10, 10)));
+        self.downstream.record_playout_delay_stamp(
+            kind,
+            mid,
+            None,
+            Some((
+                str0m::media::MediaTime::from_hundredths(1),
+                str0m::media::MediaTime::from_hundredths(1),
+            )),
+            str0m::rtp::SeqNo::from(1u64),
+        );
+    }
+
     pub fn apply(&mut self, effect: ParticipantEffect, track_handle: Option<TrackHandle>) {
         match effect {
             ParticipantEffect::ParticipantsChanged { added, removed } => {
