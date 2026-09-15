@@ -1,0 +1,8 @@
+set shell := ["bash", "-euc"]
+
+test-fast:
+    cargo test -p pulsebeam-rtc
+
+test-slow:
+    cargo test -p pulsebeam-rtc --test scaling -- --ignored --exact many_connections_many_streams
+    scripts/run-browser-matrix.sh --platform linux-x86_64

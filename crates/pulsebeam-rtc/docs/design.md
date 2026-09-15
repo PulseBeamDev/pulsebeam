@@ -1034,8 +1034,8 @@ traffic is dropped and counted.
 ## Validation boundary
 
 Crate-local deterministic and live-browser sources live under
-`crates/pulsebeam-rtc`. The repository gate additionally validates workspace
-consumers without changing their behavior.
+`crates/pulsebeam-rtc`. Web and React own their consumer browser coverage; the
+repository gate validates complete workspace acceptance.
 
 Acceptance requires:
 
@@ -1064,17 +1064,18 @@ Acceptance requires:
   mutually exclusive RFC 8888/TWCC negotiation are explicit `unsupported`
   records, never silent skips.
 
-Normal `cargo test` is browser-free. The canonical local and CI command is:
+Normal `cargo test` is browser-free. The canonical RTC local and CI command is:
 
 ```sh
-crates/pulsebeam-rtc/scripts/run-browser-matrix.sh --platform linux-x86_64 --include-root-tests
+just --justfile crates/pulsebeam-rtc/Justfile test-slow
 ```
 
 It provisions/verifies the fixed cache, runs both exact ignored matrices, and
-then invokes root `just test` with the same Chrome binary for existing consumer
-browser regression tests. Logs, exact offer inputs, and JSON reports are emitted
-under `target/pulsebeam-rtc-browser-artifacts` and uploaded by CI. Other
-platforms, ICE restart, and renegotiation remain outside the v3 profile.
+the exact ignored scaling gate. Logs, exact offer inputs, and JSON reports are
+emitted under `target/pulsebeam-rtc-browser-artifacts` and uploaded by CI. Run
+root `just test` for complete workspace acceptance, including consumer-owned Web
+and React browser coverage. Other platforms, ICE restart, and renegotiation
+remain outside the v3 profile.
 
 Stored SDP cannot prove runtime interoperability. Differential checks against
 `str0m`, Ericsson SCReAM, or libwebrtc are component evidence only and never

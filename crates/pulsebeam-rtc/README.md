@@ -227,8 +227,9 @@ dependency and does not expose mutable controller internals.
 ## Validation boundary
 
 Crate checks, fixtures, deterministic tests, benchmarks, browser sources, and
-browser evidence are owned by `crates/pulsebeam-rtc`. The root `just test` gate
-also runs workspace consumers and their existing browser regression suite.
+browser evidence are owned by `crates/pulsebeam-rtc`. Web and React own their
+consumer browser coverage; root `just test` runs the complete workspace
+acceptance gate.
 
 Required evidence includes deterministic crate-local tests and simulation for
 negotiation, media-clock normalization, source switching, RTP/RTCP continuity,
@@ -246,20 +247,22 @@ tests.
 The binding Linux x86_64 matrix is Chrome/ChromeDriver `153.0.8010.36` and
 Firefox ESR `140.15.0esr` with geckodriver `0.36.0`. Exact URLs, lengths, hashes,
 and version probes live in `browser/browser-matrix.json`. Normal `cargo test`
-runs are offline and never provision or launch a browser. Run the complete local
-and CI browser gate with:
+runs are offline and never provision or launch a browser. Run the complete RTC
+local and CI gate with:
 
 ```sh
-crates/pulsebeam-rtc/scripts/run-browser-matrix.sh --platform linux-x86_64 --include-root-tests
+just --justfile crates/pulsebeam-rtc/Justfile test-slow
 ```
 
 The command provisions into `target/pulsebeam-rtc-browsers/linux-x86_64`, runs
-the exact ignored Chrome and Firefox RTC matrices, and then invokes the literal
-root `just test` with the same Chrome binary. Browser/driver logs, offer inputs,
-and compact JSON scenario reports are written under
+the exact ignored Chrome and Firefox RTC matrices. Browser/driver logs, offer
+inputs, and compact JSON scenario reports are written under
 `target/pulsebeam-rtc-browser-artifacts`. Other platforms, ICE restart, and
 renegotiation are not part of the accepted v3 profile. Unsupported browser
 profile differences are recorded in each matrix report rather than skipped.
+
+Run root `just test` for complete workspace acceptance, including the
+consumer-owned Web and React browser coverage.
 
 Detailed public types, ownership decisions, alternatives considered, and their
 rationale are specified in [docs/design.md](docs/design.md). Detailed
