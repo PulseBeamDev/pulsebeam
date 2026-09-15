@@ -1532,26 +1532,30 @@ impl Signaling {
         signaling
     }
 
-    pub(crate) fn stage_authorization(&mut self, expires_at_unix_seconds: i64) {
+    pub(crate) fn stage_authorization(&mut self, expires_at_unix_seconds: i64) -> bool {
         let Some(output) = &mut self.v1_output else {
-            return;
+            return true;
         };
-        if output.authorization_responses.len() < MAX_PENDING_AUTHORIZATION_RESPONSES {
-            output
-                .authorization_responses
-                .push_back(AuthorizationResponse::Accepted(expires_at_unix_seconds));
+        if output.authorization_responses.len() >= MAX_PENDING_AUTHORIZATION_RESPONSES {
+            return false;
         }
+        output
+            .authorization_responses
+            .push_back(AuthorizationResponse::Accepted(expires_at_unix_seconds));
+        true
     }
 
-    pub(crate) fn stage_authorization_rejected(&mut self) {
+    pub(crate) fn stage_authorization_rejected(&mut self) -> bool {
         let Some(output) = &mut self.v1_output else {
-            return;
+            return true;
         };
-        if output.authorization_responses.len() < MAX_PENDING_AUTHORIZATION_RESPONSES {
-            output
-                .authorization_responses
-                .push_back(AuthorizationResponse::Rejected);
+        if output.authorization_responses.len() >= MAX_PENDING_AUTHORIZATION_RESPONSES {
+            return false;
         }
+        output
+            .authorization_responses
+            .push_back(AuthorizationResponse::Rejected);
+        true
     }
 
     pub(crate) fn stage_v1_output(
@@ -2660,6 +2664,37 @@ mod authorization_tests {
                 ))
             })
         ));
+    }
+
+    #[test]
+    fn authorization_response_capacity_refuses_unstaged_outcomes_until_a_commit() {
+        let room = crate::entity::RoomId::from_external(
+            &crate::entity::RoomExternalId::new("room").unwrap(),
+        );
+        let ctx = LogCtx {
+            room_id: room,
+            participant_id: crate::entity::ParticipantId::new(),
+        };
+        let mut signaling = Signaling::new_v1(ctx, "self".to_owned());
+        let mut rtc = str0m::Rtc::new(std::time::Instant::now());
+        signaling.set_cid(rtc.direct_api().create_data_channel(Default::default()));
+        let snapshot = SignalingSnapshot {
+            publications: Vec::new(),
+            participants: HashMap::new(),
+            video: Vec::new(),
+            audio: Vec::new(),
+        };
+        for expiry in 0..MAX_PENDING_AUTHORIZATION_RESPONSES {
+            assert!(signaling.stage_authorization(expiry as i64));
+        }
+        assert!(!signaling.stage_authorization(999));
+        let first = signaling.poll(&snapshot).expect("first queued output");
+        assert_eq!(
+            signaling.poll(&snapshot).expect("exact retry").bytes,
+            first.bytes
+        );
+        signaling.commit_sent();
+        assert!(signaling.stage_authorization(999));
     }
 }
 

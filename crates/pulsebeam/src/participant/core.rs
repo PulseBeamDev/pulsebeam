@@ -739,8 +739,9 @@ impl Participant {
                     && connection_id == self.connection_id
                     && self.pending_authorization_request == Some(request_id)
                 {
-                    self.pending_authorization_request = None;
-                    self.signaling.stage_authorization(expires_at_unix_seconds);
+                    if self.signaling.stage_authorization(expires_at_unix_seconds) {
+                        self.pending_authorization_request = None;
+                    }
                 }
             }
             ParticipantEffect::AuthorizationRejected {
@@ -752,11 +753,48 @@ impl Participant {
                     && connection_id == self.connection_id
                     && self.pending_authorization_request == Some(request_id)
                 {
-                    self.pending_authorization_request = None;
-                    self.signaling.stage_authorization_rejected();
+                    if self.signaling.stage_authorization_rejected() {
+                        self.pending_authorization_request = None;
+                    }
                 }
             }
         }
+    }
+
+    pub(crate) fn apply_authorization_result(&mut self, effect: ParticipantEffect) -> bool {
+        match effect {
+            ParticipantEffect::AuthorizationRenewed {
+                participant_id,
+                connection_id,
+                request_id,
+                expires_at_unix_seconds,
+            } if participant_id == self.participant_id
+                && connection_id == self.connection_id
+                && self.pending_authorization_request == Some(request_id) =>
+            {
+                if !self.signaling.stage_authorization(expires_at_unix_seconds) {
+                    return false;
+                }
+                self.pending_authorization_request = None;
+            }
+            ParticipantEffect::AuthorizationRejected {
+                participant_id,
+                connection_id,
+                request_id,
+            } if participant_id == self.participant_id
+                && connection_id == self.connection_id
+                && self.pending_authorization_request == Some(request_id) =>
+            {
+                if !self.signaling.stage_authorization_rejected() {
+                    return false;
+                }
+                self.pending_authorization_request = None;
+            }
+            ParticipantEffect::AuthorizationRenewed { .. }
+            | ParticipantEffect::AuthorizationRejected { .. } => {}
+            _ => return true,
+        }
+        true
     }
 
     pub(crate) fn input<'a>(&mut self, input: ParticipantInput<'a>) {
