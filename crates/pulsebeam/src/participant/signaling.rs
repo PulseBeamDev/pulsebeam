@@ -20,6 +20,8 @@ pub enum SignalingError {
     DecodeFailed,
     #[error("Request complexity limit exceeded")]
     ComplexityExceeded,
+    #[error("invalid v1 signaling output: {0}")]
+    V1Output(String),
 }
 
 pub enum SignalingInputEvent {
@@ -442,6 +444,8 @@ mod v1_intent_tests {
                         manual_sub: true,
                         room_id: crate::entity::RoomId::from_external(&room),
                         participant_id: crate::entity::ParticipantId::new(),
+                        participant_external_id: crate::entity::ParticipantExternalId::new("self")
+                            .unwrap(),
                         connection_id: crate::entity::ConnectionId::new(),
                         profile: ConnectionProfile::Native,
                         rtc: Rtc::new(std::time::Instant::now()),
@@ -1150,6 +1154,12 @@ pub(crate) struct V1DesiredState {
     mapping: media_signaling::Mapping,
 }
 
+struct V1OutputState {
+    recipient_external_id: String,
+    history: V1CatalogHistory,
+    scheduler: V1OutputScheduler,
+}
+
 #[allow(
     dead_code,
     reason = "the replacement signaling transport supplies this state to the scheduler in the next unit"
@@ -1264,17 +1274,21 @@ impl V1OutputScheduler {
         Some(bytes)
     }
 
-    pub(crate) fn commit_sent(&mut self) {
+    pub(crate) fn commit_sent(&mut self) -> Option<media_signaling::CatalogSnapshot> {
         let Some(pending) = self.pending.take() else {
             debug_assert!(false, "v1 output commit requires a pending message");
-            return;
+            return None;
         };
         match pending.commit {
             V1Commit::Catalog { catalog, revision } => {
-                self.delivered_catalog = Some(catalog);
+                self.delivered_catalog = Some(catalog.clone());
                 self.catalog_revision = revision;
+                Some(catalog)
             }
-            V1Commit::Mapping(mapping) => self.delivered_mapping = Some(mapping),
+            V1Commit::Mapping(mapping) => {
+                self.delivered_mapping = Some(mapping);
+                None
+            }
         }
     }
 
@@ -1414,6 +1428,7 @@ pub struct Signaling {
     last_audio_intent: Option<AudioIntent>,
     last_playout_delay: Option<(u32, u32)>,
     pending_commit: Option<SignalingCommit>,
+    v1_output: Option<V1OutputState>,
     v1_revision: u64,
     v1_intent: Option<V1Intent>,
 }
@@ -1435,12 +1450,41 @@ impl Signaling {
             last_audio_intent: None,
             last_playout_delay: None,
             pending_commit: None,
+            v1_output: None,
             v1_revision: 0,
             v1_intent: None,
 
             slot_count: 0,
             audio_slot_count: 0,
         }
+    }
+
+    pub(crate) fn new_v1(ctx: LogCtx, recipient_external_id: String) -> Self {
+        let mut signaling = Self::new(ctx);
+        signaling.v1_output = Some(V1OutputState {
+            recipient_external_id,
+            history: V1CatalogHistory::default(),
+            scheduler: V1OutputScheduler::default(),
+        });
+        signaling
+    }
+
+    pub(crate) fn stage_v1_output(
+        &mut self,
+        snapshot: &SignalingSnapshot,
+        mapping: media_signaling::Mapping,
+    ) -> Result<(), V1OutputBuildError> {
+        let Some(output) = &mut self.v1_output else {
+            return Ok(());
+        };
+        output.scheduler.stage_validated(build_v1_desired_state(
+            &output.history,
+            self.ctx.participant_id,
+            &output.recipient_external_id,
+            snapshot,
+            mapping,
+        )?);
+        Ok(())
     }
 
     pub fn set_cid(&mut self, cid: ChannelId) {
@@ -1606,6 +1650,9 @@ impl Signaling {
     }
 
     pub(crate) fn needs_poll(&self) -> bool {
+        if self.v1_output.is_some() {
+            return self.cid.is_some() && (self.dirty_roster || self.dirty_bindings);
+        }
         self.cid.is_some()
             && self.pending_commit.is_none()
             && (self.dirty_roster || self.dirty_bindings)
@@ -1635,6 +1682,15 @@ impl Signaling {
         }
 
         let cid = self.cid?;
+
+        if let Some(output) = &mut self.v1_output {
+            let Some(bytes) = output.scheduler.poll() else {
+                self.dirty_roster = false;
+                self.dirty_bindings = false;
+                return None;
+            };
+            return Some(SignalingOutput { cid, bytes });
+        }
 
         // The roster: every publication the client could ask for, and the people
         // behind them. Video and audio both, because a pin has to be able to
@@ -1757,6 +1813,15 @@ impl Signaling {
     }
 
     pub(crate) fn commit_sent(&mut self) {
+        if let Some(output) = &mut self.v1_output {
+            if let Some(catalog) = output.scheduler.commit_sent() {
+                output.history.commit(&catalog);
+            }
+            // Keep polling until the staged causal sequence is exhausted.
+            self.dirty_roster = true;
+            self.dirty_bindings = true;
+            return;
+        }
         let Some(commit) = self.pending_commit.take() else {
             debug_assert!(false, "signaling commit requires a pending output");
             return;
@@ -1777,6 +1842,10 @@ impl Signaling {
     }
 
     pub(crate) fn retry_pending(&mut self) {
+        if let Some(output) = &mut self.v1_output {
+            output.scheduler.retry_pending();
+            return;
+        }
         let _ = self.pending_commit.take();
     }
 }
@@ -2144,6 +2213,67 @@ mod tests {
         assert!(signaling.poll(&snapshot).is_some(), "second retry emits");
         signaling.commit_sent();
         assert!(!signaling.needs_poll(), "a clean state needs no snapshot");
+    }
+
+    #[test]
+    fn native_v1_transport_commits_catalog_before_mapping() {
+        let room = crate::entity::RoomId::from_external(
+            &crate::entity::RoomExternalId::new("room").unwrap(),
+        );
+        let ctx = LogCtx {
+            room_id: room,
+            participant_id: crate::entity::ParticipantId::new(),
+        };
+        let mut signaling = Signaling::new_v1(ctx, "self".to_owned());
+        let remote = crate::entity::ParticipantId::new();
+        let track = crate::track::TrackMeta::labeled_media(
+            room,
+            crate::id::ShardId::new(0),
+            remote,
+            crate::entity::TrackKind::Video,
+            "camera".to_owned(),
+        );
+        let track_id = track.id.as_str();
+        let snapshot = SignalingSnapshot {
+            publications: vec![track],
+            participants: HashMap::from_iter([(remote.as_str(), "alice".to_owned())]),
+            video: Vec::new(),
+            audio: Vec::new(),
+        };
+        let mut rtc = str0m::Rtc::new(std::time::Instant::now());
+        signaling.set_cid(rtc.direct_api().create_data_channel(Default::default()));
+        signaling
+            .stage_v1_output(
+                &snapshot,
+                media_signaling::Mapping {
+                    intent_revision: 0,
+                    video: Some(media_signaling::TrackMappings {
+                        tracks: vec![media_signaling::TrackMapping {
+                            receiver_index: 0,
+                            track_id,
+                        }],
+                    }),
+                    audio: Some(media_signaling::TrackMappings { tracks: Vec::new() }),
+                },
+            )
+            .expect("valid desired state");
+
+        let first = signaling.poll(&snapshot).expect("catalog output");
+        assert!(matches!(
+            pulsebeam_proto::codec::decode_server(&first.bytes),
+            Ok(media_signaling::ServerMessage {
+                payload: Some(media_signaling::server_message::Payload::Catalog(_)),
+            })
+        ));
+        signaling.commit_sent();
+
+        let second = signaling.poll(&snapshot).expect("mapping output");
+        assert!(matches!(
+            pulsebeam_proto::codec::decode_server(&second.bytes),
+            Ok(media_signaling::ServerMessage {
+                payload: Some(media_signaling::server_message::Payload::Mapping(_)),
+            })
+        ));
     }
 
     #[test]
