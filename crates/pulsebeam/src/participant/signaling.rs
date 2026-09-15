@@ -2413,6 +2413,208 @@ mod v1_output_tests {
 #[cfg(test)]
 mod authorization_tests {
     use super::*;
+    use crate::control::NegotiatedResources;
+    use crate::control::controller::ConnectionProfile;
+    use crate::entity::{
+        ConnectionId, ParticipantExternalId, ParticipantId, RoomExternalId, TrackKind,
+    };
+    use crate::id::ShardId;
+    use crate::participant::core::{Participant, ParticipantConfig};
+    use crate::participant::downstream::SlotConfig;
+    use crate::participant::effect::AuthorizationRequestId;
+    use crate::participant::event::test_utils::MockParticipantSink;
+    use crate::participant::{ParticipantEffect, RoomParticipant};
+    use crate::track::{Track, TrackMeta};
+    use str0m::Rtc;
+    use str0m::media::{MediaKind, Mid};
+
+    struct RenewalFixture {
+        participant: Participant,
+        sink: MockParticipantSink,
+        participant_id: ParticipantId,
+        connection_id: ConnectionId,
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct RenewalStateSnapshot {
+        catalog: media_signaling::CatalogSnapshot,
+        intent: Option<(u64, Vec<String>, Vec<String>, Vec<String>, bool)>,
+        mapping: media_signaling::Mapping,
+        media_publications: Vec<(u32, TrackId, bool)>,
+        video_playout_locked: bool,
+        audio_playout_locked: bool,
+    }
+
+    impl RenewalFixture {
+        fn new() -> Self {
+            let room_external_id = RoomExternalId::new("renewal-room").unwrap();
+            let participant_id = ParticipantId::new();
+            let connection_id =
+                ConnectionId::from_bytes([0, 0, 0, 0, 0, 0, 0x70, 0, 0x80, 0, 0, 0, 0, 0, 0, 2]);
+            let mut rtc = Rtc::new(std::time::Instant::now());
+            let cid = rtc.direct_api().create_data_channel(Default::default());
+            let mut participant = Participant::new(
+                ParticipantConfig {
+                    manual_sub: true,
+                    room_id: crate::entity::RoomId::from_external(&room_external_id),
+                    participant_id,
+                    participant_external_id: ParticipantExternalId::new("self").unwrap(),
+                    connection_id,
+                    profile: ConnectionProfile::Native,
+                    initial_authorization_expiry: Some(100),
+                    rtc,
+                    resources: NegotiatedResources::empty_for_test(),
+                },
+                ShardId::new(0),
+                1_200,
+                1_200,
+            );
+            participant.enable_v1_test_output("self".to_owned(), cid);
+            participant.add_v1_test_receiver(SlotConfig {
+                media_index: 7,
+                mid: Mid::from("video"),
+                kind: MediaKind::Video,
+                ..SlotConfig::default()
+            });
+            participant.add_v1_test_receiver(SlotConfig {
+                media_index: 8,
+                mid: Mid::from("audio"),
+                kind: MediaKind::Audio,
+                ..SlotConfig::default()
+            });
+            let peer_id = ParticipantId::new();
+            participant.apply(
+                ParticipantEffect::ParticipantsChanged {
+                    added: vec![RoomParticipant {
+                        id: peer_id,
+                        external_id: ParticipantExternalId::new("peer").unwrap(),
+                    }],
+                    removed: Vec::new(),
+                },
+                None,
+            );
+            let video_track = Track::video(
+                TrackMeta::labeled_media(
+                    participant.room_id,
+                    ShardId::new(0),
+                    peer_id,
+                    TrackKind::Video,
+                    "camera".to_owned(),
+                ),
+                Vec::new(),
+                None,
+            );
+            let video_track_id = video_track.id().as_str();
+            participant.add_v1_test_track(video_track);
+            let audio_track = Track::audio(
+                TrackMeta::labeled_media(
+                    participant.room_id,
+                    ShardId::new(0),
+                    peer_id,
+                    TrackKind::Audio,
+                    "microphone".to_owned(),
+                ),
+                None,
+            );
+            let audio_track_id = audio_track.id().as_str();
+            participant.add_v1_test_track(audio_track);
+            let intent = media_signaling::ClientMessage {
+                payload: Some(media_signaling::client_message::Payload::Intent(
+                    media_signaling::Intent {
+                        revision: 1,
+                        send: None,
+                        receive: Some(media_signaling::ReceiveIntent {
+                            video: Some(media_signaling::VideoIntent {
+                                tracks: vec![media_signaling::VideoTrackIntent {
+                                    track_id: video_track_id,
+                                    options: None,
+                                }],
+                            }),
+                            audio: Some(media_signaling::AudioIntent {
+                                tracks: vec![media_signaling::AudioTrackIntent {
+                                    track_id: audio_track_id,
+                                    options: None,
+                                }],
+                                mode: media_signaling::AudioMode::ExplicitOnly.into(),
+                            }),
+                        }),
+                    },
+                )),
+            };
+            let mut sink = MockParticipantSink::new();
+            participant
+                .handle_v1_input(
+                    &pulsebeam_proto::codec::encode_client(&intent).unwrap(),
+                    &mut sink,
+                )
+                .unwrap();
+            participant.lock_v1_test_playout(MediaKind::Video, Mid::from("video"));
+            participant.lock_v1_test_playout(MediaKind::Audio, Mid::from("audio"));
+            Self {
+                participant,
+                sink,
+                participant_id,
+                connection_id,
+            }
+        }
+
+        fn request(&mut self) -> AuthorizationRequestId {
+            let renewal = media_signaling::ClientMessage {
+                payload: Some(
+                    media_signaling::client_message::Payload::RenewAuthorization(
+                        media_signaling::RenewAuthorization {
+                            token: "secret-token".to_owned(),
+                        },
+                    ),
+                ),
+            };
+            self.participant
+                .handle_v1_input(
+                    &pulsebeam_proto::codec::encode_client(&renewal).unwrap(),
+                    &mut self.sink,
+                )
+                .unwrap();
+            self.participant
+                .v1_test_pending_authorization_request()
+                .expect("renewal request is pending")
+        }
+
+        fn snapshot(&self) -> RenewalStateSnapshot {
+            let intent = self.participant.v1_test_intent().map(|intent| {
+                (
+                    intent.revision,
+                    intent
+                        .publications
+                        .iter()
+                        .map(|track| track.label.clone())
+                        .collect(),
+                    intent
+                        .video
+                        .iter()
+                        .map(|track| track.track_id.clone())
+                        .collect(),
+                    intent
+                        .audio
+                        .iter()
+                        .map(|track| track.track_id.clone())
+                        .collect(),
+                    intent.audio_auto,
+                )
+            });
+            RenewalStateSnapshot {
+                catalog: self.participant.v1_test_catalog().unwrap(),
+                intent,
+                mapping: self.participant.v1_test_mapping(),
+                media_publications: self.participant.v1_test_publications(),
+                video_playout_locked: self
+                    .participant
+                    .v1_test_receiver_locked(MediaKind::Video, 7),
+                audio_playout_locked: self
+                    .participant
+                    .v1_test_receiver_locked(MediaKind::Audio, 8),
+            }
+        }
+    }
 
     #[test]
     fn readiness_stages_authorization_before_catalog() {
@@ -2697,6 +2899,126 @@ mod authorization_tests {
         );
         signaling.commit_sent();
         assert!(signaling.stage_authorization(999));
+    }
+
+    #[test]
+    fn authorization_results_are_fenced_backpressured_and_media_invariant() {
+        let mut fixture = RenewalFixture::new();
+        let before = fixture.snapshot();
+        let request_id = fixture.request();
+        assert_eq!(fixture.snapshot(), before);
+
+        assert!(fixture.participant.apply_authorization_result(
+            ParticipantEffect::AuthorizationRenewed {
+                participant_id: fixture.participant_id,
+                connection_id: fixture.connection_id,
+                request_id: AuthorizationRequestId::new(999),
+                expires_at_unix_seconds: 200,
+            }
+        ));
+        assert_eq!(
+            fixture.participant.v1_test_pending_authorization_request(),
+            Some(request_id)
+        );
+        assert_eq!(fixture.snapshot(), before);
+
+        let retired_connection =
+            ConnectionId::from_bytes([0, 0, 0, 0, 0, 0, 0x70, 0, 0x80, 0, 0, 0, 0, 0, 0, 1]);
+        assert!(fixture.participant.apply_authorization_result(
+            ParticipantEffect::AuthorizationRejected {
+                participant_id: fixture.participant_id,
+                connection_id: retired_connection,
+                request_id,
+            }
+        ));
+        assert_eq!(
+            fixture.participant.v1_test_pending_authorization_request(),
+            Some(request_id)
+        );
+        assert_eq!(fixture.snapshot(), before);
+
+        assert!(fixture.participant.apply_authorization_result(
+            ParticipantEffect::AuthorizationRejected {
+                participant_id: fixture.participant_id,
+                connection_id: fixture.connection_id,
+                request_id,
+            }
+        ));
+        assert_eq!(
+            fixture.participant.v1_test_pending_authorization_request(),
+            None
+        );
+        let rejection = fixture.participant.take_v1_test_output().unwrap();
+        assert!(matches!(
+            pulsebeam_proto::codec::decode_server(&rejection),
+            Ok(media_signaling::ServerMessage {
+                payload: Some(media_signaling::server_message::Payload::Error(
+                    media_signaling::Error { code, fatal: false, .. }
+                ))
+            }) if code == media_signaling::ErrorCode::AuthorizationRejected as i32
+        ));
+        assert_eq!(fixture.snapshot(), before);
+
+        let request_id = fixture.request();
+        assert!(fixture.participant.apply_authorization_result(
+            ParticipantEffect::AuthorizationRenewed {
+                participant_id: fixture.participant_id,
+                connection_id: fixture.connection_id,
+                request_id,
+                expires_at_unix_seconds: 300,
+            }
+        ));
+        assert_eq!(
+            fixture.participant.v1_test_pending_authorization_request(),
+            None
+        );
+        let renewed = fixture.participant.take_v1_test_output().unwrap();
+        assert!(matches!(
+            pulsebeam_proto::codec::decode_server(&renewed),
+            Ok(media_signaling::ServerMessage {
+                payload: Some(media_signaling::server_message::Payload::Authorization(
+                    media_signaling::Authorization {
+                        expires_at_unix_seconds: 300,
+                    }
+                ))
+            })
+        ));
+        assert_eq!(fixture.snapshot(), before);
+
+        let request_id = fixture.request();
+        for expiry in 0..MAX_PENDING_AUTHORIZATION_RESPONSES {
+            assert!(
+                fixture
+                    .participant
+                    .stage_v1_test_authorization(expiry as i64)
+            );
+        }
+        assert!(!fixture.participant.apply_authorization_result(
+            ParticipantEffect::AuthorizationRejected {
+                participant_id: fixture.participant_id,
+                connection_id: fixture.connection_id,
+                request_id,
+            }
+        ));
+        assert_eq!(
+            fixture.participant.v1_test_pending_authorization_request(),
+            Some(request_id)
+        );
+        assert_eq!(fixture.snapshot(), before);
+
+        fixture.participant.take_v1_test_output().unwrap();
+        assert!(fixture.participant.apply_authorization_result(
+            ParticipantEffect::AuthorizationRejected {
+                participant_id: fixture.participant_id,
+                connection_id: fixture.connection_id,
+                request_id,
+            }
+        ));
+        assert_eq!(
+            fixture.participant.v1_test_pending_authorization_request(),
+            None
+        );
+        assert_eq!(fixture.snapshot(), before);
     }
 }
 

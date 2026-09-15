@@ -585,6 +585,39 @@ impl Participant {
     }
 
     #[cfg(test)]
+    pub(crate) fn v1_test_catalog(
+        &self,
+    ) -> Result<pulsebeam_proto::signaling_v1::CatalogSnapshot, signaling::CatalogBuildError> {
+        let mut snapshot = self.downstream.signaling_snapshot();
+        snapshot.participants = self.signaling.participants_snapshot();
+        signaling::build_catalog(
+            self.participant_id,
+            self.participant_external_id.as_str(),
+            &snapshot,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn v1_test_pending_authorization_request(
+        &self,
+    ) -> Option<crate::participant::effect::AuthorizationRequestId> {
+        self.pending_authorization_request
+    }
+
+    #[cfg(test)]
+    pub(crate) fn stage_v1_test_authorization(&mut self, expiry: i64) -> bool {
+        self.signaling.stage_authorization(expiry)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_v1_test_output(&mut self) -> Option<Vec<u8>> {
+        let snapshot = self.downstream.signaling_snapshot();
+        let bytes = self.signaling.poll(&snapshot)?.bytes;
+        self.signaling.commit_sent();
+        Some(bytes)
+    }
+
+    #[cfg(test)]
     pub(crate) fn stage_v1_test_output(&mut self) -> Result<(), signaling::V1OutputBuildError> {
         let mut snapshot = self.downstream.signaling_snapshot();
         snapshot.participants = self.signaling.participants_snapshot();

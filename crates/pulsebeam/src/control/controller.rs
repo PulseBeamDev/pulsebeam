@@ -1349,31 +1349,41 @@ mod authorization_tests {
         clippy::disallowed_types,
         reason = "the production ShardContext owns the sanctioned shared occupancy counters"
     )]
-    fn actor() -> ControllerActor {
+    fn actor_with_updates() -> (
+        ControllerActor,
+        mailbox::Receiver<Box<crate::shard_update::ShardUpdate>>,
+    ) {
         let (command_tx, _command_rx) = mailbox::new(4);
         let context = ShardContext {
             command_tx,
             metrics: std::sync::Arc::new(ShardMetrics::new()),
         };
-        let (update, _update_rx) = new_shard_update(ShardId::new(0));
-        ControllerActor {
-            router: crate::control::router::ShardRouter::new(vec![context]),
-            core: ControllerCore::with_shards(1, 1, RoomPlacement::Hashed),
-            negotiator: Negotiator::new(Vec::new()),
-            tcp_listener: None,
-            cluster_id: 0,
-            node_id: 0,
-            updates: vec![update],
-            update_touched: vec![false],
-            pending_updates: VecDeque::new(),
-            update_queued: vec![false],
-            egress_ready: false,
-            lifecycle: TrackLifecycle::new(1),
-            command_backlog: VecDeque::new(),
-            authorization_expiries: BTreeSet::new(),
-            project_registry: None,
-            steering: None,
-        }
+        let (update, update_rx) = new_shard_update(ShardId::new(0));
+        (
+            ControllerActor {
+                router: crate::control::router::ShardRouter::new(vec![context]),
+                core: ControllerCore::with_shards(1, 1, RoomPlacement::Hashed),
+                negotiator: Negotiator::new(Vec::new()),
+                tcp_listener: None,
+                cluster_id: 0,
+                node_id: 0,
+                updates: vec![update],
+                update_touched: vec![false],
+                pending_updates: VecDeque::new(),
+                update_queued: vec![false],
+                egress_ready: false,
+                lifecycle: TrackLifecycle::new(1),
+                command_backlog: VecDeque::new(),
+                authorization_expiries: BTreeSet::new(),
+                project_registry: None,
+                steering: None,
+            },
+            update_rx,
+        )
+    }
+
+    fn actor() -> ControllerActor {
+        actor_with_updates().0
     }
 
     fn connection_id(sequence: u8) -> ConnectionId {
@@ -1404,7 +1414,7 @@ mod authorization_tests {
             ProjectKey, ProjectKeys, mint_development_token,
         };
 
-        let mut actor = actor();
+        let (mut actor, mut update_rx) = actor_with_updates();
         actor.project_registry = Some(
             ProjectRegistry::new(vec![ProjectKeys {
                 project_id: DEVELOPMENT_PROJECT_ID,
@@ -1439,6 +1449,12 @@ mod authorization_tests {
                 wall_now,
             )
             .unwrap();
+        let old_work = AuthorizationExpiryWork {
+            deadline: old_lease.deadline(),
+            participant_id,
+            connection_id: connection_id(1),
+        };
+        assert!(actor.authorization_expiries.contains(&old_work));
         let secret =
             mint_development_token(&room_external_id, &participant_external_id, now + 120).unwrap();
         let token = crate::participant::effect::RenewalToken::new(secret.clone()).unwrap();
@@ -1462,14 +1478,38 @@ mod authorization_tests {
         );
         assert_eq!(actor.authorization_expiries.len(), 1);
 
-        let renewed_deadline = actor
+        let renewed_lease = actor
             .core
             .registry
             .get_participant(&participant_id)
             .unwrap()
             .authorization
-            .unwrap()
-            .deadline();
+            .unwrap();
+        let renewed_deadline = renewed_lease.deadline();
+        let renewed_work = AuthorizationExpiryWork {
+            deadline: renewed_deadline,
+            participant_id,
+            connection_id: connection_id(1),
+        };
+        assert!(!actor.authorization_expiries.contains(&old_work));
+        assert!(actor.authorization_expiries.contains(&renewed_work));
+        let update = update_rx.try_recv().expect("correlated renewal effect");
+        assert!(matches!(
+            update.participant_effects.as_slice(),
+            [(
+                effect_participant,
+                crate::participant::ParticipantEffect::AuthorizationRenewed {
+                    participant_id: effect_identity,
+                    connection_id: effect_connection,
+                    request_id,
+                    expires_at_unix_seconds,
+                }
+            )] if *effect_participant == participant_id
+                && *effect_identity == participant_id
+                && *effect_connection == connection_id(1)
+                && *request_id == crate::participant::effect::AuthorizationRequestId::new(1)
+                && *expires_at_unix_seconds == i64::try_from(now + 120).unwrap()
+        ));
         let cases = [
             "bad-signature".to_owned(),
             mint_development_token(&room_external_id, &participant_external_id, now + 120).unwrap(),
@@ -1488,10 +1528,12 @@ mod authorization_tests {
             .unwrap(),
         ];
         for (request, token) in cases.into_iter().enumerate() {
+            let request_id =
+                crate::participant::effect::AuthorizationRequestId::new(request as u64 + 2);
             actor.renew_authorization(
                 participant_id,
                 connection_id(1),
-                crate::participant::effect::AuthorizationRequestId::new(request as u64 + 2),
+                request_id,
                 crate::participant::effect::RenewalToken::new(token).unwrap(),
             );
             let lease = actor
@@ -1504,6 +1546,136 @@ mod authorization_tests {
             assert_eq!(lease.expires_at_unix_seconds(), now + 120);
             assert_eq!(lease.deadline(), renewed_deadline);
             assert_eq!(actor.authorization_expiries.len(), 1);
+            assert!(actor.authorization_expiries.contains(&renewed_work));
+            let update = update_rx.try_recv().expect("correlated rejection effect");
+            assert!(matches!(
+                update.participant_effects.as_slice(),
+                [(
+                    effect_participant,
+                    crate::participant::ParticipantEffect::AuthorizationRejected {
+                        participant_id: effect_identity,
+                        connection_id: effect_connection,
+                        request_id: effect_request,
+                    }
+                )] if *effect_participant == participant_id
+                    && *effect_identity == participant_id
+                    && *effect_connection == connection_id(1)
+                    && *effect_request == request_id
+            ));
+        }
+    }
+
+    #[test]
+    fn authorization_tests_reject_each_authoritative_identity_mismatch() {
+        use pulsebeam_core::auth::{
+            DEVELOPMENT_API_KEY_ID, DEVELOPMENT_API_VERIFYING_KEY, DEVELOPMENT_PROJECT_ID,
+            ProjectKey, ProjectKeys, mint_development_token,
+        };
+
+        let room_external_id = RoomExternalId::new("identity-room").unwrap();
+        let room_id = RoomId::derive(&DEVELOPMENT_PROJECT_ID, &room_external_id);
+        let participant_external_id = participant_external_id();
+        let participant_id = ParticipantId::derive(&room_id, &participant_external_id);
+        let mismatches = [
+            (
+                crate::entity::ProjectId::new(),
+                room_external_id.clone(),
+                room_id,
+                participant_id,
+            ),
+            (
+                DEVELOPMENT_PROJECT_ID,
+                room_external_id.clone(),
+                RoomId::from_external(&RoomExternalId::new("wrong-canonical-room").unwrap()),
+                participant_id,
+            ),
+            (
+                DEVELOPMENT_PROJECT_ID,
+                room_external_id.clone(),
+                room_id,
+                ParticipantId::new(),
+            ),
+        ];
+
+        for (
+            index,
+            (project_id, admitted_room_external_id, admitted_room_id, admitted_participant),
+        ) in mismatches.into_iter().enumerate()
+        {
+            let (mut actor, mut update_rx) = actor_with_updates();
+            actor.project_registry = Some(
+                ProjectRegistry::new(vec![ProjectKeys {
+                    project_id: DEVELOPMENT_PROJECT_ID,
+                    keys: vec![ProjectKey {
+                        key_id: DEVELOPMENT_API_KEY_ID,
+                        verifying_key: DEVELOPMENT_API_VERIFYING_KEY,
+                    }],
+                }])
+                .unwrap(),
+            );
+            let wall_now = SystemTime::now();
+            let now = wall_now.duration_since(UNIX_EPOCH).unwrap().as_secs();
+            let runtime_now = tokio::time::Instant::now();
+            let old_lease = authorization_lease(now + 60, wall_now, runtime_now);
+            let transport = actor.core.reserve_transport(ShardId::new(0), runtime_now);
+            actor
+                .commit_candidate_with_identity(
+                    admitted_participant,
+                    participant_external_id.clone(),
+                    project_id,
+                    admitted_room_external_id,
+                    admitted_room_id,
+                    ShardId::new(0),
+                    transport,
+                    connection_id(1),
+                    Some(old_lease),
+                    ConnectionProfile::Native,
+                    wall_now,
+                )
+                .unwrap();
+            let old_work = AuthorizationExpiryWork {
+                deadline: old_lease.deadline(),
+                participant_id: admitted_participant,
+                connection_id: connection_id(1),
+            };
+            let request_id =
+                crate::participant::effect::AuthorizationRequestId::new(index as u64 + 10);
+            actor.renew_authorization(
+                admitted_participant,
+                connection_id(1),
+                request_id,
+                crate::participant::effect::RenewalToken::new(
+                    mint_development_token(&room_external_id, &participant_external_id, now + 120)
+                        .unwrap(),
+                )
+                .unwrap(),
+            );
+
+            let lease = actor
+                .core
+                .registry
+                .get_participant(&admitted_participant)
+                .unwrap()
+                .authorization
+                .unwrap();
+            assert_eq!(lease, old_lease);
+            assert_eq!(actor.authorization_expiries.len(), 1);
+            assert!(actor.authorization_expiries.contains(&old_work));
+            let update = update_rx.try_recv().expect("identity rejection effect");
+            assert!(matches!(
+                update.participant_effects.as_slice(),
+                [(
+                    effect_participant,
+                    crate::participant::ParticipantEffect::AuthorizationRejected {
+                        participant_id: effect_identity,
+                        connection_id: effect_connection,
+                        request_id: effect_request,
+                    }
+                )] if *effect_participant == admitted_participant
+                    && *effect_identity == admitted_participant
+                    && *effect_connection == connection_id(1)
+                    && *effect_request == request_id
+            ));
         }
     }
 
