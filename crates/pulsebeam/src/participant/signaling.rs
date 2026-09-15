@@ -350,7 +350,10 @@ enum Commit {
         catalog: v1::CatalogSnapshot,
         revision: u64,
     },
-    Mapping(v1::Mapping),
+    Mapping {
+        mapping: v1::Mapping,
+        stale_ack: bool,
+    },
 }
 
 #[derive(Default)]
@@ -361,7 +364,7 @@ struct Scheduler {
     catalog_revision: u64,
     pending: Option<Pending>,
     resnapshot: bool,
-    forced_mapping: Option<v1::Mapping>,
+    stale_ack_count: usize,
 }
 impl Scheduler {
     fn stage(&mut self, desired: Desired) {
@@ -370,8 +373,8 @@ impl Scheduler {
     fn request_resnapshot(&mut self) {
         self.resnapshot = true
     }
-    fn force_mapping(&mut self, mapping: v1::Mapping) {
-        self.forced_mapping = Some(mapping)
+    fn request_stale_ack(&mut self) {
+        self.stale_ack_count = self.stale_ack_count.saturating_add(1)
     }
     fn poll(&mut self) -> Option<Vec<u8>> {
         if let Some(pending) = &self.pending {
@@ -397,7 +400,13 @@ impl Scheduler {
                 if let Some(mapping) =
                     cleared.filter(|mapping| self.delivered_mapping.as_ref() != Some(mapping))
                 {
-                    (mapping_message(mapping.clone()), Commit::Mapping(mapping))
+                    (
+                        mapping_message(mapping.clone()),
+                        Commit::Mapping {
+                            mapping,
+                            stale_ack: false,
+                        },
+                    )
                 } else {
                     let revision = self.catalog_revision.checked_add(1)?;
                     (
@@ -423,13 +432,19 @@ impl Scheduler {
                     },
                 )
             }
-            Some(_) if self.forced_mapping.is_some() => {
-                let mapping = self.forced_mapping.take().expect("forced mapping exists");
-                (mapping_message(mapping.clone()), Commit::Mapping(mapping))
-            }
             Some(_) if self.delivered_mapping.as_ref() != Some(&desired.mapping) => (
                 mapping_message(desired.mapping.clone()),
-                Commit::Mapping(desired.mapping.clone()),
+                Commit::Mapping {
+                    mapping: desired.mapping.clone(),
+                    stale_ack: self.stale_ack_count != 0,
+                },
+            ),
+            Some(_) if self.stale_ack_count != 0 => (
+                mapping_message(desired.mapping.clone()),
+                Commit::Mapping {
+                    mapping: desired.mapping.clone(),
+                    stale_ack: true,
+                },
             ),
             Some(_) => return None,
         };
@@ -448,8 +463,11 @@ impl Scheduler {
                 self.resnapshot = false;
                 Some(catalog)
             }
-            Commit::Mapping(mapping) => {
+            Commit::Mapping { mapping, stale_ack } => {
                 self.delivered_mapping = Some(mapping);
+                if stale_ack {
+                    self.stale_ack_count = self.stale_ack_count.saturating_sub(1);
+                }
                 None
             }
         }
@@ -676,9 +694,9 @@ impl Signaling {
         output.scheduler.stage(Desired { catalog, mapping });
         Ok(())
     }
-    pub(crate) fn force_v1_mapping(&mut self, mapping: v1::Mapping) {
+    pub(crate) fn request_stale_v1_ack(&mut self) {
         if let Some(output) = &mut self.output {
-            output.scheduler.force_mapping(mapping);
+            output.scheduler.request_stale_ack();
             self.dirty = true;
         }
     }
@@ -957,13 +975,106 @@ mod tests {
         scheduler.commit_sent();
         scheduler.poll();
         scheduler.commit_sent();
-        scheduler.force_mapping(expected.clone());
+        scheduler.request_stale_ack();
 
         let bytes = scheduler.poll().expect("forced mapping");
         assert!(matches!(
             pulsebeam_proto::codec::decode_server(&bytes),
             Ok(v1::ServerMessage { payload: Some(v1::server_message::Payload::Mapping(mapping)) })
                 if mapping == expected
+        ));
+    }
+
+    #[test]
+    fn two_stale_acknowledgements_each_emit_a_mapping() {
+        let expected = mapping(9);
+        let mut scheduler = Scheduler::default();
+        scheduler.stage(Desired {
+            catalog: v1::CatalogSnapshot {
+                participants: Vec::new(),
+                tracks: Vec::new(),
+            },
+            mapping: expected.clone(),
+        });
+        scheduler.poll();
+        scheduler.commit_sent();
+        scheduler.poll();
+        scheduler.commit_sent();
+        scheduler.request_stale_ack();
+        scheduler.request_stale_ack();
+
+        for _ in 0..2 {
+            let bytes = scheduler.poll().expect("stale acknowledgement");
+            assert!(matches!(
+                pulsebeam_proto::codec::decode_server(&bytes),
+                Ok(v1::ServerMessage { payload: Some(v1::server_message::Payload::Mapping(mapping)) })
+                    if mapping == expected
+            ));
+            scheduler.commit_sent();
+        }
+        assert!(scheduler.poll().is_none());
+    }
+
+    #[test]
+    fn stale_acknowledgement_waits_for_removal_causality_and_uses_current_mapping() {
+        let track = v1::RemoteTrack {
+            track_id: "track".to_owned(),
+            participant_id: "participant".to_owned(),
+            kind: v1::TrackKind::Video.into(),
+            label: "camera".to_owned(),
+        };
+        let mapped = v1::Mapping {
+            intent_revision: 1,
+            video: Some(v1::TrackMappings {
+                tracks: vec![v1::TrackMapping {
+                    receiver_index: 0,
+                    track_id: track.track_id.clone(),
+                }],
+            }),
+            audio: Some(v1::TrackMappings { tracks: Vec::new() }),
+        };
+        let empty = mapping(1);
+        let mut scheduler = Scheduler::default();
+        scheduler.stage(Desired {
+            catalog: v1::CatalogSnapshot {
+                participants: Vec::new(),
+                tracks: vec![track],
+            },
+            mapping: mapped,
+        });
+        scheduler.poll();
+        scheduler.commit_sent();
+        scheduler.poll();
+        scheduler.commit_sent();
+        scheduler.request_stale_ack();
+        scheduler.stage(Desired {
+            catalog: v1::CatalogSnapshot {
+                participants: Vec::new(),
+                tracks: Vec::new(),
+            },
+            mapping: empty.clone(),
+        });
+
+        let clear = scheduler.poll().expect("clear removed mapping");
+        assert!(matches!(
+            pulsebeam_proto::codec::decode_server(&clear),
+            Ok(v1::ServerMessage { payload: Some(v1::server_message::Payload::Mapping(mapping)) })
+                if mapping == empty
+        ));
+        scheduler.commit_sent();
+        let catalog = scheduler.poll().expect("catalog removal");
+        assert!(matches!(
+            pulsebeam_proto::codec::decode_server(&catalog),
+            Ok(v1::ServerMessage {
+                payload: Some(v1::server_message::Payload::Catalog(_))
+            })
+        ));
+        scheduler.commit_sent();
+        let stale = scheduler.poll().expect("current stale acknowledgement");
+        assert!(matches!(
+            pulsebeam_proto::codec::decode_server(&stale),
+            Ok(v1::ServerMessage { payload: Some(v1::server_message::Payload::Mapping(mapping)) })
+                if mapping == empty
         ));
     }
 }

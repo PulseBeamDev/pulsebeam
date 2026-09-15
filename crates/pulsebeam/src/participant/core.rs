@@ -440,7 +440,7 @@ impl Participant {
                             self.signaling.stage_v1_internal_error();
                             self.signaling_terminated = true;
                         } else if !fresh {
-                            self.signaling.force_v1_mapping(mapping);
+                            self.signaling.request_stale_v1_ack();
                         }
                     }
                     signaling::V1IntentResult::ProtocolError(error) => {
@@ -844,6 +844,7 @@ impl Participant {
                     return;
                 }
                 self.authorization_expired = true;
+                self.signaling_terminated = true;
                 self.pending_authorization_request = None;
                 if !self.signaling.stage_authorization_expired() {
                     self.disconnect(DisconnectReason::AuthorizationExpired);
@@ -1245,6 +1246,36 @@ impl Participant {
             return None;
         }
 
+        if self.signaling_terminated {
+            if self.transport.needs_drain() {
+                let Some(rtc_deadline) = self.poll_rtc(now, events) else {
+                    self.transport.set_drain_result(None);
+                    events.exit();
+                    return None;
+                };
+                self.transport.set_drain_result(Some(rtc_deadline));
+            }
+            if self.transport.is_exited() {
+                return None;
+            }
+            if self.signaling.needs_poll() {
+                if let Some(output) = self.signaling.poll(&self.downstream.signaling_snapshot()) {
+                    if self
+                        .transport
+                        .write_channel(output.cid, true, &output.bytes)
+                        && self.signaling.commit_sent()
+                    {
+                        self.disconnect(if self.authorization_expired {
+                            DisconnectReason::AuthorizationExpired
+                        } else {
+                            DisconnectReason::SignalingTerminated
+                        });
+                    }
+                }
+            }
+            return self.transport.deadline();
+        }
+
         // Entered once per poll cycle rather than per packet, so every str0m line produced by
         // this participant's work carries its identity for the cost of one guard.
         //
@@ -1406,6 +1437,15 @@ impl Participant {
 
     fn handle_event(&mut self, now: Instant, e: Event, events: &mut impl ParticipantSink) {
         if self.signaling_terminated {
+            if let Event::ChannelClose(cid) = e
+                && self.signaling.clear_cid(cid)
+            {
+                self.disconnect(if self.authorization_expired {
+                    DisconnectReason::AuthorizationExpired
+                } else {
+                    DisconnectReason::SignalingTerminated
+                });
+            }
             return;
         }
         match e {
@@ -2129,10 +2169,42 @@ mod authorization_tests {
             None,
         );
 
+        let queued_intent =
+            pulsebeam_proto::codec::encode_client(&pulsebeam_proto::signaling_v1::ClientMessage {
+                payload: Some(
+                    pulsebeam_proto::signaling_v1::client_message::Payload::Intent(
+                        pulsebeam_proto::signaling_v1::Intent {
+                            revision: 1,
+                            send: None,
+                            receive: None,
+                        },
+                    ),
+                ),
+            })
+            .unwrap();
+
         let mut sink = crate::participant::event::test_utils::MockParticipantSink::new();
+        participant.handle_event(
+            Instant::now(),
+            Event::ChannelData(str0m::channel::ChannelData {
+                id: cid,
+                binary: true,
+                data: queued_intent,
+            }),
+            &mut sink,
+        );
         let _ = participant.poll(Instant::now(), &mut sink);
         assert_eq!(sink.exit_count, 0);
         assert!(participant.signaling.needs_poll());
+        assert_eq!(participant.v1_test_mapping().intent_revision, 0);
+
+        participant.handle_event(Instant::now(), Event::ChannelClose(cid), &mut sink);
+        assert!(matches!(
+            participant.disconnect_reason,
+            Some(DisconnectReason::AuthorizationExpired)
+        ));
+        let _ = participant.poll(Instant::now(), &mut sink);
+        assert_eq!(sink.exit_count, 1);
     }
 
     #[test]
