@@ -37,8 +37,7 @@ use crate::participant::{
         TransportPollOutput,
     },
     upstream::{
-        IncomingRtpRoute, NativePublicationError, NativePublicationEvent, NativePublicationPreview,
-        UpstreamAllocator,
+        IncomingRtpRoute, NativePublicationError, NativePublicationPreview, UpstreamAllocator,
     },
 };
 use crate::rtp::cache::TrackStreamCache;
@@ -290,10 +289,7 @@ impl Participant {
         events: &mut impl ParticipantSink,
     ) {
         for event in self.upstream.commit_native_publications(preview) {
-            match event {
-                NativePublicationEvent::Publish(track) => events.publish_track(track),
-                NativePublicationEvent::Unpublish(track_id) => events.unpublish_track(track_id),
-            }
+            event.apply(events);
         }
     }
 
@@ -1230,6 +1226,9 @@ impl Participant {
         let Some((route, incoming)) = incoming else {
             return;
         };
+        if !self.upstream.route_is_active(route) {
+            return;
+        }
         self.handle_incoming_rtp_after_lookup(route, incoming, events);
     }
 

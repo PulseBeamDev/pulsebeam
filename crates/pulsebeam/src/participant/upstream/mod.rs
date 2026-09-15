@@ -3,6 +3,7 @@ mod data;
 mod video;
 
 use crate::keys::TrackHandle;
+use crate::participant::event::ParticipantSink;
 use crate::participant::intent::NativePublication;
 use crate::{
     entity::{TrackId, TrackKind},
@@ -23,7 +24,7 @@ pub(crate) const MAX_UPSTREAM_SLOT_PER_TYPE: usize = crate::control::MAX_RTP_SLO
 pub(crate) const MAX_UPSTREAM_ENCODED_STREAMS: usize =
     MAX_UPSTREAM_SLOT_PER_TYPE * (1 + crate::track::MAX_SIMULCAST_LAYERS);
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct IncomingRtpRoute {
     pub(crate) ssrc: Ssrc,
     pub(crate) mid: Mid,
@@ -161,6 +162,15 @@ pub(crate) struct NativePublicationPreview {
 pub(crate) enum NativePublicationEvent {
     Publish(crate::track::Track),
     Unpublish(TrackId),
+}
+
+impl NativePublicationEvent {
+    pub(crate) fn apply(self, sink: &mut impl ParticipantSink) {
+        match self {
+            Self::Publish(track) => sink.publish_track(track),
+            Self::Unpublish(track_id) => sink.unpublish_track(track_id),
+        }
+    }
 }
 
 pub(crate) struct UpstreamMedia {
@@ -369,6 +379,18 @@ impl Upstream {
     pub(crate) fn route_for_ssrc(&self, ssrc: Ssrc) -> Option<IncomingRtpRoute> {
         self.routes.get(ssrc)
     }
+    pub(crate) fn route_is_active(&self, route: IncomingRtpRoute) -> bool {
+        let slots = match route.upstream_slot {
+            UpstreamSlotKey::Audio(_) => &self.audio.media.published_tracks,
+            UpstreamSlotKey::Video(_) => &self.video.media.published_tracks,
+        };
+        let index = match route.upstream_slot {
+            UpstreamSlotKey::Audio(index) | UpstreamSlotKey::Video(index) => index,
+        };
+        slots.get(index).is_some_and(|slot| {
+            slot.in_topology && slot.mid == route.mid && slot.track.meta.id == route.track_id
+        })
+    }
     pub(crate) fn cache_route(&mut self, route: IncomingRtpRoute) {
         self.routes.insert(route);
     }
@@ -408,7 +430,7 @@ impl Upstream {
                 continue;
             }
             let identity = (kind, publication.label.as_str());
-            if !sender_indices.insert(sender_index) || !identities.insert(identity) {
+            if sender_indices.contains(&sender_index) || identities.contains(&identity) {
                 continue;
             }
 
@@ -427,6 +449,8 @@ impl Upstream {
                     label: publication.label.clone(),
                 });
             }
+            sender_indices.insert(sender_index);
+            identities.insert(identity);
             accepted.push(publication.clone());
         }
 
@@ -553,6 +577,7 @@ impl Upstream {
 mod tests {
     use super::*;
     use crate::entity::{ParticipantId, RoomExternalId, RoomId, TrackKind};
+    use crate::participant::event::test_utils::MockParticipantSink;
     use crate::track::{self, TrackMeta};
 
     fn upstream_with_slots() -> (Upstream, ParticipantId, RoomId) {
@@ -743,13 +768,47 @@ mod tests {
     }
 
     #[test]
+    fn native_sender_bindings_conflicting_identity_does_not_reserve_sender() {
+        let (upstream, _, _) = upstream_with_slots();
+        let preview = upstream
+            .preview_native_publications(&[
+                publication(0, TrackKind::Audio, "mic"),
+                publication(2, TrackKind::Audio, "mic"),
+                publication(2, TrackKind::Audio, "backup"),
+            ])
+            .unwrap();
+        assert_eq!(
+            preview.publications,
+            vec![
+                publication(0, TrackKind::Audio, "mic"),
+                publication(2, TrackKind::Audio, "backup"),
+            ]
+        );
+    }
+
+    #[test]
     fn native_sender_bindings_relabel_and_move_are_atomic_after_unpublish() {
         let (mut upstream, _, _) = upstream_with_slots();
         let preview = upstream
             .preview_native_publications(&[publication(0, TrackKind::Audio, "mic")])
             .unwrap();
-        upstream.commit_native_publications(preview);
-        upstream.commit_native_publications(upstream.preview_native_publications(&[]).unwrap());
+        let mut sink = MockParticipantSink::new();
+        for event in upstream.commit_native_publications(preview) {
+            event.apply(&mut sink);
+        }
+        let omitted = upstream.preview_native_publications(&[]).unwrap();
+        for event in upstream.commit_native_publications(omitted) {
+            event.apply(&mut sink);
+        }
+        let route = IncomingRtpRoute {
+            ssrc: Ssrc::from(7),
+            mid: Mid::from("Audio-0"),
+            rid: None,
+            upstream_slot: UpstreamSlotKey::Audio(0),
+            track_id: upstream.track_for_sender_index(0).unwrap(),
+            fanout: None,
+        };
+        upstream.cache_route(route);
         let bindings_before: Vec<_> = upstream
             .audio
             .media
@@ -764,7 +823,20 @@ mod tests {
                 )
             })
             .collect();
-        let routes_before = upstream.routes.routes.len();
+        let active_before: Vec<_> = upstream
+            .audio
+            .media
+            .published_tracks
+            .iter()
+            .chain(upstream.video.media.published_tracks.iter())
+            .filter(|slot| slot.in_topology)
+            .map(|slot| (slot.media_index, slot.descriptor.id()))
+            .collect();
+        let routes_before = upstream.routes.routes.clone();
+        let sink_before = (
+            sink.publish_track_calls.clone(),
+            sink.unpublish_track_calls.clone(),
+        );
 
         assert_eq!(
             upstream.preview_native_publications(&[publication(0, TrackKind::Audio, "other")]),
@@ -793,7 +865,23 @@ mod tests {
                 ))
                 .collect::<Vec<_>>()
         );
-        assert_eq!(routes_before, upstream.routes.routes.len());
+        assert_eq!(
+            active_before,
+            upstream
+                .audio
+                .media
+                .published_tracks
+                .iter()
+                .chain(upstream.video.media.published_tracks.iter())
+                .filter(|slot| slot.in_topology)
+                .map(|slot| (slot.media_index, slot.descriptor.id()))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(routes_before, upstream.routes.routes);
+        assert_eq!(
+            sink_before,
+            (sink.publish_track_calls, sink.unpublish_track_calls)
+        );
     }
 
     #[test]
@@ -819,6 +907,36 @@ mod tests {
             upstream
                 .commit_native_publications(upstream.preview_native_publications(&input).unwrap())
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn native_sender_bindings_omission_disables_cached_and_new_routes() {
+        let (mut upstream, _, _) = upstream_with_slots();
+        let input = [publication(0, TrackKind::Audio, "mic")];
+        upstream.commit_native_publications(upstream.preview_native_publications(&input).unwrap());
+        let route = IncomingRtpRoute {
+            ssrc: Ssrc::from(7),
+            mid: Mid::from("Audio-0"),
+            rid: None,
+            upstream_slot: UpstreamSlotKey::Audio(0),
+            track_id: upstream.track_for_sender_index(0).unwrap(),
+            fanout: None,
+        };
+        upstream.cache_route(route);
+        assert!(upstream.route_is_active(route));
+
+        upstream.commit_native_publications(upstream.preview_native_publications(&[]).unwrap());
+        assert!(upstream.route_for_ssrc(Ssrc::from(7)).is_some());
+        assert!(!upstream.route_is_active(route));
+        assert!(!upstream.route_is_active(IncomingRtpRoute {
+            ssrc: Ssrc::from(8),
+            ..route
+        }));
+        assert_eq!(
+            upstream.track_for_sender_index(0),
+            Some(route.track_id),
+            "omission retains the permanent sender binding"
         );
     }
 }
