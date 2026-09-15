@@ -1241,7 +1241,15 @@ mod data_track {
             match parts.next() {
                 Some("sys") => {
                     if parts.next() == Some("signaling") && parts.next().is_none() {
-                        Ok(Self::InternalSignaling)
+                        if cfg.ordered && matches!(cfg.reliability, Reliability::Reliable) {
+                            Ok(Self::InternalSignaling)
+                        } else {
+                            Err(DataTrackIntentError::UnsupportedDataChannelConfig {
+                                label: s.clone(),
+                                ordered: cfg.ordered,
+                                reliability: cfg.reliability.clone(),
+                            })
+                        }
                     } else {
                         Err(DataTrackIntentError::InvalidDirection)
                     }
@@ -1366,8 +1374,17 @@ mod data_track {
 
         #[test]
         fn test_modern_system_routing() {
-            let res = DataTrackIntent::try_from(&cfg("v1/sys/signaling")).unwrap();
+            let res = DataTrackIntent::try_from(&rel_cfg("v1/sys/signaling")).unwrap();
             assert!(matches!(res, DataTrackIntent::InternalSignaling));
+        }
+
+        #[test]
+        fn system_signaling_requires_reliable_ordered_delivery() {
+            let err = DataTrackIntent::try_from(&cfg("v1/sys/signaling")).unwrap_err();
+            assert!(matches!(
+                err,
+                DataTrackIntentError::UnsupportedDataChannelConfig { .. }
+            ));
         }
 
         #[test]

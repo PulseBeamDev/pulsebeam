@@ -187,6 +187,7 @@ pub struct Participant {
     next_authorization_request: u64,
     pending_authorization_request: Option<crate::participant::effect::AuthorizationRequestId>,
     authorization_expired: bool,
+    signaling_terminated: bool,
     last_keyframe_request: HashMap<(Mid, Option<str0m::media::Rid>), Instant>,
     pending_keyframe_requests: HashSet<(Mid, Option<str0m::media::Rid>)>,
 
@@ -262,6 +263,7 @@ impl Participant {
             next_authorization_request: 1,
             pending_authorization_request: None,
             authorization_expired: false,
+            signaling_terminated: false,
             upstream: UpstreamAllocator::new(ctx),
             negotiated: cfg.resources,
             downstream: DownstreamAllocator::new(ctx, cfg.manual_sub),
@@ -418,25 +420,37 @@ impl Participant {
         bytes: &[u8],
         events: &mut impl ParticipantSink,
     ) -> Result<(), signaling::SignalingError> {
-        if self.authorization_expired || self.signaling.is_terminal() {
+        if self.authorization_expired || self.signaling_terminated {
             return Ok(());
         }
         let message = pulsebeam_proto::codec::decode_client(bytes)
             .map_err(|_| signaling::SignalingError::DecodeFailed)?;
         match message.payload {
             Some(pulsebeam_proto::signaling_v1::client_message::Payload::Intent(intent)) => {
+                let fresh = self.signaling.v1_is_fresh(intent.revision);
                 match self.apply_v1_intent(intent, events) {
                     signaling::V1IntentResult::Mapping(mapping) => {
                         let mut snapshot = self.downstream.signaling_snapshot();
                         snapshot.participants = self.signaling.participants_snapshot();
-                        self.signaling
-                            .stage_v1_output(&snapshot, mapping)
-                            .map_err(|_| signaling::SignalingError::DecodeFailed)?;
+                        if self
+                            .signaling
+                            .stage_v1_output(&snapshot, mapping.clone())
+                            .is_err()
+                        {
+                            self.signaling.stage_v1_internal_error();
+                            self.signaling_terminated = true;
+                        } else if !fresh {
+                            self.signaling.force_v1_mapping(mapping);
+                        }
                     }
                     signaling::V1IntentResult::ProtocolError(error) => {
                         self.signaling.stage_v1_terminal_error(error);
+                        self.signaling_terminated = true;
                     }
-                    signaling::V1IntentResult::Reconnect => self.signaling.stage_v1_reconnect(),
+                    signaling::V1IntentResult::Reconnect => {
+                        self.signaling.stage_v1_reconnect();
+                        self.signaling_terminated = true;
+                    }
                 }
             }
             Some(pulsebeam_proto::signaling_v1::client_message::Payload::RenewAuthorization(
@@ -741,7 +755,7 @@ impl Participant {
     }
 
     pub fn apply(&mut self, effect: ParticipantEffect, track_handle: Option<TrackHandle>) {
-        if self.authorization_expired || self.signaling.is_terminal() {
+        if self.authorization_expired || self.signaling_terminated {
             return;
         }
         match effect {
@@ -839,6 +853,9 @@ impl Participant {
     }
 
     pub(crate) fn apply_authorization_result(&mut self, effect: ParticipantEffect) -> bool {
+        if self.authorization_expired || self.signaling_terminated {
+            return true;
+        }
         match effect {
             ParticipantEffect::AuthorizationRenewed {
                 participant_id,
@@ -876,7 +893,7 @@ impl Participant {
     }
 
     pub(crate) fn input<'a>(&mut self, input: ParticipantInput<'a>) {
-        if self.authorization_expired || self.signaling.is_terminal() {
+        if self.authorization_expired || self.signaling_terminated {
             return;
         }
         match input {
@@ -1299,7 +1316,8 @@ impl Participant {
                         .stage_v1_output(&snapshot, self.v1_mapping())
                         .is_err()
                 {
-                    self.signaling.stage_v1_invalid_message();
+                    self.signaling.stage_v1_internal_error();
+                    self.signaling_terminated = true;
                 }
                 if let Some(output) = self.signaling.poll(&snapshot) {
                     if self
@@ -1387,6 +1405,9 @@ impl Participant {
     }
 
     fn handle_event(&mut self, now: Instant, e: Event, events: &mut impl ParticipantSink) {
+        if self.signaling_terminated {
+            return;
+        }
         match e {
             // `Connected` is DTLS; ICE reaching connected is what tells the
             // shard the peer address is authenticated, and that is handled
@@ -1519,6 +1540,7 @@ impl Participant {
                 if Some(data.id) == self.signaling.cid {
                     if !data.binary || self.handle_v1_input(&data.data, events).is_err() {
                         self.signaling.stage_v1_invalid_message();
+                        self.signaling_terminated = true;
                     }
                     return;
                 }

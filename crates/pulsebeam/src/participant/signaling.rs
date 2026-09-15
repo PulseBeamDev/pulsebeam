@@ -361,6 +361,7 @@ struct Scheduler {
     catalog_revision: u64,
     pending: Option<Pending>,
     resnapshot: bool,
+    forced_mapping: Option<v1::Mapping>,
 }
 impl Scheduler {
     fn stage(&mut self, desired: Desired) {
@@ -368,6 +369,9 @@ impl Scheduler {
     }
     fn request_resnapshot(&mut self) {
         self.resnapshot = true
+    }
+    fn force_mapping(&mut self, mapping: v1::Mapping) {
+        self.forced_mapping = Some(mapping)
     }
     fn poll(&mut self) -> Option<Vec<u8>> {
         if let Some(pending) = &self.pending {
@@ -418,6 +422,10 @@ impl Scheduler {
                         revision,
                     },
                 )
+            }
+            Some(_) if self.forced_mapping.is_some() => {
+                let mapping = self.forced_mapping.take().expect("forced mapping exists");
+                (mapping_message(mapping.clone()), Commit::Mapping(mapping))
             }
             Some(_) if self.delivered_mapping.as_ref() != Some(&desired.mapping) => (
                 mapping_message(desired.mapping.clone()),
@@ -668,6 +676,12 @@ impl Signaling {
         output.scheduler.stage(Desired { catalog, mapping });
         Ok(())
     }
+    pub(crate) fn force_v1_mapping(&mut self, mapping: v1::Mapping) {
+        if let Some(output) = &mut self.output {
+            output.scheduler.force_mapping(mapping);
+            self.dirty = true;
+        }
+    }
     pub(crate) fn stage_authorization(&mut self, expiry: i64) -> bool {
         let Some(output) = &mut self.output else {
             return false;
@@ -711,6 +725,14 @@ impl Signaling {
             intent_revision: None,
         });
     }
+    pub(crate) fn stage_v1_internal_error(&mut self) {
+        self.stage_v1_terminal_error(v1::Error {
+            code: v1::ErrorCode::Internal.into(),
+            message: "internal signaling invariant failed".to_owned(),
+            fatal: true,
+            intent_revision: None,
+        });
+    }
     pub(crate) fn stage_v1_terminal_error(&mut self, error: v1::Error) {
         self.stage_terminal(v1::ServerMessage {
             payload: Some(v1::server_message::Payload::Error(error)),
@@ -725,6 +747,9 @@ impl Signaling {
         let Some(output) = &mut self.output else {
             return;
         };
+        if output.terminal.is_some() {
+            return;
+        }
         let Ok(bytes) = pulsebeam_proto::codec::encode_server(&message) else {
             return;
         };
@@ -757,6 +782,10 @@ impl Signaling {
                 cid,
                 bytes: bytes.clone(),
             });
+        }
+        if output.scheduler.pending.is_some() {
+            let bytes = output.scheduler.poll()?;
+            return Some(SignalingOutput { cid, bytes });
         }
         if let Some(response) = output.authorization_responses.pop_front() {
             let payload = match response {
@@ -811,17 +840,42 @@ impl Signaling {
 mod tests {
     use super::*;
 
+    fn mapping(revision: u64) -> v1::Mapping {
+        v1::Mapping {
+            intent_revision: revision,
+            video: Some(v1::TrackMappings { tracks: Vec::new() }),
+            audio: Some(v1::TrackMappings { tracks: Vec::new() }),
+        }
+    }
+
+    fn v1_signaling() -> Signaling {
+        let room = crate::entity::RoomExternalId::new("signaling-test").unwrap();
+        let participant_id = crate::entity::ParticipantId::new();
+        let mut rtc = str0m::Rtc::new(std::time::Instant::now());
+        let cid = rtc.direct_api().create_data_channel(Default::default());
+        let mut signaling = Signaling::new_v1(
+            LogCtx {
+                room_id: crate::entity::RoomId::from_external(&room),
+                participant_id,
+            },
+            "recipient".to_owned(),
+        );
+        signaling.set_cid(cid);
+        let snapshot = SignalingSnapshot {
+            publications: Vec::new(),
+            participants: HashMap::default(),
+        };
+        signaling.stage_v1_output(&snapshot, mapping(1)).unwrap();
+        signaling
+    }
+
     #[test]
     fn v1_scheduler_emits_catalog_before_mapping() {
         let catalog = v1::CatalogSnapshot {
             participants: Vec::new(),
             tracks: Vec::new(),
         };
-        let expected_mapping = v1::Mapping {
-            intent_revision: 1,
-            video: Some(v1::TrackMappings { tracks: Vec::new() }),
-            audio: Some(v1::TrackMappings { tracks: Vec::new() }),
-        };
+        let expected_mapping = mapping(1);
         let mut scheduler = Scheduler::default();
         scheduler.stage(Desired {
             catalog,
@@ -842,6 +896,74 @@ mod tests {
             Ok(v1::ServerMessage {
                 payload: Some(v1::server_message::Payload::Mapping(value))
             }) if value == expected_mapping
+        ));
+    }
+
+    #[test]
+    fn failed_catalog_retries_before_a_later_authorization() {
+        let mut signaling = v1_signaling();
+        let failed = signaling
+            .poll(&SignalingSnapshot {
+                publications: Vec::new(),
+                participants: HashMap::default(),
+            })
+            .unwrap()
+            .bytes;
+        signaling.retry_pending();
+        assert!(signaling.stage_authorization(42));
+
+        let retry = signaling
+            .poll(&SignalingSnapshot {
+                publications: Vec::new(),
+                participants: HashMap::default(),
+            })
+            .unwrap()
+            .bytes;
+        assert_eq!(retry, failed);
+    }
+
+    #[test]
+    fn terminal_staging_keeps_its_first_payload() {
+        let mut signaling = v1_signaling();
+        signaling.stage_v1_invalid_message();
+        signaling.stage_v1_reconnect();
+
+        let bytes = signaling
+            .poll(&SignalingSnapshot {
+                publications: Vec::new(),
+                participants: HashMap::default(),
+            })
+            .unwrap()
+            .bytes;
+        assert!(matches!(
+            pulsebeam_proto::codec::decode_server(&bytes),
+            Ok(v1::ServerMessage { payload: Some(v1::server_message::Payload::Error(v1::Error { code, .. })) })
+                if code == v1::ErrorCode::InvalidMessage as i32
+        ));
+    }
+
+    #[test]
+    fn forced_mapping_is_emitted_after_an_identical_delivered_mapping() {
+        let expected = mapping(7);
+        let mut scheduler = Scheduler::default();
+        scheduler.stage(Desired {
+            catalog: v1::CatalogSnapshot {
+                participants: Vec::new(),
+                tracks: Vec::new(),
+            },
+            mapping: expected.clone(),
+        });
+        scheduler.poll();
+        scheduler.commit_sent();
+        scheduler.poll();
+        scheduler.commit_sent();
+        scheduler.force_mapping(expected.clone());
+
+        let bytes = scheduler.poll().expect("forced mapping");
+        assert!(matches!(
+            pulsebeam_proto::codec::decode_server(&bytes),
+            Ok(v1::ServerMessage { payload: Some(v1::server_message::Payload::Mapping(mapping)) })
+                if mapping == expected
         ));
     }
 }
