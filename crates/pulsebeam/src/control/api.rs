@@ -91,6 +91,7 @@ impl IntoResponse for ApiError {
             Self::IdValidation(_)
             | Self::OfferInvalid(_)
             | Self::JoinError(controller::ControllerError::OfferRejected(_))
+            | Self::JoinError(controller::ControllerError::AuthorizationExpiryOutOfRange)
             | Self::BadRequest(_) => (StatusCode::BAD_REQUEST, "Bad Request"),
             Self::NotFound => (StatusCode::NOT_FOUND, "Not Found"),
             Self::JoinError(controller::ControllerError::Superseded) => {
@@ -313,6 +314,11 @@ async fn create_native(
         .unwrap_or_default()
         .as_secs();
     let authorization = verify_bearer(&headers, &state.project_registry, unix_now)?;
+    if i64::try_from(authorization.expiry.unix_seconds()).is_err() {
+        return Err(ApiError::BadRequest(
+            "authorization expiry exceeds signaling range".to_owned(),
+        ));
+    }
     ensure_json_content_type(&headers)?;
     let body = to_bytes(request.into_body(), MAX_SIGNALING_BODY_BYTES)
         .await
@@ -1006,6 +1012,37 @@ mod tests {
         assert!(body["answer"].as_str().unwrap().starts_with("v=0"));
         assert!(location.ends_with(body["connection_id"].as_str().unwrap()));
         responder.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn native_post_rejects_expiry_outside_signaling_range_before_materialization() {
+        let (controller, mut commands) = pulsebeam_runtime::mailbox::new(4);
+        let app = router(controller, cfg(), auth_registry());
+        let token = mint_development_token(
+            &RoomExternalId::new("general").unwrap(),
+            &ParticipantExternalId::new("alice").unwrap(),
+            (i64::MAX as u64) + 1,
+        )
+        .unwrap();
+        let body = serde_json::to_vec(&serde_json::json!({
+            "offer": valid_offer(),
+            "manual": true
+        }))
+        .unwrap();
+
+        let response = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            app.oneshot(native_post(&token, body)),
+        )
+        .await
+        .expect("out-of-range expiry is rejected without waiting for materialization")
+        .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            commands.try_recv().is_err(),
+            "no participant is materialized"
+        );
     }
 
     #[tokio::test]

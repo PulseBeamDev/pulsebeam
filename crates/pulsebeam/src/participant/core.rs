@@ -135,8 +135,10 @@ pub struct ParticipantConfig {
     pub manual_sub: bool,
     pub room_id: entity::RoomId,
     pub participant_id: entity::ParticipantId,
+    pub participant_external_id: entity::ParticipantExternalId,
     pub connection_id: entity::ConnectionId,
     pub profile: ConnectionProfile,
+    pub initial_authorization_expiry: Option<i64>,
     pub rtc: Rtc,
     pub resources: NegotiatedResources,
 }
@@ -174,8 +176,10 @@ pub struct Participant {
     upstream: UpstreamAllocator,
     negotiated: NegotiatedResources,
     pub(crate) participant_id: entity::ParticipantId,
+    participant_external_id: entity::ParticipantExternalId,
     pub(crate) connection_id: entity::ConnectionId,
     profile: ConnectionProfile,
+    initial_authorization_expiry: Option<i64>,
     last_keyframe_request: HashMap<(Mid, Option<str0m::media::Rid>), Instant>,
     pending_keyframe_requests: HashSet<(Mid, Option<str0m::media::Rid>)>,
 
@@ -239,8 +243,10 @@ impl Participant {
             ),
             stream_writer: StreamWriter::new(),
             participant_id: cfg.participant_id,
+            participant_external_id: cfg.participant_external_id,
             connection_id: cfg.connection_id,
             profile: cfg.profile,
+            initial_authorization_expiry: cfg.initial_authorization_expiry,
             upstream: UpstreamAllocator::new(ctx),
             negotiated: cfg.resources,
             downstream: DownstreamAllocator::new(ctx, cfg.manual_sub),
@@ -1658,6 +1664,58 @@ mod native_profile_tests {
 }
 
 #[cfg(test)]
+mod authorization_tests {
+    use super::*;
+    use crate::control::controller::{AuthorizationLease, ParticipantState};
+    use crate::control::core::{ControllerCore, RoomPlacement};
+    use crate::entity::{ParticipantExternalId, RoomExternalId};
+    use pulsebeam_core::auth::AuthorizationExpiry;
+    use std::time::UNIX_EPOCH;
+
+    #[test]
+    fn native_config_retains_external_identity_and_wire_expiry() {
+        let room_external_id = RoomExternalId::new("room").unwrap();
+        let room_id = entity::RoomId::from_external(&room_external_id);
+        let participant_external_id = ParticipantExternalId::new("alice").unwrap();
+        let participant_id = entity::ParticipantId::new();
+        let expiry = 1_700_000_000;
+        let state = ParticipantState {
+            manual_sub: true,
+            room_id,
+            participant_id,
+            participant_external_id: participant_external_id.clone(),
+            connection_id: entity::ConnectionId::new(),
+            old_connection_id: None,
+            authorization: Some(
+                AuthorizationLease::from_expiry(
+                    AuthorizationExpiry::from_unix_seconds(expiry),
+                    UNIX_EPOCH,
+                    Instant::now(),
+                )
+                .unwrap(),
+            ),
+            profile: ConnectionProfile::Native,
+        };
+        let config = ControllerCore::with_placement(1, RoomPlacement::Hashed)
+            .prepare_participant(
+                Rtc::new(std::time::Instant::now()),
+                NegotiatedResources::empty_for_test(),
+                state,
+            )
+            .unwrap();
+
+        assert_eq!(config.participant_external_id, participant_external_id);
+        assert_eq!(config.initial_authorization_expiry, Some(expiry as i64));
+        let participant = Participant::new(config, ShardId::new(0), 1_200, 1_200);
+        assert_eq!(participant.participant_external_id, participant_external_id);
+        assert_eq!(
+            participant.initial_authorization_expiry,
+            Some(expiry as i64)
+        );
+    }
+}
+
+#[cfg(test)]
 mod upstream_route_table_tests {
     // Convenience only: a test is not a shard, so nothing here is
     // cross-core. See crates/pulsebeam/docs/thread-per-core.md.
@@ -1836,8 +1894,10 @@ mod v1_catalog_reconciliation_tests {
                 manual_sub: true,
                 room_id: crate::entity::RoomId::from_external(&room),
                 participant_id: crate::entity::ParticipantId::new(),
+                participant_external_id: crate::entity::ParticipantExternalId::new("self").unwrap(),
                 connection_id: crate::entity::ConnectionId::new(),
                 profile: ConnectionProfile::Native,
+                initial_authorization_expiry: None,
                 rtc: Rtc::new(std::time::Instant::now()),
                 resources: NegotiatedResources::empty_for_test(),
             },

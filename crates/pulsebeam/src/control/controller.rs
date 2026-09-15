@@ -98,6 +98,10 @@ impl AuthorizationLease {
     pub(crate) fn deadline(self) -> tokio::time::Instant {
         self.deadline
     }
+
+    pub(crate) fn expires_at_unix_seconds(self) -> u64 {
+        self.expiry.unix_seconds()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -160,6 +164,8 @@ pub enum ControllerError {
     Superseded,
     #[error("participant authorization expired")]
     AuthorizationExpired,
+    #[error("participant authorization expiry exceeds signaling range")]
+    AuthorizationExpiryOutOfRange,
     #[error("IO error: {0}")]
     IOError(#[from] io::Error),
     #[error("unknown error: {0}")]
@@ -857,6 +863,13 @@ impl ControllerActor {
         state: ParticipantState,
         offer: SdpOffer,
     ) -> Result<PendingMaterialization, ControllerError> {
+        if state.profile == ConnectionProfile::Native
+            && state
+                .authorization
+                .is_some_and(|lease| i64::try_from(lease.expires_at_unix_seconds()).is_err())
+        {
+            return Err(ControllerError::AuthorizationExpiryOutOfRange);
+        }
         let participant_id = state.participant_id;
         let participant_external_id = state.participant_external_id.clone();
         let (slot, placement) = self.core.room_slot(&state.room_id);
@@ -888,7 +901,7 @@ impl ControllerActor {
         let connection_id = state.connection_id;
         let authorization = state.authorization;
         let profile = state.profile;
-        let config = self.core.prepare_participant(rtc, resources, state);
+        let config = self.core.prepare_participant(rtc, resources, state)?;
         let room_id = config.room_id;
         let (ack_tx, ack_rx) = oneshot::channel();
         Ok(PendingMaterialization {

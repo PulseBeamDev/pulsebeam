@@ -442,8 +442,11 @@ mod v1_intent_tests {
                         manual_sub: true,
                         room_id: crate::entity::RoomId::from_external(&room),
                         participant_id: crate::entity::ParticipantId::new(),
+                        participant_external_id: crate::entity::ParticipantExternalId::new("self")
+                            .unwrap(),
                         connection_id: crate::entity::ConnectionId::new(),
                         profile: ConnectionProfile::Native,
+                        initial_authorization_expiry: None,
                         rtc: Rtc::new(std::time::Instant::now()),
                         resources: NegotiatedResources::empty_for_test(),
                     },
@@ -1155,6 +1158,8 @@ struct V1OutputState {
     recipient_external_id: String,
     history: V1CatalogHistory,
     scheduler: V1OutputScheduler,
+    authorization_to_send: Option<i64>,
+    pending_authorization: Option<Vec<u8>>,
 }
 
 #[allow(
@@ -1211,6 +1216,10 @@ impl V1OutputScheduler {
     /// The current desired state is selected only when that snapshot is staged.
     pub(crate) fn request_resnapshot(&mut self) {
         self.resnapshot_requested = true;
+    }
+
+    fn has_pending(&self) -> bool {
+        self.pending.is_some()
     }
 
     pub(crate) fn poll(&mut self) -> Option<Vec<u8>> {
@@ -1510,8 +1519,17 @@ impl Signaling {
             recipient_external_id,
             history: V1CatalogHistory::default(),
             scheduler: V1OutputScheduler::default(),
+            authorization_to_send: None,
+            pending_authorization: None,
         });
         signaling
+    }
+
+    pub(crate) fn stage_authorization(&mut self, expires_at_unix_seconds: i64) {
+        let Some(output) = &mut self.v1_output else {
+            return;
+        };
+        output.authorization_to_send = Some(expires_at_unix_seconds);
     }
 
     pub(crate) fn stage_v1_output(
@@ -1706,8 +1724,12 @@ impl Signaling {
     }
 
     pub(crate) fn needs_poll(&self) -> bool {
-        if self.v1_output.is_some() {
-            return self.cid.is_some() && (self.dirty_roster || self.dirty_bindings);
+        if let Some(output) = &self.v1_output {
+            return self.cid.is_some()
+                && (output.pending_authorization.is_some()
+                    || output.authorization_to_send.is_some()
+                    || self.dirty_roster
+                    || self.dirty_bindings);
         }
         self.cid.is_some()
             && self.pending_commit.is_none()
@@ -1740,6 +1762,31 @@ impl Signaling {
         let cid = self.cid?;
 
         if let Some(output) = &mut self.v1_output {
+            if let Some(bytes) = &output.pending_authorization {
+                return Some(SignalingOutput {
+                    cid,
+                    bytes: bytes.clone(),
+                });
+            }
+            if output.scheduler.has_pending() {
+                let bytes = output
+                    .scheduler
+                    .poll()
+                    .expect("pending scheduler bytes exist");
+                return Some(SignalingOutput { cid, bytes });
+            }
+            if let Some(expires_at_unix_seconds) = output.authorization_to_send.take() {
+                let message = media_signaling::ServerMessage {
+                    payload: Some(media_signaling::server_message::Payload::Authorization(
+                        media_signaling::Authorization {
+                            expires_at_unix_seconds,
+                        },
+                    )),
+                };
+                let bytes = pulsebeam_proto::codec::encode_server(&message).ok()?;
+                output.pending_authorization = Some(bytes.clone());
+                return Some(SignalingOutput { cid, bytes });
+            }
             let Some(bytes) = output.scheduler.poll() else {
                 self.dirty_roster = false;
                 self.dirty_bindings = false;
@@ -1870,6 +1917,9 @@ impl Signaling {
 
     pub(crate) fn commit_sent(&mut self) {
         if let Some(output) = &mut self.v1_output {
+            if output.pending_authorization.take().is_some() {
+                return;
+            }
             if let Some(catalog) = output.scheduler.commit_sent() {
                 output.history.commit(&catalog);
             }
@@ -1963,8 +2013,11 @@ mod v1_output_tests {
                     manual_sub: true,
                     room_id: crate::entity::RoomId::from_external(&room),
                     participant_id: crate::entity::ParticipantId::new(),
+                    participant_external_id: crate::entity::ParticipantExternalId::new("self")
+                        .unwrap(),
                     connection_id: crate::entity::ConnectionId::new(),
                     profile: ConnectionProfile::Native,
+                    initial_authorization_expiry: None,
                     rtc,
                     resources: NegotiatedResources::empty_for_test(),
                 },
@@ -2312,6 +2365,165 @@ mod v1_output_tests {
         assert_eq!(
             history.validate(&changed),
             Err(V1OutputBuildError::TrackIdentityChanged)
+        );
+    }
+}
+
+#[cfg(test)]
+mod authorization_tests {
+    use super::*;
+
+    #[test]
+    fn readiness_stages_authorization_before_catalog() {
+        let room = crate::entity::RoomId::from_external(
+            &crate::entity::RoomExternalId::new("room").unwrap(),
+        );
+        let ctx = LogCtx {
+            room_id: room,
+            participant_id: crate::entity::ParticipantId::new(),
+        };
+        let mut signaling = Signaling::new_v1(ctx, "self".to_owned());
+        let mut rtc = str0m::Rtc::new(std::time::Instant::now());
+        signaling.set_cid(rtc.direct_api().create_data_channel(Default::default()));
+        let snapshot = SignalingSnapshot {
+            publications: Vec::new(),
+            participants: HashMap::new(),
+            video: Vec::new(),
+            audio: Vec::new(),
+        };
+        signaling
+            .stage_v1_output(
+                &snapshot,
+                media_signaling::Mapping {
+                    intent_revision: 0,
+                    video: Some(media_signaling::TrackMappings { tracks: Vec::new() }),
+                    audio: Some(media_signaling::TrackMappings { tracks: Vec::new() }),
+                },
+            )
+            .unwrap();
+        signaling.stage_authorization(1_700_000_000);
+
+        let output = signaling
+            .poll(&snapshot)
+            .expect("ready native signaling emits authorization");
+        assert!(matches!(
+            pulsebeam_proto::codec::decode_server(&output.bytes),
+            Ok(media_signaling::ServerMessage {
+                payload: Some(media_signaling::server_message::Payload::Authorization(
+                    media_signaling::Authorization {
+                        expires_at_unix_seconds: 1_700_000_000,
+                    }
+                )),
+            })
+        ));
+        signaling.commit_sent();
+        assert!(matches!(
+            pulsebeam_proto::codec::decode_server(
+                &signaling
+                    .poll(&snapshot)
+                    .expect("catalog follows authorization")
+                    .bytes
+            ),
+            Ok(media_signaling::ServerMessage {
+                payload: Some(media_signaling::server_message::Payload::Catalog(_)),
+            })
+        ));
+    }
+
+    #[test]
+    fn authorization_waits_for_an_inflight_catalog_and_retries_it_unchanged() {
+        let room = crate::entity::RoomId::from_external(
+            &crate::entity::RoomExternalId::new("room").unwrap(),
+        );
+        let ctx = LogCtx {
+            room_id: room,
+            participant_id: crate::entity::ParticipantId::new(),
+        };
+        let mut signaling = Signaling::new_v1(ctx, "self".to_owned());
+        let mut rtc = str0m::Rtc::new(std::time::Instant::now());
+        signaling.set_cid(rtc.direct_api().create_data_channel(Default::default()));
+        let snapshot = SignalingSnapshot {
+            publications: Vec::new(),
+            participants: HashMap::new(),
+            video: Vec::new(),
+            audio: Vec::new(),
+        };
+        signaling
+            .stage_v1_output(
+                &snapshot,
+                media_signaling::Mapping {
+                    intent_revision: 0,
+                    video: Some(media_signaling::TrackMappings { tracks: Vec::new() }),
+                    audio: Some(media_signaling::TrackMappings { tracks: Vec::new() }),
+                },
+            )
+            .unwrap();
+        let catalog = signaling.poll(&snapshot).expect("catalog is in flight");
+        signaling.stage_authorization(1_700_000_000);
+
+        assert_eq!(
+            signaling
+                .poll(&snapshot)
+                .expect("catalog remains in flight")
+                .bytes,
+            catalog.bytes
+        );
+        signaling.retry_pending();
+        assert_eq!(
+            signaling
+                .poll(&snapshot)
+                .expect("catalog retry remains exact")
+                .bytes,
+            catalog.bytes
+        );
+        signaling.commit_sent();
+
+        assert!(matches!(
+            pulsebeam_proto::codec::decode_server(
+                &signaling
+                    .poll(&snapshot)
+                    .expect("authorization follows catalog")
+                    .bytes
+            ),
+            Ok(media_signaling::ServerMessage {
+                payload: Some(media_signaling::server_message::Payload::Authorization(_)),
+            })
+        ));
+    }
+
+    #[test]
+    fn authorization_retries_identical_bytes_until_commit() {
+        let room = crate::entity::RoomId::from_external(
+            &crate::entity::RoomExternalId::new("room").unwrap(),
+        );
+        let ctx = LogCtx {
+            room_id: room,
+            participant_id: crate::entity::ParticipantId::new(),
+        };
+        let mut signaling = Signaling::new_v1(ctx, "self".to_owned());
+        let mut rtc = str0m::Rtc::new(std::time::Instant::now());
+        signaling.set_cid(rtc.direct_api().create_data_channel(Default::default()));
+        signaling.stage_authorization(1_700_000_000);
+        let snapshot = SignalingSnapshot {
+            publications: Vec::new(),
+            participants: HashMap::new(),
+            video: Vec::new(),
+            audio: Vec::new(),
+        };
+
+        let first = signaling.poll(&snapshot).expect("authorization output");
+        signaling.retry_pending();
+        assert_eq!(
+            signaling
+                .poll(&snapshot)
+                .expect("authorization retry")
+                .bytes,
+            first.bytes
+        );
+        signaling.commit_sent();
+        assert!(
+            signaling.poll(&snapshot).is_none(),
+            "commit drains authorization"
         );
     }
 }

@@ -2,7 +2,9 @@ use tokio::time::Instant;
 
 use crate::{
     control::{
-        controller::ParticipantState, negotiator::NegotiatedResources, registry::RoomRegistry,
+        controller::{ControllerError, ParticipantState},
+        negotiator::NegotiatedResources,
+        registry::RoomRegistry,
     },
     entity::{ParticipantId, RoomId},
     id::ShardId,
@@ -113,16 +115,25 @@ impl ControllerCore {
         rtc: Rtc,
         resources: NegotiatedResources,
         state: ParticipantState,
-    ) -> ParticipantConfig {
-        ParticipantConfig {
+    ) -> Result<ParticipantConfig, ControllerError> {
+        let initial_authorization_expiry = match (state.profile, state.authorization) {
+            (crate::control::controller::ConnectionProfile::Native, Some(lease)) => Some(
+                i64::try_from(lease.expires_at_unix_seconds())
+                    .map_err(|_| ControllerError::AuthorizationExpiryOutOfRange)?,
+            ),
+            _ => None,
+        };
+        Ok(ParticipantConfig {
             manual_sub: state.manual_sub,
             room_id: state.room_id,
             participant_id: state.participant_id,
+            participant_external_id: state.participant_external_id,
             connection_id: state.connection_id,
             profile: state.profile,
+            initial_authorization_expiry,
             rtc,
             resources,
-        }
+        })
     }
 
     pub fn remove_incarnation(
