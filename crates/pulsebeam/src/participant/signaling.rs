@@ -67,7 +67,7 @@ pub(crate) enum CatalogBuildError {
 pub(crate) fn build_catalog(
     recipient: crate::entity::ParticipantId,
     snapshot: &SignalingSnapshot,
-) -> Result<media_signaling::Catalog, CatalogBuildError> {
+) -> Result<media_signaling::CatalogSnapshot, CatalogBuildError> {
     let mut external_ids = HashSet::new();
     let mut participants: Vec<_> = snapshot
         .participants
@@ -118,7 +118,7 @@ pub(crate) fn build_catalog(
     }
     tracks.sort_by(|left, right| left.track_id.cmp(&right.track_id));
 
-    Ok(media_signaling::Catalog {
+    Ok(media_signaling::CatalogSnapshot {
         participants,
         tracks,
     })

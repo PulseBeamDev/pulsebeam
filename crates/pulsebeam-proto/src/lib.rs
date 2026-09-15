@@ -35,8 +35,7 @@ pub mod rtp_extensions {
     pub const VIDEO_LAYERS_ALLOCATION: u8 = 12;
 
     /// Playout delay (`playout-delay`). Sent on egress RTP to bound the
-    /// receiver's jitter buffer (see `ClientIntent.max_playout_delay_ms`). 6 is
-    /// free of the str0m defaults above.
+    /// receiver's jitter buffer. 6 is free of the str0m defaults above.
     pub const PLAYOUT_DELAY: u8 = 6;
 
     /// AV1 Dependency Descriptor. Not 13 (Chrome's usual id) because that is
