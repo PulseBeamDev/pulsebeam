@@ -59,6 +59,12 @@ pub(crate) enum CatalogBuildError {
     UnknownParticipant,
     #[error("catalog contains duplicate application identity")]
     DuplicateIdentity,
+    #[error("catalog identity exceeds a protocol bound")]
+    ValueOutOfBounds,
+    #[error("catalog snapshot exceeds the signaling codec limit")]
+    SnapshotTooLarge,
+    #[error("catalog track ID does not match its immutable identity")]
+    IdentityMismatch,
 }
 
 #[allow(
@@ -69,15 +75,22 @@ pub(crate) fn build_catalog(
     recipient: crate::entity::ParticipantId,
     snapshot: &SignalingSnapshot,
 ) -> Result<media_signaling::CatalogSnapshot, CatalogBuildError> {
+    // The recipient is omitted from its own Catalog, but its external ID still
+    // participates in the room-wide uniqueness invariant.
     let mut external_ids = HashSet::new();
+    for (participant_id, external_id) in &snapshot.participants {
+        if !valid_protocol_string(participant_id, 128) || !valid_protocol_string(external_id, 256) {
+            return Err(CatalogBuildError::ValueOutOfBounds);
+        }
+        if !external_ids.insert(external_id.clone()) {
+            return Err(CatalogBuildError::DuplicateIdentity);
+        }
+    }
     let mut participants: Vec<_> = snapshot
         .participants
         .iter()
         .filter(|(id, _)| id.as_str() != recipient.as_str())
         .map(|(id, external_id)| {
-            if !external_ids.insert(external_id.clone()) {
-                return Err(CatalogBuildError::DuplicateIdentity);
-            }
             Ok(media_signaling::Participant {
                 participant_id: id.clone(),
                 participant_external_id: external_id.clone(),
@@ -100,11 +113,17 @@ pub(crate) fn build_catalog(
         let Some(label) = meta.label.clone() else {
             return Err(CatalogBuildError::MissingLabel);
         };
+        if !valid_protocol_string(&meta.id.as_str(), 128) || !valid_protocol_string(&label, 64) {
+            return Err(CatalogBuildError::ValueOutOfBounds);
+        }
         let kind = match meta.id.kind() {
             crate::entity::TrackKind::Audio => media_signaling::TrackKind::Audio,
             crate::entity::TrackKind::Video => media_signaling::TrackKind::Video,
             crate::entity::TrackKind::Data => continue,
         };
+        if meta.id != meta.origin.derive_track_id(meta.id.kind(), &label) {
+            return Err(CatalogBuildError::IdentityMismatch);
+        }
         if !track_ids.insert(meta.id)
             || !selectors.insert((meta.origin, kind as i32, label.clone()))
         {
@@ -119,10 +138,151 @@ pub(crate) fn build_catalog(
     }
     tracks.sort_by(|left, right| left.track_id.cmp(&right.track_id));
 
-    Ok(media_signaling::CatalogSnapshot {
+    let catalog = media_signaling::CatalogSnapshot {
         participants,
         tracks,
-    })
+    };
+    let message = media_signaling::ServerMessage {
+        payload: Some(media_signaling::server_message::Payload::Catalog(
+            media_signaling::Catalog {
+                revision: 1,
+                state: Some(media_signaling::catalog::State::Snapshot(catalog.clone())),
+            },
+        )),
+    };
+    if message.encoded_len() > pulsebeam_proto::codec::MAX_MESSAGE_SIZE {
+        return Err(CatalogBuildError::SnapshotTooLarge);
+    }
+
+    Ok(catalog)
+}
+
+fn valid_protocol_string(value: &str, max_bytes: usize) -> bool {
+    !value.is_empty() && value.len() <= max_bytes
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[allow(
+    dead_code,
+    reason = "the replacement signaling transport installs this validated state in the next unit"
+)]
+pub(crate) enum V1OutputBuildError {
+    #[error(transparent)]
+    Catalog(#[from] CatalogBuildError),
+    #[error("catalog reuses a participant ID for a different external identity")]
+    ParticipantIdentityChanged,
+    #[error("catalog reuses a track ID for a different immutable identity")]
+    TrackIdentityChanged,
+    #[error("mapping references a track absent from the catalog")]
+    MappingUnknownTrack,
+    #[error("mapping references a track with the wrong media kind")]
+    MappingWrongKind,
+    #[error("mapping repeats a receiver or track identity")]
+    DuplicateMapping,
+}
+
+/// Retains immutable identities across complete Catalog snapshots, including
+/// identities removed from the currently visible room state.
+#[derive(Default)]
+#[allow(
+    dead_code,
+    reason = "the replacement signaling transport owns commit-time history installation in the next unit"
+)]
+pub(crate) struct V1CatalogHistory {
+    participants: HashMap<String, String>,
+    tracks: HashMap<String, (String, i32, String)>,
+}
+
+#[allow(
+    dead_code,
+    reason = "the replacement signaling transport owns commit-time history installation in the next unit"
+)]
+impl V1CatalogHistory {
+    fn validate(
+        &self,
+        catalog: &media_signaling::CatalogSnapshot,
+    ) -> Result<(), V1OutputBuildError> {
+        for participant in &catalog.participants {
+            if self
+                .participants
+                .get(&participant.participant_id)
+                .is_some_and(|external_id| external_id != &participant.participant_external_id)
+            {
+                return Err(V1OutputBuildError::ParticipantIdentityChanged);
+            }
+        }
+        for track in &catalog.tracks {
+            let identity = (
+                track.participant_id.clone(),
+                track.kind,
+                track.label.clone(),
+            );
+            if self
+                .tracks
+                .get(&track.track_id)
+                .is_some_and(|known| known != &identity)
+            {
+                return Err(V1OutputBuildError::TrackIdentityChanged);
+            }
+        }
+        Ok(())
+    }
+
+    /// Record only after the corresponding Catalog state has been committed.
+    pub(crate) fn commit(&mut self, catalog: &media_signaling::CatalogSnapshot) {
+        for participant in &catalog.participants {
+            self.participants.insert(
+                participant.participant_id.clone(),
+                participant.participant_external_id.clone(),
+            );
+        }
+        for track in &catalog.tracks {
+            self.tracks.insert(
+                track.track_id.clone(),
+                (
+                    track.participant_id.clone(),
+                    track.kind,
+                    track.label.clone(),
+                ),
+            );
+        }
+    }
+}
+
+fn validate_mapping(
+    catalog: &media_signaling::CatalogSnapshot,
+    mapping: &media_signaling::Mapping,
+) -> Result<(), V1OutputBuildError> {
+    let tracks: BTreeMap<_, _> = catalog
+        .tracks
+        .iter()
+        .map(|track| (track.track_id.as_str(), track.kind))
+        .collect();
+    for (mappings, expected_kind) in [
+        (&mapping.video, media_signaling::TrackKind::Video),
+        (&mapping.audio, media_signaling::TrackKind::Audio),
+    ] {
+        let mut receiver_indices = HashSet::new();
+        let mut track_ids = HashSet::new();
+        for mapping in mappings
+            .as_ref()
+            .into_iter()
+            .flat_map(|group| &group.tracks)
+        {
+            let Some(kind) = tracks.get(mapping.track_id.as_str()) else {
+                return Err(V1OutputBuildError::MappingUnknownTrack);
+            };
+            if *kind != expected_kind as i32 {
+                return Err(V1OutputBuildError::MappingWrongKind);
+            }
+            if !receiver_indices.insert(mapping.receiver_index)
+                || !track_ids.insert(mapping.track_id.as_str())
+            {
+                return Err(V1OutputBuildError::DuplicateMapping);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// A decoded v1 Intent after omission/default and first-occurrence handling.
@@ -977,9 +1137,25 @@ pub(crate) struct V1OutputScheduler {
 }
 
 #[derive(Clone)]
-struct V1DesiredState {
+pub(crate) struct V1DesiredState {
     catalog: media_signaling::CatalogSnapshot,
     mapping: media_signaling::Mapping,
+}
+
+#[allow(
+    dead_code,
+    reason = "the replacement signaling transport supplies this state to the scheduler in the next unit"
+)]
+pub(crate) fn build_v1_desired_state(
+    history: &V1CatalogHistory,
+    recipient: crate::entity::ParticipantId,
+    snapshot: &SignalingSnapshot,
+    mapping: media_signaling::Mapping,
+) -> Result<V1DesiredState, V1OutputBuildError> {
+    let catalog = build_catalog(recipient, snapshot)?;
+    history.validate(&catalog)?;
+    validate_mapping(&catalog, &mapping)?;
+    Ok(V1DesiredState { catalog, mapping })
 }
 
 struct V1Pending {
@@ -1003,7 +1179,15 @@ impl V1OutputScheduler {
         catalog: media_signaling::CatalogSnapshot,
         mapping: media_signaling::Mapping,
     ) {
-        self.desired = Some(V1DesiredState { catalog, mapping });
+        self.stage_validated(V1DesiredState { catalog, mapping });
+    }
+
+    #[allow(
+        dead_code,
+        reason = "the replacement signaling transport supplies validated desired state in the next unit"
+    )]
+    pub(crate) fn stage_validated(&mut self, desired: V1DesiredState) {
+        self.desired = Some(desired);
     }
 
     pub(crate) fn poll(&mut self) -> Option<Vec<u8>> {
@@ -1719,6 +1903,39 @@ mod v1_output_tests {
         scheduler.commit_sent();
         assert!(scheduler.poll().is_none());
     }
+
+    #[test]
+    fn validated_desired_state_rejects_unknown_mapping_tracks() {
+        let snapshot = SignalingSnapshot {
+            publications: Vec::new(),
+            participants: HashMap::new(),
+            video: Vec::new(),
+            audio: Vec::new(),
+        };
+
+        assert!(matches!(
+            build_v1_desired_state(
+                &V1CatalogHistory::default(),
+                crate::entity::ParticipantId::new(),
+                &snapshot,
+                mapping("unknown-track"),
+            ),
+            Err(V1OutputBuildError::MappingUnknownTrack)
+        ));
+    }
+
+    #[test]
+    fn catalog_history_rejects_reused_track_identity() {
+        let mut history = V1CatalogHistory::default();
+        let original = catalog(&[("track-a", "camera")]);
+        history.commit(&original);
+
+        let changed = catalog(&[("track-a", "screen")]);
+        assert_eq!(
+            history.validate(&changed),
+            Err(V1OutputBuildError::TrackIdentityChanged)
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1963,5 +2180,118 @@ mod tests {
             build_catalog(crate::entity::ParticipantId::new(), &snapshot),
             Err(CatalogBuildError::MissingLabel)
         );
+    }
+
+    #[test]
+    fn replacement_catalog_rejects_recipient_external_id_collision() {
+        let room = crate::entity::RoomId::from_external(
+            &crate::entity::RoomExternalId::new("room").unwrap(),
+        );
+        let recipient = crate::entity::ParticipantId::derive(
+            &room,
+            &crate::entity::ParticipantExternalId::new("self").unwrap(),
+        );
+        let remote = crate::entity::ParticipantId::derive(
+            &room,
+            &crate::entity::ParticipantExternalId::new("alice").unwrap(),
+        );
+        let snapshot = SignalingSnapshot {
+            publications: Vec::new(),
+            participants: HashMap::from_iter([
+                (recipient.as_str(), "same-external-id".to_owned()),
+                (remote.as_str(), "same-external-id".to_owned()),
+            ]),
+            video: Vec::new(),
+            audio: Vec::new(),
+        };
+
+        assert_eq!(
+            build_catalog(recipient, &snapshot),
+            Err(CatalogBuildError::DuplicateIdentity)
+        );
+    }
+
+    #[test]
+    fn replacement_catalog_rejects_overlong_labels_before_staging() {
+        let room = crate::entity::RoomId::from_external(
+            &crate::entity::RoomExternalId::new("room").unwrap(),
+        );
+        let remote = crate::entity::ParticipantId::derive(
+            &room,
+            &crate::entity::ParticipantExternalId::new("alice").unwrap(),
+        );
+        let mut track = crate::track::TrackMeta::labeled_media(
+            room,
+            crate::id::ShardId::new(1),
+            remote,
+            crate::entity::TrackKind::Video,
+            "camera".to_owned(),
+        );
+        track.label = Some("x".repeat(65));
+        let snapshot = SignalingSnapshot {
+            publications: vec![track],
+            participants: HashMap::from_iter([(remote.as_str(), "alice".to_owned())]),
+            video: Vec::new(),
+            audio: Vec::new(),
+        };
+
+        assert!(build_catalog(crate::entity::ParticipantId::new(), &snapshot).is_err());
+    }
+
+    #[test]
+    fn replacement_catalog_rejects_track_id_with_changed_label() {
+        let room = crate::entity::RoomId::from_external(
+            &crate::entity::RoomExternalId::new("room").unwrap(),
+        );
+        let remote = crate::entity::ParticipantId::derive(
+            &room,
+            &crate::entity::ParticipantExternalId::new("alice").unwrap(),
+        );
+        let mut track = crate::track::TrackMeta::labeled_media(
+            room,
+            crate::id::ShardId::new(1),
+            remote,
+            crate::entity::TrackKind::Video,
+            "camera".to_owned(),
+        );
+        track.label = Some("screen".to_owned());
+        let snapshot = SignalingSnapshot {
+            publications: vec![track],
+            participants: HashMap::from_iter([(remote.as_str(), "alice".to_owned())]),
+            video: Vec::new(),
+            audio: Vec::new(),
+        };
+
+        assert!(build_catalog(crate::entity::ParticipantId::new(), &snapshot).is_err());
+    }
+
+    #[test]
+    fn replacement_catalog_rejects_snapshot_that_exceeds_codec_limit() {
+        let room = crate::entity::RoomId::from_external(
+            &crate::entity::RoomExternalId::new("room").unwrap(),
+        );
+        let remote = crate::entity::ParticipantId::derive(
+            &room,
+            &crate::entity::ParticipantExternalId::new("alice").unwrap(),
+        );
+        let publications = (0..400)
+            .map(|index| {
+                crate::track::TrackMeta::labeled_media(
+                    room,
+                    crate::id::ShardId::new(1),
+                    remote,
+                    crate::entity::TrackKind::Video,
+                    format!("{index:0>61}"),
+                )
+            })
+            .collect();
+        let snapshot = SignalingSnapshot {
+            publications,
+            participants: HashMap::from_iter([(remote.as_str(), "alice".to_owned())]),
+            video: Vec::new(),
+            audio: Vec::new(),
+        };
+
+        assert!(build_catalog(crate::entity::ParticipantId::new(), &snapshot).is_err());
     }
 }
