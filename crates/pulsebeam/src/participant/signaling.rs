@@ -1112,21 +1112,19 @@ fn clear_tracks_absent_from(
     mapping: &media_signaling::Mapping,
 ) -> media_signaling::Mapping {
     let known: BTreeSet<_> = catalog.tracks.iter().map(|track| &track.track_id).collect();
-    let retain = |tracks: &Option<media_signaling::TrackMappings>| {
-        tracks.as_ref().and_then(|tracks| {
-            let tracks: Vec<_> = tracks
-                .tracks
-                .iter()
-                .filter(|track| known.contains(&track.track_id))
-                .cloned()
-                .collect();
-            (!tracks.is_empty()).then_some(media_signaling::TrackMappings { tracks })
-        })
+    let retain = |tracks: &Option<media_signaling::TrackMappings>| media_signaling::TrackMappings {
+        tracks: tracks
+            .as_ref()
+            .into_iter()
+            .flat_map(|tracks| &tracks.tracks)
+            .filter(|track| known.contains(&track.track_id))
+            .cloned()
+            .collect(),
     };
     media_signaling::Mapping {
         intent_revision: mapping.intent_revision,
-        video: retain(&mapping.video),
-        audio: retain(&mapping.audio),
+        video: Some(retain(&mapping.video)),
+        audio: Some(retain(&mapping.audio)),
     }
 }
 
@@ -1615,13 +1613,16 @@ mod v1_output_tests {
     fn mapping(track_id: &str) -> media_signaling::Mapping {
         media_signaling::Mapping {
             intent_revision: 0,
-            video: (!track_id.is_empty()).then(|| media_signaling::TrackMappings {
-                tracks: vec![media_signaling::TrackMapping {
-                    receiver_index: 0,
-                    track_id: track_id.to_owned(),
-                }],
+            video: Some(media_signaling::TrackMappings {
+                tracks: (!track_id.is_empty())
+                    .then(|| media_signaling::TrackMapping {
+                        receiver_index: 0,
+                        track_id: track_id.to_owned(),
+                    })
+                    .into_iter()
+                    .collect(),
             }),
-            audio: None,
+            audio: Some(media_signaling::TrackMappings { tracks: Vec::new() }),
         }
     }
 
@@ -1691,7 +1692,8 @@ mod v1_output_tests {
         else {
             panic!("removal must first clear mapping");
         };
-        assert!(mapping.video.is_none());
+        assert!(mapping.video.is_some_and(|video| video.tracks.is_empty()));
+        assert!(mapping.audio.is_some_and(|audio| audio.tracks.is_empty()));
         scheduler.commit_sent();
 
         let message = next(&mut scheduler);
