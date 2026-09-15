@@ -73,12 +73,19 @@ pub(crate) enum CatalogBuildError {
 )]
 pub(crate) fn build_catalog(
     recipient: crate::entity::ParticipantId,
+    recipient_external_id: &str,
     snapshot: &SignalingSnapshot,
 ) -> Result<media_signaling::CatalogSnapshot, CatalogBuildError> {
     // The recipient is omitted from its own Catalog, but its external ID still
     // participates in the room-wide uniqueness invariant.
-    let mut external_ids = HashSet::new();
+    if !valid_protocol_string(recipient_external_id, 256) {
+        return Err(CatalogBuildError::ValueOutOfBounds);
+    }
+    let mut external_ids = HashSet::from_iter([recipient_external_id.to_owned()]);
     for (participant_id, external_id) in &snapshot.participants {
+        if participant_id.as_str() == recipient.as_str() {
+            continue;
+        }
         if !valid_protocol_string(participant_id, 128) || !valid_protocol_string(external_id, 256) {
             return Err(CatalogBuildError::ValueOutOfBounds);
         }
@@ -177,6 +184,8 @@ pub(crate) enum V1OutputBuildError {
     MappingUnknownTrack,
     #[error("mapping references a track with the wrong media kind")]
     MappingWrongKind,
+    #[error("mapping must include both video and audio groups")]
+    IncompleteMapping,
     #[error("mapping repeats a receiver or track identity")]
     DuplicateMapping,
 }
@@ -258,17 +267,16 @@ fn validate_mapping(
         .iter()
         .map(|track| (track.track_id.as_str(), track.kind))
         .collect();
+    let mut receiver_indices = HashSet::new();
     for (mappings, expected_kind) in [
         (&mapping.video, media_signaling::TrackKind::Video),
         (&mapping.audio, media_signaling::TrackKind::Audio),
     ] {
-        let mut receiver_indices = HashSet::new();
+        let Some(mappings) = mappings else {
+            return Err(V1OutputBuildError::IncompleteMapping);
+        };
         let mut track_ids = HashSet::new();
-        for mapping in mappings
-            .as_ref()
-            .into_iter()
-            .flat_map(|group| &group.tracks)
-        {
+        for mapping in &mappings.tracks {
             let Some(kind) = tracks.get(mapping.track_id.as_str()) else {
                 return Err(V1OutputBuildError::MappingUnknownTrack);
             };
@@ -1149,10 +1157,11 @@ pub(crate) struct V1DesiredState {
 pub(crate) fn build_v1_desired_state(
     history: &V1CatalogHistory,
     recipient: crate::entity::ParticipantId,
+    recipient_external_id: &str,
     snapshot: &SignalingSnapshot,
     mapping: media_signaling::Mapping,
 ) -> Result<V1DesiredState, V1OutputBuildError> {
-    let catalog = build_catalog(recipient, snapshot)?;
+    let catalog = build_catalog(recipient, recipient_external_id, snapshot)?;
     history.validate(&catalog)?;
     validate_mapping(&catalog, &mapping)?;
     Ok(V1DesiredState { catalog, mapping })
@@ -1917,11 +1926,74 @@ mod v1_output_tests {
             build_v1_desired_state(
                 &V1CatalogHistory::default(),
                 crate::entity::ParticipantId::new(),
+                "self",
                 &snapshot,
                 mapping("unknown-track"),
             ),
             Err(V1OutputBuildError::MappingUnknownTrack)
         ));
+    }
+
+    #[test]
+    fn validated_desired_state_requires_complete_mapping_groups() {
+        let mut incomplete = mapping("");
+        incomplete.video = None;
+
+        assert_eq!(
+            validate_mapping(&catalog(&[]), &incomplete),
+            Err(V1OutputBuildError::IncompleteMapping)
+        );
+
+        incomplete.video = Some(media_signaling::TrackMappings { tracks: Vec::new() });
+        incomplete.audio = None;
+        assert_eq!(
+            validate_mapping(&catalog(&[]), &incomplete),
+            Err(V1OutputBuildError::IncompleteMapping)
+        );
+    }
+
+    #[test]
+    fn validated_desired_state_rejects_receiver_reused_across_mapping_groups() {
+        let catalog = media_signaling::CatalogSnapshot {
+            participants: vec![media_signaling::Participant {
+                participant_id: "participant".to_owned(),
+                participant_external_id: "alice".to_owned(),
+            }],
+            tracks: vec![
+                media_signaling::RemoteTrack {
+                    track_id: "video".to_owned(),
+                    participant_id: "participant".to_owned(),
+                    kind: media_signaling::TrackKind::Video.into(),
+                    label: "camera".to_owned(),
+                },
+                media_signaling::RemoteTrack {
+                    track_id: "audio".to_owned(),
+                    participant_id: "participant".to_owned(),
+                    kind: media_signaling::TrackKind::Audio.into(),
+                    label: "mic".to_owned(),
+                },
+            ],
+        };
+        let mapping = media_signaling::Mapping {
+            intent_revision: 0,
+            video: Some(media_signaling::TrackMappings {
+                tracks: vec![media_signaling::TrackMapping {
+                    receiver_index: 0,
+                    track_id: "video".to_owned(),
+                }],
+            }),
+            audio: Some(media_signaling::TrackMappings {
+                tracks: vec![media_signaling::TrackMapping {
+                    receiver_index: 0,
+                    track_id: "audio".to_owned(),
+                }],
+            }),
+        };
+
+        assert_eq!(
+            validate_mapping(&catalog, &mapping),
+            Err(V1OutputBuildError::DuplicateMapping)
+        );
     }
 
     #[test]
@@ -2110,15 +2182,12 @@ mod tests {
         );
         let snapshot = SignalingSnapshot {
             publications: vec![self_track, video.clone(), audio.clone()],
-            participants: HashMap::from_iter([
-                (remote.as_str(), "alice".to_owned()),
-                (recipient.as_str(), "self".to_owned()),
-            ]),
+            participants: HashMap::from_iter([(remote.as_str(), "alice".to_owned())]),
             video: Vec::new(),
             audio: Vec::new(),
         };
 
-        let catalog = build_catalog(recipient, &snapshot).unwrap();
+        let catalog = build_catalog(recipient, "self", &snapshot).unwrap();
 
         assert_eq!(catalog.participants.len(), 1);
         assert_eq!(catalog.participants[0].participant_external_id, "alice");
@@ -2177,7 +2246,7 @@ mod tests {
         };
 
         assert_eq!(
-            build_catalog(crate::entity::ParticipantId::new(), &snapshot),
+            build_catalog(crate::entity::ParticipantId::new(), "self", &snapshot),
             Err(CatalogBuildError::MissingLabel)
         );
     }
@@ -2197,17 +2266,37 @@ mod tests {
         );
         let snapshot = SignalingSnapshot {
             publications: Vec::new(),
-            participants: HashMap::from_iter([
-                (recipient.as_str(), "same-external-id".to_owned()),
-                (remote.as_str(), "same-external-id".to_owned()),
-            ]),
+            participants: HashMap::from_iter([(remote.as_str(), "same-external-id".to_owned())]),
             video: Vec::new(),
             audio: Vec::new(),
         };
 
         assert_eq!(
-            build_catalog(recipient, &snapshot),
+            build_catalog(recipient, "same-external-id", &snapshot),
             Err(CatalogBuildError::DuplicateIdentity)
+        );
+    }
+
+    #[test]
+    fn replacement_catalog_validates_recipient_external_id_input() {
+        let snapshot = SignalingSnapshot {
+            publications: Vec::new(),
+            participants: HashMap::new(),
+            video: Vec::new(),
+            audio: Vec::new(),
+        };
+
+        assert_eq!(
+            build_catalog(crate::entity::ParticipantId::new(), "", &snapshot),
+            Err(CatalogBuildError::ValueOutOfBounds)
+        );
+        assert_eq!(
+            build_catalog(
+                crate::entity::ParticipantId::new(),
+                &"x".repeat(257),
+                &snapshot,
+            ),
+            Err(CatalogBuildError::ValueOutOfBounds)
         );
     }
 
@@ -2235,7 +2324,7 @@ mod tests {
             audio: Vec::new(),
         };
 
-        assert!(build_catalog(crate::entity::ParticipantId::new(), &snapshot).is_err());
+        assert!(build_catalog(crate::entity::ParticipantId::new(), "self", &snapshot).is_err());
     }
 
     #[test]
@@ -2262,7 +2351,7 @@ mod tests {
             audio: Vec::new(),
         };
 
-        assert!(build_catalog(crate::entity::ParticipantId::new(), &snapshot).is_err());
+        assert!(build_catalog(crate::entity::ParticipantId::new(), "self", &snapshot).is_err());
     }
 
     #[test]
@@ -2292,6 +2381,6 @@ mod tests {
             audio: Vec::new(),
         };
 
-        assert!(build_catalog(crate::entity::ParticipantId::new(), &snapshot).is_err());
+        assert!(build_catalog(crate::entity::ParticipantId::new(), "self", &snapshot).is_err());
     }
 }
