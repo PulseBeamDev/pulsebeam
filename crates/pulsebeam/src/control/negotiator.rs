@@ -98,7 +98,7 @@ impl NegotiatedResources {
     }
 
     #[cfg(test)]
-    fn as_slice(&self) -> &[NegotiatedMedia] {
+    pub(crate) fn as_slice(&self) -> &[NegotiatedMedia] {
         &self.media
     }
 }

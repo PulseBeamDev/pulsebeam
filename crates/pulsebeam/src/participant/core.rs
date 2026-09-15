@@ -6,7 +6,7 @@ use pulsebeam_runtime::net::{self};
 use std::time::Duration;
 use str0m::bwe::BweKind;
 #[cfg(test)]
-use str0m::channel::ChannelId;
+use str0m::channel::{ChannelConfig, ChannelId};
 use str0m::media::{KeyframeRequestKind, MediaKind, Mid};
 use str0m::{
     Event, Rtc, RtcError,
@@ -672,6 +672,16 @@ impl Participant {
     #[cfg(test)]
     pub(crate) fn v1_test_channel_write_attempts(&self) -> &[Vec<u8>] {
         self.transport.test_channel_write_attempts()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn handle_v1_test_event(&mut self, event: Event, sink: &mut impl ParticipantSink) {
+        self.handle_event(Instant::now(), event, sink);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_v1_test_channel_config(&mut self, cid: ChannelId, config: ChannelConfig) {
+        self.transport.set_test_channel_config(cid, config);
     }
 
     #[cfg(test)]
@@ -2257,6 +2267,7 @@ mod authorization_tests {
         let attempts = participant.v1_test_channel_write_attempts();
         assert_eq!(attempts.len(), failed.len() + 1);
         assert_eq!(attempts.last(), failed.first());
+        let _ = participant.poll(Instant::now(), &mut sink);
         assert_eq!(sink.exit_count, 1);
     }
 }
@@ -2299,7 +2310,10 @@ mod v1_server_integration_tests {
         let mut sink = MockParticipantSink::new();
 
         participant.poll(Instant::now(), &mut sink);
-        let initial = participant.v1_test_channel_write_attempts().last().unwrap();
+        let initial = participant
+            .v1_test_channel_write_attempts()
+            .first()
+            .unwrap();
         assert!(matches!(
             pulsebeam_proto::codec::decode_server(initial),
             Ok(pulsebeam_proto::signaling_v1::ServerMessage {
@@ -2329,22 +2343,27 @@ mod v1_server_integration_tests {
             }),
             &mut sink,
         );
+        let offset = participant.v1_test_channel_write_attempts().len();
+        participant.set_v1_test_write_channel_result(true);
         participant.poll(Instant::now(), &mut sink);
 
-        let mapping = participant.v1_test_channel_write_attempts().last().unwrap();
-        assert!(matches!(
-            pulsebeam_proto::codec::decode_server(mapping),
-            Ok(pulsebeam_proto::signaling_v1::ServerMessage {
-                payload: Some(
-                    pulsebeam_proto::signaling_v1::server_message::Payload::Mapping(
-                        pulsebeam_proto::signaling_v1::Mapping {
-                            intent_revision: 1,
-                            ..
-                        }
-                    )
-                )
-            })
-        ));
+        assert!(
+            participant.v1_test_channel_write_attempts()[offset..]
+                .iter()
+                .any(|mapping| matches!(
+                    pulsebeam_proto::codec::decode_server(mapping),
+                    Ok(pulsebeam_proto::signaling_v1::ServerMessage {
+                        payload: Some(
+                            pulsebeam_proto::signaling_v1::server_message::Payload::Mapping(
+                                pulsebeam_proto::signaling_v1::Mapping {
+                                    intent_revision: 1,
+                                    ..
+                                }
+                            )
+                        )
+                    })
+                ))
+        );
     }
 
     #[test]
@@ -2373,6 +2392,7 @@ mod v1_server_integration_tests {
                 ))
             }) if code == pulsebeam_proto::signaling_v1::ErrorCode::InvalidMessage as i32
         ));
+        participant.poll(Instant::now(), &mut sink);
         assert_eq!(sink.exit_count, 1);
     }
 

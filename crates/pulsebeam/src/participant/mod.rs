@@ -10,6 +10,9 @@ pub(crate) mod reverse;
 mod signaling;
 pub(crate) mod transport;
 mod upstream;
+#[cfg(test)]
+#[path = "v1_server_acceptance_tests.rs"]
+mod v1_server_integration_tests_matrix;
 
 pub use core::*;
 pub use effect::{ParticipantEffect, RoomParticipant};

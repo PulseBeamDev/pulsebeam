@@ -114,6 +114,8 @@ pub(crate) struct Transport {
     channel_write_attempts: Vec<Vec<u8>>,
     #[cfg(test)]
     test_rtc_events: VecDeque<Event>,
+    #[cfg(test)]
+    test_channel_config: Option<(ChannelId, str0m::channel::ChannelConfig)>,
     #[cfg(debug_assertions)]
     egress_guard: crate::rtp::egress_guard::EgressGuard,
     #[cfg(feature = "sim")]
@@ -147,6 +149,8 @@ impl Transport {
             channel_write_attempts: Vec::new(),
             #[cfg(test)]
             test_rtc_events: VecDeque::new(),
+            #[cfg(test)]
+            test_channel_config: None,
             #[cfg(debug_assertions)]
             egress_guard: crate::rtp::egress_guard::EgressGuard::new(),
             #[cfg(feature = "sim")]
@@ -269,6 +273,15 @@ impl Transport {
     }
 
     #[cfg(test)]
+    pub(crate) fn set_test_channel_config(
+        &mut self,
+        cid: ChannelId,
+        config: str0m::channel::ChannelConfig,
+    ) {
+        self.test_channel_config = Some((cid, config));
+    }
+
+    #[cfg(test)]
     pub(crate) fn test_pending_mutation_count(&self) -> usize {
         self.pending_mutations.len()
     }
@@ -277,6 +290,12 @@ impl Transport {
         &mut self,
         cid: ChannelId,
     ) -> Option<str0m::channel::ChannelConfig> {
+        #[cfg(test)]
+        if let Some((test_cid, config)) = &self.test_channel_config
+            && *test_cid == cid
+        {
+            return Some(config.clone());
+        }
         self.rtc.channel(cid)?.config().cloned()
     }
 
