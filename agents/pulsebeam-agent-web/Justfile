@@ -24,7 +24,7 @@ uniffi-generate:
 uniffi-browser-build: uniffi-generate
     pnpm exec tsc -p tsconfig.uniffi.browser.json
     mkdir -p dist/uniffi-proof/generated/bindings/wasm-bindgen
-    cp generated/bindings/wasm-bindgen/index_bg.wasm dist/uniffi-proof/generated/bindings/wasm-bindgen/index_bg.wasm
+    cp generated/bindings/wasm-bindgen/index.js generated/bindings/wasm-bindgen/index_bg.wasm dist/uniffi-proof/generated/bindings/wasm-bindgen/
 
 # Regenerate and reject checked-in binding drift.
 uniffi-check: uniffi-generate
