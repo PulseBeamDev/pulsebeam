@@ -6,7 +6,8 @@ build: prepare
 
 # The web package owns its lockfile and install.
 prepare:
-    pnpm install --frozen-lockfile --ignore-scripts
+    pnpm install --no-frozen-lockfile --ignore-scripts
+    git diff -- pnpm-lock.yaml
 
 # Format handwritten TypeScript and JavaScript sources.
 fix: prepare
