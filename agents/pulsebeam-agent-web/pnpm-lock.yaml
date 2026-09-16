@@ -4,9 +4,6 @@ settings:
   autoInstallPeers: true
   excludeLinksFromLockfile: false
 
-patchedDependencies:
-  uniffi-bindgen-react-native@0.31.0-5: eb97c214d88cdc717929c5e0fb5dd7a0b0641b353f85cf9156937f5f799bab1e
-
 importers:
 
   .:
@@ -23,7 +20,7 @@ importers:
         version: 5.9.3
       uniffi-bindgen-react-native:
         specifier: 0.31.0-5
-        version: 0.31.0-5(patch_hash=eb97c214d88cdc717929c5e0fb5dd7a0b0641b353f85cf9156937f5f799bab1e)
+        version: 0.31.0-5
 
 packages:
 
@@ -52,4 +49,4 @@ snapshots:
 
   typescript@5.9.3: {}
 
-  uniffi-bindgen-react-native@0.31.0-5(patch_hash=eb97c214d88cdc717929c5e0fb5dd7a0b0641b353f85cf9156937f5f799bab1e): {}
+  uniffi-bindgen-react-native@0.31.0-5: {}
