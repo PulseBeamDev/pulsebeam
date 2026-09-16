@@ -168,6 +168,7 @@ impl Simulation {
                 path_available: true,
                 feedback: &samples,
                 feedback_hold: Duration::ZERO,
+                fresh_network_feedback: !samples.is_empty(),
                 bytes_in_flight,
                 paced_queue_bytes: self.queue_bytes,
                 offered_media_rate: offered_bps,

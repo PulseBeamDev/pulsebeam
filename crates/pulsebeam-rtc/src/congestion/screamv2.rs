@@ -239,20 +239,10 @@ impl ScreamV2 {
         }
     }
 
-    /// Transport/path replacement invalidates one-way-delay and ECN evidence, not capacity state.
-    pub(crate) fn reset_path_evidence(&mut self) {
-        self.base_delay_minima.clear();
-        self.competing_samples.clear();
-        self.qdelay = Duration::ZERO;
-        self.qdelay_avg = Duration::ZERO;
-        self.qdelay_max_avg = self.qdelay_target;
-        self.qdelay_min_avg = Duration::ZERO;
-        self.qdelay_dev_avg = Duration::ZERO;
-        self.ref_wnd_delay_scale = ONE;
-        self.l4s_alpha = 0;
-        self.ecn_mode = EcnMode::Disabled;
-        self.data_units_delivered_this_rtt = 0;
-        self.data_units_marked_this_rtt = 0;
+    /// A selected-path replacement invalidates path capacity as well as delay/ECN evidence.
+    pub(crate) fn reset_path(&mut self, target_bitrate_max: u64) {
+        let path_payload_max = u32::try_from(self.mss).ok();
+        *self = Self::new(target_bitrate_max, path_payload_max);
         self.reason = ControllerReason::PathChanged;
     }
 
@@ -293,11 +283,11 @@ impl ScreamV2 {
                 self.bytes_newly_acked = self
                     .bytes_newly_acked
                     .saturating_add(u64::from(sample.transport_bytes));
-                if sample.received && sample.ecn == Some(EcnMark::Ce) {
-                    self.bytes_newly_acked_ce = self
-                        .bytes_newly_acked_ce
-                        .saturating_add(u64::from(sample.transport_bytes));
-                }
+            }
+            if sample.received && sample.ecn == Some(EcnMark::Ce) {
+                self.bytes_newly_acked_ce = self
+                    .bytes_newly_acked_ce
+                    .saturating_add(u64::from(sample.transport_bytes));
             }
             if sample.received {
                 delivered_bytes = delivered_bytes.saturating_add(u64::from(sample.transport_bytes));
@@ -883,6 +873,32 @@ mod tests {
         let before = cc.ref_wnd;
         cc.update(Duration::from_millis(50), values);
         assert!(cc.ref_wnd >= before);
+    }
+
+    #[test]
+    fn path_reset_drops_previous_capacity_state() {
+        let mut cc = ScreamV2::new(8_000_000, None);
+        cc.ref_wnd = 200_000;
+        cc.target_bitrate = 8_000_000;
+        cc.s_rtt = Duration::from_millis(350);
+        cc.qdelay_target = Duration::from_millis(400);
+        cc.reset_path(2_000_000);
+        assert_eq!(cc.s_rtt, PROFILE.initial_rtt);
+        assert_eq!(cc.qdelay_target, PROFILE.queue_target_low);
+        assert!(cc.ref_wnd < 200_000);
+        assert!(cc.target_bitrate <= PROFILE.target_initial_bps);
+        assert_eq!(cc.reason, ControllerReason::PathChanged);
+    }
+
+    #[test]
+    fn recovered_ce_is_counted_without_double_ack_credit() {
+        let mut cc = ScreamV2::new(4_000_000, None);
+        let first = [sample(25, false, true, false, false)];
+        cc.consume_feedback(Duration::from_millis(25), input(&first, 4_000_000));
+        assert_eq!(cc.debug_accumulated_acks(), (1_000, 0));
+        let recovered = [sample(50, true, false, false, true)];
+        cc.consume_feedback(Duration::from_millis(50), input(&recovered, 4_000_000));
+        assert_eq!(cc.debug_accumulated_acks(), (1_000, 1_000));
     }
 
     #[test]

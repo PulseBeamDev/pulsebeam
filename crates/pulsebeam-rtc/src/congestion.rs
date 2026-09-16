@@ -52,6 +52,7 @@ pub(crate) struct ControllerInput<'a> {
     pub(crate) path_available: bool,
     pub(crate) feedback: &'a [FeedbackSample],
     pub(crate) feedback_hold: Duration,
+    pub(crate) fresh_network_feedback: bool,
     pub(crate) bytes_in_flight: u64,
     pub(crate) paced_queue_bytes: u64,
     pub(crate) offered_media_rate: u64,
@@ -228,15 +229,19 @@ impl ScreamController {
     }
 
     pub(crate) fn update(&mut self, now: Duration, input: ControllerInput<'_>) -> SafeRtpEnvelope {
-        self.update_path(input.path_epoch, input.path_available);
+        self.update_path(
+            input.path_epoch,
+            input.path_available,
+            input.desired_media_rate.min(TARGET_BITRATE_MAX),
+        );
         self.feedback_hold = input.feedback_hold;
         self.update_application_limited(now, &input);
-        if !input.feedback.is_empty() {
+        if input.fresh_network_feedback {
             self.last_feedback = Some(now);
             self.feedback_stale = false;
         }
         self.update_staleness(now);
-        self.update_confidence(now, !input.feedback.is_empty());
+        self.update_confidence(now, input.fresh_network_feedback);
 
         // SCReAMv2 sees only draft-defined algorithm inputs. PulseBeam's playout-derived
         // queue_delay_ceiling, offered/admitted rates, and pacer state remain outside it.
@@ -272,6 +277,7 @@ impl ScreamController {
             path_available: self.path_available,
             feedback: &[],
             feedback_hold: self.feedback_hold,
+            fresh_network_feedback: false,
             bytes_in_flight,
             paced_queue_bytes,
             offered_media_rate: 0,
@@ -284,7 +290,7 @@ impl ScreamController {
         self.envelope(output, &input, self.last_reason)
     }
 
-    fn update_path(&mut self, epoch: Option<u64>, available: bool) {
+    fn update_path(&mut self, epoch: Option<u64>, available: bool, target_bitrate_max: u64) {
         if self.path_epoch == epoch && self.path_available == available {
             return;
         }
@@ -292,7 +298,7 @@ impl ScreamController {
         self.path_available = available;
         self.last_feedback = None;
         self.feedback_stale = false;
-        self.core.reset_path_evidence();
+        self.core.reset_path(target_bitrate_max);
         self.last_reason = ControllerReason::PathChanged;
     }
 
@@ -433,6 +439,7 @@ mod tests {
             path_available: true,
             feedback: &[],
             feedback_hold: Duration::ZERO,
+            fresh_network_feedback: false,
             bytes_in_flight: 0,
             paced_queue_bytes: 0,
             offered_media_rate: 0,
@@ -459,6 +466,49 @@ mod tests {
             tight_output.effective_queue_delay_target,
             tight_output.native_queue_delay_target
         );
+    }
+
+    #[test]
+    fn synthetic_loss_does_not_refresh_feedback_freshness() {
+        let mut cc = ScreamController::new(2_000_000, None);
+        cc.note_send(Duration::ZERO);
+        let base = ControllerInput {
+            path_epoch: Some(1),
+            path_available: true,
+            feedback: &[],
+            feedback_hold: Duration::ZERO,
+            fresh_network_feedback: false,
+            bytes_in_flight: 0,
+            paced_queue_bytes: 0,
+            offered_media_rate: 2_000_000,
+            admitted_media_rate: 2_000_000,
+            desired_media_rate: 2_000_000,
+            window_or_pacer_blocked: false,
+            queue_delay_ceiling: Duration::from_millis(15),
+            ecn: EcnValidation::default(),
+        };
+        cc.update(Duration::from_millis(600), base);
+        assert!(cc.feedback_stale);
+        let loss = [FeedbackSample {
+            sent_at: Duration::ZERO,
+            received_at: Duration::from_millis(600),
+            transport_bytes: 1_000,
+            received: false,
+            newly_acked: false,
+            lost: true,
+            receiver_arrival_micros: None,
+            ecn: None,
+        }];
+        let output = cc.update(
+            Duration::from_millis(650),
+            ControllerInput {
+                feedback: &loss,
+                fresh_network_feedback: false,
+                ..base
+            },
+        );
+        assert!(output.feedback_stale);
+        assert_eq!(cc.last_feedback, None);
     }
 
     #[test]

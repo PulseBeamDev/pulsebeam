@@ -116,6 +116,12 @@ impl SentHistory {
                 .saturating_add(statuses.len() as u64);
             return;
         }
+        let last_reported = base
+            .saturating_add(u64::try_from(statuses.len().saturating_sub(1)).unwrap_or(u64::MAX));
+        if base > newest || last_reported > newest {
+            self.add_unknown(statuses.len());
+            return;
+        }
         let reference = unwrap_near_signed(i64::from(reference_time), self.twcc_reference, 1 << 24);
         self.twcc_reference = Some(reference);
         let count = unwrap_near_signed(i64::from(feedback_count), self.twcc_feedback_count, 1 << 8);
@@ -219,6 +225,13 @@ impl SentHistory {
                     .counters
                     .stale_feedback
                     .saturating_add(report.statuses.len() as u64);
+                continue;
+            }
+            let last_reported = base.saturating_add(
+                u64::try_from(report.statuses.len().saturating_sub(1)).unwrap_or(u64::MAX),
+            );
+            if base > newest || last_reported > newest {
+                self.add_unknown(report.statuses.len());
                 continue;
             }
             let timestamp = unwrap_near_signed(

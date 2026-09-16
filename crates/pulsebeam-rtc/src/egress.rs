@@ -296,6 +296,7 @@ impl MediaEgress {
         path_change: Option<(u64, bool)>,
         feedback: &[FeedbackSample],
         feedback_hold: Duration,
+        fresh_network_feedback: bool,
         bytes_in_flight: u64,
     ) -> bool {
         if let Some((epoch, available)) = path_change {
@@ -331,6 +332,7 @@ impl MediaEgress {
                 path_available: self.path_available,
                 feedback,
                 feedback_hold,
+                fresh_network_feedback,
                 bytes_in_flight,
                 paced_queue_bytes: self.queued_transport_bytes as u64,
                 offered_media_rate: offered,
