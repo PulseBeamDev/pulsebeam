@@ -453,6 +453,75 @@ mod tests {
     }
 
     #[test]
+    fn application_limited_feedback_does_not_inflate_reference_window() {
+        let mut cc = ScreamController::new(4_000_000, None);
+        cc.note_send(Duration::ZERO);
+        let base = ControllerInput {
+            path_epoch: Some(1),
+            path_available: true,
+            feedback: &[],
+            feedback_hold: Duration::ZERO,
+            fresh_network_feedback: false,
+            bytes_in_flight: 1_000,
+            paced_queue_bytes: 0,
+            offered_media_rate: 64_000,
+            admitted_media_rate: 64_000,
+            desired_media_rate: 4_000_000,
+            window_or_pacer_blocked: false,
+            ecn: EcnValidation::default(),
+        };
+        cc.update(Duration::ZERO, base);
+        let entered = cc.update(Duration::from_millis(250), base);
+        assert!(entered.application_limited);
+        let before = entered.reference_window;
+        let feedback = [FeedbackSample {
+            sent_at: Duration::from_millis(240),
+            received_at: Duration::from_millis(300),
+            transport_bytes: 1_000,
+            received: true,
+            newly_acked: true,
+            lost: false,
+            receiver_arrival_micros: None,
+            ecn: None,
+        }];
+        let after = cc.update(
+            Duration::from_millis(300),
+            ControllerInput {
+                feedback: &feedback,
+                fresh_network_feedback: true,
+                ..base
+            },
+        );
+        assert!(after.application_limited);
+        assert_eq!(after.reference_window, before);
+    }
+
+    #[test]
+    fn confidence_has_five_second_half_life_while_application_limited() {
+        let mut cc = ScreamController::new(2_000_000, None);
+        cc.note_send(Duration::ZERO);
+        let input = ControllerInput {
+            path_epoch: Some(1),
+            path_available: true,
+            feedback: &[],
+            feedback_hold: Duration::ZERO,
+            fresh_network_feedback: false,
+            bytes_in_flight: 0,
+            paced_queue_bytes: 0,
+            offered_media_rate: 64_000,
+            admitted_media_rate: 64_000,
+            desired_media_rate: 2_000_000,
+            window_or_pacer_blocked: false,
+            ecn: EcnValidation::default(),
+        };
+        cc.update(Duration::ZERO, input);
+        let started = cc.update(Duration::from_millis(250), input);
+        assert!(started.application_limited);
+        let half = cc.update(Duration::from_millis(5_250), input);
+        assert_eq!(half.queue_delay_confidence, u16::MAX / 2);
+    }
+
+    #[test]
     fn latency_governor_remains_outer_policy_only() {
         let urgent = LatencyGovernor::operating_point(0, 1_000_000);
         let quality = LatencyGovernor::operating_point(50, 1_000_000);

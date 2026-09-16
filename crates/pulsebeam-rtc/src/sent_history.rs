@@ -28,6 +28,7 @@ pub(crate) const MAX_EXPIRATIONS_PER_POLL: usize = 256;
 const MAX_ACK_REORDERING: u64 = 4_096;
 const MAX_FEEDBACK_STATUSES: usize = 8_192;
 const INITIAL_REORDERING_WINDOW: Duration = Duration::from_millis(30);
+const MAX_REORDERING_WINDOW: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub(crate) struct SentPacketId(u64);
@@ -207,13 +208,20 @@ impl SentHistory {
         let slot = ring_index(sent_id.0);
         if let Some(previous) = self.entries[slot] {
             self.remove_indexes(previous);
+            // Once a ring generation is overwritten, no earlier sent id can still be
+            // retained. Keep the expiration cursor on a live generation.
+            self.oldest_sent_id = self.oldest_sent_id.max(previous.id.0.saturating_add(1));
         }
         let ssrc_index = self.ssrc_index_or_insert(rtp.ssrc, rtp.sequence);
-        let rtp_sequence = if self.ssrcs[ssrc_index].sent_ids.is_empty() {
+        let empty_history = self.ssrcs[ssrc_index].sent_ids.is_empty();
+        let rtp_sequence = if empty_history {
             u64::from(rtp.sequence)
         } else {
             unwrap_forward(rtp.sequence, self.ssrcs[ssrc_index].newest_sequence)
         };
+        if empty_history {
+            self.ssrcs[ssrc_index].first_sequence = rtp_sequence;
+        }
         self.ssrcs[ssrc_index].newest_sequence = rtp_sequence;
         let twcc_sequence = rtp.twcc_sequence.map(|sequence| {
             let unwrapped = self.newest_twcc.map_or_else(
@@ -308,6 +316,10 @@ impl SentHistory {
             }
         }
         self.inputs.bytes_in_flight = self.bytes_in_flight;
+        // Controller evidence is path scoped. Never let feedback emitted before a
+        // selected-path replacement reach the controller on the new epoch.
+        self.inputs.feedback.clear();
+        self.inputs.timing = None;
         self.inputs.path_change = Some(PathChange { epoch, available });
         self.twcc_reference = None;
         self.twcc_feedback_count = None;
@@ -319,6 +331,7 @@ impl SentHistory {
         for ssrc in &mut self.ssrcs {
             ssrc.last_report_timestamp = None;
             ssrc.highest_acked_sequence = None;
+            ssrc.sent_ids.clear();
         }
     }
 

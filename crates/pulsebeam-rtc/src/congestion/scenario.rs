@@ -21,7 +21,6 @@ pub(crate) struct ScenarioMetrics {
     pub(crate) stale_recovered: bool,
     pub(crate) window_grew_while_stale: bool,
     pub(crate) baseline_resets: u64,
-    pub(crate) old_path_sample_used: bool,
     pub(crate) ecn_reduced_window: bool,
     pub(crate) l4s_disabled_on_bleach: bool,
     pub(crate) policer_detected: bool,
@@ -205,7 +204,6 @@ impl Simulation {
             stale_recovered: false,
             window_grew_while_stale: false,
             baseline_resets: 0,
-            old_path_sample_used: false,
             ecn_reduced_window: false,
             l4s_disabled_on_bleach: false,
             policer_detected: self.output.policer_detected,
@@ -365,7 +363,6 @@ fn path_step() -> ScenarioMetrics {
     }
     let mut metrics = sim.metrics("RTT-path-step", 0x0705);
     metrics.baseline_resets = resets;
-    metrics.old_path_sample_used = false;
     metrics
 }
 

@@ -135,6 +135,9 @@ sender policy + immutable packet global_media_at + frame metadata
                 per-sender operating points
                               |
                               v
+                 external demand aggregation
+                              |
+                              v
 packet feedback ------> self-contained SCReAM v2 core ----------> safe RTP envelope
                               |                                         |
                               +----------------+------------------------+

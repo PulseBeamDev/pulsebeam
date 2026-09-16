@@ -275,3 +275,45 @@ fn future_rfc8888_feedback_cannot_advance_ack_edge() {
     assert!(history.ssrcs[0].highest_acked_sequence.is_none());
     assert!(history.counters.unknown_feedback >= 2);
 }
+
+#[test]
+fn path_change_discards_pending_feedback_and_rebases_ssrc_history() {
+    let now = Instant::now();
+    let old_epoch = PathEpoch::from_value(20);
+    let new_epoch = PathEpoch::from_value(21);
+    let mut history = SentHistory::new(PacketFeedbackKind::Rfc8888);
+    history.path_changed(old_epoch, true);
+    history.commit(rfc_context(now, old_epoch, 10)).unwrap();
+    history.emit(SentPacketId(0), false, false, true, None, None);
+    assert!(!history.inputs.feedback.is_empty());
+    history.path_changed(new_epoch, true);
+    assert!(history.inputs.feedback.is_empty());
+    assert!(history.inputs.timing.is_none());
+    assert!(history.ssrcs[0].sent_ids.is_empty());
+    history.commit(rfc_context(now, new_epoch, 500)).unwrap();
+    assert_eq!(history.ssrcs[0].first_sequence, 500);
+}
+
+#[test]
+fn reordering_window_is_bounded_and_decays_after_confirmed_loss() {
+    let now = Instant::now();
+    let epoch = PathEpoch::from_value(22);
+    let mut history = SentHistory::new(PacketFeedbackKind::Rfc8888);
+    history.path_changed(epoch, true);
+    history.commit(rfc_context(now, epoch, 1)).unwrap();
+    history.set_missing(SentPacketId(0), now);
+    history.recover(
+        Some(SentPacketId(0)),
+        epoch,
+        None,
+        None,
+        now + Duration::from_secs(2),
+    );
+    assert_eq!(history.reordering_window, MAX_REORDERING_WINDOW);
+
+    history.commit(rfc_context(now, epoch, 2)).unwrap();
+    history.set_missing(SentPacketId(1), now);
+    history.confirm_losses(now + MAX_REORDERING_WINDOW, 1);
+    assert!(history.reordering_window < MAX_REORDERING_WINDOW);
+    assert!(history.reordering_window >= INITIAL_REORDERING_WINDOW);
+}

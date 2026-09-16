@@ -76,9 +76,14 @@ impl SentHistory {
     }
 
     pub(crate) fn next_deadline(&self) -> Option<Instant> {
-        let sent = self
-            .entry(SentPacketId(self.oldest_sent_id))
-            .and_then(|entry| entry.committed_at.checked_add(SENT_HISTORY_MAX_AGE));
+        let scan_end = self
+            .oldest_sent_id
+            .saturating_add(SENT_HISTORY_CAPACITY as u64)
+            .min(self.next_sent_id);
+        let sent = (self.oldest_sent_id..scan_end).find_map(|id| {
+            self.entry(SentPacketId(id))
+                .and_then(|entry| entry.committed_at.checked_add(SENT_HISTORY_MAX_AGE))
+        });
         let missing = self.missing.iter().find_map(|id| {
             let entry = self.entry(*id)?;
             match entry.acknowledgment {
@@ -174,11 +179,18 @@ impl SentHistory {
         epoch: PathEpoch,
         received_at: Instant,
     ) {
-        let start = self.highest_twcc_acked.map_or_else(
-            || self.oldest_twcc.unwrap_or(base),
-            |previous| previous.saturating_add(1),
-        );
-        if edge < start || edge.saturating_sub(start) > MAX_FEEDBACK_STATUSES as u64 {
+        let start = self
+            .highest_twcc_acked
+            .map_or(base, |previous| base.max(previous.saturating_add(1)));
+        if edge < start || edge.saturating_sub(start) >= MAX_FEEDBACK_STATUSES as u64 {
+            return;
+        }
+        let edge_known = self
+            .twcc_sent_id(edge)
+            .and_then(|sent_id| self.entry(sent_id))
+            .is_some_and(|entry| entry.path_epoch == epoch);
+        if !edge_known {
+            self.add_unknown(1);
             return;
         }
         for sequence in start..=edge {
@@ -287,10 +299,15 @@ impl SentHistory {
             }
             let old_edge = self.ssrcs[ssrc_index].highest_acked_sequence;
             if let Some(edge) = highest_received {
-                let start = old_edge.map_or(self.ssrcs[ssrc_index].first_sequence, |previous| {
-                    previous.saturating_add(1)
-                });
-                if edge >= start && edge.saturating_sub(start) <= MAX_FEEDBACK_STATUSES as u64 {
+                let start = old_edge.map_or(base, |previous| base.max(previous.saturating_add(1)));
+                let edge_known = self
+                    .lookup_rtp(ssrc_index, edge)
+                    .and_then(|sent_id| self.entry(sent_id))
+                    .is_some_and(|entry| entry.path_epoch == epoch);
+                if !edge_known {
+                    self.add_unknown(1);
+                } else if edge >= start && edge.saturating_sub(start) < MAX_FEEDBACK_STATUSES as u64
+                {
                     for sequence in start..=edge {
                         let sent_id = self.lookup_rtp(ssrc_index, sequence);
                         let offset = sequence
@@ -368,9 +385,10 @@ impl SentHistory {
         }
         match entry.acknowledgment {
             Acknowledgment::Missing { since } => {
-                self.reordering_window = self
-                    .reordering_window
-                    .max(received_at.saturating_duration_since(since));
+                let observed = received_at
+                    .saturating_duration_since(since)
+                    .min(MAX_REORDERING_WINDOW);
+                self.reordering_window = self.reordering_window.max(observed);
                 self.set_received(sent_id, false, receiver_arrival, ecn, received_at);
             }
             Acknowledgment::Received | Acknowledgment::Lost | Acknowledgment::Retired => {
@@ -395,7 +413,7 @@ impl SentHistory {
         let Some(entry) = self.entry_mut(sent_id) else {
             return;
         };
-        if matches!(entry.acknowledgment, Acknowledgment::Received) {
+        if entry.acknowledgment.is_terminal() {
             self.counters.duplicate_feedback = self.counters.duplicate_feedback.saturating_add(1);
             return;
         }
@@ -422,6 +440,7 @@ impl SentHistory {
 
     fn confirm_losses(&mut self, now: Instant, limit: usize) -> usize {
         let mut work = 0;
+        let mut confirmed_loss = false;
         while work < limit {
             let Some(sent_id) = self.missing.front().copied() else {
                 break;
@@ -441,6 +460,7 @@ impl SentHistory {
                     }
                     self.missing.pop_front();
                     self.mark_lost(sent_id, false);
+                    confirmed_loss = true;
                     work += 1;
                 }
                 _ => {
@@ -448,6 +468,12 @@ impl SentHistory {
                     work += 1;
                 }
             }
+        }
+        if confirmed_loss && self.reordering_window > INITIAL_REORDERING_WINDOW {
+            let excess = self
+                .reordering_window
+                .saturating_sub(INITIAL_REORDERING_WINDOW);
+            self.reordering_window = INITIAL_REORDERING_WINDOW.saturating_add(excess / 2);
         }
         work
     }
@@ -488,13 +514,10 @@ impl SentHistory {
         receiver_arrival: Option<ReceiverTime>,
         ecn: Option<EcnMark>,
     ) {
-        if self.inputs.feedback.len() >= MAX_FEEDBACK_STATUSES {
-            return;
-        }
         let Some(entry) = self.entry(sent_id).copied() else {
             return;
         };
-        self.inputs.feedback.push(PacketFeedback {
+        let sample = PacketFeedback {
             sent_id,
             committed_at: entry.committed_at,
             transport_bytes: u32::try_from(entry.wire_len).unwrap_or(u32::MAX),
@@ -504,7 +527,18 @@ impl SentHistory {
             lost,
             receiver_arrival,
             ecn,
-        });
+        };
+        if self.inputs.feedback.len() >= MAX_FEEDBACK_STATUSES {
+            // A confirmed loss must never disappear merely because one RTCP batch filled
+            // the bounded vector. Replace lower-severity evidence so the controller takes
+            // a conservative congestion path while preserving the hard work bound.
+            if lost && let Some(existing) = self.inputs.feedback.iter_mut().find(|item| !item.lost)
+            {
+                *existing = sample;
+            }
+            return;
+        }
+        self.inputs.feedback.push(sample);
     }
 
     fn twcc_sent_id(&self, sequence: u64) -> Option<SentPacketId> {

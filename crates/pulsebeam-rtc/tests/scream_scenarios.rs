@@ -28,7 +28,6 @@ fn fixed_scenario_matrix() {
             }
             0x0705 => {
                 assert_eq!(metrics.baseline_resets, 1);
-                assert!(!metrics.old_path_sample_used);
             }
             0x0706 => {
                 assert!(metrics.ecn_reduced_window);

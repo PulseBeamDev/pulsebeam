@@ -171,10 +171,10 @@ The SFU chooses sources and layers. The connection returns governed aggregate
 and per-sender allocations and owns transport scheduling.
 
 Egress uses one connection-level SCReAM-v2-derived RTP congestion controller.
-The SCReAM core remains independently testable and self-contained. A private
-PulseBeam latency governor may only tighten its native queue-delay target; it
-cannot increase SCReAM's congestion window, pacing permission, or estimated
-capacity.
+The SCReAM core remains independently testable and self-contained. PulseBeam
+latency policy governs admission, allocation, pacing horizons, retransmission, and
+probing outside that core; it does not override SCReAM's native queue-delay target,
+congestion window, pacing equations, or estimated capacity.
 
 The latency governor uses sender policy and immutable `global_media_at` to
 derive private receiver-specific admission, pacing, shedding, retransmission,

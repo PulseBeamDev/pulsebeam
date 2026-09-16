@@ -277,6 +277,11 @@ impl ScreamV2 {
         let mut delivered_bytes = 0_u64;
         let mut interval_start = now;
         let mut loss_events = 0_u64;
+        let rtt_sample = input
+            .feedback
+            .iter()
+            .filter(|sample| sample.received)
+            .max_by_key(|sample| sample.sent_at);
         for sample in input.feedback {
             interval_start = interval_start.min(sample.sent_at);
             if sample.newly_acked {
@@ -291,11 +296,6 @@ impl ScreamV2 {
             }
             if sample.received {
                 delivered_bytes = delivered_bytes.saturating_add(u64::from(sample.transport_bytes));
-                let raw_rtt = sample
-                    .received_at
-                    .saturating_sub(sample.sent_at)
-                    .saturating_sub(input.feedback_hold);
-                self.s_rtt = ewma_duration(self.s_rtt, raw_rtt, 1, 8);
                 self.observe_delay(sample);
                 self.data_units_delivered_this_rtt =
                     self.data_units_delivered_this_rtt.saturating_add(1);
@@ -307,6 +307,13 @@ impl ScreamV2 {
             if sample.lost {
                 loss_events = loss_events.saturating_add(1);
             }
+        }
+        if let Some(sample) = rtt_sample {
+            let raw_rtt = sample
+                .received_at
+                .saturating_sub(sample.sent_at)
+                .saturating_sub(input.feedback_hold);
+            self.s_rtt = ewma_duration(self.s_rtt, raw_rtt, 1, 8);
         }
         let interval = now
             .saturating_sub(interval_start)
@@ -873,6 +880,35 @@ mod tests {
         let before = cc.ref_wnd;
         cc.update(Duration::from_millis(50), values);
         assert!(cc.ref_wnd >= before);
+    }
+
+    #[test]
+    fn rtt_filter_consumes_one_sample_per_feedback_batch() {
+        let mut cc = ScreamV2::new(4_000_000, None);
+        let feedback = [
+            FeedbackSample {
+                sent_at: Duration::ZERO,
+                received_at: Duration::from_millis(200),
+                transport_bytes: 1_000,
+                received: true,
+                newly_acked: true,
+                lost: false,
+                receiver_arrival_micros: None,
+                ecn: None,
+            },
+            FeedbackSample {
+                sent_at: Duration::from_millis(190),
+                received_at: Duration::from_millis(200),
+                transport_bytes: 1_000,
+                received: true,
+                newly_acked: true,
+                lost: false,
+                receiver_arrival_micros: None,
+                ecn: None,
+            },
+        ];
+        cc.consume_feedback(Duration::from_millis(200), input(&feedback, 4_000_000));
+        assert_eq!(cc.s_rtt, Duration::from_micros(88_750));
     }
 
     #[test]
