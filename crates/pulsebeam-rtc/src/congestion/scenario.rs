@@ -146,6 +146,8 @@ impl Simulation {
                     received_at: self.now,
                     transport_bytes: packet.bytes,
                     received: packet.received,
+                    newly_acked: packet.received,
+                    lost: !packet.received,
                     receiver_arrival_micros: packet
                         .received
                         .then_some(packet.receiver_arrival_micros),
