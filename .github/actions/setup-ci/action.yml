@@ -39,5 +39,10 @@ runs:
         version: v0.13.1
 
     - if: inputs.web == 'true'
+      uses: taiki-e/install-action@v2
+      with:
+        tool: wasm-bindgen-cli@0.2.127
+
+    - if: inputs.web == 'true'
       shell: bash
       run: rustup target add wasm32-unknown-unknown
