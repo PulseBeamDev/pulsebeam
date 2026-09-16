@@ -24,7 +24,7 @@ uniffi-generate:
 uniffi-browser-build: uniffi-generate
     pnpm exec tsc -p tsconfig.uniffi.browser.json
     mkdir -p dist/uniffi-proof/generated/bindings/wasm-bindgen
-    cp generated/bindings/wasm-bindgen/index_bg.wasm dist/uniffi-proof/generated/bindings/wasm-bindgen/index_bg.wasm
+    cp generated/bindings/wasm-bindgen/index.js generated/bindings/wasm-bindgen/index_bg.wasm dist/uniffi-proof/generated/bindings/wasm-bindgen/
 
 # Regenerate and reject checked-in binding drift.
 uniffi-check: uniffi-generate
@@ -38,9 +38,9 @@ check: format-check
     pnpm run build:wasm
     pnpm run check
 
-# Run deterministic host-boundary tests. Browser contracts are opt-in.
+# Run deterministic host-boundary unit tests. Generated binding contracts have their own gate.
 test-fast: build uniffi-browser-build
-    cargo test -p pulsebeam-agent-web
+    cargo test -p pulsebeam-agent-web --lib
 
 # Run browser contracts after rebuilding every Web and React fixture.
 test-slow:
