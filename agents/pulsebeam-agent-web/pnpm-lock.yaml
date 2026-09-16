@@ -5,7 +5,7 @@ settings:
   excludeLinksFromLockfile: false
 
 patchedDependencies:
-  uniffi-bindgen-react-native@0.31.0-5: 156f32ac4d8fd0a870da9dff52d292476c1410493b466c9ef73abb2cfa3e2cef
+  uniffi-bindgen-react-native@0.31.0-5: eb97c214d88cdc717929c5e0fb5dd7a0b0641b353f85cf9156937f5f799bab1e
 
 importers:
 
@@ -23,7 +23,7 @@ importers:
         version: 5.9.3
       uniffi-bindgen-react-native:
         specifier: 0.31.0-5
-        version: 0.31.0-5(patch_hash=156f32ac4d8fd0a870da9dff52d292476c1410493b466c9ef73abb2cfa3e2cef)
+        version: 0.31.0-5(patch_hash=eb97c214d88cdc717929c5e0fb5dd7a0b0641b353f85cf9156937f5f799bab1e)
 
 packages:
 
@@ -52,4 +52,4 @@ snapshots:
 
   typescript@5.9.3: {}
 
-  uniffi-bindgen-react-native@0.31.0-5(patch_hash=156f32ac4d8fd0a870da9dff52d292476c1410493b466c9ef73abb2cfa3e2cef): {}
+  uniffi-bindgen-react-native@0.31.0-5(patch_hash=eb97c214d88cdc717929c5e0fb5dd7a0b0641b353f85cf9156937f5f799bab1e): {}
