@@ -6,6 +6,7 @@ bindings:
   uniffiToml: uniffi.toml
 web:
   manifestPath: generated/wasm/Cargo.toml
+  manifestPatchFile: ubrn.wasm.toml
   wasmCrateName: pulsebeam-agent-web-wasm
   features:
     - uniffi
