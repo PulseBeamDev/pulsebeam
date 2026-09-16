@@ -175,7 +175,6 @@ impl Simulation {
                 admitted_media_rate: admitted_rate,
                 desired_media_rate: desired_bps,
                 window_or_pacer_blocked: false,
-                queue_delay_ceiling: Duration::from_millis(60),
                 ecn: validation,
             },
         );

@@ -309,19 +309,6 @@ impl MediaEgress {
             .map(|sender| sender.policy.desired_bitrate.as_bps())
             .sum();
         let offered = if self.queue.is_empty() { 0 } else { desired };
-        let points = self
-            .senders
-            .iter()
-            .filter(|sender| sender.policy.desired_bitrate.as_bps() > 0)
-            .map(|sender| {
-                LatencyGovernor::operating_point(
-                    playout_max_ticks(sender.policy),
-                    sender.policy.desired_bitrate.as_bps(),
-                )
-            })
-            .collect::<Vec<_>>();
-        let queue_ceiling = LatencyGovernor::strictest_queue_ceiling(points.iter())
-            .unwrap_or(Duration::from_millis(15));
         let now = at
             .monotonic
             .saturating_duration_since(self.controller_origin);
@@ -339,7 +326,6 @@ impl MediaEgress {
                 admitted_media_rate: offered,
                 desired_media_rate: desired,
                 window_or_pacer_blocked: !self.pacer.eligible(at.monotonic),
-                queue_delay_ceiling: queue_ceiling,
                 ecn: EcnValidation::default(),
             },
         );

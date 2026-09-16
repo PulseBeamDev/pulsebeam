@@ -59,8 +59,6 @@ pub(crate) struct ControllerInput<'a> {
     pub(crate) admitted_media_rate: u64,
     pub(crate) desired_media_rate: u64,
     pub(crate) window_or_pacer_blocked: bool,
-    /// Legacy PulseBeam policy seam. It is intentionally NOT passed to SCReAMv2.
-    pub(crate) queue_delay_ceiling: Duration,
     pub(crate) ecn: EcnValidation,
 }
 
@@ -117,11 +115,9 @@ pub(crate) struct SafeRtpEnvelope {
 }
 
 /// PulseBeam latency policy. These values govern media usefulness, allocation, pacer
-/// horizon, repair, and probing outside SCReAMv2. In particular, queue_delay_ceiling is
-/// NOT a congestion-control input.
+/// horizon, repair, and probing outside SCReAMv2.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct SenderOperatingPoint {
-    pub(crate) queue_delay_ceiling: Duration,
     pub(crate) allocation_utilization: u64,
     pub(crate) pacer_horizon: Duration,
     pub(crate) rtx_extra_allowance: Duration,
@@ -149,12 +145,6 @@ impl LatencyGovernor {
         let denominator = micros(quality_playout_saturation.saturating_sub(urgent_playout_knee));
         let allocation_utilization = lerp_even(52_429, 62_259, numerator, denominator);
         SenderOperatingPoint {
-            queue_delay_ceiling: lerp_duration_even(
-                Duration::from_millis(15),
-                Duration::from_millis(60),
-                numerator,
-                denominator,
-            ),
             allocation_utilization,
             pacer_horizon: lerp_duration_even(
                 Duration::from_millis(15),
@@ -176,15 +166,6 @@ impl LatencyGovernor {
             ),
             governed_demand: mul_fixed(desired_media_rate, allocation_utilization),
         }
-    }
-
-    pub(crate) fn strictest_queue_ceiling<'a>(
-        active: impl IntoIterator<Item = &'a SenderOperatingPoint>,
-    ) -> Option<Duration> {
-        active
-            .into_iter()
-            .map(|point| point.queue_delay_ceiling)
-            .min()
     }
 }
 
@@ -243,8 +224,8 @@ impl ScreamController {
         self.update_staleness(now);
         self.update_confidence(now, input.fresh_network_feedback);
 
-        // SCReAMv2 sees only draft-defined algorithm inputs. PulseBeam's playout-derived
-        // queue_delay_ceiling, offered/admitted rates, and pacer state remain outside it.
+        // SCReAMv2 sees only draft-defined algorithm inputs. PulseBeam's playout,
+        // offered/admitted-rate, and pacer policy remain outside it.
         let output = self.core.update(
             now,
             screamv2::ControllerInput {
@@ -284,7 +265,6 @@ impl ScreamController {
             admitted_media_rate: 0,
             desired_media_rate: desired,
             window_or_pacer_blocked: false,
-            queue_delay_ceiling: Duration::ZERO,
             ecn: EcnValidation::default(),
         };
         self.envelope(output, &input, self.last_reason)
@@ -431,44 +411,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn pulsebeam_queue_policy_cannot_change_scream_state() {
-        let mut tight = ScreamController::new(2_000_000, None);
-        let mut loose = ScreamController::new(2_000_000, None);
-        let base = ControllerInput {
-            path_epoch: Some(1),
-            path_available: true,
-            feedback: &[],
-            feedback_hold: Duration::ZERO,
-            fresh_network_feedback: false,
-            bytes_in_flight: 0,
-            paced_queue_bytes: 0,
-            offered_media_rate: 0,
-            admitted_media_rate: 0,
-            desired_media_rate: 2_000_000,
-            window_or_pacer_blocked: false,
-            queue_delay_ceiling: Duration::from_millis(15),
-            ecn: EcnValidation::default(),
-        };
-        let tight_output = tight.update(Duration::ZERO, base);
-        let loose_output = loose.update(
-            Duration::ZERO,
-            ControllerInput {
-                queue_delay_ceiling: Duration::from_millis(500),
-                ..base
-            },
-        );
-        assert_eq!(tight_output.reference_window, loose_output.reference_window);
-        assert_eq!(
-            tight_output.native_queue_delay_target,
-            loose_output.native_queue_delay_target
-        );
-        assert_eq!(
-            tight_output.effective_queue_delay_target,
-            tight_output.native_queue_delay_target
-        );
-    }
-
-    #[test]
     fn synthetic_loss_does_not_refresh_feedback_freshness() {
         let mut cc = ScreamController::new(2_000_000, None);
         cc.note_send(Duration::ZERO);
@@ -484,7 +426,6 @@ mod tests {
             admitted_media_rate: 2_000_000,
             desired_media_rate: 2_000_000,
             window_or_pacer_blocked: false,
-            queue_delay_ceiling: Duration::from_millis(15),
             ecn: EcnValidation::default(),
         };
         cc.update(Duration::from_millis(600), base);
@@ -515,7 +456,7 @@ mod tests {
     fn latency_governor_remains_outer_policy_only() {
         let urgent = LatencyGovernor::operating_point(0, 1_000_000);
         let quality = LatencyGovernor::operating_point(50, 1_000_000);
-        assert!(quality.queue_delay_ceiling >= urgent.queue_delay_ceiling);
+        assert!(quality.allocation_utilization >= urgent.allocation_utilization);
         assert!(quality.pacer_horizon >= urgent.pacer_horizon);
     }
 }

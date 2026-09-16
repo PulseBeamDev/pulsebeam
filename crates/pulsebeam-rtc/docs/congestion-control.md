@@ -134,9 +134,7 @@ sender policy + immutable packet global_media_at + frame metadata
                               |
                 per-sender operating points
                               |
-                              +------ strict queue-target ceiling -----+
-                              |                                         |
-                              v                                         v
+                              v
 packet feedback ------> self-contained SCReAM v2 core ----------> safe RTP envelope
                               |                                         |
                               +----------------+------------------------+
@@ -387,7 +385,6 @@ The core consumes:
 - selected-path changes and network availability;
 - aggregate offered/admitted RTP media-payload rate;
 - aggregate SFU desired media-payload rate;
-- the private PulseBeam queue-delay ceiling.
 
 Per-sender priority, frame IDs, source selection, SCTP sequence/SACK state, and
 raw playout ranges are not SCReAM inputs.
@@ -554,8 +551,6 @@ not permission for implementation choice.
 
 | Field | Version-one value |
 | --- | ---: |
-| Most urgent queue-delay ceiling | `15 ms` |
-| Quality-saturated queue-delay ceiling | `60 ms` |
 | Urgent playout-maximum knee | `75 ms` |
 | Quality saturation playout maximum | `500 ms` |
 | Urgent allocation utilization | `0.80` |
@@ -585,7 +580,6 @@ private stable operating point. It does not continuously retune SCReAM per packe
 
 ```rust
 struct SenderOperatingPoint {
-    queue_delay_ceiling: Duration,
     allocation_utilization: Ratio,
     pacer_horizon: Duration,
     new_frame_horizon: Duration,
@@ -618,7 +612,6 @@ x = clamp((playout_max - 75 ms) / (500 ms - 75 ms), 0, 1)
 Then:
 
 ```text
-queue_delay_ceiling  = lerp(15 ms, 60 ms, x)
 allocation_utilization = lerp(0.80, 0.95, x)
 pacer_horizon        = lerp(15 ms, 80 ms, x)
 rtx_extra_allowance  = lerp(0 ms, 50 ms, x)
@@ -640,9 +633,9 @@ controls recovery classification and stability:
 - a fixed nonzero range requests stable playback and uses the slower upward
   relaxation in the profile.
 
-The strictest `queue_delay_ceiling` and `probe_queue_impact` among active senders
-become the path values. Utilization, demand, frame/RTX usefulness, and service
-balance remain per sender.
+The strictest `probe_queue_impact` among active senders becomes the path probe
+limit. Utilization, demand, frame/RTX usefulness, and service balance remain per
+sender.
 
 ### Receiver-specific deadline derivation
 
@@ -693,7 +686,7 @@ the server-anchored timeline and is reported separately.
 - drop audio older than `100 ms` and video older than `150 ms` at admission;
 - retransmit only when immediate prediction says it can arrive before newer
   replacement media and within the same age limit;
-- use the `15 ms` queue-delay ceiling and `0.80` allocation utilization;
+- use `0.80` allocation utilization and the urgent pacer horizon;
 - never wait to fill a smoothing interval.
 
 ### Dynamic policy changes
@@ -705,9 +698,7 @@ Tightening takes effect in the same `Command::SetSenderPolicy` call:
   `global_media_at`;
 - not-yet-started stale video frames are removed whole;
 - obsolete RTX is removed;
-- governed demand, pacer horizon, and allocation may fall immediately;
-- the path queue-delay ceiling tightens immediately when this sender becomes the
-  strictest active sender.
+- governed demand, pacer horizon, probe impact, and allocation may fall immediately.
 
 Relaxing follows the profile's per-RTT damping. It cannot release a burst, jump
 the SCReAM reference window, trust a stale estimate, or reconstruct dropped
@@ -718,7 +709,6 @@ media.
 For identical network, packet, and other-sender state, reducing one sender's
 playout maximum MUST NOT:
 
-- increase its or the path queue-delay ceiling;
 - increase its allocation utilization, governed demand, pacer horizon, or RTX
   allowance;
 - admit an older frame rejected by the looser policy;
@@ -726,7 +716,7 @@ playout maximum MUST NOT:
 - increase SCReAM's native target or reference window.
 
 Increasing a maximum may relax only that sender's private limits and only through
-damping. It cannot relax a path ceiling still required by another active sender.
+damping. It cannot alter SCReAM's native congestion state.
 
 ## Global media time and frame admission
 
@@ -1084,9 +1074,9 @@ comparison, the pinned live-browser matrix, and the root workspace gates.
 
 - Reducing a sender's playout maximum satisfies every monotonicity property across
   all `0..=4095` ticks.
-- Tightening one active sender cannot relax a shared path ceiling; making it
-  inactive permits the next strictest active sender to control it.
-- `effective_queue_delay_target <= native_queue_delay_target` always.
+- Tightening one active sender cannot increase SCReAM's native queue-delay target,
+  reference window, or target bitrate.
+- `effective_queue_delay_target == native_queue_delay_target` always.
 - Weighted allocation is demand-capped, capacity-conserving, deterministic, and
   converges to configured ratios.
 - Priority or desired-rate changes never reset SCReAM, sent history, transport
@@ -1134,9 +1124,9 @@ The corpus includes:
 For deterministic scenarios whose configured bottleneck and propagation model are
 known:
 
-- the internal effective queue target never exceeds the strictest active ceiling;
+- PulseBeam policy never mutates the SCReAM-native queue-delay target;
 - after convergence, controlled-bottleneck p99 queue delay is no more than the
-  effective target plus `10 ms`, except during a declared path step or probe;
+  native SCReAM target plus `10 ms`, except during a declared path step or probe;
 - a sustained equal-demand weighted allocation is within `10%` of its expected
   ratio after `5` smoothed RTTs;
 - probe overhead never exceeds the fixed rolling `5%` bound;
