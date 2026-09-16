@@ -6,14 +6,10 @@
     module_or_path:
       "/dist/uniffi-proof/generated/bindings/wasm-bindgen/index_bg.wasm",
   });
-  const core = await import(
-    "/dist/uniffi-proof/generated/bindings/pulsebeam_agent_core.js"
-  );
   const web = await import(
     "/dist/uniffi-proof/generated/bindings/pulsebeam_agent_web.js"
   );
   const registry = await import("/dist/uniffi-proof/web/media-registry.js");
-  core.default.initialize();
   web.default.initialize();
 
   const canvas = document.createElement("canvas");
