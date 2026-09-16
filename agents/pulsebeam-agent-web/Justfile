@@ -6,8 +6,7 @@ build: prepare
 
 # The web package owns its lockfile and install.
 prepare:
-    pnpm install --no-frozen-lockfile --ignore-scripts
-    git diff -- pnpm-lock.yaml
+    pnpm install --frozen-lockfile --ignore-scripts
 
 # Format handwritten TypeScript and JavaScript sources.
 fix: prepare
@@ -39,9 +38,9 @@ check: format-check
     pnpm run build:wasm
     pnpm run check
 
-# Run deterministic host-boundary tests. Browser contracts are opt-in.
+# Run deterministic host-boundary unit tests. Generated binding contracts have their own gate.
 test-fast: build uniffi-browser-build
-    cargo test -p pulsebeam-agent-web
+    cargo test -p pulsebeam-agent-web --lib
 
 # Run browser contracts after rebuilding every Web and React fixture.
 test-slow:
