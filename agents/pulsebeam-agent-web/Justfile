@@ -4,17 +4,9 @@ set shell := ["bash", "-euc"]
 build: prepare
     pnpm run build
 
-# The web package owns its lockfile and install. UBRN 0.31.0-5 hard-pins an
-# in-process wasm-bindgen schema; align that installed source with this package
-# until upstream #454 is released.
+# The web package owns its lockfile and install.
 prepare:
     pnpm install --frozen-lockfile --ignore-scripts
-    grep -Eq '^wasm-bindgen-cli-support = "=(0\.2\.100|0\.2\.127)"$' node_modules/uniffi-bindgen-react-native/Cargo.toml
-    sed -i 's/^wasm-bindgen-cli-support = "=0\.2\.100"$/wasm-bindgen-cli-support = "=0.2.127"/' node_modules/uniffi-bindgen-react-native/Cargo.toml
-    grep -qx 'wasm-bindgen-cli-support = "=0.2.127"' node_modules/uniffi-bindgen-react-native/Cargo.toml
-    grep -Eq '^wasm-bindgen = "(\*|=0\.2\.127)"$' node_modules/uniffi-bindgen-react-native/crates/ubrn_cli/templates/wasm/Cargo.toml.txt
-    sed -i 's/^wasm-bindgen = "\*"$/wasm-bindgen = "=0.2.127"/' node_modules/uniffi-bindgen-react-native/crates/ubrn_cli/templates/wasm/Cargo.toml.txt
-    grep -qx 'wasm-bindgen = "=0.2.127"' node_modules/uniffi-bindgen-react-native/crates/ubrn_cli/templates/wasm/Cargo.toml.txt
 
 # Format handwritten TypeScript and JavaScript sources.
 fix: prepare
