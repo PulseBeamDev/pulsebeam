@@ -259,17 +259,23 @@ impl ScreamV2 {
     pub(crate) fn update(&mut self, now: Duration, input: ControllerInput<'_>) -> Output {
         self.max_bytes_in_flight = self.max_bytes_in_flight.max(input.bytes_in_flight);
         self.ecn_mode = input.ecn_mode;
+        let has_feedback = !input.feedback.is_empty();
+        let has_received = input.feedback.iter().any(|sample| sample.received);
         self.consume_feedback(now, input);
-        self.update_qdelay_filter(now);
-        self.reduce_ref_wnd(now, input);
-        // RFC 8298bis updates the reference window from newly received feedback.
-        // Do not consume accumulated ACK credit from an idle timer poll; this also
-        // prevents evidence-free growth while feedback is stale.
-        if !input.feedback.is_empty() {
+        // The draft updates queue-delay state from received acknowledgements and
+        // reference-window state from feedback. Timer-only polls must not replay
+        // stale delay evidence or consume accumulated ACK credit.
+        if has_received {
+            self.update_qdelay_filter(now);
+        }
+        if has_feedback {
+            self.reduce_ref_wnd(now, input);
             self.increase_ref_wnd(now, input.target_bitrate_max);
+            if has_received {
+                self.adjust_qdelay_target();
+            }
         }
         self.ref_wnd = self.ref_wnd.min(self.max_policed_ref_wnd);
-        self.adjust_qdelay_target();
         self.derive_target(input.target_bitrate_max);
         self.snapshot(input.target_bitrate_max)
     }
@@ -810,7 +816,12 @@ mod tests {
             received,
             newly_acked,
             lost,
-            receiver_arrival_micros: received.then_some((at as i64) * 1_000 - 25_000),
+            receiver_arrival_micros: received.then_some(
+                i64::try_from(at)
+                    .unwrap_or(i64::MAX)
+                    .saturating_mul(1_000)
+                    .saturating_sub(25_000),
+            ),
             ecn: ce.then_some(EcnMark::Ce),
         }
     }
@@ -872,6 +883,19 @@ mod tests {
         let before = cc.ref_wnd;
         cc.update(Duration::from_millis(50), values);
         assert!(cc.ref_wnd >= before);
+    }
+
+    #[test]
+    fn timer_only_poll_does_not_replay_stale_delay_evidence() {
+        let mut cc = ScreamV2::new(4_000_000, None);
+        cc.ref_wnd = 20_000;
+        cc.qdelay = Duration::from_millis(60);
+        cc.qdelay_avg = Duration::from_millis(60);
+        let before_window = cc.ref_wnd;
+        let before_target = cc.qdelay_target;
+        cc.update(Duration::from_millis(100), input(&[], 4_000_000));
+        assert_eq!(cc.ref_wnd, before_window);
+        assert_eq!(cc.qdelay_target, before_target);
     }
 
     #[test]

@@ -131,3 +131,74 @@ fn missing_packet_becomes_loss_only_after_reordering_window() {
     history.expire(now + Duration::from_millis(50), 256);
     assert!(history.inputs.feedback.iter().any(|sample| sample.lost));
 }
+
+#[test]
+fn stale_twcc_generation_is_rejected_without_advancing_ack_state() {
+    let now = Instant::now();
+    let epoch = PathEpoch::from_value(4);
+    let mut history = SentHistory::new(PacketFeedbackKind::TransportWide);
+    history.path_changed(epoch, true);
+    for sequence in 1..=5_000_u16 {
+        history.commit(context(now, epoch, sequence)).unwrap();
+    }
+    let bytes_in_flight = history.inputs.bytes_in_flight;
+    history.process_feedback(batch(
+        now + Duration::from_millis(20),
+        epoch,
+        vec![TwccStatus::Received { delta_250us: 1 }],
+    ));
+    assert_eq!(history.counters.stale_feedback, 1);
+    assert_eq!(history.inputs.bytes_in_flight, bytes_in_flight);
+    assert!(history.inputs.feedback.is_empty());
+    assert!(history.highest_twcc_acked.is_none());
+}
+
+fn rfc_context(at: Instant, epoch: PathEpoch, sequence: u16) -> TransmitCommitContext {
+    TransmitCommitContext {
+        at,
+        kind: DatagramKind::Rtp,
+        wire_len: 1_200,
+        path_epoch: Some(epoch),
+        rtp: Some(PreparedRtpIdentity {
+            ssrc: 7,
+            sequence,
+            twcc_sequence: None,
+            service: RtpService::Original,
+        }),
+    }
+}
+
+#[test]
+fn stale_rfc8888_generation_is_rejected_per_ssrc() {
+    let now = Instant::now();
+    let epoch = PathEpoch::from_value(5);
+    let mut history = SentHistory::new(PacketFeedbackKind::Rfc8888);
+    history.path_changed(epoch, true);
+    for sequence in 1..=5_000_u16 {
+        history.commit(rfc_context(now, epoch, sequence)).unwrap();
+    }
+    let bytes_in_flight = history.inputs.bytes_in_flight;
+    history.process_feedback(FeedbackBatch {
+        received_at: at(now + Duration::from_millis(20)),
+        path_epoch: epoch,
+        sender_ssrc: 9,
+        report: FeedbackReport::Rfc8888 {
+            reports: vec![crate::rtcp::Rfc8888Report {
+                ssrc: 7,
+                begin_sequence: 1,
+                report_count: 1,
+                statuses: vec![crate::rtcp::Rfc8888Status::Received {
+                    ecn: 0,
+                    arrival_offset: crate::rtcp::ArrivalOffset::Ticks(1),
+                }]
+                .into(),
+            }]
+            .into(),
+            report_timestamp: 1,
+        },
+    });
+    assert_eq!(history.counters.stale_feedback, 1);
+    assert_eq!(history.inputs.bytes_in_flight, bytes_in_flight);
+    assert!(history.inputs.feedback.is_empty());
+    assert!(history.ssrcs[0].highest_acked_sequence.is_none());
+}

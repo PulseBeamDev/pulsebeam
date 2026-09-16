@@ -9,8 +9,6 @@ fn fixed_scenario_matrix() {
             metrics.name, metrics.seed
         );
         assert!(metrics.maximum_native_target_micros <= 400_000);
-        assert!(metrics.probe_overhead_percent <= 5);
-        assert_eq!(metrics.duplicate_status_consumptions, 0);
         match metrics.seed {
             0x0701 => {
                 assert!(metrics.utilization_percent >= 85);

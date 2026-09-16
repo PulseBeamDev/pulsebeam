@@ -16,7 +16,6 @@ pub(crate) struct ScenarioMetrics {
     pub(crate) admitted_percent: u64,
     pub(crate) p99_queue_micros: u64,
     pub(crate) effective_target_micros: u64,
-    pub(crate) probe_overhead_percent: u64,
     pub(crate) application_limited_at_millis: Option<u64>,
     pub(crate) stale_at_millis: Option<u64>,
     pub(crate) stale_recovered: bool,
@@ -28,7 +27,6 @@ pub(crate) struct ScenarioMetrics {
     pub(crate) policer_detected: bool,
     pub(crate) fairness_percent: u64,
     pub(crate) maximum_native_target_micros: u64,
-    pub(crate) duplicate_status_consumptions: u64,
 }
 
 struct Packet {
@@ -146,7 +144,9 @@ impl Simulation {
                     received_at: self.now,
                     transport_bytes: packet.bytes,
                     received: packet.received,
-                    newly_acked: packet.received,
+                    // Covered sequence-space gaps advance SCReAM's ACK edge too;
+                    // confirmed loss is a separate signal.
+                    newly_acked: true,
                     lost: !packet.received,
                     receiver_arrival_micros: packet
                         .received
@@ -200,7 +200,6 @@ impl Simulation {
                 .copied()
                 .unwrap_or(0),
             effective_target_micros: micros(self.output.effective_queue_delay_target),
-            probe_overhead_percent: 0,
             application_limited_at_millis: None,
             stale_at_millis: None,
             stale_recovered: false,
@@ -212,7 +211,6 @@ impl Simulation {
             policer_detected: self.output.policer_detected,
             fairness_percent: 50,
             maximum_native_target_micros: self.maximum_native_target,
-            duplicate_status_consumptions: 0,
         }
     }
 }
