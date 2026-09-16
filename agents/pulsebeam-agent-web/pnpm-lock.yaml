@@ -19,8 +19,8 @@ importers:
         specifier: ~5.9.3
         version: 5.9.3
       uniffi-bindgen-react-native:
-        specifier: 0.31.0-5
-        version: 0.31.0-5
+        specifier: github:jhugman/uniffi-bindgen-react-native#f5865e794e4507809f2b2bfea1d9fc00f4882322
+        version: https://codeload.github.com/jhugman/uniffi-bindgen-react-native/tar.gz/f5865e794e4507809f2b2bfea1d9fc00f4882322
 
 packages:
 
@@ -37,8 +37,9 @@ packages:
     engines: {node: '>=14.17'}
     hasBin: true
 
-  uniffi-bindgen-react-native@0.31.0-5:
-    resolution: {integrity: sha512-YtL3gTe+RVXAQx/2P2Iuypic/CunRZC65Cs47v//YRfwWNYU4Ufd1jT3rqxSrH5b5QFCYblP89Nf/9ssZRvNgg==}
+  uniffi-bindgen-react-native@https://codeload.github.com/jhugman/uniffi-bindgen-react-native/tar.gz/f5865e794e4507809f2b2bfea1d9fc00f4882322:
+    resolution: {tarball: https://codeload.github.com/jhugman/uniffi-bindgen-react-native/tar.gz/f5865e794e4507809f2b2bfea1d9fc00f4882322}
+    version: 0.31.0-5
     hasBin: true
 
 snapshots:
@@ -49,4 +50,4 @@ snapshots:
 
   typescript@5.9.3: {}
 
-  uniffi-bindgen-react-native@0.31.0-5: {}
+  uniffi-bindgen-react-native@https://codeload.github.com/jhugman/uniffi-bindgen-react-native/tar.gz/f5865e794e4507809f2b2bfea1d9fc00f4882322: {}
