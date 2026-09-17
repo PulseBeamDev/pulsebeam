@@ -34,6 +34,15 @@ replace_once(
     "unsafe oldest_sent_id bump",
 )
 
+# The first bounded unit of work removes the previously recovered id from the missing queue;
+# allow the second unit to confirm the following loss and exercise reorder-window decay.
+replace_once(
+    "crates/pulsebeam-rtc/src/sent_history/tests.rs",
+    "history.confirm_losses(now + MAX_REORDERING_WINDOW, 1);",
+    "history.confirm_losses(now + MAX_REORDERING_WINDOW, 2);",
+    "reordering decay work budget",
+)
+
 # Make the application-limited contract describe the pinned draft's actual control boundary:
 # PulseBeam observes application-limited state but does not inject a private ref_wnd freeze.
 replace_once(
