@@ -973,7 +973,7 @@ behavior MUST be equivalent.
 | Unproven | RTP path writable, no feedback for a committed RTP packet | Initial target, bounded pre-media probe, no evidence-free growth | First valid packet feedback |
 | Learning | Valid feedback exists but fewer than three feedback rounds or one smoothed RTT of delivery | Grow only from delivered evidence | Evidence threshold met, or congestion/staleness |
 | Steady | Credible feedback and offered load | Follow pinned SCReAM and governed policy | ALR, congestion, stale feedback, or path change |
-| Application-limited | Offered RTP below 85% threshold for 200 ms with no pacing/window block | Freeze unsupported growth, decay confidence, demand-aware probes | Offered load recovers or another state dominates |
+| Application-limited | Offered RTP below 85% threshold for 200 ms with no pacing/window block | Keep the draft bytes-in-flight growth bound authoritative, decay confidence, demand-aware probes | Offered load recovers or another state dominates |
 | Congested | Pinned SCReAM queue/loss/ECN response triggers | Stop probes, back off, shed stale video/RTX | Pinned recovery conditions hold |
 | Feedback-stale | No covering feedback by stale threshold | Stop growth/probes, decay confidence, conservative envelope | One valid covering report; return through Learning |
 
