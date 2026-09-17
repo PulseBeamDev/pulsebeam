@@ -1,26 +1,14 @@
-#![allow(
-    dead_code,
-    clippy::arithmetic_side_effects,
-    clippy::cast_possible_truncation,
-    clippy::cast_precision_loss,
-    reason = "the PulseBeam adapter uses bounded fixed-point policy interpolation"
-)]
-
 use std::time::Duration;
 
+mod scenario;
 mod screamv2;
 
+pub(crate) use scenario::{ScenarioMetrics, run_fixed_scenario_matrix};
 pub(crate) use screamv2::{EcnMark, FeedbackSample};
 
 const ONE: u64 = 65_536;
 const TARGET_BITRATE_MAX: u64 = 100_000_000;
 
-#[cfg(test)]
-#[path = "congestion/scenario.rs"]
-pub(crate) mod scenario;
-
-/// PulseBeam-side validation of ECN capability. This selects an RFC-defined SCReAMv2
-/// mode; it does not tune the congestion-control algorithm.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct EcnValidation {
     pub(crate) classic: bool,
@@ -29,7 +17,7 @@ pub(crate) struct EcnValidation {
 }
 
 impl EcnValidation {
-    fn mode(self) -> screamv2::EcnMode {
+    const fn mode(self) -> screamv2::EcnMode {
         if self.bleached {
             screamv2::EcnMode::Disabled
         } else if self.l4s {
@@ -42,26 +30,6 @@ impl EcnValidation {
     }
 }
 
-/// Adapter inputs owned by PulseBeam. `desired_media_rate` maps to the draft's
-/// application-controlled TARGET_BITRATE_MAX. Other PulseBeam policy fields may govern
-/// scheduling/probing outside the isolated SCReAMv2 core but MUST NOT change its window,
-/// qdelay target, gains, pacing equations, or feedback semantics.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct ControllerInput<'a> {
-    pub(crate) path_epoch: Option<u64>,
-    pub(crate) path_available: bool,
-    pub(crate) feedback: &'a [FeedbackSample],
-    pub(crate) feedback_hold: Duration,
-    pub(crate) fresh_network_feedback: bool,
-    pub(crate) bytes_in_flight: u64,
-    pub(crate) paced_queue_bytes: u64,
-    pub(crate) offered_media_rate: u64,
-    pub(crate) admitted_media_rate: u64,
-    pub(crate) desired_media_rate: u64,
-    pub(crate) window_or_pacer_blocked: bool,
-    pub(crate) ecn: EcnValidation,
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ControllerReason {
     Startup,
@@ -70,10 +38,10 @@ pub(crate) enum ControllerReason {
     Loss,
     ClassicEcn,
     L4s,
-    ApplicationLimited,
-    FeedbackStale,
     PathChanged,
     Policer,
+    ApplicationLimited,
+    FeedbackStale,
 }
 
 impl From<screamv2::ControllerReason> for ControllerReason {
@@ -91,6 +59,24 @@ impl From<screamv2::ControllerReason> for ControllerReason {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ControllerInput<'a> {
+    pub(crate) path_epoch: Option<u64>,
+    pub(crate) path_available: bool,
+    pub(crate) feedback: &'a [FeedbackSample],
+    pub(crate) feedback_hold: Duration,
+    /// True only when the current network feedback report covered a committed
+    /// packet. Locally synthesized expiry/loss evidence does not set this.
+    pub(crate) fresh_network_feedback: bool,
+    pub(crate) bytes_in_flight: u64,
+    pub(crate) paced_queue_bytes: u64,
+    pub(crate) offered_media_rate: u64,
+    pub(crate) admitted_media_rate: u64,
+    pub(crate) desired_media_rate: u64,
+    pub(crate) window_or_pacer_blocked: bool,
+    pub(crate) ecn: EcnValidation,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct SafeRtpEnvelope {
     pub(crate) target_media_payload_rate: u64,
@@ -98,8 +84,6 @@ pub(crate) struct SafeRtpEnvelope {
     pub(crate) pacing_transport_rate: u64,
     pub(crate) reference_window: u64,
     pub(crate) native_queue_delay_target: Duration,
-    /// Kept for the existing stats surface. It is exactly the native SCReAMv2 target;
-    /// PulseBeam policy no longer overrides it.
     pub(crate) effective_queue_delay_target: Duration,
     pub(crate) queue_delay: Duration,
     pub(crate) queue_delay_confidence: u16,
@@ -114,9 +98,7 @@ pub(crate) struct SafeRtpEnvelope {
     pub(crate) reason: ControllerReason,
 }
 
-/// PulseBeam latency policy. These values govern media usefulness, allocation, pacer
-/// horizon, repair, and probing outside SCReAMv2.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct SenderOperatingPoint {
     pub(crate) allocation_utilization: u64,
     pub(crate) pacer_horizon: Duration,
@@ -128,54 +110,59 @@ pub(crate) struct SenderOperatingPoint {
 pub(crate) struct LatencyGovernor;
 
 impl LatencyGovernor {
-    pub(crate) fn operating_point(
-        playout_max_ticks: u16,
-        desired_media_rate: u64,
-    ) -> SenderOperatingPoint {
-        let urgent_playout_knee = Duration::from_millis(75);
-        let quality_playout_saturation = Duration::from_millis(500);
-        let playout = Duration::from_millis(u64::from(playout_max_ticks).saturating_mul(10));
-        let numerator = if playout_max_ticks == 0 || playout <= urgent_playout_knee {
+    pub(crate) fn operating_point(playout_max_ticks: u16, desired_bitrate: u64) -> SenderOperatingPoint {
+        let playout_max = Duration::from_millis(u64::from(playout_max_ticks) * 10);
+        let low = Duration::from_millis(75);
+        let high = Duration::from_millis(500);
+        let x = if playout_max_ticks == 0 || playout_max <= low {
             0
+        } else if playout_max >= high {
+            ONE
         } else {
-            micros(playout.saturating_sub(urgent_playout_knee)).min(micros(
-                quality_playout_saturation.saturating_sub(urgent_playout_knee),
-            ))
+            playout_max
+                .saturating_sub(low)
+                .as_micros()
+                .saturating_mul(u128::from(ONE))
+                .checked_div(high.saturating_sub(low).as_micros().max(1))
+                .unwrap_or(0)
+                .min(u128::from(ONE)) as u64
         };
-        let denominator = micros(quality_playout_saturation.saturating_sub(urgent_playout_knee));
-        let allocation_utilization = lerp_even(52_429, 62_259, numerator, denominator);
+        let allocation_utilization = lerp_even(80 * ONE / 100, 95 * ONE / 100, x, ONE);
+        let pacer_horizon = lerp_duration_even(
+            Duration::from_millis(15),
+            Duration::from_millis(80),
+            x,
+            ONE,
+        );
+        let rtx_extra_allowance = lerp_duration_even(
+            Duration::ZERO,
+            Duration::from_millis(50),
+            x,
+            ONE,
+        );
+        let probe_queue_impact = lerp_duration_even(
+            Duration::from_millis(5),
+            Duration::from_millis(20),
+            x,
+            ONE,
+        );
         SenderOperatingPoint {
             allocation_utilization,
-            pacer_horizon: lerp_duration_even(
-                Duration::from_millis(15),
-                Duration::from_millis(80),
-                numerator,
-                denominator,
-            ),
-            rtx_extra_allowance: lerp_duration_even(
-                Duration::ZERO,
-                Duration::from_millis(50),
-                numerator,
-                denominator,
-            ),
-            probe_queue_impact: lerp_duration_even(
-                Duration::from_millis(5),
-                Duration::from_millis(20),
-                numerator,
-                denominator,
-            ),
-            governed_demand: mul_fixed(desired_media_rate, allocation_utilization),
+            pacer_horizon,
+            rtx_extra_allowance,
+            probe_queue_impact,
+            governed_demand: mul_fixed(desired_bitrate, allocation_utilization),
         }
     }
 }
 
 pub(crate) struct ScreamController {
     core: screamv2::ScreamV2,
-    path_epoch: Option<u64>,
+    pub(crate) path_epoch: Option<u64>,
     path_available: bool,
     last_feedback: Option<Duration>,
     last_send: Option<Duration>,
-    application_limited_since: Option<Duration>,
+    pub(crate) application_limited_since: Option<Duration>,
     application_limited: bool,
     feedback_stale: bool,
     confidence: u16,
@@ -276,8 +263,16 @@ impl ScreamController {
         }
         self.path_epoch = epoch;
         self.path_available = available;
+        // Everything below is evidence about the selected path, not application
+        // policy. A replacement starts in the same unproven state as a new path.
         self.last_feedback = None;
+        self.last_send = None;
+        self.application_limited_since = None;
+        self.application_limited = false;
         self.feedback_stale = false;
+        self.confidence = u16::MAX;
+        self.confidence_decay_started = None;
+        self.feedback_hold = Duration::ZERO;
         self.core.reset_path(target_bitrate_max);
         self.last_reason = ControllerReason::PathChanged;
     }
@@ -410,14 +405,11 @@ fn half_life(base: u16, elapsed: Duration) -> u16 {
 mod tests {
     use super::*;
 
-    #[test]
-    fn synthetic_loss_does_not_refresh_feedback_freshness() {
-        let mut cc = ScreamController::new(2_000_000, None);
-        cc.note_send(Duration::ZERO);
-        let base = ControllerInput {
+    fn base_input<'a>(feedback: &'a [FeedbackSample]) -> ControllerInput<'a> {
+        ControllerInput {
             path_epoch: Some(1),
             path_available: true,
-            feedback: &[],
+            feedback,
             feedback_hold: Duration::ZERO,
             fresh_network_feedback: false,
             bytes_in_flight: 0,
@@ -427,7 +419,14 @@ mod tests {
             desired_media_rate: 2_000_000,
             window_or_pacer_blocked: false,
             ecn: EcnValidation::default(),
-        };
+        }
+    }
+
+    #[test]
+    fn synthetic_loss_does_not_refresh_feedback_freshness() {
+        let mut cc = ScreamController::new(2_000_000, None);
+        cc.note_send(Duration::ZERO);
+        let base = base_input(&[]);
         cc.update(Duration::from_millis(600), base);
         assert!(cc.feedback_stale);
         let loss = [FeedbackSample {
@@ -445,7 +444,7 @@ mod tests {
             ControllerInput {
                 feedback: &loss,
                 fresh_network_feedback: false,
-                ..base
+                ..base_input(&loss)
             },
         );
         assert!(output.feedback_stale);
@@ -456,20 +455,11 @@ mod tests {
     fn draft_bytes_in_flight_gate_limits_growth_under_low_offer() {
         let mut cc = ScreamController::new(4_000_000, None);
         cc.note_send(Duration::ZERO);
-        let base = ControllerInput {
-            path_epoch: Some(1),
-            path_available: true,
-            feedback: &[],
-            feedback_hold: Duration::ZERO,
-            fresh_network_feedback: false,
-            bytes_in_flight: 1_000,
-            paced_queue_bytes: 0,
-            offered_media_rate: 64_000,
-            admitted_media_rate: 64_000,
-            desired_media_rate: 4_000_000,
-            window_or_pacer_blocked: false,
-            ecn: EcnValidation::default(),
-        };
+        let mut base = base_input(&[]);
+        base.bytes_in_flight = 1_000;
+        base.offered_media_rate = 64_000;
+        base.admitted_media_rate = 64_000;
+        base.desired_media_rate = 4_000_000;
         cc.update(Duration::ZERO, base);
         let entered = cc.update(Duration::from_millis(250), base);
         assert!(entered.application_limited);
@@ -500,25 +490,36 @@ mod tests {
     fn confidence_has_five_second_half_life_while_application_limited() {
         let mut cc = ScreamController::new(2_000_000, None);
         cc.note_send(Duration::ZERO);
-        let input = ControllerInput {
-            path_epoch: Some(1),
-            path_available: true,
-            feedback: &[],
-            feedback_hold: Duration::ZERO,
-            fresh_network_feedback: false,
-            bytes_in_flight: 0,
-            paced_queue_bytes: 0,
-            offered_media_rate: 64_000,
-            admitted_media_rate: 64_000,
-            desired_media_rate: 2_000_000,
-            window_or_pacer_blocked: false,
-            ecn: EcnValidation::default(),
-        };
+        let mut input = base_input(&[]);
+        input.offered_media_rate = 64_000;
+        input.admitted_media_rate = 64_000;
         cc.update(Duration::ZERO, input);
         let started = cc.update(Duration::from_millis(250), input);
         assert!(started.application_limited);
         let half = cc.update(Duration::from_millis(5_250), input);
         assert_eq!(half.queue_delay_confidence, u16::MAX / 2);
+    }
+
+    #[test]
+    fn path_replacement_resets_outer_path_evidence() {
+        let mut cc = ScreamController::new(2_000_000, None);
+        cc.note_send(Duration::ZERO);
+        let mut input = base_input(&[]);
+        input.offered_media_rate = 64_000;
+        input.admitted_media_rate = 64_000;
+        cc.update(Duration::ZERO, input);
+        let stale_alr = cc.update(Duration::from_secs(3), input);
+        assert!(stale_alr.feedback_stale);
+        assert!(stale_alr.application_limited);
+
+        input.path_epoch = Some(2);
+        let replaced = cc.update(Duration::from_secs(3), input);
+        assert!(!replaced.feedback_stale);
+        assert!(!replaced.application_limited);
+        assert_eq!(cc.last_send, None);
+        assert_eq!(cc.last_feedback, None);
+        assert_eq!(cc.application_limited_since, Some(Duration::from_secs(3)));
+        assert_eq!(replaced.reason, ControllerReason::PathChanged);
     }
 
     #[test]
