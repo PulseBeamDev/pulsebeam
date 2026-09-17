@@ -7,6 +7,7 @@ use super::{
 
 const STEP: Duration = Duration::from_millis(10);
 const FEEDBACK_INTERVAL: Duration = Duration::from_millis(50);
+const LOSS_CONFIRMATION_DELAY: Duration = Duration::from_millis(30);
 
 #[derive(Clone, Debug)]
 pub(crate) struct ScenarioMetrics {
@@ -38,6 +39,13 @@ struct Packet {
     ecn: Option<EcnMark>,
 }
 
+struct PendingLoss {
+    epoch: u64,
+    sent_at: Duration,
+    confirm_at: Duration,
+    bytes: u32,
+}
+
 struct Simulation {
     controller: ScreamController,
     output: SafeRtpEnvelope,
@@ -45,6 +53,7 @@ struct Simulation {
     next_feedback: Duration,
     queue_bytes: u64,
     pending: VecDeque<Packet>,
+    pending_losses: VecDeque<PendingLoss>,
     delivered_bytes: u64,
     offered_bytes: u64,
     admitted_bytes: u64,
@@ -63,6 +72,7 @@ impl Simulation {
             next_feedback: FEEDBACK_INTERVAL,
             queue_bytes: 0,
             pending: VecDeque::new(),
+            pending_losses: VecDeque::new(),
             delivered_bytes: 0,
             offered_bytes: 0,
             admitted_bytes: 0,
@@ -124,6 +134,7 @@ impl Simulation {
         }
         self.now = self.now.saturating_add(STEP);
         let mut samples = Vec::new();
+        let mut fresh_network_feedback = false;
         if feedback_enabled && self.now >= self.next_feedback {
             while self
                 .pending
@@ -134,19 +145,27 @@ impl Simulation {
                 if packet.epoch != epoch {
                     continue;
                 }
+                fresh_network_feedback = true;
                 if packet.received {
                     self.delivered_bytes =
                         self.delivered_bytes.saturating_add(u64::from(packet.bytes));
+                } else {
+                    self.pending_losses.push_back(PendingLoss {
+                        epoch: packet.epoch,
+                        sent_at: packet.sent_at,
+                        confirm_at: self.now.saturating_add(LOSS_CONFIRMATION_DELAY),
+                        bytes: packet.bytes,
+                    });
                 }
                 samples.push(FeedbackSample {
                     sent_at: packet.sent_at,
                     received_at: self.now,
                     transport_bytes: packet.bytes,
                     received: packet.received,
-                    // Covered sequence-space gaps advance SCReAM's ACK edge too;
-                    // confirmed loss is a separate signal.
+                    // ACK-edge accounting includes a covered missing data unit, but
+                    // loss remains deferred until the reordering timer expires.
                     newly_acked: true,
-                    lost: !packet.received,
+                    lost: false,
                     receiver_arrival_micros: packet
                         .received
                         .then_some(packet.receiver_arrival_micros),
@@ -154,6 +173,26 @@ impl Simulation {
                 });
             }
             self.next_feedback = self.next_feedback.saturating_add(FEEDBACK_INTERVAL);
+        }
+        while self
+            .pending_losses
+            .front()
+            .is_some_and(|loss| loss.confirm_at <= self.now)
+        {
+            let confirmed = self.pending_losses.pop_front().expect("front checked");
+            if confirmed.epoch != epoch {
+                continue;
+            }
+            samples.push(FeedbackSample {
+                sent_at: confirmed.sent_at,
+                received_at: self.now,
+                transport_bytes: confirmed.bytes,
+                received: false,
+                newly_acked: false,
+                lost: true,
+                receiver_arrival_micros: None,
+                ecn: None,
+            });
         }
         let bytes_in_flight = self
             .pending
@@ -167,7 +206,7 @@ impl Simulation {
                 path_available: true,
                 feedback: &samples,
                 feedback_hold: Duration::ZERO,
-                fresh_network_feedback: !samples.is_empty(),
+                fresh_network_feedback,
                 bytes_in_flight,
                 paced_queue_bytes: self.queue_bytes,
                 offered_media_rate: offered_bps,
