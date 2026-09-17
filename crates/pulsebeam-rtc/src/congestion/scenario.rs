@@ -145,8 +145,8 @@ impl Simulation {
                 if packet.epoch != epoch {
                     continue;
                 }
-                fresh_network_feedback = true;
                 if packet.received {
+                    fresh_network_feedback = true;
                     self.delivered_bytes =
                         self.delivered_bytes.saturating_add(u64::from(packet.bytes));
                 } else {
