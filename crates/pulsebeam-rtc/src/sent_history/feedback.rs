@@ -184,11 +184,12 @@ impl SentHistory {
         if edge < start || edge.saturating_sub(start) >= MAX_FEEDBACK_STATUSES as u64 {
             return;
         }
-        let edge_known = self
-            .twcc_sent_id(edge)
-            .and_then(|sent_id| self.entry(sent_id))
-            .is_some_and(|entry| entry.path_epoch == epoch);
-        if !edge_known {
+        let range_known = (start..=edge).all(|sequence| {
+            self.twcc_sent_id(sequence)
+                .and_then(|sent_id| self.entry(sent_id))
+                .is_some_and(|entry| entry.path_epoch == epoch)
+        });
+        if !range_known {
             self.add_unknown(1);
             return;
         }
@@ -299,26 +300,28 @@ impl SentHistory {
             let old_edge = self.ssrcs[ssrc_index].highest_acked_sequence;
             if let Some(edge) = highest_received {
                 let start = old_edge.map_or(base, |previous| base.max(previous.saturating_add(1)));
-                let edge_known = self
-                    .lookup_rtp(ssrc_index, edge)
-                    .and_then(|sent_id| self.entry(sent_id))
-                    .is_some_and(|entry| entry.path_epoch == epoch);
-                if !edge_known {
-                    self.add_unknown(1);
-                } else if edge >= start && edge.saturating_sub(start) < MAX_FEEDBACK_STATUSES as u64
-                {
-                    for sequence in start..=edge {
-                        let sent_id = self.lookup_rtp(ssrc_index, sequence);
-                        let offset = sequence
-                            .checked_sub(base)
-                            .and_then(|value| usize::try_from(value).ok());
-                        let (received, arrival, ecn, _) = offset
-                            .and_then(|index| normalized.get(index))
-                            .copied()
-                            .unwrap_or((false, None, None, None));
-                        self.advance_entry(sent_id, epoch, received, arrival, ecn, received_at);
+                if edge >= start && edge.saturating_sub(start) < MAX_FEEDBACK_STATUSES as u64 {
+                    let range_known = (start..=edge).all(|sequence| {
+                        self.lookup_rtp(ssrc_index, sequence)
+                            .and_then(|sent_id| self.entry(sent_id))
+                            .is_some_and(|entry| entry.path_epoch == epoch)
+                    });
+                    if !range_known {
+                        self.add_unknown(1);
+                    } else {
+                        for sequence in start..=edge {
+                            let sent_id = self.lookup_rtp(ssrc_index, sequence);
+                            let offset = sequence
+                                .checked_sub(base)
+                                .and_then(|value| usize::try_from(value).ok());
+                            let (received, arrival, ecn, _) = offset
+                                .and_then(|index| normalized.get(index))
+                                .copied()
+                                .unwrap_or((false, None, None, None));
+                            self.advance_entry(sent_id, epoch, received, arrival, ecn, received_at);
+                        }
+                        self.ssrcs[ssrc_index].highest_acked_sequence = Some(edge);
                     }
-                    self.ssrcs[ssrc_index].highest_acked_sequence = Some(edge);
                 }
             }
             for (offset, (received, arrival, ecn, _)) in normalized.iter().copied().enumerate() {
@@ -431,9 +434,9 @@ impl SentHistory {
         if self.missing.len() >= SENT_HISTORY_CAPACITY {
             let entries = &self.entries;
             self.missing.retain(|id| {
-                entries[ring_index(id.0)]
-                    .as_ref()
-                    .is_some_and(|entry| entry.id == *id && matches!(entry.acknowledgment, Acknowledgment::Missing { .. }))
+                entries[ring_index(id.0)].as_ref().is_some_and(|entry| {
+                    entry.id == *id && matches!(entry.acknowledgment, Acknowledgment::Missing { .. })
+                })
             });
         }
         if self.missing.len() >= SENT_HISTORY_CAPACITY {
