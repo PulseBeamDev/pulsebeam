@@ -175,6 +175,8 @@ pub(crate) struct ScreamV2 {
     last_ref_wnd_increase: Duration,
     last_congestion_detected: Duration,
     last_reaction_to_congestion: Duration,
+    pending_loss: bool,
+    pending_ce: bool,
     bytes_newly_acked: u64,
     bytes_newly_acked_ce: u64,
     delivered_rate: u64,
@@ -223,6 +225,8 @@ impl ScreamV2 {
             last_ref_wnd_increase: Duration::ZERO,
             last_congestion_detected: Duration::ZERO,
             last_reaction_to_congestion: Duration::ZERO,
+            pending_loss: false,
+            pending_ce: false,
             bytes_newly_acked: 0,
             bytes_newly_acked_ce: 0,
             delivered_rate: 0,
@@ -251,16 +255,19 @@ impl ScreamV2 {
         self.ecn_mode = input.ecn_mode;
         let has_feedback = !input.feedback.is_empty();
         let has_received = input.feedback.iter().any(|sample| sample.received);
+        let has_ack_progress = input.feedback.iter().any(|sample| sample.newly_acked);
         self.consume_feedback(now, input);
         // The draft updates queue-delay state from received acknowledgements and
-        // reference-window state from feedback. Timer-only polls must not replay
-        // stale delay evidence or consume accumulated ACK credit.
+        // reference-window state from ACK-edge progress. Timer/local-loss-only polls
+        // must not replay stale delay evidence or consume accumulated ACK credit.
         if has_received {
             self.update_qdelay_filter(now);
         }
         if has_feedback {
             self.reduce_ref_wnd(now, input);
-            self.increase_ref_wnd(now, input.target_bitrate_max);
+            if has_ack_progress {
+                self.increase_ref_wnd(now, input.target_bitrate_max);
+            }
             if has_received {
                 self.adjust_qdelay_target();
             }
@@ -289,7 +296,11 @@ impl ScreamV2 {
                     .bytes_newly_acked
                     .saturating_add(u64::from(sample.transport_bytes));
             }
-            if sample.received && sample.ecn == Some(EcnMark::Ce) {
+            if input.ecn_mode != EcnMode::Disabled
+                && sample.received
+                && sample.newly_acked
+                && sample.ecn == Some(EcnMark::Ce)
+            {
                 self.bytes_newly_acked_ce = self
                     .bytes_newly_acked_ce
                     .saturating_add(u64::from(sample.transport_bytes));
@@ -299,7 +310,7 @@ impl ScreamV2 {
                 self.observe_delay(sample);
                 self.data_units_delivered_this_rtt =
                     self.data_units_delivered_this_rtt.saturating_add(1);
-                if sample.ecn == Some(EcnMark::Ce) {
+                if input.ecn_mode != EcnMode::Disabled && sample.ecn == Some(EcnMark::Ce) {
                     self.data_units_marked_this_rtt =
                         self.data_units_marked_this_rtt.saturating_add(1);
                 }
@@ -426,20 +437,26 @@ impl ScreamV2 {
     }
 
     fn reduce_ref_wnd(&mut self, now: Duration, input: ControllerInput<'_>) {
-        let loss_detected = input.feedback.iter().any(|sample| sample.lost);
-        let data_units_marked = input.ecn_mode != EcnMode::Disabled
+        let current_loss = input.feedback.iter().any(|sample| sample.lost);
+        let current_ce = input.ecn_mode != EcnMode::Disabled
             && input
                 .feedback
                 .iter()
                 .any(|sample| sample.received && sample.ecn == Some(EcnMark::Ce));
-        if loss_detected || data_units_marked {
+        if current_loss || current_ce {
             self.last_congestion_detected = now;
         }
+        self.pending_loss |= current_loss;
+        self.pending_ce |= current_ce;
         let reaction_interval = PROFILE.virtual_rtt.min(self.s_rtt);
         if now.saturating_sub(self.last_reaction_to_congestion) < reaction_interval {
             return;
         }
 
+        let loss_detected = self.pending_loss;
+        let data_units_marked = self.pending_ce;
+        self.pending_loss = false;
+        self.pending_ce = false;
         let virtual_alpha = if self.qdelay_avg > self.qdelay_target / 2 {
             ratio_between(
                 self.qdelay_avg.saturating_sub(self.qdelay_target / 2),
@@ -629,15 +646,11 @@ impl ScreamV2 {
             .map(|value| u128::from(*value))
             .sum::<u128>()
             / variance_count.max(1);
-        let variance = self
-            .competing_samples
-            .iter()
-            .map(|value| {
-                let delta = i128::from(*value) - i128::try_from(variance_mean).unwrap_or(i128::MAX);
-                delta.unsigned_abs().saturating_mul(delta.unsigned_abs())
-            })
-            .sum::<u128>()
-            / variance_count.max(1);
+        let variance = self.competing_samples.iter().fold(0_u128, |sum, value| {
+            let delta = i128::from(*value) - i128::try_from(variance_mean).unwrap_or(i128::MAX);
+            let squared = delta.unsigned_abs().saturating_mul(delta.unsigned_abs());
+            sum.saturating_add(squared)
+        }) / variance_count.max(1);
         let candidate_normalized = mean.saturating_add(integer_sqrt(variance));
         let candidate = candidate_normalized
             .saturating_mul(u128::from(micros(PROFILE.queue_target_low)))
@@ -869,6 +882,22 @@ mod tests {
     }
 
     #[test]
+    fn congestion_signal_survives_the_virtual_rtt_reaction_gate() {
+        let mut cc = ScreamV2::new(4_000_000, None);
+        cc.s_rtt = Duration::from_millis(200);
+        cc.ref_wnd = 20_000;
+        cc.loss_rate = ONE / 50;
+        cc.last_reaction_to_congestion = Duration::from_millis(1);
+        let loss = [sample(10, false, false, true, false)];
+        let before = cc.ref_wnd;
+        cc.update(Duration::from_millis(10), input(&loss, 4_000_000));
+        assert_eq!(cc.ref_wnd, before);
+        let clean = [sample(30, true, true, false, false)];
+        cc.update(Duration::from_millis(30), input(&clean, 4_000_000));
+        assert!(cc.ref_wnd < before);
+    }
+
+    #[test]
     fn lingering_l4s_alpha_without_a_fresh_mark_does_not_backoff_again() {
         let mut cc = ScreamV2::new(4_000_000, None);
         cc.ref_wnd = 20_000;
@@ -918,23 +947,51 @@ mod tests {
         cc.target_bitrate = 8_000_000;
         cc.s_rtt = Duration::from_millis(350);
         cc.qdelay_target = Duration::from_millis(400);
+        cc.bytes_newly_acked = 12_000;
+        cc.bytes_newly_acked_ce = 1_000;
+        cc.pending_loss = true;
+        cc.pending_ce = true;
         cc.reset_path(2_000_000);
         assert_eq!(cc.s_rtt, PROFILE.initial_rtt);
         assert_eq!(cc.qdelay_target, PROFILE.queue_target_low);
         assert!(cc.ref_wnd < 200_000);
         assert!(cc.target_bitrate <= PROFILE.target_initial_bps);
+        assert_eq!(cc.debug_accumulated_acks(), (0, 0));
+        assert!(!cc.pending_loss && !cc.pending_ce);
         assert_eq!(cc.reason, ControllerReason::PathChanged);
     }
 
     #[test]
-    fn recovered_ce_is_counted_without_double_ack_credit() {
+    fn recovered_ce_does_not_cross_ack_windows() {
         let mut cc = ScreamV2::new(4_000_000, None);
         let first = [sample(25, false, true, false, false)];
         cc.consume_feedback(Duration::from_millis(25), input(&first, 4_000_000));
         assert_eq!(cc.debug_accumulated_acks(), (1_000, 0));
         let recovered = [sample(50, true, false, false, true)];
-        cc.consume_feedback(Duration::from_millis(50), input(&recovered, 4_000_000));
-        assert_eq!(cc.debug_accumulated_acks(), (1_000, 1_000));
+        let mut values = input(&recovered, 4_000_000);
+        values.ecn_mode = EcnMode::L4s;
+        cc.consume_feedback(Duration::from_millis(50), values);
+        assert_eq!(cc.debug_accumulated_acks(), (1_000, 0));
+    }
+
+    #[test]
+    fn disabled_ecn_does_not_suppress_ack_growth_credit() {
+        let mut cc = ScreamV2::new(4_000_000, None);
+        let marked = [sample(25, true, true, false, true)];
+        cc.consume_feedback(Duration::from_millis(25), input(&marked, 4_000_000));
+        assert_eq!(cc.debug_accumulated_acks(), (1_000, 0));
+    }
+
+    #[test]
+    fn loss_only_feedback_does_not_consume_pending_ack_credit() {
+        let mut cc = ScreamV2::new(4_000_000, None);
+        let ack = [sample(25, true, true, false, false)];
+        cc.update(Duration::from_millis(25), input(&ack, 4_000_000));
+        assert_eq!(cc.debug_accumulated_acks().0, 1_000);
+        cc.loss_rate = ONE / 50;
+        let loss = [sample(100, false, false, true, false)];
+        cc.update(Duration::from_millis(100), input(&loss, 4_000_000));
+        assert_eq!(cc.debug_accumulated_acks().0, 1_000);
     }
 
     #[test]
