@@ -40,10 +40,10 @@ Normative precedence is:
 5. pinned Ericsson and libwebrtc revisions as comparison oracles only.
 
 Where the pinned draft gives an equation, ordering rule, or numeric constant, the
-private `ScreamController` implementation MUST transcribe it unchanged unless the
-complete deviation is listed below. The implementation keeps a source citation
-beside each transcribed equation or constant. No undocumented local tuning
-constant is allowed.
+private `screamv2::ScreamV2` implementation MUST transcribe it unchanged unless
+the complete deviation is listed below. The implementation keeps a source
+citation beside each transcribed equation or constant. No undocumented local
+tuning constant is allowed.
 
 ### Explicit PulseBeam deviations and extensions
 
@@ -92,7 +92,7 @@ being hidden as tuning.
 | Application-limited behavior | Keep the draft-defined bytes-in-flight growth bound authoritative; decay PulseBeam confidence and use demand-aware bounded probes | Add a PulseBeam-specific ref_wnd freeze; collapse estimate to media rate | Keeps product policy outside the SCReAM core while low offered load naturally limits growth through the draft's bytes-in-flight state. |
 | ECN/L4S | Optional only with validated RFC 8888 ECN | Require L4S/ECN; force-enable from configuration | Baseline must work on ordinary Internet paths; inconsistent/bleached ECN must not compromise control. |
 | Frame scheduling | Prefer whole unstarted-frame drops; started frame is not guaranteed completion | Packet-only FIFO; unbounded commitment once first packet sends | Minimizes decoder damage while preserving bounded queues and congestion safety. |
-| Constants | Freeze `CongestionProfileV1`; changes require profile/doc evidence | Leave tuning qualitative or implementation-defined | Prevents implementation agents from silently choosing controller semantics and makes deterministic comparison meaningful. |
+| Fixed constants | Freeze the private SCReAM `PROFILE` plus outer/history/scheduler constants in their owning modules; changes require matching profile/doc evidence | Leave tuning qualitative or implementation-defined | Prevents implementation agents from silently choosing controller semantics and makes deterministic comparison meaningful. |
 
 ## Goals
 
@@ -267,16 +267,27 @@ private enum PacketFeedbackMode {
 }
 ```
 
-Both modes normalize to one private record:
+Both modes normalize to one private record. The excerpt below shows the fields
+that define SCReAM feedback semantics:
 
 ```rust
 struct PacketFeedback {
     sent_id: SentPacketId,
     received: bool,
+    newly_acked: bool,
+    lost: bool,
     receiver_arrival: Option<ReceiverTime>,
     ecn: Option<EcnMark>,
 }
 ```
+
+`newly_acked` means the data unit lies in newly advanced ACK-edge sequence space.
+Per draft section 4.1.2, a covered data unit reported missing still contributes
+to `bytes_newly_acked`; its size is not re-credited if it later recovers.
+`lost` is distinct: it becomes true only after the bounded reordering timer or
+history expiry confirms loss. A first `NotReceived` is therefore recoverable
+missing evidence (`newly_acked = true`, `lost = false`) when it lies below a newly
+advanced ACK edge.
 
 `ReceiverTime` is a mode-specific relative timeline. Its absolute epoch is never
 interpreted as server or endpoint wall time.
@@ -320,7 +331,10 @@ network_loop = max(0, feedback_rtt - receiver_feedback_hold)
 
 Sparse or application-limited samples cannot rapidly rewrite either estimate.
 Feedback staleness is evaluated from monotonic send/feedback time and can never
-increase the target rate.
+increase the target rate. Freshness recovers only when the **current network
+feedback report** normalizes evidence for a committed packet. Locally generated
+reordering-expiry/history-expiry loss samples never refresh network feedback
+freshness, and an invalid/duplicate report cannot borrow such an older sample.
 
 ## `Transmit` is the sent-data-unit commit
 
@@ -379,18 +393,20 @@ or mutate it.
 
 ### Inputs
 
-The core consumes:
+The isolated `screamv2::ScreamV2` core consumes only:
 
-- committed RTP data-unit time, transport size, transport/RTP identity, and class;
-- normalized packet arrival/loss and valid ECN marks;
-- feedback receipt time and estimated receiver feedback hold;
-- current RTP bytes-in-flight and paced RTP queue state;
-- selected-path changes and network availability;
-- aggregate offered/admitted RTP media-payload rate;
-- aggregate SFU desired media-payload rate;
+- normalized feedback samples carrying committed send time, transport size,
+  ACK-edge progress, confirmed loss, receiver-arrival evidence, and validated ECN;
+- feedback receipt timing plus estimated receiver feedback hold;
+- current RTP bytes-in-flight;
+- the draft-defined application maximum target bitrate (`TARGET_BITRATE_MAX`);
+- the validated ECN mode for the selected path.
 
-Per-sender priority, frame IDs, source selection, SCTP sequence/SACK state, and
-raw playout ranges are not SCReAM inputs.
+Selected-path availability/change handling, paced RTP queue state,
+application-limited classification, aggregate offered/admitted media rates,
+per-sender priority, frame IDs, source selection, SCTP sequence/SACK state, and
+raw playout ranges remain in the outer adapter/egress layers. They are not
+SCReAM-core inputs.
 
 ### Delay model
 
@@ -415,10 +431,14 @@ is not renamed or treated as an absolute public congestion window. The draft's
 bounded slack between reference window, send window, pacing, and bytes-in-flight
 is implemented exactly. No PulseBeam layer can bypass those rules.
 
-The reference window grows only from delivered evidence and falls on the draft's
-queue, congestion-loss, or valid ECN signals. Random isolated wireless loss is
-not silently reclassified as sustained congestion, but repeated loss or an
-overflowing queue cannot be filtered away.
+Reference-window additive credit follows the draft's ACK-edge accounting:
+`bytes_newly_acked` includes the bytes spanned by newly advanced acknowledged
+sequence space, including covered data units that are later confirmed lost.
+Confirmed loss is a separate congestion signal and never creates a second ACK
+credit. The reference window falls on the draft's queue, congestion-loss, or
+valid ECN signals. Random isolated wireless loss is not silently reclassified as
+sustained congestion, but repeated loss or an overflowing queue cannot be
+filtered away.
 
 The target bitrate is a controller output for RTP media payload. It is not a proof
 of physical bottleneck capacity and is named `target_media_payload_rate` in local
@@ -472,12 +492,16 @@ ECN. ECN is disabled unless:
 
 Bleaching, impossible transitions, or inconsistent counts disable ECN for the
 path without disabling delay/loss control. No public switch can force ECN on.
+When ECN is disabled, CE-marked bytes do not enter the SCReAM CE accumulator and
+therefore cannot suppress ordinary ACK growth.
 
-## `CongestionProfileV1`
+## Version-one fixed profiles and limits
 
-`CongestionProfileV1` is private and compile-time fixed. Every value below is
-normative. A code change to one value requires a profile-version change or a
-matching documentation revision with new evidence.
+SCReAM algorithm constants live in the private `screamv2::PROFILE`. Outer adapter,
+feedback-history, transport, scheduler, latency-governor, and probe limits are
+also compile-time fixed, but live in their owning modules rather than one legacy
+`CongestionProfileV1` object. Every value below is normative. A code change to a
+value requires a matching documented profile/contract revision and new evidence.
 
 Where a field says **pinned draft**, its complete formula and constants come
 unchanged from revision `01`; this is still an exact value by normative reference,
@@ -573,8 +597,10 @@ not permission for implementation choice.
 | ASAP new-packet pacer horizon | `15 ms` |
 | Maximum extra quality-oriented RTX allowance | `50 ms` |
 
-The profile is encoded as one private immutable value. Tests obtain it through a
-crate-private accessor; production callers cannot select or mutate it.
+The SCReAM constants are encoded in private immutable `screamv2::PROFILE`; outer
+fixed limits live in their owning modules. Tests exercise the resulting contract
+through crate-private state and behavior. Production callers cannot select or
+mutate any of these constants.
 
 ## Latency governor
 
@@ -634,7 +660,7 @@ controls recovery classification and stability:
 - delivery between minimum and maximum has linearly decaying utility;
 - delivery after the maximum has zero utility;
 - a fixed nonzero range requests stable playback and uses the slower upward
-  relaxation in the profile.
+  relaxation in the version-one fixed limits.
 
 The strictest `probe_queue_impact` among active senders becomes the path probe
 limit. Utilization, demand, frame/RTX usefulness, and service balance remain per
@@ -703,8 +729,8 @@ Tightening takes effect in the same `Command::SetSenderPolicy` call:
 - obsolete RTX is removed;
 - governed demand, pacer horizon, probe impact, and allocation may fall immediately.
 
-Relaxing follows the profile's per-RTT damping. It cannot release a burst, jump
-the SCReAM reference window, trust a stale estimate, or reconstruct dropped
+Relaxing follows the version-one fixed per-RTT damping. It cannot release a burst,
+jump the SCReAM reference window, trust a stale estimate, or reconstruct dropped
 media.
 
 ### Required monotonicity
@@ -947,8 +973,9 @@ A probe may begin when:
 - all media is paused while nonzero desired demand remains;
 - a congestion response has stabilized and evidence is needed before recovery.
 
-The exact cluster size, interval, overhead, and success criteria are fixed in the
-profile. One cluster aborts immediately on:
+The exact cluster size, interval, overhead, and success criteria are fixed by the
+version-one constants in the probe/egress implementation. One cluster aborts
+immediately on:
 
 - effective queue target violation or the configured queue rise;
 - configured probe loss;
@@ -971,7 +998,7 @@ behavior MUST be equivalent.
 | Classification | Entry | Required behavior | Exit |
 | --- | --- | --- | --- |
 | Unproven | RTP path writable, no feedback for a committed RTP packet | Initial target, bounded pre-media probe, no evidence-free growth | First valid packet feedback |
-| Learning | Valid feedback exists but fewer than three feedback rounds or one smoothed RTT of delivery | Grow only from delivered evidence | Evidence threshold met, or congestion/staleness |
+| Learning | Valid feedback exists but fewer than three feedback rounds or one smoothed RTT of delivery | Grow only from valid ACK-edge progress | Evidence threshold met, or congestion/staleness |
 | Steady | Credible feedback and offered load | Follow pinned SCReAM and governed policy | ALR, congestion, stale feedback, or path change |
 | Application-limited | Offered RTP below 85% threshold for 200 ms with no pacing/window block | Keep the draft bytes-in-flight growth bound authoritative, decay confidence, demand-aware probes | Offered load recovers or another state dominates |
 | Congested | Pinned SCReAM queue/loss/ECN response triggers | Stop probes, back off, shed stale video/RTX | Pinned recovery conditions hold |
@@ -995,8 +1022,6 @@ and outbound RTP identity where protocol continuity permits.
   recovery, not queue-target inflation.
 - Isolated random loss may slow unsupported growth; repeated loss or loss with
   queue growth causes the pinned congestion response.
-- An external rate policer is a path condition. Repeated burst loss makes probes
-  more conservative and cannot be answered by ever larger clusters.
 - A caller-side failure after `Transmit` is ordinary apparent packet loss. There
   is no rollback or missing-receipt state.
 - Controller faults produce bounded counters and one actionable warning/state
@@ -1132,7 +1157,9 @@ known:
   native SCReAM target plus `10 ms`, except during a declared path step or probe;
 - a sustained equal-demand weighted allocation is within `10%` of its expected
   ratio after `5` smoothed RTTs;
-- probe overhead never exceeds the fixed rolling `5%` bound;
+- probe overhead never exceeds the fixed rolling `5%` bound; this must be measured
+  from actual emitted probe and transport bytes, not satisfied by a constant or
+  placeholder scenario field;
 - no target/window growth occurs while feedback is stale;
 - no queue/history/resource count exceeds its hard bound;
 - tightening latency never improves utilization by retaining work the looser
