@@ -1,0 +1,31 @@
+name: One-shot PR216 doc finalizer
+
+on:
+  push:
+    branches:
+      - fix/rtc-screamv2-rfc01
+    paths:
+      - .pr216-docfix-trigger
+
+permissions:
+  contents: write
+
+jobs:
+  finalize:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: fix/rtc-screamv2-rfc01
+      - run: python .github/scripts/pr216_docfix.py
+      - run: git diff --check
+      - name: Commit final documentation repair
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git rm .github/workflows/pr216-docfix-temp.yml .github/scripts/pr216_docfix.py .pr216-docfix-trigger
+          git add crates/pulsebeam-rtc/docs/congestion-control.md
+          git commit -m 'docs(rtc): align application-limited SCReAM contract'
+          git push origin HEAD:fix/rtc-screamv2-rfc01
