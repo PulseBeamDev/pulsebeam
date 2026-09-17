@@ -12,6 +12,7 @@ impl SentHistory {
             return;
         }
         let received_at = batch.received_at.monotonic;
+        let feedback_start = self.inputs.feedback.len();
         let feedback_hold = match batch.report {
             FeedbackReport::Twcc {
                 base_sequence,
@@ -35,14 +36,13 @@ impl SentHistory {
                 report_timestamp,
             } => self.process_rfc8888(&reports, report_timestamp, batch.path_epoch, received_at),
         };
-        self.confirm_losses(received_at, MAX_EXPIRATIONS_PER_POLL);
-        let newest_send_age = self
-            .inputs
-            .feedback
+        let feedback_end = self.inputs.feedback.len();
+        let newest_send_age = self.inputs.feedback[feedback_start..feedback_end]
             .iter()
             .filter_map(|feedback| self.entry(feedback.sent_id))
             .map(|entry| received_at.saturating_duration_since(entry.committed_at))
             .min();
+        self.confirm_losses(received_at, MAX_EXPIRATIONS_PER_POLL);
         self.inputs.timing = Some(FeedbackTiming {
             received_at,
             feedback_hold,
@@ -76,11 +76,10 @@ impl SentHistory {
     }
 
     pub(crate) fn next_deadline(&self) -> Option<Instant> {
-        let scan_end = self
+        let scan_start = self
             .oldest_sent_id
-            .saturating_add(SENT_HISTORY_CAPACITY as u64)
-            .min(self.next_sent_id);
-        let sent = (self.oldest_sent_id..scan_end).find_map(|id| {
+            .max(self.next_sent_id.saturating_sub(SENT_HISTORY_CAPACITY as u64));
+        let sent = (scan_start..self.next_sent_id).find_map(|id| {
             self.entry(SentPacketId(id))
                 .and_then(|entry| entry.committed_at.checked_add(SENT_HISTORY_MAX_AGE))
         });
