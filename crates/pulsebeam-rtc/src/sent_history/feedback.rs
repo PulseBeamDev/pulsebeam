@@ -363,7 +363,7 @@ impl SentHistory {
         }
     }
 
-    fn recover(
+    pub(super) fn recover(
         &mut self,
         sent_id: Option<SentPacketId>,
         epoch: PathEpoch,
@@ -422,7 +422,7 @@ impl SentHistory {
         self.emit(sent_id, true, newly_acked, false, receiver_arrival, ecn);
     }
 
-    fn set_missing(&mut self, sent_id: SentPacketId, now: Instant) {
+    pub(super) fn set_missing(&mut self, sent_id: SentPacketId, now: Instant) {
         let Some(entry) = self.entry_mut(sent_id) else {
             return;
         };
@@ -438,7 +438,7 @@ impl SentHistory {
         }
     }
 
-    fn confirm_losses(&mut self, now: Instant, limit: usize) -> usize {
+    pub(super) fn confirm_losses(&mut self, now: Instant, limit: usize) -> usize {
         let mut work = 0;
         let mut confirmed_loss = false;
         while work < limit {
@@ -505,7 +505,7 @@ impl SentHistory {
         }
     }
 
-    fn emit(
+    pub(super) fn emit(
         &mut self,
         sent_id: SentPacketId,
         received: bool,

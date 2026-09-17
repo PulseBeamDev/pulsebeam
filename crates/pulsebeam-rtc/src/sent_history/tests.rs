@@ -313,7 +313,7 @@ fn reordering_window_is_bounded_and_decays_after_confirmed_loss() {
 
     history.commit(rfc_context(now, epoch, 2)).unwrap();
     history.set_missing(SentPacketId(1), now);
-    history.confirm_losses(now + MAX_REORDERING_WINDOW, 1);
+    history.confirm_losses(now + MAX_REORDERING_WINDOW, 2);
     assert!(history.reordering_window < MAX_REORDERING_WINDOW);
     assert!(history.reordering_window >= INITIAL_REORDERING_WINDOW);
 }

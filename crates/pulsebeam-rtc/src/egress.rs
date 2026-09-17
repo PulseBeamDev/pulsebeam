@@ -1375,7 +1375,7 @@ mod tests {
             policy,
             now,
         );
-        owner.update_controller(at, Some((1, true)), &[], Duration::ZERO, 0);
+        owner.update_controller(at, Some((1, true)), &[], Duration::ZERO, false, 0);
         owner
             .envelope
             .as_mut()

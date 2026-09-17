@@ -453,7 +453,7 @@ mod tests {
     }
 
     #[test]
-    fn application_limited_feedback_does_not_inflate_reference_window() {
+    fn draft_bytes_in_flight_gate_limits_growth_under_low_offer() {
         let mut cc = ScreamController::new(4_000_000, None);
         cc.note_send(Duration::ZERO);
         let base = ControllerInput {

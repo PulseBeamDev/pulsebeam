@@ -89,7 +89,7 @@ being hidden as tuning.
 | Rate units | SFU-facing allocations use media payload; pacer/BIF use transport bytes | One generic bitrate/byte unit | Keeps allocations directly comparable to codec/layer rates while congestion accounting includes observable transport overhead. |
 | SCTP | Keep SCTP congestion control; reserve/coordinate its service outside SCReAM | Count SCTP as SCReAM BIF; feed SACK into a new coupled controller | TWCC/RFC 8888 does not acknowledge SCTP. V1 avoids inventing a second research-grade coupled controller. |
 | Probing | RTP padding on negotiated media/RTX SSRC | Synthetic SSRC zero; no active probing | Matches normal RTP sender identity and enables pre-media/application-limited capacity observations without a special source. |
-| Application-limited behavior | Freeze unsupported growth, decay confidence, demand-aware bounded probes | Collapse estimate to media rate; grow without observations | Separates offered media rate from path capacity and avoids both needless collapse and evidence-free optimism. |
+| Application-limited behavior | Keep the draft-defined bytes-in-flight growth bound authoritative; decay PulseBeam confidence and use demand-aware bounded probes | Add a PulseBeam-specific ref_wnd freeze; collapse estimate to media rate | Keeps product policy outside the SCReAM core while low offered load naturally limits growth through the draft's bytes-in-flight state. |
 | ECN/L4S | Optional only with validated RFC 8888 ECN | Require L4S/ECN; force-enable from configuration | Baseline must work on ordinary Internet paths; inconsistent/bleached ECN must not compromise control. |
 | Frame scheduling | Prefer whole unstarted-frame drops; started frame is not guaranteed completion | Packet-only FIFO; unbounded commitment once first packet sends | Minimizes decoder damage while preserving bounded queues and congestion safety. |
 | Constants | Freeze `CongestionProfileV1`; changes require profile/doc evidence | Leave tuning qualitative or implementation-defined | Prevents implementation agents from silently choosing controller semantics and makes deterministic comparison meaningful. |
@@ -432,7 +432,7 @@ eligible RTP packet is held back by pacing or the send window.
 
 While application-limited:
 
-- unsupported reference-window growth stops;
+- SCReAM's draft-defined bytes-in-flight growth bound remains authoritative; PulseBeam injects no separate application-limited freeze into the core;
 - sparse delay/RTT samples cannot rapidly move the baseline;
 - the last credible rate is retained while confidence decays with a `5 s`
   half-life;
@@ -1088,7 +1088,7 @@ comparison, the pinned live-browser matrix, and the root workspace gates.
   sent entry and is acknowledged once.
 - SCTP bytes never enter SCReAM sent history or RTP bytes-in-flight.
 - Payload and transport accounting round trips without double-counting overhead.
-- Feedback-stale and application-limited states cannot cause unsupported growth.
+- Feedback-stale timer polls cannot replay growth; under low offered load, SCReAM growth remains bounded by the draft-defined bytes-in-flight gate.
 - Unknown, duplicate, reordered, wrapped, and per-SSRC RFC 8888 feedback cannot
   corrupt rings or acknowledgment progression.
 - Paced queues, histories, dependency lists, and per-poll work remain within every

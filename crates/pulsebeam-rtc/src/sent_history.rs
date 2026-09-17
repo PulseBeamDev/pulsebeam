@@ -208,9 +208,6 @@ impl SentHistory {
         let slot = ring_index(sent_id.0);
         if let Some(previous) = self.entries[slot] {
             self.remove_indexes(previous);
-            // Once a ring generation is overwritten, no earlier sent id can still be
-            // retained. Keep the expiration cursor on a live generation.
-            self.oldest_sent_id = self.oldest_sent_id.max(previous.id.0.saturating_add(1));
         }
         let ssrc_index = self.ssrc_index_or_insert(rtp.ssrc, rtp.sequence);
         let empty_history = self.ssrcs[ssrc_index].sent_ids.is_empty();
