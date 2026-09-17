@@ -126,18 +126,12 @@ impl SentHistory {
             self.add_unknown(statuses.len());
             return;
         }
-        let reference = unwrap_near_signed(i64::from(reference_time), self.twcc_reference, 1 << 24);
-        self.twcc_reference = Some(reference);
-        let count = unwrap_near_signed(i64::from(feedback_count), self.twcc_feedback_count, 1 << 8);
-        if self
-            .twcc_feedback_count
-            .is_some_and(|previous| count <= previous)
-        {
-            self.counters.reordered_feedback = self.counters.reordered_feedback.saturating_add(1);
-        } else {
-            self.twcc_feedback_count = Some(count);
-        }
 
+        // Unwrap report-local timing against the last accepted baseline, but do
+        // not commit either cursor until this report proves that it refers to
+        // retained packets on the current path.
+        let reference = unwrap_near_signed(i64::from(reference_time), self.twcc_reference, 1 << 24);
+        let count = unwrap_near_signed(i64::from(feedback_count), self.twcc_feedback_count, 1 << 8);
         let mut arrivals = Vec::with_capacity(statuses.len());
         let mut arrival_micros = reference.saturating_mul(64_000);
         let mut highest_received = None;
@@ -154,10 +148,48 @@ impl SentHistory {
             };
             arrivals.push(arrival);
         }
+
         let old_edge = self.highest_twcc_acked;
+        let mut accepted = false;
         if let Some(edge) = highest_received {
-            self.advance_twcc_edge(base, statuses, &arrivals, edge, epoch, received_at);
+            if old_edge.is_none_or(|previous| edge > previous) {
+                accepted = self.advance_twcc_edge(
+                    base,
+                    statuses,
+                    &arrivals,
+                    edge,
+                    epoch,
+                    received_at,
+                );
+            } else {
+                accepted = statuses.iter().enumerate().any(|(offset, status)| {
+                    if !matches!(status, TwccStatus::Received { .. }) {
+                        return false;
+                    }
+                    let sequence = base.saturating_add(offset as u64);
+                    self.twcc_sent_id(sequence)
+                        .and_then(|sent_id| self.entry(sent_id))
+                        .is_some_and(|entry| entry.path_epoch == epoch)
+                });
+            }
         }
+        if !accepted {
+            return;
+        }
+
+        // A reordered/duplicate report may still recover a packet, but it must
+        // not move the unwrap baseline backwards. Advance both timing cursors
+        // only with a newly accepted feedback-count generation.
+        if self
+            .twcc_feedback_count
+            .is_some_and(|previous| count <= previous)
+        {
+            self.counters.reordered_feedback = self.counters.reordered_feedback.saturating_add(1);
+        } else {
+            self.twcc_feedback_count = Some(count);
+            self.twcc_reference = Some(reference);
+        }
+
         for (offset, status) in statuses.iter().enumerate() {
             let sequence = base.saturating_add(offset as u64);
             if old_edge.is_some_and(|edge| sequence <= edge)
@@ -177,12 +209,12 @@ impl SentHistory {
         edge: u64,
         epoch: PathEpoch,
         received_at: Instant,
-    ) {
+    ) -> bool {
         let start = self
             .highest_twcc_acked
             .map_or(base, |previous| base.max(previous.saturating_add(1)));
         if edge < start || edge.saturating_sub(start) >= MAX_FEEDBACK_STATUSES as u64 {
-            return;
+            return false;
         }
         let range_known = (start..=edge).all(|sequence| {
             self.twcc_sent_id(sequence)
@@ -191,7 +223,7 @@ impl SentHistory {
         });
         if !range_known {
             self.add_unknown(1);
-            return;
+            return false;
         }
         for sequence in start..=edge {
             let sent_id = self.twcc_sent_id(sequence);
@@ -208,6 +240,7 @@ impl SentHistory {
             self.advance_entry(sent_id, epoch, received, arrival, None, received_at);
         }
         self.highest_twcc_acked = Some(edge);
+        true
     }
 
     fn process_rfc8888(
@@ -246,15 +279,16 @@ impl SentHistory {
                 self.add_unknown(report.statuses.len());
                 continue;
             }
+
             let timestamp = unwrap_near_signed(
                 i64::from(report_timestamp),
                 self.ssrcs[ssrc_index].last_report_timestamp,
                 1_i64 << 32,
             );
-            self.ssrcs[ssrc_index].last_report_timestamp = Some(timestamp);
             let report_micros = timestamp.saturating_mul(1_000_000) / 65_536;
             let mut normalized = Vec::with_capacity(report.statuses.len());
             let mut highest_received = None;
+            let mut report_minimum_hold: Option<Duration> = None;
             for (offset, status) in report.statuses.iter().enumerate() {
                 let sequence = base.saturating_add(offset as u64);
                 let value = match status {
@@ -293,14 +327,27 @@ impl SentHistory {
                     }
                 };
                 if let Some(hold) = value.3 {
-                    minimum_hold = Some(minimum_hold.map_or(hold, |known| known.min(hold)));
+                    report_minimum_hold = Some(report_minimum_hold.map_or(hold, |known| known.min(hold)));
                 }
                 normalized.push(value);
             }
+
             let old_edge = self.ssrcs[ssrc_index].highest_acked_sequence;
+            let known_received = normalized.iter().enumerate().any(|(offset, (received, _, _, _))| {
+                if !*received {
+                    return false;
+                }
+                let sequence = base.saturating_add(offset as u64);
+                self.lookup_rtp(ssrc_index, sequence)
+                    .and_then(|sent_id| self.entry(sent_id))
+                    .is_some_and(|entry| entry.path_epoch == epoch)
+            });
+            let mut accepted = false;
             if let Some(edge) = highest_received {
                 let start = old_edge.map_or(base, |previous| base.max(previous.saturating_add(1)));
-                if edge >= start && edge.saturating_sub(start) < MAX_FEEDBACK_STATUSES as u64 {
+                if edge < start {
+                    accepted = known_received;
+                } else if edge.saturating_sub(start) < MAX_FEEDBACK_STATUSES as u64 {
                     let range_known = (start..=edge).all(|sequence| {
                         self.lookup_rtp(ssrc_index, sequence)
                             .and_then(|sent_id| self.entry(sent_id))
@@ -321,8 +368,17 @@ impl SentHistory {
                             self.advance_entry(sent_id, epoch, received, arrival, ecn, received_at);
                         }
                         self.ssrcs[ssrc_index].highest_acked_sequence = Some(edge);
+                        accepted = true;
                     }
                 }
+            }
+            if !accepted {
+                continue;
+            }
+
+            self.ssrcs[ssrc_index].last_report_timestamp = Some(timestamp);
+            if let Some(hold) = report_minimum_hold {
+                minimum_hold = Some(minimum_hold.map_or(hold, |known| known.min(hold)));
             }
             for (offset, (received, arrival, ecn, _)) in normalized.iter().copied().enumerate() {
                 let sequence = base.saturating_add(offset as u64);
