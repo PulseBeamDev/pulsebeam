@@ -426,3 +426,65 @@ fn rfc8888_preserves_arrival_sentinels_and_per_ssrc_progression() {
     assert_eq!(ssrc7.highest_acked_sequence, Some(10));
     assert_eq!(ssrc8.highest_acked_sequence, Some(21));
 }
+
+#[test]
+fn twcc_wraparound_overlap_never_acknowledges_twice() {
+    let now = Instant::now();
+    let epoch = PathEpoch::from_value(25);
+    let mut history = SentHistory::new(PacketFeedbackKind::TransportWide);
+    history.path_changed(epoch, true);
+    for sequence in [u16::MAX - 1, u16::MAX, 0, 1] {
+        history.commit(context(now, epoch, sequence)).unwrap();
+    }
+
+    history.process_feedback(FeedbackBatch {
+        received_at: at(now + Duration::from_millis(20)),
+        path_epoch: epoch,
+        sender_ssrc: 9,
+        report: FeedbackReport::Twcc {
+            media_ssrc: 7,
+            base_sequence: u16::MAX - 1,
+            reference_time: 0,
+            feedback_count: 1,
+            statuses: vec![
+                TwccStatus::Received { delta_250us: 1 },
+                TwccStatus::Received { delta_250us: 1 },
+                TwccStatus::Received { delta_250us: 1 },
+                TwccStatus::Received { delta_250us: 1 },
+            ]
+            .into(),
+        },
+    });
+    assert_eq!(
+        history
+            .inputs
+            .feedback
+            .iter()
+            .filter(|sample| sample.newly_acked)
+            .count(),
+        4
+    );
+    assert_eq!(history.highest_twcc_acked, Some(u64::from(u16::MAX) + 2));
+
+    history.clear_controller_inputs();
+    let duplicates_before = history.counters.duplicate_feedback;
+    history.process_feedback(FeedbackBatch {
+        received_at: at(now + Duration::from_millis(40)),
+        path_epoch: epoch,
+        sender_ssrc: 9,
+        report: FeedbackReport::Twcc {
+            media_ssrc: 7,
+            base_sequence: u16::MAX,
+            reference_time: 0,
+            feedback_count: 2,
+            statuses: vec![
+                TwccStatus::Received { delta_250us: 1 },
+                TwccStatus::Received { delta_250us: 1 },
+                TwccStatus::Received { delta_250us: 1 },
+            ]
+            .into(),
+        },
+    });
+    assert!(history.inputs.feedback.is_empty());
+    assert!(history.counters.duplicate_feedback >= duplicates_before.saturating_add(3));
+}
