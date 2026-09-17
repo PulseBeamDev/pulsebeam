@@ -422,19 +422,33 @@ impl SentHistory {
     }
 
     pub(super) fn set_missing(&mut self, sent_id: SentPacketId, now: Instant) {
+        if !self
+            .entry(sent_id)
+            .is_some_and(|entry| matches!(entry.acknowledgment, Acknowledgment::Pending))
+        {
+            return;
+        }
+        if self.missing.len() >= SENT_HISTORY_CAPACITY {
+            let entries = &self.entries;
+            self.missing.retain(|id| {
+                entries[ring_index(id.0)]
+                    .as_ref()
+                    .is_some_and(|entry| entry.id == *id && matches!(entry.acknowledgment, Acknowledgment::Missing { .. }))
+            });
+        }
+        if self.missing.len() >= SENT_HISTORY_CAPACITY {
+            // This should be unreachable because at most one Missing state exists
+            // per retained sent-history slot. If that invariant is ever violated,
+            // fail conservatively by confirming this packet as lost instead of
+            // allocating unbounded bookkeeping.
+            self.mark_lost(sent_id, false);
+            return;
+        }
         let Some(entry) = self.entry_mut(sent_id) else {
             return;
         };
-        match entry.acknowledgment {
-            Acknowledgment::Pending => {
-                entry.acknowledgment = Acknowledgment::Missing { since: now };
-                self.missing.push_back(sent_id);
-            }
-            Acknowledgment::Missing { .. }
-            | Acknowledgment::Received
-            | Acknowledgment::Lost
-            | Acknowledgment::Retired => {}
-        }
+        entry.acknowledgment = Acknowledgment::Missing { since: now };
+        self.missing.push_back(sent_id);
     }
 
     pub(super) fn confirm_losses(&mut self, now: Instant, limit: usize) -> usize {
