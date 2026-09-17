@@ -154,13 +154,22 @@ fn stale_twcc_generation_is_rejected_without_advancing_ack_state() {
 }
 
 fn rfc_context(at: Instant, epoch: PathEpoch, sequence: u16) -> TransmitCommitContext {
+    rfc_context_ssrc(at, epoch, 7, sequence)
+}
+
+fn rfc_context_ssrc(
+    at: Instant,
+    epoch: PathEpoch,
+    ssrc: u32,
+    sequence: u16,
+) -> TransmitCommitContext {
     TransmitCommitContext {
         at,
         kind: DatagramKind::Rtp,
         wire_len: 1_200,
         path_epoch: Some(epoch),
         rtp: Some(PreparedRtpIdentity {
-            ssrc: 7,
+            ssrc,
             sequence,
             twcc_sequence: None,
             service: RtpService::Original,
@@ -316,4 +325,104 @@ fn reordering_window_is_bounded_and_decays_after_confirmed_loss() {
     history.confirm_losses(now + MAX_REORDERING_WINDOW, 2);
     assert!(history.reordering_window < MAX_REORDERING_WINDOW);
     assert!(history.reordering_window >= INITIAL_REORDERING_WINDOW);
+}
+
+#[test]
+fn invalid_report_cannot_borrow_queued_local_loss_for_freshness() {
+    let now = Instant::now();
+    let epoch = PathEpoch::from_value(23);
+    let mut history = SentHistory::new(PacketFeedbackKind::TransportWide);
+    history.path_changed(epoch, true);
+    history.commit(context(now, epoch, 1)).unwrap();
+    history.emit(SentPacketId(0), false, false, true, None, None);
+    assert_eq!(history.inputs.feedback.len(), 1);
+
+    history.process_feedback(FeedbackBatch {
+        received_at: at(now + Duration::from_millis(20)),
+        path_epoch: epoch,
+        sender_ssrc: 9,
+        report: FeedbackReport::Twcc {
+            media_ssrc: 7,
+            base_sequence: 2,
+            reference_time: 0,
+            feedback_count: 1,
+            statuses: vec![TwccStatus::Received { delta_250us: 1 }].into(),
+        },
+    });
+    assert!(history.inputs.timing.is_some());
+    assert_eq!(history.inputs.timing.and_then(|timing| timing.newest_send_age), None);
+    assert_eq!(history.inputs.feedback.len(), 1);
+}
+
+#[test]
+fn rfc8888_preserves_arrival_sentinels_and_per_ssrc_progression() {
+    let now = Instant::now();
+    let epoch = PathEpoch::from_value(24);
+    let mut history = SentHistory::new(PacketFeedbackKind::Rfc8888);
+    history.path_changed(epoch, true);
+    history
+        .commit(rfc_context_ssrc(now, epoch, 7, 10))
+        .unwrap();
+    history
+        .commit(rfc_context_ssrc(now, epoch, 8, 20))
+        .unwrap();
+    history
+        .commit(rfc_context_ssrc(now, epoch, 8, 21))
+        .unwrap();
+
+    history.process_feedback(FeedbackBatch {
+        received_at: at(now + Duration::from_millis(20)),
+        path_epoch: epoch,
+        sender_ssrc: 9,
+        report: FeedbackReport::Rfc8888 {
+            reports: vec![
+                crate::rtcp::Rfc8888Report {
+                    ssrc: 7,
+                    begin_sequence: 10,
+                    report_count: 1,
+                    statuses: vec![crate::rtcp::Rfc8888Status::Received {
+                        ecn: 0,
+                        arrival_offset: crate::rtcp::ArrivalOffset::OverRange,
+                    }]
+                    .into(),
+                },
+                crate::rtcp::Rfc8888Report {
+                    ssrc: 8,
+                    begin_sequence: 20,
+                    report_count: 2,
+                    statuses: vec![
+                        crate::rtcp::Rfc8888Status::Received {
+                            ecn: 0,
+                            arrival_offset: crate::rtcp::ArrivalOffset::Ticks(1),
+                        },
+                        crate::rtcp::Rfc8888Status::Received {
+                            ecn: 0,
+                            arrival_offset: crate::rtcp::ArrivalOffset::Unavailable,
+                        },
+                    ]
+                    .into(),
+                },
+            ]
+            .into(),
+            report_timestamp: 65_536,
+        },
+    });
+
+    assert_eq!(history.inputs.feedback.len(), 3);
+    assert!(matches!(
+        history.inputs.feedback[0].receiver_arrival,
+        Some(ReceiverTime::OverRange)
+    ));
+    assert!(matches!(
+        history.inputs.feedback[1].receiver_arrival,
+        Some(ReceiverTime::Micros(_))
+    ));
+    assert!(matches!(
+        history.inputs.feedback[2].receiver_arrival,
+        Some(ReceiverTime::Unavailable)
+    ));
+    let ssrc7 = history.ssrcs.iter().find(|state| state.ssrc == 7).unwrap();
+    let ssrc8 = history.ssrcs.iter().find(|state| state.ssrc == 8).unwrap();
+    assert_eq!(ssrc7.highest_acked_sequence, Some(10));
+    assert_eq!(ssrc8.highest_acked_sequence, Some(21));
 }
