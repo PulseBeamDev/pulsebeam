@@ -37,7 +37,7 @@ jobs:
     timeout-minutes: 120
     steps:
     - uses: actions/checkout@v5
-    - run: sudo apt-get install -y protobuf-compiler clang nasm pkg-config
+    - run: sudo apt-get install -y protobuf-compiler clang mold nasm pkg-config
     - name: Run sccache-cache
       uses: mozilla-actions/sccache-action@v0.0.10
     - uses: taiki-e/install-action@v2
