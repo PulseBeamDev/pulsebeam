@@ -51,6 +51,8 @@ x86_64-pc-windows-msvc = "ubuntu-24.04"
 [dist.dependencies.apt]
 build-essential = "*"
 clang = "*"
+mold = "*"
+sccache = "*"
 pkg-config = "*"
 protobuf-compiler = "*"
 nasm = "*"
