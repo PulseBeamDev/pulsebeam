@@ -34,9 +34,13 @@ jobs:
           tool: nextest
 
       - name: Run fast gates
+        env:
+          PULSEBEAM_SIM_PROPERTY_CASES: "4"
         run: just test-fast
 
       - name: Run slow tests
+        env:
+          PULSEBEAM_SIM_PROPERTY_CASES: "4"
         run: just test-slow
 
       - name: Upload RTC browser evidence
