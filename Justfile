@@ -30,24 +30,14 @@ fix:
     just --justfile agents/react/Justfile fix
     just --justfile apps/meet/Justfile fix
 
-# Run every owner fast gate concurrently, bounded to the machine's CPU count.
+# Run every owner fast gate with readable, ordered output.
 test-fast:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    printf '%s\n' {{ test_owners }} | xargs -P "${JUST_TEST_JOBS:-$(nproc)}" -I{} just --justfile "{}/Justfile" test-fast
+    @for owner in {{ test_owners }}; do just --justfile "$owner/Justfile" test-fast; done
 
-# Run independent slow owners concurrently. RTC and Web remain one ordered
-# chain because RTC provisions the browser cache consumed by Web.
+# Run every owner slow gate with readable, ordered output.
+# RTC precedes Web to provision the shared browser cache.
 test-slow:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    just --justfile crates/pulsebeam-rtc/Justfile test-slow &
-    browser_pid=$!
-    just --justfile crates/pulsebeam-simulator/Justfile test-slow &
-    sim_pid=$!
-    wait "$browser_pid"
-    just --justfile agents/pulsebeam-agent-web/Justfile test-slow
-    wait "$sim_pid"
+    @for owner in {{ test_owners }}; do just --justfile "$owner/Justfile" test-slow; done
 
 # Run all owner test gates.
 test: test-fast
