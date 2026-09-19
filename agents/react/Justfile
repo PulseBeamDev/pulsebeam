@@ -17,9 +17,10 @@ fix: prepare
 format-check: prepare
     pnpm run format:check
 
-# Check the implementation and public type contract.
+# Check the dependency and public type contract, leaving dist for consumers.
 check: format-check
-    just --justfile ../pulsebeam-agent-web/Justfile build
+    just --justfile ../pulsebeam-agent-web/Justfile check
+    pnpm run build
     pnpm run check
 
 # Run React compile and package-resolution checks only.
