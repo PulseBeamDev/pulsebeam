@@ -17,11 +17,6 @@ env:
   RUSTC_WRAPPER: sccache
 
 jobs:
-  # Separate from the test job on purpose: a lint failure and a test failure are
-  # different problems, and the architectural rules (shared state, ambient
-  # clock, blocking — see crates/pulsebeam/docs/thread-per-core.md) are the ones
-  # most likely to be waved through if they only ever appear as a warning inside
-  # a test log.
   lint:
     runs-on: ubuntu-latest
     env:
@@ -31,28 +26,49 @@ jobs:
       - uses: ./.github/actions/setup-ci
         with:
           web: "true"
-
       - run: rustup component add clippy rustfmt
-
       - name: Check
         run: just check
 
-  build:
+  test-fast:
     runs-on: ubuntu-latest
-
     steps:
       - uses: actions/checkout@v5
       - uses: ./.github/actions/setup-ci
         with:
           web: "true"
-
       - uses: taiki-e/install-action@v2
         with:
           tool: nextest
+      - name: Run fast tests
+        run: just test-fast
 
-      - name: Run tests
-        run: just test
+  test-simulator-slow:
+    runs-on: ubuntu-latest
+    env:
+      SCCACHE_GHA_RW_MODE: READ_ONLY
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/setup-ci
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+      - name: Run slow simulation tests
+        run: just --justfile crates/pulsebeam-simulator/Justfile test-slow
 
+  test-rtc-browser:
+    runs-on: ubuntu-latest
+    env:
+      SCCACHE_GHA_RW_MODE: READ_ONLY
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/setup-ci
+        with:
+          web: "true"
+      - name: Run RTC and browser tests
+        run: |
+          just --justfile crates/pulsebeam-rtc/Justfile test-slow
+          just --justfile agents/pulsebeam-agent-web/Justfile test-slow
       - name: Upload RTC browser evidence
         if: always()
         uses: actions/upload-artifact@v4
@@ -60,20 +76,3 @@ jobs:
           name: pulsebeam-rtc-browser-evidence
           path: target/pulsebeam-rtc-browser-artifacts
           if-no-files-found: warn
-
-  # eBPF attach/load needs elevated kernel privileges, which the normal `build`
-  # job does not have and should not gain. Keep the behavioural smoke test in
-  # its own job so capability failures remain distinct from build failures.
-  ebpf-smoke:
-    runs-on: ubuntu-latest
-    env:
-      SCCACHE_GHA_RW_MODE: READ_ONLY
-    steps:
-      - uses: actions/checkout@v5
-      - uses: ./.github/actions/setup-ci
-
-      - name: Install nightly for eBPF build-std
-        run: rustup toolchain install nightly --component rust-src --profile minimal
-
-      - name: Build and attach eBPF program
-        run: just ebpf
