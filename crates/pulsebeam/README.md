@@ -9,7 +9,7 @@ Read these contracts before changing the corresponding subsystem:
 - [Naming boundaries](docs/naming.md)
 - [Shard-owned work-stealing dataplane](docs/shard-owned-dataplane.md)
 - [Routing and compiled plans](docs/routing.md)
-- [Linux and eBPF requirements](docs/linux-only.md)
+- [Linux server requirements](docs/linux-only.md)
 - [Architecture diagram](docs/architecture.svg)
 
 Shared mutable packet state, cross-shard handles, blocking calls, and
@@ -17,6 +17,7 @@ multi-atomic snapshots are architectural regressions. Cross-shard and
 cross-node coordination uses owned messages.
 
 Run focused crate tests while iterating. Before handoff, run root `just check`
-and `just test`; use root `just ebpf` when that boundary is touched. Server
+and `just test`. UDP steering is an extension point: higher layers can provide
+a `Steering` implementation through `NodeBuilder::with_steering`. Server
 development, profiling, traffic shaping, and cleanup helpers live in this
 crate's `Justfile`.

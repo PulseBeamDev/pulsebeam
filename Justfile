@@ -1,5 +1,7 @@
 set shell := ["bash", "-euc"]
 
+test_owners := "agents/pulsebeam-agent-core agents/pulsebeam-agent-native agents/react apps/meet crates/pulsebeam crates/pulsebeam-cli crates/pulsebeam-core crates/pulsebeam-proto crates/pulsebeam-routing crates/pulsebeam-rtc agents/pulsebeam-agent-web crates/pulsebeam-runtime crates/pulsebeam-simulator crates/pulsebeam-testdata docs tools"
+
 default:
     @just --list
 
@@ -19,7 +21,7 @@ check:
     just --justfile apps/meet/Justfile check
     just --justfile docs/Justfile check
     just --fmt --check
-    @for file in agents/pulsebeam-agent-core/Justfile agents/pulsebeam-agent-native/Justfile agents/pulsebeam-agent-web/Justfile agents/react/Justfile apps/meet/Justfile crates/pulsebeam/Justfile crates/pulsebeam-cli/Justfile crates/pulsebeam-core/Justfile crates/pulsebeam-ebpf/Justfile crates/pulsebeam-proto/Justfile crates/pulsebeam-routing/Justfile crates/pulsebeam-rtc/Justfile crates/pulsebeam-runtime/Justfile crates/pulsebeam-simulator/Justfile crates/pulsebeam-testdata/Justfile docs/Justfile tools/Justfile; do just --justfile "$file" --fmt --check; done
+    @for owner in {{ test_owners }}; do just --justfile "$owner/Justfile" --fmt --check; done
 
 fix:
     cargo fmt --all
@@ -28,48 +30,18 @@ fix:
     just --justfile agents/react/Justfile fix
     just --justfile apps/meet/Justfile fix
 
-# Run every owner fast gate.
-test-fast:
-    just --justfile agents/pulsebeam-agent-core/Justfile test-fast
-    just --justfile agents/pulsebeam-agent-native/Justfile test-fast
-    just --justfile agents/pulsebeam-agent-web/Justfile test-fast
-    just --justfile agents/react/Justfile test-fast
-    just --justfile apps/meet/Justfile test-fast
-    just --justfile crates/pulsebeam/Justfile test-fast
-    just --justfile crates/pulsebeam-cli/Justfile test-fast
-    just --justfile crates/pulsebeam-core/Justfile test-fast
-    just --justfile crates/pulsebeam-ebpf/Justfile test-fast
-    just --justfile crates/pulsebeam-proto/Justfile test-fast
-    just --justfile crates/pulsebeam-routing/Justfile test-fast
-    just --justfile crates/pulsebeam-rtc/Justfile test-fast
-    just --justfile crates/pulsebeam-runtime/Justfile test-fast
-    just --justfile crates/pulsebeam-simulator/Justfile test-fast
-    just --justfile crates/pulsebeam-testdata/Justfile test-fast
-    just --justfile docs/Justfile test-fast
-    just --justfile tools/Justfile test-fast
+# Run every cheap merge gate with readable, ordered output.
+test-fast: check
+    @for owner in {{ test_owners }}; do just --justfile "$owner/Justfile" test-fast; done
 
-# Run every owner slow gate. RTC precedes Web to provision the shared browser cache.
+# Run every owner slow gate with readable, ordered output.
+# RTC precedes Web to provision the shared browser cache.
 test-slow:
-    just --justfile agents/pulsebeam-agent-core/Justfile test-slow
-    just --justfile agents/pulsebeam-agent-native/Justfile test-slow
-    just --justfile agents/react/Justfile test-slow
-    just --justfile apps/meet/Justfile test-slow
-    just --justfile crates/pulsebeam/Justfile test-slow
-    just --justfile crates/pulsebeam-cli/Justfile test-slow
-    just --justfile crates/pulsebeam-core/Justfile test-slow
-    just --justfile crates/pulsebeam-ebpf/Justfile test-slow
-    just --justfile crates/pulsebeam-proto/Justfile test-slow
-    just --justfile crates/pulsebeam-routing/Justfile test-slow
-    just --justfile crates/pulsebeam-rtc/Justfile test-slow
-    just --justfile agents/pulsebeam-agent-web/Justfile test-slow
-    just --justfile crates/pulsebeam-runtime/Justfile test-slow
-    just --justfile crates/pulsebeam-simulator/Justfile test-slow
-    just --justfile crates/pulsebeam-testdata/Justfile test-slow
-    just --justfile docs/Justfile test-slow
-    just --justfile tools/Justfile test-slow
+    @for owner in {{ test_owners }}; do just --justfile "$owner/Justfile" test-slow; done
 
-# Run all non-privileged owner test gates, with fast gates before slow gates.
-test: test-fast test-slow
+# Run all owner test gates.
+test: test-fast
+    just test-slow
 
 # Build the static Meet export.
 meet-build:
@@ -78,10 +50,6 @@ meet-build:
 # Build local packages and start the Meet development server.
 dev:
     just --justfile apps/meet/Justfile dev
-
-# Build, load, and attach the eBPF steering programs.
-ebpf:
-    just --justfile crates/pulsebeam-ebpf/Justfile ci
 
 # Search deterministic simulation seeds without making the result a merge gate.
 sweep seeds="20" from="1" filter="":

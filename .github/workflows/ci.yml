@@ -17,15 +17,10 @@ env:
   RUSTC_WRAPPER: sccache
 
 jobs:
-  # Separate from the test job on purpose: a lint failure and a test failure are
-  # different problems, and the architectural rules (shared state, ambient
-  # clock, blocking — see crates/pulsebeam/docs/thread-per-core.md) are the ones
-  # most likely to be waved through if they only ever appear as a warning inside
-  # a test log.
-  lint:
+  build:
     runs-on: ubuntu-latest
-    env:
-      SCCACHE_GHA_RW_MODE: READ_ONLY
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v5
       - uses: ./.github/actions/setup-ci
@@ -34,24 +29,15 @@ jobs:
 
       - run: rustup component add clippy rustfmt
 
-      - name: Check
-        run: just check
-
-  build:
-    runs-on: ubuntu-latest
-
-    steps:
-      - uses: actions/checkout@v5
-      - uses: ./.github/actions/setup-ci
-        with:
-          web: "true"
-
       - uses: taiki-e/install-action@v2
         with:
           tool: nextest
 
-      - name: Run tests
-        run: just test
+      - name: Run fast gates
+        run: just test-fast
+
+      - name: Run slow tests
+        run: just test-slow
 
       - name: Upload RTC browser evidence
         if: always()
@@ -60,20 +46,3 @@ jobs:
           name: pulsebeam-rtc-browser-evidence
           path: target/pulsebeam-rtc-browser-artifacts
           if-no-files-found: warn
-
-  # eBPF attach/load needs elevated kernel privileges, which the normal `build`
-  # job does not have and should not gain. Keep the behavioural smoke test in
-  # its own job so capability failures remain distinct from build failures.
-  ebpf-smoke:
-    runs-on: ubuntu-latest
-    env:
-      SCCACHE_GHA_RW_MODE: READ_ONLY
-    steps:
-      - uses: actions/checkout@v5
-      - uses: ./.github/actions/setup-ci
-
-      - name: Install nightly for eBPF build-std
-        run: rustup toolchain install nightly --component rust-src --profile minimal
-
-      - name: Build and attach eBPF program
-        run: just ebpf

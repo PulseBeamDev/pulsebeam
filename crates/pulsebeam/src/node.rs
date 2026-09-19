@@ -31,6 +31,7 @@ use tower_http::decompression::RequestDecompressionLayer;
 
 use crate::control::api;
 use crate::control::controller::ControllerActor;
+use crate::control::steering::Steering;
 use crate::id::ShardId;
 use crate::shard::ShardContext;
 use crate::shard::metrics::ShardMetrics;
@@ -400,6 +401,10 @@ mod shard_executor {
 }
 
 use platform::bind_tcp_listener;
+
+type SteeringFactory =
+    Box<dyn FnOnce(&[pulsebeam_runtime::net::BoundUdpSocket]) -> Result<Box<dyn Steering>> + Send>;
+
 pub struct NodeBuilder {
     // Data-plane topology
     //
@@ -421,8 +426,7 @@ pub struct NodeBuilder {
     http_api: Option<ListenerSource>,
     project_registry: Option<ProjectRegistry>,
     internal_metrics: Option<ListenerSource>,
-
-    ebpf: bool,
+    steering: Option<SteeringFactory>,
 
     /// When `true`, UDP candidates are suppressed so that clients are forced
     /// to use the TCP path. Used in simulation tests that exercise TCP-only
@@ -456,7 +460,16 @@ impl NodeBuilder {
             http_api: None,
             project_registry: None,
             internal_metrics: None,
-            ebpf: true,
+            steering: {
+                #[cfg(feature = "sim")]
+                {
+                    Some(Box::new(crate::control::steering::sim::attach))
+                }
+                #[cfg(not(feature = "sim"))]
+                {
+                    None
+                }
+            },
             tcp_only: false,
             room_shard_slot: crate::control::core::DEFAULT_ROOM_SHARD_SLOT,
             room_placement: crate::control::core::RoomPlacement::Hashed,
@@ -603,8 +616,17 @@ impl NodeBuilder {
         self
     }
 
-    pub fn without_ebpf(mut self) -> Self {
-        self.ebpf = false;
+    /// Install an optional UDP steering extension after PulseBeam binds its sockets.
+    ///
+    /// The extension owns how steering is implemented; PulseBeam only supplies
+    /// the bound reuseport sockets and consumes the generic `Steering` trait.
+    pub fn with_steering<F>(mut self, attach: F) -> Self
+    where
+        F: FnOnce(&[pulsebeam_runtime::net::BoundUdpSocket]) -> Result<Box<dyn Steering>>
+            + Send
+            + 'static,
+    {
+        self.steering = Some(Box::new(attach));
         self
     }
 
@@ -718,26 +740,9 @@ impl NodeBuilder {
             );
         }
 
-        let steering = if self.ebpf {
-            match crate::control::steering::attach(&udp_sockets) {
-                Ok(steering) => {
-                    metrics::gauge!("ebpf_steering_attached").set(1.0);
-                    tracing::info!("attached eBPF UDP steering");
-                    Some(steering)
-                }
-                Err(err) => {
-                    metrics::gauge!("ebpf_steering_attached").set(0.0);
-                    tracing::warn!(
-                        "eBPF UDP steering disabled; using userspace bootstrap forwarding: {:?}",
-                        err
-                    );
-                    None
-                }
-            }
-        } else {
-            metrics::gauge!("ebpf_steering_attached").set(0.0);
-            tracing::info!("eBPF UDP steering disabled by configuration");
-            None
+        let steering = match self.steering {
+            Some(attach) => Some(attach(&udp_sockets).context("attaching UDP steering")?),
+            None => None,
         };
 
         let tcp_listener = bind_tcp_listener(local_addr)
@@ -1560,7 +1565,10 @@ mod tests {
         assert!(builder.internal_metrics.is_none());
         assert!(!builder.tcp_only, "UDP candidates are offered by default");
         assert!(matches!(builder.udp_mode, UdpMode::Batch));
-        assert!(builder.ebpf);
+        #[cfg(feature = "sim")]
+        assert!(builder.steering.is_some());
+        #[cfg(not(feature = "sim"))]
+        assert!(builder.steering.is_none());
         assert_eq!(builder.shard_runtime, ShardRuntime::ThreadPerCore);
         assert!(matches!(
             builder.room_placement,
@@ -1611,15 +1619,13 @@ mod tests {
             .external_addrs(vec![addr])
             .room_shard_slot(9)
             .round_robin_rooms()
-            .tcp_only()
-            .without_ebpf();
+            .tcp_only();
 
         assert_eq!(builder.data_threads, 4);
         assert_eq!(builder.local_addr, Some(addr));
         assert_eq!(builder.external_addrs, vec![addr]);
         assert_eq!(builder.room_shard_slot, 9);
         assert!(builder.tcp_only);
-        assert!(!builder.ebpf);
         assert!(matches!(
             builder.room_placement,
             crate::control::core::RoomPlacement::RoundRobin

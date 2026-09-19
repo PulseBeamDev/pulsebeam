@@ -20,7 +20,6 @@ workspace = true
 [dependencies]
 arc-swap = { workspace = true }
 ahash = "0.8.12"
-aya = { workspace = true }
 anyhow = { workspace = true }
 arrayvec = { version = "0.7.6", features = ["serde"] }
 axum = { version = "0.8.9", features = ["macros"] }

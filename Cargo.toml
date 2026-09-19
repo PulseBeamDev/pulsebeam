@@ -4,7 +4,6 @@ members = [
   "crates/pulsebeam",
   "crates/pulsebeam-cli",
   "crates/pulsebeam-core",
-  "crates/pulsebeam-ebpf",
   "crates/pulsebeam-proto",
   "crates/pulsebeam-routing",
   "crates/pulsebeam-rtc",
@@ -28,8 +27,6 @@ license = "AGPL-3.0"
 [workspace.dependencies]
 arc-swap = "1.7.1"
 anyhow = "1"
-aya = "0.14.0"
-aya-ebpf = "0.2.1"
 bytes = "1.11.1"
 derive_more = { version = "2.1.1", features = ["full"] }
 fastrand = "2.3.0"
