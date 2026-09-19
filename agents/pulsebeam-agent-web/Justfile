@@ -32,10 +32,10 @@ uniffi-check: uniffi-generate
     cargo test -p pulsebeam-agent-web --test uniffi_contract
     git diff --exit-code -- generated
 
-# Check Rust/WASM and the handwritten TypeScript boundary.
+# Check Rust/WASM and leave the package built for dependent owner checks.
 check: format-check
     cargo check -p pulsebeam-agent-web --target wasm32-unknown-unknown
-    pnpm run build:wasm
+    pnpm run build
     pnpm run check
 
 # Run deterministic host-boundary unit tests. Browser fixtures are built by test-slow.
