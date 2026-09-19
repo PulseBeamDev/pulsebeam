@@ -1,5 +1,7 @@
 set shell := ["bash", "-euc"]
 
+test_owners := "agents/pulsebeam-agent-core agents/pulsebeam-agent-native agents/pulsebeam-agent-web agents/react apps/meet crates/pulsebeam crates/pulsebeam-cli crates/pulsebeam-core crates/pulsebeam-proto crates/pulsebeam-routing crates/pulsebeam-rtc crates/pulsebeam-runtime crates/pulsebeam-simulator crates/pulsebeam-testdata docs tools"
+
 default:
     @just --list
 
@@ -19,7 +21,7 @@ check:
     just --justfile apps/meet/Justfile check
     just --justfile docs/Justfile check
     just --fmt --check
-    @for file in agents/pulsebeam-agent-core/Justfile agents/pulsebeam-agent-native/Justfile agents/pulsebeam-agent-web/Justfile agents/react/Justfile apps/meet/Justfile crates/pulsebeam/Justfile crates/pulsebeam-cli/Justfile crates/pulsebeam-core/Justfile crates/pulsebeam-proto/Justfile crates/pulsebeam-routing/Justfile crates/pulsebeam-rtc/Justfile crates/pulsebeam-runtime/Justfile crates/pulsebeam-simulator/Justfile crates/pulsebeam-testdata/Justfile docs/Justfile tools/Justfile; do just --justfile "$file" --fmt --check; done
+    @for owner in {{ test_owners }}; do just --justfile "$owner/Justfile" --fmt --check; done
 
 fix:
     cargo fmt --all
@@ -28,87 +30,26 @@ fix:
     just --justfile agents/react/Justfile fix
     just --justfile apps/meet/Justfile fix
 
-# Run every owner fast gate concurrently.
-[parallel]
-test-fast: _test-fast-agent-core _test-fast-agent-native _test-fast-agent-web _test-fast-react _test-fast-meet _test-fast-pulsebeam _test-fast-cli _test-fast-core _test-fast-proto _test-fast-routing _test-fast-rtc _test-fast-runtime _test-fast-simulator _test-fast-testdata _test-fast-docs _test-fast-tools
+# Run every owner fast gate concurrently, bounded to the machine's CPU count.
+test-fast:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    printf '%s\n' {{ test_owners }} | xargs -n1 -P "${JUST_TEST_JOBS:-$(nproc)}" -I{} just --justfile "{}/Justfile" test-fast
 
-_test-fast-agent-core:
-    just --justfile agents/pulsebeam-agent-core/Justfile test-fast
-
-_test-fast-agent-native:
-    just --justfile agents/pulsebeam-agent-native/Justfile test-fast
-
-_test-fast-agent-web:
-    just --justfile agents/pulsebeam-agent-web/Justfile test-fast
-
-_test-fast-react:
-    just --justfile agents/react/Justfile test-fast
-
-_test-fast-meet:
-    just --justfile apps/meet/Justfile test-fast
-
-_test-fast-pulsebeam:
-    just --justfile crates/pulsebeam/Justfile test-fast
-
-_test-fast-cli:
-    just --justfile crates/pulsebeam-cli/Justfile test-fast
-
-_test-fast-core:
-    just --justfile crates/pulsebeam-core/Justfile test-fast
-
-_test-fast-proto:
-    just --justfile crates/pulsebeam-proto/Justfile test-fast
-
-_test-fast-routing:
-    just --justfile crates/pulsebeam-routing/Justfile test-fast
-
-_test-fast-rtc:
-    just --justfile crates/pulsebeam-rtc/Justfile test-fast
-
-_test-fast-runtime:
-    just --justfile crates/pulsebeam-runtime/Justfile test-fast
-
-_test-fast-simulator:
-    just --justfile crates/pulsebeam-simulator/Justfile test-fast
-
-_test-fast-testdata:
-    just --justfile crates/pulsebeam-testdata/Justfile test-fast
-
-_test-fast-docs:
-    just --justfile docs/Justfile test-fast
-
-_test-fast-tools:
-    just --justfile tools/Justfile test-fast
-
-# Run independent slow gates concurrently. Browser tests stay in one chain so
-# RTC provisions the shared browser cache before the Web-owned runner uses it.
-[parallel]
-test-slow: _test-slow-browser _test-slow-simulator _test-slow-other
-
-_test-slow-browser:
-    just --justfile crates/pulsebeam-rtc/Justfile test-slow
+# Run independent slow owners concurrently. RTC and Web remain one ordered
+# chain because RTC provisions the browser cache consumed by Web.
+test-slow:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    just --justfile crates/pulsebeam-rtc/Justfile test-slow &
+    browser_pid=$!
+    just --justfile crates/pulsebeam-simulator/Justfile test-slow &
+    sim_pid=$!
+    wait "$browser_pid"
     just --justfile agents/pulsebeam-agent-web/Justfile test-slow
+    wait "$sim_pid"
 
-_test-slow-simulator:
-    just --justfile crates/pulsebeam-simulator/Justfile test-slow
-
-# Preserve the owner contract even though these are currently no-ops.
-_test-slow-other:
-    just --justfile agents/pulsebeam-agent-core/Justfile test-slow
-    just --justfile agents/pulsebeam-agent-native/Justfile test-slow
-    just --justfile agents/react/Justfile test-slow
-    just --justfile apps/meet/Justfile test-slow
-    just --justfile crates/pulsebeam/Justfile test-slow
-    just --justfile crates/pulsebeam-cli/Justfile test-slow
-    just --justfile crates/pulsebeam-core/Justfile test-slow
-    just --justfile crates/pulsebeam-proto/Justfile test-slow
-    just --justfile crates/pulsebeam-routing/Justfile test-slow
-    just --justfile crates/pulsebeam-runtime/Justfile test-slow
-    just --justfile crates/pulsebeam-testdata/Justfile test-slow
-    just --justfile docs/Justfile test-slow
-    just --justfile tools/Justfile test-slow
-
-# Run all non-privileged owner test gates.
+# Run all owner test gates.
 test: test-fast && test-slow
 
 # Build the static Meet export.
