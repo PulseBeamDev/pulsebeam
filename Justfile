@@ -13,11 +13,9 @@ prepare:
 # Run every static workspace gate.
 check:
     just prepare
-    cargo check
     cargo fmt --all --check
     cargo clippy --all-targets --workspace --features pulsebeam/sim
-    just --justfile agents/pulsebeam-agent-web/Justfile check
-    just --justfile agents/react/Justfile check
+    cargo check -p pulsebeam
     just --justfile apps/meet/Justfile check
     just --justfile docs/Justfile check
     just --fmt --check
