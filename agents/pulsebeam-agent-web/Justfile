@@ -38,8 +38,8 @@ check: format-check
     pnpm run build:wasm
     pnpm run check
 
-# Run deterministic host-boundary unit tests. Generated binding contracts have their own gate.
-test-fast: build uniffi-browser-build
+# Run deterministic host-boundary unit tests. Browser fixtures are built by test-slow.
+test-fast:
     cargo test -p pulsebeam-agent-web --lib
 
 # Run browser contracts after rebuilding every Web and React fixture.
