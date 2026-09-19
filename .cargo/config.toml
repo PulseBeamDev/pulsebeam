@@ -25,18 +25,6 @@ rustflags = [
   "link-arg=-fuse-ld=mold",
 ]
 
-[target.aarch64-unknown-linux-gnu]
-linker = "clang"
-rustflags = [
-  "--cfg",
-  "tracing_unstable",
-  "--cfg",
-  "tokio_unstable",
-  "-C",
-  "force-frame-pointers=yes",
-  "-C",
-  "link-arg=-fuse-ld=mold",
-]
 
 # [unstable]
 # codegen-backend = true
