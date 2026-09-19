@@ -402,9 +402,8 @@ mod shard_executor {
 
 use platform::bind_tcp_listener;
 
-type SteeringFactory = Box<
-    dyn FnOnce(&[pulsebeam_runtime::net::BoundUdpSocket]) -> Result<Box<dyn Steering>> + Send,
->;
+type SteeringFactory =
+    Box<dyn FnOnce(&[pulsebeam_runtime::net::BoundUdpSocket]) -> Result<Box<dyn Steering>> + Send>;
 
 pub struct NodeBuilder {
     // Data-plane topology
