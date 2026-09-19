@@ -1,0 +1,5 @@
+# Keep the pull request description human-owned. CodeRabbit review output stays in
+# its walkthrough/review surface so /dev-ship can own the final PR body.
+reviews:
+  high_level_summary: false
+  high_level_summary_in_walkthrough: true
