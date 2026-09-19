@@ -75,6 +75,7 @@ pulsebeam-proto = { package = "pulsebeam-proto", version = "0.3.2", path = "crat
 # str0m = { path = "../str0m" }
 
 [profile.dev]
+incremental = false
 panic = "abort"
 
 [profile.release]
@@ -87,6 +88,7 @@ panic = "abort"
 lto = true
 
 [profile.test]
+incremental = false
 panic = "abort"
 
 # The profile that 'dist' will build with
@@ -99,8 +101,8 @@ lto = "thin"
 inherits = "dev"
 opt-level = 2
 
-# For fast feedback loop
-incremental = true
+# Favor reusable sccache artifacts over Cargo incremental state.
+incremental = false
 codegen-units = 256
 lto = false
 
