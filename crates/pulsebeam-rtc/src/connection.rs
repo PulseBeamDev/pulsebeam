@@ -367,7 +367,7 @@ impl Connection {
                 .request_repair(repair.media_ssrc, repair.sequence);
         }
 
-        let (path_change, feedback, feedback_hold, bytes_in_flight) = {
+        let (path_change, feedback, feedback_hold, fresh_network_feedback, bytes_in_flight) = {
             let inputs = self.runtime.commit.history.controller_inputs();
             let received_at = inputs
                 .timing
@@ -386,6 +386,9 @@ impl Connection {
                     .timing
                     .and_then(|timing| timing.feedback_hold)
                     .unwrap_or_default(),
+                inputs
+                    .timing
+                    .is_some_and(|timing| timing.newest_send_age.is_some()),
                 inputs.bytes_in_flight,
             )
         };
@@ -394,6 +397,7 @@ impl Connection {
             path_change,
             &feedback,
             feedback_hold,
+            fresh_network_feedback,
             bytes_in_flight,
         );
         self.runtime.commit.history.clear_controller_inputs();

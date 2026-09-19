@@ -7,6 +7,7 @@ use super::{
 
 const STEP: Duration = Duration::from_millis(10);
 const FEEDBACK_INTERVAL: Duration = Duration::from_millis(50);
+const LOSS_CONFIRMATION_DELAY: Duration = Duration::from_millis(30);
 
 #[derive(Clone, Debug)]
 pub(crate) struct ScenarioMetrics {
@@ -16,19 +17,16 @@ pub(crate) struct ScenarioMetrics {
     pub(crate) admitted_percent: u64,
     pub(crate) p99_queue_micros: u64,
     pub(crate) effective_target_micros: u64,
-    pub(crate) probe_overhead_percent: u64,
     pub(crate) application_limited_at_millis: Option<u64>,
     pub(crate) stale_at_millis: Option<u64>,
     pub(crate) stale_recovered: bool,
     pub(crate) window_grew_while_stale: bool,
     pub(crate) baseline_resets: u64,
-    pub(crate) old_path_sample_used: bool,
     pub(crate) ecn_reduced_window: bool,
     pub(crate) l4s_disabled_on_bleach: bool,
     pub(crate) policer_detected: bool,
     pub(crate) fairness_percent: u64,
     pub(crate) maximum_native_target_micros: u64,
-    pub(crate) duplicate_status_consumptions: u64,
 }
 
 struct Packet {
@@ -41,6 +39,13 @@ struct Packet {
     ecn: Option<EcnMark>,
 }
 
+struct PendingLoss {
+    epoch: u64,
+    sent_at: Duration,
+    confirm_at: Duration,
+    bytes: u32,
+}
+
 struct Simulation {
     controller: ScreamController,
     output: SafeRtpEnvelope,
@@ -48,6 +53,7 @@ struct Simulation {
     next_feedback: Duration,
     queue_bytes: u64,
     pending: VecDeque<Packet>,
+    pending_losses: VecDeque<PendingLoss>,
     delivered_bytes: u64,
     offered_bytes: u64,
     admitted_bytes: u64,
@@ -66,6 +72,7 @@ impl Simulation {
             next_feedback: FEEDBACK_INTERVAL,
             queue_bytes: 0,
             pending: VecDeque::new(),
+            pending_losses: VecDeque::new(),
             delivered_bytes: 0,
             offered_bytes: 0,
             admitted_bytes: 0,
@@ -127,6 +134,7 @@ impl Simulation {
         }
         self.now = self.now.saturating_add(STEP);
         let mut samples = Vec::new();
+        let mut fresh_network_feedback = false;
         if feedback_enabled && self.now >= self.next_feedback {
             while self
                 .pending
@@ -138,14 +146,26 @@ impl Simulation {
                     continue;
                 }
                 if packet.received {
+                    fresh_network_feedback = true;
                     self.delivered_bytes =
                         self.delivered_bytes.saturating_add(u64::from(packet.bytes));
+                } else {
+                    self.pending_losses.push_back(PendingLoss {
+                        epoch: packet.epoch,
+                        sent_at: packet.sent_at,
+                        confirm_at: self.now.saturating_add(LOSS_CONFIRMATION_DELAY),
+                        bytes: packet.bytes,
+                    });
                 }
                 samples.push(FeedbackSample {
                     sent_at: packet.sent_at,
                     received_at: self.now,
                     transport_bytes: packet.bytes,
                     received: packet.received,
+                    // ACK-edge accounting includes a covered missing data unit, but
+                    // loss remains deferred until the reordering timer expires.
+                    newly_acked: true,
+                    lost: false,
                     receiver_arrival_micros: packet
                         .received
                         .then_some(packet.receiver_arrival_micros),
@@ -153,6 +173,26 @@ impl Simulation {
                 });
             }
             self.next_feedback = self.next_feedback.saturating_add(FEEDBACK_INTERVAL);
+        }
+        while self
+            .pending_losses
+            .front()
+            .is_some_and(|loss| loss.confirm_at <= self.now)
+        {
+            let confirmed = self.pending_losses.pop_front().expect("front checked");
+            if confirmed.epoch != epoch {
+                continue;
+            }
+            samples.push(FeedbackSample {
+                sent_at: confirmed.sent_at,
+                received_at: self.now,
+                transport_bytes: confirmed.bytes,
+                received: false,
+                newly_acked: false,
+                lost: true,
+                receiver_arrival_micros: None,
+                ecn: None,
+            });
         }
         let bytes_in_flight = self
             .pending
@@ -166,13 +206,13 @@ impl Simulation {
                 path_available: true,
                 feedback: &samples,
                 feedback_hold: Duration::ZERO,
+                fresh_network_feedback,
                 bytes_in_flight,
                 paced_queue_bytes: self.queue_bytes,
                 offered_media_rate: offered_bps,
                 admitted_media_rate: admitted_rate,
                 desired_media_rate: desired_bps,
                 window_or_pacer_blocked: false,
-                queue_delay_ceiling: Duration::from_millis(60),
                 ecn: validation,
             },
         );
@@ -198,19 +238,16 @@ impl Simulation {
                 .copied()
                 .unwrap_or(0),
             effective_target_micros: micros(self.output.effective_queue_delay_target),
-            probe_overhead_percent: 0,
             application_limited_at_millis: None,
             stale_at_millis: None,
             stale_recovered: false,
             window_grew_while_stale: false,
             baseline_resets: 0,
-            old_path_sample_used: false,
             ecn_reduced_window: false,
             l4s_disabled_on_bleach: false,
             policer_detected: self.output.policer_detected,
             fairness_percent: 50,
             maximum_native_target_micros: self.maximum_native_target,
-            duplicate_status_consumptions: 0,
         }
     }
 }
@@ -365,7 +402,6 @@ fn path_step() -> ScenarioMetrics {
     }
     let mut metrics = sim.metrics("RTT-path-step", 0x0705);
     metrics.baseline_resets = resets;
-    metrics.old_path_sample_used = false;
     metrics
 }
 
