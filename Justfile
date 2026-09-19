@@ -34,7 +34,7 @@ fix:
 test-fast:
     #!/usr/bin/env bash
     set -euo pipefail
-    printf '%s\n' {{ test_owners }} | xargs -n1 -P "${JUST_TEST_JOBS:-$(nproc)}" -I{} just --justfile "{}/Justfile" test-fast
+    printf '%s\n' {{ test_owners }} | xargs -P "${JUST_TEST_JOBS:-$(nproc)}" -I{} just --justfile "{}/Justfile" test-fast
 
 # Run independent slow owners concurrently. RTC and Web remain one ordered
 # chain because RTC provisions the browser cache consumed by Web.
@@ -50,7 +50,8 @@ test-slow:
     wait "$sim_pid"
 
 # Run all owner test gates.
-test: test-fast && test-slow
+test: test-fast
+    just test-slow
 
 # Build the static Meet export.
 meet-build:
