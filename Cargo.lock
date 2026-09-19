@@ -3386,7 +3386,6 @@ dependencies = [
  "arrayvec",
  "axum",
  "axum-extra",
- "aya",
  "base32",
  "clap",
  "core_affinity",
@@ -3529,15 +3528,6 @@ dependencies = [
  "tokio",
  "turmoil",
  "uuid",
-]
-
-[[package]]
-name = "pulsebeam-ebpf"
-version = "0.3.2"
-dependencies = [
- "aya-ebpf",
- "pulsebeam-routing",
- "sha2",
 ]
 
 [[package]]
