@@ -80,12 +80,12 @@ panic = "abort"
 
 [profile.release]
 debug = "line-tables-only"
-codegen-units = 1
+codegen-units = 16
 
 debug-assertions = false
 overflow-checks = false
 panic = "abort"
-lto = true
+lto = "thin"
 
 [profile.test]
 incremental = false
