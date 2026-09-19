@@ -15,7 +15,7 @@ format-check: prepare
     pnpm run format:check
 
 check: format-check
-    just --justfile ../../agents/react/Justfile build
+    just --justfile ../../agents/react/Justfile check
     pnpm run check
 
 test-fast:
