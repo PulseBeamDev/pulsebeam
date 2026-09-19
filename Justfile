@@ -30,8 +30,8 @@ fix:
     just --justfile agents/react/Justfile fix
     just --justfile apps/meet/Justfile fix
 
-# Run every owner fast gate with readable, ordered output.
-test-fast:
+# Run every cheap merge gate with readable, ordered output.
+test-fast: check
     @for owner in {{ test_owners }}; do just --justfile "$owner/Justfile" test-fast; done
 
 # Run every owner slow gate with readable, ordered output.
