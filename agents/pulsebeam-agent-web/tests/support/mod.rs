@@ -32,7 +32,7 @@ impl DestinationServer {
             .and_then(Path::parent)
             .ok_or("web package must be inside the workspace")?;
         let build = Command::new("cargo")
-            .args(["build", "--release", "-p", "pulsebeam"])
+            .args(["build", "-p", "pulsebeam"])
             .current_dir(root)
             .output()?;
         if !build.status.success() {
@@ -42,8 +42,8 @@ impl DestinationServer {
             )
             .into());
         }
-        let mut child = Command::new("cargo")
-            .args(["run", "--release", "-p", "pulsebeam", "--", "--dev"])
+        let mut child = Command::new(root.join("target/debug/pulsebeam"))
+            .arg("--dev")
             .current_dir(root)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
