@@ -707,15 +707,10 @@ impl DeliverySignature {
 }
 
 fn config(cases: u32) -> ProptestConfig {
-    let cases = std::env::var("PULSEBEAM_SIM_PROPERTY_CASES")
-        .ok()
-        .and_then(|value| value.parse::<u32>().ok())
-        .filter(|&value| value > 0)
-        .map_or(cases, |limit| cases.min(limit));
-
     ProptestConfig {
-        // Each case is a full simulation. CI may cap the committed-seed sample through
-        // PULSEBEAM_SIM_PROPERTY_CASES; local runs and nightly seed sweeps keep the full budget.
+        // Each case is a full simulation. The count is worth more than it was: cases are no
+        // longer discarded after being simulated, and the space they sample is small enough that
+        // this many is a real sample of it.
         cases,
         max_shrink_iters: 8,
         // Every case here is a full simulation, and these properties `prop_assume!` *after*
