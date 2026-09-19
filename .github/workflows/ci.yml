@@ -26,49 +26,30 @@ jobs:
       - uses: ./.github/actions/setup-ci
         with:
           web: "true"
+
       - run: rustup component add clippy rustfmt
+
       - name: Check
         run: just check
 
-  test-fast:
+  build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
       - uses: ./.github/actions/setup-ci
         with:
           web: "true"
+
       - uses: taiki-e/install-action@v2
         with:
           tool: nextest
+
       - name: Run fast tests
         run: just test-fast
 
-  test-simulator-slow:
-    runs-on: ubuntu-latest
-    env:
-      SCCACHE_GHA_RW_MODE: READ_ONLY
-    steps:
-      - uses: actions/checkout@v5
-      - uses: ./.github/actions/setup-ci
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: nextest
-      - name: Run slow simulation tests
-        run: just --justfile crates/pulsebeam-simulator/Justfile test-slow
+      - name: Run slow tests
+        run: just test-slow
 
-  test-rtc-browser:
-    runs-on: ubuntu-latest
-    env:
-      SCCACHE_GHA_RW_MODE: READ_ONLY
-    steps:
-      - uses: actions/checkout@v5
-      - uses: ./.github/actions/setup-ci
-        with:
-          web: "true"
-      - name: Run RTC and browser tests
-        run: |
-          just --justfile crates/pulsebeam-rtc/Justfile test-slow
-          just --justfile agents/pulsebeam-agent-web/Justfile test-slow
       - name: Upload RTC browser evidence
         if: always()
         uses: actions/upload-artifact@v4
