@@ -17,21 +17,6 @@ env:
   RUSTC_WRAPPER: sccache
 
 jobs:
-  lint:
-    runs-on: ubuntu-latest
-    env:
-      SCCACHE_GHA_RW_MODE: READ_ONLY
-    steps:
-      - uses: actions/checkout@v5
-      - uses: ./.github/actions/setup-ci
-        with:
-          web: "true"
-
-      - run: rustup component add clippy rustfmt
-
-      - name: Check
-        run: just check
-
   build:
     runs-on: ubuntu-latest
     steps:
@@ -40,11 +25,13 @@ jobs:
         with:
           web: "true"
 
+      - run: rustup component add clippy rustfmt
+
       - uses: taiki-e/install-action@v2
         with:
           tool: nextest
 
-      - name: Run fast tests
+      - name: Run fast gates
         run: just test-fast
 
       - name: Run slow tests
