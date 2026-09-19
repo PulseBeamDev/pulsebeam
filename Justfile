@@ -1,6 +1,6 @@
 set shell := ["bash", "-euc"]
 
-test_owners := "agents/pulsebeam-agent-core agents/pulsebeam-agent-native agents/pulsebeam-agent-web agents/react apps/meet crates/pulsebeam crates/pulsebeam-cli crates/pulsebeam-core crates/pulsebeam-proto crates/pulsebeam-routing crates/pulsebeam-rtc crates/pulsebeam-runtime crates/pulsebeam-simulator crates/pulsebeam-testdata docs tools"
+test_owners := "agents/pulsebeam-agent-core agents/pulsebeam-agent-native agents/react apps/meet crates/pulsebeam crates/pulsebeam-cli crates/pulsebeam-core crates/pulsebeam-proto crates/pulsebeam-routing crates/pulsebeam-rtc agents/pulsebeam-agent-web crates/pulsebeam-runtime crates/pulsebeam-simulator crates/pulsebeam-testdata docs tools"
 
 default:
     @just --list
