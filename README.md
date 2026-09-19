@@ -56,7 +56,7 @@ docker run --rm --net=host ghcr.io/pulsebeamdev/pulsebeam:pulsebeam-v0.4.5 --dev
 **Other options:**
 
 - **Binary:** download from [Releases](https://github.com/pulsebeamdev/pulsebeam/releases/latest)
-- **Source:** `cargo run --release -p pulsebeam`
+- **Source:** install `clang`, `mold`, and `sccache`, then run `cargo run --release -p pulsebeam`
 
 ### Step 2. Publish a video
 

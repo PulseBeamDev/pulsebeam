@@ -1,4 +1,5 @@
 [build]
+rustc-wrapper = "sccache"
 rustflags = [
   "--cfg",
   "tracing_unstable",
@@ -10,13 +11,27 @@ rustflags = [
   #  "-C",
   #  "link-arg=-Wl,--allow-multiple-definition"
 ]
-# rustc-wrapper = "/usr/bin/sccache"
+
+[target.x86_64-unknown-linux-gnu]
+linker = "clang"
+rustflags = [
+  "--cfg",
+  "tracing_unstable",
+  "--cfg",
+  "tokio_unstable",
+  "-C",
+  "force-frame-pointers=yes",
+  "-C",
+  "link-arg=-fuse-ld=mold",
+]
+
 
 # [unstable]
 # codegen-backend = true
 #
 # [profile.dev]
 # codegen-backend = "cranelift"
+
 [env]
 CFLAGS = "-fno-omit-frame-pointer -mno-omit-leaf-frame-pointer"
 CXXFLAGS = "-fno-omit-frame-pointer -mno-omit-leaf-frame-pointer"

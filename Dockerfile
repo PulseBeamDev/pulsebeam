@@ -1,5 +1,5 @@
 FROM docker.io/library/rust:1.92.0 AS builder
-RUN apt update && apt install -y protobuf-compiler libprotobuf-dev
+RUN apt update && apt install -y protobuf-compiler libprotobuf-dev clang mold sccache
 RUN cargo install just --version 1.58.0 --locked
 WORKDIR /app
 
@@ -8,6 +8,7 @@ COPY . .
 RUN --mount=type=cache,target=/app/target \
     --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/root/.cargo/git \
+    --mount=type=cache,target=/root/.cache/sccache \
     just build release && \
     cp /app/target/release/pulsebeam /app/pulsebeam-bin
 
