@@ -26,8 +26,7 @@
 
 #[cfg(not(target_os = "linux"))]
 compile_error!(
-    "pulsebeam server requires Linux: its UDP steering path is Aya/eBPF \
-     (BPF_PROG_TYPE_SK_REUSEPORT). Portable crates (protocol, core, \
+    "pulsebeam server currently requires Linux. Portable crates (protocol, core, \
      simulator) build elsewhere; the server binary does not."
 );
 
