@@ -1566,6 +1566,9 @@ mod tests {
         assert!(builder.internal_metrics.is_none());
         assert!(!builder.tcp_only, "UDP candidates are offered by default");
         assert!(matches!(builder.udp_mode, UdpMode::Batch));
+        #[cfg(feature = "sim")]
+        assert!(builder.steering.is_some());
+        #[cfg(not(feature = "sim"))]
         assert!(builder.steering.is_none());
         assert_eq!(builder.shard_runtime, ShardRuntime::ThreadPerCore);
         assert!(matches!(
