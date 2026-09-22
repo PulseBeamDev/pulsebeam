@@ -872,13 +872,14 @@ impl ControllerActor {
         let address = self.core.reserve_transport(shard, now);
         let creds = IceUfrag::new(self.cluster_id, self.node_id, address.route, address.epoch)
             .into_ice_creds();
-        let (rtc, answer, resources) = match self.negotiator.create_answer(offer, creds) {
-            Ok(value) => value,
-            Err(error) => {
-                self.core.release_transport(address, now);
-                return Err(error.into());
-            }
-        };
+        let (rtc, answer, resources) =
+            match self.negotiator.create_answer(offer, creds, state.profile) {
+                Ok(value) => value,
+                Err(error) => {
+                    self.core.release_transport(address, now);
+                    return Err(error.into());
+                }
+            };
         let connection_id = state.connection_id;
         let authorization = state.authorization;
         let profile = state.profile;

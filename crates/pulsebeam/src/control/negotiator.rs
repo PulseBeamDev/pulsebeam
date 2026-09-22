@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use super::controller::ConnectionProfile;
 use crate::participant::downstream::INITIAL_BANDWIDTH;
 use pulsebeam_proto::rtp_extensions;
 use str0m::{
@@ -115,6 +116,7 @@ impl Negotiator {
         &mut self,
         offer: SdpOffer,
         creds: IceCreds,
+        profile: ConnectionProfile,
     ) -> Result<(Rtc, SdpAnswer, NegotiatedResources), NegotiatorError> {
         tracing::debug!("{offer}");
         let mut rtc_config = RtcConfig::new()
@@ -168,7 +170,7 @@ impl Negotiator {
             .sdp_api()
             .accept_offer(offer)
             .map_err(NegotiatorError::Rtc)?;
-        Self::enforce_media_lines(&answer)?;
+        Self::enforce_media_lines(&answer, profile)?;
         let resources = Self::negotiated_resources(&answer)?;
 
         tracing::debug!("{answer}");
@@ -209,12 +211,27 @@ impl Negotiator {
         Ok(NegotiatedResources { media })
     }
 
-    fn enforce_media_lines(answer: &SdpAnswer) -> Result<(), NegotiatorError> {
+    fn enforce_media_lines(
+        answer: &SdpAnswer,
+        profile: ConnectionProfile,
+    ) -> Result<(), NegotiatorError> {
         let mut video_recv_count = 0usize;
         let mut video_send_count = 0usize;
         let mut audio_recv_count = 0usize;
         let mut audio_send_count = 0usize;
         let mut data_channel_count = 0usize;
+
+        let (recv_video_limit, recv_audio_limit, send_video_limit, send_audio_limit) =
+            if profile == ConnectionProfile::Native {
+                (32, 32, 32, 32)
+            } else {
+                (
+                    MAX_RECV_VIDEO_SLOTS,
+                    MAX_RECV_AUDIO_SLOTS,
+                    MAX_SEND_VIDEO_SLOTS,
+                    MAX_SEND_AUDIO_SLOTS,
+                )
+            };
 
         for m in &answer.media_lines {
             if m.disabled {
@@ -231,41 +248,41 @@ impl Negotiator {
             match (media_type, dir) {
                 (MediaType::Video, Direction::RecvOnly) => {
                     video_recv_count = video_recv_count.saturating_add(1);
-                    if video_recv_count > MAX_RECV_VIDEO_SLOTS {
+                    if video_recv_count > recv_video_limit {
                         return Err(NegotiatorError::SlotsLimit(
                             MediaType::Video,
                             Direction::SendOnly,
-                            MAX_RECV_VIDEO_SLOTS,
+                            recv_video_limit,
                         ));
                     }
                 }
                 (MediaType::Video, Direction::SendOnly) => {
                     video_send_count = video_send_count.saturating_add(1);
-                    if video_send_count > MAX_SEND_VIDEO_SLOTS {
+                    if video_send_count > send_video_limit {
                         return Err(NegotiatorError::SlotsLimit(
                             MediaType::Video,
                             Direction::RecvOnly,
-                            MAX_SEND_VIDEO_SLOTS,
+                            send_video_limit,
                         ));
                     }
                 }
                 (MediaType::Audio, Direction::RecvOnly) => {
                     audio_recv_count = audio_recv_count.saturating_add(1);
-                    if audio_recv_count > MAX_RECV_AUDIO_SLOTS {
+                    if audio_recv_count > recv_audio_limit {
                         return Err(NegotiatorError::SlotsLimit(
                             MediaType::Audio,
                             Direction::SendOnly,
-                            MAX_RECV_AUDIO_SLOTS,
+                            recv_audio_limit,
                         ));
                     }
                 }
                 (MediaType::Audio, Direction::SendOnly) => {
                     audio_send_count = audio_send_count.saturating_add(1);
-                    if audio_send_count > MAX_SEND_AUDIO_SLOTS {
+                    if audio_send_count > send_audio_limit {
                         return Err(NegotiatorError::SlotsLimit(
                             MediaType::Audio,
                             Direction::RecvOnly,
-                            MAX_SEND_AUDIO_SLOTS,
+                            send_audio_limit,
                         ));
                     }
                 }
@@ -343,7 +360,11 @@ mod tests {
     fn answer_sdp() -> String {
         let mut negotiator = Negotiator::new(Vec::new());
         let (_, answer, _) = negotiator
-            .create_answer(chrome_like_offer(Direction::SendOnly), IceCreds::new())
+            .create_answer(
+                chrome_like_offer(Direction::SendOnly),
+                IceCreds::new(),
+                ConnectionProfile::Native,
+            )
             .unwrap();
         answer.to_sdp_string()
     }
@@ -356,7 +377,11 @@ mod tests {
         ] {
             let mut negotiator = Negotiator::new(Vec::new());
             let (_, answer, _) = negotiator
-                .create_answer(chrome_like_offer(offer_direction), IceCreds::new())
+                .create_answer(
+                    chrome_like_offer(offer_direction),
+                    IceCreds::new(),
+                    ConnectionProfile::Native,
+                )
                 .unwrap();
             assert!(answer.to_sdp_string().contains(answer_direction));
         }
@@ -371,7 +396,9 @@ mod tests {
         change.add_media(MediaKind::Video, Direction::RecvOnly, None, None, None);
         let offer = change.apply().unwrap().0;
         let mut negotiator = Negotiator::new(Vec::new());
-        let (_, _, resources) = negotiator.create_answer(offer, IceCreds::new()).unwrap();
+        let (_, _, resources) = negotiator
+            .create_answer(offer, IceCreds::new(), ConnectionProfile::Native)
+            .unwrap();
 
         assert_eq!(
             resources
@@ -400,7 +427,40 @@ mod tests {
             .replacen("m=video 9", "m=video 0", 1);
         let offer = SdpOffer::from_sdp_string(&offer).unwrap();
         let mut negotiator = Negotiator::new(Vec::new());
-        assert!(negotiator.create_answer(offer, IceCreds::new()).is_ok());
+        assert!(
+            negotiator
+                .create_answer(offer, IceCreds::new(), ConnectionProfile::Native)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn native_accepts_default_topology_and_rejects_independent_caps() {
+        fn offer(video_receivers: usize) -> SdpOffer {
+            let mut rtc = RtcConfig::new().build(std::time::Instant::now());
+            let mut change = rtc.sdp_api();
+            for _ in 0..2 {
+                change.add_media(MediaKind::Video, Direction::SendOnly, None, None, None);
+                change.add_media(MediaKind::Audio, Direction::SendOnly, None, None, None);
+            }
+            for _ in 0..video_receivers {
+                change.add_media(MediaKind::Video, Direction::RecvOnly, None, None, None);
+            }
+            for _ in 0..8 {
+                change.add_media(MediaKind::Audio, Direction::RecvOnly, None, None, None);
+            }
+            change.apply().unwrap().0
+        }
+        let mut negotiator = Negotiator::new(Vec::new());
+        let (_, _, resources) = negotiator
+            .create_answer(offer(16), IceCreds::new(), ConnectionProfile::Native)
+            .unwrap();
+        assert_eq!(resources.as_slice().len(), 28);
+        assert!(
+            negotiator
+                .create_answer(offer(33), IceCreds::new(), ConnectionProfile::Native)
+                .is_err()
+        );
     }
 
     #[test]

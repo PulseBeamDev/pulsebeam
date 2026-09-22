@@ -6,8 +6,8 @@ use prost::Message;
 
 use crate::signaling_v1::{ClientMessage, ServerMessage};
 
-pub const MAX_MESSAGE_SIZE: usize = 256 * 1024;
-const SIZE_PREFIX_LEN: usize = size_of::<u32>();
+pub const MAX_MESSAGE_SIZE: usize = 32_768;
+pub const MAX_COMPRESSED_SIZE: usize = 32_912;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EncodeError {
@@ -19,10 +19,8 @@ pub enum EncodeError {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DecodeError {
     CompressedTooLarge,
-    TruncatedPrefix,
-    AdvertisedSizeTooLarge,
     TruncatedBlock,
-    OutputSizeMismatch,
+    OutputTooLarge,
     InvalidBlock,
     InvalidProtobuf,
     MissingPayload,
@@ -64,56 +62,21 @@ fn encode<M: Message>(message: &M) -> Result<Vec<u8>, EncodeError> {
     }
 
     let protobuf = message.encode_to_vec();
-    let output_capacity = SIZE_PREFIX_LEN
-        .checked_add(get_maximum_output_size(protobuf.len()))
-        .ok_or(EncodeError::CompressedTooLarge)?
-        .min(MAX_MESSAGE_SIZE);
-    let mut output = vec![0; output_capacity];
-    let prefix = u32::try_from(protobuf.len())
-        .map_err(|_| EncodeError::UncompressedTooLarge)?
-        .to_le_bytes();
-    output
-        .get_mut(..SIZE_PREFIX_LEN)
-        .ok_or(EncodeError::CompressedTooLarge)?
-        .copy_from_slice(&prefix);
-
-    let compressed = output
-        .get_mut(SIZE_PREFIX_LEN..)
-        .ok_or(EncodeError::CompressedTooLarge)?;
+    let mut output = vec![0; get_maximum_output_size(protobuf.len()).min(MAX_COMPRESSED_SIZE)];
     let compressed_len =
-        compress_into(&protobuf, compressed).map_err(|_| EncodeError::CompressedTooLarge)?;
-    let output_len = SIZE_PREFIX_LEN
-        .checked_add(compressed_len)
-        .ok_or(EncodeError::CompressedTooLarge)?;
-    output.truncate(output_len);
+        compress_into(&protobuf, &mut output).map_err(|_| EncodeError::CompressedTooLarge)?;
+    output.truncate(compressed_len);
     Ok(output)
 }
 
 fn decode<M: Message + Default>(input: &[u8]) -> Result<M, DecodeError> {
-    if input.len() > MAX_MESSAGE_SIZE {
+    if input.len() > MAX_COMPRESSED_SIZE {
         return Err(DecodeError::CompressedTooLarge);
     }
 
-    let prefix: [u8; SIZE_PREFIX_LEN] = input
-        .get(..SIZE_PREFIX_LEN)
-        .ok_or(DecodeError::TruncatedPrefix)?
-        .try_into()
-        .map_err(|_| DecodeError::TruncatedPrefix)?;
-    let advertised_len = usize::try_from(u32::from_le_bytes(prefix))
-        .map_err(|_| DecodeError::AdvertisedSizeTooLarge)?;
-    if advertised_len > MAX_MESSAGE_SIZE {
-        return Err(DecodeError::AdvertisedSizeTooLarge);
-    }
-
-    let block = input
-        .get(SIZE_PREFIX_LEN..)
-        .ok_or(DecodeError::TruncatedPrefix)?;
-    let mut protobuf = vec![0; advertised_len];
-    let actual_len = decompress_into(block, &mut protobuf).map_err(map_decompress_error)?;
-    if actual_len != advertised_len {
-        return Err(DecodeError::OutputSizeMismatch);
-    }
-
+    let mut protobuf = vec![0; MAX_MESSAGE_SIZE];
+    let actual_len = decompress_into(input, &mut protobuf).map_err(map_decompress_error)?;
+    protobuf.truncate(actual_len);
     M::decode(protobuf.as_slice()).map_err(|_| DecodeError::InvalidProtobuf)
 }
 
@@ -122,7 +85,7 @@ fn map_decompress_error(error: DecompressError) -> DecodeError {
         DecompressError::ExpectedAnotherByte | DecompressError::LiteralOutOfBounds => {
             DecodeError::TruncatedBlock
         }
-        DecompressError::OutputTooSmall { .. } => DecodeError::OutputSizeMismatch,
+        DecompressError::OutputTooSmall { .. } => DecodeError::OutputTooLarge,
         _ => DecodeError::InvalidBlock,
     }
 }
@@ -137,7 +100,7 @@ fn map_decompress_error(error: DecompressError) -> DecodeError {
 mod tests {
     use alloc::string::String;
     use alloc::vec;
-    use lz4_flex::block::compress_prepend_size;
+    use lz4_flex::block::{compress, decompress_into};
 
     use super::*;
     use crate::signaling_v1::{
@@ -194,40 +157,34 @@ mod tests {
 
         assert_eq!(
             encode_client(&message),
-            Ok(vec![5, 0, 0, 0, 0x50, 0x12, 0x03, 0x0a, 0x01, b'a'])
+            Ok(vec![0x50, 0x12, 0x03, 0x0a, 0x01, b'a'])
         );
     }
 
     #[test]
-    fn rejects_truncated_prefix_and_block() {
-        assert_eq!(decode_client(&[0, 0, 0]), Err(DecodeError::TruncatedPrefix));
-
-        let mut wire = encode_client(&empty_intent()).expect("client message fits");
-        wire.pop();
-        assert_eq!(decode_client(&wire), Err(DecodeError::TruncatedBlock));
-    }
-
-    #[test]
-    fn rejects_false_output_size_and_invalid_block() {
-        let mut wire = encode_client(&empty_intent()).expect("client message fits");
-        let advertised = u32::from_le_bytes(wire.get(..4).unwrap().try_into().unwrap());
-        wire.get_mut(..4)
-            .unwrap()
-            .copy_from_slice(&advertised.saturating_add(1).to_le_bytes());
-        assert_eq!(decode_client(&wire), Err(DecodeError::OutputSizeMismatch));
-
-        let invalid = [4, 0, 0, 0, 0, 0, 0];
-        assert_eq!(decode_client(&invalid), Err(DecodeError::InvalidBlock));
+    fn raw_block_matches_independent_decoder_and_rejects_truncation() {
+        let wire = encode_client(&empty_intent()).expect("client message fits");
+        let mut output = vec![0; MAX_MESSAGE_SIZE];
+        let decoded = decompress_into(&wire, &mut output).expect("independent decoder");
+        assert_eq!(
+            ClientMessage::decode(&output[..decoded]),
+            Ok(empty_intent())
+        );
+        assert_eq!(
+            decode_client(&wire[..wire.len() - 1]),
+            Err(DecodeError::TruncatedBlock)
+        );
+        assert_eq!(decode_client(&[0, 0, 0]), Err(DecodeError::InvalidBlock));
     }
 
     #[test]
     fn rejects_invalid_protobuf_and_missing_payload() {
         assert_eq!(
-            decode_client(&compress_prepend_size(&[0xff])),
+            decode_client(&compress(&[0xff])),
             Err(DecodeError::InvalidProtobuf)
         );
         assert_eq!(
-            decode_client(&compress_prepend_size(&[])),
+            decode_client(&compress(&[])),
             Err(DecodeError::MissingPayload)
         );
         assert_eq!(
@@ -243,16 +200,13 @@ mod tests {
     #[test]
     fn enforces_decode_limits_before_decompression() {
         assert_eq!(
-            decode_client(&vec![0; MAX_MESSAGE_SIZE + 1]),
+            decode_client(&vec![0; MAX_COMPRESSED_SIZE + 1]),
             Err(DecodeError::CompressedTooLarge)
         );
 
-        let advertised = u32::try_from(MAX_MESSAGE_SIZE + 1)
-            .expect("protocol limit fits u32")
-            .to_le_bytes();
         assert_eq!(
-            decode_server(&advertised),
-            Err(DecodeError::AdvertisedSizeTooLarge)
+            decode_server(&compress(&vec![0; MAX_MESSAGE_SIZE + 1])),
+            Err(DecodeError::OutputTooLarge)
         );
     }
 
