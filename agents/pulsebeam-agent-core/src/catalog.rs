@@ -55,7 +55,7 @@ pub enum CatalogError {
 
 impl Catalog {
     pub fn from_server(
-        value: signaling_v1::Catalog,
+        value: signaling_v1::CatalogSnapshot,
         recipient: &ParticipantId,
     ) -> Result<Self, CatalogError> {
         let mut participants = BTreeMap::new();
@@ -193,7 +193,7 @@ mod tests {
     #[test]
     fn resolves_opaque_ids_by_external_identity_kind_and_label() {
         let catalog = Catalog::from_server(
-            signaling_v1::Catalog {
+            signaling_v1::CatalogSnapshot {
                 participants: vec![participant("opaque/alice", "alice")],
                 tracks: vec![
                     track(
@@ -240,7 +240,7 @@ mod tests {
 
     #[test]
     fn comparison_ignores_wire_order() {
-        let first = signaling_v1::Catalog {
+        let first = signaling_v1::CatalogSnapshot {
             participants: vec![participant("p1", "one"), participant("p2", "two")],
             tracks: vec![
                 track("t1", "p1", signaling_v1::TrackKind::Audio, "mic"),
@@ -259,7 +259,7 @@ mod tests {
 
     #[test]
     fn malformed_or_ambiguous_catalogs_reject_atomically() {
-        let ambiguous = signaling_v1::Catalog {
+        let ambiguous = signaling_v1::CatalogSnapshot {
             participants: vec![participant("p1", "alice")],
             tracks: vec![
                 track("t1", "p1", signaling_v1::TrackKind::Video, "camera"),
@@ -271,7 +271,7 @@ mod tests {
             Err(CatalogError::AmbiguousSelector)
         );
 
-        let unknown = signaling_v1::Catalog {
+        let unknown = signaling_v1::CatalogSnapshot {
             participants: Vec::new(),
             tracks: vec![track(
                 "t1",
@@ -288,7 +288,7 @@ mod tests {
 
     #[test]
     fn self_tracks_and_duplicate_external_identities_reject() {
-        let self_track = signaling_v1::Catalog {
+        let self_track = signaling_v1::CatalogSnapshot {
             participants: vec![participant("self", "me")],
             tracks: vec![track("mine", "self", signaling_v1::TrackKind::Audio, "mic")],
         };
@@ -297,7 +297,7 @@ mod tests {
             Err(CatalogError::SelfTrack(_))
         ));
 
-        let duplicate_external = signaling_v1::Catalog {
+        let duplicate_external = signaling_v1::CatalogSnapshot {
             participants: vec![participant("p1", "alice"), participant("p2", "alice")],
             tracks: Vec::new(),
         };
