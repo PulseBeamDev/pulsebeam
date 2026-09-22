@@ -296,6 +296,7 @@ impl MediaEgress {
         path_change: Option<(u64, bool)>,
         feedback: &[FeedbackSample],
         feedback_hold: Duration,
+        fresh_network_feedback: bool,
         bytes_in_flight: u64,
     ) -> bool {
         if let Some((epoch, available)) = path_change {
@@ -308,19 +309,6 @@ impl MediaEgress {
             .map(|sender| sender.policy.desired_bitrate.as_bps())
             .sum();
         let offered = if self.queue.is_empty() { 0 } else { desired };
-        let points = self
-            .senders
-            .iter()
-            .filter(|sender| sender.policy.desired_bitrate.as_bps() > 0)
-            .map(|sender| {
-                LatencyGovernor::operating_point(
-                    playout_max_ticks(sender.policy),
-                    sender.policy.desired_bitrate.as_bps(),
-                )
-            })
-            .collect::<Vec<_>>();
-        let queue_ceiling = LatencyGovernor::strictest_queue_ceiling(points.iter())
-            .unwrap_or(Duration::from_millis(15));
         let now = at
             .monotonic
             .saturating_duration_since(self.controller_origin);
@@ -331,13 +319,13 @@ impl MediaEgress {
                 path_available: self.path_available,
                 feedback,
                 feedback_hold,
+                fresh_network_feedback,
                 bytes_in_flight,
                 paced_queue_bytes: self.queued_transport_bytes as u64,
                 offered_media_rate: offered,
                 admitted_media_rate: offered,
                 desired_media_rate: desired,
                 window_or_pacer_blocked: !self.pacer.eligible(at.monotonic),
-                queue_delay_ceiling: queue_ceiling,
                 ecn: EcnValidation::default(),
             },
         );
@@ -1387,7 +1375,7 @@ mod tests {
             policy,
             now,
         );
-        owner.update_controller(at, Some((1, true)), &[], Duration::ZERO, 0);
+        owner.update_controller(at, Some((1, true)), &[], Duration::ZERO, false, 0);
         owner
             .envelope
             .as_mut()
