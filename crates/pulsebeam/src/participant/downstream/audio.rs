@@ -5,7 +5,6 @@ use str0m::media::{Mid, Pt};
 use str0m::rtp::Ssrc;
 use tokio::time::Instant;
 
-use crate::control::MAX_SEND_AUDIO_SLOTS;
 use crate::entity::{AudioOrigin, TrackId};
 use crate::log::{LogCtx, plog_debug, plog_warn};
 use crate::participant::downstream::SlotConfig;
@@ -23,7 +22,7 @@ use std::ops::{Deref, DerefMut};
 /// see `tests::room_isolation::audio_selection_does_not_cross_rooms_test`. A listener only ever
 /// ranks the streams forwarded to it, which are its own room's, so scoping is a property here
 /// rather than a check.
-pub const SELECTOR_SLOTS: usize = MAX_SEND_AUDIO_SLOTS;
+pub const SELECTOR_SLOTS: usize = 32;
 
 /// A slot is dead if no packet has arrived within this window.
 const DEAD_TIMEOUT: Duration = Duration::from_millis(2000);
@@ -474,6 +473,19 @@ mod tests {
 
     fn heard_origins(alloc: &AudioAllocator) -> Vec<AudioOrigin> {
         alloc.assignments().into_iter().map(|h| h.origin).collect()
+    }
+
+    #[test]
+    fn provisions_every_native_audio_receiver() {
+        let mut alloc = AudioAllocator::new(test_ctx(), false);
+        for index in 0..SELECTOR_SLOTS {
+            let mid = format!("a{index}");
+            let mut config = slot_config("a0", index as u32);
+            config.mid = Mid::from(mid.as_str());
+            alloc.add_slot(config);
+        }
+        assert_eq!(alloc.slots.iter().flatten().count(), 32);
+        assert!(alloc.has_slot(Mid::from("a31")));
     }
 
     #[test]
