@@ -745,11 +745,17 @@ mod tests {
         );
         assert_eq!(
             hundredths((3_000, 500)),
-            (MediaTime::from_hundredths(200), MediaTime::from_hundredths(200))
+            (
+                MediaTime::from_hundredths(200),
+                MediaTime::from_hundredths(200)
+            )
         );
         assert_eq!(
             hundredths((500, 3_000)),
-            (MediaTime::from_hundredths(50), MediaTime::from_hundredths(200))
+            (
+                MediaTime::from_hundredths(50),
+                MediaTime::from_hundredths(200)
+            )
         );
         assert_eq!(
             hundredths((14, 15)),
