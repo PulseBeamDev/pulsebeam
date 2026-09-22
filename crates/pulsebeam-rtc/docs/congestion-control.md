@@ -51,8 +51,9 @@ PulseBeam intentionally adds or changes only these behaviors:
 
 1. Browser transport-wide feedback is normalized into the draft's packet-feedback
    model. RFC 8888 is an alternative normalized input.
-2. A private latency governor supplies an upper ceiling on SCReAM's native
-   queue-delay target. It can only make the controller more latency-conservative.
+2. A private latency governor acts only outside the SCReAM core: it governs media
+   usefulness, admission, allocation, retransmission, probing, and scheduling. It MUST NOT
+   modify SCReAM's queue-delay target, congestion window, gains, or pacing equations.
 3. A weighted max-min allocator divides governed RTP media-payload capacity among
    stable outbound senders. The pinned draft does not define this SFU layer.
 4. A deadline-aware transport scheduler combines per-sender service, frame
@@ -77,7 +78,7 @@ being hidden as tuning.
 | Topic | Decision | Alternatives considered | Why this direction |
 | --- | --- | --- | --- |
 | Normative controller | Implement pinned SCReAM v2 revision `01` as the core | libwebrtc normative; Ericsson normative; custom controller inspired by SCReAM | Gives one reviewable algorithm baseline. Other implementations are comparison evidence, not moving production semantics. |
-| PulseBeam influence on SCReAM | Only cap the native queue-delay target: `effective = min(native, policy_ceiling)` | Replace SCReAM qdelay logic; mutate gains/windows from playout policy; never influence SCReAM | Preserves SCReAM self-containment while allowing the product to choose lower latency than its coexistence logic might otherwise tolerate. |
+| PulseBeam influence on SCReAM | Use only controls permitted by the pinned draft, principally the application maximum target bitrate; keep playout/deadline policy outside the controller | Mutate queue targets, gains, windows, or pacing from product policy | Keeps the SCReAM core faithful and independently testable while PulseBeam governs what media it offers and schedules. |
 | Controller scope | One aggregate RTP controller per connection | Per-sender congestion controllers plus coupling | All bundled RTP shares one bottleneck; sender priority should divide capacity, not manufacture independent capacity estimates. |
 | Feedback | TWCC baseline; RFC 8888 normalized alternative | REMB; fixed-rate fallback; simultaneous TWCC + RFC 8888 | Packet-level arrival/loss data fits SCReAM. One selected mode avoids conflicting acknowledgment domains. |
 | RFC 8888 accounting | Maintain acknowledgment progression per SSRC | Invent one aggregate RTP sequence cursor | RFC 8888 reports RTP sequence progression per SSRC; aggregation would mis-acknowledge packets. |
@@ -88,7 +89,7 @@ being hidden as tuning.
 | Rate units | SFU-facing allocations use media payload; pacer/BIF use transport bytes | One generic bitrate/byte unit | Keeps allocations directly comparable to codec/layer rates while congestion accounting includes observable transport overhead. |
 | SCTP | Keep SCTP congestion control; reserve/coordinate its service outside SCReAM | Count SCTP as SCReAM BIF; feed SACK into a new coupled controller | TWCC/RFC 8888 does not acknowledge SCTP. V1 avoids inventing a second research-grade coupled controller. |
 | Probing | RTP padding on negotiated media/RTX SSRC | Synthetic SSRC zero; no active probing | Matches normal RTP sender identity and enables pre-media/application-limited capacity observations without a special source. |
-| Application-limited behavior | Freeze unsupported growth, decay confidence, demand-aware bounded probes | Collapse estimate to media rate; grow without observations | Separates offered media rate from path capacity and avoids both needless collapse and evidence-free optimism. |
+| Application-limited behavior | Keep the draft-defined bytes-in-flight growth bound authoritative; decay PulseBeam confidence and use demand-aware bounded probes | Add a PulseBeam-specific ref_wnd freeze; collapse estimate to media rate | Keeps product policy outside the SCReAM core while low offered load naturally limits growth through the draft's bytes-in-flight state. |
 | ECN/L4S | Optional only with validated RFC 8888 ECN | Require L4S/ECN; force-enable from configuration | Baseline must work on ordinary Internet paths; inconsistent/bleached ECN must not compromise control. |
 | Frame scheduling | Prefer whole unstarted-frame drops; started frame is not guaranteed completion | Packet-only FIFO; unbounded commitment once first packet sends | Minimizes decoder damage while preserving bounded queues and congestion safety. |
 | Constants | Freeze `CongestionProfileV1`; changes require profile/doc evidence | Leave tuning qualitative or implementation-defined | Prevents implementation agents from silently choosing controller semantics and makes deterministic comparison meaningful. |
@@ -133,9 +134,10 @@ sender policy + immutable packet global_media_at + frame metadata
                               |
                 per-sender operating points
                               |
-                              +------ strict queue-target ceiling -----+
-                              |                                         |
-                              v                                         v
+                              v
+                 external demand aggregation
+                              |
+                              v
 packet feedback ------> self-contained SCReAM v2 core ----------> safe RTP envelope
                               |                                         |
                               +----------------+------------------------+
@@ -386,7 +388,6 @@ The core consumes:
 - selected-path changes and network availability;
 - aggregate offered/admitted RTP media-payload rate;
 - aggregate SFU desired media-payload rate;
-- the private PulseBeam queue-delay ceiling.
 
 Per-sender priority, frame IDs, source selection, SCTP sequence/SACK state, and
 raw playout ranges are not SCReAM inputs.
@@ -431,7 +432,7 @@ eligible RTP packet is held back by pacing or the send window.
 
 While application-limited:
 
-- unsupported reference-window growth stops;
+- SCReAM's draft-defined bytes-in-flight growth bound remains authoritative; PulseBeam injects no separate application-limited freeze into the core;
 - sparse delay/RTT samples cannot rapidly move the baseline;
 - the last credible rate is retained while confidence decays with a `5 s`
   half-life;
@@ -443,29 +444,22 @@ Low-complexity VBR video, audio-only periods, paused video, and all-media-paused
 periods can be application-limited. Media rate and available network rate are
 never equated.
 
-### Native and effective queue-delay targets
+### Queue-delay target ownership
 
-SCReAM computes its native queue-delay target using the pinned draft, including
-its competing-flow adaptation. Revision `01` begins from the draft's recommended
-`60 ms` target and can natively relax as far as `400 ms` where the algorithm
-permits.
+SCReAM computes its queue-delay target entirely inside the pinned draft core,
+including competing-flow adaptation. Revision `01` begins from the draft's
+recommended `60 ms` target and can natively relax as far as `400 ms` where the
+algorithm permits.
 
-PulseBeam supplies one upper ceiling:
+PulseBeam does **not** cap, replace, or otherwise mutate that target. Playout and
+deadline policy is enforced outside the congestion controller by deciding which
+media remains useful, what media demand is offered, how safe controller capacity
+is allocated, and what queued work is scheduled or dropped. The SCReAM core sees
+only draft-defined controller inputs such as packet feedback, path ECN mode,
+bytes in flight, and the application maximum target bitrate.
 
-```text
-effective_queue_delay_target =
-    min(native_queue_delay_target,
-        strictest_active_sender_queue_delay_ceiling)
-```
-
-The ceiling cannot increase the native target, reference window, send window,
-pacing rate, or bitrate. It is the only latency-governor input to the SCReAM core.
-All native gains, loss response, ECN response, baseline handling, and competing-
-flow logic remain self-contained.
-
-This deliberately trades some coexistence aggressiveness against loss-based bulk
-traffic for PulseBeam's interactive latency bound. That product decision is an
-explicit deviation, not hidden “SCReAM tuning.”
+`effective_queue_delay_target` remains in private statistics for compatibility in
+version one, but equals the SCReAM-native target. It is not a second policy input.
 
 ### ECN/L4S
 
@@ -560,8 +554,6 @@ not permission for implementation choice.
 
 | Field | Version-one value |
 | --- | ---: |
-| Most urgent queue-delay ceiling | `15 ms` |
-| Quality-saturated queue-delay ceiling | `60 ms` |
 | Urgent playout-maximum knee | `75 ms` |
 | Quality saturation playout maximum | `500 ms` |
 | Urgent allocation utilization | `0.80` |
@@ -591,7 +583,6 @@ private stable operating point. It does not continuously retune SCReAM per packe
 
 ```rust
 struct SenderOperatingPoint {
-    queue_delay_ceiling: Duration,
     allocation_utilization: Ratio,
     pacer_horizon: Duration,
     new_frame_horizon: Duration,
@@ -624,7 +615,6 @@ x = clamp((playout_max - 75 ms) / (500 ms - 75 ms), 0, 1)
 Then:
 
 ```text
-queue_delay_ceiling  = lerp(15 ms, 60 ms, x)
 allocation_utilization = lerp(0.80, 0.95, x)
 pacer_horizon        = lerp(15 ms, 80 ms, x)
 rtx_extra_allowance  = lerp(0 ms, 50 ms, x)
@@ -646,9 +636,9 @@ controls recovery classification and stability:
 - a fixed nonzero range requests stable playback and uses the slower upward
   relaxation in the profile.
 
-The strictest `queue_delay_ceiling` and `probe_queue_impact` among active senders
-become the path values. Utilization, demand, frame/RTX usefulness, and service
-balance remain per sender.
+The strictest `probe_queue_impact` among active senders becomes the path probe
+limit. Utilization, demand, frame/RTX usefulness, and service balance remain per
+sender.
 
 ### Receiver-specific deadline derivation
 
@@ -699,7 +689,7 @@ the server-anchored timeline and is reported separately.
 - drop audio older than `100 ms` and video older than `150 ms` at admission;
 - retransmit only when immediate prediction says it can arrive before newer
   replacement media and within the same age limit;
-- use the `15 ms` queue-delay ceiling and `0.80` allocation utilization;
+- use `0.80` allocation utilization and the urgent pacer horizon;
 - never wait to fill a smoothing interval.
 
 ### Dynamic policy changes
@@ -711,9 +701,7 @@ Tightening takes effect in the same `Command::SetSenderPolicy` call:
   `global_media_at`;
 - not-yet-started stale video frames are removed whole;
 - obsolete RTX is removed;
-- governed demand, pacer horizon, and allocation may fall immediately;
-- the path queue-delay ceiling tightens immediately when this sender becomes the
-  strictest active sender.
+- governed demand, pacer horizon, probe impact, and allocation may fall immediately.
 
 Relaxing follows the profile's per-RTT damping. It cannot release a burst, jump
 the SCReAM reference window, trust a stale estimate, or reconstruct dropped
@@ -724,7 +712,6 @@ media.
 For identical network, packet, and other-sender state, reducing one sender's
 playout maximum MUST NOT:
 
-- increase its or the path queue-delay ceiling;
 - increase its allocation utilization, governed demand, pacer horizon, or RTX
   allowance;
 - admit an older frame rejected by the looser policy;
@@ -732,7 +719,7 @@ playout maximum MUST NOT:
 - increase SCReAM's native target or reference window.
 
 Increasing a maximum may relax only that sender's private limits and only through
-damping. It cannot relax a path ceiling still required by another active sender.
+damping. It cannot alter SCReAM's native congestion state.
 
 ## Global media time and frame admission
 
@@ -1090,9 +1077,9 @@ comparison, the pinned live-browser matrix, and the root workspace gates.
 
 - Reducing a sender's playout maximum satisfies every monotonicity property across
   all `0..=4095` ticks.
-- Tightening one active sender cannot relax a shared path ceiling; making it
-  inactive permits the next strictest active sender to control it.
-- `effective_queue_delay_target <= native_queue_delay_target` always.
+- Tightening one active sender cannot increase SCReAM's native queue-delay target,
+  reference window, or target bitrate.
+- `effective_queue_delay_target == native_queue_delay_target` always.
 - Weighted allocation is demand-capped, capacity-conserving, deterministic, and
   converges to configured ratios.
 - Priority or desired-rate changes never reset SCReAM, sent history, transport
@@ -1101,7 +1088,7 @@ comparison, the pinned live-browser matrix, and the root workspace gates.
   sent entry and is acknowledged once.
 - SCTP bytes never enter SCReAM sent history or RTP bytes-in-flight.
 - Payload and transport accounting round trips without double-counting overhead.
-- Feedback-stale and application-limited states cannot cause unsupported growth.
+- Feedback-stale timer polls cannot replay growth; under low offered load, SCReAM growth remains bounded by the draft-defined bytes-in-flight gate.
 - Unknown, duplicate, reordered, wrapped, and per-SSRC RFC 8888 feedback cannot
   corrupt rings or acknowledgment progression.
 - Paced queues, histories, dependency lists, and per-poll work remain within every
@@ -1140,9 +1127,9 @@ The corpus includes:
 For deterministic scenarios whose configured bottleneck and propagation model are
 known:
 
-- the internal effective queue target never exceeds the strictest active ceiling;
+- PulseBeam policy never mutates the SCReAM-native queue-delay target;
 - after convergence, controlled-bottleneck p99 queue delay is no more than the
-  effective target plus `10 ms`, except during a declared path step or probe;
+  native SCReAM target plus `10 ms`, except during a declared path step or probe;
 - a sustained equal-demand weighted allocation is within `10%` of its expected
   ratio after `5` smoothed RTTs;
 - probe overhead never exceeds the fixed rolling `5%` bound;

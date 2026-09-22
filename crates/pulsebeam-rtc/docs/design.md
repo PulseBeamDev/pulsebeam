@@ -933,8 +933,8 @@ probe clusters, and histories remain private.
 The fixed design is:
 
 - one connection-level SCReAM-v2-derived RTP controller;
-- one private PulseBeam latency governor that may only tighten the core's native
-  queue-delay target through an upper ceiling;
+- one private PulseBeam latency governor for admission, allocation, pacer horizons,
+  retransmission, and probing outside the SCReAM core;
 - one weighted max-min allocator over sender media-payload demand;
 - one transport-byte pacer and deadline-aware scheduler;
 - ordinary RTP padding on a negotiated media or RTX SSRC for pre-media and

@@ -16,19 +16,16 @@ pub(crate) struct ScenarioMetrics {
     pub(crate) admitted_percent: u64,
     pub(crate) p99_queue_micros: u64,
     pub(crate) effective_target_micros: u64,
-    pub(crate) probe_overhead_percent: u64,
     pub(crate) application_limited_at_millis: Option<u64>,
     pub(crate) stale_at_millis: Option<u64>,
     pub(crate) stale_recovered: bool,
     pub(crate) window_grew_while_stale: bool,
     pub(crate) baseline_resets: u64,
-    pub(crate) old_path_sample_used: bool,
     pub(crate) ecn_reduced_window: bool,
     pub(crate) l4s_disabled_on_bleach: bool,
     pub(crate) policer_detected: bool,
     pub(crate) fairness_percent: u64,
     pub(crate) maximum_native_target_micros: u64,
-    pub(crate) duplicate_status_consumptions: u64,
 }
 
 struct Packet {
@@ -146,6 +143,10 @@ impl Simulation {
                     received_at: self.now,
                     transport_bytes: packet.bytes,
                     received: packet.received,
+                    // Covered sequence-space gaps advance SCReAM's ACK edge too;
+                    // confirmed loss is a separate signal.
+                    newly_acked: true,
+                    lost: !packet.received,
                     receiver_arrival_micros: packet
                         .received
                         .then_some(packet.receiver_arrival_micros),
@@ -166,13 +167,13 @@ impl Simulation {
                 path_available: true,
                 feedback: &samples,
                 feedback_hold: Duration::ZERO,
+                fresh_network_feedback: !samples.is_empty(),
                 bytes_in_flight,
                 paced_queue_bytes: self.queue_bytes,
                 offered_media_rate: offered_bps,
                 admitted_media_rate: admitted_rate,
                 desired_media_rate: desired_bps,
                 window_or_pacer_blocked: false,
-                queue_delay_ceiling: Duration::from_millis(60),
                 ecn: validation,
             },
         );
@@ -198,19 +199,16 @@ impl Simulation {
                 .copied()
                 .unwrap_or(0),
             effective_target_micros: micros(self.output.effective_queue_delay_target),
-            probe_overhead_percent: 0,
             application_limited_at_millis: None,
             stale_at_millis: None,
             stale_recovered: false,
             window_grew_while_stale: false,
             baseline_resets: 0,
-            old_path_sample_used: false,
             ecn_reduced_window: false,
             l4s_disabled_on_bleach: false,
             policer_detected: self.output.policer_detected,
             fairness_percent: 50,
             maximum_native_target_micros: self.maximum_native_target,
-            duplicate_status_consumptions: 0,
         }
     }
 }
@@ -365,7 +363,6 @@ fn path_step() -> ScenarioMetrics {
     }
     let mut metrics = sim.metrics("RTT-path-step", 0x0705);
     metrics.baseline_resets = resets;
-    metrics.old_path_sample_used = false;
     metrics
 }
 
