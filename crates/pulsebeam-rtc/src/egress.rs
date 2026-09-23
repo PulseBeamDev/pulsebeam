@@ -1449,6 +1449,19 @@ mod tests {
         assert!(!egress.probe_budget_available(now + Duration::from_secs(1), 1_000));
         assert!(!egress.probe_budget_available(now + Duration::from_secs(4), 1_000));
         assert!(egress.probe_budget_available(now + Duration::from_secs(6), 3_000));
+        egress.record_rtp(now + Duration::from_secs(6), 3_000, true);
+        egress.update_controller(
+            TimePoint {
+                monotonic: now + Duration::from_secs(6),
+                global: GlobalMediaTime::from_micros(1),
+            },
+            Some((2, true)),
+            &[],
+            Duration::ZERO,
+            false,
+            0,
+        );
+        assert!(!egress.probe_budget_available(now + Duration::from_secs(6), 1));
     }
 
     #[test]

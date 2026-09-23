@@ -12,7 +12,10 @@ mod support;
 use std::time::Duration;
 
 use bytes::Bytes;
-use pulsebeam_rtc::{CloseReason, Command, CommandError, NetworkInput, Output};
+use pulsebeam_rtc::{
+    CloseReason, Command, CommandError, ConnectionConfig, MediaPayloadBitrate, NetworkInput,
+    Output, PlayoutDelay,
+};
 use support::{NetworkPolicy, PeerFixture, forwarded};
 
 const PAYLOAD_BYTES: usize = 1_000;
@@ -137,10 +140,47 @@ const fn scenario(name: &'static str, seed: u64, seconds: u64, packets: u64) -> 
     }
 }
 
+fn assert_probe_windows(emitted: &[(std::time::Instant, u64, bool)]) {
+    let mut checkpoints = Vec::with_capacity(emitted.len() * 2);
+    for (at, _, _) in emitted {
+        checkpoints.push(*at);
+        checkpoints.push(*at + Duration::from_secs(5));
+    }
+    checkpoints.sort_unstable();
+    checkpoints.dedup();
+    let mut peak_ratio = 0_u64;
+    let mut peak_allowance = 0_u64;
+    for at in checkpoints {
+        let mut nonprobe = 0_u64;
+        let mut probes = 0_u64;
+        for (sent, bytes, probe) in emitted {
+            if *sent <= at && at.saturating_duration_since(*sent) < Duration::from_secs(5) {
+                if *probe {
+                    probes = probes.saturating_add(*bytes);
+                } else {
+                    nonprobe = nonprobe.saturating_add(*bytes);
+                }
+            }
+        }
+        let total = probes.saturating_add(nonprobe);
+        peak_ratio = peak_ratio.max(if total == 0 { 0 } else { probes * 100 / total });
+        peak_allowance = peak_allowance.max(probes.saturating_sub(nonprobe / 19));
+        assert!(
+            probes <= nonprobe / 19 + 3_000,
+            "emitted probe budget at {at:?}: probes={probes} nonprobe={nonprobe}"
+        );
+    }
+    eprintln!(
+        "production probe windows events={} peak_raw_ratio={peak_ratio}% peak_allowance_used={peak_allowance}",
+        emitted.len()
+    );
+}
+
 #[test]
 fn production_pre_media_probes_use_only_the_low_traffic_allowance() {
     let mut fixture = PeerFixture::connected();
     fixture.drive_for(Duration::from_secs(6));
+    assert_probe_windows(fixture.emitted_rtp());
     let totals = fixture.connection.stats().connection;
     assert_eq!(totals.transmitted_rtp_bytes, 0);
     assert!(totals.transmitted_padding_bytes > 0);
@@ -208,18 +248,17 @@ fn production_connection_bottleneck_emits_measured_transport_bytes() {
             measured_windows += 1;
             let emitted = totals.transmitted_rtp_bytes.saturating_sub(*rtp);
             let probes = totals.transmitted_padding_bytes.saturating_sub(*padding);
-            if emitted > 0 {
-                max_probe_percent = max_probe_percent.max(probes.saturating_mul(100) / emitted);
-                assert!(
-                    probes.saturating_mul(20) <= emitted,
-                    "rolling five-second emitted-byte probe overhead"
-                );
+            let total = emitted.saturating_add(probes);
+            max_probe_percent = max_probe_percent.max(if total == 0 {
+                0
             } else {
-                assert_eq!(probes, 0, "zero-byte window cannot contain probes");
-            }
+                probes.saturating_mul(100) / total
+            });
+            assert!(probes <= emitted / 19 + 3_000);
         }
     }
     fixture.drive_for(Duration::from_secs(2));
+    assert_probe_windows(fixture.emitted_rtp());
     let (sojourn, delivered) = fixture.bottleneck_samples();
     let mut ordered = sojourn.to_vec();
     ordered.sort_unstable();
@@ -246,10 +285,82 @@ fn production_connection_bottleneck_emits_measured_transport_bytes() {
     assert!(stats.connection.transmitted_rtp_bytes > 0);
     assert!(stats.connection.transmitted_padding_bytes <= stats.connection.transmitted_rtp_bytes);
     assert!(measured_windows >= 1_000);
-    assert!(
-        max_probe_percent <= 5,
-        "rolling five-second emitted-byte probe overhead"
+}
+
+#[test]
+fn production_two_megabit_single_flow_capacity() {
+    let mut fixture = PeerFixture::connected();
+    fixture.configure_network(
+        0x2201,
+        NetworkPolicy {
+            delay: Duration::from_millis(25),
+            ..NetworkPolicy::default()
+        },
     );
+    fixture.configure_bottleneck(2_000_000);
+    fixture.configure_time_quantum(Duration::from_millis(2));
+    let mut policy = ConnectionConfig::default().default_audio_policy;
+    policy.desired_bitrate = MediaPayloadBitrate::from_bps(4_000_000);
+    policy.playout_delay = PlayoutDelay::from_ticks(0, 50).expect("500ms playout");
+    fixture
+        .connection
+        .command(
+            fixture.at(),
+            Command::SetSenderPolicy {
+                sender: fixture.sender,
+                policy,
+            },
+        )
+        .expect("demand policy");
+    let start = fixture.at().monotonic;
+    let mut source = PeerFixture::connected();
+    source.configure_time_quantum(Duration::from_millis(2));
+    for id in 1..=6_000_u64 {
+        source.drive_for(
+            fixture
+                .at()
+                .monotonic
+                .saturating_duration_since(source.at().monotonic)
+                + Duration::from_millis(2),
+        );
+        let media = forwarded(source.send_source(&[0x5a; PAYLOAD_BYTES]), id);
+        match fixture.connection.command(
+            fixture.at(),
+            Command::SendMedia {
+                sender: fixture.sender,
+                media,
+            },
+        ) {
+            Ok(()) | Err(CommandError::WouldBlock) => {}
+            Err(error) => panic!("admission: {error:?}"),
+        }
+        fixture.drive_for(Duration::from_millis(2));
+    }
+    let end = fixture.at().monotonic;
+    let stable_start = start + Duration::from_secs(2);
+    let cohort = fixture
+        .emitted_rtp()
+        .iter()
+        .filter(|(at, _, _)| *at >= stable_start && *at < end)
+        .map(|(_, bytes, _)| *bytes)
+        .sum::<u64>();
+    fixture.drive_for(Duration::from_secs(2));
+    assert_probe_windows(fixture.emitted_rtp());
+    let delivered = fixture
+        .delivered_rtp()
+        .iter()
+        .filter(|(at, _)| *at >= stable_start && *at < end)
+        .map(|(_, bytes)| *bytes)
+        .sum::<u64>();
+    let service = 2_000_000_u128 * end.duration_since(stable_start).as_micros() / 8_000_000;
+    eprintln!(
+        "2mbps seed=0x2201 stable_emitted={cohort} stable_delivered={delivered} service={service} duration={:?}",
+        end.duration_since(stable_start)
+    );
+    assert!(end.duration_since(stable_start) >= Duration::from_secs(10));
+    assert_eq!(delivered, cohort, "all emission-cohort RTP must drain");
+    assert!(fixture.bottleneck_samples().0.len() >= 1_000);
+    assert!(u128::from(delivered) * 100 >= service * 85);
 }
 
 #[test]

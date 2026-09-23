@@ -75,6 +75,7 @@ enum PendingPacket {
         destination: SocketAddr,
         payload: Vec<u8>,
         rtp_bytes: u64,
+        emitted_at: Instant,
     },
 }
 
@@ -107,6 +108,10 @@ struct DeterministicNetwork {
     queue_sojourn: Vec<Duration>,
     delivered_bytes: u64,
     last_committed_rtp_bytes: u64,
+    last_committed_padding_bytes: u64,
+    emitted_rtp: Vec<(Instant, u64, bool)>,
+    delivered_rtp: Vec<(Instant, u64)>,
+    time_quantum: Option<Duration>,
 }
 
 impl DeterministicNetwork {
@@ -333,6 +338,11 @@ impl PeerFixture {
         self.network.configure(seed, policy);
     }
 
+    pub fn configure_time_quantum(&mut self, quantum: Duration) {
+        assert!(!quantum.is_zero());
+        self.network.time_quantum = Some(quantum);
+    }
+
     pub fn configure_bottleneck(&mut self, bits_per_second: u64) {
         assert!(bits_per_second > 0);
         self.network.bottleneck_bps = Some(bits_per_second);
@@ -341,6 +351,14 @@ impl PeerFixture {
         self.network.delivered_bytes = 0;
         self.network.last_committed_rtp_bytes =
             self.connection.stats().connection.transmitted_rtp_bytes;
+    }
+
+    pub fn emitted_rtp(&self) -> &[(Instant, u64, bool)] {
+        &self.network.emitted_rtp
+    }
+
+    pub fn delivered_rtp(&self) -> &[(Instant, u64)] {
+        &self.network.delivered_rtp
     }
 
     pub fn bottleneck_samples(&self) -> (&[Duration], u64) {
@@ -497,11 +515,15 @@ impl PeerFixture {
                     destination,
                     payload,
                     rtp_bytes,
+                    emitted_at,
                     ..
                 } => {
                     if self.network.bottleneck_bps.is_some() {
                         self.network.delivered_bytes =
                             self.network.delivered_bytes.saturating_add(rtp_bytes);
+                        if rtp_bytes > 0 {
+                            self.network.delivered_rtp.push((emitted_at, rtp_bytes));
+                        }
                     }
                     let receive = Receive::new(protocol, source, destination, &payload)
                         .expect("peer classifies PulseBeam datagram");
@@ -617,10 +639,21 @@ impl PeerFixture {
                     } else {
                         self.now + self.network.policy.delay
                     };
-                    let committed_rtp = self.connection.stats().connection.transmitted_rtp_bytes;
+                    let stats = self.connection.stats().connection;
+                    let committed_rtp = stats.transmitted_rtp_bytes;
                     let rtp_bytes =
                         committed_rtp.saturating_sub(self.network.last_committed_rtp_bytes);
                     self.network.last_committed_rtp_bytes = committed_rtp;
+                    let padding = stats
+                        .transmitted_padding_bytes
+                        .saturating_sub(self.network.last_committed_padding_bytes);
+                    self.network.last_committed_padding_bytes = stats.transmitted_padding_bytes;
+                    if rtp_bytes != 0 {
+                        self.network.emitted_rtp.push((self.now, rtp_bytes, false));
+                    }
+                    if padding != 0 {
+                        self.network.emitted_rtp.push((self.now, padding, true));
+                    }
                     self.network.enqueue(PendingPacket::Peer {
                         due,
                         protocol,
@@ -628,6 +661,7 @@ impl PeerFixture {
                         destination,
                         payload: payload.to_vec(),
                         rtp_bytes,
+                        emitted_at: self.now,
                     });
                     return None;
                 }
@@ -659,7 +693,8 @@ impl PeerFixture {
                             .due()
                             .saturating_duration_since(self.now)
                             .max(Duration::from_millis(1))
-                    }),
+                    })
+                    .min(self.network.time_quantum.unwrap_or(Duration::MAX)),
             )
             .expect("fixture clock");
         self.peer
