@@ -29,7 +29,7 @@ impl CatalogState {
         match state {
             wire::catalog::State::Snapshot(snapshot) => {
                 if self.revision != 0 && catalog.revision <= self.revision {
-                    return Ok(false);
+                    return Err(SignalingError::Invalid("catalog snapshot revision"));
                 }
                 if self.revision == 0 && catalog.revision != 1 {
                     return Err(SignalingError::Invalid("initial catalog revision"));
@@ -54,7 +54,7 @@ impl CatalogState {
                     return Err(SignalingError::Invalid("catalog delta before snapshot"));
                 }
                 if catalog.revision <= self.revision {
-                    return Ok(false);
+                    return Err(SignalingError::Invalid("catalog delta revision"));
                 }
                 if catalog.revision != self.revision.saturating_add(1) {
                     return Err(SignalingError::Invalid("catalog revision gap"));
@@ -461,7 +461,7 @@ mod tests {
         let initial = state.clone();
         assert!(state.apply(snapshot(0)).is_err());
         assert_eq!(state, initial);
-        assert!(!state.apply(snapshot(1)).unwrap());
+        assert!(state.apply(snapshot(1)).is_err());
         assert_eq!(state, initial);
         let removal = wire::Catalog {
             revision: 2,
@@ -472,7 +472,7 @@ mod tests {
         };
         assert!(state.apply(removal).unwrap());
         assert!(state.tracks.is_empty());
-        assert!(!state.apply(snapshot(1)).unwrap());
+        assert!(state.apply(snapshot(1)).is_err());
         assert!(state.apply(snapshot(3)).unwrap());
         assert_eq!(state.tracks.len(), 1);
         let encoded = pulsebeam_proto::codec::encode_server(&wire::ServerMessage {
