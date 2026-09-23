@@ -215,6 +215,12 @@ pub(crate) enum ShardEvent {
         participant: ParticipantId,
         connection_id: crate::entity::ConnectionId,
     },
+    RenewAuthorization {
+        participant: ParticipantId,
+        connection_id: crate::entity::ConnectionId,
+        request_id: crate::participant::effect::AuthorizationRequestId,
+        token: crate::participant::effect::RenewalToken,
+    },
     TrackSubscribed {
         subscriber: ParticipantId,
         track: crate::track::TrackMeta,

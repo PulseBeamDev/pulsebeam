@@ -12,5 +12,7 @@ pub mod tcp_acceptor;
 pub(crate) mod topology;
 pub mod ufrag;
 
-pub use negotiator::MAX_SEND_AUDIO_SLOTS;
+pub use negotiator::MAX_RTP_SLOTS_PER_TYPE;
 pub(crate) use negotiator::NegotiatedResources;
+#[cfg(test)]
+pub(crate) use negotiator::Negotiator;

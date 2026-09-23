@@ -5,6 +5,8 @@ use pulsebeam_proto::reliable::{RelControl, rel_control};
 use pulsebeam_runtime::net::{self};
 use std::time::Duration;
 use str0m::bwe::BweKind;
+#[cfg(test)]
+use str0m::channel::{ChannelConfig, ChannelId};
 use str0m::media::{KeyframeRequestKind, MediaKind, Mid};
 use str0m::{
     Event, Rtc, RtcError,
@@ -13,12 +15,16 @@ use str0m::{
 use tokio::time::Instant;
 
 use crate::control::NegotiatedResources;
+use crate::control::controller::ConnectionProfile;
 use crate::entity::{self, TrackId, TrackKind};
 use crate::id::ShardId;
 use crate::keys::TrackHandle;
 use crate::log::{LogCtx, plog_debug, plog_info, plog_trace, plog_warn};
 use crate::participant::data::{DataOpenError, DataState};
-use crate::participant::downstream::SlotConfig;
+use crate::participant::downstream::{
+    AudioReceiverAdmissionError, AudioReceiverRequest, SlotConfig, VideoReceiverAdmissionError,
+    VideoReceiverRequest,
+};
 use crate::participant::effect::ParticipantEffect;
 use crate::participant::event::ParticipantSink;
 use crate::participant::reverse::{ReverseInput, ReversePacket};
@@ -35,7 +41,9 @@ use crate::participant::{
         AppliedMutation, IngressResult, RtpWriteCommand, Transport, TransportMutation,
         TransportPollOutput,
     },
-    upstream::{IncomingRtpRoute, UpstreamAllocator},
+    upstream::{
+        IncomingRtpRoute, NativePublicationError, NativePublicationPreview, UpstreamAllocator,
+    },
 };
 use crate::rtp::cache::TrackStreamCache;
 use crate::track::{
@@ -55,6 +63,37 @@ fn inline_rtc_timeout(deadline: Instant, wall_now: Instant) -> Option<Instant> {
     (deadline <= latest).then_some(deadline.max(wall_now))
 }
 
+fn upstream_track_meta(
+    profile: ConnectionProfile,
+    room_id: entity::RoomId,
+    shard_id: ShardId,
+    participant_id: entity::ParticipantId,
+    kind: TrackKind,
+    mid: &Mid,
+) -> track::TrackMeta {
+    match profile {
+        ConnectionProfile::Whip => track::TrackMeta::labeled_media(
+            room_id,
+            shard_id,
+            participant_id,
+            kind,
+            match kind {
+                TrackKind::Audio => "audio",
+                TrackKind::Video => "video",
+                TrackKind::Data => "data",
+            }
+            .to_owned(),
+        ),
+        ConnectionProfile::Native | ConnectionProfile::Whep => track::TrackMeta {
+            room_id,
+            shard_id,
+            id: participant_id.derive_track_id(kind, mid),
+            origin: participant_id,
+            label: None,
+        },
+    }
+}
+
 pub struct TrackMapping {
     pub mid: Mid,
     pub track_id: TrackId,
@@ -71,6 +110,8 @@ pub enum DisconnectReason {
     RtcError(#[from] RtcError),
     #[error("Signaling error")]
     SignalingError(#[from] signaling::SignalingError),
+    #[error("Media signaling terminated")]
+    SignalingTerminated,
     #[error("ICE connection disconnected")]
     IceDisconnected,
     #[error("Unsupported media direction (must be SendOnly or RecvOnly)")]
@@ -79,7 +120,7 @@ pub enum DisconnectReason {
     InvalidDataTrackIntent(#[from] DataTrackIntentError),
     #[error("Duplicate data channel label for same direction: {0}")]
     DuplicateDataChannelLabel(DataTopicChannel),
-    #[error("Exceeded maximum upstream tracks: only 2 video and 2 audio allowed")]
+    #[error("Exceeded maximum upstream tracks: only 32 video and 32 audio allowed")]
     TooManyUpstreamTracks,
     #[error(
         "Exceeded maximum data topic channels: only 64 channels (across all topics/scopes) allowed"
@@ -89,6 +130,8 @@ pub enum DisconnectReason {
     RoomClosed,
     #[error("System terminated")]
     SystemTerminated,
+    #[error("Authorization expired")]
+    AuthorizationExpired,
 }
 
 #[derive(Debug)]
@@ -96,7 +139,10 @@ pub struct ParticipantConfig {
     pub manual_sub: bool,
     pub room_id: entity::RoomId,
     pub participant_id: entity::ParticipantId,
+    pub(crate) participant_external_id: entity::ParticipantExternalId,
     pub connection_id: entity::ConnectionId,
+    pub profile: ConnectionProfile,
+    pub(crate) initial_authorization_expiry: Option<i64>,
     pub rtc: Rtc,
     pub resources: NegotiatedResources,
 }
@@ -134,7 +180,14 @@ pub struct Participant {
     upstream: UpstreamAllocator,
     negotiated: NegotiatedResources,
     pub(crate) participant_id: entity::ParticipantId,
+    participant_external_id: entity::ParticipantExternalId,
     pub(crate) connection_id: entity::ConnectionId,
+    profile: ConnectionProfile,
+    initial_authorization_expiry: Option<i64>,
+    next_authorization_request: u64,
+    pending_authorization_request: Option<crate::participant::effect::AuthorizationRequestId>,
+    authorization_expired: bool,
+    signaling_terminated: bool,
     last_keyframe_request: HashMap<(Mid, Option<str0m::media::Rid>), Instant>,
     pending_keyframe_requests: HashSet<(Mid, Option<str0m::media::Rid>)>,
 
@@ -179,7 +232,12 @@ impl Participant {
             room_id: cfg.room_id,
             participant_id: cfg.participant_id,
         };
-        let signaling = Signaling::new(ctx);
+        let signaling = match cfg.profile {
+            ConnectionProfile::Native => {
+                Signaling::new_v1(ctx, cfg.participant_external_id.as_str().to_owned())
+            }
+            ConnectionProfile::Whip | ConnectionProfile::Whep => Signaling::new(ctx),
+        };
         let now = Instant::now();
         #[cfg(feature = "sim")]
         let sim_span = tracing::info_span!(
@@ -198,7 +256,14 @@ impl Participant {
             ),
             stream_writer: StreamWriter::new(),
             participant_id: cfg.participant_id,
+            participant_external_id: cfg.participant_external_id,
             connection_id: cfg.connection_id,
+            profile: cfg.profile,
+            initial_authorization_expiry: cfg.initial_authorization_expiry,
+            next_authorization_request: 1,
+            pending_authorization_request: None,
+            authorization_expired: false,
+            signaling_terminated: false,
             upstream: UpstreamAllocator::new(ctx),
             negotiated: cfg.resources,
             downstream: DownstreamAllocator::new(ctx, cfg.manual_sub),
@@ -230,13 +295,472 @@ impl Participant {
 
     #[allow(
         dead_code,
+        reason = "the replacement signaling transaction invokes this seam in Plan 07"
+    )]
+    pub(crate) fn preview_native_publications(
+        &self,
+        publications: &[crate::participant::intent::NativePublication],
+    ) -> Result<NativePublicationPreview, NativePublicationError> {
+        if self.profile != ConnectionProfile::Native {
+            return Err(NativePublicationError::NotNative);
+        }
+        self.upstream.preview_native_publications(publications)
+    }
+
+    #[allow(
+        dead_code,
+        reason = "the replacement signaling transaction invokes this seam in Plan 07"
+    )]
+    pub(crate) fn commit_native_publications(
+        &mut self,
+        preview: NativePublicationPreview,
+        events: &mut impl ParticipantSink,
+    ) {
+        for event in self.upstream.commit_native_publications(preview) {
+            event.apply(events);
+        }
+    }
+
+    #[allow(
+        dead_code,
         reason = "the replacement signaling path consumes negotiated receiver coordinates in Plan 07"
     )]
     pub(crate) fn receiver_index(&self, kind: MediaKind, mid: Mid) -> Option<u32> {
         self.downstream.receiver_index(kind, mid)
     }
 
+    /// Apply one decoded native v1 Intent as a single preview-then-commit
+    /// transaction.  The production channel deliberately does not route this
+    /// seam until the v1 signaling lifecycle is installed.
+    pub(crate) fn apply_v1_intent(
+        &mut self,
+        wire: pulsebeam_proto::signaling_v1::Intent,
+        events: &mut impl ParticipantSink,
+    ) -> signaling::V1IntentResult {
+        if !self.signaling.v1_is_fresh(wire.revision) {
+            return signaling::V1IntentResult::Mapping(self.v1_mapping());
+        }
+
+        let intent = signaling::normalize_v1_intent(wire);
+        if intent.video.len() > self.downstream.video_slot_count() {
+            return Self::v1_protocol_error(intent.revision, "video receiver capacity exceeded");
+        }
+
+        let (video, audio) = self.v1_receiver_requests(&intent);
+
+        let Ok(publications) = self.preview_native_publications(&intent.publications) else {
+            return Self::v1_protocol_error(intent.revision, "native sender binding changed");
+        };
+        let video_preview = match self.downstream.preview_video_receiver_assignments(&video) {
+            Ok(preview) => preview,
+            Err(VideoReceiverAdmissionError::PlayoutResetRequired) => {
+                return signaling::V1IntentResult::Reconnect;
+            }
+            Err(
+                VideoReceiverAdmissionError::Capacity | VideoReceiverAdmissionError::DuplicateTrack,
+            ) => {
+                return Self::v1_protocol_error(
+                    intent.revision,
+                    "invalid video receiver assignment",
+                );
+            }
+            Err(VideoReceiverAdmissionError::Stale) => {
+                debug_assert!(false, "a transaction preview cannot be stale before commit");
+                return signaling::V1IntentResult::Reconnect;
+            }
+        };
+        let audio_preview = match self.downstream.preview_audio_receiver_assignments(&audio) {
+            Ok(preview) => preview,
+            Err(AudioReceiverAdmissionError::PlayoutResetRequired) => {
+                return signaling::V1IntentResult::Reconnect;
+            }
+            Err(
+                AudioReceiverAdmissionError::Capacity | AudioReceiverAdmissionError::DuplicateTrack,
+            ) => {
+                return Self::v1_protocol_error(
+                    intent.revision,
+                    "invalid audio receiver assignment",
+                );
+            }
+            Err(AudioReceiverAdmissionError::Stale) => {
+                debug_assert!(false, "a transaction preview cannot be stale before commit");
+                return signaling::V1IntentResult::Reconnect;
+            }
+        };
+
+        // The previews are current and commits have no remaining fallible work.
+        // A stale result here would be an internal ordering bug, not input state.
+        self.commit_native_publications(publications, events);
+        if self
+            .downstream
+            .commit_video_receiver_assignments(video_preview)
+            .is_err()
+            || self
+                .downstream
+                .commit_audio_receiver_assignments(audio_preview)
+                .is_err()
+        {
+            debug_assert!(false, "a current transaction preview must commit");
+            return signaling::V1IntentResult::Reconnect;
+        }
+        self.downstream
+            .set_audio_intent(crate::participant::intent::AudioIntent {
+                pinned: audio.iter().map(|request| request.track_id).collect(),
+                auto: intent.audio_auto,
+            });
+        self.signaling.accept_v1_intent(intent);
+        signaling::V1IntentResult::Mapping(self.v1_mapping())
+    }
+
+    pub(crate) fn handle_v1_input(
+        &mut self,
+        bytes: &[u8],
+        events: &mut impl ParticipantSink,
+    ) -> Result<(), signaling::SignalingError> {
+        if self.authorization_expired || self.signaling_terminated {
+            return Ok(());
+        }
+        let message = pulsebeam_proto::codec::decode_client(bytes)
+            .map_err(|_| signaling::SignalingError::DecodeFailed)?;
+        match message.payload {
+            Some(pulsebeam_proto::signaling_v1::client_message::Payload::Intent(intent)) => {
+                let fresh = self.signaling.v1_is_fresh(intent.revision);
+                match self.apply_v1_intent(intent, events) {
+                    signaling::V1IntentResult::Mapping(mapping) => {
+                        let mut snapshot = self.downstream.signaling_snapshot();
+                        snapshot.participants = self.signaling.participants_snapshot();
+                        if self.signaling.stage_v1_output(&snapshot, mapping).is_err() {
+                            self.signaling.stage_v1_internal_error();
+                            self.signaling_terminated = true;
+                        } else if !fresh {
+                            self.signaling.request_stale_v1_ack();
+                        }
+                    }
+                    signaling::V1IntentResult::ProtocolError(error) => {
+                        self.signaling.stage_v1_terminal_error(error);
+                        self.signaling_terminated = true;
+                    }
+                    signaling::V1IntentResult::Reconnect => {
+                        self.signaling.stage_v1_reconnect();
+                        self.signaling_terminated = true;
+                    }
+                }
+            }
+            Some(pulsebeam_proto::signaling_v1::client_message::Payload::RenewAuthorization(
+                renew,
+            )) => {
+                let Some(token) = crate::participant::effect::RenewalToken::new(renew.token) else {
+                    return self
+                        .signaling
+                        .stage_authorization_rejected()
+                        .then_some(())
+                        .ok_or(signaling::SignalingError::ResponseBackpressured);
+                };
+                if self.pending_authorization_request.is_some() {
+                    return self
+                        .signaling
+                        .stage_authorization_rejected()
+                        .then_some(())
+                        .ok_or(signaling::SignalingError::ResponseBackpressured);
+                }
+                let request_id = crate::participant::effect::AuthorizationRequestId::new(
+                    self.next_authorization_request,
+                );
+                self.next_authorization_request = self.next_authorization_request.wrapping_add(1);
+                self.pending_authorization_request = Some(request_id);
+                events.renew_authorization(request_id, token);
+            }
+            None => return Err(signaling::SignalingError::DecodeFailed),
+        }
+        Ok(())
+    }
+
+    /// Reconcile retained v1 receive desire when the visible catalog changes.
+    /// This intentionally does not consult legacy signaling intent fields.
+    fn reconcile_v1_catalog(&mut self) {
+        let Some(intent) = self.signaling.v1_intent().cloned() else {
+            return;
+        };
+        let (video, audio) = self.v1_receiver_requests(&intent);
+        let Ok(video_preview) = self.downstream.preview_video_receiver_assignments(&video) else {
+            return;
+        };
+        let Ok(audio_preview) = self.downstream.preview_audio_receiver_assignments(&audio) else {
+            return;
+        };
+        if self
+            .downstream
+            .commit_video_receiver_assignments(video_preview)
+            .is_err()
+            || self
+                .downstream
+                .commit_audio_receiver_assignments(audio_preview)
+                .is_err()
+        {
+            debug_assert!(
+                false,
+                "a current catalog reconciliation preview must commit"
+            );
+            return;
+        }
+        self.downstream
+            .set_audio_intent(crate::participant::intent::AudioIntent {
+                pinned: audio.iter().map(|request| request.track_id).collect(),
+                auto: intent.audio_auto,
+            });
+    }
+
+    fn v1_receiver_requests(
+        &self,
+        intent: &signaling::V1Intent,
+    ) -> (Vec<VideoReceiverRequest>, Vec<AudioReceiverRequest>) {
+        let snapshot = self.downstream.signaling_snapshot();
+        let track = |id: &str| {
+            snapshot
+                .publications
+                .iter()
+                .find(|meta| meta.id.as_str() == id)
+        };
+        let video = intent
+            .video
+            .iter()
+            .filter_map(|request| {
+                let meta = track(&request.track_id)?;
+                (meta.id.kind() == TrackKind::Video).then_some(VideoReceiverRequest {
+                    intent: crate::participant::intent::VideoIntent {
+                        track_id: meta.id,
+                        target_height: request.target_height,
+                        min_height: request.min_height,
+                        min_fps: request.min_fps,
+                        priority: request.priority,
+                    },
+                    playout: request.playout,
+                })
+            })
+            .collect();
+        let audio = intent
+            .audio
+            .iter()
+            .filter_map(|request| {
+                let meta = track(&request.track_id)?;
+                (meta.id.kind() == TrackKind::Audio).then_some(AudioReceiverRequest {
+                    track_id: meta.id,
+                    playout: request.playout,
+                })
+            })
+            .collect();
+        (video, audio)
+    }
+
+    fn v1_protocol_error(revision: u64, message: &str) -> signaling::V1IntentResult {
+        signaling::V1IntentResult::ProtocolError(pulsebeam_proto::signaling_v1::Error {
+            code: pulsebeam_proto::signaling_v1::ErrorCode::ProtocolError.into(),
+            message: message.to_owned(),
+            fatal: true,
+            intent_revision: Some(revision),
+        })
+    }
+
+    fn v1_mapping(&self) -> pulsebeam_proto::signaling_v1::Mapping {
+        let mappings =
+            |assignments: Vec<(u32, TrackId)>| pulsebeam_proto::signaling_v1::TrackMappings {
+                tracks: assignments
+                    .into_iter()
+                    .map(
+                        |(receiver_index, track_id)| pulsebeam_proto::signaling_v1::TrackMapping {
+                            receiver_index,
+                            track_id: track_id.as_str(),
+                        },
+                    )
+                    .collect(),
+            };
+        pulsebeam_proto::signaling_v1::Mapping {
+            intent_revision: self.signaling.v1_revision(),
+            video: Some(mappings(self.downstream.video_receiver_assignments())),
+            audio: Some(mappings(self.downstream.audio_receiver_assignments())),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn add_v1_test_receiver(&mut self, slot: SlotConfig) {
+        self.downstream.add_slot(slot);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn add_v1_test_track(&mut self, track: Track) {
+        if track.kind() == TrackKind::Video {
+            self.downstream.video.add_track(track);
+        } else {
+            self.on_track_published(TrackHandle::default(), track);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn v1_test_mapping(&self) -> pulsebeam_proto::signaling_v1::Mapping {
+        self.v1_mapping()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn enable_v1_test_output(&mut self, recipient_external_id: String, cid: ChannelId) {
+        self.signaling = Signaling::new_v1(self.log_ctx(), recipient_external_id);
+        self.signaling.set_cid(cid);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_v1_test_write_channel_result(&mut self, result: bool) {
+        self.transport.set_test_write_channel_result(result);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn v1_test_catalog_revision(&self) -> u64 {
+        self.signaling.v1_test_catalog_revision()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn v1_test_catalog(
+        &self,
+    ) -> Result<pulsebeam_proto::signaling_v1::CatalogSnapshot, signaling::CatalogBuildError> {
+        let mut snapshot = self.downstream.signaling_snapshot();
+        snapshot.participants = self.signaling.participants_snapshot();
+        signaling::build_catalog(
+            self.participant_id,
+            self.participant_external_id.as_str(),
+            &snapshot,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn v1_test_pending_authorization_request(
+        &self,
+    ) -> Option<crate::participant::effect::AuthorizationRequestId> {
+        self.pending_authorization_request
+    }
+
+    #[cfg(test)]
+    pub(crate) fn stage_v1_test_authorization(&mut self, expiry: i64) -> bool {
+        self.signaling.stage_authorization(expiry)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_v1_test_output(&mut self) -> Option<Vec<u8>> {
+        let snapshot = self.downstream.signaling_snapshot();
+        let bytes = self.signaling.poll(&snapshot)?.bytes;
+        self.signaling.commit_sent();
+        Some(bytes)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn stage_v1_test_output(&mut self) -> Result<(), signaling::V1OutputBuildError> {
+        let mut snapshot = self.downstream.signaling_snapshot();
+        snapshot.participants = self.signaling.participants_snapshot();
+        self.signaling.stage_v1_output(&snapshot, self.v1_mapping())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn poll_v1_test_output(&mut self) {
+        let mut sink = crate::participant::event::test_utils::MockParticipantSink::new();
+        let _ = self.poll(Instant::now(), &mut sink);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn v1_test_channel_write_attempts(&self) -> &[Vec<u8>] {
+        self.transport.test_channel_write_attempts()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn handle_v1_test_event(&mut self, event: Event, sink: &mut impl ParticipantSink) {
+        self.handle_event(Instant::now(), event, sink);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_v1_test_channel_config(&mut self, cid: ChannelId, config: ChannelConfig) {
+        self.transport.set_test_channel_config(cid, config);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn lock_v1_test_playout(&mut self, kind: MediaKind, mid: Mid) {
+        self.downstream.set_playout_delay(Some((10, 10)));
+        self.downstream.record_playout_delay_stamp(
+            kind,
+            mid,
+            None,
+            Some((
+                str0m::media::MediaTime::from_hundredths(1),
+                str0m::media::MediaTime::from_hundredths(1),
+            )),
+            str0m::rtp::SeqNo::from(1u64),
+        );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn add_v1_test_sender(
+        &mut self,
+        sender_index: u32,
+        kind: TrackKind,
+        mid: Mid,
+    ) -> TrackId {
+        let track_id = self.participant_id.derive_track_id(kind, &mid);
+        let meta = crate::track::TrackMeta {
+            room_id: self.room_id,
+            shard_id: self.shard_id,
+            id: track_id,
+            origin: self.participant_id,
+            label: None,
+        };
+        let (sender, descriptor) = match kind {
+            TrackKind::Audio => track::new_audio(mid, meta),
+            TrackKind::Video => track::new_video(mid, meta, Vec::new()),
+            TrackKind::Data => unreachable!("native v1 has no data sender"),
+        };
+        assert!(
+            self.upstream
+                .add_published_track(sender_index, mid, sender, descriptor)
+        );
+        track_id
+    }
+
+    #[cfg(test)]
+    pub(crate) fn v1_test_publications(&self) -> Vec<(u32, TrackId, bool)> {
+        self.upstream.v1_test_publications()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn v1_test_receiver_locked(&self, kind: MediaKind, receiver_index: u32) -> bool {
+        self.downstream
+            .v1_test_receiver_locked(kind, receiver_index)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn v1_test_intent(&self) -> Option<&signaling::V1Intent> {
+        self.signaling.v1_intent()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn v1_test_remove_track(&mut self, track_id: TrackId) {
+        assert!(self.on_tracks_unpublished(&[track_id]));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn v1_test_forward_audio(&mut self, origin: crate::entity::AudioOrigin) {
+        let mut packet = crate::rtp::RtpPacket::default();
+        packet.ext_vals.audio_level = Some(-20);
+        self.downstream
+            .on_forward_audio_rtp(origin, &packet, &mut self.stream_writer);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn v1_test_reallocate_video_quality(
+        &mut self,
+        bitrate_bps: u64,
+    ) -> Option<crate::track::LayerQuality> {
+        self.downstream
+            .v1_test_reallocate_video_quality(str0m::bwe::Bitrate::from(bitrate_bps))
+    }
+
     pub fn apply(&mut self, effect: ParticipantEffect, track_handle: Option<TrackHandle>) {
+        if self.authorization_expired || self.signaling_terminated {
+            return;
+        }
         match effect {
             ParticipantEffect::ParticipantsChanged { added, removed } => {
                 self.signaling.apply_participants(added, removed);
@@ -289,10 +813,91 @@ impl Participant {
                     self.upstream.data.unpublish(track_id);
                 }
             }
+            ParticipantEffect::AuthorizationRenewed {
+                participant_id,
+                connection_id,
+                request_id,
+                expires_at_unix_seconds,
+            } => {
+                if participant_id == self.participant_id
+                    && connection_id == self.connection_id
+                    && self.pending_authorization_request == Some(request_id)
+                    && self.signaling.stage_authorization(expires_at_unix_seconds)
+                {
+                    self.pending_authorization_request = None;
+                }
+            }
+            ParticipantEffect::AuthorizationRejected {
+                participant_id,
+                connection_id,
+                request_id,
+            } => {
+                if participant_id == self.participant_id
+                    && connection_id == self.connection_id
+                    && self.pending_authorization_request == Some(request_id)
+                    && self.signaling.stage_authorization_rejected()
+                {
+                    self.pending_authorization_request = None;
+                }
+            }
+            ParticipantEffect::AuthorizationExpired { connection_id } => {
+                if connection_id != self.connection_id {
+                    return;
+                }
+                self.authorization_expired = true;
+                self.signaling_terminated = true;
+                self.pending_authorization_request = None;
+                if !self.signaling.stage_authorization_expired() {
+                    self.disconnect(DisconnectReason::AuthorizationExpired);
+                }
+            }
         }
     }
 
+    pub(crate) fn apply_authorization_result(&mut self, effect: ParticipantEffect) -> bool {
+        if self.authorization_expired || self.signaling_terminated {
+            return true;
+        }
+        match effect {
+            ParticipantEffect::AuthorizationRenewed {
+                participant_id,
+                connection_id,
+                request_id,
+                expires_at_unix_seconds,
+            } if participant_id == self.participant_id
+                && connection_id == self.connection_id
+                && self.pending_authorization_request == Some(request_id) =>
+            {
+                if !self.signaling.stage_authorization(expires_at_unix_seconds) {
+                    return false;
+                }
+                self.pending_authorization_request = None;
+            }
+            ParticipantEffect::AuthorizationRejected {
+                participant_id,
+                connection_id,
+                request_id,
+            } if participant_id == self.participant_id
+                && connection_id == self.connection_id
+                && self.pending_authorization_request == Some(request_id) =>
+            {
+                if !self.signaling.stage_authorization_rejected() {
+                    return false;
+                }
+                self.pending_authorization_request = None;
+            }
+            ParticipantEffect::AuthorizationRenewed { .. }
+            | ParticipantEffect::AuthorizationRejected { .. }
+            | ParticipantEffect::AuthorizationExpired { .. } => {}
+            _ => return true,
+        }
+        true
+    }
+
     pub(crate) fn input<'a>(&mut self, input: ParticipantInput<'a>) {
+        if self.authorization_expired || self.signaling_terminated {
+            return;
+        }
         match input {
             ParticipantInput::Network {
                 batch,
@@ -455,8 +1060,7 @@ impl Participant {
         self.downstream.install_track(key, track);
         self.signaling.mark_tracks_dirty();
         self.signaling.mark_assignments_dirty();
-        let intents = self.signaling.reconcile();
-        self.downstream.apply_signaling_intents(intents);
+        self.reconcile_v1_catalog();
     }
 
     fn on_tracks_unpublished(&mut self, tracks: &[TrackId]) -> bool {
@@ -467,8 +1071,7 @@ impl Participant {
         if removed {
             self.signaling.mark_tracks_dirty();
             self.signaling.mark_assignments_dirty();
-            let intents = self.signaling.reconcile();
-            self.downstream.apply_signaling_intents(intents);
+            self.reconcile_v1_catalog();
         }
         removed
     }
@@ -553,20 +1156,24 @@ impl Participant {
 
     fn apply_one_rtc_mutation(&mut self, now: Instant) -> bool {
         if let Some(write) = self.stream_writer.pop() {
-            let (pkt, mid, rid, ssrc, pt, kind) = match write {
+            let (pkt, mid, rid, ssrc, pt, kind, playout_delay) = match write {
                 StreamWrite::Video {
                     pkt,
                     mid,
                     rid,
                     ssrc,
                     pt,
-                } => (pkt, mid, rid, ssrc, pt, MediaKind::Video),
-                StreamWrite::Audio { pkt, mid, ssrc, pt } => {
-                    (pkt, mid, None, ssrc, pt, MediaKind::Audio)
-                }
+                    playout_delay,
+                } => (pkt, mid, rid, ssrc, pt, MediaKind::Video, playout_delay),
+                StreamWrite::Audio {
+                    pkt,
+                    mid,
+                    ssrc,
+                    pt,
+                    playout_delay,
+                } => (pkt, mid, None, ssrc, pt, MediaKind::Audio, playout_delay),
             };
             let seq_no = pkt.seq_no;
-            let playout_delay = self.downstream.playout_delay_to_stamp();
             let result = self.transport.apply_rtp_command(RtpWriteCommand {
                 pkt,
                 mid,
@@ -587,11 +1194,23 @@ impl Participant {
                     let refreshed = self.downstream.refresh_ssrc(kind, mid, rid, ssrc);
                     debug_assert!(refreshed, "recovered stream has no downstream slot");
                     if playout_delay.is_some() {
-                        self.downstream.record_playout_delay_stamp(mid, rid, seq_no);
+                        self.downstream.record_playout_delay_stamp(
+                            kind,
+                            mid,
+                            rid,
+                            playout_delay,
+                            seq_no,
+                        );
                     }
                 }
                 AppliedMutation::RtpWritten if playout_delay.is_some() => {
-                    self.downstream.record_playout_delay_stamp(mid, rid, seq_no);
+                    self.downstream.record_playout_delay_stamp(
+                        kind,
+                        mid,
+                        rid,
+                        playout_delay,
+                        seq_no,
+                    );
                 }
                 AppliedMutation::KeyframeUnavailable { mid, rid } => {
                     debug_assert!(self.pending_keyframe_requests.remove(&(mid, rid)));
@@ -628,6 +1247,10 @@ impl Participant {
             return None;
         }
 
+        if self.signaling_terminated {
+            return self.poll_terminal(now, events);
+        }
+
         // Entered once per poll cycle rather than per packet, so every str0m line produced by
         // this participant's work carries its identity for the cost of one guard.
         //
@@ -655,6 +1278,9 @@ impl Participant {
                     return None;
                 };
                 self.transport.set_drain_result(Some(rtc_deadline));
+            }
+            if self.signaling_terminated {
+                return self.poll_terminal(now, events);
             }
             debug_assert!(self.transport.deadline().is_some());
 
@@ -693,12 +1319,27 @@ impl Participant {
             if self.signaling.needs_poll() {
                 let mut snapshot = self.downstream.signaling_snapshot();
                 snapshot.participants = self.signaling.participants_snapshot();
+                if self.signaling.is_v1()
+                    && self
+                        .signaling
+                        .stage_v1_output(&snapshot, self.v1_mapping())
+                        .is_err()
+                {
+                    self.signaling.stage_v1_internal_error();
+                    self.signaling_terminated = true;
+                }
                 if let Some(output) = self.signaling.poll(&snapshot) {
                     if self
                         .transport
                         .write_channel(output.cid, true, &output.bytes)
                     {
-                        self.signaling.commit_sent();
+                        if self.signaling.commit_sent() {
+                            self.disconnect(if self.authorization_expired {
+                                DisconnectReason::AuthorizationExpired
+                            } else {
+                                DisconnectReason::SignalingTerminated
+                            });
+                        }
                     } else {
                         self.signaling.retry_pending();
                     }
@@ -741,6 +1382,38 @@ impl Participant {
         }
     }
 
+    fn poll_terminal(
+        &mut self,
+        now: Instant,
+        events: &mut impl ParticipantSink,
+    ) -> Option<Instant> {
+        if self.transport.needs_drain() {
+            let Some(rtc_deadline) = self.poll_rtc(now, events) else {
+                self.transport.set_drain_result(None);
+                events.exit();
+                return None;
+            };
+            self.transport.set_drain_result(Some(rtc_deadline));
+        }
+        if self.transport.is_exited() {
+            return None;
+        }
+        if self.signaling.needs_poll()
+            && let Some(output) = self.signaling.poll(&self.downstream.signaling_snapshot())
+            && self
+                .transport
+                .write_channel(output.cid, true, &output.bytes)
+            && self.signaling.commit_sent()
+        {
+            self.disconnect(if self.authorization_expired {
+                DisconnectReason::AuthorizationExpired
+            } else {
+                DisconnectReason::SignalingTerminated
+            });
+        }
+        self.transport.deadline()
+    }
+
     fn advance_rtc_clock(&mut self, candidate: Instant, wall_now: Instant) {
         self.transport.advance_clock(candidate, wall_now);
     }
@@ -773,6 +1446,18 @@ impl Participant {
     }
 
     fn handle_event(&mut self, now: Instant, e: Event, events: &mut impl ParticipantSink) {
+        if self.signaling_terminated {
+            if let Event::ChannelClose(cid) = e
+                && self.signaling.clear_cid(cid)
+            {
+                self.disconnect(if self.authorization_expired {
+                    DisconnectReason::AuthorizationExpired
+                } else {
+                    DisconnectReason::SignalingTerminated
+                });
+            }
+            return;
+        }
         match e {
             // `Connected` is DTLS; ICE reaching connected is what tells the
             // shard the peer address is authenticated, and that is handled
@@ -828,8 +1513,17 @@ impl Participant {
 
                 match intent {
                     DataTrackIntent::InternalSignaling => {
+                        if self.profile != ConnectionProfile::Native {
+                            self.disconnect(DisconnectReason::InvalidMediaDirection);
+                            return;
+                        }
                         plog_info!(self.log_ctx(), "internal media signaling is opened");
                         self.signaling.set_cid(cid);
+                        if let Some(expiry) = self.initial_authorization_expiry
+                            && !self.signaling.stage_authorization(expiry)
+                        {
+                            self.disconnect(DisconnectReason::SignalingTerminated);
+                        }
                     }
 
                     DataTrackIntent::UserTopic(channel) => {
@@ -859,6 +1553,7 @@ impl Participant {
                                             .participant_id
                                             .derive_track_id(TrackKind::Data, &label),
                                         origin: self.participant_id,
+                                        label: None,
                                     },
                                     channel.topic,
                                     channel.lane,
@@ -878,6 +1573,12 @@ impl Participant {
                 }
             }
             Event::ChannelClose(cid) => {
+                if self.signaling.clear_cid(cid) {
+                    if self.authorization_expired {
+                        self.disconnect(DisconnectReason::AuthorizationExpired);
+                    }
+                    return;
+                }
                 let Some(channel) = self.data.close(cid) else {
                     return;
                 };
@@ -886,16 +1587,11 @@ impl Participant {
                 self.release_data_channel(channel, events);
             }
             Event::ChannelData(data) => {
-                if Some(data.id) == self.signaling.cid
-                    && let Err(err) = self.signaling.handle_input(&data.data).map(|input_events| {
-                        for input_event in input_events {
-                            self.handle_signaling_input(input_event, events);
-                        }
-                        let intents = self.signaling.reconcile();
-                        self.downstream.apply_signaling_intents(intents);
-                    })
-                {
-                    self.disconnect(err.into());
+                if Some(data.id) == self.signaling.cid {
+                    if !data.binary || self.handle_v1_input(&data.data, events).is_err() {
+                        self.signaling.stage_v1_invalid_message();
+                        self.signaling_terminated = true;
+                    }
                     return;
                 }
 
@@ -941,18 +1637,6 @@ impl Participant {
         }
     }
 
-    fn handle_signaling_input(
-        &mut self,
-        event: signaling::SignalingInputEvent,
-        events: &mut impl ParticipantSink,
-    ) {
-        match event {
-            signaling::SignalingInputEvent::UpstreamTrackState { mid, active } => {
-                self.handle_upstream_track_state(mid, active, events);
-            }
-        }
-    }
-
     fn release_data_channel(
         &mut self,
         channel: DataTopicChannel,
@@ -976,6 +1660,9 @@ impl Participant {
         active: bool,
         events: &mut impl ParticipantSink,
     ) {
+        if self.profile == ConnectionProfile::Native {
+            return;
+        }
         if active {
             let Some((descriptor, in_topology)) = self.upstream.announce_state_mut(mid) else {
                 return;
@@ -1004,7 +1691,7 @@ impl Participant {
         // Treat unpaused as an implicit publish signal from str0m.
         // We intentionally do not unpublish on paused=true here; explicit
         // client intent is authoritative for stop/unpublish transitions.
-        if !paused {
+        if self.profile == ConnectionProfile::Whip && !paused {
             self.handle_upstream_track_state(mid, true, events);
         }
     }
@@ -1024,13 +1711,14 @@ impl Participant {
                     MediaKind::Audio => TrackKind::Audio,
                     MediaKind::Video => TrackKind::Video,
                 };
-                let track_id = self.participant_id.derive_track_id(kind, &media.mid);
-                let track_meta = track::TrackMeta {
-                    room_id: self.room_id,
-                    shard_id: self.shard_id,
-                    id: track_id,
-                    origin: self.participant_id,
-                };
+                let track_meta = upstream_track_meta(
+                    self.profile,
+                    self.room_id,
+                    self.shard_id,
+                    self.participant_id,
+                    kind,
+                    &media.mid,
+                );
                 match media.kind {
                     MediaKind::Audio => {
                         let (tx, track) = track::new_audio(media.mid, track_meta);
@@ -1062,14 +1750,6 @@ impl Participant {
             }
             Direction::SendOnly => {
                 self.try_add_downstream_slot(resource.media_index, media.mid, media.kind);
-                // Update signaling slot count AFTER adding the slot so the
-                // server accepts ClientIntent requests up to the actual slot
-                // count (previously this was called before add_slot, so the
-                // count was always one behind and every intent was rejected).
-                self.signaling
-                    .set_slot_count(self.downstream.video.slot_count());
-                self.signaling
-                    .set_audio_slot_count(self.downstream.audio_slot_count());
             }
             _ => self.disconnect(DisconnectReason::InvalidMediaDirection),
         }
@@ -1140,6 +1820,9 @@ impl Participant {
         let Some((route, incoming)) = incoming else {
             return;
         };
+        if !self.upstream.route_is_active(route) {
+            return;
+        }
         self.handle_incoming_rtp_after_lookup(route, incoming, events);
     }
 
@@ -1201,6 +1884,576 @@ mod rtc_clock_tests {
         }
 
         assert_eq!(rtc, wall);
+    }
+}
+
+#[cfg(test)]
+mod native_profile_tests {
+    use super::*;
+
+    #[test]
+    fn whip_synthesizes_only_exact_media_labels() {
+        let room_id = entity::RoomId::from_external(&entity::RoomExternalId::new("test").unwrap());
+        let participant_id = entity::ParticipantId::new();
+        for (kind, label) in [(TrackKind::Audio, "audio"), (TrackKind::Video, "video")] {
+            let meta = upstream_track_meta(
+                ConnectionProfile::Whip,
+                room_id,
+                ShardId::from(0),
+                participant_id,
+                kind,
+                &Mid::from("negotiated-mid"),
+            );
+            assert_eq!(meta.label.as_deref(), Some(label));
+            assert_eq!(meta.id, participant_id.derive_track_id(kind, label));
+        }
+        let native = upstream_track_meta(
+            ConnectionProfile::Native,
+            room_id,
+            ShardId::from(0),
+            participant_id,
+            TrackKind::Audio,
+            &Mid::from("negotiated-mid"),
+        );
+        assert_eq!(native.label, None);
+    }
+}
+
+#[cfg(test)]
+mod authorization_tests {
+    use super::*;
+    use crate::control::controller::{AuthorizationLease, ParticipantState};
+    use crate::control::core::{ControllerCore, RoomPlacement};
+    use crate::entity::{ParticipantExternalId, RoomExternalId};
+    use pulsebeam_core::auth::AuthorizationExpiry;
+    use std::time::UNIX_EPOCH;
+
+    #[test]
+    fn native_participant_constructs_v1_output() {
+        let room_external_id = RoomExternalId::new("v1-construction").unwrap();
+        let mut rtc = Rtc::new(std::time::Instant::now());
+        let cid = rtc.direct_api().create_data_channel(Default::default());
+        let mut participant = Participant::new(
+            ParticipantConfig {
+                manual_sub: true,
+                room_id: entity::RoomId::from_external(&room_external_id),
+                participant_id: entity::ParticipantId::new(),
+                participant_external_id: ParticipantExternalId::new("alice").unwrap(),
+                connection_id: entity::ConnectionId::new(),
+                profile: ConnectionProfile::Native,
+                initial_authorization_expiry: None,
+                rtc,
+                resources: NegotiatedResources::empty_for_test(),
+            },
+            ShardId::new(0),
+            1_200,
+            1_200,
+        );
+
+        participant.signaling.set_cid(cid);
+        participant.stage_v1_test_output().unwrap();
+        let bytes = participant.take_v1_test_output().expect("initial output");
+        assert!(matches!(
+            pulsebeam_proto::codec::decode_server(&bytes),
+            Ok(pulsebeam_proto::signaling_v1::ServerMessage {
+                payload: Some(pulsebeam_proto::signaling_v1::server_message::Payload::Catalog(_))
+            })
+        ));
+    }
+
+    #[test]
+    fn native_config_retains_external_identity_and_wire_expiry() {
+        let room_external_id = RoomExternalId::new("room").unwrap();
+        let room_id = entity::RoomId::from_external(&room_external_id);
+        let participant_external_id = ParticipantExternalId::new("alice").unwrap();
+        let participant_id = entity::ParticipantId::new();
+        let expiry = 1_700_000_000;
+        let state = ParticipantState {
+            manual_sub: true,
+            room_id,
+            project_id: crate::entity::ProjectId::new(),
+            room_external_id: crate::entity::RoomExternalId::new("room").unwrap(),
+            participant_id,
+            participant_external_id: participant_external_id.clone(),
+            connection_id: entity::ConnectionId::new(),
+            old_connection_id: None,
+            authorization: Some(
+                AuthorizationLease::from_expiry(
+                    AuthorizationExpiry::from_unix_seconds(expiry),
+                    UNIX_EPOCH,
+                    Instant::now(),
+                )
+                .unwrap(),
+            ),
+            profile: ConnectionProfile::Native,
+        };
+        let config = ControllerCore::with_placement(1, RoomPlacement::Hashed)
+            .prepare_participant(
+                Rtc::new(std::time::Instant::now()),
+                NegotiatedResources::empty_for_test(),
+                state,
+            )
+            .unwrap();
+
+        assert_eq!(config.participant_external_id, participant_external_id);
+        assert_eq!(
+            config.initial_authorization_expiry,
+            Some(i64::try_from(expiry).unwrap())
+        );
+        let participant = Participant::new(config, ShardId::new(0), 1_200, 1_200);
+        assert_eq!(participant.participant_external_id, participant_external_id);
+        assert_eq!(
+            participant.initial_authorization_expiry,
+            Some(i64::try_from(expiry).unwrap())
+        );
+    }
+
+    #[test]
+    fn inactive_v1_renewal_seam_bounds_duplicate_requests() {
+        let room_external_id = RoomExternalId::new("room").unwrap();
+        let mut rtc = Rtc::new(std::time::Instant::now());
+        let cid = rtc.direct_api().create_data_channel(Default::default());
+        let mut participant = Participant::new(
+            ParticipantConfig {
+                manual_sub: true,
+                room_id: entity::RoomId::from_external(&room_external_id),
+                participant_id: entity::ParticipantId::new(),
+                participant_external_id: ParticipantExternalId::new("alice").unwrap(),
+                connection_id: entity::ConnectionId::new(),
+                profile: ConnectionProfile::Native,
+                initial_authorization_expiry: None,
+                rtc,
+                resources: NegotiatedResources::empty_for_test(),
+            },
+            ShardId::new(0),
+            1_200,
+            1_200,
+        );
+        participant.enable_v1_test_output("alice".to_owned(), cid);
+        let wire =
+            pulsebeam_proto::codec::encode_client(&pulsebeam_proto::signaling_v1::ClientMessage {
+                payload: Some(
+                    pulsebeam_proto::signaling_v1::client_message::Payload::RenewAuthorization(
+                        pulsebeam_proto::signaling_v1::RenewAuthorization {
+                            token: "secret-token".to_owned(),
+                        },
+                    ),
+                ),
+            })
+            .unwrap();
+        let mut sink = crate::participant::event::test_utils::MockParticipantSink::new();
+        participant.handle_v1_input(&wire, &mut sink).unwrap();
+        participant.handle_v1_input(&wire, &mut sink).unwrap();
+        let empty =
+            pulsebeam_proto::codec::encode_client(&pulsebeam_proto::signaling_v1::ClientMessage {
+                payload: Some(
+                    pulsebeam_proto::signaling_v1::client_message::Payload::RenewAuthorization(
+                        pulsebeam_proto::signaling_v1::RenewAuthorization {
+                            token: String::new(),
+                        },
+                    ),
+                ),
+            })
+            .unwrap();
+        let oversized =
+            pulsebeam_proto::codec::encode_client(&pulsebeam_proto::signaling_v1::ClientMessage {
+                payload: Some(
+                    pulsebeam_proto::signaling_v1::client_message::Payload::RenewAuthorization(
+                        pulsebeam_proto::signaling_v1::RenewAuthorization {
+                            token: "x".repeat(16_385),
+                        },
+                    ),
+                ),
+            })
+            .unwrap();
+        participant.handle_v1_input(&empty, &mut sink).unwrap();
+        participant.handle_v1_input(&oversized, &mut sink).unwrap();
+        assert_eq!(sink.renewal_requests, 1);
+        let snapshot = participant.downstream.signaling_snapshot();
+        let responses: Vec<_> = (0..3)
+            .map(|_| {
+                let response = participant
+                    .signaling
+                    .poll(&snapshot)
+                    .expect("rejection output")
+                    .bytes;
+                participant.signaling.commit_sent();
+                response
+            })
+            .collect();
+        assert!(responses.iter().all(|bytes| matches!(
+            pulsebeam_proto::codec::decode_server(bytes),
+            Ok(pulsebeam_proto::signaling_v1::ServerMessage {
+                payload: Some(pulsebeam_proto::signaling_v1::server_message::Payload::Error(
+                    pulsebeam_proto::signaling_v1::Error { code, fatal: false, .. }
+                ))
+            }) if code == pulsebeam_proto::signaling_v1::ErrorCode::AuthorizationRejected as i32
+        )));
+
+        for expiry in 0..signaling::MAX_PENDING_AUTHORIZATION_RESPONSES {
+            assert!(
+                participant
+                    .signaling
+                    .stage_authorization(i64::try_from(expiry).unwrap())
+            );
+        }
+        assert!(matches!(
+            participant.handle_v1_input(&empty, &mut sink),
+            Err(signaling::SignalingError::ResponseBackpressured)
+        ));
+        let queued = participant
+            .signaling
+            .poll(&snapshot)
+            .expect("queued authorization")
+            .bytes;
+        participant.signaling.commit_sent();
+        participant.handle_v1_input(&empty, &mut sink).unwrap();
+        assert!(matches!(
+            pulsebeam_proto::codec::decode_server(&queued),
+            Ok(pulsebeam_proto::signaling_v1::ServerMessage {
+                payload: Some(
+                    pulsebeam_proto::signaling_v1::server_message::Payload::Authorization(_)
+                )
+            })
+        ));
+    }
+
+    #[test]
+    fn expiry_after_signaling_channel_close_disconnects_through_participant_poll() {
+        let room_external_id = RoomExternalId::new("expired-channel").unwrap();
+        let participant_id = entity::ParticipantId::new();
+        let connection_id = entity::ConnectionId::new();
+        let mut rtc = Rtc::new(std::time::Instant::now());
+        let cid = rtc.direct_api().create_data_channel(Default::default());
+        let mut participant = Participant::new(
+            ParticipantConfig {
+                manual_sub: true,
+                room_id: entity::RoomId::from_external(&room_external_id),
+                participant_id,
+                participant_external_id: ParticipantExternalId::new("alice").unwrap(),
+                connection_id,
+                profile: ConnectionProfile::Native,
+                initial_authorization_expiry: None,
+                rtc,
+                resources: NegotiatedResources::empty_for_test(),
+            },
+            ShardId::new(0),
+            1_200,
+            1_200,
+        );
+        participant.enable_v1_test_output("alice".to_owned(), cid);
+        let mut sink = crate::participant::event::test_utils::MockParticipantSink::new();
+        participant.handle_event(Instant::now(), Event::ChannelClose(cid), &mut sink);
+        participant.apply(
+            ParticipantEffect::AuthorizationExpired { connection_id },
+            None,
+        );
+
+        assert!(matches!(
+            participant.disconnect_reason,
+            Some(DisconnectReason::AuthorizationExpired)
+        ));
+        let _ = participant.poll(Instant::now(), &mut sink);
+        assert_eq!(sink.exit_count, 1);
+    }
+
+    #[test]
+    fn expiry_retries_when_an_opened_signaling_channel_is_backpressured() {
+        let room_external_id = RoomExternalId::new("expiry-send").unwrap();
+        let participant_id = entity::ParticipantId::new();
+        let connection_id = entity::ConnectionId::new();
+        let mut rtc = Rtc::new(std::time::Instant::now());
+        let cid = rtc.direct_api().create_data_channel(Default::default());
+        let mut participant = Participant::new(
+            ParticipantConfig {
+                manual_sub: true,
+                room_id: entity::RoomId::from_external(&room_external_id),
+                participant_id,
+                participant_external_id: ParticipantExternalId::new("alice").unwrap(),
+                connection_id,
+                profile: ConnectionProfile::Native,
+                initial_authorization_expiry: None,
+                rtc,
+                resources: NegotiatedResources::empty_for_test(),
+            },
+            ShardId::new(0),
+            1_200,
+            1_200,
+        );
+        participant.enable_v1_test_output("alice".to_owned(), cid);
+        participant.apply(
+            ParticipantEffect::AuthorizationExpired { connection_id },
+            None,
+        );
+
+        let queued_intent =
+            pulsebeam_proto::codec::encode_client(&pulsebeam_proto::signaling_v1::ClientMessage {
+                payload: Some(
+                    pulsebeam_proto::signaling_v1::client_message::Payload::Intent(
+                        pulsebeam_proto::signaling_v1::Intent {
+                            revision: 1,
+                            send: None,
+                            receive: None,
+                        },
+                    ),
+                ),
+            })
+            .unwrap();
+
+        let mut sink = crate::participant::event::test_utils::MockParticipantSink::new();
+        participant.handle_event(
+            Instant::now(),
+            Event::ChannelData(str0m::channel::ChannelData {
+                id: cid,
+                binary: true,
+                data: queued_intent,
+            }),
+            &mut sink,
+        );
+        let _ = participant.poll(Instant::now(), &mut sink);
+        assert_eq!(sink.exit_count, 0);
+        assert!(participant.signaling.needs_poll());
+        assert_eq!(participant.v1_test_mapping().intent_revision, 0);
+
+        participant.handle_event(Instant::now(), Event::ChannelClose(cid), &mut sink);
+        assert!(matches!(
+            participant.disconnect_reason,
+            Some(DisconnectReason::AuthorizationExpired)
+        ));
+        let _ = participant.poll(Instant::now(), &mut sink);
+        assert_eq!(sink.exit_count, 1);
+    }
+
+    #[test]
+    fn expiry_retries_fatal_bytes_then_commits_and_exits_through_participant_poll() {
+        let room_external_id = RoomExternalId::new("expiry-retry").unwrap();
+        let connection_id = entity::ConnectionId::new();
+        let mut rtc = Rtc::new(std::time::Instant::now());
+        let cid = rtc.direct_api().create_data_channel(Default::default());
+        let mut participant = Participant::new(
+            ParticipantConfig {
+                manual_sub: true,
+                room_id: entity::RoomId::from_external(&room_external_id),
+                participant_id: entity::ParticipantId::new(),
+                participant_external_id: ParticipantExternalId::new("alice").unwrap(),
+                connection_id,
+                profile: ConnectionProfile::Native,
+                initial_authorization_expiry: None,
+                rtc,
+                resources: NegotiatedResources::empty_for_test(),
+            },
+            ShardId::new(0),
+            1_200,
+            1_200,
+        );
+        participant.enable_v1_test_output("alice".to_owned(), cid);
+        participant.apply(
+            ParticipantEffect::AuthorizationExpired { connection_id },
+            None,
+        );
+        let mut sink = crate::participant::event::test_utils::MockParticipantSink::new();
+
+        participant.set_v1_test_write_channel_result(false);
+        let _ = participant.poll(Instant::now(), &mut sink);
+        let failed = participant.v1_test_channel_write_attempts().to_vec();
+        assert!(!failed.is_empty());
+        assert!(failed.iter().all(|bytes| bytes == &failed[0]));
+        assert_eq!(sink.exit_count, 0);
+
+        participant.set_v1_test_write_channel_result(true);
+        let _ = participant.poll(Instant::now(), &mut sink);
+        let attempts = participant.v1_test_channel_write_attempts();
+        assert_eq!(attempts.len(), failed.len() + 1);
+        assert_eq!(attempts.last(), failed.first());
+        let _ = participant.poll(Instant::now(), &mut sink);
+        assert_eq!(sink.exit_count, 1);
+    }
+}
+
+#[cfg(test)]
+mod v1_server_integration_tests {
+    use super::*;
+    use crate::entity::{ParticipantExternalId, RoomExternalId};
+    use crate::participant::event::test_utils::MockParticipantSink;
+    use str0m::channel::ChannelData;
+
+    fn participant() -> (Participant, ChannelId) {
+        let room = RoomExternalId::new("v1-integration").unwrap();
+        let mut rtc = Rtc::new(std::time::Instant::now());
+        let cid = rtc.direct_api().create_data_channel(Default::default());
+        let mut participant = Participant::new(
+            ParticipantConfig {
+                manual_sub: true,
+                room_id: entity::RoomId::from_external(&room),
+                participant_id: entity::ParticipantId::new(),
+                participant_external_id: ParticipantExternalId::new("alice").unwrap(),
+                connection_id: entity::ConnectionId::new(),
+                profile: ConnectionProfile::Native,
+                initial_authorization_expiry: None,
+                rtc,
+                resources: NegotiatedResources::empty_for_test(),
+            },
+            ShardId::new(0),
+            1_200,
+            1_200,
+        );
+        participant.signaling.set_cid(cid);
+        participant.set_v1_test_write_channel_result(true);
+        (participant, cid)
+    }
+
+    #[test]
+    fn channel_data_uses_compressed_v1_and_emits_catalog_before_mapping() {
+        let (mut participant, cid) = participant();
+        let mut sink = MockParticipantSink::new();
+
+        participant.poll(Instant::now(), &mut sink);
+        let initial = participant
+            .v1_test_channel_write_attempts()
+            .first()
+            .unwrap();
+        assert!(matches!(
+            pulsebeam_proto::codec::decode_server(initial),
+            Ok(pulsebeam_proto::signaling_v1::ServerMessage {
+                payload: Some(pulsebeam_proto::signaling_v1::server_message::Payload::Catalog(_))
+            })
+        ));
+
+        let intent =
+            pulsebeam_proto::codec::encode_client(&pulsebeam_proto::signaling_v1::ClientMessage {
+                payload: Some(
+                    pulsebeam_proto::signaling_v1::client_message::Payload::Intent(
+                        pulsebeam_proto::signaling_v1::Intent {
+                            revision: 1,
+                            send: None,
+                            receive: None,
+                        },
+                    ),
+                ),
+            })
+            .unwrap();
+        participant.handle_event(
+            Instant::now(),
+            Event::ChannelData(ChannelData {
+                id: cid,
+                binary: true,
+                data: intent,
+            }),
+            &mut sink,
+        );
+        let offset = participant.v1_test_channel_write_attempts().len();
+        participant.set_v1_test_write_channel_result(true);
+        participant.poll(Instant::now(), &mut sink);
+
+        assert!(
+            participant.v1_test_channel_write_attempts()[offset..]
+                .iter()
+                .any(|mapping| matches!(
+                    pulsebeam_proto::codec::decode_server(mapping),
+                    Ok(pulsebeam_proto::signaling_v1::ServerMessage {
+                        payload: Some(
+                            pulsebeam_proto::signaling_v1::server_message::Payload::Mapping(
+                                pulsebeam_proto::signaling_v1::Mapping {
+                                    intent_revision: 1,
+                                    ..
+                                }
+                            )
+                        )
+                    })
+                ))
+        );
+    }
+
+    #[test]
+    fn malformed_channel_data_emits_terminal_invalid_message() {
+        let (mut participant, cid) = participant();
+        let mut sink = MockParticipantSink::new();
+        participant.handle_event(
+            Instant::now(),
+            Event::ChannelData(ChannelData {
+                id: cid,
+                binary: true,
+                data: vec![0xff],
+            }),
+            &mut sink,
+        );
+        participant.poll(Instant::now(), &mut sink);
+
+        assert!(matches!(
+            participant
+                .v1_test_channel_write_attempts()
+                .last()
+                .and_then(|bytes| pulsebeam_proto::codec::decode_server(bytes).ok()),
+            Some(pulsebeam_proto::signaling_v1::ServerMessage {
+                payload: Some(pulsebeam_proto::signaling_v1::server_message::Payload::Error(
+                    pulsebeam_proto::signaling_v1::Error { code, fatal: true, .. }
+                ))
+            }) if code == pulsebeam_proto::signaling_v1::ErrorCode::InvalidMessage as i32
+        ));
+        participant.poll(Instant::now(), &mut sink);
+        assert_eq!(sink.exit_count, 1);
+    }
+
+    #[test]
+    fn in_poll_terminal_event_fences_later_rtc_slow_and_media_work() {
+        let (mut participant, cid) = participant();
+        let now = Instant::now();
+        participant.last_slow_poll = now - SLOW_POLL_INTERVAL;
+        participant.set_v1_test_write_channel_result(false);
+        participant
+            .transport
+            .enqueue_test_rtc_event(Event::ChannelData(ChannelData {
+                id: cid,
+                binary: true,
+                data: vec![0xff],
+            }));
+        let intent =
+            pulsebeam_proto::codec::encode_client(&pulsebeam_proto::signaling_v1::ClientMessage {
+                payload: Some(
+                    pulsebeam_proto::signaling_v1::client_message::Payload::Intent(
+                        pulsebeam_proto::signaling_v1::Intent {
+                            revision: 1,
+                            send: None,
+                            receive: None,
+                        },
+                    ),
+                ),
+            })
+            .unwrap();
+        participant
+            .transport
+            .enqueue_test_rtc_event(Event::ChannelData(ChannelData {
+                id: cid,
+                binary: true,
+                data: intent,
+            }));
+        participant
+            .transport
+            .enqueue_mutation(TransportMutation::Data {
+                channel: cid,
+                bytes: b"later media work".to_vec(),
+            });
+        let previous_slow_poll = participant.last_slow_poll;
+        let mut sink = MockParticipantSink::new();
+
+        participant.poll(now, &mut sink);
+
+        let attempts = participant.v1_test_channel_write_attempts();
+        assert_eq!(attempts.len(), 1);
+        assert!(matches!(
+            pulsebeam_proto::codec::decode_server(&attempts[0]),
+            Ok(pulsebeam_proto::signaling_v1::ServerMessage {
+                payload: Some(
+                    pulsebeam_proto::signaling_v1::server_message::Payload::Error(
+                        pulsebeam_proto::signaling_v1::Error { fatal: true, .. }
+                    )
+                )
+            })
+        ));
+        assert_eq!(participant.v1_test_mapping().intent_revision, 0);
+        assert_eq!(participant.last_slow_poll, previous_slow_poll);
+        assert_eq!(participant.transport.test_pending_mutation_count(), 1);
+        assert_eq!(sink.exit_count, 0);
     }
 }
 
@@ -1367,5 +2620,83 @@ mod upstream_route_table_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod v1_catalog_reconciliation_tests {
+    use super::*;
+    use crate::participant::event::test_utils::MockParticipantSink;
+    use crate::track::test_utils::make_audio_track;
+
+    fn participant() -> Participant {
+        let room = crate::entity::RoomExternalId::new("room").unwrap();
+        Participant::new(
+            ParticipantConfig {
+                manual_sub: true,
+                room_id: crate::entity::RoomId::from_external(&room),
+                participant_id: crate::entity::ParticipantId::new(),
+                participant_external_id: crate::entity::ParticipantExternalId::new("self").unwrap(),
+                connection_id: crate::entity::ConnectionId::new(),
+                profile: ConnectionProfile::Native,
+                initial_authorization_expiry: None,
+                rtc: Rtc::new(std::time::Instant::now()),
+                resources: NegotiatedResources::empty_for_test(),
+            },
+            ShardId::new(0),
+            1_200,
+            1_200,
+        )
+    }
+
+    #[test]
+    fn retained_unavailable_audio_is_mapped_when_published_and_unmapped_when_removed() {
+        let mut participant = participant();
+        participant.downstream.add_slot(SlotConfig {
+            media_index: 7,
+            mid: Mid::from("receive-audio"),
+            kind: MediaKind::Audio,
+            ..SlotConfig::default()
+        });
+        let remote = crate::entity::ParticipantId::new();
+        let (upstream, track) = make_audio_track(remote, Mid::from("remote-audio"));
+        let track_id = track.id().as_str();
+        let mut sink = MockParticipantSink::new();
+
+        let accepted = participant.apply_v1_intent(
+            pulsebeam_proto::signaling_v1::Intent {
+                revision: 1,
+                send: None,
+                receive: Some(pulsebeam_proto::signaling_v1::ReceiveIntent {
+                    video: None,
+                    audio: Some(pulsebeam_proto::signaling_v1::AudioIntent {
+                        tracks: vec![pulsebeam_proto::signaling_v1::AudioTrackIntent {
+                            track_id: track_id.clone(),
+                            options: None,
+                        }],
+                        mode: pulsebeam_proto::signaling_v1::AudioMode::ExplicitOnly.into(),
+                    }),
+                }),
+            },
+            &mut sink,
+        );
+        assert!(
+            matches!(accepted, signaling::V1IntentResult::Mapping(ref mapping) if mapping.audio.as_ref().is_some_and(|audio| audio.tracks.is_empty()))
+        );
+
+        participant.on_track_published(TrackHandle::default(), track);
+        assert_eq!(
+            participant.v1_mapping().audio.unwrap().tracks,
+            vec![pulsebeam_proto::signaling_v1::TrackMapping {
+                receiver_index: 7,
+                track_id: track_id,
+            }]
+        );
+
+        assert!(participant.on_tracks_unpublished(&[upstream.meta.id]));
+        let mapping = participant.v1_mapping();
+        assert_eq!(mapping.intent_revision, 1);
+        assert!(mapping.video.is_some_and(|video| video.tracks.is_empty()));
+        assert!(mapping.audio.is_some_and(|audio| audio.tracks.is_empty()));
     }
 }

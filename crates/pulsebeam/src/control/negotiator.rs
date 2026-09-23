@@ -18,6 +18,7 @@ pub const MAX_RECV_AUDIO_SLOTS: usize = 2;
 pub const MAX_SEND_VIDEO_SLOTS: usize = 7;
 pub const MAX_SEND_AUDIO_SLOTS: usize = 3;
 pub const MAX_DATA_CHANNELS: usize = 1;
+pub const MAX_RTP_SLOTS_PER_TYPE: usize = 32;
 
 #[derive(Debug)]
 pub enum MediaType {
@@ -98,8 +99,13 @@ impl NegotiatedResources {
     }
 
     #[cfg(test)]
-    fn as_slice(&self) -> &[NegotiatedMedia] {
+    pub(crate) fn as_slice(&self) -> &[NegotiatedMedia] {
         &self.media
+    }
+
+    #[cfg(test)]
+    pub(crate) fn empty_for_test() -> Self {
+        Self { media: Vec::new() }
     }
 }
 

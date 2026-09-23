@@ -47,12 +47,14 @@ pub enum StreamWrite {
         rid: Option<Rid>,
         ssrc: Ssrc,
         pt: Pt,
+        playout_delay: Option<(str0m::media::MediaTime, str0m::media::MediaTime)>,
     },
     Audio {
         pkt: RtpPacket,
         mid: Mid,
         ssrc: Ssrc,
         pt: Pt,
+        playout_delay: Option<(str0m::media::MediaTime, str0m::media::MediaTime)>,
     },
 }
 
@@ -82,6 +84,7 @@ impl StreamWriter {
         rid: Option<Rid>,
         ssrc: Ssrc,
         pt: Pt,
+        playout_delay: Option<(str0m::media::MediaTime, str0m::media::MediaTime)>,
     ) {
         self.pending.push_back(StreamWrite::Video {
             pkt,
@@ -89,16 +92,65 @@ impl StreamWriter {
             rid,
             ssrc,
             pt,
+            playout_delay,
         });
     }
 
-    pub fn write_audio_owned(&mut self, pkt: RtpPacket, mid: Mid, ssrc: Ssrc, pt: Pt) {
-        self.pending
-            .push_back(StreamWrite::Audio { pkt, mid, ssrc, pt });
+    pub fn write_audio_owned(
+        &mut self,
+        pkt: RtpPacket,
+        mid: Mid,
+        ssrc: Ssrc,
+        pt: Pt,
+        playout_delay: Option<(str0m::media::MediaTime, str0m::media::MediaTime)>,
+    ) {
+        self.pending.push_back(StreamWrite::Audio {
+            pkt,
+            mid,
+            ssrc,
+            pt,
+            playout_delay,
+        });
     }
 
     pub fn pop(&mut self) -> Option<StreamWrite> {
         self.pending.pop_front()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use str0m::media::MediaTime;
+
+    #[test]
+    fn queued_writes_keep_their_audio_and_video_playout_snapshots() {
+        let mut writer = StreamWriter::new();
+        let audio = Some((MediaTime::from_hundredths(2), MediaTime::from_hundredths(4)));
+        let video = Some((MediaTime::from_hundredths(6), MediaTime::from_hundredths(9)));
+
+        writer.write_audio_owned(
+            RtpPacket::default(),
+            Mid::from("audio"),
+            Ssrc::from(1_u32),
+            Pt::from(111_u8),
+            audio,
+        );
+        writer.write_video_owned(
+            RtpPacket::default(),
+            Mid::from("video"),
+            None,
+            Ssrc::from(2_u32),
+            Pt::from(96_u8),
+            video,
+        );
+
+        assert!(
+            matches!(writer.pop(), Some(StreamWrite::Audio { playout_delay, .. }) if playout_delay == audio)
+        );
+        assert!(
+            matches!(writer.pop(), Some(StreamWrite::Video { playout_delay, .. }) if playout_delay == video)
+        );
     }
 }
 
@@ -109,6 +161,31 @@ pub struct TrackMeta {
     pub shard_id: ShardId,
     pub id: crate::entity::TrackId,
     pub origin: crate::entity::ParticipantId,
+    /// Application-facing media identity. Legacy signaling publications have
+    /// no label and are intentionally ineligible for the replacement catalog.
+    pub label: Option<String>,
+}
+
+impl TrackMeta {
+    #[allow(
+        dead_code,
+        reason = "candidate replacement signaling is intentionally not routed in this slice"
+    )]
+    pub(crate) fn labeled_media(
+        room_id: crate::entity::RoomId,
+        shard_id: ShardId,
+        origin: ParticipantId,
+        kind: TrackKind,
+        label: String,
+    ) -> Self {
+        Self {
+            room_id,
+            shard_id,
+            id: origin.derive_track_id(kind, &label),
+            origin,
+            label: Some(label),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -666,6 +743,23 @@ impl Track {
         }
     }
 
+    #[allow(
+        dead_code,
+        reason = "the replacement signaling transaction updates native publication metadata in Plan 07"
+    )]
+    pub(crate) fn replace_meta(&mut self, meta: TrackMeta) {
+        match self {
+            Self::Audio(track) => track.meta = meta,
+            Self::Video(track) => {
+                track.meta = meta.clone();
+                for layer in &mut track.layers {
+                    layer.meta = meta.clone();
+                }
+            }
+            Self::Data(track) => track.meta = meta,
+        }
+    }
+
     pub fn id(&self) -> TrackId {
         self.meta().id
     }
@@ -693,7 +787,8 @@ impl Track {
     pub fn publication_label(&self) -> Option<String> {
         match self {
             Self::Data(track) => Some(publication_label(track.lane, &track.topic)),
-            Self::Audio(_) | Self::Video(_) => None,
+            Self::Audio(track) => track.meta.label.clone(),
+            Self::Video(track) => track.meta.label.clone(),
         }
     }
 
@@ -930,6 +1025,7 @@ pub mod test_utils {
             shard_id: ShardId::new(0),
             id: track_id,
             origin: participant_id,
+            label: None,
         };
         crate::track::new_video(mid, meta, layers)
     }
@@ -943,6 +1039,7 @@ pub mod test_utils {
             shard_id: ShardId::new(0),
             id: track_id,
             origin: participant_id,
+            label: None,
         };
         crate::track::new_audio(mid, meta)
     }
@@ -1144,7 +1241,15 @@ mod data_track {
             match parts.next() {
                 Some("sys") => {
                     if parts.next() == Some("signaling") && parts.next().is_none() {
-                        Ok(Self::InternalSignaling)
+                        if cfg.ordered && matches!(cfg.reliability, Reliability::Reliable) {
+                            Ok(Self::InternalSignaling)
+                        } else {
+                            Err(DataTrackIntentError::UnsupportedDataChannelConfig {
+                                label: s.clone(),
+                                ordered: cfg.ordered,
+                                reliability: cfg.reliability,
+                            })
+                        }
                     } else {
                         Err(DataTrackIntentError::InvalidDirection)
                     }
@@ -1269,8 +1374,17 @@ mod data_track {
 
         #[test]
         fn test_modern_system_routing() {
-            let res = DataTrackIntent::try_from(&cfg("v1/sys/signaling")).unwrap();
+            let res = DataTrackIntent::try_from(&rel_cfg("v1/sys/signaling")).unwrap();
             assert!(matches!(res, DataTrackIntent::InternalSignaling));
+        }
+
+        #[test]
+        fn system_signaling_requires_reliable_ordered_delivery() {
+            let err = DataTrackIntent::try_from(&cfg("v1/sys/signaling")).unwrap_err();
+            assert!(matches!(
+                err,
+                DataTrackIntentError::UnsupportedDataChannelConfig { .. }
+            ));
         }
 
         #[test]

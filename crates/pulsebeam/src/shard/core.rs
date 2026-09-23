@@ -191,6 +191,8 @@ impl ShardCore {
         tcp_socket: &mut net::tcp::TcpTransport,
         budget: usize,
     ) -> usize {
+        self.updates
+            .apply_pending_participant_effects(&mut self.execution);
         self.execution
             .poll_and_flush_dirty(now, udp_socket, tcp_socket, budget)
     }
@@ -335,7 +337,17 @@ impl ShardExecution {
         let Some(meta) = self.registry.resolve_mut(handle) else {
             return false;
         };
-        meta.apply(effect, track_handle);
+        if matches!(
+            effect,
+            crate::participant::ParticipantEffect::AuthorizationRenewed { .. }
+                | crate::participant::ParticipantEffect::AuthorizationRejected { .. }
+        ) {
+            if !meta.apply_authorization_result(effect) {
+                return false;
+            }
+        } else {
+            meta.apply(effect, track_handle);
+        }
         self.dirty.mark(handle, meta);
         true
     }

@@ -5,6 +5,7 @@ use crate::entity::{ConnectionId, ParticipantId, RoomId, TrackId};
 use crate::keys::ParticipantHandle;
 use crate::keys::TrackHandle;
 use crate::participant::TrackPacket;
+use crate::participant::effect::{AuthorizationRequestId, RenewalToken};
 use crate::participant::event::ParticipantSink;
 use crate::participant::reverse::ReversePacket;
 use crate::track::{SelectionPolicy, Track, TrackMeta, TrackSelector};
@@ -240,6 +241,16 @@ impl<'a> ParticipantSink for PipelineSinkRef<'a> {
                     connection_id: self.connection_id,
                 },
             ));
+    }
+
+    fn renew_authorization(&mut self, request_id: AuthorizationRequestId, token: RenewalToken) {
+        self.pipeline
+            .push_shard_event(ShardEvent::RenewAuthorization {
+                participant: self.id,
+                connection_id: self.connection_id,
+                request_id,
+                token,
+            });
     }
 
     #[inline]

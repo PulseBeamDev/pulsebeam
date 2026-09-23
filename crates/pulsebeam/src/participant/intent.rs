@@ -1,4 +1,19 @@
 use crate::entity::TrackId;
+use crate::entity::TrackKind;
+
+/// Normalized native send entry. The decoder keeps malformed coordinates as
+/// `None` so publication reconciliation can skip them without changing the
+/// accepted replacement state.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(
+    dead_code,
+    reason = "the replacement signaling transaction consumes normalized publications in Plan 07"
+)]
+pub(crate) struct NativePublication {
+    pub(crate) sender_index: Option<u32>,
+    pub(crate) kind: Option<TrackKind>,
+    pub(crate) label: String,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AudioIntent {

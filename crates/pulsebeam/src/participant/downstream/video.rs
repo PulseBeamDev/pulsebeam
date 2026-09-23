@@ -1,5 +1,5 @@
 use crate::bitrate::{BitrateController, BitrateControllerConfig};
-use crate::participant::downstream::SlotConfig;
+use crate::participant::downstream::{PlayoutPolicy, ReceiverPlayout, SlotConfig};
 use crate::participant::event::ParticipantSink;
 use crate::rtp;
 #[cfg(test)]
@@ -15,7 +15,7 @@ use std::ops::{Deref, DerefMut};
 use std::time::Duration;
 use str0m::bwe::Bitrate;
 use str0m::media::{KeyframeRequest, Mid, Pt, Rid};
-use str0m::rtp::Ssrc;
+use str0m::rtp::{SeqNo, Ssrc};
 use tokio::time::Instant;
 
 use crate::entity::TrackId;
@@ -29,7 +29,7 @@ use crate::track::{LayerQuality, StreamId, StreamWriter, Track, TrackLayer, Trac
 /// A starting capacity, not a bound. Nothing here may assume a participant has
 /// few slots: the negotiated limit is expected to rise, so anything that walks
 /// slots has to stay cheap as it does.
-const VIDEO_MAX_SLOTS: usize = 25;
+const VIDEO_MAX_SLOTS: usize = crate::control::MAX_RTP_SLOTS_PER_TYPE;
 
 /// How long to wait before the *first* PLI retry while a slot is transitioning.
 ///
@@ -114,6 +114,7 @@ pub struct VideoAllocator {
     last_reconciled: HashSet<(TrackHandle, DownstreamSlotKey)>,
     desired_ctrl: BitrateController,
     current_allocation: Bitrate,
+    receiver_assignment_revision: u64,
     #[cfg(test)]
     test_keys: SlotMap<TrackHandle, ()>,
     #[cfg(test)]
@@ -122,6 +123,37 @@ pub struct VideoAllocator {
 
 pub struct DownstreamVideo {
     allocator: VideoAllocator,
+}
+
+#[derive(Clone)]
+pub(crate) struct VideoReceiverRequest {
+    pub(crate) intent: Intent,
+    pub(crate) playout: PlayoutPolicy,
+}
+
+#[derive(Clone)]
+pub(crate) struct VideoReceiverAssignment {
+    pub(crate) receiver_index: u32,
+    pub(crate) request: VideoReceiverRequest,
+}
+
+pub(crate) struct VideoReceiverPreview {
+    revision: u64,
+    assignments: Vec<VideoReceiverAssignment>,
+}
+
+impl VideoReceiverPreview {
+    pub(crate) fn assignments(&self) -> &[VideoReceiverAssignment] {
+        &self.assignments
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum VideoReceiverAdmissionError {
+    Capacity,
+    DuplicateTrack,
+    PlayoutResetRequired,
+    Stale,
 }
 
 impl DownstreamVideo {
@@ -147,6 +179,25 @@ impl DerefMut for DownstreamVideo {
 }
 
 impl VideoAllocator {
+    #[cfg(test)]
+    pub(crate) fn v1_test_receiver_locked(&self, receiver_index: u32) -> bool {
+        self.slots
+            .values()
+            .find(|slot| slot.media_index == receiver_index)
+            .is_some_and(|slot| slot.playout.is_locked())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn v1_test_selected_layer(&self) -> Option<LayerQuality> {
+        self.slots
+            .values()
+            .find_map(|slot| slot.target().map(|layer| layer.quality))
+    }
+
+    fn invalidate_receiver_previews(&mut self) {
+        self.receiver_assignment_revision = self.receiver_assignment_revision.wrapping_add(1);
+    }
+
     pub(crate) fn new(ctx: LogCtx, manual_sub: bool) -> Self {
         let desired_ctrl = BitrateControllerConfig {
             min_bitrate: START_BANDWIDTH,
@@ -166,6 +217,7 @@ impl VideoAllocator {
             last_reconciled: HashSet::new(),
             desired_ctrl,
             current_allocation: Bitrate::ZERO,
+            receiver_assignment_revision: 0,
             #[cfg(test)]
             test_keys: SlotMap::with_key(),
             #[cfg(test)]
@@ -221,6 +273,7 @@ impl VideoAllocator {
                 slot.stop();
             }
         }
+        self.invalidate_receiver_previews();
         self.rebalance();
         true
     }
@@ -246,10 +299,11 @@ impl VideoAllocator {
                 Self::configure_slot(tracks, track_handles, slot, None);
             }
         }
+        self.invalidate_receiver_previews();
     }
 
     /// Routes this slot to the given track at the specified QoS, or stops
-    /// routing if `track_id` is `None` or `intent.max_height` is 0.
+    /// routing if `track_id` is `None` or both requested heights are 0.
     fn configure_slot(
         tracks: &SecondaryMap<TrackHandle, Track>,
         track_handles: &HashMap<TrackId, TrackHandle>,
@@ -257,7 +311,7 @@ impl VideoAllocator {
         intent: Option<&Intent>,
     ) -> Option<()> {
         if let Some(intent) = intent
-            && intent.target_height > 0
+            && intent.target_height.max(intent.min_height) > 0
         {
             let track_id = &intent.track_id;
             let Some(&track_handle) = track_handles.get(track_id) else {
@@ -272,19 +326,39 @@ impl VideoAllocator {
                 return None;
             };
 
-            // Keep current layer if slot already targets this track to avoid
-            // unnecessary PLI requests; otherwise start at lowest quality.
+            let min_height = intent.min_height;
+            let states = track_states(track_state);
+            let meets_floor = |layer: &TrackLayer| {
+                min_height == 0
+                    || states
+                        .get(&layer.stream_id())
+                        .is_some_and(|state| state.height() >= min_height)
+            };
+
+            // Keep a floor-compatible current layer to avoid unnecessary PLI
+            // requests; otherwise begin at the lowest healthy layer that meets
+            // the requested floor. If the publication has no such layer, park
+            // on its highest layer and pause below.
             let layer = if let Some(target) = slot.target()
                 && target.meta.id == track_state.id()
+                && meets_floor(target)
             {
                 target
             } else {
-                let states = track_states(track_state);
-                let Some(layer) = track_state.lowest_healthy_quality(|l| {
-                    states
-                        .get(&l.stream_id())
-                        .is_some_and(crate::rtp::monitor::StreamStats::is_healthy)
-                }) else {
+                let layer = track_state
+                    .lowest_healthy_quality(|layer| {
+                        meets_floor(layer)
+                            && states
+                                .get(&layer.stream_id())
+                                .is_some_and(crate::rtp::monitor::StreamStats::is_healthy)
+                    })
+                    .or_else(|| {
+                        track_state
+                            .layers()
+                            .iter()
+                            .max_by_key(|layer| layer.quality)
+                    });
+                let Some(layer) = layer else {
                     slot.stop();
                     return None;
                 };
@@ -292,11 +366,20 @@ impl VideoAllocator {
             };
 
             let layer = layer.clone();
-            slot.max_height = intent.target_height;
+            slot.max_height = intent.target_height.max(intent.min_height);
             slot.min_height = intent.min_height;
             slot.min_fps = intent.min_fps;
             slot.priority = intent.priority;
-            slot.switch_to(&layer, false);
+            if !meets_floor(&layer) {
+                slot.pause_at(&layer);
+            } else if intent.min_height > 0 && slot.needs_floor_barrier(&layer) {
+                // An old lower layer may still be active or draining while the
+                // floor-compatible layer awaits a keyframe. Stop it before the
+                // new stage is exposed so no packet slips through below floor.
+                slot.pause_at(&layer);
+            } else {
+                slot.switch_to(&layer, false);
+            }
         } else {
             slot.max_height = 0;
             slot.min_height = 0;
@@ -336,6 +419,197 @@ impl VideoAllocator {
             .map(|slot| slot.media_index)
     }
 
+    pub(crate) fn set_playout_policy_all(&mut self, policy: PlayoutPolicy) {
+        for slot in self.slots.values_mut() {
+            let _ = slot.playout.set_policy(policy);
+        }
+        self.invalidate_receiver_previews();
+    }
+
+    /// Evaluate every requested receiver without changing allocator state.
+    pub(crate) fn preview_receiver_assignments(
+        &self,
+        requests: &[VideoReceiverRequest],
+    ) -> Result<VideoReceiverPreview, VideoReceiverAdmissionError> {
+        if requests.len() > self.slots.len() {
+            return Err(VideoReceiverAdmissionError::Capacity);
+        }
+
+        let mut track_ids = HashSet::with_capacity(requests.len());
+        if requests
+            .iter()
+            .any(|request| !track_ids.insert(request.intent.track_id))
+        {
+            return Err(VideoReceiverAdmissionError::DuplicateTrack);
+        }
+
+        let mut requested = requests.to_vec();
+        requested.sort_by_key(|request| request.intent.track_id.as_str());
+
+        let mut slots: Vec<_> = self.slots.values().collect();
+        slots.sort_by_key(|slot| (slot.media_index, slot.mid.to_string()));
+        let Some(max_preserved) = maximum_preserved_matching(&requested, &slots) else {
+            return Err(VideoReceiverAdmissionError::PlayoutResetRequired);
+        };
+
+        // Choose the lexicographically smallest receiver-index vector among
+        // the maximum-preservation matchings.  Re-solving the bounded matching
+        // after each prefix keeps a current occupant a preference, never a
+        // reservation that can make the remainder impossible.
+        let mut assigned = HashSet::new();
+        let mut assignments = Vec::with_capacity(requested.len());
+        let mut preserved: usize = 0;
+        for (request_index, request) in requested.iter().enumerate() {
+            let Some((slot_index, keeps_current)) = slots
+                .iter()
+                .enumerate()
+                .filter(|(slot_index, slot)| {
+                    !assigned.contains(&slot.media_index)
+                        && slot.playout.can_admit(request.playout)
+                        && maximum_preserved_matching_with_prefix(
+                            &requested,
+                            &slots,
+                            request_index,
+                            &assigned,
+                            *slot_index,
+                        )
+                        .is_some_and(|remaining| {
+                            preserved
+                                .saturating_add(usize::from(
+                                    slot.logical_track_id == Some(request.intent.track_id),
+                                ))
+                                .saturating_add(remaining)
+                                == max_preserved
+                        })
+                })
+                .map(|(slot_index, slot)| {
+                    (
+                        slot_index,
+                        slot.logical_track_id == Some(request.intent.track_id),
+                    )
+                })
+                .next()
+            else {
+                debug_assert!(false, "a maximum matching must admit each chosen prefix");
+                return Err(VideoReceiverAdmissionError::PlayoutResetRequired);
+            };
+            let Some(slot) = slots.get(slot_index).copied() else {
+                debug_assert!(
+                    false,
+                    "a selected slot must remain in the sorted receiver list"
+                );
+                return Err(VideoReceiverAdmissionError::PlayoutResetRequired);
+            };
+            assigned.insert(slot.media_index);
+            preserved = preserved.saturating_add(usize::from(keeps_current));
+            assignments.push(VideoReceiverAssignment {
+                receiver_index: slot.media_index,
+                request: request.clone(),
+            });
+        }
+
+        assignments.sort_by_key(|assignment| assignment.receiver_index);
+        Ok(VideoReceiverPreview {
+            revision: self.receiver_assignment_revision,
+            assignments,
+        })
+    }
+
+    /// Apply an accepted preview only if it still describes this allocator.
+    pub(crate) fn commit_receiver_assignments(
+        &mut self,
+        preview: VideoReceiverPreview,
+    ) -> Result<bool, VideoReceiverAdmissionError> {
+        if preview.revision != self.receiver_assignment_revision {
+            return Err(VideoReceiverAdmissionError::Stale);
+        }
+        if preview.assignments.iter().any(|assignment| {
+            self.slots
+                .values()
+                .find(|slot| slot.media_index == assignment.receiver_index)
+                .is_none_or(|slot| !slot.playout.can_admit(assignment.request.playout))
+        }) {
+            return Err(VideoReceiverAdmissionError::Stale);
+        }
+
+        let logical_changed = self.slots.values().any(|slot| {
+            preview
+                .assignments
+                .iter()
+                .find(|assignment| assignment.receiver_index == slot.media_index)
+                .map(|assignment| assignment.request.intent.track_id)
+                != slot.logical_track_id
+        });
+
+        for slot in self.slots.values_mut() {
+            let Some(assignment) = preview
+                .assignments
+                .iter()
+                .find(|assignment| assignment.receiver_index == slot.media_index)
+            else {
+                slot.logical_track_id = None;
+                slot.stop();
+                continue;
+            };
+            debug_assert!(slot.playout.set_policy(assignment.request.playout));
+            slot.logical_track_id = Some(assignment.request.intent.track_id);
+            Self::configure_slot(
+                &self.tracks,
+                &self.track_handles,
+                slot,
+                Some(&assignment.request.intent),
+            );
+        }
+        self.invalidate_receiver_previews();
+        Ok(logical_changed)
+    }
+
+    /// The logical map is independent from active, staging, and draining RTP.
+    pub(crate) fn receiver_assignments(&self) -> Vec<(u32, TrackId)> {
+        let mut assignments: Vec<_> = self
+            .slots
+            .values()
+            .filter_map(|slot| {
+                slot.logical_track_id
+                    .map(|track_id| (slot.media_index, track_id))
+            })
+            .collect();
+        assignments.sort_by_key(|(receiver_index, _)| *receiver_index);
+        assignments
+    }
+
+    pub(crate) fn record_playout_delay_stamp(
+        &mut self,
+        mid: Mid,
+        rid: Option<Rid>,
+        playout_delay: (str0m::media::MediaTime, str0m::media::MediaTime),
+        seq: SeqNo,
+    ) {
+        if let Some(slot) = self
+            .slots
+            .values_mut()
+            .find(|slot| slot.mid == mid && slot.rid == rid)
+        {
+            slot.playout.record_stamp(playout_delay, seq);
+            self.invalidate_receiver_previews();
+        }
+    }
+
+    pub(crate) fn handle_egress_stats(
+        &mut self,
+        mid: Mid,
+        rid: Option<Rid>,
+        remote_max_seq: SeqNo,
+    ) {
+        if let Some(slot) = self
+            .slots
+            .values_mut()
+            .find(|slot| slot.mid == mid && slot.rid == rid)
+        {
+            slot.playout.confirm(remote_max_seq);
+        }
+    }
+
     pub fn refresh_ssrc(&mut self, mid: Mid, rid: Option<Rid>, ssrc: Ssrc) -> bool {
         for slot in self.slots.values_mut() {
             if slot.mid == mid && slot.rid == rid {
@@ -346,13 +620,19 @@ impl VideoAllocator {
         false
     }
 
+    #[cfg(test)]
     pub fn add_slot(&mut self, config: SlotConfig) {
+        self.add_slot_with_policy(config, PlayoutPolicy::Default);
+    }
+
+    pub(crate) fn add_slot_with_policy(&mut self, config: SlotConfig, playout: PlayoutPolicy) {
         if self.has_slot(config.mid) {
             plog_debug!(self.ctx, mid = %config.mid, "video slot already provisioned; skipping duplicate");
             return;
         }
-        let slot = Slot::new(self.ctx, config);
+        let slot = Slot::new(self.ctx, config, playout);
         self.slots.insert(slot);
+        self.invalidate_receiver_previews();
         self.rebalance();
     }
 
@@ -510,10 +790,16 @@ impl VideoAllocator {
 
             match decision {
                 AllocationDecision::Forward(layer, _) => {
+                    if slot.min_height > 0 && slot.needs_floor_barrier(layer) {
+                        changed |= slot.pause_at(layer);
+                    }
                     changed |= slot.switch_to(layer, false);
                     changed |= slot.set_decode_target(DecodeTargetSelection::Full);
                 }
                 AllocationDecision::ForwardTarget(layer, target, _) => {
+                    if slot.min_height > 0 && slot.needs_floor_barrier(layer) {
+                        changed |= slot.pause_at(layer);
+                    }
                     changed |= slot.switch_to(layer, false);
                     changed |= slot.set_decode_target(*target);
                 }
@@ -768,6 +1054,90 @@ impl VideoAllocator {
     }
 }
 
+/// Return the greatest number of compatible current associations in a complete
+/// matching. Compatibility has two receiver classes: default requests require
+/// a fresh receiver, while fixed requests can use either class.
+fn maximum_preserved_matching(requests: &[VideoReceiverRequest], slots: &[&Slot]) -> Option<usize> {
+    maximum_preserved_matching_for(requests, slots, &HashSet::new())
+}
+
+fn maximum_preserved_matching_with_prefix(
+    requests: &[VideoReceiverRequest],
+    slots: &[&Slot],
+    request_index: usize,
+    assigned: &HashSet<u32>,
+    slot_index: usize,
+) -> Option<usize> {
+    let mut used = assigned.clone();
+    let slot = slots.get(slot_index)?;
+    used.insert(slot.media_index);
+    maximum_preserved_matching_for(
+        requests.get(request_index.saturating_add(1)..)?,
+        slots,
+        &used,
+    )
+}
+
+fn maximum_preserved_matching_for(
+    requests: &[VideoReceiverRequest],
+    slots: &[&Slot],
+    unavailable: &HashSet<u32>,
+) -> Option<usize> {
+    let available = slots
+        .iter()
+        .copied()
+        .filter(|slot| !unavailable.contains(&slot.media_index));
+    let fresh = available
+        .clone()
+        .filter(|slot| slot.playout.can_admit(PlayoutPolicy::Default))
+        .count();
+    let defaults = requests
+        .iter()
+        .filter(|request| matches!(request.playout, PlayoutPolicy::Default))
+        .count();
+    if requests.len() > slots.len().saturating_sub(unavailable.len()) || defaults > fresh {
+        return None;
+    }
+    let preserved_default = requests
+        .iter()
+        .filter(|request| matches!(request.playout, PlayoutPolicy::Default))
+        .filter(|request| {
+            slots.iter().any(|slot| {
+                !unavailable.contains(&slot.media_index)
+                    && slot.logical_track_id == Some(request.intent.track_id)
+                    && slot.playout.can_admit(PlayoutPolicy::Default)
+            })
+        })
+        .count();
+    let preserved_fixed_locked = requests
+        .iter()
+        .filter(|request| matches!(request.playout, PlayoutPolicy::Fixed(..)))
+        .filter(|request| {
+            slots.iter().any(|slot| {
+                !unavailable.contains(&slot.media_index)
+                    && slot.logical_track_id == Some(request.intent.track_id)
+                    && !slot.playout.can_admit(PlayoutPolicy::Default)
+            })
+        })
+        .count();
+    let preserved_fixed_fresh = requests
+        .iter()
+        .filter(|request| matches!(request.playout, PlayoutPolicy::Fixed(..)))
+        .filter(|request| {
+            slots.iter().any(|slot| {
+                !unavailable.contains(&slot.media_index)
+                    && slot.logical_track_id == Some(request.intent.track_id)
+                    && slot.playout.can_admit(PlayoutPolicy::Default)
+            })
+        })
+        .count();
+    Some(
+        preserved_default
+            .saturating_add(preserved_fixed_locked)
+            .saturating_add(preserved_fixed_fresh.min(fresh.saturating_sub(defaults))),
+    )
+}
+
 fn track_states(track: &Track) -> LayerStates {
     let Some(stats) = track.stats() else {
         return LayerStates::new();
@@ -827,10 +1197,12 @@ struct Slot {
     staging_keyframe_last_at: Option<Instant>,
     /// Current retry interval for PLI probes while waiting for the staging keyframe.
     staging_keyframe_interval: Duration,
+    playout: ReceiverPlayout,
+    logical_track_id: Option<TrackId>,
 }
 
 impl Slot {
-    fn new(ctx: LogCtx, cfg: SlotConfig) -> Self {
+    fn new(ctx: LogCtx, cfg: SlotConfig, playout: PlayoutPolicy) -> Self {
         Self {
             ctx,
             mid: cfg.mid,
@@ -852,11 +1224,26 @@ impl Slot {
             staging_keyframe_retries: 0,
             staging_keyframe_last_at: None,
             staging_keyframe_interval: KEYFRAME_FIRST_RETRY,
+            playout: ReceiverPlayout::with_policy(playout),
+            logical_track_id: None,
         }
     }
 
     fn target(&self) -> Option<&TrackLayer> {
         self.desired.as_ref()
+    }
+
+    /// Whether a floor-constrained target must first clear an incompatible
+    /// active, staging, or draining stream.
+    fn needs_floor_barrier(&self, layer: &TrackLayer) -> bool {
+        [
+            self.switcher.active_stream(),
+            self.switcher.staging_stream(),
+            self.switcher.draining_stream(),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|stream| stream != layer.stream_id())
     }
 
     fn state(&self) -> SlotState {
@@ -1065,8 +1452,9 @@ impl Slot {
         // change in the active stream means a switch was promoted this tick.
         let (mid, rid, ssrc, pt) = (self.mid, self.rid, self.ssrc, self.pt);
         let before = self.switcher.active_stream();
+        let playout_delay = self.playout.to_stamp();
         self.switcher.feed(track_id, cache, arrival_ts, &mut |out| {
-            writer.write_video_owned(out, mid, rid, ssrc, pt);
+            writer.write_video_owned(out, mid, rid, ssrc, pt, playout_delay);
         });
         self.switcher.active_stream() != before
     }
@@ -1417,7 +1805,10 @@ impl AllocationEngine {
     /// also subsumes the all-taller-layers case (e.g. screen-share tiers that only differ in fps)
     /// - the smallest layer is always eligible rather than every layer being rejected.
     fn spatially_allowed(&self, slot: &SlotView<'_>, layer: &TrackLayer) -> bool {
-        let request = slot.max_height.max(self.min_track_height(slot.track));
+        let request = slot
+            .max_height
+            .max(slot.min_height)
+            .max(self.min_track_height(slot.track));
         let ceiling = slot
             .track
             .layers()
@@ -1426,7 +1817,7 @@ impl AllocationEngine {
             .filter(|&h| h >= request)
             .min()
             .unwrap_or(request);
-        self.height(layer) <= ceiling
+        self.height(layer) >= slot.min_height && self.height(layer) <= ceiling
     }
 
     /// Whether a layer may currently be forwarded or switched into.
@@ -1445,15 +1836,12 @@ impl AllocationEngine {
         self.snap(layer).stable_bitrate_bps
     }
 
-    /// Lowest healthy layer ignoring the spatial constraint. Used as a
-    /// last-resort fallback when all spatially-allowed layers are inactive
-    /// (e.g. "f"/"h"/"q" negotiated but only "f" and "h" are active and the
-    /// client requests a height that only "q" would satisfy).
+    /// Lowest healthy layer that satisfies the requested spatial bounds.
     fn closest_healthy<'a>(&self, slot: &'a SlotView<'a>) -> Option<&'a TrackLayer> {
         slot.track
             .layers()
             .iter()
-            .filter(|layer| self.snap(layer).healthy && self.cost(layer) > 0.0)
+            .filter(|layer| self.eligible(slot, layer))
             .min_by_key(|l| l.quality)
     }
 
@@ -1474,12 +1862,15 @@ impl AllocationEngine {
             .iter()
             .filter(|layer| self.spatially_allowed(slot, layer))
             .min_by_key(|layer| layer.quality)
-            .or_else(|| slot.track.layers().iter().min_by_key(|layer| layer.quality))
+            .or_else(|| {
+                (slot.min_height == 0)
+                    .then(|| slot.track.layers().iter().min_by_key(|layer| layer.quality))?
+            })
     }
 
-    /// A legal layer to retain as the pause target even when no layer is
-    /// currently healthy enough to forward. Falls back to the lowest healthy
-    /// layer (closest rank) when no spatially-allowed layer exists.
+    /// A layer to retain as the pause target even when no allowed layer is
+    /// currently healthy enough to forward. A positive floor may park on the
+    /// current lower layer, but it is never forwarded from that fallback.
     fn pause_target<'a>(&self, slot: &'a SlotView<'a>) -> Option<&'a TrackLayer> {
         let target = slot
             .track
@@ -1488,7 +1879,13 @@ impl AllocationEngine {
             .filter(|layer| self.eligible(slot, layer))
             .min_by_key(|layer| layer.quality)
             .or_else(|| self.closest_healthy(slot))
-            .or_else(|| self.lowest_ladder(slot));
+            .or_else(|| self.lowest_ladder(slot))
+            .or_else(|| {
+                slot.track
+                    .layers()
+                    .iter()
+                    .find(|layer| layer.quality == slot.current_quality)
+            });
         debug_assert!(
             self.closest_healthy(slot).is_none()
                 || target.is_some_and(|layer| self.snap(layer).healthy)
@@ -1511,10 +1908,8 @@ impl AllocationEngine {
     }
 
     /// The lowest eligible layer strictly above the selected layer.
-    /// When starting from nothing (`current = None`) and no spatially-allowed
-    /// healthy layer exists, falls back to the closest-rank healthy layer so
-    /// the slot always gets an initial allocation rather than being silently
-    /// dropped.
+    /// When starting from nothing (`current = None`), only a healthy layer
+    /// satisfying the requested spatial bounds may be selected.
     fn next_layer<'a>(
         &self,
         slot: &'a SlotView<'a>,
@@ -1592,10 +1987,7 @@ impl AllocationEngine {
         Bitrate::from(crate::bitrate::saturating_bps(total))
     }
 
-    /// The layer that satisfies a slot's `min_height` floor: the lowest eligible
-    /// layer at least `min_height` tall, or the tallest eligible layer if none
-    /// reaches it. `None` when the slot is droppable (`min_height == 0`) or has
-    /// no eligible layer.
+    /// The lowest eligible layer satisfying a slot's positive spatial floor.
     fn floor_layer<'a>(&self, slot: &'a SlotView<'a>) -> Option<&'a TrackLayer> {
         if slot.min_height == 0 {
             return None;
@@ -1606,11 +1998,7 @@ impl AllocationEngine {
                 .iter()
                 .filter(|l| self.eligible(slot, l))
         };
-        eligible()
-            .filter(|l| self.height(l) >= slot.min_height)
-            .min_by_key(|l| l.quality)
-            .or_else(|| eligible().max_by_key(|l| l.quality))
-            .or_else(|| self.closest_healthy(slot))
+        eligible().min_by_key(|l| l.quality)
     }
 
     /// Strict-priority allocation. `slots` must be pre-sorted by `priority_order`
@@ -1887,9 +2275,658 @@ mod assignment_tests {
         for i in 0..count {
             allocator.add_slot(SlotConfig {
                 mid: Mid::from(&format!("s{i}")[..]),
+                media_index: u32::try_from(i).unwrap_or(u32::MAX),
                 ..SlotConfig::default()
             });
         }
+    }
+
+    fn receiver_request(
+        track_id: TrackId,
+        height: u32,
+        playout: PlayoutPolicy,
+    ) -> VideoReceiverRequest {
+        VideoReceiverRequest {
+            intent: Intent {
+                track_id,
+                target_height: height,
+                min_height: 0,
+                min_fps: 0,
+                priority: 0,
+            },
+            playout,
+        }
+    }
+
+    #[test]
+    fn receiver_preview_is_deterministic_and_preserves_compatible_occupants() {
+        let mut allocator = setup_allocator();
+        let tracks = add_tracks(&mut allocator, 2);
+        add_slots(&mut allocator, 2);
+        let first = receiver_request(tracks.ids[0], 0, PlayoutPolicy::Default);
+        let second = receiver_request(tracks.ids[1], 0, PlayoutPolicy::Default);
+
+        let preview = allocator
+            .preview_receiver_assignments(&[second.clone(), first.clone()])
+            .unwrap();
+        let reordered = allocator
+            .preview_receiver_assignments(&[first.clone(), second.clone()])
+            .unwrap();
+        assert_eq!(
+            preview
+                .assignments()
+                .iter()
+                .map(|assignment| (
+                    assignment.receiver_index,
+                    assignment.request.intent.track_id
+                ))
+                .collect::<Vec<_>>(),
+            reordered
+                .assignments()
+                .iter()
+                .map(|assignment| (
+                    assignment.receiver_index,
+                    assignment.request.intent.track_id
+                ))
+                .collect::<Vec<_>>()
+        );
+        assert!(allocator.commit_receiver_assignments(preview).unwrap());
+
+        let preserved = allocator
+            .preview_receiver_assignments(&[first, second])
+            .unwrap();
+        assert_eq!(
+            preserved
+                .assignments()
+                .iter()
+                .map(|assignment| assignment.receiver_index)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        assert_eq!(allocator.receiver_assignments().len(), 2);
+    }
+
+    #[test]
+    fn receiver_preview_rejects_capacity_and_duplicate_tracks_without_mutation() {
+        let mut allocator = setup_allocator();
+        let tracks = add_tracks(&mut allocator, 3);
+        add_slots(&mut allocator, 2);
+        let request = receiver_request(tracks.ids[0], 0, PlayoutPolicy::Default);
+        let before = allocator.receiver_assignments();
+
+        assert!(matches!(
+            allocator.preview_receiver_assignments(&[
+                request.clone(),
+                receiver_request(tracks.ids[1], 0, PlayoutPolicy::Default),
+                receiver_request(tracks.ids[2], 0, PlayoutPolicy::Default),
+            ]),
+            Err(VideoReceiverAdmissionError::Capacity)
+        ));
+        assert!(matches!(
+            allocator.preview_receiver_assignments(&[request.clone(), request]),
+            Err(VideoReceiverAdmissionError::DuplicateTrack)
+        ));
+        assert_eq!(allocator.receiver_assignments(), before);
+    }
+
+    #[test]
+    fn receiver_preview_rejects_mixed_policy_duplicate_tracks_in_every_order_without_mutation() {
+        let mut allocator = setup_allocator();
+        let tracks = add_tracks(&mut allocator, 3);
+        add_slots(&mut allocator, 3);
+        let fixed = PlayoutPolicy::fixed((25, 75));
+        let initial = allocator
+            .preview_receiver_assignments(&[receiver_request(tracks.ids[2], 0, fixed)])
+            .unwrap();
+        allocator.commit_receiver_assignments(initial).unwrap();
+        let slot = allocator.slots.values_mut().next().unwrap();
+        slot.playout
+            .record_stamp(slot.playout.to_stamp().unwrap(), 1_u64.into());
+
+        let before = allocator.receiver_assignments();
+        let receiver_state = allocator
+            .slots
+            .values()
+            .map(|slot| {
+                (
+                    slot.media_index,
+                    slot.logical_track_id,
+                    slot.playout.policy,
+                    slot.playout.locked,
+                    slot.playout.pending,
+                    slot.playout.confirm,
+                    slot.state(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let revision = allocator.receiver_assignment_revision;
+        let requests = [
+            receiver_request(tracks.ids[0], 0, PlayoutPolicy::Default),
+            receiver_request(tracks.ids[1], 0, PlayoutPolicy::Default),
+            receiver_request(tracks.ids[0], 0, fixed),
+        ];
+
+        for permutation in [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ] {
+            let request_set = permutation.map(|index| requests[index].clone());
+            assert!(matches!(
+                allocator.preview_receiver_assignments(&request_set),
+                Err(VideoReceiverAdmissionError::DuplicateTrack)
+            ));
+        }
+
+        assert_eq!(allocator.receiver_assignments(), before);
+        assert_eq!(allocator.receiver_assignment_revision, revision);
+        assert!(
+            allocator
+                .slots
+                .values()
+                .map(|slot| {
+                    (
+                        slot.media_index,
+                        slot.logical_track_id,
+                        slot.playout.policy,
+                        slot.playout.locked,
+                        slot.playout.pending,
+                        slot.playout.confirm,
+                        slot.state(),
+                    )
+                })
+                .collect::<Vec<_>>()
+                == receiver_state
+        );
+
+        assert!(
+            allocator
+                .preview_receiver_assignments(&[
+                    receiver_request(tracks.ids[0], 0, PlayoutPolicy::Default),
+                    receiver_request(tracks.ids[1], 0, fixed),
+                ])
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn height_zero_receiver_assignment_survives_forwarding_suppression() {
+        let mut allocator = setup_allocator();
+        let tracks = add_tracks(&mut allocator, 1);
+        add_slots(&mut allocator, 1);
+        let preview = allocator
+            .preview_receiver_assignments(&[receiver_request(
+                tracks.ids[0],
+                0,
+                PlayoutPolicy::Default,
+            )])
+            .unwrap();
+        allocator.commit_receiver_assignments(preview).unwrap();
+
+        assert_eq!(allocator.receiver_assignments(), vec![(0, tracks.ids[0])]);
+        assert!(matches!(
+            allocator.slots.values().next().unwrap().state(),
+            SlotState::Idle
+        ));
+    }
+
+    #[test]
+    fn receiver_preview_reserves_fresh_receiver_for_default_playout() {
+        let mut allocator = setup_allocator();
+        let tracks = add_tracks(&mut allocator, 2);
+        add_slots(&mut allocator, 2);
+        let fixed = PlayoutPolicy::fixed((25, 75));
+        let locked = allocator
+            .slots
+            .values_mut()
+            .find(|slot| slot.media_index == 1)
+            .unwrap();
+        assert!(locked.playout.set_policy(fixed));
+        locked
+            .playout
+            .record_stamp(locked.playout.to_stamp().unwrap(), 1_u64.into());
+
+        let mut track_ids = tracks.ids;
+        track_ids.sort_by_key(TrackId::as_str);
+        let fixed_track = track_ids[0];
+        let default_track = track_ids[1];
+        let preview = allocator
+            .preview_receiver_assignments(&[
+                receiver_request(fixed_track, 0, fixed),
+                receiver_request(default_track, 0, PlayoutPolicy::Default),
+            ])
+            .unwrap();
+
+        assert_eq!(
+            preview
+                .assignments()
+                .iter()
+                .map(|assignment| (
+                    assignment.receiver_index,
+                    assignment.request.intent.track_id
+                ))
+                .collect::<Vec<_>>(),
+            vec![(0, default_track), (1, fixed_track)]
+        );
+        assert!(allocator.commit_receiver_assignments(preview).unwrap());
+        assert_eq!(
+            allocator.receiver_assignments(),
+            vec![(0, default_track), (1, fixed_track)]
+        );
+    }
+
+    #[test]
+    fn receiver_preview_displaces_a_preserved_fixed_track_for_default_in_every_order() {
+        let mut allocator = setup_allocator();
+        let tracks = add_tracks(&mut allocator, 2);
+        add_slots(&mut allocator, 2);
+        let fixed = PlayoutPolicy::fixed((25, 75));
+        let fixed_track = tracks.ids[0];
+        let default_track = tracks.ids[1];
+
+        // Receiver 0 is still fresh, but has the requested fixed occupant.
+        // Receiver 1 is locked and therefore cannot carry the default track.
+        let initial = allocator
+            .preview_receiver_assignments(&[receiver_request(fixed_track, 0, fixed)])
+            .unwrap();
+        allocator.commit_receiver_assignments(initial).unwrap();
+        let locked = allocator
+            .slots
+            .values_mut()
+            .find(|slot| slot.media_index == 1)
+            .unwrap();
+        assert!(locked.playout.set_policy(fixed));
+        locked
+            .playout
+            .record_stamp(locked.playout.to_stamp().unwrap(), 1_u64.into());
+
+        let fixed_request = receiver_request(fixed_track, 0, fixed);
+        let default_request = receiver_request(default_track, 0, PlayoutPolicy::Default);
+        for requests in [
+            [fixed_request.clone(), default_request.clone()],
+            [default_request, fixed_request],
+        ] {
+            let preview = allocator.preview_receiver_assignments(&requests).unwrap();
+            assert_eq!(
+                preview
+                    .assignments()
+                    .iter()
+                    .map(|assignment| (
+                        assignment.receiver_index,
+                        assignment.request.intent.track_id
+                    ))
+                    .collect::<Vec<_>>(),
+                vec![(0, default_track), (1, fixed_track)]
+            );
+        }
+    }
+
+    fn oracle_assignment(requests: &[VideoReceiverRequest], slots: &[&Slot]) -> Option<Vec<u32>> {
+        fn visit(
+            request_index: usize,
+            requests: &[VideoReceiverRequest],
+            slots: &[&Slot],
+            used: &mut [bool],
+            candidate: &mut Vec<u32>,
+            preserved: usize,
+            best: &mut Option<(usize, Vec<u32>)>,
+        ) {
+            if request_index == requests.len() {
+                if best
+                    .as_ref()
+                    .is_none_or(|(best_preserved, best_candidate)| {
+                        preserved > *best_preserved
+                            || (preserved == *best_preserved
+                                && candidate.as_slice() < best_candidate.as_slice())
+                    })
+                {
+                    *best = Some((preserved, candidate.clone()));
+                }
+                return;
+            }
+            let request = &requests[request_index];
+            for (slot_index, slot) in slots.iter().enumerate() {
+                if used[slot_index] || !slot.playout.can_admit(request.playout) {
+                    continue;
+                }
+                used[slot_index] = true;
+                candidate.push(slot.media_index);
+                visit(
+                    request_index + 1,
+                    requests,
+                    slots,
+                    used,
+                    candidate,
+                    preserved + usize::from(slot.logical_track_id == Some(request.intent.track_id)),
+                    best,
+                );
+                candidate.pop();
+                used[slot_index] = false;
+            }
+        }
+
+        let mut sorted = requests.to_vec();
+        sorted.sort_by_key(|request| request.intent.track_id.as_str());
+        let mut used = vec![false; slots.len()];
+        let mut best = None;
+        visit(0, &sorted, slots, &mut used, &mut Vec::new(), 0, &mut best);
+        best.map(|(_, assignment)| assignment)
+    }
+
+    #[test]
+    fn receiver_preview_matches_independent_bounded_matching_oracle() {
+        let policies = [PlayoutPolicy::Default, PlayoutPolicy::fixed((25, 75))];
+        let request_orders: &[&[usize]] = &[
+            &[],
+            &[0],
+            &[1],
+            &[2],
+            &[0, 1],
+            &[1, 0],
+            &[0, 2],
+            &[2, 0],
+            &[1, 2],
+            &[2, 1],
+            &[0, 1, 2],
+            &[0, 2, 1],
+            &[1, 0, 2],
+            &[1, 2, 0],
+            &[2, 0, 1],
+            &[2, 1, 0],
+        ];
+        for locked_receivers in 0_u8..8 {
+            for occupants in [
+                [None, None, None],
+                [Some(0), None, None],
+                [None, Some(0), None],
+                [None, None, Some(0)],
+                [Some(1), None, None],
+                [None, Some(1), None],
+                [None, None, Some(1)],
+                [Some(2), None, None],
+                [None, Some(2), None],
+                [None, None, Some(2)],
+                [Some(0), Some(1), None],
+                [Some(1), Some(0), None],
+                [Some(0), None, Some(1)],
+                [Some(1), None, Some(0)],
+                [None, Some(0), Some(1)],
+                [None, Some(1), Some(0)],
+                [Some(0), None, Some(2)],
+                [Some(2), None, Some(0)],
+                [Some(0), Some(2), None],
+                [Some(2), Some(0), None],
+                [None, Some(0), Some(2)],
+                [None, Some(2), Some(0)],
+                [Some(1), None, Some(2)],
+                [Some(2), None, Some(1)],
+                [Some(1), Some(2), None],
+                [Some(2), Some(1), None],
+                [None, Some(1), Some(2)],
+                [None, Some(2), Some(1)],
+                [Some(0), Some(1), Some(2)],
+                [Some(0), Some(2), Some(1)],
+                [Some(1), Some(0), Some(2)],
+                [Some(1), Some(2), Some(0)],
+                [Some(2), Some(0), Some(1)],
+                [Some(2), Some(1), Some(0)],
+            ] {
+                for request_indices in request_orders {
+                    for request_policies in [
+                        [policies[0], policies[0], policies[0]],
+                        [policies[0], policies[0], policies[1]],
+                        [policies[0], policies[1], policies[0]],
+                        [policies[0], policies[1], policies[1]],
+                        [policies[1], policies[0], policies[0]],
+                        [policies[1], policies[0], policies[1]],
+                        [policies[1], policies[1], policies[0]],
+                        [policies[1], policies[1], policies[1]],
+                    ] {
+                        let mut allocator = setup_allocator();
+                        let tracks = add_tracks(&mut allocator, 3);
+                        add_slots(&mut allocator, 3);
+                        for slot in allocator.slots.values_mut() {
+                            if locked_receivers & (1_u8 << slot.media_index) != 0 {
+                                assert!(slot.playout.set_policy(policies[1]));
+                                slot.playout
+                                    .record_stamp(slot.playout.to_stamp().unwrap(), 1_u64.into());
+                            }
+                            slot.logical_track_id = occupants
+                                [usize::try_from(slot.media_index).unwrap_or(usize::MAX)]
+                            .map(|index| tracks.ids[index]);
+                        }
+                        let all_requests = [
+                            receiver_request(tracks.ids[0], 0, request_policies[0]),
+                            receiver_request(tracks.ids[1], 0, request_policies[1]),
+                            receiver_request(tracks.ids[2], 0, request_policies[2]),
+                        ];
+                        let requests = request_indices
+                            .iter()
+                            .map(|index| all_requests[*index].clone())
+                            .collect::<Vec<_>>();
+                        let mut slots: Vec<_> = allocator.slots.values().collect();
+                        slots.sort_by_key(|slot| slot.media_index);
+                        let expected = oracle_assignment(&requests, &slots);
+                        let actual =
+                            allocator
+                                .preview_receiver_assignments(&requests)
+                                .ok()
+                                .map(|preview| {
+                                    let mut assignments =
+                                        preview.assignments().iter().collect::<Vec<_>>();
+                                    assignments.sort_by_key(|assignment| {
+                                        assignment.request.intent.track_id.as_str()
+                                    });
+                                    assignments
+                                        .into_iter()
+                                        .map(|assignment| assignment.receiver_index)
+                                        .collect::<Vec<_>>()
+                                });
+                        assert_eq!(actual, expected);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn locked_receiver_refuses_default_but_accepts_fixed_replacement() {
+        let mut allocator = setup_allocator();
+        let tracks = add_tracks(&mut allocator, 2);
+        add_slots(&mut allocator, 1);
+        let fixed = PlayoutPolicy::fixed((25, 75));
+        let initial = allocator
+            .preview_receiver_assignments(&[receiver_request(tracks.ids[0], 0, fixed)])
+            .unwrap();
+        allocator.commit_receiver_assignments(initial).unwrap();
+        let slot = allocator.slots.values_mut().next().unwrap();
+        slot.playout
+            .record_stamp(slot.playout.to_stamp().unwrap(), 1_u64.into());
+
+        let replacement = allocator
+            .preview_receiver_assignments(&[receiver_request(
+                tracks.ids[1],
+                0,
+                PlayoutPolicy::fixed((40, 90)),
+            )])
+            .unwrap();
+        allocator.commit_receiver_assignments(replacement).unwrap();
+        assert_eq!(allocator.receiver_assignments(), vec![(0, tracks.ids[1])]);
+        let before = allocator.receiver_assignments();
+        assert!(matches!(
+            allocator.preview_receiver_assignments(&[receiver_request(
+                tracks.ids[0],
+                0,
+                PlayoutPolicy::Default,
+            )]),
+            Err(VideoReceiverAdmissionError::PlayoutResetRequired)
+        ));
+        assert_eq!(allocator.receiver_assignments(), before);
+    }
+
+    #[test]
+    fn receiver_lock_survives_unmapping_an_occupant() {
+        let mut allocator = setup_allocator();
+        let tracks = add_tracks(&mut allocator, 2);
+        add_slots(&mut allocator, 1);
+        let fixed = PlayoutPolicy::fixed((25, 75));
+        let preview = allocator
+            .preview_receiver_assignments(&[receiver_request(tracks.ids[0], 0, fixed)])
+            .unwrap();
+        allocator.commit_receiver_assignments(preview).unwrap();
+        let slot = allocator.slots.values_mut().next().unwrap();
+        slot.playout
+            .record_stamp(slot.playout.to_stamp().unwrap(), 1_u64.into());
+
+        let unmap = allocator.preview_receiver_assignments(&[]).unwrap();
+        allocator.commit_receiver_assignments(unmap).unwrap();
+        assert!(allocator.receiver_assignments().is_empty());
+        assert!(matches!(
+            allocator.preview_receiver_assignments(&[receiver_request(
+                tracks.ids[1],
+                0,
+                PlayoutPolicy::Default,
+            )]),
+            Err(VideoReceiverAdmissionError::PlayoutResetRequired)
+        ));
+    }
+
+    #[test]
+    fn committed_receiver_playout_is_captured_in_video_writes() {
+        let mut allocator = setup_allocator();
+        let tracks = add_tracks(&mut allocator, 3);
+        add_slots(&mut allocator, 3);
+        let first_fixed = PlayoutPolicy::fixed((25, 75));
+        let second_fixed = PlayoutPolicy::fixed((40, 90));
+        let preview = allocator
+            .preview_receiver_assignments(&[
+                receiver_request(tracks.ids[0], 0, first_fixed),
+                receiver_request(tracks.ids[1], 0, second_fixed),
+                receiver_request(tracks.ids[2], 0, PlayoutPolicy::Default),
+            ])
+            .unwrap();
+        allocator.commit_receiver_assignments(preview).unwrap();
+
+        let targets = allocator
+            .slots
+            .iter()
+            .map(|(key, slot)| {
+                let track_id = slot.logical_track_id.unwrap();
+                let layer = allocator
+                    .track(&track_id)
+                    .unwrap()
+                    .lowest_quality()
+                    .unwrap()
+                    .clone();
+                (key, track_id, layer, slot.playout.to_stamp())
+            })
+            .collect::<Vec<_>>();
+        let mut writer = StreamWriter::new();
+        let mut writes = Vec::new();
+        for (slot_key, track_id, layer, expected_playout) in targets {
+            let slot = allocator.slots.get_mut(slot_key).unwrap();
+            assert!(slot.switch_to(&layer, false));
+            slot.paused = false;
+            allocator.set_route(track_id, slot_key);
+
+            let mut cache = TrackStreamCache::new();
+            let mut builder = crate::rtp::test_utils::H264StreamBuilder::new(
+                1,
+                1000,
+                90_000,
+                tokio::time::Instant::now(),
+            );
+            for mut packet in builder.keyframe(4) {
+                packet.ext_vals.rid = layer.rid;
+                cache.push(packet.clone());
+                allocator.on_rtp_slot(slot_key, track_id, &packet, Some(&cache), &mut writer);
+            }
+            while let Some(write) = writer.pop() {
+                if let crate::track::StreamWrite::Video { playout_delay, .. } = write {
+                    writes.push(playout_delay);
+                }
+            }
+            assert!(writes.contains(&expected_playout));
+        }
+
+        assert!(writes.contains(&ReceiverPlayout::with_policy(first_fixed).to_stamp()));
+        assert!(writes.contains(&ReceiverPlayout::with_policy(second_fixed).to_stamp()));
+        assert!(writes.contains(&None));
+    }
+
+    #[test]
+    fn stale_receiver_preview_does_not_change_assignments() {
+        let mut allocator = setup_allocator();
+        let tracks = add_tracks(&mut allocator, 2);
+        add_slots(&mut allocator, 1);
+        let stale = allocator
+            .preview_receiver_assignments(&[receiver_request(
+                tracks.ids[0],
+                0,
+                PlayoutPolicy::Default,
+            )])
+            .unwrap();
+        let current = allocator
+            .preview_receiver_assignments(&[receiver_request(
+                tracks.ids[1],
+                0,
+                PlayoutPolicy::Default,
+            )])
+            .unwrap();
+        allocator.commit_receiver_assignments(current).unwrap();
+        let before = allocator.receiver_assignments();
+        let receiver_state = allocator
+            .slots
+            .values()
+            .map(|slot| {
+                (
+                    slot.media_index,
+                    slot.logical_track_id,
+                    slot.playout.policy,
+                    slot.playout.locked,
+                    slot.playout.pending,
+                    slot.playout.confirm,
+                    slot.desired.as_ref().map(TrackLayer::stream_id),
+                    slot.switcher.active_stream(),
+                    slot.switcher.staging_stream(),
+                    slot.switcher.draining_stream(),
+                    slot.paused,
+                )
+            })
+            .collect::<Vec<_>>();
+        let revision = allocator.receiver_assignment_revision;
+
+        assert!(matches!(
+            allocator.commit_receiver_assignments(stale),
+            Err(VideoReceiverAdmissionError::Stale)
+        ));
+        assert_eq!(allocator.receiver_assignments(), before);
+        assert_eq!(allocator.receiver_assignment_revision, revision);
+        assert_eq!(
+            allocator
+                .slots
+                .values()
+                .map(|slot| {
+                    (
+                        slot.media_index,
+                        slot.logical_track_id,
+                        slot.playout.policy,
+                        slot.playout.locked,
+                        slot.playout.pending,
+                        slot.playout.confirm,
+                        slot.desired.as_ref().map(TrackLayer::stream_id),
+                        slot.switcher.active_stream(),
+                        slot.switcher.staging_stream(),
+                        slot.switcher.draining_stream(),
+                        slot.paused,
+                    )
+                })
+                .collect::<Vec<_>>(),
+            receiver_state
+        );
     }
 
     #[test]
@@ -1977,6 +3014,210 @@ mod assignment_tests {
             downgraded.get(key),
             Some(AllocationDecision::Forward(layer, _)) if layer.quality == LayerQuality::High
         ));
+    }
+
+    #[test]
+    fn unaffordable_positive_spatial_floor_never_falls_back_to_lower_layer() {
+        let pid = ParticipantId::new();
+        let (tx, built, mut states) = video_track_with_states(
+            pid,
+            Mid::from("v0"),
+            vec![SimulcastLayer::new("h"), SimulcastLayer::new("f")],
+        );
+        let track = Track::video(tx.meta, built.layers().to_vec(), None);
+        let medium = track.by_quality(LayerQuality::Medium).unwrap();
+        let high = track.by_quality(LayerQuality::High).unwrap();
+        state_of_mut(&mut states, medium)
+            .set_height(360)
+            .bitrate(200_000);
+        state_of_mut(&mut states, high)
+            .set_height(720)
+            .bitrate(900_000);
+
+        let mut keys: SlotMap<DownstreamSlotKey, ()> = SlotMap::with_key();
+        let key = keys.insert(());
+        let view = SlotView {
+            key,
+            mid: Mid::from("s0"),
+            max_height: 720,
+            min_height: 720,
+            min_fps: 0,
+            priority: 0,
+            track: &track,
+            current_quality: LayerQuality::High,
+            forwarding: true,
+        };
+        let engine = AllocationEngine::new(std::slice::from_ref(&view), &states);
+
+        assert!(matches!(
+            engine
+                .run_compute(Bitrate::from(500_000), std::slice::from_ref(&view))
+                .get(key),
+            Some(AllocationDecision::Pause(_, _))
+        ));
+    }
+
+    #[test]
+    fn positive_floor_without_a_matching_layer_pauses_at_the_assignment() {
+        let pid = ParticipantId::new();
+        let (tx, built, states) =
+            video_track_with_states(pid, Mid::from("v0"), vec![SimulcastLayer::new("h")]);
+        let track = Track::video(tx.meta, built.layers().to_vec(), None);
+        let medium = track.by_quality(LayerQuality::Medium).unwrap();
+        let mut keys: SlotMap<DownstreamSlotKey, ()> = SlotMap::with_key();
+        let key = keys.insert(());
+        let view = SlotView {
+            key,
+            mid: Mid::from("s0"),
+            max_height: 360,
+            min_height: 720,
+            min_fps: 0,
+            priority: 0,
+            track: &track,
+            current_quality: LayerQuality::Medium,
+            forwarding: true,
+        };
+        let engine = AllocationEngine::new(std::slice::from_ref(&view), &states);
+
+        assert!(matches!(
+            engine.run_compute(Bitrate::from(2_000_000), std::slice::from_ref(&view)).get(key),
+            Some(AllocationDecision::Pause(layer, _)) if *layer == medium
+        ));
+    }
+
+    #[test]
+    fn positive_floor_degrades_temporally_then_resumes_full_quality() {
+        let pid = ParticipantId::new();
+        let (tx, built, mut states) = video_track_with_states(
+            pid,
+            Mid::from("v0"),
+            vec![SimulcastLayer::new("h"), SimulcastLayer::new("f")],
+        );
+        let track = Track::video(tx.meta, built.layers().to_vec(), None);
+        let high = track.by_quality(LayerQuality::High).unwrap();
+        state_of_mut(&mut states, high)
+            .update_for_test()
+            .set_height(720)
+            .bitrate(900_000)
+            .set_decode_target_count(3);
+        let mut keys: SlotMap<DownstreamSlotKey, ()> = SlotMap::with_key();
+        let key = keys.insert(());
+        let view = SlotView {
+            key,
+            mid: Mid::from("s0"),
+            max_height: 0,
+            min_height: 720,
+            min_fps: 0,
+            priority: 0,
+            track: &track,
+            current_quality: LayerQuality::High,
+            forwarding: true,
+        };
+        let engine = AllocationEngine::new(std::slice::from_ref(&view), &states);
+
+        let degraded = engine.run_compute(Bitrate::from(500_000), std::slice::from_ref(&view));
+        assert!(
+            matches!(
+            degraded.get(key),
+            Some(AllocationDecision::ForwardTarget(layer, DecodeTargetSelection::Target(_), _))
+                if *layer == high),
+            "{degraded:?}"
+        );
+        assert!(matches!(
+            engine.run_compute(Bitrate::from(2_000_000), std::slice::from_ref(&view)).get(key),
+            Some(AllocationDecision::Forward(layer, _)) if *layer == high
+        ));
+    }
+
+    #[test]
+    fn raising_a_floor_stops_active_lower_video_before_720p_is_staged() {
+        let mut allocator = setup_allocator();
+        let pid = ParticipantId::new();
+        let (tx, track, states) = video_track_with_states(
+            pid,
+            Mid::from("v0"),
+            vec![SimulcastLayer::new("h"), SimulcastLayer::new("f")],
+        );
+        allocator.seed_layer_states(&states);
+        let track_id = tx.meta.id;
+        allocator.add_track(Track::video(tx.meta, track.layers().to_vec(), None));
+        add_slots(&mut allocator, 1);
+
+        let track = allocator.track(&track_id).unwrap();
+        let medium = track.by_quality(LayerQuality::Medium).unwrap().clone();
+        let high = track.by_quality(LayerQuality::High).unwrap().clone();
+        let slot = allocator.slots.values_mut().next().unwrap();
+        slot.set_roles_for_test(Some(&medium), None);
+        slot.paused = false;
+
+        let mut intents = HashMap::new();
+        intents.insert(
+            Mid::from("s0"),
+            Intent {
+                track_id,
+                target_height: 360,
+                min_height: 720,
+                min_fps: 0,
+                priority: 0,
+            },
+        );
+        allocator.configure(&intents);
+
+        let slot = allocator.slots.values_mut().next().unwrap();
+        assert!(slot.paused);
+        assert!(slot.test_active().is_none());
+        assert_eq!(slot.test_staging(), Some(high.stream_id()));
+
+        let mut writer = StreamWriter::new();
+        let packet = RtpPacket::default();
+        assert!(!slot.on_rtp(track_id, packet.arrival_ts, None, &mut writer));
+        assert!(
+            writer.pop().is_none(),
+            "360p must not emit while 720p is pending"
+        );
+    }
+
+    #[test]
+    fn raising_a_floor_clears_a_draining_lower_video_tail() {
+        let mut allocator = setup_allocator();
+        let pid = ParticipantId::new();
+        let (tx, track, states) = video_track_with_states(
+            pid,
+            Mid::from("v0"),
+            vec![SimulcastLayer::new("h"), SimulcastLayer::new("f")],
+        );
+        allocator.seed_layer_states(&states);
+        let track_id = tx.meta.id;
+        allocator.add_track(Track::video(tx.meta, track.layers().to_vec(), None));
+        add_slots(&mut allocator, 1);
+
+        let track = allocator.track(&track_id).unwrap();
+        let medium = track.by_quality(LayerQuality::Medium).unwrap().clone();
+        let high = track.by_quality(LayerQuality::High).unwrap().clone();
+        let slot = allocator.slots.values_mut().next().unwrap();
+        slot.set_roles_for_test(Some(&medium), Some(&high));
+        slot.test_promote();
+        slot.paused = false;
+        assert_eq!(slot.switcher.draining_stream(), Some(medium.stream_id()));
+
+        let mut intents = HashMap::new();
+        intents.insert(
+            Mid::from("s0"),
+            Intent {
+                track_id,
+                target_height: 360,
+                min_height: 720,
+                min_fps: 0,
+                priority: 0,
+            },
+        );
+        allocator.configure(&intents);
+
+        let slot = allocator.slots.values().next().unwrap();
+        assert!(slot.paused);
+        assert!(slot.test_active().is_none());
+        assert_eq!(slot.test_staging(), Some(high.stream_id()));
+        assert_eq!(slot.switcher.draining_stream(), None);
     }
 
     #[test]
@@ -2730,7 +3971,7 @@ mod slot_switch_tests {
             let high = track.by_quality(LayerQuality::High).unwrap().clone();
             let low = track.by_quality(LayerQuality::Low).unwrap().clone();
 
-            let mut slot = Slot::new(test_ctx(), SlotConfig::default());
+            let mut slot = Slot::new(test_ctx(), SlotConfig::default(), PlayoutPolicy::Default);
             slot.paused = false;
 
             Self {
