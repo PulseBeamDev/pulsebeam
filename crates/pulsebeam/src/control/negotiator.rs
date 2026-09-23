@@ -172,21 +172,31 @@ impl Negotiator {
             rtc.add_local_candidate(c.clone());
         }
 
+        // str0m can emit an enabled answer section for a port-zero offer section.
+        // Only sections enabled on both sides are negotiated media resources.
+        let offered_enabled: Vec<_> = offer
+            .media_lines
+            .iter()
+            .map(|section| !section.disabled)
+            .collect();
         let answer = rtc
             .sdp_api()
             .accept_offer(offer)
             .map_err(NegotiatorError::Rtc)?;
-        Self::enforce_media_lines(&answer, profile)?;
-        let resources = Self::negotiated_resources(&answer)?;
+        Self::enforce_media_lines(&answer, profile, &offered_enabled)?;
+        let resources = Self::negotiated_resources(&answer, &offered_enabled)?;
 
         tracing::debug!("{answer}");
         Ok((rtc, answer, resources))
     }
 
-    fn negotiated_resources(answer: &SdpAnswer) -> Result<NegotiatedResources, NegotiatorError> {
+    fn negotiated_resources(
+        answer: &SdpAnswer,
+        offered_enabled: &[bool],
+    ) -> Result<NegotiatedResources, NegotiatorError> {
         let mut media = Vec::new();
         for (index, section) in answer.media_lines.iter().enumerate() {
-            if section.disabled {
+            if section.disabled || offered_enabled.get(index) != Some(&true) {
                 continue;
             }
             let kind = match section.typ.to_string().as_str() {
@@ -220,6 +230,7 @@ impl Negotiator {
     fn enforce_media_lines(
         answer: &SdpAnswer,
         profile: ConnectionProfile,
+        offered_enabled: &[bool],
     ) -> Result<(), NegotiatorError> {
         let mut video_recv_count = 0usize;
         let mut video_send_count = 0usize;
@@ -239,8 +250,8 @@ impl Negotiator {
                 )
             };
 
-        for m in &answer.media_lines {
-            if m.disabled {
+        for (index, m) in answer.media_lines.iter().enumerate() {
+            if m.disabled || offered_enabled.get(index) != Some(&true) {
                 continue;
             }
             let kind = m.typ.to_string();
@@ -441,32 +452,83 @@ mod tests {
     }
 
     #[test]
+    fn disabled_rtp_section_does_not_shift_later_receiver_index() {
+        let mut rtc = RtcConfig::new().build(std::time::Instant::now());
+        let mut change = rtc.sdp_api();
+        change.add_media(MediaKind::Audio, Direction::SendOnly, None, None, None);
+        change.add_media(MediaKind::Video, Direction::SendOnly, None, None, None);
+        change.add_media(MediaKind::Video, Direction::RecvOnly, None, None, None);
+        let offer = change
+            .apply()
+            .unwrap()
+            .0
+            .to_sdp_string()
+            .replacen("m=video 9", "m=video 0", 1);
+        assert!(
+            offer.contains("m=video 0"),
+            "offer has no disabled section: {offer}"
+        );
+        let offer = SdpOffer::from_sdp_string(&offer).unwrap();
+        assert!(
+            offer.media_lines[1].disabled,
+            "parsed offer: {:?}",
+            offer
+                .media_lines
+                .iter()
+                .map(|section| section.disabled)
+                .collect::<Vec<_>>()
+        );
+        let mut negotiator = Negotiator::new(Vec::new());
+        let (_, _, resources) = negotiator
+            .create_answer(offer, IceCreds::new(), ConnectionProfile::Native)
+            .unwrap();
+        assert_eq!(
+            resources
+                .as_slice()
+                .iter()
+                .map(|resource| resource.media_index)
+                .collect::<Vec<_>>(),
+            vec![0, 2]
+        );
+    }
+
+    #[test]
     fn native_accepts_default_topology_and_rejects_independent_caps() {
-        fn offer(video_receivers: usize) -> SdpOffer {
+        fn offer(counts: [[usize; 2]; 2]) -> SdpOffer {
             let mut rtc = RtcConfig::new().build(std::time::Instant::now());
             let mut change = rtc.sdp_api();
-            for _ in 0..2 {
-                change.add_media(MediaKind::Video, Direction::SendOnly, None, None, None);
-                change.add_media(MediaKind::Audio, Direction::SendOnly, None, None, None);
-            }
-            for _ in 0..video_receivers {
-                change.add_media(MediaKind::Video, Direction::RecvOnly, None, None, None);
-            }
-            for _ in 0..8 {
-                change.add_media(MediaKind::Audio, Direction::RecvOnly, None, None, None);
+            for (kind, per_direction) in
+                [(MediaKind::Video, counts[0]), (MediaKind::Audio, counts[1])]
+            {
+                for (direction, count) in [
+                    (Direction::SendOnly, per_direction[0]),
+                    (Direction::RecvOnly, per_direction[1]),
+                ] {
+                    for _ in 0..count {
+                        change.add_media(kind, direction, None, None, None);
+                    }
+                }
             }
             change.apply().unwrap().0
         }
         let mut negotiator = Negotiator::new(Vec::new());
+        let defaults = [[2, 16], [2, 8]];
         let (_, _, resources) = negotiator
-            .create_answer(offer(16), IceCreds::new(), ConnectionProfile::Native)
+            .create_answer(offer(defaults), IceCreds::new(), ConnectionProfile::Native)
             .unwrap();
         assert_eq!(resources.as_slice().len(), 28);
-        assert!(
-            negotiator
-                .create_answer(offer(33), IceCreds::new(), ConnectionProfile::Native)
-                .is_err()
-        );
+        for kind in 0..2 {
+            for direction in 0..2 {
+                let mut counts = defaults;
+                counts[kind][direction] = 33;
+                assert!(
+                    negotiator
+                        .create_answer(offer(counts), IceCreds::new(), ConnectionProfile::Native)
+                        .is_err(),
+                    "kind {kind}, direction {direction} exceeded its independent cap"
+                );
+            }
+        }
     }
 
     #[test]
