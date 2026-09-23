@@ -289,7 +289,10 @@ impl ScreamV2 {
                 self.adjust_qdelay_target();
             }
         }
-        self.ref_wnd = self.ref_wnd.min(self.max_policed_ref_wnd);
+        self.ref_wnd = self
+            .ref_wnd
+            .min(self.max_policed_ref_wnd)
+            .max(PROFILE.min_reference_window);
         self.derive_target(input.target_bitrate_max);
         self.snapshot(input.target_bitrate_max)
     }
@@ -991,6 +994,15 @@ mod tests {
         cc.consume_feedback(Duration::from_millis(25), input(&received, 4_000_000));
         assert_eq!(cc.debug_accumulated_acks(), (1_000, 0));
         assert_eq!(cc.data_units_marked_this_rtt, 0);
+    }
+
+    #[test]
+    fn policer_cap_cannot_break_the_draft_reference_window_floor() {
+        let mut cc = ScreamV2::new(4_000_000, None);
+        cc.max_policed_ref_wnd = 1;
+        cc.ref_wnd = PROFILE.min_reference_window;
+        let output = cc.update(Duration::from_millis(100), input(&[], 4_000_000));
+        assert_eq!(output.reference_window, PROFILE.min_reference_window);
     }
 
     #[test]
