@@ -19,7 +19,7 @@ impl Default for RetryPolicy {
     fn default() -> Self {
         Self {
             initial_delay_ms: 500,
-            maximum_delay_ms: 5_000,
+            maximum_delay_ms: 10_000,
             maximum_attempts: 10,
         }
     }

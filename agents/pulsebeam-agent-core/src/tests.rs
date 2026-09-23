@@ -910,6 +910,43 @@ fn connection_waits_for_every_host_boundary_and_closes_both_resources() {
 }
 
 #[test]
+fn connection_retry_does_not_exhaust_attempts_before_reconciliation() {
+    let mut agent = Agent::new(config()).unwrap();
+    let (mut generation, _) = begin_connect(&mut agent, desired(1), channel(2));
+    for attempt in 1..=12 {
+        agent
+            .handle(HostEvent::Rtc(RtcEvent::Failed {
+                generation,
+                message: "network down".to_string(),
+            }))
+            .unwrap();
+        let mut timer = None;
+        while let Some(effect) = agent.next_effect() {
+            if let Effect::Timer(TimerEffect::Schedule {
+                timer: scheduled, ..
+            }) = effect
+            {
+                timer = Some(scheduled);
+            }
+        }
+        let timer = timer.expect("a desired connection must always retry");
+        assert!(matches!(
+            agent.snapshot().connection,
+            ConnectionState::RetryWaiting { attempt: observed, after }
+                if observed == attempt && after <= Duration::from_secs(10)
+        ));
+        agent
+            .handle(HostEvent::Timer(TimerEvent::Fired { timer }))
+            .unwrap();
+        generation = match next_effect(&mut agent) {
+            Effect::Rtc(RtcEffect::CreateOffer { generation, .. }) => generation,
+            effect => panic!("expected new offer after retry, got {effect:?}"),
+        };
+    }
+    assert!(agent.snapshot().terminal_failure.is_none());
+}
+
+#[test]
 fn transient_failure_schedules_a_bounded_retry_that_disconnect_cancels() {
     let mut agent = Agent::new(config()).unwrap();
     let (_generation, operation) = begin_connect(&mut agent, desired(1), channel(2));
