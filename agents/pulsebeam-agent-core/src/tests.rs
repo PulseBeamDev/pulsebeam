@@ -649,17 +649,13 @@ fn construction_and_desired_state_validate_complete_external_input() {
     ));
 
     let mut duplicate = config();
-    duplicate.topology.local_video.push("camera".to_string());
+    duplicate.topology.local_audio = vec!["camera".to_string()];
     assert!(matches!(
         Agent::new(duplicate),
         Err(AgentError::InvalidConfiguration(
             ValidationError::Duplicate { .. }
         ))
     ));
-
-    let mut shared_label = config();
-    shared_label.topology.local_audio = vec!["camera".to_string()];
-    assert!(Agent::new(shared_label).is_ok());
 
     let mut protocol_header = config();
     protocol_header.token.clear();

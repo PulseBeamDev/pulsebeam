@@ -19,6 +19,7 @@ mod identity;
 mod model;
 mod signaling;
 mod topic;
+mod v1_catalog;
 
 pub mod ffi;
 

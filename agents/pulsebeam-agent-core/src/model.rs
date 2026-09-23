@@ -389,16 +389,14 @@ impl MediaTopology {
             usize::from(self.remote_audio),
             usize::from(MAX_REMOTE_AUDIO_SLOTS),
         )?;
-        for slots in [&self.local_video, &self.local_audio] {
-            let mut names = BTreeSet::new();
-            for name in slots {
-                validate_identifier("slot name", name, 64, false)?;
-                if !names.insert(name.clone()) {
-                    return Err(ValidationError::Duplicate {
-                        field: "slot name",
-                        value: name.clone(),
-                    });
-                }
+        let mut names = BTreeSet::new();
+        for name in self.local_video.iter().chain(&self.local_audio) {
+            validate_identifier("slot name", name, 64, false)?;
+            if !names.insert(name.clone()) {
+                return Err(ValidationError::Duplicate {
+                    field: "slot name",
+                    value: name.clone(),
+                });
             }
         }
         Ok(())
