@@ -5,7 +5,9 @@ use alloc::{
 
 use pulsebeam_proto::signaling_v1 as wire;
 
-use crate::signaling::SignalingError;
+use crate::{
+    DesiredState, MediaKind, MediaSlot, PlayoutDelay, SlotBinding, signaling::SignalingError,
+};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct CatalogState {
@@ -184,6 +186,101 @@ impl CatalogState {
     }
 }
 
+pub(crate) fn encode_intent(
+    desired: &DesiredState,
+    coordinates: &BTreeMap<MediaSlot, SlotBinding>,
+    catalog: &CatalogState,
+    revision: u64,
+) -> Result<alloc::vec::Vec<u8>, SignalingError> {
+    if revision == 0 {
+        return Err(SignalingError::Invalid("intent revision"));
+    }
+    let mut send = alloc::vec::Vec::new();
+    for publication in desired
+        .publications
+        .iter()
+        .filter(|publication| publication.active)
+    {
+        let slot = coordinates
+            .iter()
+            .find(|(slot, _)| match slot {
+                MediaSlot::LocalVideo(label) | MediaSlot::LocalAudio(label) => {
+                    label == &publication.slot
+                }
+                _ => false,
+            })
+            .ok_or(SignalingError::Invalid("unbound local sender"))?;
+        let kind = match slot.0.kind() {
+            MediaKind::Video => wire::TrackKind::Video,
+            MediaKind::Audio => wire::TrackKind::Audio,
+        };
+        send.push(wire::LocalTrack {
+            sender_index: slot.1.media_index,
+            kind: kind.into(),
+            label: publication.slot.clone(),
+        });
+    }
+    let playout = match desired.playout_delay {
+        PlayoutDelay::Adaptive => None,
+        PlayoutDelay::Fixed { min_ms, max_ms } => Some(wire::PlayoutDelay { min_ms, max_ms }),
+    };
+    let mut video = alloc::vec::Vec::new();
+    for subscription in &desired.video {
+        if catalog
+            .tracks
+            .get(&subscription.track_id)
+            .is_some_and(|track| track.kind == wire::TrackKind::Video as i32)
+        {
+            video.push(wire::VideoTrackIntent {
+                track_id: subscription.track_id.clone(),
+                options: Some(wire::VideoOptions {
+                    height: subscription.height,
+                    min_height: subscription.min_height,
+                    min_fps: subscription.min_fps,
+                    priority: subscription.priority,
+                    playout_delay: playout.clone(),
+                }),
+            });
+        }
+    }
+    let audio = desired
+        .audio
+        .pinned
+        .iter()
+        .filter(|id| {
+            catalog
+                .tracks
+                .get(*id)
+                .is_some_and(|track| track.kind == wire::TrackKind::Audio as i32)
+        })
+        .map(|id| wire::AudioTrackIntent {
+            track_id: id.clone(),
+            options: Some(wire::AudioOptions {
+                playout_delay: playout.clone(),
+            }),
+        })
+        .collect();
+    let message = wire::ClientMessage {
+        payload: Some(wire::client_message::Payload::Intent(wire::Intent {
+            revision,
+            send: Some(wire::SendIntent { tracks: send }),
+            receive: Some(wire::ReceiveIntent {
+                video: Some(wire::VideoIntent { tracks: video }),
+                audio: Some(wire::AudioIntent {
+                    tracks: audio,
+                    mode: if desired.audio.automatic {
+                        wire::AudioMode::Auto.into()
+                    } else {
+                        wire::AudioMode::ExplicitOnly.into()
+                    },
+                }),
+            }),
+        })),
+    };
+    pulsebeam_proto::codec::encode_client(&message)
+        .map_err(|_| SignalingError::Invalid("intent size"))
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct MappingState {
     pub intent_revision: u64,
@@ -273,6 +370,61 @@ mod tests {
             })),
         }
     }
+    #[test]
+    fn intent_uses_negotiated_indices_and_independent_raw_lz4() {
+        let mut catalog = CatalogState::default();
+        catalog.apply(snapshot(1)).unwrap();
+        let mut desired = DesiredState::default();
+        desired.publications.push(crate::PublicationIntent {
+            slot: "camera".into(),
+            active: true,
+        });
+        desired.video.push(crate::VideoSubscription {
+            slot: 0,
+            track_id: "track".into(),
+            height: 360,
+            min_height: 720,
+            min_fps: 24,
+            priority: 1,
+        });
+        desired.playout_delay = PlayoutDelay::Fixed {
+            min_ms: 15,
+            max_ms: 50,
+        };
+        let sender = MediaSlot::LocalVideo("camera".into());
+        let coordinates = BTreeMap::from([(
+            sender.clone(),
+            SlotBinding {
+                slot: sender,
+                mid: "non-numeric-mid".into(),
+                media_index: 3,
+                kind: MediaKind::Video,
+                direction: crate::MediaDirection::SendOnly,
+            },
+        )]);
+        let bytes = encode_intent(&desired, &coordinates, &catalog, 1).unwrap();
+        let decoded = pulsebeam_proto::codec::decode_client(&bytes).unwrap();
+        let Some(wire::client_message::Payload::Intent(intent)) = decoded.payload else {
+            panic!("expected Intent");
+        };
+        assert_eq!(intent.revision, 1);
+        assert_eq!(intent.send.unwrap().tracks[0].sender_index, 3);
+        let video = intent.receive.unwrap().video.unwrap().tracks;
+        assert_eq!(video[0].track_id, "track");
+        assert_eq!(video[0].options.as_ref().unwrap().min_height, 720);
+        assert_eq!(
+            video[0]
+                .options
+                .as_ref()
+                .unwrap()
+                .playout_delay
+                .as_ref()
+                .unwrap()
+                .min_ms,
+            15
+        );
+    }
+
     #[test]
     fn catalog_snapshots_and_deltas_are_atomic_and_revisioned() {
         let mut state = CatalogState::default();
