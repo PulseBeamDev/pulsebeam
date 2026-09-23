@@ -421,6 +421,49 @@ fn room_changes_obey_catalog_mapping_causality_and_option_defaults() {
 }
 
 #[test]
+fn zero_and_stale_intents_acknowledge_without_applying_conflicting_bodies() {
+    let mut h = Harness::new(None);
+    h.intent(v1::Intent {
+        revision: 1,
+        send: Some(v1::SendIntent {
+            tracks: vec![v1::LocalTrack {
+                sender_index: h.video_sender,
+                kind: v1::TrackKind::Video.into(),
+                label: "camera".into(),
+            }],
+        }),
+        receive: None,
+    });
+    let publications = h.participant.v1_test_publications();
+    for revision in [0, 1] {
+        let from = h.intent(v1::Intent {
+            revision,
+            send: Some(v1::SendIntent {
+                tracks: vec![v1::LocalTrack {
+                    sender_index: h.video_sender,
+                    kind: v1::TrackKind::Video.into(),
+                    label: "conflicting-label".into(),
+                }],
+            }),
+            receive: None,
+        });
+        assert_eq!(h.participant.v1_test_publications(), publications);
+        assert!(h.messages(from).iter().any(|message| matches!(
+            payload(message),
+            v1::server_message::Payload::Mapping(v1::Mapping {
+                intent_revision: 1,
+                ..
+            })
+        )));
+        assert!(
+            !h.messages(from)
+                .iter()
+                .any(|message| matches!(payload(message), v1::server_message::Payload::Error(_)))
+        );
+    }
+}
+
+#[test]
 fn fatal_relabel_and_capacity_are_revisioned_and_atomic() {
     let mut h = Harness::new(None);
     h.intent(v1::Intent {
