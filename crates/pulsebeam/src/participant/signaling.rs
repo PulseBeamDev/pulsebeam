@@ -922,6 +922,27 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_bound_checks_complete_catalog_not_only_deltas() {
+        let recipient = crate::entity::ParticipantId::new();
+        let snapshot = |count: usize| SignalingSnapshot {
+            publications: Vec::new(),
+            participants: (0..count)
+                .map(|index| {
+                    (
+                        format!("p{index:03}"),
+                        format!("e{index:03}{}", "x".repeat(239)),
+                    )
+                })
+                .collect(),
+        };
+        assert!(build_catalog(recipient, "recipient", &snapshot(126)).is_ok());
+        assert_eq!(
+            build_catalog(recipient, "recipient", &snapshot(130)),
+            Err(CatalogBuildError::SnapshotTooLarge)
+        );
+    }
+
+    #[test]
     fn v1_scheduler_emits_catalog_before_mapping() {
         let catalog = v1::CatalogSnapshot {
             participants: Vec::new(),
