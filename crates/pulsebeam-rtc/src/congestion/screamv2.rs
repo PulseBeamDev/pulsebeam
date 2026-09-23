@@ -1087,6 +1087,26 @@ mod tests {
     }
 
     #[test]
+    fn simultaneous_due_reactions_prioritize_loss_then_classic_ce_then_delay() {
+        let mut cc = ScreamV2::new(4_000_000, None);
+        cc.ref_wnd = 30_000;
+        cc.loss_rate = ONE / 50;
+        cc.qdelay_avg = cc.qdelay_target * 3 / 4;
+        cc.pending_loss = true;
+        cc.pending_ce = true;
+        cc.pending_virtual_ce = true;
+        let mut values = input(&[], 4_000_000);
+        values.ecn_mode = EcnMode::Classic;
+        let first = cc.update(Duration::from_millis(25), values);
+        assert_eq!(first.reason, ControllerReason::Loss);
+        let second = cc.update(Duration::from_millis(50), values);
+        assert_eq!(second.reason, ControllerReason::ClassicEcn);
+        let third = cc.update(Duration::from_millis(75), values);
+        assert_eq!(third.reason, ControllerReason::Delay);
+        assert!(!cc.pending_loss && !cc.pending_ce && !cc.pending_virtual_ce);
+    }
+
+    #[test]
     fn blocked_loss_reacts_on_timer_without_consuming_growth_credit() {
         let mut cc = ScreamV2::new(4_000_000, None);
         cc.ref_wnd = 20_000;
