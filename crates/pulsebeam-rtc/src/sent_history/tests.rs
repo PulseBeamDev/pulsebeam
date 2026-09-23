@@ -351,7 +351,7 @@ fn terminal_rfc8888_receipt_cannot_replace_new_feedback_hold() {
             reports: vec![crate::rtcp::Rfc8888Report {
                 ssrc: 7,
                 begin_sequence: 1,
-                report_count: statuses.len() as u16,
+                report_count: u16::try_from(statuses.len()).unwrap(),
                 statuses: statuses.into(),
             }]
             .into(),
