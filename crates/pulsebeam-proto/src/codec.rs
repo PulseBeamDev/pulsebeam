@@ -62,9 +62,14 @@ fn encode<M: Message>(message: &M) -> Result<Vec<u8>, EncodeError> {
     }
 
     let protobuf = message.encode_to_vec();
-    let mut output = vec![0; get_maximum_output_size(protobuf.len()).min(MAX_COMPRESSED_SIZE)];
+    // lz4_flex requires its own conservative scratch bound even when the
+    // resulting raw block fits the protocol's tighter wire bound.
+    let mut output = vec![0; get_maximum_output_size(protobuf.len())];
     let compressed_len =
         compress_into(&protobuf, &mut output).map_err(|_| EncodeError::CompressedTooLarge)?;
+    if compressed_len > MAX_COMPRESSED_SIZE {
+        return Err(EncodeError::CompressedTooLarge);
+    }
     output.truncate(compressed_len);
     Ok(output)
 }
@@ -157,6 +162,21 @@ mod tests {
         };
         let bytes = encode_server(&message).expect("superseded terminal fits");
         assert_eq!(decode_server(&bytes), Ok(message));
+    }
+
+    #[test]
+    fn compressible_protobuf_near_limit_is_encodable() {
+        let message = ServerMessage {
+            payload: Some(server_message::Payload::Error(ProtocolError {
+                code: crate::signaling_v1::ErrorCode::Internal.into(),
+                message: "x".repeat(32_000),
+                fatal: true,
+                intent_revision: None,
+            })),
+        };
+        assert!(message.encoded_len() <= MAX_MESSAGE_SIZE);
+        let wire = encode_server(&message).expect("large compressible message fits");
+        assert_eq!(decode_server(&wire), Ok(message));
     }
 
     #[test]
@@ -265,7 +285,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_incompressible_block_that_exceeds_wire_limit() {
+    fn incompressible_protobuf_near_limit_fits_wire_bound() {
         let mut state = 0x1234_5678_u32;
         let token: String = (0..MAX_MESSAGE_SIZE - 16)
             .map(|_| {
@@ -280,9 +300,8 @@ mod tests {
             )),
         };
         assert!(message.encoded_len() <= MAX_MESSAGE_SIZE);
-        assert_eq!(
-            encode_client(&message),
-            Err(EncodeError::CompressedTooLarge)
-        );
+        let wire = encode_client(&message).expect("raw LZ4 worst case fits the wire bound");
+        assert!(wire.len() <= MAX_COMPRESSED_SIZE);
+        assert_eq!(decode_client(&wire), Ok(message));
     }
 }

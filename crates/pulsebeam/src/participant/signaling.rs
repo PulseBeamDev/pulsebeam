@@ -464,7 +464,25 @@ impl Scheduler {
             ),
             Some(_) => return None,
         };
-        let bytes = pulsebeam_proto::codec::encode_server(&message).ok()?;
+        let bytes = match pulsebeam_proto::codec::encode_server(&message) {
+            Ok(bytes) => bytes,
+            Err(pulsebeam_proto::codec::EncodeError::UncompressedTooLarge)
+                if matches!(
+                    &message.payload,
+                    Some(v1::server_message::Payload::Catalog(v1::Catalog {
+                        state: Some(v1::catalog::State::Delta(_)),
+                        ..
+                    }))
+                ) =>
+            {
+                let Commit::Catalog { catalog, revision } = &commit else {
+                    return None;
+                };
+                pulsebeam_proto::codec::encode_server(&catalog_snapshot(*revision, catalog.clone()))
+                    .ok()?
+            }
+            Err(_) => return None,
+        };
         self.pending = Some(Pending {
             bytes: bytes.clone(),
             commit,
@@ -931,6 +949,57 @@ mod tests {
                 payload: Some(v1::server_message::Payload::Mapping(value))
             }) if value == expected_mapping
         ));
+    }
+
+    #[test]
+    fn oversized_delta_falls_back_to_encodable_snapshot_without_losing_revision() {
+        let catalog = |prefix: &str| v1::CatalogSnapshot {
+            participants: (0..126)
+                .map(|index| v1::Participant {
+                    participant_id: format!("{prefix}{index:03}"),
+                    participant_external_id: format!("{prefix}{index:03}{}", "x".repeat(239)),
+                })
+                .collect(),
+            tracks: Vec::new(),
+        };
+        let first = catalog("a");
+        let second = catalog("b");
+        assert!(
+            catalog_snapshot(2, second.clone()).encoded_len()
+                <= pulsebeam_proto::codec::MAX_MESSAGE_SIZE
+        );
+        assert!(
+            catalog_delta(2, &first, &second).encoded_len()
+                > pulsebeam_proto::codec::MAX_MESSAGE_SIZE
+        );
+        assert!(pulsebeam_proto::codec::encode_server(&catalog_snapshot(1, first.clone())).is_ok());
+        let mut scheduler = Scheduler::default();
+        scheduler.stage(Desired {
+            catalog: first,
+            mapping: mapping(1),
+        });
+        scheduler.poll().unwrap();
+        scheduler.commit_sent();
+        scheduler.poll().unwrap();
+        scheduler.commit_sent();
+        scheduler.stage(Desired {
+            catalog: second.clone(),
+            mapping: mapping(1),
+        });
+        let wire = scheduler.poll().expect("fallback snapshot");
+        assert_eq!(scheduler.poll(), Some(wire.clone()));
+        assert!(matches!(
+            pulsebeam_proto::codec::decode_server(&wire),
+            Ok(v1::ServerMessage {
+                payload: Some(v1::server_message::Payload::Catalog(v1::Catalog {
+                    revision: 2,
+                    state: Some(v1::catalog::State::Snapshot(snapshot)),
+                })),
+            }) if snapshot == second
+        ));
+        scheduler.commit_sent();
+        assert_eq!(scheduler.catalog_revision, 2);
+        assert!(scheduler.poll().is_none());
     }
 
     #[test]
