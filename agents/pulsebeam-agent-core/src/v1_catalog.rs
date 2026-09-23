@@ -463,6 +463,18 @@ mod tests {
         assert_eq!(state, initial);
         assert!(state.apply(snapshot(1)).is_err());
         assert_eq!(state, initial);
+        assert!(
+            state
+                .apply(wire::Catalog {
+                    revision: 1,
+                    state: Some(wire::catalog::State::Delta(wire::CatalogDelta {
+                        removed_track_ids: vec!["track".into()],
+                        ..Default::default()
+                    })),
+                })
+                .is_err()
+        );
+        assert_eq!(state, initial);
         let removal = wire::Catalog {
             revision: 2,
             state: Some(wire::catalog::State::Delta(wire::CatalogDelta {
