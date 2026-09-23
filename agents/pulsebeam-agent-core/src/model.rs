@@ -7,10 +7,10 @@ use core::time::Duration;
 
 use crate::{Generation, TopicNotification, TopicRegistrations, TopicSnapshot};
 
-pub const MAX_LOCAL_VIDEO_SLOTS: usize = 2;
-pub const MAX_LOCAL_AUDIO_SLOTS: usize = 2;
-pub const MAX_REMOTE_VIDEO_SLOTS: u8 = 7;
-pub const MAX_REMOTE_AUDIO_SLOTS: u8 = 3;
+pub const MAX_LOCAL_VIDEO_SLOTS: usize = 32;
+pub const MAX_LOCAL_AUDIO_SLOTS: usize = 32;
+pub const MAX_REMOTE_VIDEO_SLOTS: u8 = 32;
+pub const MAX_REMOTE_AUDIO_SLOTS: u8 = 32;
 pub const MAX_MID_BYTES: usize = 16;
 pub const MAX_PLAYOUT_DELAY_MS: u32 = 40_950;
 
@@ -389,14 +389,16 @@ impl MediaTopology {
             usize::from(self.remote_audio),
             usize::from(MAX_REMOTE_AUDIO_SLOTS),
         )?;
-        let mut names = BTreeSet::new();
-        for name in self.local_video.iter().chain(&self.local_audio) {
-            validate_identifier("slot name", name, 64, false)?;
-            if !names.insert(name.clone()) {
-                return Err(ValidationError::Duplicate {
-                    field: "slot name",
-                    value: name.clone(),
-                });
+        for slots in [&self.local_video, &self.local_audio] {
+            let mut names = BTreeSet::new();
+            for name in slots {
+                validate_identifier("slot name", name, 64, false)?;
+                if !names.insert(name.clone()) {
+                    return Err(ValidationError::Duplicate {
+                        field: "slot name",
+                        value: name.clone(),
+                    });
+                }
             }
         }
         Ok(())

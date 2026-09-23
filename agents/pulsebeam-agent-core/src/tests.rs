@@ -611,6 +611,26 @@ fn drain_notifications(agent: &mut Agent) -> Vec<Notification> {
 }
 
 #[test]
+fn topology_limits_each_kind_and_direction_independently() {
+    let mut topology = MediaTopology {
+        local_video: (0..32).map(|index| format!("video-{index}")).collect(),
+        local_audio: (0..32).map(|index| format!("audio-{index}")).collect(),
+        remote_video: 32,
+        remote_audio: 32,
+    };
+    assert!(topology.validate().is_ok());
+    topology.remote_audio = 33;
+    assert!(matches!(
+        topology.validate(),
+        Err(ValidationError::SlotLimit {
+            kind: "remote audio",
+            maximum: 32,
+            ..
+        })
+    ));
+}
+
+#[test]
 fn construction_and_desired_state_validate_complete_external_input() {
     let mut invalid_endpoint = config();
     invalid_endpoint.endpoint = "https://".to_string();
@@ -620,8 +640,7 @@ fn construction_and_desired_state_validate_complete_external_input() {
     ));
 
     let mut invalid = config();
-    invalid.topology.local_video.push("second".to_string());
-    invalid.topology.local_video.push("third".to_string());
+    invalid.topology.local_video = (0..=32).map(|index| format!("camera-{index}")).collect();
     assert!(matches!(
         Agent::new(invalid),
         Err(AgentError::InvalidConfiguration(
@@ -630,13 +649,17 @@ fn construction_and_desired_state_validate_complete_external_input() {
     ));
 
     let mut duplicate = config();
-    duplicate.topology.local_audio = vec!["camera".to_string()];
+    duplicate.topology.local_video.push("camera".to_string());
     assert!(matches!(
         Agent::new(duplicate),
         Err(AgentError::InvalidConfiguration(
             ValidationError::Duplicate { .. }
         ))
     ));
+
+    let mut shared_label = config();
+    shared_label.topology.local_audio = vec!["camera".to_string()];
+    assert!(Agent::new(shared_label).is_ok());
 
     let mut protocol_header = config();
     protocol_header.token.clear();
