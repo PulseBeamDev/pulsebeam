@@ -201,15 +201,14 @@ pub(crate) fn encode_intent(
         .iter()
         .filter(|publication| publication.active)
     {
-        let slot = coordinates
-            .iter()
-            .find(|(slot, _)| match slot {
-                MediaSlot::LocalVideo(label) | MediaSlot::LocalAudio(label) => {
-                    label == &publication.slot
-                }
-                _ => false,
-            })
-            .ok_or(SignalingError::Invalid("unbound local sender"))?;
+        let Some(slot) = coordinates.iter().find(|(slot, binding)| {
+            matches!(slot, MediaSlot::LocalVideo(label) | MediaSlot::LocalAudio(label) if label == &publication.slot)
+                && binding.direction == crate::MediaDirection::SendOnly
+                && binding.kind == slot.kind()
+        }) else {
+            // A reservation can outlive the compatible sender sections of this connection.
+            continue;
+        };
         let kind = match slot.0.kind() {
             MediaKind::Video => wire::TrackKind::Video,
             MediaKind::Audio => wire::TrackKind::Audio,
@@ -423,6 +422,36 @@ mod tests {
                 .min_ms,
             15
         );
+    }
+
+    #[test]
+    fn unavailable_sender_keeps_desire_without_inventing_a_coordinate() {
+        let mut desired = DesiredState::default();
+        desired.publications.push(crate::PublicationIntent {
+            slot: "camera".into(),
+            active: true,
+        });
+        let sender = MediaSlot::LocalVideo("camera".into());
+        let incompatible = SlotBinding {
+            slot: sender.clone(),
+            mid: "recv".into(),
+            media_index: 4,
+            kind: MediaKind::Video,
+            direction: crate::MediaDirection::ReceiveOnly,
+        };
+        for coordinates in [
+            BTreeMap::new(),
+            BTreeMap::from([(sender.clone(), incompatible)]),
+        ] {
+            let bytes = encode_intent(&desired, &coordinates, &CatalogState::default(), 1)
+                .expect("missing sender is feasible");
+            let message = pulsebeam_proto::codec::decode_client(&bytes).unwrap();
+            let Some(wire::client_message::Payload::Intent(intent)) = message.payload else {
+                panic!("expected Intent");
+            };
+            assert!(intent.send.unwrap().tracks.is_empty());
+            assert_eq!(desired.publications[0].slot, "camera");
+        }
     }
 
     #[test]
