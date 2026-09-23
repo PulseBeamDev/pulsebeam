@@ -2019,6 +2019,7 @@ fn connection_name(state: &ConnectionState) -> String {
         ConnectionState::RetryWaiting { attempt, .. } => format!("retry-waiting:{attempt}"),
         ConnectionState::Closing => "closing".into(),
         ConnectionState::TerminalFailure => "terminal-failure".into(),
+        ConnectionState::Superseded => "superseded".into(),
     }
 }
 
@@ -2037,6 +2038,7 @@ fn failure_class_name(class: FailureClass) -> &'static str {
         FailureClass::Transient => "transient",
         FailureClass::ResourceExpired => "resource-expired",
         FailureClass::RetryExhausted => "retry-exhausted",
+        FailureClass::Superseded => "superseded",
     }
 }
 

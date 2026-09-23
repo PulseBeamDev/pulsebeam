@@ -104,6 +104,9 @@ enum ControlCommand {
     Reconnect {
         response: oneshot::Sender<Result<(), NativeError>>,
     },
+    Connect {
+        response: oneshot::Sender<Result<(), NativeError>>,
+    },
     Close {
         response: oneshot::Sender<Result<(), NativeError>>,
     },
@@ -201,6 +204,13 @@ impl Agent {
 
     pub fn statistics(&self) -> core_ffi::TransportStatistics {
         runtime_statistics(&self.runtime.statistics().borrow())
+    }
+
+    pub async fn connect(&self) -> Result<(), NativeError> {
+        request(&self.commands, |response| ControlCommand::Connect {
+            response,
+        })
+        .await
     }
 
     pub async fn reconnect(&self) -> Result<(), NativeError> {
@@ -476,6 +486,9 @@ async fn run_control(
                 }
                 .map_err(native_runtime_error);
                 let _ = response.send(result);
+            }
+            ControlCommand::Connect { response } => {
+                let _ = response.send(runtime.connect().await.map_err(native_runtime_error));
             }
             ControlCommand::Reconnect { response } => {
                 let _ = response.send(runtime.reconnect().await.map_err(native_runtime_error));

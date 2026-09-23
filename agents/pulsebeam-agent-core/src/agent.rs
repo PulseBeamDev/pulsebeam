@@ -34,6 +34,7 @@ macro_rules! agent_log {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AgentCommand {
     ReplaceDesired(DesiredState),
+    Connect,
     SendTopic(TopicSend),
 }
 
@@ -160,6 +161,7 @@ pub struct Agent {
     intent_dirty: bool,
     closing: Option<Closing>,
     orphaned_creates: BTreeSet<OperationId>,
+    superseded: bool,
     topics: Topics,
 }
 
@@ -183,6 +185,7 @@ impl Agent {
             intent_dirty: false,
             closing: None,
             orphaned_creates: BTreeSet::new(),
+            superseded: false,
             topics: Topics::new(log_level),
         })
     }
@@ -190,6 +193,10 @@ impl Agent {
     pub fn command(&mut self, command: AgentCommand) -> Result<(), AgentError> {
         let result = match command {
             AgentCommand::ReplaceDesired(desired) => self.replace_desired(desired),
+            AgentCommand::Connect => {
+                self.connect();
+                Ok(())
+            }
             AgentCommand::SendTopic(send) => self
                 .topics
                 .send(
@@ -235,6 +242,9 @@ impl Agent {
     fn replace_desired(&mut self, mut desired: DesiredState) -> Result<(), AgentError> {
         desired.normalize();
         desired.validate(&self.config.topology)?;
+        if self.superseded {
+            desired.connected = false;
+        }
         if desired.revision < self.desired.revision {
             return Err(AgentError::StaleDesiredRevision {
                 received: desired.revision,
@@ -316,10 +326,23 @@ impl Agent {
             } else {
                 self.send_intent_if_ready();
             }
-        } else {
+        } else if !self.superseded {
             self.begin_close();
         }
         Ok(())
+    }
+
+    fn connect(&mut self) {
+        if self.desired.connected && !self.superseded {
+            return;
+        }
+        self.superseded = false;
+        self.desired.connected = true;
+        self.snapshot.terminal_failure = None;
+        self.bump_snapshot();
+        if self.closing.is_none() && self.attempt.is_none() && self.retry.is_none() {
+            self.start_attempt(AttemptMode::Fresh);
+        }
     }
 
     fn start_attempt(&mut self, mode: AttemptMode) {
@@ -554,7 +577,7 @@ impl Agent {
             operation.get(),
             response.status,
         );
-        let failure = classify_http_failure(response.status);
+        let failure = classify_http_failure(&response);
         if let Some(failure) = failure {
             self.fail_attempt(failure);
             return Ok(());
@@ -961,6 +984,7 @@ impl Agent {
         self.intent_dirty = true;
         self.notify_failure(failure.clone());
         match failure.class {
+            FailureClass::Superseded => self.suspend_superseded(failure),
             FailureClass::Transient => self.schedule_retry(attempt.mode),
             FailureClass::InvalidConfiguration
             | FailureClass::Authorization
@@ -971,6 +995,14 @@ impl Agent {
                 self.set_connection_state(ConnectionState::TerminalFailure);
             }
         }
+    }
+
+    fn suspend_superseded(&mut self, failure: Failure) {
+        self.superseded = true;
+        self.desired.connected = false;
+        self.snapshot.terminal_failure = Some(failure);
+        self.begin_close();
+        self.set_connection_state(ConnectionState::Superseded);
     }
 
     fn schedule_retry(&mut self, mode: AttemptMode) {
@@ -1194,6 +1226,10 @@ impl Agent {
         self.snapshot.generation = None;
         self.snapshot.participant_id = None;
         self.clear_observed_state();
+        if self.superseded {
+            self.set_connection_state(ConnectionState::Superseded);
+            return;
+        }
         self.snapshot.terminal_failure = None;
         self.set_connection_state(ConnectionState::Disconnected);
         if self.desired.connected {
@@ -1384,11 +1420,23 @@ fn request_headers(token: &str, json: bool) -> Vec<HttpHeader> {
     headers
 }
 
-fn classify_http_failure(status: u16) -> Option<Failure> {
+fn classify_http_failure(response: &HttpResponse) -> Option<Failure> {
+    let status = response.status;
     if status == 201 {
         return None;
     }
+    let superseded = status == 409
+        && serde_json::from_slice::<serde_json::Value>(&response.body)
+            .ok()
+            .and_then(|problem| {
+                problem
+                    .get("type")
+                    .and_then(|kind| kind.as_str())
+                    .map(str::to_owned)
+            })
+            .is_some_and(|kind| kind == "urn:pulsebeam:error:superseded");
     let (class, message) = match status {
+        409 if superseded => (FailureClass::Superseded, "connection superseded"),
         401 | 403 => (FailureClass::Authorization, "server rejected authorization"),
         408 | 425 | 429 | 500..=599 => (FailureClass::Transient, "transient HTTP failure"),
         400 | 404 | 409 | 410 | 412 | 422 => (

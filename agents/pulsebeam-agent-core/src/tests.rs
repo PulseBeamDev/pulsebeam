@@ -1188,6 +1188,99 @@ fn authorization_is_terminal_for_one_revision_and_a_new_revision_retries() {
 }
 
 #[test]
+fn superseded_admission_suspends_retries_until_explicit_connect() {
+    let mut agent = Agent::new(config()).unwrap();
+    let (old_generation, operation) = begin_connect(&mut agent, desired(1), channel(12));
+    agent
+        .handle(HostEvent::Http(HttpEvent::Response {
+            operation,
+            response: HttpResponse {
+                status: 409,
+                headers: vec![],
+                body: br#"{"type":"urn:pulsebeam:error:superseded"}"#.to_vec(),
+            },
+        }))
+        .unwrap();
+    assert_eq!(
+        next_effect(&mut agent),
+        Effect::Rtc(RtcEffect::Close {
+            generation: old_generation,
+        })
+    );
+    assert_eq!(agent.snapshot().connection, ConnectionState::Superseded);
+    assert_eq!(
+        agent
+            .snapshot()
+            .terminal_failure
+            .as_ref()
+            .map(|error| error.class),
+        Some(FailureClass::Superseded)
+    );
+    assert!(agent.next_effect().is_none());
+
+    agent
+        .command(AgentCommand::ReplaceDesired(desired(1)))
+        .unwrap();
+    let mut changed = desired(2);
+    changed.video[0].height = 480;
+    agent
+        .command(AgentCommand::ReplaceDesired(changed))
+        .unwrap();
+    agent
+        .handle(HostEvent::Rtc(RtcEvent::Disconnected {
+            generation: old_generation,
+        }))
+        .unwrap();
+    agent
+        .handle(HostEvent::Rtc(RtcEvent::Closed {
+            generation: old_generation,
+        }))
+        .unwrap();
+    assert_eq!(agent.snapshot().connection, ConnectionState::Superseded);
+    assert_eq!(agent.snapshot().desired_revision, 2);
+    assert!(agent.next_effect().is_none());
+
+    agent.command(AgentCommand::Connect).unwrap();
+    let new_generation = match next_effect(&mut agent) {
+        Effect::Rtc(RtcEffect::CreateOffer { generation, .. }) => generation,
+        effect => panic!("expected fresh offer, got {effect:?}"),
+    };
+    assert_ne!(new_generation, old_generation);
+    assert_eq!(agent.snapshot().connection, ConnectionState::CreatingOffer);
+    assert!(agent.snapshot().terminal_failure.is_none());
+    agent.command(AgentCommand::Connect).unwrap();
+    assert!(agent.next_effect().is_none());
+}
+
+#[test]
+fn ordinary_http_conflict_is_not_supersession() {
+    let mut agent = Agent::new(config()).unwrap();
+    let (_, operation) = begin_connect(&mut agent, desired(1), channel(12));
+    agent
+        .handle(HostEvent::Http(HttpEvent::Response {
+            operation,
+            response: HttpResponse {
+                status: 409,
+                headers: vec![],
+                body: br#"{"type":"urn:pulsebeam:error:conflict"}"#.to_vec(),
+            },
+        }))
+        .unwrap();
+    assert_eq!(
+        agent.snapshot().connection,
+        ConnectionState::TerminalFailure
+    );
+    assert_eq!(
+        agent
+            .snapshot()
+            .terminal_failure
+            .as_ref()
+            .map(|error| error.class),
+        Some(FailureClass::InvalidConfiguration)
+    );
+}
+
+#[test]
 fn signaling_snapshot_diff_and_empty_binding_groups_are_exact() {
     let (mut agent, generation, cid, send) = connected_agent();
     acknowledge_send(&mut agent, generation, cid, send);

@@ -219,12 +219,14 @@ impl<H: Host> Actor<H> {
     }
 
     fn set_connected(&mut self, connected: bool) {
-        let mut desired = self.desired.clone();
-        if desired.connected == connected {
-            return;
+        if self.desired.connected != connected {
+            let mut desired = self.desired.clone();
+            desired.connected = connected;
+            self.replace_desired(desired);
         }
-        desired.connected = connected;
-        self.replace_desired(desired);
+        if connected {
+            self.turn(Input::Command(AgentCommand::Connect));
+        }
     }
 
     fn replace_desired(&mut self, mut desired: DesiredState) {

@@ -138,6 +138,9 @@ enum Command {
     Reconnect {
         response: oneshot::Sender<Result<(), Error>>,
     },
+    Connect {
+        response: oneshot::Sender<Result<(), Error>>,
+    },
     Close {
         response: oneshot::Sender<Result<(), Error>>,
     },
@@ -269,6 +272,15 @@ impl Agent {
 
     pub fn events(&self) -> broadcast::Receiver<AgentEvent> {
         self.events.subscribe()
+    }
+
+    pub async fn connect(&self) -> Result<(), Error> {
+        let (response, result) = oneshot::channel();
+        self.commands
+            .send(Command::Connect { response })
+            .await
+            .map_err(|_| Error::Closed)?;
+        result.await.map_err(|_| Error::Closed)?
     }
 
     pub async fn reconnect(&self) -> Result<(), Error> {
@@ -728,6 +740,13 @@ impl Actor {
                 let _ = response.send(result);
             }
             Command::RequestKeyframe { slot, ssrc } => self.request_keyframe(&slot, ssrc),
+            Command::Connect { response } => {
+                let _ = response.send(
+                    self.core
+                        .command(AgentCommand::Connect)
+                        .map_err(Error::Core),
+                );
+            }
             Command::Reconnect { response } => {
                 let result = match self.core.snapshot().generation {
                     Some(generation) => {

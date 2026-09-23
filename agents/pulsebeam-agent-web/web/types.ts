@@ -82,7 +82,8 @@ export type ConnectionState =
   | "reconnecting"
   | `retry-waiting:${number}`
   | "closing"
-  | "terminal-failure";
+  | "terminal-failure"
+  | "superseded";
 
 export type FailureClass =
   | "initialization"
@@ -92,6 +93,7 @@ export type FailureClass =
   | "transient"
   | "resource-expired"
   | "retry-exhausted"
+  | "superseded"
   | "validation"
   | "runtime";
 
@@ -280,6 +282,8 @@ export type AgentEvent =
 
 export interface Agent {
   setState(state: AgentState): void;
+  connect(): void;
+  disconnect(): void;
   replaceLocalTrack(
     slot: string,
     track: MediaStreamTrack | null,

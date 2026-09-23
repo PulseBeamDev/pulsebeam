@@ -173,6 +173,7 @@ pub enum ConnectionState {
     RetryWaiting { attempt: u8, after_ms: u64 },
     Closing,
     TerminalFailure,
+    Superseded,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
@@ -183,6 +184,7 @@ pub enum FailureClass {
     Transient,
     ResourceExpired,
     RetryExhausted,
+    Superseded,
     Browser,
     Native,
 }
@@ -725,6 +727,7 @@ impl From<model::ConnectionState> for ConnectionState {
             },
             model::ConnectionState::Closing => Self::Closing,
             model::ConnectionState::TerminalFailure => Self::TerminalFailure,
+            model::ConnectionState::Superseded => Self::Superseded,
         }
     }
 }
@@ -738,6 +741,7 @@ impl From<model::FailureClass> for FailureClass {
             model::FailureClass::Transient => Self::Transient,
             model::FailureClass::ResourceExpired => Self::ResourceExpired,
             model::FailureClass::RetryExhausted => Self::RetryExhausted,
+            model::FailureClass::Superseded => Self::Superseded,
         }
     }
 }
@@ -1323,6 +1327,7 @@ mod tests {
             },
             ConnectionState::Closing,
             ConnectionState::TerminalFailure,
+            ConnectionState::Superseded,
         ] {
             assert_ffi_round_trip(value);
         }
@@ -1333,6 +1338,7 @@ mod tests {
             FailureClass::Transient,
             FailureClass::ResourceExpired,
             FailureClass::RetryExhausted,
+            FailureClass::Superseded,
             FailureClass::Browser,
             FailureClass::Native,
         ] {

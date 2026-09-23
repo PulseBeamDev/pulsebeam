@@ -234,6 +234,7 @@ pub enum ConnectionState {
     RetryWaiting { attempt: u8, after: Duration },
     Closing,
     TerminalFailure,
+    Superseded,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -277,6 +278,7 @@ pub enum FailureClass {
     Transient,
     ResourceExpired,
     RetryExhausted,
+    Superseded,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -281,6 +281,15 @@ class AgentFacade implements Agent {
     }
   }
 
+  connect(): void {
+    this.setState({ ...this.#state, connected: true });
+    if (!this.#closed && this.#runtime) this.#runtime.connect();
+  }
+
+  disconnect(): void {
+    this.setState({ ...this.#state, connected: false });
+  }
+
   replaceLocalTrack(
     slot: string,
     track: MediaStreamTrack | null,
