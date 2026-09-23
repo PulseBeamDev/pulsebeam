@@ -265,9 +265,19 @@ impl ScreamV2 {
         if has_received {
             self.update_qdelay_filter(now);
         }
+        let congestion_pending = self.pending_loss
+            || self.pending_ce
+            || self.pending_virtual_ce
+            || input.feedback.iter().any(|sample| {
+                sample.lost
+                    || (input.ecn_mode != EcnMode::Disabled
+                        && sample.received
+                        && sample.ecn == Some(EcnMark::Ce))
+            });
         let reacted = self.reduce_ref_wnd(now, input);
         if has_feedback {
             if input.growth_eligible
+                && !congestion_pending
                 && !reacted
                 && !self.pending_loss
                 && !self.pending_ce
@@ -303,7 +313,10 @@ impl ScreamV2 {
                     .bytes_newly_acked
                     .saturating_add(u64::from(sample.transport_bytes));
             }
-            if sample.received && sample.ecn == Some(EcnMark::Ce) {
+            if input.ecn_mode != EcnMode::Disabled
+                && sample.received
+                && sample.ecn == Some(EcnMark::Ce)
+            {
                 self.bytes_newly_acked_ce = self
                     .bytes_newly_acked_ce
                     .saturating_add(u64::from(sample.transport_bytes));
@@ -313,7 +326,7 @@ impl ScreamV2 {
                 self.observe_delay(sample);
                 self.data_units_delivered_this_rtt =
                     self.data_units_delivered_this_rtt.saturating_add(1);
-                if sample.ecn == Some(EcnMark::Ce) {
+                if input.ecn_mode != EcnMode::Disabled && sample.ecn == Some(EcnMark::Ce) {
                     self.data_units_marked_this_rtt =
                         self.data_units_marked_this_rtt.saturating_add(1);
                 }
@@ -965,8 +978,29 @@ mod tests {
         cc.consume_feedback(Duration::from_millis(25), input(&first, 4_000_000));
         assert_eq!(cc.debug_accumulated_acks(), (1_000, 0));
         let recovered = [sample(50, true, false, false, true)];
-        cc.consume_feedback(Duration::from_millis(50), input(&recovered, 4_000_000));
+        let mut values = input(&recovered, 4_000_000);
+        values.ecn_mode = EcnMode::Classic;
+        cc.consume_feedback(Duration::from_millis(50), values);
         assert_eq!(cc.debug_accumulated_acks(), (1_000, 1_000));
+    }
+
+    #[test]
+    fn disabled_ecn_marks_do_not_subtract_ack_credit() {
+        let mut cc = ScreamV2::new(4_000_000, None);
+        let received = [sample(25, true, true, false, true)];
+        cc.consume_feedback(Duration::from_millis(25), input(&received, 4_000_000));
+        assert_eq!(cc.debug_accumulated_acks(), (1_000, 0));
+        assert_eq!(cc.data_units_marked_this_rtt, 0);
+    }
+
+    #[test]
+    fn isolated_loss_suppresses_growth_on_its_feedback_update() {
+        let mut cc = ScreamV2::new(4_000_000, None);
+        let before = cc.ref_wnd;
+        let loss = [sample(100, false, true, true, false)];
+        cc.update(Duration::from_millis(100), input(&loss, 4_000_000));
+        assert_eq!(cc.ref_wnd, before);
+        assert_eq!(cc.debug_accumulated_acks().0, 1_000);
     }
 
     #[test]

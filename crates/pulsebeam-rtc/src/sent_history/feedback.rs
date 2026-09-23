@@ -10,6 +10,10 @@ impl SentHistory {
                 .saturating_add(count as u64);
             return;
         }
+        if feedback_status_count(&batch.report) > MAX_FEEDBACK_STATUSES {
+            self.add_unknown(feedback_status_count(&batch.report));
+            return;
+        }
         let received_at = batch.received_at.monotonic;
         let prior_evidence = self.inputs.feedback.len();
         let feedback_hold = match batch.report {
@@ -52,7 +56,7 @@ impl SentHistory {
     }
 
     pub(crate) fn expire(&mut self, now: Instant, limit: usize) -> usize {
-        let mut work = self.confirm_losses(now, limit);
+        let mut work = self.confirm_losses(now, limit.min(MAX_EXPIRATIONS_PER_POLL / 2));
         while work < limit && self.oldest_sent_id < self.next_sent_id {
             let id = SentPacketId(self.oldest_sent_id);
             let Some(entry) = self.entry(id).copied() else {
@@ -85,13 +89,20 @@ impl SentHistory {
             self.entry(SentPacketId(id))
                 .and_then(|entry| entry.committed_at.checked_add(SENT_HISTORY_MAX_AGE))
         });
-        let missing = self.missing.iter().find_map(|id| {
-            let entry = self.entry(*id)?;
-            match entry.acknowledgment {
-                Acknowledgment::Missing { since } => since.checked_add(self.reordering_window),
-                _ => None,
-            }
-        });
+        let missing = self
+            .missing
+            .iter()
+            .filter_map(|id| {
+                let entry = self.entry(*id)?;
+                match entry.acknowledgment {
+                    Acknowledgment::Missing {
+                        higher_received_at: Some(at),
+                        ..
+                    } => at.checked_add(self.reordering_window),
+                    _ => None,
+                }
+            })
+            .min();
         match (sent, missing) {
             (Some(left), Some(right)) => Some(left.min(right)),
             (left, None) | (None, left) => left,
@@ -181,6 +192,29 @@ impl SentHistory {
                 return;
             }
         }
+        let late_receipt = statuses.iter().enumerate().any(|(offset, status)| {
+            matches!(status, TwccStatus::Received { .. })
+                && self
+                    .twcc_sent_id(base.saturating_add(offset as u64))
+                    .and_then(|id| self.entry(id))
+                    .is_some_and(|entry| {
+                        matches!(entry.acknowledgment, Acknowledgment::Missing { .. })
+                    })
+        });
+        let fresh = !statuses.is_empty()
+            && (self
+                .twcc_feedback_count
+                .is_none_or(|previous| count > previous)
+                || late_receipt)
+            && (base..=last_reported).any(|sequence| {
+                self.twcc_sent_id(sequence)
+                    .and_then(|id| self.entry(id))
+                    .is_some_and(|entry| {
+                        !entry.acknowledgment.is_terminal()
+                            && received_at.saturating_duration_since(entry.committed_at)
+                                < SENT_HISTORY_MAX_AGE
+                    })
+            });
         if self
             .twcc_reference
             .is_none_or(|previous| reference >= previous)
@@ -195,9 +229,7 @@ impl SentHistory {
         } else {
             self.twcc_feedback_count = Some(count);
         }
-        if !statuses.is_empty() {
-            self.inputs.fresh_network_feedback = true;
-        }
+        self.inputs.fresh_network_feedback |= fresh;
         if let Some(edge) = received_edge {
             self.advance_twcc_edge(base, statuses, &arrivals, edge, epoch, received_at);
         }
@@ -211,6 +243,9 @@ impl SentHistory {
             } else if old_edge.is_some_and(|edge| sequence <= edge) {
                 self.recover(sent_id, epoch, arrivals[offset], None, received_at);
             }
+        }
+        if let Some(edge) = received_edge {
+            self.anchor_missing(Some(edge), None, received_at);
         }
     }
 
@@ -251,6 +286,7 @@ impl SentHistory {
             self.add_unknown(1);
             return;
         }
+        self.anchor_missing(Some(edge), None, received_at);
         for sequence in start..=edge {
             let sent_id = self.twcc_sent_id(sequence);
             let offset = sequence
@@ -345,6 +381,30 @@ impl SentHistory {
                 };
                 normalized.push(value);
             }
+            let count = unwrap_near_signed(
+                i64::from(report.report_count),
+                self.ssrcs[ssrc_index].last_report_count,
+                1 << 8,
+            );
+            let late_receipt = normalized.iter().enumerate().any(|(offset, status)| {
+                status.0
+                    && self
+                        .lookup_rtp(ssrc_index, base.saturating_add(offset as u64))
+                        .and_then(|id| self.entry(id))
+                        .is_some_and(|entry| {
+                            matches!(entry.acknowledgment, Acknowledgment::Missing { .. })
+                        })
+            });
+            let has_nonterminal = !report.statuses.is_empty()
+                && (base..=last_reported).any(|sequence| {
+                    self.lookup_rtp(ssrc_index, sequence)
+                        .and_then(|id| self.entry(id))
+                        .is_some_and(|entry| {
+                            !entry.acknowledgment.is_terminal()
+                                && received_at.saturating_duration_since(entry.committed_at)
+                                    < SENT_HISTORY_MAX_AGE
+                        })
+                });
             let old_edge = self.ssrcs[ssrc_index].highest_acked_sequence;
             let received_edge = normalized
                 .iter()
@@ -383,6 +443,7 @@ impl SentHistory {
                     self.add_unknown(unresolved_reported + unresolved_advance);
                     continue;
                 } else if received_edge.is_some() && edge >= start {
+                    self.anchor_missing(None, Some((report.ssrc, edge)), received_at);
                     for sequence in start..=edge {
                         let sent_id = self.lookup_rtp(ssrc_index, sequence);
                         let offset = sequence
@@ -397,8 +458,17 @@ impl SentHistory {
                     self.ssrcs[ssrc_index].highest_acked_sequence = Some(edge);
                 }
             }
-            if !report.statuses.is_empty() {
-                self.inputs.fresh_network_feedback = true;
+            let fresh = has_nonterminal
+                && (self.ssrcs[ssrc_index]
+                    .last_report_count
+                    .is_none_or(|previous| count > previous)
+                    || late_receipt);
+            self.inputs.fresh_network_feedback |= fresh;
+            if self.ssrcs[ssrc_index]
+                .last_report_count
+                .is_none_or(|previous| count > previous)
+            {
+                self.ssrcs[ssrc_index].last_report_count = Some(count);
             }
             for (_, _, _, hold) in &normalized {
                 if let Some(hold) = hold {
@@ -422,8 +492,38 @@ impl SentHistory {
                     self.recover(sent_id, epoch, arrival, ecn, received_at);
                 }
             }
+            if let Some(edge) = received_edge {
+                self.anchor_missing(None, Some((report.ssrc, edge)), received_at);
+            }
         }
         minimum_hold
+    }
+
+    pub(super) fn anchor_missing(
+        &mut self,
+        twcc_edge: Option<u64>,
+        rtp_edge: Option<(u32, u64)>,
+        received_at: Instant,
+    ) {
+        for id in &self.missing {
+            let Some(entry) = self.entries[ring_index(id.0)].as_mut() else {
+                continue;
+            };
+            if entry.id != *id {
+                continue;
+            }
+            let lower = twcc_edge
+                .is_some_and(|edge| entry.twcc_sequence.is_some_and(|seq| seq < edge))
+                || rtp_edge
+                    .is_some_and(|(ssrc, edge)| entry.ssrc == ssrc && entry.rtp_sequence < edge);
+            if lower
+                && let Acknowledgment::Missing {
+                    higher_received_at, ..
+                } = &mut entry.acknowledgment
+            {
+                higher_received_at.get_or_insert(received_at);
+            }
+        }
     }
 
     fn advance_entry(
@@ -448,7 +548,23 @@ impl SentHistory {
             return;
         }
         self.retire_from_flight(sent_id);
+        if received_at.saturating_duration_since(entry.committed_at) >= SENT_HISTORY_MAX_AGE {
+            self.mark_lost(sent_id, false);
+            return;
+        }
         if received {
+            if let Acknowledgment::Missing {
+                higher_received_at: Some(at),
+                ..
+            } = entry.acknowledgment
+                && at
+                    .checked_add(self.reordering_window)
+                    .is_some_and(|deadline| received_at >= deadline)
+            {
+                self.mark_lost(sent_id, false);
+                self.emit(sent_id, false, true, false, None, None);
+                return;
+            }
             self.set_received(sent_id, true, receiver_arrival, ecn, received_at);
         } else {
             self.set_missing(sent_id, received_at);
@@ -476,15 +592,56 @@ impl SentHistory {
             self.counters.wrong_path_feedback = self.counters.wrong_path_feedback.saturating_add(1);
             return;
         }
+        if received_at.saturating_duration_since(entry.committed_at) >= SENT_HISTORY_MAX_AGE {
+            self.mark_lost(sent_id, true);
+            if let Some(since) = self
+                .entry_mut(sent_id)
+                .and_then(|entry| entry.missing_since.take())
+            {
+                self.reordering_window = self.reordering_window.max(
+                    received_at
+                        .saturating_duration_since(since)
+                        .min(MAX_REORDERING_WINDOW),
+                );
+            }
+            return;
+        }
         match entry.acknowledgment {
-            Acknowledgment::Missing { since } => {
+            Acknowledgment::Missing {
+                since,
+                higher_received_at,
+            } => {
                 let observed = received_at
                     .saturating_duration_since(since)
                     .min(MAX_REORDERING_WINDOW);
+                let deadline_passed = higher_received_at
+                    .and_then(|at| at.checked_add(self.reordering_window))
+                    .is_some_and(|deadline| received_at >= deadline);
                 self.reordering_window = self.reordering_window.max(observed);
-                self.set_received(sent_id, false, receiver_arrival, ecn, received_at);
+                if deadline_passed {
+                    self.mark_lost(sent_id, false);
+                    if let Some(entry) = self.entry_mut(sent_id) {
+                        entry.missing_since = None;
+                    }
+                } else {
+                    self.set_received(sent_id, false, receiver_arrival, ecn, received_at);
+                }
             }
-            Acknowledgment::Received | Acknowledgment::Lost | Acknowledgment::Retired => {
+            Acknowledgment::Lost => {
+                if let Some(since) = self
+                    .entry_mut(sent_id)
+                    .and_then(|entry| entry.missing_since.take())
+                {
+                    self.reordering_window = self.reordering_window.max(
+                        received_at
+                            .saturating_duration_since(since)
+                            .min(MAX_REORDERING_WINDOW),
+                    );
+                }
+                self.counters.duplicate_feedback =
+                    self.counters.duplicate_feedback.saturating_add(1);
+            }
+            Acknowledgment::Received | Acknowledgment::Retired => {
                 self.counters.duplicate_feedback =
                     self.counters.duplicate_feedback.saturating_add(1);
             }
@@ -511,6 +668,7 @@ impl SentHistory {
             return;
         }
         entry.acknowledgment = Acknowledgment::Received;
+        entry.missing_since = None;
         self.counters.received = self.counters.received.saturating_add(1);
         self.emit(sent_id, true, newly_acked, false, receiver_arrival, ecn);
     }
@@ -521,7 +679,11 @@ impl SentHistory {
         };
         match entry.acknowledgment {
             Acknowledgment::Pending => {
-                entry.acknowledgment = Acknowledgment::Missing { since: now };
+                entry.acknowledgment = Acknowledgment::Missing {
+                    since: now,
+                    higher_received_at: None,
+                };
+                entry.missing_since = Some(now);
                 self.missing.push_back(sent_id);
             }
             Acknowledgment::Missing { .. }
@@ -533,40 +695,31 @@ impl SentHistory {
 
     pub(super) fn confirm_losses(&mut self, now: Instant, limit: usize) -> usize {
         let mut work = 0;
-        let mut confirmed_loss = false;
-        while work < limit {
-            let Some(sent_id) = self.missing.front().copied() else {
+        let scan_limit = limit.min(self.missing.len());
+        while work < scan_limit {
+            let Some(sent_id) = self.missing.pop_front() else {
                 break;
             };
+            work += 1;
             let Some(entry) = self.entry(sent_id).copied() else {
-                self.missing.pop_front();
-                work += 1;
                 continue;
             };
-            match entry.acknowledgment {
-                Acknowledgment::Missing { since } => {
-                    let Some(deadline) = since.checked_add(self.reordering_window) else {
-                        break;
-                    };
-                    if now < deadline {
-                        break;
-                    }
-                    self.missing.pop_front();
-                    self.mark_lost(sent_id, false);
-                    confirmed_loss = true;
-                    work += 1;
+            if let Acknowledgment::Missing {
+                higher_received_at, ..
+            } = entry.acknowledgment
+            {
+                let Some(deadline) =
+                    higher_received_at.and_then(|at| at.checked_add(self.reordering_window))
+                else {
+                    self.missing.push_back(sent_id);
+                    continue;
+                };
+                if now < deadline {
+                    self.missing.push_back(sent_id);
+                    continue;
                 }
-                _ => {
-                    self.missing.pop_front();
-                    work += 1;
-                }
+                self.mark_lost(sent_id, false);
             }
-        }
-        if confirmed_loss && self.reordering_window > INITIAL_REORDERING_WINDOW {
-            let excess = self
-                .reordering_window
-                .saturating_sub(INITIAL_REORDERING_WINDOW);
-            self.reordering_window = INITIAL_REORDERING_WINDOW.saturating_add(excess / 2);
         }
         work
     }

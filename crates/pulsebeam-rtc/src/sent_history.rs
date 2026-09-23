@@ -100,7 +100,10 @@ pub(crate) struct HistoryCounters {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Acknowledgment {
     Pending,
-    Missing { since: Instant },
+    Missing {
+        since: Instant,
+        higher_received_at: Option<Instant>,
+    },
     Received,
     Lost,
     Retired,
@@ -123,6 +126,7 @@ struct SentEntry {
     twcc_sequence: Option<u64>,
     service: RtpService,
     acknowledgment: Acknowledgment,
+    missing_since: Option<Instant>,
     in_flight: bool,
 }
 
@@ -140,6 +144,7 @@ struct SsrcHistory {
     highest_acked_sequence: Option<u64>,
     sent_ids: VecDeque<SentPacketId>,
     last_report_timestamp: Option<i64>,
+    last_report_count: Option<i64>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -249,6 +254,7 @@ impl SentHistory {
             twcc_sequence,
             service: rtp.service,
             acknowledgment: Acknowledgment::Pending,
+            missing_since: None,
             in_flight: true,
         });
         self.next_sent_id = self
@@ -337,6 +343,7 @@ impl SentHistory {
         self.reordering_window = INITIAL_REORDERING_WINDOW;
         for ssrc in &mut self.ssrcs {
             ssrc.last_report_timestamp = None;
+            ssrc.last_report_count = None;
             ssrc.highest_acked_sequence = None;
             ssrc.sent_ids.clear();
         }
@@ -354,6 +361,7 @@ impl SentHistory {
             highest_acked_sequence: None,
             sent_ids: VecDeque::new(),
             last_report_timestamp: None,
+            last_report_count: None,
         });
         self.ssrcs.len() - 1
     }

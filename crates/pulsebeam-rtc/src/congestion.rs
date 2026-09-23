@@ -174,7 +174,7 @@ pub(crate) struct ScreamController {
     path_epoch: Option<u64>,
     path_available: bool,
     last_feedback: Option<Duration>,
-    last_send: Option<Duration>,
+    first_send: Option<Duration>,
     application_limited_since: Option<Duration>,
     application_limited: bool,
     feedback_stale: bool,
@@ -194,7 +194,7 @@ impl ScreamController {
             path_epoch: None,
             path_available: false,
             last_feedback: None,
-            last_send: None,
+            first_send: None,
             application_limited_since: None,
             application_limited: false,
             feedback_stale: false,
@@ -206,7 +206,7 @@ impl ScreamController {
     }
 
     pub(crate) fn note_send(&mut self, at: Duration) {
-        self.last_send = Some(at);
+        self.first_send.get_or_insert(at);
     }
 
     pub(crate) fn update(&mut self, now: Duration, input: ControllerInput<'_>) -> SafeRtpEnvelope {
@@ -281,6 +281,7 @@ impl ScreamController {
         self.path_epoch = epoch;
         self.path_available = available;
         self.last_feedback = None;
+        self.first_send = None;
         self.feedback_stale = false;
         self.core.reset_path(target_bitrate_max);
         self.last_reason = ControllerReason::PathChanged;
@@ -307,10 +308,10 @@ impl ScreamController {
             .smoothed_rtt
             .saturating_mul(3)
             .clamp(Duration::from_millis(500), Duration::from_secs(2));
-        let reference = self.last_feedback.or(self.last_send);
+        let reference = self.last_feedback.or(self.first_send);
         self.feedback_stale = self.path_available
             && reference.is_some_and(|at| now.saturating_sub(at) >= threshold)
-            && self.last_send.is_some();
+            && self.first_send.is_some();
     }
 
     fn update_confidence(&mut self, now: Duration, has_feedback: bool) {
@@ -359,7 +360,6 @@ impl ScreamController {
             l4s_enabled: output.l4s_enabled,
             probe_permitted: self.path_available
                 && !self.feedback_stale
-                && !self.application_limited
                 && unmet
                 && input
                     .bytes_in_flight
@@ -417,7 +417,6 @@ mod tests {
     #[test]
     fn synthetic_loss_does_not_refresh_feedback_freshness() {
         let mut cc = ScreamController::new(2_000_000, None);
-        cc.note_send(Duration::ZERO);
         let base = ControllerInput {
             path_epoch: Some(1),
             path_available: true,
@@ -432,6 +431,8 @@ mod tests {
             window_or_pacer_blocked: false,
             ecn: EcnValidation::default(),
         };
+        cc.update(Duration::ZERO, base);
+        cc.note_send(Duration::ZERO);
         cc.update(Duration::from_millis(600), base);
         assert!(cc.feedback_stale);
         let loss = [FeedbackSample {
@@ -454,6 +455,29 @@ mod tests {
         );
         assert!(output.feedback_stale);
         assert_eq!(cc.last_feedback, None);
+    }
+
+    #[test]
+    fn repeated_sends_without_first_feedback_still_become_stale() {
+        let mut cc = ScreamController::new(4_000_000, None);
+        let base = ControllerInput {
+            path_epoch: Some(1),
+            path_available: true,
+            feedback: &[],
+            feedback_hold: Duration::ZERO,
+            fresh_network_feedback: false,
+            bytes_in_flight: 20_000,
+            paced_queue_bytes: 0,
+            offered_media_rate: 4_000_000,
+            admitted_media_rate: 4_000_000,
+            desired_media_rate: 4_000_000,
+            window_or_pacer_blocked: false,
+            ecn: EcnValidation::default(),
+        };
+        cc.update(Duration::ZERO, base);
+        cc.note_send(Duration::from_millis(1));
+        cc.note_send(Duration::from_millis(499));
+        assert!(cc.update(Duration::from_millis(501), base).feedback_stale);
     }
 
     #[test]
@@ -512,7 +536,6 @@ mod tests {
     #[test]
     fn draft_bytes_in_flight_gate_limits_growth_under_low_offer() {
         let mut cc = ScreamController::new(4_000_000, None);
-        cc.note_send(Duration::ZERO);
         let base = ControllerInput {
             path_epoch: Some(1),
             path_available: true,
@@ -528,6 +551,7 @@ mod tests {
             ecn: EcnValidation::default(),
         };
         cc.update(Duration::ZERO, base);
+        cc.note_send(Duration::ZERO);
         let entered = cc.update(Duration::from_millis(250), base);
         assert!(entered.application_limited);
         let before = entered.reference_window;

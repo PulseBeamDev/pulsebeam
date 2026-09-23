@@ -347,6 +347,32 @@ fn all_missing_twcc_report_does_not_advance_credit() {
     assert_eq!(history.highest_twcc_acked, None);
     assert!(history.inputs.feedback.is_empty());
     assert!(history.inputs.fresh_network_feedback);
+    history.clear_controller_inputs();
+    history.process_feedback(batch(
+        now + Duration::from_millis(20),
+        epoch,
+        vec![TwccStatus::NotReceived; 3],
+    ));
+    assert!(
+        !history.inputs.fresh_network_feedback,
+        "replayed report is not fresh"
+    );
+    history.process_feedback(FeedbackBatch {
+        received_at: at(now + Duration::from_millis(21)),
+        path_epoch: epoch,
+        sender_ssrc: 9,
+        report: FeedbackReport::Twcc {
+            media_ssrc: 7,
+            base_sequence: 1,
+            reference_time: 0,
+            feedback_count: 2,
+            statuses: vec![TwccStatus::NotReceived; 3].into(),
+        },
+    });
+    assert!(
+        history.inputs.fresh_network_feedback,
+        "new covering report is fresh"
+    );
 }
 
 #[test]
@@ -519,7 +545,93 @@ fn invalid_nonadvancing_report_does_not_mutate_feedback_baseline() {
 }
 
 #[test]
-fn reordering_window_is_bounded_and_decays_after_confirmed_loss() {
+fn all_missing_waits_for_higher_receipt_before_reorder_loss() {
+    let now = Instant::now();
+    let epoch = PathEpoch::from_value(31);
+    let mut history = SentHistory::new(PacketFeedbackKind::TransportWide);
+    history.path_changed(epoch, true);
+    for sequence in 1..=3 {
+        history.commit(context(now, epoch, sequence)).unwrap();
+    }
+    history.process_feedback(batch(
+        now + Duration::from_millis(10),
+        epoch,
+        vec![TwccStatus::NotReceived, TwccStatus::NotReceived],
+    ));
+    assert_eq!(history.confirm_losses(now + Duration::from_secs(1), 256), 2);
+    assert_eq!(history.counters.not_received, 0);
+    history.process_feedback(batch(
+        now + Duration::from_millis(100),
+        epoch,
+        vec![
+            TwccStatus::NotReceived,
+            TwccStatus::NotReceived,
+            TwccStatus::Received { delta_250us: 1 },
+        ],
+    ));
+    assert_eq!(
+        history.confirm_losses(now + Duration::from_millis(129), 256),
+        2
+    );
+    assert_eq!(history.counters.not_received, 0);
+    history.confirm_losses(now + Duration::from_millis(130), 256);
+    assert_eq!(history.counters.not_received, 2);
+}
+
+#[test]
+fn late_receipt_after_logical_deadline_cannot_erase_loss() {
+    let now = Instant::now();
+    let epoch = PathEpoch::from_value(32);
+    let mut history = SentHistory::new(PacketFeedbackKind::TransportWide);
+    history.path_changed(epoch, true);
+    for sequence in 1..=3 {
+        history.commit(context(now, epoch, sequence)).unwrap();
+    }
+    history.process_feedback(batch(
+        now + Duration::from_millis(10),
+        epoch,
+        vec![
+            TwccStatus::Received { delta_250us: 1 },
+            TwccStatus::NotReceived,
+            TwccStatus::Received { delta_250us: 1 },
+        ],
+    ));
+    history.clear_controller_inputs();
+    history.process_feedback(FeedbackBatch {
+        received_at: at(now + Duration::from_millis(40)),
+        path_epoch: epoch,
+        sender_ssrc: 9,
+        report: FeedbackReport::Twcc {
+            media_ssrc: 7,
+            base_sequence: 2,
+            reference_time: 0,
+            feedback_count: 2,
+            statuses: vec![TwccStatus::Received { delta_250us: 1 }].into(),
+        },
+    });
+    assert_eq!(
+        history.entry(SentPacketId(1)).unwrap().acknowledgment,
+        Acknowledgment::Lost
+    );
+    assert!(!history.inputs.feedback.iter().any(|sample| sample.received));
+    assert_eq!(history.reordering_window, INITIAL_REORDERING_WINDOW);
+    history.process_feedback(FeedbackBatch {
+        received_at: at(now + Duration::from_millis(80)),
+        path_epoch: epoch,
+        sender_ssrc: 9,
+        report: FeedbackReport::Twcc {
+            media_ssrc: 7,
+            base_sequence: 2,
+            reference_time: 0,
+            feedback_count: 3,
+            statuses: vec![TwccStatus::Received { delta_250us: 1 }].into(),
+        },
+    });
+    assert_eq!(history.reordering_window, INITIAL_REORDERING_WINDOW);
+}
+
+#[test]
+fn reordering_window_is_bounded_and_stays_monotonic_after_confirmed_loss() {
     let now = Instant::now();
     let epoch = PathEpoch::from_value(22);
     let mut history = SentHistory::new(PacketFeedbackKind::Rfc8888);
@@ -537,7 +649,15 @@ fn reordering_window_is_bounded_and_decays_after_confirmed_loss() {
 
     history.commit(rfc_context(now, epoch, 2)).unwrap();
     history.set_missing(SentPacketId(1), now);
+    assert_eq!(history.confirm_losses(now + MAX_REORDERING_WINDOW, 2), 2);
+    assert_eq!(
+        history.entry(SentPacketId(1)).unwrap().acknowledgment,
+        Acknowledgment::Missing {
+            since: now,
+            higher_received_at: None
+        }
+    );
+    history.anchor_missing(None, Some((7, 3)), now);
     history.confirm_losses(now + MAX_REORDERING_WINDOW, 2);
-    assert!(history.reordering_window < MAX_REORDERING_WINDOW);
-    assert!(history.reordering_window >= INITIAL_REORDERING_WINDOW);
+    assert_eq!(history.reordering_window, MAX_REORDERING_WINDOW);
 }
