@@ -138,6 +138,20 @@ const fn scenario(name: &'static str, seed: u64, seconds: u64, packets: u64) -> 
 }
 
 #[test]
+fn production_pre_media_probes_use_only_the_low_traffic_allowance() {
+    let mut fixture = PeerFixture::connected();
+    fixture.drive_for(Duration::from_secs(6));
+    let totals = fixture.connection.stats().connection;
+    assert_eq!(totals.transmitted_rtp_bytes, 0);
+    assert!(totals.transmitted_padding_bytes > 0);
+    assert!(totals.transmitted_padding_bytes <= 3_000);
+    eprintln!(
+        "probe-only window nonprobe=0 padding={} raw_ratio=100% allowance_used={}",
+        totals.transmitted_padding_bytes, totals.transmitted_padding_bytes
+    );
+}
+
+#[test]
 fn production_connection_bottleneck_emits_measured_transport_bytes() {
     const SEED: u64 = 0x1122;
     const RATE_BPS: u64 = 100_000;

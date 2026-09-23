@@ -95,14 +95,21 @@
       state.waiters = [...(state.waiters || []), check];
       check();
     });
-    const stats = await state.pc.getStats();
     let inboundPackets = 0;
     let outboundPackets = 0;
     let selectedCandidatePairChanges = 0;
-    for (const report of stats.values()) {
-      if (report.type === "inbound-rtp") inboundPackets += report.packetsReceived || 0;
-      if (report.type === "outbound-rtp") outboundPackets += report.packetsSent || 0;
-      if (report.type === "candidate-pair" && report.state === "succeeded") selectedCandidatePairChanges += 1;
+    for (let attempt = 0; attempt < 100; attempt++) {
+      inboundPackets = 0;
+      outboundPackets = 0;
+      selectedCandidatePairChanges = 0;
+      const stats = await state.pc.getStats();
+      for (const report of stats.values()) {
+        if (report.type === "inbound-rtp") inboundPackets += report.packetsReceived || 0;
+        if (report.type === "outbound-rtp") outboundPackets += report.packetsSent || 0;
+        if (report.type === "candidate-pair" && report.state === "succeeded") selectedCandidatePairChanges += 1;
+      }
+      if (inboundPackets > 0 && outboundPackets > 0) break;
+      await new Promise((resolve) => setTimeout(resolve, 50));
     }
     return {
       connectionState: state.pc.connectionState,

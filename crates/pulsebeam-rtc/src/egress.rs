@@ -33,6 +33,9 @@ const MAX_QUEUED_MEDIA_PACKETS: usize = 8_192;
 const MAX_PACED_TRANSPORT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_EXPIRATIONS_PER_POLL: usize = 256;
 const RTP_TRANSPORT_ALLOWANCE: usize = 96;
+const PROBE_WINDOW: Duration = Duration::from_secs(5);
+const PROBE_ALLOWANCE: u64 = 3_000;
+const MAX_PROBE_ACCOUNTING: usize = 32_768;
 
 pub(crate) struct MediaEgress {
     senders: Box<[Sender]>,
@@ -61,6 +64,8 @@ pub(crate) struct MediaEgress {
     probe_remaining: u8,
     last_probe: Option<Instant>,
     probe_history: VecDeque<Instant>,
+    emitted_rtp: VecDeque<(Instant, u64, bool)>,
+    probe_disabled_until: Option<Instant>,
 }
 
 struct Sender {
@@ -216,6 +221,8 @@ impl MediaEgress {
             probe_remaining: 0,
             last_probe: None,
             probe_history: VecDeque::with_capacity(64),
+            emitted_rtp: VecDeque::new(),
+            probe_disabled_until: None,
         };
         owner.reallocate(300_000_u64.min(desired));
         owner.events.clear();
@@ -304,6 +311,7 @@ impl MediaEgress {
             self.path_available = available;
             self.pacer.reset();
             self.probe_remaining = 0;
+            self.last_probe = None;
         }
         let desired = self
             .senders
@@ -585,6 +593,13 @@ impl MediaEgress {
             self.controller.note_send(
                 at.monotonic
                     .saturating_duration_since(self.controller_origin),
+            );
+        }
+        if !matches!(pending, PendingTransmit::Control) {
+            self.record_rtp(
+                at.monotonic,
+                prepared.wire_len as u64,
+                matches!(pending, PendingTransmit::Padding { .. }),
             );
         }
         match pending {
@@ -1106,6 +1121,57 @@ impl MediaEgress {
         }
     }
 
+    fn record_rtp(&mut self, at: Instant, bytes: u64, probe: bool) {
+        while self
+            .emitted_rtp
+            .front()
+            .is_some_and(|(sent, _, _)| at.saturating_duration_since(*sent) >= PROBE_WINDOW)
+        {
+            self.emitted_rtp.pop_front();
+        }
+        if self.emitted_rtp.len() >= MAX_PROBE_ACCOUNTING {
+            self.emitted_rtp.clear();
+            self.probe_disabled_until = at.checked_add(PROBE_WINDOW);
+        }
+        self.emitted_rtp.push_back((at, bytes, probe));
+    }
+
+    fn probe_budget_available(&self, at: Instant, bytes: u64) -> bool {
+        if self.probe_disabled_until.is_some_and(|until| at < until) {
+            return false;
+        }
+        let mut nonprobe = 0_u64;
+        let mut probes = bytes;
+        for (sent, size, probe) in &self.emitted_rtp {
+            if at.saturating_duration_since(*sent) < PROBE_WINDOW {
+                if *probe {
+                    probes = probes.saturating_add(*size);
+                } else {
+                    nonprobe = nonprobe.saturating_add(*size);
+                }
+            }
+        }
+        if probes > nonprobe / 19 + PROBE_ALLOWANCE {
+            return false;
+        }
+        // A probe must remain affordable as older non-probe bytes age out,
+        // until the probe itself leaves the five-second window.
+        for (sent, size, probe) in &self.emitted_rtp {
+            if at.saturating_duration_since(*sent) >= PROBE_WINDOW {
+                continue;
+            }
+            if *probe {
+                probes = probes.saturating_sub(*size);
+            } else {
+                nonprobe = nonprobe.saturating_sub(*size);
+            }
+            if probes > nonprobe / 19 + PROBE_ALLOWANCE {
+                return false;
+            }
+        }
+        true
+    }
+
     fn prepare_padding(&mut self, at: TimePoint, transport: &mut Transport) -> PrepareResult {
         if !self.path_available {
             return PrepareResult::Blocked;
@@ -1177,6 +1243,14 @@ impl MediaEgress {
         ) else {
             return PrepareResult::Fatal;
         };
+        if !self.probe_budget_available(
+            at.monotonic,
+            packet.len().saturating_add(RTP_TRANSPORT_ALLOWANCE) as u64,
+        ) {
+            self.probe_remaining = 0;
+            self.last_probe = Some(at.monotonic);
+            return PrepareResult::Blocked;
+        }
         match transport.send_rtp_with_service(&packet, RtpService::Padding) {
             Ok(()) => {
                 self.pending = Some(PendingTransmit::Padding {
@@ -1347,6 +1421,35 @@ mod tests {
 
     use super::*;
     use crate::{FrameMetadata, MediaPacket, MediaPriority, PlayoutDelay};
+
+    #[test]
+    fn probe_allowance_survives_nonprobe_expiry() {
+        let now = Instant::now();
+        let mut egress = MediaEgress::new(
+            Vec::new().into_boxed_slice(),
+            &[0; 32],
+            1,
+            1,
+            SenderPolicy {
+                playout_delay: PlayoutDelay::from_ticks(0, 0).expect("asap"),
+                priority: MediaPriority::MEDIUM,
+                desired_bitrate: MediaPayloadBitrate::from_bps(0),
+            },
+            SenderPolicy {
+                playout_delay: PlayoutDelay::from_ticks(0, 0).expect("asap"),
+                priority: MediaPriority::MEDIUM,
+                desired_bitrate: MediaPayloadBitrate::from_bps(0),
+            },
+            now,
+        );
+        assert!(egress.probe_budget_available(now, 3_000));
+        egress.record_rtp(now, 19_000, false);
+        egress.record_rtp(now + Duration::from_secs(1), 3_000, true);
+        // At t=5s the non-probe credit disappears, but the probe remains.
+        assert!(!egress.probe_budget_available(now + Duration::from_secs(1), 1_000));
+        assert!(!egress.probe_budget_available(now + Duration::from_secs(4), 1_000));
+        assert!(egress.probe_budget_available(now + Duration::from_secs(6), 3_000));
+    }
 
     #[test]
     fn admission_reaches_exact_paced_packet_bound_under_a_feasible_envelope() {

@@ -295,7 +295,7 @@ interpreted as server or endpoint wall time.
 - Receiver arrival deltas are reconstructed in feedback order, then associated
   with committed sent entries.
 - The ACK edge advances to the highest *received* sequence, after the entire retained interval and every reported identity have been validated. A gap beneath that edge contributes one-time span credit but not delivery or confirmed loss. An all-missing report does not move the edge or acknowledge bytes in flight.
-- Missing packets remain recoverable until the bounded reordering deadline or history expiry confirms loss. Duplicate reports update no bytes twice.
+- Missing packets remain recoverable until the bounded reordering deadline anchored to the first acknowledged higher received sequence in that space, or five-second history expiry, confirms loss. Repeated all-missing reports cannot start the reorder deadline. Duplicate reports update no bytes twice.
 - Feedback for a padding probe follows exactly the same path as media.
 
 ### RFC 8888 feedback
@@ -323,8 +323,8 @@ network_loop = max(0, feedback_rtt - receiver_feedback_hold)
 ```
 
 Sparse or application-limited samples cannot rapidly rewrite either estimate.
-Only a valid covering network report refreshes feedback freshness, including an
-all-missing report. Duplicate-only, unknown, wrong-path, malformed and locally
+Only a newly accepted, validated covering network report refreshes feedback
+freshness, including a new all-missing report; replaying the same report does not. Duplicate-only, unknown, wrong-path, malformed and locally
 confirmed loss do not. Staleness is evaluated before recovery evidence, so a
 recovery report returns through Learning without growing the window on that update.
 Feedback staleness can never increase the target rate.
@@ -512,7 +512,7 @@ not permission for implementation choice.
 | Maximum statuses normalized from one feedback packet | `8_192` |
 | Feedback stale threshold | `clamp(max(500 ms, 3 * srtt), 500 ms, 2 s)` |
 | Confidence half-life while stale or application-limited | `5 s` |
-| Feedback recovery requirement | one syntactically valid report covering one committed packet |
+| Feedback recovery requirement | a new validated covering report for a nonterminal current-path committed unit or an accepted late-receipt transition |
 | Maximum expiration work in one `poll` | `256` entries; return immediate wakeup if more remains |
 
 ### Transport, queue, and scheduler ledger
@@ -549,7 +549,7 @@ not permission for implementation choice.
 | Maximum packets | `32` |
 | Maximum cluster transport bytes | `48 KiB` and current send window, whichever is lower |
 | Minimum interval | `max(1 s, 4 * srtt)` |
-| Rolling probe overhead | at most `5%` of emitted transport bytes over `5 s` |
+| Rolling probe overhead | `P <= floor(N / 19) + 3,000` transport bytes in every trailing `5 s`, where `P` is emitted RTP padding probes and `N` is emitted non-probe RTP including media and RTX |
 | Success feedback deadline | `2 * srtt`, clamped to `[200 ms, 2 s]` |
 | Successful observation | at least `80%` of probe bytes reported received with no SCReAM congestion response |
 | Queue-growth abort | effective target exceeded or queue rises `10 ms` during cluster |
@@ -953,7 +953,12 @@ A probe may begin when:
 - a congestion response has stabilized and evidence is needed before recovery.
 
 The exact cluster size, interval, overhead, and success criteria are fixed in the
-profile. One cluster aborts immediately on:
+profile. The 3,000-byte allowance is PulseBeam low-traffic policy, not a SCReAM
+window floor or an unconditional 5% share. The budget uses final emitted RTP
+transport bytes; RTCP, SCTP and other protocol traffic earn no credit. It remains
+connection-wide across selected-path changes and is checked against the expiry
+of older non-probe traffic as well as current emissions. All safety gates take
+precedence over the minimum cluster packet count. One cluster aborts immediately on:
 
 - effective queue target violation or the configured queue rise;
 - configured probe loss;
@@ -1133,11 +1138,24 @@ For deterministic scenarios whose configured bottleneck and propagation model ar
 known:
 
 - PulseBeam policy never mutates the SCReAM-native queue-delay target;
-- after convergence, controlled-bottleneck p99 queue delay is no more than the
-  native SCReAM target plus `10 ms`, except during a declared path step or probe;
-- a sustained equal-demand weighted allocation is within `10%` of its expected
-  ratio after `5` smoothed RTTs;
-- probe overhead never exceeds the fixed rolling `5%` bound;
+- after five smoothed RTTs of warmup, each designated stable interval spans at
+  least `max(20 smoothed RTTs, 10 s)` and contains at least 1,000 delivered RTP
+  queue samples. Compare each shared-bottleneck sojourn to the native target at
+  that unit's enqueue; nearest-rank p99 of the differences is at most `10 ms`.
+  Exclude path-step through five RTTs and probe-start through two RTTs after
+  probe end from stable queue claims only; report losses and transients separately;
+- each continuously backlogged sender's time-integrated payload allocation is
+  within `10%` of its governed-demand-capped weighted max-min share of the actual
+  aggregate allocation budget after warmup. In a stable loss-free fixture,
+  delivered original-media payload share is within `10%` of allocation share;
+- delivered RTP transport from emission cohorts uses at least `85%` of available
+  bottleneck service in designated stable, non-demand-limited intervals, including
+  the `2 Mbit/s`, `50 ms` RTT, `4 Mbit/s` demand single-flow baseline;
+- two independent, equally backlogged PulseBeam connections on one `4 Mbit/s`,
+  `50 ms` RTT bottleneck each receive `40%`–`60%` of combined delivered RTP
+  transport and together use at least `85%` of bottleneck service; heterogeneous
+  modeled competitors do not inherit this equal-share threshold;
+- probe emissions obey `P <= floor(N / 19) + 3,000` in every trailing five-second window, with raw probe ratio and allowance usage reported separately;
 - no target/window growth occurs while feedback is stale;
 - no queue/history/resource count exceeds its hard bound;
 - tightening latency never improves utilization by retaining work the looser
