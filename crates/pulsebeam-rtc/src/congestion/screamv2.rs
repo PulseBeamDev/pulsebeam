@@ -47,6 +47,7 @@ pub(crate) enum EcnMode {
 pub(crate) struct ControllerInput<'a> {
     pub(crate) feedback: &'a [FeedbackSample],
     pub(crate) feedback_hold: Duration,
+    pub(crate) growth_eligible: bool,
     pub(crate) bytes_in_flight: u64,
     /// The application supplied TARGET_BITRATE_MAX from draft section 4.4.
     pub(crate) target_bitrate_max: u64,
@@ -177,6 +178,9 @@ pub(crate) struct ScreamV2 {
     last_reaction_to_congestion: Duration,
     bytes_newly_acked: u64,
     bytes_newly_acked_ce: u64,
+    pending_loss: bool,
+    pending_ce: bool,
+    pending_virtual_ce: bool,
     delivered_rate: u64,
     loss_rate: u64,
     loss_event_rate: u64,
@@ -225,6 +229,9 @@ impl ScreamV2 {
             last_reaction_to_congestion: Duration::ZERO,
             bytes_newly_acked: 0,
             bytes_newly_acked_ce: 0,
+            pending_loss: false,
+            pending_ce: false,
+            pending_virtual_ce: false,
             delivered_rate: 0,
             loss_rate: 0,
             loss_event_rate: 0,
@@ -258,9 +265,16 @@ impl ScreamV2 {
         if has_received {
             self.update_qdelay_filter(now);
         }
+        let reacted = self.reduce_ref_wnd(now, input);
         if has_feedback {
-            self.reduce_ref_wnd(now, input);
-            self.increase_ref_wnd(now, input.target_bitrate_max);
+            if input.growth_eligible
+                && !reacted
+                && !self.pending_loss
+                && !self.pending_ce
+                && !self.pending_virtual_ce
+            {
+                self.increase_ref_wnd(now, input.target_bitrate_max);
+            }
             if has_received {
                 self.adjust_qdelay_target();
             }
@@ -425,19 +439,25 @@ impl ScreamV2 {
         self.last_qdelay_update = now;
     }
 
-    fn reduce_ref_wnd(&mut self, now: Duration, input: ControllerInput<'_>) {
-        let loss_detected = input.feedback.iter().any(|sample| sample.lost);
-        let data_units_marked = input.ecn_mode != EcnMode::Disabled
-            && input
-                .feedback
-                .iter()
-                .any(|sample| sample.received && sample.ecn == Some(EcnMark::Ce));
+    fn reduce_ref_wnd(&mut self, now: Duration, input: ControllerInput<'_>) -> bool {
+        let loss_detected = self.pending_loss || input.feedback.iter().any(|sample| sample.lost);
+        let data_units_marked = self.pending_ce
+            || (input.ecn_mode != EcnMode::Disabled
+                && input
+                    .feedback
+                    .iter()
+                    .any(|sample| sample.received && sample.ecn == Some(EcnMark::Ce)));
+        self.pending_loss = loss_detected;
+        self.pending_ce = data_units_marked;
+        if !input.feedback.is_empty() && self.qdelay_avg > self.qdelay_target / 2 {
+            self.pending_virtual_ce = true;
+        }
         if loss_detected || data_units_marked {
             self.last_congestion_detected = now;
         }
         let reaction_interval = PROFILE.virtual_rtt.min(self.s_rtt);
         if now.saturating_sub(self.last_reaction_to_congestion) < reaction_interval {
-            return;
+            return false;
         }
 
         let virtual_alpha = if self.qdelay_avg > self.qdelay_target / 2 {
@@ -458,9 +478,11 @@ impl ScreamV2 {
             && (self.loss_rate > PROFILE.loss_rate_threshold
                 || self.qdelay_avg > self.qdelay_target / 4);
         let is_ce = data_units_marked;
-        let is_virtual_ce = !is_loss && !is_ce && virtual_alpha > 0;
+        let is_virtual_ce = !is_loss && !is_ce && self.pending_virtual_ce && virtual_alpha > 0;
         if !(is_loss || is_ce || is_virtual_ce) {
-            return;
+            self.pending_loss = false;
+            self.pending_virtual_ce = false;
+            return false;
         }
 
         let scl = self.inflection_scale();
@@ -517,7 +539,8 @@ impl ScreamV2 {
                     self.reason = ControllerReason::L4s;
                 }
                 EcnMode::Disabled => {
-                    return;
+                    self.pending_ce = false;
+                    return false;
                 }
             }
         } else {
@@ -535,6 +558,14 @@ impl ScreamV2 {
         self.ref_wnd = self.ref_wnd.max(PROFILE.min_reference_window);
         self.last_congestion_detected = now;
         self.last_reaction_to_congestion = now;
+        if is_loss {
+            self.pending_loss = false;
+        } else if is_ce {
+            self.pending_ce = false;
+        } else {
+            self.pending_virtual_ce = false;
+        }
+        true
     }
 
     fn increase_ref_wnd(&mut self, now: Duration, target_bitrate_max: u64) {
@@ -827,6 +858,7 @@ mod tests {
         ControllerInput {
             feedback,
             feedback_hold: Duration::ZERO,
+            growth_eligible: true,
             bytes_in_flight: 20_000,
             target_bitrate_max: max,
             ecn_mode: EcnMode::Disabled,
@@ -935,6 +967,50 @@ mod tests {
         let recovered = [sample(50, true, false, false, true)];
         cc.consume_feedback(Duration::from_millis(50), input(&recovered, 4_000_000));
         assert_eq!(cc.debug_accumulated_acks(), (1_000, 1_000));
+    }
+
+    #[test]
+    fn blocked_loss_reacts_on_timer_without_consuming_growth_credit() {
+        let mut cc = ScreamV2::new(4_000_000, None);
+        cc.ref_wnd = 20_000;
+        cc.loss_rate = ONE / 50;
+        cc.last_reaction_to_congestion = Duration::from_millis(20);
+        let loss = [sample(25, false, true, true, false)];
+        cc.update(Duration::from_millis(25), input(&loss, 4_000_000));
+        assert_eq!(cc.ref_wnd, 20_000);
+        assert!(cc.pending_loss);
+        cc.update(Duration::from_millis(50), input(&[], 4_000_000));
+        assert!(cc.ref_wnd < 20_000);
+        assert!(!cc.pending_loss);
+        assert_eq!(cc.debug_accumulated_acks().0, 1_000);
+    }
+
+    #[test]
+    fn resolved_virtual_signal_does_not_permanently_block_growth() {
+        let mut cc = ScreamV2::new(4_000_000, None);
+        cc.pending_virtual_ce = true;
+        cc.qdelay_avg = Duration::ZERO;
+        cc.update(Duration::from_millis(100), input(&[], 4_000_000));
+        assert!(!cc.pending_virtual_ce);
+        let received = [sample(200, true, true, false, false)];
+        cc.update(Duration::from_millis(200), input(&received, 4_000_000));
+        assert!(!cc.pending_virtual_ce);
+    }
+
+    #[test]
+    fn nonfresh_feedback_does_not_consume_accumulated_growth() {
+        let mut cc = ScreamV2::new(4_000_000, None);
+        let feedback = [sample(100, true, true, false, false)];
+        cc.update(
+            Duration::from_millis(100),
+            ControllerInput {
+                growth_eligible: false,
+                ..input(&feedback, 4_000_000)
+            },
+        );
+        assert_eq!(cc.debug_accumulated_acks().0, 1_000);
+        cc.update(Duration::from_millis(200), input(&[], 4_000_000));
+        assert_eq!(cc.debug_accumulated_acks().0, 1_000);
     }
 
     #[test]

@@ -127,9 +127,9 @@ fn missing_packet_becomes_loss_only_after_reordering_window() {
     ));
     history.clear_controller_inputs();
     history.expire(now + Duration::from_millis(49), 256);
-    assert!(!history.inputs.feedback.iter().any(|sample| sample.lost));
+    assert!(history.inputs.synthetic.is_empty());
     history.expire(now + Duration::from_millis(50), 256);
-    assert!(history.inputs.feedback.iter().any(|sample| sample.lost));
+    assert!(history.inputs.synthetic.iter().any(|sample| sample.lost));
 }
 
 #[test]
@@ -285,13 +285,237 @@ fn path_change_discards_pending_feedback_and_rebases_ssrc_history() {
     history.path_changed(old_epoch, true);
     history.commit(rfc_context(now, old_epoch, 10)).unwrap();
     history.emit(SentPacketId(0), false, false, true, None, None);
-    assert!(!history.inputs.feedback.is_empty());
+    assert!(!history.inputs.synthetic.is_empty());
     history.path_changed(new_epoch, true);
-    assert!(history.inputs.feedback.is_empty());
+    assert!(history.inputs.synthetic.is_empty());
     assert!(history.inputs.timing.is_none());
     assert!(history.ssrcs[0].sent_ids.is_empty());
     history.commit(rfc_context(now, new_epoch, 500)).unwrap();
     assert_eq!(history.ssrcs[0].first_sequence, 500);
+}
+
+#[test]
+fn all_missing_rfc8888_report_does_not_advance_either_ssrc() {
+    let now = Instant::now();
+    let epoch = PathEpoch::from_value(13);
+    let mut history = SentHistory::new(PacketFeedbackKind::Rfc8888);
+    history.path_changed(epoch, true);
+    for ssrc in [7, 8] {
+        for sequence in 1..=2 {
+            let mut packet = rfc_context(now, epoch, sequence);
+            packet.rtp.as_mut().unwrap().ssrc = ssrc;
+            history.commit(packet).unwrap();
+        }
+    }
+    history.process_feedback(FeedbackBatch {
+        received_at: at(now + Duration::from_millis(10)),
+        path_epoch: epoch,
+        sender_ssrc: 9,
+        report: FeedbackReport::Rfc8888 {
+            reports: vec![crate::rtcp::Rfc8888Report {
+                ssrc: 7,
+                begin_sequence: 1,
+                report_count: 2,
+                statuses: vec![crate::rtcp::Rfc8888Status::NotReceived; 2].into(),
+            }]
+            .into(),
+            report_timestamp: 1,
+        },
+    });
+    assert_eq!(history.bytes_in_flight, 4_800);
+    assert!(history.inputs.feedback.is_empty());
+    assert_eq!(history.ssrcs[0].highest_acked_sequence, None);
+    assert_eq!(history.ssrcs[1].highest_acked_sequence, None);
+    assert!(history.inputs.fresh_network_feedback);
+}
+
+#[test]
+fn all_missing_twcc_report_does_not_advance_credit() {
+    let now = Instant::now();
+    let epoch = PathEpoch::from_value(12);
+    let mut history = SentHistory::new(PacketFeedbackKind::TransportWide);
+    history.path_changed(epoch, true);
+    for sequence in 1..=3 {
+        history.commit(context(now, epoch, sequence)).unwrap();
+    }
+    history.process_feedback(batch(
+        now + Duration::from_millis(10),
+        epoch,
+        vec![TwccStatus::NotReceived; 3],
+    ));
+    assert_eq!(history.bytes_in_flight, 3_600);
+    assert_eq!(history.highest_twcc_acked, None);
+    assert!(history.inputs.feedback.is_empty());
+    assert!(history.inputs.fresh_network_feedback);
+}
+
+#[test]
+fn all_missing_then_received_advances_credit_once_without_double_delivery() {
+    let now = Instant::now();
+    let epoch = PathEpoch::from_value(14);
+    let mut history = SentHistory::new(PacketFeedbackKind::TransportWide);
+    history.path_changed(epoch, true);
+    for sequence in 1..=3 {
+        history.commit(context(now, epoch, sequence)).unwrap();
+    }
+    history.process_feedback(batch(
+        now + Duration::from_millis(10),
+        epoch,
+        vec![TwccStatus::NotReceived; 3],
+    ));
+    assert_eq!(history.bytes_in_flight, 3_600);
+    assert_eq!(history.missing.len(), 3);
+    history.clear_controller_inputs();
+    history.process_feedback(batch(
+        now + Duration::from_millis(20),
+        epoch,
+        vec![
+            TwccStatus::NotReceived,
+            TwccStatus::Received { delta_250us: 1 },
+            TwccStatus::NotReceived,
+        ],
+    ));
+    assert_eq!(history.highest_twcc_acked, Some(2));
+    assert_eq!(history.bytes_in_flight, 1_200);
+    assert_eq!(
+        history
+            .inputs
+            .feedback
+            .iter()
+            .filter(|item| item.newly_acked)
+            .count(),
+        2
+    );
+    assert_eq!(
+        history
+            .inputs
+            .feedback
+            .iter()
+            .filter(|item| item.received)
+            .count(),
+        1
+    );
+    history.clear_controller_inputs();
+    history.process_feedback(batch(
+        now + Duration::from_millis(25),
+        epoch,
+        vec![
+            TwccStatus::NotReceived,
+            TwccStatus::Received { delta_250us: 1 },
+        ],
+    ));
+    assert_eq!(history.bytes_in_flight, 1_200);
+    assert!(history.inputs.feedback.is_empty());
+}
+
+#[test]
+fn synthetic_loss_never_evicts_network_evidence() {
+    let now = Instant::now();
+    let epoch = PathEpoch::from_value(16);
+    let mut history = SentHistory::new(PacketFeedbackKind::TransportWide);
+    history.path_changed(epoch, true);
+    history.commit(context(now, epoch, 1)).unwrap();
+    history.emit(SentPacketId(0), true, true, false, None, None);
+    for _ in 0..MAX_EXPIRATIONS_PER_POLL + 1 {
+        history.emit(SentPacketId(0), false, false, true, None, None);
+    }
+    assert_eq!(history.inputs.feedback.len(), 1);
+    assert!(history.inputs.feedback[0].received);
+    assert_eq!(history.inputs.synthetic.len(), MAX_EXPIRATIONS_PER_POLL);
+    assert!(!history.inputs.fresh_network_feedback);
+}
+
+#[test]
+fn repeated_unavailable_path_preserves_pending_reset_evidence() {
+    let epoch = PathEpoch::from_value(15);
+    let mut history = SentHistory::new(PacketFeedbackKind::TransportWide);
+    history.path_changed(epoch, false);
+    history.path_changed(epoch, false);
+    assert_eq!(
+        history.inputs.path_change,
+        Some(PathChange {
+            epoch,
+            available: false
+        })
+    );
+}
+
+#[test]
+fn unknown_twcc_gap_does_not_poison_report_cursors_or_accounting() {
+    let now = Instant::now();
+    let epoch = PathEpoch::from_value(11);
+    let mut history = SentHistory::new(PacketFeedbackKind::TransportWide);
+    history.path_changed(epoch, true);
+    history.commit(context(now, epoch, 1)).unwrap();
+    history.commit(context(now, epoch, 3)).unwrap();
+    let first = batch(
+        now + Duration::from_millis(10),
+        epoch,
+        vec![TwccStatus::Received { delta_250us: 1 }],
+    );
+    history.process_feedback(first);
+    history.clear_controller_inputs();
+    let invalid = FeedbackBatch {
+        received_at: at(now + Duration::from_millis(20)),
+        path_epoch: epoch,
+        sender_ssrc: 9,
+        report: FeedbackReport::Twcc {
+            media_ssrc: 7,
+            base_sequence: 2,
+            reference_time: 400,
+            feedback_count: 200,
+            statuses: vec![
+                TwccStatus::NotReceived,
+                TwccStatus::Received { delta_250us: 1 },
+            ]
+            .into(),
+        },
+    };
+    let bytes = history.bytes_in_flight;
+    let reference = history.twcc_reference;
+    let count = history.twcc_feedback_count;
+    history.process_feedback(invalid);
+    assert_eq!(history.bytes_in_flight, bytes);
+    assert_eq!(history.highest_twcc_acked, Some(1));
+    assert_eq!(history.twcc_reference, reference);
+    assert_eq!(history.twcc_feedback_count, count);
+    assert!(!history.inputs.fresh_network_feedback);
+    assert!(history.inputs.feedback.is_empty());
+    assert!(history.inputs.timing.is_none());
+}
+
+#[test]
+fn invalid_nonadvancing_report_does_not_mutate_feedback_baseline() {
+    let now = Instant::now();
+    let epoch = PathEpoch::from_value(11);
+    let mut history = SentHistory::new(PacketFeedbackKind::TransportWide);
+    history.path_changed(epoch, true);
+    history.commit(context(now, epoch, 1)).unwrap();
+    history.commit(context(now, epoch, 3)).unwrap();
+    history.process_feedback(batch(
+        now + Duration::from_millis(10),
+        epoch,
+        vec![TwccStatus::Received { delta_250us: 1 }],
+    ));
+    history.clear_controller_inputs();
+    let reference = history.twcc_reference;
+    let count = history.twcc_feedback_count;
+    history.process_feedback(FeedbackBatch {
+        received_at: at(now + Duration::from_millis(20)),
+        path_epoch: epoch,
+        sender_ssrc: 9,
+        report: FeedbackReport::Twcc {
+            media_ssrc: 7,
+            base_sequence: 2,
+            reference_time: 400,
+            feedback_count: 200,
+            statuses: vec![TwccStatus::NotReceived].into(),
+        },
+    });
+    assert_eq!(history.twcc_reference, reference);
+    assert_eq!(history.twcc_feedback_count, count);
+    assert!(history.inputs.timing.is_none());
+    assert!(history.inputs.feedback.is_empty());
 }
 
 #[test]

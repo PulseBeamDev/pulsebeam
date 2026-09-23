@@ -90,7 +90,7 @@ being hidden as tuning.
 | SCTP | Keep SCTP congestion control; reserve/coordinate its service outside SCReAM | Count SCTP as SCReAM BIF; feed SACK into a new coupled controller | TWCC/RFC 8888 does not acknowledge SCTP. V1 avoids inventing a second research-grade coupled controller. |
 | Probing | RTP padding on negotiated media/RTX SSRC | Synthetic SSRC zero; no active probing | Matches normal RTP sender identity and enables pre-media/application-limited capacity observations without a special source. |
 | Application-limited behavior | Keep the draft-defined bytes-in-flight growth bound authoritative; decay PulseBeam confidence and use demand-aware bounded probes | Add a PulseBeam-specific ref_wnd freeze; collapse estimate to media rate | Keeps product policy outside the SCReAM core while low offered load naturally limits growth through the draft's bytes-in-flight state. |
-| ECN/L4S | Optional only with validated RFC 8888 ECN | Require L4S/ECN; force-enable from configuration | Baseline must work on ordinary Internet paths; inconsistent/bleached ECN must not compromise control. |
+| ECN/L4S | Disabled in production; core-only equation tests | Require L4S/ECN; force-enable from configuration | Baseline must work on ordinary Internet paths; marking deployment needs separate validation. |
 | Frame scheduling | Prefer whole unstarted-frame drops; started frame is not guaranteed completion | Packet-only FIFO; unbounded commitment once first packet sends | Minimizes decoder damage while preserving bounded queues and congestion safety. |
 | Constants | Freeze `CongestionProfileV1`; changes require profile/doc evidence | Leave tuning qualitative or implementation-defined | Prevents implementation agents from silently choosing controller semantics and makes deterministic comparison meaningful. |
 
@@ -272,7 +272,10 @@ Both modes normalize to one private record:
 ```rust
 struct PacketFeedback {
     sent_id: SentPacketId,
+    transport_bytes: u32,
     received: bool,
+    newly_acked: bool,
+    lost: bool,
     receiver_arrival: Option<ReceiverTime>,
     ecn: Option<EcnMark>,
 }
@@ -291,7 +294,8 @@ interpreted as server or endpoint wall time.
   accepted generation/reordering window is unknown and counted.
 - Receiver arrival deltas are reconstructed in feedback order, then associated
   with committed sent entries.
-- Duplicate reports update no bytes twice.
+- The ACK edge advances to the highest *received* sequence, after the entire retained interval and every reported identity have been validated. A gap beneath that edge contributes one-time span credit but not delivery or confirmed loss. An all-missing report does not move the edge or acknowledge bytes in flight.
+- Missing packets remain recoverable until the bounded reordering deadline or history expiry confirms loss. Duplicate reports update no bytes twice.
 - Feedback for a padding probe follows exactly the same path as media.
 
 ### RFC 8888 feedback
@@ -305,8 +309,8 @@ separate unwrap/acknowledgment cursor per SSRC. It MUST NOT invent one aggregate
 - Multiple report blocks in one RTCP feedback packet are normalized independently.
 - A report for an unknown SSRC or sequence is ignored and counted without
   allocating state.
-- ECN is usable only when this selected feedback format reports it consistently
-  and path validation succeeds.
+- Received statuses with unavailable or over-range arrival offsets are still received, but provide no arrival sample.
+- ECN marks remain normalized for validation; production RTP control supplies disabled ECN in both feedback modes. Classic and L4S behavior is core-only test coverage, not live path support.
 
 ### Feedback hold and staleness
 
@@ -319,8 +323,11 @@ network_loop = max(0, feedback_rtt - receiver_feedback_hold)
 ```
 
 Sparse or application-limited samples cannot rapidly rewrite either estimate.
-Feedback staleness is evaluated from monotonic send/feedback time and can never
-increase the target rate.
+Only a valid covering network report refreshes feedback freshness, including an
+all-missing report. Duplicate-only, unknown, wrong-path, malformed and locally
+confirmed loss do not. Staleness is evaluated before recovery evidence, so a
+recovery report returns through Learning without growing the window on that update.
+Feedback staleness can never increase the target rate.
 
 ## `Transmit` is the sent-data-unit commit
 
@@ -415,8 +422,10 @@ is not renamed or treated as an absolute public congestion window. The draft's
 bounded slack between reference window, send window, pacing, and bytes-in-flight
 is implemented exactly. No PulseBeam layer can bypass those rules.
 
-The reference window grows only from delivered evidence and falls on the draft's
-queue, congestion-loss, or valid ECN signals. Random isolated wireless loss is
+The reference window grows only on eligible fresh feedback with accumulated
+highest-received ACK-edge credit, including one-time credit for covered gaps,
+and falls on the draft's queue or confirmed congestion-loss signals. Production
+ECN remains disabled. Random isolated wireless loss is
 not silently reclassified as sustained congestion, but repeated loss or an
 overflowing queue cannot be filtered away.
 
@@ -463,15 +472,11 @@ version one, but equals the SCReAM-native target. It is not a second policy inpu
 
 ### ECN/L4S
 
-Baseline version-one behavior uses delay and loss and MUST be excellent without
-ECN. ECN is disabled unless:
-
-1. RFC 8888 is the selected feedback mode and reports ECN marks;
-2. the negotiated sender/path supports the required marking semantics;
-3. validation traffic proves marks are preserved and internally consistent.
-
-Bleaching, impossible transitions, or inconsistent counts disable ECN for the
-path without disabling delay/loss control. No public switch can force ECN on.
+Production version-one behavior uses delay and loss. ECN is disabled for both
+negotiated feedback modes, even when RFC 8888 reports marks. The private core
+retains draft Classic and L4S equations for independent testing; deploying live
+ECN requires a separate path-validation and marking change. No public switch
+can force ECN on.
 
 ## `CongestionProfileV1`
 
@@ -497,7 +502,7 @@ not permission for implementation choice.
 | Reference-window update | pinned draft |
 | Send-window/reference-window slack | pinned draft |
 | Queue/loss backoff | pinned draft |
-| ECN response | pinned draft, gated by validated RFC 8888 ECN |
+| ECN response | disabled in production; pinned draft equations tested in the private core |
 | Clock-drift and path-baseline filters | pinned draft |
 | Target-rate derivation | pinned draft |
 | Normal pacing derivation | pinned draft, then bounded by the transport limits below |
@@ -1110,7 +1115,7 @@ The corpus includes:
   recovery;
 - uniform random loss, burst loss, reordering, duplication, and wraparound;
 - tail-drop, AQM, rate policers, and competing CUBIC/BBR-like flows;
-- optional RFC 8888 ECN/L4S paths, bleaching, and fallback;
+- disabled production CE in both feedback modes; private core-only Classic and L4S equations;
 - independent playout policies changing while queues, RTX, probes, and other
   senders are active;
 - equal/skewed/changing priorities and desired rates;

@@ -77,7 +77,9 @@ pub(crate) struct PathChange {
 #[derive(Debug, Default)]
 pub(crate) struct ControllerInputs {
     pub(crate) feedback: Vec<PacketFeedback>,
+    pub(crate) synthetic: Vec<PacketFeedback>,
     pub(crate) timing: Option<FeedbackTiming>,
+    pub(crate) fresh_network_feedback: bool,
     pub(crate) path_change: Option<PathChange>,
     pub(crate) application_limited: bool,
     pub(crate) bytes_in_flight: u64,
@@ -159,6 +161,7 @@ pub(crate) struct SentHistory {
     twcc_reference: Option<i64>,
     twcc_feedback_count: Option<i64>,
     active_epoch: Option<PathEpoch>,
+    last_path: Option<(PathEpoch, bool)>,
     inputs: ControllerInputs,
     counters: HistoryCounters,
     bytes_in_flight: u64,
@@ -185,8 +188,10 @@ impl SentHistory {
             twcc_reference: None,
             twcc_feedback_count: None,
             active_epoch: None,
+            last_path: None,
             inputs: ControllerInputs {
                 feedback: Vec::with_capacity(MAX_FEEDBACK_STATUSES),
+                synthetic: Vec::with_capacity(MAX_EXPIRATIONS_PER_POLL),
                 ..ControllerInputs::default()
             },
             counters: HistoryCounters::default(),
@@ -298,9 +303,12 @@ impl SentHistory {
     }
 
     pub(crate) fn path_changed(&mut self, epoch: PathEpoch, available: bool) {
-        if self.active_epoch == Some(epoch) && self.active_epoch.is_some() == available {
+        if self.last_path == Some((epoch, available))
+            || (!available && self.last_path.is_some_and(|(_, previous)| !previous))
+        {
             return;
         }
+        self.last_path = Some((epoch, available));
         self.active_epoch = available.then_some(epoch);
         for entry in self.entries.iter_mut().flatten() {
             if !entry.acknowledgment.is_terminal() && self.active_epoch != Some(entry.path_epoch) {
@@ -316,7 +324,9 @@ impl SentHistory {
         // Controller evidence is path scoped. Never let feedback emitted before a
         // selected-path replacement reach the controller on the new epoch.
         self.inputs.feedback.clear();
+        self.inputs.synthetic.clear();
         self.inputs.timing = None;
+        self.inputs.fresh_network_feedback = false;
         self.inputs.path_change = Some(PathChange { epoch, available });
         self.twcc_reference = None;
         self.twcc_feedback_count = None;
@@ -354,6 +364,11 @@ impl SentHistory {
             if self.twcc_index[slot].is_some_and(|index| index.sent_id == entry.id) {
                 self.twcc_index[slot] = None;
             }
+            if self.oldest_twcc == Some(sequence) {
+                let newest = self.newest_twcc.unwrap_or(sequence);
+                self.oldest_twcc = ((sequence.saturating_add(1))..=newest)
+                    .find(|&candidate| self.twcc_sent_id(candidate).is_some());
+            }
         }
         if let Some(state) = self.ssrcs.iter_mut().find(|state| state.ssrc == entry.ssrc)
             && state.sent_ids.front() == Some(&entry.id)
@@ -389,7 +404,9 @@ impl SentHistory {
 
     pub(crate) fn clear_controller_inputs(&mut self) {
         self.inputs.feedback.clear();
+        self.inputs.synthetic.clear();
         self.inputs.timing = None;
+        self.inputs.fresh_network_feedback = false;
         self.inputs.path_change = None;
     }
 

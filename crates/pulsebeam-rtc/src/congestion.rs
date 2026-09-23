@@ -217,11 +217,12 @@ impl ScreamController {
         );
         self.feedback_hold = input.feedback_hold;
         self.update_application_limited(now, &input);
+        self.update_staleness(now);
+        let recovering = self.feedback_stale && input.fresh_network_feedback;
         if input.fresh_network_feedback {
             self.last_feedback = Some(now);
             self.feedback_stale = false;
         }
-        self.update_staleness(now);
         self.update_confidence(now, input.fresh_network_feedback);
 
         // SCReAMv2 sees only draft-defined algorithm inputs. PulseBeam's playout,
@@ -231,6 +232,9 @@ impl ScreamController {
             screamv2::ControllerInput {
                 feedback: input.feedback,
                 feedback_hold: input.feedback_hold,
+                growth_eligible: input.fresh_network_feedback
+                    && !self.feedback_stale
+                    && !recovering,
                 bytes_in_flight: input.bytes_in_flight,
                 target_bitrate_max: input.desired_media_rate.min(TARGET_BITRATE_MAX),
                 ecn_mode: input.ecn.mode(),
@@ -450,6 +454,59 @@ mod tests {
         );
         assert!(output.feedback_stale);
         assert_eq!(cc.last_feedback, None);
+    }
+
+    #[test]
+    fn stale_recovery_requires_a_second_covering_report_for_growth() {
+        let mut cc = ScreamController::new(4_000_000, None);
+        let base = ControllerInput {
+            path_epoch: Some(1),
+            path_available: true,
+            feedback: &[],
+            feedback_hold: Duration::ZERO,
+            fresh_network_feedback: false,
+            bytes_in_flight: 20_000,
+            paced_queue_bytes: 0,
+            offered_media_rate: 4_000_000,
+            admitted_media_rate: 4_000_000,
+            desired_media_rate: 4_000_000,
+            window_or_pacer_blocked: false,
+            ecn: EcnValidation::default(),
+        };
+        cc.update(Duration::ZERO, base);
+        cc.note_send(Duration::ZERO);
+        cc.update(Duration::from_millis(500), base);
+        assert!(cc.feedback_stale);
+        let sample = [FeedbackSample {
+            sent_at: Duration::from_millis(450),
+            received_at: Duration::from_millis(550),
+            transport_bytes: 1_000,
+            received: true,
+            newly_acked: true,
+            lost: false,
+            receiver_arrival_micros: None,
+            ecn: None,
+        }];
+        let before = cc.core.snapshot(4_000_000).reference_window;
+        let first = cc.update(
+            Duration::from_millis(550),
+            ControllerInput {
+                feedback: &sample,
+                fresh_network_feedback: true,
+                ..base
+            },
+        );
+        assert!(!first.feedback_stale);
+        assert_eq!(first.reference_window, before);
+        let second = cc.update(
+            Duration::from_millis(650),
+            ControllerInput {
+                feedback: &sample,
+                fresh_network_feedback: true,
+                ..base
+            },
+        );
+        assert!(second.reference_window >= first.reference_window);
     }
 
     #[test]

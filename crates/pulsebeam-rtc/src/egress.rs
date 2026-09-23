@@ -302,6 +302,8 @@ impl MediaEgress {
         if let Some((epoch, available)) = path_change {
             self.active_path = available.then_some(epoch);
             self.path_available = available;
+            self.pacer.reset();
+            self.probe_remaining = 0;
         }
         let desired = self
             .senders
@@ -1105,6 +1107,9 @@ impl MediaEgress {
     }
 
     fn prepare_padding(&mut self, at: TimePoint, transport: &mut Transport) -> PrepareResult {
+        if !self.path_available {
+            return PrepareResult::Blocked;
+        }
         let Some(envelope) = self.envelope else {
             return PrepareResult::Blocked;
         };

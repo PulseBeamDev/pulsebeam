@@ -74,6 +74,7 @@ enum PendingPacket {
         source: SocketAddr,
         destination: SocketAddr,
         payload: Vec<u8>,
+        rtp_bytes: u64,
     },
 }
 
@@ -101,6 +102,11 @@ struct DeterministicNetwork {
     reordered: u64,
     pending: VecDeque<PendingPacket>,
     trace: Vec<&'static str>,
+    bottleneck_bps: Option<u64>,
+    next_departure: Option<Instant>,
+    queue_sojourn: Vec<Duration>,
+    delivered_bytes: u64,
+    last_committed_rtp_bytes: u64,
 }
 
 impl DeterministicNetwork {
@@ -327,6 +333,20 @@ impl PeerFixture {
         self.network.configure(seed, policy);
     }
 
+    pub fn configure_bottleneck(&mut self, bits_per_second: u64) {
+        assert!(bits_per_second > 0);
+        self.network.bottleneck_bps = Some(bits_per_second);
+        self.network.next_departure = None;
+        self.network.queue_sojourn.clear();
+        self.network.delivered_bytes = 0;
+        self.network.last_committed_rtp_bytes =
+            self.connection.stats().connection.transmitted_rtp_bytes;
+    }
+
+    pub fn bottleneck_samples(&self) -> (&[Duration], u64) {
+        (&self.network.queue_sojourn, self.network.delivered_bytes)
+    }
+
     pub fn network_counters(&self) -> (u64, u64, u64, u64) {
         (
             self.network.packets,
@@ -476,8 +496,13 @@ impl PeerFixture {
                     source,
                     destination,
                     payload,
+                    rtp_bytes,
                     ..
                 } => {
+                    if self.network.bottleneck_bps.is_some() {
+                        self.network.delivered_bytes =
+                            self.network.delivered_bytes.saturating_add(rtp_bytes);
+                    }
                     let receive = Receive::new(protocol, source, destination, &payload)
                         .expect("peer classifies PulseBeam datagram");
                     self.peer
@@ -572,12 +597,37 @@ impl PeerFixture {
                             )
                         }
                     };
+                    let due = if let Some(rate) = self.network.bottleneck_bps {
+                        let departure = self
+                            .network
+                            .next_departure
+                            .unwrap_or(self.now)
+                            .max(self.now);
+                        let nanos = (payload.len() as u128)
+                            .saturating_mul(8_000_000_000)
+                            .div_ceil(u128::from(rate));
+                        let service =
+                            Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX));
+                        let end = departure.checked_add(service).expect("bottleneck clock");
+                        self.network.next_departure = Some(end);
+                        self.network
+                            .queue_sojourn
+                            .push(end.saturating_duration_since(self.now));
+                        end + self.network.policy.delay
+                    } else {
+                        self.now + self.network.policy.delay
+                    };
+                    let committed_rtp = self.connection.stats().connection.transmitted_rtp_bytes;
+                    let rtp_bytes =
+                        committed_rtp.saturating_sub(self.network.last_committed_rtp_bytes);
+                    self.network.last_committed_rtp_bytes = committed_rtp;
                     self.network.enqueue(PendingPacket::Peer {
-                        due: self.now + self.network.policy.delay,
+                        due,
                         protocol,
                         source,
                         destination,
                         payload: payload.to_vec(),
+                        rtp_bytes,
                     });
                     return None;
                 }

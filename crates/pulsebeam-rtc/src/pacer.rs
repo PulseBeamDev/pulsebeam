@@ -7,6 +7,10 @@ pub(crate) struct Pacer {
 }
 
 impl Pacer {
+    pub(crate) fn reset(&mut self) {
+        self.next_send = None;
+    }
+
     pub(crate) fn eligible(&self, now: Instant) -> bool {
         self.next_send.is_none_or(|deadline| now >= deadline)
     }
@@ -47,5 +51,8 @@ mod tests {
         );
         assert!(!pacer.eligible(now + Duration::from_millis(99)));
         assert!(pacer.eligible(now + Duration::from_millis(100)));
+        pacer.reset();
+        assert!(pacer.eligible(now));
+        assert_eq!(pacer.next_deadline(), None);
     }
 }

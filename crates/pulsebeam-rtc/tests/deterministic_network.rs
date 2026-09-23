@@ -138,6 +138,107 @@ const fn scenario(name: &'static str, seed: u64, seconds: u64, packets: u64) -> 
 }
 
 #[test]
+fn production_connection_bottleneck_emits_measured_transport_bytes() {
+    const SEED: u64 = 0x1122;
+    const RATE_BPS: u64 = 100_000;
+    const PACKETS: u64 = 1_500;
+    let mut fixture = PeerFixture::connected();
+    fixture.configure_network(
+        SEED,
+        NetworkPolicy {
+            delay: Duration::from_millis(25),
+            ..NetworkPolicy::default()
+        },
+    );
+    fixture.configure_bottleneck(RATE_BPS);
+    let started = fixture.at().monotonic;
+    let mut source = PeerFixture::connected();
+    let mut emitted_windows =
+        std::collections::VecDeque::from([(fixture.at().monotonic, 0_u64, 0_u64)]);
+    let mut max_probe_percent = 0_u64;
+    let mut measured_windows = 0_u64;
+    for id in 1..=PACKETS {
+        source.drive_for(
+            fixture
+                .at()
+                .monotonic
+                .saturating_duration_since(source.at().monotonic)
+                + Duration::from_millis(40),
+        );
+        let media = forwarded(source.send_source(&[0x5a; PAYLOAD_BYTES]), id);
+        match fixture.connection.command(
+            fixture.at(),
+            Command::SendMedia {
+                sender: fixture.sender,
+                media,
+            },
+        ) {
+            Ok(()) | Err(CommandError::WouldBlock) => {}
+            Err(error) => panic!("production admission at {id}: {error:?}"),
+        }
+        fixture.drive_for(Duration::from_millis(40));
+        let totals = fixture.connection.stats().connection;
+        emitted_windows.push_back((
+            fixture.at().monotonic,
+            totals.transmitted_rtp_bytes,
+            totals.transmitted_padding_bytes,
+        ));
+        while emitted_windows.get(1).is_some_and(|(at, _, _)| {
+            fixture.at().monotonic.saturating_duration_since(*at) >= Duration::from_secs(5)
+        }) {
+            emitted_windows.pop_front();
+        }
+        if let Some((start, rtp, padding)) = emitted_windows.front()
+            && fixture.at().monotonic.saturating_duration_since(*start) >= Duration::from_secs(5)
+        {
+            measured_windows += 1;
+            let emitted = totals.transmitted_rtp_bytes.saturating_sub(*rtp);
+            let probes = totals.transmitted_padding_bytes.saturating_sub(*padding);
+            if emitted > 0 {
+                max_probe_percent = max_probe_percent.max(probes.saturating_mul(100) / emitted);
+                assert!(
+                    probes.saturating_mul(20) <= emitted,
+                    "rolling five-second emitted-byte probe overhead"
+                );
+            } else {
+                assert_eq!(probes, 0, "zero-byte window cannot contain probes");
+            }
+        }
+    }
+    fixture.drive_for(Duration::from_secs(2));
+    let (sojourn, delivered) = fixture.bottleneck_samples();
+    let mut ordered = sojourn.to_vec();
+    ordered.sort_unstable();
+    let p99 = ordered[ordered.len() * 99 / 100];
+    let stats = fixture.connection.stats();
+    eprintln!(
+        "production bottleneck seed={SEED:#06x} rate={RATE_BPS} samples={} delivered_bytes={delivered} emitted_rtp_bytes={} padding_bytes={} target_bps={} max_rolling_probe_percent={max_probe_percent} measured_windows={measured_windows} queue_p99_ms={}",
+        sojourn.len(),
+        stats.connection.transmitted_rtp_bytes,
+        stats.connection.transmitted_padding_bytes,
+        stats.connection.target_media_bitrate.as_bps(),
+        p99.as_millis()
+    );
+    assert!(
+        sojourn.len() >= 1_000,
+        "insufficient emitted transport samples"
+    );
+    let elapsed_micros = fixture.at().monotonic.duration_since(started).as_micros();
+    let service_bytes = u128::from(RATE_BPS).saturating_mul(elapsed_micros) / 8_000_000;
+    assert!(
+        u128::from(delivered).saturating_mul(100) >= service_bytes.saturating_mul(85),
+        "non-outage bottleneck utilization must be at least 85%; delivered={delivered} service={service_bytes} elapsed_us={elapsed_micros}"
+    );
+    assert!(stats.connection.transmitted_rtp_bytes > 0);
+    assert!(stats.connection.transmitted_padding_bytes <= stats.connection.transmitted_rtp_bytes);
+    assert!(measured_windows >= 1_000);
+    assert!(
+        max_probe_percent <= 5,
+        "rolling five-second emitted-byte probe overhead"
+    );
+}
+
+#[test]
 fn fixed_system_matrix() {
     assert_eq!(PAYLOAD_BYTES, 1_000);
     assert_eq!(FEEDBACK_INTERVAL, Duration::from_millis(50));

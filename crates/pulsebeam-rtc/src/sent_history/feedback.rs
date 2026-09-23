@@ -2,7 +2,6 @@ use super::*;
 
 impl SentHistory {
     pub(crate) fn process_feedback(&mut self, batch: FeedbackBatch) {
-        self.inputs.timing = None;
         if self.active_epoch != Some(batch.path_epoch) {
             let count = feedback_status_count(&batch.report);
             self.counters.wrong_path_feedback = self
@@ -12,6 +11,7 @@ impl SentHistory {
             return;
         }
         let received_at = batch.received_at.monotonic;
+        let prior_evidence = self.inputs.feedback.len();
         let feedback_hold = match batch.report {
             FeedbackReport::Twcc {
                 base_sequence,
@@ -35,7 +35,6 @@ impl SentHistory {
                 report_timestamp,
             } => self.process_rfc8888(&reports, report_timestamp, batch.path_epoch, received_at),
         };
-        self.confirm_losses(received_at, MAX_EXPIRATIONS_PER_POLL);
         let newest_send_age = self
             .inputs
             .feedback
@@ -43,11 +42,13 @@ impl SentHistory {
             .filter_map(|feedback| self.entry(feedback.sent_id))
             .map(|entry| received_at.saturating_duration_since(entry.committed_at))
             .min();
-        self.inputs.timing = Some(FeedbackTiming {
-            received_at,
-            feedback_hold,
-            newest_send_age,
-        });
+        if self.inputs.feedback.len() > prior_evidence && newest_send_age.is_some() {
+            self.inputs.timing = Some(FeedbackTiming {
+                received_at,
+                feedback_hold,
+                newest_send_age,
+            });
+        }
     }
 
     pub(crate) fn expire(&mut self, now: Instant, limit: usize) -> usize {
@@ -128,8 +129,64 @@ impl SentHistory {
             return;
         }
         let reference = unwrap_near_signed(i64::from(reference_time), self.twcc_reference, 1 << 24);
-        self.twcc_reference = Some(reference);
         let count = unwrap_near_signed(i64::from(feedback_count), self.twcc_feedback_count, 1 << 8);
+        let mut arrivals = Vec::with_capacity(statuses.len());
+        let mut arrival_micros = reference.saturating_mul(64_000);
+        for status in statuses {
+            let arrival = match status {
+                TwccStatus::NotReceived => None,
+                TwccStatus::Received { delta_250us } => {
+                    arrival_micros =
+                        arrival_micros.saturating_add(i64::from(*delta_250us).saturating_mul(250));
+                    Some(ReceiverTime::Micros(arrival_micros))
+                }
+            };
+            arrivals.push(arrival);
+        }
+        let old_edge = self.highest_twcc_acked;
+        let received_edge = statuses
+            .iter()
+            .rposition(|status| matches!(status, TwccStatus::Received { .. }))
+            .map(|offset| base.saturating_add(offset as u64));
+        if !statuses.is_empty() {
+            let edge = received_edge.unwrap_or(last_reported);
+            let floor = self.oldest_twcc.unwrap_or(base);
+            let start = old_edge.map_or(floor, |previous| floor.max(previous.saturating_add(1)));
+            let unknown_reported = (base..=last_reported)
+                .filter(|&sequence| {
+                    self.twcc_sent_id(sequence)
+                        .and_then(|id| self.entry(id))
+                        .is_none_or(|entry| entry.path_epoch != epoch)
+                })
+                .count();
+            if received_edge.is_some_and(|edge| {
+                edge >= start && edge.saturating_sub(start) >= MAX_FEEDBACK_STATUSES as u64
+            }) {
+                self.add_unknown(statuses.len());
+                return;
+            }
+            let unknown_advance = if received_edge.is_some_and(|edge| edge >= start) {
+                (start..base.min(edge.saturating_add(1)))
+                    .filter(|&sequence| {
+                        self.twcc_sent_id(sequence)
+                            .and_then(|id| self.entry(id))
+                            .is_none_or(|entry| entry.path_epoch != epoch)
+                    })
+                    .count()
+            } else {
+                0
+            };
+            if unknown_reported + unknown_advance != 0 {
+                self.add_unknown(unknown_reported + unknown_advance);
+                return;
+            }
+        }
+        if self
+            .twcc_reference
+            .is_none_or(|previous| reference >= previous)
+        {
+            self.twcc_reference = Some(reference);
+        }
         if self
             .twcc_feedback_count
             .is_some_and(|previous| count <= previous)
@@ -138,36 +195,32 @@ impl SentHistory {
         } else {
             self.twcc_feedback_count = Some(count);
         }
-
-        let mut arrivals = Vec::with_capacity(statuses.len());
-        let mut arrival_micros = reference.saturating_mul(64_000);
-        let mut highest_received = None;
-        for (offset, status) in statuses.iter().enumerate() {
-            let sequence = base.saturating_add(offset as u64);
-            let arrival = match status {
-                TwccStatus::NotReceived => None,
-                TwccStatus::Received { delta_250us } => {
-                    arrival_micros =
-                        arrival_micros.saturating_add(i64::from(*delta_250us).saturating_mul(250));
-                    highest_received = Some(sequence);
-                    Some(ReceiverTime::Micros(arrival_micros))
-                }
-            };
-            arrivals.push(arrival);
+        if !statuses.is_empty() {
+            self.inputs.fresh_network_feedback = true;
         }
-        let old_edge = self.highest_twcc_acked;
-        if let Some(edge) = highest_received {
+        if let Some(edge) = received_edge {
             self.advance_twcc_edge(base, statuses, &arrivals, edge, epoch, received_at);
         }
         for (offset, status) in statuses.iter().enumerate() {
             let sequence = base.saturating_add(offset as u64);
-            if old_edge.is_some_and(|edge| sequence <= edge)
-                && matches!(status, TwccStatus::Received { .. })
-            {
-                let sent_id = self.twcc_sent_id(sequence);
+            let sent_id = self.twcc_sent_id(sequence);
+            if matches!(status, TwccStatus::NotReceived) {
+                if let Some(sent_id) = sent_id {
+                    self.set_missing(sent_id, received_at);
+                }
+            } else if old_edge.is_some_and(|edge| sequence <= edge) {
                 self.recover(sent_id, epoch, arrivals[offset], None, received_at);
             }
         }
+    }
+
+    fn validate_twcc_range(&self, start: u64, edge: u64, epoch: PathEpoch) -> bool {
+        edge.saturating_sub(start) < MAX_FEEDBACK_STATUSES as u64
+            && (start..=edge).all(|sequence| {
+                self.twcc_sent_id(sequence)
+                    .and_then(|id| self.entry(id))
+                    .is_some_and(|entry| entry.path_epoch == epoch)
+            })
     }
 
     fn advance_twcc_edge(
@@ -179,9 +232,14 @@ impl SentHistory {
         epoch: PathEpoch,
         received_at: Instant,
     ) {
-        let start = self
-            .highest_twcc_acked
-            .map_or(base, |previous| base.max(previous.saturating_add(1)));
+        let start = self.highest_twcc_acked.map_or_else(
+            || self.oldest_twcc.unwrap_or(base),
+            |previous| {
+                self.oldest_twcc
+                    .unwrap_or(base)
+                    .max(previous.saturating_add(1))
+            },
+        );
         if edge < start || edge.saturating_sub(start) >= MAX_FEEDBACK_STATUSES as u64 {
             return;
         }
@@ -251,63 +309,80 @@ impl SentHistory {
                 self.ssrcs[ssrc_index].last_report_timestamp,
                 1_i64 << 32,
             );
-            self.ssrcs[ssrc_index].last_report_timestamp = Some(timestamp);
             let report_micros = timestamp.saturating_mul(1_000_000) / 65_536;
             let mut normalized = Vec::with_capacity(report.statuses.len());
-            let mut highest_received = None;
-            for (offset, status) in report.statuses.iter().enumerate() {
-                let sequence = base.saturating_add(offset as u64);
+            for status in &report.statuses {
                 let value = match status {
                     Rfc8888Status::NotReceived => (false, None, None, None),
                     Rfc8888Status::Received {
                         ecn,
                         arrival_offset,
-                    } => {
-                        highest_received = Some(sequence);
-                        match arrival_offset {
-                            ArrivalOffset::Ticks(ticks) => {
-                                let hold_micros =
-                                    u64::from(*ticks).saturating_mul(1_000_000) / 1_024;
-                                (
-                                    true,
-                                    Some(ReceiverTime::Micros(
-                                        report_micros.saturating_sub(hold_micros as i64),
-                                    )),
-                                    Some(ecn_mark(*ecn)),
-                                    Some(Duration::from_micros(hold_micros)),
-                                )
-                            }
-                            ArrivalOffset::OverRange => (
+                    } => match arrival_offset {
+                        ArrivalOffset::Ticks(ticks) => {
+                            let hold_micros = u64::from(*ticks).saturating_mul(1_000_000) / 1_024;
+                            (
                                 true,
-                                Some(ReceiverTime::OverRange),
+                                Some(ReceiverTime::Micros(
+                                    report_micros.saturating_sub(hold_micros as i64),
+                                )),
                                 Some(ecn_mark(*ecn)),
-                                None,
-                            ),
-                            ArrivalOffset::Unavailable => (
-                                true,
-                                Some(ReceiverTime::Unavailable),
-                                Some(ecn_mark(*ecn)),
-                                None,
-                            ),
+                                Some(Duration::from_micros(hold_micros)),
+                            )
                         }
-                    }
+                        ArrivalOffset::OverRange => (
+                            true,
+                            Some(ReceiverTime::OverRange),
+                            Some(ecn_mark(*ecn)),
+                            None,
+                        ),
+                        ArrivalOffset::Unavailable => (
+                            true,
+                            Some(ReceiverTime::Unavailable),
+                            Some(ecn_mark(*ecn)),
+                            None,
+                        ),
+                    },
                 };
-                if let Some(hold) = value.3 {
-                    minimum_hold = Some(minimum_hold.map_or(hold, |known| known.min(hold)));
-                }
                 normalized.push(value);
             }
             let old_edge = self.ssrcs[ssrc_index].highest_acked_sequence;
-            if let Some(edge) = highest_received {
-                let start = old_edge.map_or(base, |previous| base.max(previous.saturating_add(1)));
-                let edge_known = self
-                    .lookup_rtp(ssrc_index, edge)
-                    .and_then(|sent_id| self.entry(sent_id))
-                    .is_some_and(|entry| entry.path_epoch == epoch);
-                if !edge_known {
-                    self.add_unknown(1);
-                } else if edge >= start && edge.saturating_sub(start) < MAX_FEEDBACK_STATUSES as u64
-                {
+            let received_edge = normalized
+                .iter()
+                .rposition(|value| value.0)
+                .map(|offset| base.saturating_add(offset as u64));
+            if !report.statuses.is_empty() {
+                let edge = received_edge.unwrap_or(last_reported);
+                let floor = self.ssrcs[ssrc_index].first_sequence;
+                let start =
+                    old_edge.map_or(floor, |previous| floor.max(previous.saturating_add(1)));
+                if received_edge.is_some_and(|edge| {
+                    edge >= start && edge.saturating_sub(start) >= MAX_FEEDBACK_STATUSES as u64
+                }) {
+                    self.add_unknown(report.statuses.len());
+                    continue;
+                }
+                let unresolved_reported = (base..=last_reported)
+                    .filter(|&sequence| {
+                        self.lookup_rtp(ssrc_index, sequence)
+                            .and_then(|id| self.entry(id))
+                            .is_none_or(|entry| entry.path_epoch != epoch)
+                    })
+                    .count();
+                let unresolved_advance = if received_edge.is_some_and(|edge| edge >= start) {
+                    (start..base.min(edge.saturating_add(1)))
+                        .filter(|&sequence| {
+                            self.lookup_rtp(ssrc_index, sequence)
+                                .and_then(|id| self.entry(id))
+                                .is_none_or(|entry| entry.path_epoch != epoch)
+                        })
+                        .count()
+                } else {
+                    0
+                };
+                if unresolved_reported + unresolved_advance != 0 {
+                    self.add_unknown(unresolved_reported + unresolved_advance);
+                    continue;
+                } else if received_edge.is_some() && edge >= start {
                     for sequence in start..=edge {
                         let sent_id = self.lookup_rtp(ssrc_index, sequence);
                         let offset = sequence
@@ -322,10 +397,28 @@ impl SentHistory {
                     self.ssrcs[ssrc_index].highest_acked_sequence = Some(edge);
                 }
             }
+            if !report.statuses.is_empty() {
+                self.inputs.fresh_network_feedback = true;
+            }
+            for (_, _, _, hold) in &normalized {
+                if let Some(hold) = hold {
+                    minimum_hold = Some(minimum_hold.map_or(*hold, |known| known.min(*hold)));
+                }
+            }
+            if self.ssrcs[ssrc_index]
+                .last_report_timestamp
+                .is_none_or(|previous| timestamp >= previous)
+            {
+                self.ssrcs[ssrc_index].last_report_timestamp = Some(timestamp);
+            }
             for (offset, (received, arrival, ecn, _)) in normalized.iter().copied().enumerate() {
                 let sequence = base.saturating_add(offset as u64);
-                if received && old_edge.is_some_and(|edge| sequence <= edge) {
-                    let sent_id = self.lookup_rtp(ssrc_index, sequence);
+                let sent_id = self.lookup_rtp(ssrc_index, sequence);
+                if !received {
+                    if let Some(sent_id) = sent_id {
+                        self.set_missing(sent_id, received_at);
+                    }
+                } else if old_edge.is_some_and(|edge| sequence <= edge) {
                     self.recover(sent_id, epoch, arrival, ecn, received_at);
                 }
             }
@@ -528,20 +621,16 @@ impl SentHistory {
             receiver_arrival,
             ecn,
         };
-        if self.inputs.feedback.len() >= MAX_FEEDBACK_STATUSES {
-            // A confirmed loss must never disappear merely because one RTCP batch filled
-            // the bounded vector. Replace lower-severity evidence so the controller takes
-            // a conservative congestion path while preserving the hard work bound.
-            if lost && let Some(existing) = self.inputs.feedback.iter_mut().find(|item| !item.lost)
-            {
-                *existing = sample;
+        if lost {
+            if self.inputs.synthetic.len() < MAX_EXPIRATIONS_PER_POLL {
+                self.inputs.synthetic.push(sample);
             }
-            return;
+        } else if self.inputs.feedback.len() < MAX_FEEDBACK_STATUSES {
+            self.inputs.feedback.push(sample);
         }
-        self.inputs.feedback.push(sample);
     }
 
-    fn twcc_sent_id(&self, sequence: u64) -> Option<SentPacketId> {
+    pub(super) fn twcc_sent_id(&self, sequence: u64) -> Option<SentPacketId> {
         self.twcc_index[ring_index(sequence)]
             .filter(|index| index.sequence == sequence)
             .map(|index| index.sent_id)

@@ -314,11 +314,6 @@ impl Connection {
             Lifecycle::Open | Lifecycle::Closing { .. } => {}
         }
 
-        self.runtime
-            .commit
-            .history
-            .expire(at.monotonic, MAX_EXPIRATIONS_PER_POLL);
-
         if self._time.take_warning() {
             return Output::Event(Event::Warning(ConnectionWarning::ClockRegression));
         }
@@ -358,6 +353,11 @@ impl Connection {
             return Output::Event(event);
         }
 
+        self.runtime
+            .commit
+            .history
+            .expire(at.monotonic, MAX_EXPIRATIONS_PER_POLL);
+
         if let Some(feedback) = self._subsystems.ingress.poll_feedback() {
             self.runtime.commit.history.process_feedback(feedback);
         }
@@ -380,15 +380,14 @@ impl Connection {
                 inputs
                     .feedback
                     .iter()
+                    .chain(&inputs.synthetic)
                     .map(|feedback| feedback.controller_sample(received_at, origin))
                     .collect::<Vec<_>>(),
                 inputs
                     .timing
                     .and_then(|timing| timing.feedback_hold)
                     .unwrap_or_default(),
-                inputs
-                    .timing
-                    .is_some_and(|timing| timing.newest_send_age.is_some()),
+                inputs.fresh_network_feedback,
                 inputs.bytes_in_flight,
             )
         };
