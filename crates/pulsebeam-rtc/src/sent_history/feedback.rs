@@ -43,6 +43,7 @@ impl SentHistory {
             .inputs
             .feedback
             .iter()
+            .skip(prior_evidence)
             .filter_map(|feedback| self.entry(feedback.sent_id))
             .map(|entry| received_at.saturating_duration_since(entry.committed_at))
             .min();
@@ -437,7 +438,23 @@ impl SentHistory {
                 if unresolved_reported + unresolved_advance != 0 {
                     self.add_unknown(unresolved_reported + unresolved_advance);
                     continue;
-                } else if received_edge.is_some() && edge >= start {
+                }
+                for (offset, (received, _, _, hold)) in normalized.iter().enumerate() {
+                    if *received
+                        && let Some(hold) = hold
+                        && self
+                            .lookup_rtp(ssrc_index, base.saturating_add(offset as u64))
+                            .and_then(|id| self.entry(id))
+                            .is_some_and(|entry| {
+                                !entry.acknowledgment.is_terminal()
+                                    && received_at.saturating_duration_since(entry.committed_at)
+                                        < SENT_HISTORY_MAX_AGE
+                            })
+                    {
+                        minimum_hold = Some(minimum_hold.map_or(*hold, |known| known.min(*hold)));
+                    }
+                }
+                if received_edge.is_some() && edge >= start {
                     self.anchor_missing(None, Some((report.ssrc, edge)), received_at);
                     for sequence in start..=edge {
                         let sent_id = self.lookup_rtp(ssrc_index, sequence);
@@ -459,11 +476,6 @@ impl SentHistory {
                     .is_none_or(|previous| timestamp > previous)
                     || late_receipt);
             self.inputs.fresh_network_feedback |= fresh;
-            for (_, _, _, hold) in &normalized {
-                if let Some(hold) = hold {
-                    minimum_hold = Some(minimum_hold.map_or(*hold, |known| known.min(*hold)));
-                }
-            }
             if self.ssrcs[ssrc_index]
                 .last_report_timestamp
                 .is_none_or(|previous| timestamp >= previous)

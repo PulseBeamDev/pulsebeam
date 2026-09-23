@@ -335,6 +335,91 @@ fn path_change_discards_pending_feedback_and_rebases_ssrc_history() {
 }
 
 #[test]
+fn terminal_rfc8888_receipt_cannot_replace_new_feedback_hold() {
+    let now = Instant::now();
+    let epoch = PathEpoch::from_value(36);
+    let mut history = SentHistory::new(PacketFeedbackKind::Rfc8888);
+    history.path_changed(epoch, true);
+    for sequence in 1..=2 {
+        history.commit(rfc_context(now, epoch, sequence)).unwrap();
+    }
+    let report = |received_at, timestamp, statuses: Vec<Rfc8888Status>| FeedbackBatch {
+        received_at: at(received_at),
+        path_epoch: epoch,
+        sender_ssrc: 9,
+        report: FeedbackReport::Rfc8888 {
+            reports: vec![crate::rtcp::Rfc8888Report {
+                ssrc: 7,
+                begin_sequence: 1,
+                report_count: statuses.len() as u16,
+                statuses: statuses.into(),
+            }]
+            .into(),
+            report_timestamp: timestamp,
+        },
+    };
+    let received = |ticks| Rfc8888Status::Received {
+        ecn: 0,
+        arrival_offset: ArrivalOffset::Ticks(ticks),
+    };
+    history.process_feedback(report(
+        now + Duration::from_millis(10),
+        1,
+        vec![received(1)],
+    ));
+    history.clear_controller_inputs();
+    history.process_feedback(report(
+        now + Duration::from_millis(20),
+        2,
+        vec![received(0), received(100)],
+    ));
+    assert_eq!(history.inputs.feedback.len(), 1);
+    assert_eq!(
+        history.inputs.timing.unwrap().feedback_hold,
+        Some(Duration::from_micros(97_656))
+    );
+}
+
+#[test]
+fn feedback_timing_uses_only_the_current_accepted_report() {
+    let now = Instant::now();
+    let epoch = PathEpoch::from_value(37);
+    let mut history = SentHistory::new(PacketFeedbackKind::Rfc8888);
+    history.path_changed(epoch, true);
+    let mut older = rfc_context(now, epoch, 1);
+    older.rtp.as_mut().unwrap().ssrc = 8;
+    history.commit(older).unwrap();
+    history
+        .commit(rfc_context(now + Duration::from_millis(10), epoch, 1))
+        .unwrap();
+    for (ssrc, received_at) in [(7, 20), (8, 100)] {
+        history.process_feedback(FeedbackBatch {
+            received_at: at(now + Duration::from_millis(received_at)),
+            path_epoch: epoch,
+            sender_ssrc: 9,
+            report: FeedbackReport::Rfc8888 {
+                reports: vec![crate::rtcp::Rfc8888Report {
+                    ssrc,
+                    begin_sequence: 1,
+                    report_count: 1,
+                    statuses: vec![Rfc8888Status::Received {
+                        ecn: 0,
+                        arrival_offset: ArrivalOffset::Ticks(0),
+                    }]
+                    .into(),
+                }]
+                .into(),
+                report_timestamp: u32::try_from(received_at).unwrap(),
+            },
+        });
+    }
+    assert_eq!(
+        history.inputs.timing.unwrap().newest_send_age,
+        Some(Duration::from_millis(100))
+    );
+}
+
+#[test]
 fn all_missing_rfc8888_report_does_not_advance_either_ssrc() {
     let now = Instant::now();
     let epoch = PathEpoch::from_value(13);
