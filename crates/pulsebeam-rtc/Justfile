@@ -5,4 +5,5 @@ test-fast:
 
 test-slow:
     cargo test -p pulsebeam-rtc --test scaling -- --ignored --exact many_connections_many_streams
+    scripts/run-rfc8888-peer.sh
     scripts/run-browser-matrix.sh --platform linux-x86_64

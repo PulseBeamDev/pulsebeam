@@ -19,6 +19,7 @@ str0m = { git = "https://github.com/PulseBeamDev/str0m.git", branch = "patch/0.2
 thiserror.workspace = true
 
 [dev-dependencies]
+base64 = "0.22"
 futures-lite.workspace = true
 proptest = "1.11.0"
 serde.workspace = true
