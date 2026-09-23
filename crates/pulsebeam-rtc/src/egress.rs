@@ -64,6 +64,9 @@ pub(crate) struct MediaEgress {
     next_rtcp: Instant,
     rtcp_cursor: usize,
     probe_remaining: u8,
+    probe_sender: Option<usize>,
+    probe_target_bytes: u64,
+    probe_packet_count: u8,
     probe_started_at: Option<Instant>,
     probe_start_queue_delay: Duration,
     last_probe: Option<Instant>,
@@ -254,6 +257,9 @@ impl MediaEgress {
                 .unwrap_or(accepted_at),
             rtcp_cursor: 0,
             probe_remaining: 0,
+            probe_sender: None,
+            probe_target_bytes: 0,
+            probe_packet_count: 0,
             probe_started_at: None,
             probe_start_queue_delay: Duration::ZERO,
             last_probe: None,
@@ -368,6 +374,9 @@ impl MediaEgress {
             self.path_available = available;
             self.pacer.reset();
             self.probe_remaining = 0;
+            self.probe_sender = None;
+            self.probe_target_bytes = 0;
+            self.probe_packet_count = 0;
             self.probe_started_at = None;
             self.probe_sent_bytes = 0;
             self.probe_last_sent_at = None;
@@ -487,6 +496,9 @@ impl MediaEgress {
         self.repair_requests.clear();
         self.pending = None;
         self.probe_remaining = 0;
+        self.probe_sender = None;
+        self.probe_target_bytes = 0;
+        self.probe_packet_count = 0;
         self.probe_started_at = None;
         self.probe_sent_bytes = 0;
         self.probe_last_sent_at = None;
@@ -828,8 +840,12 @@ impl MediaEgress {
                     .probe_sent_bytes
                     .saturating_add(prepared.wire_len as u64);
                 self.probe_last_sent_at = Some(at.monotonic);
+                self.probe_packet_count = self.probe_packet_count.saturating_add(1);
                 self.probe_remaining = self.probe_remaining.saturating_sub(1);
-                if self.probe_remaining == 0 {
+                if self.probe_remaining == 0
+                    || (self.probe_packet_count >= 5
+                        && self.probe_sent_bytes >= self.probe_target_bytes)
+                {
                     self.finish_probe(at.monotonic, false);
                 }
             }
@@ -1296,6 +1312,9 @@ impl MediaEgress {
 
     fn finish_probe(&mut self, at: Instant, aborted: bool) {
         self.probe_remaining = 0;
+        self.probe_sender = None;
+        self.probe_target_bytes = 0;
+        self.probe_packet_count = 0;
         self.last_probe = Some(at);
         if let (Some(started_at), Some(last_sent_at)) =
             (self.probe_started_at.take(), self.probe_last_sent_at.take())
@@ -1467,6 +1486,37 @@ impl MediaEgress {
         true
     }
 
+    fn probe_candidate(&self) -> Option<usize> {
+        self.senders
+            .iter()
+            .enumerate()
+            .filter(|(_, sender)| sender.policy.desired_bitrate.as_bps() > 0)
+            .max_by_key(|(index, sender)| {
+                LatencyGovernor::operating_point(
+                    playout_max_ticks(sender.policy),
+                    sender.policy.desired_bitrate.as_bps(),
+                )
+                .governed_demand
+                .saturating_sub(self.allocations[*index])
+                .saturating_mul(u64::from(sender.policy.priority.weight()))
+            })
+            .map(|(index, _)| index)
+    }
+
+    fn cluster_target_bytes(&self, credible_media_rate: u64) -> u64 {
+        let governed_demand = self.senders.iter().fold(0_u64, |total, sender| {
+            total.saturating_add(
+                LatencyGovernor::operating_point(
+                    playout_max_ticks(sender.policy),
+                    sender.policy.desired_bitrate.as_bps(),
+                )
+                .governed_demand,
+            )
+        });
+        let target_rate = governed_demand.min(credible_media_rate.saturating_mul(2).max(300_000));
+        (target_rate / 400).clamp(1, 48 * 1024)
+    }
+
     fn prepare_padding(
         &mut self,
         at: TimePoint,
@@ -1489,39 +1539,17 @@ impl MediaEgress {
             let due = self
                 .last_probe
                 .is_none_or(|last| at.monotonic.saturating_duration_since(last) >= interval);
-            let candidate = self
-                .senders
-                .iter()
-                .enumerate()
-                .filter(|(_, sender)| sender.policy.desired_bitrate.as_bps() > 0)
-                .max_by_key(|(index, sender)| {
-                    sender
-                        .policy
-                        .desired_bitrate
-                        .as_bps()
-                        .saturating_sub(self.allocations[*index])
-                        .saturating_mul(u64::from(sender.policy.priority.weight()))
-                })
-                .map(|(index, _)| index);
-            if !envelope.probe_permitted || !due || candidate.is_none() {
+            if !envelope.probe_permitted || !due {
                 return PrepareResult::Blocked;
             }
-            self.probe_remaining = 5;
+            let Some(sender_index) = self.probe_candidate() else {
+                return PrepareResult::Blocked;
+            };
+            self.probe_sender = Some(sender_index);
+            self.probe_target_bytes = self.cluster_target_bytes(envelope.target_media_payload_rate);
+            self.probe_remaining = 32;
         }
-        let Some(sender_index) = self
-            .senders
-            .iter()
-            .enumerate()
-            .filter(|(_, sender)| sender.policy.desired_bitrate.as_bps() > 0)
-            .max_by_key(|(index, sender)| {
-                sender
-                    .policy
-                    .desired_bitrate
-                    .as_bps()
-                    .saturating_sub(self.allocations[*index])
-            })
-            .map(|(index, _)| index)
-        else {
+        let Some(sender_index) = self.probe_sender else {
             self.finish_probe(at.monotonic, true);
             return PrepareResult::Blocked;
         };
@@ -1548,7 +1576,10 @@ impl MediaEgress {
         ) else {
             return PrepareResult::Fatal;
         };
-        if !self.fits_send_window(bytes_in_flight, packet.len()) {
+        if packet.len().saturating_add(RTP_TRANSPORT_ALLOWANCE) as u64
+            > (48 * 1024_u64).saturating_sub(self.probe_sent_bytes)
+            || !self.fits_send_window(bytes_in_flight, packet.len())
+        {
             self.finish_probe(at.monotonic, true);
             return PrepareResult::Blocked;
         }
@@ -1834,6 +1865,42 @@ mod tests {
             0,
         );
         assert_eq!(egress.probe_started_at, None, "path reset cancels cluster");
+    }
+
+    #[test]
+    fn probe_uses_weighted_governed_unmet_demand_and_bounded_target() {
+        let now = Instant::now();
+        let policy = SenderPolicy {
+            playout_delay: PlayoutDelay::from_ticks(0, 50).expect("500 ms"),
+            priority: MediaPriority::LOW,
+            desired_bitrate: MediaPayloadBitrate::from_bps(1_000_000),
+        };
+        let sender = |id| EgressSenderFacts {
+            id: SenderId::new(id).expect("sender"),
+            kind: MediaKind::Audio,
+            mid: format!("audio{id}").into(),
+            payload_type: 111,
+            retransmission_payload_type: None,
+            clock_rate: 48_000,
+            mid_extension_id: None,
+            twcc_extension_id: Some(3),
+        };
+        let mut egress = MediaEgress::new(
+            vec![sender(1), sender(2)].into_boxed_slice(),
+            &[0; 32],
+            1,
+            1,
+            policy,
+            policy,
+            now,
+        );
+        egress.senders[1].policy.priority = MediaPriority::HIGH;
+        egress.senders[1].policy.desired_bitrate = MediaPayloadBitrate::from_bps(500_000);
+        assert_eq!(egress.probe_candidate(), Some(1));
+        assert_eq!(egress.cluster_target_bytes(100_000), 750);
+        assert_eq!(egress.cluster_target_bytes(1_000_000), 3_562);
+        egress.senders[0].policy.desired_bitrate = MediaPayloadBitrate::from_bps(u64::MAX);
+        assert_eq!(egress.cluster_target_bytes(u64::MAX), 48 * 1024);
     }
 
     #[test]
