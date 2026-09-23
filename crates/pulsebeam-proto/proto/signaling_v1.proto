@@ -41,8 +41,8 @@ package pulsebeam.media.v1;
 //   - A valid desired state that requires fresh negotiated receiver structure MAY
 //     cause an explicit Reconnect, subject to the video request-count invariant
 //     documented on VideoIntent.
-//   - Intent is reconciled to feasible, authorized media state. Only permission
-//     failures cause non-fatal Intent rejection. Exceeding the VideoIntent
+//   - Intent is reconciled to feasible media state for an admitted participant.
+//     Exceeding the VideoIntent
 //     receiver-count limit or changing an established SendIntent label binding
 //     is a fatal PROTOCOL_ERROR. Other intent-level faults are reconciled and
 //     answered with complete Mapping state.
@@ -147,12 +147,12 @@ package pulsebeam.media.v1;
 //
 //   ParticipantExternalId
 //       Application-owned participant identity supplied through authorization.
-//       It is unique among active participants in one room. The server MUST
-//       resolve a duplicate active identity by terminating/rejecting one of the
-//       conflicting connections before exposing both as active room state. Which
-//       connection wins is an admission-policy decision outside this protobuf;
-//       duplicate ParticipantExternalIds MUST never appear in one logical room
-//       state.
+//       It is unique among active participants in one room. An explicitly
+//       admitted newer connection takes over the same authorized identity and
+//       fences the displaced generation before the winner becomes visible.
+//       Failed candidates leave the incumbent intact. Automatic retries of a
+//       displaced attempt cannot initiate another takeover. Duplicate
+//       ParticipantExternalIds MUST never appear in one logical room state.
 //
 //   ParticipantId
 //       Stable canonical participant identity owned by PulseBeam.
@@ -855,7 +855,8 @@ message ReceiveIntent {
 // Mapping MUST only reference currently visible tracks and MUST obey Catalog
 // causal ordering. The reply is complete Mapping state, not correction reasons.
 //
-// Only permission failures cause non-fatal Intent rejection. Exceeding the
+// Admitted native participants can publish and receive media visible in their
+// room; Intent has no additional media-permission rejection. Exceeding the
 // VideoIntent receiver-count limit or violating established SendIntent label
 // bindings is a fatal PROTOCOL_ERROR, as specified on those messages. Other
 // structural and option faults in a decoded Intent are
@@ -1030,10 +1031,11 @@ enum ErrorCode {
 //
 // `intent_revision` MUST be present when an Error rejects a specific candidate
 // Intent and MUST be absent when the error is unrelated to one candidate Intent.
-// Only AUTHORIZATION_REJECTED may non-fatally reject a candidate Intent. Such
-// a permission rejection never modifies accepted Intent or Mapping. Exceeding
-// the VideoIntent receiver-count limit or changing an established SendIntent
-// label binding requires fatal PROTOCOL_ERROR without applying the candidate. Other intent-level faults are reconciled and answered
+// AUTHORIZATION_REJECTED reports a failed token renewal, not media permission
+// rejection, and does not modify accepted Intent or Mapping. Exceeding the
+// VideoIntent receiver-count limit or changing an established SendIntent
+// label binding requires fatal PROTOCOL_ERROR without applying the candidate.
+// Other intent-level faults are reconciled and answered
 // with complete Mapping state, not relabeled as protocol or internal failures.
 // Wire decoding failures are distinct from faults inside a decoded Intent.
 //
@@ -1094,7 +1096,10 @@ message Error {
 // transport establishment or changes in desired media state alone MUST NOT.
 // There is no attempt-count or per-Intent-revision retry limit. Disconnect or
 // Agent destruction MUST cancel pending retries. Retrying does not bypass
-// authorization or extend an expired authorization lease.
+// authorization or extend an expired authorization lease. A fatal SUPERSEDED
+// Error is different: the Agent suspends its connected desire and retries only
+// after an explicit connect() call. Credentials, timers and rerenders cannot
+// restart the displaced attempt.
 //
 // WHIP/WHEP clients never receive this message; their lifecycle is governed by
 // their respective HTTP/SDP protocols.
