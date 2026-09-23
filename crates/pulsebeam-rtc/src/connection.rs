@@ -367,7 +367,14 @@ impl Connection {
                 .request_repair(repair.media_ssrc, repair.sequence);
         }
 
-        let (path_change, feedback, feedback_hold, fresh_network_feedback, bytes_in_flight) = {
+        let (
+            path_change,
+            feedback,
+            probe_feedback,
+            feedback_hold,
+            fresh_network_feedback,
+            bytes_in_flight,
+        ) = {
             let inputs = self.runtime.commit.history.controller_inputs();
             let received_at = inputs
                 .timing
@@ -384,6 +391,12 @@ impl Connection {
                     .map(|feedback| feedback.controller_sample(received_at, origin))
                     .collect::<Vec<_>>(),
                 inputs
+                    .feedback
+                    .iter()
+                    .chain(&inputs.synthetic)
+                    .copied()
+                    .collect::<Vec<_>>(),
+                inputs
                     .timing
                     .and_then(|timing| timing.feedback_hold)
                     .unwrap_or_default(),
@@ -395,6 +408,7 @@ impl Connection {
             at,
             path_change,
             &feedback,
+            &probe_feedback,
             feedback_hold,
             fresh_network_feedback,
             bytes_in_flight,

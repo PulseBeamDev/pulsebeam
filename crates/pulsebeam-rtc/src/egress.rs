@@ -25,6 +25,7 @@ use crate::{
     pacer::Pacer,
     packet::RtpPacket,
     scheduler::SenderScheduler,
+    sent_history::PacketFeedback,
     transport::{
         DatagramKind, PreparedRtpIdentity, PreparedTransmit, RtpService, Transport, TransportError,
     },
@@ -66,7 +67,12 @@ pub(crate) struct MediaEgress {
     probe_started_at: Option<Instant>,
     probe_start_queue_delay: Duration,
     last_probe: Option<Instant>,
-    probe_history: VecDeque<Instant>,
+    probe_history: VecDeque<ProbeCluster>,
+    probe_sent_bytes: u64,
+    probe_last_sent_at: Option<Instant>,
+    probe_received_bytes: u64,
+    probe_lost_packets: u32,
+    probe_reported_packets: u32,
     emitted_rtp: VecDeque<(Instant, u64, bool)>,
     probe_disabled_until: Option<Instant>,
     offer_window_started: Instant,
@@ -109,6 +115,25 @@ struct QueuedMedia {
     media: ForwardedMedia,
     payload_bytes: usize,
     transport_estimate: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProbeResult {
+    Pending,
+    Successful,
+    Failed,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ProbeCluster {
+    started_at: Instant,
+    last_sent_at: Instant,
+    deadline: Instant,
+    sent_bytes: u64,
+    received_bytes: u64,
+    lost_packets: u32,
+    reported_packets: u32,
+    result: ProbeResult,
 }
 
 struct RetainedPacket {
@@ -233,6 +258,11 @@ impl MediaEgress {
             probe_start_queue_delay: Duration::ZERO,
             last_probe: None,
             probe_history: VecDeque::with_capacity(64),
+            probe_sent_bytes: 0,
+            probe_last_sent_at: None,
+            probe_received_bytes: 0,
+            probe_lost_packets: 0,
+            probe_reported_packets: 0,
             emitted_rtp: VecDeque::new(),
             probe_disabled_until: None,
             offer_window_started: accepted_at,
@@ -306,11 +336,7 @@ impl MediaEgress {
 
         self.apply_frame_admission(sender_index, &media);
         self.admitted_bytes = self.admitted_bytes.saturating_add(payload_bytes as u64);
-        if self.probe_started_at.is_some() {
-            self.last_probe = Some(at.monotonic);
-        }
-        self.probe_remaining = 0;
-        self.probe_started_at = None;
+        self.finish_probe(at.monotonic, true);
         self.senders[sender_index].latest_admitted_global = Some(media.packet.global_media_at());
         self.queued_payload_bytes = self.queued_payload_bytes.saturating_add(payload_bytes);
         self.queued_transport_bytes = self
@@ -332,6 +358,7 @@ impl MediaEgress {
         at: TimePoint,
         path_change: Option<(u64, bool)>,
         feedback: &[FeedbackSample],
+        probe_feedback: &[PacketFeedback],
         feedback_hold: Duration,
         fresh_network_feedback: bool,
         bytes_in_flight: u64,
@@ -342,6 +369,12 @@ impl MediaEgress {
             self.pacer.reset();
             self.probe_remaining = 0;
             self.probe_started_at = None;
+            self.probe_sent_bytes = 0;
+            self.probe_last_sent_at = None;
+            self.probe_received_bytes = 0;
+            self.probe_lost_packets = 0;
+            self.probe_reported_packets = 0;
+            self.probe_history.clear();
             self.last_probe = None;
             self.offer_window_started = at.monotonic;
             self.offered_bytes = 0;
@@ -395,6 +428,14 @@ impl MediaEgress {
             },
         );
         self.rtp_bytes_in_flight = bytes_in_flight;
+        self.observe_probe_feedback(at.monotonic, probe_feedback, output.reason);
+        if self.probe_remaining > 0
+            && self.probe_reported_packets > 0
+            && u64::from(self.probe_lost_packets).saturating_mul(100)
+                >= u64::from(self.probe_reported_packets).saturating_mul(5)
+        {
+            self.finish_probe(at.monotonic, true);
+        }
         if self.probe_remaining > 0
             && self.probe_started_at.is_some()
             && (output.feedback_stale
@@ -405,9 +446,7 @@ impl MediaEgress {
                         .saturating_add(Duration::from_millis(10))
                 || matches!(output.reason, crate::congestion::ControllerReason::Loss))
         {
-            self.probe_remaining = 0;
-            self.probe_started_at = None;
-            self.last_probe = Some(at.monotonic);
+            self.finish_probe(at.monotonic, true);
         }
         self.envelope = Some(output);
         self.reallocate(output.target_media_payload_rate);
@@ -449,6 +488,11 @@ impl MediaEgress {
         self.pending = None;
         self.probe_remaining = 0;
         self.probe_started_at = None;
+        self.probe_sent_bytes = 0;
+        self.probe_last_sent_at = None;
+        self.probe_received_bytes = 0;
+        self.probe_lost_packets = 0;
+        self.probe_reported_packets = 0;
     }
 
     pub(crate) fn stats(&self) -> (EgressStats, Vec<SenderStats>) {
@@ -780,14 +824,13 @@ impl MediaEgress {
                         .envelope
                         .map_or(Duration::ZERO, |envelope| envelope.queue_delay);
                 }
+                self.probe_sent_bytes = self
+                    .probe_sent_bytes
+                    .saturating_add(prepared.wire_len as u64);
+                self.probe_last_sent_at = Some(at.monotonic);
                 self.probe_remaining = self.probe_remaining.saturating_sub(1);
                 if self.probe_remaining == 0 {
-                    self.probe_started_at = None;
-                    self.last_probe = Some(at.monotonic);
-                    if self.probe_history.len() == 64 {
-                        self.probe_history.pop_front();
-                    }
-                    self.probe_history.push_back(at.monotonic);
+                    self.finish_probe(at.monotonic, false);
                 }
             }
         }
@@ -822,6 +865,11 @@ impl MediaEgress {
             probe_deadline,
             self.probe_started_at
                 .and_then(|started| started.checked_add(Duration::from_millis(20))),
+            self.probe_history
+                .iter()
+                .filter(|cluster| cluster.result == ProbeResult::Pending)
+                .map(|cluster| cluster.deadline)
+                .min(),
         ]
         .into_iter()
         .flatten()
@@ -1246,6 +1294,111 @@ impl MediaEgress {
         }
     }
 
+    fn finish_probe(&mut self, at: Instant, aborted: bool) {
+        self.probe_remaining = 0;
+        self.last_probe = Some(at);
+        if let (Some(started_at), Some(last_sent_at)) =
+            (self.probe_started_at.take(), self.probe_last_sent_at.take())
+        {
+            let timeout = self
+                .envelope
+                .map_or(Duration::from_millis(200), |envelope| {
+                    envelope
+                        .smoothed_rtt
+                        .saturating_mul(2)
+                        .clamp(Duration::from_millis(200), Duration::from_secs(2))
+                });
+            if self.probe_history.len() == 64 {
+                self.probe_history.pop_front();
+            }
+            self.probe_history.push_back(ProbeCluster {
+                started_at,
+                last_sent_at,
+                deadline: at.checked_add(timeout).unwrap_or(at),
+                sent_bytes: self.probe_sent_bytes,
+                received_bytes: self.probe_received_bytes,
+                lost_packets: self.probe_lost_packets,
+                reported_packets: self.probe_reported_packets,
+                result: if aborted {
+                    ProbeResult::Failed
+                } else {
+                    ProbeResult::Pending
+                },
+            });
+        }
+        self.probe_sent_bytes = 0;
+        self.probe_received_bytes = 0;
+        self.probe_lost_packets = 0;
+        self.probe_reported_packets = 0;
+    }
+
+    fn observe_probe_feedback(
+        &mut self,
+        at: Instant,
+        feedback: &[PacketFeedback],
+        reason: crate::congestion::ControllerReason,
+    ) {
+        let congested = matches!(
+            reason,
+            crate::congestion::ControllerReason::Loss
+                | crate::congestion::ControllerReason::Delay
+                | crate::congestion::ControllerReason::Policer
+                | crate::congestion::ControllerReason::ClassicEcn
+                | crate::congestion::ControllerReason::L4s
+        );
+        for sample in feedback {
+            if sample.service != RtpService::Padding || (!sample.received && !sample.lost) {
+                continue;
+            }
+            if let Some(cluster) = self.probe_history.iter_mut().rev().find(|cluster| {
+                cluster.result == ProbeResult::Pending
+                    && sample.committed_at >= cluster.started_at
+                    && sample.committed_at <= cluster.last_sent_at
+            }) {
+                cluster.reported_packets = cluster.reported_packets.saturating_add(1);
+                if sample.received {
+                    cluster.received_bytes = cluster
+                        .received_bytes
+                        .saturating_add(u64::from(sample.transport_bytes));
+                } else {
+                    cluster.lost_packets = cluster.lost_packets.saturating_add(1);
+                }
+            } else if self.probe_started_at.is_some_and(|start| {
+                sample.committed_at >= start
+                    && self
+                        .probe_last_sent_at
+                        .is_some_and(|last| sample.committed_at <= last)
+            }) {
+                self.probe_reported_packets = self.probe_reported_packets.saturating_add(1);
+                if sample.received {
+                    self.probe_received_bytes = self
+                        .probe_received_bytes
+                        .saturating_add(u64::from(sample.transport_bytes));
+                } else {
+                    self.probe_lost_packets = self.probe_lost_packets.saturating_add(1);
+                }
+            }
+        }
+        for cluster in &mut self.probe_history {
+            if cluster.result != ProbeResult::Pending {
+                continue;
+            }
+            if congested
+                || (cluster.reported_packets > 0
+                    && u64::from(cluster.lost_packets).saturating_mul(100)
+                        >= u64::from(cluster.reported_packets).saturating_mul(5))
+            {
+                cluster.result = ProbeResult::Failed;
+            } else if cluster.received_bytes.saturating_mul(100)
+                >= cluster.sent_bytes.saturating_mul(80)
+            {
+                cluster.result = ProbeResult::Successful;
+            } else if at >= cluster.deadline {
+                cluster.result = ProbeResult::Failed;
+            }
+        }
+    }
+
     fn record_rtp(&mut self, at: Instant, bytes: u64, probe: bool) {
         for _ in 0..MAX_EXPIRATIONS_PER_POLL {
             if self
@@ -1323,9 +1476,7 @@ impl MediaEgress {
         if self.probe_started_at.is_some_and(|started| {
             at.monotonic.saturating_duration_since(started) >= Duration::from_millis(20)
         }) {
-            self.probe_remaining = 0;
-            self.probe_started_at = None;
-            self.last_probe = Some(at.monotonic);
+            self.finish_probe(at.monotonic, true);
         }
         if !self.path_available {
             return PrepareResult::Blocked;
@@ -1371,7 +1522,7 @@ impl MediaEgress {
             })
             .map(|(index, _)| index)
         else {
-            self.probe_remaining = 0;
+            self.finish_probe(at.monotonic, true);
             return PrepareResult::Blocked;
         };
         let sender = &self.senders[sender_index];
@@ -1398,19 +1549,14 @@ impl MediaEgress {
             return PrepareResult::Fatal;
         };
         if !self.fits_send_window(bytes_in_flight, packet.len()) {
-            if self.probe_started_at.is_some() {
-                self.last_probe = Some(at.monotonic);
-            }
-            self.probe_remaining = 0;
-            self.probe_started_at = None;
+            self.finish_probe(at.monotonic, true);
             return PrepareResult::Blocked;
         }
         if !self.probe_budget_available(
             at.monotonic,
             packet.len().saturating_add(RTP_TRANSPORT_ALLOWANCE) as u64,
         ) {
-            self.probe_remaining = 0;
-            self.last_probe = Some(at.monotonic);
+            self.finish_probe(at.monotonic, true);
             return PrepareResult::Blocked;
         }
         match transport.send_rtp_with_service(&packet, RtpService::Padding) {
@@ -1619,6 +1765,7 @@ mod tests {
             },
             Some((2, true)),
             &[],
+            &[],
             Duration::ZERO,
             false,
             0,
@@ -1681,11 +1828,88 @@ mod tests {
             },
             Some((1, true)),
             &[],
+            &[],
             Duration::ZERO,
             false,
             0,
         );
         assert_eq!(egress.probe_started_at, None, "path reset cancels cluster");
+    }
+
+    #[test]
+    fn probe_success_requires_its_own_received_bytes_and_fails_on_loss_or_timeout() {
+        let now = Instant::now();
+        let policy = SenderPolicy {
+            playout_delay: PlayoutDelay::from_ticks(0, 0).expect("asap"),
+            priority: MediaPriority::MEDIUM,
+            desired_bitrate: MediaPayloadBitrate::from_bps(0),
+        };
+        let mut egress = MediaEgress::new(
+            Vec::new().into_boxed_slice(),
+            &[0; 32],
+            1,
+            1,
+            policy,
+            policy,
+            now,
+        );
+        let cluster = ProbeCluster {
+            started_at: now,
+            last_sent_at: now + Duration::from_millis(10),
+            deadline: now + Duration::from_millis(210),
+            sent_bytes: 1_000,
+            received_bytes: 0,
+            lost_packets: 0,
+            reported_packets: 0,
+            result: ProbeResult::Pending,
+        };
+        let sample = PacketFeedback {
+            sent_id: crate::sent_history::SentPacketId::for_test(1),
+            committed_at: now + Duration::from_millis(5),
+            transport_bytes: 800,
+            service: RtpService::Original,
+            received: true,
+            newly_acked: true,
+            lost: false,
+            receiver_arrival: None,
+            ecn: None,
+        };
+        egress.probe_history.push_back(cluster);
+        egress.observe_probe_feedback(
+            now + Duration::from_millis(100),
+            &[sample],
+            crate::congestion::ControllerReason::Feedback,
+        );
+        assert_eq!(egress.probe_history[0].result, ProbeResult::Pending);
+        egress.observe_probe_feedback(
+            now + Duration::from_millis(110),
+            &[PacketFeedback {
+                service: RtpService::Padding,
+                ..sample
+            }],
+            crate::congestion::ControllerReason::Feedback,
+        );
+        assert_eq!(egress.probe_history[0].result, ProbeResult::Successful);
+        egress.probe_history[0] = cluster;
+        egress.observe_probe_feedback(
+            now + Duration::from_millis(110),
+            &[PacketFeedback {
+                service: RtpService::Padding,
+                received: false,
+                newly_acked: false,
+                lost: true,
+                ..sample
+            }],
+            crate::congestion::ControllerReason::Loss,
+        );
+        assert_eq!(egress.probe_history[0].result, ProbeResult::Failed);
+        egress.probe_history[0] = cluster;
+        egress.observe_probe_feedback(
+            cluster.deadline,
+            &[],
+            crate::congestion::ControllerReason::Feedback,
+        );
+        assert_eq!(egress.probe_history[0].result, ProbeResult::Failed);
     }
 
     #[test]
@@ -1746,7 +1970,7 @@ mod tests {
             policy,
             now,
         );
-        owner.update_controller(at, Some((1, true)), &[], Duration::ZERO, false, 0);
+        owner.update_controller(at, Some((1, true)), &[], &[], Duration::ZERO, false, 0);
         owner
             .envelope
             .as_mut()

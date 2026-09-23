@@ -33,6 +33,13 @@ const MAX_REORDERING_WINDOW: Duration = Duration::from_millis(500);
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub(crate) struct SentPacketId(u64);
 
+#[cfg(test)]
+impl SentPacketId {
+    pub(crate) const fn for_test(value: u64) -> Self {
+        Self(value)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ReceiverTime {
     Micros(i64),
