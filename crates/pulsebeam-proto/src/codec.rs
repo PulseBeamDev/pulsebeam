@@ -146,6 +146,20 @@ mod tests {
     }
 
     #[test]
+    fn superseded_terminal_reason_is_machine_readable() {
+        let message = ServerMessage {
+            payload: Some(server_message::Payload::Error(ProtocolError {
+                code: crate::signaling_v1::ErrorCode::Superseded.into(),
+                message: String::new(),
+                fatal: true,
+                intent_revision: None,
+            })),
+        };
+        let bytes = encode_server(&message).expect("superseded terminal fits");
+        assert_eq!(decode_server(&bytes), Ok(message));
+    }
+
+    #[test]
     fn framing_matches_reference_bytes() {
         let message = ClientMessage {
             payload: Some(client_message::Payload::RenewAuthorization(

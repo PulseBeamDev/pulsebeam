@@ -1000,6 +1000,7 @@ message Authorization {
 //   AUTHORIZATION_EXPIRED    fatal = true
 //   PROTOCOL_ERROR           fatal = true
 //   INTERNAL                 fatal = implementation-dependent
+//   SUPERSEDED               fatal = true
 //
 // ERROR_CODE_UNSPECIFIED MUST NOT be sent.
 enum ErrorCode {
@@ -1014,6 +1015,10 @@ enum ErrorCode {
 
   PROTOCOL_ERROR = 7;
   INTERNAL = 8;
+
+  // A newer explicitly admitted connection displaced this generation. The
+  // Agent suspends automatic recovery until an explicit connect() request.
+  SUPERSEDED = 9;
 }
 
 
