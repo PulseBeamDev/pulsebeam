@@ -62,6 +62,8 @@ pub(crate) struct MediaEgress {
     next_rtcp: Instant,
     rtcp_cursor: usize,
     probe_remaining: u8,
+    probe_started_at: Option<Instant>,
+    probe_start_queue_delay: Duration,
     last_probe: Option<Instant>,
     probe_history: VecDeque<Instant>,
     emitted_rtp: VecDeque<(Instant, u64, bool)>,
@@ -225,6 +227,8 @@ impl MediaEgress {
                 .unwrap_or(accepted_at),
             rtcp_cursor: 0,
             probe_remaining: 0,
+            probe_started_at: None,
+            probe_start_queue_delay: Duration::ZERO,
             last_probe: None,
             probe_history: VecDeque::with_capacity(64),
             emitted_rtp: VecDeque::new(),
@@ -294,7 +298,11 @@ impl MediaEgress {
 
         self.apply_frame_admission(sender_index, &media);
         self.admitted_bytes = self.admitted_bytes.saturating_add(payload_bytes as u64);
+        if self.probe_started_at.is_some() {
+            self.last_probe = Some(at.monotonic);
+        }
         self.probe_remaining = 0;
+        self.probe_started_at = None;
         self.senders[sender_index].latest_admitted_global = Some(media.packet.global_media_at());
         self.queued_payload_bytes = self.queued_payload_bytes.saturating_add(payload_bytes);
         self.queued_transport_bytes = self
@@ -325,6 +333,7 @@ impl MediaEgress {
             self.path_available = available;
             self.pacer.reset();
             self.probe_remaining = 0;
+            self.probe_started_at = None;
             self.last_probe = None;
             self.offer_window_started = at.monotonic;
             self.offered_bytes = 0;
@@ -378,6 +387,20 @@ impl MediaEgress {
             },
         );
         self.rtp_bytes_in_flight = bytes_in_flight;
+        if self.probe_remaining > 0
+            && self.probe_started_at.is_some()
+            && (output.feedback_stale
+                || output.queue_delay > output.native_queue_delay_target
+                || output.queue_delay
+                    > self
+                        .probe_start_queue_delay
+                        .saturating_add(Duration::from_millis(10))
+                || matches!(output.reason, crate::congestion::ControllerReason::Loss))
+        {
+            self.probe_remaining = 0;
+            self.probe_started_at = None;
+            self.last_probe = Some(at.monotonic);
+        }
         self.envelope = Some(output);
         self.reallocate(output.target_media_payload_rate);
         output.application_limited
@@ -417,6 +440,7 @@ impl MediaEgress {
         self.repair_requests.clear();
         self.pending = None;
         self.probe_remaining = 0;
+        self.probe_started_at = None;
     }
 
     pub(crate) fn stats(&self) -> (EgressStats, Vec<SenderStats>) {
@@ -741,8 +765,15 @@ impl MediaEgress {
                 if twcc.is_some() {
                     self.next_twcc = self.next_twcc.saturating_add(1);
                 }
+                if self.probe_started_at.is_none() {
+                    self.probe_started_at = Some(at.monotonic);
+                    self.probe_start_queue_delay = self
+                        .envelope
+                        .map_or(Duration::ZERO, |envelope| envelope.queue_delay);
+                }
                 self.probe_remaining = self.probe_remaining.saturating_sub(1);
                 if self.probe_remaining == 0 {
+                    self.probe_started_at = None;
                     self.last_probe = Some(at.monotonic);
                     if self.probe_history.len() == 64 {
                         self.probe_history.pop_front();
@@ -780,6 +811,8 @@ impl MediaEgress {
                 .any(|sender| sender.committed_packets > 0)
                 .then_some(self.next_rtcp),
             probe_deadline,
+            self.probe_started_at
+                .and_then(|started| started.checked_add(Duration::from_millis(20))),
         ]
         .into_iter()
         .flatten()
@@ -1268,6 +1301,13 @@ impl MediaEgress {
         bytes_in_flight: u64,
         transport: &mut Transport,
     ) -> PrepareResult {
+        if self.probe_started_at.is_some_and(|started| {
+            at.monotonic.saturating_duration_since(started) >= Duration::from_millis(20)
+        }) {
+            self.probe_remaining = 0;
+            self.probe_started_at = None;
+            self.last_probe = Some(at.monotonic);
+        }
         if !self.path_available {
             return PrepareResult::Blocked;
         }
@@ -1339,7 +1379,11 @@ impl MediaEgress {
             return PrepareResult::Fatal;
         };
         if !self.fits_send_window(bytes_in_flight, packet.len()) {
+            if self.probe_started_at.is_some() {
+                self.last_probe = Some(at.monotonic);
+            }
             self.probe_remaining = 0;
+            self.probe_started_at = None;
             return PrepareResult::Blocked;
         }
         if !self.probe_budget_available(
@@ -1586,6 +1630,43 @@ mod tests {
         assert_eq!(egress.emitted_rtp.len(), MAX_PROBE_ACCOUNTING);
         assert!(!egress.probe_budget_available(now, 1));
         assert!(egress.probe_budget_available(now + PROBE_WINDOW, PROBE_ALLOWANCE));
+    }
+
+    #[test]
+    fn active_probe_deadline_wakes_the_connection_for_cluster_expiry() {
+        let now = Instant::now();
+        let policy = SenderPolicy {
+            playout_delay: PlayoutDelay::from_ticks(0, 0).expect("asap"),
+            priority: MediaPriority::MEDIUM,
+            desired_bitrate: MediaPayloadBitrate::from_bps(0),
+        };
+        let mut egress = MediaEgress::new(
+            Vec::new().into_boxed_slice(),
+            &[0; 32],
+            1,
+            1,
+            policy,
+            policy,
+            now,
+        );
+        egress.probe_remaining = 4;
+        egress.probe_started_at = Some(now);
+        assert_eq!(
+            egress.next_deadline(),
+            now.checked_add(Duration::from_millis(20))
+        );
+        egress.update_controller(
+            TimePoint {
+                monotonic: now + Duration::from_millis(1),
+                global: GlobalMediaTime::from_micros(1),
+            },
+            Some((1, true)),
+            &[],
+            Duration::ZERO,
+            false,
+            0,
+        );
+        assert_eq!(egress.probe_started_at, None, "path reset cancels cluster");
     }
 
     #[test]
