@@ -92,7 +92,30 @@ function copyConfig(config: AgentConfig): RuntimeConfig {
   });
 }
 
+function assertUint32(field: string, value: number): void {
+  if (!Number.isInteger(value) || value < 0 || value > 0xffff_ffff) {
+    throw Object.assign(new RangeError(`${field} must be a uint32 integer`), {
+      code: "INVALID_UINT32_OPTION",
+      field,
+    });
+  }
+}
+
 function copyState(state: AgentState): AgentState {
+  for (const [index, demand] of (state.video ?? []).entries()) {
+    for (const field of [
+      "height",
+      "minHeight",
+      "minFps",
+      "priority",
+    ] as const) {
+      assertUint32(`video[${index}].${field}`, demand[field]);
+    }
+  }
+  if (state.playoutDelay) {
+    assertUint32("playoutDelay.minMs", state.playoutDelay.minMs);
+    assertUint32("playoutDelay.maxMs", state.playoutDelay.maxMs);
+  }
   return Object.freeze({
     connected: state.connected,
     publications: Object.freeze(
@@ -238,7 +261,8 @@ class AgentFacade implements Agent {
 
   setState(state: AgentState): void {
     if (this.#closed) return;
-    this.#state = copyState(state);
+    const next = copyState(state);
+    this.#state = next;
     if (!this.#runtime) {
       if (this.#snapshot.connection === "terminal-failure") return;
       this.#publish(

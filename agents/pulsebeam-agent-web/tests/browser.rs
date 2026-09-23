@@ -31,6 +31,7 @@ struct Public {
     config_copied: bool,
     initial_stable: bool,
     initial_frozen: bool,
+    number_validation_atomic: bool,
     initial: String,
     latest_only: bool,
     close_before_settlement: bool,
@@ -137,6 +138,7 @@ async fn web(server: &StaticServer, failure: bool) -> TestResult<()> {
                     && result.config_copied
                     && result.initial_stable
                     && result.initial_frozen
+                    && result.number_validation_atomic
                     && result.latest_only
                     && result.close_before_settlement
                     && result.local_operations

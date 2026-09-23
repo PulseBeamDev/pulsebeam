@@ -42,6 +42,44 @@ globalThis.__pulsebeamPublic = (async () => {
     Object.isFrozen(initial.publications) &&
     Object.isFrozen(initial.tracks) &&
     Object.isFrozen(initial.topics);
+  const invalidNumbers = [NaN, Infinity, -1, 1.5, 0x1_0000_0000];
+  const numberValidationAtomic = invalidNumbers.every((value) => {
+    try {
+      first.setState({
+        connected: true,
+        publications: [{ slot: "camera", active: true }],
+        video: [
+          {
+            slot: 0,
+            trackId: "track",
+            height: value,
+            minHeight: 0,
+            minFps: 0,
+            priority: 0,
+          },
+        ],
+      });
+      return false;
+    } catch (error) {
+      return (
+        error.code === "INVALID_UINT32_OPTION" &&
+        error.field === "video[0].height" &&
+        first.getSnapshot() === initial
+      );
+    }
+  });
+  let delayValidationAtomic = false;
+  try {
+    first.setState({
+      connected: true,
+      playoutDelay: { mode: "fixed", minMs: 0, maxMs: Infinity },
+    });
+  } catch (error) {
+    delayValidationAtomic =
+      error.code === "INVALID_UINT32_OPTION" &&
+      error.field === "playoutDelay.maxMs" &&
+      first.getSnapshot() === initial;
+  }
 
   second.close();
   const publications = [{ slot: "camera", active: true }];
@@ -170,6 +208,7 @@ globalThis.__pulsebeamPublic = (async () => {
     configCopied: endpointReads === 1 && tokenReads === 1,
     initialStable,
     initialFrozen,
+    numberValidationAtomic: numberValidationAtomic && delayValidationAtomic,
     initial: initial.connection,
     latestOnly:
       latestOnly &&
