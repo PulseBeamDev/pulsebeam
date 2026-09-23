@@ -386,18 +386,19 @@ or mutate it.
 
 ### Inputs
 
-The core consumes:
+The connection's adapter receives committed RTP identities, transport sizes,
+packet classes, normalized feedback, selected-path state, current RTP bytes in
+flight, paced queue state, offered/admitted media rates, and aggregate desired
+rate. It derives feedback freshness, report timing, confidence, application-
+limited state, and the draft's application maximum target bitrate outside the
+core.
 
-- committed RTP data-unit time, transport size, transport/RTP identity, and class;
-- normalized packet arrival/loss and valid ECN marks;
-- feedback receipt time and estimated receiver feedback hold;
-- current RTP bytes-in-flight and paced RTP queue state;
-- selected-path changes and network availability;
-- aggregate offered/admitted RTP media-payload rate;
-- aggregate SFU desired media-payload rate;
-
-Per-sender priority, frame IDs, source selection, SCTP sequence/SACK state, and
-raw playout ranges are not SCReAM inputs.
+The isolated SCReAM core receives accepted arrival/loss evidence, ACK-edge
+credit, committed send evidence, RTT/feedback hold, RTP bytes in flight, path
+reset, ECN mode (disabled in production), and the application maximum target
+bitrate. Per-sender priority, frame IDs, source selection, SCTP sequence/SACK
+state, raw playout ranges, and the adapter's offered/admitted media rates are
+not SCReAM core inputs.
 
 ### Delay model
 
