@@ -633,8 +633,11 @@ fn production_two_sender_allocation_matches_payload_service() {
             .iter()
             .map(|(_, bytes)| *bytes)
             .sum::<u64>(),
-        stats.connection.transmitted_rtp_bytes,
-        "all emitted nonprobe RTP delivered"
+        stats
+            .connection
+            .transmitted_rtp_bytes
+            .saturating_add(stats.connection.transmitted_padding_bytes),
+        "all emitted RTP including probes delivered"
     );
     let delivered = [0, 1].map(|i| stats.senders[i].transmitted_payload_bytes - payload_start[i]);
     eprintln!(

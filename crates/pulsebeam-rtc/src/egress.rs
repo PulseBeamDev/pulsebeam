@@ -71,6 +71,7 @@ pub(crate) struct MediaEgress {
     admitted_bytes: u64,
     offered_rate: u64,
     admitted_rate: u64,
+    rtp_bytes_in_flight: u64,
 }
 
 struct Sender {
@@ -233,6 +234,7 @@ impl MediaEgress {
             admitted_bytes: 0,
             offered_rate: 0,
             admitted_rate: 0,
+            rtp_bytes_in_flight: 0,
         };
         owner.reallocate(300_000_u64.min(desired));
         owner.events.clear();
@@ -375,6 +377,7 @@ impl MediaEgress {
                 ecn: EcnValidation::default(),
             },
         );
+        self.rtp_bytes_in_flight = bytes_in_flight;
         self.envelope = Some(output);
         self.reallocate(output.target_media_payload_rate);
         output.application_limited
@@ -483,7 +486,7 @@ impl MediaEgress {
         {
             return PrepareResult::Blocked;
         }
-        if let Some(result) = self.prepare_repair(at, transport) {
+        if let Some(result) = self.prepare_repair(at, bytes_in_flight, transport) {
             return result;
         }
 
@@ -499,7 +502,7 @@ impl MediaEgress {
             })
             .collect::<Vec<_>>();
         let Some(sender_index) = self.scheduler.select(&eligible, &self.allocations) else {
-            return self.prepare_padding(at, transport);
+            return self.prepare_padding(at, bytes_in_flight, transport);
         };
         let Some(queue_index) = self
             .queue
@@ -539,6 +542,9 @@ impl MediaEgress {
         ) else {
             return PrepareResult::Fatal;
         };
+        if !self.fits_send_window(bytes_in_flight, packet.len()) {
+            return PrepareResult::Blocked;
+        }
         match transport.send_rtp_with_service(&packet, RtpService::Original) {
             Ok(()) => {
                 self.pending = Some(PendingTransmit::Original {
@@ -557,6 +563,15 @@ impl MediaEgress {
     }
 
     pub(crate) fn preflight_commit(&self, prepared: &PreparedTransmit) -> bool {
+        if prepared.kind == DatagramKind::Rtp
+            && self.envelope.is_some_and(|envelope| {
+                self.rtp_bytes_in_flight
+                    .saturating_add(prepared.wire_len as u64)
+                    > envelope.max_rtp_bytes_in_flight
+            })
+        {
+            return false;
+        }
         match &self.pending {
             Some(PendingTransmit::Original {
                 sender,
@@ -1105,6 +1120,7 @@ impl MediaEgress {
     fn prepare_repair(
         &mut self,
         at: TimePoint,
+        bytes_in_flight: u64,
         transport: &mut Transport,
     ) -> Option<PrepareResult> {
         let (sender_index, original_sequence) = *self.repair_requests.front()?;
@@ -1136,6 +1152,9 @@ impl MediaEgress {
             sender.rtx_ssrc,
             false,
         )?;
+        if !self.fits_send_window(bytes_in_flight, packet.len()) {
+            return Some(PrepareResult::Blocked);
+        }
         let result = match transport.send_rtp_with_service(&packet, RtpService::Repair) {
             Ok(()) => {
                 self.pending = Some(PendingTransmit::Repair {
@@ -1198,6 +1217,15 @@ impl MediaEgress {
         self.emitted_rtp.push_back((at, bytes, probe));
     }
 
+    fn fits_send_window(&self, bytes_in_flight: u64, packet_len: usize) -> bool {
+        self.envelope.is_some_and(|envelope| {
+            bytes_in_flight.saturating_add(
+                u64::try_from(packet_len.saturating_add(RTP_TRANSPORT_ALLOWANCE))
+                    .unwrap_or(u64::MAX),
+            ) <= envelope.max_rtp_bytes_in_flight
+        })
+    }
+
     fn probe_budget_available(&self, at: Instant, bytes: u64) -> bool {
         if self.probe_disabled_until.is_some_and(|until| at < until) {
             return false;
@@ -1234,7 +1262,12 @@ impl MediaEgress {
         true
     }
 
-    fn prepare_padding(&mut self, at: TimePoint, transport: &mut Transport) -> PrepareResult {
+    fn prepare_padding(
+        &mut self,
+        at: TimePoint,
+        bytes_in_flight: u64,
+        transport: &mut Transport,
+    ) -> PrepareResult {
         if !self.path_available {
             return PrepareResult::Blocked;
         }
@@ -1305,6 +1338,10 @@ impl MediaEgress {
         ) else {
             return PrepareResult::Fatal;
         };
+        if !self.fits_send_window(bytes_in_flight, packet.len()) {
+            self.probe_remaining = 0;
+            return PrepareResult::Blocked;
+        }
         if !self.probe_budget_available(
             at.monotonic,
             packet.len().saturating_add(RTP_TRANSPORT_ALLOWANCE) as u64,
@@ -1549,6 +1586,32 @@ mod tests {
         assert_eq!(egress.emitted_rtp.len(), MAX_PROBE_ACCOUNTING);
         assert!(!egress.probe_budget_available(now, 1));
         assert!(egress.probe_budget_available(now + PROBE_WINDOW, PROBE_ALLOWANCE));
+    }
+
+    #[test]
+    fn send_window_reserves_the_complete_transport_packet() {
+        let now = Instant::now();
+        let policy = SenderPolicy {
+            playout_delay: PlayoutDelay::from_ticks(0, 50).expect("500 ms"),
+            priority: MediaPriority::MEDIUM,
+            desired_bitrate: MediaPayloadBitrate::from_bps(2_000_000),
+        };
+        let mut egress = MediaEgress::new(
+            Vec::new().into_boxed_slice(),
+            &[0; 32],
+            1,
+            1,
+            policy,
+            policy,
+            now,
+        );
+        egress.envelope = Some(egress.controller.snapshot(2_000_000, 0, 0));
+        let window = egress.envelope.expect("envelope").max_rtp_bytes_in_flight;
+        let window = usize::try_from(window).expect("bounded window");
+        assert!(window > RTP_TRANSPORT_ALLOWANCE);
+        assert!(egress.fits_send_window(0, window - RTP_TRANSPORT_ALLOWANCE));
+        assert!(!egress.fits_send_window(1, window - RTP_TRANSPORT_ALLOWANCE));
+        assert!(!egress.fits_send_window(u64::try_from(window - 1).unwrap(), 1));
     }
 
     #[test]

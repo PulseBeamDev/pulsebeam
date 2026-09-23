@@ -854,7 +854,18 @@ mod tests {
                 .iter()
                 .map(|(_, bytes)| *bytes)
                 .sum::<u64>(),
-            fixture.connection.stats().connection.transmitted_rtp_bytes,
+            fixture
+                .connection
+                .stats()
+                .connection
+                .transmitted_rtp_bytes
+                .saturating_add(
+                    fixture
+                        .connection
+                        .stats()
+                        .connection
+                        .transmitted_padding_bytes
+                ),
             "only delivered RTP may enter queue percentiles"
         );
         let stable_start = start + Duration::from_secs(2);

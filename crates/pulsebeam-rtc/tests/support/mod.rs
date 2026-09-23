@@ -686,31 +686,32 @@ impl PeerFixture {
                     self.network.last_committed_padding_bytes = stats.transmitted_padding_bytes;
                     if rtp_bytes != 0 {
                         self.network.emitted_rtp.push((self.now, rtp_bytes, false));
-                        if let (Some(reader), Some(rate)) =
-                            (self.native_target, self.network.bottleneck_bps)
-                        {
-                            let service = Duration::from_nanos(
-                                u64::try_from(
-                                    (u128::from(rtp_bytes) * 8_000_000_000)
-                                        .div_ceil(u128::from(rate)),
-                                )
-                                .unwrap_or(u64::MAX),
-                            );
-                            let departure = self
-                                .network
-                                .shared_departure
-                                .as_ref()
-                                .map_or(self.network.next_departure, |shared| *shared.borrow())
-                                .unwrap_or(self.now);
-                            self.network.rtp_queue_samples.push((
-                                self.now,
-                                departure.saturating_duration_since(self.now).max(service),
-                                reader(&self.connection),
-                            ));
-                        }
                     }
                     if padding != 0 {
                         self.network.emitted_rtp.push((self.now, padding, true));
+                    }
+                    let rtp_bytes = rtp_bytes.saturating_add(padding);
+                    if rtp_bytes != 0
+                        && let (Some(reader), Some(rate)) =
+                            (self.native_target, self.network.bottleneck_bps)
+                    {
+                        let service = Duration::from_nanos(
+                            u64::try_from(
+                                (u128::from(rtp_bytes) * 8_000_000_000).div_ceil(u128::from(rate)),
+                            )
+                            .unwrap_or(u64::MAX),
+                        );
+                        let departure = self
+                            .network
+                            .shared_departure
+                            .as_ref()
+                            .map_or(self.network.next_departure, |shared| *shared.borrow())
+                            .unwrap_or(self.now);
+                        self.network.rtp_queue_samples.push((
+                            self.now,
+                            departure.saturating_duration_since(self.now).max(service),
+                            reader(&self.connection),
+                        ));
                     }
                     self.network.enqueue(PendingPacket::Peer {
                         due,
