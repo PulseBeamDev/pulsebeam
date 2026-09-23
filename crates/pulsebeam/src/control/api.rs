@@ -113,6 +113,14 @@ impl IntoResponse for ApiError {
                 HeaderValue::from_static("Bearer error=\"invalid_token\"")
             }
         });
+        let problem_type = if matches!(
+            self,
+            Self::JoinError(controller::ControllerError::Superseded)
+        ) {
+            "urn:pulsebeam:error:superseded"
+        } else {
+            "about:blank"
+        };
         let detail = if status == StatusCode::UNAUTHORIZED {
             title.to_owned()
         } else {
@@ -122,7 +130,7 @@ impl IntoResponse for ApiError {
             status,
             [(CONTENT_TYPE, "application/problem+json")],
             Json(Problem {
-                r#type: "about:blank",
+                r#type: problem_type,
                 title,
                 status: status.as_u16(),
                 detail,
@@ -294,7 +302,7 @@ fn validate_strict_directions(offer: &str, required: &str) -> Result<(), ApiErro
             headers(("Location" = String, description = "Absolute native resource URL"))),
         (status = 400, description = "Invalid request or SDP", body = Problem, content_type = "application/problem+json"),
         (status = 401, description = "Invalid bearer authorization", body = Problem, content_type = "application/problem+json"),
-        (status = 409, description = "Candidate was superseded", body = Problem, content_type = "application/problem+json"),
+        (status = 409, description = "Superseded attempt (problem type urn:pulsebeam:error:superseded)", body = Problem, content_type = "application/problem+json"),
         (status = 413, description = "Request body is too large", body = Problem, content_type = "application/problem+json"),
         (status = 429, description = "Controller is busy", body = Problem, content_type = "application/problem+json"),
         (status = 500, description = "Internal server error", body = Problem, content_type = "application/problem+json"),
@@ -1549,13 +1557,18 @@ mod tests {
         );
     }
 
-    #[test]
-    fn superseded_candidates_are_conflicts() {
-        assert_eq!(
-            ApiError::JoinError(controller::ControllerError::Superseded)
-                .into_response()
-                .status(),
-            StatusCode::CONFLICT
-        );
+    #[tokio::test]
+    async fn superseded_candidates_are_machine_readable_conflicts() {
+        let response = ApiError::JoinError(controller::ControllerError::Superseded).into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = to_bytes(response.into_body(), 4096).await.unwrap();
+        let problem: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(problem["type"], "urn:pulsebeam:error:superseded");
+        assert_eq!(problem["status"], 409);
+
+        let response = ApiError::AuthorizationRequired.into_response();
+        let body = to_bytes(response.into_body(), 4096).await.unwrap();
+        let problem: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(problem["type"], "about:blank");
     }
 }
