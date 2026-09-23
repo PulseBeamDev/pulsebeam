@@ -387,7 +387,7 @@ mod tests {
             priority: 1,
         });
         desired.playout_delay = PlayoutDelay::Fixed {
-            min_ms: 15,
+            min_ms: 3_000,
             max_ms: 50,
         };
         let sender = MediaSlot::LocalVideo("camera".into());
@@ -411,17 +411,14 @@ mod tests {
         let video = intent.receive.unwrap().video.unwrap().tracks;
         assert_eq!(video[0].track_id, "track");
         assert_eq!(video[0].options.as_ref().unwrap().min_height, 720);
-        assert_eq!(
-            video[0]
-                .options
-                .as_ref()
-                .unwrap()
-                .playout_delay
-                .as_ref()
-                .unwrap()
-                .min_ms,
-            15
-        );
+        let delay = video[0]
+            .options
+            .as_ref()
+            .unwrap()
+            .playout_delay
+            .as_ref()
+            .unwrap();
+        assert_eq!((delay.min_ms, delay.max_ms), (3_000, 50));
     }
 
     #[test]

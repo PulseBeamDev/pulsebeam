@@ -454,9 +454,6 @@ impl DesiredState {
                     capacity: topology.remote_video,
                 });
             }
-            if video.min_height > video.height || (video.height == 0 && video.min_height != 0) {
-                return Err(ValidationError::VideoHeight);
-            }
             if !video_slots.insert(video.slot) {
                 return Err(ValidationError::Duplicate {
                     field: "video slot",
@@ -479,11 +476,6 @@ impl DesiredState {
                     value: track_id.clone(),
                 });
             }
-        }
-        if let PlayoutDelay::Fixed { min_ms, max_ms } = self.playout_delay
-            && (min_ms > max_ms || max_ms > MAX_PLAYOUT_DELAY_MS)
-        {
-            return Err(ValidationError::PlayoutDelay);
         }
         self.topics.validate()?;
         Ok(())

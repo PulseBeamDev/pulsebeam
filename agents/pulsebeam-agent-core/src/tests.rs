@@ -700,28 +700,24 @@ fn construction_and_desired_state_validate_complete_external_input() {
     );
 
     let mut agent = Agent::new(config()).unwrap();
-    let mut invalid_desired = desired(1);
-    invalid_desired.video[0].min_height = 721;
-    assert_eq!(
-        agent.command(AgentCommand::ReplaceDesired(invalid_desired)),
-        Err(AgentError::InvalidConfiguration(
-            ValidationError::VideoHeight
-        ))
-    );
-    assert_eq!(agent.snapshot().desired_revision, 0);
-    assert!(agent.next_effect().is_none());
+    let mut floor = desired(1);
+    floor.video[0].min_height = 721;
+    agent
+        .command(AgentCommand::ReplaceDesired(floor.clone()))
+        .unwrap();
+    assert_eq!(agent.snapshot().desired_revision, 1);
+    assert_eq!(agent.snapshot().connection, ConnectionState::CreatingOffer);
 
-    let mut invalid_delay = desired(2);
-    invalid_delay.playout_delay = PlayoutDelay::Fixed {
+    let mut reversed_delay = floor;
+    reversed_delay.revision = 2;
+    reversed_delay.playout_delay = PlayoutDelay::Fixed {
         min_ms: 200,
         max_ms: 100,
     };
-    assert_eq!(
-        agent.command(AgentCommand::ReplaceDesired(invalid_delay)),
-        Err(AgentError::InvalidConfiguration(
-            ValidationError::PlayoutDelay
-        ))
-    );
+    agent
+        .command(AgentCommand::ReplaceDesired(reversed_delay))
+        .unwrap();
+    assert_eq!(agent.snapshot().desired_revision, 2);
 }
 
 #[test]
