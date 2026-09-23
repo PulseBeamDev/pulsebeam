@@ -364,6 +364,233 @@ fn production_two_megabit_single_flow_capacity() {
 }
 
 #[test]
+fn production_homogeneous_shared_bottleneck_competition() {
+    let shared = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let mut flows = vec![PeerFixture::connected(), PeerFixture::connected()];
+    let mut sources = vec![PeerFixture::connected(), PeerFixture::connected()];
+    for (index, flow) in flows.iter_mut().enumerate() {
+        flow.configure_network(
+            0x3301 + index as u64,
+            NetworkPolicy {
+                delay: Duration::from_millis(25),
+                ..NetworkPolicy::default()
+            },
+        );
+        flow.configure_bottleneck(4_000_000);
+        flow.share_bottleneck_departure(shared.clone());
+        flow.configure_time_quantum(Duration::from_millis(2));
+        let mut policy = ConnectionConfig::default().default_audio_policy;
+        policy.desired_bitrate = MediaPayloadBitrate::from_bps(4_000_000);
+        policy.playout_delay = PlayoutDelay::from_ticks(0, 50).expect("500ms playout");
+        flow.connection
+            .command(
+                flow.at(),
+                Command::SetSenderPolicy {
+                    sender: flow.sender,
+                    policy,
+                },
+            )
+            .expect("demand policy");
+    }
+    for source in &mut sources {
+        source.configure_time_quantum(Duration::from_millis(2));
+    }
+    let start = flows.iter().map(|flow| flow.at().monotonic).max().unwrap();
+    for id in 1..=6_000_u64 {
+        let tick = start + Duration::from_millis(id * 2);
+        for (flow, source) in flows.iter_mut().zip(sources.iter_mut()) {
+            flow.drive_for(tick.saturating_duration_since(flow.at().monotonic));
+            source.drive_for(tick.saturating_duration_since(source.at().monotonic));
+            let media = forwarded(source.send_source(&[0x5a; PAYLOAD_BYTES]), id);
+            match flow.connection.command(
+                flow.at(),
+                Command::SendMedia {
+                    sender: flow.sender,
+                    media,
+                },
+            ) {
+                Ok(()) | Err(CommandError::WouldBlock) => {}
+                Err(error) => panic!("shared-flow admission: {error:?}"),
+            }
+        }
+    }
+    for flow in &mut flows {
+        flow.drive_for(
+            (start + Duration::from_secs(12)).saturating_duration_since(flow.at().monotonic),
+        );
+    }
+    let end = flows.iter().map(|flow| flow.at().monotonic).min().unwrap();
+    let stable_start = start + Duration::from_secs(2);
+    for flow in &mut flows {
+        flow.drive_for(Duration::from_secs(2));
+    }
+    let emitted: [u64; 2] = std::array::from_fn(|index| {
+        assert_probe_windows(flows[index].emitted_rtp());
+        flows[index]
+            .emitted_rtp()
+            .iter()
+            .filter(|(at, _, _)| *at >= stable_start && *at < end)
+            .map(|(_, bytes, _)| *bytes)
+            .sum()
+    });
+    let delivered: [u64; 2] = std::array::from_fn(|index| {
+        flows[index]
+            .delivered_rtp()
+            .iter()
+            .filter(|(at, _)| *at >= stable_start && *at < end)
+            .map(|(_, bytes)| *bytes)
+            .sum::<u64>()
+    });
+    let combined = delivered.iter().sum::<u64>();
+    let service = 4_000_000_u128 * end.duration_since(stable_start).as_micros() / 8_000_000;
+    eprintln!(
+        "competition seed=0x3301/0x3302 delivered={delivered:?} service={service} duration={:?} end_skew={:?} targets={:?} emitted={:?}",
+        end.duration_since(stable_start),
+        flows[0]
+            .at()
+            .monotonic
+            .max(flows[1].at().monotonic)
+            .duration_since(flows[0].at().monotonic.min(flows[1].at().monotonic)),
+        flows
+            .iter()
+            .map(|flow| flow
+                .connection
+                .stats()
+                .connection
+                .target_media_bitrate
+                .as_bps())
+            .collect::<Vec<_>>(),
+        flows
+            .iter()
+            .map(|flow| flow.connection.stats().connection.transmitted_rtp_bytes)
+            .collect::<Vec<_>>()
+    );
+    assert!(end.duration_since(stable_start) >= Duration::from_secs(10));
+    assert_eq!(delivered, emitted, "both emission cohorts must drain");
+    assert!(u128::from(combined) * 100 >= service * 85);
+    for bytes in delivered {
+        assert!(u128::from(bytes) * 100 >= u128::from(combined) * 40);
+        assert!(u128::from(bytes) * 100 <= u128::from(combined) * 60);
+    }
+}
+
+#[test]
+fn production_two_sender_allocation_matches_payload_service() {
+    let mut fixture = PeerFixture::connected_with_senders(2);
+    fixture.configure_network(
+        0x4401,
+        NetworkPolicy {
+            delay: Duration::from_millis(25),
+            ..NetworkPolicy::default()
+        },
+    );
+    fixture.configure_bottleneck(2_000_000);
+    fixture.configure_time_quantum(Duration::from_millis(2));
+    for sender in &fixture.senders {
+        let mut policy = ConnectionConfig::default().default_audio_policy;
+        policy.desired_bitrate = MediaPayloadBitrate::from_bps(4_000_000);
+        policy.playout_delay = PlayoutDelay::from_ticks(0, 50).expect("500ms playout");
+        fixture
+            .connection
+            .command(
+                fixture.at(),
+                Command::SetSenderPolicy {
+                    sender: *sender,
+                    policy,
+                },
+            )
+            .expect("sender demand");
+    }
+    let mut sources = vec![PeerFixture::connected(), PeerFixture::connected()];
+    for source in &mut sources {
+        source.configure_time_quantum(Duration::from_millis(2));
+    }
+    let start = fixture.at().monotonic;
+    let mut previous_at = start + Duration::from_secs(2);
+    let mut integrated = [0_u128; 2];
+    let mut payload_start = [0_u64; 2];
+    let mut admitted = [0_u64; 2];
+    let mut blocked = [0_u64; 2];
+    for id in 1..=6_000_u64 {
+        let tick = start + Duration::from_millis(id * 2);
+        fixture.drive_for(tick.saturating_duration_since(fixture.at().monotonic));
+        let first = usize::try_from(id % 2).unwrap_or_default();
+        for index in [first, 1 - first] {
+            let source = &mut sources[index];
+            source.drive_for(tick.saturating_duration_since(source.at().monotonic));
+            let media = forwarded(source.send_source(&[0x5a; PAYLOAD_BYTES]), id);
+            match fixture.try_command(Command::SendMedia {
+                sender: fixture.senders[index],
+                media,
+            }) {
+                Ok(()) => admitted[index] += 1,
+                Err(CommandError::WouldBlock) => blocked[index] += 1,
+                Err(error) => panic!("two-sender admission: {error:?}"),
+            }
+        }
+        let now = fixture.at().monotonic;
+        let stats = fixture.connection.stats();
+        if now < previous_at {
+            for (index, sender) in stats.senders.iter().enumerate() {
+                payload_start[index] = sender.transmitted_payload_bytes;
+            }
+        } else {
+            let dt = now.saturating_duration_since(previous_at).as_micros();
+            for (index, sender) in stats.senders.iter().enumerate() {
+                integrated[index] += u128::from(sender.allocation.as_bps()) * dt;
+            }
+            previous_at = now;
+        }
+    }
+    assert!(
+        fixture
+            .at()
+            .monotonic
+            .duration_since(start + Duration::from_secs(2))
+            >= Duration::from_secs(10)
+    );
+    fixture.drive_for(Duration::from_secs(2));
+    let stats = fixture.connection.stats();
+    assert_eq!(
+        fixture.network_counters().1,
+        0,
+        "loss-free allocation fixture"
+    );
+    assert_eq!(
+        fixture
+            .delivered_rtp()
+            .iter()
+            .map(|(_, bytes)| *bytes)
+            .sum::<u64>(),
+        stats.connection.transmitted_rtp_bytes,
+        "all emitted nonprobe RTP delivered"
+    );
+    let delivered = [0, 1].map(|i| stats.senders[i].transmitted_payload_bytes - payload_start[i]);
+    eprintln!(
+        "two-sender seed=0x4401 admitted={admitted:?} blocked={blocked:?} integrated_allocation={integrated:?} payload={delivered:?} end_stats={:?}",
+        stats
+            .senders
+            .iter()
+            .map(|sender| (
+                sender.transmitted_packets,
+                sender.queued_packets,
+                sender.allocation.as_bps()
+            ))
+            .collect::<Vec<_>>()
+    );
+    let total = integrated.iter().sum::<u128>();
+    let total_payload = delivered.iter().sum::<u64>();
+    assert!(total > 0 && total_payload > 0);
+    for value in integrated {
+        assert!(value * 100 >= total * 45 && value * 100 <= total * 55);
+    }
+    for value in delivered {
+        assert!(u128::from(value) * 100 >= u128::from(total_payload) * 45);
+        assert!(u128::from(value) * 100 <= u128::from(total_payload) * 55);
+    }
+}
+
+#[test]
 fn fixed_system_matrix() {
     assert_eq!(PAYLOAD_BYTES, 1_000);
     assert_eq!(FEEDBACK_INTERVAL, Duration::from_millis(50));

@@ -19,11 +19,11 @@ use std::{
 
 use bytes::Bytes;
 use pulsebeam_rtc::{
-    Command, Connection, ConnectionConfig, ConnectionEntropy, ConnectionLimits, DataChannelEvent,
-    DataChannelId, DataMessage, Event as ConnectionEvent, ForwardedMedia, FrameBoundary,
-    FrameDependencies, FrameId, FrameMetadata, GlobalMediaTime, IceTcpFlowId, LocalCandidate,
-    MediaPacket, MediaPayloadBitrate, NetworkInput, Output as ConnectionOutput, SdpOffer, SenderId,
-    TimePoint, TransmitTarget,
+    Command, CommandError, Connection, ConnectionConfig, ConnectionEntropy, ConnectionLimits,
+    DataChannelEvent, DataChannelId, DataMessage, Event as ConnectionEvent, ForwardedMedia,
+    FrameBoundary, FrameDependencies, FrameId, FrameMetadata, GlobalMediaTime, IceTcpFlowId,
+    LocalCandidate, MediaPacket, MediaPayloadBitrate, NetworkInput, Output as ConnectionOutput,
+    SdpOffer, SenderId, TimePoint, TransmitTarget,
 };
 use str0m_reference::{
     Candidate, Event, Input, Output, Rtc,
@@ -112,6 +112,7 @@ struct DeterministicNetwork {
     emitted_rtp: Vec<(Instant, u64, bool)>,
     delivered_rtp: Vec<(Instant, u64)>,
     time_quantum: Option<Duration>,
+    shared_departure: Option<std::rc::Rc<std::cell::RefCell<Option<Instant>>>>,
 }
 
 impl DeterministicNetwork {
@@ -343,6 +344,13 @@ impl PeerFixture {
         self.network.time_quantum = Some(quantum);
     }
 
+    pub fn share_bottleneck_departure(
+        &mut self,
+        departure: std::rc::Rc<std::cell::RefCell<Option<Instant>>>,
+    ) {
+        self.network.shared_departure = Some(departure);
+    }
+
     pub fn configure_bottleneck(&mut self, bits_per_second: u64) {
         assert!(bits_per_second > 0);
         self.network.bottleneck_bps = Some(bits_per_second);
@@ -457,10 +465,15 @@ impl PeerFixture {
     }
 
     pub fn command(&mut self, command: Command) {
-        self.connection
-            .command(self.at(), command)
-            .expect("connection command");
-        self.connection_idle = false;
+        self.try_command(command).expect("connection command");
+    }
+
+    pub fn try_command(&mut self, command: Command) -> Result<(), CommandError> {
+        let result = self.connection.command(self.at(), command);
+        if result.is_ok() {
+            self.connection_idle = false;
+        }
+        result
     }
 
     pub fn peer_send(&mut self, binary: bool, payload: &[u8]) {
@@ -622,7 +635,9 @@ impl PeerFixture {
                     let due = if let Some(rate) = self.network.bottleneck_bps {
                         let departure = self
                             .network
-                            .next_departure
+                            .shared_departure
+                            .as_ref()
+                            .map_or(self.network.next_departure, |shared| *shared.borrow())
                             .unwrap_or(self.now)
                             .max(self.now);
                         let nanos = (payload.len() as u128)
@@ -631,7 +646,11 @@ impl PeerFixture {
                         let service =
                             Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX));
                         let end = departure.checked_add(service).expect("bottleneck clock");
-                        self.network.next_departure = Some(end);
+                        if let Some(shared) = &self.network.shared_departure {
+                            *shared.borrow_mut() = Some(end);
+                        } else {
+                            self.network.next_departure = Some(end);
+                        }
                         self.network
                             .queue_sojourn
                             .push(end.saturating_duration_since(self.now));
