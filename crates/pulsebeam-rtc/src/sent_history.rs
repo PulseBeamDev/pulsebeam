@@ -144,7 +144,6 @@ struct SsrcHistory {
     highest_acked_sequence: Option<u64>,
     sent_ids: VecDeque<SentPacketId>,
     last_report_timestamp: Option<i64>,
-    last_report_count: Option<i64>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -343,7 +342,6 @@ impl SentHistory {
         self.reordering_window = INITIAL_REORDERING_WINDOW;
         for ssrc in &mut self.ssrcs {
             ssrc.last_report_timestamp = None;
-            ssrc.last_report_count = None;
             ssrc.highest_acked_sequence = None;
             ssrc.sent_ids.clear();
         }
@@ -361,7 +359,6 @@ impl SentHistory {
             highest_acked_sequence: None,
             sent_ids: VecDeque::new(),
             last_report_timestamp: None,
-            last_report_count: None,
         });
         self.ssrcs.len() - 1
     }

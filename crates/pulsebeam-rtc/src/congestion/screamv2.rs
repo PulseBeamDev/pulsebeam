@@ -917,6 +917,38 @@ mod tests {
     }
 
     #[test]
+    fn classic_ecn_reaction_uses_revision_one_beta() {
+        let mut cc = ScreamV2::new(4_000_000, None);
+        cc.ref_wnd = 20_000;
+        let marked = [sample(25, true, true, false, true)];
+        let mut values = input(&marked, 4_000_000);
+        values.ecn_mode = EcnMode::Classic;
+        let output = cc.update(Duration::from_millis(25), values);
+        assert_eq!(
+            output.reference_window,
+            mul_fixed(20_000, PROFILE.classic_ecn_beta)
+        );
+        assert_eq!(output.reason, ControllerReason::ClassicEcn);
+        assert_eq!(cc.debug_accumulated_acks(), (1_000, 1_000));
+    }
+
+    #[test]
+    fn l4s_reaction_halves_persistent_alpha() {
+        let mut cc = ScreamV2::new(4_000_000, None);
+        cc.ref_wnd = 20_000;
+        cc.qdelay = cc.qdelay_target / 2;
+        cc.s_rtt = PROFILE.virtual_rtt;
+        cc.l4s_alpha = ONE / 4;
+        cc.pending_ce = true;
+        let mut values = input(&[], 4_000_000);
+        values.ecn_mode = EcnMode::L4s;
+        let output = cc.update(Duration::from_millis(25), values);
+        assert_eq!(output.reference_window, mul_fixed(20_000, ONE - ONE / 8));
+        assert_eq!(output.reason, ControllerReason::L4s);
+        assert_eq!(cc.l4s_alpha, ONE / 4);
+    }
+
+    #[test]
     fn lingering_l4s_alpha_without_a_fresh_mark_does_not_backoff_again() {
         let mut cc = ScreamV2::new(4_000_000, None);
         cc.ref_wnd = 20_000;

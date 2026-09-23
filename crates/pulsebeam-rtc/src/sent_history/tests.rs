@@ -38,6 +38,46 @@ fn batch(now: Instant, epoch: PathEpoch, statuses: Vec<TwccStatus>) -> FeedbackB
     }
 }
 
+proptest::proptest! {
+    #[test]
+    fn received_edge_credit_is_once_only_across_gaps_and_overlap(
+        received in proptest::collection::vec(proptest::bool::ANY, 1..128)
+    ) {
+        let now = Instant::now();
+        let epoch = PathEpoch::from_value(35);
+        let mut history = SentHistory::new(PacketFeedbackKind::TransportWide);
+        history.path_changed(epoch, true);
+        for sequence in 1..=received.len() {
+            history.commit(context(now, epoch, u16::try_from(sequence).unwrap())).unwrap();
+        }
+        let first = received.iter().map(|received| if *received {
+            TwccStatus::Received { delta_250us: 1 }
+        } else {
+            TwccStatus::NotReceived
+        }).collect::<Vec<_>>();
+        history.process_feedback(batch(now + Duration::from_millis(10), epoch, first));
+        let first_credit = history.inputs.feedback.iter().filter(|sample| sample.newly_acked).count();
+        history.clear_controller_inputs();
+        history.process_feedback(FeedbackBatch {
+            received_at: at(now + Duration::from_millis(20)),
+            path_epoch: epoch,
+            sender_ssrc: 9,
+            report: FeedbackReport::Twcc {
+                media_ssrc: 7,
+                base_sequence: 1,
+                reference_time: 0,
+                feedback_count: 2,
+                statuses: vec![TwccStatus::Received { delta_250us: 1 }; received.len()].into(),
+            },
+        });
+        let second_credit = history.inputs.feedback.iter().filter(|sample| sample.newly_acked).count();
+        proptest::prop_assert_eq!(first_credit + second_credit, received.len());
+        proptest::prop_assert_eq!(history.bytes_in_flight, 0);
+        proptest::prop_assert_eq!(history.counters.received, received.len() as u64);
+        proptest::prop_assert!(history.inputs.feedback.len() <= MAX_FEEDBACK_STATUSES);
+    }
+}
+
 #[test]
 fn ack_edge_retires_missing_bytes_but_defers_loss() {
     let now = Instant::now();
@@ -327,6 +367,34 @@ fn all_missing_rfc8888_report_does_not_advance_either_ssrc() {
     assert_eq!(history.ssrcs[0].highest_acked_sequence, None);
     assert_eq!(history.ssrcs[1].highest_acked_sequence, None);
     assert!(history.inputs.fresh_network_feedback);
+}
+
+#[test]
+fn rfc8888_freshness_follows_report_time_not_status_count() {
+    let now = Instant::now();
+    let epoch = PathEpoch::from_value(34);
+    let mut history = SentHistory::new(PacketFeedbackKind::Rfc8888);
+    history.path_changed(epoch, true);
+    history.commit(rfc_context(now, epoch, 1)).unwrap();
+    for (timestamp, expected) in [(1, true), (1, false), (2, true)] {
+        history.clear_controller_inputs();
+        history.process_feedback(FeedbackBatch {
+            received_at: at(now + Duration::from_millis(timestamp as u64 * 10)),
+            path_epoch: epoch,
+            sender_ssrc: 9,
+            report: FeedbackReport::Rfc8888 {
+                reports: vec![crate::rtcp::Rfc8888Report {
+                    ssrc: 7,
+                    begin_sequence: 1,
+                    report_count: 1,
+                    statuses: vec![Rfc8888Status::NotReceived].into(),
+                }]
+                .into(),
+                report_timestamp: timestamp,
+            },
+        });
+        assert_eq!(history.inputs.fresh_network_feedback, expected);
+    }
 }
 
 #[test]

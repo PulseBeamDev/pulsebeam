@@ -381,11 +381,6 @@ impl SentHistory {
                 };
                 normalized.push(value);
             }
-            let count = unwrap_near_signed(
-                i64::from(report.report_count),
-                self.ssrcs[ssrc_index].last_report_count,
-                1 << 8,
-            );
             let late_receipt = normalized.iter().enumerate().any(|(offset, status)| {
                 status.0
                     && self
@@ -460,16 +455,10 @@ impl SentHistory {
             }
             let fresh = has_nonterminal
                 && (self.ssrcs[ssrc_index]
-                    .last_report_count
-                    .is_none_or(|previous| count > previous)
+                    .last_report_timestamp
+                    .is_none_or(|previous| timestamp > previous)
                     || late_receipt);
             self.inputs.fresh_network_feedback |= fresh;
-            if self.ssrcs[ssrc_index]
-                .last_report_count
-                .is_none_or(|previous| count > previous)
-            {
-                self.ssrcs[ssrc_index].last_report_count = Some(count);
-            }
             for (_, _, _, hold) in &normalized {
                 if let Some(hold) = hold {
                     minimum_hold = Some(minimum_hold.map_or(*hold, |known| known.min(*hold)));
