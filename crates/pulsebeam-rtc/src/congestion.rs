@@ -477,7 +477,16 @@ mod tests {
         cc.update(Duration::ZERO, base);
         cc.note_send(Duration::from_millis(1));
         cc.note_send(Duration::from_millis(499));
-        assert!(cc.update(Duration::from_millis(501), base).feedback_stale);
+        let stale = cc.update(Duration::from_millis(501), base);
+        assert!(stale.feedback_stale);
+        for millis in [1_000, 2_000, 5_000] {
+            let current = cc.update(Duration::from_millis(millis), base);
+            assert!(current.feedback_stale);
+            assert!(current.reference_window <= stale.reference_window);
+            assert!(current.target_media_payload_rate <= stale.target_media_payload_rate);
+            assert!(current.pacing_transport_rate <= stale.pacing_transport_rate);
+            assert!(!current.probe_permitted);
+        }
     }
 
     #[test]

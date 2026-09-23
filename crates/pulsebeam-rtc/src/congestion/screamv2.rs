@@ -992,6 +992,45 @@ mod tests {
     }
 
     #[test]
+    fn accepted_extreme_timestamps_and_sizes_saturate() {
+        let mut cc = ScreamV2::new(u64::MAX, Some(u32::MAX));
+        let feedback = [
+            FeedbackSample {
+                sent_at: Duration::MAX,
+                received_at: Duration::MAX,
+                transport_bytes: u32::MAX,
+                received: true,
+                newly_acked: true,
+                lost: false,
+                receiver_arrival_micros: Some(i64::MIN),
+                ecn: None,
+            },
+            FeedbackSample {
+                sent_at: Duration::ZERO,
+                received_at: Duration::MAX,
+                transport_bytes: u32::MAX,
+                received: true,
+                newly_acked: true,
+                lost: false,
+                receiver_arrival_micros: Some(i64::MAX),
+                ecn: None,
+            },
+        ];
+        let output = cc.update(
+            Duration::MAX,
+            ControllerInput {
+                feedback: &feedback,
+                feedback_hold: Duration::MAX,
+                growth_eligible: true,
+                bytes_in_flight: u64::MAX,
+                target_bitrate_max: u64::MAX,
+                ecn_mode: EcnMode::Disabled,
+            },
+        );
+        assert!(output.reference_window >= PROFILE.min_reference_window);
+    }
+
+    #[test]
     fn path_reset_drops_previous_capacity_state() {
         let mut cc = ScreamV2::new(8_000_000, None);
         cc.ref_wnd = 200_000;
