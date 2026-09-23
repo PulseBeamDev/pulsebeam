@@ -682,7 +682,10 @@ latest_useful_arrival = global_media_at
 All arithmetic is checked. Underflow makes the deadline already expired; overflow
 saturates to the maximum representable global time and is counted.
 
-A new frame is admitted only when its predicted receiver arrival is no later than
+Ingress carries clock synchronization quality privately with the immutable media
+value; local transit preserves it. A packet without verified clock metadata uses
+the provisional `25 ms` reserve rather than assuming synchronized time. A new
+frame is admitted only when its predicted receiver arrival is no later than
 `latest_useful_arrival` and its predicted pacer wait is no longer than the current
 sender pacer horizon. An RTX is admitted only when its predicted receiver arrival
 has positive utility and fits the SCReAM send window.

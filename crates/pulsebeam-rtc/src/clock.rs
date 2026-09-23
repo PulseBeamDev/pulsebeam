@@ -9,7 +9,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::GlobalMediaTime;
+use crate::{GlobalMediaTime, media_packet::ClockQuality};
 
 pub(crate) const REORDER_WINDOW: i64 = 2_048;
 const MAX_RESIDUAL_US: i128 = 100_000;
@@ -47,6 +47,7 @@ pub(crate) struct ClockMapper {
     last_sr: Option<Instant>,
     last_ntp: Option<i128>,
     synchronized: bool,
+    discontinuous: bool,
     collapsed_segments: u64,
 }
 
@@ -66,6 +67,7 @@ impl ClockMapper {
             last_sr: None,
             last_ntp: None,
             synchronized: false,
+            discontinuous: false,
             collapsed_segments: 0,
         }
     }
@@ -150,7 +152,22 @@ impl ClockMapper {
                     .zip(self.reports.front())
                     .is_some_and(|(last, first)| last.arrival.duration_since(first.arrival) >= rtt)
             });
+        if self.synchronized {
+            self.discontinuous = false;
+        }
         (!was_synchronized && self.synchronized).then_some(ClockWarning::Synchronized)
+    }
+
+    pub(crate) const fn quality(&self) -> ClockQuality {
+        if self.synchronized {
+            ClockQuality::Synchronized
+        } else if self.discontinuous {
+            ClockQuality::Discontinuous
+        } else if self.last_sr.is_some() {
+            ClockQuality::Unverified
+        } else {
+            ClockQuality::Provisional
+        }
     }
 
     fn stale_if_needed(&mut self, now: Instant) -> Option<ClockWarning> {
@@ -174,6 +191,7 @@ impl ClockMapper {
         }
         self.reports.clear();
         self.synchronized = false;
+        self.discontinuous = true;
         Some(ClockWarning::Discontinuous)
     }
 
@@ -239,6 +257,7 @@ mod tests {
     fn three_reports_need_an_rtt_span() {
         let now = Instant::now();
         let mut mapper = mapper();
+        assert_eq!(mapper.quality(), ClockQuality::Provisional);
         let offset = mapper.relation_at(90_000, 5).unwrap();
         for second in 0..3_u64 {
             let warning = mapper.observe_sender_report(
@@ -249,6 +268,14 @@ mod tests {
                 offset,
             );
             assert_eq!(warning, (second == 2).then_some(ClockWarning::Synchronized));
+            assert_eq!(
+                mapper.quality(),
+                if second == 2 {
+                    ClockQuality::Synchronized
+                } else {
+                    ClockQuality::Unverified
+                }
+            );
         }
     }
 
@@ -273,6 +300,7 @@ mod tests {
                 .1,
             Some(ClockWarning::Stale)
         );
+        assert_eq!(mapper.quality(), ClockQuality::Unverified);
         assert_eq!(
             mapper
                 .map(15, 450_000, now + Duration::from_secs(13))
@@ -280,5 +308,15 @@ mod tests {
                 .1,
             None
         );
+        assert_eq!(mapper.quality(), ClockQuality::Unverified);
+        let warning = mapper.observe_sender_report(
+            450_000,
+            5,
+            now + Duration::from_secs(14),
+            Some(Duration::ZERO),
+            offset,
+        );
+        assert_eq!(warning, Some(ClockWarning::Discontinuous));
+        assert_eq!(mapper.quality(), ClockQuality::Discontinuous);
     }
 }

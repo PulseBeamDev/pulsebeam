@@ -20,6 +20,7 @@ use crate::{
         ControllerInput, EcnValidation, FeedbackSample, LatencyGovernor, SafeRtpEnvelope,
         ScreamController,
     },
+    media_packet::ClockQuality,
     negotiation::EgressSenderFacts,
     pacer::Pacer,
     packet::RtpPacket,
@@ -117,6 +118,7 @@ struct RetainedPacket {
     payload: Vec<u8>,
     retained_at: Instant,
     global: GlobalMediaTime,
+    clock_quality: ClockQuality,
     transport_bytes: usize,
 }
 
@@ -281,7 +283,13 @@ impl MediaEgress {
         self.offered_bytes = self.offered_bytes.saturating_add(payload_bytes as u64);
         let pacer_wait = self.predicted_pacer_wait(at.monotonic);
         if self.senders[sender_index].policy.desired_bitrate.as_bps() == 0
-            || !self.useful_at(sender_index, media.packet.global_media_at(), at, pacer_wait)
+            || !self.useful_at(
+                sender_index,
+                media.packet.global_media_at(),
+                media.packet.clock_quality(),
+                at,
+                pacer_wait,
+            )
         {
             return Err(CommandError::WouldBlock);
         }
@@ -730,6 +738,7 @@ impl MediaEgress {
                     timestamp,
                     &packet,
                     queued.media.packet.global_media_at(),
+                    queued.media.packet.clock_quality(),
                     at.monotonic,
                     prepared.wire_len,
                 );
@@ -933,6 +942,7 @@ impl MediaEgress {
         &self,
         sender: usize,
         global: GlobalMediaTime,
+        quality: ClockQuality,
         at: TimePoint,
         pacer_wait: Duration,
     ) -> bool {
@@ -960,7 +970,7 @@ impl MediaEgress {
         };
         let Some(latest) = global
             .checked_add(state.policy.playout_delay.max())
-            .and_then(|value| value.checked_sub(processing))
+            .and_then(|value| value.checked_sub(processing.saturating_add(quality.uncertainty())))
         else {
             return false;
         };
@@ -980,6 +990,7 @@ impl MediaEgress {
                     (!self.useful_at(
                         queued.sender,
                         queued.media.packet.global_media_at(),
+                        queued.media.packet.clock_quality(),
                         at,
                         Duration::ZERO,
                     ) || (!self.senders[queued.sender].dependency_chain_valid
@@ -1102,6 +1113,7 @@ impl MediaEgress {
         timestamp: u32,
         packet: &[u8],
         global: GlobalMediaTime,
+        clock_quality: ClockQuality,
         at: Instant,
         wire_len: usize,
     ) {
@@ -1133,6 +1145,7 @@ impl MediaEgress {
             payload: parsed.payload().to_vec(),
             retained_at: at,
             global,
+            clock_quality,
             transport_bytes: wire_len,
         });
         self.retained_bytes = self.retained_bytes.saturating_add(wire_len);
@@ -1161,7 +1174,13 @@ impl MediaEgress {
             .retained
             .iter()
             .find(|packet| packet.sender == sender_index && packet.sequence == original_sequence)?;
-        if !self.useful_at(sender_index, retained.global, at, Duration::ZERO) {
+        if !self.useful_at(
+            sender_index,
+            retained.global,
+            retained.clock_quality,
+            at,
+            Duration::ZERO,
+        ) {
             self.repair_requests.pop_front();
             return Some(PrepareResult::Blocked);
         }

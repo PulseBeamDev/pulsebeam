@@ -165,7 +165,7 @@ impl IngressOwner {
                 index
             }
         };
-        let (encoding, global_media_at, warning) = {
+        let (encoding, global_media_at, warning, clock_quality) = {
             let encoding = &mut self.encodings[encoding];
             if encoding.ssrc.is_none() {
                 encoding.ssrc = Some(packet.ssrc());
@@ -186,13 +186,23 @@ impl IngressOwner {
                 self.drop();
                 return;
             };
-            (encoding.id, global_media_at, warning)
+            (
+                encoding.id,
+                global_media_at,
+                warning,
+                encoding.mapper.quality(),
+            )
         };
         if let Some(warning) = warning {
             self.push_clock_warning(warning);
         }
         let extensions = self.extensions_for(media, &packet);
-        let packet = MediaPacket::new(Bytes::from(bytes), global_media_at, extensions);
+        let packet = MediaPacket::with_clock_quality(
+            Bytes::from(bytes),
+            global_media_at,
+            extensions,
+            clock_quality,
+        );
         self.queued_media_bytes = self.queued_media_bytes.saturating_add(packet.bytes().len());
         self.events.push_back(Event::Media { encoding, packet });
     }

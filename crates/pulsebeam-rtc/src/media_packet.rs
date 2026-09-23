@@ -3,7 +3,7 @@
     reason = "the v3 media-value contract requires immutable shared packet bytes and metadata"
 )]
 
-use std::{cell::Cell, marker::PhantomData, ops::Range, sync::Arc};
+use std::{cell::Cell, marker::PhantomData, ops::Range, sync::Arc, time::Duration};
 
 use bytes::Bytes;
 
@@ -14,7 +14,27 @@ pub struct MediaPacket {
     bytes: Bytes,
     global_media_at: GlobalMediaTime,
     extensions: Arc<[(Arc<str>, Range<usize>)]>,
+    clock_quality: ClockQuality,
     _not_sync: PhantomData<Cell<()>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ClockQuality {
+    Provisional,
+    Synchronized,
+    Unverified,
+    Discontinuous,
+}
+
+impl ClockQuality {
+    pub(crate) const fn uncertainty(self) -> Duration {
+        match self {
+            Self::Synchronized => Duration::from_millis(5),
+            Self::Provisional => Duration::from_millis(25),
+            Self::Unverified => Duration::from_millis(50),
+            Self::Discontinuous => Duration::from_millis(75),
+        }
+    }
 }
 
 impl MediaPacket {
@@ -24,12 +44,31 @@ impl MediaPacket {
         global_media_at: GlobalMediaTime,
         extensions: Arc<[(Arc<str>, Range<usize>)]>,
     ) -> Self {
+        Self::with_clock_quality(
+            bytes,
+            global_media_at,
+            extensions,
+            ClockQuality::Provisional,
+        )
+    }
+
+    pub(crate) fn with_clock_quality(
+        bytes: Bytes,
+        global_media_at: GlobalMediaTime,
+        extensions: Arc<[(Arc<str>, Range<usize>)]>,
+        clock_quality: ClockQuality,
+    ) -> Self {
         Self {
             bytes,
             global_media_at,
             extensions,
+            clock_quality,
             _not_sync: PhantomData,
         }
+    }
+
+    pub(crate) const fn clock_quality(&self) -> ClockQuality {
+        self.clock_quality
     }
 
     pub const fn bytes(&self) -> &Bytes {
@@ -52,6 +91,7 @@ impl MediaPacket {
         Self {
             bytes: Bytes::copy_from_slice(&self.bytes),
             global_media_at: self.global_media_at,
+            clock_quality: self.clock_quality,
             extensions: self
                 .extensions
                 .iter()
@@ -107,16 +147,34 @@ mod tests {
 
     #[test]
     fn transit_deep_copies_packet_owned_state() {
-        let packet = MediaPacket::new(
+        let packet = MediaPacket::with_clock_quality(
             Bytes::from_static(b"headerextensionpayload"),
             GlobalMediaTime::from_micros(42),
             vec![(Arc::from("urn:example:extension"), 6..15)].into(),
+            ClockQuality::Synchronized,
         );
 
         let transit = packet.to_transit();
 
         assert_eq!(transit.bytes(), packet.bytes());
         assert_eq!(transit.global_media_at(), packet.global_media_at());
+        assert_eq!(transit.clock_quality(), ClockQuality::Synchronized);
+        assert_eq!(
+            ClockQuality::Synchronized.uncertainty(),
+            Duration::from_millis(5)
+        );
+        assert_eq!(
+            ClockQuality::Provisional.uncertainty(),
+            Duration::from_millis(25)
+        );
+        assert_eq!(
+            ClockQuality::Unverified.uncertainty(),
+            Duration::from_millis(50)
+        );
+        assert_eq!(
+            ClockQuality::Discontinuous.uncertainty(),
+            Duration::from_millis(75)
+        );
         assert_eq!(
             transit.extension("urn:example:extension"),
             packet.extension("urn:example:extension")
