@@ -1253,6 +1253,87 @@ fn superseded_admission_suspends_retries_until_explicit_connect() {
 }
 
 #[test]
+fn superseded_reconnect_retires_the_incumbent_before_explicit_reentry() {
+    let (mut agent, old_generation, old_channel, send) = connected_agent();
+    acknowledge_send(&mut agent, old_generation, old_channel, send);
+    agent
+        .handle(HostEvent::Rtc(RtcEvent::Disconnected {
+            generation: old_generation,
+        }))
+        .unwrap();
+    let replacement = match next_effect(&mut agent) {
+        Effect::Rtc(RtcEffect::CreateOffer { generation, .. }) => generation,
+        effect => panic!("expected replacement offer, got {effect:?}"),
+    };
+    agent
+        .handle(HostEvent::Rtc(RtcEvent::OfferCreated {
+            generation: replacement,
+            offer: offer(),
+            resources: resources(channel(11)),
+        }))
+        .unwrap();
+    let operation = match next_effect(&mut agent) {
+        Effect::Http(HttpEffect::Request { operation, .. }) => operation,
+        effect => panic!("expected replacement request, got {effect:?}"),
+    };
+    agent
+        .handle(HostEvent::Http(HttpEvent::Response {
+            operation,
+            response: HttpResponse {
+                status: 409,
+                headers: vec![],
+                body: br#"{"type":"urn:pulsebeam:error:superseded"}"#.to_vec(),
+            },
+        }))
+        .unwrap();
+    for generation in [replacement, old_generation] {
+        assert_eq!(
+            next_effect(&mut agent),
+            Effect::Rtc(RtcEffect::Close { generation })
+        );
+    }
+    let deletion = match next_effect(&mut agent) {
+        Effect::Http(HttpEffect::Request {
+            operation, request, ..
+        }) => {
+            assert_eq!(request.method, HttpMethod::Delete);
+            operation
+        }
+        effect => panic!("expected incumbent delete, got {effect:?}"),
+    };
+    assert_eq!(agent.snapshot().connection, ConnectionState::Superseded);
+    agent
+        .handle(HostEvent::Rtc(RtcEvent::Closed {
+            generation: replacement,
+        }))
+        .unwrap();
+    agent
+        .handle(HostEvent::Rtc(RtcEvent::Closed {
+            generation: old_generation,
+        }))
+        .unwrap();
+    agent
+        .handle(HostEvent::Http(HttpEvent::Response {
+            operation: deletion,
+            response: HttpResponse {
+                status: 204,
+                headers: vec![],
+                body: vec![],
+            },
+        }))
+        .unwrap();
+    assert!(agent.next_effect().is_none());
+    assert_eq!(agent.snapshot().connection, ConnectionState::Superseded);
+    assert_eq!(agent.snapshot().generation, None);
+
+    agent.command(AgentCommand::Connect).unwrap();
+    assert!(matches!(
+        next_effect(&mut agent),
+        Effect::Rtc(RtcEffect::CreateOffer { .. })
+    ));
+}
+
+#[test]
 fn ordinary_http_conflict_is_not_supersession() {
     let mut agent = Agent::new(config()).unwrap();
     let (_, operation) = begin_connect(&mut agent, desired(1), channel(12));
