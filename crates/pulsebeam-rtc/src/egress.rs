@@ -66,6 +66,11 @@ pub(crate) struct MediaEgress {
     probe_history: VecDeque<Instant>,
     emitted_rtp: VecDeque<(Instant, u64, bool)>,
     probe_disabled_until: Option<Instant>,
+    offer_window_started: Instant,
+    offered_bytes: u64,
+    admitted_bytes: u64,
+    offered_rate: u64,
+    admitted_rate: u64,
 }
 
 struct Sender {
@@ -223,6 +228,11 @@ impl MediaEgress {
             probe_history: VecDeque::with_capacity(64),
             emitted_rtp: VecDeque::new(),
             probe_disabled_until: None,
+            offer_window_started: accepted_at,
+            offered_bytes: 0,
+            admitted_bytes: 0,
+            offered_rate: 0,
+            admitted_rate: 0,
         };
         owner.reallocate(300_000_u64.min(desired));
         owner.events.clear();
@@ -262,6 +272,7 @@ impl MediaEgress {
             .len()
             .saturating_add(RTP_TRANSPORT_ALLOWANCE);
         self.validate_frame(sender_index, &media)?;
+        self.offered_bytes = self.offered_bytes.saturating_add(payload_bytes as u64);
         let pacer_wait = self.predicted_pacer_wait(at.monotonic);
         if self.senders[sender_index].policy.desired_bitrate.as_bps() == 0
             || !self.useful_at(sender_index, media.packet.global_media_at(), at, pacer_wait)
@@ -280,6 +291,7 @@ impl MediaEgress {
         }
 
         self.apply_frame_admission(sender_index, &media);
+        self.admitted_bytes = self.admitted_bytes.saturating_add(payload_bytes as u64);
         self.probe_remaining = 0;
         self.senders[sender_index].latest_admitted_global = Some(media.packet.global_media_at());
         self.queued_payload_bytes = self.queued_payload_bytes.saturating_add(payload_bytes);
@@ -312,13 +324,32 @@ impl MediaEgress {
             self.pacer.reset();
             self.probe_remaining = 0;
             self.last_probe = None;
+            self.offer_window_started = at.monotonic;
+            self.offered_bytes = 0;
+            self.admitted_bytes = 0;
+            self.offered_rate = 0;
+            self.admitted_rate = 0;
+        }
+        let interval = at
+            .monotonic
+            .saturating_duration_since(self.offer_window_started);
+        if interval >= Duration::from_millis(200) {
+            let micros = interval.as_micros().max(1);
+            self.offered_rate =
+                u64::try_from(u128::from(self.offered_bytes).saturating_mul(8_000_000) / micros)
+                    .unwrap_or(u64::MAX);
+            self.admitted_rate =
+                u64::try_from(u128::from(self.admitted_bytes).saturating_mul(8_000_000) / micros)
+                    .unwrap_or(u64::MAX);
+            self.offered_bytes = 0;
+            self.admitted_bytes = 0;
+            self.offer_window_started = at.monotonic;
         }
         let desired = self
             .senders
             .iter()
             .map(|sender| sender.policy.desired_bitrate.as_bps())
             .sum();
-        let offered = if self.queue.is_empty() { 0 } else { desired };
         let now = at
             .monotonic
             .saturating_duration_since(self.controller_origin);
@@ -332,10 +363,15 @@ impl MediaEgress {
                 fresh_network_feedback,
                 bytes_in_flight,
                 paced_queue_bytes: self.queued_transport_bytes as u64,
-                offered_media_rate: offered,
-                admitted_media_rate: offered,
+                offered_media_rate: self.offered_rate,
+                admitted_media_rate: self.admitted_rate,
+                governed_allocation_rate: self.allocations.iter().copied().sum(),
                 desired_media_rate: desired,
-                window_or_pacer_blocked: !self.pacer.eligible(at.monotonic),
+                window_or_pacer_blocked: !self.pacer.eligible(at.monotonic)
+                    || (self.queued_transport_bytes > 0
+                        && self.envelope.is_some_and(|envelope| {
+                            bytes_in_flight >= envelope.max_rtp_bytes_in_flight
+                        })),
                 ecn: EcnValidation::default(),
             },
         );
@@ -728,6 +764,15 @@ impl MediaEgress {
         .into_iter()
         .flatten()
         .min()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn observed_offer(&self) -> (u64, bool) {
+        (
+            self.offered_rate,
+            self.envelope
+                .is_some_and(|envelope| envelope.application_limited),
+        )
     }
 
     #[cfg(test)]

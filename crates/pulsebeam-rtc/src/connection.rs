@@ -894,6 +894,33 @@ mod tests {
         assert!(p99 <= Duration::from_millis(10));
     }
 
+    #[test]
+    fn low_rate_media_uses_actual_offer_for_application_limited_classification() {
+        let mut fixture = PeerFixture::connected();
+        let mut source = PeerFixture::connected();
+        let mut policy = crate::ConnectionConfig::default().default_audio_policy;
+        policy.desired_bitrate = crate::MediaPayloadBitrate::from_bps(4_000_000);
+        policy.playout_delay = crate::PlayoutDelay::from_ticks(0, 50).expect("500 ms");
+        fixture.command(Command::SetSenderPolicy {
+            sender: fixture.sender,
+            policy,
+        });
+        for id in 1..=10 {
+            source.drive_for(Duration::from_millis(100));
+            fixture.drive_for(Duration::from_millis(100));
+            let media = forwarded(source.send_source(&[0x5a; 1_000]), id);
+            fixture.command(Command::SendMedia {
+                sender: fixture.sender,
+                media,
+            });
+        }
+        fixture.drive_for(Duration::from_millis(300));
+        let (offered, application_limited) = fixture.connection._subsystems.egress.observed_offer();
+        assert!(offered <= 100_000, "actual sparse offer={offered}");
+        assert!(application_limited);
+        assert!(fixture.connection.stats().connection.transmitted_rtp_bytes > 0);
+    }
+
     struct Observer(Arc<Mutex<Option<TransmitCommitContext>>>);
 
     impl CommitParticipant for Observer {

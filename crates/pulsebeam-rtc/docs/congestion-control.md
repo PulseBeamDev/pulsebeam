@@ -435,9 +435,14 @@ code and statistics. “Sustainable path capacity” is not used as a synonym.
 
 ### Application-limited behavior
 
-The connection is RTP application-limited when offered RTP payload remains below
-`85%` of the governed aggregate media allocation for at least `200 ms` and no
-eligible RTP packet is held back by pacing or the send window.
+The connection is RTP application-limited when the measured RTP payload offered
+at admission remains below `85%` of the governed aggregate media allocation for
+at least `200 ms` and no eligible RTP packet is held back by pacing or the send
+window. A bounded `200 ms` measurement bucket counts validated submission bytes,
+including media rejected by usefulness or queue admission; accepted bytes are measured
+separately. Queue nonemptiness and configured desired bitrate are not substitutes
+for measured offer. This measurement governs only outer confidence, allocation,
+and probes, never SCReAM's native growth equation.
 
 While application-limited:
 

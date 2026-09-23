@@ -15,7 +15,9 @@ fn fixed_scenario_matrix() {
                 assert!(metrics.p99_queue_micros <= metrics.effective_target_micros + 10_000);
             }
             0x0702 => {
-                assert_eq!(metrics.application_limited_at_millis, Some(200));
+                // The first 10 ms step installs the path; the full 200 ms
+                // classification interval belongs to that active path.
+                assert_eq!(metrics.application_limited_at_millis, Some(210));
                 assert!(metrics.admitted_percent >= 95);
             }
             0x0703 => {

@@ -172,6 +172,7 @@ impl Simulation {
                 paced_queue_bytes: self.queue_bytes,
                 offered_media_rate: offered_bps,
                 admitted_media_rate: admitted_rate,
+                governed_allocation_rate: desired_bps,
                 desired_media_rate: desired_bps,
                 window_or_pacer_blocked: false,
                 ecn: validation,

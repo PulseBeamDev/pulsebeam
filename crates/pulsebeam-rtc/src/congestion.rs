@@ -57,6 +57,7 @@ pub(crate) struct ControllerInput<'a> {
     pub(crate) paced_queue_bytes: u64,
     pub(crate) offered_media_rate: u64,
     pub(crate) admitted_media_rate: u64,
+    pub(crate) governed_allocation_rate: u64,
     pub(crate) desired_media_rate: u64,
     pub(crate) window_or_pacer_blocked: bool,
     pub(crate) ecn: EcnValidation,
@@ -267,6 +268,7 @@ impl ScreamController {
             paced_queue_bytes,
             offered_media_rate: 0,
             admitted_media_rate: 0,
+            governed_allocation_rate: 0,
             desired_media_rate: desired,
             window_or_pacer_blocked: false,
             ecn: EcnValidation::default(),
@@ -282,14 +284,19 @@ impl ScreamController {
         self.path_available = available;
         self.last_feedback = None;
         self.first_send = None;
+        self.application_limited_since = None;
+        self.application_limited = false;
         self.feedback_stale = false;
+        self.confidence = u16::MAX;
+        self.confidence_decay_started = None;
+        self.feedback_hold = Duration::ZERO;
         self.core.reset_path(target_bitrate_max);
         self.last_reason = ControllerReason::PathChanged;
     }
 
     fn update_application_limited(&mut self, now: Duration, input: &ControllerInput<'_>) {
-        let credible = input.desired_media_rate.max(input.admitted_media_rate);
-        let below = input.offered_media_rate.saturating_mul(100) < credible.saturating_mul(85)
+        let below = input.offered_media_rate.saturating_mul(100)
+            < input.governed_allocation_rate.saturating_mul(85)
             && !input.window_or_pacer_blocked;
         if below {
             let since = *self.application_limited_since.get_or_insert(now);
@@ -427,6 +434,7 @@ mod tests {
             paced_queue_bytes: 0,
             offered_media_rate: 2_000_000,
             admitted_media_rate: 2_000_000,
+            governed_allocation_rate: 2_000_000,
             desired_media_rate: 2_000_000,
             window_or_pacer_blocked: false,
             ecn: EcnValidation::default(),
@@ -470,6 +478,7 @@ mod tests {
             paced_queue_bytes: 0,
             offered_media_rate: 4_000_000,
             admitted_media_rate: 4_000_000,
+            governed_allocation_rate: 4_000_000,
             desired_media_rate: 4_000_000,
             window_or_pacer_blocked: false,
             ecn: EcnValidation::default(),
@@ -502,6 +511,7 @@ mod tests {
             paced_queue_bytes: 0,
             offered_media_rate: 4_000_000,
             admitted_media_rate: 4_000_000,
+            governed_allocation_rate: 4_000_000,
             desired_media_rate: 4_000_000,
             window_or_pacer_blocked: false,
             ecn: EcnValidation::default(),
@@ -555,6 +565,7 @@ mod tests {
             paced_queue_bytes: 0,
             offered_media_rate: 64_000,
             admitted_media_rate: 64_000,
+            governed_allocation_rate: 4_000_000,
             desired_media_rate: 4_000_000,
             window_or_pacer_blocked: false,
             ecn: EcnValidation::default(),
@@ -600,6 +611,7 @@ mod tests {
             paced_queue_bytes: 0,
             offered_media_rate: 64_000,
             admitted_media_rate: 64_000,
+            governed_allocation_rate: 2_000_000,
             desired_media_rate: 2_000_000,
             window_or_pacer_blocked: false,
             ecn: EcnValidation::default(),
@@ -609,6 +621,40 @@ mod tests {
         assert!(started.application_limited);
         let half = cc.update(Duration::from_millis(5_250), input);
         assert_eq!(half.queue_delay_confidence, u16::MAX / 2);
+    }
+
+    #[test]
+    fn path_replacement_drops_old_offer_classification_and_confidence_decay() {
+        let mut cc = ScreamController::new(2_000_000, None);
+        let input = ControllerInput {
+            path_epoch: Some(1),
+            path_available: true,
+            feedback: &[],
+            feedback_hold: Duration::ZERO,
+            fresh_network_feedback: false,
+            bytes_in_flight: 0,
+            paced_queue_bytes: 0,
+            offered_media_rate: 0,
+            admitted_media_rate: 0,
+            governed_allocation_rate: 2_000_000,
+            desired_media_rate: 2_000_000,
+            window_or_pacer_blocked: false,
+            ecn: EcnValidation::default(),
+        };
+        cc.update(Duration::ZERO, input);
+        cc.update(Duration::from_secs(1), input);
+        assert!(cc.application_limited);
+        cc.update(Duration::from_secs(2), input);
+        assert!(cc.confidence < u16::MAX);
+        cc.update(
+            Duration::from_secs(3),
+            ControllerInput {
+                path_epoch: Some(2),
+                ..input
+            },
+        );
+        assert!(!cc.application_limited);
+        assert_eq!(cc.confidence, u16::MAX);
     }
 
     #[test]
