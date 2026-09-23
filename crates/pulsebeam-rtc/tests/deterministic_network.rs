@@ -178,6 +178,7 @@ fn assert_probe_windows(emitted: &[(std::time::Instant, u64, bool)]) {
 
 #[test]
 fn production_pre_media_probes_use_only_the_low_traffic_allowance() {
+    assert_probe_windows(&[]);
     let mut fixture = PeerFixture::connected();
     fixture.drive_for(Duration::from_secs(6));
     assert_probe_windows(fixture.emitted_rtp());
@@ -361,6 +362,76 @@ fn production_two_megabit_single_flow_capacity() {
     assert_eq!(delivered, cohort, "all emission-cohort RTP must drain");
     assert!(fixture.bottleneck_samples().0.len() >= 1_000);
     assert!(u128::from(delivered) * 100 >= service * 85);
+}
+
+#[test]
+fn production_capacity_steps_recover_stable_transport_service() {
+    let mut fixture = PeerFixture::connected();
+    fixture.configure_network(
+        0x6601,
+        NetworkPolicy {
+            delay: Duration::from_millis(25),
+            ..NetworkPolicy::default()
+        },
+    );
+    fixture.configure_bottleneck(2_000_000);
+    fixture.configure_time_quantum(Duration::from_millis(2));
+    let mut policy = ConnectionConfig::default().default_audio_policy;
+    policy.desired_bitrate = MediaPayloadBitrate::from_bps(4_000_000);
+    policy.playout_delay = PlayoutDelay::from_ticks(0, 50).expect("500ms playout");
+    fixture.command(Command::SetSenderPolicy {
+        sender: fixture.sender,
+        policy,
+    });
+    let mut source = PeerFixture::connected();
+    source.configure_time_quantum(Duration::from_millis(2));
+    let start = fixture.at().monotonic;
+    for id in 1..=18_000_u64 {
+        let tick = start + Duration::from_millis(id * 2);
+        fixture.drive_for(tick.saturating_duration_since(fixture.at().monotonic));
+        if id == 6_000 {
+            fixture.set_bottleneck_rate(1_000_000);
+        }
+        if id == 12_000 {
+            fixture.set_bottleneck_rate(2_000_000);
+        }
+        source.drive_for(tick.saturating_duration_since(source.at().monotonic));
+        let media = forwarded(source.send_source(&[0x5a; PAYLOAD_BYTES]), id);
+        match fixture.try_command(Command::SendMedia {
+            sender: fixture.sender,
+            media,
+        }) {
+            Ok(()) | Err(CommandError::WouldBlock) => {}
+            Err(error) => panic!("step admission: {error:?}"),
+        }
+    }
+    fixture.drive_for(Duration::from_secs(2));
+    for (from, to, rate) in [
+        (2, 12, 2_000_000_u64),
+        (14, 24, 1_000_000),
+        (26, 36, 2_000_000),
+    ] {
+        let begin = start + Duration::from_secs(from);
+        let end = start + Duration::from_secs(to);
+        let emitted = fixture
+            .emitted_rtp()
+            .iter()
+            .filter(|(at, _, _)| *at >= begin && *at < end)
+            .map(|(_, bytes, _)| *bytes)
+            .sum::<u64>();
+        let delivered = fixture
+            .delivered_rtp()
+            .iter()
+            .filter(|(at, _)| *at >= begin && *at < end)
+            .map(|(_, bytes)| *bytes)
+            .sum::<u64>();
+        let service = rate / 8 * 10;
+        eprintln!(
+            "capacity-step seed=0x6601 interval={from}..{to} rate={rate} emitted={emitted} delivered={delivered} service={service}"
+        );
+        assert_eq!(delivered, emitted, "stable emission cohort must drain");
+        assert!(u128::from(delivered) * 100 >= u128::from(service) * 85);
+    }
 }
 
 #[test]

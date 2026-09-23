@@ -362,6 +362,12 @@ impl PeerFixture {
         self.network.shared_departure = Some(departure);
     }
 
+    pub fn set_bottleneck_rate(&mut self, bits_per_second: u64) {
+        assert!(bits_per_second > 0);
+        assert!(self.network.bottleneck_bps.is_some());
+        self.network.bottleneck_bps = Some(bits_per_second);
+    }
+
     pub fn configure_bottleneck(&mut self, bits_per_second: u64) {
         assert!(bits_per_second > 0);
         self.network.bottleneck_bps = Some(bits_per_second);
