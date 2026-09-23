@@ -655,6 +655,11 @@ impl MediaEgress {
                     .base_global
                     .get_or_insert_with(|| queued.media.packet.global_media_at());
                 state.latest_committed_global = Some(queued.media.packet.global_media_at());
+                if queued.media.frame.random_access
+                    || matches!(&queued.media.frame.dependencies, FrameDependencies::Known(value) if value.is_empty())
+                {
+                    state.dependency_chain_valid = true;
+                }
                 state.next_sequence = state.next_sequence.saturating_add(1);
                 if twcc.is_some() {
                     self.next_twcc = self.next_twcc.saturating_add(1);
@@ -861,11 +866,6 @@ impl MediaEgress {
 
     fn apply_frame_admission(&mut self, sender: usize, media: &ForwardedMedia) {
         let state = &mut self.senders[sender];
-        if media.frame.random_access
-            || matches!(&media.frame.dependencies, FrameDependencies::Known(value) if value.is_empty())
-        {
-            state.dependency_chain_valid = true;
-        }
         match media.frame.boundary {
             FrameBoundary::Start => {
                 state.open_frame = Some(OpenFrame {
@@ -934,7 +934,9 @@ impl MediaEgress {
                         queued.media.packet.global_media_at(),
                         at,
                         Duration::ZERO,
-                    ))
+                    ) || (!self.senders[queued.sender].dependency_chain_valid
+                        && !queued.media.frame.random_access
+                        && !matches!(&queued.media.frame.dependencies, FrameDependencies::Known(value) if value.is_empty())))
                     .then(|| {
                         (
                             index,

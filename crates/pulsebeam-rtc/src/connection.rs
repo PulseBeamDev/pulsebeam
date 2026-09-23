@@ -895,6 +895,71 @@ mod tests {
     }
 
     #[test]
+    fn tightening_policy_drops_queued_dependents_but_preserves_independent_frame() {
+        let mut fixture = PeerFixture::connected();
+        fixture.drive_for(Duration::from_millis(200));
+        let mut source = PeerFixture::connected();
+        let bytes = source.send_source(&[0x5a; 100]).bytes().clone();
+        let at = fixture.at();
+        let mut policy = crate::ConnectionConfig::default().default_audio_policy;
+        policy.playout_delay = crate::PlayoutDelay::from_ticks(0, 50).expect("500 ms");
+        policy.desired_bitrate = crate::MediaPayloadBitrate::from_bps(2_000_000);
+        fixture.command(Command::SetSenderPolicy {
+            sender: fixture.sender,
+            policy,
+        });
+        for (id, offset, dependencies, random_access) in [
+            (1, 0, vec![], true),
+            (2, 100, vec![FrameId::from_value(1)], false),
+            (3, 200, vec![], true),
+        ] {
+            let packet = crate::MediaPacket::new(
+                bytes.clone(),
+                at.global
+                    .checked_add(Duration::from_millis(offset))
+                    .expect("media global time"),
+                Arc::from([]),
+            );
+            fixture
+                .connection
+                .command(
+                    at,
+                    Command::SendMedia {
+                        sender: fixture.sender,
+                        media: ForwardedMedia {
+                            packet,
+                            frame: FrameMetadata {
+                                id: FrameId::from_value(id),
+                                boundary: FrameBoundary::Complete,
+                                random_access,
+                                discardable: false,
+                                dependencies: FrameDependencies::known(dependencies)
+                                    .expect("dependencies"),
+                            },
+                        },
+                    },
+                )
+                .unwrap_or_else(|error| panic!("frame {id}: {error:?}"));
+        }
+        assert_eq!(fixture.connection.stats().senders[0].queued_packets, 3);
+        policy.playout_delay = crate::PlayoutDelay::from_ticks(0, 10).expect("100 ms");
+        fixture
+            .connection
+            .command(
+                TimePoint {
+                    monotonic: at.monotonic + Duration::from_millis(50),
+                    global: at.global.checked_add(Duration::from_millis(50)).unwrap(),
+                },
+                Command::SetSenderPolicy {
+                    sender: fixture.sender,
+                    policy,
+                },
+            )
+            .expect("tighten policy");
+        assert_eq!(fixture.connection.stats().senders[0].queued_packets, 1);
+    }
+
+    #[test]
     fn low_rate_media_uses_actual_offer_for_application_limited_classification() {
         let mut fixture = PeerFixture::connected();
         let mut source = PeerFixture::connected();
