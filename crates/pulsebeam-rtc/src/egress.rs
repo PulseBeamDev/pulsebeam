@@ -730,6 +730,13 @@ impl MediaEgress {
         .min()
     }
 
+    #[cfg(test)]
+    pub(crate) fn native_queue_delay_target(&self) -> Duration {
+        self.envelope.map_or(Duration::ZERO, |envelope| {
+            envelope.native_queue_delay_target
+        })
+    }
+
     pub(crate) const fn controller_origin(&self) -> Instant {
         self.controller_origin
     }

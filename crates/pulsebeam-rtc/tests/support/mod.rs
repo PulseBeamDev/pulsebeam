@@ -52,6 +52,7 @@ pub struct PeerFixture {
     twcc_sent: usize,
     peer_channel: Option<str0m_reference::channel::ChannelId>,
     network: DeterministicNetwork,
+    native_target: Option<fn(&Connection) -> Duration>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -113,6 +114,7 @@ struct DeterministicNetwork {
     delivered_rtp: Vec<(Instant, u64)>,
     time_quantum: Option<Duration>,
     shared_departure: Option<std::rc::Rc<std::cell::RefCell<Option<Instant>>>>,
+    rtp_queue_samples: Vec<(Instant, Duration, Duration)>,
 }
 
 impl DeterministicNetwork {
@@ -331,12 +333,21 @@ impl PeerFixture {
             twcc_sent: 0,
             peer_channel,
             network: DeterministicNetwork::default(),
+            native_target: None,
         }
     }
 
     pub fn configure_network(&mut self, seed: u64, policy: NetworkPolicy) {
         assert!(self.network.pending.is_empty(), "network must be drained");
         self.network.configure(seed, policy);
+    }
+
+    pub fn observe_native_target(&mut self, reader: fn(&Connection) -> Duration) {
+        self.native_target = Some(reader);
+    }
+
+    pub fn rtp_queue_samples(&self) -> &[(Instant, Duration, Duration)] {
+        &self.network.rtp_queue_samples
     }
 
     pub fn configure_time_quantum(&mut self, quantum: Duration) {
@@ -669,6 +680,28 @@ impl PeerFixture {
                     self.network.last_committed_padding_bytes = stats.transmitted_padding_bytes;
                     if rtp_bytes != 0 {
                         self.network.emitted_rtp.push((self.now, rtp_bytes, false));
+                        if let (Some(reader), Some(rate)) =
+                            (self.native_target, self.network.bottleneck_bps)
+                        {
+                            let service = Duration::from_nanos(
+                                u64::try_from(
+                                    (u128::from(rtp_bytes) * 8_000_000_000)
+                                        .div_ceil(u128::from(rate)),
+                                )
+                                .unwrap_or(u64::MAX),
+                            );
+                            let departure = self
+                                .network
+                                .shared_departure
+                                .as_ref()
+                                .map_or(self.network.next_departure, |shared| *shared.borrow())
+                                .unwrap_or(self.now);
+                            self.network.rtp_queue_samples.push((
+                                self.now,
+                                departure.saturating_duration_since(self.now).max(service),
+                                reader(&self.connection),
+                            ));
+                        }
                     }
                     if padding != 0 {
                         self.network.emitted_rtp.push((self.now, padding, true));

@@ -802,10 +802,97 @@ impl Drop for EntropyConsumer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{NetworkPolicy, PeerFixture, forwarded};
     use crate::{
         ForwardedMedia, FrameBoundary, FrameDependencies, FrameId, FrameMetadata, TransmitTarget,
     };
-    use std::sync::{Arc, Mutex};
+    use std::{
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
+
+    #[test]
+    fn production_queue_sojourn_tracks_contemporaneous_native_target() {
+        let mut fixture = PeerFixture::connected();
+        fixture.configure_network(
+            0x5501,
+            NetworkPolicy {
+                delay: Duration::from_millis(25),
+                ..NetworkPolicy::default()
+            },
+        );
+        fixture.configure_bottleneck(2_000_000);
+        fixture.configure_time_quantum(Duration::from_millis(2));
+        fixture.observe_native_target(|connection| {
+            connection._subsystems.egress.native_queue_delay_target()
+        });
+        let mut policy = crate::ConnectionConfig::default().default_audio_policy;
+        policy.desired_bitrate = crate::MediaPayloadBitrate::from_bps(4_000_000);
+        policy.playout_delay = crate::PlayoutDelay::from_ticks(0, 50).expect("500 ms");
+        fixture.command(Command::SetSenderPolicy {
+            sender: fixture.sender,
+            policy,
+        });
+        let start = fixture.at().monotonic;
+        let mut source = PeerFixture::connected();
+        source.configure_time_quantum(Duration::from_millis(2));
+        for id in 1..=6_000_u64 {
+            let tick = start + Duration::from_millis(id * 2);
+            fixture.drive_for(tick.saturating_duration_since(fixture.at().monotonic));
+            source.drive_for(tick.saturating_duration_since(source.at().monotonic));
+            let media = forwarded(source.send_source(&[0x5a; 1_000]), id);
+            let _ = fixture.try_command(Command::SendMedia {
+                sender: fixture.sender,
+                media,
+            });
+        }
+        fixture.drive_for(Duration::from_secs(2));
+        assert_eq!(fixture.network_counters().1, 0);
+        assert_eq!(
+            fixture
+                .delivered_rtp()
+                .iter()
+                .map(|(_, bytes)| *bytes)
+                .sum::<u64>(),
+            fixture.connection.stats().connection.transmitted_rtp_bytes,
+            "only delivered RTP may enter queue percentiles"
+        );
+        let stable_start = start + Duration::from_secs(2);
+        let stable_end = stable_start + Duration::from_secs(10);
+        let eligible = |at: &Instant| {
+            *at >= stable_start
+                && *at < stable_end
+                && !fixture.emitted_rtp().iter().any(|(probe_at, _, probe)| {
+                    *probe
+                        && *at >= *probe_at
+                        && at.saturating_duration_since(*probe_at) < Duration::from_millis(120)
+                })
+        };
+        let mut raw = fixture
+            .rtp_queue_samples()
+            .iter()
+            .filter(|(at, _, _)| eligible(at))
+            .map(|(_, sojourn, _)| *sojourn)
+            .collect::<Vec<_>>();
+        raw.sort_unstable();
+        let mut excess = fixture
+            .rtp_queue_samples()
+            .iter()
+            .filter(|(at, _, _)| eligible(at))
+            .map(|(_, sojourn, target)| sojourn.saturating_sub(*target))
+            .collect::<Vec<_>>();
+        excess.sort_unstable();
+        assert!(excess.len() >= 1_000);
+        let p99 = excess[(excess.len() * 99).div_ceil(100) - 1];
+        eprintln!(
+            "production queue seed=0x5501 samples={} raw_p50={:?} raw_p95={:?} raw_p99={:?} excess_p99={p99:?}",
+            excess.len(),
+            raw[(raw.len() * 50).div_ceil(100) - 1],
+            raw[(raw.len() * 95).div_ceil(100) - 1],
+            raw[(raw.len() * 99).div_ceil(100) - 1],
+        );
+        assert!(p99 <= Duration::from_millis(10));
+    }
 
     struct Observer(Arc<Mutex<Option<TransmitCommitContext>>>);
 
