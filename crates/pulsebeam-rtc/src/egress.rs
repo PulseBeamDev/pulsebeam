@@ -1129,16 +1129,24 @@ impl MediaEgress {
     }
 
     fn record_rtp(&mut self, at: Instant, bytes: u64, probe: bool) {
-        while self
-            .emitted_rtp
-            .front()
-            .is_some_and(|(sent, _, _)| at.saturating_duration_since(*sent) >= PROBE_WINDOW)
-        {
+        for _ in 0..MAX_EXPIRATIONS_PER_POLL {
+            if self
+                .emitted_rtp
+                .front()
+                .is_none_or(|(sent, _, _)| at.saturating_duration_since(*sent) < PROBE_WINDOW)
+            {
+                break;
+            }
             self.emitted_rtp.pop_front();
         }
         if self.emitted_rtp.len() >= MAX_PROBE_ACCOUNTING {
-            self.emitted_rtp.clear();
-            self.probe_disabled_until = at.checked_add(PROBE_WINDOW);
+            let evicted_recent = self
+                .emitted_rtp
+                .pop_front()
+                .is_some_and(|(sent, _, _)| at.saturating_duration_since(sent) < PROBE_WINDOW);
+            if evicted_recent {
+                self.probe_disabled_until = at.checked_add(PROBE_WINDOW);
+            }
         }
         self.emitted_rtp.push_back((at, bytes, probe));
     }
@@ -1469,6 +1477,31 @@ mod tests {
             0,
         );
         assert!(!egress.probe_budget_available(now + Duration::from_secs(6), 1));
+    }
+
+    #[test]
+    fn probe_history_overflow_suppresses_credit_until_evictions_age_out() {
+        let now = Instant::now();
+        let policy = SenderPolicy {
+            playout_delay: PlayoutDelay::from_ticks(0, 0).expect("asap"),
+            priority: MediaPriority::MEDIUM,
+            desired_bitrate: MediaPayloadBitrate::from_bps(0),
+        };
+        let mut egress = MediaEgress::new(
+            Vec::new().into_boxed_slice(),
+            &[0; 32],
+            1,
+            1,
+            policy,
+            policy,
+            now,
+        );
+        for _ in 0..=MAX_PROBE_ACCOUNTING {
+            egress.record_rtp(now, 19, false);
+        }
+        assert_eq!(egress.emitted_rtp.len(), MAX_PROBE_ACCOUNTING);
+        assert!(!egress.probe_budget_available(now, 1));
+        assert!(egress.probe_budget_available(now + PROBE_WINDOW, PROBE_ALLOWANCE));
     }
 
     #[test]

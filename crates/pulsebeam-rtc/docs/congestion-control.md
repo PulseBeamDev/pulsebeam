@@ -541,7 +541,7 @@ not permission for implementation choice.
 | Field | Version-one value |
 | --- | ---: |
 | Concurrent probe clusters | `1` |
-| Probe-history records | `64` |
+| Probe-history records | `64` cluster records; `32,768` emitted RTP accounting entries. Recent-entry eviction suppresses probes for `5 s` |
 | Minimum unmet-demand trigger | desired payload exceeds credible allocation by `20%` and `50_000 bit/s` |
 | Cluster target | `min(total governed demand, max(2 * credible media rate, 300_000 bit/s))` |
 | Cluster duration | `20 ms` |
@@ -1032,7 +1032,7 @@ Version-one hard internal bounds are:
 | Retained RTX age | `2 s` |
 | Retained RTX bytes | public configured limit |
 | Active probe clusters | `1` |
-| Probe history | `64` records |
+| Probe history | `64` cluster records and `32,768` emitted RTP accounting entries |
 | Direct frame dependencies | `8` |
 | Delay samples | `4_096` and `10 s` |
 | Rate samples per category | `2_048` and `5 s` |
