@@ -317,6 +317,7 @@ impl ScreamV2 {
                     .saturating_add(u64::from(sample.transport_bytes));
             }
             if input.ecn_mode != EcnMode::Disabled
+                && sample.newly_acked
                 && sample.received
                 && sample.ecn == Some(EcnMark::Ce)
             {
@@ -1046,7 +1047,7 @@ mod tests {
     }
 
     #[test]
-    fn recovered_ce_is_counted_without_double_ack_credit() {
+    fn recovered_ce_does_not_subtract_unrelated_ack_credit() {
         let mut cc = ScreamV2::new(4_000_000, None);
         let first = [sample(25, false, true, false, false)];
         cc.consume_feedback(Duration::from_millis(25), input(&first, 4_000_000));
@@ -1055,6 +1056,16 @@ mod tests {
         let mut values = input(&recovered, 4_000_000);
         values.ecn_mode = EcnMode::Classic;
         cc.consume_feedback(Duration::from_millis(50), values);
+        assert_eq!(cc.debug_accumulated_acks(), (1_000, 0));
+    }
+
+    #[test]
+    fn newly_acked_ce_subtracts_only_its_own_credit() {
+        let mut cc = ScreamV2::new(4_000_000, None);
+        let received = [sample(25, true, true, false, true)];
+        let mut values = input(&received, 4_000_000);
+        values.ecn_mode = EcnMode::Classic;
+        cc.consume_feedback(Duration::from_millis(25), values);
         assert_eq!(cc.debug_accumulated_acks(), (1_000, 1_000));
     }
 
