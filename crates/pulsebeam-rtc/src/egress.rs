@@ -452,7 +452,7 @@ impl MediaEgress {
                 || output.queue_delay
                     > self
                         .probe_start_queue_delay
-                        .saturating_add(Duration::from_millis(10))
+                        .saturating_add(self.probe_queue_impact_limit())
                 || matches!(output.reason, crate::congestion::ControllerReason::Loss))
         {
             self.finish_probe(at.monotonic, true);
@@ -1486,6 +1486,22 @@ impl MediaEgress {
         true
     }
 
+    fn probe_queue_impact_limit(&self) -> Duration {
+        self.senders
+            .iter()
+            .filter(|sender| sender.policy.desired_bitrate.as_bps() > 0)
+            .map(|sender| {
+                LatencyGovernor::operating_point(
+                    playout_max_ticks(sender.policy),
+                    sender.policy.desired_bitrate.as_bps(),
+                )
+                .probe_queue_impact
+            })
+            .min()
+            .unwrap_or(Duration::from_millis(10))
+            .min(Duration::from_millis(10))
+    }
+
     fn probe_candidate(&self) -> Option<usize> {
         self.senders
             .iter()
@@ -1897,6 +1913,10 @@ mod tests {
         egress.senders[1].policy.priority = MediaPriority::HIGH;
         egress.senders[1].policy.desired_bitrate = MediaPayloadBitrate::from_bps(500_000);
         assert_eq!(egress.probe_candidate(), Some(1));
+        assert_eq!(egress.probe_queue_impact_limit(), Duration::from_millis(10));
+        egress.senders[0].policy.playout_delay = PlayoutDelay::from_ticks(0, 0).expect("asap");
+        assert_eq!(egress.probe_queue_impact_limit(), Duration::from_millis(5));
+        egress.senders[0].policy.playout_delay = policy.playout_delay;
         assert_eq!(egress.cluster_target_bytes(100_000), 750);
         assert_eq!(egress.cluster_target_bytes(1_000_000), 3_562);
         egress.senders[0].policy.desired_bitrate = MediaPayloadBitrate::from_bps(u64::MAX);
