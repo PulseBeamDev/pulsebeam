@@ -12,7 +12,7 @@ use str0m::{
 };
 use tokio::time::Instant;
 
-use crate::control::NegotiatedResources;
+use crate::control::{NegotiatedResources, controller::ConnectionProfile};
 use crate::entity::{self, TrackId, TrackKind};
 use crate::id::ShardId;
 use crate::keys::TrackHandle;
@@ -98,6 +98,7 @@ pub struct ParticipantConfig {
     pub participant_id: entity::ParticipantId,
     pub participant_external_id: entity::ParticipantExternalId,
     pub connection_id: entity::ConnectionId,
+    pub profile: ConnectionProfile,
     pub rtc: Rtc,
     pub resources: NegotiatedResources,
 }
@@ -134,6 +135,7 @@ pub struct Participant {
     // Warm: touched per poll cycle
     upstream: UpstreamAllocator,
     negotiated: NegotiatedResources,
+    profile: ConnectionProfile,
     pub(crate) participant_id: entity::ParticipantId,
     pub(crate) connection_id: entity::ConnectionId,
     last_keyframe_request: HashMap<(Mid, Option<str0m::media::Rid>), Instant>,
@@ -200,6 +202,7 @@ impl Participant {
             stream_writer: StreamWriter::new(),
             participant_id: cfg.participant_id,
             connection_id: cfg.connection_id,
+            profile: cfg.profile,
             upstream: UpstreamAllocator::new(ctx),
             negotiated: cfg.resources,
             downstream: DownstreamAllocator::new(ctx, cfg.manual_sub),
@@ -829,8 +832,10 @@ impl Participant {
 
                 match intent {
                     DataTrackIntent::InternalSignaling => {
-                        plog_info!(self.log_ctx(), "internal media signaling is opened");
-                        self.signaling.set_cid(cid);
+                        if self.profile == ConnectionProfile::Native {
+                            plog_info!(self.log_ctx(), "internal media signaling is opened");
+                            self.signaling.set_cid(cid);
+                        }
                     }
 
                     DataTrackIntent::UserTopic(channel) => {
