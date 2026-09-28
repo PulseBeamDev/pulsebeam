@@ -1,0 +1,498 @@
+use alloc::{
+    collections::{BTreeMap, BTreeSet},
+    string::String,
+};
+
+use pulsebeam_proto::signaling_v1::{self as wire, catalog};
+
+use crate::{MediaDirection, MediaKind, MediaSlot, SlotBinding};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CatalogError {
+    Revision,
+    MissingState,
+    EmptyDelta,
+    Duplicate,
+    Missing,
+    InvalidIdentity,
+    IdentityChanged,
+    MappingReference,
+    MappingShape,
+    MappingRevision,
+}
+
+#[derive(Default)]
+pub(crate) struct CatalogState {
+    pub(crate) revision: u64,
+    pub(crate) participants: BTreeMap<String, wire::Participant>,
+    pub(crate) tracks: BTreeMap<String, wire::RemoteTrack>,
+    pub(crate) video: BTreeMap<u32, String>,
+    pub(crate) audio: BTreeMap<u32, String>,
+    pub(crate) intent_revision: u64,
+    known_participants: BTreeMap<String, String>,
+    known_tracks: BTreeMap<String, wire::RemoteTrack>,
+}
+
+impl CatalogState {
+    pub(crate) fn apply(
+        &mut self,
+        incoming: wire::Catalog,
+        recipient_id: &str,
+        recipient_external_id: &str,
+    ) -> Result<(), CatalogError> {
+        if incoming.revision == 0 {
+            return Err(CatalogError::Revision);
+        }
+        let mut next = Self {
+            revision: incoming.revision,
+            participants: self.participants.clone(),
+            tracks: self.tracks.clone(),
+            video: self.video.clone(),
+            audio: self.audio.clone(),
+            intent_revision: self.intent_revision,
+            known_participants: self.known_participants.clone(),
+            known_tracks: self.known_tracks.clone(),
+        };
+        match incoming.state.ok_or(CatalogError::MissingState)? {
+            catalog::State::Snapshot(snapshot) => {
+                if incoming.revision <= self.revision {
+                    return Err(CatalogError::Revision);
+                }
+                next.participants.clear();
+                next.tracks.clear();
+                for participant in snapshot.participants {
+                    let id = participant.participant_id.clone();
+                    if next.participants.insert(id, participant).is_some() {
+                        return Err(CatalogError::Duplicate);
+                    }
+                }
+                for track in snapshot.tracks {
+                    let id = track.track_id.clone();
+                    if next.tracks.insert(id, track).is_some() {
+                        return Err(CatalogError::Duplicate);
+                    }
+                }
+            }
+            catalog::State::Delta(delta) => {
+                if self.revision == 0 || self.revision.checked_add(1) != Some(incoming.revision) {
+                    return Err(CatalogError::Revision);
+                }
+                if delta.added_participants.is_empty()
+                    && delta.removed_participant_ids.is_empty()
+                    && delta.added_tracks.is_empty()
+                    && delta.removed_track_ids.is_empty()
+                {
+                    return Err(CatalogError::EmptyDelta);
+                }
+                let mut removed_participants = BTreeSet::new();
+                for id in delta.removed_participant_ids {
+                    if !removed_participants.insert(id.clone()) {
+                        return Err(CatalogError::Duplicate);
+                    }
+                    if !self.participants.contains_key(&id) {
+                        return Err(CatalogError::Missing);
+                    }
+                }
+                let mut removed_tracks = BTreeSet::new();
+                for id in delta.removed_track_ids {
+                    if !removed_tracks.insert(id.clone()) {
+                        return Err(CatalogError::Duplicate);
+                    }
+                    let Some(track) = self.tracks.get(&id) else {
+                        return Err(CatalogError::Missing);
+                    };
+                    if removed_participants.contains(&track.participant_id) {
+                        return Err(CatalogError::Duplicate);
+                    }
+                }
+                for id in removed_tracks {
+                    next.tracks.remove(&id);
+                }
+                for id in removed_participants {
+                    next.participants.remove(&id);
+                    next.tracks.retain(|_, track| track.participant_id != id);
+                }
+                for participant in delta.added_participants {
+                    let id = participant.participant_id.clone();
+                    if self.participants.contains_key(&id)
+                        || next.participants.insert(id, participant).is_some()
+                    {
+                        return Err(CatalogError::Duplicate);
+                    }
+                }
+                for track in delta.added_tracks {
+                    let id = track.track_id.clone();
+                    if self.tracks.contains_key(&id) || next.tracks.insert(id, track).is_some() {
+                        return Err(CatalogError::Duplicate);
+                    }
+                }
+            }
+        }
+        next.validate(recipient_id, recipient_external_id)?;
+        if self
+            .video
+            .values()
+            .chain(self.audio.values())
+            .any(|id| !next.tracks.contains_key(id))
+        {
+            return Err(CatalogError::MappingReference);
+        }
+        *self = next;
+        Ok(())
+    }
+
+    pub(crate) fn apply_mapping(
+        &mut self,
+        mapping: wire::Mapping,
+        coordinates: &BTreeMap<MediaSlot, SlotBinding>,
+    ) -> Result<(), CatalogError> {
+        if self.revision == 0 || mapping.intent_revision < self.intent_revision {
+            return Err(CatalogError::MappingRevision);
+        }
+        let (Some(video), Some(audio)) = (mapping.video, mapping.audio) else {
+            return Err(CatalogError::MappingShape);
+        };
+        let receivers: BTreeMap<u32, MediaKind> = coordinates
+            .values()
+            .filter(|binding| binding.direction == MediaDirection::ReceiveOnly)
+            .map(|binding| (binding.media_index, binding.kind))
+            .collect();
+        let mut used_tracks = BTreeSet::new();
+        let mut used_receivers = BTreeSet::new();
+        let mut parse = |entries: alloc::vec::Vec<wire::TrackMapping>, kind| {
+            let mut result = BTreeMap::new();
+            for entry in entries {
+                if !used_receivers.insert(entry.receiver_index)
+                    || !used_tracks.insert(entry.track_id.clone())
+                    || receivers.get(&entry.receiver_index) != Some(&kind)
+                    || self.tracks.get(&entry.track_id).map(|track| track.kind)
+                        != Some(match kind {
+                            MediaKind::Video => wire::TrackKind::Video as i32,
+                            MediaKind::Audio => wire::TrackKind::Audio as i32,
+                        })
+                {
+                    return Err(CatalogError::MappingShape);
+                }
+                result.insert(entry.receiver_index, entry.track_id);
+            }
+            Ok(result)
+        };
+        let video = parse(video.tracks, MediaKind::Video)?;
+        let audio = parse(audio.tracks, MediaKind::Audio)?;
+        self.video = video;
+        self.audio = audio;
+        self.intent_revision = mapping.intent_revision;
+        Ok(())
+    }
+
+    fn validate(
+        &mut self,
+        recipient_id: &str,
+        recipient_external_id: &str,
+    ) -> Result<(), CatalogError> {
+        let mut external_ids = BTreeSet::new();
+        external_ids.insert(recipient_external_id);
+        for (id, participant) in &self.participants {
+            if !valid(id, 128)
+                || !valid(&participant.participant_external_id, 256)
+                || id == recipient_id
+            {
+                return Err(CatalogError::InvalidIdentity);
+            }
+            if !external_ids.insert(&participant.participant_external_id) {
+                return Err(CatalogError::Duplicate);
+            }
+            if self
+                .known_participants
+                .get(id)
+                .is_some_and(|old| old != &participant.participant_external_id)
+            {
+                return Err(CatalogError::IdentityChanged);
+            }
+            self.known_participants
+                .insert(id.clone(), participant.participant_external_id.clone());
+        }
+        let mut selectors = BTreeSet::new();
+        for (id, track) in &self.tracks {
+            if !valid(id, 128)
+                || !valid(&track.label, 64)
+                || !self.participants.contains_key(&track.participant_id)
+                || track.participant_id == recipient_id
+                || !matches!(
+                    wire::TrackKind::try_from(track.kind),
+                    Ok(wire::TrackKind::Audio | wire::TrackKind::Video)
+                )
+            {
+                return Err(CatalogError::InvalidIdentity);
+            }
+            if !selectors.insert((&track.participant_id, track.kind, &track.label)) {
+                return Err(CatalogError::Duplicate);
+            }
+            if self.known_tracks.get(id).is_some_and(|old| old != track) {
+                return Err(CatalogError::IdentityChanged);
+            }
+            self.known_tracks.insert(id.clone(), track.clone());
+        }
+        Ok(())
+    }
+}
+
+fn valid(value: &str, limit: usize) -> bool {
+    !value.is_empty() && value.len() <= limit
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::vec;
+
+    fn participant() -> wire::Participant {
+        wire::Participant {
+            participant_id: "peer".into(),
+            participant_external_id: "alice".into(),
+        }
+    }
+    fn track() -> wire::RemoteTrack {
+        wire::RemoteTrack {
+            track_id: "opaque".into(),
+            participant_id: "peer".into(),
+            kind: wire::TrackKind::Audio.into(),
+            label: "mic".into(),
+        }
+    }
+    fn snapshot(
+        revision: u64,
+        participants: alloc::vec::Vec<wire::Participant>,
+        tracks: alloc::vec::Vec<wire::RemoteTrack>,
+    ) -> wire::Catalog {
+        wire::Catalog {
+            revision,
+            state: Some(catalog::State::Snapshot(wire::CatalogSnapshot {
+                participants,
+                tracks,
+            })),
+        }
+    }
+    fn delta(revision: u64, value: wire::CatalogDelta) -> wire::Catalog {
+        wire::Catalog {
+            revision,
+            state: Some(catalog::State::Delta(value)),
+        }
+    }
+    fn apply(
+        state: &mut CatalogState,
+        message: wire::Catalog,
+        mapped: &[&str],
+    ) -> Result<(), CatalogError> {
+        if !mapped.is_empty() {
+            state.audio = mapped
+                .iter()
+                .enumerate()
+                .map(|(index, id)| (index as u32, String::from(*id)))
+                .collect();
+        }
+        state.apply(message, "self", "me")
+    }
+
+    #[test]
+    fn catalog_requires_first_snapshot_and_atomic_consecutive_deltas() {
+        let mut state = CatalogState::default();
+        assert_eq!(
+            apply(&mut state, delta(1, wire::CatalogDelta::default()), &[]),
+            Err(CatalogError::Revision)
+        );
+        apply(
+            &mut state,
+            snapshot(1, vec![participant()], vec![track()]),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            apply(
+                &mut state,
+                delta(
+                    3,
+                    wire::CatalogDelta {
+                        removed_track_ids: vec!["opaque".into()],
+                        ..Default::default()
+                    }
+                ),
+                &[]
+            ),
+            Err(CatalogError::Revision)
+        );
+        assert_eq!(
+            apply(
+                &mut state,
+                delta(
+                    2,
+                    wire::CatalogDelta {
+                        removed_track_ids: vec!["opaque".into()],
+                        ..Default::default()
+                    }
+                ),
+                &["opaque"]
+            ),
+            Err(CatalogError::MappingReference)
+        );
+        assert_eq!(state.revision, 1);
+        assert!(state.tracks.contains_key("opaque"));
+        state.audio.clear();
+        apply(
+            &mut state,
+            delta(
+                2,
+                wire::CatalogDelta {
+                    removed_participant_ids: vec!["peer".into()],
+                    ..Default::default()
+                },
+            ),
+            &[],
+        )
+        .unwrap();
+        assert!(state.tracks.is_empty());
+        assert_eq!(
+            apply(&mut state, delta(3, wire::CatalogDelta::default()), &[]),
+            Err(CatalogError::EmptyDelta)
+        );
+        assert_eq!(state.revision, 2);
+    }
+
+    #[test]
+    fn catalog_rejects_duplicate_selectors_and_immutable_id_reuse() {
+        let mut state = CatalogState::default();
+        apply(
+            &mut state,
+            snapshot(1, vec![participant()], vec![track()]),
+            &[],
+        )
+        .unwrap();
+        let mut impostor = track();
+        impostor.track_id = "different".into();
+        assert_eq!(
+            apply(
+                &mut state,
+                snapshot(2, vec![participant()], vec![track(), impostor]),
+                &[]
+            ),
+            Err(CatalogError::Duplicate)
+        );
+        let mut altered = track();
+        altered.label = "other".into();
+        assert_eq!(
+            apply(
+                &mut state,
+                snapshot(2, vec![participant()], vec![altered]),
+                &[]
+            ),
+            Err(CatalogError::IdentityChanged)
+        );
+        assert_eq!(state.revision, 1);
+    }
+
+    #[test]
+    fn mapping_is_complete_kind_checked_and_causally_fenced() {
+        let mut state = CatalogState::default();
+        apply(
+            &mut state,
+            snapshot(1, vec![participant()], vec![track()]),
+            &[],
+        )
+        .unwrap();
+        let slot = MediaSlot::RemoteAudio(0);
+        let mut coordinates = BTreeMap::new();
+        coordinates.insert(
+            slot.clone(),
+            SlotBinding {
+                slot,
+                mid: "remote-audio".into(),
+                media_index: 3,
+                kind: MediaKind::Audio,
+                direction: MediaDirection::ReceiveOnly,
+            },
+        );
+        let valid = wire::Mapping {
+            intent_revision: 2,
+            video: Some(wire::TrackMappings::default()),
+            audio: Some(wire::TrackMappings {
+                tracks: vec![wire::TrackMapping {
+                    receiver_index: 3,
+                    track_id: "opaque".into(),
+                }],
+            }),
+        };
+        assert_eq!(
+            state.apply_mapping(
+                wire::Mapping {
+                    video: None,
+                    ..valid.clone()
+                },
+                &coordinates
+            ),
+            Err(CatalogError::MappingShape)
+        );
+        state.apply_mapping(valid.clone(), &coordinates).unwrap();
+        assert_eq!(state.audio.get(&3).map(String::as_str), Some("opaque"));
+        assert_eq!(
+            state.apply_mapping(
+                wire::Mapping {
+                    intent_revision: 1,
+                    ..valid.clone()
+                },
+                &coordinates
+            ),
+            Err(CatalogError::MappingRevision)
+        );
+        let invalid = wire::Mapping {
+            video: Some(wire::TrackMappings {
+                tracks: vec![wire::TrackMapping {
+                    receiver_index: 3,
+                    track_id: "opaque".into(),
+                }],
+            }),
+            ..valid
+        };
+        assert_eq!(
+            state.apply_mapping(invalid, &coordinates),
+            Err(CatalogError::MappingShape)
+        );
+        assert_eq!(state.intent_revision, 2);
+        assert_eq!(
+            apply(
+                &mut state,
+                delta(
+                    2,
+                    wire::CatalogDelta {
+                        removed_track_ids: vec!["opaque".into()],
+                        ..Default::default()
+                    }
+                ),
+                &[]
+            ),
+            Err(CatalogError::MappingReference)
+        );
+        state
+            .apply_mapping(
+                wire::Mapping {
+                    intent_revision: 2,
+                    video: Some(wire::TrackMappings::default()),
+                    audio: Some(wire::TrackMappings::default()),
+                },
+                &coordinates,
+            )
+            .unwrap();
+        apply(
+            &mut state,
+            delta(
+                2,
+                wire::CatalogDelta {
+                    removed_track_ids: vec!["opaque".into()],
+                    ..Default::default()
+                },
+            ),
+            &[],
+        )
+        .unwrap();
+        assert!(state.tracks.is_empty());
+    }
+}
