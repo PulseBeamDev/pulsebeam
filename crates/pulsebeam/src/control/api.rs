@@ -284,6 +284,35 @@ fn validate_strict_directions(offer: &str, required: &str) -> Result<(), ApiErro
     validate_directions(offer, &[required], required, true)
 }
 
+fn validate_single_media_per_kind(offer: &str) -> Result<(), ApiError> {
+    let (mut audio, mut video) = (0, 0);
+    for line in offer.lines().map(str::trim_end) {
+        let Some(media) = line.strip_prefix("m=") else {
+            continue;
+        };
+        let mut fields = media.split_ascii_whitespace();
+        let kind = fields.next();
+        let port = fields.next();
+        let protocol = fields.next();
+        if port.is_none_or(|value| value.split('/').next() == Some("0"))
+            || !protocol.is_some_and(|value| value.to_ascii_uppercase().contains("RTP"))
+        {
+            continue;
+        }
+        match kind {
+            Some("audio") => audio += 1,
+            Some("video") => video += 1,
+            _ => {}
+        }
+        if audio > 1 || video > 1 {
+            return Err(ApiError::BadRequest(
+                "WHIP/WHEP support at most one active track per media kind".to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[utoipa::path(
     post,
     path = "/native",
@@ -446,6 +475,7 @@ async fn create_sdp_profile(
         .map_err(|_| ApiError::BadRequest("SDP body must be UTF-8".to_owned()))?;
     let offer = SdpOffer::from_sdp_string(raw_offer)?;
     validate_strict_directions(raw_offer, required_direction)?;
+    validate_single_media_per_kind(raw_offer)?;
     let lease = controller::AuthorizationLease::from_expiry(
         authorization.expiry,
         wall_now,
@@ -1262,6 +1292,19 @@ mod tests {
                 assert!(validate_strict_directions(&only_port_zero, required).is_err());
             }
         }
+    }
+
+    #[test]
+    fn whip_and_whep_reject_multiple_active_tracks_of_one_kind() {
+        let one_of_each = "m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n\
+                           m=video 9 UDP/TLS/RTP/SAVPF 96\r\n";
+        assert!(validate_single_media_per_kind(one_of_each).is_ok());
+        let duplicate_audio = format!("{one_of_each}m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n");
+        assert!(validate_single_media_per_kind(&duplicate_audio).is_err());
+        let duplicate_video = format!("{one_of_each}m=video 9 UDP/TLS/RTP/SAVPF 96\r\n");
+        assert!(validate_single_media_per_kind(&duplicate_video).is_err());
+        let rejected_duplicate = format!("{one_of_each}m=audio 0 UDP/TLS/RTP/SAVPF 111\r\n");
+        assert!(validate_single_media_per_kind(&rejected_duplicate).is_ok());
     }
 
     #[test]
