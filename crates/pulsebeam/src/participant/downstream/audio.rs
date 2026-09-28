@@ -1,6 +1,8 @@
 use std::array;
 use std::time::Duration;
 
+use ahash::{HashSet, HashSetExt};
+
 use str0m::media::{Mid, Pt};
 use str0m::rtp::Ssrc;
 use tokio::time::Instant;
@@ -41,6 +43,8 @@ pub struct AudioAllocator {
     /// What the client asked for. Auto with no pins until it says otherwise,
     /// which is what the SFU did before a client could say anything about audio.
     intent: AudioIntent,
+    fixed_receivers: HashSet<Mid>,
+    fixed_tracks: HashSet<TrackId>,
 }
 
 pub struct DownstreamAudio {
@@ -136,11 +140,40 @@ impl AudioAllocator {
                 pinned: Vec::new(),
                 auto: !manual_sub,
             },
+            fixed_receivers: HashSet::new(),
+            fixed_tracks: HashSet::new(),
         }
     }
 
     pub fn set_intent(&mut self, intent: AudioIntent) {
         self.intent = intent;
+    }
+
+    pub(crate) fn set_playout_compatibility(
+        &mut self,
+        fixed_receivers: HashSet<Mid>,
+        fixed_tracks: HashSet<TrackId>,
+    ) {
+        self.fixed_receivers = fixed_receivers;
+        self.fixed_tracks = fixed_tracks;
+    }
+
+    pub(crate) fn mark_fixed_receiver(&mut self, mid: Mid) {
+        self.fixed_receivers.insert(mid);
+    }
+
+    pub(crate) fn default_needs_reconnect(&self) -> bool {
+        let has_default_demand = self.intent.auto
+            || self
+                .intent
+                .pinned
+                .iter()
+                .any(|id| !self.fixed_tracks.contains(id));
+        has_default_demand
+            && self.provisioned().next().is_some()
+            && self
+                .provisioned()
+                .all(|(_, slot)| self.fixed_receivers.contains(&slot.mid))
     }
 
     fn is_pinned(&self, track: TrackId) -> bool {
@@ -208,12 +241,6 @@ impl AudioAllocator {
             }
         }
         removed
-    }
-
-    /// How many audio mids this subscriber negotiated. The ceiling on both what
-    /// it can hear at once and how many tracks it may usefully pin.
-    pub fn slot_count(&self) -> usize {
-        self.slots.iter().flatten().count()
     }
 
     pub fn has_slot(&self, mid: Mid) -> bool {
@@ -333,25 +360,28 @@ impl AudioAllocator {
             pkt.marker = true;
             slot.pending_marker = false;
         }
-        writer.write_audio_owned(pkt, slot.mid, slot.ssrc, slot.pt);
+        writer.write_audio_owned(pkt, origin.track, slot.mid, slot.ssrc, slot.pt);
         Some(())
     }
 
     /// Which slot this speaker gets, if any.
     fn slot_for(&self, origin: AudioOrigin, power: f32, now: Instant) -> Option<usize> {
         let pinned = self.is_pinned(origin.track);
+        let compatible = |slot: &Slot| {
+            self.fixed_tracks.contains(&origin.track) || !self.fixed_receivers.contains(&slot.mid)
+        };
         if !pinned && !self.intent.auto {
             return None;
         }
         if let Some((idx, _)) = self
             .provisioned()
-            .find(|(_, slot)| slot.occupant.map(|o| o.origin) == Some(origin))
+            .find(|(_, slot)| compatible(slot) && slot.occupant.map(|o| o.origin) == Some(origin))
         {
             return Some(idx);
         }
         if let Some((idx, _)) = self
             .provisioned()
-            .find(|(_, slot)| slot.is_dead(now) && !slot.is_immune(now))
+            .find(|(_, slot)| compatible(slot) && slot.is_dead(now) && !slot.is_immune(now))
         {
             return Some(idx);
         }
@@ -359,7 +389,7 @@ impl AudioAllocator {
         // quiet it goes - that is what pinning means.
         let (idx, quietest) = self
             .provisioned()
-            .filter(|(_, slot)| !slot.is_immune(now) && !self.holds_pin(slot))
+            .filter(|(_, slot)| compatible(slot) && !slot.is_immune(now) && !self.holds_pin(slot))
             .min_by(|(_, a), (_, b)| {
                 a.last_power
                     .partial_cmp(&b.last_power)
@@ -474,6 +504,23 @@ mod tests {
 
     fn heard_origins(alloc: &AudioAllocator) -> Vec<AudioOrigin> {
         alloc.assignments().into_iter().map(|h| h.origin).collect()
+    }
+
+    #[test]
+    fn default_audio_uses_a_fresh_receiver_instead_of_a_fixed_one() {
+        let mut alloc = allocator_with(2);
+        alloc.mark_fixed_receiver(Mid::from("a0"));
+        alloc.on_rtp(origin(1), &speaking(-30), &mut StreamWriter::new());
+        assert_eq!(alloc.assignments()[0].mid, Mid::from("a1"));
+        assert!(!alloc.default_needs_reconnect());
+        let mut only_fixed = allocator_with(1);
+        only_fixed.mark_fixed_receiver(Mid::from("a0"));
+        assert!(only_fixed.default_needs_reconnect());
+        assert!(
+            only_fixed
+                .on_rtp(origin(1), &speaking(-30), &mut StreamWriter::new())
+                .is_none()
+        );
     }
 
     #[test]

@@ -181,7 +181,7 @@ pub(crate) struct IntentState {
 
 pub(crate) enum IntentDecision {
     Replay,
-    Accept(IntentPlan),
+    Accept(Box<IntentPlan>),
 }
 
 pub(crate) struct IntentPlan {
@@ -219,11 +219,11 @@ impl IntentState {
             .senders
             .plan(intent.send.as_ref(), negotiated_senders)
             .map_err(IntentError::SendBinding)?;
-        Ok(IntentDecision::Accept(IntentPlan {
+        Ok(IntentDecision::Accept(Box::new(IntentPlan {
             revision: intent.revision,
             send,
             receive: intent.receive.clone(),
-        }))
+        })))
     }
 
     pub(crate) fn commit(
@@ -519,7 +519,7 @@ pub(crate) struct NativeOutput {
 }
 
 enum PendingOutput {
-    Catalog(CatalogPlan),
+    Catalog(Box<CatalogPlan>),
     Mapping(pulsebeam_proto::signaling_v1::Mapping),
 }
 
@@ -601,7 +601,7 @@ impl NativeSession {
                         revision: plan.revision,
                         cause,
                     })?;
-                let (published, receive) = self.intents.commit(plan);
+                let (published, receive) = self.intents.commit(*plan);
                 self.mark_mapping_dirty();
                 Ok(AppliedInput::Intent { published, receive })
             }
@@ -667,7 +667,7 @@ impl NativeSession {
             }
             let bytes = pulsebeam_proto::codec::encode_server(&plan.message)
                 .map_err(OutputError::Encode)?;
-            self.pending = Some(PendingOutput::Catalog(plan));
+            self.pending = Some(PendingOutput::Catalog(Box::new(plan)));
             return Ok(Some(NativeOutput { cid, bytes }));
         }
         let video = assignments
@@ -696,7 +696,7 @@ impl NativeSession {
 
     pub(crate) fn commit_sent(&mut self) {
         match self.pending.take() {
-            Some(PendingOutput::Catalog(plan)) => self.catalog.commit(plan),
+            Some(PendingOutput::Catalog(plan)) => self.catalog.commit(*plan),
             Some(PendingOutput::Mapping(mapping)) => {
                 self.mapping = Some(mapping);
                 self.force_mapping = false;
@@ -873,9 +873,8 @@ mod tests {
             })),
         };
         let bytes = pulsebeam_proto::codec::encode_client(&message).unwrap();
-        let err = match decode_input(&bytes, &IntentState::default(), &HashMap::new(), 0) {
-            Ok(_) => panic!("capacity overflow must be fatal"),
-            Err(err) => err,
+        let Err(err) = decode_input(&bytes, &IntentState::default(), &HashMap::new(), 0) else {
+            panic!("capacity overflow must be fatal");
         };
         assert_eq!(
             err,
@@ -910,7 +909,7 @@ mod tests {
         let IntentDecision::Accept(plan) = state.plan(&initial, &media(), 0).unwrap() else {
             panic!("fresh revision must be accepted");
         };
-        assert_eq!(state.commit(plan).0.len(), 1);
+        assert_eq!(state.commit(*plan).0.len(), 1);
         assert_eq!(state.revision(), 2);
         let conflicting = Intent {
             revision: 2,
@@ -972,7 +971,7 @@ mod tests {
         let IntentDecision::Accept(plan) = state.plan(&valid, &media(), 1).unwrap() else {
             panic!("failed candidate must not reserve sender labels");
         };
-        assert_eq!(state.commit(plan).0.len(), 1);
+        assert_eq!(state.commit(*plan).0.len(), 1);
     }
 
     #[test]

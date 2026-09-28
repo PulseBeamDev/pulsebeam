@@ -9,11 +9,6 @@ pub mod reliable {
 }
 
 #[allow(clippy::doc_lazy_continuation)]
-pub mod signaling {
-    include!(concat!(env!("OUT_DIR"), "/signaling.rs"));
-}
-
-#[allow(clippy::doc_lazy_continuation)]
 pub mod signaling_v1 {
     include!(concat!(env!("OUT_DIR"), "/pulsebeam.media.v1.rs"));
 }

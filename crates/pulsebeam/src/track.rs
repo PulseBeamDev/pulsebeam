@@ -43,6 +43,7 @@ pub const MAX_SIMULCAST_LAYERS: usize = 3;
 pub enum StreamWrite {
     Video {
         pkt: RtpPacket,
+        track_id: TrackId,
         mid: Mid,
         rid: Option<Rid>,
         ssrc: Ssrc,
@@ -50,6 +51,7 @@ pub enum StreamWrite {
     },
     Audio {
         pkt: RtpPacket,
+        track_id: TrackId,
         mid: Mid,
         ssrc: Ssrc,
         pt: Pt,
@@ -78,6 +80,7 @@ impl StreamWriter {
     pub fn write_video_owned(
         &mut self,
         pkt: RtpPacket,
+        track_id: TrackId,
         mid: Mid,
         rid: Option<Rid>,
         ssrc: Ssrc,
@@ -85,6 +88,7 @@ impl StreamWriter {
     ) {
         self.pending.push_back(StreamWrite::Video {
             pkt,
+            track_id,
             mid,
             rid,
             ssrc,
@@ -92,9 +96,21 @@ impl StreamWriter {
         });
     }
 
-    pub fn write_audio_owned(&mut self, pkt: RtpPacket, mid: Mid, ssrc: Ssrc, pt: Pt) {
-        self.pending
-            .push_back(StreamWrite::Audio { pkt, mid, ssrc, pt });
+    pub fn write_audio_owned(
+        &mut self,
+        pkt: RtpPacket,
+        track_id: TrackId,
+        mid: Mid,
+        ssrc: Ssrc,
+        pt: Pt,
+    ) {
+        self.pending.push_back(StreamWrite::Audio {
+            pkt,
+            track_id,
+            mid,
+            ssrc,
+            pt,
+        });
     }
 
     pub fn pop(&mut self) -> Option<StreamWrite> {

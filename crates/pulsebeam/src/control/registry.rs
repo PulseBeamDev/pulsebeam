@@ -89,6 +89,10 @@ impl RoomRegistry {
     /// Atomically installs a prepared local incarnation when it wins UUIDv7
     /// ordering. The ordering is only a local convergence discriminator: this
     /// registry is neither replicated nor durable across process restarts.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "candidate identity, placement, and transport commit atomically"
+    )]
     pub fn commit_candidate(
         &mut self,
         participant_id: ParticipantId,

@@ -11,11 +11,10 @@ use str0m::{
 };
 use tokio::time::Instant;
 
-pub const MAX_RECV_VIDEO_SLOTS: usize = 2;
-pub const MAX_RECV_AUDIO_SLOTS: usize = 2;
-// https://github.com/PulseBeamDev/pulsebeam/issues/133
-pub const MAX_SEND_VIDEO_SLOTS: usize = 7;
-pub const MAX_SEND_AUDIO_SLOTS: usize = 3;
+pub const MAX_RECV_VIDEO_SLOTS: usize = 32;
+pub const MAX_RECV_AUDIO_SLOTS: usize = 32;
+pub const MAX_SEND_VIDEO_SLOTS: usize = 32;
+pub const MAX_SEND_AUDIO_SLOTS: usize = 32;
 pub const MAX_DATA_CHANNELS: usize = 1;
 
 #[derive(Debug)]
@@ -94,6 +93,10 @@ pub struct NegotiatedResources {
 impl NegotiatedResources {
     pub fn media(&self, mid: Mid) -> Option<NegotiatedMedia> {
         self.media.iter().find(|media| media.mid == mid).copied()
+    }
+
+    pub(crate) fn media_sections(&self) -> &[NegotiatedMedia] {
+        &self.media
     }
 
     #[cfg(test)]
@@ -384,6 +387,44 @@ mod tests {
                 (2, MediaKind::Video, Direction::SendOnly),
             ]
         );
+    }
+
+    #[test]
+    fn negotiated_capacity_is_independent_per_kind_and_direction() {
+        let mut rtc = RtcConfig::new().build(std::time::Instant::now());
+        let mut change = rtc.sdp_api();
+        for (kind, direction) in [
+            (MediaKind::Audio, Direction::SendOnly),
+            (MediaKind::Video, Direction::SendOnly),
+            (MediaKind::Audio, Direction::RecvOnly),
+            (MediaKind::Video, Direction::RecvOnly),
+        ] {
+            for _ in 0..32 {
+                change.add_media(kind, direction, None, None, None);
+            }
+        }
+        let offer = change.apply().unwrap().0;
+        let mut negotiator = Negotiator::new(Vec::new());
+        assert!(negotiator.create_answer(offer, IceCreds::new()).is_ok());
+    }
+
+    #[test]
+    fn rejects_thirty_third_video_receiver() {
+        let mut rtc = RtcConfig::new().build(std::time::Instant::now());
+        let mut change = rtc.sdp_api();
+        for _ in 0..33 {
+            change.add_media(MediaKind::Video, Direction::RecvOnly, None, None, None);
+        }
+        let offer = change.apply().unwrap().0;
+        let mut negotiator = Negotiator::new(Vec::new());
+        assert!(matches!(
+            negotiator.create_answer(offer, IceCreds::new()),
+            Err(NegotiatorError::SlotsLimit(
+                MediaType::Video,
+                Direction::RecvOnly,
+                32
+            ))
+        ));
     }
 
     #[test]

@@ -15,7 +15,7 @@ use crate::participant::event::ParticipantSink;
 pub use crate::participant::intent::AudioIntent;
 use crate::rtp::RtpPacket;
 use crate::track::{StreamWriter, Track, TrackLayer, TrackMeta};
-use ahash::HashSetExt;
+use ahash::{HashMap, HashMapExt, HashSet, HashSetExt};
 pub use audio::DownstreamAudio;
 pub(crate) use data::DownstreamData;
 use indexmap::IndexMap;
@@ -213,9 +213,14 @@ impl BweFilter {
 }
 
 struct PlayoutDelayConfirm {
-    mid: Mid,
     rid: Option<Rid>,
     seq: SeqNo,
+}
+
+struct FixedReceiver {
+    bounds: (MediaTime, MediaTime),
+    pending: bool,
+    confirm: Option<PlayoutDelayConfirm>,
 }
 
 pub struct Downstream {
@@ -238,9 +243,8 @@ pub struct Downstream {
     /// exists, and the estimate it was at then.
     starved_since: Option<StarvationWatch>,
 
-    playout_delay: Option<(MediaTime, MediaTime)>,
-    playout_delay_pending: bool,
-    playout_delay_confirm: Option<PlayoutDelayConfirm>,
+    desired_playout: HashMap<TrackId, (MediaTime, MediaTime)>,
+    fixed_receivers: HashMap<Mid, FixedReceiver>,
 }
 
 #[derive(Clone, Copy)]
@@ -264,9 +268,8 @@ impl Downstream {
             available_bandwidth: BweFilter::new(START_BANDWIDTH),
             last_desired: video::START_BANDWIDTH,
             starved_since: None,
-            playout_delay: None,
-            playout_delay_pending: false,
-            playout_delay_confirm: None,
+            desired_playout: HashMap::new(),
+            fixed_receivers: HashMap::new(),
         }
     }
 
@@ -300,55 +303,64 @@ impl Downstream {
         self.catalog.get(key).copied()
     }
 
-    pub fn set_playout_delay(&mut self, bounds: Option<(u32, u32)>) {
-        const MAX_HUNDREDTHS: u64 = 0xfff;
-        let to_hundredths = |ms: u32| ((ms as u64).saturating_add(5) / 10).min(MAX_HUNDREDTHS);
-        let Some(bounds) = bounds else {
-            return;
+    fn encode_playout_delay(
+        bounds: &pulsebeam_proto::signaling_v1::PlayoutDelay,
+    ) -> (MediaTime, MediaTime) {
+        let min = bounds.min_ms.min(2_000);
+        let max = bounds.max_ms.min(2_000).max(min);
+        let rounded = |ms: u32| MediaTime::from_hundredths(u64::from(ms.saturating_add(5) / 10));
+        (rounded(min), rounded(max))
+    }
+
+    /// A fixed receiver cannot return to native defaults during this transport generation.
+    /// The caller must send Reconnect and suppress the incompatible packet.
+    pub fn playout_delay_to_stamp(
+        &mut self,
+        track_id: TrackId,
+        mid: Mid,
+    ) -> Result<Option<(MediaTime, MediaTime)>, ()> {
+        let Some(&bounds) = self.desired_playout.get(&track_id) else {
+            return if self.fixed_receivers.contains_key(&mid) {
+                Err(())
+            } else {
+                Ok(None)
+            };
         };
-        let max = to_hundredths(bounds.1);
-        let min = to_hundredths(bounds.0).min(max);
-        let delay = (
-            MediaTime::from_hundredths(min),
-            MediaTime::from_hundredths(max),
-        );
-        if self.playout_delay == Some(delay) {
-            return;
+        let receiver = self.fixed_receivers.entry(mid).or_insert(FixedReceiver {
+            bounds,
+            pending: true,
+            confirm: None,
+        });
+        if receiver.bounds != bounds {
+            receiver.bounds = bounds;
+            receiver.pending = true;
+            receiver.confirm = None;
         }
-        self.playout_delay = Some(delay);
-        self.playout_delay_pending = true;
-        self.playout_delay_confirm = None;
+        let stamp = receiver.pending.then_some(bounds);
+        if track_id.kind() == TrackKind::Audio {
+            self.audio.mark_fixed_receiver(mid);
+        }
+        Ok(stamp)
     }
 
-    /// Returns the playout delay to stamp if the receiver has not yet confirmed
-    /// receipt. Returns `None` once confirmed — extension is sticky so no need
-    /// to keep sending unchanged values.
-    #[inline]
-    pub fn playout_delay_to_stamp(&self) -> Option<(MediaTime, MediaTime)> {
-        if self.playout_delay_pending {
-            self.playout_delay
-        } else {
-            None
-        }
-    }
-
-    /// Record that a packet with the current playout delay values was stamped.
-    /// Tracks the first such packet per change for RTCP confirmation.
     pub fn record_playout_delay_stamp(&mut self, mid: Mid, rid: Option<Rid>, seq: SeqNo) {
-        if self.playout_delay_confirm.is_none() {
-            self.playout_delay_confirm = Some(PlayoutDelayConfirm { mid, rid, seq });
+        if let Some(receiver) = self.fixed_receivers.get_mut(&mid)
+            && receiver.confirm.is_none()
+        {
+            receiver.confirm = Some(PlayoutDelayConfirm { rid, seq });
         }
     }
 
-    /// Called when RTCP receiver report stats arrive for a stream. Clears the
-    /// pending flag once the remote has acknowledged receipt past our tracked seq.
     pub fn handle_egress_stats(&mut self, mid: Mid, rid: Option<Rid>, remote_max_seq: SeqNo) {
-        let Some(confirm) = &self.playout_delay_confirm else {
+        let Some(receiver) = self.fixed_receivers.get_mut(&mid) else {
             return;
         };
-        if confirm.mid == mid && confirm.rid == rid && remote_max_seq >= confirm.seq {
-            self.playout_delay_pending = false;
-            self.playout_delay_confirm = None;
+        let Some(confirm) = &receiver.confirm else {
+            return;
+        };
+        if confirm.rid == rid && remote_max_seq >= confirm.seq {
+            receiver.pending = false;
+            receiver.confirm = None;
         }
     }
 
@@ -388,70 +400,72 @@ impl Downstream {
     pub(crate) fn apply_native_receive(
         &mut self,
         receive: Option<&pulsebeam_proto::signaling_v1::ReceiveIntent>,
-    ) {
+    ) -> bool {
         let requested_video = receive
             .and_then(|request| request.video.as_ref())
             .map_or(&[][..], |video| video.tracks.as_slice());
-        self.video.configure_native(requested_video);
         self.set_audio_intent(decode_native_audio(
             receive.and_then(|request| request.audio.as_ref()),
         ));
+        self.desired_playout.clear();
+        let mut seen = HashSet::new();
+        for request in requested_video {
+            if let Ok(id) = TrackId::try_from(request.track_id.clone())
+                && id.kind() == TrackKind::Video
+                && seen.insert(id)
+                && let Some(bounds) = request
+                    .options
+                    .as_ref()
+                    .and_then(|options| options.playout_delay.as_ref())
+            {
+                self.desired_playout
+                    .insert(id, Self::encode_playout_delay(bounds));
+            }
+        }
+        if let Some(audio) = receive.and_then(|request| request.audio.as_ref()) {
+            for request in &audio.tracks {
+                if let Ok(id) = TrackId::try_from(request.track_id.clone())
+                    && id.kind() == TrackKind::Audio
+                    && seen.insert(id)
+                    && let Some(bounds) = request
+                        .options
+                        .as_ref()
+                        .and_then(|options| options.playout_delay.as_ref())
+                {
+                    self.desired_playout
+                        .insert(id, Self::encode_playout_delay(bounds));
+                }
+            }
+        }
+        let fixed_mids = self.fixed_receivers.keys().copied().collect();
+        let fixed_audio = self
+            .desired_playout
+            .keys()
+            .filter(|id| id.kind() == TrackKind::Audio)
+            .copied()
+            .collect();
+        let fixed_audio_mids = self
+            .fixed_receivers
+            .keys()
+            .copied()
+            .filter(|mid| self.audio.has_slot(*mid))
+            .collect();
+        self.audio
+            .set_playout_compatibility(fixed_audio_mids, fixed_audio);
+        let reconnect = self.video.configure_native(requested_video, &fixed_mids)
+            || self.audio.default_needs_reconnect();
         self.dirty_allocation = true;
+        reconnect
     }
 
-    pub(crate) fn apply_signaling_intents(
-        &mut self,
-        intents: crate::participant::signaling::SignalingIntents,
-    ) {
-        if let Some(video) = intents.video {
-            self.video.configure(&video);
-        }
-        if let Some(audio) = intents.audio {
-            self.set_audio_intent(audio);
-        }
-        if intents.playout_delay.is_some() {
-            self.set_playout_delay(intents.playout_delay);
-        }
-        self.dirty_allocation = true;
+    pub(crate) fn native_publications(&self) -> Vec<crate::track::TrackMeta> {
+        self.video
+            .tracks()
+            .chain(self.audio_tracks.values())
+            .cloned()
+            .collect()
     }
 
-    pub(crate) fn signaling_snapshot(&self) -> crate::participant::signaling::SignalingSnapshot {
-        use crate::participant::signaling::{
-            SignalingAudioBinding, SignalingSnapshot, SignalingVideoBinding,
-        };
-        SignalingSnapshot {
-            publications: self
-                .video
-                .tracks()
-                .chain(self.audio_tracks.values())
-                .cloned()
-                .collect(),
-            participants: ahash::HashSet::new(),
-            video: self
-                .video
-                .slots()
-                .map(|slot| SignalingVideoBinding {
-                    mid: slot.mid.to_string(),
-                    track_id: slot.track.id.as_str(),
-                    paused: slot.paused,
-                })
-                .collect(),
-            audio: self
-                .audio_assignments()
-                .iter()
-                .map(|heard| SignalingAudioBinding {
-                    mid: heard.mid.to_string(),
-                    track_id: heard.origin.track.as_str(),
-                    level_dbov: i32::from(heard.level_dbov),
-                })
-                .collect(),
-        }
-    }
-
-    #[allow(
-        dead_code,
-        reason = "native v1 Mapping uses stable negotiated receiver indices"
-    )]
     pub(crate) fn native_assignments(&self) -> (Vec<(u32, TrackId)>, Vec<(u32, TrackId)>) {
         let video = self.video.native_mapping_slots().collect();
         let audio = self
@@ -464,10 +478,6 @@ impl Downstream {
             })
             .collect();
         (video, audio)
-    }
-
-    pub fn audio_slot_count(&self) -> usize {
-        self.audio.slot_count()
     }
 
     pub(super) fn remove_track(&mut self, track_id: &TrackId) -> bool {
@@ -657,6 +667,59 @@ mod tests {
     // Convenience only: a test is not a shard, so nothing here is
     // cross-core. See crates/pulsebeam/docs/thread-per-core.md.
     use super::*;
+
+    #[test]
+    fn fixed_playout_is_per_receiver_and_defaults_require_a_fresh_mid() {
+        use pulsebeam_proto::signaling_v1::PlayoutDelay;
+        let mut downstream = Downstream::new(
+            LogCtx {
+                room_id: crate::entity::RoomId::from_external(
+                    &crate::entity::RoomExternalId::new("room").unwrap(),
+                ),
+                participant_id: ParticipantId::new(),
+            },
+            false,
+        );
+        let fixed = ParticipantId::new().derive_track_id(TrackKind::Video, "fixed");
+        let default = ParticipantId::new().derive_track_id(TrackKind::Video, "default");
+        let first = Mid::from("0");
+        let fresh = Mid::from("1");
+        let bounds = Downstream::encode_playout_delay(&PlayoutDelay {
+            min_ms: 1_995,
+            max_ms: 10,
+        });
+        assert_eq!(
+            bounds,
+            (
+                MediaTime::from_hundredths(200),
+                MediaTime::from_hundredths(200)
+            )
+        );
+        downstream.desired_playout.insert(fixed, bounds);
+        assert_eq!(
+            downstream.playout_delay_to_stamp(fixed, first),
+            Ok(Some(bounds))
+        );
+        downstream.record_playout_delay_stamp(first, None, SeqNo::from(7u64));
+        downstream.handle_egress_stats(first, None, SeqNo::from(8u64));
+        assert_eq!(downstream.playout_delay_to_stamp(fixed, first), Ok(None));
+        downstream.desired_playout.clear();
+        assert_eq!(downstream.playout_delay_to_stamp(default, first), Err(()));
+        assert_eq!(downstream.playout_delay_to_stamp(default, fresh), Ok(None));
+        let zero = Downstream::encode_playout_delay(&PlayoutDelay {
+            min_ms: 0,
+            max_ms: 0,
+        });
+        assert_eq!(
+            zero,
+            (MediaTime::from_hundredths(0), MediaTime::from_hundredths(0))
+        );
+        downstream.desired_playout.insert(default, zero);
+        assert_eq!(
+            downstream.playout_delay_to_stamp(default, first),
+            Ok(Some(zero))
+        );
+    }
 
     #[test]
     fn native_audio_defaults_auto_and_preserves_first_unique_audio_preference() {

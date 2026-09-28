@@ -18,6 +18,7 @@ pub(crate) trait ParticipantSink {
     fn subscribe_tracks(&mut self, selector: TrackSelector, selection: SelectionPolicy);
     fn unsubscribe_tracks(&mut self, selector: TrackSelector);
     fn request_reverse(&mut self, stream: TrackHandle, packet: ReversePacket);
+    fn renew_authorization(&mut self, token: String);
     fn exit(&mut self);
 
     fn publish_track_packet(&mut self, fanout: Option<TrackHandle>, packet: TrackPacket);
@@ -78,6 +79,8 @@ pub mod test_utils {
         fn request_reverse(&mut self, stream: TrackHandle, _packet: ReversePacket) {
             self.reverse_requests.push(stream);
         }
+
+        fn renew_authorization(&mut self, _token: String) {}
 
         fn exit(&mut self) {
             self.exit_count = self.exit_count.saturating_add(1);

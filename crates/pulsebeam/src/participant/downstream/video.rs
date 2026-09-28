@@ -251,14 +251,11 @@ impl VideoAllocator {
         }
     }
 
-    #[allow(
-        dead_code,
-        reason = "native v1 receive intent selects canonical tracks, not MIDs"
-    )]
     pub(crate) fn configure_native(
         &mut self,
         requests: &[pulsebeam_proto::signaling_v1::VideoTrackIntent],
-    ) {
+        fixed_mids: &HashSet<Mid>,
+    ) -> bool {
         let mut desired = IndexMap::new();
         for request in requests {
             let Ok(track_id) = TrackId::try_from(request.track_id.clone()) else {
@@ -269,7 +266,7 @@ impl VideoAllocator {
             {
                 desired
                     .entry(track_id)
-                    .or_insert_with(|| request.options.clone().unwrap_or_default());
+                    .or_insert_with(|| request.options.unwrap_or_default());
             }
         }
         let mut slots: Vec<_> = self
@@ -283,6 +280,7 @@ impl VideoAllocator {
         for (_, mid, current) in &slots {
             if let Some(track_id) = current
                 && let Some(options) = desired.get(track_id)
+                && (options.playout_delay.is_some() || !fixed_mids.contains(mid))
             {
                 assigned.insert(*track_id);
                 intents.insert(*mid, Self::native_slot_intent(*track_id, options));
@@ -292,16 +290,26 @@ impl VideoAllocator {
             .iter()
             .filter(|(_, mid, _)| !intents.contains_key(mid))
             .map(|(_, mid, _)| *mid)
-            .collect::<Vec<_>>()
-            .into_iter();
-        for (track_id, options) in desired {
-            if assigned.contains(&track_id) {
-                continue;
+            .collect::<Vec<_>>();
+        let mut reconnect = false;
+        for fixed in [false, true] {
+            for (&track_id, options) in &desired {
+                if assigned.contains(&track_id) || options.playout_delay.is_some() != fixed {
+                    continue;
+                }
+                let position = unused
+                    .iter()
+                    .position(|mid| fixed || !fixed_mids.contains(mid));
+                if let Some(position) = position {
+                    let mid = unused.remove(position);
+                    intents.insert(mid, Self::native_slot_intent(track_id, options));
+                } else if !fixed && !unused.is_empty() {
+                    reconnect = true;
+                }
             }
-            let Some(mid) = unused.next() else { break };
-            intents.insert(mid, Self::native_slot_intent(track_id, &options));
         }
         self.configure(&intents);
+        reconnect
     }
 
     fn native_slot_intent(
@@ -346,10 +354,10 @@ impl VideoAllocator {
 
             let states = track_states(track_state);
             let meets_floor = |layer: &&TrackLayer| {
-                states
-                    .get(&layer.stream_id())
-                    .map_or(layer.quality.fallback_height(), |state| state.height())
-                    >= intent.min_height
+                states.get(&layer.stream_id()).map_or_else(
+                    || layer.quality.fallback_height(),
+                    crate::rtp::monitor::StreamStats::height,
+                ) >= intent.min_height
             };
             // An old active or staged layer below a newly raised floor must
             // not forward while waiting for its replacement's keyframe.
@@ -1187,7 +1195,7 @@ impl Slot {
         let (mid, rid, ssrc, pt) = (self.mid, self.rid, self.ssrc, self.pt);
         let before = self.switcher.active_stream();
         self.switcher.feed(track_id, cache, arrival_ts, &mut |out| {
-            writer.write_video_owned(out, mid, rid, ssrc, pt);
+            writer.write_video_owned(out, track_id, mid, rid, ssrc, pt);
         });
         self.switcher.active_stream() != before
     }
@@ -2385,10 +2393,7 @@ mod assignment_tests {
             },
         );
         allocator.configure(&intents);
-        assert_eq!(
-            allocator.native_mapping_slots().collect::<Vec<_>>().len(),
-            1
-        );
+        assert_eq!(allocator.native_mapping_slots().count(), 1);
         assert_eq!(allocator.native_mapping_slots().next().unwrap().1, track_id);
         assert_eq!(allocator.slots().count(), 0);
         let key = allocator.track_handles[&track_id];
@@ -2411,16 +2416,52 @@ mod assignment_tests {
                 options: Some(VideoOptions::default()),
             })
             .collect::<Vec<_>>();
-        allocator.configure_native(&requests);
+        allocator.configure_native(&requests, &HashSet::new());
         let before = allocator.native_mapping_slots().collect::<Vec<_>>();
         assert_eq!(before.len(), 2);
         assert_eq!(allocator.slots().count(), 0);
-        allocator.configure_native(&requests.into_iter().rev().collect::<Vec<_>>());
+        allocator.configure_native(
+            &requests.into_iter().rev().collect::<Vec<_>>(),
+            &HashSet::new(),
+        );
         let after = allocator.native_mapping_slots().collect::<Vec<_>>();
         assert_eq!(before.len(), after.len());
         for binding in before {
             assert!(after.contains(&binding));
         }
+    }
+
+    #[test]
+    fn native_default_playout_prefers_fresh_receiver_and_requests_reconnect_without_one() {
+        use pulsebeam_proto::signaling_v1::VideoTrackIntent;
+        let mut allocator = setup_allocator();
+        let tracks = add_tracks(&mut allocator, 1);
+        add_slots(&mut allocator, 2);
+        let request = VideoTrackIntent {
+            track_id: tracks.ids[0].as_str(),
+            options: None,
+        };
+        let fixed_mids = HashSet::from_iter([Mid::from("s0")]);
+        assert!(!allocator.configure_native(&[request], &fixed_mids));
+        assert_eq!(
+            allocator
+                .slots
+                .values()
+                .find(|slot| slot.assignment == Some(tracks.ids[0]))
+                .unwrap()
+                .mid,
+            Mid::from("s1")
+        );
+
+        let mut only_fixed = setup_allocator();
+        let tracks = add_tracks(&mut only_fixed, 1);
+        add_slots(&mut only_fixed, 1);
+        let request = VideoTrackIntent {
+            track_id: tracks.ids[0].as_str(),
+            options: None,
+        };
+        assert!(only_fixed.configure_native(&[request], &fixed_mids));
+        assert_eq!(only_fixed.native_mapping_slots().count(), 0);
     }
 
     #[test]
