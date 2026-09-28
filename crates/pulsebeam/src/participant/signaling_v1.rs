@@ -453,6 +453,161 @@ impl CatalogState {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OutputError {
+    Catalog(CatalogError),
+    Mapping(MappingError),
+    Encode(pulsebeam_proto::codec::EncodeError),
+}
+
+pub(crate) struct NativeOutput {
+    pub(crate) cid: str0m::channel::ChannelId,
+    pub(crate) bytes: Vec<u8>,
+}
+
+enum PendingOutput {
+    Catalog(CatalogPlan),
+    Mapping(pulsebeam_proto::signaling_v1::Mapping),
+}
+
+#[derive(Default)]
+pub(crate) struct NativeSession {
+    pub(crate) cid: Option<str0m::channel::ChannelId>,
+    pub(crate) intents: IntentState,
+    catalog: CatalogState,
+    peers: HashMap<crate::entity::ParticipantId, super::effect::RoomPeer>,
+    mapping: Option<pulsebeam_proto::signaling_v1::Mapping>,
+    pending: Option<PendingOutput>,
+    dirty: bool,
+    force_mapping: bool,
+}
+
+impl NativeSession {
+    pub(crate) fn set_cid(&mut self, cid: str0m::channel::ChannelId) {
+        self.cid = Some(cid);
+        self.catalog = CatalogState::default();
+        self.mapping = None;
+        self.pending = None;
+        self.dirty = true;
+        self.force_mapping = true;
+    }
+
+    pub(crate) fn apply_participants(
+        &mut self,
+        added: impl IntoIterator<Item = super::effect::RoomPeer>,
+        removed: impl IntoIterator<Item = crate::entity::ParticipantId>,
+    ) {
+        for peer in added {
+            self.peers.insert(peer.id, peer);
+        }
+        for id in removed {
+            self.peers.remove(&id);
+        }
+        self.dirty = true;
+    }
+
+    pub(crate) fn mark_dirty(&mut self) {
+        self.dirty = true;
+    }
+
+    pub(crate) fn mark_mapping_dirty(&mut self) {
+        self.force_mapping = true;
+        self.dirty = true;
+    }
+
+    pub(crate) fn needs_poll(&self) -> bool {
+        self.cid.is_some() && self.pending.is_none() && self.dirty
+    }
+
+    pub(crate) fn poll(
+        &mut self,
+        publications: &[crate::track::TrackMeta],
+        assignments: (
+            Vec<(u32, crate::entity::TrackId)>,
+            Vec<(u32, crate::entity::TrackId)>,
+        ),
+        recipient: crate::entity::ParticipantId,
+        external_id: &str,
+    ) -> Result<Option<NativeOutput>, OutputError> {
+        use pulsebeam_proto::signaling_v1::{ServerMessage, server_message};
+        let Some(cid) = self.cid else { return Ok(None) };
+        if !self.dirty || self.pending.is_some() {
+            return Ok(None);
+        }
+        let planned = self
+            .catalog
+            .plan(
+                self.peers.values().cloned(),
+                publications.iter().cloned(),
+                recipient,
+                external_id,
+            )
+            .map_err(OutputError::Catalog)?;
+        if let Some(plan) = planned {
+            if let Some(mut cleared) = self.mapping.clone() {
+                for group in [&mut cleared.video, &mut cleared.audio] {
+                    if let Some(group) = group.as_mut() {
+                        group
+                            .tracks
+                            .retain(|track| plan.next.tracks.contains_key(&track.track_id));
+                    }
+                }
+                if self.mapping.as_ref() != Some(&cleared) {
+                    let message = ServerMessage {
+                        payload: Some(server_message::Payload::Mapping(cleared.clone())),
+                    };
+                    let bytes = pulsebeam_proto::codec::encode_server(&message)
+                        .map_err(OutputError::Encode)?;
+                    self.pending = Some(PendingOutput::Mapping(cleared));
+                    return Ok(Some(NativeOutput { cid, bytes }));
+                }
+            }
+            let bytes = pulsebeam_proto::codec::encode_server(&plan.message)
+                .map_err(OutputError::Encode)?;
+            self.pending = Some(PendingOutput::Catalog(plan));
+            return Ok(Some(NativeOutput { cid, bytes }));
+        }
+        let video = assignments
+            .0
+            .into_iter()
+            .filter(|(_, id)| self.catalog.tracks.contains_key(&id.as_str()));
+        let audio = assignments
+            .1
+            .into_iter()
+            .filter(|(_, id)| self.catalog.tracks.contains_key(&id.as_str()));
+        let mapping = self
+            .catalog
+            .mapping(self.intents.revision(), video, audio)
+            .map_err(OutputError::Mapping)?;
+        if !self.force_mapping && self.mapping.as_ref() == Some(&mapping) {
+            self.dirty = false;
+            return Ok(None);
+        }
+        let message = ServerMessage {
+            payload: Some(server_message::Payload::Mapping(mapping.clone())),
+        };
+        let bytes = pulsebeam_proto::codec::encode_server(&message).map_err(OutputError::Encode)?;
+        self.pending = Some(PendingOutput::Mapping(mapping));
+        Ok(Some(NativeOutput { cid, bytes }))
+    }
+
+    pub(crate) fn commit_sent(&mut self) {
+        match self.pending.take() {
+            Some(PendingOutput::Catalog(plan)) => self.catalog.commit(plan),
+            Some(PendingOutput::Mapping(mapping)) => {
+                self.mapping = Some(mapping);
+                self.force_mapping = false;
+            }
+            None => debug_assert!(false, "native signaling commit requires pending output"),
+        }
+        self.dirty = true;
+    }
+
+    pub(crate) fn retry_pending(&mut self) {
+        self.pending = None;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -641,6 +796,52 @@ mod tests {
         assert!(delta.removed_track_ids.is_empty());
         state.commit(plan);
         assert!(state.plan([], [], recipient, "self").unwrap().is_none());
+    }
+
+    #[test]
+    fn native_session_orders_mapping_clear_before_catalog_removal() {
+        use pulsebeam_proto::signaling_v1::server_message::Payload;
+        let recipient = crate::entity::ParticipantId::new();
+        let publisher = crate::entity::ParticipantId::new();
+        let track = remote_audio(publisher, "mic");
+        let mut rtc = str0m::Rtc::new(std::time::Instant::now());
+        let cid = rtc.direct_api().create_data_channel(Default::default());
+        let mut session = NativeSession::default();
+        session.set_cid(cid);
+        session.apply_participants([peer(publisher, "alice")], []);
+        let next =
+            |session: &mut NativeSession, publications: &[crate::track::TrackMeta], audio| {
+                let output = session
+                    .poll(publications, (Vec::new(), audio), recipient, "self")
+                    .unwrap()
+                    .unwrap();
+                let message = pulsebeam_proto::codec::decode_server(&output.bytes).unwrap();
+                session.commit_sent();
+                message.payload.unwrap()
+            };
+        assert!(matches!(
+            next(&mut session, &[track.clone()], Vec::new()),
+            Payload::Catalog(_)
+        ));
+        assert!(matches!(
+            next(&mut session, &[track.clone()], vec![(2, track.id)]),
+            Payload::Mapping(_)
+        ));
+        session.apply_participants([], [publisher]);
+        assert!(matches!(
+            next(&mut session, &[], vec![(2, track.id)]),
+            Payload::Mapping(mapping) if mapping.audio.as_ref().unwrap().tracks.is_empty()
+        ));
+        assert!(matches!(
+            next(&mut session, &[], vec![(2, track.id)]),
+            Payload::Catalog(_)
+        ));
+        assert!(
+            session
+                .poll(&[], (Vec::new(), vec![(2, track.id)]), recipient, "self")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
