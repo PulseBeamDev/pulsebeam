@@ -430,6 +430,24 @@ impl Downstream {
         }
     }
 
+    #[allow(
+        dead_code,
+        reason = "native v1 Mapping uses stable negotiated receiver indices"
+    )]
+    pub(crate) fn native_assignments(&self) -> (Vec<(u32, TrackId)>, Vec<(u32, TrackId)>) {
+        let video = self.video.native_mapping_slots().collect();
+        let audio = self
+            .audio_assignments()
+            .into_iter()
+            .filter_map(|heard| {
+                self.audio
+                    .receiver_index(heard.mid)
+                    .map(|index| (index, heard.origin.track))
+            })
+            .collect();
+        (video, audio)
+    }
+
     pub fn audio_slot_count(&self) -> usize {
         self.audio.slot_count()
     }
