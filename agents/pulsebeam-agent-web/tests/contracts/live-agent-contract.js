@@ -184,7 +184,12 @@
     connected:
       senderConnected.participantId !== null &&
       receiverConnected.participantId !== null,
-    discovered: publication.id.length > 0,
+    discovered:
+      publication.id.length > 0 &&
+      publication.label === "camera" &&
+      discovered.participants.find(
+        (participant) => participant.id === senderConnected.participantId,
+      )?.externalId === "web-sender",
     delivered: delivered.tracks[publication.id].kind === "video",
     reconnected: reconnected.tracks[publication.id].kind === "video",
     topicMetadata:

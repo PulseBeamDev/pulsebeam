@@ -1874,6 +1874,7 @@ fn snapshot_value(snapshot: &agent_core::Snapshot) -> JsValue {
     for participant in snapshot.participants.values() {
         let item = Object::new();
         set(&item, "id", participant.id.clone());
+        set(&item, "externalId", participant.external_id.clone());
         participants.push(&item);
     }
     set(&value, "participants", participants);
@@ -1883,6 +1884,7 @@ fn snapshot_value(snapshot: &agent_core::Snapshot) -> JsValue {
         set(&item, "id", publication.id.clone());
         set(&item, "participantId", publication.participant_id.clone());
         set(&item, "kind", media_kind_name(publication.kind));
+        set(&item, "label", publication.label.clone());
         publications.push(&item);
     }
     set(&value, "publications", publications);

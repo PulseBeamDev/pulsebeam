@@ -305,8 +305,16 @@ fn update_snapshot(
 ) -> Result<(), SignalingError> {
     let participants: BTreeMap<_, _> = state
         .participants
-        .keys()
-        .map(|id| (id.clone(), Participant { id: id.clone() }))
+        .iter()
+        .map(|(id, participant)| {
+            (
+                id.clone(),
+                Participant {
+                    id: id.clone(),
+                    external_id: participant.participant_external_id.clone(),
+                },
+            )
+        })
         .collect();
     let publications: BTreeMap<_, _> = state
         .tracks
@@ -322,6 +330,7 @@ fn update_snapshot(
                     } else {
                         MediaKind::Video
                     },
+                    label: track.label.clone(),
                 },
             )
         })

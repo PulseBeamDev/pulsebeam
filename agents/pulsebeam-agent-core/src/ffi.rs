@@ -151,6 +151,7 @@ pub enum MediaKind {
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct Participant {
     pub id: String,
+    pub external_id: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
@@ -158,6 +159,7 @@ pub struct Publication {
     pub id: String,
     pub participant_id: String,
     pub kind: MediaKind,
+    pub label: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
@@ -705,7 +707,10 @@ impl From<model::MediaKind> for MediaKind {
 
 impl From<model::Participant> for Participant {
     fn from(value: model::Participant) -> Self {
-        Self { id: value.id }
+        Self {
+            id: value.id,
+            external_id: value.external_id,
+        }
     }
 }
 
@@ -715,6 +720,7 @@ impl From<model::Publication> for Publication {
             id: value.id,
             participant_id: value.participant_id,
             kind: value.kind.into(),
+            label: value.label,
         }
     }
 }
@@ -1118,12 +1124,14 @@ mod tests {
             "z".to_string(),
             model::Participant {
                 id: "z".to_string(),
+                external_id: "external-z".to_string(),
             },
         );
         snapshot.participants.insert(
             "a".to_string(),
             model::Participant {
                 id: "a".to_string(),
+                external_id: "external-a".to_string(),
             },
         );
         let projected = Snapshot::from(&snapshot);
@@ -1179,6 +1187,7 @@ mod tests {
             id: "participant/video".to_string(),
             participant_id: "participant".to_string(),
             kind: MediaKind::Video,
+            label: "camera".to_string(),
         };
         let video = VideoBinding {
             publication_id: publication.id.clone(),
@@ -1267,6 +1276,7 @@ mod tests {
         });
         assert_ffi_round_trip(Participant {
             id: "participant".to_string(),
+            external_id: "user".to_string(),
         });
         assert_ffi_round_trip(publication.clone());
         assert_ffi_round_trip(video.clone());
@@ -1287,6 +1297,7 @@ mod tests {
             authorization_expires_at: Some(1_720_000_000),
             participants: vec![Participant {
                 id: "participant".to_string(),
+                external_id: "user".to_string(),
             }],
             publications: vec![publication],
             video: vec![video],
@@ -1462,11 +1473,13 @@ mod tests {
         }
         let participant = Participant {
             id: "participant".to_string(),
+            external_id: "user".to_string(),
         };
         let publication = Publication {
             id: "participant/video".to_string(),
             participant_id: participant.id.clone(),
             kind: MediaKind::Video,
+            label: "camera".to_string(),
         };
         let video = VideoBinding {
             publication_id: publication.id.clone(),

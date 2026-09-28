@@ -1438,6 +1438,15 @@ fn signaling_snapshot_diff_and_empty_binding_groups_are_exact() {
         .unwrap();
     assert_eq!(agent.snapshot().participants.len(), 1);
     assert_eq!(agent.snapshot().publications.len(), 2);
+    assert_eq!(
+        agent.snapshot().participants["publisher"].external_id,
+        "publisher-external"
+    );
+    assert_eq!(agent.snapshot().publications["video-track"].label, "camera");
+    assert_eq!(
+        agent.snapshot().publications["audio-track"].label,
+        "microphone"
+    );
     agent
         .handle(HostEvent::DataChannel(DataChannelEvent::Message {
             generation,

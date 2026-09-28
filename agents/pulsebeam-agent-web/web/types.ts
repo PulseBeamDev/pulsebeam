@@ -107,12 +107,14 @@ export interface AgentFailure {
 
 export interface Participant {
   readonly id: string;
+  readonly externalId: string;
 }
 
 export interface Publication {
   readonly id: string;
   readonly participantId: string;
   readonly kind: MediaKind;
+  readonly label: string;
 }
 
 export interface VideoBinding {
