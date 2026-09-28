@@ -124,6 +124,20 @@ pub(crate) struct UpstreamSlot {
     published_once: bool,
 }
 
+impl UpstreamSlot {
+    fn bind_label(&mut self, id: TrackId, label: &str) {
+        self.track.meta.id = id;
+        self.track.meta.label = Some(label.to_owned());
+        self.descriptor.meta_mut().id = id;
+        self.descriptor.meta_mut().label = Some(label.to_owned());
+        if let crate::track::Track::Video(video) = &mut self.descriptor {
+            for layer in &mut video.layers {
+                layer.meta = video.meta.clone();
+            }
+        }
+    }
+}
+
 pub(crate) struct UpstreamMedia {
     ctx: LogCtx,
     kind: TrackKind,
@@ -217,10 +231,7 @@ impl UpstreamMedia {
             .get_mut(slot_index)
             .ok_or(SenderLabelError::UnknownSender)?;
         let previous = slot.track.meta.id;
-        slot.track.meta.id = id;
-        slot.track.meta.label = Some(label.to_owned());
-        slot.descriptor.meta_mut().id = id;
-        slot.descriptor.meta_mut().label = Some(label.to_owned());
+        slot.bind_label(id, label);
         Ok((previous, id))
     }
     fn plan_sender_labels(
@@ -277,10 +288,7 @@ impl UpstreamMedia {
             let Some(slot) = self.published_tracks.get_mut(index) else {
                 return false;
             };
-            slot.track.meta.id = id;
-            slot.track.meta.label = Some(label.clone());
-            slot.descriptor.meta_mut().id = id;
-            slot.descriptor.meta_mut().label = Some(label);
+            slot.bind_label(id, &label);
         }
         changed
     }
