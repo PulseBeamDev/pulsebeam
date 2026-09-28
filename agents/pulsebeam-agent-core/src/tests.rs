@@ -746,6 +746,43 @@ fn rtc_host_failure_closes_the_generation_and_uses_core_retry_policy() {
 }
 
 #[test]
+fn transient_retries_continue_past_the_old_budget_with_a_ten_second_ceiling() {
+    let mut config = config();
+    config.retry.maximum_attempts = 1;
+    config.retry.maximum_delay = Duration::from_secs(30);
+    let mut agent = Agent::new(config).unwrap();
+    agent
+        .command(AgentCommand::ReplaceDesired(desired(1)))
+        .unwrap();
+    for _ in 0..24 {
+        let generation = match next_effect(&mut agent) {
+            Effect::Rtc(RtcEffect::CreateOffer { generation, .. }) => generation,
+            effect => panic!("expected offer, got {effect:?}"),
+        };
+        agent
+            .handle(HostEvent::Rtc(RtcEvent::Failed {
+                generation,
+                message: "temporary".to_string(),
+            }))
+            .unwrap();
+        assert_eq!(
+            next_effect(&mut agent),
+            Effect::Rtc(RtcEffect::Close { generation })
+        );
+        let (timer, delay) = match next_effect(&mut agent) {
+            Effect::Timer(TimerEffect::Schedule { timer, after }) => (timer, after),
+            effect => panic!("expected retry timer, got {effect:?}"),
+        };
+        assert!(delay <= Duration::from_secs(10));
+        assert!(delay > Duration::ZERO);
+        assert!(agent.snapshot().terminal_failure.is_none());
+        agent
+            .handle(HostEvent::Timer(TimerEvent::Fired { timer }))
+            .unwrap();
+    }
+}
+
+#[test]
 fn desired_revisions_are_idempotent_and_offer_events_are_correlated() {
     let mut agent = Agent::new(config()).unwrap();
     let state = desired(1);
@@ -926,18 +963,15 @@ fn transient_failure_schedules_a_bounded_retry_that_disconnect_cancels() {
     ));
     let timer = match next_effect(&mut agent) {
         Effect::Timer(TimerEffect::Schedule { timer, after }) => {
-            assert_eq!(after, Duration::from_millis(500));
+            assert!((Duration::from_millis(250)..=Duration::from_millis(500)).contains(&after));
+            assert_eq!(
+                agent.snapshot().connection,
+                ConnectionState::RetryWaiting { attempt: 1, after }
+            );
             timer
         }
         effect => panic!("expected retry timer, got {effect:?}"),
     };
-    assert_eq!(
-        agent.snapshot().connection,
-        ConnectionState::RetryWaiting {
-            attempt: 1,
-            after: Duration::from_millis(500),
-        }
-    );
 
     let disconnected = DesiredState {
         revision: 2,
