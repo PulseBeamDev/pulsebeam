@@ -26,6 +26,13 @@ impl UpstreamAudio {
     pub(super) fn track_for_sender_index(&self, media_index: u32) -> Option<TrackId> {
         self.media.track_for_sender_index(media_index)
     }
+    pub(super) fn bind_sender_label(
+        &mut self,
+        media_index: u32,
+        label: &str,
+    ) -> Result<(TrackId, TrackId), super::SenderLabelError> {
+        self.media.bind_sender_label(media_index, label)
+    }
     pub(super) fn slot_for_mid(&self, mid: Mid) -> Option<(usize, TrackId)> {
         self.media.slot_for_mid(mid)
     }
@@ -42,8 +49,9 @@ impl UpstreamAudio {
     pub(super) fn announce_state_mut(
         &mut self,
         mid: Mid,
+        active: bool,
     ) -> Option<(&crate::track::Track, &mut bool)> {
-        self.media.announce_state_mut(mid)
+        self.media.announce_state_mut(mid, active)
     }
     pub(super) fn mid_for_track_id(&self, id: TrackId) -> Option<Mid> {
         self.media.mid_for_track_id(id)
