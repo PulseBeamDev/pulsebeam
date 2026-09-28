@@ -117,6 +117,10 @@ enum Command {
         desired: DesiredState,
         response: oneshot::Sender<Result<(), Error>>,
     },
+    RenewAuthorization {
+        token: String,
+        response: oneshot::Sender<Result<(), Error>>,
+    },
     SendTopic {
         send: TopicSend,
         response: oneshot::Sender<Result<(), Error>>,
@@ -201,6 +205,15 @@ impl Agent {
         let (response, result) = oneshot::channel();
         self.commands
             .send(Command::ReplaceDesired { desired, response })
+            .await
+            .map_err(|_| Error::Closed)?;
+        result.await.map_err(|_| Error::Closed)?
+    }
+
+    pub async fn renew_authorization(&self, token: String) -> Result<(), Error> {
+        let (response, result) = oneshot::channel();
+        self.commands
+            .send(Command::RenewAuthorization { token, response })
             .await
             .map_err(|_| Error::Closed)?;
         result.await.map_err(|_| Error::Closed)?
@@ -672,6 +685,13 @@ impl Actor {
                 if result.is_ok() {
                     self.active_publications = publications;
                 }
+                let _ = response.send(result);
+            }
+            Command::RenewAuthorization { token, response } => {
+                let result = self
+                    .core
+                    .command(AgentCommand::RenewAuthorization(token))
+                    .map_err(Error::Core);
                 let _ = response.send(result);
             }
             Command::SendTopic { send, response } => {

@@ -84,6 +84,10 @@ enum ControlCommand {
         desired: core_ffi::DesiredState,
         response: oneshot::Sender<Result<(), NativeError>>,
     },
+    RenewAuthorization {
+        token: String,
+        response: oneshot::Sender<Result<(), NativeError>>,
+    },
     SendTopic {
         publisher: core_ffi::TopicPublisher,
         payload: Vec<u8>,
@@ -145,6 +149,13 @@ impl Agent {
         request(&self.commands, |response| ControlCommand::ReplaceDesired {
             desired,
             response,
+        })
+        .await
+    }
+
+    pub async fn renew_authorization(&self, token: String) -> Result<(), NativeError> {
+        request(&self.commands, |response| {
+            ControlCommand::RenewAuthorization { token, response }
         })
         .await
     }
@@ -421,6 +432,13 @@ async fn run_control(
                 if result.is_ok() {
                     desired_owner.accept();
                 }
+                let _ = response.send(result);
+            }
+            ControlCommand::RenewAuthorization { token, response } => {
+                let result = runtime
+                    .renew_authorization(token)
+                    .await
+                    .map_err(native_runtime_error);
                 let _ = response.send(result);
             }
             ControlCommand::SendTopic {

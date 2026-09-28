@@ -29,6 +29,7 @@ interface RuntimeSnapshot {
   readonly connection: ConnectionState;
   readonly generation?: number;
   readonly participantId?: string;
+  readonly authorizationExpiresAt?: number;
   readonly participants: readonly Participant[];
   readonly publications: readonly Publication[];
   readonly video: readonly VideoBinding[];
@@ -68,6 +69,7 @@ function emptySnapshot(connection: ConnectionState): AgentSnapshot {
     connection,
     generation: null,
     participantId: null,
+    authorizationExpiresAt: null,
     participants: EMPTY_ARRAY,
     publications: EMPTY_ARRAY,
     video: EMPTY_ARRAY,
@@ -168,6 +170,7 @@ class AgentFacade implements Agent {
   #runtime: Runtime | undefined;
   #localOperations = new Map<string, Promise<void>>();
   #localTracks = new Map<string, MediaStreamTrack>();
+  #pendingToken: string | undefined;
   #closed = false;
   readonly #ready: Promise<Runtime>;
 
@@ -195,6 +198,10 @@ class AgentFacade implements Agent {
           this.#emitFailure(localFailureClass(error), message(error)),
         );
         try {
+          if (this.#pendingToken !== undefined) {
+            runtime.renew_authorization(this.#pendingToken);
+            this.#pendingToken = undefined;
+          }
           runtime.replace_desired(desiredValue(this.#state));
         } catch (error) {
           this.#terminalFailure("invalid-configuration", message(error));
@@ -292,6 +299,18 @@ class AgentFacade implements Agent {
 
   reconnect(): void {
     this.#requireRuntime().force_reconnect();
+  }
+
+  renewAuthorization(token: string): void {
+    if (this.#closed) throw new Error("agent is closed");
+    if (!token || token.length > 16_384 || !/^[!-~]+$/.test(token)) {
+      throw new Error("authorization token is invalid");
+    }
+    if (this.#runtime) {
+      this.#runtime.renew_authorization(token);
+    } else {
+      this.#pendingToken = token;
+    }
   }
 
   sendTopic(name: string, mode: TopicMode, payload: Uint8Array): void {
@@ -419,6 +438,7 @@ class AgentFacade implements Agent {
         connection: raw.connection,
         generation: raw.generation ?? null,
         participantId: raw.participantId ?? null,
+        authorizationExpiresAt: raw.authorizationExpiresAt ?? null,
         participants,
         publications,
         video,
