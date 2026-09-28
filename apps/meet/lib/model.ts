@@ -25,10 +25,12 @@ export function desiredState(
   return {
     connected,
     publications: publications.map((slot) => ({ slot, active: true })),
-    video,
+    video: video?.map((demand) => ({
+      ...demand,
+      ...(playoutDelay ? { playoutDelay } : {}),
+    })),
     audio: { automatic: true },
     topics: topicState,
-    ...(playoutDelay ? { playoutDelay } : {}),
   };
 }
 

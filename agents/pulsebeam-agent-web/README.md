@@ -77,8 +77,8 @@ metadata, and distinguish admission, drop, resynchronization, channel failure,
 and agent failure events. Send admission is not a delivery acknowledgment.
 
 `reconnect()` delegates to the runtime's reconnect operation and retains the
-complete desired state. A fixed playout delay cannot return to adaptive mode
-during the same session; create a new agent for adaptive mode. `close()` is
+complete desired state. Explicit video and pinned-audio policies are per track;
+server-directed receiver recreation restores a fresh default when needed. `close()` is
 terminal and idempotent, detaches callbacks, aborts browser resources, and
 fences initialization and pending operations. Unsubscribe functions are also
 idempotent.

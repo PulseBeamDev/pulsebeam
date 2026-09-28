@@ -10,6 +10,7 @@ const disconnected: AgentSnapshot = Object.freeze({
   connection: "disconnected",
   generation: null,
   participantId: null,
+  authorizationExpiresAt: null,
   participants: [],
   publications: [],
   video: [],

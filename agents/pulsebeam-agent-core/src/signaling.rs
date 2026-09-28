@@ -60,10 +60,6 @@ pub(crate) fn encode_v1_intent(
             });
         }
     }
-    let playout_delay = match desired.playout_delay {
-        PlayoutDelay::Adaptive => None,
-        PlayoutDelay::Fixed { min_ms, max_ms } => Some(wire::PlayoutDelay { min_ms, max_ms }),
-    };
     let video = desired
         .video
         .iter()
@@ -74,7 +70,7 @@ pub(crate) fn encode_v1_intent(
                 min_height: track.min_height,
                 min_fps: track.min_fps,
                 priority: track.priority,
-                playout_delay,
+                playout_delay: encode_playout_delay(track.playout_delay),
             }),
         })
         .collect();
@@ -84,7 +80,14 @@ pub(crate) fn encode_v1_intent(
         .iter()
         .map(|id| wire::AudioTrackIntent {
             track_id: id.clone(),
-            options: Some(wire::AudioOptions { playout_delay }),
+            options: Some(wire::AudioOptions {
+                playout_delay: desired
+                    .audio
+                    .playout_delays
+                    .get(id)
+                    .copied()
+                    .and_then(encode_playout_delay),
+            }),
         })
         .collect();
     let message = wire::ClientMessage {
@@ -106,6 +109,13 @@ pub(crate) fn encode_v1_intent(
         })),
     };
     pulsebeam_proto::codec::encode_client(&message).map_err(|_| SignalingError::Encode)
+}
+
+fn encode_playout_delay(value: PlayoutDelay) -> Option<wire::PlayoutDelay> {
+    match value {
+        PlayoutDelay::Adaptive => None,
+        PlayoutDelay::Fixed { min_ms, max_ms } => Some(wire::PlayoutDelay { min_ms, max_ms }),
+    }
 }
 
 #[cfg(test)]
@@ -155,11 +165,11 @@ mod tests {
                 min_height: 720,
                 min_fps: 15,
                 priority: 2,
+                playout_delay: PlayoutDelay::Fixed {
+                    min_ms: 3000,
+                    max_ms: 500,
+                },
             }],
-            playout_delay: PlayoutDelay::Fixed {
-                min_ms: 3000,
-                max_ms: 500,
-            },
             ..DesiredState::default()
         };
         let encoded = encode_v1_intent(&desired, &topology, &coordinates, 5).unwrap();
@@ -181,7 +191,7 @@ mod tests {
         assert_eq!((options.height, options.min_height), (360, 720));
         assert_eq!(options.playout_delay.as_ref().unwrap().min_ms, 3000);
         assert_eq!(
-            desired.playout_delay,
+            desired.video[0].playout_delay,
             PlayoutDelay::Fixed {
                 min_ms: 3000,
                 max_ms: 500

@@ -94,6 +94,29 @@ function copyConfig(config: AgentConfig): RuntimeConfig {
   });
 }
 
+function validatePlayoutDelay(state: AgentState): void {
+  const delays = [
+    ...(state.video ?? []).map((demand) => demand.playoutDelay),
+    ...(state.audio?.playoutDelays ?? []).map((entry) => entry.playoutDelay),
+  ];
+  for (const delay of delays) {
+    if (delay === undefined) continue;
+    if (
+      delay.mode !== "fixed" ||
+      !Number.isInteger(delay.minMs) ||
+      !Number.isInteger(delay.maxMs) ||
+      delay.minMs < 0 ||
+      delay.maxMs < 0 ||
+      delay.minMs > 0xffffffff ||
+      delay.maxMs > 0xffffffff
+    ) {
+      throw new RangeError(
+        "playout delay requires unsigned 32-bit millisecond bounds",
+      );
+    }
+  }
+}
+
 function copyState(state: AgentState): AgentState {
   return Object.freeze({
     connected: state.connected,
@@ -103,15 +126,27 @@ function copyState(state: AgentState): AgentState {
       ),
     ),
     video: Object.freeze(
-      (state.video ?? []).map((demand) => Object.freeze({ ...demand })),
+      (state.video ?? []).map((demand) =>
+        Object.freeze({
+          ...demand,
+          playoutDelay: demand.playoutDelay
+            ? Object.freeze({ ...demand.playoutDelay })
+            : undefined,
+        }),
+      ),
     ),
     audio: Object.freeze({
       pinned: Object.freeze([...(state.audio?.pinned ?? [])]),
       automatic: state.audio?.automatic ?? true,
+      playoutDelays: Object.freeze(
+        (state.audio?.playoutDelays ?? []).map((entry) =>
+          Object.freeze({
+            trackId: entry.trackId,
+            playoutDelay: Object.freeze({ ...entry.playoutDelay }),
+          }),
+        ),
+      ),
     }),
-    playoutDelay: state.playoutDelay
-      ? Object.freeze({ ...state.playoutDelay })
-      : undefined,
     topics: Object.freeze(
       (state.topics ?? []).map((topic) => Object.freeze({ ...topic })),
     ),
@@ -124,7 +159,6 @@ function desiredValue(state: AgentState): object {
     publications: state.publications,
     video: state.video,
     audio: state.audio,
-    playoutDelay: state.playoutDelay ?? { mode: "adaptive" },
     topics: state.topics,
   };
 }
@@ -245,7 +279,12 @@ class AgentFacade implements Agent {
 
   setState(state: AgentState): void {
     if (this.#closed) return;
-    this.#state = copyState(state);
+    validatePlayoutDelay(state);
+    const next = copyState(state);
+    if (this.#runtime) {
+      this.#runtime.replace_desired(desiredValue(next));
+    }
+    this.#state = next;
     if (!this.#runtime) {
       if (this.#snapshot.connection === "terminal-failure") return;
       this.#publish(
@@ -255,12 +294,6 @@ class AgentFacade implements Agent {
           failure: null,
         }),
       );
-    } else {
-      try {
-        this.#runtime.replace_desired(desiredValue(this.#state));
-      } catch (error) {
-        this.#emitFailure(localFailureClass(error), message(error));
-      }
     }
   }
 

@@ -41,10 +41,10 @@ const desired: AgentState = {
       minHeight: 180,
       minFps: 15,
       priority: 100,
+      playoutDelay: { mode: "fixed", minMs: 100, maxMs: 250 },
     },
   ],
   audio: { pinned: ["publication-audio"], automatic: true },
-  playoutDelay: { mode: "fixed", minMs: 100, maxMs: 250 },
   topics: [
     { name: "presence", mode: "latest", publish: true, subscribe: true },
     { name: "chat", mode: "ordered", subscribe: true },

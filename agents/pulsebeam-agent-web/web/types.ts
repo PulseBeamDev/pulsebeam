@@ -35,11 +35,16 @@ export interface VideoDemand {
   readonly minHeight: number;
   readonly minFps: number;
   readonly priority: number;
+  readonly playoutDelay?: FixedPlayoutDelay;
 }
 
 export interface AudioDemand {
   readonly pinned?: readonly string[];
   readonly automatic?: boolean;
+  readonly playoutDelays?: readonly {
+    readonly trackId: string;
+    readonly playoutDelay: FixedPlayoutDelay;
+  }[];
 }
 
 export interface FixedPlayoutDelay {
@@ -58,15 +63,14 @@ export interface TopicRegistration {
 
 /**
  * Complete desired state. Omitted collections are empty and retract their
- * previous desired values. Once fixed, playout delay stays fixed for the
- * lifetime of an agent; create a new agent to return to adaptive mode.
+ * previous desired values. Playout policy belongs to each explicitly
+ * requested track, not to the connection or automatic audio.
  */
 export interface AgentState {
   readonly connected: boolean;
   readonly publications?: readonly PublicationIntent[];
   readonly video?: readonly VideoDemand[];
   readonly audio?: AudioDemand;
-  readonly playoutDelay?: FixedPlayoutDelay;
   readonly topics?: readonly TopicRegistration[];
 }
 

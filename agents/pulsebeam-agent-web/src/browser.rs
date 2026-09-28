@@ -96,8 +96,6 @@ struct DesiredConfig {
     #[serde(default)]
     audio: AudioSubscriptionConfig,
     #[serde(default)]
-    playout_delay: PlayoutDelayConfig,
-    #[serde(default)]
     topics: Vec<TopicRegistrationConfig>,
 }
 
@@ -117,6 +115,8 @@ struct VideoSubscriptionConfig {
     min_height: u32,
     min_fps: u32,
     priority: u32,
+    #[serde(default)]
+    playout_delay: PlayoutDelayConfig,
 }
 
 #[derive(Deserialize)]
@@ -126,6 +126,15 @@ struct AudioSubscriptionConfig {
     pinned: Vec<String>,
     #[serde(default = "default_true")]
     automatic: bool,
+    #[serde(default)]
+    playout_delays: Vec<AudioTrackDelayConfig>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AudioTrackDelayConfig {
+    track_id: String,
+    playout_delay: PlayoutDelayConfig,
 }
 
 impl Default for AudioSubscriptionConfig {
@@ -133,6 +142,7 @@ impl Default for AudioSubscriptionConfig {
         Self {
             pinned: Vec::new(),
             automatic: true,
+            playout_delays: Vec::new(),
         }
     }
 }
@@ -232,19 +242,29 @@ impl DesiredConfig {
                     min_height: video.min_height,
                     min_fps: video.min_fps,
                     priority: video.priority,
+                    playout_delay: video.playout_delay.into(),
                 })
                 .collect(),
             audio: AudioSubscription {
                 pinned: self.audio.pinned,
                 automatic: self.audio.automatic,
-            },
-            playout_delay: match self.playout_delay {
-                PlayoutDelayConfig::Adaptive => PlayoutDelay::Adaptive,
-                PlayoutDelayConfig::Fixed { min_ms, max_ms } => {
-                    PlayoutDelay::Fixed { min_ms, max_ms }
-                }
+                playout_delays: self
+                    .audio
+                    .playout_delays
+                    .into_iter()
+                    .map(|entry| (entry.track_id, entry.playout_delay.into()))
+                    .collect(),
             },
             topics: topic_registrations(&self.topics),
+        }
+    }
+}
+
+impl From<PlayoutDelayConfig> for PlayoutDelay {
+    fn from(value: PlayoutDelayConfig) -> Self {
+        match value {
+            PlayoutDelayConfig::Adaptive => Self::Adaptive,
+            PlayoutDelayConfig::Fixed { min_ms, max_ms } => Self::Fixed { min_ms, max_ms },
         }
     }
 }

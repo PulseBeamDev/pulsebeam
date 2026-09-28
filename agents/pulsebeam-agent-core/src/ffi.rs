@@ -80,12 +80,20 @@ pub struct VideoDemand {
     pub min_height: u32,
     pub min_fps: u32,
     pub priority: u32,
+    pub playout_delay: PlayoutDelay,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, uniffi::Record)]
 pub struct AudioDemand {
     pub pinned: Vec<String>,
     pub automatic: bool,
+    pub playout_delays: Vec<AudioTrackDelay>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct AudioTrackDelay {
+    pub track_id: String,
+    pub playout_delay: PlayoutDelay,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, uniffi::Enum)]
@@ -123,7 +131,6 @@ pub struct DesiredState {
     pub publications: Vec<PublicationIntent>,
     pub video: Vec<VideoDemand>,
     pub audio: AudioDemand,
-    pub playout_delay: PlayoutDelay,
     pub topic_publishers: Vec<TopicPublisher>,
     pub topic_subscribers: Vec<TopicSubscriber>,
 }
@@ -410,7 +417,6 @@ impl DesiredState {
             publications: self.publications.into_iter().map(Into::into).collect(),
             video: self.video.into_iter().map(Into::into).collect(),
             audio: self.audio.into(),
-            playout_delay: self.playout_delay.into(),
             topics: model::TopicRegistrations {
                 publishers: self.topic_publishers.into_iter().map(Into::into).collect(),
                 subscribers: self.topic_subscribers.into_iter().map(Into::into).collect(),
@@ -432,7 +438,6 @@ impl From<model::DesiredState> for DesiredState {
             publications: value.publications.into_iter().map(Into::into).collect(),
             video: value.video.into_iter().map(Into::into).collect(),
             audio: value.audio.into(),
-            playout_delay: value.playout_delay.into(),
             topic_publishers: value
                 .topics
                 .publishers
@@ -556,6 +561,7 @@ impl From<VideoDemand> for model::VideoSubscription {
             min_height: value.min_height,
             min_fps: value.min_fps,
             priority: value.priority,
+            playout_delay: value.playout_delay.into(),
         }
     }
 }
@@ -569,6 +575,7 @@ impl From<model::VideoSubscription> for VideoDemand {
             min_height: value.min_height,
             min_fps: value.min_fps,
             priority: value.priority,
+            playout_delay: value.playout_delay.into(),
         }
     }
 }
@@ -578,6 +585,11 @@ impl From<AudioDemand> for model::AudioSubscription {
         Self {
             pinned: value.pinned,
             automatic: value.automatic,
+            playout_delays: value
+                .playout_delays
+                .into_iter()
+                .map(|entry| (entry.track_id, entry.playout_delay.into()))
+                .collect(),
         }
     }
 }
@@ -587,6 +599,14 @@ impl From<model::AudioSubscription> for AudioDemand {
         Self {
             pinned: value.pinned,
             automatic: value.automatic,
+            playout_delays: value
+                .playout_delays
+                .into_iter()
+                .map(|(track_id, playout_delay)| AudioTrackDelay {
+                    track_id,
+                    playout_delay: playout_delay.into(),
+                })
+                .collect(),
         }
     }
 }
@@ -963,7 +983,6 @@ impl From<model::AgentError> for AgentError {
             model::AgentError::InvalidConfiguration(_) => ErrorCode::InvalidConfiguration,
             model::AgentError::StaleDesiredRevision { .. }
             | model::AgentError::ConflictingDesiredRevision(_)
-            | model::AgentError::AdaptiveAfterFixed
             | model::AgentError::InvalidAuthorizationToken => ErrorCode::InvalidDesiredState,
             model::AgentError::RenewalBusy => ErrorCode::RenewalBusy,
             model::AgentError::InvalidTopic(_) => ErrorCode::InvalidTopic,
@@ -1039,6 +1058,7 @@ mod tests {
                 min_height: 180,
                 min_fps: 15,
                 priority: 1,
+                playout_delay: PlayoutDelay::Adaptive,
             }],
             ..DesiredState::default()
         };
@@ -1204,10 +1224,21 @@ mod tests {
             min_height: 180,
             min_fps: 15,
             priority: 2,
+            playout_delay: PlayoutDelay::Fixed {
+                min_ms: 80,
+                max_ms: 160,
+            },
         });
         assert_ffi_round_trip(AudioDemand {
             pinned: vec![audio.publication_id.clone()],
             automatic: false,
+            playout_delays: vec![AudioTrackDelay {
+                track_id: audio.publication_id.clone(),
+                playout_delay: PlayoutDelay::Fixed {
+                    min_ms: 0,
+                    max_ms: 0,
+                },
+            }],
         });
         assert_ffi_round_trip(publisher.clone());
         assert_ffi_round_trip(subscriber.clone());
@@ -1219,10 +1250,6 @@ mod tests {
             }],
             video: vec![],
             audio: AudioDemand::default(),
-            playout_delay: PlayoutDelay::Fixed {
-                min_ms: 80,
-                max_ms: 160,
-            },
             topic_publishers: vec![publisher],
             topic_subscribers: vec![subscriber],
         });
