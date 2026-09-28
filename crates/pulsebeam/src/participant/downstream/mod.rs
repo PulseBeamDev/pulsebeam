@@ -381,6 +381,24 @@ impl Downstream {
         self.audio.set_intent(intent);
     }
 
+    #[allow(
+        dead_code,
+        reason = "native v1 receive state replaces MID-based signaling intents"
+    )]
+    pub(crate) fn apply_native_receive(
+        &mut self,
+        receive: Option<&pulsebeam_proto::signaling_v1::ReceiveIntent>,
+    ) {
+        let requested_video = receive
+            .and_then(|request| request.video.as_ref())
+            .map_or(&[][..], |video| video.tracks.as_slice());
+        self.video.configure_native(requested_video);
+        self.set_audio_intent(decode_native_audio(
+            receive.and_then(|request| request.audio.as_ref()),
+        ));
+        self.dirty_allocation = true;
+    }
+
     pub(crate) fn apply_signaling_intents(
         &mut self,
         intents: crate::participant::signaling::SignalingIntents,
@@ -612,11 +630,70 @@ impl Downstream {
     }
 }
 
+fn decode_native_audio(audio: Option<&pulsebeam_proto::signaling_v1::AudioIntent>) -> AudioIntent {
+    use pulsebeam_proto::signaling_v1::AudioMode;
+    let mut pinned = Vec::new();
+    let mut seen = ahash::HashSet::new();
+    if let Some(request) = audio {
+        for track in &request.tracks {
+            let Ok(id) = TrackId::try_from(track.track_id.clone()) else {
+                continue;
+            };
+            if id.kind() == TrackKind::Audio && seen.insert(id) {
+                pinned.push(id);
+            }
+        }
+    }
+    AudioIntent {
+        pinned,
+        auto: !audio.is_some_and(|request| {
+            AudioMode::try_from(request.mode) == Ok(AudioMode::ExplicitOnly)
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     // Convenience only: a test is not a shard, so nothing here is
     // cross-core. See crates/pulsebeam/docs/thread-per-core.md.
     use super::*;
+
+    #[test]
+    fn native_audio_defaults_auto_and_preserves_first_unique_audio_preference() {
+        use pulsebeam_proto::signaling_v1::{AudioIntent as WireAudio, AudioTrackIntent};
+        let publisher = ParticipantId::new();
+        let mic = publisher.derive_track_id(TrackKind::Audio, "mic");
+        let camera = publisher.derive_track_id(TrackKind::Video, "camera");
+        assert_eq!(decode_native_audio(None), AudioIntent::default());
+        let request = WireAudio {
+            mode: 999,
+            tracks: [mic, mic, camera]
+                .into_iter()
+                .map(|id| AudioTrackIntent {
+                    track_id: id.as_str(),
+                    ..Default::default()
+                })
+                .collect(),
+        };
+        assert_eq!(
+            decode_native_audio(Some(&request)),
+            AudioIntent {
+                pinned: vec![mic],
+                auto: true,
+            }
+        );
+        let request = WireAudio {
+            mode: pulsebeam_proto::signaling_v1::AudioMode::ExplicitOnly.into(),
+            tracks: Vec::new(),
+        };
+        assert_eq!(
+            decode_native_audio(Some(&request)),
+            AudioIntent {
+                pinned: Vec::new(),
+                auto: false,
+            }
+        );
+    }
 
     fn expected(initial: f64, target: f64, elapsed: Duration, time_constant: Duration) -> f64 {
         let alpha = (-elapsed.as_secs_f64() / time_constant.as_secs_f64()).exp();
