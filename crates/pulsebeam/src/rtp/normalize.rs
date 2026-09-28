@@ -13,8 +13,11 @@ use str0m::media::{Mid, Rid};
 use str0m::rtp::vla::VideoLayersAllocation;
 
 use pulsebeam_core::dd::{
-    DdReadError, DependencyDescriptorReader, RawDependencyDescriptor, read_mandatory,
+    DdReadError, DecodeTargetIndication, DependencyDescriptorReader, RawDependencyDescriptor,
+    TemplateDependencyStructure, read_mandatory,
 };
+
+use crate::rtp::monitor::MAX_LADDER_TARGETS;
 
 use crate::rtp::{RtpPacket, cache::PACKET_WINDOW_CAPACITY, cache::PacketWindow};
 
@@ -28,6 +31,45 @@ pub struct StreamFacts {
     /// Decode targets the Dependency Descriptor structure advertises, present
     /// only once a scalable keyframe has taught the structure.
     pub decode_targets: Option<u8>,
+    /// Output height for each known decode target. Zero means the structure
+    /// cannot establish the target's spatial resolution.
+    pub decode_target_heights: Option<[u16; MAX_LADDER_TARGETS]>,
+    /// All decode targets use one spatial layer; the encoding's measured height
+    /// can stand in when the DD structure omits explicit resolutions.
+    pub temporal_only: Option<bool>,
+}
+
+fn decode_target_heights(structure: &TemplateDependencyStructure) -> [u16; MAX_LADDER_TARGETS] {
+    let mut heights = [0; MAX_LADDER_TARGETS];
+    for (dt, height) in heights.iter_mut().enumerate() {
+        if dt >= usize::from(structure.decode_target_count) {
+            break;
+        }
+        let mut known = true;
+        for template in &structure.templates {
+            if template
+                .dtis
+                .get(dt)
+                .is_some_and(|dti| *dti != DecodeTargetIndication::NotPresent)
+            {
+                if let Some(resolution) =
+                    structure.resolutions.get(usize::from(template.spatial_id))
+                {
+                    *height = (*height).max(resolution.height);
+                } else if structure.spatial_layer_count() == 1 {
+                    // Nonzero marks a real target; the allocator uses the
+                    // encoding's measured height for a single spatial layer.
+                    *height = 1;
+                } else {
+                    known = false;
+                }
+            }
+        }
+        if !known {
+            *height = 0;
+        }
+    }
+    heights
 }
 
 pub struct Normalization {
@@ -180,6 +222,11 @@ impl StreamNormalizer {
                 pkt.ext_vals.user_values.set_arc(std::sync::Arc::new(dd));
                 Some(StreamFacts {
                     decode_targets: self.dd.structure().map(|s| s.decode_target_count),
+                    decode_target_heights: self.dd.structure().map(decode_target_heights),
+                    temporal_only: self
+                        .dd
+                        .structure()
+                        .map(|s| s.spatial_layer_count() == 1 && s.resolutions.is_empty()),
                 })
             }
             Err(error) => {
@@ -272,6 +319,40 @@ mod tests {
     }
 
     #[test]
+    fn decode_target_output_heights_follow_spatial_templates() {
+        use pulsebeam_core::dd::{FrameDependencyTemplate, RenderResolution};
+        let mut structure = TemplateDependencyStructure {
+            decode_target_count: 3,
+            ..TemplateDependencyStructure::default()
+        };
+        structure.resolutions.push(RenderResolution {
+            width: 320,
+            height: 180,
+        });
+        structure.resolutions.push(RenderResolution {
+            width: 1280,
+            height: 720,
+        });
+        for (spatial_id, dtis) in [(0, [1, 1, 1]), (1, [0, 0, 1])] {
+            let mut template = FrameDependencyTemplate {
+                spatial_id,
+                ..FrameDependencyTemplate::default()
+            };
+            for dti in dtis {
+                template.dtis.push(if dti == 0 {
+                    DecodeTargetIndication::NotPresent
+                } else {
+                    DecodeTargetIndication::Required
+                });
+            }
+            structure.templates.push(template);
+        }
+        assert_eq!(decode_target_heights(&structure), [180, 180, 720]);
+        structure.resolutions.pop();
+        assert_eq!(decode_target_heights(&structure), [180, 180, 0]);
+    }
+
+    #[test]
     fn buffers_reordered_fragments_until_the_template_arrives() {
         let mut source = TemporalDdSource::new(1);
         let descriptors = source
@@ -301,6 +382,8 @@ mod tests {
         );
         assert!(packets[0].0.is_keyframe);
         assert!(packets[0].0.is_frame_start);
+        assert_eq!(packets[0].1.temporal_only, Some(true));
+        assert_eq!(packets[0].1.decode_target_heights, Some([1, 0, 0]));
 
         let result = normalizer.normalize(packet(11, descriptors[2].clone()));
         assert!(result.first.is_some());

@@ -133,6 +133,10 @@ pub struct StreamStats {
     /// Decode targets the encoding advertises (>= 1). `1` means no scalability
     /// structure has been seen, so the encoding is one indivisible rung.
     pub decode_targets: u8,
+    /// Resolution of each decode target when the dependency structure makes it
+    /// unambiguous. Unknown targets have height zero and cannot satisfy a floor.
+    pub decode_target_heights: [u16; MAX_LADDER_TARGETS],
+    pub temporal_only: bool,
     /// Cumulative bitrate (kbps) per decode target, from the sender's
     /// per-temporal Video Layers Allocation. `0` = not declared.
     pub decode_target_kbps: [u32; MAX_LADDER_TARGETS],
@@ -157,6 +161,8 @@ impl StreamStats {
             height,
             quality: StreamQuality::Good,
             decode_targets: 1,
+            decode_target_heights: [0; MAX_LADDER_TARGETS],
+            temporal_only: false,
             decode_target_kbps: [0; MAX_LADDER_TARGETS],
             full_fps: 0,
         }
@@ -401,6 +407,14 @@ impl StreamMonitor {
     /// Record the decode-target count a scalable keyframe's structure taught.
     pub fn set_decode_target_count(&mut self, count: u8) {
         self.stats.decode_targets = count.max(1);
+    }
+
+    pub fn set_decode_target_heights(&mut self, heights: [u16; MAX_LADDER_TARGETS]) {
+        self.stats.decode_target_heights = heights;
+    }
+
+    pub fn set_temporal_only(&mut self, temporal_only: bool) {
+        self.stats.temporal_only = temporal_only;
     }
 
     /// Record the sender's per-temporal cumulative bitrates and full frame rate
