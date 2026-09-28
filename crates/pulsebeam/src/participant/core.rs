@@ -1009,10 +1009,10 @@ impl Participant {
     }
 
     fn handle_stream_paused(&mut self, mid: Mid, paused: bool, events: &mut impl ParticipantSink) {
-        // Treat unpaused as an implicit publish signal from str0m.
-        // We intentionally do not unpublish on paused=true here; explicit
-        // client intent is authoritative for stop/unpublish transitions.
-        if !paused {
+        // WHIP has no native Intent: unpaused is its implicit publish signal.
+        // Native tracks wait for a labeled Intent before becoming visible.
+        // Paused never unpublishes; explicit state owns stop transitions.
+        if !paused && self.profile == ConnectionProfile::Whip {
             self.handle_upstream_track_state(mid, true, events);
         }
     }
