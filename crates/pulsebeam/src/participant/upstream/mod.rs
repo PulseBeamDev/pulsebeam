@@ -12,7 +12,7 @@ use crate::{
     rtp::RtpPacket,
     track::UpstreamTrack,
 };
-use ahash::{HashMap, HashMapExt};
+use ahash::{HashMap, HashMapExt, HashSetExt};
 pub(crate) use audio::UpstreamAudio;
 pub(crate) use data::UpstreamData;
 use str0m::media::Mid;
@@ -217,6 +217,63 @@ impl UpstreamMedia {
         slot.descriptor.meta_mut().label = Some(label.to_owned());
         Ok((previous, id))
     }
+    fn plan_sender_labels(
+        &self,
+        labels: &[(u32, &str)],
+    ) -> Result<Vec<(usize, TrackId, String)>, SenderLabelError> {
+        let mut replacements = Vec::new();
+        for &(media_index, label) in labels {
+            let Some(index) = self
+                .published_tracks
+                .iter()
+                .position(|slot| slot.media_index == media_index)
+            else {
+                continue;
+            };
+            let slot = &self.published_tracks[index];
+            if let Some(bound) = &slot.track.meta.label {
+                if bound != label {
+                    return Err(SenderLabelError::AlreadyBound);
+                }
+                continue;
+            }
+            if slot.published_once {
+                return Err(SenderLabelError::AlreadyPublished);
+            }
+            if replacements.iter().any(|(other, _, _)| *other == index) {
+                return Err(SenderLabelError::DuplicateLabel);
+            }
+            replacements.push((
+                index,
+                slot.track.meta.origin.derive_track_id(self.kind, label),
+                label.to_owned(),
+            ));
+        }
+        let mut identities = ahash::HashSet::new();
+        for (index, slot) in self.published_tracks.iter().enumerate() {
+            let id = replacements
+                .iter()
+                .find(|(other, _, _)| *other == index)
+                .map_or(slot.track.meta.id, |(_, id, _)| *id);
+            if !identities.insert(id) {
+                return Err(SenderLabelError::DuplicateLabel);
+            }
+        }
+        Ok(replacements)
+    }
+
+    fn apply_sender_labels(&mut self, replacements: Vec<(usize, TrackId, String)>) -> bool {
+        let changed = !replacements.is_empty();
+        for (index, id, label) in replacements {
+            let slot = &mut self.published_tracks[index];
+            slot.track.meta.id = id;
+            slot.track.meta.label = Some(label.clone());
+            slot.descriptor.meta_mut().id = id;
+            slot.descriptor.meta_mut().label = Some(label);
+        }
+        changed
+    }
+
     fn handle_incoming_rtp(
         &mut self,
         index: usize,
@@ -335,6 +392,31 @@ impl Upstream {
         }
         Ok(id)
     }
+    #[allow(
+        dead_code,
+        reason = "native v1 applies a complete sender plan atomically"
+    )]
+    pub(crate) fn bind_sender_labels_atomically(
+        &mut self,
+        labels: &[(u32, TrackKind, &str)],
+    ) -> Result<(), SenderLabelError> {
+        let mut audio = Vec::new();
+        let mut video = Vec::new();
+        for &(index, kind, label) in labels {
+            match kind {
+                TrackKind::Audio => audio.push((index, label)),
+                TrackKind::Video => video.push((index, label)),
+                TrackKind::Data => return Err(SenderLabelError::UnknownSender),
+            }
+        }
+        let audio = self.audio.plan_sender_labels(&audio)?;
+        let video = self.video.plan_sender_labels(&video)?;
+        if self.audio.apply_sender_labels(audio) | self.video.apply_sender_labels(video) {
+            self.routes.clear();
+        }
+        Ok(())
+    }
+
     pub fn slot_for_mid(&self, mid: Mid) -> Option<(UpstreamSlotKey, TrackId)> {
         self.audio
             .slot_for_mid(mid)

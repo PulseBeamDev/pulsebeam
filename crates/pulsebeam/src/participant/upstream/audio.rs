@@ -33,6 +33,18 @@ impl UpstreamAudio {
     ) -> Result<(TrackId, TrackId), super::SenderLabelError> {
         self.media.bind_sender_label(media_index, label)
     }
+    pub(super) fn plan_sender_labels(
+        &self,
+        labels: &[(u32, &str)],
+    ) -> Result<Vec<(usize, TrackId, String)>, super::SenderLabelError> {
+        self.media.plan_sender_labels(labels)
+    }
+    pub(super) fn apply_sender_labels(
+        &mut self,
+        replacements: Vec<(usize, TrackId, String)>,
+    ) -> bool {
+        self.media.apply_sender_labels(replacements)
+    }
     pub(super) fn slot_for_mid(&self, mid: Mid) -> Option<(usize, TrackId)> {
         self.media.slot_for_mid(mid)
     }
