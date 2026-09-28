@@ -25,12 +25,18 @@ impl Default for RetryPolicy {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, uniffi::Record)]
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct MediaTopology {
-    pub local_video: Vec<String>,
-    pub local_audio: Vec<String>,
-    pub remote_video: u8,
-    pub remote_audio: u8,
+    pub local_videos: u8,
+    pub local_audios: u8,
+    pub remote_videos: u8,
+    pub remote_audios: u8,
+}
+
+impl Default for MediaTopology {
+    fn default() -> Self {
+        model::MediaTopology::default().into()
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, uniffi::Record)]
@@ -478,10 +484,10 @@ impl From<model::RetryPolicy> for RetryPolicy {
 impl From<MediaTopology> for model::MediaTopology {
     fn from(value: MediaTopology) -> Self {
         Self {
-            local_video: value.local_video,
-            local_audio: value.local_audio,
-            remote_video: value.remote_video,
-            remote_audio: value.remote_audio,
+            local_video: value.local_videos,
+            local_audio: value.local_audios,
+            remote_video: value.remote_videos,
+            remote_audio: value.remote_audios,
         }
     }
 }
@@ -489,10 +495,10 @@ impl From<MediaTopology> for model::MediaTopology {
 impl From<model::MediaTopology> for MediaTopology {
     fn from(value: model::MediaTopology) -> Self {
         Self {
-            local_video: value.local_video,
-            local_audio: value.local_audio,
-            remote_video: value.remote_video,
-            remote_audio: value.remote_audio,
+            local_videos: value.local_video,
+            local_audios: value.local_audio,
+            remote_videos: value.remote_video,
+            remote_audios: value.remote_audio,
         }
     }
 }
@@ -1020,10 +1026,10 @@ mod tests {
             endpoint: "https://sfu.example.com/".to_string(),
             token: "private".to_string(),
             topology: MediaTopology {
-                local_video: vec!["camera".to_string()],
-                local_audio: vec!["microphone".to_string()],
-                remote_video: 2,
-                remote_audio: 1,
+                local_videos: 1,
+                local_audios: 1,
+                remote_videos: 2,
+                remote_audios: 1,
             },
             retry: RetryPolicy::default(),
             log_level: LogLevel::default(),
@@ -1077,7 +1083,7 @@ mod tests {
         let desired = DesiredState {
             connected: true,
             publications: vec![PublicationIntent {
-                slot: "camera".to_string(),
+                slot: "v0".to_string(),
                 label: "camera".to_string(),
                 active: true,
             }],
@@ -1218,7 +1224,7 @@ mod tests {
         assert_ffi_round_trip(config().topology);
         assert_ffi_round_trip(config());
         assert_ffi_round_trip(PublicationIntent {
-            slot: "camera".to_string(),
+            slot: "v0".to_string(),
             label: "camera".to_string(),
             active: true,
         });
@@ -1250,7 +1256,7 @@ mod tests {
         assert_ffi_round_trip(DesiredState {
             connected: true,
             publications: vec![PublicationIntent {
-                slot: "camera".to_string(),
+                slot: "v0".to_string(),
                 label: "camera".to_string(),
                 active: true,
             }],

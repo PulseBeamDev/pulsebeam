@@ -43,17 +43,18 @@ pub(crate) fn encode_v1_intent(
         })
         .collect();
     let mut send = Vec::new();
-    for (slots, kind) in [
-        (&topology.local_video, wire::TrackKind::Video),
-        (&topology.local_audio, wire::TrackKind::Audio),
+    for (count, prefix, kind) in [
+        (topology.local_video, 'v', wire::TrackKind::Video),
+        (topology.local_audio, 'a', wire::TrackKind::Audio),
     ] {
-        for name in slots {
+        for index in 0..count {
+            let name = alloc::format!("{prefix}{index}");
             let Some((label, true)) = active.get(name.as_str()).copied() else {
                 continue;
             };
             let slot = match kind {
-                wire::TrackKind::Video => MediaSlot::LocalVideo(name.clone()),
-                _ => MediaSlot::LocalAudio(name.clone()),
+                wire::TrackKind::Video => MediaSlot::LocalVideo(name),
+                _ => MediaSlot::LocalAudio(name),
             };
             let resource = coordinates
                 .get(&slot)
@@ -131,15 +132,15 @@ mod tests {
     #[test]
     fn v1_intent_uses_all_media_section_indices_and_preserves_desired_options() {
         let topology = MediaTopology {
-            local_video: alloc::vec!["camera".into()],
-            local_audio: alloc::vec!["mic".into()],
+            local_video: 1,
+            local_audio: 1,
             remote_video: 1,
             remote_audio: 1,
         };
         let mut coordinates = BTreeMap::new();
         for (slot, media_index, kind) in [
-            (MediaSlot::LocalVideo("camera".into()), 2, MediaKind::Video),
-            (MediaSlot::LocalAudio("mic".into()), 4, MediaKind::Audio),
+            (MediaSlot::LocalVideo("v0".into()), 2, MediaKind::Video),
+            (MediaSlot::LocalAudio("a0".into()), 4, MediaKind::Audio),
         ] {
             coordinates.insert(
                 slot.clone(),
@@ -155,12 +156,12 @@ mod tests {
         let desired = DesiredState {
             publications: alloc::vec![
                 PublicationIntent {
-                    slot: "camera".into(),
+                    slot: "v0".into(),
                     label: "front camera".into(),
                     active: true
                 },
                 PublicationIntent {
-                    slot: "mic".into(),
+                    slot: "a0".into(),
                     label: "mic".into(),
                     active: true
                 },
@@ -210,8 +211,8 @@ mod tests {
     #[test]
     fn per_track_playout_does_not_leak_to_default_video_or_audio() {
         let topology = MediaTopology {
-            local_video: Vec::new(),
-            local_audio: Vec::new(),
+            local_video: 0,
+            local_audio: 0,
             remote_video: 2,
             remote_audio: 2,
         };

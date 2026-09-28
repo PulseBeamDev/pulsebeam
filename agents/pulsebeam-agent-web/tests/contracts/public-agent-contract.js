@@ -15,10 +15,10 @@ globalThis.__pulsebeamPublic = (async () => {
       return "contract-token";
     },
     topology: {
-      localVideo: ["camera"],
-      localAudio: ["microphone"],
-      remoteVideo: 1,
-      remoteAudio: 1,
+      localVideos: 1,
+      localAudios: 1,
+      remoteVideos: 1,
+      remoteAudios: 1,
     },
     logging: { level: "debug" },
   };
@@ -44,9 +44,9 @@ globalThis.__pulsebeamPublic = (async () => {
     Object.isFrozen(initial.topics);
 
   second.close();
-  const publications = [{ slot: "camera", active: true }];
+  const publications = [{ slot: "v0", label: "camera", active: true }];
   first.setState({ connected: true, publications });
-  publications.push({ slot: "mutated", active: true });
+  publications.push({ slot: "mutated", label: "mutated", active: true });
   first.setState({
     connected: false,
     topics: [{ name: "presence", mode: "latest", publish: true }],
@@ -54,16 +54,16 @@ globalThis.__pulsebeamPublic = (async () => {
 
   const canvas = document.createElement("canvas");
   const track = canvas.captureStream(1).getVideoTracks()[0];
-  await first.replaceLocalTrack("camera", track, {
+  await first.replaceLocalTrack("v0", track, {
     contentHint: "motion",
     encodings: [],
   });
   const latestOnly = first.getSnapshot().connection === "disconnected";
-  await first.setLocalMuted("camera", true);
+  await first.setLocalMuted("v0", true);
   const muted = !track.enabled;
-  await first.setLocalMuted("camera", false);
+  await first.setLocalMuted("v0", false);
   const unmuted = track.enabled;
-  await first.replaceLocalTrack("camera", null, {
+  await first.replaceLocalTrack("v0", null, {
     contentHint: "motion",
   });
 
@@ -112,7 +112,7 @@ globalThis.__pulsebeamPublic = (async () => {
     connected: false,
     topics: [{ name: "presence", mode: "latest", publish: true }],
   });
-  const validationRejected = await first.setLocalMuted("camera", true).then(
+  const validationRejected = await first.setLocalMuted("v0", true).then(
     () => false,
     () => true,
   );

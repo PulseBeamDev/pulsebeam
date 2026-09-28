@@ -16,15 +16,25 @@ export const topicState = [
 
 import type { AgentState } from "@pulsebeam/react";
 
+export const localSlots = {
+  camera: "v0",
+  screen: "v1",
+  microphone: "a0",
+} as const;
+
 export function desiredState(
   connected: boolean,
-  publications: readonly string[],
+  publications: readonly (keyof typeof localSlots)[],
   video: AgentState["video"],
   playoutDelay?: { mode: "fixed"; minMs: number; maxMs: number },
 ): AgentState {
   return {
     connected,
-    publications: publications.map((slot) => ({ slot, active: true })),
+    publications: publications.map((label) => ({
+      slot: localSlots[label],
+      label,
+      active: true,
+    })),
     video: video?.map((demand) => ({
       ...demand,
       ...(playoutDelay ? { playoutDelay } : {}),

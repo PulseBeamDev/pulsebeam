@@ -509,8 +509,8 @@ mod tests {
             endpoint: "https://example.com".into(),
             token: "token".into(),
             topology: agent_core::MediaTopology {
-                local_video: vec!["cam".into()],
-                local_audio: vec!["mic".into()],
+                local_video: 1,
+                local_audio: 1,
                 remote_video: 1,
                 remote_audio: 1,
             },

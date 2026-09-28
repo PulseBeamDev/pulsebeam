@@ -722,7 +722,7 @@ fn runtime_config(config: NativeAgentConfig) -> Result<Config, NativeError> {
     let mut video_encodings = BTreeMap::new();
     let mut video_temporal_layers = BTreeMap::new();
     for encoding in config.video_encodings {
-        if !topology.local_video.contains(&encoding.slot) {
+        if topology.local_slot_kind(&encoding.slot) != Some(agent_core::MediaKind::Video) {
             return Err(invalid_configuration(format!(
                 "video encoding references unknown slot {:?}",
                 encoding.slot
@@ -953,10 +953,10 @@ mod tests {
             endpoint: "http://pulsebeam.test".into(),
             token: "token".into(),
             topology: core_ffi::MediaTopology {
-                local_video: vec!["camera".into()],
-                local_audio: vec!["microphone".into()],
-                remote_video: 1,
-                remote_audio: 1,
+                local_videos: 1,
+                local_audios: 1,
+                remote_videos: 1,
+                remote_audios: 1,
             },
             retry: core_ffi::RetryPolicy::default(),
             log_level: core_ffi::LogLevel::default(),

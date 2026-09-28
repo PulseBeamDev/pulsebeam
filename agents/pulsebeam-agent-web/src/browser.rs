@@ -47,14 +47,27 @@ struct RuntimeConfig {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct TopologyConfig {
-    #[serde(default)]
-    local_video: Vec<String>,
-    #[serde(default)]
-    local_audio: Vec<String>,
-    #[serde(default)]
-    remote_video: u8,
-    #[serde(default)]
-    remote_audio: u8,
+    #[serde(default = "default_local_videos")]
+    local_videos: u8,
+    #[serde(default = "default_local_audios")]
+    local_audios: u8,
+    #[serde(default = "default_remote_videos")]
+    remote_videos: u8,
+    #[serde(default = "default_remote_audios")]
+    remote_audios: u8,
+}
+
+fn default_local_videos() -> u8 {
+    MediaTopology::default().local_video
+}
+fn default_local_audios() -> u8 {
+    MediaTopology::default().local_audio
+}
+fn default_remote_videos() -> u8 {
+    MediaTopology::default().remote_video
+}
+fn default_remote_audios() -> u8 {
+    MediaTopology::default().remote_audio
 }
 
 #[derive(Deserialize)]
@@ -433,23 +446,14 @@ impl BrowserRuntime {
         let config: RuntimeConfig = serde_wasm_bindgen::from_value(config)
             .map_err(|error| js_error(format!("invalid browser runtime config: {error}")))?;
         let topology = MediaTopology {
-            local_video: config.topology.local_video,
-            local_audio: config.topology.local_audio,
-            remote_video: config.topology.remote_video,
-            remote_audio: config.topology.remote_audio,
+            local_video: config.topology.local_videos,
+            local_audio: config.topology.local_audios,
+            remote_video: config.topology.remote_videos,
+            remote_audio: config.topology.remote_audios,
         };
-        let local_slots: BTreeMap<String, MediaKind> = topology
-            .local_video
-            .iter()
-            .cloned()
-            .map(|slot| (slot, MediaKind::Video))
-            .chain(
-                topology
-                    .local_audio
-                    .iter()
-                    .cloned()
-                    .map(|slot| (slot, MediaKind::Audio)),
-            )
+        let local_slots: BTreeMap<String, MediaKind> = (0..topology.local_video)
+            .map(|index| (format!("v{index}"), MediaKind::Video))
+            .chain((0..topology.local_audio).map(|index| (format!("a{index}"), MediaKind::Audio)))
             .collect();
         let local_operation_gates = local_slots
             .keys()
@@ -1071,13 +1075,13 @@ impl RuntimeInner {
         }
 
         let mut transceivers = Vec::new();
-        for name in &topology.local_video {
-            let slot = MediaSlot::LocalVideo(name.clone());
+        for index in 0..topology.local_video {
+            let slot = MediaSlot::LocalVideo(format!("v{index}"));
             let transceiver = add_transceiver(&connection, "video", true, true)?;
             transceivers.push((slot, transceiver));
         }
-        for name in &topology.local_audio {
-            let slot = MediaSlot::LocalAudio(name.clone());
+        for index in 0..topology.local_audio {
+            let slot = MediaSlot::LocalAudio(format!("a{index}"));
             let transceiver = add_transceiver(&connection, "audio", true, false)?;
             transceivers.push((slot, transceiver));
         }

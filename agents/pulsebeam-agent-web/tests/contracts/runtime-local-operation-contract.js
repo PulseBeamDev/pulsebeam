@@ -7,7 +7,7 @@
   const runtime = new BrowserRuntime({
     endpoint: location.origin,
     token: "runtime-local-operation-contract",
-    topology: { localVideo: ["camera"] },
+    topology: { localVideos: 1 },
   });
   runtime.connect();
 
@@ -44,11 +44,11 @@
   };
 
   try {
-    const first = runtime.replace_local_track("camera", firstTrack, {
+    const first = runtime.replace_local_track("v0", firstTrack, {
       contentHint: "motion",
     });
     await waitFor(() => parameterCalls === 1, "first sender operation");
-    const second = runtime.replace_local_track("camera", secondTrack, {
+    const second = runtime.replace_local_track("v0", secondTrack, {
       contentHint: "motion",
     });
     await new Promise((resolve) => setTimeout(resolve, 20));
@@ -61,7 +61,7 @@
     const statistics = await runtime.statistics();
     const finalTrackWins = statistics.senders[0]?.trackId === secondTrack.id;
 
-    const closing = runtime.replace_local_track("camera", thirdTrack, {
+    const closing = runtime.replace_local_track("v0", thirdTrack, {
       contentHint: "motion",
     });
     await waitFor(() => parameterCalls === 3, "closing sender operation");
@@ -76,7 +76,7 @@
       ),
       "closing operation",
     );
-    const postCloseFenced = await runtime.set_local_muted("camera", true).then(
+    const postCloseFenced = await runtime.set_local_muted("v0", true).then(
       () => false,
       (error) =>
         error instanceof Error && error.message === "browser runtime is closed",

@@ -75,12 +75,23 @@ impl Default for RetryPolicy {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MediaTopology {
-    pub local_video: Vec<String>,
-    pub local_audio: Vec<String>,
+    pub local_video: u8,
+    pub local_audio: u8,
     pub remote_video: u8,
     pub remote_audio: u8,
+}
+
+impl Default for MediaTopology {
+    fn default() -> Self {
+        Self {
+            local_video: 2,
+            local_audio: 2,
+            remote_video: 16,
+            remote_audio: 8,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -367,8 +378,16 @@ impl AgentConfig {
 
 impl MediaTopology {
     pub(crate) fn validate(&self) -> Result<(), ValidationError> {
-        validate_limit("local video", self.local_video.len(), MAX_LOCAL_VIDEO_SLOTS)?;
-        validate_limit("local audio", self.local_audio.len(), MAX_LOCAL_AUDIO_SLOTS)?;
+        validate_limit(
+            "local video",
+            usize::from(self.local_video),
+            MAX_LOCAL_VIDEO_SLOTS,
+        )?;
+        validate_limit(
+            "local audio",
+            usize::from(self.local_audio),
+            MAX_LOCAL_AUDIO_SLOTS,
+        )?;
         validate_limit(
             "remote video",
             usize::from(self.remote_video),
@@ -379,29 +398,34 @@ impl MediaTopology {
             usize::from(self.remote_audio),
             usize::from(MAX_REMOTE_AUDIO_SLOTS),
         )?;
-        let mut names = BTreeSet::new();
-        for name in self.local_video.iter().chain(&self.local_audio) {
-            validate_identifier("slot name", name, 64, false)?;
-            if !names.insert(name.clone()) {
-                return Err(ValidationError::Duplicate {
-                    field: "slot name",
-                    value: name.clone(),
-                });
-            }
-        }
         Ok(())
+    }
+
+    pub fn local_slot_kind(&self, name: &str) -> Option<MediaKind> {
+        if let Some(index) = name
+            .strip_prefix('v')
+            .and_then(|index| index.parse::<u8>().ok())
+        {
+            return (index < self.local_video && name == alloc::format!("v{index}"))
+                .then_some(MediaKind::Video);
+        }
+        let index = name.strip_prefix('a')?.parse::<u8>().ok()?;
+        (index < self.local_audio && name == alloc::format!("a{index}")).then_some(MediaKind::Audio)
     }
 
     pub(crate) fn slots(&self) -> Vec<MediaSlot> {
         let mut slots = Vec::with_capacity(
-            self.local_video
-                .len()
-                .saturating_add(self.local_audio.len())
+            usize::from(self.local_video)
+                .saturating_add(usize::from(self.local_audio))
                 .saturating_add(usize::from(self.remote_video))
                 .saturating_add(usize::from(self.remote_audio)),
         );
-        slots.extend(self.local_video.iter().cloned().map(MediaSlot::LocalVideo));
-        slots.extend(self.local_audio.iter().cloned().map(MediaSlot::LocalAudio));
+        slots.extend(
+            (0..self.local_video).map(|index| MediaSlot::LocalVideo(alloc::format!("v{index}"))),
+        );
+        slots.extend(
+            (0..self.local_audio).map(|index| MediaSlot::LocalAudio(alloc::format!("a{index}"))),
+        );
         slots.extend((0..self.remote_video).map(MediaSlot::RemoteVideo));
         slots.extend((0..self.remote_audio).map(MediaSlot::RemoteAudio));
         slots
@@ -414,20 +438,12 @@ impl DesiredState {
     }
 
     pub(crate) fn validate(&self, topology: &MediaTopology) -> Result<(), ValidationError> {
-        let local: BTreeSet<&str> = topology
-            .local_video
-            .iter()
-            .chain(&topology.local_audio)
-            .map(String::as_str)
-            .collect();
         let mut publications = BTreeSet::new();
         let mut labels = BTreeSet::new();
         for publication in &self.publications {
-            if !local.contains(publication.slot.as_str()) {
-                return Err(ValidationError::UnknownPublicationSlot(
-                    publication.slot.clone(),
-                ));
-            }
+            let kind = topology
+                .local_slot_kind(&publication.slot)
+                .ok_or_else(|| ValidationError::UnknownPublicationSlot(publication.slot.clone()))?;
             validate_identifier("publication label", &publication.label, 64, false)?;
             if !publications.insert(publication.slot.clone()) {
                 return Err(ValidationError::Duplicate {
@@ -435,11 +451,6 @@ impl DesiredState {
                     value: publication.slot.clone(),
                 });
             }
-            let kind = if topology.local_video.contains(&publication.slot) {
-                MediaKind::Video
-            } else {
-                MediaKind::Audio
-            };
             if !labels.insert((kind, publication.label.clone())) {
                 return Err(ValidationError::Duplicate {
                     field: "publication label",

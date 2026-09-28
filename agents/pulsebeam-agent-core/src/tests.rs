@@ -77,8 +77,8 @@ fn config() -> AgentConfig {
         endpoint: "https://sfu.test/".to_string(),
         token: "private-token".to_string(),
         topology: MediaTopology {
-            local_video: vec!["camera".to_string()],
-            local_audio: vec!["microphone".to_string()],
+            local_video: 1,
+            local_audio: 1,
             remote_video: 1,
             remote_audio: 1,
         },
@@ -210,7 +210,7 @@ fn desired(revision: u64) -> DesiredState {
         revision,
         connected: true,
         publications: vec![PublicationIntent {
-            slot: "camera".to_string(),
+            slot: "v0".to_string(),
             label: "camera".to_string(),
             active: true,
         }],
@@ -262,14 +262,8 @@ fn resources(channel: ChannelId) -> OfferResources {
         slots: negotiated_slot_bindings(
             &offer(),
             [
-                (
-                    MediaSlot::LocalVideo("camera".to_string()),
-                    "lv0".to_string(),
-                ),
-                (
-                    MediaSlot::LocalAudio("microphone".to_string()),
-                    "la0".to_string(),
-                ),
+                (MediaSlot::LocalVideo("v0".to_string()), "lv0".to_string()),
+                (MediaSlot::LocalAudio("a0".to_string()), "la0".to_string()),
                 (MediaSlot::RemoteVideo(0), "rv0".to_string()),
                 (MediaSlot::RemoteAudio(0), "ra0".to_string()),
             ],
@@ -286,14 +280,14 @@ fn negotiated_coordinates_follow_sdp_sections_including_data() {
         resources(channel(1)).slots,
         vec![
             SlotBinding {
-                slot: MediaSlot::LocalVideo("camera".into()),
+                slot: MediaSlot::LocalVideo("v0".into()),
                 mid: "lv0".into(),
                 media_index: 1,
                 kind: MediaKind::Video,
                 direction: MediaDirection::SendOnly,
             },
             SlotBinding {
-                slot: MediaSlot::LocalAudio("microphone".into()),
+                slot: MediaSlot::LocalAudio("a0".into()),
                 mid: "la0".into(),
                 media_index: 3,
                 kind: MediaKind::Audio,
@@ -780,6 +774,35 @@ fn accepted_renewal_commits_the_new_credential_only_on_authorization() {
 }
 
 #[test]
+fn default_topology_reserves_distinct_counted_sender_slots() {
+    let topology = MediaTopology::default();
+    assert_eq!(
+        (
+            topology.local_video,
+            topology.local_audio,
+            topology.remote_video,
+            topology.remote_audio,
+        ),
+        (2, 2, 16, 8)
+    );
+    let slots = topology.slots();
+    assert_eq!(
+        &slots[..4],
+        &[
+            MediaSlot::LocalVideo("v0".into()),
+            MediaSlot::LocalVideo("v1".into()),
+            MediaSlot::LocalAudio("a0".into()),
+            MediaSlot::LocalAudio("a1".into()),
+        ]
+    );
+    assert_eq!(slots.len(), 28);
+    assert_eq!(topology.local_slot_kind("v0"), Some(MediaKind::Video));
+    assert_eq!(topology.local_slot_kind("a0"), Some(MediaKind::Audio));
+    assert_eq!(topology.local_slot_kind("v00"), None);
+    assert_eq!(topology.local_slot_kind("v2"), None);
+}
+
+#[test]
 fn publication_label_is_bound_to_its_slot_even_after_desire_is_cleared() {
     let mut agent = Agent::new(config()).unwrap();
     let original = desired(1);
@@ -807,7 +830,7 @@ fn publication_label_is_bound_to_its_slot_even_after_desire_is_cleared() {
     let mut audio = original;
     audio.revision = 3;
     audio.publications = vec![PublicationIntent {
-        slot: "microphone".into(),
+        slot: "a0".into(),
         label: "camera".into(),
         active: true,
     }];
@@ -824,10 +847,7 @@ fn construction_and_desired_state_validate_complete_external_input() {
     ));
 
     let mut invalid = config();
-    invalid
-        .topology
-        .local_video
-        .extend((0..MAX_LOCAL_VIDEO_SLOTS).map(|index| format!("camera-{index}")));
+    invalid.topology.local_video = (MAX_LOCAL_VIDEO_SLOTS + 1) as u8;
     assert!(matches!(
         Agent::new(invalid),
         Err(AgentError::InvalidConfiguration(
@@ -836,25 +856,17 @@ fn construction_and_desired_state_validate_complete_external_input() {
     ));
 
     let mut at_capacity = config();
-    at_capacity
-        .topology
-        .local_video
-        .extend((1..MAX_LOCAL_VIDEO_SLOTS).map(|index| format!("camera-{index}")));
+    at_capacity.topology.local_video = MAX_LOCAL_VIDEO_SLOTS as u8;
     at_capacity.topology.remote_audio = MAX_REMOTE_AUDIO_SLOTS;
     at_capacity.topology.remote_video = MAX_REMOTE_VIDEO_SLOTS;
-    at_capacity
-        .topology
-        .local_audio
-        .extend((1..MAX_LOCAL_AUDIO_SLOTS).map(|index| format!("microphone-{index}")));
+    at_capacity.topology.local_audio = MAX_LOCAL_AUDIO_SLOTS as u8;
     assert!(Agent::new(at_capacity).is_ok());
 
-    let mut duplicate = config();
-    duplicate.topology.local_audio = vec!["camera".to_string()];
+    let mut invalid_slot = desired(1);
+    invalid_slot.publications[0].slot = "v00".into();
     assert!(matches!(
-        Agent::new(duplicate),
-        Err(AgentError::InvalidConfiguration(
-            ValidationError::Duplicate { .. }
-        ))
+        invalid_slot.validate(&config().topology),
+        Err(ValidationError::UnknownPublicationSlot(_))
     ));
 
     let mut protocol_header = config();

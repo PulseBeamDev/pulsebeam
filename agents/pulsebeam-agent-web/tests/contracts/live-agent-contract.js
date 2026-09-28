@@ -1,9 +1,10 @@
 (async () => {
   const endpoint = "http://127.0.0.1:7070";
   const topology = {
-    localVideo: ["camera"],
-    remoteVideo: 1,
-    remoteAudio: 0,
+    localVideos: 1,
+    localAudios: 0,
+    remoteVideos: 1,
+    remoteAudios: 0,
   };
   const sender = window.pulsebeam.createAgent({
     endpoint,
@@ -40,12 +41,12 @@
   context.fillStyle = "#20a0ff";
   context.fillRect(0, 0, 16, 16);
   const localTrack = canvas.captureStream(5).getVideoTracks()[0];
-  await sender.replaceLocalTrack("camera", localTrack, {
+  await sender.replaceLocalTrack("v0", localTrack, {
     contentHint: "motion",
   });
   sender.setState({
     connected: true,
-    publications: [{ slot: "camera", active: true }],
+    publications: [{ slot: "v0", label: "camera", active: true }],
     topics: [{ name: "chat", mode: "ordered", publish: true }],
   });
   receiver.setState({
@@ -140,7 +141,7 @@
   RTCRtpSender.prototype.setParameters = () =>
     Promise.reject(new DOMException("contract runtime failure"));
   const runtimeRejected = await sender
-    .replaceLocalTrack("camera", localTrack, { contentHint: "motion" })
+    .replaceLocalTrack("v0", localTrack, { contentHint: "motion" })
     .then(
       () => false,
       () => true,
@@ -165,7 +166,7 @@
     enterPendingOperation();
     return pendingOperationGate;
   };
-  const pendingReplacement = sender.replaceLocalTrack("camera", localTrack, {
+  const pendingReplacement = sender.replaceLocalTrack("v0", localTrack, {
     contentHint: "motion",
   });
   await pendingOperationEntered;

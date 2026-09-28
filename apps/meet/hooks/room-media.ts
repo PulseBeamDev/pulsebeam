@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { Agent } from "@pulsebeam/react";
+import { localSlots } from "../lib/model";
 
 const sender = {
   camera: { contentHint: "motion" as const },
@@ -50,14 +51,14 @@ export function useRoomMedia(
       const microphone = stream.getAudioTracks()[0] ?? null;
       if (camera) camera.enabled = cameraOn;
       if (microphone) microphone.enabled = micOn;
-      await agent.replaceLocalTrack("camera", camera, sender.camera);
+      await agent.replaceLocalTrack(localSlots.camera, camera, sender.camera);
       await agent.replaceLocalTrack(
-        "microphone",
+        localSlots.microphone,
         microphone,
         sender.microphone,
       );
-      await agent.setLocalMuted("camera", !cameraOn);
-      await agent.setLocalMuted("microphone", !micOn);
+      await agent.setLocalMuted(localSlots.camera, !cameraOn);
+      await agent.setLocalMuted(localSlots.microphone, !micOn);
     });
   }, [agent, cameraOn, micOn, queue, stream]);
 
@@ -68,7 +69,7 @@ export function useRoomMedia(
     setScreen(null);
     queue(async () => {
       try {
-        await agent.replaceLocalTrack("screen", null, sender.screen);
+        await agent.replaceLocalTrack(localSlots.screen, null, sender.screen);
       } finally {
         stopMedia(active);
       }
@@ -113,7 +114,7 @@ export function useRoomMedia(
       queue(async () => {
         try {
           await agent.replaceLocalTrack(
-            "screen",
+            localSlots.screen,
             display.getVideoTracks()[0] ?? null,
             sender.screen,
           );
@@ -155,7 +156,7 @@ export function useRoomMedia(
         });
       if (slot === "camera") setCameraOn(enabled);
       else setMicOn(enabled);
-      queue(() => agent.setLocalMuted(slot, !enabled));
+      queue(() => agent.setLocalMuted(localSlots[slot], !enabled));
     },
     [agent, queue, stream],
   );
