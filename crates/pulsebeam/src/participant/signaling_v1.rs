@@ -83,7 +83,36 @@ impl SenderBindings {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum InputError {
     Decode(pulsebeam_proto::codec::DecodeError),
-    Intent(IntentError),
+    Intent { revision: u64, cause: IntentError },
+}
+
+impl InputError {
+    pub(crate) fn response(self) -> pulsebeam_proto::signaling_v1::ServerMessage {
+        use pulsebeam_proto::signaling_v1::{Error, ErrorCode, ServerMessage, server_message};
+        let (code, message, intent_revision) = match self {
+            Self::Decode(_) => (
+                ErrorCode::InvalidMessage,
+                "invalid signaling envelope",
+                None,
+            ),
+            Self::Intent { revision, cause } => (
+                ErrorCode::ProtocolError,
+                match cause {
+                    IntentError::VideoReceiverCapacity => "video receiver capacity exceeded",
+                    IntentError::SendBinding(_) => "sender binding changed",
+                },
+                Some(revision),
+            ),
+        };
+        ServerMessage {
+            payload: Some(server_message::Payload::Error(Error {
+                code: code.into(),
+                message: message.into(),
+                fatal: true,
+                intent_revision,
+            })),
+        }
+    }
 }
 
 pub(crate) enum NativeInput {
@@ -103,7 +132,10 @@ pub(crate) fn decode_input(
         Some(Payload::Intent(intent)) => state
             .plan(&intent, negotiated_senders, video_receiver_capacity)
             .map(NativeInput::Intent)
-            .map_err(InputError::Intent),
+            .map_err(|cause| InputError::Intent {
+                revision: intent.revision,
+                cause,
+            }),
         Some(Payload::RenewAuthorization(renewal)) => {
             Ok(NativeInput::RenewAuthorization(renewal.token))
         }
@@ -682,6 +714,51 @@ mod tests {
             decode_input(&[0x80], &state, &HashMap::new(), 0),
             Err(InputError::Decode(_))
         ));
+    }
+
+    #[test]
+    fn fatal_intent_error_identifies_candidate_revision_without_secret_input() {
+        use pulsebeam_proto::signaling_v1::{
+            ClientMessage, Intent, ReceiveIntent, VideoIntent, VideoTrackIntent, client_message,
+            server_message::Payload,
+        };
+        let message = ClientMessage {
+            payload: Some(client_message::Payload::Intent(Intent {
+                revision: 9,
+                receive: Some(ReceiveIntent {
+                    video: Some(VideoIntent {
+                        tracks: vec![VideoTrackIntent {
+                            track_id: "private-track".into(),
+                            options: None,
+                        }],
+                    }),
+                    audio: None,
+                }),
+                ..Default::default()
+            })),
+        };
+        let bytes = pulsebeam_proto::codec::encode_client(&message).unwrap();
+        let err = match decode_input(&bytes, &IntentState::default(), &HashMap::new(), 0) {
+            Ok(_) => panic!("capacity overflow must be fatal"),
+            Err(err) => err,
+        };
+        assert_eq!(
+            err,
+            InputError::Intent {
+                revision: 9,
+                cause: IntentError::VideoReceiverCapacity
+            }
+        );
+        let Payload::Error(wire) = err.response().payload.unwrap() else {
+            panic!("expected error response")
+        };
+        assert!(wire.fatal);
+        assert_eq!(wire.intent_revision, Some(9));
+        assert_eq!(
+            wire.code,
+            pulsebeam_proto::signaling_v1::ErrorCode::ProtocolError as i32
+        );
+        assert!(!wire.message.contains("private-track"));
     }
 
     #[test]
