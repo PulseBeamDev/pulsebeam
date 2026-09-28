@@ -81,6 +81,39 @@ impl SenderBindings {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InputError {
+    Decode(pulsebeam_proto::codec::DecodeError),
+    Intent(IntentError),
+}
+
+pub(crate) enum NativeInput {
+    Intent(IntentDecision),
+    RenewAuthorization(String),
+}
+
+pub(crate) fn decode_input(
+    bytes: &[u8],
+    state: &IntentState,
+    negotiated_senders: &HashMap<u32, TrackKind>,
+    video_receiver_capacity: usize,
+) -> Result<NativeInput, InputError> {
+    use pulsebeam_proto::signaling_v1::client_message::Payload;
+    let message = pulsebeam_proto::codec::decode_client(bytes).map_err(InputError::Decode)?;
+    match message.payload {
+        Some(Payload::Intent(intent)) => state
+            .plan(&intent, negotiated_senders, video_receiver_capacity)
+            .map(NativeInput::Intent)
+            .map_err(InputError::Intent),
+        Some(Payload::RenewAuthorization(renewal)) => {
+            Ok(NativeInput::RenewAuthorization(renewal.token))
+        }
+        None => Err(InputError::Decode(
+            pulsebeam_proto::codec::DecodeError::MissingPayload,
+        )),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum IntentError {
     VideoReceiverCapacity,
     SendBinding(SendBindingError),
@@ -459,6 +492,41 @@ mod tests {
         meta.id = publisher.derive_track_id(TrackKind::Audio, label);
         meta.label = Some(label.to_owned());
         meta.clone()
+    }
+
+    #[test]
+    fn native_input_decodes_compressed_intent_and_renewal_without_legacy_fallback() {
+        use pulsebeam_proto::signaling_v1::{
+            ClientMessage, Intent, RenewAuthorization, client_message,
+        };
+        let intent = ClientMessage {
+            payload: Some(client_message::Payload::Intent(Intent {
+                revision: 1,
+                ..Default::default()
+            })),
+        };
+        let bytes = pulsebeam_proto::codec::encode_client(&intent).unwrap();
+        let state = IntentState::default();
+        assert!(matches!(
+            decode_input(&bytes, &state, &HashMap::new(), 0),
+            Ok(NativeInput::Intent(IntentDecision::Accept(_)))
+        ));
+        let renewal = ClientMessage {
+            payload: Some(client_message::Payload::RenewAuthorization(
+                RenewAuthorization {
+                    token: "token".into(),
+                },
+            )),
+        };
+        let bytes = pulsebeam_proto::codec::encode_client(&renewal).unwrap();
+        assert!(matches!(
+            decode_input(&bytes, &state, &HashMap::new(), 0),
+            Ok(NativeInput::RenewAuthorization(jwt)) if jwt == "token"
+        ));
+        assert!(matches!(
+            decode_input(&[0x80], &state, &HashMap::new(), 0),
+            Err(InputError::Decode(_))
+        ));
     }
 
     #[test]
