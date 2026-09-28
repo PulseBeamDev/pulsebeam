@@ -18,6 +18,7 @@ mod id;
 mod identity;
 mod model;
 mod signaling;
+mod signaling_v1;
 mod topic;
 
 pub mod ffi;
