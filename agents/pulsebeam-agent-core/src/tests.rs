@@ -788,14 +788,29 @@ fn construction_and_desired_state_validate_complete_external_input() {
     ));
 
     let mut invalid = config();
-    invalid.topology.local_video.push("second".to_string());
-    invalid.topology.local_video.push("third".to_string());
+    invalid
+        .topology
+        .local_video
+        .extend((0..MAX_LOCAL_VIDEO_SLOTS).map(|index| format!("camera-{index}")));
     assert!(matches!(
         Agent::new(invalid),
         Err(AgentError::InvalidConfiguration(
             ValidationError::SlotLimit { .. }
         ))
     ));
+
+    let mut at_capacity = config();
+    at_capacity
+        .topology
+        .local_video
+        .extend((1..MAX_LOCAL_VIDEO_SLOTS).map(|index| format!("camera-{index}")));
+    at_capacity.topology.remote_audio = MAX_REMOTE_AUDIO_SLOTS;
+    at_capacity.topology.remote_video = MAX_REMOTE_VIDEO_SLOTS;
+    at_capacity
+        .topology
+        .local_audio
+        .extend((1..MAX_LOCAL_AUDIO_SLOTS).map(|index| format!("microphone-{index}")));
+    assert!(Agent::new(at_capacity).is_ok());
 
     let mut duplicate = config();
     duplicate.topology.local_audio = vec!["camera".to_string()];
