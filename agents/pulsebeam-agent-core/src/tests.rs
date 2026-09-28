@@ -211,6 +211,7 @@ fn desired(revision: u64) -> DesiredState {
         connected: true,
         publications: vec![PublicationIntent {
             slot: "camera".to_string(),
+            label: "camera".to_string(),
             active: true,
         }],
         video: vec![VideoSubscription {
@@ -776,6 +777,41 @@ fn accepted_renewal_commits_the_new_credential_only_on_authorization() {
         })
     );
     assert!(!format!("{delete:?}").contains("new-secret"));
+}
+
+#[test]
+fn publication_label_is_bound_to_its_slot_even_after_desire_is_cleared() {
+    let mut agent = Agent::new(config()).unwrap();
+    let original = desired(1);
+    agent
+        .command(AgentCommand::ReplaceDesired(original.clone()))
+        .unwrap();
+    let mut cleared = original.clone();
+    cleared.revision = 2;
+    cleared.publications.clear();
+    agent
+        .command(AgentCommand::ReplaceDesired(cleared))
+        .unwrap();
+
+    let mut relabelled = original.clone();
+    relabelled.revision = 3;
+    relabelled.publications[0].label = "different camera".into();
+    assert!(matches!(
+        agent.command(AgentCommand::ReplaceDesired(relabelled)),
+        Err(AgentError::InvalidConfiguration(
+            ValidationError::PublicationBinding(_)
+        ))
+    ));
+    assert_eq!(agent.snapshot().desired_revision, 2);
+
+    let mut audio = original;
+    audio.revision = 3;
+    audio.publications = vec![PublicationIntent {
+        slot: "microphone".into(),
+        label: "camera".into(),
+        active: true,
+    }];
+    agent.command(AgentCommand::ReplaceDesired(audio)).unwrap();
 }
 
 #[test]
