@@ -326,6 +326,21 @@ impl JitterBuffer {
         true
     }
 
+    fn next_deadline(&self) -> Option<Instant> {
+        let (&sequence, head) = self.buf.first_key_value()?;
+        let budget = match self.next {
+            None => self.initial_wait,
+            Some(next) if next == sequence => Duration::ZERO,
+            Some(_) if self.delivered_frame => self.max_wait,
+            Some(_) => self.initial_wait,
+        };
+        head.arrival.checked_add(budget)
+    }
+
+    fn advance(&mut self, now: Instant) {
+        self.latest_arrival = Some(self.latest_arrival.map_or(now, |latest| latest.max(now)));
+    }
+
     /// Release the next in-order packet that is ready, or `None` while still
     /// waiting for it to arrive (up to `max_wait` from the head packet's arrival).
     pub fn pop(&mut self) -> Option<RtpPacket> {
@@ -463,6 +478,11 @@ impl FrameReceiver {
         self.awaiting_keyframe
     }
 
+    pub fn set_max_wait(&mut self, max_wait: Duration) {
+        self.jitter.max_wait = max_wait;
+        self.jitter.initial_wait = DEFAULT_INITIAL_COMMIT_WAIT.min(max_wait);
+    }
+
     /// Feed one RTP packet; returns any frames that became ready (0+). Frames may
     /// be released now or on a later push once the jitter buffer's delay elapses.
     pub fn push(&mut self, rtp: RtpPacket) -> Vec<MediaFrame> {
@@ -475,6 +495,19 @@ impl FrameReceiver {
             self.awaiting_keyframe = true;
         }
         self.jitter.push(rtp);
+        self.pop_ready()
+    }
+
+    pub fn next_deadline(&self) -> Option<Instant> {
+        self.jitter.next_deadline()
+    }
+
+    pub fn advance(&mut self, now: Instant) -> Vec<MediaFrame> {
+        self.jitter.advance(now);
+        self.pop_ready()
+    }
+
+    fn pop_ready(&mut self) -> Vec<MediaFrame> {
         let mut frames = Vec::new();
         while let Some(ordered) = self.jitter.pop() {
             if let Some(frame) = self.reassemble(ordered) {
@@ -1107,6 +1140,46 @@ mod tests {
             "the stream must open on the reordering window, not the loss-recovery budget: at 5s \
              a viewer stares at a blank tile for five seconds before the first frame"
         );
+    }
+
+    #[test]
+    fn jitter_timer_releases_opening_and_missing_packets_without_new_arrivals() {
+        use tokio::time::Instant;
+
+        let base = Instant::now();
+        let packet = |seq: u64, arrival: Instant| RtpPacket {
+            ssrc: None,
+            mid: Mid::from("v0"),
+            rid: None,
+            seq: SeqNo::from(seq),
+            ts: MediaTime::from_90khz(seq.saturating_mul(3000)),
+            marker: true,
+            payload: Arc::from([0_u8]),
+            ext_vals: ExtensionValues::default(),
+            arrival,
+        };
+        let mut jitter = JitterBuffer::new(Duration::from_millis(50));
+        jitter.push(packet(1, base));
+        assert_eq!(
+            jitter.next_deadline(),
+            Some(base + Duration::from_millis(50))
+        );
+        jitter.advance(base + Duration::from_millis(49));
+        assert!(jitter.pop().is_none());
+        jitter.advance(base + Duration::from_millis(50));
+        assert_eq!(jitter.pop().map(|pkt| *pkt.seq), Some(1));
+        jitter.note_frame_delivered();
+
+        let next = base + Duration::from_millis(100);
+        jitter.push(packet(3, next));
+        assert_eq!(
+            jitter.next_deadline(),
+            Some(next + Duration::from_millis(50))
+        );
+        jitter.advance(next + Duration::from_millis(49));
+        assert!(jitter.pop().is_none());
+        jitter.advance(next + Duration::from_millis(50));
+        assert_eq!(jitter.pop().map(|pkt| *pkt.seq), Some(3));
     }
 
     /// The shorter opening window must still absorb the reordering it exists for.

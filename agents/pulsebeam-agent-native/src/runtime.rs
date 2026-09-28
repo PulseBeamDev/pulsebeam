@@ -15,7 +15,7 @@ use str0m::bwe::Bitrate;
 use str0m::change::{SdpAnswer, SdpPendingOffer};
 use str0m::channel::{ChannelConfig, ChannelId as RtcChannelId, Reliability};
 use str0m::media::{
-    Direction, KeyframeRequestKind, MediaKind, Mid, Rid, Simulcast, SimulcastLayer,
+    Direction, KeyframeRequestKind, MediaKind, MediaTime, Mid, Rid, Simulcast, SimulcastLayer,
 };
 use str0m::net::{Protocol, Receive, TcpType};
 use str0m::rtp::{RtpWrite, Ssrc};
@@ -353,8 +353,10 @@ pub struct RemoteMedia {
     mid: watch::Receiver<Option<String>>,
     packets: flume::Receiver<RtpPacket>,
     frames: FrameReceiver,
-    ready: VecDeque<MediaFrame>,
+    ready: VecDeque<(MediaFrame, Option<(Duration, Duration)>)>,
+    frame_policy: BTreeMap<MediaTime, Option<(Duration, Duration)>>,
     last_audio_seq: Option<u64>,
+    playout_delay: Option<(Duration, Duration)>,
     commands: mpsc::Sender<Command>,
     snapshot: watch::Receiver<Snapshot>,
 }
@@ -386,7 +388,9 @@ impl RemoteMedia {
             FrameReceiver::new()
         };
         self.ready.clear();
+        self.frame_policy.clear();
         self.last_audio_seq = None;
+        self.playout_delay = None;
         while self.packets.try_recv().is_ok() {}
     }
 
@@ -419,6 +423,56 @@ impl RemoteMedia {
         }
     }
 
+    fn update_playout_delay(&mut self, packet: &RtpPacket) {
+        let (Some(min), Some(max)) = (
+            packet.ext_vals.play_delay_min,
+            packet.ext_vals.play_delay_max,
+        ) else {
+            return;
+        };
+        let min = Duration::from_micros(min.as_micros()).min(Duration::from_secs(2));
+        let max = Duration::from_micros(max.as_micros())
+            .min(Duration::from_secs(2))
+            .max(min);
+        self.playout_delay = Some((min, max));
+        if matches!(self.slot, MediaSlot::RemoteVideo(_)) {
+            self.frames.set_max_wait(max);
+        }
+    }
+
+    fn queue_frames(&mut self, frames: Vec<MediaFrame>) {
+        for frame in frames {
+            let policy = self
+                .frame_policy
+                .remove(&frame.ts)
+                .unwrap_or(self.playout_delay);
+            self.ready.push_back((frame, policy));
+        }
+    }
+
+    async fn wait_for_playout(
+        &mut self,
+        arrival: Instant,
+        policy: Option<(Duration, Duration)>,
+    ) -> Result<bool, Error> {
+        let Some((minimum, _)) = policy else {
+            return Ok(true);
+        };
+        let deadline = arrival.checked_add(minimum).unwrap_or(arrival);
+        tokio::select! {
+            biased;
+            changed = self.mid.changed() => {
+                changed.map_err(|_| Error::Closed)?;
+                self.retire_receiver();
+                Ok(false)
+            }
+            () = tokio::time::sleep_until(deadline) => {
+                self.retire_changed_generation()?;
+                Ok(self.mid.borrow().is_some())
+            }
+        }
+    }
+
     pub async fn request_keyframe(&self, ssrc: Ssrc) -> Result<(), Error> {
         self.commands
             .send(Command::RequestKeyframe {
@@ -432,37 +486,71 @@ impl RemoteMedia {
     pub async fn recv_frame(&mut self) -> Result<MediaFrame, Error> {
         self.retire_changed_generation()?;
         if matches!(self.slot, MediaSlot::RemoteAudio(_)) {
-            let packet = self.recv_packet().await?;
-            let sequence = *packet.seq;
-            let contiguous = self
-                .last_audio_seq
-                .is_none_or(|previous| sequence == previous.saturating_add(1));
-            self.last_audio_seq = Some(sequence);
-            return Ok(MediaFrame {
-                ts: packet.ts,
-                data: packet.payload,
-                capture_time: packet.arrival,
-                abs_capture_time: packet
-                    .ext_vals
-                    .abs_capture_time
-                    .map(|capture| capture.capture_time),
-                contiguous,
-                is_keyframe: false,
-                audio_level: packet.ext_vals.audio_level,
-                voice_activity: packet.ext_vals.voice_activity,
-                target_bitrate_bps: None,
-                resolution: None,
-                dependency_descriptor: None,
-                temporal_layers: None,
-            });
+            loop {
+                let packet = self.recv_packet().await?;
+                self.update_playout_delay(&packet);
+                if !self
+                    .wait_for_playout(packet.arrival, self.playout_delay)
+                    .await?
+                {
+                    continue;
+                }
+                let sequence = *packet.seq;
+                let contiguous = self
+                    .last_audio_seq
+                    .is_none_or(|previous| sequence == previous.saturating_add(1));
+                self.last_audio_seq = Some(sequence);
+                return Ok(MediaFrame {
+                    ts: packet.ts,
+                    data: packet.payload,
+                    capture_time: packet.arrival,
+                    abs_capture_time: packet
+                        .ext_vals
+                        .abs_capture_time
+                        .map(|capture| capture.capture_time),
+                    contiguous,
+                    is_keyframe: false,
+                    audio_level: packet.ext_vals.audio_level,
+                    voice_activity: packet.ext_vals.voice_activity,
+                    target_bitrate_bps: None,
+                    resolution: None,
+                    dependency_descriptor: None,
+                    temporal_layers: None,
+                });
+            }
         }
         loop {
-            if let Some(frame) = self.ready.pop_front() {
-                return Ok(frame);
+            self.retire_changed_generation()?;
+            if let Some((frame, policy)) = self.ready.pop_front() {
+                if self.wait_for_playout(frame.capture_time, policy).await? {
+                    return Ok(frame);
+                }
+                continue;
             }
-            let packet = self.recv_packet().await?;
+            let packet = if let Some(deadline) = self.frames.next_deadline() {
+                tokio::select! {
+                    biased;
+                    packet = self.recv_packet() => packet?,
+                    () = tokio::time::sleep_until(deadline) => {
+                        self.retire_changed_generation()?;
+                        let frames = self.frames.advance(Instant::now());
+                        self.queue_frames(frames);
+                        continue;
+                    }
+                }
+            } else {
+                self.recv_packet().await?
+            };
+            self.update_playout_delay(&packet);
+            if self.frame_policy.len() >= crate::pipeline::MAX_JITTER_BUFFER_PACKETS {
+                self.frame_policy.pop_first();
+            }
+            self.frame_policy
+                .entry(packet.ts)
+                .or_insert(self.playout_delay);
             let ssrc = packet.ssrc;
-            self.ready.extend(self.frames.push(packet));
+            let frames = self.frames.push(packet);
+            self.queue_frames(frames);
             if self.frames.needs_keyframe()
                 && let Some(ssrc) = ssrc
             {
@@ -775,7 +863,9 @@ impl Actor {
                         packets,
                         frames,
                         ready: VecDeque::new(),
+                        frame_policy: BTreeMap::new(),
                         last_audio_seq: None,
+                        playout_delay: None,
                         commands: self.command_tx.clone(),
                         snapshot: self.snapshot.subscribe(),
                     })
@@ -1791,7 +1881,9 @@ mod tests {
             packets,
             frames: FrameReceiver::new(),
             ready: VecDeque::new(),
+            frame_policy: BTreeMap::new(),
             last_audio_seq: None,
+            playout_delay: None,
             commands,
             snapshot,
         };
@@ -1834,7 +1926,9 @@ mod tests {
             packets,
             frames: FrameReceiver::new(),
             ready: VecDeque::new(),
+            frame_policy: BTreeMap::new(),
             last_audio_seq: Some(99),
+            playout_delay: None,
             commands,
             snapshot,
         };
@@ -1854,6 +1948,7 @@ mod tests {
         media.retire_changed_generation().unwrap();
         assert!(media.packets.try_recv().is_err());
         assert_eq!(media.last_audio_seq, None);
+        assert_eq!(media.playout_delay, None);
 
         mid_tx.send_replace(Some("audio".to_owned()));
         media.retire_changed_generation().unwrap();
@@ -1861,5 +1956,134 @@ mod tests {
         let frame = media.recv_frame().await.unwrap();
         assert_eq!(frame.data.as_ref(), [1]);
         assert!(frame.contiguous);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn audio_playout_waits_for_first_packet_policy_and_caches_it() {
+        let (packet_tx, packets) = flume::bounded(2);
+        let (_mid_tx, mid) = watch::channel(Some("audio".to_owned()));
+        let (commands, _command_rx) = mpsc::channel(1);
+        let (_snapshot_tx, snapshot) = watch::channel(Snapshot::default());
+        let mut media = RemoteMedia {
+            slot: MediaSlot::RemoteAudio(0),
+            mid,
+            packets,
+            frames: FrameReceiver::new(),
+            ready: VecDeque::new(),
+            frame_policy: BTreeMap::new(),
+            last_audio_seq: None,
+            playout_delay: None,
+            commands,
+            snapshot,
+        };
+        let first = RtpPacket {
+            mid: Mid::from("audio"),
+            rid: None,
+            seq: crate::SeqNo::from(1),
+            ts: crate::MediaTime::new(960, crate::Frequency::FORTY_EIGHT_KHZ),
+            marker: false,
+            ssrc: Some(Ssrc::from(1)),
+            payload: Arc::from([1_u8]),
+            ext_vals: crate::ExtensionValues {
+                play_delay_min: Some(crate::MediaTime::from_millis(50)),
+                play_delay_max: Some(crate::MediaTime::from_millis(100)),
+                ..crate::ExtensionValues::default()
+            },
+            arrival: Instant::now(),
+        };
+        packet_tx.send_async(first.clone()).await.unwrap();
+        let mut task = tokio::spawn(async move {
+            let frame = media.recv_frame().await.unwrap();
+            (frame, media)
+        });
+        tokio::task::yield_now().await;
+        assert!(!task.is_finished());
+        tokio::time::advance(Duration::from_millis(49)).await;
+        assert!(!task.is_finished());
+        tokio::time::advance(Duration::from_millis(1)).await;
+        let (frame, mut media) = (&mut task).await.unwrap();
+        assert_eq!(frame.data.as_ref(), [1]);
+        assert_eq!(
+            media.playout_delay,
+            Some((Duration::from_millis(50), Duration::from_millis(100)))
+        );
+
+        let second = RtpPacket {
+            seq: crate::SeqNo::from(2),
+            payload: Arc::from([2_u8]),
+            ext_vals: crate::ExtensionValues::default(),
+            arrival: Instant::now(),
+            ..first
+        };
+        packet_tx.send_async(second).await.unwrap();
+        let task = tokio::spawn(async move { media.recv_frame().await.unwrap() });
+        tokio::task::yield_now().await;
+        assert!(!task.is_finished());
+        tokio::time::advance(Duration::from_millis(50)).await;
+        assert_eq!(task.await.unwrap().data.as_ref(), [2]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn video_frames_snapshot_policy_before_a_later_frame_changes_it() {
+        let (packet_tx, packets) = flume::bounded(2);
+        let (_mid_tx, mid) = watch::channel(Some("video".to_owned()));
+        let (commands, _command_rx) = mpsc::channel(2);
+        let (_snapshot_tx, snapshot) = watch::channel(Snapshot::default());
+        let mut media = RemoteMedia {
+            slot: MediaSlot::RemoteVideo(0),
+            mid,
+            packets,
+            frames: FrameReceiver::new(),
+            ready: VecDeque::new(),
+            frame_policy: BTreeMap::new(),
+            last_audio_seq: None,
+            playout_delay: None,
+            commands,
+            snapshot,
+        };
+        let base = Instant::now();
+        let first = RtpPacket {
+            mid: Mid::from("video"),
+            rid: None,
+            seq: crate::SeqNo::from(1),
+            ts: MediaTime::from_90khz(3000),
+            marker: true,
+            ssrc: Some(Ssrc::from(1)),
+            payload: Arc::from([1_u8]),
+            ext_vals: crate::ExtensionValues {
+                play_delay_min: Some(MediaTime::from_millis(50)),
+                play_delay_max: Some(MediaTime::from_millis(100)),
+                ..crate::ExtensionValues::default()
+            },
+            arrival: base,
+        };
+        let next = RtpPacket {
+            seq: crate::SeqNo::from(2),
+            ts: MediaTime::from_90khz(6000),
+            payload: Arc::from([2_u8]),
+            ext_vals: crate::ExtensionValues {
+                play_delay_min: Some(MediaTime::ZERO),
+                play_delay_max: Some(MediaTime::ZERO),
+                ..crate::ExtensionValues::default()
+            },
+            ..first.clone()
+        };
+        packet_tx.send_async(first).await.unwrap();
+        packet_tx.send_async(next).await.unwrap();
+        let task = tokio::spawn(async move {
+            let first = media.recv_frame().await.unwrap();
+            let second = media.recv_frame().await.unwrap();
+            (first, second, media)
+        });
+        tokio::task::yield_now().await;
+        assert!(!task.is_finished());
+        tokio::time::advance(Duration::from_millis(49)).await;
+        assert!(!task.is_finished());
+        tokio::time::advance(Duration::from_millis(1)).await;
+        let (first, second, media) = task.await.unwrap();
+        assert_eq!(first.data.as_ref(), [1]);
+        assert_eq!(second.data.as_ref(), [2]);
+        assert_eq!(Instant::now(), base + Duration::from_millis(50));
+        assert_eq!(media.playout_delay, Some((Duration::ZERO, Duration::ZERO)));
     }
 }
