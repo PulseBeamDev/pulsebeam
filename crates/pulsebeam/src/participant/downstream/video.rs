@@ -8,7 +8,7 @@ use crate::rtp::cache::TrackStreamCache;
 use crate::rtp::frame_selector::DecodeTargetSelection;
 use crate::rtp::switcher::{LayerStates, Switcher};
 use ahash::{HashMap, HashMapExt, HashSet, HashSetExt};
-use indexmap::IndexSet;
+use indexmap::{IndexMap, IndexSet};
 use slotmap::{SecondaryMap, SlotMap};
 use std::cmp::Ordering;
 use std::ops::{Deref, DerefMut};
@@ -248,6 +248,72 @@ impl VideoAllocator {
             } else {
                 Self::configure_slot(tracks, track_handles, slot, None);
             }
+        }
+    }
+
+    #[allow(
+        dead_code,
+        reason = "native v1 receive intent selects canonical tracks, not MIDs"
+    )]
+    pub(crate) fn configure_native(
+        &mut self,
+        requests: &[pulsebeam_proto::signaling_v1::VideoTrackIntent],
+    ) {
+        let mut desired = IndexMap::new();
+        for request in requests {
+            let Ok(track_id) = TrackId::try_from(request.track_id.clone()) else {
+                continue;
+            };
+            if track_id.kind() == crate::entity::TrackKind::Video
+                && self.track_handles.contains_key(&track_id)
+            {
+                desired
+                    .entry(track_id)
+                    .or_insert_with(|| request.options.clone().unwrap_or_default());
+            }
+        }
+        let mut slots: Vec<_> = self
+            .slots
+            .values()
+            .map(|slot| (slot.media_index, slot.mid, slot.assignment))
+            .collect();
+        slots.sort_by_key(|(index, _, _)| *index);
+        let mut assigned = HashSet::new();
+        let mut intents = HashMap::new();
+        for (_, mid, current) in &slots {
+            if let Some(track_id) = current
+                && let Some(options) = desired.get(track_id)
+            {
+                assigned.insert(*track_id);
+                intents.insert(*mid, Self::native_slot_intent(*track_id, options));
+            }
+        }
+        let mut unused = slots
+            .iter()
+            .filter(|(_, mid, _)| !intents.contains_key(mid))
+            .map(|(_, mid, _)| *mid)
+            .collect::<Vec<_>>()
+            .into_iter();
+        for (track_id, options) in desired {
+            if assigned.contains(&track_id) {
+                continue;
+            }
+            let Some(mid) = unused.next() else { break };
+            intents.insert(mid, Self::native_slot_intent(track_id, &options));
+        }
+        self.configure(&intents);
+    }
+
+    fn native_slot_intent(
+        track_id: TrackId,
+        options: &pulsebeam_proto::signaling_v1::VideoOptions,
+    ) -> Intent {
+        Intent {
+            track_id,
+            target_height: options.height,
+            min_height: options.min_height,
+            min_fps: options.min_fps,
+            priority: options.priority,
         }
     }
 
@@ -2329,6 +2395,32 @@ mod assignment_tests {
         allocator.deactivate_track_binding(key, track_id);
         allocator.remove_track(&track_id);
         assert_eq!(allocator.native_mapping_slots().count(), 0);
+    }
+
+    #[test]
+    fn native_receive_tracks_keep_slots_across_reordered_zero_height_requests() {
+        use pulsebeam_proto::signaling_v1::{VideoOptions, VideoTrackIntent};
+        let mut allocator = setup_allocator();
+        let tracks = add_tracks(&mut allocator, 2);
+        add_slots(&mut allocator, 2);
+        let requests = tracks
+            .ids
+            .iter()
+            .map(|id| VideoTrackIntent {
+                track_id: id.as_str(),
+                options: Some(VideoOptions::default()),
+            })
+            .collect::<Vec<_>>();
+        allocator.configure_native(&requests);
+        let before = allocator.native_mapping_slots().collect::<Vec<_>>();
+        assert_eq!(before.len(), 2);
+        assert_eq!(allocator.slots().count(), 0);
+        allocator.configure_native(&requests.into_iter().rev().collect::<Vec<_>>());
+        let after = allocator.native_mapping_slots().collect::<Vec<_>>();
+        assert_eq!(before.len(), after.len());
+        for binding in before {
+            assert!(after.contains(&binding));
+        }
     }
 
     #[test]
