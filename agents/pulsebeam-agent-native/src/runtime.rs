@@ -2024,6 +2024,71 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn audio_playout_discards_a_waiting_frame_on_generation_change() {
+        let (packet_tx, packets) = flume::bounded(2);
+        let (mid_tx, mid) = watch::channel(Some("audio".to_owned()));
+        let (commands, _command_rx) = mpsc::channel(1);
+        let (_snapshot_tx, snapshot) = watch::channel(Snapshot::default());
+        let mut media = RemoteMedia {
+            slot: MediaSlot::RemoteAudio(0),
+            mid,
+            packets,
+            frames: FrameReceiver::new(),
+            ready: VecDeque::new(),
+            frame_policy: BTreeMap::new(),
+            last_audio_seq: None,
+            playout_delay: None,
+            commands,
+            snapshot,
+        };
+        let base = Instant::now();
+        let old = RtpPacket {
+            mid: Mid::from("audio"),
+            rid: None,
+            seq: crate::SeqNo::from(1),
+            ts: MediaTime::new(960, crate::Frequency::FORTY_EIGHT_KHZ),
+            marker: false,
+            ssrc: Some(Ssrc::from(1)),
+            payload: Arc::from([1_u8]),
+            ext_vals: crate::ExtensionValues {
+                play_delay_min: Some(MediaTime::from_millis(100)),
+                play_delay_max: Some(MediaTime::from_millis(100)),
+                ..crate::ExtensionValues::default()
+            },
+            arrival: base,
+        };
+        packet_tx.send_async(old.clone()).await.unwrap();
+        let task = tokio::spawn(async move {
+            let frame = media.recv_frame().await.unwrap();
+            (frame, media)
+        });
+        tokio::task::yield_now().await;
+        assert!(!task.is_finished());
+        mid_tx.send_replace(None);
+        tokio::time::advance(Duration::from_millis(1)).await;
+        mid_tx.send_replace(Some("audio".to_owned()));
+        tokio::time::advance(Duration::from_millis(1)).await;
+        packet_tx
+            .send_async(RtpPacket {
+                seq: crate::SeqNo::from(2),
+                payload: Arc::from([2_u8]),
+                ext_vals: crate::ExtensionValues::default(),
+                arrival: Instant::now(),
+                ..old
+            })
+            .await
+            .unwrap();
+        let (frame, media) = tokio::time::timeout(Duration::from_millis(10), task)
+            .await
+            .expect("replacement packet must not inherit the retired playout wait")
+            .unwrap();
+        assert_eq!(frame.data.as_ref(), [2]);
+        assert!(frame.contiguous);
+        assert_eq!(media.playout_delay, None);
+        assert_eq!(Instant::now(), base + Duration::from_millis(2));
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn video_frames_snapshot_policy_before_a_later_frame_changes_it() {
         let (packet_tx, packets) = flume::bounded(2);
         let (_mid_tx, mid) = watch::channel(Some("video".to_owned()));
