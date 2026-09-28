@@ -68,7 +68,7 @@ fn generated_package_has_strict_portable_boundaries() {
             "--moduleResolution",
             "Bundler",
             "--lib",
-            "ES2022,DOM,DOM.Iterable",
+            "ES2022,DOM,DOM.Iterable,ESNext.Disposable",
             "--allowJs",
         ])
         .arg(root.join("web/assets.d.ts"))

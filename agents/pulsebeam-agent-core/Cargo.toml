@@ -8,6 +8,9 @@ homepage.workspace = true
 repository.workspace = true
 license = "Apache-2.0"
 
+[lib]
+crate-type = ["cdylib", "rlib"]
+
 [dependencies]
 log = { version = "0.4", default-features = false }
 serde = { version = "1", default-features = false, features = ["derive"] }

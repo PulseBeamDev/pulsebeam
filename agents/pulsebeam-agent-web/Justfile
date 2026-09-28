@@ -15,9 +15,15 @@ fix: prepare
 format-check: prepare
     pnpm run format:check
 
-# Regenerate the UniFFI web proof and its WASM package.
+# Regenerate both UniFFI namespaces and their shared WASM proof.
 uniffi-generate:
     pnpm run build:uniffi
+    cargo build -p pulsebeam-agent-core
+    pnpm exec ubrn generate wasm bindings --library --crate pulsebeam_agent_core --ts-dir generated/bindings --cpp-dir generated/bindings ../../target/debug/libpulsebeam_agent_core.so
+    pnpm exec ubrn generate wasm wasm-crate --config ubrn.config.yaml pulsebeam_agent_web pulsebeam_agent_core
+    cp generated/bindings/pulsebeam_agent_core_module.rs generated/wasm/src/
+    cargo build --manifest-path generated/wasm/Cargo.toml --target wasm32-unknown-unknown
+    wasm-bindgen --target web --omit-default-module-path --out-name index --out-dir generated/bindings/wasm-bindgen generated/wasm/target/wasm32-unknown-unknown/debug/pulsebeam_agent_web_wasm.wasm
     pnpm exec prettier --write "generated/**/*.ts"
 
 # Transpile generated bindings for the Rust-authored browser proof.
