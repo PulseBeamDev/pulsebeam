@@ -57,6 +57,45 @@ fn sender_labels_replace_provisional_mid_identity_once() {
 }
 
 #[test]
+fn sender_label_rebinds_video_layer_identity() {
+    let (mut upstream, participant) = publisher();
+    let mid = Mid::from("video-mid");
+    let (track, descriptor) = track::test_utils::make_video_track(participant, mid, Vec::new());
+    assert!(upstream.add_published_track(0, mid, track, descriptor));
+    let bound = upstream
+        .bind_sender_label(0, TrackKind::Video, "camera")
+        .unwrap();
+    let (descriptor, _) = upstream.announce_state_mut(mid, true).unwrap();
+    assert_eq!(descriptor.id(), bound);
+    assert!(
+        descriptor.layers().iter().all(|layer| {
+            layer.meta.id == bound && layer.meta.label.as_deref() == Some("camera")
+        })
+    );
+    assert!(!descriptor.layers().is_empty());
+}
+
+#[test]
+fn sender_label_batch_rebinds_video_layer_identity() {
+    let (mut upstream, participant) = publisher();
+    let mid = Mid::from("video-mid");
+    let (track, descriptor) = track::test_utils::make_video_track(participant, mid, Vec::new());
+    assert!(upstream.add_published_track(0, mid, track, descriptor));
+    upstream
+        .bind_sender_labels_atomically(&[(0, TrackKind::Video, "camera")])
+        .unwrap();
+    let bound = participant.derive_track_id(TrackKind::Video, "camera");
+    let (descriptor, _) = upstream.announce_state_mut(mid, true).unwrap();
+    assert_eq!(descriptor.id(), bound);
+    assert!(
+        descriptor.layers().iter().all(|layer| {
+            layer.meta.id == bound && layer.meta.label.as_deref() == Some("camera")
+        })
+    );
+    assert!(!descriptor.layers().is_empty());
+}
+
+#[test]
 fn sender_label_batch_does_not_commit_audio_when_video_rejects() {
     let (mut upstream, participant) = publisher();
     add_audio(&mut upstream, participant, 0, "a");

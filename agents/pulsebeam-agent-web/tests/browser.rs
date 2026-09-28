@@ -52,6 +52,7 @@ struct Live {
     discovered: bool,
     delivered: bool,
     reconnected: bool,
+    default_recreated: bool,
     topic_metadata: bool,
     runtime_failure_event: bool,
     close_during_local_operation: bool,
@@ -251,6 +252,7 @@ async fn public_agent_connects_and_delivers_remote_media() -> TestResult<()> {
                 && r.discovered
                 && r.delivered
                 && r.reconnected
+                && r.default_recreated
                 && r.topic_metadata
                 && r.runtime_failure_event
                 && r.close_during_local_operation

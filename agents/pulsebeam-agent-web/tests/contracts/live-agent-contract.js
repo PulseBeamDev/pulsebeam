@@ -1,5 +1,16 @@
 (async () => {
   const endpoint = "http://127.0.0.1:7070";
+  // Test-only observation of the browser's real receivers, without a public Agent seam.
+  const peers = new Set();
+  const originalAddTransceiver = RTCPeerConnection.prototype.addTransceiver;
+  RTCPeerConnection.prototype.addTransceiver = function (...args) {
+    peers.add(this);
+    return originalAddTransceiver.apply(this, args);
+  };
+  const peerForTrack = (track) =>
+    [...peers].find((peer) =>
+      peer.getReceivers().some((receiver) => receiver.track === track),
+    );
   const topology = {
     localVideos: 1,
     localAudios: 0,
@@ -41,6 +52,10 @@
   context.fillStyle = "#20a0ff";
   context.fillRect(0, 0, 16, 16);
   const localTrack = canvas.captureStream(5).getVideoTracks()[0];
+  const painting = setInterval(() => {
+    context.fillStyle = context.fillStyle === "#20a0ff" ? "#ff8020" : "#20a0ff";
+    context.fillRect(0, 0, 16, 16);
+  }, 200);
   await sender.replaceLocalTrack("v0", localTrack, {
     contentHint: "motion",
   });
@@ -77,14 +92,14 @@
   const discovered = await waitFor(
     receiver,
     (snapshot) =>
-      snapshot.publications.some(
+      snapshot.catalog.publications.some(
         (publication) =>
           publication.kind === "video" &&
           publication.participantId === senderConnected.participantId,
       ),
     "remote publication",
   );
-  const publication = discovered.publications.find(
+  const publication = discovered.catalog.publications.find(
     (candidate) =>
       candidate.kind === "video" &&
       candidate.participantId === senderConnected.participantId,
@@ -113,25 +128,114 @@
         minHeight: 1,
         minFps: 1,
         priority: 100,
+        playoutDelay: { mode: "fixed", minMs: 100, maxMs: 100 },
       },
     ],
   });
   const delivered = await waitFor(
     receiver,
-    (snapshot) => snapshot.tracks[publication.id]?.media.readyState === "live",
-    "remote media",
+    (snapshot) =>
+      snapshot.mapping.acceptedIntentRevision > 0 &&
+      snapshot.mapping.video.some((entry) => entry.publicationId === publication.id) &&
+      snapshot.tracks[publication.id]?.media.readyState === "live",
+    "fixed-policy remote media",
   );
 
   const previousGeneration = delivered.generation;
-  receiver.reconnect();
+  const oldTrack = delivered.tracks[publication.id].media;
+  const oldPeer = peerForTrack(oldTrack);
+  const oldReceiver = oldPeer?.getReceivers().find((entry) => entry.track === oldTrack);
+  const fixedRevision = delivered.mapping.acceptedIntentRevision;
+  const receivedPackets = async () => {
+    const stats = await oldReceiver.getStats();
+    let count = 0;
+    for (const report of stats.values()) {
+      if (report.type === "inbound-rtp" && report.kind === "video") {
+        count += report.packetsReceived ?? 0;
+      }
+    }
+    return count;
+  };
+  const initialPackets = await receivedPackets();
+  let fixedPackets = initialPackets;
+  for (let attempt = 0; attempt < 100 && fixedPackets < initialPackets + 4; attempt++) {
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    fixedPackets = await receivedPackets();
+  }
+  if (fixedPackets < initialPackets + 4) {
+    throw new Error(`no continuing fixed-policy RTP: initial=${initialPackets} final=${fixedPackets}`);
+  }
+  const decodedFrames = async () => {
+    const stats = await oldReceiver.getStats();
+    return [...stats.values()]
+      .filter((report) => report.type === "inbound-rtp" && report.kind === "video")
+      .reduce((sum, report) => sum + (report.framesDecoded ?? 0), 0);
+  };
+  const initialFrames = await decodedFrames();
+  let fixedFrames = initialFrames;
+  for (let attempt = 0; attempt < 100 && fixedFrames < initialFrames + 2; attempt++) {
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    fixedFrames = await decodedFrames();
+  }
+  if (fixedFrames < initialFrames + 2) {
+    throw new Error(`no decoded fixed-policy frames: initial=${initialFrames} final=${fixedFrames}`);
+  }
+  const receiverEvents = [];
+  const removeReceiverEvents = receiver.subscribeEvents((event) => {
+    if (event.type !== "topic-message") receiverEvents.push(event.type);
+  });
+  receiver.setState({
+    connected: true,
+    video: [
+      {
+        slot: 0,
+        selector: { participantExternalId: "web-sender", label: "camera" },
+        height: 180,
+        minHeight: 1,
+        minFps: 1,
+        priority: 100,
+      },
+    ],
+  });
   const reconnected = await waitFor(
     receiver,
     (snapshot) =>
       snapshot.connection === "connected" &&
       snapshot.generation !== previousGeneration &&
-      snapshot.tracks[publication.id]?.media.readyState === "live",
-    "reconnected media",
-  );
+      snapshot.mapping.acceptedIntentRevision > 0 &&
+      snapshot.mapping.video.some((entry) => entry.publicationId === publication.id) &&
+      snapshot.tracks[publication.id]?.media.readyState === "live" &&
+      oldTrack.readyState === "ended",
+    "fresh default receiver after fixed playout",
+  ).catch((error) => {
+    const snapshot = receiver.getSnapshot();
+    throw new Error(`${error.message}: ${JSON.stringify({
+      generation: String(snapshot.generation),
+      oldGeneration: String(previousGeneration),
+      acceptedRevision: String(snapshot.mapping.acceptedIntentRevision),
+      desiredRevision: String(snapshot.desiredRevision),
+      failure: snapshot.failure,
+      events: receiverEvents,
+      oldState: oldTrack.readyState,
+      oldPeerState: oldPeer?.signalingState,
+    })}`);
+  });
+  removeReceiverEvents();
+  const newTrack = reconnected.tracks[publication.id].media;
+  const newPeer = peerForTrack(newTrack);
+  const newReceiver = newPeer?.getReceivers().find((entry) => entry.track === newTrack);
+  const defaultRecreated =
+    fixedRevision > 0 &&
+    oldPeer !== undefined &&
+    oldPeer.signalingState === "closed" &&
+    oldReceiver !== undefined &&
+    newPeer !== undefined &&
+    newPeer !== oldPeer &&
+    newReceiver !== undefined &&
+    newReceiver !== oldReceiver &&
+    oldTrack.readyState === "ended" &&
+    newTrack.readyState === "live";
+  RTCPeerConnection.prototype.addTransceiver = originalAddTransceiver;
 
   const runtimeEvents = [];
   const removeRuntimeEvents = sender.subscribeEvents((event) =>
@@ -179,6 +283,7 @@
   RTCRtpSender.prototype.setParameters = originalSetParameters;
   receiver.close();
   const callerOwnsTrack = localTrack.readyState === "live";
+  clearInterval(painting);
   localTrack.stop();
   return {
     connected:
@@ -187,11 +292,12 @@
     discovered:
       publication.id.length > 0 &&
       publication.label === "camera" &&
-      discovered.participants.find(
+      discovered.catalog.participants.find(
         (participant) => participant.id === senderConnected.participantId,
       )?.externalId === "web-sender",
     delivered: delivered.tracks[publication.id].kind === "video",
     reconnected: reconnected.tracks[publication.id].kind === "video",
+    defaultRecreated,
     topicMetadata:
       receivedTopic.publisherId === senderConnected.participantId &&
       receivedTopic.streamId > 0 &&

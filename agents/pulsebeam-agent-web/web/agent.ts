@@ -140,9 +140,9 @@ function copyState(state: AgentState): AgentState {
           minHeight: demand.minHeight,
           minFps: demand.minFps,
           priority: demand.priority,
-          playoutDelay: demand.playoutDelay
-            ? Object.freeze({ ...demand.playoutDelay })
-            : undefined,
+          ...(demand.playoutDelay
+            ? { playoutDelay: Object.freeze({ ...demand.playoutDelay }) }
+            : {}),
         };
         return demand.selector
           ? Object.freeze({
