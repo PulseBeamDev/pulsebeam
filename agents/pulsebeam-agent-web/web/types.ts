@@ -129,33 +129,18 @@ export interface Publication {
   readonly label: string;
 }
 
-export interface VideoBinding {
-  readonly trackId: string;
-  readonly mid: string;
-  readonly paused: boolean;
-}
-
-export interface AudioBinding {
-  readonly trackId: string;
-  readonly mid: string;
-  readonly levelDbov: number | null;
-}
-
 interface RemoteMediaBase {
   readonly publicationId: string;
   readonly participantId: string;
-  readonly mid: string;
   readonly media: MediaStreamTrack;
 }
 
 export interface RemoteVideoTrack extends RemoteMediaBase {
   readonly kind: "video";
-  readonly paused: boolean;
 }
 
 export interface RemoteAudioTrack extends RemoteMediaBase {
   readonly kind: "audio";
-  readonly levelDbov: number | null;
 }
 
 export type RemoteTrack = RemoteVideoTrack | RemoteAudioTrack;
@@ -189,6 +174,23 @@ export interface TopicSnapshot {
   readonly channelFailures: number;
 }
 
+export interface CatalogSnapshot {
+  readonly revision: number;
+  readonly participants: readonly Participant[];
+  readonly publications: readonly Publication[];
+}
+
+export interface TrackMapping {
+  readonly receiverIndex: number;
+  readonly publicationId: string;
+}
+
+export interface MappingSnapshot {
+  readonly acceptedIntentRevision: number;
+  readonly video: readonly TrackMapping[];
+  readonly audio: readonly TrackMapping[];
+}
+
 export interface AgentSnapshot {
   readonly version: number;
   readonly desiredRevision: number;
@@ -197,10 +199,8 @@ export interface AgentSnapshot {
   readonly participantId: string | null;
   /** Current authorization deadline, in Unix seconds. */
   readonly authorizationExpiresAt: number | null;
-  readonly participants: readonly Participant[];
-  readonly publications: readonly Publication[];
-  readonly video: readonly VideoBinding[];
-  readonly audio: readonly AudioBinding[];
+  readonly catalog: CatalogSnapshot;
+  readonly mapping: MappingSnapshot;
   /** Available remote tracks, keyed by publication ID. */
   readonly tracks: Readonly<Record<string, RemoteTrack>>;
   readonly topics: TopicSnapshot;

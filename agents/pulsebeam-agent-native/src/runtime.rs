@@ -366,19 +366,21 @@ impl RemoteMedia {
         &self.slot
     }
 
-    pub fn video_binding(&self) -> Option<agent_core::VideoBinding> {
+    pub fn publication_id(&self) -> Option<String> {
         let mid = self.mid.borrow().clone()?;
-        self.snapshot.borrow().video.get(&mid).cloned()
-    }
-
-    pub fn audio_binding(&self) -> Option<agent_core::AudioBinding> {
-        let mid = self.mid.borrow().clone()?;
-        self.snapshot
-            .borrow()
-            .audio
-            .iter()
-            .find(|binding| binding.mid == mid)
-            .cloned()
+        let snapshot = self.snapshot.borrow();
+        match &self.slot {
+            MediaSlot::RemoteVideo(_) => snapshot
+                .video
+                .get(&mid)
+                .map(|binding| binding.track_id.clone()),
+            MediaSlot::RemoteAudio(_) => snapshot
+                .audio
+                .iter()
+                .find(|binding| binding.mid == mid)
+                .map(|binding| binding.track_id.clone()),
+            _ => None,
+        }
     }
 
     fn retire_receiver(&mut self) {

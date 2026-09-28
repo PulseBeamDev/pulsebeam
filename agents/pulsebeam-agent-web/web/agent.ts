@@ -5,10 +5,11 @@ import type {
   AgentFailure,
   AgentSnapshot,
   AgentState,
-  AudioBinding,
+  CatalogSnapshot,
   ConnectionState,
   LogLevel,
   MediaTopology,
+  MappingSnapshot,
   Participant,
   Publication,
   RemoteTrack,
@@ -17,7 +18,6 @@ import type {
   TopicPublisherStatus,
   TopicSnapshot,
   TopicSubscriberStatus,
-  VideoBinding,
 } from "./types.js";
 import { BrowserRuntime, whenInitialized } from "./wasm.js";
 
@@ -30,12 +30,12 @@ interface RuntimeSnapshot {
   readonly generation?: number;
   readonly participantId?: string;
   readonly authorizationExpiresAt?: number;
+  readonly catalog: CatalogSnapshot;
+  readonly mapping: MappingSnapshot;
   readonly participants: readonly Participant[];
   readonly publications: readonly Publication[];
-  readonly video: readonly VideoBinding[];
-  readonly audio: readonly (Omit<AudioBinding, "levelDbov"> & {
-    readonly levelDbov?: number;
-  })[];
+  readonly video: readonly { readonly trackId: string; readonly mid: string }[];
+  readonly audio: readonly { readonly trackId: string; readonly mid: string }[];
   readonly topics: TopicSnapshot;
   readonly failure?: AgentFailure;
 }
@@ -70,10 +70,16 @@ function emptySnapshot(connection: ConnectionState): AgentSnapshot {
     generation: null,
     participantId: null,
     authorizationExpiresAt: null,
-    participants: EMPTY_ARRAY,
-    publications: EMPTY_ARRAY,
-    video: EMPTY_ARRAY,
-    audio: EMPTY_ARRAY,
+    catalog: Object.freeze({
+      revision: 0,
+      participants: EMPTY_ARRAY,
+      publications: EMPTY_ARRAY,
+    }),
+    mapping: Object.freeze({
+      acceptedIntentRevision: 0,
+      video: EMPTY_ARRAY,
+      audio: EMPTY_ARRAY,
+    }),
     tracks: EMPTY_TRACKS,
     topics: emptyTopics(),
     failure: null,
@@ -450,14 +456,22 @@ class AgentFacade implements Agent {
     const publications = Object.freeze(
       raw.publications.map((publication) => Object.freeze({ ...publication })),
     );
-    const video = Object.freeze(
-      raw.video.map((binding) => Object.freeze({ ...binding })),
-    );
-    const audio = Object.freeze(
-      raw.audio.map((binding) =>
-        Object.freeze({ ...binding, levelDbov: binding.levelDbov ?? null }),
+    const video = raw.video;
+    const audio = raw.audio;
+    const catalog = Object.freeze({
+      revision: raw.catalog.revision,
+      participants,
+      publications,
+    });
+    const mapping = Object.freeze({
+      acceptedIntentRevision: raw.mapping.acceptedIntentRevision,
+      video: Object.freeze(
+        raw.mapping.video.map((entry) => Object.freeze({ ...entry })),
       ),
-    );
+      audio: Object.freeze(
+        raw.mapping.audio.map((entry) => Object.freeze({ ...entry })),
+      ),
+    });
     const publicationById = new Map(
       publications.map((publication) => [publication.id, publication]),
     );
@@ -470,8 +484,6 @@ class AgentFacade implements Agent {
         publicationId: publication.id,
         participantId: publication.participantId,
         kind: "video",
-        mid: binding.mid,
-        paused: binding.paused,
         media,
       });
     }
@@ -483,8 +495,6 @@ class AgentFacade implements Agent {
         publicationId: publication.id,
         participantId: publication.participantId,
         kind: "audio",
-        mid: binding.mid,
-        levelDbov: binding.levelDbov,
         media,
       });
     }
@@ -496,10 +506,8 @@ class AgentFacade implements Agent {
         generation: raw.generation ?? null,
         participantId: raw.participantId ?? null,
         authorizationExpiresAt: raw.authorizationExpiresAt ?? null,
-        participants,
-        publications,
-        video,
-        audio,
+        catalog,
+        mapping,
         tracks: Object.freeze(tracks),
         topics: freezeTopicSnapshot(raw.topics),
         failure: raw.failure ? Object.freeze({ ...raw.failure }) : null,

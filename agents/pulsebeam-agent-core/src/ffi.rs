@@ -178,17 +178,23 @@ pub struct Publication {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
-pub struct VideoBinding {
-    pub publication_id: String,
-    pub mid: String,
-    pub paused: bool,
+pub struct CatalogSnapshot {
+    pub revision: u64,
+    pub participants: Vec<Participant>,
+    pub publications: Vec<Publication>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
-pub struct AudioBinding {
+pub struct TrackMapping {
+    pub receiver_index: u32,
     pub publication_id: String,
-    pub mid: String,
-    pub level_dbov: i8,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct MappingSnapshot {
+    pub accepted_intent_revision: u64,
+    pub video: Vec<TrackMapping>,
+    pub audio: Vec<TrackMapping>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Enum)]
@@ -263,10 +269,8 @@ pub struct Snapshot {
     pub generation: Option<u64>,
     pub participant_id: Option<String>,
     pub authorization_expires_at: Option<i64>,
-    pub participants: Vec<Participant>,
-    pub publications: Vec<Publication>,
-    pub video: Vec<VideoBinding>,
-    pub audio: Vec<AudioBinding>,
+    pub catalog: CatalogSnapshot,
+    pub mapping: MappingSnapshot,
     pub topics: TopicState,
     pub failure: Option<Failure>,
 }
@@ -336,25 +340,7 @@ pub enum Notification {
         from: ConnectionState,
         to: ConnectionState,
     },
-    ParticipantAdded {
-        participant: Participant,
-    },
-    ParticipantRemoved {
-        participant_id: String,
-    },
-    PublicationAdded {
-        publication: Publication,
-    },
-    PublicationRemoved {
-        publication_id: String,
-    },
-    VideoBindingChanged {
-        mid: String,
-        binding: Option<VideoBinding>,
-    },
-    AudioBindingsChanged {
-        bindings: Vec<AudioBinding>,
-    },
+    SnapshotChanged,
     Topic {
         notification: TopicNotification,
     },
@@ -775,26 +761,6 @@ impl From<model::Publication> for Publication {
     }
 }
 
-impl From<model::VideoBinding> for VideoBinding {
-    fn from(value: model::VideoBinding) -> Self {
-        Self {
-            publication_id: value.track_id,
-            mid: value.mid,
-            paused: value.paused,
-        }
-    }
-}
-
-impl From<model::AudioBinding> for AudioBinding {
-    fn from(value: model::AudioBinding) -> Self {
-        Self {
-            publication_id: value.track_id,
-            mid: value.mid,
-            level_dbov: value.level_dbov,
-        }
-    }
-}
-
 impl From<model::ConnectionState> for ConnectionState {
     fn from(value: model::ConnectionState) -> Self {
         match value {
@@ -885,20 +851,40 @@ impl From<&model::Snapshot> for Snapshot {
             generation: value.generation.map(model::Generation::get),
             participant_id: value.participant_id.clone(),
             authorization_expires_at: value.authorization_expires_at,
-            participants: value
-                .participants
-                .values()
-                .cloned()
-                .map(Into::into)
-                .collect(),
-            publications: value
-                .publications
-                .values()
-                .cloned()
-                .map(Into::into)
-                .collect(),
-            video: value.video.values().cloned().map(Into::into).collect(),
-            audio: value.audio.iter().cloned().map(Into::into).collect(),
+            catalog: CatalogSnapshot {
+                revision: value.catalog_revision,
+                participants: value
+                    .participants
+                    .values()
+                    .cloned()
+                    .map(Into::into)
+                    .collect(),
+                publications: value
+                    .publications
+                    .values()
+                    .cloned()
+                    .map(Into::into)
+                    .collect(),
+            },
+            mapping: MappingSnapshot {
+                accepted_intent_revision: value.accepted_intent_revision,
+                video: value
+                    .video_mapping
+                    .iter()
+                    .map(|(&receiver_index, publication_id)| TrackMapping {
+                        receiver_index,
+                        publication_id: publication_id.clone(),
+                    })
+                    .collect(),
+                audio: value
+                    .audio_mapping
+                    .iter()
+                    .map(|(&receiver_index, publication_id)| TrackMapping {
+                        receiver_index,
+                        publication_id: publication_id.clone(),
+                    })
+                    .collect(),
+            },
             topics: (&value.topics).into(),
             failure: value.terminal_failure.clone().map(Into::into),
         }
@@ -1010,27 +996,12 @@ impl From<model::Notification> for Notification {
                 from: from.into(),
                 to: to.into(),
             },
-            model::Notification::ParticipantAdded(participant) => Self::ParticipantAdded {
-                participant: participant.into(),
-            },
-            model::Notification::ParticipantRemoved(participant_id) => {
-                Self::ParticipantRemoved { participant_id }
-            }
-            model::Notification::PublicationAdded(publication) => Self::PublicationAdded {
-                publication: publication.into(),
-            },
-            model::Notification::PublicationRemoved(publication_id) => {
-                Self::PublicationRemoved { publication_id }
-            }
-            model::Notification::VideoBindingChanged { mid, binding } => {
-                Self::VideoBindingChanged {
-                    mid,
-                    binding: binding.map(Into::into),
-                }
-            }
-            model::Notification::AudioBindingsChanged(bindings) => Self::AudioBindingsChanged {
-                bindings: bindings.into_iter().map(Into::into).collect(),
-            },
+            model::Notification::ParticipantAdded(_)
+            | model::Notification::ParticipantRemoved(_)
+            | model::Notification::PublicationAdded(_)
+            | model::Notification::PublicationRemoved(_)
+            | model::Notification::VideoBindingChanged { .. }
+            | model::Notification::AudioBindingsChanged(_) => Self::SnapshotChanged,
             model::Notification::Topic(notification) => Self::Topic {
                 notification: notification.into(),
             },
@@ -1188,6 +1159,7 @@ mod tests {
         let projected = Snapshot::from(&snapshot);
         assert_eq!(
             projected
+                .catalog
                 .participants
                 .into_iter()
                 .map(|value| value.id)
@@ -1239,16 +1211,6 @@ mod tests {
             participant_id: "participant".to_string(),
             kind: MediaKind::Video,
             label: "camera".to_string(),
-        };
-        let video = VideoBinding {
-            publication_id: publication.id.clone(),
-            mid: "0".to_string(),
-            paused: false,
-        };
-        let audio = AudioBinding {
-            publication_id: "participant/audio".to_string(),
-            mid: "1".to_string(),
-            level_dbov: 42,
         };
         let failure = Failure {
             class: FailureClass::Protocol,
@@ -1311,11 +1273,11 @@ mod tests {
             playout_delay: PlayoutDelay::Adaptive,
         });
         assert_ffi_round_trip(AudioDemand {
-            pinned: vec![audio.publication_id.clone()],
+            pinned: vec!["participant/audio".to_string()],
             selected: vec![selector.clone()],
             automatic: false,
             playout_delays: vec![AudioTrackDelay {
-                track_id: audio.publication_id.clone(),
+                track_id: "participant/audio".to_string(),
                 playout_delay: PlayoutDelay::Fixed {
                     min_ms: 0,
                     max_ms: 0,
@@ -1345,8 +1307,6 @@ mod tests {
             external_id: "user".to_string(),
         });
         assert_ffi_round_trip(publication.clone());
-        assert_ffi_round_trip(video.clone());
-        assert_ffi_round_trip(audio.clone());
         assert_ffi_round_trip(failure.clone());
         assert_ffi_round_trip(publisher_state);
         assert_ffi_round_trip(subscriber_state);
@@ -1361,13 +1321,22 @@ mod tests {
             generation: Some(3),
             participant_id: Some("participant".to_string()),
             authorization_expires_at: Some(1_720_000_000),
-            participants: vec![Participant {
-                id: "participant".to_string(),
-                external_id: "user".to_string(),
-            }],
-            publications: vec![publication],
-            video: vec![video],
-            audio: vec![audio],
+            catalog: CatalogSnapshot {
+                revision: 2,
+                participants: vec![Participant {
+                    id: "participant".to_string(),
+                    external_id: "user".to_string(),
+                }],
+                publications: vec![publication.clone()],
+            },
+            mapping: MappingSnapshot {
+                accepted_intent_revision: 4,
+                video: vec![TrackMapping {
+                    receiver_index: 2,
+                    publication_id: "video".to_string(),
+                }],
+                audio: vec![],
+            },
             topics,
             failure: Some(failure),
         });
@@ -1537,50 +1506,12 @@ mod tests {
         ] {
             assert_ffi_round_trip(value);
         }
-        let participant = Participant {
-            id: "participant".to_string(),
-            external_id: "user".to_string(),
-        };
-        let publication = Publication {
-            id: "participant/video".to_string(),
-            participant_id: participant.id.clone(),
-            kind: MediaKind::Video,
-            label: "camera".to_string(),
-        };
-        let video = VideoBinding {
-            publication_id: publication.id.clone(),
-            mid: "0".to_string(),
-            paused: false,
-        };
-        let audio = AudioBinding {
-            publication_id: "participant/audio".to_string(),
-            mid: "1".to_string(),
-            level_dbov: 42,
-        };
         for value in [
             Notification::ConnectionChanged {
                 from: ConnectionState::Joining,
                 to: ConnectionState::Connected,
             },
-            Notification::ParticipantAdded {
-                participant: participant.clone(),
-            },
-            Notification::ParticipantRemoved {
-                participant_id: participant.id,
-            },
-            Notification::PublicationAdded {
-                publication: publication.clone(),
-            },
-            Notification::PublicationRemoved {
-                publication_id: publication.id,
-            },
-            Notification::VideoBindingChanged {
-                mid: "0".to_string(),
-                binding: Some(video),
-            },
-            Notification::AudioBindingsChanged {
-                bindings: vec![audio],
-            },
+            Notification::SnapshotChanged,
             Notification::Topic {
                 notification: TopicNotification::SendDropped {
                     publisher,

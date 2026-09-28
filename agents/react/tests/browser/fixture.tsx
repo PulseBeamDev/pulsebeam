@@ -11,10 +11,8 @@ const disconnected: AgentSnapshot = Object.freeze({
   generation: null,
   participantId: null,
   authorizationExpiresAt: null,
-  participants: [],
-  publications: [],
-  video: [],
-  audio: [],
+  catalog: { revision: 0, participants: [], publications: [] },
+  mapping: { acceptedIntentRevision: 0, video: [], audio: [] },
   tracks: {},
   topics: {
     publishers: [],
@@ -362,17 +360,13 @@ void (async () => {
     first: {
       publicationId: "first",
       participantId: "participant",
-      mid: "0",
       kind: "video",
-      paused: false,
       media: firstTrack,
     },
     second: {
       publicationId: "second",
       participantId: "participant",
-      mid: "1",
       kind: "video",
-      paused: false,
       media: secondTrack,
     },
   });

@@ -1917,7 +1917,7 @@ fn snapshot_value(snapshot: &agent_core::Snapshot) -> JsValue {
         set(&item, "externalId", participant.external_id.clone());
         participants.push(&item);
     }
-    set(&value, "participants", participants);
+    set(&value, "participants", participants.clone());
     let publications = Array::new();
     for publication in snapshot.publications.values() {
         let item = Object::new();
@@ -1927,7 +1927,32 @@ fn snapshot_value(snapshot: &agent_core::Snapshot) -> JsValue {
         set(&item, "label", publication.label.clone());
         publications.push(&item);
     }
-    set(&value, "publications", publications);
+    set(&value, "publications", publications.clone());
+    let catalog = Object::new();
+    set(&catalog, "revision", snapshot.catalog_revision);
+    set(&catalog, "participants", participants);
+    set(&catalog, "publications", publications);
+    set(&value, "catalog", catalog);
+    let mapping = Object::new();
+    set(
+        &mapping,
+        "acceptedIntentRevision",
+        snapshot.accepted_intent_revision,
+    );
+    for (name, entries) in [
+        ("video", &snapshot.video_mapping),
+        ("audio", &snapshot.audio_mapping),
+    ] {
+        let tracks = Array::new();
+        for (&receiver_index, publication_id) in entries {
+            let item = Object::new();
+            set(&item, "receiverIndex", receiver_index);
+            set(&item, "publicationId", publication_id.clone());
+            tracks.push(&item);
+        }
+        set(&mapping, name, tracks);
+    }
+    set(&value, "mapping", mapping);
     let video = Array::new();
     for binding in snapshot.video.values() {
         let item = Object::new();

@@ -1451,6 +1451,10 @@ impl Agent {
             self.notifications
                 .push_back(Notification::AudioBindingsChanged(vec![]));
         }
+        self.snapshot.catalog_revision = 0;
+        self.snapshot.accepted_intent_revision = 0;
+        self.snapshot.video_mapping.clear();
+        self.snapshot.audio_mapping.clear();
         self.snapshot.participants.clear();
         self.snapshot.publications.clear();
         self.snapshot.video.clear();
