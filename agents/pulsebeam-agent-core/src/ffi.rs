@@ -231,6 +231,7 @@ pub struct Snapshot {
     pub connection: ConnectionState,
     pub generation: Option<u64>,
     pub participant_id: Option<String>,
+    pub authorization_expires_at: Option<i64>,
     pub participants: Vec<Participant>,
     pub publications: Vec<Publication>,
     pub video: Vec<VideoBinding>,
@@ -369,6 +370,7 @@ pub enum ErrorCode {
     InvalidConfiguration,
     InvalidDesiredState,
     InvalidTopic,
+    RenewalBusy,
     Closed,
     Runtime,
 }
@@ -797,6 +799,7 @@ impl From<&model::Snapshot> for Snapshot {
             connection: value.connection.clone().into(),
             generation: value.generation.map(model::Generation::get),
             participant_id: value.participant_id.clone(),
+            authorization_expires_at: value.authorization_expires_at,
             participants: value
                 .participants
                 .values()
@@ -960,11 +963,13 @@ impl From<model::AgentError> for AgentError {
             model::AgentError::InvalidConfiguration(_) => ErrorCode::InvalidConfiguration,
             model::AgentError::StaleDesiredRevision { .. }
             | model::AgentError::ConflictingDesiredRevision(_)
-            | model::AgentError::AdaptiveAfterFixed => ErrorCode::InvalidDesiredState,
+            | model::AgentError::AdaptiveAfterFixed
+            | model::AgentError::InvalidAuthorizationToken => ErrorCode::InvalidDesiredState,
+            model::AgentError::RenewalBusy => ErrorCode::RenewalBusy,
             model::AgentError::InvalidTopic(_) => ErrorCode::InvalidTopic,
-            model::AgentError::InvalidOffer(_) | model::AgentError::InvalidSignaling(_) => {
-                ErrorCode::Runtime
-            }
+            model::AgentError::RenewalNotReady
+            | model::AgentError::InvalidOffer(_)
+            | model::AgentError::InvalidSignaling(_) => ErrorCode::Runtime,
         };
         Self {
             code,
@@ -1240,6 +1245,7 @@ mod tests {
             },
             generation: Some(3),
             participant_id: Some("participant".to_string()),
+            authorization_expires_at: Some(1_720_000_000),
             participants: vec![Participant {
                 id: "participant".to_string(),
             }],

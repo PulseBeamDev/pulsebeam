@@ -612,6 +612,136 @@ fn drain_notifications(agent: &mut Agent) -> Vec<Notification> {
 }
 
 #[test]
+fn rejected_renewal_preserves_the_committed_credential_and_expiry() {
+    let (mut agent, generation, channel, send) = connected_agent();
+    acknowledge_send(&mut agent, generation, channel, send);
+    agent
+        .handle(HostEvent::DataChannel(DataChannelEvent::Message {
+            generation,
+            channel,
+            payload: server_payload(server_message::Payload::Authorization(v1::Authorization {
+                expires_at_unix_seconds: 100,
+            })),
+        }))
+        .unwrap();
+    assert_eq!(agent.snapshot().authorization_expires_at, Some(100));
+    let command = AgentCommand::RenewAuthorization("new-secret".to_string());
+    assert!(!format!("{command:?}").contains("new-secret"));
+    agent.command(command).unwrap();
+    let operation = match next_effect(&mut agent) {
+        Effect::DataChannel(DataChannelEffect::Send {
+            operation, payload, ..
+        }) => {
+            let decoded = pulsebeam_proto::codec::decode_client(&payload).unwrap();
+            assert!(matches!(
+                decoded.payload,
+                Some(client_message::Payload::RenewAuthorization(v1::RenewAuthorization { token }))
+                if token == "new-secret"
+            ));
+            operation
+        }
+        effect => panic!("expected renewal, got {effect:?}"),
+    };
+    assert_eq!(
+        agent.command(AgentCommand::RenewAuthorization("second".to_string())),
+        Err(AgentError::RenewalBusy)
+    );
+    agent
+        .handle(HostEvent::DataChannel(DataChannelEvent::Sent {
+            operation,
+            generation,
+            channel,
+        }))
+        .unwrap();
+    agent
+        .handle(HostEvent::DataChannel(DataChannelEvent::Message {
+            generation,
+            channel,
+            payload: server_payload(server_message::Payload::Error(v1::Error {
+                code: v1::ErrorCode::AuthorizationRejected.into(),
+                message: "rejected".to_string(),
+                fatal: false,
+                intent_revision: None,
+            })),
+        }))
+        .unwrap();
+    assert_eq!(agent.snapshot().authorization_expires_at, Some(100));
+    agent
+        .command(AgentCommand::ReplaceDesired(DesiredState {
+            revision: 2,
+            ..DesiredState::default()
+        }))
+        .unwrap();
+    let delete = (0..4)
+        .filter_map(|_| agent.next_effect())
+        .find_map(|effect| match effect {
+            Effect::Http(HttpEffect::Request { request, .. })
+                if request.method == HttpMethod::Delete =>
+            {
+                Some(request)
+            }
+            _ => None,
+        })
+        .expect("delete request");
+    assert!(delete.headers.iter().any(|header| {
+        header.name == "Authorization" && header.value == "Bearer private-token"
+    }));
+    assert!(!format!("{delete:?}").contains("private-token"));
+}
+
+#[test]
+fn accepted_renewal_commits_the_new_credential_only_on_authorization() {
+    let (mut agent, generation, channel, send) = connected_agent();
+    acknowledge_send(&mut agent, generation, channel, send);
+    agent
+        .handle(HostEvent::DataChannel(DataChannelEvent::Message {
+            generation,
+            channel,
+            payload: server_payload(server_message::Payload::Authorization(v1::Authorization {
+                expires_at_unix_seconds: 100,
+            })),
+        }))
+        .unwrap();
+    agent
+        .command(AgentCommand::RenewAuthorization("new-secret".to_string()))
+        .unwrap();
+    let _send = next_effect(&mut agent);
+    agent
+        .handle(HostEvent::DataChannel(DataChannelEvent::Message {
+            generation,
+            channel,
+            payload: server_payload(server_message::Payload::Authorization(v1::Authorization {
+                expires_at_unix_seconds: 200,
+            })),
+        }))
+        .unwrap();
+    assert_eq!(agent.snapshot().authorization_expires_at, Some(200));
+    agent
+        .command(AgentCommand::ReplaceDesired(DesiredState {
+            revision: 2,
+            ..DesiredState::default()
+        }))
+        .unwrap();
+    let delete = (0..4)
+        .filter_map(|_| agent.next_effect())
+        .find_map(|effect| match effect {
+            Effect::Http(HttpEffect::Request { request, .. })
+                if request.method == HttpMethod::Delete =>
+            {
+                Some(request)
+            }
+            _ => None,
+        })
+        .expect("delete request");
+    assert!(
+        delete.headers.iter().any(|header| {
+            header.name == "Authorization" && header.value == "Bearer new-secret"
+        })
+    );
+    assert!(!format!("{delete:?}").contains("new-secret"));
+}
+
+#[test]
 fn construction_and_desired_state_validate_complete_external_input() {
     let mut invalid_endpoint = config();
     invalid_endpoint.endpoint = "https://".to_string();
@@ -1311,7 +1441,21 @@ fn malformed_signaling_is_transactional() {
             "catalog"
         )))
     ));
-    assert_eq!(agent.snapshot(), &before);
+    assert_eq!(agent.snapshot().participants, before.participants);
+    assert_eq!(agent.snapshot().publications, before.publications);
+    assert_eq!(agent.snapshot().video, before.video);
+    assert_eq!(
+        agent.snapshot().connection,
+        ConnectionState::TerminalFailure
+    );
+    assert_eq!(
+        agent
+            .snapshot()
+            .terminal_failure
+            .as_ref()
+            .map(|failure| &failure.class),
+        Some(&FailureClass::Protocol)
+    );
 }
 
 #[test]
