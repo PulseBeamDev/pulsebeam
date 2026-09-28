@@ -249,7 +249,7 @@ impl VideoAllocator {
     }
 
     /// Routes this slot to the given track at the specified QoS, or stops
-    /// routing if `track_id` is `None` or `intent.max_height` is 0.
+    /// routing if no track is requested or both target and floor are zero.
     fn configure_slot(
         tracks: &SecondaryMap<TrackHandle, Track>,
         track_handles: &HashMap<TrackId, TrackHandle>,
@@ -257,7 +257,7 @@ impl VideoAllocator {
         intent: Option<&Intent>,
     ) -> Option<()> {
         if let Some(intent) = intent
-            && intent.target_height > 0
+            && intent.target_height.max(intent.min_height) > 0
         {
             let track_id = &intent.track_id;
             let Some(&track_handle) = track_handles.get(track_id) else {
@@ -272,31 +272,67 @@ impl VideoAllocator {
                 return None;
             };
 
-            // Keep current layer if slot already targets this track to avoid
-            // unnecessary PLI requests; otherwise start at lowest quality.
-            let layer = if let Some(target) = slot.target()
-                && target.meta.id == track_state.id()
-            {
-                target
-            } else {
-                let states = track_states(track_state);
-                let Some(layer) = track_state.lowest_healthy_quality(|l| {
-                    states
-                        .get(&l.stream_id())
-                        .is_some_and(crate::rtp::monitor::StreamStats::is_healthy)
-                }) else {
-                    slot.stop();
-                    return None;
-                };
-                layer
+            let states = track_states(track_state);
+            let meets_floor = |layer: &&TrackLayer| {
+                states
+                    .get(&layer.stream_id())
+                    .map_or(layer.quality.fallback_height(), |state| state.height())
+                    >= intent.min_height
             };
+            // An old active or staged layer below a newly raised floor must
+            // not forward while waiting for its replacement's keyframe.
+            let active_below_floor = slot
+                .switcher
+                .active_stream()
+                .and_then(|stream| {
+                    track_state
+                        .layers()
+                        .iter()
+                        .find(|l| l.stream_id() == stream)
+                })
+                .is_some_and(|layer| !meets_floor(&layer));
+            if active_below_floor
+                || slot.target().is_some_and(|target| {
+                    target.meta.id == track_state.id() && !meets_floor(&target)
+                })
+            {
+                slot.stop();
+            }
+            let layer = slot
+                .target()
+                .filter(|target| target.meta.id == track_state.id() && meets_floor(target))
+                .or_else(|| {
+                    track_state
+                        .layers()
+                        .iter()
+                        .filter(meets_floor)
+                        .filter(|layer| {
+                            states
+                                .get(&layer.stream_id())
+                                .is_some_and(crate::rtp::monitor::StreamStats::is_healthy)
+                        })
+                        .min_by_key(|layer| layer.quality)
+                })
+                .or_else(|| {
+                    track_state
+                        .layers()
+                        .iter()
+                        .filter(meets_floor)
+                        .min_by_key(|layer| layer.quality)
+                })
+                .cloned();
 
-            let layer = layer.clone();
             slot.max_height = intent.target_height;
             slot.min_height = intent.min_height;
             slot.min_fps = intent.min_fps;
             slot.priority = intent.priority;
-            slot.switch_to(&layer, false);
+            if let Some(layer) = layer {
+                slot.switch_to(&layer, false);
+            } else if let Some(layer) = track_state.lowest_quality() {
+                slot.pause_at(layer);
+            } else {
+                slot.stop();
+            }
         } else {
             slot.max_height = 0;
             slot.min_height = 0;
@@ -1337,7 +1373,7 @@ impl AllocationEngine {
 pub struct SlotView<'a> {
     pub key: DownstreamSlotKey,
     pub mid: Mid,
-    /// Target render height (px); layers taller than this are ineligible.
+    /// Preferred render height (px); the spatial floor can raise this target.
     pub max_height: u32,
     /// Floor render height (px) to keep under contention; `0` = droppable.
     pub min_height: u32,
@@ -1417,7 +1453,10 @@ impl AllocationEngine {
     /// also subsumes the all-taller-layers case (e.g. screen-share tiers that only differ in fps)
     /// - the smallest layer is always eligible rather than every layer being rejected.
     fn spatially_allowed(&self, slot: &SlotView<'_>, layer: &TrackLayer) -> bool {
-        let request = slot.max_height.max(self.min_track_height(slot.track));
+        let request = slot
+            .max_height
+            .max(slot.min_height)
+            .max(self.min_track_height(slot.track));
         let ceiling = slot
             .track
             .layers()
@@ -1434,7 +1473,10 @@ impl AllocationEngine {
         let bitrate = self.cost(layer);
         debug_assert!(bitrate.is_finite());
         debug_assert!(bitrate >= 0.0);
-        self.spatially_allowed(slot, layer) && self.snap(layer).healthy && bitrate > 0.0
+        self.spatially_allowed(slot, layer)
+            && self.height(layer) >= slot.min_height
+            && self.snap(layer).healthy
+            && bitrate > 0.0
     }
 
     fn cost(&self, layer: &TrackLayer) -> f64 {
@@ -1453,7 +1495,11 @@ impl AllocationEngine {
         slot.track
             .layers()
             .iter()
-            .filter(|layer| self.snap(layer).healthy && self.cost(layer) > 0.0)
+            .filter(|layer| {
+                self.height(layer) >= slot.min_height
+                    && self.snap(layer).healthy
+                    && self.cost(layer) > 0.0
+            })
             .min_by_key(|l| l.quality)
     }
 
@@ -1472,9 +1518,10 @@ impl AllocationEngine {
         slot.track
             .layers()
             .iter()
-            .filter(|layer| self.spatially_allowed(slot, layer))
+            .filter(|layer| {
+                self.spatially_allowed(slot, layer) && self.height(layer) >= slot.min_height
+            })
             .min_by_key(|layer| layer.quality)
-            .or_else(|| slot.track.layers().iter().min_by_key(|layer| layer.quality))
     }
 
     /// A legal layer to retain as the pause target even when no layer is
@@ -1488,7 +1535,10 @@ impl AllocationEngine {
             .filter(|layer| self.eligible(slot, layer))
             .min_by_key(|layer| layer.quality)
             .or_else(|| self.closest_healthy(slot))
-            .or_else(|| self.lowest_ladder(slot));
+            .or_else(|| self.lowest_ladder(slot))
+            // A parked layer is not forwarded. Keep a pause decision even when
+            // no source layer can satisfy the requested spatial floor.
+            .or_else(|| slot.track.layers().iter().min_by_key(|layer| layer.quality));
         debug_assert!(
             self.closest_healthy(slot).is_none()
                 || target.is_some_and(|layer| self.snap(layer).healthy)
@@ -1592,25 +1642,17 @@ impl AllocationEngine {
         Bitrate::from(crate::bitrate::saturating_bps(total))
     }
 
-    /// The layer that satisfies a slot's `min_height` floor: the lowest eligible
-    /// layer at least `min_height` tall, or the tallest eligible layer if none
-    /// reaches it. `None` when the slot is droppable (`min_height == 0`) or has
-    /// no eligible layer.
+    /// The lowest eligible layer at the spatial floor. If none satisfies it,
+    /// forwarding pauses rather than falling back below the floor.
     fn floor_layer<'a>(&self, slot: &'a SlotView<'a>) -> Option<&'a TrackLayer> {
         if slot.min_height == 0 {
             return None;
         }
-        let eligible = || {
-            slot.track
-                .layers()
-                .iter()
-                .filter(|l| self.eligible(slot, l))
-        };
-        eligible()
-            .filter(|l| self.height(l) >= slot.min_height)
+        slot.track
+            .layers()
+            .iter()
+            .filter(|l| self.eligible(slot, l))
             .min_by_key(|l| l.quality)
-            .or_else(|| eligible().max_by_key(|l| l.quality))
-            .or_else(|| self.closest_healthy(slot))
     }
 
     /// Strict-priority allocation. `slots` must be pre-sorted by `priority_order`
@@ -1707,13 +1749,15 @@ impl AllocationEngine {
 
             // Nothing measured healthy. Health describes the publisher's uplink,
             // not permission to forward, so an assigned slot still tries the
-            // bottom of the ladder: a struggling publisher must read as
-            // bandwidth-limited, not as a blank tile the SFU never explains.
+            // bottom of the ladder for a droppable stream: a struggling publisher
+            // must read as bandwidth-limited, not as a blank tile. A stream
+            // with a hard spatial floor instead pauses when no layer is available.
             // Budget still governs — a link that cannot carry the lowest rung
             // pauses exactly as before, and a slot that declined a layer for
             // budget or `min_fps` reasons is untouched because something was
             // healthy there.
             if cur.is_none()
+                && slot.min_height == 0
                 && self.nothing_healthy(slot)
                 && let Some(lowest) = self.lowest_ladder(slot)
             {
@@ -1977,6 +2021,103 @@ mod assignment_tests {
             downgraded.get(key),
             Some(AllocationDecision::Forward(layer, _)) if layer.quality == LayerQuality::High
         ));
+    }
+
+    #[test]
+    fn spatial_floor_raises_target_and_never_forwards_a_lower_layer() {
+        let pid = ParticipantId::new();
+        let (tx, built, mut states) = video_track_with_states(
+            pid,
+            Mid::from("v0"),
+            vec![
+                SimulcastLayer::new("q"),
+                SimulcastLayer::new("h"),
+                SimulcastLayer::new("f"),
+            ],
+        );
+        let track = Track::video(tx.meta, built.layers().to_vec(), None);
+        let high = track.by_quality(LayerQuality::High).unwrap();
+        let mut keys: SlotMap<DownstreamSlotKey, ()> = SlotMap::with_key();
+        let key = keys.insert(());
+        let mut view = SlotView {
+            key,
+            mid: Mid::from("s0"),
+            max_height: 360,
+            min_height: 720,
+            min_fps: 0,
+            priority: 0,
+            track: &track,
+            current_quality: LayerQuality::Low,
+            forwarding: false,
+        };
+
+        for target in [360, 0] {
+            view.max_height = target;
+            let engine = AllocationEngine::new(std::slice::from_ref(&view), &states);
+            let decisions =
+                engine.run_compute(Bitrate::from(10_000_000), std::slice::from_ref(&view));
+            assert!(matches!(
+                decisions.get(key),
+                Some(AllocationDecision::Forward(layer, _)) if layer.quality == LayerQuality::High
+            ));
+        }
+
+        state_of_mut(&mut states, high).set_inactive(true);
+        let engine = AllocationEngine::new(std::slice::from_ref(&view), &states);
+        let decisions = engine.run_compute(Bitrate::from(10_000_000), std::slice::from_ref(&view));
+        assert!(matches!(
+            decisions.get(key),
+            Some(AllocationDecision::Pause(_, _))
+        ));
+
+        for layer in track.layers() {
+            state_of_mut(&mut states, layer).set_inactive(true);
+        }
+        let engine = AllocationEngine::new(std::slice::from_ref(&view), &states);
+        let decisions = engine.run_compute(Bitrate::from(10_000_000), std::slice::from_ref(&view));
+        assert!(matches!(
+            decisions.get(key),
+            Some(AllocationDecision::Pause(_, _))
+        ));
+    }
+
+    #[test]
+    fn configuring_a_spatial_floor_never_stages_a_lower_layer() {
+        let mut allocator = setup_allocator();
+        let pid = ParticipantId::new();
+        let (tx, built, states) = video_track_with_states(
+            pid,
+            Mid::from("v0"),
+            vec![
+                SimulcastLayer::new("q"),
+                SimulcastLayer::new("h"),
+                SimulcastLayer::new("f"),
+            ],
+        );
+        let track_id = tx.meta.id;
+        allocator.seed_layer_states(&states);
+        allocator.add_track(Track::video(tx.meta, built.layers().to_vec(), None));
+        add_slots(&mut allocator, 1);
+        let mut intents = HashMap::new();
+        intents.insert(
+            Mid::from("s0"),
+            Intent {
+                track_id,
+                target_height: 0,
+                min_height: 720,
+                min_fps: 0,
+                priority: 0,
+            },
+        );
+        allocator.configure(&intents);
+        let slot = allocator.slots.values().next().unwrap();
+        assert_eq!(slot.target().unwrap().quality, LayerQuality::High);
+        assert!(!slot.paused);
+
+        intents.get_mut(&Mid::from("s0")).unwrap().min_height = 1080;
+        allocator.configure(&intents);
+        let slot = allocator.slots.values().next().unwrap();
+        assert!(slot.paused);
     }
 
     #[test]

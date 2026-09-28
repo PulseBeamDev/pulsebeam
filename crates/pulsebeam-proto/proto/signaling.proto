@@ -147,21 +147,20 @@ message VideoIntent {
   string track_id = 2;
 
   // TARGET render height in physical pixels — the size you are actually
-  // displaying at. The primary quality lever: the server will not send
-  // meaningfully more, because pixels beyond your display size are invisible.
+  // displaying at. The primary quality lever; min_height may raise it.
   // Update it whenever your layout changes (resize, pin, fullscreen).
-  //   0  = hidden / off-screen; the server sends nothing and frees the bandwidth
+  //   0 with min_height == 0 = hidden / off-screen; no forwarding
+  //   0 with min_height > 0  = keep at least the spatial floor
   //   >0 = the server picks the simulcast layer that best matches
   // Do not over-request: asking for 1080p in a thumbnail steals bandwidth from
   // the streams you are actually looking at.
   uint32 height = 3;
 
   // FLOOR: the lowest render height to keep under contention. The server holds
-  // the stream at or above this as long as it can, dropping below it only when
-  // no budget remains after higher-`priority` streams.
-  //   0              = droppable: may be paused entirely
-  //   0 < n < height = keep at least ~n px (a small always-visible tile)
-  //   n == height    = pin at full quality: never degrade
+  // the stream at or above this when a layer is available and affordable,
+  // pausing instead of forwarding a smaller layer.
+  //   0 = droppable: may be paused entirely
+  //   >0 = smallest acceptable spatial height, even above the target
   uint32 min_height = 4;
 
   // FLOOR: the lowest frame rate to keep under contention, for scalable
