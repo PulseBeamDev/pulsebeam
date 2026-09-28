@@ -1,5 +1,4 @@
 use alloc::{
-    borrow::ToOwned,
     collections::{BTreeMap, BTreeSet, VecDeque},
     string::String,
     vec::Vec,
@@ -9,8 +8,7 @@ use pulsebeam_proto::signaling_v1::{self as wire, catalog};
 
 use crate::{
     AudioBinding, MediaDirection, MediaKind, MediaSlot, Notification, Participant, Publication,
-    SlotBinding, Snapshot, VideoBinding,
-    signaling::{self, SignalingError},
+    SlotBinding, Snapshot, VideoBinding, signaling::SignalingError,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -266,14 +264,14 @@ pub(crate) fn decode_and_apply(
             state
                 .apply(catalog, recipient_id, recipient_external_id)
                 .map_err(|_| SignalingError::Invalid("catalog"))?;
-            update_snapshot(state, snapshot, notifications, coordinates);
+            update_snapshot(state, snapshot, notifications, coordinates)?;
             Ok(ServerOutput::StateChanged)
         }
         wire::server_message::Payload::Mapping(mapping) => {
             state
                 .apply_mapping(mapping, coordinates)
                 .map_err(|_| SignalingError::Invalid("mapping"))?;
-            update_snapshot(state, snapshot, notifications, coordinates);
+            update_snapshot(state, snapshot, notifications, coordinates)?;
             Ok(ServerOutput::StateChanged)
         }
         wire::server_message::Payload::Authorization(authorization) => Ok(
@@ -304,7 +302,7 @@ fn update_snapshot(
     snapshot: &mut Snapshot,
     notifications: &mut VecDeque<Notification>,
     coordinates: &BTreeMap<MediaSlot, SlotBinding>,
-) {
+) -> Result<(), SignalingError> {
     let participants: BTreeMap<_, _> = state
         .participants
         .keys()
@@ -336,29 +334,39 @@ fn update_snapshot(
         .video
         .iter()
         .map(|(index, id)| {
-            let mid = mids[index].to_owned();
-            (
+            let mid = String::from(
+                *mids
+                    .get(index)
+                    .ok_or(SignalingError::Invalid("mapping index"))?,
+            );
+            Ok((
                 mid.clone(),
                 VideoBinding {
                     track_id: id.clone(),
                     mid,
                     paused: false,
                 },
-            )
+            ))
         })
-        .collect();
+        .collect::<Result<_, SignalingError>>()?;
     let audio: Vec<_> = state
         .audio
         .iter()
-        .map(|(index, id)| AudioBinding {
-            track_id: id.clone(),
-            mid: mids[index].to_owned(),
-            level_dbov: 0,
+        .map(|(index, id)| {
+            Ok(AudioBinding {
+                track_id: id.clone(),
+                mid: String::from(
+                    *mids
+                        .get(index)
+                        .ok_or(SignalingError::Invalid("mapping index"))?,
+                ),
+                level_dbov: 0,
+            })
         })
-        .collect();
-    signaling::emit_participant_changes(&snapshot.participants, &participants, notifications);
-    signaling::emit_publication_changes(&snapshot.publications, &publications, notifications);
-    signaling::emit_video_changes(&snapshot.video, &video, notifications);
+        .collect::<Result<_, SignalingError>>()?;
+    emit_participant_changes(&snapshot.participants, &participants, notifications);
+    emit_publication_changes(&snapshot.publications, &publications, notifications);
+    emit_video_changes(&snapshot.video, &video, notifications);
     if snapshot.audio != audio {
         notifications.push_back(Notification::AudioBindingsChanged(audio.clone()));
     }
@@ -367,6 +375,57 @@ fn update_snapshot(
     snapshot.video = video;
     snapshot.audio = audio;
     snapshot.version = snapshot.version.saturating_add(1);
+    Ok(())
+}
+
+fn emit_participant_changes(
+    old: &BTreeMap<String, Participant>,
+    new: &BTreeMap<String, Participant>,
+    notifications: &mut VecDeque<Notification>,
+) {
+    for id in old.keys() {
+        if !new.contains_key(id) {
+            notifications.push_back(Notification::ParticipantRemoved(id.clone()));
+        }
+    }
+    for (id, participant) in new {
+        if old.get(id) != Some(participant) {
+            notifications.push_back(Notification::ParticipantAdded(participant.clone()));
+        }
+    }
+}
+
+fn emit_publication_changes(
+    old: &BTreeMap<String, Publication>,
+    new: &BTreeMap<String, Publication>,
+    notifications: &mut VecDeque<Notification>,
+) {
+    for (id, publication) in old {
+        if new.get(id) != Some(publication) {
+            notifications.push_back(Notification::PublicationRemoved(id.clone()));
+        }
+    }
+    for (id, publication) in new {
+        if old.get(id) != Some(publication) {
+            notifications.push_back(Notification::PublicationAdded(publication.clone()));
+        }
+    }
+}
+
+fn emit_video_changes(
+    old: &BTreeMap<String, VideoBinding>,
+    new: &BTreeMap<String, VideoBinding>,
+    notifications: &mut VecDeque<Notification>,
+) {
+    let mids: BTreeSet<&String> = old.keys().chain(new.keys()).collect();
+    for mid in mids {
+        if old.get(mid) != new.get(mid) {
+            notifications.push_back(Notification::VideoBindingChanged {
+                mid: mid.clone(),
+                binding: new.get(mid).cloned(),
+            });
+        }
+    }
 }
 
 fn valid(value: &str, limit: usize) -> bool {
@@ -416,12 +475,8 @@ mod tests {
         message: wire::Catalog,
         mapped: &[&str],
     ) -> Result<(), CatalogError> {
-        if !mapped.is_empty() {
-            state.audio = mapped
-                .iter()
-                .enumerate()
-                .map(|(index, id)| (index as u32, String::from(*id)))
-                .collect();
+        for id in mapped {
+            state.audio.insert(0, String::from(*id));
         }
         state.apply(message, "self", "me")
     }

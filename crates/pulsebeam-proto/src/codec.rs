@@ -79,7 +79,10 @@ fn decode<M: Message + Default>(input: &[u8]) -> Result<M, DecodeError> {
 
     let mut protobuf = vec![0; MAX_MESSAGE_SIZE];
     let decoded_len = decompress_into(input, &mut protobuf).map_err(map_decompress_error)?;
-    M::decode(&protobuf[..decoded_len]).map_err(|_| DecodeError::InvalidProtobuf)
+    let decoded = protobuf
+        .get(..decoded_len)
+        .ok_or(DecodeError::DecodedTooLarge)?;
+    M::decode(decoded).map_err(|_| DecodeError::InvalidProtobuf)
 }
 
 fn map_decompress_error(error: DecompressError) -> DecodeError {
