@@ -197,6 +197,7 @@ impl MediaSlot {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Participant {
     pub id: String,
+    pub external_id: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -204,6 +205,7 @@ pub struct Publication {
     pub id: String,
     pub participant_id: String,
     pub kind: MediaKind,
+    pub label: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
