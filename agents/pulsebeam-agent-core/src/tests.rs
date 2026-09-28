@@ -612,6 +612,42 @@ fn drain_notifications(agent: &mut Agent) -> Vec<Notification> {
 }
 
 #[test]
+fn disconnected_credential_update_is_used_for_next_http_admission() {
+    let mut agent = Agent::new(config()).unwrap();
+    assert_eq!(
+        agent.command(AgentCommand::RenewAuthorization("bad\nheader".to_string())),
+        Err(AgentError::InvalidAuthorizationToken)
+    );
+    agent
+        .command(AgentCommand::RenewAuthorization(
+            "replacement-token".to_string(),
+        ))
+        .unwrap();
+    agent
+        .command(AgentCommand::ReplaceDesired(desired(1)))
+        .unwrap();
+    let generation = match next_effect(&mut agent) {
+        Effect::Rtc(RtcEffect::CreateOffer { generation, .. }) => generation,
+        effect => panic!("expected offer, got {effect:?}"),
+    };
+    agent
+        .handle(HostEvent::Rtc(RtcEvent::OfferCreated {
+            generation,
+            offer: offer(),
+            resources: resources(channel(9)),
+        }))
+        .unwrap();
+    let request = match next_effect(&mut agent) {
+        Effect::Http(HttpEffect::Request { request, .. }) => request,
+        effect => panic!("expected HTTP admission, got {effect:?}"),
+    };
+    assert!(request.headers.iter().any(|header| {
+        header.name == "Authorization" && header.value == "Bearer replacement-token"
+    }));
+    assert!(!format!("{request:?}").contains("replacement-token"));
+}
+
+#[test]
 fn rejected_renewal_preserves_the_committed_credential_and_expiry() {
     let (mut agent, generation, channel, send) = connected_agent();
     acknowledge_send(&mut agent, generation, channel, send);
