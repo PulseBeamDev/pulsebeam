@@ -1072,10 +1072,12 @@ impl Agent {
         let Some(active) = self.active.as_mut() else {
             return;
         };
-        if active.signaling_terminal || active.intent_revision == u64::MAX {
+        if active.signaling_terminal {
             return;
         }
-        let revision = active.intent_revision + 1;
+        let Some(revision) = active.intent_revision.checked_add(1) else {
+            return;
+        };
         let payload = match signaling::encode_v1_intent(
             &self.desired,
             &self.config.topology,
