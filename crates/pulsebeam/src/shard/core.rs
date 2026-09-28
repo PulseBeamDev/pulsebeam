@@ -636,6 +636,19 @@ impl ShardExecution {
                 #[cfg(feature = "sim")]
                 crate::sim_metrics::record_routing_counter("demux_flow_authenticated");
             }
+            ShardCommand::AuthorizationResult {
+                participant,
+                connection_id,
+                expiry,
+            } => {
+                if let Some(key) = self.registry.resolve(&participant)
+                    && let Some(current) = self.registry.resolve_mut(key)
+                    && current.connection_id == connection_id
+                {
+                    current.input(crate::participant::ParticipantInput::Authorization(expiry));
+                    self.dirty.mark(key, current);
+                }
+            }
         }
         let _ = router;
         Some(())

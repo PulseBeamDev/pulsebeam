@@ -121,6 +121,9 @@ impl ControllerCore {
             participant_external_id: state.participant_external_id,
             connection_id: state.connection_id,
             profile: state.profile,
+            authorization_expiry: state
+                .authorization
+                .map(super::controller::AuthorizationLease::expiry),
             rtc,
             resources,
         }

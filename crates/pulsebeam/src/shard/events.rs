@@ -231,6 +231,17 @@ impl<'a> ParticipantSink for PipelineSinkRef<'a> {
     }
 
     #[inline]
+    fn renew_authorization(&mut self, token: String) {
+        self.pipeline
+            .participant_events
+            .push_back(ParticipantEvent::Control(ShardEvent::RenewAuthorization {
+                participant: self.id,
+                connection_id: self.connection_id,
+                token: crate::shard::worker::RenewalToken(token),
+            }));
+    }
+
+    #[inline]
     fn exit(&mut self) {
         self.pipeline
             .participant_events

@@ -12,7 +12,7 @@ const KEY_BYTES: usize = 32;
 const KEY_TEXT_LEN: usize = 52;
 const CROCKFORD: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 const REDACTED: &str = "[REDACTED]";
-pub const MAX_COMPACT_TOKEN_LEN: usize = 2 * 1024;
+pub const MAX_COMPACT_TOKEN_LEN: usize = 16_384;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]

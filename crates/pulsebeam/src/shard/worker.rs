@@ -166,6 +166,11 @@ pub(crate) enum ShardCommand {
         source: std::net::SocketAddr,
         address: crate::route::NodeTransportAddress,
     },
+    AuthorizationResult {
+        participant: ParticipantId,
+        connection_id: crate::entity::ConnectionId,
+        expiry: Option<i64>,
+    },
 }
 
 pub(crate) type MediaPayload = RoutedTrackPacket;
@@ -198,6 +203,14 @@ pub(crate) enum ShardFrame {
     },
 }
 
+pub(crate) struct RenewalToken(pub(crate) String);
+
+impl std::fmt::Debug for RenewalToken {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("[REDACTED]")
+    }
+}
+
 pub(crate) type ShardEventMessage = (ShardId, ShardEvent);
 
 /// Runtime facts observed by a shard. The controller converts these facts into
@@ -214,6 +227,11 @@ pub(crate) enum ShardEvent {
     ParticipantClosed {
         participant: ParticipantId,
         connection_id: crate::entity::ConnectionId,
+    },
+    RenewAuthorization {
+        participant: ParticipantId,
+        connection_id: crate::entity::ConnectionId,
+        token: RenewalToken,
     },
     TrackSubscribed {
         subscriber: ParticipantId,

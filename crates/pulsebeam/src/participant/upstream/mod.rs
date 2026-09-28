@@ -21,7 +21,7 @@ use str0m::rtp::rtcp::SenderInfo;
 use tokio::time::Instant;
 pub(crate) use video::UpstreamVideo;
 
-pub(crate) const MAX_UPSTREAM_SLOT_PER_TYPE: usize = 2;
+pub(crate) const MAX_UPSTREAM_SLOT_PER_TYPE: usize = 32;
 pub(crate) const MAX_UPSTREAM_ENCODED_STREAMS: usize =
     MAX_UPSTREAM_SLOT_PER_TYPE * (1 + crate::track::MAX_SIMULCAST_LAYERS);
 
@@ -191,7 +191,10 @@ impl UpstreamMedia {
             .iter()
             .position(|slot| slot.media_index == media_index)
             .ok_or(SenderLabelError::UnknownSender)?;
-        let slot = &self.published_tracks[slot_index];
+        let slot = self
+            .published_tracks
+            .get(slot_index)
+            .ok_or(SenderLabelError::UnknownSender)?;
         if let Some(bound) = &slot.track.meta.label {
             return (bound == label)
                 .then_some((slot.track.meta.id, slot.track.meta.id))
@@ -209,7 +212,10 @@ impl UpstreamMedia {
         {
             return Err(SenderLabelError::DuplicateLabel);
         }
-        let slot = &mut self.published_tracks[slot_index];
+        let slot = self
+            .published_tracks
+            .get_mut(slot_index)
+            .ok_or(SenderLabelError::UnknownSender)?;
         let previous = slot.track.meta.id;
         slot.track.meta.id = id;
         slot.track.meta.label = Some(label.to_owned());
@@ -230,7 +236,10 @@ impl UpstreamMedia {
             else {
                 continue;
             };
-            let slot = &self.published_tracks[index];
+            let slot = self
+                .published_tracks
+                .get(index)
+                .ok_or(SenderLabelError::UnknownSender)?;
             if let Some(bound) = &slot.track.meta.label {
                 if bound != label {
                     return Err(SenderLabelError::AlreadyBound);
@@ -265,7 +274,9 @@ impl UpstreamMedia {
     fn apply_sender_labels(&mut self, replacements: Vec<(usize, TrackId, String)>) -> bool {
         let changed = !replacements.is_empty();
         for (index, id, label) in replacements {
-            let slot = &mut self.published_tracks[index];
+            let Some(slot) = self.published_tracks.get_mut(index) else {
+                return false;
+            };
             slot.track.meta.id = id;
             slot.track.meta.label = Some(label.clone());
             slot.descriptor.meta_mut().id = id;

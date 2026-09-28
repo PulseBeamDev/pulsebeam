@@ -285,7 +285,7 @@ fn validate_strict_directions(offer: &str, required: &str) -> Result<(), ApiErro
 }
 
 fn validate_single_media_per_kind(offer: &str) -> Result<(), ApiError> {
-    let (mut audio, mut video) = (0, 0);
+    let (mut audio, mut video) = (0_u8, 0_u8);
     for line in offer.lines().map(str::trim_end) {
         let Some(media) = line.strip_prefix("m=") else {
             continue;
@@ -300,8 +300,8 @@ fn validate_single_media_per_kind(offer: &str) -> Result<(), ApiError> {
             continue;
         }
         match kind {
-            Some("audio") => audio += 1,
-            Some("video") => video += 1,
+            Some("audio") => audio = audio.saturating_add(1),
+            Some("video") => video = video.saturating_add(1),
             _ => {}
         }
         if audio > 1 || video > 1 {

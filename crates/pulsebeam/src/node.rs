@@ -902,6 +902,7 @@ impl NodeBuilder {
             view_writers,
         );
         controller.set_steering(steering);
+        controller.set_project_registry(self.project_registry.clone());
         // intentionally small so backpressure is applied early
         // with 62.5 ms pacing rate, at most we get 1s latency here.
         let (controller_command_tx, controller_command_rx) = mailbox::new(16);

@@ -1,4 +1,4 @@
-use super::signaling::Signaling;
+use super::signaling_v1::{AppliedInput, NativeSession};
 use ahash::{HashMap, HashMapExt, HashSet, HashSetExt};
 use pulsebeam_proto::prelude::Message;
 use pulsebeam_proto::reliable::{RelControl, rel_control};
@@ -22,7 +22,7 @@ use crate::participant::downstream::SlotConfig;
 use crate::participant::effect::ParticipantEffect;
 use crate::participant::event::ParticipantSink;
 use crate::participant::reverse::{ReverseInput, ReversePacket};
-use crate::participant::signaling;
+
 #[cfg(test)]
 use crate::participant::upstream::{
     MAX_UPSTREAM_ENCODED_STREAMS, UpstreamRouteTable, UpstreamSlotKey,
@@ -69,8 +69,12 @@ pub struct TrackMapping {
 pub enum DisconnectReason {
     #[error("RTC engine error")]
     RtcError(#[from] RtcError),
-    #[error("Signaling error")]
-    SignalingError(#[from] signaling::SignalingError),
+    #[error("Native signaling input error")]
+    SignalingInput,
+    #[error("Native signaling output error")]
+    SignalingOutput,
+    #[error("Native signaling channel closed")]
+    SignalingClosed,
     #[error("ICE connection disconnected")]
     IceDisconnected,
     #[error("Unsupported media direction (must be SendOnly or RecvOnly)")]
@@ -99,6 +103,7 @@ pub struct ParticipantConfig {
     pub participant_external_id: entity::ParticipantExternalId,
     pub connection_id: entity::ConnectionId,
     pub profile: ConnectionProfile,
+    pub authorization_expiry: Option<pulsebeam_core::auth::AuthorizationExpiry>,
     pub rtc: Rtc,
     pub resources: NegotiatedResources,
 }
@@ -109,6 +114,7 @@ pub(crate) enum ParticipantInput<'a> {
         source_shard: crate::id::ShardId,
     },
     Timeout(Instant),
+    Authorization(Option<i64>),
     Track {
         key: TrackHandle,
         packet: TrackPacketRef<'a>,
@@ -137,6 +143,7 @@ pub struct Participant {
     negotiated: NegotiatedResources,
     profile: ConnectionProfile,
     pub(crate) participant_id: entity::ParticipantId,
+    participant_external_id: entity::ParticipantExternalId,
     pub(crate) connection_id: entity::ConnectionId,
     last_keyframe_request: HashMap<(Mid, Option<str0m::media::Rid>), Instant>,
     pending_keyframe_requests: HashSet<(Mid, Option<str0m::media::Rid>)>,
@@ -162,7 +169,11 @@ pub struct Participant {
     /// unwarranted for something only a human reading a trace benefits from.
     // Cold: touched rarely
     disconnect_reason: Option<DisconnectReason>,
-    signaling: Signaling,
+    signaling: NativeSession,
+    renewal_pending: bool,
+    playout_reconnect_sent: bool,
+    authorization_expiry: Option<pulsebeam_core::auth::AuthorizationExpiry>,
+    active_sender_indices: HashSet<u32>,
     last_slow_poll: Instant,
     pub(crate) room_id: entity::RoomId,
     pub(crate) shard_id: ShardId,
@@ -182,7 +193,7 @@ impl Participant {
             room_id: cfg.room_id,
             participant_id: cfg.participant_id,
         };
-        let signaling = Signaling::new(ctx, cfg.participant_external_id);
+        let signaling = NativeSession::default();
         let now = Instant::now();
         #[cfg(feature = "sim")]
         let sim_span = tracing::info_span!(
@@ -201,6 +212,7 @@ impl Participant {
             ),
             stream_writer: StreamWriter::new(),
             participant_id: cfg.participant_id,
+            participant_external_id: cfg.participant_external_id,
             connection_id: cfg.connection_id,
             profile: cfg.profile,
             upstream: UpstreamAllocator::new(ctx),
@@ -208,6 +220,10 @@ impl Participant {
             downstream: DownstreamAllocator::new(ctx, cfg.manual_sub),
             disconnect_reason: None,
             signaling,
+            renewal_pending: false,
+            playout_reconnect_sent: false,
+            authorization_expiry: cfg.authorization_expiry,
+            active_sender_indices: HashSet::new(),
             last_slow_poll: now,
             last_keyframe_request: HashMap::new(),
             pending_keyframe_requests: HashSet::new(),
@@ -303,6 +319,17 @@ impl Participant {
                 source_shard,
             } => self.on_ingress(batch, source_shard),
             ParticipantInput::Timeout(now) => self.on_timeout(now),
+            ParticipantInput::Authorization(expiry) => {
+                if self.renewal_pending {
+                    self.renewal_pending = false;
+                    if let Some(expiry) = expiry {
+                        self.authorization_expiry = u64::try_from(expiry)
+                            .ok()
+                            .map(pulsebeam_core::auth::AuthorizationExpiry::from_unix_seconds);
+                    }
+                    self.send_authorization_result(expiry);
+                }
+            }
             ParticipantInput::Track { key, packet, cache } => {
                 self.on_track_packet(key, packet, cache);
             }
@@ -414,7 +441,7 @@ impl Participant {
                     &mut self.stream_writer,
                 );
                 if promoted {
-                    self.signaling.mark_assignments_dirty();
+                    self.signaling.mark_mapping_dirty();
                 }
             }
             TrackKind::Audio => {
@@ -426,7 +453,7 @@ impl Participant {
                 self.downstream
                     .on_forward_audio_rtp(origin, packet, &mut self.stream_writer);
                 if self.downstream.take_audio_speakers_changed() {
-                    self.signaling.mark_assignments_dirty();
+                    self.signaling.mark_mapping_dirty();
                 }
             }
             TrackKind::Data => debug_assert!(false, "data tracks carry bytes, not RTP"),
@@ -457,10 +484,7 @@ impl Participant {
             "participant received published track"
         );
         self.downstream.install_track(key, track);
-        self.signaling.mark_tracks_dirty();
-        self.signaling.mark_assignments_dirty();
-        let intents = self.signaling.reconcile();
-        self.downstream.apply_signaling_intents(intents);
+        self.signaling.mark_dirty();
     }
 
     fn on_tracks_unpublished(&mut self, tracks: &[TrackId]) -> bool {
@@ -469,10 +493,7 @@ impl Participant {
             removed |= self.downstream.remove_track(track_id);
         }
         if removed {
-            self.signaling.mark_tracks_dirty();
-            self.signaling.mark_assignments_dirty();
-            let intents = self.signaling.reconcile();
-            self.downstream.apply_signaling_intents(intents);
+            self.signaling.mark_dirty();
         }
         removed
     }
@@ -551,26 +572,34 @@ impl Participant {
             .transport
             .with_bwe(|bwe| self.downstream.poll_slow(now, bwe, events));
         if assignments_changed {
-            self.signaling.mark_assignments_dirty();
+            self.signaling.mark_mapping_dirty();
         }
     }
 
     fn apply_one_rtc_mutation(&mut self, now: Instant) -> bool {
         if let Some(write) = self.stream_writer.pop() {
-            let (pkt, mid, rid, ssrc, pt, kind) = match write {
+            let (pkt, track_id, mid, rid, ssrc, pt, kind) = match write {
                 StreamWrite::Video {
                     pkt,
+                    track_id,
                     mid,
                     rid,
                     ssrc,
                     pt,
-                } => (pkt, mid, rid, ssrc, pt, MediaKind::Video),
-                StreamWrite::Audio { pkt, mid, ssrc, pt } => {
-                    (pkt, mid, None, ssrc, pt, MediaKind::Audio)
-                }
+                } => (pkt, track_id, mid, rid, ssrc, pt, MediaKind::Video),
+                StreamWrite::Audio {
+                    pkt,
+                    track_id,
+                    mid,
+                    ssrc,
+                    pt,
+                } => (pkt, track_id, mid, None, ssrc, pt, MediaKind::Audio),
             };
             let seq_no = pkt.seq_no;
-            let playout_delay = self.downstream.playout_delay_to_stamp();
+            let Ok(playout_delay) = self.downstream.playout_delay_to_stamp(track_id, mid) else {
+                self.send_playout_reconnect();
+                return true;
+            };
             let result = self.transport.apply_rtp_command(RtpWriteCommand {
                 pkt,
                 mid,
@@ -695,19 +724,32 @@ impl Participant {
             }
 
             if self.signaling.needs_poll() {
-                let mut snapshot = self.downstream.signaling_snapshot();
-                snapshot.participants = self.signaling.participants_snapshot();
-                if let Some(output) = self.signaling.poll(&snapshot) {
-                    if self
-                        .transport
-                        .write_channel(output.cid, true, &output.bytes)
-                    {
-                        self.signaling.commit_sent();
-                    } else {
-                        self.signaling.retry_pending();
+                let publications = self.downstream.native_publications();
+                let assignments = self.downstream.native_assignments();
+                match self.signaling.poll(
+                    &publications,
+                    assignments,
+                    self.participant_id,
+                    self.participant_external_id.as_str(),
+                ) {
+                    Ok(Some(output)) => {
+                        if self
+                            .transport
+                            .write_channel(output.cid, true, &output.bytes)
+                        {
+                            self.signaling.commit_sent();
+                        } else {
+                            self.signaling.retry_pending();
+                        }
+                        self.transport.mark_needs_drain();
+                        continue;
                     }
-                    self.transport.mark_needs_drain();
-                    continue;
+                    Ok(None) => {}
+                    Err(err) => {
+                        plog_warn!(self.log_ctx(), ?err, "native signaling output failed");
+                        self.disconnect(DisconnectReason::SignalingOutput);
+                        return None;
+                    }
                 }
             }
 
@@ -716,7 +758,7 @@ impl Participant {
                     .transport
                     .with_bwe(|bwe| self.downstream.update_allocations(now, bwe));
                 if assignments_changed {
-                    self.signaling.mark_assignments_dirty();
+                    self.signaling.mark_mapping_dirty();
                 }
                 self.downstream.reconcile_routes(now, events);
                 self.transport.mark_needs_drain();
@@ -835,6 +877,11 @@ impl Participant {
                         if self.profile == ConnectionProfile::Native {
                             plog_info!(self.log_ctx(), "internal media signaling is opened");
                             self.signaling.set_cid(cid);
+                            if let Some(expiry) = self.authorization_expiry
+                                && let Ok(expiry) = i64::try_from(expiry.unix_seconds())
+                            {
+                                self.send_authorization_result(Some(expiry));
+                            }
                         }
                     }
 
@@ -885,6 +932,10 @@ impl Participant {
                 }
             }
             Event::ChannelClose(cid) => {
+                if Some(cid) == self.signaling.cid {
+                    self.disconnect(DisconnectReason::SignalingClosed);
+                    return;
+                }
                 let Some(channel) = self.data.close(cid) else {
                     return;
                 };
@@ -893,16 +944,12 @@ impl Participant {
                 self.release_data_channel(channel, events);
             }
             Event::ChannelData(data) => {
-                if Some(data.id) == self.signaling.cid
-                    && let Err(err) = self.signaling.handle_input(&data.data).map(|input_events| {
-                        for input_event in input_events {
-                            self.handle_signaling_input(input_event, events);
-                        }
-                        let intents = self.signaling.reconcile();
-                        self.downstream.apply_signaling_intents(intents);
-                    })
-                {
-                    self.disconnect(err.into());
+                if Some(data.id) == self.signaling.cid {
+                    if !data.binary {
+                        self.disconnect(DisconnectReason::SignalingClosed);
+                        return;
+                    }
+                    self.handle_native_signaling(&data.data, events);
                     return;
                 }
 
@@ -948,15 +995,118 @@ impl Participant {
         }
     }
 
-    fn handle_signaling_input(
-        &mut self,
-        event: signaling::SignalingInputEvent,
-        events: &mut impl ParticipantSink,
-    ) {
-        match event {
-            signaling::SignalingInputEvent::UpstreamTrackState { mid, active } => {
-                self.handle_upstream_track_state(mid, active, events);
+    fn handle_native_signaling(&mut self, bytes: &[u8], events: &mut impl ParticipantSink) {
+        let senders = self
+            .negotiated
+            .media_sections()
+            .iter()
+            .filter_map(|media| {
+                if media.direction != Direction::RecvOnly {
+                    return None;
+                }
+                let kind = match media.kind {
+                    MediaKind::Audio => TrackKind::Audio,
+                    MediaKind::Video => TrackKind::Video,
+                };
+                Some((media.media_index, kind))
+            })
+            .collect();
+        let result = self.signaling.apply_input(
+            bytes,
+            &senders,
+            self.downstream.video.slot_count(),
+            &mut self.upstream,
+        );
+        match result {
+            Ok(AppliedInput::Intent { published, receive }) => {
+                let next: HashSet<u32> = published.iter().map(|track| track.sender_index).collect();
+                let removed: Vec<u32> = self
+                    .active_sender_indices
+                    .difference(&next)
+                    .copied()
+                    .collect();
+                let added: Vec<u32> = next
+                    .difference(&self.active_sender_indices)
+                    .copied()
+                    .collect();
+                for (indices, active) in [(removed, false), (added, true)] {
+                    for index in indices {
+                        if let Some(mid) = self
+                            .negotiated
+                            .media_sections()
+                            .iter()
+                            .find(|media| media.media_index == index)
+                            .map(|media| media.mid)
+                        {
+                            self.handle_upstream_track_state(mid, active, events);
+                        }
+                    }
+                }
+                self.active_sender_indices = next;
+                if self.downstream.apply_native_receive(receive.as_ref()) {
+                    self.send_playout_reconnect();
+                }
             }
+            Ok(AppliedInput::Replay) => {}
+            Ok(AppliedInput::RenewAuthorization(token)) => {
+                if self.renewal_pending {
+                    self.send_authorization_result(None);
+                } else {
+                    self.renewal_pending = true;
+                    events.renew_authorization(token);
+                }
+            }
+            Err(error) => {
+                if let Ok(bytes) = pulsebeam_proto::codec::encode_server(&error.response())
+                    && let Some(cid) = self.signaling.cid
+                {
+                    self.transport.write_channel(cid, true, &bytes);
+                    self.transport.mark_needs_drain();
+                }
+                plog_warn!(self.log_ctx(), ?error, "native signaling input rejected");
+                self.disconnect(DisconnectReason::SignalingInput);
+            }
+        }
+    }
+
+    fn send_playout_reconnect(&mut self) {
+        if self.playout_reconnect_sent {
+            return;
+        }
+        self.playout_reconnect_sent = true;
+        use pulsebeam_proto::signaling_v1::{Reconnect, ServerMessage, server_message::Payload};
+        if let Some(cid) = self.signaling.cid
+            && let Ok(bytes) = pulsebeam_proto::codec::encode_server(&ServerMessage {
+                payload: Some(Payload::Reconnect(Reconnect {})),
+            })
+        {
+            self.transport.write_channel(cid, true, &bytes);
+            self.transport.mark_needs_drain();
+        }
+    }
+
+    fn send_authorization_result(&mut self, expiry: Option<i64>) {
+        use pulsebeam_proto::signaling_v1::{
+            Authorization, Error, ErrorCode, ServerMessage, server_message::Payload,
+        };
+        let payload = match expiry {
+            Some(expires_at_unix_seconds) => Payload::Authorization(Authorization {
+                expires_at_unix_seconds,
+            }),
+            None => Payload::Error(Error {
+                code: ErrorCode::AuthorizationRejected as i32,
+                message: "authorization renewal rejected or busy".to_string(),
+                fatal: false,
+                intent_revision: None,
+            }),
+        };
+        if let Some(cid) = self.signaling.cid
+            && let Ok(bytes) = pulsebeam_proto::codec::encode_server(&ServerMessage {
+                payload: Some(payload),
+            })
+        {
+            self.transport.write_channel(cid, true, &bytes);
+            self.transport.mark_needs_drain();
         }
     }
 
@@ -1074,14 +1224,7 @@ impl Participant {
             }
             Direction::SendOnly => {
                 self.try_add_downstream_slot(resource.media_index, media.mid, media.kind);
-                // Update signaling slot count AFTER adding the slot so the
-                // server accepts ClientIntent requests up to the actual slot
-                // count (previously this was called before add_slot, so the
-                // count was always one behind and every intent was rejected).
-                self.signaling
-                    .set_slot_count(self.downstream.video.slot_count());
-                self.signaling
-                    .set_audio_slot_count(self.downstream.audio_slot_count());
+                self.signaling.mark_mapping_dirty();
             }
             _ => self.disconnect(DisconnectReason::InvalidMediaDirection),
         }
