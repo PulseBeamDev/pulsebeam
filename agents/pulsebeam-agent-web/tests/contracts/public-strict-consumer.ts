@@ -32,7 +32,7 @@ legacyConfig.requestHeaders;
 
 const desired: AgentState = {
   connected: true,
-  publications: [{ slot: "microphone", active: true }],
+  publications: [{ slot: "microphone", label: "microphone", active: true }],
   video: [
     {
       slot: 0,

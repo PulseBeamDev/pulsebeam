@@ -25,6 +25,7 @@ export interface AgentConfig {
 
 export interface PublicationIntent {
   readonly slot: string;
+  readonly label: string;
   readonly active: boolean;
 }
 

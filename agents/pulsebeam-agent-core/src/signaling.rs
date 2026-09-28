@@ -32,23 +32,28 @@ pub(crate) fn encode_v1_intent(
     if desired.video.len() > usize::from(topology.remote_video) {
         return Err(SignalingError::Invalid("video receiver capacity"));
     }
-    let active: BTreeMap<&str, bool> = desired
+    let active: BTreeMap<&str, (&str, bool)> = desired
         .publications
         .iter()
-        .map(|publication| (publication.slot.as_str(), publication.active))
+        .map(|publication| {
+            (
+                publication.slot.as_str(),
+                (publication.label.as_str(), publication.active),
+            )
+        })
         .collect();
     let mut send = Vec::new();
     for (slots, kind) in [
         (&topology.local_video, wire::TrackKind::Video),
         (&topology.local_audio, wire::TrackKind::Audio),
     ] {
-        for label in slots {
-            if !active.get(label.as_str()).copied().unwrap_or(false) {
+        for name in slots {
+            let Some((label, true)) = active.get(name.as_str()).copied() else {
                 continue;
-            }
+            };
             let slot = match kind {
-                wire::TrackKind::Video => MediaSlot::LocalVideo(label.clone()),
-                _ => MediaSlot::LocalAudio(label.clone()),
+                wire::TrackKind::Video => MediaSlot::LocalVideo(name.clone()),
+                _ => MediaSlot::LocalAudio(name.clone()),
             };
             let resource = coordinates
                 .get(&slot)
@@ -56,7 +61,7 @@ pub(crate) fn encode_v1_intent(
             send.push(wire::LocalTrack {
                 sender_index: resource.media_index,
                 kind: kind.into(),
-                label: label.clone(),
+                label: label.into(),
             });
         }
     }
@@ -151,10 +156,12 @@ mod tests {
             publications: alloc::vec![
                 PublicationIntent {
                     slot: "camera".into(),
+                    label: "front camera".into(),
                     active: true
                 },
                 PublicationIntent {
                     slot: "mic".into(),
+                    label: "mic".into(),
                     active: true
                 },
             ],
@@ -185,6 +192,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             alloc::vec![2, 4]
         );
+        assert_eq!(send[0].label, "front camera");
         let video = intent.receive.unwrap().video.unwrap().tracks;
         assert_eq!(video[0].track_id, "opaque-remote-id");
         let options = video[0].options.as_ref().unwrap();

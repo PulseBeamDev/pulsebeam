@@ -168,6 +168,7 @@ struct Closing {
 pub struct Agent {
     config: AgentConfig,
     desired: DesiredState,
+    local_bindings: BTreeMap<MediaSlot, String>,
     snapshot: Snapshot,
     ids: IdGenerator,
     effects: VecDeque<Effect>,
@@ -191,6 +192,7 @@ impl Agent {
         Ok(Self {
             config,
             desired: DesiredState::default(),
+            local_bindings: BTreeMap::new(),
             snapshot: Snapshot::default(),
             ids: IdGenerator::new(),
             effects: VecDeque::new(),
@@ -312,6 +314,33 @@ impl Agent {
             } else {
                 Err(AgentError::ConflictingDesiredRevision(desired.revision))
             };
+        }
+        for publication in &desired.publications {
+            let slot = if self.config.topology.local_video.contains(&publication.slot) {
+                MediaSlot::LocalVideo(publication.slot.clone())
+            } else {
+                MediaSlot::LocalAudio(publication.slot.clone())
+            };
+            if self
+                .local_bindings
+                .get(&slot)
+                .is_some_and(|label| label != &publication.label)
+                || self.local_bindings.iter().any(|(reserved_slot, label)| {
+                    reserved_slot.kind() == slot.kind()
+                        && label == &publication.label
+                        && reserved_slot != &slot
+                })
+            {
+                return Err(ValidationError::PublicationBinding(publication.label.clone()).into());
+            }
+        }
+        for publication in &desired.publications {
+            let slot = if self.config.topology.local_video.contains(&publication.slot) {
+                MediaSlot::LocalVideo(publication.slot.clone())
+            } else {
+                MediaSlot::LocalAudio(publication.slot.clone())
+            };
+            self.local_bindings.insert(slot, publication.label.clone());
         }
         let video_changed = self.desired.video != desired.video;
         let intent_changed = self.desired.publications != desired.publications

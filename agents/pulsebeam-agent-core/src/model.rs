@@ -96,6 +96,7 @@ pub struct DesiredState {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PublicationIntent {
     pub slot: String,
+    pub label: String,
     pub active: bool,
 }
 
@@ -312,6 +313,8 @@ pub enum ValidationError {
     },
     #[error("unknown local publication slot: {0}")]
     UnknownPublicationSlot(String),
+    #[error("local publication binding conflicts with a reserved slot or label: {0}")]
+    PublicationBinding(String),
     #[error("remote video slot {slot} is outside topology capacity {capacity}")]
     UnknownVideoSlot { slot: u8, capacity: u8 },
     #[error("audio playout policy refers to an unpinned track: {0}")]
@@ -418,16 +421,29 @@ impl DesiredState {
             .map(String::as_str)
             .collect();
         let mut publications = BTreeSet::new();
+        let mut labels = BTreeSet::new();
         for publication in &self.publications {
             if !local.contains(publication.slot.as_str()) {
                 return Err(ValidationError::UnknownPublicationSlot(
                     publication.slot.clone(),
                 ));
             }
+            validate_identifier("publication label", &publication.label, 64, false)?;
             if !publications.insert(publication.slot.clone()) {
                 return Err(ValidationError::Duplicate {
                     field: "publication slot",
                     value: publication.slot.clone(),
+                });
+            }
+            let kind = if topology.local_video.contains(&publication.slot) {
+                MediaKind::Video
+            } else {
+                MediaKind::Audio
+            };
+            if !labels.insert((kind, publication.label.clone())) {
+                return Err(ValidationError::Duplicate {
+                    field: "publication label",
+                    value: publication.label.clone(),
                 });
             }
         }

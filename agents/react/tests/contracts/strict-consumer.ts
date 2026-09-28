@@ -37,9 +37,9 @@ const agent: Agent = createAgent(config);
 const state: AgentState = {
   connected: true,
   publications: [
-    { slot: "camera", active: true },
-    { slot: "mic", active: true },
-    { slot: "screen", active: true },
+    { slot: "camera", label: "camera", active: true },
+    { slot: "mic", label: "mic", active: true },
+    { slot: "screen", label: "screen", active: true },
   ],
   video: [
     {

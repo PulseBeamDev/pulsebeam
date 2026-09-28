@@ -69,6 +69,7 @@ pub enum LogLevel {
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct PublicationIntent {
     pub slot: String,
+    pub label: String,
     pub active: bool,
 }
 
@@ -538,6 +539,7 @@ impl From<PublicationIntent> for model::PublicationIntent {
     fn from(value: PublicationIntent) -> Self {
         Self {
             slot: value.slot,
+            label: value.label,
             active: value.active,
         }
     }
@@ -547,6 +549,7 @@ impl From<model::PublicationIntent> for PublicationIntent {
     fn from(value: model::PublicationIntent) -> Self {
         Self {
             slot: value.slot,
+            label: value.label,
             active: value.active,
         }
     }
@@ -1075,6 +1078,7 @@ mod tests {
             connected: true,
             publications: vec![PublicationIntent {
                 slot: "camera".to_string(),
+                label: "camera".to_string(),
                 active: true,
             }],
             topic_publishers: vec![
@@ -1215,6 +1219,7 @@ mod tests {
         assert_ffi_round_trip(config());
         assert_ffi_round_trip(PublicationIntent {
             slot: "camera".to_string(),
+            label: "camera".to_string(),
             active: true,
         });
         assert_ffi_round_trip(VideoDemand {
@@ -1246,6 +1251,7 @@ mod tests {
             connected: true,
             publications: vec![PublicationIntent {
                 slot: "camera".to_string(),
+                label: "camera".to_string(),
                 active: true,
             }],
             video: vec![],

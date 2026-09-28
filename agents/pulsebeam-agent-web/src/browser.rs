@@ -103,6 +103,7 @@ struct DesiredConfig {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct PublicationConfig {
     slot: String,
+    label: String,
     active: bool,
 }
 
@@ -229,6 +230,7 @@ impl DesiredConfig {
                 .into_iter()
                 .map(|publication| PublicationIntent {
                     slot: publication.slot,
+                    label: publication.label,
                     active: publication.active,
                 })
                 .collect(),
