@@ -176,6 +176,8 @@ export interface AgentSnapshot {
   readonly connection: ConnectionState;
   readonly generation: number | null;
   readonly participantId: string | null;
+  /** Current authorization deadline, in Unix seconds. */
+  readonly authorizationExpiresAt: number | null;
   readonly participants: readonly Participant[];
   readonly publications: readonly Publication[];
   readonly video: readonly VideoBinding[];
@@ -287,6 +289,7 @@ export interface Agent {
   ): Promise<void>;
   setLocalMuted(slot: string, muted: boolean): Promise<void>;
   reconnect(): void;
+  renewAuthorization(token: string): void;
   sendTopic(name: string, mode: TopicMode, payload: Uint8Array): void;
   readonly getSnapshot: () => AgentSnapshot;
   readonly subscribe: (listener: () => void) => () => void;

@@ -491,6 +491,11 @@ impl BrowserRuntime {
         Ok(())
     }
 
+    pub fn renew_authorization(&self, token: String) -> Result<(), JsValue> {
+        self.inner.ensure_open()?;
+        self.inner.renew_authorization(token).map_err(js_error)
+    }
+
     pub async fn replace_local_track(
         &self,
         slot: String,
@@ -640,6 +645,14 @@ impl RuntimeInner {
             return Err("runtime actor not initialized".to_owned());
         };
         actor.send_public(PublicCommand::ReplaceDesired(desired))
+    }
+
+    fn renew_authorization(&self, token: String) -> Result<(), String> {
+        let actor = self.actor.borrow();
+        let Some(actor) = actor.as_ref() else {
+            return Err("runtime actor not initialized".to_owned());
+        };
+        actor.send_public(PublicCommand::RenewAuthorization(token))
     }
 
     fn replace_connection_desired(self: &Rc<Self>, connected: bool) -> Result<(), String> {
@@ -1826,6 +1839,11 @@ fn snapshot_value(snapshot: &agent_core::Snapshot) -> JsValue {
         snapshot.generation.map(Generation::get),
     );
     set(&value, "participantId", snapshot.participant_id.clone());
+    set(
+        &value,
+        "authorizationExpiresAt",
+        snapshot.authorization_expires_at,
+    );
     let participants = Array::new();
     for participant in snapshot.participants.values() {
         let item = Object::new();

@@ -103,10 +103,26 @@ pub(crate) trait Host {
     fn shutdown(&self);
 }
 
-#[derive(Debug)]
 pub(crate) enum PublicCommand {
     ReplaceDesired(DesiredState),
+    RenewAuthorization(String),
     SetConnected(bool),
+}
+
+impl fmt::Debug for PublicCommand {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ReplaceDesired(desired) => formatter
+                .debug_tuple("ReplaceDesired")
+                .field(desired)
+                .finish(),
+            Self::RenewAuthorization(_) => formatter.write_str("RenewAuthorization([REDACTED])"),
+            Self::SetConnected(connected) => formatter
+                .debug_tuple("SetConnected")
+                .field(connected)
+                .finish(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -346,6 +362,9 @@ impl<H: Host> Actor<H> {
         match message {
             Message::Public(command) => match command {
                 PublicCommand::ReplaceDesired(desired) => self.replace_desired(desired),
+                PublicCommand::RenewAuthorization(token) => {
+                    self.turn(Input::Command(AgentCommand::RenewAuthorization(token)));
+                }
                 PublicCommand::SetConnected(connected) => self.set_connected(connected),
             },
             Message::Topic(topic) => match topic {
