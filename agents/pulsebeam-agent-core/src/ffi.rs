@@ -83,6 +83,7 @@ pub struct PublicationIntent {
 pub struct VideoDemand {
     pub slot: u8,
     pub publication_id: String,
+    pub selector: Option<TrackSelector>,
     pub height: u32,
     pub min_height: u32,
     pub min_fps: u32,
@@ -93,13 +94,27 @@ pub struct VideoDemand {
 #[derive(Clone, Debug, Default, PartialEq, Eq, uniffi::Record)]
 pub struct AudioDemand {
     pub pinned: Vec<String>,
+    pub selected: Vec<TrackSelector>,
     pub automatic: bool,
     pub playout_delays: Vec<AudioTrackDelay>,
+    pub selector_delays: Vec<SelectorDelay>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct AudioTrackDelay {
     pub track_id: String,
+    pub playout_delay: PlayoutDelay,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct TrackSelector {
+    pub participant_external_id: String,
+    pub label: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct SelectorDelay {
+    pub selector: TrackSelector,
     pub playout_delay: PlayoutDelay,
 }
 
@@ -568,6 +583,7 @@ impl From<VideoDemand> for model::VideoSubscription {
         Self {
             slot: value.slot,
             track_id: value.publication_id,
+            selector: value.selector.map(Into::into),
             height: value.height,
             min_height: value.min_height,
             min_fps: value.min_fps,
@@ -582,6 +598,7 @@ impl From<model::VideoSubscription> for VideoDemand {
         Self {
             slot: value.slot,
             publication_id: value.track_id,
+            selector: value.selector.map(Into::into),
             height: value.height,
             min_height: value.min_height,
             min_fps: value.min_fps,
@@ -595,11 +612,17 @@ impl From<AudioDemand> for model::AudioSubscription {
     fn from(value: AudioDemand) -> Self {
         Self {
             pinned: value.pinned,
+            selected: value.selected.into_iter().map(Into::into).collect(),
             automatic: value.automatic,
             playout_delays: value
                 .playout_delays
                 .into_iter()
                 .map(|entry| (entry.track_id, entry.playout_delay.into()))
+                .collect(),
+            selector_delays: value
+                .selector_delays
+                .into_iter()
+                .map(|entry| (entry.selector.into(), entry.playout_delay.into()))
                 .collect(),
         }
     }
@@ -609,6 +632,7 @@ impl From<model::AudioSubscription> for AudioDemand {
     fn from(value: model::AudioSubscription) -> Self {
         Self {
             pinned: value.pinned,
+            selected: value.selected.into_iter().map(Into::into).collect(),
             automatic: value.automatic,
             playout_delays: value
                 .playout_delays
@@ -618,6 +642,32 @@ impl From<model::AudioSubscription> for AudioDemand {
                     playout_delay: playout_delay.into(),
                 })
                 .collect(),
+            selector_delays: value
+                .selector_delays
+                .into_iter()
+                .map(|(selector, playout_delay)| SelectorDelay {
+                    selector: selector.into(),
+                    playout_delay: playout_delay.into(),
+                })
+                .collect(),
+        }
+    }
+}
+
+impl From<TrackSelector> for model::TrackSelector {
+    fn from(value: TrackSelector) -> Self {
+        Self {
+            participant_external_id: value.participant_external_id,
+            label: value.label,
+        }
+    }
+}
+
+impl From<model::TrackSelector> for TrackSelector {
+    fn from(value: model::TrackSelector) -> Self {
+        Self {
+            participant_external_id: value.participant_external_id,
+            label: value.label,
         }
     }
 }
@@ -1069,6 +1119,7 @@ mod tests {
             video: vec![VideoDemand {
                 slot: 3,
                 publication_id: "participant/video".to_string(),
+                selector: None,
                 height: 720,
                 min_height: 180,
                 min_fps: 15,
@@ -1240,6 +1291,7 @@ mod tests {
         assert_ffi_round_trip(VideoDemand {
             slot: 1,
             publication_id: publication.id.clone(),
+            selector: None,
             height: 720,
             min_height: 180,
             min_fps: 15,
@@ -1249,8 +1301,18 @@ mod tests {
                 max_ms: 160,
             },
         });
+        let selector = TrackSelector {
+            participant_external_id: "web-sender".to_string(),
+            label: "camera".to_string(),
+        };
+        assert_ffi_round_trip(selector.clone());
+        assert_ffi_round_trip(SelectorDelay {
+            selector: selector.clone(),
+            playout_delay: PlayoutDelay::Adaptive,
+        });
         assert_ffi_round_trip(AudioDemand {
             pinned: vec![audio.publication_id.clone()],
+            selected: vec![selector.clone()],
             automatic: false,
             playout_delays: vec![AudioTrackDelay {
                 track_id: audio.publication_id.clone(),
@@ -1258,6 +1320,10 @@ mod tests {
                     min_ms: 0,
                     max_ms: 0,
                 },
+            }],
+            selector_delays: vec![SelectorDelay {
+                selector,
+                playout_delay: PlayoutDelay::Adaptive,
             }],
         });
         assert_ffi_round_trip(publisher.clone());

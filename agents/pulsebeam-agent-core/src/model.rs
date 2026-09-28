@@ -115,6 +115,7 @@ pub struct PublicationIntent {
 pub struct VideoSubscription {
     pub slot: u8,
     pub track_id: String,
+    pub selector: Option<TrackSelector>,
     pub height: u32,
     pub min_height: u32,
     pub min_fps: u32,
@@ -125,18 +126,28 @@ pub struct VideoSubscription {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AudioSubscription {
     pub pinned: Vec<String>,
+    pub selected: Vec<TrackSelector>,
     pub automatic: bool,
     pub playout_delays: BTreeMap<String, PlayoutDelay>,
+    pub selector_delays: BTreeMap<TrackSelector, PlayoutDelay>,
 }
 
 impl Default for AudioSubscription {
     fn default() -> Self {
         Self {
             pinned: Vec::new(),
+            selected: Vec::new(),
             automatic: true,
             playout_delays: BTreeMap::new(),
+            selector_delays: BTreeMap::new(),
         }
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct TrackSelector {
+    pub participant_external_id: String,
+    pub label: String,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -463,7 +474,16 @@ impl DesiredState {
         let mut video_slots = BTreeSet::new();
         let mut video_tracks = BTreeSet::new();
         for video in &self.video {
-            validate_identifier("video track_id", &video.track_id, 256, true)?;
+            if let Some(selector) = &video.selector {
+                if !video.track_id.is_empty() {
+                    return Err(ValidationError::Identifier {
+                        field: "video track_id with selector",
+                    });
+                }
+                selector.validate()?;
+            } else {
+                validate_identifier("video track_id", &video.track_id, 256, true)?;
+            }
             if video.slot >= topology.remote_video {
                 return Err(ValidationError::UnknownVideoSlot {
                     slot: video.slot,
@@ -476,7 +496,7 @@ impl DesiredState {
                     value: video.slot.to_string(),
                 });
             }
-            if !video_tracks.insert(video.track_id.clone()) {
+            if !video_tracks.insert((video.selector.as_ref(), video.track_id.as_str())) {
                 return Err(ValidationError::Duplicate {
                     field: "video track",
                     value: video.track_id.clone(),
@@ -493,13 +513,46 @@ impl DesiredState {
                 });
             }
         }
+        let mut selectors = BTreeSet::new();
+        for selector in &self.audio.selected {
+            selector.validate()?;
+            if !selectors.insert(selector) {
+                return Err(ValidationError::Duplicate {
+                    field: "audio selector",
+                    value: alloc::format!(
+                        "{}:{}",
+                        selector.participant_external_id,
+                        selector.label
+                    ),
+                });
+            }
+        }
         for track_id in self.audio.playout_delays.keys() {
             if !pins.contains(track_id) {
                 return Err(ValidationError::UnknownAudioTrack(track_id.clone()));
             }
         }
+        for selector in self.audio.selector_delays.keys() {
+            if !selectors.contains(selector) {
+                return Err(ValidationError::Identifier {
+                    field: "audio selector playout policy",
+                });
+            }
+        }
         self.topics.validate()?;
         Ok(())
+    }
+}
+
+impl TrackSelector {
+    fn validate(&self) -> Result<(), ValidationError> {
+        validate_identifier(
+            "participant external id",
+            &self.participant_external_id,
+            256,
+            true,
+        )?;
+        validate_identifier("track label", &self.label, 64, true)
     }
 }
 

@@ -2,7 +2,9 @@ use alloc::{collections::BTreeMap, vec::Vec};
 
 use pulsebeam_proto::signaling_v1 as wire;
 
-use crate::{DesiredState, MediaSlot, MediaTopology, PlayoutDelay, SlotBinding};
+use crate::{DesiredState, MediaKind, MediaSlot, MediaTopology, PlayoutDelay, SlotBinding};
+
+use crate::signaling_v1::CatalogState;
 
 pub(crate) const SIGNALING_LABEL: &str = "v1/sys/signaling";
 
@@ -20,10 +22,33 @@ pub enum SignalingError {
     Encode,
 }
 
+pub(crate) fn resolved_selectors(
+    desired: &DesiredState,
+    catalog: &CatalogState,
+) -> (
+    Vec<Option<alloc::string::String>>,
+    Vec<Option<alloc::string::String>>,
+) {
+    let video = desired
+        .video
+        .iter()
+        .filter_map(|video| video.selector.as_ref())
+        .map(|selector| catalog.resolve(selector, MediaKind::Video).map(Into::into))
+        .collect();
+    let audio = desired
+        .audio
+        .selected
+        .iter()
+        .map(|selector| catalog.resolve(selector, MediaKind::Audio).map(Into::into))
+        .collect();
+    (video, audio)
+}
+
 pub(crate) fn encode_v1_intent(
     desired: &DesiredState,
     topology: &MediaTopology,
     coordinates: &BTreeMap<MediaSlot, SlotBinding>,
+    catalog: &CatalogState,
     revision: u64,
 ) -> Result<Vec<u8>, SignalingError> {
     if revision == 0 {
@@ -69,30 +94,37 @@ pub(crate) fn encode_v1_intent(
     let video = desired
         .video
         .iter()
-        .map(|track| wire::VideoTrackIntent {
-            track_id: track.track_id.clone(),
-            options: Some(wire::VideoOptions {
-                height: track.height,
-                min_height: track.min_height,
-                min_fps: track.min_fps,
-                priority: track.priority,
-                playout_delay: encode_playout_delay(track.playout_delay),
-            }),
+        .filter_map(|track| {
+            let id = track.selector.as_ref().map_or_else(
+                || Some(track.track_id.as_str()),
+                |selector| catalog.resolve(selector, MediaKind::Video),
+            )?;
+            Some(wire::VideoTrackIntent {
+                track_id: id.into(),
+                options: Some(wire::VideoOptions {
+                    height: track.height,
+                    min_height: track.min_height,
+                    min_fps: track.min_fps,
+                    priority: track.priority,
+                    playout_delay: encode_playout_delay(track.playout_delay),
+                }),
+            })
         })
         .collect();
     let audio = desired
         .audio
         .pinned
         .iter()
-        .map(|id| wire::AudioTrackIntent {
-            track_id: id.clone(),
+        .map(|id| (id.as_str(), desired.audio.playout_delays.get(id).copied()))
+        .chain(desired.audio.selected.iter().filter_map(|selector| {
+            catalog
+                .resolve(selector, MediaKind::Audio)
+                .map(|id| (id, desired.audio.selector_delays.get(selector).copied()))
+        }))
+        .map(|(id, delay)| wire::AudioTrackIntent {
+            track_id: id.into(),
             options: Some(wire::AudioOptions {
-                playout_delay: desired
-                    .audio
-                    .playout_delays
-                    .get(id)
-                    .copied()
-                    .and_then(encode_playout_delay),
+                playout_delay: delay.and_then(encode_playout_delay),
             }),
         })
         .collect();
@@ -169,6 +201,7 @@ mod tests {
             video: alloc::vec![VideoSubscription {
                 slot: 0,
                 track_id: "opaque-remote-id".into(),
+                selector: None,
                 height: 360,
                 min_height: 720,
                 min_fps: 15,
@@ -180,7 +213,14 @@ mod tests {
             }],
             ..DesiredState::default()
         };
-        let encoded = encode_v1_intent(&desired, &topology, &coordinates, 5).unwrap();
+        let encoded = encode_v1_intent(
+            &desired,
+            &topology,
+            &coordinates,
+            &CatalogState::default(),
+            5,
+        )
+        .unwrap();
         let decoded = pulsebeam_proto::codec::decode_client(&encoded).unwrap();
         let Some(wire::client_message::Payload::Intent(intent)) = decoded.payload else {
             panic!("expected compressed v1 intent")
@@ -221,6 +261,7 @@ mod tests {
                 VideoSubscription {
                     slot: 0,
                     track_id: "fixed-video".into(),
+                    selector: None,
                     height: 720,
                     min_height: 0,
                     min_fps: 0,
@@ -233,6 +274,7 @@ mod tests {
                 VideoSubscription {
                     slot: 1,
                     track_id: "default-video".into(),
+                    selector: None,
                     height: 360,
                     min_height: 0,
                     min_fps: 0,
@@ -242,6 +284,7 @@ mod tests {
             ],
             audio: crate::AudioSubscription {
                 pinned: alloc::vec!["default-audio".into(), "fixed-audio".into()],
+                selected: Vec::new(),
                 automatic: true,
                 playout_delays: BTreeMap::from([(
                     "fixed-audio".into(),
@@ -250,10 +293,18 @@ mod tests {
                         max_ms: 500,
                     },
                 )]),
+                selector_delays: BTreeMap::new(),
             },
             ..DesiredState::default()
         };
-        let encoded = encode_v1_intent(&desired, &topology, &BTreeMap::new(), 1).unwrap();
+        let encoded = encode_v1_intent(
+            &desired,
+            &topology,
+            &BTreeMap::new(),
+            &CatalogState::default(),
+            1,
+        )
+        .unwrap();
         let decoded = pulsebeam_proto::codec::decode_client(&encoded).unwrap();
         let Some(wire::client_message::Payload::Intent(intent)) = decoded.payload else {
             panic!("expected intent");

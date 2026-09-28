@@ -217,6 +217,7 @@ fn desired(revision: u64) -> DesiredState {
         video: vec![VideoSubscription {
             slot: 0,
             track_id: "video-track".to_string(),
+            selector: None,
             height: 720,
             min_height: 180,
             min_fps: 15,
@@ -225,8 +226,10 @@ fn desired(revision: u64) -> DesiredState {
         }],
         audio: AudioSubscription {
             pinned: vec!["audio-track".to_string()],
+            selected: Vec::new(),
             automatic: true,
             playout_delays: BTreeMap::new(),
+            selector_delays: BTreeMap::new(),
         },
         topics: TopicRegistrations::default(),
     }
@@ -1518,6 +1521,158 @@ fn signaling_snapshot_diff_and_empty_binding_groups_are_exact() {
         .unwrap();
     assert!(agent.snapshot().participants.is_empty());
     assert!(agent.snapshot().publications.is_empty());
+}
+
+#[test]
+fn catalog_selectors_remain_unresolved_then_follow_canonical_track_changes() {
+    let mut selected = desired(1);
+    selected.video[0].track_id.clear();
+    selected.video[0].selector = Some(TrackSelector {
+        participant_external_id: "remote-user".to_string(),
+        label: "camera".to_string(),
+    });
+    selected.audio.pinned.clear();
+    let audio_selector = TrackSelector {
+        participant_external_id: "remote-user".to_string(),
+        label: "microphone".to_string(),
+    };
+    selected.audio.selected.push(audio_selector.clone());
+    selected.audio.selector_delays.insert(
+        audio_selector,
+        PlayoutDelay::Fixed {
+            min_ms: 0,
+            max_ms: 0,
+        },
+    );
+    let mut agent = Agent::new(config()).unwrap();
+    let cid = channel(9);
+    let (generation, operation) = begin_connect(&mut agent, selected, cid);
+    let send = finish_connect(&mut agent, generation, operation, cid);
+    acknowledge_send(&mut agent, generation, cid, send);
+
+    let deliver = |agent: &mut Agent, catalog: v1::Catalog| {
+        agent
+            .handle(HostEvent::DataChannel(DataChannelEvent::Message {
+                generation,
+                channel: cid,
+                payload: server_payload(server_message::Payload::Catalog(catalog)),
+            }))
+            .unwrap();
+    };
+    deliver(
+        &mut agent,
+        v1::Catalog {
+            revision: 1,
+            state: Some(v1::catalog::State::Snapshot(v1::CatalogSnapshot {
+                participants: vec![v1::Participant {
+                    participant_id: "remote".to_string(),
+                    participant_external_id: "remote-user".to_string(),
+                }],
+                tracks: vec![],
+            })),
+        },
+    );
+    assert!(agent.next_effect().is_none());
+
+    deliver(
+        &mut agent,
+        v1::Catalog {
+            revision: 2,
+            state: Some(v1::catalog::State::Delta(v1::CatalogDelta {
+                added_tracks: vec![
+                    v1::RemoteTrack {
+                        track_id: "video-one".to_string(),
+                        participant_id: "remote".to_string(),
+                        kind: v1::TrackKind::Video.into(),
+                        label: "camera".to_string(),
+                    },
+                    v1::RemoteTrack {
+                        track_id: "audio-one".to_string(),
+                        participant_id: "remote".to_string(),
+                        kind: v1::TrackKind::Audio.into(),
+                        label: "microphone".to_string(),
+                    },
+                ],
+                ..Default::default()
+            })),
+        },
+    );
+    let Effect::DataChannel(DataChannelEffect::Send {
+        operation, payload, ..
+    }) = next_effect(&mut agent)
+    else {
+        panic!("expected resolved intent");
+    };
+    let receive = decode_intent(&payload).receive.unwrap();
+    assert_eq!(receive.video.unwrap().tracks[0].track_id, "video-one");
+    let audio = receive.audio.unwrap().tracks;
+    assert_eq!(audio[0].track_id, "audio-one");
+    let delay = audio[0]
+        .options
+        .as_ref()
+        .unwrap()
+        .playout_delay
+        .as_ref()
+        .unwrap();
+    assert_eq!((delay.min_ms, delay.max_ms), (0, 0));
+    acknowledge_send(&mut agent, generation, cid, operation);
+
+    deliver(
+        &mut agent,
+        v1::Catalog {
+            revision: 3,
+            state: Some(v1::catalog::State::Delta(v1::CatalogDelta {
+                removed_track_ids: vec!["video-one".to_string()],
+                ..Default::default()
+            })),
+        },
+    );
+    let Effect::DataChannel(DataChannelEffect::Send {
+        operation, payload, ..
+    }) = next_effect(&mut agent)
+    else {
+        panic!("expected cleared video intent");
+    };
+    assert!(
+        decode_intent(&payload)
+            .receive
+            .unwrap()
+            .video
+            .unwrap()
+            .tracks
+            .is_empty()
+    );
+    acknowledge_send(&mut agent, generation, cid, operation);
+
+    deliver(
+        &mut agent,
+        v1::Catalog {
+            revision: 4,
+            state: Some(v1::catalog::State::Delta(v1::CatalogDelta {
+                added_tracks: vec![v1::RemoteTrack {
+                    track_id: "video-two".to_string(),
+                    participant_id: "remote".to_string(),
+                    kind: v1::TrackKind::Video.into(),
+                    label: "camera".to_string(),
+                }],
+                ..Default::default()
+            })),
+        },
+    );
+    let Effect::DataChannel(DataChannelEffect::Send { payload, .. }) = next_effect(&mut agent)
+    else {
+        panic!("expected re-resolved video intent");
+    };
+    assert_eq!(
+        decode_intent(&payload)
+            .receive
+            .unwrap()
+            .video
+            .unwrap()
+            .tracks[0]
+            .track_id,
+        "video-two"
+    );
 }
 
 #[test]

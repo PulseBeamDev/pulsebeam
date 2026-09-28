@@ -108,7 +108,7 @@
     video: [
       {
         slot: 0,
-        trackId: publication.id,
+        selector: { participantExternalId: "web-sender", label: "camera" },
         height: 180,
         minHeight: 1,
         minFps: 1,

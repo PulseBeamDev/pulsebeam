@@ -804,6 +804,8 @@ impl Agent {
                 if active.signaling_terminal {
                     return Ok(());
                 }
+                let resolved_before =
+                    signaling::resolved_selectors(&self.desired, &active.observed);
                 let output = signaling_v1::decode_and_apply(
                     &payload,
                     &mut active.observed,
@@ -849,6 +851,12 @@ impl Agent {
                             self.snapshot.video.len(),
                             self.snapshot.audio.len(),
                         );
+                        if resolved_before
+                            != signaling::resolved_selectors(&self.desired, &active.observed)
+                        {
+                            self.intent_dirty = true;
+                            self.send_intent_if_ready();
+                        }
                     }
                     ServerOutput::Authorization(expires_at) => {
                         if active.pending_renewal.is_some()
@@ -1234,6 +1242,7 @@ impl Agent {
             &self.desired,
             &self.config.topology,
             &active.coordinates,
+            &active.observed,
             revision,
         ) {
             Ok(payload) => payload,

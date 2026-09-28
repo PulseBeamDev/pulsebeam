@@ -98,6 +98,7 @@ function validatePlayoutDelay(state: AgentState): void {
   const delays = [
     ...(state.video ?? []).map((demand) => demand.playoutDelay),
     ...(state.audio?.playoutDelays ?? []).map((entry) => entry.playoutDelay),
+    ...(state.audio?.selectorDelays ?? []).map((entry) => entry.playoutDelay),
   ];
   for (const delay of delays) {
     if (delay === undefined) continue;
@@ -126,22 +127,45 @@ function copyState(state: AgentState): AgentState {
       ),
     ),
     video: Object.freeze(
-      (state.video ?? []).map((demand) =>
-        Object.freeze({
-          ...demand,
+      (state.video ?? []).map((demand) => {
+        const fields = {
+          slot: demand.slot,
+          height: demand.height,
+          minHeight: demand.minHeight,
+          minFps: demand.minFps,
+          priority: demand.priority,
           playoutDelay: demand.playoutDelay
             ? Object.freeze({ ...demand.playoutDelay })
             : undefined,
-        }),
-      ),
+        };
+        return demand.selector
+          ? Object.freeze({
+              ...fields,
+              selector: Object.freeze({ ...demand.selector }),
+            })
+          : Object.freeze({ ...fields, trackId: demand.trackId! });
+      }),
     ),
     audio: Object.freeze({
       pinned: Object.freeze([...(state.audio?.pinned ?? [])]),
+      selected: Object.freeze(
+        (state.audio?.selected ?? []).map((selector) =>
+          Object.freeze({ ...selector }),
+        ),
+      ),
       automatic: state.audio?.automatic ?? true,
       playoutDelays: Object.freeze(
         (state.audio?.playoutDelays ?? []).map((entry) =>
           Object.freeze({
             trackId: entry.trackId,
+            playoutDelay: Object.freeze({ ...entry.playoutDelay }),
+          }),
+        ),
+      ),
+      selectorDelays: Object.freeze(
+        (state.audio?.selectorDelays ?? []).map((entry) =>
+          Object.freeze({
+            selector: Object.freeze({ ...entry.selector }),
             playoutDelay: Object.freeze({ ...entry.playoutDelay }),
           }),
         ),

@@ -11,7 +11,8 @@ use agent_core::{
     HttpMethod, HttpResponse, MediaKind, MediaSlot, MediaTopology, Notification, OfferResources,
     OperationId, PlayoutDelay, PublicationIntent, RetryPolicy, RtcEffect, RtcEvent, TimerEffect,
     TimerEvent, TopicChannel, TopicDropReason, TopicMessage, TopicMode, TopicNotification,
-    TopicPublisher, TopicRegistrations, TopicSend, TopicSubscriber, VideoSubscription,
+    TopicPublisher, TopicRegistrations, TopicSend, TopicSubscriber, TrackSelector,
+    VideoSubscription,
 };
 use futures_channel::oneshot;
 use js_sys::{Array, Function, Object, Reflect, Uint8Array};
@@ -124,7 +125,9 @@ struct PublicationConfig {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct VideoSubscriptionConfig {
     slot: u8,
+    #[serde(default)]
     track_id: String,
+    selector: Option<TrackSelectorConfig>,
     height: u32,
     min_height: u32,
     min_fps: u32,
@@ -138,10 +141,37 @@ struct VideoSubscriptionConfig {
 struct AudioSubscriptionConfig {
     #[serde(default)]
     pinned: Vec<String>,
+    #[serde(default)]
+    selected: Vec<TrackSelectorConfig>,
     #[serde(default = "default_true")]
     automatic: bool,
     #[serde(default)]
     playout_delays: Vec<AudioTrackDelayConfig>,
+    #[serde(default)]
+    selector_delays: Vec<SelectorDelayConfig>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct TrackSelectorConfig {
+    participant_external_id: String,
+    label: String,
+}
+
+impl From<TrackSelectorConfig> for TrackSelector {
+    fn from(value: TrackSelectorConfig) -> Self {
+        Self {
+            participant_external_id: value.participant_external_id,
+            label: value.label,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SelectorDelayConfig {
+    selector: TrackSelectorConfig,
+    playout_delay: PlayoutDelayConfig,
 }
 
 #[derive(Deserialize)]
@@ -155,8 +185,10 @@ impl Default for AudioSubscriptionConfig {
     fn default() -> Self {
         Self {
             pinned: Vec::new(),
+            selected: Vec::new(),
             automatic: true,
             playout_delays: Vec::new(),
+            selector_delays: Vec::new(),
         }
     }
 }
@@ -253,6 +285,7 @@ impl DesiredConfig {
                 .map(|video| VideoSubscription {
                     slot: video.slot,
                     track_id: video.track_id,
+                    selector: video.selector.map(Into::into),
                     height: video.height,
                     min_height: video.min_height,
                     min_fps: video.min_fps,
@@ -262,12 +295,19 @@ impl DesiredConfig {
                 .collect(),
             audio: AudioSubscription {
                 pinned: self.audio.pinned,
+                selected: self.audio.selected.into_iter().map(Into::into).collect(),
                 automatic: self.audio.automatic,
                 playout_delays: self
                     .audio
                     .playout_delays
                     .into_iter()
                     .map(|entry| (entry.track_id, entry.playout_delay.into()))
+                    .collect(),
+                selector_delays: self
+                    .audio
+                    .selector_delays
+                    .into_iter()
+                    .map(|entry| (entry.selector.into(), entry.playout_delay.into()))
                     .collect(),
             },
             topics: topic_registrations(&self.topics),
