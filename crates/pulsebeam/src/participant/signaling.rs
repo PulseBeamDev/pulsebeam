@@ -84,6 +84,7 @@ fn audio_shape(items: &[signaling::AudioBinding]) -> Vec<(String, String)> {
 
 pub struct Signaling {
     ctx: LogCtx,
+    self_external_id: crate::entity::ParticipantExternalId,
     pub cid: Option<ChannelId>,
     slot_count: usize,
     audio_slot_count: usize,
@@ -98,6 +99,7 @@ pub struct Signaling {
     /// are sent whole, so only their shape is kept, to skip an unchanged group.
     previous_participants: HashSet<String>,
     participants: HashSet<String>,
+    external_participants: HashMap<String, crate::entity::ParticipantExternalId>,
     previous_publications: HashSet<String>,
     previous_video: Vec<signaling::VideoBinding>,
     previous_audio: Vec<(String, String)>,
@@ -109,15 +111,17 @@ pub struct Signaling {
 }
 
 impl Signaling {
-    pub(crate) fn new(ctx: LogCtx) -> Self {
+    pub(crate) fn new(ctx: LogCtx, self_external_id: crate::entity::ParticipantExternalId) -> Self {
         Self {
             ctx,
+            self_external_id,
             cid: None,
             dirty_roster: true,
             dirty_bindings: true,
             full_state_retries: 0,
             previous_participants: HashSet::new(),
             participants: HashSet::new(),
+            external_participants: HashMap::new(),
             previous_publications: HashSet::new(),
             previous_video: Vec::new(),
             previous_audio: Vec::new(),
@@ -283,14 +287,20 @@ impl Signaling {
 
     pub fn apply_participants(
         &mut self,
-        added: impl IntoIterator<Item = crate::entity::ParticipantId>,
+        added: impl IntoIterator<Item = super::effect::RoomPeer>,
         removed: impl IntoIterator<Item = crate::entity::ParticipantId>,
     ) {
-        for participant in added {
-            self.participants.insert(participant.as_str());
+        for peer in added {
+            let id = peer.id.as_str();
+            self.participants.insert(id.clone());
+            if let Some(external_id) = peer.external_id {
+                self.external_participants.insert(id, external_id);
+            }
         }
         for participant in removed {
-            self.participants.remove(&participant.as_str());
+            let id = participant.as_str();
+            self.participants.remove(&id);
+            self.external_participants.remove(&id);
         }
         self.dirty_roster = true;
         self.full_state_retries = 2;
@@ -552,7 +562,10 @@ mod tests {
             participant_id: crate::entity::ParticipantId::new(),
         };
         let track_id = crate::entity::VideoTrackId::derive(&ctx.participant_id, "camera");
-        let mut signaling = Signaling::new(ctx);
+        let mut signaling = Signaling::new(
+            ctx,
+            crate::entity::ParticipantExternalId::new("self").unwrap(),
+        );
         signaling.apply_client_intent(signaling::ClientIntent {
             video: vec![signaling::VideoIntent {
                 mid: "v0".to_owned(),
@@ -571,13 +584,46 @@ mod tests {
     }
 
     #[test]
+    fn roster_keeps_external_identity_across_join_and_leave() {
+        let room = crate::entity::RoomExternalId::new("room").unwrap();
+        let ctx = LogCtx {
+            room_id: crate::entity::RoomId::from_external(&room),
+            participant_id: crate::entity::ParticipantId::new(),
+        };
+        let mut signaling = Signaling::new(
+            ctx,
+            crate::entity::ParticipantExternalId::new("self").unwrap(),
+        );
+        let peer = crate::entity::ParticipantId::new();
+        let external_id = crate::entity::ParticipantExternalId::new("alice").unwrap();
+        signaling.apply_participants(
+            [crate::participant::effect::RoomPeer {
+                id: peer,
+                external_id: Some(external_id),
+            }],
+            [],
+        );
+        assert_eq!(signaling.self_external_id.as_str(), "self");
+        assert_eq!(
+            signaling.external_participants[&peer.as_str()].as_str(),
+            "alice"
+        );
+        signaling.apply_participants([], [peer]);
+        assert!(signaling.external_participants.is_empty());
+        assert!(signaling.participants.is_empty());
+    }
+
+    #[test]
     fn snapshots_are_requested_only_while_signaling_can_emit() {
         let room = crate::entity::RoomExternalId::new("room").expect("valid room");
         let ctx = LogCtx {
             room_id: crate::entity::RoomId::from_external(&room),
             participant_id: crate::entity::ParticipantId::new(),
         };
-        let mut signaling = Signaling::new(ctx);
+        let mut signaling = Signaling::new(
+            ctx,
+            crate::entity::ParticipantExternalId::new("self").unwrap(),
+        );
         let snapshot = SignalingSnapshot {
             publications: Vec::new(),
             participants: HashSet::new(),
