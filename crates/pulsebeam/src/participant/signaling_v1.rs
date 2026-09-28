@@ -81,6 +81,84 @@ impl SenderBindings {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IntentError {
+    VideoReceiverCapacity,
+    SendBinding(SendBindingError),
+}
+
+#[derive(Default)]
+pub(crate) struct IntentState {
+    revision: u64,
+    senders: SenderBindings,
+    receive: Option<pulsebeam_proto::signaling_v1::ReceiveIntent>,
+}
+
+pub(crate) enum IntentDecision {
+    Replay,
+    Accept(IntentPlan),
+}
+
+pub(crate) struct IntentPlan {
+    revision: u64,
+    send: SendPlan,
+    receive: Option<pulsebeam_proto::signaling_v1::ReceiveIntent>,
+}
+
+impl IntentState {
+    pub(crate) fn plan(
+        &self,
+        intent: &pulsebeam_proto::signaling_v1::Intent,
+        negotiated_senders: &HashMap<u32, TrackKind>,
+        video_receiver_capacity: usize,
+    ) -> Result<IntentDecision, IntentError> {
+        if intent.revision == 0 || intent.revision <= self.revision {
+            return Ok(IntentDecision::Replay);
+        }
+        let mut distinct_video = HashSet::new();
+        for track in intent
+            .receive
+            .as_ref()
+            .and_then(|receive| receive.video.as_ref())
+            .into_iter()
+            .flat_map(|video| &video.tracks)
+        {
+            if !track.track_id.is_empty() && track.track_id.len() <= 128 {
+                distinct_video.insert(&track.track_id);
+            }
+        }
+        if distinct_video.len() > video_receiver_capacity {
+            return Err(IntentError::VideoReceiverCapacity);
+        }
+        let send = self
+            .senders
+            .plan(intent.send.as_ref(), negotiated_senders)
+            .map_err(IntentError::SendBinding)?;
+        Ok(IntentDecision::Accept(IntentPlan {
+            revision: intent.revision,
+            send,
+            receive: intent.receive.clone(),
+        }))
+    }
+
+    pub(crate) fn commit(
+        &mut self,
+        decision: IntentPlan,
+    ) -> (
+        Vec<LocalTrack>,
+        Option<pulsebeam_proto::signaling_v1::ReceiveIntent>,
+    ) {
+        self.revision = decision.revision;
+        self.receive = decision.receive;
+        let published = self.senders.commit(decision.send);
+        (published, self.receive.clone())
+    }
+
+    pub(crate) fn revision(&self) -> u64 {
+        self.revision
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CatalogError {
     MissingIdentity,
     DuplicateIdentity,
@@ -330,6 +408,85 @@ mod tests {
         meta.id = publisher.derive_track_id(TrackKind::Audio, label);
         meta.label = Some(label.to_owned());
         meta.clone()
+    }
+
+    #[test]
+    fn intent_revisions_replay_mapping_without_changing_accepted_state() {
+        use pulsebeam_proto::signaling_v1::Intent;
+        let mut state = IntentState::default();
+        let initial = Intent {
+            revision: 2,
+            send: Some(SendIntent {
+                tracks: vec![track(0, WireTrackKind::Audio, "mic")],
+            }),
+            ..Default::default()
+        };
+        let IntentDecision::Accept(plan) = state.plan(&initial, &media(), 0).unwrap() else {
+            panic!("fresh revision must be accepted");
+        };
+        assert_eq!(state.commit(plan).0.len(), 1);
+        assert_eq!(state.revision(), 2);
+        let conflicting = Intent {
+            revision: 2,
+            send: Some(SendIntent {
+                tracks: vec![track(0, WireTrackKind::Audio, "different")],
+            }),
+            ..Default::default()
+        };
+        assert!(matches!(
+            state.plan(&conflicting, &media(), 0),
+            Ok(IntentDecision::Replay)
+        ));
+        assert!(matches!(
+            state.plan(
+                &Intent {
+                    revision: 0,
+                    ..Default::default()
+                },
+                &media(),
+                0
+            ),
+            Ok(IntentDecision::Replay)
+        ));
+        assert_eq!(state.revision(), 2);
+    }
+
+    #[test]
+    fn video_capacity_error_is_fatal_and_does_not_bind_senders() {
+        use pulsebeam_proto::signaling_v1::{Intent, ReceiveIntent, VideoIntent, VideoTrackIntent};
+        let mut state = IntentState::default();
+        let invalid = Intent {
+            revision: 1,
+            send: Some(SendIntent {
+                tracks: vec![track(0, WireTrackKind::Audio, "mic")],
+            }),
+            receive: Some(ReceiveIntent {
+                video: Some(VideoIntent {
+                    tracks: ["first", "first", "second"]
+                        .into_iter()
+                        .map(|track_id| VideoTrackIntent {
+                            track_id: track_id.to_owned(),
+                            ..Default::default()
+                        })
+                        .collect(),
+                }),
+                ..Default::default()
+            }),
+        };
+        assert!(matches!(
+            state.plan(&invalid, &media(), 1),
+            Err(IntentError::VideoReceiverCapacity)
+        ));
+        assert_eq!(state.revision(), 0);
+        let valid = Intent {
+            revision: 2,
+            receive: None,
+            ..invalid
+        };
+        let IntentDecision::Accept(plan) = state.plan(&valid, &media(), 1).unwrap() else {
+            panic!("failed candidate must not reserve sender labels");
+        };
+        assert_eq!(state.commit(plan).0.len(), 1);
     }
 
     #[test]
