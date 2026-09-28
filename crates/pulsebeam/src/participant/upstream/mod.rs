@@ -2,6 +2,9 @@ mod audio;
 mod data;
 mod video;
 
+#[cfg(test)]
+mod binding_tests;
+
 use crate::keys::TrackHandle;
 use crate::{
     entity::{TrackId, TrackKind},
@@ -103,12 +106,22 @@ impl UpstreamRouteTable {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code, reason = "reported by the native v1 publish-intent path")]
+pub(crate) enum SenderLabelError {
+    UnknownSender,
+    AlreadyBound,
+    AlreadyPublished,
+    DuplicateLabel,
+}
+
 pub(crate) struct UpstreamSlot {
     media_index: u32,
     mid: Mid,
     track: UpstreamTrack,
     descriptor: crate::track::Track,
     in_topology: bool,
+    published_once: bool,
 }
 
 pub(crate) struct UpstreamMedia {
@@ -150,6 +163,7 @@ impl UpstreamMedia {
             track,
             descriptor,
             in_topology: false,
+            published_once: false,
         });
         true
     }
@@ -165,6 +179,43 @@ impl UpstreamMedia {
             .iter()
             .find(|slot| slot.media_index == media_index)
             .map(|slot| slot.track.meta.id)
+    }
+
+    fn bind_sender_label(
+        &mut self,
+        media_index: u32,
+        label: &str,
+    ) -> Result<(TrackId, TrackId), SenderLabelError> {
+        let slot_index = self
+            .published_tracks
+            .iter()
+            .position(|slot| slot.media_index == media_index)
+            .ok_or(SenderLabelError::UnknownSender)?;
+        let slot = &self.published_tracks[slot_index];
+        if let Some(bound) = &slot.track.meta.label {
+            return (bound == label)
+                .then_some((slot.track.meta.id, slot.track.meta.id))
+                .ok_or(SenderLabelError::AlreadyBound);
+        }
+        if slot.published_once {
+            return Err(SenderLabelError::AlreadyPublished);
+        }
+        let id = slot.track.meta.origin.derive_track_id(self.kind, label);
+        if self
+            .published_tracks
+            .iter()
+            .enumerate()
+            .any(|(index, other)| index != slot_index && other.track.meta.id == id)
+        {
+            return Err(SenderLabelError::DuplicateLabel);
+        }
+        let slot = &mut self.published_tracks[slot_index];
+        let previous = slot.track.meta.id;
+        slot.track.meta.id = id;
+        slot.track.meta.label = Some(label.to_owned());
+        slot.descriptor.meta_mut().id = id;
+        slot.descriptor.meta_mut().label = Some(label.to_owned());
+        Ok((previous, id))
     }
     fn handle_incoming_rtp(
         &mut self,
@@ -197,8 +248,15 @@ impl UpstreamMedia {
         rtp.ext_vals.rid = rid.cloned();
         slot.track.process(rid, rtp, sr)
     }
-    fn announce_state_mut(&mut self, mid: Mid) -> Option<(&crate::track::Track, &mut bool)> {
+    fn announce_state_mut(
+        &mut self,
+        mid: Mid,
+        active: bool,
+    ) -> Option<(&crate::track::Track, &mut bool)> {
         let slot = self.published_tracks.iter_mut().find(|s| s.mid == mid)?;
+        if active {
+            slot.published_once = true;
+        }
         Some((&slot.descriptor, &mut slot.in_topology))
     }
     fn mid_for_track_id(&self, track_id: TrackId) -> Option<Mid> {
@@ -257,6 +315,26 @@ impl Upstream {
             .track_for_sender_index(media_index)
             .or_else(|| self.video.track_for_sender_index(media_index))
     }
+
+    #[allow(dead_code, reason = "called by the native v1 publish-intent path")]
+    pub(crate) fn bind_sender_label(
+        &mut self,
+        media_index: u32,
+        kind: TrackKind,
+        label: &str,
+    ) -> Result<TrackId, SenderLabelError> {
+        let (previous, id) = match kind {
+            TrackKind::Audio => self.audio.bind_sender_label(media_index, label),
+            TrackKind::Video => self.video.bind_sender_label(media_index, label),
+            TrackKind::Data => return Err(SenderLabelError::UnknownSender),
+        }?;
+        // A sender can receive RTP before its intent. Its cached route still
+        // carries the provisional MID-derived identity until rebuilt.
+        if previous != id {
+            self.routes.clear();
+        }
+        Ok(id)
+    }
     pub fn slot_for_mid(&self, mid: Mid) -> Option<(UpstreamSlotKey, TrackId)> {
         self.audio
             .slot_for_mid(mid)
@@ -284,10 +362,14 @@ impl Upstream {
             }
         }
     }
-    pub fn announce_state_mut(&mut self, mid: Mid) -> Option<(&crate::track::Track, &mut bool)> {
+    pub fn announce_state_mut(
+        &mut self,
+        mid: Mid,
+        active: bool,
+    ) -> Option<(&crate::track::Track, &mut bool)> {
         self.audio
-            .announce_state_mut(mid)
-            .or_else(|| self.video.announce_state_mut(mid))
+            .announce_state_mut(mid, active)
+            .or_else(|| self.video.announce_state_mut(mid, active))
     }
     pub fn mid_for_track_id(&self, track_id: TrackId) -> Option<Mid> {
         self.audio

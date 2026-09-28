@@ -984,7 +984,8 @@ impl Participant {
         events: &mut impl ParticipantSink,
     ) {
         if active {
-            let Some((descriptor, in_topology)) = self.upstream.announce_state_mut(mid) else {
+            let Some((descriptor, in_topology)) = self.upstream.announce_state_mut(mid, true)
+            else {
                 return;
             };
             if *in_topology {
@@ -996,7 +997,7 @@ impl Participant {
             return;
         }
 
-        let Some((descriptor, in_topology)) = self.upstream.announce_state_mut(mid) else {
+        let Some((descriptor, in_topology)) = self.upstream.announce_state_mut(mid, false) else {
             return;
         };
         if !*in_topology {
