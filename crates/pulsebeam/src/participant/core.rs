@@ -865,6 +865,7 @@ impl Participant {
                                             .participant_id
                                             .derive_track_id(TrackKind::Data, &label),
                                         origin: self.participant_id,
+                                        label: Some(label),
                                     },
                                     channel.topic,
                                     channel.lane,
@@ -1030,12 +1031,16 @@ impl Participant {
                     MediaKind::Audio => TrackKind::Audio,
                     MediaKind::Video => TrackKind::Video,
                 };
-                let track_id = self.participant_id.derive_track_id(kind, &media.mid);
+                let label = whip_media_label(self.profile, media.kind);
+                let track_id = self
+                    .participant_id
+                    .derive_track_id(kind, label.unwrap_or(&media.mid));
                 let track_meta = track::TrackMeta {
                     room_id: self.room_id,
                     shard_id: self.shard_id,
                     id: track_id,
                     origin: self.participant_id,
+                    label: label.map(str::to_owned),
                 };
                 match media.kind {
                     MediaKind::Audio => {
@@ -1187,9 +1192,34 @@ impl Participant {
     }
 }
 
+fn whip_media_label(profile: ConnectionProfile, kind: MediaKind) -> Option<&'static str> {
+    match (profile, kind) {
+        (ConnectionProfile::Whip, MediaKind::Audio) => Some("audio"),
+        (ConnectionProfile::Whip, MediaKind::Video) => Some("video"),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod rtc_clock_tests {
     use super::*;
+
+    #[test]
+    fn whip_uses_fixed_track_labels_independent_of_mid() {
+        let participant = entity::ParticipantId::new();
+        for (kind, track_kind, expected) in [
+            (MediaKind::Audio, TrackKind::Audio, "audio"),
+            (MediaKind::Video, TrackKind::Video, "video"),
+        ] {
+            let label = whip_media_label(ConnectionProfile::Whip, kind).unwrap();
+            assert_eq!(label, expected);
+            assert_eq!(
+                participant.derive_track_id(track_kind, label),
+                participant.derive_track_id(track_kind, expected)
+            );
+            assert!(whip_media_label(ConnectionProfile::Native, kind).is_none());
+        }
+    }
 
     #[test]
     fn sub_quantum_deadlines_do_not_accumulate_clock_lag() {

@@ -133,8 +133,12 @@ impl UpstreamMedia {
         descriptor: crate::track::Track,
     ) -> bool {
         debug_assert_eq!(track.meta.id.kind(), self.kind);
-        if self.published_tracks.iter().any(|s| s.mid == mid) {
-            plog_warn!(self.ctx, "duplicated slot mid={}.", mid);
+        if self
+            .published_tracks
+            .iter()
+            .any(|s| s.mid == mid || s.track.meta.id == track.meta.id)
+        {
+            plog_warn!(self.ctx, "duplicated publisher slot mid={}.", mid);
             return false;
         }
         if self.published_tracks.len() >= MAX_UPSTREAM_SLOT_PER_TYPE {

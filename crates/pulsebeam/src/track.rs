@@ -109,6 +109,8 @@ pub struct TrackMeta {
     pub shard_id: ShardId,
     pub id: crate::entity::TrackId,
     pub origin: crate::entity::ParticipantId,
+    /// Application-facing media identity. Pending native senders have no label.
+    pub label: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -930,6 +932,7 @@ pub mod test_utils {
     ) -> (UpstreamTrack, Track) {
         let track_id = participant_id.derive_track_id(TrackKind::Video, &mid);
         let meta = TrackMeta {
+            label: None,
             room_id: crate::entity::RoomId::from_external(
                 &crate::entity::RoomExternalId::new("test-room").unwrap(),
             ),
@@ -943,6 +946,7 @@ pub mod test_utils {
     pub fn make_audio_track(participant_id: ParticipantId, mid: Mid) -> (UpstreamTrack, Track) {
         let track_id = participant_id.derive_track_id(TrackKind::Audio, &mid);
         let meta = TrackMeta {
+            label: None,
             room_id: crate::entity::RoomId::from_external(
                 &crate::entity::RoomExternalId::new("test-room").unwrap(),
             ),
