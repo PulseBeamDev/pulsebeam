@@ -211,6 +211,12 @@ impl UpstreamTrackLayer {
         if let Some(count) = facts.decode_targets {
             self.monitor.set_decode_target_count(count);
         }
+        if let Some(heights) = facts.decode_target_heights {
+            self.monitor.set_decode_target_heights(heights);
+        }
+        if let Some(temporal_only) = facts.temporal_only {
+            self.monitor.set_temporal_only(temporal_only);
+        }
     }
 
     #[cfg(test)]

@@ -1220,6 +1220,8 @@ struct LayerSnap {
     /// the encoding is one indivisible rung; `> 1` is the number of temporal/
     /// spatial sub-layers the SFU could shed to.
     decode_targets: u8,
+    decode_target_heights: [u16; crate::rtp::monitor::MAX_LADDER_TARGETS],
+    temporal_only: bool,
     /// Cumulative cost (bps) of each decode target, from the sender's per-temporal
     /// VLA. `0` = not declared (the allocator then estimates from `bitrate_bps`).
     decode_target_bps: [u64; crate::rtp::monitor::MAX_LADDER_TARGETS],
@@ -1270,6 +1272,8 @@ impl AllocationEngine {
                         healthy: state.is_healthy(),
                         height: state.height(),
                         decode_targets: state.decode_target_count(),
+                        decode_target_heights: state.decode_target_heights,
+                        temporal_only: state.temporal_only,
                         decode_target_bps,
                         full_fps: state.full_fps(),
                     }
@@ -1280,6 +1284,8 @@ impl AllocationEngine {
                     healthy: false,
                     height: l.quality.fallback_height(),
                     decode_targets: 1,
+                    decode_target_heights: [0; crate::rtp::monitor::MAX_LADDER_TARGETS],
+                    temporal_only: false,
                     decode_target_bps: [0u64; crate::rtp::monitor::MAX_LADDER_TARGETS],
                     full_fps: 0,
                 },
@@ -1342,6 +1348,7 @@ impl AllocationEngine {
         layer: &TrackLayer,
         budget: f64,
         min_fps: u32,
+        min_height: u32,
     ) -> Option<(DecodeTargetSelection, f64)> {
         let count = usize::from(self.decode_target_count(layer));
         if count <= 1 {
@@ -1358,6 +1365,18 @@ impl AllocationEngine {
         // Highest affordable target at or above the floor. Skip the top target —
         // that is "full", handled by the normal (non-degraded) path.
         for dt in (floor_dt..count.saturating_sub(1)).rev() {
+            let snap = self.snap(layer);
+            let target_height = snap
+                .decode_target_heights
+                .get(dt)
+                .copied()
+                .map(u32::from)
+                .unwrap_or(0);
+            if target_height < min_height
+                && !(target_height == 1 && snap.temporal_only && snap.height >= min_height)
+            {
+                continue;
+            }
             let cost = self.decode_target_cost(layer, dt);
             if cost <= budget {
                 return Some((DecodeTargetSelection::Target(dt), cost));
@@ -1714,7 +1733,7 @@ impl AllocationEngine {
                     budget -= cost;
                     cur = Some(floor);
                 } else if let Some((target, dt_cost)) =
-                    self.best_affordable_decode_target(floor, budget, slot.min_fps)
+                    self.best_affordable_decode_target(floor, budget, slot.min_fps, slot.min_height)
                 {
                     budget -= dt_cost;
                     cur = Some(floor);
@@ -1974,6 +1993,63 @@ mod assignment_tests {
             engine.decode_target_count(plain),
             1,
             "a non-scalable encoding is a single rung"
+        );
+    }
+
+    #[test]
+    fn spatial_floor_rejects_lower_or_unknown_decode_targets() {
+        let pid = ParticipantId::new();
+        let (tx, built, mut states) = video_track_with_states(
+            pid,
+            Mid::from("v0"),
+            vec![SimulcastLayer::new("q"), SimulcastLayer::new("h")],
+        );
+        let track = Track::video(tx.meta, built.layers().to_vec(), None);
+        let high = track.by_quality(LayerQuality::Medium).unwrap();
+        let state = state_of_mut(&mut states, high);
+        state.set_decode_target_count(3);
+        state.decode_target_kbps = [50, 100, 200];
+        state.decode_target_heights = [180, 360, 720];
+
+        let mut keys: SlotMap<DownstreamSlotKey, ()> = SlotMap::with_key();
+        let view = SlotView {
+            key: keys.insert(()),
+            mid: Mid::from("s0"),
+            max_height: 720,
+            min_height: 360,
+            min_fps: 0,
+            priority: 0,
+            track: &track,
+            current_quality: LayerQuality::Medium,
+            forwarding: true,
+        };
+        let engine = AllocationEngine::new(std::slice::from_ref(&view), &states);
+        assert!(
+            engine
+                .best_affordable_decode_target(high, 75_000.0, 0, 360)
+                .is_none()
+        );
+        assert_eq!(
+            engine.best_affordable_decode_target(high, 150_000.0, 0, 360),
+            Some((DecodeTargetSelection::Target(1), 100_000.0))
+        );
+
+        state_of_mut(&mut states, high).decode_target_heights = [0; 3];
+        let engine = AllocationEngine::new(std::slice::from_ref(&view), &states);
+        assert!(
+            engine
+                .best_affordable_decode_target(high, 150_000.0, 0, 360)
+                .is_none()
+        );
+
+        let state = state_of_mut(&mut states, high);
+        state.temporal_only = true;
+        state.height = 720;
+        state.decode_target_heights = [1; 3];
+        let engine = AllocationEngine::new(std::slice::from_ref(&view), &states);
+        assert_eq!(
+            engine.best_affordable_decode_target(high, 150_000.0, 0, 360),
+            Some((DecodeTargetSelection::Target(1), 100_000.0))
         );
     }
 
