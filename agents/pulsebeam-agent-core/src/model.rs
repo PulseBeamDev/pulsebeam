@@ -7,10 +7,10 @@ use core::time::Duration;
 
 use crate::{Generation, TopicNotification, TopicRegistrations, TopicSnapshot};
 
-pub const MAX_LOCAL_VIDEO_SLOTS: usize = 2;
-pub const MAX_LOCAL_AUDIO_SLOTS: usize = 2;
-pub const MAX_REMOTE_VIDEO_SLOTS: u8 = 16;
-pub const MAX_REMOTE_AUDIO_SLOTS: u8 = 3;
+pub const MAX_LOCAL_VIDEO_SLOTS: usize = 32;
+pub const MAX_LOCAL_AUDIO_SLOTS: usize = 32;
+pub const MAX_REMOTE_VIDEO_SLOTS: u8 = 32;
+pub const MAX_REMOTE_AUDIO_SLOTS: u8 = 32;
 pub const MAX_MID_BYTES: usize = 16;
 
 #[derive(Clone, PartialEq, Eq)]
