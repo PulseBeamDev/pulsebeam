@@ -392,10 +392,6 @@ impl Upstream {
         }
         Ok(id)
     }
-    #[allow(
-        dead_code,
-        reason = "native v1 applies a complete sender plan atomically"
-    )]
     pub(crate) fn bind_sender_labels_atomically(
         &mut self,
         labels: &[(u32, TrackKind, &str)],

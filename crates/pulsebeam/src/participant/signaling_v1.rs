@@ -83,7 +83,14 @@ impl SenderBindings {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum InputError {
     Decode(pulsebeam_proto::codec::DecodeError),
-    Intent { revision: u64, cause: IntentError },
+    Intent {
+        revision: u64,
+        cause: IntentError,
+    },
+    Binding {
+        revision: u64,
+        cause: super::upstream::SenderLabelError,
+    },
 }
 
 impl InputError {
@@ -103,6 +110,11 @@ impl InputError {
                 },
                 Some(revision),
             ),
+            Self::Binding { revision, .. } => (
+                ErrorCode::ProtocolError,
+                "sender binding unavailable",
+                Some(revision),
+            ),
         };
         ServerMessage {
             payload: Some(server_message::Payload::Error(Error {
@@ -117,6 +129,15 @@ impl InputError {
 
 pub(crate) enum NativeInput {
     Intent(IntentDecision),
+    RenewAuthorization(String),
+}
+
+pub(crate) enum AppliedInput {
+    Intent {
+        published: Vec<LocalTrack>,
+        receive: Option<pulsebeam_proto::signaling_v1::ReceiveIntent>,
+    },
+    Replay,
     RenewAuthorization(String),
 }
 
@@ -538,6 +559,56 @@ impl NativeSession {
         self.dirty = true;
     }
 
+    pub(crate) fn apply_input(
+        &mut self,
+        bytes: &[u8],
+        negotiated_senders: &HashMap<u32, TrackKind>,
+        video_receiver_capacity: usize,
+        upstream: &mut super::upstream::Upstream,
+    ) -> Result<AppliedInput, InputError> {
+        match decode_input(
+            bytes,
+            &self.intents,
+            negotiated_senders,
+            video_receiver_capacity,
+        )? {
+            NativeInput::Intent(IntentDecision::Replay) => {
+                self.mark_mapping_dirty();
+                Ok(AppliedInput::Replay)
+            }
+            NativeInput::Intent(IntentDecision::Accept(plan)) => {
+                let labels = plan
+                    .send
+                    .tracks
+                    .iter()
+                    .filter_map(|track| {
+                        let kind =
+                            match pulsebeam_proto::signaling_v1::TrackKind::try_from(track.kind) {
+                                Ok(pulsebeam_proto::signaling_v1::TrackKind::Audio) => {
+                                    TrackKind::Audio
+                                }
+                                Ok(pulsebeam_proto::signaling_v1::TrackKind::Video) => {
+                                    TrackKind::Video
+                                }
+                                _ => return None,
+                            };
+                        Some((track.sender_index, kind, track.label.as_str()))
+                    })
+                    .collect::<Vec<_>>();
+                upstream
+                    .bind_sender_labels_atomically(&labels)
+                    .map_err(|cause| InputError::Binding {
+                        revision: plan.revision,
+                        cause,
+                    })?;
+                let (published, receive) = self.intents.commit(plan);
+                self.mark_mapping_dirty();
+                Ok(AppliedInput::Intent { published, receive })
+            }
+            NativeInput::RenewAuthorization(token) => Ok(AppliedInput::RenewAuthorization(token)),
+        }
+    }
+
     pub(crate) fn mark_dirty(&mut self) {
         self.dirty = true;
     }
@@ -714,6 +785,70 @@ mod tests {
             decode_input(&[0x80], &state, &HashMap::new(), 0),
             Err(InputError::Decode(_))
         ));
+    }
+
+    #[test]
+    fn native_session_rejects_sender_binding_without_committing_partial_intent() {
+        use pulsebeam_proto::signaling_v1::{ClientMessage, Intent, SendIntent, client_message};
+        let publisher = crate::entity::ParticipantId::new();
+        let room = crate::entity::RoomExternalId::new("binding-room").unwrap();
+        let ctx = crate::log::LogCtx {
+            room_id: crate::entity::RoomId::from_external(&room),
+            participant_id: publisher,
+        };
+        let mut upstream = super::super::upstream::Upstream::new(ctx);
+        for (index, mid) in [(0, "a"), (3, "b")] {
+            let mid = str0m::media::Mid::from(mid);
+            let (track, descriptor) = crate::track::test_utils::make_audio_track(publisher, mid);
+            assert!(upstream.add_published_track(index, mid, track, descriptor));
+        }
+        let original = upstream.track_for_sender_index(0);
+        upstream
+            .announce_state_mut(str0m::media::Mid::from("b"), true)
+            .unwrap();
+        let encode = |revision, tracks| {
+            pulsebeam_proto::codec::encode_client(&ClientMessage {
+                payload: Some(client_message::Payload::Intent(Intent {
+                    revision,
+                    send: Some(SendIntent { tracks }),
+                    ..Default::default()
+                })),
+            })
+            .unwrap()
+        };
+        let mut session = NativeSession::default();
+        let failed = session.apply_input(
+            &encode(
+                1,
+                vec![
+                    track(0, WireTrackKind::Audio, "mic"),
+                    track(3, WireTrackKind::Audio, "speaker"),
+                ],
+            ),
+            &media(),
+            0,
+            &mut upstream,
+        );
+        assert!(matches!(
+            failed,
+            Err(InputError::Binding { revision: 1, .. })
+        ));
+        assert_eq!(session.intents.revision(), 0);
+        assert_eq!(upstream.track_for_sender_index(0), original);
+        assert!(matches!(
+            session.apply_input(
+                &encode(2, vec![track(0, WireTrackKind::Audio, "mic")]),
+                &media(),
+                0,
+                &mut upstream,
+            ),
+            Ok(AppliedInput::Intent { published, .. }) if published.len() == 1
+        ));
+        assert_eq!(session.intents.revision(), 2);
+        assert_eq!(
+            upstream.track_for_sender_index(0),
+            Some(publisher.derive_track_id(TrackKind::Audio, "mic"))
+        );
     }
 
     #[test]
