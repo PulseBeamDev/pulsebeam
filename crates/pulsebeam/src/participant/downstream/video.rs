@@ -217,7 +217,10 @@ impl VideoAllocator {
         // Stop any slot currently targeting the removed track so reconcile_routes
         // fires StreamUnsubscribed and cleans up the routing table.
         for slot in self.slots.values_mut() {
-            if slot.matches_track_id(track_id) {
+            if slot.assignment == Some(*track_id) {
+                slot.assignment = None;
+                slot.stop();
+            } else if slot.matches_track_id(track_id) {
                 slot.stop();
             }
         }
@@ -256,6 +259,9 @@ impl VideoAllocator {
         slot: &mut Slot,
         intent: Option<&Intent>,
     ) -> Option<()> {
+        slot.assignment = intent
+            .map(|request| request.track_id)
+            .filter(|track_id| track_handles.contains_key(track_id));
         if let Some(intent) = intent
             && intent.target_height.max(intent.min_height) > 0
         {
@@ -359,6 +365,16 @@ impl VideoAllocator {
                 },
             })
         })
+    }
+
+    #[allow(
+        dead_code,
+        reason = "native v1 Mapping reports assignment without forwarding"
+    )]
+    pub(crate) fn native_mapping_slots(&self) -> impl Iterator<Item = (u32, TrackId)> + '_ {
+        self.slots
+            .values()
+            .filter_map(|slot| slot.assignment.map(|track_id| (slot.media_index, track_id)))
     }
 
     pub fn has_slot(&self, mid: Mid) -> bool {
@@ -845,6 +861,8 @@ struct Slot {
     /// What is *actually* being forwarded (active / staging / draining streams)
     /// and every step of moving between them is owned by `switcher`.
     desired: Option<TrackLayer>,
+    /// Logical receiver assignment, independent of whether forwarding has a layer.
+    assignment: Option<TrackId>,
 
     switcher: Switcher,
 
@@ -876,6 +894,7 @@ impl Slot {
             pt: cfg.pt,
 
             desired: None,
+            assignment: None,
 
             switcher: Switcher::new(rtp::VIDEO_FREQUENCY),
             // With no signaling, we assume users are viewing with 720p playback
@@ -2280,6 +2299,36 @@ mod assignment_tests {
                 .values()
                 .all(|s| matches!(s.state(), SlotState::Idle))
         );
+    }
+
+    #[test]
+    fn native_mapping_retains_zero_height_assignment_without_forwarding() {
+        let mut allocator = setup_allocator();
+        let tracks = add_tracks(&mut allocator, 1);
+        add_slots(&mut allocator, 1);
+        let track_id = tracks.ids[0];
+        let mut intents = HashMap::new();
+        intents.insert(
+            Mid::from("s0"),
+            Intent {
+                track_id,
+                target_height: 0,
+                min_height: 0,
+                min_fps: 0,
+                priority: 0,
+            },
+        );
+        allocator.configure(&intents);
+        assert_eq!(
+            allocator.native_mapping_slots().collect::<Vec<_>>().len(),
+            1
+        );
+        assert_eq!(allocator.native_mapping_slots().next().unwrap().1, track_id);
+        assert_eq!(allocator.slots().count(), 0);
+        let key = allocator.track_handles[&track_id];
+        allocator.deactivate_track_binding(key, track_id);
+        allocator.remove_track(&track_id);
+        assert_eq!(allocator.native_mapping_slots().count(), 0);
     }
 
     #[test]
