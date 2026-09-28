@@ -379,8 +379,44 @@ impl RemoteMedia {
             .cloned()
     }
 
+    fn retire_receiver(&mut self) {
+        self.frames = if matches!(self.slot, MediaSlot::RemoteVideo(_)) {
+            FrameReceiver::with_h264()
+        } else {
+            FrameReceiver::new()
+        };
+        self.ready.clear();
+        self.last_audio_seq = None;
+        while self.packets.try_recv().is_ok() {}
+    }
+
+    fn retire_changed_generation(&mut self) -> Result<(), Error> {
+        if self.mid.has_changed().map_err(|_| Error::Closed)? {
+            let _ = self.mid.borrow_and_update();
+            self.retire_receiver();
+        }
+        Ok(())
+    }
+
     pub async fn recv_packet(&mut self) -> Result<RtpPacket, Error> {
-        self.packets.recv_async().await.map_err(|_| Error::Closed)
+        loop {
+            self.retire_changed_generation()?;
+            tokio::select! {
+                biased;
+                changed = self.mid.changed() => {
+                    changed.map_err(|_| Error::Closed)?;
+                    self.retire_receiver();
+                }
+                packet = self.packets.recv_async() => {
+                    let packet = packet.map_err(|_| Error::Closed)?;
+                    if !self.mid.has_changed().map_err(|_| Error::Closed)?
+                        && self.mid.borrow().is_some()
+                    {
+                        return Ok(packet);
+                    }
+                }
+            }
+        }
     }
 
     pub async fn request_keyframe(&self, ssrc: Ssrc) -> Result<(), Error> {
@@ -394,6 +430,7 @@ impl RemoteMedia {
     }
 
     pub async fn recv_frame(&mut self) -> Result<MediaFrame, Error> {
+        self.retire_changed_generation()?;
         if matches!(self.slot, MediaSlot::RemoteAudio(_)) {
             let packet = self.recv_packet().await?;
             let sequence = *packet.seq;
@@ -861,6 +898,13 @@ impl Actor {
             }
             RtcEffect::Close { generation } => {
                 if let Some(mut peer) = self.peers.remove(&generation) {
+                    for slot in peer.mids.keys() {
+                        if let Some(observers) = self.observers.get_mut(slot) {
+                            for observer in observers {
+                                observer.mid.send_replace(None);
+                            }
+                        }
+                    }
                     peer.rtc.disconnect();
                 }
                 self.accept(HostEvent::Rtc(RtcEvent::Closed { generation }));
@@ -1738,7 +1782,7 @@ mod tests {
     #[tokio::test]
     async fn remote_audio_returns_each_encoded_packet_as_a_frame() {
         let (packet_tx, packets) = flume::bounded(1);
-        let (_mid_tx, mid) = watch::channel(None);
+        let (_mid_tx, mid) = watch::channel(Some("audio".to_owned()));
         let (commands, _command_rx) = mpsc::channel(1);
         let (_snapshot_tx, snapshot) = watch::channel(Snapshot::default());
         let mut media = RemoteMedia {
@@ -1775,6 +1819,47 @@ mod tests {
         assert_eq!(frame.data.as_ref(), [0xf8, 0xff, 0xfe]);
         assert_eq!(frame.audio_level, Some(-30));
         assert_eq!(frame.voice_activity, Some(true));
+        assert!(frame.contiguous);
+    }
+
+    #[tokio::test]
+    async fn receiver_discards_queued_packets_and_sequence_history_on_generation_change() {
+        let (packet_tx, packets) = flume::bounded(2);
+        let (mid_tx, mid) = watch::channel(Some("audio".to_owned()));
+        let (commands, _command_rx) = mpsc::channel(1);
+        let (_snapshot_tx, snapshot) = watch::channel(Snapshot::default());
+        let mut media = RemoteMedia {
+            slot: MediaSlot::RemoteAudio(0),
+            mid,
+            packets,
+            frames: FrameReceiver::new(),
+            ready: VecDeque::new(),
+            last_audio_seq: Some(99),
+            commands,
+            snapshot,
+        };
+        let packet = RtpPacket {
+            mid: Mid::from("audio"),
+            rid: None,
+            seq: crate::SeqNo::from(1),
+            ts: crate::MediaTime::new(960, crate::Frequency::FORTY_EIGHT_KHZ),
+            marker: false,
+            ssrc: Some(Ssrc::from(1)),
+            payload: Arc::from([1_u8]),
+            ext_vals: crate::ExtensionValues::default(),
+            arrival: Instant::now(),
+        };
+        packet_tx.send_async(packet.clone()).await.unwrap();
+        mid_tx.send_replace(None);
+        media.retire_changed_generation().unwrap();
+        assert!(media.packets.try_recv().is_err());
+        assert_eq!(media.last_audio_seq, None);
+
+        mid_tx.send_replace(Some("audio".to_owned()));
+        media.retire_changed_generation().unwrap();
+        packet_tx.send_async(packet).await.unwrap();
+        let frame = media.recv_frame().await.unwrap();
+        assert_eq!(frame.data.as_ref(), [1]);
         assert!(frame.contiguous);
     }
 }
