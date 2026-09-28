@@ -732,6 +732,11 @@ impl Agent {
                     &active.participant_external_id,
                 )? {
                     ServerOutput::StateChanged => {
+                        if active.intent_revision != 0
+                            && active.observed.intent_revision == active.intent_revision
+                        {
+                            self.retry_attempts = 0;
+                        }
                         self.topics.retain_remote_publishers(
                             self.snapshot.participants.keys().map(String::as_str),
                         );
@@ -933,7 +938,6 @@ impl Agent {
             attempt.generation.get(),
             previous_generation.map(Generation::get),
         );
-        self.retry_attempts = 0;
         self.pending_signal = None;
         self.cancel_signal_retry();
         self.intent_dirty = true;
@@ -1020,32 +1024,24 @@ impl Agent {
 
     fn schedule_retry(&mut self, mode: AttemptMode) {
         self.retry_attempts = self.retry_attempts.saturating_add(1);
-        if self.retry_attempts > self.config.retry.maximum_attempts {
-            let failure = Failure {
-                class: FailureClass::RetryExhausted,
-                message: "connection retry budget exhausted".to_string(),
-            };
-            agent_log!(
-                self,
-                Error,
-                "connection retry budget exhausted attempts={}",
-                self.retry_attempts.saturating_sub(1)
-            );
-            self.notify_failure(failure.clone());
-            self.snapshot.terminal_failure = Some(failure);
-            self.set_connection_state(ConnectionState::TerminalFailure);
-            return;
-        }
         let shift = u32::from(self.retry_attempts.saturating_sub(1).min(10));
         let multiplier = 1u32.checked_shl(shift).unwrap_or(u32::MAX);
-        let delay = self
+        let ceiling = self.config.retry.maximum_delay.min(Duration::from_secs(10));
+        let base = self
             .config
             .retry
             .initial_delay
             .checked_mul(multiplier)
-            .unwrap_or(self.config.retry.maximum_delay)
-            .min(self.config.retry.maximum_delay);
+            .unwrap_or(ceiling)
+            .min(ceiling);
         let timer = self.ids.timer();
+        let mut entropy = timer.get().wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        entropy ^= entropy >> 30;
+        entropy = entropy.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        entropy ^= entropy >> 27;
+        let jitter = u64::from(entropy as u32) * (base.as_millis() as u64 / 2 + 1)
+            / (u64::from(u32::MAX) + 1);
+        let delay = base / 2 + Duration::from_millis(jitter);
         agent_log!(
             self,
             Info,
