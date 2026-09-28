@@ -15,7 +15,8 @@ use crate::{
     PlayoutDelay, RoomId, RtcEffect, RtcEvent, SlotBinding, Snapshot, TimerEffect, TimerEvent,
     TimerId, TopicDropReason, TopicError, TopicSend, ValidationError,
     id::IdGenerator,
-    signaling::{self, ServerOutput, SignalingError},
+    signaling::{self, SignalingError},
+    signaling_v1::{self, CatalogState, ServerOutput},
     topic::Topics,
 };
 
@@ -62,15 +63,14 @@ struct Session {
     participant_id: String,
     _room_external_id: String,
     _room_id: RoomId,
-    _participant_external_id: String,
+    participant_external_id: String,
     _opaque_participant_id: ParticipantId,
     _connection_id: ConnectionId,
-    mids: BTreeMap<MediaSlot, String>,
-    #[allow(
-        dead_code,
-        reason = "replacement signaling resolves sender and receiver indices in Plan 07"
-    )]
     coordinates: BTreeMap<MediaSlot, SlotBinding>,
+    observed: CatalogState,
+    intent_revision: u64,
+    authorization_expires_at: Option<i64>,
+    signaling_terminal: bool,
     signaling_channel: ChannelId,
 }
 
@@ -701,7 +701,7 @@ impl Agent {
                 channel,
                 payload,
             } => {
-                let Some(active) = self.active.as_ref() else {
+                let Some(active) = self.active.as_mut() else {
                     return Ok(());
                 };
                 if active.generation != generation {
@@ -719,11 +719,17 @@ impl Agent {
                     )?;
                     return Ok(());
                 }
-                match signaling::apply_server_message(
+                if active.signaling_terminal {
+                    return Ok(());
+                }
+                match signaling_v1::decode_and_apply(
                     &payload,
+                    &mut active.observed,
                     &mut self.snapshot,
                     &mut self.notifications,
-                    &active.mids,
+                    &active.coordinates,
+                    &active.participant_id,
+                    &active.participant_external_id,
                 )? {
                     ServerOutput::StateChanged => {
                         self.topics.retain_remote_publishers(
@@ -740,15 +746,55 @@ impl Agent {
                             self.snapshot.audio.len(),
                         );
                     }
-                    ServerOutput::ServerError(message) => {
+                    ServerOutput::Authorization(expires_at) => {
+                        active.authorization_expires_at = Some(expires_at);
+                    }
+                    ServerOutput::ServerError(error) => {
                         agent_log!(
                             self,
                             Warn,
-                            "server reported signaling error generation={}",
-                            generation.get()
+                            "server reported signaling error generation={} code={} fatal={}",
+                            generation.get(),
+                            error.code,
+                            error.fatal
                         );
-                        self.notifications
-                            .push_back(Notification::ServerError(message));
+                        if error.fatal {
+                            active.signaling_terminal = true;
+                            self.pending_signal = None;
+                            self.cancel_signal_retry();
+                            let class = if error.code
+                                == pulsebeam_proto::signaling_v1::ErrorCode::AuthorizationExpired
+                                    as i32
+                            {
+                                FailureClass::Authorization
+                            } else {
+                                FailureClass::Protocol
+                            };
+                            let failure = Failure {
+                                class,
+                                message: error.message,
+                            };
+                            self.notify_failure(failure.clone());
+                            self.snapshot.terminal_failure = Some(failure);
+                            self.set_connection_state(ConnectionState::TerminalFailure);
+                        } else {
+                            self.notifications
+                                .push_back(Notification::ServerError(error.message));
+                        }
+                    }
+                    ServerOutput::Reconnect => {
+                        active.signaling_terminal = true;
+                        self.pending_signal = None;
+                        self.cancel_signal_retry();
+                        if self.desired.connected && self.attempt.is_none() {
+                            self.topics.unbind_generation(
+                                generation,
+                                TopicDropReason::TransportReplaced,
+                                &mut self.snapshot,
+                                &mut self.notifications,
+                            );
+                            self.start_attempt(AttemptMode::Replace);
+                        }
                     }
                 }
             }
@@ -858,10 +904,6 @@ impl Agent {
             .into_iter()
             .map(|binding| (binding.slot.clone(), binding))
             .collect();
-        let mids = coordinates
-            .iter()
-            .map(|(slot, binding)| (slot.clone(), binding.mid.clone()))
-            .collect();
         let previous_generation = self.active.as_ref().map(|session| session.generation);
         if let Some(previous) = self.active.replace(Session {
             generation: attempt.generation,
@@ -869,11 +911,14 @@ impl Agent {
             participant_id: candidate.participant_id,
             _room_external_id: candidate.room_external_id,
             _room_id: candidate.room_id,
-            _participant_external_id: candidate.participant_external_id,
+            participant_external_id: candidate.participant_external_id,
             _opaque_participant_id: candidate.opaque_participant_id,
             _connection_id: candidate.connection_id,
-            mids,
             coordinates,
+            observed: CatalogState::default(),
+            intent_revision: 0,
+            authorization_expires_at: None,
+            signaling_terminal: false,
             signaling_channel: resources.signaling_channel,
         }) && previous.generation != attempt.generation
         {
@@ -1024,25 +1069,34 @@ impl Agent {
         if !self.intent_dirty || self.pending_signal.is_some() || self.signal_retry.is_some() {
             return;
         }
-        let Some(active) = self.active.as_ref() else {
+        let Some(active) = self.active.as_mut() else {
             return;
         };
-        let payload =
-            match signaling::encode_intent(&self.desired, &self.config.topology, &active.mids) {
-                Ok(payload) => payload,
-                Err(error) => {
-                    let failure = Failure::protocol(error.to_string());
-                    agent_log!(
-                        self,
-                        Error,
-                        "failed to encode desired signaling intent: {error}"
-                    );
-                    self.notify_failure(failure.clone());
-                    self.snapshot.terminal_failure = Some(failure);
-                    self.set_connection_state(ConnectionState::TerminalFailure);
-                    return;
-                }
-            };
+        if active.signaling_terminal || active.intent_revision == u64::MAX {
+            return;
+        }
+        let revision = active.intent_revision + 1;
+        let payload = match signaling::encode_v1_intent(
+            &self.desired,
+            &self.config.topology,
+            &active.coordinates,
+            revision,
+        ) {
+            Ok(payload) => payload,
+            Err(error) => {
+                let failure = Failure::protocol(error.to_string());
+                agent_log!(
+                    self,
+                    Error,
+                    "failed to encode desired signaling intent: {error}"
+                );
+                self.notify_failure(failure.clone());
+                self.snapshot.terminal_failure = Some(failure);
+                self.set_connection_state(ConnectionState::TerminalFailure);
+                return;
+            }
+        };
+        active.intent_revision = revision;
         let operation = self.ids.operation();
         let generation = active.generation;
         let channel = active.signaling_channel;
@@ -1050,7 +1104,7 @@ impl Agent {
             self,
             Debug,
             "sending desired signaling intent revision={} generation={} operation={} channel={} bytes={}",
-            self.desired.revision,
+            revision,
             generation.get(),
             operation.get(),
             channel.get(),

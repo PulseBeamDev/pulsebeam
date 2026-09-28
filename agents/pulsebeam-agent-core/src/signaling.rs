@@ -460,7 +460,7 @@ fn validate_audio_bindings(
     Ok(result)
 }
 
-fn emit_participant_changes(
+pub(crate) fn emit_participant_changes(
     old: &BTreeMap<String, Participant>,
     new: &BTreeMap<String, Participant>,
     notifications: &mut alloc::collections::VecDeque<Notification>,
@@ -477,7 +477,7 @@ fn emit_participant_changes(
     }
 }
 
-fn emit_publication_changes(
+pub(crate) fn emit_publication_changes(
     old: &BTreeMap<String, Publication>,
     new: &BTreeMap<String, Publication>,
     notifications: &mut alloc::collections::VecDeque<Notification>,
@@ -494,7 +494,7 @@ fn emit_publication_changes(
     }
 }
 
-fn emit_video_changes(
+pub(crate) fn emit_video_changes(
     old: &BTreeMap<String, VideoBinding>,
     new: &BTreeMap<String, VideoBinding>,
     notifications: &mut alloc::collections::VecDeque<Notification>,

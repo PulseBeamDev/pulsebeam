@@ -10,7 +10,7 @@ use core::time::Duration;
 use pulsebeam_proto::{
     prelude::Message,
     reliable::{RelControl, RelDelivery, RelMsg, RelNack, rel_control},
-    signaling::{self, client_message, server_message},
+    signaling_v1::{self as v1, client_message, server_message},
 };
 
 use crate::*;
@@ -588,18 +588,19 @@ fn acknowledge_send(
         .unwrap();
 }
 
-fn decode_intent(payload: &[u8]) -> signaling::ClientIntent {
-    let message = signaling::ClientMessage::decode(payload).unwrap();
+fn decode_intent(payload: &[u8]) -> v1::Intent {
+    let message = pulsebeam_proto::codec::decode_client(payload).unwrap();
     match message.payload.unwrap() {
         client_message::Payload::Intent(intent) => intent,
+        client_message::Payload::RenewAuthorization(_) => panic!("expected media intent"),
     }
 }
 
-fn server_state(state: signaling::ServerState) -> Vec<u8> {
-    signaling::ServerMessage {
-        payload: Some(server_message::Payload::State(state)),
-    }
-    .encode_to_vec()
+fn server_payload(payload: server_message::Payload) -> Vec<u8> {
+    pulsebeam_proto::codec::encode_server(&v1::ServerMessage {
+        payload: Some(payload),
+    })
+    .unwrap()
 }
 
 fn drain_notifications(agent: &mut Agent) -> Vec<Notification> {
@@ -1140,51 +1141,61 @@ fn signaling_snapshot_diff_and_empty_binding_groups_are_exact() {
     let (mut agent, generation, cid, send) = connected_agent();
     acknowledge_send(&mut agent, generation, cid, send);
     let _ = drain_notifications(&mut agent);
-    let initial = signaling::ServerState {
-        snapshot: true,
-        participants_added: vec![signaling::Participant {
-            participant_id: "publisher".to_string(),
-        }],
-        participants_removed: vec![],
-        publications_added: vec![
-            signaling::Publication {
-                track_id: "video-track".to_string(),
+    let initial = v1::Catalog {
+        revision: 1,
+        state: Some(v1::catalog::State::Snapshot(v1::CatalogSnapshot {
+            participants: vec![v1::Participant {
                 participant_id: "publisher".to_string(),
-                kind: signaling::TrackKind::Video.into(),
-            },
-            signaling::Publication {
-                track_id: "audio-track".to_string(),
-                participant_id: "publisher".to_string(),
-                kind: signaling::TrackKind::Audio.into(),
-            },
-        ],
-        publications_removed: vec![],
-        video: Some(signaling::VideoBindings {
-            items: vec![signaling::VideoBinding {
-                track_id: "video-track".to_string(),
-                mid: "rv0".to_string(),
-                paused: false,
+                participant_external_id: "publisher-external".to_string(),
             }],
-        }),
-        audio: Some(signaling::AudioBindings {
-            items: vec![signaling::AudioBinding {
-                track_id: "audio-track".to_string(),
-                mid: "ra0".to_string(),
-                level_dbov: -24,
-            }],
-        }),
+            tracks: vec![
+                v1::RemoteTrack {
+                    track_id: "video-track".to_string(),
+                    participant_id: "publisher".to_string(),
+                    kind: v1::TrackKind::Video.into(),
+                    label: "camera".to_string(),
+                },
+                v1::RemoteTrack {
+                    track_id: "audio-track".to_string(),
+                    participant_id: "publisher".to_string(),
+                    kind: v1::TrackKind::Audio.into(),
+                    label: "microphone".to_string(),
+                },
+            ],
+        })),
     };
     agent
         .handle(HostEvent::DataChannel(DataChannelEvent::Message {
             generation,
             channel: cid,
-            payload: server_state(initial),
+            payload: server_payload(server_message::Payload::Catalog(initial)),
         }))
         .unwrap();
     assert_eq!(agent.snapshot().participants.len(), 1);
     assert_eq!(agent.snapshot().publications.len(), 2);
+    agent
+        .handle(HostEvent::DataChannel(DataChannelEvent::Message {
+            generation,
+            channel: cid,
+            payload: server_payload(server_message::Payload::Mapping(v1::Mapping {
+                intent_revision: 1,
+                video: Some(v1::TrackMappings {
+                    tracks: vec![v1::TrackMapping {
+                        receiver_index: 4,
+                        track_id: "video-track".to_string(),
+                    }],
+                }),
+                audio: Some(v1::TrackMappings {
+                    tracks: vec![v1::TrackMapping {
+                        receiver_index: 2,
+                        track_id: "audio-track".to_string(),
+                    }],
+                }),
+            })),
+        }))
+        .unwrap();
     assert_eq!(agent.snapshot().video["rv0"].track_id, "video-track");
-    assert_eq!(agent.snapshot().audio[0].level_dbov, -24);
+    assert_eq!(agent.snapshot().audio[0].mid, "ra0");
     let notifications = drain_notifications(&mut agent);
     assert_eq!(
         notifications
@@ -1198,15 +1209,11 @@ fn signaling_snapshot_diff_and_empty_binding_groups_are_exact() {
         .handle(HostEvent::DataChannel(DataChannelEvent::Message {
             generation,
             channel: cid,
-            payload: server_state(signaling::ServerState {
-                snapshot: false,
-                participants_added: vec![],
-                participants_removed: vec![],
-                publications_added: vec![],
-                publications_removed: vec![],
-                video: Some(signaling::VideoBindings { items: vec![] }),
-                audio: Some(signaling::AudioBindings { items: vec![] }),
-            }),
+            payload: server_payload(server_message::Payload::Mapping(v1::Mapping {
+                intent_revision: 1,
+                video: Some(v1::TrackMappings { tracks: vec![] }),
+                audio: Some(v1::TrackMappings { tracks: vec![] }),
+            })),
         }))
         .unwrap();
     assert!(agent.snapshot().video.is_empty());
@@ -1226,15 +1233,13 @@ fn signaling_snapshot_diff_and_empty_binding_groups_are_exact() {
         .handle(HostEvent::DataChannel(DataChannelEvent::Message {
             generation,
             channel: cid,
-            payload: server_state(signaling::ServerState {
-                snapshot: false,
-                participants_added: vec![],
-                participants_removed: vec!["publisher".to_string()],
-                publications_added: vec![],
-                publications_removed: vec!["video-track".to_string(), "audio-track".to_string()],
-                video: None,
-                audio: None,
-            }),
+            payload: server_payload(server_message::Payload::Catalog(v1::Catalog {
+                revision: 2,
+                state: Some(v1::catalog::State::Delta(v1::CatalogDelta {
+                    removed_participant_ids: vec!["publisher".to_string()],
+                    ..Default::default()
+                })),
+            })),
         }))
         .unwrap();
     assert!(agent.snapshot().participants.is_empty());
@@ -1246,31 +1251,31 @@ fn malformed_signaling_is_transactional() {
     let (mut agent, generation, cid, send) = connected_agent();
     acknowledge_send(&mut agent, generation, cid, send);
     let before = agent.snapshot().clone();
-    let malformed = signaling::ServerState {
-        snapshot: false,
-        participants_added: vec![
-            signaling::Participant {
-                participant_id: "duplicate".to_string(),
-            },
-            signaling::Participant {
-                participant_id: "duplicate".to_string(),
-            },
-        ],
-        participants_removed: vec![],
-        publications_added: vec![],
-        publications_removed: vec![],
-        video: None,
-        audio: None,
+    let malformed = v1::Catalog {
+        revision: 1,
+        state: Some(v1::catalog::State::Snapshot(v1::CatalogSnapshot {
+            participants: vec![
+                v1::Participant {
+                    participant_id: "duplicate".to_string(),
+                    participant_external_id: "a".to_string(),
+                },
+                v1::Participant {
+                    participant_id: "duplicate".to_string(),
+                    participant_external_id: "b".to_string(),
+                },
+            ],
+            tracks: vec![],
+        })),
     };
     assert!(matches!(
         agent.handle(HostEvent::DataChannel(DataChannelEvent::Message {
             generation,
             channel: cid,
-            payload: server_state(malformed),
+            payload: server_payload(server_message::Payload::Catalog(malformed)),
         })),
-        Err(AgentError::InvalidSignaling(
-            SignalingError::Duplicate { .. }
-        ))
+        Err(AgentError::InvalidSignaling(SignalingError::Invalid(
+            "catalog"
+        )))
     ));
     assert_eq!(agent.snapshot(), &before);
 }
@@ -1298,15 +1303,11 @@ fn complete_intent_retracts_omitted_state_and_playout_delay_is_one_way() {
         }) => (operation, decode_intent(&payload)),
         effect => panic!("expected updated intent, got {effect:?}"),
     };
-    assert!(intent.video.is_empty());
-    assert!(intent.publish.iter().all(|publication| !publication.active));
-    assert_eq!(
-        intent.ext.and_then(|ext| ext.playout_delay),
-        Some(signaling::PlayoutDelay {
-            min_ms: 20,
-            max_ms: 100,
-        })
-    );
+    assert_eq!(intent.revision, 2);
+    assert!(intent.send.unwrap().tracks.is_empty());
+    let receive = intent.receive.unwrap();
+    assert!(receive.video.unwrap().tracks.is_empty());
+    assert!(receive.audio.unwrap().tracks.is_empty());
     acknowledge_send(&mut agent, generation, cid, operation);
 
     let mut adaptive = desired(3);
@@ -1356,7 +1357,15 @@ fn failed_signaling_send_retries_only_the_latest_complete_intent() {
         Effect::DataChannel(DataChannelEffect::Send { payload, .. }) => decode_intent(&payload),
         effect => panic!("expected retried intent, got {effect:?}"),
     };
-    assert_eq!(intent.video[0].height, 360);
+    assert_eq!(intent.revision, 2);
+    assert_eq!(
+        intent.receive.unwrap().video.unwrap().tracks[0]
+            .options
+            .as_ref()
+            .unwrap()
+            .height,
+        360
+    );
 }
 
 #[test]

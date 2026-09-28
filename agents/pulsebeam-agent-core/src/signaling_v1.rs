@@ -1,11 +1,17 @@
 use alloc::{
-    collections::{BTreeMap, BTreeSet},
+    borrow::ToOwned,
+    collections::{BTreeMap, BTreeSet, VecDeque},
     string::String,
+    vec::Vec,
 };
 
 use pulsebeam_proto::signaling_v1::{self as wire, catalog};
 
-use crate::{MediaDirection, MediaKind, MediaSlot, SlotBinding};
+use crate::{
+    AudioBinding, MediaDirection, MediaKind, MediaSlot, Notification, Participant, Publication,
+    SlotBinding, Snapshot, VideoBinding,
+    signaling::{self, SignalingError},
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CatalogError {
@@ -21,7 +27,7 @@ pub(crate) enum CatalogError {
     MappingRevision,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct CatalogState {
     pub(crate) revision: u64,
     pub(crate) participants: BTreeMap<String, wire::Participant>,
@@ -235,6 +241,132 @@ impl CatalogState {
         }
         Ok(())
     }
+}
+
+pub(crate) enum ServerOutput {
+    StateChanged,
+    Authorization(i64),
+    ServerError(wire::Error),
+    Reconnect,
+}
+
+pub(crate) fn decode_and_apply(
+    payload: &[u8],
+    state: &mut CatalogState,
+    snapshot: &mut Snapshot,
+    notifications: &mut VecDeque<Notification>,
+    coordinates: &BTreeMap<MediaSlot, SlotBinding>,
+    recipient_id: &str,
+    recipient_external_id: &str,
+) -> Result<ServerOutput, SignalingError> {
+    let message =
+        pulsebeam_proto::codec::decode_server(payload).map_err(|_| SignalingError::Malformed)?;
+    match message.payload.ok_or(SignalingError::MissingPayload)? {
+        wire::server_message::Payload::Catalog(catalog) => {
+            state
+                .apply(catalog, recipient_id, recipient_external_id)
+                .map_err(|_| SignalingError::Invalid("catalog"))?;
+            update_snapshot(state, snapshot, notifications, coordinates);
+            Ok(ServerOutput::StateChanged)
+        }
+        wire::server_message::Payload::Mapping(mapping) => {
+            state
+                .apply_mapping(mapping, coordinates)
+                .map_err(|_| SignalingError::Invalid("mapping"))?;
+            update_snapshot(state, snapshot, notifications, coordinates);
+            Ok(ServerOutput::StateChanged)
+        }
+        wire::server_message::Payload::Authorization(authorization) => Ok(
+            ServerOutput::Authorization(authorization.expires_at_unix_seconds),
+        ),
+        wire::server_message::Payload::Error(error) => {
+            let valid = match wire::ErrorCode::try_from(error.code) {
+                Ok(
+                    wire::ErrorCode::InvalidMessage
+                    | wire::ErrorCode::AuthorizationExpired
+                    | wire::ErrorCode::ProtocolError,
+                ) => error.fatal,
+                Ok(wire::ErrorCode::AuthorizationRejected) => !error.fatal,
+                Ok(wire::ErrorCode::Internal) => true,
+                _ => false,
+            };
+            if !valid {
+                return Err(SignalingError::Invalid("error classification"));
+            }
+            Ok(ServerOutput::ServerError(error))
+        }
+        wire::server_message::Payload::Reconnect(_) => Ok(ServerOutput::Reconnect),
+    }
+}
+
+fn update_snapshot(
+    state: &CatalogState,
+    snapshot: &mut Snapshot,
+    notifications: &mut VecDeque<Notification>,
+    coordinates: &BTreeMap<MediaSlot, SlotBinding>,
+) {
+    let participants: BTreeMap<_, _> = state
+        .participants
+        .keys()
+        .map(|id| (id.clone(), Participant { id: id.clone() }))
+        .collect();
+    let publications: BTreeMap<_, _> = state
+        .tracks
+        .iter()
+        .map(|(id, track)| {
+            (
+                id.clone(),
+                Publication {
+                    id: id.clone(),
+                    participant_id: track.participant_id.clone(),
+                    kind: if track.kind == wire::TrackKind::Audio as i32 {
+                        MediaKind::Audio
+                    } else {
+                        MediaKind::Video
+                    },
+                },
+            )
+        })
+        .collect();
+    let mids: BTreeMap<_, _> = coordinates
+        .values()
+        .map(|binding| (binding.media_index, binding.mid.as_str()))
+        .collect();
+    let video: BTreeMap<_, _> = state
+        .video
+        .iter()
+        .map(|(index, id)| {
+            let mid = mids[index].to_owned();
+            (
+                mid.clone(),
+                VideoBinding {
+                    track_id: id.clone(),
+                    mid,
+                    paused: false,
+                },
+            )
+        })
+        .collect();
+    let audio: Vec<_> = state
+        .audio
+        .iter()
+        .map(|(index, id)| AudioBinding {
+            track_id: id.clone(),
+            mid: mids[index].to_owned(),
+            level_dbov: 0,
+        })
+        .collect();
+    signaling::emit_participant_changes(&snapshot.participants, &participants, notifications);
+    signaling::emit_publication_changes(&snapshot.publications, &publications, notifications);
+    signaling::emit_video_changes(&snapshot.video, &video, notifications);
+    if snapshot.audio != audio {
+        notifications.push_back(Notification::AudioBindingsChanged(audio.clone()));
+    }
+    snapshot.participants = participants;
+    snapshot.publications = publications;
+    snapshot.video = video;
+    snapshot.audio = audio;
+    snapshot.version = snapshot.version.saturating_add(1);
 }
 
 fn valid(value: &str, limit: usize) -> bool {
@@ -494,5 +626,71 @@ mod tests {
         )
         .unwrap();
         assert!(state.tracks.is_empty());
+    }
+
+    #[test]
+    fn encoded_catalog_and_mapping_update_observation_without_inventing_reconnect() {
+        let mut state = CatalogState::default();
+        let mut snapshot = Snapshot::default();
+        let mut notifications = VecDeque::new();
+        let slot = MediaSlot::RemoteAudio(0);
+        let coordinates = BTreeMap::from([(
+            slot.clone(),
+            SlotBinding {
+                slot,
+                mid: "non-numeric".into(),
+                media_index: 2,
+                kind: MediaKind::Audio,
+                direction: MediaDirection::ReceiveOnly,
+            },
+        )]);
+        let encoded = pulsebeam_proto::codec::encode_server(&wire::ServerMessage {
+            payload: Some(wire::server_message::Payload::Catalog(snapshot_message())),
+        })
+        .unwrap();
+        assert!(matches!(
+            decode_and_apply(
+                &encoded,
+                &mut state,
+                &mut snapshot,
+                &mut notifications,
+                &coordinates,
+                "self",
+                "me"
+            ),
+            Ok(ServerOutput::StateChanged)
+        ));
+        assert!(snapshot.publications.contains_key("opaque"));
+        let encoded = pulsebeam_proto::codec::encode_server(&wire::ServerMessage {
+            payload: Some(wire::server_message::Payload::Mapping(wire::Mapping {
+                intent_revision: 1,
+                video: Some(wire::TrackMappings::default()),
+                audio: Some(wire::TrackMappings {
+                    tracks: vec![wire::TrackMapping {
+                        receiver_index: 2,
+                        track_id: "opaque".into(),
+                    }],
+                }),
+            })),
+        })
+        .unwrap();
+        assert!(matches!(
+            decode_and_apply(
+                &encoded,
+                &mut state,
+                &mut snapshot,
+                &mut notifications,
+                &coordinates,
+                "self",
+                "me"
+            ),
+            Ok(ServerOutput::StateChanged)
+        ));
+        assert_eq!(snapshot.audio[0].mid, "non-numeric");
+        assert_eq!(state.intent_revision, 1);
+    }
+
+    fn snapshot_message() -> wire::Catalog {
+        snapshot(1, vec![participant()], vec![track()])
     }
 }
