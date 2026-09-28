@@ -7,6 +7,7 @@ use alloc::{
 use pulsebeam_proto::{
     prelude::Message,
     signaling::{self, client_message, server_message},
+    signaling_v1 as v1,
 };
 
 use crate::{
@@ -30,6 +31,10 @@ pub enum SignalingError {
     Unknown { field: &'static str, value: String },
     #[error("media topology has no negotiated mid for {0:?}")]
     MissingMid(MediaSlot),
+    #[error("media topology has no negotiated resource for {0:?}")]
+    MissingCoordinate(MediaSlot),
+    #[error("intent exceeds bounded signaling size")]
+    Encode,
 }
 
 pub(crate) enum ServerOutput {
@@ -98,6 +103,97 @@ pub(crate) fn encode_intent(
         })),
     };
     Ok(message.encode_to_vec())
+}
+
+#[allow(dead_code, reason = "used when the native Agent switches to media v1")]
+pub(crate) fn encode_v1_intent(
+    desired: &DesiredState,
+    topology: &MediaTopology,
+    coordinates: &BTreeMap<MediaSlot, crate::SlotBinding>,
+    revision: u64,
+) -> Result<Vec<u8>, SignalingError> {
+    if revision == 0 {
+        return Err(SignalingError::Invalid("intent revision"));
+    }
+    if desired.video.len() > usize::from(topology.remote_video) {
+        return Err(SignalingError::Invalid("video receiver capacity"));
+    }
+    let active: BTreeMap<&str, bool> = desired
+        .publications
+        .iter()
+        .map(|publication| (publication.slot.as_str(), publication.active))
+        .collect();
+    let mut send = Vec::new();
+    for (slots, kind) in [
+        (&topology.local_video, v1::TrackKind::Video),
+        (&topology.local_audio, v1::TrackKind::Audio),
+    ] {
+        for label in slots {
+            if !active.get(label.as_str()).copied().unwrap_or(false) {
+                continue;
+            }
+            let slot = match kind {
+                v1::TrackKind::Video => MediaSlot::LocalVideo(label.clone()),
+                _ => MediaSlot::LocalAudio(label.clone()),
+            };
+            let resource = coordinates
+                .get(&slot)
+                .ok_or(SignalingError::MissingCoordinate(slot))?;
+            send.push(v1::LocalTrack {
+                sender_index: resource.media_index,
+                kind: kind.into(),
+                label: label.clone(),
+            });
+        }
+    }
+    let playout_delay = match desired.playout_delay {
+        PlayoutDelay::Adaptive => None,
+        PlayoutDelay::Fixed { min_ms, max_ms } => Some(v1::PlayoutDelay { min_ms, max_ms }),
+    };
+    let video = desired
+        .video
+        .iter()
+        .map(|track| v1::VideoTrackIntent {
+            track_id: track.track_id.clone(),
+            options: Some(v1::VideoOptions {
+                height: track.height,
+                min_height: track.min_height,
+                min_fps: track.min_fps,
+                priority: track.priority,
+                playout_delay: playout_delay.clone(),
+            }),
+        })
+        .collect();
+    let audio = desired
+        .audio
+        .pinned
+        .iter()
+        .map(|id| v1::AudioTrackIntent {
+            track_id: id.clone(),
+            options: Some(v1::AudioOptions {
+                playout_delay: playout_delay.clone(),
+            }),
+        })
+        .collect();
+    let message = v1::ClientMessage {
+        payload: Some(v1::client_message::Payload::Intent(v1::Intent {
+            revision,
+            send: Some(v1::SendIntent { tracks: send }),
+            receive: Some(v1::ReceiveIntent {
+                video: Some(v1::VideoIntent { tracks: video }),
+                audio: Some(v1::AudioIntent {
+                    tracks: audio,
+                    mode: if desired.audio.automatic {
+                        v1::AudioMode::Auto
+                    } else {
+                        v1::AudioMode::ExplicitOnly
+                    }
+                    .into(),
+                }),
+            }),
+        })),
+    };
+    pulsebeam_proto::codec::encode_client(&message).map_err(|_| SignalingError::Encode)
 }
 
 pub(crate) fn apply_server_message(
@@ -459,4 +555,84 @@ fn validate_wire_id(field: &'static str, value: &str) -> Result<(), SignalingErr
 fn validate_wire_mid(value: &str) -> Result<(), SignalingError> {
     validate_identifier("mid", value, crate::MAX_MID_BYTES, false)
         .map_err(|_| SignalingError::Invalid("mid"))
+}
+
+#[cfg(test)]
+mod v1_tests {
+    use super::*;
+    use crate::{MediaDirection, PublicationIntent, SlotBinding, VideoSubscription};
+
+    #[test]
+    fn v1_intent_uses_all_media_section_indices_and_preserves_desired_options() {
+        let topology = MediaTopology {
+            local_video: alloc::vec!["camera".into()],
+            local_audio: alloc::vec!["mic".into()],
+            remote_video: 1,
+            remote_audio: 1,
+        };
+        let mut coordinates = BTreeMap::new();
+        for (slot, media_index, kind) in [
+            (MediaSlot::LocalVideo("camera".into()), 2, MediaKind::Video),
+            (MediaSlot::LocalAudio("mic".into()), 4, MediaKind::Audio),
+        ] {
+            coordinates.insert(
+                slot.clone(),
+                SlotBinding {
+                    slot,
+                    mid: "nonnumeric-mid".into(),
+                    media_index,
+                    kind,
+                    direction: MediaDirection::SendOnly,
+                },
+            );
+        }
+        let mut desired = DesiredState::default();
+        desired.publications = alloc::vec![
+            PublicationIntent {
+                slot: "camera".into(),
+                active: true
+            },
+            PublicationIntent {
+                slot: "mic".into(),
+                active: true
+            },
+        ];
+        desired.video = alloc::vec![VideoSubscription {
+            slot: 0,
+            track_id: "opaque-remote-id".into(),
+            height: 360,
+            min_height: 720,
+            min_fps: 15,
+            priority: 2,
+        }];
+        desired.playout_delay = PlayoutDelay::Fixed {
+            min_ms: 3000,
+            max_ms: 500,
+        };
+        let encoded = encode_v1_intent(&desired, &topology, &coordinates, 5).unwrap();
+        let decoded = pulsebeam_proto::codec::decode_client(&encoded).unwrap();
+        let Some(v1::client_message::Payload::Intent(intent)) = decoded.payload else {
+            panic!("expected compressed v1 intent")
+        };
+        assert_eq!(intent.revision, 5);
+        let send = intent.send.unwrap().tracks;
+        assert_eq!(
+            send.iter()
+                .map(|track| track.sender_index)
+                .collect::<Vec<_>>(),
+            alloc::vec![2, 4]
+        );
+        let video = intent.receive.unwrap().video.unwrap().tracks;
+        assert_eq!(video[0].track_id, "opaque-remote-id");
+        let options = video[0].options.as_ref().unwrap();
+        assert_eq!((options.height, options.min_height), (360, 720));
+        assert_eq!(options.playout_delay.as_ref().unwrap().min_ms, 3000);
+        assert_eq!(
+            desired.playout_delay,
+            PlayoutDelay::Fixed {
+                min_ms: 3000,
+                max_ms: 500
+            }
+        );
+    }
 }
