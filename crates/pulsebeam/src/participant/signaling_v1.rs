@@ -182,7 +182,58 @@ pub(crate) struct CatalogPlan {
     next: CatalogState,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MappingError {
+    UnknownTrack,
+    WrongKind,
+    DuplicateReceiver,
+    DuplicateTrack,
+}
+
 impl CatalogState {
+    pub(crate) fn mapping(
+        &self,
+        intent_revision: u64,
+        video: impl IntoIterator<Item = (u32, crate::entity::TrackId)>,
+        audio: impl IntoIterator<Item = (u32, crate::entity::TrackId)>,
+    ) -> Result<pulsebeam_proto::signaling_v1::Mapping, MappingError> {
+        use pulsebeam_proto::signaling_v1::{Mapping, TrackKind, TrackMapping, TrackMappings};
+        let mut used_receivers = HashSet::new();
+        let mut used_tracks = HashSet::new();
+        let mut collect = |assignments: Vec<(u32, crate::entity::TrackId)>, kind| {
+            let mut tracks = Vec::with_capacity(assignments.len());
+            for (receiver_index, id) in assignments {
+                let track_id = id.as_str();
+                let remote = self
+                    .tracks
+                    .get(&track_id)
+                    .ok_or(MappingError::UnknownTrack)?;
+                if remote.kind != kind as i32 {
+                    return Err(MappingError::WrongKind);
+                }
+                if !used_receivers.insert(receiver_index) {
+                    return Err(MappingError::DuplicateReceiver);
+                }
+                if !used_tracks.insert(track_id.clone()) {
+                    return Err(MappingError::DuplicateTrack);
+                }
+                tracks.push(TrackMapping {
+                    receiver_index,
+                    track_id,
+                });
+            }
+            tracks.sort_by_key(|track| track.receiver_index);
+            Ok(TrackMappings { tracks })
+        };
+        let video = collect(video.into_iter().collect(), TrackKind::Video)?;
+        let audio = collect(audio.into_iter().collect(), TrackKind::Audio)?;
+        Ok(Mapping {
+            intent_revision,
+            video: Some(video),
+            audio: Some(audio),
+        })
+    }
+
     pub(crate) fn plan(
         &self,
         peers: impl IntoIterator<Item = super::effect::RoomPeer>,
@@ -522,6 +573,44 @@ mod tests {
         assert!(delta.removed_track_ids.is_empty());
         state.commit(plan);
         assert!(state.plan([], [], recipient, "self").unwrap().is_none());
+    }
+
+    #[test]
+    fn mapping_only_references_committed_catalog_with_unique_coordinates() {
+        let recipient = crate::entity::ParticipantId::new();
+        let publisher = crate::entity::ParticipantId::new();
+        let id = remote_audio(publisher, "mic").id;
+        let mut state = CatalogState::default();
+        let plan = state
+            .plan(
+                [peer(publisher, "alice")],
+                [remote_audio(publisher, "mic")],
+                recipient,
+                "self",
+            )
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            state.mapping(7, [], [(1, id)]),
+            Err(MappingError::UnknownTrack)
+        ));
+        state.commit(plan);
+        let mapped = state.mapping(7, [], [(1, id)]).unwrap();
+        assert_eq!(mapped.intent_revision, 7);
+        assert!(mapped.video.unwrap().tracks.is_empty());
+        assert_eq!(mapped.audio.unwrap().tracks[0].receiver_index, 1);
+        assert!(matches!(
+            state.mapping(7, [(1, id)], []),
+            Err(MappingError::WrongKind)
+        ));
+        assert!(matches!(
+            state.mapping(7, [], [(1, id), (2, id)]),
+            Err(MappingError::DuplicateTrack)
+        ));
+        assert!(matches!(
+            state.mapping(7, [], [(1, id), (1, id)]),
+            Err(MappingError::DuplicateReceiver)
+        ));
     }
 
     #[test]
