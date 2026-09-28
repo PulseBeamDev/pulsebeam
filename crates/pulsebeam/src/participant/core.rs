@@ -96,6 +96,7 @@ pub struct ParticipantConfig {
     pub manual_sub: bool,
     pub room_id: entity::RoomId,
     pub participant_id: entity::ParticipantId,
+    pub participant_external_id: entity::ParticipantExternalId,
     pub connection_id: entity::ConnectionId,
     pub rtc: Rtc,
     pub resources: NegotiatedResources,
@@ -179,7 +180,7 @@ impl Participant {
             room_id: cfg.room_id,
             participant_id: cfg.participant_id,
         };
-        let signaling = Signaling::new(ctx);
+        let signaling = Signaling::new(ctx, cfg.participant_external_id);
         let now = Instant::now();
         #[cfg(feature = "sim")]
         let sim_span = tracing::info_span!(

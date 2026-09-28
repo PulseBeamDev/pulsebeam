@@ -36,6 +36,7 @@ pub struct ParticipantState {
     pub manual_sub: bool,
     pub room_id: RoomId,
     pub participant_id: ParticipantId,
+    pub participant_external_id: crate::entity::ParticipantExternalId,
     pub connection_id: ConnectionId,
     pub old_connection_id: Option<ConnectionId>,
     pub authorization: Option<AuthorizationLease>,
@@ -177,6 +178,7 @@ struct PendingMaterialization {
     command: Option<ShardCommand>,
     ack: Option<oneshot::Receiver<bool>>,
     participant: ParticipantId,
+    participant_external_id: crate::entity::ParticipantExternalId,
     connection_id: ConnectionId,
     authorization: Option<AuthorizationLease>,
     profile: ConnectionProfile,
@@ -683,6 +685,17 @@ impl ControllerActor {
         self.mark_update_touched(shard);
     }
 
+    fn room_peer(&self, id: ParticipantId) -> crate::participant::effect::RoomPeer {
+        crate::participant::effect::RoomPeer {
+            id,
+            external_id: self
+                .core
+                .registry
+                .get_participant(&id)
+                .and_then(|meta| meta.participant_external_id.clone()),
+        }
+    }
+
     fn stage_participant_change_at(
         &mut self,
         room_id: crate::entity::RoomId,
@@ -709,7 +722,7 @@ impl ControllerActor {
                 generation,
                 participant,
                 crate::participant::ParticipantEffect::ParticipantsChanged {
-                    added: added.into_iter().collect(),
+                    added: added.into_iter().map(|id| self.room_peer(id)).collect(),
                     removed: removed.into_iter().collect(),
                 },
             );
@@ -880,6 +893,7 @@ impl ControllerActor {
             }
         };
         let connection_id = state.connection_id;
+        let participant_external_id = state.participant_external_id.clone();
         let authorization = state.authorization;
         let profile = state.profile;
         let config = self.core.prepare_participant(rtc, resources, state);
@@ -894,6 +908,7 @@ impl ControllerActor {
             }),
             ack: Some(ack_rx),
             participant: participant_id,
+            participant_external_id,
             connection_id,
             authorization,
             profile,
@@ -918,6 +933,7 @@ impl ControllerActor {
             pending.connection_id,
             pending.authorization,
             pending.profile,
+            pending.participant_external_id,
             wall_now,
         )?;
         if let Some(previous) = previous {
@@ -932,6 +948,7 @@ impl ControllerActor {
                 .participant_ids_in_room(&room_id)
                 .into_iter()
                 .filter(|participant| *participant != participant_id)
+                .map(|id| self.room_peer(id))
                 .collect();
             self.stage_participant_at(
                 meta.shard_id,
@@ -973,6 +990,7 @@ impl ControllerActor {
         connection_id: ConnectionId,
         authorization: Option<AuthorizationLease>,
         profile: ConnectionProfile,
+        participant_external_id: crate::entity::ParticipantExternalId,
         wall_now: SystemTime,
     ) -> Result<Option<crate::control::registry::ParticipantMeta>, ControllerError> {
         if authorization.is_some_and(|lease| lease.is_expired_at(wall_now)) {
@@ -988,6 +1006,7 @@ impl ControllerActor {
                 transport,
                 connection_id,
                 profile,
+                Some(participant_external_id),
             )
             .map_err(|_| ControllerError::Superseded)?;
         if let Some(lease) = authorization {
@@ -1032,7 +1051,7 @@ impl ControllerActor {
             .core
             .registry
             .get_participant(&participant)
-            .copied()
+            .cloned()
             .filter(|meta| meta.connection_id == connection_id)
         else {
             return;
@@ -1115,7 +1134,7 @@ impl ControllerActor {
                 .core
                 .registry
                 .get_participant(&work.participant_id)
-                .copied()
+                .cloned()
                 .filter(|meta| meta.connection_id == work.connection_id)
             else {
                 continue;
@@ -1231,6 +1250,7 @@ mod replacement_tests {
             connection_id(1),
             Some(lease),
             ConnectionProfile::Native,
+            crate::entity::ParticipantExternalId::new("alice").unwrap(),
             UNIX_EPOCH + Duration::from_secs(10),
         );
 
@@ -1262,6 +1282,7 @@ mod replacement_tests {
                 connection_id(1),
                 Some(lease),
                 ConnectionProfile::Native,
+                crate::entity::ParticipantExternalId::new("alice").unwrap(),
                 UNIX_EPOCH,
             )
             .unwrap();
@@ -1301,6 +1322,7 @@ mod replacement_tests {
                 old_id,
                 Some(old_lease),
                 ConnectionProfile::Native,
+                crate::entity::ParticipantExternalId::new("alice").unwrap(),
                 UNIX_EPOCH,
             )
             .unwrap();
@@ -1316,6 +1338,7 @@ mod replacement_tests {
                 current_id,
                 Some(current_lease),
                 ConnectionProfile::Native,
+                crate::entity::ParticipantExternalId::new("alice").unwrap(),
                 UNIX_EPOCH,
             )
             .unwrap()
@@ -1359,6 +1382,7 @@ mod replacement_tests {
                     connection_id(sequence),
                     Some(lease),
                     ConnectionProfile::Native,
+                    crate::entity::ParticipantExternalId::new("alice").unwrap(),
                     UNIX_EPOCH,
                 )
                 .unwrap();
@@ -1400,6 +1424,7 @@ mod replacement_tests {
                 old_transport,
                 old,
                 ConnectionProfile::Native,
+                None,
             )
             .unwrap();
         actor
@@ -1412,6 +1437,7 @@ mod replacement_tests {
                 current_transport,
                 current,
                 ConnectionProfile::Native,
+                None,
             )
             .unwrap();
 
@@ -1423,6 +1449,7 @@ mod replacement_tests {
                 old_transport,
                 old,
                 ConnectionProfile::Native,
+                None,
             ),
             Err(CommitCandidateError::Superseded)
         );

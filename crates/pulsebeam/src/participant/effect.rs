@@ -1,10 +1,16 @@
-use crate::entity::ParticipantId;
+use crate::entity::{ParticipantExternalId, ParticipantId};
+
+#[derive(Debug, Clone)]
+pub struct RoomPeer {
+    pub id: ParticipantId,
+    pub external_id: Option<ParticipantExternalId>,
+}
 use crate::track::Track;
 
 #[derive(Debug, Clone)]
 pub enum ParticipantEffect {
     ParticipantsChanged {
-        added: Vec<ParticipantId>,
+        added: Vec<RoomPeer>,
         removed: Vec<ParticipantId>,
     },
     TrackCandidateAdded {

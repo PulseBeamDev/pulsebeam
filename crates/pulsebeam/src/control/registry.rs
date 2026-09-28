@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use crate::{
     control::controller::ConnectionProfile,
     control::room::Room,
-    entity::{ConnectionId, ParticipantId, RoomId},
+    entity::{ConnectionId, ParticipantExternalId, ParticipantId, RoomId},
     id::ShardId,
     route::NodeTransportAddress,
 };
@@ -13,10 +13,11 @@ use crate::{
 /// The single owner of `participant -> (shard, room)`. It used to be three
 /// indexes — this registry, the lifecycle state, and a copy on every shard —
 /// which is three chances for them to disagree about where somebody is.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ParticipantMeta {
     pub shard_id: ShardId,
     pub room_id: RoomId,
+    pub participant_external_id: Option<ParticipantExternalId>,
     /// The client's ICE association, kept so teardown can retire it. The
     /// route outlives the negotiation that produced it, so something has to
     /// remember it, and this is the record that already knows who it belongs
@@ -58,6 +59,7 @@ impl RoomRegistry {
             ParticipantMeta {
                 shard_id,
                 room_id,
+                participant_external_id: None,
                 transport,
                 connection_id: ConnectionId::new(),
                 profile: ConnectionProfile::Native,
@@ -95,6 +97,7 @@ impl RoomRegistry {
         transport: NodeTransportAddress,
         connection_id: ConnectionId,
         profile: ConnectionProfile,
+        participant_external_id: Option<ParticipantExternalId>,
     ) -> Result<Option<ParticipantMeta>, CommitCandidateError> {
         if let Some(current) = self.participants.get(&participant_id)
             && current.connection_id >= connection_id
@@ -107,6 +110,7 @@ impl RoomRegistry {
             ParticipantMeta {
                 shard_id,
                 room_id,
+                participant_external_id,
                 transport: Some(transport),
                 connection_id,
                 profile,
@@ -114,7 +118,7 @@ impl RoomRegistry {
                 materialized: true,
             },
         );
-        if let Some(previous) = previous {
+        if let Some(previous) = &previous {
             self.remove_from_room(&previous.room_id, &participant_id, previous.shard_id);
         }
         self.rooms
@@ -350,6 +354,7 @@ mod tests {
             transport(0, 1),
             current,
             ConnectionProfile::Native,
+            None,
         )
         .unwrap();
 
@@ -374,6 +379,7 @@ mod tests {
             transport(0, 1),
             current,
             ConnectionProfile::Native,
+            None,
         )
         .unwrap();
 
@@ -400,6 +406,7 @@ mod tests {
             transport(0, 2),
             newer,
             ConnectionProfile::Native,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -410,6 +417,7 @@ mod tests {
                 transport(0, 1),
                 older,
                 ConnectionProfile::Native,
+                None,
             ),
             Err(CommitCandidateError::Superseded)
         );
@@ -434,6 +442,7 @@ mod tests {
             transport(0, 1),
             old,
             ConnectionProfile::Native,
+            None,
         )
         .unwrap();
         reg.commit_candidate(
@@ -443,6 +452,7 @@ mod tests {
             transport(0, 2),
             current,
             ConnectionProfile::Native,
+            None,
         )
         .unwrap();
 
@@ -471,6 +481,7 @@ mod tests {
                 transport(0, 1),
                 connection_id(1),
                 ConnectionProfile::Native,
+                None,
             )
             .unwrap();
 
