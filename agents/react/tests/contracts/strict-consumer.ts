@@ -49,10 +49,10 @@ const state: AgentState = {
       minHeight: 360,
       minFps: 24,
       priority: 1,
+      playoutDelay: { mode: "fixed", minMs: 50, maxMs: 100 },
     },
   ],
   audio: { automatic: true },
-  playoutDelay: { mode: "fixed", minMs: 50, maxMs: 100 },
   topics: [
     { name: "chat", mode: "ordered", publish: true, subscribe: true },
     { name: "reaction", mode: "latest", publish: true, subscribe: true },

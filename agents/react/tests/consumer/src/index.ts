@@ -24,7 +24,6 @@ const state: AgentState = {
   publications: [],
   video: [],
   audio: { automatic: true },
-  playoutDelay: { mode: "fixed", minMs: 50, maxMs: 100 },
   topics: [],
 };
 

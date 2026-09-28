@@ -12,9 +12,9 @@ use crate::{
     AgentConfig, ChannelId, ConnectionId, ConnectionState, DataChannelEffect, DataChannelEvent,
     DataChannelReliability, DataChannelSpec, DesiredState, Effect, Failure, FailureClass,
     Generation, HostEvent, HttpEffect, HttpEvent, HttpHeader, HttpMethod, HttpRequest,
-    HttpResponse, MediaSlot, Notification, OfferResources, OperationId, ParticipantId,
-    PlayoutDelay, RoomId, RtcEffect, RtcEvent, SlotBinding, Snapshot, TimerEffect, TimerEvent,
-    TimerId, TopicDropReason, TopicError, TopicSend, ValidationError,
+    HttpResponse, MediaSlot, Notification, OfferResources, OperationId, ParticipantId, RoomId,
+    RtcEffect, RtcEvent, SlotBinding, Snapshot, TimerEffect, TimerEvent, TimerId, TopicDropReason,
+    TopicError, TopicSend, ValidationError,
     id::IdGenerator,
     signaling::{self, SignalingError},
     signaling_v1::{self, CatalogState, ServerOutput},
@@ -61,8 +61,6 @@ pub enum AgentError {
     StaleDesiredRevision { received: u64, accepted: u64 },
     #[error("desired revision {0} was reused with different state")]
     ConflictingDesiredRevision(u64),
-    #[error("fixed playout delay cannot return to adaptive within one session")]
-    AdaptiveAfterFixed,
     #[error("authorization token is invalid")]
     InvalidAuthorizationToken,
     #[error("authorization renewal is already in flight")]
@@ -315,19 +313,10 @@ impl Agent {
                 Err(AgentError::ConflictingDesiredRevision(desired.revision))
             };
         }
-        if self.desired.connected
-            && desired.connected
-            && matches!(self.desired.playout_delay, PlayoutDelay::Fixed { .. })
-            && desired.playout_delay == PlayoutDelay::Adaptive
-        {
-            return Err(AgentError::AdaptiveAfterFixed);
-        }
-
         let video_changed = self.desired.video != desired.video;
         let intent_changed = self.desired.publications != desired.publications
             || video_changed
-            || self.desired.audio != desired.audio
-            || self.desired.playout_delay != desired.playout_delay;
+            || self.desired.audio != desired.audio;
         let topics_changed = self.desired.topics != desired.topics;
         let previous_desired = core::mem::replace(&mut self.desired, desired);
         self.snapshot.desired_revision = self.desired.revision;

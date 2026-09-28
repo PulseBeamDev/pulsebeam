@@ -9,10 +9,9 @@ use crate::{Generation, TopicNotification, TopicRegistrations, TopicSnapshot};
 
 pub const MAX_LOCAL_VIDEO_SLOTS: usize = 2;
 pub const MAX_LOCAL_AUDIO_SLOTS: usize = 2;
-pub const MAX_REMOTE_VIDEO_SLOTS: u8 = 7;
+pub const MAX_REMOTE_VIDEO_SLOTS: u8 = 16;
 pub const MAX_REMOTE_AUDIO_SLOTS: u8 = 3;
 pub const MAX_MID_BYTES: usize = 16;
-pub const MAX_PLAYOUT_DELAY_MS: u32 = 40_950;
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct AgentConfig {
@@ -84,29 +83,14 @@ pub struct MediaTopology {
     pub remote_audio: u8,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DesiredState {
     pub revision: u64,
     pub connected: bool,
     pub publications: Vec<PublicationIntent>,
     pub video: Vec<VideoSubscription>,
     pub audio: AudioSubscription,
-    pub playout_delay: PlayoutDelay,
     pub topics: TopicRegistrations,
-}
-
-impl Default for DesiredState {
-    fn default() -> Self {
-        Self {
-            revision: 0,
-            connected: false,
-            publications: Vec::new(),
-            video: Vec::new(),
-            audio: AudioSubscription::default(),
-            playout_delay: PlayoutDelay::Adaptive,
-            topics: TopicRegistrations::default(),
-        }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -123,12 +107,14 @@ pub struct VideoSubscription {
     pub min_height: u32,
     pub min_fps: u32,
     pub priority: u32,
+    pub playout_delay: PlayoutDelay,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AudioSubscription {
     pub pinned: Vec<String>,
     pub automatic: bool,
+    pub playout_delays: BTreeMap<String, PlayoutDelay>,
 }
 
 impl Default for AudioSubscription {
@@ -136,6 +122,7 @@ impl Default for AudioSubscription {
         Self {
             pinned: Vec::new(),
             automatic: true,
+            playout_delays: BTreeMap::new(),
         }
     }
 }
@@ -327,10 +314,8 @@ pub enum ValidationError {
     UnknownPublicationSlot(String),
     #[error("remote video slot {slot} is outside topology capacity {capacity}")]
     UnknownVideoSlot { slot: u8, capacity: u8 },
-    #[error("minimum video height exceeds target height")]
-    VideoHeight,
-    #[error("playout delay bounds are invalid")]
-    PlayoutDelay,
+    #[error("audio playout policy refers to an unpinned track: {0}")]
+    UnknownAudioTrack(String),
     #[error("retry policy is invalid")]
     RetryPolicy,
     #[error("topic name is invalid: {0}")]
@@ -456,9 +441,6 @@ impl DesiredState {
                     capacity: topology.remote_video,
                 });
             }
-            if video.min_height > video.height || (video.height == 0 && video.min_height != 0) {
-                return Err(ValidationError::VideoHeight);
-            }
             if !video_slots.insert(video.slot) {
                 return Err(ValidationError::Duplicate {
                     field: "video slot",
@@ -482,10 +464,10 @@ impl DesiredState {
                 });
             }
         }
-        if let PlayoutDelay::Fixed { min_ms, max_ms } = self.playout_delay
-            && (min_ms > max_ms || max_ms > MAX_PLAYOUT_DELAY_MS)
-        {
-            return Err(ValidationError::PlayoutDelay);
+        for track_id in self.audio.playout_delays.keys() {
+            if !pins.contains(track_id) {
+                return Err(ValidationError::UnknownAudioTrack(track_id.clone()));
+            }
         }
         self.topics.validate()?;
         Ok(())

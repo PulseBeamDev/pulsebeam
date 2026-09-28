@@ -220,12 +220,13 @@ fn desired(revision: u64) -> DesiredState {
             min_height: 180,
             min_fps: 15,
             priority: 100,
+            playout_delay: PlayoutDelay::Adaptive,
         }],
         audio: AudioSubscription {
             pinned: vec!["audio-track".to_string()],
             automatic: true,
+            playout_delays: BTreeMap::new(),
         },
-        playout_delay: PlayoutDelay::Adaptive,
         topics: TopicRegistrations::default(),
     }
 }
@@ -848,26 +849,27 @@ fn construction_and_desired_state_validate_complete_external_input() {
     );
 
     let mut agent = Agent::new(config()).unwrap();
-    let mut invalid_desired = desired(1);
-    invalid_desired.video[0].min_height = 721;
-    assert_eq!(
-        agent.command(AgentCommand::ReplaceDesired(invalid_desired)),
-        Err(AgentError::InvalidConfiguration(
-            ValidationError::VideoHeight
-        ))
-    );
-    assert_eq!(agent.snapshot().desired_revision, 0);
-    assert!(agent.next_effect().is_none());
-
-    let mut invalid_delay = desired(2);
-    invalid_delay.playout_delay = PlayoutDelay::Fixed {
-        min_ms: 200,
-        max_ms: 100,
+    let mut valid = desired(1);
+    valid.video[0].min_height = 721;
+    valid.video[0].playout_delay = PlayoutDelay::Fixed {
+        min_ms: 3000,
+        max_ms: 500,
     };
+    agent.command(AgentCommand::ReplaceDesired(valid)).unwrap();
+    assert_eq!(agent.snapshot().desired_revision, 1);
+
+    let mut invalid = desired(2);
+    invalid.audio.playout_delays.insert(
+        "not-pinned".into(),
+        PlayoutDelay::Fixed {
+            min_ms: 0,
+            max_ms: 0,
+        },
+    );
     assert_eq!(
-        agent.command(AgentCommand::ReplaceDesired(invalid_delay)),
+        agent.command(AgentCommand::ReplaceDesired(invalid)),
         Err(AgentError::InvalidConfiguration(
-            ValidationError::PlayoutDelay
+            ValidationError::UnknownAudioTrack("not-pinned".into())
         ))
     );
 }
@@ -1495,7 +1497,7 @@ fn malformed_signaling_is_transactional() {
 }
 
 #[test]
-fn complete_intent_retracts_omitted_state_and_playout_delay_is_one_way() {
+fn complete_intent_retracts_omitted_state_and_allows_per_track_playout_changes() {
     let (mut agent, generation, cid, initial_send) = connected_agent();
     assert!(agent.next_effect().is_none());
     acknowledge_send(&mut agent, generation, cid, initial_send);
@@ -1504,10 +1506,6 @@ fn complete_intent_retracts_omitted_state_and_playout_delay_is_one_way() {
     retracted.publications.clear();
     retracted.video.clear();
     retracted.audio = AudioSubscription::default();
-    retracted.playout_delay = PlayoutDelay::Fixed {
-        min_ms: 20,
-        max_ms: 100,
-    };
     agent
         .command(AgentCommand::ReplaceDesired(retracted))
         .unwrap();
@@ -1524,22 +1522,57 @@ fn complete_intent_retracts_omitted_state_and_playout_delay_is_one_way() {
     assert!(receive.audio.unwrap().tracks.is_empty());
     acknowledge_send(&mut agent, generation, cid, operation);
 
-    let mut adaptive = desired(3);
-    adaptive.playout_delay = PlayoutDelay::Adaptive;
-    assert_eq!(
-        agent.command(AgentCommand::ReplaceDesired(adaptive)),
-        Err(AgentError::AdaptiveAfterFixed)
+    let mut per_track = desired(3);
+    per_track.video[0].playout_delay = PlayoutDelay::Fixed {
+        min_ms: 20,
+        max_ms: 100,
+    };
+    per_track.audio.playout_delays.insert(
+        "audio-track".into(),
+        PlayoutDelay::Fixed {
+            min_ms: 0,
+            max_ms: 0,
+        },
     );
-    assert_eq!(agent.snapshot().desired_revision, 2);
+    agent
+        .command(AgentCommand::ReplaceDesired(per_track))
+        .unwrap();
+    let next = match next_effect(&mut agent) {
+        Effect::DataChannel(DataChannelEffect::Send { payload, .. }) => decode_intent(&payload),
+        effect => panic!("expected track policy intent, got {effect:?}"),
+    };
+    let receive = next.receive.unwrap();
+    assert_eq!(
+        receive.video.unwrap().tracks[0]
+            .options
+            .as_ref()
+            .unwrap()
+            .playout_delay
+            .as_ref()
+            .unwrap()
+            .min_ms,
+        20
+    );
+    assert_eq!(
+        receive.audio.unwrap().tracks[0]
+            .options
+            .as_ref()
+            .unwrap()
+            .playout_delay
+            .as_ref()
+            .unwrap()
+            .max_ms,
+        0
+    );
 
     let disconnected = DesiredState {
-        revision: 3,
+        revision: 4,
         ..DesiredState::default()
     };
     agent
         .command(AgentCommand::ReplaceDesired(disconnected))
         .unwrap();
-    assert_eq!(agent.snapshot().desired_revision, 3);
+    assert_eq!(agent.snapshot().desired_revision, 4);
 }
 
 #[test]
