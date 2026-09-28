@@ -5,6 +5,7 @@ use alloc::{
     vec,
 };
 use core::time::Duration;
+use pulsebeam_proto::signaling_v1 as wire;
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -32,10 +33,24 @@ macro_rules! agent_log {
     };
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum AgentCommand {
     ReplaceDesired(DesiredState),
+    RenewAuthorization(String),
     SendTopic(TopicSend),
+}
+
+impl core::fmt::Debug for AgentCommand {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::ReplaceDesired(desired) => formatter
+                .debug_tuple("ReplaceDesired")
+                .field(desired)
+                .finish(),
+            Self::RenewAuthorization(_) => formatter.write_str("RenewAuthorization([REDACTED])"),
+            Self::SendTopic(send) => formatter.debug_tuple("SendTopic").field(send).finish(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -48,6 +63,12 @@ pub enum AgentError {
     ConflictingDesiredRevision(u64),
     #[error("fixed playout delay cannot return to adaptive within one session")]
     AdaptiveAfterFixed,
+    #[error("authorization token is invalid")]
+    InvalidAuthorizationToken,
+    #[error("authorization renewal is already in flight")]
+    RenewalBusy,
+    #[error("signaling is not ready for authorization renewal")]
+    RenewalNotReady,
     #[error("host offer resources are invalid: {0}")]
     InvalidOffer(&'static str),
     #[error(transparent)]
@@ -70,6 +91,8 @@ struct Session {
     observed: CatalogState,
     intent_revision: u64,
     authorization_expires_at: Option<i64>,
+    pending_renewal: Option<String>,
+    renewal_send: Option<OperationId>,
     signaling_terminal: bool,
     signaling_channel: ChannelId,
 }
@@ -190,6 +213,7 @@ impl Agent {
     pub fn command(&mut self, command: AgentCommand) -> Result<(), AgentError> {
         let result = match command {
             AgentCommand::ReplaceDesired(desired) => self.replace_desired(desired),
+            AgentCommand::RenewAuthorization(token) => self.renew_authorization(token),
             AgentCommand::SendTopic(send) => self
                 .topics
                 .send(
@@ -230,6 +254,49 @@ impl Agent {
 
     pub fn next_notification(&mut self) -> Option<Notification> {
         self.notifications.pop_front()
+    }
+
+    fn renew_authorization(&mut self, token: String) -> Result<(), AgentError> {
+        if token.is_empty()
+            || token.len() > 16_384
+            || token.bytes().any(|byte| !(b'!'..=b'~').contains(&byte))
+        {
+            return Err(AgentError::InvalidAuthorizationToken);
+        }
+        if !self.desired.connected {
+            self.config.token = token;
+            return Ok(());
+        }
+        let active = self
+            .active
+            .as_mut()
+            .filter(|active| {
+                !active.signaling_terminal && active.authorization_expires_at.is_some()
+            })
+            .ok_or(AgentError::RenewalNotReady)?;
+        if active.pending_renewal.is_some() {
+            return Err(AgentError::RenewalBusy);
+        }
+        let payload = pulsebeam_proto::codec::encode_client(&wire::ClientMessage {
+            payload: Some(wire::client_message::Payload::RenewAuthorization(
+                wire::RenewAuthorization {
+                    token: token.clone(),
+                },
+            )),
+        })
+        .map_err(|_| SignalingError::Encode)?;
+        let operation = self.ids.operation();
+        active.pending_renewal = Some(token);
+        active.renewal_send = Some(operation);
+        self.effects
+            .push_back(Effect::DataChannel(DataChannelEffect::Send {
+                operation,
+                generation: active.generation,
+                channel: active.signaling_channel,
+                binary: true,
+                payload,
+            }));
+        Ok(())
     }
 
     fn replace_desired(&mut self, mut desired: DesiredState) -> Result<(), AgentError> {
@@ -722,7 +789,7 @@ impl Agent {
                 if active.signaling_terminal {
                     return Ok(());
                 }
-                match signaling_v1::decode_and_apply(
+                let output = signaling_v1::decode_and_apply(
                     &payload,
                     &mut active.observed,
                     &mut self.snapshot,
@@ -730,7 +797,24 @@ impl Agent {
                     &active.coordinates,
                     &active.participant_id,
                     &active.participant_external_id,
-                )? {
+                );
+                let output = match output {
+                    Ok(output) => output,
+                    Err(error) => {
+                        active.signaling_terminal = true;
+                        self.pending_signal = None;
+                        self.cancel_signal_retry();
+                        let failure = Failure {
+                            class: FailureClass::Protocol,
+                            message: error.to_string(),
+                        };
+                        self.notify_failure(failure.clone());
+                        self.snapshot.terminal_failure = Some(failure);
+                        self.set_connection_state(ConnectionState::TerminalFailure);
+                        return Err(error.into());
+                    }
+                };
+                match output {
                     ServerOutput::StateChanged => {
                         if active.intent_revision != 0
                             && active.observed.intent_revision == active.intent_revision
@@ -752,7 +836,29 @@ impl Agent {
                         );
                     }
                     ServerOutput::Authorization(expires_at) => {
+                        if active.pending_renewal.is_some()
+                            && active
+                                .authorization_expires_at
+                                .is_some_and(|previous| expires_at <= previous)
+                        {
+                            active.signaling_terminal = true;
+                            let failure = Failure {
+                                class: FailureClass::Protocol,
+                                message: "authorization renewal did not extend the lease"
+                                    .to_string(),
+                            };
+                            self.notify_failure(failure.clone());
+                            self.snapshot.terminal_failure = Some(failure);
+                            self.set_connection_state(ConnectionState::TerminalFailure);
+                            return Err(SignalingError::Invalid("renewal expiry").into());
+                        }
                         active.authorization_expires_at = Some(expires_at);
+                        if let Some(token) = active.pending_renewal.take() {
+                            self.config.token = token;
+                            active.renewal_send = None;
+                        }
+                        self.snapshot.authorization_expires_at = Some(expires_at);
+                        self.snapshot.version = self.snapshot.version.saturating_add(1);
                     }
                     ServerOutput::ServerError(error) => {
                         agent_log!(
@@ -783,6 +889,10 @@ impl Agent {
                             self.snapshot.terminal_failure = Some(failure);
                             self.set_connection_state(ConnectionState::TerminalFailure);
                         } else {
+                            if error.code == wire::ErrorCode::AuthorizationRejected as i32 {
+                                active.pending_renewal = None;
+                                active.renewal_send = None;
+                            }
                             self.notifications
                                 .push_back(Notification::ServerError(error.message));
                         }
@@ -808,7 +918,15 @@ impl Agent {
                 generation,
                 channel,
             } => {
-                if self.pending_signal.as_ref().is_some_and(|pending| {
+                if self.active.as_ref().is_some_and(|active| {
+                    active.generation == generation
+                        && active.signaling_channel == channel
+                        && active.renewal_send == Some(operation)
+                }) {
+                    if let Some(active) = self.active.as_mut() {
+                        active.renewal_send = None;
+                    }
+                } else if self.pending_signal.as_ref().is_some_and(|pending| {
                     pending.operation == operation
                         && pending.generation == generation
                         && pending.channel == channel
@@ -841,7 +959,19 @@ impl Agent {
                 channel,
                 message,
             } => {
-                if self.pending_signal.as_ref().is_some_and(|pending| {
+                if self.active.as_ref().is_some_and(|active| {
+                    active.generation == generation
+                        && active.signaling_channel == channel
+                        && active.renewal_send == Some(operation)
+                }) {
+                    if let Some(active) = self.active.as_mut() {
+                        active.renewal_send = None;
+                        active.pending_renewal = None;
+                    }
+                    self.notify_failure(Failure::transient(
+                        "authorization renewal send failed".to_string(),
+                    ));
+                } else if self.pending_signal.as_ref().is_some_and(|pending| {
                     pending.operation == operation
                         && pending.generation == generation
                         && pending.channel == channel
@@ -923,6 +1053,8 @@ impl Agent {
             observed: CatalogState::default(),
             intent_revision: 0,
             authorization_expires_at: None,
+            pending_renewal: None,
+            renewal_send: None,
             signaling_terminal: false,
             signaling_channel: resources.signaling_channel,
         }) && previous.generation != attempt.generation
@@ -944,6 +1076,7 @@ impl Agent {
         if let Some(active) = &self.active {
             self.snapshot.generation = Some(active.generation);
             self.snapshot.participant_id = Some(active.participant_id.clone());
+            self.snapshot.authorization_expires_at = None;
             self.topics.bind(
                 active.generation,
                 active.participant_id.clone(),
@@ -1039,9 +1172,17 @@ impl Agent {
         entropy ^= entropy >> 30;
         entropy = entropy.wrapping_mul(0xbf58_476d_1ce4_e5b9);
         entropy ^= entropy >> 27;
-        let jitter = u64::from(entropy as u32) * (base.as_millis() as u64 / 2 + 1)
-            / (u64::from(u32::MAX) + 1);
-        let delay = base / 2 + Duration::from_millis(jitter);
+        let jitter = u64::try_from(
+            u128::from(entropy & u64::from(u32::MAX))
+                .saturating_mul(base.as_millis().saturating_div(2).saturating_add(1))
+                .checked_div(u128::from(u32::MAX).saturating_add(1))
+                .unwrap_or_default(),
+        )
+        .unwrap_or_default();
+        let delay = base
+            .checked_div(2)
+            .unwrap_or_default()
+            .saturating_add(Duration::from_millis(jitter));
         agent_log!(
             self,
             Info,
@@ -1257,6 +1398,7 @@ impl Agent {
         self.pending_signal = None;
         self.snapshot.generation = None;
         self.snapshot.participant_id = None;
+        self.snapshot.authorization_expires_at = None;
         self.clear_observed_state();
         self.snapshot.terminal_failure = None;
         self.set_connection_state(ConnectionState::Disconnected);

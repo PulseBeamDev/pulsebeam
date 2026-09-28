@@ -48,7 +48,7 @@ pub enum TimerEffect {
     Cancel { timer: TimerId },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum DataChannelEffect {
     Send {
         operation: OperationId,
@@ -57,6 +57,27 @@ pub enum DataChannelEffect {
         binary: bool,
         payload: Vec<u8>,
     },
+}
+
+impl core::fmt::Debug for DataChannelEffect {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Send {
+                operation,
+                generation,
+                channel,
+                binary,
+                ..
+            } => formatter
+                .debug_struct("Send")
+                .field("operation", operation)
+                .field("generation", generation)
+                .field("channel", channel)
+                .field("binary", binary)
+                .field("payload", &"[REDACTED]")
+                .finish(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

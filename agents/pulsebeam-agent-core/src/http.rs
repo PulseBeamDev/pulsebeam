@@ -8,10 +8,27 @@ pub struct HttpRequest {
     pub body: Vec<u8>,
 }
 
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct HttpHeader {
     pub name: String,
     pub value: String,
+}
+
+impl core::fmt::Debug for HttpHeader {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("HttpHeader")
+            .field("name", &self.name)
+            .field(
+                "value",
+                &if self.name.eq_ignore_ascii_case("authorization") {
+                    "[REDACTED]"
+                } else {
+                    &self.value
+                },
+            )
+            .finish()
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
