@@ -29,21 +29,33 @@ export interface PublicationIntent {
   readonly active: boolean;
 }
 
-export interface VideoDemand {
+export interface TrackSelector {
+  readonly participantExternalId: string;
+  readonly label: string;
+}
+
+export type VideoDemand = {
   readonly slot: number;
-  readonly trackId: string;
   readonly height: number;
   readonly minHeight: number;
   readonly minFps: number;
   readonly priority: number;
   readonly playoutDelay?: FixedPlayoutDelay;
-}
+} & (
+  | { readonly trackId: string; readonly selector?: never }
+  | { readonly trackId?: never; readonly selector: TrackSelector }
+);
 
 export interface AudioDemand {
   readonly pinned?: readonly string[];
+  readonly selected?: readonly TrackSelector[];
   readonly automatic?: boolean;
   readonly playoutDelays?: readonly {
     readonly trackId: string;
+    readonly playoutDelay: FixedPlayoutDelay;
+  }[];
+  readonly selectorDelays?: readonly {
+    readonly selector: TrackSelector;
     readonly playoutDelay: FixedPlayoutDelay;
   }[];
 }

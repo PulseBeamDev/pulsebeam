@@ -23,14 +23,17 @@ agent.setState({
   video: [
     {
       slot: 0,
-      trackId: "speaker-camera",
+      selector: { participantExternalId: "speaker", label: "camera" },
       height: 720,
       minHeight: 180,
       minFps: 15,
       priority: 100,
     },
   ],
-  audio: { pinned: ["speaker-microphone"], automatic: true },
+  audio: {
+    selected: [{ participantExternalId: "speaker", label: "microphone" }],
+    automatic: true,
+  },
   topics: [{ name: "presence", mode: "latest", subscribe: true }],
 });
 
@@ -44,7 +47,9 @@ const unsubscribeEvents = agent.subscribeEvents((event) => {
 is still initializing. The facade retains only the latest complete desired
 state during initialization and then gives it to the browser runtime. Omitted
 publication, video, audio-pinning, and topic collections are empty, retracting
-their previous desired values.
+their previous desired values. Selectors resolve against the current Catalog;
+missing tracks stay desired but are not sent in Intent until they appear. Low-level
+callers can use Catalog TrackIds through `trackId` and `audio.pinned` instead.
 
 The endpoint is the absolute HTTP(S) PulseBeam server endpoint; the core adds
 `/api/v1/native`. The opaque token is sent only as bearer authorization. Local

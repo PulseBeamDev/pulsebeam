@@ -38,6 +38,28 @@ pub(crate) struct CatalogState {
 }
 
 impl CatalogState {
+    pub(crate) fn resolve(
+        &self,
+        selector: &crate::TrackSelector,
+        kind: crate::MediaKind,
+    ) -> Option<&str> {
+        let wire_kind = match kind {
+            crate::MediaKind::Video => wire::TrackKind::Video,
+            crate::MediaKind::Audio => wire::TrackKind::Audio,
+        };
+        self.tracks.iter().find_map(|(id, track)| {
+            (track.kind == wire_kind as i32
+                && track.label == selector.label
+                && self
+                    .participants
+                    .get(&track.participant_id)
+                    .is_some_and(|participant| {
+                        participant.participant_external_id == selector.participant_external_id
+                    }))
+            .then_some(id.as_str())
+        })
+    }
+
     pub(crate) fn apply(
         &mut self,
         incoming: wire::Catalog,
