@@ -198,4 +198,90 @@ mod tests {
             }
         );
     }
+
+    #[test]
+    fn per_track_playout_does_not_leak_to_default_video_or_audio() {
+        let topology = MediaTopology {
+            local_video: Vec::new(),
+            local_audio: Vec::new(),
+            remote_video: 2,
+            remote_audio: 2,
+        };
+        let desired = DesiredState {
+            video: alloc::vec![
+                VideoSubscription {
+                    slot: 0,
+                    track_id: "fixed-video".into(),
+                    height: 720,
+                    min_height: 0,
+                    min_fps: 0,
+                    priority: 0,
+                    playout_delay: PlayoutDelay::Fixed {
+                        min_ms: 15,
+                        max_ms: 14,
+                    },
+                },
+                VideoSubscription {
+                    slot: 1,
+                    track_id: "default-video".into(),
+                    height: 360,
+                    min_height: 0,
+                    min_fps: 0,
+                    priority: 0,
+                    playout_delay: PlayoutDelay::Adaptive,
+                },
+            ],
+            audio: crate::AudioSubscription {
+                pinned: alloc::vec!["default-audio".into(), "fixed-audio".into()],
+                automatic: true,
+                playout_delays: BTreeMap::from([(
+                    "fixed-audio".into(),
+                    PlayoutDelay::Fixed {
+                        min_ms: 3000,
+                        max_ms: 500,
+                    },
+                )]),
+            },
+            ..DesiredState::default()
+        };
+        let encoded = encode_v1_intent(&desired, &topology, &BTreeMap::new(), 1).unwrap();
+        let decoded = pulsebeam_proto::codec::decode_client(&encoded).unwrap();
+        let Some(wire::client_message::Payload::Intent(intent)) = decoded.payload else {
+            panic!("expected intent");
+        };
+        let receive = intent.receive.unwrap();
+        let video = receive.video.unwrap().tracks;
+        assert_eq!(
+            video[0]
+                .options
+                .as_ref()
+                .unwrap()
+                .playout_delay
+                .as_ref()
+                .unwrap()
+                .min_ms,
+            15
+        );
+        assert!(video[1].options.as_ref().unwrap().playout_delay.is_none());
+        let audio = receive.audio.unwrap().tracks;
+        assert!(audio[0].options.as_ref().unwrap().playout_delay.is_none());
+        assert_eq!(
+            audio[1]
+                .options
+                .as_ref()
+                .unwrap()
+                .playout_delay
+                .as_ref()
+                .unwrap()
+                .max_ms,
+            500
+        );
+        assert_eq!(
+            desired.audio.playout_delays["fixed-audio"],
+            PlayoutDelay::Fixed {
+                min_ms: 3000,
+                max_ms: 500,
+            }
+        );
+    }
 }
