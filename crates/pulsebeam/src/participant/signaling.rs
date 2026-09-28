@@ -207,7 +207,7 @@ impl Signaling {
             // `Mid` is a fixed-size (16-byte) identifier and will truncate longer strings.
             let mid = Mid::from(req.mid.as_str());
 
-            if req.height == 0 {
+            if req.height == 0 && req.min_height == 0 {
                 continue;
             }
 
@@ -216,7 +216,7 @@ impl Signaling {
                 Intent {
                     track_id,
                     target_height: req.height,
-                    min_height: req.min_height.min(req.height),
+                    min_height: req.min_height,
                     min_fps: req.min_fps,
                     priority: req.priority,
                 },
@@ -542,6 +542,32 @@ mod tests {
         let intent = AudioIntent::default();
         assert!(intent.auto);
         assert!(intent.pinned.is_empty());
+    }
+
+    #[test]
+    fn zero_video_target_keeps_an_explicit_spatial_floor() {
+        let room = crate::entity::RoomExternalId::new("room").unwrap();
+        let ctx = LogCtx {
+            room_id: crate::entity::RoomId::from_external(&room),
+            participant_id: crate::entity::ParticipantId::new(),
+        };
+        let track_id = crate::entity::VideoTrackId::derive(&ctx.participant_id, "camera");
+        let mut signaling = Signaling::new(ctx);
+        signaling.apply_client_intent(signaling::ClientIntent {
+            video: vec![signaling::VideoIntent {
+                mid: "v0".to_owned(),
+                track_id: track_id.to_string(),
+                height: 0,
+                min_height: 720,
+                min_fps: 0,
+                priority: 0,
+            }],
+            ..Default::default()
+        });
+        let intents = signaling.last_client_intents.unwrap();
+        let request = &intents[&Mid::from("v0")];
+        assert_eq!(request.target_height, 0);
+        assert_eq!(request.min_height, 720);
     }
 
     #[test]
