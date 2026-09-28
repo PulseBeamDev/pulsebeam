@@ -137,7 +137,7 @@ function RoomSession({
     tiles,
     spotlightFrame,
     setPin,
-  } = useVideoLayout(agent.publications, agent.participantId);
+  } = useVideoLayout(agent.catalog.publications, agent.participantId);
   const onBlocked = useCallback((reason: string, retry: PlaybackRetry) => {
     setFailure(`Playback: ${reason}`);
     setPlaybackRetry(() => retry);
@@ -160,8 +160,8 @@ function RoomSession({
     );
   }, [agent, latency, screen, selected]);
   const blocked = failure ?? topicError ?? agent.failure?.message;
-  const audioTracks = agent.audio
-    .map((binding) => agent.tracks[binding.trackId])
+  const audioTracks = agent.mapping.audio
+    .map((binding) => agent.tracks[binding.publicationId])
     .filter((track): track is RemoteTrack => track?.kind === "audio");
   const label = (id: string) => publicationById.get(id)?.participantId ?? id;
   return (

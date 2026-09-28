@@ -53,6 +53,13 @@ const desired: AgentState = {
 agent.setState(desired);
 
 const snapshot: AgentSnapshot = agent.getSnapshot();
+const catalogRevision: number = snapshot.catalog.revision;
+const acceptedIntentRevision: number = snapshot.mapping.acceptedIntentRevision;
+const mappedPublication: string | undefined =
+  snapshot.mapping.audio[0]?.publicationId;
+void catalogRevision;
+void acceptedIntentRevision;
+void mappedPublication;
 if (snapshot.failure) {
   const failure: AgentFailure = snapshot.failure;
   const failureClass: FailureClass = failure.class;

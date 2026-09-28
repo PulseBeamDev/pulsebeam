@@ -401,6 +401,10 @@ fn update_snapshot(
     if snapshot.audio != audio {
         notifications.push_back(Notification::AudioBindingsChanged(audio.clone()));
     }
+    snapshot.catalog_revision = state.revision;
+    snapshot.accepted_intent_revision = state.intent_revision;
+    snapshot.video_mapping = state.video.clone();
+    snapshot.audio_mapping = state.audio.clone();
     snapshot.participants = participants;
     snapshot.publications = publications;
     snapshot.video = video;

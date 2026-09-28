@@ -1439,6 +1439,8 @@ fn signaling_snapshot_diff_and_empty_binding_groups_are_exact() {
             payload: server_payload(server_message::Payload::Catalog(initial)),
         }))
         .unwrap();
+    assert_eq!(agent.snapshot().catalog_revision, 1);
+    assert_eq!(agent.snapshot().accepted_intent_revision, 0);
     assert_eq!(agent.snapshot().participants.len(), 1);
     assert_eq!(agent.snapshot().publications.len(), 2);
     assert_eq!(
@@ -1471,6 +1473,9 @@ fn signaling_snapshot_diff_and_empty_binding_groups_are_exact() {
             })),
         }))
         .unwrap();
+    assert_eq!(agent.snapshot().accepted_intent_revision, 1);
+    assert_eq!(agent.snapshot().video_mapping[&4], "video-track");
+    assert_eq!(agent.snapshot().audio_mapping[&2], "audio-track");
     assert_eq!(agent.snapshot().video["rv0"].track_id, "video-track");
     assert_eq!(agent.snapshot().audio[0].mid, "ra0");
     let notifications = drain_notifications(&mut agent);
@@ -1495,6 +1500,8 @@ fn signaling_snapshot_diff_and_empty_binding_groups_are_exact() {
         .unwrap();
     assert!(agent.snapshot().video.is_empty());
     assert!(agent.snapshot().audio.is_empty());
+    assert!(agent.snapshot().video_mapping.is_empty());
+    assert!(agent.snapshot().audio_mapping.is_empty());
     assert_eq!(
         drain_notifications(&mut agent),
         vec![

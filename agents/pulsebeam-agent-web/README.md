@@ -72,10 +72,12 @@ Logging is configured independently for each agent with `logging.level`.
 Messages use the browser console. The default level is `warn`. Chrome hides
 `debug` and `trace` console messages unless Verbose output is enabled.
 
-Snapshots contain participants and discoverable publications independently of
-whether media is currently bound. Available remote `MediaStreamTrack` objects
-are exposed in `snapshot.tracks`, keyed by publication ID. Snapshot records and
-collections are immutable and retain identity until an observable update;
+Snapshots keep `catalog` (revision, participants, publications) separate from
+`mapping` (accepted Intent revision and receiver-index bindings). Publications
+remain discoverable independently of whether media is currently bound. Available
+remote `MediaStreamTrack` objects are exposed in `snapshot.tracks`, keyed by
+publication ID; offer-specific MIDs remain private to the host. Snapshot records
+and collections are immutable and retain identity until an observable update;
 platform track objects themselves are not frozen.
 
 Topics support `latest` and `ordered` registrations and sends. Event
