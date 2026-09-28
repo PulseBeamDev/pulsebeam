@@ -9,17 +9,17 @@ const agent = createAgent({
   endpoint: "https://pulsebeam.example",
   token,
   topology: {
-    localAudio: ["microphone"],
-    localVideo: ["camera", "screen"],
-    remoteAudio: 3,
-    remoteVideo: 7,
+    localAudios: 1,
+    localVideos: 2,
+    remoteAudios: 3,
+    remoteVideos: 7,
   },
   logging: { level: "debug" },
 });
 
 agent.setState({
   connected: true,
-  publications: [{ slot: "microphone", active: true }],
+  publications: [{ slot: "a0", label: "microphone", active: true }],
   video: [
     {
       slot: 0,
@@ -47,11 +47,13 @@ publication, video, audio-pinning, and topic collections are empty, retracting
 their previous desired values.
 
 The endpoint is the absolute HTTP(S) PulseBeam server endpoint; the core adds
-`/api/v1/native`. The opaque token is sent only as bearer authorization. Local slots
-are named by the topology and are limited to two audio and two video slots;
-remote capacities are limited to three audio and seven video slots.
+`/api/v1/native`. The opaque token is sent only as bearer authorization. Local
+counts reserve sender slots `v0`, `v1`, ... and `a0`, `a1`, ...; each direction
+supports up to 32 media sections. A publication's label is bound to its sender
+slot on first use and cannot be changed or reused for another slot of the same
+kind during the Agent lifetime.
 
-Use `replaceLocalTrack` and `setLocalMuted` for declared local slots. The
+Use `replaceLocalTrack` and `setLocalMuted` for reserved local slots. The
 runtime validates media kinds and sender settings. Omitted or empty encoding
 settings enable the runtime's default three-layer video or single-layer audio
 sender configuration; explicit video and audio settings contain three and one

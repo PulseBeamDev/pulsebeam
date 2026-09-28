@@ -16,7 +16,7 @@ declare const attachment: RemoteMediaAttachment;
 const config: AgentConfig = {
   endpoint: "https://pulsebeam.example",
   token: "opaque-token",
-  topology: { localVideo: ["camera"], localAudio: ["mic"] },
+  topology: { localVideos: 1, localAudios: 1 },
 };
 const agent: Agent = createAgent(config);
 const state: AgentState = {

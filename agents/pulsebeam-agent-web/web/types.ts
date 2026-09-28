@@ -8,10 +8,10 @@ export interface AgentLogging {
 }
 
 export interface MediaTopology {
-  readonly localVideo?: readonly string[];
-  readonly localAudio?: readonly string[];
-  readonly remoteVideo?: number;
-  readonly remoteAudio?: number;
+  readonly localVideos?: number;
+  readonly localAudios?: number;
+  readonly remoteVideos?: number;
+  readonly remoteAudios?: number;
 }
 
 export interface AgentConfig {

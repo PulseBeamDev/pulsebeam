@@ -16,10 +16,10 @@ const agent = createAgent({
   endpoint: "https://pulsebeam.example",
   token: "opaque-token",
   topology: {
-    localAudio: ["microphone"],
-    localVideo: ["camera", "screen"],
-    remoteAudio: 3,
-    remoteVideo: 7,
+    localAudios: 1,
+    localVideos: 2,
+    remoteAudios: 3,
+    remoteVideos: 7,
   },
   logging: { level: "debug" },
 });
@@ -32,7 +32,7 @@ legacyConfig.requestHeaders;
 
 const desired: AgentState = {
   connected: true,
-  publications: [{ slot: "microphone", label: "microphone", active: true }],
+  publications: [{ slot: "a0", label: "microphone", active: true }],
   video: [
     {
       slot: 0,
@@ -75,12 +75,11 @@ const removeEvents = agent.subscribeEvents((event: AgentEvent) => {
     void failureMessage;
   }
 });
-const replacement: Promise<void> = agent.replaceLocalTrack(
-  "microphone",
-  audioTrack,
-  { contentHint: "speech", encodings: [] },
-);
-const muted: Promise<void> = agent.setLocalMuted("microphone", true);
+const replacement: Promise<void> = agent.replaceLocalTrack("a0", audioTrack, {
+  contentHint: "speech",
+  encodings: [],
+});
+const muted: Promise<void> = agent.setLocalMuted("a0", true);
 const attachment: RemoteMediaAttachment = attachRemoteMedia(
   agent,
   audioElement,

@@ -315,12 +315,13 @@ impl Agent {
                 Err(AgentError::ConflictingDesiredRevision(desired.revision))
             };
         }
+        let local_slot = |name: &str| match self.config.topology.local_slot_kind(name) {
+            Some(crate::MediaKind::Video) => MediaSlot::LocalVideo(name.to_string()),
+            Some(crate::MediaKind::Audio) => MediaSlot::LocalAudio(name.to_string()),
+            None => unreachable!("validated publication slot"),
+        };
         for publication in &desired.publications {
-            let slot = if self.config.topology.local_video.contains(&publication.slot) {
-                MediaSlot::LocalVideo(publication.slot.clone())
-            } else {
-                MediaSlot::LocalAudio(publication.slot.clone())
-            };
+            let slot = local_slot(&publication.slot);
             if self
                 .local_bindings
                 .get(&slot)
@@ -335,12 +336,8 @@ impl Agent {
             }
         }
         for publication in &desired.publications {
-            let slot = if self.config.topology.local_video.contains(&publication.slot) {
-                MediaSlot::LocalVideo(publication.slot.clone())
-            } else {
-                MediaSlot::LocalAudio(publication.slot.clone())
-            };
-            self.local_bindings.insert(slot, publication.label.clone());
+            self.local_bindings
+                .insert(local_slot(&publication.slot), publication.label.clone());
         }
         let video_changed = self.desired.video != desired.video;
         let intent_changed = self.desired.publications != desired.publications

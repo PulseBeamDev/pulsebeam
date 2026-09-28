@@ -74,10 +74,10 @@ export function Room({
       endpoint,
       token,
       topology: {
-        localVideo: ["camera", "screen"],
-        localAudio: ["microphone"],
-        remoteVideo: 7,
-        remoteAudio: 3,
+        localVideos: 2,
+        localAudios: 1,
+        remoteVideos: 7,
+        remoteAudios: 3,
       },
       logging: { level: "debug" },
     });
@@ -146,7 +146,7 @@ function RoomSession({
     agent.setState(
       desiredState(
         true,
-        ["camera", "microphone", ...(screen ? ["screen"] : [])],
+        ["camera", "microphone", ...(screen ? (["screen"] as const) : [])],
         selected.map(({ id, slot, height, priority }) => ({
           slot,
           trackId: id,

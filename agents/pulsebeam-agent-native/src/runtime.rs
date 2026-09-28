@@ -786,16 +786,16 @@ impl Actor {
                             .config
                             .session
                             .topology
-                            .local_video
-                            .contains(&publication.slot)
+                            .local_slot_kind(&publication.slot)
+                            == Some(agent_core::MediaKind::Video)
                         {
                             Some(MediaSlot::LocalVideo(publication.slot.clone()))
                         } else if self
                             .config
                             .session
                             .topology
-                            .local_audio
-                            .contains(&publication.slot)
+                            .local_slot_kind(&publication.slot)
+                            == Some(agent_core::MediaKind::Audio)
                         {
                             Some(MediaSlot::LocalAudio(publication.slot.clone()))
                         } else {
@@ -912,8 +912,14 @@ impl Actor {
 
     fn slot_exists(&self, slot: &MediaSlot) -> bool {
         match slot {
-            MediaSlot::LocalVideo(name) => self.config.session.topology.local_video.contains(name),
-            MediaSlot::LocalAudio(name) => self.config.session.topology.local_audio.contains(name),
+            MediaSlot::LocalVideo(name) => {
+                self.config.session.topology.local_slot_kind(name)
+                    == Some(agent_core::MediaKind::Video)
+            }
+            MediaSlot::LocalAudio(name) => {
+                self.config.session.topology.local_slot_kind(name)
+                    == Some(agent_core::MediaKind::Audio)
+            }
             MediaSlot::RemoteVideo(index) => *index < self.config.session.topology.remote_video,
             MediaSlot::RemoteAudio(index) => *index < self.config.session.topology.remote_audio,
         }
@@ -1673,18 +1679,9 @@ impl Actor {
 }
 
 fn topology_slots(topology: &agent_core::MediaTopology) -> Vec<MediaSlot> {
-    topology
-        .local_video
-        .iter()
-        .cloned()
-        .map(MediaSlot::LocalVideo)
-        .chain(
-            topology
-                .local_audio
-                .iter()
-                .cloned()
-                .map(MediaSlot::LocalAudio),
-        )
+    (0..topology.local_video)
+        .map(|index| MediaSlot::LocalVideo(format!("v{index}")))
+        .chain((0..topology.local_audio).map(|index| MediaSlot::LocalAudio(format!("a{index}"))))
         .chain((0..topology.remote_video).map(MediaSlot::RemoteVideo))
         .chain((0..topology.remote_audio).map(MediaSlot::RemoteAudio))
         .collect()
@@ -1774,8 +1771,8 @@ mod tests {
             endpoint: "http://pulsebeam.test".into(),
             token: "token".into(),
             topology: agent_core::MediaTopology {
-                local_video: vec!["camera".into()],
-                local_audio: vec!["microphone".into()],
+                local_video: 1,
+                local_audio: 1,
                 remote_video: 1,
                 remote_audio: 1,
             },
@@ -1818,8 +1815,8 @@ mod tests {
         assert_eq!(
             slots,
             vec![
-                MediaSlot::LocalVideo("camera".into()),
-                MediaSlot::LocalAudio("microphone".into()),
+                MediaSlot::LocalVideo("v0".into()),
+                MediaSlot::LocalAudio("a0".into()),
                 MediaSlot::RemoteVideo(0),
                 MediaSlot::RemoteAudio(0),
             ]

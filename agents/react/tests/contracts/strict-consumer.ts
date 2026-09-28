@@ -26,10 +26,10 @@ const config: AgentConfig = {
   endpoint: "https://pulsebeam.example",
   token: "opaque-token",
   topology: {
-    localVideo: ["camera", "screen"],
-    localAudio: ["mic"],
-    remoteVideo: 9,
-    remoteAudio: 9,
+    localVideos: 2,
+    localAudios: 1,
+    remoteVideos: 9,
+    remoteAudios: 9,
   },
   logging: { level: "info" },
 };
@@ -37,9 +37,9 @@ const agent: Agent = createAgent(config);
 const state: AgentState = {
   connected: true,
   publications: [
-    { slot: "camera", label: "camera", active: true },
-    { slot: "mic", label: "mic", active: true },
-    { slot: "screen", label: "screen", active: true },
+    { slot: "v0", label: "camera", active: true },
+    { slot: "a0", label: "mic", active: true },
+    { slot: "v1", label: "screen", active: true },
   ],
   video: [
     {
@@ -77,8 +77,8 @@ const participantId = result.participantId;
 const tracks: Readonly<Record<string, RemoteTrack>> = result.tracks;
 result.setState(state);
 const sender: VideoSenderConfig = { contentHint: "motion" };
-void result.replaceLocalTrack("camera", media, sender);
-void result.setLocalMuted("mic", false);
+void result.replaceLocalTrack("v0", media, sender);
+void result.setLocalMuted("a0", false);
 result.reconnect();
 const mode: TopicMode = "ordered";
 result.sendTopic("chat", mode, new Uint8Array());
