@@ -489,7 +489,24 @@ impl Transport {
     }
 
     pub(crate) fn poll_event(&mut self) -> Option<TransportEvent> {
+        if let Some(index) = self
+            .events
+            .iter()
+            .rposition(|event| matches!(event, TransportEvent::SelectedPathChanged { .. }))
+        {
+            let latest = self.events.remove(index);
+            // The next commit uses the current path, never an intermediate queued epoch.
+            self.events
+                .retain(|event| !matches!(event, TransportEvent::SelectedPathChanged { .. }));
+            return latest;
+        }
         self.events.pop_front()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reselect_path_for_test(&mut self) -> Result<(), TransportError> {
+        let selected = self.selected.clone().ok_or(TransportError::Protocol)?;
+        self.select_path(SelectedPath::unselected(selected.envelope))
     }
 
     pub(crate) fn smoothed_rtt(&self) -> Option<Duration> {
@@ -1648,6 +1665,68 @@ mod tests {
         assert_eq!(prepared.wire_len, prepared.bytes.len());
         assert_eq!(prepared.path_epoch, None);
         assert_eq!(prepared.rtp, None);
+    }
+
+    #[test]
+    fn latest_selected_path_precedes_queued_old_path_feedback() {
+        let local_certificate = certificate();
+        let remote_certificate = certificate();
+        let local = address(6260);
+        let remote = address(6261);
+        let now = Instant::now();
+        let mut transport = Transport::new(
+            config(local, remote, local_certificate, &remote_certificate, true),
+            now,
+        )
+        .expect("transport");
+        transport.events.clear();
+        transport.transmissions.clear();
+        let path = || SelectedPath::unselected(NetworkEnvelope::Udp { local, remote });
+        transport.select_path(path()).expect("initial path");
+        transport.poll_event().expect("initial selection");
+        let old_feedback = TransportEvent::Rtcp {
+            arrival: TimePoint {
+                monotonic: now,
+                global: GlobalMediaTime::from_micros(0),
+            },
+            path_epoch: PathEpoch(1),
+            bytes: vec![0x80, 201, 0, 1, 0, 0, 0, 7],
+        };
+        transport.push_event(old_feedback).expect("old feedback");
+        transport.clear_selected_path().expect("unavailable");
+        transport.select_path(path()).expect("replacement");
+        assert!(matches!(
+            transport.poll_event(),
+            Some(TransportEvent::SelectedPathChanged {
+                current: Some(_),
+                epoch: PathEpoch(3),
+                ..
+            })
+        ));
+        assert!(matches!(
+            transport.poll_event(),
+            Some(TransportEvent::Rtcp {
+                path_epoch: PathEpoch(1),
+                ..
+            })
+        ));
+        assert!(
+            transport.poll_event().is_none(),
+            "superseded transitions must not rewind history"
+        );
+        transport
+            .push_event(TransportEvent::Data(vec![1]))
+            .expect("data");
+        transport.clear_selected_path().expect("unavailable");
+        assert!(matches!(
+            transport.poll_event(),
+            Some(TransportEvent::SelectedPathChanged {
+                current: None,
+                epoch: PathEpoch(4),
+                ..
+            })
+        ));
+        assert_eq!(transport.poll_event(), Some(TransportEvent::Data(vec![1])));
     }
 
     #[test]

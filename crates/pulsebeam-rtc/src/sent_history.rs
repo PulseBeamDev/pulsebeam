@@ -85,6 +85,7 @@ pub(crate) struct PathChange {
 pub(crate) struct ControllerInputs {
     pub(crate) feedback: Vec<PacketFeedback>,
     pub(crate) synthetic: Vec<PacketFeedback>,
+    pub(crate) exhausted: bool,
     pub(crate) timing: Option<FeedbackTiming>,
     pub(crate) fresh_network_feedback: bool,
     pub(crate) path_change: Option<PathChange>,
@@ -134,6 +135,7 @@ struct SentEntry {
     service: RtpService,
     acknowledgment: Acknowledgment,
     missing_since: Option<Instant>,
+    frozen_reorder_deadline: Option<Instant>,
     in_flight: bool,
 }
 
@@ -177,7 +179,9 @@ pub(crate) struct SentHistory {
     counters: HistoryCounters,
     bytes_in_flight: u64,
     reordering_window: Duration,
+    observed_reordering_window: Duration,
     missing: VecDeque<SentPacketId>,
+    loss_work: usize,
 }
 
 impl SentHistory {
@@ -208,7 +212,9 @@ impl SentHistory {
             counters: HistoryCounters::default(),
             bytes_in_flight: 0,
             reordering_window: INITIAL_REORDERING_WINDOW,
+            observed_reordering_window: INITIAL_REORDERING_WINDOW,
             missing: VecDeque::new(),
+            loss_work: 0,
         }
     }
 
@@ -261,6 +267,7 @@ impl SentHistory {
             service: rtp.service,
             acknowledgment: Acknowledgment::Pending,
             missing_since: None,
+            frozen_reorder_deadline: None,
             in_flight: true,
         });
         self.next_sent_id = self
@@ -347,6 +354,7 @@ impl SentHistory {
         self.newest_twcc = None;
         self.missing.clear();
         self.reordering_window = INITIAL_REORDERING_WINDOW;
+        self.observed_reordering_window = INITIAL_REORDERING_WINDOW;
         for ssrc in &mut self.ssrcs {
             ssrc.last_report_timestamp = None;
             ssrc.highest_acked_sequence = None;
@@ -415,6 +423,7 @@ impl SentHistory {
     }
 
     pub(crate) fn clear_controller_inputs(&mut self) {
+        self.loss_work = 0;
         self.inputs.feedback.clear();
         self.inputs.synthetic.clear();
         self.inputs.timing = None;

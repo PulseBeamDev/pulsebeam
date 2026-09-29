@@ -50,6 +50,7 @@ pub struct PeerFixture {
     peer_connected: bool,
     connection_connected: bool,
     twcc_sent: usize,
+    feedback_enabled: bool,
     peer_channel: Option<str0m_reference::channel::ChannelId>,
     network: DeterministicNetwork,
     native_target: Option<fn(&Connection) -> Duration>,
@@ -61,6 +62,21 @@ pub struct NetworkPolicy {
     pub drop_every: Option<u64>,
     pub duplicate_every: Option<u64>,
     pub reorder_every: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum RtpImpairment {
+    Random {
+        per_mille: u64,
+    },
+    Burst {
+        every: u64,
+        length: u64,
+    },
+    Policer {
+        bits_per_second: u64,
+        burst_bytes: u64,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -77,6 +93,7 @@ enum PendingPacket {
         payload: Vec<u8>,
         rtp_bytes: u64,
         emitted_at: Instant,
+        queue_sample: Option<(Duration, Duration)>,
     },
 }
 
@@ -115,6 +132,11 @@ struct DeterministicNetwork {
     time_quantum: Option<Duration>,
     shared_departure: Option<std::rc::Rc<std::cell::RefCell<Option<Instant>>>>,
     rtp_queue_samples: Vec<(Instant, Duration, Duration)>,
+    impairment: Option<RtpImpairment>,
+    impaired_packets: u64,
+    impaired_drops: u64,
+    policer_tokens: u128,
+    policer_at: Option<Instant>,
 }
 
 impl DeterministicNetwork {
@@ -131,6 +153,55 @@ impl DeterministicNetwork {
         self.trace.clear();
     }
 
+    fn impair(&mut self, packet: &PendingPacket) -> bool {
+        let PendingPacket::Peer { rtp_bytes, due, .. } = packet else {
+            return false;
+        };
+        if *rtp_bytes == 0 {
+            return false;
+        }
+        self.impaired_packets += 1;
+        let drop = match self.impairment {
+            None => false,
+            Some(RtpImpairment::Random { per_mille }) => {
+                let mut value = self
+                    .impaired_packets
+                    .wrapping_add(self.seed)
+                    .wrapping_add(0x9e3779b97f4a7c15);
+                value = (value ^ (value >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+                value = (value ^ (value >> 27)).wrapping_mul(0x94d049bb133111eb);
+                (value ^ (value >> 31)) % 1_000 < per_mille
+            }
+            Some(RtpImpairment::Burst { every, length }) => self.impaired_packets % every < length,
+            Some(RtpImpairment::Policer {
+                bits_per_second,
+                burst_bytes,
+            }) => {
+                // Downstream policer after shared-link service and propagation.
+                // Drops consume upstream service; tokens retain fractional bytes.
+                let capacity = u128::from(burst_bytes) * 8_000_000_000;
+                self.policer_tokens = self.policer_at.map_or(capacity, |previous| {
+                    (self.policer_tokens
+                        + due.saturating_duration_since(previous).as_nanos()
+                            * u128::from(bits_per_second))
+                    .min(capacity)
+                });
+                self.policer_at = Some(*due);
+                let cost = u128::from(*rtp_bytes) * 8_000_000_000;
+                if cost <= self.policer_tokens {
+                    self.policer_tokens -= cost;
+                    false
+                } else {
+                    true
+                }
+            }
+        };
+        if drop {
+            self.impaired_drops += 1;
+        }
+        drop
+    }
+
     fn enqueue(&mut self, mut packet: PendingPacket) {
         self.packets = self.packets.saturating_add(1);
         let ordinal = self.packets.saturating_add(self.seed);
@@ -139,10 +210,11 @@ impl DeterministicNetwork {
             self.record("queue-full");
             return;
         }
-        if self
-            .policy
-            .drop_every
-            .is_some_and(|period| period != 0 && ordinal.is_multiple_of(period))
+        if self.impair(&packet)
+            || self
+                .policy
+                .drop_every
+                .is_some_and(|period| period != 0 && ordinal.is_multiple_of(period))
         {
             self.dropped = self.dropped.saturating_add(1);
             self.record("drop");
@@ -184,6 +256,17 @@ impl PeerFixture {
         Self::connected_with(FixtureTransport::Udp, None, false)
     }
 
+    pub fn connected_at(start: Instant) -> Self {
+        Self::connect_media_at(
+            FixtureTransport::Udp,
+            None,
+            false,
+            1,
+            MediaKind::Audio,
+            start,
+        )
+    }
+
     pub fn connected_tcp() -> Self {
         Self::connected_with(FixtureTransport::Tcp, None, false)
     }
@@ -209,7 +292,7 @@ impl PeerFixture {
     }
 
     pub fn unconnected() -> Self {
-        Self::new_with(FixtureTransport::Udp, None, false, 1)
+        Self::new_with(FixtureTransport::Udp, None, false, 1, MediaKind::Audio)
     }
 
     fn connected_with(
@@ -226,7 +309,46 @@ impl PeerFixture {
         datachannels: bool,
         sender_count: usize,
     ) -> Self {
-        let mut fixture = Self::new_with(transport, limits, datachannels, sender_count);
+        Self::connect_media(
+            transport,
+            limits,
+            datachannels,
+            sender_count,
+            MediaKind::Audio,
+        )
+    }
+
+    pub fn connected_video() -> Self {
+        Self::connect_media(FixtureTransport::Udp, None, false, 1, MediaKind::Video)
+    }
+
+    fn connect_media(
+        transport: FixtureTransport,
+        limits: Option<ConnectionLimits>,
+        datachannels: bool,
+        sender_count: usize,
+        media: MediaKind,
+    ) -> Self {
+        Self::connect_media_at(
+            transport,
+            limits,
+            datachannels,
+            sender_count,
+            media,
+            Instant::now(),
+        )
+    }
+
+    fn connect_media_at(
+        transport: FixtureTransport,
+        limits: Option<ConnectionLimits>,
+        datachannels: bool,
+        sender_count: usize,
+        media: MediaKind,
+        start: Instant,
+    ) -> Self {
+        let mut fixture =
+            Self::new_with_start(transport, limits, datachannels, sender_count, media, start);
         for _ in 0..2_000 {
             let _ = fixture.step();
             if fixture.peer_connected && fixture.connection_connected {
@@ -241,8 +363,26 @@ impl PeerFixture {
         limits: Option<ConnectionLimits>,
         datachannels: bool,
         sender_count: usize,
+        media: MediaKind,
     ) -> Self {
-        let start = Instant::now();
+        Self::new_with_start(
+            transport,
+            limits,
+            datachannels,
+            sender_count,
+            media,
+            Instant::now(),
+        )
+    }
+
+    fn new_with_start(
+        transport: FixtureTransport,
+        limits: Option<ConnectionLimits>,
+        datachannels: bool,
+        sender_count: usize,
+        media: MediaKind,
+        start: Instant,
+    ) -> Self {
         str0m_reference::crypto::from_feature_flags().install_process_default();
         let connection_addr = SocketAddr::from(([127, 0, 0, 1], 41000));
         let peer_addr = SocketAddr::from(([127, 0, 0, 1], 41001));
@@ -265,7 +405,7 @@ impl PeerFixture {
             drain_peer(&mut peer);
             let mut change = peer.sdp_api();
             let mids = (0..sender_count)
-                .map(|_| change.add_media(MediaKind::Audio, Direction::SendRecv, None, None, None))
+                .map(|_| change.add_media(media, Direction::SendRecv, None, None, None))
                 .collect::<Vec<_>>();
             if mids
                 .iter()
@@ -331,6 +471,7 @@ impl PeerFixture {
             peer_connected: false,
             connection_connected: false,
             twcc_sent: 0,
+            feedback_enabled: true,
             peer_channel,
             network: DeterministicNetwork::default(),
             native_target: None,
@@ -376,6 +517,38 @@ impl PeerFixture {
         self.network.delivered_bytes = 0;
         self.network.last_committed_rtp_bytes =
             self.connection.stats().connection.transmitted_rtp_bytes;
+    }
+
+    pub fn configure_impairment(&mut self, impairment: RtpImpairment) {
+        match impairment {
+            RtpImpairment::Random { per_mille } => assert!(per_mille <= 1_000),
+            RtpImpairment::Burst { every, length } => assert!(every > 0 && length <= every),
+            RtpImpairment::Policer {
+                bits_per_second,
+                burst_bytes,
+            } => assert!(bits_per_second > 0 && burst_bytes > 0),
+        }
+        self.network.impairment = Some(impairment);
+        self.network.impaired_packets = 0;
+        self.network.impaired_drops = 0;
+        self.network.policer_at = None;
+    }
+
+    pub fn impairment_counts(&self) -> (u64, u64) {
+        (self.network.impaired_packets, self.network.impaired_drops)
+    }
+
+    pub fn inject_cross_traffic(&mut self, bytes: u64) {
+        let rate = self.network.bottleneck_bps.expect("configured bottleneck");
+        let departure = self
+            .network
+            .next_departure
+            .unwrap_or(self.now)
+            .max(self.now);
+        let nanos = (u128::from(bytes) * 8_000_000_000).div_ceil(u128::from(rate));
+        self.network.next_departure = Some(
+            departure + Duration::from_nanos(u64::try_from(nanos).expect("cross traffic service")),
+        );
     }
 
     pub fn emitted_rtp(&self) -> &[(Instant, u64, bool)] {
@@ -481,6 +654,10 @@ impl PeerFixture {
         self.twcc_sent
     }
 
+    pub fn set_feedback_enabled(&mut self, enabled: bool) {
+        self.feedback_enabled = enabled;
+    }
+
     pub fn command(&mut self, command: Command) {
         self.try_command(command).expect("connection command");
     }
@@ -546,6 +723,7 @@ impl PeerFixture {
                     payload,
                     rtp_bytes,
                     emitted_at,
+                    queue_sample,
                     ..
                 } => {
                     if self.network.bottleneck_bps.is_some() {
@@ -553,6 +731,11 @@ impl PeerFixture {
                             self.network.delivered_bytes.saturating_add(rtp_bytes);
                         if rtp_bytes > 0 {
                             self.network.delivered_rtp.push((emitted_at, rtp_bytes));
+                            if let Some((sojourn, target)) = queue_sample {
+                                self.network
+                                    .rtp_queue_samples
+                                    .push((emitted_at, sojourn, target));
+                            }
                         }
                     }
                     let receive = Receive::new(protocol, source, destination, &payload)
@@ -569,6 +752,12 @@ impl PeerFixture {
             match self.peer.poll_output().expect("peer poll") {
                 Output::Transmit(transmit) => {
                     let bytes: &[u8] = &transmit.contents;
+                    if !self.feedback_enabled
+                        && bytes.first().is_some_and(|byte| byte >> 6 == 2)
+                        && bytes.get(1).is_some_and(|byte| (192..=223).contains(byte))
+                    {
+                        return None;
+                    }
                     let payload = match self.transport {
                         FixtureTransport::Udp => Bytes::copy_from_slice(bytes),
                         FixtureTransport::Tcp => {
@@ -691,7 +880,7 @@ impl PeerFixture {
                         self.network.emitted_rtp.push((self.now, padding, true));
                     }
                     let rtp_bytes = rtp_bytes.saturating_add(padding);
-                    if rtp_bytes != 0
+                    let queue_sample = if rtp_bytes != 0
                         && let (Some(reader), Some(rate)) =
                             (self.native_target, self.network.bottleneck_bps)
                     {
@@ -707,12 +896,13 @@ impl PeerFixture {
                             .as_ref()
                             .map_or(self.network.next_departure, |shared| *shared.borrow())
                             .unwrap_or(self.now);
-                        self.network.rtp_queue_samples.push((
-                            self.now,
+                        Some((
                             departure.saturating_duration_since(self.now).max(service),
                             reader(&self.connection),
-                        ));
-                    }
+                        ))
+                    } else {
+                        None
+                    };
                     self.network.enqueue(PendingPacket::Peer {
                         due,
                         protocol,
@@ -721,6 +911,7 @@ impl PeerFixture {
                         payload: payload.to_vec(),
                         rtp_bytes,
                         emitted_at: self.now,
+                        queue_sample,
                     });
                     return None;
                 }
@@ -793,6 +984,66 @@ pub fn second_negotiated_sender() -> SenderId {
     .session
     .senders[1]
         .id
+}
+
+#[allow(
+    clippy::print_stderr,
+    reason = "report actual production probe overhead separately from the allowance"
+)]
+pub fn assert_probe_windows(emitted: &[(Instant, u64, bool)]) {
+    assert!(emitted.windows(2).all(|pair| pair[0].0 <= pair[1].0));
+    let mut checkpoints = Vec::with_capacity(emitted.len() * 2);
+    for (at, _, _) in emitted {
+        checkpoints.push(*at);
+        checkpoints.push(*at + Duration::from_secs(5));
+    }
+    checkpoints.sort_unstable();
+    checkpoints.dedup();
+    let (mut next, mut expired) = (0, 0);
+    let (mut nonprobe, mut probes) = (0_u64, 0_u64);
+    let (mut peak_ratio, mut peak_allowance) = (0_u64, 0_u64);
+    let mut check = |at: Instant, nonprobe: u64, probes: u64| {
+        let total = probes + nonprobe;
+        peak_ratio = peak_ratio.max(if total == 0 { 0 } else { probes * 100 / total });
+        peak_allowance = peak_allowance.max(probes.saturating_sub(nonprobe / 19));
+        assert!(
+            probes <= nonprobe / 19 + 3_000,
+            "emitted probe budget at {at:?}: probes={probes} nonprobe={nonprobe}"
+        );
+    };
+    for at in checkpoints {
+        while expired < next && at.duration_since(emitted[expired].0) >= Duration::from_secs(5) {
+            let (_, bytes, probe) = emitted[expired];
+            if probe {
+                probes -= bytes;
+            } else {
+                nonprobe -= bytes;
+            }
+            expired += 1;
+        }
+        check(at, nonprobe, probes);
+        while next < emitted.len() && emitted[next].0 == at {
+            let (_, bytes, probe) = emitted[next];
+            if probe {
+                probes += bytes;
+            } else {
+                nonprobe += bytes;
+            }
+            next += 1;
+            // Later media at this same clock instant cannot fund an earlier probe.
+            check(at, nonprobe, probes);
+        }
+    }
+    let total: u64 = emitted.iter().map(|(_, bytes, _)| *bytes).sum();
+    let padding: u64 = emitted
+        .iter()
+        .filter(|(_, _, probe)| *probe)
+        .map(|(_, bytes, _)| *bytes)
+        .sum();
+    eprintln!(
+        "production probe windows events={} total_bytes={total} probe_bytes={padding} peak_raw_ratio={peak_ratio}% peak_allowance_used={peak_allowance}",
+        emitted.len()
+    );
 }
 
 pub fn forwarded(packet: MediaPacket, id: u64) -> ForwardedMedia {

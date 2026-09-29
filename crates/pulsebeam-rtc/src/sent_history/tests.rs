@@ -767,6 +767,7 @@ fn late_receipt_after_logical_deadline_cannot_erase_loss() {
         Acknowledgment::Lost
     );
     assert!(!history.inputs.feedback.iter().any(|sample| sample.received));
+    assert!(!history.inputs.fresh_network_feedback);
     assert_eq!(history.reordering_window, INITIAL_REORDERING_WINDOW);
     history.process_feedback(FeedbackBatch {
         received_at: at(now + Duration::from_millis(80)),
@@ -784,6 +785,293 @@ fn late_receipt_after_logical_deadline_cannot_erase_loss() {
 }
 
 #[test]
+fn reorder_learning_cannot_reopen_another_packets_elapsed_deadline() {
+    let now = Instant::now();
+    let epoch = PathEpoch::from_value(35);
+    let mut history = SentHistory::new(PacketFeedbackKind::TransportWide);
+    history.path_changed(epoch, true);
+    for sequence in 1..=3 {
+        history.commit(context(now, epoch, sequence)).unwrap();
+    }
+    history.process_feedback(batch(
+        now + Duration::from_millis(10),
+        epoch,
+        vec![TwccStatus::NotReceived; 3],
+    ));
+    history.process_feedback(batch(
+        now + Duration::from_millis(50),
+        epoch,
+        vec![
+            TwccStatus::NotReceived,
+            TwccStatus::NotReceived,
+            TwccStatus::Received { delta_250us: 1 },
+        ],
+    ));
+    history.clear_controller_inputs();
+    history.process_feedback(batch(
+        now + Duration::from_millis(100),
+        epoch,
+        vec![
+            TwccStatus::Received { delta_250us: 1 },
+            TwccStatus::Received { delta_250us: 1 },
+        ],
+    ));
+    assert_eq!(history.counters.received, 1);
+    assert_eq!(history.counters.not_received, 2);
+    assert!(
+        history
+            .inputs
+            .feedback
+            .iter()
+            .all(|sample| !sample.received)
+    );
+    assert!(!history.inputs.fresh_network_feedback);
+}
+
+#[test]
+fn reorder_learning_preserves_elapsed_deadlines_when_loss_work_is_deferred() {
+    let now = Instant::now();
+    let epoch = PathEpoch::from_value(36);
+    let mut history = SentHistory::new(PacketFeedbackKind::TransportWide);
+    history.path_changed(epoch, true);
+    for sequence in 1..=3 {
+        history.commit(context(now, epoch, sequence)).unwrap();
+    }
+    history.process_feedback(batch(
+        now + Duration::from_millis(10),
+        epoch,
+        vec![TwccStatus::NotReceived; 3],
+    ));
+    history.process_feedback(batch(
+        now + Duration::from_millis(50),
+        epoch,
+        vec![
+            TwccStatus::NotReceived,
+            TwccStatus::NotReceived,
+            TwccStatus::Received { delta_250us: 1 },
+        ],
+    ));
+    history.clear_controller_inputs();
+    assert_eq!(
+        history.confirm_losses(now + Duration::from_millis(80), 1),
+        1
+    );
+    history.loss_work = MAX_EXPIRATIONS_PER_POLL;
+    let receipt_at = now + Duration::from_millis(100);
+    history.process_feedback(batch(
+        receipt_at,
+        epoch,
+        vec![TwccStatus::Received { delta_250us: 1 }],
+    ));
+    assert_eq!(history.reordering_window, Duration::from_millis(90));
+    assert_eq!(
+        history.next_deadline(),
+        Some(now + Duration::from_millis(80))
+    );
+    history.process_feedback(batch(
+        receipt_at,
+        epoch,
+        vec![
+            TwccStatus::NotReceived,
+            TwccStatus::Received { delta_250us: 1 },
+        ],
+    ));
+    assert_eq!(history.counters.received, 1);
+    assert!(!history.inputs.fresh_network_feedback);
+    history.clear_controller_inputs();
+    history.confirm_losses(receipt_at, MAX_EXPIRATIONS_PER_POLL);
+    assert_eq!(history.counters.not_received, 2);
+}
+
+#[test]
+fn feedback_confirmation_shares_the_expiry_budget_and_defers_without_losing_evidence() {
+    let now = Instant::now();
+    let epoch = PathEpoch::from_value(34);
+    let mut history = SentHistory::new(PacketFeedbackKind::TransportWide);
+    history.path_changed(epoch, true);
+    for sequence in 1..=512 {
+        history.commit(context(now, epoch, sequence)).unwrap();
+    }
+    let expired_at = now + SENT_HISTORY_MAX_AGE;
+    assert_eq!(history.expire(expired_at, MAX_EXPIRATIONS_PER_POLL), 256);
+    history.process_feedback(batch(
+        expired_at,
+        epoch,
+        vec![TwccStatus::Received { delta_250us: 1 }; 512],
+    ));
+    assert_eq!(history.loss_work, MAX_EXPIRATIONS_PER_POLL);
+    assert_eq!(history.inputs.synthetic.len(), MAX_EXPIRATIONS_PER_POLL);
+    assert!(history.inputs.feedback.is_empty());
+    assert!(!history.inputs.fresh_network_feedback);
+    assert!(!history.inputs.exhausted);
+    assert_eq!(history.bytes_in_flight, 256 * 1_200);
+    assert!(
+        history
+            .next_deadline()
+            .is_some_and(|deadline| deadline <= expired_at)
+    );
+    history.clear_controller_inputs();
+    assert_eq!(history.expire(expired_at, MAX_EXPIRATIONS_PER_POLL), 256);
+    assert_eq!(history.inputs.synthetic.len(), MAX_EXPIRATIONS_PER_POLL);
+    assert_eq!(history.bytes_in_flight, 0);
+}
+
+#[test]
+fn rfc8888_sparse_block_expansion_signals_terminal_resource_exhaustion() {
+    let now = Instant::now();
+    let epoch = PathEpoch::from_value(34);
+    let mut history = SentHistory::new(PacketFeedbackKind::Rfc8888);
+    history.path_changed(epoch, true);
+    for ssrc in 1..=3 {
+        for sequence in 1..=4_096 {
+            let mut commit = context(now, epoch, sequence);
+            let rtp = commit.rtp.as_mut().unwrap();
+            rtp.ssrc = ssrc;
+            rtp.twcc_sequence = None;
+            history.commit(commit).unwrap();
+        }
+    }
+    history.process_feedback(FeedbackBatch {
+        received_at: at(now + Duration::from_millis(10)),
+        path_epoch: epoch,
+        sender_ssrc: 9,
+        report: FeedbackReport::Rfc8888 {
+            report_timestamp: 65_536,
+            reports: (1..=3)
+                .map(|ssrc| crate::rtcp::Rfc8888Report {
+                    ssrc,
+                    begin_sequence: 4_096,
+                    report_count: 1,
+                    statuses: vec![Rfc8888Status::Received {
+                        ecn: 0,
+                        arrival_offset: ArrivalOffset::Ticks(1),
+                    }]
+                    .into(),
+                })
+                .collect(),
+        },
+    });
+    assert!(history.inputs.exhausted);
+    assert_eq!(history.inputs.feedback.len(), MAX_FEEDBACK_STATUSES);
+    assert!(
+        history
+            .inputs
+            .feedback
+            .iter()
+            .all(|sample| sample.sent_id.0 < MAX_FEEDBACK_STATUSES as u64)
+    );
+}
+
+#[test]
+fn terminal_late_receipt_cannot_refresh_replayed_report_covering_live_missing() {
+    for mode in [
+        PacketFeedbackKind::TransportWide,
+        PacketFeedbackKind::Rfc8888,
+    ] {
+        let now = Instant::now();
+        let epoch = PathEpoch::from_value(32);
+        let mut history = SentHistory::new(mode);
+        history.path_changed(epoch, true);
+        for sequence in 1..=3 {
+            let mut commit = context(now, epoch, sequence);
+            if mode == PacketFeedbackKind::Rfc8888 {
+                commit.rtp.as_mut().unwrap().twcc_sequence = None;
+            }
+            history.commit(commit).unwrap();
+        }
+        let report = |received_at, received_index| match mode {
+            PacketFeedbackKind::TransportWide => batch(
+                received_at,
+                epoch,
+                (0..3)
+                    .map(|index| {
+                        if index == received_index {
+                            TwccStatus::Received { delta_250us: 1 }
+                        } else {
+                            TwccStatus::NotReceived
+                        }
+                    })
+                    .collect(),
+            ),
+            PacketFeedbackKind::Rfc8888 => FeedbackBatch {
+                received_at: at(received_at),
+                path_epoch: epoch,
+                sender_ssrc: 9,
+                report: FeedbackReport::Rfc8888 {
+                    report_timestamp: 65_536,
+                    reports: vec![crate::rtcp::Rfc8888Report {
+                        ssrc: 7,
+                        begin_sequence: 1,
+                        report_count: 3,
+                        statuses: (0..3)
+                            .map(|index| {
+                                if index == received_index {
+                                    Rfc8888Status::Received {
+                                        ecn: 0,
+                                        arrival_offset: ArrivalOffset::Ticks(1),
+                                    }
+                                } else {
+                                    Rfc8888Status::NotReceived
+                                }
+                            })
+                            .collect(),
+                    }]
+                    .into(),
+                },
+            },
+        };
+        history.process_feedback(report(now, 1));
+        history.clear_controller_inputs();
+        history.process_feedback(report(now + INITIAL_REORDERING_WINDOW, 0));
+        assert!(!history.inputs.fresh_network_feedback, "{mode:?}");
+        assert!(!history.inputs.feedback.iter().any(|sample| sample.received));
+        assert!(matches!(
+            history.entry(SentPacketId(0)).unwrap().acknowledgment,
+            Acknowledgment::Lost
+        ));
+    }
+}
+
+#[test]
+fn rfc8888_logically_lost_receipt_cannot_refresh_feedback_or_hold() {
+    let now = Instant::now();
+    let epoch = PathEpoch::from_value(32);
+    let mut history = SentHistory::new(PacketFeedbackKind::Rfc8888);
+    history.path_changed(epoch, true);
+    history.commit(rfc_context(now, epoch, 1)).unwrap();
+    history.set_missing(SentPacketId(0), now);
+    history.anchor_missing(None, Some((7, 2)), now);
+    history.clear_controller_inputs();
+    history.process_feedback(FeedbackBatch {
+        received_at: at(now + INITIAL_REORDERING_WINDOW),
+        path_epoch: epoch,
+        sender_ssrc: 9,
+        report: FeedbackReport::Rfc8888 {
+            report_timestamp: 65_536,
+            reports: vec![crate::rtcp::Rfc8888Report {
+                ssrc: 7,
+                begin_sequence: 1,
+                report_count: 1,
+                statuses: vec![Rfc8888Status::Received {
+                    ecn: 0,
+                    arrival_offset: ArrivalOffset::Ticks(1),
+                }]
+                .into(),
+            }]
+            .into(),
+        },
+    });
+    assert!(!history.inputs.fresh_network_feedback);
+    assert!(
+        history
+            .inputs
+            .timing
+            .is_none_or(|timing| timing.feedback_hold.is_none())
+    );
+    assert!(!history.inputs.feedback.iter().any(|sample| sample.received));
+}
+
+#[test]
 fn reordering_window_is_bounded_and_stays_monotonic_after_confirmed_loss() {
     let now = Instant::now();
     let epoch = PathEpoch::from_value(22);
@@ -798,6 +1086,7 @@ fn reordering_window_is_bounded_and_stays_monotonic_after_confirmed_loss() {
         None,
         now + Duration::from_secs(2),
     );
+    history.apply_reordering_window(now + Duration::from_secs(2));
     assert_eq!(history.reordering_window, MAX_REORDERING_WINDOW);
 
     history.commit(rfc_context(now, epoch, 2)).unwrap();

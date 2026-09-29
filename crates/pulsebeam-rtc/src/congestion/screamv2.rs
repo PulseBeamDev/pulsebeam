@@ -257,12 +257,15 @@ impl ScreamV2 {
         self.max_bytes_in_flight = self.max_bytes_in_flight.max(input.bytes_in_flight);
         self.ecn_mode = input.ecn_mode;
         let has_feedback = !input.feedback.is_empty();
-        let has_received = input.feedback.iter().any(|sample| sample.received);
+        let has_arrival = input
+            .feedback
+            .iter()
+            .any(|sample| sample.received && sample.receiver_arrival_micros.is_some());
         self.consume_feedback(now, input);
         // The draft updates queue-delay state from received acknowledgements and
         // reference-window state from feedback. Timer-only polls must not replay
         // stale delay evidence or consume accumulated ACK credit.
-        if has_received {
+        if has_arrival {
             self.update_qdelay_filter(now);
         }
         let congestion_pending = self.pending_loss
@@ -285,7 +288,7 @@ impl ScreamV2 {
             {
                 self.increase_ref_wnd(now, input.target_bitrate_max);
             }
-            if has_received {
+            if has_arrival {
                 self.adjust_qdelay_target();
             }
         }
@@ -1172,6 +1175,28 @@ mod tests {
         cc.update(Duration::from_millis(100), input(&[], 4_000_000));
         assert_eq!(cc.ref_wnd, before_window);
         assert_eq!(cc.qdelay_target, before_target);
+    }
+
+    #[test]
+    fn receipt_without_arrival_does_not_replay_delay_evidence() {
+        let mut cc = ScreamV2::new(4_000_000, None);
+        cc.qdelay = Duration::from_millis(40);
+        cc.qdelay_avg = Duration::from_millis(10);
+        cc.qdelay_target = Duration::from_millis(100);
+        let feedback = [FeedbackSample {
+            receiver_arrival_micros: None,
+            ..sample(100, true, true, false, false)
+        }];
+        cc.update(Duration::from_millis(100), input(&feedback, 4_000_000));
+        assert_eq!(cc.qdelay_avg, Duration::from_millis(10));
+        assert_eq!(cc.qdelay_target, Duration::from_millis(100));
+        assert_eq!(cc.last_qdelay_update, Duration::ZERO);
+        assert!(cc.base_delay_minima.is_empty());
+        assert!(cc.competing_samples.is_empty());
+        assert!(
+            cc.delivered_rate > 0,
+            "receipt still provides delivery evidence"
+        );
     }
 
     #[test]

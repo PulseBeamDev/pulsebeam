@@ -361,6 +361,10 @@ impl Connection {
         if let Some(feedback) = self._subsystems.ingress.poll_feedback() {
             self.runtime.commit.history.process_feedback(feedback);
         }
+        if self.runtime.commit.history.controller_inputs().exhausted {
+            self.runtime.lifecycle = Lifecycle::Closed(CloseReason::TransportFailure);
+            return Output::Closed(CloseReason::TransportFailure);
+        }
         if let Some(repair) = self._subsystems.ingress.poll_repair() {
             self._subsystems
                 .egress
@@ -816,7 +820,9 @@ impl Drop for EntropyConsumer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{NetworkPolicy, PeerFixture, forwarded};
+    use crate::test_support::{
+        NetworkPolicy, PeerFixture, RtpImpairment, assert_probe_windows, forwarded,
+    };
     use crate::{
         ForwardedMedia, FrameBoundary, FrameDependencies, FrameId, FrameMetadata, TransmitTarget,
     };
@@ -824,6 +830,374 @@ mod tests {
         sync::{Arc, Mutex},
         time::Duration,
     };
+
+    #[test]
+    #[should_panic(expected = "emitted probe budget")]
+    fn probe_oracle_rejects_credit_from_later_emission_at_same_instant() {
+        let now = Instant::now();
+        assert_probe_windows(&[(now, 3_001, true), (now, 19, false)]);
+    }
+
+    #[test]
+    #[should_panic(expected = "emitted probe budget")]
+    fn probe_oracle_rejects_overspend_when_media_credit_expires() {
+        let now = Instant::now();
+        assert_probe_windows(&[
+            (now, 19_000, false),
+            (now + Duration::from_secs(1), 4_000, true),
+        ]);
+    }
+
+    #[test]
+    fn production_feedback_outage_path_replacement_and_media_pause_recover() {
+        let mut fixture = PeerFixture::connected();
+        fixture.configure_network(
+            0x6601,
+            NetworkPolicy {
+                delay: Duration::from_millis(25),
+                ..NetworkPolicy::default()
+            },
+        );
+        fixture.configure_bottleneck(2_000_000);
+        fixture.configure_time_quantum(Duration::from_millis(5));
+        let mut source = PeerFixture::connected();
+        source.configure_time_quantum(Duration::from_millis(5));
+        let mut policy = crate::ConnectionConfig::default().default_audio_policy;
+        policy.playout_delay = crate::PlayoutDelay::from_ticks(0, 50).expect("500 ms");
+        policy.desired_bitrate = MediaPayloadBitrate::from_bps(2_000_000);
+        fixture.command(Command::SetSenderPolicy {
+            sender: fixture.sender,
+            policy,
+        });
+        let mut frame = 0;
+        for (feedback_enabled, replace_path) in
+            [(true, false), (false, false), (true, false), (true, true)]
+        {
+            fixture.set_feedback_enabled(feedback_enabled);
+            if replace_path {
+                assert_probe_windows(fixture.emitted_rtp());
+                for _ in 0..2 {
+                    fixture
+                        .connection
+                        ._subsystems
+                        .transport
+                        .reselect_path_for_test()
+                        .expect("replace selected path");
+                }
+                fixture.command(Command::SetSenderPolicy {
+                    sender: fixture.sender,
+                    policy,
+                });
+            }
+            let start = fixture.at().monotonic;
+            let before = fixture.connection.stats().connection.transmitted_rtp_bytes;
+            for tick in 1..=600 {
+                let at = start + Duration::from_millis(tick * 5);
+                fixture.drive_for(at.saturating_duration_since(fixture.at().monotonic));
+                source.drive_for(at.saturating_duration_since(source.at().monotonic));
+                frame += 1;
+                let media = forwarded(source.send_source(&[0x5a; 1_000]), frame);
+                match fixture.try_command(Command::SendMedia {
+                    sender: fixture.sender,
+                    media,
+                }) {
+                    Ok(()) | Err(CommandError::WouldBlock) => {}
+                    Err(error) => panic!("unexpected media error: {error:?}"),
+                }
+            }
+            let envelope = fixture
+                .connection
+                ._subsystems
+                .egress
+                .test_envelope()
+                .expect("controller output");
+            assert_eq!(envelope.feedback_stale, !feedback_enabled);
+            assert!(fixture.connection.stats().connection.transmitted_rtp_bytes > before);
+        }
+        fixture.drive_for(Duration::from_secs(1));
+        let paused = fixture.connection.stats().connection.transmitted_rtp_bytes;
+        fixture.drive_for(Duration::from_secs(2));
+        assert_eq!(
+            fixture.connection.stats().connection.transmitted_rtp_bytes,
+            paused
+        );
+        assert!(
+            fixture
+                .connection
+                ._subsystems
+                .egress
+                .test_envelope()
+                .expect("controller output")
+                .application_limited
+        );
+        let start = fixture.at().monotonic;
+        for tick in 1..=600 {
+            let at = start + Duration::from_millis(tick * 5);
+            fixture.drive_for(at.saturating_duration_since(fixture.at().monotonic));
+            source.drive_for(at.saturating_duration_since(source.at().monotonic));
+            frame += 1;
+            let media = forwarded(source.send_source(&[0x5a; 1_000]), frame);
+            let _ = fixture.try_command(Command::SendMedia {
+                sender: fixture.sender,
+                media,
+            });
+        }
+        assert!(fixture.connection.stats().connection.transmitted_rtp_bytes > paused);
+        assert!(
+            !fixture
+                .connection
+                ._subsystems
+                .egress
+                .test_envelope()
+                .expect("controller output")
+                .feedback_stale
+        );
+        assert_probe_windows(fixture.emitted_rtp());
+        fixture.drive_for(Duration::from_secs(1));
+        let stopped = fixture.connection.stats().connection.transmitted_rtp_bytes;
+        fixture.drive_for(Duration::from_secs(6));
+        assert_eq!(
+            fixture.connection.stats().connection.transmitted_rtp_bytes,
+            stopped
+        );
+        assert_probe_windows(fixture.emitted_rtp());
+    }
+
+    #[test]
+    fn production_random_burst_policer_and_heterogeneous_traces() {
+        for (name, impairment) in [
+            (
+                "random-1-percent",
+                Some(RtpImpairment::Random { per_mille: 10 }),
+            ),
+            (
+                "burst-6-of-200",
+                Some(RtpImpairment::Burst {
+                    every: 200,
+                    length: 6,
+                }),
+            ),
+            (
+                "policer-125kbps-3000bytes",
+                Some(RtpImpairment::Policer {
+                    bits_per_second: 125_000,
+                    burst_bytes: 3_000,
+                }),
+            ),
+            ("cubic-like", None),
+            ("bbr-like", None),
+        ] {
+            let mut fixture = PeerFixture::connected();
+            fixture.configure_network(
+                0x7701,
+                NetworkPolicy {
+                    delay: Duration::from_millis(25),
+                    ..NetworkPolicy::default()
+                },
+            );
+            fixture.configure_bottleneck(4_000_000);
+            fixture.configure_time_quantum(Duration::from_millis(5));
+            fixture.observe_native_target(|connection| {
+                connection
+                    ._subsystems
+                    .egress
+                    .test_envelope()
+                    .expect("envelope")
+                    .native_queue_delay_target
+            });
+            if let Some(impairment) = impairment {
+                fixture.configure_impairment(impairment);
+            }
+            let mut source = PeerFixture::connected();
+            source.configure_time_quantum(Duration::from_millis(5));
+            let mut policy = crate::ConnectionConfig::default().default_audio_policy;
+            policy.playout_delay = crate::PlayoutDelay::from_ticks(0, 50).expect("500 ms");
+            policy.desired_bitrate = MediaPayloadBitrate::from_bps(4_000_000);
+            fixture.command(Command::SetSenderPolicy {
+                sender: fixture.sender,
+                policy,
+            });
+            let start = fixture.at().monotonic;
+            let mut policed = false;
+            let mut cross_bytes = 0;
+            for tick in 1..=3_000_u64 {
+                let at = start + Duration::from_millis(tick * 5);
+                fixture.drive_for(at.saturating_duration_since(fixture.at().monotonic));
+                source.drive_for(at.saturating_duration_since(source.at().monotonic));
+                // Open-loop pacing traces, not TCP implementations or equal-share promises.
+                let cross_rate = match name {
+                    "cubic-like" => {
+                        let phase = i64::try_from((tick * 5) % 4_000).expect("phase") - 2_000;
+                        u64::try_from(750_000 + phase.pow(3) / 16_000)
+                            .expect("positive cubic trace")
+                    }
+                    "bbr-like" => match (tick / 10) % 8 {
+                        0 => 1_250_000,
+                        1 => 750_000,
+                        _ => 1_000_000,
+                    },
+                    _ => 0,
+                };
+                if cross_rate > 0 {
+                    let bytes = cross_rate * 5 / 8_000;
+                    fixture.inject_cross_traffic(bytes);
+                    cross_bytes += bytes;
+                }
+                for packet in 0..2 {
+                    let media = forwarded(source.send_source(&[0x5a; 1_000]), tick * 2 + packet);
+                    match fixture.try_command(Command::SendMedia {
+                        sender: fixture.sender,
+                        media,
+                    }) {
+                        Ok(()) | Err(CommandError::WouldBlock) => {}
+                        Err(error) => panic!("{name} admission: {error:?}"),
+                    }
+                }
+                let stats = fixture.connection.stats();
+                assert!(stats.connection.queued_media_bytes <= 8 * 1024 * 1024);
+                assert!(stats.connection.rtp_bytes_in_flight <= 8 * 1024 * 1024);
+                let envelope = fixture
+                    .connection
+                    ._subsystems
+                    .egress
+                    .test_envelope()
+                    .expect("envelope");
+                policed |= envelope.policer_detected;
+                assert!(
+                    !envelope.feedback_stale,
+                    "{name}: covering feedback remains live"
+                );
+            }
+            fixture.drive_for(Duration::from_secs(2));
+            let delivered: u64 = fixture
+                .delivered_rtp()
+                .iter()
+                .filter(|(at, _)| {
+                    *at >= start + Duration::from_secs(10) && *at < start + Duration::from_secs(15)
+                })
+                .map(|(_, bytes)| *bytes)
+                .sum();
+            let (sent, dropped) = fixture.impairment_counts();
+            assert!(
+                delivered > 10_000,
+                "{name}: sustained late delivery, not startup-only success"
+            );
+            if impairment.is_some() {
+                assert!(dropped > 0 && dropped < sent);
+            }
+            if matches!(impairment, Some(RtpImpairment::Policer { .. })) {
+                assert!(policed, "production policer detection must be exercised");
+            }
+            let mut queue = fixture
+                .rtp_queue_samples()
+                .iter()
+                .map(|(_, delay, _)| *delay)
+                .collect::<Vec<_>>();
+            queue.sort_unstable();
+            assert_eq!(
+                queue.len(),
+                fixture.delivered_rtp().len(),
+                "queue samples must exclude dropped RTP"
+            );
+            assert_probe_windows(fixture.emitted_rtp());
+            eprintln!(
+                "production profile={name} seed=0x7701 link=4Mbps RTT=50ms quantum=5ms offered=3.2Mbps desired=4Mbps duration=15s sent={sent} drops={dropped} late_delivered={delivered} cross_bytes={cross_bytes} policed={policed} queue_p50={:?} queue_p95={:?} queue_p99={:?}",
+                queue[(queue.len() * 50).div_ceil(100) - 1],
+                queue[(queue.len() * 95).div_ceil(100) - 1],
+                queue[(queue.len() * 99).div_ceil(100) - 1]
+            );
+        }
+    }
+
+    #[test]
+    fn production_demand_limited_video_vbr_keyframes_keep_queue_bound() {
+        let mut fixture = PeerFixture::connected_video();
+        fixture.configure_network(
+            0x7702,
+            NetworkPolicy {
+                delay: Duration::from_millis(25),
+                ..NetworkPolicy::default()
+            },
+        );
+        fixture.configure_bottleneck(2_000_000);
+        fixture.configure_time_quantum(Duration::from_millis(5));
+        fixture.observe_native_target(|connection| {
+            connection
+                ._subsystems
+                .egress
+                .test_envelope()
+                .expect("envelope")
+                .native_queue_delay_target
+        });
+        let mut source = PeerFixture::connected_video();
+        source.configure_time_quantum(Duration::from_millis(5));
+        let mut policy = crate::ConnectionConfig::default().default_video_policy;
+        policy.playout_delay = crate::PlayoutDelay::from_ticks(0, 50).expect("500 ms");
+        policy.desired_bitrate = MediaPayloadBitrate::from_bps(2_000_000);
+        fixture.command(Command::SetSenderPolicy {
+            sender: fixture.sender,
+            policy,
+        });
+        let start = fixture.at().monotonic;
+        for frame in 1..=1_600_u64 {
+            let at = start + Duration::from_millis(frame * 25);
+            fixture.drive_for(at.saturating_duration_since(fixture.at().monotonic));
+            source.drive_for(at.saturating_duration_since(source.at().monotonic));
+            let key = frame % 40 == 1;
+            let size = if key {
+                1_000
+            } else if frame % 2 == 0 {
+                200
+            } else {
+                600
+            };
+            let mut payload = vec![0x5a; size];
+            // Synthetic H.264 slices: IDR for keyframes, non-IDR for dependents.
+            payload[0] = if key { 0x65 } else { 0x41 };
+            let mut media = forwarded(source.send_source(&payload), frame);
+            media.frame.random_access = key;
+            media.frame.dependencies = FrameDependencies::known(if key {
+                vec![]
+            } else {
+                vec![FrameId::from_value(frame - 1)]
+            })
+            .expect("frame dependencies");
+            fixture.command(Command::SendMedia {
+                sender: fixture.sender,
+                media,
+            });
+        }
+        fixture.drive_for(Duration::from_secs(2));
+        // Demand-limited 40fps VBR: fixed 2s warmup and 36s interval, including keyframes.
+        let samples = fixture
+            .rtp_queue_samples()
+            .iter()
+            .filter(|(at, _, _)| {
+                *at >= start + Duration::from_secs(2) && *at < start + Duration::from_secs(38)
+            })
+            .collect::<Vec<_>>();
+        let mut raw = samples
+            .iter()
+            .map(|(_, delay, _)| *delay)
+            .collect::<Vec<_>>();
+        let mut excess = samples
+            .iter()
+            .map(|(_, delay, target)| delay.saturating_sub(*target))
+            .collect::<Vec<_>>();
+        raw.sort_unstable();
+        excess.sort_unstable();
+        assert!(samples.len() >= 1_000);
+        assert_eq!(fixture.network_counters().1, 0);
+        assert!(excess[(excess.len() * 99).div_ceil(100) - 1] <= Duration::from_millis(10));
+        assert_probe_windows(fixture.emitted_rtp());
+        eprintln!(
+            "production demand-limited VBR video seed=0x7702 offered_payload=128kbps link=2Mbps RTT=50ms quantum=5ms frames=1600 keyframe_every=40 sizes=1000/200/600B samples={} drops=0 raw_p50={:?} raw_p95={:?} raw_p99={:?}",
+            samples.len(),
+            raw[(raw.len() * 50).div_ceil(100) - 1],
+            raw[(raw.len() * 95).div_ceil(100) - 1],
+            raw[(raw.len() * 99).div_ceil(100) - 1]
+        );
+    }
 
     #[test]
     fn production_queue_sojourn_tracks_contemporaneous_native_target() {

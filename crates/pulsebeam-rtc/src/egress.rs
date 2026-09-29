@@ -437,6 +437,11 @@ impl MediaEgress {
             },
         );
         self.rtp_bytes_in_flight = bytes_in_flight;
+        if self.probe_started_at.is_some_and(|started| {
+            at.monotonic.saturating_duration_since(started) >= Duration::from_millis(20)
+        }) {
+            self.finish_probe(at.monotonic, true);
+        }
         self.observe_probe_feedback(at.monotonic, probe_feedback, output.reason);
         if self.probe_remaining > 0
             && self.probe_reported_packets > 0
@@ -906,6 +911,11 @@ impl MediaEgress {
         self.envelope.map_or(Duration::ZERO, |envelope| {
             envelope.native_queue_delay_target
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_envelope(&self) -> Option<SafeRtpEnvelope> {
+        self.envelope
     }
 
     pub(crate) const fn controller_origin(&self) -> Instant {
@@ -1539,11 +1549,6 @@ impl MediaEgress {
         bytes_in_flight: u64,
         transport: &mut Transport,
     ) -> PrepareResult {
-        if self.probe_started_at.is_some_and(|started| {
-            at.monotonic.saturating_duration_since(started) >= Duration::from_millis(20)
-        }) {
-            self.finish_probe(at.monotonic, true);
-        }
         if !self.path_available {
             return PrepareResult::Blocked;
         }
@@ -1881,6 +1886,34 @@ mod tests {
             0,
         );
         assert_eq!(egress.probe_started_at, None, "path reset cancels cluster");
+
+        egress.probe_remaining = 4;
+        egress.probe_started_at = Some(now);
+        egress.probe_last_sent_at = Some(now);
+        egress.probe_sent_bytes = 100;
+        let deadline = now + Duration::from_millis(20);
+        egress.update_controller(
+            TimePoint {
+                monotonic: deadline,
+                global: GlobalMediaTime::from_micros(20_000),
+            },
+            None,
+            &[],
+            &[],
+            Duration::ZERO,
+            false,
+            u64::MAX,
+        );
+        assert_eq!(
+            egress.probe_started_at, None,
+            "window blockage cannot defer expiry"
+        );
+        assert_eq!(egress.probe_remaining, 0);
+        assert_eq!(
+            egress.probe_history.back().expect("cluster").result,
+            ProbeResult::Failed
+        );
+        assert!(egress.next_deadline().is_none_or(|next| next > deadline));
     }
 
     #[test]
