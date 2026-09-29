@@ -850,7 +850,7 @@ fn construction_and_desired_state_validate_complete_external_input() {
     ));
 
     let mut invalid = config();
-    invalid.topology.local_video = (MAX_LOCAL_VIDEO_SLOTS + 1) as u8;
+    invalid.topology.local_video = u8::try_from(MAX_LOCAL_VIDEO_SLOTS + 1).unwrap();
     assert!(matches!(
         Agent::new(invalid),
         Err(AgentError::InvalidConfiguration(
@@ -859,10 +859,10 @@ fn construction_and_desired_state_validate_complete_external_input() {
     ));
 
     let mut at_capacity = config();
-    at_capacity.topology.local_video = MAX_LOCAL_VIDEO_SLOTS as u8;
+    at_capacity.topology.local_video = u8::try_from(MAX_LOCAL_VIDEO_SLOTS).unwrap();
     at_capacity.topology.remote_audio = MAX_REMOTE_AUDIO_SLOTS;
     at_capacity.topology.remote_video = MAX_REMOTE_VIDEO_SLOTS;
-    at_capacity.topology.local_audio = MAX_LOCAL_AUDIO_SLOTS as u8;
+    at_capacity.topology.local_audio = u8::try_from(MAX_LOCAL_AUDIO_SLOTS).unwrap();
     assert!(Agent::new(at_capacity).is_ok());
 
     let mut invalid_slot = desired(1);
@@ -1402,6 +1402,96 @@ fn authorization_is_terminal_for_one_revision_and_a_new_revision_retries() {
     ));
     assert_eq!(agent.snapshot().connection, ConnectionState::CreatingOffer);
     assert_eq!(agent.snapshot().terminal_failure, None);
+}
+
+#[test]
+fn signaling_messages_received_before_topic_channels_open_are_replayed_on_activation() {
+    let mut agent = Agent::new(config()).unwrap();
+    let mut state = desired(1);
+    state
+        .topics
+        .publishers
+        .push(publisher("events", TopicMode::Ordered));
+    agent.command(AgentCommand::ReplaceDesired(state)).unwrap();
+    let (generation, topic_label) = match next_effect(&mut agent) {
+        Effect::Rtc(RtcEffect::CreateOffer {
+            generation,
+            data_channels,
+            ..
+        }) => (generation, data_channels[1].label.clone()),
+        effect => panic!("expected offer, got {effect:?}"),
+    };
+    let signal = channel(40);
+    let topic = channel(41);
+    let mut offer_resources = resources(signal);
+    offer_resources.data_channels.push(DataChannelBinding {
+        label: topic_label,
+        channel: topic,
+    });
+    agent
+        .handle(HostEvent::Rtc(RtcEvent::OfferCreated {
+            generation,
+            offer: offer(),
+            resources: offer_resources,
+        }))
+        .unwrap();
+    let operation = match next_effect(&mut agent) {
+        Effect::Http(HttpEffect::Request { operation, .. }) => operation,
+        effect => panic!("expected participant request, got {effect:?}"),
+    };
+    agent
+        .handle(HostEvent::Http(HttpEvent::Response {
+            operation,
+            response: create_response("p1", "etag-1", PARTICIPANT_URI),
+        }))
+        .unwrap();
+    assert!(matches!(
+        next_effect(&mut agent),
+        Effect::Rtc(RtcEffect::ApplyAnswer { .. })
+    ));
+    agent
+        .handle(HostEvent::Rtc(RtcEvent::AnswerApplied { generation }))
+        .unwrap();
+    agent
+        .handle(HostEvent::Rtc(RtcEvent::Connected { generation }))
+        .unwrap();
+    agent
+        .handle(HostEvent::DataChannel(DataChannelEvent::Opened {
+            generation,
+            channel: signal,
+        }))
+        .unwrap();
+    agent
+        .handle(HostEvent::DataChannel(DataChannelEvent::Message {
+            generation,
+            channel: signal,
+            payload: server_payload(server_message::Payload::Catalog(v1::Catalog {
+                revision: 1,
+                state: Some(v1::catalog::State::Snapshot(v1::CatalogSnapshot {
+                    participants: vec![v1::Participant {
+                        participant_id: "publisher".to_string(),
+                        participant_external_id: "publisher-external".to_string(),
+                    }],
+                    tracks: vec![v1::RemoteTrack {
+                        track_id: "video-track".to_string(),
+                        participant_id: "publisher".to_string(),
+                        kind: v1::TrackKind::Video.into(),
+                        label: "camera".to_string(),
+                    }],
+                })),
+            })),
+        }))
+        .unwrap();
+    assert_eq!(agent.snapshot().catalog_revision, 0);
+    agent
+        .handle(HostEvent::DataChannel(DataChannelEvent::Opened {
+            generation,
+            channel: topic,
+        }))
+        .unwrap();
+    assert_eq!(agent.snapshot().connection, ConnectionState::Connected);
+    assert_eq!(agent.snapshot().catalog_revision, 1);
+    assert_eq!(agent.snapshot().publications["video-track"].label, "camera");
 }
 
 #[test]

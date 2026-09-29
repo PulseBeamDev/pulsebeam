@@ -1327,7 +1327,7 @@ mod tests {
                     id: "participant".to_string(),
                     external_id: "user".to_string(),
                 }],
-                publications: vec![publication.clone()],
+                publications: vec![publication],
             },
             mapping: MappingSnapshot {
                 accepted_intent_revision: 4,

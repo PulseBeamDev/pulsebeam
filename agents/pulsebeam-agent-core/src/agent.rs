@@ -2,7 +2,7 @@ use alloc::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     format,
     string::{String, ToString},
-    vec,
+    vec::{self, Vec},
 };
 use core::time::Duration;
 use pulsebeam_proto::signaling_v1 as wire;
@@ -24,6 +24,7 @@ use crate::{
 const CONTENT_TYPE: &str = "Content-Type";
 const JSON_CONTENT_TYPE: &str = "application/json";
 const SIGNAL_RETRY_DELAY: Duration = Duration::from_millis(100);
+const MAX_EARLY_SIGNALING_MESSAGES: usize = 64;
 
 macro_rules! agent_log {
     ($agent:expr, $level:ident, $($message:tt)*) => {
@@ -144,6 +145,7 @@ struct Attempt {
     answer_applied: bool,
     transport_connected: bool,
     signaling_open: bool,
+    early_signaling: VecDeque<Vec<u8>>,
     topic_registrations: crate::TopicRegistrations,
     open_channels: BTreeSet<ChannelId>,
 }
@@ -318,12 +320,12 @@ impl Agent {
             };
         }
         let local_slot = |name: &str| match self.config.topology.local_slot_kind(name) {
-            Some(crate::MediaKind::Video) => MediaSlot::LocalVideo(name.to_string()),
-            Some(crate::MediaKind::Audio) => MediaSlot::LocalAudio(name.to_string()),
-            None => unreachable!("validated publication slot"),
+            Some(crate::MediaKind::Video) => Ok(MediaSlot::LocalVideo(name.to_string())),
+            Some(crate::MediaKind::Audio) => Ok(MediaSlot::LocalAudio(name.to_string())),
+            None => Err(ValidationError::UnknownPublicationSlot(name.to_string())),
         };
         for publication in &desired.publications {
-            let slot = local_slot(&publication.slot);
+            let slot = local_slot(&publication.slot)?;
             if self
                 .local_bindings
                 .get(&slot)
@@ -339,7 +341,7 @@ impl Agent {
         }
         for publication in &desired.publications {
             self.local_bindings
-                .insert(local_slot(&publication.slot), publication.label.clone());
+                .insert(local_slot(&publication.slot)?, publication.label.clone());
         }
         if let Some(active) = self.active.as_ref() {
             for video in &desired.video {
@@ -445,6 +447,7 @@ impl Agent {
             answer_applied: false,
             transport_connected: false,
             signaling_open: false,
+            early_signaling: VecDeque::new(),
             topic_registrations: topic_registrations.clone(),
             open_channels: BTreeSet::new(),
         });
@@ -480,7 +483,7 @@ impl Agent {
                 {
                     attempt.answer_applied = true;
                     self.update_attempt_state();
-                    self.try_activate();
+                    self.try_activate()?;
                 }
                 Ok(())
             }
@@ -490,7 +493,7 @@ impl Agent {
                 {
                     attempt.transport_connected = true;
                     self.update_attempt_state();
-                    self.try_activate();
+                    self.try_activate()?;
                 }
                 Ok(())
             }
@@ -733,7 +736,7 @@ impl Agent {
                         return Err(TopicError::UnknownChannel.into());
                     }
                     self.update_attempt_state();
-                    self.try_activate();
+                    self.try_activate()?;
                 } else if self
                     .active
                     .as_ref()
@@ -804,6 +807,20 @@ impl Agent {
                 channel,
                 payload,
             } => {
+                if let Some(attempt) = self.attempt.as_mut()
+                    && attempt.generation == generation
+                    && attempt
+                        .resources
+                        .as_ref()
+                        .is_some_and(|resources| resources.signaling_channel == channel)
+                {
+                    if attempt.early_signaling.len() == MAX_EARLY_SIGNALING_MESSAGES {
+                        self.fail_attempt(Failure::transient("early signaling buffer exhausted"));
+                        return Ok(());
+                    }
+                    attempt.early_signaling.push_back(payload);
+                    return Ok(());
+                }
                 let Some(active) = self.active.as_mut() else {
                     return Ok(());
                 };
@@ -1063,7 +1080,7 @@ impl Agent {
         Ok(())
     }
 
-    fn try_activate(&mut self) {
+    fn try_activate(&mut self) -> Result<(), AgentError> {
         let ready = self.attempt.as_ref().is_some_and(|attempt| {
             attempt.candidate.is_some()
                 && attempt.resources.is_some()
@@ -1078,18 +1095,18 @@ impl Agent {
                 })
         });
         if !ready {
-            return;
+            return Ok(());
         }
         let Some(mut attempt) = self.attempt.take() else {
-            return;
+            return Ok(());
         };
         let Some(candidate) = attempt.candidate.take() else {
             debug_assert!(false, "ready attempt must have candidate metadata");
-            return;
+            return Ok(());
         };
         let Some(resources) = attempt.resources.take() else {
             debug_assert!(false, "ready attempt must have offer resources");
-            return;
+            return Ok(());
         };
         let topic_bindings = resources.data_channels.clone();
         let coordinates: BTreeMap<_, _> = resources
@@ -1146,10 +1163,18 @@ impl Agent {
         }
         self.snapshot.terminal_failure = None;
         self.set_connection_state(ConnectionState::Connected);
+        for payload in attempt.early_signaling {
+            self.handle_data_channel(DataChannelEvent::Message {
+                generation: attempt.generation,
+                channel: resources.signaling_channel,
+                payload,
+            })?;
+        }
         self.send_intent_if_ready();
         if attempt.topic_registrations != self.desired.topics {
             self.start_attempt(AttemptMode::Replace);
         }
+        Ok(())
     }
 
     fn update_attempt_state(&mut self) {
