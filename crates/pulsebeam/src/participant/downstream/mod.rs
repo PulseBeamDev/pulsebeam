@@ -548,7 +548,7 @@ impl Downstream {
         self.dirty_allocation = false;
         let (desired, assignments_changed, unfunded) = self
             .video
-            .update_allocations(self.available_bandwidth.current());
+            .update_allocations(now, self.available_bandwidth.current());
         let allocated = self.video.current_allocation();
         bwe.set_current_bitrate(allocated);
         if self.last_desired != desired {
