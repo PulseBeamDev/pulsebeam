@@ -20,6 +20,7 @@ thiserror.workspace = true
 
 [dev-dependencies]
 base64 = "0.22"
+criterion = "0.8.2"
 futures-lite.workspace = true
 proptest = "1.11.0"
 serde.workspace = true
@@ -34,6 +35,10 @@ browser-tests = []
 [[test]]
 name = "browser_interop"
 required-features = ["browser-tests"]
+
+[[bench]]
+name = "scaling"
+harness = false
 
 [lints]
 workspace = true

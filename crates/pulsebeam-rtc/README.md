@@ -236,8 +236,22 @@ negotiation, media-clock normalization, source switching, RTP/RTCP continuity,
 loss, delay, reordering, VBR, pauses, probing, feedback loss, DataChannel
 coexistence, malformed traffic, overload, resource bounds, and timer scaling.
 
-Parameterized many-connection and many-stream benchmarks must preserve one
-externally scheduled wakeup per connection and avoid global scans.
+Parameterized many-connection and many-stream benchmarks preserve one
+externally scheduled wakeup per connection and avoid global scans. Run the
+Criterion scaling matrix separately from test gates:
+
+```sh
+just --justfile crates/pulsebeam-rtc/Justfile bench
+```
+
+The matrix covers 1/16/64 connections with 1/8/32 senders each. Criterion measures
+wall-clock execution of 30 simulated seconds of polling after attempting one
+initial packet per sender, allowing admission backpressure. Connection negotiation,
+media admission, and teardown are excluded from timing.
+Transmits are discarded, so this measures timer/poll scheduling, not sustained
+network throughput or a simulated bandwidth/RTT path. Reports and comparison
+baselines live under `target/criterion`. Criterion arguments can be passed to the
+recipe, for example `bench --save-baseline main`.
 
 Live pinned Chrome and Firefox sessions are required interoperability evidence.
 Differential checks against `str0m`, Ericsson SCReAM, or libwebrtc are useful
