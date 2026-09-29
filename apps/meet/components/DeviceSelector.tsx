@@ -1,7 +1,9 @@
+import type { MediaDevice } from "@pulsebeam/react";
+
 interface DeviceSelectorProps {
   label: string;
   value: string;
-  devices: MediaDeviceInfo[];
+  devices: readonly MediaDevice[];
   onValueChange: (deviceId: string) => void;
 }
 
@@ -27,7 +29,7 @@ export function DeviceSelector({
             <>
               {!value && <option value="">Select {label}...</option>}
               {devices.map((device) => (
-                <option key={device.deviceId} value={device.deviceId}>
+                <option key={device.id} value={device.id}>
                   {device.label}
                 </option>
               ))}

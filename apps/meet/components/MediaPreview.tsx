@@ -1,9 +1,10 @@
 import { Button } from "./ui";
 import { Mic, MicOff, Video as VideoIcon, VideoOff } from "lucide-react";
-import { RefObject } from "react";
+import { Video } from "@pulsebeam/react";
+import type { CapturedVideoTrack } from "@pulsebeam/react";
 
 interface MediaPreviewProps {
-  videoRef: RefObject<HTMLVideoElement | null>;
+  videoTrack: CapturedVideoTrack | null;
   isCamOn: boolean;
   isMicOn: boolean;
   onToggleCam: () => void;
@@ -12,7 +13,7 @@ interface MediaPreviewProps {
 }
 
 export function MediaPreview({
-  videoRef,
+  videoTrack,
   isCamOn,
   isMicOn,
   onToggleCam,
@@ -23,12 +24,11 @@ export function MediaPreview({
     <div className="space-y-4">
       <div className="relative aspect-video overflow-hidden rounded-lg border border-border bg-black shadow-inner">
         {hasStream && isCamOn ? (
-          <video
-            ref={videoRef}
+          <Video
+            source={videoTrack}
             autoPlay
-            muted
-            playsInline
-            className="w-full h-full object-contain mirror"
+            mirror
+            className="w-full h-full object-contain"
           />
         ) : (
           <div className="flex flex-col items-center justify-center h-full bg-muted text-muted-foreground transition-colors">

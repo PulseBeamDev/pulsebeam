@@ -1,25 +1,29 @@
-import { useEffect, useRef, useState } from "react";
-import { useAgent } from "@pulsebeam/react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import type { Agent, Topic } from "@pulsebeam/react";
 
-const encoder = new TextEncoder();
-const decoder = new TextDecoder();
 const emojis = new Set(["👍", "❤️", "😂", "😮", "👏", "🔥"]);
 type Message = { id: string; sender: string; text: string; self: boolean };
 type Reaction = { id: string; emoji: string };
-type Pending = {
-  topic: "chat" | "reactions";
+type ChatPayload = { sender: string; text: string; ts: number; id: string };
+type ReactionPayload = {
   id: string;
+  emoji: string;
   sender: string;
-  text?: string;
-  emoji?: string;
+  ts: number;
 };
 
-export function useTopics() {
-  const { subscribeEvents, sendTopic, participantId } = useAgent();
+export function useTopics(agent: Agent, participantId: string | null) {
+  const chat = useMemo(
+    () => agent.topic<ChatPayload>("chat", { mode: "reliable" }),
+    [agent],
+  );
+  const reactionsTopic = useMemo(
+    () => agent.topic<ReactionPayload>("reactions", { mode: "unreliable" }),
+    [agent],
+  );
   const [messages, setMessages] = useState<Message[]>([]);
   const [reactions, setReactions] = useState<Reaction[]>([]);
   const [error, setError] = useState<string | null>(null);
-  const pending = useRef<Pending[]>([]);
   const timers = useRef(new Map<string, ReturnType<typeof setTimeout>>());
   const addReaction = (reaction: Reaction) => {
     setReactions((old) =>
@@ -37,102 +41,85 @@ export function useTopics() {
       );
   };
   useEffect(() => {
-    const activeTimers = timers.current;
-    const unsubscribe = subscribeEvents((event) => {
-      if (event.type === "topic-send-dropped") {
-        const index = pending.current.findIndex(
-          (item) => item.topic === event.topic,
-        );
-        if (index >= 0) pending.current.splice(index, 1);
-        setError(`Unable to send ${event.topic}: ${event.reason}`);
-        return;
-      }
-      if (event.type === "topic-channel-failed") {
-        if (event.direction === "publish")
-          pending.current = pending.current.filter(
-            (item) => item.topic !== event.topic,
-          );
-        setError(event.message);
-        return;
-      }
-      if (event.type === "topic-send-admitted") {
-        const index = pending.current.findIndex(
-          (item) => item.topic === event.topic,
-        );
-        const local =
-          index < 0 ? undefined : pending.current.splice(index, 1)[0];
-        const localText = local?.text;
-        if (local?.topic === "chat" && typeof localText === "string")
-          setMessages((old) => [
-            ...old,
-            { id: local.id, sender: local.sender, text: localText, self: true },
-          ]);
-        if (local?.topic === "reactions" && local.emoji)
-          addReaction({ id: local.id, emoji: local.emoji });
-        return;
-      }
-      if (event.type !== "topic-message") return;
+    const controller = new AbortController();
+    const receiveChat = async (topic: Topic<ChatPayload>) => {
       try {
-        const decoded: unknown = JSON.parse(decoder.decode(event.payload));
-        if (!decoded || typeof decoded !== "object") return;
-        const payload = decoded as Record<string, unknown>;
-        const remoteSender = payload.sender;
-        const remoteText = payload.text;
-        const timestamp = payload.ts;
-        if (
-          event.topic === "chat" &&
-          event.mode === "ordered" &&
-          typeof remoteSender === "string" &&
-          typeof remoteText === "string" &&
-          typeof timestamp === "number"
-        ) {
-          const id = `${event.publisherId}-${event.streamId}-${event.sequence}`;
+        for await (const payload of topic.subscribe({
+          signal: controller.signal,
+        })) {
+          if (
+            typeof payload?.sender !== "string" ||
+            typeof payload.text !== "string" ||
+            typeof payload.id !== "string" ||
+            typeof payload.ts !== "number"
+          )
+            continue;
           setMessages((old) =>
-            old.some((message) => message.id === id)
+            old.some((message) => message.id === payload.id)
               ? old
               : [
                   ...old,
-                  { id, sender: remoteSender, text: remoteText, self: false },
+                  {
+                    id: payload.id,
+                    sender: payload.sender,
+                    text: payload.text,
+                    self: false,
+                  },
                 ],
           );
         }
-        if (
-          event.topic === "reactions" &&
-          typeof payload.id === "string" &&
-          typeof payload.emoji === "string" &&
-          emojis.has(payload.emoji) &&
-          typeof payload.sender === "string" &&
-          typeof payload.ts === "number"
-        )
-          addReaction({ id: payload.id, emoji: payload.emoji });
-      } catch {
-        /* ignore malformed remote data */
+      } catch (reason) {
+        if (!controller.signal.aborted)
+          setError(
+            reason instanceof Error
+              ? reason.message
+              : "Chat subscription failed",
+          );
       }
-    });
+    };
+    const receiveReactions = async (topic: Topic<ReactionPayload>) => {
+      try {
+        for await (const payload of topic.subscribe({
+          signal: controller.signal,
+        })) {
+          if (
+            typeof payload?.id === "string" &&
+            typeof payload.emoji === "string" &&
+            emojis.has(payload.emoji) &&
+            typeof payload.sender === "string" &&
+            typeof payload.ts === "number"
+          )
+            addReaction({ id: payload.id, emoji: payload.emoji });
+        }
+      } catch (reason) {
+        if (!controller.signal.aborted)
+          setError(
+            reason instanceof Error
+              ? reason.message
+              : "Reaction subscription failed",
+          );
+      }
+    };
+    void receiveChat(chat);
+    void receiveReactions(reactionsTopic);
+    const activeTimers = timers.current;
     return () => {
-      unsubscribe();
-      pending.current = [];
+      controller.abort();
       for (const timer of activeTimers.values()) clearTimeout(timer);
       activeTimers.clear();
     };
-  }, [subscribeEvents]);
-  const enqueue = (
-    item: Pending,
-    payload: object,
-    mode: "ordered" | "latest",
-  ) => {
-    pending.current.push(item);
-    try {
-      sendTopic(item.topic, mode, encoder.encode(JSON.stringify(payload)));
-    } catch (reason) {
-      pending.current = pending.current.filter((entry) => entry.id !== item.id);
-      setError(
-        reason instanceof Error ? reason.message : "Unable to send message",
+  }, [chat, reactionsTopic]);
+
+  const publish = (operation: Promise<void>, accepted: () => void) => {
+    void operation
+      .then(accepted)
+      .catch((reason: unknown) =>
+        setError(
+          reason instanceof Error ? reason.message : "Unable to send message",
+        ),
       );
-    }
   };
   return {
-    participantId,
     messages,
     reactions,
     error,
@@ -140,21 +127,32 @@ export function useTopics() {
     sendChat(text: string) {
       const value = text.trim();
       if (!value || !participantId) return;
-      const ts = Date.now();
-      enqueue(
-        { topic: "chat", id: `self-${ts}`, sender: participantId, text: value },
-        { sender: participantId, text: value, ts },
-        "ordered",
+      const id = crypto.randomUUID();
+      publish(
+        chat.publish({
+          id,
+          sender: participantId,
+          text: value,
+          ts: Date.now(),
+        }),
+        () =>
+          setMessages((old) => [
+            ...old,
+            { id, sender: participantId, text: value, self: true },
+          ]),
       );
     },
     sendReaction(emoji: string) {
       if (!participantId || !emojis.has(emoji)) return;
-      const ts = Date.now();
-      const id = `${participantId}-${ts}`;
-      enqueue(
-        { topic: "reactions", id, sender: participantId, emoji },
-        { id, emoji, sender: participantId, ts },
-        "latest",
+      const id = crypto.randomUUID();
+      publish(
+        reactionsTopic.publish({
+          id,
+          emoji,
+          sender: participantId,
+          ts: Date.now(),
+        }),
+        () => addReaction({ id, emoji }),
       );
     },
   };
