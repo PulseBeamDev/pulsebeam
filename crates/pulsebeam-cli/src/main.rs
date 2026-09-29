@@ -586,10 +586,12 @@ async fn spawn_agent(
         publications: vec![
             PublicationIntent {
                 slot: "camera".into(),
+                label: "camera".into(),
                 active: true,
             },
             PublicationIntent {
                 slot: "microphone".into(),
+                label: "microphone".into(),
                 active: true,
             },
         ],
@@ -708,8 +710,8 @@ fn benchmark_agent_config(
         endpoint: api_url.to_string(),
         token: mint_development_token(&room, &participant, exp)?,
         topology: MediaTopology {
-            local_video: vec!["camera".into()],
-            local_audio: vec!["microphone".into()],
+            local_video: 1,
+            local_audio: 1,
             remote_video: REMOTE_VIDEO_SLOTS,
             remote_audio: REMOTE_AUDIO_SLOTS,
         },
@@ -805,10 +807,12 @@ fn video_subscriptions(snapshot: &Snapshot) -> (Vec<VideoSubscription>, HashSet<
         subscriptions.push(VideoSubscription {
             slot,
             track_id: publication.id.clone(),
+            selector: None,
             height: 720,
             min_height: 0,
             min_fps: 0,
             priority: 0,
+            playout_delay: Default::default(),
         });
         participants.insert(publication.participant_id.clone());
     }
@@ -1252,6 +1256,7 @@ mod tests {
             Publication {
                 id: "self-video".into(),
                 participant_id: "self".into(),
+                label: "camera".into(),
                 kind: MediaKind::Video,
             },
         );
@@ -1260,6 +1265,7 @@ mod tests {
             Publication {
                 id: "remote-audio".into(),
                 participant_id: "remote-audio".into(),
+                label: "microphone".into(),
                 kind: MediaKind::Audio,
             },
         );
@@ -1270,6 +1276,7 @@ mod tests {
                 Publication {
                     id: track_id,
                     participant_id: participant.into(),
+                    label: "camera".into(),
                     kind: MediaKind::Video,
                 },
             );

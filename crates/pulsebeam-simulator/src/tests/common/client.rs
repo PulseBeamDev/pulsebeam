@@ -36,7 +36,6 @@ pub struct SimClientBuilder {
     manual_subscriptions: bool,
     video_rx: Option<Arc<Mutex<VideoReceiveLog>>>,
     audio_rx: Option<Arc<Mutex<AudioReceiveLog>>>,
-    paused_publishers: Option<Arc<Mutex<std::collections::BTreeSet<String>>>>,
     publishes_video: bool,
     /// When set, publish with a variable-bitrate source instead of the constant-rate looper.
     vbr_profile: Option<VbrProfile>,
@@ -114,7 +113,6 @@ impl SimClientBuilder {
             manual_subscriptions: false,
             video_rx: None,
             audio_rx: None,
-            paused_publishers: None,
             publishes_video: false,
             vbr_profile: None,
             temporal_dd: None,
@@ -146,7 +144,6 @@ impl SimClientBuilder {
             manual_subscriptions: false,
             video_rx: None,
             audio_rx: None,
-            paused_publishers: None,
             publishes_video: false,
             vbr_profile: None,
             temporal_dd: None,
@@ -253,16 +250,6 @@ impl SimClientBuilder {
         self
     }
 
-    /// Inject a shared `VideoReceiveLog` so the harness can read it externally.
-    /// If not called, `connect()` allocates a private one.
-    pub fn with_paused_publishers(
-        mut self,
-        seen: Arc<Mutex<std::collections::BTreeSet<String>>>,
-    ) -> Self {
-        self.paused_publishers = Some(seen);
-        self
-    }
-
     pub fn with_audio_rx(mut self, rx: Arc<Mutex<AudioReceiveLog>>) -> Self {
         self.audio_rx = Some(rx);
         self
@@ -288,16 +275,8 @@ impl SimClientBuilder {
 
     pub(crate) async fn connect(self, room: &str) -> anyhow::Result<SimClient> {
         let topology = MediaTopology {
-            local_video: self
-                .publishes_video
-                .then(|| "video".to_owned())
-                .into_iter()
-                .collect(),
-            local_audio: self
-                .audio_level_dbov
-                .map(|_| "audio".to_owned())
-                .into_iter()
-                .collect(),
+            local_video: u8::from(self.publishes_video),
+            local_audio: u8::from(self.audio_level_dbov.is_some()),
             remote_video: u8::try_from(self.video_slots)?,
             remote_audio: u8::try_from(self.audio_slots)?,
         };
@@ -319,10 +298,10 @@ impl SimClientBuilder {
         config.tcp_server = self.tcp_server;
         config.dependency_descriptor = self.temporal_dd != Some(0);
         if let Some(layers) = self.video_layers.clone() {
-            config.video_encodings.insert("video".into(), layers);
+            config.video_encodings.insert("v0".into(), layers);
         }
         if let Some(layers) = self.temporal_dd.filter(|layers| *layers > 0) {
-            config.video_temporal_layers.insert("video".into(), layers);
+            config.video_temporal_layers.insert("v0".into(), layers);
         }
 
         let agent = Agent::spawn(config, self.host).await?;
@@ -332,12 +311,14 @@ impl SimClientBuilder {
             publications: self
                 .publishes_video
                 .then(|| PublicationIntent {
-                    slot: "video".into(),
+                    slot: "v0".into(),
+                    label: "video".into(),
                     active: true,
                 })
                 .into_iter()
                 .chain(self.audio_level_dbov.map(|_| PublicationIntent {
-                    slot: "audio".into(),
+                    slot: "a0".into(),
+                    label: "audio".into(),
                     active: true,
                 }))
                 .collect(),
@@ -401,9 +382,6 @@ impl SimClientBuilder {
             requested_video: None,
             discovered_tracks: HashSet::new(),
             remote_tracks: HashMap::new(),
-            paused_publishers: self
-                .paused_publishers
-                .unwrap_or_else(|| Arc::new(Mutex::new(BTreeSet::new()))),
             received_data: Vec::new(),
             media_kinds: HashMap::new(),
             video_rx,
@@ -427,13 +405,13 @@ impl SimClientBuilder {
             join_set.spawn(async move {
                 let mut decoders = HashMap::<String, OpusReceiver>::new();
                 while let Ok(mut packet) = remote.recv_packet().await {
-                    let Some(binding) = remote.audio_binding() else {
+                    let Some(track_id) = remote.publication_id() else {
                         continue;
                     };
                     let snapshot = observed_agent.snapshot();
                     let Some(publisher) = snapshot
                         .publications
-                        .get(&binding.track_id)
+                        .get(&track_id)
                         .map(|publication| publication.participant_id.clone())
                     else {
                         continue;
@@ -457,7 +435,7 @@ impl SimClientBuilder {
         }
 
         if self.publishes_video {
-            let media = agent.local_media("video");
+            let media = agent.local_media("v0");
             let encodings: Vec<Option<String>> = self
                 .video_layers
                 .as_ref()
@@ -499,7 +477,7 @@ impl SimClientBuilder {
                     level_dbov: level,
                     phase_offset: self.audio_phase_offset,
                 }
-                .run(agent.local_audio("audio")),
+                .run(agent.local_audio("a0")),
             );
         }
         ctx.refresh().await?;
@@ -1244,7 +1222,6 @@ pub struct ClientContext {
     corrupt_video_payload: bool,
     pub discovered_tracks: HashSet<String>,
     pub remote_tracks: HashMap<String, String>,
-    pub paused_publishers: Arc<Mutex<BTreeSet<String>>>,
     pub received_data: Vec<(String, Vec<u8>)>,
     pub media_kinds: HashMap<String, (bool, bool)>,
     events: tokio::sync::broadcast::Receiver<AgentEvent>,
@@ -1305,12 +1282,6 @@ impl ClientContext {
                     .publications
                     .get(&binding.track_id)
                     .map(|publication| {
-                        if binding.paused {
-                            self.paused_publishers
-                                .lock()
-                                .unwrap()
-                                .insert(publication.participant_id.clone());
-                        }
                         (publication.participant_id.clone(), binding.track_id.clone())
                     })
             })
@@ -1380,10 +1351,12 @@ impl ClientContext {
             resolved.push(VideoSubscription {
                 slot: u8::try_from(resolved.len())?,
                 track_id,
+                selector: None,
                 height: request.height,
                 min_height: request.min_height,
                 min_fps: 0,
                 priority: request.priority,
+                playout_delay: Default::default(),
             });
         }
         if self.desired.video != resolved {
@@ -1409,7 +1382,11 @@ impl ClientContext {
             };
             pinned.push(publication.id.clone());
         }
-        let audio = AudioSubscription { pinned, automatic };
+        let audio = AudioSubscription {
+            pinned,
+            automatic,
+            ..Default::default()
+        };
         if self.desired.audio != audio {
             let mut desired = self.desired.clone();
             desired.audio = audio;
@@ -1533,13 +1510,13 @@ fn spawn_video_receiver(
     join_set.spawn(async move {
         let mut streams = HashMap::<String, VideoStreamReceiver>::new();
         while let Ok(packet) = remote.recv_packet().await {
-            let Some(binding) = remote.video_binding() else {
+            let Some(track_id) = remote.publication_id() else {
                 continue;
             };
             let snapshot = agent.snapshot();
             let Some(publisher) = snapshot
                 .publications
-                .get(&binding.track_id)
+                .get(&track_id)
                 .map(|publication| publication.participant_id.clone())
             else {
                 continue;

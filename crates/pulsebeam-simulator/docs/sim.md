@@ -82,40 +82,26 @@ Linux integration test; the simulator runs the same matrix once per family.
 The workspace wire contract is
 [`pulsebeam-proto/proto/signaling.proto`](../../pulsebeam-proto/proto/signaling.proto):
 
-- `ClientIntent` is declarative. Repeating the same intent must be idempotent;
-  omitting a video request removes that request; `active=false` explicitly
-  stops a publication.
-- `ServerState` is an ordered reliable-channel diff. Participant and
-  publication additions/removals form a roster log. Video bindings are a
-  complete group when present. Audio bindings are also a complete group when
-  present, including an explicitly empty group.
-- A participant is announced because it has a visible media publication. Audio
-  publications are in the roster so a client can pin a specific audio track;
-  audio must not be smuggled into a video-only publication list.
-- A binding is authoritative for the slot it names. The client must not infer
-  the current audio speaker or video origin from RTP alone.
-- A failed state write must leave the unsent diff pending. A later successful
-  write must not skip an addition, removal, or binding replacement.
+- `Intent` is a complete replacement of desired send and receive state.
+  Repeating it must be idempotent; omitting a video request withdraws it, and
+  `active=false` stops a publication without releasing its reserved sender.
+- `Catalog` begins with a complete snapshot and advances through ordered
+  participant/track deltas. Each track has a stable canonical ID, kind, label,
+  and owning participant. Removing a track is terminal for its receive desire.
+- `Mapping` is a complete authoritative assignment of tracks to negotiated
+  video and audio receiver indices. An omitted assignment does not remove a
+  Catalog track. The client must not infer the origin from RTP alone.
+- A failed state write must leave unsent Catalog or Mapping state pending;
+  a later successful write must not skip a removal or binding replacement.
+- Native clients use the protobuf/LZ4 signaling channel. WHIP/WHEP clients
+  retain their HTTP/SDP lifecycle and never require these messages.
 
-The supplied `../pulsebeamdev/pulsebeam-js` checkout currently implements a
-different, older schema: `StateUpdate` with `seq`, `is_snapshot`,
-`tracks_upsert`, `assignments_upsert`, and `request_sync`. The current workspace
-proto has `ServerState`, publications, separate video/audio bindings, and no
-`request_sync` field. The JS client is useful evidence for desired declarative
-client behavior, but it is not a wire-compatible oracle for this checkout until
-the generated client and proto are aligned. Browser-state tests must either pin
-the matching client revision or add a compatibility test before claiming
-coverage.
-
-If the older schema is retained for compatibility, its state reducer also needs
-explicit tests for stale snapshots, duplicate IDs, remove/upsert conflicts,
-unknown assignment tracks and track-kind mismatches. Its current snapshot path
-can replace a newer local sequence without validating that relationship.
-
-The Rust agent currently follows the workspace contract. Its signaling tests
-must remain aligned with the same invariants: roster diffs commit only after a
-successful channel write, audio shape changes include slot replacement and
-emptying, and loudness alone does not generate a signaling update.
+The Rust agent and browser contracts must follow the workspace proto rather
+than a historical `StateUpdate` or `ServerState` schema. Signaling tests should
+check complete state replacement, ordered Catalog revisions, removal fencing,
+receiver reassignment and recovery after failed writes. Audio shape changes
+include receiver replacement and emptying; loudness alone does not generate a
+signaling update.
 
 ## State invariants
 
@@ -165,7 +151,7 @@ capture value snapshots/events from control and shards for assertions.
 At every settle window, and after every injected failure, assert:
 
 - exact live participant and publication sets for every observer;
-- exact video and audio bindings, including origin, kind, mid and paused state;
+- exact video and audio assignments, including origin and kind, independently of forwarding state;
 - no duplicate publication, group member, slot binding or data delivery;
 - no stale participant, track, assignment, route, topic or epoch after removal;
 - all live control objects have a corresponding shard projection;
