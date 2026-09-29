@@ -51,6 +51,8 @@ struct Public {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Live {
+    fixed_rtp: RtpEvidence,
+    default_rtp: RtpEvidence,
     independent_rendering: bool,
     mounted_removal: bool,
     connected: bool,
@@ -62,6 +64,15 @@ struct Live {
     runtime_failure_event: bool,
     close_during_local_operation: bool,
     caller_owns_track: bool,
+}
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RtpEvidence {
+    relay: usize,
+    ssrc: u32,
+    packets: u64,
+    with_extension: u64,
+    first_value: Option<Vec<u8>>,
 }
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -363,6 +374,23 @@ async fn public_agent_connects_and_delivers_remote_media() -> TestResult<()> {
         navigate(&bidi, &context, url).await?;
         let _: () = evaluate_json(&bidi, &context, LOAD).await?;
         let r: Live = evaluate_json(&bidi, &context, &live).await?;
+        assert_ne!(r.fixed_rtp.relay, r.default_rtp.relay, "{r:?}");
+        assert!(
+            r.fixed_rtp.packets >= 4
+                && r.fixed_rtp.with_extension > 0
+                && r.fixed_rtp.first_value.as_deref() == Some(&[0, 0xa0, 10]),
+            "fixed-delay positive control SSRC {}: {:?}",
+            r.fixed_rtp.ssrc,
+            r.fixed_rtp,
+        );
+        assert!(
+            r.default_rtp.packets >= 4
+                && r.default_rtp.with_extension == 0
+                && r.default_rtp.first_value.is_none(),
+            "fresh-default receiver SSRC {}: {:?}",
+            r.default_rtp.ssrc,
+            r.default_rtp,
+        );
         assert!(
             r.independent_rendering
                 && r.mounted_removal
