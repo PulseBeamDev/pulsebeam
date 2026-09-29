@@ -1531,6 +1531,224 @@ fn signaling_snapshot_diff_and_empty_binding_groups_are_exact() {
 }
 
 #[test]
+fn mapping_omission_retains_desire_until_a_subsequent_mapping() {
+    let (mut agent, generation, cid, send) = connected_agent();
+    acknowledge_send(&mut agent, generation, cid, send);
+    let deliver = |agent: &mut Agent, payload: server_message::Payload| {
+        agent
+            .handle(HostEvent::DataChannel(DataChannelEvent::Message {
+                generation,
+                channel: cid,
+                payload: server_payload(payload),
+            }))
+            .unwrap();
+    };
+    deliver(
+        &mut agent,
+        server_message::Payload::Catalog(v1::Catalog {
+            revision: 1,
+            state: Some(v1::catalog::State::Snapshot(v1::CatalogSnapshot {
+                participants: vec![v1::Participant {
+                    participant_id: "publisher".into(),
+                    participant_external_id: "publisher-external".into(),
+                }],
+                tracks: ["audio-track", "audio-second"]
+                    .into_iter()
+                    .map(|id| v1::RemoteTrack {
+                        track_id: id.into(),
+                        participant_id: "publisher".into(),
+                        kind: v1::TrackKind::Audio.into(),
+                        label: id.into(),
+                    })
+                    .collect(),
+            })),
+        }),
+    );
+    let mut selected = desired(2);
+    selected.audio.pinned.push("audio-second".into());
+    agent
+        .command(AgentCommand::ReplaceDesired(selected))
+        .unwrap();
+    let Effect::DataChannel(DataChannelEffect::Send {
+        operation, payload, ..
+    }) = next_effect(&mut agent)
+    else {
+        panic!("expected A+B intent");
+    };
+    let audio = decode_intent(&payload)
+        .receive
+        .unwrap()
+        .audio
+        .unwrap()
+        .tracks;
+    assert_eq!(audio.len(), 2);
+    assert_eq!(audio[0].track_id, "audio-track");
+    assert_eq!(audio[1].track_id, "audio-second");
+    acknowledge_send(&mut agent, generation, cid, operation);
+    for (id, expected) in [
+        ("audio-track", "audio-track"),
+        ("audio-second", "audio-second"),
+    ] {
+        deliver(
+            &mut agent,
+            server_message::Payload::Mapping(v1::Mapping {
+                intent_revision: 2,
+                video: Some(v1::TrackMappings { tracks: vec![] }),
+                audio: Some(v1::TrackMappings {
+                    tracks: vec![v1::TrackMapping {
+                        receiver_index: 2,
+                        track_id: id.into(),
+                    }],
+                }),
+            }),
+        );
+        assert_eq!(agent.snapshot().audio_mapping[&2], expected);
+        assert_eq!(agent.snapshot().publications.len(), 2);
+        assert!(agent.next_effect().is_none());
+    }
+    deliver(
+        &mut agent,
+        server_message::Payload::Mapping(v1::Mapping {
+            intent_revision: 2,
+            video: Some(v1::TrackMappings { tracks: vec![] }),
+            audio: Some(v1::TrackMappings { tracks: vec![] }),
+        }),
+    );
+    assert!(agent.snapshot().audio_mapping.is_empty());
+    assert_eq!(agent.snapshot().publications.len(), 2);
+    assert!(agent.next_effect().is_none());
+}
+
+#[test]
+fn catalog_removal_retracts_direct_video_and_pinned_audio_intent() {
+    let (mut agent, generation, cid, send) = connected_agent();
+    acknowledge_send(&mut agent, generation, cid, send);
+    let deliver = |agent: &mut Agent, catalog: v1::Catalog| {
+        agent
+            .handle(HostEvent::DataChannel(DataChannelEvent::Message {
+                generation,
+                channel: cid,
+                payload: server_payload(server_message::Payload::Catalog(catalog)),
+            }))
+            .unwrap();
+    };
+    deliver(
+        &mut agent,
+        v1::Catalog {
+            revision: 1,
+            state: Some(v1::catalog::State::Snapshot(v1::CatalogSnapshot {
+                participants: vec![v1::Participant {
+                    participant_id: "publisher".into(),
+                    participant_external_id: "publisher-external".into(),
+                }],
+                tracks: vec![
+                    v1::RemoteTrack {
+                        track_id: "video-track".into(),
+                        participant_id: "publisher".into(),
+                        kind: v1::TrackKind::Video.into(),
+                        label: "camera".into(),
+                    },
+                    v1::RemoteTrack {
+                        track_id: "audio-track".into(),
+                        participant_id: "publisher".into(),
+                        kind: v1::TrackKind::Audio.into(),
+                        label: "microphone".into(),
+                    },
+                ],
+            })),
+        },
+    );
+    assert!(agent.next_effect().is_none());
+    deliver(
+        &mut agent,
+        v1::Catalog {
+            revision: 2,
+            state: Some(v1::catalog::State::Delta(v1::CatalogDelta {
+                removed_track_ids: vec!["video-track".into(), "audio-track".into()],
+                ..Default::default()
+            })),
+        },
+    );
+    let Effect::DataChannel(DataChannelEffect::Send {
+        operation, payload, ..
+    }) = next_effect(&mut agent)
+    else {
+        panic!("expected retracted intent");
+    };
+    let receive = decode_intent(&payload).receive.unwrap();
+    assert!(receive.video.unwrap().tracks.is_empty());
+    assert!(receive.audio.unwrap().tracks.is_empty());
+    acknowledge_send(&mut agent, generation, cid, operation);
+    assert!(agent.next_effect().is_none());
+
+    deliver(
+        &mut agent,
+        v1::Catalog {
+            revision: 3,
+            state: Some(v1::catalog::State::Delta(v1::CatalogDelta {
+                added_tracks: vec![v1::RemoteTrack {
+                    track_id: "video-track".into(),
+                    participant_id: "publisher".into(),
+                    kind: v1::TrackKind::Video.into(),
+                    label: "camera".into(),
+                }],
+                ..Default::default()
+            })),
+        },
+    );
+    assert!(agent.next_effect().is_none());
+    let mut changed = desired(2);
+    changed.video[0].height = 1080;
+    agent
+        .command(AgentCommand::ReplaceDesired(changed))
+        .unwrap();
+    let Effect::DataChannel(DataChannelEffect::Send {
+        operation, payload, ..
+    }) = next_effect(&mut agent)
+    else {
+        panic!("expected intent after unrelated policy change");
+    };
+    assert!(
+        decode_intent(&payload)
+            .receive
+            .unwrap()
+            .video
+            .unwrap()
+            .tracks
+            .is_empty()
+    );
+    acknowledge_send(&mut agent, generation, cid, operation);
+    let mut cleared = desired(3);
+    cleared.video.clear();
+    cleared.audio.pinned.clear();
+    agent
+        .command(AgentCommand::ReplaceDesired(cleared))
+        .unwrap();
+    let Effect::DataChannel(DataChannelEffect::Send { operation, .. }) = next_effect(&mut agent)
+    else {
+        panic!("expected cleared desire");
+    };
+    acknowledge_send(&mut agent, generation, cid, operation);
+    let mut fresh = desired(4);
+    fresh.audio.pinned.clear();
+    agent.command(AgentCommand::ReplaceDesired(fresh)).unwrap();
+    let Effect::DataChannel(DataChannelEffect::Send { payload, .. }) = next_effect(&mut agent)
+    else {
+        panic!("expected fresh explicit selection");
+    };
+    assert_eq!(
+        decode_intent(&payload)
+            .receive
+            .unwrap()
+            .video
+            .unwrap()
+            .tracks[0]
+            .track_id,
+        "video-track"
+    );
+}
+
+#[test]
 fn catalog_selectors_remain_unresolved_then_follow_canonical_track_changes() {
     let mut selected = desired(1);
     selected.video[0].track_id.clear();
