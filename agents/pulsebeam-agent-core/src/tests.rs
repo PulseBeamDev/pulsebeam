@@ -1226,6 +1226,39 @@ fn transient_failure_schedules_a_bounded_retry_that_disconnect_cancels() {
 }
 
 #[test]
+fn transport_loss_fences_incumbent_signaling_during_replacement() {
+    for failed in [false, true] {
+        let (mut agent, generation, channel, send) = connected_agent();
+        acknowledge_send(&mut agent, generation, channel, send);
+        let event = if failed {
+            RtcEvent::Failed {
+                generation,
+                message: "transport failed".into(),
+            }
+        } else {
+            RtcEvent::Disconnected { generation }
+        };
+        agent.handle(HostEvent::Rtc(event)).unwrap();
+        assert!(matches!(
+            next_effect(&mut agent),
+            Effect::Rtc(RtcEffect::CreateOffer { .. })
+        ));
+        drain_notifications(&mut agent);
+        let before = agent.snapshot().clone();
+        agent
+            .handle(HostEvent::DataChannel(DataChannelEvent::Message {
+                generation,
+                channel,
+                payload: vec![0xff],
+            }))
+            .unwrap();
+        assert_eq!(agent.snapshot(), &before);
+        assert!(agent.next_notification().is_none());
+        assert!(agent.next_effect().is_none());
+    }
+}
+
+#[test]
 fn reconnect_posts_a_new_resource_and_swaps_only_after_the_candidate_is_ready() {
     let (mut agent, old_generation, old_cid, send) = connected_agent();
     acknowledge_send(&mut agent, old_generation, old_cid, send);

@@ -508,17 +508,11 @@ impl Agent {
                     .active
                     .as_ref()
                     .is_some_and(|session| session.generation == generation)
-                    && self.desired.connected
-                    && self.attempt.is_none()
-                    && self.retry.is_none()
                 {
-                    self.topics.unbind_generation(
-                        generation,
-                        TopicDropReason::TransportReplaced,
-                        &mut self.snapshot,
-                        &mut self.notifications,
-                    );
-                    self.start_attempt(AttemptMode::Replace);
+                    self.fence_signaling(generation);
+                    if self.desired.connected && self.attempt.is_none() && self.retry.is_none() {
+                        self.start_attempt(AttemptMode::Replace);
+                    }
                 }
                 Ok(())
             }
@@ -536,12 +530,12 @@ impl Agent {
                     .active
                     .as_ref()
                     .is_some_and(|session| session.generation == generation)
-                    && self.desired.connected
-                    && self.attempt.is_none()
-                    && self.retry.is_none()
                 {
-                    self.notify_failure(Failure::transient(message));
-                    self.start_attempt(AttemptMode::Replace);
+                    self.fence_signaling(generation);
+                    if self.desired.connected && self.attempt.is_none() && self.retry.is_none() {
+                        self.notify_failure(Failure::transient(message));
+                        self.start_attempt(AttemptMode::Replace);
+                    }
                 }
                 Ok(())
             }
@@ -553,6 +547,20 @@ impl Agent {
                 Ok(())
             }
         }
+    }
+
+    fn fence_signaling(&mut self, generation: Generation) {
+        if let Some(active) = self.active.as_mut() {
+            active.signaling_terminal = true;
+        }
+        self.pending_signal = None;
+        self.cancel_signal_retry();
+        self.topics.unbind_generation(
+            generation,
+            TopicDropReason::TransportReplaced,
+            &mut self.snapshot,
+            &mut self.notifications,
+        );
     }
 
     fn offer_created(
