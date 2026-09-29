@@ -18,6 +18,9 @@ await build({
 });
 const inputs = [
   "tests/browser/fixture.tsx",
+  "tests/browser/acquisition.tsx",
+  "tests/browser/ownership.tsx",
+  "tests/browser/playback.tsx",
   "tests/browser/index.html",
   "../pulsebeam-agent-web/dist/index.js",
 ];

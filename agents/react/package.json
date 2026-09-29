@@ -20,8 +20,8 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "check": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.contracts.json && tsc -p tsconfig.browser.json",
-    "format": "prettier --write \"src/**/*.ts\" \"tests/browser/{build.mjs,fixture.tsx,observe.js}\" \"tests/contracts/**/*.ts\" \"tests/consumer/src/**/*.ts\" \"*.json\"",
-    "format:check": "prettier --check \"src/**/*.ts\" \"tests/browser/{build.mjs,fixture.tsx,observe.js}\" \"tests/contracts/**/*.ts\" \"tests/consumer/src/**/*.ts\" \"*.json\"",
+    "format": "prettier --write \"src/**/*.ts\" \"tests/browser/{build.mjs,*.tsx,observe.js}\" \"tests/contracts/**/*.ts\" \"tests/consumer/src/**/*.ts\" \"*.json\"",
+    "format:check": "prettier --check \"src/**/*.ts\" \"tests/browser/{build.mjs,*.tsx,observe.js}\" \"tests/contracts/**/*.ts\" \"tests/consumer/src/**/*.ts\" \"*.json\"",
     "test": "pnpm run test:consumer",
     "build:browser": "node tests/browser/build.mjs",
     "test:consumer": "pnpm --dir tests/consumer install --offline --frozen-lockfile && pnpm --dir tests/consumer run check"

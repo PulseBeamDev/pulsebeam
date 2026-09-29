@@ -2,18 +2,28 @@ import {
   AgentProvider,
   createAgent,
   useAgent,
+  useDisplayMedia,
+  useMediaDevices,
   useRemoteMedia,
+  useUserMedia,
+  Video,
+  Audio,
   type AgentProviderProps,
   type Agent,
   type AgentConfig,
   type AgentEvent,
   type AgentFailure,
   type AgentState,
+  type CapturedVideoTrack,
+  type LocalTrackCapacityError,
+  type MediaCaptureError,
   type PlaybackFailure,
   type RemoteMediaAttachment,
   type RemoteMediaAttachmentOptions,
   type UseAgentResult,
   type RemoteTrack,
+  type RemoteVideoTrack,
+  type RemoteAudioSource,
   type TopicMode,
   type VideoSenderConfig,
 } from "@pulsebeam/react";
@@ -62,6 +72,27 @@ const state: AgentState = {
 const props: AgentProviderProps = { agent, children };
 const provider: ReactElement = AgentProvider(props);
 const result: UseAgentResult = useAgent();
+const owned: Agent | null = useAgent(config);
+const camera = useUserMedia({ video: { width: 1280 }, audio: false });
+const screen = useDisplayMedia({ video: true, audio: false });
+const devices = useMediaDevices();
+if (owned) {
+  owned.connect();
+  const handle = owned.localVideoTrack("camera");
+  handle.setSource(camera.videoTrack);
+  const source: CapturedVideoTrack | null = handle.source;
+  // @ts-expect-error An audio capture cannot be bound to a video handle.
+  handle.setSource(camera.audioTrack);
+  owned.disconnect();
+  void source;
+}
+void screen.request();
+const firstCameraId: string | undefined = devices.cameras[0]?.id;
+declare const captureFailure: MediaCaptureError;
+declare const exhausted: LocalTrackCapacityError;
+const failureCode: string = captureFailure.code;
+const capacity: number = exhausted.capacity;
+void [firstCameraId, failureCode, capacity];
 const playbackOptions: RemoteMediaAttachmentOptions = {
   publicationIds: ["remote-camera"],
   onPlaybackBlocked: (failure: PlaybackFailure, retry) => {
@@ -70,6 +101,22 @@ const playbackOptions: RemoteMediaAttachmentOptions = {
   },
 };
 const playback = useRemoteMedia(agent, element, playbackOptions);
+const available: readonly RemoteVideoTrack[] = agent.remoteVideoTracks;
+const mainAudio: RemoteAudioSource = agent.remoteAudio;
+const remoteView: ReactElement | null = Video({
+  source: available[0] ?? null,
+  mirror: true,
+});
+const localView: ReactElement | null = Video({
+  source: agent.localVideoTrack("camera"),
+});
+const remoteAudio: ReactElement | null = Audio({ source: mainAudio });
+// @ts-expect-error Audio only accepts a remote audio source
+Audio({ source: available[0] });
+const messages = agent
+  .topic<{ text: string }>("chat", { mode: "reliable" })
+  .subscribe();
+void [remoteView, localView, remoteAudio, messages];
 declare const attachment: RemoteMediaAttachment;
 
 const connection = result.connection;

@@ -2,6 +2,9 @@ import { Component, StrictMode, useEffect, useRef, useState } from "react";
 import type { ErrorInfo, ReactNode } from "react";
 import { createRoot } from "react-dom/client";
 import { AgentProvider, useAgent, useRemoteMedia } from "@pulsebeam/react";
+import { runAcquisitionContract } from "./acquisition.js";
+import { runOwnershipContract } from "./ownership.js";
+import { runPlaybackContract } from "./playback.js";
 import type { AgentSnapshot } from "@pulsebeam/react";
 
 const disconnected: AgentSnapshot = Object.freeze({
@@ -122,6 +125,24 @@ const observation = {
   playbackReplacement: false,
   playbackUnmount: false,
   playbackStrictMode: false,
+  captureDevices: false,
+  capturePendingOptions: false,
+  captureReplacement: false,
+  captureFencing: false,
+  captureDisplay: false,
+  captureErrors: false,
+  captureSession: false,
+  ownedIndependent: false,
+  ownedRenewal: false,
+  ownedReplacement: false,
+  ownedCleanup: false,
+  localPreview: false,
+  capturedPreview: false,
+  replaced: false,
+  playbackError: false,
+  detached: false,
+  audioExplicit: false,
+  playbackProbeError: "",
 };
 
 declare global {
@@ -442,5 +463,12 @@ void (async () => {
     second.subscriptions === second.unsubscriptions &&
     second.eventSubscriptions === second.eventUnsubscriptions;
   observation.callerOwned = first.closed === 0 && second.closed === 0;
+  Object.assign(observation, await runAcquisitionContract());
+  Object.assign(observation, await runOwnershipContract());
+  try {
+    Object.assign(observation, await runPlaybackContract());
+  } catch (error) {
+    observation.playbackProbeError = String(error);
+  }
   globalThis.__pulsebeamReactObservation = observation;
 })();

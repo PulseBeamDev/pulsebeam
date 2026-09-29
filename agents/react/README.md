@@ -1,56 +1,93 @@
 # PulseBeam React
 
-`@pulsebeam/react` is Meet's complete app-facing PulseBeam SDK. It includes the
-agent factory, all public types, the browser runtime, and the React adapter.
-
-Install the adapter with React:
+`@pulsebeam/react` provides browser acquisition, Agent ownership, and playback.
+Install it alongside React:
 
 ```sh
 pnpm add @pulsebeam/react react
 ```
 
-Create and close an agent for each effect lifetime, then place `AgentProvider`
-above components that call `useAgent`. The provider never initializes,
-reconnects, replaces, or closes its caller-owned agent. Its preparation recipe
-builds the internal web runtime and WASM assets; applications do not need a web
-SDK dependency, runtime override, or private asset path.
+`useAgent(config)` creates one independent Agent after mount and closes it on
+unmount. It returns `null` until the Agent is ready to use. Agents start
+**disconnected**: call `connect()` to request a connection and `disconnect()` to
+stop retrying. Both methods change desired connection state synchronously;
+observe `agent.getSnapshot().connection` for progress. Changing the token
+renews authorization on the same Agent; changing endpoint, topology, or logging
+replaces the Agent. Use a distinct participant credential for each simultaneous
+Agent. The hook subscribes its component to Agent snapshot changes.
+
+Capture is owned by its acquisition hook, not by any Agent. Request it from a
+user gesture, then lend its source to one or more stable logical handles:
 
 ```tsx
-import { AgentProvider, createAgent, useAgent, useRemoteMedia, type Agent } from "@pulsebeam/react";
-import { useEffect, useRef, useState } from "react";
+import { useEffect } from "react";
+import { useAgent, useUserMedia, type AgentConfig } from "@pulsebeam/react";
 
-function Status({ agent }: { agent: Agent }) {
-  const { connection, tracks, topics, subscribeEvents } = useAgent();
-  const remoteVideo = useRef<HTMLVideoElement>(null);
-  useRemoteMedia(agent, remoteVideo, {
-    publicationIds: Object.values(tracks)
-      .filter((track) => track.kind === "video")
-      .map((track) => track.publicationId),
-    onPlaybackBlocked: (failure) => console.warn(failure.message),
-  });
-  useEffect(() => subscribeEvents((event) => {
-    if (event.type === "topic-message") console.log(event.topic, event.payload);
-  }), [subscribeEvents]);
-  return (
-    <>{connection} <video ref={remoteVideo} autoPlay /> {topics.deliveredMessages}</>
-  );
-}
-
-function App() {
-  const [agent, setAgent] = useState<Agent | null>(null);
+function Camera({ config }: { config: AgentConfig }) {
+  const agent = useAgent(config);
+  const capture = useUserMedia({ video: true, audio: false });
   useEffect(() => {
-    const current = createAgent({ endpoint: "https://pulsebeam.example", token: "opaque-token", topology: { localVideos: 2, localAudios: 1 } });
-    current.setState({ connected: true, publications: [{ slot: "camera", active: true }, { slot: "mic", active: true }, { slot: "screen", active: true }], video: [{ slot: 0, trackId: "remote-camera", height: 720, minHeight: 360, minFps: 24, priority: 1, playoutDelay: { mode: "fixed", minMs: 50, maxMs: 100 } }], audio: { automatic: true }, topics: [{ name: "chat", mode: "ordered", publish: true, subscribe: true }, { name: "reaction", mode: "latest", publish: true, subscribe: true }] });
-    setAgent(current);
-    return () => { setAgent(null); current.close(); };
-  }, []);
-  return agent && <AgentProvider agent={agent}><Status agent={agent} /></AgentProvider>;
+    if (!agent) return;
+    agent.connect();
+    return () => agent.disconnect();
+  }, [agent]);
+  useEffect(() => {
+    if (!agent) return;
+    const camera = agent.localVideoTrack("camera");
+    camera.setSource(capture.videoTrack);
+    return () => camera.setSource(null);
+  }, [agent, capture.videoTrack]);
+  return <button onClick={() => void capture.request().catch(console.error)}>
+    {capture.state === "requesting" ? "Requesting…" : "Choose camera"}
+  </button>;
 }
-
 ```
 
-The web agent owns browser attachment and playback. `useRemoteMedia` binds
-selected remote publication IDs to a caller-owned audio or video element; the
-hook retains the attachment across ordinary renders and returns a stable retry
-operation for blocked-playback UI. The application still chooses the element
-and visible tracks.
+Use the same Agent's catalog-backed remote handles directly, without looking
+up canonical publication IDs. Mounted video requests receive bandwidth based
+on visible element size; unmount releases demand. Audio playback is explicit:
+
+```tsx
+import { Audio, Video, useAgent, type AgentConfig } from "@pulsebeam/react";
+
+function Room({ config, onPlaybackError }: {
+  config: AgentConfig;
+  onPlaybackError: (error: unknown, retry: () => Promise<void>) => void;
+}) {
+  const agent = useAgent(config);
+  if (!agent) return null;
+  return <>
+    {agent.remoteVideoTracks.map((track) =>
+      <Video key={`${track.participantId}:${track.label}`}
+        source={track} mirror={false} className="participant" />)}
+    <Audio source={agent.remoteAudio}
+      onPlaybackError={({ error, retry }) => onPlaybackError(error, retry)} />
+  </>;
+}
+```
+
+`<Video>` also accepts a local video handle or a captured video source for
+pre-join preview, plus `null`, `mirror`, `muted`, `playsInline`, `className`, and
+`style`. Use
+`track.setReceiveOptions({minHeight,minFps,priority,playoutDelay})` to replace
+remote policy without activating a hidden track. `onPlaybackError` receives a
+user-gesture retry for autoplay restrictions. `agent.topic<T>(name, { mode:
+"reliable" | "unreliable" })` provides typed JSON `publish(value)` and
+`subscribe({signal})` iteration; creating a topic does not subscribe.
+
+`useMediaDevices()` lists reactive cameras, microphones and speakers with
+readonly `id` and `label`, which may be empty until permission is granted.
+`useDisplayMedia({video,audio})` uses the same explicit `request()` and `stop()`
+pattern. User-media options changing while active request a replacement while
+retaining the old capture until success; display-media option changes never
+open a chooser automatically. `stop()` and unmount stop native tracks. Agent
+disconnect, source clearing, replacement and close never stop borrowed tracks.
+Local handle labels and slots are reserved for the Agent's lifetime; exhausting
+capacity throws `LocalTrackCapacityError` synchronously.
+
+For low-level integration, `createAgent(config)` returns a caller-owned Agent.
+`AgentProvider` and zero-argument `useAgent()` consume such an Agent but do not
+initialize or close it. `setState()`, raw track operations and `useRemoteMedia()`
+remain escape hatches; they are not needed for acquisition or Agent ownership.
+The package build prepares the internal web runtime and WASM asset, without an
+application dependency on `@pulsebeam/web`.
