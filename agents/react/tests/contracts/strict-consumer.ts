@@ -1,37 +1,30 @@
 import {
-  AgentProvider,
   createAgent,
   useAgent,
   useDisplayMedia,
   useMediaDevices,
-  useRemoteMedia,
   useUserMedia,
   Video,
   Audio,
-  type AgentProviderProps,
   type Agent,
   type AgentConfig,
-  type AgentEvent,
-  type AgentFailure,
-  type AgentState,
   type CapturedVideoTrack,
   type LocalTrackCapacityError,
   type MediaCaptureError,
-  type PlaybackFailure,
-  type RemoteMediaAttachment,
-  type RemoteMediaAttachmentOptions,
-  type UseAgentResult,
-  type RemoteTrack,
   type RemoteVideoTrack,
   type RemoteAudioSource,
-  type TopicMode,
-  type VideoSenderConfig,
 } from "@pulsebeam/react";
-import type { ReactElement, ReactNode, RefObject } from "react";
+import type { ReactElement } from "react";
 
-declare const children: ReactNode;
-declare const media: MediaStreamTrack;
-declare const element: RefObject<HTMLMediaElement | null>;
+// @ts-expect-error Provider-based ownership was removed.
+import { AgentProvider } from "@pulsebeam/react";
+// @ts-expect-error Raw attachment hooks were replaced by source components.
+import { useRemoteMedia } from "@pulsebeam/react";
+// @ts-expect-error Provider snapshot adapters were removed.
+import type { UseAgentResult } from "@pulsebeam/react";
+// @ts-expect-error Raw attachment hook results were removed.
+import type { UseRemoteMediaResult } from "@pulsebeam/react";
+
 const config: AgentConfig = {
   endpoint: "https://pulsebeam.example",
   token: "opaque-token",
@@ -44,35 +37,9 @@ const config: AgentConfig = {
   logging: { level: "info" },
 };
 const agent: Agent = createAgent(config);
-const state: AgentState = {
-  connected: true,
-  publications: [
-    { slot: "v0", label: "camera", active: true },
-    { slot: "a0", label: "mic", active: true },
-    { slot: "v1", label: "screen", active: true },
-  ],
-  video: [
-    {
-      slot: 0,
-      trackId: "remote-camera",
-      height: 720,
-      minHeight: 360,
-      minFps: 24,
-      priority: 1,
-      playoutDelay: { mode: "fixed", minMs: 50, maxMs: 100 },
-    },
-  ],
-  audio: { automatic: true },
-  topics: [
-    { name: "chat", mode: "ordered", publish: true, subscribe: true },
-    { name: "reaction", mode: "latest", publish: true, subscribe: true },
-  ],
-};
-
-const props: AgentProviderProps = { agent, children };
-const provider: ReactElement = AgentProvider(props);
-const result: UseAgentResult = useAgent();
 const owned: Agent | null = useAgent(config);
+// @ts-expect-error Each useAgent must have its own construction config.
+useAgent();
 const camera = useUserMedia({ video: { width: 1280 }, audio: false });
 const screen = useDisplayMedia({ video: true, audio: false });
 const devices = useMediaDevices();
@@ -93,14 +60,6 @@ declare const exhausted: LocalTrackCapacityError;
 const failureCode: string = captureFailure.code;
 const capacity: number = exhausted.capacity;
 void [firstCameraId, failureCode, capacity];
-const playbackOptions: RemoteMediaAttachmentOptions = {
-  publicationIds: ["remote-camera"],
-  onPlaybackBlocked: (failure: PlaybackFailure, retry) => {
-    void failure;
-    void retry();
-  },
-};
-const playback = useRemoteMedia(agent, element, playbackOptions);
 const available: readonly RemoteVideoTrack[] = agent.remoteVideoTracks;
 const mainAudio: RemoteAudioSource = agent.remoteAudio;
 const remoteView: ReactElement | null = Video({
@@ -111,36 +70,10 @@ const localView: ReactElement | null = Video({
   source: agent.localVideoTrack("camera"),
 });
 const remoteAudio: ReactElement | null = Audio({ source: mainAudio });
-// @ts-expect-error Audio only accepts a remote audio source
+// @ts-expect-error Audio only accepts a remote audio source.
 Audio({ source: available[0] });
 const messages = agent
   .topic<{ text: string }>("chat", { mode: "reliable" })
   .subscribe();
 void [remoteView, localView, remoteAudio, messages];
-declare const attachment: RemoteMediaAttachment;
-
-const connection = result.connection;
-const participantId = result.participantId;
-const tracks: Readonly<Record<string, RemoteTrack>> = result.tracks;
-result.setState(state);
-const sender: VideoSenderConfig = { contentHint: "motion" };
-void result.replaceLocalTrack("v0", media, sender);
-void result.setLocalMuted("a0", false);
-result.reconnect();
-const mode: TopicMode = "ordered";
-result.sendTopic("chat", mode, new Uint8Array());
-const unsubscribe = result.subscribeEvents((event: AgentEvent) => {
-  if (event.type === "failure") {
-    const failure: AgentFailure = event;
-    void failure;
-  }
-});
-unsubscribe();
-void playback.retryPlayback();
-void attachment.retryPlayback();
 agent.close();
-
-void provider;
-void connection;
-void participantId;
-void tracks;
