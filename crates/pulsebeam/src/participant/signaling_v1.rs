@@ -219,10 +219,23 @@ impl IntentState {
             .senders
             .plan(intent.send.as_ref(), negotiated_senders)
             .map_err(IntentError::SendBinding)?;
+        let mut receive = intent.receive.clone();
+        if let Some(receive) = &mut receive {
+            if let Some(video) = &mut receive.video {
+                video
+                    .tracks
+                    .retain(|track| !track.track_id.is_empty() && track.track_id.len() <= 128);
+            }
+            if let Some(audio) = &mut receive.audio {
+                audio
+                    .tracks
+                    .retain(|track| !track.track_id.is_empty() && track.track_id.len() <= 128);
+            }
+        }
         Ok(IntentDecision::Accept(Box::new(IntentPlan {
             revision: intent.revision,
             send,
-            receive: intent.receive.clone(),
+            receive,
         })))
     }
 
@@ -972,6 +985,51 @@ mod tests {
             panic!("failed candidate must not reserve sender labels");
         };
         assert_eq!(state.commit(*plan).0.len(), 1);
+    }
+
+    #[test]
+    fn receive_ids_are_bounded_before_retention() {
+        use pulsebeam_proto::signaling_v1::{
+            AudioIntent, AudioTrackIntent, Intent, ReceiveIntent, VideoIntent, VideoTrackIntent,
+        };
+        let ids = [String::new(), "x".repeat(129), "é".repeat(64)];
+        let intent = Intent {
+            revision: 1,
+            receive: Some(ReceiveIntent {
+                video: Some(VideoIntent {
+                    tracks: ids
+                        .iter()
+                        .map(|id| VideoTrackIntent {
+                            track_id: id.clone(),
+                            ..Default::default()
+                        })
+                        .collect(),
+                }),
+                audio: Some(AudioIntent {
+                    tracks: ids
+                        .iter()
+                        .map(|id| AudioTrackIntent {
+                            track_id: id.clone(),
+                            ..Default::default()
+                        })
+                        .collect(),
+                    ..Default::default()
+                }),
+            }),
+            ..Default::default()
+        };
+        let mut state = IntentState::default();
+        let IntentDecision::Accept(plan) = state.plan(&intent, &media(), 1).unwrap() else {
+            panic!("fresh intent must be accepted");
+        };
+        let (_, receive) = state.commit(*plan);
+        let receive = receive.unwrap();
+        let video = receive.video.unwrap().tracks;
+        let audio = receive.audio.unwrap().tracks;
+        assert_eq!(video.len(), 1);
+        assert_eq!(audio.len(), 1);
+        assert_eq!(video[0].track_id, "é".repeat(64));
+        assert_eq!(audio[0].track_id, "é".repeat(64));
     }
 
     #[test]
