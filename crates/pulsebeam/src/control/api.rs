@@ -718,7 +718,7 @@ async fn delete_sdp_profile(
             TrySendError::Full(_) => ApiError::RateLimited,
             TrySendError::Closed(_) => ApiError::ServiceUnavailable,
         })?;
-    Ok(StatusCode::OK)
+    Ok(StatusCode::NO_CONTENT)
 }
 
 macro_rules! delete_handler {
@@ -728,7 +728,7 @@ macro_rules! delete_handler {
             path = $path,
             params(("connection_id" = String, Path, description = "Canonical connection ID")),
             responses(
-                (status = 200, description = "Connection deleted or already absent"),
+                (status = 204, description = "Connection deleted or already absent"),
                 (status = 401, description = "Invalid bearer authorization", body = Problem, content_type = "application/problem+json"),
                 (status = 404, description = "Malformed connection ID", body = Problem, content_type = "application/problem+json"),
                 (status = 429, description = "Controller is busy", body = Problem, content_type = "application/problem+json"),
@@ -1209,7 +1209,7 @@ mod tests {
                 .oneshot(request)
                 .await
                 .unwrap();
-            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.status(), StatusCode::NO_CONTENT);
             let controller::ControllerCommand::DeleteParticipant(message) =
                 commands.recv().await.unwrap()
             else {
