@@ -28,6 +28,12 @@
     topology,
   });
 
+  const secondReceiver = window.pulsebeam.createAgent({
+    endpoint,
+    token: "__SECOND_RECEIVER_TOKEN__",
+    topology,
+  });
+
   const waitFor = (agent, predicate, label) =>
     new Promise((resolve, reject) => {
       const timeout = setTimeout(() => {
@@ -298,6 +304,118 @@
   oldPeer?.removeEventListener("track", countStaleOnTrack);
   RTCPeerConnection.prototype.addTransceiver = originalAddTransceiver;
 
+  secondReceiver.setState({ connected: true });
+  const secondConnected = await waitFor(
+    secondReceiver,
+    (snapshot) =>
+      snapshot.connection === "connected" &&
+      snapshot.catalog.publications.some(
+        (entry) => entry.id === publication.id,
+      ),
+    "independent receiver discovery",
+  );
+  const mount = (agent) => {
+    const handle = agent.remoteVideoTracks.find(
+      (entry) => entry.publicationId === publication.id,
+    );
+    if (!handle) throw new Error("missing remote video handle");
+    const video = document.createElement("video");
+    video.muted = true;
+    video.playsInline = true;
+    video.style.cssText = "width:160px;height:120px;display:inline-block";
+    document.body.append(video);
+    return {
+      handle,
+      video,
+      attachment: window.pulsebeam.attachRemoteVideo(handle, video),
+    };
+  };
+  const rendered = (video) =>
+    new Promise((resolve, reject) => {
+      let count = 0;
+      let callback;
+      const timeout = setTimeout(() => {
+        video.cancelVideoFrameCallback(callback);
+        reject(new Error("timed out waiting for rendered remote frames"));
+      }, 20000);
+      const observe = () => {
+        count += 1;
+        if (count >= 2) {
+          clearTimeout(timeout);
+          resolve();
+        } else {
+          callback = video.requestVideoFrameCallback(observe);
+        }
+      };
+      callback = video.requestVideoFrameCallback(observe);
+    });
+  const firstView = mount(receiver);
+  const secondView = mount(secondReceiver);
+  await Promise.all([rendered(firstView.video), rendered(secondView.video)]);
+  const independentRendering =
+    receiver.getSnapshot().connection === "connected" &&
+    secondReceiver.getSnapshot().connection === "connected" &&
+    receiverConnected.participantId !== secondConnected.participantId &&
+    firstView.video.srcObject.getVideoTracks()[0] ===
+      receiver.getSnapshot().tracks[publication.id].media &&
+    secondView.video.srcObject.getVideoTracks()[0] ===
+      secondReceiver.getSnapshot().tracks[publication.id].media &&
+    firstView.video.srcObject.getVideoTracks()[0] !==
+      secondView.video.srcObject.getVideoTracks()[0];
+  firstView.attachment.close();
+  await rendered(secondView.video);
+  const independentDetach =
+    firstView.video.srcObject === null &&
+    secondReceiver.getSnapshot().connection === "connected";
+  firstView.attachment = window.pulsebeam.attachRemoteVideo(
+    firstView.handle,
+    firstView.video,
+  );
+  await rendered(firstView.video);
+
+  sender.setState({ connected: true, publications: [] });
+  const removed = (snapshot) =>
+    !snapshot.catalog.publications.some(
+      (entry) => entry.id === publication.id,
+    ) &&
+    !snapshot.mapping.video.some(
+      (entry) => entry.publicationId === publication.id,
+    ) &&
+    snapshot.tracks[publication.id] === undefined;
+  await Promise.all([
+    waitFor(receiver, removed, "first mounted publication removal"),
+    waitFor(secondReceiver, removed, "second mounted publication removal"),
+  ]);
+  const revisions = [
+    receiver.getSnapshot().desiredRevision,
+    secondReceiver.getSnapshot().desiredRevision,
+  ];
+  firstView.handle.setReceiveOptions({ minHeight: 720 });
+  secondView.handle.setReceiveOptions({ priority: 100 });
+  const stale = window.pulsebeam.attachRemoteVideo(
+    firstView.handle,
+    firstView.video,
+  );
+  const mountedRemoval =
+    !firstView.handle.active &&
+    !secondView.handle.active &&
+    (firstView.video.srcObject?.getTracks().length ?? 0) === 0 &&
+    (secondView.video.srcObject?.getTracks().length ?? 0) === 0 &&
+    !receiver.remoteVideoTracks.some(
+      (entry) => entry.publicationId === publication.id,
+    ) &&
+    !secondReceiver.remoteVideoTracks.some(
+      (entry) => entry.publicationId === publication.id,
+    ) &&
+    receiver.getSnapshot().desiredRevision === revisions[0] &&
+    secondReceiver.getSnapshot().desiredRevision === revisions[1];
+  stale.close();
+  firstView.attachment.close();
+  secondView.attachment.close();
+  firstView.video.remove();
+  secondView.video.remove();
+  secondReceiver.close();
+
   const runtimeEvents = [];
   const removeRuntimeEvents = sender.subscribeEvents((event) =>
     runtimeEvents.push(event),
@@ -347,6 +465,8 @@
   clearInterval(painting);
   localTrack.stop();
   return {
+    independentRendering: independentRendering && independentDetach,
+    mountedRemoval,
     connected:
       senderConnected.participantId !== null &&
       receiverConnected.participantId !== null,
