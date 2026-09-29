@@ -48,9 +48,11 @@ struct Public {
     closed: String,
     post_close: bool,
 }
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Live {
+    independent_rendering: bool,
+    mounted_removal: bool,
     connected: bool,
     discovered: bool,
     delivered: bool,
@@ -346,9 +348,15 @@ async fn public_agent_connects_and_delivers_remote_media() -> TestResult<()> {
         &ParticipantExternalId::new("web-receiver")?,
         u64::MAX,
     )?;
+    let second_receiver = mint_development_token(
+        &room,
+        &ParticipantExternalId::new("web-second-receiver")?,
+        u64::MAX,
+    )?;
     let live = LIVE
         .replace("__SENDER_TOKEN__", &sender)
-        .replace("__RECEIVER_TOKEN__", &receiver);
+        .replace("__RECEIVER_TOKEN__", &receiver)
+        .replace("__SECOND_RECEIVER_TOKEN__", &second_receiver);
     run_browser_test(WebDriver::managed(capabilities()?), |driver| async move {
         let bidi = driver.bidi().await?;
         let context = bidi.browsing_context().top_level().await?;
@@ -356,7 +364,9 @@ async fn public_agent_connects_and_delivers_remote_media() -> TestResult<()> {
         let _: () = evaluate_json(&bidi, &context, LOAD).await?;
         let r: Live = evaluate_json(&bidi, &context, &live).await?;
         assert!(
-            r.connected
+            r.independent_rendering
+                && r.mounted_removal
+                && r.connected
                 && r.discovered
                 && r.delivered
                 && r.reconnected
@@ -364,7 +374,8 @@ async fn public_agent_connects_and_delivers_remote_media() -> TestResult<()> {
                 && r.topic_metadata
                 && r.runtime_failure_event
                 && r.close_during_local_operation
-                && r.caller_owns_track
+                && r.caller_owns_track,
+            "{r:?}"
         );
         Ok::<_, Box<dyn Error + Send + Sync>>(())
     })
