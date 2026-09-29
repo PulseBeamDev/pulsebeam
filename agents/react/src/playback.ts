@@ -6,6 +6,7 @@ import {
   useSyncExternalStore,
 } from "react";
 import type * as React from "react";
+import { useCommittedRef } from "./committed-ref.js";
 import {
   attachRemoteAudio,
   attachRemoteVideo,
@@ -69,8 +70,7 @@ export function Video({
   ...props
 }: VideoProps): React.ReactElement | null {
   const element = useRef<HTMLVideoElement>(null);
-  const callback = useRef(onPlaybackError);
-  callback.current = onPlaybackError;
+  const callback = useCommittedRef(onPlaybackError);
   const remote = isRemote(source) ? source : null;
   const local = source && "source" in source ? source : null;
   const captured =
@@ -141,8 +141,7 @@ export function Audio({
   ...props
 }: AudioProps): React.ReactElement | null {
   const element = useRef<HTMLAudioElement>(null);
-  const callback = useRef(onPlaybackError);
-  callback.current = onPlaybackError;
+  const callback = useCommittedRef(onPlaybackError);
   useEffect(() => {
     const current = element.current;
     if (!current || !source) return;
