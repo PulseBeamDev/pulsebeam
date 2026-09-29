@@ -136,7 +136,6 @@ function RoomSession({
   );
   useEffect(() => {
     owner.connect();
-    return () => owner.disconnect();
   }, [owner]);
   useEffect(() => {
     for (const track of remoteTracks)
