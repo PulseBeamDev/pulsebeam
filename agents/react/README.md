@@ -13,7 +13,11 @@ unmount. It returns `null` until the Agent is ready to use. Agents start
 stop retrying. Both methods change desired connection state synchronously;
 observe `agent.getSnapshot().connection` for progress. Changing the token
 renews authorization on the same Agent; changing endpoint, topology, or logging
-replaces the Agent. Use a distinct participant credential for each simultaneous
+replaces the Agent. `agent.getSnapshot().participantExternalId` and
+`roomExternalId` are the authoritative application identities supplied by
+admission. They are null before admission, retained while reconnecting to the
+same session, and cleared on disconnect. `participantId` remains a separate
+opaque canonical identifier for SDK internals. Use a distinct participant credential for each simultaneous
 Agent. The hook subscribes its component to Agent snapshot changes.
 
 Capture is owned by its acquisition hook, not by any Agent. Request it from a

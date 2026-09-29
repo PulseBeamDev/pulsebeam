@@ -98,8 +98,15 @@ impl ParticipantRegistry {
         handle
     }
 
-    pub fn remove(&mut self, address: NodeTransportAddress) -> Option<Box<ParticipantMeta>> {
-        let handle = self.resolve_transport(address)?;
+    pub fn remove(
+        &mut self,
+        participant: ParticipantId,
+        address: NodeTransportAddress,
+    ) -> Option<Box<ParticipantMeta>> {
+        let handle = self.resolve(&participant)?;
+        if self.participants.get(handle)?.ingress != address {
+            return None;
+        }
         self.remove_handle(handle)
     }
 

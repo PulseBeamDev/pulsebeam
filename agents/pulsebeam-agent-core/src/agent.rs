@@ -81,11 +81,11 @@ struct Session {
     generation: Generation,
     resource_uri: String,
     participant_id: String,
-    _room_external_id: String,
+    room_external_id: String,
     _room_id: RoomId,
     participant_external_id: String,
     _opaque_participant_id: ParticipantId,
-    _connection_id: ConnectionId,
+    connection_id: ConnectionId,
     coordinates: BTreeMap<MediaSlot, SlotBinding>,
     observed: CatalogState,
     intent_revision: u64,
@@ -182,6 +182,7 @@ pub struct Agent {
     retry_attempts: u8,
     pending_signal: Option<PendingSignal>,
     signal_retry: Option<TimerId>,
+    topic_probe: Option<TimerId>,
     intent_dirty: bool,
     closing: Option<Closing>,
     orphaned_creates: BTreeSet<OperationId>,
@@ -207,6 +208,7 @@ impl Agent {
             retry_attempts: 0,
             pending_signal: None,
             signal_retry: None,
+            topic_probe: None,
             intent_dirty: false,
             closing: None,
             orphaned_creates: BTreeSet::new(),
@@ -396,6 +398,7 @@ impl Agent {
                 &mut self.snapshot,
                 &mut self.notifications,
             );
+            self.schedule_topic_probe();
         }
         if intent_changed {
             self.intent_dirty = true;
@@ -707,6 +710,16 @@ impl Agent {
                 } else if self.signal_retry == Some(timer) {
                     self.signal_retry = None;
                     self.send_intent_if_ready();
+                } else if self.topic_probe == Some(timer) {
+                    self.topic_probe = None;
+                    if self.active.is_some() && self.desired.connected {
+                        self.topics.probe_remote_publishers(
+                            self.snapshot.participants.keys().map(String::as_str),
+                            &mut self.ids,
+                            &mut self.effects,
+                        );
+                    }
+                    self.schedule_topic_probe();
                 }
             }
         }
@@ -885,8 +898,10 @@ impl Agent {
                         {
                             self.retry_attempts = 0;
                         }
-                        self.topics.retain_remote_publishers(
+                        self.topics.probe_remote_publishers(
                             self.snapshot.participants.keys().map(String::as_str),
+                            &mut self.ids,
+                            &mut self.effects,
                         );
                         agent_log!(
                             self,
@@ -1127,11 +1142,11 @@ impl Agent {
             generation: attempt.generation,
             resource_uri: candidate.resource_uri,
             participant_id: candidate.participant_id,
-            _room_external_id: candidate.room_external_id,
+            room_external_id: candidate.room_external_id,
             _room_id: candidate.room_id,
             participant_external_id: candidate.participant_external_id,
             _opaque_participant_id: candidate.opaque_participant_id,
-            _connection_id: candidate.connection_id,
+            connection_id: candidate.connection_id,
             coordinates,
             observed: CatalogState::default(),
             intent_revision: 0,
@@ -1159,14 +1174,24 @@ impl Agent {
         if let Some(active) = &self.active {
             self.snapshot.generation = Some(active.generation);
             self.snapshot.participant_id = Some(active.participant_id.clone());
+            self.snapshot.participant_external_id = Some(active.participant_external_id.clone());
+            self.snapshot.room_external_id = Some(active.room_external_id.clone());
             self.snapshot.authorization_expires_at = None;
             self.topics.bind(
                 active.generation,
                 active.participant_id.clone(),
+                active.connection_id.as_str(),
                 &attempt.topic_registrations,
                 topic_bindings,
+                &mut self.ids,
+                &mut self.effects,
                 &mut self.snapshot,
                 &mut self.notifications,
+            );
+            self.topics.probe_remote_publishers(
+                self.snapshot.participants.keys().map(String::as_str),
+                &mut self.ids,
+                &mut self.effects,
             );
         }
         self.snapshot.terminal_failure = None;
@@ -1179,6 +1204,7 @@ impl Agent {
             })?;
         }
         self.send_intent_if_ready();
+        self.schedule_topic_probe();
         if attempt.topic_registrations != self.desired.topics {
             self.start_attempt(AttemptMode::Replace);
         }
@@ -1384,6 +1410,22 @@ impl Agent {
         }));
     }
 
+    fn schedule_topic_probe(&mut self) {
+        if self.topic_probe.is_some()
+            || !self.desired.connected
+            || !self.topics.has_ordered_subscriptions()
+            || self.active.is_none()
+        {
+            return;
+        }
+        let timer = self.ids.timer();
+        self.topic_probe = Some(timer);
+        self.effects.push_back(Effect::Timer(TimerEffect::Schedule {
+            timer,
+            after: Duration::from_secs(2),
+        }));
+    }
+
     fn cancel_signal_retry(&mut self) {
         if let Some(timer) = self.signal_retry.take() {
             self.effects
@@ -1408,6 +1450,10 @@ impl Agent {
                 .push_back(Effect::Timer(TimerEffect::Cancel { timer: retry.timer }));
         }
         self.cancel_signal_retry();
+        if let Some(timer) = self.topic_probe.take() {
+            self.effects
+                .push_back(Effect::Timer(TimerEffect::Cancel { timer }));
+        }
         self.pending_signal = None;
         if let Some(active) = self.active.as_ref() {
             self.topics.unbind_generation(
@@ -1416,6 +1462,10 @@ impl Agent {
                 &mut self.snapshot,
                 &mut self.notifications,
             );
+        }
+        if !self.desired.connected {
+            self.topics
+                .end_session(&mut self.snapshot, &mut self.notifications);
         }
         let mut closing = Closing::default();
         if let Some(mut attempt) = self.attempt.take() {
@@ -1498,6 +1548,8 @@ impl Agent {
         self.pending_signal = None;
         self.snapshot.generation = None;
         self.snapshot.participant_id = None;
+        self.snapshot.participant_external_id = None;
+        self.snapshot.room_external_id = None;
         self.snapshot.authorization_expires_at = None;
         self.clear_observed_state();
         self.snapshot.terminal_failure = None;

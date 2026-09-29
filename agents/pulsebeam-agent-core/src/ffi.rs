@@ -268,6 +268,8 @@ pub struct Snapshot {
     pub connection: ConnectionState,
     pub generation: Option<u64>,
     pub participant_id: Option<String>,
+    pub participant_external_id: Option<String>,
+    pub room_external_id: Option<String>,
     pub authorization_expires_at: Option<i64>,
     pub catalog: CatalogSnapshot,
     pub mapping: MappingSnapshot,
@@ -331,6 +333,13 @@ pub enum TopicNotification {
         publisher_id: String,
         stream_id: u64,
         next_sequence: u64,
+    },
+    RecoveryGap {
+        subscriber: TopicSubscriber,
+        publisher_id: String,
+        stream_id: u64,
+        expected_sequence: u64,
+        available_sequence: u64,
     },
 }
 
@@ -850,6 +859,8 @@ impl From<&model::Snapshot> for Snapshot {
             connection: value.connection.clone().into(),
             generation: value.generation.map(model::Generation::get),
             participant_id: value.participant_id.clone(),
+            participant_external_id: value.participant_external_id.clone(),
+            room_external_id: value.room_external_id.clone(),
             authorization_expires_at: value.authorization_expires_at,
             catalog: CatalogSnapshot {
                 revision: value.catalog_revision,
@@ -984,6 +995,19 @@ impl From<model::TopicNotification> for TopicNotification {
                 publisher_id,
                 stream_id,
                 next_sequence,
+            },
+            model::TopicNotification::RecoveryGap {
+                subscriber,
+                publisher_id,
+                stream_id,
+                expected_sequence,
+                available_sequence,
+            } => Self::RecoveryGap {
+                subscriber: subscriber.into(),
+                publisher_id,
+                stream_id,
+                expected_sequence,
+                available_sequence,
             },
         }
     }
@@ -1315,6 +1339,8 @@ mod tests {
             },
             generation: Some(3),
             participant_id: Some("participant".to_string()),
+            participant_external_id: Some("user".to_string()),
+            room_external_id: Some("room".to_string()),
             authorization_expires_at: Some(1_720_000_000),
             catalog: CatalogSnapshot {
                 revision: 2,

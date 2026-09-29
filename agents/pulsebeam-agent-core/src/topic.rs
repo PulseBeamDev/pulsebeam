@@ -7,7 +7,7 @@ use alloc::{
 
 use pulsebeam_proto::{
     prelude::Message,
-    reliable::{RelControl, RelDelivery, RelMsg, RelNack, rel_control},
+    reliable::{RelControl, RelDelivery, RelMsg, RelNack, RelProbe, rel_control},
 };
 
 use crate::{
@@ -122,6 +122,13 @@ pub enum TopicNotification {
         stream_id: u64,
         next_sequence: u64,
     },
+    RecoveryGap {
+        subscriber: TopicSubscriber,
+        publisher_id: String,
+        stream_id: u64,
+        expected_sequence: u64,
+        available_sequence: u64,
+    },
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -205,7 +212,6 @@ struct PendingSend {
     operation: OperationId,
     generation: Generation,
     channel: ChannelId,
-    stream_id: Option<u64>,
     sequence: Option<u64>,
     payload: Vec<u8>,
 }
@@ -213,10 +219,14 @@ struct PendingSend {
 struct PublisherState {
     stream_id: Option<u64>,
     next_sequence: u64,
-    bound_once: bool,
     history: VecDeque<RelMsg>,
-    queue: VecDeque<Vec<u8>>,
+    queue: VecDeque<QueuedSend>,
     pending: Option<PendingSend>,
+}
+
+struct QueuedSend {
+    sequence: Option<u64>,
+    payload: Vec<u8>,
 }
 
 struct SubscriberState {
@@ -224,10 +234,11 @@ struct SubscriberState {
 }
 
 struct PublisherDelivery {
+    stream_epoch: String,
     stream_id: u64,
     next_sequence: u64,
     pending: BTreeMap<u64, RelMsg>,
-    retired_streams: VecDeque<u64>,
+    retired_streams: VecDeque<(String, u64)>,
 }
 
 struct AuxiliarySend {
@@ -244,6 +255,7 @@ pub(crate) struct Topics {
     active: Option<ActiveTopics>,
     auxiliary_sends: BTreeMap<OperationId, AuxiliarySend>,
     next_stream_id: u64,
+    stream_epoch: Option<String>,
     accepted_sends: u64,
     dropped_sends: u64,
     delivered_messages: u64,
@@ -330,15 +342,95 @@ impl Topics {
         }
     }
 
-    pub(crate) fn retain_remote_publishers<'a>(
+    pub(crate) fn end_session(
+        &mut self,
+        snapshot: &mut Snapshot,
+        notifications: &mut VecDeque<Notification>,
+    ) {
+        let publishers = self.publishers.keys().cloned().collect::<Vec<_>>();
+        for publisher in publishers {
+            let stream_id = (publisher.mode == TopicMode::Ordered)
+                .then(|| self.stream_id())
+                .flatten();
+            let Some(state) = self.publishers.get_mut(&publisher) else {
+                continue;
+            };
+            let dropped = state
+                .queue
+                .len()
+                .saturating_add(usize::from(state.pending.is_some()));
+            state.queue.clear();
+            state.pending = None;
+            state.history.clear();
+            state.stream_id = stream_id;
+            state.next_sequence = 0;
+            for _ in 0..dropped {
+                self.record_drop(&publisher, TopicDropReason::ChannelClosed, notifications);
+            }
+        }
+        for subscriber in self.subscribers.values_mut() {
+            subscriber.publishers.clear();
+        }
+        self.refresh_snapshot(snapshot);
+    }
+
+    pub(crate) fn has_ordered_subscriptions(&self) -> bool {
+        self.subscribers
+            .keys()
+            .any(|subscriber| subscriber.mode == TopicMode::Ordered)
+    }
+
+    pub(crate) fn probe_remote_publishers<'a>(
         &mut self,
         participants: impl IntoIterator<Item = &'a str>,
+        ids: &mut IdGenerator,
+        effects: &mut VecDeque<Effect>,
     ) {
-        let participants = participants.into_iter().collect::<BTreeSet<_>>();
-        for subscriber in self.subscribers.values_mut() {
-            subscriber
-                .publishers
-                .retain(|publisher, _| participants.contains(publisher.as_str()));
+        let Some(active) = self.active.as_ref() else {
+            return;
+        };
+        let generation = active.generation;
+        let local = active.participant_id.clone();
+        let subscribers = active
+            .channels
+            .iter()
+            .filter_map(|(channel, registration)| match registration {
+                ChannelRegistration::Subscriber(subscriber)
+                    if subscriber.mode == TopicMode::Ordered =>
+                {
+                    Some((*channel, subscriber.clone()))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        for publisher_id in participants {
+            if publisher_id == local {
+                continue;
+            }
+            for (channel, subscriber) in &subscribers {
+                let state = self
+                    .subscribers
+                    .get(subscriber)
+                    .and_then(|state| state.publishers.get(publisher_id));
+                let control = RelControl {
+                    msg: Some(rel_control::Msg::Probe(RelProbe {
+                        publisher_id: publisher_id.to_string(),
+                        stream_epoch: state
+                            .map_or_else(String::new, |state| state.stream_epoch.clone()),
+                        stream_id: state.map_or(0, |state| state.stream_id),
+                        from_seq: state.map_or(0, |state| state.next_sequence),
+                        live_boundary: state.is_none(),
+                    })),
+                };
+                self.emit_auxiliary(
+                    generation,
+                    *channel,
+                    TopicChannel::Subscriber(subscriber.clone()),
+                    control.encode_to_vec(),
+                    ids,
+                    effects,
+                );
+            }
         }
     }
 
@@ -383,7 +475,6 @@ impl Topics {
                     PublisherState {
                         stream_id,
                         next_sequence: 0,
-                        bound_once: false,
                         history: VecDeque::with_capacity(TOPIC_HISTORY_CAPACITY),
                         queue: VecDeque::with_capacity(TOPIC_SEND_QUEUE_CAPACITY),
                         pending: None,
@@ -441,17 +532,34 @@ impl Topics {
             .collect()
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "binding a materialized session updates the owned agent effects, snapshot, and notifications"
+    )]
     pub(crate) fn bind(
         &mut self,
         generation: Generation,
         participant_id: String,
+        connection_id: &str,
         registrations: &TopicRegistrations,
         bindings: Vec<DataChannelBinding>,
+        ids: &mut IdGenerator,
+        effects: &mut VecDeque<Effect>,
         snapshot: &mut Snapshot,
         notifications: &mut VecDeque<Notification>,
     ) {
         if self.active.is_some() {
             self.unbind(TopicDropReason::TransportReplaced, snapshot, notifications);
+        }
+        // The first admitted connection namespaces this Agent's streams even
+        // when a fresh Agent reuses the same participant and stream counter.
+        let epoch = self
+            .stream_epoch
+            .get_or_insert_with(|| connection_id.to_string());
+        for state in self.publishers.values_mut() {
+            for message in &mut state.history {
+                message.stream_epoch.clone_from(epoch);
+            }
         }
 
         let by_label: BTreeMap<_, _> = bindings
@@ -464,18 +572,6 @@ impl Topics {
                 && self.publishers.contains_key(publisher)
             {
                 channels.insert(channel, ChannelRegistration::Publisher(publisher.clone()));
-                let rotate = self
-                    .publishers
-                    .get(publisher)
-                    .is_some_and(|state| state.bound_once && publisher.mode == TopicMode::Ordered);
-                let stream_id = if rotate { self.stream_id() } else { None };
-                if let Some(state) = self.publishers.get_mut(publisher) {
-                    if rotate {
-                        state.stream_id = stream_id;
-                        state.next_sequence = 0;
-                    }
-                    state.bound_once = true;
-                }
             }
         }
         for subscriber in &registrations.subscribers {
@@ -483,9 +579,6 @@ impl Topics {
                 && self.subscribers.contains_key(subscriber)
             {
                 channels.insert(channel, ChannelRegistration::Subscriber(subscriber.clone()));
-                if let Some(state) = self.subscribers.get_mut(subscriber) {
-                    state.publishers.clear();
-                }
             }
         }
         self.active = Some(ActiveTopics {
@@ -493,6 +586,9 @@ impl Topics {
             participant_id,
             channels,
         });
+        for publisher in &registrations.publishers {
+            self.dispatch_publisher(publisher, ids, effects);
+        }
         topic_log!(
             self,
             Info,
@@ -559,17 +655,14 @@ impl Topics {
             self.refresh_snapshot(snapshot);
             return Err(TopicError::PublisherNotRegistered(send.publisher.topic));
         };
-        let available = self.active.as_ref().is_some_and(|active| {
-            active.channels.values().any(|registration| {
-                matches!(registration, ChannelRegistration::Publisher(publisher) if publisher == &send.publisher)
+        if send.publisher.mode == TopicMode::Latest
+            && !self.active.as_ref().is_some_and(|active| {
+                active.channels.values().any(|registration| {
+                    matches!(registration, ChannelRegistration::Publisher(publisher) if publisher == &send.publisher)
+                })
             })
-        });
-        if !available {
-            self.record_drop(
-                &send.publisher,
-                TopicDropReason::ChannelUnavailable,
-                notifications,
-            );
+        {
+            self.record_drop(&send.publisher, TopicDropReason::ChannelUnavailable, notifications);
             self.refresh_snapshot(snapshot);
             return Err(TopicError::PublisherUnavailable(send.publisher.topic));
         }
@@ -584,16 +677,46 @@ impl Topics {
             self.refresh_snapshot(snapshot);
             return Err(TopicError::SequenceExhausted(send.publisher.topic));
         }
-        if state.queue.len() >= TOPIC_SEND_QUEUE_CAPACITY {
+        if state.queue.len().saturating_add(usize::from(
+            state.pending.is_some() && send.publisher.mode == TopicMode::Ordered,
+        )) >= TOPIC_SEND_QUEUE_CAPACITY
+        {
             self.record_drop(&send.publisher, TopicDropReason::QueueFull, notifications);
             self.refresh_snapshot(snapshot);
             return Err(TopicError::SendQueueFull(send.publisher.topic));
         }
         let superseded =
             send.publisher.mode == TopicMode::Latest && state.queue.pop_back().is_some();
-        state.queue.push_back(send.payload);
+        let sequence = (send.publisher.mode == TopicMode::Ordered).then_some(state.next_sequence);
+        if let (Some(stream_id), Some(sequence)) = (state.stream_id, sequence) {
+            if state.history.len() == TOPIC_HISTORY_CAPACITY {
+                let _ = state.history.pop_front();
+            }
+            state.history.push_back(RelMsg {
+                stream_epoch: self.stream_epoch.clone().unwrap_or_default(),
+                stream_id,
+                seq: sequence,
+                payload: send.payload.clone(),
+                resync_required: false,
+            });
+            state.next_sequence = state.next_sequence.saturating_add(1);
+        }
+        state.queue.push_back(QueuedSend {
+            sequence,
+            payload: send.payload,
+        });
+        let stream_id = state.stream_id;
         if superseded {
             self.record_drop(&send.publisher, TopicDropReason::Superseded, notifications);
+        }
+        if send.publisher.mode == TopicMode::Ordered {
+            self.accepted_sends = self.accepted_sends.saturating_add(1);
+            notifications.push_back(Notification::Topic(TopicNotification::SendAdmitted {
+                publisher: send.publisher.clone(),
+                operation: ids.operation(),
+                stream_id,
+                sequence,
+            }));
         }
         self.dispatch_publisher(&send.publisher, ids, effects);
         self.refresh_snapshot(snapshot);
@@ -612,7 +735,7 @@ impl Topics {
         ids: &mut IdGenerator,
         effects: &mut VecDeque<Effect>,
         snapshot: &mut Snapshot,
-        notifications: &mut VecDeque<Notification>,
+        _notifications: &mut VecDeque<Notification>,
     ) -> bool {
         if self
             .auxiliary_sends
@@ -638,42 +761,26 @@ impl Topics {
             debug_assert!(false, "pending topic send must have a publisher");
             return true;
         };
-        let Some(pending) = state.pending.take() else {
+        let Some(_pending) = state.pending.take() else {
             debug_assert!(false, "matched topic send must be pending");
             return true;
         };
-        if let (Some(stream_id), Some(sequence)) = (pending.stream_id, pending.sequence) {
-            debug_assert_eq!(state.stream_id, Some(stream_id));
-            debug_assert_eq!(state.next_sequence, sequence);
-            if state.history.len() == TOPIC_HISTORY_CAPACITY {
-                let _ = state.history.pop_front();
-            }
-            state.history.push_back(RelMsg {
-                stream_id,
-                seq: sequence,
-                payload: pending.payload,
-                resync_required: false,
-            });
-            state.next_sequence = state.next_sequence.saturating_add(1);
+        if publisher.mode == TopicMode::Latest {
+            self.accepted_sends = self.accepted_sends.saturating_add(1);
+            _notifications.push_back(Notification::Topic(TopicNotification::SendAdmitted {
+                publisher: publisher.clone(),
+                operation,
+                stream_id: None,
+                sequence: None,
+            }));
         }
-        self.accepted_sends = self.accepted_sends.saturating_add(1);
         topic_log!(
             self,
             Debug,
-            "topic send admitted mode={:?} topic={} generation={} operation={} stream={:?} sequence={:?}",
+            "topic send completed mode={:?} topic={}",
             publisher.mode,
-            publisher.topic,
-            generation.get(),
-            operation.get(),
-            pending.stream_id,
-            pending.sequence,
+            publisher.topic
         );
-        notifications.push_back(Notification::Topic(TopicNotification::SendAdmitted {
-            publisher: publisher.clone(),
-            operation,
-            stream_id: pending.stream_id,
-            sequence: pending.sequence,
-        }));
         self.dispatch_publisher(&publisher, ids, effects);
         self.refresh_snapshot(snapshot);
         true
@@ -689,8 +796,8 @@ impl Topics {
         generation: Generation,
         channel: ChannelId,
         message: String,
-        ids: &mut IdGenerator,
-        effects: &mut VecDeque<Effect>,
+        _ids: &mut IdGenerator,
+        _effects: &mut VecDeque<Effect>,
         snapshot: &mut Snapshot,
         notifications: &mut VecDeque<Notification>,
     ) -> bool {
@@ -717,16 +824,26 @@ impl Topics {
         let Some(publisher) = publisher else {
             return false;
         };
-        if let Some(state) = self.publishers.get_mut(&publisher) {
-            let _ = state.pending.take();
+        if let Some(state) = self.publishers.get_mut(&publisher)
+            && let Some(pending) = state.pending.take()
+        {
+            if publisher.mode == TopicMode::Ordered {
+                state.queue.push_front(QueuedSend {
+                    sequence: pending.sequence,
+                    payload: pending.payload,
+                });
+            } else {
+                self.record_drop(&publisher, TopicDropReason::HostRejected, notifications);
+            }
         }
-        self.record_drop(&publisher, TopicDropReason::HostRejected, notifications);
         self.record_channel_failure(
             TopicChannel::Publisher(publisher.clone()),
             message,
             notifications,
         );
-        self.dispatch_publisher(&publisher, ids, effects);
+        if publisher.mode == TopicMode::Latest {
+            self.dispatch_publisher(&publisher, _ids, _effects);
+        }
         self.refresh_snapshot(snapshot);
         true
     }
@@ -822,12 +939,16 @@ impl Topics {
         match registration {
             ChannelRegistration::Publisher(publisher) => {
                 if let Some(mut state) = self.publishers.remove(&publisher) {
-                    self.drop_publisher_sends(
-                        &publisher,
-                        &mut state,
-                        TopicDropReason::ChannelClosed,
-                        notifications,
-                    );
+                    if publisher.mode == TopicMode::Ordered {
+                        Self::requeue_pending(&mut state);
+                    } else {
+                        self.drop_publisher_sends(
+                            &publisher,
+                            &mut state,
+                            TopicDropReason::ChannelClosed,
+                            notifications,
+                        );
+                    }
                     self.publishers.insert(publisher.clone(), state);
                 }
                 self.record_channel_failure(
@@ -837,9 +958,6 @@ impl Topics {
                 );
             }
             ChannelRegistration::Subscriber(subscriber) => {
-                if let Some(state) = self.subscribers.get_mut(&subscriber) {
-                    state.publishers.clear();
-                }
                 self.record_channel_failure(
                     TopicChannel::Subscriber(subscriber),
                     "data channel closed".to_string(),
@@ -862,12 +980,14 @@ impl Topics {
         let publishers: Vec<_> = self.publishers.keys().cloned().collect();
         for publisher in publishers {
             if let Some(mut state) = self.publishers.remove(&publisher) {
-                self.drop_publisher_sends(&publisher, &mut state, reason, notifications);
+                if publisher.mode == TopicMode::Ordered && reason != TopicDropReason::NotRegistered
+                {
+                    Self::requeue_pending(&mut state);
+                } else {
+                    self.drop_publisher_sends(&publisher, &mut state, reason, notifications);
+                }
                 self.publishers.insert(publisher, state);
             }
-        }
-        for state in self.subscribers.values_mut() {
-            state.publishers.clear();
         }
         self.refresh_snapshot(snapshot);
     }
@@ -894,19 +1014,24 @@ impl Topics {
         if state.pending.is_some() {
             return;
         }
-        let Some(payload) = state.queue.pop_front() else {
+        let Some(queued) = state.queue.pop_front() else {
             return;
         };
+        let payload = queued.payload;
         let operation = ids.operation();
-        let (wire_payload, stream_id, sequence) = match publisher.mode {
-            TopicMode::Latest => (payload.clone(), None, None),
+        let (wire_payload, sequence) = match publisher.mode {
+            TopicMode::Latest => (payload.clone(), None),
             TopicMode::Ordered => {
                 let Some(stream_id) = state.stream_id else {
                     debug_assert!(false, "ordered publisher must have a stream identity");
                     return;
                 };
-                let sequence = state.next_sequence;
+                let Some(sequence) = queued.sequence else {
+                    debug_assert!(false, "ordered send must have a sequence");
+                    return;
+                };
                 let message = RelMsg {
+                    stream_epoch: self.stream_epoch.clone().unwrap_or_default(),
                     stream_id,
                     seq: sequence,
                     payload: payload.clone(),
@@ -914,7 +1039,6 @@ impl Topics {
                 };
                 (
                     encode_delivery(&active.participant_id, &message),
-                    Some(stream_id),
                     Some(sequence),
                 )
             }
@@ -923,7 +1047,6 @@ impl Topics {
             operation,
             generation: active.generation,
             channel,
-            stream_id,
             sequence,
             payload,
         });
@@ -965,6 +1088,67 @@ impl Topics {
             return Err(TopicError::MalformedMessage);
         }
         let control = RelControl::decode(payload).map_err(|_| TopicError::MalformedMessage)?;
+        if let Some(rel_control::Msg::Probe(probe)) = control.msg {
+            if probe.publisher_id != participant_id {
+                return Err(TopicError::InvalidControl);
+            }
+            let Some(state) = self.publishers.get(publisher) else {
+                return Err(TopicError::InvalidControl);
+            };
+            let Some(stream_id) = state.stream_id else {
+                return Err(TopicError::InvalidControl);
+            };
+            if probe.live_boundary {
+                self.emit_auxiliary(
+                    generation,
+                    channel,
+                    TopicChannel::Publisher(publisher.clone()),
+                    encode_delivery(
+                        participant_id,
+                        &RelMsg {
+                            stream_epoch: self.stream_epoch.clone().unwrap_or_default(),
+                            stream_id,
+                            seq: state.next_sequence,
+                            payload: Vec::new(),
+                            resync_required: true,
+                        },
+                    ),
+                    ids,
+                    effects,
+                );
+                return Ok(());
+            }
+            let same_stream = probe.stream_id == stream_id
+                && self.stream_epoch.as_deref() == Some(probe.stream_epoch.as_str());
+            if !same_stream {
+                self.emit_auxiliary(
+                    generation,
+                    channel,
+                    TopicChannel::Publisher(publisher.clone()),
+                    encode_delivery(
+                        participant_id,
+                        &RelMsg {
+                            stream_epoch: self.stream_epoch.clone().unwrap_or_default(),
+                            stream_id,
+                            seq: state.history.front().map_or(state.next_sequence, |m| m.seq),
+                            payload: Vec::new(),
+                            resync_required: true,
+                        },
+                    ),
+                    ids,
+                    effects,
+                );
+            }
+            return self.replay_from(
+                generation,
+                channel,
+                participant_id,
+                publisher,
+                if same_stream { probe.from_seq } else { 0 },
+                ids,
+                effects,
+            );
+        }
         let Some(rel_control::Msg::Nack(nack)) = control.msg else {
             return Err(TopicError::InvalidControl);
         };
@@ -977,23 +1161,53 @@ impl Topics {
         let Some(stream_id) = state.stream_id else {
             return Err(TopicError::InvalidControl);
         };
-        if nack.stream_id != stream_id {
+        if nack.stream_id != stream_id
+            || self.stream_epoch.as_deref() != Some(nack.stream_epoch.as_str())
+        {
             return Err(TopicError::StaleStream);
         }
         if nack.from_seq >= state.next_sequence {
             return Err(TopicError::InvalidControl);
         }
-        let replay: Vec<_> = state
-            .history
-            .iter()
-            .filter(|message| message.stream_id == stream_id)
-            .cloned()
-            .collect();
-        let Some(earliest) = replay.first() else {
+        self.replay_from(
+            generation,
+            channel,
+            participant_id,
+            publisher,
+            nack.from_seq,
+            ids,
+            effects,
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "replay emits a bounded set of correlated effects"
+    )]
+    fn replay_from(
+        &mut self,
+        generation: Generation,
+        channel: ChannelId,
+        participant_id: &str,
+        publisher: &TopicPublisher,
+        from_seq: u64,
+        ids: &mut IdGenerator,
+        effects: &mut VecDeque<Effect>,
+    ) -> Result<(), TopicError> {
+        let Some(state) = self.publishers.get(publisher) else {
             return Err(TopicError::InvalidControl);
         };
-        if earliest.seq > nack.from_seq {
+        if from_seq > state.next_sequence {
+            return Err(TopicError::InvalidControl);
+        }
+        let stream_id = state.stream_id.ok_or(TopicError::InvalidControl)?;
+        let replay: Vec<_> = state.history.iter().cloned().collect();
+        let Some(earliest) = replay.first() else {
+            return Ok(());
+        };
+        if earliest.seq > from_seq {
             let reset = RelMsg {
+                stream_epoch: self.stream_epoch.clone().unwrap_or_default(),
                 stream_id,
                 seq: earliest.seq,
                 payload: Vec::new(),
@@ -1008,10 +1222,7 @@ impl Topics {
                 effects,
             );
         }
-        for message in replay
-            .into_iter()
-            .filter(|message| message.seq >= nack.from_seq)
-        {
+        for message in replay.into_iter().filter(|message| message.seq >= from_seq) {
             self.emit_auxiliary(
                 generation,
                 channel,
@@ -1060,6 +1271,7 @@ impl Topics {
         }
         let publisher_id = delivery.publisher_id;
         let stream_id = message.stream_id;
+        let stream_epoch = message.stream_epoch.clone();
         let Some(subscriber_state) = self.subscribers.get_mut(subscriber) else {
             return Ok(());
         };
@@ -1067,7 +1279,28 @@ impl Topics {
             .publishers
             .entry(publisher_id.clone())
             .or_insert_with(|| PublisherDelivery::new(&message));
+        let expected_sequence = state.next_sequence;
+        let same_stream = state.stream_id == stream_id && state.stream_epoch == stream_epoch;
+        let reset = message.resync_required;
         let result = state.accept(message)?;
+        let available_sequence = if reset {
+            result.next_sequence
+        } else {
+            result
+                .messages
+                .first()
+                .map_or(result.next_sequence, |message| message.seq)
+        };
+        if (reset || result.resynchronized) && same_stream && available_sequence > expected_sequence
+        {
+            notifications.push_back(Notification::Topic(TopicNotification::RecoveryGap {
+                subscriber: subscriber.clone(),
+                publisher_id: publisher_id.clone(),
+                stream_id,
+                expected_sequence,
+                available_sequence,
+            }));
+        }
         if result.resynchronized {
             self.resynchronizations = self.resynchronizations.saturating_add(1);
             topic_log!(
@@ -1101,6 +1334,7 @@ impl Topics {
         if let Some(from_seq) = result.nack_from {
             let nack = RelControl {
                 msg: Some(rel_control::Msg::Nack(RelNack {
+                    stream_epoch,
                     stream_id,
                     from_seq,
                     publisher_id,
@@ -1143,6 +1377,15 @@ impl Topics {
             binary: true,
             payload,
         }));
+    }
+
+    fn requeue_pending(state: &mut PublisherState) {
+        if let Some(pending) = state.pending.take() {
+            state.queue.push_front(QueuedSend {
+                sequence: pending.sequence,
+                payload: pending.payload,
+            });
+        }
     }
 
     fn drop_publisher_sends(
@@ -1285,6 +1528,7 @@ struct DeliveryResult {
 impl PublisherDelivery {
     fn new(message: &RelMsg) -> Self {
         Self {
+            stream_epoch: message.stream_epoch.clone(),
             stream_id: message.stream_id,
             next_sequence: message.seq,
             pending: BTreeMap::new(),
@@ -1294,20 +1538,33 @@ impl PublisherDelivery {
 
     fn accept(&mut self, message: RelMsg) -> Result<DeliveryResult, TopicError> {
         let mut resynchronized = false;
-        if self.stream_id != message.stream_id {
-            if self.retired_streams.contains(&message.stream_id) {
+        if self.stream_id != message.stream_id || self.stream_epoch != message.stream_epoch {
+            if self
+                .retired_streams
+                .contains(&(message.stream_epoch.clone(), message.stream_id))
+            {
                 return Err(TopicError::StaleStream);
             }
             if self.retired_streams.len() == TOPIC_HISTORY_CAPACITY {
                 let _ = self.retired_streams.pop_front();
             }
-            self.retired_streams.push_back(self.stream_id);
+            self.retired_streams
+                .push_back((self.stream_epoch.clone(), self.stream_id));
+            self.stream_epoch.clone_from(&message.stream_epoch);
             self.stream_id = message.stream_id;
             self.next_sequence = message.seq;
             self.pending.clear();
             resynchronized = true;
         }
         if message.resync_required {
+            if !resynchronized && message.seq <= self.next_sequence {
+                return Ok(DeliveryResult {
+                    messages: Vec::new(),
+                    nack_from: None,
+                    resynchronized: false,
+                    next_sequence: self.next_sequence,
+                });
+            }
             self.next_sequence = message.seq;
             self.pending.clear();
             return Ok(DeliveryResult {
@@ -1434,6 +1691,7 @@ mod tests {
 
     fn message(stream_id: u64, seq: u64) -> RelMsg {
         RelMsg {
+            stream_epoch: "test-session".to_string(),
             stream_id,
             seq,
             payload: alloc::vec![u8::try_from(seq).unwrap_or(u8::MAX)],
@@ -1516,7 +1774,21 @@ mod tests {
     }
 
     #[test]
-    fn departed_publishers_release_ordered_delivery_state() {
+    fn a_fresh_agent_can_reuse_stream_numbers_without_losing_or_duplicating_delivery() {
+        let old = message(1, 0);
+        let mut delivery = PublisherDelivery::new(&old);
+        assert_eq!(delivery.accept(old.clone()).unwrap().messages.len(), 1);
+        let mut fresh = message(1, 0);
+        fresh.stream_epoch = "fresh-agent".to_string();
+        let changed = delivery.accept(fresh.clone()).unwrap();
+        assert!(changed.resynchronized);
+        assert_eq!(changed.messages.len(), 1);
+        assert!(delivery.accept(fresh).unwrap().messages.is_empty());
+        assert!(matches!(delivery.accept(old), Err(TopicError::StaleStream)));
+    }
+
+    #[test]
+    fn subscription_retraction_releases_ordered_delivery_state() {
         let subscriber = TopicSubscriber {
             topic: "chat".to_string(),
             mode: TopicMode::Ordered,
@@ -1534,12 +1806,13 @@ mod tests {
         let mut topics = Topics::default();
         topics
             .subscribers
-            .insert(subscriber.clone(), SubscriberState { publishers });
+            .insert(subscriber, SubscriberState { publishers });
 
-        topics.retain_remote_publishers(["present"]);
-
-        let publishers = &topics.subscribers[&subscriber].publishers;
-        assert!(publishers.contains_key("present"));
-        assert!(!publishers.contains_key("departed"));
+        topics.reconcile(
+            &TopicRegistrations::default(),
+            &mut Snapshot::default(),
+            &mut VecDeque::new(),
+        );
+        assert!(topics.subscribers.is_empty());
     }
 }

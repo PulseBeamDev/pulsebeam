@@ -6,12 +6,24 @@ message RelMsg {
   uint64 seq       = 2;
   bytes  payload   = 3;
   bool resync_required = 4;
+  string stream_epoch = 5;
 }
 
 message RelNack {
   uint64 stream_id = 1;
   uint64 from_seq  = 2;
   string publisher_id = 3;
+  string stream_epoch = 4;
+}
+
+// Sent by a continuously active receiver when its transport or catalog changes.
+// A receiver without prior state requests a live boundary, never old history.
+message RelProbe {
+  string publisher_id = 1;
+  uint64 stream_id = 2;
+  uint64 from_seq = 3;
+  bool live_boundary = 4;
+  string stream_epoch = 5;
 }
 
 message RelDelivery {
@@ -22,5 +34,6 @@ message RelDelivery {
 message RelControl {
   oneof msg {
     RelNack nack = 1;
+    RelProbe probe = 2;
   }
 }

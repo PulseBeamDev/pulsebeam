@@ -10,7 +10,11 @@ export function useRoomMedia(
   onFailure: (message: string) => void,
   initial: { cameraOn: boolean; micOn: boolean },
 ) {
-  const display = useDisplayMedia({
+  const {
+    videoTrack: displayTrack,
+    stop: stopDisplay,
+    request: requestDisplay,
+  } = useDisplayMedia({
     video: {
       width: { ideal: 1920 },
       height: { ideal: 1080 },
@@ -32,21 +36,21 @@ export function useRoomMedia(
     microphone.setSource(micOn ? sources.audioTrack : null);
   }, [microphone, micOn, sources.audioTrack]);
   useEffect(() => {
-    screen.setSource(display.videoTrack);
-  }, [screen, display.videoTrack]);
+    screen.setSource(displayTrack);
+  }, [screen, displayTrack]);
   useEffect(
     () => () => {
       screen.setSource(null);
       camera.setSource(null);
       microphone.setSource(null);
-      display.stop();
+      stopDisplay();
     },
-    [camera, display.stop, microphone, screen],
+    [camera, stopDisplay, microphone, screen],
   );
 
   const startShare = useCallback(async () => {
     try {
-      await display.request();
+      await requestDisplay();
     } catch (reason) {
       onFailure(
         reason instanceof Error
@@ -54,21 +58,17 @@ export function useRoomMedia(
           : "Screen sharing was cancelled",
       );
     }
-  }, [display.request, onFailure]);
-  const toggle = useCallback(
-    (slot: "camera" | "microphone", enabled: boolean) => {
-      if (slot === "camera") setCameraOn(enabled);
-      else setMicOn(enabled);
-    },
-    [],
-  );
+  }, [requestDisplay, onFailure]);
   return {
-    screen: display.videoTrack,
+    screen: displayTrack,
     camera,
     cameraOn,
     micOn,
-    detachScreen: display.stop,
+    detachScreen: stopDisplay,
     startShare,
-    toggle,
+    toggle(slot: "camera" | "microphone", enabled: boolean) {
+      if (slot === "camera") setCameraOn(enabled);
+      else setMicOn(enabled);
+    },
   };
 }

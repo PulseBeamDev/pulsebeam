@@ -1,58 +1,36 @@
 import { useCallback, useEffect, useState } from "react";
 import { Audio, Video, useAgent } from "@pulsebeam/react";
-import type { Agent } from "@pulsebeam/react";
+import type { Agent, RemoteVideoTrack } from "@pulsebeam/react";
 import {
-  Badge,
+  Alert,
+  Box,
   Button,
-  Card,
-  Input,
-  ScrollArea,
-  Separator,
-  Tooltip,
-  TooltipContent,
-  TooltipProvider,
-  TooltipTrigger,
-  cn,
-} from "./ui";
-import {
-  Gauge,
-  Loader2,
-  MessageCircle,
-  Mic,
-  MicOff,
-  Settings2,
-  Monitor,
-  MonitorOff,
-  PhoneOff,
-  RotateCcw,
-  Send,
-  SmilePlus,
-  Video as VideoIcon,
-  VideoOff,
-  X,
-} from "lucide-react";
+  Chip,
+  IconButton,
+  Menu,
+  MenuItem,
+  Paper,
+  Popover,
+  Stack,
+  TextField,
+  Typography,
+} from "@mui/material";
+import * as Icons from "lucide-react";
 import { useRoomMedia } from "@/hooks/room-media";
-import { DeviceSelector } from "./DeviceSelector";
+import { DeviceSettings } from "./DeviceSettings";
 import { useMeetMedia } from "./MeetMediaProvider";
 import { useTopics } from "@/hooks/topics";
 import { useVideoLayout } from "@/hooks/video-layout";
 
-const latencyModes = [
-  {
-    label: "Smooth",
-    minMs: 400,
-    maxMs: 800,
-    description: "400–800 ms",
-  },
-  {
-    label: "Balanced",
-    minMs: 100,
-    maxMs: 200,
-    description: "100–200 ms",
-  },
-  { label: "Zero", minMs: 0, maxMs: 0, description: "Render immediately" },
-] as const;
-
+const latencyModes: Record<
+  string,
+  { minMs: number; maxMs: number } | undefined
+> = {
+  Auto: undefined,
+  Smooth: { minMs: 400, maxMs: 800 },
+  Balanced: { minMs: 100, maxMs: 200 },
+  Zero: { minMs: 0, maxMs: 0 },
+};
 const reactionEmojis = ["👍", "❤️", "😂", "😮", "👏", "🔥"];
 
 export function Room({
@@ -86,7 +64,9 @@ export function Room({
       onLeave={onLeave}
     />
   ) : (
-    <main className="grid h-dvh place-items-center">Joining room…</main>
+    <Box component="main" className="grid h-dvh place-items-center">
+      Joining room…
+    </Box>
   );
 }
 
@@ -100,23 +80,15 @@ function RoomSession({
   onLeave(): void;
 }) {
   const agent = owner.getSnapshot();
-  const {
-    capture,
-    devices,
-    videoDeviceId,
-    audioDeviceId,
-    setVideoDeviceId,
-    setAudioDeviceId,
-  } = useMeetMedia();
-  const [devicesOpen, setDevicesOpen] = useState(false);
-  const [latency, setLatency] = useState<{
-    mode: "fixed";
-    minMs: number;
-    maxMs: number;
-  }>();
+  const { capture, devices } = useMeetMedia();
+  const [deviceAnchor, setDeviceAnchor] = useState<HTMLElement | null>(null);
+  const [reactionAnchor, setReactionAnchor] = useState<HTMLElement | null>(
+    null,
+  );
+  const [latencyMode, setLatencyMode] = useState("Auto");
   const [draft, setDraft] = useState("");
+  const [sending, setSending] = useState(false);
   const [chatOpen, setChatOpen] = useState(false);
-  const [reactionPickerOpen, setReactionPickerOpen] = useState(false);
   const [failure, setFailure] = useState<string | null>(null);
   const [playbackRetry, setPlaybackRetry] = useState<
     (() => Promise<void>) | null
@@ -135,16 +107,12 @@ function RoomSession({
     sendReaction,
     error: topicError,
     clearError,
-  } = useTopics(owner, agent.participantId);
+    gap,
+    clearGap,
+    retrySubscriptions,
+  } = useTopics(owner, agent.participantExternalId);
   const { remoteTracks, spotlight, setPin } = useVideoLayout(
     owner.remoteVideoTracks,
-  );
-  const onBlocked = useCallback(
-    (reason: string, retry: () => Promise<void>) => {
-      setFailure(`Playback: ${reason}`);
-      setPlaybackRetry(() => retry);
-    },
-    [],
   );
   useEffect(() => {
     owner.connect();
@@ -152,451 +120,382 @@ function RoomSession({
   useEffect(() => {
     for (const track of remoteTracks)
       track.setReceiveOptions({
-        minHeight: track === spotlight ? 360 : 90,
         minFps: 15,
         priority: track === spotlight ? 200 : 10,
-        ...(latency ? { playoutDelay: latency } : {}),
+        playoutDelay: latencyModes[latencyMode],
       });
-  }, [latency, remoteTracks, spotlight]);
+  }, [latencyMode, remoteTracks, spotlight]);
   const playbackError = useCallback(
     ({ error, retry }: { error: unknown; retry: () => Promise<void> }) => {
-      onBlocked(error instanceof Error ? error.message : String(error), retry);
+      setFailure(
+        `Playback: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      setPlaybackRetry(() => retry);
     },
-    [onBlocked],
+    [],
   );
-  const blocked = failure ?? topicError ?? agent.failure?.message;
+  const closeAlert = () => {
+    setFailure(null);
+    setPlaybackRetry(null);
+    clearError();
+  };
+  const send = async () => {
+    if (sending || !draft.trim()) return;
+    const text = draft;
+    setSending(true);
+    try {
+      if (await sendChat(text))
+        setDraft((current) => (current === text ? "" : current));
+    } finally {
+      setSending(false);
+    }
+  };
+  const selectReaction = (emoji: string) => {
+    sendReaction(emoji);
+    setReactionAnchor(null);
+  };
+  const video = (track: RemoteVideoTrack | null, fill: "contain" | "cover") => (
+    <Video
+      source={track ?? camera}
+      autoPlay
+      mirror={!track}
+      className={
+        fill === "cover"
+          ? "h-full w-full object-cover"
+          : "h-full w-full object-contain"
+      }
+      onPlaybackError={playbackError}
+    />
+  );
+  const tile = (track: RemoteVideoTrack | null) => (
+    <Box
+      component="button"
+      key={track ? `${track.participantId}:${track.label}` : "local"}
+      aria-label={`Spotlight ${track?.participantId ?? "your camera"}`}
+      onClick={() => setPin(track ?? "local")}
+      className="relative aspect-video w-36 shrink-0 cursor-pointer overflow-hidden rounded-lg border-2 border-transparent bg-slate-900 p-0 hover:border-blue-500 focus-visible:border-blue-500 lg:w-full"
+    >
+      {video(track, "cover")}
+      <Typography
+        variant="caption"
+        className="absolute bottom-1 left-1.5 max-w-[90%] truncate rounded bg-slate-950/80 px-1.5 text-white!"
+      >
+        {track?.participantId ?? "You"}
+      </Typography>
+    </Box>
+  );
   return (
-    <TooltipProvider>
-      <div className="flex h-dvh flex-col overflow-hidden bg-background font-sans">
-        <header className="meet-room-header z-20 flex shrink-0 items-center justify-between gap-2 border-b bg-card/50 backdrop-blur-md">
-          <div className="flex min-w-0 items-center gap-2">
-            <Badge variant="outline" className="gap-2 px-2 py-0.5">
-              <span
-                aria-hidden="true"
-                className={cn(
-                  "h-1.5 w-1.5 rounded-full",
-                  agent.connection === "connected"
-                    ? "animate-pulse bg-emerald-500"
-                    : "bg-amber-500",
-                )}
-              />
-              <span className="meet-room-name truncate text-xs font-medium text-muted-foreground">
-                Participant:{" "}
-                <span className="text-foreground">
-                  {agent.participantId ?? "connecting"}
-                </span>
-                <span className="sr-only">, {agent.connection}</span>
-              </span>
-            </Badge>
-            {agent.connection !== "connected" &&
-              agent.connection !== "disconnected" &&
-              agent.connection !== "terminal-failure" && (
-                <Badge
-                  variant="secondary"
-                  className="meet-connection-status hidden gap-2"
-                >
-                  <Loader2 className="h-3 w-3 animate-spin text-primary" />
-                  <span className="text-xs font-medium">Connecting…</span>
-                </Badge>
-              )}
-          </div>
-          <div className="meet-room-actions flex items-center gap-1">
-            <div className="flex h-8 min-w-0 items-center gap-1.5 rounded-md border border-border/60 bg-muted/40 px-2">
-              <Gauge className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-              <span className="meet-latency-label text-xs text-muted-foreground">
-                Latency
-              </span>
-              <select
-                aria-label="Latency mode"
-                value={
-                  latency
-                    ? latencyModes.find(
-                        (mode) =>
-                          mode.minMs === latency.minMs &&
-                          mode.maxMs === latency.maxMs,
-                      )?.label
-                    : "Auto"
-                }
-                onChange={(event) => {
-                  const mode = latencyModes.find(
-                    (candidate) => candidate.label === event.target.value,
-                  );
-                  if (mode)
-                    setLatency({
-                      mode: "fixed",
-                      minMs: mode.minMs,
-                      maxMs: mode.maxMs,
-                    });
-                }}
-                className="h-6 min-w-18 border-0 bg-transparent px-0 text-xs font-medium outline-none"
-              >
-                <option value="Auto" disabled={Boolean(latency)}>
-                  {latency ? "Auto (new room)" : "Auto"}
-                </option>
-                {latencyModes.map((mode) => (
-                  <option key={mode.label} value={mode.label}>
-                    {mode.label} — {mode.description}
-                  </option>
-                ))}
-              </select>
-            </div>
-            <Separator orientation="vertical" className="mx-1 h-4" />
-            <Button
-              variant="ghost"
-              size="sm"
-              className={cn(
-                "h-8 rounded-md px-2.5",
-                devicesOpen && "bg-primary/10 text-primary",
-              )}
-              aria-label="Devices"
-              aria-expanded={devicesOpen}
-              onClick={() => setDevicesOpen((open) => !open)}
-            >
-              <Settings2 className="h-4 w-4" />
-              <span className="hidden text-xs sm:inline">Devices</span>
-            </Button>
-            <Button
-              variant="ghost"
-              size="sm"
-              className={cn(
-                "h-8 rounded-md px-2.5",
-                screen && "bg-primary/10 text-primary",
-              )}
-              onClick={() => (screen ? detachScreen() : void startShare())}
-            >
-              {screen ? (
-                <MonitorOff className="h-4 w-4" />
-              ) : (
-                <Monitor className="h-4 w-4" />
-              )}
-              <span className="text-xs">{screen ? "Stop" : "Share"}</span>
-            </Button>
-            <Button
-              variant="ghost"
-              size="sm"
-              className={cn(
-                "h-8 rounded-md px-2.5",
-                chatOpen && "bg-primary/10 text-primary",
-              )}
-              aria-pressed={chatOpen}
-              onClick={() => setChatOpen((open) => !open)}
-            >
-              <MessageCircle className="h-4 w-4" />
-              <span className="text-xs">Chat</span>
-            </Button>
-            <Button
-              size="sm"
-              variant="destructive"
-              className="h-8 px-2.5 text-xs"
-              onClick={onLeave}
-            >
-              <PhoneOff className="h-3.5 w-3.5" /> End
-            </Button>
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <Button
-                  size="icon"
-                  variant="ghost"
-                  className="meet-reconnect h-8 w-8"
-                  aria-label="Reconnect"
-                  onClick={() => owner.reconnect()}
-                >
-                  <RotateCcw className="h-3.5 w-3.5" />
-                </Button>
-              </TooltipTrigger>
-              <TooltipContent>Reconnect</TooltipContent>
-            </Tooltip>
-          </div>
-        </header>
-        {devicesOpen && (
-          <div className="grid shrink-0 grid-cols-1 gap-3 border-b bg-card px-3 py-3 sm:grid-cols-2">
-            <DeviceSelector
-              label="Camera"
-              value={videoDeviceId}
-              devices={devices.cameras}
-              onValueChange={setVideoDeviceId}
-            />
-            <DeviceSelector
-              label="Microphone"
-              value={audioDeviceId}
-              devices={devices.microphones}
-              onValueChange={setAudioDeviceId}
-            />
-          </div>
-        )}
-        {(capture.error || devices.error) && (
-          <div
-            role="alert"
-            className="flex items-center gap-2 border-b bg-destructive/10 px-3 py-2 text-sm text-destructive"
+    <Box className="flex h-dvh min-w-0 flex-col bg-slate-50">
+      <Paper
+        component="header"
+        square
+        elevation={0}
+        className="flex shrink-0 items-center justify-between gap-2 border-b border-slate-200 px-2 py-2 sm:px-4 max-sm:[&_.MuiIconButton-root]:p-[5px]!"
+      >
+        <Stack
+          direction="row"
+          spacing={1}
+          sx={{ minWidth: 0, alignItems: "center" }}
+        >
+          <Chip
+            size="small"
+            color={agent.connection === "connected" ? "success" : "warning"}
+            label={agent.participantExternalId ?? "Joining…"}
+            className="max-w-24 sm:max-w-65"
+          />
+          <Typography
+            variant="caption"
+            color="text.secondary"
+            sx={{ display: { xs: "none", sm: "block" } }}
           >
-            <span className="min-w-0 flex-1">
-              {(capture.error || devices.error)?.message}
-            </span>
-            <Button
-              size="sm"
-              variant="secondary"
-              onClick={() => void capture.request().catch(() => {})}
-            >
+            {agent.roomExternalId ? `Room ${agent.roomExternalId} · ` : ""}
+            {agent.connection}
+          </Typography>
+        </Stack>
+        <Stack
+          direction="row"
+          spacing={0.25}
+          sx={{ flexShrink: 0, alignItems: "center" }}
+        >
+          <IconButton
+            aria-label={screen ? "Stop sharing" : "Share screen"}
+            onClick={() => (screen ? detachScreen() : void startShare())}
+          >
+            {screen ? (
+              <Icons.MonitorOff size={20} />
+            ) : (
+              <Icons.Monitor size={20} />
+            )}
+          </IconButton>
+          <IconButton
+            aria-label="Chat"
+            aria-pressed={chatOpen}
+            color={chatOpen ? "primary" : "default"}
+            onClick={() => setChatOpen(!chatOpen)}
+          >
+            <Icons.MessageCircle size={20} />
+          </IconButton>
+          <IconButton
+            aria-label="Devices and latency"
+            onClick={(event) => setDeviceAnchor(event.currentTarget)}
+          >
+            <Icons.Settings2 size={20} />
+          </IconButton>
+          <IconButton aria-label="Reconnect" onClick={() => owner.reconnect()}>
+            <Icons.RotateCcw size={20} />
+          </IconButton>
+          <Button
+            color="error"
+            variant="contained"
+            onClick={onLeave}
+            startIcon={<Icons.PhoneOff size={17} />}
+            sx={{ minWidth: 72 }}
+          >
+            Leave
+          </Button>
+        </Stack>
+      </Paper>
+      <Popover
+        open={Boolean(deviceAnchor)}
+        anchorEl={deviceAnchor}
+        onClose={() => setDeviceAnchor(null)}
+        anchorOrigin={{ vertical: "bottom", horizontal: "right" }}
+        transformOrigin={{ vertical: "top", horizontal: "right" }}
+      >
+        <Stack spacing={2} sx={{ p: 2, width: "min(340px, 95vw)" }}>
+          <Typography variant="h6">Call settings</Typography>
+          <DeviceSettings />
+          <TextField
+            select
+            size="small"
+            fullWidth
+            label="Latency"
+            value={latencyMode}
+            onChange={(event) => setLatencyMode(event.target.value)}
+          >
+            {Object.keys(latencyModes).map((mode) => (
+              <MenuItem key={mode} value={mode}>
+                {mode}
+              </MenuItem>
+            ))}
+          </TextField>
+        </Stack>
+      </Popover>
+      {(capture.error || devices.error) && (
+        <Alert
+          severity="error"
+          action={
+            <Button onClick={() => void capture.request().catch(() => {})}>
               Retry capture
             </Button>
-          </div>
-        )}
-        {blocked && (
-          <div
-            role="alert"
-            className="flex flex-wrap items-center gap-2 border-b border-destructive/20 bg-destructive/10 px-3 py-2 text-sm text-destructive"
-          >
-            <span className="min-w-0 flex-1">{blocked}</span>
-            {playbackRetry && (
-              <Button
-                size="sm"
-                variant="secondary"
-                onClick={() => playbackRetry()}
-              >
-                Retry playback
-              </Button>
+          }
+        >
+          {(capture.error || devices.error)?.message}
+        </Alert>
+      )}
+      {(failure || topicError || agent.failure) && (
+        <Alert
+          severity="error"
+          onClose={closeAlert}
+          action={
+            <Stack direction="row">
+              {playbackRetry && (
+                <Button onClick={() => void playbackRetry()}>
+                  Retry playback
+                </Button>
+              )}
+              {topicError && (
+                <Button onClick={retrySubscriptions}>Retry chat</Button>
+              )}
+            </Stack>
+          }
+        >
+          {failure ?? topicError ?? agent.failure?.message}
+        </Alert>
+      )}
+      {gap && (
+        <Alert severity="warning" onClose={clearGap}>
+          Some chat messages may be missing after recovery.
+        </Alert>
+      )}
+      <Box
+        component="main"
+        className="relative flex min-h-0 min-w-0 flex-1 flex-col gap-3 p-2 lg:flex-row lg:p-4"
+      >
+        <Paper
+          className="relative grid min-h-0 min-w-0 flex-1 place-items-center overflow-hidden"
+          sx={{ bgcolor: "#0b1220" }}
+        >
+          <Box sx={{ width: "100%", height: "100%", position: "relative" }}>
+            {video(spotlight, "contain")}
+            {spotlight && (
+              <Chip
+                size="small"
+                label={spotlight.participantId}
+                className="absolute! top-3 left-3 max-w-[80%]"
+                sx={{ bgcolor: "#15233a", color: "white" }}
+              />
             )}
-            <Button
-              size="sm"
-              variant="secondary"
-              onClick={() => {
-                setFailure(null);
-                setPlaybackRetry(null);
-                clearError();
+            {reactions.map((reaction, index) => (
+              <span
+                key={reaction.id}
+                aria-label={reaction.emoji}
+                className="meet-reaction"
+                style={{ left: `${24 + (index % 5) * 13}%` }}
+              >
+                {reaction.emoji}
+              </span>
+            ))}
+            <Stack
+              direction="row"
+              spacing={1}
+              className="absolute bottom-4 left-1/2 -translate-x-1/2 rounded-lg bg-slate-900/90 p-1.5"
+            >
+              <IconButton
+                aria-label={micOn ? "Mute microphone" : "Unmute microphone"}
+                onClick={() => toggle("microphone", !micOn)}
+                className={
+                  micOn
+                    ? "bg-slate-700! text-white!"
+                    : "bg-red-600! text-white!"
+                }
+              >
+                {micOn ? <Icons.Mic size={22} /> : <Icons.MicOff size={22} />}
+              </IconButton>
+              <IconButton
+                aria-label={cameraOn ? "Turn camera off" : "Turn camera on"}
+                onClick={() => toggle("camera", !cameraOn)}
+                className={
+                  cameraOn
+                    ? "bg-slate-700! text-white!"
+                    : "bg-red-600! text-white!"
+                }
+              >
+                {cameraOn ? (
+                  <Icons.Video size={22} />
+                ) : (
+                  <Icons.VideoOff size={22} />
+                )}
+              </IconButton>
+              <IconButton
+                title="Send a reaction"
+                aria-label="Send a reaction"
+                aria-expanded={Boolean(reactionAnchor)}
+                onClick={(event) => setReactionAnchor(event.currentTarget)}
+                sx={{ bgcolor: "#34465e", color: "white" }}
+              >
+                <Icons.SmilePlus size={22} />
+              </IconButton>
+            </Stack>
+          </Box>
+        </Paper>
+        <Menu
+          open={Boolean(reactionAnchor)}
+          anchorEl={reactionAnchor}
+          onClose={() => setReactionAnchor(null)}
+        >
+          {reactionEmojis.map((emoji) => (
+            <MenuItem
+              key={emoji}
+              aria-label={`React with ${emoji}`}
+              onClick={() => selectReaction(emoji)}
+            >
+              {emoji}
+            </MenuItem>
+          ))}
+        </Menu>
+        <Stack
+          component="aside"
+          spacing={1}
+          className="h-[110px] min-h-0 w-full shrink-0 lg:h-full lg:w-52"
+        >
+          <Typography variant="overline" color="text.secondary">
+            Participants · {remoteTracks.length + 1}
+          </Typography>
+          <Stack
+            direction={{ xs: "row", lg: "column" }}
+            spacing={1}
+            sx={{ overflow: "auto", flex: 1, minHeight: 0 }}
+          >
+            {spotlight && tile(null)}
+            {remoteTracks
+              .filter((track) => track !== spotlight)
+              .map((track) => tile(track))}
+          </Stack>
+        </Stack>
+        {chatOpen && (
+          <Paper
+            component="aside"
+            className="absolute inset-x-0 bottom-0 z-10 flex h-[min(65dvh,480px)] min-h-0 w-full shrink-0 flex-col lg:static lg:h-auto lg:w-80"
+          >
+            <Stack
+              direction="row"
+              className="items-center justify-between border-b border-slate-200 px-4 py-2"
+            >
+              <Typography variant="subtitle1">Chat</Typography>
+              <IconButton
+                aria-label="Close chat"
+                onClick={() => setChatOpen(false)}
+              >
+                <Icons.X size={18} />
+              </IconButton>
+            </Stack>
+            <Stack spacing={1.5} className="min-h-0 flex-1 overflow-y-auto p-4">
+              {!messages.length && (
+                <Typography variant="body2" color="text.secondary">
+                  No messages yet
+                </Typography>
+              )}
+              {messages.map((message) => (
+                <Box
+                  key={message.id}
+                  className={`max-w-[90%] ${message.self ? "self-end" : "self-start"}`}
+                >
+                  <Typography variant="caption" color="text.secondary">
+                    {message.self ? "You" : message.sender}
+                    {message.status === "pending" ? " · Sending…" : ""}
+                  </Typography>
+                  <Paper
+                    elevation={0}
+                    className={`break-words px-3 py-2 ${message.self ? "bg-blue-700! text-white!" : "bg-slate-100!"}`}
+                  >
+                    {message.text}
+                  </Paper>
+                </Box>
+              ))}
+            </Stack>
+            <Stack
+              component="form"
+              direction="row"
+              spacing={1}
+              className="border-t border-slate-200 p-3"
+              onSubmit={(event) => {
+                event.preventDefault();
+                void send();
               }}
             >
-              Dismiss
-            </Button>
-          </div>
-        )}
-        <main className="meet-room-main relative flex min-h-0 flex-1">
-          <Card className="meet-spotlight relative flex min-h-0 flex-1 items-center justify-center overflow-hidden bg-black py-0">
-            <div className="meet-spotlight-frame relative w-full">
-              {spotlight ? (
-                <Video
-                  source={spotlight}
-                  autoPlay
-                  className="h-full w-full object-contain"
-                  onPlaybackError={playbackError}
-                />
-              ) : (
-                <Video
-                  source={camera}
-                  autoPlay
-                  mirror
-                  className="h-full w-full object-contain"
-                  onPlaybackError={playbackError}
-                />
-              )}
-              {spotlight && (
-                <Badge className="absolute top-3 left-3 h-7 max-w-48 gap-2 truncate rounded-lg border border-white/10 bg-black/60 px-2.5 py-1 text-[9px] font-medium text-white backdrop-blur-md">
-                  <span className="h-1.5 w-1.5 rounded-full bg-primary" />
-                  {spotlight.participantId}
-                </Badge>
-              )}
-              {reactions.map((reaction, index) => (
-                <span
-                  key={reaction.id}
-                  className="absolute bottom-24 animate-[floatUp_3s_ease-out_forwards] text-4xl"
-                  style={{ left: `${24 + (index % 5) * 13}%` }}
-                >
-                  {reaction.emoji}
-                </span>
-              ))}
-              <div className="absolute bottom-3 left-1/2 flex -translate-x-1/2 gap-2 rounded-xl border border-white/10 bg-black/60 p-1.5 shadow-2xl backdrop-blur-md sm:bottom-6 sm:gap-3">
-                <Button
-                  size="icon"
-                  variant={micOn ? "secondary" : "destructive"}
-                  className="h-11 w-11 sm:h-10 sm:w-10"
-                  aria-label={micOn ? "Mute microphone" : "Unmute microphone"}
-                  onClick={() => toggle("microphone", !micOn)}
-                >
-                  {micOn ? (
-                    <Mic className="h-4 w-4" />
-                  ) : (
-                    <MicOff className="h-4 w-4" />
-                  )}
-                </Button>
-                <Button
-                  size="icon"
-                  variant={cameraOn ? "secondary" : "destructive"}
-                  className="h-11 w-11 sm:h-10 sm:w-10"
-                  aria-label={cameraOn ? "Turn camera off" : "Turn camera on"}
-                  onClick={() => toggle("camera", !cameraOn)}
-                >
-                  {cameraOn ? (
-                    <VideoIcon className="h-4 w-4" />
-                  ) : (
-                    <VideoOff className="h-4 w-4" />
-                  )}
-                </Button>
-                <div className="relative">
-                  <Button
-                    size="icon"
-                    variant="secondary"
-                    className="h-11 w-11 sm:h-10 sm:w-10"
-                    aria-label="Send a reaction"
-                    aria-expanded={reactionPickerOpen}
-                    onClick={() => setReactionPickerOpen((open) => !open)}
-                  >
-                    <SmilePlus className="h-4 w-4" />
-                  </Button>
-                  {reactionPickerOpen && (
-                    <div className="absolute bottom-full left-1/2 mb-2 flex -translate-x-1/2 gap-1 rounded-xl border border-white/10 bg-black/80 px-2 py-1.5 backdrop-blur-md">
-                      {reactionEmojis.map((emoji) => (
-                        <button
-                          key={emoji}
-                          className="rounded p-1 text-xl transition-transform hover:scale-125 focus-visible:ring-2 focus-visible:ring-white active:scale-110"
-                          aria-label={`React with ${emoji}`}
-                          onClick={() => {
-                            sendReaction(emoji);
-                            setReactionPickerOpen(false);
-                          }}
-                        >
-                          {emoji}
-                        </button>
-                      ))}
-                    </div>
-                  )}
-                </div>
-              </div>
-            </div>
-          </Card>
-          <aside className="meet-participants flex shrink-0 flex-col">
-            <div className="flex items-center justify-between px-1">
-              <p className="text-[10px] font-bold tracking-widest text-muted-foreground uppercase">
-                Participants
-              </p>
-              <Badge variant="secondary" className="h-4 text-[9px]">
-                {remoteTracks.length + 1}
-              </Badge>
-            </div>
-            <div className="meet-participant-scroll min-h-0 flex-1">
-              <div className="meet-participant-list flex gap-2">
-                {spotlight && (
-                  <button
-                    className="meet-participant-tile relative aspect-video shrink-0 overflow-hidden rounded-lg border-2 border-transparent bg-muted transition-colors hover:border-primary"
-                    aria-label="Spotlight your camera"
-                    onClick={() => setPin("local")}
-                  >
-                    <Video
-                      source={camera}
-                      autoPlay
-                      mirror
-                      className="h-full w-full object-cover"
-                      onPlaybackError={playbackError}
-                    />
-                    <Badge
-                      variant="secondary"
-                      className="absolute bottom-1.5 left-1.5 h-4 border-0 bg-black/50 text-[9px] text-white backdrop-blur-sm"
-                    >
-                      You
-                    </Badge>
-                  </button>
-                )}
-                {remoteTracks
-                  .filter((track) => track !== spotlight)
-                  .map((track) => (
-                    <button
-                      key={`${track.participantId}:${track.label}`}
-                      className="meet-participant-tile relative aspect-video shrink-0 overflow-hidden rounded-lg border-2 border-transparent bg-muted transition-colors hover:border-primary"
-                      aria-label={`Spotlight ${track.participantId}`}
-                      onClick={() => setPin(track)}
-                    >
-                      <Video
-                        source={track}
-                        autoPlay
-                        className="h-full w-full object-contain"
-                        onPlaybackError={playbackError}
-                      />
-                      <Badge
-                        variant="secondary"
-                        className="absolute bottom-1.5 left-1.5 h-4 max-w-[calc(100%-0.75rem)] truncate border-0 bg-black/50 text-[9px] text-white backdrop-blur-sm"
-                      >
-                        {track.participantId}
-                      </Badge>
-                    </button>
-                  ))}
-              </div>
-            </div>
-          </aside>
-          {chatOpen && (
-            <aside className="meet-chat flex w-72 shrink-0 flex-col border-l bg-card">
-              <div className="flex items-center gap-2 border-b px-3 py-2">
-                <MessageCircle className="h-4 w-4 text-muted-foreground" />
-                <span className="flex-1 text-sm font-medium">Chat</span>
-                <Button
-                  size="icon"
-                  variant="ghost"
-                  className="size-7"
-                  aria-label="Close chat"
-                  onClick={() => setChatOpen(false)}
-                >
-                  <X className="size-3.5" />
-                </Button>
-              </div>
-              <ScrollArea className="min-h-0 flex-1 px-3 py-2">
-                <div className="flex flex-col gap-2">
-                  {messages.length === 0 && (
-                    <p className="py-8 text-center text-xs text-muted-foreground">
-                      No messages yet
-                    </p>
-                  )}
-                  {messages.map((message) => (
-                    <div
-                      key={message.id}
-                      className={cn(
-                        "flex flex-col gap-0.5",
-                        message.self ? "items-end" : "items-start",
-                      )}
-                    >
-                      <span className="px-1 text-[10px] text-muted-foreground">
-                        {message.self ? "You" : message.sender}
-                      </span>
-                      <div
-                        className={cn(
-                          "max-w-[85%] rounded-2xl px-3 py-1.5 text-sm break-words",
-                          message.self
-                            ? "rounded-br-sm bg-primary text-primary-foreground"
-                            : "rounded-bl-sm bg-muted",
-                        )}
-                      >
-                        {message.text}
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              </ScrollArea>
-              <form
-                onSubmit={(event) => {
-                  event.preventDefault();
-                  sendChat(draft);
-                  setDraft("");
-                }}
-                className="flex gap-2 border-t px-3 py-2"
+              <TextField
+                size="small"
+                fullWidth
+                label="Message"
+                value={draft}
+                onChange={(event) => setDraft(event.target.value)}
+              />
+              <IconButton
+                type="submit"
+                color="primary"
+                aria-label="Send message"
+                disabled={
+                  !draft.trim() || sending || !agent.participantExternalId
+                }
               >
-                <Input
-                  aria-label="Message"
-                  placeholder="Message…"
-                  className="h-8 text-sm"
-                  value={draft}
-                  onChange={(event) => setDraft(event.target.value)}
-                />
-                <Button
-                  type="submit"
-                  size="icon"
-                  className="h-8 w-8"
-                  aria-label="Send message"
-                  disabled={!draft.trim()}
-                >
-                  <Send className="h-3.5 w-3.5" />
-                </Button>
-              </form>
-            </aside>
-          )}
-        </main>
-        <Audio source={owner.remoteAudio} onPlaybackError={playbackError} />
-      </div>
-    </TooltipProvider>
+                <Icons.Send size={20} />
+              </IconButton>
+            </Stack>
+          </Paper>
+        )}
+      </Box>
+      <Audio source={owner.remoteAudio} onPlaybackError={playbackError} />
+    </Box>
   );
 }

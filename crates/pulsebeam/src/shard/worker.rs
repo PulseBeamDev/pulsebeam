@@ -587,8 +587,6 @@ impl ShardWorker {
         if frames == SHARD_FRAME_BUDGET {
             self.tick_budget_hit("frames");
         }
-        self.core.fire_timers(now);
-
         let _ = self.udp_socket.try_recv_batch(&mut self.recv_batch);
         let _ = self.tcp_socket.try_recv_batch(&mut self.recv_batch);
         let received = self.recv_batch.len();
@@ -603,7 +601,6 @@ impl ShardWorker {
         }
 
         if self.core.poll_and_flush_dirty(
-            now,
             &mut self.udp_socket,
             &mut self.tcp_socket,
             SHARD_PARTICIPANT_BUDGET,
@@ -619,7 +616,6 @@ impl ShardWorker {
             self.tick_budget_hit("pipeline");
         }
         if self.core.poll_and_flush_dirty(
-            now,
             &mut self.udp_socket,
             &mut self.tcp_socket,
             SHARD_PARTICIPANT_BUDGET,

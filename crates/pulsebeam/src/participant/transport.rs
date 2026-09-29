@@ -491,9 +491,13 @@ impl Transport {
             destination,
             contents,
         };
-        let _ = self
+        if let Err(error) = self
             .rtc
-            .handle_input(str0m::Input::Receive(at.into(), receive));
+            .handle_input(str0m::Input::Receive(at.into(), receive))
+        {
+            metrics::counter!("participant_ingress_rtc_rejected").increment(1);
+            tracing::debug!(?error, %source, "RTC rejected ingress");
+        }
         self.rtc_needs_drain = true;
         IngressResult::Received
     }

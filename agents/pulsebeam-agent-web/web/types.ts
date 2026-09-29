@@ -250,6 +250,9 @@ export interface AgentSnapshot {
   readonly connection: ConnectionState;
   readonly generation: number | null;
   readonly participantId: string | null;
+  /** Authoritative application identities, retained during reconnection to this session. */
+  readonly participantExternalId: string | null;
+  readonly roomExternalId: string | null;
   /** Current authorization deadline, in Unix seconds. */
   readonly authorizationExpiresAt: number | null;
   readonly catalog: CatalogSnapshot;
@@ -320,6 +323,14 @@ export type AgentEvent =
       readonly streamId: number;
       readonly sequence: number;
       readonly payload: Uint8Array;
+    }
+  | {
+      readonly type: "topic-recovery-gap";
+      readonly topic: string;
+      readonly publisherId: string;
+      readonly streamId: number;
+      readonly expectedSequence: number;
+      readonly availableSequence: number;
     }
   | {
       readonly type: "topic-resynchronized";

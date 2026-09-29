@@ -14,6 +14,8 @@ use thirtyfour::testing::run_browser_test;
 const PUBLIC: &str = include_str!("contracts/observe-public.js");
 const START_PUBLIC: &str = include_str!("contracts/start-public.js");
 const LIVE: &str = include_str!("contracts/live-agent-contract.js");
+const RELIABLE_RESTART_START: &str = include_str!("contracts/reliable-restart-start.js");
+const RELIABLE_RESTART_FINISH: &str = include_str!("contracts/reliable-restart-finish.js");
 const UNIFFI: &str = include_str!("contracts/uniffi-media-contract.js");
 const LOAD: &str = include_str!("contracts/load-web.js");
 const FAILURE: &str = include_str!("contracts/initialization-failure.js");
@@ -56,6 +58,7 @@ struct Live {
     independent_rendering: bool,
     mounted_removal: bool,
     connected: bool,
+    external_identity: bool,
     discovered: bool,
     delivered: bool,
     reconnected: bool,
@@ -64,6 +67,25 @@ struct Live {
     runtime_failure_event: bool,
     close_during_local_operation: bool,
     caller_owns_track: bool,
+}
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReliableStart {
+    initial: Vec<u8>,
+    generation: u64,
+}
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReliableFinish {
+    events: Vec<ReliableEvent>,
+    late_events: Vec<Vec<u8>>,
+    no_historical_replay: bool,
+    rejoined: bool,
+}
+#[derive(Debug, Deserialize)]
+struct ReliableEvent {
+    sequence: u64,
+    payload: Vec<u8>,
 }
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -104,6 +126,7 @@ struct RemoteCatalog {
     inert_policy: bool,
     invalid_atomic: bool,
     max_physical_height: bool,
+    measured_visibility: bool,
     capacity: bool,
     hidden_floor: bool,
     mapping_not_removal: bool,
@@ -296,6 +319,7 @@ async fn remote_catalog_handles_preserve_identity_and_bound_demand() -> TestResu
                 && result.inert_policy
                 && result.invalid_atomic
                 && result.max_physical_height
+                && result.measured_visibility
                 && result.capacity
                 && result.hidden_floor
                 && result.mapping_not_removal
@@ -395,6 +419,7 @@ async fn public_agent_connects_and_delivers_remote_media() -> TestResult<()> {
             r.independent_rendering
                 && r.mounted_removal
                 && r.connected
+                && r.external_identity
                 && r.discovered
                 && r.delivered
                 && r.reconnected
@@ -410,6 +435,46 @@ async fn public_agent_connects_and_delivers_remote_media() -> TestResult<()> {
     .await
     .map_err(|e| format!("live browser contract failed: {e}").into())
 }
+#[tokio::test(flavor = "multi_thread")]
+async fn reliable_topics_recover_the_lost_tail_through_server_restart() -> TestResult<()> {
+    let destination = DestinationServer::start()?;
+    let server = StaticServer::start(root()).await?;
+    let url = server.url("tests/fixture.html");
+    let room = RoomExternalId::new("reliable-restart-contract")?;
+    let sender =
+        mint_development_token(&room, &ParticipantExternalId::new("publisher")?, u64::MAX)?;
+    let receiver =
+        mint_development_token(&room, &ParticipantExternalId::new("subscriber")?, u64::MAX)?;
+    let late = mint_development_token(&room, &ParticipantExternalId::new("late")?, u64::MAX)?;
+    let start = RELIABLE_RESTART_START
+        .replace("__SENDER_TOKEN__", &sender)
+        .replace("__RECEIVER_TOKEN__", &receiver);
+    let finish = RELIABLE_RESTART_FINISH.replace("__LATE_TOKEN__", &late);
+    run_browser_test(WebDriver::managed(capabilities()?), |driver| async move {
+        let bidi = driver.bidi().await?;
+        let context = bidi.browsing_context().top_level().await?;
+        navigate(&bidi, &context, url).await?;
+        let _: () = evaluate_json(&bidi, &context, LOAD).await?;
+        let before: ReliableStart = evaluate_json(&bidi, &context, &start).await?;
+        assert_eq!(before.initial, [1]);
+        assert!(before.generation > 0);
+        drop(destination);
+        let _: () = evaluate_json(&bidi, &context,
+            "(async () => { globalThis.__reliableRestart.sender.sendTopic('chat', 'ordered', new Uint8Array([2])); return null; })()"
+        ).await?;
+        let _restarted = DestinationServer::start()?;
+        let after: ReliableFinish = evaluate_json(&bidi, &context, &finish).await?;
+        assert!(after.rejoined);
+        assert!(after.no_historical_replay);
+        assert_eq!(after.late_events, [[4]]);
+        assert_eq!(after.events.iter().map(|event| (&event.sequence, &event.payload)).collect::<Vec<_>>(),
+            vec![(&0, &vec![1]), (&1, &vec![2]), (&2, &vec![3]), (&3, &vec![4])]);
+        Ok::<_, Box<dyn Error + Send + Sync>>(())
+    })
+    .await
+    .map_err(|e| format!("reliable restart browser contract failed: {e}").into())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn generated_media_types_run_through_bidi() -> TestResult<()> {
     let server = StaticServer::start(root()).await?;

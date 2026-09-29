@@ -45,6 +45,8 @@ interface RuntimeSnapshot {
   readonly connection: ConnectionState;
   readonly generation?: number;
   readonly participantId?: string;
+  readonly participantExternalId?: string;
+  readonly roomExternalId?: string;
   readonly authorizationExpiresAt?: number;
   readonly catalog: CatalogSnapshot;
   readonly mapping: MappingSnapshot;
@@ -83,6 +85,8 @@ function emptySnapshot(connection: ConnectionState): AgentSnapshot {
     connection,
     generation: null,
     participantId: null,
+    participantExternalId: null,
+    roomExternalId: null,
     authorizationExpiresAt: null,
     catalog: Object.freeze({
       revision: 0,
@@ -759,6 +763,8 @@ class AgentFacade implements Agent {
       connection: raw.connection,
       generation: raw.generation ?? null,
       participantId: raw.participantId ?? null,
+      participantExternalId: raw.participantExternalId ?? null,
+      roomExternalId: raw.roomExternalId ?? null,
       authorizationExpiresAt: raw.authorizationExpiresAt ?? null,
       catalog,
       mapping,
