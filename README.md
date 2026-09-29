@@ -83,18 +83,28 @@ transceiver.sender.replaceTrack(stream.getVideoTracks()[0]);
 
 const offer = await pc.createOffer();
 await pc.setLocalDescription(offer);
+if (pc.iceGatheringState !== "complete") {
+  await new Promise((resolve) => {
+    pc.addEventListener("icegatheringstatechange", function gathered() {
+      if (pc.iceGatheringState === "complete") {
+        pc.removeEventListener("icegatheringstatechange", gathered);
+        resolve();
+      }
+    });
+  });
+}
 
-const res = await fetch("http://localhost:7070/api/v1/native", {
+// WHIP publishes media without the native protobuf signaling channel.
+const res = await fetch("http://localhost:7070/api/v1/whip", {
   method: "POST",
   headers: {
     Authorization: `Bearer ${token}`,
-    "Content-Type": "application/json",
+    "Content-Type": "application/sdp",
   },
-  body: JSON.stringify({ offer: offer.sdp, manual: true }),
+  body: pc.localDescription.sdp,
 });
-
-const session = await res.json();
-await pc.setRemoteDescription({ type: "answer", sdp: session.answer });
+if (res.status !== 201) throw new Error(await res.text());
+await pc.setRemoteDescription({ type: "answer", sdp: await res.text() });
 ```
 
 ### Step 3. View the video stream

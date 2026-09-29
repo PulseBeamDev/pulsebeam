@@ -38,14 +38,18 @@ build from source with `cargo run --release -p pulsebeam`.
 
 ## Step 2 — Publish a stream
 
-A room is just a name in the URL — you never create it ahead of time. The first
-participant to POST an SDP offer to `rooms/{room}/participants` brings the room
-into existence.
+Room and participant identity come from the bearer token. Mint a development
+token for the server running with `--dev`:
 
-You don't need an SDK to try this. Paste the following into your browser's
-console to publish your webcam to a room called `demo`:
+```bash
+cargo run -q -p pulsebeam-cli -- token --room demo --participant publisher
+```
+
+This example uses WHIP, the HTTP/SDP publishing boundary. Paste it into a
+browser console on localhost or an HTTPS page that permits access to the server:
 
 ```javascript
+const token = "paste the development token here";
 const pc = new RTCPeerConnection();
 const stream = await navigator.mediaDevices.getUserMedia({ video: true });
 
@@ -63,25 +67,40 @@ transceiver.sender.replaceTrack(stream.getVideoTracks()[0]);
 
 const offer = await pc.createOffer();
 await pc.setLocalDescription(offer);
+if (pc.iceGatheringState !== "complete") {
+  await new Promise((resolve) => {
+    pc.addEventListener("icegatheringstatechange", function gathered() {
+      if (pc.iceGatheringState === "complete") {
+        pc.removeEventListener("icegatheringstatechange", gathered);
+        resolve();
+      }
+    });
+  });
+}
 
-// The entire join handshake is a single HTTP request — no WebSocket.
-const res = await fetch("http://localhost:7070/api/v1/rooms/demo/participants", {
+const res = await fetch("http://localhost:7070/api/v1/whip", {
   method: "POST",
-  headers: { "Content-Type": "application/sdp" },
-  body: offer.sdp,
+  headers: {
+    Authorization: `Bearer ${token}`,
+    "Content-Type": "application/sdp",
+  },
+  body: pc.localDescription.sdp,
 });
-
+if (res.status !== 201) throw new Error(await res.text());
 await pc.setRemoteDescription({ type: "answer", sdp: await res.text() });
 ```
 
-You just used the whole connection protocol: `POST` an offer, get an answer
-back, done. Everything after this — which streams you want, at what resolution —
-flows over the WebRTC data channel, not more HTTP calls.
+WHIP publishes this video under the label `video`. It does not use native
+Catalog, Intent or Mapping messages. Native SDK clients instead create a
+connection through `/api/v1/native` and reconcile media over the reliable ordered
+`v1/sys/signaling` data channel.
 
 ## Step 3 — Watch it
 
-Open the [viewer on CodePen](https://codepen.io/lherman-cs/pen/pvgVZar) and join
-the room `demo`. Your webcam feed should appear.
+Connect a current PulseBeam SDK or Meet client to this server with a token for
+room `demo` and a distinct participant identity. Select the publisher's `video`
+track from its remote catalog. Old clients using the previous signaling schema
+are not compatible.
 
 ## Where to go next
 

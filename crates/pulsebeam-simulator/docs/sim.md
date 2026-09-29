@@ -84,7 +84,7 @@ The workspace wire contract is
 
 - `Intent` is a complete replacement of desired send and receive state.
   Repeating it must be idempotent; omitting a video request withdraws it, and
-  `active=false` stops a publication without releasing its reserved sender.
+  omitting a send entry stops publication without releasing its reserved sender.
 - `Catalog` begins with a complete snapshot and advances through ordered
   participant/track deltas. Each track has a stable canonical ID, kind, label,
   and owning participant. Removing a track is terminal for its receive desire.
@@ -128,9 +128,9 @@ claim over these sets:
 6. **Client roster.** Every observer eventually knows every expected live
    publication in its room and no publication in another room. After removal,
    the exact old set is gone; safety-only checks are insufficient.
-7. **Client bindings.** Each video mid has at most one current binding and each
-   audio mid has at most one current occupant. Every binding names a live
-   publication of the right kind, and an empty binding group is observable.
+7. **Client bindings.** Each negotiated receiver index has at most one current
+   assignment, and each track is assigned to at most one receiver. Every assignment
+   names a current Catalog track of the right kind; empty Mapping sections are observable.
 8. **User-visible result.** Every intended recipient receives the correct
    origin/lane according to that lane’s loss policy. A positive assertion must
    prove traffic moved; a negative assertion must prove the bystander did not
