@@ -70,5 +70,11 @@ name = "browser"
 path = "tests/browser.rs"
 required-features = ["browser-tests"]
 
+# Invoked by the Meet owner's slow gate against its real static export.
+[[test]]
+name = "meet"
+path = "tests/meet.rs"
+required-features = ["browser-tests"]
+
 [lints]
 workspace = true

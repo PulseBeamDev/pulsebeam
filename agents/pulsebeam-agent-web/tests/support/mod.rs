@@ -374,7 +374,11 @@ fn static_path(root: &Path, target: &str) -> Option<PathBuf> {
     {
         return None;
     }
-    Some(root.join(relative))
+    Some(root.join(if relative.as_os_str().is_empty() {
+        Path::new("index.html")
+    } else {
+        relative
+    }))
 }
 fn content_type(path: &Path) -> &'static str {
     match path.extension().and_then(|extension| extension.to_str()) {

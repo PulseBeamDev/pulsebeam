@@ -21,8 +21,9 @@ check: format-check
 test-fast:
     @:
 
-test-slow:
-    @:
+# Run the real static app using the shared Web browser driver and owned server.
+test-slow: build
+    cd ../.. && cargo test -p pulsebeam-agent-web --features browser-tests --test meet meet_leave_releases_capture_and_transport -- --test-threads=1
 
 # Install only after the direct React dependency has prepared its owned assets.
 prepare:
