@@ -43,6 +43,32 @@ const unsubscribeEvents = agent.subscribeEvents((event) => {
 });
 ```
 
+For direct browser integration, local logical tracks reserve sender slots by
+kind and label, independent of capture ownership. `connect()` and
+`disconnect()` change desired connection state synchronously. A handle may
+borrow a typed capture source without taking ownership of the native track:
+
+```ts
+import { createCaptureSource } from "@pulsebeam/web";
+
+const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+const source = createCaptureSource(stream.getVideoTracks()[0], "video");
+const camera = agent.localVideoTrack("camera");
+camera.setSource(source);
+agent.connect();
+// Later: disconnect without ending capture, or detach without releasing the label.
+agent.disconnect();
+camera.setSource(null);
+stream.getTracks().forEach((track) => track.stop());
+agent.close();
+```
+
+`localAudioTrack(label)` reserves a separate audio namespace; repeated lookups
+return the same handle. Capacity exhaustion throws `LocalTrackCapacityError`
+with `kind`, `label`, and `capacity`, even after clearing a source. Another
+Agent may borrow the same source. `@pulsebeam/react` owns capture and Agent
+lifecycle for typical React applications.
+
 `createAgent()` is synchronous and safe to call while its private WASM module
 is still initializing. The facade retains only the latest complete desired
 state during initialization and then gives it to the browser runtime. Omitted
@@ -58,7 +84,8 @@ supports up to 32 media sections. A publication's label is bound to its sender
 slot on first use and cannot be changed or reused for another slot of the same
 kind during the Agent lifetime.
 
-Use `replaceLocalTrack` and `setLocalMuted` for reserved local slots. The
+Low-level integrations can use `replaceLocalTrack` and `setLocalMuted` for
+reserved local slots. The
 runtime validates media kinds and sender settings. Omitted or empty encoding
 settings enable the runtime's default three-layer video or single-layer audio
 sender configuration; explicit video and audio settings contain three and one
@@ -72,6 +99,21 @@ Logging is configured independently for each agent with `logging.level`.
 Messages use the browser console. The default level is `warn`. Chrome hides
 `debug` and `trace` console messages unless Verbose output is enabled.
 
+The catalog-backed `agent.remoteVideoTracks` and `agent.remoteAudioTracks`
+expose stable handles with external participant identity, media kind, and
+application label. `agent.remoteAudio` is one Agent-owned aggregate playback
+source. A remote video handle's `setReceiveOptions({ minHeight, minFps,
+priority, playoutDelay })` replaces its policy, but does not request media
+until a video element is attached. `attachRemoteVideo(handle, video)` observes
+visible layout in physical pixels, shares the maximum demand across elements,
+and detaches on `close()`. Hidden or off-screen elements do not reserve a
+receiver, even with a minimum-height policy. Excess visible tracks remain
+unmapped and warn rather than evict existing visible consumers or grow the
+fixed topology. `attachRemoteAudio(agent.remoteAudio, audio)` plays only that
+Agent's currently mapped audio and detaches on `close()`; connection alone
+does not create playback. These helpers are the non-React counterpart of
+`@pulsebeam/react`'s `<Video>` and `<Audio>` components.
+
 Snapshots keep `catalog` (revision, participants, publications) separate from
 `mapping` (accepted Intent revision and receiver-index bindings). Publications
 remain discoverable independently of whether media is currently bound. Available
@@ -80,10 +122,25 @@ publication ID; offer-specific MIDs remain private to the host. Snapshot records
 and collections are immutable and retain identity until an observable update;
 platform track objects themselves are not frozen.
 
-Topics support `latest` and `ordered` registrations and sends. Event
-subscriptions preserve message bytes plus publisher, stream, and sequence
-metadata, and distinguish admission, drop, resynchronization, channel failure,
-and agent failure events. Send admission is not a delivery acknowledgment.
+Typed topics register only when used:
+
+```ts
+const chat = agent.topic<{ text: string }>("chat", { mode: "reliable" });
+await chat.publish({ text: "hello" });
+const controller = new AbortController();
+for await (const message of chat.subscribe({ signal: controller.signal })) {
+  render(message.text);
+}
+```
+
+`reliable` uses ordered delivery; `unreliable` uses latest-value delivery.
+Each subscription has its own bounded queue; ending iteration or aborting
+releases its interest. Messages use UTF-8 JSON and payloads over 64 KiB are
+rejected before sending. Lower-level `latest`/`ordered` registrations and
+sends remain available through `setState()`/`sendTopic()`. Event subscriptions
+preserve message bytes plus publisher, stream, and sequence metadata, and
+distinguish admission, drop, resynchronization, channel failure, and agent
+failure events. Send admission is not a delivery acknowledgment.
 
 `reconnect()` delegates to the runtime's reconnect operation and retains the
 complete desired state. Explicit video and pinned-audio policies are per track;

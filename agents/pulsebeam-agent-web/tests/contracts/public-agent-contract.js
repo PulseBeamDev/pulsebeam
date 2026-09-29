@@ -54,6 +54,93 @@ globalThis.__pulsebeamPublic = (async () => {
 
   const canvas = document.createElement("canvas");
   const track = canvas.captureStream(1).getVideoTracks()[0];
+  const handleAgent = window.pulsebeam.createAgent({
+    endpoint: location.origin,
+    token: "handle-token",
+    topology: { localVideos: 1, localAudios: 1 },
+  });
+  const videoHandle = handleAgent.localVideoTrack("camera");
+  const sameVideoHandle = handleAgent.localVideoTrack("camera");
+  const audioHandle = handleAgent.localAudioTrack("camera");
+  const capture = window.pulsebeam.createCaptureSource(track, "video");
+  let capacity;
+  try {
+    handleAgent.localVideoTrack("screen");
+  } catch (error) {
+    capacity = error;
+  }
+  let handleChanges = 0;
+  const unsubscribeHandle = videoHandle.subscribe(() => {
+    handleChanges += 1;
+  });
+  videoHandle.setSource(capture);
+  let wrongLabelRejected = false;
+  try {
+    handleAgent.setState({
+      connected: false,
+      publications: [{ slot: "v0", label: "screen", active: true }],
+    });
+  } catch (error) {
+    wrongLabelRejected = error instanceof TypeError;
+  }
+  handleAgent.disconnect();
+  videoHandle.setSource(null);
+  videoHandle.setSource(capture);
+  const sourceRetained = videoHandle.source === capture;
+  unsubscribeHandle();
+  handleAgent.close();
+  let closedHandleRejected = false;
+  try {
+    videoHandle.setSource(capture);
+  } catch (error) {
+    closedHandleRejected = error.message === "agent is closed";
+  }
+  const dual = window.pulsebeam.createAgent({
+    endpoint: location.origin,
+    token: "dual-handle-token",
+    topology: { localVideos: 2 },
+  });
+  const dualCamera = dual.localVideoTrack("camera");
+  const dualScreen = dual.localVideoTrack("screen");
+  dual.connect();
+  dual.disconnect();
+  dualScreen.setSource(capture);
+  dualScreen.setSource(null);
+  let exhaustedAfterClearing;
+  try {
+    dual.localVideoTrack("aux");
+  } catch (error) {
+    exhaustedAfterClearing = error;
+  }
+  let invalidLabelRejected = false;
+  try {
+    dual.localVideoTrack("ü".repeat(33));
+  } catch (error) {
+    invalidLabelRejected = error instanceof TypeError;
+  }
+  const retainedBindings =
+    dual.localVideoTrack("screen") === dualScreen &&
+    dual.localVideoTrack("camera") === dualCamera &&
+    exhaustedAfterClearing?.kind === "video" &&
+    exhaustedAfterClearing.label === "aux" &&
+    exhaustedAfterClearing.capacity === 2 &&
+    invalidLabelRejected;
+  dual.close();
+  const localHandles =
+    retainedBindings &&
+    videoHandle === sameVideoHandle &&
+    audioHandle.kind === "audio" &&
+    audioHandle.label === "camera" &&
+    capacity?.name === "LocalTrackCapacityError" &&
+    capacity.kind === "video" &&
+    capacity.label === "screen" &&
+    capacity.capacity === 1 &&
+    wrongLabelRejected &&
+    handleChanges === 3 &&
+    sourceRetained &&
+    videoHandle.source === null &&
+    closedHandleRejected &&
+    track.readyState === "live";
   await first.replaceLocalTrack("v0", track, {
     contentHint: "motion",
     encodings: [],
@@ -69,20 +156,26 @@ globalThis.__pulsebeamPublic = (async () => {
 
   const events = [];
   const removeEvents = first.subscribeEvents((event) => events.push(event));
-  first.setState({
-    connected: false,
-    video: [
-      {
-        slot: -1,
-        trackId: "invalid-slot",
-        height: 720,
-        minHeight: 180,
-        minFps: 15,
-        priority: 100,
-      },
-    ],
-  });
+  let invalidStateRejected = false;
+  try {
+    first.setState({
+      connected: false,
+      video: [
+        {
+          slot: -1,
+          trackId: "invalid-slot",
+          height: 720,
+          minHeight: 180,
+          minFps: 15,
+          priority: 100,
+        },
+      ],
+    });
+  } catch (error) {
+    invalidStateRejected = /invalid desired state/.test(error.message);
+  }
   const serializationFailureNonterminal =
+    invalidStateRejected &&
     first.getSnapshot().connection !== "terminal-failure" &&
     first.getSnapshot().failure === null;
   first.setState({
@@ -181,6 +274,7 @@ globalThis.__pulsebeamPublic = (async () => {
       ),
     closeBeforeSettlement: second.getSnapshot().connection === "disconnected",
     localOperations: muted && unmuted,
+    localHandles,
     validationRejected,
     scopedLogging: silentValidationRejected && scopedLogging,
     serializationFailureNonterminal,

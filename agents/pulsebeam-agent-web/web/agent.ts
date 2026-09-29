@@ -1,3 +1,9 @@
+import {
+  nativeCaptureTrack,
+  type CapturedAudioTrack,
+  type CapturedTrack,
+  type CapturedVideoTrack,
+} from "./capture-source.js";
 import type {
   Agent,
   AgentConfig,
@@ -8,17 +14,27 @@ import type {
   CatalogSnapshot,
   ConnectionState,
   LogLevel,
+  LocalAudioTrack,
+  LocalVideoTrack,
   MediaTopology,
   MappingSnapshot,
   Participant,
   Publication,
   RemoteTrack,
+  RemoteAudioSource,
+  RemoteAudioTrack,
+  RemoteVideoTrack,
   SenderConfig,
+  Topic,
   TopicMode,
+  TopicRegistration,
+  VideoDemand,
   TopicPublisherStatus,
   TopicSnapshot,
   TopicSubscriberStatus,
 } from "./types.js";
+import { RemoteCatalog } from "./remote-catalog.js";
+import { TopicRegistry } from "./topic.js";
 import { BrowserRuntime, whenInitialized } from "./wasm.js";
 
 type Runtime = InstanceType<typeof BrowserRuntime>;
@@ -226,6 +242,53 @@ function freezeTopicSnapshot(topics: TopicSnapshot): TopicSnapshot {
   });
 }
 
+export class LocalTrackCapacityError extends RangeError {
+  readonly kind: "video" | "audio";
+  readonly label: string;
+  readonly capacity: number;
+
+  constructor(kind: "video" | "audio", label: string, capacity: number) {
+    super(`no reserved ${kind} slot remains for ${label}`);
+    this.name = "LocalTrackCapacityError";
+    this.kind = kind;
+    this.label = label;
+    this.capacity = capacity;
+  }
+}
+
+class LocalTrackHandle<K extends "video" | "audio", S extends CapturedTrack> {
+  #source: S | null = null;
+  #listeners = new Set<() => void>();
+
+  constructor(
+    readonly kind: K,
+    readonly label: string,
+    private readonly apply: (source: S | null) => void,
+  ) {}
+
+  get source(): S | null {
+    return this.#source;
+  }
+
+  setSource(source: S | null): void {
+    if (source === this.#source) return;
+    this.apply(source);
+    this.#source = source;
+    for (const listener of this.#listeners) listener();
+  }
+
+  subscribe(listener: () => void): () => void {
+    this.#listeners.add(listener);
+    return () => this.#listeners.delete(listener);
+  }
+
+  clear(): void {
+    this.#source = null;
+    for (const listener of this.#listeners) listener();
+    this.#listeners.clear();
+  }
+}
+
 class AgentFacade implements Agent {
   #snapshot: AgentSnapshot = emptySnapshot("disconnected");
   #listeners = new Set<() => void>();
@@ -234,12 +297,54 @@ class AgentFacade implements Agent {
   #runtime: Runtime | undefined;
   #localOperations = new Map<string, Promise<void>>();
   #localTracks = new Map<string, MediaStreamTrack>();
+  #localVideoHandles = new Map<
+    string,
+    LocalTrackHandle<"video", CapturedVideoTrack>
+  >();
+  #localAudioHandles = new Map<
+    string,
+    LocalTrackHandle<"audio", CapturedAudioTrack>
+  >();
+  #reservedSlots = new Map<string, string>();
+  readonly #remote: RemoteCatalog;
+  readonly #topics: TopicRegistry;
+  #managedVideo: readonly VideoDemand[] = [];
+  #managedAudio = false;
+  #managedTopics: readonly TopicRegistration[] = [];
+  readonly #topology: Required<MediaTopology>;
   #pendingToken: string | undefined;
   #closed = false;
   readonly #ready: Promise<Runtime>;
 
   constructor(config: AgentConfig) {
     const runtimeConfig = copyConfig(config);
+    this.#topology = runtimeConfig.topology;
+    this.#remote = new RemoteCatalog(
+      this,
+      this.#topology.remoteVideos,
+      (video, audio) => {
+        if (
+          JSON.stringify(this.#managedVideo) === JSON.stringify(video) &&
+          this.#managedAudio === audio
+        )
+          return;
+        this.#managedVideo = video;
+        this.#managedAudio = audio;
+        this.#applyState(this.#state);
+      },
+    );
+    this.#topics = new TopicRegistry(
+      this,
+      async (name, mode, payload) => {
+        const runtime = await this.#ready;
+        this.#requireCurrentRuntime(runtime);
+        runtime.send_topic(name, mode, payload);
+      },
+      (topics) => {
+        this.#managedTopics = topics;
+        this.#applyState(this.#state);
+      },
+    );
     this.#ready = whenInitialized()
       .catch((error: unknown) => {
         this.#terminalFailure("initialization", message(error));
@@ -266,7 +371,9 @@ class AgentFacade implements Agent {
             runtime.renew_authorization(this.#pendingToken);
             this.#pendingToken = undefined;
           }
-          runtime.replace_desired(desiredValue(this.#state));
+          runtime.replace_desired(
+            desiredValue(this.#effectiveState(this.#state)),
+          );
         } catch (error) {
           this.#terminalFailure("invalid-configuration", message(error));
           runtime.abort();
@@ -279,6 +386,25 @@ class AgentFacade implements Agent {
         return runtime;
       });
     void this.#ready.catch(() => {});
+  }
+
+  get remoteVideoTracks(): readonly RemoteVideoTrack[] {
+    return this.#remote.videoTracks;
+  }
+
+  get remoteAudioTracks(): readonly RemoteAudioTrack[] {
+    return this.#remote.audioTracks;
+  }
+
+  get remoteAudio(): RemoteAudioSource {
+    return this.#remote.audioSource;
+  }
+
+  topic<T>(
+    name: string,
+    options: { readonly mode: "reliable" | "unreliable" },
+  ): Topic<T> {
+    return this.#topics.topic(name, options);
   }
 
   readonly getSnapshot = (): AgentSnapshot => this.#snapshot;
@@ -307,16 +433,142 @@ class AgentFacade implements Agent {
     };
   };
 
+  localVideoTrack(label: string): LocalVideoTrack {
+    return this.#localHandle(
+      "video",
+      label,
+      this.#localVideoHandles,
+      this.#topology.localVideos,
+    );
+  }
+
+  localAudioTrack(label: string): LocalAudioTrack {
+    return this.#localHandle(
+      "audio",
+      label,
+      this.#localAudioHandles,
+      this.#topology.localAudios,
+    );
+  }
+
+  #localHandle<K extends "video" | "audio", S extends CapturedTrack>(
+    kind: K,
+    label: string,
+    handles: Map<string, LocalTrackHandle<K, S>>,
+    capacity: number,
+  ): LocalTrackHandle<K, S> {
+    if (this.#closed) throw new Error("agent is closed");
+    if (
+      typeof label !== "string" ||
+      !label ||
+      new TextEncoder().encode(label).length > 64
+    )
+      throw new TypeError("invalid local track label");
+    const existing = handles.get(label);
+    if (existing) return existing;
+    if (!Number.isSafeInteger(capacity) || handles.size >= capacity) {
+      throw new LocalTrackCapacityError(kind, label, capacity);
+    }
+    const slot = `${kind === "video" ? "v" : "a"}${handles.size}`;
+    if (
+      this.#state.publications?.some((publication) => publication.slot === slot)
+    ) {
+      throw new TypeError(`reserved ${kind} slot ${slot} is already in use`);
+    }
+    const handle = new LocalTrackHandle<K, S>(kind, label, (source) =>
+      this.#setLocalSource(kind, slot, label, source),
+    );
+    handles.set(label, handle);
+    this.#reservedSlots.set(slot, label);
+    return handle;
+  }
+
+  #setLocalSource(
+    kind: "video" | "audio",
+    slot: string,
+    label: string,
+    source: CapturedTrack | null,
+  ): void {
+    if (this.#closed) throw new Error("agent is closed");
+    const track = source === null ? null : nativeCaptureTrack(source, kind);
+    this.setState({
+      ...this.#state,
+      publications: [
+        ...(this.#state.publications ?? []).filter(
+          (publication) => publication.slot !== slot,
+        ),
+        ...(track ? [{ slot, label, active: true }] : []),
+      ],
+    });
+    void this.replaceLocalTrack(
+      slot,
+      track,
+      kind === "video" ? { contentHint: "motion" } : { contentHint: "speech" },
+    ).catch(() => {});
+  }
+
+  connect(): void {
+    if (this.#closed) throw new Error("agent is closed");
+    if (!this.#state.connected)
+      this.setState({ ...this.#state, connected: true });
+  }
+
+  disconnect(): void {
+    if (this.#closed) throw new Error("agent is closed");
+    if (this.#state.connected)
+      this.setState({ ...this.#state, connected: false });
+  }
+
   setState(state: AgentState): void {
     if (this.#closed) return;
     validatePlayoutDelay(state);
-    const next = copyState(state);
-    if (this.#runtime) {
-      this.#runtime.replace_desired(desiredValue(next));
+    for (const publication of state.publications ?? []) {
+      const reserved = this.#reservedSlots.get(publication.slot);
+      if (reserved !== undefined && reserved !== publication.label) {
+        throw new TypeError(
+          `slot ${publication.slot} is reserved for ${reserved}`,
+        );
+      }
     }
+    this.#applyState(copyState(state));
+  }
+
+  #effectiveState(state: AgentState): AgentState {
+    const usedSlots = new Set((state.video ?? []).map(({ slot }) => slot));
+    const topics = new Map<string, TopicRegistration>();
+    for (const topic of state.topics ?? [])
+      topics.set(`${topic.mode}:${topic.name}`, topic);
+    for (const topic of this.#managedTopics) {
+      const key = `${topic.mode}:${topic.name}`;
+      const prior = topics.get(key);
+      topics.set(key, {
+        ...prior,
+        ...topic,
+        publish: !!(prior?.publish || topic.publish),
+        subscribe: !!(prior?.subscribe || topic.subscribe),
+      });
+    }
+    return {
+      ...state,
+      video: [
+        ...(state.video ?? []),
+        ...this.#managedVideo.filter(({ slot }) => !usedSlots.has(slot)),
+      ],
+      audio: {
+        ...state.audio,
+        automatic: this.#managedAudio || state.audio?.automatic,
+      },
+      topics: [...topics.values()],
+    };
+  }
+
+  #applyState(state: AgentState): void {
+    if (this.#closed) return;
+    const next = copyState(state);
+    if (this.#runtime)
+      this.#runtime.replace_desired(desiredValue(this.#effectiveState(next)));
     this.#state = next;
-    if (!this.#runtime) {
-      if (this.#snapshot.connection === "terminal-failure") return;
+    if (!this.#runtime && this.#snapshot.connection !== "terminal-failure") {
       this.#publish(
         Object.freeze({
           ...this.#snapshot,
@@ -392,9 +644,16 @@ class AgentFacade implements Agent {
       runtime.close();
       runtime.abort();
     }
+    this.#topics.close();
+    this.#remote.close();
     this.#state = copyState({ connected: false });
     this.#localOperations.clear();
     this.#localTracks.clear();
+    for (const handle of this.#localVideoHandles.values()) handle.clear();
+    for (const handle of this.#localAudioHandles.values()) handle.clear();
+    this.#localVideoHandles.clear();
+    this.#localAudioHandles.clear();
+    this.#reservedSlots.clear();
     this.#publish(emptySnapshot("disconnected"));
     this.#listeners.clear();
     this.#eventListeners.clear();
@@ -498,21 +757,21 @@ class AgentFacade implements Agent {
         media,
       });
     }
-    this.#publish(
-      Object.freeze({
-        version: raw.version,
-        desiredRevision: raw.desiredRevision,
-        connection: raw.connection,
-        generation: raw.generation ?? null,
-        participantId: raw.participantId ?? null,
-        authorizationExpiresAt: raw.authorizationExpiresAt ?? null,
-        catalog,
-        mapping,
-        tracks: Object.freeze(tracks),
-        topics: freezeTopicSnapshot(raw.topics),
-        failure: raw.failure ? Object.freeze({ ...raw.failure }) : null,
-      }),
-    );
+    const next: AgentSnapshot = Object.freeze({
+      version: raw.version,
+      desiredRevision: raw.desiredRevision,
+      connection: raw.connection,
+      generation: raw.generation ?? null,
+      participantId: raw.participantId ?? null,
+      authorizationExpiresAt: raw.authorizationExpiresAt ?? null,
+      catalog,
+      mapping,
+      tracks: Object.freeze(tracks),
+      topics: freezeTopicSnapshot(raw.topics),
+      failure: raw.failure ? Object.freeze({ ...raw.failure }) : null,
+    });
+    this.#remote.update(next);
+    this.#publish(next);
   }
 
   #runtimeEvent(raw: unknown): void {
