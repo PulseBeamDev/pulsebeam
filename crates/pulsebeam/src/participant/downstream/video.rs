@@ -333,6 +333,23 @@ impl VideoAllocator {
         slot: &mut Slot,
         intent: Option<&Intent>,
     ) -> Option<()> {
+        let previous_assignment = slot.assignment;
+        let mut resume_gate = slot.resume_gate;
+        if intent.is_some_and(|intent| {
+            (
+                slot.max_height,
+                slot.min_height,
+                slot.min_fps,
+                slot.priority,
+            ) != (
+                intent.target_height,
+                intent.min_height,
+                intent.min_fps,
+                intent.priority,
+            )
+        }) {
+            resume_gate.affordable = None;
+        }
         slot.assignment = intent
             .map(|request| request.track_id)
             .filter(|track_id| track_handles.contains_key(track_id));
@@ -407,7 +424,15 @@ impl VideoAllocator {
             slot.min_fps = intent.min_fps;
             slot.priority = intent.priority;
             if let Some(layer) = layer {
-                slot.switch_to(&layer, false);
+                if resume_gate.required && slot.assignment == previous_assignment {
+                    if slot.target() != Some(&layer) {
+                        resume_gate.affordable = None;
+                    }
+                    slot.pause_at(&layer);
+                    slot.resume_gate = resume_gate;
+                } else {
+                    slot.switch_to(&layer, false);
+                }
             } else if let Some(layer) = track_state.lowest_quality() {
                 slot.pause_at(layer);
             } else {
@@ -558,6 +583,7 @@ impl VideoAllocator {
     /// afterwards, which is why it is reported rather than inferred.
     pub fn update_allocations(
         &mut self,
+        now: Instant,
         available_bandwidth: Bitrate,
     ) -> (Bitrate, bool, Option<Bitrate>) {
         let available_bandwidth = available_bandwidth.max(MIN_ESTIMATE).min(MAX_BANDWIDTH);
@@ -590,7 +616,13 @@ impl VideoAllocator {
         // deterministic — no re-reads from concurrent StreamMonitor::poll() writes.
         let states = self.snapshot_states();
         let engine = AllocationEngine::new(&views, &states);
-        let decisions = engine.run_compute(available_bandwidth, &views);
+        let mut resume_gates: SecondaryMap<_, _> = self
+            .slots
+            .iter()
+            .map(|(key, slot)| (key, slot.resume_gate))
+            .collect();
+        let decisions =
+            engine.run_compute_with_resume(available_bandwidth, &views, now, &mut resume_gates);
         let desired_raw = engine.run_desired(&views);
         self.current_allocation = AllocationEngine::used_bitrate(&decisions);
         let desired = self
@@ -634,6 +666,9 @@ impl VideoAllocator {
                 continue;
             };
 
+            if let Some(gate) = resume_gates.get(key) {
+                slot.resume_gate = *gate;
+            }
             match decision {
                 AllocationDecision::Forward(layer, _) => {
                     changed |= slot.switch_to(layer, false);
@@ -925,6 +960,44 @@ enum SlotState {
     Switching,
 }
 
+// A resumed stream needs several feedback cycles of affordable residual budget.
+// Initial activation bypasses this dwell; congestion shedding remains immediate.
+const RESUME_DWELL: Duration = Duration::from_secs(2);
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ResumeGate {
+    required: bool,
+    affordable: Option<(StreamId, DecodeTargetSelection, Instant)>,
+}
+
+impl ResumeGate {
+    fn admit(
+        &mut self,
+        now: Instant,
+        candidate: Option<(StreamId, DecodeTargetSelection)>,
+    ) -> bool {
+        if !self.required {
+            return true;
+        }
+        let Some((stream, target)) = candidate else {
+            self.affordable = None;
+            return false;
+        };
+        let since = match self.affordable {
+            Some((previous_stream, previous_target, since))
+                if previous_stream == stream && previous_target == target =>
+            {
+                since
+            }
+            _ => {
+                self.affordable = Some((stream, target, now));
+                now
+            }
+        };
+        now.saturating_duration_since(since) >= RESUME_DWELL
+    }
+}
+
 struct Slot {
     ctx: LogCtx,
     ssrc: Ssrc,
@@ -948,6 +1021,7 @@ struct Slot {
     min_fps: u32,
     priority: u32,
     paused: bool,
+    resume_gate: ResumeGate,
 
     /// Number of PLI retries sent for the current staging layer.
     staging_keyframe_retries: u32,
@@ -977,6 +1051,7 @@ impl Slot {
             min_fps: 0,
             priority: 0,
             paused: true,
+            resume_gate: ResumeGate::default(),
 
             staging_keyframe_retries: 0,
             staging_keyframe_last_at: None,
@@ -1083,6 +1158,7 @@ impl Slot {
     }
 
     fn switch_to(&mut self, new_layer: &TrackLayer, force: bool) -> bool {
+        self.resume_gate = ResumeGate::default();
         let mut changed = false;
         let is_track_change = self
             .desired
@@ -1142,6 +1218,8 @@ impl Slot {
     fn stop(&mut self) {
         plog_debug!(self.ctx, mid=%self.mid, "slot stopped");
         self.desired = None;
+        self.paused = true;
+        self.resume_gate = ResumeGate::default();
         self.switcher.stop();
         self.pli_reset();
     }
@@ -1167,6 +1245,10 @@ impl Slot {
         }
 
         if !self.paused {
+            self.resume_gate = ResumeGate {
+                required: true,
+                affordable: None,
+            };
             self.paused = true;
             changed = true;
             plog_debug!(self.ctx, mid=%self.mid, target=?layer.stream_id(), "slot paused");
@@ -1773,10 +1855,21 @@ impl AllocationEngine {
     /// the same priority order, one genuine upgrade per call so send-rate rises
     /// gradually enough for BWE to track it.
     ///
-    pub fn run_compute<'a>(
+    #[cfg(test)]
+    fn run_compute<'a>(
         &self,
         bwe: Bitrate,
         slots: &'a [SlotView<'a>],
+    ) -> SecondaryMap<DownstreamSlotKey, AllocationDecision<'a>> {
+        self.run_compute_with_resume(bwe, slots, Instant::now(), &mut SecondaryMap::new())
+    }
+
+    fn run_compute_with_resume<'a>(
+        &self,
+        bwe: Bitrate,
+        slots: &'a [SlotView<'a>],
+        now: Instant,
+        resume_gates: &mut SecondaryMap<DownstreamSlotKey, ResumeGate>,
     ) -> SecondaryMap<DownstreamSlotKey, AllocationDecision<'a>> {
         debug_assert!(
             slots.is_sorted_by(|a, b| Self::priority_order(a, b).is_le()),
@@ -1798,14 +1891,14 @@ impl AllocationEngine {
         // lower-priority stream, so a lower-priority floor never preempts a
         // higher-priority target.
         //
-        // Stability comes from the inputs, not from damping the output or holding a
-        // timer: budget math uses the *stable* declared layer bitrate
+        // Budget math uses the *stable* declared layer bitrate
         // (`stable_cost`), so a variable-bitrate neighbour cannot bounce the
         // arithmetic, and each layer transition uses an asymmetric threshold — a
         // Schmitt dead-band — so a budget merely wobbling at a layer boundary does
         // not flip it. Real congestion still lands immediately: it shows up as a
         // lower `bwe`, and the very next allocation sheds.
         for slot in slots {
+            let budget_before = budget;
             let mut cur: Option<&TrackLayer> = None;
             let mut degraded: Option<(DecodeTargetSelection, f64)> = None;
 
@@ -1822,12 +1915,21 @@ impl AllocationEngine {
                 } else {
                     cost
                 };
+                let temporal_budget =
+                    if resuming && resume_gates.get(slot.key).is_some_and(|gate| gate.required) {
+                        (budget - reserve).max(0.0)
+                    } else {
+                        budget
+                    };
                 if threshold <= budget {
                     budget -= cost;
                     cur = Some(floor);
-                } else if let Some((target, dt_cost)) =
-                    self.best_affordable_decode_target(floor, budget, slot.min_fps, slot.min_height)
-                {
+                } else if let Some((target, dt_cost)) = self.best_affordable_decode_target(
+                    floor,
+                    temporal_budget,
+                    slot.min_fps,
+                    slot.min_height,
+                ) {
                     budget -= dt_cost;
                     cur = Some(floor);
                     degraded = Some((target, dt_cost));
@@ -1877,6 +1979,22 @@ impl AllocationEngine {
                 if cost <= budget {
                     budget -= cost;
                     cur = Some(lowest);
+                }
+            }
+
+            if !slot.forwarding
+                && let Some(gate) = resume_gates.get_mut(slot.key)
+            {
+                let candidate = cur.filter(|_| budget >= reserve).map(|layer| {
+                    (
+                        layer.stream_id(),
+                        degraded.map_or(DecodeTargetSelection::Full, |(target, _)| target),
+                    )
+                });
+                if !gate.admit(now, candidate) {
+                    budget = budget_before;
+                    cur = None;
+                    degraded = None;
                 }
             }
 
@@ -2147,6 +2265,205 @@ mod assignment_tests {
     }
 
     #[test]
+    fn congestion_resume_requires_sustained_residual_budget() {
+        let (tx, built, mut states) = video_track_with_states(
+            ParticipantId::new(),
+            Mid::from("v0"),
+            vec![SimulcastLayer::new("f")],
+        );
+        let track = Track::video(tx.meta, built.layers().to_vec(), None);
+        let high = track.by_quality(LayerQuality::High).unwrap();
+        state_of_mut(&mut states, high)
+            .update_for_test()
+            .bitrate(2_000_000);
+        let mut keys: SlotMap<DownstreamSlotKey, ()> = SlotMap::with_key();
+        let focused = keys.insert(());
+        let background = keys.insert(());
+        let views = [
+            SlotView {
+                key: focused,
+                mid: Mid::from("s0"),
+                max_height: 720,
+                min_height: 720,
+                min_fps: 0,
+                priority: 200,
+                track: &track,
+                current_quality: LayerQuality::High,
+                forwarding: true,
+            },
+            SlotView {
+                key: background,
+                mid: Mid::from("s1"),
+                max_height: 720,
+                min_height: 720,
+                min_fps: 0,
+                priority: 10,
+                track: &track,
+                current_quality: LayerQuality::High,
+                forwarding: false,
+            },
+        ];
+        let engine = AllocationEngine::new(&views, &states);
+        let mut gates = SecondaryMap::new();
+        gates.insert(
+            background,
+            ResumeGate {
+                required: true,
+                affordable: None,
+            },
+        );
+        let start = Instant::now();
+        let demand = engine.run_desired(&views);
+        // Peaks fit both streams, but the intervening residual only fits the focus.
+        for (millis, bandwidth) in [
+            (0, 4_500_000),
+            (500, 4_500_000),
+            (1_000, 3_000_000),
+            (2_000, 4_500_000),
+            (3_000, 4_500_000),
+        ] {
+            let decisions = engine.run_compute_with_resume(
+                Bitrate::from(bandwidth),
+                &views,
+                start + Duration::from_millis(millis),
+                &mut gates,
+            );
+            assert!(matches!(
+                decisions.get(background),
+                Some(AllocationDecision::Pause(_, _))
+            ));
+            assert!(matches!(
+                decisions.get(focused),
+                Some(AllocationDecision::Forward(_, _))
+            ));
+            assert_eq!(
+                AllocationEngine::used_bitrate(&decisions),
+                Bitrate::from(2_000_000)
+            );
+            assert_eq!(engine.run_desired(&views), demand);
+        }
+        let recovered = engine.run_compute_with_resume(
+            Bitrate::from(4_500_000),
+            &views,
+            start + Duration::from_secs(4),
+            &mut gates,
+        );
+        assert!(matches!(
+            recovered.get(background),
+            Some(AllocationDecision::Forward(_, _))
+        ));
+        assert_eq!(
+            AllocationEngine::used_bitrate(&recovered),
+            Bitrate::from(4_000_000)
+        );
+
+        // New subscriptions do not pay the congestion recovery dwell.
+        gates.insert(background, ResumeGate::default());
+        let initial =
+            engine.run_compute_with_resume(Bitrate::from(4_500_000), &views, start, &mut gates);
+        assert!(matches!(
+            initial.get(background),
+            Some(AllocationDecision::Forward(_, _))
+        ));
+    }
+
+    #[test]
+    fn congestion_resume_selects_temporal_target_with_reserve() {
+        let (tx, built, mut states) = video_track_with_states(
+            ParticipantId::new(),
+            Mid::from("v0"),
+            vec![SimulcastLayer::new("f")],
+        );
+        let focus = Track::video(tx.meta, built.layers().to_vec(), None);
+        let focus_layer = focus.by_quality(LayerQuality::High).unwrap();
+        state_of_mut(&mut states, focus_layer)
+            .update_for_test()
+            .bitrate(820_000);
+        let (tx, built, background_states) = video_track_with_states(
+            ParticipantId::new(),
+            Mid::from("v1"),
+            vec![SimulcastLayer::new("f")],
+        );
+        states.extend(background_states);
+        let background = Track::video(tx.meta, built.layers().to_vec(), None);
+        let background_layer = background.by_quality(LayerQuality::High).unwrap();
+        let state = state_of_mut(&mut states, background_layer);
+        state.update_for_test().bitrate(300_000);
+        state.set_decode_target_count(3);
+        state.decode_target_kbps = [50, 150, 300];
+        state.decode_target_heights = [720; 3];
+
+        let mut keys: SlotMap<DownstreamSlotKey, ()> = SlotMap::with_key();
+        let focused_key = keys.insert(());
+        let background_key = keys.insert(());
+        let views = [
+            SlotView {
+                key: focused_key,
+                mid: Mid::from("s0"),
+                max_height: 720,
+                min_height: 720,
+                min_fps: 0,
+                priority: 200,
+                track: &focus,
+                current_quality: LayerQuality::High,
+                forwarding: true,
+            },
+            SlotView {
+                key: background_key,
+                mid: Mid::from("s1"),
+                max_height: 720,
+                min_height: 720,
+                min_fps: 0,
+                priority: 10,
+                track: &background,
+                current_quality: LayerQuality::High,
+                forwarding: false,
+            },
+        ];
+        let engine = AllocationEngine::new(&views, &states);
+        let mut gates = SecondaryMap::new();
+        gates.insert(
+            background_key,
+            ResumeGate {
+                required: true,
+                affordable: None,
+            },
+        );
+        let start = Instant::now();
+        for millis in [0, 1_000, 2_000] {
+            let decisions = engine.run_compute_with_resume(
+                Bitrate::from(1_000_000),
+                &views,
+                start + Duration::from_millis(millis),
+                &mut gates,
+            );
+            if millis < 2_000 {
+                assert!(matches!(
+                    decisions.get(background_key),
+                    Some(AllocationDecision::Pause(_, _))
+                ));
+            } else {
+                assert!(matches!(
+                    decisions.get(background_key),
+                    Some(AllocationDecision::ForwardTarget(
+                        _,
+                        DecodeTargetSelection::Target(0),
+                        _
+                    ))
+                ));
+                assert_eq!(
+                    AllocationEngine::used_bitrate(&decisions),
+                    Bitrate::from(870_000)
+                );
+            }
+            assert_eq!(
+                gates[background_key].affordable.unwrap().1,
+                DecodeTargetSelection::Target(0)
+            );
+        }
+    }
+
+    #[test]
     fn retained_layer_uses_the_wider_downgrade_dead_band() {
         let pid = ParticipantId::new();
         let (tx, built, mut states) = video_track_with_states(
@@ -2342,6 +2659,53 @@ mod assignment_tests {
 
         allocator.configure(&intents);
         assert_eq!(allocator.slots().count(), 3);
+    }
+
+    #[test]
+    fn reconfiguration_preserves_congestion_pause_and_resets_changed_policy_dwell() {
+        let mut allocator = setup_allocator();
+        let tracks = add_tracks(&mut allocator, 2);
+        add_slots(&mut allocator, 1);
+        let mid = Mid::from("s0");
+        let mut intents = HashMap::from_iter([(
+            mid,
+            Intent {
+                track_id: tracks.ids[0],
+                target_height: 720,
+                min_height: 0,
+                min_fps: 0,
+                priority: 0,
+            },
+        )]);
+        allocator.configure(&intents);
+        let slot = allocator.slots.values_mut().next().unwrap();
+        let layer = slot.target().unwrap().clone();
+        slot.pause_at(&layer);
+        let start = Instant::now();
+        assert!(!slot.resume_gate.admit(
+            start,
+            Some((layer.stream_id(), DecodeTargetSelection::Full))
+        ));
+
+        allocator.configure(&intents);
+        let slot = allocator.slots.values().next().unwrap();
+        assert!(slot.paused && slot.resume_gate.required);
+        assert_eq!(slot.resume_gate.affordable.unwrap().2, start);
+
+        intents.get_mut(&mid).unwrap().priority = 200;
+        allocator.configure(&intents);
+        let slot = allocator.slots.values().next().unwrap();
+        assert!(slot.paused && slot.resume_gate.required);
+        assert!(slot.resume_gate.affordable.is_none());
+
+        intents.get_mut(&mid).unwrap().track_id = tracks.ids[1];
+        allocator.configure(&intents);
+        let slot = allocator.slots.values().next().unwrap();
+        assert!(!slot.paused && !slot.resume_gate.required);
+
+        allocator.configure(&HashMap::new());
+        let slot = allocator.slots.values().next().unwrap();
+        assert!(slot.paused && !slot.resume_gate.required);
     }
 
     #[test]
@@ -2728,7 +3092,8 @@ mod assignment_tests {
         let _tracks = add_tracks(&mut allocator, 1);
         add_slots(&mut allocator, 1);
 
-        let (desired, _, _) = allocator.update_allocations(Bitrate::from(5_000_000));
+        let (desired, _, _) =
+            allocator.update_allocations(Instant::now(), Bitrate::from(5_000_000));
         assert!(desired.as_f64() > 0.0);
         assert!(allocator.current_allocation().as_f64() > 0.0);
         assert!(allocator.current_allocation() <= desired);
