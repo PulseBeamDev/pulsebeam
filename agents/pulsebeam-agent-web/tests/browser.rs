@@ -133,6 +133,7 @@ struct React {
     playback_retained: bool,
     playback_latest_callback: bool,
     capture_devices: bool,
+    committed_render_isolation: bool,
     capture_replacement: bool,
     capture_fencing: bool,
     capture_display: bool,
@@ -432,6 +433,7 @@ async fn react_provider_contract_runs_through_bidi() -> TestResult<()> {
                 && r.playback_retained
                 && r.playback_latest_callback
                 && r.capture_devices
+                && r.committed_render_isolation
                 && r.capture_replacement
                 && r.capture_fencing
                 && r.capture_display

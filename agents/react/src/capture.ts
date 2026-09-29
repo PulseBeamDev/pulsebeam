@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCommittedRef } from "./committed-ref.js";
 import {
   createCaptureSource,
   type CapturedAudioTrack,
@@ -166,8 +167,7 @@ function useCapture(
   const current = useRef<Session | null>(null);
   const generation = useRef(0);
   const mounted = useRef(false);
-  const optionsRef = useRef(options);
-  optionsRef.current = options;
+  const optionsRef = useCommittedRef(options);
   const signature = JSON.stringify(options);
   const requestedSignature = useRef<string | null>(null);
 

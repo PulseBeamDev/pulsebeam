@@ -1,11 +1,13 @@
 import * as api from "@pulsebeam/react";
 import { runAcquisitionContract } from "./acquisition.js";
+import { runConcurrencyContract } from "./concurrency.js";
 import { runOwnershipContract } from "./ownership.js";
 import { runPlaybackContract } from "./playback.js";
 
 const observation = {
   removedLegacySurface: !("AgentProvider" in api) && !("useRemoteMedia" in api),
   captureDevices: false,
+  committedRenderIsolation: false,
   capturePendingOptions: false,
   captureReplacement: false,
   captureFencing: false,
@@ -34,6 +36,7 @@ declare global {
 void (async () => {
   try {
     Object.assign(observation, await runAcquisitionContract());
+    Object.assign(observation, await runConcurrencyContract());
     Object.assign(observation, await runOwnershipContract());
     Object.assign(observation, await runPlaybackContract());
   } catch (error) {
