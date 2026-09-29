@@ -87,7 +87,7 @@
     await new Promise((resolve, reject) => {
       const deadline = setTimeout(() => reject(new Error(`evidence timeout: ${state.trace.join(",")}`)), 20000);
       const check = () => {
-        if (state.pc.connectionState === "connected" && state.browserReceivedData && state.remoteTrackUnmuted) {
+        if (state.pc.connectionState === "connected" && state.browserReceivedData && state.remoteTrackUnmuted && state.channels.length >= 3) {
           clearTimeout(deadline);
           resolve();
         }
