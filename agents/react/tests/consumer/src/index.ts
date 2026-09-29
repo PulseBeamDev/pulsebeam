@@ -1,40 +1,27 @@
 import {
-  createAgent,
-  useRemoteMedia,
+  useAgent,
+  useUserMedia,
+  Video,
+  Audio,
   type Agent,
   type AgentConfig,
-  type AgentState,
-  type PlaybackFailure,
-  type RemoteMediaAttachment,
-  type RemoteMediaAttachmentOptions,
+  type PlaybackError,
 } from "@pulsebeam/react";
-import type { RefObject } from "react";
-
-declare const element: RefObject<HTMLMediaElement | null>;
-declare const attachment: RemoteMediaAttachment;
 
 const config: AgentConfig = {
   endpoint: "https://pulsebeam.example",
   token: "opaque-token",
   topology: { localVideos: 1, localAudios: 1 },
 };
-const agent: Agent = createAgent(config);
-const state: AgentState = {
-  connected: false,
-  publications: [],
-  video: [],
-  audio: { automatic: true },
-  topics: [],
-};
-
-agent.setState(state);
-const playbackOptions: RemoteMediaAttachmentOptions = {
-  publicationIds: ["remote-camera"],
-  onPlaybackBlocked: (failure: PlaybackFailure, retry) => {
-    void failure;
-    void retry();
-  },
-};
-void useRemoteMedia(agent, element, playbackOptions).retryPlayback();
-void attachment.retryPlayback();
-agent.close();
+const agent: Agent | null = useAgent(config);
+const camera = useUserMedia({ video: true, audio: false });
+if (agent) {
+  agent.localVideoTrack("camera").setSource(camera.videoTrack);
+  Video({
+    source: agent.remoteVideoTracks[0] ?? null,
+    onPlaybackError: (failure: PlaybackError) => void failure.retry(),
+  });
+  Audio({ source: agent.remoteAudio });
+  agent.connect();
+  agent.disconnect();
+}

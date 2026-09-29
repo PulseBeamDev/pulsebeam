@@ -1,4 +1,4 @@
-import { StrictMode } from "react";
+import { StrictMode, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { Audio, Video, createAgent } from "@pulsebeam/react";
 import type { LocalVideoTrack, PlaybackError } from "@pulsebeam/react";
@@ -37,13 +37,25 @@ export async function runPlaybackContract() {
     },
   } satisfies LocalVideoTrack;
   let blocked: PlaybackError | undefined;
-  root.render(
-    <StrictMode>
+  let callbackVersion = 0;
+  let updateCallback!: () => void;
+  function Preview() {
+    const [version, setVersion] = useState(1);
+    updateCallback = () => setVersion(2);
+    return (
       <Video
         source={local}
         mirror
-        onPlaybackError={(failure) => (blocked = failure)}
+        onPlaybackError={(failure) => {
+          blocked = failure;
+          callbackVersion = version;
+        }}
       />
+    );
+  }
+  root.render(
+    <StrictMode>
+      <Preview />
     </StrictMode>,
   );
   await waitFor(
@@ -67,6 +79,13 @@ export async function runPlaybackContract() {
       : Promise.resolve();
   };
   try {
+    updateCallback();
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    const playbackRetained =
+      host.querySelector("video") === firstElement &&
+      firstElement.srcObject === firstStream &&
+      listeners.size === 1 &&
+      attempts === 0;
     local.setSource(createCaptureSource(second, "video"));
     await waitFor(
       () =>
@@ -130,6 +149,8 @@ export async function runPlaybackContract() {
       localPreview,
       replaced,
       playbackError,
+      playbackRetained,
+      playbackLatestCallback: callbackVersion === 2,
       detached,
       capturedPreview,
       audioExplicit,

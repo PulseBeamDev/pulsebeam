@@ -37,9 +37,11 @@ function Camera({ config }: { config: AgentConfig }) {
     camera.setSource(capture.videoTrack);
     return () => camera.setSource(null);
   }, [agent, capture.videoTrack]);
-  return <button onClick={() => void capture.request().catch(console.error)}>
-    {capture.state === "requesting" ? "Requesting…" : "Choose camera"}
-  </button>;
+  return (
+    <button onClick={() => void capture.request().catch(console.error)}>
+      {capture.state === "requesting" ? "Requesting…" : "Choose camera"}
+    </button>
+  );
 }
 ```
 
@@ -50,19 +52,31 @@ on visible element size; unmount releases demand. Audio playback is explicit:
 ```tsx
 import { Audio, Video, useAgent, type AgentConfig } from "@pulsebeam/react";
 
-function Room({ config, onPlaybackError }: {
+function Room({
+  config,
+  onPlaybackError,
+}: {
   config: AgentConfig;
   onPlaybackError: (error: unknown, retry: () => Promise<void>) => void;
 }) {
   const agent = useAgent(config);
   if (!agent) return null;
-  return <>
-    {agent.remoteVideoTracks.map((track) =>
-      <Video key={`${track.participantId}:${track.label}`}
-        source={track} mirror={false} className="participant" />)}
-    <Audio source={agent.remoteAudio}
-      onPlaybackError={({ error, retry }) => onPlaybackError(error, retry)} />
-  </>;
+  return (
+    <>
+      {agent.remoteVideoTracks.map((track) => (
+        <Video
+          key={`${track.participantId}:${track.label}`}
+          source={track}
+          mirror={false}
+          className="participant"
+        />
+      ))}
+      <Audio
+        source={agent.remoteAudio}
+        onPlaybackError={({ error, retry }) => onPlaybackError(error, retry)}
+      />
+    </>
+  );
 }
 ```
 
@@ -86,8 +100,8 @@ Local handle labels and slots are reserved for the Agent's lifetime; exhausting
 capacity throws `LocalTrackCapacityError` synchronously.
 
 For low-level integration, `createAgent(config)` returns a caller-owned Agent.
-`AgentProvider` and zero-argument `useAgent()` consume such an Agent but do not
-initialize or close it. `setState()`, raw track operations and `useRemoteMedia()`
-remain escape hatches; they are not needed for acquisition or Agent ownership.
+React ownership uses only `useAgent(config)`; playback uses `<Video>` and
+`<Audio>` with source handles. There is no provider-based ownership adapter or
+raw media attachment hook.
 The package build prepares the internal web runtime and WASM asset, without an
 application dependency on `@pulsebeam/web`.

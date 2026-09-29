@@ -129,21 +129,9 @@ struct UniFfi {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct React {
-    snapshot_identity: bool,
-    updates: bool,
-    forwarding: bool,
-    topic_subscription: bool,
-    replacement: bool,
-    missing_provider: bool,
-    unmount: bool,
-    caller_owned: bool,
-    strict_mode: bool,
+    removed_legacy_surface: bool,
     playback_retained: bool,
-    playback_selection: bool,
     playback_latest_callback: bool,
-    playback_replacement: bool,
-    playback_unmount: bool,
-    playback_strict_mode: bool,
     capture_devices: bool,
     capture_replacement: bool,
     capture_fencing: bool,
@@ -440,21 +428,9 @@ async fn react_provider_contract_runs_through_bidi() -> TestResult<()> {
         navigate(&bidi, &context, url).await?;
         let r: React = evaluate_json(&bidi, &context, REACT).await?;
         assert!(
-            r.snapshot_identity
-                && r.updates
-                && r.forwarding
-                && r.topic_subscription
-                && r.replacement
-                && r.missing_provider
-                && r.unmount
-                && r.caller_owned
-                && r.strict_mode
+            r.removed_legacy_surface
                 && r.playback_retained
-                && r.playback_selection
                 && r.playback_latest_callback
-                && r.playback_replacement
-                && r.playback_unmount
-                && r.playback_strict_mode
                 && r.capture_devices
                 && r.capture_replacement
                 && r.capture_fencing
