@@ -7,6 +7,113 @@
     peers.add(this);
     return originalAddTransceiver.apply(this, args);
   };
+  const relays = new WeakMap();
+  const relayFailures = [];
+  const originalSetRemoteDescription =
+    RTCPeerConnection.prototype.setRemoteDescription;
+  RTCPeerConnection.prototype.setRemoteDescription = async function (
+    description,
+  ) {
+    try {
+      // Remove TCP alternatives so ICE cannot bypass the UDP observation path.
+      const lines = description.sdp
+        .split(/\r?\n/)
+        .filter(
+          (line) =>
+            !line.startsWith("a=candidate:") ||
+            line.split(/\s+/)[2]?.toLowerCase() !== "tcp",
+        );
+      const candidates = lines.filter((line) =>
+        line.startsWith("a=candidate:"),
+      );
+      if (
+        description.type !== "answer" ||
+        candidates.length === 0 ||
+        !lines.includes("a=ice-lite") ||
+        relays.has(this)
+      ) {
+        throw new Error(
+          "packet observation requires one candidate-bearing answer per peer",
+        );
+      }
+      const destinations = candidates
+        .map((line) => {
+          const fields = line.split(/\s+/);
+          if (
+            fields[1] !== "1" ||
+            fields[2].toLowerCase() !== "udp" ||
+            !/^(?:\d+\.\d+\.\d+\.\d+|[a-f0-9]*:[a-f0-9:]+)$/i.test(fields[4]) ||
+            fields[7] !== "host"
+          ) {
+            throw new Error(`unsupported relay candidate: ${line}`);
+          }
+          return fields[4].includes(":") ? null : `${fields[4]}:${fields[5]}`;
+        })
+        .filter(Boolean);
+      const ids = new Set(
+        lines.flatMap((line) => {
+          const match = line.match(
+            /^a=extmap:(\d+)(?:\/\w+)? http:\/\/www.webrtc.org\/experiments\/rtp-hdrext\/playout-delay$/,
+          );
+          return match ? [Number(match[1])] : [];
+        }),
+      );
+      if (ids.size !== 1)
+        throw new Error(`ambiguous negotiated playout extension: ${[...ids]}`);
+      const extension = [...ids][0];
+      const destination =
+        destinations.find((value) => value.startsWith("127.0.0.1:")) ??
+        destinations[0];
+      if (!destination)
+        throw new Error("packet relay requires an IPv4 server candidate");
+      // Rewrite every route, including IPv6 candidates, to the same local relay.
+      const response = await fetch(
+        `/__test/rtp-relay?destination=${destination}&extension=${extension}`,
+      );
+      if (!response.ok) throw new Error(await response.text());
+      const relay = await response.json();
+      relays.set(this, relay);
+      const sdp = lines
+        .map((line) => {
+          if (!line.startsWith("a=candidate:")) return line;
+          const fields = line.split(/\s+/);
+          fields[4] = relay.address;
+          fields[5] = String(relay.port);
+          return fields.join(" ");
+        })
+        .join("\r\n");
+      return await originalSetRemoteDescription.call(this, {
+        type: description.type,
+        sdp,
+      });
+    } catch (error) {
+      relayFailures.push(String(error));
+      throw error;
+    }
+  };
+  const packetEvidence = async (peer, receiver) => {
+    const relay = relays.get(peer);
+    if (!relay) throw new Error("receiver has no packet relay");
+    const stats = await receiver.getStats();
+    const inbound = [...stats.values()].filter(
+      (entry) => entry.type === "inbound-rtp" && entry.kind === "video",
+    );
+    if (inbound.length !== 1)
+      throw new Error(`expected one inbound video SSRC, got ${inbound.length}`);
+    for (let attempt = 0; attempt < 100; attempt++) {
+      const response = await fetch(
+        `/__test/rtp-relay/${relay.id}/${inbound[0].ssrc}`,
+      );
+      if (!response.ok) throw new Error(await response.text());
+      const observation = await response.json();
+      if (observation.packets >= 4)
+        return { relay: relay.id, ssrc: inbound[0].ssrc, ...observation };
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    throw new Error(
+      `no captured RTP for relay ${relay.id}, SSRC ${inbound[0].ssrc}`,
+    );
+  };
   const peerForTrack = (track) =>
     [...peers].find((peer) =>
       peer.getReceivers().some((receiver) => receiver.track === track),
@@ -38,7 +145,11 @@
     new Promise((resolve, reject) => {
       const timeout = setTimeout(() => {
         remove();
-        reject(new Error(`timed out waiting for ${label}`));
+        reject(
+          new Error(
+            `timed out waiting for ${label}: ${JSON.stringify({ relayFailures, failure: agent.getSnapshot().failure })}`,
+          ),
+        );
       }, 20000);
       const inspect = () => {
         const snapshot = agent.getSnapshot();
@@ -209,6 +320,7 @@
       `no decoded fixed-policy frames: initial=${initialFrames} final=${fixedFrames}`,
     );
   }
+  const fixedRtp = await packetEvidence(oldPeer, oldReceiver);
   const receiverEvents = [];
   const removeReceiverEvents = receiver.subscribeEvents((event) => {
     if (event.type !== "topic-message") receiverEvents.push(event.type);
@@ -286,6 +398,7 @@
     await new Promise((resolve) => setTimeout(resolve, 100));
     restored = await restoredStats();
   }
+  const defaultRtp = await packetEvidence(newPeer, newReceiver);
   const defaultRecreated =
     restored.packets >= restoredInitial.packets + 4 &&
     restored.frames >= restoredInitial.frames + 2 &&
@@ -303,6 +416,8 @@
     newTrack.readyState === "live";
   oldPeer?.removeEventListener("track", countStaleOnTrack);
   RTCPeerConnection.prototype.addTransceiver = originalAddTransceiver;
+  RTCPeerConnection.prototype.setRemoteDescription =
+    originalSetRemoteDescription;
 
   secondReceiver.setState({ connected: true });
   const secondConnected = await waitFor(
@@ -479,6 +594,8 @@
     delivered: delivered.tracks[publication.id].kind === "video",
     reconnected: reconnected.tracks[publication.id].kind === "video",
     defaultRecreated,
+    fixedRtp,
+    defaultRtp,
     topicMetadata:
       receivedTopic.publisherId === senderConnected.participantId &&
       receivedTopic.streamId > 0 &&

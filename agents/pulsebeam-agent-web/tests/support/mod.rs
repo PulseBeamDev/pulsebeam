@@ -1,11 +1,26 @@
+#[allow(
+    clippy::disallowed_types,
+    reason = "test-only UDP observations are shared with owned HTTP handlers, never with production shards"
+)]
+mod rtp_relay;
+
 use std::env;
 use std::error::Error;
 use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+#[allow(
+    clippy::disallowed_types,
+    reason = "owned live HTTP fixture shares its state across handler tasks"
+)]
 use std::sync::Arc;
+#[allow(
+    clippy::disallowed_types,
+    reason = "independent fixture WASM request counter, not a multi-atomic snapshot"
+)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use rtp_relay::Relays;
 use serde::de::DeserializeOwned;
 use thirtyfour::ChromeCapabilities;
 use thirtyfour::bidi::BrowsingContextId;
@@ -14,7 +29,8 @@ use thirtyfour::prelude::*;
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::task::JoinHandle;
+use tokio::sync::Mutex;
+use tokio::task::{JoinHandle, JoinSet};
 
 pub type TestResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -22,6 +38,10 @@ pub struct DestinationServer {
     child: Child,
 }
 impl DestinationServer {
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "synchronous owned-process startup polling before browser traffic, never a production shard"
+    )]
     pub fn start() -> TestResult<Self> {
         if std::net::TcpStream::connect("127.0.0.1:7070").is_ok() {
             return Err("refusing to use an existing PulseBeam listener on 127.0.0.1:7070; browser contracts require an owned destination server".into());
@@ -72,11 +92,19 @@ impl Drop for DestinationServer {
     }
 }
 
+#[allow(
+    clippy::disallowed_types,
+    reason = "owned HTTP fixture shares relay state and one independent request counter across handler tasks"
+)]
 pub struct StaticServer {
     address: String,
     task: JoinHandle<()>,
     wasm_requests: Arc<AtomicUsize>,
 }
+#[allow(
+    clippy::disallowed_types,
+    reason = "owned HTTP fixture shares relay state and one independent request counter across handler tasks"
+)]
 impl StaticServer {
     pub async fn start(root: impl Into<PathBuf>) -> io::Result<Self> {
         Self::start_with_wasm_failure(root, false).await
@@ -90,13 +118,22 @@ impl StaticServer {
         let root = root.into();
         let wasm_requests = Arc::new(AtomicUsize::new(0));
         let request_count = Arc::clone(&wasm_requests);
+        let relays = Arc::new(Mutex::new(Relays::default()));
         let task = tokio::spawn(async move {
-            while let Ok((stream, _)) = listener.accept().await {
-                let root = root.clone();
-                let request_count = Arc::clone(&request_count);
-                tokio::spawn(async move {
-                    let _ = serve(stream, &root, fail_wasm, &request_count).await;
-                });
+            let mut connections = JoinSet::new();
+            loop {
+                tokio::select! {
+                    accepted = listener.accept() => {
+                        let Ok((stream, _)) = accepted else { break };
+                        let root = root.clone();
+                        let request_count = Arc::clone(&request_count);
+                        let relays = Arc::clone(&relays);
+                        connections.spawn(async move {
+                            let _ = serve(stream, &root, fail_wasm, &request_count, &relays).await;
+                        });
+                    }
+                    _ = connections.join_next(), if !connections.is_empty() => {}
+                }
             }
         });
         Ok(Self {
@@ -208,11 +245,16 @@ fn remote_value(value: &serde_json::Value) -> serde_json::Value {
         _ => inner.clone(),
     }
 }
+#[allow(
+    clippy::disallowed_types,
+    reason = "borrows the fixture's independent WASM request counter"
+)]
 async fn serve(
     mut stream: TcpStream,
     root: &Path,
     fail_wasm: bool,
     wasm_requests: &AtomicUsize,
+    relays: &Mutex<Relays>,
 ) -> io::Result<()> {
     let mut request = [0_u8; 16 * 1024];
     let length = stream.read(&mut request).await?;
@@ -251,6 +293,48 @@ async fn serve(
         )
         .await;
     }
+    if let Some(query) = target.strip_prefix("/__test/rtp-relay?") {
+        let fields: std::collections::HashMap<_, _> = query
+            .split('&')
+            .filter_map(|field| field.split_once('='))
+            .collect();
+        let destination = fields
+            .get("destination")
+            .and_then(|value| value.parse().ok());
+        let extension = fields
+            .get("extension")
+            .and_then(|value| value.parse::<u8>().ok())
+            .filter(|value| *value > 0);
+        let (Some(destination), Some(extension)) = (destination, extension) else {
+            return respond(
+                &mut stream,
+                503,
+                "text/plain",
+                b"invalid relay destination or extension",
+                method,
+            )
+            .await;
+        };
+        let result = relays.lock().await.allocate(destination, extension).await;
+        return respond_relay(&mut stream, result, method).await;
+    }
+    if let Some(path) = target.strip_prefix("/__test/rtp-relay/") {
+        let keys = path
+            .split_once('/')
+            .and_then(|(id, ssrc)| Some((id.parse::<usize>().ok()?, ssrc.parse::<u32>().ok()?)));
+        let Some((id, ssrc)) = keys else {
+            return respond(
+                &mut stream,
+                503,
+                "text/plain",
+                b"invalid relay observation key",
+                method,
+            )
+            .await;
+        };
+        let result = relays.lock().await.observation(id, ssrc).await;
+        return respond_relay(&mut stream, result, method).await;
+    }
     let Some(path) = static_path(root, target) else {
         return respond(&mut stream, 404, "text/plain", b"not found", method).await;
     };
@@ -262,6 +346,26 @@ async fn serve(
         Err(error) => Err(error),
     }
 }
+async fn respond_relay(
+    stream: &mut TcpStream,
+    result: io::Result<Vec<u8>>,
+    method: &str,
+) -> io::Result<()> {
+    match result {
+        Ok(body) => respond(stream, 200, "application/json", &body, method).await,
+        Err(error) => {
+            respond(
+                stream,
+                503,
+                "text/plain",
+                error.to_string().as_bytes(),
+                method,
+            )
+            .await
+        }
+    }
+}
+
 fn static_path(root: &Path, target: &str) -> Option<PathBuf> {
     let relative = Path::new(target.split('?').next()?.trim_start_matches('/'));
     if relative
