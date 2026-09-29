@@ -2,7 +2,7 @@ import * as api from "@pulsebeam/react";
 import { runAcquisitionContract } from "./acquisition.js";
 import { runConcurrencyContract } from "./concurrency.js";
 import { runOwnershipContract } from "./ownership.js";
-import { runPlaybackContract } from "./playback.js";
+import { runAutoplayContract, runPlaybackContract } from "./playback.js";
 
 const observation = {
   removedLegacySurface: !("AgentProvider" in api) && !("useRemoteMedia" in api),
@@ -26,6 +26,7 @@ const observation = {
   playbackLatestCallback: false,
   detached: false,
   audioExplicit: false,
+  autoplayRespected: false,
   playbackProbeError: "",
 };
 
@@ -39,6 +40,7 @@ void (async () => {
     Object.assign(observation, await runConcurrencyContract());
     Object.assign(observation, await runOwnershipContract());
     Object.assign(observation, await runPlaybackContract());
+    Object.assign(observation, await runAutoplayContract());
   } catch (error) {
     observation.playbackProbeError = String(error);
   }

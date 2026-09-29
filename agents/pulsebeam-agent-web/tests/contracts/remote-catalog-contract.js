@@ -203,6 +203,17 @@
         ? Promise.reject(new DOMException("blocked", "NotAllowedError"))
         : Promise.resolve();
     };
+    const manual = attachRemoteAudio(catalog.audioSource, player, undefined, {
+      autoPlay: false,
+    });
+    const manuallyAttached =
+      attempts === 0 &&
+      audioDemand &&
+      player.srcObject.getAudioTracks().includes(voice);
+    await manual.retryPlayback();
+    const manuallyRetried = attempts === 1;
+    manual.close();
+    attempts = 0;
     let blocked;
     const audio = attachRemoteAudio(
       catalog.audioSource,
@@ -215,6 +226,8 @@
     for (const listener of listeners) listener();
     await until(() => blocked !== undefined);
     audioExplicit =
+      manuallyAttached &&
+      manuallyRetried &&
       audioDemand &&
       player.srcObject instanceof MediaStream &&
       player.srcObject.getAudioTracks().includes(voice);
