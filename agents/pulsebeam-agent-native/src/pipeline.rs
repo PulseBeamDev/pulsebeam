@@ -326,13 +326,18 @@ impl JitterBuffer {
         true
     }
 
+    #[cfg(test)]
     fn next_deadline(&self) -> Option<Instant> {
+        self.next_deadline_with_wait(self.max_wait)
+    }
+
+    fn next_deadline_with_wait(&self, max_wait: Duration) -> Option<Instant> {
         let (&sequence, head) = self.buf.first_key_value()?;
         let budget = match self.next {
-            None => self.initial_wait,
+            None => self.initial_wait.min(max_wait),
             Some(next) if next == sequence => Duration::ZERO,
-            Some(_) if self.delivered_frame => self.max_wait,
-            Some(_) => self.initial_wait,
+            Some(_) if self.delivered_frame => max_wait,
+            Some(_) => self.initial_wait.min(max_wait),
         };
         head.arrival.checked_add(budget)
     }
@@ -344,6 +349,10 @@ impl JitterBuffer {
     /// Release the next in-order packet that is ready, or `None` while still
     /// waiting for it to arrive (up to `max_wait` from the head packet's arrival).
     pub fn pop(&mut self) -> Option<RtpPacket> {
+        self.pop_with_wait(self.max_wait)
+    }
+
+    fn pop_with_wait(&mut self, max_wait: Duration) -> Option<RtpPacket> {
         let now = self.latest_arrival?;
         let next = match self.next {
             Some(n) => n,
@@ -352,7 +361,8 @@ impl JitterBuffer {
                 // `initial_wait`, not the gap budget: this is "how late can the real first packet
                 // be", not "how long to hope a lost packet is retransmitted".
                 let (&min_seq, min_pkt) = self.buf.iter().next()?;
-                if now.saturating_duration_since(min_pkt.arrival) < self.initial_wait {
+                if now.saturating_duration_since(min_pkt.arrival) < self.initial_wait.min(max_wait)
+                {
                     return None;
                 }
                 min_seq
@@ -375,9 +385,9 @@ impl JitterBuffer {
         // after the first one the buffer committed to, and the viewer sat blank for 5s of loss
         // budget before showing anything - on a link configured with no loss at all.
         let budget = if self.delivered_frame {
-            self.max_wait
+            max_wait
         } else {
-            self.initial_wait
+            self.initial_wait.min(max_wait)
         };
         let (_, head_pkt) = self.buf.first_key_value()?;
         if now.saturating_duration_since(head_pkt.arrival) < budget {
@@ -412,6 +422,7 @@ impl JitterBuffer {
 /// stream using the DD's per-packet start/end-of-frame flags.
 pub struct FrameReceiver {
     jitter: JitterBuffer,
+    frame_wait: BTreeMap<MediaTime, Duration>,
     frame_data: Vec<u8>,
     frame_first_seq: Option<u64>,
     frame_last_seq: Option<u64>,
@@ -462,6 +473,7 @@ impl FrameReceiver {
     fn with_max_wait_and_codec(max_wait: Duration, h264: bool) -> Self {
         Self {
             jitter: JitterBuffer::new(max_wait),
+            frame_wait: BTreeMap::new(),
             frame_data: Vec::new(),
             frame_first_seq: None,
             frame_last_seq: None,
@@ -478,14 +490,17 @@ impl FrameReceiver {
         self.awaiting_keyframe
     }
 
-    pub fn set_max_wait(&mut self, max_wait: Duration) {
-        self.jitter.max_wait = max_wait;
-        self.jitter.initial_wait = DEFAULT_INITIAL_COMMIT_WAIT.min(max_wait);
-    }
-
     /// Feed one RTP packet; returns any frames that became ready (0+). Frames may
     /// be released now or on a later push once the jitter buffer's delay elapses.
     pub fn push(&mut self, rtp: RtpPacket) -> Vec<MediaFrame> {
+        self.push_with_max_wait(rtp, None)
+    }
+
+    pub fn push_with_max_wait(
+        &mut self,
+        rtp: RtpPacket,
+        max_wait: Option<Duration>,
+    ) -> Vec<MediaFrame> {
         if !self.has_keyframe
             && let Some(raw) = rtp.ext_vals.user_values.get::<RawDependencyDescriptor>()
             && read_mandatory(&raw.0)
@@ -494,12 +509,29 @@ impl FrameReceiver {
         {
             self.awaiting_keyframe = true;
         }
-        self.jitter.push(rtp);
+        let timestamp = rtp.ts;
+        if self.jitter.push(rtp) {
+            if self.frame_wait.len() >= MAX_JITTER_BUFFER_PACKETS {
+                self.frame_wait.pop_first();
+            }
+            self.frame_wait
+                .entry(timestamp)
+                .or_insert(max_wait.unwrap_or(self.jitter.max_wait));
+        }
         self.pop_ready()
     }
 
+    fn head_wait(&self) -> Duration {
+        self.jitter
+            .buf
+            .first_key_value()
+            .and_then(|(_, packet)| self.frame_wait.get(&packet.ts))
+            .copied()
+            .unwrap_or(self.jitter.max_wait)
+    }
+
     pub fn next_deadline(&self) -> Option<Instant> {
-        self.jitter.next_deadline()
+        self.jitter.next_deadline_with_wait(self.head_wait())
     }
 
     pub fn advance(&mut self, now: Instant) -> Vec<MediaFrame> {
@@ -509,8 +541,13 @@ impl FrameReceiver {
 
     fn pop_ready(&mut self) -> Vec<MediaFrame> {
         let mut frames = Vec::new();
-        while let Some(ordered) = self.jitter.pop() {
+        loop {
+            let wait = self.head_wait();
+            let Some(ordered) = self.jitter.pop_with_wait(wait) else {
+                break;
+            };
             if let Some(frame) = self.reassemble(ordered) {
+                self.frame_wait.remove(&frame.ts);
                 self.jitter.note_frame_delivered();
                 if frame.is_keyframe {
                     self.has_keyframe = true;
