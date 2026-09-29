@@ -586,6 +586,15 @@ impl FrameReceiver {
             return None;
         }
 
+        if self.h264_depacketizer.is_some()
+            && self
+                .frame_last_seq
+                .or(self.prev_last_seq)
+                .is_some_and(|previous| seq != previous.saturating_add(1))
+        {
+            self.awaiting_keyframe = true;
+        }
+
         let raw = rtp.ext_vals.user_values.get::<RawDependencyDescriptor>();
 
         // Boundaries come from the DD when present. A packet without a DD (e.g.
@@ -1006,6 +1015,64 @@ mod tests {
         assert_eq!(frames.len(), 1);
         assert!(frames[0].is_keyframe);
         assert!(!receiver.needs_keyframe());
+    }
+
+    #[test]
+    fn h264_loss_requests_recovery_until_a_keyframe_arrives() {
+        let keyframe = [
+            0, 0, 0, 1, 0x67, 0x42, 0xc0, 0x1f, 0, 0, 0, 1, 0x68, 0xce, 0x06, 0, 0, 0, 1, 0x65,
+            0x03, 0x04,
+        ];
+        for partial in [false, true] {
+            let mut sender = FrameSender::h264(Mid::from("v0"), None, 1, 1);
+            let mut receiver = FrameReceiver::with_h264();
+            for packet in sender.packetize(&frame(keyframe.to_vec(), true)) {
+                receiver.push(packet);
+            }
+            receiver.flush();
+            assert!(!receiver.needs_keyframe());
+
+            let mut delta = vec![0, 0, 0, 1, 0x41];
+            delta.extend(std::iter::repeat_n(0x55, 3_000));
+            let lost = sender.packetize(&frame(delta, false));
+            assert!(lost.len() >= 3);
+            if partial {
+                for (index, packet) in lost.into_iter().enumerate() {
+                    if index != 1 {
+                        assert!(receiver.push(packet).is_empty());
+                    }
+                }
+                assert!(receiver.flush().is_empty());
+            } else {
+                let mut frames = Vec::new();
+                for packet in sender.packetize(&frame(vec![0, 0, 0, 1, 0x41, 0x05], false)) {
+                    frames.extend(receiver.push(packet));
+                }
+                frames.extend(receiver.flush());
+                assert_eq!(frames.len(), 1);
+                assert!(!frames[0].contiguous);
+            }
+            assert!(receiver.needs_keyframe());
+
+            let mut recovered = Vec::new();
+            for packet in sender.packetize(&frame(keyframe.to_vec(), true)) {
+                recovered.extend(receiver.push(packet));
+            }
+            recovered.extend(receiver.flush());
+            assert_eq!(recovered.len(), 1);
+            assert!(recovered[0].is_keyframe);
+            assert!(!receiver.needs_keyframe());
+
+            sender.packetize(&frame(vec![0, 0, 0, 1, 0x41, 0x05], false));
+            let mut immediate = Vec::new();
+            for packet in sender.packetize(&frame(keyframe.to_vec(), true)) {
+                immediate.extend(receiver.push(packet));
+            }
+            immediate.extend(receiver.flush());
+            assert_eq!(immediate.len(), 1);
+            assert!(immediate[0].is_keyframe);
+            assert!(!receiver.needs_keyframe());
+        }
     }
 
     #[test]
