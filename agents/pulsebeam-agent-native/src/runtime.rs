@@ -437,9 +437,6 @@ impl RemoteMedia {
             .min(Duration::from_secs(2))
             .max(min);
         self.playout_delay = Some((min, max));
-        if matches!(self.slot, MediaSlot::RemoteVideo(_)) {
-            self.frames.set_max_wait(max);
-        }
     }
 
     fn queue_frames(&mut self, frames: Vec<MediaFrame>) {
@@ -547,11 +544,14 @@ impl RemoteMedia {
             if self.frame_policy.len() >= crate::pipeline::MAX_JITTER_BUFFER_PACKETS {
                 self.frame_policy.pop_first();
             }
-            self.frame_policy
+            let policy = *self
+                .frame_policy
                 .entry(packet.ts)
                 .or_insert(self.playout_delay);
             let ssrc = packet.ssrc;
-            let frames = self.frames.push(packet);
+            let frames = self
+                .frames
+                .push_with_max_wait(packet, policy.map(|(_, max)| max));
             self.queue_frames(frames);
             if self.frames.needs_keyframe()
                 && let Some(ssrc) = ssrc
@@ -2141,13 +2141,69 @@ mod tests {
         });
         tokio::task::yield_now().await;
         assert!(!task.is_finished());
-        tokio::time::advance(Duration::from_millis(49)).await;
+        tokio::time::advance(Duration::from_millis(99)).await;
         assert!(!task.is_finished());
         tokio::time::advance(Duration::from_millis(1)).await;
         let (first, second, media) = task.await.unwrap();
         assert_eq!(first.data.as_ref(), [1]);
         assert_eq!(second.data.as_ref(), [2]);
-        assert_eq!(Instant::now(), base + Duration::from_millis(50));
+        assert_eq!(Instant::now(), base + Duration::from_millis(100));
         assert_eq!(media.playout_delay, Some((Duration::ZERO, Duration::ZERO)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn video_gap_deadline_keeps_the_first_packet_maximum() {
+        for (first_max_ms, later_max_ms) in [(100, 0), (10, 100)] {
+            let (packet_tx, packets) = flume::bounded(3);
+            let (_mid_tx, mid) = watch::channel(Some("video".to_owned()));
+            let (commands, _command_rx) = mpsc::channel(2);
+            let (_snapshot_tx, snapshot) = watch::channel(Snapshot::default());
+            let mut media = RemoteMedia {
+                slot: MediaSlot::RemoteVideo(0),
+                mid,
+                packets,
+                frames: FrameReceiver::new(),
+                ready: VecDeque::new(),
+                frame_policy: BTreeMap::new(),
+                last_audio_seq: None,
+                playout_delay: None,
+                commands,
+                snapshot,
+            };
+            let base = Instant::now();
+            let packet = |seq: u64, max_ms: u64| RtpPacket {
+                mid: Mid::from("video"),
+                rid: None,
+                seq: crate::SeqNo::from(seq),
+                ts: MediaTime::from_90khz(seq * 3000),
+                marker: true,
+                ssrc: Some(Ssrc::from(1)),
+                payload: Arc::from([u8::try_from(seq).unwrap()]),
+                ext_vals: crate::ExtensionValues {
+                    play_delay_min: Some(MediaTime::ZERO),
+                    play_delay_max: Some(MediaTime::from_millis(max_ms)),
+                    ..crate::ExtensionValues::default()
+                },
+                arrival: base,
+            };
+            packet_tx.send_async(packet(1, 0)).await.unwrap();
+            packet_tx.send_async(packet(3, first_max_ms)).await.unwrap();
+            packet_tx.send_async(packet(4, later_max_ms)).await.unwrap();
+            let task = tokio::spawn(async move {
+                let initial = media.recv_frame().await.unwrap();
+                let after_gap = media.recv_frame().await.unwrap();
+                (initial, after_gap)
+            });
+            tokio::task::yield_now().await;
+            assert!(!task.is_finished());
+            tokio::time::advance(Duration::from_millis(first_max_ms - 1)).await;
+            assert!(!task.is_finished());
+            tokio::time::advance(Duration::from_millis(1)).await;
+            let (initial, after_gap) = task.await.unwrap();
+            assert_eq!(initial.data.as_ref(), [1]);
+            assert_eq!(after_gap.data.as_ref(), [3]);
+            assert!(!after_gap.contiguous);
+            assert_eq!(Instant::now(), base + Duration::from_millis(first_max_ms));
+        }
     }
 }
