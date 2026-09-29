@@ -350,7 +350,7 @@ impl LocalMedia {
 
 pub struct RemoteMedia {
     slot: MediaSlot,
-    mid: watch::Receiver<Option<String>>,
+    mid: watch::Receiver<Option<(String, u32)>>,
     packets: flume::Receiver<RtpPacket>,
     frames: FrameReceiver,
     ready: VecDeque<(MediaFrame, Option<(Duration, Duration)>)>,
@@ -367,18 +367,11 @@ impl RemoteMedia {
     }
 
     pub fn publication_id(&self) -> Option<String> {
-        let mid = self.mid.borrow().clone()?;
+        let (_, receiver_index) = self.mid.borrow().clone()?;
         let snapshot = self.snapshot.borrow();
         match &self.slot {
-            MediaSlot::RemoteVideo(_) => snapshot
-                .video
-                .get(&mid)
-                .map(|binding| binding.track_id.clone()),
-            MediaSlot::RemoteAudio(_) => snapshot
-                .audio
-                .iter()
-                .find(|binding| binding.mid == mid)
-                .map(|binding| binding.track_id.clone()),
+            MediaSlot::RemoteVideo(_) => snapshot.video_mapping.get(&receiver_index).cloned(),
+            MediaSlot::RemoteAudio(_) => snapshot.audio_mapping.get(&receiver_index).cloned(),
             _ => None,
         }
     }
@@ -581,7 +574,7 @@ struct OutgoingMedia {
 
 struct Observer {
     packets: flume::Sender<RtpPacket>,
-    mid: watch::Sender<Option<String>>,
+    mid: watch::Sender<Option<(String, u32)>>,
 }
 
 struct Peer {
@@ -591,6 +584,7 @@ struct Peer {
     reverse_channels: HashMap<RtcChannelId, ChannelId>,
     reverse_mids: HashMap<Mid, MediaSlot>,
     mids: BTreeMap<MediaSlot, Mid>,
+    media_indices: BTreeMap<MediaSlot, u32>,
     packetizers: BTreeMap<(MediaSlot, Option<String>), FrameSender>,
     timeout: Option<Instant>,
 }
@@ -844,8 +838,12 @@ impl Actor {
                         .snapshot()
                         .generation
                         .and_then(|generation| self.peers.get(&generation))
-                        .and_then(|peer| peer.mids.get(&slot))
-                        .map(ToString::to_string);
+                        .and_then(|peer| {
+                            Some((
+                                peer.mids.get(&slot)?.to_string(),
+                                *peer.media_indices.get(&slot)?,
+                            ))
+                        });
                     let (mid, mid_rx) = watch::channel(current_mid);
                     self.observers
                         .entry(slot.clone())
@@ -960,7 +958,9 @@ impl Actor {
                 for (slot, mid) in &peer.mids {
                     if let Some(observers) = self.observers.get_mut(slot) {
                         for observer in observers {
-                            observer.mid.send_replace(Some(mid.to_string()));
+                            if let Some(&index) = peer.media_indices.get(slot) {
+                                observer.mid.send_replace(Some((mid.to_string(), index)));
+                            }
                         }
                     }
                 }
@@ -1161,6 +1161,11 @@ impl Actor {
             reverse_channels,
             reverse_mids,
             mids,
+            media_indices: resources
+                .slots
+                .iter()
+                .map(|binding| (binding.slot.clone(), binding.media_index))
+                .collect(),
             packetizers,
             timeout: None,
         };
@@ -1871,7 +1876,7 @@ mod tests {
     #[tokio::test]
     async fn remote_audio_returns_each_encoded_packet_as_a_frame() {
         let (packet_tx, packets) = flume::bounded(1);
-        let (_mid_tx, mid) = watch::channel(Some("audio".to_owned()));
+        let (_mid_tx, mid) = watch::channel(Some(("audio".to_owned(), 0)));
         let (commands, _command_rx) = mpsc::channel(1);
         let (_snapshot_tx, snapshot) = watch::channel(Snapshot::default());
         let mut media = RemoteMedia {
@@ -1916,7 +1921,7 @@ mod tests {
     #[tokio::test]
     async fn receiver_discards_queued_packets_and_sequence_history_on_generation_change() {
         let (packet_tx, packets) = flume::bounded(2);
-        let (mid_tx, mid) = watch::channel(Some("audio".to_owned()));
+        let (mid_tx, mid) = watch::channel(Some(("audio".to_owned(), 0)));
         let (commands, _command_rx) = mpsc::channel(1);
         let (_snapshot_tx, snapshot) = watch::channel(Snapshot::default());
         let mut media = RemoteMedia {
@@ -1949,7 +1954,7 @@ mod tests {
         assert_eq!(media.last_audio_seq, None);
         assert_eq!(media.playout_delay, None);
 
-        mid_tx.send_replace(Some("audio".to_owned()));
+        mid_tx.send_replace(Some(("audio".to_owned(), 0)));
         media.retire_changed_generation().unwrap();
         packet_tx.send_async(packet).await.unwrap();
         let frame = media.recv_frame().await.unwrap();
@@ -1960,7 +1965,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn audio_playout_waits_for_first_packet_policy_and_caches_it() {
         let (packet_tx, packets) = flume::bounded(2);
-        let (_mid_tx, mid) = watch::channel(Some("audio".to_owned()));
+        let (_mid_tx, mid) = watch::channel(Some(("audio".to_owned(), 0)));
         let (commands, _command_rx) = mpsc::channel(1);
         let (_snapshot_tx, snapshot) = watch::channel(Snapshot::default());
         let mut media = RemoteMedia {
@@ -2025,7 +2030,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn audio_playout_discards_a_waiting_frame_on_generation_change() {
         let (packet_tx, packets) = flume::bounded(2);
-        let (mid_tx, mid) = watch::channel(Some("audio".to_owned()));
+        let (mid_tx, mid) = watch::channel(Some(("audio".to_owned(), 0)));
         let (commands, _command_rx) = mpsc::channel(1);
         let (_snapshot_tx, snapshot) = watch::channel(Snapshot::default());
         let mut media = RemoteMedia {
@@ -2065,7 +2070,7 @@ mod tests {
         assert!(!task.is_finished());
         mid_tx.send_replace(None);
         tokio::time::advance(Duration::from_millis(1)).await;
-        mid_tx.send_replace(Some("audio".to_owned()));
+        mid_tx.send_replace(Some(("audio".to_owned(), 0)));
         tokio::time::advance(Duration::from_millis(1)).await;
         packet_tx
             .send_async(RtpPacket {
@@ -2090,7 +2095,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn video_frames_snapshot_policy_before_a_later_frame_changes_it() {
         let (packet_tx, packets) = flume::bounded(2);
-        let (_mid_tx, mid) = watch::channel(Some("video".to_owned()));
+        let (_mid_tx, mid) = watch::channel(Some(("video".to_owned(), 0)));
         let (commands, _command_rx) = mpsc::channel(2);
         let (_snapshot_tx, snapshot) = watch::channel(Snapshot::default());
         let mut media = RemoteMedia {
@@ -2155,7 +2160,7 @@ mod tests {
     async fn video_gap_deadline_keeps_the_first_packet_maximum() {
         for (first_max_ms, later_max_ms) in [(100, 0), (10, 100)] {
             let (packet_tx, packets) = flume::bounded(3);
-            let (_mid_tx, mid) = watch::channel(Some("video".to_owned()));
+            let (_mid_tx, mid) = watch::channel(Some(("video".to_owned(), 0)));
             let (commands, _command_rx) = mpsc::channel(2);
             let (_snapshot_tx, snapshot) = watch::channel(Snapshot::default());
             let mut media = RemoteMedia {

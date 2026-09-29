@@ -1,14 +1,13 @@
 use alloc::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     string::String,
-    vec::Vec,
 };
 
 use pulsebeam_proto::signaling_v1::{self as wire, catalog};
 
 use crate::{
-    AudioBinding, MediaDirection, MediaKind, MediaSlot, Notification, Participant, Publication,
-    SlotBinding, Snapshot, VideoBinding, signaling::SignalingError,
+    MediaDirection, MediaKind, MediaSlot, Notification, Participant, Publication, SlotBinding,
+    Snapshot, signaling::SignalingError,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -357,110 +356,27 @@ fn update_snapshot(
             )
         })
         .collect();
-    let mids: BTreeMap<_, _> = coordinates
+    let indices: BTreeSet<_> = coordinates
         .values()
-        .map(|binding| (binding.media_index, binding.mid.as_str()))
+        .map(|binding| binding.media_index)
         .collect();
-    let video: BTreeMap<_, _> = state
+    if state
         .video
-        .iter()
-        .map(|(index, id)| {
-            let mid = String::from(
-                *mids
-                    .get(index)
-                    .ok_or(SignalingError::Invalid("mapping index"))?,
-            );
-            Ok((
-                mid.clone(),
-                VideoBinding {
-                    track_id: id.clone(),
-                    mid,
-                    paused: false,
-                },
-            ))
-        })
-        .collect::<Result<_, SignalingError>>()?;
-    let audio: Vec<_> = state
-        .audio
-        .iter()
-        .map(|(index, id)| {
-            Ok(AudioBinding {
-                track_id: id.clone(),
-                mid: String::from(
-                    *mids
-                        .get(index)
-                        .ok_or(SignalingError::Invalid("mapping index"))?,
-                ),
-                level_dbov: 0,
-            })
-        })
-        .collect::<Result<_, SignalingError>>()?;
-    emit_participant_changes(&snapshot.participants, &participants, notifications);
-    emit_publication_changes(&snapshot.publications, &publications, notifications);
-    emit_video_changes(&snapshot.video, &video, notifications);
-    if snapshot.audio != audio {
-        notifications.push_back(Notification::AudioBindingsChanged(audio.clone()));
+        .keys()
+        .chain(state.audio.keys())
+        .any(|index| !indices.contains(index))
+    {
+        return Err(SignalingError::Invalid("mapping index"));
     }
+    notifications.push_back(Notification::SnapshotChanged);
     snapshot.catalog_revision = state.revision;
     snapshot.accepted_intent_revision = state.intent_revision;
     snapshot.video_mapping = state.video.clone();
     snapshot.audio_mapping = state.audio.clone();
     snapshot.participants = participants;
     snapshot.publications = publications;
-    snapshot.video = video;
-    snapshot.audio = audio;
     snapshot.version = snapshot.version.saturating_add(1);
     Ok(())
-}
-
-fn emit_participant_changes(
-    old: &BTreeMap<String, Participant>,
-    new: &BTreeMap<String, Participant>,
-    notifications: &mut VecDeque<Notification>,
-) {
-    for id in old.keys() {
-        if !new.contains_key(id) {
-            notifications.push_back(Notification::ParticipantRemoved(id.clone()));
-        }
-    }
-    for (id, participant) in new {
-        if old.get(id) != Some(participant) {
-            notifications.push_back(Notification::ParticipantAdded(participant.clone()));
-        }
-    }
-}
-
-fn emit_publication_changes(
-    old: &BTreeMap<String, Publication>,
-    new: &BTreeMap<String, Publication>,
-    notifications: &mut VecDeque<Notification>,
-) {
-    for (id, publication) in old {
-        if new.get(id) != Some(publication) {
-            notifications.push_back(Notification::PublicationRemoved(id.clone()));
-        }
-    }
-    for (id, publication) in new {
-        if old.get(id) != Some(publication) {
-            notifications.push_back(Notification::PublicationAdded(publication.clone()));
-        }
-    }
-}
-
-fn emit_video_changes(
-    old: &BTreeMap<String, VideoBinding>,
-    new: &BTreeMap<String, VideoBinding>,
-    notifications: &mut VecDeque<Notification>,
-) {
-    let mids: BTreeSet<&String> = old.keys().chain(new.keys()).collect();
-    for mid in mids {
-        if old.get(mid) != new.get(mid) {
-            notifications.push_back(Notification::VideoBindingChanged {
-                mid: mid.clone(),
-                binding: new.get(mid).cloned(),
-            });
-        }
-    }
 }
 
 fn valid(value: &str, limit: usize) -> bool {
@@ -776,7 +692,7 @@ mod tests {
             ),
             Ok(ServerOutput::StateChanged)
         ));
-        assert_eq!(snapshot.audio[0].mid, "non-numeric");
+        assert_eq!(snapshot.audio_mapping[&2], "opaque");
         assert_eq!(state.intent_revision, 1);
     }
 

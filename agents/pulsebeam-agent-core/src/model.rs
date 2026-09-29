@@ -220,20 +220,6 @@ pub struct Publication {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct VideoBinding {
-    pub track_id: String,
-    pub mid: String,
-    pub paused: bool,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AudioBinding {
-    pub track_id: String,
-    pub mid: String,
-    pub level_dbov: i8,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConnectionState {
     Disconnected,
     CreatingOffer,
@@ -262,8 +248,6 @@ pub struct Snapshot {
     pub audio_mapping: BTreeMap<u32, String>,
     pub participants: BTreeMap<String, Participant>,
     pub publications: BTreeMap<String, Publication>,
-    pub video: BTreeMap<String, VideoBinding>,
-    pub audio: Vec<AudioBinding>,
     pub topics: TopicSnapshot,
     pub terminal_failure: Option<Failure>,
 }
@@ -283,8 +267,6 @@ impl Default for Snapshot {
             audio_mapping: BTreeMap::new(),
             participants: BTreeMap::new(),
             publications: BTreeMap::new(),
-            video: BTreeMap::new(),
-            audio: Vec::new(),
             topics: TopicSnapshot::default(),
             terminal_failure: None,
         }
@@ -313,15 +295,7 @@ pub enum Notification {
         from: ConnectionState,
         to: ConnectionState,
     },
-    ParticipantAdded(Participant),
-    ParticipantRemoved(String),
-    PublicationAdded(Publication),
-    PublicationRemoved(String),
-    VideoBindingChanged {
-        mid: String,
-        binding: Option<VideoBinding>,
-    },
-    AudioBindingsChanged(Vec<AudioBinding>),
+    SnapshotChanged,
     Topic(TopicNotification),
     Failure(Failure),
     ServerError(String),
