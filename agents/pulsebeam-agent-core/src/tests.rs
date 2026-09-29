@@ -1599,16 +1599,8 @@ fn signaling_snapshot_diff_and_empty_binding_groups_are_exact() {
     assert_eq!(agent.snapshot().accepted_intent_revision, 1);
     assert_eq!(agent.snapshot().video_mapping[&4], "video-track");
     assert_eq!(agent.snapshot().audio_mapping[&2], "audio-track");
-    assert_eq!(agent.snapshot().video["rv0"].track_id, "video-track");
-    assert_eq!(agent.snapshot().audio[0].mid, "ra0");
-    let notifications = drain_notifications(&mut agent);
-    assert_eq!(
-        notifications
-            .iter()
-            .filter(|notification| matches!(notification, Notification::PublicationAdded(_)))
-            .count(),
-        2
-    );
+    assert_eq!(agent.snapshot().publications.len(), 2);
+    assert!(drain_notifications(&mut agent).contains(&Notification::SnapshotChanged));
 
     agent
         .handle(HostEvent::DataChannel(DataChannelEvent::Message {
@@ -1621,19 +1613,11 @@ fn signaling_snapshot_diff_and_empty_binding_groups_are_exact() {
             })),
         }))
         .unwrap();
-    assert!(agent.snapshot().video.is_empty());
-    assert!(agent.snapshot().audio.is_empty());
     assert!(agent.snapshot().video_mapping.is_empty());
     assert!(agent.snapshot().audio_mapping.is_empty());
     assert_eq!(
         drain_notifications(&mut agent),
-        vec![
-            Notification::VideoBindingChanged {
-                mid: "rv0".to_string(),
-                binding: None,
-            },
-            Notification::AudioBindingsChanged(vec![]),
-        ]
+        vec![Notification::SnapshotChanged]
     );
 
     agent
@@ -2056,7 +2040,7 @@ fn malformed_signaling_is_transactional() {
     ));
     assert_eq!(agent.snapshot().participants, before.participants);
     assert_eq!(agent.snapshot().publications, before.publications);
-    assert_eq!(agent.snapshot().video, before.video);
+    assert_eq!(agent.snapshot().video_mapping, before.video_mapping);
     assert_eq!(
         agent.snapshot().connection,
         ConnectionState::TerminalFailure

@@ -347,6 +347,7 @@ impl DataChannel {
 struct Peer {
     connection: RtcPeerConnection,
     transceivers: Vec<(MediaSlot, RtcRtpTransceiver)>,
+    receiver_mids: BTreeMap<u32, String>,
     remote_tracks: BTreeMap<String, RemoteTrackState>,
     channels: BTreeMap<u64, DataChannel>,
     _state: Closure<dyn FnMut(Event)>,
@@ -585,13 +586,17 @@ impl BrowserRuntime {
         result.map_err(LocalOperationError::into_js)
     }
 
-    pub fn remote_track(&self, mid: &str) -> Option<MediaStreamTrack> {
+    pub fn remote_track(&self, receiver_index: u32) -> Option<MediaStreamTrack> {
         let generation = self.inner.snapshot().generation?;
         self.inner
             .peers
             .borrow()
             .get(&generation.get())
-            .and_then(|peer| peer.remote_tracks.get(mid))
+            .and_then(|peer| {
+                peer.receiver_mids
+                    .get(&receiver_index)
+                    .and_then(|mid| peer.remote_tracks.get(mid))
+            })
             .map(|state| Clone::clone(&state.track))
     }
 
@@ -1137,6 +1142,7 @@ impl RuntimeInner {
         Ok(Peer {
             connection,
             transceivers,
+            receiver_mids: BTreeMap::new(),
             remote_tracks: BTreeMap::new(),
             channels,
             _state: state,
@@ -1264,9 +1270,9 @@ impl RuntimeInner {
         generation: Generation,
         offer: &str,
     ) -> Result<OfferResources, String> {
-        let peers = self.peers.borrow();
+        let mut peers = self.peers.borrow_mut();
         let peer = peers
-            .get(&generation.get())
+            .get_mut(&generation.get())
             .ok_or_else(|| "offer completed for an obsolete generation".to_owned())?;
         let mut slot_mids = Vec::with_capacity(peer.transceivers.len());
         for (slot, transceiver) in &peer.transceivers {
@@ -1276,6 +1282,11 @@ impl RuntimeInner {
             slot_mids.push((slot.clone(), mid));
         }
         let slots = agent_core::negotiated_slot_bindings(offer, slot_mids)?;
+        peer.receiver_mids = slots
+            .iter()
+            .filter(|binding| binding.direction == agent_core::MediaDirection::ReceiveOnly)
+            .map(|binding| (binding.media_index, binding.mid.clone()))
+            .collect();
         let signaling_channel = peer
             .channels
             .iter()
@@ -1953,24 +1964,6 @@ fn snapshot_value(snapshot: &agent_core::Snapshot) -> JsValue {
         set(&mapping, name, tracks);
     }
     set(&value, "mapping", mapping);
-    let video = Array::new();
-    for binding in snapshot.video.values() {
-        let item = Object::new();
-        set(&item, "trackId", binding.track_id.clone());
-        set(&item, "mid", binding.mid.clone());
-        set(&item, "paused", binding.paused);
-        video.push(&item);
-    }
-    set(&value, "video", video);
-    let audio = Array::new();
-    for binding in &snapshot.audio {
-        let item = Object::new();
-        set(&item, "trackId", binding.track_id.clone());
-        set(&item, "mid", binding.mid.clone());
-        set(&item, "levelDbov", binding.level_dbov);
-        audio.push(&item);
-    }
-    set(&value, "audio", audio);
     set(&value, "topics", topic_snapshot_value(&snapshot.topics));
     set(
         &value,

@@ -996,12 +996,7 @@ impl From<model::Notification> for Notification {
                 from: from.into(),
                 to: to.into(),
             },
-            model::Notification::ParticipantAdded(_)
-            | model::Notification::ParticipantRemoved(_)
-            | model::Notification::PublicationAdded(_)
-            | model::Notification::PublicationRemoved(_)
-            | model::Notification::VideoBindingChanged { .. }
-            | model::Notification::AudioBindingsChanged(_) => Self::SnapshotChanged,
+            model::Notification::SnapshotChanged => Self::SnapshotChanged,
             model::Notification::Topic(notification) => Self::Topic {
                 notification: notification.into(),
             },

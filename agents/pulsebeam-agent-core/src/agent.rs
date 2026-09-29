@@ -2,7 +2,7 @@ use alloc::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     format,
     string::{String, ToString},
-    vec::{self, Vec},
+    vec::Vec,
 };
 use core::time::Duration;
 use pulsebeam_proto::signaling_v1 as wire;
@@ -895,8 +895,8 @@ impl Agent {
                             generation.get(),
                             self.snapshot.participants.len(),
                             self.snapshot.publications.len(),
-                            self.snapshot.video.len(),
-                            self.snapshot.audio.len(),
+                            self.snapshot.video_mapping.len(),
+                            self.snapshot.audio_mapping.len(),
                         );
                         let removed: Vec<_> = tracks_before
                             .into_iter()
@@ -1508,33 +1508,13 @@ impl Agent {
     }
 
     fn clear_observed_state(&mut self) {
-        for id in self.snapshot.participants.keys() {
-            self.notifications
-                .push_back(Notification::ParticipantRemoved(id.clone()));
-        }
-        for id in self.snapshot.publications.keys() {
-            self.notifications
-                .push_back(Notification::PublicationRemoved(id.clone()));
-        }
-        for mid in self.snapshot.video.keys() {
-            self.notifications
-                .push_back(Notification::VideoBindingChanged {
-                    mid: mid.clone(),
-                    binding: None,
-                });
-        }
-        if !self.snapshot.audio.is_empty() {
-            self.notifications
-                .push_back(Notification::AudioBindingsChanged(vec![]));
-        }
+        self.notifications.push_back(Notification::SnapshotChanged);
         self.snapshot.catalog_revision = 0;
         self.snapshot.accepted_intent_revision = 0;
         self.snapshot.video_mapping.clear();
         self.snapshot.audio_mapping.clear();
         self.snapshot.participants.clear();
         self.snapshot.publications.clear();
-        self.snapshot.video.clear();
-        self.snapshot.audio.clear();
         self.bump_snapshot();
     }
 

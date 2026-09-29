@@ -1275,19 +1275,17 @@ impl ClientContext {
             }
         }
         self.remote_tracks = snapshot
-            .video
+            .video_mapping
             .values()
-            .filter_map(|binding| {
+            .filter_map(|track_id| {
                 snapshot
                     .publications
-                    .get(&binding.track_id)
-                    .map(|publication| {
-                        (publication.participant_id.clone(), binding.track_id.clone())
-                    })
+                    .get(track_id)
+                    .map(|publication| (publication.participant_id.clone(), track_id.clone()))
             })
             .collect();
-        for (rank, binding) in snapshot.audio.iter().enumerate() {
-            if let Some(publication) = snapshot.publications.get(&binding.track_id) {
+        for (rank, track_id) in snapshot.audio_mapping.values().enumerate() {
+            if let Some(publication) = snapshot.publications.get(track_id) {
                 self.audio_rx.lock().unwrap().record_rank(
                     &publication.participant_id,
                     u32::try_from(rank).unwrap_or(u32::MAX),

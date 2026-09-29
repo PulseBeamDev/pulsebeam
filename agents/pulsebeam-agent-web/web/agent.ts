@@ -50,8 +50,6 @@ interface RuntimeSnapshot {
   readonly mapping: MappingSnapshot;
   readonly participants: readonly Participant[];
   readonly publications: readonly Publication[];
-  readonly video: readonly { readonly trackId: string; readonly mid: string }[];
-  readonly audio: readonly { readonly trackId: string; readonly mid: string }[];
   readonly topics: TopicSnapshot;
   readonly failure?: AgentFailure;
 }
@@ -715,8 +713,6 @@ class AgentFacade implements Agent {
     const publications = Object.freeze(
       raw.publications.map((publication) => Object.freeze({ ...publication })),
     );
-    const video = raw.video;
-    const audio = raw.audio;
     const catalog = Object.freeze({
       revision: raw.catalog.revision,
       participants,
@@ -735,9 +731,9 @@ class AgentFacade implements Agent {
       publications.map((publication) => [publication.id, publication]),
     );
     const tracks: Record<string, RemoteTrack> = {};
-    for (const binding of video) {
-      const publication = publicationById.get(binding.trackId);
-      const media = runtime.remote_track(binding.mid);
+    for (const binding of mapping.video) {
+      const publication = publicationById.get(binding.publicationId);
+      const media = runtime.remote_track(binding.receiverIndex);
       if (!publication || publication.kind !== "video" || !media) continue;
       tracks[publication.id] = Object.freeze({
         publicationId: publication.id,
@@ -746,9 +742,9 @@ class AgentFacade implements Agent {
         media,
       });
     }
-    for (const binding of audio) {
-      const publication = publicationById.get(binding.trackId);
-      const media = runtime.remote_track(binding.mid);
+    for (const binding of mapping.audio) {
+      const publication = publicationById.get(binding.publicationId);
+      const media = runtime.remote_track(binding.receiverIndex);
       if (!publication || publication.kind !== "audio" || !media) continue;
       tracks[publication.id] = Object.freeze({
         publicationId: publication.id,
