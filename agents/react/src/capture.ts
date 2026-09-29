@@ -76,7 +76,9 @@ export function useMediaDevices(): MediaDevicesResult {
   const [result, setResult] = useState<MediaDevicesResult>(EMPTY_DEVICES);
   useEffect(() => {
     let live = true;
+    let revision = 0;
     const refresh = async () => {
+      const requested = ++revision;
       try {
         const devices = await navigator.mediaDevices?.enumerateDevices();
         if (!devices)
@@ -84,7 +86,7 @@ export function useMediaDevices(): MediaDevicesResult {
             "not-supported",
             "device enumeration is unavailable",
           );
-        if (!live) return;
+        if (!live || requested !== revision) return;
         const normalize = (kind: MediaDeviceKind) =>
           devices
             .filter((device) => device.kind === kind)
@@ -97,7 +99,7 @@ export function useMediaDevices(): MediaDevicesResult {
           error: null,
         });
       } catch (error) {
-        if (live)
+        if (live && requested === revision)
           setResult({
             ...EMPTY_DEVICES,
             state: "error",
