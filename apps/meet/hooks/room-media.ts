@@ -2,9 +2,11 @@ import { useCallback, useEffect, useState } from "react";
 import { useDisplayMedia } from "@pulsebeam/react";
 import type { Agent, CaptureResult } from "@pulsebeam/react";
 
+export type MediaSources = Pick<CaptureResult, "videoTrack" | "audioTrack">;
+
 export function useRoomMedia(
   agent: Agent,
-  capture: CaptureResult,
+  sources: MediaSources,
   onFailure: (message: string) => void,
   initial: { cameraOn: boolean; micOn: boolean },
 ) {
@@ -24,11 +26,11 @@ export function useRoomMedia(
   const screen = agent.localVideoTrack("screen");
 
   useEffect(() => {
-    camera.setSource(cameraOn ? capture.videoTrack : null);
-  }, [camera, cameraOn, capture.videoTrack]);
+    camera.setSource(cameraOn ? sources.videoTrack : null);
+  }, [camera, cameraOn, sources.videoTrack]);
   useEffect(() => {
-    microphone.setSource(micOn ? capture.audioTrack : null);
-  }, [microphone, micOn, capture.audioTrack]);
+    microphone.setSource(micOn ? sources.audioTrack : null);
+  }, [microphone, micOn, sources.audioTrack]);
   useEffect(() => {
     screen.setSource(display.videoTrack);
   }, [screen, display.videoTrack]);

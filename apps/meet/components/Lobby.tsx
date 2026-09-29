@@ -1,26 +1,15 @@
 import { useEffect, useState } from "react";
-import { useMediaDevices } from "@pulsebeam/react";
-import type { CaptureResult } from "@pulsebeam/react";
 import { DeviceSelector } from "./DeviceSelector";
 import { MediaPreview } from "./MediaPreview";
+import { useMeetMedia } from "./MeetMediaProvider";
 import { Button, Card, CardContent, Input } from "./ui";
 import { defaultServerUrl } from "@/lib/config";
 import { normalizeEndpoint } from "@/lib/model";
 import { Radio, RefreshCw } from "lucide-react";
 
 export function Lobby({
-  capture,
-  videoDeviceId,
-  audioDeviceId,
-  setVideoDeviceId,
-  setAudioDeviceId,
   onJoin,
 }: {
-  capture: CaptureResult;
-  videoDeviceId: string;
-  audioDeviceId: string;
-  setVideoDeviceId(id: string): void;
-  setAudioDeviceId(id: string): void;
   onJoin(
     token: string,
     endpoint: string,
@@ -30,7 +19,14 @@ export function Lobby({
 }) {
   const [token, setToken] = useState("");
   const [serverURL, setServerURL] = useState(defaultServerUrl);
-  const devices = useMediaDevices();
+  const {
+    capture,
+    devices,
+    videoDeviceId,
+    audioDeviceId,
+    setVideoDeviceId,
+    setAudioDeviceId,
+  } = useMeetMedia();
   const { videoTrack, audioTrack, error, request } = capture;
   const [isMicOn, setMicOn] = useState(true);
   const [isCamOn, setCamOn] = useState(true);
