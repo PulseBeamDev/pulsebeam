@@ -21,10 +21,8 @@ fn egress_extension_values(
     ext_vals
         .user_values
         .remove::<str0m::rtp::vla::VideoLayersAllocation>();
-    if let Some((min, max)) = playout_delay {
-        ext_vals.play_delay_min = Some(min);
-        ext_vals.play_delay_max = Some(max);
-    }
+    ext_vals.play_delay_min = playout_delay.map(|(min, _)| min);
+    ext_vals.play_delay_max = playout_delay.map(|(_, max)| max);
     ext_vals
 }
 
@@ -516,8 +514,24 @@ impl Transport {
 #[cfg(test)]
 mod tests {
     use super::egress_extension_values;
-    use str0m::media::{Mid, Rid};
+    use str0m::media::{MediaTime, Mid, Rid};
     use str0m::rtp::ExtensionValues;
+
+    #[test]
+    fn fresh_default_egress_does_not_inherit_ingress_delay() {
+        let mut ingress = ExtensionValues::default();
+        ingress.play_delay_min = Some(MediaTime::from_millis(100));
+        ingress.play_delay_max = Some(MediaTime::from_millis(200));
+        let default = egress_extension_values(ingress.clone(), None);
+        assert_eq!(default.play_delay_min, None);
+        assert_eq!(default.play_delay_max, None);
+        let fixed = egress_extension_values(
+            ingress,
+            Some((MediaTime::from_millis(50), MediaTime::from_millis(80))),
+        );
+        assert_eq!(fixed.play_delay_min, Some(MediaTime::from_millis(50)));
+        assert_eq!(fixed.play_delay_max, Some(MediaTime::from_millis(80)));
+    }
 
     #[test]
     fn ingress_stream_identity_is_not_reused_on_egress() {
