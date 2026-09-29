@@ -65,12 +65,22 @@ export async function runAcquisitionContract() {
     listeners -= 1;
     remove(...arguments_);
   };
+  const deviceList = () => [
+    { kind: "videoinput", deviceId: "camera-id", label },
+    { kind: "audioinput", deviceId: "mic-id", label: "Microphone" },
+    { kind: "audiooutput", deviceId: "speaker-id", label: "Speaker" },
+  ];
+  let holdEnumeration = false;
+  const enumerations: ReturnType<
+    typeof deferred<ReturnType<typeof deviceList>>
+  >[] = [];
   Object.assign(devices, {
-    enumerateDevices: async () => [
-      { kind: "videoinput", deviceId: "camera-id", label },
-      { kind: "audioinput", deviceId: "mic-id", label: "Microphone" },
-      { kind: "audiooutput", deviceId: "speaker-id", label: "Speaker" },
-    ],
+    enumerateDevices: () => {
+      if (!holdEnumeration) return Promise.resolve(deviceList());
+      const pending = deferred<ReturnType<typeof deviceList>>();
+      enumerations.push(pending);
+      return pending.promise;
+    },
     getUserMedia: () => {
       const request = deferred<MediaStream>();
       userPending.push(request);
@@ -146,7 +156,25 @@ export async function runAcquisitionContract() {
     label = "Camera";
     devices.dispatchEvent(new Event("devicechange"));
     await until(() => enumerated.cameras[0]?.label === "Camera");
-    const captureDevices = initialLabels && listeners === 1;
+    let captureDevices = initialLabels && listeners === 1;
+    holdEnumeration = true;
+    for (const failStale of [false, true]) {
+      devices.dispatchEvent(new Event("devicechange"));
+      devices.dispatchEvent(new Event("devicechange"));
+      const stale = enumerations.shift()!;
+      const latest = enumerations.shift()!;
+      label = `Latest camera ${failStale}`;
+      latest.resolve(deviceList());
+      await until(() => enumerated.cameras[0]?.label === label);
+      if (failStale) stale.reject(new Error("obsolete enumeration failure"));
+      else stale.resolve([]);
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      captureDevices &&=
+        enumerated.state === "ready" &&
+        enumerated.cameras[0]?.label === label &&
+        enumerated.error === null;
+    }
+    holdEnumeration = false;
 
     document.getElementById("acquire-user")!.click();
     await until(() => userPending.length === 1 && user.state === "requesting");
