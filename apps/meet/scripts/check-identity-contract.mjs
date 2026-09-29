@@ -32,13 +32,13 @@ requireMatch(
 );
 requireMatch(
   lobby,
-  /onJoin\(token, endpoint, activeStream\)/,
+  /onJoin\(token, endpoint, isCamOn, isMicOn\)/,
   "Lobby must pass the token opaquely to the room",
 );
 requireMatch(
   room,
-  /createAgent\(\{[\s\S]*?endpoint,[\s\S]*?token,[\s\S]*?topology:/,
-  "Room must construct the agent with server endpoint and token",
+  /useAgent\(\{[\s\S]*?endpoint,[\s\S]*?token,[\s\S]*?topology:/,
+  "Room must own an agent with server endpoint and token",
 );
 requireMatch(
   room,

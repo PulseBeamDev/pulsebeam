@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useRef, useState } from "react";
-import { AgentProvider, createAgent, useAgent } from "@pulsebeam/react";
-import type { Agent, RemoteTrack } from "@pulsebeam/react";
+import { useCallback, useEffect, useState } from "react";
+import { Audio, Video, useAgent } from "@pulsebeam/react";
+import type { Agent, CaptureResult } from "@pulsebeam/react";
 import {
   Badge,
   Button,
@@ -30,12 +30,9 @@ import {
   VideoOff,
   X,
 } from "lucide-react";
-import { LocalVideo } from "./LocalVideo";
-import { RemoteMedia, type PlaybackRetry } from "./RemoteMedia";
-import { useRoomMedia, stopMedia } from "@/hooks/room-media";
+import { useRoomMedia } from "@/hooks/room-media";
 import { useTopics } from "@/hooks/topics";
 import { useVideoLayout } from "@/hooks/video-layout";
-import { desiredState } from "@/lib/model";
 
 const latencyModes = [
   {
@@ -58,55 +55,53 @@ const reactionEmojis = ["👍", "❤️", "😂", "😮", "👏", "🔥"];
 export function Room({
   token,
   endpoint,
-  stream,
+  capture,
+  cameraOn,
+  micOn,
   onLeave,
 }: {
   token: string;
   endpoint: string;
-  stream: MediaStream;
+  capture: CaptureResult;
+  cameraOn: boolean;
+  micOn: boolean;
   onLeave(): void;
 }) {
-  const [agent, setAgent] = useState<Agent | null>(null);
-  const stopTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  useEffect(() => {
-    if (stopTimer.current) clearTimeout(stopTimer.current);
-    const fresh = createAgent({
-      endpoint,
-      token,
-      topology: {
-        localVideos: 2,
-        localAudios: 1,
-        remoteVideos: 7,
-        remoteAudios: 3,
-      },
-      logging: { level: "debug" },
-    });
-    // eslint-disable-next-line react-hooks/set-state-in-effect -- an agent is effect-owned to prevent Strict Mode reuse after close.
-    setAgent(fresh);
-    return () => {
-      fresh.close();
-      stopTimer.current = setTimeout(() => stopMedia(stream), 0);
-    };
-  }, [endpoint, token, stream]);
+  const agent = useAgent({
+    endpoint,
+    token,
+    topology: {
+      localVideos: 2,
+      localAudios: 1,
+      remoteVideos: 7,
+      remoteAudios: 3,
+    },
+    logging: { level: "debug" },
+  });
   return agent ? (
-    <AgentProvider agent={agent}>
-      <RoomSession agent={agent} stream={stream} onLeave={onLeave} />
-    </AgentProvider>
+    <RoomSession
+      agent={agent}
+      capture={capture}
+      initial={{ cameraOn, micOn }}
+      onLeave={onLeave}
+    />
   ) : (
     <main className="grid h-dvh place-items-center">Joining room…</main>
   );
 }
 
 function RoomSession({
-  agent: playbackAgent,
-  stream,
+  agent: owner,
+  capture,
+  initial,
   onLeave,
 }: {
   agent: Agent;
-  stream: MediaStream;
+  capture: CaptureResult;
+  initial: { cameraOn: boolean; micOn: boolean };
   onLeave(): void;
 }) {
-  const agent = useAgent();
+  const agent = owner.getSnapshot();
   const [latency, setLatency] = useState<{
     mode: "fixed";
     minMs: number;
@@ -116,11 +111,11 @@ function RoomSession({
   const [chatOpen, setChatOpen] = useState(false);
   const [reactionPickerOpen, setReactionPickerOpen] = useState(false);
   const [failure, setFailure] = useState<string | null>(null);
-  const [playbackRetry, setPlaybackRetry] = useState<PlaybackRetry | null>(
-    null,
-  );
-  const { screen, cameraOn, micOn, detachScreen, startShare, toggle } =
-    useRoomMedia(agent, stream, setFailure);
+  const [playbackRetry, setPlaybackRetry] = useState<
+    (() => Promise<void>) | null
+  >(null);
+  const { screen, camera, cameraOn, micOn, detachScreen, startShare, toggle } =
+    useRoomMedia(owner, capture, setFailure, initial);
   const {
     messages,
     reactions,
@@ -128,42 +123,37 @@ function RoomSession({
     sendReaction,
     error: topicError,
     clearError,
-  } = useTopics();
-  const {
-    remotePublications,
-    publicationById,
-    spotlight,
-    selected,
-    tiles,
-    spotlightFrame,
-    setPin,
-  } = useVideoLayout(agent.catalog.publications, agent.participantId);
-  const onBlocked = useCallback((reason: string, retry: PlaybackRetry) => {
-    setFailure(`Playback: ${reason}`);
-    setPlaybackRetry(() => retry);
-  }, []);
+  } = useTopics(owner, agent.participantId);
+  const { remoteTracks, spotlight, setPin } = useVideoLayout(
+    owner.remoteVideoTracks,
+  );
+  const onBlocked = useCallback(
+    (reason: string, retry: () => Promise<void>) => {
+      setFailure(`Playback: ${reason}`);
+      setPlaybackRetry(() => retry);
+    },
+    [],
+  );
   useEffect(() => {
-    agent.setState(
-      desiredState(
-        true,
-        ["camera", "microphone", ...(screen ? (["screen"] as const) : [])],
-        selected.map(({ id, slot, height, priority }) => ({
-          slot,
-          trackId: id,
-          height,
-          minHeight: priority === 200 ? 360 : 90,
-          minFps: 15,
-          priority,
-        })),
-        latency,
-      ),
-    );
-  }, [agent, latency, screen, selected]);
+    owner.connect();
+    return () => owner.disconnect();
+  }, [owner]);
+  useEffect(() => {
+    for (const track of remoteTracks)
+      track.setReceiveOptions({
+        minHeight: track === spotlight ? 360 : 90,
+        minFps: 15,
+        priority: track === spotlight ? 200 : 10,
+        ...(latency ? { playoutDelay: latency } : {}),
+      });
+  }, [latency, remoteTracks, spotlight]);
+  const playbackError = useCallback(
+    ({ error, retry }: { error: unknown; retry: () => Promise<void> }) => {
+      onBlocked(error instanceof Error ? error.message : String(error), retry);
+    },
+    [onBlocked],
+  );
   const blocked = failure ?? topicError ?? agent.failure?.message;
-  const audioTracks = agent.mapping.audio
-    .map((binding) => agent.tracks[binding.publicationId])
-    .filter((track): track is RemoteTrack => track?.kind === "audio");
-  const label = (id: string) => publicationById.get(id)?.participantId ?? id;
   return (
     <TooltipProvider>
       <div className="flex h-dvh flex-col overflow-hidden bg-background font-sans">
@@ -284,7 +274,7 @@ function RoomSession({
                   variant="ghost"
                   className="meet-reconnect h-8 w-8"
                   aria-label="Reconnect"
-                  onClick={agent.reconnect}
+                  onClick={() => owner.reconnect()}
                 >
                   <RotateCcw className="h-3.5 w-3.5" />
                 </Button>
@@ -323,28 +313,27 @@ function RoomSession({
         )}
         <main className="meet-room-main relative flex min-h-0 flex-1">
           <Card className="meet-spotlight relative flex min-h-0 flex-1 items-center justify-center overflow-hidden bg-black py-0">
-            <div
-              ref={spotlightFrame}
-              className="meet-spotlight-frame relative w-full"
-            >
-              {spotlight && agent.tracks[spotlight]?.kind === "video" ? (
-                <RemoteMedia
-                  agent={playbackAgent}
-                  publicationId={spotlight}
-                  kind="video"
-                  onBlocked={onBlocked}
+            <div className="meet-spotlight-frame relative w-full">
+              {spotlight ? (
+                <Video
+                  source={spotlight}
+                  autoPlay
+                  className="h-full w-full object-contain"
+                  onPlaybackError={playbackError}
                 />
               ) : (
-                <LocalVideo
-                  stream={stream}
+                <Video
+                  source={camera}
+                  autoPlay
                   mirror
                   className="h-full w-full object-contain"
+                  onPlaybackError={playbackError}
                 />
               )}
               {spotlight && (
                 <Badge className="absolute top-3 left-3 h-7 max-w-48 gap-2 truncate rounded-lg border border-white/10 bg-black/60 px-2.5 py-1 text-[9px] font-medium text-white backdrop-blur-md">
                   <span className="h-1.5 w-1.5 rounded-full bg-primary" />
-                  {label(spotlight)}
+                  {spotlight.participantId}
                 </Badge>
               )}
               {reactions.map((reaction, index) => (
@@ -421,7 +410,7 @@ function RoomSession({
                 Participants
               </p>
               <Badge variant="secondary" className="h-4 text-[9px]">
-                {remotePublications.length + 1}
+                {remoteTracks.length + 1}
               </Badge>
             </div>
             <div className="meet-participant-scroll min-h-0 flex-1">
@@ -432,10 +421,12 @@ function RoomSession({
                     aria-label="Spotlight your camera"
                     onClick={() => setPin("local")}
                   >
-                    <LocalVideo
-                      stream={stream}
+                    <Video
+                      source={camera}
+                      autoPlay
                       mirror
                       className="h-full w-full object-cover"
+                      onPlaybackError={playbackError}
                     />
                     <Badge
                       variant="secondary"
@@ -445,37 +436,26 @@ function RoomSession({
                     </Badge>
                   </button>
                 )}
-                {remotePublications
-                  .filter((publication) => publication.id !== spotlight)
-                  .map((publication) => (
+                {remoteTracks
+                  .filter((track) => track !== spotlight)
+                  .map((track) => (
                     <button
-                      key={publication.id}
-                      ref={(element) => {
-                        if (element) tiles.current.set(publication.id, element);
-                        else tiles.current.delete(publication.id);
-                      }}
-                      data-publication={publication.id}
+                      key={`${track.participantId}:${track.label}`}
                       className="meet-participant-tile relative aspect-video shrink-0 overflow-hidden rounded-lg border-2 border-transparent bg-muted transition-colors hover:border-primary"
-                      aria-label={`Spotlight ${publication.participantId}`}
-                      onClick={() => setPin(publication.id)}
+                      aria-label={`Spotlight ${track.participantId}`}
+                      onClick={() => setPin(track)}
                     >
-                      {agent.tracks[publication.id]?.kind === "video" ? (
-                        <RemoteMedia
-                          agent={playbackAgent}
-                          publicationId={publication.id}
-                          kind="video"
-                          onBlocked={onBlocked}
-                        />
-                      ) : (
-                        <span className="grid h-full place-items-center text-xs">
-                          Waiting for video
-                        </span>
-                      )}
+                      <Video
+                        source={track}
+                        autoPlay
+                        className="h-full w-full object-contain"
+                        onPlaybackError={playbackError}
+                      />
                       <Badge
                         variant="secondary"
                         className="absolute bottom-1.5 left-1.5 h-4 max-w-[calc(100%-0.75rem)] truncate border-0 bg-black/50 text-[9px] text-white backdrop-blur-sm"
                       >
-                        {publication.participantId}
+                        {track.participantId}
                       </Badge>
                     </button>
                   ))}
@@ -557,15 +537,7 @@ function RoomSession({
             </aside>
           )}
         </main>
-        {audioTracks.map((track) => (
-          <RemoteMedia
-            agent={playbackAgent}
-            key={track.publicationId}
-            publicationId={track.publicationId}
-            kind="audio"
-            onBlocked={onBlocked}
-          />
-        ))}
+        <Audio source={owner.remoteAudio} onPlaybackError={playbackError} />
       </div>
     </TooltipProvider>
   );

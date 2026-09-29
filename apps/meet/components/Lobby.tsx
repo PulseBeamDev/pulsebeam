@@ -1,42 +1,43 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
+import { useMediaDevices } from "@pulsebeam/react";
+import type { CaptureResult } from "@pulsebeam/react";
 import { DeviceSelector } from "./DeviceSelector";
 import { MediaPreview } from "./MediaPreview";
 import { Button, Card, CardContent, Input } from "./ui";
-import { useMediaDevices } from "@/hooks/media";
 import { defaultServerUrl } from "@/lib/config";
 import { normalizeEndpoint } from "@/lib/model";
 import { Radio, RefreshCw } from "lucide-react";
 
 export function Lobby({
+  capture,
+  videoDeviceId,
+  audioDeviceId,
+  setVideoDeviceId,
+  setAudioDeviceId,
   onJoin,
 }: {
-  onJoin(token: string, endpoint: string, stream: MediaStream): void;
+  capture: CaptureResult;
+  videoDeviceId: string;
+  audioDeviceId: string;
+  setVideoDeviceId(id: string): void;
+  setAudioDeviceId(id: string): void;
+  onJoin(
+    token: string,
+    endpoint: string,
+    cameraOn: boolean,
+    micOn: boolean,
+  ): void;
 }) {
   const [token, setToken] = useState("");
   const [serverURL, setServerURL] = useState(defaultServerUrl);
-  const videoRef = useRef<HTMLVideoElement>(null);
-  const {
-    stream,
-    devices,
-    videoDeviceId,
-    audioDeviceId,
-    error,
-    isMicOn,
-    isCamOn,
-    startMedia,
-    takeStream,
-    toggleAudio,
-    toggleVideo,
-    setVideoDeviceId,
-    setAudioDeviceId,
-  } = useMediaDevices();
+  const devices = useMediaDevices();
+  const { videoTrack, audioTrack, error, request } = capture;
+  const [isMicOn, setMicOn] = useState(true);
+  const [isCamOn, setCamOn] = useState(true);
   const endpoint = normalizeEndpoint(serverURL);
   useEffect(() => {
-    void startMedia();
-  }, [startMedia]);
-  useEffect(() => {
-    if (videoRef.current) videoRef.current.srcObject = stream;
-  }, [stream]);
+    void request().catch(() => {});
+  }, [request]);
   return (
     <div className="relative flex min-h-dvh items-center justify-center overflow-hidden bg-background px-3 py-4 sm:p-6">
       <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_50%_-10%,color-mix(in_oklab,var(--primary)_20%,transparent),transparent_42%)]" />
@@ -61,23 +62,25 @@ export function Lobby({
             </div>
           </header>
           <MediaPreview
-            videoRef={videoRef}
+            videoTrack={videoTrack}
             isCamOn={isCamOn}
             isMicOn={isMicOn}
-            onToggleCam={toggleVideo}
-            onToggleMic={toggleAudio}
-            hasStream={Boolean(stream)}
+            onToggleCam={() => setCamOn((value) => !value)}
+            onToggleMic={() => setMicOn((value) => !value)}
+            hasStream={Boolean(videoTrack || audioTrack)}
           />
-          {error && (
+          {(error || devices.error) && (
             <div
               role="alert"
               className="flex items-center gap-3 rounded-lg border border-destructive/25 bg-destructive/10 p-3 text-sm text-destructive"
             >
-              <span className="min-w-0 flex-1">{error}</span>
+              <span className="min-w-0 flex-1">
+                {(error || devices.error)?.message}
+              </span>
               <Button
                 size="sm"
                 variant="secondary"
-                onClick={() => void startMedia()}
+                onClick={() => void request().catch(() => {})}
               >
                 <RefreshCw className="size-3.5" /> Retry
               </Button>
@@ -87,22 +90,21 @@ export function Lobby({
             <DeviceSelector
               label="Camera"
               value={videoDeviceId}
-              devices={devices.filter((d) => d.kind === "videoinput")}
+              devices={devices.cameras}
               onValueChange={setVideoDeviceId}
             />
             <DeviceSelector
               label="Microphone"
               value={audioDeviceId}
-              devices={devices.filter((d) => d.kind === "audioinput")}
+              devices={devices.microphones}
               onValueChange={setAudioDeviceId}
             />
           </div>
           <form
             onSubmit={(event) => {
               event.preventDefault();
-              const activeStream = takeStream();
-              if (activeStream && endpoint)
-                onJoin(token, endpoint, activeStream);
+              if (videoTrack && audioTrack && endpoint)
+                onJoin(token, endpoint, isCamOn, isMicOn);
             }}
             className="space-y-3 border-t pt-4"
           >
@@ -143,7 +145,7 @@ export function Lobby({
             <Button
               type="submit"
               className="h-11 w-full sm:h-9"
-              disabled={!stream || !endpoint}
+              disabled={!videoTrack || !audioTrack || !endpoint}
             >
               Join room
             </Button>

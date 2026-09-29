@@ -1,165 +1,72 @@
-import { useCallback, useEffect, useRef, useState } from "react";
-import type { Agent } from "@pulsebeam/react";
-import { localSlots } from "../lib/model";
-
-const sender = {
-  camera: { contentHint: "motion" as const },
-  microphone: { contentHint: "speech" as const },
-  screen: { contentHint: "detail" as const },
-};
-
-export const stopMedia = (stream: MediaStream | null) =>
-  stream?.getTracks().forEach((track) => track.stop());
+import { useCallback, useEffect, useState } from "react";
+import { useDisplayMedia } from "@pulsebeam/react";
+import type { Agent, CaptureResult } from "@pulsebeam/react";
 
 export function useRoomMedia(
-  agent: Pick<Agent, "replaceLocalTrack" | "setLocalMuted">,
-  stream: MediaStream,
+  agent: Agent,
+  capture: CaptureResult,
   onFailure: (message: string) => void,
+  initial: { cameraOn: boolean; micOn: boolean },
 ) {
-  const [screen, setScreen] = useState<MediaStream | null>(null);
-  const screenRef = useRef<MediaStream | null>(null);
-  const operations = useRef(Promise.resolve());
-  const alive = useRef(true);
-  const captureRequest = useRef(0);
-  const [cameraOn, setCameraOn] = useState(
-    stream.getVideoTracks()[0]?.enabled ?? false,
-  );
-  const [micOn, setMicOn] = useState(
-    stream.getAudioTracks()[0]?.enabled ?? false,
-  );
-
-  const queue = useCallback(
-    (operation: () => Promise<void>) => {
-      operations.current = operations.current
-        .then(operation, operation)
-        .catch((reason) => {
-          if (alive.current) {
-            onFailure(
-              reason instanceof Error
-                ? reason.message
-                : "Media operation failed",
-            );
-          }
-        });
+  const display = useDisplayMedia({
+    video: {
+      width: { ideal: 1920 },
+      height: { ideal: 1080 },
+      frameRate: { ideal: 30 },
+      displaySurface: "monitor",
     },
-    [onFailure],
-  );
+    audio: false,
+  });
+  const [cameraOn, setCameraOn] = useState(initial.cameraOn);
+  const [micOn, setMicOn] = useState(initial.micOn);
+  const camera = agent.localVideoTrack("camera");
+  const microphone = agent.localAudioTrack("microphone");
+  const screen = agent.localVideoTrack("screen");
 
   useEffect(() => {
-    queue(async () => {
-      const camera = stream.getVideoTracks()[0] ?? null;
-      const microphone = stream.getAudioTracks()[0] ?? null;
-      if (camera) camera.enabled = cameraOn;
-      if (microphone) microphone.enabled = micOn;
-      await agent.replaceLocalTrack(localSlots.camera, camera, sender.camera);
-      await agent.replaceLocalTrack(
-        localSlots.microphone,
-        microphone,
-        sender.microphone,
-      );
-      await agent.setLocalMuted(localSlots.camera, !cameraOn);
-      await agent.setLocalMuted(localSlots.microphone, !micOn);
-    });
-  }, [agent, cameraOn, micOn, queue, stream]);
-
-  const detachScreen = useCallback(() => {
-    const active = screenRef.current;
-    if (!active) return;
-    screenRef.current = null;
-    setScreen(null);
-    queue(async () => {
-      try {
-        await agent.replaceLocalTrack(localSlots.screen, null, sender.screen);
-      } finally {
-        stopMedia(active);
-      }
-    });
-  }, [agent, queue]);
+    camera.setSource(cameraOn ? capture.videoTrack : null);
+  }, [camera, cameraOn, capture.videoTrack]);
+  useEffect(() => {
+    microphone.setSource(micOn ? capture.audioTrack : null);
+  }, [microphone, micOn, capture.audioTrack]);
+  useEffect(() => {
+    screen.setSource(display.videoTrack);
+  }, [screen, display.videoTrack]);
+  useEffect(
+    () => () => {
+      screen.setSource(null);
+      camera.setSource(null);
+      microphone.setSource(null);
+      display.stop();
+    },
+    [camera, display.stop, microphone, screen],
+  );
 
   const startShare = useCallback(async () => {
-    const request = ++captureRequest.current;
     try {
-      const Capture = (
-        globalThis as typeof globalThis & {
-          CaptureController?: new () => object;
-        }
-      ).CaptureController;
-      const controller = Capture ? new Capture() : undefined;
-      const display = await navigator.mediaDevices.getDisplayMedia({
-        video: {
-          width: { ideal: 1920 },
-          height: { ideal: 1080 },
-          frameRate: { ideal: 30 },
-          displaySurface: "monitor",
-        },
-        audio: false,
-        systemAudio: "exclude",
-        windowAudio: "exclude",
-        surfaceSwitching: "include",
-        ...(controller ? { controller } : {}),
-      } as MediaStreamConstraints);
-      if (
-        !alive.current ||
-        request !== captureRequest.current ||
-        screenRef.current
-      ) {
-        stopMedia(display);
-        return;
-      }
-      screenRef.current = display;
-      setScreen(display);
-      display
-        .getVideoTracks()[0]
-        ?.addEventListener("ended", detachScreen, { once: true });
-      queue(async () => {
-        try {
-          await agent.replaceLocalTrack(
-            localSlots.screen,
-            display.getVideoTracks()[0] ?? null,
-            sender.screen,
-          );
-        } catch (reason) {
-          if (screenRef.current === display) detachScreen();
-          throw reason;
-        }
-      });
+      await display.request();
     } catch (reason) {
-      if (alive.current && request === captureRequest.current) {
-        onFailure(
-          reason instanceof Error
-            ? `Screen share: ${reason.message}`
-            : "Screen sharing was cancelled",
-        );
-      }
+      onFailure(
+        reason instanceof Error
+          ? `Screen share: ${reason.message}`
+          : "Screen sharing was cancelled",
+      );
     }
-  }, [agent, detachScreen, onFailure, queue]);
-
-  useEffect(() => {
-    const requests = captureRequest;
-    alive.current = true;
-    return () => {
-      alive.current = false;
-      ++requests.current;
-      detachScreen();
-    };
-  }, [detachScreen]);
-
+  }, [display.request, onFailure]);
   const toggle = useCallback(
     (slot: "camera" | "microphone", enabled: boolean) => {
-      stream
-        .getTracks()
-        .filter(
-          (track) => track.kind === (slot === "camera" ? "video" : "audio"),
-        )
-        .forEach((track) => {
-          track.enabled = enabled;
-        });
       if (slot === "camera") setCameraOn(enabled);
       else setMicOn(enabled);
-      queue(() => agent.setLocalMuted(localSlots[slot], !enabled));
     },
-    [agent, queue, stream],
+    [],
   );
-
-  return { screen, cameraOn, micOn, detachScreen, startShare, toggle };
+  return {
+    screen: display.videoTrack,
+    camera,
+    cameraOn,
+    micOn,
+    detachScreen: display.stop,
+    startShare,
+    toggle,
+  };
 }
