@@ -136,7 +136,9 @@
     receiver,
     (snapshot) =>
       snapshot.mapping.acceptedIntentRevision > 0 &&
-      snapshot.mapping.video.some((entry) => entry.publicationId === publication.id) &&
+      snapshot.mapping.video.some(
+        (entry) => entry.publicationId === publication.id,
+      ) &&
       snapshot.tracks[publication.id]?.media.readyState === "live",
     "fixed-policy remote media",
   );
@@ -144,9 +146,13 @@
   const previousGeneration = delivered.generation;
   const oldTrack = delivered.tracks[publication.id].media;
   const oldPeer = peerForTrack(oldTrack);
-  const oldReceiver = oldPeer?.getReceivers().find((entry) => entry.track === oldTrack);
+  const oldReceiver = oldPeer
+    ?.getReceivers()
+    .find((entry) => entry.track === oldTrack);
   let staleOnTrack = 0;
-  const countStaleOnTrack = () => { staleOnTrack += 1; };
+  const countStaleOnTrack = () => {
+    staleOnTrack += 1;
+  };
   oldPeer?.addEventListener("track", countStaleOnTrack);
   const fixedRevision = delivered.mapping.acceptedIntentRevision;
   const receivedPackets = async () => {
@@ -161,27 +167,41 @@
   };
   const initialPackets = await receivedPackets();
   let fixedPackets = initialPackets;
-  for (let attempt = 0; attempt < 100 && fixedPackets < initialPackets + 4; attempt++) {
+  for (
+    let attempt = 0;
+    attempt < 100 && fixedPackets < initialPackets + 4;
+    attempt++
+  ) {
     await new Promise((resolve) => setTimeout(resolve, 100));
     fixedPackets = await receivedPackets();
   }
   if (fixedPackets < initialPackets + 4) {
-    throw new Error(`no continuing fixed-policy RTP: initial=${initialPackets} final=${fixedPackets}`);
+    throw new Error(
+      `no continuing fixed-policy RTP: initial=${initialPackets} final=${fixedPackets}`,
+    );
   }
   const decodedFrames = async () => {
     const stats = await oldReceiver.getStats();
     return [...stats.values()]
-      .filter((report) => report.type === "inbound-rtp" && report.kind === "video")
+      .filter(
+        (report) => report.type === "inbound-rtp" && report.kind === "video",
+      )
       .reduce((sum, report) => sum + (report.framesDecoded ?? 0), 0);
   };
   const initialFrames = await decodedFrames();
   let fixedFrames = initialFrames;
-  for (let attempt = 0; attempt < 100 && fixedFrames < initialFrames + 2; attempt++) {
+  for (
+    let attempt = 0;
+    attempt < 100 && fixedFrames < initialFrames + 2;
+    attempt++
+  ) {
     await new Promise((resolve) => setTimeout(resolve, 100));
     fixedFrames = await decodedFrames();
   }
   if (fixedFrames < initialFrames + 2) {
-    throw new Error(`no decoded fixed-policy frames: initial=${initialFrames} final=${fixedFrames}`);
+    throw new Error(
+      `no decoded fixed-policy frames: initial=${initialFrames} final=${fixedFrames}`,
+    );
   }
   const receiverEvents = [];
   const removeReceiverEvents = receiver.subscribeEvents((event) => {
@@ -206,32 +226,40 @@
       snapshot.connection === "connected" &&
       snapshot.generation !== previousGeneration &&
       snapshot.mapping.acceptedIntentRevision > 0 &&
-      snapshot.mapping.video.some((entry) => entry.publicationId === publication.id) &&
+      snapshot.mapping.video.some(
+        (entry) => entry.publicationId === publication.id,
+      ) &&
       snapshot.tracks[publication.id]?.media.readyState === "live" &&
       oldTrack.readyState === "ended",
     "fresh default receiver after fixed playout",
   ).catch((error) => {
     const snapshot = receiver.getSnapshot();
-    throw new Error(`${error.message}: ${JSON.stringify({
-      generation: String(snapshot.generation),
-      oldGeneration: String(previousGeneration),
-      acceptedRevision: String(snapshot.mapping.acceptedIntentRevision),
-      desiredRevision: String(snapshot.desiredRevision),
-      failure: snapshot.failure,
-      events: receiverEvents,
-      oldState: oldTrack.readyState,
-      oldPeerState: oldPeer?.signalingState,
-    })}`);
+    throw new Error(
+      `${error.message}: ${JSON.stringify({
+        generation: String(snapshot.generation),
+        oldGeneration: String(previousGeneration),
+        acceptedRevision: String(snapshot.mapping.acceptedIntentRevision),
+        desiredRevision: String(snapshot.desiredRevision),
+        failure: snapshot.failure,
+        events: receiverEvents,
+        oldState: oldTrack.readyState,
+        oldPeerState: oldPeer?.signalingState,
+      })}`,
+    );
   });
   removeReceiverEvents();
   const newTrack = reconnected.tracks[publication.id].media;
   const newPeer = peerForTrack(newTrack);
-  const newReceiver = newPeer?.getReceivers().find((entry) => entry.track === newTrack);
+  const newReceiver = newPeer
+    ?.getReceivers()
+    .find((entry) => entry.track === newTrack);
   const restoredStats = async () => {
     if (!newReceiver) return { packets: 0, frames: 0 };
     const stats = await newReceiver.getStats();
     return [...stats.values()]
-      .filter((report) => report.type === "inbound-rtp" && report.kind === "video")
+      .filter(
+        (report) => report.type === "inbound-rtp" && report.kind === "video",
+      )
       .reduce(
         (sum, report) => ({
           packets: sum.packets + (report.packetsReceived ?? 0),
@@ -242,9 +270,13 @@
   };
   const restoredInitial = await restoredStats();
   let restored = restoredInitial;
-  for (let attempt = 0; attempt < 100 &&
-      (restored.packets < restoredInitial.packets + 4 ||
-       restored.frames < restoredInitial.frames + 2); attempt++) {
+  for (
+    let attempt = 0;
+    attempt < 100 &&
+    (restored.packets < restoredInitial.packets + 4 ||
+      restored.frames < restoredInitial.frames + 2);
+    attempt++
+  ) {
     await new Promise((resolve) => setTimeout(resolve, 100));
     restored = await restoredStats();
   }

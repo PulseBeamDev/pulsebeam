@@ -1,6 +1,10 @@
 import {
   createAgent,
+  createCaptureSource,
   attachRemoteMedia,
+  attachRemoteAudio,
+  attachRemoteVideo,
+  LocalTrackCapacityError,
   type AgentEvent,
   type AgentFailure,
   type AgentSnapshot,
@@ -8,6 +12,8 @@ import {
   type FailureClass,
   type PlaybackFailure,
   type RemoteMediaAttachment,
+  type RemoteVideoTrack,
+  type RemoteAudioTrack,
 } from "../../web/index.js";
 
 declare const audioTrack: MediaStreamTrack;
@@ -52,6 +58,24 @@ const desired: AgentState = {
 };
 agent.setState(desired);
 
+agent.connect();
+const camera = agent.localVideoTrack("camera");
+const microphone = agent.localAudioTrack("camera");
+const videoSource = createCaptureSource(audioTrack, "video");
+const audioSource = createCaptureSource(audioTrack, "audio");
+camera.setSource(videoSource);
+microphone.setSource(audioSource);
+// @ts-expect-error Audio sources cannot attach to video handles.
+camera.setSource(audioSource);
+// @ts-expect-error Logical handle sources are not raw browser tracks.
+camera.setSource(audioTrack);
+const videoCapacity: LocalTrackCapacityError = new LocalTrackCapacityError(
+  "video",
+  "screen",
+  1,
+);
+void videoCapacity;
+agent.disconnect();
 const snapshot: AgentSnapshot = agent.getSnapshot();
 const catalogRevision: number = snapshot.catalog.revision;
 const acceptedIntentRevision: number = snapshot.mapping.acceptedIntentRevision;
@@ -82,6 +106,33 @@ const removeEvents = agent.subscribeEvents((event: AgentEvent) => {
     void failureMessage;
   }
 });
+const discoveredVideo: RemoteVideoTrack | undefined =
+  agent.remoteVideoTracks[0];
+const discoveredAudio: RemoteAudioTrack | undefined =
+  agent.remoteAudioTracks[0];
+if (discoveredVideo) {
+  const participant: string = discoveredVideo.participantId;
+  const label: string = discoveredVideo.label;
+  discoveredVideo.setReceiveOptions({
+    minHeight: 360,
+    minFps: 24,
+    priority: 2,
+  });
+  const unsubscribeVideo = discoveredVideo.subscribe(
+    () => discoveredVideo.active,
+  );
+  unsubscribeVideo();
+  void [participant, label];
+}
+if (discoveredAudio) void discoveredAudio.label;
+const roomChat = agent.topic<{ message: string }>("chat", { mode: "reliable" });
+void roomChat.publish({ message: "hello" });
+const liveMessages: AsyncIterable<{ message: string }> = roomChat.subscribe();
+void liveMessages;
+// @ts-expect-error topic payload must match its declared type
+void roomChat.publish({ message: 42 });
+// @ts-expect-error public topic API selects reliable or unreliable, not core wire mode
+agent.topic("chat", { mode: "ordered" });
 const replacement: Promise<void> = agent.replaceLocalTrack("a0", audioTrack, {
   contentHint: "speech",
   encodings: [],
@@ -99,6 +150,14 @@ const attachment: RemoteMediaAttachment = attachRemoteMedia(
   },
 );
 attachment.setPublicationIds(["publication-audio"]);
+const audioPlayback = attachRemoteAudio(agent.remoteAudio, audioElement);
+audioPlayback.close();
+declare const videoElement: HTMLVideoElement;
+if (discoveredVideo) attachRemoteVideo(discoveredVideo, videoElement).close();
+if (discoveredVideo) {
+  // @ts-expect-error video source cannot be attached to an audio element
+  attachRemoteVideo(discoveredVideo, audioElement);
+}
 void attachment.retryPlayback();
 attachment.close();
 agent.sendTopic("presence", "latest", new Uint8Array([1]));

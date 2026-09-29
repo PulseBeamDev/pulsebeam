@@ -1,4 +1,25 @@
+import type {
+  CapturedAudioTrack,
+  CapturedVideoTrack,
+} from "./capture-source.js";
+
 export type MediaKind = "audio" | "video";
+
+export interface LocalVideoTrack {
+  readonly kind: "video";
+  readonly label: string;
+  readonly source: CapturedVideoTrack | null;
+  setSource(source: CapturedVideoTrack | null): void;
+  subscribe(listener: () => void): () => void;
+}
+
+export interface LocalAudioTrack {
+  readonly kind: "audio";
+  readonly label: string;
+  readonly source: CapturedAudioTrack | null;
+  setSource(source: CapturedAudioTrack | null): void;
+  subscribe(listener: () => void): () => void;
+}
 export type TopicMode = "latest" | "ordered";
 export type LogLevel = "off" | "error" | "warn" | "info" | "debug" | "trace";
 
@@ -135,15 +156,47 @@ interface RemoteMediaBase {
   readonly media: MediaStreamTrack;
 }
 
-export interface RemoteVideoTrack extends RemoteMediaBase {
+export interface MappedRemoteVideoTrack extends RemoteMediaBase {
   readonly kind: "video";
 }
 
-export interface RemoteAudioTrack extends RemoteMediaBase {
+export interface MappedRemoteAudioTrack extends RemoteMediaBase {
   readonly kind: "audio";
 }
 
-export type RemoteTrack = RemoteVideoTrack | RemoteAudioTrack;
+export type RemoteTrack = MappedRemoteVideoTrack | MappedRemoteAudioTrack;
+
+export interface ReceiveOptions {
+  readonly minHeight?: number;
+  readonly minFps?: number;
+  readonly priority?: number;
+  readonly playoutDelay?: Readonly<{ minMs: number; maxMs: number }>;
+}
+
+export interface RemoteVideoTrack {
+  readonly kind: "video";
+  /** External application participant identity, not a canonical runtime ID. */
+  readonly participantId: string;
+  readonly label: string;
+  readonly active: boolean;
+  setReceiveOptions(options: ReceiveOptions): void;
+  subscribe(listener: () => void): () => void;
+}
+
+export interface RemoteAudioTrack {
+  readonly kind: "audio";
+  readonly participantId: string;
+  readonly label: string;
+}
+
+export interface RemoteAudioSource {
+  readonly kind: "remote-audio";
+}
+
+export interface Topic<T> {
+  publish(value: T): Promise<void>;
+  subscribe(options?: { readonly signal?: AbortSignal }): AsyncIterable<T>;
+}
 
 export interface TopicPublisherStatus {
   readonly name: string;
@@ -300,6 +353,17 @@ export type AgentEvent =
   | { readonly type: "state-change" };
 
 export interface Agent {
+  readonly remoteVideoTracks: readonly RemoteVideoTrack[];
+  readonly remoteAudioTracks: readonly RemoteAudioTrack[];
+  readonly remoteAudio: RemoteAudioSource;
+  topic<T>(
+    name: string,
+    options: { readonly mode: "reliable" | "unreliable" },
+  ): Topic<T>;
+  localVideoTrack(label: string): LocalVideoTrack;
+  localAudioTrack(label: string): LocalAudioTrack;
+  connect(): void;
+  disconnect(): void;
   setState(state: AgentState): void;
   replaceLocalTrack(
     slot: string,

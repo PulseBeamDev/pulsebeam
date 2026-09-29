@@ -1,5 +1,12 @@
-export { createAgent } from "./agent.js";
+export { createAgent, LocalTrackCapacityError } from "./agent.js";
+export { createCaptureSource, nativeCaptureTrack } from "./capture-source.js";
+export type {
+  CapturedAudioTrack,
+  CapturedTrack,
+  CapturedVideoTrack,
+} from "./capture-source.js";
 export { attachRemoteMedia } from "./remote-media.js";
+export { attachRemoteVideo, attachRemoteAudio } from "./remote-catalog.js";
 export type {
   Agent,
   AgentConfig,
@@ -16,13 +23,19 @@ export type {
   FixedPlayoutDelay,
   MediaKind,
   MappingSnapshot,
+  MappedRemoteAudioTrack,
+  MappedRemoteVideoTrack,
   MediaTopology,
   LogLevel,
+  LocalAudioTrack,
+  LocalVideoTrack,
   Participant,
   PlaybackFailure,
   Publication,
   PublicationIntent,
+  RemoteAudioSource,
   RemoteAudioTrack,
+  ReceiveOptions,
   RemoteMediaAttachment,
   RemoteMediaAttachmentOptions,
   RemoteTrack,
@@ -35,6 +48,7 @@ export type {
   TopicRegistration,
   TopicSnapshot,
   TopicSubscriberStatus,
+  Topic,
   TrackMapping,
   TrackSelector,
   VideoDemand,
