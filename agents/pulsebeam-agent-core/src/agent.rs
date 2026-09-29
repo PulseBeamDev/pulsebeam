@@ -169,6 +169,7 @@ pub struct Agent {
     config: AgentConfig,
     desired: DesiredState,
     local_bindings: BTreeMap<MediaSlot, String>,
+    retired_tracks: BTreeSet<String>,
     snapshot: Snapshot,
     ids: IdGenerator,
     effects: VecDeque<Effect>,
@@ -193,6 +194,7 @@ impl Agent {
             config,
             desired: DesiredState::default(),
             local_bindings: BTreeMap::new(),
+            retired_tracks: BTreeSet::new(),
             snapshot: Snapshot::default(),
             ids: IdGenerator::new(),
             effects: VecDeque::new(),
@@ -338,6 +340,25 @@ impl Agent {
         for publication in &desired.publications {
             self.local_bindings
                 .insert(local_slot(&publication.slot), publication.label.clone());
+        }
+        if let Some(active) = self.active.as_ref() {
+            for video in &desired.video {
+                if video.selector.is_none()
+                    && active.observed.tracks.contains_key(&video.track_id)
+                    && !self.desired.video.iter().any(|previous| {
+                        previous.selector.is_none() && previous.track_id == video.track_id
+                    })
+                {
+                    self.retired_tracks.remove(&video.track_id);
+                }
+            }
+            for id in &desired.audio.pinned {
+                if active.observed.tracks.contains_key(id)
+                    && !self.desired.audio.pinned.contains(id)
+                {
+                    self.retired_tracks.remove(id);
+                }
+            }
         }
         let video_changed = self.desired.video != desired.video;
         let intent_changed = self.desired.publications != desired.publications
@@ -806,6 +827,7 @@ impl Agent {
                 }
                 let resolved_before =
                     signaling::resolved_selectors(&self.desired, &active.observed);
+                let tracks_before: BTreeSet<_> = active.observed.tracks.keys().cloned().collect();
                 let output = signaling_v1::decode_and_apply(
                     &payload,
                     &mut active.observed,
@@ -851,8 +873,21 @@ impl Agent {
                             self.snapshot.video.len(),
                             self.snapshot.audio.len(),
                         );
-                        if resolved_before
-                            != signaling::resolved_selectors(&self.desired, &active.observed)
+                        let removed: Vec<_> = tracks_before
+                            .into_iter()
+                            .filter(|id| !active.observed.tracks.contains_key(id))
+                            .collect();
+                        let direct_removed = removed.iter().any(|id| {
+                            self.desired
+                                .video
+                                .iter()
+                                .any(|video| video.selector.is_none() && video.track_id == *id)
+                                || self.desired.audio.pinned.contains(id)
+                        });
+                        self.retired_tracks.extend(removed);
+                        if direct_removed
+                            || resolved_before
+                                != signaling::resolved_selectors(&self.desired, &active.observed)
                         {
                             self.intent_dirty = true;
                             self.send_intent_if_ready();
@@ -1238,8 +1273,16 @@ impl Agent {
         let Some(revision) = active.intent_revision.checked_add(1) else {
             return;
         };
+        let mut desired = self.desired.clone();
+        desired.video.retain(|video| {
+            video.selector.is_some() || !self.retired_tracks.contains(&video.track_id)
+        });
+        desired
+            .audio
+            .pinned
+            .retain(|id| !self.retired_tracks.contains(id));
         let payload = match signaling::encode_v1_intent(
-            &self.desired,
+            &desired,
             &self.config.topology,
             &active.coordinates,
             &active.observed,
