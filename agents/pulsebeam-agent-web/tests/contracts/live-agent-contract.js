@@ -145,6 +145,9 @@
   const oldTrack = delivered.tracks[publication.id].media;
   const oldPeer = peerForTrack(oldTrack);
   const oldReceiver = oldPeer?.getReceivers().find((entry) => entry.track === oldTrack);
+  let staleOnTrack = 0;
+  const countStaleOnTrack = () => { staleOnTrack += 1; };
+  oldPeer?.addEventListener("track", countStaleOnTrack);
   const fixedRevision = delivered.mapping.acceptedIntentRevision;
   const receivedPackets = async () => {
     const stats = await oldReceiver.getStats();
@@ -224,7 +227,32 @@
   const newTrack = reconnected.tracks[publication.id].media;
   const newPeer = peerForTrack(newTrack);
   const newReceiver = newPeer?.getReceivers().find((entry) => entry.track === newTrack);
+  const restoredStats = async () => {
+    if (!newReceiver) return { packets: 0, frames: 0 };
+    const stats = await newReceiver.getStats();
+    return [...stats.values()]
+      .filter((report) => report.type === "inbound-rtp" && report.kind === "video")
+      .reduce(
+        (sum, report) => ({
+          packets: sum.packets + (report.packetsReceived ?? 0),
+          frames: sum.frames + (report.framesDecoded ?? 0),
+        }),
+        { packets: 0, frames: 0 },
+      );
+  };
+  const restoredInitial = await restoredStats();
+  let restored = restoredInitial;
+  for (let attempt = 0; attempt < 100 &&
+      (restored.packets < restoredInitial.packets + 4 ||
+       restored.frames < restoredInitial.frames + 2); attempt++) {
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    restored = await restoredStats();
+  }
   const defaultRecreated =
+    restored.packets >= restoredInitial.packets + 4 &&
+    restored.frames >= restoredInitial.frames + 2 &&
+    staleOnTrack === 0 &&
+    receiver.getSnapshot().tracks[publication.id]?.media === newTrack &&
     fixedRevision > 0 &&
     oldPeer !== undefined &&
     oldPeer.signalingState === "closed" &&
@@ -235,6 +263,7 @@
     newReceiver !== oldReceiver &&
     oldTrack.readyState === "ended" &&
     newTrack.readyState === "live";
+  oldPeer?.removeEventListener("track", countStaleOnTrack);
   RTCPeerConnection.prototype.addTransceiver = originalAddTransceiver;
 
   const runtimeEvents = [];
