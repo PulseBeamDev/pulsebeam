@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { Audio, Video, useAgent } from "@pulsebeam/react";
-import type { Agent, CaptureResult } from "@pulsebeam/react";
+import type { Agent } from "@pulsebeam/react";
 import {
   Badge,
   Button,
@@ -20,6 +20,7 @@ import {
   MessageCircle,
   Mic,
   MicOff,
+  Settings2,
   Monitor,
   MonitorOff,
   PhoneOff,
@@ -31,6 +32,8 @@ import {
   X,
 } from "lucide-react";
 import { useRoomMedia } from "@/hooks/room-media";
+import { DeviceSelector } from "./DeviceSelector";
+import { useMeetMedia } from "./MeetMediaProvider";
 import { useTopics } from "@/hooks/topics";
 import { useVideoLayout } from "@/hooks/video-layout";
 
@@ -55,14 +58,12 @@ const reactionEmojis = ["👍", "❤️", "😂", "😮", "👏", "🔥"];
 export function Room({
   token,
   endpoint,
-  capture,
   cameraOn,
   micOn,
   onLeave,
 }: {
   token: string;
   endpoint: string;
-  capture: CaptureResult;
   cameraOn: boolean;
   micOn: boolean;
   onLeave(): void;
@@ -81,7 +82,6 @@ export function Room({
   return agent ? (
     <RoomSession
       agent={agent}
-      capture={capture}
       initial={{ cameraOn, micOn }}
       onLeave={onLeave}
     />
@@ -92,16 +92,23 @@ export function Room({
 
 function RoomSession({
   agent: owner,
-  capture,
   initial,
   onLeave,
 }: {
   agent: Agent;
-  capture: CaptureResult;
   initial: { cameraOn: boolean; micOn: boolean };
   onLeave(): void;
 }) {
   const agent = owner.getSnapshot();
+  const {
+    capture,
+    devices,
+    videoDeviceId,
+    audioDeviceId,
+    setVideoDeviceId,
+    setAudioDeviceId,
+  } = useMeetMedia();
+  const [devicesOpen, setDevicesOpen] = useState(false);
   const [latency, setLatency] = useState<{
     mode: "fixed";
     minMs: number;
@@ -115,7 +122,12 @@ function RoomSession({
     (() => Promise<void>) | null
   >(null);
   const { screen, camera, cameraOn, micOn, detachScreen, startShare, toggle } =
-    useRoomMedia(owner, capture, setFailure, initial);
+    useRoomMedia(
+      owner,
+      { videoTrack: capture.videoTrack, audioTrack: capture.audioTrack },
+      setFailure,
+      initial,
+    );
   const {
     messages,
     reactions,
@@ -234,6 +246,20 @@ function RoomSession({
               size="sm"
               className={cn(
                 "h-8 rounded-md px-2.5",
+                devicesOpen && "bg-primary/10 text-primary",
+              )}
+              aria-label="Devices"
+              aria-expanded={devicesOpen}
+              onClick={() => setDevicesOpen((open) => !open)}
+            >
+              <Settings2 className="h-4 w-4" />
+              <span className="hidden text-xs sm:inline">Devices</span>
+            </Button>
+            <Button
+              variant="ghost"
+              size="sm"
+              className={cn(
+                "h-8 rounded-md px-2.5",
                 screen && "bg-primary/10 text-primary",
               )}
               onClick={() => (screen ? detachScreen() : void startShare())}
@@ -282,6 +308,39 @@ function RoomSession({
             </Tooltip>
           </div>
         </header>
+        {devicesOpen && (
+          <div className="grid shrink-0 grid-cols-1 gap-3 border-b bg-card px-3 py-3 sm:grid-cols-2">
+            <DeviceSelector
+              label="Camera"
+              value={videoDeviceId}
+              devices={devices.cameras}
+              onValueChange={setVideoDeviceId}
+            />
+            <DeviceSelector
+              label="Microphone"
+              value={audioDeviceId}
+              devices={devices.microphones}
+              onValueChange={setAudioDeviceId}
+            />
+          </div>
+        )}
+        {(capture.error || devices.error) && (
+          <div
+            role="alert"
+            className="flex items-center gap-2 border-b bg-destructive/10 px-3 py-2 text-sm text-destructive"
+          >
+            <span className="min-w-0 flex-1">
+              {(capture.error || devices.error)?.message}
+            </span>
+            <Button
+              size="sm"
+              variant="secondary"
+              onClick={() => void capture.request().catch(() => {})}
+            >
+              Retry capture
+            </Button>
+          </div>
+        )}
         {blocked && (
           <div
             role="alert"
