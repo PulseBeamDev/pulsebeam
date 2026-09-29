@@ -334,10 +334,9 @@ impl JitterBuffer {
     fn next_deadline_with_wait(&self, max_wait: Duration) -> Option<Instant> {
         let (&sequence, head) = self.buf.first_key_value()?;
         let budget = match self.next {
-            None => self.initial_wait.min(max_wait),
             Some(next) if next == sequence => Duration::ZERO,
             Some(_) if self.delivered_frame => max_wait,
-            Some(_) => self.initial_wait.min(max_wait),
+            None | Some(_) => self.initial_wait.min(max_wait),
         };
         head.arrival.checked_add(budget)
     }
@@ -516,7 +515,7 @@ impl FrameReceiver {
             }
             self.frame_wait
                 .entry(timestamp)
-                .or_insert(max_wait.unwrap_or(self.jitter.max_wait));
+                .or_insert_with(|| max_wait.unwrap_or(self.jitter.max_wait));
         }
         self.pop_ready()
     }

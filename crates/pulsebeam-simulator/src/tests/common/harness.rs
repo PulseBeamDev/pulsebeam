@@ -956,7 +956,6 @@ struct ParticipantShared {
     audio_rx: Arc<Mutex<AudioReceiveLog>>,
     quality_references: Arc<Mutex<BTreeMap<String, QualityVideoReference>>>,
     h264_publishers: Arc<Mutex<BTreeSet<String>>>,
-    paused_publishers: Arc<Mutex<BTreeSet<String>>>,
     tx_bytes: Mutex<u64>,
     rx_bytes: Mutex<u64>,
     connected: Mutex<bool>,
@@ -986,7 +985,6 @@ impl ParticipantShared {
             audio_rx: Arc::new(Mutex::new(AudioReceiveLog::default())),
             quality_references,
             h264_publishers,
-            paused_publishers: Arc::new(Mutex::new(BTreeSet::new())),
             tx_bytes: Mutex::new(0),
             rx_bytes: Mutex::new(0),
             connected: Mutex::new(false),
@@ -1084,10 +1082,6 @@ impl ParticipantHandle {
         self.shared.audio_rx.lock().unwrap().clone()
     }
 
-    fn paused_publishers(&self) -> BTreeSet<String> {
-        self.shared.paused_publishers.lock().unwrap().clone()
-    }
-
     fn video_stats_since_interval(&self) -> VideoReceiveStats {
         self.video_rx().stats().since(self.interval_video_baseline)
     }
@@ -1150,7 +1144,6 @@ async fn run_participant(
         }
         .with_quality_references(shared.quality_references.clone())
         .with_h264_publishers(shared.h264_publishers.clone())
-        .with_paused_publishers(shared.paused_publishers.clone())
         .with_audio_rx(shared.audio_rx.clone())
         .with_video_rx(shared.video_rx.clone())
         .with_initial_topics(initial_topics.clone());
@@ -3445,11 +3438,6 @@ pub struct LinkReport {
     /// question and "from whom" is the right one. A total byte count cannot distinguish the
     /// selector picking correctly from it picking at all.
     pub audio: AudioReceiveLog,
-    /// Publishers this viewer was *told* the SFU had stopped forwarding.
-    ///
-    /// A stream that stops is either paused or broken, and the media cannot tell you which. The
-    /// difference decides whether a UI can show a placeholder or has to leave the tile blank.
-    pub signalled_paused: BTreeSet<String>,
     /// What the decoder made of the stream, as distinct from what the link carried.
     ///
     /// Every other figure here is about bytes and bitrates, and a viewer cannot see bytes. A
@@ -3593,7 +3581,6 @@ fn measure(handle: &ParticipantHandle, ip: IpAddr, window: Duration) -> LinkRepo
         standing_backlog: stats.mean_backlog(),
         longest_silence: qoe.longest_freeze,
         qoe,
-        signalled_paused: handle.paused_publishers(),
         audio: handle.audio_rx(),
         delivered_packets: stats.delivered,
         congestion_drops: stats.dropped_overflow,

@@ -135,8 +135,8 @@ async fn run_peer(
         endpoint,
         token: mint_development_token(&room, &participant, u64::MAX)?,
         topology: pulsebeam_agent_core::MediaTopology {
-            local_video: vec!["camera".into()],
-            local_audio: vec!["microphone".into()],
+            local_video: 1,
+            local_audio: 1,
             remote_video: 1,
             remote_audio: 1,
         },
@@ -148,8 +148,8 @@ async fn run_peer(
     let udp = UdpSocket::bind(unspecified_addr(ip, 0)).await?;
     let runtime = RuntimeAgent::spawn(config, Host::new(create_http_client(), udp)).await?;
     let agent = Agent::from_runtime(runtime);
-    let video = agent.local_video("camera".into());
-    let audio = agent.local_audio("microphone".into());
+    let video = agent.local_video("v0".into());
+    let audio = agent.local_audio("a0".into());
     let remote_video = agent.remote_video(0).await?;
     let remote_audio = agent.remote_audio(0).await?;
 
@@ -165,11 +165,13 @@ async fn run_peer(
         connected: true,
         publications: vec![
             core_ffi::PublicationIntent {
-                slot: "camera".into(),
+                slot: "v0".into(),
+                label: "camera".into(),
                 active: true,
             },
             core_ffi::PublicationIntent {
-                slot: "microphone".into(),
+                slot: "a0".into(),
+                label: "microphone".into(),
                 active: true,
             },
         ],
@@ -202,6 +204,7 @@ async fn run_peer(
         .generation
         .ok_or_else(|| anyhow::anyhow!("{name} connected without a generation"))?;
     let remote_video_id = initial
+        .catalog
         .publications
         .iter()
         .find(|publication| {
@@ -211,6 +214,7 @@ async fn run_peer(
         .map(|publication| publication.id.clone())
         .ok_or_else(|| anyhow::anyhow!("{name} did not discover remote video"))?;
     let remote_audio_id = initial
+        .catalog
         .publications
         .iter()
         .find(|publication| {
@@ -223,10 +227,12 @@ async fn run_peer(
     desired.video = vec![core_ffi::VideoDemand {
         slot: 0,
         publication_id: remote_video_id.clone(),
+        selector: None,
         height: 720,
         min_height: 0,
         min_fps: 0,
         priority: 1,
+        playout_delay: core_ffi::PlayoutDelay::Adaptive,
     }];
     desired.audio.pinned = vec![remote_audio_id.clone()];
     agent.replace_desired(desired.clone()).await?;
@@ -264,8 +270,12 @@ async fn run_peer(
     };
     barriers.after_reconnect.wait().await;
     if !reconnect {
-        let replacement = wait_remote_replacement(&agent, &participant, &remote_video_id).await?;
+        desired.video.clear();
+        desired.audio.pinned.clear();
+        agent.replace_desired(desired.clone()).await?;
+        let replacement = wait_remote_media(&agent, &video).await?;
         let replacement_video = replacement
+            .catalog
             .publications
             .iter()
             .find(|publication| {
@@ -275,6 +285,7 @@ async fn run_peer(
             .map(|publication| publication.id.clone())
             .ok_or_else(|| anyhow::anyhow!("{name} did not rediscover remote video"))?;
         let replacement_audio = replacement
+            .catalog
             .publications
             .iter()
             .find(|publication| {
@@ -283,11 +294,21 @@ async fn run_peer(
             })
             .map(|publication| publication.id.clone())
             .ok_or_else(|| anyhow::anyhow!("{name} did not rediscover remote audio"))?;
-        desired.video[0].publication_id = replacement_video;
+        desired.video = vec![core_ffi::VideoDemand {
+            slot: 0,
+            publication_id: replacement_video,
+            selector: None,
+            height: 720,
+            min_height: 0,
+            min_fps: 0,
+            priority: 1,
+            playout_delay: core_ffi::PlayoutDelay::Adaptive,
+        }];
         desired.audio.pinned = vec![replacement_audio];
         agent.replace_desired(desired.clone()).await?;
     }
     wait_video_binding(&agent, &desired.video[0].publication_id).await?;
+    barriers.after_reconnect.wait().await;
     prime_ordered_topic(&agent, &ordered).await?;
     barriers.after_reconnect.wait().await;
     let events = agent.events();
@@ -317,35 +338,6 @@ async fn run_peer(
         latest_messages: first.2.saturating_add(second.2),
         ordered_messages: first.3.saturating_add(second.3),
     })
-}
-
-async fn wait_remote_replacement(
-    agent: &Agent,
-    participant: &str,
-    previous_video: &str,
-) -> anyhow::Result<core_ffi::Snapshot> {
-    let snapshots = agent.snapshots();
-    tokio::time::timeout(Duration::from_secs(20), async {
-        loop {
-            let SnapshotUpdate::Snapshot { snapshot } = snapshots.next().await else {
-                anyhow::bail!("native snapshot stream closed")
-            };
-            let has_replacement_video = snapshot.publications.iter().any(|publication| {
-                publication.participant_id != participant
-                    && publication.kind == core_ffi::MediaKind::Video
-                    && publication.id != previous_video
-            });
-            let has_remote_audio = snapshot.publications.iter().any(|publication| {
-                publication.participant_id != participant
-                    && publication.kind == core_ffi::MediaKind::Audio
-            });
-            if has_replacement_video && has_remote_audio {
-                return Ok(snapshot);
-            }
-        }
-    })
-    .await
-    .map_err(|_| anyhow::anyhow!("native peer did not observe replacement publications"))?
 }
 
 async fn wait_connected(
@@ -414,6 +406,7 @@ async fn wait_video_binding(agent: &Agent, video_id: &str) -> anyhow::Result<cor
                 anyhow::bail!("native snapshot stream closed")
             };
             let video_ready = snapshot
+                .mapping
                 .video
                 .iter()
                 .any(|binding| binding.publication_id == video_id);
@@ -456,7 +449,9 @@ async fn prime_ordered_topic(
                 anyhow::bail!("native snapshot stream closed")
             };
             if snapshot.topics.subscribers.iter().any(|subscriber| {
-                subscriber.subscriber.mode == core_ffi::TopicMode::Ordered
+                subscriber.subscriber.name == publisher.name
+                    && subscriber.subscriber.mode == publisher.mode
+                    && subscriber.connected
                     && subscriber.publishers > 0
             }) {
                 return Ok(());
@@ -491,6 +486,7 @@ async fn wait_remote_media(
             };
             let remote_media = snapshot.participant_id.as_ref().is_some_and(|participant| {
                 let remote: Vec<_> = snapshot
+                    .catalog
                     .publications
                     .iter()
                     .filter(|publication| &publication.participant_id != participant)
