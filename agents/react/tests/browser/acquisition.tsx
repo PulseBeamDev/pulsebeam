@@ -261,7 +261,13 @@ export async function runAcquisitionContract() {
     document.getElementById("acquire-display")!.click();
     await until(() => displayPending.length === 1);
     const screen = videoStream();
-    displayPending.shift()!.resolve(screen.stream);
+    const displayAudioContext = new AudioContext();
+    const displayAudio = displayAudioContext
+      .createMediaStreamDestination()
+      .stream.getAudioTracks()[0];
+    displayPending
+      .shift()!
+      .resolve(new MediaStream([screen.track, displayAudio]));
     await until(() => display.state === "active");
     screen.track.stop();
     screen.track.dispatchEvent(new Event("ended"));
@@ -270,7 +276,10 @@ export async function runAcquisitionContract() {
       noPromptOnOptions &&
       cancelledDisplay &&
       displayCalls === 2 &&
-      display.videoTrack === null;
+      display.videoTrack === null &&
+      display.audioTrack === null &&
+      displayAudio.readyState === "ended";
+    await displayAudioContext.close();
     document.getElementById("acquire-user")!.click();
     await until(() => userPending.length === 1);
     const afterUnmount = videoStream();

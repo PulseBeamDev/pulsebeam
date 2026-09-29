@@ -240,7 +240,10 @@ function useCapture(
     const audio = stream.getAudioTracks()[0];
     const onEnded = () => {
       if (current.current?.stream !== stream) return;
-      if (stream.getTracks().every((track) => track.readyState === "ended")) {
+      if (
+        (display && video?.readyState === "ended") ||
+        stream.getTracks().every((track) => track.readyState === "ended")
+      ) {
         stop();
       } else {
         setSnapshot((before) => ({
