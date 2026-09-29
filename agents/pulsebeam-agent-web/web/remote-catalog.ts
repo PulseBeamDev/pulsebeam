@@ -324,6 +324,26 @@ export function attachRemoteVideo(
   return attachVideoHandle(handle, element, onPlaybackBlocked, options);
 }
 
+function visibleInTree(element: HTMLElement): boolean {
+  if (element.ownerDocument.hidden) return false;
+  for (
+    let node: HTMLElement | null = element;
+    node;
+    node = node.parentElement
+  ) {
+    const style = node.ownerDocument.defaultView?.getComputedStyle(node);
+    if (
+      node.hidden ||
+      style?.display === "none" ||
+      style?.visibility === "hidden" ||
+      style?.visibility === "collapse" ||
+      Number(style?.opacity ?? 1) === 0
+    )
+      return false;
+  }
+  return true;
+}
+
 function attachVideoHandle(
   handle: VideoHandle,
   element: HTMLVideoElement,
@@ -337,12 +357,15 @@ function attachVideoHandle(
     autoPlay: options.autoPlay,
   });
   const token = Symbol("video-consumer");
+  const viewport = element.ownerDocument.defaultView;
   let intersecting = true;
+  let closed = false;
   const sync = () => {
+    if (closed) return;
     const rect = element.getBoundingClientRect();
-    const viewport = element.ownerDocument.defaultView;
     const visible =
       intersecting &&
+      visibleInTree(element) &&
       rect.width > 0 &&
       rect.height > 0 &&
       (viewport === null ||
@@ -358,6 +381,20 @@ function attachVideoHandle(
       : 0;
     handle.consume(token, height, visible);
   };
+  let pixelRatioQuery: MediaQueryList | null = null;
+  const onPixelRatioChange = () => {
+    watchPixelRatio();
+    sync();
+  };
+  const watchPixelRatio = () => {
+    pixelRatioQuery?.removeEventListener("change", onPixelRatioChange);
+    pixelRatioQuery =
+      viewport?.matchMedia?.(
+        `(resolution: ${viewport.devicePixelRatio || 1}dppx)`,
+      ) ?? null;
+    pixelRatioQuery?.addEventListener("change", onPixelRatioChange);
+  };
+  watchPixelRatio();
   const resize =
     typeof ResizeObserver === "undefined" ? null : new ResizeObserver(sync);
   resize?.observe(element);
@@ -369,13 +406,22 @@ function attachVideoHandle(
           sync();
         });
   intersection?.observe(element);
-  const viewport = element.ownerDocument.defaultView;
-  viewport?.addEventListener("resize", sync);
+  const mutation = new MutationObserver(sync);
+  for (let node: HTMLElement | null = element; node; node = node.parentElement)
+    mutation.observe(node, {
+      attributes: true,
+      attributeFilter: ["style", "class", "hidden"],
+    });
+  const onResize = () => {
+    watchPixelRatio();
+    sync();
+  };
+  viewport?.addEventListener("resize", onResize);
   viewport?.addEventListener("scroll", sync, true);
+  element.ownerDocument.addEventListener("visibilitychange", sync);
   const retire = () => attachment.setPublicationIds([]);
   handle.retireListeners.add(retire);
   sync();
-  let closed = false;
   return {
     setPublicationIds: (ids) => attachment.setPublicationIds(ids),
     retryPlayback: () => attachment.retryPlayback(),
@@ -384,8 +430,11 @@ function attachVideoHandle(
       closed = true;
       resize?.disconnect();
       intersection?.disconnect();
-      viewport?.removeEventListener("resize", sync);
+      mutation.disconnect();
+      pixelRatioQuery?.removeEventListener("change", onPixelRatioChange);
+      viewport?.removeEventListener("resize", onResize);
       viewport?.removeEventListener("scroll", sync, true);
+      element.ownerDocument.removeEventListener("visibilitychange", sync);
       handle.retireListeners.delete(retire);
       handle.release(token);
       attachment.close();

@@ -1,16 +1,7 @@
-import { Button } from "./ui";
+import { Box, IconButton, Stack, Typography } from "@mui/material";
 import { Mic, MicOff, Video as VideoIcon, VideoOff } from "lucide-react";
 import { Video } from "@pulsebeam/react";
 import type { CapturedVideoTrack } from "@pulsebeam/react";
-
-interface MediaPreviewProps {
-  videoTrack: CapturedVideoTrack | null;
-  isCamOn: boolean;
-  isMicOn: boolean;
-  onToggleCam: () => void;
-  onToggleMic: () => void;
-  hasStream: boolean;
-}
 
 export function MediaPreview({
   videoTrack,
@@ -19,65 +10,63 @@ export function MediaPreview({
   onToggleCam,
   onToggleMic,
   hasStream,
-}: MediaPreviewProps) {
+}: {
+  videoTrack: CapturedVideoTrack | null;
+  isCamOn: boolean;
+  isMicOn: boolean;
+  onToggleCam(): void;
+  onToggleMic(): void;
+  hasStream: boolean;
+}) {
+  const microphoneLabel = isMicOn ? "Mute microphone" : "Unmute microphone";
+  const cameraLabel = isCamOn ? "Turn camera off" : "Turn camera on";
   return (
-    <div className="space-y-4">
-      <div className="relative aspect-video overflow-hidden rounded-lg border border-border bg-black shadow-inner">
-        {hasStream && isCamOn ? (
-          <Video
-            source={videoTrack}
-            autoPlay
-            mirror
-            className="w-full h-full object-contain"
-          />
-        ) : (
-          <div className="flex flex-col items-center justify-center h-full bg-muted text-muted-foreground transition-colors">
-            <div className="p-4 rounded-full bg-background/50 mb-2">
-              <VideoOff className="w-8 h-8 opacity-20" />
-            </div>
-            <span className="text-sm font-medium">
-              {!hasStream ? "Initializing hardware..." : "Camera is turned off"}
-            </span>
-          </div>
-        )}
-
-        {/* Floating Controls Overlay */}
-        <div className="absolute bottom-3 left-1/2 z-10 flex -translate-x-1/2 gap-3 sm:bottom-4">
-          <Button
-            type="button"
-            size="icon"
-            variant={isMicOn ? "secondary" : "destructive"}
-            className="h-11 w-11 rounded-full shadow-lg transition-transform hover:scale-105 sm:h-12 sm:w-12"
-            aria-label={isMicOn ? "Mute microphone" : "Unmute microphone"}
-            title={isMicOn ? "Mute microphone" : "Unmute microphone"}
-            disabled={!hasStream}
+    <Box className="relative aspect-video overflow-hidden rounded-lg bg-slate-900">
+      {hasStream && isCamOn ? (
+        <Video
+          source={videoTrack}
+          autoPlay
+          mirror
+          className="h-full w-full object-contain"
+        />
+      ) : (
+        <Stack className="h-full items-center justify-center text-slate-200">
+          <VideoOff size={30} aria-hidden="true" />
+          <Typography variant="body2">
+            {!hasStream ? "Initializing camera…" : "Camera is off"}
+          </Typography>
+        </Stack>
+      )}
+      {hasStream && (
+        <Stack
+          direction="row"
+          spacing={1}
+          className="absolute bottom-3 left-1/2 -translate-x-1/2"
+        >
+          <IconButton
+            title={microphoneLabel}
+            aria-label={microphoneLabel}
             onClick={onToggleMic}
+            sx={{
+              bgcolor: isMicOn ? "#e4edf9" : "error.main",
+              color: isMicOn ? "#12233d" : "white",
+            }}
           >
-            {isMicOn ? (
-              <Mic className="w-5 h-5" />
-            ) : (
-              <MicOff className="w-5 h-5" />
-            )}
-          </Button>
-
-          <Button
-            type="button"
-            size="icon"
-            variant={isCamOn ? "secondary" : "destructive"}
-            className="h-11 w-11 rounded-full shadow-lg transition-transform hover:scale-105 sm:h-12 sm:w-12"
-            aria-label={isCamOn ? "Turn camera off" : "Turn camera on"}
-            title={isCamOn ? "Turn camera off" : "Turn camera on"}
-            disabled={!hasStream}
+            {isMicOn ? <Mic size={20} /> : <MicOff size={20} />}
+          </IconButton>
+          <IconButton
+            title={cameraLabel}
+            aria-label={cameraLabel}
             onClick={onToggleCam}
+            sx={{
+              bgcolor: isCamOn ? "#e4edf9" : "error.main",
+              color: isCamOn ? "#12233d" : "white",
+            }}
           >
-            {isCamOn ? (
-              <VideoIcon className="w-5 h-5" />
-            ) : (
-              <VideoOff className="w-5 h-5" />
-            )}
-          </Button>
-        </div>
-      </div>
-    </div>
+            {isCamOn ? <VideoIcon size={20} /> : <VideoOff size={20} />}
+          </IconButton>
+        </Stack>
+      )}
+    </Box>
   );
 }

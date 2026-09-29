@@ -99,6 +99,7 @@
     return { element, attachment };
   };
   let maxPhysicalHeight = false;
+  let measuredVisibility = false;
   let capacity = false;
   let hiddenFloor = false;
   let mappingNotRemoval = false;
@@ -129,6 +130,32 @@
         wire.find(({ trackId }) => trackId === first.publicationId)?.height ===
         smaller.height,
     );
+    const measured = elements[0];
+    measured.style.height = "200px";
+    await until(() => wire[0]?.height >= Math.ceil(200 * devicePixelRatio));
+    const resized = wire[0].height;
+    host.style.opacity = "0";
+    await until(() => wire.length === 0);
+    host.style.opacity = "1";
+    await until(() => wire[0]?.height === resized);
+    host.style.visibility = "hidden";
+    await until(() => wire.length === 0);
+    host.style.visibility = "visible";
+    await until(() => wire[0]?.height === resized);
+    measured.style.top = "-500px";
+    await until(() => wire.length === 0);
+    measured.style.top = "-50px";
+    await until(() => wire[0]?.height === resized);
+    Object.defineProperty(document, "hidden", {
+      configurable: true,
+      value: true,
+    });
+    document.dispatchEvent(new Event("visibilitychange"));
+    await until(() => wire.length === 0);
+    delete document.hidden;
+    document.dispatchEvent(new Event("visibilitychange"));
+    await until(() => wire[0]?.height === resized);
+    measuredVisibility = wire[0]?.minHeight === 720;
     for (const handle of initialHandles.slice(1, 17)) mount(handle, 100);
     await until(() => wire.length === 16 && warnings.length > 0);
     capacity =
@@ -239,6 +266,7 @@
     voice.stop();
     await context.close();
   } finally {
+    delete document.hidden;
     console.warn = originalWarn;
     for (const attachment of attachments) attachment.close();
     host.remove();
@@ -249,6 +277,7 @@
     inertPolicy,
     invalidAtomic,
     maxPhysicalHeight,
+    measuredVisibility,
     capacity,
     hiddenFloor,
     mappingNotRemoval,

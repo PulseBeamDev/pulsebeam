@@ -62,8 +62,8 @@ impl DestinationServer {
             )
             .into());
         }
-        let mut child = Command::new("cargo")
-            .args(["run", "--release", "-p", "pulsebeam", "--", "--dev"])
+        let mut child = Command::new(root.join("target/release/pulsebeam"))
+            .arg("--dev")
             .current_dir(root)
             .stdout(Stdio::null())
             .stderr(Stdio::null())

@@ -52,10 +52,15 @@ impl DownstreamData {
         self.forwarding.get(key).copied()
     }
 
-    pub(crate) fn subscribed_stream(&self, cid: ChannelId) -> Option<TrackHandle> {
-        self.forwarding
-            .iter()
-            .find_map(|(key, channel)| (*channel == cid).then_some(key))
+    pub(crate) fn subscribed_stream(
+        &self,
+        cid: ChannelId,
+        publisher: &crate::entity::ParticipantId,
+        tracks: &impl Fn(TrackHandle) -> Option<crate::entity::ParticipantId>,
+    ) -> Option<TrackHandle> {
+        self.forwarding.iter().find_map(|(key, channel)| {
+            (*channel == cid && tracks(key) == Some(*publisher)).then_some(key)
+        })
     }
 
     pub(crate) fn close(&mut self, cid: ChannelId) {

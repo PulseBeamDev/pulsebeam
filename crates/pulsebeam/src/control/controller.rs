@@ -491,8 +491,22 @@ impl ControllerActor {
                     .record(started.elapsed().as_micros() as f64);
                 let result = if materialized {
                     let transport = pending.transport;
+                    let participant = pending.participant;
+                    let shard = pending.shard;
                     let result = self.complete_materialization(pending, SystemTime::now());
                     if result.is_err() {
+                        let generation = self.lifecycle.next_generation();
+                        if let Some(update) = self.updates.get_mut(shard.index()) {
+                            update.stage(
+                                generation,
+                                crate::shard_update::ShardUpdateOp::RemoveParticipant {
+                                    participant,
+                                    address: transport,
+                                },
+                            );
+                            self.mark_update_touched(shard);
+                            self.publish_staged();
+                        }
                         self.core
                             .release_transport(transport, tokio::time::Instant::now());
                     }

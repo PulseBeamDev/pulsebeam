@@ -585,6 +585,13 @@
     connected:
       senderConnected.participantId !== null &&
       receiverConnected.participantId !== null,
+    externalIdentity:
+      senderConnected.participantExternalId === "web-sender" &&
+      senderConnected.roomExternalId === "public-web-contract" &&
+      receiverConnected.participantExternalId === "web-receiver" &&
+      receiverConnected.roomExternalId === "public-web-contract" &&
+      reconnected.participantExternalId === "web-receiver" &&
+      reconnected.roomExternalId === "public-web-contract",
     discovered:
       publication.id.length > 0 &&
       publication.label === "camera" &&

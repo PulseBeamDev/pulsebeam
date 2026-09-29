@@ -1918,6 +1918,12 @@ fn snapshot_value(snapshot: &agent_core::Snapshot) -> JsValue {
     set(&value, "participantId", snapshot.participant_id.clone());
     set(
         &value,
+        "participantExternalId",
+        snapshot.participant_external_id.clone(),
+    );
+    set(&value, "roomExternalId", snapshot.room_external_id.clone());
+    set(
+        &value,
         "authorizationExpiresAt",
         snapshot.authorization_expires_at,
     );
@@ -2050,6 +2056,20 @@ fn notification_value(notification: &Notification) -> JsValue {
                     set(&value, "payload", Uint8Array::from(payload.as_slice()));
                 }
             }
+        }
+        Notification::Topic(TopicNotification::RecoveryGap {
+            subscriber,
+            publisher_id,
+            stream_id,
+            expected_sequence,
+            available_sequence,
+        }) => {
+            set(&value, "type", "topic-recovery-gap");
+            set(&value, "topic", &subscriber.topic);
+            set(&value, "publisherId", publisher_id);
+            set(&value, "streamId", *stream_id);
+            set(&value, "expectedSequence", *expected_sequence);
+            set(&value, "availableSequence", *available_sequence);
         }
         Notification::Topic(TopicNotification::Resynchronized {
             subscriber,

@@ -42,8 +42,18 @@ requireMatch(
 );
 requireMatch(
   room,
-  /agent\.participantId \?\? "connecting"/,
-  "Room must display only the identity returned by the agent",
+  /agent\.participantExternalId \?\? "Joining…"/,
+  "Room must display the authoritative external participant identity",
+);
+requireMatch(
+  room,
+  /agent\.roomExternalId/,
+  "Room must display the authoritative external room identity",
+);
+rejectMatch(
+  sources,
+  /agent\.(?:participantId|roomId)\b/,
+  "Meet must not display canonical agent identity",
 );
 rejectMatch(
   identityInputs,

@@ -9,7 +9,7 @@ use core::time::Duration;
 
 use pulsebeam_proto::{
     prelude::Message,
-    reliable::{RelControl, RelDelivery, RelMsg, RelNack, rel_control},
+    reliable::{RelControl, RelDelivery, RelMsg, RelNack, RelProbe, rel_control},
     signaling_v1::{self as v1, client_message, server_message},
 };
 
@@ -334,6 +334,10 @@ fn connect_with_topics(
 ) -> (Agent, Generation, ChannelId, BTreeMap<String, ChannelId>) {
     let mut agent = Agent::new(config()).unwrap();
     let mut state = desired(1);
+    let has_ordered_subscriber = registrations
+        .subscribers
+        .iter()
+        .any(|subscriber| subscriber.mode == TopicMode::Ordered);
     state.topics = registrations;
     agent.command(AgentCommand::ReplaceDesired(state)).unwrap();
     let (generation, specs) = match next_effect(&mut agent) {
@@ -412,6 +416,12 @@ fn connect_with_topics(
         effect => panic!("expected signaling intent, got {effect:?}"),
     };
     acknowledge_send(&mut agent, generation, signal, signaling);
+    if has_ordered_subscriber {
+        assert!(matches!(
+            next_effect(&mut agent),
+            Effect::Timer(TimerEffect::Schedule { .. })
+        ));
+    }
     let _ = drain_notifications(&mut agent);
     (agent, generation, signal, channels)
 }
@@ -420,6 +430,7 @@ fn ordered_delivery(publisher_id: &str, stream_id: u64, seq: u64, payload: &[u8]
     RelDelivery {
         publisher_id: publisher_id.to_string(),
         frame: RelMsg {
+            stream_epoch: "not-canonical".to_string(),
             stream_id,
             seq,
             payload: payload.to_vec(),
@@ -1130,6 +1141,11 @@ fn connection_waits_for_every_host_boundary_and_closes_both_resources() {
     let (mut agent, generation, cid, send) = connected_agent();
     assert_eq!(agent.snapshot().connection, ConnectionState::Connected);
     assert_eq!(agent.snapshot().participant_id.as_deref(), Some("p1"));
+    assert_eq!(
+        agent.snapshot().participant_external_id.as_deref(),
+        Some("participant")
+    );
+    assert_eq!(agent.snapshot().room_external_id.as_deref(), Some("room"));
     acknowledge_send(&mut agent, generation, cid, send);
 
     let disconnected = DesiredState {
@@ -1179,6 +1195,8 @@ fn connection_waits_for_every_host_boundary_and_closes_both_resources() {
         .unwrap();
     assert_eq!(agent.snapshot().connection, ConnectionState::Disconnected);
     assert_eq!(agent.snapshot().generation, None);
+    assert_eq!(agent.snapshot().participant_external_id, None);
+    assert_eq!(agent.snapshot().room_external_id, None);
 }
 
 #[test]
@@ -1272,6 +1290,11 @@ fn reconnect_posts_a_new_resource_and_swaps_only_after_the_candidate_is_ready() 
         effect => panic!("expected replacement offer, got {effect:?}"),
     };
     assert_eq!(agent.snapshot().generation, Some(old_generation));
+    assert_eq!(
+        agent.snapshot().participant_external_id.as_deref(),
+        Some("participant")
+    );
+    assert_eq!(agent.snapshot().room_external_id.as_deref(), Some("room"));
     let replacement_cid = channel(10);
     agent
         .handle(HostEvent::Rtc(RtcEvent::OfferCreated {
@@ -1333,6 +1356,11 @@ fn reconnect_posts_a_new_resource_and_swaps_only_after_the_candidate_is_ready() 
     ));
     assert_eq!(agent.snapshot().generation, Some(replacement_generation));
     assert_eq!(agent.snapshot().participant_id.as_deref(), Some("p1"));
+    assert_eq!(
+        agent.snapshot().participant_external_id.as_deref(),
+        Some("participant")
+    );
+    assert_eq!(agent.snapshot().room_external_id.as_deref(), Some("room"));
 }
 
 #[test]
@@ -2435,6 +2463,7 @@ fn ordered_topics_reorder_deduplicate_nack_replay_and_resynchronize() {
             assert_eq!(
                 control.msg,
                 Some(rel_control::Msg::Nack(RelNack {
+                    stream_epoch: "not-canonical".to_string(),
                     stream_id: 7,
                     from_seq: 1,
                     publisher_id: REMOTE_PUBLISHER.to_string(),
@@ -2480,6 +2509,7 @@ fn ordered_topics_reorder_deduplicate_nack_replay_and_resynchronize() {
 
     let nack = RelControl {
         msg: Some(rel_control::Msg::Nack(RelNack {
+            stream_epoch: "not-canonical".to_string(),
             stream_id: 1,
             from_seq: 1,
             publisher_id: LOCAL_PUBLISHER.to_string(),
@@ -2517,6 +2547,12 @@ fn ordered_topics_reorder_deduplicate_nack_replay_and_resynchronize() {
     assert!(matches!(
         resynchronized.as_slice(),
         [
+            Notification::Topic(TopicNotification::RecoveryGap {
+                stream_id: 7,
+                expected_sequence: 3,
+                available_sequence: 259,
+                ..
+            }),
             Notification::Topic(TopicNotification::Resynchronized {
                 stream_id: 7,
                 next_sequence: 260,
@@ -2528,6 +2564,141 @@ fn ordered_topics_reorder_deduplicate_nack_replay_and_resynchronize() {
             }))
         ]
     ));
+}
+
+#[test]
+fn late_receiver_starts_live_and_existing_receiver_replays_from_its_checkpoint() {
+    let registrations = TopicRegistrations {
+        publishers: vec![publisher("events", TopicMode::Ordered)],
+        subscribers: vec![],
+    };
+    let (mut agent, generation, _, channels) = connect_with_topics(registrations);
+    let channel = channels["v1/rel/pub/events"];
+    for sequence in 0..3u8 {
+        agent
+            .command(AgentCommand::SendTopic(TopicSend {
+                publisher: publisher("events", TopicMode::Ordered),
+                payload: vec![sequence],
+            }))
+            .unwrap();
+        let operation = match next_effect(&mut agent) {
+            Effect::DataChannel(DataChannelEffect::Send { operation, .. }) => operation,
+            effect => panic!("expected send, got {effect:?}"),
+        };
+        acknowledge_send(&mut agent, generation, channel, operation);
+    }
+    let _ = drain_notifications(&mut agent);
+    for (probe, expected) in [
+        (
+            RelProbe {
+                stream_epoch: String::new(),
+                publisher_id: LOCAL_PUBLISHER.to_string(),
+                stream_id: 0,
+                from_seq: 0,
+                live_boundary: true,
+            },
+            vec![(3, true)],
+        ),
+        (
+            RelProbe {
+                stream_epoch: "not-canonical".to_string(),
+                publisher_id: LOCAL_PUBLISHER.to_string(),
+                stream_id: 1,
+                from_seq: 1,
+                live_boundary: false,
+            },
+            vec![(1, false), (2, false)],
+        ),
+    ] {
+        agent
+            .handle(HostEvent::DataChannel(DataChannelEvent::Message {
+                generation,
+                channel,
+                payload: RelControl {
+                    msg: Some(rel_control::Msg::Probe(probe)),
+                }
+                .encode_to_vec(),
+            }))
+            .unwrap();
+        for (sequence, reset) in expected {
+            let frame = match next_effect(&mut agent) {
+                Effect::DataChannel(DataChannelEffect::Send { payload, .. }) => {
+                    let delivery = RelDelivery::decode(payload.as_slice()).unwrap();
+                    RelMsg::decode(delivery.frame.as_slice()).unwrap()
+                }
+                effect => panic!("expected response, got {effect:?}"),
+            };
+            assert_eq!(
+                (frame.stream_id, frame.seq, frame.resync_required),
+                (1, sequence, reset)
+            );
+        }
+        assert!(agent.next_effect().is_none());
+    }
+}
+
+#[test]
+fn recovery_reset_reports_only_missing_confirmed_sequences() {
+    let registrations = TopicRegistrations {
+        publishers: vec![],
+        subscribers: vec![subscriber("events", TopicMode::Ordered, None)],
+    };
+    let (mut agent, generation, _, channels) = connect_with_topics(registrations);
+    let channel = channels["v1/rel/sub/events"];
+    let reset = |seq| {
+        RelDelivery {
+            publisher_id: REMOTE_PUBLISHER.to_string(),
+            frame: RelMsg {
+                stream_epoch: "not-canonical".to_string(),
+                stream_id: 4,
+                seq,
+                payload: vec![],
+                resync_required: true,
+            }
+            .encode_to_vec(),
+        }
+        .encode_to_vec()
+    };
+    agent
+        .handle(HostEvent::DataChannel(DataChannelEvent::Message {
+            generation,
+            channel,
+            payload: reset(5),
+        }))
+        .unwrap();
+    assert!(!drain_notifications(&mut agent).iter().any(|notification| {
+        matches!(
+            notification,
+            Notification::Topic(TopicNotification::RecoveryGap { .. })
+        )
+    }));
+    agent
+        .handle(HostEvent::DataChannel(DataChannelEvent::Message {
+            generation,
+            channel,
+            payload: ordered_delivery(REMOTE_PUBLISHER, 4, 5, b"live"),
+        }))
+        .unwrap();
+    let _ = drain_notifications(&mut agent);
+    agent
+        .handle(HostEvent::DataChannel(DataChannelEvent::Message {
+            generation,
+            channel,
+            payload: reset(9),
+        }))
+        .unwrap();
+    assert!(
+        drain_notifications(&mut agent)
+            .iter()
+            .any(|notification| matches!(
+                notification,
+                Notification::Topic(TopicNotification::RecoveryGap {
+                    expected_sequence: 6,
+                    available_sequence: 9,
+                    ..
+                })
+            ))
+    );
 }
 
 #[test]
@@ -2570,6 +2741,7 @@ fn ordered_replay_exhaustion_emits_reset_before_the_retained_window() {
                     stream_id: 1,
                     from_seq: 0,
                     publisher_id: LOCAL_PUBLISHER.to_string(),
+                    stream_epoch: "not-canonical".to_string(),
                 })),
             }
             .encode_to_vec(),
@@ -2617,7 +2789,7 @@ fn topic_send_queue_overflow_and_channel_close_drop_every_admitted_message() {
         next_effect(&mut agent),
         Effect::DataChannel(DataChannelEffect::Send { .. })
     ));
-    for _ in 0..TOPIC_SEND_QUEUE_CAPACITY {
+    for _ in 1..TOPIC_SEND_QUEUE_CAPACITY {
         agent
             .command(AgentCommand::SendTopic(TopicSend {
                 publisher: publish.clone(),
@@ -2627,7 +2799,7 @@ fn topic_send_queue_overflow_and_channel_close_drop_every_admitted_message() {
     }
     assert_eq!(
         agent.snapshot().topics.publishers[0].queued_messages,
-        TOPIC_SEND_QUEUE_CAPACITY
+        TOPIC_SEND_QUEUE_CAPACITY - 1
     );
     assert!(matches!(
         agent.command(AgentCommand::SendTopic(TopicSend {
@@ -2644,15 +2816,62 @@ fn topic_send_queue_overflow_and_channel_close_drop_every_admitted_message() {
             channel,
         }))
         .unwrap();
+    assert_eq!(agent.snapshot().topics.dropped_sends, 1);
     assert_eq!(
-        agent.snapshot().topics.dropped_sends,
-        u64::try_from(TOPIC_SEND_QUEUE_CAPACITY).unwrap() + 2
+        agent.snapshot().topics.publishers[0].queued_messages,
+        TOPIC_SEND_QUEUE_CAPACITY
     );
     assert_eq!(agent.snapshot().topics.channel_failures, 1);
     assert!(matches!(
         next_effect(&mut agent),
         Effect::Rtc(RtcEffect::CreateOffer { .. })
     ));
+}
+
+#[test]
+fn explicit_disconnect_cancels_pending_topic_sends_and_rotates_the_stream() {
+    let registrations = TopicRegistrations {
+        publishers: vec![publisher("chat", TopicMode::Ordered)],
+        subscribers: vec![subscriber("chat", TopicMode::Ordered, None)],
+    };
+    let (mut agent, _, _, _) = connect_with_topics(registrations.clone());
+    agent
+        .command(AgentCommand::SendTopic(TopicSend {
+            publisher: publisher("chat", TopicMode::Ordered),
+            payload: b"pending".to_vec(),
+        }))
+        .unwrap();
+    assert!(matches!(
+        next_effect(&mut agent),
+        Effect::DataChannel(DataChannelEffect::Send { .. })
+    ));
+    agent
+        .command(AgentCommand::SendTopic(TopicSend {
+            publisher: publisher("chat", TopicMode::Ordered),
+            payload: b"queued".to_vec(),
+        }))
+        .unwrap();
+    let mut disconnected = desired(2);
+    disconnected.connected = false;
+    disconnected.topics = registrations;
+    agent
+        .command(AgentCommand::ReplaceDesired(disconnected))
+        .unwrap();
+    assert_eq!(agent.snapshot().topics.dropped_sends, 2);
+    assert_eq!(agent.snapshot().topics.publishers[0].queued_messages, 0);
+    assert!(
+        drain_notifications(&mut agent)
+            .iter()
+            .filter(|notification| matches!(
+                notification,
+                Notification::Topic(TopicNotification::SendDropped {
+                    reason: TopicDropReason::ChannelClosed,
+                    ..
+                })
+            ))
+            .count()
+            >= 2
+    );
 }
 
 #[test]
@@ -2714,7 +2933,7 @@ fn topic_boundaries_reject_malformed_cross_lane_unknown_and_oversized_input() {
 }
 
 #[test]
-fn reconnect_rotates_ordered_streams_without_replaying_accepted_history() {
+fn reconnect_preserves_ordered_streams_and_replays_accepted_history() {
     let registrations = TopicRegistrations {
         publishers: vec![publisher("chat", TopicMode::Ordered)],
         subscribers: vec![subscriber("chat", TopicMode::Ordered, None)],
@@ -2837,10 +3056,10 @@ fn reconnect_rotates_ordered_streams_without_replaying_accepted_history() {
     };
     acknowledge_send(&mut agent, generation, signal, signaling);
     assert!(agent.next_effect().is_none());
-    assert_eq!(agent.snapshot().topics.publishers[0].stream_id, Some(2));
-    assert_eq!(agent.snapshot().topics.publishers[0].next_sequence, Some(0));
+    assert_eq!(agent.snapshot().topics.publishers[0].stream_id, Some(1));
+    assert_eq!(agent.snapshot().topics.publishers[0].next_sequence, Some(1));
     assert_eq!(agent.snapshot().topics.publishers[0].accepted_history, 1);
-    assert_eq!(agent.snapshot().topics.publishers[0].replay_messages, 0);
+    assert_eq!(agent.snapshot().topics.publishers[0].replay_messages, 1);
     let _ = drain_notifications(&mut agent);
 
     agent
@@ -2869,7 +3088,7 @@ fn reconnect_rotates_ordered_streams_without_replaying_accepted_history() {
         }
         effect => panic!("expected post-reconnect ordered send, got {effect:?}"),
     };
-    assert_eq!((message.stream_id, message.seq), (2, 0));
+    assert_eq!((message.stream_id, message.seq), (1, 1));
 
     assert_eq!(
         agent.handle(HostEvent::DataChannel(DataChannelEvent::Message {
@@ -2877,6 +3096,7 @@ fn reconnect_rotates_ordered_streams_without_replaying_accepted_history() {
             channel: new_publish_channel,
             payload: RelControl {
                 msg: Some(rel_control::Msg::Nack(RelNack {
+                    stream_epoch: "not-canonical".to_string(),
                     stream_id: 1,
                     from_seq: 0,
                     publisher_id: LOCAL_PUBLISHER.to_string(),
@@ -2884,6 +3104,19 @@ fn reconnect_rotates_ordered_streams_without_replaying_accepted_history() {
             }
             .encode_to_vec(),
         })),
-        Err(AgentError::InvalidTopic(TopicError::StaleStream))
+        Ok(())
     );
+    for expected in 0..=1 {
+        let replay = match next_effect(&mut agent) {
+            Effect::DataChannel(DataChannelEffect::Send {
+                channel, payload, ..
+            }) => {
+                assert_eq!(channel, new_publish_channel);
+                let delivery = RelDelivery::decode(payload.as_slice()).unwrap();
+                RelMsg::decode(delivery.frame.as_slice()).unwrap()
+            }
+            effect => panic!("expected retained replay, got {effect:?}"),
+        };
+        assert_eq!((replay.stream_id, replay.seq), (1, expected));
+    }
 }

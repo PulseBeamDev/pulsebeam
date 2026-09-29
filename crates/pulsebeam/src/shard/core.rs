@@ -87,6 +87,8 @@ pub(crate) struct ShardCore {
 pub(crate) struct ShardExecution {
     pub(crate) shard_id: crate::id::ShardId,
     registry: ParticipantRegistry,
+    pending_replacements:
+        std::collections::VecDeque<(crate::route::NodeTransportAddress, ParticipantConfig)>,
     pub(super) runtime: ShardRuntime,
     plans: SecondaryMap<crate::keys::TrackHandle, crate::shard::router::InstalledTrackPlan>,
     timers: TimerWheel,
@@ -180,19 +182,14 @@ impl ShardCore {
         self.execution.next_timer_deadline()
     }
 
-    pub(crate) fn fire_timers(&mut self, now: Instant) {
-        self.execution.fire_timers(now);
-    }
-
     pub(crate) fn poll_and_flush_dirty(
         &mut self,
-        now: Instant,
         udp_socket: &mut UnifiedSocket,
         tcp_socket: &mut net::tcp::TcpTransport,
         budget: usize,
     ) -> usize {
         self.execution
-            .poll_and_flush_dirty(now, udp_socket, tcp_socket, budget)
+            .poll_and_flush_dirty(udp_socket, tcp_socket, budget)
     }
 
     pub(crate) fn flush_close_peers(
@@ -222,6 +219,7 @@ impl ShardExecution {
         Self {
             shard_id,
             registry: ParticipantRegistry::new(shard_id, max_gso_segments, shard_count),
+            pending_replacements: std::collections::VecDeque::new(),
             runtime,
             plans: SecondaryMap::new(),
             timers: TimerWheel::new(PARTICIPANT_CAPACITY_HINT),
@@ -279,11 +277,33 @@ impl ShardExecution {
                 self.registry.retire_transport(*address);
             }
             crate::shard_update::ShardUpdateOp::Placeholder => {}
-            crate::shard_update::ShardUpdateOp::RemoveParticipant { address, .. } => {
-                if let Some(handle) = self.registry.resolve_transport(*address) {
+            crate::shard_update::ShardUpdateOp::RemoveParticipant {
+                participant,
+                address,
+            } => {
+                self.pending_replacements.retain(|(transport, config)| {
+                    *transport != *address || config.participant_id != *participant
+                });
+                if let Some(handle) = self.registry.resolve(participant)
+                    && self
+                        .registry
+                        .resolve_mut(handle)
+                        .is_some_and(|meta| meta.ingress == *address)
+                {
                     self.timers.cancel(handle);
                 }
-                let _ = self.registry.remove(*address);
+                let removed = self.registry.remove(*participant, *address);
+                if removed.is_some()
+                    && let Some(index) = self
+                        .pending_replacements
+                        .iter()
+                        .position(|(_, config)| config.participant_id == *participant)
+                    && let Some((transport, config)) = self.pending_replacements.remove(index)
+                {
+                    // The retiring generation has already replaced its plans. Only
+                    // now may a new incarnation occupy the participant identity.
+                    let _ = self.add_participant(transport, config);
+                }
             }
             crate::shard_update::ShardUpdateOp::InsertTrackRuntime { track_id, runtime } => {
                 let descriptor = runtime.descriptor.as_ref();
@@ -624,7 +644,21 @@ impl ShardExecution {
                     let _ = ack.send(false);
                     return Some(());
                 }
-                let materialized = self.add_participant(transport, *config);
+                let materialized = if self.registry.resolve(&config.participant_id).is_some() {
+                    // Materialization and plan updates use independent mailboxes. The
+                    // controller acknowledges this command before it can stage old
+                    // incarnation cleanup, so defer insertion until that cleanup retires
+                    // the old handle. Never let an old plan resolve to the new peer.
+                    if self.pending_replacements.len() >= 256 {
+                        tracing::warn!("pending participant replacement capacity exhausted");
+                        false
+                    } else {
+                        self.pending_replacements.push_back((transport, *config));
+                        true
+                    }
+                } else {
+                    self.add_participant(transport, *config)
+                };
                 let _ = ack.send(materialized);
             }
             ShardCommand::AdoptTcpConnection { .. } => {
@@ -762,11 +796,15 @@ impl ShardExecution {
 
     pub(crate) fn poll_and_flush_dirty(
         &mut self,
-        now: Instant,
         udp_socket: &mut UnifiedSocket,
         tcp_socket: &mut net::tcp::TcpTransport,
         budget: usize,
     ) -> usize {
+        // Commands and update retirements can create transports after the
+        // worker sampled its turn start. Advance the wheel and RTC from one
+        // fresh wall-time sample at the poll boundary.
+        let now = Instant::now();
+        self.fire_timers(now);
         debug_assert!(budget > 0);
         debug_assert!(self.udp_send_batch.is_empty());
         self.dirty.begin_phase();
@@ -972,6 +1010,179 @@ mod wrong_owner_tests {
         let plans = &core.execution.plans;
         let track_handle = core.execution.runtime.track_handle(track_id).unwrap();
         assert!(plans.get(track_handle).is_some());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn replacement_waits_for_old_plans_to_release_the_participant_handle() {
+        use crate::route::NodeTransportAddress;
+        use crate::shard_update::{ShardUpdateOp, TrackPlan, TrackPlanUpdate, TrackRuntime};
+        use std::time::Duration;
+
+        let shard = ShardId::new(0);
+        let (mut writer, update_rx) = crate::shard_update::new_shard_update(shard);
+        let mut core = ShardCore::new(
+            shard,
+            4,
+            1,
+            WallAnchor::new(std::time::SystemTime::UNIX_EPOCH, Instant::now()),
+            update_rx,
+        );
+        let router = CaptureTransport {
+            frames: std::cell::RefCell::new(Vec::new()),
+        };
+        let participant = crate::entity::ParticipantId::new();
+        let old_address = NodeTransportAddress::new(TransportRoute::new(shard, 51), 1);
+        let new_address = NodeTransportAddress::new(TransportRoute::new(shard, 52), 1);
+        let config = || ParticipantConfig {
+            manual_sub: false,
+            room_id: crate::entity::RoomId::from_external(
+                &crate::entity::RoomExternalId::new("room").unwrap(),
+            ),
+            participant_id: participant,
+            participant_external_id: crate::entity::ParticipantExternalId::new("peer").unwrap(),
+            connection_id: crate::entity::ConnectionId::new(),
+            profile: crate::control::controller::ConnectionProfile::Native,
+            authorization_expiry: None,
+            rtc: str0m::Rtc::new(std::time::Instant::now()),
+            resources: crate::control::NegotiatedResources::empty_for_test(),
+        };
+        let materialize = |core: &mut ShardCore, address, config| {
+            let (ack, received) = tokio::sync::oneshot::channel();
+            core.on_command(
+                ShardCommand::MaterializeParticipant {
+                    transport: address,
+                    config: Box::new(config),
+                    ack,
+                },
+                &router,
+            );
+            received
+        };
+        assert!(materialize(&mut core, old_address, config()).await.unwrap());
+        let old_handle = core.execution.registry.resolve(&participant).unwrap();
+        let track_id = participant.derive_track_id(crate::entity::TrackKind::Audio, "mic");
+        writer.stage(
+            1,
+            ShardUpdateOp::InsertTrackRuntime {
+                track_id,
+                runtime: TrackRuntime::default(),
+            },
+        );
+        writer.stage_plans(
+            1,
+            vec![TrackPlanUpdate {
+                track_id,
+                plan: Some(TrackPlan::new([participant], [], None)),
+            }],
+        );
+        writer.publish();
+        assert_eq!(core.apply_updates(1), 1);
+        let track_handle = core.execution.runtime.track_handle(track_id).unwrap();
+        assert_eq!(
+            core.execution.plans.get(track_handle).unwrap().local,
+            vec![old_handle]
+        );
+
+        // A rejected candidate and its successor arrive before plan cleanup.
+        let rejected_address = NodeTransportAddress::new(TransportRoute::new(shard, 53), 1);
+        assert!(
+            materialize(&mut core, rejected_address, config())
+                .await
+                .unwrap()
+        );
+        assert!(materialize(&mut core, new_address, config()).await.unwrap());
+        assert_eq!(
+            core.execution.registry.resolve(&participant),
+            Some(old_handle)
+        );
+        assert_eq!(core.execution.registry.resolve_transport(new_address), None);
+        assert_eq!(
+            core.execution.plans.get(track_handle).unwrap().local,
+            vec![old_handle]
+        );
+
+        writer.stage_plans(
+            2,
+            vec![TrackPlanUpdate {
+                track_id,
+                plan: Some(TrackPlan::default()),
+            }],
+        );
+        writer.stage(
+            2,
+            ShardUpdateOp::RemoveParticipant {
+                participant,
+                address: rejected_address,
+            },
+        );
+        writer.stage(
+            2,
+            ShardUpdateOp::RetireTransport {
+                address: old_address,
+            },
+        );
+        writer.stage(
+            2,
+            ShardUpdateOp::RemoveParticipant {
+                participant,
+                address: old_address,
+            },
+        );
+        writer.publish();
+        let turn_started = Instant::now();
+        tokio::time::advance(Duration::from_millis(50)).await;
+        assert_eq!(core.apply_updates(1), 1);
+        let new_handle = core.execution.registry.resolve(&participant).unwrap();
+        assert_ne!(new_handle, old_handle);
+        assert!(core.execution.pending_replacements.is_empty());
+        assert_eq!(
+            core.execution.registry.resolve_transport(rejected_address),
+            None
+        );
+        assert_eq!(
+            core.execution.registry.resolve_transport(new_address),
+            Some(new_handle)
+        );
+        assert!(core.execution.registry.resolve_mut(old_handle).is_none());
+        assert!(
+            core.execution
+                .plans
+                .get(track_handle)
+                .unwrap()
+                .local
+                .is_empty()
+        );
+
+        let mut udp = net::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            Transport::Udp(UdpMode::Scalar),
+            None,
+            0,
+        )
+        .await
+        .unwrap();
+        let mut tcp = net::tcp::TcpTransport::new(udp.local_addr());
+        let wall_now = Instant::now();
+        assert!(wall_now > turn_started + pulsebeam_runtime::SHARD_TIMER_QUANTUM);
+        assert_eq!(core.poll_and_flush_dirty(&mut udp, &mut tcp, 256), 2);
+        let deadline = core.next_timer_deadline().unwrap();
+        assert!(deadline >= wall_now);
+        assert!(deadline <= wall_now + Duration::from_millis(101));
+
+        writer.stage(
+            3,
+            ShardUpdateOp::RemoveParticipant {
+                participant,
+                address: old_address,
+            },
+        );
+        writer.publish();
+        assert_eq!(core.apply_updates(1), 1);
+        assert_eq!(
+            core.execution.registry.resolve(&participant),
+            Some(new_handle)
+        );
+        assert!(core.next_timer_deadline().is_some());
     }
 
     #[tokio::test(start_paused = true)]

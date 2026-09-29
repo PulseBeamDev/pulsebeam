@@ -1,15 +1,32 @@
 "use client";
 
 import { useCallback, useState } from "react";
+import { CssBaseline, ThemeProvider, createTheme } from "@mui/material";
 import { Lobby } from "./Lobby";
 import { MeetMediaProvider, useMeetMedia } from "./MeetMediaProvider";
 import { Room } from "./Room";
 
+const theme = createTheme({
+  palette: {
+    primary: { main: "#2858bd" },
+    error: { main: "#b32637" },
+    background: { default: "#f5f7fb", paper: "#ffffff" },
+  },
+  typography: { fontFamily: "Manrope, system-ui, sans-serif" },
+  shape: { borderRadius: 10 },
+  components: {
+    MuiButton: { defaultProps: { disableElevation: true } },
+  },
+});
+
 export function MeetApp() {
   return (
-    <MeetMediaProvider>
-      <MeetSession />
-    </MeetMediaProvider>
+    <ThemeProvider theme={theme}>
+      <CssBaseline />
+      <MeetMediaProvider>
+        <MeetSession />
+      </MeetMediaProvider>
+    </ThemeProvider>
   );
 }
 
@@ -20,11 +37,11 @@ function MeetSession() {
     cameraOn: boolean;
     micOn: boolean;
   } | null>(null);
-  const { capture } = useMeetMedia();
+  const { stop } = useMeetMedia().capture;
   const leave = useCallback(() => {
-    capture.stop();
+    stop();
     setSession(null);
-  }, [capture.stop]);
+  }, [stop]);
   return session ? (
     <Room {...session} onLeave={leave} />
   ) : (

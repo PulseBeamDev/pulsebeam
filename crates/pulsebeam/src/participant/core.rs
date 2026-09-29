@@ -973,10 +973,24 @@ impl Participant {
                         let Ok(control) = RelControl::decode(data.data.as_ref()) else {
                             return;
                         };
-                        if !matches!(control.msg, Some(rel_control::Msg::Nack(_))) {
+                        let publisher = match control.msg {
+                            Some(rel_control::Msg::Nack(nack)) => nack.publisher_id,
+                            Some(rel_control::Msg::Probe(probe)) => probe.publisher_id,
+                            None => return,
+                        };
+                        let Ok(publisher) = publisher.parse::<crate::entity::ParticipantId>()
+                        else {
                             return;
-                        }
-                        if let Some(stream) = self.downstream.data.subscribed_stream(data.id) {
+                        };
+                        if let Some(stream) =
+                            self.downstream
+                                .data
+                                .subscribed_stream(data.id, &publisher, &|key| {
+                                    self.downstream
+                                        .track_candidate(key)
+                                        .map(|entry| entry.participant_id)
+                                })
+                        {
                             events.request_reverse(
                                 stream,
                                 ReversePacket::reliable_control(data.data.to_vec()),
@@ -1366,21 +1380,21 @@ mod rtc_clock_tests {
     }
 
     #[test]
-    fn sub_quantum_deadlines_do_not_accumulate_clock_lag() {
-        let start = Instant::now();
-        let mut wall = start;
-        let mut rtc = start;
-
-        for _ in 0..1_000 {
-            wall += pulsebeam_runtime::SHARD_TIMER_QUANTUM;
-            let deadline = rtc + Duration::from_micros(30);
-            let candidate = inline_rtc_timeout(deadline, wall).expect("deadline is inline");
-            rtc = rtc.max(candidate).max(wall);
-            assert!(rtc >= wall);
-            assert!(rtc <= wall + pulsebeam_runtime::SHARD_TIMER_QUANTUM);
+    fn sub_quantum_deadlines_are_bounded_by_the_sampled_wall_time() {
+        let wall = Instant::now();
+        let due = wall + Duration::from_micros(30);
+        assert_eq!(inline_rtc_timeout(due, wall), Some(due));
+        let delayed_wake = due + Duration::from_millis(50);
+        assert_eq!(inline_rtc_timeout(due, delayed_wake), Some(delayed_wake));
+        let distant = wall + pulsebeam_runtime::SHARD_TIMER_QUANTUM * 2;
+        assert_eq!(inline_rtc_timeout(distant, wall), None);
+        for tick in 1..=1_000 {
+            let now = wall + pulsebeam_runtime::SHARD_TIMER_QUANTUM * tick;
+            let deadline = now + Duration::from_micros(30);
+            let rtc = inline_rtc_timeout(deadline, now).unwrap();
+            assert!(rtc >= now);
+            assert!(rtc <= now + pulsebeam_runtime::SHARD_TIMER_QUANTUM);
         }
-
-        assert_eq!(rtc, wall);
     }
 }
 
