@@ -9,7 +9,7 @@ use crate::entity::ParticipantId;
 use crate::entity::TrackId;
 use crate::entity::TrackKind;
 use crate::keys::TrackHandle;
-use crate::log::LogCtx;
+use crate::log::{LogCtx, plog_debug, plog_trace};
 use crate::participant::downstream::video::START_BANDWIDTH;
 use crate::participant::event::ParticipantSink;
 pub use crate::participant::intent::AudioIntent;
@@ -224,6 +224,7 @@ struct FixedReceiver {
 }
 
 pub struct Downstream {
+    ctx: LogCtx,
     pub dirty_allocation: bool,
     pub video: DownstreamVideo,
     pub(crate) audio: DownstreamAudio,
@@ -258,6 +259,7 @@ pub type DownstreamAllocator = Downstream;
 impl Downstream {
     pub(crate) fn new(ctx: LogCtx, manual_sub: bool) -> Self {
         Self {
+            ctx,
             video: DownstreamVideo::new(ctx, manual_sub),
             audio: DownstreamAudio::new(ctx, manual_sub),
             data: DownstreamData::new(),
@@ -537,6 +539,7 @@ impl Downstream {
 
     pub fn update_bitrate(&mut self, now: Instant, available_bandwidth: Bitrate) {
         self.available_bandwidth.update(now, available_bandwidth);
+        plog_trace!(self.ctx, raw=%available_bandwidth, filtered=%self.available_bandwidth.current(), "downstream bandwidth sample");
         self.dirty_allocation = true;
     }
 
@@ -580,6 +583,7 @@ impl Downstream {
         ) else {
             return;
         };
+        plog_debug!(self.ctx, %estimate, %allocated, %desired, ?unfunded, %target, "resetting starved downstream bandwidth estimate");
         bwe.reset(target);
         self.available_bandwidth = BweFilter::new(target);
     }
