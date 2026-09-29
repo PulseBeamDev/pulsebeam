@@ -65,6 +65,7 @@ export function Video({
   mirror = false,
   onPlaybackError,
   muted = true,
+  autoPlay = true,
   playsInline = true,
   style,
   ...props
@@ -97,11 +98,14 @@ export function Video({
   useEffect(() => {
     const current = element.current;
     if (!current || !remote || !active) return;
-    const attachment = attachRemoteVideo(remote, current, (failure, retry) =>
-      report(callback.current, failure, retry),
+    const attachment = attachRemoteVideo(
+      remote,
+      current,
+      (failure, retry) => report(callback.current, failure, retry),
+      { autoPlay },
     );
     return () => attachment.close();
-  }, [remote, active]);
+  }, [remote, active, autoPlay]);
 
   useEffect(() => {
     const current = element.current;
@@ -112,14 +116,16 @@ export function Video({
     const retry = async () => {
       if (!cancelled) await current.play();
     };
-    void retry().catch((error: unknown) => {
-      if (!cancelled) callback.current?.({ error, retry });
-    });
+    if (autoPlay) {
+      void retry().catch((error: unknown) => {
+        if (!cancelled) callback.current?.({ error, retry });
+      });
+    }
     return () => {
       cancelled = true;
       if (current.srcObject === stream) current.srcObject = null;
     };
-  }, [local, localSource]);
+  }, [local, localSource, autoPlay]);
 
   if (!source || (remote && !active)) return null;
   const presentation = mirror
@@ -129,6 +135,7 @@ export function Video({
     ...props,
     ref: element,
     muted,
+    autoPlay,
     playsInline,
     style: presentation,
   });
@@ -145,11 +152,14 @@ export function Audio({
   useEffect(() => {
     const current = element.current;
     if (!current || !source) return;
-    const attachment = attachRemoteAudio(source, current, (failure, retry) =>
-      report(callback.current, failure, retry),
+    const attachment = attachRemoteAudio(
+      source,
+      current,
+      (failure, retry) => report(callback.current, failure, retry),
+      { autoPlay },
     );
     return () => attachment.close();
-  }, [source]);
+  }, [source, autoPlay]);
   if (!source) return null;
   return createElement("audio", { ...props, ref: element, autoPlay });
 }

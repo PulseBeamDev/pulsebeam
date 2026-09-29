@@ -389,6 +389,7 @@ export type PlaybackFailure = Readonly<{
 
 export type RemoteMediaAttachmentOptions = Readonly<{
   publicationIds: readonly string[];
+  autoPlay?: boolean;
   onPlaybackBlocked?: (
     failure: PlaybackFailure,
     retry: () => Promise<void>,

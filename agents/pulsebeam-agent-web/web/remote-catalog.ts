@@ -7,6 +7,7 @@ import type {
   RemoteAudioSource,
   RemoteAudioTrack,
   RemoteMediaAttachment,
+  RemoteMediaAttachmentOptions,
   RemoteVideoTrack,
   VideoDemand,
 } from "./types.js";
@@ -310,6 +311,7 @@ export function attachRemoteVideo(
   source: RemoteVideoTrack,
   element: HTMLVideoElement,
   onPlaybackBlocked?: PlaybackCallback,
+  options: Pick<RemoteMediaAttachmentOptions, "autoPlay"> = {},
 ): RemoteMediaAttachment {
   const handle = videoOwners.get(source);
   if (!handle) throw new TypeError("invalid remote video source");
@@ -319,18 +321,20 @@ export function attachRemoteVideo(
       retryPlayback: async () => {},
       close() {},
     };
-  return attachVideoHandle(handle, element, onPlaybackBlocked);
+  return attachVideoHandle(handle, element, onPlaybackBlocked, options);
 }
 
 function attachVideoHandle(
   handle: VideoHandle,
   element: HTMLVideoElement,
-  onPlaybackBlocked?: PlaybackCallback,
+  onPlaybackBlocked: PlaybackCallback | undefined,
+  options: Pick<RemoteMediaAttachmentOptions, "autoPlay">,
 ): RemoteMediaAttachment {
   const agent = handle.catalog.agent;
   const attachment = attachRemoteMedia(agent, element, {
     publicationIds: [handle.publicationId],
     onPlaybackBlocked,
+    autoPlay: options.autoPlay,
   });
   const token = Symbol("video-consumer");
   let intersecting = true;
@@ -393,6 +397,7 @@ export function attachRemoteAudio(
   source: RemoteAudioSource,
   element: HTMLAudioElement,
   onPlaybackBlocked?: PlaybackCallback,
+  options: Pick<RemoteMediaAttachmentOptions, "autoPlay"> = {},
 ): RemoteMediaAttachment {
   const catalog = audioOwners.get(source);
   if (!catalog) throw new TypeError("invalid remote audio source");
@@ -401,6 +406,7 @@ export function attachRemoteAudio(
   const attachment = attachRemoteMedia(agent, element, {
     publicationIds: [],
     onPlaybackBlocked,
+    autoPlay: options.autoPlay,
   });
   const update = () => {
     const current = new Set(

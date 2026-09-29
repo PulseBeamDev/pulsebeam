@@ -82,7 +82,10 @@ function Room({
 
 `<Video>` also accepts a local video handle or a captured video source for
 pre-join preview, plus `null`, `mirror`, `muted`, `playsInline`, `className`, and
-`style`. Use
+`style`. Both playback components default to `autoPlay={true}`. Set
+`autoPlay={false}` to attach without starting playback automatically; native
+`controls` can then start playback. Attachment still contributes receive demand.
+Use
 `track.setReceiveOptions({minHeight,minFps,priority,playoutDelay})` to replace
 remote policy without activating a hidden track. `onPlaybackError` receives a
 user-gesture retry for autoplay restrictions. `agent.topic<T>(name, { mode:

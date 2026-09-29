@@ -2,7 +2,12 @@ import { StrictMode, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { Audio, Video, createAgent } from "@pulsebeam/react";
 import type { LocalVideoTrack, PlaybackError } from "@pulsebeam/react";
-import { createCaptureSource } from "@pulsebeam/web";
+import {
+  createCaptureSource,
+  type Agent,
+  type AgentSnapshot,
+} from "@pulsebeam/web";
+import { RemoteCatalog } from "../../../pulsebeam-agent-web/dist/remote-catalog.js";
 
 const waitFor = async (predicate: () => boolean, phase: string) => {
   for (let index = 0; index < 200; index++) {
@@ -156,6 +161,123 @@ export async function runPlaybackContract() {
       audioExplicit,
     };
   } finally {
+    HTMLMediaElement.prototype.play = originalPlay;
+  }
+}
+
+export async function runAutoplayContract() {
+  const host = document.createElement("div");
+  document.body.append(host);
+  const root = createRoot(host);
+  const video = document
+    .createElement("canvas")
+    .captureStream(1)
+    .getVideoTracks()[0];
+  const context = new AudioContext();
+  const audio = context
+    .createMediaStreamDestination()
+    .stream.getAudioTracks()[0];
+  const snapshot = {
+    catalog: {
+      revision: 1,
+      participants: [{ id: "participant", externalId: "alice" }],
+      publications: [
+        {
+          id: "video",
+          participantId: "participant",
+          label: "camera",
+          kind: "video",
+        },
+        {
+          id: "audio",
+          participantId: "participant",
+          label: "microphone",
+          kind: "audio",
+        },
+      ],
+    },
+    mapping: {
+      acceptedIntentRevision: 1,
+      video: [{ receiverIndex: 0, publicationId: "video" }],
+      audio: [{ receiverIndex: 0, publicationId: "audio" }],
+    },
+    tracks: {
+      video: { media: video, kind: "video" },
+      audio: { media: audio, kind: "audio" },
+    },
+  } as unknown as AgentSnapshot;
+  const fakeAgent = {
+    getSnapshot: () => snapshot,
+    subscribe: () => () => {},
+  } as unknown as Agent;
+  let videoDemand = 0;
+  let audioDemand = false;
+  const catalog = new RemoteCatalog(fakeAgent, 1, (videos, receiveAudio) => {
+    videoDemand = videos.length;
+    audioDemand = receiveAudio;
+  });
+  catalog.update(snapshot);
+  const captured = createCaptureSource(video, "video");
+  const render = (autoPlay: boolean) =>
+    root.render(
+      <>
+        <Video source={captured} autoPlay={autoPlay} />
+        <Video
+          source={catalog.videoTracks[0]}
+          autoPlay={autoPlay}
+          style={{ width: 160, height: 120 }}
+        />
+        <Audio source={catalog.audioSource} autoPlay={autoPlay} />
+      </>,
+    );
+  const originalPlay = HTMLMediaElement.prototype.play;
+  let attempts = 0;
+  HTMLMediaElement.prototype.play = () => {
+    attempts += 1;
+    return Promise.resolve();
+  };
+  try {
+    render(false);
+    await waitFor(() => {
+      const elements = [
+        ...host.querySelectorAll<HTMLMediaElement>("video,audio"),
+      ];
+      return (
+        elements.length === 3 &&
+        elements.every(
+          (element) =>
+            element.srcObject instanceof MediaStream &&
+            element.srcObject.getTracks().length === 1,
+        )
+      );
+    }, "autoplay disabled attachments");
+    const disabled =
+      attempts === 0 &&
+      videoDemand === 1 &&
+      audioDemand &&
+      [...host.querySelectorAll<HTMLMediaElement>("video,audio")].every(
+        (element) => !element.autoplay,
+      );
+    render(true);
+    await waitFor(() => attempts >= 3, "autoplay enabled");
+    const enabled = attempts === 3 && videoDemand === 1 && audioDemand;
+    root.unmount();
+    const released = videoDemand === 0 && !audioDemand;
+    return {
+      autoplayRespected:
+        disabled &&
+        enabled &&
+        released &&
+        video.readyState === "live" &&
+        audio.readyState === "live",
+    };
+  } finally {
+    root.unmount();
+    catalog.close();
+    host.remove();
+    video.stop();
+    audio.stop();
+    await context.close();
     HTMLMediaElement.prototype.play = originalPlay;
   }
 }
