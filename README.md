@@ -51,7 +51,7 @@ Rust 1.92.0 toolchain and components, including the WASM target, without
 changing the global default. Cargo installs `wasm-bindgen-cli` 0.2.127 to match
 `Cargo.lock`; Homebrew's version can be incompatible.
 
-On Fedora, `just deps` also installs `libstdc++-devel` through `sudo dnf` so
+On Fedora, `just deps` also installs `gcc-c++` through `sudo dnf` so
 Clang can link the C++ codec dependencies. This step may prompt for your password.
 Native builds default to `clang`/`clang++`; explicit `CC`/`CXX` environment
 variables still take precedence. JavaScript dependencies remain owned by each

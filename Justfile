@@ -9,7 +9,7 @@ default:
 deps:
     #!/usr/bin/env bash
     set -euo pipefail
-    if command -v dnf >/dev/null; then sudo dnf install -y libstdc++-devel; fi
+    if command -v dnf >/dev/null; then sudo dnf install -y gcc-c++; fi
     brew install just rustup llvm mold sccache cmake make nasm pkgconf protobuf node pnpm wasm-pack cargo-nextest go python curl unzip xz
     export PATH="$HOME/.cargo/bin:$(brew --prefix rustup)/bin:$PATH"
     rustup toolchain install 1.92.0 --profile minimal --component rustfmt,clippy,rust-src,rust-analyzer --target wasm32-unknown-unknown
