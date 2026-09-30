@@ -32,6 +32,35 @@ This is a **thread-per-core** system that isolates the data plane from the contr
 
 ![architecture](./crates/pulsebeam/docs/architecture.png)
 
+## Development dependencies
+
+For Linux development, install [Homebrew](https://brew.sh), activate its
+`shellenv`, then run from the repository root:
+
+```bash
+brew install just
+just deps
+export PATH="$HOME/.cargo/bin:$(brew --prefix rustup)/bin:$PATH"
+just test-fast
+```
+
+`just deps` installs the tools for normal builds, static checks, and fast/slow
+tests: the native compiler/build tools, Node/pnpm, WebAssembly tooling,
+`cargo-nextest`, Go, Python, and browser download utilities. Rustup installs the
+Rust 1.92.0 toolchain and components, including the WASM target, without
+changing the global default. Cargo installs `wasm-bindgen-cli` 0.2.127 to match
+`Cargo.lock`; Homebrew's version can be incompatible.
+
+On Fedora, `just deps` also installs `libstdc++-devel` through `sudo dnf` so
+Clang can link the C++ codec dependencies. This step may prompt for your password.
+Native builds default to `clang`/`clang++`; explicit `CC`/`CXX` environment
+variables still take precedence. JavaScript dependencies remain owned by each
+package's frozen lockfile and are installed by `just prepare`. Slow tests
+provision the pinned browsers through the RTC owner's scripts; the accepted
+browser matrix is Linux x86_64 and also requires the host's browser runtime
+libraries. Optional release, profiling, and privileged kernel tools are not
+installed by `just deps`.
+
 ## Quickstart
 
 The following quickstart assumes that you have a Linux machine. As a fallback, you can go to <https://pulsebeam.dev/#quickstart> and check the "fallback" toggle.

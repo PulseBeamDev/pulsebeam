@@ -5,6 +5,16 @@ test_owners := "agents/pulsebeam-agent-core agents/pulsebeam-agent-native agents
 default:
     @just --list
 
+# Install Linux build, check, and test tools using Homebrew and Rustup/Cargo.
+deps:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if command -v dnf >/dev/null; then sudo dnf install -y libstdc++-devel; fi
+    brew install just rustup llvm mold sccache cmake make nasm pkgconf protobuf node pnpm wasm-pack cargo-nextest go python curl unzip xz
+    export PATH="$HOME/.cargo/bin:$(brew --prefix rustup)/bin:$PATH"
+    rustup toolchain install 1.92.0 --profile minimal --component rustfmt,clippy,rust-src,rust-analyzer --target wasm32-unknown-unknown
+    cargo +1.92.0 install wasm-bindgen-cli --version 0.2.127 --locked
+
 # Prepare local JavaScript packages in direct-dependency order.
 prepare:
     just --justfile apps/meet/Justfile prepare
