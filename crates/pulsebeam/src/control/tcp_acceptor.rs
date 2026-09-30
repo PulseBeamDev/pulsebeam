@@ -281,7 +281,7 @@ mod tests {
     }
 
     fn test_host_ip() -> IpAddr {
-        pulsebeam_runtime::testing::test_host_ip("192.168.250.11")
+        std::net::Ipv4Addr::LOCALHOST.into()
     }
 
     fn test_config() -> TcpAcceptorConfig {

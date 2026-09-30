@@ -770,7 +770,7 @@ mod tests {
     }
 
     fn test_host_ip() -> IpAddr {
-        crate::testing::test_host_ip("192.168.250.12")
+        std::net::Ipv4Addr::LOCALHOST.into()
     }
 
     /// Connect a client to `listener`, accept the server-side stream, return both.

@@ -25,28 +25,14 @@ pub fn test_host_ip(sim_host_ip: &str) -> IpAddr {
 
 pub fn run_local<Fut>(host_ip: IpAddr, test: Fut)
 where
-    Fut: Future<Output = ()> + Send + 'static,
+    Fut: Future<Output = ()> + 'static,
 {
     #[cfg(feature = "sim")]
     {
-        use std::sync::{Arc, Mutex};
-
-        let test = Arc::new(Mutex::new(Some(test)));
         let mut sim = turmoil::Builder::new().build();
-        sim.host(host_ip, {
-            let test = Arc::clone(&test);
-            move || {
-                let test = Arc::clone(&test);
-                async move {
-                    let test = test
-                        .lock()
-                        .unwrap()
-                        .take()
-                        .expect("test future already used");
-                    Box::pin(test).await;
-                    Ok(())
-                }
-            }
+        sim.client(host_ip, async move {
+            test.await;
+            Ok(())
         });
         sim.run().unwrap();
     }
@@ -60,5 +46,22 @@ where
             .unwrap_or_else(|err| crate::fatal!("test runtime unavailable: {err}"));
         let local = tokio::task::LocalSet::new();
         local.block_on(&rt, test);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{cell::Cell, rc::Rc};
+
+    #[test]
+    fn local_future_completes_after_yielding() {
+        let completed = Rc::new(Cell::new(false));
+        let observed = Rc::clone(&completed);
+        run_local(test_host_ip("192.168.250.13"), async move {
+            tokio::task::yield_now().await;
+            completed.set(true);
+        });
+        assert!(observed.get());
     }
 }
