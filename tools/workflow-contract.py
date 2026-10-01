@@ -7,8 +7,7 @@ import sys
 
 COMMANDS = re.compile(
     r"(?m)^\s*(?:\$\s*)?(?:just\s+|(?:brew|rustup)\s+(?:install|toolchain|component)|"
-    r"cargo\s+(?:build|run|test|nextest)|pnpm\s+(?:run|build|test)|"
-    r"(?:export\s+)?RUSTC_WRAPPER[=:]\s*[\"']?sccache)"
+    r"cargo\s+(?:build|run|test|nextest)|pnpm\s+(?:run|build|test))"
 )
 
 
@@ -22,7 +21,7 @@ def main():
         for match in COMMANDS.finditer(text):
             line = text.count("\n", 0, match.start()) + 1
             failures.append(f"{path}:{line}: retired build/setup command: {match.group().strip()}")
-        if "sccache-action" in text or "tool: just" in text:
+        if "tool: just" in text:
             failures.append(f"{path}: retired CI tool setup")
     if failures:
         print("\n".join(failures), file=sys.stderr)

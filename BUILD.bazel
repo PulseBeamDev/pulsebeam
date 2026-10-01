@@ -3,7 +3,7 @@ load("@bazel_skylib//rules:build_test.bzl", "build_test")
 
 package(default_visibility = ["//visibility:public"])
 
-exports_files(["Cargo.toml", "Cargo.lock", "clippy.toml", "rust-toolchain.toml", "LICENSE", "README.md", "scripts/bwe-scoreboard.py"])
+exports_files(["bazel", "Cargo.toml", "Cargo.lock", "clippy.toml", "rust-toolchain.toml", "LICENSE", "README.md", "scripts/bwe-scoreboard.py"])
 
 filegroup(
     name = "cargo_metadata_inputs",
@@ -34,8 +34,8 @@ test_suite(
     tests = ["//%s:%s" % (owner, check) for owner in RUST_OWNERS + ["crates/pulsebeam-simulator"] for check in ["format", "clippy"]] + [
         ":artifacts", "//agents/pulsebeam-agent-web:js_format", "//agents/pulsebeam-agent-web:public_contract",
         "//agents/pulsebeam-agent-web:uniffi_types", "//agents/pulsebeam-agent-web:uniffi_contract",
-        "//agents/react:format", "//agents/react:fast", "//apps/meet:check", "//tools:legacy_contract", "//tools:simulation_runner_contract", "//tools:scoreboard_contract", "//tools:ide_contract",
-        "//release:contract",
+        "//agents/react:format", "//agents/react:fast", "//apps/meet:check", "//tools:workflow_contract", "//tools:simulation_runner_contract", "//tools:scoreboard_contract", "//tools:ide_contract", "//tools:launcher_contract",
+        "//release:contract", "//release:elf_contract", "//release:plan_contract",
     ],
 )
 

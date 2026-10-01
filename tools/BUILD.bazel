@@ -3,7 +3,7 @@ load("@rules_rust_wasm_bindgen//:defs.bzl", "rust_wasm_bindgen_toolchain")
 
 package(default_visibility = ["//visibility:public"])
 
-exports_files(["rust-pins.MODULE.bazel", "distribution.MODULE.bazel", "rust-metadata.bzl", "wasm-deps.bzl", "generators.toml", "run-simulations.py", "check-js-format.py", "scoreboard.py", "static-server.py", "cmake.sh"] + glob(["rust/**", "patches/**"]))
+exports_files(["rust-pins.MODULE.bazel", "rust-metadata.bzl", "wasm-deps.bzl", "generators.toml", "run-simulations.py", "check-js-format.py", "scoreboard.py", "static-server.py", "cmake.sh"] + glob(["rust/**", "patches/**"]))
 
 rust_wasm_bindgen_toolchain(
     name = "wasm_bindgen_toolchain_impl",
@@ -71,9 +71,17 @@ FIX_INPUTS = {
 }
 
 py_test(
-    name = "legacy_contract",
-    srcs = ["legacy-contract.py"],
-    main = "legacy-contract.py",
+    name = "launcher_contract",
+    srcs = ["tests/launcher_test.py"],
+    main = "tests/launcher_test.py",
+    args = ["--launcher", "$(rootpath //:bazel)", "--flake", "$(rootpath :host/flake.nix)", "--lock", "$(rootpath :host/flake.lock)"],
+    data = ["//:bazel", "host/flake.nix", "host/flake.lock"],
+)
+
+py_test(
+    name = "workflow_contract",
+    srcs = ["workflow-contract.py"],
+    main = "workflow-contract.py",
     args = ["$(rootpaths //:workflow_inputs)"],
     data = ["//:workflow_inputs"],
 )

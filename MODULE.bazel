@@ -53,9 +53,20 @@ use_repo(npm, "web_npm", "react_npm", "consumer_npm", "meet_npm", "docs_npm")
 browsers = use_extension("//tools:browsers.bzl", "browsers")
 use_repo(browsers, "browser_chrome", "browser_chromedriver", "browser_firefox", "browser_geckodriver")
 
+host_environment = use_repo_rule("//tools:host-env.bzl", "host_environment")
+host_environment(name = "host_environment")
+
 llvm = use_extension("@toolchains_llvm//toolchain/extensions:llvm.bzl", "llvm")
-llvm.toolchain(name = "llvm_toolchain", llvm_version = "20.1.8")
-use_repo(llvm, "llvm_toolchain")
+llvm.toolchain(
+    name = "llvm_toolchain",
+    llvm_version = "20.1.8",
+    # The locked FHS runtime has no host-distro identity to probe.
+    exec_os = "linux",
+    linker = {"linux-x86_64": "/usr/bin/mold", "linux-aarch64": "/usr/bin/mold"},
+)
+llvm.extra_compiler_files(name = "llvm_toolchain", label = "@host_environment//:identity")
+llvm.extra_linker_files(name = "llvm_toolchain", label = "@host_environment//:identity")
+use_repo(llvm, "llvm_toolchain", "llvm_toolchain_llvm")
 register_toolchains("@llvm_toolchain//:all")
 
 tools = use_extension("@rules_foreign_cc//foreign_cc:extensions.bzl", "tools")
@@ -73,7 +84,6 @@ http_file(
 )
 
 include("//tools:rust-pins.MODULE.bazel")
-include("//tools:distribution.MODULE.bazel")
 
 oci = use_extension("@rules_oci//oci:extensions.bzl", "oci")
 oci.pull(
@@ -102,7 +112,7 @@ CMAKE_ENV = {
     "PULSEBEAM_NINJA": "$${pwd}/$(REAL_NINJA)",
 }
 CMAKE_INJECTIONS = {"//tools:cmake.sh": "@pulsebeam"}
-crate.annotation(crate = "aws-lc-sys", build_script_tools = CMAKE_TOOLS, build_script_toolchains = CMAKE_TOOLCHAINS, build_script_env = CMAKE_ENV, label_injections = CMAKE_INJECTIONS, repositories = ["crates", "str0m_legacy", "str0m_rtc", "str0m_reference"])
+crate.annotation(crate = "aws-lc-sys", build_script_tools = CMAKE_TOOLS, build_script_toolchains = CMAKE_TOOLCHAINS, build_script_env = CMAKE_ENV, label_injections = CMAKE_INJECTIONS, repositories = ["crates", "str0m_native", "str0m_rtc", "str0m_reference"])
 crate.annotation(crate = "opusic-sys", build_script_tools = CMAKE_TOOLS, build_script_toolchains = CMAKE_TOOLCHAINS, build_script_env = CMAKE_ENV, label_injections = CMAKE_INJECTIONS, repositories = ["crates"])
 crate.annotation(
     crate = "openh264-sys2",

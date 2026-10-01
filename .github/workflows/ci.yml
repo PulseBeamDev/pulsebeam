@@ -16,8 +16,6 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: ./.github/actions/setup-ci
-        with:
-          browsers: "true"
       - name: Run complete non-privileged gate
         run: ./bazel test //:test --test_output=errors
       - name: Retain test logs and browser evidence

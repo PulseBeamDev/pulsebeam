@@ -1,5 +1,8 @@
 common --enable_bzlmod
 common --lockfile_mode=error
+common --repo_env=PULSEBEAM_HOST_ENV
+build --action_env=PULSEBEAM_HOST_ENV
+build --disk_cache=~/.cache/pulsebeam/bazel/disk-cache
 build --incompatible_strict_action_env
 build --announce_rc
 build --@rules_python//python/config_settings:bootstrap_impl=script
