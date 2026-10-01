@@ -1,0 +1,17 @@
+[package]
+name = "pulsebeam-auth-conformance"
+version = "0.1.0"
+edition.workspace = true
+license = "Apache-2.0"
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+data-encoding = "2.11.1"
+ed25519-dalek = "2.2.0"
+pulsebeam-core = { path = "../../crates/pulsebeam-core" }
+pulsebeam-server = { path = "../rust" }
+serde = { workspace = true }
+serde_json = "1.0.150"

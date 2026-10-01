@@ -1,20 +1,15 @@
 //! Canonical PulseBeam entity identities.
 
-use data_encoding::Encoding;
-use data_encoding_macro::new_encoding;
+pub use pulsebeam_auth::identity::IdValidationError;
+#[cfg(test)]
+use pulsebeam_auth::identity::{UUID_TEXT_LEN, decode_uuid, encode_uuid};
+use pulsebeam_auth::identity::{format_id, parse_id, validate_external};
 use serde::{Deserialize, Serialize};
 use sha3::{Digest, Sha3_256};
 use std::{fmt, str::FromStr};
-use uuid::{Uuid, Variant, Version};
-
-const UUID_TEXT_LEN: usize = 26;
-const EXTERNAL_ID_MAX_LEN: usize = 36;
-const VERSION: u8 = b'0';
-const CROCKFORD: Encoding = new_encoding! {
-    symbols: "0123456789ABCDEFGHJKMNPQRSTVWXYZ",
-    translate_from: "abcdefghjkmnpqrstvwxyzIiLlOo",
-    translate_to: "ABCDEFGHJKMNPQRSTVWXYZ111100",
-};
+#[cfg(test)]
+use uuid::Variant;
+use uuid::{Uuid, Version};
 
 // These domain bytes and TrackKind discriminants are part of the V0 transcript.
 const ROOM_DOMAIN: &[u8] = b"pulsebeam.identity.room.v0";
@@ -22,85 +17,6 @@ const PARTICIPANT_DOMAIN: &[u8] = b"pulsebeam.identity.participant.v0";
 const AUDIO_TRACK_DOMAIN: &[u8] = b"pulsebeam.identity.audio-track.v0";
 const VIDEO_TRACK_DOMAIN: &[u8] = b"pulsebeam.identity.video-track.v0";
 const DATA_TRACK_DOMAIN: &[u8] = b"pulsebeam.identity.data-track.v0";
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
-#[non_exhaustive]
-pub enum IdValidationError {
-    #[error("ID is empty")]
-    Empty,
-    #[error("ID exceeds maximum length of {0}")]
-    TooLong(usize),
-    #[error("ID contains invalid characters")]
-    InvalidCharacters,
-    #[error("invalid ID prefix; expected {expected}")]
-    InvalidPrefix { expected: &'static str },
-    #[error("invalid ID length; expected {expected}, got {actual}")]
-    InvalidLength { expected: usize, actual: usize },
-    #[error("unsupported ID encoding version")]
-    UnsupportedVersion,
-    #[error("invalid Crockford Base32 encoding")]
-    InvalidEncoding,
-    #[error("invalid UUID variant")]
-    InvalidUuidVariant,
-    #[error("invalid UUID version")]
-    InvalidUuidVersion,
-}
-
-fn encode_uuid(uuid: Uuid) -> String {
-    CROCKFORD.encode(uuid.as_bytes())
-}
-
-fn decode_uuid(value: &str) -> Result<Uuid, IdValidationError> {
-    if value.len() != UUID_TEXT_LEN {
-        return Err(IdValidationError::InvalidLength {
-            expected: UUID_TEXT_LEN,
-            actual: value.len(),
-        });
-    }
-    let decoded = CROCKFORD
-        .decode(value.as_bytes())
-        .ok()
-        .and_then(|bytes| <[u8; 16]>::try_from(bytes).ok())
-        .ok_or(IdValidationError::InvalidEncoding)?;
-    Ok(Uuid::from_bytes(decoded))
-}
-
-fn format_id(prefix: &str, uuid: Uuid) -> String {
-    let mut value = String::with_capacity(prefix.len().saturating_add(UUID_TEXT_LEN + 2));
-    value.push_str(prefix);
-    value.push('_');
-    value.push(char::from(VERSION));
-    value.push_str(&encode_uuid(uuid));
-    value
-}
-
-fn parse_id(
-    value: &str,
-    prefix: &'static str,
-    expected_version: Version,
-) -> Result<Uuid, IdValidationError> {
-    let Some(encoded) = value
-        .strip_prefix(prefix)
-        .and_then(|rest| rest.strip_prefix('_'))
-    else {
-        return Err(IdValidationError::InvalidPrefix { expected: prefix });
-    };
-    let Some(payload) = encoded
-        .strip_prefix(char::from(VERSION))
-        .or_else(|| encoded.strip_prefix('O'))
-        .or_else(|| encoded.strip_prefix('o'))
-    else {
-        return Err(IdValidationError::UnsupportedVersion);
-    };
-    let uuid = decode_uuid(payload)?;
-    if uuid.get_variant() != Variant::RFC4122 {
-        return Err(IdValidationError::InvalidUuidVariant);
-    }
-    if uuid.get_version() != Some(expected_version) {
-        return Err(IdValidationError::InvalidUuidVersion);
-    }
-    Ok(uuid)
-}
 
 fn write_string(hasher: &mut Sha3_256, value: &str) {
     let length = u32::try_from(value.len()).unwrap_or(u32::MAX);
@@ -128,22 +44,6 @@ fn derive_v8(domain: &[u8], parent: &[u8; 16], kind: Option<TrackKind>, text: &s
         *variant = (*variant & 0x3f) | 0x80;
     }
     Uuid::from_bytes(bytes)
-}
-
-fn validate_external(value: &str) -> Result<(), IdValidationError> {
-    if value.is_empty() {
-        return Err(IdValidationError::Empty);
-    }
-    if value.len() > EXTERNAL_ID_MAX_LEN {
-        return Err(IdValidationError::TooLong(EXTERNAL_ID_MAX_LEN));
-    }
-    if !value
-        .bytes()
-        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
-    {
-        return Err(IdValidationError::InvalidCharacters);
-    }
-    Ok(())
 }
 
 macro_rules! external_id {

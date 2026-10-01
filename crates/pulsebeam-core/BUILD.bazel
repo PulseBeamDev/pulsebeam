@@ -21,7 +21,7 @@ rust_library(
     rustc_env_files = [":cargo_env"],
     lint_config = ":lints",
     aliases = aliases(),
-    deps = all_crate_deps(normal = True),
+    deps = all_crate_deps(normal = True) + ["//crates/pulsebeam-auth"],
     proc_macro_deps = all_crate_deps(proc_macro = True),
 )
 
@@ -37,14 +37,13 @@ rust_library(
     rustc_env_files = [":cargo_env"],
     lint_config = ":lints",
     aliases = aliases(),
-    deps = all_crate_deps(normal = True),
+    deps = all_crate_deps(normal = True) + ["//crates/pulsebeam-auth"],
     proc_macro_deps = all_crate_deps(proc_macro = True),
 )
 
 rust_test(
     name = "unit_tests",
     crate = ":pulsebeam-core",
-    compile_data = ["//sdks/auth:vectors.json"],
     crate_features = ["reqwest", "str0m", "test-utils"],
     lint_config = ":lints",
     aliases = aliases(normal_dev = True, proc_macro_dev = True),

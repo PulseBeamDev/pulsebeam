@@ -1,0 +1,33 @@
+load("@crates//:defs.bzl", "aliases", "all_crate_deps", "crate_edition")
+load("@rules_rust//cargo:defs.bzl", "cargo_toml_env_vars")
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test", "rust_clippy_test", "rustfmt_test")
+load("@rules_pkg//pkg:mappings.bzl", "pkg_files", "strip_prefix")
+
+package(default_visibility = ["//visibility:public"])
+exports_files(["Cargo.toml"])
+filegroup(name = "workflow_inputs", srcs = ["README.md", "Cargo.toml"])
+filegroup(name = "cargo_metadata_inputs", srcs = ["Cargo.toml"] + glob(["src/**/*.rs"]))
+cargo_toml_env_vars(name = "cargo_env", src = "Cargo.toml")
+
+rust_library(
+    name = "pulsebeam-auth",
+    crate_root = "src/lib.rs",
+    srcs = glob(["src/**/*.rs"]),
+    edition = crate_edition(),
+    rustc_env_files = [":cargo_env"],
+    lint_config = "//crates/pulsebeam-core:lints",
+    aliases = aliases(),
+    deps = all_crate_deps(normal = True),
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+)
+
+pkg_files(
+    name = "bundled_sources",
+    srcs = ["Cargo.toml", "README.md", "LICENSE"] + glob(["src/**/*.rs"]),
+    prefix = "vendor/pulsebeam-auth",
+    strip_prefix = strip_prefix.from_pkg(),
+)
+
+rust_test(name = "unit_tests", crate = ":pulsebeam-auth", lint_config = "//crates/pulsebeam-core:lints")
+rustfmt_test(name = "format", targets = [":pulsebeam-auth"])
+rust_clippy_test(name = "clippy", targets = [":pulsebeam-auth", ":unit_tests"])

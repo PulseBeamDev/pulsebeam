@@ -1,6 +1,45 @@
-load("@aspect_rules_js//js:defs.bzl", "js_test")
+load("@crates//:defs.bzl", "aliases", "all_crate_deps", "crate_edition")
+load("@rules_rust//cargo:defs.bzl", "cargo_toml_env_vars", "extract_cargo_lints")
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_binary", "rust_test", "rust_clippy_test", "rustfmt_test")
 
 package(default_visibility = ["//visibility:public"])
 exports_files(["vectors.json"])
-filegroup(name = "workflow_inputs", srcs = ["README.md"])
-js_test(name = "contract", entry_point = "contract.mjs", data = ["vectors.json"])
+filegroup(name = "workflow_inputs", srcs = ["README.md", "Cargo.toml", "cases.json"])
+filegroup(name = "cargo_metadata_inputs", srcs = ["Cargo.toml"] + glob(["src/**/*.rs"]))
+cargo_toml_env_vars(name = "cargo_env", src = "Cargo.toml", workspace = "//:Cargo.toml")
+extract_cargo_lints(name = "lints", manifest = "Cargo.toml", workspace = "//:Cargo.toml")
+
+rust_library(
+    name = "pulsebeam-auth-conformance",
+    crate_root = "src/lib.rs",
+    srcs = ["src/lib.rs"],
+    edition = crate_edition(),
+    rustc_env_files = [":cargo_env"],
+    lint_config = ":lints",
+    aliases = aliases(),
+    deps = all_crate_deps(normal = True) + ["//crates/pulsebeam-core", "//sdks/rust:pulsebeam-server"],
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+)
+
+rust_test(
+    name = "contract",
+    crate = ":pulsebeam-auth-conformance",
+    compile_data = ["vectors.json", "cases.json"],
+    lint_config = ":lints",
+)
+
+rust_binary(
+    name = "generate_vectors",
+    crate_root = "src/bin/generate_vectors.rs",
+    srcs = ["src/bin/generate_vectors.rs"],
+    compile_data = ["cases.json"],
+    edition = crate_edition(),
+    rustc_env_files = [":cargo_env"],
+    lint_config = ":lints",
+    deps = [":pulsebeam-auth-conformance", "//crates/pulsebeam-core"] + all_crate_deps(normal = True),
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+)
+
+rustfmt_test(name = "format", targets = [":pulsebeam-auth-conformance", ":generate_vectors"])
+rust_clippy_test(name = "clippy", targets = [":pulsebeam-auth-conformance", ":contract", ":generate_vectors"])
+test_suite(name = "fast", tests = [":contract", ":format", ":clippy", "//sdks/rust:consumer", "//sdks/rust:compiler_contract"])

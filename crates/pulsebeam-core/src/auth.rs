@@ -4,231 +4,15 @@ use crate::identity::{
     ApiKeyId, ParticipantExternalId, ParticipantId, ProjectId, RoomExternalId, RoomId,
 };
 use data_encoding::BASE64URL_NOPAD;
-use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
+use ed25519_dalek::{Signature, VerifyingKey};
+pub use pulsebeam_auth::keys::{ApiSigningKey, ApiVerifyingKey, KeyValidationError};
 use serde::{Deserialize, Serialize, de};
-use std::{collections::HashMap, fmt, str::FromStr};
+use std::{collections::HashMap, fmt};
 
+#[cfg(test)]
 const KEY_BYTES: usize = 32;
-const KEY_TEXT_LEN: usize = 52;
-const CROCKFORD: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 const REDACTED: &str = "[REDACTED]";
 pub const MAX_COMPACT_TOKEN_LEN: usize = 16_384;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
-#[non_exhaustive]
-pub enum KeyValidationError {
-    #[error("invalid key prefix; expected {expected}")]
-    InvalidPrefix { expected: &'static str },
-    #[error("invalid key length; expected {expected}, got {actual}")]
-    InvalidLength { expected: usize, actual: usize },
-    #[error("unsupported key encoding version")]
-    UnsupportedVersion,
-    #[error("invalid Crockford Base32 key encoding")]
-    InvalidEncoding,
-    #[error("key encoding has nonzero high padding bits")]
-    NonzeroPadding,
-    #[error("invalid Ed25519 verifying key")]
-    InvalidVerifyingKey,
-}
-
-fn crockford_value(byte: u8) -> Option<u8> {
-    match byte.to_ascii_uppercase() {
-        b'O' => Some(0),
-        b'I' | b'L' => Some(1),
-        byte => CROCKFORD
-            .iter()
-            .position(|candidate| *candidate == byte)
-            .and_then(|index| u8::try_from(index).ok()),
-    }
-}
-
-fn encode_key(bytes: &[u8; KEY_BYTES]) -> String {
-    let mut encoded = String::with_capacity(KEY_TEXT_LEN);
-    let mut buffer = 0u16;
-    let mut bits = 4u8;
-    for byte in bytes {
-        buffer = (buffer << 8) | u16::from(*byte);
-        bits = bits.saturating_add(8);
-        while bits >= 5 {
-            bits = bits.saturating_sub(5);
-            let value = (buffer >> bits) & 0x1f;
-            let character = CROCKFORD.get(usize::from(value)).copied().unwrap_or(b'?');
-            encoded.push(char::from(character));
-            buffer &= (1u16 << bits).wrapping_sub(1);
-        }
-    }
-    encoded
-}
-
-fn decode_key(value: &str) -> Result<[u8; KEY_BYTES], KeyValidationError> {
-    if value.len() != KEY_TEXT_LEN {
-        return Err(KeyValidationError::InvalidLength {
-            expected: KEY_TEXT_LEN,
-            actual: value.len(),
-        });
-    }
-
-    let mut decoded = Vec::with_capacity(KEY_BYTES);
-    let mut buffer = 0u16;
-    let mut bits = 0u8;
-    for (index, byte) in value.bytes().enumerate() {
-        let digit = crockford_value(byte).ok_or(KeyValidationError::InvalidEncoding)?;
-        if index == 0 {
-            if digit > 1 {
-                return Err(KeyValidationError::NonzeroPadding);
-            }
-            buffer = u16::from(digit);
-            bits = 1;
-        } else {
-            buffer = (buffer << 5) | u16::from(digit);
-            bits = bits.saturating_add(5);
-        }
-        while bits >= 8 {
-            bits = bits.saturating_sub(8);
-            let byte =
-                u8::try_from(buffer >> bits).map_err(|_| KeyValidationError::InvalidEncoding)?;
-            decoded.push(byte);
-            buffer &= (1u16 << bits).wrapping_sub(1);
-        }
-    }
-    decoded
-        .try_into()
-        .map_err(|_| KeyValidationError::InvalidEncoding)
-}
-
-fn parse_payload<'a>(value: &'a str, prefix: &'static str) -> Result<&'a str, KeyValidationError> {
-    let Some(versioned) = value
-        .strip_prefix(prefix)
-        .and_then(|rest| rest.strip_prefix('_'))
-    else {
-        return Err(KeyValidationError::InvalidPrefix { expected: prefix });
-    };
-    versioned
-        .strip_prefix('0')
-        .or_else(|| versioned.strip_prefix('O'))
-        .or_else(|| versioned.strip_prefix('o'))
-        .ok_or(KeyValidationError::UnsupportedVersion)
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub struct ApiVerifyingKey([u8; KEY_BYTES]);
-
-impl ApiVerifyingKey {
-    pub fn from_bytes(bytes: [u8; KEY_BYTES]) -> Result<Self, KeyValidationError> {
-        VerifyingKey::from_bytes(&bytes).map_err(|_| KeyValidationError::InvalidVerifyingKey)?;
-        Ok(Self(bytes))
-    }
-
-    #[doc(hidden)]
-    pub const fn from_bytes_unchecked(bytes: [u8; KEY_BYTES]) -> Self {
-        Self(bytes)
-    }
-
-    pub fn as_bytes(&self) -> &[u8; KEY_BYTES] {
-        &self.0
-    }
-
-    pub fn as_str(&self) -> String {
-        format!("pk_0{}", encode_key(&self.0))
-    }
-}
-
-impl fmt::Display for ApiVerifyingKey {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.as_str())
-    }
-}
-
-impl fmt::Debug for ApiVerifyingKey {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.as_str())
-    }
-}
-
-impl FromStr for ApiVerifyingKey {
-    type Err = KeyValidationError;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        Self::from_bytes(decode_key(parse_payload(value, "pk")?)?)
-    }
-}
-
-impl Serialize for ApiVerifyingKey {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        serializer.serialize_str(&self.as_str())
-    }
-}
-
-impl<'de> Deserialize<'de> for ApiVerifyingKey {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        String::deserialize(deserializer)?
-            .parse()
-            .map_err(serde::de::Error::custom)
-    }
-}
-
-#[derive(Clone, PartialEq, Eq)]
-pub struct ApiSigningKey([u8; KEY_BYTES]);
-
-impl ApiSigningKey {
-    pub const fn from_seed(seed: [u8; KEY_BYTES]) -> Self {
-        Self(seed)
-    }
-
-    pub fn verifying_key(&self) -> ApiVerifyingKey {
-        ApiVerifyingKey(SigningKey::from_bytes(&self.0).verifying_key().to_bytes())
-    }
-
-    pub fn to_secret_string(&self) -> String {
-        format!("sk_0{}", encode_key(&self.0))
-    }
-}
-
-impl fmt::Display for ApiSigningKey {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(REDACTED)
-    }
-}
-
-impl fmt::Debug for ApiSigningKey {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(REDACTED)
-    }
-}
-
-impl FromStr for ApiSigningKey {
-    type Err = KeyValidationError;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        Ok(Self(decode_key(parse_payload(value, "sk")?)?))
-    }
-}
-
-impl Serialize for ApiSigningKey {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        serializer.serialize_str(&self.to_secret_string())
-    }
-}
-
-impl<'de> Deserialize<'de> for ApiSigningKey {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        String::deserialize(deserializer)?
-            .parse()
-            .map_err(serde::de::Error::custom)
-    }
-}
 
 pub const DEVELOPMENT_PROJECT_ID: ProjectId =
     ProjectId::from_bytes([0, 0, 0, 0, 0, 0, 0x70, 0, 0x80, 0, 0, 0, 0, 0, 0, 1]);
@@ -472,52 +256,6 @@ pub fn verify_participant_token(
     })
 }
 
-#[derive(Serialize)]
-struct DevelopmentHeader<'a> {
-    alg: &'a str,
-    kid: ApiKeyId,
-    typ: &'a str,
-}
-
-#[derive(Serialize)]
-struct DevelopmentClaims<'a> {
-    iss: ProjectId,
-    aud: &'a str,
-    sub: &'a str,
-    room: &'a str,
-    exp: u64,
-}
-
-pub fn mint_development_token(
-    room: &RoomExternalId,
-    participant: &ParticipantExternalId,
-    exp: u64,
-) -> Result<String, TokenError> {
-    let header = serde_json::to_vec(&DevelopmentHeader {
-        alg: "EdDSA",
-        kid: DEVELOPMENT_API_KEY_ID,
-        typ: "pb+jwt",
-    })
-    .map_err(|_| TokenError::Invalid)?;
-    let claims = serde_json::to_vec(&DevelopmentClaims {
-        iss: DEVELOPMENT_PROJECT_ID,
-        aud: "pb",
-        sub: participant.as_str(),
-        room: room.as_str(),
-        exp,
-    })
-    .map_err(|_| TokenError::Invalid)?;
-    let encoded_header = BASE64URL_NOPAD.encode(&header);
-    let encoded_claims = BASE64URL_NOPAD.encode(&claims);
-    let signing_input = format!("{encoded_header}.{encoded_claims}");
-    let signature =
-        SigningKey::from_bytes(&DEVELOPMENT_API_SIGNING_KEY.0).sign(signing_input.as_bytes());
-    Ok(format!(
-        "{signing_input}.{}",
-        BASE64URL_NOPAD.encode(&signature.to_bytes())
-    ))
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProjectKey {
@@ -684,11 +422,8 @@ mod tests {
         let encoded_header = BASE64URL_NOPAD.encode(header.as_bytes());
         let encoded_claims = BASE64URL_NOPAD.encode(claims.as_bytes());
         let signing_input = format!("{encoded_header}.{encoded_claims}");
-        let signature = SigningKey::from_bytes(&signing_key.0).sign(signing_input.as_bytes());
-        format!(
-            "{signing_input}.{}",
-            BASE64URL_NOPAD.encode(&signature.to_bytes())
-        )
+        let signature = signing_key.sign_message(signing_input.as_bytes());
+        format!("{signing_input}.{}", BASE64URL_NOPAD.encode(&signature))
     }
 
     fn profile_token(header_extra: &str, claims_extra: &str) -> String {
@@ -751,70 +486,6 @@ mod tests {
                 })
                 .collect(),
         }
-    }
-
-    #[test]
-    fn key_vectors_round_trip_and_aliases_canonicalize() {
-        let signing = DEVELOPMENT_API_SIGNING_KEY.clone();
-        let public = DEVELOPMENT_API_VERIFYING_KEY;
-        let signing_text = signing.to_secret_string();
-        let public_text = public.as_str();
-        assert_eq!(
-            signing_text,
-            "sk_017B1P6EYZZATC2X88JQMJBP2SH24972PJYSJD4CQ0EXC0CEAWZV0"
-        );
-        assert_eq!(
-            public_text,
-            "pk_01NTTK00R5C8APZAMQZPKS5J0EEGEW5SF7PN64CJTY0GTD3VGEM8T"
-        );
-        assert_eq!(signing_text.parse::<ApiSigningKey>().unwrap(), signing);
-        assert_eq!(public_text.parse::<ApiVerifyingKey>().unwrap(), public);
-        assert_eq!(
-            public_text
-                .to_ascii_lowercase()
-                .parse::<ApiVerifyingKey>()
-                .unwrap(),
-            public
-        );
-        assert_eq!(
-            signing_text
-                .replace('0', "O")
-                .parse::<ApiSigningKey>()
-                .unwrap(),
-            signing
-        );
-    }
-
-    #[test]
-    fn malformed_keys_and_nonzero_high_bits_are_rejected() {
-        let public = DEVELOPMENT_API_VERIFYING_KEY.as_str();
-        assert!(matches!(
-            public.replacen("pk", "sk", 1).parse::<ApiVerifyingKey>(),
-            Err(KeyValidationError::InvalidPrefix { .. })
-        ));
-        assert!(matches!(
-            public
-                .replacen("pk_0", "pk_1", 1)
-                .parse::<ApiVerifyingKey>(),
-            Err(KeyValidationError::UnsupportedVersion)
-        ));
-        let short = public.chars().take(55).collect::<String>();
-        assert!(matches!(
-            short.parse::<ApiVerifyingKey>(),
-            Err(KeyValidationError::InvalidLength { .. })
-        ));
-        let payload = public.chars().skip(5).collect::<String>();
-        let nonzero_padding = format!("pk_0Z{payload}");
-        assert!(matches!(
-            nonzero_padding.parse::<ApiVerifyingKey>(),
-            Err(KeyValidationError::NonzeroPadding)
-        ));
-        assert!(
-            public
-                .replacen('D', "U", 1)
-                .parse::<ApiVerifyingKey>()
-                .is_err()
-        );
     }
 
     #[test]
@@ -919,14 +590,10 @@ mod tests {
     fn development_jwt_golden_vector_verifies_and_derives_canonical_identity() {
         let room = RoomExternalId::new("general").unwrap();
         let participant = ParticipantExternalId::new("alice").unwrap();
-        let token = mint_development_token(&room, &participant, 2_000).unwrap();
-        assert_eq!(
-            token,
-            "eyJhbGciOiJFZERTQSIsImtpZCI6ImtpZF8wMDAwMDAwMDAwMVIwMTAwMDAwMDAwMDAwMDgiLCJ0eXAiOiJwYitqd3QifQ.eyJpc3MiOiJwXzAwMDAwMDAwMDAxUjAxMDAwMDAwMDAwMDAwNCIsImF1ZCI6InBiIiwic3ViIjoiYWxpY2UiLCJyb29tIjoiZ2VuZXJhbCIsImV4cCI6MjAwMH0.Bp8UJVINeP0cqUiG_0qSk4wjqDg5MGZqRcBel3Qy176HoTy0OQvTpTp5Uuav5k2Wlsgdd58rPt6DLiWVt0U1AQ"
-        );
+        let token = "eyJhbGciOiJFZERTQSIsImtpZCI6ImtpZF8wMDAwMDAwMDAwMVIwMTAwMDAwMDAwMDAwMDgiLCJ0eXAiOiJwYitqd3QifQ.eyJpc3MiOiJwXzAwMDAwMDAwMDAxUjAxMDAwMDAwMDAwMDAwNCIsImF1ZCI6InBiIiwic3ViIjoiYWxpY2UiLCJyb29tIjoiZ2VuZXJhbCIsImV4cCI6MjAwMH0.Bp8UJVINeP0cqUiG_0qSk4wjqDg5MGZqRcBel3Qy176HoTy0OQvTpTp5Uuav5k2Wlsgdd58rPt6DLiWVt0U1AQ";
 
         let authorization =
-            verify_participant_token(&development_registry(), &token, 1_999).unwrap();
+            verify_participant_token(&development_registry(), token, 1_999).unwrap();
         assert_eq!(authorization.project_id, DEVELOPMENT_PROJECT_ID);
         assert_eq!(authorization.room_external_id, room);
         assert_eq!(authorization.participant_external_id, participant);
@@ -942,7 +609,7 @@ mod tests {
             )
         );
         assert_eq!(authorization.expiry.unix_seconds(), 2_000);
-        assert!(!format!("{authorization:?}").contains(&token));
+        assert!(!format!("{authorization:?}").contains(token));
     }
 
     #[test]
@@ -1121,175 +788,6 @@ mod tests {
         let authorization =
             verify_participant_token(&development_registry(), &token, 1_000).unwrap();
         assert_eq!(authorization.project_id, DEVELOPMENT_PROJECT_ID);
-    }
-
-    #[test]
-    fn server_sdk_shared_conformance() {
-        #[derive(Deserialize)]
-        struct Input {
-            project_id: String,
-            key_id: String,
-            secret: String,
-            room: String,
-            participant: String,
-            expiration: String,
-        }
-        #[derive(Deserialize)]
-        struct Golden {
-            name: String,
-            input: Input,
-            canonical_project_id: String,
-            canonical_key_id: String,
-            seed_hex: String,
-            public_key_hex: String,
-            header: String,
-            claims: String,
-            signing_input: String,
-            signature: String,
-            token: String,
-        }
-        #[derive(Deserialize)]
-        struct Rejection {
-            name: String,
-            field: String,
-            value: serde_json::Value,
-        }
-        #[derive(Deserialize)]
-        struct Vectors {
-            valid: Vec<Golden>,
-            invalid: Vec<Rejection>,
-        }
-        let vectors: Vectors =
-            serde_json::from_str(include_str!("../../../sdks/auth/vectors.json")).unwrap();
-        let hex = |bytes: &[u8]| {
-            bytes
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect::<String>()
-        };
-        for golden in vectors.valid {
-            let input = golden.input;
-            let project: ProjectId = input.project_id.parse().unwrap();
-            let key: ApiKeyId = input.key_id.parse().unwrap();
-            let signing: ApiSigningKey = input.secret.parse().unwrap();
-            assert_eq!(
-                project.as_str(),
-                golden.canonical_project_id,
-                "{}",
-                golden.name
-            );
-            assert_eq!(key.as_str(), golden.canonical_key_id);
-            assert_eq!(hex(&signing.0), golden.seed_hex);
-            assert_eq!(
-                hex(signing.verifying_key().as_bytes()),
-                golden.public_key_hex
-            );
-            let signing_input = format!(
-                "{}.{}",
-                BASE64URL_NOPAD.encode(golden.header.as_bytes()),
-                BASE64URL_NOPAD.encode(golden.claims.as_bytes())
-            );
-            assert_eq!(signing_input, golden.signing_input);
-            assert_eq!(
-                format!("{signing_input}.{}", golden.signature),
-                golden.token
-            );
-            assert_eq!(
-                signed_token(&golden.header, &golden.claims, &signing),
-                golden.token
-            );
-            let registry = ProjectRegistry::new(vec![ProjectKeys {
-                project_id: project,
-                keys: vec![ProjectKey {
-                    key_id: key,
-                    verifying_key: signing.verifying_key(),
-                }],
-            }])
-            .unwrap();
-            let exp: u64 = input.expiration.parse().unwrap();
-            if exp == 0 {
-                assert_eq!(
-                    verify_participant_token(&registry, &golden.token, 0),
-                    Err(TokenError::Expired)
-                );
-                continue;
-            }
-            let auth = verify_participant_token(&registry, &golden.token, exp - 1).unwrap();
-            assert_eq!(auth.project_id, project);
-            assert_eq!(auth.room_external_id.as_str(), input.room);
-            assert_eq!(auth.participant_external_id.as_str(), input.participant);
-            assert_eq!(auth.expiry.unix_seconds(), exp);
-            assert_eq!(
-                auth.room_id,
-                RoomId::derive(&project, &auth.room_external_id)
-            );
-            assert_eq!(
-                auth.participant_id,
-                ParticipantId::derive(&auth.room_id, &auth.participant_external_id)
-            );
-            assert_eq!(
-                verify_participant_token(&registry, &golden.token, exp),
-                Err(TokenError::Expired)
-            );
-            if let Some(after) = exp.checked_add(1) {
-                assert_eq!(
-                    verify_participant_token(&registry, &golden.token, after),
-                    Err(TokenError::Expired)
-                );
-            }
-            let wrong_secret = ProjectRegistry::new(vec![ProjectKeys {
-                project_id: project,
-                keys: vec![ProjectKey {
-                    key_id: key,
-                    verifying_key: ApiSigningKey::from_seed([7; 32]).verifying_key(),
-                }],
-            }])
-            .unwrap();
-            assert_eq!(
-                verify_participant_token(&wrong_secret, &golden.token, exp - 1),
-                Err(TokenError::Invalid)
-            );
-            assert_eq!(
-                verify_participant_token(&development_registry(), &golden.token, exp - 1),
-                Err(TokenError::Invalid)
-            );
-            let tampered_claims = golden
-                .claims
-                .replace(&input.participant, "OtherParticipant");
-            let tampered = format!(
-                "{}.{}.{}",
-                BASE64URL_NOPAD.encode(golden.header.as_bytes()),
-                BASE64URL_NOPAD.encode(tampered_claims.as_bytes()),
-                golden.signature
-            );
-            assert_eq!(
-                verify_participant_token(&registry, &tampered, exp - 1),
-                Err(TokenError::Invalid)
-            );
-            let mut signature = BASE64URL_NOPAD.decode(golden.signature.as_bytes()).unwrap();
-            *signature.first_mut().unwrap() ^= 1;
-            let tampered = format!("{signing_input}.{}", BASE64URL_NOPAD.encode(&signature));
-            assert_eq!(
-                verify_participant_token(&registry, &tampered, exp - 1),
-                Err(TokenError::Invalid)
-            );
-        }
-        for rejection in vectors.invalid {
-            // The Rust codecs accept only strings; native type errors are SDK adapter evidence.
-            let Some(value) = rejection.value.as_str() else {
-                continue;
-            };
-            let rejected = match rejection.field.as_str() {
-                "project_id" => value.parse::<ProjectId>().is_err(),
-                "key_id" => value.parse::<ApiKeyId>().is_err(),
-                "secret" => value.parse::<ApiSigningKey>().is_err(),
-                "room" => RoomExternalId::new(value).is_err(),
-                "participant" => ParticipantExternalId::new(value).is_err(),
-                "expiration" => continue,
-                _ => panic!("unknown conformance field"),
-            };
-            assert!(rejected, "{}", rejection.name);
-        }
     }
 
     #[test]

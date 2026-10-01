@@ -71,6 +71,7 @@ zerocopy = { version = "0.8.56", features = ["derive"] }
 parking_lot = "0.12.5"
 
 [dev-dependencies]
+pulsebeam-server = { path = "../../sdks/rust" }
 pulsebeam-core = { path = "../pulsebeam-core", features = [
   "str0m",
   "test-utils",

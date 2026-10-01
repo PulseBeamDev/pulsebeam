@@ -20,8 +20,8 @@ use pulsebeam_agent_native::{
 };
 use pulsebeam_agent_native::{clock::clock_anchor, wallclock_at};
 use pulsebeam_core::auth::{
-    ApiSigningKey, PrivateSigningBundle, ProjectKey, ProjectKeys, ProjectRegistry,
-    mint_development_token,
+    ApiSigningKey, DEVELOPMENT_API_KEY_ID, DEVELOPMENT_API_SIGNING_KEY, DEVELOPMENT_PROJECT_ID,
+    PrivateSigningBundle, ProjectKey, ProjectKeys, ProjectRegistry,
 };
 use pulsebeam_core::identity::{
     ApiKeyId, AudioTrackId, DataTrackId, ParticipantExternalId, ParticipantId, ProjectId,
@@ -329,6 +329,21 @@ fn main() -> Result<()> {
         }
         anyhow::Ok(())
     })
+}
+
+fn mint_development_token(
+    room: &RoomExternalId,
+    participant: &ParticipantExternalId,
+    expiration: u64,
+) -> Result<String> {
+    Ok(pulsebeam_server::sign_participant_token(
+        &DEVELOPMENT_PROJECT_ID.as_str(),
+        &DEVELOPMENT_API_KEY_ID.as_str(),
+        &DEVELOPMENT_API_SIGNING_KEY.to_secret_string(),
+        room.as_str(),
+        participant.as_str(),
+        expiration,
+    )?)
 }
 
 fn development_token(config: TokenConfig) -> Result<String> {

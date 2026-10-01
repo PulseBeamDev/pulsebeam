@@ -1,0 +1,19 @@
+[package]
+name = "pulsebeam-auth"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+license = "Apache-2.0"
+description = "Shared PulseBeam authentication keys and identity codecs"
+repository = "https://github.com/PulseBeamDev/pulsebeam"
+homepage = "https://pulsebeam.dev/"
+readme = "README.md"
+include = ["src/**", "README.md", "LICENSE", "Cargo.toml"]
+
+[dependencies]
+data-encoding = "2.11.1"
+data-encoding-macro = "0.1.21"
+ed25519-dalek = "2.2.0"
+serde = { version = "1", features = ["derive"] }
+thiserror = "2.0"
+uuid = "1.23.2"

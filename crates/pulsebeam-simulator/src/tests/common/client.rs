@@ -12,7 +12,7 @@ use pulsebeam_agent_native::{Agent, AgentEvent, Config, Host, MediaFrame, Simulc
 use pulsebeam_core::net::UdpSocket;
 use pulsebeam_core::net::{AsyncHttpClient, HttpError, HttpRequest, HttpResult};
 use pulsebeam_core::{
-    auth::mint_development_token,
+    auth::{DEVELOPMENT_API_KEY_ID, DEVELOPMENT_API_SIGNING_KEY, DEVELOPMENT_PROJECT_ID},
     identity::{ParticipantExternalId, RoomExternalId},
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -288,7 +288,14 @@ impl SimClientBuilder {
         let participant = ParticipantExternalId::new(&participant)?;
         let session = AgentConfig {
             endpoint: self.endpoint,
-            token: mint_development_token(&room, &participant, u64::MAX)?,
+            token: pulsebeam_server::sign_participant_token(
+                &DEVELOPMENT_PROJECT_ID.as_str(),
+                &DEVELOPMENT_API_KEY_ID.as_str(),
+                &DEVELOPMENT_API_SIGNING_KEY.to_secret_string(),
+                (room).as_str(),
+                (participant).as_str(),
+                u64::MAX,
+            )?,
             topology,
             retry: Default::default(),
             log_level: Default::default(),
