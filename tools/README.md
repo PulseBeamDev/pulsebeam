@@ -17,7 +17,8 @@ build framework or an alternative package compilation pipeline.
 | JS dependencies | Each owner package manifest and frozen pnpm lock | rules_js npm repositories and editor installs |
 | Node, pnpm, Python, LLVM, CMake/Ninja and upstream rules | `MODULE.bazel` | All configured actions and CI |
 | Linux OS inputs and mold | `tools/host/flake.nix`, `tools/host/flake.lock` | Narrow Nixpkgs FHS runtime; no application build graph |
-| Go SDK/dependencies | RTC peer `go.mod`/`go.sum` | rules_go/gazelle module extensions |
+| Go SDK/dependencies | RTC peer `go.mod`/`go.sum`; server SDK `sdks/go/go.mod` uses the same minimum Go version and standard library only | rules_go/gazelle module extensions |
+| Python server SDK dependencies | `sdks/python/pyproject.toml` (public requirements), `requirements.in`/hashed `requirements.lock` (repository tools and concrete test resolution) | rules_python pip hub |
 | Browser binaries/drivers | RTC `browser/browser-matrix.json` | Browser extension and RTC version probes |
 | Runtime image | Immutable cc-debian13 manifest digest in `MODULE.bazel` | rules_oci image |
 | Release identity/version/layout | Server Cargo manifest and `release/distribution.toml` | Archives, installer, plans and publication |
@@ -41,8 +42,8 @@ from supported application compilation; CI does not install parallel host tools.
 - `protobuf`: generated Rust protobuf input through the pinned code generator.
 - `rules_js`, `rules_nodejs`, `bazel_lib`: frozen pnpm translation, first-party
   package links, JS execution/tests, directory outputs and declared artifact views.
-- `rules_go` and `gazelle`: pinned local RFC 8888 peer, not a hosted Go service.
-- `rules_python`: compatible provisioned runtimes for bounded glue.
+- `rules_go` and `gazelle`: pinned local RFC 8888 peer and standard-library server SDK, not a hosted Go service.
+- `rules_python`: compatible provisioned runtimes for bounded glue and the server SDK's native crypto dependency. The Python SDK invokes the pinned setuptools backend against its authoritative pyproject for wheel/sdist packaging. Its consumer uses the standard installer library to test the wheel.
 - `rules_pkg` and `rules_oci`: binary layer packaging, immutable non-root base,
   linux/amd64 image and optional daemon loading.
 

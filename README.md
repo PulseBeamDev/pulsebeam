@@ -134,6 +134,21 @@ await pc.setRemoteDescription({ type: "answer", sdp: await res.text() });
 Mint a second token with a distinct participant and connect another client to
 the same `demo` room.
 
+## Server SDKs
+
+Mint participant tokens locally with explicit project ID, API key ID, signing
+secret, room/participant external IDs, and mandatory absolute Unix expiration:
+
+- [TypeScript / Node.js: `@pulsebeam/server`](sdks/typescript/README.md)
+- [Go: `github.com/PulseBeamDev/pulsebeam/sdks/go`](sdks/go/README.md)
+- [Python: `pulsebeam-server`](sdks/python/README.md)
+
+These server-only SDKs use native Ed25519, with no PulseBeam connectivity or
+Rust/WASM runtime. Keep signing secrets on your server, never in client code.
+The packages are locally installable; public registry publication is deferred.
+Their [shared auth profile and vectors](sdks/auth/README.md) are exercised by the
+ordinary Bazel acceptance gates and the Rust authorization verifier.
+
 ## Profiling & Metrics
 
 PulseBeam exposes an internal debug HTTP server on **`http://localhost:6060`**.
