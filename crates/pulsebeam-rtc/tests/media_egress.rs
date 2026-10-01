@@ -17,6 +17,27 @@ use pulsebeam_rtc::{
 use support::{PeerFixture, second_negotiated_sender};
 
 #[test]
+fn default_peer_fixtures_share_a_global_clock_origin() {
+    let first = PeerFixture::unconnected().at();
+    let second = PeerFixture::unconnected().at();
+    assert_eq!(first.monotonic, second.monotonic);
+    assert_eq!(first.global, second.global);
+
+    let connected = PeerFixture::connected().at();
+    let elapsed = u64::try_from(
+        connected
+            .monotonic
+            .duration_since(first.monotonic)
+            .as_micros(),
+    )
+    .expect("short fixture interval");
+    assert_eq!(
+        connected.global.as_micros(),
+        first.global.as_micros() + elapsed
+    );
+}
+
+#[test]
 fn public_send_media_reaches_a_standards_peer_with_stable_continuity() {
     let mut fixture = PeerFixture::connected();
     let local_source = fixture.send_source(b"local source");

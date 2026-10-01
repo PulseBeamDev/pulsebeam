@@ -13,7 +13,7 @@
 use std::{
     collections::VecDeque,
     net::SocketAddr,
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::{Duration, Instant},
 };
 
@@ -252,6 +252,12 @@ impl DeterministicNetwork {
 }
 
 impl PeerFixture {
+    fn default_start() -> Instant {
+        // Construction time must not age media forwarded between virtual peers.
+        static START: OnceLock<Instant> = OnceLock::new();
+        *START.get_or_init(Instant::now)
+    }
+
     pub fn connected() -> Self {
         Self::connected_with(FixtureTransport::Udp, None, false)
     }
@@ -335,7 +341,7 @@ impl PeerFixture {
             datachannels,
             sender_count,
             media,
-            Instant::now(),
+            Self::default_start(),
         )
     }
 
@@ -371,7 +377,7 @@ impl PeerFixture {
             datachannels,
             sender_count,
             media,
-            Instant::now(),
+            Self::default_start(),
         )
     }
 
