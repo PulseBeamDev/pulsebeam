@@ -1,14 +1,7 @@
-new Promise((resolve, reject) => {
-  const deadline = Date.now() + 5000;
-  const poll = () =>
-    globalThis.__pulsebeamReactObservation
-      ? resolve(globalThis.__pulsebeamReactObservation)
-      : Date.now() >= deadline
-        ? reject(
-            new Error(
-              "React fixture did not publish observations; build //agents/react:browser_fixture through Bazel",
-            ),
-          )
-        : setTimeout(poll, 10);
-  poll();
-});
+// Navigation awaits module loading; observe completion rather than elapsed time.
+globalThis.__pulsebeamReactObservation ??
+  Promise.reject(
+    new Error(
+      "React fixture did not start; build //agents/react:browser_fixture through Bazel",
+    ),
+  );

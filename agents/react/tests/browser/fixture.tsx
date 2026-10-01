@@ -31,10 +31,10 @@ const observation = {
 };
 
 declare global {
-  var __pulsebeamReactObservation: typeof observation | undefined;
+  var __pulsebeamReactObservation: Promise<typeof observation> | undefined;
 }
 
-void (async () => {
+globalThis.__pulsebeamReactObservation = (async () => {
   try {
     Object.assign(observation, await runAcquisitionContract());
     Object.assign(observation, await runConcurrencyContract());
@@ -44,5 +44,5 @@ void (async () => {
   } catch (error) {
     observation.playbackProbeError = String(error);
   }
-  globalThis.__pulsebeamReactObservation = observation;
+  return observation;
 })();
