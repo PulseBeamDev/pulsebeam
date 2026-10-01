@@ -13,7 +13,7 @@ jobs:
     outputs:
       plan: ${{ steps.plan.outputs.plan }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-ci
       - id: plan
         name: Validate version tag against package authority
@@ -35,7 +35,7 @@ jobs:
             target: aarch64-unknown-linux-gnu
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-ci
       - name: Build architecture-appropriate release assets
         run: |
@@ -49,7 +49,7 @@ jobs:
           tar -xJf pulsebeam-${{ matrix.target }}.tar.xz -C "$temporary"
           "$temporary/pulsebeam-${{ matrix.target }}/pulsebeam" --version
           rm -rf "$temporary"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: release-${{ matrix.target }}
           path: bazel-bin/release/artifacts/*
@@ -58,10 +58,10 @@ jobs:
     needs: [plan, checks]
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-ci
       - run: ./bazel build //release:global
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: release-global
           path: bazel-bin/release/global-artifacts/*
@@ -81,7 +81,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: release-*
           path: artifacts
