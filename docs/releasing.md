@@ -15,7 +15,13 @@ Run on the architecture-appropriate Linux runner: x86_64 or aarch64. Aarch64
 release support does not expand the full development/browser host matrix.
 The application version comes from the server Cargo manifest; the distribution
 contract in `release/distribution.toml` owns target identities and the tag prefix.
-The plan rejects a version tag that does not match the manifest:
+Release tags identify the package and version: `pulsebeam-v<version>` for the
+server distribution. Bare version tags and alternative package-tag forms are
+intentionally unsupported. This package-scoped convention permits independent release schedules without
+selecting unrelated packages that happen to share a version. New publication
+channels remain out of scope.
+
+The plan rejects a tag that does not match both the prefix and manifest version:
 
 ```sh
 ./bazel run //release:plan -- --tag pulsebeam-v0.4.9
@@ -27,21 +33,29 @@ Outputs under `bazel-bin/release/artifacts` retain these identities:
 
 - `pulsebeam-<target>.tar.xz`, with `pulsebeam-<target>/pulsebeam`, README and LICENSE;
 - the archive's `.sha256` checksum;
-- `pulsebeam-<target>-update`, the immutable receipt-driven standalone updater;
-- updater checksum and per-target assembly metadata.
+- per-target assembly metadata identifying the version, target and archive hash.
+
+The archive is assembled by `rules_pkg` from the Bazel-built binary and declared
+documentation inputs. A bounded action adds checksum and identity metadata.
 
 `bazel-bin/release/global-artifacts` contains `pulsebeam-installer.sh`, its checksum
-and the version/prerelease plan. The installer verifies downloads before installing
-`pulsebeam` and `pulsebeam-update` into `${CARGO_HOME:-$HOME/.cargo}/bin`, preserves
-Cargo's environment convention, supports `--no-modify-path`, and writes the
-existing cargo-dist-compatible receipt under the XDG config directory. The
-updater remains receipt-driven; its implementation is not an application rebuild.
+and the version/prerelease plan. The installer verifies the archive before
+installing `pulsebeam` into `${CARGO_HOME:-$HOME/.cargo}/bin`, preserves Cargo's
+environment convention and supports `--no-modify-path`. To update, run the
+installer from the explicitly chosen release; it replaces the binary only after
+successful download and verification. No separate updater or receipt is required.
+An existing `pulsebeam-update` executable is no longer used or shipped; remove
+it if present and use the selected release's installer instead.
 
-The release contract exercises real installation, archive/layout/hash checks and
-the shipped updater against a local non-production GitHub-shaped fixture. Its
-temporary HOME/CARGO_HOME/config and loopback services are isolated. Installer
-fixture routing uses `PULSEBEAM_DOWNLOAD_URL`; updater API fixture routing uses
-`PULSEBEAM_INSTALLER_GHE_BASE_URL`. Do not point acceptance at a live release.
+`//release:elf_contract` checks GNU loader identity, the Ubuntu 24.04-or-lower
+runtime symbol baseline and absence of Nix-store/build-directory runtime paths.
+This checks artifacts, not merely a successful link in the provisioning runtime.
+
+The release contract exercises archive/layout/hash checks, real installation,
+replacement of an existing installation and checksum-failure atomicity against
+local non-production fixtures. Its temporary HOME/CARGO_HOME and loopback services
+are isolated. Installer fixture routing uses `PULSEBEAM_DOWNLOAD_URL`; do not
+point acceptance at a live release.
 
 ## Runtime image
 
@@ -71,7 +85,7 @@ On Linux x86_64 with an explicitly available Docker-compatible daemon:
 
 ```sh
 ./bazel build --config=release //release:all
-./bazel test --config=release //release:contract //tools:legacy_contract --test_output=errors
+./bazel test --config=release //release:contract //release:elf_contract //tools:workflow_contract --test_output=errors
 ./bazel run --config=release //release:load
 test "$(docker image inspect --format '{{.Config.User}}' pulsebeam:local)" = '65532:65532'
 test "$(docker image inspect --format '{{.Architecture}}' pulsebeam:local)" = amd64
@@ -92,7 +106,7 @@ existing trigger and credential boundaries in the workflow sources.
   test outputs are retained on failure.
 - Main pushes and manual dispatch build/check Meet's static export and upload
   `bazel-bin/apps/meet/out` through the existing Pages environment/credentials.
-- Version tags trigger the release plan, complete checks, native architecture
+- `pulsebeam-v*` tags trigger the release plan, complete checks, native architecture
   builds, checksum validation and image smoke checks before GitHub release creation. Stable and
   prerelease versions follow the plan; failed/incomplete assemblies cannot publish.
 - The image workflow consumes the same Bazel-owned binary/image, checks non-root

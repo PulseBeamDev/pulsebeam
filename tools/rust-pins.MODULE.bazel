@@ -34,14 +34,14 @@ crate.from_specs(
 use_repo(crate, "build_tools")
 
 crate.from_cargo(
-    name = "str0m_legacy",
-    manifests = ["//tools:rust/str0m_legacy/Cargo.toml"],
-    cargo_lockfile = "//tools:rust/str0m_legacy/Cargo.lock",
+    name = "str0m_native",
+    manifests = ["//tools:rust/str0m_native/Cargo.toml"],
+    cargo_lockfile = "//tools:rust/str0m_native/Cargo.lock",
     skip_cargo_lockfile_overwrite = True,
     supported_platform_triples = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"],
     host_tools = "@pulsebeam_rust_host_tools//:BUILD.bazel",
 )
-use_repo(crate, "str0m_legacy")
+use_repo(crate, "str0m_native")
 
 crate.from_cargo(
     name = "str0m_rtc",
@@ -72,6 +72,6 @@ crate.from_cargo(
     host_tools = "@pulsebeam_rust_host_tools//:BUILD.bazel",
 )
 use_repo(crate, "wasm_crates")
-crate.annotation(crate = "str0m", version = "=0.22.0", override_target_lib = "@str0m_legacy//:str0m", repositories = ["crates"])
+crate.annotation(crate = "str0m", version = "=0.22.0", override_target_lib = "@str0m_native//:str0m", repositories = ["crates"])
 crate.annotation(crate = "str0m", version = "=0.23.1", override_target_lib = "@str0m_rtc//:str0m", repositories = ["crates"])
 crate.annotation(crate = "is", override_target_lib = "@str0m_rtc//:is", repositories = ["crates"])

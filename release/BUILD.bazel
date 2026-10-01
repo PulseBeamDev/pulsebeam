@@ -13,20 +13,41 @@ config_setting(name = "aarch64", constraint_values = ["@platforms//cpu:aarch64"]
 py_binary(name = "packager", srcs = ["package.py"], main = "package.py")
 py_binary(name = "global_packager", srcs = ["global.py"], main = "global.py")
 
-UPDATER = select({":aarch64": ["@updater_aarch64//file"], "//conditions:default": ["@updater_x86_64//file"]})
-UPDATER_ARG = select({":aarch64": ["$(location @updater_aarch64//file)"], "//conditions:default": ["$(location @updater_x86_64//file)"]})
 TRIPLE = select({":aarch64": ["aarch64-unknown-linux-gnu"], "//conditions:default": ["x86_64-unknown-linux-gnu"]})
+ARCHIVE_PREFIX = select({":aarch64": "pulsebeam-aarch64-unknown-linux-gnu", "//conditions:default": "pulsebeam-x86_64-unknown-linux-gnu"})
+
+pkg_files(
+    name = "archive_binary",
+    srcs = ["//crates/pulsebeam:server"],
+    prefix = ARCHIVE_PREFIX,
+    renames = {"//crates/pulsebeam:server": "pulsebeam"},
+    attributes = pkg_attributes(mode = "0755"),
+)
+pkg_files(
+    name = "archive_docs",
+    srcs = ["//:LICENSE", "//:README.md"],
+    prefix = ARCHIVE_PREFIX,
+    attributes = pkg_attributes(mode = "0644"),
+)
+pkg_tar(
+    name = "archive",
+    srcs = [":archive_binary", ":archive_docs"],
+    extension = "tar.xz",
+    package_file_name = select({":aarch64": "pulsebeam-aarch64-unknown-linux-gnu.tar.xz", "//conditions:default": "pulsebeam-x86_64-unknown-linux-gnu.tar.xz"}),
+    mtime = 0,
+    portable_mtime = False,
+)
 
 run_binary(
     name = "local",
     tool = ":packager",
-    srcs = ["//crates/pulsebeam:server", "//crates/pulsebeam:Cargo.toml", "//:LICENSE", "//:README.md", "distribution.toml"] + UPDATER,
+    srcs = [":archive", "//crates/pulsebeam:Cargo.toml", "distribution.toml"],
     args = [
-        "--binary", "$(location //crates/pulsebeam:server)",
+        "--archive", "$(location :archive)",
         "--manifest", "$(location //crates/pulsebeam:Cargo.toml)",
-        "--license", "$(location //:LICENSE)", "--readme", "$(location //:README.md)",
-        "--config", "$(location distribution.toml)", "--updater",
-    ] + UPDATER_ARG + ["--triple"] + TRIPLE + ["--out", "$(RULEDIR)/artifacts"],
+        "--config", "$(location distribution.toml)",
+        "--triple",
+    ] + TRIPLE + ["--out", "$(RULEDIR)/artifacts"],
     out_dirs = ["artifacts"],
 )
 
@@ -49,6 +70,23 @@ oci_image(name = "image", base = "@distroless_linux_amd64//:distroless_linux_amd
           entrypoint = ["/app/pulsebeam"], workdir = "/app", user = "65532:65532",
           exposed_ports = ["3478/udp", "7070/tcp"])
 oci_load(name = "load", image = ":image", repo_tags = ["pulsebeam:local"])
+
+py_test(
+    name = "plan_contract",
+    srcs = ["plan_test.py", "global.py"],
+    main = "plan_test.py",
+    args = [arg.replace("$(location", "$(rootpath") for arg in GLOBAL_ARGS],
+    data = GLOBAL_INPUTS,
+)
+
+py_test(
+    name = "elf_contract",
+    srcs = ["elf_contract.py"],
+    main = "elf_contract.py",
+    data = ["//crates/pulsebeam:server", "@llvm_toolchain_llvm//:bin/llvm-readelf"],
+    args = ["--binary", "$(rootpath //crates/pulsebeam:server)", "--readelf", "$(rootpath @llvm_toolchain_llvm//:bin/llvm-readelf)"],
+    size = "small",
+)
 
 py_test(name = "contract", srcs = ["contract.py"], main = "contract.py",
         args = ["--local", "$(rootpath :local)", "--global", "$(rootpath :global)"],

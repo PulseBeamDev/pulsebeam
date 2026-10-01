@@ -6,29 +6,80 @@ Linux x86_64. Linux aarch64 runners support release binary assembly only.
 
 ## Host prerequisites
 
-The reference baseline is Ubuntu 24.04, a writable checkout/cache, and ordinary
-non-root execution. Install OS utilities, system headers, and runtime libraries:
+Use a writable checkout/cache and ordinary non-root execution on Linux. Install
+[Nix](https://nix.dev/install-nix), with access to its normal `/nix/store` and
+unprivileged user namespaces, then use `./bazel`. Fedora and Ubuntu use the same
+pinned OS inputs without distro-specific development-header or browser-library
+installation lists.
+
+`tools/host/flake.nix` supplies only the Linux OS environment: bootstrap utilities,
+C/system headers and libraries, browser runtime libraries, the unwrapped mold
+linker and Docker client for loading Bazel-built images. Only GCC's library
+directories are projected into the runtime, including the static archives required
+by its shared-unwind linker script; no GCC executable is exposed. C++ headers and
+static libc++ come from the Bazel-provisioned LLVM distribution.
+`tools/host/flake.lock` pins its Nixpkgs input. The maintained Nixpkgs FHS
+runtime avoids custom sysroot-layout machinery; it is not a hermetic kernel or an
+Apple SDK. The LLVM integration supports an executable linker path, so it selects
+mold at the locked runtime's `/usr/bin/mold`, not an ambient host installation.
+
+The launcher refuses implicit lockfile updates, enters that environment and
+verifies its immutable `/etc/pulsebeam-host` marker against the flake, lockfile and
+execution architecture. Caller-supplied environment flags cannot substitute for
+that marker. It verifies the pinned Bazelisk binary selecting `.bazelversion`.
+The verified locked-input identity is passed to Bazel action/repository
+environments and exposed as a declared native toolchain input so OS-input changes
+do not reuse old actions. A native Bazel JVM startup setting also carries that
+identity, forcing a daemon restart when the runtime changes. This prevents a
+long-lived server from executing new actions in an older FHS namespace.
+The native identity repository independently checks its environment value against
+the marker. `PULSEBEAM_HOST_ENV` is reserved: supported builds/tests use `./bazel`
+without overriding it via action, repository or test environment options.
+Deliberately suppressing the repository rc or replacing its environments/toolchains
+is a native Bazel escape hatch, not a supported runtime-identity guarantee.
+
+Bazel provisions versioned compilers, Rust libraries, Node/pnpm, Python, Go,
+protobuf, native build tools, generators, browsers and drivers. Nix does not
+compile PulseBeam or provide another build/test graph. No host language compiler,
+package preparation sequence, development container, or language/browser cache
+is required. Initial downloads need network access and CA trust; tests use local
+fixtures and loopback services, not hosted application services.
+
+To deliberately update the OS input, use the owning flake and review its lockfile:
 
 ```sh
-sudo apt-get update
-sudo apt-get install -y --no-install-recommends ca-certificates curl git tar xz-utils unzip patch libc6-dev linux-libc-dev libstdc++-13-dev zlib1g-dev
-sudo apt-get install -y --no-install-recommends libasound2t64 libatk1.0-0t64 libatk-bridge2.0-0t64 libcups2t64 libdbus-1-3 libdrm2 libgbm1 libglib2.0-0t64 libgtk-3-0t64 libnspr4 libnss3 libpango-1.0-0 libx11-6 libx11-xcb1 libxcb1 libxcomposite1 libxdamage1 libxext6 libxfixes3 libxrandr2 libxrender1 libxt6 libxtst6
+nix --extra-experimental-features 'nix-command flakes' flake update --flake path:./tools/host
 ```
 
-Git is a source-fetch utility required by Bazel's upstream Git repository rules,
-not a language build workflow. The second command supplies browser OS libraries,
-not browser executables.
-Bazel provisions versioned compilers, Rust libraries, Node/pnpm, Python, Go,
-protobuf, native build tools, generators, browsers and drivers. No host language
-compiler, package preparation sequence, development container, or language/browser
-cache is required. Initial dependency downloads need network access and CA trust.
-Tests use local fixtures and loopback services, not hosted application services.
+macOS/iOS CI is future work. It needs separate platform validation and Apple's
+Xcode/SDK provisioning; the Linux FHS runtime is not a macOS environment.
 
 Missing libraries or failed pinned downloads are errors, not reasons to skip
 acceptance. Browsers need working user namespaces or their documented headless
 sandbox mode, a writable temporary directory, and available loopback ports.
-Privileged perf/network diagnostics and a Docker/Podman daemon are optional and
-not prerequisites for the complete test gate.
+Privileged perf/network diagnostics and a Docker-compatible daemon are optional
+and not prerequisites for the complete test gate. The image loader consumes a
+Bazel-built artifact; the provisioned client does not build images.
+
+## Shared local action cache
+
+`.bazelrc` enables Bazel's native disk cache at
+`~/.cache/pulsebeam/bazel/disk-cache`. Bazel expands `~` using its JVM user-home
+property. This persistent, per-user directory is shared by local worktrees and
+concurrent agents. Bazel supports concurrent cache readers/writers and validates
+artifact digests; no cache daemon, wrapper protocol or remote service is needed.
+
+Output state is **not** shared: the native workspace-hashed `output_base` retains
+separate servers, analysis state, execution roots and locks for each worktree.
+Do not configure a common `--output_base` or copy one worktree's output state into
+another. `clean --expunge` removes worktree output state, not the shared cache.
+
+OS identity, declared inputs, toolchains and action arguments remain part of the
+action keys. The cache does not weaken checks or make results from a different
+runtime reusable. Disk-cache GC size/age policies are disabled by default; use
+Bazel's `--experimental_disk_cache_gc_max_size` or
+`--experimental_disk_cache_gc_max_age` if a local retention limit is needed.
+`--disk_cache=` explicitly disables caching for diagnostics.
 
 ## Entrypoints
 
