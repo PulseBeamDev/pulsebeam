@@ -1124,6 +1124,175 @@ mod tests {
     }
 
     #[test]
+    fn server_sdk_shared_conformance() {
+        #[derive(Deserialize)]
+        struct Input {
+            project_id: String,
+            key_id: String,
+            secret: String,
+            room: String,
+            participant: String,
+            expiration: String,
+        }
+        #[derive(Deserialize)]
+        struct Golden {
+            name: String,
+            input: Input,
+            canonical_project_id: String,
+            canonical_key_id: String,
+            seed_hex: String,
+            public_key_hex: String,
+            header: String,
+            claims: String,
+            signing_input: String,
+            signature: String,
+            token: String,
+        }
+        #[derive(Deserialize)]
+        struct Rejection {
+            name: String,
+            field: String,
+            value: serde_json::Value,
+        }
+        #[derive(Deserialize)]
+        struct Vectors {
+            valid: Vec<Golden>,
+            invalid: Vec<Rejection>,
+        }
+        let vectors: Vectors =
+            serde_json::from_str(include_str!("../../../sdks/auth/vectors.json")).unwrap();
+        let hex = |bytes: &[u8]| {
+            bytes
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        };
+        for golden in vectors.valid {
+            let input = golden.input;
+            let project: ProjectId = input.project_id.parse().unwrap();
+            let key: ApiKeyId = input.key_id.parse().unwrap();
+            let signing: ApiSigningKey = input.secret.parse().unwrap();
+            assert_eq!(
+                project.as_str(),
+                golden.canonical_project_id,
+                "{}",
+                golden.name
+            );
+            assert_eq!(key.as_str(), golden.canonical_key_id);
+            assert_eq!(hex(&signing.0), golden.seed_hex);
+            assert_eq!(
+                hex(signing.verifying_key().as_bytes()),
+                golden.public_key_hex
+            );
+            let signing_input = format!(
+                "{}.{}",
+                BASE64URL_NOPAD.encode(golden.header.as_bytes()),
+                BASE64URL_NOPAD.encode(golden.claims.as_bytes())
+            );
+            assert_eq!(signing_input, golden.signing_input);
+            assert_eq!(
+                format!("{signing_input}.{}", golden.signature),
+                golden.token
+            );
+            assert_eq!(
+                signed_token(&golden.header, &golden.claims, &signing),
+                golden.token
+            );
+            let registry = ProjectRegistry::new(vec![ProjectKeys {
+                project_id: project,
+                keys: vec![ProjectKey {
+                    key_id: key,
+                    verifying_key: signing.verifying_key(),
+                }],
+            }])
+            .unwrap();
+            let exp: u64 = input.expiration.parse().unwrap();
+            if exp == 0 {
+                assert_eq!(
+                    verify_participant_token(&registry, &golden.token, 0),
+                    Err(TokenError::Expired)
+                );
+                continue;
+            }
+            let auth = verify_participant_token(&registry, &golden.token, exp - 1).unwrap();
+            assert_eq!(auth.project_id, project);
+            assert_eq!(auth.room_external_id.as_str(), input.room);
+            assert_eq!(auth.participant_external_id.as_str(), input.participant);
+            assert_eq!(auth.expiry.unix_seconds(), exp);
+            assert_eq!(
+                auth.room_id,
+                RoomId::derive(&project, &auth.room_external_id)
+            );
+            assert_eq!(
+                auth.participant_id,
+                ParticipantId::derive(&auth.room_id, &auth.participant_external_id)
+            );
+            assert_eq!(
+                verify_participant_token(&registry, &golden.token, exp),
+                Err(TokenError::Expired)
+            );
+            if let Some(after) = exp.checked_add(1) {
+                assert_eq!(
+                    verify_participant_token(&registry, &golden.token, after),
+                    Err(TokenError::Expired)
+                );
+            }
+            let wrong_secret = ProjectRegistry::new(vec![ProjectKeys {
+                project_id: project,
+                keys: vec![ProjectKey {
+                    key_id: key,
+                    verifying_key: ApiSigningKey::from_seed([7; 32]).verifying_key(),
+                }],
+            }])
+            .unwrap();
+            assert_eq!(
+                verify_participant_token(&wrong_secret, &golden.token, exp - 1),
+                Err(TokenError::Invalid)
+            );
+            assert_eq!(
+                verify_participant_token(&development_registry(), &golden.token, exp - 1),
+                Err(TokenError::Invalid)
+            );
+            let tampered_claims = golden
+                .claims
+                .replace(&input.participant, "OtherParticipant");
+            let tampered = format!(
+                "{}.{}.{}",
+                BASE64URL_NOPAD.encode(golden.header.as_bytes()),
+                BASE64URL_NOPAD.encode(tampered_claims.as_bytes()),
+                golden.signature
+            );
+            assert_eq!(
+                verify_participant_token(&registry, &tampered, exp - 1),
+                Err(TokenError::Invalid)
+            );
+            let mut signature = BASE64URL_NOPAD.decode(golden.signature.as_bytes()).unwrap();
+            *signature.first_mut().unwrap() ^= 1;
+            let tampered = format!("{signing_input}.{}", BASE64URL_NOPAD.encode(&signature));
+            assert_eq!(
+                verify_participant_token(&registry, &tampered, exp - 1),
+                Err(TokenError::Invalid)
+            );
+        }
+        for rejection in vectors.invalid {
+            // The Rust codecs accept only strings; native type errors are SDK adapter evidence.
+            let Some(value) = rejection.value.as_str() else {
+                continue;
+            };
+            let rejected = match rejection.field.as_str() {
+                "project_id" => value.parse::<ProjectId>().is_err(),
+                "key_id" => value.parse::<ApiKeyId>().is_err(),
+                "secret" => value.parse::<ApiSigningKey>().is_err(),
+                "room" => RoomExternalId::new(value).is_err(),
+                "participant" => ParticipantExternalId::new(value).is_err(),
+                "expiration" => continue,
+                _ => panic!("unknown conformance field"),
+            };
+            assert!(rejected, "{}", rejection.name);
+        }
+    }
+
+    #[test]
     fn jwt_expiry_is_strictly_later_than_admission() {
         let token = profile_token("", "");
         let registry = development_registry();

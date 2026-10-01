@@ -1,0 +1,6 @@
+load("@aspect_rules_js//js:defs.bzl", "js_test")
+
+package(default_visibility = ["//visibility:public"])
+exports_files(["vectors.json"])
+filegroup(name = "workflow_inputs", srcs = ["README.md"])
+js_test(name = "contract", entry_point = "contract.mjs", data = ["vectors.json"])

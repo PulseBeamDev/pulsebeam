@@ -44,6 +44,7 @@ rust_library(
 rust_test(
     name = "unit_tests",
     crate = ":pulsebeam-core",
+    compile_data = ["//sdks/auth:vectors.json"],
     crate_features = ["reqwest", "str0m", "test-utils"],
     lint_config = ":lints",
     aliases = aliases(normal_dev = True, proc_macro_dev = True),

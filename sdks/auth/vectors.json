@@ -1,0 +1,522 @@
+{
+  "version": 1,
+  "base": {
+    "project_id": "p_0067MYZ1001R010000000000064",
+    "key_id": "kid_0067MYZ1005R030010000000068",
+    "secret": "sk_00K6D12DJHZWPVAEVDGT6XG8MW3TVH8RSYDDBMRJDN37PXN7VH9QV",
+    "room": "Room_9-Z",
+    "participant": "Alice_-9",
+    "expiration": "2000"
+  },
+  "valid": [
+    {
+      "name": "registered",
+      "input": {
+        "project_id": "p_0067MYZ1001R010000000000064",
+        "key_id": "kid_0067MYZ1005R030010000000068",
+        "secret": "sk_00K6D12DJHZWPVAEVDGT6XG8MW3TVH8RSYDDBMRJDN37PXN7VH9QV",
+        "room": "Room_9-Z",
+        "participant": "Alice_-9",
+        "expiration": "2000"
+      },
+      "canonical_project_id": "p_0067MYZ1001R010000000000064",
+      "canonical_key_id": "kid_0067MYZ1005R030010000000068",
+      "seed_hex": "4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb",
+      "public_key_hex": "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c",
+      "header": "{\"alg\":\"EdDSA\",\"kid\":\"kid_0067MYZ1005R030010000000068\",\"typ\":\"pb+jwt\"}",
+      "claims": "{\"iss\":\"p_0067MYZ1001R010000000000064\",\"aud\":\"pb\",\"sub\":\"Alice_-9\",\"room\":\"Room_9-Z\",\"exp\":2000}",
+      "signing_input": "eyJhbGciOiJFZERTQSIsImtpZCI6ImtpZF8wMDY3TVlaMTAwNVIwMzAwMTAwMDAwMDAwNjgiLCJ0eXAiOiJwYitqd3QifQ.eyJpc3MiOiJwXzAwNjdNWVoxMDAxUjAxMDAwMDAwMDAwMDA2NCIsImF1ZCI6InBiIiwic3ViIjoiQWxpY2VfLTkiLCJyb29tIjoiUm9vbV85LVoiLCJleHAiOjIwMDB9",
+      "signature": "oAY5dK8o1dWo5xu942DV8Q56v1Pk2lQrWEOkGONGcsW1givVlcXg5N_ZPWw4aFFyVP-5p3Z_jXWm66L8Pn1BBg",
+      "token": "eyJhbGciOiJFZERTQSIsImtpZCI6ImtpZF8wMDY3TVlaMTAwNVIwMzAwMTAwMDAwMDAwNjgiLCJ0eXAiOiJwYitqd3QifQ.eyJpc3MiOiJwXzAwNjdNWVoxMDAxUjAxMDAwMDAwMDAwMDA2NCIsImF1ZCI6InBiIiwic3ViIjoiQWxpY2VfLTkiLCJyb29tIjoiUm9vbV85LVoiLCJleHAiOjIwMDB9.oAY5dK8o1dWo5xu942DV8Q56v1Pk2lQrWEOkGONGcsW1givVlcXg5N_ZPWw4aFFyVP-5p3Z_jXWm66L8Pn1BBg"
+    },
+    {
+      "name": "expired-zero",
+      "input": {
+        "project_id": "p_0067MYZ1001R010000000000064",
+        "key_id": "kid_0067MYZ1005R030010000000068",
+        "secret": "sk_00K6D12DJHZWPVAEVDGT6XG8MW3TVH8RSYDDBMRJDN37PXN7VH9QV",
+        "room": "-",
+        "participant": "_",
+        "expiration": "0"
+      },
+      "canonical_project_id": "p_0067MYZ1001R010000000000064",
+      "canonical_key_id": "kid_0067MYZ1005R030010000000068",
+      "seed_hex": "4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb",
+      "public_key_hex": "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c",
+      "header": "{\"alg\":\"EdDSA\",\"kid\":\"kid_0067MYZ1005R030010000000068\",\"typ\":\"pb+jwt\"}",
+      "claims": "{\"iss\":\"p_0067MYZ1001R010000000000064\",\"aud\":\"pb\",\"sub\":\"_\",\"room\":\"-\",\"exp\":0}",
+      "signing_input": "eyJhbGciOiJFZERTQSIsImtpZCI6ImtpZF8wMDY3TVlaMTAwNVIwMzAwMTAwMDAwMDAwNjgiLCJ0eXAiOiJwYitqd3QifQ.eyJpc3MiOiJwXzAwNjdNWVoxMDAxUjAxMDAwMDAwMDAwMDA2NCIsImF1ZCI6InBiIiwic3ViIjoiXyIsInJvb20iOiItIiwiZXhwIjowfQ",
+      "signature": "fBwAPqD7-1ECG7FKo5fw5bs_53_nqDm9E2488cfKzshx8V0uoXYR855JskQHqW7fZ6QjobS5Y9dMaxESpFhpDA",
+      "token": "eyJhbGciOiJFZERTQSIsImtpZCI6ImtpZF8wMDY3TVlaMTAwNVIwMzAwMTAwMDAwMDAwNjgiLCJ0eXAiOiJwYitqd3QifQ.eyJpc3MiOiJwXzAwNjdNWVoxMDAxUjAxMDAwMDAwMDAwMDA2NCIsImF1ZCI6InBiIiwic3ViIjoiXyIsInJvb20iOiItIiwiZXhwIjowfQ.fBwAPqD7-1ECG7FKo5fw5bs_53_nqDm9E2488cfKzshx8V0uoXYR855JskQHqW7fZ6QjobS5Y9dMaxESpFhpDA"
+    },
+    {
+      "name": "safe-number-boundary",
+      "input": {
+        "project_id": "p_0067MYZ1001R010000000000064",
+        "key_id": "kid_0067MYZ1005R030010000000068",
+        "secret": "sk_00K6D12DJHZWPVAEVDGT6XG8MW3TVH8RSYDDBMRJDN37PXN7VH9QV",
+        "room": "Room_9-Z",
+        "participant": "Alice_-9",
+        "expiration": "9007199254740991"
+      },
+      "canonical_project_id": "p_0067MYZ1001R010000000000064",
+      "canonical_key_id": "kid_0067MYZ1005R030010000000068",
+      "seed_hex": "4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb",
+      "public_key_hex": "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c",
+      "header": "{\"alg\":\"EdDSA\",\"kid\":\"kid_0067MYZ1005R030010000000068\",\"typ\":\"pb+jwt\"}",
+      "claims": "{\"iss\":\"p_0067MYZ1001R010000000000064\",\"aud\":\"pb\",\"sub\":\"Alice_-9\",\"room\":\"Room_9-Z\",\"exp\":9007199254740991}",
+      "signing_input": "eyJhbGciOiJFZERTQSIsImtpZCI6ImtpZF8wMDY3TVlaMTAwNVIwMzAwMTAwMDAwMDAwNjgiLCJ0eXAiOiJwYitqd3QifQ.eyJpc3MiOiJwXzAwNjdNWVoxMDAxUjAxMDAwMDAwMDAwMDA2NCIsImF1ZCI6InBiIiwic3ViIjoiQWxpY2VfLTkiLCJyb29tIjoiUm9vbV85LVoiLCJleHAiOjkwMDcxOTkyNTQ3NDA5OTF9",
+      "signature": "gW7x83B22VR8S9L1D9GCQxP2b2E3zuhr2feySDhtdDz-Q8HkItkqiAYfsIrKY2y78rlLQoqI-UjPAKEwidy_DQ",
+      "token": "eyJhbGciOiJFZERTQSIsImtpZCI6ImtpZF8wMDY3TVlaMTAwNVIwMzAwMTAwMDAwMDAwNjgiLCJ0eXAiOiJwYitqd3QifQ.eyJpc3MiOiJwXzAwNjdNWVoxMDAxUjAxMDAwMDAwMDAwMDA2NCIsImF1ZCI6InBiIiwic3ViIjoiQWxpY2VfLTkiLCJyb29tIjoiUm9vbV85LVoiLCJleHAiOjkwMDcxOTkyNTQ3NDA5OTF9.gW7x83B22VR8S9L1D9GCQxP2b2E3zuhr2feySDhtdDz-Q8HkItkqiAYfsIrKY2y78rlLQoqI-UjPAKEwidy_DQ"
+    },
+    {
+      "name": "beyond-safe-number",
+      "input": {
+        "project_id": "p_0067MYZ1001R010000000000064",
+        "key_id": "kid_0067MYZ1005R030010000000068",
+        "secret": "sk_00K6D12DJHZWPVAEVDGT6XG8MW3TVH8RSYDDBMRJDN37PXN7VH9QV",
+        "room": "Room_9-Z",
+        "participant": "Alice_-9",
+        "expiration": "9007199254740993"
+      },
+      "canonical_project_id": "p_0067MYZ1001R010000000000064",
+      "canonical_key_id": "kid_0067MYZ1005R030010000000068",
+      "seed_hex": "4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb",
+      "public_key_hex": "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c",
+      "header": "{\"alg\":\"EdDSA\",\"kid\":\"kid_0067MYZ1005R030010000000068\",\"typ\":\"pb+jwt\"}",
+      "claims": "{\"iss\":\"p_0067MYZ1001R010000000000064\",\"aud\":\"pb\",\"sub\":\"Alice_-9\",\"room\":\"Room_9-Z\",\"exp\":9007199254740993}",
+      "signing_input": "eyJhbGciOiJFZERTQSIsImtpZCI6ImtpZF8wMDY3TVlaMTAwNVIwMzAwMTAwMDAwMDAwNjgiLCJ0eXAiOiJwYitqd3QifQ.eyJpc3MiOiJwXzAwNjdNWVoxMDAxUjAxMDAwMDAwMDAwMDA2NCIsImF1ZCI6InBiIiwic3ViIjoiQWxpY2VfLTkiLCJyb29tIjoiUm9vbV85LVoiLCJleHAiOjkwMDcxOTkyNTQ3NDA5OTN9",
+      "signature": "U2VaKTr-twp9Bk9y12_f6JgpBrl6cD0c4FAKWa56f_XZb59et8vkQ-I70lP8ni_wtTZQutx9QN7pHV-BEG2VCw",
+      "token": "eyJhbGciOiJFZERTQSIsImtpZCI6ImtpZF8wMDY3TVlaMTAwNVIwMzAwMTAwMDAwMDAwNjgiLCJ0eXAiOiJwYitqd3QifQ.eyJpc3MiOiJwXzAwNjdNWVoxMDAxUjAxMDAwMDAwMDAwMDA2NCIsImF1ZCI6InBiIiwic3ViIjoiQWxpY2VfLTkiLCJyb29tIjoiUm9vbV85LVoiLCJleHAiOjkwMDcxOTkyNTQ3NDA5OTN9.U2VaKTr-twp9Bk9y12_f6JgpBrl6cD0c4FAKWa56f_XZb59et8vkQ-I70lP8ni_wtTZQutx9QN7pHV-BEG2VCw"
+    },
+    {
+      "name": "u64-max",
+      "input": {
+        "project_id": "p_0067MYZ1001R010000000000064",
+        "key_id": "kid_0067MYZ1005R030010000000068",
+        "secret": "sk_00K6D12DJHZWPVAEVDGT6XG8MW3TVH8RSYDDBMRJDN37PXN7VH9QV",
+        "room": "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
+        "participant": "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+        "expiration": "18446744073709551615"
+      },
+      "canonical_project_id": "p_0067MYZ1001R010000000000064",
+      "canonical_key_id": "kid_0067MYZ1005R030010000000068",
+      "seed_hex": "4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb",
+      "public_key_hex": "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c",
+      "header": "{\"alg\":\"EdDSA\",\"kid\":\"kid_0067MYZ1005R030010000000068\",\"typ\":\"pb+jwt\"}",
+      "claims": "{\"iss\":\"p_0067MYZ1001R010000000000064\",\"aud\":\"pb\",\"sub\":\"zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\",\"room\":\"XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX\",\"exp\":18446744073709551615}",
+      "signing_input": "eyJhbGciOiJFZERTQSIsImtpZCI6ImtpZF8wMDY3TVlaMTAwNVIwMzAwMTAwMDAwMDAwNjgiLCJ0eXAiOiJwYitqd3QifQ.eyJpc3MiOiJwXzAwNjdNWVoxMDAxUjAxMDAwMDAwMDAwMDA2NCIsImF1ZCI6InBiIiwic3ViIjoienp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6Iiwicm9vbSI6IlhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWCIsImV4cCI6MTg0NDY3NDQwNzM3MDk1NTE2MTV9",
+      "signature": "GJoAb4aEx1ei4BA0kr9zPuqhMxAF_jwzrMWRwJ_7hMzSWk8C5f_75Q6ZM6YRuFB0_22_WXXzven5GNF65A5oCg",
+      "token": "eyJhbGciOiJFZERTQSIsImtpZCI6ImtpZF8wMDY3TVlaMTAwNVIwMzAwMTAwMDAwMDAwNjgiLCJ0eXAiOiJwYitqd3QifQ.eyJpc3MiOiJwXzAwNjdNWVoxMDAxUjAxMDAwMDAwMDAwMDA2NCIsImF1ZCI6InBiIiwic3ViIjoienp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6Iiwicm9vbSI6IlhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWCIsImV4cCI6MTg0NDY3NDQwNzM3MDk1NTE2MTV9.GJoAb4aEx1ei4BA0kr9zPuqhMxAF_jwzrMWRwJ_7hMzSWk8C5f_75Q6ZM6YRuFB0_22_WXXzven5GNF65A5oCg"
+    },
+    {
+      "name": "aliases",
+      "input": {
+        "project_id": "p_oo67myzloolrolooooooooooo64",
+        "key_id": "kid_OO67MYZIOO5RO3OOIOOOOOOOO68",
+        "secret": "sk_ook6dl2djhzwpvaevdgt6xg8mw3tvh8rsyddbmrjdn37pxn7vh9qv",
+        "room": "Room_9-Z",
+        "participant": "Alice_-9",
+        "expiration": "2000"
+      },
+      "canonical_project_id": "p_0067MYZ1001R010000000000064",
+      "canonical_key_id": "kid_0067MYZ1005R030010000000068",
+      "seed_hex": "4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb",
+      "public_key_hex": "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c",
+      "header": "{\"alg\":\"EdDSA\",\"kid\":\"kid_0067MYZ1005R030010000000068\",\"typ\":\"pb+jwt\"}",
+      "claims": "{\"iss\":\"p_0067MYZ1001R010000000000064\",\"aud\":\"pb\",\"sub\":\"Alice_-9\",\"room\":\"Room_9-Z\",\"exp\":2000}",
+      "signing_input": "eyJhbGciOiJFZERTQSIsImtpZCI6ImtpZF8wMDY3TVlaMTAwNVIwMzAwMTAwMDAwMDAwNjgiLCJ0eXAiOiJwYitqd3QifQ.eyJpc3MiOiJwXzAwNjdNWVoxMDAxUjAxMDAwMDAwMDAwMDA2NCIsImF1ZCI6InBiIiwic3ViIjoiQWxpY2VfLTkiLCJyb29tIjoiUm9vbV85LVoiLCJleHAiOjIwMDB9",
+      "signature": "oAY5dK8o1dWo5xu942DV8Q56v1Pk2lQrWEOkGONGcsW1givVlcXg5N_ZPWw4aFFyVP-5p3Z_jXWm66L8Pn1BBg",
+      "token": "eyJhbGciOiJFZERTQSIsImtpZCI6ImtpZF8wMDY3TVlaMTAwNVIwMzAwMTAwMDAwMDAwNjgiLCJ0eXAiOiJwYitqd3QifQ.eyJpc3MiOiJwXzAwNjdNWVoxMDAxUjAxMDAwMDAwMDAwMDA2NCIsImF1ZCI6InBiIiwic3ViIjoiQWxpY2VfLTkiLCJyb29tIjoiUm9vbV85LVoiLCJleHAiOjIwMDB9.oAY5dK8o1dWo5xu942DV8Q56v1Pk2lQrWEOkGONGcsW1givVlcXg5N_ZPWw4aFFyVP-5p3Z_jXWm66L8Pn1BBg"
+    }
+  ],
+  "invalid": [
+    {
+      "name": "project_id-missing",
+      "field": "project_id",
+      "value": null
+    },
+    {
+      "name": "project_id-boolean",
+      "field": "project_id",
+      "value": true
+    },
+    {
+      "name": "project_id-empty",
+      "field": "project_id",
+      "value": ""
+    },
+    {
+      "name": "project_id-number",
+      "field": "project_id",
+      "value": 42
+    },
+    {
+      "name": "key_id-missing",
+      "field": "key_id",
+      "value": null
+    },
+    {
+      "name": "key_id-boolean",
+      "field": "key_id",
+      "value": true
+    },
+    {
+      "name": "key_id-empty",
+      "field": "key_id",
+      "value": ""
+    },
+    {
+      "name": "key_id-number",
+      "field": "key_id",
+      "value": 42
+    },
+    {
+      "name": "secret-missing",
+      "field": "secret",
+      "value": null
+    },
+    {
+      "name": "secret-boolean",
+      "field": "secret",
+      "value": true
+    },
+    {
+      "name": "secret-empty",
+      "field": "secret",
+      "value": ""
+    },
+    {
+      "name": "secret-number",
+      "field": "secret",
+      "value": 42
+    },
+    {
+      "name": "room-missing",
+      "field": "room",
+      "value": null
+    },
+    {
+      "name": "room-boolean",
+      "field": "room",
+      "value": true
+    },
+    {
+      "name": "room-empty",
+      "field": "room",
+      "value": ""
+    },
+    {
+      "name": "room-number",
+      "field": "room",
+      "value": 42
+    },
+    {
+      "name": "participant-missing",
+      "field": "participant",
+      "value": null
+    },
+    {
+      "name": "participant-boolean",
+      "field": "participant",
+      "value": true
+    },
+    {
+      "name": "participant-empty",
+      "field": "participant",
+      "value": ""
+    },
+    {
+      "name": "participant-number",
+      "field": "participant",
+      "value": 42
+    },
+    {
+      "name": "expiration-missing",
+      "field": "expiration",
+      "value": null
+    },
+    {
+      "name": "expiration-boolean",
+      "field": "expiration",
+      "value": true
+    },
+    {
+      "name": "room-long",
+      "field": "room",
+      "value": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    },
+    {
+      "name": "room-space",
+      "field": "room",
+      "value": "has space"
+    },
+    {
+      "name": "room-slash",
+      "field": "room",
+      "value": "a/b"
+    },
+    {
+      "name": "room-unicode",
+      "field": "room",
+      "value": "café"
+    },
+    {
+      "name": "room-newline",
+      "field": "room",
+      "value": "abc\n"
+    },
+    {
+      "name": "room-leading",
+      "field": "room",
+      "value": " abc"
+    },
+    {
+      "name": "participant-long",
+      "field": "participant",
+      "value": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    },
+    {
+      "name": "participant-space",
+      "field": "participant",
+      "value": "has space"
+    },
+    {
+      "name": "participant-slash",
+      "field": "participant",
+      "value": "a/b"
+    },
+    {
+      "name": "participant-unicode",
+      "field": "participant",
+      "value": "café"
+    },
+    {
+      "name": "participant-newline",
+      "field": "participant",
+      "value": "abc\n"
+    },
+    {
+      "name": "participant-leading",
+      "field": "participant",
+      "value": " abc"
+    },
+    {
+      "name": "project_id-prefix",
+      "field": "project_id",
+      "value": "P_0067MYZ1001R010000000000064"
+    },
+    {
+      "name": "project_id-wrong_prefix",
+      "field": "project_id",
+      "value": "rm_0067MYZ1001R010000000000064"
+    },
+    {
+      "name": "project_id-version",
+      "field": "project_id",
+      "value": "p_1067MYZ1001R010000000000064"
+    },
+    {
+      "name": "project_id-short",
+      "field": "project_id",
+      "value": "p_0067MYZ1001R01000000000006"
+    },
+    {
+      "name": "project_id-long",
+      "field": "project_id",
+      "value": "p_0067MYZ1001R0100000000000640"
+    },
+    {
+      "name": "project_id-character",
+      "field": "project_id",
+      "value": "p_0067MYZ1001R01000000000006U"
+    },
+    {
+      "name": "project_id-unicode",
+      "field": "project_id",
+      "value": "p_0067ſYZ1001R010000000000064"
+    },
+    {
+      "name": "project_id-padding",
+      "field": "project_id",
+      "value": "p_0067MYZ1001R010000000000061"
+    },
+    {
+      "name": "project_id-whitespace",
+      "field": "project_id",
+      "value": " p_0067MYZ1001R010000000000064"
+    },
+    {
+      "name": "project_id-newline",
+      "field": "project_id",
+      "value": "p_0067MYZ1001R010000000000064\n"
+    },
+    {
+      "name": "project_id-uuid_version",
+      "field": "project_id",
+      "value": "p_0067MYZ10010010000000000064"
+    },
+    {
+      "name": "project_id-uuid_variant",
+      "field": "project_id",
+      "value": "p_0067MYZ1001R000000000000064"
+    },
+    {
+      "name": "key_id-prefix",
+      "field": "key_id",
+      "value": "KID_0067MYZ1005R030010000000068"
+    },
+    {
+      "name": "key_id-wrong_prefix",
+      "field": "key_id",
+      "value": "rm_0067MYZ1005R030010000000068"
+    },
+    {
+      "name": "key_id-version",
+      "field": "key_id",
+      "value": "kid_1067MYZ1005R030010000000068"
+    },
+    {
+      "name": "key_id-short",
+      "field": "key_id",
+      "value": "kid_0067MYZ1005R03001000000006"
+    },
+    {
+      "name": "key_id-long",
+      "field": "key_id",
+      "value": "kid_0067MYZ1005R0300100000000680"
+    },
+    {
+      "name": "key_id-character",
+      "field": "key_id",
+      "value": "kid_0067MYZ1005R03001000000006U"
+    },
+    {
+      "name": "key_id-unicode",
+      "field": "key_id",
+      "value": "kid_0067ſYZ1005R030010000000068"
+    },
+    {
+      "name": "key_id-padding",
+      "field": "key_id",
+      "value": "kid_0067MYZ1005R030010000000061"
+    },
+    {
+      "name": "key_id-whitespace",
+      "field": "key_id",
+      "value": " kid_0067MYZ1005R030010000000068"
+    },
+    {
+      "name": "key_id-newline",
+      "field": "key_id",
+      "value": "kid_0067MYZ1005R030010000000068\n"
+    },
+    {
+      "name": "key_id-uuid_version",
+      "field": "key_id",
+      "value": "kid_0067MYZ10010010000000000064"
+    },
+    {
+      "name": "key_id-uuid_variant",
+      "field": "key_id",
+      "value": "kid_0067MYZ1001R000000000000064"
+    },
+    {
+      "name": "secret-prefix",
+      "field": "secret",
+      "value": "SK_00K6D12DJHZWPVAEVDGT6XG8MW3TVH8RSYDDBMRJDN37PXN7VH9QV"
+    },
+    {
+      "name": "secret-public_key",
+      "field": "secret",
+      "value": "pk_00FA02Z1YGGW9BA9BE2N79MDQXF4WK0PCYBP4JT6C1KANY4NF8SGC"
+    },
+    {
+      "name": "secret-version",
+      "field": "secret",
+      "value": "sk_10K6D12DJHZWPVAEVDGT6XG8MW3TVH8RSYDDBMRJDN37PXN7VH9QV"
+    },
+    {
+      "name": "secret-short",
+      "field": "secret",
+      "value": "sk_00K6D12DJHZWPVAEVDGT6XG8MW3TVH8RSYDDBMRJDN37PXN7VH9Q"
+    },
+    {
+      "name": "secret-long",
+      "field": "secret",
+      "value": "sk_00K6D12DJHZWPVAEVDGT6XG8MW3TVH8RSYDDBMRJDN37PXN7VH9QV0"
+    },
+    {
+      "name": "secret-expanded",
+      "field": "secret",
+      "value": "sk_016CT24V53ZSDPMXPV1MDV0H9R7NQ2HHKWTTQ9H4VA6FDVAFQ2KFPFA02Z1YGGW9BA9BE2N79MDQXF4WK0PCYBP4JT6C1KANY4NF8SGC"
+    },
+    {
+      "name": "secret-character",
+      "field": "secret",
+      "value": "sk_00K6D12DJHZWPVAEVDGT6XG8MW3TVH8RSYDDBMRJDN37PXN7VH9QU"
+    },
+    {
+      "name": "secret-unicode",
+      "field": "secret",
+      "value": "sk_00K6D12DJHZWPVAEVDGT6XG8MW3TVH8RſYDDBMRJDN37PXN7VH9QV"
+    },
+    {
+      "name": "secret-padding",
+      "field": "secret",
+      "value": "sk_02K6D12DJHZWPVAEVDGT6XG8MW3TVH8RSYDDBMRJDN37PXN7VH9QV"
+    },
+    {
+      "name": "secret-whitespace",
+      "field": "secret",
+      "value": " sk_00K6D12DJHZWPVAEVDGT6XG8MW3TVH8RSYDDBMRJDN37PXN7VH9QV"
+    },
+    {
+      "name": "secret-newline",
+      "field": "secret",
+      "value": "sk_00K6D12DJHZWPVAEVDGT6XG8MW3TVH8RSYDDBMRJDN37PXN7VH9QV\n"
+    },
+    {
+      "name": "expiration-negative",
+      "field": "expiration",
+      "value": "-1",
+      "representation": "number"
+    },
+    {
+      "name": "expiration-fractional",
+      "field": "expiration",
+      "value": "1.5",
+      "representation": "number"
+    },
+    {
+      "name": "expiration-overflow",
+      "field": "expiration",
+      "value": "18446744073709551616",
+      "representation": "number"
+    },
+    {
+      "name": "expiration-lossy_number",
+      "field": "expiration",
+      "value": "9007199254740993",
+      "representation": "number"
+    },
+    {
+      "name": "expiration-string",
+      "field": "expiration",
+      "value": "2000",
+      "representation": "string"
+    },
+    {
+      "name": "expiration-nan",
+      "field": "expiration",
+      "value": "NaN",
+      "representation": "number"
+    },
+    {
+      "name": "expiration-infinity",
+      "field": "expiration",
+      "value": "Infinity",
+      "representation": "number"
+    }
+  ]
+}
