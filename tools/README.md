@@ -13,9 +13,10 @@ build framework or an alternative package compilation pipeline.
 | Rust channel/components/targets | `rust-toolchain.toml` | `tools/rust-pins.MODULE.bazel` toolchains/host tools |
 | Rust dependencies/features/lints | Cargo manifests and `Cargo.lock` | Native/browser crate-universe graphs, `rust-metadata.bzl` and `wasm-deps.bzl` |
 | WASM glue/runtime and UniFFI | Cargo lock/manifests | Build-tool universe, generated bindings and proof runtime |
-| UBRN generator and standalone updater | `tools/generators.toml` | Derived generator/updater repositories |
+| UBRN generator | `tools/generators.toml` | Derived generator repository |
 | JS dependencies | Each owner package manifest and frozen pnpm lock | rules_js npm repositories and editor installs |
 | Node, pnpm, Python, LLVM, CMake/Ninja and upstream rules | `MODULE.bazel` | All configured actions and CI |
+| Linux OS inputs and mold | `tools/host/flake.nix`, `tools/host/flake.lock` | Narrow Nixpkgs FHS runtime; no application build graph |
 | Go SDK/dependencies | RTC peer `go.mod`/`go.sum` | rules_go/gazelle module extensions |
 | Browser binaries/drivers | RTC `browser/browser-matrix.json` | Browser extension and RTC version probes |
 | Runtime image | Immutable cc-debian13 manifest digest in `MODULE.bazel` | rules_oci image |
@@ -24,7 +25,7 @@ build framework or an alternative package compilation pipeline.
 After editing authoritative Rust/generator inputs, explicitly run
 `./bazel run --lockfile_mode=update //tools:update-rust-pins`, then
 `./bazel mod deps --lockfile_mode=update`, and review derived files. Never edit
-`rust-pins.MODULE.bazel`, `rust-metadata.bzl`, `wasm-deps.bzl`, distribution repositories or
+`rust-pins.MODULE.bazel`, `rust-metadata.bzl`, `wasm-deps.bzl` or
 `tools/rust/*/Cargo.toml` by hand. Cargo/pnpm lock maintenance remains separate
 from supported application compilation; CI does not install parallel host tools.
 
@@ -34,7 +35,9 @@ from supported application compilation; CI does not install parallel host tools.
   rustfmt, crate-universe and editor-neutral rust-analyzer setup/discovery/flycheck.
 - `rules_rust_wasm_bindgen`: matching glue generation and WASM toolchain use.
 - `toolchains_llvm`, `rules_cc`, `rules_foreign_cc`, `nasm`: native compiler,
-  linker, CMake/Ninja and codec assembler inputs.
+  CMake/Ninja and codec assembler inputs. The LLVM integration consumes the
+  locked OS runtime's unwrapped mold executable; its current linker API accepts
+  a path, not a provisioned-artifact label.
 - `protobuf`: generated Rust protobuf input through the pinned code generator.
 - `rules_js`, `rules_nodejs`, `bazel_lib`: frozen pnpm translation, first-party
   package links, JS execution/tests, directory outputs and declared artifact views.
@@ -45,6 +48,12 @@ from supported application compilation; CI does not install parallel host tools.
 
 ## Concrete repository-owned gaps
 
+- `host-env.bzl` exposes the locked OS environment's immutable identity as a
+  declared native compile/link input, independently matching it against the watched
+  immutable runtime marker. The launcher also passes it through action/repository
+  environments; the identity is reserved for supported builds/tests. The OS-only flake is separate from application
+  sources, so the verified flake/lock/architecture identity does not depend on
+  worktree location.
 - `update-rust-pins.py` projects existing workspace/manifests into the external
   crate-universe first-party override boundaries and tool-only universes. A
   browser-only universe is derived from the Web/Core/protobuf normal dependencies,
@@ -59,7 +68,8 @@ from supported application compilation; CI does not install parallel host tools.
   generated embedded path relocatable in Bazel sandboxes.
 - `browsers.bzl` preserves the existing matrix's checked URLs, hashes, archive
   structure and Firefox ESR contract, which a generic Chrome-only toolchain
-  would not cover. Runtime OS libraries remain explicit host prerequisites.
+  would not cover. The locked OS runtime supplies shared libraries; kernel
+  namespace/sandbox support remains an explicit host prerequisite.
 - `run-simulations.py` preserves nextest-style per-case process isolation and
   slow namespace selection with libtest, including seed replay and advisory
   windows. It runs actual Bazel-built test binaries, not Cargo commands.
@@ -75,10 +85,12 @@ from supported application compilation; CI does not install parallel host tools.
   Web SDK dependency. Meet's independent lockfile does not encode that edge
   through its linked React package; the bridge references the existing package
   output, with no duplicate version pin or application resolver alias.
-- `release/package.py`, `global.py`, and the installer template preserve archive
-  identity/checksums, version tags, CARGO_HOME installation and the shipped
-  receipt-driven updater schema. They consume already-built binaries. Publication
-  is credentialed workflow glue, never a build action.
+- `rules_pkg` owns release archives. `release/package.py` adds hashes and assembly
+  metadata; `global.py` and the installer template preserve package-scoped tags
+  and CARGO_HOME installation. Updates reuse the explicitly selected release's
+  installer, without a separate updater or receipt. These actions consume
+  already-built artifacts. Publication is credentialed workflow glue, never a
+  build action.
 - Static example serving and scoreboard regeneration are bounded utilities for
   their concrete outputs. Source metadata, scripts and fixtures are declared.
 

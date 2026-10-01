@@ -759,7 +759,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "str0m_legacy"
+name = "str0m_native"
 version = "0.0.0"
 dependencies = [
  "str0m",

@@ -9,10 +9,6 @@ homepage.workspace = true
 repository.workspace = true
 license.workspace = true
 
-[package.metadata.dist]
-tag-prefix = "pulsebeam-v"
-changelog = "CHANGELOG.md"
-
 [lints]
 workspace = true
 

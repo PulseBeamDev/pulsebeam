@@ -40,7 +40,7 @@ jobs:
       - name: Build architecture-appropriate release assets
         run: |
           ./bazel build --config=release //release:local //release:global
-          ./bazel test --config=release //release:contract --test_output=errors
+          ./bazel test --config=release //release:contract //release:elf_contract --test_output=errors
       - name: Validate hashes and executable target
         run: |
           cd bazel-bin/release/artifacts
@@ -92,7 +92,6 @@ jobs:
           sha256sum --check *.sha256
           for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
             test -s "pulsebeam-$target.tar.xz"
-            test -s "pulsebeam-$target-update"
           done
           test -s pulsebeam-installer.sh
       - name: Publish GitHub release

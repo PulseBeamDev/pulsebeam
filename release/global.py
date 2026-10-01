@@ -1,4 +1,4 @@
-"""Generate version-tag plans and the receipt-compatible shell installer."""
+"""Generate package-scoped release plans and the shell installer."""
 
 import argparse
 import hashlib
@@ -23,13 +23,12 @@ def main():
     tag = config["tag-prefix"] + version
     if args.tag and args.tag != tag:
         parser.error(f"tag {args.tag!r} does not match authoritative package version ({tag})")
-    plan = {"version": version, "tag": tag, "prerelease": "-" in version, "targets": config["targets"]}
+    plan = {"version": version, "tag": tag, "prerelease": "-" in version.split("+", 1)[0], "targets": config["targets"]}
     if args.out:
         out = Path(args.out)
         out.mkdir(parents=True, exist_ok=True)
         installer = Path(args.template).read_text()
-        for key, value in {"VERSION": version, "TAG": tag, "REPOSITORY": config["repository"],
-                           "PROVIDER_VERSION": config["receipt-provider-version"]}.items():
+        for key, value in {"VERSION": version, "TAG": tag, "REPOSITORY": config["repository"]}.items():
             installer = installer.replace(f"@{key}@", value)
         path = out / f"{package['name']}-installer.sh"
         path.write_text(installer)

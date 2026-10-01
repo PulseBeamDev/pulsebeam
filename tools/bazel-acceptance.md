@@ -13,6 +13,22 @@ exclusion, documented in
 [the exception record](../crates/pulsebeam-simulator/docs/native-dtls-exception.md).
 Neither deferred ARM execution nor that excluded case is reported as passed.
 
+During review, the human approved build/test ownership and legacy removal,
+generated SDK/browser/IDE integration, and the distribution handoff with its
+explicit native-aarch64 validation waiver. The human also approved canonical
+package-scoped `pulsebeam-v<version>` tags as an intentional compatibility
+exception to the old generic trigger and permissive tag parser. Unused
+distribution manifest metadata was removed. The human subsequently
+required mold, permitted narrow Nix OS provisioning, and authorized removing
+separate updater/receipt compatibility in favor of Bazel-native archive assembly
+and explicit versioned-installer updates. Earlier updater and host-baseline
+evidence below describes the prior candidate, not acceptance of these renewed
+changes. Renewed native, browser, image and shared-cache evidence is recorded
+below. Complete coverage combines the aggregate with affected-owner reruns.
+The human approved the qualified renewed handoff for tooling/tests, native
+and image distribution, and the persistent shared local disk cache.
+No approval here authorizes production publication.
+
 ## Reference environment and aggregate gate
 
 The reference environment was rootless Ubuntu 24.04 on Linux x86_64, with the
@@ -106,6 +122,121 @@ committed BWE plan passed and produced its PASS outcome and real link metrics:
 
 This exercises the real generator and parser without rerunning the already
 accepted full simulation matrix or modifying tracked `bwe-baseline.txt`.
+
+## Renewed OS, distribution and shared-cache evidence
+
+The renewed reference harness is rootless, non-root Linux x86_64 with the locked
+OS-only Nix flake, not a required development container. Language/build/browser
+tools remain Bazel-owned. This is not a renewed empty-cache complete-gate claim,
+Fedora installation acceptance, native ARM execution or GitHub CI execution.
+
+Receipt `de91f022-6982-435b-9f7a-3f27d7568f79` passed native Rust bootstrap linking,
+launcher/plan/workflow checks, default archive/installer and ELF checks, profile
+ELF checks, and release archive/installer and ELF checks. The only failed command
+was `git diff --check` for a blank EOF line; its whitespace-only correction passed
+`9c2451bf-3bb6-43b7-bf84-3026e1a3e8b3`. ELF checks require mold linkage, executable
+startup, GNU symbol floors, and no Nix-store/build-directory runtime paths. The
+new marker validation preserves identity-file bytes and action keys for legitimate
+builds; renewed launcher/plan/workflow and diff checks passed
+`a9ab4bfc-564b-4c39-978a-92e4a24add0f`.
+
+The native disk cache is `~/.cache/pulsebeam/bazel/disk-cache`, with default
+workspace-hashed output bases unchanged. Three fresh detached Git worktrees held
+the same candidate. Their output state was expunged, not shared or copied. A
+executed the routing unit test; B and C then ran concurrently, each restoring all
+111 logged spawns from the persistent host-mounted cache, including the routing
+test-binary `Rustc` action and two `TestRunner` spawns. Three distinct output bases
+and daemon PIDs were recorded. A forged repository identity was rejected against
+the actual immutable OS marker.
+
+Receipt `3a5b4fe6-75e7-4eac-911b-95eb094cf7b2` completed all three test builds, but
+postprocessing incorrectly expected an expanded cache path in build events and a
+separate library action in the unit-test graph. Corrected retained-log analysis
+passed `9ae8a487-459c-44e3-b200-d7dedc75c830`, without repeating the builds. The
+summary and original execution/build-event logs are retained locally under
+`/home/lukas/.cache/pulsebeam/cache-proof.9pltBF/evidence-resumed/`; that location
+is evidence storage, not a development prerequisite. The physical cache remains
+`/home/lukas/.cache/pulsebeam/bazel/disk-cache`, outside all proof worktrees.
+
+A prior interrupted cache run is not used as completed concurrent-reuse evidence.
+Its persistent cache and worktrees survived recovery; the resumed proof used
+expunged output state and new retained logs. Scoped read-only distribution review
+found no concrete release/automation defects. Deliberate native Bazel environment,
+rc or toolchain overrides are unsupported escape hatches, not a cache guarantee.
+
+## Final repaired-candidate acceptance
+
+The renewed aggregate `36ac244c-e0d8-4278-a8a8-45cd57b01a16` ran `//:test` once:
+75 of 77 targets passed, including static/architectural checks, fast/slow
+simulations, RTC Firefox and the Go peer. RTC Chrome and Web/React browser tests
+failed at Chrome startup. It is not reported as a passing aggregate invocation.
+Direct startup and a complete loader trace identified missing expat, xkbcommon,
+cairo and udev libraries. The existing locked OS runtime now supplies the
+maintained Nixpkgs packages `expat`, `libxkbcommon`, `cairo` and `systemdLibs`.
+No browser cases, assertions or tool pins changed.
+
+Receipt `e99df649-5668-497a-a349-5d04c08206d2` passed Chrome startup and every
+affected browser boundary, plus launcher/workflow and whitespace checks:
+
+```sh
+./bazel test //crates/pulsebeam-rtc:chrome //crates/pulsebeam-rtc:firefox \
+  //crates/pulsebeam-rtc:rfc8888 //agents/pulsebeam-agent-web:browser \
+  //tools:launcher_contract //tools:workflow_contract --test_output=errors --jobs=8
+```
+
+Receipt `069a1863-e9a1-4906-b296-1f49aa25b8a1` renewed native and distribution
+checks against that repaired runtime:
+
+```sh
+./bazel test //release:contract //release:elf_contract //release:plan_contract --test_output=errors --jobs=8
+./bazel test --config=profile //release:elf_contract --test_output=errors --jobs=8
+./bazel test --config=release //release:contract //release:elf_contract //release:plan_contract --test_output=errors --jobs=8
+./bazel build --config=release //release:load --output_groups=+tarball --jobs=8
+```
+
+The tarball output group is the pinned upstream `oci_load` API. An earlier
+attempt at nonexistent `//release:load.tarball` failed during target selection,
+not image compilation. Receipt `018359f5-1cca-468c-87c2-72e7b2f916a9` loaded the
+produced tarball into rootless Podman, asserted amd64, user `65532:65532`,
+entrypoint `/app/pulsebeam`, workdir `/app`, and ports `3478/udp` and `7070/tcp`.
+The non-root image passed `--help` with `--network=none`. Nothing was published.
+
+Receipt `8aa01d1a-d4d1-400f-825c-3c896bb93307` repeated the shared-cache proof
+with all three worktrees synchronized to the repaired candidate and their
+output state expunged. A executed the routing Rustc/test actions; concurrent B/C
+each restored all 111 logged spawns, including one routing test-binary Rustc
+and two TestRunner actions, from the persistent shared disk cache. Output bases
+and daemon PIDs were distinct, and the forged runtime identity was rejected.
+Original logs and the summary are retained locally under
+`/home/lukas/.cache/pulsebeam/cache-proof.9pltBF/evidence-browser-runtime/`.
+
+Complete acceptance coverage therefore combines the unaffected passing aggregate
+results with all affected browser/native reruns, rather than repeating slow
+simulation acceptance or claiming the earlier aggregate returned success.
+The original empty-cache, native-aarch64 and native-DTLS qualifications above
+remain unchanged. This does not establish Fedora installation, GitHub CI
+execution or production publication. Earlier real Neovim evidence is retained;
+the renewed Rust launcher/PATH effect was source-reviewed without finding a
+concrete routing break, not exercised in a renewed Neovim session.
+
+## Final handoff approval
+
+Final launcher/workflow/plan and whitespace checks passed receipt
+`b5680081-4715-4917-8807-81341687ebbd` after recording the repaired-candidate
+evidence. The human then explicitly approved all three consequential outcomes:
+
+- Renewed Bazel/tooling and test ownership with the stated validation
+  qualifications and retained editor evidence.
+- Native distribution and the amd64 image, retaining the previously accepted
+  native-aarch64 execution waiver.
+- Persistent shared local disk caching with isolated output state and the
+  refreshed concurrent Rustc/TestRunner reuse proof.
+
+These approvals accepted the qualified review handoff. The human subsequently
+explicitly authorized a local commit of the approved migration changes,
+superseding the original review-only no-commit endpoint. This does not authorize
+merge, push or production publication. No additional exclusions or validation
+claims were introduced.
 
 ## Retained evidence identifiers
 
