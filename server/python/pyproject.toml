@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pulsebeam-server"
+version = "0.1.0"
+description = "Native server-side PulseBeam participant token signing"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+dependencies = ["cryptography>=44,<47"]
+
+[project.urls]
+Repository = "https://github.com/PulseBeamDev/pulsebeam"
+
+[tool.setuptools]
+packages = ["pulsebeam_server"]
+
+[tool.setuptools.package-data]
+pulsebeam_server = ["py.typed"]

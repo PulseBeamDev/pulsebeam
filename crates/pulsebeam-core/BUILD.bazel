@@ -21,7 +21,7 @@ rust_library(
     rustc_env_files = [":cargo_env"],
     lint_config = ":lints",
     aliases = aliases(),
-    deps = all_crate_deps(normal = True),
+    deps = all_crate_deps(normal = True) + ["//crates/pulsebeam-auth"],
     proc_macro_deps = all_crate_deps(proc_macro = True),
 )
 
@@ -37,7 +37,7 @@ rust_library(
     rustc_env_files = [":cargo_env"],
     lint_config = ":lints",
     aliases = aliases(),
-    deps = all_crate_deps(normal = True),
+    deps = all_crate_deps(normal = True) + ["//crates/pulsebeam-auth"],
     proc_macro_deps = all_crate_deps(proc_macro = True),
 )
 

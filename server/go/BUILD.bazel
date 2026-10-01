@@ -1,0 +1,36 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+load("@rules_pkg//pkg:tar.bzl", "pkg_tar")
+load("@rules_python//python:defs.bzl", "py_test")
+
+package(default_visibility = ["//visibility:public"])
+exports_files(["go.mod"])
+filegroup(name = "workflow_inputs", srcs = ["README.md", "go.mod"])
+
+go_library(
+    name = "server",
+    srcs = ["auth.go"],
+    importpath = "github.com/PulseBeamDev/pulsebeam/server/go",
+)
+
+go_test(
+    name = "conformance",
+    srcs = ["auth_test.go"],
+    deps = [":server"],
+    data = ["//server/auth:vectors.json"],
+)
+
+pkg_tar(
+    name = "package",
+    srcs = ["auth.go", "go.mod", "README.md", "LICENSE"],
+    extension = "tar.gz",
+)
+
+py_test(
+    name = "consumer",
+    srcs = ["tests/consumer.py"],
+    main = "tests/consumer.py",
+    args = ["$(rootpath :package)", "$(rootpath @go_default_sdk//:bin/go)", "$(rootpath auth_test.go)", "$(rootpath //server/auth:vectors.json)"],
+    data = [":package", "auth_test.go", "//server/auth:vectors.json", "@go_default_sdk//:bin/go", "@go_default_sdk//:go_sdk"],
+)
+
+test_suite(name = "fast", tests = [":conformance", ":consumer"])

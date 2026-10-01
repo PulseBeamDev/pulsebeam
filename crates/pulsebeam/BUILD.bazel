@@ -47,7 +47,7 @@ rust_test(
     rustc_flags = ["-Copt-level=2", "-Cdebug-assertions=yes", "-Coverflow-checks=yes"],
     lint_config = ":lints",
     aliases = aliases(normal_dev = True, proc_macro_dev = True),
-    deps = all_crate_deps(normal_dev = True) + ["//crates/pulsebeam-core:pulsebeam-core-sim", "//crates/pulsebeam-testdata:pulsebeam-testdata"],
+    deps = all_crate_deps(normal_dev = True) + ["//crates/pulsebeam-core:pulsebeam-core-sim", "//crates/pulsebeam-testdata:pulsebeam-testdata", "//server/rust:pulsebeam-server"],
     proc_macro_deps = all_crate_deps(proc_macro_dev = True),
     
 )

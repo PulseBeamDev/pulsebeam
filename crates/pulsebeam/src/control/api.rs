@@ -899,8 +899,8 @@ mod tests {
     use super::*;
     use pulsebeam_core::{
         auth::{
-            DEVELOPMENT_API_KEY_ID, DEVELOPMENT_API_VERIFYING_KEY, DEVELOPMENT_PROJECT_ID,
-            ProjectKey, ProjectKeys, mint_development_token,
+            DEVELOPMENT_API_KEY_ID, DEVELOPMENT_API_SIGNING_KEY, DEVELOPMENT_API_VERIFYING_KEY,
+            DEVELOPMENT_PROJECT_ID, ProjectKey, ProjectKeys,
         },
         identity::{ParticipantExternalId, RoomExternalId},
     };
@@ -959,9 +959,12 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs();
-        mint_development_token(
-            &RoomExternalId::new("general").unwrap(),
-            &ParticipantExternalId::new("alice").unwrap(),
+        pulsebeam_server::sign_participant_token(
+            &DEVELOPMENT_PROJECT_ID.as_str(),
+            &DEVELOPMENT_API_KEY_ID.as_str(),
+            &DEVELOPMENT_API_SIGNING_KEY.to_secret_string(),
+            (RoomExternalId::new("general").unwrap()).as_str(),
+            (ParticipantExternalId::new("alice").unwrap()).as_str(),
             now + 60,
         )
         .unwrap()
@@ -1330,9 +1333,12 @@ mod tests {
 
     #[tokio::test]
     async fn authorization_failures_are_secret_safe_rfc_9457_responses() {
-        let token = mint_development_token(
-            &RoomExternalId::new("general").unwrap(),
-            &ParticipantExternalId::new("alice").unwrap(),
+        let token = pulsebeam_server::sign_participant_token(
+            &DEVELOPMENT_PROJECT_ID.as_str(),
+            &DEVELOPMENT_API_KEY_ID.as_str(),
+            &DEVELOPMENT_API_SIGNING_KEY.to_secret_string(),
+            (RoomExternalId::new("general").unwrap()).as_str(),
+            (ParticipantExternalId::new("alice").unwrap()).as_str(),
             2_000,
         )
         .unwrap();

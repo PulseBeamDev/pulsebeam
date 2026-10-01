@@ -3262,6 +3262,7 @@ dependencies = [
  "pulsebeam-proto",
  "pulsebeam-routing",
  "pulsebeam-runtime",
+ "pulsebeam-server",
  "pulsebeam-testdata",
  "rand 0.10.2",
  "rust-embed",
@@ -3330,6 +3331,7 @@ dependencies = [
  "log",
  "pulsebeam-agent-core",
  "pulsebeam-core",
+ "pulsebeam-server",
  "serde",
  "serde-wasm-bindgen",
  "serde_json",
@@ -3344,6 +3346,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "pulsebeam-auth"
+version = "0.1.0"
+dependencies = [
+ "data-encoding",
+ "data-encoding-macro",
+ "ed25519-dalek",
+ "serde",
+ "thiserror 2.0.20",
+ "uuid",
+]
+
+[[package]]
+name = "pulsebeam-auth-conformance"
+version = "0.1.0"
+dependencies = [
+ "data-encoding",
+ "ed25519-dalek",
+ "pulsebeam-core",
+ "pulsebeam-server",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "pulsebeam-cli"
 version = "0.3.2"
 dependencies = [
@@ -3353,6 +3379,7 @@ dependencies = [
  "pulsebeam-agent-native",
  "pulsebeam-core",
  "pulsebeam-proto",
+ "pulsebeam-server",
  "pulsebeam-testdata",
  "rand 0.10.2",
  "reqwest",
@@ -3370,11 +3397,11 @@ dependencies = [
  "arrayvec",
  "axum",
  "data-encoding",
- "data-encoding-macro",
  "ed25519-dalek",
  "futures",
  "http",
  "proptest",
+ "pulsebeam-auth",
  "pulsebeam-core",
  "reqwest",
  "serde",
@@ -3460,6 +3487,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "pulsebeam-server"
+version = "0.1.0"
+dependencies = [
+ "data-encoding",
+ "pulsebeam-auth",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "uuid",
+]
+
+[[package]]
 name = "pulsebeam-simulator"
 version = "0.3.2"
 dependencies = [
@@ -3483,6 +3522,7 @@ dependencies = [
  "pulsebeam-agent-native",
  "pulsebeam-core",
  "pulsebeam-runtime",
+ "pulsebeam-server",
  "pulsebeam-testdata",
  "rand 0.10.2",
  "reqwest",

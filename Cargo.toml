@@ -3,6 +3,7 @@ resolver = "3"
 members = [
   "crates/pulsebeam",
   "crates/pulsebeam-cli",
+  "crates/pulsebeam-auth",
   "crates/pulsebeam-core",
   "crates/pulsebeam-proto",
   "crates/pulsebeam-routing",
@@ -14,6 +15,8 @@ members = [
   "agents/pulsebeam-agent-web",
   "agents/pulsebeam-agent-native",
   "tools/rust/wasm_proof",
+  "server/rust",
+  "server/auth",
 ]
 
 [workspace.package]

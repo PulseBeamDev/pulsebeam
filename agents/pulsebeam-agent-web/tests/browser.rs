@@ -1,7 +1,7 @@
 mod support;
 
 use pulsebeam_core::{
-    auth::mint_development_token,
+    auth::{DEVELOPMENT_API_KEY_ID, DEVELOPMENT_API_SIGNING_KEY, DEVELOPMENT_PROJECT_ID},
     identity::{ParticipantExternalId, RoomExternalId},
 };
 use serde::Deserialize;
@@ -381,16 +381,28 @@ async fn public_agent_connects_and_delivers_remote_media() -> TestResult<()> {
     let server = StaticServer::start(root()).await?;
     let url = server.url("tests/fixture.html");
     let room = RoomExternalId::new("public-web-contract")?;
-    let sender =
-        mint_development_token(&room, &ParticipantExternalId::new("web-sender")?, u64::MAX)?;
-    let receiver = mint_development_token(
-        &room,
-        &ParticipantExternalId::new("web-receiver")?,
+    let sender = pulsebeam_server::sign_participant_token(
+        &DEVELOPMENT_PROJECT_ID.as_str(),
+        &DEVELOPMENT_API_KEY_ID.as_str(),
+        &DEVELOPMENT_API_SIGNING_KEY.to_secret_string(),
+        (room).as_str(),
+        (ParticipantExternalId::new("web-sender")?).as_str(),
         u64::MAX,
     )?;
-    let second_receiver = mint_development_token(
-        &room,
-        &ParticipantExternalId::new("web-second-receiver")?,
+    let receiver = pulsebeam_server::sign_participant_token(
+        &DEVELOPMENT_PROJECT_ID.as_str(),
+        &DEVELOPMENT_API_KEY_ID.as_str(),
+        &DEVELOPMENT_API_SIGNING_KEY.to_secret_string(),
+        (room).as_str(),
+        (ParticipantExternalId::new("web-receiver")?).as_str(),
+        u64::MAX,
+    )?;
+    let second_receiver = pulsebeam_server::sign_participant_token(
+        &DEVELOPMENT_PROJECT_ID.as_str(),
+        &DEVELOPMENT_API_KEY_ID.as_str(),
+        &DEVELOPMENT_API_SIGNING_KEY.to_secret_string(),
+        (room).as_str(),
+        (ParticipantExternalId::new("web-second-receiver")?).as_str(),
         u64::MAX,
     )?;
     let live = LIVE
@@ -446,11 +458,30 @@ async fn reliable_topics_recover_the_lost_tail_through_server_restart() -> TestR
     let server = StaticServer::start(root()).await?;
     let url = server.url("tests/fixture.html");
     let room = RoomExternalId::new("reliable-restart-contract")?;
-    let sender =
-        mint_development_token(&room, &ParticipantExternalId::new("publisher")?, u64::MAX)?;
-    let receiver =
-        mint_development_token(&room, &ParticipantExternalId::new("subscriber")?, u64::MAX)?;
-    let late = mint_development_token(&room, &ParticipantExternalId::new("late")?, u64::MAX)?;
+    let sender = pulsebeam_server::sign_participant_token(
+        &DEVELOPMENT_PROJECT_ID.as_str(),
+        &DEVELOPMENT_API_KEY_ID.as_str(),
+        &DEVELOPMENT_API_SIGNING_KEY.to_secret_string(),
+        (room).as_str(),
+        (ParticipantExternalId::new("publisher")?).as_str(),
+        u64::MAX,
+    )?;
+    let receiver = pulsebeam_server::sign_participant_token(
+        &DEVELOPMENT_PROJECT_ID.as_str(),
+        &DEVELOPMENT_API_KEY_ID.as_str(),
+        &DEVELOPMENT_API_SIGNING_KEY.to_secret_string(),
+        (room).as_str(),
+        (ParticipantExternalId::new("subscriber")?).as_str(),
+        u64::MAX,
+    )?;
+    let late = pulsebeam_server::sign_participant_token(
+        &DEVELOPMENT_PROJECT_ID.as_str(),
+        &DEVELOPMENT_API_KEY_ID.as_str(),
+        &DEVELOPMENT_API_SIGNING_KEY.to_secret_string(),
+        (room).as_str(),
+        (ParticipantExternalId::new("late")?).as_str(),
+        u64::MAX,
+    )?;
     let start = RELIABLE_RESTART_START
         .replace("__SENDER_TOKEN__", &sender)
         .replace("__RECEIVER_TOKEN__", &receiver);

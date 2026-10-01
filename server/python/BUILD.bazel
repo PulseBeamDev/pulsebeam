@@ -1,0 +1,34 @@
+load("@rules_python//python:defs.bzl", "py_binary", "py_test")
+load("@bazel_lib//lib:run_binary.bzl", "run_binary")
+load("@server_pypi//:requirements.bzl", "requirement")
+
+package(default_visibility = ["//visibility:public"])
+exports_files(["requirements.lock", "requirements.in", "pyproject.toml"])
+filegroup(name = "workflow_inputs", srcs = ["README.md", "pyproject.toml", "requirements.in"])
+filegroup(name = "sources", srcs = ["pyproject.toml", "README.md", "LICENSE"] + glob(["pulsebeam_server/*"]))
+
+py_binary(
+    name = "builder",
+    srcs = ["build.py"],
+    main = "build.py",
+    deps = [requirement("setuptools"), requirement("wheel")],
+)
+
+run_binary(
+    name = "package",
+    tool = ":builder",
+    srcs = [":sources", "pyproject.toml"],
+    args = ["$(location pyproject.toml)", "$(RULEDIR)/dist"],
+    out_dirs = ["dist"],
+)
+
+py_test(
+    name = "conformance",
+    srcs = ["tests/consumer.py"],
+    main = "tests/consumer.py",
+    args = ["$(rootpath :package)", "$(rootpath //server/auth:vectors.json)"],
+    data = [":package", "//server/auth:vectors.json"],
+    deps = [requirement("cryptography"), requirement("installer")],
+)
+
+test_suite(name = "fast", tests = [":conformance"])

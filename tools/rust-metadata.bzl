@@ -2,6 +2,7 @@
 CARGO_METADATA_INPUTS = [
     "//crates/pulsebeam:cargo_metadata_inputs",
     "//crates/pulsebeam-cli:cargo_metadata_inputs",
+    "//crates/pulsebeam-auth:cargo_metadata_inputs",
     "//crates/pulsebeam-core:cargo_metadata_inputs",
     "//crates/pulsebeam-proto:cargo_metadata_inputs",
     "//crates/pulsebeam-routing:cargo_metadata_inputs",
@@ -12,5 +13,7 @@ CARGO_METADATA_INPUTS = [
     "//agents/pulsebeam-agent-core:cargo_metadata_inputs",
     "//agents/pulsebeam-agent-web:cargo_metadata_inputs",
     "//agents/pulsebeam-agent-native:cargo_metadata_inputs",
-    "//tools/rust/wasm_proof:cargo_metadata_inputs"
+    "//tools/rust/wasm_proof:cargo_metadata_inputs",
+    "//server/rust:cargo_metadata_inputs",
+    "//server/auth:cargo_metadata_inputs"
 ]
