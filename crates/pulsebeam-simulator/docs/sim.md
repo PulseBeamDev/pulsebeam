@@ -214,4 +214,4 @@ Before a new simulator scenario is accepted:
   failures;
 - a baseline failure was reproduced before a production fix when the scenario
   is a regression;
-- `just check` and `just test` are run before handoff.
+- `./bazel test //:test` runs static checks and complete acceptance before handoff.

@@ -1,0 +1,9 @@
+diff --git a/src/rust_crate.rs b/src/rust_crate.rs
+--- a/src/rust_crate.rs
++++ b/src/rust_crate.rs
+@@ -91,1 +91,1 @@
+-        Ok(MetadataCommand::new().exec()?)
++        Ok(MetadataCommand::new().no_deps().exec()?)
+@@ -96,1 +96,1 @@
+-        Ok(MetadataCommand::new().manifest_path(manifest_path).exec()?)
++        Ok(MetadataCommand::new().manifest_path(manifest_path).no_deps().exec()?)

@@ -1,0 +1,93 @@
+load("//tools:npm-links.bzl", "link_web_for_meet")
+load("@aspect_rules_js//js:defs.bzl", "js_binary", "js_run_binary", "js_test")
+load("@bazel_lib//lib:output_files.bzl", "output_files")
+load("@bazel_lib//lib:copy_to_directory.bzl", "copy_to_directory")
+load("@rules_python//python:defs.bzl", "py_test")
+load("@meet_npm//:defs.bzl", "npm_link_all_packages")
+load("@meet_npm//apps/meet:next/package_json.bzl", next = "bin")
+load("@meet_npm//apps/meet:typescript/package_json.bzl", typescript = "bin")
+load("@meet_npm//apps/meet:eslint/package_json.bzl", eslint = "bin")
+load("@meet_npm//apps/meet:prettier/package_json.bzl", prettier = "bin")
+load("@meet_npm//apps/meet:serve/package_json.bzl", serve = "bin")
+
+package(default_visibility = ["//visibility:public"])
+filegroup(name = "workflow_inputs", srcs = glob(["*.md", "docs/**/*.md", "Justfile", "*.json", "*.yaml", "scripts/*.sh"], allow_empty = True))
+exports_files(["package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml"])
+
+npm_link_all_packages(name = "node_modules", imported_links = [link_web_for_meet])
+
+filegroup(
+    name = "sources",
+    srcs = glob(["app/**", "components/**", "hooks/**", "lib/**", "scripts/**", "public/**", "*.json", "*.mjs", "*.ts"]),
+)
+
+next.next_binary(name = "next")
+prettier.prettier_binary(name = "prettier")
+
+js_run_binary(
+    name = "export",
+    tool = ":next",
+    srcs = [":sources", ":node_modules"],
+    # Turbopack rejects Bazel's declared source symlinks outside its filesystem root.
+    args = ["build", "--webpack"],
+    chdir = package_name(),
+    env = {"NEXT_TELEMETRY_DISABLED": "1", "NEXT_PUBLIC_PULSEBEAM_SERVER_URL": "https://demo.pulsebeam.dev"},
+    out_dirs = ["out", ".next"],
+)
+
+js_binary(
+    name = "dev",
+    entry_point = "scripts/dev.mjs",
+    chdir = package_name(),
+    data = [":sources", ":node_modules"],
+)
+
+typescript.tsc_test(
+    name = "types",
+    args = ["--noEmit"],
+    chdir = package_name(),
+    data = [":sources", ":node_modules", ":export"],
+)
+
+eslint.eslint_test(
+    name = "eslint",
+    chdir = package_name(),
+    data = [":sources", ":node_modules"],
+)
+
+copy_to_directory(name = "format_sources", srcs = [":sources"])
+
+py_test(
+    name = "format",
+    srcs = ["//tools:check-js-format.py"],
+    main = "//tools:check-js-format.py",
+    args = ["--formatter", "$(rootpath :prettier)", "--source", "$(rootpath :format_sources)", "--", "app/**/*.{css,ts,tsx}", "components/**/*.{ts,tsx}", "hooks/**/*.ts", "lib/**/*.ts", "scripts/**/*.mjs", "*.{json,mjs,ts}"],
+    data = [":prettier", ":format_sources"],
+)
+
+js_test(
+    name = "boundary",
+    entry_point = "scripts/check-boundary.mjs",
+    chdir = package_name(),
+    data = [":sources", "pnpm-lock.yaml"],
+)
+
+js_test(
+    name = "identity_contract",
+    entry_point = "scripts/check-identity-contract.mjs",
+    chdir = package_name(),
+    data = [":sources"],
+)
+
+js_test(
+    name = "artifact",
+    entry_point = "scripts/check-artifact.mjs",
+    chdir = package_name(),
+    data = [":export"],
+)
+
+output_files(name = "framework_types", target = ":export", paths = [package_name() + "/.next"])
+output_files(name = "static_export", target = ":export", paths = [package_name() + "/out"])
+serve.serve_binary(name = "preview", args = ["$(rootpath :static_export)"], data = [":static_export"])
+
+test_suite(name = "check", tests = [":types", ":eslint", ":format", ":boundary", ":identity_contract", ":artifact"])

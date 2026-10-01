@@ -7,7 +7,7 @@ import {
   type Agent,
   type AgentSnapshot,
 } from "@pulsebeam/web";
-import { RemoteCatalog } from "../../../pulsebeam-agent-web/dist/remote-catalog.js";
+import { RemoteCatalog } from "../../node_modules/@pulsebeam/web/dist/remote-catalog.js";
 
 const waitFor = async (predicate: () => boolean, phase: string) => {
   for (let index = 0; index < 200; index++) {

@@ -3264,6 +3264,7 @@ dependencies = [
  "pulsebeam-runtime",
  "pulsebeam-testdata",
  "rand 0.10.2",
+ "rust-embed",
  "rustix",
  "serde",
  "serde_json",
@@ -3500,6 +3501,16 @@ version = "0.3.2"
 dependencies = [
  "sha2",
  "zstd",
+]
+
+[[package]]
+name = "pulsebeam-wasm-proof-deps"
+version = "0.0.0"
+dependencies = [
+ "pulsebeam-agent-core",
+ "pulsebeam-agent-web",
+ "uniffi-runtime-javascript",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -3888,6 +3899,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "rust-embed-utils",
+ "shellexpand",
  "syn 2.0.117",
  "walkdir",
 ]
@@ -4320,6 +4332,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f40ca3c46823713e0d4209592e8d6e826aa57e928f09752619fc696c499637f6"
 dependencies = [
  "lazy_static",
+]
+
+[[package]]
+name = "shellexpand"
+version = "3.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32824fab5e16e6c4d86dc1ba84489390419a39f97699852b66480bb87d297ed8"
+dependencies = [
+ "dirs",
 ]
 
 [[package]]
@@ -5310,6 +5331,16 @@ dependencies = [
  "uniffi_core",
  "uniffi_macros",
  "uniffi_pipeline",
+]
+
+[[package]]
+name = "uniffi-runtime-javascript"
+version = "0.31.0-5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c5d53d7e11b458c183554ed521ca8407e7368170846bbee354744ca2f5406304"
+dependencies = [
+ "uniffi_core",
+ "wasm-bindgen",
 ]
 
 [[package]]

@@ -3,8 +3,8 @@
 The official PulseBeam documentation site, built with VitePress.
 
 ```bash
-just dev
+./bazel run //:docs_dev
 ```
 
-Run `just check` to build the static site and validate links before submitting a
+Run `./bazel test //docs:check` to build the static site and validate links before submitting a
 change.

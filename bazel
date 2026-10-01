@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+set -euo pipefail
+# Only the launcher is bootstrapped outside Bazel's dependency graph.
+[[ $(uname -s) == Linux ]] || { echo 'PulseBeam requires a supported Linux host.' >&2; exit 1; }
+case $(uname -m) in
+  x86_64) arch=amd64; sha=e1508323f347ad1465a887bc5d2bfb91cffc232d11e8e997b623227c6b32fb76 ;;
+  aarch64|arm64) arch=arm64; sha=bb608519a440d45d10304eb684a73a2b6bb7699c5b0e5434361661b25f113a5d ;;
+  *) echo 'Development supports Linux x86_64; release-only builds also support Linux aarch64.' >&2; exit 1 ;;
+esac
+cache="${XDG_CACHE_HOME:-$HOME/.cache}/pulsebeam/bazelisk-1.27.0-$arch"
+mkdir -p "$cache"
+launcher="$cache/bazelisk"
+if [[ ! -f "$launcher" ]]; then
+  command -v curl >/dev/null || { echo 'Install curl and CA certificates to bootstrap Bazel.' >&2; exit 1; }
+  tmp=$(mktemp "$cache/download.XXXXXX")
+  trap 'rm -f "$tmp"' EXIT
+  curl --fail --location --retry 3 "https://github.com/bazelbuild/bazelisk/releases/download/v1.27.0/bazelisk-linux-$arch" -o "$tmp"
+  echo "$sha  $tmp" | sha256sum --check --status || { echo 'Bazelisk download checksum mismatch.' >&2; exit 1; }
+  chmod +x "$tmp"
+  mv "$tmp" "$launcher"
+fi
+echo "$sha  $launcher" | sha256sum --check --status || { echo "Corrupt launcher: remove $launcher and retry." >&2; exit 1; }
+export BAZELISK_SKIP_WRAPPER=1
+exec "$launcher" "$@"

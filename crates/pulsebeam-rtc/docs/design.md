@@ -1064,21 +1064,21 @@ Acceptance requires:
   mutually exclusive RFC 8888/TWCC negotiation are explicit `unsupported`
   records, never silent skips.
 
-Normal `cargo test` is browser-free. The canonical RTC local and CI command is:
+The Bazel fast gate is browser-free. The canonical RTC local and CI command is:
 
 ```sh
-just --justfile crates/pulsebeam-rtc/Justfile test-slow
+./bazel test //crates/pulsebeam-rtc:chrome //crates/pulsebeam-rtc:firefox //crates/pulsebeam-rtc:rfc8888
 ```
 
-It provisions/verifies the fixed cache and runs the RFC 8888 peer and both exact
-ignored browser matrices. Logs, exact offer inputs, and JSON reports are
-emitted under `target/pulsebeam-rtc-browser-artifacts` and uploaded by CI. Run
-root `just test` for complete workspace acceptance, including consumer-owned Web
+It provisions verified graph-owned browser/driver inputs and runs the local
+RFC 8888 peer and both exact browser matrices. Logs, exact offer inputs, and JSON
+reports are emitted under isolated `bazel-testlogs` outputs and retained by CI. Run
+root `./bazel test //:test` for complete workspace acceptance, including consumer-owned Web
 and React browser coverage. Other platforms, ICE restart, and renegotiation
 remain outside the v3 profile.
 
 Scaling measurements are separate from test gates. Run the Criterion matrix with
-`just --justfile crates/pulsebeam-rtc/Justfile bench`. It measures timer/poll
+`./bazel run //:benchmark`. It measures timer/poll
 scheduling for 1/16/64 connections and 1/8/32 senders, excluding fixture setup and
 teardown. This initial-burst workload is not sustained network throughput
 evidence. Benchmark reports and baselines are emitted under `target/criterion`.

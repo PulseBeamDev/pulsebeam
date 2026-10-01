@@ -16,8 +16,8 @@ Shared mutable packet state, cross-shard handles, blocking calls, and
 multi-atomic snapshots are architectural regressions. Cross-shard and
 cross-node coordination uses owned messages.
 
-Run focused crate tests while iterating. Before handoff, run root `just check`
-and `just test`. UDP steering is an extension point: higher layers can provide
-a `Steering` implementation through `NodeBuilder::with_steering`. Server
-development, profiling, traffic shaping, and cleanup helpers live in this
-crate's `Justfile`.
+Run focused crate tests while iterating. Before handoff, run root `./bazel test //:check`
+and `./bazel test //:test`. UDP steering is an extension point: higher layers can provide
+a `Steering` implementation through `NodeBuilder::with_steering`. Server development and profiling entrypoints are documented in
+[the Bazel workflow](../../docs/build.md). Privileged traffic shaping remains
+an optional manual diagnostic, not package preparation or acceptance.

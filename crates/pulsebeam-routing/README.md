@@ -12,6 +12,6 @@ Keep the crate `no_std`, heap-free, and panic-free on malformed input.
 Packet-derived offsets need checked arithmetic and bounds-checked reads. Narrow
 lookup-table indexing exceptions require a reasoned lint allowance.
 
-Run `cargo test -p pulsebeam-routing` while iterating. Higher-level steering
+Run `./bazel test //crates/pulsebeam-routing:unit_tests` while iterating. Higher-level steering
 extensions are responsible for validating any additional platform-specific
 constraints they impose.

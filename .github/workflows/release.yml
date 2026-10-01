@@ -1,301 +1,116 @@
-# Repository-owned cargo-dist release workflow.
-#
-# Copyright 2022-2024, axodotdev
-# SPDX-License-Identifier: MIT or Apache-2.0
-#
-# CI that:
-#
-# * checks for a Git Tag that looks like a release
-# * builds artifacts with dist (archives, installers, hashes)
-# * uploads those artifacts to temporary workflow zip
-# * on success, uploads the artifacts to a GitHub Release
-#
-# Note that the GitHub Release will be created with a generated
-# title/body based on your changelogs.
-
 name: Release
-permissions:
-  "contents": "write"
-
-# This task will run whenever you push a git tag that looks like a version
-# like "1.0.0", "v0.1.0-prerelease.1", "my-app/0.1.0", "releases/v1.0.0", etc.
-# Various formats will be parsed into a VERSION and an optional PACKAGE_NAME, where
-# PACKAGE_NAME must be the name of a Cargo package in your workspace, and VERSION
-# must be a Cargo-style SemVer Version (must have at least major.minor.patch).
-#
-# If PACKAGE_NAME is specified, then the announcement will be for that
-# package (erroring out if it doesn't have the given version or isn't dist-able).
-#
-# If PACKAGE_NAME isn't specified, then the announcement will be for all
-# (dist-able) packages in the workspace with that version (this mode is
-# intended for workspaces with only one dist-able package, or with all dist-able
-# packages versioned/released in lockstep).
-#
-# If you push multiple tags at once, separate instances of this workflow will
-# spin up, creating an independent announcement for each one. However, GitHub
-# will hard limit this to 3 tags per commit, as it will assume more tags is a
-# mistake.
-#
-# If there's a prerelease-style suffix to the version, then the release(s)
-# will be marked as a prerelease.
 on:
   push:
-    tags:
-      - '**[0-9]+.[0-9]+.[0-9]+*'
-
+    tags: ['pulsebeam-v*']
+permissions:
+  contents: read
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 jobs:
-  # Run 'dist plan' (or host) to determine what tasks we need to do
   plan:
-    runs-on: "ubuntu-24.04"
+    runs-on: ubuntu-24.04
     outputs:
-      val: ${{ steps.plan.outputs.manifest }}
-      tag: ${{ !github.event.pull_request && github.ref_name || '' }}
-      publishing: ${{ !github.event.pull_request }}
-    env:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      plan: ${{ steps.plan.outputs.plan }}
     steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-          submodules: recursive
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: just
-      - name: Install dist
-        # we specify bash to get pipefail; it guards against the `curl` command
-        # failing. otherwise `sh` won't catch that `curl` returned non-0
-        shell: bash
-        run: "curl --proto '=https' --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.30.3/cargo-dist-installer.sh | sh"
-      - name: Cache dist
-        uses: actions/upload-artifact@v4
-        with:
-          name: cargo-dist-cache
-          path: ~/.cargo/bin/dist
-      # sure would be cool if github gave us proper conditionals...
-      # so here's a doubly-nested ternary-via-truthiness to try to provide the best possible
-      # functionality based on whether this is a pull_request, and whether it's from a fork.
-      # (PRs run on the *source* but secrets are usually on the *target* -- that's *good*
-      # but also really annoying to build CI around when it needs secrets to work right.)
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/setup-ci
       - id: plan
-        run: just release plan "${{ !github.event.pull_request && github.ref_name || '' }}"
-      - name: "Upload dist-manifest.json"
-        uses: actions/upload-artifact@v4
-        with:
-          name: artifacts-plan-dist-manifest
-          path: plan-dist-manifest.json
-
-  custom-ci:
+        name: Validate version tag against package authority
+        run: |
+          plan=$(./bazel run //release:plan -- --tag "$GITHUB_REF_NAME")
+          echo "plan=$plan" >> "$GITHUB_OUTPUT"
+  checks:
+    needs: plan
     uses: ./.github/workflows/ci.yml
-    secrets: inherit
-
-  # Build and packages all the platform-specific things
-  build-local-artifacts:
-    name: build-local-artifacts (${{ join(matrix.targets, ', ') }})
-    # Let the initial task tell us to not run (currently very blunt)
-    needs:
-      - plan
-      - custom-ci
-    if: ${{ fromJson(needs.plan.outputs.val).ci.github.artifacts_matrix.include != null && (needs.plan.outputs.publishing == 'true' || fromJson(needs.plan.outputs.val).ci.github.pr_run_mode == 'upload') }}
+  binaries:
+    needs: [plan, checks]
     strategy:
       fail-fast: false
-      # Target platforms/runners are computed by dist in create-release.
-      # Each member of the matrix has the following arguments:
-      #
-      # - runner: the github runner
-      # - dist-args: cli flags to pass to dist
-      # - install-dist: expression to run to install dist on the runner
-      #
-      # Typically there will be:
-      # - 1 "global" task that builds universal installers
-      # - N "local" tasks that build each platform's binaries and platform-specific installers
-      matrix: ${{ fromJson(needs.plan.outputs.val).ci.github.artifacts_matrix }}
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
     runs-on: ${{ matrix.runner }}
-    container: ${{ matrix.container && matrix.container.image || null }}
-    env:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      BUILD_MANIFEST_NAME: target/distrib/${{ join(matrix.targets, '-') }}-dist-manifest.json
     steps:
-      - name: enable windows longpaths
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/setup-ci
+      - name: Build architecture-appropriate release assets
         run: |
-          git config --global core.longpaths true
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-          submodules: recursive
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: just
-      - name: Install Rust non-interactively if not already installed
-        if: ${{ matrix.container }}
+          ./bazel build --config=release //release:local //release:global
+          ./bazel test --config=release //release:contract --test_output=errors
+      - name: Validate hashes and executable target
         run: |
-          if ! command -v cargo > /dev/null 2>&1; then
-            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-            echo "$HOME/.cargo/bin" >> $GITHUB_PATH
-          fi
-      - name: Install dist
-        run: ${{ matrix.install_dist.run }}
-      # Get the dist-manifest
-      - name: Fetch local artifacts
-        uses: actions/download-artifact@v4
+          cd bazel-bin/release/artifacts
+          sha256sum --check *.sha256
+          temporary=$(mktemp -d)
+          tar -xJf pulsebeam-${{ matrix.target }}.tar.xz -C "$temporary"
+          "$temporary/pulsebeam-${{ matrix.target }}/pulsebeam" --version
+          rm -rf "$temporary"
+      - uses: actions/upload-artifact@v4
         with:
-          pattern: artifacts-*
-          path: target/distrib/
-          merge-multiple: true
-      - name: Install dependencies
-        run: |
-          ${{ matrix.packages_install }}
-      - id: cargo-dist
-        name: Build artifacts
-        shell: bash
-        run: just release local "$BUILD_MANIFEST_NAME" "${{ needs.plan.outputs.tag || '-' }}" ${{ matrix.dist_args }}
-      - name: "Upload artifacts"
-        uses: actions/upload-artifact@v4
+          name: release-${{ matrix.target }}
+          path: bazel-bin/release/artifacts/*
+          if-no-files-found: error
+  global:
+    needs: [plan, checks]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/setup-ci
+      - run: ./bazel build //release:global
+      - uses: actions/upload-artifact@v4
         with:
-          name: artifacts-build-local-${{ join(matrix.targets, '_') }}
-          path: |
-            ${{ steps.cargo-dist.outputs.paths }}
-            ${{ env.BUILD_MANIFEST_NAME }}
-
-  custom-docker:
-    needs:
-      - plan
-      - custom-ci
-    if: ${{ needs.plan.outputs.publishing == 'true' || fromJson(needs.plan.outputs.val).ci.github.pr_run_mode == 'upload' }}
+          name: release-global
+          path: bazel-bin/release/global-artifacts/*
+          if-no-files-found: error
+  validate_image:
+    needs: [plan, checks]
     uses: ./.github/workflows/docker.yml
     with:
-      plan: ${{ needs.plan.outputs.val }}
-    secrets: inherit
+      plan: ${{ needs.plan.outputs.plan }}
+      validate_only: true
     permissions:
-      "actions": "read"
-      "attestations": "write"
-      "checks": "write"
-      "contents": "write"
-      "discussions": "read"
-      "id-token": "write"
-      "issues": "read"
-      "packages": "write"
-      "pull-requests": "read"
-      "repository-projects": "read"
-      "security-events": "read"
-      "statuses": "read"
-
-  # Build and package all the platform-agnostic(ish) things
-  build-global-artifacts:
-    needs:
-      - plan
-      - build-local-artifacts
-      - custom-docker
-    runs-on: "ubuntu-24.04"
-    env:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      BUILD_MANIFEST_NAME: target/distrib/global-dist-manifest.json
+      contents: read
+      packages: write
+  publish:
+    needs: [plan, binaries, global, validate_image]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
         with:
-          persist-credentials: false
-          submodules: recursive
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: just
-      - name: Install cached dist
-        uses: actions/download-artifact@v4
-        with:
-          name: cargo-dist-cache
-          path: ~/.cargo/bin/
-      - run: chmod +x ~/.cargo/bin/dist
-      # Get all the local artifacts for the global tasks to use (for e.g. checksums)
-      - name: Fetch local artifacts
-        uses: actions/download-artifact@v4
-        with:
-          pattern: artifacts-*
-          path: target/distrib/
-          merge-multiple: true
-      - id: cargo-dist
-        shell: bash
-        run: just release global "$BUILD_MANIFEST_NAME" "${{ needs.plan.outputs.tag || '-' }}"
-      - name: "Upload artifacts"
-        uses: actions/upload-artifact@v4
-        with:
-          name: artifacts-build-global
-          path: |
-            ${{ steps.cargo-dist.outputs.paths }}
-            ${{ env.BUILD_MANIFEST_NAME }}
-  # Determines if we should publish/announce
-  host:
-    needs:
-      - plan
-      - build-local-artifacts
-      - custom-docker
-      - build-global-artifacts
-    # Only run if we're "publishing", and only if plan, local and global didn't fail (skipped is fine)
-    if: ${{ always() && needs.plan.result == 'success' && needs.plan.outputs.publishing == 'true' && needs.build-global-artifacts.result == 'success' && needs.build-local-artifacts.result == 'success' && needs.custom-docker.result == 'success' }}
-    env:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-    runs-on: "ubuntu-24.04"
-    outputs:
-      val: ${{ steps.host.outputs.manifest }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-          submodules: recursive
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: just
-      - name: Install cached dist
-        uses: actions/download-artifact@v4
-        with:
-          name: cargo-dist-cache
-          path: ~/.cargo/bin/
-      - run: chmod +x ~/.cargo/bin/dist
-      # Fetch artifacts from scratch-storage
-      - name: Fetch artifacts
-        uses: actions/download-artifact@v4
-        with:
-          pattern: artifacts-*
-          path: target/distrib/
-          merge-multiple: true
-      - id: host
-        shell: bash
-        run: just release host "${{ needs.plan.outputs.tag }}"
-      - name: "Upload dist-manifest.json"
-        uses: actions/upload-artifact@v4
-        with:
-          # Overwrite the previous copy
-          name: artifacts-dist-manifest
-          path: dist-manifest.json
-      # Create a GitHub Release while uploading all files to it
-      - name: "Download GitHub Artifacts"
-        uses: actions/download-artifact@v4
-        with:
-          pattern: artifacts-*
+          pattern: release-*
           path: artifacts
           merge-multiple: true
-      - name: Cleanup
+      - name: Validate complete assembly before publication
         run: |
-          # Remove the granular manifests
-          rm -f artifacts/*-dist-manifest.json
-      - name: Create GitHub Release
+          cd artifacts
+          sha256sum --check *.sha256
+          for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
+            test -s "pulsebeam-$target.tar.xz"
+            test -s "pulsebeam-$target-update"
+          done
+          test -s pulsebeam-installer.sh
+      - name: Publish GitHub release
         env:
-          PRERELEASE_FLAG: "${{ fromJson(steps.host.outputs.manifest).announcement_is_prerelease && '--prerelease' || '' }}"
-          ANNOUNCEMENT_TITLE: "${{ fromJson(steps.host.outputs.manifest).announcement_title }}"
-          ANNOUNCEMENT_BODY: "${{ fromJson(steps.host.outputs.manifest).announcement_github_body }}"
-          RELEASE_COMMIT: "${{ github.sha }}"
-        run: just release publish "${{ needs.plan.outputs.tag }}" "$RELEASE_COMMIT" artifacts
-
-  announce:
-    needs:
-      - plan
-      - host
-    # use "always() && ..." to allow us to wait for all publish jobs while
-    # still allowing individual publish jobs to skip themselves (for prereleases).
-    # "host" however must run to completion, no skipping allowed!
-    if: ${{ always() && needs.host.result == 'success' }}
-    runs-on: "ubuntu-24.04"
-    env:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-          submodules: recursive
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          PRERELEASE: ${{ fromJSON(needs.plan.outputs.plan).prerelease }}
+        run: |
+          args=()
+          if [[ "$PRERELEASE" == true ]]; then args+=(--prerelease); fi
+          gh release create "$GITHUB_REF_NAME" artifacts/* --verify-tag --generate-notes "${args[@]}"
+  docker:
+    needs: [plan, publish]
+    uses: ./.github/workflows/docker.yml
+    with:
+      plan: ${{ needs.plan.outputs.plan }}
+      reuse_image: true
+    permissions:
+      contents: read
+      packages: write
+    secrets: inherit

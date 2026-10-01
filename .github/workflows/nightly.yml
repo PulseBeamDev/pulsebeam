@@ -1,59 +1,40 @@
-# Seed search. Deliberately not a gate.
-#
-# `ci.yml` runs the simulation at committed seeds, so it is deterministic and
-# can never flake. This job does the opposite job: it runs the same plans at
-# seeds nobody has tried, looking for the interleaving that breaks one.
-#
-# It must never block a merge. A failure here is a lead, not a broken build —
-# the output is a seed to reproduce, fix, and then promote into a plan's seed
-# list so `ci.yml` guards it from then on. See
-# crates/pulsebeam-simulator/docs/simulation.md.
+# Advisory and replayable seed search, never a merge gate.
 name: Nightly seed sweep
-
 on:
   schedule:
-    # 04:00 UTC, off the working day.
     - cron: '0 4 * * *'
   workflow_dispatch:
     inputs:
       seeds:
-        description: 'How many seeds to run'
+        description: How many seeds to run
         required: false
         default: '24'
       from:
-        description: 'First seed'
+        description: First seed
         required: false
         default: '1'
-
-env:
-  CARGO_TERM_COLOR: always
-
+permissions:
+  contents: read
 jobs:
   sweep:
-    runs-on: ubuntu-latest
-    # Seeds run in parallel lanes and skip the plans no seed changes, so the
-    # count is set by the budget rather than by one seed's wall time. The cap
-    # exists so a hung plan cannot burn the runner.
+    runs-on: ubuntu-24.04
     timeout-minutes: 120
+    continue-on-error: true
     steps:
-    - uses: actions/checkout@v5
-    - run: sudo apt-get install -y protobuf-compiler clang mold nasm pkg-config
-    - name: Run sccache-cache
-      uses: mozilla-actions/sccache-action@v0.0.10
-    - uses: taiki-e/install-action@v2
-      with:
-        tool: nextest
-    - uses: taiki-e/install-action@v2
-      with:
-        tool: just
-    # The seed window advances every night rather than replaying the same one,
-    # which is the whole point — a fixed window would just be slower CI. Derived
-    # from the run number so it is still a known range, not a mystery.
-    - name: Sweep
-      run: |
-        seeds="${{ github.event.inputs.seeds || '24' }}"
-        from="${{ github.event.inputs.from }}"
-        if [ -z "$from" ]; then
-          from=$(( ${{ github.run_number }} * seeds + 1 ))
-        fi
-        just sweep "$seeds" "$from"
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/setup-ci
+      - name: Sweep and retain replay commands
+        shell: bash
+        run: |
+          set -o pipefail
+          seeds='${{ github.event.inputs.seeds || '24' }}'
+          from='${{ github.event.inputs.from }}'
+          if [[ -z "$from" ]]; then
+            from=$(( ${{ github.run_number }} * seeds + 1 ))
+          fi
+          ./bazel run //:sweep -- --seeds "$seeds" --from-seed "$from" 2>&1 | tee seed-sweep.log
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: seed-sweep-evidence
+          path: seed-sweep.log

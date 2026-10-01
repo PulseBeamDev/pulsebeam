@@ -18,13 +18,13 @@
     }
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
-    "check": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.contracts.json && tsc -p tsconfig.browser.json",
-    "format": "prettier --write \"src/**/*.ts\" \"tests/browser/{build.mjs,*.tsx,observe.js}\" \"tests/contracts/**/*.ts\" \"tests/consumer/src/**/*.ts\" \"*.json\"",
-    "format:check": "prettier --check \"src/**/*.ts\" \"tests/browser/{build.mjs,*.tsx,observe.js}\" \"tests/contracts/**/*.ts\" \"tests/consumer/src/**/*.ts\" \"*.json\"",
-    "test": "pnpm run test:consumer",
-    "build:browser": "node tests/browser/build.mjs",
-    "test:consumer": "pnpm --dir tests/consumer install --offline --frozen-lockfile && pnpm --dir tests/consumer run check"
+    "build": "../../bazel build //agents/react:package",
+    "check": "../../bazel test //agents/react:fast",
+    "format": "../../bazel run //:fix",
+    "format:check": "../../bazel test //agents/react:format",
+    "test": "../../bazel test //agents/react:fast //agents/pulsebeam-agent-web:browser",
+    "build:browser": "../../bazel build //agents/react:browser_fixture",
+    "test:consumer": "../../bazel test //agents/react/tests/consumer:types"
   },
   "dependencies": {
     "@pulsebeam/web": "^0.1.0"

@@ -1,0 +1,80 @@
+load("@aspect_rules_js//js:defs.bzl", "js_binary", "js_run_binary")
+load("@aspect_rules_js//npm:defs.bzl", "npm_package")
+load("@bazel_lib//lib:copy_to_directory.bzl", "copy_to_directory")
+load("@rules_python//python:defs.bzl", "py_test")
+load("@react_npm//:defs.bzl", "npm_link_all_packages")
+load("@react_npm//agents/react:typescript/package_json.bzl", typescript = "bin")
+load("@react_npm//agents/react:prettier/package_json.bzl", prettier = "bin")
+
+package(default_visibility = ["//visibility:public"])
+filegroup(name = "workflow_inputs", srcs = glob(["*.md", "docs/**/*.md", "Justfile", "*.json", "*.yaml", "scripts/*.sh"], allow_empty = True))
+exports_files(["package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml"])
+filegroup(name = "browser_observer", srcs = ["tests/browser/observe.js"])
+
+npm_link_all_packages(name = "node_modules")
+typescript.tsc_binary(name = "tsc")
+prettier.prettier_binary(name = "prettier")
+
+js_run_binary(
+    name = "typescript",
+    tool = ":tsc",
+    srcs = ["tsconfig.json", ":node_modules"] + glob(["src/**"]),
+    args = ["-p", "tsconfig.json", "--outDir", "typescript"],
+    chdir = package_name(),
+    out_dirs = ["typescript"],
+)
+
+npm_package(
+    name = "package",
+    srcs = ["package.json", "LICENSE", ":typescript"],
+    data = [":node_modules"],
+    replace_prefixes = {"typescript": "dist"},
+    packable = True,
+)
+
+typescript.tsc_test(
+    name = "contracts",
+    args = ["-p", "tsconfig.contracts.json"],
+    chdir = package_name(),
+    data = [":node_modules"] + glob(["src/**", "tests/contracts/**", "tsconfig*.json"]),
+)
+
+typescript.tsc_test(
+    name = "browser_types",
+    args = ["-p", "tsconfig.browser.json"],
+    chdir = package_name(),
+    data = [":node_modules"] + glob(["src/**", "tests/browser/**", "tsconfig*.json"]),
+)
+
+copy_to_directory(
+    name = "format_sources",
+    srcs = glob(["src/**", "tests/browser/**", "tests/contracts/**", "*.json"]) + ["//agents/react/tests/consumer:sources"],
+)
+
+py_test(
+    name = "format",
+    srcs = ["//tools:check-js-format.py"],
+    main = "//tools:check-js-format.py",
+    args = ["--formatter", "$(rootpath :prettier)", "--source", "$(rootpath :format_sources)", "--", "src/**/*.ts", "tests/browser/{build.mjs,*.tsx,observe.js}", "tests/contracts/**/*.ts", "tests/consumer/src/**/*.ts", "*.json"],
+    data = [":prettier", ":format_sources"],
+)
+
+js_binary(
+    name = "browser_builder",
+    entry_point = "tests/browser/build.mjs",
+    data = [":node_modules"],
+)
+
+js_run_binary(
+    name = "browser_fixture",
+    tool = ":browser_builder",
+    srcs = [":package", ":node_modules", "//agents/pulsebeam-agent-web:package"] + glob(["src/**", "tests/browser/**"], exclude = ["tests/browser/dist/**"]),
+    args = ["tests/browser/dist", "../pulsebeam-agent-web/package/dist"],
+    chdir = package_name(),
+    out_dirs = ["tests/browser/dist"],
+)
+
+test_suite(
+    name = "fast",
+    tests = [":contracts", ":browser_types", "//agents/react/tests/consumer:contract"],
+)

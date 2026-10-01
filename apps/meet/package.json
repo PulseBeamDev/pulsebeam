@@ -4,15 +4,15 @@
   "version": "0.1.1",
   "license": "Apache-2.0",
   "scripts": {
-    "dev": "next dev",
-    "build": "next build && pnpm run artifact",
-    "start": "serve out",
-    "check": "pnpm run boundary && pnpm run identity-contract && tsc --noEmit && eslint",
-    "format": "prettier --write \"app/**/*.{css,ts,tsx}\" \"components/**/*.{ts,tsx}\" \"hooks/**/*.ts\" \"lib/**/*.ts\" \"scripts/**/*.mjs\" \"*.{json,mjs,ts}\"",
-    "format:check": "prettier --check \"app/**/*.{css,ts,tsx}\" \"components/**/*.{ts,tsx}\" \"hooks/**/*.ts\" \"lib/**/*.ts\" \"scripts/**/*.mjs\" \"*.{json,mjs,ts}\"",
-    "boundary": "node scripts/check-boundary.mjs",
-    "identity-contract": "node scripts/check-identity-contract.mjs",
-    "artifact": "node scripts/check-artifact.mjs"
+    "dev": "../../bazel run //:meet_dev --",
+    "build": "../../bazel build //:meet",
+    "start": "../../bazel run //apps/meet:preview --",
+    "check": "../../bazel test //apps/meet:check",
+    "format": "../../bazel run //:fix",
+    "format:check": "../../bazel test //apps/meet:format",
+    "boundary": "../../bazel test //apps/meet:boundary",
+    "identity-contract": "../../bazel test //apps/meet:identity_contract",
+    "artifact": "../../bazel test //apps/meet:artifact"
   },
   "dependencies": {
     "@emotion/react": "^11.14.0",

@@ -1,0 +1,11 @@
+load("@rules_go//go:def.bzl", "go_binary")
+
+package(default_visibility = ["//visibility:public"])
+exports_files(["go.mod", "go.sum"])
+
+go_binary(
+    name = "peer",
+    srcs = ["main.go"],
+    importpath = "pulsebeam.dev/rfc8888-peer",
+    deps = ["@com_github_pion_rtcp//:rtcp", "@com_github_pion_webrtc_v4//:webrtc", "@com_github_pion_webrtc_v4//pkg/media"],
+)

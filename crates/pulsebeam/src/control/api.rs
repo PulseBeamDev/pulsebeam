@@ -1498,6 +1498,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn router_serves_embedded_swagger_assets() {
+        let (controller, _) = pulsebeam_runtime::mailbox::new(1);
+        let app = router(controller, cfg(), auth_registry());
+        let redirect = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/swagger-ui")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(redirect.status(), StatusCode::SEE_OTHER);
+        assert_eq!(redirect.headers()[LOCATION], "/swagger-ui/");
+
+        for (uri, content_type) in [
+            ("/swagger-ui/", "text/html"),
+            ("/swagger-ui/swagger-ui.css", "text/css"),
+            ("/api-docs/openapi.json", "application/json"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{uri}");
+            assert!(
+                response.headers()[CONTENT_TYPE]
+                    .to_str()
+                    .unwrap()
+                    .starts_with(content_type)
+            );
+            let body = to_bytes(response.into_body(), 4 * 1024 * 1024)
+                .await
+                .unwrap();
+            assert!(!body.is_empty(), "{uri}");
+            if uri == "/api-docs/openapi.json" {
+                let document: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                assert!(document["paths"]["/native"].is_object());
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn router_exposes_native_without_legacy_signaling_routes() {
         let (controller, _) = pulsebeam_runtime::mailbox::new(1);
         let app = router(controller, cfg(), auth_registry());

@@ -1,4 +1,8 @@
 /target
+/bazel-*
+/.rules_rust_analyzer/
+/rust-project.json
+/agents/pulsebeam-agent-web/generated/
 node_modules
 dist
 **/target

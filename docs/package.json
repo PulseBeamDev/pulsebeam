@@ -4,10 +4,10 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "vitepress dev",
-    "build": "vitepress build",
-    "preview": "vitepress preview",
-    "check": "vitepress build"
+    "dev": "../bazel run //:docs_dev --",
+    "build": "../bazel build //:docs",
+    "preview": "../bazel run //docs:preview --",
+    "check": "../bazel test //docs:check"
   },
   "devDependencies": {
     "mermaid": "11.12.1",

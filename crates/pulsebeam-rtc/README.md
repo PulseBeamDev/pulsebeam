@@ -228,7 +228,7 @@ dependency and does not expose mutable controller internals.
 
 Crate checks, fixtures, deterministic tests, benchmarks, browser sources, and
 browser evidence are owned by `crates/pulsebeam-rtc`. Web and React own their
-consumer browser coverage; root `just test` runs the complete workspace
+consumer browser coverage; root `./bazel test //:test` runs the complete workspace
 acceptance gate.
 
 Required evidence includes deterministic crate-local tests and simulation for
@@ -241,7 +241,7 @@ externally scheduled wakeup per connection and avoid global scans. Run the
 Criterion scaling matrix separately from test gates:
 
 ```sh
-just --justfile crates/pulsebeam-rtc/Justfile bench
+./bazel run //:benchmark
 ```
 
 The matrix covers 1/16/64 connections with 1/8/32 senders each. Criterion measures
@@ -251,31 +251,29 @@ media admission, and teardown are excluded from timing.
 Transmits are discarded, so this measures timer/poll scheduling, not sustained
 network throughput or a simulated bandwidth/RTT path. Reports and comparison
 baselines live under `target/criterion`. Criterion arguments can be passed to the
-recipe, for example `bench --save-baseline main`.
+entrypoint, for example `./bazel run //:benchmark -- --save-baseline main`.
 
 Live pinned Chrome and Firefox sessions are required interoperability evidence.
 Differential checks against `str0m`, Ericsson SCReAM, or libwebrtc are useful
 component evidence but do not replace the documented contract or live-browser
 tests.
 
-The binding Linux x86_64 matrix is Chrome/ChromeDriver `153.0.8010.36` and
-Firefox ESR `140.15.0esr` with geckodriver `0.36.0`. Exact URLs, lengths, hashes,
-and version probes live in `browser/browser-matrix.json`. Normal `cargo test`
-runs are offline and never provision or launch a browser. Run the complete RTC
-local and CI gate with:
+The binding Linux x86_64 Chrome/ChromeDriver and Firefox ESR/geckodriver matrix
+is authoritative in `browser/browser-matrix.json`, including versions, URLs,
+lengths, hashes, and version probes. Fast RTC tests never launch browsers. Run
+the RTC interoperability boundary with:
 
 ```sh
-just --justfile crates/pulsebeam-rtc/Justfile test-slow
+./bazel test //crates/pulsebeam-rtc:chrome //crates/pulsebeam-rtc:firefox //crates/pulsebeam-rtc:rfc8888
 ```
 
-The command provisions into `target/pulsebeam-rtc-browsers/linux-x86_64`, runs
-the exact ignored Chrome and Firefox RTC matrices. Browser/driver logs, offer
-inputs, and compact JSON scenario reports are written under
-`target/pulsebeam-rtc-browser-artifacts`. Other platforms, ICE restart, and
+Bazel provisions the exact executables/drivers and Go peer as declared inputs.
+Browser/driver logs, offer inputs, and compact JSON scenario reports are written
+to isolated test outputs under `bazel-testlogs`, retained by CI on failure. Other platforms, ICE restart, and
 renegotiation are not part of the accepted v3 profile. Unsupported browser
 profile differences are recorded in each matrix report rather than skipped.
 
-Run root `just test` for complete workspace acceptance, including the
+Run root `./bazel test //:test` for complete workspace acceptance, including the
 consumer-owned Web and React browser coverage.
 
 Detailed public types, ownership decisions, alternatives considered, and their

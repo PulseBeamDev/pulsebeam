@@ -10,5 +10,5 @@ The crate must remain independent of the server's shard runtime. Types here may
 be used on either side of the wire, so parsing must validate hostile input and
 avoid assumptions tied to one executor or operating system.
 
-Run `cargo test -p pulsebeam-core` for focused work and the root `just test`
+Run `./bazel test //crates/pulsebeam-core:unit_tests` for focused work and root `./bazel test //:test`
 gate for changes consumed by the full stack.

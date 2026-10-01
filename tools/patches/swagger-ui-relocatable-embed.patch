@@ -1,0 +1,15 @@
+--- a/build.rs
++++ b/build.rs
+@@ -248,10 +248,10 @@
+         r#"
+ // This file is auto-generated during compilation, do not modify
+ #[derive(RustEmbed)]
+-#[folder = r"{}/{}/dist/"]
++#[folder = r"$OUT_DIR/{}/dist/"]
+ struct SwaggerUiDist;
+ "#,
+-        target_dir, zip_top_level_folder
++        zip_top_level_folder
+     );
+     let path = [target_dir, "embed.rs"].iter().collect::<PathBuf>();
+     fs::write(path, contents).unwrap();

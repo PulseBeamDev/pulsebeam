@@ -33,7 +33,7 @@ pub const DEFAULT_SIM_UDP_MODE: UdpMode = UdpMode::Batch;
 /// and losses these plans can produce, and then reports that point forever. The
 /// override is what lets the same suite sweep the rest of the space without
 /// giving up reproducibility: a sweep failure names its seed, and
-/// The simulator Justfile's `replay <n>` recipe replays exactly that run.
+/// `./bazel run //:replay -- --seed <n>` replays exactly that run.
 ///
 /// A malformed value is refused rather than silently ignored — a sweep that
 /// quietly ran 200 iterations of the default seed would report the opposite of

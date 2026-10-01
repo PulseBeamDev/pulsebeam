@@ -15,12 +15,26 @@ if (!modules.length) throw new Error("Export must reference module assets");
 for (const asset of modules)
   if (!asset.startsWith("/") || !existsSync(join(out, asset)))
     throw new Error(`Invalid exported asset path: ${asset}`);
-const wasm = modules.flatMap((module) =>
-  [
-    ...readFileSync(join(out, module), "utf8").matchAll(
-      /(?:"|')([^"']+\.wasm)(?:"|')/g,
+const moduleSources = modules.map((module) =>
+  readFileSync(join(out, module), "utf8"),
+);
+const publicPaths = [
+  ...new Set(
+    moduleSources.flatMap((source) =>
+      [...source.matchAll(/\b[\w$]+\.p=["'](\/[^"']*\/)["']/g)].map(
+        (match) => match[1],
+      ),
     ),
-  ].map((match) => match[1]),
+  ),
+];
+const wasm = moduleSources.flatMap((source) =>
+  [...source.matchAll(/(?:"|')([^"']+\.wasm)(?:"|')/g)].map((match) => {
+    const asset = match[1];
+    if (asset.startsWith("/")) return asset;
+    if (publicPaths.length !== 1 || !asset.startsWith("static/media/"))
+      throw new Error(`Unresolved exported WASM runtime path: ${asset}`);
+    return publicPaths[0] + asset;
+  }),
 );
 if (!wasm.length)
   throw new Error("Exported modules must reference destination WASM");

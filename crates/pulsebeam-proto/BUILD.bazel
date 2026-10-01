@@ -1,0 +1,50 @@
+load("@crates//:defs.bzl", "aliases", "crate_edition")
+load("//tools:wasm-deps.bzl", "all_crate_deps")
+load("@rules_rust//cargo:defs.bzl", "cargo_toml_env_vars", "extract_cargo_lints", "cargo_build_script")
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test", "rust_clippy_test", "rustfmt_test")
+
+package(default_visibility = ["//visibility:public"])
+filegroup(name = "workflow_inputs", srcs = glob(["*.md", "docs/**/*.md", "Justfile", "scripts/*.sh"], allow_empty = True))
+exports_files(["Cargo.toml"])
+filegroup(name = "cargo_metadata_inputs", srcs = glob(["Cargo.toml", "uniffi.toml", "src/**/*.rs", "benches/**/*.rs", "examples/**/*.rs"], allow_empty = True))
+
+cargo_toml_env_vars(name = "cargo_env", src = "Cargo.toml", workspace = "//:Cargo.toml")
+extract_cargo_lints(name = "lints", manifest = "Cargo.toml", workspace = "//:Cargo.toml")
+
+cargo_build_script(
+    name = "build_script",
+    srcs = ["build.rs"],
+    edition = crate_edition(),
+    deps = all_crate_deps(build = True),
+    proc_macro_deps = all_crate_deps(build_proc_macro = True),
+    data = glob(["proto/**"]),
+    tools = ["@protobuf//:protoc"],
+    build_script_env = {"PROTOC": "$(execpath @protobuf//:protoc)"},
+)
+
+rust_library(
+    name = "pulsebeam-proto",
+    crate_root = "src/lib.rs",
+    srcs = glob(["src/**/*.rs"], exclude = ["src/bin/**", "src/reliable.rs", "src/signaling.rs"]),
+    compile_data = glob(["README.md", "src/**"], exclude = ["src/**/*.rs"]),
+    edition = crate_edition(),
+    crate_features = [],
+    rustc_env_files = [":cargo_env"],
+    lint_config = ":lints",
+    aliases = aliases(),
+    deps = all_crate_deps(normal = True) + [":build_script"],
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+)
+
+rust_test(
+    name = "unit_tests",
+    crate = ":pulsebeam-proto",
+    lint_config = ":lints",
+    aliases = aliases(normal_dev = True, proc_macro_dev = True),
+    deps = all_crate_deps(normal_dev = True),
+    proc_macro_deps = all_crate_deps(proc_macro_dev = True),
+    
+)
+
+rustfmt_test(name = "format", targets = [":pulsebeam-proto"])
+rust_clippy_test(name = "clippy", targets = [":pulsebeam-proto", ":unit_tests"])

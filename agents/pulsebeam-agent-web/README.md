@@ -151,9 +151,10 @@ idempotent.
 
 ## Development
 
-`just --justfile agents/pulsebeam-agent-web/Justfile check` checks the WASM
-runtime and strict public TypeScript contract. `just --justfile
-agents/pulsebeam-agent-web/Justfile test-fast` builds the package and runs the
-deterministic Rust boundary tests. `just --justfile
-agents/pulsebeam-agent-web/Justfile test-slow` verifies the pinned browser,
-rebuilds the Web and React fixtures, and runs the browser contracts.
+`./bazel build //:web` builds the package, WASM runtime, and bindings in graph order.
+`./bazel test //agents/pulsebeam-agent-web:public_contract //agents/pulsebeam-agent-web:uniffi_types //agents/pulsebeam-agent-web:uniffi_contract`
+checks public TypeScript and generated contracts. `./bazel test
+//agents/pulsebeam-agent-web:unit_tests` runs the deterministic Rust boundary tests.
+`./bazel test //agents/pulsebeam-agent-web:browser` provisions the pinned browser,
+builds declared Web/React fixtures, and runs the browser contracts.
+`./bazel run //:web_dev` serves the Web example. See [editor setup](../../docs/ide.md).

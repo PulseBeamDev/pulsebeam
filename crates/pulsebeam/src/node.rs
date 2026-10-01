@@ -130,7 +130,12 @@ mod shard_executor {
     #[cfg(not(feature = "sim"))]
     mod imp {
         use super::*;
-        use std::sync::atomic::{AtomicUsize, Ordering};
+        #[allow(
+            clippy::disallowed_types,
+            reason = "one independent thread-start sequence counter, not a multi-atomic snapshot"
+        )]
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::atomic::Ordering;
 
         /// Owns the dedicated Tokio runtime used only by data-plane shard tasks.
         ///
@@ -142,6 +147,10 @@ mod shard_executor {
 
         impl WorkStealingRuntime {
             fn build(data_threads: usize, cpu_cores: &[core_affinity::CoreId]) -> Result<Self> {
+                #[allow(
+                    clippy::disallowed_types,
+                    reason = "one independent thread-start sequence counter, not a multi-atomic snapshot"
+                )]
                 let next_worker = AtomicUsize::new(0);
                 let worker_cores = cpu_cores.to_vec();
 
@@ -165,11 +174,10 @@ mod shard_executor {
                         return;
                     }
 
-                    let core_id = if worker_cores.is_empty() {
-                        None
-                    } else {
-                        worker_cores.get(worker_idx % worker_cores.len()).copied()
-                    };
+                    let core_id = worker_idx
+                        .checked_rem(worker_cores.len())
+                        .and_then(|index| worker_cores.get(index))
+                        .copied();
 
                     let realtime = tune_current_data_thread(core_id);
                     metrics::gauge!(
@@ -188,11 +196,11 @@ mod shard_executor {
                 })
             }
 
-            fn handle(&self) -> &tokio::runtime::Handle {
+            fn handle(&self) -> Result<&tokio::runtime::Handle> {
                 self.runtime
                     .as_ref()
-                    .expect("work-stealing data runtime is alive")
-                    .handle()
+                    .map(tokio::runtime::Runtime::handle)
+                    .context("work-stealing data runtime is not alive")
             }
         }
 
@@ -278,14 +286,14 @@ mod shard_executor {
                         let shard = launch()?;
                         // Dropping a Tokio JoinHandle detaches the task; the
                         // dedicated Runtime remains its owner and shuts it down.
-                        drop(runtime.handle().spawn(ignore(shard.run())));
+                        drop(runtime.handle()?.spawn(ignore(shard.run())));
                     }
                     Execution::ThreadPerCore { cpu_cores, threads } => {
-                        let core_id = if cpu_cores.is_empty() {
-                            None
-                        } else {
-                            cpu_cores.get(shard_id.index() % cpu_cores.len()).copied()
-                        };
+                        let core_id = shard_id
+                            .index()
+                            .checked_rem(cpu_cores.len())
+                            .and_then(|index| cpu_cores.get(index))
+                            .copied();
 
                         let handle = std::thread::Builder::new()
                             .name(format!("pb-w-{shard_id}"))

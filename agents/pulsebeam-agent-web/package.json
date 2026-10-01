@@ -19,14 +19,11 @@
     }
   },
   "scripts": {
-    "build:uniffi": "ubrn build web --config ubrn.config.yaml",
-    "build:wasm": "wasm-pack build --target web --out-dir dist/wasm --out-name pulsebeam_agent_web && touch dist/wasm/.npmignore",
-    "build:ts": "tsc -p tsconfig.json",
-    "build": "pnpm run build:wasm && pnpm run build:ts",
-    "check": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.public-contract.json",
-    "format": "prettier --write \"web/**/*.ts\" \"tests/**/*.{js,ts}\" \"*.{json,mjs}\" ubrn.config.yaml pnpm-workspace.yaml",
-    "format:check": "prettier --check \"web/**/*.ts\" \"tests/**/*.{js,ts}\" \"*.{json,mjs}\" ubrn.config.yaml pnpm-workspace.yaml",
-    "test": "just test-fast"
+    "build": "../../bazel build //agents/pulsebeam-agent-web:package",
+    "generate": "../../bazel build //agents/pulsebeam-agent-web:uniffi_bindings",
+    "check": "../../bazel test //agents/pulsebeam-agent-web:public_contract //agents/pulsebeam-agent-web:uniffi_types //agents/pulsebeam-agent-web:uniffi_contract",
+    "format": "../../bazel run //agents/pulsebeam-agent-web:fix",
+    "test": "../../bazel test //agents/pulsebeam-agent-web:unit_tests //agents/pulsebeam-agent-web:browser"
   },
   "dependencies": {
     "@ubjs/core": "0.31.0-5"
@@ -34,6 +31,6 @@
   "devDependencies": {
     "prettier": "3.6.2",
     "typescript": "~5.9.3",
-    "uniffi-bindgen-react-native": "github:jhugman/uniffi-bindgen-react-native#f5865e794e4507809f2b2bfea1d9fc00f4882322"
+    "typescript-language-server": "5.1.3"
   }
 }

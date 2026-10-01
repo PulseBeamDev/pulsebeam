@@ -1,0 +1,31 @@
+load("@aspect_rules_js//js:defs.bzl", "js_run_binary")
+load("@bazel_skylib//rules:build_test.bzl", "build_test")
+load("@docs_npm//:defs.bzl", "npm_link_all_packages")
+load("@docs_npm//docs:vitepress/package_json.bzl", vitepress = "bin")
+
+package(default_visibility = ["//visibility:public"])
+filegroup(name = "workflow_inputs", srcs = glob(["*.md", "Justfile", "*.json", "*.yaml"], allow_empty = True))
+exports_files(["package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml"])
+
+npm_link_all_packages(name = "node_modules")
+filegroup(name = "sources", srcs = glob(["*.md", "public/**", ".vitepress/*.mts", "*.json"]))
+vitepress.vitepress_binary(name = "vitepress")
+
+js_run_binary(
+    name = "site",
+    tool = ":vitepress",
+    srcs = [":sources", ":node_modules"],
+    args = ["build"],
+    chdir = package_name(),
+    out_dirs = [".vitepress/dist", ".vitepress/cache"],
+)
+
+vitepress.vitepress_binary(name = "preview", args = ["preview"], chdir = package_name(), data = [":sources", ":node_modules", ":site"])
+build_test(name = "check", targets = [":site"])
+
+vitepress.vitepress_binary(
+    name = "dev",
+    args = ["dev"],
+    chdir = package_name(),
+    data = [":sources", ":node_modules"],
+)

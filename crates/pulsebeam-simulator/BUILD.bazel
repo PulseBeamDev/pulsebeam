@@ -1,0 +1,92 @@
+load("@crates//:defs.bzl", "aliases", "all_crate_deps", "crate_edition")
+load("@rules_rust//cargo:defs.bzl", "cargo_toml_env_vars", "extract_cargo_lints")
+load("@rules_rust//rust:defs.bzl", "rust_clippy_test", "rust_test", "rustfmt_test")
+load("@rules_python//python:defs.bzl", "py_binary", "py_test")
+
+package(default_visibility = ["//visibility:public"])
+filegroup(name = "workflow_inputs", srcs = glob(["*.md", "docs/**/*.md", "Justfile", "scripts/*.sh"], allow_empty = True))
+exports_files(["Cargo.toml"])
+filegroup(name = "cargo_metadata_inputs", srcs = glob(["Cargo.toml", "uniffi.toml", "src/**/*.rs", "benches/**/*.rs", "examples/**/*.rs"], allow_empty = True))
+cargo_toml_env_vars(name = "cargo_env", src = "Cargo.toml", workspace = "//:Cargo.toml")
+extract_cargo_lints(name = "lints", manifest = "Cargo.toml", workspace = "//:Cargo.toml")
+
+rust_test(
+    name = "test_binary",
+    crate_name = "pulsebeam_simulator",
+    crate_root = "src/main.rs",
+    srcs = glob(["src/**/*.rs"]),
+    edition = crate_edition(),
+    crate_features = ["parking_lot"],
+    lint_config = ":lints",
+    rustc_env_files = [":cargo_env"],
+    rustc_flags = ["-Copt-level=2", "-Cdebug-assertions=yes", "-Coverflow-checks=yes"],
+    aliases = aliases(normal_dev = True, proc_macro_dev = True),
+    deps = all_crate_deps(normal_dev = True) + [
+        "//crates/pulsebeam:pulsebeam-sim",
+        "//crates/pulsebeam-core:pulsebeam-core-sim",
+        "//crates/pulsebeam-runtime:pulsebeam-runtime-sim",
+        "//crates/pulsebeam-testdata",
+        "//agents/pulsebeam-agent-core",
+        "//agents/pulsebeam-agent-native:pulsebeam-agent-native-sim",
+    ],
+    proc_macro_deps = all_crate_deps(proc_macro_dev = True),
+    tags = ["manual"],
+)
+
+# Human-authorized exception; keep the oracle and explicit replay intact.
+# See docs/native-dtls-exception.md for cause and reinstatement criteria.
+NATIVE_DTLS_EXCEPTION = ["--skip", "tests::native_runtime::native_agents_prove_media_topics_reconnect_and_close"]
+
+py_test(
+    name = "fast",
+    srcs = ["//tools:run-simulations.py"],
+    main = "//tools:run-simulations.py",
+    args = ["$(rootpath :test_binary)", "--mode", "fast"] + NATIVE_DTLS_EXCEPTION,
+    data = [":test_binary"],
+    size = "large",
+)
+
+py_test(
+    name = "slow",
+    srcs = ["//tools:run-simulations.py"],
+    main = "//tools:run-simulations.py",
+    args = ["$(rootpath :test_binary)", "--mode", "slow"],
+    data = [":test_binary"],
+    size = "enormous",
+    tags = ["slow"],
+)
+
+REPLAY_ARGS = ["$(rootpath :test_binary)", "--mode", "all"] + NATIVE_DTLS_EXCEPTION
+
+py_binary(
+    name = "replay",
+    testonly = True,
+    srcs = ["//tools:run-simulations.py"],
+    main = "//tools:run-simulations.py",
+    args = REPLAY_ARGS,
+    data = [":test_binary"],
+)
+
+py_binary(
+    name = "sweep",
+    testonly = True,
+    srcs = ["//tools:run-simulations.py"],
+    main = "//tools:run-simulations.py",
+    args = ["$(rootpath :test_binary)", "--mode", "all", "--seeds", "20", "--from-seed", "1"] + NATIVE_DTLS_EXCEPTION,
+    data = [":test_binary"],
+)
+
+py_binary(
+    name = "scoreboard",
+    testonly = True,
+    srcs = ["//tools:scoreboard.py"],
+    main = "//tools:scoreboard.py",
+    # Keep each plan's metrics adjacent to its result for deterministic grouping.
+    args = ["--runner", "$(rootpath :replay)", "--parser", "$(rootpath //tools:scoreboard_parser)"] + [
+        "--runner-arg=" + arg for arg in REPLAY_ARGS + ["--jobs", "1"]
+    ],
+    data = [":replay", ":test_binary", "//tools:scoreboard_parser"],
+)
+
+rustfmt_test(name = "format", targets = [":test_binary"])
+rust_clippy_test(name = "clippy", targets = [":test_binary"])

@@ -8,7 +8,7 @@ allow-indexing-slicing-in-tests = true
 allow-dbg-in-tests = true
 allow-print-in-tests = true
 
-# Architectural lints. See `crates/pulsebeam/docs/thread-per-core.md`; `just check` gates on
+# Architectural lints. See `crates/pulsebeam/docs/thread-per-core.md`; Bazel gates on
 # these, so a violation fails rather than scrolling past in a build log.
 #
 # Two tables below, both thread-per-core rules: `disallowed-types` keeps shared

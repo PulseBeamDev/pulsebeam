@@ -7,8 +7,10 @@ use pulsebeam_core::{
 use serde::Deserialize;
 use std::error::Error;
 use std::path::PathBuf;
-use support::{DestinationServer, StaticServer, TestResult, capabilities, evaluate_json, navigate};
-use thirtyfour::prelude::WebDriver;
+use support::{
+    DestinationServer, StaticServer, TestResult, capabilities, evaluate_json, managed_driver,
+    navigate,
+};
 use thirtyfour::testing::run_browser_test;
 
 const PUBLIC: &str = include_str!("contracts/observe-public.js");
@@ -189,12 +191,15 @@ struct React {
     audio_explicit: bool,
 }
 fn root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    PathBuf::from(
+        std::env::var_os("PULSEBEAM_WEB_FIXTURE_ROOT")
+            .expect("run SDK browser contracts through ./bazel test"),
+    )
 }
 
 async fn web(server: &StaticServer, failure: bool) -> TestResult<()> {
     let url = server.url("tests/fixture.html");
-    run_browser_test(WebDriver::managed(capabilities()?), |driver| async move {
+    run_browser_test(managed_driver(capabilities()?), |driver| async move {
         let bidi = driver.bidi().await?;
         let context = bidi.browsing_context().top_level().await?;
         navigate(&bidi, &context, url).await?;
@@ -258,7 +263,7 @@ async fn public_agent_contract_runs_through_bidi() -> TestResult<()> {
 async fn runtime_local_operations_are_serialized_and_close_fenced() -> TestResult<()> {
     let server = StaticServer::start(root()).await?;
     let url = server.url("tests/fixture.html");
-    run_browser_test(WebDriver::managed(capabilities()?), |driver| async move {
+    run_browser_test(managed_driver(capabilities()?), |driver| async move {
         let bidi = driver.bidi().await?;
         let context = bidi.browsing_context().top_level().await?;
         navigate(&bidi, &context, url).await?;
@@ -280,7 +285,7 @@ async fn runtime_local_operations_are_serialized_and_close_fenced() -> TestResul
 async fn remote_media_attachment_is_stable_and_terminal() -> TestResult<()> {
     let server = StaticServer::start(root()).await?;
     let url = server.url("tests/fixture.html");
-    run_browser_test(WebDriver::managed(capabilities()?), |driver| async move {
+    run_browser_test(managed_driver(capabilities()?), |driver| async move {
         let bidi = driver.bidi().await?;
         let context = bidi.browsing_context().top_level().await?;
         navigate(&bidi, &context, url).await?;
@@ -309,7 +314,7 @@ async fn remote_media_attachment_is_stable_and_terminal() -> TestResult<()> {
 async fn remote_catalog_handles_preserve_identity_and_bound_demand() -> TestResult<()> {
     let server = StaticServer::start(root()).await?;
     let url = server.url("tests/fixture.html");
-    run_browser_test(WebDriver::managed(capabilities()?), |driver| async move {
+    run_browser_test(managed_driver(capabilities()?), |driver| async move {
         let bidi = driver.bidi().await?;
         let context = bidi.browsing_context().top_level().await?;
         navigate(&bidi, &context, url).await?;
@@ -338,7 +343,7 @@ async fn remote_catalog_handles_preserve_identity_and_bound_demand() -> TestResu
 async fn typed_topic_facade_tracks_lifetime_and_bounds_delivery() -> TestResult<()> {
     let server = StaticServer::start(root()).await?;
     let url = server.url("tests/fixture.html");
-    run_browser_test(WebDriver::managed(capabilities()?), |driver| async move {
+    run_browser_test(managed_driver(capabilities()?), |driver| async move {
         let bidi = driver.bidi().await?;
         let context = bidi.browsing_context().top_level().await?;
         navigate(&bidi, &context, url).await?;
@@ -392,7 +397,7 @@ async fn public_agent_connects_and_delivers_remote_media() -> TestResult<()> {
         .replace("__SENDER_TOKEN__", &sender)
         .replace("__RECEIVER_TOKEN__", &receiver)
         .replace("__SECOND_RECEIVER_TOKEN__", &second_receiver);
-    run_browser_test(WebDriver::managed(capabilities()?), |driver| async move {
+    run_browser_test(managed_driver(capabilities()?), |driver| async move {
         let bidi = driver.bidi().await?;
         let context = bidi.browsing_context().top_level().await?;
         navigate(&bidi, &context, url).await?;
@@ -450,7 +455,7 @@ async fn reliable_topics_recover_the_lost_tail_through_server_restart() -> TestR
         .replace("__SENDER_TOKEN__", &sender)
         .replace("__RECEIVER_TOKEN__", &receiver);
     let finish = RELIABLE_RESTART_FINISH.replace("__LATE_TOKEN__", &late);
-    run_browser_test(WebDriver::managed(capabilities()?), |driver| async move {
+    run_browser_test(managed_driver(capabilities()?), |driver| async move {
         let bidi = driver.bidi().await?;
         let context = bidi.browsing_context().top_level().await?;
         navigate(&bidi, &context, url).await?;
@@ -479,7 +484,7 @@ async fn reliable_topics_recover_the_lost_tail_through_server_restart() -> TestR
 async fn generated_media_types_run_through_bidi() -> TestResult<()> {
     let server = StaticServer::start(root()).await?;
     let url = server.url("tests/uniffi-fixture.html");
-    run_browser_test(WebDriver::managed(capabilities()?), |driver| async move {
+    run_browser_test(managed_driver(capabilities()?), |driver| async move {
         let bidi = driver.bidi().await?;
         let context = bidi.browsing_context().top_level().await?;
         navigate(&bidi, &context, url).await?;
@@ -502,33 +507,28 @@ async fn generated_media_types_run_through_bidi() -> TestResult<()> {
 }
 #[tokio::test(flavor = "multi_thread")]
 async fn react_provider_contract_runs_through_bidi() -> TestResult<()> {
-    let fixture = root().join("../react/tests/browser/dist");
+    let fixture = PathBuf::from(std::env::var_os("PULSEBEAM_REACT_FIXTURE_ROOT")
+        .ok_or("missing declared React fixture; run //agents/pulsebeam-agent-web:browser through ./bazel test")?);
     let manifest = fixture.join("fixture-manifest.json");
     if !fixture.join("index.html").is_file() || !manifest.is_file() {
         return Err(
-            "React browser fixture is missing; run `just --justfile agents/react/Justfile browser-fixture`"
+            "declared React browser fixture is missing; rebuild //agents/pulsebeam-agent-web:browser"
                 .into(),
         );
     }
-    let manifest_time = std::fs::metadata(&manifest)?.modified()?;
-    for source in [
-        root().join("../react/tests/browser/fixture.tsx"),
-        root().join("../react/tests/browser/acquisition.tsx"),
-        root().join("../react/tests/browser/ownership.tsx"),
-        root().join("../react/tests/browser/playback.tsx"),
-        root().join("../react/tests/browser/index.html"),
-        root().join("dist/index.js"),
-    ] {
-        if std::fs::metadata(source)?.modified()? > manifest_time {
-            return Err(
-                "React browser fixture is stale; run `just --justfile agents/react/Justfile browser-fixture`"
-                    .into(),
-            );
-        }
+    // The fixture's source and Web package inputs are Bazel dependencies.
+    // Filesystem mtimes cannot establish freshness after an action-cache restore.
+    let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(&manifest)?)?;
+    if manifest
+        .get("inputs")
+        .and_then(serde_json::Value::as_array)
+        .is_none_or(|inputs| inputs.len() != 6)
+    {
+        return Err("React browser fixture is missing its six declared input records".into());
     }
     let server = StaticServer::start(fixture).await?;
     let url = server.url("index.html");
-    run_browser_test(WebDriver::managed(capabilities()?), |driver| async move {
+    run_browser_test(managed_driver(capabilities()?), |driver| async move {
         let bidi = driver.bidi().await?;
         let context = bidi.browsing_context().top_level().await?;
         navigate(&bidi, &context, url).await?;

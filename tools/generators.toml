@@ -1,0 +1,10 @@
+[ubrn]
+git = "https://github.com/jhugman/uniffi-bindgen-react-native.git"
+rev = "f5865e794e4507809f2b2bfea1d9fc00f4882322"
+
+# Preserve the shipped receipt-driven standalone updater, independently of
+# application version updates. Bazel verifies the published asset digests.
+[updater]
+release = "pulsebeam-v0.4.9"
+x86_64 = "0a1fae2d4323f45068fcc5d731baf8a544c4cd59de52e6d17479afc97a59d5c4"
+aarch64 = "f78035d79dca8944cc5bb0dadd4743856c28e61ec9814dfad890efafdd852cfe"

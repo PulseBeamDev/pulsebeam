@@ -1,0 +1,90 @@
+#!/bin/sh
+set -eu
+
+VERSION='@VERSION@'
+TAG='@TAG@'
+REPOSITORY='@REPOSITORY@'
+quiet=false
+modify_path=true
+for arg in "$@"; do
+  case "$arg" in
+    --quiet|-q) quiet=true ;;
+    --verbose|-v) quiet=false ;;
+    --no-modify-path) modify_path=false ;;
+    --help|-h) echo 'Install pulsebeam and pulsebeam-update into ${CARGO_HOME:-$HOME/.cargo}/bin'; exit 0 ;;
+    *) echo "Unknown installer argument: $arg" >&2; exit 1 ;;
+  esac
+done
+fail() { echo "pulsebeam installer: $*" >&2; exit 1; }
+for tool in curl tar sha256sum mktemp; do
+  command -v "$tool" >/dev/null 2>&1 || fail "required OS tool '$tool' is missing"
+done
+[ "$(uname -s)" = Linux ] || fail 'only Linux GNU release targets are supported'
+case "$(uname -m)" in
+  x86_64) target=x86_64-unknown-linux-gnu ;;
+  aarch64|arm64) target=aarch64-unknown-linux-gnu ;;
+  *) fail "unsupported Linux architecture: $(uname -m)" ;;
+esac
+cargo_home=${CARGO_HOME:-"$HOME/.cargo"}
+# The standalone updater must replace the installation named by its receipt.
+if [ -n "${CARGO_DIST_FORCE_INSTALL_DIR:-}" ]; then
+  mkdir -p "$CARGO_DIST_FORCE_INSTALL_DIR"
+  prefix=$(cd "$CARGO_DIST_FORCE_INSTALL_DIR" && pwd)
+  modify_path=false
+else
+  mkdir -p "$cargo_home/bin"
+  prefix=$(cd "$cargo_home/bin" && pwd)
+fi
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT HUP INT TERM
+name="pulsebeam-$target"
+base="https://github.com/$REPOSITORY/releases/download/$TAG"
+archive_url=${PULSEBEAM_DOWNLOAD_URL:-"$base/$name.tar.xz"}
+base=${archive_url%/*}
+fetch() { curl --fail --location --retry 3 --silent --show-error "$1" -o "$2" || fail "download failed: $1"; }
+fetch "$archive_url" "$tmp/$name.tar.xz"
+fetch "$archive_url.sha256" "$tmp/$name.tar.xz.sha256"
+fetch "$base/$name-update" "$tmp/$name-update"
+fetch "$base/$name-update.sha256" "$tmp/$name-update.sha256"
+(cd "$tmp" && sha256sum --check "$name.tar.xz.sha256" "$name-update.sha256") || fail 'download checksum mismatch; nothing installed'
+tar -xJf "$tmp/$name.tar.xz" -C "$tmp"
+[ -f "$tmp/$name/pulsebeam" ] || fail 'archive does not contain the release binary'
+# Install only after every download and checksum has succeeded.
+stage=$(mktemp -d "$prefix/.pulsebeam-install.XXXXXX")
+trap 'rm -rf "$tmp" "$stage"' EXIT HUP INT TERM
+cp "$tmp/$name/pulsebeam" "$stage/pulsebeam"
+cp "$tmp/$name-update" "$stage/pulsebeam-update"
+chmod 755 "$stage/pulsebeam" "$stage/pulsebeam-update"
+# Rename within the destination filesystem so a running updater can replace itself.
+mv -f "$stage/pulsebeam" "$prefix/pulsebeam"
+mv -f "$stage/pulsebeam-update" "$prefix/pulsebeam-update"
+receipt_dir="${XDG_CONFIG_HOME:-$HOME/.config}/pulsebeam"
+mkdir -p "$receipt_dir"
+escaped_prefix=$(printf '%s' "$prefix" | sed 's/\\/\\\\/g; s/"/\\"/g')
+cat > "$receipt_dir/pulsebeam-receipt.json" <<EOF
+{
+  "install_prefix": "$escaped_prefix",
+  "install_layout": "flat",
+  "binaries": ["pulsebeam"],
+  "cdylibs": [],
+  "cstaticlibs": [],
+  "version": "$VERSION",
+  "modify_path": $modify_path,
+  "provider": {"source": "cargo-dist", "version": "@PROVIDER_VERSION@"},
+  "source": {"app_name": "pulsebeam", "name": "pulsebeam", "owner": "PulseBeamDev", "release_type": "github"}
+}
+EOF
+if [ "$modify_path" = true ]; then
+  # Match Cargo's environment convention without introducing a tool install.
+  escaped_home=$(printf '%s' "$cargo_home" | sed "s/'/'\\\\''/g")
+  printf "export PATH='%s/bin':\"\$PATH\"\n" "$escaped_home" > "$cargo_home/env"
+  for profile in "$HOME/.profile" "$HOME/.bash_profile" "$HOME/.zshenv"; do
+    if [ -f "$profile" ] && ! grep -F "$cargo_home/env" "$profile" >/dev/null; then
+      printf '\n. "%s/env"\n' "$cargo_home" >> "$profile"
+    fi
+  done
+fi
+if [ "$quiet" = false ]; then
+  echo "Installed pulsebeam $VERSION and pulsebeam-update into $prefix"
+  echo "Run: . \"$cargo_home/env\" (or add $prefix to PATH)"
+fi

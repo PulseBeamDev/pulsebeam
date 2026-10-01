@@ -2,11 +2,11 @@
 
 Static Meet client using only the local `@pulsebeam/react` SDK.
 
-From the repository root, run `just prepare` before `just check` or
-`just meet-build`. Production builds use
-`https://demo.pulsebeam.dev`. `just dev` defaults to the local server at
-`http://localhost:7070` when `NEXT_PUBLIC_PULSEBEAM_SERVER_URL` is unset.
-Serve an export with `pnpm start`.
+From the repository root, run `./bazel test //apps/meet:check` or
+`./bazel build //:meet`; Web and React packages are built automatically.
+Production builds use `https://demo.pulsebeam.dev`. `./bazel run //:meet_dev`
+defaults to `http://localhost:7070` when `NEXT_PUBLIC_PULSEBEAM_SERVER_URL` is unset.
+Serve the export with `./bazel run //apps/meet:preview -- --listen 3000`.
 
 Meet has no app-level browser tests. Its `check` recipe covers static checks,
 and `build` produces the static export. Capture, device replacement, Agent
@@ -27,7 +27,7 @@ bounded recovery. Reliable stream identity includes an opaque epoch from the
 Agent's first admitted connection, retained across transient replacements, so a
 fresh Agent cannot collide with an existing receiver's stream counter.
 
-Recorded checks:
+Recorded pre-migration checks, not evidence for the current Bazel candidate:
 
 - `pnpm run check` and `pnpm run build` passed.
 - Agent-core tests and workspace Clippy passed after the recovery changes.
@@ -49,8 +49,9 @@ final interactive acceptance alongside the shared SDK browser gates.
 Reproduce with:
 
 ```sh
-cargo nextest run --cargo-profile sim -p pulsebeam-simulator --no-fail-fast \
-  -E 'test(=tests::native_runtime::native_agents_prove_media_topics_reconnect_and_close)'
+./bazel test //crates/pulsebeam-simulator:fast \
+  --test_arg=--run-skipped --test_arg=--filter \
+  --test_arg=tests::native_runtime::native_agents_prove_media_topics_reconnect_and_close
 ```
 
 The replacement native connection completes ICE and verifies the client
@@ -67,7 +68,10 @@ can reach a replacement on a reused UDP tuple, but the offending packet's origin
 has not been conclusively captured. The existing post-handshake bad-record fix
 in this dependency does not cover this buffered handshake transition.
 
+This case is now explicitly excluded from ordinary migration acceptance by a
+[human-authorized exception](../../crates/pulsebeam-simulator/docs/native-dtls-exception.md).
+The case and its assertions remain available through the opt-in command above.
 No dependency patch was vendored and no test oracle was weakened. Follow-up must
 repair and regress this dependency boundary, rerun the exact native simulation,
-then complete affected owner and root `just test` acceptance, including fresh
+then complete affected owner and root `./bazel test //:test` acceptance, including fresh
 browser evidence for the shared reliable-topic wire changes.

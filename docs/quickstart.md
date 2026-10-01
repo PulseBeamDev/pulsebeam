@@ -34,7 +34,7 @@ production (without `--dev`), WebRTC uses the standard port **443**. See
 
 Prefer not to use Docker? Grab a prebuilt binary from the
 [releases page](https://github.com/pulsebeamdev/pulsebeam/releases/latest), or
-build from source with `cargo run --release -p pulsebeam`.
+build from source with `./bazel run --config=release //:server --`.
 
 ## Step 2 — Publish a stream
 
@@ -42,7 +42,7 @@ Room and participant identity come from the bearer token. Mint a development
 token for the server running with `--dev`:
 
 ```bash
-cargo run -q -p pulsebeam-cli -- token --room demo --participant publisher
+./bazel run //:cli -- token --room demo --participant publisher
 ```
 
 This example uses WHIP, the HTTP/SDP publishing boundary. Paste it into a

@@ -44,6 +44,8 @@ pulsebeam-proto = { path = "../pulsebeam-proto" }
 pulsebeam-routing = { path = "../pulsebeam-routing" }
 pulsebeam-runtime = { path = "../pulsebeam-runtime" }
 rand = { workspace = true }
+# Swagger's generated folder must resolve the compiler action's OUT_DIR.
+rust-embed = { version = "8", features = ["interpolate-folder-path"] }
 rustix = { version = "1.1.4", features = ["param", "process", "thread"] }
 serde = { workspace = true }
 serde_json = "1.0.150"
@@ -66,7 +68,8 @@ tracing-appender = "0.2.5"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 url = "2.5.8"
 utoipa = { version = "5.5.0", features = ["axum_extras", "uuid"] }
-utoipa-swagger-ui = { version = "9.0.2", features = ["axum"] }
+# Build sandboxes are ephemeral, so serve embedded assets in debug builds too.
+utoipa-swagger-ui = { version = "9.0.2", features = ["axum", "debug-embed"] }
 uuid = { version = "1.23.2", features = ["v4", "v5", "v7"] }
 zerocopy = { version = "0.8.56", features = ["derive"] }
 parking_lot = "0.12.5"

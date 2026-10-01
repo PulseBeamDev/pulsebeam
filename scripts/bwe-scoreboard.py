@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Turn a `just test` run into a stable, diffable scoreboard.
+"""Turn a Bazel simulation run into a stable, diffable scoreboard.
 
 Reads nextest output on stdin and writes one block per plan: the plan's name, its outcome, and
 the measured behaviour of every participant's link.
@@ -24,7 +24,7 @@ import sys
 
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
 SCOREBOARD = re.compile(r"\[scoreboard\] (.*)")
-RESULT = re.compile(r"^\s+(PASS|FAIL|TRY \d+ FAIL) \[.*?\] \(\s*\d+/\d+\) \S+ (\S+)")
+RESULT = re.compile(r"^\[simulation-result\] (PASS|FAIL) (\S+)")
 
 # Randomised plans are excluded. They draw a fresh seed each run, so their numbers differ every
 # time by design - that is the point of them. Including them would make the baseline churn on
@@ -59,7 +59,7 @@ def main() -> int:
             pending = []
 
     if not blocks:
-        print("no plans found - was this the output of `just test`?", file=sys.stderr)
+        print("no plans found; pipe output from ./bazel run //:replay", file=sys.stderr)
         return 1
 
     for name in sorted(blocks):

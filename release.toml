@@ -1,4 +1,0 @@
-publish = false
-tag = false
-tag-prefix = "{{crate_name}}-"
-shared-version = false

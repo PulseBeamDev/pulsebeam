@@ -46,25 +46,12 @@ impl DestinationServer {
         if std::net::TcpStream::connect("127.0.0.1:7070").is_ok() {
             return Err("refusing to use an existing PulseBeam listener on 127.0.0.1:7070; browser contracts require an owned destination server".into());
         }
-        let package = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let root = package
-            .parent()
-            .and_then(Path::parent)
-            .ok_or("web package must be inside the workspace")?;
-        let build = Command::new("cargo")
-            .args(["build", "--release", "-p", "pulsebeam"])
-            .current_dir(root)
-            .output()?;
-        if !build.status.success() {
-            return Err(format!(
-                "failed to build the owned PulseBeam development server:\n{}",
-                String::from_utf8_lossy(&build.stderr)
-            )
-            .into());
-        }
-        let mut child = Command::new(root.join("target/release/pulsebeam"))
+        let binary = env::var_os("PULSEBEAM_SERVER_BINARY").ok_or(
+            "missing PULSEBEAM_SERVER_BINARY; run the SDK browser target through ./bazel test",
+        )?;
+        let mut child = Command::new(Path::new(&binary).canonicalize()?)
             .arg("--dev")
-            .current_dir(root)
+            .current_dir(env::var_os("TEST_TMPDIR").ok_or("missing Bazel TEST_TMPDIR")?)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()?;
@@ -164,18 +151,11 @@ pub fn capabilities() -> TestResult<ChromeCapabilities> {
             )
             .into());
         }
-    } else if !["google-chrome", "chromium", "chromium-browser"]
-        .iter()
-        .any(|name| {
-            Command::new(name)
-                .arg("--version")
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .is_ok()
-        })
-    {
-        return Err("no compatible Chrome/Chromium was found; install one or set PULSEBEAM_BROWSER_BINARY=/path/to/chrome".into());
+    } else {
+        return Err(
+            "missing PULSEBEAM_BROWSER_BINARY; run the SDK browser target through ./bazel test"
+                .into(),
+        );
     }
     let mut capabilities = DesiredCapabilities::chrome();
     capabilities.set_headless()?;
@@ -185,10 +165,30 @@ pub fn capabilities() -> TestResult<ChromeCapabilities> {
     capabilities.add_arg("--use-fake-ui-for-media-stream")?;
     capabilities.enable_bidi()?;
     if let Some(binary) = env::var_os("PULSEBEAM_BROWSER_BINARY") {
-        capabilities.set_binary(&binary.to_string_lossy())?;
+        capabilities.set_binary(&Path::new(&binary).canonicalize()?.to_string_lossy())?;
     }
     Ok(capabilities)
 }
+pub async fn managed_driver(
+    capabilities: ChromeCapabilities,
+) -> thirtyfour::error::WebDriverResult<WebDriver> {
+    let binary = env::var_os("PULSEBEAM_DRIVER_BINARY").ok_or_else(|| {
+        thirtyfour::error::WebDriverError::ParseError(
+            "missing PULSEBEAM_DRIVER_BINARY; run the SDK browser target through ./bazel test"
+                .into(),
+        )
+    })?;
+    let binary = Path::new(&binary)
+        .canonicalize()
+        .map_err(|error| thirtyfour::error::WebDriverError::ParseError(error.to_string()))?;
+    thirtyfour::manager::WebDriverManager::builder()
+        .driver_binary(thirtyfour::manager::BrowserKind::Chrome, binary)
+        .offline()
+        .build()
+        .launch(capabilities)
+        .await
+}
+
 pub async fn navigate(
     bidi: &thirtyfour::bidi::BiDi,
     context: &BrowsingContextId,

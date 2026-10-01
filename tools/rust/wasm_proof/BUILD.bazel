@@ -1,0 +1,8 @@
+package(default_visibility = ["//visibility:public"])
+
+# Dependency-maintenance manifest for UBRN's generated WASM crate. The SDK
+# compiles the generated Rust with rules_rust, not this Cargo placeholder.
+filegroup(
+    name = "cargo_metadata_inputs",
+    srcs = ["Cargo.toml", "//tools:rust/empty.rs"],
+)

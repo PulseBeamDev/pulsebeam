@@ -1,4 +1,6 @@
 packages:
   - .
+onlyBuiltDependencies:
+  - esbuild
 overrides:
   "@pulsebeam/web": link:../pulsebeam-agent-web

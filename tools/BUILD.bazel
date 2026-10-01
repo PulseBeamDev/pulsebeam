@@ -1,0 +1,106 @@
+load("@rules_python//python:defs.bzl", "py_binary", "py_test")
+load("@rules_rust_wasm_bindgen//:defs.bzl", "rust_wasm_bindgen_toolchain")
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files(["rust-pins.MODULE.bazel", "distribution.MODULE.bazel", "rust-metadata.bzl", "wasm-deps.bzl", "generators.toml", "run-simulations.py", "check-js-format.py", "scoreboard.py", "static-server.py", "cmake.sh"] + glob(["rust/**", "patches/**"]))
+
+rust_wasm_bindgen_toolchain(
+    name = "wasm_bindgen_toolchain_impl",
+    wasm_bindgen_cli = "@build_tools//:wasm-bindgen-cli__wasm-bindgen",
+)
+
+toolchain(
+    name = "wasm_bindgen_toolchain",
+    toolchain_type = "@rules_rust_wasm_bindgen//:toolchain_type",
+    toolchain = ":wasm_bindgen_toolchain_impl",
+)
+
+py_test(
+    name = "simulation_runner_contract",
+    srcs = ["tests/run_simulations_test.py", "run-simulations.py"],
+    main = "tests/run_simulations_test.py",
+    env = {"PYTHONDONTWRITEBYTECODE": "1"},
+)
+
+py_test(
+    name = "ide_contract",
+    srcs = ["tests/ide_test.py", "ide.py"],
+    main = "tests/ide_test.py",
+    env = {"PYTHONDONTWRITEBYTECODE": "1"},
+)
+
+py_binary(
+    name = "native-codegen",
+    srcs = ["native-codegen.py"],
+    main = "native-codegen.py",
+)
+
+py_binary(
+    name = "ubrn-codegen",
+    srcs = ["ubrn-codegen.py"],
+    main = "ubrn-codegen.py",
+)
+
+IDE_INPUTS = {
+    "pnpm": "@pnpm//:pnpm",
+    "web": "//agents/pulsebeam-agent-web:package",
+    "react": "//agents/react:package",
+    "bindings": "//agents/pulsebeam-agent-web:bindings_dir",
+    "rust-lib": "//agents/pulsebeam-agent-web:generated/wasm/src/lib.rs",
+    "web-module": "//agents/pulsebeam-agent-web:generated/wasm/src/pulsebeam_agent_web_module.rs",
+    "core-module": "//agents/pulsebeam-agent-web:generated/wasm/src/pulsebeam_agent_core_module.rs",
+    "entrypoint": "//agents/pulsebeam-agent-web:generated/index.web.ts",
+    "next": "//apps/meet:framework_types",
+    "native": "//agents/pulsebeam-agent-native:bindings",
+}
+
+py_binary(
+    name = "ide",
+    srcs = ["ide.py"],
+    main = "ide.py",
+    data = IDE_INPUTS.values(),
+    args = [argument for key, target in IDE_INPUTS.items() for argument in ["--" + key, "$(rootpath %s)" % target]],
+)
+
+FIX_INPUTS = {
+    "rustfmt": "@rules_rust//tools/upstream_wrapper:rustfmt",
+    "web": "//agents/pulsebeam-agent-web:prettier",
+    "react": "//agents/react:prettier",
+    "meet": "//apps/meet:prettier",
+}
+
+py_test(
+    name = "legacy_contract",
+    srcs = ["legacy-contract.py"],
+    main = "legacy-contract.py",
+    args = ["$(rootpaths //:workflow_inputs)"],
+    data = ["//:workflow_inputs"],
+)
+
+py_binary(name = "scoreboard_parser", srcs = ["//:scripts/bwe-scoreboard.py"], main = "//:scripts/bwe-scoreboard.py")
+
+py_test(
+    name = "scoreboard_contract",
+    srcs = ["tests/scoreboard_test.py", "scoreboard.py"],
+    main = "tests/scoreboard_test.py",
+    data = [":scoreboard_parser"],
+    env = {"PYTHONDONTWRITEBYTECODE": "1"},
+)
+filegroup(name = "workflow_inputs", srcs = glob(["*.md", "Justfile"], allow_empty = True))
+
+py_binary(
+    name = "fix",
+    srcs = ["fix.py"],
+    main = "fix.py",
+    data = FIX_INPUTS.values(),
+    args = [argument for key, target in FIX_INPUTS.items() for argument in ["--" + key, "$(rootpath %s)" % target]],
+)
+
+py_binary(
+    name = "update-rust-pins",
+    srcs = ["update-rust-pins.py"],
+    main = "update-rust-pins.py",
+    data = ["@pulsebeam_rust_host_tools//:cargo", "@pulsebeam_rust_host_tools//:rustc", "@pulsebeam_rust_host_tools//:rustc_lib"],
+    args = ["--cargo", "$(rootpath @pulsebeam_rust_host_tools//:cargo)", "--rustc", "$(rootpath @pulsebeam_rust_host_tools//:rustc)"],
+)

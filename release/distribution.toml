@@ -1,0 +1,9 @@
+# Observable distribution contract, consumed by Bazel packaging and installers.
+[distribution]
+targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
+tag-prefix = "pulsebeam-v"
+repository = "PulseBeamDev/pulsebeam"
+install-path = "CARGO_HOME"
+install-updater = true
+# Existing standalone updaters consume cargo-dist's receipt schema.
+receipt-provider-version = "0.30.3"

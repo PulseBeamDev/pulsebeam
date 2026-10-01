@@ -1,0 +1,70 @@
+load("@crates//:defs.bzl", "aliases", "all_crate_deps", "crate_edition")
+load("@rules_rust//cargo:defs.bzl", "cargo_toml_env_vars", "extract_cargo_lints")
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test", "rust_clippy_test", "rustfmt_test", "rust_binary")
+
+package(default_visibility = ["//visibility:public"])
+filegroup(name = "workflow_inputs", srcs = glob(["*.md", "docs/**/*.md", "Justfile", "scripts/*.sh"], allow_empty = True))
+exports_files(["Cargo.toml"])
+filegroup(name = "cargo_metadata_inputs", srcs = glob(["Cargo.toml", "uniffi.toml", "src/**/*.rs", "benches/**/*.rs", "examples/**/*.rs"], allow_empty = True))
+
+cargo_toml_env_vars(name = "cargo_env", src = "Cargo.toml", workspace = "//:Cargo.toml")
+extract_cargo_lints(name = "lints", manifest = "Cargo.toml", workspace = "//:Cargo.toml")
+
+rust_library(
+    name = "pulsebeam",
+    crate_root = "src/lib.rs",
+    srcs = glob(["src/**/*.rs"], exclude = ["src/bin/**"]),
+    compile_data = glob(["README.md", "src/**"], exclude = ["src/**/*.rs"]),
+    edition = crate_edition(),
+    crate_features = [],
+    rustc_env_files = [":cargo_env"],
+    lint_config = ":lints",
+    aliases = aliases(),
+    deps = all_crate_deps(normal = True) + ["//crates/pulsebeam-core:pulsebeam-core", "//crates/pulsebeam-proto:pulsebeam-proto", "//crates/pulsebeam-routing:pulsebeam-routing", "//crates/pulsebeam-runtime:pulsebeam-runtime"],
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+)
+
+rust_library(
+    name = "pulsebeam-sim",
+    crate_name = "pulsebeam",
+    crate_root = "src/lib.rs",
+    srcs = glob(["src/**/*.rs"], exclude = ["src/bin/**"]),
+    compile_data = glob(["README.md", "src/**"], exclude = ["src/**/*.rs"]),
+    edition = crate_edition(),
+    crate_features = ["sim"],
+    rustc_flags = ["-Copt-level=2", "-Cdebug-assertions=yes", "-Coverflow-checks=yes"],
+    rustc_env_files = [":cargo_env"],
+    lint_config = ":lints",
+    aliases = aliases(),
+    deps = all_crate_deps(normal = True) + ["//crates/pulsebeam-core:pulsebeam-core-sim", "//crates/pulsebeam-proto:pulsebeam-proto", "//crates/pulsebeam-routing:pulsebeam-routing", "//crates/pulsebeam-runtime:pulsebeam-runtime-sim"],
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+)
+
+rust_test(
+    name = "unit_tests",
+    crate = ":pulsebeam-sim",
+    crate_features = ["sim"],
+    rustc_flags = ["-Copt-level=2", "-Cdebug-assertions=yes", "-Coverflow-checks=yes"],
+    lint_config = ":lints",
+    aliases = aliases(normal_dev = True, proc_macro_dev = True),
+    deps = all_crate_deps(normal_dev = True) + ["//crates/pulsebeam-core:pulsebeam-core-sim", "//crates/pulsebeam-testdata:pulsebeam-testdata"],
+    proc_macro_deps = all_crate_deps(proc_macro_dev = True),
+    
+)
+
+rust_binary(
+    name = "server",
+    rustc_flags = ["-Cpanic=abort"],
+    crate_name = "pulsebeam",
+    crate_root = "src/main.rs",
+    srcs = glob(["src/**/*.rs"], exclude = ["src/bin/**"]),
+    edition = crate_edition(),
+    rustc_env_files = [":cargo_env"],
+    lint_config = ":lints",
+    aliases = aliases(),
+    deps = all_crate_deps(normal = True) + ["//crates/pulsebeam-core:pulsebeam-core", "//crates/pulsebeam-proto:pulsebeam-proto", "//crates/pulsebeam-routing:pulsebeam-routing", "//crates/pulsebeam-runtime:pulsebeam-runtime"] + [":pulsebeam"],
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+)
+
+rustfmt_test(name = "format", targets = [":pulsebeam"])
+rust_clippy_test(name = "clippy", targets = [":pulsebeam", ":unit_tests", ":server"])

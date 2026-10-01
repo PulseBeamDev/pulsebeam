@@ -46,5 +46,5 @@ core-owned byte arrays and strictness follow the core namespace.
 
 ## Verification
 
-Run `cargo test -p pulsebeam-agent-core` while iterating. The repository gates
-are `just check` and `just test` from the workspace root.
+Run `./bazel test //agents/pulsebeam-agent-core:unit_tests` while iterating.
+The repository gates are `./bazel test //:check` and `./bazel test //:test`.

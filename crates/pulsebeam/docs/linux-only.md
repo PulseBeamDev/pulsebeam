@@ -37,7 +37,7 @@ dependencies.
 
 ## CI
 
-The OSS CI has no privileged kernel steering job. Root `just test-fast` covers
-static checks and fast owner tests; `just test-slow` covers the slower browser
+The OSS CI has no privileged kernel steering job. Root `./bazel test //:fast` covers
+static checks and fast owner tests; `./bazel test //:slow` covers the slower browser
 and simulation gates. Any proprietary steering implementation owns its own
 build, verifier, capability, and attach/load tests outside this repository.

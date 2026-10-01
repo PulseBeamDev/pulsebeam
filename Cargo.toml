@@ -13,6 +13,7 @@ members = [
   "agents/pulsebeam-agent-core",
   "agents/pulsebeam-agent-web",
   "agents/pulsebeam-agent-native",
+  "tools/rust/wasm_proof",
 ]
 
 [workspace.package]
@@ -98,7 +99,7 @@ lto = "thin"
 inherits = "dev"
 opt-level = 2
 
-# Favor reusable sccache artifacts over Cargo incremental state.
+# Retain the simulation profile contract for metadata consumers.
 incremental = false
 codegen-units = 256
 lto = false
@@ -109,7 +110,7 @@ overflow-checks = true
 # Enough symbols for useful backtraces/profiling.
 debug = 1
 
-# Lints shared by every hand-written crate. `just check` gates on these.
+# Lints shared by every hand-written crate. Bazel's static gate applies these.
 #
 # Three tiers, and the tiering is measured rather than guessed — the counts came
 # from a clippy JSON run over `crates/pulsebeam/src`, split at each file's first

@@ -852,7 +852,7 @@ where
 
     if let Err(err) = runner.run(&strategy, test) {
         panic!(
-            "{err}\n\nreplay this exact run with:\n    just --justfile crates/pulsebeam-simulator/Justfile replay {seed}\n"
+            "{err}\n\nreplay this exact run with:\n    ./bazel run //:replay -- --seed {seed}\n"
         );
     }
 }

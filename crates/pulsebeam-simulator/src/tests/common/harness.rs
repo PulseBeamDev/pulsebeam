@@ -4361,7 +4361,7 @@ impl LocalNodeSim {
         pulsebeam_runtime::net::shaper::seed_impairments(self.rng_seed);
         tracing::info!(
             seed = self.rng_seed,
-            "simulation plan seed; replay with `just --justfile crates/pulsebeam-simulator/Justfile replay {}`",
+            "simulation plan seed; replay with `./bazel run //:replay -- --seed {}`",
             self.rng_seed
         );
 

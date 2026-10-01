@@ -34,32 +34,25 @@ This is a **thread-per-core** system that isolates the data plane from the contr
 
 ## Development dependencies
 
-For Linux development, install [Homebrew](https://brew.sh), activate its
-`shellenv`, then run from the repository root:
+Bazel owns compilation, dependency/tool provisioning, generated bindings, checks,
+and tests. Normal development and browser acceptance support Linux x86_64.
+Install the [baseline OS prerequisites](docs/build.md#host-prerequisites), then:
 
 ```bash
-brew install just
-just deps
-export PATH="$HOME/.cargo/bin:$(brew --prefix rustup)/bin:$PATH"
-just test-fast
+./bazel test //:fast                  # Static checks and fast tests
+./bazel test //:test                  # Complete non-privileged acceptance
+./bazel build //:server //:native //:web //:react //:meet //:docs
 ```
 
-`just deps` installs the tools for normal builds, static checks, and fast/slow
-tests: the native compiler/build tools, Node/pnpm, WebAssembly tooling,
-`cargo-nextest`, Go, Python, and browser download utilities. Rustup installs the
-Rust 1.92.0 toolchain and components, including the WASM target, without
-changing the global default. Cargo installs `wasm-bindgen-cli` 0.2.127 to match
-`Cargo.lock`; Homebrew's version can be incompatible.
+The checksum-verified launcher bootstraps the pinned Bazel version. Bazel supplies
+Rust 1.92.0, native compilation tools, Node/pnpm, matching WASM generators/runtime,
+protobuf, Go, Python, and the pinned Chrome/Firefox executables and drivers.
+Initial downloads require network access; tests use local application fixtures.
+No pre-existing language/browser cache or independent tool installation is required.
 
-On Fedora, `just deps` also installs `gcc-c++` through `sudo dnf` so
-Clang can link the C++ codec dependencies. This step may prompt for your password.
-Native builds default to `clang`/`clang++`; explicit `CC`/`CXX` environment
-variables still take precedence. JavaScript dependencies remain owned by each
-package's frozen lockfile and are installed by `just prepare`. Slow tests
-provision the pinned browsers through the RTC owner's scripts; the accepted
-browser matrix is Linux x86_64 and also requires the host's browser runtime
-libraries. Optional release, profiling, and privileged kernel tools are not
-installed by `just deps`.
+See [build and development](docs/build.md), [editor-neutral LSP setup](docs/ide.md),
+and [distribution](docs/releasing.md). Cargo/pnpm metadata remains authoritative
+for dependencies and editor maintenance, not a supported parallel build/test workflow.
 
 ## Quickstart
 
@@ -85,14 +78,14 @@ docker run --rm --net=host ghcr.io/pulsebeamdev/pulsebeam:pulsebeam-v0.4.5 --dev
 **Other options:**
 
 - **Binary:** download from [Releases](https://github.com/pulsebeamdev/pulsebeam/releases/latest)
-- **Source:** install `clang`, `mold`, and `sccache`, then run `cargo run --release -p pulsebeam`
+- **Source:** `./bazel run --config=release //:server -- --dev`
 
 ### Step 2. Publish a video
 
 Mint a development token, then paste it into the browser-console snippet below:
 
 ```bash
-cargo run -q -p pulsebeam-cli -- token --room demo --participant publisher
+./bazel run //:cli -- token --room demo --participant publisher
 ```
 
 ```javascript
@@ -155,7 +148,7 @@ PulseBeam exposes an internal debug HTTP server on **`http://localhost:6060`**.
 View CPU profiles with:
 
 ```bash
-go tool pprof -http=:8080 cpu.pprof
+./bazel run @rules_go//go -- tool pprof -http=:8080 cpu.pprof
 ```
 
 Or view as a flamegraph on a browser by specifying `flamegraph=true` to the URL query.

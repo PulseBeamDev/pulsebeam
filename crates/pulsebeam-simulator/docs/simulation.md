@@ -14,9 +14,9 @@ determines one entire run**, so anything found can be replayed exactly.
 
 | Command | What it is |
 |---|---|
-| `just test` | what CI runs: workspace unit tests plus the committed simulation plans |
-| `just --justfile crates/pulsebeam-simulator/Justfile replay <n>` | replay one seed exactly |
-| `just sweep [count] [first] [filter]` | search for seeds nobody has tried |
+| `./bazel test //:test` | complete acceptance, including committed simulation plans |
+| `./bazel run //:replay -- --seed <n>` | replay one seed exactly |
+| `./bazel run //:sweep -- --seeds <count> --from-seed <first> --filter <name>` | search for seeds nobody has tried |
 
 ## Two rules
 
@@ -24,7 +24,7 @@ determines one entire run**, so anything found can be replayed exactly.
 source (`DEFAULT_SIM_SEED`, or a plan's own `QOS_SEEDS`). CI never draws a random
 seed, so a CI failure is always real and always reproducible. It cannot flake.
 
-**Search is advisory and never blocks.** `just sweep` explores new seeds — nightly
+**Search is advisory and never blocks.** `./bazel run //:sweep` explores new seeds nightly
 in CI (`.github/workflows/nightly.yml`, over a window that advances each run) and
 on demand locally. Its only product is a seed to promote. It is not a gate, and a
 sweep failure is not a broken build.
@@ -35,7 +35,7 @@ sweep failure is not a broken build.
    sweep ──> "seed 4711 fails tests::bwe::foo"
                │
                ▼
-     just --justfile crates/pulsebeam-simulator/Justfile replay 4711
+     ./bazel run //:replay -- --seed 4711
                │
                ▼
           fix the bug
@@ -44,7 +44,7 @@ sweep failure is not a broken build.
      add 4711 to that plan's seed list   promote
                │
                ▼
-   every PR ──> just test                guarded forever
+   every PR ──> ./bazel test //:test                guarded forever
 ```
 
 Promotion is the point. A seed that found a bug once becomes a committed
@@ -251,7 +251,7 @@ is committed and replayed before any new case.
 
 `bwe-baseline.txt` is a committed, diffable record of what every authored plan
 measured — capacity, estimate, drawdown, demand, queueing, loss. Regenerate with
-Run `just --justfile crates/pulsebeam-simulator/Justfile baseline` and read the
+`./bazel run //:scoreboard` and read the
 diff.
 
 It is not a test. Its job is that a congestion-control change rarely improves
@@ -348,10 +348,10 @@ so the next person can requalify the number instead of guessing at it.
 Simulation runs are minutes long and mostly idle CPU-wise from the agent's point
 of view, so the slow way to work is one plan at a time, waiting on each.
 
-- **Batch the verification chain.** `just check`, `just test`, the scoreboard
-  and the sweep run unattended as one job. Check back once.
-- **Do not interleave source edits with a running simulation.** Cargo rebuilds
-  mid-run and the results become a mix of two trees. Draft into a scratch file
+- **Batch final verification.** Freeze the candidate, then run `./bazel test //:test`.
+  Scoreboard regeneration and advisory sweeps retain their separate semantics.
+- **Do not interleave source edits with a running simulation.** A source change
+  invalidates affected evidence. Draft into a scratch file
   and apply when the run lands.
 - **Investigate while it runs.** Reading code, extracting a predicate, and
   writing unit tests cost nothing and need no build.

@@ -1,0 +1,8 @@
+node_modules
+agents/pulsebeam-agent-native/node_modules
+agents/pulsebeam-agent-web/node_modules
+agents/react/node_modules
+agents/react/tests/consumer/node_modules
+apps/meet/node_modules
+docs/node_modules
+target

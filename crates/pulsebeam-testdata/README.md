@@ -8,7 +8,7 @@ Fixture generation must be deterministic: encoder settings, frame counts, and
 the committed manifest together define the corpus. Never replace an asset
 without verifying its hash, length, decodability, and expected identity map.
 
-Use `just --justfile crates/pulsebeam-testdata/Justfile --list` for fixture,
-quality-corpus, screen-share, analysis, verification, and cleanup workflows.
-Normal consumers should use the committed assets and run `cargo test -p
-pulsebeam-testdata`.
+Consumers use committed assets, declared as Bazel compilation inputs.
+`./bazel test //crates/pulsebeam-testdata:unit_tests` validates corpus identity,
+hashes, and frame metadata. Corpus authoring scripts are not required for
+normal development or acceptance; never regenerate fixtures as package preparation.

@@ -1,0 +1,86 @@
+load("//tools:rust-metadata.bzl", "CARGO_METADATA_INPUTS")
+load("@bazel_skylib//rules:build_test.bzl", "build_test")
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files(["Cargo.toml", "Cargo.lock", "clippy.toml", "rust-toolchain.toml", "LICENSE", "README.md", "scripts/bwe-scoreboard.py"])
+
+filegroup(
+    name = "cargo_metadata_inputs",
+    srcs = ["Cargo.toml", "Cargo.lock"] + CARGO_METADATA_INPUTS,
+)
+
+RUST_OWNERS = [
+    "crates/pulsebeam", "crates/pulsebeam-cli", "crates/pulsebeam-core",
+    "crates/pulsebeam-proto", "crates/pulsebeam-routing", "crates/pulsebeam-rtc",
+    "crates/pulsebeam-runtime", "crates/pulsebeam-testdata",
+    "agents/pulsebeam-agent-core", "agents/pulsebeam-agent-native", "agents/pulsebeam-agent-web",
+]
+
+build_test(
+    name = "artifacts",
+    targets = [
+        "//crates/pulsebeam:server", "//crates/pulsebeam-cli:pulsebeam-cli",
+        "//agents/pulsebeam-agent-native:native", "//agents/pulsebeam-agent-web:package",
+        "//agents/pulsebeam-agent-web:uniffi_proof", "//agents/react:package",
+        "//apps/meet:export", "//docs:site",
+        "//crates/pulsebeam-simulator:replay", "//crates/pulsebeam-simulator:sweep",
+        "//crates/pulsebeam-simulator:scoreboard", "//crates/pulsebeam-rtc:benchmark",
+    ],
+)
+
+test_suite(
+    name = "check",
+    tests = ["//%s:%s" % (owner, check) for owner in RUST_OWNERS + ["crates/pulsebeam-simulator"] for check in ["format", "clippy"]] + [
+        ":artifacts", "//agents/pulsebeam-agent-web:js_format", "//agents/pulsebeam-agent-web:public_contract",
+        "//agents/pulsebeam-agent-web:uniffi_types", "//agents/pulsebeam-agent-web:uniffi_contract",
+        "//agents/react:format", "//agents/react:fast", "//apps/meet:check", "//tools:legacy_contract", "//tools:simulation_runner_contract", "//tools:scoreboard_contract", "//tools:ide_contract",
+        "//release:contract",
+    ],
+)
+
+test_suite(
+    name = "fast",
+    tests = [":check"] + ["//%s:unit_tests" % owner for owner in RUST_OWNERS] + [
+        "//crates/pulsebeam-rtc:integration_tests", "//crates/pulsebeam-rtc:browser_protocol",
+        "//crates/pulsebeam-simulator:fast",
+    ],
+)
+
+test_suite(
+    name = "slow",
+    tests = [
+        "//crates/pulsebeam-simulator:slow", "//crates/pulsebeam-rtc:chrome",
+        "//crates/pulsebeam-rtc:firefox", "//crates/pulsebeam-rtc:rfc8888",
+        "//agents/pulsebeam-agent-web:browser",
+    ],
+    tags = ["slow"],
+)
+
+test_suite(name = "test", tests = [":fast", ":slow"])
+
+alias(name = "server", actual = "//crates/pulsebeam:server")
+alias(name = "cli", actual = "//crates/pulsebeam-cli:pulsebeam-cli")
+alias(name = "web", actual = "//agents/pulsebeam-agent-web:package")
+alias(name = "react", actual = "//agents/react:package")
+alias(name = "meet", actual = "//apps/meet:export")
+alias(name = "meet_dev", actual = "//apps/meet:dev")
+alias(name = "docs", actual = "//docs:site")
+alias(name = "docs_dev", actual = "//docs:dev")
+alias(name = "web_dev", actual = "//agents/pulsebeam-agent-web:dev")
+alias(name = "replay", actual = "//crates/pulsebeam-simulator:replay")
+alias(name = "sweep", actual = "//crates/pulsebeam-simulator:sweep")
+alias(name = "scoreboard", actual = "//crates/pulsebeam-simulator:scoreboard")
+alias(name = "benchmark", actual = "//crates/pulsebeam-rtc:benchmark")
+alias(name = "rust_ide", actual = "@rules_rust//tools/rust_analyzer:setup")
+alias(name = "ide", actual = "//tools:ide")
+alias(name = "fix", actual = "//tools:fix")
+alias(name = "native", actual = "//agents/pulsebeam-agent-native:native")
+alias(name = "release_artifacts", actual = "//release:all")
+alias(name = "image", actual = "//release:image")
+
+filegroup(
+    name = "workflow_inputs",
+    srcs = glob(["*.md", "Justfile", ".cargo/*.toml", ".github/**/*.yml", "scripts/*.sh"], allow_empty = True) +
+           ["//%s:workflow_inputs" % owner for owner in RUST_OWNERS + ["crates/pulsebeam-simulator", "agents/react", "apps/meet", "docs", "tools"]],
+)

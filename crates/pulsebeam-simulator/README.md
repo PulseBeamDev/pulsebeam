@@ -20,8 +20,9 @@ or failure injection.
 
 ## Commands
 
-- Root `just test` runs the committed deterministic suite.
-- `just --justfile crates/pulsebeam-simulator/Justfile replay <seed> [filter]`
-  reproduces one seed.
-- The local `sweep` and `baseline` recipes search seeds and regenerate the
-  diffable BWE scoreboard.
+- Root `./bazel test //:test` runs acceptance, including committed seeds, with
+  one [human-authorized native DTLS exception](docs/native-dtls-exception.md).
+- `./bazel run //:replay -- --seed <seed> --filter <name>` reproduces a seed.
+- `./bazel run //:sweep -- --seeds <count> --from-seed <first> --filter <name>`
+  searches replayable seeds outside merge gates.
+- `./bazel run //:scoreboard` explicitly regenerates the diffable BWE scoreboard.

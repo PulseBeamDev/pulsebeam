@@ -11,4 +11,4 @@ packet state in `pulsebeam`; read the
 an ownership or synchronization boundary.
 
 Network implementations must preserve the same observable contract under real
-I/O and simulation. Run `cargo test -p pulsebeam-runtime`, then root `just test`.
+I/O and simulation. Run `./bazel test //crates/pulsebeam-runtime:unit_tests`, then root `./bazel test //:test`.

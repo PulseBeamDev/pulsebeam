@@ -2,14 +2,13 @@
 
 use std::fs;
 use std::path::PathBuf;
-use std::process::Command;
-
-const STRICT_CONSUMER: &str = include_str!("contracts/strict-consumer.ts");
 
 #[test]
 fn generated_package_has_strict_portable_boundaries() {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let generated = root.join("generated/bindings");
+    let generated = PathBuf::from(
+        std::env::var_os("PULSEBEAM_UNIFFI_BINDINGS")
+            .expect("run //agents/pulsebeam-agent-web:uniffi_contract through ./bazel test"),
+    );
     let core = fs::read_to_string(generated.join("pulsebeam_agent_core.ts"))
         .expect("core bindings must be generated");
     let web = fs::read_to_string(generated.join("pulsebeam_agent_web.ts"))
@@ -50,33 +49,7 @@ fn generated_package_has_strict_portable_boundaries() {
     assert!(!config.contains("requestHeaders"));
     assert!(!config.contains("manualSubscriptions"));
 
-    let consumer = root.join("target/uniffi-strict-consumer.ts");
-    fs::create_dir_all(consumer.parent().expect("consumer has parent"))
-        .expect("create consumer directory");
-    fs::write(&consumer, STRICT_CONSUMER).expect("write strict consumer");
-
-    let status = Command::new("pnpm")
-        .args([
-            "exec",
-            "tsc",
-            "--strict",
-            "--noEmit",
-            "--target",
-            "ES2022",
-            "--module",
-            "ESNext",
-            "--moduleResolution",
-            "Bundler",
-            "--lib",
-            "ES2022,DOM,DOM.Iterable,ESNext.Disposable",
-            "--allowJs",
-        ])
-        .arg(root.join("web/assets.d.ts"))
-        .arg(&consumer)
-        .current_dir(&root)
-        .status()
-        .expect("run TypeScript compiler");
-    assert!(status.success(), "strict generated-package consumer failed");
+    // The strict consumer is compiled by the paired :uniffi_types Bazel test.
 }
 
 fn record_definition<'a>(source: &'a str, name: &str) -> &'a str {

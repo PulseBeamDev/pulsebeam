@@ -32,11 +32,11 @@ Canonical entity IDs can be derived for log lookup with `id room`,
 `--project-id` and the external identity chain for the requested entity.
 
 ```text
-cargo run --release -p pulsebeam-cli -- \
+./bazel run --config=release //:cli -- \
   --api-url http://127.0.0.1:7070 bench \
   --rooms 5 --users-per-room 4 --max-rooms 50
 ```
 
 Keep command documentation aligned with `--help`; do not document unimplemented
-subcommands. Focused verification is `cargo test -p pulsebeam-cli`, followed by
-the root `just check` and `just test` gates.
+subcommands. Focused verification is `./bazel test //crates/pulsebeam-cli:unit_tests`, followed by
+the root `./bazel test //:check` and `./bazel test //:test` gates.

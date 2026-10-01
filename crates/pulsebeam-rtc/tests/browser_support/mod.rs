@@ -50,9 +50,19 @@ pub type TestResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
 const PAGE: &[u8] = include_bytes!("../../browser/interop.html");
 const PLATFORM: &str = "linux-x86_64";
-const CHROME_VERSION: &str = "153.0.8010.36";
-const FIREFOX_VERSION: &str = "140.15.0esr";
-const GECKODRIVER_VERSION: &str = "0.36.0";
+fn matrix_artifact(name: &str) -> serde_json::Value {
+    let matrix: serde_json::Value =
+        serde_json::from_str(include_str!("../../browser/browser-matrix.json"))
+            .expect("valid pinned browser matrix");
+    let artifacts = matrix["platforms"][PLATFORM]["artifacts"]
+        .as_array()
+        .expect("matrix artifacts");
+    let index = artifacts
+        .iter()
+        .position(|artifact| artifact["name"] == name)
+        .expect("browser artifact is pinned");
+    artifacts.get(index).expect("pinned artifact index").clone()
+}
 
 #[derive(Clone, Copy, Debug, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -69,11 +79,11 @@ impl BrowserKind {
         }
     }
 
-    fn browser_probe(self) -> &'static str {
-        match self {
-            Self::Chrome => "Google Chrome for Testing 153.0.8010.36",
-            Self::Firefox => "Mozilla Firefox 140.15.0esr",
-        }
+    fn browser_probe(self) -> String {
+        matrix_artifact(self.name())["probe"]
+            .as_str()
+            .expect("browser version probe")
+            .to_owned()
     }
 
     fn driver_name(self) -> &'static str {
@@ -83,11 +93,11 @@ impl BrowserKind {
         }
     }
 
-    fn driver_probe(self) -> &'static str {
-        match self {
-            Self::Chrome => "ChromeDriver 153.0.8010.36",
-            Self::Firefox => "geckodriver 0.36.0",
-        }
+    fn driver_probe(self) -> String {
+        matrix_artifact(self.driver_name())["probe"]
+            .as_str()
+            .expect("driver version probe")
+            .to_owned()
     }
 }
 
@@ -187,9 +197,11 @@ struct BrowserHarness {
 }
 
 impl BrowserHarness {
-    async fn start(kind: BrowserKind, artifacts: &Path) -> TestResult<Self> {
-        let driver_binary = artifacts.join("bin").join(kind.driver_name());
-        let browser_binary = artifacts.join("bin").join(kind.name());
+    async fn start(
+        kind: BrowserKind,
+        driver_binary: &Path,
+        browser_binary: &Path,
+    ) -> TestResult<Self> {
         let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
         let port = listener.local_addr()?.port();
         drop(listener);
@@ -204,7 +216,20 @@ impl BrowserHarness {
                 command.arg(format!("--port={port}"));
             }
             BrowserKind::Firefox => {
-                command.args(["--port", &port.to_string()]);
+                let home = std::env::var_os("TEST_TMPDIR")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(std::env::temp_dir)
+                    .join(format!("rtc-firefox-{port}"));
+                for directory in [&home, &home.join("cache"), &home.join("config")] {
+                    fs::create_dir_all(directory)?;
+                }
+                command
+                    .args(["--port", &port.to_string(), "--websocket-port", "0"])
+                    .arg("--profile-root")
+                    .arg(&home)
+                    .env("HOME", &home)
+                    .env("XDG_CACHE_HOME", home.join("cache"))
+                    .env("XDG_CONFIG_HOME", home.join("config"));
             }
         }
         let mut child = command
@@ -631,28 +656,26 @@ fn point(start: Instant, now: Instant) -> TimePoint {
 
 pub async fn run_matrix(kind: BrowserKind) -> TestResult<()> {
     let workspace = workspace();
-    let artifacts = workspace
-        .join("target/pulsebeam-rtc-browsers")
-        .join(PLATFORM);
-    verify_matrix(&workspace)?;
-    let browser_version = probe(
-        &artifacts.join("bin").join(kind.name()),
-        kind.browser_probe(),
-    )?;
-    let driver_version = probe(
-        &artifacts.join("bin").join(kind.driver_name()),
-        kind.driver_probe(),
-    )?;
-    assert!(browser_version.contains(match kind {
-        BrowserKind::Chrome => CHROME_VERSION,
-        BrowserKind::Firefox => FIREFOX_VERSION,
-    }));
-    assert!(driver_version.contains(match kind {
-        BrowserKind::Chrome => CHROME_VERSION,
-        BrowserKind::Firefox => GECKODRIVER_VERSION,
-    }));
+    let browser_binary = declared_binary("PULSEBEAM_BROWSER_BINARY")?;
+    let driver_binary = declared_binary("PULSEBEAM_DRIVER_BINARY")?;
+    let browser_version = probe(&browser_binary, &kind.browser_probe())?;
+    let driver_version = probe(&driver_binary, &kind.driver_probe())?;
+    assert!(
+        browser_version.contains(
+            matrix_artifact(kind.name())["version"]
+                .as_str()
+                .expect("browser pin")
+        )
+    );
+    assert!(
+        driver_version.contains(
+            matrix_artifact(kind.driver_name())["version"]
+                .as_str()
+                .expect("driver pin")
+        )
+    );
 
-    let mut browser = BrowserHarness::start(kind, &artifacts).await?;
+    let mut browser = BrowserHarness::start(kind, &driver_binary, &browser_binary).await?;
     let (offer, browser_evidence, peer_evidence) = run_live_case(&mut browser, true).await?;
     let (_, _, aborted) = run_live_case(&mut browser, false).await?;
     assert!(aborted.closed);
@@ -789,18 +812,20 @@ fn scenario_evidence(
     ]
 }
 
-fn verify_matrix(workspace: &Path) -> TestResult<()> {
-    let status =
-        ProcessCommand::new(workspace.join("crates/pulsebeam-rtc/scripts/provision-browsers.sh"))
-            .args(["--platform", PLATFORM, "--verify-only"])
-            .current_dir(workspace)
-            .status()?;
-    if !status.success() {
-        return Err(
-            "repository-provisioned browser matrix failed hash/version verification".into(),
-        );
+// Archive hashes are enforced by the matrix-driven Bazel repositories;
+// executable probes below retain the live version checks.
+fn declared_binary(variable: &str) -> TestResult<PathBuf> {
+    let path = PathBuf::from(std::env::var_os(variable).ok_or_else(|| {
+        format!("missing {variable}; run the RTC browser target through ./bazel test")
+    })?);
+    if !path.is_file() {
+        return Err(format!(
+            "{variable} does not identify a provisioned executable: {}",
+            path.display()
+        )
+        .into());
     }
-    Ok(())
+    Ok(path.canonicalize()?)
 }
 
 fn probe(path: &Path, expected: &str) -> TestResult<String> {
@@ -836,7 +861,12 @@ fn workspace() -> PathBuf {
 }
 
 fn artifact_dir() -> PathBuf {
-    workspace().join("target/pulsebeam-rtc-browser-artifacts")
+    PathBuf::from(
+        std::env::var_os("TEST_UNDECLARED_OUTPUTS_DIR")
+            .or_else(|| std::env::var_os("TEST_TMPDIR"))
+            .expect("RTC browser tests require Bazel's isolated output directory"),
+    )
+    .join("rtc-browser")
 }
 
 fn remote_value(value: &serde_json::Value) -> serde_json::Value {

@@ -1,0 +1,297 @@
+load("@crates//:defs.bzl", "aliases", "crate_edition")
+load("//tools:wasm-deps.bzl", "all_crate_deps")
+load("@rules_rust//cargo:defs.bzl", "cargo_toml_env_vars", "extract_cargo_lints")
+load("@rules_rust//rust:defs.bzl", "rust_shared_library", "rust_library", "rust_test", "rust_clippy_test", "rustfmt_test")
+load("@rules_rust_wasm_bindgen//:defs.bzl", "rust_wasm_bindgen")
+load("@bazel_lib//lib:copy_to_directory.bzl", "copy_to_directory")
+load("@bazel_lib//lib:run_binary.bzl", "run_binary")
+load("@bazel_lib//lib:copy_file.bzl", "copy_file")
+load("@bazel_lib//lib:output_files.bzl", "output_files")
+load("@rules_python//python:defs.bzl", "py_binary", "py_test")
+load("@web_npm//agents/pulsebeam-agent-web:typescript-language-server/package_json.bzl", tsls = "bin")
+load("@aspect_rules_js//js:defs.bzl", "js_run_binary")
+load("@aspect_rules_js//npm:defs.bzl", "npm_package")
+load("@web_npm//:defs.bzl", "npm_link_all_packages")
+load("@web_npm//agents/pulsebeam-agent-web:typescript/package_json.bzl", typescript = "bin")
+load("@web_npm//agents/pulsebeam-agent-web:prettier/package_json.bzl", prettier = "bin")
+
+package(default_visibility = ["//visibility:public"])
+filegroup(name = "workflow_inputs", srcs = glob(["*.md", "docs/**/*.md", "Justfile", "*.json", "*.yaml", "scripts/*.sh"], allow_empty = True))
+exports_files(["Cargo.toml", "package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml"])
+
+npm_link_all_packages(name = "node_modules")
+typescript.tsc_binary(name = "tsc")
+
+typescript.tsc_test(
+    name = "public_contract",
+    args = ["-p", "tsconfig.public-contract.json"],
+    chdir = package_name(),
+    data = [":typescript", ":dist/wasm", ":node_modules"] + glob(["web/**", "tests/contracts/**", "tsconfig*.json"]),
+)
+
+copy_to_directory(
+    name = "format_sources",
+    srcs = glob(["web/**", "tests/**", "*.json", "*.mjs", "ubrn.config.yaml", "pnpm-workspace.yaml"], allow_empty = True),
+)
+
+py_test(
+    name = "js_format",
+    srcs = ["//tools:check-js-format.py"],
+    main = "//tools:check-js-format.py",
+    args = ["--formatter", "$(rootpath :prettier)", "--source", "$(rootpath :format_sources)", "--", "web/**/*.ts", "tests/**/*.{js,ts}", "*.{json,mjs}", "ubrn.config.yaml", "pnpm-workspace.yaml"],
+    data = [":prettier", ":format_sources"],
+)
+filegroup(name = "cargo_metadata_inputs", srcs = glob(["Cargo.toml", "uniffi.toml", "src/**/*.rs", "benches/**/*.rs", "examples/**/*.rs"], allow_empty = True))
+
+cargo_toml_env_vars(name = "cargo_env", src = "Cargo.toml", workspace = "//:Cargo.toml")
+extract_cargo_lints(name = "lints", manifest = "Cargo.toml", workspace = "//:Cargo.toml")
+
+rust_library(
+    name = "pulsebeam-agent-web",
+    crate_root = "src/lib.rs",
+    srcs = glob(["src/**/*.rs"], exclude = ["src/bin/**"]),
+    compile_data = ["Cargo.toml", "//:Cargo.toml"] + glob(["README.md", "src/**"], exclude = ["src/**/*.rs"]),
+    edition = crate_edition(),
+    crate_features = [],
+    rustc_env_files = [":cargo_env"],
+    lint_config = ":lints",
+    aliases = aliases() | {"//agents/pulsebeam-agent-core:pulsebeam-agent-core": "agent_core"},
+    deps = all_crate_deps(normal = True) + ["//agents/pulsebeam-agent-core:pulsebeam-agent-core"],
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+)
+
+rust_test(
+    name = "unit_tests",
+    crate = ":pulsebeam-agent-web",
+    lint_config = ":lints",
+    aliases = aliases(normal_dev = True, proc_macro_dev = True),
+    deps = all_crate_deps(normal_dev = True) + ["//crates/pulsebeam-core:pulsebeam-core"],
+    proc_macro_deps = all_crate_deps(proc_macro_dev = True),
+    
+)
+
+rust_shared_library(
+    name = "wasm_library",
+    crate_name = "pulsebeam_agent_web",
+    crate_root = "src/lib.rs",
+    srcs = glob(["src/**/*.rs"], exclude = ["src/bin/**"]),
+    compile_data = ["Cargo.toml", "//:Cargo.toml"],
+    edition = crate_edition(),
+    rustc_env_files = [":cargo_env"],
+    lint_config = ":lints",
+    aliases = aliases() | {"//agents/pulsebeam-agent-core:pulsebeam-agent-core": "agent_core"},
+    deps = all_crate_deps(normal = True) + ["//agents/pulsebeam-agent-core"],
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+)
+
+rust_wasm_bindgen(
+    name = "dist/wasm",
+    wasm_file = ":wasm_library",
+    target = "web",
+    out_name = "pulsebeam_agent_web",
+)
+
+alias(name = "wasm", actual = ":dist/wasm")
+
+rust_shared_library(
+    name = "uniffi_metadata",
+    crate_name = "pulsebeam_agent_web",
+    crate_root = "src/lib.rs",
+    srcs = glob(["src/**/*.rs"], exclude = ["src/bin/**"]),
+    compile_data = ["Cargo.toml", "//:Cargo.toml"],
+    crate_features = ["uniffi"],
+    edition = crate_edition(),
+    rustc_env_files = [":cargo_env"],
+    lint_config = ":lints",
+    aliases = aliases() | {"//agents/pulsebeam-agent-core:pulsebeam-agent-core": "agent_core"},
+    deps = all_crate_deps(normal = True) + ["//agents/pulsebeam-agent-core:pulsebeam-agent-core"],
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+)
+
+rust_library(
+    name = "uniffi_library",
+    crate_name = "pulsebeam_agent_web",
+    crate_root = "src/lib.rs",
+    srcs = glob(["src/**/*.rs"], exclude = ["src/bin/**"]),
+    compile_data = ["Cargo.toml", "//:Cargo.toml"],
+    crate_features = ["uniffi"],
+    edition = crate_edition(),
+    rustc_env_files = [":cargo_env"],
+    lint_config = ":lints",
+    aliases = aliases() | {"//agents/pulsebeam-agent-core:pulsebeam-agent-core": "agent_core"},
+    deps = all_crate_deps(normal = True) + ["//agents/pulsebeam-agent-core:pulsebeam-agent-core"],
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+)
+
+run_binary(
+    name = "uniffi_bindings",
+    tool = "//tools:ubrn-codegen",
+    srcs = ["//:cargo_metadata_inputs", "ubrn.config.yaml", "ubrn.wasm.toml", "package.json"],
+    tools = [":uniffi_metadata", "//agents/pulsebeam-agent-core:native_library", "@build_tools//:uniffi-bindgen-react-native__uniffi-bindgen-react-native", "@pulsebeam_rust_host_tools//:cargo", "@pulsebeam_rust_host_tools//:rustc", "@pulsebeam_rust_host_tools//:rustc_lib"],
+    out_dirs = ["uniffi/bindings"],
+    outs = ["generated/wasm/src/lib.rs", "generated/wasm/src/pulsebeam_agent_web_module.rs", "generated/wasm/src/pulsebeam_agent_core_module.rs", "generated/index.web.ts", "generated/wasm/Cargo.toml"],
+    args = [
+        "--generator", "$(execpath @build_tools//:uniffi-bindgen-react-native__uniffi-bindgen-react-native)",
+        "--cargo", "$(execpath @pulsebeam_rust_host_tools//:cargo)",
+        "--rustc", "$(execpath @pulsebeam_rust_host_tools//:rustc)",
+        "--web-library", "$(execpath :uniffi_metadata)",
+        "--core-library", "$(execpath //agents/pulsebeam-agent-core:native_library)",
+        "--bindings-output", "$(RULEDIR)/uniffi/bindings",
+        "--lib-output", "$(RULEDIR)/generated/wasm/src/lib.rs",
+        "--web-module-output", "$(RULEDIR)/generated/wasm/src/pulsebeam_agent_web_module.rs",
+        "--core-module-output", "$(RULEDIR)/generated/wasm/src/pulsebeam_agent_core_module.rs",
+        "--entrypoint-output", "$(RULEDIR)/generated/index.web.ts",
+        "--manifest-output", "$(RULEDIR)/generated/wasm/Cargo.toml",
+    ],
+    mnemonic = "UBRNBindings",
+)
+
+output_files(
+    name = "typescript_bindings",
+    target = ":uniffi_bindings",
+    paths = [package_name() + "/uniffi/bindings"],
+)
+
+rust_shared_library(
+    name = "uniffi_wasm_library",
+    crate_name = "pulsebeam_agent_web_wasm",
+    crate_root = "generated/wasm/src/lib.rs",
+    srcs = ["generated/wasm/src/lib.rs", "generated/wasm/src/pulsebeam_agent_web_module.rs", "generated/wasm/src/pulsebeam_agent_core_module.rs"],
+    # Pinned UBRN emits Rust 2021 extern blocks; do not patch generated output.
+    edition = "2021",
+    deps = [":uniffi_library", "//agents/pulsebeam-agent-core:pulsebeam-agent-core", "@wasm_crates//:uniffi-runtime-javascript", "@wasm_crates//:wasm-bindgen"],
+)
+
+rust_wasm_bindgen(
+    name = "uniffi-wasm-bindgen",
+    wasm_file = ":uniffi_wasm_library",
+    target = "web",
+    out_name = "index",
+    bindgen_flags = ["--omit-default-module-path"],
+)
+
+copy_to_directory(
+    name = "bindings_dir",
+    out = "generated/bindings",
+    srcs = [":typescript_bindings", ":uniffi-wasm-bindgen"],
+    replace_prefixes = {"uniffi/bindings/": "", "uniffi-wasm-bindgen/": "wasm-bindgen/"},
+)
+
+output_files(
+    name = "uniffi_wasm_file",
+    target = ":uniffi-wasm-bindgen",
+    paths = [package_name() + "/uniffi-wasm-bindgen/index_bg.wasm"],
+)
+
+js_run_binary(
+    name = "uniffi_proof",
+    tool = ":tsc",
+    srcs = [":uniffi_bindings", ":bindings_dir", ":node_modules", "tsconfig.uniffi.json", "tsconfig.uniffi.browser.json"] + glob(["web/**"]),
+    args = ["-p", "tsconfig.uniffi.browser.json", "--outDir", "uniffi-proof"],
+    chdir = package_name(),
+    out_dirs = ["uniffi-proof"],
+)
+
+copy_file(
+    name = "strict_consumer_source",
+    src = "tests/contracts/strict-consumer.ts",
+    out = "target/uniffi-strict-consumer.ts",
+)
+
+typescript.tsc_test(
+    name = "uniffi_types",
+    args = ["--strict", "--noEmit", "--target", "ES2022", "--module", "ESNext", "--moduleResolution", "Bundler", "--lib", "ES2022,DOM,DOM.Iterable,ESNext.Disposable", "--allowJs", "web/assets.d.ts", "target/uniffi-strict-consumer.ts"],
+    chdir = package_name(),
+    data = [":uniffi_bindings", ":bindings_dir", ":strict_consumer_source", ":node_modules"] + glob(["web/**"]),
+)
+
+rust_test(
+    name = "uniffi_contract",
+    crate_root = "tests/uniffi_contract.rs",
+    srcs = ["tests/uniffi_contract.rs"],
+    edition = crate_edition(),
+    lint_config = ":lints",
+    data = [":bindings_dir"],
+    env = {"PULSEBEAM_UNIFFI_BINDINGS": "$(rootpath :bindings_dir)"},
+)
+
+js_run_binary(
+    name = "typescript",
+    tool = ":tsc",
+    srcs = ["tsconfig.json", ":dist/wasm", ":node_modules"] + glob(["web/**"]),
+    args = ["-p", "tsconfig.json", "--outDir", "typescript"],
+    chdir = package_name(),
+    out_dirs = ["typescript"],
+)
+
+npm_package(
+    name = "package",
+    srcs = ["package.json", "LICENSE", ":typescript", ":dist/wasm"],
+    replace_prefixes = {"typescript": "dist"},
+)
+
+copy_to_directory(
+    name = "browser_assets",
+    srcs = [":package", ":uniffi_proof", ":uniffi-wasm-bindgen", ":node_modules/@ubjs/core/dir"] + glob(["tests/*.html", "tests/contracts/*.js"]),
+    replace_prefixes = {
+        "package/": "",
+        "uniffi-proof/": "dist/uniffi-proof/",
+        "uniffi-wasm-bindgen/": "dist/uniffi-proof/generated/bindings/wasm-bindgen/",
+        "node_modules/.aspect_rules_js/*/node_modules/": "node_modules/",
+    },
+)
+
+rust_test(
+    name = "browser",
+    crate_root = "tests/browser.rs",
+    srcs = ["tests/browser.rs"] + glob(["tests/support/**/*.rs"]),
+    compile_data = glob(["tests/contracts/*.js"]) + ["//agents/react:browser_observer"],
+    crate_features = ["browser-tests"],
+    edition = crate_edition(),
+    rustc_env_files = [":cargo_env"],
+    lint_config = ":lints",
+    aliases = aliases(normal = True, normal_dev = True, proc_macro = True, proc_macro_dev = True),
+    deps = all_crate_deps(normal = True, normal_dev = True) + ["//crates/pulsebeam-core:pulsebeam-core"],
+    proc_macro_deps = all_crate_deps(proc_macro = True, proc_macro_dev = True),
+    args = ["--test-threads=1"],
+    data = [
+        ":browser_assets",
+        "//agents/react:browser_fixture",
+        "//crates/pulsebeam:server",
+        "@browser_chrome//:files",
+        "@browser_chrome//:executable",
+        "@browser_chromedriver//:files",
+        "@browser_chromedriver//:executable",
+    ],
+    env = {
+        "PULSEBEAM_WEB_FIXTURE_ROOT": "$(rootpath :browser_assets)",
+        "PULSEBEAM_REACT_FIXTURE_ROOT": "$(rootpath //agents/react:browser_fixture)",
+        "PULSEBEAM_SERVER_BINARY": "$(rootpath //crates/pulsebeam:server)",
+        "PULSEBEAM_BROWSER_BINARY": "$(rootpath @browser_chrome//:executable)",
+        "PULSEBEAM_DRIVER_BINARY": "$(rootpath @browser_chromedriver//:executable)",
+    },
+    tags = ["slow"],
+    size = "large",
+)
+
+copy_to_directory(
+    name = "dev_assets",
+    srcs = [":browser_assets", "index.html"],
+    replace_prefixes = {"browser_assets/": ""},
+)
+
+py_binary(
+    name = "dev",
+    srcs = ["//tools:static-server.py"],
+    main = "//tools:static-server.py",
+    args = ["$(rootpath :dev_assets)"],
+    data = [":dev_assets"],
+)
+
+tsls.typescript_language_server_binary(name = "lsp", args = ["--stdio"], data = [":node_modules"])
+
+prettier.prettier_binary(name = "prettier")
+alias(name = "fix", actual = "//tools:fix")
+
+rustfmt_test(name = "format", targets = [":pulsebeam-agent-web", ":browser", ":uniffi_contract"])
+rust_clippy_test(name = "clippy", targets = [":pulsebeam-agent-web", ":unit_tests"])

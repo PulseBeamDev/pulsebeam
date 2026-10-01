@@ -1,0 +1,15 @@
+load("@consumer_npm//:defs.bzl", "npm_link_all_packages")
+load("@consumer_npm//agents/react/tests/consumer:typescript/package_json.bzl", typescript = "bin")
+
+package(default_visibility = ["//visibility:public"])
+exports_files(["package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml"])
+filegroup(name = "sources", srcs = glob(["src/**"]))
+
+npm_link_all_packages(name = "node_modules")
+
+typescript.tsc_test(
+    name = "contract",
+    args = ["-p", "tsconfig.json"],
+    chdir = package_name(),
+    data = [":node_modules", ":sources", "tsconfig.json"],
+)
