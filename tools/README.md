@@ -11,7 +11,7 @@ build framework or an alternative package compilation pipeline.
 | --- | --- | --- |
 | Bazel | `.bazelversion`; launcher Bazelisk version/checksums in `bazel` | Local and CI launch the same executable |
 | Rust channel/components/targets | `rust-toolchain.toml` | `tools/rust-pins.MODULE.bazel` toolchains/host tools |
-| Rust dependencies/features/lints | Cargo manifests and `Cargo.lock` | Native/browser crate-universe graphs, `rust-metadata.bzl` and `wasm-deps.bzl` |
+| Rust dependencies/features/lints, including the server SDK, shared auth primitives and conformance proof | Cargo manifests and `Cargo.lock` | Native/browser crate-universe graphs, `rust-metadata.bzl` and `wasm-deps.bzl` |
 | WASM glue/runtime and UniFFI | Cargo lock/manifests | Build-tool universe, generated bindings and proof runtime |
 | UBRN generator | `tools/generators.toml` | Derived generator repository |
 | JS dependencies | Each owner package manifest and frozen pnpm lock | rules_js npm repositories and editor installs |

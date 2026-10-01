@@ -142,6 +142,7 @@ secret, room/participant external IDs, and mandatory absolute Unix expiration:
 - [TypeScript / Node.js: `@pulsebeam/server`](sdks/typescript/README.md)
 - [Go: `github.com/PulseBeamDev/pulsebeam/sdks/go`](sdks/go/README.md)
 - [Python: `pulsebeam-server`](sdks/python/README.md)
+- [Rust: `pulsebeam-server`](sdks/rust/README.md)
 
 These server-only SDKs use native Ed25519, with no PulseBeam connectivity or
 Rust/WASM runtime. Keep signing secrets on your server, never in client code.

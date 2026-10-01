@@ -4,6 +4,12 @@ This language-neutral profile and [vectors.json](vectors.json) are the SDK
 correctness authority. The existing Rust server remains the authorization
 boundary. No SDK or vector generator can alter server acceptance rules.
 
+The shared Rust [`pulsebeam-auth`](../../crates/pulsebeam-auth/README.md) library
+owns transport-free ID/key codecs. Core and the Rust SDK depend on it separately:
+the SDK owns JWT generation, while core owns registry matching and verification.
+This conformance package tests their boundary; it is not the shared library or a
+public signing package.
+
 ## Inputs and codecs
 
 All six inputs are mandatory: project ID, API key ID, signing secret, room
@@ -44,19 +50,27 @@ verifies the signature, and requires `now < exp`.
 ## Fixture adaptation
 
 `valid[].input.expiration` is a decimal string to avoid JSON numeric precision
-loss. Adapters use bigint (TypeScript), uint64 (Go), or int (Python), not a public
-string expiration API. Each accepted fixture records canonical IDs, seed/public
+loss. Adapters use bigint (TypeScript), uint64 (Go), int (Python), or u64 (Rust), not a
+public string expiration API. Each accepted fixture records canonical IDs, seed/public
 key bytes, raw JSON, signing input, signature, and complete token. All packages
 consume every valid and every applicable invalid case through public entry
 points. Null invalid values represent omitted inputs. `representation: number`
 invalid expirations exercise an inexact native numeric type; `string` exercises
 the forbidden string API input. Go rejects wrong types and omission of its
 mandatory uint64 argument at compile time; its adapter establishes those cases
-with the Go type checker. No applicable fixture is silently skipped.
+with the Go type checker. Rust uses compile-fail doctests against the packaged
+crate for its corresponding typed boundary. Runtime adapters classify every
+invalid fixture and reject unknown fields/representations. No applicable
+fixture is silently skipped.
 
-`generate-vectors.mjs` is an explicit maintenance generator using Node's native
-Ed25519, not an SDK. Run `node sdks/auth/generate-vectors.mjs` and review the diff.
+`cases.json` is the maintenance source for accepted inputs, seed bytes and
+rejections. The Rust generator uses native Ed25519 directly, not an SDK signer.
+Run `./bazel run //sdks/auth:generate_vectors` and review the `vectors.json` diff.
 Golden data is committed and never regenerated during tests. Its seed/public key
 pair comes from RFC 8032 section 7.1 test 2, not development credentials.
-Independent Go/Python crypto verification and Rust server verification check
-that the generator and SDKs have not converged on an incorrect algorithm.
+Rust owns the shared conformance and server-authorization tests under this
+package. Independent strict Ed25519 verification of every frozen signature,
+including expiration zero, is anchored to the RFC public key. The Go/Python
+consumer tests independently verify signatures with their native crypto.
+These checks prevent a self-consistent generator/signer from redefining auth.
+Run `./bazel test //sdks/auth:fast` for the shared owning gate.
