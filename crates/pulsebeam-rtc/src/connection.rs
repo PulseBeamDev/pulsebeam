@@ -860,8 +860,7 @@ mod tests {
         );
         fixture.configure_bottleneck(2_000_000);
         fixture.configure_time_quantum(Duration::from_millis(5));
-        let mut source = PeerFixture::connected();
-        source.configure_time_quantum(Duration::from_millis(5));
+        let mut source = crate::test_source::ComponentSource::audio(1);
         let mut policy = crate::ConnectionConfig::default().default_audio_policy;
         policy.playout_delay = crate::PlayoutDelay::from_ticks(0, 50).expect("500 ms");
         policy.desired_bitrate = MediaPayloadBitrate::from_bps(2_000_000);
@@ -894,9 +893,8 @@ mod tests {
             for tick in 1..=600 {
                 let at = start + Duration::from_millis(tick * 5);
                 fixture.drive_for(at.saturating_duration_since(fixture.at().monotonic));
-                source.drive_for(at.saturating_duration_since(source.at().monotonic));
                 frame += 1;
-                let media = forwarded(source.send_source(&[0x5a; 1_000]), frame);
+                let media = forwarded(source.sample(fixture.at(), &[0x5a; 1_000]), frame);
                 match fixture.try_command(Command::SendMedia {
                     sender: fixture.sender,
                     media,
@@ -934,13 +932,15 @@ mod tests {
         for tick in 1..=600 {
             let at = start + Duration::from_millis(tick * 5);
             fixture.drive_for(at.saturating_duration_since(fixture.at().monotonic));
-            source.drive_for(at.saturating_duration_since(source.at().monotonic));
             frame += 1;
-            let media = forwarded(source.send_source(&[0x5a; 1_000]), frame);
-            let _ = fixture.try_command(Command::SendMedia {
+            let media = forwarded(source.sample(fixture.at(), &[0x5a; 1_000]), frame);
+            match fixture.try_command(Command::SendMedia {
                 sender: fixture.sender,
                 media,
-            });
+            }) {
+                Ok(()) | Err(CommandError::WouldBlock) => {}
+                Err(error) => panic!("unexpected media error: {error:?}"),
+            }
         }
         assert!(fixture.connection.stats().connection.transmitted_rtp_bytes > paused);
         assert!(
@@ -1008,8 +1008,7 @@ mod tests {
             if let Some(impairment) = impairment {
                 fixture.configure_impairment(impairment);
             }
-            let mut source = PeerFixture::connected();
-            source.configure_time_quantum(Duration::from_millis(5));
+            let mut source = crate::test_source::ComponentSource::audio(1);
             let mut policy = crate::ConnectionConfig::default().default_audio_policy;
             policy.playout_delay = crate::PlayoutDelay::from_ticks(0, 50).expect("500 ms");
             policy.desired_bitrate = MediaPayloadBitrate::from_bps(4_000_000);
@@ -1023,7 +1022,6 @@ mod tests {
             for tick in 1..=3_000_u64 {
                 let at = start + Duration::from_millis(tick * 5);
                 fixture.drive_for(at.saturating_duration_since(fixture.at().monotonic));
-                source.drive_for(at.saturating_duration_since(source.at().monotonic));
                 // Open-loop pacing traces, not TCP implementations or equal-share promises.
                 let cross_rate = match name {
                     "cubic-like" => {
@@ -1044,7 +1042,12 @@ mod tests {
                     cross_bytes += bytes;
                 }
                 for packet in 0..2 {
-                    let media = forwarded(source.send_source(&[0x5a; 1_000]), tick * 2 + packet);
+                    let packet_at = at + Duration::from_micros(packet * 2_500);
+                    fixture.drive_for(packet_at.saturating_duration_since(fixture.at().monotonic));
+                    let media = forwarded(
+                        source.sample(fixture.at(), &[0x5a; 1_000]),
+                        tick * 2 + packet,
+                    );
                     match fixture.try_command(Command::SendMedia {
                         sender: fixture.sender,
                         media,
@@ -1129,8 +1132,7 @@ mod tests {
                 .expect("envelope")
                 .native_queue_delay_target
         });
-        let mut source = PeerFixture::connected_video();
-        source.configure_time_quantum(Duration::from_millis(5));
+        let mut source = crate::test_source::ComponentSource::video(1);
         let mut policy = crate::ConnectionConfig::default().default_video_policy;
         policy.playout_delay = crate::PlayoutDelay::from_ticks(0, 50).expect("500 ms");
         policy.desired_bitrate = MediaPayloadBitrate::from_bps(2_000_000);
@@ -1138,11 +1140,10 @@ mod tests {
             sender: fixture.sender,
             policy,
         });
-        let start = fixture.at().monotonic.max(source.at().monotonic);
+        let start = fixture.at().monotonic;
         for frame in 1..=1_600_u64 {
             let at = start + Duration::from_millis(frame * 25);
             fixture.drive_for(at.saturating_duration_since(fixture.at().monotonic));
-            source.drive_for(at.saturating_duration_since(source.at().monotonic));
             let key = frame % 40 == 1;
             let size = if key {
                 1_000
@@ -1154,7 +1155,7 @@ mod tests {
             let mut payload = vec![0x5a; size];
             // Synthetic H.264 slices: IDR for keyframes, non-IDR for dependents.
             payload[0] = if key { 0x65 } else { 0x41 };
-            let mut media = forwarded(source.send_source(&payload), frame);
+            let mut media = forwarded(source.sample(fixture.at(), &payload), frame);
             media.frame.random_access = key;
             media.frame.dependencies = FrameDependencies::known(if key {
                 vec![]
@@ -1222,17 +1223,18 @@ mod tests {
             policy,
         });
         let start = fixture.at().monotonic;
-        let mut source = PeerFixture::connected();
-        source.configure_time_quantum(Duration::from_millis(2));
+        let mut source = crate::test_source::ComponentSource::audio(1);
         for id in 1..=6_000_u64 {
             let tick = start + Duration::from_millis(id * 2);
             fixture.drive_for(tick.saturating_duration_since(fixture.at().monotonic));
-            source.drive_for(tick.saturating_duration_since(source.at().monotonic));
-            let media = forwarded(source.send_source(&[0x5a; 1_000]), id);
-            let _ = fixture.try_command(Command::SendMedia {
+            let media = forwarded(source.sample(fixture.at(), &[0x5a; 1_000]), id);
+            match fixture.try_command(Command::SendMedia {
                 sender: fixture.sender,
                 media,
-            });
+            }) {
+                Ok(()) | Err(CommandError::WouldBlock) => {}
+                Err(error) => panic!("unexpected media error: {error:?}"),
+            }
         }
         fixture.drive_for(Duration::from_secs(2));
         assert_eq!(fixture.network_counters().1, 0);

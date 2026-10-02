@@ -274,6 +274,13 @@ share the world. No real sockets, hardware media, production scheduling, sleeps,
 or wall-clock protocol deadlines are used. The warm, uncached complete RTC suite
 has a five-second elapsed budget, including peer setup and teardown.
 
+High-volume egress traces in `src/network_tests.rs` and `src/connection.rs`
+construct canonical SFU media inputs through the private `src/test_source.rs`
+component source. Their receivers and packet feedback still use actual controlled
+libwebrtc peers. These traces establish server admission, scheduling, and
+congestion invariants, not native ingress interoperability. Separate native media
+and media-clock tests retain authenticated source delivery and normalization.
+
 Actual authenticated bidirectional media, client-generated TWCC accounting,
 DataChannels, and same-seed replay are interoperability evidence. RFC 8888 and
 passive ICE-TCP retain client-free negotiation, framing, parsing, and accounting
