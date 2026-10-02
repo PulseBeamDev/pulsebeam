@@ -35,7 +35,7 @@ pip = use_extension("@rules_python//python/extensions:pip.bzl", "pip")
 pip.parse(
     hub_name = "server_pypi",
     python_version = "3.12.11",
-    requirements_lock = "//sdks/python:requirements.lock",
+    requirements_lock = "//server/python:requirements.lock",
 )
 use_repo(pip, "server_pypi")
 
@@ -56,7 +56,7 @@ npm.npm_translate_lock(name = "meet_npm", pnpm_lock = "//apps/meet:pnpm-lock.yam
 # Langium imports these transitive packages without declaring them directly.
 # Preserve pnpm's compatibility hoist using the existing locked version.
 npm.npm_translate_lock(name = "docs_npm", pnpm_lock = "//docs:pnpm-lock.yaml", public_hoist_packages = {"vscode-languageserver-types": ["docs"], "vscode-languageserver-protocol": ["docs"], "vscode-jsonrpc": ["docs"], "@chevrotain/regexp-to-ast": ["docs"], "@chevrotain/types": ["docs"]})
-npm.npm_translate_lock(name = "server_npm", pnpm_lock = "//sdks/typescript:pnpm-lock.yaml", npm_package_target_name = "package")
+npm.npm_translate_lock(name = "server_npm", pnpm_lock = "//server/typescript:pnpm-lock.yaml", npm_package_target_name = "package")
 use_repo(npm, "web_npm", "react_npm", "consumer_npm", "meet_npm", "docs_npm", "server_npm")
 
 browsers = use_extension("//tools:browsers.bzl", "browsers")

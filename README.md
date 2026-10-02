@@ -139,15 +139,15 @@ the same `demo` room.
 Mint participant tokens locally with explicit project ID, API key ID, signing
 secret, room/participant external IDs, and mandatory absolute Unix expiration:
 
-- [TypeScript / Node.js: `@pulsebeam/server`](sdks/typescript/README.md)
-- [Go: `github.com/PulseBeamDev/pulsebeam/sdks/go`](sdks/go/README.md)
-- [Python: `pulsebeam-server`](sdks/python/README.md)
-- [Rust: `pulsebeam-server`](sdks/rust/README.md)
+- [TypeScript / Node.js: `@pulsebeam/server`](server/typescript/README.md)
+- [Go: `github.com/PulseBeamDev/pulsebeam/server/go`](server/go/README.md)
+- [Python: `pulsebeam-server`](server/python/README.md)
+- [Rust: `pulsebeam-server`](server/rust/README.md)
 
 These server-only SDKs use native Ed25519, with no PulseBeam connectivity or
 Rust/WASM runtime. Keep signing secrets on your server, never in client code.
 The packages are locally installable; public registry publication is deferred.
-Their [shared auth profile and vectors](sdks/auth/README.md) are exercised by the
+Their [shared auth profile and vectors](server/auth/README.md) are exercised by the
 ordinary Bazel acceptance gates and the Rust authorization verifier.
 
 ## Profiling & Metrics

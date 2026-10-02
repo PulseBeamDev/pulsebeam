@@ -1,0 +1,104 @@
+load("@crates//:defs.bzl", "aliases", "all_crate_deps", "crate_edition")
+load("@rules_rust//cargo:defs.bzl", "cargo_toml_env_vars")
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test", "rust_doc_test", "rust_clippy_test", "rustfmt_test")
+load("@rules_pkg//pkg:tar.bzl", "pkg_tar")
+load("@rules_pkg//pkg:mappings.bzl", "pkg_files", "strip_prefix")
+load("@rules_python//python:defs.bzl", "py_binary")
+
+package(default_visibility = ["//visibility:public"])
+exports_files(["Cargo.toml"])
+filegroup(name = "workflow_inputs", srcs = ["README.md", "Cargo.toml"])
+filegroup(name = "cargo_metadata_inputs", srcs = ["Cargo.toml"] + glob(["src/**/*.rs"]))
+
+cargo_toml_env_vars(name = "cargo_env", src = "Cargo.toml")
+
+rust_library(
+    name = "pulsebeam-server",
+    crate_root = "src/lib.rs",
+    srcs = glob(["src/**/*.rs"]),
+    edition = crate_edition(),
+    rustc_env_files = [":cargo_env"],
+    lint_config = "//crates/pulsebeam-core:lints",
+    aliases = aliases(),
+    deps = all_crate_deps(normal = True) + ["//crates/pulsebeam-auth"],
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+)
+
+py_binary(name = "package_manifest", srcs = ["package_manifest.py"], main = "package_manifest.py")
+
+genrule(
+    name = "relocated_manifest",
+    srcs = ["Cargo.toml", "//crates/pulsebeam-auth:Cargo.toml"],
+    outs = ["packaged/Cargo.toml"],
+    tools = [":package_manifest"],
+    cmd = "$(location :package_manifest) $(location Cargo.toml) $(location //crates/pulsebeam-auth:Cargo.toml) $@",
+)
+
+pkg_files(
+    name = "source_files",
+    srcs = ["README.md", "LICENSE"] + glob(["src/**/*.rs"]),
+    strip_prefix = strip_prefix.from_pkg(),
+)
+
+pkg_files(
+    name = "manifest_file",
+    srcs = [":relocated_manifest"],
+    strip_prefix = strip_prefix.from_pkg("packaged"),
+)
+
+pkg_tar(
+    name = "package",
+    srcs = [":source_files", ":manifest_file", "//crates/pulsebeam-auth:bundled_sources"],
+    extension = "tar.gz",
+)
+
+py_binary(name = "unpacker", srcs = ["tests/unpack.py"], main = "tests/unpack.py")
+
+genrule(
+    name = "unpacked",
+    srcs = [":package"],
+    outs = ["unpacked/Cargo.toml", "unpacked/README.md", "unpacked/LICENSE",
+            "unpacked/src/lib.rs", "unpacked/vendor/pulsebeam-auth/Cargo.toml",
+            "unpacked/vendor/pulsebeam-auth/README.md", "unpacked/vendor/pulsebeam-auth/LICENSE",
+            "unpacked/vendor/pulsebeam-auth/src/lib.rs",
+            "unpacked/vendor/pulsebeam-auth/src/keys.rs", "unpacked/vendor/pulsebeam-auth/src/identity.rs"],
+    tools = [":unpacker"],
+    cmd = "$(location :unpacker) $(location :package) $(RULEDIR)/unpacked",
+)
+
+rust_library(
+    name = "packaged_auth",
+    crate_name = "pulsebeam_auth",
+    crate_root = "unpacked/vendor/pulsebeam-auth/src/lib.rs",
+    srcs = ["unpacked/vendor/pulsebeam-auth/src/lib.rs",
+            "unpacked/vendor/pulsebeam-auth/src/keys.rs", "unpacked/vendor/pulsebeam-auth/src/identity.rs"],
+    edition = crate_edition(package_name = "crates/pulsebeam-auth"),
+    aliases = aliases(package_name = "crates/pulsebeam-auth"),
+    deps = all_crate_deps(normal = True, package_name = "crates/pulsebeam-auth"),
+    proc_macro_deps = all_crate_deps(proc_macro = True, package_name = "crates/pulsebeam-auth"),
+)
+
+rust_library(
+    name = "packaged_server",
+    crate_name = "pulsebeam_server",
+    crate_root = "unpacked/src/lib.rs",
+    srcs = ["unpacked/src/lib.rs"],
+    edition = crate_edition(),
+    aliases = aliases(),
+    deps = all_crate_deps(normal = True) + [":packaged_auth"],
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+)
+
+rust_test(
+    name = "consumer",
+    crate_root = "tests/consumer.rs",
+    srcs = ["tests/consumer.rs"],
+    compile_data = ["//server/auth:vectors.json"],
+    edition = crate_edition(),
+    deps = [":packaged_server", "@crates//:serde", "@crates//:serde_json"],
+)
+
+rust_doc_test(name = "compiler_contract", crate = ":packaged_server")
+rustfmt_test(name = "format", targets = [":pulsebeam-server", ":consumer"])
+rust_clippy_test(name = "clippy", targets = [":pulsebeam-server"])
+test_suite(name = "fast", tests = [":consumer", ":compiler_contract", ":format", ":clippy"])

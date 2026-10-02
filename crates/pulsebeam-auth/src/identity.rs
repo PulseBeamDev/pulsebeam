@@ -5,7 +5,7 @@ use uuid::{Uuid, Variant, Version};
 pub const UUID_TEXT_LEN: usize = 26;
 const EXTERNAL_ID_MAX_LEN: usize = 36;
 const VERSION: u8 = b'0';
-const CROCKFORD: Encoding = new_encoding! {
+pub(crate) const CROCKFORD: Encoding = new_encoding! {
     symbols: "0123456789ABCDEFGHJKMNPQRSTVWXYZ",
     translate_from: "abcdefghjkmnpqrstvwxyzIiLlOo",
     translate_to: "ABCDEFGHJKMNPQRSTVWXYZ111100",

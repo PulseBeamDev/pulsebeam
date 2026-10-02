@@ -1,10 +1,10 @@
+use crate::identity::CROCKFORD;
 use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use std::{fmt, str::FromStr};
 
 const KEY_BYTES: usize = 32;
 const KEY_TEXT_LEN: usize = 52;
-const CROCKFORD: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 const REDACTED: &str = "[REDACTED]";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
@@ -24,33 +24,11 @@ pub enum KeyValidationError {
     InvalidVerifyingKey,
 }
 
-fn crockford_value(byte: u8) -> Option<u8> {
-    match byte.to_ascii_uppercase() {
-        b'O' => Some(0),
-        b'I' | b'L' => Some(1),
-        byte => CROCKFORD
-            .iter()
-            .position(|candidate| *candidate == byte)
-            .and_then(|index| u8::try_from(index).ok()),
-    }
-}
-
 fn encode_key(bytes: &[u8; KEY_BYTES]) -> String {
-    let mut encoded = String::with_capacity(KEY_TEXT_LEN);
-    let mut buffer = 0u16;
-    let mut bits = 4u8;
-    for byte in bytes {
-        buffer = (buffer << 8) | u16::from(*byte);
-        bits = bits.saturating_add(8);
-        while bits >= 5 {
-            bits = bits.saturating_sub(5);
-            let value = (buffer >> bits) & 0x1f;
-            let character = CROCKFORD.get(usize::from(value)).copied().unwrap_or(b'?');
-            encoded.push(char::from(character));
-            buffer &= (1u16 << bits).wrapping_sub(1);
-        }
-    }
-    encoded
+    let mut padded = [0; KEY_BYTES + 3];
+    padded.split_at_mut(3).1.copy_from_slice(bytes);
+    // Three zero bytes supply the four high padding bits after dropping four digits.
+    CROCKFORD.encode(&padded).chars().skip(4).collect()
 }
 
 fn decode_key(value: &str) -> Result<[u8; KEY_BYTES], KeyValidationError> {
@@ -61,31 +39,17 @@ fn decode_key(value: &str) -> Result<[u8; KEY_BYTES], KeyValidationError> {
         });
     }
 
-    let mut decoded = Vec::with_capacity(KEY_BYTES);
-    let mut buffer = 0u16;
-    let mut bits = 0u8;
-    for (index, byte) in value.bytes().enumerate() {
-        let digit = crockford_value(byte).ok_or(KeyValidationError::InvalidEncoding)?;
-        if index == 0 {
-            if digit > 1 {
-                return Err(KeyValidationError::NonzeroPadding);
-            }
-            buffer = u16::from(digit);
-            bits = 1;
-        } else {
-            buffer = (buffer << 5) | u16::from(digit);
-            bits = bits.saturating_add(5);
-        }
-        while bits >= 8 {
-            bits = bits.saturating_sub(8);
-            let byte =
-                u8::try_from(buffer >> bits).map_err(|_| KeyValidationError::InvalidEncoding)?;
-            decoded.push(byte);
-            buffer &= (1u16 << bits).wrapping_sub(1);
-        }
+    // Twenty added zero bits align the four high padding bits to three bytes.
+    let decoded = CROCKFORD
+        .decode(format!("0000{value}").as_bytes())
+        .map_err(|_| KeyValidationError::InvalidEncoding)?;
+    let (padding, seed) = decoded
+        .split_at_checked(3)
+        .ok_or(KeyValidationError::InvalidEncoding)?;
+    if padding != [0; 3] {
+        return Err(KeyValidationError::NonzeroPadding);
     }
-    decoded
-        .try_into()
+    seed.try_into()
         .map_err(|_| KeyValidationError::InvalidEncoding)
 }
 

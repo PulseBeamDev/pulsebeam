@@ -14,7 +14,7 @@ publish = false
 workspace = true
 
 [dev-dependencies]
-pulsebeam-server = { path = "../../sdks/rust" }
+pulsebeam-server = { path = "../../server/rust" }
 anyhow.workspace = true
 bytes = "1"
 fastrand.workspace = true

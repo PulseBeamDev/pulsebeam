@@ -15,8 +15,8 @@ members = [
   "agents/pulsebeam-agent-web",
   "agents/pulsebeam-agent-native",
   "tools/rust/wasm_proof",
-  "sdks/rust",
-  "sdks/auth",
+  "server/rust",
+  "server/auth",
 ]
 
 [workspace.package]

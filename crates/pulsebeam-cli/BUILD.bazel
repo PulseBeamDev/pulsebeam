@@ -22,7 +22,7 @@ rust_binary(
         "//crates/pulsebeam-core",
         "//crates/pulsebeam-proto",
         "//crates/pulsebeam-testdata",
-        "//sdks/rust:pulsebeam-server",
+        "//server/rust:pulsebeam-server",
     ],
     proc_macro_deps = all_crate_deps(proc_macro = True),
 )

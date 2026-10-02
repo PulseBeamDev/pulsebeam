@@ -1,0 +1,55 @@
+load("@aspect_rules_js//js:defs.bzl", "js_binary", "js_run_binary")
+load("@aspect_rules_js//npm:defs.bzl", "npm_package")
+load("@bazel_lib//lib:copy_to_directory.bzl", "copy_to_directory")
+load("@rules_python//python:defs.bzl", "py_test")
+load("@server_npm//:defs.bzl", "npm_link_all_packages")
+load("@server_npm//server/typescript:typescript/package_json.bzl", typescript = "bin")
+load("@server_npm//server/typescript:prettier/package_json.bzl", prettier = "bin")
+
+package(default_visibility = ["//visibility:public"])
+exports_files(["package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml"])
+filegroup(name = "workflow_inputs", srcs = ["README.md", "package.json", "pnpm-lock.yaml"])
+npm_link_all_packages(name = "node_modules")
+typescript.tsc_binary(name = "tsc")
+prettier.prettier_binary(name = "prettier")
+
+js_run_binary(
+    name = "typescript",
+    tool = ":tsc",
+    srcs = ["package.json", "tsconfig.json", ":node_modules"] + glob(["src/**"]),
+    args = ["-p", "tsconfig.json", "--outDir", "typescript"],
+    chdir = package_name(),
+    out_dirs = ["typescript"],
+)
+
+npm_package(
+    name = "package",
+    srcs = ["package.json", "README.md", "LICENSE", ":typescript"],
+    replace_prefixes = {"typescript": "dist"},
+    packable = True,
+)
+
+js_binary(
+    name = "consumer",
+    entry_point = "tests/consumer.mjs",
+    data = [":node_modules"],
+)
+
+py_test(
+    name = "conformance",
+    srcs = ["tests/install.py"],
+    main = "tests/install.py",
+    args = ["$(rootpath :package.pack)", "$(rootpath :consumer)", "$(rootpath //server/auth:vectors.json)"],
+    data = [":package.pack", ":consumer", "//server/auth:vectors.json"],
+)
+
+copy_to_directory(name = "format_sources", srcs = glob(["src/**", "tests/*.mjs", "*.json"]))
+py_test(
+    name = "format",
+    srcs = ["//tools:check-js-format.py"],
+    main = "//tools:check-js-format.py",
+    args = ["--formatter", "$(rootpath :prettier)", "--source", "$(rootpath :format_sources)", "--", "src/**/*.ts", "tests/*.mjs", "*.json"],
+    data = [":prettier", ":format_sources"],
+)
+
+test_suite(name = "fast", tests = [":conformance", ":format"])

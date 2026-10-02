@@ -16,7 +16,7 @@ standalone local consumption. Both crates have explicit manifests and
 Apache-2.0 licenses. Registry publication remains deferred; a future registry
 release must make this versioned dependency available before publishing the SDK.
 
-See [shared conformance](../../sdks/auth/README.md) for the wire authority and
-[the Rust SDK](../../sdks/rust/README.md) for signing and package consumption.
+See [shared conformance](../../server/auth/README.md) for the wire authority and
+[the Rust SDK](../../server/rust/README.md) for signing and package consumption.
 Focused verification: `./bazel test //crates/pulsebeam-auth:unit_tests
 //crates/pulsebeam-auth:format //crates/pulsebeam-auth:clippy`.

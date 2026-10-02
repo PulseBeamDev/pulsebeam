@@ -24,7 +24,7 @@ build_test(
         "//agents/pulsebeam-agent-native:native", "//agents/pulsebeam-agent-web:package",
         "//agents/pulsebeam-agent-web:uniffi_proof", "//agents/react:package",
         "//apps/meet:export", "//docs:site",
-        "//sdks/typescript:package.pack", "//sdks/go:package", "//sdks/python:package", "//sdks/rust:package",
+        "//server/typescript:package.pack", "//server/go:package", "//server/python:package", "//server/rust:package",
         "//crates/pulsebeam-simulator:replay", "//crates/pulsebeam-simulator:sweep",
         "//crates/pulsebeam-simulator:scoreboard", "//crates/pulsebeam-rtc:benchmark",
     ],
@@ -45,7 +45,7 @@ test_suite(
     tests = [":check"] + ["//%s:unit_tests" % owner for owner in RUST_OWNERS] + [
         "//crates/pulsebeam-rtc:integration_tests", "//crates/pulsebeam-rtc:browser_protocol",
         "//crates/pulsebeam-simulator:fast",
-        "//sdks/auth:fast", "//sdks/typescript:fast", "//sdks/go:fast", "//sdks/python:fast", "//sdks/rust:fast",
+        "//server/auth:fast", "//server/typescript:fast", "//server/go:fast", "//server/python:fast", "//server/rust:fast",
     ],
 )
 
@@ -84,5 +84,5 @@ alias(name = "image", actual = "//release:image")
 filegroup(
     name = "workflow_inputs",
     srcs = glob(["*.md", "Justfile", ".cargo/*.toml", ".github/**/*.yml", "scripts/*.sh"], allow_empty = True) +
-           ["//%s:workflow_inputs" % owner for owner in RUST_OWNERS + ["crates/pulsebeam-simulator", "agents/react", "apps/meet", "docs", "tools", "sdks/auth", "sdks/typescript", "sdks/go", "sdks/python", "sdks/rust"]],
+           ["//%s:workflow_inputs" % owner for owner in RUST_OWNERS + ["crates/pulsebeam-simulator", "agents/react", "apps/meet", "docs", "tools", "server/auth", "server/typescript", "server/go", "server/python", "server/rust"]],
 )

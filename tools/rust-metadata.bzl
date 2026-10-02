@@ -14,6 +14,6 @@ CARGO_METADATA_INPUTS = [
     "//agents/pulsebeam-agent-web:cargo_metadata_inputs",
     "//agents/pulsebeam-agent-native:cargo_metadata_inputs",
     "//tools/rust/wasm_proof:cargo_metadata_inputs",
-    "//sdks/rust:cargo_metadata_inputs",
-    "//sdks/auth:cargo_metadata_inputs"
+    "//server/rust:cargo_metadata_inputs",
+    "//server/auth:cargo_metadata_inputs"
 ]

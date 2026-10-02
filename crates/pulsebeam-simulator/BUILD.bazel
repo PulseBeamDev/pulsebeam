@@ -26,7 +26,7 @@ rust_test(
         "//crates/pulsebeam-core:pulsebeam-core-sim",
         "//crates/pulsebeam-runtime:pulsebeam-runtime-sim",
         "//crates/pulsebeam-testdata",
-        "//sdks/rust:pulsebeam-server",
+        "//server/rust:pulsebeam-server",
         "//agents/pulsebeam-agent-core",
         "//agents/pulsebeam-agent-native:pulsebeam-agent-native-sim",
     ],
