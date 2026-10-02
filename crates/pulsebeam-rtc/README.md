@@ -108,8 +108,9 @@ parsing and must carry opaque or SFrame-protected media.
   supported packet-feedback mode: transport-wide congestion-control feedback or
   RFC 8888. There is no REMB or fixed-rate egress fallback.
 * Compatibility means compatibility with the negotiated PulseBeam WebRTC
-  profile. Live acceptance evidence covers current pinned Chrome and Firefox
-  versions. Stored SDP is parser regression evidence only.
+  profile. The sole client compatibility baseline is pinned libwebrtc
+  `pulsebeam-webrtc-sys` `0.6.2` in controlled execution. Stored SDP is generic
+  parser regression evidence only, not browser compatibility evidence.
 
 ## Packet and stream model
 
@@ -226,10 +227,10 @@ dependency and does not expose mutable controller internals.
 
 ## Validation boundary
 
-Crate checks, fixtures, deterministic tests, benchmarks, browser sources, and
-browser evidence are owned by `crates/pulsebeam-rtc`. Web and React own their
-consumer browser coverage; root `./bazel test //:test` runs the complete workspace
-acceptance gate.
+Crate checks, deterministic tests, benchmarks, and the test-only native
+simulation harness are owned by `crates/pulsebeam-rtc`. Web and React retain
+consumer browser coverage; root `./bazel test //:test` runs complete workspace
+acceptance. Their shared browser provisioning is owned by `tools/browser-matrix.json`.
 
 Required evidence includes deterministic crate-local tests and simulation for
 negotiation, media-clock normalization, source switching, RTP/RTCP continuity,
@@ -253,25 +254,38 @@ network throughput or a simulated bandwidth/RTT path. Reports and comparison
 baselines live under `target/criterion`. Criterion arguments can be passed to the
 entrypoint, for example `./bazel run //:benchmark -- --save-baseline main`.
 
-Live pinned Chrome and Firefox sessions are required interoperability evidence.
-Differential checks against `str0m`, Ericsson SCReAM, or libwebrtc are useful
-component evidence but do not replace the documented contract or live-browser
-tests.
-
-The binding Linux x86_64 Chrome/ChromeDriver and Firefox ESR/geckodriver matrix
-is authoritative in `browser/browser-matrix.json`, including versions, URLs,
-lengths, hashes, and version probes. Fast RTC tests never launch browsers. Run
-the RTC interoperability boundary with:
+Run the complete RTC unit, property, integration, and native interoperability
+suite, with cached test results disabled:
 
 ```sh
-./bazel test //crates/pulsebeam-rtc:chrome //crates/pulsebeam-rtc:firefox //crates/pulsebeam-rtc:rfc8888
+./bazel test //crates/pulsebeam-rtc:test --nocache_test_results
 ```
 
-Bazel provisions the exact executables/drivers and Go peer as declared inputs.
-Browser/driver logs, offer inputs, and compact JSON scenario reports are written
-to isolated test outputs under `bazel-testlogs`, retained by CI on failure. Other platforms, ICE restart, and
-renegotiation are not part of the accepted v3 profile. Unsupported browser
-profile differences are recorded in each matrix report rather than skipped.
+The Linux x86_64 harness uses `pulsebeam-webrtc-sys` `0.6.2`, commit
+`f87f99a48e58fb9cd13767ba58e9b7cd937c71a3`. Bazel provisions matching immutable
+Rust sources and released native artifacts before compilation. Native actions
+do not download artifacts. The isolated `simulation/Cargo.toml` keeps upstream
+build-dependency pins out of the production Cargo workspace; Bazel explicitly
+supplies this test-only dependency to RTC fixtures.
+
+Every native peer uses a process-exclusive controlled world, explicit simulated
+time, task pumping, and virtual UDP delivery. Multiple peers in one scenario
+share the world. No real sockets, hardware media, production scheduling, sleeps,
+or wall-clock protocol deadlines are used. The warm, uncached complete RTC suite
+has a five-second elapsed budget, including peer setup and teardown.
+
+Actual authenticated bidirectional media, client-generated TWCC accounting,
+DataChannels, and same-seed replay are interoperability evidence. RFC 8888 and
+passive ICE-TCP retain client-free negotiation, framing, parsing, and accounting
+coverage. The pinned controlled adapter has no TCP listener; these component
+tests do not establish ICE-TCP client interoperability. RFC 8888 client
+interoperability is also not claimed. Neither browser nor Pion compatibility
+is inferred from the native replacement. Missing artifacts or required native
+evidence fail the gate.
+
+Other platforms, ICE restart, and renegotiation remain outside this acceptance
+profile. Criterion still measures only RTC polling; native setup and teardown
+are outside its timed region.
 
 Run root `./bazel test //:test` for complete workspace acceptance, including the
 consumer-owned Web and React browser coverage.

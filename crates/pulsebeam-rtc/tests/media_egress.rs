@@ -266,26 +266,9 @@ fn public_send_media_reports_invalid_and_closed_transport_states() {
 }
 
 #[test]
-fn public_send_media_uses_passive_ice_tcp_framing() {
-    let mut fixture = PeerFixture::connected_tcp();
-    let source = fixture.send_source(b"tcp payload");
-    fixture
-        .connection
-        .command(
-            fixture.at(),
-            Command::SendMedia {
-                sender: fixture.sender,
-                media: forwarded(source, 1),
-            },
-        )
-        .expect("TCP media admitted");
-    assert_eq!(fixture.receive_egress().1, b"tcp payload");
-}
-
-#[test]
 fn public_media_admission_enforces_exact_configured_payload_bound() {
     let mut source = PeerFixture::connected();
-    let packet = source.send_source(b"x");
+    let packet = source.send_source(&[0xf8]);
 
     let mut bytes = PeerFixture::connected_with_media_limit(2);
     for id in 1..=2 {

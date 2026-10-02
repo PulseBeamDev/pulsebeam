@@ -36,11 +36,11 @@ fn accepts(offer: &'static str) -> Result<(), AcceptError> {
 }
 
 #[test]
-fn chrome_representative_offer_is_compatible() -> Result<(), AcceptError> {
+fn parser_accepts_bundle_with_named_mids() -> Result<(), AcceptError> {
     accepts(include_str!("fixtures/chrome-representative.sdp"))
 }
 
 #[test]
-fn firefox_representative_offer_is_compatible() -> Result<(), AcceptError> {
+fn parser_accepts_bundle_with_numeric_mids() -> Result<(), AcceptError> {
     accepts(include_str!("fixtures/firefox-representative.sdp"))
 }

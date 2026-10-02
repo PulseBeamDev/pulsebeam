@@ -1,4 +1,4 @@
-"""Provision the existing RTC acceptance matrix, without a mutable browser cache.
+"""Provision the consumer browser acceptance matrix, without a mutable browser cache.
 
 Upstream browser defaults do not implement this repository's ESR/version/hash
 matrix. Bazel's http_archive owns downloads and extraction; this extension only
@@ -9,7 +9,7 @@ load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
 
 
 def _browsers_impl(ctx):
-    matrix = json.decode(ctx.read(Label("//crates/pulsebeam-rtc:browser/browser-matrix.json")))
+    matrix = json.decode(ctx.read(Label("//tools:browser-matrix.json")))
     for artifact in matrix["platforms"]["linux-x86_64"]["artifacts"]:
         http_archive(
             name = "browser_" + artifact["name"],

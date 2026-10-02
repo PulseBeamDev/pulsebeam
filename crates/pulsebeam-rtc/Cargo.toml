@@ -19,22 +19,8 @@ str0m = { git = "https://github.com/PulseBeamDev/str0m.git", branch = "patch/0.2
 thiserror.workspace = true
 
 [dev-dependencies]
-base64 = "0.22"
 criterion = "0.8.2"
-futures-lite.workspace = true
 proptest = "1.11.0"
-serde.workspace = true
-serde_json = "1"
-str0m-reference = { package = "str0m", version = "=0.23.1", default-features = false, features = ["aws-lc-rs"] }
-thirtyfour = { version = "0.37.5", default-features = false, features = ["bidi", "rustls"] }
-tokio.workspace = true
-
-[features]
-browser-tests = []
-
-[[test]]
-name = "browser_interop"
-required-features = ["browser-tests"]
 
 [[bench]]
 name = "scaling"

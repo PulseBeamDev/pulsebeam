@@ -19,14 +19,6 @@ bazel_dep(name = "gazelle", version = "0.47.0")
 bazel_dep(name = "rules_oci", version = "2.2.7")
 bazel_dep(name = "rules_pkg", version = "1.1.0")
 
-go_sdk = use_extension("@rules_go//go:extensions.bzl", "go_sdk")
-go_sdk.from_file(go_mod = "//crates/pulsebeam-rtc/tests/peers/rfc8888:go.mod")
-use_repo(go_sdk, "go_default_sdk")
-
-go_deps = use_extension("@gazelle//:extensions.bzl", "go_deps")
-go_deps.from_file(go_mod = "//crates/pulsebeam-rtc/tests/peers/rfc8888:go.mod")
-use_repo(go_deps, "com_github_pion_rtcp", "com_github_pion_webrtc_v4")
-
 python = use_extension("@rules_python//python/extensions:python.bzl", "python")
 python.toolchain(python_version = "3.12.11")
 use_repo(python, "python_3_12_11")
@@ -92,6 +84,14 @@ http_file(
     downloaded_file_path = "swagger-ui.zip",
 )
 
+http_archive = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
+http_archive(
+    name = "libwebrtc_core",
+    urls = ["https://github.com/PulseBeamDev/pulsebeam-libwebrtc-sys/releases/download/v0.6.2/webrtc-core-linux-x86_64.tar.gz"],
+    sha256 = "de8126e5bcdba66fa531edbb3c92c63eac64fd4397ca8cdb7ea3b8aab8fb128f",
+    build_file_content = 'exports_files(["lib/libwebrtc.a", "manifest.json"])\nfilegroup(name = "licenses", srcs = glob(["LICENSES/**"]), visibility = ["//visibility:public"])',
+)
+
 include("//tools:rust-pins.MODULE.bazel")
 
 oci = use_extension("@rules_oci//oci:extensions.bzl", "oci")
@@ -121,7 +121,7 @@ CMAKE_ENV = {
     "PULSEBEAM_NINJA": "$${pwd}/$(REAL_NINJA)",
 }
 CMAKE_INJECTIONS = {"//tools:cmake.sh": "@pulsebeam"}
-crate.annotation(crate = "aws-lc-sys", build_script_tools = CMAKE_TOOLS, build_script_toolchains = CMAKE_TOOLCHAINS, build_script_env = CMAKE_ENV, label_injections = CMAKE_INJECTIONS, repositories = ["crates", "str0m_native", "str0m_rtc", "str0m_reference"])
+crate.annotation(crate = "aws-lc-sys", build_script_tools = CMAKE_TOOLS, build_script_toolchains = CMAKE_TOOLCHAINS, build_script_env = CMAKE_ENV, label_injections = CMAKE_INJECTIONS, repositories = ["crates", "str0m_native", "str0m_rtc"])
 crate.annotation(crate = "opusic-sys", build_script_tools = CMAKE_TOOLS, build_script_toolchains = CMAKE_TOOLCHAINS, build_script_env = CMAKE_ENV, label_injections = CMAKE_INJECTIONS, repositories = ["crates"])
 crate.annotation(
     crate = "openh264-sys2",
@@ -129,6 +129,14 @@ crate.annotation(
     label_injections = {"@nasm//:nasm": "@nasm"},
     build_script_tools = ["@nasm//:nasm"],
     build_script_env = {"NASM": "$(execpath @nasm//:nasm)"},
+)
+crate.annotation(
+    crate = "pulsebeam-webrtc-sys",
+    version = "=0.6.2",
+    repositories = ["rtc_libwebrtc"],
+    gen_build_script = "off",
+    link_deps = ["@pulsebeam//tools:libwebrtc_native"],
+    label_injections = {"//tools:libwebrtc_native": "@pulsebeam"},
 )
 # Cargo's custom tokio_unstable cfg is applied by .bazelrc, but crate-universe
 # does not include cfg-gated edges in its generated platform selects.
@@ -145,3 +153,17 @@ crate.annotation(
     label_injections = {"@swagger_ui_assets//file": "@swagger_ui_assets"},
 )
 use_repo(crate, "crates")
+
+crate.spec(
+    package = "pulsebeam-webrtc-sys",
+    version = "=0.6.2",
+    git = "https://github.com/PulseBeamDev/pulsebeam-libwebrtc-sys",
+    rev = "f87f99a48e58fb9cd13767ba58e9b7cd937c71a3",
+    repositories = ["rtc_libwebrtc"],
+)
+crate.from_specs(
+    name = "rtc_libwebrtc",
+    supported_platform_triples = ["x86_64-unknown-linux-gnu"],
+    host_tools = "@pulsebeam_rust_host_tools//:BUILD.bazel",
+)
+use_repo(crate, "rtc_libwebrtc")
