@@ -258,7 +258,7 @@ Run the complete RTC unit, property, integration, and native interoperability
 suite, with cached test results disabled:
 
 ```sh
-./bazel test //crates/pulsebeam-rtc:test --nocache_test_results
+./bazel test --config=sim //crates/pulsebeam-rtc:test --nocache_test_results
 ```
 
 The Linux x86_64 harness uses `pulsebeam-webrtc-sys` `0.6.2`, commit
@@ -270,8 +270,10 @@ supplies this test-only dependency to RTC fixtures.
 
 Every native peer uses a process-exclusive controlled world, explicit simulated
 time, task pumping, and virtual UDP delivery. Multiple peers in one scenario
-share the world. No real sockets, hardware media, production scheduling, sleeps,
-or wall-clock protocol deadlines are used. The warm, uncached complete RTC suite
+share the world. The unit target uses one Rust test thread to avoid parallel
+harness threads blocking on the native-world lease. Separate test binaries may
+run concurrently. No real sockets, hardware media, production scheduling,
+sleeps, or wall-clock protocol deadlines are used. The warm, uncached complete RTC suite
 has a five-second elapsed budget, including peer setup and teardown.
 
 High-volume egress traces in `src/network_tests.rs` and `src/connection.rs`

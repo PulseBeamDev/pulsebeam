@@ -23,7 +23,7 @@ fn production_connection_bottleneck_emits_measured_transport_bytes() {
     const RATE_BPS: u64 = 100_000;
     const PACKETS: u64 = 4_000;
     let origin = std::time::Instant::now();
-    let mut fixture = PeerFixture::connected_at(origin);
+    let mut fixture = PeerFixture::connected_at(origin).without_egress_observation();
     fixture.configure_network(
         SEED,
         NetworkPolicy {
@@ -119,7 +119,7 @@ fn production_connection_bottleneck_emits_measured_transport_bytes() {
 
 #[test]
 fn production_two_megabit_single_flow_capacity() {
-    let mut fixture = PeerFixture::connected();
+    let mut fixture = PeerFixture::connected().without_egress_observation();
     fixture.configure_network(
         0x2201,
         NetworkPolicy {
@@ -187,7 +187,7 @@ fn production_two_megabit_single_flow_capacity() {
 
 #[test]
 fn production_capacity_steps_recover_stable_transport_service() {
-    let mut fixture = PeerFixture::connected();
+    let mut fixture = PeerFixture::connected().without_egress_observation();
     fixture.configure_network(
         0x6601,
         NetworkPolicy {
@@ -256,7 +256,10 @@ fn production_capacity_steps_recover_stable_transport_service() {
 #[test]
 fn production_homogeneous_shared_bottleneck_competition() {
     let shared = std::rc::Rc::new(std::cell::RefCell::new(None));
-    let mut flows = vec![PeerFixture::connected(), PeerFixture::connected()];
+    let mut flows = vec![
+        PeerFixture::connected().without_egress_observation(),
+        PeerFixture::connected().without_egress_observation(),
+    ];
     let mut sources = [ComponentSource::audio(1), ComponentSource::audio(2)];
     for (index, flow) in flows.iter_mut().enumerate() {
         flow.configure_network(
@@ -377,7 +380,7 @@ fn production_two_sender_allocation_matches_payload_service() {
     reason = "the two-sender fixture uses matching two-element measurement arrays"
 )]
 fn check_two_sender_allocation(weights: [u16; 2], desired: [u64; 2]) {
-    let mut fixture = PeerFixture::connected_with_senders(2);
+    let mut fixture = PeerFixture::connected_with_senders(2).without_egress_observation();
     fixture.configure_network(
         0x4401,
         NetworkPolicy {

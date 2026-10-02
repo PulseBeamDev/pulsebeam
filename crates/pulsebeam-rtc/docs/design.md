@@ -1062,7 +1062,7 @@ Acceptance requires:
 The canonical complete RTC local and CI command is:
 
 ```sh
-./bazel test //crates/pulsebeam-rtc:test --nocache_test_results
+./bazel test --config=sim //crates/pulsebeam-rtc:test --nocache_test_results
 ```
 
 This includes all unit, property, integration, and native simulation tests.

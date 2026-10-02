@@ -48,6 +48,7 @@ pub struct PeerFixture {
     start: Instant,
     source_timestamp: u32,
     headers: VecDeque<FixtureRtpHeader>,
+    observe_egress: bool,
     connection_idle: bool,
     peer_connected: bool,
     connection_connected: bool,
@@ -280,6 +281,13 @@ impl PeerFixture {
 
     pub fn connected() -> Self {
         Self::connected_with(FixtureTransport::Udp, None, false)
+    }
+
+    /// Keep bounded native interception and RTCP/TWCC, but omit Rust frame observation.
+    pub fn without_egress_observation(mut self) -> Self {
+        self.observe_egress = false;
+        self.headers.clear();
+        self
     }
 
     pub fn connected_at(start: Instant) -> Self {
@@ -631,6 +639,7 @@ impl PeerFixture {
             world,
             source_timestamp: 0,
             headers: VecDeque::new(),
+            observe_egress: true,
             now,
             start,
             connection_idle: false,
@@ -828,6 +837,7 @@ impl PeerFixture {
     }
 
     pub fn receive_egress(&mut self) -> (FixtureRtpHeader, Vec<u8>) {
+        assert!(self.observe_egress, "egress observation is disabled");
         self.connection_idle = false;
         for _ in 0..2_000 {
             if let Some(PeerEvent::Outbound(header, payload)) = self.step() {
@@ -961,7 +971,9 @@ impl PeerFixture {
                             }
                         }
                     }
-                    if let Some(header) = fixture_rtp_header(&payload) {
+                    if self.observe_egress
+                        && let Some(header) = fixture_rtp_header(&payload)
+                    {
                         if self.headers.len() == 256 {
                             self.headers.pop_front();
                         }
@@ -1040,7 +1052,8 @@ impl PeerFixture {
                 };
             }
         }
-        if let Some(sink) = &self.audio_sink
+        if self.observe_egress
+            && let Some(sink) = &self.audio_sink
             && let Some(frame) = sink.try_next_frame()
         {
             let index = self

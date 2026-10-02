@@ -30,6 +30,8 @@ rust_library(
 rust_test(
     name = "unit_tests",
     crate = ":pulsebeam-rtc",
+    # Native controlled worlds are process-exclusive; parallel harness threads only wait on the lease.
+    args = ["--test-threads=1"],
     lint_config = ":lints",
     aliases = TEST_ALIASES,
     deps = depset(all_crate_deps(normal = True, normal_dev = True)).to_list() + ["//crates/pulsebeam-rtc/simulation:pulsebeam-rtc-simulation"],

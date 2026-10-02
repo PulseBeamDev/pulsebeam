@@ -850,7 +850,7 @@ mod tests {
 
     #[test]
     fn production_feedback_outage_path_replacement_and_media_pause_recover() {
-        let mut fixture = PeerFixture::connected();
+        let mut fixture = PeerFixture::connected().without_egress_observation();
         fixture.configure_network(
             0x6601,
             NetworkPolicy {
@@ -987,7 +987,7 @@ mod tests {
             ("cubic-like", None),
             ("bbr-like", None),
         ] {
-            let mut fixture = PeerFixture::connected();
+            let mut fixture = PeerFixture::connected().without_egress_observation();
             fixture.configure_network(
                 0x7701,
                 NetworkPolicy {
@@ -1114,7 +1114,7 @@ mod tests {
 
     #[test]
     fn production_demand_limited_video_vbr_keyframes_keep_queue_bound() {
-        let mut fixture = PeerFixture::connected_video();
+        let mut fixture = PeerFixture::connected_video().without_egress_observation();
         fixture.configure_network(
             0x7702,
             NetworkPolicy {
@@ -1202,7 +1202,7 @@ mod tests {
 
     #[test]
     fn production_queue_sojourn_tracks_contemporaneous_native_target() {
-        let mut fixture = PeerFixture::connected();
+        let mut fixture = PeerFixture::connected().without_egress_observation();
         fixture.configure_network(
             0x5501,
             NetworkPolicy {
