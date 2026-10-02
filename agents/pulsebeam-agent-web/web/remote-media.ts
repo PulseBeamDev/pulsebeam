@@ -105,7 +105,10 @@ class Attachment implements RemoteMediaAttachment {
       }
     }
     this.#tracks = next;
-    if (changed && next.size > 0 && this.#autoPlay) void this.#play();
+    if (changed) {
+      this.#playAttempt += 1;
+      if (next.size > 0 && this.#autoPlay) void this.#play();
+    }
   };
 
   #play(): Promise<void> {

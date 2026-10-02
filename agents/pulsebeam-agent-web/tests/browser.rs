@@ -1,3 +1,4 @@
+mod meet;
 mod support;
 
 use pulsebeam_core::{
@@ -13,6 +14,21 @@ use support::{
 };
 use thirtyfour::prelude::ChromiumLikeCapabilities;
 use thirtyfour::testing::run_browser_test;
+
+fn mint_development_token(
+    room: &RoomExternalId,
+    participant: &ParticipantExternalId,
+    expires_at: u64,
+) -> TestResult<String> {
+    Ok(pulsebeam_server::sign_participant_token(
+        &DEVELOPMENT_PROJECT_ID.as_str(),
+        &DEVELOPMENT_API_KEY_ID.as_str(),
+        &DEVELOPMENT_API_SIGNING_KEY.to_secret_string(),
+        room.as_str(),
+        participant.as_str(),
+        expires_at,
+    )?)
+}
 
 const PUBLIC: &str = include_str!("contracts/observe-public.js");
 const START_PUBLIC: &str = include_str!("contracts/start-public.js");

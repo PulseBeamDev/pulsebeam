@@ -128,8 +128,18 @@
     publicationIds: ["audio"],
     onPlaybackBlocked: () => (pendingBlocked = true),
   });
+  pendingAgent.publish({});
+  rejectPlay?.(new Error("retired receiver rejected late"));
+  await settle();
+  const retiredSuppressed = !pendingBlocked;
+  pendingAgent.publish({ audio: { media: replacement } });
+  rejectPlay?.(new Error("current receiver blocked"));
+  await settle();
+  const replacementReported = pendingBlocked;
+  pendingBlocked = false;
+  pendingAgent.publish({ audio: { media: audio } });
   pending.close();
-  rejectPlay?.(new DOMException("superseded", "AbortError"));
+  rejectPlay?.(new Error("closed receiver rejected late"));
   await settle();
 
   globalThis.__pulsebeamRemoteMedia = {
@@ -143,7 +153,8 @@
     terminal,
     reported,
     retried,
-    pendingSuppressed: !pendingBlocked,
+    pendingSuppressed:
+      retiredSuppressed && replacementReported && !pendingBlocked,
   };
   return globalThis.__pulsebeamRemoteMedia;
 })();

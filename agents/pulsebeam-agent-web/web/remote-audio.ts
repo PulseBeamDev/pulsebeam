@@ -24,15 +24,20 @@ export class RemoteAudioPlayback {
   }
 
   async resume(): Promise<void> {
-    const context = this.#contextForPlayback();
-    // Start both operations in the caller's gesture, before awaiting either.
-    await Promise.all([
-      context.resume(),
-      this.#decoder?.srcObject ? this.#decoder.play() : undefined,
-    ]);
-    if (this.#closed) throw new Error("agent is closed");
-    if (context.state !== "running")
-      throw new Error("audio playback is not running");
+    try {
+      const context = this.#contextForPlayback();
+      // Start both operations in the caller's gesture, before awaiting either.
+      await Promise.all([
+        context.resume(),
+        this.#decoder?.srcObject ? this.#decoder.play() : undefined,
+      ]);
+      if (this.#closed) throw new Error("agent is closed");
+      if (context.state !== "running")
+        throw new Error("audio playback is not running");
+    } catch (error) {
+      this.#warn(error);
+      throw error;
+    }
   }
 
   update(snapshot: AgentSnapshot): void {
@@ -93,7 +98,7 @@ export class RemoteAudioPlayback {
       if (context.state !== "running")
         this.#warn(new Error("browser audio context is suspended"));
       if (changed || context.state !== "running" || this.#decoder?.paused)
-        void this.resume().catch((error: unknown) => this.#warn(error));
+        void this.resume().catch(() => {});
     } catch (error) {
       this.#warn(error);
     }

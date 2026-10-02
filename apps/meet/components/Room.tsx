@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Video, useAgent } from "@pulsebeam/react";
 import type { Agent, RemoteVideoTrack } from "@pulsebeam/react";
 import {
@@ -80,6 +80,17 @@ function RoomSession({
   onLeave(): void;
 }) {
   const agent = owner.getSnapshot();
+  useEffect(() => {
+    // Declare known publisher channels before capture and connection effects:
+    // adding a channel on the first send would replace the media transport.
+    owner.setState({
+      connected: false,
+      topics: [
+        { name: "chat", mode: "ordered", publish: true },
+        { name: "reactions", mode: "latest", publish: true },
+      ],
+    });
+  }, [owner]);
   const { capture, devices } = useMeetMedia();
   const [deviceAnchor, setDeviceAnchor] = useState<HTMLElement | null>(null);
   const [reactionAnchor, setReactionAnchor] = useState<HTMLElement | null>(
@@ -90,9 +101,7 @@ function RoomSession({
   const [sending, setSending] = useState(false);
   const [chatOpen, setChatOpen] = useState(false);
   const [failure, setFailure] = useState<string | null>(null);
-  const [playbackRetry, setPlaybackRetry] = useState<
-    (() => Promise<void>) | null
-  >(null);
+  const playbackRetry = useRef<(() => Promise<void>) | null>(null);
   const { screen, camera, cameraOn, micOn, detachScreen, startShare, toggle } =
     useRoomMedia(
       owner,
@@ -130,13 +139,20 @@ function RoomSession({
       setFailure(
         `Playback: ${error instanceof Error ? error.message : String(error)}`,
       );
-      setPlaybackRetry(() => retry);
+      playbackRetry.current = retry;
     },
     [],
   );
+  const recoverPlayback = () => {
+    void owner.remote.resumeAudio().catch(() => {});
+    const retry = playbackRetry.current;
+    playbackRetry.current = null;
+    if (retry)
+      void retry().catch((error: unknown) => playbackError({ error, retry }));
+  };
   const closeAlert = () => {
     setFailure(null);
-    setPlaybackRetry(null);
+    playbackRetry.current = null;
     clearError();
   };
   const send = async () => {
@@ -185,7 +201,11 @@ function RoomSession({
     </Box>
   );
   return (
-    <Box className="flex h-dvh min-w-0 flex-col bg-slate-50">
+    <Box
+      className="flex h-dvh min-w-0 flex-col bg-slate-50"
+      onClickCapture={recoverPlayback}
+      onKeyDownCapture={recoverPlayback}
+    >
       <Paper
         component="header"
         square
@@ -299,11 +319,6 @@ function RoomSession({
           onClose={closeAlert}
           action={
             <Stack direction="row">
-              {playbackRetry && (
-                <Button onClick={() => void playbackRetry()}>
-                  Retry playback
-                </Button>
-              )}
               {topicError && (
                 <Button onClick={retrySubscriptions}>Retry chat</Button>
               )}
@@ -495,18 +510,6 @@ function RoomSession({
           </Paper>
         )}
       </Box>
-      <button
-        type="button"
-        onClick={() =>
-          void owner.remote
-            .resumeAudio()
-            .catch((error) =>
-              playbackError({ error, retry: () => owner.remote.resumeAudio() }),
-            )
-        }
-      >
-        Enable audio
-      </button>
     </Box>
   );
 }

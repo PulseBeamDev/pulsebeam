@@ -49,11 +49,18 @@ impl DestinationServer {
         let binary = env::var_os("PULSEBEAM_SERVER_BINARY").ok_or(
             "missing PULSEBEAM_SERVER_BINARY; run the SDK browser target through ./bazel test",
         )?;
+        let log = std::fs::OpenOptions::new().create(true).append(true).open(
+            PathBuf::from(
+                env::var_os("TEST_UNDECLARED_OUTPUTS_DIR")
+                    .ok_or("missing Bazel TEST_UNDECLARED_OUTPUTS_DIR")?,
+            )
+            .join("destination-server.log"),
+        )?;
         let mut child = Command::new(Path::new(&binary).canonicalize()?)
             .arg("--dev")
             .current_dir(env::var_os("TEST_TMPDIR").ok_or("missing Bazel TEST_TMPDIR")?)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stdout(Stdio::from(log.try_clone()?))
+            .stderr(Stdio::from(log))
             .spawn()?;
         for _ in 0..300 {
             if let Some(status) = child.try_wait()? {
@@ -411,7 +418,7 @@ async fn respond(
         _ => "Unknown",
     };
     let head = format!(
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
     stream.write_all(head.as_bytes()).await?;

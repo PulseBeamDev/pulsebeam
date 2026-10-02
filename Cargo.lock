@@ -3318,6 +3318,7 @@ dependencies = [
  "log",
  "pulsebeam-agent-core",
  "pulsebeam-core",
+ "pulsebeam-proto",
  "pulsebeam-server",
  "serde",
  "serde-wasm-bindgen",
