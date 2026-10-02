@@ -268,9 +268,8 @@ fn public_send_media_reports_invalid_and_closed_transport_states() {
 #[test]
 fn public_media_admission_enforces_exact_configured_payload_bound() {
     let mut source = PeerFixture::connected();
-    let packet = source.send_source(&[0xf8]);
-
     let mut bytes = PeerFixture::connected_with_media_limit(2);
+    let packet = source.send_source(&[0xf8]);
     for id in 1..=2 {
         assert_eq!(
             bytes.connection.command(
