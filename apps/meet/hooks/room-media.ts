@@ -25,9 +25,9 @@ export function useRoomMedia(
   });
   const [cameraOn, setCameraOn] = useState(initial.cameraOn);
   const [micOn, setMicOn] = useState(initial.micOn);
-  const camera = agent.localVideoTrack("camera");
-  const microphone = agent.localAudioTrack("microphone");
-  const screen = agent.localVideoTrack("screen");
+  const camera = agent.local.video("camera");
+  const microphone = agent.local.audio("microphone");
+  const screen = agent.local.video("screen");
 
   useEffect(() => {
     camera.setSource(cameraOn ? sources.videoTrack : null);

@@ -5,7 +5,10 @@ import { runOwnershipContract } from "./ownership.js";
 import { runAutoplayContract, runPlaybackContract } from "./playback.js";
 
 const observation = {
-  removedLegacySurface: !("AgentProvider" in api) && !("useRemoteMedia" in api),
+  removedLegacySurface:
+    !("AgentProvider" in api) &&
+    !("useRemoteMedia" in api) &&
+    !("Audio" in api),
   captureDevices: false,
   committedRenderIsolation: false,
   capturePendingOptions: false,
@@ -25,7 +28,7 @@ const observation = {
   playbackRetained: false,
   playbackLatestCallback: false,
   detached: false,
-  audioExplicit: false,
+  audioWithoutUi: false,
   autoplayRespected: false,
   playbackProbeError: "",
 };

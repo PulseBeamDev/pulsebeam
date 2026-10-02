@@ -430,7 +430,7 @@
     "independent receiver discovery",
   );
   const mount = (agent) => {
-    const handle = agent.remoteVideoTracks.find(
+    const handle = agent.remote.videoTracks.find(
       (entry) => entry.publicationId === publication.id,
     );
     if (!handle) throw new Error("missing remote video handle");
@@ -516,12 +516,8 @@
     !secondView.handle.active &&
     (firstView.video.srcObject?.getTracks().length ?? 0) === 0 &&
     (secondView.video.srcObject?.getTracks().length ?? 0) === 0 &&
-    !receiver.remoteVideoTracks.some(
-      (entry) => entry.publicationId === publication.id,
-    ) &&
-    !secondReceiver.remoteVideoTracks.some(
-      (entry) => entry.publicationId === publication.id,
-    ) &&
+    !receiver.remote.videoTracks.includes(firstView.handle) &&
+    !secondReceiver.remote.videoTracks.includes(secondView.handle) &&
     receiver.getSnapshot().desiredRevision === revisions[0] &&
     secondReceiver.getSnapshot().desiredRevision === revisions[1];
   stale.close();

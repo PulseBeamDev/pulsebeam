@@ -21,9 +21,8 @@ import type {
   Participant,
   Publication,
   RemoteTrack,
-  RemoteAudioSource,
-  RemoteAudioTrack,
-  RemoteVideoTrack,
+  LocalMedia,
+  RemoteMedia,
   SenderConfig,
   Topic,
   TopicMode,
@@ -311,7 +310,6 @@ class AgentFacade implements Agent {
   readonly #remote: RemoteCatalog;
   readonly #topics: TopicRegistry;
   #managedVideo: readonly VideoDemand[] = [];
-  #managedAudio = false;
   #managedTopics: readonly TopicRegistration[] = [];
   readonly #topology: Required<MediaTopology>;
   #pendingToken: string | undefined;
@@ -324,16 +322,13 @@ class AgentFacade implements Agent {
     this.#remote = new RemoteCatalog(
       this,
       this.#topology.remoteVideos,
-      (video, audio) => {
-        if (
-          JSON.stringify(this.#managedVideo) === JSON.stringify(video) &&
-          this.#managedAudio === audio
-        )
+      (video) => {
+        if (JSON.stringify(this.#managedVideo) === JSON.stringify(video))
           return;
         this.#managedVideo = video;
-        this.#managedAudio = audio;
         this.#applyState(this.#state);
       },
+      runtimeConfig.logLevel,
     );
     this.#topics = new TopicRegistry(
       this,
@@ -390,16 +385,13 @@ class AgentFacade implements Agent {
     void this.#ready.catch(() => {});
   }
 
-  get remoteVideoTracks(): readonly RemoteVideoTrack[] {
-    return this.#remote.videoTracks;
-  }
+  readonly local: LocalMedia = Object.freeze({
+    video: (label: string) => this.#localVideoTrack(label),
+    audio: (label: string) => this.#localAudioTrack(label),
+  });
 
-  get remoteAudioTracks(): readonly RemoteAudioTrack[] {
-    return this.#remote.audioTracks;
-  }
-
-  get remoteAudio(): RemoteAudioSource {
-    return this.#remote.audioSource;
+  get remote(): RemoteMedia {
+    return this.#remote;
   }
 
   topic<T>(
@@ -435,7 +427,7 @@ class AgentFacade implements Agent {
     };
   };
 
-  localVideoTrack(label: string): LocalVideoTrack {
+  #localVideoTrack(label: string): LocalVideoTrack {
     return this.#localHandle(
       "video",
       label,
@@ -444,7 +436,7 @@ class AgentFacade implements Agent {
     );
   }
 
-  localAudioTrack(label: string): LocalAudioTrack {
+  #localAudioTrack(label: string): LocalAudioTrack {
     return this.#localHandle(
       "audio",
       label,
@@ -556,10 +548,6 @@ class AgentFacade implements Agent {
         ...(state.video ?? []),
         ...this.#managedVideo.filter(({ slot }) => !usedSlots.has(slot)),
       ],
-      audio: {
-        ...state.audio,
-        automatic: this.#managedAudio || state.audio?.automatic,
-      },
       topics: [...topics.values()],
     };
   }
@@ -570,6 +558,8 @@ class AgentFacade implements Agent {
     if (this.#runtime)
       this.#runtime.replace_desired(desiredValue(this.#effectiveState(next)));
     this.#state = next;
+    if (!next.connected)
+      this.#remote.update({ ...this.#snapshot, connection: "disconnected" });
     if (!this.#runtime && this.#snapshot.connection !== "terminal-failure") {
       this.#publish(
         Object.freeze({
@@ -772,7 +762,6 @@ class AgentFacade implements Agent {
       topics: freezeTopicSnapshot(raw.topics),
       failure: raw.failure ? Object.freeze({ ...raw.failure }) : null,
     });
-    this.#remote.update(next);
     this.#publish(next);
   }
 
@@ -810,6 +799,7 @@ class AgentFacade implements Agent {
   #publish(snapshot: AgentSnapshot): void {
     if (snapshot === this.#snapshot) return;
     this.#snapshot = snapshot;
+    this.#remote.update(snapshot);
     for (const listener of [...this.#listeners]) listener();
   }
 

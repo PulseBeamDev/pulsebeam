@@ -51,8 +51,8 @@ export async function runOwnershipContract() {
     await until(() => left !== null && right !== null);
     const first = left!;
     const independent = right!;
-    const firstVideo = first.localVideoTrack("camera");
-    const secondVideo = independent.localVideoTrack("camera");
+    const firstVideo = first.local.video("camera");
+    const secondVideo = independent.local.video("camera");
     firstVideo.setSource(source);
     secondVideo.setSource(source);
     const shared =

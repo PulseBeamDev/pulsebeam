@@ -6,7 +6,7 @@ export type {
   CapturedVideoTrack,
 } from "./capture-source.js";
 export { attachRemoteMedia } from "./remote-media.js";
-export { attachRemoteVideo, attachRemoteAudio } from "./remote-catalog.js";
+export { attachRemoteVideo } from "./remote-catalog.js";
 export type {
   Agent,
   AgentConfig,
@@ -33,7 +33,9 @@ export type {
   PlaybackFailure,
   Publication,
   PublicationIntent,
-  RemoteAudioSource,
+  LocalMedia,
+  RemoteMedia,
+  RemoteParticipant,
   RemoteAudioTrack,
   ReceiveOptions,
   RemoteMediaAttachment,

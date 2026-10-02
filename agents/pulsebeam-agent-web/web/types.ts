@@ -187,10 +187,34 @@ export interface RemoteAudioTrack {
   readonly kind: "audio";
   readonly participantId: string;
   readonly label: string;
+  readonly receiving: boolean;
+  subscribe(listener: () => void): () => void;
+  /** Normalized amplitudes, leading samples of the default 2048-point FFT. Oversized tails are zero. */
+  readWaveform(buffer: Float32Array): void;
+  /** Decibel bins in ascending frequency order with default smoothing. Oversized tails are -Infinity. */
+  readSpectrum(buffer: Float32Array): void;
 }
 
-export interface RemoteAudioSource {
-  readonly kind: "remote-audio";
+export interface LocalMedia {
+  video(label: string): LocalVideoTrack;
+  audio(label: string): LocalAudioTrack;
+}
+
+export interface RemoteParticipant {
+  readonly externalId: string;
+  video(label: string): RemoteVideoTrack;
+  audio(label: string): RemoteAudioTrack;
+  readonly videoTracks: readonly RemoteVideoTrack[];
+  readonly audioTracks: readonly RemoteAudioTrack[];
+}
+
+export interface RemoteMedia {
+  readonly participants: readonly RemoteParticipant[];
+  readonly videoTracks: readonly RemoteVideoTrack[];
+  readonly audioTracks: readonly RemoteAudioTrack[];
+  participant(externalId: string): RemoteParticipant;
+  /** Exceptional user-gesture recovery, also valid before media arrives. */
+  resumeAudio(): Promise<void>;
 }
 
 export interface Topic<T> {
@@ -364,15 +388,12 @@ export type AgentEvent =
   | { readonly type: "state-change" };
 
 export interface Agent {
-  readonly remoteVideoTracks: readonly RemoteVideoTrack[];
-  readonly remoteAudioTracks: readonly RemoteAudioTrack[];
-  readonly remoteAudio: RemoteAudioSource;
+  readonly local: LocalMedia;
+  readonly remote: RemoteMedia;
   topic<T>(
     name: string,
     options: { readonly mode: "reliable" | "unreliable" },
   ): Topic<T>;
-  localVideoTrack(label: string): LocalVideoTrack;
-  localAudioTrack(label: string): LocalAudioTrack;
   connect(): void;
   disconnect(): void;
   setState(state: AgentState): void;

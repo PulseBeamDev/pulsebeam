@@ -53,7 +53,7 @@ import { createCaptureSource } from "@pulsebeam/web";
 
 const stream = await navigator.mediaDevices.getUserMedia({ video: true });
 const source = createCaptureSource(stream.getVideoTracks()[0], "video");
-const camera = agent.localVideoTrack("camera");
+const camera = agent.local.video("camera");
 camera.setSource(source);
 agent.connect();
 // Later: disconnect without ending capture, or detach without releasing the label.
@@ -63,7 +63,7 @@ stream.getTracks().forEach((track) => track.stop());
 agent.close();
 ```
 
-`localAudioTrack(label)` reserves a separate audio namespace; repeated lookups
+`agent.local.audio(label)` reserves a separate audio namespace; repeated lookups
 return the same handle. Capacity exhaustion throws `LocalTrackCapacityError`
 with `kind`, `label`, and `capacity`, even after clearing a source. Another
 Agent may borrow the same source. `@pulsebeam/react` owns capture and Agent
@@ -99,20 +99,60 @@ Logging is configured independently for each agent with `logging.level`.
 Messages use the browser console. The default level is `warn`. Chrome hides
 `debug` and `trace` console messages unless Verbose output is enabled.
 
-The catalog-backed `agent.remoteVideoTracks` and `agent.remoteAudioTracks`
+The catalog-backed `agent.remote.videoTracks` and `agent.remote.audioTracks`
 expose stable handles with external participant identity, media kind, and
-application label. `agent.remoteAudio` is one Agent-owned aggregate playback
-source. A remote video handle's `setReceiveOptions({ minHeight, minFps,
-priority, playoutDelay })` replaces its policy, but does not request media
+application label. `agent.remote.participant(externalId)` returns a stable participant
+even before discovery, with `video(label)` and `audio(label)` lookup and per-participant
+collections. `agent.remote.participants` excludes self, as do all remote collections.
+Lookup does not discover a track or request video. Handles survive unpublication,
+departure/rejoin, publication-ID replacement, remapping, and reconnection.
+Collections retain identity until membership changes.
+
+A remote video handle's `setReceiveOptions({ minHeight, minFps, priority, playoutDelay })` replaces its policy, but does not request media
 until a video element is attached. `attachRemoteVideo(handle, video)` observes
 visible layout in physical pixels, shares the maximum demand across elements,
 and detaches on `close()`. Hidden or off-screen elements do not reserve a
 receiver, even with a minimum-height policy. Excess visible tracks remain
 unmapped and warn rather than evict existing visible consumers or grow the
-fixed topology. `attachRemoteAudio(agent.remoteAudio, audio)` plays only that
-Agent's currently mapped audio and detaches on `close()`; connection alone
-does not create playback. These helpers are the non-React counterpart of
-`@pulsebeam/react`'s `<Video>` and `<Audio>` components.
+fixed topology. Video policy and mounted demand survive temporary Catalog absence.
+Video attachment is the non-React counterpart of `@pulsebeam/react`'s `<Video>`.
+Generic attachments accept only video elements and ignore audio tracks.
+
+Remote audio is SDK-played automatically through one Web Audio route per mapped
+receiver, without an application audio element, component, attachment, or analysis
+read. A private detached, hidden, muted decoder element activates native browser
+decoding where needed; it is never mounted or exposed and adds no audible route.
+Connected Agents request automatic server-selected audio by default. Explicit
+`audio.automatic: false` in `setState` opts out of automatic selection, not
+playback of explicitly selected/pinned mapped audio. This deliberately replaces
+the former attachment-driven automatic demand.
+
+A logical audio handle's `receiving` is true exactly when Mapping binds its
+current publication to an audio receiver. Catalog presence, track readiness,
+silence, suspended browser audio, and analysis reads do not determine it.
+Mapping changes notify track subscribers, including same-receiver reassignment.
+
+`readWaveform(buffer)` synchronously fills normalized time-domain amplitudes;
+`readSpectrum(buffer)` fills decibel bins in ascending frequency order.
+Analysis uses AnalyserNode defaults: a 2048-point FFT and default spectral
+smoothing. Smaller buffers receive leading samples/bins, not different FFT
+resolution. Oversized tails are zero waveform or negative-infinity spectrum.
+Unmapped/absent handles and unavailable signal clear the entire caller buffer
+to those silence values. Empty buffers are valid. Pull reads do not publish
+signal arrays or notify subscribers. Remapping resets analyser history.
+
+`agent.remote.resumeAudio(): Promise<void>` is exceptional user-gesture recovery
+for browsers blocking autoplay, not a normal playback prerequisite. It works
+before media arrives, resolves only when the context is running, is safe to
+repeat, and rejects on recovery failure or close. Automatic failure is logged
+without terminating the Agent or changing Mapping. Applications call recovery
+directly from a gesture; the SDK adds no global gesture listeners.
+
+Disconnect removes routes and stale analysis; reconnect restores current
+receivers without duplicate output. Agent-owned contexts are isolated and close
+is terminal/idempotent. Existing handles become inactive/nonreceiving and read
+silence after close; new remote lookups fail. Borrowed local capture is never
+routed to the speakers or stopped by this feature.
 
 Snapshots keep `catalog` (revision, participants, publications) separate from
 `mapping` (accepted Intent revision and receiver-index bindings). Publications

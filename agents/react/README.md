@@ -37,7 +37,7 @@ function Camera({ config }: { config: AgentConfig }) {
   }, [agent]);
   useEffect(() => {
     if (!agent) return;
-    const camera = agent.localVideoTrack("camera");
+    const camera = agent.local.video("camera");
     camera.setSource(capture.videoTrack);
     return () => camera.setSource(null);
   }, [agent, capture.videoTrack]);
@@ -51,10 +51,11 @@ function Camera({ config }: { config: AgentConfig }) {
 
 Use the same Agent's catalog-backed remote handles directly, without looking
 up canonical publication IDs. Mounted video requests receive bandwidth based
-on visible element size; unmount releases demand. Audio playback is explicit:
+on visible element size; unmount releases demand. Remote audio plays automatically without an audio component:
 
 ```tsx
-import { Audio, Video, useAgent, type AgentConfig } from "@pulsebeam/react";
+import { useEffect } from "react";
+import { Video, useAgent, type AgentConfig } from "@pulsebeam/react";
 
 function Room({
   config,
@@ -64,10 +65,15 @@ function Room({
   onPlaybackError: (error: unknown, retry: () => Promise<void>) => void;
 }) {
   const agent = useAgent(config);
+  useEffect(() => {
+    if (!agent) return;
+    agent.connect();
+    return () => agent.disconnect();
+  }, [agent]);
   if (!agent) return null;
   return (
     <>
-      {agent.remoteVideoTracks.map((track) => (
+      {agent.remote.videoTracks.map((track) => (
         <Video
           key={`${track.participantId}:${track.label}`}
           source={track}
@@ -75,10 +81,15 @@ function Room({
           className="participant"
         />
       ))}
-      <Audio
-        source={agent.remoteAudio}
-        onPlaybackError={({ error, retry }) => onPlaybackError(error, retry)}
-      />
+      <button
+        onClick={() =>
+          void agent.remote.resumeAudio().catch((error) =>
+            onPlaybackError(error, () => agent.remote.resumeAudio()),
+          )
+        }
+      >
+        Enable audio
+      </button>
     </>
   );
 }
@@ -86,7 +97,7 @@ function Room({
 
 `<Video>` also accepts a local video handle or a captured video source for
 pre-join preview, plus `null`, `mirror`, `muted`, `playsInline`, `className`, and
-`style`. Both playback components default to `autoPlay={true}`. Set
+`style`. Video defaults to `autoPlay={true}`. Set
 `autoPlay={false}` to attach without starting playback automatically; native
 `controls` can then start playback. Attachment still contributes receive demand.
 Use
@@ -107,8 +118,44 @@ Local handle labels and slots are reserved for the Agent's lifetime; exhausting
 capacity throws `LocalTrackCapacityError` synchronously.
 
 For low-level integration, `createAgent(config)` returns a caller-owned Agent.
-React ownership uses only `useAgent(config)`; playback uses `<Video>` and
-`<Audio>` with source handles. There is no provider-based ownership adapter or
+React ownership uses only `useAgent(config)`; video presentation uses `<Video>` with source handles. There is no provider-based ownership adapter or
 raw media attachment hook.
 The package build prepares the internal web runtime and WASM asset, without an
 application dependency on `@pulsebeam/web`.
+
+## Logical discovery and audio analysis
+
+`agent.remote.participant(externalId)` works before discovery. Its `video(label)`
+and `audio(label)` handles survive departure and republication. Catalog-backed
+`participants`, `videoTracks`, and `audioTracks` exclude self and retain collection
+identity until membership changes. `useAgent` observes discovery changes.
+
+For an independently rendered audio indicator, use React's external-store binding:
+
+```tsx
+import { useSyncExternalStore } from "react";
+import type { RemoteAudioTrack } from "@pulsebeam/react";
+
+function Receiving({ track }: { track: RemoteAudioTrack }) {
+  const receiving = useSyncExternalStore(
+    (listener) => track.subscribe(listener),
+    () => track.receiving,
+    () => false,
+  );
+  return <span>{receiving ? "Receiving" : "Unmapped"}</span>;
+}
+```
+
+`receiving` follows Mapping, not audible signal or autoplay. Waveform and spectrum
+reads are imperative animation/DSP calls and do not trigger React renders.
+They use normalized amplitudes and decibels, respectively, with the default
+2048-point FFT and spectral smoothing. Smaller buffers get leading samples/bins,
+not a different FFT resolution; oversized tails and unavailable signal are zero
+for waveform and negative infinity for spectrum.
+
+Connected Agents select remote audio automatically. Low-level
+`setState({ connected: true, audio: { automatic: false } })` opts out of automatic
+selection, not playback of explicitly selected/pinned mapped audio.
+`resumeAudio()` is exceptional browser-autoplay recovery, can unlock before
+media arrives, and rejects on failure or close. Call it directly from a gesture;
+the SDK does not install global recovery listeners.

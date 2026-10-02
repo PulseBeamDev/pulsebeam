@@ -1,5 +1,5 @@
 (async () => {
-  const { RemoteCatalog, attachRemoteVideo, attachRemoteAudio } = await import(
+  const { RemoteCatalog, attachRemoteVideo } = await import(
     "/dist/remote-catalog.js"
   );
   const publications = Array.from({ length: 18 }, (_, index) => ({
@@ -32,15 +32,25 @@
     },
   };
   let wire = [];
-  let audioDemand = false;
-  const catalog = new RemoteCatalog(fakeAgent, 16, (video, audio) => {
+  const catalog = new RemoteCatalog(fakeAgent, 16, (video) => {
     wire = video;
-    audioDemand = audio;
   });
+  const absent = catalog.participant("alice");
+  const prepublication = absent.video("camera-0");
+  const voice = absent.audio("microphone");
+  const prelookup =
+    catalog.participants.length === 0 &&
+    catalog.videoTracks.length === 0 &&
+    !prepublication.active &&
+    !voice.receiving;
   catalog.update(snapshot);
   const initialHandles = catalog.videoTracks;
   const first = initialHandles[0];
   const externalIdentity =
+    prelookup &&
+    prepublication === initialHandles[0] &&
+    catalog.participants[0] === absent &&
+    absent.videoTracks[0] === prepublication &&
     initialHandles.length === 18 &&
     first.participantId === "alice" &&
     first.label === "camera-0" &&
@@ -103,9 +113,9 @@
   let capacity = false;
   let hiddenFloor = false;
   let mappingNotRemoval = false;
-  let removedTerminal = false;
-  let audioExplicit = false;
-  let playbackScoped = false;
+  let logicalLifetime = false;
+  let logicalAudio = false;
+  let independentKinds = false;
   try {
     mount(first, 120);
     await until(() =>
@@ -190,8 +200,8 @@
     catalog.update(snapshot);
     for (const listener of listeners) listener();
     const stale = first;
-    stale.setReceiveOptions({ minHeight: -1 });
-    removedTerminal =
+    stale.setReceiveOptions({ minHeight: 720 });
+    logicalLifetime =
       !stale.active &&
       !catalog.videoTracks.includes(stale) &&
       !wire.some(({ trackId }) => trackId === "video-0");
@@ -204,67 +214,129 @@
       },
     };
     catalog.update(snapshot);
-    removedTerminal &&=
-      catalog.videoTracks[0] !== stale &&
+    logicalLifetime &&=
+      catalog.videoTracks[0] === stale &&
       !wire.some(({ trackId }) => trackId === "video-0");
 
-    const context = new AudioContext();
-    const voice = context
-      .createMediaStreamDestination()
-      .stream.getAudioTracks()[0];
+    let notifications = 0;
+    voice.subscribe(() => notifications++);
+    const wave = new Float32Array([1, 2, 3]);
+    const spectrum = new Float32Array([1, 2, 3]);
+    voice.readWaveform(wave);
+    voice.readSpectrum(spectrum);
+    const clears =
+      wave.every((value) => value === 0) &&
+      spectrum.every((value) => value === -Infinity);
+    const mapped = (id) => {
+      snapshot = {
+        ...snapshot,
+        mapping: {
+          acceptedIntentRevision: 6,
+          video: [],
+          audio: [{ receiverIndex: 0, publicationId: id }],
+        },
+      };
+      catalog.update(snapshot);
+    };
+    mapped("audio-1");
+    const receivingWithoutMedia = voice.receiving && notifications === 1;
+    const other = absent.audio("other");
     snapshot = {
       ...snapshot,
-      mapping: {
-        acceptedIntentRevision: 6,
-        video: [],
-        audio: [{ receiverIndex: 0, publicationId: "audio-1" }],
+      catalog: {
+        ...snapshot.catalog,
+        publications: [
+          ...snapshot.catalog.publications,
+          { ...audioPublication, id: "audio-2", label: "other" },
+        ],
       },
-      tracks: { "audio-1": { media: voice, kind: "audio" } },
     };
-    const player = document.createElement("audio");
-    host.append(player);
-    let attempts = 0;
-    player.play = () => {
-      attempts += 1;
-      return attempts === 1
-        ? Promise.reject(new DOMException("blocked", "NotAllowedError"))
-        : Promise.resolve();
-    };
-    const manual = attachRemoteAudio(catalog.audioSource, player, undefined, {
-      autoPlay: false,
-    });
-    const manuallyAttached =
-      attempts === 0 &&
-      audioDemand &&
-      player.srcObject.getAudioTracks().includes(voice);
-    await manual.retryPlayback();
-    const manuallyRetried = attempts === 1;
-    manual.close();
-    attempts = 0;
-    let blocked;
-    const audio = attachRemoteAudio(
-      catalog.audioSource,
-      player,
-      (failure, retry) => {
-        blocked = { failure, retry };
-      },
-    );
     catalog.update(snapshot);
-    for (const listener of listeners) listener();
-    await until(() => blocked !== undefined);
-    audioExplicit =
-      manuallyAttached &&
-      manuallyRetried &&
-      audioDemand &&
-      player.srcObject instanceof MediaStream &&
-      player.srcObject.getAudioTracks().includes(voice);
-    await blocked.retry();
-    playbackScoped = blocked.failure.message === "blocked" && attempts === 2;
-    audio.close();
-    audioExplicit &&=
-      !audioDemand && player.srcObject === null && voice.readyState === "live";
-    voice.stop();
-    await context.close();
+    mapped("audio-2");
+    const reassignment =
+      !voice.receiving && other.receiving && notifications === 2;
+    snapshot = {
+      ...snapshot,
+      catalog: { revision: 4, participants: [], publications: [] },
+      mapping: { acceptedIntentRevision: 7, video: [], audio: [] },
+    };
+    catalog.update(snapshot);
+    const absentAgain =
+      catalog.participants.length === 0 && !other.receiving && !stale.active;
+    elements[0].style.display = "block";
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    logicalLifetime &&= wire.length === 0 && !stale.active;
+    snapshot = {
+      ...snapshot,
+      catalog: {
+        revision: 5,
+        participants: [{ id: "participant-NEW", externalId: "alice" }],
+        publications: [
+          {
+            ...audioPublication,
+            id: "audio-NEW",
+            participantId: "participant-NEW",
+          },
+          {
+            ...publications[0],
+            id: "video-NEW",
+            participantId: "participant-NEW",
+          },
+        ],
+      },
+      mapping: {
+        acceptedIntentRevision: 8,
+        video: [],
+        audio: [{ receiverIndex: 0, publicationId: "audio-NEW" }],
+      },
+    };
+    catalog.update(snapshot);
+    const returned =
+      catalog.participants[0] === absent &&
+      catalog.audioTracks[0] === voice &&
+      catalog.videoTracks[0] === stale &&
+      voice.receiving;
+    await until(() => wire.some(({ trackId }) => trackId === "video-NEW"));
+    const policyRetained =
+      stale.options.minHeight === 720 &&
+      wire.find(({ trackId }) => trackId === "video-NEW")?.minHeight === 720;
+    logicalLifetime &&= policyRetained;
+    const self = new RemoteCatalog(fakeAgent, 1, () => {});
+    self.update({
+      ...snapshot,
+      participantId: "participant-NEW",
+      participantExternalId: "alice",
+    });
+    const selfExcluded =
+      self.participants.length === 0 &&
+      self.videoTracks.length === 0 &&
+      self.audioTracks.length === 0;
+    self.close();
+    logicalAudio =
+      clears &&
+      receivingWithoutMedia &&
+      reassignment &&
+      absentAgain &&
+      returned &&
+      selfExcluded;
+    independentKinds =
+      policyRetained &&
+      absent.video("microphone") !== voice &&
+      absent.audio("camera-0") !== stale;
+    catalog.close();
+    voice.readWaveform(wave.fill(9));
+    voice.readSpectrum(spectrum.fill(9));
+    let lookupClosed = false;
+    try {
+      absent.audio("new");
+    } catch {
+      lookupClosed = true;
+    }
+    logicalAudio &&=
+      !voice.receiving &&
+      wave.every((value) => value === 0) &&
+      spectrum.every((value) => value === -Infinity) &&
+      lookupClosed;
   } finally {
     delete document.hidden;
     console.warn = originalWarn;
@@ -281,8 +353,8 @@
     capacity,
     hiddenFloor,
     mappingNotRemoval,
-    removedTerminal,
-    audioExplicit,
-    playbackScoped,
+    logicalLifetime,
+    logicalAudio,
+    independentKinds,
   };
 })();

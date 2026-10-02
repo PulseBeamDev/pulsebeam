@@ -59,13 +59,13 @@ globalThis.__pulsebeamPublic = (async () => {
     token: "handle-token",
     topology: { localVideos: 1, localAudios: 1 },
   });
-  const videoHandle = handleAgent.localVideoTrack("camera");
-  const sameVideoHandle = handleAgent.localVideoTrack("camera");
-  const audioHandle = handleAgent.localAudioTrack("camera");
+  const videoHandle = handleAgent.local.video("camera");
+  const sameVideoHandle = handleAgent.local.video("camera");
+  const audioHandle = handleAgent.local.audio("camera");
   const capture = window.pulsebeam.createCaptureSource(track, "video");
   let capacity;
   try {
-    handleAgent.localVideoTrack("screen");
+    handleAgent.local.video("screen");
   } catch (error) {
     capacity = error;
   }
@@ -100,27 +100,27 @@ globalThis.__pulsebeamPublic = (async () => {
     token: "dual-handle-token",
     topology: { localVideos: 2 },
   });
-  const dualCamera = dual.localVideoTrack("camera");
-  const dualScreen = dual.localVideoTrack("screen");
+  const dualCamera = dual.local.video("camera");
+  const dualScreen = dual.local.video("screen");
   dual.connect();
   dual.disconnect();
   dualScreen.setSource(capture);
   dualScreen.setSource(null);
   let exhaustedAfterClearing;
   try {
-    dual.localVideoTrack("aux");
+    dual.local.video("aux");
   } catch (error) {
     exhaustedAfterClearing = error;
   }
   let invalidLabelRejected = false;
   try {
-    dual.localVideoTrack("ü".repeat(33));
+    dual.local.video("ü".repeat(33));
   } catch (error) {
     invalidLabelRejected = error instanceof TypeError;
   }
   const retainedBindings =
-    dual.localVideoTrack("screen") === dualScreen &&
-    dual.localVideoTrack("camera") === dualCamera &&
+    dual.local.video("screen") === dualScreen &&
+    dual.local.video("camera") === dualCamera &&
     exhaustedAfterClearing?.kind === "video" &&
     exhaustedAfterClearing.label === "aux" &&
     exhaustedAfterClearing.capacity === 2 &&

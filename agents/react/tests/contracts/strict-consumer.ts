@@ -5,14 +5,13 @@ import {
   useMediaDevices,
   useUserMedia,
   Video,
-  Audio,
   type Agent,
   type AgentConfig,
   type CapturedVideoTrack,
   type LocalTrackCapacityError,
   type MediaCaptureError,
   type RemoteVideoTrack,
-  type RemoteAudioSource,
+  type RemoteAudioTrack,
 } from "@pulsebeam/react";
 import type { ReactElement } from "react";
 
@@ -45,7 +44,7 @@ const screen = useDisplayMedia({ video: true, audio: false });
 const devices = useMediaDevices();
 if (owned) {
   owned.connect();
-  const handle = owned.localVideoTrack("camera");
+  const handle = owned.local.video("camera");
   handle.setSource(camera.videoTrack);
   const source: CapturedVideoTrack | null = handle.source;
   // @ts-expect-error An audio capture cannot be bound to a video handle.
@@ -60,20 +59,27 @@ declare const exhausted: LocalTrackCapacityError;
 const failureCode: string = captureFailure.code;
 const capacity: number = exhausted.capacity;
 void [firstCameraId, failureCode, capacity];
-const available: readonly RemoteVideoTrack[] = agent.remoteVideoTracks;
-const mainAudio: RemoteAudioSource = agent.remoteAudio;
+const available: readonly RemoteVideoTrack[] = agent.remote.videoTracks;
+const mainAudio: RemoteAudioTrack = agent.remote
+  .participant("alice")
+  .audio("microphone");
+const receiving: boolean = mainAudio.receiving;
+mainAudio.readWaveform(new Float32Array(2048));
+mainAudio.readSpectrum(new Float32Array(1024));
+mainAudio.subscribe(() => {});
 const remoteView: ReactElement | null = Video({
   source: available[0] ?? null,
   mirror: true,
 });
 const localView: ReactElement | null = Video({
-  source: agent.localVideoTrack("camera"),
+  source: agent.local.video("camera"),
 });
-const remoteAudio: ReactElement | null = Audio({ source: mainAudio });
-// @ts-expect-error Audio only accepts a remote audio source.
-Audio({ source: available[0] });
+// @ts-expect-error Audio playback components were removed.
+import { Audio } from "@pulsebeam/react";
+// @ts-expect-error Aggregate playback sources were removed.
+agent.remoteAudio;
 const messages = agent
   .topic<{ text: string }>("chat", { mode: "reliable" })
   .subscribe();
-void [remoteView, localView, remoteAudio, messages];
+void [remoteView, localView, receiving, messages];
 agent.close();

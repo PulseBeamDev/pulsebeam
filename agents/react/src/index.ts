@@ -2,8 +2,8 @@ import { useEffect, useState, useSyncExternalStore } from "react";
 import { createAgent, type Agent, type AgentConfig } from "@pulsebeam/web";
 
 export { createAgent, LocalTrackCapacityError } from "@pulsebeam/web";
-export { Video, Audio } from "./playback.js";
-export type { AudioProps, VideoProps, PlaybackError } from "./playback.js";
+export { Video } from "./playback.js";
+export type { VideoProps, PlaybackError } from "./playback.js";
 export {
   useMediaDevices,
   useUserMedia,
@@ -45,7 +45,9 @@ export type {
   Participant,
   Publication,
   PublicationIntent,
-  RemoteAudioSource,
+  LocalMedia,
+  RemoteMedia,
+  RemoteParticipant,
   RemoteAudioTrack,
   ReceiveOptions,
   RemoteTrack,

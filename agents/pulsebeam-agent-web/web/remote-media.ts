@@ -48,6 +48,8 @@ class Attachment implements RemoteMediaAttachment {
     publicationIds: readonly string[],
     autoPlay: boolean,
   ) {
+    if (!(element instanceof HTMLVideoElement))
+      throw new TypeError("remote attachment requires a video element");
     this.#agent = agent;
     this.#element = element;
     this.#autoPlay = autoPlay;
@@ -87,7 +89,7 @@ class Attachment implements RemoteMediaAttachment {
     const tracks = this.#agent.getSnapshot().tracks;
     for (const publicationId of this.#publicationIds) {
       const track = tracks[publicationId]?.media;
-      if (track) next.add(track);
+      if (track?.kind === "video") next.add(track);
     }
     let changed = false;
     for (const track of this.#tracks) {
@@ -125,7 +127,7 @@ class Attachment implements RemoteMediaAttachment {
 
 export function attachRemoteMedia(
   agent: Agent,
-  element: HTMLMediaElement,
+  element: HTMLVideoElement,
   options: RemoteMediaAttachmentOptions,
 ): RemoteMediaAttachment {
   return new Attachment(

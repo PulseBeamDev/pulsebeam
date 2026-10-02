@@ -11,6 +11,7 @@ use support::{
     DestinationServer, StaticServer, TestResult, capabilities, evaluate_json, managed_driver,
     navigate,
 };
+use thirtyfour::prelude::ChromiumLikeCapabilities;
 use thirtyfour::testing::run_browser_test;
 
 const PUBLIC: &str = include_str!("contracts/observe-public.js");
@@ -132,9 +133,9 @@ struct RemoteCatalog {
     capacity: bool,
     hidden_floor: bool,
     mapping_not_removal: bool,
-    removed_terminal: bool,
-    audio_explicit: bool,
-    playback_scoped: bool,
+    logical_lifetime: bool,
+    logical_audio: bool,
+    independent_kinds: bool,
 }
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -188,7 +189,7 @@ struct React {
     replaced: bool,
     playback_error: bool,
     detached: bool,
-    audio_explicit: bool,
+    audio_without_ui: bool,
 }
 fn root() -> PathBuf {
     PathBuf::from(
@@ -216,7 +217,6 @@ async fn web(server: &StaticServer, failure: bool) -> TestResult<()> {
                 result.exports,
                 [
                     "LocalTrackCapacityError",
-                    "attachRemoteAudio",
                     "attachRemoteMedia",
                     "attachRemoteVideo",
                     "createAgent",
@@ -328,15 +328,74 @@ async fn remote_catalog_handles_preserve_identity_and_bound_demand() -> TestResu
                 && result.capacity
                 && result.hidden_floor
                 && result.mapping_not_removal
-                && result.removed_terminal
-                && result.audio_explicit
-                && result.playback_scoped,
+                && result.logical_lifetime
+                && result.logical_audio
+                && result.independent_kinds,
             "remote catalog contract: {result:?}",
         );
         Ok::<_, Box<dyn Error + Send + Sync>>(())
     })
     .await
     .map_err(|error| format!("remote catalog contract failed: {error}").into())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn remote_audio_routes_real_decoded_receivers_without_ui() -> TestResult<()> {
+    let server = StaticServer::start(root()).await?;
+    let mut browser = capabilities()?;
+    browser.add_arg("--autoplay-policy=no-user-gesture-required")?;
+    let url = server.url("tests/fixture.html");
+    run_browser_test(managed_driver(browser), |driver| async move {
+        let bidi = driver.bidi().await?;
+        let context = bidi.browsing_context().top_level().await?;
+        navigate(&bidi, &context, url).await?;
+        let result: bool = evaluate_json(
+            &bidi,
+            &context,
+            include_str!("contracts/remote-audio-contract.js"),
+        )
+        .await?;
+        assert!(result);
+        Ok::<_, Box<dyn Error + Send + Sync>>(())
+    })
+    .await
+    .map_err(|error| format!("decoded remote audio contract failed: {error}").into())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn remote_audio_recovers_from_a_trusted_gesture_and_fences_close() -> TestResult<()> {
+    let server = StaticServer::start(root()).await?;
+    let mut browser = capabilities()?;
+    browser.add_arg("--autoplay-policy=document-user-activation-required")?;
+    let url = server.url("tests/fixture.html");
+    run_browser_test(managed_driver(browser), |driver| async move {
+        let bidi = driver.bidi().await?;
+        let context = bidi.browsing_context().top_level().await?;
+        navigate(&bidi, &context, url).await?;
+        let _: () = evaluate_json(&bidi, &context, LOAD).await?;
+        let started: bool = evaluate_json(
+            &bidi,
+            &context,
+            include_str!("contracts/remote-audio-recovery-start.js"),
+        )
+        .await?;
+        assert!(started);
+        driver
+            .find(thirtyfour::By::Id("resume-audio"))
+            .await?
+            .click()
+            .await?;
+        let result: bool = evaluate_json(
+            &bidi,
+            &context,
+            include_str!("contracts/remote-audio-recovery-finish.js"),
+        )
+        .await?;
+        assert!(result);
+        Ok::<_, Box<dyn Error + Send + Sync>>(())
+    })
+    .await
+    .map_err(|error| format!("remote audio recovery contract failed: {error}").into())
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -375,6 +434,40 @@ async fn initialization_failure_is_private_and_deterministic() -> TestResult<()>
     assert_eq!(server.wasm_requests(), 1);
     Ok(())
 }
+#[tokio::test(flavor = "multi_thread")]
+async fn connected_agents_select_and_play_audio_without_ui() -> TestResult<()> {
+    let _destination = DestinationServer::start()?;
+    let server = StaticServer::start(root()).await?;
+    let room = RoomExternalId::new("automatic-web-audio")?;
+    let sender =
+        mint_development_token(&room, &ParticipantExternalId::new("web-sender")?, u64::MAX)?;
+    let receiver = mint_development_token(
+        &room,
+        &ParticipantExternalId::new("web-receiver")?,
+        u64::MAX,
+    )?;
+    let pinned =
+        mint_development_token(&room, &ParticipantExternalId::new("web-pinned")?, u64::MAX)?;
+    let expression = include_str!("contracts/automatic-audio-contract.js")
+        .replace("__SENDER_TOKEN__", &sender)
+        .replace("__RECEIVER_TOKEN__", &receiver)
+        .replace("__SECOND_RECEIVER_TOKEN__", &pinned);
+    let url = server.url("tests/fixture.html");
+    let mut browser = capabilities()?;
+    browser.add_arg("--autoplay-policy=no-user-gesture-required")?;
+    run_browser_test(managed_driver(browser), |driver| async move {
+        let bidi = driver.bidi().await?;
+        let context = bidi.browsing_context().top_level().await?;
+        navigate(&bidi, &context, url).await?;
+        let _: () = evaluate_json(&bidi, &context, LOAD).await?;
+        let result: bool = evaluate_json(&bidi, &context, &expression).await?;
+        assert!(result);
+        Ok::<_, Box<dyn Error + Send + Sync>>(())
+    })
+    .await
+    .map_err(|error| format!("automatic Agent audio contract failed: {error}").into())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn public_agent_connects_and_delivers_remote_media() -> TestResult<()> {
     let _destination = DestinationServer::start()?;
@@ -586,7 +679,7 @@ async fn react_provider_contract_runs_through_bidi() -> TestResult<()> {
                 && r.replaced
                 && r.playback_error
                 && r.detached
-                && r.audio_explicit,
+                && r.audio_without_ui,
             "React browser contract result: {r:?}"
         );
         Ok::<_, Box<dyn Error + Send + Sync>>(())

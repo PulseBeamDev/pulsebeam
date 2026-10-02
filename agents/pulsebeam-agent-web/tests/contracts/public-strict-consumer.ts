@@ -2,7 +2,6 @@ import {
   createAgent,
   createCaptureSource,
   attachRemoteMedia,
-  attachRemoteAudio,
   attachRemoteVideo,
   LocalTrackCapacityError,
   type AgentEvent,
@@ -59,8 +58,8 @@ const desired: AgentState = {
 agent.setState(desired);
 
 agent.connect();
-const camera = agent.localVideoTrack("camera");
-const microphone = agent.localAudioTrack("camera");
+const camera = agent.local.video("camera");
+const microphone = agent.local.audio("camera");
 const videoSource = createCaptureSource(audioTrack, "video");
 const audioSource = createCaptureSource(audioTrack, "audio");
 camera.setSource(videoSource);
@@ -107,9 +106,9 @@ const removeEvents = agent.subscribeEvents((event: AgentEvent) => {
   }
 });
 const discoveredVideo: RemoteVideoTrack | undefined =
-  agent.remoteVideoTracks[0];
+  agent.remote.videoTracks[0];
 const discoveredAudio: RemoteAudioTrack | undefined =
-  agent.remoteAudioTracks[0];
+  agent.remote.audioTracks[0];
 if (discoveredVideo) {
   const participant: string = discoveredVideo.participantId;
   const label: string = discoveredVideo.label;
@@ -140,7 +139,7 @@ const replacement: Promise<void> = agent.replaceLocalTrack("a0", audioTrack, {
 const muted: Promise<void> = agent.setLocalMuted("a0", true);
 const attachment: RemoteMediaAttachment = attachRemoteMedia(
   agent,
-  audioElement,
+  videoElement,
   {
     publicationIds: ["publication-audio"],
     onPlaybackBlocked: (failure: PlaybackFailure, retry) => {
@@ -150,8 +149,29 @@ const attachment: RemoteMediaAttachment = attachRemoteMedia(
   },
 );
 attachment.setPublicationIds(["publication-audio"]);
-const audioPlayback = attachRemoteAudio(agent.remoteAudio, audioElement);
-audioPlayback.close();
+const participant = agent.remote.participant("alice");
+const voice = participant.audio("microphone");
+const receiving: boolean = voice.receiving;
+voice.readWaveform(new Float32Array(2048));
+voice.readSpectrum(new Float32Array(1024));
+voice.subscribe(() => {});
+void agent.remote.resumeAudio();
+void receiving;
+// @ts-expect-error Native media is only available on the low-level snapshot.
+voice.media;
+// @ts-expect-error Audio level telemetry is not part of the logical API.
+voice.level;
+// @ts-expect-error Aggregate audio playback sources were removed.
+agent.remoteAudio;
+// @ts-expect-error Top-level discovery was removed.
+agent.remoteAudioTracks;
+// @ts-expect-error Old local lookup methods were removed.
+agent.localVideoTrack("camera");
+// @ts-expect-error Explicit audio attachments were removed.
+import { attachRemoteAudio } from "../../web/index.js";
+// @ts-expect-error Generic attachment cannot provide an alternate audio playback model.
+attachRemoteMedia(agent, audioElement, { publicationIds: [] });
+
 declare const videoElement: HTMLVideoElement;
 if (discoveredVideo) attachRemoteVideo(discoveredVideo, videoElement).close();
 if (discoveredVideo) {

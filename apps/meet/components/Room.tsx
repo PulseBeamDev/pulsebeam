@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { Audio, Video, useAgent } from "@pulsebeam/react";
+import { Video, useAgent } from "@pulsebeam/react";
 import type { Agent, RemoteVideoTrack } from "@pulsebeam/react";
 import {
   Alert,
@@ -112,7 +112,7 @@ function RoomSession({
     retrySubscriptions,
   } = useTopics(owner, agent.participantExternalId);
   const { remoteTracks, spotlight, setPin } = useVideoLayout(
-    owner.remoteVideoTracks,
+    owner.remote.videoTracks,
   );
   useEffect(() => {
     owner.connect();
@@ -495,7 +495,18 @@ function RoomSession({
           </Paper>
         )}
       </Box>
-      <Audio source={owner.remoteAudio} onPlaybackError={playbackError} />
+      <button
+        type="button"
+        onClick={() =>
+          void owner.remote
+            .resumeAudio()
+            .catch((error) =>
+              playbackError({ error, retry: () => owner.remote.resumeAudio() }),
+            )
+        }
+      >
+        Enable audio
+      </button>
     </Box>
   );
 }

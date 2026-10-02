@@ -2,7 +2,6 @@ import {
   useAgent,
   useUserMedia,
   Video,
-  Audio,
   type Agent,
   type AgentConfig,
   type PlaybackError,
@@ -16,12 +15,12 @@ const config: AgentConfig = {
 const agent: Agent | null = useAgent(config);
 const camera = useUserMedia({ video: true, audio: false });
 if (agent) {
-  agent.localVideoTrack("camera").setSource(camera.videoTrack);
+  agent.local.video("camera").setSource(camera.videoTrack);
   Video({
-    source: agent.remoteVideoTracks[0] ?? null,
+    source: agent.remote.videoTracks[0] ?? null,
     onPlaybackError: (failure: PlaybackError) => void failure.retry(),
   });
-  Audio({ source: agent.remoteAudio });
+  void agent.remote.resumeAudio();
   agent.connect();
   agent.disconnect();
 }

@@ -27,12 +27,6 @@
     };
   }
 
-  function audioTrack() {
-    return new AudioContext()
-      .createMediaStreamDestination()
-      .stream.getAudioTracks()[0];
-  }
-
   function videoTrack() {
     return document.createElement("canvas").captureStream().getVideoTracks()[0];
   }
@@ -42,7 +36,7 @@
     await Promise.resolve();
   }
 
-  const audio = audioTrack();
+  const audio = videoTrack();
   const video = videoTrack();
   const replacement = videoTrack();
   const agent = fakeAgent();
@@ -76,7 +70,7 @@
   agent.publish({ audio: { media: audio }, video: { media: replacement } });
   const restored = hasTracks(stream, audio, replacement) && plays === 5;
 
-  const secondElement = document.createElement("audio");
+  const secondElement = document.createElement("video");
   Object.defineProperty(secondElement, "play", {
     value: () => Promise.resolve(),
   });
@@ -97,7 +91,7 @@
   const terminal = secondElement.srcObject === null && hasTracks(stream);
 
   const blockedAgent = fakeAgent({ audio: { media: audio } });
-  const blockedElement = document.createElement("audio");
+  const blockedElement = document.createElement("video");
   let blockedPlays = 0;
   let retry;
   let blockedMessage = "";
@@ -124,7 +118,7 @@
   blocked.close();
 
   const pendingAgent = fakeAgent({ audio: { media: audio } });
-  const pendingElement = document.createElement("audio");
+  const pendingElement = document.createElement("video");
   let rejectPlay;
   let pendingBlocked = false;
   Object.defineProperty(pendingElement, "play", {
