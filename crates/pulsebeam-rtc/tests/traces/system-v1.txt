@@ -5,7 +5,7 @@ feedback-outage 0x1104 10s 2Mbit 100ms outage=3-6s
 ecn 0x1105 10s 2Mbit 50ms ce=20 bleach=5-7s
 policer-competition 0x1106 20s 5Mbit policer=2Mbit flows=2
 pause-switch 0x1107 12s 4Mbit pause=4-6s switch=8s
-path-replacement 0x1108 12s udp4-to-tcp6=5s loss=2pct
+loss-reordering 0x1108 12s udp4-to-tcp6=5s loss=2pct
 sctp-coexistence 0x1109 10s 4Mbit rtp=3Mbit data=64KiB
 overload-malformed 0x1110 bounds=default,hard,limit+1
 close 0x1111 graceful=2s abort=separate

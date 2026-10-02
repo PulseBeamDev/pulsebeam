@@ -43,7 +43,7 @@ test_suite(
 test_suite(
     name = "fast",
     tests = [":check"] + ["//%s:unit_tests" % owner for owner in RUST_OWNERS] + [
-        "//crates/pulsebeam-rtc:integration_tests", "//crates/pulsebeam-rtc:browser_protocol",
+        "//crates/pulsebeam-rtc:integration_tests", "//crates/pulsebeam-rtc/simulation:interop",
         "//crates/pulsebeam-simulator:fast",
         "//server/auth:fast", "//server/typescript:fast", "//server/go:fast", "//server/python:fast", "//server/rust:fast",
     ],
@@ -52,8 +52,7 @@ test_suite(
 test_suite(
     name = "slow",
     tests = [
-        "//crates/pulsebeam-simulator:slow", "//crates/pulsebeam-rtc:chrome",
-        "//crates/pulsebeam-rtc:firefox", "//crates/pulsebeam-rtc:rfc8888",
+        "//crates/pulsebeam-simulator:slow",
         "//agents/pulsebeam-agent-web:browser",
     ],
     tags = ["slow"],

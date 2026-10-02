@@ -1,0 +1,25 @@
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+load("@rtc_libwebrtc//:defs.bzl", "aliases")
+
+package(default_visibility = ["//visibility:public"])
+exports_files(["Cargo.toml"])
+filegroup(name = "cargo_metadata_inputs", srcs = ["Cargo.toml", "src/lib.rs"])
+
+rust_library(
+    name = "pulsebeam-rtc-simulation",
+    testonly = True,
+    crate_root = "src/lib.rs",
+    srcs = ["src/lib.rs"],
+    edition = "2024",
+    deps = ["@rtc_libwebrtc//:pulsebeam-webrtc-sys"],
+    aliases = aliases(),
+)
+
+rust_test(
+    name = "interop",
+    crate_root = "tests/interop.rs",
+    srcs = ["tests/interop.rs"],
+    edition = "2024",
+    deps = ["@rtc_libwebrtc//:pulsebeam-webrtc-sys", "@crates//:bytes", "//crates/pulsebeam-rtc:pulsebeam-rtc"],
+    aliases = aliases(),
+)

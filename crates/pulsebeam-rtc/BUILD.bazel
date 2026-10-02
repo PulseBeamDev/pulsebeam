@@ -4,18 +4,11 @@ load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test", "rust_clippy_tes
 
 package(default_visibility = ["//visibility:public"])
 filegroup(name = "workflow_inputs", srcs = glob(["*.md", "docs/**/*.md", "Justfile", "scripts/*.sh"], allow_empty = True))
-exports_files(["Cargo.toml", "browser/browser-matrix.json"])
+exports_files(["Cargo.toml"])
 filegroup(name = "cargo_metadata_inputs", srcs = glob(["Cargo.toml", "uniffi.toml", "src/**/*.rs", "benches/**/*.rs", "examples/**/*.rs"], allow_empty = True))
 
-# crate-universe 0.74 keys packages by name/version, not Cargo source ID.
-# Keep the registry reference independent from the patched production fork.
-TEST_DEPS = depset(all_crate_deps(normal = True, normal_dev = True)).to_list() + [":pulsebeam-rtc", "@str0m_reference//:str0m"]
-# The collapsed dev alias must not rename the production fork to the reference.
-TEST_ALIASES = {
-    label: name
-    for label, name in (aliases(normal_dev = True, proc_macro_dev = True) | aliases()).items()
-    if name != "str0m_reference"
-} | {"@str0m_reference//:str0m": "str0m_reference"}
+TEST_DEPS = depset(all_crate_deps(normal = True, normal_dev = True)).to_list() + [":pulsebeam-rtc", "//crates/pulsebeam-rtc/simulation:pulsebeam-rtc-simulation"]
+TEST_ALIASES = aliases(normal_dev = True, proc_macro_dev = True) | aliases()
 
 cargo_toml_env_vars(name = "cargo_env", src = "Cargo.toml", workspace = "//:Cargo.toml")
 extract_cargo_lints(name = "lints", manifest = "Cargo.toml", workspace = "//:Cargo.toml")
@@ -39,14 +32,14 @@ rust_test(
     crate = ":pulsebeam-rtc",
     lint_config = ":lints",
     aliases = TEST_ALIASES,
-    deps = depset(all_crate_deps(normal = True, normal_dev = True)).to_list() + ["@str0m_reference//:str0m"],
+    deps = depset(all_crate_deps(normal = True, normal_dev = True)).to_list() + ["//crates/pulsebeam-rtc/simulation:pulsebeam-rtc-simulation"],
     proc_macro_deps = all_crate_deps(proc_macro_dev = True),
     
 )
 
-INTEGRATION_SRCS = glob(["tests/*.rs"], exclude = ["tests/browser_interop.rs", "tests/rfc8888_peer.rs"])
+INTEGRATION_SRCS = glob(["tests/*.rs"])
 INTEGRATION_TARGETS = [":integration_tests_" + src[:-3] + "_test" for src in INTEGRATION_SRCS]
-CHECK_TARGETS = [":pulsebeam-rtc", ":unit_tests", ":browser_protocol", ":rfc8888", ":scaling"] + INTEGRATION_TARGETS
+CHECK_TARGETS = [":pulsebeam-rtc", ":unit_tests", ":scaling"] + INTEGRATION_TARGETS
 rustfmt_test(name = "format", targets = CHECK_TARGETS)
 rust_clippy_test(name = "clippy", targets = CHECK_TARGETS)
 
@@ -63,80 +56,14 @@ rust_test_suite(
     proc_macro_deps = all_crate_deps(proc_macro = True, proc_macro_dev = True),
 )
 
-rust_test(
-    name = "rfc8888",
-    crate_root = "tests/rfc8888_peer.rs",
-    srcs = ["tests/rfc8888_peer.rs"],
-    edition = crate_edition(),
-    lint_config = ":lints",
-    deps = TEST_DEPS,
-    proc_macro_deps = all_crate_deps(proc_macro = True, proc_macro_dev = True),
-    aliases = TEST_ALIASES,
-    args = ["--ignored", "--exact", "authenticated_pion_ccfb_reaches_production_feedback"],
-    data = ["//crates/pulsebeam-rtc/tests/peers/rfc8888:peer"],
-    env = {"PULSEBEAM_RFC8888_PEER": "$(rootpath //crates/pulsebeam-rtc/tests/peers/rfc8888:peer)"},
-    tags = ["slow"],
-    size = "large",
-)
-
-rust_test(
-    name = "browser_protocol",
-    crate_root = "tests/browser_interop.rs",
-    srcs = ["tests/browser_interop.rs", "tests/browser_support/mod.rs"],
-    compile_data = ["browser/interop.html", "browser/browser-matrix.json"],
-    edition = crate_edition(),
-    lint_config = ":lints",
-    rustc_env_files = [":cargo_env"],
-    deps = TEST_DEPS,
-    proc_macro_deps = all_crate_deps(proc_macro = True, proc_macro_dev = True),
-    aliases = TEST_ALIASES,
-    args = ["--exact", "browser_harness_confines_classic_webdriver"],
-)
-
-rust_test(
-    name = "chrome",
-    crate_root = "tests/browser_interop.rs",
-    srcs = ["tests/browser_interop.rs", "tests/browser_support/mod.rs"],
-    compile_data = ["browser/interop.html", "browser/browser-matrix.json"],
-    edition = crate_edition(),
-    lint_config = ":lints",
-    rustc_env_files = [":cargo_env"],
-    deps = TEST_DEPS,
-    proc_macro_deps = all_crate_deps(proc_macro = True, proc_macro_dev = True),
-    aliases = TEST_ALIASES,
-    args = ["--ignored", "--exact", "chrome_matrix"],
-    data = ["@browser_chrome//:files", "@browser_chrome//:executable", "@browser_chromedriver//:files", "@browser_chromedriver//:executable"],
-    env = {
-        "PULSEBEAM_BROWSER_BINARY": "$(rootpath @browser_chrome//:executable)",
-        "PULSEBEAM_DRIVER_BINARY": "$(rootpath @browser_chromedriver//:executable)",
-    },
-    tags = ["slow"],
-    size = "large",
-)
-
-rust_test(
-    name = "firefox",
-    crate_root = "tests/browser_interop.rs",
-    srcs = ["tests/browser_interop.rs", "tests/browser_support/mod.rs"],
-    compile_data = ["browser/interop.html", "browser/browser-matrix.json"],
-    edition = crate_edition(),
-    lint_config = ":lints",
-    rustc_env_files = [":cargo_env"],
-    deps = TEST_DEPS,
-    proc_macro_deps = all_crate_deps(proc_macro = True, proc_macro_dev = True),
-    aliases = TEST_ALIASES,
-    args = ["--ignored", "--exact", "firefox_matrix"],
-    data = ["@browser_firefox//:files", "@browser_firefox//:executable", "@browser_geckodriver//:files", "@browser_geckodriver//:executable"],
-    env = {
-        "PULSEBEAM_BROWSER_BINARY": "$(rootpath @browser_firefox//:executable)",
-        "PULSEBEAM_DRIVER_BINARY": "$(rootpath @browser_geckodriver//:executable)",
-    },
-    tags = ["slow"],
-    size = "large",
+test_suite(
+    name = "test",
+    tests = [":unit_tests", ":integration_tests", "//crates/pulsebeam-rtc/simulation:interop"],
 )
 
 rust_binary(
     name = "benchmark",
+    testonly = True,
     args = ["--bench"],
     crate_root = "benches/scaling.rs",
     srcs = ["benches/scaling.rs", "tests/support/mod.rs"],
@@ -150,6 +77,7 @@ rust_binary(
 
 rust_binary(
     name = "scaling",
+    testonly = True,
     crate_root = "benches/scaling.rs",
     srcs = ["benches/scaling.rs", "tests/support/mod.rs"],
     edition = crate_edition(),

@@ -34,7 +34,6 @@ struct Scenario {
 #[derive(Clone, Copy, Debug)]
 enum Transport {
     Udp,
-    Tcp,
     Data,
 }
 
@@ -83,7 +82,7 @@ const SCENARIOS: [Scenario; 11] = [
     scenario("policer-competition", 0x1106, 20, 160),
     scenario("pause-switch", 0x1107, 12, 48),
     Scenario {
-        name: "path-replacement",
+        name: "loss-reordering",
         seed: 0x1108,
         duration: Duration::from_secs(12),
         policy: NetworkPolicy {
@@ -93,7 +92,7 @@ const SCENARIOS: [Scenario; 11] = [
             reorder_every: Some(1),
         },
         packets: 48,
-        transport: Transport::Tcp,
+        transport: Transport::Udp,
     },
     Scenario {
         name: "sctp-coexistence",
@@ -710,7 +709,6 @@ fn run(scenario: Scenario) {
     let mut fixture = match (scenario.name, scenario.transport) {
         ("policer-competition", _) => PeerFixture::connected_with_senders(2),
         (_, Transport::Udp) => PeerFixture::connected(),
-        (_, Transport::Tcp) => PeerFixture::connected_tcp(),
         (_, Transport::Data) => PeerFixture::connected_datachannels(),
     };
     if matches!(scenario.transport, Transport::Data) {

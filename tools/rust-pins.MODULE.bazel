@@ -54,16 +54,6 @@ crate.from_cargo(
 use_repo(crate, "str0m_rtc")
 
 crate.from_cargo(
-    name = "str0m_reference",
-    manifests = ["//tools:rust/str0m_reference/Cargo.toml"],
-    cargo_lockfile = "//tools:rust/str0m_reference/Cargo.lock",
-    skip_cargo_lockfile_overwrite = True,
-    supported_platform_triples = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"],
-    host_tools = "@pulsebeam_rust_host_tools//:BUILD.bazel",
-)
-use_repo(crate, "str0m_reference")
-
-crate.from_cargo(
     name = "wasm_crates",
     manifests = ["//tools:rust/wasm_crates/Cargo.toml"],
     cargo_lockfile = "//tools:rust/wasm_crates/Cargo.lock",

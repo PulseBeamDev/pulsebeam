@@ -59,7 +59,7 @@ fn every_configured_limit_accepts_its_hard_maximum_and_rejects_limit_plus_one() 
 #[test]
 fn media_queue_admission_is_exact_and_preserves_ownership_on_would_block() {
     let mut source = PeerFixture::connected();
-    let packet = source.send_source(b"x");
+    let packet = source.send_source(&[0xf8]);
     let mut fixture = PeerFixture::connected_with_media_limit(2);
 
     for id in 1..=2 {

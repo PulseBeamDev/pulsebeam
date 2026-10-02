@@ -28,7 +28,7 @@ properties before reviewing controller changes.
 
 A later Internet-Draft revision, RFC, Ericsson commit, or libwebrtc commit MUST
 NOT silently change production behavior. Adopting one requires a new documented
-profile and fresh trace/simulation/browser evidence.
+profile and fresh trace/simulation/native-client evidence.
 
 Normative precedence is:
 
@@ -102,7 +102,7 @@ being hidden as tuning.
   exposing queue targets or controller gains.
 - Divide one safe connection envelope among senders according to SFU demand and
   relative priority.
-- Support ordinary Chrome and Firefox packet feedback without modified clients.
+- Support negotiated TWCC and RFC 8888 packet feedback without client modifications.
 - Remain responsive before media, during VBR/application-limited media, after
   pauses, and during feedback loss.
 - Commit packets at `Output::Transmit` without a transmit-receipt lifecycle.
@@ -1090,7 +1090,7 @@ public statistics.
 ## Validation
 
 Acceptance uses deterministic crate-local simulation, property tests, component
-comparison, the pinned live-browser matrix, and the root workspace gates.
+comparison, pinned controlled libwebrtc interoperability, and root workspace gates.
 
 ### Property tests
 
@@ -1181,22 +1181,20 @@ Scenario pass thresholds are committed before tuning a candidate profile.
 
 ### External evidence
 
-Pinned current Chrome and Firefox sessions MUST prove:
+The sole client acceptance baseline is pinned libwebrtc `0.6.2` in controlled
+execution. It MUST establish authenticated bidirectional media, actual native
+TWCC reaching server send accounting, DataChannel delivery/coexistence, and
+bounded lifecycle behavior. Simulation and component tests retain quantitative
+proof for loss/reordering, padding, priorities, pause/resume, VBR, source-switch
+continuity, malformed input, congestion safety, and resource bounds.
 
-- negotiation and selected TWCC feedback;
-- RTP, RTCP, NACK, and RTX behavior;
-- pre-media padding on negotiated media/RTX SSRCs;
-- independent per-sender playout-delay signaling and acknowledgment;
-- priority reallocation, pause/resume, sustained VBR, and source switching;
-- DataChannel coexistence and priority under RTP load;
-- graceful close and fallback ICE-TCP behavior.
-
-RFC 8888 behavior is proven with a standards test peer until ordinary browser
-support is an acceptance target. Stored SDP cannot prove any runtime behavior.
-Ericsson/libwebrtc traces are comparison oracles, not production dependencies or
-independent browser evidence. A PulseBeam deviation is accepted only when the
-same deterministic scenario demonstrates its intended latency/quality benefit
-without violating congestion safety or the fixed bounds.
+RFC 8888 negotiation/parsing/accounting and passive ICE-TCP framing remain
+client-free deterministic server evidence, not native interoperability claims.
+Stored SDP cannot prove runtime behavior or browser compatibility. Ericsson
+traces are comparison oracles, not production dependencies or client evidence.
+A PulseBeam deviation is accepted only when the same deterministic scenario
+demonstrates its intended latency/quality benefit without violating congestion
+safety or fixed bounds.
 
 ## Primary references
 

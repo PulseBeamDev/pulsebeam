@@ -36,7 +36,7 @@ than reopen rejected alternatives for convenience.
 | DataChannels | SCTP owns reliability/congestion; connection coordinates its bounded service with RTP | Feed SCTP bytes into SCReAM/TWCC; one pseudo-cwnd for all traffic | RTP feedback cannot acknowledge SCTP. Keeping controllers distinct avoids false accounting while still preventing starvation. |
 | Error handling | Malformed peer traffic is generally dropped/counted; semantic caller errors are returned | Bubble low-level parser/protocol errors publicly | Keeps hostile input from expanding API/error state and prevents implementation types from leaking. |
 | Resource policy | Explicit public limits plus fixed private hard bounds | Unbounded maps/queues; best-effort cleanup after overflow | Correctness and predictable per-connection work outrank preserving every packet/state under overload. |
-| Browser acceptance | Chrome + Firefox live acceptance; stored SDP only parser evidence | Claim compatibility from standards/parser fixtures alone | Runtime behavior such as TWCC, RTX, probing, and DataChannels requires live evidence. |
+| Client acceptance | Pinned libwebrtc `0.6.2` in controlled simulation; stored SDP only parser evidence | Infer browser/Pion compatibility from fixtures or native acceptance | Required media, TWCC, and DataChannel delivery must cross the actual native engine. |
 
 ## Minimal public surface
 
@@ -562,10 +562,9 @@ Private controller names and mutable internal objects are not returned.
   outbound RTP sender. TWCC and RFC 8888 are not run concurrently for the same
   RTP path.
 - Compatibility means compatibility with the negotiated PulseBeam WebRTC
-  profile, not every theoretically standards-compliant SDP. Live acceptance
-  evidence covers pinned current Chrome and Firefox versions. Stored SDP is parser
-  regression evidence only. Safari and `webrtcbin` are not initial acceptance
-  targets.
+  profile, not every theoretically standards-compliant SDP. Client acceptance
+  uses only pinned libwebrtc `0.6.2` in controlled execution. Stored SDP is generic
+  parser regression evidence only; browser and Pion compatibility are not claimed.
 
 The maximum accepted session is 128 negotiated media sections. The implementation
 allocates dense storage from the accepted answer; it does not reserve runtime
@@ -1033,8 +1032,8 @@ traffic is dropped and counted.
 
 ## Validation boundary
 
-Crate-local deterministic and live-browser sources live under
-`crates/pulsebeam-rtc`. Web and React own their consumer browser coverage; the
+Crate-local deterministic tests and the controlled native harness live under
+`crates/pulsebeam-rtc`. Web and React retain consumer browser coverage; the
 repository gate validates complete workspace acceptance.
 
 Acceptance requires:
@@ -1051,31 +1050,37 @@ Acceptance requires:
   policy monotonicity;
 - parameterized many-connection/many-stream benchmarks with one wakeup per
   connection and no global scans;
-- live Chrome/ChromeDriver `153.0.8010.36` and Firefox ESR `140.15.0esr` with
-  geckodriver `0.36.0`, provisioned from the immutable Linux x86_64 artifact
-  manifest;
-- version/hash assertions before offer creation and BiDi-only navigation,
-  script, network-event, log-event, synchronization, and assertion control after
-  classic WebDriver session bootstrap;
-- compact per-browser evidence for offer/answer, UDP, feedback, RTP/RTCP,
-  negotiated sender identity, policy/admission behavior, DataChannel reliability
-  and backpressure, malformed/overload handling, path observations, graceful
-  close, and abort. Standards/profile differences such as unavailable ICE-TCP or
-  mutually exclusive RFC 8888/TWCC negotiation are explicit `unsupported`
-  records, never silent skips.
+- actual libwebrtc `pulsebeam-webrtc-sys` `0.6.2`, source commit
+  `f87f99a48e58fb9cd13767ba58e9b7cd937c71a3`, and matching released native
+  artifacts provisioned through Bazel on Linux x86_64;
+- controlled execution with explicit task pumping, simulated clocks, virtual
+  packet delivery, and bounded progress; no production scheduling or live sockets;
+- authenticated bidirectional media, actual native TWCC affecting send accounting,
+  text/binary DataChannel delivery and media coexistence, lifecycle handling,
+  and repeatable same-seed results.
 
-The Bazel fast gate is browser-free. The canonical RTC local and CI command is:
+The canonical complete RTC local and CI command is:
 
 ```sh
-./bazel test //crates/pulsebeam-rtc:chrome //crates/pulsebeam-rtc:firefox //crates/pulsebeam-rtc:rfc8888
+./bazel test //crates/pulsebeam-rtc:test --nocache_test_results
 ```
 
-It provisions verified graph-owned browser/driver inputs and runs the local
-RFC 8888 peer and both exact browser matrices. Logs, exact offer inputs, and JSON
-reports are emitted under isolated `bazel-testlogs` outputs and retained by CI. Run
-root `./bazel test //:test` for complete workspace acceptance, including consumer-owned Web
-and React browser coverage. Other platforms, ICE restart, and renegotiation
-remain outside the v3 profile.
+This includes all unit, property, integration, and native simulation tests.
+With built binaries and cached test results disabled, one complete invocation
+MUST finish within five seconds including peer setup and teardown. Dependency
+fetching, compilation, lint/format checks, benchmarks, and other owners are
+excluded. Required native scenarios cannot be moved to optional slow gates.
+Missing artifacts or absent required media, feedback, or DataChannel evidence
+fail acceptance, never silently skip or fall back to another client.
+
+RFC 8888 and passive ICE-TCP retain deterministic client-free protocol evidence.
+The controlled native adapter has no TCP listener; no native ICE-TCP or RFC 8888
+client interoperability is claimed. Other platforms, ICE restart, and
+renegotiation remain outside this acceptance profile.
+
+Run root `./bazel test //:test` for complete workspace acceptance, including
+consumer-owned Web and React browser coverage. Shared browser provisioning is
+retained in `tools/browser-matrix.json`.
 
 Scaling measurements are separate from test gates. Run the Criterion matrix with
 `./bazel run //:benchmark`. It measures timer/poll
@@ -1083,9 +1088,10 @@ scheduling for 1/16/64 connections and 1/8/32 senders, excluding fixture setup a
 teardown. This initial-burst workload is not sustained network throughput
 evidence. Benchmark reports and baselines are emitted under `target/criterion`.
 
-Stored SDP cannot prove runtime interoperability. Differential checks against
-`str0m`, Ericsson SCReAM, or libwebrtc are component evidence only and never
-replace the deterministic contract or live-browser evidence.
+Stored SDP cannot prove runtime interoperability. Client-free protocol checks
+and Ericsson SCReAM comparisons establish narrower server invariants, not
+additional client compatibility. Only controlled actual libwebrtc delivery
+establishes the native interoperability baseline.
 
 
 ## Primary references

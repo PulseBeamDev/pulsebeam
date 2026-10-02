@@ -1,0 +1,13 @@
+[workspace]
+
+[package]
+name = "pulsebeam-rtc-simulation"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+pulsebeam-webrtc-sys = { version = "=0.6.2", git = "https://github.com/PulseBeamDev/pulsebeam-libwebrtc-sys", rev = "f87f99a48e58fb9cd13767ba58e9b7cd937c71a3" }
+[dev-dependencies]
+pulsebeam-rtc = { path = ".." }
+bytes = "1.11.1"

@@ -93,7 +93,6 @@ def main():
     sources = {
         "str0m_native": {"str0m": workspace["workspace"]["dependencies"]["str0m"]},
         "str0m_rtc": {name: rtc["dependencies"][name] for name in ("str0m", "is")},
-        "str0m_reference": {"str0m": {k: v for k, v in rtc["dev-dependencies"]["str0m-reference"].items() if k != "package"}},
     }
     # A separate Cargo workspace avoids native-only feature unification while
     # retaining every resolved package identity from the authoritative root lock.
