@@ -1138,7 +1138,7 @@ mod tests {
             sender: fixture.sender,
             policy,
         });
-        let start = fixture.at().monotonic;
+        let start = fixture.at().monotonic.max(source.at().monotonic);
         for frame in 1..=1_600_u64 {
             let at = start + Duration::from_millis(frame * 25);
             fixture.drive_for(at.saturating_duration_since(fixture.at().monotonic));

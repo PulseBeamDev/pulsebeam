@@ -46,7 +46,6 @@ pub struct PeerFixture {
     _server: NetworkEndpoint,
     now: Instant,
     start: Instant,
-    native_origin: Duration,
     source_timestamp: u32,
     headers: VecDeque<FixtureRtpHeader>,
     connection_idle: bool,
@@ -57,6 +56,17 @@ pub struct PeerFixture {
     network: DeterministicNetwork,
     native_target: Option<fn(&Connection) -> Duration>,
     world: std::rc::Rc<SimulationWorld>,
+}
+
+#[test]
+fn scenario_clock_binding_survives_later_peer_initialization() {
+    let world = SimulationWorld::acquire();
+    let start = Instant::now();
+    world.bind_clock(start);
+    let elapsed = Duration::from_millis(37);
+    world.advance_clock_to(start + elapsed);
+    world.bind_clock(start + Duration::from_secs(99));
+    assert_eq!(world.monotonic_now(), start + elapsed);
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -389,23 +399,28 @@ impl PeerFixture {
         assert!(matches!(transport, FixtureTransport::Udp));
         assert!((1..=128).contains(&sender_count));
         let world = SimulationWorld::acquire();
+        world.bind_clock(start);
         let network = world.controlled.create_network().expect("controlled network");
         let client = network.register_endpoint("192.0.2.1".parse().unwrap()).unwrap();
         let server = network.register_endpoint("192.0.2.2".parse().unwrap()).unwrap();
         let socket = server.bind_udp(41000).unwrap();
-        let video_input = EncodedVideoInput::new_for_format(VideoCodecFormat::new("VP8")).unwrap();
+        let video_input = EncodedVideoInput::new().unwrap();
         let factory = world.controlled.peer_factory_builder().unwrap()
             .network_manager(client.network_manager().unwrap())
             .packet_socket_factory(client.packet_socket_factory().unwrap())
             .audio_encoder_factory(AudioEncoderFactory::with_opus_frames().unwrap())
             .audio_decoder_factory(AudioDecoderFactory::builtin_opus().unwrap())
             .video_encoder_factory(video_input.encoder_factory())
-            .video_decoder_factory(VideoDecoderFactoryHandle::builtin_vp8().unwrap())
+            .video_decoder_factory(video_input.encoded_receive_factory().unwrap())
             .controlled_media().build().unwrap();
         let peer = factory.create_peer_connection(PeerConfiguration {
             always_negotiate_data_channels: datachannels,
             ..PeerConfiguration::default()
         }).unwrap();
+        if matches!(media, MediaKind::Video) {
+            // Sustain VBR source bursts before PulseBeam admission and pacing.
+            peer.set_bitrate(Some(10_000_000), Some(10_000_000), Some(10_000_000)).unwrap();
+        }
         let mut audio_source = None;
         let mut video_source = None;
         let mut transceivers = Vec::new();
@@ -456,9 +471,10 @@ impl PeerFixture {
         };
         config.default_audio_policy.desired_bitrate = MediaPayloadBitrate::from_bps(1_000_000);
         if let Some(limits) = limits { config.limits = limits; }
+        let now = world.monotonic_now();
         let accepted = Connection::accept(config, SdpOffer::new(offer.sdp), TimePoint {
-            monotonic: start,
-            global: GlobalMediaTime::from_micros(1_000_000),
+            monotonic: now,
+            global: GlobalMediaTime::from_micros(1_000_000 + now.duration_since(start).as_micros() as u64),
         }, ConnectionEntropy::new([11; 32])).expect("RTC accepts actual native offer");
         let senders = accepted.session.senders.iter().map(|s| s.id).collect::<Vec<_>>();
         let sender_mid = accepted.session.senders[0].mid.to_string();
@@ -468,16 +484,16 @@ impl PeerFixture {
         }).unwrap());
         let audio_sink = audio_source.as_ref().map(|_| transceivers[0].receiver().attach_encoded_audio_sink().unwrap());
         let video_sink = video_source.as_ref().map(|_| transceivers[0].receiver().attach_encoded_sink().unwrap());
-        let native_origin = world.controlled.now();
+        let now = world.monotonic_now();
         Self {
             connection: accepted.connection,
             sender: senders[0], senders, sender_mid,
             peer, audio_source, video_source, audio_sink, video_sink,
             peer_channel, remote_channels: Vec::new(), network_adapter: network, socket,
             _factory: factory, _client: client, _server: server,
-            world, native_origin, source_timestamp: 0,
+            world, source_timestamp: 0,
             headers: VecDeque::new(),
-            now: start, start,
+            now, start,
             connection_idle: false, peer_connected: false, connection_connected: false,
             twcc_sent: 0, feedback_enabled: true,
             network: DeterministicNetwork::default(), native_target: None,
@@ -602,6 +618,7 @@ impl PeerFixture {
     }
 
     pub fn send_source(&mut self, payload: &[u8]) -> MediaPacket {
+        self.now = self.now.max(self.world.monotonic_now());
         self.source_timestamp = self.source_timestamp.wrapping_add(960).max(
             u32::try_from(self.now.duration_since(self.start).as_micros() * 48_000 / 1_000_000)
                 .expect("short source clock") + 960,
@@ -613,21 +630,30 @@ impl PeerFixture {
                 samples_per_channel: 960,
             }, self.world.controlled.now()).expect("native controlled Opus source");
         } else {
-            let mut data = payload.get(1..).expect("VP8 descriptor").to_vec();
-            assert!(data.len() >= 10);
-            let key_frame = data[0] & 1 == 0;
-            if key_frame {
-                data[3..10].copy_from_slice(&[0x9d, 1, 0x2a, 2, 0, 2, 0]);
-            }
+            // A caller can drain prior RTP without advancing its next capture tick.
+            // Each encoded access unit still needs a distinct controlled capture instant.
+            self.world.advance_to(self.world.controlled.now() + Duration::from_micros(1));
+            let key_frame = payload[0] & 0x1f == 5;
+            let mut data = if key_frame {
+                // SPS/PPS describe 16x16 constrained-baseline input. Only the clear
+                // slice prefix is codec data; the tail remains opaque test demand.
+                vec![0, 0, 0, 1, 0x67, 0x42, 0xc0, 0x0a, 0xd9, 0x1e, 0x84,
+                    0, 0, 3, 0, 4, 0, 0, 3, 0, 0xf0, 0x3c, 0x48, 0x99, 0x20,
+                    0, 0, 0, 1, 0x68, 0xcb, 0x80, 0xc4, 0xb2]
+            } else {
+                Vec::new()
+            };
+            data.extend_from_slice(&[0, 0, 0, 1, payload[0], 0x88, 0x84]);
+            data.extend_from_slice(&payload[1..]);
             self.video_source.as_ref().unwrap().push_encoded(EncodedVideoAccessUnit {
-                data, width: 2, height: 2,
-                timestamp_us: self.source_timestamp as i64 * 1_000_000 / 48_000,
+                data, width: 16, height: 16,
+                timestamp_us: self.world.controlled.now().as_micros() as i64,
                 key_frame, qp: None,
                 metadata: EncodedVideoMetadata {
-                    codec: EncodedVideoCodec::Vp8 { non_reference: false, layer_sync: false, key_index: None },
+                    codec: EncodedVideoCodec::H264 { base_layer_sync: false },
                     simulcast_index: None, spatial_index: None, temporal_index: None, end_of_picture: true,
                 },
-            }).expect("native controlled VP8 source");
+            }).expect("native controlled H264 source");
         }
         for _ in 0..2_000 {
             if let Some(PeerEvent::Inbound(packet)) = self.step() { return packet; }
@@ -887,7 +913,7 @@ impl PeerFixture {
         self.now += self.network.pending.iter().min_by_key(|packet| packet.due())
             .map_or(Duration::from_millis(10), |packet| packet.due().saturating_duration_since(self.now).max(Duration::from_millis(1)))
             .min(self.network.time_quantum.unwrap_or(Duration::MAX));
-        self.world.advance_to(self.native_origin + self.now.duration_since(self.start));
+        self.world.advance_clock_to(self.now);
         self.connection_idle = false;
         None
     }

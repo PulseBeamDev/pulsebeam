@@ -6,7 +6,7 @@ use std::{
     cell::RefCell,
     rc::{Rc, Weak},
     sync::{Mutex, MutexGuard},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 static LEASE: Mutex<()> = Mutex::new(());
@@ -19,6 +19,7 @@ thread_local! {
 /// world ownership, not protocol time or packet delivery.
 pub struct SimulationWorld {
     pub controlled: ControlledWorld,
+    clock_origin: RefCell<Option<(Instant, Duration)>>,
     _lease: MutexGuard<'static, ()>,
 }
 
@@ -33,11 +34,30 @@ impl SimulationWorld {
             let world = Rc::new(Self {
                 controlled: ControlledWorld::acquire(11, Duration::from_secs(10))
                     .expect("pinned controlled native engine"),
+                clock_origin: RefCell::new(None),
                 _lease: lease,
             });
             *slot.borrow_mut() = Rc::downgrade(&world);
             world
         })
+    }
+
+    pub fn bind_clock(&self, origin: Instant) {
+        self.clock_origin.borrow_mut().get_or_insert((origin, self.controlled.now()));
+    }
+
+    pub fn native_time_at(&self, at: Instant) -> Duration {
+        let (origin, native_origin) = self.clock_origin.borrow().expect("bound scenario clock");
+        native_origin + at.duration_since(origin)
+    }
+
+    pub fn monotonic_now(&self) -> Instant {
+        let (origin, native_origin) = self.clock_origin.borrow().expect("bound scenario clock");
+        origin + self.controlled.now().saturating_sub(native_origin)
+    }
+
+    pub fn advance_clock_to(&self, at: Instant) {
+        self.advance_to(self.native_time_at(at));
     }
 
     pub fn pump(&self) {
