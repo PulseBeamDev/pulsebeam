@@ -37,6 +37,7 @@ pub mod test_utils {
         pub publish_track_calls: Vec<TrackId>,
         pub unpublish_track_calls: Vec<TrackId>,
         pub reverse_requests: Vec<TrackHandle>,
+        pub reverse_packets: Vec<ReversePacket>,
         pub exit_count: usize,
         pub publish_track_packet_calls: Vec<TrackHandle>,
     }
@@ -76,8 +77,9 @@ pub mod test_utils {
 
         fn unsubscribe_tracks(&mut self, _selector: TrackSelector) {}
 
-        fn request_reverse(&mut self, stream: TrackHandle, _packet: ReversePacket) {
+        fn request_reverse(&mut self, stream: TrackHandle, packet: ReversePacket) {
             self.reverse_requests.push(stream);
+            self.reverse_packets.push(packet);
         }
 
         fn renew_authorization(&mut self, _token: String) {}

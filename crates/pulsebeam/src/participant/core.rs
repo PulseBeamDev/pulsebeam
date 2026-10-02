@@ -840,7 +840,7 @@ impl Participant {
             Event::MediaChanged(_) => self.upstream.clear_routes(),
             Event::RtpPacket(rtp) => self.handle_incoming_rtp(rtp, events),
             Event::KeyframeRequest(req) => {
-                if let Some((fanout, layer)) = self.downstream.handle_keyframe_request(req) {
+                if let Some((fanout, layer)) = self.downstream.handle_keyframe_request(now, req) {
                     events.request_reverse(
                         fanout,
                         ReversePacket::keyframe(layer.rid, KeyframeRequestKind::Pli),

@@ -1,5 +1,5 @@
 use super::decoder::{DecodeError, H264ReferenceDecoder, OpusReferenceDecoder, ReferenceError};
-use super::media::{VbrProfile, VbrSource, VideoSource};
+use super::media::{KeyframeRecoveryProbe, VbrProfile, VbrSource, VideoSource};
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper_util::{client::legacy::Client, rt::TokioExecutor};
@@ -53,6 +53,7 @@ pub struct SimClientBuilder {
     corrupt_video_payload: bool,
     corrupt_audio_payload: bool,
     suppress_natural_keyframe_repeats: bool,
+    keyframe_recovery: Arc<Mutex<KeyframeRecoveryProbe>>,
     initial_topics: pulsebeam_agent_native::agent_core::TopicRegistrations,
     quality_references: Arc<Mutex<BTreeMap<String, QualityVideoReference>>>,
     h264_publishers: Arc<Mutex<BTreeSet<String>>>,
@@ -123,6 +124,7 @@ impl SimClientBuilder {
             corrupt_video_payload: false,
             corrupt_audio_payload: false,
             suppress_natural_keyframe_repeats: false,
+            keyframe_recovery: Arc::default(),
             initial_topics: Default::default(),
             quality_references: Arc::new(Mutex::new(BTreeMap::new())),
             h264_publishers: Arc::new(Mutex::new(BTreeSet::new())),
@@ -154,6 +156,7 @@ impl SimClientBuilder {
             corrupt_video_payload: false,
             corrupt_audio_payload: false,
             suppress_natural_keyframe_repeats: false,
+            keyframe_recovery: Arc::default(),
             initial_topics: Default::default(),
             quality_references: Arc::new(Mutex::new(BTreeMap::new())),
             h264_publishers: Arc::new(Mutex::new(BTreeSet::new())),
@@ -223,6 +226,14 @@ impl SimClientBuilder {
 
     pub fn suppress_natural_keyframe_repeats(mut self) -> Self {
         self.suppress_natural_keyframe_repeats = true;
+        self
+    }
+
+    pub(crate) fn with_keyframe_recovery_probe(
+        mut self,
+        probe: Arc<Mutex<KeyframeRecoveryProbe>>,
+    ) -> Self {
+        self.keyframe_recovery = probe;
         self
     }
 
@@ -396,6 +407,7 @@ impl SimClientBuilder {
             quality_references: self.quality_references.clone(),
             h264_publishers: self.h264_publishers.clone(),
             corrupt_video_payload: self.corrupt_video_payload,
+            keyframe_recovery: self.keyframe_recovery.clone(),
             events: agent.events(),
         };
         let mut join_set = JoinSet::new();
@@ -467,7 +479,8 @@ impl SimClientBuilder {
                         agent.events(),
                     ));
                 } else {
-                    let mut source = create_video_source(encoding.as_deref());
+                    let mut source = create_video_source(encoding.as_deref())
+                        .with_recovery_probe(self.keyframe_recovery.clone());
                     if self.suppress_natural_keyframe_repeats {
                         source = source.without_natural_keyframe_repeats();
                     }
@@ -1227,6 +1240,7 @@ pub struct ClientContext {
     quality_references: Arc<Mutex<BTreeMap<String, QualityVideoReference>>>,
     h264_publishers: Arc<Mutex<BTreeSet<String>>>,
     corrupt_video_payload: bool,
+    keyframe_recovery: Arc<Mutex<KeyframeRecoveryProbe>>,
     pub discovered_tracks: HashSet<String>,
     pub remote_tracks: HashMap<String, String>,
     pub received_data: Vec<(String, Vec<u8>)>,
@@ -1512,7 +1526,9 @@ fn spawn_video_receiver(
     let references = ctx.quality_references.clone();
     let h264_publishers = ctx.h264_publishers.clone();
     let corrupt = ctx.corrupt_video_payload;
+    let recovery_probe = ctx.keyframe_recovery.clone();
     join_set.spawn(async move {
+        let mut one_shot = false;
         let mut streams = HashMap::<String, VideoStreamReceiver>::new();
         while let Ok(packet) = remote.recv_packet().await {
             let Some(track_id) = remote.publication_id() else {
@@ -1538,6 +1554,12 @@ fn spawn_video_receiver(
                     decoder_ready: false,
                     last_keyframe_request: None,
                 });
+            let request_once = std::mem::take(&mut recovery_probe.lock().unwrap().request_once);
+            if request_once {
+                one_shot = true;
+                stream.decoder_ready = false;
+                stream.frames = pulsebeam_agent_native::FrameReceiver::with_h264();
+            }
             let ssrc = packet.ssrc;
             let frames = stream.frames.push(packet);
             let now = tokio::time::Instant::now();
@@ -1545,11 +1567,16 @@ fn spawn_video_receiver(
                 && stream
                     .last_keyframe_request
                     .is_none_or(|last| now.duration_since(last) >= Duration::from_millis(500));
-            if should_request_keyframe
+            // The recovery probe sends exactly one native PLI. Subsequent
+            // recovery must come from the server's retry chain, not this loop.
+            if (request_once || (!one_shot && should_request_keyframe))
                 && let Some(ssrc) = ssrc
                 && remote.request_keyframe(ssrc).await.is_ok()
             {
                 stream.last_keyframe_request = Some(now);
+                if request_once {
+                    recovery_probe.lock().unwrap().one_shot_requests += 1;
+                }
             } else if !stream.frames.needs_keyframe() {
                 stream.last_keyframe_request = None;
             }

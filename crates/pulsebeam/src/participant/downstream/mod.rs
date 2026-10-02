@@ -638,9 +638,10 @@ impl Downstream {
 
     pub fn handle_keyframe_request(
         &mut self,
+        now: Instant,
         req: KeyframeRequest,
     ) -> Option<(TrackHandle, &TrackLayer)> {
-        self.video.handle_keyframe_request(req)
+        self.video.handle_keyframe_request(now, req)
     }
 }
 

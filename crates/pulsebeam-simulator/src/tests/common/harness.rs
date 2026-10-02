@@ -5,7 +5,7 @@ use crate::tests::common::client::{
 use crate::tests::common::decoder::{
     MAX_AUDIO_REFERENCE_PEAK, MAX_REFERENCE_MEAN_ABSOLUTE, MAX_REFERENCE_PEAK,
 };
-use crate::tests::common::media::VbrProfile;
+use crate::tests::common::media::{KeyframeRecoveryProbe, VbrProfile};
 use crate::tests::common::{
     DEFAULT_SIM_SHARDS, reserve_subnet, run_sim_or_timeout, start_sfu_node_with, subnet_ip,
     subnet_ip_v6,
@@ -403,6 +403,13 @@ pub enum Step {
         description: &'static str,
         duration: Duration,
     },
+    /// Wait in simulated time until every same-room video observer knows this publication.
+    /// Does not reset the measurement window; fails if discovery exceeds the bounded budget.
+    WaitForPublication {
+        description: &'static str,
+        publisher: &'static str,
+        timeout: Duration,
+    },
     StallController {
         duration: Duration,
     },
@@ -643,6 +650,17 @@ pub enum Step {
         description: &'static str,
         participant: &'static str,
         min: u64,
+    },
+    RecoverVideoAfterLostKeyframe {
+        description: &'static str,
+        publisher: &'static str,
+        subscriber: &'static str,
+    },
+    CheckKeyframeRecovery {
+        description: &'static str,
+        publisher: &'static str,
+        subscriber: &'static str,
+        encoding: &'static str,
     },
     CheckRoutingCounter {
         description: &'static str,
@@ -961,6 +979,7 @@ struct ParticipantShared {
     connected: Mutex<bool>,
     /// Cumulative keyframe (PLI) requests this participant's publisher received.
     keyframe_requests: Mutex<u64>,
+    keyframe_recovery: Arc<Mutex<KeyframeRecoveryProbe>>,
     unroutable_media_dropped: Mutex<u64>,
     media_kinds: Mutex<HashMap<String, (bool, bool)>>,
     /// Every participant id this name has had, oldest first. All but the last are dead identities.
@@ -989,6 +1008,7 @@ impl ParticipantShared {
             rx_bytes: Mutex::new(0),
             connected: Mutex::new(false),
             keyframe_requests: Mutex::new(0),
+            keyframe_recovery: Arc::default(),
             unroutable_media_dropped: Mutex::new(0),
             media_kinds: Mutex::new(HashMap::new()),
             incarnations: Mutex::new(Vec::new()),
@@ -1146,6 +1166,7 @@ async fn run_participant(
         .with_h264_publishers(shared.h264_publishers.clone())
         .with_audio_rx(shared.audio_rx.clone())
         .with_video_rx(shared.video_rx.clone())
+        .with_keyframe_recovery_probe(shared.keyframe_recovery.clone())
         .with_initial_topics(initial_topics.clone());
 
         if config.suppress_natural_keyframe_repeats {
@@ -1329,6 +1350,7 @@ async fn run_participant(
 fn step_name(step: &Step) -> &'static str {
     match step {
         Step::Run { .. } => "Run",
+        Step::WaitForPublication { .. } => "WaitForPublication",
         Step::StallController { .. } => "StallController",
         Step::SendToWrongShard { .. } => "SendToWrongShard",
         Step::FailNextMaterialization { .. } => "FailNextMaterialization",
@@ -1358,6 +1380,8 @@ fn step_name(step: &Step) -> &'static str {
         Step::CheckVideoNotRenderedFrom { .. } => "CheckVideoNotRenderedFrom",
         Step::CheckKeyframeRequests { .. } => "CheckKeyframeRequests",
         Step::CheckKeyframeRequestsAtLeast { .. } => "CheckKeyframeRequestsAtLeast",
+        Step::RecoverVideoAfterLostKeyframe { .. } => "RecoverVideoAfterLostKeyframe",
+        Step::CheckKeyframeRecovery { .. } => "CheckKeyframeRecovery",
         Step::CheckRoutingCounter { .. } => "CheckRoutingCounter",
         Step::CheckRoutingCounterAtLeast { .. } => "CheckRoutingCounterAtLeast",
         Step::CheckRoutingCounterSettles { .. } => "CheckRoutingCounterSettles",
@@ -1436,6 +1460,54 @@ async fn execute_plan(
                 if *duration >= ROOM_SETTLE_FLOOR {
                     assert_room_state_consistent(handles, description);
                 }
+            }
+
+            Step::WaitForPublication {
+                description,
+                publisher,
+                timeout,
+            } => {
+                tracing::info!(
+                    "[step {n}/{total}: {kind}] \"{description}\" ({publisher}, {timeout:?})"
+                );
+                let subject = handles.get(publisher).ok_or_else(|| {
+                    anyhow::anyhow!("step \"{description}\": unknown publisher {publisher}")
+                })?;
+                anyhow::ensure!(
+                    subject.present && subject.publishes_video,
+                    "step \"{description}\": {publisher} is not a present video publisher"
+                );
+                let observers: Vec<_> = handles
+                    .iter()
+                    .filter(|(name, handle)| {
+                        **name != *publisher
+                            && handle.present
+                            && handle.observes_video
+                            && handle.room_name == subject.room_name
+                    })
+                    .collect();
+                anyhow::ensure!(
+                    !observers.is_empty(),
+                    "step \"{description}\": no video observers for {publisher}"
+                );
+                tokio::time::timeout(*timeout, async {
+                    loop {
+                        if subject.connected()
+                            && let Some(id) = subject.participant_id()
+                            && observers.iter().all(|(_, observer)| {
+                                observer.connected()
+                                    && observer.media_kinds_of(&id)
+                                        == Some((subject.publishes_video, subject.publishes_audio))
+                            })
+                        {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                })
+                .await
+                .map_err(|_| anyhow::anyhow!("step \"{description}\": {publisher} publication did not converge within {timeout:?}"))?;
+                assert_room_state_consistent(handles, description);
             }
 
             Step::StallController { duration } => {
@@ -2296,6 +2368,58 @@ async fn execute_plan(
                 assert!(
                     actual >= *min,
                     "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  participant:  {participant}\n  expected:     ≥ {min} keyframe (PLI) requests\n  actual:       {actual}"
+                );
+            }
+
+            Step::RecoverVideoAfterLostKeyframe {
+                description,
+                publisher,
+                subscriber,
+            } => {
+                let source = get_handle(handles, publisher, description)?;
+                *source.shared.keyframe_recovery.lock().unwrap() = KeyframeRecoveryProbe {
+                    armed: true,
+                    ..Default::default()
+                };
+                let viewer = get_handle(handles, subscriber, description)?;
+                viewer.shared.keyframe_recovery.lock().unwrap().request_once = true;
+            }
+
+            Step::CheckKeyframeRecovery {
+                description,
+                publisher,
+                subscriber,
+                encoding,
+            } => {
+                let viewer = get_handle(handles, subscriber, description)?;
+                assert_eq!(
+                    viewer
+                        .shared
+                        .keyframe_recovery
+                        .lock()
+                        .unwrap()
+                        .one_shot_requests,
+                    1,
+                    "{description}: receiver must send exactly one recovery PLI"
+                );
+                let source = get_handle(handles, publisher, description)?;
+                let probe = source.shared.keyframe_recovery.lock().unwrap();
+                assert_eq!(
+                    probe.discarded_responses, 1,
+                    "{description}: exactly one response must be discarded"
+                );
+                assert!(
+                    probe.requests.len() >= 2,
+                    "{description}: first response must be lost, then retried: {:?}",
+                    probe.requests
+                );
+                assert!(
+                    probe
+                        .requests
+                        .iter()
+                        .all(|(slot, rid)| slot == "v0" && rid.as_deref() == Some(*encoding)),
+                    "{description}: PLI must reach the current local slot/RID: {:?}",
+                    probe.requests
                 );
             }
 
@@ -4369,6 +4493,7 @@ impl LocalNodeSim {
             .iter()
             .filter_map(|s| match s {
                 Step::Run { duration, .. } => Some(*duration),
+                Step::WaitForPublication { timeout, .. } => Some(*timeout),
                 _ => None,
             })
             .sum::<Duration>()

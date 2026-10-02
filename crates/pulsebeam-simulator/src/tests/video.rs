@@ -390,6 +390,59 @@ fn cross_shard_keyframe_reaches_the_publisher() {
 }
 
 #[test]
+fn stable_receiver_decodes_after_the_first_pli_response_is_lost_test() {
+    LocalNodeSim::new()
+        .with_room(
+            Room::new("stable-pli-retry")
+                .with_participant(
+                    Participant::publisher("source", &["q", "h", "f"])
+                        .suppress_natural_keyframe_repeats(),
+                )
+                .with_participant(Participant::subscriber("viewer")),
+        )
+        .run(vec![
+            Step::Run {
+                description: "Discover the multi-RID source",
+                duration: Duration::from_secs(5),
+            },
+            Step::SubscribeTo {
+                description: "Keep one receiver on the current publisher's low layer",
+                participant: "viewer",
+                targets: &[("source", 180)],
+            },
+            Step::Run {
+                description: "Establish decoded output on the selected layer",
+                duration: Duration::from_secs(10),
+            },
+            Step::CheckVideoQualityInterval {
+                description: "Recovery starts from a genuinely decoded stream",
+                participant: "viewer",
+                quality: VideoQuality::min_frames(1),
+            },
+            Step::RecoverVideoAfterLostKeyframe {
+                description: "Reset decoding, send one native PLI, and discard its first response",
+                publisher: "source",
+                subscriber: "viewer",
+            },
+            Step::Run {
+                description: "Observe server retry and the returned usable keyframe",
+                duration: Duration::from_secs(5),
+            },
+            Step::CheckKeyframeRecovery {
+                description: "Both the lost response and retry address the current local slot and RID",
+                publisher: "source",
+                subscriber: "viewer",
+                encoding: "q",
+            },
+            Step::CheckVideoQualityInterval {
+                description: "A usable returned keyframe restores actual decoded output",
+                participant: "viewer",
+                quality: VideoQuality::min_frames(1).min_keyframes(1).allow_gaps(5),
+            },
+        ]);
+}
+
+#[test]
 fn a_pli_recovers_decoding_without_natural_keyframe_repeats_test() {
     LocalNodeSim::new()
         .with_room(

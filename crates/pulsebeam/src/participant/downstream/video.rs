@@ -696,14 +696,16 @@ impl VideoAllocator {
     }
 
     pub fn handle_keyframe_request(
-        &self,
+        &mut self,
+        now: Instant,
         req: KeyframeRequest,
     ) -> Option<(TrackHandle, &TrackLayer)> {
-        for slot in self.slots.values() {
-            if slot.mid == req.mid && slot.rid == req.rid {
+        for slot in self.slots.values_mut() {
+            if slot.mid == req.mid && slot.rid == req.rid && !slot.paused {
                 let layer = slot.target()?;
                 let fanout = self.active_track_handles.get(&layer.meta.id).copied()?;
-                return Some((fanout, layer));
+                slot.request_keyframe(now);
+                return slot.target().map(|layer| (fanout, layer));
             }
         }
         None
@@ -1023,12 +1025,10 @@ struct Slot {
     paused: bool,
     resume_gate: ResumeGate,
 
-    /// Number of PLI retries sent for the current staging layer.
-    staging_keyframe_retries: u32,
-    /// When the last PLI retry was sent for the current staging layer.
-    staging_keyframe_last_at: Option<Instant>,
-    /// Current retry interval for PLI probes while waiting for the staging keyframe.
-    staging_keyframe_interval: Duration,
+    recovery_requested_at: Option<Instant>,
+    keyframe_retries: u32,
+    keyframe_last_at: Option<Instant>,
+    keyframe_interval: Duration,
 }
 
 impl Slot {
@@ -1053,9 +1053,10 @@ impl Slot {
             paused: true,
             resume_gate: ResumeGate::default(),
 
-            staging_keyframe_retries: 0,
-            staging_keyframe_last_at: None,
-            staging_keyframe_interval: KEYFRAME_FIRST_RETRY,
+            recovery_requested_at: None,
+            keyframe_retries: 0,
+            keyframe_last_at: None,
+            keyframe_interval: KEYFRAME_FIRST_RETRY,
         }
     }
 
@@ -1076,9 +1077,18 @@ impl Slot {
     }
 
     fn pli_reset(&mut self) {
-        self.staging_keyframe_retries = 0;
-        self.staging_keyframe_last_at = None;
-        self.staging_keyframe_interval = KEYFRAME_FIRST_RETRY;
+        self.recovery_requested_at = None;
+        self.keyframe_retries = 0;
+        self.keyframe_last_at = None;
+        self.keyframe_interval = KEYFRAME_FIRST_RETRY;
+    }
+
+    fn request_keyframe(&mut self, now: Instant) {
+        if !self.switcher.awaiting_switch() && self.recovery_requested_at.is_none() {
+            self.pli_reset();
+            self.recovery_requested_at = Some(now);
+        }
+        self.keyframe_last_at = Some(now);
     }
 
     fn pli_retry(
@@ -1090,9 +1100,7 @@ impl Slot {
         if self.paused {
             return;
         }
-        // The switcher is the authority on whether a switch is still pending; the
-        // layer it is waiting on is the one this slot is assigned to (`desired`).
-        if !self.switcher.awaiting_switch() {
+        if !self.switcher.awaiting_switch() && self.recovery_requested_at.is_none() {
             return;
         }
         let Some(staging) = self.desired.as_ref() else {
@@ -1113,11 +1121,11 @@ impl Slot {
             return;
         };
 
-        let last_at = self.staging_keyframe_last_at;
-        let retries = self.staging_keyframe_retries;
+        let last_at = self.keyframe_last_at;
+        let retries = self.keyframe_retries;
 
         let should_request =
-            last_at.is_none_or(|last| now.duration_since(last) >= self.staging_keyframe_interval);
+            last_at.is_none_or(|last| now.duration_since(last) >= self.keyframe_interval);
         if !should_request {
             return;
         }
@@ -1126,25 +1134,25 @@ impl Slot {
         let reached_keepalive =
             !keepalive_mode && retries.saturating_add(1) == KEYFRAME_MAX_RETRIES;
         if !keepalive_mode {
-            self.staging_keyframe_retries = self.staging_keyframe_retries.saturating_add(1);
+            self.keyframe_retries = self.keyframe_retries.saturating_add(1);
         }
-        self.staging_keyframe_last_at = Some(now);
+        self.keyframe_last_at = Some(now);
 
         if !keepalive_mode && !reached_keepalive {
-            self.staging_keyframe_interval = self
-                .staging_keyframe_interval
+            self.keyframe_interval = self
+                .keyframe_interval
                 .saturating_mul(2)
                 .min(KEYFRAME_RETRY_INTERVAL);
         }
 
         if reached_keepalive {
-            self.staging_keyframe_interval = KEYFRAME_KEEPALIVE_INTERVAL;
+            self.keyframe_interval = KEYFRAME_KEEPALIVE_INTERVAL;
             plog_debug!(
                 self.ctx,
                 mid = %self.mid,
                 retries = KEYFRAME_MAX_RETRIES,
-                interval = ?self.staging_keyframe_interval,
-                "slot transition still waiting for any packets on the staged stream; using low-frequency keep-alive PLIs"
+                interval = ?self.keyframe_interval,
+                "slot still waiting for a usable keyframe; using low-frequency keep-alive PLIs"
             );
         }
 
@@ -1245,6 +1253,7 @@ impl Slot {
         }
 
         if !self.paused {
+            self.pli_reset();
             self.resume_gate = ResumeGate {
                 required: true,
                 affordable: None,
@@ -1274,6 +1283,19 @@ impl Slot {
         // The switcher owns the entire switching state machine; hand it the
         // whole track cache and let it emit whatever the subscriber should see. A
         // change in the active stream means a switch was promoted this tick.
+        if let Some(requested_at) = self.recovery_requested_at
+            && let Some(desired) = self
+                .desired
+                .as_ref()
+                .filter(|layer| layer.meta.id == track_id)
+            && let Some(encoding) = cache.encoding(desired.rid)
+            && let Some(replay) = encoding.replay()
+            && replay
+                .iter()
+                .any(|packet| packet.is_keyframe && packet.arrival_ts > requested_at)
+        {
+            self.pli_reset();
+        }
         let (mid, rid, ssrc, pt) = (self.mid, self.rid, self.ssrc, self.pt);
         let before = self.switcher.active_stream();
         self.switcher.feed(track_id, cache, arrival_ts, &mut |out| {
@@ -2885,13 +2907,10 @@ mod assignment_tests {
             "retry_keyframe_requests should not send an immediate duplicate PLI after reconcile_routes"
         );
         let (fanout, requested_layer) = allocator
-            .handle_keyframe_request(request)
+            .handle_keyframe_request(now, request)
             .expect("an active downstream target must resolve its reverse route");
-        assert_eq!(
-            fanout,
-            allocator.active_track_handles[&requested_layer.meta.id]
-        );
         assert_eq!(requested_layer.stream_id(), low.stream_id());
+        assert_eq!(fanout, allocator.active_track_handles[&low.meta.id]);
 
         // Before the view delta lands there is nothing to address the request
         // to, and the shard would only drop it. Issuing anyway burns a retry,
@@ -3642,6 +3661,97 @@ mod slot_switch_tests {
         assert!(fx.ingest_all(&low, &kf));
         assert_eq!(fx.slot.test_active(), Some(low.stream_id()));
         assert_decodable(&fx.emitted, "deferred switch after PLI");
+    }
+
+    #[test]
+    fn stable_receiver_retries_until_a_fresh_usable_keyframe_arrives() {
+        let t0 = Instant::now();
+        let mut fx = Fixture::new();
+        let (high, low) = (fx.high.clone(), fx.low.clone());
+        let mut hi = H264StreamBuilder::new(1, 300, 90_000, t0)
+            .with_parameter_sets(ParameterSetStyle::SeparatePacket);
+        let mut lo = H264StreamBuilder::new(2, 40_000, 600_000, t0)
+            .with_parameter_sets(ParameterSetStyle::SeparatePacket);
+        fx.slot.switch_to(&high, false);
+        fx.ingest_all(&high, &hi.keyframe(3));
+        assert!(matches!(fx.slot.state(), SlotState::Stable));
+
+        let requested_at = t0 + Duration::from_millis(1);
+        fx.slot.request_keyframe(requested_at);
+        let mut keys: SlotMap<TrackHandle, ()> = SlotMap::with_key();
+        let fanout = keys.insert(());
+        let mut sink = crate::participant::event::test_utils::MockParticipantSink::new();
+        let retry = |slot: &mut Slot, now, sink: &mut _| {
+            slot.pli_retry(now, sink, |id| (id == high.meta.id).then_some(fanout));
+        };
+        retry(&mut fx.slot, requested_at, &mut sink);
+        assert!(sink.reverse_requests.is_empty(), "no immediate duplicate");
+        let first_retry = requested_at + KEYFRAME_FIRST_RETRY;
+        retry(&mut fx.slot, first_retry, &mut sink);
+        assert_eq!(sink.reverse_requests, [fanout]);
+
+        // Drop the first response entirely. A fresh keyframe on another RID
+        // and the old usable segment on the selected RID must not end recovery.
+        let _lost = hi.keyframe(3);
+        fx.ingest_all(&low, &lo.keyframe(3));
+        assert_eq!(fx.slot.recovery_requested_at, Some(requested_at));
+        fx.slot.request_keyframe(first_retry);
+        let second_retry = first_retry + KEYFRAME_FIRST_RETRY.saturating_mul(2);
+        let repeated_at = second_retry - Duration::from_millis(1);
+        fx.slot.request_keyframe(repeated_at);
+        retry(&mut fx.slot, second_retry, &mut sink);
+        assert_eq!(
+            sink.reverse_requests,
+            [fanout],
+            "a repeated receiver PLI defers the server retry without restarting recovery"
+        );
+        assert_eq!(fx.slot.recovery_requested_at, Some(requested_at));
+        let second_retry = repeated_at + KEYFRAME_FIRST_RETRY.saturating_mul(2);
+        retry(&mut fx.slot, second_retry, &mut sink);
+        assert_eq!(sink.reverse_requests, [fanout, fanout]);
+
+        let incomplete = hi.keyframe(3);
+        fx.ingest_all(&high, &incomplete[..incomplete.len().saturating_sub(1)]);
+        assert_eq!(fx.slot.recovery_requested_at, Some(requested_at));
+        let third_retry = second_retry + KEYFRAME_FIRST_RETRY.saturating_mul(4);
+        retry(&mut fx.slot, third_retry, &mut sink);
+        assert_eq!(sink.reverse_requests, [fanout, fanout, fanout]);
+        for packet in sink.reverse_packets {
+            assert!(
+                matches!(packet.decode(), Some(crate::participant::reverse::ReverseInput::Keyframe { rid, kind: str0m::media::KeyframeRequestKind::Pli }) if rid == high.rid)
+            );
+        }
+
+        let before = fx.emitted.len();
+        fx.ingest_all(&high, &hi.keyframe(3));
+        fx.ingest_all(&high, &hi.delta_frame(3));
+        assert_eq!(fx.slot.recovery_requested_at, None);
+        assert_eq!(fx.slot.test_active(), Some(high.stream_id()));
+        assert_decodable(
+            &fx.emitted[before..],
+            "stable receiver recovery after lost and unusable responses",
+        );
+        let mut done = crate::participant::event::test_utils::MockParticipantSink::new();
+        retry(
+            &mut fx.slot,
+            third_retry + KEYFRAME_KEEPALIVE_INTERVAL,
+            &mut done,
+        );
+        assert!(done.reverse_requests.is_empty());
+
+        fx.slot.request_keyframe(third_retry);
+        fx.slot.switch_to(&low, false);
+        assert_eq!(
+            fx.slot.recovery_requested_at, None,
+            "retarget retires old recovery"
+        );
+        fx.slot.stop();
+        retry(
+            &mut fx.slot,
+            third_retry + KEYFRAME_KEEPALIVE_INTERVAL,
+            &mut done,
+        );
+        assert!(done.reverse_requests.is_empty(), "stopping retires retries");
     }
 
     #[test]

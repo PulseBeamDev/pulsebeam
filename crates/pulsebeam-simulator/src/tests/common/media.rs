@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use pulsebeam_agent_native::agent_core::MediaSlot;
@@ -39,12 +39,22 @@ impl VbrProfile {
     }
 }
 
+#[derive(Default)]
+pub struct KeyframeRecoveryProbe {
+    pub armed: bool,
+    pub request_once: bool,
+    pub requests: Vec<(String, Option<String>)>,
+    pub discarded_responses: u64,
+    pub one_shot_requests: u64,
+}
+
 pub struct VideoSource {
     frames: Vec<Arc<[u8]>>,
     first_idr: usize,
     fps: u32,
     opaque: bool,
     repeat_keyframes: bool,
+    recovery_probe: Arc<Mutex<KeyframeRecoveryProbe>>,
 }
 
 impl VideoSource {
@@ -63,6 +73,7 @@ impl VideoSource {
             fps,
             opaque: false,
             repeat_keyframes: true,
+            recovery_probe: Arc::default(),
         }
     }
 
@@ -73,6 +84,11 @@ impl VideoSource {
 
     pub fn without_natural_keyframe_repeats(mut self) -> Self {
         self.repeat_keyframes = false;
+        self
+    }
+
+    pub fn with_recovery_probe(mut self, probe: Arc<Mutex<KeyframeRecoveryProbe>>) -> Self {
+        self.recovery_probe = probe;
         self
     }
 
@@ -90,6 +106,17 @@ impl VideoSource {
             let capture_time = interval.tick().await;
             while let Ok(event) = events.try_recv() {
                 if keyframe_matches(&event, media.slot(), encoding.as_deref()) {
+                    let mut probe = self.recovery_probe.lock().unwrap();
+                    if probe.armed {
+                        let MediaSlot::LocalVideo(slot) = media.slot() else {
+                            unreachable!("keyframe_matches requires a local video slot");
+                        };
+                        probe.requests.push((slot.clone(), encoding.clone()));
+                        if probe.requests.len() == 1 {
+                            probe.discarded_responses += 1;
+                            continue;
+                        }
+                    }
                     index = self.first_idr;
                 }
             }

@@ -73,6 +73,37 @@ fn sharding_differential_preserves_the_media_contract() {
     }
 }
 
+#[test]
+#[should_panic(expected = "publication did not converge within 0ns")]
+fn publication_discovery_has_a_bounded_deadline() {
+    LocalNodeSim::new()
+        .with_room(
+            Room::new("bounded-discovery")
+                .with_participant(Participant::single_publisher("publisher"))
+                .with_participant(Participant::subscriber("subscriber")),
+        )
+        .run(vec![Step::WaitForPublication {
+            description: "An undiscovered publication cannot pass",
+            publisher: "publisher",
+            timeout: Duration::ZERO,
+        }]);
+}
+
+#[test]
+#[should_panic(expected = "no video observers for publisher")]
+fn publication_discovery_cannot_pass_without_observers() {
+    LocalNodeSim::new()
+        .with_room(
+            Room::new("nonvacuous-discovery")
+                .with_participant(Participant::single_publisher("publisher")),
+        )
+        .run(vec![Step::WaitForPublication {
+            description: "Discovery requires an observer",
+            publisher: "publisher",
+            timeout: Duration::from_secs(1),
+        }]);
+}
+
 /// The simulcast ladder every plan here publishes, and the single-layer screen share rate.
 const LADDER_Q_BPS: u64 = 150_000;
 const LADDER_H_BPS: u64 = 400_000;
@@ -193,7 +224,7 @@ enum Fault {
 }
 
 impl Fault {
-    fn steps(self) -> Vec<Step> {
+    fn steps(self, discovery_budget: Duration) -> Vec<Step> {
         match self {
             Fault::None => vec![],
             Fault::Outage => vec![
@@ -266,6 +297,14 @@ impl Fault {
                     steps.push(Step::Join {
                         description: "A publisher arrives",
                         participant: who,
+                    });
+                    // Ordered SCTP delivery can outlast the active period on a lossy path.
+                    // Require positive discovery before starting that period, rather than
+                    // treating a fixed pause as a transport-delivery deadline.
+                    steps.push(Step::WaitForPublication {
+                        description: "Every observer discovers the arriving publication",
+                        publisher: who,
+                        timeout: discovery_budget,
                     });
                     steps.push(Step::Run {
                         description: "Briefly active",
@@ -589,7 +628,7 @@ impl Scenario {
                 duration: self.path.settle(),
             },
         ];
-        plan.extend(self.fault.steps());
+        plan.extend(self.fault.steps(self.path.settle()));
         // A fresh window last, so every claim describes the state the plan arrives at rather
         // than the disturbance on the way there.
         plan.push(Step::Run {
@@ -1006,6 +1045,25 @@ mod slow {
                 Ok(())
             },
         );
+    }
+
+    #[test]
+    fn cellular_peer_churn_preserves_publication_discovery() {
+        let scenario = Scenario {
+            demand: Demand {
+                temporal: false,
+                screenshare: true,
+                target_height: 360,
+                contended: true,
+            },
+            path: Path::Cellular,
+            placement: Placement::MultiShard,
+            fault: Fault::PeerStorm,
+            capacity_bps: 2_650_000,
+        };
+        let report = scenario.run("renders_floor");
+        assert!(report.samples > 0);
+        assert_ne!(report.qoe.experience(scenario.content()), Experience::Blank);
     }
 
     /// A link that can carry the bottom rung must show a picture, not nothing.
