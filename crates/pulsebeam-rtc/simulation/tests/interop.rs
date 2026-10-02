@@ -1,10 +1,8 @@
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
-    sync::Arc,
     time::{Duration, Instant},
 };
 
-use bytes::Bytes;
 use pulsebeam_rtc::{
     Command, Connection, ConnectionConfig, ConnectionEntropy, Event, ForwardedMedia, FrameBoundary,
     FrameDependencies, FrameId, FrameMetadata, GlobalMediaTime, LocalCandidate, NetworkInput,
@@ -30,7 +28,34 @@ fn complete(
     panic!("signaling operation stalled: {operation:?}");
 }
 
-fn exercise(seed: u64) -> (u64, u64, usize) {
+fn is_twcc(payload: &[u8]) -> bool {
+    // DTLS 1.3 ciphertext can match the PT/FMT bytes, but not RTP version 2.
+    payload
+        .first()
+        .is_some_and(|byte| byte >> 6 == 2 && byte & 31 == 15)
+        && payload.get(1) == Some(&205)
+}
+
+#[test]
+fn feedback_classifier_excludes_dtls13_records() {
+    assert!(is_twcc(&[0x8f, 205, 0, 5, 0, 0, 0, 0]));
+    assert!(is_twcc(&[0xaf, 205, 0, 5, 0, 0, 0, 0]));
+    assert!(!is_twcc(&[0x2f, 205, 0, 5, 0, 0, 0, 0]));
+    assert!(!is_twcc(&[0x3f, 205, 0, 5, 0, 0, 0, 0]));
+    assert!(!is_twcc(&[0x8f, 201, 0, 5, 0, 0, 0, 0]));
+    assert!(!is_twcc(&[0x80, 205, 0, 5, 0, 0, 0, 0]));
+    assert!(!is_twcc(&[]));
+    assert!(!is_twcc(&[0x8f]));
+}
+
+#[allow(
+    clippy::disallowed_types,
+    reason = "single-threaded test retains immutable public API payloads and dependencies without cross-shard sharing"
+)]
+fn exercise(seed: u64, start: Instant) -> (u64, u64, usize) {
+    use bytes::Bytes;
+    use std::sync::Arc;
+
     let world = ControlledWorld::acquire(seed, Duration::from_secs(10)).unwrap();
     let network = world.create_network().unwrap();
     let client_endpoint = network
@@ -98,7 +123,6 @@ fn exercise(seed: u64) -> (u64, u64, usize) {
     }
     assert!(gathered, "native ICE gathering stalled");
     let offer = peer.descriptions().unwrap().pending_local.unwrap();
-    let start = Instant::now();
     let origin = world.now();
     let point = |now: Duration| TimePoint {
         monotonic: start + (now - origin),
@@ -147,16 +171,15 @@ fn exercise(seed: u64) -> (u64, u64, usize) {
     let mut sent_data = false;
     let mut server_data = Vec::new();
     let mut client_data = Vec::new();
+    const MEDIA_START_TICK: u32 = 1_000;
+    const FRAME_TICKS: u32 = 20;
+    const MEDIA_FRAMES: u32 = 10;
     for tick in 0..5_000 {
         world.pump(512);
         let mut received_twcc = false;
         while let Some(packet) = network.next_packet() {
             assert_eq!(packet.kind, OutboundKind::Udp);
-            if packet.destination == server_socket.local_address()
-                && packet.payload.len() > 1
-                && packet.payload[1] == 205
-                && packet.payload[0] & 31 == 15
-            {
+            if packet.destination == server_socket.local_address() && is_twcc(&packet.payload) {
                 feedback += 1;
                 received_twcc = true;
             }
@@ -274,7 +297,13 @@ fn exercise(seed: u64) -> (u64, u64, usize) {
             );
             sent_data = true;
         }
-        if connected && peer_connected && tick % 20 == 0 {
+        if (MEDIA_START_TICK..MEDIA_START_TICK + MEDIA_FRAMES * FRAME_TICKS).contains(&tick)
+            && (tick - MEDIA_START_TICK).is_multiple_of(FRAME_TICKS)
+        {
+            assert!(
+                connected && peer_connected,
+                "scheduled media requires connection"
+            );
             source
                 .push_opus_at(
                     &OpusInputFrame {
@@ -285,14 +314,6 @@ fn exercise(seed: u64) -> (u64, u64, usize) {
                     world.now(),
                 )
                 .unwrap();
-        }
-        if inbound >= 10
-            && outbound >= 10
-            && accounted_feedback
-            && server_data.len() == 2
-            && client_data.len() == 2
-        {
-            break;
         }
         world.advance(Duration::from_millis(1)).unwrap();
     }
@@ -333,5 +354,10 @@ fn exercise(seed: u64) -> (u64, u64, usize) {
 
 #[test]
 fn controlled_libwebrtc_reaches_production_connection() {
-    assert_eq!(exercise(731), exercise(731), "same-seed controlled replay");
+    let start = Instant::now();
+    assert_eq!(
+        exercise(731, start),
+        exercise(731, start),
+        "same-seed controlled replay"
+    );
 }

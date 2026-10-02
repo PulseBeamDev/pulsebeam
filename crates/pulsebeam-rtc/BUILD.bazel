@@ -39,7 +39,7 @@ rust_test(
 
 INTEGRATION_SRCS = glob(["tests/*.rs"])
 INTEGRATION_TARGETS = [":integration_tests_" + src[:-3] + "_test" for src in INTEGRATION_SRCS]
-CHECK_TARGETS = [":pulsebeam-rtc", ":unit_tests", ":scaling"] + INTEGRATION_TARGETS
+CHECK_TARGETS = [":pulsebeam-rtc", ":unit_tests", ":scaling", "//crates/pulsebeam-rtc/simulation:pulsebeam-rtc-simulation", "//crates/pulsebeam-rtc/simulation:interop"] + INTEGRATION_TARGETS
 rustfmt_test(name = "format", targets = CHECK_TARGETS)
 rust_clippy_test(name = "clippy", targets = CHECK_TARGETS)
 

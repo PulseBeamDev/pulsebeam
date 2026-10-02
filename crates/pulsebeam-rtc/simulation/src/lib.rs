@@ -5,11 +5,15 @@ pub use pulsebeam_webrtc_sys::*;
 use std::{
     cell::RefCell,
     rc::{Rc, Weak},
-    sync::{Mutex, MutexGuard},
+    sync::MutexGuard,
     time::{Duration, Instant},
 };
 
-static LEASE: Mutex<()> = Mutex::new(());
+#[allow(
+    clippy::disallowed_types,
+    reason = "test-only lease serializes libwebrtc's process-global controlled driver"
+)]
+static LEASE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 thread_local! {
     static WORLD: RefCell<Weak<SimulationWorld>> = const { RefCell::new(Weak::new()) };
 }
