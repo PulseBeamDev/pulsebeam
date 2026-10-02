@@ -157,6 +157,8 @@ fn production_pre_media_probes_use_only_the_low_traffic_allowance() {
 
 #[test]
 fn production_connection_bottleneck_emits_measured_transport_bytes() {
+    // Keep packet serialization below the unchanged 60 ms queue-delay target.
+    const PAYLOAD_BYTES: usize = 500;
     const SEED: u64 = 0x1122;
     const RATE_BPS: u64 = 100_000;
     const PACKETS: u64 = 4_000;

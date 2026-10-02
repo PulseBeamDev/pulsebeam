@@ -69,6 +69,15 @@ fn scenario_clock_binding_survives_later_peer_initialization() {
     assert_eq!(world.monotonic_now(), start + elapsed);
 }
 
+#[test]
+fn fixture_advance_stops_at_requested_deadline() {
+    let mut fixture = PeerFixture::connected();
+    fixture.configure_time_quantum(Duration::from_millis(5));
+    let before = fixture.at().monotonic;
+    fixture.drive_for(Duration::from_millis(1));
+    assert_eq!(fixture.at().monotonic, before + Duration::from_millis(1));
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NetworkPolicy {
     pub delay: Duration,
@@ -681,7 +690,7 @@ impl PeerFixture {
         let mut stalled_steps = 0;
         while self.now < deadline {
             let before = self.now;
-            let _ = self.step();
+            let _ = self.step_until(Some(deadline));
             stalled_steps = if self.now == before { stalled_steps + 1 } else { 0 };
             assert!(stalled_steps < 100_000, "simulation failed to advance protocol time");
         }
@@ -719,6 +728,10 @@ impl PeerFixture {
     }
 
     fn step(&mut self) -> Option<PeerEvent> {
+        self.step_until(None)
+    }
+
+    fn step_until(&mut self, deadline: Option<Instant>) -> Option<PeerEvent> {
         self.world.pump();
         if let Some(index) = self.network.pending.iter().position(|packet| packet.due() <= self.now) {
             match self.network.pending.remove(index).unwrap() {
@@ -912,7 +925,8 @@ impl PeerFixture {
         }
         self.now += self.network.pending.iter().min_by_key(|packet| packet.due())
             .map_or(Duration::from_millis(10), |packet| packet.due().saturating_duration_since(self.now).max(Duration::from_millis(1)))
-            .min(self.network.time_quantum.unwrap_or(Duration::MAX));
+            .min(self.network.time_quantum.unwrap_or(Duration::MAX))
+            .min(deadline.map_or(Duration::MAX, |at| at.duration_since(self.now)));
         self.world.advance_clock_to(self.now);
         self.connection_idle = false;
         None
