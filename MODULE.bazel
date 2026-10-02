@@ -19,6 +19,10 @@ bazel_dep(name = "gazelle", version = "0.47.0")
 bazel_dep(name = "rules_oci", version = "2.2.7")
 bazel_dep(name = "rules_pkg", version = "1.1.0")
 
+go_sdk = use_extension("@rules_go//go:extensions.bzl", "go_sdk")
+go_sdk.from_file(go_mod = "//server/go:go.mod")
+use_repo(go_sdk, "go_default_sdk")
+
 python = use_extension("@rules_python//python/extensions:python.bzl", "python")
 python.toolchain(python_version = "3.12.11")
 use_repo(python, "python_3_12_11")
