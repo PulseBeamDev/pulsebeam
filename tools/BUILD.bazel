@@ -86,8 +86,8 @@ py_test(
     name = "launcher_contract",
     srcs = ["tests/launcher_test.py"],
     main = "tests/launcher_test.py",
-    args = ["--launcher", "$(rootpath //:bazel)", "--flake", "$(rootpath :host/flake.nix)", "--lock", "$(rootpath :host/flake.lock)"],
-    data = ["//:bazel", "host/flake.nix", "host/flake.lock"],
+    args = ["--launcher", "$(rootpath //:bazel)"],
+    data = ["//:bazel"],
 )
 
 py_test(

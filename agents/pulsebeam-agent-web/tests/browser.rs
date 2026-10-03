@@ -439,15 +439,30 @@ async fn connected_agents_select_and_play_audio_without_ui() -> TestResult<()> {
     let _destination = DestinationServer::start()?;
     let server = StaticServer::start(root()).await?;
     let room = RoomExternalId::new("automatic-web-audio")?;
-    let sender =
-        mint_development_token(&room, &ParticipantExternalId::new("web-sender")?, u64::MAX)?;
-    let receiver = mint_development_token(
-        &room,
-        &ParticipantExternalId::new("web-receiver")?,
+    let sender = pulsebeam_server::sign_participant_token(
+        &DEVELOPMENT_PROJECT_ID.as_str(),
+        &DEVELOPMENT_API_KEY_ID.as_str(),
+        &DEVELOPMENT_API_SIGNING_KEY.to_secret_string(),
+        room.as_str(),
+        ParticipantExternalId::new("web-sender")?.as_str(),
         u64::MAX,
     )?;
-    let pinned =
-        mint_development_token(&room, &ParticipantExternalId::new("web-pinned")?, u64::MAX)?;
+    let receiver = pulsebeam_server::sign_participant_token(
+        &DEVELOPMENT_PROJECT_ID.as_str(),
+        &DEVELOPMENT_API_KEY_ID.as_str(),
+        &DEVELOPMENT_API_SIGNING_KEY.to_secret_string(),
+        room.as_str(),
+        ParticipantExternalId::new("web-receiver")?.as_str(),
+        u64::MAX,
+    )?;
+    let pinned = pulsebeam_server::sign_participant_token(
+        &DEVELOPMENT_PROJECT_ID.as_str(),
+        &DEVELOPMENT_API_KEY_ID.as_str(),
+        &DEVELOPMENT_API_SIGNING_KEY.to_secret_string(),
+        room.as_str(),
+        ParticipantExternalId::new("web-pinned")?.as_str(),
+        u64::MAX,
+    )?;
     let expression = include_str!("contracts/automatic-audio-contract.js")
         .replace("__SENDER_TOKEN__", &sender)
         .replace("__RECEIVER_TOKEN__", &receiver)

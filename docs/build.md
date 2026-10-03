@@ -7,36 +7,35 @@ Linux x86_64. Linux aarch64 runners support release binary assembly only.
 ## Host prerequisites
 
 Use a writable checkout/cache and ordinary non-root execution on Linux. Install
-[Nix](https://nix.dev/install-nix), with access to its normal `/nix/store` and
-unprivileged user namespaces, then use `./bazel`. Fedora and Ubuntu use the same
-pinned OS inputs without distro-specific development-header or browser-library
-installation lists.
+[Nix](https://nix.dev/install-nix), with access to its normal `/nix/store`, and
+make its `nix` and `nix-build` commands available on PATH. The clean reference
+baseline is Ubuntu 24.04 with its standard shell utilities, Git, curl and CA trust,
+plus Nix. No distro package-manager setup, host language/compiler installation,
+or browser-library installation is part of the supported workflow.
 
-`tools/host/flake.nix` supplies only the Linux OS environment: bootstrap utilities,
-C/system headers and libraries, browser runtime libraries, the unwrapped mold
-linker and Docker client for loading Bazel-built images. Only GCC's library
-directories are projected into the runtime, including the static archives required
-by its shared-unwind linker script; no GCC executable is exposed. C++ headers and
-static libc++ come from the Bazel-provisioned LLVM distribution.
-`tools/host/flake.lock` pins its Nixpkgs input. The maintained Nixpkgs FHS
-runtime avoids custom sysroot-layout machinery; it is not a hermetic kernel or an
-Apple SDK. The LLVM integration supports an executable linker path, so it selects
-mold at the locked runtime's `/usr/bin/mold`, not an ambient host installation.
+`./bazel` verifies the pinned Bazelisk binary selecting `.bazelversion` and
+starts Bazel directly on the host. It does not enter a private OS namespace,
+change process libraries, or establish a runtime identity/daemon protocol.
 
-The launcher refuses implicit lockfile updates, enters that environment and
-verifies its immutable `/etc/pulsebeam-host` marker against the flake, lockfile and
-execution architecture. Caller-supplied environment flags cannot substitute for
-that marker. It verifies the pinned Bazelisk binary selecting `.bazelversion`.
-The verified locked-input identity is passed to Bazel action/repository
-environments and exposed as a declared native toolchain input so OS-input changes
-do not reuse old actions. A native Bazel JVM startup setting also carries that
-identity, forcing a daemon restart when the runtime changes. This prevents a
-long-lived server from executing new actions in an older FHS namespace.
-The native identity repository independently checks its environment value against
-the marker. `PULSEBEAM_HOST_ENV` is reserved: supported builds/tests use `./bazel`
-without overriding it via action, repository or test environment options.
-Deliberately suppressing the repository rc or replacing its environments/toolchains
-is a native Bazel escape hatch, not a supported runtime-identity guarantee.
+`rules_nixpkgs_core` imports OS packages from `tools/host/flake.lock`.
+`tools/host/sdk.nix` supplies concrete glibc startup objects, C/system headers,
+zlib, GCC runtime libraries/private archives, and unwrapped mold. GCC executables
+are not exposed. The small SDK projection uses Nixpkgs' `buildEnv` and LLVM's
+supported sysroot interface. C++ headers and static libc++ remain supplied by
+Bazel's LLVM 20.1.8 distribution. Compile/link actions declare the SDK files;
+mold is a declared linker input selected by its immutable store path. The bounded
+`native.bzl` bridge exists because toolchains_llvm 1.10.0 accepts a linker path,
+not an artifact label. There is no ambient compiler or linker fallback.
+
+Browser archives and drivers retain their URLs, versions and checksums from
+`tools/browser-matrix.json`. Their separate `tools/host/browser.nix` package uses maintained
+Nixpkgs `autoPatchelfHook` to supply each ELF executable/helper's interpreter
+and shared-library RPATHs. Test targets consume the patched trees as declared
+runfiles. Nix libraries are not injected into the host process via
+`LD_LIBRARY_PATH`, and no outer FHS/container environment is required.
+Nix store outputs remain rooted by the upstream repository integration while
+Bazel uses them. Missing Nix, download failures, and unresolved libraries fail
+provisioning rather than selecting host substitutes or skipping acceptance.
 
 Bazel provisions versioned compilers, Rust libraries, Node/pnpm, Python, Go,
 protobuf, native build tools, generators, browsers and drivers. Nix does not
@@ -52,14 +51,14 @@ nix --extra-experimental-features 'nix-command flakes' flake update --flake path
 ```
 
 macOS/iOS CI is future work. It needs separate platform validation and Apple's
-Xcode/SDK provisioning; the Linux FHS runtime is not a macOS environment.
+Xcode/SDK provisioning; the Linux SDK is not a macOS environment.
 
 Missing libraries or failed pinned downloads are errors, not reasons to skip
 acceptance. Browsers need working user namespaces or their documented headless
 sandbox mode, a writable temporary directory, and available loopback ports.
 Privileged perf/network diagnostics and a Docker-compatible daemon are optional
 and not prerequisites for the complete test gate. The image loader consumes a
-Bazel-built artifact; the provisioned client does not build images.
+Bazel-built artifact and an optional Docker client/daemon; it does not build images.
 
 ## Shared local action cache
 
@@ -74,7 +73,7 @@ separate servers, analysis state, execution roots and locks for each worktree.
 Do not configure a common `--output_base` or copy one worktree's output state into
 another. `clean --expunge` removes worktree output state, not the shared cache.
 
-OS identity, declared inputs, toolchains and action arguments remain part of the
+Declared SDK/browser files, toolchains and action arguments remain part of the
 action keys. The cache does not weaken checks or make results from a different
 runtime reusable. Disk-cache GC size/age policies are disabled by default; use
 Bazel's `--experimental_disk_cache_gc_max_size` or
@@ -90,9 +89,10 @@ Bazel's `--experimental_disk_cache_gc_max_size` or
 ```
 
 `//:fast` includes formatting, compiler/type/architectural/artifact checks and
-fast owner tests. `//:test` adds committed slow simulations, both RTC browser
-matrices, the local RFC 8888 Go peer, and Web/React browser contracts. Ignored
-exploratory cases and advisory seed search retain their separate semantics.
+fast owner tests, including controlled native RTC interoperability and the server
+SDK contracts. `//:test` adds committed slow simulations and consumer-owned
+Web/React browser contracts. Ignored exploratory cases and advisory seed search
+retain their separate semantics.
 The sole human-authorized gate exclusion is the known native DTLS reconnect
 case, recorded in the [exception document](https://github.com/PulseBeamDev/pulsebeam/blob/main/crates/pulsebeam-simulator/docs/native-dtls-exception.md).
 It is reported as skipped, not passed, and remains explicitly runnable.

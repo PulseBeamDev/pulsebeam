@@ -18,6 +18,14 @@ or failure injection.
 - `src/tests/common/harness.rs` owns automatic discovery/subscription policy, lifecycle commands, reports, and oracles.
 - `src/tests/native_runtime.rs` is the narrow UniFFI-facing native-runtime vertical slice; the authored scenarios exercise the same runtime through the common harness.
 
+## Build profile
+
+Simulator runners apply the workspace's Cargo `sim` optimization and safety
+settings to the full target-configured Rust dependency closure. Proc macros and
+build scripts keep their normal execution configuration, and other owners keep
+their normal build configuration. Target-local optimization alone does not
+optimize runtime dependencies.
+
 ## Commands
 
 - Root `./bazel test //:test` runs acceptance, including committed seeds, with

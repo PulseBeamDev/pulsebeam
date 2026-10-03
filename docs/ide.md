@@ -28,9 +28,10 @@ these editor copies.
 
 The Rust setup is maintained by `rules_rust`. It installs ignored discovery and
 flycheck launchers under `.rules_rust_analyzer` and prints the Neovim configuration
-for the provisioned rust-analyzer, matching proc-macro server and rustfmt. On
-Linux these tool paths point directly at provisioned executables; the printed
-configuration is authoritative, not an assumed launcher filename.
+for the provisioned rust-analyzer and matching proc-macro server. The installed
+server launcher supplies declared Cargo, Rustc and Rustfmt paths, rather than
+ambient host tools. The printed configuration is authoritative, not an assumed
+launcher filename.
 Use the printed settings unchanged rather than generating a Cargo-only project.
 For another client:
 
@@ -48,8 +49,10 @@ regenerate settings because the upstream snippet contains absolute tool paths.
 
 Use the Neovim snippet printed by `//:rust_ide` with `nvim-lspconfig`, or translate
 its `cmd` and `settings` to Neovim's native `vim.lsp.config` API. Keep the matching
-proc-macro server and rustfmt override. This covers derives/attributes and
-Bazel-generated protobuf and UniFFI inputs, not merely hand-authored Rust.
+proc-macro server and saved-file flycheck configuration. The default formatter
+uses the declared Rustfmt executable and the crate edition from analysis; do not
+add a formatter command that duplicates the edition. This covers derives/attributes
+and Bazel-generated protobuf and UniFFI inputs, not merely hand-authored Rust.
 
 The upstream discovery/flycheck implementation derives dependency edges,
 features, cfgs, proc-macro artifacts, build-script environment and generated
@@ -59,6 +62,9 @@ list of crates or invented native/WASM Cargo build commands.
 
 Compiler-backed diagnostics are available through the upstream flycheck
 integration, scoped to the edited target rather than the full acceptance suite.
+Keep `check.workspace = false`: whole-workspace restarts cannot supply the saved
+file and would cancel its check when initial indexing finishes. This does not
+disable saved-file checks or whole-workspace reference discovery.
 Its optional Clippy integration is enabled by:
 
 ```sh

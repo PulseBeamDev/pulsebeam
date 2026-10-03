@@ -240,6 +240,17 @@
         Math.abs((peak(spectrum) * sdkContext.sampleRate) / 2048 - 1320) < 45
       );
     }, "replacement receiver signal follows B");
+    // The persistent destination probe has its own render/FFT history.
+    await wait(
+      () => Math.abs(outputFrequency() - 1320) < 45,
+      "replacement receiver reaches SDK output",
+      () =>
+        JSON.stringify({
+          frequency: outputFrequency(),
+          routes: output.routes.size,
+          context: sdkContext.state,
+        }),
+    );
     assert(
       Math.abs(outputFrequency() - 1320) < 45 && output.routes.size === 1,
       "destination follows replacement",

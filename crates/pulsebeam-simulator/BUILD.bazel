@@ -2,6 +2,7 @@ load("@crates//:defs.bzl", "aliases", "all_crate_deps", "crate_edition")
 load("@rules_rust//cargo:defs.bzl", "cargo_toml_env_vars", "extract_cargo_lints")
 load("@rules_rust//rust:defs.bzl", "rust_clippy_test", "rust_test", "rustfmt_test")
 load("@rules_python//python:defs.bzl", "py_binary", "py_test")
+load("@bazel_lib//lib:transitions.bzl", "platform_transition_filegroup")
 
 package(default_visibility = ["//visibility:public"])
 filegroup(name = "workflow_inputs", srcs = glob(["*.md", "docs/**/*.md", "Justfile", "scripts/*.sh"], allow_empty = True))
@@ -34,6 +35,29 @@ rust_test(
     tags = ["manual"],
 )
 
+# Target-local rustc_flags do not optimize dependencies. Apply the simulation
+# profile to the complete dependency closure without changing other owners.
+platform(
+    name = "sim_platform",
+    parents = ["@platforms//host"],
+    flags = [
+        "--compilation_mode=opt",
+        "--@rules_rust//rust/settings:codegen_units=256",
+        "--@rules_rust//rust/settings:per_crate_rustc_flag=@-Copt-level=2",
+        "--@rules_rust//rust/settings:per_crate_rustc_flag=@-Cdebug-assertions=yes",
+        "--@rules_rust//rust/settings:per_crate_rustc_flag=@-Coverflow-checks=yes",
+        "--@rules_rust//rust/settings:per_crate_rustc_flag=@-Cdebuginfo=1",
+        "--@rules_rust//rust/settings:per_crate_rustc_flag=@-Cstrip=none",
+    ],
+)
+
+platform_transition_filegroup(
+    name = "sim_binary",
+    testonly = True,
+    srcs = [":test_binary"],
+    target_platform = ":sim_platform",
+)
+
 # Human-authorized exception; keep the oracle and explicit replay intact.
 # See docs/native-dtls-exception.md for cause and reinstatement criteria.
 NATIVE_DTLS_EXCEPTION = ["--skip", "tests::native_runtime::native_agents_prove_media_topics_reconnect_and_close"]
@@ -42,8 +66,8 @@ py_test(
     name = "fast",
     srcs = ["//tools:run-simulations.py"],
     main = "//tools:run-simulations.py",
-    args = ["$(rootpath :test_binary)", "--mode", "fast"] + NATIVE_DTLS_EXCEPTION,
-    data = [":test_binary"],
+    args = ["$(rootpath :sim_binary)", "--mode", "fast"] + NATIVE_DTLS_EXCEPTION,
+    data = [":sim_binary"],
     size = "large",
 )
 
@@ -51,13 +75,13 @@ py_test(
     name = "slow",
     srcs = ["//tools:run-simulations.py"],
     main = "//tools:run-simulations.py",
-    args = ["$(rootpath :test_binary)", "--mode", "slow"],
-    data = [":test_binary"],
+    args = ["$(rootpath :sim_binary)", "--mode", "slow"],
+    data = [":sim_binary"],
     size = "enormous",
     tags = ["slow"],
 )
 
-REPLAY_ARGS = ["$(rootpath :test_binary)", "--mode", "all"] + NATIVE_DTLS_EXCEPTION
+REPLAY_ARGS = ["$(rootpath :sim_binary)", "--mode", "all"] + NATIVE_DTLS_EXCEPTION
 
 py_binary(
     name = "replay",
@@ -65,7 +89,7 @@ py_binary(
     srcs = ["//tools:run-simulations.py"],
     main = "//tools:run-simulations.py",
     args = REPLAY_ARGS,
-    data = [":test_binary"],
+    data = [":sim_binary"],
 )
 
 py_binary(
@@ -73,8 +97,8 @@ py_binary(
     testonly = True,
     srcs = ["//tools:run-simulations.py"],
     main = "//tools:run-simulations.py",
-    args = ["$(rootpath :test_binary)", "--mode", "all", "--seeds", "20", "--from-seed", "1"] + NATIVE_DTLS_EXCEPTION,
-    data = [":test_binary"],
+    args = ["$(rootpath :sim_binary)", "--mode", "all", "--seeds", "20", "--from-seed", "1"] + NATIVE_DTLS_EXCEPTION,
+    data = [":sim_binary"],
 )
 
 py_binary(
@@ -86,7 +110,7 @@ py_binary(
     args = ["--runner", "$(rootpath :replay)", "--parser", "$(rootpath //tools:scoreboard_parser)"] + [
         "--runner-arg=" + arg for arg in REPLAY_ARGS + ["--jobs", "1"]
     ],
-    data = [":replay", ":test_binary", "//tools:scoreboard_parser"],
+    data = [":replay", ":sim_binary", "//tools:scoreboard_parser"],
 )
 
 rustfmt_test(name = "format", targets = [":test_binary"])

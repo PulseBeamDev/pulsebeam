@@ -1,21 +1,20 @@
-"""Provision the consumer browser acceptance matrix, without a mutable browser cache.
+"""Provision the consumer browser acceptance matrix with a pinned OS closure.
 
-Upstream browser defaults do not implement this repository's ESR/version/hash
-matrix. Bazel's http_archive owns downloads and extraction; this extension only
-translates the existing matrix into repositories.
+Nixpkgs' autoPatchelfHook supplies interpreter/RPATHs for all browser helpers,
+without changing host-process libraries or entering an FHS namespace.
 """
 
-load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
+load("@rules_nixpkgs_core//:nixpkgs.bzl", "nixpkgs_package")
 
 
 def _browsers_impl(ctx):
     matrix = json.decode(ctx.read(Label("//tools:browser-matrix.json")))
     for artifact in matrix["platforms"]["linux-x86_64"]["artifacts"]:
-        http_archive(
+        nixpkgs_package(
             name = "browser_" + artifact["name"],
-            urls = [artifact["url"]],
-            sha256 = artifact["sha256"],
-            type = artifact["archive"],
+            nix_file = Label("//tools/host:browser.nix"),
+            repository = Label("@nixpkgs//:nixpkgs"),
+            nixopts = [arg for key in ["name", "version", "url", "sha256", "archive"] for arg in ["--argstr", key, artifact[key]]],
             build_file_content = '''package(default_visibility = ["//visibility:public"])
 filegroup(name = "files", srcs = glob(["**"]))
 filegroup(name = "executable", srcs = [%s])

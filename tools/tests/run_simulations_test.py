@@ -79,6 +79,16 @@ class SimulationRunnerContract(unittest.TestCase):
         self.assertEqual({item[0] for item in executed}, {FAST, EXCEPTION})
         self.assertNotIn("SKIP ", output)
 
+    def test_wall_timing_and_concurrency_are_reported_outside_child(self):
+        with patch.object(RUNNER.time, "perf_counter", side_effect=[10.0, 12.5]):
+            status, executed, output = self.invoke("--filter", FAST, "--seed", "4711")
+        self.assertEqual(status, 0)
+        self.assertEqual(len(executed), 1)
+        self.assertIn("[simulation-run] cases=1 seeds=1 jobs=1 cpus=", output)
+        self.assertIn(f"[simulation-timing] START {FAST} seed=4711", output)
+        self.assertIn(f"[simulation-timing] END {FAST} wall_seconds=2.500", output)
+        self.assertIn(f"[simulation-result] PASS {FAST}", output)
+
     def test_invalid_seed_window_fails_before_execution(self):
         status, executed, output = self.invoke("--seed", str(2**64 - 1), "--seeds", "2")
         self.assertEqual(status, 2)

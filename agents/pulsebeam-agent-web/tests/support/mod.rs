@@ -161,6 +161,13 @@ pub fn capabilities() -> TestResult<ChromeCapabilities> {
     capabilities.set_headless()?;
     capabilities.set_no_sandbox()?;
     capabilities.set_disable_gpu()?;
+    capabilities.add_arg("--enable-logging")?;
+    if let Some(outputs) = env::var_os("TEST_UNDECLARED_OUTPUTS_DIR") {
+        let thread = std::thread::current();
+        let test_name = thread.name().unwrap_or("browser");
+        let log_path = Path::new(&outputs).join(format!("chrome-{test_name}.log"));
+        capabilities.set_browser_option("logPath", log_path.to_string_lossy())?;
+    }
     capabilities.add_arg("--use-fake-device-for-media-stream")?;
     capabilities.add_arg("--use-fake-ui-for-media-stream")?;
     capabilities.enable_bidi()?;
@@ -183,6 +190,7 @@ pub async fn managed_driver(
         .map_err(|error| thirtyfour::error::WebDriverError::ParseError(error.to_string()))?;
     thirtyfour::manager::WebDriverManager::builder()
         .driver_binary(thirtyfour::manager::BrowserKind::Chrome, binary)
+        .stdio(thirtyfour::manager::StdioMode::Inherit)
         .offline()
         .build()
         .launch(capabilities)

@@ -1,0 +1,46 @@
+name: Non-publishing provisioning acceptance
+on:
+  push:
+    branches: [build/bazel-provisioning-acceptance]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: provisioning-acceptance-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  checks:
+    uses: ./.github/workflows/ci.yml
+  native-image:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/setup-ci
+      - name: Validate GNU release artifacts
+        run: ./bazel test --config=release //release:elf_contract //release:contract --test_output=errors
+      - name: Validate profiling ELF
+        run: ./bazel test --config=profile //release:elf_contract --test_output=errors
+      - name: Build and load the non-publishing amd64 image
+        run: ./bazel run --config=release //release:load
+      - name: Inspect non-root runtime and argument forwarding
+        run: |
+          test "$(docker image inspect --format '{{.Config.User}}' pulsebeam:local)" = '65532:65532'
+          test "$(docker image inspect --format '{{.Architecture}}' pulsebeam:local)" = amd64
+          docker run --rm pulsebeam:local --help
+  native-arm:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/setup-ci
+      - name: Validate native aarch64 GNU release contracts
+        run: ./bazel test --config=release //release:contract //release:elf_contract --test_output=errors
+  meet:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/setup-ci
+      - name: Assemble deployable Meet output without deployment
+        run: ./bazel test //apps/meet:check --test_output=errors
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: bazel-bin/apps/meet/out

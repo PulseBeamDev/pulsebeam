@@ -1,0 +1,30 @@
+--- a/tools/rust_analyzer/bin/flycheck.rs
++++ b/tools/rust_analyzer/bin/flycheck.rs
+@@ -471,12 +471,14 @@
+         format!("saved file {saved_file} is not under Bazel package //{package}")
+     })?;
+     let pattern = format!("//{package}:{file_in_package}");
+-    Ok(format!("attr(srcs, {pattern:?}, //{package}:*)"))
++    Ok(format!(
++        "kind(\"rust_(library|dylib_library|cdylib_library|static_library|proc_macro|binary|test) rule\", attr(srcs, {pattern:?}, //{package}:*))"
++    ))
+ }
+ 
+-/// `bazel query 'attr(srcs, "<file>", //<package>:*)'` scoped to the
+-/// nearest `BUILD.bazel`. Returns the first match — if a file belongs
+-/// to several targets, any is correct.
++/// Query Rust compilation rules containing the saved source in the nearest
++/// package. Filegroups also match `srcs` but do not invoke rustc. If a source
++/// belongs to several compilation targets, return the first match.
+ fn query_label_for(
+     bazel: &Utf8Path,
+     workspace: &Utf8Path,
+@@ -569,7 +571,7 @@
+ 
+         assert_eq!(
+             query_string_for(&workspace, &workspace.join(&rust_src_path)).unwrap(),
+-            r#"attr(srcs, "//example/library:src/main.rs", //example/library:*)"#
++            r#"kind("rust_(library|dylib_library|cdylib_library|static_library|proc_macro|binary|test) rule", attr(srcs, "//example/library:src/main.rs", //example/library:*))"#
+         );
+     }
+ 

@@ -16,7 +16,7 @@ build framework or an alternative package compilation pipeline.
 | UBRN generator | `tools/generators.toml` | Derived generator repository |
 | JS dependencies | Each owner package manifest and frozen pnpm lock | rules_js npm repositories and editor installs |
 | Node, pnpm, Python, LLVM, CMake/Ninja and upstream rules | `MODULE.bazel` | All configured actions and CI |
-| Linux OS inputs and mold | `tools/host/flake.nix`, `tools/host/flake.lock` | Narrow Nixpkgs FHS runtime; no application build graph |
+| Linux OS inputs and mold | `tools/host/flake.nix`, `tools/host/flake.lock` | Declared native SDK/mold and patched browser runtime inputs; no application graph |
 | Go server SDK | `server/go/go.mod`, standard library only | Consumer-owned SDK verification |
 | Python server SDK dependencies | `server/python/pyproject.toml` (public requirements), `requirements.in`/hashed `requirements.lock` (repository tools and concrete test resolution) | rules_python pip hub |
 | Browser binaries/drivers | `tools/browser-matrix.json` | Browser extension and consumer-owned Web/React coverage |
@@ -38,8 +38,11 @@ from supported application compilation; CI does not install parallel host tools.
 - `rules_rust_wasm_bindgen`: matching glue generation and WASM toolchain use.
 - `toolchains_llvm`, `rules_cc`, `rules_foreign_cc`, `nasm`: native compiler,
   CMake/Ninja and codec assembler inputs. The LLVM integration consumes the
-  locked OS runtime's unwrapped mold executable; its current linker API accepts
+  declared Nix SDK and unwrapped mold executable; its current linker API accepts
   a path, not a provisioned-artifact label.
+- `rules_nixpkgs_core`: imports concrete OS packages from the existing flake lock.
+  Nixpkgs `buildEnv` owns SDK projection and `autoPatchelfHook` owns browser ELF
+  interpreter/runtime-library integration on the normal host.
 - `protobuf`: generated Rust protobuf input through the pinned code generator.
 - `rules_js`, `rules_nodejs`, `bazel_lib`: frozen pnpm translation, first-party
   package links, JS execution/tests, directory outputs and declared artifact views.
@@ -50,12 +53,12 @@ from supported application compilation; CI does not install parallel host tools.
 
 ## Concrete repository-owned gaps
 
-- `host-env.bzl` exposes the locked OS environment's immutable identity as a
-  declared native compile/link input, independently matching it against the watched
-  immutable runtime marker. The launcher also passes it through action/repository
-  environments; the identity is reserved for supported builds/tests. The OS-only flake is separate from application
-  sources, so the verified flake/lock/architecture identity does not depend on
-  worktree location.
+- `os.bzl` connects the existing flake lock to upstream Nix repository rules:
+  their module-extension tags do not expose the lock-file import API.
+  `native.bzl` translates the imported mold path to upstream LLVM's path-only
+  linker API and declares the artifact. SDK headers/libraries use its native
+  sysroot label interface. These adapters do not install tools, resolve versions,
+  or orchestrate application builds.
 - `update-rust-pins.py` projects existing workspace/manifests into the external
   crate-universe first-party override boundaries and tool-only universes. A
   browser-only universe is derived from the Web/Core/protobuf normal dependencies,
@@ -70,11 +73,18 @@ from supported application compilation; CI does not install parallel host tools.
   generated embedded path relocatable in Bazel sandboxes.
 - `browsers.bzl` preserves the existing matrix's checked URLs, hashes, archive
   structure and Firefox ESR contract, which a generic Chrome-only toolchain
-  would not cover. The locked OS runtime supplies shared libraries; kernel
+  would not cover. It passes matrix values to a separately locked Nixpkgs browser
+  derivation. Upstream autoPatchelfHook handles all ELF helpers and shared
+  libraries without a process-wide library override or FHS runtime. Kernel
   namespace/sandbox support remains an explicit host prerequisite.
 - `run-simulations.py` preserves nextest-style per-case process isolation and
   slow namespace selection with libtest, including seed replay and advisory
   windows. It runs actual Bazel-built test binaries, not Cargo commands.
+- Two bounded `rules_rust` patches keep its editor setup/discovery/flycheck
+  ownership: setup supplies declared tool paths through upstream launchers,
+  forwards tool runtime closures, and emits saved-file checks/default formatting;
+  flycheck's source-owner fallback excludes non-compiling filegroups. Rust tools
+  share the `rust-toolchain.toml` version, without separate analyzer pairing.
 - `ide.py` materializes ignored generated SDK/framework assets and locked editor
   dependency trees. Rust crate/configuration information comes exclusively from
   upstream rules_rust discovery. No bespoke language server/project graph exists.
@@ -97,5 +107,6 @@ from supported application compilation; CI does not install parallel host tools.
   their concrete outputs. Source metadata, scripts and fixtures are declared.
 
 The integration inventory describes ownership, not passing acceptance evidence.
-See the [migration evidence record](bazel-acceptance.md) for actual commands,
-results and explicit exclusions.
+See [build and development](../docs/build.md) for the supported provisioning path.
+Acceptance records must distinguish passing execution from pending or qualified
+boundaries; source wiring alone is not runtime evidence.

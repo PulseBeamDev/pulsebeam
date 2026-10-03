@@ -1,0 +1,606 @@
+diff --git a/tools/rust_analyzer/BUILD.bazel b/tools/rust_analyzer/BUILD.bazel
+--- a/tools/rust_analyzer/BUILD.bazel
++++ b/tools/rust_analyzer/BUILD.bazel
+@@ -123,12 +123,16 @@
+         ":discover_bazel_rust_project_opt",
+         ":flycheck_opt",
+         ":launcher_opt",
++        "//rust/toolchain:current_cargo_files",
++        "//rust/toolchain:current_rustc_files",
+         "//rust/toolchain:current_rust_analyzer_toolchain",
+         "//rust/toolchain:current_rustfmt_toolchain",
+     ],
+     edition = "2021",
+     rustc_env = {
+         "LAUNCHER_RLOCATIONPATH": "$(rlocationpath :launcher_opt)",
++        "CARGO_RLOCATIONPATH": "$(rlocationpath //rust/toolchain:current_cargo_files)",
++        "RUSTC_RLOCATIONPATH": "$(rlocationpath //rust/toolchain:current_rustc_files)",
+         "RUSTFMT_RLOCATIONPATH": "$(RUSTFMT_RLOCATIONPATH)",
+         "RUST_ANALYZER_PROC_MACRO_SRV_RLOCATIONPATH": "$(RUST_ANALYZER_PROC_MACRO_SRV_RLOCATIONPATH)",
+         "RUST_ANALYZER_RLOCATIONPATH": "$(RUST_ANALYZER_RLOCATIONPATH)",
+diff --git a/tools/rust_analyzer/bin/setup.rs b/tools/rust_analyzer/bin/setup.rs
+--- a/tools/rust_analyzer/bin/setup.rs
++++ b/tools/rust_analyzer/bin/setup.rs
+@@ -49,6 +49,8 @@
+ /// check` for any auto-detected `Cargo.toml`, creating `target/` and
+ /// emitting cargo-anchored diagnostic paths.
+ const CHECK_OVERRIDE_KEY: &str = "rust-analyzer.check.overrideCommand";
++const CHECK_STRATEGY_KEY: &str = "rust-analyzer.check.invocationStrategy";
++const CHECK_WORKSPACE_KEY: &str = "rust-analyzer.check.workspace";
+ 
+ const FILES_WATCHER_EXCLUDE_KEY: &str = "files.watcherExclude";
+ const SEARCH_EXCLUDE_KEY: &str = "search.exclude";
+@@ -105,7 +107,7 @@
+     #[arg(long, global = true)]
+     skip_proc_macro_server: bool,
+ 
+-    /// Skip the rustfmt override key. Useful when the workspace
++    /// Skip the declared rustfmt environment. Useful when the workspace
+     /// deliberately wants the host's rustfmt instead of the Bazel one.
+     #[arg(long, global = true)]
+     skip_rustfmt: bool,
+@@ -308,14 +310,12 @@
+             env!("RUST_ANALYZER_PROC_MACRO_SRV_RLOCATIONPATH"),
+         )?,
+         rustfmt: lookup_canonical(&runfiles, env!("RUSTFMT_RLOCATIONPATH"))?,
++        cargo: lookup_canonical(&runfiles, env!("CARGO_RLOCATIONPATH"))?,
++        rustc: lookup_canonical(&runfiles, env!("RUSTC_RLOCATIONPATH"))?,
+     };
+ 
+     install_source_binaries(&launcher_dir, &runfiles)?;
+-    // Only VSCode goes through launcher shims; other IDEs bake
+-    // absolute toolchain paths into their snippets.
+-    if matches!(ide, IdeCmd::Vscode(_)) {
+-        install_toolchain_launchers(&launcher_dir, &runfiles, &toolchain)?;
+-    }
++    install_toolchain_launchers(&launcher_dir, &runfiles, &toolchain, skip_rustfmt)?;
+ 
+     // Apply user_config edits before per-IDE dispatch so the runners
+     // and any --dry-run flow see the same on-disk state.
+@@ -366,6 +366,8 @@
+     rust_analyzer: Utf8PathBuf,
+     proc_macro_srv: Utf8PathBuf,
+     rustfmt: Utf8PathBuf,
++    cargo: Utf8PathBuf,
++    rustc: Utf8PathBuf,
+ }
+ 
+ fn lookup_runfile(runfiles: &Runfiles, env_path: &str) -> Result<Utf8PathBuf> {
+@@ -712,6 +714,7 @@
+     dir: &Utf8Path,
+     runfiles: &Runfiles,
+     toolchain: &ToolchainBinaries,
++    skip_rustfmt: bool,
+ ) -> Result<()> {
+     let launcher_src = lookup_runfile(runfiles, env!("LAUNCHER_RLOCATIONPATH"))?;
+     for logical in LAUNCHER_LOGICAL_NAMES {
+@@ -720,10 +723,14 @@
+             .with_context(|| format!("copying {launcher_src} -> {dest}"))?;
+         set_executable(&dest)?;
+     }
+-    write_launcher_paths_json(&dir.join(LAUNCHER_PATHS_JSON), toolchain)
++    write_launcher_paths_json(&dir.join(LAUNCHER_PATHS_JSON), toolchain, skip_rustfmt)
+ }
+ 
+-fn write_launcher_paths_json(path: &Utf8Path, toolchain: &ToolchainBinaries) -> Result<()> {
++fn write_launcher_paths_json(
++    path: &Utf8Path,
++    toolchain: &ToolchainBinaries,
++    skip_rustfmt: bool,
++) -> Result<()> {
+     // Fully generated — plain serde_json (unlike the CST-merged
+     // settings.json / .code-workspace paths).
+     let map = Value::Object(
+@@ -738,6 +745,13 @@
+             })
+             .collect(),
+     );
++    let mut map = map;
++    let object = map.as_object_mut().unwrap();
++    object.insert("CARGO".to_owned(), json!(toolchain.cargo));
++    object.insert("RUSTC".to_owned(), json!(toolchain.rustc));
++    if !skip_rustfmt {
++        object.insert("RUSTFMT".to_owned(), json!(toolchain.rustfmt));
++    }
+     let mut json = serde_json::to_string_pretty(&map)?;
+     json.push('\n');
+     write_text(path.as_std_path(), &json)
+@@ -823,7 +837,6 @@
+ fn vscode_managed_keys(ctx: &SetupCtx) -> Vec<(String, ManagedValue)> {
+     let ra_path = workspace_relative("rust_analyzer.exe");
+     let pms_path = workspace_relative("rust_analyzer_proc_macro_srv.exe");
+-    let rustfmt_path = workspace_relative("rustfmt.exe");
+     let discover_path = workspace_relative(DISCOVER_BINARY_FILENAME);
+     let flycheck_path = workspace_relative(FLYCHECK_BINARY_FILENAME);
+     let bazel_outputs = || vec![(BAZEL_OUTPUTS_GLOB.to_string(), Value::Bool(true))];
+@@ -861,7 +874,8 @@
+     if !ctx.skip_rustfmt {
+         out.push((
+             RUSTFMT_OVERRIDE_KEY.to_string(),
+-            ManagedValue::Replace(json!([rustfmt_path])),
++            // Default formatting supplies the analyzed crate edition.
++            ManagedValue::Replace(Value::Null),
+         ));
+     }
+     // Prevents RA from running `cargo check` for any auto-detected
+@@ -871,6 +885,15 @@
+         CHECK_OVERRIDE_KEY.to_string(),
+         ManagedValue::Replace(json!([flycheck_path, "--saved-file", "$saved_file"])),
+     ));
++    out.push((
++        CHECK_STRATEGY_KEY.to_string(),
++        ManagedValue::Replace(json!("once")),
++    ));
++    // Workspace restarts cannot substitute `$saved_file` and cancel active save checks.
++    out.push((
++        CHECK_WORKSPACE_KEY.to_string(),
++        ManagedValue::Replace(json!(false)),
++    ));
+     // All three exclude maps get the same glob, dict-merged so any
+     // user entries survive.
+     out.push((
+@@ -1061,8 +1084,8 @@
+ // Universal placeholders used across all snippet templates.
+ const TPL_RA_LAUNCHER: &str = "__RA_LAUNCHER__";
+ const TPL_DISCOVER_LAUNCHER: &str = "__DISCOVER_LAUNCHER__";
++const TPL_FLYCHECK_LAUNCHER: &str = "__FLYCHECK_LAUNCHER__";
+ const TPL_PMS_LAUNCHER: &str = "__PMS_LAUNCHER__";
+-const TPL_RUSTFMT_LAUNCHER: &str = "__RUSTFMT_LAUNCHER__";
+ // Optional-block slots in the main templates.
+ const TPL_OPT_PROC_MACRO: &str = "__OPT_PROC_MACRO__";
+ const TPL_OPT_RUSTFMT: &str = "__OPT_RUSTFMT__";
+@@ -1086,6 +1109,11 @@
+           filesToWatch = { "BUILD", "BUILD.bazel", "MODULE.bazel", "WORKSPACE", "WORKSPACE.bazel" },
+         },
+       },
++      check = {
++        overrideCommand = { "__FLYCHECK_LAUNCHER__", "--saved-file", "$saved_file" },
++        invocationStrategy = "once",
++        workspace = false,
++      },
+ __OPT_PROC_MACRO____OPT_RUSTFMT__      lens = { enable = true },
+     },
+   },
+@@ -1098,7 +1126,7 @@
+ "#;
+ 
+ const NEOVIM_LUA_RUSTFMT: &str = r#"      rustfmt = {
+-        overrideCommand = { "__RUSTFMT_LAUNCHER__" },
++        overrideCommand = vim.NIL,
+       },
+ "#;
+ 
+@@ -1111,6 +1139,11 @@
+ command = ["__DISCOVER_LAUNCHER__", "{arg}"]
+ progressLabel = "rules_rust"
+ filesToWatch = ["BUILD", "BUILD.bazel", "MODULE.bazel", "WORKSPACE", "WORKSPACE.bazel"]
++
++[language-server.rust-analyzer.config.check]
++overrideCommand = ["__FLYCHECK_LAUNCHER__", "--saved-file", "$saved_file"]
++invocationStrategy = "once"
++workspace = false
+ __OPT_PROC_MACRO____OPT_RUSTFMT__
+ [language-server.rust-analyzer.config.lens]
+ enable = true
+@@ -1121,10 +1154,7 @@
+ server = "__PMS_LAUNCHER__"
+ "#;
+ 
+-const HELIX_TOML_RUSTFMT: &str = r#"
+-[language-server.rust-analyzer.config.rustfmt]
+-overrideCommand = ["__RUSTFMT_LAUNCHER__"]
+-"#;
++const HELIX_TOML_RUSTFMT: &str = "";
+ 
+ // -- Editor-agnostic JSON (coc.nvim, vim-lsp, ALE, ...) --
+ //
+@@ -1141,6 +1171,9 @@
+     "progressLabel": "rules_rust",
+     "filesToWatch": ["BUILD", "BUILD.bazel", "MODULE.bazel", "WORKSPACE", "WORKSPACE.bazel"]
+   },
++  "rust-analyzer.check.overrideCommand": ["__FLYCHECK_LAUNCHER__", "--saved-file", "$saved_file"],
++  "rust-analyzer.check.invocationStrategy": "once",
++  "rust-analyzer.check.workspace": false,
+   __OPT_PROC_MACRO____OPT_RUSTFMT__"rust-analyzer.lens.enable": true
+ }
+ "#;
+@@ -1148,7 +1181,7 @@
+ const SETTINGS_JSON_PROC_MACRO: &str = r#""rust-analyzer.procMacro.server": "__PMS_LAUNCHER__",
+   "#;
+ 
+-const SETTINGS_JSON_RUSTFMT: &str = r#""rust-analyzer.rustfmt.overrideCommand": ["__RUSTFMT_LAUNCHER__"],
++const SETTINGS_JSON_RUSTFMT: &str = r#""rust-analyzer.rustfmt.overrideCommand": null,
+   "#;
+ 
+ // -- Helpers shared by all three generators --
+@@ -1184,17 +1217,21 @@
+ struct SnippetPaths {
+     ra: String,
+     pms: String,
+-    rustfmt: String,
+     discover: String,
++    flycheck: String,
+ }
+ 
+ impl SnippetPaths {
+     fn for_ctx(ctx: &SetupCtx, launcher_dir: &Utf8Path) -> Self {
+         Self {
+-            ra: to_forward_slashes(ctx.toolchain.rust_analyzer.as_str()),
++            ra: to_forward_slashes(
++                launcher_dir
++                    .join(launcher_filename("rust_analyzer"))
++                    .as_str(),
++            ),
+             pms: to_forward_slashes(ctx.toolchain.proc_macro_srv.as_str()),
+-            rustfmt: to_forward_slashes(ctx.toolchain.rustfmt.as_str()),
+             discover: to_forward_slashes(launcher_dir.join(DISCOVER_BINARY_FILENAME).as_str()),
++            flycheck: to_forward_slashes(launcher_dir.join(FLYCHECK_BINARY_FILENAME).as_str()),
+         }
+     }
+ }
+@@ -1213,12 +1250,11 @@
+     let proc_macro = opt_block(!ctx.skip_proc_macro_server, proc_macro_template, |t| {
+         t.replace(TPL_PMS_LAUNCHER, &paths.pms)
+     });
+-    let rustfmt = opt_block(!ctx.skip_rustfmt, rustfmt_template, |t| {
+-        t.replace(TPL_RUSTFMT_LAUNCHER, &paths.rustfmt)
+-    });
++    let rustfmt = opt_block(!ctx.skip_rustfmt, rustfmt_template, str::to_owned);
+     main_template
+         .replace(TPL_RA_LAUNCHER, &paths.ra)
+         .replace(TPL_DISCOVER_LAUNCHER, &paths.discover)
++        .replace(TPL_FLYCHECK_LAUNCHER, &paths.flycheck)
+         .replace(TPL_OPT_PROC_MACRO, &proc_macro)
+         .replace(TPL_OPT_RUSTFMT, &rustfmt)
+ }
+@@ -1280,6 +1316,8 @@
+             rust_analyzer: Utf8PathBuf::from("/obase/external/ra/rust-analyzer"),
+             proc_macro_srv: Utf8PathBuf::from("/obase/external/ra/proc-macro-srv"),
+             rustfmt: Utf8PathBuf::from("/obase/external/rfmt/rustfmt"),
++            cargo: Utf8PathBuf::from("/obase/external/rust/bin/cargo"),
++            rustc: Utf8PathBuf::from("/obase/external/rust/bin/rustc"),
+         }
+     }
+ 
+@@ -1375,10 +1413,8 @@
+         let with_srv = vscode_managed_keys(&ctx);
+         ctx.skip_proc_macro_server = true;
+         let without_srv = vscode_managed_keys(&ctx);
+-        // 5 rust-analyzer keys (discover, server, proc-macro, rustfmt,
+-        // check.overrideCommand) + 2 exclude maps = 7 total.
+-        assert_eq!(with_srv.len(), 7);
+-        assert_eq!(without_srv.len(), 6);
++        assert_eq!(with_srv.len(), 9);
++        assert_eq!(without_srv.len(), 8);
+         assert!(!without_srv.iter().any(|(k, _)| k == PROC_MACRO_SRV_KEY));
+     }
+ 
+@@ -1388,8 +1424,8 @@
+         let with_fmt = vscode_managed_keys(&ctx);
+         ctx.skip_rustfmt = true;
+         let without_fmt = vscode_managed_keys(&ctx);
+-        assert_eq!(with_fmt.len(), 7);
+-        assert_eq!(without_fmt.len(), 6);
++        assert_eq!(with_fmt.len(), 9);
++        assert_eq!(without_fmt.len(), 8);
+         assert!(!without_fmt.iter().any(|(k, _)| k == RUSTFMT_OVERRIDE_KEY));
+         // The proc-macro and check-override keys still ride along.
+         assert!(without_fmt.iter().any(|(k, _)| k == PROC_MACRO_SRV_KEY));
+@@ -1397,15 +1433,11 @@
+     }
+ 
+     #[test]
+-    fn rustfmt_override_is_argv_array_pointing_at_launcher() {
+-        let (ctx, _launcher_dir) = dummy_ctx();
+-        let keys = vscode_managed_keys(&ctx);
+-        let val = replace_value(&keys, RUSTFMT_OVERRIDE_KEY);
+-        let arr = val.as_array().unwrap();
+-        assert_eq!(arr.len(), 1);
++    fn rustfmt_override_is_cleared_for_default_edition_handling() {
++        let (ctx, _) = dummy_ctx();
+         assert_eq!(
+-            arr[0].as_str().unwrap(),
+-            "${workspaceFolder}/.vscode/.rules_rust_analyzer/rustfmt.exe"
++            replace_value(&vscode_managed_keys(&ctx), RUSTFMT_OVERRIDE_KEY),
++            &Value::Null
+         );
+     }
+ 
+@@ -1644,8 +1676,7 @@
+         let launcher_dir = Utf8PathBuf::from(DUMMY_WORKSPACE).join(LAUNCHER_SUBDIR);
+         let snippet = generate_neovim_lua(&ctx, &launcher_dir);
+         assert!(snippet.contains("require(\"lspconfig\").rust_analyzer.setup"));
+-        // rust-analyzer LSP from the toolchain.
+-        assert!(snippet.contains("/obase/external/ra/rust-analyzer"));
++        assert!(snippet.contains("/ws/.rules_rust_analyzer/rust_analyzer.exe"));
+         // discover binary from the launcher dir.
+         assert!(snippet.contains("/ws/.rules_rust_analyzer/discover_bazel_rust_project"));
+         assert!(snippet.contains("lens = { enable = true }"));
+@@ -1660,8 +1691,7 @@
+         let snippet = generate_helix_toml(&ctx, &launcher_dir);
+         assert!(snippet.contains("[language-server.rust-analyzer]"));
+         assert!(snippet.contains("[language-server.rust-analyzer.config.workspace.discoverConfig]"));
+-        // rust-analyzer LSP path comes from the toolchain.
+-        assert!(snippet.contains("/obase/external/ra/rust-analyzer"));
++        assert!(snippet.contains("/ws/.helix/.rules_rust_analyzer/rust_analyzer.exe"));
+         // discover sits next to the helix-specific launcher dir.
+         assert!(snippet.contains("/ws/.helix/.rules_rust_analyzer/discover_bazel_rust_project"));
+     }
+@@ -1680,7 +1710,7 @@
+         // Toolchain paths land in the right JSON keys.
+         assert_eq!(
+             obj.get(SERVER_PATH_KEY).unwrap().as_str().unwrap(),
+-            "/obase/external/ra/rust-analyzer"
++            "/ws/.rules_rust_analyzer/rust_analyzer.exe"
+         );
+         assert_eq!(
+             obj.get(PROC_MACRO_SRV_KEY).unwrap().as_str().unwrap(),
+@@ -1798,6 +1828,7 @@
+             for ph in [
+                 TPL_RA_LAUNCHER,
+                 TPL_DISCOVER_LAUNCHER,
++                TPL_FLYCHECK_LAUNCHER,
+                 TPL_OPT_PROC_MACRO,
+                 TPL_OPT_RUSTFMT,
+             ] {
+@@ -1814,16 +1845,9 @@
+                 "{name} missing {TPL_PMS_LAUNCHER}"
+             );
+         }
+-        for (name, body) in [
+-            ("neovim rustfmt", NEOVIM_LUA_RUSTFMT),
+-            ("helix rustfmt", HELIX_TOML_RUSTFMT),
+-            ("json rustfmt", SETTINGS_JSON_RUSTFMT),
+-        ] {
+-            assert!(
+-                body.contains(TPL_RUSTFMT_LAUNCHER),
+-                "{name} missing {TPL_RUSTFMT_LAUNCHER}"
+-            );
+-        }
++        assert!(NEOVIM_LUA_RUSTFMT.contains("vim.NIL"));
++        assert!(HELIX_TOML_RUSTFMT.is_empty());
++        assert!(SETTINGS_JSON_RUSTFMT.contains("null"));
+     }
+ 
+     // -----------------------------------------------------------------
+@@ -2072,7 +2096,7 @@
+         let _ = std::fs::remove_dir_all(&tmp);
+         std::fs::create_dir_all(&tmp).unwrap();
+         let out = Utf8PathBuf::try_from(tmp.join("launcher_paths.json")).unwrap();
+-        write_launcher_paths_json(&out, &dummy_toolchain()).unwrap();
++        write_launcher_paths_json(&out, &dummy_toolchain(), false).unwrap();
+         let parsed: Value = serde_json::from_str(&fs::read_to_string(&out).unwrap()).unwrap();
+         let obj = parsed.as_object().unwrap();
+         assert_eq!(
+@@ -2090,9 +2114,58 @@
+             obj.get("rustfmt").unwrap().as_str().unwrap(),
+             "/obase/external/rfmt/rustfmt"
+         );
++        assert_eq!(
++            obj.get("CARGO"),
++            Some(&json!("/obase/external/rust/bin/cargo"))
++        );
++        assert_eq!(
++            obj.get("RUSTC"),
++            Some(&json!("/obase/external/rust/bin/rustc"))
++        );
++        assert_eq!(
++            obj.get("RUSTFMT"),
++            Some(&json!("/obase/external/rfmt/rustfmt"))
++        );
++        write_launcher_paths_json(&out, &dummy_toolchain(), true).unwrap();
++        let skipped: Value = serde_json::from_str(&fs::read_to_string(&out).unwrap()).unwrap();
++        assert!(skipped.get("RUSTFMT").is_none());
++        assert_eq!(skipped.get("CARGO"), obj.get("CARGO"));
++        assert_eq!(skipped.get("RUSTC"), obj.get("RUSTC"));
+         let _ = std::fs::remove_dir_all(&tmp);
+     }
+ 
++    #[test]
++    fn all_editor_snippets_route_saved_files_without_workspace_restarts() {
++        for skip_rustfmt in [false, true] {
++            for skip_proc_macro_server in [false, true] {
++                let (mut ctx, launcher_dir) = dummy_ctx();
++                ctx.skip_rustfmt = skip_rustfmt;
++                ctx.skip_proc_macro_server = skip_proc_macro_server;
++                let json: Value =
++                    serde_json::from_str(&generate_settings_json(&ctx, &launcher_dir)).unwrap();
++                assert_eq!(json[CHECK_STRATEGY_KEY], "once");
++                assert_eq!(json[CHECK_WORKSPACE_KEY], false);
++                let command = json[CHECK_OVERRIDE_KEY].as_array().unwrap();
++                assert!(command[0].as_str().unwrap().ends_with("/flycheck.exe"));
++                assert_eq!(command[1], "--saved-file");
++                assert_eq!(command[2], "$saved_file");
++                let keys = vscode_managed_keys(&ctx);
++                assert_eq!(replace_value(&keys, CHECK_STRATEGY_KEY), &json!("once"));
++                assert_eq!(replace_value(&keys, CHECK_WORKSPACE_KEY), &json!(false));
++                for snippet in [
++                    generate_neovim_lua(&ctx, &launcher_dir),
++                    generate_helix_toml(&ctx, &launcher_dir),
++                ] {
++                    assert!(snippet.contains("flycheck.exe"));
++                    assert!(snippet.contains("--saved-file"));
++                    assert!(snippet.contains("$saved_file"));
++                    assert!(snippet.contains("invocationStrategy = \"once\""));
++                    assert!(snippet.contains("workspace = false"));
++                }
++            }
++        }
++    }
++
+     // -----------------------------------------------------------------
+     // JSONC support (via `serde_jsonrc`)
+     // -----------------------------------------------------------------
+diff --git a/tools/rust_analyzer/bin/launcher.rs b/tools/rust_analyzer/bin/launcher.rs
+--- a/tools/rust_analyzer/bin/launcher.rs
++++ b/tools/rust_analyzer/bin/launcher.rs
+@@ -10,12 +10,7 @@
+ //! [`gen_rust_project_lib::DISCOVER_BINARY_FILENAME`] for the same
+ //! decision on the discover/flycheck side.
+ 
+-use std::{
+-    collections::HashMap,
+-    env, fs,
+-    path::{Path, PathBuf},
+-    process,
+-};
++use std::{collections::HashMap, env, fs, path::Path, process};
+ 
+ const PATHS_FILENAME: &str = "launcher_paths.json";
+ 
+@@ -27,9 +22,9 @@
+         .parent()
+         .unwrap_or_else(|| die(format!("current_exe has no parent: {}", exe.display())))
+         .join(PATHS_FILENAME);
+-    let target = resolve_target(&paths_path, &logical)
++    let command = resolve_target(&paths_path, &logical)
+         .unwrap_or_else(|e| die(format!("resolving {logical}: {e}")));
+-    exec_replace(&target);
++    exec_replace(command);
+ }
+ 
+ fn logical_name(exe: &Path) -> Option<String> {
+@@ -38,31 +33,44 @@
+ 
+ /// Borrows strings out of `raw` to skip per-entry heap allocations on
+ /// the LSP-startup hot path.
+-fn resolve_target(paths_path: &Path, logical: &str) -> Result<PathBuf, String> {
++fn resolve_target(paths_path: &Path, logical: &str) -> Result<process::Command, String> {
+     let raw = fs::read_to_string(paths_path)
+         .map_err(|e| format!("reading {}: {e}", paths_path.display()))?;
+     let map: HashMap<&str, &str> =
+         serde_json::from_str(&raw).map_err(|e| format!("parsing {}: {e}", paths_path.display()))?;
+-    map.get(logical)
+-        .map(PathBuf::from)
+-        .ok_or_else(|| format!("no entry for `{logical}` in {}", paths_path.display()))
++    let target = map
++        .get(logical)
++        .ok_or_else(|| format!("no entry for `{logical}` in {}", paths_path.display()))?;
++    let mut command = process::Command::new(target);
++    for name in ["CARGO", "RUSTC", "RUSTFMT"] {
++        if let Some(value) = map.get(name) {
++            command.env(name, value);
++        }
++    }
++    Ok(command)
+ }
+ 
+ #[cfg(unix)]
+-fn exec_replace(target: &Path) -> ! {
++fn exec_replace(mut command: process::Command) -> ! {
+     use std::os::unix::process::CommandExt;
+-    let err = process::Command::new(target)
+-        .args(env::args_os().skip(1))
+-        .exec();
+-    die(format!("exec {}: {err}", target.display()))
++    let err = command.args(env::args_os().skip(1)).exec();
++    die(format!(
++        "exec {}: {err}",
++        command.get_program().to_string_lossy()
++    ))
+ }
+ 
+ #[cfg(not(unix))]
+-fn exec_replace(target: &Path) -> ! {
+-    let status = process::Command::new(target)
++fn exec_replace(mut command: process::Command) -> ! {
++    let status = command
+         .args(env::args_os().skip(1))
+         .status()
+-        .unwrap_or_else(|e| die(format!("spawn {}: {e}", target.display())));
++        .unwrap_or_else(|e| {
++            die(format!(
++                "spawn {}: {e}",
++                command.get_program().to_string_lossy()
++            ))
++        });
+     process::exit(status.code().unwrap_or(1));
+ }
+ 
+@@ -103,11 +111,35 @@
+         )
+         .unwrap();
+         let out = resolve_target(&paths, "rust_analyzer").unwrap();
+-        assert_eq!(out, PathBuf::from("/abs/rust-analyzer"));
++        assert_eq!(out.get_program(), "/abs/rust-analyzer");
+         let _ = fs::remove_dir_all(&tmp);
+     }
+ 
+     #[test]
++    fn resolve_target_sets_only_declared_environment() {
++        let tmp = std::env::temp_dir().join(format!("launcher_env_{}", process::id()));
++        fs::create_dir_all(&tmp).unwrap();
++        let paths = tmp.join(PATHS_FILENAME);
++        fs::write(&paths, r#"{"rust_analyzer": "/ra", "CARGO": "/cargo", "RUSTC": "/rustc", "RUSTFMT": "/rustfmt", "PATH": "/ambient"}"#).unwrap();
++        let command = resolve_target(&paths, "rust_analyzer").unwrap();
++        let values: HashMap<_, _> = command.get_envs().collect();
++        assert_eq!(values.len(), 3);
++        assert_eq!(
++            values[std::ffi::OsStr::new("CARGO")],
++            Some(std::ffi::OsStr::new("/cargo"))
++        );
++        assert_eq!(
++            values[std::ffi::OsStr::new("RUSTC")],
++            Some(std::ffi::OsStr::new("/rustc"))
++        );
++        assert_eq!(
++            values[std::ffi::OsStr::new("RUSTFMT")],
++            Some(std::ffi::OsStr::new("/rustfmt"))
++        );
++        fs::remove_dir_all(tmp).unwrap();
++    }
++
++    #[test]
+     fn resolve_target_errors_on_missing_key_with_path_context() {
+         let tmp = std::env::temp_dir().join(format!("launcher_resolve_miss_{}", process::id()));
+         let _ = fs::remove_dir_all(&tmp);
+diff --git a/rust/private/rust_analyzer.bzl b/rust/private/rust_analyzer.bzl
+--- a/rust/private/rust_analyzer.bzl
++++ b/rust/private/rust_analyzer.bzl
+@@ -341,7 +341,16 @@
+         )
+     make_variable_info = platform_common.TemplateVariableInfo(make_vars)
+ 
++    inputs = [target for target in [ctx.attr.rust_analyzer, ctx.attr.proc_macro_srv, ctx.attr.rustc] if target]
++    files = depset(transitive = [target[DefaultInfo].files for target in inputs])
++    runfiles = ctx.runfiles(transitive_files = files).merge_all([
++        target[DefaultInfo].default_runfiles
++        for target in inputs
++    ])
++
+     toolchain = platform_common.ToolchainInfo(
++        files = files,
++        runfiles = runfiles,
+         proc_macro_srv = ctx.executable.proc_macro_srv,
+         rust_analyzer = ctx.executable.rust_analyzer,
+         rustc = ctx.executable.rustc,
+@@ -354,6 +363,7 @@
+     return [
+         make_variable_info,
+         toolchain,
++        DefaultInfo(files = files, runfiles = runfiles),
+     ]
+ 
+ rust_analyzer_toolchain = rule(
+@@ -404,19 +414,12 @@
+ def _current_rust_analyzer_toolchain_impl(ctx):
+     toolchain = ctx.toolchains[str(Label("@rules_rust//rust/rust_analyzer:toolchain_type"))]
+ 
+-    files = []
+-    if toolchain.rust_analyzer:
+-        files.append(toolchain.rust_analyzer)
+-    if toolchain.proc_macro_srv:
+-        files.append(toolchain.proc_macro_srv)
+-    if toolchain.rustc:
+-        files.append(toolchain.rustc)
+-
+     return [
+         toolchain,
+         toolchain.make_variables,
+         DefaultInfo(
+-            files = depset(files),
++            files = toolchain.files,
++            runfiles = toolchain.runfiles,
+         ),
+     ]
+ 

@@ -1,7 +1,5 @@
 common --enable_bzlmod
 common --lockfile_mode=error
-common --repo_env=PULSEBEAM_HOST_ENV
-build --action_env=PULSEBEAM_HOST_ENV
 build --disk_cache=~/.cache/pulsebeam/bazel/disk-cache
 build --incompatible_strict_action_env
 build --announce_rc
@@ -9,6 +7,8 @@ build --@rules_python//python/config_settings:bootstrap_impl=script
 build --@rules_rust//rust/settings:clippy.toml=//:clippy.toml
 build --@rules_rust//rust/settings:extra_rustc_flags=--cfg=tokio_unstable,--cfg=tracing_unstable,-Cforce-frame-pointers=yes
 build --@rules_rust//rust/settings:extra_exec_rustc_flags=--cfg=tokio_unstable,--cfg=tracing_unstable
+# Simulation runners fan out internally; keep live browser tests off those cores.
+test --local_test_jobs=1
 build:dev --compilation_mode=dbg
 build:dev --@rules_rust//rust/settings:extra_rustc_flags=--cfg=tokio_unstable,--cfg=tracing_unstable,-Cforce-frame-pointers=yes,-Cpanic=abort,-Cdebug-assertions=yes,-Coverflow-checks=yes
 build:profile --compilation_mode=opt

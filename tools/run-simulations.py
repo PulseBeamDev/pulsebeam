@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import time
 
 
 def names(binary, *flags):
@@ -40,11 +41,17 @@ def main():
     if args.from_seed is not None and not (0 <= args.from_seed <= args.from_seed + args.seeds - 1 < 2**64):
         parser.error("seed window must fit an unsigned 64-bit integer")
 
+    print(f"[simulation-run] cases={len(selected)} seeds={args.seeds} jobs={args.jobs} cpus={os.cpu_count()}", flush=True)
+
     def run(name, seed):
         env = os.environ.copy()
         if seed is not None:
             env["PULSEBEAM_SIM_SEED"] = str(seed)
+        # Measure in the runner, outside the child's virtualized clock.
+        started = time.perf_counter()
+        print(f"[simulation-timing] START {name} seed={seed if seed is not None else 'default'}", flush=True)
         result = subprocess.run([binary, "--exact", name, "--nocapture", "--test-threads=1"], env=env)
+        print(f"[simulation-timing] END {name} wall_seconds={time.perf_counter() - started:.3f}", flush=True)
         outcome = "PASS" if result.returncode == 0 else "FAIL"
         print(f"[simulation-result] {outcome} {name}", flush=True)
         if result.returncode:

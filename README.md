@@ -45,7 +45,7 @@ Install the [baseline OS prerequisites](docs/build.md#host-prerequisites), then:
 ```
 
 The checksum-verified launcher bootstraps the pinned Bazel version. Bazel supplies
-Rust 1.92.0, native compilation tools, Node/pnpm, matching WASM generators/runtime,
+Rust 1.99.0, native compilation tools, Node/pnpm, matching WASM generators/runtime,
 protobuf, Go, Python, and the pinned Chrome/Firefox executables and drivers.
 Initial downloads require network access; tests use local application fixtures.
 No pre-existing language/browser cache or independent tool installation is required.

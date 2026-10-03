@@ -1,5 +1,5 @@
-name: Set up the locked Linux OS environment
-description: Install Nix for the OS-only flake. Bazel owns language tools, builds and tests.
+name: Set up locked OS inputs
+description: Install Nix for Bazel-declared SDK and browser inputs. Bazel runs on the host.
 runs:
   using: composite
   steps:
