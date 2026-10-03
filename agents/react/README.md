@@ -114,6 +114,12 @@ pattern. User-media options changing while active request a replacement while
 retaining the old capture until success; display-media option changes never
 open a chooser automatically. `stop()` and unmount stop native tracks. Agent
 disconnect, source clearing, replacement and close never stop borrowed tracks.
+Use `camera.setEnabled(false)` or `microphone.setEnabled(false)` to send black
+video or silent audio without withdrawing the publication. Enablement is
+independent of capture, persists across source replacement, and can be set before
+capture arrives. `<Video source={camera}>` blanks the local preview while disabled.
+The SDK owns sender clones, so sharing capture across Agents does not share mute
+state. Use `setSource(null)` for publication withdrawal, not camera/microphone mute.
 Local handle labels and slots are reserved for the Agent's lifetime; exhausting
 capacity throws `LocalTrackCapacityError` synchronously.
 

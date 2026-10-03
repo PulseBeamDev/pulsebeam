@@ -262,7 +262,7 @@ struct EncodingConfig {
 struct LocalTrackState {
     track: MediaStreamTrack,
     config: SenderConfig,
-    muted: bool,
+    source_id: String,
 }
 
 impl DesiredConfig {
@@ -436,6 +436,8 @@ struct RuntimeInner {
     local_slots: BTreeMap<String, MediaKind>,
     local_operation_gates: BTreeMap<String, LocalOperationGate>,
     local_tracks: RefCell<BTreeMap<String, LocalTrackState>>,
+    local_muted: RefCell<BTreeMap<String, bool>>,
+    local_source_revisions: RefCell<BTreeMap<String, u64>>,
     peers: RefCell<BTreeMap<u64, Peer>>,
     requests: RefCell<BTreeMap<u64, AbortController>>,
     timers: RefCell<BTreeMap<u64, TimerHandle>>,
@@ -514,6 +516,8 @@ impl BrowserRuntime {
             local_slots,
             local_operation_gates,
             local_tracks: RefCell::new(BTreeMap::new()),
+            local_muted: RefCell::new(BTreeMap::new()),
+            local_source_revisions: RefCell::new(BTreeMap::new()),
             peers: RefCell::new(BTreeMap::new()),
             requests: RefCell::new(BTreeMap::new()),
             timers: RefCell::new(BTreeMap::new()),
@@ -736,6 +740,7 @@ impl RuntimeInner {
 
     fn request_close(&self) {
         self.closing.set(true);
+        self.stop_local_sources();
         let actor = self.actor.borrow();
         let Some(actor) = actor.as_ref() else {
             return;
@@ -747,6 +752,7 @@ impl RuntimeInner {
 
     fn request_abort(&self) {
         self.closing.set(true);
+        self.stop_local_sources();
         let actor = self.actor.borrow();
         let Some(actor) = actor.as_ref() else {
             self.shutdown();
@@ -779,11 +785,13 @@ impl RuntimeInner {
                 "local publication slot has no operation gate: {slot}"
             ))
         })?;
-        let _permit = gate.enter().await;
         self.ensure_local_operation_open()?;
+        let config = if track.is_some() {
+            normalize_sender_config(kind, config).map_err(LocalOperationError::validation)?
+        } else {
+            config
+        };
         if let Some(track) = &track {
-            let config =
-                normalize_sender_config(kind, config).map_err(LocalOperationError::validation)?;
             let expected = media_kind_name(kind);
             if track.kind() != expected {
                 return Err(LocalOperationError::validation(format!(
@@ -791,28 +799,56 @@ impl RuntimeInner {
                     track.kind()
                 )));
             }
+        }
+        let revision = {
+            let mut revisions = self.local_source_revisions.borrow_mut();
+            let current = revisions.entry(slot.clone()).or_default();
+            *current = current
+                .checked_add(1)
+                .ok_or_else(|| LocalOperationError::runtime("local source revision exhausted"))?;
+            *current
+        };
+        if track.is_none() {
+            if let Some(state) = self.local_tracks.borrow().get(&slot) {
+                state.track.stop();
+            }
+        }
+        let _permit = gate.enter().await;
+        self.ensure_local_operation_open()?;
+        if self.local_source_revisions.borrow().get(&slot) != Some(&revision) {
+            return Ok(());
+        }
+        let previous = if let Some(track) = &track {
             let muted = self
-                .local_tracks
+                .local_muted
                 .borrow()
                 .get(&slot)
-                .is_some_and(|state| state.muted);
+                .copied()
+                .unwrap_or(false);
+            let source_id = track.id();
+            let track = track.clone();
             track.set_enabled(!muted);
-            set_property(
+            if let Err(error) = set_property(
                 track.as_ref(),
                 "contentHint",
                 &JsValue::from_str(&config.content_hint),
-            )
-            .map_err(LocalOperationError::runtime)?;
+            ) {
+                track.stop();
+                return Err(LocalOperationError::runtime(error));
+            }
             self.local_tracks.borrow_mut().insert(
                 slot.clone(),
                 LocalTrackState {
-                    track: Clone::clone(track),
+                    track,
                     config,
-                    muted,
+                    source_id,
                 },
-            );
+            )
         } else {
-            self.local_tracks.borrow_mut().remove(&slot);
+            self.local_tracks.borrow_mut().remove(&slot)
+        };
+        if let Some(previous) = previous {
+            previous.track.stop();
         }
         self.sync_local_slot(&slot)
             .await
@@ -825,29 +861,19 @@ impl RuntimeInner {
         slot: String,
         muted: bool,
     ) -> Result<(), LocalOperationError> {
-        let gate = self.local_operation_gates.get(&slot).ok_or_else(|| {
-            LocalOperationError::validation(format!("unknown local publication slot: {slot}"))
-        })?;
-        let _permit = gate.enter().await;
         self.ensure_local_operation_open()?;
-        let track = {
-            let mut tracks = self.local_tracks.borrow_mut();
-            let state = tracks.get_mut(&slot).ok_or_else(|| {
-                LocalOperationError::validation(format!(
-                    "local publication slot has no track: {slot}"
-                ))
-            })?;
-            if state.muted == muted {
-                return Ok(());
-            }
-            state.muted = muted;
-            Clone::clone(&state.track)
-        };
-        track.set_enabled(!muted);
-        self.sync_local_slot(&slot)
-            .await
-            .map_err(LocalOperationError::runtime)?;
-        self.ensure_local_operation_open()
+        if !self.local_slots.contains_key(&slot) {
+            return Err(LocalOperationError::validation(format!(
+                "unknown local publication slot: {slot}"
+            )));
+        }
+        self.local_muted.borrow_mut().insert(slot.clone(), muted);
+        // Disabling must not wait for sender negotiation or disable RTP encodings:
+        // the owned clone sends black video/silent audio without unpublishing.
+        if let Some(state) = self.local_tracks.borrow().get(&slot) {
+            state.track.set_enabled(!muted);
+        }
+        Ok(())
     }
 
     async fn sync_local_slot(&self, slot: &str) -> Result<(), String> {
@@ -930,12 +956,25 @@ impl RuntimeInner {
         let sender_values = Array::new();
         for (slot, kind, sender) in senders {
             let sender_value = Object::new();
-            set(&sender_value, "slot", slot);
+            set(&sender_value, "slot", slot.clone());
             set(&sender_value, "kind", kind);
             set(
                 &sender_value,
                 "trackId",
                 sender.track().map(|track| track.id()),
+            );
+            set(
+                &sender_value,
+                "enabled",
+                sender.track().map(|track| track.enabled()),
+            );
+            set(
+                &sender_value,
+                "sourceTrackId",
+                self.local_tracks
+                    .borrow()
+                    .get(&slot)
+                    .map(|state| state.source_id.clone()),
             );
             set(&sender_value, "parameters", sender.get_parameters());
             sender_values.push(&sender_value);
@@ -1540,12 +1579,20 @@ impl RuntimeInner {
         }
     }
 
+    fn stop_local_sources(&self) {
+        for (_, state) in std::mem::take(&mut *self.local_tracks.borrow_mut()) {
+            state.track.stop();
+        }
+        self.local_muted.borrow_mut().clear();
+        self.local_source_revisions.borrow_mut().clear();
+    }
+
     fn shutdown(&self) {
         self.closing.set(true);
         if self.closed.replace(true) {
             return;
         }
-        self.local_tracks.borrow_mut().clear();
+        self.stop_local_sources();
         for (_, peer) in std::mem::take(&mut *self.peers.borrow_mut()) {
             peer.close();
         }
@@ -1769,11 +1816,7 @@ async fn apply_sender_parameters(
             }
             continue;
         }
-        set_property(
-            &value,
-            "active",
-            &JsValue::from_bool(config.active && !state.muted),
-        )?;
+        set_property(&value, "active", &JsValue::from_bool(config.active))?;
         set_optional_number(
             &value,
             "scaleResolutionDownBy",

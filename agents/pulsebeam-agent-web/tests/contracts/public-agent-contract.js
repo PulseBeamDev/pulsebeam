@@ -73,7 +73,11 @@ globalThis.__pulsebeamPublic = (async () => {
   const unsubscribeHandle = videoHandle.subscribe(() => {
     handleChanges += 1;
   });
+  videoHandle.setEnabled(false);
   videoHandle.setSource(capture);
+  const disabledBeforeCapture =
+    !videoHandle.enabled && videoHandle.source === capture && track.enabled;
+  videoHandle.setEnabled(true);
   let wrongLabelRejected = false;
   try {
     handleAgent.setState({
@@ -136,7 +140,8 @@ globalThis.__pulsebeamPublic = (async () => {
     capacity.label === "screen" &&
     capacity.capacity === 1 &&
     wrongLabelRejected &&
-    handleChanges === 3 &&
+    disabledBeforeCapture &&
+    handleChanges === 5 &&
     sourceRetained &&
     videoHandle.source === null &&
     closedHandleRejected &&
@@ -147,7 +152,7 @@ globalThis.__pulsebeamPublic = (async () => {
   });
   const latestOnly = first.getSnapshot().connection === "disconnected";
   await first.setLocalMuted("v0", true);
-  const muted = !track.enabled;
+  const muted = track.enabled;
   await first.setLocalMuted("v0", false);
   const unmuted = track.enabled;
   await first.replaceLocalTrack("v0", null, {
@@ -205,7 +210,7 @@ globalThis.__pulsebeamPublic = (async () => {
     connected: false,
     topics: [{ name: "presence", mode: "latest", publish: true }],
   });
-  const validationRejected = await first.setLocalMuted("v0", true).then(
+  const validationRejected = await first.setLocalMuted("missing", true).then(
     () => false,
     () => true,
   );

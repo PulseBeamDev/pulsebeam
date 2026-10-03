@@ -9,6 +9,21 @@
     token: "runtime-local-operation-contract",
     topology: { localVideos: 1 },
   });
+  const originalFetch = window.fetch;
+  window.fetch = (request, init) => {
+    if (
+      request instanceof Request &&
+      request.method === "POST" &&
+      new URL(request.url).origin === location.origin
+    ) {
+      return new Promise((_, reject) => {
+        const abort = () => reject(new DOMException("Aborted", "AbortError"));
+        if (request.signal.aborted) abort();
+        else request.signal.addEventListener("abort", abort, { once: true });
+      });
+    }
+    return originalFetch.call(window, request, init);
+  };
   runtime.connect();
 
   const waitFor = async (condition, label) => {
@@ -41,6 +56,16 @@
   const secondTrack = canvas.captureStream(1).getVideoTracks()[0];
   const thirdTrack = canvas.captureStream(1).getVideoTracks()[0];
   const originalSetParameters = RTCRtpSender.prototype.setParameters;
+  const originalReplaceTrack = RTCRtpSender.prototype.replaceTrack;
+  const originalClone = MediaStreamTrack.prototype.clone;
+  const ownedTracks = [];
+  const cloneSources = new WeakMap();
+  MediaStreamTrack.prototype.clone = function () {
+    const clone = originalClone.call(this);
+    ownedTracks.push(clone);
+    cloneSources.set(clone, this);
+    return clone;
+  };
   const releases = [];
   let parameterCalls = 0;
   let holdParameters = true;
@@ -77,8 +102,64 @@
       () =>
         `serialized operations: calls=${parameterCalls}, releases=${releases.length}, first=${firstSettled}, second=${secondSettled}`,
     );
-    const statistics = await runtime.statistics();
-    const finalTrackWins = statistics.senders[0]?.trackId === secondTrack.id;
+    const senderTrack = ownedTracks.at(-1);
+    const finalTrackWins =
+      cloneSources.get(senderTrack) === secondTrack &&
+      senderTrack.id !== secondTrack.id;
+    await runtime.set_local_muted("v0", true);
+    const disabledRetainsSender =
+      senderTrack.readyState === "live" &&
+      !senderTrack.enabled &&
+      secondTrack.enabled;
+    await runtime.replace_local_track("v0", null, { contentHint: "motion" });
+    await runtime.replace_local_track("v0", secondTrack, {
+      contentHint: "motion",
+    });
+    const stickyDisabled = !ownedTracks.at(-1).enabled;
+    await runtime.set_local_muted("v0", false);
+    const enabledAgain = ownedTracks.at(-1).enabled;
+
+    let pendingTrack;
+    let previousTrack;
+    let releaseReplacement;
+    RTCRtpSender.prototype.replaceTrack = function (track) {
+      previousTrack = this.track;
+      pendingTrack = track;
+      return new Promise((resolve, reject) => {
+        releaseReplacement = () =>
+          originalReplaceTrack.call(this, track).then(resolve, reject);
+      });
+    };
+    const replacing = runtime.replace_local_track("v0", thirdTrack, {
+      contentHint: "motion",
+    });
+    await waitFor(() => releaseReplacement, "blocked replacement");
+    const previousStoppedBeforeReplacement =
+      previousTrack.readyState === "ended";
+    await runtime.set_local_muted("v0", true);
+    const pendingDisabled = !pendingTrack.enabled && thirdTrack.enabled;
+    const clonesBeforeSuperseded = ownedTracks.length;
+    const superseded = runtime.replace_local_track("v0", firstTrack, {
+      contentHint: "motion",
+    });
+    const detaching = runtime.replace_local_track("v0", null, {
+      contentHint: "motion",
+    });
+    await waitFor(
+      () => pendingTrack.readyState === "ended",
+      "immediate detach",
+    );
+    const detachStopsOwnedOnly = thirdTrack.readyState === "live";
+    RTCRtpSender.prototype.replaceTrack = originalReplaceTrack;
+    releaseReplacement();
+    await withTimeout(
+      Promise.all([replacing, superseded, detaching]),
+      "replacement and detach",
+    );
+    const supersededSkipped = ownedTracks.length === clonesBeforeSuperseded;
+    await runtime.replace_local_track("v0", secondTrack, {
+      contentHint: "motion",
+    });
 
     holdParameters = true;
     const callsBeforeClosing = parameterCalls;
@@ -90,6 +171,9 @@
       "closing sender operation",
     );
     runtime.close();
+    const closeStopsOwnedImmediately =
+      ownedTracks.length > 0 &&
+      ownedTracks.every((track) => track.readyState === "ended");
     releases.at(-1)();
     const closeFenced = await withTimeout(
       closing.then(
@@ -108,12 +192,23 @@
 
     return {
       serializedBeforeRelease,
-      finalTrackWins,
-      closeFenced,
+      finalTrackWins:
+        finalTrackWins &&
+        disabledRetainsSender &&
+        stickyDisabled &&
+        enabledAgain &&
+        previousStoppedBeforeReplacement &&
+        pendingDisabled &&
+        detachStopsOwnedOnly &&
+        supersededSkipped,
+      closeFenced: closeFenced && closeStopsOwnedImmediately,
       postCloseFenced,
     };
   } finally {
     RTCRtpSender.prototype.setParameters = originalSetParameters;
+    RTCRtpSender.prototype.replaceTrack = originalReplaceTrack;
+    MediaStreamTrack.prototype.clone = originalClone;
+    window.fetch = originalFetch;
     runtime.abort();
     firstTrack.stop();
     secondTrack.stop();

@@ -258,6 +258,21 @@ impl Agent {
         &self.snapshot
     }
 
+    /// Whether accepted desired state publishes this local sender slot.
+    /// Media silence/blanking is a host operation, not publication withdrawal.
+    pub fn is_publishing(&self, slot: &MediaSlot) -> bool {
+        let name = match slot {
+            MediaSlot::LocalVideo(name) | MediaSlot::LocalAudio(name) => name,
+            MediaSlot::RemoteVideo(_) | MediaSlot::RemoteAudio(_) => return false,
+        };
+        self.config.topology.local_slot_kind(name) == Some(slot.kind())
+            && self
+                .desired
+                .publications
+                .iter()
+                .any(|publication| publication.slot == *name && publication.active)
+    }
+
     pub fn next_notification(&mut self) -> Option<Notification> {
         self.notifications.pop_front()
     }

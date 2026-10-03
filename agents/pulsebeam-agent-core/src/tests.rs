@@ -817,6 +817,38 @@ fn default_topology_reserves_distinct_counted_sender_slots() {
 }
 
 #[test]
+fn publishing_uses_only_accepted_local_publication_intent() {
+    let mut agent = Agent::new(config()).unwrap();
+    let video = MediaSlot::LocalVideo("v0".into());
+    assert!(!agent.is_publishing(&video));
+    let mut state = desired(1);
+    agent
+        .command(AgentCommand::ReplaceDesired(state.clone()))
+        .unwrap();
+    assert!(agent.is_publishing(&video));
+    assert!(!agent.is_publishing(&MediaSlot::LocalAudio("v0".into())));
+    assert!(!agent.is_publishing(&MediaSlot::RemoteVideo(0)));
+    state.revision = 2;
+    state.publications[0].label = "replacement".into();
+    assert!(
+        agent
+            .command(AgentCommand::ReplaceDesired(state.clone()))
+            .is_err()
+    );
+    assert!(agent.is_publishing(&video));
+    state.publications[0].label = "camera".into();
+    state.publications[0].active = false;
+    agent
+        .command(AgentCommand::ReplaceDesired(state.clone()))
+        .unwrap();
+    assert!(!agent.is_publishing(&video));
+    state.revision = 3;
+    state.publications.clear();
+    agent.command(AgentCommand::ReplaceDesired(state)).unwrap();
+    assert!(!agent.is_publishing(&video));
+}
+
+#[test]
 fn publication_label_is_bound_to_its_slot_even_after_desire_is_cleared() {
     let mut agent = Agent::new(config()).unwrap();
     let original = desired(1);

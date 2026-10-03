@@ -368,6 +368,10 @@
         before.peers.every((peer) => receiverPeers().includes(peer)),
       "UI traffic does not replace Agent transport",
     );
+    assert(
+      remoteVideos().length === before.videos.length,
+      "UI traffic does not duplicate remote video output",
+    );
     const topics = retainedTopics(before.peers);
     assert(
       topics.length === before.topics.length &&
@@ -400,11 +404,75 @@
       "real Meet video and automatic decoded audio",
     );
     assert(audioNodes().length === 1, "one audible output route");
+    assert(remoteVideos().length === 1, "one remote video output");
     assert(
       !/Enable audio|Retry playback|Unlock audio/i.test(
         document.body.innerText,
       ),
       "no playback unlock UI",
+    );
+    return true;
+  };
+  const enablement = async () => {
+    const { sender } = window.__meet;
+    const camera = sender.local.video("camera");
+    const microphone = sender.local.audio("microphone");
+    const video = currentVideo();
+    const stream = video.srcObject;
+    const track = stream.getVideoTracks()[0];
+    const identity = JSON.stringify(sender.getSnapshot().publications);
+    const pixel = document.createElement("canvas");
+    pixel.width = pixel.height = 1;
+    const context = pixel.getContext("2d");
+    const brightness = () => {
+      context.drawImage(video, 0, 0, 1, 1);
+      return Math.max(...context.getImageData(0, 0, 1, 1).data.slice(0, 3));
+    };
+    await wait(() => brightness() > 32, "colored video before disable");
+    mark();
+    camera.setEnabled(false);
+    sender.setState({
+      connected: true,
+      topics: [
+        { name: "chat", mode: "ordered", publish: true },
+        { name: "reactions", mode: "latest", publish: true },
+      ],
+    });
+    await wait(
+      () => brightness() < 8 && audible(),
+      "black video while audio continues",
+    );
+    assert(camera.source !== null, "camera disable retains capture");
+    assert(
+      JSON.stringify(sender.getSnapshot().publications) === identity,
+      "disable and unrelated intent retain publication identities",
+    );
+    assert(
+      currentVideo() === video &&
+        video.srcObject === stream &&
+        stream.getVideoTracks()[0] === track,
+      "black frames retain receiver and DOM identity",
+    );
+    camera.setEnabled(true);
+    await wait(
+      () => brightness() > 32 && audible(),
+      "camera resumes without reattachment",
+    );
+    await continuity();
+    const routes = routeChanges;
+    microphone.setEnabled(false);
+    await wait(() => !audible(), "disabled microphone decodes silence");
+    assert(
+      microphone.source !== null &&
+        audioNodes().length === 1 &&
+        routeChanges === routes,
+      "microphone disable retains capture and audio route",
+    );
+    microphone.setEnabled(true);
+    await wait(() => audible(), "microphone resumes without route reset");
+    assert(
+      JSON.stringify(sender.getSnapshot().publications) === identity,
+      "media enablement never withdraws publications",
     );
     return true;
   };
@@ -427,6 +495,10 @@
     );
     retainedTopics(replacements());
     assert(
+      remoteVideos().length === 1,
+      "replacement has no duplicate remote video output",
+    );
+    assert(
       audioNodes().length === 1,
       "replacement has no duplicate audio output",
     );
@@ -445,6 +517,7 @@
     ready,
     mark,
     continuity,
+    enablement,
     recovered,
     receiverPeers,
     audioNodes,

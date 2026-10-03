@@ -30,19 +30,25 @@ export function useRoomMedia(
   const screen = agent.local.video("screen");
 
   useEffect(() => {
-    camera.setSource(cameraOn ? sources.videoTrack : null);
-  }, [camera, cameraOn, sources.videoTrack]);
+    camera.setEnabled(cameraOn);
+  }, [camera, cameraOn]);
   useEffect(() => {
-    microphone.setSource(micOn ? sources.audioTrack : null);
-  }, [microphone, micOn, sources.audioTrack]);
+    camera.setSource(sources.videoTrack);
+  }, [camera, sources.videoTrack]);
+  useEffect(() => {
+    microphone.setEnabled(micOn);
+  }, [microphone, micOn]);
+  useEffect(() => {
+    microphone.setSource(sources.audioTrack);
+  }, [microphone, sources.audioTrack]);
   useEffect(() => {
     screen.setSource(displayTrack);
   }, [screen, displayTrack]);
   useEffect(
     () => () => {
-      screen.setSource(null);
-      camera.setSource(null);
-      microphone.setSource(null);
+      for (const handle of [screen, camera, microphone]) {
+        if (handle.source !== null) handle.setSource(null);
+      }
       stopDisplay();
     },
     [camera, stopDisplay, microphone, screen],

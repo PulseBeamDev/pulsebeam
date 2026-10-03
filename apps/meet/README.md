@@ -15,7 +15,10 @@ served application. Playback-policy cases cover ordinary gestures both before
 and after remote media arrives. Topic-continuity checks observe playback throughout
 outbound and inbound chat/reactions, rejecting even a transient same-stream detach
 that is restored before the final check. Capture, device replacement, and Agent
-ownership are also tested by the React SDK and Web runtime owners.
+ownership are also tested by the React SDK and Web runtime owners. Camera and
+microphone controls use handle enablement, not source detachment. The real Meet
+contract checks decoded black video and silent audio with unchanged publication,
+receiver, playback element, and audio-route identities.
 
 ## Media and topics
 
@@ -24,9 +27,9 @@ consumers. Reconnect retains logical media consumers, receive policies, local
 publications, and topic subscriptions. Replacement receivers restore playback
 without remounting or a separate repair control.
 
-Remote audio policy is internal to the shared SDK. Joining, toggling the
-microphone or camera, opening settings, sending chat, and leaving are ordinary
-user interactions that retry blocked playback. Meet has no audio-unlock button
+Remote audio policy is internal to the shared SDK. Ordinary room interactions,
+such as toggling the microphone or camera, opening settings, and sending chat,
+retry blocked playback. Meet has no audio-unlock button
 or repair banner. `NotAllowedError` is retriable; missing or failed audio sinks
 remain observable through the Web runtime's diagnostics rather than a bespoke
 application repair state.

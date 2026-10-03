@@ -72,7 +72,7 @@ export function Video({
   );
   const localSource = useSyncExternalStore(
     subscribeLocal,
-    () => local?.source ?? captured,
+    () => (local ? (local.enabled ? local.source : null) : captured),
     () => null,
   );
 

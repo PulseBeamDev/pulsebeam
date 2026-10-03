@@ -60,6 +60,13 @@ export async function runOwnershipContract() {
       firstVideo !== secondVideo &&
       firstVideo.source === source &&
       secondVideo.source === source;
+    firstVideo.setEnabled(false);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    const independentEnablement =
+      !firstVideo.enabled &&
+      secondVideo.enabled &&
+      track.enabled &&
+      firstVideo.source === source;
     first.disconnect();
     const disconnectRetainsSource =
       firstVideo.source === source && track.readyState === "live";
@@ -84,7 +91,8 @@ export async function runOwnershipContract() {
       track.readyState === "live";
     track.stop();
     return {
-      ownedIndependent: shared && disconnectRetainsSource,
+      ownedIndependent:
+        shared && independentEnablement && disconnectRetainsSource,
       ownedRenewal: renewedWithoutReplacing,
       ownedReplacement: replacedConstruction,
       ownedCleanup: ownedCleanup && String(track.readyState) === "ended",

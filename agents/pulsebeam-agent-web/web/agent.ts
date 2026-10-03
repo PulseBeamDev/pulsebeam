@@ -20,6 +20,7 @@ import type {
   MappingSnapshot,
   Participant,
   Publication,
+  PublicationIntent,
   RemoteTrack,
   LocalMedia,
   RemoteMedia,
@@ -259,19 +260,37 @@ export class LocalTrackCapacityError extends RangeError {
 
 class LocalTrackHandle<K extends "video" | "audio", S extends CapturedTrack> {
   #source: S | null = null;
+  #enabled = true;
+  #closed = false;
   #listeners = new Set<() => void>();
 
   constructor(
     readonly kind: K,
     readonly label: string,
     private readonly apply: (source: S | null) => void,
+    private readonly applyEnabled: (enabled: boolean) => void,
   ) {}
 
   get source(): S | null {
     return this.#source;
   }
 
+  get enabled(): boolean {
+    return this.#enabled;
+  }
+
+  setEnabled(enabled: boolean): void {
+    if (this.#closed) throw new Error("agent is closed");
+    if (typeof enabled !== "boolean")
+      throw new TypeError("enabled must be a boolean");
+    if (enabled === this.#enabled) return;
+    this.applyEnabled(enabled);
+    this.#enabled = enabled;
+    for (const listener of this.#listeners) listener();
+  }
+
   setSource(source: S | null): void {
+    if (this.#closed) throw new Error("agent is closed");
     if (source === this.#source) return;
     this.apply(source);
     this.#source = source;
@@ -284,6 +303,7 @@ class LocalTrackHandle<K extends "video" | "audio", S extends CapturedTrack> {
   }
 
   clear(): void {
+    this.#closed = true;
     this.#source = null;
     for (const listener of this.#listeners) listener();
     this.#listeners.clear();
@@ -296,8 +316,8 @@ class AgentFacade implements Agent {
   #eventListeners = new Set<(event: AgentEvent) => void>();
   #state: AgentState = copyState({ connected: false });
   #runtime: Runtime | undefined;
-  #localOperations = new Map<string, Promise<void>>();
-  #localTracks = new Map<string, MediaStreamTrack>();
+  #localSourcePresent = new Map<string, boolean>();
+  #localMuted = new Map<string, boolean>();
   #localVideoHandles = new Map<
     string,
     LocalTrackHandle<"video", CapturedVideoTrack>
@@ -307,6 +327,7 @@ class AgentFacade implements Agent {
     LocalTrackHandle<"audio", CapturedAudioTrack>
   >();
   #reservedSlots = new Map<string, string>();
+  #localPublications = new Map<string, PublicationIntent>();
   readonly #remote: RemoteCatalog;
   readonly #topics: TopicRegistry;
   #managedVideo: readonly VideoDemand[] = [];
@@ -469,8 +490,13 @@ class AgentFacade implements Agent {
     ) {
       throw new TypeError(`reserved ${kind} slot ${slot} is already in use`);
     }
-    const handle = new LocalTrackHandle<K, S>(kind, label, (source) =>
-      this.#setLocalSource(kind, slot, label, source),
+    const handle = new LocalTrackHandle<K, S>(
+      kind,
+      label,
+      (source) => this.#setLocalSource(kind, slot, label, source),
+      (enabled) => {
+        void this.setLocalMuted(slot, !enabled).catch(() => {});
+      },
     );
     handles.set(label, handle);
     this.#reservedSlots.set(slot, label);
@@ -485,15 +511,9 @@ class AgentFacade implements Agent {
   ): void {
     if (this.#closed) throw new Error("agent is closed");
     const track = source === null ? null : nativeCaptureTrack(source, kind);
-    this.setState({
-      ...this.#state,
-      publications: [
-        ...(this.#state.publications ?? []).filter(
-          (publication) => publication.slot !== slot,
-        ),
-        ...(track ? [{ slot, label, active: true }] : []),
-      ],
-    });
+    if (track) this.#localPublications.set(slot, { slot, label, active: true });
+    else this.#localPublications.delete(slot);
+    this.#applyState(this.#state);
     void this.replaceLocalTrack(
       slot,
       track,
@@ -544,6 +564,12 @@ class AgentFacade implements Agent {
     }
     return {
       ...state,
+      publications: [
+        ...(state.publications ?? []).filter(
+          ({ slot }) => !this.#reservedSlots.has(slot),
+        ),
+        ...this.#localPublications.values(),
+      ],
       video: [
         ...(state.video ?? []),
         ...this.#managedVideo.filter(({ slot }) => !usedSlots.has(slot)),
@@ -576,6 +602,7 @@ class AgentFacade implements Agent {
     track: MediaStreamTrack | null,
     config: SenderConfig,
   ): Promise<void> {
+    if (this.#closed) return Promise.reject(new Error("agent is closed"));
     const sender = Object.freeze({
       contentHint: config.contentHint,
       degradationPreference: config.degradationPreference,
@@ -585,22 +612,19 @@ class AgentFacade implements Agent {
         ),
       ),
     });
-    return this.#queueLocal(slot, async (runtime) => {
+    this.#localSourcePresent.set(slot, track !== null);
+    return this.#runLocal(async (runtime) => {
+      await runtime.set_local_muted(slot, this.#effectiveLocalMuted(slot));
       await runtime.replace_local_track(slot, track, sender);
       this.#requireCurrentRuntime(runtime);
-      if (track) {
-        this.#localTracks.set(slot, track);
-      } else {
-        this.#localTracks.delete(slot);
-      }
     });
   }
 
   setLocalMuted(slot: string, muted: boolean): Promise<void> {
-    return this.#queueLocal(slot, async (runtime) => {
-      await runtime.set_local_muted(slot, muted);
-      const track = this.#localTracks.get(slot);
-      if (track) track.enabled = !muted;
+    if (this.#closed) return Promise.reject(new Error("agent is closed"));
+    this.#localMuted.set(slot, muted);
+    return this.#runLocal(async (runtime) => {
+      await runtime.set_local_muted(slot, this.#effectiveLocalMuted(slot));
     });
   }
 
@@ -639,13 +663,14 @@ class AgentFacade implements Agent {
     this.#topics.close();
     this.#remote.close();
     this.#state = copyState({ connected: false });
-    this.#localOperations.clear();
-    this.#localTracks.clear();
+    this.#localSourcePresent.clear();
+    this.#localMuted.clear();
     for (const handle of this.#localVideoHandles.values()) handle.clear();
     for (const handle of this.#localAudioHandles.values()) handle.clear();
     this.#localVideoHandles.clear();
     this.#localAudioHandles.clear();
     this.#reservedSlots.clear();
+    this.#localPublications.clear();
     this.#publish(emptySnapshot("disconnected"));
     this.#listeners.clear();
     this.#eventListeners.clear();
@@ -657,40 +682,28 @@ class AgentFacade implements Agent {
     return this.#runtime;
   }
 
-  #queueLocal(
-    slot: string,
-    operation: (runtime: Runtime) => Promise<void>,
-  ): Promise<void> {
+  #effectiveLocalMuted(slot: string): boolean {
+    return (
+      this.#localSourcePresent.get(slot) === false ||
+      (this.#localMuted.get(slot) ?? false)
+    );
+  }
+
+  #runLocal(operation: (runtime: Runtime) => Promise<void>): Promise<void> {
     if (this.#closed) return Promise.reject(new Error("agent is closed"));
-    const prior = this.#localOperations.get(slot) ?? Promise.resolve();
-    const current = prior
-      .catch(() => {})
-      .then(async () => {
-        const runtime = await this.#ready;
-        if (this.#closed || runtime !== this.#runtime) {
-          throw new Error("agent is closed");
-        }
+    return this.#ready
+      .then(async (runtime) => {
+        this.#requireCurrentRuntime(runtime);
         await operation(runtime);
         this.#requireCurrentRuntime(runtime);
       })
       .catch((error: unknown) => {
-        if (this.#closed) {
-          throw new Error("agent is closed");
-        }
-        if (!this.#closed && this.#snapshot.failure === null) {
+        if (this.#closed) throw new Error("agent is closed");
+        if (this.#snapshot.failure === null) {
           this.#emitFailure(localFailureClass(error), message(error));
         }
         throw error;
       });
-    this.#localOperations.set(slot, current);
-    void current
-      .finally(() => {
-        if (this.#localOperations.get(slot) === current) {
-          this.#localOperations.delete(slot);
-        }
-      })
-      .catch(() => {});
-    return current;
   }
 
   #requireCurrentRuntime(runtime: Runtime): void {

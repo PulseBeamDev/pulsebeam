@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
@@ -616,7 +616,6 @@ struct Actor {
     outgoing_media_rx: mpsc::UnboundedReceiver<OutgoingMedia>,
     ingress_loss: HashMap<(Mid, Option<Rid>), Option<f32>>,
     observers: BTreeMap<MediaSlot, Vec<Observer>>,
-    active_publications: BTreeSet<MediaSlot>,
     close_waiters: Vec<oneshot::Sender<Result<(), Error>>>,
 }
 
@@ -665,7 +664,6 @@ impl Actor {
             outgoing_media_rx,
             ingress_loss: HashMap::new(),
             observers: BTreeMap::new(),
-            active_publications: BTreeSet::new(),
             close_waiters: Vec::new(),
         }
     }
@@ -773,39 +771,10 @@ impl Actor {
     fn handle_command(&mut self, command: Command) {
         match command {
             Command::ReplaceDesired { desired, response } => {
-                let publications = desired
-                    .publications
-                    .iter()
-                    .filter(|publication| publication.active)
-                    .filter_map(|publication| {
-                        if self
-                            .config
-                            .session
-                            .topology
-                            .local_slot_kind(&publication.slot)
-                            == Some(agent_core::MediaKind::Video)
-                        {
-                            Some(MediaSlot::LocalVideo(publication.slot.clone()))
-                        } else if self
-                            .config
-                            .session
-                            .topology
-                            .local_slot_kind(&publication.slot)
-                            == Some(agent_core::MediaKind::Audio)
-                        {
-                            Some(MediaSlot::LocalAudio(publication.slot.clone()))
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
                 let result = self
                     .core
                     .command(AgentCommand::ReplaceDesired(desired))
                     .map_err(Error::Core);
-                if result.is_ok() {
-                    self.active_publications = publications;
-                }
                 let _ = response.send(result);
             }
             Command::RenewAuthorization { token, response } => {
@@ -1548,7 +1517,7 @@ impl Actor {
         encoding: Option<&str>,
         frame: &MediaFrame,
     ) -> Result<(Generation, Vec<RtpPacket>), Error> {
-        if !self.active_publications.contains(slot) {
+        if !self.core.is_publishing(slot) {
             return Err(Error::InactiveSlot(slot.clone()));
         }
         let generation = self

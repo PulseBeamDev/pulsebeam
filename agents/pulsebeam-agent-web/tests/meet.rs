@@ -108,6 +108,8 @@ async fn meet_media_contract(gesture_before_media: bool) -> TestResult<()> {
             click(&driver, "Chat").await?;
         }
         let _: bool = evaluate_json(&bidi, &context, "__meet.ready()").await?;
+        eprintln!("Meet stage: media enablement retains identity");
+        let _: bool = evaluate_json(&bidi, &context, "__meet.enablement()").await?;
         let baseline: Vec<Vec<u8>> = evaluate_json(&bidi, &context, "__meet.mark()").await?;
         let baseline = observed_intents(baseline)?.pop().ok_or("missing baseline receive intent")?;
         let desired = baseline.receive.and_then(|receive| receive.video).ok_or("missing baseline video intent")?;
@@ -151,6 +153,14 @@ async fn meet_media_contract(gesture_before_media: bool) -> TestResult<()> {
             catch (error) { rejected = String(error).includes('remote stream tracks changed'); }
             __meet.assert(rejected, 'oracle rejects same-stream detach/re-add even when restored before sampling');
             await __meet.ready();
+            const duplicate = document.createElement('video');
+            duplicate.srcObject = stream;
+            document.body.append(duplicate);
+            rejected = false;
+            try { await __meet.ready(); }
+            catch (error) { rejected = String(error).includes('one remote video output'); }
+            finally { duplicate.remove(); duplicate.srcObject = null; }
+            __meet.assert(rejected, 'oracle rejects duplicate remote video output');
             return true;
         })()"#).await?;
         eprintln!("Meet stage: explicit reconnect");

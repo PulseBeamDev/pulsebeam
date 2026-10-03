@@ -56,6 +56,9 @@ const source = createCaptureSource(stream.getVideoTracks()[0], "video");
 const camera = agent.local.video("camera");
 camera.setSource(source);
 agent.connect();
+// Keep publication identity while sending black video.
+camera.setEnabled(false);
+camera.setEnabled(true);
 // Later: disconnect without ending capture, or detach without releasing the label.
 agent.disconnect();
 camera.setSource(null);
@@ -66,7 +69,12 @@ agent.close();
 `agent.local.audio(label)` reserves a separate audio namespace; repeated lookups
 return the same handle. Capacity exhaustion throws `LocalTrackCapacityError`
 with `kind`, `label`, and `capacity`, even after clearing a source. Another
-Agent may borrow the same source. `@pulsebeam/react` owns capture and Agent
+Agent may borrow the same source. Each runtime owns a clone for its sender,
+so disabling one handle never disables another Agent or the original capture.
+`setEnabled(false)` retains the source and publication, sending black video or
+silent audio. It survives source replacement and detachment; `setSource(null)`
+explicitly withdraws the publication. Handle publications remain managed even
+when low-level `setState` replaces unrelated intent. `@pulsebeam/react` owns capture and Agent
 lifecycle for typical React applications.
 
 `createAgent()` is synchronous and safe to call while its private WASM module
@@ -92,8 +100,10 @@ sender configuration; explicit video and audio settings contain three and one
 encoding entries respectively. Sender settings are ignored when detaching with
 a `null` track. Capture tracks remain owned by the caller: replacement and
 `close()` detach them but never stop them.
-Local-track operations are serialized per slot so an older replacement cannot
-become the final attachment after a newer one.
+The runtime serializes sender attachment per slot and discards superseded
+queued replacements. Disabling and detaching silence owned clones without
+waiting for a pending sender operation; replacement and close stop owned clones,
+never the caller’s capture.
 
 Logging is configured independently for each agent with `logging.level`.
 Messages use the browser console. The default level is `warn`. Chrome hides

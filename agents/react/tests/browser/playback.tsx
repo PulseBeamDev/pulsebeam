@@ -26,9 +26,17 @@ export async function runPlaybackContract() {
   const second = canvas.captureStream().getVideoTracks()[0];
   let capture: LocalVideoTrack["source"] = createCaptureSource(first, "video");
   const listeners = new Set<() => void>();
+  let enabled = true;
   const local = {
     kind: "video" as const,
     label: "camera",
+    get enabled() {
+      return enabled;
+    },
+    setEnabled(value: boolean) {
+      enabled = value;
+      listeners.forEach((listener) => listener());
+    },
     get source() {
       return capture;
     },
@@ -74,6 +82,21 @@ export async function runPlaybackContract() {
     firstElement.muted &&
     firstElement.playsInline &&
     firstElement.style.transform.includes("scaleX(-1)");
+  local.setEnabled(false);
+  await waitFor(
+    () => firstElement.srcObject === null,
+    "disabled local preview blanks",
+  );
+  const disabledPreview =
+    host.querySelector("video") === firstElement &&
+    local.source !== null &&
+    first.enabled;
+  local.setEnabled(true);
+  await waitFor(
+    () => firstElement.srcObject instanceof MediaStream,
+    "enabled local preview resumes",
+  );
+  const resumedStream = firstElement.srcObject as MediaStream;
   const originalPlay = HTMLMediaElement.prototype.play;
   blocked = undefined;
   let attempts = 0;
@@ -88,7 +111,8 @@ export async function runPlaybackContract() {
     await new Promise((resolve) => setTimeout(resolve, 30));
     const playbackRetained =
       host.querySelector("video") === firstElement &&
-      firstElement.srcObject === firstStream &&
+      firstElement.srcObject === resumedStream &&
+      disabledPreview &&
       listeners.size === 1 &&
       attempts === 0;
     local.setSource(createCaptureSource(second, "video"));

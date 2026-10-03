@@ -9,6 +9,8 @@ export interface LocalVideoTrack {
   readonly kind: "video";
   readonly label: string;
   readonly source: CapturedVideoTrack | null;
+  readonly enabled: boolean;
+  setEnabled(enabled: boolean): void;
   setSource(source: CapturedVideoTrack | null): void;
   subscribe(listener: () => void): () => void;
 }
@@ -17,6 +19,8 @@ export interface LocalAudioTrack {
   readonly kind: "audio";
   readonly label: string;
   readonly source: CapturedAudioTrack | null;
+  readonly enabled: boolean;
+  setEnabled(enabled: boolean): void;
   setSource(source: CapturedAudioTrack | null): void;
   subscribe(listener: () => void): () => void;
 }
