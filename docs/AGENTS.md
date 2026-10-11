@@ -1,12 +1,14 @@
 # PulseBeam documentation agent guide
 
-Applies directly to `docs/**` and, through the root `AGENTS.md`, to `README.md` files throughout the repository. Follow the root and any nearer `AGENTS.md` too. Use the shared editorial rules for all documentation; **VitePress-specific instructions apply only to `docs/**`**.
+Applies directly to `docs/**` and, through the root `AGENTS.md`, to `README.md` files throughout the repository. Follow the root and any nearer `AGENTS.md` too. Use every shared rule below for all documentation; **VitePress-specific instructions apply only to `docs/**`**. This file is self-contained: no external style guide is required.
 
 ## Goal
 
 Write for the actual reader. Public docs usually serve application developers who can build software but may not know WebRTC; package READMEs may instead serve SDK integrators, contributors, or maintainers. Help them reach a working outcome without requiring irrelevant PulseBeam or WebRTC internals.
 
-Optimize for **time to successful task completion and correct understanding**, not page length, reading-grade scores, or diagram count. Favor the simplest supported path, then reveal advanced detail through links.
+Optimize for **time to successful task completion and correct understanding**, not page length, reading-grade scores, or diagram count. Favor the simplest supported path; link to deeper local documentation only when the reader actually needs it.
+
+When goals conflict, prioritize **technical correctness and safety**, then **task completion**, then **clarity**, then **brevity** and visual polish. Never sacrifice a required limitation or warning merely to make a page shorter.
 
 ## Before writing
 
@@ -17,7 +19,7 @@ Optimize for **time to successful task completion and correct understanding**, n
 
 ## Choose the right page type
 
-Use [Diátaxis](https://diataxis.fr/) as an editorial decision tool, **not** as a mandatory four-section navigation or rigid README template. A README is often an entry point mixing a short overview, quickstart, development commands, and links to deeper pages.
+Choose a page's shape from the reader's question, not from the implementation's module layout. These are four distinct writing modes, **not** mandatory website sections or rigid README templates. A README is often an entry point mixing a short overview, quickstart, development commands, and links to deeper pages.
 
 | Reader need | Page type | Write it this way |
 | --- | --- | --- |
@@ -26,7 +28,7 @@ Use [Diátaxis](https://diataxis.fr/) as an editorial decision tool, **not** as 
 | "What exactly does X do?" | **Reference** | Complete, precise API/CLI/configuration contracts, defaults, limits, and errors |
 | "Why does it work this way?" | **Explanation** | Mental models, architecture, rationale, and tradeoffs |
 
-Keep these purposes distinct. Do not interrupt a procedure with architecture essays or force a narrative into reference material. Link to the appropriate page instead. Organize navigation and titles around developer goals (for example, "Publish video"), not internal subsystems they do not yet know.
+Keep these purposes distinct in full documentation pages. Do not interrupt a procedure with architecture essays or force a narrative into reference material. Link to the appropriate page instead. Organize navigation and titles around developer goals (for example, "Publish video"), not internal subsystems they do not yet know. A README may combine a short orientation and onboarding path, then link to specialized pages.
 
 ## Prefer the clearest representation
 
@@ -42,26 +44,40 @@ Keep these purposes distinct. Do not interrupt a procedure with architecture ess
 | What does this UI look like? | Current, annotated screenshot when necessary |
 | What is one simple idea? | One or two clear sentences |
 
-A diagram should **replace** a difficult explanation, not repeat it. Show the minimum necessary actors and relationships; split crowded diagrams into overview and detail. Label protocols and directions accurately, especially HTTP signaling versus WebRTC media/data. Never suggest timing, delivery, or ordering guarantees the implementation does not provide.
+A diagram should **replace** a difficult explanation, not repeat it. Before adding one, state the question it answers; if one sentence or a small code sample works as well, use that instead. Show the minimum necessary actors and relationships; split crowded diagrams into overview and detail. Label protocols and directions accurately, especially HTTP signaling versus WebRTC media/data. Never suggest timing, delivery, or ordering guarantees the implementation does not provide.
 
 For `docs/**`, use the site's existing fenced `mermaid` support for source-controlled diagrams. For READMEs elsewhere, use only diagram and asset formats supported by their actual renderers (such as GitHub and package registries); do not assume VitePress extensions work. Add a concise textual takeaway and accessible description. Check mobile readability, contrast, and light/dark rendering when preview is available. Prefer a short explanation to an unreadable diagram.
 
 ## Write for scanning and action
 
-- Lead with the **outcome** and the recommended path. State prerequisites before commands, expected results after them, and next steps at the end.
-- Use descriptive, task-oriented headings; direct, active, second-person language; short paragraphs; and familiar terms. Explain jargon at first use without renaming real technical concepts.
-- Cut marketing copy, filler, repetitive summaries, unnecessary alternatives, and implementation detail unrelated to the reader's goal.
-- Give one default path. Present alternatives only when a real constraint or tradeoff makes them useful.
-- Prefer specific statements over vague claims such as "easy," "fast," "seamless," or "production-ready." Be explicit about limitations and failure modes.
-- Keep API names, `RoomId`/`ParticipantId` terminology, track labels, and protocol names consistent with the actual code.
+- Start with **what the reader will accomplish**, then the recommended path. Put prerequisites **before** commands, expected results **after** them, and a useful next step at the end.
+- Use **sentence-case, task-oriented headings** that make sense in search results and a table of contents: prefer "Publish a video track" to "Video overview." A concept page may use a question or named concept instead.
+- Address the reader as "you"; use active voice and present tense where accurate. Use short sentences and paragraphs. Give each paragraph one job. Define unfamiliar terms at first use without inventing substitute names for protocol concepts.
+- Make instructions unambiguous: say **what to run, where to run it, what to replace, and how to tell whether it worked**. Write commands in copyable fenced blocks with a language tag, and put expected output in separate blocks or prose.
+- Use descriptive links ("Deploy PulseBeam" rather than "click here") and link to the most specific local destination. Do not make readers repeatedly follow links to finish a basic task.
+- Cut marketing copy, filler, repetitive summaries, unnecessary alternatives, and implementation detail unrelated to the reader's goal. Give one default path; mention alternatives only when a meaningful decision changes.
+- Replace vague adjectives ("easy," "fast," "seamless," "production-ready") with testable behavior, exact constraints, or explicitly measured evidence.
+- Keep public types, `RoomId`/`ParticipantId` terminology, track labels, and protocol names consistent with the owning code. Do not rename technical concepts merely to simplify prose.
+- Use lists for steps, tables for genuine comparisons, and callouts for important warnings—not for decoration. Prefer a focused page over an exhaustive one; move unrelated deep dives to their own pages.
+
+### Concrete writing examples
+
+| Avoid | Prefer |
+| --- | --- |
+| Heading: "Authentication" followed by an essay | Heading: "Create a participant token" followed by the actual command, required inputs, and where to use the result |
+| "Run the server. It should work." | Exact supported command, runtime assumptions, and an observable success signal |
+| A paragraph enumerating many message exchanges | A minimal sequence diagram with labeled arrows and one-sentence takeaway |
+| "See the API" when a task needs one method | Show the minimal verified method call, then link to the complete API contract |
+| Claiming a feature "just works" | State the supported environment, protocol boundary, and known restrictions |
 
 ## Make examples trustworthy
 
 - In application-facing documentation, use the public SDK for the simplest supported task. Drop to raw WebRTC, WHIP/WHEP, or native signaling only when intentionally teaching that integration level. In package READMEs, prefer the owning package's canonical integration, build, or test commands.
-- Provide runnable, copyable examples with required imports, setup, authentication, cleanup, and environment assumptions. For intentionally partial snippets, name the omissions; label pseudocode explicitly.
+- Provide runnable, copyable examples with required imports, setup, authentication, cleanup, and environment assumptions. Choose one idiomatic language/platform per task unless the reader needs to compare implementations. For intentionally partial snippets, name the omissions; label pseudocode explicitly.
 - Show how to confirm success, and include the common failure or diagnostic that blocks that task. Troubleshooting should connect **symptom → likely cause → action → verification**.
 - Keep signing secrets and privileged credentials on the server; use unmistakable placeholders rather than real keys.
 - Do not conflate native SDK signaling with WHIP/WHEP behavior. Document protocol-specific differences and unsupported features precisely.
+- Keep examples small but complete enough to reproduce. Avoid imaginary helpers, unspecified dependency versions, hidden prerequisites, or placeholders that resemble real credentials.
 - Validate examples against the current SDK and server whenever practical. Do not claim a sample was executed unless it was.
 
 ## Page patterns
@@ -76,19 +92,10 @@ Do not copy full reference sections into task pages. Link to the canonical sourc
 
 ## Review and verification
 
-1. **Accuracy:** trace every technical claim, example, number, and diagram edge to the owning implementation or test. Flag anything unverified.
-2. **Usability:** follow the page as its intended reader. Can they identify the first action, copy the example, recognize success, and recover from a likely failure? Remove needless conceptual detours.
-3. **Presentation:** check links, headings, table layout, diagram syntax, and accessible text in the intended renderer. For `docs/**` only, follow existing VitePress Markdown/frontmatter conventions and update `docs/.vitepress/config.mts` for public page changes; keep agent guidance out of public routes.
+1. **Accuracy:** trace every technical claim, example, number, and diagram edge to the owning implementation or test. Check version, release status, exact arguments, required permissions, error behavior, and security boundaries. Flag anything unverified.
+2. **Usability:** follow the page as its intended reader. Can they identify the first action, copy the example, recognize success, and recover from a likely failure? Remove needless conceptual detours, repeated information, and visuals that convey nothing new.
+3. **Presentation:** check links, heading hierarchy, fenced-code language tags, table layout, diagram syntax, and accessible alt text or equivalent explanation in the intended renderer. Do not communicate meaning with color alone. For `docs/**` only, follow existing VitePress Markdown/frontmatter conventions and update `docs/.vitepress/config.mts` for public page changes; keep agent guidance out of public routes.
 4. **Build:** for `docs/**`, run `./bazel test //docs:check` when possible and preview complex diagrams with `./bazel run //:docs_dev` when needed. For other READMEs, use the owning package's relevant checks. Neither a docs build nor a Markdown render proves code examples run—test those separately when practical.
 5. **Handoff:** report the edits, exact checks performed, untested examples, and material uncertainty. Never imply verification that did not happen.
 
 **Acceptance:** The intended reader—developer, integrator, contributor, or maintainer—can find the right entry point, understand the minimum necessary concepts, complete the documented task, and verify the result without undocumented knowledge.
-
-## Editorial references
-
-Consult these only for the relevant problem; keep this guide self-contained:
-
-- [Diátaxis](https://diataxis.fr/) — separate tutorials, how-to guides, reference, and explanation.
-- [GitHub documentation content model](https://docs.github.com/en/contributing/style-guide-and-content-model) — practical page design and scannability.
-- [Google developer documentation style guide](https://developers.google.com/style) and [technical illustrations](https://developers.google.com/tech-writing/two/illustrations) — clear language and useful visuals.
-- [Claude skill authoring best practices](https://platform.claude.com/docs/en/agents-and-tools/agent-skills/best-practices) — concise instructions, appropriate specificity, progressive disclosure, and real-world validation. This is an `AGENTS.md`, not a `SKILL.md`; skill frontmatter conventions do not apply.
