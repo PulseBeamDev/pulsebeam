@@ -1,10 +1,10 @@
 # PulseBeam documentation agent guide
 
-Applies to `docs/**`. Follow the repository-root `AGENTS.md` too; do not duplicate its build or discovery rules.
+Applies directly to `docs/**` and, through the root `AGENTS.md`, to `README.md` files throughout the repository. Follow the root and any nearer `AGENTS.md` too. Use the shared editorial rules for all documentation; **VitePress-specific instructions apply only to `docs/**`**.
 
 ## Goal
 
-Write for application developers who know how to build software but may not know WebRTC. Help them reach a working outcome without first learning RTP, SDP, ICE, or SFU internals.
+Write for the actual reader. Public docs usually serve application developers who can build software but may not know WebRTC; package READMEs may instead serve SDK integrators, contributors, or maintainers. Help them reach a working outcome without requiring irrelevant PulseBeam or WebRTC internals.
 
 Optimize for **time to successful task completion and correct understanding**, not page length, reading-grade scores, or diagram count. Favor the simplest supported path, then reveal advanced detail through links.
 
@@ -17,7 +17,7 @@ Optimize for **time to successful task completion and correct understanding**, n
 
 ## Choose the right page type
 
-Use [Diátaxis](https://diataxis.fr/) as an editorial decision tool, **not** as a mandatory four-section website navigation.
+Use [Diátaxis](https://diataxis.fr/) as an editorial decision tool, **not** as a mandatory four-section navigation or rigid README template. A README is often an entry point mixing a short overview, quickstart, development commands, and links to deeper pages.
 
 | Reader need | Page type | Write it this way |
 | --- | --- | --- |
@@ -44,7 +44,7 @@ Keep these purposes distinct. Do not interrupt a procedure with architecture ess
 
 A diagram should **replace** a difficult explanation, not repeat it. Show the minimum necessary actors and relationships; split crowded diagrams into overview and detail. Label protocols and directions accurately, especially HTTP signaling versus WebRTC media/data. Never suggest timing, delivery, or ordering guarantees the implementation does not provide.
 
-Use the site's existing fenced `mermaid` support for source-controlled diagrams. Add a concise textual takeaway and accessible description. Check mobile readability, contrast, and light/dark rendering when preview is available. Prefer a short explanation to an unreadable diagram.
+For `docs/**`, use the site's existing fenced `mermaid` support for source-controlled diagrams. For READMEs elsewhere, use only diagram and asset formats supported by their actual renderers (such as GitHub and package registries); do not assume VitePress extensions work. Add a concise textual takeaway and accessible description. Check mobile readability, contrast, and light/dark rendering when preview is available. Prefer a short explanation to an unreadable diagram.
 
 ## Write for scanning and action
 
@@ -57,7 +57,7 @@ Use the site's existing fenced `mermaid` support for source-controlled diagrams.
 
 ## Make examples trustworthy
 
-- Use the public SDK for the simplest supported application task. Drop to raw WebRTC, WHIP/WHEP, or native signaling only when the page intentionally teaches that integration level.
+- In application-facing documentation, use the public SDK for the simplest supported task. Drop to raw WebRTC, WHIP/WHEP, or native signaling only when intentionally teaching that integration level. In package READMEs, prefer the owning package's canonical integration, build, or test commands.
 - Provide runnable, copyable examples with required imports, setup, authentication, cleanup, and environment assumptions. For intentionally partial snippets, name the omissions; label pseudocode explicitly.
 - Show how to confirm success, and include the common failure or diagnostic that blocks that task. Troubleshooting should connect **symptom → likely cause → action → verification**.
 - Keep signing secrets and privileged credentials on the server; use unmistakable placeholders rather than real keys.
@@ -70,6 +70,7 @@ Use the site's existing fenced `mermaid` support for source-controlled diagrams.
 - **How-to:** use case → prerequisites → steps/code → verification → edge cases and related tasks.
 - **Reference:** exact syntax/types → meaning and defaults → constraints/errors → minimal usage example. Completeness and correctness outrank prose simplicity.
 - **Explanation:** central insight → small mental model or visual → example → rationale/tradeoffs → links to action and reference.
+- **Repository or package README:** what this is / who needs it → minimum supported getting-started or development commands → verification → relevant limitations → links to detailed docs and owner contracts. Keep it a useful entry point, not a duplicate documentation site.
 
 Do not copy full reference sections into task pages. Link to the canonical source of detail.
 
@@ -77,11 +78,11 @@ Do not copy full reference sections into task pages. Link to the canonical sourc
 
 1. **Accuracy:** trace every technical claim, example, number, and diagram edge to the owning implementation or test. Flag anything unverified.
 2. **Usability:** follow the page as its intended reader. Can they identify the first action, copy the example, recognize success, and recover from a likely failure? Remove needless conceptual detours.
-3. **Presentation:** check links, headings, table layout, Mermaid syntax, accessible text, and navigation. Follow existing VitePress Markdown/frontmatter conventions. Update `docs/.vitepress/config.mts` when adding or renaming public pages; keep agent guidance out of public routes.
-4. **Build:** run `./bazel test //docs:check` at the repository root when possible. Preview complex diagrams with `./bazel run //:docs_dev` when visual verification matters. The docs build does **not** prove examples run—test those separately where possible.
+3. **Presentation:** check links, headings, table layout, diagram syntax, and accessible text in the intended renderer. For `docs/**` only, follow existing VitePress Markdown/frontmatter conventions and update `docs/.vitepress/config.mts` for public page changes; keep agent guidance out of public routes.
+4. **Build:** for `docs/**`, run `./bazel test //docs:check` when possible and preview complex diagrams with `./bazel run //:docs_dev` when needed. For other READMEs, use the owning package's relevant checks. Neither a docs build nor a Markdown render proves code examples run—test those separately when practical.
 5. **Handoff:** report the edits, exact checks performed, untested examples, and material uncertainty. Never imply verification that did not happen.
 
-**Acceptance:** A developer can find the right page, understand the minimum necessary concepts, complete the documented task, and verify the result without relying on undocumented knowledge.
+**Acceptance:** The intended reader—developer, integrator, contributor, or maintainer—can find the right entry point, understand the minimum necessary concepts, complete the documented task, and verify the result without undocumented knowledge.
 
 ## Editorial references
 
