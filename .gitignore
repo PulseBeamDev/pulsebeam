@@ -5,6 +5,7 @@
 /agents/pulsebeam-agent-web/generated/
 node_modules
 dist
+.wrangler/
 **/target
 *.data
 *.data.old
