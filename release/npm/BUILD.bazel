@@ -18,6 +18,29 @@ ARCHIVE_ARGS = [arg for archive in ARCHIVES for arg in ["--archive", "$(rootpath
 alias(name = "npm", actual = "@npm_cli//:npm")
 
 py_binary(
+    name = "login",
+    srcs = ["release.py"],
+    main = "release.py",
+    data = [":npm"],
+    args = ["--npm", "$(rootpath :npm)", "--login"],
+)
+
+[
+    py_binary(
+        name = "publish_" + key,
+        srcs = ["release.py"],
+        main = "release.py",
+        data = [manifest, archive, ":npm"],
+        args = [
+            "--manifest", "$(rootpath %s)" % manifest,
+            "--archive", "$(rootpath %s)" % archive,
+            "--npm", "$(rootpath :npm)", "--package", key, "--publish",
+        ],
+    )
+    for key, manifest, archive in zip(["web", "react", "server"], MANIFESTS, ARCHIVES)
+]
+
+py_binary(
     name = "plan",
     srcs = ["release.py"],
     main = "release.py",
@@ -37,6 +60,8 @@ py_test(
     name = "contract",
     srcs = ["release_test.py", "release.py"],
     main = "release_test.py",
-    data = MANIFESTS + ARCHIVES + [":npm"],
-    args = MANIFEST_ARGS + ARCHIVE_ARGS + ["--npm", "$(rootpath :npm)"],
+    data = MANIFESTS + ARCHIVES + [":npm", ":login", ":publish_web", ":publish_react", ":publish_server"],
+    args = MANIFEST_ARGS + ARCHIVE_ARGS + ["--npm", "$(rootpath :npm)", "--login", "$(rootpath :login)"] + [
+        arg for key in ["web", "react", "server"] for arg in ["--publisher", "$(rootpath :publish_%s)" % key]
+    ],
 )

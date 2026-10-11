@@ -1,8 +1,9 @@
 # Distribution and authorized automation
 
 Compilation and non-publishing artifact assembly are Bazel-owned. Publication
-is a separate credentialed operation, invoked only by the existing authorized
-workflow triggers. Ordinary builds/tests never publish or require secrets.
+is a separate credentialed operation, invoked only by an authorized human or
+the existing authorized workflow triggers. Ordinary builds/tests never publish
+or require secrets.
 
 ## Linux GNU binaries and installer
 
@@ -128,15 +129,16 @@ the checksum-pinned npm 11.6.4 CLI running on the pinned Node 22.14.0 toolchain.
 The GitHub workflow only provides an authorized tag trigger, runner setup,
 acceptance invocation, and OIDC credentials. Ordinary builds/tests never publish.
 
-| Package | Version authority | Release tag |
+| Package | Version authority | CI release tag |
 | --- | --- | --- |
 | `@pulsebeam/web` | `agents/pulsebeam-agent-web/package.json` | `npm-web-v<version>` |
 | `@pulsebeam/react` | `agents/react/package.json` | `npm-react-v<version>` |
 | `@pulsebeam/server` | `server/typescript/package.json` | `npm-server-v<version>` |
 
-Tags must exactly match the corresponding manifest's version. Stable releases
-publish with the `latest` dist-tag; prereleases use `next`, never `latest`.
-Each tag publishes only its named package. Publish a compatible Web version
+Versions come from the package manifests. CI Git tags must exactly match the
+corresponding manifest's version. Stable releases automatically publish with
+the `latest` npm dist-tag; prereleases use `next`, leaving `latest` unchanged.
+Each release publishes only its named package. Publish a compatible Web version
 before React: React retains its declared runtime dependency, and the publisher
 checks that the public registry can resolve it before uploading React.
 Server releases do not change the browser packages.
@@ -157,25 +159,49 @@ resolves frozen third-party dependencies, imports the public JavaScript exports,
 compiles the WASM, and typechecks its public API. Server conformance consumes its
 packed artifact against the shared signing vectors.
 
-### First publication and trusted-publisher setup
+### Manual releases from your laptop
 
-An npm organization administrator must grant the publishing identity access to
-the `@pulsebeam` scope. npm requires a package to exist before a trusted publisher
-can be configured. For each new package, an authorized human must first publish
-the validated tarball with their npm identity. Publish Web before React. For
-example, after the complete `./bazel test //:test` gate and explicit publication
-authorization:
+An npm organization administrator must grant your npm identity publishing access
+to the `@pulsebeam` scope. Log in once (or again when your session expires):
 
 ```sh
-./bazel run //release/npm:npm -- login --registry https://registry.npmjs.org/
-./bazel run //release/npm:npm -- publish "$PWD/bazel-bin/agents/pulsebeam-agent-web/package.tgz" --access public --tag latest --ignore-scripts --registry https://registry.npmjs.org/
+./bazel run //release/npm:login
 ```
 
-Repeat for React and Server with their respective tarball paths. Use `--tag next`
-for a prerelease. These commands are real credentialed publication, not local
-acceptance. No login or bootstrap publication occurs during ordinary tests.
+Update `"version"` in the package's manifest, for example to `0.2.0` or
+`0.3.0-rc.1`. Update dependent version requirements/lockfiles as needed, complete
+review and `./bazel test //:test`, then run the target for the package you intend
+to publish:
 
-Then configure each package's npm trusted publisher with:
+```sh
+./bazel run //release/npm:publish_web
+./bazel run //release/npm:publish_react
+./bazel run //release/npm:publish_server
+```
+
+Each target builds and validates its own tarball, reads its manifest version,
+and selects `latest` or `next` automatically. No tarball paths, version arguments,
+CI setup, or Git tags are required. No Git tags are created or pushed.
+React checks that a compatible Web version is already published; it never
+publishes Web implicitly. Server publication does not build the browser SDKs.
+To inspect a release plan without publishing:
+
+```sh
+./bazel run //release/npm:plan -- --package react
+```
+
+Login uses your local npm credentials, shared with subsequent publish commands.
+Publication uses the pinned npm CLI, public access, the npm public registry, and
+disabled lifecycle scripts. Local publication does not request CI provenance.
+These are real credentialed operations, not acceptance checks. Ordinary builds
+and tests never log in or publish. An existing npm version cannot be overwritten;
+use a new manifest version for another release.
+
+### Optional CI trusted-publisher setup
+
+npm requires a package to exist before a trusted publisher can be configured.
+Use the manual targets above for each package's first publication, then configure
+each package's npm trusted publisher with:
 
 - GitHub organization/user: `PulseBeamDev`;
 - repository: `pulsebeam`;
@@ -189,7 +215,7 @@ only to its publishing job; no stored npm token is required. The pinned CLI
 supports npm's [trusted publishing](https://docs.npmjs.com/trusted-publishers/).
 Remove obsolete write tokens after confirming OIDC publication works.
 
-### Routine releases
+### CI releases
 
 Update the owning manifest version and dependent version requirements/lockfiles
 as needed, complete repository acceptance and review, then integrate the release

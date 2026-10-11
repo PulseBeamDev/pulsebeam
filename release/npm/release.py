@@ -1,4 +1,4 @@
-"""Version-checked npm plans and explicitly invoked trusted publication."""
+"""Manifest-versioned npm plans, local login, and explicit SDK publication."""
 
 import argparse
 import json
@@ -20,22 +20,26 @@ VERSION = re.compile(
 )
 
 
+def package_plan(key, manifests):
+    name = PACKAGES[key]
+    version = manifests[name]["version"]
+    match = VERSION.fullmatch(version)
+    if not match or (match[4] and any(
+        part.isdigit() and len(part) > 1 and part.startswith("0")
+        for part in match[4].split(".")
+    )):
+        raise ValueError("package must contain a canonical release version")
+    return {"name": name, "version": version, "dist_tag": "next" if match[4] else "latest"}
+
+
 def plan(tag, manifests):
-    for key, name in PACKAGES.items():
+    for key in PACKAGES:
         prefix = f"npm-{key}-v"
-        if not tag.startswith(prefix):
-            continue
-        version = tag[len(prefix):]
-        match = VERSION.fullmatch(version)
-        if not match or (match[4] and any(
-            part.isdigit() and len(part) > 1 and part.startswith("0")
-            for part in match[4].split(".")
-        )):
-            raise ValueError("tag must contain a canonical release version")
-        manifest = manifests[name]
-        if version != manifest["version"]:
-            raise ValueError("tag does not match the package manifest version")
-        return {"name": name, "version": version, "dist_tag": "next" if match[4] else "latest"}
+        if tag.startswith(prefix):
+            release = package_plan(key, manifests)
+            if tag[len(prefix):] != release["version"]:
+                raise ValueError("tag does not match the package manifest version")
+            return release
     raise ValueError("expected npm-web-v*, npm-react-v* or npm-server-v* tag")
 
 
@@ -73,10 +77,10 @@ def validate_archive(path, expected):
     return manifest
 
 
-def publish(release, manifest, archive, npm):
-    if os.environ.get("GITHUB_ACTIONS") != "true" or not all(os.environ.get(key) for key in (
+def publish(release, manifest, archive, npm, *, trusted=True):
+    if trusted and (os.environ.get("GITHUB_ACTIONS") != "true" or not all(os.environ.get(key) for key in (
         "ACTIONS_ID_TOKEN_REQUEST_URL", "ACTIONS_ID_TOKEN_REQUEST_TOKEN",
-    )):
+    ))):
         raise ValueError("automated publication requires GitHub Actions OIDC")
     if manifest["name"] == "@pulsebeam/react":
         requirement = manifest["dependencies"]["@pulsebeam/web"]
@@ -89,16 +93,20 @@ def publish(release, manifest, archive, npm):
             raise ValueError("publish a compatible @pulsebeam/web version first")
     subprocess.run([
         npm, "publish", str(archive), "--access", "public",
-        "--tag", release["dist_tag"], "--provenance", "--ignore-scripts",
+        "--tag", release["dist_tag"],
+        *(["--provenance"] if trusted else []), "--ignore-scripts",
         "--registry", REGISTRY,
     ], check=True)
 
 
 def arguments():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--manifest", action="append", type=Path, required=True)
+    parser.add_argument("--manifest", action="append", type=Path, default=[])
     parser.add_argument("--archive", action="append", type=Path, default=[])
-    parser.add_argument("--tag", required=True)
+    action = parser.add_mutually_exclusive_group(required=True)
+    action.add_argument("--tag", help="CI Git tag, checked against the manifest")
+    action.add_argument("--package", choices=PACKAGES, help="local release using the manifest version")
+    action.add_argument("--login", action="store_true", help="log into npm with your local identity")
     parser.add_argument("--npm", type=Path)
     parser.add_argument("--publish", action="store_true")
     return parser.parse_args()
@@ -106,10 +114,15 @@ def arguments():
 
 def main():
     args = arguments()
+    if args.login:
+        if args.npm is None:
+            raise ValueError("login needs the Bazel npm CLI")
+        subprocess.run([str(args.npm.resolve()), "login", "--registry", REGISTRY], check=True)
+        return
     manifests = {document["name"]: document for document in (
         json.loads(path.read_text()) for path in args.manifest
     )}
-    release = plan(args.tag, manifests)
+    release = plan(args.tag, manifests) if args.tag else package_plan(args.package, manifests)
     archives = {}
     for path in args.archive:
         with tarfile.open(path) as archive:
@@ -119,7 +132,10 @@ def main():
     if args.publish:
         if args.npm is None or release["name"] not in archives:
             raise ValueError("publication needs the Bazel CLI and validated archive")
-        publish(release, manifests[release["name"]], archives[release["name"]], str(args.npm.resolve()))
+        publish(
+            release, manifests[release["name"]], archives[release["name"]],
+            str(args.npm.resolve()), trusted=args.tag is not None,
+        )
     print(json.dumps(release, sort_keys=True))
 
 
