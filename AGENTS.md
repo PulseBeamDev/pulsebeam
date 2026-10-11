@@ -9,7 +9,7 @@
 ## Documentation and README changes
 
 * **Before creating or editing any `README.md` anywhere in this repository** (including the root), read `docs/AGENTS.md` and apply its shared developer-documentation standards for accuracy, task-first writing, examples, visuals, and review. This also applies to documentation changes outside `docs/`.
-* Apply those standards to the README's actual reader: an application developer, SDK integrator, contributor, or package maintainer. A README can be a concise entry point linking to deeper tutorials, how-to guides, explanations, and reference material; it need not fit a single Diátaxis page type.
+* Apply those standards to the README's actual reader: an application developer, SDK integrator, contributor, or package maintainer. A README should be a concise entry point with the right overview, verified setup or contributor commands, and links to detailed task guides, API contracts, and architectural explanations; do not force a README into one page type.
 * Keep instructions specific to the owner's package and verified against its current code and build targets. Follow more-specific nested `AGENTS.md` instructions as well. VitePress site configuration and `//docs:check` requirements apply to `docs/**`, **not automatically** to other READMEs.
 
 ## Prefer executable truth
