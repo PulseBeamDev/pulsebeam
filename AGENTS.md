@@ -6,6 +6,10 @@
 * Use targeted text search only after identifying the owning package or symbol. Do not begin with broad filesystem scans, tree dumps, or indiscriminate documentation reading.
 * After identifying the owner, read its `README.md`, the relevant linked design documents, and the nearest nested `AGENTS.md`.
 
+## Documentation and README changes
+
+* When writing or editing `docs/**`, any `README.md`, or other developer-facing documentation, follow `docs/AGENTS.md` and any nearer local instructions. Apply VitePress-specific checks only to `docs/**`.
+
 ## Prefer executable truth
 
 * Manifests, Bazel targets, lints, tests, and generators are authoritative. Do not duplicate their dependency, formatting, generated-code, or command rules here.
