@@ -1,210 +1,265 @@
 # PulseBeam Web
 
-`@pulsebeam/web` is the browser-facing declarative PulseBeam agent package.
+Connect a browser application to a PulseBeam room with `@pulsebeam/web`.
+Publish camera and microphone tracks, play another participant's media, and
+exchange live messages without owning WebRTC signaling or reconnection.
+
+For a React application, use the [React SDK quickstart](../../docs/react/quickstart.md)
+instead. It includes a complete application and owns capture and session cleanup
+through hooks. The direct browser API below is for applications managing their own UI.
+
+## Install and configure your browser app
+
+```sh
+npm install @pulsebeam/web@0.2.0
+```
+
+Before joining, you need:
+
+- A compatible PulseBeam server's absolute HTTP(S) **base URL**, without
+  `/api/v1/native`, and an unexpired participant token from your backend.
+  Keep signing secrets out of the browser. If you need a local server and tokens,
+  use the [source-based sandbox](../../docs/react/quickstart.md#local-development-sandbox).
+- A browser-rendered app on **HTTPS or localhost**, with WebRTC, WebAssembly,
+  Web Audio, and camera/microphone access. An HTTPS page cannot use an insecure
+  remote HTTP endpoint. Start capture from a user action and handle permission errors.
+- A bundler that serves the package's `pulsebeam_agent_web_bg.wasm` at its loader's
+  module-resolved URL. The npm package includes this separate WASM asset; installing
+  JavaScript alone does not guarantee that your bundler emits it correctly.
+
+For Vite 5, add this to `vite.config.mjs` to avoid moving the loader away from its
+WASM asset during development:
+
+```js
+export default {
+  optimizeDeps: { exclude: ["@pulsebeam/web"] },
+};
+```
+
+For another bundler or a WASM loading failure, follow the
+[asset checks](../../docs/react/troubleshooting.md#package-and-wasm).
+Initialize the SDK only in the browser, not during server-side rendering.
+
+## Join, publish, and receive
+
+This TypeScript helper integrates with your **existing browser UI**; token fetching
+and the UI itself are caller-owned. Call it from your Join handler with the endpoint,
+token, other participant's external ID, a mounted visible `<video>` element, and
+a callback that displays snapshot connection/failure state. Reserve one outgoing
+and one incoming track of each media kind for this two-participant example.
 
 ```ts
-import { createAgent } from "@pulsebeam/web";
+import {
+  attachRemoteVideo,
+  createAgent,
+  createCaptureSource,
+  type AgentSnapshot,
+  type RemoteMediaAttachment,
+} from "@pulsebeam/web";
 
-const agent = createAgent({
-  endpoint: "https://pulsebeam.example",
-  token,
-  topology: {
-    localAudios: 1,
-    localVideos: 2,
-    remoteAudios: 3,
-    remoteVideos: 7,
-  },
-  logging: { level: "debug" },
-});
-
-agent.setState({
-  connected: true,
-  publications: [{ slot: "a0", label: "microphone", active: true }],
-  video: [
-    {
-      slot: 0,
-      selector: { participantExternalId: "speaker", label: "camera" },
-      height: 720,
-      minHeight: 180,
-      minFps: 15,
-      priority: 100,
+export async function joinRoom(
+  endpoint: string,
+  token: string,
+  peerId: string,
+  remoteVideo: HTMLVideoElement,
+  onSnapshot: (snapshot: AgentSnapshot) => void,
+) {
+  const agent = createAgent({
+    endpoint,
+    token,
+    topology: {
+      localAudios: 1,
+      localVideos: 1,
+      remoteAudios: 1,
+      remoteVideos: 1,
     },
-  ],
-  audio: {
-    selected: [{ participantExternalId: "speaker", label: "microphone" }],
-    automatic: true,
-  },
-  topics: [{ name: "presence", mode: "latest", subscribe: true }],
-});
+  });
+  let stream: MediaStream | undefined;
+  let attachment: RemoteMediaAttachment | undefined;
+  let unsubscribe = () => {};
+  const leave = () => {
+    unsubscribe();
+    attachment?.close();
+    agent.close();
+    stream?.getTracks().forEach((track) => track.stop());
+  };
 
-const unsubscribe = agent.subscribe(() => render(agent.getSnapshot()));
-const unsubscribeEvents = agent.subscribeEvents((event) => {
-  if (event.type === "topic-message") consume(event.payload);
-});
-```
-
-For direct browser integration, local logical tracks reserve sender slots by
-kind and label, independent of capture ownership. `connect()` and
-`disconnect()` change desired connection state synchronously. A handle may
-borrow a typed capture source without taking ownership of the native track:
-
-```ts
-import { createCaptureSource } from "@pulsebeam/web";
-
-const stream = await navigator.mediaDevices.getUserMedia({ video: true });
-const source = createCaptureSource(stream.getVideoTracks()[0], "video");
-const camera = agent.local.video("camera");
-camera.setSource(source);
-agent.connect();
-// Keep publication identity while sending black video.
-camera.setEnabled(false);
-camera.setEnabled(true);
-// Later: disconnect without ending capture, or detach without releasing the label.
-agent.disconnect();
-camera.setSource(null);
-stream.getTracks().forEach((track) => track.stop());
-agent.close();
-```
-
-`agent.local.audio(label)` reserves a separate audio namespace; repeated lookups
-return the same handle. Capacity exhaustion throws `LocalTrackCapacityError`
-with `kind`, `label`, and `capacity`, even after clearing a source. Another
-Agent may borrow the same source. Each runtime owns a clone for its sender,
-so disabling one handle never disables another Agent or the original capture.
-`setEnabled(false)` retains the source and publication, sending black video or
-silent audio. It survives source replacement and detachment; `setSource(null)`
-explicitly withdraws the publication. Handle publications remain managed even
-when low-level `setState` replaces unrelated intent. `@pulsebeam/react` owns capture and Agent
-lifecycle for typical React applications.
-
-`createAgent()` is synchronous and safe to call while its private WASM module
-is still initializing. The facade retains only the latest complete desired
-state during initialization and then gives it to the browser runtime. Omitted
-publication, video, audio-pinning, and topic collections are empty, retracting
-their previous desired values. Selectors resolve against the current Catalog;
-missing tracks stay desired but are not sent in Intent until they appear. Low-level
-callers can use Catalog TrackIds through `trackId` and `audio.pinned` instead.
-
-The endpoint is the absolute HTTP(S) PulseBeam server endpoint; the core adds
-`/api/v1/native`. The opaque token is sent only as bearer authorization. Local
-counts reserve sender slots `v0`, `v1`, ... and `a0`, `a1`, ...; each direction
-supports up to 32 media sections. A publication's label is bound to its sender
-slot on first use and cannot be changed or reused for another slot of the same
-kind during the Agent lifetime.
-
-Low-level integrations can use `replaceLocalTrack` and `setLocalMuted` for
-reserved local slots. The
-runtime validates media kinds and sender settings. Omitted or empty encoding
-settings enable the runtime's default three-layer video or single-layer audio
-sender configuration; explicit video and audio settings contain three and one
-encoding entries respectively. Sender settings are ignored when detaching with
-a `null` track. Capture tracks remain owned by the caller: replacement and
-`close()` detach them but never stop them.
-The runtime serializes sender attachment per slot and discards superseded
-queued replacements. Disabling and detaching silence owned clones without
-waiting for a pending sender operation; replacement and close stop owned clones,
-never the caller’s capture.
-
-Logging is configured independently for each agent with `logging.level`.
-Messages use the browser console. The default level is `warn`. Chrome hides
-`debug` and `trace` console messages unless Verbose output is enabled.
-
-The catalog-backed `agent.remote.videoTracks` and `agent.remote.audioTracks`
-expose stable handles with external participant identity, media kind, and
-application label. `agent.remote.participant(externalId)` returns a stable participant
-even before discovery, with `video(label)` and `audio(label)` lookup and per-participant
-collections. `agent.remote.participants` excludes self, as do all remote collections.
-Lookup does not discover a track or request video. Handles survive unpublication,
-departure/rejoin, publication-ID replacement, remapping, and reconnection.
-Collections retain identity until membership changes.
-
-A remote video handle's `setReceiveOptions({ minHeight, minFps, priority, playoutDelay })` replaces its policy, but does not request media
-until a video element is attached. `attachRemoteVideo(handle, video)` observes
-visible layout in physical pixels, shares the maximum demand across elements,
-and detaches on `close()`. Hidden or off-screen elements do not reserve a
-receiver, even with a minimum-height policy. Excess visible tracks remain
-unmapped and warn rather than evict existing visible consumers or grow the
-fixed topology. Video policy and mounted demand survive temporary Catalog absence.
-Video attachment is the non-React counterpart of `@pulsebeam/react`'s `<Video>`.
-Generic attachments accept only video elements and ignore audio tracks.
-
-Remote audio is SDK-played automatically through one Web Audio route per mapped
-receiver, without an application audio element, component, attachment, or analysis
-read. A private detached, hidden, muted decoder element activates native browser
-decoding where needed; it is never mounted or exposed and adds no audible route.
-Connected Agents request automatic server-selected audio by default. Explicit
-`audio.automatic: false` in `setState` opts out of automatic selection, not
-playback of explicitly selected/pinned mapped audio. This deliberately replaces
-the former attachment-driven automatic demand.
-
-A logical audio handle's `receiving` is true exactly when Mapping binds its
-current publication to an audio receiver. Catalog presence, track readiness,
-silence, suspended browser audio, and analysis reads do not determine it.
-Mapping changes notify track subscribers, including same-receiver reassignment.
-
-`readWaveform(buffer)` synchronously fills normalized time-domain amplitudes;
-`readSpectrum(buffer)` fills decibel bins in ascending frequency order.
-Analysis uses AnalyserNode defaults: a 2048-point FFT and default spectral
-smoothing. Smaller buffers receive leading samples/bins, not different FFT
-resolution. Oversized tails are zero waveform or negative-infinity spectrum.
-Unmapped/absent handles and unavailable signal clear the entire caller buffer
-to those silence values. Empty buffers are valid. Pull reads do not publish
-signal arrays or notify subscribers. Remapping resets analyser history.
-
-`agent.remote.resumeAudio(): Promise<void>` is exceptional user-gesture recovery
-for browsers blocking autoplay, not a normal playback prerequisite. It works
-before media arrives, resolves only when the context is running, is safe to
-repeat, and rejects on recovery failure or close. Automatic failure is logged
-without terminating the Agent or changing Mapping. Applications call recovery
-directly from a gesture; the SDK adds no global gesture listeners.
-
-Disconnect removes routes and stale analysis; reconnect restores current
-receivers without duplicate output. Agent-owned contexts are isolated and close
-is terminal/idempotent. Existing handles become inactive/nonreceiving and read
-silence after close; new remote lookups fail. Borrowed local capture is never
-routed to the speakers or stopped by this feature.
-
-Snapshots keep `catalog` (revision, participants, publications) separate from
-`mapping` (accepted Intent revision and receiver-index bindings). Publications
-remain discoverable independently of whether media is currently bound. Available
-remote `MediaStreamTrack` objects are exposed in `snapshot.tracks`, keyed by
-publication ID; offer-specific MIDs remain private to the host. Snapshot records
-and collections are immutable and retain identity until an observable update;
-platform track objects themselves are not frozen.
-
-Typed topics register only when used:
-
-```ts
-const chat = agent.topic<{ text: string }>("chat", { mode: "reliable" });
-await chat.publish({ text: "hello" });
-const controller = new AbortController();
-for await (const message of chat.subscribe({ signal: controller.signal })) {
-  render(message.text);
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: true });
+    agent.local.audio("microphone").setSource(
+      createCaptureSource(stream.getAudioTracks()[0]!, "audio"),
+    );
+    agent.local.video("camera").setSource(
+      createCaptureSource(stream.getVideoTracks()[0]!, "video"),
+    );
+    remoteVideo.autoplay = true;
+    remoteVideo.playsInline = true;
+    attachment = attachRemoteVideo(
+      agent.remote.participant(peerId).video("camera"),
+      remoteVideo,
+    );
+    const update = () => onSnapshot(agent.getSnapshot());
+    unsubscribe = agent.subscribe(update);
+    update();
+    agent.connect();
+    return {
+      agent,
+      leave,
+      resumeAudio: () => agent.remote.resumeAudio(),
+      retryVideo: () => attachment!.retryPlayback(),
+    };
+  } catch (error) {
+    leave();
+    throw error;
+  }
 }
 ```
 
-`reliable` uses ordered delivery; `unreliable` uses latest-value delivery.
-Each subscription has its own bounded queue; ending iteration or aborting
-releases its interest. Messages use UTF-8 JSON and payloads over 64 KiB are
-rejected before sending. Lower-level `latest`/`ordered` registrations and
-sends remain available through `setState()`/`sendTopic()`. Event subscriptions
-preserve message bytes plus publisher, stream, and sequence metadata, and
-distinguish admission, drop, resynchronization, channel failure, and agent
-failure events. Send admission is not a delivery acknowledgment.
+Try your UI in two tabs with fresh tokens for **the same room and different
+participant IDs**. In Alice's tab pass `peerId: "bob"`; in Bob's pass `"alice"`.
+Both use publication label `camera`. Give the remote video element nonzero visible
+size, for example `width: 320px; max-width: 100%`. Disable repeated joins while
+awaiting the helper; display capture errors and allow a new attempt.
 
-`reconnect()` delegates to the runtime's reconnect operation and retains the
-complete desired state. Explicit video and pinned-audio policies are per track;
-server-directed receiver recreation restores a fresh default when needed. `close()` is
-terminal and idempotent, detaches callbacks, aborts browser resources, and
-fences initialization and pending operations. Unsubscribe functions are also
-idempotent.
+**Success:** both snapshots report `connected`, and waving in one tab changes
+the other tab's remote video. Remote microphone audio plays automatically without
+an audio element. Use headphones to avoid feedback. If the browser blocks playback,
+wire user-gesture buttons directly to `resumeAudio()` or `retryVideo()` and report
+rejections. For a missing track, check the peer ID, publication label, and video visibility.
 
-## Development
+Call the returned `leave()` on Leave and application teardown. It closes the
+attachment, unsubscribes, closes the Agent, and stops this helper's captured tracks.
+Disconnecting or closing an Agent alone never stops caller-owned capture.
+For longer sessions, [renew authorization before expiry](../../docs/react/guides.md#connection-renewal-and-errors)
+with `agent.renewAuthorization(token)`. A different room or participant needs a new Agent.
 
-`./bazel build //:web` builds the package, WASM runtime, and bindings in graph order.
-`./bazel test //agents/pulsebeam-agent-web:public_contract //agents/pulsebeam-agent-web:uniffi_types //agents/pulsebeam-agent-web:uniffi_contract`
-checks public TypeScript and generated contracts. `./bazel test
-//agents/pulsebeam-agent-web:unit_tests` runs the deterministic Rust boundary tests.
-`./bazel test //agents/pulsebeam-agent-web:browser` provisions the pinned browser,
-builds declared Web/React fixtures, and runs the browser contracts.
-`./bazel run //:web_dev` serves the Web example. See [editor setup](../../docs/ide.md).
+## Local tracks and capacity
+
+`agent.local.video(label)` and `agent.local.audio(label)` reserve separate sender
+namespaces; repeated lookups return the same handle. A handle borrows a typed
+capture source without taking ownership of its native track. Each runtime owns
+a sender clone, so disabling one handle does not disable another Agent or the
+original capture.
+
+`setEnabled(false)` retains the source and publication, sending black video or
+silent audio. It survives source replacement and detachment. `setSource(null)`
+withdraws the publication but does not release the reserved label or stop capture.
+Capacity exhaustion throws `LocalTrackCapacityError` with `kind`, `label`, and
+`capacity`, even after a source is cleared.
+
+Topology reserves sender and receiver media sections. Omitted counts default to
+2 local videos, 2 local audios, 16 remote videos, and 8 remote audios. Set explicit
+counts for your application. Labels bind to sender slots on first use and cannot
+be changed or reused for another slot of the same kind during the Agent lifetime.
+
+## Remote tracks and playback
+
+`agent.remote.participant(externalId)` returns a stable participant handle even
+before discovery. Its `video(label)` and `audio(label)` handles survive unpublication,
+departure/rejoin, publication replacement, remapping, and reconnection. Remote
+collections exclude self and retain identity until membership changes. Lookup
+alone neither discovers a track nor requests video.
+
+`attachRemoteVideo(handle, element)` requests video according to visible layout
+in physical pixels and shares maximum demand across elements. Hidden or off-screen
+elements do not reserve a receiver, even with `setReceiveOptions({ minHeight })`.
+Excess visible tracks remain unmapped and warn rather than evicting consumers or
+growing topology. `setReceiveOptions({ minHeight, minFps, priority, playoutDelay })`
+replaces the handle's policy. Policy and mounted demand survive temporary Catalog
+absence. Close attachments when removing elements; `agent.close()` also detaches them.
+
+Remote audio uses one SDK-owned Web Audio route per mapped receiver. Connected
+Agents request automatic server-selected audio by default. Low-level
+`audio.automatic: false` opts out of automatic selection, not playback of explicitly
+selected or pinned audio. `resumeAudio()` is exceptional recovery for blocked
+autoplay, not a normal prerequisite. Call it directly from a user gesture; the SDK
+adds no global gesture listeners. It rejects on recovery failure or close.
+
+An audio handle's `receiving` reflects Mapping, not Catalog presence or audible
+signal. `readWaveform(buffer)` fills normalized time-domain amplitudes;
+`readSpectrum(buffer)` fills decibel bins. Analysis uses the default 2048-point
+FFT and smoothing. Smaller buffers receive leading samples/bins; oversized tails
+and unavailable signals are zero waveform or negative-infinity spectrum. Reads
+do not notify subscribers. Remapping resets analysis; close makes existing
+handles inactive and reads silent. New remote lookups after close fail.
+
+## Live messages
+
+Typed topics register when used. Given the connected `agent` returned above:
+
+```ts
+const chat = agent.topic<{ text: string }>("chat", { mode: "reliable" });
+const controller = new AbortController();
+const messages = (async () => {
+  for await (const message of chat.subscribe({ signal: controller.signal })) {
+    console.log(message.text);
+  }
+})();
+const stopMessages = async () => {
+  controller.abort();
+  await messages;
+};
+try {
+  await chat.publish({ text: "hello" });
+} catch (error) {
+  await stopMessages();
+  throw error;
+}
+```
+
+Call `stopMessages()` on application teardown. Use the same topic name on both participants. `reliable` uses ordered delivery;
+`unreliable` uses latest-value delivery. Names are 1 to 85 ASCII characters in
+`[A-Za-z0-9_-]`. Messages use UTF-8 JSON, capped at 65,536 bytes before sending.
+Each subscription queues at most 256 values; ordered overflow drops the oldest,
+and latest mode coalesces queued values. Ending iteration or aborting releases
+subscription interest. Send admission is not a delivery acknowledgment.
+
+## Low-level state and runtime behavior
+
+Prefer local/remote handles and typed topics above. `setState()` replaces complete
+low-level intent: omitted publication, video, audio-pinning, and topic collections
+are empty and retract previous values. Handle-managed publications remain managed
+when unrelated intent changes. Selectors resolve against the current Catalog;
+missing tracks remain desired until discovered. `trackId` and `audio.pinned`
+accept Catalog track IDs. Low-level topics use `latest`/`ordered` registrations
+and `sendTopic()`. Event subscriptions expose message bytes and publisher/stream/
+sequence metadata plus admission, drop, resynchronization, and failure events.
+
+Snapshots separate `catalog` (discovery) from `mapping` (accepted Intent revision
+and receiver bindings). `snapshot.tracks` exposes available remote platform tracks
+by publication ID. Records and collections are immutable and stable until observable
+updates; the platform track objects are not frozen. See the
+[public types](web/types.ts) for exact fields.
+
+`replaceLocalTrack` and `setLocalMuted` operate on reserved local slots. Default
+sender settings use three video encodings or one audio encoding; explicit settings
+require those same counts. Detaching with `null` ignores sender settings. Sender
+attachment is serialized per slot and superseded queued replacements are discarded.
+Disabling or detaching silences owned clones immediately. Replacement and close
+stop clones, never caller-owned capture.
+
+`createAgent()` is synchronous while WASM initializes asynchronously. Only the
+latest complete desired state is retained during initialization. `connect()` and
+`disconnect()` change desired state synchronously; use snapshots to observe completion.
+`reconnect()` retains desired state. `close()` is terminal/idempotent and fences
+initialization and pending operations. Unsubscribe functions are also idempotent.
+Disconnect removes audio routes and stale analysis; reconnect restores current
+receivers without duplicate output.
+
+Logging is per Agent via `logging.level`, defaults to `warn`, and uses the browser
+console. Enable Chrome's Verbose console output to see `debug` and `trace` messages.
+
+## Contributor development
+
+Run from a build-ready repository root:
+
+```sh
+./bazel build //:web
+./bazel test //agents/pulsebeam-agent-web:public_contract //agents/pulsebeam-agent-web:uniffi_types //agents/pulsebeam-agent-web:uniffi_contract
+./bazel test //agents/pulsebeam-agent-web:unit_tests
+./bazel test //agents/pulsebeam-agent-web:browser
+```
+
+The browser target provisions pinned browsers and builds Web, React, and Meet
+fixtures. `./bazel run //:web_dev` serves the repository Web example; it is not the
+npm consumer installation. See [editor setup](../../docs/ide.md).

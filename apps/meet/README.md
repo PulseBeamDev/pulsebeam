@@ -43,7 +43,7 @@ The room should show `alice`, `Room demo`, and a `connected` status. To see remo
 video, mint another token with `--participant bob` in the same room and join from
 a second tab. Mute both microphones to avoid feedback. Select the remote video
 tile to spotlight it, or open **Chat** to exchange messages. The complete
-[two-participant quickstart](../../README.md#quickstart) also describes server ports.
+[local two-participant demo](../../README.md#local-development-demo) also describes server ports.
 
 If capture fails, enable camera and microphone permissions and select **Retry**.
 If admission fails, check the server URL, confirm the server uses `--dev`, and

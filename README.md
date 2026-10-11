@@ -14,6 +14,11 @@ PulseBeam is an open source, general-purpose WebRTC SFU server for connecting br
 
 If your client device speaks WebRTC, it can communicate with PulseBeam.
 
+To add a room to your application, start with the
+[React SDK quickstart](docs/react/quickstart.md). It uses the published SDK and
+shows how to connect two participants in your own app. For other browser UIs,
+use the [Web SDK](agents/pulsebeam-agent-web/README.md).
+
 ## Technical Targets
 
 - CPU induced p99 jitter: <2ms
@@ -32,7 +37,7 @@ PulseBeam uses a **shard-owned work-stealing dataplane**, separate from the cont
 
 Read the [dataplane ownership contract](crates/pulsebeam/docs/shard-owned-dataplane.md) for the ownership, scheduling, and locality rules.
 
-## Development dependencies
+## Contributor setup
 
 Bazel owns compilation, dependency/tool provisioning, generated bindings, checks,
 and tests. Normal development and browser acceptance support Linux x86_64.
@@ -54,7 +59,7 @@ See [build and development](docs/build.md), [editor-neutral LSP setup](docs/ide.
 and [distribution](docs/releasing.md). Cargo/pnpm metadata remains authoritative
 for dependencies and editor maintenance, not a supported parallel build/test workflow.
 
-## Quickstart
+## Local development demo
 
 See video forwarded through a local server using [PulseBeam Meet](apps/meet/README.md).
 Both browser tabs publish their camera and receive the other participant's video.
