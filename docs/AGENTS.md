@@ -1,64 +1,93 @@
 # PulseBeam documentation agent guide
 
-Applies to `docs/**`. Supplement, do not repeat, the repository-root `AGENTS.md`.
+Applies to `docs/**`. Follow the repository-root `AGENTS.md` too; do not duplicate its build or discovery rules.
 
-## Goal and reader
+## Goal
 
-Write for application developers who can build software but may not know WebRTC. Help them accomplish a task before teaching internals. Quickstarts and SDK guides must not require prior knowledge of RTP, SDP, ICE, or SFU architecture.
+Write for application developers who know how to build software but may not know WebRTC. Help them reach a working outcome without first learning RTP, SDP, ICE, or SFU internals.
 
-Optimize for **correct comprehension and task completion per minute of reading**, not word count, visual count, or a readability score.
+Optimize for **time to successful task completion and correct understanding**, not page length, reading-grade scores, or diagram count. Favor the simplest supported path, then reveal advanced detail through links.
 
-## Verify before explaining
+## Before writing
 
-- Follow the root guide to find the owning implementation, API/protobuf definition, example, test, CLI help, or Bazel target. Treat code and executable contracts as authoritative over older prose.
-- Use exact current names, signatures, endpoints, flags, defaults, errors, and supported environments. Do not invent examples, behavior, guarantees, or roadmap status.
-- Distinguish released, experimental, and planned behavior. State material constraints and failure modes without burying them.
-- Keep signing keys and secrets server-side. Identify placeholders and environmental assumptions in examples.
+1. Identify the reader, their concrete goal, and what success looks like. Find the relevant code, SDK contracts, CLI help, tests, and examples using the root agent guide.
+2. Verify what actually works. Source code and executable contracts outrank existing prose. Do not invent signatures, flags, defaults, error codes, support claims, or guarantees.
+3. Check whether the behavior is **released, available only on the current branch, experimental, or planned**. Never present an aspiration as a working feature.
+4. Choose the page's purpose and the clearest presentation before drafting paragraphs.
 
-## Design information before writing prose
+## Choose the right page type
 
-**Prefer the format that conveys the idea fastest and most accurately.** Do not default to paragraphs when a visual or structured presentation would be clearer.
+Use [Diátaxis](https://diataxis.fr/) as an editorial decision tool, **not** as a mandatory four-section website navigation.
 
-- **Task or integration:** numbered steps, runnable code, and observable results.
-- **Component relationships, topology, or data flow:** a small Mermaid flowchart.
-- **Request/response, signaling, ordering, or timing:** a Mermaid sequence diagram.
-- **Lifecycle or state transitions:** a Mermaid state diagram.
-- **Choices, configuration, limits, or tradeoffs:** a compact comparison table.
-- **Exact UI appearance:** an up-to-date screenshot when it materially helps.
-- **One straightforward point:** a sentence, not a diagram.
+| Reader need | Page type | Write it this way |
+| --- | --- | --- |
+| "Teach me by doing" | **Tutorial / quickstart** | A guided, end-to-end first success; minimal prerequisites and theory |
+| "Help me accomplish X" | **How-to** | Task-specific steps for a developer who already has a working setup |
+| "What exactly does X do?" | **Reference** | Complete, precise API/CLI/configuration contracts, defaults, limits, and errors |
+| "Why does it work this way?" | **Explanation** | Mental models, architecture, rationale, and tradeoffs |
 
-Before writing several paragraphs about a system, sequence, or comparison, ask whether a visual could replace them. A useful diagram plus a one- or two-sentence takeaway is often better than a wall of text. Code remains the primary explanation when the reader needs to implement something.
+Keep these purposes distinct. Do not interrupt a procedure with architecture essays or force a narrative into reference material. Link to the appropriate page instead. Organize navigation and titles around developer goals (for example, "Publish video"), not internal subsystems they do not yet know.
 
-Use the existing VitePress Mermaid support (fenced code blocks with the `mermaid` language) for editable technical diagrams. Prefer source-controlled diagrams to screenshots of diagrams. Do not add tools or image assets just to decorate a page.
+## Prefer the clearest representation
 
-**Visual quality bar:**
-- Each visual should answer a specific reader question and replace explanation, not merely duplicate it.
-- Show only the elements needed for that question. Split dense diagrams into an overview and optional detailed views.
-- Use clear labels, meaningful arrows, and accurate boundaries. Distinguish HTTP signaling from WebRTC media/data paths where relevant; never imply an unverified order or guarantee.
-- Put the takeaway near the visual. Provide an accessible text explanation or image alt text; readers must still understand the essential point without the image.
-- Check legibility at mobile widths and in light/dark themes when preview is available. Avoid tiny labels, giant tables, and decorative complexity.
+**Use structured or visual explanations when they communicate more accurately and with less effort than prose.** Do not default to text walls, but do not add decorative visuals either.
 
-## Writing and information architecture
+| Question | Preferred format |
+| --- | --- |
+| How do I integrate this? | Ordered steps with executable code and an observable result |
+| What connects to what? | Small Mermaid flowchart or topology diagram |
+| What happens, and in what order? | Mermaid sequence diagram |
+| What states can this enter? | Mermaid state diagram |
+| Which option, value, or limit applies? | Compact comparison or reference table |
+| What does this UI look like? | Current, annotated screenshot when necessary |
+| What is one simple idea? | One or two clear sentences |
 
-- Aim for **Flesch–Kincaid grade 8** for explanatory prose: **6–8** for quickstarts, **8–10** for concepts. This is a heuristic, not a gate; accuracy and comprehension come first. Do not grade code or protocol specifications.
-- Use direct, active language. Prefer sentences around 15–20 words and paragraphs of 2–4 sentences when prose is needed. Avoid filler, hype, redundant restatement, and unexplained jargon.
-- Introduce unfamiliar concepts only when needed, define each once, and use consistent SDK/API terminology. Do not rename technical concepts merely to lower the reading grade.
-- Put the **result and simplest path first**, then constraints, reasoning, and advanced details. Use headings and links for progressive disclosure instead of copying reference material into every page.
-- Give one recommended path by default. Include alternatives only when they change a meaningful decision.
+A diagram should **replace** a difficult explanation, not repeat it. Show the minimum necessary actors and relationships; split crowded diagrams into overview and detail. Label protocols and directions accurately, especially HTTP signaling versus WebRTC media/data. Never suggest timing, delivery, or ordering guarantees the implementation does not provide.
 
-## Page patterns and examples
+Use the site's existing fenced `mermaid` support for source-controlled diagrams. Add a concise textual takeaway and accessible description. Check mobile readability, contrast, and light/dark rendering when preview is available. Prefer a short explanation to an unreadable diagram.
 
-- **Quickstarts:** objective, prerequisites, shortest complete example, expected result, common blockers, next step.
-- **Concept guides:** plain-language takeaway, mental model or visual where useful, concrete example, deeper links.
-- **API reference:** exact signatures/fields, semantics, limits, errors, and minimal usage examples. Precision outranks reading grade.
-- Keep examples copyable and representative of the actual API, including required setup, imports, cleanup, and assumptions. Mark deliberate omissions. Do not conflate native signaling with WHIP/WHEP.
-- Follow the existing VitePress Markdown/frontmatter conventions. Update `docs/.vitepress/config.mts` navigation for new or renamed public pages. Keep agent and contributor instructions out of published routes.
+## Write for scanning and action
 
-## Review loop
+- Lead with the **outcome** and the recommended path. State prerequisites before commands, expected results after them, and next steps at the end.
+- Use descriptive, task-oriented headings; direct, active, second-person language; short paragraphs; and familiar terms. Explain jargon at first use without renaming real technical concepts.
+- Cut marketing copy, filler, repetitive summaries, unnecessary alternatives, and implementation detail unrelated to the reader's goal.
+- Give one default path. Present alternatives only when a real constraint or tradeoff makes them useful.
+- Prefer specific statements over vague claims such as "easy," "fast," "seamless," or "production-ready." Be explicit about limitations and failure modes.
+- Keep API names, `RoomId`/`ParticipantId` terminology, track labels, and protocol names consistent with the actual code.
 
-1. **Check accuracy:** trace every claim, example, table value, and diagram relationship to its owning source. Exercise runnable examples when practical; report those not exercised.
-2. **Check comprehension:** can a developer scan the page, understand the main idea, and find the next action? Replace avoidable prose blocks with a useful visual or structured format; remove redundant diagrams.
-3. **Check rendering:** verify links and Mermaid syntax, and preview complex visuals when possible. Run `./bazel test //docs:check` from the repository root; follow the root guide for wider gates if product code changed.
-4. **Report evidence:** summarize edits, checks actually run, and any uncertainty. Improve these instructions based on observed failures in real documentation tasks, not hypothetical edge cases.
+## Make examples trustworthy
 
-**Acceptance:** A competent developer can understand the system and successfully follow the documented task without undocumented context or deep WebRTC knowledge.
+- Use the public SDK for the simplest supported application task. Drop to raw WebRTC, WHIP/WHEP, or native signaling only when the page intentionally teaches that integration level.
+- Provide runnable, copyable examples with required imports, setup, authentication, cleanup, and environment assumptions. For intentionally partial snippets, name the omissions; label pseudocode explicitly.
+- Show how to confirm success, and include the common failure or diagnostic that blocks that task. Troubleshooting should connect **symptom → likely cause → action → verification**.
+- Keep signing secrets and privileged credentials on the server; use unmistakable placeholders rather than real keys.
+- Do not conflate native SDK signaling with WHIP/WHEP behavior. Document protocol-specific differences and unsupported features precisely.
+- Validate examples against the current SDK and server whenever practical. Do not claim a sample was executed unless it was.
+
+## Page patterns
+
+- **Quickstart:** goal → prerequisites → shortest complete path → visible success → common blocker → next task. Aim for a first working video room in roughly ten minutes for the target reader; this is a UX goal, not a claim about current performance.
+- **How-to:** use case → prerequisites → steps/code → verification → edge cases and related tasks.
+- **Reference:** exact syntax/types → meaning and defaults → constraints/errors → minimal usage example. Completeness and correctness outrank prose simplicity.
+- **Explanation:** central insight → small mental model or visual → example → rationale/tradeoffs → links to action and reference.
+
+Do not copy full reference sections into task pages. Link to the canonical source of detail.
+
+## Review and verification
+
+1. **Accuracy:** trace every technical claim, example, number, and diagram edge to the owning implementation or test. Flag anything unverified.
+2. **Usability:** follow the page as its intended reader. Can they identify the first action, copy the example, recognize success, and recover from a likely failure? Remove needless conceptual detours.
+3. **Presentation:** check links, headings, table layout, Mermaid syntax, accessible text, and navigation. Follow existing VitePress Markdown/frontmatter conventions. Update `docs/.vitepress/config.mts` when adding or renaming public pages; keep agent guidance out of public routes.
+4. **Build:** run `./bazel test //docs:check` at the repository root when possible. Preview complex diagrams with `./bazel run //:docs_dev` when visual verification matters. The docs build does **not** prove examples run—test those separately where possible.
+5. **Handoff:** report the edits, exact checks performed, untested examples, and material uncertainty. Never imply verification that did not happen.
+
+**Acceptance:** A developer can find the right page, understand the minimum necessary concepts, complete the documented task, and verify the result without relying on undocumented knowledge.
+
+## Editorial references
+
+Consult these only for the relevant problem; keep this guide self-contained:
+
+- [Diátaxis](https://diataxis.fr/) — separate tutorials, how-to guides, reference, and explanation.
+- [GitHub documentation content model](https://docs.github.com/en/contributing/style-guide-and-content-model) — practical page design and scannability.
+- [Google developer documentation style guide](https://developers.google.com/style) and [technical illustrations](https://developers.google.com/tech-writing/two/illustrations) — clear language and useful visuals.
+- [Claude skill authoring best practices](https://platform.claude.com/docs/en/agents-and-tools/agent-skills/best-practices) — concise instructions, appropriate specificity, progressive disclosure, and real-world validation. This is an `AGENTS.md`, not a `SKILL.md`; skill frontmatter conventions do not apply.
