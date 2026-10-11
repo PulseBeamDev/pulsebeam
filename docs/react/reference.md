@@ -4,11 +4,8 @@ title: React SDK API reference
 
 # API reference
 
-Import all runtime values and types below from `@pulsebeam/react`.
-Use this page to look up inputs, defaults, ownership, and failures.
-For a complete app, follow the [quickstart](/react/quickstart).
-For a task or failed step, use [guides](/react/guides) or
-[troubleshooting](/react/troubleshooting).
+Import from `@pulsebeam/react`. Pick an API below.
+Need a working app first? [Run the demo](/react/quickstart).
 
 ## Runtime export index
 
@@ -22,11 +19,6 @@ For a task or failed step, use [guides](/react/guides) or
 | `useMediaDevices` | [Device enumeration](#usemediadevices) |
 | `MediaCaptureError` | [Acquisition errors](#errors) |
 | `LocalTrackCapacityError` | [Local slot exhaustion](#errors) |
-
-There is no provider, `Audio` component, raw attachment hook, or React export
-for constructing capture from a native track. Use hook capture and source
-handles with `Video`. The internal Web dependency is prepared by the package
-build, not imported directly by application examples.
 
 ## useAgent
 
@@ -112,23 +104,25 @@ The additional low-level methods are documented [below](#low-level-agent-state).
 
 ## Local media and captured sources
 
-**LocalMedia** exposes `video(label): LocalVideoTrack` and
-`audio(label): LocalAudioTrack`. Labels are stable per-kind names and bind
-reserved slots (`v0`, `a0`, etc.). Repeated lookup returns the same handle.
-Clearing a source does not release labels or capacity.
+**LocalMedia:** `video(label): LocalVideoTrack`, `audio(label): LocalAudioTrack`.
+Repeated per-kind label lookup returns the same handle and reserved slot.
+Withdrawal does not free that slot.
 
-**LocalVideoTrack / LocalAudioTrack** expose readonly `kind`, `label`, `source`,
-`enabled`, plus `setSource(source | null)`, `setEnabled(boolean)`, and
-`subscribe(listener): unsubscribe`. Enablement starts true and persists across
-source replacement/withdrawal. False retains publication while sending black
-video/silent audio. A disabled local-handle video preview blanks.
-`setSource(null)` withdraws publication; neither it nor Agent teardown stops
-borrowed native capture. Kind/capture mismatches fail validation. Capture sources
-from another hook can be borrowed; SDK sender clones isolate mute state.
+**LocalVideoTrack / LocalAudioTrack**
 
-**CapturedVideoTrack / CapturedAudioTrack** are typed opaque sources returned
-by capture hooks. They expose `kind` but not a public native-track accessor in
-React. Pass them to matching local handles or a captured video to `Video`.
+| Member | Contract |
+| --- | --- |
+| readonly `kind`, `label`, `source`, `enabled` | Current logical handle; enabled starts true |
+| `setSource(source \| null)` | Borrow matching capture or withdraw; never stops original tracks |
+| `setEnabled(boolean)` | False sends black/silent media and blanks local-handle video; publication remains |
+| `subscribe(listener): unsubscribe` | Observe changes; caller cleans up |
+
+Enablement survives replacement/withdrawal. Kind/capture mismatches fail validation.
+Agent teardown does not stop capture; sender clones isolate mute state.
+
+**CapturedVideoTrack / CapturedAudioTrack:** opaque hook-owned sources with `kind`,
+not a public native-track accessor. Pass them to matching local handles or a
+captured video to `Video`; sources from another hook can be borrowed.
 
 ## Video
 
@@ -224,11 +218,14 @@ Excess visible tracks beyond topology stay unmapped and warn.
 
 **RemoteAudioTrack:** `kind`, external `participantId`, `label`, `receiving`,
 `subscribe`, `readWaveform(Float32Array)`, `readSpectrum(Float32Array)`.
-`receiving` follows Mapping, not sound level or autoplay. Reads synchronously
-fill normalized amplitudes or decibel frequency bins using the default 2048-point
-FFT and smoothing; smaller buffers get leading samples/bins, not a new FFT size.
-Unmapped/unavailable signal and oversized tails are zero waveform or negative
-infinity spectrum. Empty buffers are valid. Reads do not notify subscribers.
+`receiving` follows receiver assignment (Mapping), not sound or autoplay.
+
+::: details Waveform and spectrum reads
+Reads synchronously fill normalized amplitudes or decibel frequency bins using
+the default 2048-point FFT and smoothing. Smaller buffers get leading samples/bins,
+not a new FFT size. Unmapped/unavailable signal and oversized tails are zero waveform
+or negative infinity spectrum. Empty buffers are valid; reads do not notify subscribers.
+:::
 
 Automatic audio selection/playback is enabled while connected. It does not
 require UI or analysis reads. `resumeAudio()` is exceptional autoplay recovery:
@@ -261,6 +258,7 @@ Admission means the server accepted the participant into the room.
 `connected`, `reconnecting`, `retry-waiting:N`, `closing`, `terminal-failure`.
 Do not infer admission from intent or an intermediate transport state.
 
+::: details Catalog, Mapping, and native-track fields
 **CatalogSnapshot** has revision, participants, publications. **Participant**
 has internal `id` and application `externalId`; **Publication** has `id`,
 canonical `participantId`, `kind: MediaKind` (`audio`/`video`), and `label`.
@@ -273,6 +271,7 @@ Discovery does not imply receiver assignment, called Mapping.
 canonical `participantId`, and native `media: MediaStreamTrack`. These are
 low-level observations, not stable logical handles. Snapshot containers are
 immutable/stable until observable changes; platform tracks are not frozen.
+:::
 
 ### Errors
 
@@ -313,6 +312,7 @@ Send admission is not delivery acknowledgment. Neither mode provides arbitrary
 channels, persistent history, exactly-once semantics, or guaranteed offline
 replay. Desired interest survives reconnection; messages are not durable. See [topic recovery](/react/guides#typed-topics).
 
+::: details Topic status and events
 **TopicSnapshot** contains publishers/subscribers and counters for accepted
 and dropped sends, delivered messages, resynchronizations, channel failures.
 **TopicPublisherStatus** includes name/mode, connected, streamId/nextSequence,
@@ -326,11 +326,14 @@ topic-send-dropped, topic-recovery-gap, topic-resynchronized, and
 topic-channel-failed. **TopicDropReason** includes invalid-payload, not-registered,
 channel-unavailable, queue-full, superseded, host-rejected, channel-closed,
 transport-replaced, sequence-exhausted. Clean up event subscriptions explicitly.
+:::
 
 ## Low-level Agent state
 
-Use these methods only when you own the Agent and need to replace its complete
-desired state. Prefer logical handles and capture hooks for ordinary React apps.
+Prefer logical handles and capture hooks. Open this only to manage complete
+Agent state or native slots yourself.
+
+:::: details Native state, slots, and sender configuration
 A slot is a sender or receiver position reserved by topology.
 
 ::: warning Complete-state replacement
@@ -372,3 +375,4 @@ Encoding fields include required active, optional rid, scaleResolutionDownBy,
 maxBitrate, maxFramerate, scalabilityMode (L1T1/L1T2/L1T3), and dtx
 (enabled/disabled). Invalid kinds/configuration fail validation. These settings
 are not browser-independent codec guarantees.
+::::

@@ -37,11 +37,11 @@ export default withMermaid(
         {
           text: "React SDK",
           items: [
-            { text: "Concepts", link: "/react/" },
-            { text: "Quickstart", link: "/react/quickstart" },
-            { text: "Integration guides", link: "/react/guides" },
+            { text: "Start here", link: "/react/" },
+            { text: "Run the demo", link: "/react/quickstart" },
+            { text: "Add a feature", link: "/react/guides" },
             { text: "API reference", link: "/react/reference" },
-            { text: "Troubleshooting", link: "/react/troubleshooting" },
+            { text: "Fix a problem", link: "/react/troubleshooting" },
           ],
         },
       ],
