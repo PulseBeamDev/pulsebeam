@@ -29,6 +29,7 @@ The [React quickstart](react/quickstart.md) includes its actual `Room.tsx` and
 `main.tsx` sources. `//agents/react:quickstart_types` checks them against the built
 public packages, and `//agents/pulsebeam-agent-web:browser` exercises the same
 bundled application with two participants and real browser media.
+
 ## Publish the documentation
 
 The site is served at <https://docs.pulsebeam.dev> by Cloudflare Workers Static
@@ -56,12 +57,14 @@ account and zone using Cloudflare's **Edit Cloudflare Workers** template. Keep
 credentials outside the repository.
 
 The configuration binds `docs.pulsebeam.dev` as a Workers Custom Domain.
-Cloudflare manages its DNS record and TLS certificate. During the first
-migration, Wrangler replaces any conflicting DNS record for this hostname. In an
-interactive terminal it asks for confirmation; noninteractive deployment replaces
-conflicting records without prompting. Inspect the existing record and authorize
-that one-time cutover with the zone owner before deploying; do not modify other
-hostnames.
+Cloudflare manages its DNS record and TLS certificate. Before the first
+publication, inspect the existing DNS record and authorize the one-time cutover
+with the zone owner. Wrangler attempts to replace conflicting records, but
+Cloudflare can reject externally managed records with error `100117`. In that
+case, remove only the approved old `docs.pulsebeam.dev` record through the
+Cloudflare dashboard or a zone-scoped **DNS Edit** API token, then rerun the deploy
+command. Wrangler's login credential does not necessarily include DNS access.
+Do not modify other hostnames.
 
 After deployment, open the homepage and `/react/quickstart` directly. A nonexistent
 path must return HTTP 404, not the homepage. Clean URLs and VitePress's generated
