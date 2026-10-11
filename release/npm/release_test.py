@@ -33,6 +33,29 @@ class ReleaseContract(unittest.TestCase):
             str(args.npm.resolve()), "--version",
         ], text=True).strip(), "11.6.4")
 
+    def test_npm_launcher_without_bazel_test_environment(self):
+        environment = {key: value for key, value in os.environ.items() if key not in (
+            "TEST_SRCDIR", "RUNFILES", "RUNFILES_DIR", "RUNFILES_MANIFEST_FILE",
+        )}
+        run = subprocess.run
+
+        def probe(command, **kwargs):
+            self.assertIn(command[1], ("login", "publish"))
+            result = run([command[0], "--version"], capture_output=True, text=True, **kwargs)
+            self.assertEqual(result.stdout.strip(), "11.6.4")
+            return result
+
+        for login in (True, False):
+            invocation = argparse.Namespace(
+                login=login, npm=args.npm, manifest=args.manifest, archive=args.archive,
+                tag=None, package="server", publish=True,
+            )
+            with self.subTest(login=login), patch.dict(os.environ, environment, clear=True), patch.object(
+                release, "arguments", return_value=invocation
+            ), patch("subprocess.run", side_effect=probe) as command, patch("sys.stdout", new_callable=io.StringIO):
+                release.main()
+                command.assert_called_once()
+
     def test_package_scoped_versions(self):
         for key, name in release.PACKAGES.items():
             version = MANIFESTS[name]["version"]

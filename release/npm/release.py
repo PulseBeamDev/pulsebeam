@@ -117,7 +117,8 @@ def main():
     if args.login:
         if args.npm is None:
             raise ValueError("login needs the Bazel npm CLI")
-        subprocess.run([str(args.npm.resolve()), "login", "--registry", REGISTRY], check=True)
+        # Keep the runfiles symlink path so the JS launcher can locate its runtime.
+        subprocess.run([str(args.npm.absolute()), "login", "--registry", REGISTRY], check=True)
         return
     manifests = {document["name"]: document for document in (
         json.loads(path.read_text()) for path in args.manifest
@@ -134,7 +135,7 @@ def main():
             raise ValueError("publication needs the Bazel CLI and validated archive")
         publish(
             release, manifests[release["name"]], archives[release["name"]],
-            str(args.npm.resolve()), trusted=args.tag is not None,
+            str(args.npm.absolute()), trusted=args.tag is not None,
         )
     print(json.dumps(release, sort_keys=True))
 
