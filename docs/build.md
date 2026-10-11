@@ -60,9 +60,24 @@ Privileged perf/network diagnostics and a Docker-compatible daemon are optional
 and not prerequisites for the complete test gate. The image loader consumes a
 Bazel-built artifact and an optional Docker client/daemon; it does not build images.
 
-## Shared local action cache
+## Shared local caches
 
-`.bazelrc` enables Bazel's native disk cache at
+`.bazelrc` enables Bazel's native fetched-repository contents cache at
+`~/.cache/pulsebeam/bazel/repo-contents-cache`. Reproducible external repositories
+reuse their extracted/generated directories across worktrees. Pinned Rust archive
+checksums are derived from the official release manifest by `//tools:update-rust-pins`,
+so tool repositories can reuse both downloaded archives and fetched contents.
+The `rules_go` patch retains resolved SDK URLs/hashes in the lockfile and marks
+pinned, checksummed, explicit-platform SDK repositories reproducible.
+
+Enabling contents caching does not seed repositories already present in an
+existing output tree. A successful run that fetches them populates the shared
+cache; subsequent equivalent worktrees reuse those directories.
+The separate download cache retains Bazel's default location under
+`<output_user_root>/cache/repos/v1`. `--repo_contents_cache=` explicitly disables
+contents reuse; `--repository_cache=` disables the download cache.
+
+`.bazelrc` also enables Bazel's native disk cache at
 `~/.cache/pulsebeam/bazel/disk-cache`. Bazel expands `~` using its JVM user-home
 property. This persistent, per-user directory is shared by local worktrees and
 concurrent agents. Bazel supports concurrent cache readers/writers and validates
@@ -78,7 +93,25 @@ action keys. The cache does not weaken checks or make results from a different
 runtime reusable. Disk-cache GC size/age policies are disabled by default; use
 Bazel's `--experimental_disk_cache_gc_max_size` or
 `--experimental_disk_cache_gc_max_age` if a local retention limit is needed.
-`--disk_cache=` explicitly disables caching for diagnostics.
+`--disk_cache=` explicitly disables action caching for diagnostics.
+
+Native input-tree memoization avoids repeated Merkle-tree construction within a
+command, including when using the disk cache. Its default 1,000-entry bound is
+not a guarantee of retained useful entries: soft references can be reclaimed.
+Tests defer runfiles symlink creation until local execution needs it; ordinary
+build commands retain their default behavior. Filesystem watching reduces scans
+for locally edited checkouts. Use `--nowatchfs` for network filesystems edited
+from another machine, where native watching cannot reliably detect changes.
+
+A fresh worktree still starts its own Bazel server, analyzes the graph, hashes
+declared inputs, and prepares cached outputs, even when all build and test
+results are cached. Repository contents caching does not share in-memory
+analysis state. A “fetching” progress message need not represent a network
+download. To measure
+first-run overhead separately from a warmed server, capture `--profile=<path>`
+and `--build_event_json_file=<path>` in a fresh worktree, then repeat the same
+command there. The build-event runner counts and cached test summaries distinguish
+execution from disk-cache hits and internal materialization.
 
 ## Entrypoints
 

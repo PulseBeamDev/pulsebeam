@@ -117,6 +117,13 @@ py_binary(
     args = [argument for key, target in FIX_INPUTS.items() for argument in ["--" + key, "$(rootpath %s)" % target]],
 )
 
+py_test(
+    name = "rust_pins_contract",
+    srcs = ["tests/rust_pins_test.py", "update-rust-pins.py"],
+    main = "tests/rust_pins_test.py",
+    env = {"PYTHONDONTWRITEBYTECODE": "1"},
+)
+
 py_binary(
     name = "update-rust-pins",
     srcs = ["update-rust-pins.py"],

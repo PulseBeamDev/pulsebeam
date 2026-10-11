@@ -1,0 +1,36 @@
+diff --git a/go/private/extensions.bzl b/go/private/extensions.bzl
+--- a/go/private/extensions.bzl
++++ b/go/private/extensions.bzl
+@@ -296,8 +296,8 @@
+             _download_sdk(
+                 get_sdks_by_version = get_sdks_by_version_cached,
+                 name = name,
+-                goos = download_tag.goos,
+-                goarch = download_tag.goarch,
++                goos = download_tag.goos or host_detected_goos,
++                goarch = download_tag.goarch or host_detected_goarch,
+                 download_tag = download_tag,
+             )
+ 
+@@ -400,7 +400,8 @@
+ 
+     if bazel_features.external_deps.extension_metadata_has_reproducible:
+         kwargs = {
+-            "reproducible": True,
++            # Bazel 8.4 lacks extension facts; retain SDK URLs and hashes in the lockfile.
++            "reproducible": False,
+         }
+ 
+         # See get_sdks_by_version_cached above for details on these facts.
+diff --git a/go/private/sdk.bzl b/go/private/sdk.bzl
+--- a/go/private/sdk.bzl
++++ b/go/private/sdk.bzl
+@@ -121,6 +121,8 @@
+             "version": version,
+             "strip_prefix": ctx.attr.strip_prefix,
+         }
++    if ctx.attr.version and ctx.attr.sdks and ctx.attr.goos and ctx.attr.goarch and sha256:
++        return ctx.repo_metadata(reproducible = True)
+     return None
+ 
+ go_download_sdk_rule = repository_rule(
