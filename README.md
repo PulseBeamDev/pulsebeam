@@ -31,13 +31,7 @@ PulseBeam is opinionated about media handling to prioritize battery efficiency, 
 - **Audio:** Opus
 - **Data channels:** Native SDK signaling and reliable/unreliable topics are implemented. WHIP publishing is media-only.
 
-## Architecture
-
-PulseBeam uses a **shard-owned work-stealing dataplane**, separate from the control plane. Each shard exclusively owns its participants, transports, packet buffers, and forwarding state. Workers execute shards and may steal runnable shards; a shard is not permanently pinned to a core. Cross-shard coordination uses owned messages rather than shared mutable packet state.
-
-Read the [dataplane ownership contract](crates/pulsebeam/docs/shard-owned-dataplane.md) for the ownership, scheduling, and locality rules.
-
-## Contributor setup
+## Development
 
 Bazel owns compilation, dependency/tool provisioning, generated bindings, checks,
 and tests. Normal development and browser acceptance support Linux x86_64.
