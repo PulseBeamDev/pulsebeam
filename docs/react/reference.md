@@ -5,7 +5,7 @@ title: React SDK API reference
 # API reference
 
 Import from `@pulsebeam/react`. Pick an API below.
-Need a working app first? [Run the demo](/react/quickstart).
+Need a working app first? [Install the SDK and add a room](/react/quickstart).
 
 ## Runtime export index
 

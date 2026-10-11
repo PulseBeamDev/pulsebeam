@@ -4,7 +4,7 @@ import { withMermaid } from "vitepress-plugin-mermaid";
 export default withMermaid(
   defineConfig({
     title: "PulseBeam",
-    description: "Official documentation for the PulseBeam WebRTC SFU",
+    description: "Build real-time video, audio, and room messaging with PulseBeam",
     cleanUrls: true,
     srcExclude: ["README.md", "AGENTS.md"],
     vite: {
@@ -27,21 +27,36 @@ export default withMermaid(
       ],
       sidebar: [
         {
-          text: "Guide",
+          text: "Start here",
           items: [
-            { text: "Introduction", link: "/" },
-            { text: "Quickstart", link: "/quickstart" },
-            { text: "Deployment", link: "/deployment" },
+            { text: "Build with PulseBeam", link: "/" },
+            { text: "Getting started", link: "/quickstart" },
           ],
         },
         {
           text: "React SDK",
           items: [
-            { text: "Start here", link: "/react/" },
-            { text: "Run the demo", link: "/react/quickstart" },
+            { text: "Quickstart", link: "/react/quickstart" },
+            { text: "Concepts", link: "/react/" },
             { text: "Add a feature", link: "/react/guides" },
             { text: "API reference", link: "/react/reference" },
             { text: "Fix a problem", link: "/react/troubleshooting" },
+          ],
+        },
+        {
+          text: "Other integrations",
+          items: [{ text: "WHIP publishing", link: "/whip" }],
+        },
+        {
+          text: "Operate a server",
+          items: [{ text: "Deployment", link: "/deployment" }],
+        },
+        {
+          text: "Contribute",
+          items: [
+            { text: "Build and development", link: "/build" },
+            { text: "Editor setup", link: "/ide" },
+            { text: "Releasing", link: "/releasing" },
           ],
         },
       ],

@@ -10,12 +10,27 @@ is mostly about two things: terminating TLS in front of it, and — once you sca
 past one node — routing each participant to the node that holds their room. This
 page covers both.
 
+::: warning Legacy example, not current SDK onboarding
+The `pulsebeam-v0.4.6` image below does not provide the endpoints used by the
+current React SDK. For a local SDK trial, use the
+[React quickstart's source-based sandbox](/react/quickstart#local-development-sandbox).
+
+`--dev` uses publicly known development credentials and is for local testing
+only. Do not expose it through Caddy, a public hostname, or a public network.
+TLS does not make development credentials safe.
+
+A production service needs a compatible server, your own signing keys, and
+restricted token issuance. The legacy example and port table below are not a
+verified production configuration for the current SDK.
+:::
+
 ## Deployment Architectures
 
-### 1. Single Node (Quick Start)
+### 1. Single Node (Legacy Example)
 
-Best for testing, demos, or low-traffic internal tools. Caddy handles SSL
-termination and proxies signaling traffic to PulseBeam.
+This historical example illustrates TLS termination and proxy layout. It is not
+a supported setup for the current React SDK, and its development server must
+not be exposed as a public service.
 
 ```mermaid
 graph TD

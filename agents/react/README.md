@@ -2,8 +2,16 @@
 
 **See and hear the other participant in a React room.**
 
-[Run the two-tab demo](../../docs/react/quickstart.md), then adapt its source.
-It uses local SDK packages from this checkout; registry availability is not assumed.
+[Install the SDK and add a room](../../docs/react/quickstart.md) in your own app.
+The quickstart uses the published npm package, a server endpoint, and two participant
+tokens. A source-based local sandbox is available if you do not have a server yet.
+
+```sh
+npm install @pulsebeam/react@0.2.0
+```
+
+The compatible `@pulsebeam/web` runtime and its WASM asset are installed as a
+dependency. Follow the quickstart's bundler setup so the asset is served correctly.
 
 ## Build your next feature
 

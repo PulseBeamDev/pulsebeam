@@ -83,16 +83,25 @@ If recovery fails, inspect the browser error.
 
 ## Package and WASM
 
-Use the [local package setup](/react/quickstart#use-the-sdk-in-your-app).
-WASM is the SDK's WebAssembly runtime.
+Start with the [npm installation](/react/quickstart#1-install-the-sdk) and
+[browser entry setup](/react/quickstart#2-set-up-the-browser-entry).
+The published `@pulsebeam/react@0.2.0` package depends on `@pulsebeam/web@^0.2.0`;
+the Web package includes the compiled WebAssembly (WASM) runtime.
 
-1. Find `pulsebeam_agent_web_bg.wasm` in Network: it must return WASM, not HTML or a 404.
-2. Check its module-resolved URL, base path, content type, and Content Security Policy.
-3. Keep JavaScript, declarations, and WASM from the same build.
-4. Check WebRTC/Web Audio support; initialize only in the browser, never during SSR.
+1. In Network, find the request for `pulsebeam_agent_web_bg.wasm`. It must
+   return the WASM file with `Content-Type: application/wasm`, not an HTML
+   fallback or a 404.
+2. If the request goes to Vite's optimized dependency directory, apply the
+   quickstart's `optimizeDeps.exclude` configuration and restart Vite with
+   `npx vite --force`. Test both development serving and `npx vite build`.
+3. For other bundlers, emit or copy the WASM asset at the URL resolved relative
+   to the loader module. Check the deployed base path and Content Security Policy.
+4. Keep JavaScript, declarations, and WASM from the same package build; do not
+   substitute a WASM file from another release or local checkout.
+5. Check WebRTC/Web Audio support; initialize only in the browser, never during SSR.
 
-The demo copies the asset; another bundler may not. Registry availability is not
-established by package metadata.
+Try **Open room** and **Join** again. Successful WASM loading gets you past
+initialization; it does not by itself confirm server admission or media delivery.
 
 ## Topic failures
 
