@@ -24,13 +24,13 @@ PulseBeam is opinionated about media handling to prioritize battery efficiency, 
 
 - **Video:** H.264 Baseline profile up to Level 4.1
 - **Audio:** Opus
-- **Data Channel:** Planned
+- **Data channels:** Native SDK signaling and reliable/unreliable topics are implemented. WHIP publishing is media-only.
 
 ## Architecture
 
-This is a **thread-per-core** system that isolates the data plane from the control plane. It follows a shared-nothing design, keeping the fast path lock-free and cache-local.
+PulseBeam uses a **shard-owned work-stealing dataplane**, separate from the control plane. Each shard exclusively owns its participants, transports, packet buffers, and forwarding state. Workers execute shards and may steal runnable shards; a shard is not permanently pinned to a core. Cross-shard coordination uses owned messages rather than shared mutable packet state.
 
-![architecture](./crates/pulsebeam/docs/architecture.png)
+Read the [dataplane ownership contract](crates/pulsebeam/docs/shard-owned-dataplane.md) for the ownership, scheduling, and locality rules.
 
 ## Development dependencies
 
@@ -56,83 +56,83 @@ for dependencies and editor maintenance, not a supported parallel build/test wor
 
 ## Quickstart
 
-The following quickstart assumes that you have a Linux machine. As a fallback, you can go to <https://pulsebeam.dev/#quickstart> and check the "fallback" toggle.
+See video forwarded through a local server using [PulseBeam Meet](apps/meet/README.md).
+Both browser tabs publish their camera and receive the other participant's video.
 
-### Step 1. Run the PulseBeam Server
+Use a Linux x86_64 checkout with the [host prerequisites](docs/build.md#host-prerequisites)
+installed. Run commands from the repository root. You need a browser and working
+camera and microphone capture; Meet requires both even when joining to view media.
 
-**Docker/Podman (recommended):**
+### 1. Start the server
 
-```bash
-docker run --rm --net=host ghcr.io/pulsebeamdev/pulsebeam:pulsebeam-v0.4.5 --dev
-```
-
-**Open Port Requirements:**
-
-- **TCP/7070:** HTTP signaling
-- **TCP/6060:** Internal CPU & Memory profilers
-- **UDP/3478:** WebRTC traffic (Multiplexed)
-- **TCP/3478:** WebRTC over TCP fallback (Multiplexed)
-
-> **Note:** The `--dev` flag used above configures PulseBeam to use port **3478** to avoid requiring root privileges. In production (running without `--dev`), WebRTC traffic defaults to standard port **443** (UDP/TCP).
-
-**Other options:**
-
-- **Binary:** download from [Releases](https://github.com/pulsebeamdev/pulsebeam/releases/latest)
-- **Source:** `./bazel run --config=release //:server -- --dev`
-
-### Step 2. Publish a video
-
-Mint a development token, then paste it into the browser-console snippet below:
+Keep this command running in its own terminal:
 
 ```bash
-./bazel run //:cli -- token --room demo --participant publisher
+./bazel run --config=dev //:server -- --dev
 ```
 
-```javascript
-const token = "paste the development token here";
-const pc = new RTCPeerConnection();
-const stream = await navigator.mediaDevices.getUserMedia({ video: true });
-const transceiver = pc.addTransceiver("video", {
-  direction: "sendonly",
-  // Define scalability layers (low, medium, high)
-  sendEncodings: [
-    { rid: "q", scaleResolutionDownBy: 4, maxBitrate: 150_000 },
-    { rid: "h", scaleResolutionDownBy: 2, maxBitrate: 400_000 },
-    { rid: "f", scaleResolutionDownBy: 1, maxBitrate: 1_250_000 },
-  ],
-});
-transceiver.sender.replaceTrack(stream.getVideoTracks()[0]);
+Development mode uses fixed, public development credentials and unprivileged
+WebRTC ports. Use it only for local testing, not an internet-facing deployment.
 
-const offer = await pc.createOffer();
-await pc.setLocalDescription(offer);
-if (pc.iceGatheringState !== "complete") {
-  await new Promise((resolve) => {
-    pc.addEventListener("icegatheringstatechange", function gathered() {
-      if (pc.iceGatheringState === "complete") {
-        pc.removeEventListener("icegatheringstatechange", gathered);
-        resolve();
-      }
-    });
-  });
-}
+| Port | Purpose | Access |
+| --- | --- | --- |
+| TCP/7070 | HTTP signaling | Local clients in this quickstart |
+| UDP/3478 | WebRTC traffic | Local clients in this quickstart |
+| TCP/3478 | WebRTC over TCP fallback | Local clients in this quickstart |
+| TCP/6060 | Internal metrics, health checks, and CPU profiling | Private only; never add to the public firewall allowlist |
 
-// WHIP publishes media without the native protobuf signaling channel.
-const res = await fetch("http://localhost:7070/api/v1/whip", {
-  method: "POST",
-  headers: {
-    Authorization: `Bearer ${token}`,
-    "Content-Type": "application/sdp",
-  },
-  body: pc.localDescription.sdp,
-});
-if (res.status !== 201) throw new Error(await res.text());
-await pc.setRemoteDescription({ type: "answer", sdp: await res.text() });
+Without `--dev`, WebRTC uses UDP/TCP 443 and the server requires a public project
+registry. Development mode does not restrict listener access to loopback; keep
+these services protected by your host firewall.
+
+### 2. Start Meet and mint two tokens
+
+In a second terminal, keep the Meet development server running:
+
+```bash
+./bazel run //:meet_dev -- --port 3000
 ```
 
-### Step 3. View the video stream
+When Next.js reports that it is ready, open <http://localhost:3000>. Use this
+localhost origin so the browser can capture media without a separate HTTPS setup.
 
-Mint a second token with a distinct participant and connect another client to
-the same `demo` room.
+In a third terminal, mint tokens for two distinct participants in the same room:
+
+```bash
+./bazel run //:cli -- token --room demo --participant alice
+./bazel run //:cli -- token --room demo --participant bob
+```
+
+These tokens expire after one hour. Generate new ones if they expire; do not use
+the CLI's development tokens for production.
+
+### 3. Publish and view
+
+1. In the first Meet tab, allow camera and microphone access and confirm that
+   the camera preview appears.
+2. Paste Alice's token into **Bearer token**, set **Server URL** to
+   `http://localhost:7070`, and select **Join room**.
+3. Open <http://localhost:3000> in a second tab. Repeat with Bob's token and the
+   same server URL. Mute the microphones in both tabs to avoid audio feedback.
+4. Each tab should show its own participant identity, `Room demo`, a `connected`
+   status, and a remote video tile in addition to its local camera. Select the
+   remote tile to view the other participant's video. Send a message through
+   **Chat** to try a reliable topic.
+
+If **Join room** stays disabled, enable camera and microphone permissions and
+select **Retry** after a capture error. If admission fails, check that the server
+is running in `--dev` mode, the server URL is correct, and both tokens are fresh.
+
+### 4. Clean up
+
+Select **Leave** in each tab, then close the tabs. Leave disconnects the client
+and stops its captured media, but returning to the lobby requests capture again.
+Close the tabs to release the devices, then stop Meet and the server with Ctrl+C
+in their terminals.
+
+For your own client, start with the [Web SDK](agents/pulsebeam-agent-web/README.md)
+or [React SDK](agents/react/README.md). For packaged server artifacts, see
+[distribution](docs/releasing.md).
 
 ## Server SDKs
 
@@ -155,11 +155,14 @@ ordinary Bazel acceptance gates and the Rust authorization verifier.
 ## Profiling & Metrics
 
 PulseBeam exposes an internal debug HTTP server on **`http://localhost:6060`**.
+Keep port 6060 private; the server does not restrict its listener to loopback.
+Use local or trusted administrative access, never a public endpoint.
 
 - **Metrics (Prometheus):** `http://localhost:6060/metrics`
 - **CPU profile (pprof):** `http://localhost:6060/debug/pprof/profile?seconds=30`
 - **CPU flamegraph:** `http://localhost:6060/debug/pprof/profile?seconds=30&flamegraph=true`
-- **Memory profile:** `http://localhost:6060/debug/pprof/allocs`
+
+Memory profiling is currently disabled; `/debug/pprof/allocs` is not available.
 
 > CPU profiling measures **CPU usage**, not wall time. For meaningful results, profile while the server is under load.
 
