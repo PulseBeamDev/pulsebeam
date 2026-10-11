@@ -17,7 +17,7 @@ build framework or an alternative package compilation pipeline.
 | JS dependencies | Each owner package manifest and frozen pnpm lock | rules_js npm repositories and editor installs |
 | Node, pnpm, Python, LLVM, CMake/Ninja and upstream rules | `MODULE.bazel` | All configured actions and CI |
 | Linux OS inputs and mold | `tools/host/flake.nix`, `tools/host/flake.lock` | Declared native SDK/mold and patched browser runtime inputs; no application graph |
-| Go server SDK | `server/go/go.mod`, standard library only | Consumer-owned SDK verification |
+| Go server SDK | `server/go/go.mod`, standard library only | Go compilation toolchain and consumer-owned verification share the derived SDK |
 | Python server SDK dependencies | `server/python/pyproject.toml` (public requirements), `requirements.in`/hashed `requirements.lock` (repository tools and concrete test resolution) | rules_python pip hub |
 | Browser binaries/drivers | `tools/browser-matrix.json` | Browser extension and consumer-owned Web/React coverage |
 | RTC native client | Pinned `pulsebeam-webrtc-sys` `0.6.2` source revision and released native archive hash in `MODULE.bazel` | Test-only controlled RTC simulation |
