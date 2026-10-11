@@ -29,7 +29,7 @@ Optimize for **correct comprehension and task completion per minute of reading**
 
 Before writing several paragraphs about a system, sequence, or comparison, ask whether a visual could replace them. A useful diagram plus a one- or two-sentence takeaway is often better than a wall of text. Code remains the primary explanation when the reader needs to implement something.
 
-Use the existing VitePress Mermaid support (```mermaid` fences) for editable technical diagrams. Prefer source-controlled diagrams to screenshots of diagrams. Do not add tools or image assets just to decorate a page.
+Use the existing VitePress Mermaid support (fenced code blocks with the `mermaid` language) for editable technical diagrams. Prefer source-controlled diagrams to screenshots of diagrams. Do not add tools or image assets just to decorate a page.
 
 **Visual quality bar:**
 - Each visual should answer a specific reader question and replace explanation, not merely duplicate it.
