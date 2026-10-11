@@ -245,7 +245,7 @@ copy_to_directory(
 rust_test(
     name = "browser",
     crate_root = "tests/browser.rs",
-    srcs = ["tests/browser.rs", "tests/meet.rs"] + glob(["tests/support/**/*.rs"]),
+    srcs = ["tests/browser.rs", "tests/meet.rs", "tests/quickstart.rs"] + glob(["tests/support/**/*.rs"]),
     compile_data = glob(["tests/contracts/*.js"]) + ["//agents/react:browser_observer"],
     crate_features = ["browser-tests"],
     edition = crate_edition(),
@@ -258,6 +258,7 @@ rust_test(
     data = [
         ":browser_assets",
         "//agents/react:browser_fixture",
+        "//agents/react:quickstart",
         "//apps/meet:static_export",
         "//crates/pulsebeam:server",
         "@browser_chrome//:files",
@@ -268,6 +269,7 @@ rust_test(
     env = {
         "PULSEBEAM_WEB_FIXTURE_ROOT": "$(rootpath :browser_assets)",
         "PULSEBEAM_REACT_FIXTURE_ROOT": "$(rootpath //agents/react:browser_fixture)",
+        "PULSEBEAM_REACT_QUICKSTART_ROOT": "$(rootpath //agents/react:quickstart)",
         "PULSEBEAM_MEET_ROOT": "$(rootpath //apps/meet:static_export)",
         "PULSEBEAM_SERVER_BINARY": "$(rootpath //crates/pulsebeam:server)",
         "PULSEBEAM_BROWSER_BINARY": "$(rootpath @browser_chrome//:executable)",

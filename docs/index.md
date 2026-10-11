@@ -105,6 +105,8 @@ devices, rather than forcing a low-end CPU to struggle with software decoding.
 
 ## Next Steps
 
+- **[React SDK](/react/)**: learn the ownership model and build a complete
+  two-participant browser media integration.
 - **[Quickstart](/quickstart)** — run a server and stream your first
   video in a couple of minutes.
 - **[Deployment](/deployment)** — take it to production with TLS and,

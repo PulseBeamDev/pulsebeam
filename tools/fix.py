@@ -34,6 +34,8 @@ def main():
                 path = Path(directory) / name
                 if path.suffix in {".ts", ".tsx", ".js", ".mjs", ".json", ".css"} or name in {"ubrn.config.yaml", "pnpm-workspace.yaml"}:
                     files.append(str(path))
+        if tool == "react":
+            files.extend(str(path) for path in (root / "docs/react").glob("*.tsx"))
         subprocess.run([tools[tool], "--write", *sorted(files)], cwd=package,
                        env=os.environ | {"BAZEL_BINDIR": "."}, check=True)
 

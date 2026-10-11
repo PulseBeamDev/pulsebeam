@@ -1,7 +1,7 @@
 load("@aspect_rules_js//js:defs.bzl", "js_binary", "js_run_binary")
 load("@aspect_rules_js//npm:defs.bzl", "npm_package")
 load("@bazel_lib//lib:copy_to_directory.bzl", "copy_to_directory")
-load("@rules_python//python:defs.bzl", "py_test")
+load("@rules_python//python:defs.bzl", "py_binary", "py_test")
 load("@react_npm//:defs.bzl", "npm_link_all_packages")
 load("@react_npm//agents/react:typescript/package_json.bzl", typescript = "bin")
 load("@react_npm//agents/react:prettier/package_json.bzl", prettier = "bin")
@@ -75,14 +75,14 @@ typescript.tsc_test(
 
 copy_to_directory(
     name = "format_sources",
-    srcs = glob(["src/**", "tests/browser/**", "tests/contracts/**", "tests/*.mjs", "*.json"]) + ["//agents/react/tests/consumer:sources"],
+    srcs = glob(["src/**", "tests/browser/**", "tests/contracts/**", "tests/*.mjs", "*.json"]) + ["//agents/react/tests/consumer:sources", "//docs:react_example"],
 )
 
 py_test(
     name = "format",
     srcs = ["//tools:check-js-format.py"],
     main = "//tools:check-js-format.py",
-    args = ["--formatter", "$(rootpath :prettier)", "--source", "$(rootpath :format_sources)", "--", "src/**/*.ts", "tests/browser/{build.mjs,*.tsx,observe.js}", "tests/contracts/**/*.ts", "tests/consumer/src/**/*.ts", "tests/*.mjs", "*.json"],
+    args = ["--formatter", "$(rootpath :prettier)", "--source", "$(rootpath :format_sources)", "--", "src/**/*.ts", "tests/browser/{*.mjs,*.tsx,observe.js}", "docs/react/*.tsx", "tests/contracts/**/*.ts", "tests/consumer/src/**/*.ts", "tests/*.mjs", "*.json"],
     data = [":prettier", ":format_sources"],
 )
 
@@ -101,7 +101,43 @@ js_run_binary(
     out_dirs = ["tests/browser/dist"],
 )
 
+copy_to_directory(
+    name = "quickstart_source",
+    srcs = ["//docs:react_example"],
+    root_paths = ["docs/react"],
+)
+
+typescript.tsc_test(
+    name = "quickstart_types",
+    args = ["-p", "tsconfig.quickstart.json"],
+    chdir = package_name(),
+    data = [":quickstart_source", ":package", ":node_modules", "//agents/pulsebeam-agent-web:package", "tsconfig.quickstart.json"],
+)
+
+js_binary(
+    name = "quickstart_builder",
+    entry_point = "tests/browser/build-quickstart.mjs",
+    data = [":node_modules"],
+)
+
+js_run_binary(
+    name = "quickstart",
+    tool = ":quickstart_builder",
+    srcs = [":quickstart_source", ":package", ":node_modules", "//agents/pulsebeam-agent-web:package"],
+    args = ["quickstart"],
+    chdir = package_name(),
+    out_dirs = ["quickstart"],
+)
+
+py_binary(
+    name = "quickstart_dev",
+    srcs = ["//tools:static-server.py"],
+    main = "//tools:static-server.py",
+    args = ["$(rootpath :quickstart)"],
+    data = [":quickstart"],
+)
+
 test_suite(
     name = "fast",
-    tests = [":contracts", ":browser_types", ":packed_contract", "//agents/react/tests/consumer:contract"],
+    tests = [":contracts", ":browser_types", ":packed_contract", ":quickstart_types", "//agents/react/tests/consumer:contract"],
 )

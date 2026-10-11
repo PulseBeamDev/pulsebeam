@@ -1,4 +1,5 @@
 mod meet;
+mod quickstart;
 mod support;
 
 use pulsebeam_core::{

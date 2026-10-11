@@ -97,6 +97,10 @@ connection through `/api/v1/native` and reconcile media over the reliable ordere
 
 ## Step 3 — Watch it
 
+For a complete browser integration, follow the **[React SDK quickstart](/react/quickstart)**.
+It includes local capture, publication, remote video, automatic audio, and cleanup
+with two distinct participant credentials.
+
 Connect a current PulseBeam SDK or Meet client to this server with a token for
 room `demo` and a distinct participant identity. Select the publisher's `video`
 track from its remote catalog. Old clients using the previous signaling schema
@@ -104,6 +108,8 @@ are not compatible.
 
 ## Where to go next
 
+- **[React SDK](/react/)**: concepts, a complete browser integration, guides,
+  API reference, and troubleshooting.
 - **[Deployment](/deployment)** — put a domain, TLS, and a reverse proxy
   in front of the server for production.
 - **[Introduction](/)** — the design choices behind PulseBeam and why it

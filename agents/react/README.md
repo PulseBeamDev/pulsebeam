@@ -1,11 +1,18 @@
 # PulseBeam React
 
 `@pulsebeam/react` provides browser acquisition, Agent ownership, and playback.
-Install it alongside React:
+Start with the [React SDK documentation](../../docs/react/index.md) and the
+[complete browser quickstart](../../docs/react/quickstart.md) for concepts,
+package setup, two-participant media, guides, reference, and troubleshooting.
+Registry availability is not implied by package metadata. Build and serve the
+checked example from a checkout with compatible locked React dependencies:
 
 ```sh
-pnpm add @pulsebeam/react react
+./bazel run //agents/react:quickstart_dev
 ```
+
+For an existing application, the quickstart describes local Bazel packages,
+the internal Web dependency override, and required WASM asset handling.
 
 `useAgent(config)` creates one independent Agent after mount and closes it on
 unmount. It returns `null` until the Agent is ready to use. Agents start
@@ -39,7 +46,6 @@ function Camera({ config }: { config: AgentConfig }) {
     if (!agent) return;
     const camera = agent.local.video("camera");
     camera.setSource(capture.videoTrack);
-    return () => camera.setSource(null);
   }, [agent, capture.videoTrack]);
   return (
     <button onClick={() => void capture.request().catch(console.error)}>
