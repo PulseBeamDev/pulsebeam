@@ -226,8 +226,9 @@ js_run_binary(
 
 npm_package(
     name = "package",
-    srcs = ["package.json", "LICENSE", ":typescript", ":dist/wasm"],
+    srcs = ["package.json", "README.md", "LICENSE", ":typescript", ":dist/wasm"],
     replace_prefixes = {"typescript": "dist"},
+    packable = True,
 )
 
 copy_to_directory(

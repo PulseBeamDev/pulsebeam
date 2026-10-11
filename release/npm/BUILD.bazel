@@ -1,0 +1,42 @@
+load("@rules_python//python:defs.bzl", "py_binary", "py_test")
+
+package(default_visibility = ["//visibility:public"])
+
+MANIFESTS = [
+    "//agents/pulsebeam-agent-web:package.json",
+    "//agents/react:package.json",
+    "//server/typescript:package.json",
+]
+ARCHIVES = [
+    "//agents/pulsebeam-agent-web:package.pack",
+    "//agents/react:package.pack",
+    "//server/typescript:package.pack",
+]
+MANIFEST_ARGS = [arg for manifest in MANIFESTS for arg in ["--manifest", "$(rootpath %s)" % manifest]]
+ARCHIVE_ARGS = [arg for archive in ARCHIVES for arg in ["--archive", "$(rootpath %s)" % archive]]
+
+alias(name = "npm", actual = "@npm_cli//:npm")
+
+py_binary(
+    name = "plan",
+    srcs = ["release.py"],
+    main = "release.py",
+    data = MANIFESTS,
+    args = MANIFEST_ARGS,
+)
+
+py_binary(
+    name = "publish",
+    srcs = ["release.py"],
+    main = "release.py",
+    data = MANIFESTS + ARCHIVES + [":npm"],
+    args = MANIFEST_ARGS + ARCHIVE_ARGS + ["--npm", "$(rootpath :npm)", "--publish"],
+)
+
+py_test(
+    name = "contract",
+    srcs = ["release_test.py", "release.py"],
+    main = "release_test.py",
+    data = MANIFESTS + ARCHIVES + [":npm"],
+    args = MANIFEST_ARGS + ARCHIVE_ARGS + ["--npm", "$(rootpath :npm)"],
+)

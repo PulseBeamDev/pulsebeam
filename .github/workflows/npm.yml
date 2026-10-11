@@ -1,0 +1,25 @@
+name: Publish npm SDK
+on:
+  push:
+    tags: ['npm-web-v*', 'npm-react-v*', 'npm-server-v*']
+permissions:
+  contents: read
+concurrency:
+  group: npm-publication
+  cancel-in-progress: false
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    environment: npm
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/setup-ci
+      - name: Validate package release identity
+        run: ./bazel run //release/npm:plan -- --tag "$GITHUB_REF_NAME"
+      - name: Check SDKs and packed artifacts
+        run: ./bazel test //:test --test_output=errors
+      - name: Publish validated Bazel artifact using npm OIDC
+        run: ./bazel run //release/npm:publish -- --tag "$GITHUB_REF_NAME"

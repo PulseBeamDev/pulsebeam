@@ -3,7 +3,14 @@
 Server-only Node.js 22+ SDK with native Ed25519 signing and `@scure/base` for
 Crockford codecs. No PulseBeam connectivity, Rust, or WASM is needed. ESM and
 TypeScript are supported.
-Public registry publication is not part of this change.
+
+## Installation
+
+```sh
+npm install @pulsebeam/server
+```
+
+Registry availability depends on completing the [npm release setup](../../docs/releasing.md#npm-sdks).
 
 ## Local installation
 

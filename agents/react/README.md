@@ -126,8 +126,10 @@ capacity throws `LocalTrackCapacityError` synchronously.
 For low-level integration, `createAgent(config)` returns a caller-owned Agent.
 React ownership uses only `useAgent(config)`; video presentation uses `<Video>` with source handles. There is no provider-based ownership adapter or
 raw media attachment hook.
-The package build prepares the internal web runtime and WASM asset, without an
-application dependency on `@pulsebeam/web`.
+The package depends on `@pulsebeam/web`, which supplies the browser runtime and
+WASM asset. Applications only need to install `@pulsebeam/react`; npm resolves
+the runtime dependency. See [npm releases](../../docs/releasing.md#npm-sdks) for
+registry setup and release ordering.
 
 ## Logical discovery and audio analysis
 

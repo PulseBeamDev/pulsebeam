@@ -97,6 +97,16 @@ http_archive(
     build_file_content = 'exports_files(["lib/libwebrtc.a", "manifest.json"])\nfilegroup(name = "licenses", srcs = glob(["LICENSES/**"]), visibility = ["//visibility:public"])',
 )
 
+# npm >=11.5.1 supports GitHub OIDC trusted publishing. Its bundled dependencies
+# are provisioned with the CLI, independently of application package lockfiles.
+http_archive(
+    name = "npm_cli",
+    urls = ["https://registry.npmjs.org/npm/-/npm-11.6.4.tgz"],
+    sha256 = "9c07edca12853cddbf4fed4e372485aa60c064f9bf3e4cd157a2db5518a1792b",
+    strip_prefix = "package",
+    build_file_content = 'load("@aspect_rules_js//js:defs.bzl", "js_binary")\njs_binary(name = "npm", entry_point = "bin/npm-cli.js", data = glob(["**"], exclude = ["BUILD.bazel"]), visibility = ["//visibility:public"])',
+)
+
 include("//tools:rust-pins.MODULE.bazel")
 
 oci = use_extension("@rules_oci//oci:extensions.bzl", "oci")

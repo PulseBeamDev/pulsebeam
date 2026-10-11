@@ -36,7 +36,7 @@ test_suite(
         ":artifacts", "//agents/pulsebeam-agent-web:js_format", "//agents/pulsebeam-agent-web:public_contract",
         "//agents/pulsebeam-agent-web:uniffi_types", "//agents/pulsebeam-agent-web:uniffi_contract",
         "//agents/react:format", "//agents/react:fast", "//apps/meet:check", "//tools:workflow_contract", "//tools:simulation_runner_contract", "//tools:scoreboard_contract", "//tools:ide_contract", "//tools:launcher_contract",
-        "//release:contract", "//release:elf_contract", "//release:plan_contract",
+        "//release:contract", "//release:elf_contract", "//release:plan_contract", "//release/npm:contract",
     ],
 )
 
