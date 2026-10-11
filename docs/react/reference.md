@@ -4,10 +4,11 @@ title: React SDK API reference
 
 # API reference
 
-Import runtime values and types from `@pulsebeam/react`. This reference groups
-all public exports by contract. Follow the [quickstart](/react/quickstart) for a
-complete application, [guides](/react/guides) for recipes, and
-[troubleshooting](/react/troubleshooting) for recovery.
+Import all runtime values and types below from `@pulsebeam/react`.
+Use this page to look up inputs, defaults, ownership, and failures.
+For a complete app, follow the [quickstart](/react/quickstart).
+For a task or failed step, use [guides](/react/guides) or
+[troubleshooting](/react/troubleshooting).
 
 ## Runtime export index
 
@@ -29,23 +30,44 @@ build, not imported directly by application examples.
 
 ## useAgent
 
-`useAgent(config: AgentConfig): Agent | null` creates an independent Agent after
-mount and closes it on cleanup. It returns null until ready and during keyed
-replacement. It subscribes the component to snapshot updates. It does not connect
-or acquire capture automatically. Token-only changes call `renewAuthorization`
-on the existing Agent. Endpoint/topology/logging changes replace it.
+```ts
+useAgent(config: AgentConfig): Agent | null
+```
+
+Creates an independent Agent after mount and subscribes the component to its
+snapshots. It does not connect or start capture automatically.
+
+| Lifecycle | Result |
+| --- | --- |
+| Before creation or during replacement | Returns null |
+| Token-only change | Calls `renewAuthorization` on the existing Agent |
+| Endpoint/topology/logging change | Replaces the Agent |
+| Unmount | Closes the hook-owned Agent |
 
 ### Configuration types
 
-- **AgentConfig:** required absolute HTTP(S) `endpoint`, opaque bearer `token`,
-  and `topology`; optional `logging`. Use the server base URL, not a native API
-  path: the runtime adds `/api/v1/native`.
-- **MediaTopology:** optional counts `localVideos` (default 2), `localAudios`
-  (2), `remoteVideos` (16), `remoteAudios` (8). Directions support at most 32
-  media sections. Capacity is fixed for the Agent lifetime.
-- **AgentLogging / LogLevel:** optional `level`, default `warn`; levels are
-  `off`, `error`, `warn`, `info`, `debug`, `trace`. Console logging is scoped to
-  each Agent. Chrome needs Verbose enabled for debug/trace.
+**AgentConfig**
+
+| Field | Input |
+| --- | --- |
+| `endpoint` | Required absolute HTTP(S) base URL; the runtime adds `/api/v1/native` |
+| `token` | Required opaque bearer token |
+| `topology` | Required `MediaTopology`; reserves fixed media-slot capacity |
+| `logging` | Optional `AgentLogging` |
+
+**MediaTopology** fields are optional; capacity is fixed for the Agent lifetime.
+Directions support at most 32 media sections.
+
+| Field | Default |
+| --- | --- |
+| `localVideos` | 2 |
+| `localAudios` | 2 |
+| `remoteVideos` | 16 |
+| `remoteAudios` | 8 |
+
+**AgentLogging / LogLevel:** optional `level`, default `warn`.
+Supported levels: `off`, `error`, `warn`, `info`, `debug`, `trace`.
+Console logging is scoped to each Agent. Chrome needs Verbose enabled for debug/trace.
 
 Configuration and runtime initialization failures appear through Agent failure
 snapshots/events. Browser assets and APIs must be available. Connection intent
@@ -53,10 +75,13 @@ is not admission. See [connection diagnostics](/react/troubleshooting#admission-
 
 ## createAgent
 
-`createAgent(config: AgentConfig): Agent` is synchronous and may return while
-its private WASM initialization is pending. It starts disconnected, retaining
-the latest complete desired state during initialization. This is a supported
-low-level ownership path, not the recommended React lifetime binding.
+```ts
+createAgent(config: AgentConfig): Agent
+```
+
+Returns a caller-owned Agent synchronously, possibly before WebAssembly (WASM)
+initialization finishes. It starts disconnected and retains the latest complete
+desired state during initialization. Prefer `useAgent` for React ownership.
 
 The caller owns `subscribe`/`subscribeEvents` unsubscribe functions and
 `close()`. Unsubscribe and close are idempotent; close is terminal, fences
@@ -107,11 +132,19 @@ React. Pass them to matching local handles or a captured video to `Video`.
 
 ## Video
 
-`Video(props: VideoProps)` renders a video element, or null for a null source.
-`source` is required and accepts a captured video source, local video handle,
-remote video handle, or null. Defaults: `autoPlay=true`, `muted=true`,
-`playsInline=true`, `mirror=false`. Other native video attributes are supported
-except `src` and `children`; `className`, `style`, and `controls` are useful.
+`Video(props: VideoProps)` renders a video element, or null when `source` is null.
+
+| Prop | Input / default |
+| --- | --- |
+| `source` | Required captured video source, local video handle, remote video handle, or null |
+| `autoPlay` | `true` |
+| `muted` | `true` |
+| `playsInline` | `true` |
+| `mirror` | `false`; visual transform only |
+| `onPlaybackError` | Optional callback receiving `PlaybackError` |
+
+Other native video attributes are supported except `src` and `children`.
+Use `className`, `style`, or `controls` as needed.
 
 For remote video it attaches presentation-driven receive demand. Visible size
 in physical pixels determines demand, shared by maximum size when multiple
@@ -129,21 +162,34 @@ from a user gesture; catch rejection. It is not a general connection retry.
 
 ## Capture hooks
 
-`useUserMedia(options: UserMediaOptions): CaptureResult` and
-`useDisplayMedia(options: DisplayMediaOptions): CaptureResult` require both
-`video` and `audio`, each boolean or browser `MediaTrackConstraints`.
-No capture happens until `request(): Promise<void>` is explicitly called.
-Invoke it from a gesture; display choosers especially require transient activation.
+```ts
+useUserMedia(options: UserMediaOptions): CaptureResult
+useDisplayMedia(options: DisplayMediaOptions): CaptureResult
+```
 
-**CaptureResult:** readonly `videoTrack`/`audioTrack` (typed sources or null),
-`state` (`idle`, `requesting`, `active`, `error`), `error` (nullable
-`MediaCaptureError`), `request()`, and `stop(): void`.
-`request` rejects on failure or supersession; observe/catch it. `stop` and unmount
-stop native tracks and fence pending acquisitions; late tracks are stopped.
-User-media option changes after requesting trigger replacement. The old session
-remains until success, including when replacement fails (`active` with an error).
-Display option changes never open a chooser automatically. Ending the display
-video stops that session. Browser display audio is not guaranteed.
+Both option types require `video` and `audio`, each a boolean or browser
+`MediaTrackConstraints`. For camera and microphone, use
+`useUserMedia({video: true, audio: true})`.
+
+No capture starts until `request()` is called. Invoke it from a gesture;
+display choosers especially require transient activation.
+
+**CaptureResult**
+
+| Member | Contract |
+| --- | --- |
+| `videoTrack` / `audioTrack` | Readonly typed sources or null |
+| `state` | Readonly `idle`, `requesting`, `active`, or `error` |
+| `error` | Readonly `MediaCaptureError` or null |
+| `request(): Promise<void>` | Rejects on failure or supersession; catch rejection |
+| `stop(): void` | Stops native tracks and returns the hook to idle |
+
+Stopping or unmounting also invalidates pending acquisitions; late tracks are stopped.
+
+| Hook | Replacement and ending behavior |
+| --- | --- |
+| `useUserMedia` | Option changes after requesting trigger replacement. Old capture stays until success; failure retains it with `active` and an error. |
+| `useDisplayMedia` | Option changes never open a chooser automatically. Ending the shared video stops the session. Display audio is not guaranteed. |
 
 ## useMediaDevices
 
@@ -194,15 +240,21 @@ handles inactive/nonreceiving and analysis silent.
 
 ## Snapshots, status, and errors
 
-**AgentSnapshot** separates desired progress and observed state:
+**AgentSnapshot** separates requested state from observed results.
+Admission means the server accepted the participant into the room.
 
-- `version`, `desiredRevision`, `generation`, and `connection: ConnectionState`.
-- `participantId` is internal; `participantExternalId` and `roomExternalId`
-  are authoritative admitted application IDs, null before admission, retained
-  during same-session reconnection, cleared on disconnect.
-- `authorizationExpiresAt` is a nullable Unix-seconds authorization deadline.
-- `catalog: CatalogSnapshot`, `mapping: MappingSnapshot`, `tracks`, `topics`,
-  and nullable `failure: AgentFailure`.
+| Field | Meaning |
+| --- | --- |
+| `connection: ConnectionState` | Current connection progress/status |
+| `participantExternalId`, `roomExternalId` | Authoritative admitted app IDs; null before admission, retained during same-session reconnection, cleared on disconnect |
+| `participantId` | Opaque internal (canonical) participant ID, not the app's identity |
+| `authorizationExpiresAt` | Nullable authorization deadline in Unix seconds |
+| `catalog: CatalogSnapshot` | Discovered participants and publications |
+| `mapping: MappingSnapshot` | Publications assigned to receiver slots |
+| `tracks` | Publication-ID-keyed low-level media observations |
+| `topics: TopicSnapshot` | Topic transport status and counters |
+| `failure: AgentFailure \| null` | Failure class and message |
+| `version`, `desiredRevision`, `generation` | Snapshot version, desired-state revision, and runtime generation for diagnostics |
 
 **ConnectionState** includes `disconnected`, `initializing`, `creating-offer`,
 `joining`, `applying-answer`, `waiting-for-transport`, `waiting-for-signaling`,
@@ -212,8 +264,10 @@ Do not infer admission from intent or an intermediate transport state.
 **CatalogSnapshot** has revision, participants, publications. **Participant**
 has internal `id` and application `externalId`; **Publication** has `id`,
 canonical `participantId`, `kind: MediaKind` (`audio`/`video`), and `label`.
-**MappingSnapshot** has `acceptedIntentRevision` and audio/video **TrackMapping**
-entries (`receiverIndex`, `publicationId`). Discovery does not imply Mapping.
+**MappingSnapshot** has `acceptedIntentRevision` (the accepted desired-state
+revision) and audio/video **TrackMapping** entries. Each entry pairs a
+`receiverIndex` (a reserved receiver slot) with a `publicationId`.
+Discovery does not imply receiver assignment, called Mapping.
 `tracks` is a publication-ID-keyed record of **RemoteTrack**, a union of
 **MappedRemoteVideoTrack / MappedRemoteAudioTrack** with `kind`, `publicationId`,
 canonical `participantId`, and native `media: MediaStreamTrack`. These are
@@ -250,12 +304,14 @@ Publishing interest remains for the Agent lifetime once activated.
 Abort, iterator return, or ending iteration releases interest; an already-aborted
 signal yields no values. Malformed incoming JSON rejects iteration.
 
-Reliable maps to ordered **TopicMode**; unreliable maps to latest. Latest
-replaces queued values; ordered retains at most 256 queued values, dropping
-oldest on overflow. Admission is not delivery acknowledgment. Neither provides
-arbitrary channels, persistent history, exactly-once semantics, or guaranteed
-replay to offline subscribers. Desired interest survives reconnection, not
-application message durability. See [topic recovery](/react/guides#typed-topics).
+| Facade mode | Internal `TopicMode` | Per-subscription queue |
+| --- | --- | --- |
+| `reliable` | `ordered` | At most 256 values; drops oldest on overflow |
+| `unreliable` | `latest` | New queued values replace old ones |
+
+Send admission is not delivery acknowledgment. Neither mode provides arbitrary
+channels, persistent history, exactly-once semantics, or guaranteed offline
+replay. Desired interest survives reconnection; messages are not durable. See [topic recovery](/react/guides#typed-topics).
 
 **TopicSnapshot** contains publishers/subscribers and counters for accepted
 and dropped sends, delivered messages, resynchronizations, channel failures.
@@ -273,8 +329,14 @@ transport-replaced, sequence-exhausted. Clean up event subscriptions explicitly.
 
 ## Low-level Agent state
 
-These methods are supported but need explicit ownership and full-state reasoning.
-Do not substitute low-level native slots for the recommended React capture flow.
+Use these methods only when you own the Agent and need to replace its complete
+desired state. Prefer logical handles and capture hooks for ordinary React apps.
+A slot is a sender or receiver position reserved by topology.
+
+::: warning Complete-state replacement
+Omitted collections in `setState` retract previous low-level values. Do not
+mix native slot ownership with logical source ownership for the same slot.
+:::
 
 - `setState(state: AgentState): void` replaces complete desired state.
   `connected` is required. Omitted publication, video, audio-pinning, and topic

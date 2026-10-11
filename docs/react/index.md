@@ -1,105 +1,148 @@
 ---
 title: React SDK concepts
-description: Build browser media integrations with React-owned Agents and capture.
+description: Understand the parts of a React media app and who owns each resource.
 ---
 
 # React SDK concepts
 
-Start with the [quickstart](/react/quickstart), then use the
-[integration guides](/react/guides), [API reference](/react/reference), and
-[troubleshooting](/react/troubleshooting). All application-facing imports on
-these pages come from `@pulsebeam/react`.
+Build a room where people can share camera, microphone, and messages.
+The [quickstart](/react/quickstart) runs a complete app in two browser tabs.
+You do not need to know WebRTC protocols to follow it.
 
-## Four roles
+Use this page to understand the parts you will work with. All SDK imports
+come from `@pulsebeam/react`.
 
-- **React application:** renders controls and media, requests capture after a
-  gesture, and expresses whether the user wants to be connected.
-- **Browser SDK runtime:** owns an Agent's connection, reconciles publications
-  and receive demand, and plays selected remote audio. Its JavaScript and WASM
-  run in the browser, not on an SSR server.
-- **PulseBeam server:** admits a participant to a room and forwards media and
-  topic traffic among admitted participants. It does not capture your camera.
-- **Application token backend:** authenticates your users and issues scoped,
-  expiring participant tokens. Signing secrets stay here, never in React code.
+## What runs where?
 
-For local development the server's `--dev` profile and CLI replace the token
-backend. This is not a production authentication design.
+```mermaid
+flowchart TB
+    Backend["Token backend<br/>Keeps signing keys"]
+    subgraph Browser["Browser"]
+        App["React app"]
+        SDK["Browser SDK<br/>JS + WASM"]
+        App -->|"User actions"| SDK
+    end
+    Backend -->|"Token"| App
+    SDK <-->|"HTTP setup"| Server["PulseBeam server"]
+    SDK <-->|"WebRTC<br/>Media + topics"| Server
+```
 
-## Rooms and identity
+Your backend decides who may join. React controls the UI and passes a token
+to the SDK. The SDK connects to PulseBeam, which forwards media and messages
+among participants in the room. HTTP sets up the connection; WebRTC carries
+media and topic data. WebAssembly (WASM) is the SDK's compiled browser runtime.
 
-A credential chooses a room and participant identity. Two simultaneous Agents
-must use **distinct participant credentials in the same room** to exchange
-media. Calling `connect()` only expresses intent. Inspect
-`getSnapshot().connection === "connected"` and the admitted
-`participantExternalId` and `roomExternalId` before displaying successful entry.
+For local development, the server's `--dev` profile and CLI provide tokens.
+They replace the backend only for testing. Keep signing keys out of browser code.
 
-Those external IDs are your application identities. They are null before
-admission, retained during reconnection to the same session, and cleared on
-disconnect. The snapshot's `participantId` is an opaque internal canonical ID,
-not your user ID. Logical remote handles use the external ID in their
-`participantId` property; raw Catalog publications use canonical IDs.
-Do not persist transport generations, receiver indices, or publication IDs as
-application identities.
+## Join a room
 
-## Agent ownership and intent
+A **room** groups participants who can exchange media and messages.
+A participant token identifies both the room and the participant.
 
-`useAgent(config)` creates one independent Agent after mount, can initially
-return null, and closes it on unmount. It observes snapshots so discovery and
-connection changes rerender its component. Agents start disconnected.
-`connect()` requests connection and retry; `disconnect()` clears that intent.
-Temporary transport loss can recover while intent remains connected.
-`reconnect()` preserves desired state. A terminal failure needs diagnosis,
-not a loop of blind retries.
+1. Give each simultaneous Agent a distinct participant credential in the same room.
+2. Call `agent.connect()`.
+3. Show successful entry only when `agent.getSnapshot().connection` is
+   `"connected"`. Check the admitted identities too.
 
-Token changes renew authorization on the existing Agent. Endpoint, topology,
-or logging changes replace it. Topology reserves fixed sender and receiver
-capacity; it does not grow when more video elements mount. Use
-`createAgent()` only if you will explicitly own subscriptions and `close()`.
+An **Agent** is one SDK session. Calling `connect()` means “try to connect,”
+not “the server accepted me.” While that intent remains set, the runtime can
+retry after temporary connection loss.
 
-## Capture, publications, and stable handles
+### Which identity should I use?
 
-Capture is separate from connection. `useUserMedia({video: true, audio: true})`
-does nothing until `request()`. Its hook owns native tracks: `stop()` or
-unmount releases the devices. You can [preview before joining](/react/guides#pre-join-preview).
+| Value | Use |
+| --- | --- |
+| `snapshot.participantExternalId` | Your admitted participant identity |
+| `snapshot.roomExternalId` | Your admitted room identity |
+| `remoteTrack.participantId` | The other participant's external identity |
+| `snapshot.participantId` | An opaque internal ID, not your app's user ID |
 
-`agent.local.video("camera")` reserves a stable logical video handle.
-`setSource(capture.videoTrack)` lends capture to that handle and expresses a
-publication. Labels such as `camera`, `microphone`, and `screen` are your
-application's per-kind names. Repeated lookup returns the same handle.
-Labels and slots stay reserved for the Agent lifetime, even after withdrawal.
+The snapshot's external IDs are null before admission. They remain during
+same-session reconnection and clear on disconnect. Do not use publication IDs,
+receiver indices, or transport generations as app identities.
 
-- `setEnabled(false)` retains the publication and sends black video or silent
-  audio. It does not release the device.
-- `setSource(null)` withdraws the publication. It does not stop borrowed capture.
-- `capture.stop()` releases the native tracks. Clear or update the handle's
-  source too, as the quickstart does.
-- Agent disconnect or close does not stop capture borrowed from a hook.
+## Let React own the session
 
-Each sender uses SDK-owned clones, so lending one capture source to two Agents
-does not share their mute state.
+Use `useAgent(config)` in a mounted component. It can return null at first,
+updates the component when snapshots change, and closes the Agent on unmount.
+Agents start disconnected; capture does not start automatically.
 
-## Discovery, presentation, and audio
+| Change or action | Result |
+| --- | --- |
+| Update only the token | Renew authorization on the same Agent |
+| Change endpoint, topology, or logging | Replace the Agent |
+| `disconnect()` | Stop connection intent and retries |
+| `reconnect()` | Request reconnection while keeping desired media and topic state |
+| Unmount the owning component | Close the Agent |
 
-Remote publications appear in `agent.remote.videoTracks` and
-`audioTracks`, excluding self. Discovery is not proof that media is mapped
-or playing. `remote.participant(externalId).video(label)` returns a logical
-handle even before discovery; the handle survives departure and republication.
+**Topology** is the fixed number of sending and receiving slots reserved for
+the Agent. It does not grow when you mount more videos. Use
+[`createAgent`](/react/reference#createagent) only when you need to manage
+subscriptions and cleanup yourself.
 
-Mounting `<Video source={remoteTrack} />` contributes receive demand based on
-visible physical-pixel size. Hidden/off-screen elements do not reserve receivers.
-Unmounting releases demand. Receive policy can constrain quality without
-activating an unpresented track.
+## Capture, publish, or stop?
 
-Remote audio is automatically selected and played by the runtime, subject to
-browser autoplay restrictions. There is no React audio component to mount.
-`remoteAudio.receiving` reports Mapping, not audibility; recover blocked audio
-with `agent.remote.resumeAudio()` directly from a gesture.
+**Capture** reads the camera or microphone. A **publication** makes a source
+available to other participants. They have separate lifetimes.
 
-## Typed topics
+After a user clicks a button, call `capture.request()` on a
+`useUserMedia({video: true, audio: true})` result. To publish its video, pass
+`capture.videoTrack` to `agent.local.video("camera").setSource(...)`.
 
-`agent.topic<T>("chat", {mode: "reliable"})` exchanges typed JSON, not arbitrary
-data-channel handles. Construction alone does not subscribe. Publishing and
-async subscription express their own interest; abort or end iteration to
-release it. Ordered and latest-value delivery are bounded, not durable messaging.
-See [topics and recovery](/react/guides#typed-topics) before using them for
-application state.
+The local handle is a stable reference named by your app. Repeated lookup
+with the same kind and label returns the same handle. Labels such as
+`camera`, `microphone`, and `screen` keep their slots for the Agent's lifetime.
+
+| Goal | Action | Camera/microphone stays active? |
+| --- | --- | --- |
+| Send black video or silent audio | `handle.setEnabled(false)` | Yes |
+| Remove the publication | `handle.setSource(null)` | Yes |
+| Release the device | `capture.stop()` and clear/update bound sources | No |
+| Leave the room | `agent.disconnect()` | Yes, unless you also stop capture |
+| Unmount the capture hook | Hook cleanup | No |
+
+The capture hook owns the native tracks. An Agent only borrows its sources.
+Disconnecting or closing an Agent does not stop those tracks. Sender clones
+keep one Agent's enablement separate from another's when they share capture.
+
+See [pre-join preview](/react/guides#pre-join-preview) and
+[enablement, withdrawal, and release](/react/guides#enablement-withdrawal-and-release).
+
+## Receive video and audio
+
+Use `agent.remote.videoTracks` and `audioTracks` to find remote publications;
+these collections exclude yourself. Finding a publication does not prove it
+is playing.
+
+- **Video:** render `<Video source={track} />` at a visible, nonzero size.
+  The SDK uses its size to request video. Hidden or off-screen elements do not
+  reserve receivers; unmounting releases the request.
+- **Audio:** the runtime selects and plays remote audio automatically.
+  You do not need an audio component. If the browser blocks playback, call
+  `agent.remote.resumeAudio()` directly from a click handler.
+
+A remote handle stays stable across departure and republication. If you know
+the participant and label, `remote.participant(externalId).video(label)`
+works even before discovery.
+
+For diagnostics, **Mapping** means the SDK assigned a publication to a
+receiver. An audio track's `receiving` reports this assignment, not whether
+the user can hear sound. See [missing media](/react/troubleshooting#missing-media).
+
+## Send app messages
+
+A **topic** is a named stream of JSON messages, such as `chat`.
+Use `agent.topic<T>("chat", {mode: "reliable"})` to publish and subscribe.
+Creating a topic alone does not subscribe.
+
+Topics are not a durable message store. Both modes use bounded queues;
+neither promises offline replay or exactly-once processing. Start with the
+[typed topics guide](/react/guides#typed-topics) for subscription cleanup
+and recovery.
+
+## Next step
+
+[Run the quickstart](/react/quickstart), then choose a task from the
+[integration guides](/react/guides). Use the [API reference](/react/reference)
+for exact contracts and [troubleshooting](/react/troubleshooting) when a step fails.

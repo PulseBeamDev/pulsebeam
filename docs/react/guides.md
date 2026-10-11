@@ -1,151 +1,236 @@
 ---
 title: React integration guides
+description: Add preview, device controls, screen sharing, remote playback, and messages.
 ---
 
 # Integration guides
 
-These recipes extend the complete [quickstart](/react/quickstart). Use
-`useAgent` for React ownership, and check its initial null before accessing it.
-Contracts and related types are grouped in the [reference](/react/reference).
+Start with the working [quickstart](/react/quickstart), then add one task at
+a time. These guides use a React-owned Agent from `useAgent`; check for null
+before accessing it. See the [reference](/react/reference) for exact types.
+
+| Task | Start here |
+| --- | --- |
+| Let people check their camera before joining | [Pre-join preview](#pre-join-preview) |
+| Choose another camera or microphone | [Device selection](#device-selection-and-replacement) |
+| Mute, stop sharing, or release devices | [Media controls](#enablement-withdrawal-and-release) |
+| Share a screen | [Screen sharing](#screen-sharing) |
+| Show participants and tune video | [Remote video](#remote-discovery-and-video-receive-policy) |
+| Recover blocked sound | [Remote audio](#remote-audio-and-autoplay) |
+| Renew a token or handle connection errors | [Connection and renewal](#connection-renewal-and-errors) |
+| Send app messages | [Typed topics](#typed-topics) |
 
 ## Pre-join preview
 
-Call `useUserMedia({video: true, audio: true})` in a mounted component.
-A user gesture calls `capture.request()`; render
-`<Video source={capture.videoTrack} mirror />` without creating or connecting
-an Agent. On join, lend the capture to local handles with `setSource`.
-Unmounting that capture component stops the devices, so keep it mounted if
-you want the same capture to survive the transition into the room.
+Let people check their devices without joining a room.
 
-A captured-source preview shows the raw capture even if a local publication is
-disabled. Use `<Video source={cameraHandle} />` when the preview should blank
-with `cameraHandle.setEnabled(false)`.
+1. In a mounted component, call `useUserMedia({video: true, audio: true})`.
+2. From a click handler, call `capture.request()` and catch its rejection.
+3. Render `<Video source={capture.videoTrack} mirror />`.
+4. On join, lend the sources to the Agent's local handles with `setSource`,
+   as the quickstart does.
+
+No Agent is needed for the preview. The capture hook owns the device tracks;
+a local handle only borrows a source. Keep the capture component mounted if
+you want that same capture to survive the transition into the room.
+
+**Check:** the local preview appears while disconnected. Unmounting the capture
+component stops the devices.
+
+A captured-source preview still shows the camera when a publication is disabled.
+Use `<Video source={cameraHandle} />` if the preview should blank when you call
+`cameraHandle.setEnabled(false)`.
 
 ## Device selection and replacement
 
-`useMediaDevices()` returns reactive cameras, microphones, and speakers.
-Each has `id` and `label`; browser privacy can leave these empty until
-permission. Check `state` and `error` before presenting choices.
+1. Call `useMediaDevices()`. Check its `state` and `error` before showing choices.
+2. Read `cameras` and `microphones`. Each device has an `id` and `label`;
+   browser privacy may leave them empty until permission is granted.
+3. Pass the chosen ID to `useUserMedia`, for example
+   `{video: {deviceId: {exact: cameraId}}, audio: true}`.
+4. Request capture once from a user action. Later option changes request replacement.
+5. Keep the quickstart's effect that binds source changes to the local handles.
 
-Pass the selected IDs in `useUserMedia` options, for example
-`{video: {deviceId: {exact: cameraId}}, audio: true}`.
-After an initial explicit request, changing options requests replacement.
-The old capture remains available until success, then is stopped.
-A failed replacement retains the old active tracks and reports `error`;
-do not equate every error with absent capture. Bind source changes using an
-effect as in the quickstart. Relax an exact device constraint or let the user
-select again if a device disappears. Device enumeration does not switch audio
-output: there is no React speaker-selection API.
+| Replacement result | What to show |
+| --- | --- |
+| Pending | The old capture remains available |
+| Success | New capture becomes active; old native tracks stop |
+| Failure with `state === "active"` | Keep the old preview and show `error` |
 
-The quickstart's source-binding effect needs no teardown: new capture replaces
-its source, stopped capture updates it to null, and `useAgent` closes all local
-handles on unmount or Agent replacement. Do not call `setSource` on a handle
-in cleanup after its owning Agent has closed.
+If an exact device constraint fails, let the user choose another device or
+relax the constraint. Do not hide a working preview just because replacement failed.
+
+The binding effect needs no teardown: new sources replace old ones, stopped
+capture changes to null, and `useAgent` closes its handles on unmount.
+Do not call `setSource` in cleanup after its Agent has closed.
+
+**Limit:** `speakers` lists devices, but the React SDK has no speaker-selection API.
 
 ## Enablement, withdrawal, and release
 
-Keep stable labels rather than inventing a new one for each capture:
-`agent.local.video("camera")` and `agent.local.audio("microphone")`.
+Use stable labels: `agent.local.video("camera")` and
+`agent.local.audio("microphone")`. A label keeps its slot for the Agent's lifetime.
 
-| User action | API | Observable result |
+| Goal | API | Result |
 | --- | --- | --- |
-| Disable camera/microphone | `handle.setEnabled(false)` | Black video/silent audio, same publication; capture stays active |
-| Re-enable | `handle.setEnabled(true)` | Current borrowed source sends again |
-| Withdraw publication | `handle.setSource(null)` | Catalog publication removed; capture still active |
-| Release devices | `capture.stop()` and update/clear sources | Native tracks stop; hook returns idle |
-| Leave | `agent.disconnect()` plus capture stop if intended | Connection intent stops; borrowed capture otherwise survives |
+| Disable camera/microphone | `handle.setEnabled(false)` | Black video/silent audio; same publication and active capture |
+| Re-enable | `handle.setEnabled(true)` | Current source sends again |
+| Stop publishing | `handle.setSource(null)` | Publication removed; capture stays active |
+| Release devices | `capture.stop()` and update/clear sources | Native tracks stop; hook becomes idle |
+| Leave and release devices | `agent.disconnect()` and `capture.stop()` | Connection intent stops and devices are released |
 
-Enablement can be set before capture arrives and persists across replacement
-and detachment. Labels reserve capacity for the Agent lifetime; withdrawing a
-track does not free its slot. Catch `LocalTrackCapacityError` if user-driven
-labels might exceed topology rather than continually allocating new labels.
+Enablement persists across source replacement and withdrawal, and can be set
+before capture arrives. Withdrawing a publication does not free its slot.
+Catch `LocalTrackCapacityError` when user-selected labels may exceed the
+reserved capacity.
+
+**Check:** disabling preserves the publication; withdrawing removes it.
+Only stopping or unmounting capture releases the device.
 
 ## Screen sharing
 
-Use a separate `useDisplayMedia({video: true, audio: false})` hook.
-Call `request()` directly from a Share screen gesture and catch its rejection
-(for example `void share.request().catch(reportError)`), then bind its
-`videoTrack` to `agent.local.video("screen")`. Reserve two local video slots
-if camera and screen coexist. Render screen preview without mirroring.
+1. Add a separate `useDisplayMedia({video: true, audio: false})` hook.
+2. Call its `request()` directly from a **Share screen** click handler.
+   Catch rejection, for example `void share.request().catch(reportError)`.
+3. Bind `share.videoTrack` to `agent.local.video("screen")`.
+4. Reserve two local video slots if camera and screen must coexist.
+5. Show the screen preview without mirroring.
+6. To stop, call `share.stop()` and clear the publication.
 
-Display-media option changes do not automatically open the chooser. Explicitly
-request again from a gesture. Cancellation is not necessarily a fatal error;
-inspect `MediaCaptureError.code`. Browser UI ending the shared video returns
-capture to idle and stops the session. Display audio availability depends on
-the browser and selected surface; `audio: true` does not guarantee an audio
-track. Stop or unmount the display hook to release it, and clear its publication.
+**Check:** the shared surface appears as a separate video publication.
+Ending the shared video through browser UI stops that capture session.
+
+Changing display options does not open a chooser; request again from a gesture.
+Inspect `MediaCaptureError.code` when the user cancels or capture fails.
+Display audio depends on the browser and chosen surface, so `audio: true`
+does not guarantee an audio track. Unmounting the display hook also stops it.
 
 ## Remote discovery and video receive policy
 
-Use `agent.remote.participants`, `videoTracks`, and `audioTracks` for
-current discovery; they exclude self. Key video elements by external
-participant ID plus label, not a transient publication ID.
+1. Read `agent.remote.participants`, `videoTracks`, or `audioTracks`.
+   These collections exclude yourself.
+2. Key videos by external participant ID plus label, not publication ID.
+3. Render each `<Video source={track} />` at a visible, nonzero size.
+4. If needed, replace a track's policy with
+   `track.setReceiveOptions({minHeight: 180, minFps: 15, priority: 100})`.
 
-For a known identity, `agent.remote.participant("alice").video("camera")`
-works before discovery and survives departure/republication.
-Lookup alone neither discovers media nor activates demand.
+**Receive demand** is the request contributed by visible video presentation.
+Its size is measured in physical pixels. Multiple presentations of one track
+share the maximum size.
 
-`track.setReceiveOptions({minHeight: 180, minFps: 15, priority: 100})`
-replaces its receive policy. Mount a visibly sized `Video` to request media.
-Visible element size sets demand in physical pixels, with the maximum shared
-across presentations of one track. Unmount releases demand; hidden/off-screen
-elements do not request receivers even with `minHeight`.
-If visible tracks exceed `remoteVideos`, excess tracks remain unmapped and
-warn rather than growing capacity. Increase topology intentionally (replacing
-the Agent) or show fewer tracks.
+| Action | Effect on receiving |
+| --- | --- |
+| Look up a remote handle | No demand by itself |
+| Mount a visible, sized `Video` | Requests video |
+| Hide it, move it off-screen, or unmount | No receiver reserved for that presentation |
+| Set receive policy alone | Does not activate hidden/unmounted video |
+| Use `autoPlay={false}` | Still attaches and requests media; use native `controls` to play |
 
-`autoPlay={false}` with native `controls` disables automatic video play,
-not attachment or receive demand. For automatic play, retain
-`onPlaybackError`'s `retry` and call it from a button gesture.
-Changing receive policy is not an autoplay recovery mechanism.
+For a known participant, `agent.remote.participant("alice").video("camera")`
+works before discovery. The handle survives departure and republication.
+
+**Check:** a discovered publication becomes moving video, not just a list entry.
+If visible tracks exceed `remoteVideos`, excess tracks remain unassigned and
+warn. Show fewer tracks or increase topology, which replaces the Agent.
+
+For an autoplay failure, store the `retry` supplied by `onPlaybackError`
+and call it from a button. Changing receive policy will not unblock playback.
 
 ## Remote audio and autoplay
 
-Connected Agents select and play remote audio automatically without an
-`Audio` component, audio element, or waveform read.
-Use `agent.remote.resumeAudio()` directly inside a click handler to recover
-a blocked AudioContext. It can unlock before media arrives, resolves only when
-the context is running, and rejects on recovery failure or close.
-Automatic playback failure is logged but does not terminate the Agent.
-Surface rejected recovery promises to the user; do not install a timer loop.
+The connected runtime selects and plays remote audio automatically. No audio
+component, audio element, or waveform read is needed.
 
-A `RemoteAudioTrack` exposes `receiving`, meaning it is bound by Mapping,
-not that the user can hear it. Subscribe for an isolated indicator with
-React's `useSyncExternalStore((listener) => track.subscribe(listener), () => track.receiving, () => false)`.
-Waveform and spectrum reads are imperative animation/DSP operations and do not
-trigger renders.
+If the browser blocks automatic playback:
+
+1. Show an **Enable audio** button.
+2. Call `agent.remote.resumeAudio()` directly inside its click handler.
+3. Catch rejection and show the error. Do not retry with a timer.
+
+This call resumes the browser's audio context. It can run before media arrives,
+resolves when the context is running, and rejects on recovery failure or close.
+Automatic playback failure is logged but does not terminate the Agent.
+
+**Check:** listen for the other participant. `RemoteAudioTrack.receiving`
+only means the SDK assigned the publication to a receiver, called **Mapping**.
+It does not prove audible sound.
+
+For an isolated status indicator, subscribe with React's `useSyncExternalStore`.
+See [remote audio](/react/reference#remote-media) for the track contract.
+Waveform and spectrum reads do not trigger React renders.
 
 ## Connection, renewal, and errors
 
-`connect()` and `disconnect()` synchronously change desired state.
-Render `getSnapshot().connection`, `failure`, and admitted identities.
-A transient retry may pass through `reconnecting` and
-`retry-waiting:N`; the runtime owns retries while intent is connected.
-`reconnect()` preserves publication, receive, and topic intent.
-Disconnect clears admission identity and remote output, but does not stop
-borrowed capture. Close is terminal.
+Show `getSnapshot().connection`, `failure`, and admitted identities.
+`connect()` and `disconnect()` change intent synchronously; they do not wait
+for admission or teardown.
 
-Fetch renewed credentials from your authenticated backend before the
-snapshot's `authorizationExpiresAt`, allowing for request latency.
-Update the config token or call `renewAuthorization(token)` for low-level
-ownership. Renewal does not replace endpoint or session identity. The browser
-never holds the signing secret. The SDK does not schedule a backend refresh.
-Use a new Agent to change room/participant. Diagnose authorization,
-configuration, protocol, initialization, and retry-exhaustion failures instead
-of assuming reconnect will repair them.
+| State or action | App responsibility |
+| --- | --- |
+| `reconnecting` or `retry-waiting:N` | Show progress; the runtime retries while connection is desired |
+| `reconnect()` | Request recovery with publication, receive, and topic intent retained |
+| `disconnect()` | Admission identity and remote output clear; stop borrowed capture separately if intended |
+| `close()` | Terminal cleanup; use a new Agent for a new session |
+| `terminal-failure` | Diagnose the cause before creating a fresh authorized session |
 
-Use capture's `error` and rejected `request()` promises for acquisition;
-video's `onPlaybackError` for play failures; rejected `resumeAudio()` for
-audio recovery; snapshots and `subscribeEvents` for Agent failures and topic
-diagnostics. Subscription cleanup returns an idempotent unsubscribe function.
-See [troubleshooting](/react/troubleshooting).
+### Renew before expiry
+
+Your backend must issue a new token for the **same room and participant**.
+The SDK does not schedule a backend refresh.
+
+```mermaid
+---
+config:
+    sequence:
+        width: 120
+        actorMargin: 20
+        diagramMarginX: 10
+---
+sequenceDiagram
+    participant App as React app
+    participant Backend as Token backend
+    App->>Backend: Renew token
+    Backend-->>App: Scoped token
+    App->>App: Set token
+```
+
+Request renewal before `snapshot.authorizationExpiresAt` (Unix seconds),
+allowing time for the backend call. Updating only the config token renews the
+existing hook-owned Agent. Caller-owned Agents can use `renewAuthorization(token)`
+directly. Use a new Agent to change room or participant.
+
+The app sets the config token to the backend response; the hook calls
+`renewAuthorization` on the existing Agent. Keep endpoint, topology, and logging
+unchanged. This is the successful backend handoff, not guaranteed admission.
+Keep signing secrets on the backend and report renewal failures.
+
+### Route errors to the right control
+
+| Failure | Observe |
+| --- | --- |
+| Camera, microphone, or screen acquisition | Capture `error` and rejected `request()` |
+| Video autoplay | `onPlaybackError` |
+| Audio recovery | Rejected `resumeAudio()` |
+| Agent or topic failure | Snapshots and `subscribeEvents` |
+
+Clean up event subscriptions with their returned unsubscribe functions.
+Configuration, authorization, initialization, protocol, and retry-exhaustion
+failures need diagnosis, not blind reconnects.
+Use [troubleshooting](/react/troubleshooting) for the next check.
 
 ## Typed topics
 
-`agent.topic<{text: string}>("chat", {mode: "reliable"})` gives JSON
-`publish(value): Promise<void>` and `subscribe({signal})` async iteration.
-Constructing a topic does not subscribe. A React effect can start iteration and
-abort it on cleanup:
+Use a topic for live JSON messages, not durable chat history.
+
+1. Get a facade with
+   `agent.topic<{text: string}>("chat", {mode: "reliable"})`.
+2. Subscribe only where you need messages. Creating the facade alone does not subscribe.
+3. Publish from an app action and catch rejection.
+4. Abort or end iteration when the consumer unmounts.
+
+The following fragment belongs inside a component. Import `useEffect` from
+`react`; `agent` is its hook-owned Agent, `setMessages` updates a string array,
+and `reportError` displays a failure. Those UI definitions are omitted.
 
 ```tsx
 useEffect(() => {
@@ -161,24 +246,25 @@ useEffect(() => {
 }, [agent]);
 ```
 
-Publish from an application action and catch its rejection:
+To publish, get the same `chat` facade in your action handler, then call
 `void chat.publish({text: "hello"}).catch(reportError)`.
-The generic type is a compile-time contract, not schema validation or
-authorization. Validate untrusted application payloads at consumption.
 
-- **reliable** maps to ordered delivery, with a bounded per-subscription queue.
-- **unreliable** maps to latest-value delivery; queued values can be replaced.
-- UTF-8 JSON payloads above 65,536 bytes reject before sending. Non-JSON values
-  can fail serialization; this is not an arbitrary binary data-channel API.
-- Abort, iterator return, or breaking iteration releases that subscription.
-  Each subscriber has its own queue.
-- Send admission is not a delivery acknowledgment. Reconnection is not durable
-  replay: gaps, dropped sends, resynchronization, and channel failures remain
-  possible. Inspect `snapshot.topics` and `AgentEvent` diagnostics and rebuild
-  authoritative application state through your backend when necessary.
-- Desired interest survives connection recovery, but neither mode guarantees
-  application-level exactly-once processing, permanent history, or delivery to
-  offline participants.
+| Mode | Behavior | Limit |
+| --- | --- | --- |
+| `reliable` | Ordered delivery | Bounded queue, not durable storage |
+| `unreliable` | Latest-value delivery | New values can replace queued ones |
 
-Do not mix low-level whole-state topic registrations with hook-oriented logic
-without understanding [complete desired state](/react/reference#low-level-agent-state).
+Each subscription has its own queue. Abort, iterator return, or breaking
+iteration releases it. UTF-8 JSON above 65,536 bytes rejects before sending;
+non-JSON values can fail serialization. The generic type does not validate
+untrusted messages or authorize users.
+
+Send admission is not a delivery acknowledgment. Neither mode guarantees
+offline replay, permanent history, or exactly-once processing. Connection
+recovery keeps desired topic interest, but gaps and dropped sends are possible.
+Use `snapshot.topics` and `AgentEvent` diagnostics; reload authoritative state
+from your backend when needed.
+
+See [topic contracts](/react/reference#topics) for queue limits and diagnostics.
+Avoid mixing low-level whole-state registrations with this flow without
+understanding [complete desired state](/react/reference#low-level-agent-state).

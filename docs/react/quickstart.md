@@ -1,50 +1,148 @@
 ---
 title: React SDK quickstart
-description: Run the checked browser example with two participants in a local room.
+description: Share camera and microphone between two browser tabs with the checked React example.
 ---
 
 # React SDK quickstart
 
-This framework-independent browser example captures camera and microphone,
-publishes them, renders discovered remote video, and receives automatic audio.
-Read [concepts](/react/) for the ownership model.
+Run a complete React room in two browser tabs. Each participant will join,
+share camera and microphone, see the other's video, and leave without keeping
+the devices active.
 
-## Prerequisites
+The example uses plain React, not a specific framework. You can run it before
+reading the [concepts](/react/).
 
-- A repository checkout and the [Bazel build prerequisites](/build).
-  Run commands below from the repository root on a supported Linux host.
-- A browser with WebRTC, WebAssembly, `navigator.mediaDevices.getUserMedia`,
-  and Web Audio. The repository browser gate uses pinned Chromium; this is
-  not a compatibility promise for every browser.
-- HTTPS or localhost for capture, with camera/microphone permission.
-  A secure page cannot use an insecure remote server through mixed content.
-  A non-local HTTP page is not a capture environment.
-- React 18 or newer is the declared peer range. The checked example uses
-  React and React DOM 18.3.1; keep their versions compatible.
-- A reachable PulseBeam HTTP(S) endpoint and its media ports. See
-  [deployment](/deployment) for production TLS/firewalls. Use the base endpoint,
-  such as `http://localhost:7070`, not `/api/v1/native`.
+## Before you start
 
-## 1. Build the available packages and example
+| You need | Check |
+| --- | --- |
+| Repository checkout on a supported Linux host | Install the [Bazel build prerequisites](/build). Run all commands from the repository root. |
+| Camera and microphone | Allow browser access. Use headphones to avoid feedback between tabs. |
+| Browser media support | WebRTC, WebAssembly, Web Audio, and `navigator.mediaDevices.getUserMedia` must be available. |
+| Secure capture page | Use HTTPS or localhost. An HTTPS page cannot connect to an insecure remote endpoint. |
 
-Do not assume the package version in repository metadata is published to npm.
-The reproducible distribution path here is a **local Bazel package build**:
+The checked example uses React and React DOM 18.3.1 with pinned Chromium.
+The package declares React 18 or newer as its peer range; this is not a tested
+compatibility promise for every browser or React version.
+
+## 1. Start the development server
+
+In a terminal:
 
 ```bash
-./bazel build //agents/react:package //agents/pulsebeam-agent-web:package
+./bazel run //:server -- --dev
+```
+
+Keep it running. The HTTP endpoint is `http://localhost:7070`, and the
+development media port is 3478. Use the base endpoint, not `/api/v1/native`.
+The `--dev` authentication profile is for local testing, not production.
+
+## 2. Open the example in two tabs
+
+In another terminal:
+
+```bash
 ./bazel run //agents/react:quickstart_dev
 ```
 
-The second command builds and serves this page's actual example using the
-built public packages and the repository's locked dependencies, without
-fetching `@pulsebeam/react` from a public registry. Open the localhost URL it
-prints in two tabs. This runner is a development convenience, not a required
-React framework.
+Open the localhost URL it prints in **tab A** and **tab B**. You should see
+the endpoint and participant-token form.
 
-To integrate into an existing bundled browser application, build the same
-packages and add them from their absolute local paths. With pnpm 10.12.4,
-put an application-level override in your application's package.json
-(replace the checkout path with your own):
+The runner builds the local SDK packages, uses locked dependencies, and serves
+the complete example below. It does not fetch `@pulsebeam/react` from npm.
+Package metadata alone does not establish public registry availability.
+
+## 3. Create a token for each participant
+
+```bash
+./bazel run //:cli -- token --room react-demo --participant alice
+./bazel run //:cli -- token --room react-demo --participant bob
+```
+
+| Tab | Endpoint | Token |
+| --- | --- | --- |
+| A | `http://localhost:7070` | Output for `alice` |
+| B | `http://localhost:7070` | Output for `bob` |
+
+Paste the tokens into their tabs and click **Open room**. Both tokens name
+the same room, but each Agent needs a different participant credential.
+The CLI's default token lifetime is one hour.
+
+Do not commit tokens or put signing keys in browser code. These pasted tokens
+stand in for a production backend response.
+
+## 4. Join and share media
+
+Do each action in both tabs.
+
+| Action | Expected result |
+| --- | --- |
+| Click **Join** | `Connection: connected` and the expected participant name |
+| Click **Enable camera and microphone** and allow access | `Capture: active` and a local preview |
+| Watch the other tab's publication | The other's `camera` appears and its remote video moves |
+| Speak into the microphone | The other tab receives audio; the remote audio publication count becomes one |
+
+A connected status confirms admission. A local preview confirms capture.
+Neither proves that the other participant received media.
+
+If audio is blocked, click **Enable remote audio**. If video playback is
+blocked, use **Retry video playback**. A publication count alone does not
+prove sound; listen in the other tab.
+
+## 5. Leave and release devices
+
+1. Click **Leave and stop capture** in tab A. It disconnects and stops capture.
+   Its publications should disappear from tab B.
+2. Click **Unmount room** in each tab. The hook-owned Agent closes and capture stops.
+3. Check that the camera and microphone are no longer active.
+
+Disconnect alone does not release borrowed capture. This example stops it
+explicitly. It reports capture and connection failures rather than retrying
+them blindly.
+
+## Common blockers
+
+| Symptom | First check |
+| --- | --- |
+| Capture fails | Browser/site permission and HTTPS or localhost |
+| Join fails | Base endpoint, token expiry, and distinct participant credentials |
+| Connected, but no remote video | Both tabs published; remote video is visible and playback is allowed |
+| Remote audio is silent | Click **Enable remote audio**, then speak; check browser/OS output |
+| SDK does not initialize | JavaScript and WASM asset URLs; a WASM request must not return HTML |
+
+Follow [troubleshooting](/react/troubleshooting) for detailed checks.
+For a remote server, also verify its reachable media ports, TLS, and firewall
+settings in [deployment](/deployment).
+
+## Complete source
+
+These are the files served by the runner. The site includes the actual source,
+and `//agents/react:quickstart_types` checks it against the built public package.
+
+### Room.tsx
+
+<<< ./Room.tsx
+
+### main.tsx
+
+<<< ./main.tsx
+
+The HTML entry supplies `<div id="root"></div>` and loads the bundled
+`main.js`. In an SSR framework, mount the room in a client-only boundary.
+Keep capture, Web Audio, and WASM/media initialization out of server execution.
+Show the preparing state while `useAgent` returns null.
+
+## Use the SDK in your app
+
+The runner is the recommended first test. For an existing bundled browser app,
+use local packages from the same checkout:
+
+```bash
+./bazel build //agents/react:package //agents/pulsebeam-agent-web:package
+```
+
+With pnpm 10.12.4, add this application-level override to your
+`package.json`. Replace `/absolute/checkout` with your checkout's absolute path.
 
 ```json
 {
@@ -56,98 +154,34 @@ put an application-level override in your application's package.json
 }
 ```
 
-Then install the local React package alongside compatible React/React DOM:
+Then install the React package and compatible React dependencies:
 
 ```bash
 pnpm add file:/absolute/checkout/bazel-bin/agents/react/package react@18.3.1 react-dom@18.3.1
 ```
 
-The override supplies the React package's internal Web dependency from the same
-checkout. Application imports still use only `@pulsebeam/react`. Rebuild and
-reinstall local packages when changing SDK versions. Do not edit generated
-Bazel output.
+The override supplies the internal Web dependency. App imports still come
+from `@pulsebeam/react`. Rebuild and reinstall local packages when changing
+SDK versions; do not edit generated Bazel output.
 
-Your bundler must emit and serve the Web package's
-`dist/wasm/pulsebeam_agent_web_bg.wasm` at the URL resolved by its generated
-JavaScript. The example bundler copies it next to the bundled module.
-A 404, HTML fallback, CSP denial, or blocked WASM initialization is a setup
-failure, not a camera-permission problem. See [troubleshooting](/react/troubleshooting#package-and-wasm).
-
-## 2. Start a matching development server
-
-In another terminal:
-
-```bash
-./bazel run //:server -- --dev
-```
-
-This serves signaling on `http://localhost:7070` and uses unprivileged media
-port 3478. Do not use this development authentication profile in production.
-
-## 3. Acquire two distinct participant tokens
-
-```bash
-./bazel run //:cli -- token --room react-demo --participant alice
-./bazel run //:cli -- token --room react-demo --participant bob
-```
-
-Paste Alice's output into tab A and Bob's into tab B. Both use the same room,
-but must not reuse a participant credential concurrently. The CLI's default
-token lifetime is one hour. Do not commit tokens or put signing keys in browser
-code. A pasted development token is only a local stand-in for your authenticated
-backend's token response.
-
-## 4. Run the complete browser integration
-
-The runner serves the following two source files. The site includes them
-directly, and the example gate type-checks them against built public declarations.
-
-### Room.tsx
-
-<<< ./Room.tsx
-
-### main.tsx
-
-<<< ./main.tsx
-
-The HTML entry contains `<div id="root"></div>` and a module script for the
-bundled `main.js`. For SSR frameworks, mount this application in a client-only
-boundary. Do not execute capture, Web Audio, or WASM/media initialization on
-the server. Render the null/preparing state until `useAgent` creates its Agent.
-
-## 5. Observe media and leave
-
-1. In both tabs, enter the endpoint and respective token, then **Open room**.
-2. Click **Join** in each. Wait for **Connection: connected** and the expected
-   admitted participant name. Intent alone is not successful admission.
-3. Click **Enable camera and microphone** in each and accept permission.
-   **Capture: active** and the local preview confirm capture, not remote delivery.
-4. Each tab should list the other's `camera` publication and render a moving
-   remote video. The remote audio publication count should become one.
-   Click **Enable remote audio** if the browser blocked automatic playback.
-   Use headphones to avoid feedback between two tabs. A count does not prove
-   audible signal; speak into the other tab's microphone.
-5. **Leave and stop capture** disconnects and releases devices. The other tab's
-   remote publication disappears. **Unmount room** also closes the hook-owned
-   Agent and stops capture. No device should remain active after unmount.
-
-The capture hook and source-binding effect perform cleanup independently:
-disconnect alone would not release capture. The example does not automatically
-retry capture errors or terminal connection failures.
+::: warning Serve the WASM asset
+Your bundler must serve `dist/wasm/pulsebeam_agent_web_bg.wasm` from the Web
+package at the URL resolved by its generated JavaScript. The example copies
+it next to the bundled module. Do not assume another bundler does this.
+See [package and WASM checks](/react/troubleshooting#package-and-wasm).
+:::
 
 ## Production handoff
 
-Your application backend must authenticate the user, choose the room and
-participant identity, and return a scoped token. Fetch that token over your
-authenticated application API before mounting the room, never mint it using
-a browser signing secret.
+Before mounting the room, fetch a scoped token from your authenticated backend.
+The backend chooses the room and participant identity and keeps the signing key.
 
-Observe `authorizationExpiresAt` (Unix seconds) and renew before expiry through
-your backend. Update the config's token without changing endpoint/topology/logging
-to renew the same Agent. The SDK does not fetch tokens for you.
-A new token must authorize the existing session identity; use a new Agent for a
-different participant/room. Denied admission or terminal expiry needs explicit
-diagnosis and a fresh authorized session, not endless reconnects.
+Renew before `authorizationExpiresAt` (Unix seconds). Update only the config's
+token to keep the same Agent. The SDK does not fetch new tokens for you.
+Use a new Agent for a different room or participant. See
+[connection and renewal](/react/guides#connection-renewal-and-errors).
 
-Continue with [guides](/react/guides), [reference](/react/reference), or
-[symptom-based troubleshooting](/react/troubleshooting).
+## Next step
+
+Choose a task in the [integration guides](/react/guides), or look up an exact
+contract in the [API reference](/react/reference).

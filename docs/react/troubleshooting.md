@@ -1,102 +1,138 @@
 ---
 title: React SDK troubleshooting
+description: Find the failing step, check its evidence, and choose a safe recovery.
 ---
 
 # Troubleshooting
 
-Start with the [checked quickstart](/react/quickstart) and the
-[API reference](/react/reference). Separate capture, admission, discovery,
-Mapping, and playback: success at one boundary does not prove the next.
+Find the first step that fails. Capture, connection, discovery, receiver
+assignment, and playback are separate: success at one does not prove the next.
+
+| What fails? | Start here |
+| --- | --- |
+| Camera, microphone, or screen access | [Permission and capture](#permission-and-capture-failures) |
+| Joining or staying connected | [Admission and connection](#admission-and-connection) |
+| Connected, but media is missing or silent | [Missing media](#missing-media) |
+| Browser blocks playback | [Autoplay](#autoplay) |
+| SDK fails before joining | [Package and WASM](#package-and-wasm) |
+| Messages fail or disappear | [Topic failures](#topic-failures) |
+
+If you have not seen a working room yet, try the
+[checked quickstart](/react/quickstart) first.
 
 ## Permission and capture failures
 
-Inspect `CaptureResult.state`, `error.code`, and the rejected `request()`.
+Read `capture.state`, `capture.error?.code`, and the rejection from
+`capture.request()`. Do not retry the same request without fixing its cause.
 
-| Code/symptom | Diagnostic and recovery |
+| Code or symptom | Next action |
 | --- | --- |
-| `permission-denied` | Check browser/site and OS permission, HTTPS/localhost, iframe permissions policy. Let the user change permission, then request from a gesture. |
-| `device-not-found` | Enumerate devices after permission, select an available device, or remove stale exact constraints. |
-| `device-busy` | Release competing application capture or check OS device access, then request explicitly. |
-| `constraint-unsatisfied` | Relax device/resolution constraints; do not repeat the same impossible request. |
-| `request-cancelled` | Chooser cancellation or a superseded request is visible failure, not successful capture. Request again only when intended. |
-| `not-supported` | Inspect mediaDevices/getUserMedia/getDisplayMedia and secure context; use a supported browser/environment. |
-| Replacement error with `active` | Old capture was retained. Keep previewing it and let the user select a replacement. |
-| Camera light remains after leave | Disconnect does not stop borrowed capture. Call hook `stop()` or unmount it. |
+| `permission-denied` | Check browser/site and OS permission, HTTPS/localhost, and iframe permissions policy. Request again after the user changes permission. |
+| `device-not-found` | Enumerate after permission. Choose an available device or remove a stale exact constraint. |
+| `device-busy` | Release competing capture or check OS device access, then request again. |
+| `constraint-unsatisfied` | Relax the device or resolution constraint. |
+| `request-cancelled` | The chooser was cancelled or the request was superseded. Request again only when intended. |
+| `not-supported` | Check `mediaDevices`, the required capture API, and secure context. Use a supported environment. |
+| Replacement error with `active` | Keep the old capture. Let the user choose another replacement. |
+| Camera light remains after leaving | Call the hook's `stop()` or unmount it. Disconnect does not stop borrowed capture. |
 
-Display-media errors are browser-normalized and cancellation can also appear
-as permission denial. Never promise a specific chooser behavior across browsers.
+Browsers normalize display-capture failures differently. Chooser cancellation
+may appear as permission denial; do not depend on one code in every browser.
 
 ## Admission and connection
 
-Read `getSnapshot().connection`, `failure.class/message`, admitted IDs, and
-`authorizationExpiresAt`. Enable `logging: {level: "debug"}` during diagnosis;
-this replaces a hook-owned Agent, and Chrome requires Verbose console output
-to show debug logs. Avoid logging bearer tokens.
+**Admission** is the server accepting the participant into a room.
+Calling `connect()` only expresses intent.
 
-- No admission: verify the absolute base endpoint, matching server/SDK version,
-  token expiry, room, and distinct participant credential. Inspect the native
-  HTTP request and CORS/TLS/mixed-content failures.
-- Admission succeeds but transport stalls: verify advertised media address and
-  UDP/TCP ports using [deployment](/deployment). An HTTP response alone is not
-  media connectivity.
-- Transient retry states: the runtime retries while connection is desired.
-  Disconnect cancels intent. Reconnect preserves desired state but cannot fix
-  bad credentials or assets.
-- `terminal-failure`: identify the failure class. Fix configuration/assets,
-  obtain appropriate authorization, or correct incompatible protocol versions
-  before creating a fresh Agent. Blind retry is not a supported repair.
-- Renewal failure: ask the backend for a token authorizing the same session.
-  Changing rooms or identities requires a new Agent, not token-only renewal.
+1. Read `getSnapshot().connection`, `failure.class`, and `failure.message`.
+2. Check the admitted external IDs and `authorizationExpiresAt`.
+3. If needed, enable `logging: {level: "debug"}`. Changing logging replaces
+   a hook-owned Agent. Enable Verbose in Chrome's console to see debug logs.
+
+Never log bearer tokens.
+
+| Symptom | Check and recovery |
+| --- | --- |
+| No admission | Base HTTP(S) endpoint, matching server/SDK version, token expiry, room, and distinct participant credential |
+| Native HTTP request fails | TLS, mixed content, and cross-origin access (CORS) settings |
+| Admitted, but media connection stalls | Advertised media address and UDP/TCP ports in [deployment](/deployment) |
+| Transient retry state | Runtime retries while connection is desired; disconnect cancels that intent |
+| `terminal-failure` | Fix the reported configuration, assets, authorization, or protocol issue before creating a fresh Agent |
+| Renewal fails | Get a backend token for the same session; use a new Agent to change room or participant |
+
+An HTTP response alone does not prove media connectivity.
+Reconnect preserves desired state, but cannot repair bad credentials or missing
+assets. Do not loop on terminal errors.
 
 ## Missing media
 
-- Confirm both tabs are connected with different participant IDs in one room.
-- Confirm local capture is active and sources are bound to the correct local
-  `camera`/`microphone` handles. `setSource(null)` withdraws; disabling
-  retains a black/silent publication.
-- Catalog presence is discovery, not receive Mapping. Inspect
-  `snapshot.catalog`, `snapshot.mapping`, and `snapshot.tracks`.
-- Give remote `Video` a visible nonzero size. Hidden/off-screen elements do not
-  demand video. Check remote topology capacity and console warnings for excess
-  visible consumers.
-- Check publication labels and application external IDs rather than matching
-  against opaque snapshot participant IDs.
-- Remote audio `receiving` indicates Mapping only. A silent sender, suspended
-  context, OS output selection, or autoplay can still mean no audible sound.
-- If capture was stopped, update/clear its bound sources. Disconnect or source
-  clearing alone does not release the capture device.
+Check in order. Stop at the first missing piece of evidence.
+
+1. **Both participants joined.** Each tab shows `connection === "connected"`
+   and a distinct admitted participant identity in the same room.
+2. **The sender captured and published.** Capture is active and the sources
+   are bound to the correct `camera` and `microphone` handles.
+   `setSource(null)` removes a publication; disabling keeps it black/silent.
+3. **The receiver discovered the publication.** Read `snapshot.catalog`,
+   the list of discovered participants and publications.
+4. **The SDK assigned a receiver.** Read `snapshot.mapping` and
+   `snapshot.tracks`. This assignment is called **Mapping**.
+   Discovery alone does not prove it happened.
+5. **Video is visible and playing.** Give remote `Video` a nonzero size.
+   Hidden/off-screen elements do not request receivers. Check topology
+   capacity warnings and [autoplay](#autoplay).
+6. **Audio is audible.** `receiving` only reports Mapping. Check sender
+   silence, the browser audio context, autoplay, and OS output selection.
+
+Match remote handles by external participant ID and label, not the opaque
+internal IDs in raw snapshot publications.
+
+If capture was stopped, clear or update its bound sources. Clearing a source
+or disconnecting an Agent does not release the capture device.
 
 ## Autoplay
 
-Remote audio needs no component. Automatic failures are logged. Add a gesture
-button that calls `remote.resumeAudio()` directly and catches failure.
-For video, display a button using `onPlaybackError`'s supplied `retry`.
-Do not defer these recovery calls until after an unrelated network request.
-`autoPlay={false}` intentionally leaves video paused but still requests media;
-native controls can start it. Repeat failures require inspecting the actual
-browser error, not adding global timers.
+Use a button gesture to recover blocked playback.
+
+| Media | Recovery |
+| --- | --- |
+| Audio | Call `agent.remote.resumeAudio()` directly in the click handler and catch rejection |
+| Video | Store `onPlaybackError`'s supplied `retry`; call it from a button and catch rejection |
+
+Audio needs no component; automatic failures are logged.
+Do not defer recovery until after an unrelated network request.
+With `autoPlay={false}`, video stays attached and requests media, but needs
+native controls or a gesture to start playback.
+
+If recovery still fails, inspect the browser error rather than adding timers.
 
 ## Package and WASM
 
-Use the local [package setup](/react/quickstart#_1-build-the-available-packages-and-example).
-Package metadata does not establish registry availability.
+Use the local [package setup](/react/quickstart#use-the-sdk-in-your-app).
+Package metadata does not prove registry availability.
 
-Check Network for `pulsebeam_agent_web_bg.wasm`: it must be a real WASM
-response, not HTML from an SPA fallback. Serve it at the module-resolved URL
-with an appropriate WASM content type and permitted CSP. Keep generated JS,
-declarations, and WASM from the same build. Check the console for initialization
-or unavailable WebRTC/Web Audio APIs. Do not import browser runtime into
-server-side execution or assume the bundler copies WASM automatically.
+**WASM** is WebAssembly, the SDK's compiled browser runtime. Check these
+before debugging camera permission:
 
-The repository runner supplies the asset explicitly. If it works but your
-application does not, compare emitted module/asset URLs, base path, MIME, CSP,
-and browser-only mounting before investigating media permissions.
+1. In Network, find `pulsebeam_agent_web_bg.wasm`. Its response must contain
+   WASM, not a 404 or the app's HTML fallback.
+2. Check the module-resolved URL, base path, and WASM content type.
+3. Check Content Security Policy (CSP) and console initialization errors.
+4. Keep generated JavaScript, declarations, and WASM from the same build.
+5. Confirm WebRTC and Web Audio are available and the SDK mounts only in the browser.
+
+Do not assume your bundler copies the asset. The quickstart runner does;
+compare its emitted asset layout with your app if only your app fails.
+Never execute browser media initialization during server-side rendering.
 
 ## Topic failures
 
-Catch publish/iteration errors and inspect `snapshot.topics` plus
-`topic-send-dropped`, `topic-channel-failed`, `topic-recovery-gap`, and
-`topic-resynchronized` events. Check JSON size, mode/name consistency, and
-subscription cleanup. Bounded queues and transient transport replacement can
-drop messages. Recover durable application state through your backend, not by
-assuming every admitted send was received.
+1. Catch publish and iteration errors.
+2. Check JSON size, topic name and mode, and subscription cleanup.
+3. Read `snapshot.topics` and the events `topic-send-dropped`,
+   `topic-channel-failed`, `topic-recovery-gap`, and `topic-resynchronized`.
+4. Reload authoritative app state from your backend when gaps matter.
+
+Queues are bounded. Connection recovery may drop messages, and accepted sends
+do not prove delivery. See [topic contracts](/react/reference#topics) rather
+than treating topics as durable storage.

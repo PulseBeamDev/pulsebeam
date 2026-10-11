@@ -1,175 +1,57 @@
 # PulseBeam React
 
-`@pulsebeam/react` provides browser acquisition, Agent ownership, and playback.
-Start with the [React SDK documentation](../../docs/react/index.md) and the
-[complete browser quickstart](../../docs/react/quickstart.md) for concepts,
-package setup, two-participant media, guides, reference, and troubleshooting.
-Registry availability is not implied by package metadata. Build and serve the
-checked example from a checkout with compatible locked React dependencies:
+`@pulsebeam/react` lets a browser React app capture, publish, and receive media.
+Start with the [complete quickstart](../../docs/react/quickstart.md):
+run two participants, see remote video, hear audio, and clean up on leave.
+
+## Run the checked example
+
+From a repository checkout with the [build prerequisites](../../docs/build.md):
+
+```sh
+./bazel run //:server -- --dev
+```
+
+Keep that server running. In another terminal:
 
 ```sh
 ./bazel run //agents/react:quickstart_dev
 ```
 
-For an existing application, the quickstart describes local Bazel packages,
-the internal Web dependency override, and required WASM asset handling.
+The [quickstart](../../docs/react/quickstart.md) explains distinct participant
+tokens, browser requirements, local package installation, and WASM assets.
+The runner builds local packages; metadata does not imply npm availability.
+Signing keys belong on your backend, not in browser code.
 
-`useAgent(config)` creates one independent Agent after mount and closes it on
-unmount. It returns `null` until the Agent is ready to use. Agents start
-**disconnected**: call `connect()` to request a connection and `disconnect()` to
-stop retrying. Both methods change desired connection state synchronously;
-observe `agent.getSnapshot().connection` for progress. Changing the token
-renews authorization on the same Agent; changing endpoint, topology, or logging
-replaces the Agent. `agent.getSnapshot().participantExternalId` and
-`roomExternalId` are the authoritative application identities supplied by
-admission. They are null before admission, retained while reconnecting to the
-same session, and cleared on disconnect. `participantId` remains a separate
-opaque canonical identifier for SDK internals. Use a distinct participant credential for each simultaneous
-Agent. The hook subscribes its component to Agent snapshot changes.
+## Choose your next task
 
-Capture is owned by its acquisition hook, not by any Agent. Request it from a
-user gesture, then lend its source to one or more stable logical handles:
+| Goal | Documentation |
+| --- | --- |
+| Understand sessions, capture, and publications | [Concepts](../../docs/react/index.md) |
+| Add device controls, screen sharing, or topics | [Integration guides](../../docs/react/guides.md) |
+| Look up exports, signatures, defaults, and limits | [API reference](../../docs/react/reference.md) |
+| Diagnose permission, connection, or playback failures | [Troubleshooting](../../docs/react/troubleshooting.md) |
 
-```tsx
-import { useEffect } from "react";
-import { useAgent, useUserMedia, type AgentConfig } from "@pulsebeam/react";
+## Ownership at a glance
 
-function Camera({ config }: { config: AgentConfig }) {
-  const agent = useAgent(config);
-  const capture = useUserMedia({ video: true, audio: false });
-  useEffect(() => {
-    if (!agent) return;
-    agent.connect();
-    return () => agent.disconnect();
-  }, [agent]);
-  useEffect(() => {
-    if (!agent) return;
-    const camera = agent.local.video("camera");
-    camera.setSource(capture.videoTrack);
-  }, [agent, capture.videoTrack]);
-  return (
-    <button onClick={() => void capture.request().catch(console.error)}>
-      {capture.state === "requesting" ? "Requesting…" : "Choose camera"}
-    </button>
-  );
-}
+| Resource | Owner and cleanup |
+| --- | --- |
+| Agent from `useAgent` | React hook; closes on unmount |
+| Agent from `createAgent` | Caller; unsubscribe and call `close()` |
+| Camera/microphone or display capture | Capture hook; `stop()` or unmount releases devices |
+| Remote video presentation | `Video`; unmount releases receive demand |
+| Topic subscription | Consumer; abort or end iteration |
+
+Agents start disconnected. Call `connect()` and observe the snapshot; intent
+alone does not prove admission. Disconnecting an Agent does not stop borrowed
+capture. Remote audio plays automatically, subject to browser autoplay rules.
+
+## Check changes
+
+```sh
+./bazel test //agents/react:fast
 ```
 
-Use the same Agent's catalog-backed remote handles directly, without looking
-up canonical publication IDs. Mounted video requests receive bandwidth based
-on visible element size; unmount releases demand. Remote audio plays automatically without an audio component:
-
-```tsx
-import { useEffect } from "react";
-import { Video, useAgent, type AgentConfig } from "@pulsebeam/react";
-
-function Room({
-  config,
-  onPlaybackError,
-}: {
-  config: AgentConfig;
-  onPlaybackError: (error: unknown, retry: () => Promise<void>) => void;
-}) {
-  const agent = useAgent(config);
-  useEffect(() => {
-    if (!agent) return;
-    agent.connect();
-    return () => agent.disconnect();
-  }, [agent]);
-  if (!agent) return null;
-  return (
-    <>
-      {agent.remote.videoTracks.map((track) => (
-        <Video
-          key={`${track.participantId}:${track.label}`}
-          source={track}
-          mirror={false}
-          className="participant"
-        />
-      ))}
-      <button
-        onClick={() =>
-          void agent.remote.resumeAudio().catch((error) =>
-            onPlaybackError(error, () => agent.remote.resumeAudio()),
-          )
-        }
-      >
-        Enable audio
-      </button>
-    </>
-  );
-}
-```
-
-`<Video>` also accepts a local video handle or a captured video source for
-pre-join preview, plus `null`, `mirror`, `muted`, `playsInline`, `className`, and
-`style`. Video defaults to `autoPlay={true}`. Set
-`autoPlay={false}` to attach without starting playback automatically; native
-`controls` can then start playback. Attachment still contributes receive demand.
-Use
-`track.setReceiveOptions({minHeight,minFps,priority,playoutDelay})` to replace
-remote policy without activating a hidden track. `onPlaybackError` receives a
-user-gesture retry for autoplay restrictions. `agent.topic<T>(name, { mode:
-"reliable" | "unreliable" })` provides typed JSON `publish(value)` and
-`subscribe({signal})` iteration; creating a topic does not subscribe.
-
-`useMediaDevices()` lists reactive cameras, microphones and speakers with
-readonly `id` and `label`, which may be empty until permission is granted.
-`useDisplayMedia({video,audio})` uses the same explicit `request()` and `stop()`
-pattern. User-media options changing while active request a replacement while
-retaining the old capture until success; display-media option changes never
-open a chooser automatically. `stop()` and unmount stop native tracks. Agent
-disconnect, source clearing, replacement and close never stop borrowed tracks.
-Use `camera.setEnabled(false)` or `microphone.setEnabled(false)` to send black
-video or silent audio without withdrawing the publication. Enablement is
-independent of capture, persists across source replacement, and can be set before
-capture arrives. `<Video source={camera}>` blanks the local preview while disabled.
-The SDK owns sender clones, so sharing capture across Agents does not share mute
-state. Use `setSource(null)` for publication withdrawal, not camera/microphone mute.
-Local handle labels and slots are reserved for the Agent's lifetime; exhausting
-capacity throws `LocalTrackCapacityError` synchronously.
-
-For low-level integration, `createAgent(config)` returns a caller-owned Agent.
-React ownership uses only `useAgent(config)`; video presentation uses `<Video>` with source handles. There is no provider-based ownership adapter or
-raw media attachment hook.
-The package depends on `@pulsebeam/web`, which supplies the browser runtime and
-WASM asset. Applications only need to install `@pulsebeam/react`; npm resolves
-the runtime dependency. See [npm releases](../../docs/releasing.md#npm-sdks) for
-registry setup and release ordering.
-
-## Logical discovery and audio analysis
-
-`agent.remote.participant(externalId)` works before discovery. Its `video(label)`
-and `audio(label)` handles survive departure and republication. Catalog-backed
-`participants`, `videoTracks`, and `audioTracks` exclude self and retain collection
-identity until membership changes. `useAgent` observes discovery changes.
-
-For an independently rendered audio indicator, use React's external-store binding:
-
-```tsx
-import { useSyncExternalStore } from "react";
-import type { RemoteAudioTrack } from "@pulsebeam/react";
-
-function Receiving({ track }: { track: RemoteAudioTrack }) {
-  const receiving = useSyncExternalStore(
-    (listener) => track.subscribe(listener),
-    () => track.receiving,
-    () => false,
-  );
-  return <span>{receiving ? "Receiving" : "Unmapped"}</span>;
-}
-```
-
-`receiving` follows Mapping, not audible signal or autoplay. Waveform and spectrum
-reads are imperative animation/DSP calls and do not trigger React renders.
-They use normalized amplitudes and decibels, respectively, with the default
-2048-point FFT and spectral smoothing. Smaller buffers get leading samples/bins,
-not a different FFT resolution; oversized tails and unavailable signal are zero
-for waveform and negative infinity for spectrum.
-
-Connected Agents select remote audio automatically. Low-level
-`setState({ connected: true, audio: { automatic: false } })` opts out of automatic
-selection, not playback of explicitly selected/pinned mapped audio.
-`resumeAudio()` is exceptional browser-autoplay recovery, can unlock before
-media arrives, and rejects on failure or close. Call it directly from a gesture;
-the SDK does not install global recovery listeners.
+The fast gate includes type-checking the actual quickstart sources.
+`//agents/pulsebeam-agent-web:browser` exercises the same application with
+two participants and real browser media.
