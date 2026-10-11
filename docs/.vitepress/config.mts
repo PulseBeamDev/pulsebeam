@@ -6,7 +6,7 @@ export default withMermaid(
     title: "PulseBeam",
     description: "Official documentation for the PulseBeam WebRTC SFU",
     cleanUrls: true,
-    srcExclude: ["README.md"],
+    srcExclude: ["README.md", "AGENTS.md"],
     vite: {
       optimizeDeps: {
         include: [
