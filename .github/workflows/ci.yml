@@ -17,14 +17,15 @@ jobs:
       - uses: actions/checkout@v5
       - uses: ./.github/actions/setup-ci
       - name: Run complete non-privileged gate
-        run: ./bazel test //:test --test_output=errors
+        run: ./bazel test //:test --test_output=errors --zip_undeclared_test_outputs
       - name: Retain test logs and browser evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: bazel-test-evidence
+          # Browser evidence names can contain ':'; upload Bazel's archive instead.
           path: |
             bazel-testlogs/**/test.log
-            bazel-testlogs/**/test.outputs/**
+            bazel-testlogs/**/test.outputs/outputs.zip
           include-hidden-files: true
           if-no-files-found: warn
