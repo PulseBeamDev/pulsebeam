@@ -11,11 +11,12 @@ media. Your application provides the server endpoint and participant token.
 
 **[Install the SDK and add your first room →](/react/quickstart)**
 
-The [quickstart](/react/quickstart) separates three parts: the PulseBeam
-media server (Docker/Podman), your backend (`@pulsebeam/server` to sign tokens),
-and your browser (`@pulsebeam/react` to join and share media). Signing keys
-never belong in the browser. Use any React framework; no source build or
-signaling code is needed.
+You build your application's backend and React frontend. PulseBeam supplies
+the media server, which you run with Docker or Podman. The
+[quickstart](/react/quickstart) shows the ownership and connection flow:
+your backend signs participant tokens using `@pulsebeam/server`; your React
+frontend uses `@pulsebeam/react` to connect directly to PulseBeam.
+Signing credentials never enter the browser.
 
 ## Find your next task
 
