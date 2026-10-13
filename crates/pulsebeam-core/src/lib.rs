@@ -14,7 +14,6 @@
 )]
 
 pub mod auth;
-mod development;
 pub mod dd;
 pub mod framing;
 pub mod h264;
