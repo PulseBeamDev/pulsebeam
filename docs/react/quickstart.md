@@ -5,15 +5,15 @@ description: Add live video and audio to your React app.
 
 # Add video and audio to React
 
-You build **your application's backend** and **React frontend**. PulseBeam
-provides the media server, which you run separately.
+You own **your application's backend** and **React frontend**. PulseBeam
+provides the separate media server, which you run.
 
 ```mermaid
 flowchart LR
     subgraph app["Your application — code you own"]
         backend["Backend: sign tokens"] -->|"participant token"| frontend["React frontend: runs in the browser"]
     end
-    frontend -->|"token + WebRTC media"| server["PulseBeam media server: you run"]
+    frontend <-->|"connection + media"| server["PulseBeam media server: you run"]
 ```
 
 Works with Next.js, Vite, Astro + React, or your existing React app.
@@ -61,64 +61,71 @@ Never send the signing credentials to the browser. In production, authenticate
 users and authorize room access before issuing tokens. For Rust, Go, or Python
 backends, use the corresponding server SDK.
 
-## 3. Your React frontend: connect
+## 3. Your React frontend: join and share media
 
-In **your React frontend** (running in your users' browsers), install the React SDK:
+In **your React application** (browser code), install the React SDK:
 
 ```sh
 npm install @pulsebeam/react
 ```
 
-In a browser-rendered React component, use the token from **your app backend**:
+Render a `Room` component with the participant `token` received from **your
+application backend**:
 
 ```tsx
-const agent = useAgent({ endpoint: "http://localhost:7070", token });
+import { useEffect } from "react";
+import { Video, useAgent, useUserMedia } from "@pulsebeam/react";
+
+export function Room({ token }: { token: string }) {
+  const agent = useAgent({ endpoint: "http://localhost:7070", token });
+  const capture = useUserMedia({ video: true, audio: true });
+
+  useEffect(() => {
+    if (!agent) return;
+    agent.local.video("camera").setSource(capture.videoTrack);
+    agent.local.audio("microphone").setSource(capture.audioTrack);
+  }, [agent, capture.videoTrack, capture.audioTrack]);
+
+  function join() {
+    if (!agent) return;
+    agent.connect();
+    void capture.request().catch(console.error);
+  }
+
+  function leave() {
+    agent?.disconnect();
+    capture.stop();
+  }
+
+  return (
+    <main>
+      <button disabled={!agent} onClick={join}>Join</button>
+      <button onClick={leave}>Leave</button>
+      <button disabled={!agent} onClick={() => {
+        void agent?.remote.resumeAudio().catch(console.error);
+      }}>Enable audio</button>
+
+      <Video source={capture.videoTrack} mirror
+        style={{ width: 320, height: 240 }} />
+      {agent?.remote.videoTracks.map((track) => (
+        <Video key={`${track.participantId}:${track.label}`}
+          source={track} style={{ width: 320, height: 240 }} />
+      ))}
+      {capture.error && <p role="alert">{capture.error.message}</p>}
+    </main>
+  );
+}
 ```
 
-Import `useAgent` from `@pulsebeam/react`; call `agent.connect()` on **Join**.
-Your React frontend connects directly to the **PulseBeam media server**; your
-app backend only supplies the token.
+The React SDK connects **directly to the PulseBeam media server**. Your backend
+only issues the token; it never carries the WebRTC media.
 
-## 4. Your React frontend: share camera and microphone
+## 4. Try it
 
-```tsx
-const media = useUserMedia({ video: true, audio: true });
-
-useEffect(() => {
-  if (!agent) return;
-  agent.local.video("camera").setSource(media.videoTrack);
-  agent.local.audio("microphone").setSource(media.audioTrack);
-}, [agent, media.videoTrack, media.audioTrack]);
-```
-
-Import `useUserMedia` from `@pulsebeam/react` and `useEffect` from React.
-Request capture in the Join click handler (not on mount):
-
-```tsx
-<button onClick={() => {
-  agent?.connect();
-  void media.request().catch(console.error);
-}}>Join</button>
-```
-
-The labels `camera` and `microphone` name your publications.
-
-## 5. Your React frontend: see the other participant
-
-```tsx
-{agent?.remote.videoTracks.map((track) => (
-  <Video key={track.participantId + ":" + track.label} source={track} />
-))}
-```
-
-Import `Video` from `@pulsebeam/react` and give it a visible, nonzero size.
-Remote audio plays automatically when allowed; if blocked, call
-`agent.remote.resumeAudio()` from a user click. On leave, call
-`agent.disconnect()` and `media.stop()`.
-
-Run your app and join from two tabs, each with its own token for the same room.
-**Success means each tab receives video and audio from the other**, not just
-a local preview. Use headphones to avoid feedback.
+Start your React app and open it in two tabs. Give each tab a **different token**
+for the same `demo` room, then click **Join** in both. Each tab should show
+its own camera and the other participant's video and audio. If the browser
+blocks audio playback, click **Enable audio**. Use headphones to avoid feedback.
 
 ## Complete example
 
