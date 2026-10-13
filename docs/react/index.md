@@ -59,8 +59,10 @@ and recovery limits.
   token for the same session; replace the Agent when identity changes.
 - **Media lifecycle:** disconnecting stops sending and receiving, but capture
   can remain active. Stop capture on leave or unmount its owning hooks.
-- **Capacity:** choose topology before creating the Agent. It reserves outgoing
-  and incoming media capacity; changing it requires a new Agent.
+- **Capacity:** topology is optional; the default reserves 2 local videos,
+  2 local audios, 16 remote videos and 8 remote audios. These are fixed media
+  slots, not participant limits. Changing capacity requires a new Agent;
+  automatic growth is not supported yet.
 
 Use the [guides](/react/guides) when adding controls, and the
 [reference](/react/reference) for exact contracts and advanced ownership APIs.
