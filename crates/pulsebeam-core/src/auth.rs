@@ -7,18 +7,41 @@ use data_encoding::BASE64URL_NOPAD;
 use ed25519_dalek::{Signature, VerifyingKey};
 pub use pulsebeam_auth::keys::{ApiSigningKey, ApiVerifyingKey, KeyValidationError};
 use serde::{Deserialize, Serialize, de};
-use std::{collections::HashMap, fmt};
+use std::{collections::HashMap, fmt, sync::LazyLock};
 
 #[cfg(test)]
 const KEY_BYTES: usize = 32;
 const REDACTED: &str = "[REDACTED]";
 pub const MAX_COMPACT_TOKEN_LEN: usize = 16_384;
 
-// Generated from server/auth/development.json; see tools/sync-development-credentials.py.
-pub use crate::development::{
-    DEVELOPMENT_API_KEY_ID, DEVELOPMENT_API_SIGNING_KEY, DEVELOPMENT_API_VERIFYING_KEY,
-    DEVELOPMENT_PROJECT_ID,
-};
+// The --dev server and all server SDKs use the same public test key.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DevCredentials {
+    project_id: ProjectId,
+    key_id: ApiKeyId,
+    secret: ApiSigningKey,
+    public_key: ApiVerifyingKey,
+}
+
+// This checked-in fixture is validated by the SDK credential tests. A malformed
+// embedded fixture is a build defect, not a recoverable user-input error.
+#[allow(clippy::expect_used)]
+fn load_dev_credentials() -> DevCredentials {
+    serde_json::from_str(include_str!("../../../server/auth/development.json"))
+        .expect("invalid PulseBeam development credentials")
+}
+
+static DEV_CREDENTIALS: LazyLock<DevCredentials> = LazyLock::new(load_dev_credentials);
+
+pub static DEVELOPMENT_PROJECT_ID: LazyLock<ProjectId> =
+    LazyLock::new(|| DEV_CREDENTIALS.project_id);
+pub static DEVELOPMENT_API_KEY_ID: LazyLock<ApiKeyId> =
+    LazyLock::new(|| DEV_CREDENTIALS.key_id);
+pub static DEVELOPMENT_API_SIGNING_KEY: LazyLock<ApiSigningKey> =
+    LazyLock::new(|| DEV_CREDENTIALS.secret.clone());
+pub static DEVELOPMENT_API_VERIFYING_KEY: LazyLock<ApiVerifyingKey> =
+    LazyLock::new(|| DEV_CREDENTIALS.public_key);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VerifiedAuthorization {
