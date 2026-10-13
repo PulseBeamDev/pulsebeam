@@ -73,12 +73,14 @@ Render a `Room` component with the participant `token` received from **your
 application backend**:
 
 ```tsx
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { Video, useAgent, useUserMedia } from "@pulsebeam/react";
 
 export function Room({ token }: { token: string }) {
   const agent = useAgent({ endpoint: "http://localhost:7070", token });
   const capture = useUserMedia({ video: true, audio: true });
+  const [error, setError] = useState("");
+  const reportError = (cause: unknown) => setError(String(cause));
 
   useEffect(() => {
     if (!agent) return;
@@ -89,7 +91,7 @@ export function Room({ token }: { token: string }) {
   function join() {
     if (!agent) return;
     agent.connect();
-    void capture.request().catch(console.error);
+    void capture.request().catch(reportError);
   }
 
   function leave() {
@@ -99,19 +101,32 @@ export function Room({ token }: { token: string }) {
 
   return (
     <main>
-      <button disabled={!agent} onClick={join}>Join</button>
+      <button disabled={!agent} onClick={join}>
+        Join
+      </button>
       <button onClick={leave}>Leave</button>
-      <button disabled={!agent} onClick={() => {
-        void agent?.remote.resumeAudio().catch(console.error);
-      }}>Enable audio</button>
+      <button
+        disabled={!agent}
+        onClick={() => void agent?.remote.resumeAudio().catch(reportError)}
+      >
+        Enable audio
+      </button>
 
-      <Video source={capture.videoTrack} mirror
-        style={{ width: 320, height: 240 }} />
+      <Video
+        source={capture.videoTrack}
+        mirror
+        style={{ width: 320, height: 240 }}
+      />
       {agent?.remote.videoTracks.map((track) => (
-        <Video key={`${track.participantId}:${track.label}`}
-          source={track} style={{ width: 320, height: 240 }} />
+        <Video
+          key={`${track.participantId}:${track.label}`}
+          source={track}
+          style={{ width: 320, height: 240 }}
+        />
       ))}
-      {capture.error && <p role="alert">{capture.error.message}</p>}
+      {(error || capture.error) && (
+        <p role="alert">{error || capture.error?.message}</p>
+      )}
     </main>
   );
 }
