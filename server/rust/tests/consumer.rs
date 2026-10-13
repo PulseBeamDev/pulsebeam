@@ -114,7 +114,13 @@ fn packaged_development_credentials_match_canonical_json() {
     assert_eq!(actual.secret, expected["secret"].as_str().unwrap());
     assert_eq!(actual.public_key, expected["publicKey"].as_str().unwrap());
     let token = pulsebeam_server::sign_participant_token(
-        &actual.project_id, &actual.key_id, &actual.secret, "demo", "alice", 2_000_000_000,
-    ).unwrap();
+        &actual.project_id,
+        &actual.key_id,
+        &actual.secret,
+        "demo",
+        "alice",
+        2_000_000_000,
+    )
+    .unwrap();
     assert!(!token.is_empty());
 }
