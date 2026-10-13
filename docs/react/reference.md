@@ -71,9 +71,8 @@ is not admission. See [connection diagnostics](/react/troubleshooting#admission-
 createAgent(config: AgentConfig): Agent
 ```
 
-Returns a caller-owned Agent synchronously, possibly before WebAssembly (WASM)
-initialization finishes. It starts disconnected and retains the latest complete
-desired state during initialization. Prefer `useAgent` for React ownership.
+Returns a caller-owned Agent synchronously. It starts disconnected and retains
+the latest desired state while initializing. Prefer `useAgent` for React ownership.
 
 The caller owns `subscribe`/`subscribeEvents` unsubscribe functions and
 `close()`. Unsubscribe and close are idempotent; close is terminal, fences
