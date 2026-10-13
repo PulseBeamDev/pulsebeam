@@ -10,22 +10,26 @@ You'll run a development server, issue participant tokens, and connect two tabs.
 
 ## 1. Start PulseBeam
 
-Install a **compatible** Linux server binary from
-[PulseBeam Releases](https://github.com/PulseBeamDev/pulsebeam/releases), then run:
+On Linux x86_64, run the published server image with Docker or Podman:
 
 ```sh
-pulsebeam --dev
+docker run --pull=always --rm --network=host ghcr.io/pulsebeamdev/pulsebeam:main --dev
 ```
 
-Your local endpoint is `http://localhost:7070`. Use a release that supports
-the current `/api/v1/native` endpoint: **older releases such as v0.4.6 are not
-compatible**. If no compatible binary is published yet, the
-[source checkout instructions](/build#local-development) are the fallback.
+Using Podman? Replace `docker` with `podman`. Your server is now at
+`http://localhost:7070`. Host networking lets WebRTC use UDP port 3478
+without container port mapping.
+
+The `:main` image follows the main branch. For a reproducible setup, use
+[a published commit-SHA image tag](https://github.com/PulseBeamDev/pulsebeam/pkgs/container/pulsebeam)
+instead. Building PulseBeam [from source](/build#local-development) is optional,
+not a prerequisite for using the SDK.
 
 ::: warning Development only
 `--dev` uses **public, insecure signing keys** and does not restrict network
-listeners to localhost. Keep the server behind your local firewall; never
-expose it to the internet or use these credentials in production.
+listeners to localhost. Host networking exposes the server's listeners on your
+machine's network interfaces. Keep them behind your local firewall; never
+expose them to the internet or use these credentials in production.
 :::
 
 ## 2. Install the SDK
