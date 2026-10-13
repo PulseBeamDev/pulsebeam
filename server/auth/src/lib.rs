@@ -222,7 +222,7 @@ mod tests {
                 Err(TokenError::Invalid)
             );
             let wrong_project = ProjectRegistry::new(vec![ProjectKeys {
-                project_id: DEVELOPMENT_PROJECT_ID,
+                project_id: *DEVELOPMENT_PROJECT_ID,
                 keys: vec![ProjectKey {
                     key_id: key,
                     verifying_key: signing.verifying_key(),
