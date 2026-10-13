@@ -3,14 +3,14 @@
 **See and hear the other participant in a React room.**
 
 [Install the SDK and add a room](../../docs/react/quickstart.md) in your own app.
-Start with Next.js and install the React and server SDKs:
+Install the React SDK in your app and the server SDK on a Node.js backend:
 
 ```sh
 npm install @pulsebeam/react @pulsebeam/server
 ```
 
-Use the [quickstart](../../docs/react/quickstart.md) to issue participant tokens
-on the server, then join and publish media in React.
+Use the [framework-independent quickstart](../../docs/react/quickstart.md) to
+issue participant tokens on your backend, then join and publish media in React.
 
 ## Build your next feature
 
@@ -29,6 +29,6 @@ Keep signing keys on your backend.
 ./bazel test //agents/react:fast
 ```
 
-The fast gate checks SDK contracts and the existing Vite-based repository test
-fixture. `//agents/pulsebeam-agent-web:browser` exercises that fixture with two
-participants; neither test builds the Next.js docs walkthrough.
+The fast gate checks SDK contracts and the repository's separate Vite test
+fixture. `//agents/pulsebeam-agent-web:browser` exercises that fixture with
+two participants; these checks don't validate the tutorial's other frameworks.
