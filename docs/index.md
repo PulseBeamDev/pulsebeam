@@ -34,6 +34,7 @@ Your backend decides who can join and issues scoped participant tokens. Keep
 signing keys on the backend, never in browser code. The SDK connects with those
 tokens; it does not provide an application login or fetch credentials for you.
 
-The [quickstart](/react/quickstart) includes an installation path, complete React
-code, two-participant checks, and a separately labeled local development sandbox.
-For the ownership model behind the code, see [React concepts](/react/).
+The [quickstart](/react/quickstart) walks through starting a local server,
+joining a room, and exchanging media using short SDK snippets. For a complete
+React application, see [PulseBeam Meet](https://github.com/PulseBeamDev/pulsebeam/tree/main/apps/meet).
+For the ownership model, see [React concepts](/react/).
