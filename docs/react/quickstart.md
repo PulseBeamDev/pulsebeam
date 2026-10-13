@@ -18,36 +18,35 @@ cd pulsebeam-room
 npm install @pulsebeam/react @pulsebeam/server
 ```
 
-## 2. Issue a participant token
+## 2. Create a participant token
 
-Replace `app/page.tsx`:
+Start a PulseBeam server in `--dev` mode at `http://localhost:7070`
+([local server setup](/build#local-development)). On the Next.js server:
 
 ```tsx
-import { randomUUID } from "node:crypto";
 import { signParticipantToken, INSECURE_DEV_CREDENTIALS } from "@pulsebeam/server";
-import Room from "./room";
 
-export const dynamic = "force-dynamic";
-
-export default function Page() {
-  const token = signParticipantToken({
-    ...INSECURE_DEV_CREDENTIALS,
-    room: "demo",
-    participant: randomUUID(),
-    expiration: Math.floor(Date.now() / 1000) + 3600,
-  });
-
-  return <Room token={token} endpoint="http://localhost:7070" />;
-}
+const token = signParticipantToken({
+  ...INSECURE_DEV_CREDENTIALS,
+  room: "demo",
+  participant: crypto.randomUUID(),
+  expiration: Math.floor(Date.now() / 1000) + 3600,
+});
 ```
 
-Replace the placeholders and endpoint with your PulseBeam credentials and server
-URL. Each page load gets a new participant identity in the same room.
+Each participant needs a different token for the same room. Generate the token
+on the server, then pass it to your React room component. In `app/page.tsx`,
+set `export const dynamic = "force-dynamic"` to issue a token per page load.
 
-**For local development only:** Don't commit real signing secrets. In production,
-authenticate users, authorize their room access, and load signing credentials from
-your server's secret store.
+::: warning Local development only
+The built-in credentials are public and work with PulseBeam's `--dev` server.
+**Never expose a dev server publicly or use these credentials for production.**
+In production, authenticate and authorize participants and protect signing keys
+on your server.
+:::
 
+The [shared JSON fixture](https://github.com/PulseBeamDev/pulsebeam/blob/main/server/auth/development.json)
+contains the same credentials for other server SDKs.
 ## 3. Add the room
 
 Create `app/room.tsx`:
