@@ -12,8 +12,9 @@ page covers both.
 
 ::: warning Legacy example, not current SDK onboarding
 The `pulsebeam-v0.4.6` image below does not provide the endpoints used by the
-current React SDK. For a local SDK trial, use the
-[React quickstart's source-based sandbox](/react/quickstart#local-development-sandbox).
+current React SDK. For a local source-based PulseBeam server, use the
+[build and development guide](/build). The [React quickstart](/react/quickstart)
+assumes a compatible endpoint and registered signing credentials.
 
 `--dev` uses publicly known development credentials and is for local testing
 only. Do not expose it through Caddy, a public hostname, or a public network.
