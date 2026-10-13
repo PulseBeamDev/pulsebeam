@@ -44,11 +44,13 @@ snapshots. It does not connect or start capture automatically.
 | --- | --- |
 | `endpoint` | Required absolute HTTP(S) base URL; the runtime adds `/api/v1/native` |
 | `token` | Required opaque bearer token |
-| `topology` | Required `MediaTopology`; reserves fixed media-slot capacity |
+| `topology` | Optional `MediaTopology`; omitted values use the defaults below |
 | `logging` | Optional `AgentLogging` |
 
-**MediaTopology** fields are optional; capacity is fixed for the Agent lifetime.
-Directions support at most 32 media sections.
+**MediaTopology** fields are optional. The SDK reserves these outgoing and
+incoming **track slots** when an Agent is created; they are not participant
+limits. Capacity stays fixed for that Agent's lifetime, and each direction
+supports at most 32 media sections.
 
 | Field | Default |
 | --- | --- |
@@ -56,6 +58,14 @@ Directions support at most 32 media sections.
 | `localAudios` | 2 |
 | `remoteVideos` | 16 |
 | `remoteAudios` | 8 |
+
+Local publication labels permanently claim a slot for the lifetime of the
+Agent, even after withdrawal. Creating more local labels than the reserved
+slots throws `LocalTrackCapacityError`; remote media beyond reserved receiver
+slots cannot be assigned. Set only the fields you need, for example
+`topology: { remoteVideos: 4 }`; unspecified fields retain their defaults.
+**Today, increasing any capacity means replacing the Agent and reconnecting.**
+Automatic resizing is planned, not implemented.
 
 **AgentLogging / LogLevel:** optional `level`, default `warn`.
 Supported levels: `off`, `error`, `warn`, `info`, `debug`, `trace`.
