@@ -1,28 +1,38 @@
 ---
 title: React quickstart
-description: Add a live video room to a Next.js app.
+description: Add live video and audio to any React app.
 ---
 
 # Add a video room to React
 
-Build a room where two people can see and hear each other. We'll use Next.js
-to issue participant tokens and `@pulsebeam/react` to handle media.
-The snippets below are building blocks for your own components, not a UI template.
+Build a room where two people can see and hear each other. The same React SDK
+works with Next.js, Vite, Astro, and other React setups. These short snippets
+focus on PulseBeam, not your app's UI.
 
-You need Node.js 22+ and a local PulseBeam development server.
+You need a local PulseBeam development server and Node.js 22+ to issue tokens.
 
-## 1. Create an app
+## 1. Install the SDK
+
+In your React project:
 
 ```bash
-npx create-next-app@latest pulsebeam-room --ts --app --no-src-dir --use-npm --yes
-cd pulsebeam-room
-npm install @pulsebeam/react @pulsebeam/server
+npm install @pulsebeam/react
 ```
+
+On your Node.js backend, install `@pulsebeam/server` to sign participant tokens:
+
+```bash
+npm install @pulsebeam/server
+```
+
+Starting from scratch? Use your usual scaffolder—for example,
+`npx create-next-app@latest pulsebeam-room` for Next.js.
+The remaining steps are the same regardless of framework.
 
 ## 2. Create a participant token
 
 Start a PulseBeam server in `--dev` mode at `http://localhost:7070`
-([local server setup](/build#local-development)). On the Next.js server:
+([local server setup](/build#local-development)). On your **backend**:
 
 ```tsx
 import { signParticipantToken, INSECURE_DEV_CREDENTIALS } from "@pulsebeam/server";
@@ -39,10 +49,10 @@ function issueToken() {
 }
 ```
 
-Call `issueToken()` inside a Server Component or request handler for each visitor,
-then pass that token to your React room component. Each participant needs a
-unique token for the same room; don't create it at module scope. For a Next.js
-page, use `export const dynamic = "force-dynamic"` to avoid sharing a cached page.
+Call `issueToken()` for each participant after deciding who can join the room,
+then send that token to your React app. Each participant needs a distinct
+identity in the same room. Never sign tokens in the browser or cache one
+participant's token for other visitors.
 
 ::: warning Local development only
 The built-in credentials are public and work with PulseBeam's `--dev` server.
@@ -51,13 +61,12 @@ In production, authenticate and authorize participants and protect signing keys
 on your server.
 :::
 
-The [shared JSON fixture](https://github.com/PulseBeamDev/pulsebeam/blob/main/server/auth/development.json)
-contains the same credentials for other server SDKs.
+These development credentials are shared by the other server SDKs.
 
 ## 3. Connect
 
-In a React Client Component (`"use client"`), import `useAgent` from
-`@pulsebeam/react`. Pass it the token issued by your server:
+In your browser-rendered React component, import `useAgent` from
+`@pulsebeam/react`. The `token` comes from your backend:
 
 ```tsx
 const agent = useAgent({
@@ -117,10 +126,11 @@ from a button click. On leave, call `agent.disconnect()` and `media.stop()`.
 npm run dev
 ```
 
-Open [localhost:3000](http://localhost:3000) in two tabs and click **Join** in
-both. You should see and hear the other participant. Use headphones to avoid
-feedback; if audio is blocked, click **Enable audio**. On one device, you may
-need two browsers or devices if camera sharing is unsupported.
+Open the local URL printed by your dev server in two tabs. Issue a distinct token
+for each tab in the same `demo` room, then click **Join** in both. You should
+see and hear the other participant. Use headphones to avoid feedback; if
+audio is blocked, call `agent.remote.resumeAudio()` from a button click. On one
+device, you may need two browsers or devices if camera sharing is unsupported.
 
 Next: [screen sharing and device controls](/react/guides) ·
 [API reference](/react/reference) · [Troubleshooting](/react/troubleshooting).
