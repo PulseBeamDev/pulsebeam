@@ -7,8 +7,8 @@ description: Choose an application integration, protocol publisher, or server de
 
 **To add video and audio to a React app, follow the [React quickstart →](/react/quickstart).**
 
-It covers server-side participant tokens, camera and microphone capture,
-remote playback, and leaving the room in any React app. Success
+It covers starting a development server, issuing participant tokens,
+joining a room, publishing capture, and receiving remote media in any React app. Success
 means seeing and hearing another participant, not just a local camera preview.
 
 ## Other starting points
