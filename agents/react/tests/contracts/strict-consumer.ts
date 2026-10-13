@@ -35,6 +35,13 @@ const config: AgentConfig = {
   },
   logging: { level: "info" },
 };
+const minimal: AgentConfig = {
+  endpoint: "https://pulsebeam.example",
+  token: "opaque-token",
+};
+const defaultAgent: Agent = createAgent(minimal);
+const defaultOwned: Agent | null = useAgent(minimal);
+void [defaultAgent, defaultOwned];
 const agent: Agent = createAgent(config);
 const owned: Agent | null = useAgent(config);
 // @ts-expect-error Each useAgent must have its own construction config.
