@@ -3,15 +3,17 @@
 **See and hear the other participant in a React room.**
 
 [Install the SDK and add a room](../../docs/react/quickstart.md) in your own app.
-The quickstart uses the published npm package, a server endpoint, and two participant
-tokens. A source-based local sandbox is available if you do not have a server yet.
+The Next.js quickstart uses the published client and server SDKs. Its server
+component mints a different participant token for each tab, using credentials
+registered with a compatible PulseBeam server.
 
 ```sh
 npm install @pulsebeam/react@0.2.0
 ```
 
 The compatible `@pulsebeam/web` runtime and its WASM asset are installed as a
-dependency. Follow the quickstart's bundler setup so the asset is served correctly.
+dependency. See [troubleshooting](../../docs/react/troubleshooting.md) if the
+app's bundler cannot serve the runtime.
 
 ## Build your next feature
 
@@ -30,5 +32,6 @@ Keep signing keys on your backend.
 ./bazel test //agents/react:fast
 ```
 
-The fast gate checks the quickstart's actual sources. The browser owner
-`//agents/pulsebeam-agent-web:browser` exercises the same app with two participants.
+The fast gate checks SDK contracts and the existing Vite-based repository test
+fixture. `//agents/pulsebeam-agent-web:browser` exercises that fixture with two
+participants; neither test builds the Next.js docs walkthrough.
