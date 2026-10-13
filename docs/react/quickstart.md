@@ -80,28 +80,42 @@ npm install @pulsebeam/react
 Pass the token from **your application backend** into a `Room` component:
 
 ```tsx
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { Video, useAgent, useUserMedia } from "@pulsebeam/react";
 
 export function Room({ token }: { token: string }) {
   const agent = useAgent({ endpoint: "http://localhost:7070", token });
   const media = useUserMedia({ video: true, audio: true });
+  const [joinError, setJoinError] = useState<string | null>(null);
 
+  // Send captured camera/microphone tracks to PulseBeam when they become available.
   useEffect(() => {
     if (!agent) return;
     agent.local.video("camera").setSource(media.videoTrack);
     agent.local.audio("microphone").setSource(media.audioTrack);
   }, [agent, media.videoTrack, media.audioTrack]);
 
-  function join() {
+  async function handleJoin() {
     if (!agent) return;
-    agent.connect();
-    void media.request().catch(console.error);
+    setJoinError(null);
+    try {
+      agent.connect();
+      await media.request();
+    } catch (error) {
+      setJoinError(error instanceof Error ? error.message : String(error));
+    }
   }
+
+  const snapshot = agent?.getSnapshot();
+  const connectionError =
+    snapshot?.connection === "terminal-failure" ? snapshot.failure?.message : null;
 
   return (
     <main>
-      <button disabled={!agent} onClick={join}>
+      <button
+        disabled={!agent || media.state === "requesting"}
+        onClick={handleJoin}
+      >
         Join
       </button>
       <Video
@@ -116,15 +130,19 @@ export function Room({ token }: { token: string }) {
           style={{ width: 320, height: 240 }}
         />
       ))}
+      {(joinError || connectionError) && (
+        <p role="alert">{joinError || connectionError}</p>
+      )}
     </main>
   );
 }
 ```
 
-`useAgent` prepares a room session using the participant token. **Join** connects
-to the PulseBeam media server and requests camera/microphone permission.
-The effect publishes those tracks when capture starts; `Video` shows your
-camera preview and other participants' video.
+`useAgent` owns the room session; `useUserMedia` owns camera/microphone capture.
+Clicking **Join** connects to PulseBeam and asks for device permission.
+The effect publishes tracks after capture succeeds; `Video` shows your preview
+and other participants. Capture errors appear in the page, while the Agent
+reports connection failures through its snapshot.
 
 Only the **token** comes from your backend. WebRTC media goes directly between
 the browser and PulseBeam. Remote audio plays automatically when allowed.
