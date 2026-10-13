@@ -11,9 +11,10 @@ media. Your application provides the server endpoint and participant token.
 
 **[Install the SDK and add your first room →](/react/quickstart)**
 
-The quickstart signs participant tokens on your backend, then connects two
-participants with React. Use it with Next.js or any other React framework;
-you don't need to write signaling code.
+The quickstart runs the published server image with Docker or Podman, signs
+participant tokens on your backend, and connects two participants with React.
+Use it with Next.js or any other React framework; no source build or signaling
+code is needed.
 
 ## Find your next task
 
