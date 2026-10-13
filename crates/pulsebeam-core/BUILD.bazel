@@ -4,7 +4,7 @@ load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test", "rust_clippy_tes
 
 package(default_visibility = ["//visibility:public"])
 filegroup(name = "workflow_inputs", srcs = glob(["*.md", "docs/**/*.md", "Justfile", "scripts/*.sh"], allow_empty = True))
-exports_files(["Cargo.toml", "src/development.rs"])
+exports_files(["Cargo.toml"])
 filegroup(name = "cargo_metadata_inputs", srcs = glob(["Cargo.toml", "uniffi.toml", "src/**/*.rs", "benches/**/*.rs", "examples/**/*.rs"], allow_empty = True))
 
 cargo_toml_env_vars(name = "cargo_env", src = "Cargo.toml", workspace = "//:Cargo.toml")
@@ -14,7 +14,7 @@ rust_library(
     name = "pulsebeam-core",
     crate_root = "src/lib.rs",
     srcs = glob(["src/**/*.rs"], exclude = ["src/bin/**"]),
-    compile_data = glob(["README.md", "src/**"], exclude = ["src/**/*.rs"]),
+    compile_data = glob(["README.md", "src/**"], exclude = ["src/**/*.rs"]) + ["//server/auth:development.json"],
     edition = crate_edition(),
     # Downstream dev dependencies require the same shared Rust crate identity.
     crate_features = ["reqwest", "str0m", "test-utils"],
