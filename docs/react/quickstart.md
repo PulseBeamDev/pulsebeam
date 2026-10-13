@@ -27,17 +27,20 @@ Start a PulseBeam server in `--dev` mode at `http://localhost:7070`
 ```tsx
 import { signParticipantToken, INSECURE_DEV_CREDENTIALS } from "@pulsebeam/server";
 
-const token = signParticipantToken({
-  ...INSECURE_DEV_CREDENTIALS,
-  room: "demo",
-  participant: crypto.randomUUID(),
-  expiration: Math.floor(Date.now() / 1000) + 3600,
-});
+function issueToken() {
+  return signParticipantToken({
+    ...INSECURE_DEV_CREDENTIALS,
+    room: "demo",
+    participant: crypto.randomUUID(),
+    expiration: Math.floor(Date.now() / 1000) + 3600,
+  });
+}
 ```
 
-Each participant needs a different token for the same room. Generate the token
-on the server, then pass it to your React room component. In `app/page.tsx`,
-set `export const dynamic = "force-dynamic"` to issue a token per page load.
+Call `issueToken()` inside a Server Component or request handler for each visitor,
+then pass that token to your React room component. Each participant needs a
+unique token for the same room; don't create it at module scope. For a Next.js
+page, use `export const dynamic = "force-dynamic"` to avoid sharing a cached page.
 
 ::: warning Local development only
 The built-in credentials are public and work with PulseBeam's `--dev` server.
