@@ -25,10 +25,12 @@ server with Ctrl+C.
 This builds the static site and checks its internal links. `README.md` and
 `AGENTS.md` are excluded from site pages, so check their links separately.
 
-The [React quickstart](react/quickstart.md) includes its actual `Room.tsx` and
-`main.tsx` sources. `//agents/react:quickstart_types` checks them against the built
-public packages, and `//agents/pulsebeam-agent-web:browser` exercises the same
-bundled application with two participants and real browser media.
+The [React quickstart](react/quickstart.md) now documents a standalone Next.js
+application with server-side token signing. The existing `react/Room.tsx` and
+`react/main.tsx` files remain a **separate Vite-based test fixture**:
+`//agents/react:quickstart_types` checks them against built packages, and
+`//agents/pulsebeam-agent-web:browser` exercises that fixture with browser media.
+These checks do not validate the new Next.js walkthrough.
 
 ## Publish the documentation
 
