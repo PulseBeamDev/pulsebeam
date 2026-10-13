@@ -49,8 +49,9 @@ snapshots. It does not connect or start capture automatically.
 
 **MediaTopology** fields are optional. The SDK reserves these outgoing and
 incoming **track slots** when an Agent is created; they are not participant
-limits. Capacity stays fixed for that Agent's lifetime, and each direction
-supports at most 32 media sections.
+limits. Capacity stays fixed for that Agent's lifetime; each individual
+field is capped at 32 slots (local video, local audio, remote video, and
+remote audio).
 
 | Field | Default |
 | --- | --- |
