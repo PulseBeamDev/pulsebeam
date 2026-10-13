@@ -4,6 +4,13 @@ Native Python 3.10+ server SDK using `cryptography`'s Ed25519 implementation.
 Ordinary crypto native extensions are supported; there is no PulseBeam network
 call, Rust signer, WASM, or language bridge. Public registry publication is deferred.
 
+## Local development
+
+`from pulsebeam_server import INSECURE_DEV_CREDENTIALS` provides the embedded
+public keys for `--dev` servers. Pass the mapping to
+`sign_participant_token(**INSECURE_DEV_CREDENTIALS, room=..., participant=..., expiration=...)`.
+**Never use these credentials in production or expose a development server.**
+
 ## Local installation
 
 ```sh
