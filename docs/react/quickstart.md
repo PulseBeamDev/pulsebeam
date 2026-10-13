@@ -25,7 +25,7 @@ The PulseBeam endpoint is `http://localhost:7070`.
 
 ## 2. Backend: issue a participant token
 
-On **your application backend**, install the server SDK:
+On **your Node.js backend**, install the server SDK:
 
 ```sh
 npm install @pulsebeam/server
