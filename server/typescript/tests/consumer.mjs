@@ -13,7 +13,7 @@ import { inspect } from "node:util";
 import ts from "typescript";
 
 // Exercise the publishable tarball, isolated from source and private imports.
-const [artifact, fixtures] = process.argv.slice(2).map((p) => resolve(p));
+const [artifact, fixtures, developmentFixture] = process.argv.slice(2).map((p) => resolve(p));
 const directory = mkdtempSync(
   join(process.env.TEST_TMPDIR || tmpdir(), "server-consumer-"),
 );
@@ -28,11 +28,25 @@ cpSync(codec, installedCodec, { recursive: true, dereference: true });
 writeFileSync(join(directory, "package.json"), '{"type":"module"}');
 writeFileSync(
   join(directory, "consumer.mjs"),
-  'export { signParticipantToken } from "@pulsebeam/server";',
+  'export { signParticipantToken, INSECURE_DEV_CREDENTIALS } from "@pulsebeam/server";',
 );
-const { signParticipantToken } = await import(
+const { signParticipantToken, INSECURE_DEV_CREDENTIALS } = await import(
   pathToFileURL(join(directory, "consumer.mjs"))
 );
+const development = JSON.parse(readFileSync(developmentFixture));
+assert.deepEqual(INSECURE_DEV_CREDENTIALS, {
+  projectId: development.projectId,
+  keyId: development.keyId,
+  secret: development.secret,
+});
+const devToken = signParticipantToken({
+  ...INSECURE_DEV_CREDENTIALS,
+  room: "local",
+  participant: "test",
+  expiration: 2000000000,
+});
+assert.equal(JSON.parse(Buffer.from(devToken.split(".")[1], "base64url")).iss, development.projectId);
+
 const document = JSON.parse(readFileSync(fixtures));
 const adapt = (i) => ({
   projectId: i.project_id,
@@ -94,7 +108,8 @@ assert(!inspect(signParticipantToken).includes(document.base.secret));
 // Resolve declarations through the installed package's public export map.
 writeFileSync(
   join(directory, "consumer.ts"),
-  `import { signParticipantToken } from "@pulsebeam/server";
+  `import { signParticipantToken, INSECURE_DEV_CREDENTIALS } from "@pulsebeam/server";
+const devKey: string = INSECURE_DEV_CREDENTIALS.secret;
 const input = {projectId:"p", keyId:"k", secret:"s", room:"r", participant:"p", expiration:18446744073709551615n};
 const token: string = signParticipantToken(input);
 signParticipantToken({...input, expiration: 2000});
