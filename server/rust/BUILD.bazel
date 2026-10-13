@@ -6,7 +6,7 @@ load("@rules_pkg//pkg:mappings.bzl", "pkg_files", "strip_prefix")
 load("@rules_python//python:defs.bzl", "py_binary")
 
 package(default_visibility = ["//visibility:public"])
-exports_files(["Cargo.toml"])
+exports_files(["Cargo.toml", "src/development.json"])
 filegroup(name = "workflow_inputs", srcs = ["README.md", "Cargo.toml"])
 filegroup(name = "cargo_metadata_inputs", srcs = ["Cargo.toml"] + glob(["src/**/*.rs"]))
 
@@ -16,6 +16,7 @@ rust_library(
     name = "pulsebeam-server",
     crate_root = "src/lib.rs",
     srcs = glob(["src/**/*.rs"]),
+    compile_data = ["src/development.json"],
     edition = crate_edition(),
     rustc_env_files = [":cargo_env"],
     lint_config = "//crates/pulsebeam-core:lints",
@@ -36,7 +37,7 @@ genrule(
 
 pkg_files(
     name = "source_files",
-    srcs = ["README.md", "LICENSE"] + glob(["src/**/*.rs"]),
+    srcs = ["README.md", "LICENSE"] + glob(["src/**"]),
     strip_prefix = strip_prefix.from_pkg(),
 )
 
@@ -58,7 +59,8 @@ genrule(
     name = "unpacked",
     srcs = [":package"],
     outs = ["unpacked/Cargo.toml", "unpacked/README.md", "unpacked/LICENSE",
-            "unpacked/src/lib.rs", "unpacked/vendor/pulsebeam-auth/Cargo.toml",
+            "unpacked/src/lib.rs", "unpacked/src/development.rs",
+            "unpacked/src/development.json", "unpacked/vendor/pulsebeam-auth/Cargo.toml",
             "unpacked/vendor/pulsebeam-auth/README.md", "unpacked/vendor/pulsebeam-auth/LICENSE",
             "unpacked/vendor/pulsebeam-auth/src/lib.rs",
             "unpacked/vendor/pulsebeam-auth/src/keys.rs", "unpacked/vendor/pulsebeam-auth/src/identity.rs"],
@@ -82,7 +84,8 @@ rust_library(
     name = "packaged_server",
     crate_name = "pulsebeam_server",
     crate_root = "unpacked/src/lib.rs",
-    srcs = ["unpacked/src/lib.rs"],
+    srcs = ["unpacked/src/lib.rs", "unpacked/src/development.rs"],
+    compile_data = ["unpacked/src/development.json"],
     edition = crate_edition(),
     aliases = aliases(),
     deps = all_crate_deps(normal = True) + [":packaged_auth"],
@@ -93,7 +96,7 @@ rust_test(
     name = "consumer",
     crate_root = "tests/consumer.rs",
     srcs = ["tests/consumer.rs"],
-    compile_data = ["//server/auth:vectors.json"],
+    compile_data = ["//server/auth:vectors.json", "//server/auth:development.json"],
     edition = crate_edition(),
     deps = [":packaged_server", "@crates//:serde", "@crates//:serde_json"],
 )
