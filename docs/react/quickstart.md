@@ -10,15 +10,19 @@ You'll run a development server, issue participant tokens, and connect two tabs.
 
 ## 1. Start PulseBeam
 
-On Linux x86_64, run the published server image with Docker or Podman:
+Run the published server image with Docker (or Podman):
 
 ```sh
-docker run --pull=always --rm --network=host ghcr.io/pulsebeamdev/pulsebeam:08eb6635a9d28694e2688865cfd9a69e0d71f1c2 --dev
+docker run --pull=always --rm --platform linux/amd64 --network=host ghcr.io/pulsebeamdev/pulsebeam:08eb6635a9d28694e2688865cfd9a69e0d71f1c2 --dev
 ```
 
-Using Podman? Replace `docker` with `podman`. Your server is now at
-`http://localhost:7070`. Host networking lets WebRTC use UDP port 3478
-without container port mapping.
+The image targets **linux/amd64**, not a particular host OS. Docker runs Linux
+containers on macOS and Windows too; ARM hosts need amd64 emulation. On Linux,
+`--network=host` makes signaling available at `http://localhost:7070` and
+allows WebRTC to use UDP port 3478 without port mapping. On macOS or Windows,
+[enable Docker Desktop host networking](https://docs.docker.com/engine/network/drivers/host/)
+(version 4.34+), and see [VM networking notes](/react/troubleshooting#container-networking)
+if media cannot connect. Podman Machine has different host-network behavior.
 
 This image is pinned to [commit `08eb663`](https://github.com/PulseBeamDev/pulsebeam/commit/08eb6635a9d28694e2688865cfd9a69e0d71f1c2)
 so the guide does not change when `main` advances. Building PulseBeam
