@@ -83,22 +83,23 @@ If recovery fails, inspect the browser error.
 
 ## Package and WASM
 
-Start with the [npm installation](/react/quickstart#1-install-the-sdk) and
-[browser entry setup](/react/quickstart#2-set-up-the-browser-entry).
+Start with the [Next.js setup](/react/quickstart#1-create-an-app) and the
+[client component](/react/quickstart#4-connect-and-publish).
 The published `@pulsebeam/react@0.2.0` package depends on `@pulsebeam/web@^0.2.0`;
 the Web package includes the compiled WebAssembly (WASM) runtime.
 
 1. In Network, find the request for `pulsebeam_agent_web_bg.wasm`. It must
    return the WASM file with `Content-Type: application/wasm`, not an HTML
    fallback or a 404.
-2. If the request goes to Vite's optimized dependency directory, apply the
-   quickstart's `optimizeDeps.exclude` configuration and restart Vite with
-   `npx vite --force`. Test both development serving and `npx vite build`.
-3. For other bundlers, emit or copy the WASM asset at the URL resolved relative
-   to the loader module. Check the deployed base path and Content Security Policy.
+2. In Next.js, keep `useAgent` and `Video` inside a `"use client"` component;
+   keep `signParticipantToken` on the server. Do not initialize the browser SDK
+   during server-side rendering.
+3. Confirm the bundler emits or serves the WASM at the module-resolved URL.
+   Check the deployed base path and Content Security Policy.
 4. Keep JavaScript, declarations, and WASM from the same package build; do not
    substitute a WASM file from another release or local checkout.
-5. Check WebRTC/Web Audio support; initialize only in the browser, never during SSR.
+5. Check WebRTC and Web Audio support. Test both development and production
+   builds, not only the TypeScript compiler.
 
 Try **Open room** and **Join** again. Successful WASM loading gets you past
 initialization; it does not by itself confirm server admission or media delivery.
