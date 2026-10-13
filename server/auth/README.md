@@ -13,10 +13,9 @@ public signing package.
 ## Shared development identity
 
 The public development identity is defined in [development.json](development.json).
-Rust core embeds it directly. Each independently distributed server SDK includes
-a local copy so it works without the PulseBeam repository.
-`//server/auth:development_credentials_match` checks that these package copies
-match. No code generation is needed.
+Rust core embeds it directly. Bazel stages the same file into each independently
+distributed server SDK's package. No credential copies are committed or
+synchronization step is needed.
 
 These keys are publicly known: **never use them for production or an exposed server**.
 
