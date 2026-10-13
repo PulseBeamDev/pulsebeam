@@ -7,8 +7,8 @@ description: Choose an application integration, protocol publisher, or server de
 
 **To add video and audio to a React app, follow the [React quickstart →](/react/quickstart).**
 
-It uses the Next.js scaffolder, server-side participant-token signing, camera
-and microphone capture, remote playback, and leaving the room. Success
+It covers server-side participant tokens, camera and microphone capture,
+remote playback, and leaving the room in any React app. Success
 means seeing and hearing another participant, not just a local camera preview.
 
 ## Other starting points
