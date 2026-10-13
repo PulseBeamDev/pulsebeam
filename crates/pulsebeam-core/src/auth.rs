@@ -425,10 +425,10 @@ mod tests {
 
     fn development_registry() -> ProjectRegistry {
         ProjectRegistry::new(vec![ProjectKeys {
-            project_id: DEVELOPMENT_PROJECT_ID,
+            project_id: *DEVELOPMENT_PROJECT_ID,
             keys: vec![ProjectKey {
-                key_id: DEVELOPMENT_API_KEY_ID,
-                verifying_key: DEVELOPMENT_API_VERIFYING_KEY,
+                key_id: *DEVELOPMENT_API_KEY_ID,
+                verifying_key: *DEVELOPMENT_API_VERIFYING_KEY,
             }],
         }])
         .unwrap()
@@ -514,8 +514,8 @@ mod tests {
             !format!(
                 "{:?}",
                 PrivateSigningBundle {
-                    project_id: DEVELOPMENT_PROJECT_ID,
-                    key_id: DEVELOPMENT_API_KEY_ID,
+                    project_id: *DEVELOPMENT_PROJECT_ID,
+                    key_id: *DEVELOPMENT_API_KEY_ID,
                     signing_key: signing,
                 }
             )
@@ -528,7 +528,7 @@ mod tests {
     fn development_constants_form_one_ed25519_pair() {
         assert_eq!(
             DEVELOPMENT_API_SIGNING_KEY.verifying_key(),
-            DEVELOPMENT_API_VERIFYING_KEY
+            *DEVELOPMENT_API_VERIFYING_KEY
         );
         assert_eq!(
             DEVELOPMENT_PROJECT_ID.as_str(),
@@ -610,7 +610,7 @@ mod tests {
 
         let authorization =
             verify_participant_token(&development_registry(), token, 1_999).unwrap();
-        assert_eq!(authorization.project_id, DEVELOPMENT_PROJECT_ID);
+        assert_eq!(authorization.project_id, *DEVELOPMENT_PROJECT_ID);
         assert_eq!(authorization.room_external_id, room);
         assert_eq!(authorization.participant_external_id, participant);
         assert_eq!(
@@ -632,6 +632,8 @@ mod tests {
     fn compact_shape_and_json_are_strict() {
         let registry = development_registry();
         let valid = profile_token("", "");
+        let key_id = DEVELOPMENT_API_KEY_ID.as_str();
+        let project_id = DEVELOPMENT_PROJECT_ID.as_str();
         for token in [
             "",
             "a.b",
@@ -646,17 +648,17 @@ mod tests {
             ),
             &signed_token(
                 &format!(
-                    "{{\"alg\":\"EdDSA\",\"kid\":\"{DEVELOPMENT_API_KEY_ID}\",\"typ\":\"pb+jwt\",\"unknown\":{{\"x\":1,\"x\":2}}}}"
+                    "{{\"alg\":\"EdDSA\",\"kid\":\"{key_id}\",\"typ\":\"pb+jwt\",\"unknown\":{{\"x\":1,\"x\":2}}}}"
                 ),
                 "{}",
                 &DEVELOPMENT_API_SIGNING_KEY,
             ),
             &signed_token(
                 &format!(
-                    "{{\"alg\":\"EdDSA\",\"kid\":\"{DEVELOPMENT_API_KEY_ID}\",\"typ\":\"pb+jwt\"}}"
+                    "{{\"alg\":\"EdDSA\",\"kid\":\"{key_id}\",\"typ\":\"pb+jwt\"}}"
                 ),
                 &format!(
-                    "{{\"iss\":\"{DEVELOPMENT_PROJECT_ID}\",\"aud\":\"pb\",\"sub\":\"alice\",\"room\":\"general\",\"exp\":2000,\"exp\":2001}}"
+                    "{{\"iss\":\"{project_id}\",\"aud\":\"pb\",\"sub\":\"alice\",\"room\":\"general\",\"exp\":2000,\"exp\":2001}}"
                 ),
                 &DEVELOPMENT_API_SIGNING_KEY,
             ),
@@ -803,7 +805,7 @@ mod tests {
         );
         let authorization =
             verify_participant_token(&development_registry(), &token, 1_000).unwrap();
-        assert_eq!(authorization.project_id, DEVELOPMENT_PROJECT_ID);
+        assert_eq!(authorization.project_id, *DEVELOPMENT_PROJECT_ID);
     }
 
     #[test]
