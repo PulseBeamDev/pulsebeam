@@ -13,7 +13,9 @@ import { inspect } from "node:util";
 import ts from "typescript";
 
 // Exercise the publishable tarball, isolated from source and private imports.
-const [artifact, fixtures, developmentFixture] = process.argv.slice(2).map((p) => resolve(p));
+const [artifact, fixtures, developmentFixture] = process.argv
+  .slice(2)
+  .map((p) => resolve(p));
 const directory = mkdtempSync(
   join(process.env.TEST_TMPDIR || tmpdir(), "server-consumer-"),
 );
@@ -45,7 +47,10 @@ const devToken = signParticipantToken({
   participant: "test",
   expiration: 2000000000,
 });
-assert.equal(JSON.parse(Buffer.from(devToken.split(".")[1], "base64url")).iss, development.projectId);
+assert.equal(
+  JSON.parse(Buffer.from(devToken.split(".")[1], "base64url")).iss,
+  development.projectId,
+);
 
 const document = JSON.parse(readFileSync(fixtures));
 const adapt = (i) => ({
