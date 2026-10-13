@@ -5,13 +5,17 @@ description: Add live video and audio to any React app.
 
 # Add a video room to React
 
-Build a room where two people can see and hear each other. The same React SDK
-works with Next.js, Vite, Astro, and other React setups. These short snippets
-focus on PulseBeam, not your app's UI.
+Build a room where two people can see and hear each other. Use the React SDK
+with your existing framework—Next.js, Vite, Astro with React, or another
+browser-rendered React setup. These snippets teach PulseBeam, not React UI.
 
-You need a local PulseBeam development server and Node.js 22+ to issue tokens.
+You'll need a local PulseBeam development server. The Node.js signing example
+requires Node.js 22+; Rust, Go, and Python server SDKs are also available.
 
 ## 1. Install the SDK
+
+Starting fresh? Scaffold your React project as usual (for example,
+`npx create-next-app@latest pulsebeam-room` for Next.js).
 
 In your React project:
 
@@ -19,15 +23,15 @@ In your React project:
 npm install @pulsebeam/react
 ```
 
-On your Node.js backend, install `@pulsebeam/server` to sign participant tokens:
+On your Node.js backend (or the server side of a full-stack React app),
+install `@pulsebeam/server` to sign participant tokens:
 
 ```bash
 npm install @pulsebeam/server
 ```
 
-Starting from scratch? Use your usual scaffolder—for example,
-`npx create-next-app@latest pulsebeam-room` for Next.js.
-The remaining steps are the same regardless of framework.
+If your backend uses Rust, Go, or Python instead, use the corresponding
+PulseBeam server SDK. The browser integration is unchanged.
 
 ## 2. Create a participant token
 
@@ -49,10 +53,10 @@ function issueToken() {
 }
 ```
 
-Call `issueToken()` for each participant after deciding who can join the room,
-then send that token to your React app. Each participant needs a distinct
-identity in the same room. Never sign tokens in the browser or cache one
-participant's token for other visitors.
+Call `issueToken()` on your backend for each participant, then deliver the
+token to your React app. Each participant needs a distinct identity in the
+same room. Never sign tokens in the browser or share cached tokens between
+participants.
 
 ::: warning Local development only
 The built-in credentials are public and work with PulseBeam's `--dev` server.
@@ -122,11 +126,8 @@ from a button click. On leave, call `agent.disconnect()` and `media.stop()`.
 
 ## 6. Try it
 
-```bash
-npm run dev
-```
-
-Open the local URL printed by your dev server in two tabs. Issue a distinct token
+Wire the snippets into your app and start it with your normal development
+command (typically `npm run dev`). Open the app in two tabs. Issue a distinct token
 for each tab in the same `demo` room, then click **Join** in both. You should
 see and hear the other participant. Use headphones to avoid feedback; if
 audio is blocked, call `agent.remote.resumeAudio()` from a button click. On one
