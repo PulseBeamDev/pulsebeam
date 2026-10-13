@@ -35,8 +35,8 @@ to publish the package. Publication is not part of installation or testing.
 
 ## Development credentials
 
-For local `--dev` servers, `INSECURE_DEV_CREDENTIALS` provides the
-public test identity in [shared JSON](../auth/development.json).
+For local `--dev` servers, `INSECURE_DEV_CREDENTIALS` is loaded from
+embedded JSON generated from the [shared fixture](../auth/development.json).
 Never use it in production or expose a dev server publicly.
 
 ## Configure credentials
