@@ -11,9 +11,9 @@ media. Your application provides the server endpoint and participant token.
 
 **[Install the SDK and add your first room →](/react/quickstart)**
 
-The Next.js quickstart generates participant tokens on the server, then connects
-two browser participants with the React SDK. You do not need to learn the
-transport or write signaling code first.
+The quickstart signs participant tokens on your backend, then connects two
+participants with React. Use it with Next.js or any other React framework;
+you don't need to write signaling code.
 
 ## Find your next task
 
