@@ -108,8 +108,7 @@ WebAssembly loading error, check the failed request in Network. This is an SDK
 packaging/bundler integration issue, **not an application file to copy manually**.
 Report it with the SDK version, your framework/bundler version, and the failing request.
 
-See [the quickstart](/react/quickstart#3-react-client-connect) to retry a minimal
-integration.
+See [the quickstart](/react/quickstart) to retry a minimal integration.
 
 ## Topic failures
 
