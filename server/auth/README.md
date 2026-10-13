@@ -12,14 +12,13 @@ public signing package.
 
 ## Shared development identity
 
-The **single authoritative** public development identity is
-[development.json](development.json). The Rust server's `--dev` mode and every
-server SDK embed generated credentials from this same file.
+The public development identity is defined in [development.json](development.json).
+Rust core embeds it directly. Each independently distributed server SDK includes
+a local copy so it works without the PulseBeam repository.
+`//server/auth:development_credentials_match` checks that these package copies
+match. No code generation is needed.
 
-After changing it, run `python tools/sync-development-credentials.py` from
-the repository root. `//server/auth:development_credentials_sync` rejects
-out-of-date embedded copies or Rust constants. The development key is publicly
-known; **never use it for production or internet-facing servers**.
+These keys are publicly known: **never use them for production or an exposed server**.
 
 ## Inputs and codecs
 
