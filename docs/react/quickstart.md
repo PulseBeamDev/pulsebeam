@@ -126,8 +126,9 @@ You can omit `topology`, but capacity is **fixed for each Agent**:
 | Publish locally | 2 | 2 |
 | Receive remotely | 16 | 8 |
 
-These are reserved **track slots**, not room participant limits. A label keeps
-its outgoing slot even after withdrawal. Exceeding local slots throws
+These are reserved **track slots**, not room participant limits. Each of the
+four capacity fields can be set to at most **32**. A label keeps its outgoing
+slot even after withdrawal. Exceeding local slots throws
 `LocalTrackCapacityError`; excess remote tracks cannot be assigned receivers.
 To override defaults, pass `topology: { remoteVideos: 4 }` (other fields keep
 their defaults). Today changing capacity requires **recreating the Agent and
