@@ -29,7 +29,8 @@ docker run --rm --network host ghcr.io/pulsebeamdev/pulsebeam:08eb663 --dev
 The PulseBeam endpoint is `http://localhost:7070`.
 
 ::: warning Local development only
-`--dev` uses public signing keys. Keep the server off public networks.
+`--dev` trusts a fixed test key whose signing secret is publicly known.
+Anyone can mint valid tokens for it. Never expose a `--dev` server publicly.
 :::
 
 ## 2. Your app backend: issue a participant token
@@ -39,6 +40,10 @@ In **your application's backend** (Node.js), install the server SDK:
 ```sh
 npm install @pulsebeam/server
 ```
+
+`INSECURE_DEV_CREDENTIALS` provides the project ID, key ID, and signing secret
+matching the server's `--dev` identity. That is why tokens signed below work
+without configuring keys locally.
 
 ```ts
 import { signParticipantToken, INSECURE_DEV_CREDENTIALS } from "@pulsebeam/server";
@@ -57,9 +62,12 @@ function issueToken() {
 
 Call `issueToken()` for each participant and send the resulting token to
 your React frontend through your application's API or server-rendered props.
-Never send the signing credentials to the browser. In production, authenticate
-users and authorize room access before issuing tokens. For Rust, Go, or Python
-backends, use the corresponding server SDK.
+Never send signing credentials to the browser. **In production:** run PulseBeam
+without `--dev`, register your own public key with `--project-registry`, and
+keep its matching private signing key on your application backend. Authenticate
+users and authorize room access before issuing tokens.
+
+For Rust, Go, or Python backends, use the corresponding server SDK.
 
 ## 3. Your React frontend: join and share media
 
