@@ -101,12 +101,20 @@ export function Room({ token }: { token: string }) {
 
   return (
     <main>
-      <button disabled={!agent} onClick={join}>Join</button>
-      <Video source={media.videoTrack} mirror
-        style={{ width: 320, height: 240 }} />
+      <button disabled={!agent} onClick={join}>
+        Join
+      </button>
+      <Video
+        source={media.videoTrack}
+        mirror
+        style={{ width: 320, height: 240 }}
+      />
       {agent?.remote.videoTracks.map((track) => (
-        <Video key={`${track.participantId}:${track.label}`}
-          source={track} style={{ width: 320, height: 240 }} />
+        <Video
+          key={`${track.participantId}:${track.label}`}
+          source={track}
+          style={{ width: 320, height: 240 }}
+        />
       ))}
     </main>
   );
