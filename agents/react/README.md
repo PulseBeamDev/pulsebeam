@@ -9,8 +9,9 @@ Install the React SDK in your app:
 npm install @pulsebeam/react
 ```
 
-Use `@pulsebeam/server` on a Node.js backend, or the corresponding Rust,
-Go, or Python server SDK, to issue participant tokens.
+The React SDK runs in the browser. Issue participant tokens using
+`@pulsebeam/server` on your Node.js backend (or a Rust, Go, or Python server SDK).
+Keep signing credentials out of browser code.
 
 Use the [framework-independent quickstart](../../docs/react/quickstart.md) to
 start PulseBeam, issue tokens, and join or publish media in React.
