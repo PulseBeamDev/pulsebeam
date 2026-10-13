@@ -37,6 +37,7 @@ These are writing patterns, not mandatory website sections. A README can combine
 - For beginner SDK quickstarts, show one small, idiomatic example that completes the primary task. Avoid bundling optional controls, diagnostic UI, and advanced lifecycle management into the first snippet; link those from focused guides instead.
 - Visuals should explain something prose cannot convey as efficiently, not decorate or repeat it. Keep diagrams focused, accurately labeled, accessible without color, and legible on small screens. Use the renderer's supported formats.
 - Keep examples copyable and idiomatic. Include required setup, imports, permissions, cleanup, environment assumptions, and expected results; explicitly mark pseudocode or omitted steps.
+- Handle user-triggered async failures where they occur and show actionable errors in the UI. Do not use console logging as the only error handling in beginner examples.
 
 ## Ground and verify every claim
 
