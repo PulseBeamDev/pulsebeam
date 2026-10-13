@@ -5,11 +5,20 @@ description: Add live video and audio to your React app.
 
 # Add video and audio to React
 
-PulseBeam is the media server. **Your backend** issues participant tokens;
-**your React app** uses those tokens to connect and share media. This works
-with Next.js, Vite, Astro + React, or your existing React app.
+You build **your application's backend** and **React frontend**. PulseBeam
+provides the media server, which you run separately.
 
-## 1. Start PulseBeam (media server)
+```mermaid
+flowchart LR
+    subgraph app["Your application — code you own"]
+        backend["Backend: sign tokens"] -->|"participant token"| frontend["React frontend: runs in the browser"]
+    end
+    frontend -->|"token + WebRTC media"| server["PulseBeam media server: you run"]
+```
+
+Works with Next.js, Vite, Astro + React, or your existing React app.
+
+## 1. Run the PulseBeam media server
 
 With Docker (or Podman):
 
@@ -23,9 +32,9 @@ The PulseBeam endpoint is `http://localhost:7070`.
 `--dev` uses public signing keys. Keep the server off public networks.
 :::
 
-## 2. Backend: issue a participant token
+## 2. Your app backend: issue a participant token
 
-On **your Node.js backend**, install the server SDK:
+In **your application's backend** (Node.js), install the server SDK:
 
 ```sh
 npm install @pulsebeam/server
@@ -46,30 +55,31 @@ function issueToken() {
 }
 ```
 
-Call `issueToken()` for each participant and deliver the returned token to
-your React app through your existing backend API or server-rendered props.
+Call `issueToken()` for each participant and send the resulting token to
+your React frontend through your application's API or server-rendered props.
 Never send the signing credentials to the browser. In production, authenticate
 users and authorize room access before issuing tokens. For Rust, Go, or Python
 backends, use the corresponding server SDK.
 
-## 3. React client: connect
+## 3. Your React frontend: connect
 
-In **your browser app**, install the React SDK:
+In **your React frontend** (running in your users' browsers), install the React SDK:
 
 ```sh
 npm install @pulsebeam/react
 ```
 
-In a browser-rendered React component, pass the token from your backend:
+In a browser-rendered React component, use the token from **your app backend**:
 
 ```tsx
 const agent = useAgent({ endpoint: "http://localhost:7070", token });
 ```
 
 Import `useAgent` from `@pulsebeam/react`; call `agent.connect()` on **Join**.
-The browser connects directly to PulseBeam, not through your token endpoint.
+Your React frontend connects directly to the **PulseBeam media server**; your
+app backend only supplies the token.
 
-## 4. React client: share camera and microphone
+## 4. Your React frontend: share camera and microphone
 
 ```tsx
 const media = useUserMedia({ video: true, audio: true });
@@ -93,7 +103,7 @@ Request capture in the Join click handler (not on mount):
 
 The labels `camera` and `microphone` name your publications.
 
-## 5. React client: see the other participant
+## 5. Your React frontend: see the other participant
 
 ```tsx
 {agent?.remote.videoTracks.map((track) => (
