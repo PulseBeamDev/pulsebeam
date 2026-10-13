@@ -29,7 +29,9 @@ import { signParticipantToken, INSECURE_DEV_CREDENTIALS } from "@pulsebeam/serve
 
 function issueToken() {
   return signParticipantToken({
-    ...INSECURE_DEV_CREDENTIALS,
+    projectId: INSECURE_DEV_CREDENTIALS.projectId,
+    keyId: INSECURE_DEV_CREDENTIALS.keyId,
+    secret: INSECURE_DEV_CREDENTIALS.secret,
     room: "demo",
     participant: crypto.randomUUID(),
     expiration: Math.floor(Date.now() / 1000) + 3600,
