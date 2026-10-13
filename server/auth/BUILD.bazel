@@ -3,8 +3,8 @@ load("@rules_rust//cargo:defs.bzl", "cargo_toml_env_vars", "extract_cargo_lints"
 load("@rules_rust//rust:defs.bzl", "rust_library", "rust_binary", "rust_test", "rust_clippy_test", "rustfmt_test")
 
 package(default_visibility = ["//visibility:public"])
-exports_files(["vectors.json"])
-filegroup(name = "workflow_inputs", srcs = ["README.md", "Cargo.toml", "cases.json"])
+exports_files(["vectors.json", "development.json"])
+filegroup(name = "workflow_inputs", srcs = ["README.md", "Cargo.toml", "cases.json", "development.json"])
 filegroup(name = "cargo_metadata_inputs", srcs = ["Cargo.toml"] + glob(["src/**/*.rs"]))
 cargo_toml_env_vars(name = "cargo_env", src = "Cargo.toml", workspace = "//:Cargo.toml")
 extract_cargo_lints(name = "lints", manifest = "Cargo.toml", workspace = "//:Cargo.toml")
@@ -24,7 +24,7 @@ rust_library(
 rust_test(
     name = "contract",
     crate = ":pulsebeam-auth-conformance",
-    compile_data = ["vectors.json", "cases.json"],
+    compile_data = ["vectors.json", "cases.json", "development.json"],
     lint_config = ":lints",
 )
 
