@@ -11,9 +11,9 @@ media. Your application provides the server endpoint and participant token.
 
 **[Install the SDK and add your first room →](/react/quickstart)**
 
-The quickstart includes complete React components and checks that two
-participants exchange moving video and audible microphone audio. You do not
-need to learn the transport or write signaling code first.
+The Next.js quickstart generates participant tokens on the server, then connects
+two browser participants with the React SDK. You do not need to learn the
+transport or write signaling code first.
 
 ## Find your next task
 
