@@ -24,6 +24,8 @@ rust_library(
     crate_root = "src/lib.rs",
     srcs = glob(["src/**/*.rs"]),
     compile_data = [":development_json"],
+    rustc_flags = ["--cfg=pulsebeam_bazel"],
+    rustc_env = {"PULSEBEAM_DEVELOPMENT_JSON": "$(rootpath :development_json)"},
     edition = crate_edition(),
     rustc_env_files = [":cargo_env"],
     lint_config = "//crates/pulsebeam-core:lints",
