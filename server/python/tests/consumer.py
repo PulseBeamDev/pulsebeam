@@ -14,6 +14,7 @@ from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
 artifacts = pathlib.Path(sys.argv[1])
 vectors = json.loads(pathlib.Path(sys.argv[2]).read_text())
+development = json.loads(pathlib.Path(sys.argv[3]).read_text())
 with tempfile.TemporaryDirectory() as directory:
     site = pathlib.Path(directory) / "site"
     destination = SchemeDictionaryDestination(
@@ -29,6 +30,15 @@ with tempfile.TemporaryDirectory() as directory:
     sdk = importlib.import_module("pulsebeam_server")
     assert pathlib.Path(sdk.__file__).is_relative_to(site)
     sign = sdk.sign_participant_token
+    assert sdk.INSECURE_DEV_CREDENTIALS == {
+        "project_id": development["projectId"],
+        "key_id": development["keyId"],
+        "secret": development["secret"],
+    }
+    packaged = site / "pulsebeam_server/development.json"
+    assert json.loads(packaged.read_text()) == development
+    assert sign(**sdk.INSECURE_DEV_CREDENTIALS, room="demo", participant="alice",
+                expiration=2000000000)
     assert (site / "pulsebeam_server/py.typed").exists()
     for v in vectors["valid"]:
         args = {**v["input"], "expiration": int(v["input"]["expiration"])}
