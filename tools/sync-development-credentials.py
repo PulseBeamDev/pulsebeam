@@ -8,7 +8,7 @@ import argparse
 import json
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(__file__).absolute().parent.parent
 SOURCE = ROOT / "server/auth/development.json"
 COPIES = (
     "server/go/development.json",
@@ -35,6 +35,10 @@ def bytes_literal(value):
     return ", ".join(f"0x{x:02x}" for x in value)
 
 
+def id_literal(value):
+    return ", ".join(f"0x{x:02x}" if x in (0x70, 0x80) else str(x) for x in value)
+
+
 def rust_constants(credentials):
     project = decoded(credentials["projectId"], "p_0", 16)
     key = decoded(credentials["keyId"], "kid_0", 16)
@@ -45,9 +49,9 @@ def rust_constants(credentials):
         "use crate::identity::{ApiKeyId, ProjectId};\n"
         "use pulsebeam_auth::keys::{ApiSigningKey, ApiVerifyingKey};\n\n"
         "pub const DEVELOPMENT_PROJECT_ID: ProjectId =\n"
-        f"    ProjectId::from_bytes([{bytes_literal(project)}]);\n"
+        f"    ProjectId::from_bytes([{id_literal(project)}]);\n"
         "pub const DEVELOPMENT_API_KEY_ID: ApiKeyId =\n"
-        f"    ApiKeyId::from_bytes([{bytes_literal(key)}]);\n"
+        f"    ApiKeyId::from_bytes([{id_literal(key)}]);\n"
         "pub const DEVELOPMENT_API_SIGNING_KEY: ApiSigningKey = ApiSigningKey::from_seed([\n"
         f"    {bytes_literal(signing[:16])},\n"
         f"    {bytes_literal(signing[16:])},\n"
