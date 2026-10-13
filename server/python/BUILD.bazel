@@ -3,9 +3,16 @@ load("@bazel_lib//lib:run_binary.bzl", "run_binary")
 load("@server_pypi//:requirements.bzl", "requirement")
 
 package(default_visibility = ["//visibility:public"])
-exports_files(["requirements.lock", "requirements.in", "pyproject.toml", "pulsebeam_server/development.json"])
+exports_files(["requirements.lock", "requirements.in", "pyproject.toml"])
+
+genrule(
+    name = "development_json",
+    srcs = ["//server/auth:development.json"],
+    outs = ["pulsebeam_server/development.json"],
+    cmd = "cp $< $@",
+)
 filegroup(name = "workflow_inputs", srcs = ["README.md", "pyproject.toml", "requirements.in"])
-filegroup(name = "sources", srcs = ["pyproject.toml", "README.md", "LICENSE"] + glob(["pulsebeam_server/*"]))
+filegroup(name = "sources", srcs = ["pyproject.toml", "README.md", "LICENSE"] + glob(["pulsebeam_server/*"]) + [":development_json"])
 
 py_binary(
     name = "builder",
@@ -18,7 +25,7 @@ run_binary(
     name = "package",
     tool = ":builder",
     srcs = [":sources", "pyproject.toml"],
-    args = ["$(location pyproject.toml)", "$(RULEDIR)/dist"],
+    args = ["$(location pyproject.toml)", "$(RULEDIR)/dist", "$(location :development_json)"],
     out_dirs = ["dist"],
 )
 
