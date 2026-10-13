@@ -91,9 +91,8 @@ WebAssembly loading error, check the failed request in Network. This is an SDK
 packaging/bundler integration issue, **not an application file to copy manually**.
 Report it with the SDK version, Next.js version, and the failing request.
 
-See [the quickstart](/react/quickstart#3-add-the-room) to retry a minimal
+See [the quickstart](/react/quickstart#3-connect) to retry a minimal
 integration.
-
 
 ## Topic failures
 
