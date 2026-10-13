@@ -1,4 +1,5 @@
 //! Publicly known credentials used only by PulseBeam servers running with --dev.
+#![allow(unexpected_cfgs)] // Bazel uses a compile-time file path; Cargo uses the packaged file.
 use serde::Deserialize;
 
 /// Insecure, fixed development credentials. Never use to authorize real users.
