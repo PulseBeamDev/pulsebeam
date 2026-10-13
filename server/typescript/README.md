@@ -2,7 +2,7 @@
 
 Mint participant bearer tokens on your Node.js backend for clients joining a
 PulseBeam room. The SDK signs locally with native Ed25519; it does not connect
-to PulseBeam or require Rust or WASM at runtime. It supports ESM and TypeScript
+to PulseBeam at runtime. It supports ESM and TypeScript
 on **Node.js 22 or newer**.
 
 Keep signing secrets on your backend. Give clients only participant tokens,
