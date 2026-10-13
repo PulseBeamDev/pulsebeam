@@ -6,7 +6,14 @@ load("@rules_pkg//pkg:mappings.bzl", "pkg_files", "strip_prefix")
 load("@rules_python//python:defs.bzl", "py_binary")
 
 package(default_visibility = ["//visibility:public"])
-exports_files(["Cargo.toml", "src/development.json"])
+exports_files(["Cargo.toml"])
+
+genrule(
+    name = "development_json",
+    srcs = ["//server/auth:development.json"],
+    outs = ["src/development.json"],
+    cmd = "cp $< $@",
+)
 filegroup(name = "workflow_inputs", srcs = ["README.md", "Cargo.toml"])
 filegroup(name = "cargo_metadata_inputs", srcs = ["Cargo.toml"] + glob(["src/**/*.rs"]))
 
@@ -16,7 +23,7 @@ rust_library(
     name = "pulsebeam-server",
     crate_root = "src/lib.rs",
     srcs = glob(["src/**/*.rs"]),
-    compile_data = ["src/development.json"],
+    compile_data = [":development_json"],
     edition = crate_edition(),
     rustc_env_files = [":cargo_env"],
     lint_config = "//crates/pulsebeam-core:lints",
@@ -37,7 +44,7 @@ genrule(
 
 pkg_files(
     name = "source_files",
-    srcs = ["README.md", "LICENSE"] + glob(["src/**"]),
+    srcs = ["README.md", "LICENSE"] + glob(["src/**"]) + [":development_json"],
     strip_prefix = strip_prefix.from_pkg(),
 )
 
