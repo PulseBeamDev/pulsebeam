@@ -108,7 +108,7 @@ fn public_artifact_conformance_and_diagnostics() {
 fn packaged_development_credentials_match_canonical_json() {
     let expected: serde_json::Value =
         serde_json::from_str(include_str!("../../auth/development.json")).unwrap();
-    let actual = pulsebeam_server::insecure_dev_credentials();
+    let actual = pulsebeam_server::insecure_dev_credentials().unwrap();
     assert_eq!(actual.project_id, expected["projectId"].as_str().unwrap());
     assert_eq!(actual.key_id, expected["keyId"].as_str().unwrap());
     assert_eq!(actual.secret, expected["secret"].as_str().unwrap());
