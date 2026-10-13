@@ -109,10 +109,10 @@ function copyConfig(config: AgentConfig): RuntimeConfig {
     endpoint: config.endpoint,
     token: config.token,
     topology: Object.freeze({
-      localVideos: config.topology.localVideos ?? 2,
-      localAudios: config.topology.localAudios ?? 2,
-      remoteVideos: config.topology.remoteVideos ?? 16,
-      remoteAudios: config.topology.remoteAudios ?? 8,
+      localVideos: config.topology?.localVideos ?? 2,
+      localAudios: config.topology?.localAudios ?? 2,
+      remoteVideos: config.topology?.remoteVideos ?? 16,
+      remoteAudios: config.topology?.remoteAudios ?? 8,
     }),
     logLevel: config.logging?.level ?? "warn",
   });
