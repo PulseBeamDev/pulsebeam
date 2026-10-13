@@ -7,7 +7,7 @@ import tempfile
 
 from setuptools import build_meta
 
-manifest, output = (pathlib.Path(p).resolve() for p in sys.argv[1:])
+manifest, output, development_json = (pathlib.Path(p).resolve() for p in sys.argv[1:])
 source = manifest.parent
 output.mkdir(parents=True, exist_ok=True)
 os.environ["SOURCE_DATE_EPOCH"] = "0"
@@ -16,6 +16,7 @@ with tempfile.TemporaryDirectory() as directory:
     for name in ("pyproject.toml", "README.md", "LICENSE"):
         shutil.copyfile(source / name, work / name)
     shutil.copytree(source / "pulsebeam_server", work / "pulsebeam_server", ignore=shutil.ignore_patterns("__pycache__"))
+    shutil.copyfile(development_json, work / "pulsebeam_server/development.json")
     os.chdir(work)
     build_meta.build_wheel(str(output))
     build_meta.build_sdist(str(output))
