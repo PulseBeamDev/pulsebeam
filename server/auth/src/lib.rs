@@ -236,7 +236,7 @@ mod tests {
             let wrong_key = ProjectRegistry::new(vec![ProjectKeys {
                 project_id: project,
                 keys: vec![ProjectKey {
-                    key_id: pulsebeam_core::auth::DEVELOPMENT_API_KEY_ID,
+                    key_id: *pulsebeam_core::auth::DEVELOPMENT_API_KEY_ID,
                     verifying_key: signing.verifying_key(),
                 }],
             }])
