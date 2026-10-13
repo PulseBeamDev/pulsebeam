@@ -42,20 +42,18 @@ rust_binary(
 )
 
 py_test(
-    name = "development_credentials_sync",
-    srcs = ["//tools:sync-development-credentials.py"],
-    main = "//tools:sync-development-credentials.py",
-    args = ["--check"],
+    name = "development_credentials_match",
+    srcs = ["//tools:tests/development_credentials_test.py"],
+    main = "//tools:tests/development_credentials_test.py",
     data = [
         "development.json",
         "//server/go:development.json",
         "//server/rust:src/development.json",
         "//server/python:pulsebeam_server/development.json",
         "//server/typescript:src/development.json",
-        "//crates/pulsebeam-core:src/development.rs",
     ],
 )
 
 rustfmt_test(name = "format", targets = [":pulsebeam-auth-conformance", ":generate_vectors"])
 rust_clippy_test(name = "clippy", targets = [":pulsebeam-auth-conformance", ":contract", ":generate_vectors"])
-test_suite(name = "fast", tests = [":contract", ":development_credentials_sync", ":format", ":clippy", "//server/rust:consumer", "//server/rust:compiler_contract"])
+test_suite(name = "fast", tests = [":contract", ":development_credentials_match", ":format", ":clippy", "//server/rust:consumer", "//server/rust:compiler_contract"])
