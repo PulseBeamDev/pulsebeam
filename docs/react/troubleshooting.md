@@ -101,7 +101,7 @@ the Web package includes the compiled WebAssembly (WASM) runtime.
 5. Check WebRTC and Web Audio support. Test both development and production
    builds, not only the TypeScript compiler.
 
-Try **Open room** and **Join** again. Successful WASM loading gets you past
+Try **Join with camera and microphone** again. Successful WASM loading gets you past
 initialization; it does not by itself confirm server admission or media delivery.
 
 ## Topic failures
