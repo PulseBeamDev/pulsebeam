@@ -5,8 +5,9 @@ Publish camera and microphone tracks, play another participant's media, and
 exchange live messages without owning WebRTC signaling or reconnection.
 
 For a React application, use the [React SDK quickstart](../../docs/react/quickstart.md)
-instead. It includes a complete application and owns capture and session cleanup
-through hooks. The direct browser API below is for applications managing their own UI.
+instead. It uses short, framework-independent snippets and owns capture
+and session cleanup through hooks. The complete app is in
+[PulseBeam Meet](../../apps/meet). The direct browser API below is for applications managing their own UI.
 
 ## Install and configure your browser app
 
@@ -19,7 +20,7 @@ Before joining, you need:
 - A compatible PulseBeam server's absolute HTTP(S) **base URL**, without
   `/api/v1/native`, and an unexpired participant token from your backend.
   Keep signing secrets out of the browser. If you need a local server and tokens,
-  use the [source-based sandbox](../../docs/react/quickstart.md#local-development-sandbox).
+  follow the [development server setup](../../docs/react/quickstart.md#1-start-pulsebeam).
 - A browser-rendered app on **HTTPS or localhost**, with WebRTC, WebAssembly,
   Web Audio, and camera/microphone access. An HTTPS page cannot use an insecure
   remote HTTP endpoint. Start capture from a user action and handle permission errors.
@@ -37,7 +38,7 @@ export default {
 ```
 
 For another bundler or a WASM loading failure, follow the
-[asset checks](../../docs/react/troubleshooting.md#package-and-wasm).
+[SDK initialization diagnostics](../../docs/react/troubleshooting.md#sdk-initialization).
 Initialize the SDK only in the browser, not during server-side rendering.
 
 ## Join, publish, and receive
