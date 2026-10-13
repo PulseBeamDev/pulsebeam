@@ -13,7 +13,7 @@ Pick the symptom. Fix the first failing step, then try again.
 | Can't join or stay connected | [Connection](#admission-and-connection) |
 | Connected, but no video or sound | [Media](#missing-media) |
 | Playback blocked | [Autoplay](#autoplay) |
-| SDK won't initialize | [Packages/WASM](#package-and-wasm) |
+| SDK won't initialize | [SDK initialization](#sdk-initialization) |
 | Messages fail or disappear | [Topics](#topic-failures) |
 
 ## Permission and capture failures
@@ -81,28 +81,19 @@ Do not defer the gesture behind a network request or replace it with a timer.
 With `autoPlay={false}`, video still requests media; provide native controls.
 If recovery fails, inspect the browser error.
 
-## Package and WASM
+## SDK initialization
 
-Start with the [Next.js setup](/react/quickstart#1-create-an-app) and the
-[client component](/react/quickstart#4-connect-and-publish).
-The published `@pulsebeam/react@0.2.0` package depends on `@pulsebeam/web@^0.2.0`;
-the Web package includes the compiled WebAssembly (WASM) runtime.
+If the SDK doesn't initialize, verify you're using a browser client component
+(`"use client"`) and a compatible version of `@pulsebeam/react`.
 
-1. In Network, find the request for `pulsebeam_agent_web_bg.wasm`. It must
-   return the WASM file with `Content-Type: application/wasm`, not an HTML
-   fallback or a 404.
-2. In Next.js, keep `useAgent` and `Video` inside a `"use client"` component;
-   keep `signParticipantToken` on the server. Do not initialize the browser SDK
-   during server-side rendering.
-3. Confirm the bundler emits or serves the WASM at the module-resolved URL.
-   Check the deployed base path and Content Security Policy.
-4. Keep JavaScript, declarations, and WASM from the same package build; do not
-   substitute a WASM file from another release or local checkout.
-5. Check WebRTC and Web Audio support. Test both development and production
-   builds, not only the TypeScript compiler.
+If the browser reports a missing `pulsebeam_agent_web_bg.wasm` file or a
+WebAssembly loading error, check the failed request in Network. This is an SDK
+packaging/bundler integration issue, **not an application file to copy manually**.
+Report it with the SDK version, Next.js version, and the failing request.
 
-Try **Join with camera and microphone** again. Successful WASM loading gets you past
-initialization; it does not by itself confirm server admission or media delivery.
+See [the quickstart](/react/quickstart#3-add-the-room) to retry a minimal
+integration.
+
 
 ## Topic failures
 
