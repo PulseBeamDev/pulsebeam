@@ -83,13 +83,14 @@ If recovery fails, inspect the browser error.
 
 ## SDK initialization
 
-If the SDK doesn't initialize, verify you're using a browser client component
-(`"use client"`) and a compatible version of `@pulsebeam/react`.
+If the SDK doesn't initialize, verify that React SDK code runs in the browser
+(not during server rendering) and that you're using compatible SDK versions.
+With Next.js App Router, mark browser components `"use client"`.
 
 If the browser reports a missing `pulsebeam_agent_web_bg.wasm` file or a
 WebAssembly loading error, check the failed request in Network. This is an SDK
 packaging/bundler integration issue, **not an application file to copy manually**.
-Report it with the SDK version, Next.js version, and the failing request.
+Report it with the SDK version, your framework/bundler version, and the failing request.
 
 See [the quickstart](/react/quickstart#3-connect) to retry a minimal
 integration.
