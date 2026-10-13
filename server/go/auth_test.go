@@ -184,3 +184,28 @@ func TestInvalidInputsAndDiagnostics(t *testing.T) {
 		})
 	}
 }
+
+func TestEmbeddedDevelopmentCredentials(t *testing.T) {
+	path := os.Getenv("PULSEBEAM_DEVELOPMENT")
+	if path == "" {
+		path = "../auth/development.json"
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var expected pulsebeam.DevelopmentCredentials
+	if err := json.Unmarshal(data, &expected); err != nil {
+		t.Fatal(err)
+	}
+	actual := pulsebeam.InsecureDevCredentials()
+	if actual != expected {
+		t.Fatal("embedded credentials differ from canonical JSON")
+	}
+	jwt, err := pulsebeam.SignParticipantToken(
+		actual.ProjectID, actual.KeyID, actual.Secret, "demo", "alice", 2000000000,
+	)
+	if err != nil || jwt == "" {
+		t.Fatalf("development token: %v", err)
+	}
+}
