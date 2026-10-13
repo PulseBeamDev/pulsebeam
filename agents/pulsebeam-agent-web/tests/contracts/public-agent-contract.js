@@ -99,6 +99,39 @@ globalThis.__pulsebeamPublic = (async () => {
   } catch (error) {
     closedHandleRejected = error.message === "agent is closed";
   }
+  const defaulted = window.pulsebeam.createAgent({
+    endpoint: location.origin,
+    token: "default-capacity-token",
+  });
+  const defaultedCamera = defaulted.local.video("camera");
+  const defaultedScreen = defaulted.local.video("screen");
+  const defaultedMicrophone = defaulted.local.audio("microphone");
+  const defaultedSystemAudio = defaulted.local.audio("system");
+  let defaultVideoExhausted = false;
+  let defaultAudioExhausted = false;
+  try {
+    defaulted.local.video("third");
+  } catch (error) {
+    defaultVideoExhausted =
+      error instanceof window.pulsebeam.LocalTrackCapacityError &&
+      error.capacity === 2;
+  }
+  try {
+    defaulted.local.audio("third");
+  } catch (error) {
+    defaultAudioExhausted =
+      error instanceof window.pulsebeam.LocalTrackCapacityError &&
+      error.capacity === 2;
+  }
+  const defaultTopology =
+    defaultedCamera.kind === "video" &&
+    defaultedScreen.kind === "video" &&
+    defaultedMicrophone.kind === "audio" &&
+    defaultedSystemAudio.kind === "audio" &&
+    defaultVideoExhausted &&
+    defaultAudioExhausted;
+  defaulted.close();
+
   const dual = window.pulsebeam.createAgent({
     endpoint: location.origin,
     token: "dual-handle-token",
@@ -280,6 +313,7 @@ globalThis.__pulsebeamPublic = (async () => {
     closeBeforeSettlement: second.getSnapshot().connection === "disconnected",
     localOperations: muted && unmuted,
     localHandles,
+    defaultTopology,
     validationRejected,
     scopedLogging: silentValidationRejected && scopedLogging,
     serializationFailureNonterminal,
