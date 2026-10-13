@@ -10,6 +10,17 @@ the SDK owns JWT generation, while core owns registry matching and verification.
 This conformance package tests their boundary; it is not the shared library or a
 public signing package.
 
+## Shared development identity
+
+The **single authoritative** public development identity is
+[development.json](development.json). The Rust server's `--dev` mode and every
+server SDK embed generated credentials from this same file.
+
+After changing it, run `python tools/sync-development-credentials.py` from
+the repository root. `//server/auth:development_credentials_sync` rejects
+out-of-date embedded copies or Rust constants. The development key is publicly
+known; **never use it for production or internet-facing servers**.
+
 ## Inputs and codecs
 
 All six inputs are mandatory: project ID, API key ID, signing secret, room
