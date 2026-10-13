@@ -4,6 +4,9 @@
 //! environment lookup, service call, or registration check is performed.
 //! Keep signing secrets on your server and send only the token to clients.
 
+pub mod development;
+pub use development::{InsecureDevCredentials, insecure_dev_credentials};
+
 use data_encoding::BASE64URL_NOPAD;
 use pulsebeam_auth::identity::{IdValidationError, format_id, parse_id, validate_external};
 use pulsebeam_auth::keys::{ApiSigningKey, KeyValidationError};
