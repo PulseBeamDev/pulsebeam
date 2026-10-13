@@ -25,10 +25,11 @@ server with Ctrl+C.
 This builds the static site and checks its internal links. `README.md` and
 `AGENTS.md` are excluded from site pages, so check their links separately.
 
-The [React quickstart](react/quickstart.md) uses Next.js. The separate Vite
-browser test fixture in `react/Room.tsx` and `react/main.tsx` is still exercised
-by `//agents/react:quickstart_types` and
-`//agents/pulsebeam-agent-web:browser`; those tests do not validate Next.js.
+The [React quickstart](react/quickstart.md) uses short, framework-independent
+SDK snippets. The separate Vite browser fixture in `react/Room.tsx` and
+`react/main.tsx` is still exercised by `//agents/react:quickstart_types` and
+`//agents/pulsebeam-agent-web:browser`; those tests don't cover every React
+framework.
 
 ## Publish the documentation
 
