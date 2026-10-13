@@ -15,7 +15,7 @@ pub struct InsecureDevCredentials {
 // Bazel's generated file lives under bazel-out, not next to this source file.
 // Packaged Cargo consumers use the normal relative include.
 #[cfg(pulsebeam_bazel)]
-const DEVELOPMENT_JSON: &str = include_str!(env!("PULSEBEAM_DEVELOPMENT_JSON"));
+const DEVELOPMENT_JSON: &str = include_str!(concat!("../../../", env!("PULSEBEAM_DEVELOPMENT_JSON")));
 #[cfg(not(pulsebeam_bazel))]
 const DEVELOPMENT_JSON: &str = include_str!("development.json");
 
