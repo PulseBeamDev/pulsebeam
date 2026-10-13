@@ -7,7 +7,14 @@ load("@server_npm//server/typescript:typescript/package_json.bzl", typescript = 
 load("@server_npm//server/typescript:prettier/package_json.bzl", prettier = "bin")
 
 package(default_visibility = ["//visibility:public"])
-exports_files(["package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml", "src/development.json"])
+exports_files(["package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml"])
+
+genrule(
+    name = "development_json",
+    srcs = ["//server/auth:development.json"],
+    outs = ["src/development.json"],
+    cmd = "cp $< $@",
+)
 filegroup(name = "workflow_inputs", srcs = ["README.md", "package.json", "pnpm-lock.yaml"])
 npm_link_all_packages(name = "node_modules")
 typescript.tsc_binary(name = "tsc")
@@ -24,8 +31,8 @@ js_run_binary(
 
 npm_package(
     name = "package",
-    srcs = ["package.json", "README.md", "LICENSE", ":typescript"],
-    replace_prefixes = {"typescript": "dist"},
+    srcs = ["package.json", "README.md", "LICENSE", ":typescript", ":development_json"],
+    replace_prefixes = {"typescript": "dist", "src": "dist"},
     packable = True,
 )
 
