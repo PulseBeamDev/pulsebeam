@@ -7,8 +7,9 @@ description: Add a live video room to a Next.js app.
 
 Build a room where two people can see and hear each other. We'll use Next.js
 to issue participant tokens and `@pulsebeam/react` to handle media.
+The snippets below are building blocks for your own components, not a UI template.
 
-You need Node.js 22+, a PulseBeam server URL, and signing credentials.
+You need Node.js 22+ and a local PulseBeam development server.
 
 ## 1. Create an app
 
@@ -47,6 +48,7 @@ on your server.
 
 The [shared JSON fixture](https://github.com/PulseBeamDev/pulsebeam/blob/main/server/auth/development.json)
 contains the same credentials for other server SDKs.
+
 ## 3. Connect
 
 In a React Client Component (`"use client"`), import `useAgent` from
@@ -77,8 +79,16 @@ useEffect(() => {
 }, [agent, media.videoTrack, media.audioTrack]);
 ```
 
-Call `media.request()` directly from a user click to capture the camera and
-microphone. The labels `camera` and `microphone` identify publications that
+Connect and request capture directly from the Join button:
+
+```tsx
+<button onClick={() => {
+  agent?.connect();
+  void media.request().catch(console.error);
+}}>Join</button>
+```
+
+The labels `camera` and `microphone` identify publications that
 other participants can receive.
 
 ## 5. Display remote video
@@ -95,6 +105,7 @@ Import `Video` from `@pulsebeam/react` and render the tracks you want to receive
 Visible videos request incoming media. Remote audio plays automatically when
 the browser permits; if blocked, call `agent.remote.resumeAudio()` directly
 from a button click. On leave, call `agent.disconnect()` and `media.stop()`.
+
 ## 6. Try it
 
 ```bash
