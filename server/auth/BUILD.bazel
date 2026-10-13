@@ -25,7 +25,7 @@ rust_library(
 rust_test(
     name = "contract",
     crate = ":pulsebeam-auth-conformance",
-    compile_data = ["vectors.json", "cases.json", "development.json"],
+    compile_data = ["vectors.json", "cases.json"],
     lint_config = ":lints",
 )
 
