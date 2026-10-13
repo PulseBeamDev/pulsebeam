@@ -5,6 +5,12 @@
 PulseBeam connectivity, WASM, foreign runtime, or dependency on the server/core
 crate. Public registry publication remains deferred.
 
+## Local development
+
+`insecure_dev_credentials()` returns the public keys embedded from the
+[shared development fixture](../auth/development.json), matching `--dev`
+servers. **Never use them with production or publicly accessible servers.**
+
 ## Local crate consumption
 
 Use a checkout as a normal Cargo path dependency:
