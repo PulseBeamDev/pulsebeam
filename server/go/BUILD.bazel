@@ -3,13 +3,20 @@ load("@rules_pkg//pkg:tar.bzl", "pkg_tar")
 load("@rules_python//python:defs.bzl", "py_test")
 
 package(default_visibility = ["//visibility:public"])
-exports_files(["go.mod", "development.json"])
+exports_files(["go.mod"])
+
+genrule(
+    name = "development_json",
+    srcs = ["//server/auth:development.json"],
+    outs = ["development.json"],
+    cmd = "cp $< $@",
+)
 filegroup(name = "workflow_inputs", srcs = ["README.md", "go.mod"])
 
 go_library(
     name = "server",
     srcs = ["auth.go", "development.go"],
-    embedsrcs = ["development.json"],
+    embedsrcs = [":development_json"],
     importpath = "github.com/PulseBeamDev/pulsebeam/server/go",
 )
 
@@ -22,7 +29,7 @@ go_test(
 
 pkg_tar(
     name = "package",
-    srcs = ["auth.go", "development.go", "development.json", "go.mod", "README.md", "LICENSE"],
+    srcs = ["auth.go", "development.go", ":development_json", "go.mod", "README.md", "LICENSE"],
     extension = "tar.gz",
 )
 
