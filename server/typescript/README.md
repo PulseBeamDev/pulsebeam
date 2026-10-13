@@ -33,6 +33,12 @@ Bazel supplies the build tools; your backend still needs Node.js 22 or newer.
 Maintainers can follow the [npm release guide](../../docs/releasing.md#npm-sdks)
 to publish the package. Publication is not part of installation or testing.
 
+## Development credentials
+
+For local `--dev` servers, `INSECURE_DEV_CREDENTIALS` provides the
+public test identity in [shared JSON](../auth/development.json).
+Never use it in production or expose a dev server publicly.
+
 ## Configure credentials
 
 You need a project ID, API key ID, and `sk_0...` signing secret whose public key
