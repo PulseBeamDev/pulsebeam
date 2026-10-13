@@ -39,8 +39,8 @@ py_test(
     name = "conformance",
     srcs = ["tests/install.py"],
     main = "tests/install.py",
-    args = ["$(rootpath :package.pack)", "$(rootpath :consumer)", "$(rootpath //server/auth:vectors.json)"],
-    data = [":package.pack", ":consumer", "//server/auth:vectors.json"],
+    args = ["$(rootpath :package.pack)", "$(rootpath :consumer)", "$(rootpath //server/auth:vectors.json)", "$(rootpath //server/auth:development.json)"],
+    data = [":package.pack", ":consumer", "//server/auth:vectors.json", "//server/auth:development.json"],
 )
 
 copy_to_directory(name = "format_sources", srcs = glob(["src/**", "tests/*.mjs", "*.json"]))
