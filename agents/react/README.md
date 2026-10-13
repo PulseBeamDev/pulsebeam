@@ -3,11 +3,14 @@
 **See and hear the other participant in a React room.**
 
 [Install the SDK and add a room](../../docs/react/quickstart.md) in your own app.
-Install the React SDK in your app and the server SDK on a Node.js backend:
+Install the React SDK in your app:
 
 ```sh
-npm install @pulsebeam/react @pulsebeam/server
+npm install @pulsebeam/react
 ```
+
+Use `@pulsebeam/server` on a Node.js backend, or the corresponding Rust,
+Go, or Python server SDK, to issue participant tokens.
 
 Use the [framework-independent quickstart](../../docs/react/quickstart.md) to
 issue participant tokens on your backend, then join and publish media in React.
