@@ -17,7 +17,6 @@ means seeing and hearing another participant, not just a local camera preview.
 | --- | --- |
 | Publish using the HTTP/SDP WHIP protocol | [WHIP publishing](/whip) |
 | Run and configure a server for your application | [Deployment](/deployment) |
-| Build and run a server locally as a contributor | [Build and development](/build) |
 | Build or contribute to PulseBeam | [Build and development](/build) |
 
 WHIP publishing and the React integration are different tasks. The React
