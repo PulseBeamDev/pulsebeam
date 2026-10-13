@@ -7,9 +7,10 @@ crate. Public registry publication remains deferred.
 
 ## Local development
 
-`insecure_dev_credentials()` returns the public keys embedded from the
-[shared development fixture](../auth/development.json), matching `--dev`
-servers. **Never use them with production or publicly accessible servers.**
+`insecure_dev_credentials()` returns the public keys from an embedded
+copy of the [shared development fixture](../auth/development.json), matching
+`--dev` servers. Pass the returned `project_id`, `key_id`, and `secret`
+to `sign_participant_token`. **Never use them with production or publicly accessible servers.**
 
 ## Local crate consumption
 
