@@ -13,7 +13,11 @@ Use `@pulsebeam/server` on a Node.js backend, or the corresponding Rust,
 Go, or Python server SDK, to issue participant tokens.
 
 Use the [framework-independent quickstart](../../docs/react/quickstart.md) to
-issue participant tokens on your backend, then join and publish media in React.
+start PulseBeam, issue tokens, and join or publish media in React.
+`useAgent({endpoint, token})` uses fixed defaults of 2 local videos,
+2 local audios, 16 remote videos, and 8 remote audios. See
+[capacity limits](../../docs/react/reference.md#configuration-types) for
+overrides and the current reconnect requirement.
 
 ## Build your next feature
 
