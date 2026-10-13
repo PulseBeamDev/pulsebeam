@@ -11,7 +11,14 @@ pub struct InsecureDevCredentials {
     pub public_key: String,
 }
 
+// Bazel's generated file lives under bazel-out, not next to this source file.
+// Packaged Cargo consumers use the normal relative include.
+#[cfg(pulsebeam_bazel)]
+const DEVELOPMENT_JSON: &str = include_str!(env!("PULSEBEAM_DEVELOPMENT_JSON"));
+#[cfg(not(pulsebeam_bazel))]
+const DEVELOPMENT_JSON: &str = include_str!("development.json");
+
 /// The same embedded development identity used by the SFU's --dev mode.
 pub fn insecure_dev_credentials() -> Result<InsecureDevCredentials, serde_json::Error> {
-    serde_json::from_str(include_str!("development.json"))
+    serde_json::from_str(DEVELOPMENT_JSON)
 }
