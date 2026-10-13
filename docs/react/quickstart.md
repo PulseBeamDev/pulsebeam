@@ -47,56 +47,55 @@ on your server.
 
 The [shared JSON fixture](https://github.com/PulseBeamDev/pulsebeam/blob/main/server/auth/development.json)
 contains the same credentials for other server SDKs.
-## 3. Add the room
+## 3. Connect
 
-Create `app/room.tsx`:
+In a React Client Component (`"use client"`), import `useAgent` from
+`@pulsebeam/react`. Pass it the token issued by your server:
 
 ```tsx
-"use client";
-
-import { useEffect } from "react";
-import { Video, useAgent, useUserMedia } from "@pulsebeam/react";
-
-export default function Room({ token, endpoint }: { token: string; endpoint: string }) {
-  const agent = useAgent({
-    token, endpoint,
-    topology: { localVideos: 1, localAudios: 1, remoteVideos: 2, remoteAudios: 2 },
-  });
-  const media = useUserMedia({ video: true, audio: true });
-
-  useEffect(() => {
-    if (!agent) return;
-    agent.local.video("camera").setSource(media.videoTrack);
-    agent.local.audio("microphone").setSource(media.audioTrack);
-  }, [agent, media.videoTrack, media.audioTrack]);
-
-  return (
-    <main>
-      <p>Connection: {agent?.getSnapshot().connection ?? "preparing"}</p>
-      <button disabled={!agent} onClick={() => {
-        agent?.connect();
-        void media.request().catch(console.error);
-      }}>Join</button>
-      <button onClick={() => { media.stop(); agent?.disconnect(); }}>Leave</button>
-      <button onClick={() => void agent?.remote.resumeAudio().catch(console.error)}>
-        Enable audio
-      </button>
-      <Video source={media.videoTrack} mirror style={{ width: 320, height: 240 }} />
-      {agent?.remote.videoTracks.map((track) => (
-        <Video key={track.participantId + ":" + track.label}
-          source={track} style={{ width: 320, height: 240 }} />
-      ))}
-    </main>
-  );
-}
+const agent = useAgent({
+  endpoint: "http://localhost:7070",
+  token,
+  topology: { localVideos: 1, localAudios: 1, remoteVideos: 2, remoteAudios: 2 },
+});
 ```
 
-`useAgent` connects to the room. `useUserMedia` requests camera and microphone
-access when you click **Join**. Local tracks are published as `camera` and
-`microphone`; rendering a remote `Video` requests that participant's video.
-Remote audio plays automatically when the browser allows it.
+One Agent represents one participant in one room. Call `agent.connect()`
+from your **Join** button.
 
-## 4. Try it
+## 4. Publish media
+
+Import `useUserMedia` from `@pulsebeam/react` and `useEffect` from React:
+
+```tsx
+const media = useUserMedia({ video: true, audio: true });
+
+useEffect(() => {
+  if (!agent) return;
+  agent.local.video("camera").setSource(media.videoTrack);
+  agent.local.audio("microphone").setSource(media.audioTrack);
+}, [agent, media.videoTrack, media.audioTrack]);
+```
+
+Call `media.request()` directly from a user click to capture the camera and
+microphone. The labels `camera` and `microphone` identify publications that
+other participants can receive.
+
+## 5. Display remote video
+
+Import `Video` from `@pulsebeam/react` and render the tracks you want to receive:
+
+```tsx
+{agent?.remote.videoTracks.map((track) => (
+  <Video key={track.participantId + ':' + track.label}
+    source={track} style={{ width: 320, height: 240 }} />
+))}
+```
+
+Visible videos request incoming media. Remote audio plays automatically when
+the browser permits; if blocked, call `agent.remote.resumeAudio()` directly
+from a button click. On leave, call `agent.disconnect()` and `media.stop()`.
+## 6. Try it
 
 ```bash
 npm run dev
