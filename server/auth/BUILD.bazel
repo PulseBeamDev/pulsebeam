@@ -1,6 +1,7 @@
 load("@crates//:defs.bzl", "aliases", "all_crate_deps", "crate_edition")
 load("@rules_rust//cargo:defs.bzl", "cargo_toml_env_vars", "extract_cargo_lints")
 load("@rules_rust//rust:defs.bzl", "rust_library", "rust_binary", "rust_test", "rust_clippy_test", "rustfmt_test")
+load("@rules_python//python:defs.bzl", "py_test")
 
 package(default_visibility = ["//visibility:public"])
 exports_files(["vectors.json", "development.json"])
@@ -40,6 +41,21 @@ rust_binary(
     proc_macro_deps = all_crate_deps(proc_macro = True),
 )
 
+py_test(
+    name = "development_credentials_sync",
+    srcs = ["//tools:sync-development-credentials.py"],
+    main = "//tools:sync-development-credentials.py",
+    args = ["--check"],
+    data = [
+        "development.json",
+        "//server/go:development.json",
+        "//server/rust:src/development.json",
+        "//server/python:pulsebeam_server/development.json",
+        "//server/typescript:src/development.json",
+        "//crates/pulsebeam-core:src/development.rs",
+    ],
+)
+
 rustfmt_test(name = "format", targets = [":pulsebeam-auth-conformance", ":generate_vectors"])
 rust_clippy_test(name = "clippy", targets = [":pulsebeam-auth-conformance", ":contract", ":generate_vectors"])
-test_suite(name = "fast", tests = [":contract", ":format", ":clippy", "//server/rust:consumer", "//server/rust:compiler_contract"])
+test_suite(name = "fast", tests = [":contract", ":development_credentials_sync", ":format", ":clippy", "//server/rust:consumer", "//server/rust:compiler_contract"])
