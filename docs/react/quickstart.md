@@ -13,16 +13,16 @@ You'll run a development server, issue participant tokens, and connect two tabs.
 On Linux x86_64, run the published server image with Docker or Podman:
 
 ```sh
-docker run --pull=always --rm --network=host ghcr.io/pulsebeamdev/pulsebeam:main --dev
+docker run --pull=always --rm --network=host ghcr.io/pulsebeamdev/pulsebeam:08eb6635a9d28694e2688865cfd9a69e0d71f1c2 --dev
 ```
 
 Using Podman? Replace `docker` with `podman`. Your server is now at
 `http://localhost:7070`. Host networking lets WebRTC use UDP port 3478
 without container port mapping.
 
-The `:main` image follows the main branch. For a reproducible setup, use
-[a published commit-SHA image tag](https://github.com/PulseBeamDev/pulsebeam/pkgs/container/pulsebeam)
-instead. Building PulseBeam [from source](/build#local-development) is optional,
+This image is pinned to [commit `08eb663`](https://github.com/PulseBeamDev/pulsebeam/commit/08eb6635a9d28694e2688865cfd9a69e0d71f1c2)
+so the guide does not change when `main` advances. Building PulseBeam
+[from source](/build#local-development) is optional,
 not a prerequisite for using the SDK.
 
 ::: warning Development only
