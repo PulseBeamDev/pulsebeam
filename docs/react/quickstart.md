@@ -101,66 +101,36 @@ Create `app/room.tsx`:
 ```tsx
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect } from "react";
 import { Video, useAgent, useUserMedia } from "@pulsebeam/react";
 
-export default function Room({
-  endpoint,
-  token,
-}: {
-  endpoint: string;
-  token: string;
-}) {
+export default function Room({ endpoint, token }: { endpoint: string; token: string }) {
   const agent = useAgent({
     endpoint,
     token,
-    topology: {
-      localVideos: 1,
-      localAudios: 1,
-      remoteVideos: 2,
-      remoteAudios: 2,
-    },
+    topology: { localVideos: 1, localAudios: 1, remoteVideos: 2, remoteAudios: 2 },
   });
-  const capture = useUserMedia({ video: true, audio: true });
-  const [error, setError] = useState("");
+  const media = useUserMedia({ video: true, audio: true });
 
   useEffect(() => {
     if (!agent) return;
-    agent.local.video("camera").setSource(capture.videoTrack);
-    agent.local.audio("microphone").setSource(capture.audioTrack);
-  }, [agent, capture.videoTrack, capture.audioTrack]);
-
-  const status = agent?.getSnapshot();
+    agent.local.video("camera").setSource(media.videoTrack);
+    agent.local.audio("microphone").setSource(media.audioTrack);
+  }, [agent, media.videoTrack, media.audioTrack]);
 
   return (
     <main>
-      <p>Connection: {status?.connection ?? "preparing"}</p>
+      <p>Connection: {agent?.getSnapshot().connection ?? "preparing"}</p>
+      <button disabled={!agent} onClick={() => {
+        agent?.connect();
+        void media.request().catch(console.error);
+      }}>Join with camera and microphone</button>
+      <button onClick={() => { media.stop(); agent?.disconnect(); }}>Leave</button>
       <button
         disabled={!agent}
-        onClick={() => {
-          agent?.connect();
-          void capture.request().catch((e) => setError(String(e)));
-        }}
-      >
-        Join with camera and microphone
-      </button>
-      <button onClick={() => {
-        capture.stop();
-        agent?.disconnect();
-      }}>Leave</button>
-      <button
-        disabled={!agent}
-        onClick={() =>
-          void agent?.remote.resumeAudio().catch((e) => setError(String(e)))
-        }
-      >
-        Enable remote audio
-      </button>
-      <Video
-        source={capture.videoTrack}
-        mirror
-        style={{ width: 320, height: 240 }}
-      />
+        onClick={() => void agent?.remote.resumeAudio().catch(console.error)}
+      >Enable remote audio</button>
+      <Video source={media.videoTrack} mirror style={{ width: 320, height: 240 }} />
       {agent?.remote.videoTracks.map((track) => (
         <Video
           key={track.participantId + ":" + track.label}
@@ -168,9 +138,9 @@ export default function Room({
           style={{ width: 320, height: 240 }}
         />
       ))}
-      {(error || capture.error || status?.failure) && (
+      {(media.error || agent?.getSnapshot().failure) && (
         <p role="alert">
-          {error || capture.error?.message || status?.failure?.message}
+          {media.error?.message ?? agent?.getSnapshot().failure?.message}
         </p>
       )}
     </main>
