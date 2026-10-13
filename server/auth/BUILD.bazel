@@ -43,8 +43,8 @@ rust_binary(
 
 py_test(
     name = "development_credentials_match",
-    srcs = ["//tools:tests/development_credentials_test.py"],
-    main = "//tools:tests/development_credentials_test.py",
+    srcs = ["tests/development_credentials_test.py"],
+    main = "tests/development_credentials_test.py",
     data = [
         "development.json",
         "//server/go:development.json",
