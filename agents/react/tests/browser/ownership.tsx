@@ -30,7 +30,6 @@ export async function runOwnershipContract() {
     right = useAgent({
       endpoint: location.origin,
       token: "independent-token",
-      topology: { localVideos: 1 },
     });
     return (
       <span>
@@ -55,11 +54,21 @@ export async function runOwnershipContract() {
     const secondVideo = independent.local.video("camera");
     firstVideo.setSource(source);
     secondVideo.setSource(source);
+    const secondSlot = independent.local.video("screen");
+    let defaultCapacityReached = false;
+    try {
+      independent.local.video("third");
+    } catch (error) {
+      defaultCapacityReached =
+        error instanceof RangeError && error.message.includes("third");
+    }
     const shared =
       first !== independent &&
       firstVideo !== secondVideo &&
       firstVideo.source === source &&
-      secondVideo.source === source;
+      secondVideo.source === source &&
+      secondSlot.kind === "video" &&
+      defaultCapacityReached;
     firstVideo.setEnabled(false);
     await new Promise((resolve) => setTimeout(resolve, 30));
     const independentEnablement =
