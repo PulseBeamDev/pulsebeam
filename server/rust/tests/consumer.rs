@@ -103,3 +103,18 @@ fn public_artifact_conformance_and_diagnostics() {
         assert!(!diagnostic.contains("4ccd089b28ff96da"));
     }
 }
+
+#[test]
+fn packaged_development_credentials_match_canonical_json() {
+    let expected: serde_json::Value =
+        serde_json::from_str(include_str!("../../auth/development.json")).unwrap();
+    let actual = pulsebeam_server::insecure_dev_credentials();
+    assert_eq!(actual.project_id, expected["projectId"].as_str().unwrap());
+    assert_eq!(actual.key_id, expected["keyId"].as_str().unwrap());
+    assert_eq!(actual.secret, expected["secret"].as_str().unwrap());
+    assert_eq!(actual.public_key, expected["publicKey"].as_str().unwrap());
+    let token = pulsebeam_server::sign_participant_token(
+        &actual.project_id, &actual.key_id, &actual.secret, "demo", "alice", 2_000_000_000,
+    ).unwrap();
+    assert!(!token.is_empty());
+}
