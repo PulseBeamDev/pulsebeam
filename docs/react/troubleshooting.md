@@ -52,6 +52,22 @@ For more detail, enable `logging: {level: "debug"}` and Chrome's Verbose console
 level. Changing logging replaces a hook-owned Agent. **Never log bearer tokens.**
 Reconnect cannot repair bad credentials or missing assets.
 
+## Container networking
+
+The published server image is `linux/amd64`, but the host may be Linux,
+macOS, or Windows. On an ARM host, enable amd64 emulation in your container
+runtime. On Docker Desktop (macOS/Windows), `--network=host` requires
+[host networking to be enabled](https://docs.docker.com/engine/network/drivers/host/)
+(Docker Desktop 4.34+). With Podman Machine, `--network=host` refers to the
+Linux VM's network, not your macOS/Windows host.
+
+If `http://localhost:7070` works but connecting or receiving media fails,
+check UDP 3478 **and the RTC IP address the server advertises at startup**.
+PulseBeam currently selects that address from its network interfaces; an
+address inside a container/VM may not be reachable from your browser.
+Forwarding ports alone does not fix an unreachable advertised ICE address.
+Native Linux host networking avoids this extra VM boundary.
+
 ## Missing media
 
 Check in order:
