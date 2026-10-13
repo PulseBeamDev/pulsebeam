@@ -24,16 +24,14 @@ Replace `app/page.tsx`:
 
 ```tsx
 import { randomUUID } from "node:crypto";
-import { signParticipantToken } from "@pulsebeam/server";
+import { signParticipantToken, INSECURE_DEV_CREDENTIALS } from "@pulsebeam/server";
 import Room from "./room";
 
 export const dynamic = "force-dynamic";
 
 export default function Page() {
   const token = signParticipantToken({
-    projectId: "p_...",
-    keyId: "kid_...",
-    secret: "sk_0...",
+    ...INSECURE_DEV_CREDENTIALS,
     room: "demo",
     participant: randomUUID(),
     expiration: Math.floor(Date.now() / 1000) + 3600,
