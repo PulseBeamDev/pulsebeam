@@ -4,6 +4,13 @@ Import `github.com/PulseBeamDev/pulsebeam/server/go` (package `pulsebeam`). Go 1
 is required. Signing uses only the Go standard library: no PulseBeam service,
 Rust, WASM, or foreign runtime is needed. Registry publication is deferred.
 
+## Local development
+
+`pulsebeam.InsecureDevCredentials()` returns the same embedded JSON identity
+used by the local `--dev` server. Pass its `ProjectID`, `KeyID`, and
+`Secret` fields to `SignParticipantToken`. **Never use these publicly known
+credentials in production or on an exposed server.**
+
 ## Local module consumption
 
 In your application's `go.mod`, require the module and replace it with a local
