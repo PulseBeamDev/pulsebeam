@@ -16,6 +16,7 @@ Applies to `docs/**` and every repository `README.md` (via the root `AGENTS.md`)
 - An integration quickstart should take the reader through obtaining the software, required configuration, minimal working code, and visible confirmation in their own application. A repository demo can supplement this path, not substitute for it.
 - State prerequisites before they are needed. Keep required setup, security boundaries, and blockers visible; reserve collapsible sections for lengthy source and optional detail.
 - Introduce concepts only when they help the next action. Explain what the reader must configure or own, not how every internal layer works. Link advanced configuration, implementation detail, and rationale from the relevant step.
+- Keep the main task free of distractions: show the shortest idiomatic command, retain only essential security caveats, and move platform quirks, version rationale, optional flags, and detailed limits to troubleshooting or reference.
 - Keep tutorial handoffs coherent. Preserve configuration, credentials, versions, and running processes when continuing a task; explicitly announce any reset or separate example.
 
 ## Match the content to the question
