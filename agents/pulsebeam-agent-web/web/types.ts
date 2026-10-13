@@ -44,7 +44,8 @@ export interface AgentConfig {
   readonly endpoint: string;
   /** Opaque bearer token issued by the application backend. */
   readonly token: string;
-  readonly topology: MediaTopology;
+  /** Optional fixed media capacity. Omitted fields use SDK defaults. */
+  readonly topology?: MediaTopology;
   readonly logging?: AgentLogging;
 }
 
