@@ -10,30 +10,16 @@ You'll run a development server, issue participant tokens, and connect two tabs.
 
 ## 1. Start PulseBeam
 
-Run the published server image with Docker (or Podman):
+With Docker (or Podman):
 
 ```sh
-docker run --pull=always --rm --platform linux/amd64 --network=host ghcr.io/pulsebeamdev/pulsebeam:08eb6635a9d28694e2688865cfd9a69e0d71f1c2 --dev
+docker run --rm --network host ghcr.io/pulsebeamdev/pulsebeam:08eb663 --dev
 ```
 
-The image targets **linux/amd64**, not a particular host OS. Docker runs Linux
-containers on macOS and Windows too; ARM hosts need amd64 emulation. On Linux,
-`--network=host` makes signaling available at `http://localhost:7070` and
-allows WebRTC to use UDP port 3478 without port mapping. On macOS or Windows,
-[enable Docker Desktop host networking](https://docs.docker.com/engine/network/drivers/host/)
-(version 4.34+), and see [VM networking notes](/react/troubleshooting#container-networking)
-if media cannot connect. Podman Machine has different host-network behavior.
+Your server is at `http://localhost:7070`.
 
-This image is pinned to [commit `08eb663`](https://github.com/PulseBeamDev/pulsebeam/commit/08eb6635a9d28694e2688865cfd9a69e0d71f1c2)
-so the guide does not change when `main` advances. Building PulseBeam
-[from source](/build#local-development) is optional,
-not a prerequisite for using the SDK.
-
-::: warning Development only
-`--dev` uses **public, insecure signing keys** and does not restrict network
-listeners to localhost. Host networking exposes the server's listeners on your
-machine's network interfaces. Keep them behind your local firewall; never
-expose them to the internet or use these credentials in production.
+::: warning Local development only
+`--dev` uses public signing keys. Keep the server off public networks.
 :::
 
 ## 2. Install the SDK
@@ -125,31 +111,10 @@ Run your app and join from two tabs with distinct tokens. **Success means each
 tab receives moving video and audio from the other**, not just a local preview.
 Use headphones to avoid feedback.
 
-## Default capacity
-
-You can omit `topology`, but capacity is **fixed for each Agent**:
-
-| Direction | Video tracks | Audio tracks |
-| --- | ---: | ---: |
-| Publish locally | 2 | 2 |
-| Receive remotely | 16 | 8 |
-
-These are reserved **track slots**, not room participant limits. Each of the
-four capacity fields can be set to at most **32**. A label keeps its outgoing
-slot even after withdrawal. Exceeding local slots throws
-`LocalTrackCapacityError`; excess remote tracks cannot be assigned receivers.
-To override defaults, pass `topology: { remoteVideos: 4 }` (other fields keep
-their defaults). Today changing capacity requires **recreating the Agent and
-reconnecting**; automatic expansion is planned but not available yet.
-See [capacity and limits](/react/reference#configuration-types).
-
 ## Complete example
 
-Want to inspect a working application instead of assembling snippets?
-[PulseBeam Meet](https://github.com/PulseBeamDev/pulsebeam/tree/main/apps/meet)
-is the full React example. Its [local run instructions](https://github.com/PulseBeamDev/pulsebeam/blob/main/apps/meet/README.md)
-use the source repository's Bazel development workflow; that is **not**
-required to integrate the published SDK into your own app.
+Explore the [complete React example](https://github.com/PulseBeamDev/pulsebeam/tree/main/apps/meet)
+or see [capacity and configuration](/react/reference#configuration-types).
 
 Next: [screen sharing and controls](/react/guides) ·
 [API reference](/react/reference) · [Troubleshooting](/react/troubleshooting).
