@@ -34,6 +34,7 @@ These are writing patterns, not mandatory website sections. A README can combine
 ## Choose the clearest form
 
 - Prefer **working code** for integration, **steps** for procedures, **tables** for comparisons, and **flow/sequence/state diagrams** for relationships or behavior. Use a sentence when that is clearer.
+- For beginner SDK quickstarts, show one small, idiomatic example that completes the primary task. Avoid bundling optional controls, diagnostic UI, and advanced lifecycle management into the first snippet; link those from focused guides instead.
 - Visuals should explain something prose cannot convey as efficiently, not decorate or repeat it. Keep diagrams focused, accurately labeled, accessible without color, and legible on small screens. Use the renderer's supported formats.
 - Keep examples copyable and idiomatic. Include required setup, imports, permissions, cleanup, environment assumptions, and expected results; explicitly mark pseudocode or omitted steps.
 
