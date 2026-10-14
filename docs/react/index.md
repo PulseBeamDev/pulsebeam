@@ -11,9 +11,12 @@ media. Your application provides the server endpoint and participant token.
 
 **[Install the SDK and add your first room →](/react/quickstart)**
 
-The quickstart includes complete React components and checks that two
-participants exchange moving video and audible microphone audio. You do not
-need to learn the transport or write signaling code first.
+You build your application's backend and React frontend. PulseBeam supplies
+the media server, which you run with Docker or Podman. The
+[quickstart](/react/quickstart) shows the ownership and connection flow:
+your backend signs participant tokens using `@pulsebeam/server`; your React
+frontend uses `@pulsebeam/react` to connect directly to PulseBeam.
+Signing credentials never enter the browser.
 
 ## Find your next task
 
@@ -28,8 +31,8 @@ need to learn the transport or write signaling code first.
 
 These concepts explain the quickstart after you have tried it:
 
-1. **Agent:** one room session for one participant. `useAgent` owns it while
-   the component is mounted and closes it on unmount.
+1. **Agent:** one room session handle for one participant. `useAgent` returns
+   a handle immediately and owns its runtime while the component is mounted.
 2. **Capture:** `useUserMedia` and `useDisplayMedia` own local capture tracks.
    Start capture from a user gesture. Connect alone does not open devices.
 3. **Publication:** `agent.local.video("camera")` and
@@ -59,8 +62,10 @@ and recovery limits.
   token for the same session; replace the Agent when identity changes.
 - **Media lifecycle:** disconnecting stops sending and receiving, but capture
   can remain active. Stop capture on leave or unmount its owning hooks.
-- **Capacity:** choose topology before creating the Agent. It reserves outgoing
-  and incoming media capacity; changing it requires a new Agent.
+- **Capacity:** topology is optional; the default reserves 2 local videos,
+  2 local audios, 16 remote videos and 8 remote audios. These are fixed media
+  slots, not participant limits. Changing capacity requires a new Agent;
+  automatic growth is not supported yet.
 
 Use the [guides](/react/guides) when adding controls, and the
 [reference](/react/reference) for exact contracts and advanced ownership APIs.

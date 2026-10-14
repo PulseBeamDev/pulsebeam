@@ -7,8 +7,8 @@ description: Choose an application integration, protocol publisher, or server de
 
 **To add video and audio to a React app, follow the [React quickstart →](/react/quickstart).**
 
-It takes you through npm installation, endpoint and participant-token setup,
-camera and microphone capture, remote playback, and leaving the room. Success
+It starts PulseBeam with Docker or Podman, then covers issuing participant tokens,
+joining a room, publishing capture, and receiving remote media in any React app. Success
 means seeing and hearing another participant, not just a local camera preview.
 
 ## Other starting points
@@ -17,7 +17,6 @@ means seeing and hearing another participant, not just a local camera preview.
 | --- | --- |
 | Publish using the HTTP/SDP WHIP protocol | [WHIP publishing](/whip) |
 | Run and configure a server for your application | [Deployment](/deployment) |
-| Run a local source-based server and token helper | [Development sandbox](/react/quickstart#local-development-sandbox) |
 | Build or contribute to PulseBeam | [Build and development](/build) |
 
 WHIP publishing and the React integration are different tasks. The React
