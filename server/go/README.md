@@ -36,8 +36,8 @@ if err != nil {
 _ = token
 ```
 
-One server-side `PULSEBEAM_API_KEY` holds the project's UUIDv7, key UUIDv7,
-and 32-byte Ed25519 seed in the [V0 format](../auth/api-key.md). The legacy
+Configure one opaque, server-only `PULSEBEAM_API_KEY`; let the SDK interpret
+it. Do not parse, log, or send it to clients. The legacy
 `SignParticipantToken(projectID, keyID, secret, ...)` remains available.
 All credentials are explicit. The SDK never reads the environment. Expiration
 is a mandatory uint64 absolute Unix timestamp in `0..18446744073709551615`, not
@@ -47,9 +47,8 @@ validate external data before passing it to the typed API. No clock is consulted
 Zero and past expiration can be signed, but the server rejects at and after expiry.
 
 Room and participant are case-sensitive external IDs of 1–36 ASCII characters
-in `[A-Za-z0-9_-]`. Project/key IDs are core V0 UUID v7 identities. The `sk_0...`
-secret is a 32-byte Ed25519 seed, not a public or expanded private key. Credential
-aliases are accepted and IDs canonicalized; external identities are never trimmed.
+in `[A-Za-z0-9_-]`. The API key is opaque; existing three-field callers retain
+their original credential-validation behavior. External identities are never trimmed.
 
 Keep secrets on servers only, never in clients or logs. Offline signing cannot
 check registration or whether a secret belongs to the supplied project/key.
