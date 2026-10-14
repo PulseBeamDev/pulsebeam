@@ -53,6 +53,10 @@ impl Driver {
         })
     }
 
+    pub(crate) fn set_log_level(&mut self, level: agent_core::LogLevel) {
+        self.agent.set_log_level(level);
+    }
+
     pub(crate) fn snapshot(&self) -> &Snapshot {
         self.agent.snapshot()
     }
@@ -107,6 +111,7 @@ pub(crate) enum PublicCommand {
     ReplaceDesired(DesiredState),
     RenewAuthorization(String),
     SetConnected(bool),
+    SetLogLevel(agent_core::LogLevel),
 }
 
 impl fmt::Debug for PublicCommand {
@@ -120,6 +125,10 @@ impl fmt::Debug for PublicCommand {
             Self::SetConnected(connected) => formatter
                 .debug_tuple("SetConnected")
                 .field(connected)
+                .finish(),
+            Self::SetLogLevel(level) => formatter
+                .debug_tuple("SetLogLevel")
+                .field(level)
                 .finish(),
         }
     }
@@ -366,6 +375,7 @@ impl<H: Host> Actor<H> {
                     self.turn(Input::Command(AgentCommand::RenewAuthorization(token)));
                 }
                 PublicCommand::SetConnected(connected) => self.set_connected(connected),
+                PublicCommand::SetLogLevel(level) => self.driver.set_log_level(level),
             },
             Message::Topic(topic) => match topic {
                 TopicCommand::SendTopic(send) => self.send_topic(send),

@@ -12,15 +12,13 @@ const config: AgentConfig = {
   token: "opaque-token",
   topology: { localVideos: 1, localAudios: 1 },
 };
-const agent: Agent | null = useAgent(config);
+const agent: Agent = useAgent(config);
 const camera = useUserMedia({ video: true, audio: false });
-if (agent) {
-  agent.local.video("camera").setSource(camera.videoTrack);
-  Video({
-    source: agent.remote.videoTracks[0] ?? null,
-    onPlaybackError: (failure: PlaybackError) => void failure.retry(),
-  });
-  void agent.remote.resumeAudio();
-  agent.connect();
-  agent.disconnect();
-}
+agent.local.video("camera").setSource(camera.videoTrack);
+Video({
+  source: agent.remote.videoTracks[0] ?? null,
+  onPlaybackError: (failure: PlaybackError) => void failure.retry(),
+});
+void agent.remote.resumeAudio();
+agent.connect();
+agent.disconnect();

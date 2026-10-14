@@ -44,7 +44,8 @@ export interface AgentConfig {
   readonly endpoint: string;
   /** Opaque bearer token issued by the application backend. */
   readonly token: string;
-  readonly topology: MediaTopology;
+  /** Optional fixed media capacity. Omitted fields use SDK defaults. */
+  readonly topology?: MediaTopology;
   readonly logging?: AgentLogging;
 }
 
@@ -409,6 +410,7 @@ export interface Agent {
   setLocalMuted(slot: string, muted: boolean): Promise<void>;
   reconnect(): void;
   renewAuthorization(token: string): void;
+  setLogging(level: LogLevel): void;
   sendTopic(name: string, mode: TopicMode, payload: Uint8Array): void;
   readonly getSnapshot: () => AgentSnapshot;
   readonly subscribe: (listener: () => void) => () => void;
