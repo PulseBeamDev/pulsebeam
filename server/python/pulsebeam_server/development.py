@@ -8,3 +8,6 @@ INSECURE_DEV_CREDENTIALS = {
     "key_id": _fixture["keyId"],
     "secret": _fixture["secret"],
 }
+
+# Insecure, publicly known fixture for local --dev only.
+INSECURE_DEV_API_KEY = _fixture["apiKey"]
