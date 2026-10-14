@@ -41,9 +41,9 @@ In **your application's backend** (Node.js), install the server SDK:
 npm install @pulsebeam/server
 ```
 
-`INSECURE_DEV_API_KEY` is a single publicly known `key_0` credential matching
-the server's `--dev` identity. Production backends use their own
-`PULSEBEAM_API_KEY` secret; see the [V0 format](https://github.com/PulseBeamDev/pulsebeam/blob/main/server/auth/api-key.md).
+`INSECURE_DEV_API_KEY` is a publicly known development-only API key matching
+the server's `--dev` identity. In production, configure your own opaque
+`PULSEBEAM_API_KEY` on the backend. Never interpret or expose the key itself.
 
 ```ts
 import { signParticipantToken, INSECURE_DEV_API_KEY } from "@pulsebeam/server";
