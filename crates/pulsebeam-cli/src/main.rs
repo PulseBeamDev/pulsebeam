@@ -20,7 +20,7 @@ use pulsebeam_agent_native::{
 };
 use pulsebeam_agent_native::{clock::clock_anchor, wallclock_at};
 use pulsebeam_core::auth::{
-    ApiSigningKey, DEVELOPMENT_API_KEY_ID, DEVELOPMENT_API_SIGNING_KEY, DEVELOPMENT_PROJECT_ID,
+    ApiKey, ApiSigningKey, DEVELOPMENT_API_KEY_ID, DEVELOPMENT_API_SIGNING_KEY, DEVELOPMENT_PROJECT_ID,
     PrivateSigningBundle, ProjectKey, ProjectKeys, ProjectRegistry,
 };
 use pulsebeam_core::identity::{
@@ -198,6 +198,9 @@ struct AuthKeyConfig {
     /// New private signing bundle JSON output
     #[arg(long)]
     private_signing_bundle: PathBuf,
+    /// Optional owner-only file containing the single V0 key_0 secret
+    #[arg(long)]
+    private_api_key: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -385,6 +388,11 @@ fn write_auth_key(config: AuthKeyConfig, signing_key: ApiSigningKey) -> Result<(
             config.private_signing_bundle.display()
         );
     }
+    if let Some(path) = &config.private_api_key {
+        if path == &config.private_signing_bundle || path == &config.public_registry || path.try_exists()? {
+            anyhow::bail!("refusing to overwrite private API key {}", path.display());
+        }
+    }
 
     let project_id = config.project_id.unwrap_or_default();
     let key_id = ApiKeyId::new();
@@ -395,6 +403,12 @@ fn write_auth_key(config: AuthKeyConfig, signing_key: ApiSigningKey) -> Result<(
             verifying_key: signing_key.verifying_key(),
         }],
     }])?;
+    let api_key = ApiKey::from_signing_key(
+        *project_id.as_bytes(),
+        *key_id.as_bytes(),
+        &signing_key,
+    )?
+    .to_secret_string();
     let public_json = format!("{}\n", registry.to_pretty_json()?);
     let private_json = format!(
         "{}\n",
@@ -411,13 +425,25 @@ fn write_auth_key(config: AuthKeyConfig, signing_key: ApiSigningKey) -> Result<(
         true,
     )
     .with_context(|| "cannot create private signing bundle")?;
+    if let Some(path) = &config.private_api_key {
+        if let Err(error) = create_new_file(path, format!("{api_key}\n").as_bytes(), true) {
+            let _ = std::fs::remove_file(&config.private_signing_bundle);
+            return Err(error).with_context(|| "cannot create private API key");
+        }
+    }
     if let Err(error) = create_new_file(&config.public_registry, public_json.as_bytes(), false) {
         let _ = std::fs::remove_file(&config.private_signing_bundle);
+        if let Some(path) = &config.private_api_key {
+            let _ = std::fs::remove_file(path);
+        }
         return Err(error).with_context(|| "cannot create public project registry");
     }
 
     println!("project_id={project_id}");
     println!("key_id={key_id}");
+    if let Some(path) = &config.private_api_key {
+        println!("private_api_key={}", path.display());
+    }
     println!("public_registry={}", config.public_registry.display());
     println!(
         "private_signing_bundle={}",
@@ -950,6 +976,7 @@ mod tests {
             project_id,
             public_registry,
             private_signing_bundle,
+            private_api_key: None,
         }
     }
 
