@@ -337,7 +337,7 @@ class AgentFacade implements Agent {
   #closed = false;
   #active = false;
   #activation = 0;
-  #ready: Promise<Runtime> = new Promise(() => {});
+  #ready: Promise<Runtime> | undefined;
   #runtimeConfig: RuntimeConfig;
 
   constructor(config: AgentConfig, managed = false) {
@@ -358,7 +358,9 @@ class AgentFacade implements Agent {
     this.#topics = new TopicRegistry(
       this,
       async (name, mode, payload) => {
-        const runtime = await this.#ready;
+        const ready = this.#ready;
+        if (!ready) throw new Error("agent is not active");
+        const runtime = await ready;
         this.#requireCurrentRuntime(runtime);
         runtime.send_topic(name, mode, payload);
       },
@@ -440,6 +442,7 @@ class AgentFacade implements Agent {
     if (!this.#active || this.#closed) return;
     this.#active = false;
     ++this.#activation;
+    this.#ready = undefined;
     const runtime = this.#runtime;
     this.#runtime = undefined;
     if (runtime) {
@@ -750,7 +753,9 @@ class AgentFacade implements Agent {
 
   #runLocal(operation: (runtime: Runtime) => Promise<void>): Promise<void> {
     if (this.#closed) return Promise.reject(new Error("agent is closed"));
-    return this.#ready
+    const ready = this.#ready;
+    if (!ready) return Promise.reject(new Error("agent is not active"));
+    return ready
       .then(async (runtime) => {
         this.#requireCurrentRuntime(runtime);
         await operation(runtime);
