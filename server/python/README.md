@@ -6,9 +6,9 @@ call, Rust signer, WASM, or language bridge. Public registry publication is defe
 
 ## Local development
 
-`from pulsebeam_server import INSECURE_DEV_CREDENTIALS` provides the embedded
-public keys for `--dev` servers. Pass the mapping to
-`sign_participant_token(**INSECURE_DEV_CREDENTIALS, room=..., participant=..., expiration=...)`.
+`from pulsebeam_server import INSECURE_DEV_API_KEY` provides one publicly known
+`key_0` credential for local `--dev` servers. Pass it to
+`sign_participant_token_with_api_key(api_key, room=..., participant=..., expiration=...)`.
 **Never use these credentials in production or expose a development server.**
 
 ## Local installation
@@ -24,19 +24,18 @@ The distribution is also buildable with standard Python build tooling from
 
 ```python
 import os
-from pulsebeam_server import sign_participant_token
+from pulsebeam_server import sign_participant_token_with_api_key
 
-token = sign_participant_token(
-    project_id=os.environ["PULSEBEAM_PROJECT_ID"],
-    key_id=os.environ["PULSEBEAM_KEY_ID"],
-    secret=os.environ["PULSEBEAM_SECRET"],
+token = sign_participant_token_with_api_key(
+    os.environ["PULSEBEAM_API_KEY"],
     room="general",
     participant="Alice",
     expiration=2000000000,
 )
 ```
 
-All six keyword-only arguments are mandatory. The SDK never reads the
+The new API takes one explicit API key plus room, participant and expiration;
+the legacy `sign_participant_token` accepts the original three-part credentials. The SDK never reads the
 environment. Expiration must be an exact int in `0..18446744073709551615`,
 representing absolute Unix seconds, not a TTL. Booleans, floats and strings are
 not accepted. Invalid values raise without returning a token. No clock is
@@ -44,8 +43,9 @@ consulted: zero and past timestamps can be signed, but the server rejects tokens
 at and after their expiration.
 
 Room and participant are case-sensitive external IDs of 1–36 ASCII characters
-in `[A-Za-z0-9_-]`. Project/key IDs must be core V0 UUID v7 identities. The secret
-is an `sk_0...` 32-byte Ed25519 seed, not a public or expanded private key.
+in `[A-Za-z0-9_-]`. A V0 `key_0` credential contains project UUIDv7,
+key UUIDv7 and a 32-byte Ed25519 seed. See the
+[exact encoding specification](../auth/api-key.md).
 Credential aliases are accepted and IDs canonicalized; external IDs are never
 trimmed or normalized.
 
