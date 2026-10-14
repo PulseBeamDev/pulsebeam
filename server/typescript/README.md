@@ -56,7 +56,7 @@ Use `pulsebeam-cli auth-key` to generate the public registry and private key:
 ```
 
 Configure the SFU with the **public** registry, and place the private key into
-your backend's secret store as `PULSEBEAM_API_KEY`. Do not send it to browsers.
+your backend's secret store as `PULSEBEAM_API_KEY` (for local use,\n`export PULSEBEAM_API_KEY="$(cat pulsebeam.key)"`). Do not send it to browsers.
 For local `--dev` only, use the publicly known `INSECURE_DEV_API_KEY`.
 
 ## Issue a participant token
