@@ -40,9 +40,10 @@ fn token() -> Result<String, Box<dyn std::error::Error>> {
 }
 ```
 
-The API key plus room, participant and expiration are mandatory. The original
-six-argument `sign_participant_token` remains for compatibility. The V0
-`key_0` format is specified in [API key V0](../auth/api-key.md). The SDK never reads the environment. Expiration
+The opaque API key plus room, participant and expiration are mandatory. The
+original six-argument `sign_participant_token` remains for compatibility.
+The SDK validates API keys without exposing their representation and never reads
+the environment. Expiration
 is a `u64` absolute Unix timestamp in `0..18446744073709551615`, not a TTL.
 Rust rejects missing arguments, booleans, floats, strings, negative constants
 and overflowing constants before signing. Validate externally supplied values
@@ -50,10 +51,9 @@ instead of casting them to `u64`. No clock is consulted. Zero and past expiratio
 may be signed, but authorize nothing at or after expiry.
 
 Room and participant are case-sensitive external IDs of 1–36 ASCII characters
-in `[A-Za-z0-9_-]`. Project/key IDs must be core V0 UUID v7 identities. The
-`sk_0...` secret is a 32-byte Ed25519 seed, not a public or expanded private key.
-Credential aliases are canonicalized; external IDs are never normalized or
-trimmed. Invalid string inputs return `SigningError` without a token. Errors
+in `[A-Za-z0-9_-]`. API keys are opaque; the legacy three-field API retains
+its original validation rules. External IDs are never normalized or trimmed.
+Invalid string inputs return `SigningError` without a token. Errors
 and default diagnostics do not disclose credential values or decoded seeds.
 
 Keep signing secrets on your server, never in clients or logs. Offline signing
