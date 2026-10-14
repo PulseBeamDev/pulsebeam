@@ -41,10 +41,9 @@ Never use it in production or expose a dev server publicly.
 
 ## Configure one API key
 
-Set a **server-only** `PULSEBEAM_API_KEY` containing a V0 `key_0...` string.
-Its 64-byte payload is project UUIDv7 (16), key UUIDv7 (16), and raw Ed25519
-seed (32), encoded together using Crockford Base32. See the
-[complete format and validation contract](../auth/api-key.md).
+Set a **server-only** `PULSEBEAM_API_KEY` using the opaque credential
+generated for your project. Treat it as a secret: don't decode, modify,
+log, or expose it to the browser. The SDK handles its representation.
 
 Use `pulsebeam-cli auth-key` to generate the public registry and private key:
 
@@ -56,7 +55,8 @@ Use `pulsebeam-cli auth-key` to generate the public registry and private key:
 ```
 
 Configure the SFU with the **public** registry, and place the private key into
-your backend's secret store as `PULSEBEAM_API_KEY` (for local use,\n`export PULSEBEAM_API_KEY="$(cat pulsebeam.key)"`). Do not send it to browsers.
+your backend's secret store as `PULSEBEAM_API_KEY`. For local use, load
+it with `export PULSEBEAM_API_KEY="$(cat pulsebeam.key)"`. Do not send it to browsers.
 For local `--dev` only, use the publicly known `INSECURE_DEV_API_KEY`.
 
 ## Issue a participant token
@@ -77,8 +77,8 @@ network request. Only the short-lived participant JWT goes to the browser.
 A renewal must use the **same** room and participant identity.
 
 For compatibility, `signParticipantToken` also accepts the original
-`{projectId, keyId, secret}` triple. The V0 API key packages those
-same fields; the resulting JWT and public-key verification are unchanged.
+`{projectId, keyId, secret}` configuration. The new single-key API produces
+the same participant JWT; the SDK owns the credential representation.
 
 The expiration must be an absolute safe-integer number or bigint within the
 unsigned 64-bit range; it is not a TTL. Room/participant IDs are case-sensitive
