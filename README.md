@@ -80,8 +80,7 @@ WebRTC ports. Use it only for local testing, not an internet-facing deployment.
 | TCP/3478 | WebRTC over TCP fallback | Local clients in this quickstart |
 | TCP/6060 | Internal metrics, health checks, and CPU profiling | Private only; never add to the public firewall allowlist |
 
-Without `--dev`, WebRTC uses UDP/TCP 443 and the server requires a public project
-registry. Development mode does not restrict listener access to loopback; keep
+Without `--dev`, WebRTC uses UDP/TCP 443 and the server requires a public `key-registry.json` for its single project. Development mode does not restrict listener access to loopback; keep
 these services protected by your host firewall.
 
 ### 2. Start Meet and mint two tokens

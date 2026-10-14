@@ -10,6 +10,23 @@ the SDK owns JWT generation, while core owns registry matching and verification.
 This conformance package tests their boundary; it is not the shared library or a
 public signing package.
 
+## Shared development identity
+
+The public development identity is defined in [development.json](development.json).
+Rust core embeds it directly. Bazel stages the same file into each independently
+distributed server SDK's package. No credential copies are committed or
+synchronization step is needed.
+
+These keys are publicly known: **never use them for production or an exposed server**.
+
+## Server API keys
+
+Applications pass one opaque API key explicitly to their backend SDK.
+The SDK validates and interprets the credential but does not decide how the
+application stores it; applications must not parse or depend on its representation. The participant JWT wire format below is
+unchanged. The legacy three-field signing API remains available for existing
+consumers and frozen conformance vectors.
+
 ## Inputs and codecs
 
 All six inputs are mandatory: project ID, API key ID, signing secret, room
@@ -44,7 +61,7 @@ Exactly these UTF-8 JSON fields, in this order, with no whitespace:
 Unpadded base64url encode each object, join with `.`, sign those literal ASCII
 bytes using Ed25519 and the decoded seed, then append `.` and the unpadded
 base64url 64-byte signature. No `iat`, `nbf`, additional grants, or default JWT
-headers are emitted. The server matches project/key/public key registration,
+headers are emitted. The server matches the token project ID and key ID against the public key registry,
 verifies the signature, and requires `now < exp`.
 
 ## Fixture adaptation

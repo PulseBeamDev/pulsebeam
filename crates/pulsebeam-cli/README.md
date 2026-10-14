@@ -5,17 +5,36 @@ Headless load and benchmark client for a running PulseBeam server. The current
 encoded fixtures, automatically subscribes each peer to remote video, and
 records latency and transport snapshots as CSV.
 
-This binary does not run the SFU. Its `auth-key` command creates production
-authentication material without issuing production bearer tokens:
+## Production keys
+
+Generate the initial project and API key with no arguments:
 
 ```text
-pulsebeam-cli auth-key \
-  --public-registry project-registry.json \
-  --private-signing-bundle signing-key.json
+./bazel run //:cli -- key
 ```
 
-Pass `--project-id p_0...` to generate a rotation key for an existing project.
-Both outputs must be new files; the private output is owner-only on Unix.
+The command writes nothing to disk. It prints two values to the terminal:
+
+- an opaque **API key** (private), for your application backend to pass explicitly
+  to a PulseBeam server SDK when signing participant tokens;
+- a **key registry** (public JSON), containing the one project ID and the public
+  keys the PulseBeam server trusts.
+
+The production PulseBeam server reads `./key-registry.json` from its working
+directory. How you store the private API key is application policy; the SDK does
+not implicitly read an environment variable.
+
+To add a replacement key without changing the project identity, feed the
+existing public key registry to the explicit rotation command:
+
+```text
+./bazel run //:cli -- key rotate < key-registry.json
+```
+
+Rotation prints the new private API key and an updated public key registry containing
+both the old and new public keys. Replace the server key registry only after saving
+the new private key. Retain old public keys until participant tokens signed by
+them have expired.
 
 For a local `pulsebeam --dev` server, mint a one-hour development bearer token
 with fixed development credentials:

@@ -16,6 +16,8 @@ Applies to `docs/**` and every repository `README.md` (via the root `AGENTS.md`)
 - An integration quickstart should take the reader through obtaining the software, required configuration, minimal working code, and visible confirmation in their own application. A repository demo can supplement this path, not substitute for it.
 - State prerequisites before they are needed. Keep required setup, security boundaries, and blockers visible; reserve collapsible sections for lengthy source and optional detail.
 - Introduce concepts only when they help the next action. Explain what the reader must configure or own, not how every internal layer works. Link advanced configuration, implementation detail, and rationale from the relevant step.
+- Keep the main task free of distractions: show the shortest idiomatic command, retain only essential security caveats, and move platform quirks, version rationale, optional flags, and detailed limits to troubleshooting or reference.
+- When an integration crosses environments, **identify the owner before naming a backend or client**: product-provided server, developer-owned application backend, and developer-owned browser frontend. A small three-node flow diagram can clarify ownership and token/media direction once; keep subsequent instructions short. Keep signing secrets and privileged SDKs on the application backend.
 - Keep tutorial handoffs coherent. Preserve configuration, credentials, versions, and running processes when continuing a task; explicitly announce any reset or separate example.
 
 ## Match the content to the question
@@ -32,8 +34,10 @@ These are writing patterns, not mandatory website sections. A README can combine
 ## Choose the clearest form
 
 - Prefer **working code** for integration, **steps** for procedures, **tables** for comparisons, and **flow/sequence/state diagrams** for relationships or behavior. Use a sentence when that is clearer.
+- For beginner SDK quickstarts, show one small, idiomatic example that completes the primary task. Avoid bundling optional controls, diagnostic UI, and advanced lifecycle management into the first snippet; link those from focused guides instead.
 - Visuals should explain something prose cannot convey as efficiently, not decorate or repeat it. Keep diagrams focused, accurately labeled, accessible without color, and legible on small screens. Use the renderer's supported formats.
 - Keep examples copyable and idiomatic. Include required setup, imports, permissions, cleanup, environment assumptions, and expected results; explicitly mark pseudocode or omitted steps.
+- Handle user-triggered async failures where they occur and show actionable errors in the UI. Do not use console logging as the only error handling in beginner examples.
 
 ## Ground and verify every claim
 
