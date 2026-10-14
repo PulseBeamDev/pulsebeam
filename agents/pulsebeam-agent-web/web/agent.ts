@@ -636,7 +636,7 @@ class AgentFacade implements Agent {
     this.#state = next;
     if (!next.connected)
       this.#remote.update({ ...this.#snapshot, connection: "disconnected" });
-    if (!this.#runtime && this.#snapshot.connection !== "terminal-failure") {
+    if (this.#active && !this.#runtime && this.#snapshot.connection !== "terminal-failure") {
       this.#publish(
         Object.freeze({
           ...this.#snapshot,
