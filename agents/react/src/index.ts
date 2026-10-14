@@ -103,6 +103,10 @@ export function useAgent(config: AgentConfig): Agent {
     agent.renewAuthorization(config.token);
   }, [agent, config.token]);
 
+  useEffect(() => {
+    agent.setLogging(config.logging?.level ?? "warn");
+  }, [agent, config.logging?.level]);
+
   useSyncExternalStore(agent.subscribe, agent.getSnapshot, agent.getSnapshot);
   return agent;
 }
