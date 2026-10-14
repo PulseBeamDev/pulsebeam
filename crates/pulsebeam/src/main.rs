@@ -4,14 +4,14 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use pulsebeam::node::NodeBuilder;
 use pulsebeam_core::auth::{
-    DEVELOPMENT_API_KEY_ID, DEVELOPMENT_API_VERIFYING_KEY, DEVELOPMENT_PROJECT_ID, ProjectKey,
-    ProjectKeys, ProjectRegistry,
+    DEVELOPMENT_API_KEY_ID, DEVELOPMENT_API_PUBLIC_KEY, DEVELOPMENT_PROJECT_ID, KeyRegistry,
+    KeyRegistryEntry,
 };
 use pulsebeam_runtime::rand;
 use std::{
     net::{IpAddr, Ipv6Addr, SocketAddr},
     num::NonZeroUsize,
-    path::PathBuf,
+    path::Path,
 };
 use tokio::runtime::LocalOptions;
 use tokio_util::sync::CancellationToken;
@@ -62,14 +62,6 @@ struct Args {
     /// Enable development mode preset
     #[arg(short, long)]
     dev: bool,
-    /// Public project registry JSON used for production authentication
-    #[arg(
-        long,
-        value_name = "PATH",
-        required_unless_present = "dev",
-        conflicts_with = "dev"
-    )]
-    project_registry: Option<PathBuf>,
     /// Pin to a specific network interface name (e.g., enp0s13f0u1u2)
     #[arg(short = 'i', long = "iface")]
     iface: Option<String>,
@@ -94,13 +86,11 @@ fn main() {
         .with(fmt_layer)
         .init();
 
-    let registry = configured_project_registry(&args).unwrap_or_else(|error| {
-        pulsebeam_runtime::fatal!("invalid authentication configuration: {error:#}")
-    });
-    let project = registry.only_project().unwrap_or_else(|error| {
-        pulsebeam_runtime::fatal!("invalid authentication configuration: {error}")
-    });
-    tracing::info!(project_id = %project.project_id, "configured authentication project");
+    let registry = configured_key_registry(&args, Path::new("key-registry.json"))
+        .unwrap_or_else(|error| {
+            pulsebeam_runtime::fatal!("invalid authentication configuration: {error:#}")
+        });
+    tracing::info!(project_id = %registry.project_id(), "configured authentication project");
 
     // Control thread is floating between threads
     let total_cores = std::thread::available_parallelism().map_or(1, NonZeroUsize::get);
@@ -135,26 +125,19 @@ fn main() {
     shutdown.cancel();
 }
 
-fn configured_project_registry(args: &Args) -> Result<ProjectRegistry> {
-    let registry = if args.dev {
-        ProjectRegistry::new(vec![ProjectKeys {
-            project_id: DEVELOPMENT_PROJECT_ID,
-            keys: vec![ProjectKey {
-                key_id: DEVELOPMENT_API_KEY_ID,
-                verifying_key: DEVELOPMENT_API_VERIFYING_KEY,
+fn configured_key_registry(args: &Args, path: &Path) -> Result<KeyRegistry> {
+    if args.dev {
+        return Ok(KeyRegistry::new(
+            *DEVELOPMENT_PROJECT_ID,
+            vec![KeyRegistryEntry {
+                key_id: *DEVELOPMENT_API_KEY_ID,
+                public_key: *DEVELOPMENT_API_PUBLIC_KEY,
             }],
-        }])?
-    } else {
-        let path = args
-            .project_registry
-            .as_deref()
-            .context("production requires --project-registry")?;
-        let json = std::fs::read_to_string(path)
-            .with_context(|| format!("cannot read project registry {}", path.display()))?;
-        ProjectRegistry::parse_json(&json)?
-    };
-    registry.only_project()?;
-    Ok(registry)
+        )?);
+    }
+    let json = std::fs::read_to_string(path)
+        .with_context(|| format!("cannot read key registry {}", path.display()))?;
+    Ok(KeyRegistry::parse_json(&json)?)
 }
 
 pub async fn run(
@@ -163,7 +146,7 @@ pub async fn run(
     rtc_port: u16,
     network_interface: Option<String>,
     shards_per_worker: usize,
-    project_registry: ProjectRegistry,
+    key_registry: KeyRegistry,
 ) -> Result<()> {
     let external_ips =
         pulsebeam_runtime::system::select_host_addresses(network_interface.as_deref());
@@ -189,7 +172,7 @@ pub async fn run(
         .rng(rng)
         .work_stealing(shards_per_worker)
         .with_http_api(http_api_addr)
-        .with_project_registry(project_registry)
+        .with_key_registry(key_registry)
         .with_internal_metrics(metrics_addr);
 
     let node = node_builder.run(shutdown.child_token());
@@ -219,6 +202,7 @@ mod tests {
     #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
     use super::*;
+    use std::path::PathBuf;
     use pulsebeam_core::{
         auth::ApiSigningKey,
         identity::{ApiKeyId, ProjectId},
@@ -232,69 +216,53 @@ mod tests {
         ApiKeyId::from_bytes([0, 0, 0, 0, 0, 0, 0x70, 0, 0x80, 0, 0, 0, 0, 0, 0, last])
     }
 
-    fn entry(project_id: ProjectId, last: u8) -> ProjectKeys {
-        ProjectKeys {
-            project_id,
-            keys: vec![ProjectKey {
-                key_id: key_id(last),
-                verifying_key: ApiSigningKey::from_seed([last; 32]).verifying_key(),
-            }],
+    fn entry(last: u8) -> KeyRegistryEntry {
+        KeyRegistryEntry {
+            key_id: key_id(last),
+            public_key: ApiSigningKey::from_seed([last; 32]).public_key(),
         }
     }
 
     fn registry_path() -> PathBuf {
         std::env::temp_dir().join(format!(
-            "pulsebeam-server-registry-{}.json",
+            "pulsebeam-server-key-registry-{}.json",
             ApiKeyId::new()
         ))
     }
 
     #[test]
-    fn development_and_production_registry_flags_are_exclusive() {
+    fn authentication_only_needs_explicit_dev_mode() {
         assert!(Args::try_parse_from(["pulsebeam", "--dev"]).is_ok());
+        assert!(Args::try_parse_from(["pulsebeam"]).is_ok());
         assert!(
-            Args::try_parse_from(["pulsebeam", "--dev", "--project-registry", "registry.json"])
-                .is_err()
+            Args::try_parse_from(["pulsebeam", "--project-registry", "registry.json"]).is_err()
         );
-        assert!(Args::try_parse_from(["pulsebeam"]).is_err());
     }
 
     #[test]
     fn development_configuration_uses_the_well_known_project() {
         let args = Args::try_parse_from(["pulsebeam", "--dev"]).unwrap();
-        let registry = configured_project_registry(&args).unwrap();
-        let project = registry.only_project().unwrap();
-        assert_eq!(project.project_id, DEVELOPMENT_PROJECT_ID);
-        assert_eq!(project.keys.len(), 1);
-        assert_eq!(project.keys[0].key_id, DEVELOPMENT_API_KEY_ID);
+        let registry = configured_key_registry(&args, Path::new("nonexistent.json")).unwrap();
+        assert_eq!(registry.project_id(), *DEVELOPMENT_PROJECT_ID);
+        assert_eq!(registry.keys().len(), 1);
+        assert_eq!(registry.keys()[0].key_id, *DEVELOPMENT_API_KEY_ID);
     }
 
     #[test]
-    fn production_configuration_requires_exactly_one_project() {
+    fn production_configuration_requires_valid_key_registry() {
         let path = registry_path();
-        let args =
-            Args::try_parse_from(["pulsebeam", "--project-registry", path.to_str().unwrap()])
-                .unwrap();
+        let args = Args::try_parse_from(["pulsebeam"]).unwrap();
+        assert!(configured_key_registry(&args, &path).is_err());
 
-        let multiple =
-            ProjectRegistry::new(vec![entry(project(1), 1), entry(project(2), 2)]).unwrap();
-        std::fs::write(&path, multiple.to_pretty_json().unwrap()).unwrap();
-        assert!(configured_project_registry(&args).is_err());
+        let registry = KeyRegistry::new(project(1), vec![entry(1)]).unwrap();
+        std::fs::write(&path, registry.to_pretty_json().unwrap()).unwrap();
+        let configured = configured_key_registry(&args, &path).unwrap();
+        assert_eq!(configured.project_id(), project(1));
+        assert_eq!(configured.keys(), registry.keys());
 
-        let empty = ProjectRegistry::new(Vec::new()).unwrap();
-        std::fs::write(&path, empty.to_pretty_json().unwrap()).unwrap();
-        assert!(configured_project_registry(&args).is_err());
-
-        let single = ProjectRegistry::new(vec![entry(project(1), 1)]).unwrap();
-        std::fs::write(&path, single.to_pretty_json().unwrap()).unwrap();
-        assert_eq!(
-            configured_project_registry(&args)
-                .unwrap()
-                .only_project()
-                .unwrap()
-                .project_id,
-            project(1)
-        );
+        std::fs::write(&path, "{\"projectId\":\"invalid\",\"keys\":[]}").unwrap();
+        assert!(configured_key_registry(&args, &path).is_err());
         std::fs::remove_file(path).unwrap();
     }
+
 }

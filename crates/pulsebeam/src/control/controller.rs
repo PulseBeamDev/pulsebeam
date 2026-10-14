@@ -23,7 +23,7 @@ use crate::{
     },
 };
 use pulsebeam_core::auth::{
-    AuthorizationExpiry, MAX_COMPACT_TOKEN_LEN, ProjectRegistry, TokenError, VerifiedAuthorization,
+    AuthorizationExpiry, MAX_COMPACT_TOKEN_LEN, KeyRegistry, TokenError, VerifiedAuthorization,
     verify_participant_token,
 };
 use pulsebeam_runtime::mailbox;
@@ -229,7 +229,7 @@ pub struct ControllerActor {
     lifecycle: TrackLifecycle,
     command_backlog: VecDeque<(ShardId, ShardCommand)>,
     authorization_expiries: BTreeSet<AuthorizationExpiryWork>,
-    project_registry: Option<ProjectRegistry>,
+    key_registry: Option<KeyRegistry>,
     renewal_tx: tokio::sync::mpsc::Sender<RenewalResult>,
     renewal_rx: tokio::sync::mpsc::Receiver<RenewalResult>,
     renewals_inflight: usize,
@@ -264,7 +264,7 @@ impl ControllerActor {
             lifecycle: TrackLifecycle::new(shard_count),
             command_backlog: VecDeque::new(),
             authorization_expiries: BTreeSet::new(),
-            project_registry: None,
+            key_registry: None,
             renewal_tx,
             renewal_rx,
             renewals_inflight: 0,
@@ -272,8 +272,8 @@ impl ControllerActor {
         }
     }
 
-    pub(crate) fn set_project_registry(&mut self, registry: Option<ProjectRegistry>) {
-        self.project_registry = registry;
+    pub(crate) fn set_key_registry(&mut self, registry: Option<KeyRegistry>) {
+        self.key_registry = registry;
     }
 
     pub(crate) fn set_steering(&mut self, steering: Option<Box<dyn Steering>>) {
@@ -661,7 +661,7 @@ impl ControllerActor {
         {
             return;
         }
-        let Some(registry) = self.project_registry.clone() else {
+        let Some(registry) = self.key_registry.clone() else {
             self.send_renewal_result(shard, participant, connection_id, None);
             return;
         };
@@ -1375,7 +1375,7 @@ mod replacement_tests {
             lifecycle: TrackLifecycle::new(1),
             command_backlog: VecDeque::new(),
             authorization_expiries: BTreeSet::new(),
-            project_registry: None,
+            key_registry: None,
             renewal_tx,
             renewal_rx,
             renewals_inflight: 0,
@@ -1502,7 +1502,7 @@ mod replacement_tests {
             )
             .unwrap();
         let verified = VerifiedAuthorization {
-            project_id: pulsebeam_core::auth::DEVELOPMENT_PROJECT_ID,
+            project_id: *pulsebeam_core::auth::DEVELOPMENT_PROJECT_ID,
             room_external_id: RoomExternalId::new("renewal-room").unwrap(),
             room_id,
             participant_external_id: crate::entity::ParticipantExternalId::new("alice").unwrap(),
@@ -1578,18 +1578,18 @@ mod replacement_tests {
     #[tokio::test]
     async fn renewal_verifies_jwt_off_control_loop_and_commits_only_current_identity() {
         use pulsebeam_core::auth::{
-            DEVELOPMENT_API_KEY_ID, DEVELOPMENT_API_SIGNING_KEY, DEVELOPMENT_API_VERIFYING_KEY,
-            DEVELOPMENT_PROJECT_ID, ProjectKey, ProjectKeys,
+            DEVELOPMENT_API_KEY_ID, DEVELOPMENT_API_SIGNING_KEY, DEVELOPMENT_API_PUBLIC_KEY,
+            DEVELOPMENT_PROJECT_ID, KeyRegistryEntry,
         };
         let mut actor = actor();
-        actor.set_project_registry(Some(
-            ProjectRegistry::new(vec![ProjectKeys {
-                project_id: DEVELOPMENT_PROJECT_ID,
-                keys: vec![ProjectKey {
-                    key_id: DEVELOPMENT_API_KEY_ID,
-                    verifying_key: DEVELOPMENT_API_VERIFYING_KEY,
+        actor.set_key_registry(Some(
+            KeyRegistry::new(
+                *DEVELOPMENT_PROJECT_ID,
+                vec![KeyRegistryEntry {
+                    key_id: *DEVELOPMENT_API_KEY_ID,
+                    public_key: *DEVELOPMENT_API_PUBLIC_KEY,
                 }],
-            }])
+            )
             .unwrap(),
         ));
         let room = RoomExternalId::new("renewal-room").unwrap();

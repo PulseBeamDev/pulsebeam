@@ -19,4 +19,4 @@ Repository = "https://github.com/PulseBeamDev/pulsebeam"
 packages = ["pulsebeam_server"]
 
 [tool.setuptools.package-data]
-pulsebeam_server = ["py.typed"]
+pulsebeam_server = ["py.typed", "development.json"]

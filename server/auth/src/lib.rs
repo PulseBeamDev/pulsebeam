@@ -81,8 +81,8 @@ mod tests {
     use ed25519_dalek::{Signature, VerifyingKey};
     use pulsebeam_core::{
         auth::{
-            ApiSigningKey, DEVELOPMENT_PROJECT_ID, ProjectKey, ProjectKeys, ProjectRegistry,
-            TokenError, verify_participant_token,
+            ApiSigningKey, DEVELOPMENT_PROJECT_ID, KeyRegistry, KeyRegistryEntry, TokenError,
+            verify_participant_token,
         },
         identity::{
             ApiKeyId, ParticipantExternalId, ParticipantId, ProjectId, RoomExternalId, RoomId,
@@ -118,7 +118,7 @@ mod tests {
                 ApiSigningKey::from_seed(decode_hex(&golden.seed_hex).unwrap())
             );
             assert_eq!(
-                encode_hex(signing.verifying_key().as_bytes()),
+                encode_hex(signing.public_key().as_bytes()),
                 golden.public_key_hex
             );
             // Anchor the independent verifier in RFC 8032 test 2, not derived SDK output.
@@ -160,13 +160,13 @@ mod tests {
                 "{}",
                 golden.name,
             );
-            let registry = ProjectRegistry::new(vec![ProjectKeys {
-                project_id: project,
-                keys: vec![ProjectKey {
+            let registry = KeyRegistry::new(
+                project,
+                vec![KeyRegistryEntry {
                     key_id: key,
-                    verifying_key: signing.verifying_key(),
+                    public_key: signing.public_key(),
                 }],
-            }])
+            )
             .unwrap();
             if exp == 0 {
                 assert_eq!(
@@ -209,37 +209,37 @@ mod tests {
                     Err(TokenError::Expired)
                 );
             }
-            let wrong_secret = ProjectRegistry::new(vec![ProjectKeys {
-                project_id: project,
-                keys: vec![ProjectKey {
+            let wrong_secret = KeyRegistry::new(
+                project,
+                vec![KeyRegistryEntry {
                     key_id: key,
-                    verifying_key: ApiSigningKey::from_seed([7; 32]).verifying_key(),
+                    public_key: ApiSigningKey::from_seed([7; 32]).public_key(),
                 }],
-            }])
+            )
             .unwrap();
             assert_eq!(
                 verify_participant_token(&wrong_secret, &golden.token, exp - 1),
                 Err(TokenError::Invalid)
             );
-            let wrong_project = ProjectRegistry::new(vec![ProjectKeys {
-                project_id: DEVELOPMENT_PROJECT_ID,
-                keys: vec![ProjectKey {
+            let wrong_project = KeyRegistry::new(
+                *DEVELOPMENT_PROJECT_ID,
+                vec![KeyRegistryEntry {
                     key_id: key,
-                    verifying_key: signing.verifying_key(),
+                    public_key: signing.public_key(),
                 }],
-            }])
+            )
             .unwrap();
             assert_eq!(
                 verify_participant_token(&wrong_project, &golden.token, exp - 1),
                 Err(TokenError::Invalid)
             );
-            let wrong_key = ProjectRegistry::new(vec![ProjectKeys {
-                project_id: project,
-                keys: vec![ProjectKey {
-                    key_id: pulsebeam_core::auth::DEVELOPMENT_API_KEY_ID,
-                    verifying_key: signing.verifying_key(),
+            let wrong_key = KeyRegistry::new(
+                project,
+                vec![KeyRegistryEntry {
+                    key_id: *pulsebeam_core::auth::DEVELOPMENT_API_KEY_ID,
+                    public_key: signing.public_key(),
                 }],
-            }])
+            )
             .unwrap();
             assert_eq!(
                 verify_participant_token(&wrong_key, &golden.token, exp - 1),

@@ -90,3 +90,19 @@ def sign_participant_token(
     signing_input = _base64(header.encode()) + "." + _base64(claims.encode())
     signature = Ed25519PrivateKey.from_private_bytes(seed).sign(signing_input.encode("ascii"))
     return signing_input + "." + _base64(signature)
+
+
+def sign_participant_token_with_api_key(
+    api_key: str, *, room: str, participant: str, expiration: int
+) -> str:
+    """Sign with one V0 key_0 credential, without a network call."""
+    raw = _decode(_payload(api_key, "key", 103))
+    if len(raw) != 64:
+        raise ValueError("Invalid API key")
+    project = _canonical_id("p_0" + _encode(raw[:16]), "p")
+    key = _canonical_id("kid_0" + _encode(raw[16:32]), "kid")
+    secret = "sk_0" + _encode(bytes(3) + raw[32:])[4:]
+    return sign_participant_token(
+        project_id=project, key_id=key, secret=secret,
+        room=room, participant=participant, expiration=expiration
+    )

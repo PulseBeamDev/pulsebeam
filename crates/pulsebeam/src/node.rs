@@ -3,7 +3,7 @@
 
 use anyhow::{Context, Result};
 use core_affinity::get_core_ids;
-use pulsebeam_core::auth::ProjectRegistry;
+use pulsebeam_core::auth::KeyRegistry;
 use pulsebeam_core::net::TcpListener;
 use pulsebeam_runtime::mailbox;
 use pulsebeam_runtime::net;
@@ -432,7 +432,7 @@ pub struct NodeBuilder {
 
     // Services
     http_api: Option<ListenerSource>,
-    project_registry: Option<ProjectRegistry>,
+    key_registry: Option<KeyRegistry>,
     internal_metrics: Option<ListenerSource>,
     steering: Option<SteeringFactory>,
 
@@ -466,7 +466,7 @@ impl NodeBuilder {
             rng: None,
             udp_mode: UdpMode::Batch,
             http_api: None,
-            project_registry: None,
+            key_registry: None,
             internal_metrics: None,
             steering: {
                 #[cfg(feature = "sim")]
@@ -600,8 +600,8 @@ impl NodeBuilder {
         self
     }
 
-    pub fn with_project_registry(mut self, project_registry: ProjectRegistry) -> Self {
-        self.project_registry = Some(project_registry);
+    pub fn with_key_registry(mut self, key_registry: KeyRegistry) -> Self {
+        self.key_registry = Some(key_registry);
         self
     }
 
@@ -910,7 +910,7 @@ impl NodeBuilder {
             view_writers,
         );
         controller.set_steering(steering);
-        controller.set_project_registry(self.project_registry.clone());
+        controller.set_key_registry(self.key_registry.clone());
         // intentionally small so backpressure is applied early
         // with 62.5 ms pacing rate, at most we get 1s latency here.
         let (controller_command_tx, controller_command_rx) = mailbox::new(16);
@@ -963,10 +963,10 @@ impl NodeBuilder {
                 ])
                 .max_age(Duration::from_secs(86400));
 
-            let project_registry = self
-                .project_registry
-                .context("HTTP signaling requires a project registry")?;
-            let router = api::router(controller_command_tx, api_cfg, project_registry)
+            let key_registry = self
+                .key_registry
+                .context("HTTP signaling requires a key registry")?;
+            let router = api::router(controller_command_tx, api_cfg, key_registry)
                 .layer(CompressionLayer::new().zstd(true))
                 .layer(RequestDecompressionLayer::new().zstd(true).gzip(true))
                 .layer(cors);

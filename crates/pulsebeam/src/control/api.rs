@@ -11,7 +11,7 @@ use axum::{
 };
 use hyper::header::{ALLOW, AUTHORIZATION, CONTENT_TYPE, LOCATION, WWW_AUTHENTICATE};
 use pulsebeam_core::auth::{
-    ProjectRegistry, TokenError, VerifiedAuthorization, verify_participant_token,
+    KeyRegistry, TokenError, VerifiedAuthorization, verify_participant_token,
 };
 use pulsebeam_runtime::mailbox::TrySendError;
 use serde::{Deserialize, Serialize};
@@ -35,7 +35,7 @@ const ACCEPT_POST: hyper::header::HeaderName =
 struct AppState {
     controller: ControllerSender,
     api_config: ApiConfig,
-    project_registry: ProjectRegistry,
+    key_registry: KeyRegistry,
 }
 
 #[derive(Clone)]
@@ -137,7 +137,7 @@ impl IntoResponse for ApiError {
 
 pub(crate) fn verify_bearer(
     headers: &HeaderMap,
-    registry: &ProjectRegistry,
+    registry: &KeyRegistry,
     now: u64,
 ) -> Result<VerifiedAuthorization, ApiError> {
     let mut values = headers.get_all(AUTHORIZATION).iter();
@@ -341,7 +341,7 @@ async fn create_native(
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let authorization = verify_bearer(&headers, &state.project_registry, unix_now)?;
+    let authorization = verify_bearer(&headers, &state.key_registry, unix_now)?;
     ensure_json_content_type(&headers)?;
     let body = to_bytes(request.into_body(), MAX_SIGNALING_BODY_BYTES)
         .await
@@ -433,7 +433,7 @@ async fn delete_native(
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let authorization = verify_bearer(&headers, &state.project_registry, now)?;
+    let authorization = verify_bearer(&headers, &state.key_registry, now)?;
     let connection_id = connection_id.parse().map_err(|_| ApiError::NotFound)?;
     state
         .controller
@@ -466,7 +466,7 @@ async fn create_sdp_profile(
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let authorization = verify_bearer(&headers, &state.project_registry, unix_now)?;
+    let authorization = verify_bearer(&headers, &state.key_registry, unix_now)?;
     ensure_sdp_content_type(&headers)?;
     let body = to_bytes(request.into_body(), MAX_SIGNALING_BODY_BYTES)
         .await
@@ -585,7 +585,7 @@ fn verify_discovery(state: &AppState, headers: &HeaderMap) -> Result<StatusCode,
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let _authorization = verify_bearer(headers, &state.project_registry, now)?;
+    let _authorization = verify_bearer(headers, &state.key_registry, now)?;
     Ok(StatusCode::OK)
 }
 
@@ -701,7 +701,7 @@ async fn delete_sdp_profile(
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let authorization = verify_bearer(&headers, &state.project_registry, now)?;
+    let authorization = verify_bearer(&headers, &state.key_registry, now)?;
     let connection_id = connection_id.parse().map_err(|_| ApiError::NotFound)?;
     state
         .controller
@@ -832,7 +832,7 @@ struct ApiDoc;
 pub fn router(
     controller: ControllerSender,
     cfg: ApiConfig,
-    project_registry: ProjectRegistry,
+    key_registry: KeyRegistry,
 ) -> Router {
     let openapi = build_openapi(&cfg.base_path);
     let api = Router::new()
@@ -876,7 +876,7 @@ pub fn router(
         .with_state(AppState {
             controller,
             api_config: cfg,
-            project_registry,
+            key_registry,
         })
 }
 
@@ -899,8 +899,8 @@ mod tests {
     use super::*;
     use pulsebeam_core::{
         auth::{
-            DEVELOPMENT_API_KEY_ID, DEVELOPMENT_API_SIGNING_KEY, DEVELOPMENT_API_VERIFYING_KEY,
-            DEVELOPMENT_PROJECT_ID, ProjectKey, ProjectKeys,
+            DEVELOPMENT_API_KEY_ID, DEVELOPMENT_API_SIGNING_KEY, DEVELOPMENT_API_PUBLIC_KEY,
+            DEVELOPMENT_PROJECT_ID, KeyRegistryEntry,
         },
         identity::{ParticipantExternalId, RoomExternalId},
     };
@@ -912,14 +912,14 @@ mod tests {
     use tower::ServiceExt;
     use tower_http::cors::{Any, CorsLayer};
 
-    fn auth_registry() -> ProjectRegistry {
-        ProjectRegistry::new(vec![ProjectKeys {
-            project_id: DEVELOPMENT_PROJECT_ID,
-            keys: vec![ProjectKey {
-                key_id: DEVELOPMENT_API_KEY_ID,
-                verifying_key: DEVELOPMENT_API_VERIFYING_KEY,
+    fn auth_registry() -> KeyRegistry {
+        KeyRegistry::new(
+            *DEVELOPMENT_PROJECT_ID,
+            vec![KeyRegistryEntry {
+                key_id: *DEVELOPMENT_API_KEY_ID,
+                public_key: *DEVELOPMENT_API_PUBLIC_KEY,
             }],
-        }])
+        )
         .unwrap()
     }
 

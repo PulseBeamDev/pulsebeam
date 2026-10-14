@@ -20,8 +20,8 @@ pub enum KeyValidationError {
     InvalidEncoding,
     #[error("key encoding has nonzero high padding bits")]
     NonzeroPadding,
-    #[error("invalid Ed25519 verifying key")]
-    InvalidVerifyingKey,
+    #[error("invalid Ed25519 public key")]
+    InvalidPublicKey,
 }
 
 fn encode_key(bytes: &[u8; KEY_BYTES]) -> String {
@@ -68,11 +68,11 @@ fn parse_payload<'a>(value: &'a str, prefix: &'static str) -> Result<&'a str, Ke
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub struct ApiVerifyingKey([u8; KEY_BYTES]);
+pub struct ApiPublicKey([u8; KEY_BYTES]);
 
-impl ApiVerifyingKey {
+impl ApiPublicKey {
     pub fn from_bytes(bytes: [u8; KEY_BYTES]) -> Result<Self, KeyValidationError> {
-        VerifyingKey::from_bytes(&bytes).map_err(|_| KeyValidationError::InvalidVerifyingKey)?;
+        VerifyingKey::from_bytes(&bytes).map_err(|_| KeyValidationError::InvalidPublicKey)?;
         Ok(Self(bytes))
     }
 
@@ -90,19 +90,19 @@ impl ApiVerifyingKey {
     }
 }
 
-impl fmt::Display for ApiVerifyingKey {
+impl fmt::Display for ApiPublicKey {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(&self.as_str())
     }
 }
 
-impl fmt::Debug for ApiVerifyingKey {
+impl fmt::Debug for ApiPublicKey {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(&self.as_str())
     }
 }
 
-impl FromStr for ApiVerifyingKey {
+impl FromStr for ApiPublicKey {
     type Err = KeyValidationError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
@@ -110,7 +110,7 @@ impl FromStr for ApiVerifyingKey {
     }
 }
 
-impl Serialize for ApiVerifyingKey {
+impl Serialize for ApiPublicKey {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
@@ -119,7 +119,7 @@ impl Serialize for ApiVerifyingKey {
     }
 }
 
-impl<'de> Deserialize<'de> for ApiVerifyingKey {
+impl<'de> Deserialize<'de> for ApiPublicKey {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
@@ -138,8 +138,12 @@ impl ApiSigningKey {
         Self(seed)
     }
 
-    pub fn verifying_key(&self) -> ApiVerifyingKey {
-        ApiVerifyingKey(SigningKey::from_bytes(&self.0).verifying_key().to_bytes())
+    pub(crate) fn seed_bytes(&self) -> &[u8; KEY_BYTES] {
+        &self.0
+    }
+
+    pub fn public_key(&self) -> ApiPublicKey {
+        ApiPublicKey(SigningKey::from_bytes(&self.0).verifying_key().to_bytes())
     }
 
     #[doc(hidden)]
@@ -207,7 +211,7 @@ mod tests {
     #[test]
     fn key_vectors_round_trip_and_aliases_canonicalize() {
         let signing = SIGNING_KEY.clone();
-        let public = SIGNING_KEY.verifying_key();
+        let public = SIGNING_KEY.public_key();
         let signing_text = signing.to_secret_string();
         let public_text = public.as_str();
         assert_eq!(
@@ -219,11 +223,11 @@ mod tests {
             "pk_01NTTK00R5C8APZAMQZPKS5J0EEGEW5SF7PN64CJTY0GTD3VGEM8T"
         );
         assert_eq!(signing_text.parse::<ApiSigningKey>().unwrap(), signing);
-        assert_eq!(public_text.parse::<ApiVerifyingKey>().unwrap(), public);
+        assert_eq!(public_text.parse::<ApiPublicKey>().unwrap(), public);
         assert_eq!(
             public_text
                 .to_ascii_lowercase()
-                .parse::<ApiVerifyingKey>()
+                .parse::<ApiPublicKey>()
                 .unwrap(),
             public
         );
@@ -238,32 +242,32 @@ mod tests {
 
     #[test]
     fn malformed_keys_and_nonzero_high_bits_are_rejected() {
-        let public = SIGNING_KEY.verifying_key().as_str();
+        let public = SIGNING_KEY.public_key().as_str();
         assert!(matches!(
-            public.replacen("pk", "sk", 1).parse::<ApiVerifyingKey>(),
+            public.replacen("pk", "sk", 1).parse::<ApiPublicKey>(),
             Err(KeyValidationError::InvalidPrefix { .. })
         ));
         assert!(matches!(
             public
                 .replacen("pk_0", "pk_1", 1)
-                .parse::<ApiVerifyingKey>(),
+                .parse::<ApiPublicKey>(),
             Err(KeyValidationError::UnsupportedVersion)
         ));
         let short = public.chars().take(55).collect::<String>();
         assert!(matches!(
-            short.parse::<ApiVerifyingKey>(),
+            short.parse::<ApiPublicKey>(),
             Err(KeyValidationError::InvalidLength { .. })
         ));
         let payload = public.chars().skip(5).collect::<String>();
         let nonzero_padding = format!("pk_0Z{payload}");
         assert!(matches!(
-            nonzero_padding.parse::<ApiVerifyingKey>(),
+            nonzero_padding.parse::<ApiPublicKey>(),
             Err(KeyValidationError::NonzeroPadding)
         ));
         assert!(
             public
                 .replacen('D', "U", 1)
-                .parse::<ApiVerifyingKey>()
+                .parse::<ApiPublicKey>()
                 .is_err()
         );
     }
