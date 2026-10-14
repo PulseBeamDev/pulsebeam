@@ -12,7 +12,7 @@ and session cleanup through hooks. The complete app is in
 ## Install and configure your browser app
 
 ```sh
-npm install @pulsebeam/web@0.3.0
+npm install @pulsebeam/web
 ```
 
 Before joining, you need:
