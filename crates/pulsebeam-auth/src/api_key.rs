@@ -95,10 +95,15 @@ impl FromStr for ApiKey {
         // Reject noncanonical unused padding bits, including codec aliases
         // that would alter the underlying secret's textual representation.
         let canonical = CROCKFORD.encode(&data);
-        let roundtrip = CROCKFORD
-            .decode(text.as_bytes())
-            .map_err(|_| ApiKeyError::InvalidEncoding)?;
-        if canonical.len() != text.len() || roundtrip != data {
+        let normalized = text
+            .chars()
+            .map(|c| match c.to_ascii_uppercase() {
+                'O' => '0',
+                'I' | 'L' => '1',
+                other => other,
+            })
+            .collect::<String>();
+        if canonical != normalized {
             return Err(ApiKeyError::InvalidEncoding);
         }
         let project_id = data[..16].try_into().map_err(|_| ApiKeyError::InvalidEncoding)?;
@@ -155,6 +160,6 @@ mod tests {
         assert!(good.replacen("key_0", "key_1", 1).parse::<ApiKey>().is_err());
         assert!(good[..good.len() - 1].parse::<ApiKey>().is_err());
         assert!(good.replace("key_0", "sk_0").parse::<ApiKey>().is_err());
-        assert!(good.replacen('4', "5", 1).parse::<ApiKey>().is_err());
+        assert!(format!("{}1", &good[..good.len() - 1]).parse::<ApiKey>().is_err());
     }
 }
