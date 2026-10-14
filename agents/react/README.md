@@ -27,7 +27,8 @@ overrides and the current reconnect requirement.
 - [API reference](../../docs/react/reference.md)
 - [Fix a failing step](../../docs/react/troubleshooting.md)
 
-Import from `@pulsebeam/react`. Use `useAgent` for React-owned session cleanup.
+Import from `@pulsebeam/react`. `useAgent` returns an Agent immediately; React
+owns its runtime lifecycle. Use a React `key` to replace logical sessions.
 Capture hooks own the devices: disconnecting an Agent does not stop capture.
 Keep signing keys on your backend.
 
