@@ -5,6 +5,12 @@
 PulseBeam connectivity, WASM, foreign runtime, or dependency on the server/core
 crate. Public registry publication remains deferred.
 
+## Local development
+
+`insecure_dev_credentials()` returns one `api_key` plus legacy fields from
+the [shared development fixture](../auth/development.json), matching `--dev`
+servers. Use the new `sign_participant_token_with_api_key` entry point. **Never use them with production or publicly accessible servers.**
+
 ## Local crate consumption
 
 Use a checkout as a normal Cargo path dependency:
@@ -24,19 +30,19 @@ repository paths. A future registry release must publish the shared dependency
 before the SDK; no registry publication is performed by this build.
 
 ```rust
-use pulsebeam_server::sign_participant_token;
+use pulsebeam_server::sign_participant_token_with_api_key;
 
 fn token() -> Result<String, Box<dyn std::error::Error>> {
-    let project = std::env::var("PULSEBEAM_PROJECT_ID")?;
-    let key = std::env::var("PULSEBEAM_KEY_ID")?;
-    let secret = std::env::var("PULSEBEAM_SECRET")?;
-    Ok(sign_participant_token(
-        &project, &key, &secret, "general", "Alice", 2_000_000_000,
+    let api_key = std::env::var("PULSEBEAM_API_KEY")?;
+    Ok(sign_participant_token_with_api_key(
+        &api_key, "general", "Alice", 2_000_000_000,
     )?)
 }
 ```
 
-All six inputs are mandatory. The SDK never reads the environment. Expiration
+The API key plus room, participant and expiration are mandatory. The original
+six-argument `sign_participant_token` remains for compatibility. The V0
+`key_0` format is specified in [API key V0](../auth/api-key.md). The SDK never reads the environment. Expiration
 is a `u64` absolute Unix timestamp in `0..18446744073709551615`, not a TTL.
 Rust rejects missing arguments, booleans, floats, strings, negative constants
 and overflowing constants before signing. Validate externally supplied values
