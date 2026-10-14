@@ -20,7 +20,7 @@ Before joining, you need:
 - A compatible PulseBeam server's absolute HTTP(S) **base URL**, without
   `/api/v1/native`, and an unexpired participant token from your backend.
   Keep signing secrets out of the browser. If you need a local server and tokens,
-  follow the [development server setup](../../docs/react/quickstart.md#1-start-pulsebeam).
+  follow the [development server setup](../../docs/react/quickstart.md#1-run-the-pulsebeam-media-server).
 - A browser-rendered app on **HTTPS or localhost**, with WebRTC, WebAssembly,
   Web Audio, and camera/microphone access. An HTTPS page cannot use an insecure
   remote HTTP endpoint. Start capture from a user action and handle permission errors.
