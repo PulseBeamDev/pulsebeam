@@ -8,7 +8,7 @@ import type {
   Agent,
   AgentConfig,
   AgentEvent,
-  AgentFailure,
+  AgentError,
   AgentSnapshot,
   AgentState,
   CatalogSnapshot,
@@ -53,7 +53,7 @@ interface RuntimeSnapshot {
   readonly participants: readonly Participant[];
   readonly publications: readonly Publication[];
   readonly topics: TopicSnapshot;
-  readonly failure?: AgentFailure;
+  readonly failure?: AgentError;
 }
 
 interface RuntimeConfig {
@@ -215,7 +215,7 @@ function message(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-function localFailureClass(error: unknown): AgentFailure["class"] {
+function localFailureClass(error: unknown): AgentError["class"] {
   if (
     typeof error === "object" &&
     error !== null &&
@@ -454,6 +454,30 @@ class AgentFacade implements Agent {
     video: (label: string) => this.#localVideoTrack(label),
     audio: (label: string) => this.#localAudioTrack(label),
   });
+
+  get connection(): ConnectionState {
+    return this.#snapshot.connection;
+  }
+
+  get error(): AgentError | null {
+    return this.#snapshot.failure;
+  }
+
+  get participantId(): string | null {
+    return this.#snapshot.participantId;
+  }
+
+  get participantExternalId(): string | null {
+    return this.#snapshot.participantExternalId;
+  }
+
+  get roomExternalId(): string | null {
+    return this.#snapshot.roomExternalId;
+  }
+
+  get authorizationExpiresAt(): number | null {
+    return this.#snapshot.authorizationExpiresAt;
+  }
 
   get remote(): RemoteMedia {
     return this.#remote;
@@ -849,7 +873,7 @@ class AgentFacade implements Agent {
     this.#emit(event);
   }
 
-  #terminalFailure(failureClass: AgentFailure["class"], text: string): void {
+  #terminalFailure(failureClass: AgentError["class"], text: string): void {
     if (this.#closed) return;
     const failure = Object.freeze({ class: failureClass, message: text });
     this.#publish(
@@ -862,7 +886,7 @@ class AgentFacade implements Agent {
     this.#emit(Object.freeze({ type: "failure", ...failure }));
   }
 
-  #emitFailure(failureClass: AgentFailure["class"], text: string): void {
+  #emitFailure(failureClass: AgentError["class"], text: string): void {
     if (this.#closed) return;
     this.#emit(
       Object.freeze({ type: "failure", class: failureClass, message: text }),

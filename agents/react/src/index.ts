@@ -25,6 +25,7 @@ export type {
 export type {
   Agent,
   AgentConfig,
+  AgentError,
   AgentEvent,
   AgentFailure,
   AgentLogging,

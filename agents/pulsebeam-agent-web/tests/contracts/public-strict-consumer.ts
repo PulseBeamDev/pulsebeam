@@ -4,6 +4,7 @@ import {
   attachRemoteMedia,
   attachRemoteVideo,
   LocalTrackCapacityError,
+  type AgentError,
   type AgentEvent,
   type AgentFailure,
   type AgentSnapshot,
@@ -87,6 +88,9 @@ const videoCapacity: LocalTrackCapacityError = new LocalTrackCapacityError(
 void videoCapacity;
 agent.disconnect();
 const snapshot: AgentSnapshot = agent.getSnapshot();
+const connection: ConnectionState = agent.connection;
+const agentError: AgentError | null = agent.error;
+void [connection, agentError];
 const catalogRevision: number = snapshot.catalog.revision;
 const acceptedIntentRevision: number = snapshot.mapping.acceptedIntentRevision;
 const mappedPublication: string | undefined =

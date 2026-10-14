@@ -15,6 +15,7 @@ export { attachRemoteVideo } from "./remote-catalog.js";
 export type {
   Agent,
   AgentConfig,
+  AgentError,
   AgentEvent,
   AgentFailure,
   AgentLogging,

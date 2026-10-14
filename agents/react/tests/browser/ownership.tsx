@@ -46,7 +46,7 @@ export async function runOwnershipContract() {
     firstRenderAvailable = true;
     return (
       <span>
-        {left.getSnapshot().connection} / {right.getSnapshot().connection}
+        {left.connection} / {right.connection}
       </span>
     );
   }
@@ -106,7 +106,7 @@ export async function runOwnershipContract() {
     await until(() => left !== null && left !== first);
     const resized = left!;
     const topologyReplacement =
-      first.getSnapshot().connection === "disconnected" &&
+      first.connection === "disconnected" &&
       resized.local.video("camera").kind === "video" &&
       resized.local.video("screen").kind === "video";
 
@@ -114,13 +114,13 @@ export async function runOwnershipContract() {
     await until(() => left !== null && left !== resized);
     const replacedConstruction =
       topologyReplacement &&
-      resized.getSnapshot().connection === "disconnected" &&
+      resized.connection === "disconnected" &&
       right === independent;
     const replacement = left!;
     root.unmount();
     unmounted = true;
     const ownedCleanup =
-      replacement.getSnapshot().connection === "disconnected" &&
+      replacement.connection === "disconnected" &&
       track.readyState === "live";
     track.stop();
     return {

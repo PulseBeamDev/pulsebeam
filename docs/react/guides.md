@@ -106,7 +106,7 @@ it from a button instead. [Playback diagnostics](/react/troubleshooting#autoplay
 
 ## Connection, renewal, and errors
 
-Show `getSnapshot().connection` and `failure`, not just the last button clicked.
+Show `agent.connection` and `agent.error`, not just the last button clicked.
 The runtime retries temporary loss while connection is desired. `reconnect()`
 retains desired media/topic state; `disconnect()` stops retries, not capture.
 Fix a `terminal-failure` before creating a fresh Agent.
@@ -131,14 +131,15 @@ sequenceDiagram
     App->>App: Set token
 ```
 
-Fetch before `snapshot.authorizationExpiresAt` (Unix seconds), then update only
+Fetch before `agent.authorizationExpiresAt` (Unix seconds), then update only
 `config.token`. The hook renews the same Agent; changing endpoint or topology replaces it; logging changes update in place.
 Caller-owned Agents use `renewAuthorization(token)`.
 The SDK does not fetch tokens. Keep keys server-side, report renewal failures,
 and use a new Agent to change room or participant.
 
-Catch capture, playback, and topic failures at their controls. Observe Agent
-failures through snapshots/events; unsubscribe event listeners on cleanup.
+Catch capture, playback, and topic failures at their controls. In React, read
+`agent.error` directly; `useAgent` owns the subscription and rerenders the component.
+Use `subscribeEvents` only when you specifically need the diagnostic/event stream.
 [Choose the next diagnostic](/react/troubleshooting).
 
 ## Typed topics
