@@ -80,6 +80,12 @@ func TestConformance(t *testing.T) {
 			if err != nil || got != v.Token {
 				t.Fatalf("token mismatch: %v", err)
 			}
+			viaKey, keyErr := pulsebeam.SignParticipantTokenWithAPIKey(
+				"key_0067MYZ1001R0100000000000640RYKVW400Q00C00400000000S4SK88KCMFZ5PTKPVC6HQC2570YPWA66FKBAX64KD8SXQD9YWADYR", v.Input.Room, v.Input.Participant, exp,
+			)
+			if keyErr != nil || viaKey != got {
+				t.Fatalf("API key V0 mismatch: %v", keyErr)
+			}
 			parts := strings.Split(got, ".")
 			for i, expected := range []string{v.Header, v.Claims} {
 				decoded, err := base64.RawURLEncoding.DecodeString(parts[i])
@@ -182,5 +188,44 @@ func TestInvalidInputsAndDiagnostics(t *testing.T) {
 				t.Fatal("secret disclosed")
 			}
 		})
+	}
+}
+
+func TestEmbeddedDevelopmentCredentials(t *testing.T) {
+	path := os.Getenv("PULSEBEAM_DEVELOPMENT")
+	if path == "" {
+		path = "../auth/development.json"
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var expected pulsebeam.DevelopmentCredentials
+	if err := json.Unmarshal(data, &expected); err != nil {
+		t.Fatal(err)
+	}
+	actual := pulsebeam.InsecureDevCredentials()
+	if actual != expected {
+		t.Fatal("embedded credentials differ from canonical JSON")
+	}
+	jwt, err := pulsebeam.SignParticipantToken(
+		actual.ProjectID, actual.KeyID, actual.Secret, "demo", "alice", 2000000000,
+	)
+	if err != nil || jwt == "" {
+		t.Fatalf("development token: %v", err)
+	}
+	compact, err := pulsebeam.SignParticipantTokenWithAPIKey(actual.APIKey, "demo", "alice", 2000000000)
+	if err != nil || compact != jwt {
+		t.Fatalf("development API key mismatch: %v", err)
+	}
+	for _, bad := range []string{
+		"key_1" + actual.APIKey[5:],
+		actual.APIKey[:len(actual.APIKey)-1],
+		actual.APIKey[:len(actual.APIKey)-1] + "1",
+	} {
+		_, err := pulsebeam.SignParticipantTokenWithAPIKey(bad, "demo", "alice", 2000000000)
+		if err == nil {
+			t.Fatal("invalid API key accepted")
+		}
 	}
 }
