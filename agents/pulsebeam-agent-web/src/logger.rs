@@ -26,7 +26,9 @@ impl BrowserLogger {
     pub(crate) fn new(level: LogLevel) -> Self {
         let _ = log::set_logger(&CORE_CONSOLE_LOGGER);
         log::set_max_level(log::LevelFilter::Trace);
-        Self { level: Cell::new(level) }
+        Self {
+            level: Cell::new(level),
+        }
     }
 
     pub(crate) fn set_level(&self, level: LogLevel) {
