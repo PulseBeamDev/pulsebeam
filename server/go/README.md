@@ -6,9 +6,8 @@ Rust, WASM, or foreign runtime is needed. Registry publication is deferred.
 
 ## Local development
 
-`pulsebeam.InsecureDevCredentials()` returns the same embedded JSON identity
-used by the local `--dev` server. Pass its `ProjectID`, `KeyID`, and
-`Secret` fields to `SignParticipantToken`. **Never use these publicly known
+`pulsebeam.InsecureDevCredentials()` returns the embedded development identity
+with a single `APIKey` usable by `SignParticipantTokenWithAPIKey`. **Never use these publicly known
 credentials in production or on an exposed server.**
 
 ## Local module consumption
@@ -27,11 +26,8 @@ import (
     pulsebeam "github.com/PulseBeamDev/pulsebeam/server/go"
 )
 
-token, err := pulsebeam.SignParticipantToken(
-    os.Getenv("PULSEBEAM_PROJECT_ID"),
-    os.Getenv("PULSEBEAM_KEY_ID"),
-    os.Getenv("PULSEBEAM_SECRET"),
-    "general", "Alice", uint64(2000000000),
+token, err := pulsebeam.SignParticipantTokenWithAPIKey(
+    os.Getenv("PULSEBEAM_API_KEY"), "general", "Alice", uint64(2000000000),
 )
 if err != nil {
     // Handle without logging credentials. No token is returned on error.
@@ -40,6 +36,9 @@ if err != nil {
 _ = token
 ```
 
+One server-side `PULSEBEAM_API_KEY` holds the project's UUIDv7, key UUIDv7,
+and 32-byte Ed25519 seed in the [V0 format](../auth/api-key.md). The legacy
+`SignParticipantToken(projectID, keyID, secret, ...)` remains available.
 All credentials are explicit. The SDK never reads the environment. Expiration
 is a mandatory uint64 absolute Unix timestamp in `0..18446744073709551615`, not
 a TTL. Go's type checker rejects missing, negative, fractional, boolean,
