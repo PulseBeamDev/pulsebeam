@@ -1,4 +1,5 @@
 use serde::Deserialize;
+use std::cell::Cell;
 use wasm_bindgen::JsValue;
 
 struct CoreConsoleLogger;
@@ -18,14 +19,20 @@ pub(crate) enum LogLevel {
 }
 
 pub(crate) struct BrowserLogger {
-    level: LogLevel,
+    level: Cell<LogLevel>,
 }
 
 impl BrowserLogger {
     pub(crate) fn new(level: LogLevel) -> Self {
         let _ = log::set_logger(&CORE_CONSOLE_LOGGER);
         log::set_max_level(log::LevelFilter::Trace);
-        Self { level }
+        Self {
+            level: Cell::new(level),
+        }
+    }
+
+    pub(crate) fn set_level(&self, level: LogLevel) {
+        self.level.set(level);
     }
 
     pub(crate) fn debug(&self, target: &str, message: String) {
@@ -41,7 +48,7 @@ impl BrowserLogger {
     }
 
     fn log(&self, level: LogLevel, target: &str, message: impl AsRef<str>) {
-        if self.level == LogLevel::Off || level > self.level {
+        if self.level.get() == LogLevel::Off || level > self.level.get() {
             return;
         }
         let message = message.as_ref();

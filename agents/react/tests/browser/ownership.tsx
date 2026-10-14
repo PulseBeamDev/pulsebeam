@@ -1,7 +1,7 @@
 import { StrictMode, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { createCaptureSource } from "@pulsebeam/web";
-import { useAgent, type Agent } from "@pulsebeam/react";
+import { useAgent, type Agent, type LogLevel } from "@pulsebeam/react";
 
 async function until(predicate: () => boolean): Promise<void> {
   for (let i = 0; i < 100; i++) {
@@ -21,20 +21,32 @@ export async function runOwnershipContract() {
   let right: Agent | null = null;
   let changeToken!: () => void;
   let changeEndpoint!: () => void;
+  let changeLogging!: () => void;
+  let changeTopology!: () => void;
+  let firstRenderAvailable = false;
   function Probe() {
     const [token, setToken] = useState("owned-token-a");
     const [endpoint, setEndpoint] = useState(location.origin);
+    const [logging, setLogging] = useState<LogLevel>("warn");
+    const [localVideos, setLocalVideos] = useState(1);
     changeToken = () => setToken("owned-token-b");
     changeEndpoint = () => setEndpoint(`${location.origin}/replacement`);
-    left = useAgent({ endpoint, token, topology: { localVideos: 1 } });
+    changeLogging = () => setLogging("debug");
+    changeTopology = () => setLocalVideos(2);
+    left = useAgent({
+      endpoint,
+      token,
+      topology: { localVideos },
+      logging: { level: logging },
+    });
     right = useAgent({
       endpoint: location.origin,
       token: "independent-token",
-      topology: { localVideos: 1 },
     });
+    firstRenderAvailable = true;
     return (
       <span>
-        {left?.getSnapshot().connection} / {right?.getSnapshot().connection}
+        {left.getSnapshot().connection} / {right.getSnapshot().connection}
       </span>
     );
   }
@@ -55,11 +67,21 @@ export async function runOwnershipContract() {
     const secondVideo = independent.local.video("camera");
     firstVideo.setSource(source);
     secondVideo.setSource(source);
+    const secondSlot = independent.local.video("screen");
+    let defaultCapacityReached = false;
+    try {
+      independent.local.video("third");
+    } catch (error) {
+      defaultCapacityReached =
+        error instanceof RangeError && error.message.includes("third");
+    }
     const shared =
       first !== independent &&
       firstVideo !== secondVideo &&
       firstVideo.source === source &&
-      secondVideo.source === source;
+      secondVideo.source === source &&
+      secondSlot.kind === "video" &&
+      defaultCapacityReached;
     firstVideo.setEnabled(false);
     await new Promise((resolve) => setTimeout(resolve, 30));
     const independentEnablement =
@@ -76,24 +98,38 @@ export async function runOwnershipContract() {
     await new Promise((resolve) => setTimeout(resolve, 30));
     const renewedWithoutReplacing = left === first && right === independent;
 
-    changeEndpoint();
+    changeLogging();
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    const loggingKeepsSession = left === first;
+
+    changeTopology();
     await until(() => left !== null && left !== first);
-    const replacedConstruction =
-      firstVideo.source === null &&
+    const resized = left!;
+    const topologyReplacement =
       first.getSnapshot().connection === "disconnected" &&
+      resized.local.video("camera").kind === "video" &&
+      resized.local.video("screen").kind === "video";
+
+    changeEndpoint();
+    await until(() => left !== null && left !== resized);
+    const replacedConstruction =
+      topologyReplacement &&
+      resized.getSnapshot().connection === "disconnected" &&
       right === independent;
     const replacement = left!;
     root.unmount();
     unmounted = true;
     const ownedCleanup =
-      secondVideo.source === null &&
       replacement.getSnapshot().connection === "disconnected" &&
       track.readyState === "live";
     track.stop();
     return {
       ownedIndependent:
-        shared && independentEnablement && disconnectRetainsSource,
-      ownedRenewal: renewedWithoutReplacing,
+        firstRenderAvailable &&
+        shared &&
+        independentEnablement &&
+        disconnectRetainsSource,
+      ownedRenewal: renewedWithoutReplacing && loggingKeepsSession,
       ownedReplacement: replacedConstruction,
       ownedCleanup: ownedCleanup && String(track.readyState) === "ended",
     };
