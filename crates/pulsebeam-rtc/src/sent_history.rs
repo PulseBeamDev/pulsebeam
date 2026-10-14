@@ -16,7 +16,7 @@ use std::{
 
 use crate::{
     PacketFeedbackKind,
-    congestion::{EcnMark as ControllerEcnMark, FeedbackSample},
+    congestion::{EcnMark as ControllerEcnMark, FeedbackSample, LossOrigin},
     connection::{CommitParticipant, TransmitCommitContext},
     rtcp::{ArrivalOffset, FeedbackBatch, FeedbackReport, Rfc8888Status, TwccStatus},
     transport::{DatagramKind, PathEpoch, RtpService},
@@ -58,12 +58,14 @@ pub(crate) enum EcnMark {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct PacketFeedback {
     pub(crate) sent_id: SentPacketId,
+    pub(crate) ssrc: u32,
     pub(crate) committed_at: Instant,
     pub(crate) transport_bytes: u32,
     pub(crate) service: RtpService,
     pub(crate) received: bool,
     pub(crate) newly_acked: bool,
     pub(crate) lost: bool,
+    pub(crate) loss_origin: Option<LossOrigin>,
     pub(crate) receiver_arrival: Option<ReceiverTime>,
     pub(crate) ecn: Option<EcnMark>,
 }
@@ -162,7 +164,7 @@ pub(crate) enum HistoryError {
 }
 
 pub(crate) struct SentHistory {
-    mode: PacketFeedbackKind,
+    mode: Option<PacketFeedbackKind>,
     entries: Box<[Option<SentEntry>]>,
     twcc_index: Box<[Option<TwccIndex>]>,
     ssrcs: Vec<SsrcHistory>,
@@ -185,9 +187,9 @@ pub(crate) struct SentHistory {
 }
 
 impl SentHistory {
-    pub(crate) fn new(mode: PacketFeedbackKind) -> Self {
+    pub(crate) fn new(mode: impl Into<Option<PacketFeedbackKind>>) -> Self {
         Self {
-            mode,
+            mode: mode.into(),
             entries: std::iter::repeat_with(|| None)
                 .take(SENT_HISTORY_CAPACITY)
                 .collect(),
@@ -301,7 +303,8 @@ impl SentHistory {
             || context.wire_len == 0
             || !matches!(
                 (self.mode, rtp.twcc_sequence),
-                (PacketFeedbackKind::TransportWide, Some(_)) | (PacketFeedbackKind::Rfc8888, None)
+                (Some(PacketFeedbackKind::TransportWide), Some(_))
+                    | (Some(PacketFeedbackKind::Rfc8888), None)
             )
             || self.next_sent_id == u64::MAX
             || self
@@ -414,6 +417,11 @@ impl SentHistory {
             self.counters.unknown_feedback.saturating_add(count as u64);
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_active_epoch(&self) -> Option<PathEpoch> {
+        self.active_epoch
+    }
+
     pub(crate) const fn counters(&self) -> HistoryCounters {
         self.counters
     }
@@ -445,6 +453,7 @@ impl PacketFeedback {
             received: self.received,
             newly_acked: self.newly_acked,
             lost: self.lost,
+            loss_origin: self.loss_origin,
             receiver_arrival_micros: match self.receiver_arrival {
                 Some(ReceiverTime::Micros(value)) => Some(value),
                 Some(ReceiverTime::OverRange | ReceiverTime::Unavailable) | None => None,

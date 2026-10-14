@@ -59,12 +59,13 @@ pub(crate) struct NegotiatedSessionFacts {
     pub(crate) dtls_identity: str0m::crypto::dtls::DtlsCert,
     protocol_randomness: [u8; 32],
     media: Box<[NegotiatedMediaSection]>,
-    feedback: PacketFeedbackKind,
+    feedback: Option<PacketFeedbackKind>,
     limits: ConnectionLimits,
     accepted_at: TimePoint,
 }
 
 pub(crate) struct IngressMediaFacts {
+    pub(crate) sender_index: u32,
     pub(crate) kind: crate::MediaKind,
     pub(crate) mid: Box<str>,
     pub(crate) payloads: Box<[(u8, u32)]>,
@@ -82,6 +83,9 @@ pub(crate) struct EgressSenderFacts {
     pub(crate) clock_rate: u32,
     pub(crate) mid_extension_id: Option<u8>,
     pub(crate) twcc_extension_id: Option<u8>,
+    pub(crate) playout_extension_id: Option<u8>,
+    pub(crate) dependency_extension_id: Option<u8>,
+    pub(crate) forwarded_extensions: Box<[(u8, Box<str>)]>,
 }
 
 #[derive(Clone, Copy)]
@@ -93,7 +97,7 @@ pub(crate) struct SctpSessionFacts {
 }
 
 impl NegotiatedSessionFacts {
-    pub(crate) const fn feedback(&self) -> PacketFeedbackKind {
+    pub(crate) const fn feedback(&self) -> Option<PacketFeedbackKind> {
         self.feedback
     }
 
@@ -131,6 +135,7 @@ impl NegotiatedSessionFacts {
                     SectionKind::Application => return None,
                 };
                 Some(IngressMediaFacts {
+                    sender_index: section.media_index,
                     kind,
                     mid: section.mid.clone().into_boxed_str(),
                     payloads: section
@@ -187,6 +192,16 @@ impl NegotiatedSessionFacts {
                     clock_rate: codec.clock_rate,
                     mid_extension_id: extension_id(MID_URI),
                     twcc_extension_id: TWCC_URIS.iter().find_map(|uri| extension_id(uri)),
+                    playout_extension_id: extension_id(PLAYOUT_DELAY_URI),
+                    dependency_extension_id: crate::dependency_descriptor::URIS
+                        .iter()
+                        .find_map(|uri| extension_id(uri)),
+                    forwarded_extensions: section
+                        .extensions
+                        .iter()
+                        .filter(|extension| extension.direction.allows_send() && extension.forward)
+                        .map(|extension| (extension.id, extension.uri.clone().into_boxed_str()))
+                        .collect(),
                 })
             })
             .collect()
@@ -292,6 +307,7 @@ struct HeaderExtensionFacts {
     uri: String,
     direction: Direction,
     attributes: Option<String>,
+    forward: bool,
 }
 
 struct SsrcGroupFacts {
@@ -313,6 +329,7 @@ struct NegotiatedMediaSection {
     codecs: Box<[CodecFacts]>,
     extensions: Box<[HeaderExtensionFacts]>,
     rids: Box<[String]>,
+    inbound_rids: Box<[String]>,
     ssrcs: Box<[u32]>,
     ssrc_groups: Box<[SsrcGroupFacts]>,
     sctp: Option<SctpFacts>,
@@ -369,16 +386,21 @@ fn negotiate_inner(
         return Err(NegotiationError::limit());
     }
     let parsed = Sdp::parse(offer.as_str()).map_err(|_| NegotiationError::invalid())?;
-    if !offer.as_str().lines().any(|line| {
-        line.trim_end_matches('\r')
-            .strip_prefix("a=rtcp-fb:")
-            .is_some_and(|value| {
-                value
-                    .split_whitespace()
-                    .nth(1)
-                    .is_some_and(|feedback| feedback == "transport-cc" || feedback == "ccfb")
-            })
-    }) {
+    if parsed
+        .media_lines
+        .iter()
+        .any(|line| line.typ != MediaType::Application)
+        && !offer.as_str().lines().any(|line| {
+            line.trim_end_matches('\r')
+                .strip_prefix("a=rtcp-fb:")
+                .is_some_and(|value| {
+                    value
+                        .split_whitespace()
+                        .nth(1)
+                        .is_some_and(|feedback| feedback == "transport-cc" || feedback == "ccfb")
+                })
+        })
+    {
         return Err(NegotiationError(AcceptError::MissingPacketFeedback));
     }
     let raw = RawSdp::parse(offer.as_str())?;
@@ -426,6 +448,21 @@ fn negotiate_inner(
         let media_index = u32::try_from(index).map_err(|_| NegotiationError::limit())?;
         builds.push(parse_section(line, section, mid, media_index, allow_mixed)?);
     }
+    for section in &mut builds {
+        section.facts.extensions = std::mem::take(&mut section.facts.extensions)
+            .into_vec()
+            .into_iter()
+            .filter_map(|mut extension| {
+                let known = supported_extension(&extension.uri);
+                if !known && config.unknown_extension_policy == crate::UnknownExtensionPolicy::Drop
+                {
+                    return None;
+                }
+                extension.forward = forward_extension(&extension.uri);
+                Some(extension)
+            })
+            .collect();
+    }
     validate_bundle_namespaces(&builds)?;
 
     let active = builds
@@ -435,9 +472,6 @@ fn negotiate_inner(
                 && section.facts.direction != Direction::Inactive
         })
         .collect::<Vec<_>>();
-    if active.is_empty() {
-        return Err(NegotiationError(AcceptError::MissingPacketFeedback));
-    }
     let outbound = active
         .iter()
         .copied()
@@ -453,17 +487,25 @@ fn negotiate_inner(
     } else {
         &outbound
     };
-    let feedback = if checked
+    let feedback = if builds
+        .iter()
+        .all(|section| section.facts.kind == SectionKind::Application)
+        && builds.iter().any(|section| section.facts.sctp.is_some())
+    {
+        None
+    } else if checked.is_empty() {
+        return Err(NegotiationError(AcceptError::MissingPacketFeedback));
+    } else if checked
         .iter()
         .all(|section| section.twcc && (outbound.is_empty() || section.twcc_sendable))
     {
-        PacketFeedbackKind::TransportWide
+        Some(PacketFeedbackKind::TransportWide)
     } else if checked.iter().all(|section| section.rfc8888) {
-        PacketFeedbackKind::Rfc8888
+        Some(PacketFeedbackKind::Rfc8888)
     } else {
         return Err(NegotiationError(AcceptError::MissingPacketFeedback));
     };
-    if feedback == PacketFeedbackKind::Rfc8888 {
+    if feedback == Some(PacketFeedbackKind::Rfc8888) {
         for section in &mut builds {
             section.facts.extensions = std::mem::take(&mut section.facts.extensions)
                 .into_vec()
@@ -475,9 +517,15 @@ fn negotiate_inner(
     }
 
     let (dtls_identity, local_fingerprint) = dtls_identity(entropy)?;
-    let local_ice = IceCredentials {
-        ufrag: token(&entropy.take::<12>(b"ice ufrag")),
-        password: token(&entropy.take::<24>(b"ice password")),
+    let local_ice = match &config.local_ice_credentials {
+        Some(credentials) => IceCredentials {
+            ufrag: credentials.ufrag().to_owned(),
+            password: credentials.password().to_owned(),
+        },
+        None => IceCredentials {
+            ufrag: token(&entropy.take::<12>(b"ice ufrag")),
+            password: token(&entropy.take::<24>(b"ice password")),
+        },
     };
     let protocol_randomness = entropy.take::<32>(b"protocol randomness");
     let local_candidates = local_candidates(config)?;
@@ -499,6 +547,12 @@ fn negotiate_inner(
                 sender_index: section.facts.media_index,
                 kind,
                 mid: Arc::from(section.facts.mid.as_str()),
+                rids: section
+                    .facts
+                    .inbound_rids
+                    .iter()
+                    .map(|rid| Arc::from(rid.as_str()))
+                    .collect(),
             })
         })
         .collect::<Vec<_>>();
@@ -534,15 +588,13 @@ fn negotiate_inner(
             mid: Arc::from(section.facts.mid.as_str()),
             rtp_clock_rate: codec.clock_rate,
             supports_rtx: codec.retransmission_payload_type.is_some(),
-            signals_playout_delay: section
-                .facts
-                .extensions
-                .iter()
-                .any(|extension| extension.uri == PLAYOUT_DELAY_URI),
+            signals_playout_delay: section.facts.extensions.iter().any(|extension| {
+                extension.direction.allows_send() && extension.uri == PLAYOUT_DELAY_URI
+            }),
         });
     }
     let session = SessionInfo {
-        feedback: Some(feedback),
+        feedback,
         inbound_media: Arc::from(inbound_media),
         senders: Arc::from(senders),
     };
@@ -823,6 +875,7 @@ fn parse_section(
             codecs: codecs.into_boxed_slice(),
             extensions: extensions.into_boxed_slice(),
             rids: rids.into_boxed_slice(),
+            inbound_rids: inbound_rids(raw)?.into_boxed_slice(),
             ssrcs: ssrcs.into_boxed_slice(),
             ssrc_groups: groups.into_boxed_slice(),
             sctp,
@@ -883,12 +936,22 @@ fn parse_codecs(
     if codecs.is_empty() {
         return Err(NegotiationError::conflict());
     }
-    for parameter in &params {
-        if !parameter.spec.codec.to_string().eq_ignore_ascii_case("rtx") {
+    // rtp_params folds RTX into primary payloads; inspect offered maps to retain
+    // duplicate apt validation instead of accepting only its last resend mapping.
+    for mapping in raw.iter().filter_map(|line| line.strip_prefix("a=rtpmap:")) {
+        let mut fields = mapping.split_whitespace();
+        let Some(payload) = fields.next().and_then(|value| value.parse::<u8>().ok()) else {
+            continue;
+        };
+        if !line.pts.iter().any(|offered| **offered == payload)
+            || !fields
+                .next()
+                .is_some_and(|codec| codec.eq_ignore_ascii_case("rtx/90000"))
+        {
             continue;
         }
         let Some(apt) =
-            fmtp_parameter(raw, *parameter.pt, "apt")?.and_then(|value| value.parse::<u8>().ok())
+            fmtp_parameter(raw, payload, "apt")?.and_then(|value| value.parse::<u8>().ok())
         else {
             continue;
         };
@@ -896,8 +959,8 @@ fn parse_codecs(
             if primary.retransmission_payload_type.is_some() {
                 return Err(NegotiationError::conflict());
             }
-            primary.retransmission_payload_type = Some(*parameter.pt);
-            payloads.push(*parameter.pt);
+            primary.retransmission_payload_type = Some(payload);
+            payloads.push(payload);
         }
     }
     Ok((codecs, payloads))
@@ -956,8 +1019,12 @@ fn parse_extensions(
     let mut ids = HashSet::new();
     let mut uris = HashSet::new();
     let mut result = Vec::new();
-    for value in raw.iter().filter_map(|line| line.strip_prefix("a=extmap:")) {
-        if result.len() >= MAX_EXTENSIONS {
+    for (index, value) in raw
+        .iter()
+        .filter_map(|line| line.strip_prefix("a=extmap:"))
+        .enumerate()
+    {
+        if index >= MAX_EXTENSIONS {
             return Err(NegotiationError::limit());
         }
         let Some((id, value)) = value.split_once(char::is_whitespace) else {
@@ -981,20 +1048,24 @@ fn parse_extensions(
             Some("inactive") => Direction::Inactive,
             Some(_) => return Err(NegotiationError::invalid()),
         };
-        if media_direction != Direction::Inactive && !direction.is_subset_of(media_direction) {
-            return Err(NegotiationError::invalid());
-        }
         if parts.next().is_some() || !ids.insert(id) || !uris.insert(uri) {
             return Err(NegotiationError::conflict());
         }
-        if supported_extension(uri) {
-            result.push(HeaderExtensionFacts {
-                id,
-                uri: uri.to_owned(),
-                direction,
-                attributes,
-            });
+        if media_direction != Direction::Inactive && !direction.is_subset_of(media_direction) {
+            if uri == MID_URI || TWCC_URIS.contains(&uri) {
+                return Err(NegotiationError::invalid());
+            }
+            // Firefox advertises recvonly playout-delay on sendonly media. An
+            // unusable optional mapping is omitted, never answered as usable.
+            continue;
         }
+        result.push(HeaderExtensionFacts {
+            id,
+            uri: uri.to_owned(),
+            direction,
+            attributes,
+            forward: false,
+        });
     }
     result.sort_by_key(|extension| extension.id);
     Ok(result)
@@ -1005,12 +1076,22 @@ fn supported_extension(uri: &str) -> bool {
         || uri == "urn:ietf:params:rtp-hdrext:sdes:rtp-stream-id"
         || uri == "urn:ietf:params:rtp-hdrext:sdes:repaired-rtp-stream-id"
         || uri == "urn:ietf:params:rtp-hdrext:ssrc-audio-level"
+        || uri == "urn:3gpp:video-orientation"
         || uri == "http://www.webrtc.org/experiments/rtp-hdrext/abs-capture-time"
         || TWCC_URIS.contains(&uri)
-        || uri.contains("video-dependency-descriptor")
-        || uri.contains("dependency-descriptor-rtp-header-extension")
+        || crate::dependency_descriptor::URIS.contains(&uri)
         || uri.contains("video-layers-allocation")
         || uri == PLAYOUT_DELAY_URI
+}
+
+fn forward_extension(uri: &str) -> bool {
+    matches!(
+        uri,
+        "urn:ietf:params:rtp-hdrext:ssrc-audio-level"
+            | "urn:3gpp:video-orientation"
+            | "http://www.webrtc.org/experiments/rtp-hdrext/abs-capture-time"
+    ) || (!supported_extension(uri)
+        && uri != "http://www.webrtc.org/experiments/rtp-hdrext/abs-send-time")
 }
 
 fn parse_rids(raw: &[String], kind: SectionKind) -> Result<Vec<String>, NegotiationError> {
@@ -1036,6 +1117,48 @@ fn parse_rids(raw: &[String], kind: SectionKind) -> Result<Vec<String>, Negotiat
         result.push(id.to_owned());
     }
     Ok(result)
+}
+
+fn inbound_rids(raw: &[String]) -> Result<Vec<String>, NegotiationError> {
+    let declared = raw
+        .iter()
+        .filter_map(|line| line.strip_prefix("a=rid:"))
+        .filter_map(|value| {
+            let mut fields = value.split_whitespace();
+            let rid = fields.next()?;
+            (fields.next() == Some("send")).then_some(rid)
+        })
+        .collect::<Vec<_>>();
+    if declared.len() > MAX_RIDS {
+        return Err(NegotiationError::limit());
+    }
+    let mut rids = Vec::new();
+    for value in raw
+        .iter()
+        .filter_map(|line| line.strip_prefix("a=simulcast:"))
+    {
+        let fields = value.split_whitespace().collect::<Vec<_>>();
+        for pair in fields.chunks_exact(2) {
+            let ["send", rid_list] = pair else {
+                continue;
+            };
+            for rid in rid_list
+                .split([';', ','])
+                .map(|rid| rid.strip_prefix('~').unwrap_or(rid))
+            {
+                if !declared.contains(&rid) {
+                    return Err(NegotiationError::invalid());
+                }
+                if !rids.iter().any(|existing| existing == rid) {
+                    rids.push(rid.to_owned());
+                }
+            }
+        }
+    }
+    if rids.is_empty() {
+        rids.extend(declared.into_iter().map(str::to_owned));
+    }
+    Ok(rids)
 }
 
 fn validate_simulcast(raw: &[String], kind: SectionKind) -> Result<(), NegotiationError> {
@@ -1402,7 +1525,7 @@ fn format_answer_section(
     local_candidates: &[is::Candidate],
     setup: Setup,
     bundle_tag: bool,
-    feedback: PacketFeedbackKind,
+    feedback: Option<PacketFeedbackKind>,
 ) -> String {
     let disabled = raw.first().and_then(|line| line.split_whitespace().nth(1)) == Some("0")
         && !raw.iter().any(|line| line == "a=bundle-only");
@@ -1457,8 +1580,8 @@ fn format_answer_section(
             let name = fields.next().unwrap_or_default();
             applies
                 && match name {
-                    "transport-cc" => feedback == PacketFeedbackKind::TransportWide,
-                    "ccfb" => feedback == PacketFeedbackKind::Rfc8888,
+                    "transport-cc" => feedback == Some(PacketFeedbackKind::TransportWide),
+                    "ccfb" => feedback == Some(PacketFeedbackKind::Rfc8888),
                     _ => true,
                 }
         });
@@ -1471,7 +1594,8 @@ fn format_answer_section(
                     .extensions
                     .iter()
                     .any(|extension| extension.uri == uri)
-                    && (feedback == PacketFeedbackKind::TransportWide || !TWCC_URIS.contains(&uri))
+                    && (feedback == Some(PacketFeedbackKind::TransportWide)
+                        || !TWCC_URIS.contains(&uri))
             });
         let keep = line.starts_with("a=mid:")
             || line == "a=rtcp-mux"
@@ -1639,6 +1763,134 @@ mod tests {
     }
 
     #[test]
+    fn offered_rtx_mapping_survives_primary_codec_normalization() {
+        let offer = SdpOffer::new(
+            fixture("chrome")
+                .as_str()
+                .replace("a=sendonly", "a=sendrecv"),
+        );
+        let mut entropy = EntropyConsumer::new(ConnectionEntropy::new([8; 32]));
+        let result = negotiate_inner(&config(), &offer, at(), &mut entropy).expect("negotiate RTX");
+        assert!(
+            result
+                .answer
+                .as_str()
+                .contains("m=video 9 UDP/TLS/RTP/SAVPF 102 121")
+        );
+        assert!(result.answer.as_str().contains("a=rtpmap:121 rtx/90000"));
+        assert!(result.answer.as_str().contains("a=fmtp:121 apt=102"));
+    }
+
+    #[test]
+    fn extension_policy_negotiates_opaque_values_only_when_enabled_and_never_copies_managed_state()
+    {
+        let offer = SdpOffer::new(
+            fixture("chrome")
+                .as_str()
+                .replace("a=sendonly", "a=sendrecv")
+                .replace(
+                    "a=mid:audio",
+                    concat!(
+                        "a=mid:audio\n",
+                        "a=extmap:10 urn:example:opaque\n",
+                        "a=extmap:11 urn:3gpp:video-orientation\n",
+                        "a=extmap:12 http://www.webrtc.org/experiments/rtp-hdrext/abs-send-time\n",
+                        "a=extmap:13/sendonly urn:example:receive-only",
+                    ),
+                ),
+        );
+        for policy in [
+            crate::UnknownExtensionPolicy::Drop,
+            crate::UnknownExtensionPolicy::Opaque,
+        ] {
+            let mut configured = config();
+            configured.unknown_extension_policy = policy;
+            let mut entropy = EntropyConsumer::new(ConnectionEntropy::new([8; 32]));
+            let result = negotiate_inner(&configured, &offer, at(), &mut entropy)
+                .expect("negotiate extensions");
+            let opaque = policy == crate::UnknownExtensionPolicy::Opaque;
+            assert_eq!(
+                result.answer.as_str().contains("urn:example:opaque"),
+                opaque
+            );
+            assert!(
+                result
+                    .answer
+                    .as_str()
+                    .contains("urn:3gpp:video-orientation")
+            );
+            let senders = result.facts.egress_senders();
+            let audio = senders
+                .iter()
+                .find(|sender| sender.kind == crate::MediaKind::Audio)
+                .expect("audio sender");
+            let forwarded = |uri: &str| {
+                audio
+                    .forwarded_extensions
+                    .iter()
+                    .any(|(_, candidate)| &**candidate == uri)
+            };
+            assert_eq!(forwarded("urn:example:opaque"), opaque);
+            assert!(forwarded("urn:ietf:params:rtp-hdrext:ssrc-audio-level"));
+            assert!(forwarded("urn:3gpp:video-orientation"));
+            assert!(forwarded(
+                "http://www.webrtc.org/experiments/rtp-hdrext/abs-capture-time"
+            ));
+            assert!(!forwarded("urn:example:receive-only"));
+            assert!(!forwarded(
+                "http://www.webrtc.org/experiments/rtp-hdrext/abs-send-time"
+            ));
+            assert!(!forwarded(MID_URI));
+            assert!(!forwarded(TWCC_URIS[0]));
+            assert!(
+                senders
+                    .iter()
+                    .all(|sender| sender.forwarded_extensions.iter().all(|(_, uri)| {
+                        !uri.contains("dependency-descriptor")
+                            && !uri.contains("video-layers-allocation")
+                            && &**uri != PLAYOUT_DELAY_URI
+                    }))
+            );
+            let inbound = result.facts.ingress_media();
+            assert_eq!(
+                inbound
+                    .iter()
+                    .flat_map(|media| media.extensions.iter())
+                    .any(|(_, uri)| &**uri == "urn:example:receive-only"),
+                opaque
+            );
+        }
+    }
+
+    #[test]
+    fn application_only_offer_has_no_rtp_feedback_or_senders() {
+        let source = fixture("chrome");
+        let (header, _) = source
+            .as_str()
+            .split_once("m=audio")
+            .expect("session header");
+        let (_, application) = source
+            .as_str()
+            .split_once("m=application")
+            .expect("SCTP section");
+        let offer = SdpOffer::new(format!(
+            "{}m=application{}a=candidate:1 1 UDP 2130706431 192.0.2.1 50000 typ host\n",
+            header.replace("a=group:BUNDLE audio video data", "a=group:BUNDLE data"),
+            application,
+        ));
+        let accepted = Connection::accept(config(), offer, at(), ConnectionEntropy::new([7; 32]))
+            .expect("application-only admission");
+        assert_eq!(accepted.session.feedback, None);
+        assert!(accepted.session.inbound_media.is_empty());
+        assert!(accepted.session.senders.is_empty());
+        assert_eq!(accepted.connection.stats().connection.feedback, None);
+        assert!(accepted.answer.as_str().contains("a=sctp-port:"));
+        assert!(!accepted.answer.as_str().contains("m=audio"));
+        assert!(!accepted.answer.as_str().contains("m=video"));
+        assert!(!accepted.answer.as_str().contains("transport-cc"));
+    }
+
+    #[test]
     fn representative_browser_offers_are_accepted() {
         for name in ["chrome", "firefox"] {
             let result = Connection::accept(
@@ -1684,6 +1936,7 @@ mod tests {
                 sender_index: 0,
                 kind: crate::MediaKind::Audio,
                 mid: Arc::from("audioIn"),
+                rids: Arc::from([]),
             })
         );
         let sender = accepted.session.senders.first().unwrap();
@@ -1831,6 +2084,62 @@ mod tests {
             result.facts.remote_candidates[0]
                 .split_whitespace()
                 .any(|field| field == "relay")
+        );
+    }
+
+    #[test]
+    fn incompatible_optional_extensions_are_omitted_without_weakening_structure() {
+        let optional = format!("a=extmap:6/recvonly {PLAYOUT_DELAY_URI}");
+        let raw = vec![optional.clone(), format!("a=extmap:1 {MID_URI}")];
+        let extensions = parse_extensions(&raw, false, Direction::ReceiveOnly).unwrap();
+        assert_eq!(extensions.len(), 1);
+        assert_eq!(extensions[0].uri, MID_URI);
+        for invalid in [
+            format!("a=extmap:6 {MID_URI}"),
+            format!("a=extmap:7 {PLAYOUT_DELAY_URI}"),
+            format!("a=extmap:7/invalid {PLAYOUT_DELAY_URI}"),
+            format!("a=extmap:7/recvonly/extra {PLAYOUT_DELAY_URI}"),
+            format!("a=extmap:0/recvonly {PLAYOUT_DELAY_URI}"),
+        ] {
+            assert!(
+                parse_extensions(
+                    &[optional.clone(), invalid.clone()],
+                    false,
+                    Direction::ReceiveOnly
+                )
+                .is_err(),
+                "{invalid}"
+            );
+        }
+        for uri in [MID_URI, TWCC_URIS[0], TWCC_URIS[1]] {
+            assert!(
+                parse_extensions(
+                    &[format!("a=extmap:6/recvonly {uri}")],
+                    false,
+                    Direction::ReceiveOnly,
+                )
+                .is_err(),
+                "{uri}"
+            );
+        }
+    }
+
+    #[test]
+    fn firefox_unusable_playout_mapping_is_absent_from_the_answer() {
+        let offer = SdpOffer::new(fixture("firefox").as_str().replace(
+            "a=sendonly",
+            &format!("a=sendonly\na=extmap:6/recvonly {PLAYOUT_DELAY_URI}"),
+        ));
+        let accepted =
+            Connection::accept(config(), offer, at(), ConnectionEntropy::new([10; 32])).unwrap();
+        assert!(
+            !accepted
+                .answer
+                .as_str()
+                .split("m=video")
+                .next()
+                .unwrap()
+                .contains(PLAYOUT_DELAY_URI)
         );
     }
 
@@ -2006,6 +2315,37 @@ mod tests {
     }
 
     #[test]
+    fn inbound_rids_preserve_send_topology_order_and_paused_alternatives() {
+        let raw = [
+            "a=rid:f send",
+            "a=rid:q send",
+            "a=rid:h send",
+            "a=rid:remote recv",
+            "a=simulcast:recv remote send q;~h,f",
+        ]
+        .map(str::to_owned);
+        assert_eq!(inbound_rids(&raw).unwrap(), ["q", "h", "f"]);
+        assert_eq!(inbound_rids(&raw[..4]).unwrap(), ["f", "q", "h"]);
+        assert!(inbound_rids(&raw[3..4]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn inbound_simulcast_rejects_undeclared_and_wrong_direction_rids() {
+        for topology in ["q;phantom", "q;remote", "q;", "~~q"] {
+            let raw = vec![
+                "a=rid:q send".to_owned(),
+                "a=rid:remote recv".to_owned(),
+                format!("a=simulcast:send {topology}"),
+            ];
+            assert!(inbound_rids(&raw).is_err(), "{topology}");
+        }
+        let raw = (0..=MAX_RIDS)
+            .map(|index| format!("a=rid:r{index} send"))
+            .collect::<Vec<_>>();
+        assert!(inbound_rids(&raw).is_err());
+    }
+
+    #[test]
     fn rid_and_every_simulcast_direction_group_are_inverted_by_syntax() {
         let chrome = Connection::accept(
             config(),
@@ -2016,6 +2356,16 @@ mod tests {
         .unwrap();
         assert!(chrome.answer.as_str().contains("a=rid:q recv"));
         assert!(chrome.answer.as_str().contains("a=simulcast:recv q;h;f"));
+        let video = chrome
+            .session
+            .inbound_media
+            .iter()
+            .find(|media| media.kind == crate::MediaKind::Video)
+            .unwrap();
+        assert_eq!(
+            video.rids.iter().map(AsRef::as_ref).collect::<Vec<&str>>(),
+            ["q", "h", "f"]
+        );
 
         let firefox = fixture("firefox");
         let two_directions = SdpOffer::new(
@@ -2025,7 +2375,7 @@ mod tests {
                 .replace("a=rid:high recv", "a=rid:receiver_send send max-width=640")
                 .replace(
                     "a=simulcast:recv low;high",
-                    "a=simulcast:recv sender_recv;~receiver_send send ~receiver_send,sender_recv",
+                    "a=simulcast:recv sender_recv send ~receiver_send",
                 ),
         );
         let accepted = Connection::accept(
@@ -2047,9 +2397,12 @@ mod tests {
                 .as_str()
                 .contains("a=rid:receiver_send recv max-width=640")
         );
-        assert!(accepted.answer.as_str().contains(
-            "a=simulcast:send sender_recv;~receiver_send recv ~receiver_send,sender_recv"
-        ));
+        assert!(
+            accepted
+                .answer
+                .as_str()
+                .contains("a=simulcast:send sender_recv recv ~receiver_send")
+        );
     }
 
     #[test]
@@ -2219,7 +2572,10 @@ mod tests {
         assert_eq!(sctp.max_message_size, Some(65_536));
         assert!(!sctp.unlimited_message_size);
         assert_eq!(result.facts.limits, config.limits);
-        assert_eq!(result.facts.feedback, PacketFeedbackKind::TransportWide);
+        assert_eq!(
+            result.facts.feedback,
+            Some(PacketFeedbackKind::TransportWide)
+        );
         assert!(!result.facts.dtls_identity.certificate.is_empty());
         assert!(!result.facts.dtls_identity.private_key.is_empty());
         let expected = Sha256::digest(&result.facts.dtls_identity.certificate);

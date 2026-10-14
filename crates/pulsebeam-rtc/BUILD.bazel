@@ -7,7 +7,8 @@ filegroup(name = "workflow_inputs", srcs = glob(["*.md", "docs/**/*.md", "Justfi
 exports_files(["Cargo.toml"])
 filegroup(name = "cargo_metadata_inputs", srcs = glob(["Cargo.toml", "uniffi.toml", "src/**/*.rs", "benches/**/*.rs", "examples/**/*.rs"], allow_empty = True))
 
-TEST_DEPS = depset(all_crate_deps(normal = True, normal_dev = True)).to_list() + [":pulsebeam-rtc", "//crates/pulsebeam-rtc/simulation:pulsebeam-rtc-simulation"]
+CORE_DEPS = ["//crates/pulsebeam-core:pulsebeam-core-portable"]
+TEST_DEPS = depset(all_crate_deps(normal = True, normal_dev = True)).to_list() + CORE_DEPS + [":pulsebeam-rtc", "//crates/pulsebeam-rtc/simulation:pulsebeam-rtc-simulation"]
 TEST_ALIASES = aliases(normal_dev = True, proc_macro_dev = True) | aliases()
 
 cargo_toml_env_vars(name = "cargo_env", src = "Cargo.toml", workspace = "//:Cargo.toml")
@@ -23,7 +24,7 @@ rust_library(
     rustc_env_files = [":cargo_env"],
     lint_config = ":lints",
     aliases = aliases(),
-    deps = all_crate_deps(normal = True),
+    deps = all_crate_deps(normal = True) + CORE_DEPS,
     proc_macro_deps = all_crate_deps(proc_macro = True),
 )
 
@@ -34,7 +35,7 @@ rust_test(
     args = ["--test-threads=1"],
     lint_config = ":lints",
     aliases = TEST_ALIASES,
-    deps = depset(all_crate_deps(normal = True, normal_dev = True)).to_list() + ["//crates/pulsebeam-rtc/simulation:pulsebeam-rtc-simulation"],
+    deps = depset(all_crate_deps(normal = True, normal_dev = True)).to_list() + CORE_DEPS + ["//crates/pulsebeam-rtc/simulation:pulsebeam-rtc-simulation"],
     proc_macro_deps = all_crate_deps(proc_macro_dev = True),
     
 )

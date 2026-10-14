@@ -23,6 +23,12 @@ pub(crate) enum EcnMark {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LossOrigin {
+    Reordering,
+    HistoryExpiry,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct FeedbackSample {
     pub(crate) sent_at: Duration,
     pub(crate) received_at: Duration,
@@ -30,8 +36,9 @@ pub(crate) struct FeedbackSample {
     pub(crate) received: bool,
     /// True when this data unit belongs to newly advanced ACK-edge bytes.
     pub(crate) newly_acked: bool,
-    /// True only after the RFC 4.2.1.1 reordering timer confirms loss.
+    /// Native loss accounting includes reordering confirmation and history expiry.
     pub(crate) lost: bool,
+    pub(crate) loss_origin: Option<LossOrigin>,
     pub(crate) receiver_arrival_micros: Option<i64>,
     pub(crate) ecn: Option<EcnMark>,
 }
@@ -111,6 +118,11 @@ pub(crate) struct Profile {
     pub(crate) relaxed_pacing_threshold: u64,
     pub(crate) packet_overhead_bytes: u64,
     pub(crate) loss_rate_threshold: u64,
+    pub(crate) capacity_loss_threshold: u64,
+    pub(crate) loss_observation_min_packets: u32,
+    pub(crate) loss_observation_min_duration: Duration,
+    pub(crate) loss_observation_max_age: Duration,
+    pub(crate) loss_backoff_interval: Duration,
     pub(crate) policer_loss_threshold: u64,
     pub(crate) policer_window_backoff: u64,
     pub(crate) policer_window_lift: u64,
@@ -146,12 +158,103 @@ pub(crate) const PROFILE: Profile = Profile {
     relaxed_pacing_threshold: 4 * ONE / 5,
     packet_overhead_bytes: 20,
     loss_rate_threshold: ONE / 100,
+    capacity_loss_threshold: ONE / 10,
+    loss_observation_min_packets: 20,
+    loss_observation_min_duration: Duration::from_millis(250),
+    loss_observation_max_age: Duration::from_secs(6),
+    loss_backoff_interval: Duration::from_millis(300),
     policer_loss_threshold: ONE / 10,
     policer_window_backoff: 9 * ONE / 10,
     policer_window_lift: 1_001 * ONE / 1_000,
     acknowledged_rate_margin: 4 * ONE / 5,
     low_target_backoff_scale: ONE / 4,
 };
+
+const LOSS_HISTORY_MAX: usize = 15;
+const LOSS_HISTORY_MIN: usize = 3;
+const LOSS_HISTORY_WEIGHT: u64 = 9 * ONE / 10;
+
+#[derive(Clone, Copy)]
+struct LossWindow {
+    expected_bytes: u64,
+    lost_bytes: u64,
+}
+
+#[derive(Default)]
+struct LossObservation {
+    send_time_anchor: Option<Duration>,
+    packets: u32,
+    expected_bytes: u64,
+    lost_bytes: u64,
+    fraction: Option<u64>,
+    observed_at: Option<Duration>,
+    history: VecDeque<LossWindow>,
+}
+
+impl LossObservation {
+    fn capacity_limited(&self, now: Duration) -> bool {
+        self.fraction
+            .is_some_and(|fraction| fraction > PROFILE.capacity_loss_threshold)
+            && self.observed_at.is_some_and(|observed| {
+                now.saturating_sub(observed) <= PROFILE.loss_observation_max_age
+            })
+    }
+
+    fn update<'a>(
+        &mut self,
+        now: Duration,
+        feedback: impl IntoIterator<Item = &'a FeedbackSample>,
+    ) {
+        let mut send_range: Option<(Duration, Duration)> = None;
+        for sample in feedback {
+            if !sample.received && !sample.lost {
+                continue;
+            }
+            send_range = Some(
+                send_range.map_or((sample.sent_at, sample.sent_at), |(first, last)| {
+                    (first.min(sample.sent_at), last.max(sample.sent_at))
+                }),
+            );
+            self.packets = self.packets.saturating_add(1);
+            let bytes = u64::from(sample.transport_bytes);
+            self.expected_bytes = self.expected_bytes.saturating_add(bytes);
+            if sample.lost {
+                self.lost_bytes = self.lost_bytes.saturating_add(bytes);
+            }
+        }
+        let Some((first_sent, last_sent)) = send_range else {
+            return;
+        };
+        let anchor = *self.send_time_anchor.get_or_insert(first_sent);
+        if self.packets >= PROFILE.loss_observation_min_packets
+            && last_sent.saturating_sub(anchor) >= PROFILE.loss_observation_min_duration
+        {
+            if self.history.len() == LOSS_HISTORY_MAX {
+                self.history.pop_front();
+            }
+            self.history.push_back(LossWindow {
+                expected_bytes: self.expected_bytes,
+                lost_bytes: self.lost_bytes,
+            });
+            if self.history.len() >= LOSS_HISTORY_MIN {
+                let mut weight = ONE;
+                let mut expected = 0_u64;
+                let mut lost = 0_u64;
+                for window in self.history.iter().rev() {
+                    expected = expected.saturating_add(mul_fixed(window.expected_bytes, weight));
+                    lost = lost.saturating_add(mul_fixed(window.lost_bytes, weight));
+                    weight = mul_fixed(weight, LOSS_HISTORY_WEIGHT);
+                }
+                self.fraction = Some(mul_ratio(lost, ONE, expected.max(1)));
+                self.observed_at = Some(now);
+            }
+            self.send_time_anchor = Some(last_sent);
+            self.packets = 0;
+            self.expected_bytes = 0;
+            self.lost_bytes = 0;
+        }
+    }
+}
 
 pub(crate) struct ScreamV2 {
     mss: u64,
@@ -173,6 +276,7 @@ pub(crate) struct ScreamV2 {
     base_delay_minima: VecDeque<(Duration, i128)>,
     competing_samples: VecDeque<u64>,
     last_qdelay_update: Duration,
+    last_received_arrival: Option<Duration>,
     last_ref_wnd_increase: Duration,
     last_congestion_detected: Duration,
     last_reaction_to_congestion: Duration,
@@ -183,6 +287,9 @@ pub(crate) struct ScreamV2 {
     pending_virtual_ce: bool,
     delivered_rate: u64,
     loss_rate: u64,
+    loss_observation: LossObservation,
+    policing_observation: LossObservation,
+    last_loss_backoff: Option<Duration>,
     loss_event_rate: u64,
     policer_detected: bool,
     max_policed_ref_wnd: u64,
@@ -224,6 +331,7 @@ impl ScreamV2 {
             base_delay_minima: VecDeque::with_capacity(BASE_DELAY_SAMPLES_MAX),
             competing_samples: VecDeque::with_capacity(COMPETING_HISTORY),
             last_qdelay_update: Duration::ZERO,
+            last_received_arrival: None,
             last_ref_wnd_increase: Duration::ZERO,
             last_congestion_detected: Duration::ZERO,
             last_reaction_to_congestion: Duration::ZERO,
@@ -234,6 +342,9 @@ impl ScreamV2 {
             pending_virtual_ce: false,
             delivered_rate: 0,
             loss_rate: 0,
+            loss_observation: LossObservation::default(),
+            policing_observation: LossObservation::default(),
+            last_loss_backoff: None,
             loss_event_rate: 0,
             policer_detected: false,
             max_policed_ref_wnd: u64::MAX,
@@ -253,14 +364,26 @@ impl ScreamV2 {
         self.reason = ControllerReason::PathChanged;
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_flight_peak(&self) -> u64 {
+        self.max_bytes_in_flight.max(self.max_bytes_in_flight_prev)
+    }
+
+    pub(crate) fn observe_bytes_in_flight(&mut self, bytes: u64) {
+        self.max_bytes_in_flight = self.max_bytes_in_flight.max(bytes);
+    }
+
     pub(crate) fn update(&mut self, now: Duration, input: ControllerInput<'_>) -> Output {
-        self.max_bytes_in_flight = self.max_bytes_in_flight.max(input.bytes_in_flight);
+        self.observe_bytes_in_flight(input.bytes_in_flight);
         self.ecn_mode = input.ecn_mode;
         let has_feedback = !input.feedback.is_empty();
         let has_arrival = input
             .feedback
             .iter()
             .any(|sample| sample.received && sample.receiver_arrival_micros.is_some());
+        if has_arrival {
+            self.last_received_arrival = Some(now);
+        }
         self.consume_feedback(now, input);
         // The draft updates queue-delay state from received acknowledgements and
         // reference-window state from feedback. Timer-only polls must not replay
@@ -268,24 +391,11 @@ impl ScreamV2 {
         if has_arrival {
             self.update_qdelay_filter(now);
         }
-        let congestion_pending = self.pending_loss
-            || self.pending_ce
-            || self.pending_virtual_ce
-            || input.feedback.iter().any(|sample| {
-                sample.lost
-                    || (input.ecn_mode != EcnMode::Disabled
-                        && sample.received
-                        && sample.ecn == Some(EcnMark::Ce))
-            });
-        let reacted = self.reduce_ref_wnd(now, input);
+        self.reduce_ref_wnd(now, input);
         if has_feedback {
-            if input.growth_eligible
-                && !congestion_pending
-                && !reacted
-                && !self.pending_loss
-                && !self.pending_ce
-                && !self.pending_virtual_ce
-            {
+            // Draft section 4.2.2 permits RTT-cadenced growth even on a
+            // congestion update, after applying the independent reduction.
+            if input.growth_eligible {
                 self.increase_ref_wnd(now, input.target_bitrate_max);
             }
             if has_arrival {
@@ -306,7 +416,10 @@ impl ScreamV2 {
         }
         let mut delivered_bytes = 0_u64;
         let mut interval_start = now;
-        let mut loss_events = 0_u64;
+        // Section 4.5.2 filters received and confirmed-lost data units in
+        // observation order; grouping all losses last changes the EWMA.
+        let loss_alpha = ((self.mss.saturating_mul(ONE) / self.ref_wnd.max(1)) / 2)
+            .min(PROFILE.loss_rate_threshold / 4);
         let rtt_sample = input
             .feedback
             .iter()
@@ -338,8 +451,10 @@ impl ScreamV2 {
                         self.data_units_marked_this_rtt.saturating_add(1);
                 }
             }
-            if sample.lost {
-                loss_events = loss_events.saturating_add(1);
+            if sample.received || sample.lost {
+                self.loss_rate = mul_fixed(self.loss_rate, ONE.saturating_sub(loss_alpha))
+                    .saturating_add(if sample.lost { loss_alpha } else { 0 })
+                    .min(ONE);
             }
         }
         if let Some(sample) = rtt_sample {
@@ -359,21 +474,14 @@ impl ScreamV2 {
             ewma(self.delivered_rate, sample_rate, 1, 8)
         };
 
-        // Section 4.5.2 example loss-rate filter. Missing-but-not-yet-lost statuses do not enter it.
-        let alpha = ((self.mss.saturating_mul(ONE) / self.ref_wnd.max(1)) / 2).min(ONE / 400);
-        let observed = input
-            .feedback
-            .iter()
-            .filter(|sample| sample.received || sample.lost)
-            .count() as u64;
-        for _ in 0..observed.saturating_sub(loss_events) {
-            self.loss_rate = mul_fixed(self.loss_rate, ONE.saturating_sub(alpha));
-        }
-        for _ in 0..loss_events {
-            self.loss_rate = mul_fixed(self.loss_rate, ONE.saturating_sub(alpha))
-                .saturating_add(alpha)
-                .min(ONE);
-        }
+        self.loss_observation.update(now, input.feedback);
+        self.policing_observation.update(
+            now,
+            input
+                .feedback
+                .iter()
+                .filter(|sample| sample.loss_origin != Some(LossOrigin::HistoryExpiry)),
+        );
         self.update_l4s(now, input.ecn_mode);
         self.reason = ControllerReason::Feedback;
     }
@@ -472,7 +580,10 @@ impl ScreamV2 {
         if !input.feedback.is_empty() && self.qdelay_avg > self.qdelay_target / 2 {
             self.pending_virtual_ce = true;
         }
-        if loss_detected || data_units_marked {
+        let loss_congestion = loss_detected
+            && (self.loss_observation.capacity_limited(now)
+                || self.qdelay_avg > self.qdelay_target / 4);
+        if loss_congestion || data_units_marked {
             self.last_congestion_detected = now;
         }
         let reaction_interval = PROFILE.virtual_rtt.min(self.s_rtt);
@@ -488,15 +599,30 @@ impl ScreamV2 {
         } else {
             0
         };
+        // Loss needs contemporaneous receipt/delay evidence, not necessarily the
+        // same batch. Native loss backoff remains independent of this classification.
         self.policer_detected = loss_detected
+            && input
+                .feedback
+                .iter()
+                .any(|sample| sample.loss_origin == Some(LossOrigin::Reordering))
+            && self
+                .last_received_arrival
+                .is_some_and(|received| now.saturating_sub(received) <= self.s_rtt)
+            && self.policing_observation.capacity_limited(now)
             && self.loss_rate > PROFILE.policer_loss_threshold
             && self.qdelay_avg < self.qdelay_target / 4;
         if self.policer_detected {
             self.max_policed_ref_wnd = mul_fixed(self.ref_wnd, PROFILE.policer_window_backoff);
+            self.last_congestion_detected = now;
         }
-        let is_loss = loss_detected
-            && (self.loss_rate > PROFILE.loss_rate_threshold
-                || self.qdelay_avg > self.qdelay_target / 4);
+        // Libwebrtc qualifies loss over observations instead of penalizing
+        // isolated wireless losses. Queue-backed congestion remains immediate.
+        let capacity_loss = self.loss_observation.capacity_limited(now)
+            && self.last_loss_backoff.is_none_or(|last| {
+                now.saturating_sub(last) >= PROFILE.loss_backoff_interval.saturating_add(self.s_rtt)
+            });
+        let is_loss = loss_detected && (capacity_loss || self.qdelay_avg > self.qdelay_target / 4);
         let is_ce = data_units_marked;
         let is_virtual_ce = !is_loss && !is_ce && self.pending_virtual_ce && virtual_alpha > 0;
         if !(is_loss || is_ce || is_virtual_ce) {
@@ -512,6 +638,7 @@ impl ScreamV2 {
         }
 
         if is_loss {
+            self.last_loss_backoff = Some(now);
             let mut backoff = ONE.saturating_sub(PROFILE.loss_beta);
             if self.target_bitrate
                 < mul_fixed(self.delivered_rate, PROFILE.acknowledged_rate_margin)
@@ -864,6 +991,7 @@ mod tests {
             received,
             newly_acked,
             lost,
+            loss_origin: lost.then_some(LossOrigin::Reordering),
             receiver_arrival_micros: received.then_some(
                 i64::try_from(at)
                     .unwrap_or(i64::MAX)
@@ -883,6 +1011,25 @@ mod tests {
             target_bitrate_max: max,
             ecn_mode: EcnMode::Disabled,
         }
+    }
+
+    #[test]
+    fn pre_feedback_flight_peak_survives_batched_ack_retirement() {
+        let mut observed = ScreamV2::new(4_000_000, None);
+        let mut unobserved = ScreamV2::new(4_000_000, None);
+        observed.observe_bytes_in_flight(20_000);
+        let feedback = [sample(100, true, true, false, false)];
+        let mut retired = input(&feedback, 4_000_000);
+        retired.bytes_in_flight = 0;
+        observed.update(Duration::from_millis(100), retired);
+        let mut retired = input(&feedback, 4_000_000);
+        retired.bytes_in_flight = 0;
+        unobserved.update(Duration::from_millis(100), retired);
+        assert_eq!(observed.max_bytes_in_flight_prev, 20_000);
+        assert!(observed.ref_wnd > unobserved.ref_wnd);
+        observed.reset_path(4_000_000);
+        assert_eq!(observed.max_bytes_in_flight, 0);
+        assert_eq!(observed.max_bytes_in_flight_prev, 0);
     }
 
     #[test]
@@ -909,11 +1056,306 @@ mod tests {
     }
 
     #[test]
+    fn loss_filter_preserves_data_unit_order_and_ignores_unconfirmed_gaps() {
+        let mut loss_first = ScreamV2::new(4_000_000, None);
+        let mut receipt_first = ScreamV2::new(4_000_000, None);
+        let lost = sample(100, false, false, true, false);
+        let received = sample(100, true, true, false, false);
+        let gap = sample(100, false, true, false, false);
+        let alpha = PROFILE.loss_rate_threshold / 4;
+        loss_first.consume_feedback(
+            Duration::from_millis(100),
+            input(&[lost, gap, received], 4_000_000),
+        );
+        receipt_first.consume_feedback(
+            Duration::from_millis(100),
+            input(&[received, gap, lost], 4_000_000),
+        );
+        assert_eq!(loss_first.loss_rate, mul_fixed(alpha, ONE - alpha));
+        assert_eq!(receipt_first.loss_rate, alpha);
+        assert!(loss_first.loss_rate < receipt_first.loss_rate);
+    }
+
+    #[test]
+    fn feedback_delay_does_not_complete_a_short_sent_loss_observation() {
+        let mut observation = LossObservation::default();
+        let received = [sample(0, true, false, false, false); 20];
+        observation.update(Duration::from_secs(5), &received);
+        assert!(observation.history.is_empty());
+        observation.update(
+            Duration::from_secs(6),
+            &[sample(60, false, false, true, false)],
+        );
+        assert!(observation.history.is_empty());
+        assert_eq!(observation.packets, 21);
+        assert_eq!(observation.lost_bytes, 1_000);
+        assert!(!observation.capacity_limited(Duration::from_secs(6)));
+        observation.update(
+            Duration::from_secs(7),
+            &[sample(350, true, false, false, false)],
+        );
+        assert_eq!(observation.history.len(), 1);
+        assert_eq!(observation.history[0].expected_bytes, 22_000);
+        assert_eq!(observation.history[0].lost_bytes, 1_000);
+        assert_eq!(
+            observation.send_time_anchor,
+            Some(Duration::from_millis(300))
+        );
+        assert_eq!(observation.packets, 0);
+    }
+
+    #[test]
+    fn low_loss_is_measured_without_congestion_backoff() {
+        let mut cc = ScreamV2::new(4_000_000, None);
+        cc.ref_wnd = 20_000;
+        let mut output = cc.snapshot(4_000_000);
+        for round in 0..3 {
+            let start = round * 500;
+            let mut feedback = vec![
+                FeedbackSample {
+                    receiver_arrival_micros: None,
+                    ..sample(start + 50, true, false, false, false)
+                };
+                285
+            ];
+            feedback.extend([sample(start + 300, false, false, true, false); 15]);
+            let mut values = input(&feedback, 4_000_000);
+            values.growth_eligible = false;
+            output = cc.update(Duration::from_millis(start + 300), values);
+        }
+        assert!(cc.loss_rate > PROFILE.loss_rate_threshold);
+        assert_eq!(cc.loss_observation.fraction, Some(ONE / 20));
+        assert_eq!(output.reference_window, 20_000);
+        assert_eq!(cc.last_loss_backoff, None);
+        assert_eq!(cc.last_congestion_detected, Duration::ZERO);
+        assert_eq!(output.reason, ControllerReason::Feedback);
+    }
+
+    #[test]
+    fn policer_window_requires_the_same_capacity_loss_qualification() {
+        for fraction in [None, Some(8 * ONE / 100), Some(ONE / 5)] {
+            let mut cc = ScreamV2::new(4_000_000, None);
+            cc.ref_wnd = 20_000;
+            cc.loss_rate = ONE / 5;
+            cc.loss_observation.fraction = fraction;
+            cc.loss_observation.observed_at = Some(Duration::from_millis(100));
+            cc.policing_observation.fraction = fraction;
+            cc.policing_observation.observed_at = Some(Duration::from_millis(100));
+            let received = [sample(50, true, true, false, false)];
+            let mut receipt = input(&received, 4_000_000);
+            receipt.growth_eligible = false;
+            cc.update(Duration::from_millis(50), receipt);
+            let feedback = [sample(100, false, false, true, false)];
+            let mut values = input(&feedback, 4_000_000);
+            values.growth_eligible = false;
+            let output = cc.update(Duration::from_millis(100), values);
+            let qualified = fraction.is_some_and(|value| value > PROFILE.capacity_loss_threshold);
+            assert_eq!(output.policer_detected, qualified);
+            if qualified {
+                assert_eq!(
+                    cc.max_policed_ref_wnd,
+                    mul_fixed(20_000, PROFILE.policer_window_backoff)
+                );
+                assert!(cc.ref_wnd < 20_000);
+            } else {
+                assert_eq!(cc.max_policed_ref_wnd, u64::MAX);
+                assert_eq!(cc.ref_wnd, 20_000);
+                assert_eq!(cc.last_congestion_detected, Duration::ZERO);
+            }
+        }
+    }
+
+    #[test]
+    fn expiry_history_and_fresh_loss_cannot_install_a_policing_ceiling() {
+        let mut cc = ScreamV2::new(4_000_000, None);
+        cc.ref_wnd = 20_000;
+        for round in 0..3 {
+            let now = 5_300 + round * 500;
+            let mut feedback = vec![
+                FeedbackSample {
+                    loss_origin: Some(LossOrigin::HistoryExpiry),
+                    ..sample(100 + round * 500, false, false, true, false)
+                };
+                20
+            ];
+            feedback.push(sample(now, true, true, false, false));
+            let mut values = input(&feedback, 4_000_000);
+            values.growth_eligible = false;
+            let output = cc.update(Duration::from_millis(now), values);
+            assert!(!output.policer_detected);
+            assert_eq!(cc.max_policed_ref_wnd, u64::MAX);
+        }
+        assert!(
+            cc.loss_observation
+                .capacity_limited(Duration::from_millis(6_300))
+        );
+        assert_eq!(cc.last_loss_backoff, Some(Duration::from_millis(6_300)));
+        assert!(cc.ref_wnd < 20_000);
+        assert_eq!(cc.policing_observation.fraction, None);
+
+        let feedback = [
+            sample(6_400, true, true, false, false),
+            sample(6_400, false, false, true, false),
+        ];
+        let mut values = input(&feedback, 4_000_000);
+        values.growth_eligible = false;
+        let output = cc.update(Duration::from_millis(6_400), values);
+        assert!(!output.policer_detected);
+        assert_eq!(cc.max_policed_ref_wnd, u64::MAX);
+    }
+
+    #[test]
+    fn flowing_confirmed_loss_retains_qualified_policing() {
+        let mut cc = ScreamV2::new(4_000_000, None);
+        cc.ref_wnd = 20_000;
+        let mut output = cc.snapshot(4_000_000);
+        for round in 0..3 {
+            let start = 50 + round * 500;
+            let feedback: Vec<_> = (0..200)
+                .map(|index| {
+                    let received = index % 2 == 0;
+                    sample(start + index * 2, received, received, !received, false)
+                })
+                .collect();
+            let mut values = input(&feedback, 4_000_000);
+            values.growth_eligible = false;
+            output = cc.update(Duration::from_millis(start + 450), values);
+        }
+        assert_eq!(
+            cc.policing_observation.fraction,
+            cc.loss_observation.fraction
+        );
+        assert!(cc.loss_rate > PROFILE.policer_loss_threshold);
+        assert!(output.policer_detected);
+        assert!(cc.max_policed_ref_wnd < u64::MAX);
+        assert!(cc.ref_wnd < 20_000);
+    }
+
+    #[test]
+    fn loss_only_feedback_keeps_native_backoff_without_a_policing_ceiling() {
+        let mut cc = ScreamV2::new(4_000_000, None);
+        cc.ref_wnd = 20_000;
+        cc.loss_rate = ONE / 5;
+        cc.loss_observation.fraction = Some(ONE / 5);
+        cc.loss_observation.observed_at = Some(Duration::from_millis(100));
+        let lost = [sample(100, false, false, true, false)];
+        let mut values = input(&lost, 4_000_000);
+        values.growth_eligible = false;
+        let output = cc.update(Duration::from_millis(100), values);
+        assert_eq!(output.reason, ControllerReason::Loss);
+        assert!(output.reference_window < 20_000);
+        assert_eq!(cc.last_loss_backoff, Some(Duration::from_millis(100)));
+        assert!(!output.policer_detected);
+        assert_eq!(cc.max_policed_ref_wnd, u64::MAX);
+        let received = [sample(200, true, true, false, false)];
+        let mut recovery = input(&received, 4_000_000);
+        recovery.growth_eligible = false;
+        let recovered = cc.update(Duration::from_millis(200), recovery);
+        assert!(!recovered.policer_detected);
+        assert_eq!(cc.max_policed_ref_wnd, u64::MAX);
+        cc.loss_rate = ONE / 5;
+        cc.loss_observation.fraction = Some(ONE / 5);
+        cc.loss_observation.observed_at = Some(Duration::from_millis(500));
+        let stale = [sample(500, false, false, true, false)];
+        let mut values = input(&stale, 4_000_000);
+        values.growth_eligible = false;
+        let loss = cc.update(Duration::from_millis(500), values);
+        assert_eq!(loss.reason, ControllerReason::Loss);
+        assert!(!loss.policer_detected);
+        assert_eq!(cc.max_policed_ref_wnd, u64::MAX);
+    }
+
+    #[test]
+    fn capacity_loss_needs_observation_and_backoff_cadence() {
+        let mut cc = ScreamV2::new(4_000_000, None);
+        cc.ref_wnd = 20_000;
+        let mut reacted = cc.snapshot(4_000_000);
+        for round in 0..3 {
+            let start = round * 500;
+            let mut feedback = vec![
+                FeedbackSample {
+                    transport_bytes: 100,
+                    receiver_arrival_micros: None,
+                    ..sample(start + 50, true, false, false, false)
+                };
+                396
+            ];
+            feedback.extend([sample(start + 300, false, false, true, false); 20]);
+            let mut values = input(&feedback, 4_000_000);
+            values.growth_eligible = false;
+            reacted = cc.update(Duration::from_millis(start + 300), values);
+            if round < 2 {
+                assert_eq!(cc.ref_wnd, 20_000);
+                assert_eq!(cc.loss_observation.fraction, None);
+            }
+        }
+        assert!(reacted.reference_window < 20_000);
+        assert_eq!(reacted.reason, ControllerReason::Loss);
+        let lost = [sample(1_330, false, false, true, false)];
+        let mut values = input(&lost, 4_000_000);
+        values.growth_eligible = false;
+        cc.update(Duration::from_millis(1_330), values);
+        assert_eq!(cc.ref_wnd, reacted.reference_window);
+        assert_eq!(cc.last_loss_backoff, Some(Duration::from_millis(1_300)));
+        cc.update(Duration::from_millis(1_750), values);
+        assert!(cc.ref_wnd < reacted.reference_window);
+        assert_eq!(cc.last_loss_backoff, Some(Duration::from_millis(1_750)));
+        cc.reset_path(4_000_000);
+        assert_eq!(cc.loss_observation.fraction, None);
+        assert_eq!(cc.last_loss_backoff, None);
+    }
+
+    #[test]
+    fn loss_observation_is_byte_weighted_bounded_and_expires() {
+        let mut observation = LossObservation::default();
+        let tiny_receipts = |start| {
+            [FeedbackSample {
+                transport_bytes: 100,
+                ..sample(start + 50, true, false, false, false)
+            }; 19]
+        };
+        for round in 0..3 {
+            let start = round * 500;
+            observation.update(Duration::from_millis(start + 50), &tiny_receipts(start));
+            observation.update(
+                Duration::from_millis(start + 300),
+                &[sample(start + 300, false, false, true, false)],
+            );
+            if round < 2 {
+                assert_eq!(observation.fraction, None);
+            }
+        }
+        let weights = [
+            ONE,
+            LOSS_HISTORY_WEIGHT,
+            mul_fixed(LOSS_HISTORY_WEIGHT, LOSS_HISTORY_WEIGHT),
+        ];
+        let lost: u64 = weights.iter().map(|weight| mul_fixed(1_000, *weight)).sum();
+        let expected: u64 = weights.iter().map(|weight| mul_fixed(2_900, *weight)).sum();
+        assert_eq!(observation.fraction, Some(mul_ratio(lost, ONE, expected)));
+        assert!(observation.capacity_limited(Duration::from_millis(1_300)));
+        assert_eq!(observation.packets, 0);
+        assert_eq!(observation.expected_bytes, 0);
+        assert_eq!(observation.lost_bytes, 0);
+        assert!(!observation.capacity_limited(Duration::from_secs(8)));
+        for round in 3..30 {
+            let start = round * 500;
+            observation.update(Duration::from_millis(start + 50), &tiny_receipts(start));
+            observation.update(
+                Duration::from_millis(start + 300),
+                &[sample(start + 300, false, false, true, false)],
+            );
+        }
+        assert_eq!(observation.history.len(), LOSS_HISTORY_MAX);
+    }
+
+    #[test]
     fn congestion_reaction_is_not_blocked_by_once_per_rtt_growth_cadence() {
         let mut cc = ScreamV2::new(4_000_000, None);
         cc.s_rtt = Duration::from_millis(200);
         cc.ref_wnd = 20_000;
         cc.loss_rate = ONE / 50;
+        cc.qdelay_avg = cc.qdelay_target / 3;
         let loss = [sample(25, false, false, true, false)];
         let before = cc.ref_wnd;
         cc.update(Duration::from_millis(25), input(&loss, 4_000_000));
@@ -977,6 +1419,7 @@ mod tests {
                 received: true,
                 newly_acked: true,
                 lost: false,
+                loss_origin: None,
                 receiver_arrival_micros: None,
                 ecn: None,
             },
@@ -987,6 +1430,7 @@ mod tests {
                 received: true,
                 newly_acked: true,
                 lost: false,
+                loss_origin: None,
                 receiver_arrival_micros: None,
                 ecn: None,
             },
@@ -1006,6 +1450,7 @@ mod tests {
                 received: true,
                 newly_acked: true,
                 lost: false,
+                loss_origin: None,
                 receiver_arrival_micros: Some(i64::MIN),
                 ecn: None,
             },
@@ -1016,6 +1461,7 @@ mod tests {
                 received: true,
                 newly_acked: true,
                 lost: false,
+                loss_origin: None,
                 receiver_arrival_micros: Some(i64::MAX),
                 ecn: None,
             },
@@ -1091,13 +1537,65 @@ mod tests {
     }
 
     #[test]
-    fn isolated_loss_suppresses_growth_on_its_feedback_update() {
+    fn isolated_loss_retains_ack_edge_growth_without_congestion_backoff() {
         let mut cc = ScreamV2::new(4_000_000, None);
         let before = cc.ref_wnd;
         let loss = [sample(100, false, true, true, false)];
         cc.update(Duration::from_millis(100), input(&loss, 4_000_000));
-        assert_eq!(cc.ref_wnd, before);
-        assert_eq!(cc.debug_accumulated_acks().0, 1_000);
+        assert!(cc.ref_wnd > before);
+        assert_eq!(cc.debug_accumulated_acks(), (0, 0));
+    }
+
+    #[test]
+    fn fresh_ack_growth_is_independent_of_due_or_pending_congestion() {
+        for reason in [
+            ControllerReason::Loss,
+            ControllerReason::ClassicEcn,
+            ControllerReason::Delay,
+        ] {
+            for reaction_blocked in [false, true] {
+                let make_controller = || {
+                    let mut cc = ScreamV2::new(4_000_000, None);
+                    cc.ref_wnd = 20_000;
+                    cc.loss_rate = ONE / 50;
+                    cc.pending_loss = reason == ControllerReason::Loss;
+                    cc.pending_ce = reason == ControllerReason::ClassicEcn;
+                    if reason == ControllerReason::Loss {
+                        cc.qdelay_avg = cc.qdelay_target / 3;
+                    }
+                    if reason == ControllerReason::Delay {
+                        cc.qdelay_avg = cc.qdelay_target * 3 / 4;
+                    }
+                    if reaction_blocked {
+                        cc.last_reaction_to_congestion = Duration::from_millis(95);
+                    }
+                    cc
+                };
+                let feedback = [FeedbackSample {
+                    receiver_arrival_micros: None,
+                    ..sample(100, true, true, false, false)
+                }];
+                let mut values = input(&feedback, 4_000_000);
+                if reason == ControllerReason::ClassicEcn {
+                    values.ecn_mode = EcnMode::Classic;
+                }
+                let mut growing = make_controller();
+                let fresh = growing.update(Duration::from_millis(100), values);
+                values.growth_eligible = false;
+                let mut blocked = make_controller();
+                let without_growth = blocked.update(Duration::from_millis(100), values);
+                assert!(fresh.reference_window > without_growth.reference_window);
+                assert_eq!(fresh.reason, without_growth.reason);
+                assert_eq!(growing.debug_accumulated_acks(), (0, 0));
+                assert_eq!(blocked.debug_accumulated_acks(), (1_000, 0));
+                if reaction_blocked {
+                    assert!(fresh.reference_window > 20_000);
+                } else {
+                    assert_eq!(fresh.reason, reason);
+                    assert!(fresh.reference_window < 20_000);
+                }
+            }
+        }
     }
 
     #[test]
@@ -1126,6 +1624,7 @@ mod tests {
         cc.ref_wnd = 20_000;
         cc.loss_rate = ONE / 50;
         cc.last_reaction_to_congestion = Duration::from_millis(20);
+        cc.qdelay_avg = cc.qdelay_target / 3;
         let loss = [sample(25, false, true, true, false)];
         cc.update(Duration::from_millis(25), input(&loss, 4_000_000));
         assert_eq!(cc.ref_wnd, 20_000);
@@ -1204,6 +1703,7 @@ mod tests {
         let mut cc = ScreamV2::new(4_000_000, None);
         cc.ref_wnd = 20_000;
         cc.loss_rate = ONE / 50;
+        cc.qdelay_avg = cc.qdelay_target / 3;
         let first = [sample(25, false, false, true, false)];
         cc.update(Duration::from_millis(25), input(&first, 4_000_000));
         let inflection = cc.ref_wnd_i;

@@ -147,6 +147,8 @@ impl Simulation {
                     // confirmed loss is a separate signal.
                     newly_acked: true,
                     lost: !packet.received,
+                    loss_origin: (!packet.received)
+                        .then_some(crate::congestion::LossOrigin::Reordering),
                     receiver_arrival_micros: packet
                         .received
                         .then_some(packet.receiver_arrival_micros),
@@ -173,6 +175,7 @@ impl Simulation {
                 offered_media_rate: offered_bps,
                 admitted_media_rate: admitted_rate,
                 governed_allocation_rate: desired_bps,
+                has_unallocated_demand: false,
                 desired_media_rate: desired_bps,
                 window_or_pacer_blocked: false,
                 ecn: validation,

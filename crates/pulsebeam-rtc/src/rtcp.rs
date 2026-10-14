@@ -10,6 +10,7 @@ use crate::{
 };
 
 const MAX_FEEDBACK_STATUSES: usize = 8_192;
+const MAX_REPORT_RECEIPTS: usize = 256;
 const MAX_RFC8888_REPORTS: usize = 16_384;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -86,6 +87,23 @@ pub(crate) struct ParsedRtcp {
     pub(crate) lifecycle: Vec<LifecycleFact>,
     pub(crate) feedback: Vec<FeedbackBatch>,
     pub(crate) repair: Vec<RepairRequest>,
+    pub(crate) keyframes: Vec<KeyframeRequest>,
+    pub(crate) receipts: Vec<ReportReceipt>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ReportReceipt {
+    pub(crate) ssrc: u32,
+    pub(crate) highest_sequence: u32,
+}
+
+impl From<ReportBlock<'_>> for ReportReceipt {
+    fn from(block: ReportBlock<'_>) -> Self {
+        Self {
+            ssrc: block.ssrc(),
+            highest_sequence: block.highest_sequence(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -94,15 +112,24 @@ pub(crate) struct RepairRequest {
     pub(crate) sequence: u16,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct KeyframeRequest {
+    pub(crate) media_ssrc: u32,
+    pub(crate) fir: Option<(u32, u8)>,
+}
+
 pub(crate) fn parse(
     bytes: &[u8],
     received_at: TimePoint,
     path_epoch: PathEpoch,
-    mode: PacketFeedbackKind,
+    mode: impl Into<Option<PacketFeedbackKind>>,
 ) -> Result<ParsedRtcp, PacketError> {
+    let mode = mode.into();
     let mut lifecycle = Vec::new();
     let mut feedback = Vec::new();
     let mut repair = Vec::new();
+    let mut keyframes = Vec::new();
+    let mut receipts = Vec::new();
     let mut status_count = 0usize;
     for packet in RtcpCompound::parse(bytes)? {
         let packet = packet?;
@@ -113,6 +140,7 @@ pub(crate) fn parse(
                 ntp_fraction: report.ntp_fraction(),
                 rtp_timestamp: report.rtp_timestamp(),
             });
+            receipts.extend(report.reports().map(ReportReceipt::from));
         }
         if let Some(sdes) = packet.sdes()? {
             for chunk in sdes.chunks() {
@@ -136,11 +164,13 @@ pub(crate) fn parse(
         }
         match (packet.packet_type(), packet.count()) {
             (201, _) => {
-                packet.receiver_report()?;
+                if let Some(report) = packet.receiver_report()? {
+                    receipts.extend(report.reports().map(ReportReceipt::from));
+                }
             }
             (205, 15) => {
                 let twcc = packet.twcc()?.ok_or(PacketError::InvalidValue)?;
-                if mode == PacketFeedbackKind::TransportWide {
+                if mode == Some(PacketFeedbackKind::TransportWide) {
                     let statuses = twcc
                         .statuses()
                         .map(|status| match status? {
@@ -172,7 +202,7 @@ pub(crate) fn parse(
             }
             (205, 11) => {
                 let report = rfc8888(packet)?.ok_or(PacketError::InvalidValue)?;
-                if mode == PacketFeedbackKind::Rfc8888 {
+                if mode == Some(PacketFeedbackKind::Rfc8888) {
                     status_count = status_count
                         .checked_add(report.status_count())
                         .ok_or(PacketError::TooManyItems)?;
@@ -210,14 +240,37 @@ pub(crate) fn parse(
                     }
                 }
             }
-            (206, 1) | (206, 4) => typed(packet)?,
+            (206, 1) => {
+                let pli = packet.pli()?.ok_or(PacketError::InvalidValue)?;
+                keyframes.push(KeyframeRequest {
+                    media_ssrc: pli.media_ssrc(),
+                    fir: None,
+                });
+            }
+            (206, 4) => {
+                let fir = packet.fir()?.ok_or(PacketError::InvalidValue)?;
+                for entry in fir.entries() {
+                    keyframes.push(KeyframeRequest {
+                        media_ssrc: entry.ssrc(),
+                        fir: Some((fir.sender_ssrc(), entry.sequence_number())),
+                    });
+                    if keyframes.len() > 256 {
+                        return Err(PacketError::TooManyItems);
+                    }
+                }
+            }
             _ => {}
+        }
+        if receipts.len() > MAX_REPORT_RECEIPTS || keyframes.len() > 256 {
+            return Err(PacketError::TooManyItems);
         }
     }
     Ok(ParsedRtcp {
         lifecycle,
         feedback,
         repair,
+        keyframes,
+        receipts,
     })
 }
 
@@ -553,7 +606,7 @@ impl TwccReferenceTime {
         self.0
     }
     pub fn seconds(self) -> f64 {
-        f64::from(self.0) / 64.0
+        f64::from(self.0) * 0.064
     }
 }
 
@@ -886,7 +939,7 @@ impl<'a> Iterator for TwccStatuses<'a> {
                     self.delta_offset += 1;
                     TwccPacketStatus::Received {
                         sequence,
-                        delta: TwccRecvDelta(i16::from(i8::from_ne_bytes([byte]))),
+                        delta: TwccRecvDelta(i16::from(byte)),
                     }
                 })
                 .ok_or(PacketError::InvalidLength),
@@ -1211,6 +1264,53 @@ mod tests {
         assert!(validate_compound(&bytes).is_ok());
     }
     #[test]
+    fn sender_and_receiver_report_blocks_publish_bounded_extension_receipts() {
+        let mut block = Vec::new();
+        block.extend_from_slice(&7_u32.to_be_bytes());
+        block.extend_from_slice(&[0; 4]);
+        block.extend_from_slice(&0x1_0002_u32.to_be_bytes());
+        block.extend_from_slice(&[0; 12]);
+        let mut sr = vec![0x81, 200, 0, 12];
+        sr.extend_from_slice(&[0; 24]);
+        sr.extend_from_slice(&block);
+        let mut rr = vec![0x81, 201, 0, 7];
+        rr.extend_from_slice(&[0; 4]);
+        rr.extend_from_slice(&block);
+        let mut compound = sr;
+        compound.extend_from_slice(&rr);
+        let parsed = parse(
+            &compound,
+            at(),
+            PathEpoch::from_value(1),
+            PacketFeedbackKind::TransportWide,
+        )
+        .expect("report blocks");
+        assert_eq!(
+            parsed.receipts,
+            vec![
+                ReportReceipt {
+                    ssrc: 7,
+                    highest_sequence: 0x1_0002
+                };
+                2
+            ]
+        );
+        let mut large_rr = vec![0x9f, 201, 0, 187];
+        large_rr.extend_from_slice(&[0; 4]);
+        large_rr.extend_from_slice(&block.repeat(31));
+        let over_bound = large_rr.repeat(9);
+        assert!(matches!(
+            parse(
+                &over_bound,
+                at(),
+                PathEpoch::from_value(1),
+                PacketFeedbackKind::TransportWide
+            ),
+            Err(PacketError::TooManyItems)
+        ));
+    }
+
+    #[test]
     fn rejects_short_typed_feedback() {
         let bytes = [0x81, 205, 0, 1, 0, 0, 0, 0];
         assert!(validate_compound(&bytes).is_err());
@@ -1273,6 +1373,12 @@ mod tests {
             .is_empty()
         );
 
+        assert!(
+            parse(&valid, at(), PathEpoch::from_value(1), None)
+                .expect("feedback without an RTP mode")
+                .feedback
+                .is_empty()
+        );
         let oversized = rfc8888(&[(7, 1, vec![0; 8_192]), (8, 1, vec![0])], 0);
         assert!(matches!(
             parse(
@@ -1334,6 +1440,39 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn keyframe_requests_preserve_pli_and_fir_targets_and_bound_compounds() {
+        let pli = [0x81, 206, 0, 2, 0, 0, 0, 9, 0, 0, 0, 7];
+        let fir = [
+            0x84, 206, 0, 6, 0, 0, 0, 9, 0, 0, 0, 0, 0, 0, 0, 7, 255, 0, 0, 0, 0, 0, 0, 8, 3, 0, 0,
+            0,
+        ];
+        let mut compound = pli.to_vec();
+        compound.extend_from_slice(&fir);
+        let parsed = parse(&compound, at(), PathEpoch::from_value(1), None).unwrap();
+        assert_eq!(
+            parsed.keyframes,
+            [
+                KeyframeRequest {
+                    media_ssrc: 7,
+                    fir: None
+                },
+                KeyframeRequest {
+                    media_ssrc: 7,
+                    fir: Some((9, 255))
+                },
+                KeyframeRequest {
+                    media_ssrc: 8,
+                    fir: Some((9, 3))
+                },
+            ]
+        );
+        assert!(parse(&pli.repeat(257), at(), PathEpoch::from_value(1), None).is_err());
+        let mut malformed = fir;
+        malformed[19] = 1;
+        assert!(parse(&malformed, at(), PathEpoch::from_value(1), None).is_err());
     }
 
     #[test]
@@ -1400,6 +1539,8 @@ mod tests {
             .unwrap();
         let twcc = packet.twcc().unwrap().unwrap();
         assert_eq!(twcc.reference_time().ticks(), 0x010203);
+        assert_eq!(TwccReferenceTime(1).seconds(), 0.064);
+        assert_eq!(TwccReferenceTime(125).seconds(), 8.0);
         assert_eq!(twcc.feedback_count(), 7);
         let statuses: Vec<_> = twcc.statuses().collect::<Result<_, _>>().unwrap();
         assert_eq!(statuses.len(), 3);
@@ -1407,7 +1548,7 @@ mod tests {
             statuses[0],
             TwccPacketStatus::Received {
                 sequence: 0x1000,
-                delta: TwccRecvDelta(-2)
+                delta: TwccRecvDelta(254)
             }
         );
         assert_eq!(
@@ -1432,7 +1573,7 @@ mod tests {
     }
 
     #[test]
-    fn twcc_one_bit_vector_handles_sequence_wrap_and_signed_deltas() {
+    fn twcc_one_bit_vector_handles_sequence_wrap_and_unsigned_small_deltas() {
         let mut bytes = vec![0xaf, 205, 0, 6];
         bytes.extend_from_slice(&[0; 8]);
         bytes.extend_from_slice(&[0xff, 0xfe, 0, 3, 0, 0, 1, 2, 0xb8, 0, 0x80, 0xff, 1]);
@@ -1457,14 +1598,14 @@ mod tests {
             statuses[0],
             TwccPacketStatus::Received {
                 sequence: 0xfffe,
-                delta: TwccRecvDelta(-128)
+                delta: TwccRecvDelta(128)
             }
         );
         assert_eq!(
             statuses[1],
             TwccPacketStatus::Received {
                 sequence: 0xffff,
-                delta: TwccRecvDelta(-1)
+                delta: TwccRecvDelta(255)
             }
         );
         assert_eq!(

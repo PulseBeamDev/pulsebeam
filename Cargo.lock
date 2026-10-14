@@ -3430,6 +3430,7 @@ dependencies = [
  "is 0.11.0 (git+https://github.com/PulseBeamDev/str0m.git?branch=patch%2F0.23.1)",
  "p256",
  "proptest",
+ "pulsebeam-core",
  "rcgen",
  "sha2",
  "str0m 0.23.1",

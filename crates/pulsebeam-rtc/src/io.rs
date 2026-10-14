@@ -11,8 +11,8 @@ use thiserror::Error;
 use crate::IceTcpFlowId;
 use crate::{
     DataChannelConfig, DataChannelId, DataChannelPriority, DataMessage, DataReliability,
-    EncodingId, ForwardedMedia, MediaKind, MediaPacket, MediaPayloadBitrate, PolicyError, SenderId,
-    SenderPolicy,
+    EncodingId, ForwardedMedia, MediaKind, MediaPacket, MediaPayloadBitrate, PolicyError,
+    SenderDemand, SenderId, SenderPolicy,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -39,6 +39,19 @@ pub enum NetworkInput {
     },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AuthenticatedFlow {
+    Udp {
+        local: SocketAddr,
+        remote: SocketAddr,
+    },
+    IceTcp {
+        flow: IceTcpFlowId,
+        local: SocketAddr,
+        remote: SocketAddr,
+    },
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TransmitTarget {
     Udp {
@@ -60,13 +73,34 @@ pub struct Transmit {
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum Command {
+    /// Register an accepted stream before delivering its first frame. IDs must never be reused.
+    AdmitIceTcpFlow {
+        flow: IceTcpFlowId,
+        local: SocketAddr,
+        remote: SocketAddr,
+    },
+    /// Remove a closed stream before admitting another incarnation of its tuple.
+    RetireIceTcpFlow {
+        flow: IceTcpFlowId,
+    },
     SetSenderPolicy {
         sender: SenderId,
         policy: SenderPolicy,
     },
+    SetSenderDemand {
+        sender: SenderId,
+        demand: SenderDemand,
+    },
     SendMedia {
         sender: SenderId,
         media: ForwardedMedia,
+    },
+    /// Recover within the same publication while retaining committed repair history.
+    RecoverSenderMedia {
+        sender: SenderId,
+    },
+    DiscardSenderMedia {
+        sender: SenderId,
     },
     RequestKeyframe {
         encoding: EncodingId,
@@ -110,6 +144,7 @@ pub enum CloseReason {
 #[non_exhaustive]
 pub enum Event {
     Connected,
+    IceAuthenticated(AuthenticatedFlow),
     Media {
         encoding: EncodingId,
         packet: MediaPacket,
@@ -119,18 +154,31 @@ pub enum Event {
         encoding: EncodingId,
         reason: EncodingRetireReason,
     },
+    /// The peer or local video delivery requires fresh independent media.
     KeyframeRequested {
         sender: SenderId,
+        reason: KeyframeRequestReason,
     },
     AllocationChanged(AllocationSnapshot),
     DataChannel(DataChannelEvent),
     Warning(ConnectionWarning),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum KeyframeRequestReason {
+    /// Authenticated peer feedback requests fresh media without abandoning current delivery.
+    Peer,
+    /// Local expiry or descriptor failure invalidated the sender's dependency chain.
+    LocalRecovery,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EncodingInfo {
     pub id: EncodingId,
+    pub sender_index: u32,
     pub kind: MediaKind,
+    pub rid: Option<std::sync::Arc<str>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -142,6 +190,9 @@ pub enum EncodingRetireReason {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct AllocationSnapshot {
+    /// Current RTP payload selection ceiling, not measured spare path bandwidth.
+    pub media_budget: MediaPayloadBitrate,
+    /// Sum of the selected-demand-capped sender allocations.
     pub total: MediaPayloadBitrate,
     pub senders: Vec<SenderAllocation>,
 }
@@ -157,6 +208,7 @@ pub struct SenderAllocation {
 pub enum DataChannelEvent {
     Opened {
         channel: DataChannelId,
+        config: DataChannelConfig,
     },
     Message {
         channel: DataChannelId,
@@ -221,8 +273,18 @@ pub enum CommandError {
     UnknownDataChannel(DataChannelId),
     #[error("invalid sender policy: {0:?}")]
     InvalidPolicy(PolicyError),
+    #[error("invalid or conflicting ICE-TCP flow binding")]
+    InvalidIceTcpFlow,
     #[error("invalid frame metadata")]
     InvalidFrameMetadata,
+    #[error("media has passed its receiver usefulness deadline")]
+    MediaExpired,
+    #[error("source packets interrupt an incomplete admitted frame")]
+    FrameInterrupted,
+    #[error("sender dependency chain requires fresh independent media")]
+    DependencyChainInterrupted,
+    #[error("sender {0:?} needs a fresh receiver to restore browser-default playout")]
+    PlayoutResetRequiresNewSender(SenderId),
     #[error("command is invalid in the current state")]
     InvalidState,
     #[error("data channel message is too large")]
@@ -256,6 +318,7 @@ pub struct ConnectionStats {
     pub clock_regressions: u64,
     pub rtp_bytes_in_flight: u64,
     pub target_media_bitrate: MediaPayloadBitrate,
+    pub media_budget: MediaPayloadBitrate,
     pub pacing_bitrate: u64,
     pub queued_media_bytes: usize,
     pub buffered_data_bytes: usize,
@@ -271,10 +334,20 @@ pub struct ConnectionStats {
     pub wrong_path_feedback: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PlayoutDelayStatus {
+    Unspecified,
+    NotSignaled,
+    Pending,
+    Confirmed,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SenderStats {
     pub sender: SenderId,
     pub policy: SenderPolicy,
+    pub demand: SenderDemand,
+    pub playout_delay: PlayoutDelayStatus,
     pub allocation: MediaPayloadBitrate,
     pub queued_packets: usize,
     pub queued_payload_bytes: usize,

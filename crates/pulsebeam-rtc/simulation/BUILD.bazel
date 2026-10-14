@@ -17,6 +17,8 @@ rust_library(
 
 rust_test(
     name = "interop",
+    # ControlledWorld exclusively owns process-global clock and randomness hooks.
+    args = ["--test-threads=1"],
     crate_root = "tests/interop.rs",
     srcs = ["tests/interop.rs"],
     edition = "2024",

@@ -56,8 +56,8 @@ proptest! {
 #[test]
 fn allocation_is_conserving_demand_capped_and_priority_monotonic_through_stats() {
     let mut source = PeerFixture::connected();
-    let packet = source.send_source(b"allocation");
     let mut fixture = PeerFixture::connected_with_senders(3);
+    let packet = source.send_source(b"allocation");
     let priorities = [
         MediaPriority::VERY_LOW,
         MediaPriority::LOW,
@@ -68,7 +68,7 @@ fn allocation_is_conserving_demand_capped_and_priority_monotonic_through_stats()
         fixture.command(Command::SetSenderPolicy {
             sender,
             policy: SenderPolicy {
-                playout_delay: PlayoutDelay::from_ticks(0, 400).expect("valid playout"),
+                playout_delay: Some(PlayoutDelay::from_ticks(0, 400).expect("valid playout")),
                 priority,
                 desired_bitrate: MediaPayloadBitrate::from_bps(4_000_000),
             },

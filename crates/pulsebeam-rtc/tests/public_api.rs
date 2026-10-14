@@ -7,8 +7,8 @@ use std::{
 use pulsebeam_rtc::{
     AcceptError, Command, CommandError, Connection, ConnectionConfig, ConnectionLimits,
     DataChannelId, FrameDependencies, FrameId, GlobalMediaTime, IceTcpFlowId, LocalCandidate,
-    MediaPacket, MediaPriority, NetworkInput, Output, PlayoutDelay, PolicyError, ReceiveError,
-    StatsSnapshot, TimePoint,
+    LocalIceCredentials, MediaPacket, MediaPayloadBitrate, MediaPriority, NetworkInput, Output,
+    PlayoutDelay, PolicyError, ReceiveError, SenderDemand, StatsSnapshot, TimePoint,
 };
 
 fn assert_send<T: Send>() {}
@@ -48,6 +48,21 @@ fn connection_runtime_methods_have_the_public_sans_io_signatures() {
     let _: fn(&mut Connection, TimePoint, Command) -> Result<(), CommandError> =
         Connection::command;
     let _: fn(&Connection) -> StatsSnapshot = Connection::stats;
+}
+
+#[test]
+fn sender_demand_distinguishes_selected_media_from_potential_without_reservations() {
+    let selected = MediaPayloadBitrate::from_bps(100_000);
+    let potential = MediaPayloadBitrate::from_bps(1_000_000);
+    let demand = SenderDemand::new(selected, potential);
+    assert_eq!(demand.map(SenderDemand::selected), Ok(selected));
+    assert_eq!(demand.map(SenderDemand::potential), Ok(potential));
+    assert_eq!(
+        SenderDemand::new(potential, selected),
+        Err(PolicyError::BitrateOutOfRange)
+    );
+    assert_eq!(SenderDemand::default().selected().as_bps(), 0);
+    assert_eq!(SenderDemand::default().potential().as_bps(), 0);
 }
 
 #[test]
@@ -128,6 +143,31 @@ fn configured_hard_limits_reject_invalid_values() {
     assert!(invalid.validate().is_err());
 
     assert!(ConnectionConfig::default().validate().is_ok());
+}
+
+#[test]
+fn caller_ice_credentials_validate_bounds_and_redact_the_password() {
+    let password = "0123456789ABCDEFGHIJKLMN";
+    let credentials =
+        LocalIceCredentials::new("0123456789ABCDEF", password).expect("routing credentials");
+    assert_eq!(credentials.ufrag(), "0123456789ABCDEF");
+    assert!(!format!("{credentials:?}").contains(password));
+    assert!(LocalIceCredentials::new("a+/0", "a".repeat(22)).is_ok());
+    assert!(LocalIceCredentials::new("a".repeat(256), "a".repeat(256)).is_ok());
+    for (ufrag, password) in [
+        ("a".repeat(3), "a".repeat(22)),
+        ("a".repeat(257), "a".repeat(22)),
+        ("a".repeat(4), "a".repeat(21)),
+        ("a".repeat(4), "a".repeat(257)),
+        ("route:peer".into(), "a".repeat(22)),
+        ("route".into(), "invalid password with spaces".into()),
+        ("routé".into(), "a".repeat(22)),
+    ] {
+        assert_eq!(
+            LocalIceCredentials::new(ufrag, password),
+            Err(AcceptError::InvalidConfiguration)
+        );
+    }
 }
 
 #[test]
@@ -245,6 +285,33 @@ fn policy_values_reject_unrepresentable_construction() {
     assert_eq!(
         PlayoutDelay::from_ticks(2, 1),
         Err(PolicyError::PlayoutRange)
+    );
+    let delay = PlayoutDelay::from_millis(149, 204).expect("valid millisecond bounds");
+    assert_eq!(delay.min(), Duration::from_millis(149));
+    assert_eq!(delay.max(), Duration::from_millis(204));
+    assert_eq!(
+        PlayoutDelay::from_millis(0, 40_951),
+        Err(PolicyError::PlayoutRange)
+    );
+    assert_eq!(
+        PlayoutDelay::from_millis(2, 1),
+        Err(PolicyError::PlayoutRange)
+    );
+    assert_eq!(
+        PlayoutDelay::from_millis(0, 40_950).map(PlayoutDelay::max),
+        Ok(Duration::from_millis(40_950))
+    );
+    assert_eq!(
+        ConnectionConfig::default()
+            .default_audio_policy
+            .playout_delay,
+        None
+    );
+    assert_eq!(
+        ConnectionConfig::default()
+            .default_video_policy
+            .playout_delay,
+        None
     );
     assert_eq!(FrameDependencies::known([FrameId::from_value(1); 9]), None);
 }

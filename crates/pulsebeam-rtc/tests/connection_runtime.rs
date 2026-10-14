@@ -11,7 +11,7 @@ use std::{
 use bytes::Bytes;
 use pulsebeam_rtc::{
     AcceptError, Connection, ConnectionConfig, ConnectionEntropy, GlobalMediaTime, LocalCandidate,
-    NetworkInput, Output, SdpOffer, TimePoint, TransmitTarget,
+    NetworkInput, Output, SdpOffer, TimePoint,
 };
 
 fn at(monotonic: Instant) -> TimePoint {
@@ -38,32 +38,22 @@ fn connection(start: Instant) -> Result<Connection, AcceptError> {
 }
 
 #[test]
-fn public_runtime_emits_one_transport_transmit_then_its_timer() -> Result<(), AcceptError> {
+fn public_runtime_waits_for_authenticated_ice_before_transmitting() -> Result<(), AcceptError> {
     let start = Instant::now();
     let mut connection = connection(start)?;
-
-    let Output::Transmit(transmit) = connection.poll(at(start)) else {
-        panic!("initial ICE work must be emitted as one transmit");
-    };
-    assert!(matches!(
-        transmit.target,
-        TransmitTarget::Udp {
-            local,
-            ecn: None,
-            ..
-        } if local == SocketAddr::from(([192, 0, 2, 1], 5000))
-    ));
-    assert!(!transmit.payload.is_empty());
 
     let Output::Idle {
         next_wakeup: Some(deadline),
     } = connection.poll(at(start))
     else {
-        panic!("transport must expose its earliest timer after initial work");
+        panic!("ICE-lite must wait for inbound checks and expose its timer");
     };
 
     assert!(deadline >= start);
-    assert!(matches!(connection.poll(at(deadline)), Output::Transmit(_)));
+    assert!(!matches!(
+        connection.poll(at(deadline)),
+        Output::Transmit(_)
+    ));
     Ok(())
 }
 

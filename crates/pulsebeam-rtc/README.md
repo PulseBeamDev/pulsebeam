@@ -1,8 +1,11 @@
 # `pulsebeam-rtc`
 
-`pulsebeam-rtc` is PulseBeam's production WebRTC connection boundary for an
-SFU. It encapsulates one peer connection and is designed to replace direct
-`str0m` use in `pulsebeam`. Migrating the server is a separate project.
+`pulsebeam-rtc` provides a sans-I/O WebRTC connection boundary for an SFU.
+It encapsulates a peer connection behind one native transport and media facade;
+the caller retains topology, routing, and source-selection policy.
+
+The production `pulsebeam` server still uses its existing transport engine.
+Integrating this facade into that server and its runtime is a separate change.
 
 The public and architectural contract is defined in
 [docs/design.md](docs/design.md). The congestion-control implementation contract
@@ -16,7 +19,9 @@ is defined in
   scheduler, pacer, probing, and congestion control.
 * The caller owns sockets, all connections, shard scheduling, cross-connection
   routing, and cluster clock synchronization. It feeds individual UDP packets or
-  RFC 4571-framed ICE-TCP packets into a connection.
+  RFC 4571-framed ICE-TCP packets into a connection. Accepted TCP streams are
+  explicitly admitted before input and retired on close. Flow IDs identify
+  non-reused stream incarnations, not peer socket addresses.
 * The SFU owns source and layer selection, keyframe caches, and semantic media
   knowledge needed for routing. Once media is submitted to an outbound sender,
   the connection owns its transport feasibility and wire representation.
@@ -85,7 +90,11 @@ The SFU supplies frame semantics it already knows, including frame identity,
 boundaries, random-access state, and dependencies. `pulsebeam-rtc` uses those
 facts for admission, deadline enforcement, shedding, RTX usefulness, and
 outbound dependency continuity. Core forwarding does not require codec-payload
-parsing and must carry opaque or SFrame-protected media.
+parsing and must carry opaque or SFrame-protected media. Within a fragmented
+frame, native admission checks canonical source RTP continuity. A missing middle
+packet interrupts the frame rather than emitting its End marker on contiguous
+output. The caller can discard unprepared work and resume at fresh independent
+media without rewinding committed transport identity.
 
 ## Session and interoperability
 
@@ -121,8 +130,13 @@ Cross-shard or cross-node transit performs an explicit deep copy so shared
 packet reference counts do not become cross-core runtime state.
 
 Negotiated outbound media produce stable `SenderId` values. A sender's identity,
-policy, outbound SSRC, RTP sequence and timestamp spaces, RTX state, extension
-state, RTCP state, and congestion state survive source and layer changes.
+policy, outbound SSRC, RTP sequence and timestamp spaces, extension state, RTCP
+state, and congestion state survive source and layer changes. The SFU can discard
+unprepared queued media and retained RTX payloads for a replaced assignment with
+`DiscardSenderMedia`, without rewinding committed transport continuity. Native
+audio senders mark their first committed packet and the first committed packet
+after discard as a talk-spurt start, preserving any source marker without changing
+the canonical source packet.
 
 Unsignaled authenticated ingress SSRCs or RIDs can produce stable encoding
 identities within a configured connection-wide bound. Overflow is dropped and
@@ -164,12 +178,14 @@ lowest-value traffic.
 
 Every outbound sender has mutable SFU-provided semantic policy:
 
-* playout-delay range;
+* browser-managed default playout or an explicit playout-delay range;
 * relative media priority;
 * desired media-payload bitrate.
 
-The SFU chooses sources and layers. The connection returns governed aggregate
-and per-sender allocations and owns transport scheduling.
+The SFU chooses sources and layers. The connection returns its controller-governed
+RTP payload selection budget separately from demand-capped aggregate and per-sender
+allocations and owns transport scheduling. The budget is not measured spare path
+bandwidth or a guaranteed reservation.
 
 Egress uses one connection-level SCReAM-v2-derived RTP congestion controller.
 The SCReAM core remains independently testable and self-contained. PulseBeam
@@ -184,8 +200,10 @@ quality recovery, but it never maps directly to an equivalently large network
 queue.
 
 Constrained media capacity is divided among active senders using weighted
-max-min allocation. Priority controls relative share; it does not manufacture
-capacity or make stale media useful.
+max-min allocation capped by actual selected source rates, not an unconditional
+latency-dependent rate discount. A selected encoding is fully funded when
+aggregate selected demand fits the controller-governed budget. Priority controls
+relative share; it does not manufacture capacity or make stale media useful.
 
 Pre-media and application-limited probing uses ordinary RTP padding on a
 negotiated media or RTX SSRC. There is no synthetic SSRC-zero probe stream.
@@ -269,7 +287,7 @@ build-dependency pins out of the production Cargo workspace; Bazel explicitly
 supplies this test-only dependency to RTC fixtures.
 
 Every native peer uses a process-exclusive controlled world, explicit simulated
-time, task pumping, and virtual UDP delivery. Multiple peers in one scenario
+time, task pumping, and virtual UDP or active-client TCP packet delivery. Multiple peers in one scenario
 share the world. The unit target uses one Rust test thread to avoid parallel
 harness threads blocking on the native-world lease. Separate test binaries may
 run concurrently. No real sockets, hardware media, production scheduling,
@@ -279,16 +297,21 @@ has a five-second elapsed budget, including peer setup and teardown.
 High-volume egress traces in `src/network_tests.rs` and `src/connection.rs`
 construct canonical SFU media inputs through the private `src/test_source.rs`
 component source. Their receivers and packet feedback still use actual controlled
-libwebrtc peers. These traces establish server admission, scheduling, and
-congestion invariants, not native ingress interoperability. Separate native media
+libwebrtc peers. These traces establish RTC admission, scheduling, and
+congestion invariants, not production-server integration or native ingress
+interoperability. Separate native media
 and media-clock tests retain authenticated source delivery and normalization.
 
 Actual authenticated bidirectional media, client-generated TWCC accounting,
-DataChannels, and same-seed replay are interoperability evidence. RFC 8888 and
-passive ICE-TCP retain client-free negotiation, framing, parsing, and accounting
-coverage. The pinned controlled adapter has no TCP listener; these component
-tests do not establish ICE-TCP client interoperability. RFC 8888 client
-interoperability is also not claimed. Neither browser nor Pion compatibility
+DataChannels, and same-seed replay are interoperability evidence. The ICE-TCP
+fixture connects an active native client to RTC's passive candidate and verifies
+authenticated media, DataChannels, flow retirement, and graceful close. The pinned
+adapter has no TCP listener and exposes unframed non-TLS packet-socket payloads;
+the fixture translates those payloads to and from RTC's complete RFC 4571 frames.
+This establishes native active-client ICE-TCP interoperability at the packet-socket
+boundary, not native TCP byte-stream fragmentation or passive-client coverage.
+RFC 8888 retains client-free negotiation, parsing, and accounting coverage;
+RFC 8888 client interoperability is not claimed. Neither browser nor Pion compatibility
 is inferred from the native replacement. Missing artifacts or required native
 evidence fail the gate.
 

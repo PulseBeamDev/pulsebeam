@@ -38,6 +38,93 @@ fn batch(now: Instant, epoch: PathEpoch, statuses: Vec<TwccStatus>) -> FeedbackB
     }
 }
 
+#[test]
+fn unreported_twcc_prefix_gets_span_credit_without_loss_evidence() {
+    let now = Instant::now();
+    let epoch = PathEpoch::from_value(1);
+    let mut history = SentHistory::new(PacketFeedbackKind::TransportWide);
+    history.path_changed(epoch, true);
+    for sequence in 1..=3 {
+        history.commit(context(now, epoch, sequence)).unwrap();
+    }
+    let mut report = batch(
+        now + Duration::from_millis(10),
+        epoch,
+        vec![TwccStatus::Received { delta_250us: 1 }],
+    );
+    if let FeedbackReport::Twcc { base_sequence, .. } = &mut report.report {
+        *base_sequence = 3;
+    }
+    history.process_feedback(report);
+    assert_eq!(history.bytes_in_flight, 0);
+    assert_eq!(
+        history
+            .inputs
+            .feedback
+            .iter()
+            .filter(|sample| sample.newly_acked)
+            .count(),
+        3
+    );
+    for sequence in 1..=2 {
+        let id = history.twcc_sent_id(sequence).unwrap();
+        assert_eq!(
+            history.entry(id).unwrap().acknowledgment,
+            Acknowledgment::Pending
+        );
+    }
+    assert!(history.missing.is_empty());
+    history.confirm_losses(now + Duration::from_secs(1), MAX_EXPIRATIONS_PER_POLL);
+    assert!(!history.inputs.feedback.iter().any(|sample| sample.lost));
+    history.clear_controller_inputs();
+    history.process_feedback(batch(
+        now + Duration::from_secs(1),
+        epoch,
+        vec![TwccStatus::Received { delta_250us: 1 }; 2],
+    ));
+    assert_eq!(
+        history
+            .inputs
+            .feedback
+            .iter()
+            .filter(|sample| sample.received)
+            .count(),
+        2
+    );
+    assert!(
+        !history
+            .inputs
+            .feedback
+            .iter()
+            .any(|sample| sample.newly_acked || sample.lost)
+    );
+}
+
+#[test]
+fn absent_feedback_mode_rejects_rtp_commit() {
+    let now = Instant::now();
+    let epoch = PathEpoch::from_value(1);
+    let mut history = SentHistory::new(None);
+    history.path_changed(epoch, true);
+    let before = history.counters();
+    history
+        .commit(TransmitCommitContext {
+            at: now,
+            kind: DatagramKind::Sctp,
+            wire_len: 100,
+            path_epoch: Some(epoch),
+            rtp: None,
+        })
+        .expect("SCTP commit without RTP feedback");
+    assert_eq!(history.counters(), before);
+    assert_eq!(
+        history.preflight_commit(context(now, epoch, 1)),
+        Err(HistoryError::InvalidCommit)
+    );
+    assert_eq!(history.bytes_in_flight, 0);
+    assert_eq!(history.next_sent_id, 0);
+}
+
 proptest::proptest! {
     #[test]
     fn received_edge_credit_is_once_only_across_gaps_and_overlap(
@@ -170,6 +257,38 @@ fn missing_packet_becomes_loss_only_after_reordering_window() {
     assert!(history.inputs.synthetic.is_empty());
     history.expire(now + Duration::from_millis(50), 256);
     assert!(history.inputs.synthetic.iter().any(|sample| sample.lost));
+    assert!(history.inputs.synthetic.iter().all(|sample| {
+        sample.loss_origin == Some(LossOrigin::Reordering)
+            && sample
+                .controller_sample(now + Duration::from_millis(50), now)
+                .loss_origin
+                == Some(LossOrigin::Reordering)
+    }));
+}
+
+#[test]
+fn expiry_retirement_preserves_an_earlier_confirmation_under_backlog() {
+    let now = Instant::now();
+    let epoch = PathEpoch::from_value(3);
+    let mut history = SentHistory::new(PacketFeedbackKind::TransportWide);
+    history.path_changed(epoch, true);
+    for sequence in 1..=513 {
+        history.commit(context(now, epoch, sequence)).unwrap();
+    }
+    let mut statuses = vec![TwccStatus::NotReceived; 512];
+    statuses.push(TwccStatus::Received { delta_250us: 1 });
+    history.process_feedback(batch(now + Duration::from_millis(20), epoch, statuses));
+    history.clear_controller_inputs();
+    history.missing.make_contiguous().reverse();
+    let expired_at = now + SENT_HISTORY_MAX_AGE;
+    assert_eq!(history.expire(expired_at, MAX_EXPIRATIONS_PER_POLL), 256);
+    assert_eq!(history.inputs.synthetic.len(), MAX_EXPIRATIONS_PER_POLL);
+    assert!(history.inputs.synthetic.iter().all(|sample| {
+        sample.lost
+            && sample.loss_origin == Some(LossOrigin::Reordering)
+            && sample.controller_sample(expired_at, now).loss_origin == Some(LossOrigin::Reordering)
+    }));
+    assert_eq!(history.bytes_in_flight, 0);
 }
 
 #[test]
@@ -324,7 +443,14 @@ fn path_change_discards_pending_feedback_and_rebases_ssrc_history() {
     let mut history = SentHistory::new(PacketFeedbackKind::Rfc8888);
     history.path_changed(old_epoch, true);
     history.commit(rfc_context(now, old_epoch, 10)).unwrap();
-    history.emit(SentPacketId(0), false, false, true, None, None);
+    history.emit(
+        SentPacketId(0),
+        false,
+        false,
+        Some(LossOrigin::Reordering),
+        None,
+        None,
+    );
     assert!(!history.inputs.synthetic.is_empty());
     history.path_changed(new_epoch, true);
     assert!(history.inputs.synthetic.is_empty());
@@ -594,9 +720,16 @@ fn synthetic_loss_never_evicts_network_evidence() {
     let mut history = SentHistory::new(PacketFeedbackKind::TransportWide);
     history.path_changed(epoch, true);
     history.commit(context(now, epoch, 1)).unwrap();
-    history.emit(SentPacketId(0), true, true, false, None, None);
+    history.emit(SentPacketId(0), true, true, None, None, None);
     for _ in 0..MAX_EXPIRATIONS_PER_POLL + 1 {
-        history.emit(SentPacketId(0), false, false, true, None, None);
+        history.emit(
+            SentPacketId(0),
+            false,
+            false,
+            Some(LossOrigin::Reordering),
+            None,
+            None,
+        );
     }
     assert_eq!(history.inputs.feedback.len(), 1);
     assert!(history.inputs.feedback[0].received);
@@ -901,6 +1034,12 @@ fn feedback_confirmation_shares_the_expiry_budget_and_defers_without_losing_evid
     ));
     assert_eq!(history.loss_work, MAX_EXPIRATIONS_PER_POLL);
     assert_eq!(history.inputs.synthetic.len(), MAX_EXPIRATIONS_PER_POLL);
+    assert!(history.inputs.synthetic.iter().all(|sample| {
+        sample.lost
+            && sample.loss_origin == Some(LossOrigin::HistoryExpiry)
+            && sample.controller_sample(expired_at, now).loss_origin
+                == Some(LossOrigin::HistoryExpiry)
+    }));
     assert!(history.inputs.feedback.is_empty());
     assert!(!history.inputs.fresh_network_feedback);
     assert!(!history.inputs.exhausted);

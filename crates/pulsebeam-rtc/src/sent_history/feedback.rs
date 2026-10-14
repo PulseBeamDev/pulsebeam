@@ -81,7 +81,7 @@ impl SentHistory {
             }
             self.loss_work += 1;
             if !entry.acknowledgment.is_terminal() {
-                self.mark_lost_unbudgeted(id, true);
+                self.mark_lost_unbudgeted(id, LossOrigin::HistoryExpiry);
                 self.counters.expired = self.counters.expired.saturating_add(1);
             }
             self.oldest_sent_id = self.oldest_sent_id.saturating_add(1);
@@ -333,9 +333,15 @@ impl SentHistory {
             let offset = sequence
                 .checked_sub(base)
                 .and_then(|value| usize::try_from(value).ok());
-            let received = offset
-                .and_then(|index| statuses.get(index))
-                .is_some_and(|status| matches!(status, TwccStatus::Received { .. }));
+            let Some(status) = offset.and_then(|index| statuses.get(index)) else {
+                // ACK-edge credit does not turn an unreported gap into loss evidence.
+                if let Some(sent_id) = sent_id {
+                    self.retire_from_flight(sent_id);
+                    self.emit(sent_id, false, true, None, None, None);
+                }
+                continue;
+            };
+            let received = matches!(status, TwccStatus::Received { .. });
             let arrival = offset
                 .and_then(|index| arrivals.get(index))
                 .copied()
@@ -582,7 +588,7 @@ impl SentHistory {
             return;
         }
         if received_at.saturating_duration_since(entry.committed_at) >= SENT_HISTORY_MAX_AGE {
-            self.mark_lost(sent_id, true);
+            self.mark_lost(sent_id, LossOrigin::HistoryExpiry);
             return;
         }
         self.retire_from_flight(sent_id);
@@ -591,13 +597,13 @@ impl SentHistory {
                 .reorder_deadline(&entry)
                 .is_some_and(|deadline| received_at >= deadline)
             {
-                self.mark_lost(sent_id, false);
+                self.mark_lost(sent_id, LossOrigin::Reordering);
                 return;
             }
             self.set_received(sent_id, true, receiver_arrival, ecn, received_at);
         } else {
             self.set_missing(sent_id, received_at);
-            self.emit(sent_id, false, true, false, None, None);
+            self.emit(sent_id, false, true, None, None, None);
         }
     }
 
@@ -622,7 +628,7 @@ impl SentHistory {
             return;
         }
         if received_at.saturating_duration_since(entry.committed_at) >= SENT_HISTORY_MAX_AGE {
-            if !self.mark_lost(sent_id, true) {
+            if !self.mark_lost(sent_id, LossOrigin::HistoryExpiry) {
                 return;
             }
             if let Some(since) = self
@@ -646,7 +652,7 @@ impl SentHistory {
                     .reorder_deadline(&entry)
                     .is_some_and(|deadline| received_at >= deadline);
                 if deadline_passed {
-                    if !self.mark_lost(sent_id, false) {
+                    if !self.mark_lost(sent_id, LossOrigin::Reordering) {
                         return;
                     }
                     if let Some(entry) = self.entry_mut(sent_id) {
@@ -700,7 +706,7 @@ impl SentHistory {
         entry.acknowledgment = Acknowledgment::Received;
         entry.missing_since = None;
         self.counters.received = self.counters.received.saturating_add(1);
-        self.emit(sent_id, true, newly_acked, false, receiver_arrival, ecn);
+        self.emit(sent_id, true, newly_acked, None, receiver_arrival, ecn);
     }
 
     pub(super) fn set_missing(&mut self, sent_id: SentPacketId, now: Instant) {
@@ -746,13 +752,13 @@ impl SentHistory {
                     self.missing.push_back(sent_id);
                     continue;
                 }
-                self.mark_lost_unbudgeted(sent_id, false);
+                self.mark_lost_unbudgeted(sent_id, LossOrigin::Reordering);
             }
         }
         work
     }
 
-    fn mark_lost(&mut self, sent_id: SentPacketId, retire_from_flight: bool) -> bool {
+    fn mark_lost(&mut self, sent_id: SentPacketId, origin: LossOrigin) -> bool {
         if self
             .entry(sent_id)
             .is_none_or(|entry| entry.acknowledgment.is_terminal())
@@ -763,13 +769,24 @@ impl SentHistory {
             return false;
         }
         self.loss_work += 1;
-        self.mark_lost_unbudgeted(sent_id, retire_from_flight);
+        self.mark_lost_unbudgeted(sent_id, origin);
         true
     }
 
-    fn mark_lost_unbudgeted(&mut self, sent_id: SentPacketId, retire_from_flight: bool) {
-        if retire_from_flight {
+    fn mark_lost_unbudgeted(&mut self, sent_id: SentPacketId, mut origin: LossOrigin) {
+        if origin == LossOrigin::HistoryExpiry {
+            let Some(entry) = self.entry(sent_id).copied() else {
+                return;
+            };
             self.retire_from_flight(sent_id);
+            // Bounded confirmation work can defer an already-due reorder loss.
+            if let Some(expiry) = entry.committed_at.checked_add(SENT_HISTORY_MAX_AGE)
+                && self
+                    .reorder_deadline(&entry)
+                    .is_some_and(|deadline| deadline <= expiry)
+            {
+                origin = LossOrigin::Reordering;
+            }
         }
         let Some(entry) = self.entry_mut(sent_id) else {
             return;
@@ -779,7 +796,7 @@ impl SentHistory {
         }
         entry.acknowledgment = Acknowledgment::Lost;
         self.counters.not_received = self.counters.not_received.saturating_add(1);
-        self.emit(sent_id, false, false, true, None, None);
+        self.emit(sent_id, false, false, Some(origin), None, None);
     }
 
     fn retire_from_flight(&mut self, sent_id: SentPacketId) {
@@ -799,7 +816,7 @@ impl SentHistory {
         sent_id: SentPacketId,
         received: bool,
         newly_acked: bool,
-        lost: bool,
+        loss_origin: Option<LossOrigin>,
         receiver_arrival: Option<ReceiverTime>,
         ecn: Option<EcnMark>,
     ) {
@@ -808,16 +825,18 @@ impl SentHistory {
         };
         let sample = PacketFeedback {
             sent_id,
+            ssrc: entry.ssrc,
             committed_at: entry.committed_at,
             transport_bytes: u32::try_from(entry.wire_len).unwrap_or(u32::MAX),
             service: entry.service,
             received,
             newly_acked,
-            lost,
+            lost: loss_origin.is_some(),
+            loss_origin,
             receiver_arrival,
             ecn,
         };
-        if lost {
+        if loss_origin.is_some() {
             if self.inputs.synthetic.len() < MAX_EXPIRATIONS_PER_POLL {
                 self.inputs.synthetic.push(sample);
             } else {

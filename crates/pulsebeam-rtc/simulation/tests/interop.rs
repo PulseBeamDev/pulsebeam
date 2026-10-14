@@ -171,9 +171,9 @@ fn exercise(seed: u64, start: Instant) -> (u64, u64, usize) {
     let mut sent_data = false;
     let mut server_data = Vec::new();
     let mut client_data = Vec::new();
-    const MEDIA_START_TICK: u32 = 1_000;
     const FRAME_TICKS: u32 = 20;
     const MEDIA_FRAMES: u32 = 10;
+    let mut media_start_tick = None;
     for tick in 0..5_000 {
         world.pump(512);
         let mut received_twcc = false;
@@ -226,6 +226,7 @@ fn exercise(seed: u64, start: Instant) -> (u64, u64, usize) {
                     pending.push_back(ForwardedMedia {
                         packet,
                         frame: FrameMetadata {
+                            decode_target_mask: None,
                             id: FrameId::from_value(inbound),
                             boundary: FrameBoundary::Complete,
                             random_access: true,
@@ -297,12 +298,17 @@ fn exercise(seed: u64, start: Instant) -> (u64, u64, usize) {
             );
             sent_data = true;
         }
-        if (MEDIA_START_TICK..MEDIA_START_TICK + MEDIA_FRAMES * FRAME_TICKS).contains(&tick)
-            && (tick - MEDIA_START_TICK).is_multiple_of(FRAME_TICKS)
+        if connected && peer_connected && media_start_tick.is_none() {
+            media_start_tick = Some(tick + FRAME_TICKS);
+        }
+        if let Some(start_tick) = media_start_tick
+            && (start_tick..start_tick + MEDIA_FRAMES * FRAME_TICKS).contains(&tick)
+            && (tick - start_tick).is_multiple_of(FRAME_TICKS)
         {
             assert!(
                 connected && peer_connected,
-                "scheduled media requires connection"
+                "scheduled media requires connection: server={connected} peer={peer_connected} stats={:?}",
+                connection.stats()
             );
             source
                 .push_opus_at(
@@ -318,7 +324,7 @@ fn exercise(seed: u64, start: Instant) -> (u64, u64, usize) {
         world.advance(Duration::from_millis(1)).unwrap();
     }
     eprintln!(
-        "connected={connected}/{peer_connected} media={inbound}/{outbound} feedback={feedback}, stats={:?}",
+        "connected={connected}/{peer_connected} media_start_tick={media_start_tick:?} media={inbound}/{outbound} feedback={feedback}, stats={:?}",
         connection.stats()
     );
     assert!(connected && peer_connected);
@@ -350,6 +356,221 @@ fn exercise(seed: u64, start: Instant) -> (u64, u64, usize) {
             < connection.stats().connection.transmitted_rtp_bytes
     );
     (inbound, outbound, feedback)
+}
+
+#[test]
+#[allow(
+    clippy::disallowed_types,
+    reason = "single-threaded native boundary test constructs immutable public API payloads without cross-shard sharing"
+)]
+fn controlled_libwebrtc_acknowledges_rtx_padding_before_primary_media() {
+    use bytes::Bytes;
+
+    let start = Instant::now();
+    let world = ControlledWorld::acquire(8324, Duration::from_secs(10)).unwrap();
+    let network = world.create_network().unwrap();
+    let client = network
+        .register_endpoint(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)))
+        .unwrap();
+    let server = network
+        .register_endpoint(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2)))
+        .unwrap();
+    let socket = server.bind_udp(41000).unwrap();
+    let video = EncodedVideoInput::new().unwrap();
+    let factory = world
+        .peer_factory_builder()
+        .unwrap()
+        .network_manager(client.network_manager().unwrap())
+        .packet_socket_factory(client.packet_socket_factory().unwrap())
+        .audio_encoder_factory(AudioEncoderFactory::with_opus_frames().unwrap())
+        .audio_decoder_factory(AudioDecoderFactory::builtin_opus().unwrap())
+        .video_encoder_factory(video.encoder_factory())
+        .video_decoder_factory(video.encoded_receive_factory().unwrap())
+        .controlled_media()
+        .build()
+        .unwrap();
+    let peer = factory
+        .create_peer_connection(PeerConfiguration::default())
+        .unwrap();
+    let source = video.create_source(&factory).unwrap();
+    let track = source.create_track(&factory, "video").unwrap();
+    let transceiver = peer
+        .add_video_transceiver(&track, RtpTransceiverDirection::SendReceive)
+        .unwrap();
+    let sink = transceiver.receiver().attach_encoded_sink().unwrap();
+    let offer = complete(&world, &peer, peer.create_offer().unwrap()).unwrap();
+    complete(&world, &peer, peer.set_local_description(offer).unwrap());
+    let mut gathered = false;
+    for _ in 0..2_000 {
+        world.pump(512);
+        while let Some(event) = peer.try_next_event() {
+            if matches!(
+                event,
+                PeerConnectionEvent::IceGatheringStateChanged(IceGatheringState::Complete)
+            ) {
+                gathered = true;
+            }
+        }
+        if gathered {
+            break;
+        }
+        world.advance(Duration::from_millis(1)).unwrap();
+    }
+    assert!(gathered, "native video ICE gathering stalled");
+    let offer = peer.descriptions().unwrap().pending_local.unwrap();
+    let origin = world.now();
+    let point = |now: Duration| TimePoint {
+        monotonic: start + (now - origin),
+        global: GlobalMediaTime::from_micros(1_000_000 + (now - origin).as_micros() as u64),
+    };
+    let local = SocketAddr::new(socket.local_address().ip(), socket.local_address().port());
+    let mut config = ConnectionConfig {
+        local_candidates: vec![LocalCandidate::Udp(local)],
+        ..ConnectionConfig::default()
+    };
+    config.default_video_policy.desired_bitrate =
+        pulsebeam_rtc::MediaPayloadBitrate::from_bps(1_000_000);
+    let accepted = Connection::accept(
+        config,
+        SdpOffer::new(offer.sdp),
+        point(world.now()),
+        ConnectionEntropy::new([19; 32]),
+    )
+    .unwrap();
+    assert_eq!(accepted.session.senders.len(), 1);
+    assert!(accepted.session.senders[0].supports_rtx);
+    assert_eq!(
+        accepted.session.feedback,
+        Some(pulsebeam_rtc::PacketFeedbackKind::TransportWide)
+    );
+    let rtx_payload_type = accepted
+        .answer
+        .as_str()
+        .lines()
+        .find_map(|line| {
+            let mapping = line.strip_prefix("a=rtpmap:")?;
+            let (payload_type, codec) = mapping.split_once(' ')?;
+            codec
+                .eq_ignore_ascii_case("rtx/90000")
+                .then(|| payload_type.parse::<u8>().unwrap())
+        })
+        .expect("negotiated RTX payload type");
+    complete(
+        &world,
+        &peer,
+        peer.set_remote_description(SessionDescription {
+            kind: SessionDescriptionType::Answer,
+            sdp: accepted.answer.as_str().to_owned(),
+        })
+        .unwrap(),
+    );
+    let mut connection = accepted.connection;
+    let mut connected = false;
+    let mut peer_connected = false;
+    let mut probes = 0;
+    let mut feedback = 0;
+    let mut accounted_feedback = false;
+    for _ in 0..2_000 {
+        world.pump(512);
+        let mut received_twcc = false;
+        while let Some(packet) = network.next_packet() {
+            assert_eq!(packet.kind, OutboundKind::Udp);
+            if packet.destination == socket.local_address() && is_twcc(&packet.payload) {
+                feedback += 1;
+                received_twcc = true;
+            }
+            match network.deliver(packet.id) {
+                Ok(()) => {}
+                Err(NetworkError::DestinationUnavailable)
+                    if packet.source == socket.local_address()
+                        && packet.payload.get(4..8) == Some(&[0x21, 0x12, 0xa4, 0x42][..]) => {}
+                Err(error) => panic!("virtual video delivery {packet:?}: {error:?}"),
+            }
+        }
+        while let Some(packet) = socket.try_receive() {
+            connection
+                .receive(
+                    point(world.now()),
+                    NetworkInput::Udp {
+                        local,
+                        remote: SocketAddr::new(packet.source.ip(), packet.source.port()),
+                        ecn: None,
+                        payload: Bytes::from(packet.payload),
+                    },
+                )
+                .unwrap();
+        }
+        let before = connection.stats().connection;
+        for _ in 0..512 {
+            match connection.poll(point(world.now())) {
+                Output::Transmit(packet) => {
+                    if packet.payload.first().is_some_and(|byte| byte >> 6 == 2)
+                        && packet
+                            .payload
+                            .get(1)
+                            .is_some_and(|byte| byte & 0x7f == rtx_payload_type)
+                    {
+                        assert_ne!(packet.payload[0] & 0x20, 0, "RTX probe is RTP padding");
+                        let ssrc = u32::from_be_bytes(packet.payload[8..12].try_into().unwrap());
+                        assert_ne!(ssrc, 0);
+                        probes += 1;
+                    }
+                    let TransmitTarget::Udp { remote, .. } = packet.target else {
+                        panic!("unexpected video TCP transport")
+                    };
+                    socket
+                        .send_to(
+                            NetworkAddress::new(remote.ip(), remote.port()).unwrap(),
+                            packet.payload.to_vec(),
+                        )
+                        .unwrap();
+                }
+                Output::Event(Event::Connected) => connected = true,
+                Output::Event(Event::Media { .. }) => {
+                    panic!("padding must not deliver bogus media")
+                }
+                Output::Event(_) => {}
+                Output::Idle { .. } => break,
+                Output::Closed(reason) => panic!("video server closed: {reason:?}"),
+                _ => panic!("unknown video output"),
+            }
+        }
+        let after = connection.stats().connection;
+        let committed = after.transmitted_padding_bytes - before.transmitted_padding_bytes;
+        if received_twcc && before.rtp_bytes_in_flight + committed > after.rtp_bytes_in_flight {
+            accounted_feedback = true;
+        }
+        while let Some(event) = peer.try_next_event() {
+            match event {
+                PeerConnectionEvent::ConnectionStateChanged(ConnectionState::Connected) => {
+                    peer_connected = true
+                }
+                PeerConnectionEvent::IceCandidateError { message, .. } => {
+                    panic!("video ICE error: {message}")
+                }
+                PeerConnectionEvent::OperationComplete(result) => {
+                    panic!("unexpected video operation: {result:?}")
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            sink.try_next_frame().is_none(),
+            "padding is not a native video frame"
+        );
+        world.advance(Duration::from_millis(1)).unwrap();
+    }
+    assert!(connected && peer_connected);
+    assert!(probes > 0, "wire-visible negotiated RTX padding");
+    assert!(
+        feedback > 0,
+        "native video peer generated TWCC before primary media"
+    );
+    assert!(
+        accounted_feedback,
+        "authenticated TWCC retired RTX padding before history expiry"
+    );
+    assert_eq!(connection.stats().connection.transmitted_rtp_bytes, 0);
 }
 
 #[test]

@@ -107,6 +107,9 @@ pub struct InboundMediaInfo {
     pub sender_index: u32,
     pub kind: MediaKind,
     pub mid: Arc<str>,
+    /// Incoming RID identities in offered simulcast order, including paused alternatives.
+    /// Without simulcast, uses send-direction RID declaration order; empty means no RID.
+    pub rids: Arc<[Arc<str>]>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -169,6 +172,46 @@ impl LocalCandidate {
     }
 }
 
+#[derive(Clone, Eq, PartialEq)]
+pub struct LocalIceCredentials {
+    ufrag: String,
+    password: String,
+}
+
+impl LocalIceCredentials {
+    pub fn new(ufrag: impl Into<String>, password: impl Into<String>) -> Result<Self, AcceptError> {
+        let credentials = Self {
+            ufrag: ufrag.into(),
+            password: password.into(),
+        };
+        let ice_char = |byte: u8| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/');
+        if !(4..=256).contains(&credentials.ufrag.len())
+            || !(22..=256).contains(&credentials.password.len())
+            || !credentials.ufrag.bytes().all(ice_char)
+            || !credentials.password.bytes().all(ice_char)
+        {
+            return Err(AcceptError::InvalidConfiguration);
+        }
+        Ok(credentials)
+    }
+
+    pub fn ufrag(&self) -> &str {
+        &self.ufrag
+    }
+
+    pub(crate) fn password(&self) -> &str {
+        &self.password
+    }
+}
+
+impl fmt::Debug for LocalIceCredentials {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LocalIceCredentials")
+            .field("ufrag", &self.ufrag)
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ConnectionLimits {
     pub max_unsignaled_encodings: u16,
@@ -224,6 +267,7 @@ impl Default for ConnectionLimits {
 pub struct ConnectionConfig {
     pub capabilities: SessionCapabilities,
     pub local_candidates: Vec<LocalCandidate>,
+    pub local_ice_credentials: Option<LocalIceCredentials>,
     pub limits: ConnectionLimits,
     pub default_audio_policy: SenderPolicy,
     pub default_video_policy: SenderPolicy,
@@ -261,14 +305,15 @@ impl Default for ConnectionConfig {
         Self {
             capabilities: SessionCapabilities::default(),
             local_candidates: Vec::new(),
+            local_ice_credentials: None,
             limits: ConnectionLimits::default(),
             default_audio_policy: SenderPolicy {
-                playout_delay: PlayoutDelay::ZERO,
+                playout_delay: None,
                 priority: MediaPriority::HIGH,
                 desired_bitrate: MediaPayloadBitrate::from_bps(0),
             },
             default_video_policy: SenderPolicy {
-                playout_delay: PlayoutDelay::ZERO,
+                playout_delay: None,
                 priority: MediaPriority::MEDIUM,
                 desired_bitrate: MediaPayloadBitrate::from_bps(0),
             },
@@ -279,9 +324,52 @@ impl Default for ConnectionConfig {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SenderPolicy {
-    pub playout_delay: PlayoutDelay,
+    pub playout_delay: Option<PlayoutDelay>,
     pub priority: MediaPriority,
     pub desired_bitrate: MediaPayloadBitrate,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SenderDemand {
+    selected: MediaPayloadBitrate,
+    potential: MediaPayloadBitrate,
+}
+
+impl SenderDemand {
+    pub const fn new(
+        selected: MediaPayloadBitrate,
+        potential: MediaPayloadBitrate,
+    ) -> Result<Self, PolicyError> {
+        if selected.as_bps() > potential.as_bps() {
+            return Err(PolicyError::BitrateOutOfRange);
+        }
+        Ok(Self {
+            selected,
+            potential,
+        })
+    }
+
+    pub const fn selected(self) -> MediaPayloadBitrate {
+        self.selected
+    }
+
+    pub const fn potential(self) -> MediaPayloadBitrate {
+        self.potential
+    }
+
+    pub(crate) const fn from_policy(
+        selected: MediaPayloadBitrate,
+        potential: Option<MediaPayloadBitrate>,
+    ) -> Self {
+        let potential = match potential {
+            Some(value) if value.as_bps() > selected.as_bps() => value,
+            _ => selected,
+        };
+        Self {
+            selected,
+            potential,
+        }
+    }
 }
 
 #[repr(transparent)]
@@ -335,14 +423,14 @@ impl MediaPriority {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PlayoutDelay {
-    min_ticks: u16,
-    max_ticks: u16,
+    min_millis: u16,
+    max_millis: u16,
 }
 
 impl PlayoutDelay {
     pub const ZERO: Self = Self {
-        min_ticks: 0,
-        max_ticks: 0,
+        min_millis: 0,
+        max_millis: 0,
     };
 
     pub const fn from_ticks(min: u16, max: u16) -> Result<Self, PolicyError> {
@@ -350,8 +438,18 @@ impl PlayoutDelay {
             return Err(PolicyError::PlayoutRange);
         }
         Ok(Self {
-            min_ticks: min,
-            max_ticks: max,
+            min_millis: min.saturating_mul(10),
+            max_millis: max.saturating_mul(10),
+        })
+    }
+
+    pub fn from_millis(min: u64, max: u64) -> Result<Self, PolicyError> {
+        if min > max || max > u64::from(MAX_PLAYOUT_TICKS).saturating_mul(MILLIS_PER_PLAYOUT_TICK) {
+            return Err(PolicyError::PlayoutRange);
+        }
+        Ok(Self {
+            min_millis: u16::try_from(min).map_err(|_| PolicyError::PlayoutRange)?,
+            max_millis: u16::try_from(max).map_err(|_| PolicyError::PlayoutRange)?,
         })
     }
 
@@ -369,11 +467,18 @@ impl PlayoutDelay {
     }
 
     pub const fn min(self) -> Duration {
-        Duration::from_millis((self.min_ticks as u64).saturating_mul(MILLIS_PER_PLAYOUT_TICK))
+        Duration::from_millis(self.min_millis as u64)
     }
 
     pub const fn max(self) -> Duration {
-        Duration::from_millis((self.max_ticks as u64).saturating_mul(MILLIS_PER_PLAYOUT_TICK))
+        Duration::from_millis(self.max_millis as u64)
+    }
+
+    pub(crate) fn wire_value(self) -> [u8; 3] {
+        let min = u32::from(self.min_millis.saturating_add(5) / 10);
+        let max = u32::from(self.max_millis.saturating_add(5) / 10);
+        let [_, a, b, c] = ((min << 12) | max).to_be_bytes();
+        [a, b, c]
     }
 }
 

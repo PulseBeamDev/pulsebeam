@@ -7,7 +7,10 @@ use std::{cell::Cell, marker::PhantomData, ops::Range, sync::Arc, time::Duration
 
 use bytes::Bytes;
 
-use crate::{FrameId, GlobalMediaTime};
+use crate::{
+    FrameId, GlobalMediaTime,
+    dependency_descriptor::{DescriptorContext, TemplateSeed},
+};
 
 #[derive(Clone, Debug)]
 pub struct MediaPacket {
@@ -15,7 +18,18 @@ pub struct MediaPacket {
     global_media_at: GlobalMediaTime,
     extensions: Arc<[(Arc<str>, Range<usize>)]>,
     clock_quality: ClockQuality,
+    descriptor_context: Option<DescriptorContext>,
     _not_sync: PhantomData<Cell<()>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MediaPacketView<'a> {
+    pub ssrc: u32,
+    pub sequence_number: u16,
+    pub timestamp: u32,
+    pub marker: bool,
+    pub header_len: usize,
+    pub payload: &'a [u8],
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -63,6 +77,7 @@ impl MediaPacket {
             global_media_at,
             extensions,
             clock_quality,
+            descriptor_context: None,
             _not_sync: PhantomData,
         }
     }
@@ -79,6 +94,18 @@ impl MediaPacket {
         self.global_media_at
     }
 
+    pub fn view(&self) -> Option<MediaPacketView<'_>> {
+        let packet = crate::packet::RtpPacket::parse(&self.bytes).ok()?;
+        Some(MediaPacketView {
+            ssrc: packet.ssrc(),
+            sequence_number: packet.sequence(),
+            timestamp: packet.timestamp(),
+            marker: packet.marker(),
+            header_len: packet.payload_range().start,
+            payload: packet.payload(),
+        })
+    }
+
     pub fn extension(&self, uri: &str) -> Option<&[u8]> {
         let (_, range) = self
             .extensions
@@ -87,11 +114,51 @@ impl MediaPacket {
         self.bytes.get(range.clone())
     }
 
+    /// An authenticated source template-definition descriptor and its current
+    /// active-target mask. The definition is metadata, not a replayable frame.
+    /// It permits cold source joins without fabricating generic target semantics.
+    pub fn dependency_descriptor_context(&self) -> Option<(&[u8], u32)> {
+        self.descriptor_context
+            .as_ref()
+            .map(|context| (context.definition.as_ref(), context.active_targets))
+    }
+
+    pub(crate) fn queued_bytes(&self) -> usize {
+        self.bytes.len().saturating_add(
+            self.descriptor_context
+                .as_ref()
+                .map_or(0, |context| context.definition.len()),
+        )
+    }
+
+    pub(crate) fn descriptor_context(&self) -> Option<&DescriptorContext> {
+        self.descriptor_context.as_ref()
+    }
+
+    pub(crate) fn set_descriptor_context(&mut self, context: Option<DescriptorContext>) {
+        self.descriptor_context = context;
+    }
+
+    pub fn materialize(&self) -> Result<crate::MaterializedMediaPacket, crate::MediaTransitError> {
+        crate::MaterializedMediaPacket::from_packet(self)
+    }
+
+    pub(crate) fn transit_extensions(&self) -> &[(Arc<str>, Range<usize>)] {
+        &self.extensions
+    }
+
     pub fn to_transit(&self) -> Self {
         Self {
             bytes: Bytes::copy_from_slice(&self.bytes),
             global_media_at: self.global_media_at,
             clock_quality: self.clock_quality,
+            descriptor_context: self
+                .descriptor_context
+                .as_ref()
+                .map(|context| DescriptorContext {
+                    definition: TemplateSeed::copy_from_slice(&context.definition),
+                    active_targets: context.active_targets,
+                }),
             extensions: self
                 .extensions
                 .iter()
@@ -109,6 +176,15 @@ pub struct ForwardedMedia {
     pub frame: FrameMetadata,
 }
 
+impl ForwardedMedia {
+    pub fn to_transit(&self) -> Self {
+        Self {
+            packet: self.packet.to_transit(),
+            frame: self.frame.to_transit(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FrameMetadata {
     pub id: FrameId,
@@ -116,6 +192,27 @@ pub struct FrameMetadata {
     pub random_access: bool,
     pub discardable: bool,
     pub dependencies: FrameDependencies,
+    /// Output decode-target selection. None preserves source active targets.
+    pub decode_target_mask: Option<u32>,
+}
+
+impl FrameMetadata {
+    pub fn to_transit(&self) -> Self {
+        let dependencies = match &self.dependencies {
+            FrameDependencies::Unknown => FrameDependencies::Unknown,
+            FrameDependencies::Known(values) => {
+                FrameDependencies::Known(Arc::from(values.as_ref()))
+            }
+        };
+        Self {
+            id: self.id,
+            boundary: self.boundary,
+            random_access: self.random_access,
+            discardable: self.discardable,
+            dependencies,
+            decode_target_mask: self.decode_target_mask,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -144,6 +241,23 @@ impl FrameDependencies {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canonical_view_excludes_padding_and_preserves_header_facts() {
+        let bytes = Bytes::from_static(&[
+            0xa0, 0xe0, 0x12, 0x34, 0, 0, 0, 42, 0, 0, 0, 7, 10, 20, 0, 2,
+        ]);
+        let packet = MediaPacket::new(bytes, GlobalMediaTime::from_micros(99), Arc::from([]));
+        let view = packet.view().unwrap();
+        assert_eq!(view.ssrc, 7);
+        assert_eq!(view.sequence_number, 0x1234);
+        assert_eq!(view.timestamp, 42);
+        assert!(view.marker);
+        assert_eq!(view.header_len, 12);
+        assert_eq!(view.payload, &[10, 20]);
+        assert_eq!(packet.global_media_at(), GlobalMediaTime::from_micros(99));
+        assert_eq!(packet.to_transit().view(), Some(view));
+    }
 
     #[test]
     fn transit_deep_copies_packet_owned_state() {

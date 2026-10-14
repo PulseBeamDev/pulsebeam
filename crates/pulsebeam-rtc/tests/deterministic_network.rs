@@ -145,10 +145,9 @@ fn production_pre_media_probes_use_only_the_low_traffic_allowance() {
     let totals = fixture.connection.stats().connection;
     assert_eq!(totals.transmitted_rtp_bytes, 0);
     assert!(totals.transmitted_padding_bytes > 0);
-    assert!(totals.transmitted_padding_bytes <= 3_000);
     eprintln!(
-        "probe-only window nonprobe=0 padding={} raw_ratio=100% allowance_used={}",
-        totals.transmitted_padding_bytes, totals.transmitted_padding_bytes
+        "probe-only cumulative padding={} over six seconds; five-second rolling allowance checked",
+        totals.transmitted_padding_bytes
     );
 }
 
@@ -183,6 +182,7 @@ fn run(scenario: Scenario) {
     fixture.configure_network(scenario.seed, scenario.policy);
 
     let mut admitted = 0_u64;
+    let mut latest_global = None;
     for id in 1..=scenario.packets {
         source.drive_for(Duration::from_millis(20));
         alternate_source.drive_for(Duration::from_millis(20));
@@ -192,7 +192,7 @@ fn run(scenario: Scenario) {
             &mut source
         };
         let packet = selected_source.send_source(&vec![0x5a; PAYLOAD_BYTES]);
-        let media = forwarded(packet, id);
+        let mut media = forwarded(packet, id);
         let sender = if scenario.name == "policer-competition" {
             *fixture
                 .senders
@@ -211,10 +211,20 @@ fn run(scenario: Scenario) {
             ) {
                 Ok(()) => {
                     admitted = admitted.saturating_add(1);
+                    latest_global = Some(media.packet.global_media_at());
                     break;
                 }
-                Err(CommandError::WouldBlock) => fixture.drive_for(FEEDBACK_INTERVAL),
-                Err(error) => panic!("scenario admission failed: {error:?}"),
+                Err(CommandError::WouldBlock) => {
+                    fixture.drive_for(FEEDBACK_INTERVAL);
+                    let packet = selected_source.send_source(&vec![0x5a; PAYLOAD_BYTES]);
+                    media = forwarded(packet, id);
+                }
+                Err(error) => panic!(
+                    "scenario {} admission failed at frame {id}: {error:?}, global={:?}, latest={latest_global:?}, receiver={:?}",
+                    scenario.name,
+                    media.packet.global_media_at(),
+                    fixture.at().global
+                ),
             }
         }
     }

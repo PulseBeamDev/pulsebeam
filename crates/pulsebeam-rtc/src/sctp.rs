@@ -636,7 +636,12 @@ impl Association {
         }
         channel.opened_emitted = true;
         let id = channel.id;
-        self.push_event(Event::DataChannel(DataChannelEvent::Opened { channel: id }));
+        let mut config = channel.config.clone();
+        config.id = Some(id);
+        self.push_event(Event::DataChannel(DataChannelEvent::Opened {
+            channel: id,
+            config,
+        }));
     }
 
     fn emit_closed(&mut self, stream: StreamId) {
@@ -914,9 +919,61 @@ mod tests {
 
     fn opened_channel(events: &[Event]) -> Option<DataChannelId> {
         events.iter().find_map(|event| match event {
-            Event::DataChannel(DataChannelEvent::Opened { channel }) => Some(*channel),
+            Event::DataChannel(DataChannelEvent::Opened { channel, .. }) => Some(*channel),
             _ => None,
         })
+    }
+
+    #[test]
+    fn data_channel_open_events_expose_assigned_identity_and_complete_configuration() {
+        for (reliability, ordered, negotiated) in [
+            (DataReliability::Reliable, true, false),
+            (DataReliability::MaxRetransmits(3), false, false),
+            (
+                DataReliability::MaxLifetime(Duration::from_millis(90)),
+                true,
+                false,
+            ),
+            (DataReliability::Reliable, true, true),
+        ] {
+            let (mut left, mut right, mut now, start) =
+                connected_pair(ConnectionLimits::default(), ConnectionLimits::default());
+            let mut expected = config(reliability, ordered);
+            expected.negotiated = negotiated;
+            if negotiated {
+                expected.id = Some(DataChannelId::from_value(7));
+                right.open(at(now, start), expected.clone()).unwrap();
+            }
+            left.open(at(now, start), expected.clone()).unwrap();
+            let mut left_events = Vec::new();
+            let mut right_events = Vec::new();
+            drive(
+                &mut left,
+                &mut right,
+                &mut now,
+                start,
+                &mut left_events,
+                &mut right_events,
+            );
+            let channel = opened_channel(&left_events).expect("local opened");
+            expected.id = Some(channel);
+            for events in [&left_events, &right_events] {
+                let configurations: Vec<_> = events
+                    .iter()
+                    .filter_map(|event| match event {
+                        Event::DataChannel(DataChannelEvent::Opened {
+                            channel: opened,
+                            config,
+                        }) => {
+                            assert_eq!(*opened, channel);
+                            Some(config)
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(configurations, vec![&expected]);
+            }
+        }
     }
 
     #[test]
@@ -1142,7 +1199,7 @@ mod tests {
         let channels: Vec<_> = left_events
             .iter()
             .filter_map(|event| match event {
-                Event::DataChannel(DataChannelEvent::Opened { channel }) => Some(*channel),
+                Event::DataChannel(DataChannelEvent::Opened { channel, .. }) => Some(*channel),
                 _ => None,
             })
             .collect();

@@ -17,7 +17,9 @@ use str0m::crypto::Fingerprint;
 use str0m::crypto::dtls::DtlsCert;
 
 use crate::negotiation::{DtlsRole, NegotiatedSessionFacts};
-use crate::{GlobalMediaTime, IceTcpFlowId, NetworkInput, TimePoint, TransmitTarget};
+use crate::{
+    AuthenticatedFlow, GlobalMediaTime, IceTcpFlowId, NetworkInput, TimePoint, TransmitTarget,
+};
 
 use srtp::{RtpMetadata, SrtpError, outbound_rtp_metadata, outbound_twcc_sequence};
 
@@ -26,6 +28,7 @@ const MAX_TRANSMISSIONS: usize = 256;
 const MAX_CANDIDATE_PAIRS: usize = 128;
 const MAX_PENDING_DTLS: usize = 64;
 const MAX_TCP_FLOWS: usize = 64;
+const MAX_AUTHENTICATED_OBSERVATIONS: usize = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TransportState {
@@ -81,6 +84,7 @@ pub(crate) enum RtpService {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum TransportEvent {
     StateChanged(TransportState),
+    IceAuthenticated(AuthenticatedFlow),
     IceStateChanged(IceConnectionState),
     Rtp {
         arrival: TimePoint,
@@ -125,6 +129,7 @@ pub(crate) struct PreparedTransmit {
 pub(crate) enum TransportError {
     Closed,
     InvalidInput,
+    UnknownTcpFlow,
     NotDue,
     QueueFull,
     Configuration,
@@ -138,6 +143,7 @@ impl fmt::Display for TransportError {
         f.write_str(match self {
             Self::Closed => "transport is closed",
             Self::InvalidInput => "invalid transport input",
+            Self::UnknownTcpFlow => "unknown ICE-TCP flow",
             Self::NotDue => "transport deadline is not due",
             Self::QueueFull => "transport queue is full",
             Self::Configuration => "invalid transport configuration",
@@ -286,13 +292,21 @@ pub(crate) struct Transport {
     twcc_extension_id: Option<u8>,
     twcc_payload_map: Box<[(u8, u8)]>,
     events: VecDeque<TransportEvent>,
+    authenticated: VecDeque<AuthenticatedFlow>,
     transmissions: VecDeque<PreparedTransmit>,
     pending_dtls: VecDeque<(SelectedPath, Vec<u8>)>,
     next_deadline: Option<Instant>,
     max_events: usize,
     max_transmissions: usize,
-    tcp_flows: Vec<(IceTcpFlowId, SocketAddr, SocketAddr)>,
+    tcp_flows: Vec<TcpFlowBinding>,
     dropped_inputs: u64,
+}
+
+struct TcpFlowBinding {
+    flow: IceTcpFlowId,
+    local: SocketAddr,
+    remote: SocketAddr,
+    authenticated: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -309,6 +323,10 @@ pub(crate) enum NetworkEnvelope {
 }
 
 impl NetworkEnvelope {
+    fn is_tcp_flow(&self, flow: IceTcpFlowId) -> bool {
+        matches!(self, Self::IceTcp { flow: id, .. } if *id == flow)
+    }
+
     fn source(&self) -> SocketAddr {
         match self {
             Self::Udp { remote, .. } | Self::IceTcp { remote, .. } => *remote,
@@ -441,6 +459,7 @@ impl Transport {
             twcc_extension_id: config.twcc_extension_id,
             twcc_payload_map: config.twcc_payload_map,
             events: VecDeque::new(),
+            authenticated: VecDeque::new(),
             transmissions: VecDeque::new(),
             pending_dtls: VecDeque::new(),
             next_deadline: None,
@@ -500,13 +519,20 @@ impl Transport {
                 .retain(|event| !matches!(event, TransportEvent::SelectedPathChanged { .. }));
             return latest;
         }
-        self.events.pop_front()
+        self.authenticated
+            .pop_front()
+            .map(TransportEvent::IceAuthenticated)
+            .or_else(|| self.events.pop_front())
     }
 
     #[cfg(test)]
     pub(crate) fn reselect_path_for_test(&mut self) -> Result<(), TransportError> {
         let selected = self.selected.clone().ok_or(TransportError::Protocol)?;
         self.select_path(SelectedPath::unselected(selected.envelope))
+    }
+
+    pub(crate) fn can_send_user_data(&self) -> bool {
+        self.state == TransportState::Connected && self.selected.is_some()
     }
 
     pub(crate) fn smoothed_rtt(&self) -> Option<Duration> {
@@ -616,10 +642,28 @@ impl Transport {
                     .ice
                     .handle_packet(now, source, destination, proto, &bytes)
                 {
-                    Ok(()) => {
-                        self.bind_current_tcp_flow(path);
+                    Ok(authenticated) => {
+                        if authenticated {
+                            if let NetworkEnvelope::IceTcp { flow, .. } = path.envelope
+                                && let Some(binding) = self
+                                    .tcp_flows
+                                    .iter_mut()
+                                    .find(|binding| binding.flow == flow)
+                            {
+                                binding.authenticated = true;
+                            }
+                            self.observe_authenticated(&path.envelope);
+                        }
                         let provider = str0m::crypto::from_feature_flags();
                         self.drain_ice(now, &provider)?;
+                        // ICE nomination is tuple-based and may not repeat on a new stream.
+                        if authenticated
+                            && matches!(path.envelope, NetworkEnvelope::IceTcp { .. })
+                            && self.selected.is_none()
+                            && self.ice.accepts_tuple(source, destination, proto)
+                        {
+                            self.select_path(path)?;
+                        }
                     }
                     Err(_) => self.drop_input(),
                 }
@@ -740,18 +784,16 @@ impl Transport {
                     self.drop_input();
                     return Ok(());
                 }
-                match self.tcp_flows.iter().find(|(id, _, _)| *id == flow) {
-                    Some((_, bound_local, bound_remote))
-                        if *bound_local != local || *bound_remote != remote =>
-                    {
+                match self.tcp_flows.iter().find(|binding| binding.flow == flow) {
+                    Some(binding) if binding.local != local || binding.remote != remote => {
                         self.drop_input();
                         return Ok(());
                     }
-                    None if self.tcp_flows.len() >= MAX_TCP_FLOWS => {
+                    None => {
                         self.drop_input();
-                        return Ok(());
+                        return Err(TransportError::UnknownTcpFlow);
                     }
-                    Some(_) | None => {}
+                    Some(_) => {}
                 }
                 (
                     NetworkEnvelope::IceTcp {
@@ -814,8 +856,8 @@ impl Transport {
     }
 
     pub(crate) fn send_sctp(&mut self, packet: &[u8], now: Instant) -> Result<(), TransportError> {
-        if self.state != TransportState::Connected {
-            return Err(TransportError::InvalidInput);
+        if !self.can_send_user_data() {
+            return Err(TransportError::Protocol);
         }
         let dtls = self.dtls.as_mut().ok_or(TransportError::InvalidInput)?;
         dtls.send_application_data(packet, now)
@@ -829,6 +871,7 @@ impl Transport {
         }
         self.transmissions.clear();
         self.events.clear();
+        self.authenticated.clear();
         self.pending_dtls.clear();
         if let Some(dtls) = self.dtls.as_mut() {
             dtls.clear_pending();
@@ -850,6 +893,7 @@ impl Transport {
         self.next_deadline = None;
         self.transmissions.clear();
         self.events.clear();
+        self.authenticated.clear();
         self.pending_dtls.clear();
         self.dtls = None;
         self.srtp = None;
@@ -948,9 +992,11 @@ impl Transport {
                         continue;
                     };
                     self.select_path(path)?;
-                    self.state = TransportState::Connecting;
-                    self.push_event(TransportEvent::StateChanged(TransportState::Connecting))?;
-                    self.start_dtls(now, provider)?;
+                    if self.srtp.is_none() {
+                        self.state = TransportState::Connecting;
+                        self.push_event(TransportEvent::StateChanged(TransportState::Connecting))?;
+                        self.start_dtls(now, provider)?;
+                    }
                 }
                 ice::IceEvent::Restart => {
                     if self.dtls.is_some() {
@@ -1022,9 +1068,11 @@ impl Transport {
         let connected = dtls.connected();
         let next_deadline = dtls.next_deadline();
         let _ = dtls;
-        let path = self.selected.clone().ok_or(TransportError::Protocol)?;
-        for bytes in packets {
-            self.prepare_transmit(path.clone(), bytes, packet_kind, None)?;
+        // Records produced without a live path are discarded, never retargeted later.
+        if let Some(path) = self.selected.clone() {
+            for bytes in packets {
+                self.prepare_transmit(path.clone(), bytes, packet_kind, None)?;
+            }
         }
         for event in events {
             match event {
@@ -1168,12 +1216,10 @@ impl Transport {
             is::Protocol::Tcp => self
                 .tcp_flows
                 .iter()
-                .find(|(_, bound_local, bound_remote)| {
-                    *bound_local == local && *bound_remote == remote
-                })
-                .map(|(flow, _, _)| {
+                .find(|binding| binding.local == local && binding.remote == remote)
+                .map(|binding| {
                     SelectedPath::unselected(NetworkEnvelope::IceTcp {
-                        flow: *flow,
+                        flow: binding.flow,
                         local,
                         remote,
                     })
@@ -1201,12 +1247,12 @@ impl Transport {
                 flow,
                 local,
                 remote,
-            } => self
-                .tcp_flows
-                .iter()
-                .any(|(bound_flow, bound_local, bound_remote)| {
-                    *bound_flow == flow && *bound_local == local && *bound_remote == remote
-                }),
+            } => self.tcp_flows.iter().any(|binding| {
+                binding.authenticated
+                    && binding.flow == flow
+                    && binding.local == local
+                    && binding.remote == remote
+            }),
         }
     }
 
@@ -1262,30 +1308,94 @@ impl Transport {
                     flow,
                     local,
                     remote,
-                } => self
-                    .tcp_flows
-                    .iter()
-                    .any(|(bound_flow, bound_local, bound_remote)| {
-                        *bound_flow == flow && *bound_local == local && *bound_remote == remote
-                    }),
+                } => self.tcp_flows.iter().any(|binding| {
+                    binding.authenticated
+                        && binding.flow == flow
+                        && binding.local == local
+                        && binding.remote == remote
+                }),
             }
     }
 
-    fn bind_current_tcp_flow(&mut self, path: SelectedPath) {
-        let NetworkEnvelope::IceTcp {
+    fn observe_authenticated(&mut self, envelope: &NetworkEnvelope) {
+        let flow = match *envelope {
+            NetworkEnvelope::Udp { local, remote } => AuthenticatedFlow::Udp { local, remote },
+            NetworkEnvelope::IceTcp {
+                flow,
+                local,
+                remote,
+            } => AuthenticatedFlow::IceTcp {
+                flow,
+                local,
+                remote,
+            },
+        };
+        if self.authenticated.contains(&flow) {
+            return;
+        }
+        if self.authenticated.len() == MAX_AUTHENTICATED_OBSERVATIONS {
+            self.authenticated.pop_front();
+        }
+        self.authenticated.push_back(flow);
+    }
+
+    pub(crate) fn admit_tcp_flow(
+        &mut self,
+        flow: IceTcpFlowId,
+        local: SocketAddr,
+        remote: SocketAddr,
+    ) -> Result<(), TransportError> {
+        if matches!(self.state, TransportState::Closed | TransportState::Failed) {
+            return Err(TransportError::Closed);
+        }
+        if !self.local_candidates_contains(local, is::Protocol::Tcp) {
+            return Err(TransportError::InvalidInput);
+        }
+        if let Some(binding) = self.tcp_flows.iter().find(|binding| binding.flow == flow) {
+            return if (binding.local, binding.remote) == (local, remote) {
+                Ok(())
+            } else {
+                Err(TransportError::InvalidInput)
+            };
+        }
+        if self
+            .tcp_flows
+            .iter()
+            .any(|binding| (binding.local, binding.remote) == (local, remote))
+        {
+            return Err(TransportError::InvalidInput);
+        }
+        if self.tcp_flows.len() == MAX_TCP_FLOWS {
+            return Err(TransportError::QueueFull);
+        }
+        self.tcp_flows.push(TcpFlowBinding {
             flow,
             local,
             remote,
-        } = path.envelope
-        else {
-            return;
-        };
-        if self.tcp_flows.iter().any(|(id, _, _)| *id == flow) {
-            return;
+            authenticated: false,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn retire_tcp_flow(&mut self, flow: IceTcpFlowId) -> Result<(), TransportError> {
+        self.tcp_flows.retain(|binding| binding.flow != flow);
+        self.transmissions
+            .retain(|prepared| prepared.target != TransmitTarget::IceTcp { flow });
+        self.pending_dtls
+            .retain(|(path, _)| !path.envelope.is_tcp_flow(flow));
+        self.authenticated
+            .retain(|observation| !matches!(observation, AuthenticatedFlow::IceTcp { flow: id, .. } if *id == flow));
+        self.events.retain(|event| {
+            !matches!(event, TransportEvent::IceAuthenticated(AuthenticatedFlow::IceTcp { flow: id, .. }) if *id == flow)
+        });
+        if self
+            .selected
+            .as_ref()
+            .is_some_and(|path| path.envelope.is_tcp_flow(flow))
+        {
+            self.clear_selected_path()?;
         }
-        if self.tcp_flows.len() < MAX_TCP_FLOWS {
-            self.tcp_flows.push((flow, local, remote));
-        }
+        Ok(())
     }
 
     fn drop_input(&mut self) {
@@ -1307,6 +1417,7 @@ impl Transport {
         self.next_deadline = None;
         self.transmissions.clear();
         self.events.clear();
+        self.authenticated.clear();
         self.pending_dtls.clear();
         self.dtls = None;
         self.srtp = None;
@@ -1488,6 +1599,63 @@ mod tests {
     }
 
     #[test]
+    fn authenticated_observations_coalesce_and_shed_without_consuming_protocol_capacity() {
+        use is::Sha1HmacProvider;
+        let now = Instant::now();
+        let local = address(5000);
+        let peer = certificate();
+        let mut transport = Transport::new(
+            config(local, address(5001), certificate(), &peer, false),
+            now,
+        )
+        .expect("transport");
+        let message = is::stun::StunMessage::binding_request(
+            "right:left",
+            is::stun::TransId::new(),
+            true,
+            2,
+            1000,
+            false,
+        );
+        let mut packet = [0; 512];
+        let length = message
+            .to_bytes(
+                Some(b"rightpasswordabcdefghijklmnop"),
+                &mut packet,
+                |key, payloads| is::DefaultSha1HmacProvider.sha1_hmac(key, payloads),
+            )
+            .expect("request");
+        for port in 5100..5180 {
+            for _ in 0..2 {
+                transport
+                    .handle_datagram(now, address(port), local, packet[..length].to_vec())
+                    .expect("authenticated STUN");
+                while transport.poll_prepared().is_some() {}
+            }
+        }
+        let mut observed = Vec::new();
+        while let Some(event) = transport.poll_event() {
+            if let TransportEvent::IceAuthenticated(flow) = event {
+                observed.push(flow);
+            }
+        }
+        let expected = (5116..5180)
+            .map(|port| AuthenticatedFlow::Udp {
+                local,
+                remote: address(port),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(observed, expected);
+        assert_ne!(transport.state(), TransportState::Failed);
+
+        transport
+            .handle_datagram(now, address(5180), local, packet[..length].to_vec())
+            .expect("next STUN");
+        transport.abort();
+        assert!(transport.poll_event().is_none());
+    }
+
+    #[test]
     fn classification_is_unambiguous() {
         assert_eq!(
             Transport::classify(&[0, 1, 0, 0, 0x21, 0x12, 0xa4, 0x42]),
@@ -1578,6 +1746,9 @@ mod tests {
         );
         assert_eq!(validate_rfc4571(&[0, 0]), Err(TransportError::InvalidInput));
         transport
+            .admit_tcp_flow(IceTcpFlowId::from_value(7), local, remote)
+            .expect("admit accepted stream");
+        transport
             .receive(
                 now,
                 NetworkInput::IceTcp {
@@ -1599,7 +1770,7 @@ mod tests {
                 },
             )
             .expect("rebound flow is dropped");
-        assert!(transport.tcp_flows.is_empty());
+        assert_eq!(transport.tcp_flows.len(), 1);
         assert!(transport.dropped_inputs >= 2);
     }
 
@@ -1665,6 +1836,95 @@ mod tests {
         assert_eq!(prepared.wire_len, prepared.bytes.len());
         assert_eq!(prepared.path_epoch, None);
         assert_eq!(prepared.rtp, None);
+    }
+
+    #[test]
+    fn retirement_cancels_all_flow_records_and_publishes_path_loss_first() {
+        let local = address(6240);
+        let remote = address(6241);
+        let mut cfg = config(local, remote, certificate(), &certificate(), true);
+        cfg.local_candidates = vec![
+            Candidate::builder()
+                .tcp()
+                .host(local)
+                .tcptype(str0m::net::TcpType::Passive)
+                .build()
+                .expect("passive candidate"),
+        ]
+        .into_boxed_slice();
+        let mut transport = Transport::new(cfg, Instant::now()).expect("transport");
+        let flow = IceTcpFlowId::from_value(1);
+        let other = IceTcpFlowId::from_value(2);
+        let other_remote = address(6242);
+        transport
+            .admit_tcp_flow(flow, local, remote)
+            .expect("first stream");
+        transport
+            .admit_tcp_flow(other, local, other_remote)
+            .expect("other stream");
+        transport.events.clear();
+        transport.transmissions.clear();
+        let envelope = NetworkEnvelope::IceTcp {
+            flow,
+            local,
+            remote,
+        };
+        transport
+            .select_path(SelectedPath::unselected(envelope.clone()))
+            .expect("select");
+        let path = transport.selected.clone().expect("selected");
+        for kind in [
+            DatagramKind::Stun,
+            DatagramKind::Dtls,
+            DatagramKind::Rtcp,
+            DatagramKind::Sctp,
+            DatagramKind::Rtp,
+        ] {
+            let rtp = (kind == DatagramKind::Rtp).then_some(PreparedRtpIdentity {
+                ssrc: 7,
+                sequence: 9,
+                twcc_sequence: None,
+                service: RtpService::Original,
+            });
+            transport
+                .prepare_transmit(path.clone(), vec![1, 2, 3], kind, rtp)
+                .expect("queue flow record");
+        }
+        transport.pending_dtls.push_back((path, vec![0x16, 0, 0]));
+        transport.observe_authenticated(&envelope);
+        transport
+            .prepare_transmit(
+                SelectedPath::unselected(NetworkEnvelope::IceTcp {
+                    flow: other,
+                    local,
+                    remote: other_remote,
+                }),
+                vec![1],
+                DatagramKind::Stun,
+                None,
+            )
+            .expect("unrelated reply");
+
+        transport.retire_tcp_flow(flow).expect("retire selected");
+        assert!(transport.selected.is_none());
+        assert!(!transport.can_send_user_data());
+        assert!(transport.pending_dtls.is_empty());
+        assert_eq!(transport.tcp_flows.len(), 1);
+        assert!(
+            matches!(transport.poll_event(), Some(TransportEvent::SelectedPathChanged {
+            previous: Some(previous), current: None, epoch: PathEpoch(2),
+        }) if previous == envelope)
+        );
+        assert!(
+            transport.poll_event().is_none(),
+            "retired authentication is removed"
+        );
+        let remaining = transport.poll_prepared().expect("unrelated reply survives");
+        assert_eq!(remaining.target, TransmitTarget::IceTcp { flow: other });
+        assert!(
+            transport.poll_prepared().is_none(),
+            "all retired records were discarded"
+        );
     }
 
     #[test]
@@ -1841,9 +2101,17 @@ mod tests {
             Instant::now(),
         )
         .expect("transport");
-        transport.tcp_flows = (0..MAX_TCP_FLOWS)
-            .map(|value| (IceTcpFlowId::from_value(value as u64), local, remote))
-            .collect();
+        for value in 0..MAX_TCP_FLOWS {
+            let mut remote = remote;
+            remote.set_port(7_000 + u16::try_from(value).expect("bounded flow count"));
+            transport
+                .admit_tcp_flow(IceTcpFlowId::from_value(value as u64), local, remote)
+                .expect("bounded admission");
+        }
+        assert_eq!(
+            transport.admit_tcp_flow(IceTcpFlowId::from_value(999), local, remote),
+            Err(TransportError::QueueFull)
+        );
         transport.dropped_inputs = 0;
         transport
             .receive(
@@ -1855,9 +2123,17 @@ mod tests {
                     frame: bytes::Bytes::from_static(&[0, 1, 0]),
                 },
             )
-            .expect("bounded drop");
+            .expect_err("unknown flow input is rejected");
         assert_eq!(transport.tcp_flows.len(), MAX_TCP_FLOWS);
         assert_eq!(transport.dropped_inputs, 1);
+        transport
+            .retire_tcp_flow(IceTcpFlowId::from_value(0))
+            .expect("retire first flow");
+        assert_eq!(transport.tcp_flows.len(), MAX_TCP_FLOWS - 1);
+        transport
+            .admit_tcp_flow(IceTcpFlowId::from_value(999), local, remote)
+            .expect("retirement reclaims capacity");
+        assert_eq!(transport.tcp_flows.len(), MAX_TCP_FLOWS);
     }
 
     #[test]

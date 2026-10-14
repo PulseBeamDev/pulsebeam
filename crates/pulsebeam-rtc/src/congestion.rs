@@ -10,7 +10,7 @@ use std::time::Duration;
 
 mod screamv2;
 
-pub(crate) use screamv2::{EcnMark, FeedbackSample};
+pub(crate) use screamv2::{EcnMark, FeedbackSample, LossOrigin};
 
 const ONE: u64 = 65_536;
 const TARGET_BITRATE_MAX: u64 = 100_000_000;
@@ -58,6 +58,8 @@ pub(crate) struct ControllerInput<'a> {
     pub(crate) offered_media_rate: u64,
     pub(crate) admitted_media_rate: u64,
     pub(crate) governed_allocation_rate: u64,
+    /// Potential source service exceeds allocation, including upgrades on active senders.
+    pub(crate) has_unallocated_demand: bool,
     pub(crate) desired_media_rate: u64,
     pub(crate) window_or_pacer_blocked: bool,
     pub(crate) ecn: EcnValidation,
@@ -119,11 +121,10 @@ pub(crate) struct SafeRtpEnvelope {
 /// horizon, repair, and probing outside SCReAMv2.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct SenderOperatingPoint {
-    pub(crate) allocation_utilization: u64,
     pub(crate) pacer_horizon: Duration,
     pub(crate) rtx_extra_allowance: Duration,
     pub(crate) probe_queue_impact: Duration,
-    pub(crate) governed_demand: u64,
+    pub(crate) probe_budget_rate: u64,
 }
 
 pub(crate) struct LatencyGovernor;
@@ -131,7 +132,7 @@ pub(crate) struct LatencyGovernor;
 impl LatencyGovernor {
     pub(crate) fn operating_point(
         playout_max_ticks: u16,
-        desired_media_rate: u64,
+        potential_media_rate: u64,
     ) -> SenderOperatingPoint {
         let urgent_playout_knee = Duration::from_millis(75);
         let quality_playout_saturation = Duration::from_millis(500);
@@ -144,9 +145,8 @@ impl LatencyGovernor {
             ))
         };
         let denominator = micros(quality_playout_saturation.saturating_sub(urgent_playout_knee));
-        let allocation_utilization = lerp_even(52_429, 62_259, numerator, denominator);
+        let probe_size_scale = lerp_even(52_429, 62_259, numerator, denominator);
         SenderOperatingPoint {
-            allocation_utilization,
             pacer_horizon: lerp_duration_even(
                 Duration::from_millis(15),
                 Duration::from_millis(80),
@@ -165,7 +165,7 @@ impl LatencyGovernor {
                 numerator,
                 denominator,
             ),
-            governed_demand: mul_fixed(desired_media_rate, allocation_utilization),
+            probe_budget_rate: mul_fixed(potential_media_rate, probe_size_scale),
         }
     }
 }
@@ -208,6 +208,15 @@ impl ScreamController {
 
     pub(crate) fn note_send(&mut self, at: Duration) {
         self.first_send.get_or_insert(at);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_flight_peak(&self) -> u64 {
+        self.core.test_flight_peak()
+    }
+
+    pub(crate) fn observe_bytes_in_flight(&mut self, bytes: u64) {
+        self.core.observe_bytes_in_flight(bytes);
     }
 
     pub(crate) fn update(&mut self, now: Duration, input: ControllerInput<'_>) -> SafeRtpEnvelope {
@@ -271,6 +280,7 @@ impl ScreamController {
             governed_allocation_rate: 0,
             desired_media_rate: desired,
             window_or_pacer_blocked: false,
+            has_unallocated_demand: false,
             ecn: EcnValidation::default(),
         };
         self.envelope(output, &input, self.last_reason)
@@ -309,16 +319,30 @@ impl ScreamController {
         }
     }
 
-    fn update_staleness(&mut self, now: Duration) {
+    pub(crate) fn next_deadline(&self) -> Option<Duration> {
+        (!self.feedback_stale)
+            .then(|| self.feedback_expiry())
+            .flatten()
+    }
+
+    fn feedback_expiry(&self) -> Option<Duration> {
+        if !self.path_available || self.first_send.is_none() {
+            return None;
+        }
         let output = self.core.snapshot(TARGET_BITRATE_MAX);
         let threshold = output
             .smoothed_rtt
             .saturating_mul(3)
             .clamp(Duration::from_millis(500), Duration::from_secs(2));
-        let reference = self.last_feedback.or(self.first_send);
-        self.feedback_stale = self.path_available
-            && reference.is_some_and(|at| now.saturating_sub(at) >= threshold)
-            && self.first_send.is_some();
+        self.last_feedback
+            .or(self.first_send)?
+            .checked_add(threshold)
+    }
+
+    fn update_staleness(&mut self, now: Duration) {
+        self.feedback_stale = self
+            .feedback_expiry()
+            .is_some_and(|deadline| now >= deadline);
     }
 
     fn update_confidence(&mut self, now: Duration, has_feedback: bool) {
@@ -349,6 +373,10 @@ impl ScreamController {
                 .desired_media_rate
                 .saturating_sub(output.target_bitrate)
                 >= 50_000;
+        // A lower selected layer or paused source cannot generate the feedback
+        // needed to cross a small upgrade shortfall on its own.
+        let source_interest = (input.has_unallocated_demand || input.governed_allocation_rate == 0)
+            && input.desired_media_rate > output.target_bitrate;
         SafeRtpEnvelope {
             target_media_payload_rate: output.target_bitrate,
             max_rtp_bytes_in_flight: output.max_bytes_in_flight,
@@ -367,7 +395,8 @@ impl ScreamController {
             l4s_enabled: output.l4s_enabled,
             probe_permitted: self.path_available
                 && !self.feedback_stale
-                && unmet
+                && (unmet || source_interest)
+                && output.queue_delay <= output.queue_delay_target
                 && input
                     .bytes_in_flight
                     .saturating_add(input.paced_queue_bytes)
@@ -422,6 +451,77 @@ mod tests {
     use super::*;
 
     #[test]
+    fn paused_interest_can_probe_below_the_ordinary_growth_trigger() {
+        let mut cc = ScreamController::new(0, None);
+        let mut input = ControllerInput {
+            path_epoch: Some(1),
+            path_available: true,
+            feedback: &[],
+            feedback_hold: Duration::ZERO,
+            fresh_network_feedback: false,
+            bytes_in_flight: 0,
+            paced_queue_bytes: 0,
+            offered_media_rate: 0,
+            admitted_media_rate: 0,
+            governed_allocation_rate: 0,
+            desired_media_rate: 0,
+            window_or_pacer_blocked: false,
+            has_unallocated_demand: false,
+            ecn: EcnValidation::default(),
+        };
+        let idle = cc.update(Duration::ZERO, input);
+        assert!(!idle.probe_permitted);
+        input.desired_media_rate = 166_667;
+        let paused = cc.update(Duration::from_millis(100), input);
+        assert!(paused.target_media_payload_rate < input.desired_media_rate);
+        assert!(input.desired_media_rate - paused.target_media_payload_rate < 50_000);
+        assert!(paused.probe_permitted);
+        assert_eq!(paused.reference_window, idle.reference_window);
+
+        let mut output = cc.core.snapshot(input.desired_media_rate);
+        output.queue_delay = output.queue_delay_target + Duration::from_micros(1);
+        assert!(
+            !cc.envelope(output, &input, ControllerReason::Delay)
+                .probe_permitted
+        );
+        output.queue_delay = Duration::ZERO;
+        assert!(
+            cc.envelope(output, &input, ControllerReason::Feedback)
+                .probe_permitted
+        );
+        cc.feedback_stale = true;
+        assert!(
+            !cc.envelope(output, &input, ControllerReason::Feedback)
+                .probe_permitted
+        );
+        cc.feedback_stale = false;
+        input.bytes_in_flight = output.max_bytes_in_flight;
+        assert!(
+            !cc.envelope(output, &input, ControllerReason::Feedback)
+                .probe_permitted
+        );
+        input.bytes_in_flight = 0;
+
+        input.governed_allocation_rate = 150_000;
+        assert!(!cc.update(Duration::from_millis(200), input).probe_permitted);
+        input.has_unallocated_demand = true;
+        assert!(cc.update(Duration::from_millis(200), input).probe_permitted);
+        let desired = input.desired_media_rate;
+        input.desired_media_rate = output.target_bitrate;
+        assert!(
+            !cc.envelope(output, &input, ControllerReason::Feedback)
+                .probe_permitted
+        );
+        input.desired_media_rate = desired;
+        input.governed_allocation_rate = 0;
+        input.path_available = false;
+        assert!(!cc.update(Duration::from_millis(300), input).probe_permitted);
+        input.path_available = true;
+        input.desired_media_rate = 0;
+        assert!(!cc.update(Duration::from_millis(400), input).probe_permitted);
+    }
+
+    #[test]
     fn synthetic_loss_does_not_refresh_feedback_freshness() {
         let mut cc = ScreamController::new(2_000_000, None);
         let base = ControllerInput {
@@ -437,12 +537,16 @@ mod tests {
             governed_allocation_rate: 2_000_000,
             desired_media_rate: 2_000_000,
             window_or_pacer_blocked: false,
+            has_unallocated_demand: false,
             ecn: EcnValidation::default(),
         };
         cc.update(Duration::ZERO, base);
+        assert_eq!(cc.next_deadline(), None);
         cc.note_send(Duration::ZERO);
+        assert_eq!(cc.next_deadline(), Some(Duration::from_millis(500)));
         cc.update(Duration::from_millis(600), base);
         assert!(cc.feedback_stale);
+        assert_eq!(cc.next_deadline(), None);
         let loss = [FeedbackSample {
             sent_at: Duration::ZERO,
             received_at: Duration::from_millis(600),
@@ -450,6 +554,7 @@ mod tests {
             received: false,
             newly_acked: false,
             lost: true,
+            loss_origin: Some(crate::congestion::LossOrigin::Reordering),
             receiver_arrival_micros: None,
             ecn: None,
         }];
@@ -481,6 +586,7 @@ mod tests {
             governed_allocation_rate: 4_000_000,
             desired_media_rate: 4_000_000,
             window_or_pacer_blocked: false,
+            has_unallocated_demand: false,
             ecn: EcnValidation::default(),
         };
         cc.update(Duration::ZERO, base);
@@ -514,6 +620,7 @@ mod tests {
             governed_allocation_rate: 4_000_000,
             desired_media_rate: 4_000_000,
             window_or_pacer_blocked: false,
+            has_unallocated_demand: false,
             ecn: EcnValidation::default(),
         };
         cc.update(Duration::ZERO, base);
@@ -527,6 +634,7 @@ mod tests {
             received: true,
             newly_acked: true,
             lost: false,
+            loss_origin: None,
             receiver_arrival_micros: None,
             ecn: None,
         }];
@@ -568,6 +676,7 @@ mod tests {
             governed_allocation_rate: 4_000_000,
             desired_media_rate: 4_000_000,
             window_or_pacer_blocked: false,
+            has_unallocated_demand: false,
             ecn: EcnValidation::default(),
         };
         cc.update(Duration::ZERO, base);
@@ -582,6 +691,7 @@ mod tests {
             received: true,
             newly_acked: true,
             lost: false,
+            loss_origin: None,
             receiver_arrival_micros: None,
             ecn: None,
         }];
@@ -614,6 +724,7 @@ mod tests {
             governed_allocation_rate: 2_000_000,
             desired_media_rate: 2_000_000,
             window_or_pacer_blocked: false,
+            has_unallocated_demand: false,
             ecn: EcnValidation::default(),
         };
         cc.update(Duration::ZERO, input);
@@ -639,6 +750,7 @@ mod tests {
             governed_allocation_rate: 2_000_000,
             desired_media_rate: 2_000_000,
             window_or_pacer_blocked: false,
+            has_unallocated_demand: false,
             ecn: EcnValidation::default(),
         };
         cc.update(Duration::ZERO, input);
@@ -661,7 +773,7 @@ mod tests {
     fn latency_governor_remains_outer_policy_only() {
         let urgent = LatencyGovernor::operating_point(0, 1_000_000);
         let quality = LatencyGovernor::operating_point(50, 1_000_000);
-        assert!(quality.allocation_utilization >= urgent.allocation_utilization);
+        assert!(quality.probe_budget_rate >= urgent.probe_budget_rate);
         assert!(quality.pacer_horizon >= urgent.pacer_horizon);
     }
 }

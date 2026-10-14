@@ -43,6 +43,7 @@ impl IceLayer {
         );
         let mut agent = IceAgent::new(local_credentials);
         agent.set_controlling(controlling);
+        agent.set_ice_lite(!controlling);
         agent.set_control_tie_breaker(control_tie_breaker);
         agent.set_max_candidate_pairs(max_candidate_pairs);
         for candidate in local_candidates {
@@ -67,8 +68,9 @@ impl IceLayer {
         destination: SocketAddr,
         proto: is::Protocol,
         bytes: &[u8],
-    ) -> Result<(), IceError> {
+    ) -> Result<bool, IceError> {
         let message = is::stun::StunMessage::parse(bytes).map_err(|_| IceError::InvalidPacket)?;
+        let binding_request = message.is_binding_request();
         let packet = is::stun::StunPacket {
             proto,
             source,
@@ -78,8 +80,15 @@ impl IceLayer {
         if !self.agent.handle_packet(now, packet) {
             return Err(IceError::InvalidPacket);
         }
-        self.validated = Some((proto, destination, source));
-        Ok(())
+        // The pinned ICE agent authenticates response transactions, but does
+        // not validate their source tuple. Only requests prove this tuple.
+        if binding_request {
+            self.validated = Some((proto, destination, source));
+        }
+        // The pinned agent evaluates receive-driven nomination only on timeout;
+        // once its reply is drained, poll_timeout can defer that work for 3 seconds.
+        self.agent.handle_timeout(now);
+        Ok(binding_request)
     }
 
     pub(crate) fn handle_timeout(&mut self, now: Instant) -> Result<(), IceError> {
@@ -172,5 +181,143 @@ impl IceLayer {
             .ok()
             .filter(|responses| *responses != 0)
             .and_then(|responses| total.checked_div(responses))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use is::Sha1HmacProvider;
+    use std::time::Duration;
+
+    #[test]
+    fn controlled_lite_agent_only_answers_authenticated_nominated_checks() {
+        let local = "192.0.2.1:5000".parse().expect("local");
+        let remote = "192.0.2.2:5001".parse().expect("remote");
+        let mut ice = IceLayer::new(
+            IceCreds {
+                ufrag: "local".into(),
+                pass: "localpasswordlongenough22".into(),
+            },
+            &[Candidate::host(local, is::Protocol::Udp).expect("local candidate")],
+            IceCreds {
+                ufrag: "remote".into(),
+                pass: "remotepasswordlongenough22".into(),
+            },
+            &[Candidate::host(remote, is::Protocol::Udp).expect("remote candidate")],
+            false,
+            128,
+            1,
+        );
+        let now = Instant::now();
+        for step in 0..20 {
+            ice.handle_timeout(now + Duration::from_millis(step * 50))
+                .expect("timeout");
+            assert!(ice.poll_transmit().is_none(), "ICE-lite initiated a check");
+        }
+        let request = is::stun::StunMessage::binding_request(
+            "local:remote",
+            is::stun::TransId::new(),
+            true,
+            2,
+            1_000,
+            true,
+        );
+        let mut bytes = [0; 512];
+        let length = request
+            .to_bytes(
+                Some(b"localpasswordlongenough22"),
+                &mut bytes,
+                |key, payloads| is::DefaultSha1HmacProvider.sha1_hmac(key, payloads),
+            )
+            .expect("signed nominated request");
+        assert_eq!(
+            ice.handle_packet(
+                now + Duration::from_secs(1),
+                remote,
+                local,
+                is::Protocol::Udp,
+                &bytes[..length]
+            ),
+            Ok(true)
+        );
+        assert!(ice.can_queue_tuple(remote, local, is::Protocol::Udp));
+        let (_, source, destination, reply) = ice.poll_transmit().expect("binding reply");
+        assert_eq!((source, destination), (local, remote));
+        assert!(
+            !is::stun::StunMessage::parse(&reply)
+                .expect("reply")
+                .is_binding_request()
+        );
+        let mut nominated = false;
+        while let Some(event) = ice.poll_event() {
+            nominated |= matches!(event, IceEvent::Nominated { .. });
+        }
+        assert!(nominated);
+        assert!(ice.accepts_tuple(remote, local, is::Protocol::Udp));
+        ice.handle_timeout(now + Duration::from_secs(2))
+            .expect("timeout");
+        assert!(
+            ice.poll_transmit().is_none(),
+            "ICE-lite initiated a check after nomination"
+        );
+    }
+
+    #[test]
+    fn authenticated_response_transaction_does_not_validate_its_source_tuple() {
+        let local = "192.0.2.1:5000".parse().expect("local");
+        let remote = "192.0.2.2:5001".parse().expect("remote");
+        let other = "192.0.2.3:5002".parse().expect("unrelated tuple");
+        let mut ice = IceLayer::new(
+            IceCreds {
+                ufrag: "local".into(),
+                pass: "localpasswordlongenough22".into(),
+            },
+            &[Candidate::host(local, is::Protocol::Udp).expect("local candidate")],
+            IceCreds {
+                ufrag: "remote".into(),
+                pass: "remotepasswordlongenough22".into(),
+            },
+            &[Candidate::host(remote, is::Protocol::Udp).expect("remote candidate")],
+            true,
+            128,
+            2,
+        );
+        let now = Instant::now();
+        let mut transmit = None;
+        for step in 0..20 {
+            ice.handle_timeout(now + Duration::from_millis(step * 50))
+                .expect("timeout");
+            transmit = ice.poll_transmit();
+            if transmit.is_some() {
+                break;
+            }
+        }
+        let (_, _, _, request) = transmit.expect("binding request");
+        let transaction = is::stun::StunMessage::parse(&request)
+            .expect("request")
+            .trans_id();
+        let response = is::stun::StunMessage::binding_reply(transaction, local);
+        let mut bytes = [0; 512];
+        let length = response
+            .to_bytes(
+                Some(b"remotepasswordlongenough22"),
+                &mut bytes,
+                |key, payloads| is::DefaultSha1HmacProvider.sha1_hmac(key, payloads),
+            )
+            .expect("signed response");
+        // A matching response is accepted by the pinned agent even when its
+        // source differs from the transaction's candidate pair.
+        assert_eq!(
+            ice.handle_packet(
+                now + Duration::from_secs(1),
+                other,
+                local,
+                is::Protocol::Udp,
+                &bytes[..length]
+            ),
+            Ok(false)
+        );
+        assert!(!ice.can_queue_tuple(other, local, is::Protocol::Udp));
     }
 }

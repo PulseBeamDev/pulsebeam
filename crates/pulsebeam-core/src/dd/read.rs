@@ -75,6 +75,13 @@ impl DependencyDescriptorReader {
     }
 
     pub fn read(&mut self, buf: &[u8]) -> Result<DependencyDescriptor, DdReadError> {
+        let descriptor = self.parse(buf)?;
+        self.commit(&descriptor);
+        Ok(descriptor)
+    }
+
+    /// Parses against the current context without advancing it.
+    pub fn parse(&self, buf: &[u8]) -> Result<DependencyDescriptor, DdReadError> {
         if buf.len() > MAX_DD_LEN {
             return Err(DdReadError::TooLong(buf.len()));
         }
@@ -121,14 +128,6 @@ impl DependencyDescriptorReader {
             return Err(DdReadError::TrailingBytes(trailing));
         }
 
-        if let Some(s) = attached.as_deref() {
-            self.active_decode_targets = s.all_decode_targets_bitmask();
-            self.structure = Some(Box::new(s.clone()));
-        }
-        if let Some(mask) = active_decode_targets {
-            self.active_decode_targets = mask;
-        }
-
         Ok(DependencyDescriptor {
             start_of_frame: mandatory.start_of_frame,
             end_of_frame: mandatory.end_of_frame,
@@ -140,6 +139,17 @@ impl DependencyDescriptorReader {
             frame_dependencies,
             resolution,
         })
+    }
+
+    /// Advances context after a successfully parsed descriptor is accepted.
+    pub fn commit(&mut self, descriptor: &DependencyDescriptor) {
+        if let Some(structure) = descriptor.attached_structure.as_deref() {
+            self.active_decode_targets = structure.all_decode_targets_bitmask();
+            self.structure = Some(Box::new(structure.clone()));
+        }
+        if let Some(mask) = descriptor.active_decode_targets {
+            self.active_decode_targets = mask;
+        }
     }
 }
 

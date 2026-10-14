@@ -5,7 +5,7 @@
 )]
 
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
     time::{Duration, Instant},
 };
 
@@ -49,6 +49,7 @@ pub(crate) struct ClockMapper {
     synchronized: bool,
     discontinuous: bool,
     collapsed_segments: u64,
+    mapped_timestamps: BTreeMap<i64, GlobalMediaTime>,
 }
 
 impl ClockMapper {
@@ -69,6 +70,7 @@ impl ClockMapper {
             synchronized: false,
             discontinuous: false,
             collapsed_segments: 0,
+            mapped_timestamps: BTreeMap::new(),
         }
     }
 
@@ -93,7 +95,18 @@ impl ClockMapper {
             self.frontier_rtp = rtp;
         }
         let warning = self.stale_if_needed(now);
-        self.map_unwrapped(rtp).map(|time| (time, warning))
+        // SR refinements must not change a frame's time between fragments.
+        let time = if let Some(time) = self.mapped_timestamps.get(&rtp) {
+            *time
+        } else {
+            let time = self.map_unwrapped(rtp)?;
+            self.mapped_timestamps.insert(rtp, time);
+            while self.mapped_timestamps.len() > REORDER_WINDOW as usize + 1 {
+                self.mapped_timestamps.pop_first();
+            }
+            time
+        };
+        Some((time, warning))
     }
 
     pub(crate) fn relation_at(&self, rtp: u32, ntp: i128) -> Option<i128> {
@@ -251,6 +264,44 @@ mod tests {
         );
         assert_eq!(mapper.map(10, 90_000, now).unwrap().0.as_micros(), 1_000);
         assert!(mapper.map(10_u16.wrapping_sub(2_049), 0, now).is_none());
+    }
+
+    #[test]
+    fn sender_report_corrections_preserve_fragment_time() {
+        let now = Instant::now();
+        let mut mapper = mapper();
+        let first = mapper.map(11, 180_000, now).unwrap().0;
+        let _ = mapper.observe_sender_report(
+            180_000,
+            i128::from(first.as_micros()) + 50_000,
+            now,
+            Some(Duration::ZERO),
+            0,
+        );
+        assert_eq!(mapper.map(12, 180_000, now).unwrap().0, first);
+        assert!(mapper.map(13, 270_000, now).unwrap().0 > first);
+        let _ = mapper.observe_sender_report(
+            270_000,
+            i128::from(first.as_micros()) + 2_000_000,
+            now,
+            Some(Duration::ZERO),
+            0,
+        );
+        assert_eq!(mapper.map(10, 180_000, now).unwrap().0, first);
+    }
+
+    #[test]
+    fn timestamp_cache_is_bounded_by_the_packet_reorder_window() {
+        let now = Instant::now();
+        let mut mapper = mapper();
+        for sequence in 11..4_000_u16 {
+            assert!(
+                mapper
+                    .map(sequence, 90_000 + u32::from(sequence - 10) * 3_000, now)
+                    .is_some()
+            );
+        }
+        assert_eq!(mapper.mapped_timestamps.len(), REORDER_WINDOW as usize + 1);
     }
 
     #[test]

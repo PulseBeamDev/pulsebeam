@@ -13,9 +13,10 @@ The words **MUST**, **MUST NOT**, **SHOULD**, and **MAY** are normative.
 
 ## Normative hierarchy and pinned algorithm
 
-The network-control core is a direct implementation of
+The network-control core uses the window, queue-delay, target-rate, pacing, and
+ACK-growth equations of
 [`draft-ietf-ccwg-rfc8298bis-screamv2-01`](https://datatracker.ietf.org/doc/html/draft-ietf-ccwg-rfc8298bis-screamv2-01),
-pinned to revision `01`. The source artifact used by the implementation review
+pinned to revision `01`, with the explicit loss-qualification deviation below. The source artifact used by the implementation review
 has SHA-256:
 
 ```text
@@ -58,11 +59,17 @@ PulseBeam intentionally adds or changes only these behaviors:
    stable outbound senders. The pinned draft does not define this SFU layer.
 4. A deadline-aware transport scheduler combines per-sender service, frame
    usefulness, RTX, protocol control, DataChannels, and padding.
-5. A bounded probe manager uses ordinary padding on a negotiated media or RTX
-   SSRC; it never creates an SSRC-zero source.
-6. SCTP retains its own congestion controller. Its acknowledged/admitted transport
-   load is coordinated once with media capacity and top-level scheduling, but
-   SCTP packets never become SCReAM-acknowledged data units.
+5. A bounded probe manager first discovers each negotiated primary stream using
+   ordinary primary-SSRC padding with MID. Only authenticated sent-history receipt
+   of that stream permits switching padding to its negotiated RTX SSRC; loss,
+   missing feedback and other streams' receipts do not prime it. Without RTX it
+   retains primary padding. It never creates an SSRC-zero source. RTX padding
+   advances only the RTX sequence space and never signals or
+   confirms primary-media playout. It carries MID and TWCC but no RTX OSN or media
+   payload, keeping probe loss separate from primary-media contiguity.
+6. SCTP retains its own congestion controller and bounded queues. The top-level
+   scheduler coordinates eligible RTP/SCTP output without inventing a combined
+   delivered-rate estimate. SCTP packets never become SCReAM-acknowledged data units.
 7. Public allocation and demand are expressed in RTP media-payload bits per
    second, while in-flight and pacing accounting use emitted transport bytes.
 
@@ -85,7 +92,7 @@ being hidden as tuning.
 | Sent timestamp | `Output::Transmit` commit time | Caller departure receipts; NIC/kernel timestamp feedback | Keeps public API small; controller uses the last time observable inside the sans-I/O engine and conservatively treats later caller failure as loss. |
 | Latency input | `global_media_at` + receiver playout policy derive private usefulness | Treat raw playout max as network queue target; trust Absolute Capture Time | Global server time is comparable across nodes; playout intent should affect usefulness/headroom, not create bufferbloat or rely on endpoint clocks. |
 | Latency curve | Saturating private operating-point curve | Linear mapping of full playout range to queue/recovery; expose expert knobs | Large playout budgets must stop relaxing network behavior; fixed policy keeps API semantic and testable. |
-| Multi-sender allocation | Weighted max-min over governed media-payload demand | Strict priority; equal split; per-sender cwnd | Gives proportional fairness without starvation or reservations while keeping source/layer selection in the SFU. |
+| Multi-sender allocation | Weighted max-min over selected media-payload demand | Strict priority; equal split; per-sender cwnd | Gives proportional fairness without starvation or reservations while keeping source/layer selection in the SFU. |
 | Rate units | SFU-facing allocations use media payload; pacer/BIF use transport bytes | One generic bitrate/byte unit | Keeps allocations directly comparable to codec/layer rates while congestion accounting includes observable transport overhead. |
 | SCTP | Keep SCTP congestion control; reserve/coordinate its service outside SCReAM | Count SCTP as SCReAM BIF; feed SACK into a new coupled controller | TWCC/RFC 8888 does not acknowledge SCTP. V1 avoids inventing a second research-grade coupled controller. |
 | Probing | RTP padding on negotiated media/RTX SSRC | Synthetic SSRC zero; no active probing | Matches normal RTP sender identity and enables pre-media/application-limited capacity observations without a special source. |
@@ -142,7 +149,7 @@ packet feedback ------> self-contained SCReAM v2 core ----------> safe RTP envel
                               |                                         |
                               +----------------+------------------------+
                                                v
-                                   media-capacity accounting
+                                   RTP payload selection budget
                                                |
                               desired rates + priority weights
                                                v
@@ -207,7 +214,7 @@ RTP packet. It excludes the RTP header, RTP header extensions, SRTP tag, RTX
 header, padding, RTCP, SCTP, DTLS, ICE, RFC 4571 framing, and outer network
 headers.
 
-`SenderPolicy.desired_bitrate`, governed sender demand, sender allocation,
+`SenderPolicy.desired_bitrate`, selected sender demand, sender allocation,
 allocation events, and SFU-facing admitted/transmitted media rates use
 `MediaPayloadRate`.
 
@@ -389,7 +396,11 @@ or mutate it.
 The connection's adapter receives committed RTP identities, transport sizes,
 packet classes, normalized feedback, selected-path state, current RTP bytes in
 flight, paced queue state, offered/admitted media rates, and aggregate desired
-rate. It derives feedback freshness, report timing, confidence, application-
+rate. Aggregate potential sender demand, not only currently selected media,
+sets the draft's application maximum target bitrate. Selected demand still caps
+weighted media allocation and body-media admission. Potential below selected is
+invalid; potential is source/layer interest, not physical capacity or a reservation.
+The adapter derives feedback freshness, report timing, confidence, application-
 limited state, and the draft's application maximum target bitrate outside the
 core.
 
@@ -425,10 +436,65 @@ is implemented exactly. No PulseBeam layer can bypass those rules.
 
 The reference window grows only on eligible fresh feedback with accumulated
 highest-received ACK-edge credit, including one-time credit for covered gaps,
-and falls on the draft's queue or confirmed congestion-loss signals. Production
-ECN remains disabled. Random isolated wireless loss is
+and falls on the draft's queue signals or qualified confirmed congestion-loss
+signals. Congestion reduction precedes the independent once-per-smoothed-RTT increase; eligible fresh
+feedback can fund growth even when congestion is pending or reduction occurs on
+that update. Timer-only updates can apply pending reduction but do not replay
+ACK credit for growth. Production ECN remains disabled. Random isolated wireless loss is
 not silently reclassified as sustained congestion, but repeated loss or an
 overflowing queue cannot be filtered away.
+
+### Loss qualification
+
+Confirmed loss remains truthful input to the native loss EWMA, ACK-edge ledger,
+and loss counters. It is not automatically evidence that the available bitrate
+fell. This profile explicitly deviates from the draft's low-queue `1%` EWMA
+backoff trigger, using bounded loss observations inside the same native core.
+
+The reference is libwebrtc commit
+[`ba469aa2093ba950066258ca0a59a6fbd1295582`](https://github.com/webrtc-sdk/webrtc/tree/ba469aa2093ba950066258ca0a59a6fbd1295582):
+`send_side_bandwidth_estimation.cc` accumulates at least 20 expected packets,
+does not reduce for loss up to 10%, and limits decreases to 300 ms plus RTT.
+`loss_based_bwe_v2.cc` uses observations spanning at least 250 ms of send time, requires three
+observations, retains fifteen, and uses 0.9 temporal weighting with a byte-loss
+objective instead of treating every lost data unit as capacity loss.
+
+PulseBeam qualifies low-queue loss over observations of at least `20` received or
+confirmed-lost data units and `250 ms` of packet send time. Completion advances the
+send-time anchor to the latest reported send; delayed feedback and timer polls do
+not age a short burst into a completed observation. Actual confirmed statuses and
+transport bytes remain accumulated, including late losses. At least three
+completed observations are required; the latest fifteen are weighted by `0.9` per
+observation in Q16. The
+loss fraction is weighted lost transport bytes divided by weighted expected
+transport bytes. Unconfirmed gaps contribute no observation. A fraction above
+`10%` permits the existing native loss reduction at most once per
+`300 ms + srtt`, using an observation no older than `6 s`. This is a loss
+qualifier, not libwebrtc's bandwidth estimator: it stores no alternate bitrate,
+never supplies a rate floor, and never overrides the native send window.
+Unqualified low-queue loss does not reset the native congestion-recovery epoch
+or install a policer-window cap. Sent history carries loss provenance through
+controller conversion: RFC reordering confirmation and five-second history expiry
+remain native losses, but expiry cannot establish persistent policing. Age-driven
+retirement preserves an earlier reordering deadline as the loss origin even if
+bounded confirmation work deferred it. The policer
+uses a separate observation with the same packet/span/history/weight/age bounds,
+including received transport bytes and reordering-confirmed losses but excluding
+expiry-origin losses. It supplies no bitrate or window. Policer classification
+requires this capacity-loss qualification in addition to its existing native
+loss/queue conditions, a current reordering-confirmed loss, and a received-arrival
+observation no older than one smoothed RTT. Receipts and losses need not arrive in the same feedback batch.
+Loss-only feedback without that bounded contemporaneous delivery/delay evidence
+retains native loss backoff but cannot install a persistent policing ceiling
+from stale low-delay state. A fresh receipt or new isolated loss cannot combine
+with expiry-heavy history to establish that ceiling. Native loss accounting and
+backoff still include expiry. Qualified flowing loss and actual policer remediation
+still act. Selected-path replacement clears the receipt witness.
+
+Confirmed loss with native average queue delay above one quarter of its target
+retains the draft's immediate reaction cadence. Native delay, ECN, policer
+remediation, backoff equations, and reference-window growth bounds are unchanged.
+A selected-path replacement clears the observation and cadence state.
 
 The target bitrate is a controller output for RTP media payload. It is not a proof
 of physical bottleneck capacity and is named `target_media_payload_rate` in local
@@ -507,7 +573,12 @@ not permission for implementation choice.
 | Native maximum queue-delay target | `400 ms` |
 | Reference-window update | pinned draft |
 | Send-window/reference-window slack | pinned draft |
-| Queue/loss backoff | pinned draft |
+| Queue/loss backoff equations | pinned draft; low-queue loss eligibility uses the explicit bounded observation policy above |
+| Low-queue loss observation | at least `20` data units and `250 ms` send-time span, byte-weighted |
+| Low-queue loss readiness/history | at least `3` completed observations; latest `15`, temporal weight `0.9` |
+| Low-queue capacity-loss threshold | above `10%` |
+| Low-queue loss decrease interval | `300 ms + srtt` |
+| Maximum age of a completed loss observation | `6 s` |
 | ECN response | disabled in production; pinned draft equations tested in the private core |
 | Clock-drift and path-baseline filters | pinned draft |
 | Target-rate derivation | pinned draft |
@@ -532,11 +603,12 @@ not permission for implementation choice.
 | Maximum private paced RTP transport bytes | `8 MiB`, additionally capped by public configured media bytes |
 | Hard maximum pacer horizon | `100 ms` |
 | Maximum retained RTX age | `2 s`, additionally capped by sender usefulness |
+| Default-mode decoder-repair window | `min(2 s, max(1 s, 3 * srtt))` from original commit, reserving predicted network service; no change to fresh-body expiry |
+| Repeat repair suppression | No retransmission within one smoothed RTT of its last committed repair; first repair remains immediate |
 | Maximum retained RTX transport bytes | public retransmission limit |
-| Protocol-control minimum service reserve | `max(16_000 bit/s, 1% of current total transport service)` |
-| Scheduler quantum | one current path-MTU transport packet |
-| Sender allocation hysteresis | `max(25_000 bit/s, 10% of previous allocation)` |
-| Upward allocation confirmation | threshold held for `2` valid feedback rounds |
+| Protocol service | Prepared protocol output precedes user lanes; due RTP control precedes RTP media |
+| Scheduler quantum | one eligible emitted packet per user-lane turn |
+| Allocation updates | One coalesced latest-state snapshot; budget-only changes are observable |
 | Downward safety change | immediate |
 | Upward operating-point relaxation | at most `10%` of remaining delta per smoothed RTT |
 | Fixed-range (`min == max != 0`) relaxation | at most `5%` of remaining delta per smoothed RTT |
@@ -548,18 +620,23 @@ not permission for implementation choice.
 | --- | ---: |
 | Concurrent probe clusters | `1` |
 | Probe-history records | `64` cluster records; `32,768` emitted RTP accounting entries. Recent-entry eviction suppresses probes for `5 s` |
-| Minimum unmet-demand trigger | desired payload exceeds credible allocation by `20%` and `50_000 bit/s` |
-| Cluster target | `min(total governed demand, max(2 * credible media rate, 300_000 bit/s))` |
-| Cluster duration | `20 ms` |
+| Minimum unmet-demand trigger | desired payload exceeds credible allocation by `20%` and `50_000 bit/s`, or a sender's potential source service exceeds its allocation and aggregate potential exceeds the native estimate. The latter includes paused sources and active-source upgrades below the ordinary trigger |
+| Demand-derived cluster rate | `min(total probe budget rate, max(2 * credible media rate, 300_000 bit/s))` |
+| Ordinary cluster transport target | `max(3,000 B, demand-derived cluster rate * 20 ms / 8)`, additionally at least `governed potential payload rate * srtt / 8` for a potential-only candidate that has not committed media or remains in the initial five-second period. Established paused or application-limited service requests at least the native reference-window bytes so a successful sample can fund observed-flight growth. RTT/reference-window extensions additionally fit at most `100 ms` of the chosen probe rate, with the existing `3,000 B` minimum. All targets remain capped at the current send window and `48 KiB`; actual emission remains subject to rolling allowance, lifetime, horizon, and per-packet send-window checks |
+| Ordinary cluster pacing | `min(2 * governed potential probe rate, max(2 * credible media rate, 300_000 bit/s))`; separate commit-driven probe deadline with at most `1 ms` of missed scheduling intervals retained. Native pacing is not a minimum discovery rate. If any sender has committed body media and positive selected demand, discovery additionally stays at or below the current native pacing rate, repriced downward on native rate changes. Every emitted byte still charges ordinary native pacing debt; native rate updates reprice remaining byte debt without clearing it |
+| Cluster duration | `clamp(requested bytes * 8 / cluster pacing rate, 20 ms, 100 ms)`; one-packet recovery retains `20 ms`. An emitted sample with at least five packets and `80%` of the requested bytes remains eligible for feedback |
 | Minimum packets | `5` |
-| Maximum packets | `32` |
+| Maximum packets | `192` |
 | Maximum cluster transport bytes | `48 KiB` and current send window, whichever is lower |
-| Minimum interval | `max(1 s, 4 * srtt)` |
-| Rolling probe overhead | `P <= floor(N / 19) + 3,000` transport bytes in every trailing `5 s`, where `P` is emitted RTP padding probes and `N` is emitted non-probe RTP including media and RTX |
+| Default-playout probe debt reservation | Default video permits `80 ms` only with empty media/repair queues. Default audio and explicit `0/0` retain their ordinary `15 ms` urgent reservation; body-media admission remains unchanged |
+| Minimum interval | Periodic discovery: `max(5 s, 4 * srtt)`; initial discovery and one-packet feedback solicitation: `max(1 s, 4 * srtt)`. Successful discovery feedback may bypass only this interval during initial probing or for an eligible potential-only source that has never committed media; it grants no padding credit |
+| Rolling probe admission | A new padding emission requires `P <= floor(N / 19) + A` transport bytes in the trailing `5 s`, including that emission, where `P` is emitted RTP padding probes and `N` is emitted non-probe RTP including media and RTX. Ordinary `A = 48 KiB`. Windows retaining spent initial service stay bounded by its earned initial allowance, without granting new ordinary credit |
+| Initial probe service | Once per connection, for `5 s` from its first ordinary probe, and only while aggregate selected demand is zero. `A` may grow to `clamp(2 clusters * 100 ms * 2 * potential payload rate / 8, 48 KiB, 96 KiB)`. Path changes never rearm this period or erase emitted bytes |
 | Success feedback deadline | `2 * srtt`, clamped to `[200 ms, 2 s]` |
-| Successful observation | at least `80%` of probe bytes reported received with no SCReAM congestion response |
+| Successful observation | At least `80%` of `max(requested bytes, emitted bytes)` newly reported received and `80%` of the minimum packet count before the deadline, with no SCReAM congestion response; reordered receipt transitions count independently of earlier ACK-edge credit, while duplicate reports earn no credit. A one-packet feedback-recovery solicitation uses its emitted packet count and cannot trigger startup continuation |
+| Discovery continuation | Earned once by the latest successful full cluster; initial or never-started eligible sources may consume it after candidate selection. Feedback processing and wakeup scheduling retain it only while that eligibility holds. Outside initial service it uses ordinary rolling credit, never rearms the five-second startup allowance, and preserves pacing debt and native bounds |
 | Queue-growth abort | effective target exceeded or queue rises `10 ms` during cluster |
-| Loss abort | `5%` of reported probe packets lost before completion |
+| Loss handling | Loss remains truthful native-controller input. A qualified SCReAM congestion response aborts the cluster; an isolated loss report alone does not replace the received-byte/packet quorum or deadline |
 
 ### Latency-governor ledger
 
@@ -567,8 +644,8 @@ not permission for implementation choice.
 | --- | ---: |
 | Urgent playout-maximum knee | `75 ms` |
 | Quality saturation playout maximum | `500 ms` |
-| Urgent allocation utilization | `0.80` |
-| Quality allocation utilization cap | `0.95` |
+| Urgent padding probe-size scale | `0.80` |
+| Quality padding probe-size scale cap | `0.95` |
 | Urgent pacer horizon | `15 ms` |
 | Quality pacer horizon cap | `80 ms` |
 | Audio receiver processing reserve | `10 ms` |
@@ -594,12 +671,11 @@ private stable operating point. It does not continuously retune SCReAM per packe
 
 ```rust
 struct SenderOperatingPoint {
-    allocation_utilization: Ratio,
     pacer_horizon: Duration,
     new_frame_horizon: Duration,
     rtx_extra_allowance: Duration,
     probe_queue_impact: Duration,
-    governed_demand: MediaPayloadRate,
+    probe_budget_rate: MediaPayloadRate,
 }
 ```
 
@@ -626,17 +702,43 @@ x = clamp((playout_max - 75 ms) / (500 ms - 75 ms), 0, 1)
 Then:
 
 ```text
-allocation_utilization = lerp(0.80, 0.95, x)
+probe_size_scale     = lerp(0.80, 0.95, x)
 pacer_horizon        = lerp(15 ms, 80 ms, x)
 rtx_extra_allowance  = lerp(0 ms, 50 ms, x)
 probe_queue_impact   = lerp(5 ms, 20 ms, x)
-governed_demand      = desired_bitrate * allocation_utilization
+probe_budget_rate    = potential_bitrate * probe_size_scale
 ```
 
 Interpolation uses integer fixed-point arithmetic with round-to-nearest ties-to-
 even. Values above `500 ms` saturate and never authorize larger network queues.
 Values at or below `75 ms` select the urgent endpoint. `0/0` bypasses the curve
-and selects the urgent endpoint plus the ASAP rules below.
+and selects the urgent endpoint plus the ASAP rules below. Browser-managed
+unspecified playout (`SenderPolicy.playout_delay == None`) retains the same bounded
+body-media admission and age limits, but does not write a receiver delay extension.
+Empty-queue video discovery may reserve at most `80 ms` of ordinary pacing debt in
+default mode, rather than treating it as an explicit urgent `0/0` receiver. Audio
+retains its ordinary urgent probe reservation so discovery cannot deliberately
+occupy service needed by arriving audio. New body media still obeys its ordinary
+admission horizon and can be shed until the
+debt drains; no bytes or debt disappear. The native send window, `20 ms` cluster
+lifetime, rolling allowance, queue-impact aborts, and media-first service remain
+mandatory. This is stricter than libwebrtc's rate-bounded `500 ms` pacing-debt cap
+in `modules/pacing/pacing_controller.cc` at the pinned reference commit.
+Neither mode creates capacity, relaxes the SCReAM core, or authorizes unbounded
+media buffering.
+
+Default-mode decoder repairs are distinct from fresh-body admission. The pinned
+libwebrtc `rtp_packet_history` protects history for `max(1 s, 3 * RTT)` and suppresses
+repeat retransmission within one RTT, rather than expiring all repairs at the
+fresh-video age limit. PulseBeam uses that protected duration for default-mode
+repair eligibility, capped by its stricter existing `2 s` cache residence and
+configured byte/request limits. Predicted network service must fit in the remaining
+history window. Repeat repair time is recorded only on actual transmit commit.
+Explicit playout, including `0/0`, retains its existing usefulness predicate.
+Fresh-body `100 ms` audio and `150 ms` video expiry, receiver waits, source time,
+ordinary pacing debt, and the native send window are unchanged. This bounded
+history adaptation does not promise the reference's longer cache lifetime or
+browser compatibility.
 
 `playout_min` does not alter SCReAM's queue target or create network capacity. It
 controls recovery classification and stability:
@@ -648,8 +750,11 @@ controls recovery classification and stability:
   relaxation in the profile.
 
 The strictest `probe_queue_impact` among active senders becomes the path probe
-limit. Utilization, demand, frame/RTX usefulness, and service balance remain per
-sender.
+limit. Probe-size scaling, frame/RTX usefulness, and service balance remain per
+sender. Probe-size scaling never discounts selected body-media demand. Selected
+source rates are fully funded when they fit the controller-governed selection
+budget; actual congestion remains authoritative through SCReAM's target, window,
+pacing and the sender's bounded burst/usefulness rules.
 
 ### Receiver-specific deadline derivation
 
@@ -703,7 +808,7 @@ the server-anchored timeline and is reported separately.
 - drop audio older than `100 ms` and video older than `150 ms` at admission;
 - retransmit only when immediate prediction says it can arrive before newer
   replacement media and within the same age limit;
-- use `0.80` allocation utilization and the urgent pacer horizon;
+- use `0.80` padding probe-size scaling and the urgent pacer horizon;
 - never wait to fill a smoothing interval.
 
 ### Dynamic policy changes
@@ -715,7 +820,9 @@ Tightening takes effect in the same `Command::SetSenderPolicy` call:
   `global_media_at`;
 - not-yet-started stale video frames are removed whole;
 - obsolete RTX is removed;
-- governed demand, pacer horizon, probe impact, and allocation may fall immediately.
+- pacer horizon, probe-size budget and probe impact may fall immediately;
+- selected source demand is unchanged, and allocation remains capped by the
+  native controller's current selection budget.
 
 Relaxing follows the profile's per-RTT damping. It cannot release a burst, jump
 the SCReAM reference window, trust a stale estimate, or reconstruct dropped
@@ -726,8 +833,9 @@ media.
 For identical network, packet, and other-sender state, reducing one sender's
 playout maximum MUST NOT:
 
-- increase its allocation utilization, governed demand, pacer horizon, or RTX
-  allowance;
+- increase its probe-size budget, pacer horizon, or RTX allowance;
+- increase its allocation for a fixed native controller envelope and selected
+  source demand;
 - admit an older frame rejected by the looser policy;
 - permit a probe with greater predicted queue impact;
 - increase SCReAM's native target or reference window.
@@ -759,78 +867,80 @@ ineligible until a random-access or otherwise independent frame restores the
 chain. `Unknown` dependencies permit only whole-current-frame decisions; the
 connection does not invent dependency relationships.
 
-## Media-capacity accounting and SCTP coordination
+## RTP selection budget and SCTP coordination
 
-SCReAM's target is the upper bound for RTP media payload. SCTP has its own
-acknowledgments and congestion window. Version one coordinates them without
-pretending that RTP feedback acknowledged SCTP bytes.
-
-The connection maintains:
+The connection exposes a controller-governed RTP media-payload selection ceiling,
+not measured spare bandwidth, physical bottleneck capacity, or a reservation:
 
 ```text
-rtp_safe_transport_rate =
-    target_media_payload_rate / aggregate_payload_efficiency
-
-observed_path_transport_rate =
-    delivered_rtp_transport_rate
-  + delivered_sctp_transport_rate
-  + delivered_protocol_control_transport_rate
-
-reserved_sctp_transport_rate =
-    max(sctp_acknowledged_rate_ewma,
-        bounded_immediately_admissible_sctp_rate)
-
-reserved_control_transport_rate =
-    max(16_000 bit/s, 1% of current total transport service)
+media_budget = min(target_media_payload_rate, total_potential_media_rate)
+allocation_i = weighted_max_min(media_budget, selected_demands, weights)_i
+total_allocation = sum(allocation_i) <= media_budget
 ```
 
-When `observed_path_transport_rate` has at least one RTT of credible samples:
+The initial ceiling comes from SCReAM's native bounded startup target. Subsequent
+ceilings come from the same native controller, including its ordinary contraction
+and recovery. Potential demand caps application interest; it never raises the
+controller target. Actual selected source demand caps sender allocations without
+an unconditional latency-dependent rate discount. If aggregate selected demand
+fits the selection budget, every selected rate is fully funded. Allocation total
+can be below the selection budget or zero while
+bounded potential-only probing remains useful. Withdrawn interest immediately
+caps the budget to zero without resetting congestion history. Per-sender window,
+pacing, usefulness, and queue bounds still apply; the selection ceiling is not
+unconditional permission to transmit.
 
-```text
-observed_media_transport_cap =
-    max(0,
-        observed_path_transport_rate
-      - reserved_sctp_transport_rate
-      - reserved_control_transport_rate)
+Body-media admission uses a per-sender payload leaky bucket at the published
+allocation, independently of the transport pacer's burst-drain rate. Accepted
+payload charges debt; rejected commands do not. Debt leaks at the allocation and
+cannot accumulate idle credit. The latency governor's existing pacer horizon
+bounds admitted burst debt, with at most one packet of overshoot so a packet
+larger than the horizon's budget can still make progress. A zero-allocation sender
+can admit this first packet only when it has no debt and has selected interest;
+subsequent packets wait for allocation service. A zero-rate interval never leaks
+existing payload debt. Queue, usefulness, continuity, and transport bounds remain
+authoritative. A caller retries the same immutable packet after `WouldBlock`;
+it does not advance source frame state on a rejected command. Once the receiver's
+intrinsic usefulness deadline has passed, admission returns `MediaExpired`
+instead, without taking ownership or charging debt. The caller discards that
+packet and continues with fresh media rather than permanently retrying an expired
+queue head. Temporary pacing or network-prediction pressure remains `WouldBlock`. This follows libwebrtc's allocation-driven encoder/frame-dropper
+versus burst-pacer split without importing encoder-specific keyframe spreading
+or changing SCReAM equations.
 
-media_transport_cap =
-    min(rtp_safe_transport_rate,
-        observed_media_transport_cap)
-```
+SCTP keeps its own acknowledgments, congestion window, and bounded buffering.
+Supported committed transport counters describe sends, not acknowledgments or
+delivery. Version one does not derive a combined delivered-path estimate or
+subtract an inferred SCTP ACK rate from RTP. It does not promise an independent
+fixed-rate SCTP or control reservation. Coordination occurs through bounded
+protocol service and eligible user-lane scheduling. Shared-path SCTP queueing can
+increase RTP delay and cause the normal SCReAM response.
 
-Before that observation is credible, `media_transport_cap` is
-`rtp_safe_transport_rate`; SCTP remains bounded by its own controller and the
-scheduler's queue limits.
-
-Finally:
-
-```text
-available_media_payload_rate =
-    media_transport_cap * aggregate_payload_efficiency
-```
-
-This construction reserves SCTP exactly once. SCTP transport bytes are never
-inserted into SCReAM sent history, never increase SCReAM RTP bytes-in-flight, and
-never appear as RTP delivery. Their queueing can still increase RTP delay and
-therefore cause a normal SCReAM response.
-
-A data-only connection uses SCTP congestion control and the bounded DataChannel
-scheduler; the RTP SCReAM core remains unproven/inactive until RTP demand exists.
+SCTP transport bytes never enter SCReAM sent history, RTP bytes-in-flight, or RTP
+delivery samples. A data-only connection uses SCTP congestion control and bounded
+DataChannel service; without selected or potential RTP demand its RTP budget is
+zero. No dependency patch or additional acknowledgment-byte observable is needed
+for this contract.
 
 ## Weighted media allocation
 
 On a material safe-rate, demand, policy, or activity change, the allocator:
 
-1. computes `available_media_payload_rate`;
-2. computes each active sender's governed demand from the latency governor;
-3. distributes capacity with weighted max-min fairness, capped by governed demand;
+1. computes `media_budget` independently of selected demand;
+2. uses each active sender's actual selected source/layer payload rate as demand;
+3. distributes capacity with weighted max-min fairness, capped by selected demand;
 4. redistributes capacity unused by paused, demand-capped, or application-limited
    senders;
-5. applies the fixed event hysteresis without delaying downward safety changes.
+5. coalesces the latest budget/allocation snapshot without delaying downward changes.
+
+A budget change emits an allocation update even when every sender allocation is
+unchanged. Pending updates replace older snapshots rather than growing a queue.
+The SFU owns source/layer selection and its quality hysteresis; it must not use the
+sum of selected-demand allocations as the discovery budget for upgrades.
 
 ### Exact water-filling algorithm
 
-For active sender set `S`, capacity `C`, governed demand `d_i`, and positive weight
+For active sender set `S`, capacity `C`, selected demand `d_i`, and positive weight
 `w_i`:
 
 ```text
@@ -869,8 +979,13 @@ state.
 
 Setting desired bitrate to zero rejects new media admission for that sender.
 Already queued, committed, or useful RTX work drains or is shed under existing
-deadlines. Once no work remains, the sender becomes inactive for path latency
-aggregation.
+deadlines. An explicit positive potential demand can retain bounded probe interest
+while selected media is paused. Potential defaults to selected for policy-only
+callers; declare both zero to withdraw RTP interest. Potential does not allocate
+body-media service or bypass window, pacing, deadline, feedback, or probe-budget
+limits. Updating the application maximum on the same path preserves native core
+state, including zero-to-positive recovery; only a genuine selected-path change
+resets path state.
 
 ## Pacer and top-level scheduler
 
@@ -893,16 +1008,18 @@ Selection has four bounded classes:
 3. non-urgent reports/control;
 4. RTP padding probes.
 
-Class 1 can preempt user traffic but normally consumes only the fixed control
-reserve. Class 4 is selected only when every real-traffic lane is empty or blocked.
+Prepared protocol output precedes user lanes. On an RTP turn, due RTCP control
+precedes media. SCTP association control uses its native bounded output lane.
+Padding is selected only when every real-traffic lane is empty or blocked; ready
+SCTP output prevents an otherwise eligible padding probe.
 
-The two class-2 lanes are **not** strict-priority ordered. A transport-byte deficit
-scheduler gives the RTP lane service at `media_transport_cap` and the SCTP lane
-service at `reserved_sctp_transport_rate`, subject respectively to the SCReAM send
-window and SCTP congestion window. An eligible nonempty lane receives at least one
-path-MTU quantum during each `max(100 ms, srtt)` interval, unless its own
-congestion controller or deadline makes every packet ineligible. Borrowed idle
-service is charged to the borrowing lane's deficit.
+The two class-2 lanes are **not** strict-priority ordered. They alternate eligible
+packet service, subject respectively to the SCReAM window/pacer and SCTP's own
+congestion controller. A blocked or empty RTP lane yields immediately to eligible
+SCTP output; a blocked or empty SCTP lane does not stall RTP. This is bounded
+work-conserving service, not a rate reservation or a guarantee within one RTT.
+Every returned transmit is committed and must receive its immediate caller
+socket-write attempt before the connection is driven again.
 
 Within the RTP lane, one media-payload deficit is maintained per `SenderId`.
 Original media, RTX, and FEC are charged to that sender. Packet deadlines determine
@@ -948,23 +1065,134 @@ It tests shared RTP path capacity only when greater capacity would be useful.
   not create or advance `GlobalMediaTime` or frame state.
 
 With multiple candidates, the probe manager chooses the active sender with the
-largest weighted unmet governed demand that has a valid padding form. Probe
+largest weighted unmet potential source demand that has a valid padding form. Probe
 results remain connection-level and are redistributed by the allocator.
 
 ### Eligibility and lifecycle
 
+Ordinary clusters use a separate probe pacing deadline. The first packet must
+wait for ordinary pacing eligibility; subsequent packets may use the cluster's
+fixed probe rate while no media or repair is queued. Each emitted probe charges
+both the probe deadline at that rate and the ordinary deadline at the current
+native pacing rate, using final emitted transport bytes. The ordinary deadline
+advances from the later of its previous deadline and the emission time, without
+burst credit. Only the probe deadline may retain at most 1 ms of missed
+scheduling intervals, matching the production timer quantum. Larger delays
+cannot accumulate more catch-up credit, and the 20 ms cluster lifetime remains
+unchanged. Aborting or completing a cluster clears only its probe schedule,
+never the ordinary debt. New clusters still wait for that debt.
+One-packet recovery solicitations retain ordinary pacing, without acceleration.
+Before any probe packet, its reserved transport service plus existing ordinary
+pacing debt must fit every selected sender's latency-governed pacer horizon.
+Otherwise the cluster aborts without clearing ordinary debt. Potential-only
+senders have no selected-media reservation, but remain subject to all other
+window, budget and congestion gates.
+
+For a potential-only candidate (zero selected demand) that has never committed
+media or remains in the initial five-second period, the ordinary cluster
+transport target samples one smoothed RTT of aggregate governed potential
+payload demand, or the ordinary demand-derived 20 ms target or 3,000 bytes,
+whichever is larger, capped by the current send window and 48 KiB. Candidates
+with selected media retain the smaller ordinary demand-derived target, so a
+quiet interval in an active stream does not request an RTT-sized burst.
+Sampling demand's flight size permits potential-only senders to supply
+the observed native RTP flight that SCReAM requires before increasing its
+reference window. A fixed 3,000-byte flight ceiling cannot bootstrap layers
+above the corresponding RTT-dependent native target when no real media is
+selected. The 192-packet limit accommodates the bounded byte sample despite
+RTP padding's 255-octet limit. This is only a requested probe size, not reserved
+allowance, a window floor, or permission to emit that many bytes: every packet
+must pass the rolling-budget and send-window checks.
+Packet padding is still bounded to 255 octets and at most five milliseconds of
+the selected pacing rate. Probe deadlines participate in connection wakeups and
+cannot extend the 20 ms cluster lifetime. Once a sender has committed media and
+the finite initial period ends, losing selected demand does not rearm the
+demand-sized bootstrap flight sample. Established periodic clusters and promoted
+covering-report recovery follow-ups retain the ordinary demand-derived 20 ms
+target and minimum. They do not renew initial allowance or request a larger RTT
+flight sample. A fresh potential-only sender still needs the bootstrap native
+reference-window sample.
+Ready protocol or SCTP output and real
+RTP retain precedence. Neither probe pacing nor successful feedback directly
+increases the SCReAM reference window or guarantees a media bitrate.
+
 A probe may begin when:
 
 - the path first becomes writable and RTP desired demand is nonzero;
-- governed demand exceeds credible allocation by both fixed trigger thresholds;
+- potential source demand exceeds credible allocation by both fixed trigger thresholds;
 - VBR or paused traffic has left capacity confidence decaying;
-- all media is paused while nonzero desired demand remains;
+- a sender has positive potential demand but zero allocation, and aggregate
+  potential payload demand exceeds the native payload estimate, even below the
+  ordinary fixed trigger thresholds; other senders may remain allocated;
 - a congestion response has stabilized and evidence is needed before recovery.
 
 The exact cluster size, interval, overhead, and success criteria are fixed in the
-profile. The 3,000-byte allowance is PulseBeam low-traffic policy, not a SCReAM
-window floor or an unconditional 5% share. The budget uses final emitted RTP
-transport bytes; RTCP, SCTP and other protocol traffic earn no credit. It remains
+profile. Periodic discovery uses libwebrtc's five-second ALR probe interval,
+separate from its one-second repeated-initial wait. Feedback solicitation retains
+the one-second interval so the periodic policy cannot starve fresh observations.
+Both intervals remain bounded below by four smoothed RTTs, and the covering-report
+follow-up retains its explicit bypass. The ordinary 48 KiB allowance is PulseBeam low-traffic policy, not a
+SCReAM window floor or an unconditional 5% share. It bounds steady zero-media
+probing to 78,644 bit/s averaged over five seconds, while permitting a
+window-sized flight sample. After the initial period, a never-started,
+potential-only candidate on a connection with no established active media may
+request one native reference window plus the existing 3,000-byte minimum sample.
+This bounded additive headroom supports native RTT-cadenced increases without
+doubling the idle request on a rate-limited path.
+The current window, 48 KiB request cap, unchanged rolling allowance and finite
+rate-derived service bound still limit the request and every emission. Existing
+body service and previously committed candidates retain the one-window sample;
+this does not rearm initial service credit.
+
+Initial capacity discovery has a separate finite service allowance. This adapts
+libwebrtc's two initial probes, 100 ms initial service duration, five-second
+repeated-initial period, application-demand cap of twice the requested rate,
+and feedback-driven continuation (`ProbeControllerConfig`,
+`InitiateExponentialProbing`, `SetEstimatedBitrate`, and `InitiateProbing` at
+pinned revision `ba469aa2093ba950066258ca0a59a6fbd1295582`). PulseBeam retains
+20 ms minimum window samples rather than replacing SCReAM with a probe-rate
+estimator. RTT/reference-window-sized samples do not force all requested bytes
+through that minimum interval: as in `ProbeController`, application-driven
+probe pacing is limited to twice the declared governed potential rate and twice
+credible media rate, with the existing 300 kbps credible-rate floor. Native
+pacing is an allowance, not a command to use that entire rate for discovery.
+The service duration adapts to requested bytes at the separate probe rate,
+capped at 100 ms, matching the pinned initial-duration bound; RTT/reference
+requests also fit that finite service budget apart from the existing minimum.
+Ordinary media retains native pacing. Any established active sender additionally
+caps connection-wide probe pacing at the current native rate, including downward
+repricing while a cluster runs, so a different paused candidate cannot borrow
+service from ongoing body media. When there is no established active sender,
+never-started and paused candidates retain the separately bounded
+bootstrap/recovery rate. Every probe byte charges the same native debt, and
+native window authority and rolling credit are unchanged.
+During the initial period, with positive
+potential demand and zero aggregate selected demand, the allowance may grow
+with actual potential demand to at most 96 KiB. It is neither refreshed by a
+successful probe nor rearmed on path change. A successfully completed latest
+ordinary sample can trigger a prompt follow-up without waiting the ordinary
+interval. This adapts libwebrtc's 80% requested-byte and minimum-packet feedback
+criteria (`ProbeBitrateEstimator`), not GCC's 70% probe-rate threshold: only
+SCReAM computes credible capacity. The packet quorum counts receipts, not loss
+reports. As in that estimator, partial feedback containing an isolated loss
+cannot fail a cluster before its remaining receipts can satisfy the quorum.
+All loss still reaches native qualification, and a native congestion response
+or expired feedback deadline aborts the sample. Timer quantization may end transmission just
+short of the requested byte target; a sufficient sample remains pending until
+its own feedback arrives. Continuation identifies the latest cluster by its
+finish time, independently of its last packet time. A promoted ordinary sample
+may grow the allowance with newly declared demand, but never refreshes spent
+credit or the initial-period start. The bypass
+is consumed by an attempt, and congestion, abort, stale feedback, selected
+media or initial-period expiry prevents continuation. Recovery solicitations
+do not earn this startup continuation.
+
+When initial discovery ends or real media is selected, the ordinary allowance
+applies again. Retained startup bytes can therefore suppress further padding
+until they age out; the ledger is not cleared. Neither allowance nor the
+requested sample or adaptive duration bypasses congestion gates or guarantees startup on every RTT,
+source rate or path. The budget uses final emitted RTP transport bytes; RTCP,
+SCTP and other protocol traffic earn no credit. It remains
 connection-wide across selected-path changes and is checked against the expiry
 of older non-probe traffic as well as current emissions. All safety gates take
 precedence over the minimum cluster packet count. One cluster aborts immediately on:
@@ -976,6 +1204,33 @@ precedence over the minimum cluster packet count. One cluster aborts immediately
 - send-window contraction that removes budget;
 - real media arrival that consumes the remaining service;
 - connection close.
+
+When feedback is stale, positive potential demand remains, and no media is
+queued or in flight, recovery may solicit a covering report with one padding
+packet. A positive bitrate allocation does not block recovery: it is a budget,
+not evidence of sendable media, and stale delay estimates can prevent admission.
+The same one-packet solicitation is permitted before feedback becomes stale when
+positive selected demand remains and even newly created media cannot meet its
+explicit nonzero playout limit under the current network-delay estimate plus
+media processing time. This requires a padding-eligible sender and empty media
+queue and RTP flight; ordinary congestion backoff and media admission are not
+bypassed. It supplies a new delay observation when the retained estimate itself
+prevents media from producing feedback. Media usefulness and expiry checks remain
+unchanged.
+This recovery-only packet retains the ordinary probe retry
+interval, pacing, selected-path, send-window, and emitted-padding budget gates.
+After a valid covering report, a prompt follow-up may bypass only the cluster
+interval. If feedback is fresh and normal probe permission is granted, this
+follow-up may become one ordinary probe cluster, subject to the existing packet,
+duration, byte, pacing, send-window, congestion and rolling-overhead limits.
+Successful feedback from an established sender's promoted cluster cannot rearm
+the covering-report interval bypass or startup continuation after the initial
+period.
+Otherwise it remains one padding packet to obtain a second fresh covering report.
+The interval bypass is consumed by that attempt; it cannot chain additional
+clusters. A blocked or aborted attempt cannot keep that interval bypass armed.
+Recovery does not grant ordinary probe permission while stale, reset SCReAM,
+or make the first recovery report growth-eligible.
 
 A successful observation is evidence supplied to the normal SCReAM growth logic;
 it does not directly set a bitrate or reference window. A failed/aborted probe can
@@ -994,7 +1249,7 @@ behavior MUST be equivalent.
 | Steady | Credible feedback and offered load | Follow pinned SCReAM and governed policy | ALR, congestion, stale feedback, or path change |
 | Application-limited | Offered RTP below 85% threshold for 200 ms with no pacing/window block | Freeze unsupported growth, decay confidence, demand-aware probes | Offered load recovers or another state dominates |
 | Congested | Pinned SCReAM queue/loss/ECN response triggers | Stop probes, back off, shed stale video/RTX | Pinned recovery conditions hold |
-| Feedback-stale | No covering feedback by stale threshold | Stop growth/probes, decay confidence, conservative envelope | One valid covering report; return through Learning |
+| Feedback-stale | No covering feedback by stale threshold | Stop growth/ordinary probes, allow only the bounded recovery solicitation above, decay confidence, conservative envelope | One valid covering report; return through Learning |
 
 A selected-path replacement returns RTP control to `Unproven`, clears feedback
 and in-flight entries that cannot apply to the new path, resets baseline/probes,
@@ -1154,7 +1409,7 @@ known:
   Exclude path-step through five RTTs and probe-start through two RTTs after
   probe end from stable queue claims only; report losses and transients separately;
 - each continuously backlogged sender's time-integrated payload allocation is
-  within `10%` of its governed-demand-capped weighted max-min share of the actual
+  within `10%` of its selected-demand-capped weighted max-min share of the actual
   aggregate allocation budget after warmup. In a stable loss-free fixture,
   delivered original-media payload share is within `10%` of allocation share;
 - delivered RTP transport from emission cohorts uses at least `85%` of available
@@ -1164,7 +1419,7 @@ known:
   `50 ms` RTT bottleneck each receive `40%`–`60%` of combined delivered RTP
   transport and together use at least `85%` of bottleneck service; heterogeneous
   modeled competitors do not inherit this equal-share threshold;
-- probe emissions obey `P <= floor(N / 19) + 3,000` in every trailing five-second window, with raw probe ratio and allowance usage reported separately;
+- probe admission checks `P <= floor(N / 19) + A` in the trailing five-second window at every emission, using the profile's ordinary or bounded initial allowance; spent initial bytes remain bounded while aging out and cannot grant new ordinary credit. Raw probe ratio and allowance usage are reported separately;
 - no target/window growth occurs while feedback is stale;
 - no queue/history/resource count exceeds its hard bound;
 - tightening latency never improves utilization by retaining work the looser
@@ -1183,13 +1438,15 @@ Scenario pass thresholds are committed before tuning a candidate profile.
 
 The sole client acceptance baseline is pinned libwebrtc `0.6.2` in controlled
 execution. It MUST establish authenticated bidirectional media, actual native
-TWCC reaching server send accounting, DataChannel delivery/coexistence, and
+TWCC reaching RTC send accounting, DataChannel delivery/coexistence, and
 bounded lifecycle behavior. Simulation and component tests retain quantitative
 proof for loss/reordering, padding, priorities, pause/resume, VBR, source-switch
 continuity, malformed input, congestion safety, and resource bounds.
 
-RFC 8888 negotiation/parsing/accounting and passive ICE-TCP framing remain
-client-free deterministic server evidence, not native interoperability claims.
+RFC 8888 negotiation/parsing/accounting and ICE-TCP framing retain client-free
+deterministic RTC component evidence, not production-server integration or
+additional client compatibility. Active-client ICE-TCP native interoperability
+is separately scoped to the controlled packet-socket boundary in `design.md`.
 Stored SDP cannot prove runtime behavior or browser compatibility. Ericsson
 traces are comparison oracles, not production dependencies or client evidence.
 A PulseBeam deviation is accepted only when the same deterministic scenario
