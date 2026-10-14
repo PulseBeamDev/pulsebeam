@@ -17,9 +17,8 @@ pulsebeam-cli auth-key \
 
 Pass `--project-id p_0...` to generate a rotation key for an existing project.
 All outputs must be new files. The private bundle and optional `pulsebeam.key`
-are owner-only on Unix. `pulsebeam.key` contains one `key_0` credential for
-`PULSEBEAM_API_KEY`; never expose it to browsers. The format is documented
-in [API key V0](../../server/auth/api-key.md).
+are owner-only on Unix. `pulsebeam.key` contains the opaque secret to set as
+`PULSEBEAM_API_KEY`; never parse it or expose it to browsers.
 
 For a local `pulsebeam --dev` server, mint a one-hour development bearer token
 with fixed development credentials:
