@@ -69,91 +69,86 @@ users and authorize room access before issuing tokens.
 
 For Rust, Go, or Python backends, use the corresponding server SDK.
 
-## 3. Your React frontend: join the room
+## 3. Your React frontend: capture and join
 
-Install the React SDK in your app:
+Install the React SDK in your application:
 
 ```sh
 npm install @pulsebeam/react
 ```
 
-Pass the token from **your application backend** into a `Room` component:
+**Capture and the Agent are independent.** The parent owns the camera and
+microphone; the keyed room owns the PulseBeam session. Pass in a token from
+your application's backend.
 
 ```tsx
-import { useEffect, useState } from "react";
-import { Video, useAgent, useUserMedia } from "@pulsebeam/react";
+import { useEffect } from "react";
+import {
+  Video, useAgent, useUserMedia, type CaptureResult,
+} from "@pulsebeam/react";
 
-export function Room({ token }: { token: string }) {
-  const agent = useAgent({ endpoint: "http://localhost:7070", token });
+export function Call({ sessionId, token }: { sessionId: string; token: string }) {
   const media = useUserMedia({ video: true, audio: true });
-  const [joinError, setJoinError] = useState<string | null>(null);
 
-  // Send captured camera/microphone tracks to PulseBeam when they become available.
+  async function enableDevices() {
+    try {
+      await media.request();
+    } catch {
+      // useUserMedia exposes the failure through media.error.
+    }
+  }
+
+  return (
+    <>
+      <button onClick={enableDevices}>Enable camera & mic</button>
+      {media.error && <p role="alert">{media.error.message}</p>}
+      <Video source={media.videoTrack} mirror style={{ width: 320, height: 240 }} />
+      <Room key={sessionId} token={token} media={media} />
+    </>
+  );
+}
+
+function Room({ token, media }: { token: string; media: CaptureResult }) {
+  const agent = useAgent({ endpoint: "http://localhost:7070", token });
+
   useEffect(() => {
-    if (!agent) return;
     agent.local.video("camera").setSource(media.videoTrack);
     agent.local.audio("microphone").setSource(media.audioTrack);
   }, [agent, media.videoTrack, media.audioTrack]);
 
-  async function handleJoin() {
-    if (!agent) return;
-    setJoinError(null);
-    try {
-      agent.connect();
-      await media.request();
-    } catch (error) {
-      setJoinError(error instanceof Error ? error.message : String(error));
-    }
-  }
-
-  const snapshot = agent?.getSnapshot();
-  const connectionError =
-    snapshot?.connection === "terminal-failure" ? snapshot.failure?.message : null;
+  const { connection, failure } = agent.getSnapshot();
 
   return (
-    <main>
-      <button
-        disabled={!agent || media.state === "requesting"}
-        onClick={handleJoin}
-      >
-        Join
-      </button>
-      <Video
-        source={media.videoTrack}
-        mirror
-        style={{ width: 320, height: 240 }}
-      />
-      {agent?.remote.videoTracks.map((track) => (
+    <>
+      <button onClick={() => agent.connect()}>Join room</button>
+      <button onClick={() => agent.disconnect()}>Leave room</button>
+      <p>Connection: {connection}</p>
+      {connection === "terminal-failure" && failure && (
+        <p role="alert">{failure.message}</p>
+      )}
+      {agent.remote.videoTracks.map((track) => (
         <Video
           key={`${track.participantId}:${track.label}`}
           source={track}
           style={{ width: 320, height: 240 }}
         />
       ))}
-      {(joinError || connectionError) && (
-        <p role="alert">{joinError || connectionError}</p>
-      )}
-    </main>
+    </>
   );
 }
 ```
 
-`useAgent` owns the room session; `useUserMedia` owns camera/microphone capture.
-Clicking **Join** connects to PulseBeam and asks for device permission.
-The effect publishes tracks after capture succeeds; `Video` shows your preview
-and other participants. Capture errors appear in the page, while the Agent
-reports connection failures through its snapshot.
-
-Only the **token** comes from your backend. WebRTC media goes directly between
-the browser and PulseBeam. Remote audio plays automatically when allowed.
+The effect keeps publications synchronized with captured sources, including
+device changes. `connect()` records connection intent; the Agent handles
+retries. The browser sends media directly to PulseBeam, not through your
+application backend. To switch rooms or participants, change `sessionId`
+(the React key); refreshing a token for the same session preserves its Agent.
 
 ## 4. Try it
 
-Start your React app and open it in two tabs. Give each tab a **different token**
-for the same `demo` room, then click **Join** in both. Each tab should show
-its own camera and the other participant's video and audio. Use headphones to
-avoid feedback. For leaving, audio playback recovery, and error UI, see
-[controls and audio](/react/guides).
+Open your app in two tabs with different participant tokens for the same
+`demo` room. Enable devices and join in both tabs. Each should display the
+other's video and play remote audio. Use headphones to avoid feedback.
 
 ## Complete example
 
