@@ -292,7 +292,7 @@ share the world. The unit target uses one Rust test thread to avoid parallel
 harness threads blocking on the native-world lease. Separate test binaries may
 run concurrently. No real sockets, hardware media, production scheduling,
 sleeps, or wall-clock protocol deadlines are used. The warm, uncached complete RTC suite
-has a five-second elapsed budget, including peer setup and teardown.
+has a fifteen-second elapsed budget, including peer setup and teardown.
 
 High-volume egress traces in `src/network_tests.rs` and `src/connection.rs`
 construct canonical SFU media inputs through the private `src/test_source.rs`

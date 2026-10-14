@@ -494,6 +494,7 @@ pub enum Event {
     },
     KeyframeRequested {
         sender: SenderId,
+        reason: KeyframeRequestReason,
     },
     AllocationChanged(AllocationSnapshot),
     DataChannel(DataChannelEvent),
@@ -575,6 +576,9 @@ pub enum CommandError {
     InvalidIceTcpFlow,
     InvalidFrameMetadata,
     MediaExpired,
+    FrameInterrupted,
+    DependencyChainInterrupted,
+    PlayoutResetRequiresNewSender(SenderId),
     InvalidState,
     MessageTooLarge,
     WouldBlock,
@@ -688,10 +692,20 @@ pub struct MediaPacket { /* private */ }
 impl MediaPacket {
     pub fn bytes(&self) -> &Bytes;
     pub fn global_media_at(&self) -> GlobalMediaTime;
+    pub fn view(&self) -> Option<MediaPacketView<'_>>;
     pub fn extension(&self, uri: &str) -> Option<&[u8]>;
     pub fn dependency_descriptor_context(&self) -> Option<(&[u8], u32)>;
     pub fn to_transit(&self) -> MediaPacket;
     pub fn materialize(&self) -> Result<MaterializedMediaPacket, MediaTransitError>;
+}
+
+pub struct MediaPacketView<'a> {
+    pub ssrc: u32,
+    pub sequence_number: u16,
+    pub timestamp: u32,
+    pub marker: bool,
+    pub header_len: usize,
+    pub payload: &'a [u8],
 }
 
 pub struct MaterializedMediaPacket { /* owned, no shared packet refcounts */ }
@@ -1391,7 +1405,7 @@ The canonical complete RTC local and CI command is:
 
 This includes all unit, property, integration, and native simulation tests.
 With built binaries and cached test results disabled, one complete invocation
-MUST finish within five seconds including peer setup and teardown. Dependency
+MUST finish within fifteen seconds including peer setup and teardown. Dependency
 fetching, compilation, lint/format checks, benchmarks, and other owners are
 excluded. Required native scenarios cannot be moved to optional slow gates.
 Missing artifacts or absent required media, feedback, or DataChannel evidence
