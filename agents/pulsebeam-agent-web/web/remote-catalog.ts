@@ -195,6 +195,10 @@ export class RemoteCatalog implements RemoteMedia {
   ) {
     this.#playback = new RemoteAudioPlayback(logLevel);
   }
+  setLogLevel(level: LogLevel): void {
+    this.#playback.setLogLevel(level);
+  }
+
   get closed(): boolean {
     return this.#closed;
   }

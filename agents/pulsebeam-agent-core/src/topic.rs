@@ -342,6 +342,10 @@ impl Topics {
         }
     }
 
+    pub(crate) fn set_log_level(&mut self, level: LogLevel) {
+        self.log_level = level;
+    }
+
     pub(crate) fn end_session(
         &mut self,
         snapshot: &mut Snapshot,
