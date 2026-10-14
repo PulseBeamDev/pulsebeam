@@ -335,10 +335,14 @@ class AgentFacade implements Agent {
   readonly #topology: Required<MediaTopology>;
   #pendingToken: string | undefined;
   #closed = false;
-  readonly #ready: Promise<Runtime>;
+  #active = false;
+  #activation = 0;
+  #ready: Promise<Runtime> = new Promise(() => {});
+  readonly #runtimeConfig: RuntimeConfig;
 
-  constructor(config: AgentConfig) {
+  constructor(config: AgentConfig, managed = false) {
     const runtimeConfig = copyConfig(config);
+    this.#runtimeConfig = runtimeConfig;
     this.#topology = runtimeConfig.topology;
     this.#remote = new RemoteCatalog(
       this,
@@ -363,27 +367,38 @@ class AgentFacade implements Agent {
         this.#applyState(this.#state);
       },
     );
+    if (!managed) this.activate();
+  }
+
+  // React can create an inert handle during render. Activation only happens
+  // after React commits, and can be repeated after Strict Mode effect cleanup.
+  activate(): void {
+    if (this.#closed) throw new Error("agent is closed");
+    if (this.#active) return;
+    this.#active = true;
+    const activation = ++this.#activation;
+    const active = () => !this.#closed && this.#active && activation === this.#activation;
     this.#ready = whenInitialized()
       .catch((error: unknown) => {
-        this.#terminalFailure("initialization", message(error));
+        if (active()) this.#terminalFailure("initialization", message(error));
         throw error;
       })
       .then(() => {
-        if (this.#closed) throw new Error("agent is closed");
+        if (!active()) throw new Error("agent is inactive");
         let runtime: Runtime;
         try {
-          runtime = new BrowserRuntime(runtimeConfig);
+          runtime = new BrowserRuntime(this.#runtimeConfig);
         } catch (error) {
-          this.#terminalFailure("invalid-configuration", message(error));
+          if (active()) this.#terminalFailure("invalid-configuration", message(error));
           throw error;
         }
         this.#runtime = runtime;
-        runtime.set_event_listener((event: unknown) =>
-          this.#runtimeEvent(event),
-        );
-        runtime.set_error_listener((error: unknown) =>
-          this.#emitFailure(localFailureClass(error), message(error)),
-        );
+        runtime.set_event_listener((event: unknown) => {
+          if (active()) this.#runtimeEvent(event);
+        });
+        runtime.set_error_listener((error: unknown) => {
+          if (active()) this.#emitFailure(localFailureClass(error), message(error));
+        });
         try {
           if (this.#pendingToken !== undefined) {
             runtime.renew_authorization(this.#pendingToken);
@@ -393,17 +408,47 @@ class AgentFacade implements Agent {
             desiredValue(this.#effectiveState(this.#state)),
           );
         } catch (error) {
-          this.#terminalFailure("invalid-configuration", message(error));
+          if (active()) this.#terminalFailure("invalid-configuration", message(error));
           runtime.abort();
           this.#runtime = undefined;
           throw error;
         }
-        runtime.set_snapshot_listener((snapshot: RuntimeSnapshot) =>
-          this.#runtimeSnapshot(runtime, snapshot),
-        );
+        runtime.set_snapshot_listener((snapshot: RuntimeSnapshot) => {
+          if (active()) this.#runtimeSnapshot(runtime, snapshot);
+        });
+        // A Strict Mode cleanup may have interrupted local-track operations.
+        // Reapply the currently desired captured sources to each fresh runtime.
+        for (const [slot, label] of this.#reservedSlots) {
+          const video = slot.startsWith("v");
+          const source = video
+            ? this.#localVideoHandles.get(label)?.source
+            : this.#localAudioHandles.get(label)?.source;
+          if (!source) continue;
+          void this.replaceLocalTrack(
+            slot,
+            nativeCaptureTrack(source, video ? "video" : "audio"),
+            video ? { contentHint: "motion" } : { contentHint: "speech" },
+          ).catch(() => {});
+        }
         return runtime;
       });
     void this.#ready.catch(() => {});
+  }
+
+  deactivate(): void {
+    if (!this.#active || this.#closed) return;
+    this.#active = false;
+    ++this.#activation;
+    const runtime = this.#runtime;
+    this.#runtime = undefined;
+    if (runtime) {
+      runtime.set_snapshot_listener();
+      runtime.set_event_listener();
+      runtime.set_error_listener();
+      runtime.close();
+      runtime.abort();
+    }
+    this.#publish(emptySnapshot("disconnected"));
   }
 
   readonly local: LocalMedia = Object.freeze({
@@ -650,6 +695,7 @@ class AgentFacade implements Agent {
 
   close(): void {
     if (this.#closed) return;
+    this.deactivate();
     this.#closed = true;
     const runtime = this.#runtime;
     this.#runtime = undefined;
@@ -819,6 +865,15 @@ class AgentFacade implements Agent {
   #emit(event: AgentEvent): void {
     for (const listener of [...this.#eventListeners]) listener(event);
   }
+}
+
+export interface ManagedAgent extends Agent {
+  activate(): void;
+  deactivate(): void;
+}
+
+export function createManagedAgent(config: AgentConfig): ManagedAgent {
+  return new AgentFacade(config, true);
 }
 
 export function createAgent(config: AgentConfig): Agent {
