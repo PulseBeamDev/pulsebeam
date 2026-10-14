@@ -6,7 +6,7 @@ description: Add one feature to your working room.
 # Add one feature
 
 Start from the [working room](/react/quickstart). Pick what you want to build.
-All examples use `@pulsebeam/react`; check that `useAgent` has returned an Agent.
+All examples use `@pulsebeam/react`; `useAgent` supplies a handle from the first render.
 
 | Build | Jump to |
 | --- | --- |
@@ -66,8 +66,9 @@ Do not clear handles in an effect cleanup after their Agent has closed.
 3. Bind `share.videoTrack` to `agent.local.video("screen")`; preview without mirroring.
 4. To stop, call `share.stop()` and clear the publication.
 
-**You see:** a separate screen video. Reserve two local video slots for simultaneous
-camera and screen; the quickstart reserves only one. Browser **Stop sharing** also
+**You see:** a separate screen video. The default reserves two local video slots, enough
+for one camera and one screen publication. Additional video labels require
+explicit capacity. Browser **Stop sharing** also
 ends capture. Changing options never opens the chooser automatically.
 Display audio depends on the browser and selected surface, even with `audio: true`.
 
@@ -84,7 +85,9 @@ hiding or unmounting releases it. Multiple views share the maximum size.
 For tuning, call
 `track.setReceiveOptions({minHeight: 180, minFps: 15, priority: 100})`.
 Policy alone does not request hidden video. Excess views beyond `remoteVideos`
-stay unassigned and warn; show fewer or change topology, which replaces the Agent.
+stay unassigned and warn. The default is 16 remote video slots; set a custom
+topology before connection if you need more. Changing it recreates the Agent;
+automatic capacity growth is not supported yet.
 
 Known participant? `agent.remote.participant("alice").video("camera")` works
 before discovery and survives republication. [Exact policies](/react/reference#remote-media).
@@ -129,8 +132,8 @@ sequenceDiagram
 ```
 
 Fetch before `snapshot.authorizationExpiresAt` (Unix seconds), then update only
-`config.token`. The hook renews the same Agent; changing endpoint, topology, or
-logging replaces it. Caller-owned Agents use `renewAuthorization(token)`.
+`config.token`. The hook renews the same Agent; changing endpoint or topology replaces it; logging changes update in place.
+Caller-owned Agents use `renewAuthorization(token)`.
 The SDK does not fetch tokens. Keep keys server-side, report renewal failures,
 and use a new Agent to change room or participant.
 

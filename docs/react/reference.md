@@ -23,18 +23,21 @@ Need a working app first? [Install the SDK and add a room](/react/quickstart).
 ## useAgent
 
 ```ts
-useAgent(config: AgentConfig): Agent | null
+useAgent(config: AgentConfig): Agent
 ```
 
-Creates an independent Agent after mount and subscribes the component to its
-snapshots. It does not connect or start capture automatically.
+Returns an Agent handle from the first render and subscribes the component to
+its snapshots. The handle is inert during rendering; React activates its runtime
+after commit. It does not connect or start capture automatically.
 
 | Lifecycle | Result |
 | --- | --- |
-| Before creation or during replacement | Returns null |
-| Token-only change | Calls `renewAuthorization` on the existing Agent |
-| Endpoint/topology/logging change | Replaces the Agent |
-| Unmount | Closes the hook-owned Agent |
+| First render | Returns a handle (no loading-time `null`) |
+| Token-only change | Renews authorization on the existing Agent |
+| Endpoint/topology change | Replaces the Agent with a new inert handle |
+| Logging change | Updates the existing Agent without replacement |
+| React key changes | Remounts the component and creates a new session |
+| Unmount | Releases Agent runtime resources; does not stop caller-owned capture |
 
 ### Configuration types
 
@@ -44,11 +47,14 @@ snapshots. It does not connect or start capture automatically.
 | --- | --- |
 | `endpoint` | Required absolute HTTP(S) base URL; the runtime adds `/api/v1/native` |
 | `token` | Required opaque bearer token |
-| `topology` | Required `MediaTopology`; reserves fixed media-slot capacity |
+| `topology` | Optional `MediaTopology`; omitted values use the defaults below |
 | `logging` | Optional `AgentLogging` |
 
-**MediaTopology** fields are optional; capacity is fixed for the Agent lifetime.
-Directions support at most 32 media sections.
+**MediaTopology** fields are optional. The SDK reserves these outgoing and
+incoming **track slots** when an Agent is created; they are not participant
+limits. Capacity stays fixed for that Agent's lifetime; each individual
+field is capped at 32 slots (local video, local audio, remote video, and
+remote audio).
 
 | Field | Default |
 | --- | --- |
@@ -57,9 +63,18 @@ Directions support at most 32 media sections.
 | `remoteVideos` | 16 |
 | `remoteAudios` | 8 |
 
+Local publication labels permanently claim a slot for the lifetime of the
+Agent, even after withdrawal. Creating more local labels than the reserved
+slots throws `LocalTrackCapacityError`; remote media beyond reserved receiver
+slots cannot be assigned. Set only the fields you need, for example
+`topology: { remoteVideos: 4 }`; unspecified fields retain their defaults.
+**Today, increasing any capacity means replacing the Agent and reconnecting.**
+Automatic resizing is planned, not implemented.
+
 **AgentLogging / LogLevel:** optional `level`, default `warn`.
 Supported levels: `off`, `error`, `warn`, `info`, `debug`, `trace`.
-Console logging is scoped to each Agent. Chrome needs Verbose enabled for debug/trace.
+Console logging is scoped to each Agent and can be changed in place via
+`agent.setLogging(level)`. Chrome needs Verbose enabled for debug/trace.
 
 Configuration and runtime initialization failures appear through Agent failure
 snapshots/events. Browser assets and APIs must be available. Connection intent
@@ -71,9 +86,8 @@ is not admission. See [connection diagnostics](/react/troubleshooting#admission-
 createAgent(config: AgentConfig): Agent
 ```
 
-Returns a caller-owned Agent synchronously, possibly before WebAssembly (WASM)
-initialization finishes. It starts disconnected and retains the latest complete
-desired state during initialization. Prefer `useAgent` for React ownership.
+Returns a caller-owned Agent synchronously. It starts disconnected and retains
+the latest desired state while initializing. Prefer `useAgent` for React ownership.
 
 The caller owns `subscribe`/`subscribeEvents` unsubscribe functions and
 `close()`. Unsubscribe and close are idempotent; close is terminal, fences
@@ -95,6 +109,7 @@ execute browser runtime initialization in SSR.
 | `getSnapshot(): AgentSnapshot` | Current immutable observable snapshot |
 | `subscribe(listener): () => void` | Snapshot notifications; caller cleans up unless using `useAgent` |
 | `subscribeEvents(listener): () => void` | Diagnostics and topic events; caller cleans up |
+| `setLogging(level): void` | Update diagnostic verbosity without restarting the session |
 | `close(): void` | Terminal, idempotent teardown |
 
 Admission supplies authoritative external IDs and expiry. Renew before expiry

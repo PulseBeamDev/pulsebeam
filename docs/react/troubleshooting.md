@@ -13,7 +13,7 @@ Pick the symptom. Fix the first failing step, then try again.
 | Can't join or stay connected | [Connection](#admission-and-connection) |
 | Connected, but no video or sound | [Media](#missing-media) |
 | Playback blocked | [Autoplay](#autoplay) |
-| SDK won't initialize | [Packages/WASM](#package-and-wasm) |
+| SDK won't initialize | [SDK initialization](#sdk-initialization) |
 | Messages fail or disappear | [Topics](#topic-failures) |
 
 ## Permission and capture failures
@@ -52,6 +52,22 @@ For more detail, enable `logging: {level: "debug"}` and Chrome's Verbose console
 level. Changing logging replaces a hook-owned Agent. **Never log bearer tokens.**
 Reconnect cannot repair bad credentials or missing assets.
 
+## Container networking
+
+The published server image is `linux/amd64`, but the host may be Linux,
+macOS, or Windows. On an ARM host, enable amd64 emulation in your container
+runtime. On Docker Desktop (macOS/Windows), `--network=host` requires
+[host networking to be enabled](https://docs.docker.com/engine/network/drivers/host/)
+(Docker Desktop 4.34+). With Podman Machine, `--network=host` refers to the
+Linux VM's network, not your macOS/Windows host.
+
+If `http://localhost:7070` works but connecting or receiving media fails,
+check UDP 3478 **and the RTC IP address the server advertises at startup**.
+PulseBeam currently selects that address from its network interfaces; an
+address inside a container/VM may not be reachable from your browser.
+Forwarding ports alone does not fix an unreachable advertised ICE address.
+Native Linux host networking avoids this extra VM boundary.
+
 ## Missing media
 
 Check in order:
@@ -81,27 +97,18 @@ Do not defer the gesture behind a network request or replace it with a timer.
 With `autoPlay={false}`, video still requests media; provide native controls.
 If recovery fails, inspect the browser error.
 
-## Package and WASM
+## SDK initialization
 
-Start with the [npm installation](/react/quickstart#1-install-the-sdk) and
-[browser entry setup](/react/quickstart#2-set-up-the-browser-entry).
-The published `@pulsebeam/react@0.2.0` package depends on `@pulsebeam/web@^0.2.0`;
-the Web package includes the compiled WebAssembly (WASM) runtime.
+If the SDK doesn't initialize, verify that React SDK code runs in the browser
+(not during server rendering) and that you're using compatible SDK versions.
+With Next.js App Router, mark browser components `"use client"`.
 
-1. In Network, find the request for `pulsebeam_agent_web_bg.wasm`. It must
-   return the WASM file with `Content-Type: application/wasm`, not an HTML
-   fallback or a 404.
-2. If the request goes to Vite's optimized dependency directory, apply the
-   quickstart's `optimizeDeps.exclude` configuration and restart Vite with
-   `npx vite --force`. Test both development serving and `npx vite build`.
-3. For other bundlers, emit or copy the WASM asset at the URL resolved relative
-   to the loader module. Check the deployed base path and Content Security Policy.
-4. Keep JavaScript, declarations, and WASM from the same package build; do not
-   substitute a WASM file from another release or local checkout.
-5. Check WebRTC/Web Audio support; initialize only in the browser, never during SSR.
+If the browser reports a missing `pulsebeam_agent_web_bg.wasm` file or a
+WebAssembly loading error, check the failed request in Network. This is an SDK
+packaging/bundler integration issue, **not an application file to copy manually**.
+Report it with the SDK version, your framework/bundler version, and the failing request.
 
-Try **Open room** and **Join** again. Successful WASM loading gets you past
-initialization; it does not by itself confirm server admission or media delivery.
+See [the quickstart](/react/quickstart) to retry a minimal integration.
 
 ## Topic failures
 

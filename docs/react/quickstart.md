@@ -1,207 +1,157 @@
 ---
 title: React quickstart
-description: Install the SDK and add a two-participant video room to a React application.
+description: Add live video and audio to your React app.
 ---
 
-# Add your first React room
+# Add video and audio to React
 
-**See another participant's video and hear their microphone in your own app.**
+You own **your application's backend** and **React frontend**. PulseBeam
+provides the separate media server, which you run.
 
-This example uses the published React SDK. You can adapt the `Room` component
-in an existing browser-rendered React app, or follow the small Vite setup below
-in a new directory. No PulseBeam repository checkout is needed for the client.
-
-## Before you start
-
-- **Server and credentials:** a compatible PulseBeam endpoint and two unexpired
-  participant tokens for the **same room**, with **different participant IDs**.
-  Your application's token backend supplies these. If you do not have one yet,
-  use the [local development sandbox](#local-development-sandbox).
-- **Client tooling:** Node.js 22 and npm for this example; React 18 or newer.
-  The code below uses React/React DOM 18.3.1 and Vite 5.4.21.
-- **Browser:** camera, microphone, headphones, and browser support for WebRTC,
-  WebAssembly, Web Audio, and `navigator.mediaDevices.getUserMedia`.
-  Capture requires **HTTPS or localhost**. An HTTPS page cannot connect to an
-  insecure remote HTTP endpoint.
-
-Use the server's HTTP(S) **base URL**, not `/api/v1/native`. Keep bearer tokens
-private. Signing secrets and token generation never belong in the browser.
-The React peer range is not a guarantee that every React version or browser
-has been tested.
-
-## 1. Install the SDK
-
-In an existing React app:
-
-```bash
-npm install @pulsebeam/react@0.2.0
+```mermaid
+flowchart LR
+    subgraph app["Your application — code you own"]
+        backend["Backend: sign tokens"] -->|"participant token"| frontend["React frontend: runs in the browser"]
+    end
+    frontend <-->|"connection + media"| server["PulseBeam media server: you run"]
 ```
 
-The package installs its compatible `@pulsebeam/web` runtime dependency, including
-WebAssembly (WASM), the compiled browser runtime. Import application APIs from
-`@pulsebeam/react`.
+Works with Next.js, Vite, Astro + React, or your existing React app.
 
-For a new, minimal app, run this **instead** in an empty working directory:
+## 1. Run the PulseBeam media server
 
-```bash
-mkdir pulsebeam-room
-cd pulsebeam-room
-npm init -y
-npm install @pulsebeam/react@0.2.0 react@18.3.1 react-dom@18.3.1
-npm install --save-dev vite@5.4.21
-mkdir src
+With Docker (or Podman):
+
+```sh
+docker run --rm --network host ghcr.io/pulsebeamdev/pulsebeam:08eb663 --dev
 ```
 
-Keep the following client commands in this app directory, not in a PulseBeam checkout.
+The PulseBeam endpoint is `http://localhost:7070`.
 
-## 2. Set up the browser entry
-
-For the minimal app, create `index.html`:
-
-```html
-<!doctype html>
-<html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>PulseBeam room</title>
-  </head>
-  <body>
-    <div id="root"></div>
-    <script type="module" src="/src/main.tsx"></script>
-  </body>
-</html>
-```
-
-Create `vite.config.mjs`:
-
-```js
-export default {
-  esbuild: { jsx: "automatic" },
-  optimizeDeps: { exclude: ["@pulsebeam/react", "@pulsebeam/web"] },
-};
-```
-
-The exclusions keep Vite's development dependency optimizer from relocating
-the SDK loader without its WASM asset. Your bundler must preserve or emit
-`pulsebeam_agent_web_bg.wasm` at the loader's module-resolved URL. For another
-bundler, follow the [asset checks](/react/troubleshooting#package-and-wasm).
-Do not initialize the SDK during server-side rendering; mount this room in the
-browser. This is a plain React example, not a requirement to use Vite in your app.
-
-## 3. Add the room
-
-Create `src/Room.tsx`. The component connects only after **Join** and requests
-capture only after **Enable camera and microphone**. It binds captured sources
-to publications, shows a local preview, renders remote video, and offers audio
-and video playback recovery.
-
-<<< ./Room.tsx
-
-Create `src/main.tsx`. This browser entry asks for the endpoint and participant
-token, then mounts the room. The topology reserves one outgoing camera and
-microphone, and capacity for two incoming videos and audio tracks.
-
-<<< ./main.tsx
-
-In an existing app, mount `Room` with the same `AgentConfig` fields instead of
-replacing your entry point. Fetch tokens from your authenticated backend before
-mounting; the form is a manual credential input for this tutorial.
-
-## 4. Connect two participants
-
-For the minimal app:
-
-```bash
-npx vite --host 127.0.0.1
-```
-
-Keep the process running. Open the printed localhost URL in **two tabs**.
-In each tab, enter your server base URL and that tab's token, then click
-**Open room**. Replace the form's localhost default if using a remote server.
-
-| Tab A | Tab B |
-| --- | --- |
-| Token for participant `alice` | Token for participant `bob` |
-| Same server and room | Same server and room |
-
-In **both tabs**:
-
-1. Click **Join**. Wait for `Connection: connected` and the admitted participant ID.
-2. Click **Enable camera and microphone** and allow browser access. Your preview appears.
-3. Wave in one tab. The other tab should show the moving remote video.
-4. Speak and listen from the other participant. Wear headphones to avoid feedback.
-
-**Success:** both participants are connected, each sees the other's moving video,
-and remote microphone audio plays. A local preview or publication count alone
-is not proof of delivery.
-
-If audio is blocked, click **Enable remote audio**. If video playback is blocked,
-click **Retry video playback**. On one device, both tabs may share the same camera
-and microphone; use two devices if you need to distinguish the participants or
-if the browser cannot share capture. For remote devices, serve the app over HTTPS.
-
-## 5. Leave and release devices
-
-Click **Leave and stop capture**. The other tab should lose your publications.
-Click **Unmount room** in both tabs. Camera and microphone should no longer be active.
-
-`useAgent` closes its Agent on unmount; capture hooks stop their owned tracks on
-unmount. Disconnecting an Agent alone does not stop capture.
-
-## If a step fails
-
-- [SDK or WASM will not load](/react/troubleshooting#package-and-wasm)
-- [Camera or microphone is blocked](/react/troubleshooting#permission-and-capture-failures)
-- [Cannot join](/react/troubleshooting#admission-and-connection)
-- [Connected, but no video or sound](/react/troubleshooting#missing-media)
-
-## Move beyond the tutorial
-
-Before production, replace manual token entry with an authenticated backend
-handoff and [renew tokens before expiry](/react/guides#connection-renewal-and-errors).
-Use new Agents for a different room or participant. Development credentials
-must not be used for a public service.
-
-Next, [add screen sharing, device controls, or live messages](/react/guides),
-learn [how the room works](/react/), or [look up an API](/react/reference).
-
-## Local development sandbox
-
-This is an **optional source-based setup** for readers who do not yet have a
-compatible server and token backend. It is not required to install the browser SDK.
-A standalone token-helper download is not provided by the server release.
-
-You need a Linux x86_64 host and a [build-ready PulseBeam checkout](/build).
-Run these commands from its repository root. Start the server in one terminal:
-
-```bash
-./bazel run //:server -- --dev
-```
-
-Keep it running. In another terminal, mint two one-hour development tokens:
-
-```bash
-./bazel run //:cli -- token --room react-demo --participant alice
-./bazel run //:cli -- token --room react-demo --participant bob
-```
-
-Return to [step 4](#4-connect-two-participants) in your **client app directory**.
-Use `http://localhost:7070` and those tokens in the form. Keep both server and
-client running; do not create a second server or switch rooms during the tutorial.
-The dev server uses media port 3478. Expose neither its development credentials
-nor this sandbox as a production service.
-
-::: details Run the repository example instead
-To investigate or contribute to the SDK without creating a client app, run this
-from the same build-ready checkout:
-
-```bash
-./bazel run //agents/react:quickstart_dev
-```
-
-This serves the same `Room.tsx` and `main.tsx` with locally built SDK packages,
-not the npm installation. Open its printed URL in two tabs and use the **same
-endpoint and development tokens** above. The runner replaces the client process
-in step 4; it does not replace your server or token setup.
+::: warning Local development only
+`--dev` trusts a fixed test key whose signing secret is publicly known.
+Anyone can mint valid tokens for it. Never expose a `--dev` server publicly.
 :::
+
+## 2. Your app backend: issue a participant token
+
+In **your application's backend** (Node.js), install the server SDK:
+
+```sh
+npm install @pulsebeam/server
+```
+
+`INSECURE_DEV_API_KEY` is a single publicly known `key_0` credential matching
+the server's `--dev` identity. Production backends use their own
+`PULSEBEAM_API_KEY` secret; see the [V0 format](https://github.com/PulseBeamDev/pulsebeam/blob/main/server/auth/api-key.md).
+
+```ts
+import { signParticipantToken, INSECURE_DEV_API_KEY } from "@pulsebeam/server";
+
+function issueToken(participant: string) {
+  return signParticipantToken({
+    apiKey: INSECURE_DEV_API_KEY,
+    room: "demo",
+    participant,
+    expiration: Math.floor(Date.now() / 1000) + 3600,
+  });
+}
+```
+
+Call `issueToken(participantId)` for each stable application participant ID and send the resulting token to
+your React frontend through your application's API or server-rendered props.
+Never send signing credentials to the browser. **In production:** run PulseBeam
+without `--dev`, register your own public key with `--project-registry`, and
+keep the corresponding `PULSEBEAM_API_KEY` on your application backend. Authenticate
+users and authorize room access before issuing tokens.
+
+For Rust, Go, or Python backends, use the corresponding server SDK.
+
+## 3. Your React frontend: capture and join
+
+Install the React SDK in your application:
+
+```sh
+npm install @pulsebeam/react
+```
+
+**Capture and the Agent are independent.** The parent owns the camera and
+microphone; the keyed room owns the PulseBeam session. Pass in a token from
+your application's backend.
+
+```tsx
+import { useEffect } from "react";
+import {
+  Video, useAgent, useUserMedia, type CaptureResult,
+} from "@pulsebeam/react";
+
+export function Call({ sessionId, token }: { sessionId: string; token: string }) {
+  const media = useUserMedia({ video: true, audio: true });
+
+  async function enableDevices() {
+    try {
+      await media.request();
+    } catch {
+      // useUserMedia exposes the failure through media.error.
+    }
+  }
+
+  return (
+    <>
+      <button onClick={enableDevices}>Enable camera & mic</button>
+      {media.error && <p role="alert">{media.error.message}</p>}
+      <Video source={media.videoTrack} mirror style={{ width: 320, height: 240 }} />
+      <Room key={sessionId} token={token} media={media} />
+    </>
+  );
+}
+
+function Room({ token, media }: { token: string; media: CaptureResult }) {
+  const agent = useAgent({ endpoint: "http://localhost:7070", token });
+
+  useEffect(() => {
+    agent.local.video("camera").setSource(media.videoTrack);
+    agent.local.audio("microphone").setSource(media.audioTrack);
+  }, [agent, media.videoTrack, media.audioTrack]);
+
+  const { connection, failure } = agent.getSnapshot();
+
+  return (
+    <>
+      <button onClick={() => agent.connect()}>Join room</button>
+      <button onClick={() => agent.disconnect()}>Leave room</button>
+      <p>Connection: {connection}</p>
+      {connection === "terminal-failure" && failure && (
+        <p role="alert">{failure.message}</p>
+      )}
+      {agent.remote.videoTracks.map((track) => (
+        <Video
+          key={`${track.participantId}:${track.label}`}
+          source={track}
+          style={{ width: 320, height: 240 }}
+        />
+      ))}
+    </>
+  );
+}
+```
+
+The effect keeps publications synchronized with captured sources, including
+device changes. `connect()` records connection intent; the Agent handles
+retries. The browser sends media directly to PulseBeam, not through your
+application backend. To switch rooms or participants, change `sessionId`
+(the React key); refreshing a token for the same session preserves its Agent.
+
+## 4. Try it
+
+Open your app in two tabs with different participant tokens for the same
+`demo` room. Enable devices and join in both tabs. Each should display the
+other's video and play remote audio. Use headphones to avoid feedback.
+
+## Complete example
+
+Explore the [complete React example](https://github.com/PulseBeamDev/pulsebeam/tree/main/apps/meet)
+or see [capacity and configuration](/react/reference#configuration-types).
+
+Next: [screen sharing and controls](/react/guides) ·
+[API reference](/react/reference) · [Troubleshooting](/react/troubleshooting).
