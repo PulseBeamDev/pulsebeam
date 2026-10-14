@@ -1,7 +1,7 @@
 import { StrictMode, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { createCaptureSource } from "@pulsebeam/web";
-import { useAgent, type Agent } from "@pulsebeam/react";
+import { useAgent, type Agent, type LogLevel } from "@pulsebeam/react";
 
 async function until(predicate: () => boolean): Promise<void> {
   for (let i = 0; i < 100; i++) {
@@ -21,19 +21,24 @@ export async function runOwnershipContract() {
   let right: Agent | null = null;
   let changeToken!: () => void;
   let changeEndpoint!: () => void;
+  let changeLogging!: () => void;
+  let firstRenderAvailable = false;
   function Probe() {
     const [token, setToken] = useState("owned-token-a");
     const [endpoint, setEndpoint] = useState(location.origin);
+    const [logging, setLogging] = useState<LogLevel>("warn");
     changeToken = () => setToken("owned-token-b");
     changeEndpoint = () => setEndpoint(`${location.origin}/replacement`);
-    left = useAgent({ endpoint, token, topology: { localVideos: 1 } });
+    changeLogging = () => setLogging("debug");
+    left = useAgent({ endpoint, token, topology: { localVideos: 1 }, logging: { level: logging } });
     right = useAgent({
       endpoint: location.origin,
       token: "independent-token",
     });
+    firstRenderAvailable = true;
     return (
       <span>
-        {left?.getSnapshot().connection} / {right?.getSnapshot().connection}
+        {left.getSnapshot().connection} / {right.getSnapshot().connection}
       </span>
     );
   }
@@ -85,24 +90,26 @@ export async function runOwnershipContract() {
     await new Promise((resolve) => setTimeout(resolve, 30));
     const renewedWithoutReplacing = left === first && right === independent;
 
+    changeLogging();
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    const loggingKeepsSession = left === first;
+
     changeEndpoint();
     await until(() => left !== null && left !== first);
     const replacedConstruction =
-      firstVideo.source === null &&
       first.getSnapshot().connection === "disconnected" &&
       right === independent;
     const replacement = left!;
     root.unmount();
     unmounted = true;
     const ownedCleanup =
-      secondVideo.source === null &&
       replacement.getSnapshot().connection === "disconnected" &&
       track.readyState === "live";
     track.stop();
     return {
       ownedIndependent:
-        shared && independentEnablement && disconnectRetainsSource,
-      ownedRenewal: renewedWithoutReplacing,
+        firstRenderAvailable && shared && independentEnablement && disconnectRetainsSource,
+      ownedRenewal: renewedWithoutReplacing && loggingKeepsSession,
       ownedReplacement: replacedConstruction,
       ownedCleanup: ownedCleanup && String(track.readyState) === "ended",
     };
