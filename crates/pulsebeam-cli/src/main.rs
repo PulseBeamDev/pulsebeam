@@ -389,7 +389,10 @@ fn write_auth_key(config: AuthKeyConfig, signing_key: ApiSigningKey) -> Result<(
         );
     }
     if let Some(path) = &config.private_api_key {
-        if path == &config.private_signing_bundle || path == &config.public_registry || path.try_exists()? {
+        if path == &config.private_signing_bundle
+            || path == &config.public_registry
+            || path.try_exists()?
+        {
             anyhow::bail!("refusing to overwrite private API key {}", path.display());
         }
     }
@@ -1188,11 +1191,11 @@ mod tests {
     fn auth_key_initial_and_rotation_outputs_are_separate_and_public_safe() {
         let signing = ApiSigningKey::from_seed([7; 32]);
         let (initial_public, initial_private) = auth_paths("initial");
-        write_auth_key(
-            auth_config(None, initial_public.clone(), initial_private.clone()),
-            signing.clone(),
-        )
-        .unwrap();
+        let initial_api_key = initial_private.with_extension("key");
+        let mut initial_config =
+            auth_config(None, initial_public.clone(), initial_private.clone());
+        initial_config.private_api_key = Some(initial_api_key.clone());
+        write_auth_key(initial_config, signing.clone()).unwrap();
 
         let initial_public_json = std::fs::read_to_string(&initial_public).unwrap();
         let initial_registry = ProjectRegistry::parse_json(&initial_public_json).unwrap();
@@ -1207,6 +1210,12 @@ mod tests {
         assert_eq!(initial_bundle.project_id, initial_project.project_id);
         assert_eq!(initial_bundle.key_id, initial_project.keys[0].key_id);
         assert_eq!(initial_bundle.signing_key, signing);
+        let key_text = std::fs::read_to_string(&initial_api_key).unwrap();
+        let api_key: ApiKey = key_text.trim_end().parse().unwrap();
+        assert_eq!(api_key.project_id_bytes(), initial_bundle.project_id.as_bytes());
+        assert_eq!(api_key.key_id_bytes(), initial_bundle.key_id.as_bytes());
+        assert_eq!(api_key.signing_key(), signing);
+        assert!(!initial_public_json.contains("key_0"));
 
         let (rotation_public, rotation_private) = auth_paths("rotation");
         write_auth_key(
@@ -1231,6 +1240,7 @@ mod tests {
         for path in [
             initial_public,
             initial_private,
+            initial_api_key,
             rotation_public,
             rotation_private,
         ] {
