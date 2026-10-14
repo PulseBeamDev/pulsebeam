@@ -3,7 +3,13 @@
 `pulsebeam-server` exposes native Ed25519 signing through
 `pulsebeam_server::sign_participant_token`. Rust 1.92+ is required. There is no
 PulseBeam connectivity, WASM, foreign runtime, or dependency on the server/core
-crate. Public registry publication remains deferred.
+crate. Public key-registry publication is handled separately by the PulseBeam server.
+
+## Local development
+
+`insecure_dev_credentials()` returns one `api_key` plus legacy fields from
+the [shared development fixture](../auth/development.json), matching `--dev`
+servers. Use the new `sign_participant_token_with_api_key` entry point. **Never use them with production or publicly accessible servers.**
 
 ## Local crate consumption
 
@@ -24,19 +30,19 @@ repository paths. A future registry release must publish the shared dependency
 before the SDK; no registry publication is performed by this build.
 
 ```rust
-use pulsebeam_server::sign_participant_token;
+use pulsebeam_server::sign_participant_token_with_api_key;
 
-fn token() -> Result<String, Box<dyn std::error::Error>> {
-    let project = std::env::var("PULSEBEAM_PROJECT_ID")?;
-    let key = std::env::var("PULSEBEAM_KEY_ID")?;
-    let secret = std::env::var("PULSEBEAM_SECRET")?;
-    Ok(sign_participant_token(
-        &project, &key, &secret, "general", "Alice", 2_000_000_000,
+fn token(api_key: &str) -> Result<String, Box<dyn std::error::Error>> {
+    Ok(sign_participant_token_with_api_key(
+        api_key, "general", "Alice", 2_000_000_000,
     )?)
 }
 ```
 
-All six inputs are mandatory. The SDK never reads the environment. Expiration
+The opaque API key plus room, participant and expiration are mandatory. The
+original six-argument `sign_participant_token` remains for compatibility.
+The SDK validates API keys without exposing their representation and never reads
+the environment. Expiration
 is a `u64` absolute Unix timestamp in `0..18446744073709551615`, not a TTL.
 Rust rejects missing arguments, booleans, floats, strings, negative constants
 and overflowing constants before signing. Validate externally supplied values
@@ -44,10 +50,9 @@ instead of casting them to `u64`. No clock is consulted. Zero and past expiratio
 may be signed, but authorize nothing at or after expiry.
 
 Room and participant are case-sensitive external IDs of 1–36 ASCII characters
-in `[A-Za-z0-9_-]`. Project/key IDs must be core V0 UUID v7 identities. The
-`sk_0...` secret is a 32-byte Ed25519 seed, not a public or expanded private key.
-Credential aliases are canonicalized; external IDs are never normalized or
-trimmed. Invalid string inputs return `SigningError` without a token. Errors
+in `[A-Za-z0-9_-]`. API keys are opaque; the legacy three-field API retains
+its original validation rules. External IDs are never normalized or trimmed.
+Invalid string inputs return `SigningError` without a token. Errors
 and default diagnostics do not disclose credential values or decoded seeds.
 
 Keep signing secrets on your server, never in clients or logs. Offline signing
