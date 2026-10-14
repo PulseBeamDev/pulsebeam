@@ -6,7 +6,7 @@ import sys
 import tarfile
 import tempfile
 
-archive, go, tests, vectors = (pathlib.Path(p).resolve() for p in sys.argv[1:])
+archive, go, tests, vectors, development = (pathlib.Path(p).resolve() for p in sys.argv[1:])
 with tempfile.TemporaryDirectory() as directory:
     root = pathlib.Path(directory)
     module = root / "module"
@@ -21,5 +21,5 @@ with tempfile.TemporaryDirectory() as directory:
         f"replace github.com/PulseBeamDev/pulsebeam/server/go => {module}\n"
     )
     (consumer / "auth_test.go").write_bytes(tests.read_bytes())
-    env = {**os.environ, "GOROOT": str(go.parent.parent), "GOPROXY": "off", "GOSUMDB": "off", "GOTOOLCHAIN": "local", "CGO_ENABLED": "0", "GOCACHE": str(root / "cache"), "GOMODCACHE": str(root / "modules"), "PULSEBEAM_VECTORS": str(vectors)}
+    env = {**os.environ, "GOROOT": str(go.parent.parent), "GOPROXY": "off", "GOSUMDB": "off", "GOTOOLCHAIN": "local", "CGO_ENABLED": "0", "GOCACHE": str(root / "cache"), "GOMODCACHE": str(root / "modules"), "PULSEBEAM_VECTORS": str(vectors), "PULSEBEAM_DEVELOPMENT": str(development)}
     subprocess.run([str(go), "test", "./..."], cwd=consumer, env=env, check=True)

@@ -4,7 +4,11 @@
 //! environment lookup, service call, or registration check is performed.
 //! Keep signing secrets on your server and send only the token to clients.
 
+pub mod development;
+pub use development::{InsecureDevCredentials, insecure_dev_credentials};
+
 use data_encoding::BASE64URL_NOPAD;
+use pulsebeam_auth::api_key::{ApiKey, ApiKeyError};
 use pulsebeam_auth::identity::{IdValidationError, format_id, parse_id, validate_external};
 use pulsebeam_auth::keys::{ApiSigningKey, KeyValidationError};
 use serde::Serialize;
@@ -20,6 +24,8 @@ pub enum SigningError {
     },
     #[error("invalid signing secret: {0}")]
     Secret(#[from] KeyValidationError),
+    #[error("invalid API key: {0}")]
+    ApiKey(#[from] ApiKeyError),
     #[error("could not encode participant token")]
     Encoding(#[from] serde_json::Error),
 }
@@ -123,4 +129,22 @@ pub fn sign_participant_token(
         "{signing_input}.{}",
         BASE64URL_NOPAD.encode(&signature)
     ))
+}
+
+/// Sign a participant JWT using one server-only `key_0` API key.
+///
+/// The key contains the project's UUIDv7, the key's UUIDv7, and the 32-byte
+/// Ed25519 signing seed. The emitted JWT is identical to signing with the
+/// three component credentials. The SDK does no environment or network I/O.
+pub fn sign_participant_token_with_api_key(
+    api_key: &str,
+    room: &str,
+    participant: &str,
+    expiration: u64,
+) -> Result<String, SigningError> {
+    let credential: ApiKey = api_key.parse()?;
+    let project = format_id("p", uuid::Uuid::from_bytes(*credential.project_id_bytes()));
+    let key = format_id("kid", uuid::Uuid::from_bytes(*credential.key_id_bytes()));
+    let secret = credential.signing_key().to_secret_string();
+    sign_participant_token(&project, &key, &secret, room, participant, expiration)
 }

@@ -222,7 +222,7 @@ mod tests {
                 Err(TokenError::Invalid)
             );
             let wrong_project = ProjectRegistry::new(vec![ProjectKeys {
-                project_id: DEVELOPMENT_PROJECT_ID,
+                project_id: *DEVELOPMENT_PROJECT_ID,
                 keys: vec![ProjectKey {
                     key_id: key,
                     verifying_key: signing.verifying_key(),
@@ -236,7 +236,7 @@ mod tests {
             let wrong_key = ProjectRegistry::new(vec![ProjectKeys {
                 project_id: project,
                 keys: vec![ProjectKey {
-                    key_id: pulsebeam_core::auth::DEVELOPMENT_API_KEY_ID,
+                    key_id: *pulsebeam_core::auth::DEVELOPMENT_API_KEY_ID,
                     verifying_key: signing.verifying_key(),
                 }],
             }])

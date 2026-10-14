@@ -914,10 +914,10 @@ mod tests {
 
     fn auth_registry() -> ProjectRegistry {
         ProjectRegistry::new(vec![ProjectKeys {
-            project_id: DEVELOPMENT_PROJECT_ID,
+            project_id: *DEVELOPMENT_PROJECT_ID,
             keys: vec![ProjectKey {
-                key_id: DEVELOPMENT_API_KEY_ID,
-                verifying_key: DEVELOPMENT_API_VERIFYING_KEY,
+                key_id: *DEVELOPMENT_API_KEY_ID,
+                verifying_key: *DEVELOPMENT_API_VERIFYING_KEY,
             }],
         }])
         .unwrap()

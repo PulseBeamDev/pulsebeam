@@ -131,10 +131,10 @@ pub async fn start_sfu_node_with(
         .with_http_api(http_api_addr)
         .with_project_registry(
             ProjectRegistry::new(vec![ProjectKeys {
-                project_id: DEVELOPMENT_PROJECT_ID,
+                project_id: *DEVELOPMENT_PROJECT_ID,
                 keys: vec![ProjectKey {
-                    key_id: DEVELOPMENT_API_KEY_ID,
-                    verifying_key: DEVELOPMENT_API_VERIFYING_KEY,
+                    key_id: *DEVELOPMENT_API_KEY_ID,
+                    verifying_key: *DEVELOPMENT_API_VERIFYING_KEY,
                 }],
             }])
             .expect("development registry is valid"),

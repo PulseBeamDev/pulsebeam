@@ -1,4 +1,4 @@
-use pulsebeam_server::sign_participant_token;
+use pulsebeam_server::{sign_participant_token, sign_participant_token_with_api_key};
 use serde::Deserialize;
 
 #[derive(Clone, Deserialize)]
@@ -54,6 +54,18 @@ fn public_artifact_conformance_and_diagnostics() {
             "{}",
             golden.name
         );
+        assert_eq!(
+            sign_participant_token_with_api_key(
+                "key_0067MYZ1001R0100000000000640RYKVW400Q00C00400000000S4SK88KCMFZ5PTKPVC6HQC2570YPWA66FKBAX64KD8SXQD9YWADYR",
+                &golden.input.room,
+                &golden.input.participant,
+                golden.input.expiration.parse().unwrap(),
+            )
+            .unwrap(),
+            golden.token,
+            "{}",
+            golden.name
+        );
     }
     for rejection in vectors.invalid {
         assert!(
@@ -101,5 +113,42 @@ fn public_artifact_conformance_and_diagnostics() {
             assert!(!diagnostic.contains(&input.secret), "{}", rejection.name);
         }
         assert!(!diagnostic.contains("4ccd089b28ff96da"));
+    }
+}
+
+#[test]
+fn packaged_development_credentials_match_canonical_json() {
+    let expected: serde_json::Value =
+        serde_json::from_str(include_str!("../../auth/development.json")).unwrap();
+    let actual = pulsebeam_server::insecure_dev_credentials().unwrap();
+    assert_eq!(actual.project_id, expected["projectId"].as_str().unwrap());
+    assert_eq!(actual.key_id, expected["keyId"].as_str().unwrap());
+    assert_eq!(actual.secret, expected["secret"].as_str().unwrap());
+    assert_eq!(actual.public_key, expected["publicKey"].as_str().unwrap());
+    assert_eq!(actual.api_key, expected["apiKey"].as_str().unwrap());
+    let token = pulsebeam_server::sign_participant_token(
+        &actual.project_id,
+        &actual.key_id,
+        &actual.secret,
+        "demo",
+        "alice",
+        2_000_000_000,
+    )
+    .unwrap();
+    assert!(!token.is_empty());
+    assert_eq!(
+        sign_participant_token_with_api_key(&actual.api_key, "demo", "alice", 2_000_000_000)
+            .unwrap(),
+        token
+    );
+    for invalid in [
+        actual.api_key.replacen("key_0", "key_1", 1),
+        actual.api_key[..actual.api_key.len() - 1].to_string(),
+        format!("{}1", &actual.api_key[..actual.api_key.len() - 1]),
+    ] {
+        assert!(
+            sign_participant_token_with_api_key(&invalid, "demo", "alice", 2_000_000_000)
+                .is_err()
+        );
     }
 }

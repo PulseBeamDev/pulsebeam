@@ -138,6 +138,10 @@ impl ApiSigningKey {
         Self(seed)
     }
 
+    pub(crate) fn seed_bytes(&self) -> &[u8; KEY_BYTES] {
+        &self.0
+    }
+
     pub fn verifying_key(&self) -> ApiVerifyingKey {
         ApiVerifyingKey(SigningKey::from_bytes(&self.0).verifying_key().to_bytes())
     }
