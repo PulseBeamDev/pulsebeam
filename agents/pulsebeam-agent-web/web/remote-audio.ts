@@ -16,7 +16,11 @@ export class RemoteAudioPlayback {
   #routes = new Map<number, Route>();
   #closed = false;
 
-  constructor(private readonly logLevel: LogLevel) {}
+  constructor(private logLevel: LogLevel) {}
+
+  setLogLevel(level: LogLevel): void {
+    this.logLevel = level;
+  }
 
   #contextForPlayback(): AudioContext {
     if (this.#closed) throw new Error("agent is closed");

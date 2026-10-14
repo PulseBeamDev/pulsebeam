@@ -1,4 +1,5 @@
-export { createAgent, LocalTrackCapacityError } from "./agent.js";
+export { createAgent, createManagedAgent, LocalTrackCapacityError } from "./agent.js";
+export type { ManagedAgent } from "./agent.js";
 export { createCaptureSource, nativeCaptureTrack } from "./capture-source.js";
 export type {
   CapturedAudioTrack,

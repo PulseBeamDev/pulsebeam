@@ -29,6 +29,17 @@ const agent = createAgent({
   logging: { level: "debug" },
 });
 
+const defaults = createAgent({
+  endpoint: "https://pulsebeam.example",
+  token: "opaque-token",
+});
+const overridden = createAgent({
+  endpoint: "https://pulsebeam.example",
+  token: "opaque-token",
+  topology: { remoteVideos: 3 },
+});
+void [defaults, overridden];
+
 declare const legacyConfig: import("../../web/index.js").AgentConfig;
 // @ts-expect-error room identity is owned by the bearer token
 legacyConfig.roomId;
