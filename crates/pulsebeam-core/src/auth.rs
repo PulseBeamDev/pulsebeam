@@ -1,31 +1,47 @@
-//! Authentication keys and the shared public project registry.
+//! Authentication keys and the shared public key registry.
 
 use crate::identity::{
     ApiKeyId, ParticipantExternalId, ParticipantId, ProjectId, RoomExternalId, RoomId,
 };
 use data_encoding::BASE64URL_NOPAD;
 use ed25519_dalek::{Signature, VerifyingKey};
-pub use pulsebeam_auth::keys::{ApiSigningKey, ApiVerifyingKey, KeyValidationError};
+pub use pulsebeam_auth::api_key::{ApiKey, ApiKeyError};
+pub use pulsebeam_auth::keys::{ApiPublicKey, ApiSigningKey, KeyValidationError};
 use serde::{Deserialize, Serialize, de};
-use std::{collections::HashMap, fmt};
+use std::{collections::HashMap, fmt, sync::LazyLock};
 
 #[cfg(test)]
 const KEY_BYTES: usize = 32;
 const REDACTED: &str = "[REDACTED]";
 pub const MAX_COMPACT_TOKEN_LEN: usize = 16_384;
 
-pub const DEVELOPMENT_PROJECT_ID: ProjectId =
-    ProjectId::from_bytes([0, 0, 0, 0, 0, 0, 0x70, 0, 0x80, 0, 0, 0, 0, 0, 0, 1]);
-pub const DEVELOPMENT_API_KEY_ID: ApiKeyId =
-    ApiKeyId::from_bytes([0, 0, 0, 0, 0, 0, 0x70, 0, 0x80, 0, 0, 0, 0, 0, 0, 2]);
-pub const DEVELOPMENT_API_SIGNING_KEY: ApiSigningKey = ApiSigningKey::from_seed([
-    0x9d, 0x61, 0xb1, 0x9d, 0xef, 0xfd, 0x5a, 0x60, 0xba, 0x84, 0x4a, 0xf4, 0x92, 0xec, 0x2c, 0xc4,
-    0x44, 0x49, 0xc5, 0x69, 0x7b, 0x32, 0x69, 0x19, 0x70, 0x3b, 0xac, 0x03, 0x1c, 0xae, 0x7f, 0x60,
-]);
-pub const DEVELOPMENT_API_VERIFYING_KEY: ApiVerifyingKey = ApiVerifyingKey::from_bytes_unchecked([
-    0xd7, 0x5a, 0x98, 0x01, 0x82, 0xb1, 0x0a, 0xb7, 0xd5, 0x4b, 0xfe, 0xd3, 0xc9, 0x64, 0x07, 0x3a,
-    0x0e, 0xe1, 0x72, 0xf3, 0xda, 0xa6, 0x23, 0x25, 0xaf, 0x02, 0x1a, 0x68, 0xf7, 0x07, 0x51, 0x1a,
-]);
+// The --dev server and all server SDKs use the same public test key.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DevCredentials {
+    project_id: ProjectId,
+    key_id: ApiKeyId,
+    secret: ApiSigningKey,
+    public_key: ApiPublicKey,
+}
+
+// This checked-in fixture is validated by the SDK credential tests. A malformed
+// embedded fixture is a build defect, not a recoverable user-input error.
+#[allow(clippy::expect_used)]
+fn load_dev_credentials() -> DevCredentials {
+    serde_json::from_str(include_str!("../../../server/auth/development.json"))
+        .expect("invalid PulseBeam development credentials")
+}
+
+static DEV_CREDENTIALS: LazyLock<DevCredentials> = LazyLock::new(load_dev_credentials);
+
+pub static DEVELOPMENT_PROJECT_ID: LazyLock<ProjectId> =
+    LazyLock::new(|| DEV_CREDENTIALS.project_id);
+pub static DEVELOPMENT_API_KEY_ID: LazyLock<ApiKeyId> = LazyLock::new(|| DEV_CREDENTIALS.key_id);
+pub static DEVELOPMENT_API_SIGNING_KEY: LazyLock<ApiSigningKey> =
+    LazyLock::new(|| DEV_CREDENTIALS.secret.clone());
+pub static DEVELOPMENT_API_PUBLIC_KEY: LazyLock<ApiPublicKey> =
+    LazyLock::new(|| DEV_CREDENTIALS.public_key);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VerifiedAuthorization {
@@ -176,7 +192,7 @@ fn take_string(object: &mut HashMap<String, UniqueJson>, name: &str) -> Result<S
 }
 
 pub fn verify_participant_token(
-    registry: &ProjectRegistry,
+    registry: &KeyRegistry,
     token: &str,
     now: u64,
 ) -> Result<VerifiedAuthorization, TokenError> {
@@ -230,16 +246,17 @@ pub fn verify_participant_token(
         return Err(TokenError::Expired);
     }
 
-    let verifying_key = registry
-        .verifying_key(&project_id, &key_id)
-        .ok_or(TokenError::Invalid)?;
+    if project_id != registry.project_id() {
+        return Err(TokenError::Invalid);
+    }
+    let public_key = registry.public_key(&key_id).ok_or(TokenError::Invalid)?;
     let signature = BASE64URL_NOPAD
         .decode(encoded_signature.as_bytes())
         .ok()
         .and_then(|bytes| Signature::from_slice(&bytes).ok())
         .ok_or(TokenError::Malformed)?;
     let signing_input = format!("{encoded_header}.{encoded_claims}");
-    VerifyingKey::from_bytes(verifying_key.as_bytes())
+    VerifyingKey::from_bytes(public_key.as_bytes())
         .map_err(|_| TokenError::Invalid)?
         .verify_strict(signing_input.as_bytes(), &signature)
         .map_err(|_| TokenError::Invalid)?;
@@ -257,142 +274,85 @@ pub fn verify_participant_token(
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ProjectKey {
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct KeyRegistryEntry {
     pub key_id: ApiKeyId,
-    pub verifying_key: ApiVerifyingKey,
+    pub public_key: ApiPublicKey,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ProjectKeys {
-    pub project_id: ProjectId,
-    pub keys: Vec<ProjectKey>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RegistryDocument {
-    projects: Vec<ProjectKeys>,
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct KeyRegistryDocument {
+    project_id: ProjectId,
+    keys: Vec<KeyRegistryEntry>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
-pub enum RegistryError {
-    #[error("invalid project registry JSON: {0}")]
+pub enum KeyRegistryError {
+    #[error("invalid key registry JSON: {0}")]
     InvalidJson(String),
-    #[error("duplicate project ID {0}")]
-    DuplicateProject(ProjectId),
     #[error("duplicate API key ID {0}")]
     DuplicateKey(ApiKeyId),
-    #[error("project {0} has no verifying keys")]
-    MissingKeys(ProjectId),
-    #[error("expected exactly one project, found {0}")]
-    ExpectedOneProject(usize),
+    #[error("key registry has no public keys")]
+    MissingKeys,
 }
 
 #[derive(Clone, Debug)]
-pub struct ProjectRegistry {
-    projects: Vec<ProjectKeys>,
-    project_index: HashMap<ProjectId, usize>,
-    key_index: HashMap<ApiKeyId, (usize, usize)>,
+pub struct KeyRegistry {
+    project_id: ProjectId,
+    keys: Vec<KeyRegistryEntry>,
+    key_index: HashMap<ApiKeyId, usize>,
 }
 
-impl ProjectRegistry {
-    pub fn new(projects: Vec<ProjectKeys>) -> Result<Self, RegistryError> {
-        let mut project_index = HashMap::with_capacity(projects.len());
-        let mut key_index = HashMap::new();
-        for (project_position, project) in projects.iter().enumerate() {
-            if project.keys.is_empty() {
-                return Err(RegistryError::MissingKeys(project.project_id));
-            }
-            if project_index
-                .insert(project.project_id, project_position)
-                .is_some()
-            {
-                return Err(RegistryError::DuplicateProject(project.project_id));
-            }
-            for (key_position, key) in project.keys.iter().enumerate() {
-                if key_index
-                    .insert(key.key_id, (project_position, key_position))
-                    .is_some()
-                {
-                    return Err(RegistryError::DuplicateKey(key.key_id));
-                }
+impl KeyRegistry {
+    pub fn new(
+        project_id: ProjectId,
+        keys: Vec<KeyRegistryEntry>,
+    ) -> Result<Self, KeyRegistryError> {
+        if keys.is_empty() {
+            return Err(KeyRegistryError::MissingKeys);
+        }
+        let mut key_index = HashMap::with_capacity(keys.len());
+        for (position, key) in keys.iter().enumerate() {
+            if key_index.insert(key.key_id, position).is_some() {
+                return Err(KeyRegistryError::DuplicateKey(key.key_id));
             }
         }
         Ok(Self {
-            projects,
-            project_index,
+            project_id,
+            keys,
             key_index,
         })
     }
 
-    pub fn parse_json(json: &str) -> Result<Self, RegistryError> {
-        let document: RegistryDocument = serde_json::from_str(json)
-            .map_err(|error| RegistryError::InvalidJson(error.to_string()))?;
-        Self::new(document.projects)
+    pub fn parse_json(json: &str) -> Result<Self, KeyRegistryError> {
+        let document: KeyRegistryDocument = serde_json::from_str(json)
+            .map_err(|error| KeyRegistryError::InvalidJson(error.to_string()))?;
+        Self::new(document.project_id, document.keys)
     }
 
-    pub fn to_pretty_json(&self) -> Result<String, RegistryError> {
-        serde_json::to_string_pretty(&RegistryDocument {
-            projects: self.projects.clone(),
+    pub fn to_pretty_json(&self) -> Result<String, KeyRegistryError> {
+        serde_json::to_string_pretty(&KeyRegistryDocument {
+            project_id: self.project_id,
+            keys: self.keys.clone(),
         })
-        .map_err(|error| RegistryError::InvalidJson(error.to_string()))
+        .map_err(|error| KeyRegistryError::InvalidJson(error.to_string()))
     }
 
-    pub fn projects(&self) -> &[ProjectKeys] {
-        &self.projects
+    pub fn project_id(&self) -> ProjectId {
+        self.project_id
     }
 
-    pub fn project(&self, project_id: &ProjectId) -> Option<&ProjectKeys> {
-        self.project_index
-            .get(project_id)
-            .and_then(|position| self.projects.get(*position))
+    pub fn keys(&self) -> &[KeyRegistryEntry] {
+        &self.keys
     }
 
-    pub fn verifying_key(
-        &self,
-        project_id: &ProjectId,
-        key_id: &ApiKeyId,
-    ) -> Option<&ApiVerifyingKey> {
-        let (project_position, key_position) = self.key_index.get(key_id)?;
-        let project = self.projects.get(*project_position)?;
-        if project.project_id != *project_id {
-            return None;
-        }
-        project
-            .keys
-            .get(*key_position)
-            .map(|key| &key.verifying_key)
-    }
-
-    pub fn only_project(&self) -> Result<&ProjectKeys, RegistryError> {
-        if self.projects.len() != 1 {
-            return Err(RegistryError::ExpectedOneProject(self.projects.len()));
-        }
-        self.projects
-            .first()
-            .ok_or(RegistryError::ExpectedOneProject(0))
-    }
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PrivateSigningBundle {
-    pub project_id: ProjectId,
-    pub key_id: ApiKeyId,
-    pub signing_key: ApiSigningKey,
-}
-
-impl fmt::Debug for PrivateSigningBundle {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("PrivateSigningBundle")
-            .field("project_id", &self.project_id)
-            .field("key_id", &self.key_id)
-            .field("signing_key", &REDACTED)
-            .finish()
+    pub fn public_key(&self, key_id: &ApiKeyId) -> Option<&ApiPublicKey> {
+        self.key_index
+            .get(key_id)
+            .and_then(|position| self.keys.get(*position))
+            .map(|key| &key.public_key)
     }
 }
 
@@ -407,14 +367,14 @@ mod tests {
 
     use super::*;
 
-    fn development_registry() -> ProjectRegistry {
-        ProjectRegistry::new(vec![ProjectKeys {
-            project_id: DEVELOPMENT_PROJECT_ID,
-            keys: vec![ProjectKey {
-                key_id: DEVELOPMENT_API_KEY_ID,
-                verifying_key: DEVELOPMENT_API_VERIFYING_KEY,
+    fn development_registry() -> KeyRegistry {
+        KeyRegistry::new(
+            *DEVELOPMENT_PROJECT_ID,
+            vec![KeyRegistryEntry {
+                key_id: *DEVELOPMENT_API_KEY_ID,
+                public_key: *DEVELOPMENT_API_PUBLIC_KEY,
             }],
-        }])
+        )
         .unwrap()
     }
 
@@ -475,17 +435,14 @@ mod tests {
         ApiKeyId::from_bytes([0, 0, 0, 0, 0, 0, 0x70, 0, 0x80, 0, 0, 0, 0, 0, 0, last])
     }
 
-    fn entry(project_id: ProjectId, key_ids: &[u8]) -> ProjectKeys {
-        ProjectKeys {
-            project_id,
-            keys: key_ids
-                .iter()
-                .map(|id| ProjectKey {
-                    key_id: key_id(*id),
-                    verifying_key: signing(*id).verifying_key(),
-                })
-                .collect(),
-        }
+    fn registry_keys(key_ids: &[u8]) -> Vec<KeyRegistryEntry> {
+        key_ids
+            .iter()
+            .map(|id| KeyRegistryEntry {
+                key_id: key_id(*id),
+                public_key: signing(*id).public_key(),
+            })
+            .collect()
     }
 
     #[test]
@@ -494,25 +451,14 @@ mod tests {
         let secret = signing.to_secret_string();
         assert_eq!(format!("{signing}"), REDACTED);
         assert_eq!(format!("{signing:?}"), REDACTED);
-        assert!(
-            !format!(
-                "{:?}",
-                PrivateSigningBundle {
-                    project_id: DEVELOPMENT_PROJECT_ID,
-                    key_id: DEVELOPMENT_API_KEY_ID,
-                    signing_key: signing,
-                }
-            )
-            .contains(&secret)
-        );
-        assert!(!format!("{:?}", secret.parse::<ApiVerifyingKey>().unwrap_err()).contains(&secret));
+        assert!(!format!("{:?}", secret.parse::<ApiPublicKey>().unwrap_err()).contains(&secret));
     }
 
     #[test]
     fn development_constants_form_one_ed25519_pair() {
         assert_eq!(
-            DEVELOPMENT_API_SIGNING_KEY.verifying_key(),
-            DEVELOPMENT_API_VERIFYING_KEY
+            DEVELOPMENT_API_SIGNING_KEY.public_key(),
+            *DEVELOPMENT_API_PUBLIC_KEY
         );
         assert_eq!(
             DEVELOPMENT_PROJECT_ID.as_str(),
@@ -525,65 +471,52 @@ mod tests {
     }
 
     #[test]
-    fn registry_accepts_multiple_projects_and_rotated_keys() {
-        let registry =
-            ProjectRegistry::new(vec![entry(project(1), &[1, 2]), entry(project(2), &[3])])
-                .unwrap();
-        assert_eq!(registry.projects().len(), 2);
+    fn registry_accepts_rotated_keys_for_one_project() {
+        let registry = KeyRegistry::new(project(1), registry_keys(&[1, 2])).unwrap();
+        assert_eq!(registry.project_id(), project(1));
+        assert_eq!(registry.keys().len(), 2);
         assert_eq!(
-            registry.verifying_key(&project(1), &key_id(2)),
-            Some(&signing(2).verifying_key())
+            registry.public_key(&key_id(2)),
+            Some(&signing(2).public_key())
         );
-        assert_eq!(registry.verifying_key(&project(2), &key_id(2)), None);
-        assert_eq!(registry.verifying_key(&project(1), &key_id(9)), None);
+        assert_eq!(registry.public_key(&key_id(9)), None);
     }
 
     #[test]
     fn registry_rejects_duplicate_canonical_aliases_and_missing_keys() {
-        let registry = ProjectRegistry::new(vec![entry(project(1), &[1]), entry(project(1), &[2])]);
-        assert!(matches!(registry, Err(RegistryError::DuplicateProject(_))));
-        let registry = ProjectRegistry::new(vec![entry(project(1), &[1]), entry(project(2), &[1])]);
-        assert!(matches!(registry, Err(RegistryError::DuplicateKey(_))));
         assert!(matches!(
-            ProjectRegistry::new(vec![entry(project(1), &[])]),
-            Err(RegistryError::MissingKeys(_))
+            KeyRegistry::new(project(1), registry_keys(&[])),
+            Err(KeyRegistryError::MissingKeys)
+        ));
+        assert!(matches!(
+            KeyRegistry::new(project(1), registry_keys(&[1, 1])),
+            Err(KeyRegistryError::DuplicateKey(_))
         ));
 
-        let project_json = serde_json::to_string(&entry(project(1), &[1])).unwrap();
-        let aliased = project_json.replace('0', "O");
-        let json = format!("{{\"projects\":[{project_json},{aliased}]}}");
-        assert!(matches!(
-            ProjectRegistry::parse_json(&json),
-            Err(RegistryError::DuplicateProject(_))
-        ));
-
-        let key_json = serde_json::to_string(&entry(project(1), &[1]).keys[0]).unwrap();
+        let key_json = serde_json::to_string(&registry_keys(&[1])[0]).unwrap();
         let aliased_key = key_json.replace('0', "O");
         let json = format!(
-            "{{\"projects\":[{{\"project_id\":\"{}\",\"keys\":[{key_json},{aliased_key}]}}]}}",
+            "{{\"projectId\":\"{}\",\"keys\":[{key_json},{aliased_key}]}}",
             project(1)
         );
         assert!(matches!(
-            ProjectRegistry::parse_json(&json),
-            Err(RegistryError::DuplicateKey(_))
+            KeyRegistry::parse_json(&json),
+            Err(KeyRegistryError::DuplicateKey(_))
         ));
     }
 
     #[test]
-    fn registry_json_round_trips_and_oss_requires_exactly_one_project() {
-        let registry = ProjectRegistry::new(vec![entry(project(1), &[1, 2])]).unwrap();
-        let reparsed = ProjectRegistry::parse_json(&registry.to_pretty_json().unwrap()).unwrap();
-        assert_eq!(reparsed.only_project().unwrap().project_id, project(1));
-        assert!(matches!(
-            ProjectRegistry::new(Vec::new()).unwrap().only_project(),
-            Err(RegistryError::ExpectedOneProject(0))
-        ));
-        assert!(matches!(
-            ProjectRegistry::new(vec![entry(project(1), &[1]), entry(project(2), &[2])])
-                .unwrap()
-                .only_project(),
-            Err(RegistryError::ExpectedOneProject(2))
-        ));
+    fn registry_json_round_trips_single_project_camel_case_schema() {
+        let registry = KeyRegistry::new(project(1), registry_keys(&[1, 2])).unwrap();
+        let json = registry.to_pretty_json().unwrap();
+        assert!(json.contains("\"projectId\""));
+        assert!(json.contains("\"keyId\""));
+        assert!(json.contains("\"publicKey\""));
+        assert!(!json.contains("\"projects\""));
+        assert!(!json.contains("verifyingKey"));
+        let reparsed = KeyRegistry::parse_json(&json).unwrap();
+        assert_eq!(reparsed.project_id(), project(1));
+        assert_eq!(reparsed.keys(), registry.keys());
     }
 
     #[test]
@@ -594,7 +527,7 @@ mod tests {
 
         let authorization =
             verify_participant_token(&development_registry(), token, 1_999).unwrap();
-        assert_eq!(authorization.project_id, DEVELOPMENT_PROJECT_ID);
+        assert_eq!(authorization.project_id, *DEVELOPMENT_PROJECT_ID);
         assert_eq!(authorization.room_external_id, room);
         assert_eq!(authorization.participant_external_id, participant);
         assert_eq!(
@@ -616,6 +549,8 @@ mod tests {
     fn compact_shape_and_json_are_strict() {
         let registry = development_registry();
         let valid = profile_token("", "");
+        let key_id = DEVELOPMENT_API_KEY_ID.as_str();
+        let project_id = DEVELOPMENT_PROJECT_ID.as_str();
         for token in [
             "",
             "a.b",
@@ -630,17 +565,15 @@ mod tests {
             ),
             &signed_token(
                 &format!(
-                    "{{\"alg\":\"EdDSA\",\"kid\":\"{DEVELOPMENT_API_KEY_ID}\",\"typ\":\"pb+jwt\",\"unknown\":{{\"x\":1,\"x\":2}}}}"
+                    "{{\"alg\":\"EdDSA\",\"kid\":\"{key_id}\",\"typ\":\"pb+jwt\",\"unknown\":{{\"x\":1,\"x\":2}}}}"
                 ),
                 "{}",
                 &DEVELOPMENT_API_SIGNING_KEY,
             ),
             &signed_token(
+                &format!("{{\"alg\":\"EdDSA\",\"kid\":\"{key_id}\",\"typ\":\"pb+jwt\"}}"),
                 &format!(
-                    "{{\"alg\":\"EdDSA\",\"kid\":\"{DEVELOPMENT_API_KEY_ID}\",\"typ\":\"pb+jwt\"}}"
-                ),
-                &format!(
-                    "{{\"iss\":\"{DEVELOPMENT_PROJECT_ID}\",\"aud\":\"pb\",\"sub\":\"alice\",\"room\":\"general\",\"exp\":2000,\"exp\":2001}}"
+                    "{{\"iss\":\"{project_id}\",\"aud\":\"pb\",\"sub\":\"alice\",\"room\":\"general\",\"exp\":2000,\"exp\":2001}}"
                 ),
                 &DEVELOPMENT_API_SIGNING_KEY,
             ),
@@ -787,7 +720,7 @@ mod tests {
         );
         let authorization =
             verify_participant_token(&development_registry(), &token, 1_000).unwrap();
-        assert_eq!(authorization.project_id, DEVELOPMENT_PROJECT_ID);
+        assert_eq!(authorization.project_id, *DEVELOPMENT_PROJECT_ID);
     }
 
     #[test]

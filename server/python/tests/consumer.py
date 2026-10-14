@@ -14,6 +14,7 @@ from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
 artifacts = pathlib.Path(sys.argv[1])
 vectors = json.loads(pathlib.Path(sys.argv[2]).read_text())
+development = json.loads(pathlib.Path(sys.argv[3]).read_text())
 with tempfile.TemporaryDirectory() as directory:
     site = pathlib.Path(directory) / "site"
     destination = SchemeDictionaryDestination(
@@ -29,11 +30,27 @@ with tempfile.TemporaryDirectory() as directory:
     sdk = importlib.import_module("pulsebeam_server")
     assert pathlib.Path(sdk.__file__).is_relative_to(site)
     sign = sdk.sign_participant_token
+    assert sdk.INSECURE_DEV_API_KEY == development["apiKey"]
+    sign_key = sdk.sign_participant_token_with_api_key
+    assert sdk.INSECURE_DEV_CREDENTIALS == {
+        "project_id": development["projectId"],
+        "key_id": development["keyId"],
+        "secret": development["secret"],
+    }
+    packaged = site / "pulsebeam_server/development.json"
+    assert json.loads(packaged.read_text()) == development
+    assert sign(**sdk.INSECURE_DEV_CREDENTIALS, room="demo", participant="alice",
+                expiration=2000000000) == sign_key(sdk.INSECURE_DEV_API_KEY,
+                                                    room="demo", participant="alice",
+                                                    expiration=2000000000)
     assert (site / "pulsebeam_server/py.typed").exists()
     for v in vectors["valid"]:
         args = {**v["input"], "expiration": int(v["input"]["expiration"])}
         token = sign(**args)
         assert token == v["token"], v["name"]
+        assert sign_key("key_0067MYZ1001R0100000000000640RYKVW400Q00C00400000000S4SK88KCMFZ5PTKPVC6HQC2570YPWA66FKBAX64KD8SXQD9YWADYR", room=v["input"]["room"],
+                        participant=v["input"]["participant"],
+                        expiration=int(v["input"]["expiration"])) == token
         header, claims, signature = token.split(".")
         decode = lambda value: base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
         assert decode(header).decode() == v["header"]
@@ -76,3 +93,15 @@ with tempfile.TemporaryDirectory() as directory:
             if exact < 0 or exact > (1 << 64) - 1:
                 assert_rejected({**args, "expiration": exact}, v["name"] + "-int")
     assert vectors["base"]["secret"] not in repr(sign)
+
+    for invalid in (
+        "key_1" + sdk.INSECURE_DEV_API_KEY[5:],
+        sdk.INSECURE_DEV_API_KEY[:-1],
+        sdk.INSECURE_DEV_API_KEY[:-1] + "1",
+    ):
+        try:
+            sign_key(invalid, room="demo", participant="alice", expiration=2000000000)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("invalid API key accepted")

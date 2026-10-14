@@ -9,8 +9,8 @@ pub use harness::{
 };
 
 use pulsebeam_core::auth::{
-    DEVELOPMENT_API_KEY_ID, DEVELOPMENT_API_VERIFYING_KEY, DEVELOPMENT_PROJECT_ID, ProjectKey,
-    ProjectKeys, ProjectRegistry,
+    DEVELOPMENT_API_KEY_ID, DEVELOPMENT_API_PUBLIC_KEY, DEVELOPMENT_PROJECT_ID, KeyRegistryEntry,
+    , KeyRegistry,
 };
 use pulsebeam_runtime::net::UdpMode;
 use std::{
@@ -129,14 +129,14 @@ pub async fn start_sfu_node_with(
         .rng(rng)
         .with_udp_mode(DEFAULT_SIM_UDP_MODE)
         .with_http_api(http_api_addr)
-        .with_project_registry(
-            ProjectRegistry::new(vec![ProjectKeys {
-                project_id: DEVELOPMENT_PROJECT_ID,
-                keys: vec![ProjectKey {
-                    key_id: DEVELOPMENT_API_KEY_ID,
-                    verifying_key: DEVELOPMENT_API_VERIFYING_KEY,
+        .with_key_registry(
+            KeyRegistry::new(
+                *DEVELOPMENT_PROJECT_ID,
+                vec![KeyRegistryEntry {
+                    key_id: *DEVELOPMENT_API_KEY_ID,
+                    public_key: *DEVELOPMENT_API_PUBLIC_KEY,
                 }],
-            }])
+            )
             .expect("development registry is valid"),
         )
         .with_current_runtime();

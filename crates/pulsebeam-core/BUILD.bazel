@@ -14,7 +14,7 @@ rust_library(
     name = "pulsebeam-core",
     crate_root = "src/lib.rs",
     srcs = glob(["src/**/*.rs"], exclude = ["src/bin/**"]),
-    compile_data = glob(["README.md", "src/**"], exclude = ["src/**/*.rs"]),
+    compile_data = glob(["README.md", "src/**"], exclude = ["src/**/*.rs"]) + ["//server/auth:development.json"],
     edition = crate_edition(),
     # Downstream dev dependencies require the same shared Rust crate identity.
     crate_features = ["reqwest", "str0m", "test-utils"],
@@ -30,7 +30,7 @@ rust_library(
     crate_name = "pulsebeam_core",
     crate_root = "src/lib.rs",
     srcs = glob(["src/**/*.rs"], exclude = ["src/bin/**"]),
-    compile_data = glob(["README.md", "src/**"], exclude = ["src/**/*.rs"]),
+    compile_data = glob(["README.md", "src/**"], exclude = ["src/**/*.rs"]) + ["//server/auth:development.json"],
     edition = crate_edition(),
     crate_features = ["reqwest", "str0m", "sim", "test-utils"],
     rustc_flags = ["-Copt-level=2", "-Cdebug-assertions=yes", "-Coverflow-checks=yes"],

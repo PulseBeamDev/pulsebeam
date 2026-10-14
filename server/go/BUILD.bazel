@@ -4,11 +4,19 @@ load("@rules_python//python:defs.bzl", "py_test")
 
 package(default_visibility = ["//visibility:public"])
 exports_files(["go.mod"])
+
+genrule(
+    name = "development_json",
+    srcs = ["//server/auth:development.json"],
+    outs = ["development.json"],
+    cmd = "cp $< $@",
+)
 filegroup(name = "workflow_inputs", srcs = ["README.md", "go.mod"])
 
 go_library(
     name = "server",
-    srcs = ["auth.go"],
+    srcs = ["auth.go", "development.go"],
+    embedsrcs = [":development_json"],
     importpath = "github.com/PulseBeamDev/pulsebeam/server/go",
 )
 
@@ -16,12 +24,12 @@ go_test(
     name = "conformance",
     srcs = ["auth_test.go"],
     deps = [":server"],
-    data = ["//server/auth:vectors.json"],
+    data = ["//server/auth:vectors.json", "//server/auth:development.json"],
 )
 
 pkg_tar(
     name = "package",
-    srcs = ["auth.go", "go.mod", "README.md", "LICENSE"],
+    srcs = ["auth.go", "development.go", ":development_json", "go.mod", "README.md", "LICENSE"],
     extension = "tar.gz",
 )
 
@@ -29,8 +37,8 @@ py_test(
     name = "consumer",
     srcs = ["tests/consumer.py"],
     main = "tests/consumer.py",
-    args = ["$(rootpath :package)", "$(rootpath @go_default_sdk//:bin/go)", "$(rootpath auth_test.go)", "$(rootpath //server/auth:vectors.json)"],
-    data = [":package", "auth_test.go", "//server/auth:vectors.json", "@go_default_sdk//:bin/go", "@go_default_sdk//:go_sdk"],
+    args = ["$(rootpath :package)", "$(rootpath @go_default_sdk//:bin/go)", "$(rootpath auth_test.go)", "$(rootpath //server/auth:vectors.json)", "$(rootpath //server/auth:development.json)"],
+    data = [":package", "auth_test.go", "//server/auth:vectors.json", "//server/auth:development.json", "@go_default_sdk//:bin/go", "@go_default_sdk//:go_sdk"],
 )
 
 test_suite(name = "fast", tests = [":conformance", ":consumer"])
