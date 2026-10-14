@@ -1,7 +1,10 @@
-# V0 API key format
+# V0 API key format (SDK maintainers only)
 
-The private server-side credential is carried by a **single** configuration
-value, `PULSEBEAM_API_KEY`. Its canonical string form is:
+This is an **internal codec and cross-language conformance specification**, not
+a developer-facing API. Application code treats `PULSEBEAM_API_KEY` as an
+opaque secret and must never inspect or depend on the format.
+
+The private server-side credential has the following V0 encoding:
 
 ```text
 key_0<103 Crockford Base32 characters>
