@@ -31,8 +31,8 @@ Signing credentials never enter the browser.
 
 These concepts explain the quickstart after you have tried it:
 
-1. **Agent:** one room session for one participant. `useAgent` owns it while
-   the component is mounted and closes it on unmount.
+1. **Agent:** one room session handle for one participant. `useAgent` returns
+   a handle immediately and owns its runtime while the component is mounted.
 2. **Capture:** `useUserMedia` and `useDisplayMedia` own local capture tracks.
    Start capture from a user gesture. Connect alone does not open devices.
 3. **Publication:** `agent.local.video("camera")` and
