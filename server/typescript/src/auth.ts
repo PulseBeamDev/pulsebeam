@@ -39,7 +39,11 @@ function parseApiKey(value: unknown): {
   key: string;
   seed: Uint8Array;
 } {
-  if (typeof value !== "string" || !value.startsWith("key_0") || value.length !== 108)
+  if (
+    typeof value !== "string" ||
+    !value.startsWith("key_0") ||
+    value.length !== 108
+  )
     invalid("API key");
   const encoded = value.slice(5);
   const canonical = encoded
@@ -50,8 +54,14 @@ function parseApiKey(value: unknown): {
   const bytes = decode(encoded);
   if (bytes.length !== 64 || base32crockford.encode(bytes) !== canonical)
     invalid("API key");
-  const project = canonicalId(`p_0${base32crockford.encode(bytes.subarray(0, 16))}`, "p");
-  const key = canonicalId(`kid_0${base32crockford.encode(bytes.subarray(16, 32))}`, "kid");
+  const project = canonicalId(
+    `p_0${base32crockford.encode(bytes.subarray(0, 16))}`,
+    "p",
+  );
+  const key = canonicalId(
+    `kid_0${base32crockford.encode(bytes.subarray(16, 32))}`,
+    "kid",
+  );
   return { project, key, seed: bytes.subarray(32) };
 }
 
