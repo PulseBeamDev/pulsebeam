@@ -410,6 +410,7 @@ export interface Agent {
   setLocalMuted(slot: string, muted: boolean): Promise<void>;
   reconnect(): void;
   renewAuthorization(token: string): void;
+  setLogging(level: LogLevel): void;
   sendTopic(name: string, mode: TopicMode, payload: Uint8Array): void;
   readonly getSnapshot: () => AgentSnapshot;
   readonly subscribe: (listener: () => void) => () => void;
