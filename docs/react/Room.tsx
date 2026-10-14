@@ -13,16 +13,15 @@ export function Room({ config }: { config: AgentConfig }) {
   const [error, setError] = useState("");
   const [playback, setPlayback] = useState<PlaybackError | null>(null);
   const report = (failure: unknown) => setError(String(failure));
-  const camera = agent?.local.video("camera");
-  const microphone = agent?.local.audio("microphone");
+  const camera = agent.local.video("camera");
+  const microphone = agent.local.audio("microphone");
 
   useEffect(() => {
-    if (!camera || !microphone) return;
     camera.setSource(capture.videoTrack);
     microphone.setSource(capture.audioTrack);
   }, [camera, microphone, capture.videoTrack, capture.audioTrack]);
 
-  const snapshot = agent?.getSnapshot();
+  const snapshot = agent.getSnapshot();
   return (
     <main>
       <h1>PulseBeam React room</h1>
@@ -31,7 +30,7 @@ export function Room({ config }: { config: AgentConfig }) {
         {snapshot?.participantExternalId ?? "not admitted"}
       </p>
       <p>Capture: {capture.state}</p>
-      <button disabled={!agent} onClick={() => agent?.connect()}>
+      <button disabled={!agent} onClick={() => agent.connect()}>
         Join
       </button>
       <button onClick={() => void capture.request().catch(report)}>
@@ -40,14 +39,14 @@ export function Room({ config }: { config: AgentConfig }) {
       <button
         onClick={() => {
           capture.stop();
-          agent?.disconnect();
+          agent.disconnect();
         }}
       >
         Leave and stop capture
       </button>
       <button
         disabled={!agent}
-        onClick={() => void agent?.remote.resumeAudio().catch(report)}
+        onClick={() => void agent.remote.resumeAudio().catch(report)}
       >
         Enable remote audio
       </button>
@@ -58,7 +57,7 @@ export function Room({ config }: { config: AgentConfig }) {
         style={{ width: 320, height: 240 }}
         onPlaybackError={setPlayback}
       />
-      <h2>Remote video ({agent?.remote.videoTracks.length ?? 0})</h2>
+      <h2>Remote video ({agent.remote.videoTracks.length ?? 0})</h2>
       {agent?.remote.videoTracks.map((track) => (
         <section key={`${track.participantId}:${track.label}`}>
           <p>
