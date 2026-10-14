@@ -377,7 +377,8 @@ class AgentFacade implements Agent {
     if (this.#active) return;
     this.#active = true;
     const activation = ++this.#activation;
-    const active = () => !this.#closed && this.#active && activation === this.#activation;
+    const active = () =>
+      !this.#closed && this.#active && activation === this.#activation;
     this.#ready = whenInitialized()
       .catch((error: unknown) => {
         if (active()) this.#terminalFailure("initialization", message(error));
@@ -559,11 +560,12 @@ class AgentFacade implements Agent {
     if (track) this.#localPublications.set(slot, { slot, label, active: true });
     else this.#localPublications.delete(slot);
     this.#applyState(this.#state);
-    void this.replaceLocalTrack(
-      slot,
-      track,
-      kind === "video" ? { contentHint: "motion" } : { contentHint: "speech" },
-    ).catch(() => {});
+    if (this.#active)
+      void this.replaceLocalTrack(
+        slot,
+        track,
+        kind === "video" ? { contentHint: "motion" } : { contentHint: "speech" },
+      ).catch(() => {});
   }
 
   connect(): void {
@@ -687,6 +689,7 @@ class AgentFacade implements Agent {
     } else {
       this.#pendingToken = token;
     }
+    this.#runtimeConfig = { ...this.#runtimeConfig, token };
   }
 
   setLogging(level: LogLevel): void {
