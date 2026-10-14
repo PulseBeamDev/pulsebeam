@@ -34,6 +34,27 @@ function canonicalId(value: unknown, prefix: string): string {
   return `${prefix}_0${base32crockford.encode(uuid)}`;
 }
 
+function parseApiKey(value: unknown): {
+  project: string;
+  key: string;
+  seed: Uint8Array;
+} {
+  if (typeof value !== "string" || !value.startsWith("key_0") || value.length !== 108)
+    invalid("API key");
+  const encoded = value.slice(5);
+  const canonical = encoded
+    .toUpperCase()
+    .replaceAll("O", "0")
+    .replaceAll("I", "1")
+    .replaceAll("L", "1");
+  const bytes = decode(encoded);
+  if (bytes.length !== 64 || base32crockford.encode(bytes) !== canonical)
+    invalid("API key");
+  const project = canonicalId(`p_0${base32crockford.encode(bytes.subarray(0, 16))}`, "p");
+  const key = canonicalId(`kid_0${base32crockford.encode(bytes.subarray(16, 32))}`, "kid");
+  return { project, key, seed: bytes.subarray(32) };
+}
+
 function externalId(value: unknown, field: string): string {
   if (
     typeof value !== "string" ||
@@ -45,29 +66,40 @@ function externalId(value: unknown, field: string): string {
   return value;
 }
 
-/** Sign a server-only participant JWT. Credentials are always explicit. */
+/** One server-side API key, or the legacy three-part signing credentials. */
+type SigningCredentials =
+  | { apiKey: string; projectId?: never; keyId?: never; secret?: never }
+  | { apiKey?: never; projectId: string; keyId: string; secret: string };
+
+/** Sign a server-only participant JWT. No environment lookup or network access. */
 export function signParticipantToken({
+  apiKey,
   projectId,
   keyId,
   secret,
   room,
   participant,
   expiration,
-}: {
-  projectId: string;
-  keyId: string;
-  secret: string;
+}: SigningCredentials & {
   room: string;
   participant: string;
   /** Absolute Unix seconds. Use bigint beyond Number.MAX_SAFE_INTEGER. */
   expiration: bigint | number;
 }): string {
-  const project = canonicalId(projectId, "p");
-  const key = canonicalId(keyId, "kid");
-  // Twenty added zero bits align the seed's four high padding bits to three bytes.
-  const paddedSeed = decode("0000" + payload(secret, "sk", 52));
-  if (paddedSeed[0] !== 0 || paddedSeed[1] !== 0 || paddedSeed[2] !== 0)
-    invalid("signing secret padding");
+  let project: string;
+  let key: string;
+  let seed: Uint8Array;
+  if (apiKey !== undefined) {
+    ({ project, key, seed } = parseApiKey(apiKey));
+  } else {
+    project = canonicalId(projectId, "p");
+    key = canonicalId(keyId, "kid");
+    // Twenty added zero bits align the seed's four high padding bits to three bytes.
+    const paddedSeed = decode("0000" + payload(secret, "sk", 52));
+    if (paddedSeed[0] !== 0 || paddedSeed[1] !== 0 || paddedSeed[2] !== 0)
+      invalid("signing secret padding");
+    seed = paddedSeed.subarray(3);
+  }
   const roomId = externalId(room, "room");
   const participantId = externalId(participant, "participant");
   if (
@@ -84,7 +116,7 @@ export function signParticipantToken({
   const privateKey = createPrivateKey({
     key: Buffer.concat([
       Buffer.from("302e020100300506032b657004220420", "hex"),
-      paddedSeed.subarray(3),
+      seed,
     ]),
     format: "der",
     type: "pkcs8",
