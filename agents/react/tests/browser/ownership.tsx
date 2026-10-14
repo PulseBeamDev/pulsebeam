@@ -30,7 +30,12 @@ export async function runOwnershipContract() {
     changeToken = () => setToken("owned-token-b");
     changeEndpoint = () => setEndpoint(`${location.origin}/replacement`);
     changeLogging = () => setLogging("debug");
-    left = useAgent({ endpoint, token, topology: { localVideos: 1 }, logging: { level: logging } });
+    left = useAgent({
+      endpoint,
+      token,
+      topology: { localVideos: 1 },
+      logging: { level: logging },
+    });
     right = useAgent({
       endpoint: location.origin,
       token: "independent-token",
@@ -108,7 +113,10 @@ export async function runOwnershipContract() {
     track.stop();
     return {
       ownedIndependent:
-        firstRenderAvailable && shared && independentEnablement && disconnectRetainsSource,
+        firstRenderAvailable &&
+        shared &&
+        independentEnablement &&
+        disconnectRetainsSource,
       ownedRenewal: renewedWithoutReplacing && loggingKeepsSession,
       ownedReplacement: replacedConstruction,
       ownedCleanup: ownedCleanup && String(track.readyState) === "ended",
