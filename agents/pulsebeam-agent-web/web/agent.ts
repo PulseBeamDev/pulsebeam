@@ -333,7 +333,6 @@ class AgentFacade implements Agent {
   #managedVideo: readonly VideoDemand[] = [];
   #managedTopics: readonly TopicRegistration[] = [];
   readonly #topology: Required<MediaTopology>;
-  #pendingToken: string | undefined;
   #closed = false;
   #active = false;
   #activation = 0;
@@ -403,10 +402,6 @@ class AgentFacade implements Agent {
           if (active()) this.#emitFailure(localFailureClass(error), message(error));
         });
         try {
-          if (this.#pendingToken !== undefined) {
-            runtime.renew_authorization(this.#pendingToken);
-            this.#pendingToken = undefined;
-          }
           runtime.replace_desired(
             desiredValue(this.#effectiveState(this.#state)),
           );
@@ -687,11 +682,8 @@ class AgentFacade implements Agent {
     if (!token || token.length > 16_384 || !/^[!-~]+$/.test(token)) {
       throw new Error("authorization token is invalid");
     }
-    if (this.#runtime) {
-      this.#runtime.renew_authorization(token);
-    } else {
-      this.#pendingToken = token;
-    }
+    if (token === this.#runtimeConfig.token) return;
+    this.#runtime?.renew_authorization(token);
     this.#runtimeConfig = { ...this.#runtimeConfig, token };
   }
 
