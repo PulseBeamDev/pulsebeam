@@ -5,6 +5,7 @@ use crate::identity::{
 };
 use data_encoding::BASE64URL_NOPAD;
 use ed25519_dalek::{Signature, VerifyingKey};
+pub use pulsebeam_auth::api_key::{ApiKey, ApiKeyError};
 pub use pulsebeam_auth::keys::{ApiSigningKey, ApiVerifyingKey, KeyValidationError};
 use serde::{Deserialize, Serialize, de};
 use std::{collections::HashMap, fmt, sync::LazyLock};
