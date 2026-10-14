@@ -40,25 +40,23 @@ const minimal: AgentConfig = {
   token: "opaque-token",
 };
 const defaultAgent: Agent = createAgent(minimal);
-const defaultOwned: Agent | null = useAgent(minimal);
+const defaultOwned: Agent = useAgent(minimal);
 void [defaultAgent, defaultOwned];
 const agent: Agent = createAgent(config);
-const owned: Agent | null = useAgent(config);
+const owned: Agent = useAgent(config);
 // @ts-expect-error Each useAgent must have its own construction config.
 useAgent();
 const camera = useUserMedia({ video: { width: 1280 }, audio: false });
 const screen = useDisplayMedia({ video: true, audio: false });
 const devices = useMediaDevices();
-if (owned) {
-  owned.connect();
-  const handle = owned.local.video("camera");
-  handle.setSource(camera.videoTrack);
-  const source: CapturedVideoTrack | null = handle.source;
-  // @ts-expect-error An audio capture cannot be bound to a video handle.
-  handle.setSource(camera.audioTrack);
-  owned.disconnect();
-  void source;
-}
+owned.connect();
+const handle = owned.local.video("camera");
+handle.setSource(camera.videoTrack);
+const source: CapturedVideoTrack | null = handle.source;
+// @ts-expect-error An audio capture cannot be bound to a video handle.
+handle.setSource(camera.audioTrack);
+owned.disconnect();
+void source;
 void screen.request();
 const firstCameraId: string | undefined = devices.cameras[0]?.id;
 declare const captureFailure: MediaCaptureError;
