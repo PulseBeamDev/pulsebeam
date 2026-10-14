@@ -556,7 +556,9 @@ impl BrowserRuntime {
         let level: LogLevel = serde_wasm_bindgen::from_value(level)
             .map_err(|error| js_error(format!("invalid log level: {error}")))?;
         let actor = self.inner.actor.borrow();
-        let actor = actor.as_ref().ok_or_else(|| js_error("runtime actor not initialized"))?;
+        let actor = actor
+            .as_ref()
+            .ok_or_else(|| js_error("runtime actor not initialized"))?;
         actor.send_public(PublicCommand::SetLogLevel(level.into()))
             .map_err(js_error)?;
         self.inner.logger.set_level(level);
