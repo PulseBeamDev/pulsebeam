@@ -30,9 +30,7 @@ export function Room({ config }: { config: AgentConfig }) {
         {snapshot.participantExternalId ?? "not admitted"}
       </p>
       <p>Capture: {capture.state}</p>
-      <button onClick={() => agent.connect()}>
-        Join
-      </button>
+      <button onClick={() => agent.connect()}>Join</button>
       <button onClick={() => void capture.request().catch(report)}>
         Enable camera and microphone
       </button>
@@ -44,9 +42,7 @@ export function Room({ config }: { config: AgentConfig }) {
       >
         Leave and stop capture
       </button>
-      <button
-        onClick={() => void agent.remote.resumeAudio().catch(report)}
-      >
+      <button onClick={() => void agent.remote.resumeAudio().catch(report)}>
         Enable remote audio
       </button>
       <h2>Local preview</h2>
@@ -56,7 +52,7 @@ export function Room({ config }: { config: AgentConfig }) {
         style={{ width: 320, height: 240 }}
         onPlaybackError={setPlayback}
       />
-      <h2>Remote video ({agent.remote.videoTracks.length ?? 0})</h2>
+      <h2>Remote video ({agent.remote.videoTracks.length})</h2>
       {agent.remote.videoTracks.map((track) => (
         <section key={`${track.participantId}:${track.label}`}>
           <p>
