@@ -6,6 +6,7 @@ use serde::Deserialize;
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InsecureDevCredentials {
+    pub api_key: String,
     pub project_id: String,
     pub key_id: String,
     pub secret: String,
