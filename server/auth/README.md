@@ -19,6 +19,15 @@ synchronization step is needed.
 
 These keys are publicly known: **never use them for production or an exposed server**.
 
+## One-string API keys (V0)
+
+The recommended server-side configuration is one `PULSEBEAM_API_KEY=key_0...`
+secret, which packages the same three signing inputs into a 64-byte payload.
+See [the exact V0 specification](api-key.md) for byte offsets, Base32 padding,
+validations, and future-version behavior. The participant JWT wire format below
+is unchanged. The legacy three-field signing API remains available for existing
+consumers and frozen conformance vectors.
+
 ## Inputs and codecs
 
 All six inputs are mandatory: project ID, API key ID, signing secret, room
