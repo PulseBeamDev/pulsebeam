@@ -138,10 +138,10 @@ fn main() {
 fn configured_project_registry(args: &Args) -> Result<ProjectRegistry> {
     let registry = if args.dev {
         ProjectRegistry::new(vec![ProjectKeys {
-            project_id: DEVELOPMENT_PROJECT_ID,
+            project_id: *DEVELOPMENT_PROJECT_ID,
             keys: vec![ProjectKey {
-                key_id: DEVELOPMENT_API_KEY_ID,
-                verifying_key: DEVELOPMENT_API_VERIFYING_KEY,
+                key_id: *DEVELOPMENT_API_KEY_ID,
+                verifying_key: *DEVELOPMENT_API_VERIFYING_KEY,
             }],
         }])?
     } else {
@@ -264,9 +264,9 @@ mod tests {
         let args = Args::try_parse_from(["pulsebeam", "--dev"]).unwrap();
         let registry = configured_project_registry(&args).unwrap();
         let project = registry.only_project().unwrap();
-        assert_eq!(project.project_id, DEVELOPMENT_PROJECT_ID);
+        assert_eq!(project.project_id, *DEVELOPMENT_PROJECT_ID);
         assert_eq!(project.keys.len(), 1);
-        assert_eq!(project.keys[0].key_id, DEVELOPMENT_API_KEY_ID);
+        assert_eq!(project.keys[0].key_id, *DEVELOPMENT_API_KEY_ID);
     }
 
     #[test]

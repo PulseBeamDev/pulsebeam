@@ -11,11 +11,15 @@ authentication material without issuing production bearer tokens:
 ```text
 pulsebeam-cli auth-key \
   --public-registry project-registry.json \
-  --private-signing-bundle signing-key.json
+  --private-signing-bundle signing-key.json \
+  --private-api-key pulsebeam.key
 ```
 
 Pass `--project-id p_0...` to generate a rotation key for an existing project.
-Both outputs must be new files; the private output is owner-only on Unix.
+All outputs must be new files. The private bundle and optional `pulsebeam.key`
+are owner-only on Unix. `pulsebeam.key` contains one `key_0` credential for
+`PULSEBEAM_API_KEY`; never expose it to browsers. The format is documented
+in [API key V0](../../server/auth/api-key.md).
 
 For a local `pulsebeam --dev` server, mint a one-hour development bearer token
 with fixed development credentials:

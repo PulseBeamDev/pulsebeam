@@ -5,27 +5,44 @@ use crate::identity::{
 };
 use data_encoding::BASE64URL_NOPAD;
 use ed25519_dalek::{Signature, VerifyingKey};
+pub use pulsebeam_auth::api_key::{ApiKey, ApiKeyError};
 pub use pulsebeam_auth::keys::{ApiSigningKey, ApiVerifyingKey, KeyValidationError};
 use serde::{Deserialize, Serialize, de};
-use std::{collections::HashMap, fmt};
+use std::{collections::HashMap, fmt, sync::LazyLock};
 
 #[cfg(test)]
 const KEY_BYTES: usize = 32;
 const REDACTED: &str = "[REDACTED]";
 pub const MAX_COMPACT_TOKEN_LEN: usize = 16_384;
 
-pub const DEVELOPMENT_PROJECT_ID: ProjectId =
-    ProjectId::from_bytes([0, 0, 0, 0, 0, 0, 0x70, 0, 0x80, 0, 0, 0, 0, 0, 0, 1]);
-pub const DEVELOPMENT_API_KEY_ID: ApiKeyId =
-    ApiKeyId::from_bytes([0, 0, 0, 0, 0, 0, 0x70, 0, 0x80, 0, 0, 0, 0, 0, 0, 2]);
-pub const DEVELOPMENT_API_SIGNING_KEY: ApiSigningKey = ApiSigningKey::from_seed([
-    0x9d, 0x61, 0xb1, 0x9d, 0xef, 0xfd, 0x5a, 0x60, 0xba, 0x84, 0x4a, 0xf4, 0x92, 0xec, 0x2c, 0xc4,
-    0x44, 0x49, 0xc5, 0x69, 0x7b, 0x32, 0x69, 0x19, 0x70, 0x3b, 0xac, 0x03, 0x1c, 0xae, 0x7f, 0x60,
-]);
-pub const DEVELOPMENT_API_VERIFYING_KEY: ApiVerifyingKey = ApiVerifyingKey::from_bytes_unchecked([
-    0xd7, 0x5a, 0x98, 0x01, 0x82, 0xb1, 0x0a, 0xb7, 0xd5, 0x4b, 0xfe, 0xd3, 0xc9, 0x64, 0x07, 0x3a,
-    0x0e, 0xe1, 0x72, 0xf3, 0xda, 0xa6, 0x23, 0x25, 0xaf, 0x02, 0x1a, 0x68, 0xf7, 0x07, 0x51, 0x1a,
-]);
+// The --dev server and all server SDKs use the same public test key.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DevCredentials {
+    project_id: ProjectId,
+    key_id: ApiKeyId,
+    secret: ApiSigningKey,
+    public_key: ApiVerifyingKey,
+}
+
+// This checked-in fixture is validated by the SDK credential tests. A malformed
+// embedded fixture is a build defect, not a recoverable user-input error.
+#[allow(clippy::expect_used)]
+fn load_dev_credentials() -> DevCredentials {
+    serde_json::from_str(include_str!("../../../server/auth/development.json"))
+        .expect("invalid PulseBeam development credentials")
+}
+
+static DEV_CREDENTIALS: LazyLock<DevCredentials> = LazyLock::new(load_dev_credentials);
+
+pub static DEVELOPMENT_PROJECT_ID: LazyLock<ProjectId> =
+    LazyLock::new(|| DEV_CREDENTIALS.project_id);
+pub static DEVELOPMENT_API_KEY_ID: LazyLock<ApiKeyId> =
+    LazyLock::new(|| DEV_CREDENTIALS.key_id);
+pub static DEVELOPMENT_API_SIGNING_KEY: LazyLock<ApiSigningKey> =
+    LazyLock::new(|| DEV_CREDENTIALS.secret.clone());
+pub static DEVELOPMENT_API_VERIFYING_KEY: LazyLock<ApiVerifyingKey> =
+    LazyLock::new(|| DEV_CREDENTIALS.public_key);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VerifiedAuthorization {
@@ -409,10 +426,10 @@ mod tests {
 
     fn development_registry() -> ProjectRegistry {
         ProjectRegistry::new(vec![ProjectKeys {
-            project_id: DEVELOPMENT_PROJECT_ID,
+            project_id: *DEVELOPMENT_PROJECT_ID,
             keys: vec![ProjectKey {
-                key_id: DEVELOPMENT_API_KEY_ID,
-                verifying_key: DEVELOPMENT_API_VERIFYING_KEY,
+                key_id: *DEVELOPMENT_API_KEY_ID,
+                verifying_key: *DEVELOPMENT_API_VERIFYING_KEY,
             }],
         }])
         .unwrap()
@@ -498,8 +515,8 @@ mod tests {
             !format!(
                 "{:?}",
                 PrivateSigningBundle {
-                    project_id: DEVELOPMENT_PROJECT_ID,
-                    key_id: DEVELOPMENT_API_KEY_ID,
+                    project_id: *DEVELOPMENT_PROJECT_ID,
+                    key_id: *DEVELOPMENT_API_KEY_ID,
                     signing_key: signing,
                 }
             )
@@ -512,7 +529,7 @@ mod tests {
     fn development_constants_form_one_ed25519_pair() {
         assert_eq!(
             DEVELOPMENT_API_SIGNING_KEY.verifying_key(),
-            DEVELOPMENT_API_VERIFYING_KEY
+            *DEVELOPMENT_API_VERIFYING_KEY
         );
         assert_eq!(
             DEVELOPMENT_PROJECT_ID.as_str(),
@@ -594,7 +611,7 @@ mod tests {
 
         let authorization =
             verify_participant_token(&development_registry(), token, 1_999).unwrap();
-        assert_eq!(authorization.project_id, DEVELOPMENT_PROJECT_ID);
+        assert_eq!(authorization.project_id, *DEVELOPMENT_PROJECT_ID);
         assert_eq!(authorization.room_external_id, room);
         assert_eq!(authorization.participant_external_id, participant);
         assert_eq!(
@@ -616,6 +633,8 @@ mod tests {
     fn compact_shape_and_json_are_strict() {
         let registry = development_registry();
         let valid = profile_token("", "");
+        let key_id = DEVELOPMENT_API_KEY_ID.as_str();
+        let project_id = DEVELOPMENT_PROJECT_ID.as_str();
         for token in [
             "",
             "a.b",
@@ -630,17 +649,17 @@ mod tests {
             ),
             &signed_token(
                 &format!(
-                    "{{\"alg\":\"EdDSA\",\"kid\":\"{DEVELOPMENT_API_KEY_ID}\",\"typ\":\"pb+jwt\",\"unknown\":{{\"x\":1,\"x\":2}}}}"
+                    "{{\"alg\":\"EdDSA\",\"kid\":\"{key_id}\",\"typ\":\"pb+jwt\",\"unknown\":{{\"x\":1,\"x\":2}}}}"
                 ),
                 "{}",
                 &DEVELOPMENT_API_SIGNING_KEY,
             ),
             &signed_token(
                 &format!(
-                    "{{\"alg\":\"EdDSA\",\"kid\":\"{DEVELOPMENT_API_KEY_ID}\",\"typ\":\"pb+jwt\"}}"
+                    "{{\"alg\":\"EdDSA\",\"kid\":\"{key_id}\",\"typ\":\"pb+jwt\"}}"
                 ),
                 &format!(
-                    "{{\"iss\":\"{DEVELOPMENT_PROJECT_ID}\",\"aud\":\"pb\",\"sub\":\"alice\",\"room\":\"general\",\"exp\":2000,\"exp\":2001}}"
+                    "{{\"iss\":\"{project_id}\",\"aud\":\"pb\",\"sub\":\"alice\",\"room\":\"general\",\"exp\":2000,\"exp\":2001}}"
                 ),
                 &DEVELOPMENT_API_SIGNING_KEY,
             ),
@@ -787,7 +806,7 @@ mod tests {
         );
         let authorization =
             verify_participant_token(&development_registry(), &token, 1_000).unwrap();
-        assert_eq!(authorization.project_id, DEVELOPMENT_PROJECT_ID);
+        assert_eq!(authorization.project_id, *DEVELOPMENT_PROJECT_ID);
     }
 
     #[test]

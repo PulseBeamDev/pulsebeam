@@ -1502,7 +1502,7 @@ mod replacement_tests {
             )
             .unwrap();
         let verified = VerifiedAuthorization {
-            project_id: pulsebeam_core::auth::DEVELOPMENT_PROJECT_ID,
+            project_id: *pulsebeam_core::auth::DEVELOPMENT_PROJECT_ID,
             room_external_id: RoomExternalId::new("renewal-room").unwrap(),
             room_id,
             participant_external_id: crate::entity::ParticipantExternalId::new("alice").unwrap(),
@@ -1584,10 +1584,10 @@ mod replacement_tests {
         let mut actor = actor();
         actor.set_project_registry(Some(
             ProjectRegistry::new(vec![ProjectKeys {
-                project_id: DEVELOPMENT_PROJECT_ID,
+                project_id: *DEVELOPMENT_PROJECT_ID,
                 keys: vec![ProjectKey {
-                    key_id: DEVELOPMENT_API_KEY_ID,
-                    verifying_key: DEVELOPMENT_API_VERIFYING_KEY,
+                    key_id: *DEVELOPMENT_API_KEY_ID,
+                    verifying_key: *DEVELOPMENT_API_VERIFYING_KEY,
                 }],
             }])
             .unwrap(),
