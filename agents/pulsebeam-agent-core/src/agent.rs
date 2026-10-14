@@ -216,6 +216,14 @@ impl Agent {
         })
     }
 
+    pub fn set_log_level(&mut self, level: crate::LogLevel) {
+        if self.config.log_level == level {
+            return;
+        }
+        self.config.log_level = level;
+        self.topics.set_log_level(level);
+    }
+
     pub fn command(&mut self, command: AgentCommand) -> Result<(), AgentError> {
         let result = match command {
             AgentCommand::ReplaceDesired(desired) => self.replace_desired(desired),
