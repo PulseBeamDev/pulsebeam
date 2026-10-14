@@ -89,3 +89,17 @@ func SignParticipantToken(projectID, keyID, secret, room, participant string, ex
 	signature := ed25519.Sign(ed25519.NewKeyFromSeed(seed), []byte(input))
 	return input + "." + encoding.EncodeToString(signature), nil
 }
+
+// SignParticipantTokenWithAPIKey signs with one V0 key_0 credential.
+// The key is 16-byte project UUIDv7 || 16-byte key UUIDv7 || 32-byte Ed25519 seed.
+func SignParticipantTokenWithAPIKey(apiKey, room, participant string, expiration uint64) (string, error) {
+	raw, err := decode(apiKey, "key", 103, false)
+	if err != nil || len(raw) != 64 {
+		return "", errors.New("invalid API key")
+	}
+	project := "p_0" + crockford.EncodeToString(raw[:16])
+	key := "kid_0" + crockford.EncodeToString(raw[16:32])
+	seed := append([]byte{0, 0, 0}, raw[32:]...)
+	secret := "sk_0" + crockford.EncodeToString(seed)[4:]
+	return SignParticipantToken(project, key, secret, room, participant, expiration)
+}
