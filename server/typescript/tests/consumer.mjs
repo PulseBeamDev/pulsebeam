@@ -30,9 +30,9 @@ cpSync(codec, installedCodec, { recursive: true, dereference: true });
 writeFileSync(join(directory, "package.json"), '{"type":"module"}');
 writeFileSync(
   join(directory, "consumer.mjs"),
-  'export { signParticipantToken, INSECURE_DEV_CREDENTIALS } from "@pulsebeam/server";',
+  'export { signParticipantToken, INSECURE_DEV_CREDENTIALS, INSECURE_DEV_API_KEY } from "@pulsebeam/server";',
 );
-const { signParticipantToken, INSECURE_DEV_CREDENTIALS } = await import(
+const { signParticipantToken, INSECURE_DEV_CREDENTIALS, INSECURE_DEV_API_KEY } = await import(
   pathToFileURL(join(directory, "consumer.mjs"))
 );
 const development = JSON.parse(readFileSync(developmentFixture));
@@ -41,6 +41,7 @@ assert.deepEqual(INSECURE_DEV_CREDENTIALS, {
   keyId: development.keyId,
   secret: development.secret,
 });
+assert.equal(INSECURE_DEV_API_KEY, development.apiKey);
 const devToken = signParticipantToken({
   ...INSECURE_DEV_CREDENTIALS,
   room: "local",
@@ -51,6 +52,12 @@ assert.equal(
   JSON.parse(Buffer.from(devToken.split(".")[1], "base64url")).iss,
   development.projectId,
 );
+assert.equal(signParticipantToken({
+  apiKey: INSECURE_DEV_API_KEY,
+  room: "local",
+  participant: "test",
+  expiration: 2000000000,
+}), devToken);
 
 const document = JSON.parse(readFileSync(fixtures));
 const adapt = (i) => ({
@@ -64,6 +71,12 @@ const adapt = (i) => ({
 for (const v of document.valid) {
   const token = signParticipantToken(adapt(v.input));
   assert.equal(token, v.token, v.name);
+  assert.equal(signParticipantToken({
+    apiKey: "key_0067MYZ1001R0100000000000640RYKVW400Q00C00400000000S4SK88KCMFZ5PTKPVC6HQC2570YPWA66FKBAX64KD8SXQD9YWADYR",
+    room: v.input.room,
+    participant: v.input.participant,
+    expiration: BigInt(v.input.expiration),
+  }), v.token, v.name + " V0 API key");
   const [header, claims, signature] = token.split(".");
   assert.equal(Buffer.from(header, "base64url").toString(), v.header);
   assert.equal(Buffer.from(claims, "base64url").toString(), v.claims);
@@ -115,8 +128,12 @@ writeFileSync(
   join(directory, "consumer.ts"),
   `import { signParticipantToken, INSECURE_DEV_CREDENTIALS } from "@pulsebeam/server";
 const devKey: string = INSECURE_DEV_CREDENTIALS.secret;
+const compactKey: string = INSECURE_DEV_API_KEY;
 const input = {projectId:"p", keyId:"k", secret:"s", room:"r", participant:"p", expiration:18446744073709551615n};
 const token: string = signParticipantToken(input);
+signParticipantToken({apiKey:compactKey, room:"r", participant:"p", expiration:2000});
+// @ts-expect-error cannot mix single API key with legacy credential fields
+signParticipantToken({...input, apiKey:compactKey});
 signParticipantToken({...input, expiration: 2000});
 // @ts-expect-error expiration is mandatory
 signParticipantToken({projectId:"p", keyId:"k", secret:"s", room:"r", participant:"p"});
@@ -144,3 +161,14 @@ assert.equal(
     getNewLine: () => "\n",
   }),
 );
+
+for (const invalid of [
+  "key_1" + INSECURE_DEV_API_KEY.slice(5),
+  INSECURE_DEV_API_KEY.slice(0, -1),
+  INSECURE_DEV_API_KEY.slice(0, -1) + "1",
+  "sk_0" + INSECURE_DEV_API_KEY.slice(5),
+]) {
+  assert.throws(() => signParticipantToken({
+    apiKey: invalid, room: "local", participant: "test", expiration: 2000,
+  }), /API key|credential/i);
+}
