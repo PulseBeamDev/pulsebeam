@@ -7,7 +7,7 @@ call, Rust signer, WASM, or language bridge. Public registry publication is defe
 ## Local development
 
 `from pulsebeam_server import INSECURE_DEV_API_KEY` provides one publicly known
-`key_0` credential for local `--dev` servers. Pass it to
+API key for local `--dev` servers. Pass it to
 `sign_participant_token_with_api_key(api_key, room=..., participant=..., expiration=...)`.
 **Never use these credentials in production or expose a development server.**
 
@@ -43,11 +43,8 @@ consulted: zero and past timestamps can be signed, but the server rejects tokens
 at and after their expiration.
 
 Room and participant are case-sensitive external IDs of 1–36 ASCII characters
-in `[A-Za-z0-9_-]`. A V0 `key_0` credential contains project UUIDv7,
-key UUIDv7 and a 32-byte Ed25519 seed. See the
-[exact encoding specification](../auth/api-key.md).
-Credential aliases are accepted and IDs canonicalized; external IDs are never
-trimmed or normalized.
+in `[A-Za-z0-9_-]`. Treat `PULSEBEAM_API_KEY` as an opaque server-side secret:
+the SDK validates it. External IDs are never trimmed or normalized.
 
 Keep secrets on servers only, never in clients or logs. Offline signing cannot
 check registration or whether a secret belongs to the supplied project/key.
