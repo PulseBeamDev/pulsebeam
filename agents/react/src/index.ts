@@ -1,5 +1,5 @@
 import { useEffect, useState, useSyncExternalStore } from "react";
-import { createAgent, type Agent, type AgentConfig } from "@pulsebeam/web";
+import { createManagedAgent, type Agent, type AgentConfig } from "@pulsebeam/web";
 
 export { createAgent, LocalTrackCapacityError } from "@pulsebeam/web";
 export { Video } from "./playback.js";
@@ -67,33 +67,42 @@ export type {
   VideoSenderConfig,
 } from "@pulsebeam/web";
 
-const noSubscription = () => () => {};
-const noSnapshot = () => null;
-
-export function useAgent(config: AgentConfig): Agent | null {
-  const [owned, setOwned] = useState<{ key: string; agent: Agent } | null>(
-    null,
-  );
+/**
+ * One React-owned Agent handle per endpoint/topology configuration.
+ * Construction is inert during render; effects activate the runtime after commit.
+ * Use a React key when the room or participant changes.
+ */
+export function useAgent(config: AgentConfig): Agent {
   const key = JSON.stringify([
     config.endpoint,
-    config.topology,
-    config.logging,
+    config.topology?.localVideos ?? 2,
+    config.topology?.localAudios ?? 2,
+    config.topology?.remoteVideos ?? 16,
+    config.topology?.remoteAudios ?? 8,
   ]);
 
-  useEffect(() => {
-    const agent = createAgent(config);
-    setOwned({ key, agent });
-    return () => agent.close();
-  }, [key]);
-  useEffect(() => {
-    if (owned?.key === key) owned.agent.renewAuthorization(config.token);
-  }, [config.token, key, owned]);
+  const [owned, setOwned] = useState(() => ({
+    key,
+    agent: createManagedAgent(config),
+  }));
+  // A changed immutable configuration creates a new inert handle. React retries
+  // this render before committing children, avoiding a stale-session render.
+  let current = owned;
+  if (owned.key !== key) {
+    current = { key, agent: createManagedAgent(config) };
+    setOwned(current);
+  }
+  const agent = current.agent;
 
-  const agent = owned?.key === key ? owned.agent : null;
-  useSyncExternalStore(
-    agent?.subscribe ?? noSubscription,
-    agent?.getSnapshot ?? noSnapshot,
-    agent?.getSnapshot ?? noSnapshot,
-  );
+  useEffect(() => {
+    agent.activate();
+    return () => agent.deactivate();
+  }, [agent]);
+
+  useEffect(() => {
+    agent.renewAuthorization(config.token);
+  }, [agent, config.token]);
+
+  useSyncExternalStore(agent.subscribe, agent.getSnapshot, agent.getSnapshot);
   return agent;
 }
