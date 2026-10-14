@@ -338,7 +338,7 @@ class AgentFacade implements Agent {
   #active = false;
   #activation = 0;
   #ready: Promise<Runtime> = new Promise(() => {});
-  readonly #runtimeConfig: RuntimeConfig;
+  #runtimeConfig: RuntimeConfig;
 
   constructor(config: AgentConfig, managed = false) {
     const runtimeConfig = copyConfig(config);
@@ -687,6 +687,16 @@ class AgentFacade implements Agent {
     } else {
       this.#pendingToken = token;
     }
+  }
+
+  setLogging(level: LogLevel): void {
+    if (this.#closed) throw new Error("agent is closed");
+    if (this.#runtimeConfig.logLevel === level) return;
+    if (!["off", "error", "warn", "info", "debug", "trace"].includes(level))
+      throw new TypeError("invalid logging level");
+    this.#runtime?.set_log_level(level);
+    this.#runtimeConfig = { ...this.#runtimeConfig, logLevel: level };
+    this.#remote.setLogLevel(level);
   }
 
   sendTopic(name: string, mode: TopicMode, payload: Uint8Array): void {
