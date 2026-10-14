@@ -10,6 +10,7 @@ var developmentJSON []byte
 
 // DevelopmentCredentials contains public, insecure credentials for --dev servers.
 type DevelopmentCredentials struct {
+	APIKey    string `json:"apiKey"`
 	ProjectID string `json:"projectId"`
 	KeyID     string `json:"keyId"`
 	Secret    string `json:"secret"`
