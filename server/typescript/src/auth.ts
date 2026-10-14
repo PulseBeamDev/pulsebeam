@@ -90,6 +90,8 @@ export function signParticipantToken({
   let key: string;
   let seed: Uint8Array;
   if (apiKey !== undefined) {
+    if (projectId !== undefined || keyId !== undefined || secret !== undefined)
+      invalid("mixed signing credentials");
     ({ project, key, seed } = parseApiKey(apiKey));
   } else {
     project = canonicalId(projectId, "p");
