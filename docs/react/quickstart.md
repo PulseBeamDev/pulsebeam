@@ -41,30 +41,28 @@ In **your application's backend** (Node.js), install the server SDK:
 npm install @pulsebeam/server
 ```
 
-`INSECURE_DEV_CREDENTIALS` provides the project ID, key ID, and signing secret
-matching the server's `--dev` identity. That is why tokens signed below work
-without configuring keys locally.
+`INSECURE_DEV_API_KEY` is a single publicly known `key_0` credential matching
+the server's `--dev` identity. Production backends use their own
+`PULSEBEAM_API_KEY` secret; see the [V0 format](../../server/auth/api-key.md).
 
 ```ts
-import { signParticipantToken, INSECURE_DEV_CREDENTIALS } from "@pulsebeam/server";
+import { signParticipantToken, INSECURE_DEV_API_KEY } from "@pulsebeam/server";
 
-function issueToken() {
+function issueToken(participant: string) {
   return signParticipantToken({
-    projectId: INSECURE_DEV_CREDENTIALS.projectId,
-    keyId: INSECURE_DEV_CREDENTIALS.keyId,
-    secret: INSECURE_DEV_CREDENTIALS.secret,
+    apiKey: INSECURE_DEV_API_KEY,
     room: "demo",
-    participant: crypto.randomUUID(),
+    participant,
     expiration: Math.floor(Date.now() / 1000) + 3600,
   });
 }
 ```
 
-Call `issueToken()` for each participant and send the resulting token to
+Call `issueToken(participantId)` for each stable application participant ID and send the resulting token to
 your React frontend through your application's API or server-rendered props.
 Never send signing credentials to the browser. **In production:** run PulseBeam
 without `--dev`, register your own public key with `--project-registry`, and
-keep its matching private signing key on your application backend. Authenticate
+keep the corresponding `PULSEBEAM_API_KEY` on your application backend. Authenticate
 users and authorize room access before issuing tokens.
 
 For Rust, Go, or Python backends, use the corresponding server SDK.
