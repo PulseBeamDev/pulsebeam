@@ -138,10 +138,13 @@ export type FailureClass =
   | "validation"
   | "runtime";
 
-export interface AgentFailure {
+export interface AgentError {
   readonly class: FailureClass;
   readonly message: string;
 }
+
+/** @deprecated Use AgentError. */
+export type AgentFailure = AgentError;
 
 export interface Participant {
   readonly id: string;
@@ -289,7 +292,7 @@ export interface AgentSnapshot {
   /** Available remote tracks, keyed by publication ID. */
   readonly tracks: Readonly<Record<string, RemoteTrack>>;
   readonly topics: TopicSnapshot;
-  readonly failure: AgentFailure | null;
+  readonly failure: AgentError | null;
 }
 
 export interface SenderEncoding {
@@ -389,10 +392,18 @@ export type AgentEvent =
       readonly mode: TopicMode;
       readonly message: string;
     }
-  | ({ readonly type: "failure" } & AgentFailure)
+  | ({ readonly type: "failure" } & AgentError)
   | { readonly type: "state-change" };
 
 export interface Agent {
+  /** Current observed connection state. Reactive when returned by React useAgent(). */
+  readonly connection: ConnectionState;
+  /** Current Agent error, if any. Reactive when returned by React useAgent(). */
+  readonly error: AgentError | null;
+  readonly participantId: string | null;
+  readonly participantExternalId: string | null;
+  readonly roomExternalId: string | null;
+  readonly authorizationExpiresAt: number | null;
   readonly local: LocalMedia;
   readonly remote: RemoteMedia;
   topic<T>(

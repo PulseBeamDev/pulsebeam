@@ -7,6 +7,8 @@ import {
   Video,
   type Agent,
   type AgentConfig,
+  type AgentError,
+  type ConnectionState,
   type CapturedVideoTrack,
   type LocalTrackCapacityError,
   type MediaCaptureError,
@@ -44,6 +46,9 @@ const defaultOwned: Agent = useAgent(minimal);
 void [defaultAgent, defaultOwned];
 const agent: Agent = createAgent(config);
 const owned: Agent = useAgent(config);
+const connection: ConnectionState = owned.connection;
+const agentError: AgentError | null = owned.error;
+void [connection, agentError];
 // @ts-expect-error Each useAgent must have its own construction config.
 useAgent();
 const camera = useUserMedia({ video: { width: 1280 }, audio: false });

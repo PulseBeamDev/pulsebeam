@@ -9,13 +9,17 @@ new Promise((resolve, reject) => {
     5000,
   );
   agent.subscribe(() => {
-    if (agent.getSnapshot().connection !== "terminal-failure") return;
+    if (agent.connection !== "terminal-failure") return;
     clearTimeout(timeout);
     const failure = agent.getSnapshot().failure;
+    const error = agent.error;
     agent.setState({ connected: false });
     const after = agent.getSnapshot();
     resolve(
-      after.connection === "terminal-failure" && after.failure === failure,
+      after.connection === "terminal-failure" &&
+      agent.connection === after.connection &&
+      after.failure === failure &&
+      error === failure,
     );
   });
   agent.setState({ connected: true });

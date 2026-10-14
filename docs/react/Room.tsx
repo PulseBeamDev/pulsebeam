@@ -21,13 +21,12 @@ export function Room({ config }: { config: AgentConfig }) {
     microphone.setSource(capture.audioTrack);
   }, [camera, microphone, capture.videoTrack, capture.audioTrack]);
 
-  const snapshot = agent.getSnapshot();
   return (
     <main>
       <h1>PulseBeam React room</h1>
       <p role="status">
-        Connection: {snapshot.connection}; participant:{" "}
-        {snapshot.participantExternalId ?? "not admitted"}
+        Connection: {agent.connection}; participant:{" "}
+        {agent.participantExternalId ?? "not admitted"}
       </p>
       <p>Capture: {capture.state}</p>
       <button onClick={() => agent.connect()}>Join</button>
@@ -78,9 +77,9 @@ export function Room({ config }: { config: AgentConfig }) {
           Retry video playback
         </button>
       )}
-      {(error || capture.error || snapshot.failure) && (
+      {(error || capture.error || agent.error) && (
         <p role="alert">
-          {error || capture.error?.message || snapshot.failure?.message}
+          {error || capture.error?.message || agent.error?.message}
         </p>
       )}
     </main>

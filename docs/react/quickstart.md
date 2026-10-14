@@ -118,15 +118,13 @@ function Room({ token, media }: { token: string; media: CaptureResult }) {
     agent.local.audio("microphone").setSource(media.audioTrack);
   }, [agent, media.videoTrack, media.audioTrack]);
 
-  const { connection, failure } = agent.getSnapshot();
-
   return (
     <>
       <button onClick={() => agent.connect()}>Join room</button>
       <button onClick={() => agent.disconnect()}>Leave room</button>
-      <p>Connection: {connection}</p>
-      {connection === "terminal-failure" && failure && (
-        <p role="alert">{failure.message}</p>
+      <p>Connection: {agent.connection}</p>
+      {agent.error && (
+        <p role="alert">{agent.error.message}</p>
       )}
       {agent.remote.videoTracks.map((track) => (
         <Video

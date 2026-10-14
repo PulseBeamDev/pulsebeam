@@ -36,8 +36,8 @@ as permission denial; codes vary by browser.
 
 ## Admission and connection
 
-Read `getSnapshot().connection`, `failure`, admitted external IDs, and expiry.
-Calling `connect()` is intent, not proof of admission.
+Read `agent.connection`, `agent.error`, admitted external IDs, and expiry directly.
+`useAgent` keeps those properties reactive; calling `connect()` is intent, not proof of admission.
 
 | Symptom | Check |
 | --- | --- |
@@ -49,7 +49,7 @@ Calling `connect()` is intent, not proof of admission.
 | Renewal fails | Backend token must keep the same room and participant |
 
 For more detail, enable `logging: {level: "debug"}` and Chrome's Verbose console
-level. Changing logging replaces a hook-owned Agent. **Never log bearer tokens.**
+level. Changing logging updates a hook-owned Agent in place. **Never log bearer tokens.**
 Reconnect cannot repair bad credentials or missing assets.
 
 ## Container networking
@@ -75,9 +75,9 @@ Check in order:
 1. **Joined?** Both participants show `connected`, with distinct external IDs in the same room.
 2. **Published?** Sender capture is active and bound to the right local handles.
    Disabled means black/silent; `setSource(null)` means withdrawn.
-3. **Discovered?** `snapshot.catalog` lists the publication.
-4. **Assigned?** `snapshot.mapping` and `tracks` show a receiver assignment.
-   Discovery alone does not prove this.
+3. **Discovered?** `agent.remote.videoTracks` / `audioTracks` expose the remote publications.
+4. **Assigned?** For audio, check the track's `receiving`; for video, a visible
+   `<Video>` drives receiver demand. Discovery alone does not prove assignment.
 5. **Playing?** Remote `Video` is visible and sized; topology has capacity.
    For audio, check autoplay, sender silence, and browser/OS output.
 

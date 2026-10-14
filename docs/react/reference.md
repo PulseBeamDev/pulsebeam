@@ -26,9 +26,12 @@ Need a working app first? [Install the SDK and add a room](/react/quickstart).
 useAgent(config: AgentConfig): Agent
 ```
 
-Returns an Agent handle from the first render and subscribes the component to
-its snapshots. The handle is inert during rendering; React activates its runtime
-after commit. It does not connect or start capture automatically.
+Returns an Agent handle from the first render and subscribes to it internally.
+Observable Agent properties such as `connection`, `error`, admitted identity, and
+remote media are reactive during render; application code does not call
+`useSyncExternalStore`, `subscribe`, or `getSnapshot`. The handle is inert during
+rendering; React activates its runtime after commit. It does not connect or start
+capture automatically.
 
 | Lifecycle | Result |
 | --- | --- |
@@ -76,8 +79,9 @@ Supported levels: `off`, `error`, `warn`, `info`, `debug`, `trace`.
 Console logging is scoped to each Agent and can be changed in place via
 `agent.setLogging(level)`. Chrome needs Verbose enabled for debug/trace.
 
-Configuration and runtime initialization failures appear through Agent failure
-snapshots/events. Browser assets and APIs must be available. Connection intent
+Configuration and runtime initialization errors appear through `agent.error`
+(and through diagnostic events for callers that need them). Browser assets and APIs
+must be available. Connection intent
 is not admission. See [connection diagnostics](/react/troubleshooting#admission-and-connection).
 
 ## createAgent
@@ -99,6 +103,10 @@ execute browser runtime initialization in SSR.
 
 | Member | Result and ownership |
 | --- | --- |
+| `connection: ConnectionState` | Current observed connection state; reactive under `useAgent` |
+| `error: AgentError \| null` | Current Agent error; reactive under `useAgent` |
+| `participantId`, `participantExternalId`, `roomExternalId` | Current admitted identity; reactive under `useAgent` |
+| `authorizationExpiresAt` | Current authorization deadline or null; reactive under `useAgent` |
 | `local: LocalMedia` | Stable local audio/video handles by label |
 | `remote: RemoteMedia` | Logical discovery, presentation handles, audio recovery |
 | `topic<T>(name, {mode})` | Typed JSON facade, see [topics](#topics) |
@@ -106,8 +114,8 @@ execute browser runtime initialization in SSR.
 | `disconnect(): void` | Sets intent false and stops retrying; capture remains caller-owned |
 | `reconnect(): void` | Requests runtime reconnection, retains desired state |
 | `renewAuthorization(token): void` | Updates bearer authorization for this session, does not fetch a token |
-| `getSnapshot(): AgentSnapshot` | Current immutable observable snapshot |
-| `subscribe(listener): () => void` | Snapshot notifications; caller cleans up unless using `useAgent` |
+| `getSnapshot(): AgentSnapshot` | Low-level immutable snapshot for caller-owned/Web integrations; React code normally does not need it |
+| `subscribe(listener): () => void` | Low-level snapshot notifications; `useAgent` owns this subscription internally |
 | `subscribeEvents(listener): () => void` | Diagnostics and topic events; caller cleans up |
 | `setLogging(level): void` | Update diagnostic verbosity without restarting the session |
 | `close(): void` | Terminal, idempotent teardown |
@@ -265,7 +273,7 @@ Admission means the server accepted the participant into the room.
 | `mapping: MappingSnapshot` | Publications assigned to receiver slots |
 | `tracks` | Publication-ID-keyed low-level media observations |
 | `topics: TopicSnapshot` | Topic transport status and counters |
-| `failure: AgentFailure \| null` | Failure class and message |
+| `failure: AgentError \| null` | Low-level snapshot error field; normal React code reads `agent.error` |
 | `version`, `desiredRevision`, `generation` | Snapshot version, desired-state revision, and runtime generation for diagnostics |
 
 **ConnectionState** includes `disconnected`, `initializing`, `creating-offer`,
@@ -290,7 +298,7 @@ immutable/stable until observable changes; platform tracks are not frozen.
 
 ### Errors
 
-**AgentFailure** has `class: FailureClass` and `message`. Classes:
+**AgentError** has `class: FailureClass` and `message`. `AgentFailure` remains a deprecated type alias for compatibility. Classes:
 `initialization`, `invalid-configuration`, `authorization`, `protocol`,
 `transient`, `resource-expired`, `retry-exhausted`, `validation`, `runtime`.
 Use connection status and class together; not every failure is terminal or
