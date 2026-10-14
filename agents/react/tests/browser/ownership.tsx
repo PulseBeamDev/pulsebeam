@@ -22,18 +22,21 @@ export async function runOwnershipContract() {
   let changeToken!: () => void;
   let changeEndpoint!: () => void;
   let changeLogging!: () => void;
+  let changeTopology!: () => void;
   let firstRenderAvailable = false;
   function Probe() {
     const [token, setToken] = useState("owned-token-a");
     const [endpoint, setEndpoint] = useState(location.origin);
     const [logging, setLogging] = useState<LogLevel>("warn");
+    const [localVideos, setLocalVideos] = useState(1);
     changeToken = () => setToken("owned-token-b");
     changeEndpoint = () => setEndpoint(`${location.origin}/replacement`);
     changeLogging = () => setLogging("debug");
+    changeTopology = () => setLocalVideos(2);
     left = useAgent({
       endpoint,
       token,
-      topology: { localVideos: 1 },
+      topology: { localVideos },
       logging: { level: logging },
     });
     right = useAgent({
@@ -99,10 +102,19 @@ export async function runOwnershipContract() {
     await new Promise((resolve) => setTimeout(resolve, 30));
     const loggingKeepsSession = left === first;
 
-    changeEndpoint();
+    changeTopology();
     await until(() => left !== null && left !== first);
-    const replacedConstruction =
+    const resized = left!;
+    const topologyReplacement =
       first.getSnapshot().connection === "disconnected" &&
+      resized.local.video("camera").kind === "video" &&
+      resized.local.video("screen").kind === "video";
+
+    changeEndpoint();
+    await until(() => left !== null && left !== resized);
+    const replacedConstruction =
+      topologyReplacement &&
+      resized.getSnapshot().connection === "disconnected" &&
       right === independent;
     const replacement = left!;
     root.unmount();
