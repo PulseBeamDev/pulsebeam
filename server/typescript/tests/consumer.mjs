@@ -32,9 +32,11 @@ writeFileSync(
   join(directory, "consumer.mjs"),
   'export { signParticipantToken, INSECURE_DEV_CREDENTIALS, INSECURE_DEV_API_KEY } from "@pulsebeam/server";',
 );
-const { signParticipantToken, INSECURE_DEV_CREDENTIALS, INSECURE_DEV_API_KEY } = await import(
-  pathToFileURL(join(directory, "consumer.mjs"))
-);
+const {
+  signParticipantToken,
+  INSECURE_DEV_CREDENTIALS,
+  INSECURE_DEV_API_KEY,
+} = await import(pathToFileURL(join(directory, "consumer.mjs")));
 const development = JSON.parse(readFileSync(developmentFixture));
 assert.deepEqual(INSECURE_DEV_CREDENTIALS, {
   projectId: development.projectId,
@@ -52,12 +54,15 @@ assert.equal(
   JSON.parse(Buffer.from(devToken.split(".")[1], "base64url")).iss,
   development.projectId,
 );
-assert.equal(signParticipantToken({
-  apiKey: INSECURE_DEV_API_KEY,
-  room: "local",
-  participant: "test",
-  expiration: 2000000000,
-}), devToken);
+assert.equal(
+  signParticipantToken({
+    apiKey: INSECURE_DEV_API_KEY,
+    room: "local",
+    participant: "test",
+    expiration: 2000000000,
+  }),
+  devToken,
+);
 
 const document = JSON.parse(readFileSync(fixtures));
 const adapt = (i) => ({
@@ -71,12 +76,16 @@ const adapt = (i) => ({
 for (const v of document.valid) {
   const token = signParticipantToken(adapt(v.input));
   assert.equal(token, v.token, v.name);
-  assert.equal(signParticipantToken({
-    apiKey: "key_0067MYZ1001R0100000000000640RYKVW400Q00C00400000000S4SK88KCMFZ5PTKPVC6HQC2570YPWA66FKBAX64KD8SXQD9YWADYR",
-    room: v.input.room,
-    participant: v.input.participant,
-    expiration: BigInt(v.input.expiration),
-  }), v.token, v.name + " V0 API key");
+  assert.equal(
+    signParticipantToken({
+      apiKey: "key_0067MYZ1001R0100000000000640RYKVW400Q00C00400000000S4SK88KCMFZ5PTKPVC6HQC2570YPWA66FKBAX64KD8SXQD9YWADYR",
+      room: v.input.room,
+      participant: v.input.participant,
+      expiration: BigInt(v.input.expiration),
+    }),
+    v.token,
+    v.name + " V0 API key",
+  );
   const [header, claims, signature] = token.split(".");
   assert.equal(Buffer.from(header, "base64url").toString(), v.header);
   assert.equal(Buffer.from(claims, "base64url").toString(), v.claims);
@@ -126,7 +135,7 @@ assert(!inspect(signParticipantToken).includes(document.base.secret));
 // Resolve declarations through the installed package's public export map.
 writeFileSync(
   join(directory, "consumer.ts"),
-  `import { signParticipantToken, INSECURE_DEV_CREDENTIALS } from "@pulsebeam/server";
+  `import { signParticipantToken, INSECURE_DEV_CREDENTIALS, INSECURE_DEV_API_KEY } from "@pulsebeam/server";
 const devKey: string = INSECURE_DEV_CREDENTIALS.secret;
 const compactKey: string = INSECURE_DEV_API_KEY;
 const input = {projectId:"p", keyId:"k", secret:"s", room:"r", participant:"p", expiration:18446744073709551615n};
@@ -168,7 +177,14 @@ for (const invalid of [
   INSECURE_DEV_API_KEY.slice(0, -1) + "1",
   "sk_0" + INSECURE_DEV_API_KEY.slice(5),
 ]) {
-  assert.throws(() => signParticipantToken({
-    apiKey: invalid, room: "local", participant: "test", expiration: 2000,
-  }), /API key|credential/i);
+  assert.throws(
+    () =>
+      signParticipantToken({
+        apiKey: invalid,
+        room: "local",
+        participant: "test",
+        expiration: 2000,
+      }),
+    /API key|credential/i,
+  );
 }
