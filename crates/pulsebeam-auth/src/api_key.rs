@@ -56,6 +56,14 @@ impl ApiKey {
         })
     }
 
+    pub fn from_signing_key(
+        project_id: [u8; 16],
+        key_id: [u8; 16],
+        signing_key: &ApiSigningKey,
+    ) -> Result<Self, ApiKeyError> {
+        Self::new(project_id, key_id, *signing_key.seed_bytes())
+    }
+
     pub fn project_id_bytes(&self) -> &[u8; 16] {
         &self.project_id
     }
