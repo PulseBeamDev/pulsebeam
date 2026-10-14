@@ -6,7 +6,7 @@ description: Add one feature to your working room.
 # Add one feature
 
 Start from the [working room](/react/quickstart). Pick what you want to build.
-All examples use `@pulsebeam/react`; check that `useAgent` has returned an Agent.
+All examples use `@pulsebeam/react`; `useAgent` supplies a handle from the first render.
 
 | Build | Jump to |
 | --- | --- |
@@ -132,8 +132,8 @@ sequenceDiagram
 ```
 
 Fetch before `snapshot.authorizationExpiresAt` (Unix seconds), then update only
-`config.token`. The hook renews the same Agent; changing endpoint, topology, or
-logging replaces it. Caller-owned Agents use `renewAuthorization(token)`.
+`config.token`. The hook renews the same Agent; changing endpoint or topology replaces it; logging changes update in place.
+Caller-owned Agents use `renewAuthorization(token)`.
 The SDK does not fetch tokens. Keep keys server-side, report renewal failures,
 and use a new Agent to change room or participant.
 
