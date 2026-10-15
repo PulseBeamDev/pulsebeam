@@ -217,6 +217,9 @@ export class RemoteCatalog implements RemoteMedia {
   resumeAudio(): Promise<void> {
     return this.#playback.resume();
   }
+  resetPlayback(): void {
+    this.#playback.reset();
+  }
   read(id: string | undefined, buffer: Float32Array, spectrum: boolean): void {
     this.#playback.read(id, buffer, spectrum);
   }

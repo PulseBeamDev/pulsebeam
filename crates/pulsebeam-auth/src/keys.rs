@@ -248,9 +248,7 @@ mod tests {
             Err(KeyValidationError::InvalidPrefix { .. })
         ));
         assert!(matches!(
-            public
-                .replacen("pk_0", "pk_1", 1)
-                .parse::<ApiPublicKey>(),
+            public.replacen("pk_0", "pk_1", 1).parse::<ApiPublicKey>(),
             Err(KeyValidationError::UnsupportedVersion)
         ));
         let short = public.chars().take(55).collect::<String>();

@@ -559,7 +559,8 @@ impl BrowserRuntime {
         let actor = actor
             .as_ref()
             .ok_or_else(|| js_error("runtime actor not initialized"))?;
-        actor.send_public(PublicCommand::SetLogLevel(level.into()))
+        actor
+            .send_public(PublicCommand::SetLogLevel(level.into()))
             .map_err(js_error)?;
         self.inner.logger.set_level(level);
         Ok(())

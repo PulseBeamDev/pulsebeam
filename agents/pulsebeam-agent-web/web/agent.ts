@@ -391,7 +391,8 @@ class AgentFacade implements Agent {
         try {
           runtime = new BrowserRuntime(this.#runtimeConfig);
         } catch (error) {
-          if (active()) this.#terminalFailure("invalid-configuration", message(error));
+          if (active())
+            this.#terminalFailure("invalid-configuration", message(error));
           throw error;
         }
         this.#runtime = runtime;
@@ -399,14 +400,16 @@ class AgentFacade implements Agent {
           if (active()) this.#runtimeEvent(event);
         });
         runtime.set_error_listener((error: unknown) => {
-          if (active()) this.#emitFailure(localFailureClass(error), message(error));
+          if (active())
+            this.#emitFailure(localFailureClass(error), message(error));
         });
         try {
           runtime.replace_desired(
             desiredValue(this.#effectiveState(this.#state)),
           );
         } catch (error) {
-          if (active()) this.#terminalFailure("invalid-configuration", message(error));
+          if (active())
+            this.#terminalFailure("invalid-configuration", message(error));
           runtime.abort();
           this.#runtime = undefined;
           throw error;
@@ -447,6 +450,7 @@ class AgentFacade implements Agent {
       runtime.close();
       runtime.abort();
     }
+    this.#remote.resetPlayback();
     this.#publish(emptySnapshot("disconnected"));
   }
 
@@ -586,7 +590,9 @@ class AgentFacade implements Agent {
       void this.replaceLocalTrack(
         slot,
         track,
-        kind === "video" ? { contentHint: "motion" } : { contentHint: "speech" },
+        kind === "video"
+          ? { contentHint: "motion" }
+          : { contentHint: "speech" },
       ).catch(() => {});
   }
 

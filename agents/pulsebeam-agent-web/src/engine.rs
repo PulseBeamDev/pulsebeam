@@ -126,10 +126,7 @@ impl fmt::Debug for PublicCommand {
                 .debug_tuple("SetConnected")
                 .field(connected)
                 .finish(),
-            Self::SetLogLevel(level) => formatter
-                .debug_tuple("SetLogLevel")
-                .field(level)
-                .finish(),
+            Self::SetLogLevel(level) => formatter.debug_tuple("SetLogLevel").field(level).finish(),
         }
     }
 }

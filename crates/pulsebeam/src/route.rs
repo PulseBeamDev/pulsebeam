@@ -754,7 +754,11 @@ impl RouteRuntime {
         dedup: crate::participant::reverse::ReverseDedup,
         now: Instant,
     ) -> bool {
-        let Some(RouteAction::Reverse { .. }) = self.resolve(address) else {
+        // Feedback can arrive after retirement or slot reuse during reconnection.
+        let Some(action) = self.resolve(address) else {
+            return false;
+        };
+        let RouteAction::Reverse { .. } = action else {
             debug_assert!(false, "a reverse envelope must resolve to a reverse route");
             return false;
         };
@@ -1143,6 +1147,44 @@ mod tests {
         assert!(!runtime.accept_reverse(route, packet.dedup(), now));
         tokio::time::advance(Duration::from_millis(101)).await;
         assert!(runtime.accept_reverse(route, packet.dedup(), Instant::now()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stale_reverse_packets_do_not_poison_a_replacement_route() {
+        let mut runtime = RouteRuntime::new(ShardId::new(0));
+        let old = address(0, 0, 7);
+        let replacement = address(0, 0, 8);
+        let action = RouteAction::Reverse {
+            target: crate::keys::TrackHandle::default(),
+        };
+        let packet = crate::participant::reverse::ReversePacket::reliable_control(vec![4, 5]);
+        let now = Instant::now();
+
+        assert!(!runtime.accept_reverse(old, packet.dedup(), now));
+        runtime.install_action(old, action);
+        assert!(runtime.accept_reverse(old, packet.dedup(), now));
+        assert!(runtime.retire(old));
+        assert!(!runtime.accept_reverse(old, packet.dedup(), now));
+
+        runtime.install_action(replacement, action);
+        assert!(!runtime.accept_reverse(old, packet.dedup(), now));
+        assert!(runtime.accept_reverse(replacement, packet.dedup(), now));
+        assert!(!runtime.accept_reverse(replacement, packet.dedup(), now));
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[should_panic(expected = "a reverse envelope must resolve to a reverse route")]
+    async fn reverse_packets_must_not_target_a_live_forward_route() {
+        let mut runtime = RouteRuntime::new(ShardId::new(0));
+        let route = address(0, 0, 7);
+        runtime.install_action(
+            route,
+            RouteAction::Forward {
+                target: crate::keys::TrackHandle::default(),
+            },
+        );
+        let packet = crate::participant::reverse::ReversePacket::reliable_control(vec![4, 5]);
+        runtime.accept_reverse(route, packet.dedup(), Instant::now());
     }
 
     #[tokio::test(start_paused = true)]

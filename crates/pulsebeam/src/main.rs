@@ -86,8 +86,8 @@ fn main() {
         .with(fmt_layer)
         .init();
 
-    let registry = configured_key_registry(&args, Path::new("key-registry.json"))
-        .unwrap_or_else(|error| {
+    let registry =
+        configured_key_registry(&args, Path::new("key-registry.json")).unwrap_or_else(|error| {
             pulsebeam_runtime::fatal!("invalid authentication configuration: {error:#}")
         });
     tracing::info!(project_id = %registry.project_id(), "configured authentication project");
@@ -202,11 +202,11 @@ mod tests {
     #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
     use super::*;
-    use std::path::PathBuf;
     use pulsebeam_core::{
         auth::ApiSigningKey,
         identity::{ApiKeyId, ProjectId},
     };
+    use std::path::PathBuf;
 
     fn project(last: u8) -> ProjectId {
         ProjectId::from_bytes([0, 0, 0, 0, 0, 0, 0x70, 0, 0x80, 0, 0, 0, 0, 0, 0, last])
@@ -264,5 +264,4 @@ mod tests {
         assert!(configured_key_registry(&args, &path).is_err());
         std::fs::remove_file(path).unwrap();
     }
-
 }

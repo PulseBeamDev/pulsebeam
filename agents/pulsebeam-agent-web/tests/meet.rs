@@ -117,6 +117,17 @@ async fn meet_media_contract(gesture_before_media: bool) -> TestResult<()> {
         driver.find(By::Css("form input")).await?.send_keys("outbound Meet chat").await?;
         click(&driver, "Send message").await?;
         click(&driver, "Send a reaction").await?;
+        let _: bool = evaluate_json(&bidi, &context, r#"(async () => {
+            await __meet.wait(() => {
+                const menu = document.querySelector('[role="menu"]');
+                if (!menu) return false;
+                for (let node = menu; node; node = node.parentElement) {
+                    if (node.getAnimations().some(animation => animation.pending || animation.playState === 'running')) return false;
+                }
+                return true;
+            }, 'reaction menu animation settled');
+            return true;
+        })()"#).await?;
         click(&driver, "React with 👍").await?;
         let _: bool = evaluate_json(&bidi, &context, r#"(async () => {
             await __meet.wait(() => __meet.chats.some(({text}) => text === 'outbound Meet chat') && __meet.emojis.some(({emoji}) => emoji === '👍'), 'real Meet sends both topics');

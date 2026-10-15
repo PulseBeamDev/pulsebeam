@@ -76,5 +76,24 @@
       await source.close();
     },
   });
+  await window.__meet.wait(() => {
+    const snapshot = sender.getSnapshot();
+    const subscribers = snapshot.topics.subscribers;
+    return (
+      snapshot.connection === "connected" &&
+      subscribers.some(
+        (status) =>
+          status.name === "chat" &&
+          status.mode === "ordered" &&
+          status.connected,
+      ) &&
+      subscribers.some(
+        (status) =>
+          status.name === "reactions" &&
+          status.mode === "latest" &&
+          status.connected,
+      )
+    );
+  }, "publisher topic subscriptions ready");
   return true;
 })();

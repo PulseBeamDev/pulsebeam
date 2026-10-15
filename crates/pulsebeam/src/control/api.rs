@@ -829,11 +829,7 @@ fn build_openapi(base_path: &str) -> utoipa::openapi::OpenApi {
 )]
 struct ApiDoc;
 
-pub fn router(
-    controller: ControllerSender,
-    cfg: ApiConfig,
-    key_registry: KeyRegistry,
-) -> Router {
+pub fn router(controller: ControllerSender, cfg: ApiConfig, key_registry: KeyRegistry) -> Router {
     let openapi = build_openapi(&cfg.base_path);
     let api = Router::new()
         .route("/native", post(create_native))
@@ -899,7 +895,7 @@ mod tests {
     use super::*;
     use pulsebeam_core::{
         auth::{
-            DEVELOPMENT_API_KEY_ID, DEVELOPMENT_API_SIGNING_KEY, DEVELOPMENT_API_PUBLIC_KEY,
+            DEVELOPMENT_API_KEY_ID, DEVELOPMENT_API_PUBLIC_KEY, DEVELOPMENT_API_SIGNING_KEY,
             DEVELOPMENT_PROJECT_ID, KeyRegistryEntry,
         },
         identity::{ParticipantExternalId, RoomExternalId},

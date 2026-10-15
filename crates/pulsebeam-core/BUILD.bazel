@@ -30,7 +30,7 @@ rust_library(
     crate_name = "pulsebeam_core",
     crate_root = "src/lib.rs",
     srcs = glob(["src/**/*.rs"], exclude = ["src/bin/**"]),
-    compile_data = glob(["README.md", "src/**"], exclude = ["src/**/*.rs"]),
+    compile_data = glob(["README.md", "src/**"], exclude = ["src/**/*.rs"]) + ["//server/auth:development.json"],
     edition = crate_edition(),
     crate_features = [],
     rustc_env_files = [":cargo_env"],

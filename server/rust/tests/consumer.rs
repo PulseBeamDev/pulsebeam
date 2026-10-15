@@ -147,8 +147,7 @@ fn packaged_development_credentials_match_canonical_json() {
         format!("{}1", &actual.api_key[..actual.api_key.len() - 1]),
     ] {
         assert!(
-            sign_participant_token_with_api_key(&invalid, "demo", "alice", 2_000_000_000)
-                .is_err()
+            sign_participant_token_with_api_key(&invalid, "demo", "alice", 2_000_000_000).is_err()
         );
     }
 }
