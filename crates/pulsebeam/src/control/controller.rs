@@ -23,7 +23,7 @@ use crate::{
     },
 };
 use pulsebeam_core::auth::{
-    AuthorizationExpiry, MAX_COMPACT_TOKEN_LEN, KeyRegistry, TokenError, VerifiedAuthorization,
+    AuthorizationExpiry, KeyRegistry, MAX_COMPACT_TOKEN_LEN, TokenError, VerifiedAuthorization,
     verify_participant_token,
 };
 use pulsebeam_runtime::mailbox;
@@ -1578,7 +1578,7 @@ mod replacement_tests {
     #[tokio::test]
     async fn renewal_verifies_jwt_off_control_loop_and_commits_only_current_identity() {
         use pulsebeam_core::auth::{
-            DEVELOPMENT_API_KEY_ID, DEVELOPMENT_API_SIGNING_KEY, DEVELOPMENT_API_PUBLIC_KEY,
+            DEVELOPMENT_API_KEY_ID, DEVELOPMENT_API_PUBLIC_KEY, DEVELOPMENT_API_SIGNING_KEY,
             DEVELOPMENT_PROJECT_ID, KeyRegistryEntry,
         };
         let mut actor = actor();

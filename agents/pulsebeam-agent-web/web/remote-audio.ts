@@ -36,6 +36,8 @@ export class RemoteAudioPlayback {
         this.#decoder?.srcObject ? this.#decoder.play() : undefined,
       ]);
       if (this.#closed) throw new Error("agent is closed");
+      if (context !== this.#context)
+        throw new Error("audio playback was reset");
       if (context.state !== "running")
         throw new Error("audio playback is not running");
     } catch (error) {
@@ -174,9 +176,7 @@ export class RemoteAudioPlayback {
     );
   }
 
-  close(): void {
-    if (this.#closed) return;
-    this.#closed = true;
+  reset(): void {
     for (const route of this.#routes.values()) {
       route.source.disconnect();
       route.analyser.disconnect();
@@ -187,5 +187,11 @@ export class RemoteAudioPlayback {
     const context = this.#context;
     this.#context = undefined;
     if (context) void context.close().catch(() => {});
+  }
+
+  close(): void {
+    if (this.#closed) return;
+    this.#closed = true;
+    this.reset();
   }
 }

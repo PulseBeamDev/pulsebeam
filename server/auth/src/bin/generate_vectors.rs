@@ -64,7 +64,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             canonical_project_id: project.as_str(),
             canonical_key_id: key.as_str(),
             seed_hex: case.seed_hex,
-            public_key_hex: encode_hex(signing.public_key().as_bytes()),
+            public_key_hex: encode_hex(signing.verifying_key().as_bytes()),
             header,
             claims,
             signing_input,

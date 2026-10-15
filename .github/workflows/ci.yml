@@ -17,7 +17,7 @@ jobs:
       - uses: actions/checkout@v5
       - uses: ./.github/actions/setup-ci
       - name: Run complete non-privileged gate
-        run: ./bazel test //:test --test_output=errors --zip_undeclared_test_outputs
+        run: ./bazel test //:test --keep_going --test_output=errors --zip_undeclared_test_outputs
       - name: Retain test logs and browser evidence
         if: always()
         uses: actions/upload-artifact@v4

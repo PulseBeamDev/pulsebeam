@@ -394,6 +394,34 @@ mod tests {
         );
     }
 
+    fn with_unique_mids(offer: SdpOffer) -> SdpOffer {
+        // str0m's random MIDs can collide within a batch of pending additions.
+        let sdp = offer.to_sdp_string();
+        let bundle = sdp
+            .lines()
+            .filter(|line| line.starts_with("a=mid:"))
+            .enumerate()
+            .map(|(index, _)| format!("m{index}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let mut index = 0;
+        let lines = sdp
+            .lines()
+            .map(|line| {
+                if line.starts_with("a=group:BUNDLE ") {
+                    format!("a=group:BUNDLE {bundle}")
+                } else if line.starts_with("a=mid:") {
+                    let mid = format!("a=mid:m{index}");
+                    index += 1;
+                    mid
+                } else {
+                    line.to_owned()
+                }
+            })
+            .collect::<Vec<_>>();
+        SdpOffer::from_sdp_string(&(lines.join("\r\n") + "\r\n")).unwrap()
+    }
+
     #[test]
     fn negotiated_capacity_is_independent_per_kind_and_direction() {
         let mut rtc = RtcConfig::new().build(std::time::Instant::now());
@@ -408,9 +436,9 @@ mod tests {
                 change.add_media(kind, direction, None, None, None);
             }
         }
-        let offer = change.apply().unwrap().0;
+        let offer = with_unique_mids(change.apply().unwrap().0);
         let mut negotiator = Negotiator::new(Vec::new());
-        assert!(negotiator.create_answer(offer, IceCreds::new()).is_ok());
+        negotiator.create_answer(offer, IceCreds::new()).unwrap();
     }
 
     #[test]
@@ -420,7 +448,7 @@ mod tests {
         for _ in 0..33 {
             change.add_media(MediaKind::Video, Direction::RecvOnly, None, None, None);
         }
-        let offer = change.apply().unwrap().0;
+        let offer = with_unique_mids(change.apply().unwrap().0);
         let mut negotiator = Negotiator::new(Vec::new());
         assert!(matches!(
             negotiator.create_answer(offer, IceCreds::new()),

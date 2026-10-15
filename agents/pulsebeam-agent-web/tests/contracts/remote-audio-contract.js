@@ -376,6 +376,35 @@
         received.every((track) => track.readyState === "live"),
       "close rejects recovery and leaves borrowed media live",
     );
+    const retainedAudio = independent.participant("alice").audio("second");
+    independent.resetPlayback();
+    await wait(
+      () => otherContext.state === "closed",
+      "deactivation releases the audio context",
+    );
+    assert(
+      otherOutput.routes.size === 0 &&
+        decoders[1].paused &&
+        decoders[1].srcObject === null,
+      "deactivation releases audible routes and private decoding",
+    );
+    independent.update(snapshot);
+    await wait(() => {
+      retainedAudio.readWaveform(wave);
+      return (
+        contexts[2]?.state === "running" &&
+        wave.some((value) => Math.abs(value) > 0.00001)
+      );
+    }, "reactivated audio output");
+    assert(
+      independent.participant("alice").audio("second") === retainedAudio &&
+        retainedAudio.receiving &&
+        contexts.length === 3 &&
+        outputs.get(contexts[2]).routes.size === 1 &&
+        captured.every((track) => track.readyState === "live") &&
+        received.every((track) => track.readyState === "live"),
+      "reactivation retains handles and borrowed media without duplicate output",
+    );
     return true;
   } finally {
     catalogs.forEach((catalog) => catalog.close());

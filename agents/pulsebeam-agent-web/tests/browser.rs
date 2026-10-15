@@ -238,6 +238,7 @@ async fn web(server: &StaticServer, failure: bool) -> TestResult<()> {
                     "attachRemoteVideo",
                     "createAgent",
                     "createCaptureSource",
+                    "createManagedAgent",
                     "nativeCaptureTrack"
                 ]
             );

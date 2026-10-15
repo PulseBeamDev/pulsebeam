@@ -23,8 +23,16 @@
         ),
       })),
     );
+    const topics = JSON.stringify(
+      {
+        status: window.__meet?.sender?.getSnapshot().topics,
+        chats: window.__meet?.chats,
+        emojis: window.__meet?.emojis,
+      },
+      (_, value) => (typeof value === "bigint" ? value.toString() : value),
+    );
     throw new Error(
-      `Meet media condition: ${label}; UI: ${document.body.innerText.slice(0, 1500)}; transports: ${JSON.stringify(transports)}`,
+      `Meet media condition: ${label}; UI: ${document.body.innerText.slice(0, 1500)}; topics: ${topics}; transports: ${JSON.stringify(transports)}`,
     );
   };
   const peers = new Set();
