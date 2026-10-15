@@ -1,6 +1,7 @@
-mod meet;
-mod quickstart;
+#[path = "support/destination.rs"]
+mod destination;
 mod support;
+use destination::DestinationServer;
 
 use pulsebeam_core::{
     auth::{DEVELOPMENT_API_KEY_ID, DEVELOPMENT_API_SIGNING_KEY, DEVELOPMENT_PROJECT_ID},
@@ -9,27 +10,9 @@ use pulsebeam_core::{
 use serde::Deserialize;
 use std::error::Error;
 use std::path::PathBuf;
-use support::{
-    DestinationServer, StaticServer, TestResult, capabilities, evaluate_json, managed_driver,
-    navigate,
-};
+use support::{StaticServer, TestResult, capabilities, evaluate_json, managed_driver, navigate};
 use thirtyfour::prelude::ChromiumLikeCapabilities;
 use thirtyfour::testing::run_browser_test;
-
-fn mint_development_token(
-    room: &RoomExternalId,
-    participant: &ParticipantExternalId,
-    expires_at: u64,
-) -> TestResult<String> {
-    Ok(pulsebeam_server::sign_participant_token(
-        &DEVELOPMENT_PROJECT_ID.as_str(),
-        &DEVELOPMENT_API_KEY_ID.as_str(),
-        &DEVELOPMENT_API_SIGNING_KEY.to_secret_string(),
-        room.as_str(),
-        participant.as_str(),
-        expires_at,
-    )?)
-}
 
 const PUBLIC: &str = include_str!("contracts/observe-public.js");
 const START_PUBLIC: &str = include_str!("contracts/start-public.js");
@@ -44,8 +27,6 @@ const RUNTIME_LOCAL_OPERATIONS: &str =
     include_str!("contracts/runtime-local-operation-contract.js");
 const REMOTE_MEDIA: &str = include_str!("contracts/remote-media-contract.js");
 const REMOTE_CATALOG: &str = include_str!("contracts/remote-catalog-contract.js");
-const TOPIC_FACADE: &str = include_str!("contracts/topic-facade-contract.js");
-const REACT: &str = include_str!("../../react/tests/browser/observe.js");
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -142,32 +123,9 @@ struct RemoteMedia {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RemoteCatalog {
-    external_identity: bool,
-    inert_policy: bool,
-    invalid_atomic: bool,
     max_physical_height: bool,
     measured_visibility: bool,
-    capacity: bool,
-    hidden_floor: bool,
-    mapping_not_removal: bool,
-    logical_lifetime: bool,
-    logical_audio: bool,
-    independent_kinds: bool,
-}
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct TopicFacade {
-    stable: bool,
-    inert: bool,
-    subscribed: bool,
-    received: bool,
-    published: bool,
-    aborted: bool,
     released: bool,
-    coalesced: bool,
-    malformed_fenced: bool,
-    validation: bool,
-    post_close: bool,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -181,32 +139,6 @@ struct UniFfi {
     retained_after_track_release: String,
     retained_before_stream_release: String,
     retained_after_stream_release: String,
-}
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct React {
-    removed_legacy_surface: bool,
-    playback_retained: bool,
-    playback_latest_callback: bool,
-    capture_devices: bool,
-    committed_render_isolation: bool,
-    autoplay_respected: bool,
-    capture_replacement: bool,
-    capture_fencing: bool,
-    capture_display: bool,
-    capture_errors: bool,
-    capture_session: bool,
-    owned_independent: bool,
-    owned_renewal: bool,
-    owned_replacement: bool,
-    owned_cleanup: bool,
-    local_preview: bool,
-    captured_preview: bool,
-    playback_probe_error: String,
-    replaced: bool,
-    playback_error: bool,
-    detached: bool,
-    audio_without_ui: bool,
 }
 fn root() -> PathBuf {
     PathBuf::from(
@@ -338,17 +270,7 @@ async fn remote_catalog_handles_preserve_identity_and_bound_demand() -> TestResu
         navigate(&bidi, &context, url).await?;
         let result: RemoteCatalog = evaluate_json(&bidi, &context, REMOTE_CATALOG).await?;
         assert!(
-            result.external_identity
-                && result.inert_policy
-                && result.invalid_atomic
-                && result.max_physical_height
-                && result.measured_visibility
-                && result.capacity
-                && result.hidden_floor
-                && result.mapping_not_removal
-                && result.logical_lifetime
-                && result.logical_audio
-                && result.independent_kinds,
+            result.max_physical_height && result.measured_visibility && result.released,
             "remote catalog contract: {result:?}",
         );
         Ok::<_, Box<dyn Error + Send + Sync>>(())
@@ -417,35 +339,6 @@ async fn remote_audio_recovers_from_a_trusted_gesture_and_fences_close() -> Test
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn typed_topic_facade_tracks_lifetime_and_bounds_delivery() -> TestResult<()> {
-    let server = StaticServer::start(root()).await?;
-    let url = server.url("tests/fixture.html");
-    run_browser_test(managed_driver(capabilities()?), |driver| async move {
-        let bidi = driver.bidi().await?;
-        let context = bidi.browsing_context().top_level().await?;
-        navigate(&bidi, &context, url).await?;
-        let result: TopicFacade = evaluate_json(&bidi, &context, TOPIC_FACADE).await?;
-        assert!(
-            result.stable
-                && result.inert
-                && result.subscribed
-                && result.received
-                && result.published
-                && result.aborted
-                && result.released
-                && result.coalesced
-                && result.malformed_fenced
-                && result.validation
-                && result.post_close,
-            "typed topic contract: {result:?}",
-        );
-        Ok::<_, Box<dyn Error + Send + Sync>>(())
-    })
-    .await
-    .map_err(|error| format!("typed topic contract failed: {error}").into())
-}
-
-#[tokio::test(flavor = "multi_thread")]
 async fn initialization_failure_is_private_and_deterministic() -> TestResult<()> {
     let server = StaticServer::start_with_wasm_failure(root(), true).await?;
     web(&server, true).await?;
@@ -454,7 +347,7 @@ async fn initialization_failure_is_private_and_deterministic() -> TestResult<()>
 }
 #[tokio::test(flavor = "multi_thread")]
 async fn connected_agents_select_and_play_audio_without_ui() -> TestResult<()> {
-    let _destination = DestinationServer::start()?;
+    let destination = DestinationServer::start().await?;
     let server = StaticServer::start(root()).await?;
     let room = RoomExternalId::new("automatic-web-audio")?;
     let sender = pulsebeam_server::sign_participant_token(
@@ -482,6 +375,7 @@ async fn connected_agents_select_and_play_audio_without_ui() -> TestResult<()> {
         u64::MAX,
     )?;
     let expression = include_str!("contracts/automatic-audio-contract.js")
+        .replace("__DESTINATION_ENDPOINT__", &destination.endpoint())
         .replace("__SENDER_TOKEN__", &sender)
         .replace("__RECEIVER_TOKEN__", &receiver)
         .replace("__SECOND_RECEIVER_TOKEN__", &pinned);
@@ -503,7 +397,7 @@ async fn connected_agents_select_and_play_audio_without_ui() -> TestResult<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn public_agent_connects_and_delivers_remote_media() -> TestResult<()> {
-    let _destination = DestinationServer::start()?;
+    let destination = DestinationServer::start().await?;
     let server = StaticServer::start(root()).await?;
     let url = server.url("tests/fixture.html");
     let room = RoomExternalId::new("public-web-contract")?;
@@ -532,6 +426,7 @@ async fn public_agent_connects_and_delivers_remote_media() -> TestResult<()> {
         u64::MAX,
     )?;
     let live = LIVE
+        .replace("__DESTINATION_ENDPOINT__", &destination.endpoint())
         .replace("__SENDER_TOKEN__", &sender)
         .replace("__RECEIVER_TOKEN__", &receiver)
         .replace("__SECOND_RECEIVER_TOKEN__", &second_receiver);
@@ -580,7 +475,9 @@ async fn public_agent_connects_and_delivers_remote_media() -> TestResult<()> {
 }
 #[tokio::test(flavor = "multi_thread")]
 async fn reliable_topics_recover_the_lost_tail_through_server_restart() -> TestResult<()> {
-    let destination = DestinationServer::start()?;
+    let destination = DestinationServer::start().await?;
+    let destination_address = destination.address();
+    let endpoint = destination.endpoint();
     let server = StaticServer::start(root()).await?;
     let url = server.url("tests/fixture.html");
     let room = RoomExternalId::new("reliable-restart-contract")?;
@@ -609,9 +506,12 @@ async fn reliable_topics_recover_the_lost_tail_through_server_restart() -> TestR
         u64::MAX,
     )?;
     let start = RELIABLE_RESTART_START
+        .replace("__DESTINATION_ENDPOINT__", &endpoint)
         .replace("__SENDER_TOKEN__", &sender)
         .replace("__RECEIVER_TOKEN__", &receiver);
-    let finish = RELIABLE_RESTART_FINISH.replace("__LATE_TOKEN__", &late);
+    let finish = RELIABLE_RESTART_FINISH
+        .replace("__DESTINATION_ENDPOINT__", &endpoint)
+        .replace("__LATE_TOKEN__", &late);
     run_browser_test(managed_driver(capabilities()?), |driver| async move {
         let bidi = driver.bidi().await?;
         let context = bidi.browsing_context().top_level().await?;
@@ -624,7 +524,7 @@ async fn reliable_topics_recover_the_lost_tail_through_server_restart() -> TestR
         let _: () = evaluate_json(&bidi, &context,
             "(async () => { globalThis.__reliableRestart.sender.sendTopic('chat', 'ordered', new Uint8Array([2])); return null; })()"
         ).await?;
-        let _restarted = DestinationServer::start()?;
+        let _restarted = DestinationServer::bind(destination_address).await?;
         let after: ReliableFinish = evaluate_json(&bidi, &context, &finish).await?;
         assert!(after.rejoined);
         assert!(after.no_historical_replay);
@@ -661,62 +561,4 @@ async fn generated_media_types_run_through_bidi() -> TestResult<()> {
     })
     .await
     .map_err(|e| format!("UniFFI browser contract failed: {e}").into())
-}
-#[tokio::test(flavor = "multi_thread")]
-async fn react_provider_contract_runs_through_bidi() -> TestResult<()> {
-    let fixture = PathBuf::from(std::env::var_os("PULSEBEAM_REACT_FIXTURE_ROOT")
-        .ok_or("missing declared React fixture; run //agents/pulsebeam-agent-web:browser through ./bazel test")?);
-    let manifest = fixture.join("fixture-manifest.json");
-    if !fixture.join("index.html").is_file() || !manifest.is_file() {
-        return Err(
-            "declared React browser fixture is missing; rebuild //agents/pulsebeam-agent-web:browser"
-                .into(),
-        );
-    }
-    // The fixture's source and Web package inputs are Bazel dependencies.
-    // Filesystem mtimes cannot establish freshness after an action-cache restore.
-    let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(&manifest)?)?;
-    if manifest
-        .get("inputs")
-        .and_then(serde_json::Value::as_array)
-        .is_none_or(|inputs| inputs.len() != 6)
-    {
-        return Err("React browser fixture is missing its six declared input records".into());
-    }
-    let server = StaticServer::start(fixture).await?;
-    let url = server.url("index.html");
-    run_browser_test(managed_driver(capabilities()?), |driver| async move {
-        let bidi = driver.bidi().await?;
-        let context = bidi.browsing_context().top_level().await?;
-        navigate(&bidi, &context, url).await?;
-        let r: React = evaluate_json(&bidi, &context, REACT).await?;
-        assert!(
-            r.removed_legacy_surface
-                && r.playback_retained
-                && r.playback_latest_callback
-                && r.capture_devices
-                && r.committed_render_isolation
-                && r.autoplay_respected
-                && r.capture_replacement
-                && r.capture_fencing
-                && r.capture_display
-                && r.capture_errors
-                && r.capture_session
-                && r.owned_independent
-                && r.owned_renewal
-                && r.owned_replacement
-                && r.owned_cleanup
-                && r.local_preview
-                && r.captured_preview
-                && r.playback_probe_error.is_empty()
-                && r.replaced
-                && r.playback_error
-                && r.detached
-                && r.audio_without_ui,
-            "React browser contract result: {r:?}"
-        );
-        Ok::<_, Box<dyn Error + Send + Sync>>(())
-    })
-    .await
-    .map_err(|e| format!("React browser contract failed: {e}").into())
 }

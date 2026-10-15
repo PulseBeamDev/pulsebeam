@@ -1,4 +1,19 @@
-use super::*;
+#[path = "support/destination.rs"]
+mod destination;
+mod support;
+use destination::DestinationServer;
+use pulsebeam_core::identity::{ParticipantExternalId, RoomExternalId};
+use std::{error::Error, path::PathBuf};
+use support::{
+    StaticServer, TestResult, capabilities, evaluate_json, managed_driver, mint_development_token,
+};
+use thirtyfour::{prelude::ChromiumLikeCapabilities, testing::run_browser_test};
+
+fn root() -> PathBuf {
+    std::env::var_os("PULSEBEAM_WEB_FIXTURE_ROOT")
+        .expect("declared Web peer fixture")
+        .into()
+}
 use thirtyfour::By;
 
 async fn click(driver: &thirtyfour::WebDriver, label: &str) -> TestResult<()> {
@@ -37,7 +52,9 @@ async fn meet_gesture_before_media_preserves_real_media() -> TestResult<()> {
 }
 
 async fn meet_media_contract(gesture_before_media: bool) -> TestResult<()> {
-    let destination = DestinationServer::start()?;
+    let destination = DestinationServer::start().await?;
+    let address = destination.address();
+    let endpoint = destination.endpoint();
     let meet = StaticServer::start(std::env::var("PULSEBEAM_MEET_ROOT")?).await?;
     let sdk = StaticServer::start(root()).await?;
     let room = RoomExternalId::new("meet-media-continuity")?;
@@ -49,25 +66,43 @@ async fn meet_media_contract(gesture_before_media: bool) -> TestResult<()> {
     let sender =
         mint_development_token(&room, &ParticipantExternalId::new("meet-sender")?, u64::MAX)?;
     let publisher = include_str!("contracts/meet-publisher-start.js")
+        .replace("__DESTINATION_ENDPOINT__", &endpoint)
         .replace("__SDK_URL__", &sdk.url("dist/index.js"))
         .replace("__SENDER_TOKEN__", &sender);
     let join = format!(
-        r#"(() => {{
+        r#"(async () => {{
+        __meetPrivacy.lobby();
         const fields = document.querySelectorAll('form input');
         const set = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
-        for (const [index, value] of [{receiver:?}, 'http://127.0.0.1:7070'].entries()) {{
+        for (const [index, value] of [{receiver:?}, {endpoint:?}].entries()) {{
             set.call(fields[index], value);
             fields[index].dispatchEvent(new Event('input', {{ bubbles: true }}));
         }}
+        const endpoint = fields[1].value;
+        set.call(fields[1], 'file:///not-a-server');
+        fields[1].dispatchEvent(new Event('input', {{ bubbles: true }}));
+        await __meet.wait(() => document.querySelector('button[type=submit]').disabled, 'invalid endpoint rejected');
+        set.call(fields[1], endpoint);
+        fields[1].dispatchEvent(new Event('input', {{ bubbles: true }}));
+        await __meet.wait(() => !document.querySelector('button[type=submit]').disabled, 'endpoint and credential committed');
         return true;
     }})()"#
     );
+    let privacy =
+        move |phase: &str| format!("__meetPrivacy.check([{receiver:?}, {sender:?}], {phase:?})");
     let mut browser = capabilities()?;
     browser.add_arg("--autoplay-policy=document-user-activation-required")?;
     browser.add_arg("--window-size=1400,1000")?;
     browser.add_arg("--disable-dev-shm-usage")?;
-    let browser_log = std::path::PathBuf::from(std::env::var("TEST_UNDECLARED_OUTPUTS_DIR")?)
-        .join("meet-chrome.log");
+    let browser_log =
+        std::path::PathBuf::from(std::env::var("TEST_UNDECLARED_OUTPUTS_DIR")?).join(format!(
+            "meet-chrome-{}.log",
+            if gesture_before_media {
+                "early"
+            } else {
+                "late"
+            }
+        ));
     browser.add_arg("--enable-logging")?;
     browser.add_arg(&format!("--log-file={}", browser_log.display()))?;
     let result = run_browser_test(managed_driver(browser), |driver| async move {
@@ -76,6 +111,7 @@ async fn meet_media_contract(gesture_before_media: bool) -> TestResult<()> {
         let bidi = driver.bidi().await?;
         let context = bidi.browsing_context().top_level().await?;
         let _: bool = evaluate_json(&bidi, &context, include_str!("contracts/meet-media-observer.js")).await?;
+        let _: bool = evaluate_json(&bidi, &context, include_str!("contracts/meet-privacy.js")).await?;
         eprintln!("Meet stage: lobby join");
         let _: bool = evaluate_json(&bidi, &context, r#"(async () => {
             await __meet.wait(() => document.querySelector('button[type=submit]')?.disabled === false, 'hydrated lobby capture');
@@ -108,6 +144,20 @@ async fn meet_media_contract(gesture_before_media: bool) -> TestResult<()> {
             click(&driver, "Chat").await?;
         }
         let _: bool = evaluate_json(&bidi, &context, "__meet.ready()").await?;
+        let _: bool = evaluate_json(&bidi, &context, "__meetPrivacy.identity()").await?;
+        let _: bool = evaluate_json(&bidi, &context, &privacy("joined")).await?;
+        assert_eq!(meet.wasm_requests(), 1, "the exported application loaded its WASM asset");
+        if gesture_before_media {
+            driver.find(By::XPath("//button[contains(., 'Leave')]" )).await?.click().await?;
+            let _: bool = evaluate_json(&bidi, &context, r#"(async () => {
+                await __meet.wait(() => document.querySelector('.meet-lobby'), 'early gesture cleanup');
+                await __meet.stopPublisher();
+                __meet.assert(__meet.audioNodes().length === 0, 'leave releases early-gesture output');
+                return true;
+            })()"#).await?;
+            let _: bool = evaluate_json(&bidi, &context, &privacy("early-gesture leave")).await?;
+            return Ok::<_, Box<dyn Error + Send + Sync>>(());
+        }
         eprintln!("Meet stage: media enablement retains identity");
         let _: bool = evaluate_json(&bidi, &context, "__meet.enablement()").await?;
         let baseline: Vec<Vec<u8>> = evaluate_json(&bidi, &context, "__meet.mark()").await?;
@@ -180,6 +230,7 @@ async fn meet_media_contract(gesture_before_media: bool) -> TestResult<()> {
             click(&driver, "Reconnect").await?;
             let recovered: bool = evaluate_json(&bidi, &context, &format!("__meet.recovered({count})")).await?;
             assert!(recovered);
+            let _: bool = evaluate_json(&bidi, &context, &privacy("explicit reconnect")).await?;
         }
         let count: usize = evaluate_json(&bidi, &context, "__meet.receiverPeers().length").await?;
         eprintln!("Meet stage: transient loss");
@@ -188,9 +239,12 @@ async fn meet_media_contract(gesture_before_media: bool) -> TestResult<()> {
             await __meet.wait(() => __meet.receiverPeers().some(peer => peer.connectionState === 'disconnected' || peer.connectionState === 'failed'), 'native detected transient transport loss');
             return true;
         })()"#).await?;
-        let _replacement = DestinationServer::start()?;
+        eprintln!("Meet stage: restart owned node");
+        let _replacement = DestinationServer::bind(address).await.map_err(|error| format!("restart owned node: {error}"))?;
+        eprintln!("Meet stage: await recovered media");
         let recovered: bool = evaluate_json(&bidi, &context, &format!("__meet.recovered({count})")).await?;
         assert!(recovered);
+        let _: bool = evaluate_json(&bidi, &context, &privacy("transport recovery")).await?;
         let _: bool = evaluate_json(&bidi, &context, r#"(async () => {
             await __meet.chat.publish({sender:'meet-sender', text:'chat after loss', id:crypto.randomUUID(), ts:Date.now()});
             await __meet.reactions.publish({sender:'meet-sender', emoji:'👏', id:crypto.randomUUID(), ts:Date.now()});
@@ -203,20 +257,35 @@ async fn meet_media_contract(gesture_before_media: bool) -> TestResult<()> {
         let _: bool = evaluate_json(&bidi, &context, r#"(async () => {
             await __meet.wait(() => document.querySelector('.meet-lobby'), 'leave returns to lobby');
             __meet.assert(__meet.audioNodes().length === 0, 'leave stops remote output');
-            await __meet.stopPublisher();
             __meet.assert(__meet.rejections.length === 0, 'cleanup has no unhandled completion');
             return true;
         })()"#).await?;
+        let _: bool = evaluate_json(&bidi, &context, &privacy("leave")).await?;
+        let _: bool = evaluate_json(&bidi, &context, r#"(async () => {
+            await __meet.wait(() => document.querySelector('button[type=submit]')?.disabled === false, 'rejoin lobby capture');
+            return true;
+        })()"#).await?;
+        let _: bool = evaluate_json(&bidi, &context, &join).await?;
+        let _: bool = evaluate_json(&bidi, &context, r#"(async () => {
+            document.querySelector('form').requestSubmit();
+            await __meet.wait(() => document.querySelector('[aria-label=Reconnect]'), 'rejoined Room mounted');
+            await __meet.ready();
+            await __meetPrivacy.identity();
+            return true;
+        })()"#).await?;
+        let _: bool = evaluate_json(&bidi, &context, &privacy("rejoin")).await?;
+        driver.find(By::XPath("//button[contains(., 'Leave')]" )).await?.click().await?;
+        let _: bool = evaluate_json(&bidi, &context, r#"(async () => {
+            await __meet.wait(() => document.querySelector('.meet-lobby') && __meet.audioNodes().length === 0, 'rejoined session releases output');
+            await __meet.stopPublisher();
+            return true;
+        })()"#).await?;
+        let _: bool = evaluate_json(&bidi, &context, &privacy("final cleanup")).await?;
         Ok::<_, Box<dyn Error + Send + Sync>>(())
     }).await;
     if result.is_err() {
-        for path in [
-            browser_log.clone(),
-            browser_log.with_file_name("destination-server.log"),
-        ] {
-            if let Ok(log) = tokio::fs::read_to_string(&path).await {
-                eprintln!("Meet {}:\n{log}", path.display());
-            }
+        if let Ok(log) = tokio::fs::read_to_string(&browser_log).await {
+            eprintln!("Meet {}:\n{log}", browser_log.display());
         }
     }
     result.map_err(|error| format!("Meet media contract failed: {error}").into())

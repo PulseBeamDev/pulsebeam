@@ -1,4 +1,5 @@
 import { useEffect, useState, useSyncExternalStore } from "react";
+import { sessionKey } from "./session-key.js";
 import {
   createManagedAgent,
   type Agent,
@@ -78,13 +79,7 @@ export type {
  * Use a React key when the room or participant changes.
  */
 export function useAgent(config: AgentConfig): Agent {
-  const key = JSON.stringify([
-    config.endpoint,
-    config.topology?.localVideos ?? 2,
-    config.topology?.localAudios ?? 2,
-    config.topology?.remoteVideos ?? 16,
-    config.topology?.remoteAudios ?? 8,
-  ]);
+  const key = sessionKey(config);
 
   const [owned, setOwned] = useState(() => ({
     key,

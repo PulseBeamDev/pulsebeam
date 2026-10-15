@@ -1,5 +1,5 @@
 (async () => {
-  const endpoint = "http://127.0.0.1:7070";
+  const endpoint = "__DESTINATION_ENDPOINT__";
   // Test-only observation of the browser's real receivers, without a public Agent seam.
   const peers = new Set();
   const originalAddTransceiver = RTCPeerConnection.prototype.addTransceiver;

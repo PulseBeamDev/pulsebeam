@@ -57,6 +57,7 @@ return to it, so close the tab when finished.
 
 ```bash
 ./bazel test //apps/meet:check
+./bazel test //apps/meet:browser
 ./bazel build //:meet
 ./bazel run //apps/meet:preview -- --listen 3000
 ```
@@ -67,9 +68,14 @@ Development mode defaults to `http://localhost:7070` when
 you choose another endpoint. For the local quickstart, use the development server
 rather than the static preview.
 
-`check` covers static checks and the export artifact. The Web runtime's
-[browser tests](../../agents/pulsebeam-agent-web/README.md) exercise Meet's real
-media and topic behavior through `./bazel test //agents/pulsebeam-agent-web:browser`.
+`check` covers types, formatting, dependency boundaries, and exported entry/CNAME
+integrity. The browser owner runs the real static export with a Web peer and an
+owned local node on ephemeral listeners. It covers external identity, credential
+handling across the exercised session lifecycle, media/topic continuity, and both
+early and late audio-gesture premises. Credential observation starts before form
+entry and includes transient storage, URL, and console effects; it is not a universal
+proof about unexercised future paths. Local fixture serving does not certify public
+hosting configuration. See the [contributor testing contract](../../docs/build.md#testing-contract).
 
 ## Media and topics
 

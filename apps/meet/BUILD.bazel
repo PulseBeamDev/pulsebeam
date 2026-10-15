@@ -11,6 +11,7 @@ load("@meet_npm//apps/meet:prettier/package_json.bzl", prettier = "bin")
 load("@meet_npm//apps/meet:serve/package_json.bzl", serve = "bin")
 
 package(default_visibility = ["//visibility:public"])
+test_suite(name = "browser", tests = ["//agents/pulsebeam-agent-web:meet_browser"])
 filegroup(name = "workflow_inputs", srcs = glob(["*.md", "docs/**/*.md", "Justfile", "*.json", "*.yaml", "scripts/*.sh"], allow_empty = True))
 exports_files(["package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml"])
 
@@ -73,15 +74,8 @@ js_test(
 )
 
 js_test(
-    name = "identity_contract",
-    entry_point = "scripts/check-identity-contract.mjs",
-    chdir = package_name(),
-    data = [":sources"],
-)
-
-js_test(
-    name = "artifact",
-    entry_point = "scripts/check-artifact.mjs",
+    name = "export_contract",
+    entry_point = "scripts/check-export.mjs",
     chdir = package_name(),
     data = [":export"],
 )
@@ -90,4 +84,4 @@ output_files(name = "framework_types", target = ":export", paths = [package_name
 output_files(name = "static_export", target = ":export", paths = [package_name() + "/out"])
 serve.serve_binary(name = "preview", args = ["$(rootpath :static_export)"], data = [":static_export"])
 
-test_suite(name = "check", tests = [":types", ":eslint", ":format", ":boundary", ":identity_contract", ":artifact"])
+test_suite(name = "check", tests = [":types", ":eslint", ":format", ":boundary", ":export_contract"])

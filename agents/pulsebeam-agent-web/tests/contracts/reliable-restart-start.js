@@ -1,5 +1,5 @@
 (async () => {
-  const endpoint = "http://127.0.0.1:7070";
+  const endpoint = "__DESTINATION_ENDPOINT__";
   const create = (token) =>
     window.pulsebeam.createAgent({
       endpoint,

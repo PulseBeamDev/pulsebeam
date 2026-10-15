@@ -24,7 +24,7 @@
   }, 30);
   const stream = canvas.captureStream(30);
   const sender = createAgent({
-    endpoint: "http://127.0.0.1:7070",
+    endpoint: "__DESTINATION_ENDPOINT__",
     token: "__SENDER_TOKEN__",
     topology: {
       localVideos: 1,

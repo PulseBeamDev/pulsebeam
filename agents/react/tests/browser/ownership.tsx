@@ -1,4 +1,4 @@
-import { StrictMode, useState } from "react";
+import { StrictMode, useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { createCaptureSource } from "@pulsebeam/web";
 import { useAgent, type Agent, type LogLevel } from "@pulsebeam/react";
@@ -24,6 +24,14 @@ export async function runOwnershipContract() {
   let changeLogging!: () => void;
   let changeTopology!: () => void;
   let firstRenderAvailable = false;
+  let committed:
+    | {
+        token: string;
+        endpoint: string;
+        logging: LogLevel;
+        localVideos: number;
+      }
+    | undefined;
   function Probe() {
     const [token, setToken] = useState("owned-token-a");
     const [endpoint, setEndpoint] = useState(location.origin);
@@ -44,6 +52,9 @@ export async function runOwnershipContract() {
       token: "independent-token",
     });
     firstRenderAvailable = true;
+    useEffect(() => {
+      committed = { token, endpoint, logging, localVideos };
+    });
     return (
       <span>
         {left.connection} / {right.connection}
@@ -60,9 +71,21 @@ export async function runOwnershipContract() {
         <Probe />
       </StrictMode>,
     );
-    await until(() => left !== null && right !== null);
+    await until(() => committed?.token === "owned-token-a");
     const first = left!;
     const independent = right!;
+    const renewals: string[] = [];
+    const loggingChanges: LogLevel[] = [];
+    const renew = first.renewAuthorization.bind(first);
+    first.renewAuthorization = (token) => {
+      renew(token);
+      renewals.push(token);
+    };
+    const setLogging = first.setLogging.bind(first);
+    first.setLogging = (level) => {
+      setLogging(level);
+      loggingChanges.push(level);
+    };
     const firstVideo = first.local.video("camera");
     const secondVideo = independent.local.video("camera");
     firstVideo.setSource(source);
@@ -83,7 +106,6 @@ export async function runOwnershipContract() {
       secondSlot.kind === "video" &&
       defaultCapacityReached;
     firstVideo.setEnabled(false);
-    await new Promise((resolve) => setTimeout(resolve, 30));
     const independentEnablement =
       !firstVideo.enabled &&
       secondVideo.enabled &&
@@ -94,16 +116,21 @@ export async function runOwnershipContract() {
       firstVideo.source === source && track.readyState === "live";
 
     changeToken();
-    await until(() => left === first);
-    await new Promise((resolve) => setTimeout(resolve, 30));
+    await until(
+      () =>
+        committed?.token === "owned-token-b" &&
+        renewals.includes("owned-token-b"),
+    );
     const renewedWithoutReplacing = left === first && right === independent;
 
     changeLogging();
-    await new Promise((resolve) => setTimeout(resolve, 30));
+    await until(
+      () => committed?.logging === "debug" && loggingChanges.includes("debug"),
+    );
     const loggingKeepsSession = left === first;
 
     changeTopology();
-    await until(() => left !== null && left !== first);
+    await until(() => committed?.localVideos === 2 && left !== first);
     const resized = left!;
     const topologyReplacement =
       first.connection === "disconnected" &&
@@ -111,7 +138,11 @@ export async function runOwnershipContract() {
       resized.local.video("screen").kind === "video";
 
     changeEndpoint();
-    await until(() => left !== null && left !== resized);
+    await until(
+      () =>
+        committed?.endpoint.endsWith("/replacement") === true &&
+        left !== resized,
+    );
     const replacedConstruction =
       topologyReplacement &&
       resized.connection === "disconnected" &&

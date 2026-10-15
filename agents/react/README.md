@@ -37,9 +37,19 @@ Keep signing keys on your backend.
 
 ```sh
 ./bazel test //agents/react:fast
+./bazel test //agents/react:browser
+./bazel test //agents/react:quickstart_browser
 ```
 
-This owner gate checks SDK/package contracts and the repository's separate Vite
-test fixture; it is not the root cheap loop. See the
-[contributor testing contract](../../docs/build.md#testing-contract) for shared routing. `//agents/pulsebeam-agent-web:browser` exercises that fixture with
-two participants; these checks don't validate the tutorial's other frameworks.
+The owner `:fast` gate includes SDK/package contracts and is not the root cheap
+loop. Pure session-identity decisions run directly in the pinned JavaScript
+runtime. The component browser owner uses real React commits, effects, DOM
+attachments, and media capture. The separate quickstart owner bundles the
+documented public example and exchanges real media between two participants.
+It also retains the production server executable startup boundary, whose fixed
+development ports are protected by a startup lock local to that boundary.
+
+Both browser owners reuse the
+[contributor testing contract](../../docs/build.md#testing-contract) and pinned
+browser infrastructure. They do not build Meet or certify other application
+frameworks.

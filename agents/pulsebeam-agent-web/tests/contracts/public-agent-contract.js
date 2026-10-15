@@ -3,6 +3,28 @@ globalThis.__pulsebeamPublic = (async () => {
   const warnings = [];
   const consoleWarn = console.warn;
   console.warn = (...values) => warnings.push(values.map(String).join(" "));
+  const nextEvent = (agent, accepts, label) =>
+    new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        unsubscribe();
+        reject(new Error(`timed out waiting for ${label}`));
+      }, 10_000);
+      const unsubscribe = agent.subscribeEvents((event) => {
+        if (!accepts(event)) return;
+        clearTimeout(timer);
+        unsubscribe();
+        resolve(event);
+      });
+    });
+  const coreRejection = (agent) =>
+    nextEvent(
+      agent,
+      (event) =>
+        event.type === "failure" &&
+        event.class === "validation" &&
+        event.message.startsWith("core rejected input:"),
+      "core validation delivery",
+    );
   let endpointReads = 0;
   let tokenReads = 0;
   const config = {
@@ -216,6 +238,7 @@ globalThis.__pulsebeamPublic = (async () => {
     invalidStateRejected &&
     first.getSnapshot().connection !== "terminal-failure" &&
     first.getSnapshot().failure === null;
+  const firstCoreRejection = coreRejection(first);
   first.setState({
     connected: false,
     video: [
@@ -237,7 +260,7 @@ globalThis.__pulsebeamPublic = (async () => {
       },
     ],
   });
-  await new Promise((resolve) => setTimeout(resolve, 20));
+  await firstCoreRejection;
   const warningsBeforeSilent = warnings.length;
   first.setState({
     connected: false,
@@ -253,6 +276,7 @@ globalThis.__pulsebeamPublic = (async () => {
       () => false,
       () => true,
     );
+  const silentCoreRejection = coreRejection(silent);
   silent.setState({
     connected: false,
     video: [
@@ -274,11 +298,17 @@ globalThis.__pulsebeamPublic = (async () => {
       },
     ],
   });
-  await new Promise((resolve) => setTimeout(resolve, 20));
+  await silentCoreRejection;
   const scopedLogging =
     warningsBeforeSilent > 0 && warnings.length === warningsBeforeSilent;
+  const dropped = nextEvent(
+    first,
+    (event) =>
+      event.type === "topic-send-dropped" && event.topic === "presence",
+    "topic drop delivery",
+  );
   first.sendTopic("presence", "latest", new Uint8Array([1, 2, 3]));
-  await new Promise((resolve) => setTimeout(resolve, 20));
+  await dropped;
   removeEvents();
   removeEvents();
 

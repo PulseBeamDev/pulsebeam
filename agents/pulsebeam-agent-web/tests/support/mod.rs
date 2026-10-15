@@ -4,11 +4,14 @@
 )]
 mod rtp_relay;
 
+use pulsebeam_core::{
+    auth::{DEVELOPMENT_API_KEY_ID, DEVELOPMENT_API_SIGNING_KEY, DEVELOPMENT_PROJECT_ID},
+    identity::{ParticipantExternalId, RoomExternalId},
+};
 use std::env;
 use std::error::Error;
 use std::io;
 use std::path::{Component, Path, PathBuf};
-use std::process::{Child, Command, Stdio};
 #[allow(
     clippy::disallowed_types,
     reason = "owned live HTTP fixture shares its state across handler tasks"
@@ -34,56 +37,19 @@ use tokio::task::{JoinHandle, JoinSet};
 
 pub type TestResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
-pub struct DestinationServer {
-    child: Child,
-}
-impl DestinationServer {
-    #[allow(
-        clippy::disallowed_methods,
-        reason = "synchronous owned-process startup polling before browser traffic, never a production shard"
-    )]
-    pub fn start() -> TestResult<Self> {
-        if std::net::TcpStream::connect("127.0.0.1:7070").is_ok() {
-            return Err("refusing to use an existing PulseBeam listener on 127.0.0.1:7070; browser contracts require an owned destination server".into());
-        }
-        let binary = env::var_os("PULSEBEAM_SERVER_BINARY").ok_or(
-            "missing PULSEBEAM_SERVER_BINARY; run the SDK browser target through ./bazel test",
-        )?;
-        let log = std::fs::OpenOptions::new().create(true).append(true).open(
-            PathBuf::from(
-                env::var_os("TEST_UNDECLARED_OUTPUTS_DIR")
-                    .ok_or("missing Bazel TEST_UNDECLARED_OUTPUTS_DIR")?,
-            )
-            .join("destination-server.log"),
-        )?;
-        let mut child = Command::new(Path::new(&binary).canonicalize()?)
-            .arg("--dev")
-            .current_dir(env::var_os("TEST_TMPDIR").ok_or("missing Bazel TEST_TMPDIR")?)
-            .stdout(Stdio::from(log.try_clone()?))
-            .stderr(Stdio::from(log))
-            .spawn()?;
-        for _ in 0..300 {
-            if let Some(status) = child.try_wait()? {
-                return Err(format!(
-                    "owned PulseBeam development server exited before readiness with {status}"
-                )
-                .into());
-            }
-            if std::net::TcpStream::connect("127.0.0.1:7070").is_ok() {
-                return Ok(Self { child });
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
-        let _ = child.kill();
-        let _ = child.wait();
-        Err("PulseBeam development server did not listen on port 7070".into())
-    }
-}
-impl Drop for DestinationServer {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
+pub fn mint_development_token(
+    room: &RoomExternalId,
+    participant: &ParticipantExternalId,
+    expires_at: u64,
+) -> TestResult<String> {
+    Ok(pulsebeam_server::sign_participant_token(
+        &DEVELOPMENT_PROJECT_ID.as_str(),
+        &DEVELOPMENT_API_KEY_ID.as_str(),
+        &DEVELOPMENT_API_SIGNING_KEY.to_secret_string(),
+        room.as_str(),
+        participant.as_str(),
+        expires_at,
+    )?)
 }
 
 #[allow(

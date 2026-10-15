@@ -1,4 +1,4 @@
-load("@aspect_rules_js//js:defs.bzl", "js_binary", "js_run_binary")
+load("@aspect_rules_js//js:defs.bzl", "js_binary", "js_run_binary", "js_test")
 load("@aspect_rules_js//npm:defs.bzl", "npm_package")
 load("@bazel_lib//lib:copy_to_directory.bzl", "copy_to_directory")
 load("@rules_python//python:defs.bzl", "py_binary", "py_test")
@@ -10,9 +10,28 @@ package(default_visibility = ["//visibility:public"])
 filegroup(name = "workflow_inputs", srcs = glob(["*.md", "docs/**/*.md", "Justfile", "*.json", "*.yaml", "scripts/*.sh"], allow_empty = True))
 exports_files(["package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml"])
 filegroup(name = "browser_observer", srcs = ["tests/browser/observe.js"])
+test_suite(name = "browser", tests = ["//agents/pulsebeam-agent-web:react_browser"])
+test_suite(name = "quickstart_browser", tests = ["//agents/pulsebeam-agent-web:quickstart_browser"])
 
 npm_link_all_packages(name = "node_modules")
 typescript.tsc_binary(name = "tsc")
+
+# Package/type gates check the public SDK types. This target emits only the
+# pure decision module, without assembling the SDK for a type-only import.
+js_run_binary(
+    name = "unit_javascript",
+    tool = ":tsc",
+    srcs = ["src/session-key.ts"],
+    args = ["--noCheck", "--noResolve", "--target", "ES2022", "--module", "ESNext", "--rootDir", "src", "--outDir", "unit-javascript", "src/session-key.ts"],
+    chdir = package_name(),
+    out_dirs = ["unit-javascript"],
+)
+
+js_test(
+    name = "unit_tests",
+    entry_point = "tests/session-key.mjs",
+    data = [":unit_javascript", "package.json"],
+)
 prettier.prettier_binary(name = "prettier")
 
 js_binary(
@@ -139,5 +158,5 @@ py_binary(
 
 test_suite(
     name = "fast",
-    tests = [":contracts", ":browser_types", ":packed_contract", ":quickstart_types", "//agents/react/tests/consumer:contract"],
+    tests = [":unit_tests", ":contracts", ":browser_types", ":packed_contract", ":quickstart_types", "//agents/react/tests/consumer:contract"],
 )

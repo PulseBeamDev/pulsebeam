@@ -26,7 +26,7 @@
   "scripts": {
     "build": "../../bazel build //agents/pulsebeam-agent-web:package",
     "generate": "../../bazel build //agents/pulsebeam-agent-web:uniffi_bindings",
-    "check": "../../bazel test //agents/pulsebeam-agent-web:public_contract //agents/pulsebeam-agent-web:uniffi_types //agents/pulsebeam-agent-web:uniffi_contract",
+    "check": "../../bazel test //agents/pulsebeam-agent-web:public_contract //agents/pulsebeam-agent-web:uniffi_types",
     "format": "../../bazel run //agents/pulsebeam-agent-web:fix",
     "test": "../../bazel test //agents/pulsebeam-agent-web:unit_tests //agents/pulsebeam-agent-web:browser"
   },

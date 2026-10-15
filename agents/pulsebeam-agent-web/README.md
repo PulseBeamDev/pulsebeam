@@ -256,13 +256,21 @@ Run from a build-ready repository root:
 
 ```sh
 ./bazel build //:web
-./bazel test //agents/pulsebeam-agent-web:public_contract //agents/pulsebeam-agent-web:uniffi_types //agents/pulsebeam-agent-web:uniffi_contract
-./bazel test //agents/pulsebeam-agent-web:unit_tests
-./bazel test //agents/pulsebeam-agent-web:browser
+./bazel test //agents/pulsebeam-agent-web:public_contract //agents/pulsebeam-agent-web:uniffi_types
+./bazel test //agents/pulsebeam-agent-web:unit_tests //agents/pulsebeam-agent-web:js_unit_tests
+./bazel test //agents/pulsebeam-agent-web:web_runtime_browser
 ```
 
-The browser target provisions pinned browsers and builds Web, React, and Meet
-fixtures. `./bazel run //:web_dev` serves the repository Web example; it is not the
-npm consumer installation. See the
+Direct JavaScript tests compile only the topic and catalog facade boundary with
+the pinned toolchain. Typed public consumers reject untyped fields and forbidden
+APIs in generated contracts. The Web browser owner covers WASM/runtime
+ownership, real layout and media, autoplay recovery, and reliable-topic recovery.
+Its live nodes own ephemeral HTTP and RTC listeners. Metrics startup remains
+in the production-executable quickstart boundary.
+
+`//agents/pulsebeam-agent-web:browser` selects all Web, React, Meet, and documented
+quickstart browser owners without duplicating their execution. Each owner builds
+only its required fixtures. See the
 [contributor testing contract](../../docs/build.md#testing-contract) for shared
-routing and [editor setup](../../docs/ide.md).
+routing and [editor setup](../../docs/ide.md). `./bazel run //:web_dev` serves the
+repository Web example, not an installed npm consumer.

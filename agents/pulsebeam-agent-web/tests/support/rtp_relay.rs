@@ -192,7 +192,7 @@ fn inspect_rtp(packet: &[u8], wanted: u8) -> Result<Option<PacketExtension<'_>>,
     Ok(Some((ssrc, found)))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "browser-tests"))]
 mod tests {
     use super::inspect_rtp;
 

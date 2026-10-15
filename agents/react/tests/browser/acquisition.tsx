@@ -1,4 +1,4 @@
-import { StrictMode, useState } from "react";
+import { StrictMode, act, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
   useDisplayMedia,
@@ -166,9 +166,10 @@ export async function runAcquisitionContract() {
       label = `Latest camera ${failStale}`;
       latest.resolve(deviceList());
       await until(() => enumerated.cameras[0]?.label === label);
-      if (failStale) stale.reject(new Error("obsolete enumeration failure"));
-      else stale.resolve([]);
-      await new Promise((resolve) => setTimeout(resolve, 30));
+      await act(async () => {
+        if (failStale) stale.reject(new Error("obsolete enumeration failure"));
+        else stale.resolve([]);
+      });
       captureDevices &&=
         enumerated.state === "ready" &&
         enumerated.cameras[0]?.label === label &&
@@ -276,8 +277,9 @@ export async function runAcquisitionContract() {
       bothKinds && pairedVideo.stops() === 1 && voice.readyState === "ended";
     await audioContext.close();
 
-    document.getElementById("next-display")!.click();
-    await new Promise((resolve) => setTimeout(resolve, 30));
+    await act(async () => {
+      document.getElementById("next-display")!.click();
+    });
     const noPromptOnOptions = displayCalls === 0;
     document.getElementById("acquire-display")!.click();
     await until(() => displayPending.length === 1);

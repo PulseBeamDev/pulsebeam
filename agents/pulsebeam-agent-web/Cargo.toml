@@ -60,6 +60,9 @@ web-sys = { version = "0.3.104", features = [
 ] }
 
 [dev-dependencies]
+pulsebeam = { path = "../../crates/pulsebeam" }
+pulsebeam-runtime = { path = "../../crates/pulsebeam-runtime" }
+tokio-util.workspace = true
 pulsebeam-server = { path = "../../server/rust" }
 pulsebeam-core = { path = "../../crates/pulsebeam-core" }
 pulsebeam-proto = { path = "../../crates/pulsebeam-proto" }

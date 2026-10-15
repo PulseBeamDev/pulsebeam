@@ -11,8 +11,7 @@
     "format": "../../bazel run //:fix",
     "format:check": "../../bazel test //apps/meet:format",
     "boundary": "../../bazel test //apps/meet:boundary",
-    "identity-contract": "../../bazel test //apps/meet:identity_contract",
-    "artifact": "../../bazel test //apps/meet:artifact"
+    "export-contract": "../../bazel test //apps/meet:export_contract"
   },
   "dependencies": {
     "@emotion/react": "^11.14.0",

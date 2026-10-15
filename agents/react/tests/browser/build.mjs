@@ -1,5 +1,5 @@
 import { build } from "esbuild";
-import { cp, mkdir, rm, stat, writeFile } from "node:fs/promises";
+import { cp, mkdir, rm } from "node:fs/promises";
 
 const output = process.argv[2] ?? "tests/browser/dist";
 const webDist = process.argv[3] ?? "../pulsebeam-agent-web/dist";
@@ -19,19 +19,3 @@ await build({
   jsx: "automatic",
   alias: { "@pulsebeam/react": "./package/dist/index.js" },
 });
-const inputs = [
-  "tests/browser/fixture.tsx",
-  "tests/browser/acquisition.tsx",
-  "tests/browser/ownership.tsx",
-  "tests/browser/playback.tsx",
-  "tests/browser/index.html",
-  `${webDist}/index.js`,
-];
-await writeFile(
-  `${output}/fixture-manifest.json`,
-  JSON.stringify({
-    inputs: await Promise.all(
-      inputs.map(async (path) => [path, (await stat(path)).mtimeMs]),
-    ),
-  }),
-);

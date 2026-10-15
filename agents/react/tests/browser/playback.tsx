@@ -1,13 +1,8 @@
-import { StrictMode, useState, useSyncExternalStore } from "react";
+import { StrictMode, useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { Video } from "@pulsebeam/react";
 import type { LocalVideoTrack, PlaybackError } from "@pulsebeam/react";
-import {
-  createCaptureSource,
-  type Agent,
-  type AgentSnapshot,
-} from "@pulsebeam/web";
-import { RemoteCatalog } from "../../node_modules/@pulsebeam/web/dist/remote-catalog.js";
+import { createAgent, createCaptureSource } from "@pulsebeam/web";
 
 const waitFor = async (predicate: () => boolean, phase: string) => {
   for (let index = 0; index < 200; index++) {
@@ -52,9 +47,13 @@ export async function runPlaybackContract() {
   let blocked: PlaybackError | undefined;
   let callbackVersion = 0;
   let updateCallback!: () => void;
+  let committedVersion = 0;
   function Preview() {
     const [version, setVersion] = useState(1);
     updateCallback = () => setVersion(2);
+    useEffect(() => {
+      committedVersion = version;
+    });
     return (
       <Video
         source={local}
@@ -108,7 +107,7 @@ export async function runPlaybackContract() {
   };
   try {
     updateCallback();
-    await new Promise((resolve) => setTimeout(resolve, 30));
+    await waitFor(() => committedVersion === 2, "callback update committed");
     const playbackRetained =
       host.querySelector("video") === firstElement &&
       firstElement.srcObject === resumedStream &&
@@ -187,161 +186,71 @@ export async function runAutoplayContract() {
     .createElement("canvas")
     .captureStream(1)
     .getVideoTracks()[0];
-  const context = new AudioContext();
-  const audio = context
-    .createMediaStreamDestination()
-    .stream.getAudioTracks()[0];
-  let snapshot = {
-    connection: "connected",
-    catalog: {
-      revision: 1,
-      participants: [{ id: "participant", externalId: "alice" }],
-      publications: [
-        {
-          id: "video",
-          participantId: "participant",
-          label: "camera",
-          kind: "video",
-        },
-        {
-          id: "audio",
-          participantId: "participant",
-          label: "microphone",
-          kind: "audio",
-        },
-      ],
-    },
-    mapping: {
-      acceptedIntentRevision: 1,
-      video: [{ receiverIndex: 0, publicationId: "video" }],
-      audio: [{ receiverIndex: 0, publicationId: "audio" }],
-    },
-    tracks: {
-      video: { media: video, kind: "video" },
-      audio: { media: audio, kind: "audio" },
-    },
-  } as unknown as AgentSnapshot;
-  const subscriptions = new Set<() => void>();
-  const fakeAgent = {
-    getSnapshot: () => snapshot,
-    subscribe: (listener: () => void) => {
-      subscriptions.add(listener);
-      return () => subscriptions.delete(listener);
-    },
-  } as unknown as Agent;
-  let videoDemand = 0;
-  const catalog = new RemoteCatalog(fakeAgent, 1, (videos) => {
-    videoDemand = videos.length;
-  });
-  const nativeConnect = AudioNode.prototype.connect;
-  let outputRoutes = 0;
-  AudioNode.prototype.connect = function (
-    this: AudioNode,
-    destination: AudioNode,
-    ...args: unknown[]
-  ) {
-    if (destination === this.context.destination) outputRoutes++;
-    return Reflect.apply(nativeConnect, this, [destination, ...args]);
-  } as typeof nativeConnect;
-  catalog.update(snapshot);
-  AudioNode.prototype.connect = nativeConnect;
-  const automaticRoute = outputRoutes === 1 && host.childElementCount === 0;
-  const voice = catalog.participant("alice").audio("microphone");
-  function Discovery() {
-    useSyncExternalStore(fakeAgent.subscribe, fakeAgent.getSnapshot);
-    const receiving = useSyncExternalStore(
-      (listener) => voice.subscribe(listener),
-      () => voice.receiving,
-    );
-    return (
-      <output>
-        {catalog.audioTracks.length}:{String(receiving)}
-      </output>
-    );
-  }
   const captured = createCaptureSource(video, "video");
-  const render = (autoPlay: boolean) =>
-    root.render(
+  const agent = createAgent({
+    endpoint: location.origin,
+    token: "autoplay-contract",
+  });
+  const remote = agent.remote.participant("alice").video("camera");
+  let committed: boolean | undefined;
+  function Probe({ autoPlay }: { autoPlay: boolean }) {
+    useEffect(() => {
+      committed = autoPlay;
+    });
+    return (
       <>
         <Video source={captured} autoPlay={autoPlay} />
         <Video
-          source={catalog.videoTracks[0]}
+          source={remote}
           autoPlay={autoPlay}
           style={{ width: 160, height: 120 }}
         />
-        <Discovery />
-      </>,
+      </>
     );
+  }
   const originalPlay = HTMLMediaElement.prototype.play;
   let attempts = 0;
   HTMLMediaElement.prototype.play = () => {
-    attempts += 1;
+    attempts++;
     return Promise.resolve();
   };
   try {
-    render(false);
-    await waitFor(() => {
-      const elements = [
-        ...host.querySelectorAll<HTMLMediaElement>("video,audio"),
-      ];
-      return (
-        elements.length === 2 &&
-        elements.every(
-          (element) =>
-            element.srcObject instanceof MediaStream &&
-            element.srcObject.getTracks().length === 1,
-        )
-      );
-    }, "autoplay disabled attachments");
+    root.render(<Probe autoPlay={false} />);
+    await waitFor(
+      () =>
+        committed === false &&
+        host.querySelector("video")?.srcObject instanceof MediaStream,
+      "autoplay disabled commit",
+    );
+    const elements = [...host.querySelectorAll("video")];
     const disabled =
       attempts === 0 &&
-      videoDemand === 1 &&
-      [...host.querySelectorAll<HTMLMediaElement>("video,audio")].every(
-        (element) => !element.autoplay,
-      );
-    render(true);
-    await waitFor(() => attempts >= 2, "autoplay enabled");
-    const enabled = attempts === 2 && videoDemand === 1;
+      elements.length === 2 &&
+      elements.every((element) => !element.autoplay);
+    root.render(<Probe autoPlay />);
     await waitFor(
-      () => host.querySelector("output")?.textContent === "1:true",
-      "receiving subscription",
+      () => committed === true && attempts === 1,
+      "autoplay enabled commit",
     );
-    snapshot = { ...snapshot, mapping: { ...snapshot.mapping, audio: [] } };
-    catalog.update(snapshot);
-    subscriptions.forEach((listener) => listener());
-    await waitFor(
-      () => host.querySelector("output")?.textContent === "1:false",
-      "mapping subscription",
-    );
-    snapshot = {
-      ...snapshot,
-      catalog: { ...snapshot.catalog, publications: [] },
-    };
-    catalog.update(snapshot);
-    subscriptions.forEach((listener) => listener());
-    await waitFor(
-      () => host.querySelector("output")?.textContent === "0:false",
-      "discovery subscription",
-    );
-    const subscriptionsUpdated = host.querySelector("audio") === null;
+    const retained =
+      elements.every(
+        (element, index) => host.querySelectorAll("video")[index] === element,
+      ) &&
+      (elements[0].srcObject as MediaStream)?.getVideoTracks()[0] === video;
     root.unmount();
-    const released = videoDemand === 0 && subscriptionsUpdated;
     return {
       autoplayRespected:
         disabled &&
-        enabled &&
-        released &&
-        automaticRoute &&
+        retained &&
+        elements.every((element) => element.srcObject === null) &&
         video.readyState === "live" &&
-        audio.readyState === "live",
+        host.querySelector("audio") === null,
     };
   } finally {
     root.unmount();
-    catalog.close();
+    agent.close();
     host.remove();
     video.stop();
-    audio.stop();
-    await context.close();
     HTMLMediaElement.prototype.play = originalPlay;
   }
 }

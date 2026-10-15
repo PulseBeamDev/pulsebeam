@@ -52,7 +52,7 @@
   oscillator.connect(destination);
   oscillator.start();
   const track = destination.stream.getAudioTracks()[0];
-  const endpoint = "http://127.0.0.1:7070";
+  const endpoint = "__DESTINATION_ENDPOINT__";
   const sender = createAgent({
     endpoint,
     token: "__SENDER_TOKEN__",

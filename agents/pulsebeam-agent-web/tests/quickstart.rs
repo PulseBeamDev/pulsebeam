@@ -1,5 +1,14 @@
-use super::*;
+#[path = "support/destination.rs"]
+mod destination;
+mod support;
+use destination::ExecutableServer;
+use pulsebeam_core::identity::{ParticipantExternalId, RoomExternalId};
+use std::error::Error;
+use support::{
+    StaticServer, TestResult, capabilities, evaluate_json, managed_driver, mint_development_token,
+};
 use thirtyfour::By;
+use thirtyfour::{prelude::ChromiumLikeCapabilities, testing::run_browser_test};
 
 async fn press(driver: &thirtyfour::WebDriver, label: &str) -> TestResult<()> {
     driver
@@ -34,7 +43,7 @@ async fn configure(driver: &thirtyfour::WebDriver, url: &str, token: &str) -> Te
 
 #[tokio::test(flavor = "multi_thread")]
 async fn documented_react_quickstart_exchanges_media_and_cleans_up() -> TestResult<()> {
-    let _destination = DestinationServer::start()?;
+    let _destination = ExecutableServer::start()?;
     let example = StaticServer::start(std::env::var("PULSEBEAM_REACT_QUICKSTART_ROOT")?).await?;
     let room = RoomExternalId::new("react-demo")?;
     let alice = mint_development_token(&room, &ParticipantExternalId::new("alice")?, u64::MAX)?;
