@@ -1371,8 +1371,12 @@ traffic is dropped and counted.
 ## Validation boundary
 
 Crate-local deterministic tests and the controlled native harness live under
-`crates/pulsebeam-rtc`. Web and React retain consumer browser coverage; the
-repository gate validates complete workspace acceptance.
+`crates/pulsebeam-rtc`. Private controller assertions, including the fixed SCReAM
+scenario matrix, run once in the unit target. Integration tests protect the
+public `Connection` boundary, and controlled native peers protect interoperability.
+Web and React retain consumer browser coverage. The
+[shared development workflow](../../../README.md#development) defines workspace
+gates.
 
 Acceptance requires:
 
@@ -1386,8 +1390,6 @@ Acceptance requires:
 - property tests for global-time wire round trips, non-regressing clock mappings,
   no double acknowledgment, bounded histories, allocation conservation, and
   policy monotonicity;
-- parameterized many-connection/many-stream benchmarks with one wakeup per
-  connection and no global scans;
 - actual libwebrtc `pulsebeam-webrtc-sys` `0.6.2`, source commit
   `f87f99a48e58fb9cd13767ba58e9b7cd937c71a3`, and matching released native
   artifacts provisioned through Bazel on Linux x86_64;
@@ -1404,10 +1406,14 @@ The canonical complete RTC local and CI command is:
 ```
 
 This includes all unit, property, integration, and native simulation tests.
-With built binaries and cached test results disabled, one complete invocation
-MUST finish within fifteen seconds including peer setup and teardown. Dependency
-fetching, compilation, lint/format checks, benchmarks, and other owners are
-excluded. Required native scenarios cannot be moved to optional slow gates.
+With built binaries and cached test results disabled, the operational host
+elapsed-time target is fifteen seconds per complete invocation, including peer
+setup and teardown. Dependency fetching, compilation, lint/format checks,
+benchmarks, and other owners are excluded. This target is not a correctness
+acceptance threshold or a host-performance benchmark. Virtual-time protocol
+deadlines, resource limits, and quantitative modeled-network/controller assertions
+remain correctness requirements. Required native scenarios cannot be moved to
+optional slow gates.
 Missing artifacts or absent required media, feedback, or DataChannel evidence
 fail acceptance, never silently skip or fall back to another client.
 
@@ -1424,7 +1430,9 @@ Run root `./bazel test //:test` for complete workspace acceptance, including
 consumer-owned Web and React browser coverage. Shared browser provisioning is
 retained in `tools/browser-matrix.json`.
 
-Scaling measurements are separate from test gates. Run the Criterion matrix with
+Host-performance comparisons use scaling measurements, separate from correctness
+test gates. The parameterized matrix preserves one wakeup per connection and no
+global scans. Run the Criterion matrix with
 `./bazel run //:benchmark`. It measures timer/poll
 scheduling for 1/16/64 connections and 1/8/32 senders, excluding fixture setup and
 teardown. This initial-burst workload is not sustained network throughput

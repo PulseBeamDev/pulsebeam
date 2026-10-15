@@ -49,7 +49,7 @@ rust_clippy_test(name = "clippy", targets = CHECK_TARGETS)
 rust_test_suite(
     name = "integration_tests",
     srcs = INTEGRATION_SRCS,
-    shared_srcs = glob(["tests/support/**/*.rs", "src/congestion.rs", "src/screamv2.rs", "src/congestion/**/*.rs"]),
+    shared_srcs = glob(["tests/support/**/*.rs"]),
     edition = crate_edition(),
     compile_data = glob(["tests/fixtures/**", "tests/traces/**"]),
     lint_config = ":lints",

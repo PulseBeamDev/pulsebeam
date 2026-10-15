@@ -17,7 +17,7 @@ const TARGET_BITRATE_MAX: u64 = 100_000_000;
 
 #[cfg(test)]
 #[path = "congestion/scenario.rs"]
-pub(crate) mod scenario;
+mod scenario;
 
 /// PulseBeam-side validation of ECN capability. This selects an RFC-defined SCReAMv2
 /// mode; it does not tune the congestion-control algorithm.

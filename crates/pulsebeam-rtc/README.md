@@ -246,9 +246,13 @@ dependency and does not expose mutable controller internals.
 ## Validation boundary
 
 Crate checks, deterministic tests, benchmarks, and the test-only native
-simulation harness are owned by `crates/pulsebeam-rtc`. Web and React retain
-consumer browser coverage; root `./bazel test //:test` runs complete workspace
-acceptance. Their shared browser provisioning is owned by `tools/browser-matrix.json`.
+simulation harness are owned by `crates/pulsebeam-rtc`. Private controller
+assertions, including the fixed SCReAM scenario matrix, run in the unit target;
+integration tests exercise the public `Connection` boundary. Controlled native
+peers establish the distinct interoperability obligations described below.
+See the [shared development workflow](../../README.md#development) for workspace
+gates. Web and React retain consumer browser coverage; their shared browser
+provisioning is owned by `tools/browser-matrix.json`.
 
 Required evidence includes deterministic crate-local tests and simulation for
 negotiation, media-clock normalization, source switching, RTP/RTCP continuity,
@@ -291,8 +295,13 @@ time, task pumping, and virtual UDP or active-client TCP packet delivery. Multip
 share the world. The unit target uses one Rust test thread to avoid parallel
 harness threads blocking on the native-world lease. Separate test binaries may
 run concurrently. No real sockets, hardware media, production scheduling,
-sleeps, or wall-clock protocol deadlines are used. The warm, uncached complete RTC suite
-has a fifteen-second elapsed budget, including peer setup and teardown.
+sleeps, or wall-clock protocol deadlines are used. The warm, uncached complete RTC
+suite has an operational host elapsed-time target of fifteen seconds, including
+peer setup and teardown. This execution target is not a correctness acceptance
+threshold. Virtual-time protocol deadlines, resource bounds, and quantitative
+modeled-network/controller assertions remain correctness requirements. Use the
+Criterion matrix above for host-performance comparisons, within its polling-only
+measurement boundary.
 
 High-volume egress traces in `src/network_tests.rs` and `src/connection.rs`
 construct canonical SFU media inputs through the private `src/test_source.rs`
