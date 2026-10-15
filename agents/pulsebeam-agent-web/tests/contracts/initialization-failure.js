@@ -17,9 +17,9 @@ new Promise((resolve, reject) => {
     const after = agent.getSnapshot();
     resolve(
       after.connection === "terminal-failure" &&
-      agent.connection === after.connection &&
-      after.failure === failure &&
-      error === failure,
+        agent.connection === after.connection &&
+        after.failure === failure &&
+        error === failure,
     );
   });
   agent.setState({ connected: true });

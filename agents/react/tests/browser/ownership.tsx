@@ -120,8 +120,7 @@ export async function runOwnershipContract() {
     root.unmount();
     unmounted = true;
     const ownedCleanup =
-      replacement.connection === "disconnected" &&
-      track.readyState === "live";
+      replacement.connection === "disconnected" && track.readyState === "live";
     track.stop();
     return {
       ownedIndependent:

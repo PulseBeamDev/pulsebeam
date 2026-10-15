@@ -90,16 +90,17 @@ impl FromStr for ApiKey {
     type Err = ApiKeyError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        let text = value.strip_prefix(PREFIX).ok_or(ApiKeyError::InvalidPrefix)?;
+        let text = value
+            .strip_prefix(PREFIX)
+            .ok_or(ApiKeyError::InvalidPrefix)?;
         if text.len() != ENCODED_DIGITS {
             return Err(ApiKeyError::InvalidLength);
         }
         let bytes = CROCKFORD
             .decode(text.as_bytes())
             .map_err(|_| ApiKeyError::InvalidEncoding)?;
-        let data: [u8; ENCODED_BYTES] = bytes
-            .try_into()
-            .map_err(|_| ApiKeyError::InvalidEncoding)?;
+        let data: [u8; ENCODED_BYTES] =
+            bytes.try_into().map_err(|_| ApiKeyError::InvalidEncoding)?;
         // Reject noncanonical unused padding bits, including codec aliases
         // that would alter the underlying secret's textual representation.
         let canonical = CROCKFORD.encode(&data);
@@ -114,9 +115,15 @@ impl FromStr for ApiKey {
         if canonical != normalized {
             return Err(ApiKeyError::InvalidEncoding);
         }
-        let project_id = data[..16].try_into().map_err(|_| ApiKeyError::InvalidEncoding)?;
-        let key_id = data[16..32].try_into().map_err(|_| ApiKeyError::InvalidEncoding)?;
-        let seed = data[32..].try_into().map_err(|_| ApiKeyError::InvalidEncoding)?;
+        let project_id = data[..16]
+            .try_into()
+            .map_err(|_| ApiKeyError::InvalidEncoding)?;
+        let key_id = data[16..32]
+            .try_into()
+            .map_err(|_| ApiKeyError::InvalidEncoding)?;
+        let seed = data[32..]
+            .try_into()
+            .map_err(|_| ApiKeyError::InvalidEncoding)?;
         Self::new(project_id, key_id, seed)
     }
 }
@@ -152,7 +159,7 @@ mod tests {
         );
         assert_eq!(
             key.key_id_bytes(),
-            &[0, 0, 0, 0, 0, 0x70, 0, 0x80, 0, 0, 0, 0, 0, 2]
+            &[0, 0, 0, 0, 0, 0, 0x70, 0, 0x80, 0, 0, 0, 0, 0, 0, 2]
         );
         assert!(key.to_secret_string().starts_with("key_0"));
         assert_eq!(key.to_secret_string().len(), 108);
@@ -165,9 +172,17 @@ mod tests {
             "key_00000000001R0100000000000040000000007004000000000001",
             "9TRDHKQQZTPK0QA24NX4JXGPC8H29RNMQPCK935R3QB033JQ7YR0"
         );
-        assert!(good.replacen("key_0", "key_1", 1).parse::<ApiKey>().is_err());
+        assert!(
+            good.replacen("key_0", "key_1", 1)
+                .parse::<ApiKey>()
+                .is_err()
+        );
         assert!(good[..good.len() - 1].parse::<ApiKey>().is_err());
         assert!(good.replace("key_0", "sk_0").parse::<ApiKey>().is_err());
-        assert!(format!("{}1", &good[..good.len() - 1]).parse::<ApiKey>().is_err());
+        assert!(
+            format!("{}1", &good[..good.len() - 1])
+                .parse::<ApiKey>()
+                .is_err()
+        );
     }
 }

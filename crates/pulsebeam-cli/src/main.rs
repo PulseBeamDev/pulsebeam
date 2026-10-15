@@ -20,8 +20,8 @@ use pulsebeam_agent_native::{
 };
 use pulsebeam_agent_native::{clock::clock_anchor, wallclock_at};
 use pulsebeam_core::auth::{
-    ApiKey, ApiSigningKey, DEVELOPMENT_API_KEY_ID, DEVELOPMENT_API_SIGNING_KEY, DEVELOPMENT_PROJECT_ID,
-    KeyRegistry, KeyRegistryEntry,
+    ApiKey, ApiSigningKey, DEVELOPMENT_API_KEY_ID, DEVELOPMENT_API_SIGNING_KEY,
+    DEVELOPMENT_PROJECT_ID, KeyRegistry, KeyRegistryEntry,
 };
 use pulsebeam_core::identity::{
     ApiKeyId, AudioTrackId, DataTrackId, ParticipantExternalId, ParticipantId, ProjectId,
@@ -374,8 +374,7 @@ fn random_signing_key() -> ApiSigningKey {
 }
 
 fn generate_key() -> Result<()> {
-    let (api_key, registry) =
-        create_api_key(ProjectId::new(), Vec::new(), random_signing_key())?;
+    let (api_key, registry) = create_api_key(ProjectId::new(), Vec::new(), random_signing_key())?;
     print_key_material(&api_key, &registry)
 }
 
@@ -402,12 +401,9 @@ fn create_api_key(
     signing_key: ApiSigningKey,
 ) -> Result<(String, KeyRegistry)> {
     let key_id = ApiKeyId::new();
-    let api_key = ApiKey::from_signing_key(
-        *project_id.as_bytes(),
-        *key_id.as_bytes(),
-        &signing_key,
-    )?
-    .to_secret_string();
+    let api_key =
+        ApiKey::from_signing_key(*project_id.as_bytes(), *key_id.as_bytes(), &signing_key)?
+            .to_secret_string();
     keys.push(KeyRegistryEntry {
         key_id,
         public_key: signing_key.public_key(),
@@ -919,7 +915,6 @@ mod tests {
     }
 
     #[test]
-    fn benchmark_arguments_keep_the_documented_surface() {    #[test]
     fn benchmark_arguments_keep_the_documented_surface() {
         let cli = Cli::try_parse_from([
             "pulsebeam-cli",
@@ -1127,12 +1122,8 @@ mod tests {
         assert!(matches!(config.command, Some(KeyCommand::Rotate)));
 
         assert!(Cli::try_parse_from(["pulsebeam-cli", "auth-key"]).is_err());
-        assert!(
-            Cli::try_parse_from(["pulsebeam-cli", "key", "--project-id", "anything"]).is_err()
-        );
-        assert!(
-            Cli::try_parse_from(["pulsebeam-cli", "key", "--output-dir", "auth"]).is_err()
-        );
+        assert!(Cli::try_parse_from(["pulsebeam-cli", "key", "--project-id", "anything"]).is_err());
+        assert!(Cli::try_parse_from(["pulsebeam-cli", "key", "--output-dir", "auth"]).is_err());
     }
 
     #[test]
@@ -1161,12 +1152,8 @@ mod tests {
     #[test]
     fn key_rotation_preserves_project_and_existing_public_keys() {
         let project_id = ProjectId::new();
-        let (first_api_key, registry) = create_api_key(
-            project_id,
-            Vec::new(),
-            ApiSigningKey::from_seed([8; 32]),
-        )
-        .unwrap();
+        let (first_api_key, registry) =
+            create_api_key(project_id, Vec::new(), ApiSigningKey::from_seed([8; 32])).unwrap();
         let first_key_id = registry.keys()[0].key_id;
 
         let (second_api_key, rotated) = create_api_key(
@@ -1186,7 +1173,6 @@ mod tests {
     }
 
     #[test]
-    fn video_policy_excludes_self_audio_and_tracks_beyond_capacity() {    #[test]
     fn video_policy_excludes_self_audio_and_tracks_beyond_capacity() {
         let mut snapshot = Snapshot {
             participant_id: Some("self".into()),

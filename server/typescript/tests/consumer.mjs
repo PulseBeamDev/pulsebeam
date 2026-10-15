@@ -32,11 +32,8 @@ writeFileSync(
   join(directory, "consumer.mjs"),
   'export { signParticipantToken, INSECURE_DEV_CREDENTIALS, INSECURE_DEV_API_KEY } from "@pulsebeam/server";',
 );
-const {
-  signParticipantToken,
-  INSECURE_DEV_CREDENTIALS,
-  INSECURE_DEV_API_KEY,
-} = await import(pathToFileURL(join(directory, "consumer.mjs")));
+const { signParticipantToken, INSECURE_DEV_CREDENTIALS, INSECURE_DEV_API_KEY } =
+  await import(pathToFileURL(join(directory, "consumer.mjs")));
 const development = JSON.parse(readFileSync(developmentFixture));
 assert.deepEqual(INSECURE_DEV_CREDENTIALS, {
   projectId: development.projectId,

@@ -9,6 +9,7 @@ import {
   type AgentFailure,
   type AgentSnapshot,
   type AgentState,
+  type ConnectionState,
   type FailureClass,
   type PlaybackFailure,
   type RemoteMediaAttachment,
