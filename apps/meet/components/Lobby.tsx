@@ -112,7 +112,7 @@ export function Lobby({
               label="Server URL"
               fullWidth
               value={serverURL}
-              inputMode="url"
+              slotProps={{ htmlInput: { inputMode: "url" } }}
               onChange={(event) => setServerURL(event.target.value)}
               error={!endpoint}
               helperText={
