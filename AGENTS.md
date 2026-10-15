@@ -20,12 +20,7 @@
 ## Repository convention
 
 * Prefer names, types, structure, and tests over narration. Keep comments for non-obvious constraints or workarounds, and do not add TODOs unless requested.
-* Iterate with the narrowest verification exposed by the owning package, then use the repository gates exposed by `BUILD.bazel` before handoff.
 
-## Test routing
+## Testing
 
-* When practical, run the exact affected test, then the nearest owner's fast gate while iterating. Use aggregate slow only for final acceptance; run an exact slow test only while actively debugging that boundary.
-* Root `./bazel test //:test` is the complete non-privileged final gate. Run it once, not per slice or review.
-* Builders report actual evidence. Reviewers reuse it unless it is missing, stale, contradictory, or needed to reproduce a finding; orchestrators request missing owning evidence rather than duplicating broad runs.
-* Final slow evidence is reusable until a repair invalidates it. At renewed final acceptance, rerun affected slow owners, including every affected browser boundary for shared changes, and reuse unaffected passing evidence.
-* Privileged perf/network operations and advisory seed sweeps remain outside ordinary test routing.
+Follow [the contributor testing contract](docs/build.md#testing-contract) for proof selection, gate routing, isolation, and evidence reuse. Executable owner targets remain authoritative.

@@ -62,23 +62,27 @@ platform_transition_filegroup(
 # See docs/native-dtls-exception.md for cause and reinstatement criteria.
 NATIVE_DTLS_EXCEPTION = ["--skip", "tests::native_runtime::native_agents_prove_media_topics_reconnect_and_close"]
 
+# Reserve one CPU per isolated child, from the same budget used by the runner.
+SIMULATION_JOBS = 4
+
 py_test(
     name = "fast",
     srcs = ["//tools:run-simulations.py"],
     main = "//tools:run-simulations.py",
-    args = ["$(rootpath :sim_binary)", "--mode", "fast"] + NATIVE_DTLS_EXCEPTION,
+    args = ["$(rootpath :sim_binary)", "--mode", "fast", "--jobs", str(SIMULATION_JOBS)] + NATIVE_DTLS_EXCEPTION,
     data = [":sim_binary"],
     size = "large",
+    tags = ["cpu:%s" % SIMULATION_JOBS],
 )
 
 py_test(
     name = "slow",
     srcs = ["//tools:run-simulations.py"],
     main = "//tools:run-simulations.py",
-    args = ["$(rootpath :sim_binary)", "--mode", "slow"],
+    args = ["$(rootpath :sim_binary)", "--mode", "slow", "--jobs", str(SIMULATION_JOBS)],
     data = [":sim_binary"],
     size = "enormous",
-    tags = ["slow"],
+    tags = ["slow", "cpu:%s" % SIMULATION_JOBS],
 )
 
 REPLAY_ARGS = ["$(rootpath :sim_binary)", "--mode", "all"] + NATIVE_DTLS_EXCEPTION
@@ -108,7 +112,7 @@ py_binary(
     main = "//tools:scoreboard.py",
     # Keep each plan's metrics adjacent to its result for deterministic grouping.
     args = ["--runner", "$(rootpath :replay)", "--parser", "$(rootpath //tools:scoreboard_parser)"] + [
-        "--runner-arg=" + arg for arg in REPLAY_ARGS + ["--jobs", "1"]
+        "--runner-arg=" + arg for arg in REPLAY_ARGS + ["--jobs", "1", "--show-output"]
     ],
     data = [":replay", ":sim_binary", "//tools:scoreboard_parser"],
 )

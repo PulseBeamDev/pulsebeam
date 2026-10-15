@@ -35,17 +35,22 @@ test_suite(
     tests = ["//%s:%s" % (owner, check) for owner in RUST_OWNERS + ["crates/pulsebeam-simulator"] for check in ["format", "clippy"]] + [
         ":artifacts", "//agents/pulsebeam-agent-web:js_format", "//agents/pulsebeam-agent-web:public_contract",
         "//agents/pulsebeam-agent-web:uniffi_types", "//agents/pulsebeam-agent-web:uniffi_contract",
-        "//agents/react:format", "//agents/react:fast", "//apps/meet:check", "//tools:workflow_contract", "//tools:simulation_runner_contract", "//tools:scoreboard_contract", "//tools:ide_contract", "//tools:launcher_contract",
+        "//agents/react:format", "//agents/react:fast", "//apps/meet:check", "//tools:workflow_contract", "//tools:simulation_runner_contract", "//tools:scoreboard_contract", "//tools:ide_contract", "//tools:launcher_contract", "//tools:rust_pins_contract",
+        "//server/auth:fast", "//server/typescript:fast", "//server/go:fast", "//server/python:fast", "//server/rust:fast",
         "//release:contract", "//release:elf_contract", "//release:plan_contract", "//release/npm:contract",
     ],
 )
 
 test_suite(
     name = "fast",
-    tests = [":check"] + ["//%s:unit_tests" % owner for owner in RUST_OWNERS] + [
-        "//crates/pulsebeam-rtc:integration_tests", "//crates/pulsebeam-rtc/simulation:interop",
+    tests = ["//%s:unit_tests" % owner for owner in RUST_OWNERS] + [
+        "//crates/pulsebeam-rtc:integration_tests",
         "//crates/pulsebeam-simulator:fast",
-        "//server/auth:fast", "//server/typescript:fast", "//server/go:fast", "//server/python:fast", "//server/rust:fast",
+        "//server/auth:contract", "//server/go:conformance",
+        "//agents/pulsebeam-agent-web:js_format", "//agents/react:format", "//server/typescript:format",
+        "//tools:workflow_contract", "//tools:simulation_runner_contract", "//tools:scoreboard_contract",
+        "//tools:ide_contract", "//tools:launcher_contract", "//tools:rust_pins_contract",
+        "//release:plan_contract",
     ],
 )
 
@@ -53,12 +58,13 @@ test_suite(
     name = "slow",
     tests = [
         "//crates/pulsebeam-simulator:slow",
+        "//crates/pulsebeam-rtc/simulation:interop",
         "//agents/pulsebeam-agent-web:browser",
     ],
     tags = ["slow"],
 )
 
-test_suite(name = "test", tests = [":fast", ":slow"])
+test_suite(name = "test", tests = [":check", ":fast", ":slow"])
 
 alias(name = "server", actual = "//crates/pulsebeam:server")
 alias(name = "cli", actual = "//crates/pulsebeam-cli:pulsebeam-cli")

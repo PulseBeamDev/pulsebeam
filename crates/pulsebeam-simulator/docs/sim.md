@@ -214,4 +214,4 @@ Before a new simulator scenario is accepted:
   failures;
 - a baseline failure was reproduced before a production fix when the scenario
   is a regression;
-- `./bazel test //:test` runs static checks and complete acceptance before handoff.
+- verification follows the [contributor testing contract](../../../docs/build.md#testing-contract).

@@ -33,25 +33,10 @@ PulseBeam is opinionated about media handling to prioritize battery efficiency, 
 
 ## Development
 
-Bazel owns compilation, dependency/tool provisioning, generated bindings, checks,
-and tests. Normal development and browser acceptance support Linux x86_64.
-Install the [baseline OS prerequisites](docs/build.md#host-prerequisites), then:
-
-```bash
-./bazel test //:fast                  # Static checks and fast tests
-./bazel test //:test                  # Complete non-privileged acceptance
-./bazel build //:server //:native //:web //:react //:meet //:docs
-```
-
-The checksum-verified launcher bootstraps the pinned Bazel version. Bazel supplies
-Rust 1.99.0, native compilation tools, Node/pnpm, matching WASM generators/runtime,
-protobuf, Go, Python, and the pinned Chrome/Firefox executables and drivers.
-Initial downloads require network access; tests use local application fixtures.
-No pre-existing language/browser cache or independent tool installation is required.
-
-See [build and development](docs/build.md), [editor-neutral LSP setup](docs/ide.md),
-and [distribution](docs/releasing.md). Cargo/pnpm metadata remains authoritative
-for dependencies and editor maintenance, not a supported parallel build/test workflow.
+Bazel owns compilation, provisioning, generated bindings, and tests. Start with
+[build and development](docs/build.md) for Linux prerequisites and the canonical
+[testing contract](docs/build.md#testing-contract). See also
+[editor setup](docs/ide.md) and [distribution](docs/releasing.md).
 
 ## Local development demo
 

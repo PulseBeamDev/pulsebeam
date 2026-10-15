@@ -275,7 +275,7 @@ rust_test(
         "PULSEBEAM_BROWSER_BINARY": "$(rootpath @browser_chrome//:executable)",
         "PULSEBEAM_DRIVER_BINARY": "$(rootpath @browser_chromedriver//:executable)",
     },
-    tags = ["slow"],
+    tags = ["slow", "cpu:4"],
     size = "large",
 )
 

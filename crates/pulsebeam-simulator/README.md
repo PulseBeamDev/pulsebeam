@@ -28,9 +28,14 @@ optimize runtime dependencies.
 
 ## Commands
 
-- Root `./bazel test //:test` runs acceptance, including committed seeds, with
-  one [human-authorized native DTLS exception](docs/native-dtls-exception.md).
-- `./bazel run //:replay -- --seed <seed> --filter <name>` reproduces a seed.
+See the [contributor testing contract](../../docs/build.md#testing-contract) for
+workspace gates and evidence reuse. This owner retains one
+[human-authorized native DTLS exception](docs/native-dtls-exception.md).
+
+- `./bazel run //:replay -- --seed <seed> --exact --filter <name>` reproduces one case.
+  Add `--jobs <count>` to select workers or `--show-output` for grouped full traces;
+  `RUST_LOG` controls diagnostic detail. Failed traces remain in the printed path
+  (Bazel test actions use standard undeclared outputs).
 - `./bazel run //:sweep -- --seeds <count> --from-seed <first> --filter <name>`
   searches replayable seeds outside merge gates.
 - `./bazel run //:scoreboard` explicitly regenerates the diffable BWE scoreboard.

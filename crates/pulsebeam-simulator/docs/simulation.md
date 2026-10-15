@@ -10,12 +10,14 @@ simulated randomness, modelled capacity, queueing, loss, reordering and
 partitions. The approach is FoundationDB's and TigerBeetle's: **one seed
 determines one entire run**, so anything found can be replayed exactly.
 
-## Three commands
+## Replay and search
+
+Use the [contributor testing contract](../../../docs/build.md#testing-contract)
+for workspace gates, proof selection and evidence reuse.
 
 | Command | What it is |
 |---|---|
-| `./bazel test //:test` | complete acceptance, including committed simulation plans |
-| `./bazel run //:replay -- --seed <n>` | replay one seed exactly |
+| `./bazel run //:replay -- --seed <n> --exact --filter <name>` | replay one case and seed exactly |
 | `./bazel run //:sweep -- --seeds <count> --from-seed <first> --filter <name>` | search for seeds nobody has tried |
 
 ## Two rules
@@ -267,8 +269,11 @@ attempt at the starvation-deadlock fix passed its own target plan and pinned an
 estimate 25% above a link's real capacity elsewhere, which the scoreboard caught
 and no single test would have.
 
-`>` truncates on start, so the `baseline` recipe destroys the file if the run is
-interrupted. Capture to a scratch file when experimenting.
+Scoreboard runs explicitly request grouped full output with one worker so each
+plan's metrics stay adjacent to its result. Normal gate output stays concise;
+use replay's `--show-output` for diagnostic traces and `RUST_LOG` for detail.
+Failed-case logs retain complete stdout/stderr in the printed location, under
+standard undeclared test outputs for Bazel tests.
 
 ## What a red test means
 
@@ -343,21 +348,11 @@ the estimate because the real deadlock sits at 15% and a healthy allocator
 backgrounding a stream sits at 44%. Write the measured figures into the comment
 so the next person can requalify the number instead of guessing at it.
 
-## Working through findings concurrently
+## Execution isolation
 
-Simulation runs are minutes long and mostly idle CPU-wise from the agent's point
-of view, so the slow way to work is one plan at a time, waiting on each.
-
-- **Batch final verification.** Freeze the candidate, then run `./bazel test //:test`.
-  Scoreboard regeneration and advisory sweeps retain their separate semantics.
-- **Do not interleave source edits with a running simulation.** A source change
-  invalidates affected evidence. Draft into a scratch file
-  and apply when the run lands.
-- **Investigate while it runs.** Reading code, extracting a predicate, and
-  writing unit tests cost nothing and need no build.
-- **Prefer the cheap signal.** A generator-level meta-test runs in 11ms and a
-  predicate unit test in microseconds; both can falsify an idea before a suite
-  run confirms it.
-- **Keep one clean measurement at the end.** Concurrent runs that raced a build
-  are worth discarding — take a single uncontended scoreboard and sweep on the
-  final tree.
+Every selected case runs in a separate process with one libtest thread: virtual
+clock and RNG hooks are process-global. Bazel reserves the same CPU budget the
+owner wrapper uses for workers; standalone replay accepts an explicit `--jobs`.
+Do not invoke the manual raw test binary from aggregate suites. Scoreboard
+comparisons need an uncontended measurement; advisory sweeps remain separate
+from final acceptance.

@@ -263,4 +263,6 @@ Run from a build-ready repository root:
 
 The browser target provisions pinned browsers and builds Web, React, and Meet
 fixtures. `./bazel run //:web_dev` serves the repository Web example; it is not the
-npm consumer installation. See [editor setup](../../docs/ide.md).
+npm consumer installation. See the
+[contributor testing contract](../../docs/build.md#testing-contract) for shared
+routing and [editor setup](../../docs/ide.md).

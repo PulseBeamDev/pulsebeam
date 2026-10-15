@@ -39,6 +39,7 @@ Keep signing keys on your backend.
 ./bazel test //agents/react:fast
 ```
 
-The fast gate checks SDK contracts and the repository's separate Vite test
-fixture. `//agents/pulsebeam-agent-web:browser` exercises that fixture with
+This owner gate checks SDK/package contracts and the repository's separate Vite
+test fixture; it is not the root cheap loop. See the
+[contributor testing contract](../../docs/build.md#testing-contract) for shared routing. `//agents/pulsebeam-agent-web:browser` exercises that fixture with
 two participants; these checks don't validate the tutorial's other frameworks.

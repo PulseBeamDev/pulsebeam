@@ -121,16 +121,19 @@ execution from disk-cache hits and internal materialization.
 ./bazel test //:test --test_output=errors
 ```
 
-`//:fast` includes formatting, compiler/type/architectural/artifact checks and
-fast owner tests, including controlled native RTC interoperability and the server
-SDK contracts. `//:test` adds committed slow simulations and consumer-owned
-Web/React browser contracts. Ignored exploratory cases and advisory seed search
-retain their separate semantics.
-The sole human-authorized gate exclusion is the known native DTLS reconnect
-case, recorded in the [exception document](https://github.com/PulseBeamDev/pulsebeam/blob/main/crates/pulsebeam-simulator/docs/native-dtls-exception.md).
-It is reported as skipped, not passed, and remains explicitly runnable.
-`//:slow` selects the slow owners explicitly; do not run it per implementation
-slice. Final acceptance runs the complete gate once against a frozen candidate.
+| Gate | Purpose |
+| --- | --- |
+| `//:fast` | Focused Rust unit/integration and fast isolated simulation behavior, source auth/Go conformance, source formatting and inexpensive tool contracts. No distribution assembly, browser fixtures, Meet export or docs site. |
+| `//:check` | Broad compiler, architectural, generated-interface, package-consumer and artifact contracts. This is not the cheap feedback loop. |
+| `//:slow` | Committed slow simulations, controlled native RTC interoperability, and existing Web/React/Meet browser acceptance. |
+| `//:test` | Complete non-privileged acceptance: the union of all three gates, including Rust-pin validation. |
+
+Owner targets are authoritative for selection and dependencies. An owner's
+`:fast` may include package contracts and need not have the root cheap gate's
+cost. Ignored exploratory cases, advisory seed sweeps and privileged diagnostics
+remain outside ordinary acceptance. The sole documented gate exclusion is the
+[native DTLS reconnect case](https://github.com/PulseBeamDev/pulsebeam/blob/main/crates/pulsebeam-simulator/docs/native-dtls-exception.md):
+it is reported as skipped, not passed, and remains explicitly runnable.
 
 Targeted selection uses the owning target and its harness:
 
@@ -139,12 +142,72 @@ Targeted selection uses the owning target and its harness:
 ./bazel test //crates/pulsebeam-simulator:fast --test_arg=--filter --test_arg=tests::bwe
 ```
 
-Replace the example Rust name with a real test name. Simulator cases run in
-separate processes, retaining virtual-clock/RNG isolation and committed seeds.
-Simulation libraries retain optimization level 2, debug assertions and overflow
-checks. Named `dev`, `release`, and `profile` configurations preserve the relevant
-panic/assertion settings; use those build configurations for runtime binaries,
-not abort-panic settings for libtest.
+Replace the example Rust name with a real test name. Simulation libraries retain
+optimization level 2, debug assertions and overflow checks. Named `dev`,
+`release`, and `profile` configurations preserve the relevant panic/assertion
+settings; use those build configurations for runtime binaries, not abort-panic
+settings for libtest.
+
+## Testing contract
+
+### Choose proof that earns its cost
+
+Choose the smallest deterministic, faithful proof in this default order: **unit,
+simulation, simulation property, integration, end-to-end**. Cost and fidelity
+are separate: a controlled simulation can be cheap, while codec/native or
+generated cases can be expensive. Put repeated or expensive proof in an honest
+owner route without making it optional in complete acceptance.
+
+Retain a higher-tier check only for a distinct failure that needs that boundary.
+Similar scenarios across language, wire or platform boundaries are not
+automatically redundant. Each test addition, relocation or deletion needs a
+meaningful regression argument. New tests must earn their maintenance cost;
+migrations must preserve unique proof, complete the cutover and remove the
+obsolete path.
+
+Consolidate compatible assertions around shared setup and reports. Assert direct
+resulting state and externally visible effects, not source/bundle spelling or
+private call ordering. Avoid fixed sleeps, post-run rejection that hides failed
+liveness, and silent conditional non-exercise. Generated failures must be
+reproducible with deterministic seeds and retained regression inputs/artifacts.
+Provisioning failures are errors, not passing skips; exceptions must be narrow,
+explicit and attributable.
+
+Correctness tests assert semantic, resource and protocol bounds. Host runtime,
+throughput and scale measurement belong in benchmarks, not flaky wall-clock
+speed assertions. Counts and coverage quotas do not enforce proof quality.
+
+### Preserve isolation and attributable evidence
+
+Let Bazel schedule independent owners using declared resources. Simulator test
+actions reserve one CPU per child from the same owner-local worker budget;
+standalone replay honors `--jobs`. Each simulator case still gets a separate
+process and one libtest thread because virtual-clock/RNG hooks are process-wide.
+Never execute its manual raw libtest binary from an aggregate. Controlled native
+worlds and browser ports/sessions retain their owner-local serialization.
+
+Normal simulator output identifies case, seed selection (`committed` means the
+case's authored defaults), outcome, elapsed host time and exact replay command.
+Full failed-case stdout/stderr stays in Bazel's undeclared test outputs; the
+runner prints its path. Replay retains failure logs in a temporary directory.
+Use `--show-output` for grouped diagnostic traces; `RUST_LOG` still selects
+tracing detail. Scoreboard regeneration explicitly consumes grouped metrics.
+See the [simulator guide](https://github.com/PulseBeamDev/pulsebeam/blob/main/crates/pulsebeam-simulator/README.md)
+for seed, fidelity and exception details.
+
+### Iterate narrowly, accept completely
+
+Run the exact affected proof, then the nearest owner's fast gate while iterating.
+Use an exact slow test only when debugging that boundary, not an aggregate slow
+run per slice. Freeze the integrated candidate and run `./bazel test //:test`
+once for final acceptance, including all existing browser boundaries.
+
+Report actual execution versus cached results and any resource limitations.
+Reuse valid evidence unless it is missing, stale, contradictory or needed to
+reproduce a finding. After a repair, rerun affected owners, including every
+affected browser boundary for shared changes, and reuse unaffected passing slow
+evidence rather than repeating complete acceptance. Never change the tested
+candidate while verification is running.
 
 ## Local development
 
