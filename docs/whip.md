@@ -15,8 +15,8 @@ You need a running PulseBeam server that supports WHIP and a participant token
 for the room you want to publish to. Your backend issues production tokens;
 never place signing secrets in a browser.
 
-For a local source-based setup, follow the
-[development sandbox](/react/quickstart#local-development-sandbox). Its
+For a local test setup, follow the
+[React quickstart's media-server setup](/react/quickstart#1-run-the-pulsebeam-media-server). Its
 `http://localhost:7070` server and development participant tokens can be reused
 here. Do not start another server or switch rooms between publishing and playback.
 For production operation, see [deployment](/deployment).
@@ -47,7 +47,7 @@ The publishing flow is:
 
 A local preview only confirms capture. To check delivery, join **the same server
 and room** with a different participant token in a receiving application. The
-[React quickstart](/react/quickstart#4-connect-two-participants) provides one:
+[React quickstart](/react/quickstart#4-try-it) provides one:
 use your existing endpoint and a token for another participant rather than
 creating a second sandbox.
 
