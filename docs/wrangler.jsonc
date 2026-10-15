@@ -11,5 +11,6 @@
   },
   "routes": [
     { "pattern": "docs.pulsebeam.dev", "custom_domain": true }
-  ]
+  ],
+  "previews": {}
 }
