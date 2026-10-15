@@ -34,9 +34,9 @@ PulseBeam is opinionated about media handling to prioritize battery efficiency, 
 ## Development
 
 Bazel owns compilation, provisioning, generated bindings, and tests. Start with
-[build and development](docs/build.md) for Linux prerequisites and the canonical
-[testing contract](docs/build.md#testing-contract). See also
-[editor setup](docs/ide.md) and [distribution](docs/releasing.md).
+[build and development](docs/build.md)
+[editor setup](docs/ide.md)
+[distribution](docs/releasing.md).
 
 ## Local development demo
 
