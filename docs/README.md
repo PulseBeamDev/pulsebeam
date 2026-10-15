@@ -37,25 +37,29 @@ The site is served at <https://docs.pulsebeam.dev> by Cloudflare Workers Static
 Assets, not Cloudflare Pages or GitHub Pages. Bazel builds the site; Wrangler
 uploads the resulting files without rebuilding them.
 
-From the repository root, validate and inspect the deployment bundle:
+Changes to `docs/**` on `main` automatically publish through the
+[Deploy docs workflow](../.github/workflows/docs.yml). It runs
+`./bazel test //docs:check` before deploying the prebuilt site with Wrangler.
+The workflow can also be run manually from GitHub Actions on `main`.
+
+Before enabling deployment, add these GitHub Actions repository secrets:
+
+- `CLOUDFLARE_API_TOKEN`: a Cloudflare **Edit Cloudflare Workers** token scoped
+  to the account and zone that own `docs.pulsebeam.dev`.
+- `CLOUDFLARE_ACCOUNT_ID`: the corresponding Cloudflare account ID.
+
+Keep credentials outside the repository. To validate and deploy manually from
+the repository root instead:
 
 ```sh
 ./bazel test //docs:check
 npx --yes wrangler@4.149.0 deploy --config docs/wrangler.jsonc --dry-run
-```
-
-For an authorized publication, authenticate to the Cloudflare account that owns
-the active `pulsebeam.dev` zone, then deploy:
-
-```sh
 npx --yes wrangler@4.149.0 login
 npx --yes wrangler@4.149.0 deploy --config docs/wrangler.jsonc
 ```
 
-For noninteractive deployment, set `CLOUDFLARE_API_TOKEN` and
-`CLOUDFLARE_ACCOUNT_ID` instead of logging in. Scope the token to the intended
-account and zone using Cloudflare's **Edit Cloudflare Workers** template. Keep
-credentials outside the repository.
+For noninteractive local deployment, export `CLOUDFLARE_API_TOKEN` and
+`CLOUDFLARE_ACCOUNT_ID` instead of running `wrangler login`.
 
 The configuration binds `docs.pulsebeam.dev` as a Workers Custom Domain.
 Cloudflare manages its DNS record and TLS certificate. Before the first
