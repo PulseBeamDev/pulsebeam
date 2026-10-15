@@ -919,7 +919,6 @@ mod tests {
     }
 
     #[test]
-    fn benchmark_arguments_keep_the_documented_surface() {    #[test]
     fn benchmark_arguments_keep_the_documented_surface() {
         let cli = Cli::try_parse_from([
             "pulsebeam-cli",
@@ -1186,7 +1185,6 @@ mod tests {
     }
 
     #[test]
-    fn video_policy_excludes_self_audio_and_tracks_beyond_capacity() {    #[test]
     fn video_policy_excludes_self_audio_and_tracks_beyond_capacity() {
         let mut snapshot = Snapshot {
             participant_id: Some("self".into()),

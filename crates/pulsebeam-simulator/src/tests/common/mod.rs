@@ -9,8 +9,8 @@ pub use harness::{
 };
 
 use pulsebeam_core::auth::{
-    DEVELOPMENT_API_KEY_ID, DEVELOPMENT_API_PUBLIC_KEY, DEVELOPMENT_PROJECT_ID, KeyRegistryEntry,
-    , KeyRegistry,
+    DEVELOPMENT_API_KEY_ID, DEVELOPMENT_API_PUBLIC_KEY, DEVELOPMENT_PROJECT_ID, KeyRegistry,
+    KeyRegistryEntry,
 };
 use pulsebeam_runtime::net::UdpMode;
 use std::{
