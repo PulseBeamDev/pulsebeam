@@ -72,7 +72,7 @@ impl RoomRegistry {
         let room = self.rooms.entry(room_id).or_insert_with(Room::new);
         let partition_index = room.next_partition_index(
             &participant_id,
-            super::core::DEFAULT_ROOM_PARTITION_SIZE,
+            1, // Test helper accepts arbitrary execution-shard placement.
         );
         room.add_participant(&participant_id, shard_id, partition_index);
     }
