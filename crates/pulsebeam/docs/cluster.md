@@ -16,8 +16,8 @@ forwarding topology.
 | Term | Scope and meaning |
 | --- | --- |
 | **Room** (`RoomId`) | Logical room spanning zero or more nodes. Identity, not an execution or leadership unit. |
-| **RoomShard** | The portion of one room hosted by **one node**. At most one per `(RoomId, NodeId)`. Contains that room's node-local partitions and authoritative live connection facts. Proposed cluster-level grouping; not a current Rust type. |
-| **RoomPartition** | Node-local admission group of participants assigned to one execution `Shard`. Many partitions can belong to one RoomShard; several partitions may map to the same execution shard. |
+| **RoomShard** | The portion of one room hosted by **one node**. At most one per `(RoomId, NodeId)`. Contains that room's node-local partitions and authoritative live connection facts. Node-local membership and partition occupancy use `control::room::RoomShard` today; cross-node synchronization is proposed. |
+| **RoomPartition** | Node-local admission group of participants assigned to one execution `Shard` (tracked by `control::room::RoomPartition`). Many partitions can belong to one RoomShard; several partitions may map to the same execution shard. |
 | **Shard** (`ShardId`) | Node-local dataplane state owner and packet executor. Hosts partitions from many rooms. A worker may execute multiple shards; workers are *not* owners. |
 | **Node** (`NodeId`) | Process owning its own connections, room shards, and execution shards. |
 | **RoomCoordinator** | Rendezvous-selected node maintaining an eventually consistent *derived* view of a room's RoomShards and coordinating cross-node topology. It does not own remote connections or their desired state. |
