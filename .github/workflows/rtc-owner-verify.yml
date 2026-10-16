@@ -1,0 +1,22 @@
+name: RTC owner verification
+on:
+  push:
+    branches: [refactor/rtc-ownership-boundaries]
+permissions:
+  contents: read
+jobs:
+  source:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Archive tracked source
+        run: git archive --format=tar.gz --output="$RUNNER_TEMP/rtc-source.tar.gz" HEAD
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rtc-source
+          path: ${{ runner.temp }}/rtc-source.tar.gz
+          retention-days: 3
+          if-no-files-found: error
