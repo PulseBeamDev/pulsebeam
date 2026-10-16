@@ -21,7 +21,7 @@ jobs:
     timeout-minutes: 120
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-ci
       - name: Sweep and retain replay commands
         shell: bash
@@ -34,7 +34,7 @@ jobs:
           fi
           ./bazel run //:sweep -- --seeds "$seeds" --from-seed "$from" 2>&1 | tee seed-sweep.log
       - if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: seed-sweep-evidence
           path: seed-sweep.log
