@@ -16,9 +16,10 @@ jobs:
         run: |
           set -euo pipefail
           rustup toolchain install 1.99.0 --profile minimal
-          cargo +1.99.0 fetch --manifest-path crates/pulsebeam-rtc/simulation/Cargo.toml --locked --target x86_64-unknown-linux-gnu
+          cargo +1.99.0 fetch --manifest-path crates/pulsebeam-rtc/simulation/Cargo.toml --target x86_64-unknown-linux-gnu
           mkdir -p "$RUNNER_TEMP/rtc-native/cargo" "$RUNNER_TEMP/rtc-native/artifact"
           cp -a "$HOME/.cargo/registry" "$HOME/.cargo/git" "$RUNNER_TEMP/rtc-native/cargo/"
+          cp crates/pulsebeam-rtc/simulation/Cargo.lock "$RUNNER_TEMP/rtc-native/native-Cargo.lock"
           curl --fail --location --retry 3 https://github.com/PulseBeamDev/pulsebeam-libwebrtc-sys/releases/download/v0.6.2/webrtc-core-linux-x86_64.tar.gz -o "$RUNNER_TEMP/native.tar.gz"
           tar -C "$RUNNER_TEMP/rtc-native/artifact" -xf "$RUNNER_TEMP/native.tar.gz"
           tar -C "$RUNNER_TEMP/rtc-native" -czf "$RUNNER_TEMP/rtc-native.tar.gz" .
