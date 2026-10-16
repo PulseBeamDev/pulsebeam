@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use crate::{
     control::controller::ConnectionProfile,
-    control::room::Room,
+    control::room::RoomShard,
     entity::{ConnectionId, ParticipantExternalId, ParticipantId, RoomId},
     id::ShardId,
     route::NodeTransportAddress,
@@ -30,7 +30,7 @@ pub struct ParticipantMeta {
 }
 
 pub struct RoomRegistry {
-    rooms: HashMap<RoomId, Room>,
+    rooms: HashMap<RoomId, RoomShard>,
     participants: HashMap<ParticipantId, ParticipantMeta>,
 }
 
@@ -42,7 +42,7 @@ impl RoomRegistry {
         }
     }
 
-    pub fn get_room(&self, room_id: &RoomId) -> Option<&Room> {
+    pub fn get_room(&self, room_id: &RoomId) -> Option<&RoomShard> {
         self.rooms.get(room_id)
     }
 
@@ -69,7 +69,7 @@ impl RoomRegistry {
         ) {
             self.remove_from_room(&previous.room_id, &participant_id, previous.shard_id);
         }
-        let room = self.rooms.entry(room_id).or_insert_with(Room::new);
+        let room = self.rooms.entry(room_id).or_insert_with(RoomShard::new);
         let partition_index = room.next_partition_index(
             &participant_id,
             1, // Test helper accepts arbitrary execution-shard placement.
@@ -85,7 +85,7 @@ impl RoomRegistry {
         self.rooms
             .get(room_id)
             .into_iter()
-            .flat_map(Room::participant_ids)
+            .flat_map(RoomShard::participant_ids)
             .copied()
             .collect()
     }
@@ -140,7 +140,7 @@ impl RoomRegistry {
         }
         self.rooms
             .entry(room_id)
-            .or_insert_with(Room::new)
+            .or_insert_with(RoomShard::new)
             .add_participant(&participant_id, shard_id, partition_index);
         Ok(previous)
     }
