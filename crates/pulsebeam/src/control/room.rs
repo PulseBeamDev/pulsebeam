@@ -37,6 +37,10 @@ impl Room {
             .unwrap_or(self.partitions.len())
     }
 
+    #[allow(
+        clippy::expect_used,
+        reason = "a controller-selected partition index must exist or be the next index"
+    )]
     pub fn add_participant(
         &mut self,
         participant_id: &ParticipantId,
@@ -69,10 +73,14 @@ impl Room {
             partition.shard_id, shard_id,
             "a live room partition cannot change execution shard"
         );
-        partition.participants += 1;
+        partition.participants = partition.participants.saturating_add(1);
         self.participants.insert(*participant_id, partition_index);
     }
 
+    #[allow(
+        clippy::expect_used,
+        reason = "every admitted participant has a live local partition"
+    )]
     pub fn remove_participant(&mut self, participant_id: &ParticipantId, shard_id: ShardId) {
         if let Some(index) = self.participants.swap_remove(participant_id) {
             let partition = self
@@ -80,7 +88,8 @@ impl Room {
                 .get_mut(index)
                 .expect("a participant must reference a known partition");
             debug_assert_eq!(partition.shard_id, shard_id);
-            partition.participants -= 1;
+            debug_assert!(partition.participants > 0);
+            partition.participants = partition.participants.saturating_sub(1);
         }
     }
 
