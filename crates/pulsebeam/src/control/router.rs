@@ -3,7 +3,7 @@ use pulsebeam_runtime::mailbox::{self};
 use pulsebeam_runtime::rand::RngCore;
 use std::hash::{BuildHasher, Hash, Hasher};
 
-use crate::{id::ShardId, shard::ShardContext, shard::worker::ShardCommand};
+use crate::{entity::RoomId, id::ShardId, shard::ShardContext, shard::worker::ShardCommand};
 
 #[cfg(test)]
 const MAX_LOAD: f64 = 0.8;
@@ -135,6 +135,10 @@ impl ShardRouter {
         best_index
     }
 
+    pub fn stable_room_slot(&self, room_id: &RoomId, slot: usize) -> Option<ShardId> {
+        self.stable_route(&(room_id, slot))
+    }
+
     fn hash_for<K: Hash>(&self, key: &K, index: usize) -> u64 {
         let mut hasher = self.hasher_config.build_hasher();
         key.hash(&mut hasher);
@@ -248,6 +252,30 @@ mod tests {
             router.try_route(&room_key).is_none(),
             "Router should signal busy state when no healthy cores remain"
         );
+    }
+
+    #[test]
+    fn stable_room_slot_keeps_locality_and_spreads_room_slots() {
+        let mut router = setup_test_router(8);
+        let room_id = RoomId::from_external(
+            &crate::entity::RoomExternalId::new("room-spill").unwrap(),
+        );
+        let primary = router.stable_room_slot(&room_id, 0).unwrap();
+
+        assert_eq!(router.stable_room_slot(&room_id, 0), Some(primary));
+
+        let mut visited = vec![false; router.shard_count()];
+        for slot in 0..32 {
+            let shard = router.stable_room_slot(&room_id, slot).unwrap();
+            visited[shard.index()] = true;
+        }
+        assert!(
+            visited.iter().filter(|&&used| used).count() > 1,
+            "different slots of one room must be able to occupy different shards"
+        );
+
+        router.shard_loads[primary.index()] = 1.0;
+        assert_eq!(router.stable_room_slot(&room_id, 0), Some(primary));
     }
 
     #[test]
