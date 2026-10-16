@@ -869,7 +869,7 @@ impl ControllerActor {
         let participants: Vec<_> = self
             .core
             .registry
-            .participant_ids_in_room(&room_id)
+            .local_participant_ids_in_room(&room_id)
             .into_iter()
             .filter(|participant| Some(*participant) != added && Some(*participant) != removed)
             .collect();
@@ -1112,7 +1112,7 @@ impl ControllerActor {
             let participants = self
                 .core
                 .registry
-                .participant_ids_in_room(&room_id)
+                .local_participant_ids_in_room(&room_id)
                 .into_iter()
                 .filter(|participant| *participant != participant_id)
                 .map(|id| self.room_peer(id))
