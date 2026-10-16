@@ -6,37 +6,25 @@ on:
 permissions:
   contents: read
 jobs:
-  source:
+  native:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
         with:
           persist-credentials: false
-      - name: Archive tracked source only
-        run: git archive --format=tar HEAD -o "$RUNNER_TEMP/pulsebeam-source.tar"
-      - uses: actions/upload-artifact@v4
-        with:
-          name: rtc-review-source
-          path: ${{ runner.temp }}/pulsebeam-source.tar
-          retention-days: 1
-  rust:
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v5
-        with:
-          persist-credentials: false
-      - name: Provision locked compiler and dependency sources
+      - name: Provision pinned native dependency sources and released artifact
         run: |
           set -euo pipefail
-          rustup toolchain install 1.99.0 --profile minimal --component rustfmt,clippy
-          cargo +1.99.0 fetch --locked --target x86_64-unknown-linux-gnu
-          mkdir -p "$RUNNER_TEMP/rtc-offline/cargo"
-          cp -a "$HOME/.rustup/toolchains/1.99.0-x86_64-unknown-linux-gnu" "$RUNNER_TEMP/rtc-offline/toolchain"
-          cp -a "$HOME/.cargo/registry" "$HOME/.cargo/git" "$RUNNER_TEMP/rtc-offline/cargo/"
-          tar -C "$RUNNER_TEMP/rtc-offline" -czf "$RUNNER_TEMP/rtc-offline.tar.gz" .
+          rustup toolchain install 1.99.0 --profile minimal
+          cargo +1.99.0 fetch --manifest-path crates/pulsebeam-rtc/simulation/Cargo.toml --locked --target x86_64-unknown-linux-gnu
+          mkdir -p "$RUNNER_TEMP/rtc-native/cargo" "$RUNNER_TEMP/rtc-native/artifact"
+          cp -a "$HOME/.cargo/registry" "$HOME/.cargo/git" "$RUNNER_TEMP/rtc-native/cargo/"
+          curl --fail --location --retry 3 https://github.com/PulseBeamDev/pulsebeam-libwebrtc-sys/releases/download/v0.6.2/webrtc-core-linux-x86_64.tar.gz -o "$RUNNER_TEMP/native.tar.gz"
+          tar -C "$RUNNER_TEMP/rtc-native/artifact" -xf "$RUNNER_TEMP/native.tar.gz"
+          tar -C "$RUNNER_TEMP/rtc-native" -czf "$RUNNER_TEMP/rtc-native.tar.gz" .
       - uses: actions/upload-artifact@v4
         with:
-          name: rtc-review-rust
-          path: ${{ runner.temp }}/rtc-offline.tar.gz
+          name: rtc-review-native
+          path: ${{ runner.temp }}/rtc-native.tar.gz
           compression-level: 0
           retention-days: 1
