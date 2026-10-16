@@ -9,7 +9,7 @@ use crate::control::steering::Steering;
 use crate::track::{SelectionPolicy, TrackSelector};
 use crate::{
     control::{
-        core::{ControllerCore, RoomPlacement},
+        core::{ControllerCore, RoomPartitionPlacement},
         lifecycle::{TrackLifecycle, TrackLifecycleOperation, TrackLifecycleOutcome},
         negotiator::{Negotiator, NegotiatorError},
         tcp_acceptor::{PendingTcpConn, TcpAcceptor},
@@ -182,6 +182,7 @@ const SHARD_UPDATE_EGRESS_BUDGET: usize = 64;
 
 struct PendingMaterialization {
     shard: ShardId,
+    partition_index: usize,
     command: Option<ShardCommand>,
     ack: Option<oneshot::Receiver<bool>>,
     participant: ParticipantId,
@@ -242,8 +243,8 @@ impl ControllerActor {
         shard_contexts: Vec<ShardContext>,
         candidates: Vec<Candidate>,
         tcp_listener: pulsebeam_core::net::TcpListener,
-        room_shard_slot: usize,
-        placement: RoomPlacement,
+        room_partition_size: usize,
+        placement: RoomPartitionPlacement,
         updates: Vec<crate::shard_update::ShardUpdateWriter>,
     ) -> Self {
         let shard_count = shard_contexts.len();
@@ -251,7 +252,7 @@ impl ControllerActor {
         let (renewal_tx, renewal_rx) = tokio::sync::mpsc::channel(MAX_PENDING_RENEWALS);
         Self {
             router: crate::control::router::ShardRouter::new(shard_contexts),
-            core: ControllerCore::with_shards(shard_count, room_shard_slot, placement),
+            core: ControllerCore::with_shards(shard_count, room_partition_size, placement),
             negotiator: Negotiator::new(candidates),
             tcp_listener: Some(tcp_listener),
             cluster_id: 0,
@@ -1028,13 +1029,15 @@ impl ControllerActor {
         offer: SdpOffer,
     ) -> Result<PendingMaterialization, ControllerError> {
         let participant_id = state.participant_id;
-        let (slot, placement) = self.core.room_slot(&state.room_id);
+        let (slot, placement) = self
+            .core
+            .next_room_partition(&state.room_id, &state.participant_id);
         let shard = match placement {
-            RoomPlacement::Hashed => self
+            RoomPartitionPlacement::Hashed => self
                 .router
-                .stable_room_slot(&state.room_id, slot)
+                .stable_room_partition(&state.room_id, slot)
                 .ok_or(ControllerError::ServiceUnavailable)?,
-            RoomPlacement::RoundRobin => {
+            RoomPartitionPlacement::RoundRobin => {
                 let shard_count = self.router.shard_count();
                 debug_assert_ne!(shard_count, 0);
                 ShardId::new(
@@ -1063,6 +1066,7 @@ impl ControllerActor {
         let (ack_tx, ack_rx) = oneshot::channel();
         Ok(PendingMaterialization {
             shard,
+            partition_index: slot,
             command: Some(ShardCommand::MaterializeParticipant {
                 transport: address,
                 config: Box::new(config),
@@ -1091,6 +1095,7 @@ impl ControllerActor {
             participant_id,
             room_id,
             pending.shard,
+            pending.partition_index,
             pending.transport,
             pending.connection_id,
             pending.authorization,
@@ -1148,6 +1153,7 @@ impl ControllerActor {
         participant_id: ParticipantId,
         room_id: RoomId,
         shard: ShardId,
+        partition_index: usize,
         transport: crate::route::NodeTransportAddress,
         connection_id: ConnectionId,
         authorization: Option<AuthorizationLease>,
@@ -1158,6 +1164,11 @@ impl ControllerActor {
         if authorization.is_some_and(|lease| lease.is_expired_at(wall_now)) {
             return Err(ControllerError::AuthorizationExpired);
         }
+        // A timeout can remove the last participant while materialization is
+        // in flight. Never commit a prepared connection to a retired slot.
+        if self.core.next_room_partition(&room_id, &participant_id).0 != partition_index {
+            return Err(ControllerError::ServiceUnavailable);
+        }
         let previous = self
             .core
             .registry
@@ -1165,6 +1176,7 @@ impl ControllerActor {
                 participant_id,
                 room_id,
                 shard,
+                partition_index,
                 transport,
                 connection_id,
                 profile,
@@ -1362,7 +1374,7 @@ mod replacement_tests {
         let (update, _update_rx) = new_shard_update(ShardId::new(0));
         ControllerActor {
             router: crate::control::router::ShardRouter::new(vec![context]),
-            core: ControllerCore::with_shards(1, 1, RoomPlacement::Hashed),
+            core: ControllerCore::with_shards(1, 1, RoomPartitionPlacement::Hashed),
             negotiator: Negotiator::new(Vec::new()),
             tcp_listener: None,
             cluster_id: 0,
@@ -1413,6 +1425,7 @@ mod replacement_tests {
             participant_id,
             room_id,
             ShardId::new(0),
+            0,
             transport,
             connection_id(1),
             Some(lease),
@@ -1445,6 +1458,7 @@ mod replacement_tests {
                 participant_id,
                 room_id,
                 ShardId::new(0),
+                0,
                 transport,
                 connection_id(1),
                 Some(lease),
@@ -1493,6 +1507,7 @@ mod replacement_tests {
                 participant_id,
                 room_id,
                 ShardId::new(0),
+                0,
                 transport,
                 connection,
                 Some(old_lease),
@@ -1613,6 +1628,7 @@ mod replacement_tests {
                 participant,
                 room_id,
                 ShardId::new(0),
+                0,
                 transport,
                 connection,
                 Some(previous),
@@ -1691,6 +1707,7 @@ mod replacement_tests {
                 participant_id,
                 room_id,
                 ShardId::new(0),
+                0,
                 old_transport,
                 old_id,
                 Some(old_lease),
@@ -1707,6 +1724,7 @@ mod replacement_tests {
                 participant_id,
                 room_id,
                 ShardId::new(0),
+                0,
                 current_transport,
                 current_id,
                 Some(current_lease),
@@ -1751,6 +1769,7 @@ mod replacement_tests {
                     participant_id,
                     room_id,
                     ShardId::new(0),
+                    0,
                     transport,
                     connection_id(sequence),
                     Some(lease),
@@ -1794,6 +1813,7 @@ mod replacement_tests {
                 participant_id,
                 room_id,
                 ShardId::new(0),
+                0,
                 old_transport,
                 old,
                 ConnectionProfile::Native,
@@ -1807,6 +1827,7 @@ mod replacement_tests {
                 participant_id,
                 room_id,
                 ShardId::new(0),
+                0,
                 current_transport,
                 current,
                 ConnectionProfile::Native,
@@ -1819,6 +1840,7 @@ mod replacement_tests {
                 participant_id,
                 room_id,
                 ShardId::new(0),
+                0,
                 old_transport,
                 old,
                 ConnectionProfile::Native,
