@@ -1032,7 +1032,7 @@ impl ControllerActor {
         let shard = match placement {
             RoomPlacement::Hashed => self
                 .router
-                .stable_route(&state.room_id)
+                .stable_room_slot(&state.room_id, slot)
                 .ok_or(ControllerError::ServiceUnavailable)?,
             RoomPlacement::RoundRobin => {
                 let shard_count = self.router.shard_count();
