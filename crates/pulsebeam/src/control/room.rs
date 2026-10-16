@@ -8,14 +8,14 @@ struct RoomPartition {
     participants: usize,
 }
 
-/// Node-local portion of a room. Its partitions are placement groups on
-/// execution shards; the cluster-wide RoomShard is a different ownership level.
-pub struct Room {
+/// Node-owned portion of a logical room. Its partitions are placement
+/// groups on local execution shards. Cluster synchronization is separate.
+pub struct RoomShard {
     participants: IndexMap<ParticipantId, usize>,
     partitions: Vec<RoomPartition>,
 }
 
-impl Room {
+impl RoomShard {
     pub fn new() -> Self {
         Self {
             participants: IndexMap::new(),
@@ -108,7 +108,7 @@ mod tests {
 
     #[test]
     fn partition_capacity_survives_departures_and_reconnects() {
-        let mut room = Room::new();
+        let mut room = RoomShard::new();
         let participants: Vec<_> = (0..5).map(|_| ParticipantId::new()).collect();
         for (index, participant) in participants.iter().enumerate() {
             let slot = room.next_partition_index(participant, 2);
