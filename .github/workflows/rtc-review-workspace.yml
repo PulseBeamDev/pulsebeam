@@ -1,0 +1,21 @@
+name: RTC review workspace
+on:
+  push:
+    branches: [refactor/rtc-ownership-boundaries]
+    paths: [.github/workflows/rtc-review-workspace.yml]
+permissions:
+  contents: read
+jobs:
+  source:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Archive tracked source only
+        run: git archive --format=tar HEAD -o "$RUNNER_TEMP/pulsebeam-source.tar"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rtc-review-source
+          path: ${{ runner.temp }}/pulsebeam-source.tar
+          retention-days: 1
