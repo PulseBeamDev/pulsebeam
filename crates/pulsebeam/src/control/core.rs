@@ -95,7 +95,7 @@ impl ControllerCore {
     ) -> (usize, RoomPartitionPlacement) {
         let index = self
             .registry
-            .get_room(room_id)
+            .get_room_shard(room_id)
             .map(|room| room.next_partition_index(participant_id, self.room_partition_size))
             .unwrap_or(0);
         (index, self.placement)
