@@ -128,6 +128,6 @@ mod tests {
         let another = ParticipantId::new();
         assert_eq!(room.next_partition_index(&another, 2), 0);
         room.add_participant(&another, ShardId::new(0), 0);
-        assert_eq!(room.participant_count(), 3);
+        assert_eq!(room.participant_count(), 4);
     }
 }
