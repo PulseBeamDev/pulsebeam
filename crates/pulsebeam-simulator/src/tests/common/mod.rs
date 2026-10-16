@@ -101,9 +101,9 @@ pub fn unspecified_addr(ip: IpAddr, port: u16) -> SocketAddr {
 
 /// Start an SFU node in the simulation.
 ///
-/// `shards` above one also sets `room_shard_slot(1)` and `round_robin_rooms()`.
+/// `shards` above one also sets `room_partition_size(1)` and `round_robin_rooms()`.
 /// Both halves matter: extra shards make `hash(peer_addr)` and `hash(room_id)`
-/// disagree, which is the cross-shard TCP egress case, but only the slot puts a
+/// disagree, which is the cross-shard TCP egress case, but only the local partition index puts a
 /// room's *participants* on different shards. Without it a room of fewer than
 /// sixteen is co-located and its media never leaves a core, so none of the
 /// route, envelope or reverse-lane machinery is reached.
@@ -141,7 +141,7 @@ pub async fn start_sfu_node_with(
         )
         .with_current_runtime();
     if shards > 1 {
-        builder = builder.room_shard_slot(1).round_robin_rooms();
+        builder = builder.room_partition_size(1).round_robin_rooms();
     }
     if tcp_only {
         builder = builder.tcp_only();
