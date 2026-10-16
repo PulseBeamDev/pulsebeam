@@ -135,7 +135,7 @@ impl ShardRouter {
         best_index
     }
 
-    pub fn stable_room_slot(&self, room_id: &RoomId, slot: usize) -> Option<ShardId> {
+    pub fn stable_room_partition(&self, room_id: &RoomId, slot: usize) -> Option<ShardId> {
         self.stable_route(&(room_id, slot))
     }
 
@@ -255,18 +255,18 @@ mod tests {
     }
 
     #[test]
-    fn stable_room_slot_keeps_locality_and_spreads_room_slots() {
+    fn stable_room_partition_keeps_locality_and_spreads_room_partitions() {
         let mut router = setup_test_router(8);
         let room_id = RoomId::from_external(
             &crate::entity::RoomExternalId::new("room-spill").unwrap(),
         );
-        let primary = router.stable_room_slot(&room_id, 0).unwrap();
+        let primary = router.stable_room_partition(&room_id, 0).unwrap();
 
-        assert_eq!(router.stable_room_slot(&room_id, 0), Some(primary));
+        assert_eq!(router.stable_room_partition(&room_id, 0), Some(primary));
 
         let mut visited = vec![false; router.shard_count()];
         for slot in 0..32 {
-            let shard = router.stable_room_slot(&room_id, slot).unwrap();
+            let shard = router.stable_room_partition(&room_id, slot).unwrap();
             visited[shard.index()] = true;
         }
         assert!(
@@ -275,7 +275,7 @@ mod tests {
         );
 
         router.shard_loads[primary.index()] = 1.0;
-        assert_eq!(router.stable_room_slot(&room_id, 0), Some(primary));
+        assert_eq!(router.stable_room_partition(&room_id, 0), Some(primary));
     }
 
     #[test]
