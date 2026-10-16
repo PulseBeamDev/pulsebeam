@@ -70,7 +70,11 @@ impl RoomRegistry {
             self.remove_from_room(&previous.room_id, &participant_id, previous.shard_id);
         }
         let room = self.rooms.entry(room_id).or_insert_with(Room::new);
-        room.add_participant(&participant_id, shard_id);
+        let partition_index = room.next_partition_index(
+            &participant_id,
+            super::core::DEFAULT_ROOM_PARTITION_SIZE,
+        );
+        room.add_participant(&participant_id, shard_id, partition_index);
     }
 
     pub fn get_participant(&self, participant_id: &ParticipantId) -> Option<&ParticipantMeta> {
@@ -98,6 +102,7 @@ impl RoomRegistry {
         participant_id: ParticipantId,
         room_id: RoomId,
         shard_id: ShardId,
+        partition_index: usize,
         transport: NodeTransportAddress,
         connection_id: ConnectionId,
         profile: ConnectionProfile,
@@ -123,12 +128,20 @@ impl RoomRegistry {
             },
         );
         if let Some(previous) = &previous {
-            self.remove_from_room(&previous.room_id, &participant_id, previous.shard_id);
+            if previous.room_id == room_id {
+                // Keep the partition table alive across a same-room replacement,
+                // even when this was its only participant.
+                if let Some(room) = self.rooms.get_mut(&room_id) {
+                    room.remove_participant(&participant_id, previous.shard_id);
+                }
+            } else {
+                self.remove_from_room(&previous.room_id, &participant_id, previous.shard_id);
+            }
         }
         self.rooms
             .entry(room_id)
             .or_insert_with(Room::new)
-            .add_participant(&participant_id, shard_id);
+            .add_participant(&participant_id, shard_id, partition_index);
         Ok(previous)
     }
 
@@ -355,6 +368,7 @@ mod tests {
             participant,
             room,
             ShardId::new(0),
+            0,
             transport(0, 1),
             current,
             ConnectionProfile::Native,
@@ -380,6 +394,7 @@ mod tests {
             participant,
             room,
             ShardId::new(0),
+            0,
             transport(0, 1),
             current,
             ConnectionProfile::Native,
@@ -407,6 +422,7 @@ mod tests {
             participant,
             room,
             ShardId::new(0),
+            0,
             transport(0, 2),
             newer,
             ConnectionProfile::Native,
@@ -418,6 +434,7 @@ mod tests {
                 participant,
                 room,
                 ShardId::new(0),
+                0,
                 transport(0, 1),
                 older,
                 ConnectionProfile::Native,
@@ -443,6 +460,7 @@ mod tests {
             participant,
             room,
             ShardId::new(0),
+            0,
             transport(0, 1),
             old,
             ConnectionProfile::Native,
@@ -453,6 +471,7 @@ mod tests {
             participant,
             room,
             ShardId::new(0),
+            0,
             transport(0, 2),
             current,
             ConnectionProfile::Native,
@@ -482,6 +501,7 @@ mod tests {
                 participant,
                 room,
                 ShardId::new(0),
+                0,
                 transport(0, 1),
                 connection_id(1),
                 ConnectionProfile::Native,
