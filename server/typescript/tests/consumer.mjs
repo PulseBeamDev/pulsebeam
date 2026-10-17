@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createPublicKey, verify } from "node:crypto";
 import {
   cpSync,
   mkdirSync,
@@ -8,7 +9,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { pathToFileURL } from "node:url";
 import { inspect } from "node:util";
 import ts from "typescript";
 
@@ -22,27 +23,18 @@ const directory = mkdtempSync(
 const installed = join(directory, "node_modules/@pulsebeam/server");
 mkdirSync(installed, { recursive: true });
 cpSync(artifact, installed, { recursive: true, dereference: true });
-// Install the sole runtime dependency from the frozen package supplied by Bazel.
-const codec = fileURLToPath(new URL(".", import.meta.resolve("@scure/base")));
-const installedCodec = join(directory, "node_modules/@scure/base");
-mkdirSync(installedCodec, { recursive: true });
-cpSync(codec, installedCodec, { recursive: true, dereference: true });
 writeFileSync(join(directory, "package.json"), '{"type":"module"}');
 writeFileSync(
   join(directory, "consumer.mjs"),
-  'export { signParticipantToken, INSECURE_DEV_CREDENTIALS, INSECURE_DEV_API_KEY } from "@pulsebeam/server";',
+  'export { signParticipantToken, INSECURE_DEV_API_KEY } from "@pulsebeam/server";',
 );
-const { signParticipantToken, INSECURE_DEV_CREDENTIALS, INSECURE_DEV_API_KEY } =
-  await import(pathToFileURL(join(directory, "consumer.mjs")));
+const { signParticipantToken, INSECURE_DEV_API_KEY } = await import(
+  pathToFileURL(join(directory, "consumer.mjs"))
+);
 const development = JSON.parse(readFileSync(developmentFixture));
-assert.deepEqual(INSECURE_DEV_CREDENTIALS, {
-  projectId: development.projectId,
-  keyId: development.keyId,
-  secret: development.secret,
-});
 assert.equal(INSECURE_DEV_API_KEY, development.apiKey);
 const devToken = signParticipantToken({
-  ...INSECURE_DEV_CREDENTIALS,
+  apiKey: INSECURE_DEV_API_KEY,
   room: "local",
   participant: "test",
   expiration: 2000000000,
@@ -51,21 +43,28 @@ assert.equal(
   JSON.parse(Buffer.from(devToken.split(".")[1], "base64url")).iss,
   development.projectId,
 );
-assert.equal(
-  signParticipantToken({
-    apiKey: INSECURE_DEV_API_KEY,
-    room: "local",
-    participant: "test",
-    expiration: 2000000000,
-  }),
-  devToken,
+
+const publicKey = createPublicKey({
+  key: Buffer.from(development.publicKey, "base64url"),
+  format: "der",
+  type: "spki",
+});
+assert.equal(publicKey.asymmetricKeyType, "ed25519");
+const devParts = devToken.split(".");
+assert(
+  verify(
+    null,
+    Buffer.from(devParts.slice(0, 2).join(".")),
+    publicKey,
+    Buffer.from(devParts[2], "base64url"),
+  ),
 );
 
 const document = JSON.parse(readFileSync(fixtures));
+const fixtureApiKey =
+  "p_0067MYZ1001R010000000000064.kid_0067MYZ1005R030010000000068.MC4CAQAwBQYDK2VwBCIEIEzNCJso_5banbbDRuwRTg9bijGfNaumJNqM9u1PuKb7";
 const adapt = (i) => ({
-  projectId: i.project_id,
-  keyId: i.key_id,
-  secret: i.secret,
+  apiKey: fixtureApiKey,
   room: i.room,
   participant: i.participant,
   expiration: BigInt(i.expiration),
@@ -73,17 +72,6 @@ const adapt = (i) => ({
 for (const v of document.valid) {
   const token = signParticipantToken(adapt(v.input));
   assert.equal(token, v.token, v.name);
-  assert.equal(
-    signParticipantToken({
-      apiKey:
-        "key_0067MYZ1001R0100000000000640RYKVW400Q00C00400000000S4SK88KCMFZ5PTKPVC6HQC2570YPWA66FKBAX64KD8SXQD9YWADYR",
-      room: v.input.room,
-      participant: v.input.participant,
-      expiration: BigInt(v.input.expiration),
-    }),
-    v.token,
-    v.name + " V0 API key",
-  );
   const [header, claims, signature] = token.split(".");
   assert.equal(Buffer.from(header, "base64url").toString(), v.header);
   assert.equal(Buffer.from(claims, "base64url").toString(), v.claims);
@@ -99,51 +87,60 @@ for (const v of document.valid) {
     );
   }
 }
-const fields = {
-  project_id: "projectId",
-  key_id: "keyId",
-  secret: "secret",
-  room: "room",
-  participant: "participant",
-  expiration: "expiration",
-};
 for (const v of document.invalid) {
+  // Only expiration must be validated locally; the SFU validates IDs.
+  if (v.field !== "expiration") continue;
   const input = adapt(document.base);
-  const field = fields[v.field];
-  assert(field, v.name);
-  if (v.value === null) delete input[field];
+  if (v.value === null) delete input[v.field];
   else if (v.representation === "number") {
-    input[field] =
+    input[v.field] =
       v.name === "expiration-overflow" ? BigInt(v.value) : Number(v.value);
-  } else input[field] = v.value;
+  } else input[v.field] = v.value;
   assert.throws(
     () => signParticipantToken(input),
     (error) => {
       const diagnostic = `${error}\n${inspect(error)}`;
-      if (typeof input.secret === "string" && input.secret)
-        assert(!diagnostic.includes(input.secret), v.name);
+      assert(!diagnostic.includes(fixtureApiKey), v.name);
       assert(!diagnostic.includes("4ccd089b28ff96da"));
       return true;
     },
     v.name,
   );
 }
-assert(!inspect(signParticipantToken).includes(document.base.secret));
+
+// Identity strings are copied without parsing or reconstructing PulseBeam IDs.
+const arbitraryKey = INSECURE_DEV_API_KEY.split(".");
+arbitraryKey[0] = "unrecognized-issuer";
+arbitraryKey[1] = "unrecognized-kid";
+const opaqueToken = signParticipantToken({
+  apiKey: arbitraryKey.join("."),
+  room: "room with spaces",
+  participant: "participant/with/slashes",
+  expiration: 2000,
+});
+const opaqueHeader = JSON.parse(
+  Buffer.from(opaqueToken.split(".")[0], "base64url"),
+);
+const opaqueClaims = JSON.parse(
+  Buffer.from(opaqueToken.split(".")[1], "base64url"),
+);
+assert.equal(opaqueHeader.kid, arbitraryKey[1]);
+assert.equal(opaqueClaims.iss, arbitraryKey[0]);
+assert.equal(opaqueClaims.room, "room with spaces");
+assert.equal(opaqueClaims.sub, "participant/with/slashes");
 
 // Resolve declarations through the installed package's public export map.
 writeFileSync(
   join(directory, "consumer.ts"),
-  `import { signParticipantToken, INSECURE_DEV_CREDENTIALS, INSECURE_DEV_API_KEY } from "@pulsebeam/server";
-const devKey: string = INSECURE_DEV_CREDENTIALS.secret;
+  `import { signParticipantToken, INSECURE_DEV_API_KEY } from "@pulsebeam/server";
 const compactKey: string = INSECURE_DEV_API_KEY;
-const input = {projectId:"p", keyId:"k", secret:"s", room:"r", participant:"p", expiration:18446744073709551615n};
+const input = {apiKey:compactKey, room:"r", participant:"p", expiration:18446744073709551615n};
 const token: string = signParticipantToken(input);
-signParticipantToken({apiKey:compactKey, room:"r", participant:"p", expiration:2000});
-// @ts-expect-error cannot mix single API key with legacy credential fields
-signParticipantToken({...input, apiKey:compactKey});
 signParticipantToken({...input, expiration: 2000});
+// @ts-expect-error cannot use legacy credential fields
+signParticipantToken({projectId:"p", keyId:"k", secret:"s", room:"r", participant:"p", expiration:2000});
 // @ts-expect-error expiration is mandatory
-signParticipantToken({projectId:"p", keyId:"k", secret:"s", room:"r", participant:"p"});
+signParticipantToken({apiKey:compactKey, room:"r", participant:"p"});
 // @ts-expect-error strings are not integer representations in the public API
 signParticipantToken({...input, expiration:"2000"});
 // @ts-expect-error booleans are not integer representations
@@ -170,10 +167,10 @@ assert.equal(
 );
 
 for (const invalid of [
-  "key_1" + INSECURE_DEV_API_KEY.slice(5),
+  INSECURE_DEV_API_KEY.replace(".MC4CAQ", ".invalid"),
   INSECURE_DEV_API_KEY.slice(0, -1),
-  INSECURE_DEV_API_KEY.slice(0, -1) + "1",
-  "sk_0" + INSECURE_DEV_API_KEY.slice(5),
+  INSECURE_DEV_API_KEY + ".extra",
+  INSECURE_DEV_API_KEY.replace(".MC4CAQ", ".MCowBQ"),
 ]) {
   assert.throws(
     () =>

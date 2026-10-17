@@ -2,6 +2,7 @@ package pulsebeam_test
 
 import (
 	"crypto/ed25519"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -19,10 +20,9 @@ import (
 	pulsebeam "github.com/PulseBeamDev/pulsebeam/server/go"
 )
 
+const fixtureAPIKey = "p_0067MYZ1001R010000000000064.kid_0067MYZ1005R030010000000068.MC4CAQAwBQYDK2VwBCIEIEzNCJso_5banbbDRuwRTg9bijGfNaumJNqM9u1PuKb7"
+
 type input struct {
-	Project     string `json:"project_id"`
-	Key         string `json:"key_id"`
-	Secret      string `json:"secret"`
 	Room        string `json:"room"`
 	Participant string `json:"participant"`
 	Expiration  string `json:"expiration"`
@@ -76,15 +76,9 @@ func TestConformance(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			got, err := pulsebeam.SignParticipantToken(v.Input.Project, v.Input.Key, v.Input.Secret, v.Input.Room, v.Input.Participant, exp)
+			got, err := pulsebeam.SignParticipantToken(fixtureAPIKey, v.Input.Room, v.Input.Participant, exp)
 			if err != nil || got != v.Token {
 				t.Fatalf("token mismatch: %v", err)
-			}
-			viaKey, keyErr := pulsebeam.SignParticipantTokenWithAPIKey(
-				"key_0067MYZ1001R0100000000000640RYKVW400Q00C00400000000S4SK88KCMFZ5PTKPVC6HQC2570YPWA66FKBAX64KD8SXQD9YWADYR", v.Input.Room, v.Input.Participant, exp,
-			)
-			if keyErr != nil || viaKey != got {
-				t.Fatalf("API key V0 mismatch: %v", keyErr)
 			}
 			parts := strings.Split(got, ".")
 			for i, expected := range []string{v.Header, v.Claims} {
@@ -109,8 +103,7 @@ func TestConformance(t *testing.T) {
 	}
 }
 
-// Build the compiler contract from the actual public function's runtime type.
-// Values not representable by this typed API must fail before signing is possible.
+// Check the compiler contract using the actual public function signature.
 func rejectsTypedCall(t *testing.T, r rejection) {
 	t.Helper()
 	functionType := reflect.TypeOf(pulsebeam.SignParticipantToken)
@@ -124,14 +117,13 @@ func rejectsTypedCall(t *testing.T, r rejection) {
 	}
 	pkg := types.NewPackage("consumer", "consumer")
 	pkg.Scope().Insert(types.NewFunc(token.NoPos, pkg, "Sign", types.NewSignatureType(nil, nil, nil, types.NewTuple(params...), types.NewTuple(), false)))
-	args := []string{`"project"`, `"key"`, `"secret"`, `"room"`, `"participant"`, "uint64(2000)"}
-	index := map[string]int{"project_id": 0, "key_id": 1, "secret": 2, "room": 3, "participant": 4, "expiration": 5}[r.Field]
+	args := []string{`"key"`, `"room"`, `"participant"`, "uint64(2000)"}
+	index := map[string]int{"room": 1, "participant": 2, "expiration": 3}[r.Field]
 	if r.Value == nil {
 		args = append(args[:index], args[index+1:]...)
 	} else if r.Representation == "string" {
 		args[index] = strconv.Quote(r.Value.(string))
 	} else if r.Representation == "number" {
-		// Native float64 is deliberately not implicitly assignable to uint64.
 		value := r.Value.(string)
 		if value == "NaN" || value == "Infinity" {
 			value = "0"
@@ -156,42 +148,39 @@ func rejectsTypedCall(t *testing.T, r rejection) {
 }
 
 func TestInvalidInputsAndDiagnostics(t *testing.T) {
-	base, _, invalid := fixture(t)
+	_, _, invalid := fixture(t)
 	for _, r := range invalid {
-		t.Run(r.Name, func(t *testing.T) {
-			value, isString := r.Value.(string)
-			if !isString || r.Field == "expiration" {
-				rejectsTypedCall(t, r)
-				return
-			}
-			in := base
-			switch r.Field {
-			case "project_id":
-				in.Project = value
-			case "key_id":
-				in.Key = value
-			case "secret":
-				in.Secret = value
-			case "room":
-				in.Room = value
-			case "participant":
-				in.Participant = value
-			default:
-				t.Fatal("unhandled field")
-			}
-			token, err := pulsebeam.SignParticipantToken(in.Project, in.Key, in.Secret, in.Room, in.Participant, 2000)
-			if err == nil || token != "" {
-				t.Fatal("invalid input accepted")
-			}
-			diagnostic := fmt.Sprintf("%v %#v", err, err)
-			if (in.Secret != "" && strings.Contains(diagnostic, in.Secret)) || strings.Contains(diagnostic, "4ccd089b28ff96da") {
-				t.Fatal("secret disclosed")
-			}
-		})
+		// Expiration is the only public signing input checked by Go's type system.
+		if r.Field != "expiration" {
+			continue
+		}
+		t.Run(r.Name, func(t *testing.T) { rejectsTypedCall(t, r) })
 	}
 }
 
-func TestEmbeddedDevelopmentCredentials(t *testing.T) {
+func TestOpaqueIdentityStrings(t *testing.T) {
+	parts := strings.Split(pulsebeam.InsecureDevAPIKey(), ".")
+	parts[0], parts[1] = "unknown-issuer", "unknown-key"
+	token, err := pulsebeam.SignParticipantToken(strings.Join(parts, "."), "room with spaces", "participant/with/slashes", 2000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded := strings.Split(token, ".")
+	header, err := base64.RawURLEncoding.DecodeString(encoded[0])
+	if err != nil { t.Fatal(err) }
+	claims, err := base64.RawURLEncoding.DecodeString(encoded[1])
+	if err != nil { t.Fatal(err) }
+	var h struct { Kid string `json:"kid"` }
+	var c struct { Iss string `json:"iss"`; Room string `json:"room"`; Sub string `json:"sub"` }
+	if json.Unmarshal(header, &h) != nil || json.Unmarshal(claims, &c) != nil {
+		t.Fatal("invalid signed JWT")
+	}
+	if h.Kid != parts[1] || c.Iss != parts[0] || c.Room != "room with spaces" || c.Sub != "participant/with/slashes" {
+		t.Fatal("signer modified opaque identities")
+	}
+}
+
+func TestEmbeddedDevelopmentAPIKey(t *testing.T) {
 	path := os.Getenv("PULSEBEAM_DEVELOPMENT")
 	if path == "" {
 		path = "../auth/development.json"
@@ -200,30 +189,45 @@ func TestEmbeddedDevelopmentCredentials(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var expected pulsebeam.DevelopmentCredentials
+	var expected struct {
+		APIKey string `json:"apiKey"`
+		PublicKey string `json:"publicKey"`
+	}
 	if err := json.Unmarshal(data, &expected); err != nil {
 		t.Fatal(err)
 	}
-	actual := pulsebeam.InsecureDevCredentials()
-	if actual != expected {
-		t.Fatal("embedded credentials differ from canonical JSON")
+	actual := pulsebeam.InsecureDevAPIKey()
+	if actual != expected.APIKey {
+		t.Fatal("embedded API key differs from canonical JSON")
 	}
-	jwt, err := pulsebeam.SignParticipantToken(
-		actual.ProjectID, actual.KeyID, actual.Secret, "demo", "alice", 2000000000,
-	)
+	jwt, err := pulsebeam.SignParticipantToken(actual, "demo", "alice", 2000000000)
 	if err != nil || jwt == "" {
 		t.Fatalf("development token: %v", err)
 	}
-	compact, err := pulsebeam.SignParticipantTokenWithAPIKey(actual.APIKey, "demo", "alice", 2000000000)
-	if err != nil || compact != jwt {
-		t.Fatalf("development API key mismatch: %v", err)
+	publicDER, err := base64.RawURLEncoding.DecodeString(expected.PublicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := x509.ParsePKIXPublicKey(publicDER)
+	if err != nil {
+		t.Fatal(err)
+	}
+	publicKey, ok := parsed.(ed25519.PublicKey)
+	if !ok {
+		t.Fatal("SPKI is not an Ed25519 public key")
+	}
+	parts := strings.Split(jwt, ".")
+	signature, err := base64.RawURLEncoding.DecodeString(parts[2])
+	if err != nil || !ed25519.Verify(publicKey, []byte(parts[0]+"."+parts[1]), signature) {
+		t.Fatal("SPKI key cannot verify development JWT")
 	}
 	for _, bad := range []string{
-		"key_1" + actual.APIKey[5:],
-		actual.APIKey[:len(actual.APIKey)-1],
-		actual.APIKey[:len(actual.APIKey)-1] + "1",
+		strings.Replace(actual, ".MC4CAQ", ".invalid", 1),
+		actual[:len(actual)-1],
+		actual + ".extra",
+		strings.Replace(actual, ".", "..", 1),
 	} {
-		_, err := pulsebeam.SignParticipantTokenWithAPIKey(bad, "demo", "alice", 2000000000)
+		_, err := pulsebeam.SignParticipantToken(bad, "demo", "alice", 2000000000)
 		if err == nil {
 			t.Fatal("invalid API key accepted")
 		}

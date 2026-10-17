@@ -9,12 +9,9 @@ use pulsebeam_agent_native::agent_core::{
     TopicSubscriber, VideoSubscription,
 };
 use pulsebeam_agent_native::{Agent, AgentEvent, Config, Host, MediaFrame, SimulcastLayer};
+use pulsebeam_core::identity::{ParticipantExternalId, RoomExternalId};
 use pulsebeam_core::net::UdpSocket;
 use pulsebeam_core::net::{AsyncHttpClient, HttpError, HttpRequest, HttpResult};
-use pulsebeam_core::{
-    auth::{DEVELOPMENT_API_KEY_ID, DEVELOPMENT_API_SIGNING_KEY, DEVELOPMENT_PROJECT_ID},
-    identity::{ParticipantExternalId, RoomExternalId},
-};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
@@ -300,9 +297,7 @@ impl SimClientBuilder {
         let session = AgentConfig {
             endpoint: self.endpoint,
             token: pulsebeam_server::sign_participant_token(
-                &DEVELOPMENT_PROJECT_ID.as_str(),
-                &DEVELOPMENT_API_KEY_ID.as_str(),
-                &DEVELOPMENT_API_SIGNING_KEY.to_secret_string(),
+                &pulsebeam_server::insecure_dev_api_key().unwrap(),
                 (room).as_str(),
                 (participant).as_str(),
                 u64::MAX,

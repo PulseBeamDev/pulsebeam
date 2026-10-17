@@ -1,9 +1,9 @@
 # `pulsebeam-auth`
 
 Transport-free identity and authentication primitives shared by `pulsebeam-core`
-and the Rust server SDK. This crate owns canonical V0 ID parsing and formatting,
-external-ID validation, Ed25519 key types, private API key validation,
-secret/public-key codecs, and redaction. It depends on neither core nor an SDK.
+and the Rust server SDK. This crate owns canonical PulseBeam ID parsing and formatting,
+external-ID validation, Ed25519 PKCS#8/SPKI key types, private API key validation,
+standard key imports/exports, and redaction. It depends on neither core nor an SDK.
 
 The Rust server SDK owns participant-JWT generation and its public signing API.
 Core owns token verification, the single-project public key registry, typed entity IDs and their

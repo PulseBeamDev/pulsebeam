@@ -1578,8 +1578,8 @@ mod replacement_tests {
     #[tokio::test]
     async fn renewal_verifies_jwt_off_control_loop_and_commits_only_current_identity() {
         use pulsebeam_core::auth::{
-            DEVELOPMENT_API_KEY_ID, DEVELOPMENT_API_PUBLIC_KEY, DEVELOPMENT_API_SIGNING_KEY,
-            DEVELOPMENT_PROJECT_ID, KeyRegistryEntry,
+            DEVELOPMENT_API_KEY_ID, DEVELOPMENT_API_PUBLIC_KEY, DEVELOPMENT_PROJECT_ID,
+            KeyRegistryEntry,
         };
         let mut actor = actor();
         actor.set_key_registry(Some(
@@ -1622,9 +1622,7 @@ mod replacement_tests {
             )
             .unwrap();
         let token = pulsebeam_server::sign_participant_token(
-            &DEVELOPMENT_PROJECT_ID.as_str(),
-            &DEVELOPMENT_API_KEY_ID.as_str(),
-            &DEVELOPMENT_API_SIGNING_KEY.to_secret_string(),
+            &pulsebeam_server::insecure_dev_api_key().unwrap(),
             (room).as_str(),
             (external).as_str(),
             unix_now + 120,

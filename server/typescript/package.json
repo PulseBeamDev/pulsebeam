@@ -1,6 +1,6 @@
 {
   "name": "@pulsebeam/server",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Native server-side PulseBeam participant token signing",
   "license": "Apache-2.0",
   "publishConfig": {
@@ -29,9 +29,6 @@
   "scripts": {
     "build": "../../bazel build //server/typescript:package",
     "test": "../../bazel test //server/typescript:fast"
-  },
-  "dependencies": {
-    "@scure/base": "2.4.0"
   },
   "devDependencies": {
     "@types/node": "22.14.0",

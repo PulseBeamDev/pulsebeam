@@ -22,17 +22,22 @@ These keys are publicly known: **never use them for production or an exposed ser
 ## Server API keys
 
 Applications pass one opaque API key explicitly to their backend SDK.
-The SDK validates and interprets the credential but does not decide how the
-application stores it; applications must not parse or depend on its representation. The participant JWT wire format below is
-unchanged. The legacy three-field signing API remains available for existing
-consumers and frozen conformance vectors.
+The SDK only splits the credential and imports its standard PKCS#8 private key;
+it does not validate or reconstruct identifiers. The SFU owns identity
+validation and authorization. Applications must not parse or depend on the
+credential's representation.
+The participant JWT wire format below is unchanged. The public SDKs do not
+accept separate project IDs, key IDs, or signing secrets.
 
 ## Inputs and codecs
 
-All six inputs are mandatory: project ID, API key ID, signing secret, room
-external ID, participant external ID, and absolute expiration in Unix seconds.
+Public signing inputs are one opaque API key, room external ID, participant
+external ID, and absolute expiration in Unix seconds. The API key is a dot-separated
+triple of canonical `ProjectId.ApiKeyId` strings and a base64url PKCS#8 private key
+(see [the internal format specification](api-key.md)). Server SDKs pass the
+already-formatted identities into the JWT and import a standard Ed25519 private key.
 Expiration is an exact unsigned integer in `0..18446744073709551615`. No clock,
-TTL, coercion, normalization of external IDs, or service lookup is involved.
+TTL, normalization of external IDs, or service lookup is involved.
 Zero and past expiration can be signed, but authorize nothing at or after expiry.
 
 Room and participant IDs are 1–36 ASCII characters in `[A-Za-z0-9_-]`. Preserve
@@ -42,12 +47,11 @@ UUID bytes in big-endian bit order, with two zero **low** padding bits. Require
 UUID v7 (high nibble of byte 6 equals 7) and RFC4122 variant (byte 8 high bits 10).
 Emit canonical uppercase payload and `0` marker.
 
-A signing secret has exact `sk_` prefix, V0 marker, and 52 Crockford digits. Its
-32-byte Ed25519 seed is encoded big-endian with four zero **high** padding bits
-(the first digit is 0 or 1). This differs from UUID padding. Payloads accept
-lowercase, O/o = 0 and I/i/L/l = 1. U/u, whitespace, incorrect lengths, versions,
-prefixes and padding are invalid. Public keys and expanded 64-byte private keys
-are not signing secrets. Crockford alphabet: `0123456789ABCDEFGHJKMNPQRSTVWXYZ`.
+Private keys use PKCS#8 DER, and public registry keys use SPKI DER (RFC 8410),
+both encoded as unpadded base64url. Standard crypto libraries import the key
+representations; the SDKs do not implement Crockford signing-key codecs.
+Project and key IDs remain canonical PulseBeam Crockford UUIDs, validated
+by the Rust auth/SFU layer.
 
 ## Wire representation
 
@@ -59,7 +63,7 @@ Exactly these UTF-8 JSON fields, in this order, with no whitespace:
 ```
 
 Unpadded base64url encode each object, join with `.`, sign those literal ASCII
-bytes using Ed25519 and the decoded seed, then append `.` and the unpadded
+bytes using Ed25519 and the imported private key, then append `.` and the unpadded
 base64url 64-byte signature. No `iat`, `nbf`, additional grants, or default JWT
 headers are emitted. The server matches the token project ID and key ID against the public key registry,
 verifies the signature, and requires `now < exp`.
@@ -70,15 +74,17 @@ verifies the signature, and requires `now < exp`.
 loss. Adapters use bigint (TypeScript), uint64 (Go), int (Python), or u64 (Rust), not a
 public string expiration API. Each accepted fixture records canonical IDs, seed/public
 key bytes, raw JSON, signing input, signature, and complete token. All packages
-consume every valid and every applicable invalid case through public entry
-points. Null invalid values represent omitted inputs. `representation: number`
+consume every valid and every applicable invalid case for their opaque-key
+signing API through public entry points. Component-format rejection fixtures
+remain internal ID/codec cases; client SDKs don't reimplement those formats.
+Null invalid values
+represent omitted inputs. `representation: number`
 invalid expirations exercise an inexact native numeric type; `string` exercises
 the forbidden string API input. Go rejects wrong types and omission of its
 mandatory uint64 argument at compile time; its adapter establishes those cases
 with the Go type checker. Rust uses compile-fail doctests against the packaged
-crate for its corresponding typed boundary. Runtime adapters classify every
-invalid fixture and reject unknown fields/representations. No applicable
-fixture is silently skipped.
+crate for its corresponding typed boundary. Runtime adapters check expiration representation; the server checks
+invalid room, participant, project, and key identities.
 
 `cases.json` is the maintenance source for accepted inputs, seed bytes and
 rejections. The Rust generator uses native Ed25519 directly, not an SDK signer.

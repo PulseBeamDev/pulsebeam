@@ -337,10 +337,13 @@ fn mint_development_token(
     participant: &ParticipantExternalId,
     expiration: u64,
 ) -> Result<String> {
+    let key = ApiKey::from_signing_key(
+        *DEVELOPMENT_PROJECT_ID.as_bytes(),
+        *DEVELOPMENT_API_KEY_ID.as_bytes(),
+        &DEVELOPMENT_API_SIGNING_KEY,
+    )?;
     Ok(pulsebeam_server::sign_participant_token(
-        &DEVELOPMENT_PROJECT_ID.as_str(),
-        &DEVELOPMENT_API_KEY_ID.as_str(),
-        &DEVELOPMENT_API_SIGNING_KEY.to_secret_string(),
+        &key.to_secret_string(),
         room.as_str(),
         participant.as_str(),
         expiration,
@@ -1145,7 +1148,7 @@ mod tests {
         assert!(json.contains("\"projectId\""));
         assert!(json.contains("\"keyId\""));
         assert!(json.contains("\"publicKey\""));
-        assert!(!json.contains("key_0"));
+        assert!(!json.contains(&api_key_text));
         assert!(!json.contains("signing"));
     }
 

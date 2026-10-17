@@ -3,103 +3,63 @@ package pulsebeam
 
 import (
 	"crypto/ed25519"
-	"encoding/base32"
+	"crypto/x509"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
-	"fmt"
 	"strings"
 )
 
-var crockford = base32.NewEncoding("0123456789ABCDEFGHJKMNPQRSTVWXYZ").WithPadding(base32.NoPadding)
-var aliases = strings.NewReplacer("O", "0", "I", "1", "L", "1")
-
-func decode(value, prefix string, length int, highPadding bool) ([]byte, error) {
-	if len(value) != len(prefix)+2+length || !strings.HasPrefix(value, prefix+"_") || !strings.ContainsRune("0Oo", rune(value[len(prefix)+1])) {
-		return nil, errors.New("invalid credential format")
+// The public issuer and key IDs are copied into JWT fields as opaque strings.
+// Standard x509 handles all private-key encoding and algorithm validation.
+func parseAPIKey(apiKey string) (string, string, ed25519.PrivateKey, error) {
+	parts := strings.Split(apiKey, ".")
+	if len(parts) != 3 {
+		return "", "", nil, errors.New("invalid API key")
 	}
-	text := value[len(prefix)+2:]
-	if strings.IndexFunc(text, func(c rune) bool { return c > 127 }) >= 0 {
-		return nil, errors.New("invalid credential encoding")
+	der, err := base64.RawURLEncoding.DecodeString(parts[2])
+	if err != nil {
+		return "", "", nil, errors.New("invalid API key")
 	}
-	text = aliases.Replace(strings.ToUpper(text))
-	if highPadding {
-		// Twenty added zero bits align the seed's four high padding bits to three bytes.
-		text = "0000" + text
+	parsed, err := x509.ParsePKCS8PrivateKey(der)
+	if err != nil {
+		return "", "", nil, errors.New("invalid API key")
 	}
-	decoded, err := crockford.DecodeString(text)
-	// The standard decoder ignores newlines and unused low bits. Require canonical bytes.
-	if err != nil || crockford.EncodeToString(decoded) != text {
-		return nil, errors.New("invalid credential encoding")
+	privateKey, ok := parsed.(ed25519.PrivateKey)
+	if !ok {
+		return "", "", nil, errors.New("invalid API key")
 	}
-	if highPadding {
-		if decoded[0] != 0 || decoded[1] != 0 || decoded[2] != 0 {
-			return nil, errors.New("invalid signing secret padding")
-		}
-		decoded = decoded[3:]
-	}
-	return decoded, nil
+	return parts[0], parts[1], privateKey, nil
 }
 
-func canonicalID(value, prefix string) (string, error) {
-	uuid, err := decode(value, prefix, 26, false)
+// SignParticipantToken signs a participant JWT using an opaque server-only API key.
+// expiration is absolute Unix seconds, not a TTL. No clock or network is consulted.
+func SignParticipantToken(apiKey, room, participant string, expiration uint64) (string, error) {
+	project, key, privateKey, err := parseAPIKey(apiKey)
 	if err != nil {
 		return "", err
 	}
-	if uuid[6]>>4 != 7 || uuid[8]&0xc0 != 0x80 {
-		return "", errors.New("invalid credential UUID")
-	}
-	return prefix + "_0" + crockford.EncodeToString(uuid), nil
-}
-
-func validExternal(value string) bool {
-	if len(value) < 1 || len(value) > 36 {
-		return false
-	}
-	for _, c := range value {
-		if !(c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '_' || c == '-') {
-			return false
-		}
-	}
-	return true
-}
-
-// SignParticipantToken signs a participant JWT with explicitly supplied credentials.
-// expiration is mandatory absolute Unix seconds, not a TTL. No clock is consulted.
-// Keep secret server-side. Registry matching is performed only by the server.
-func SignParticipantToken(projectID, keyID, secret, room, participant string, expiration uint64) (string, error) {
-	project, err := canonicalID(projectID, "p")
+	// JSON serialization escapes untrusted text without interpreting ID formats.
+	header, err := json.Marshal(struct {
+		Alg string `json:"alg"`
+		Kid string `json:"kid"`
+		Typ string `json:"typ"`
+	}{"EdDSA", key, "pb+jwt"})
 	if err != nil {
-		return "", err
+		return "", errors.New("invalid JWT header")
 	}
-	key, err := canonicalID(keyID, "kid")
+	claims, err := json.Marshal(struct {
+		Iss  string `json:"iss"`
+		Aud  string `json:"aud"`
+		Sub  string `json:"sub"`
+		Room string `json:"room"`
+		Exp  uint64 `json:"exp"`
+	}{project, "pb", participant, room, expiration})
 	if err != nil {
-		return "", err
+		return "", errors.New("invalid JWT claims")
 	}
-	seed, err := decode(secret, "sk", 52, true)
-	if err != nil {
-		return "", err
-	}
-	if !validExternal(room) || !validExternal(participant) {
-		return "", errors.New("invalid room or participant external ID")
-	}
-	header := fmt.Sprintf(`{"alg":"EdDSA","kid":"%s","typ":"pb+jwt"}`, key)
-	claims := fmt.Sprintf(`{"iss":"%s","aud":"pb","sub":"%s","room":"%s","exp":%d}`, project, participant, room, expiration)
 	encoding := base64.RawURLEncoding
-	input := encoding.EncodeToString([]byte(header)) + "." + encoding.EncodeToString([]byte(claims))
-	signature := ed25519.Sign(ed25519.NewKeyFromSeed(seed), []byte(input))
+	input := encoding.EncodeToString(header) + "." + encoding.EncodeToString(claims)
+	signature := ed25519.Sign(privateKey, []byte(input))
 	return input + "." + encoding.EncodeToString(signature), nil
-}
-
-// SignParticipantTokenWithAPIKey signs with one V0 key_0 credential.
-// The key is 16-byte project UUIDv7 || 16-byte key UUIDv7 || 32-byte Ed25519 seed.
-func SignParticipantTokenWithAPIKey(apiKey, room, participant string, expiration uint64) (string, error) {
-	raw, err := decode(apiKey, "key", 103, false)
-	if err != nil || len(raw) != 64 {
-		return "", errors.New("invalid API key")
-	}
-	project := "p_0" + crockford.EncodeToString(raw[:16])
-	key := "kid_0" + crockford.EncodeToString(raw[16:32])
-	seed := append([]byte{0, 0, 0}, raw[32:]...)
-	secret := "sk_0" + crockford.EncodeToString(seed)[4:]
-	return SignParticipantToken(project, key, secret, room, participant, expiration)
 }

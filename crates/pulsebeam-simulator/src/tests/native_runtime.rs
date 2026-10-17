@@ -5,9 +5,6 @@ use std::time::Duration;
 use pulsebeam_agent_core::ffi as core_ffi;
 use pulsebeam_agent_native::ffi::{Agent, EventUpdate, MediaUpdate, NativeEvent, SnapshotUpdate};
 use pulsebeam_agent_native::{Agent as RuntimeAgent, Config, Host};
-use pulsebeam_core::auth::{
-    DEVELOPMENT_API_KEY_ID, DEVELOPMENT_API_SIGNING_KEY, DEVELOPMENT_PROJECT_ID,
-};
 use pulsebeam_core::identity::{ParticipantExternalId, RoomExternalId};
 use pulsebeam_core::net::UdpSocket;
 
@@ -136,9 +133,7 @@ async fn run_peer(
     let session = pulsebeam_agent_core::AgentConfig {
         endpoint,
         token: pulsebeam_server::sign_participant_token(
-            &DEVELOPMENT_PROJECT_ID.as_str(),
-            &DEVELOPMENT_API_KEY_ID.as_str(),
-            &DEVELOPMENT_API_SIGNING_KEY.to_secret_string(),
+            &pulsebeam_server::insecure_dev_api_key().unwrap(),
             (room).as_str(),
             (participant).as_str(),
             u64::MAX,

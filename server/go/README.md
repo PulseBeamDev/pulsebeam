@@ -6,9 +6,8 @@ Rust, WASM, or foreign runtime is needed. Public key-registry publication is han
 
 ## Local development
 
-`pulsebeam.InsecureDevCredentials()` returns the embedded development identity
-with a single `APIKey` usable by `SignParticipantTokenWithAPIKey`. **Never use these publicly known
-credentials in production or on an exposed server.**
+`pulsebeam.InsecureDevAPIKey()` returns the publicly known API key
+usable by `SignParticipantToken`. **Never use it in production or on an exposed server.**
 
 ## Local module consumption
 
@@ -24,15 +23,14 @@ replace github.com/PulseBeamDev/pulsebeam/server/go => /absolute/path/to/pulsebe
 import pulsebeam "github.com/PulseBeamDev/pulsebeam/server/go"
 
 func issueToken(apiKey string) (string, error) {
-    return pulsebeam.SignParticipantTokenWithAPIKey(
+    return pulsebeam.SignParticipantToken(
         apiKey, "general", "Alice", uint64(2000000000),
     )
 }
 ```
 
-Pass one opaque, server-only API key explicitly; let the SDK interpret it.
-How your application stores the key is up to you. Do not parse, log, or send it to clients. The legacy
-`SignParticipantToken(projectID, keyID, secret, ...)` remains available.
+Pass one opaque server-only API key; the SDK imports the standard PKCS#8 private key.
+How your application stores the key is up to you. Do not parse, log, or send it to clients.
 All credentials are explicit. The SDK never reads the environment. Expiration
 is a mandatory uint64 absolute Unix timestamp in `0..18446744073709551615`, not
 a TTL. Go's type checker rejects missing, negative, fractional, boolean,
@@ -41,8 +39,8 @@ validate external data before passing it to the typed API. No clock is consulted
 Zero and past expiration can be signed, but the server rejects at and after expiry.
 
 Room and participant are case-sensitive external IDs of 1–36 ASCII characters
-in `[A-Za-z0-9_-]`. The API key is opaque; existing three-field callers retain
-their original credential-validation behavior. External identities are never trimmed.
+in `[A-Za-z0-9_-]`. The SDK copies IDs unchanged into the JWT; the SFU
+validates them. The API key remains opaque to applications.
 
 Keep secrets on servers only, never in clients or logs. Offline signing cannot
 check registration or whether a secret belongs to the supplied project/key.

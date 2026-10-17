@@ -146,11 +146,13 @@ mod tests {
                 golden.token
             );
             let exp: u64 = input.expiration.parse().unwrap();
+            let api_key = format!(
+                "{}.{}.{}",
+                golden.canonical_project_id, golden.canonical_key_id, input.secret
+            );
             assert_eq!(
                 pulsebeam_server::sign_participant_token(
-                    &input.project_id,
-                    &input.key_id,
-                    &input.secret,
+                    &api_key,
                     &input.room,
                     &input.participant,
                     exp
@@ -266,8 +268,8 @@ mod tests {
                 Err(TokenError::Invalid)
             );
         }
-        // This loop checks server codec compatibility. The packaged Rust consumer
-        // and compile-fail contract in :fast account for every SDK rejection.
+        // Verify internal ID and signing-secret codec fixtures here. Packaged
+        // SDK consumers exercise only the public opaque-key signing contract.
         for rejection in vectors.invalid {
             let Some(value) = rejection.value.as_str() else {
                 continue;

@@ -4,10 +4,7 @@
 )]
 mod rtp_relay;
 
-use pulsebeam_core::{
-    auth::{DEVELOPMENT_API_KEY_ID, DEVELOPMENT_API_SIGNING_KEY, DEVELOPMENT_PROJECT_ID},
-    identity::{ParticipantExternalId, RoomExternalId},
-};
+use pulsebeam_core::identity::{ParticipantExternalId, RoomExternalId};
 use std::env;
 use std::error::Error;
 use std::io;
@@ -43,9 +40,7 @@ pub fn mint_development_token(
     expires_at: u64,
 ) -> TestResult<String> {
     Ok(pulsebeam_server::sign_participant_token(
-        &DEVELOPMENT_PROJECT_ID.as_str(),
-        &DEVELOPMENT_API_KEY_ID.as_str(),
-        &DEVELOPMENT_API_SIGNING_KEY.to_secret_string(),
+        &pulsebeam_server::insecure_dev_api_key().unwrap(),
         room.as_str(),
         participant.as_str(),
         expires_at,
