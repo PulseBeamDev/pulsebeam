@@ -257,9 +257,8 @@ mod tests {
     #[test]
     fn stable_room_partition_keeps_locality_and_spreads_room_partitions() {
         let mut router = setup_test_router(8);
-        let room_id = RoomId::from_external(
-            &crate::entity::RoomExternalId::new("room-spill").unwrap(),
-        );
+        let room_id =
+            RoomId::from_external(&crate::entity::RoomExternalId::new("room-spill").unwrap());
         let primary = router.stable_room_partition(&room_id, 0).unwrap();
 
         assert_eq!(router.stable_room_partition(&room_id, 0), Some(primary));

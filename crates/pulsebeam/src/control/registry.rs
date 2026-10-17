@@ -69,7 +69,10 @@ impl RoomRegistry {
         ) {
             self.remove_from_room_shard(&previous.room_id, &participant_id, previous.shard_id);
         }
-        let room = self.room_shards.entry(room_id).or_insert_with(RoomShard::new);
+        let room = self
+            .room_shards
+            .entry(room_id)
+            .or_insert_with(RoomShard::new);
         let partition_index = room.next_partition_index(
             &participant_id,
             1, // Test helper accepts arbitrary execution-shard placement.
@@ -278,7 +281,10 @@ mod tests {
         reg.add_participant(pid, new_room, ShardId::new(1), None);
 
         assert!(reg.get_room_shard(&old_room).is_none());
-        assert_eq!(reg.get_room_shard(&new_room).unwrap().participant_count(), 1);
+        assert_eq!(
+            reg.get_room_shard(&new_room).unwrap().participant_count(),
+            1
+        );
         let meta = reg.get_participant(&pid).unwrap();
         assert_eq!(meta.room_id, new_room);
         assert_eq!(meta.shard_id, ShardId::new(1));
