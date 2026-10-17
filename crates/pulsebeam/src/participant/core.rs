@@ -17,7 +17,7 @@ use crate::entity::{self, TrackId, TrackKind};
 use crate::id::ShardId;
 use crate::keys::TrackHandle;
 use crate::log::{LogCtx, plog_debug, plog_info, plog_trace, plog_warn};
-use crate::participant::data::{DataOpenError, DataState};
+use crate::participant::data::{DataChannelState, DataOpenError, DataState};
 use crate::participant::downstream::SlotConfig;
 use crate::participant::effect::ParticipantEffect;
 use crate::participant::event::ParticipantSink;
@@ -215,7 +215,7 @@ impl Participant {
             participant_external_id: cfg.participant_external_id,
             connection_id: cfg.connection_id,
             profile: cfg.profile,
-            upstream: UpstreamAllocator::new(ctx),
+            upstream: UpstreamAllocator::new(ctx, cfg.connection_id),
             negotiated: cfg.resources,
             downstream: DownstreamAllocator::new(ctx, cfg.manual_sub),
             disconnect_reason: None,
@@ -887,9 +887,32 @@ impl Participant {
 
                     DataTrackIntent::UserTopic(channel) => {
                         if let Some(previous) = self.data.close(cid) {
+                            self.downstream.data.close(cid);
+                            self.upstream.data.close(cid);
                             self.release_data_channel(previous, events);
                         }
-                        if let Err(error) = self.data.open(cid, channel.clone()) {
+                        let publication = (channel.direction == DataTrackDirection::Publish)
+                            .then(|| {
+                                let label =
+                                    crate::track::publication_label(channel.lane, &channel.topic);
+                                Track::data(
+                                    crate::track::TrackMeta {
+                                        room_id: self.room_id,
+                                        shard_id: self.shard_id,
+                                        id: self
+                                            .connection_id
+                                            .derive_track_id(TrackKind::Data, &label),
+                                        origin: self.participant_id,
+                                        connection_id: self.connection_id,
+                                        label: Some(label),
+                                    },
+                                    channel.topic.clone(),
+                                    channel.lane,
+                                    None,
+                                )
+                            });
+                        let meta = publication.as_ref().map(|track| track.meta().clone());
+                        if let Err(error) = self.data.open(cid, channel.clone(), meta) {
                             self.disconnect(match error {
                                 DataOpenError::DuplicateDataChannelLabel(channel) => {
                                     DisconnectReason::DuplicateDataChannelLabel(channel)
@@ -900,33 +923,14 @@ impl Participant {
                             });
                             return;
                         }
-                        match channel.direction {
-                            DataTrackDirection::Publish => {
-                                let label =
-                                    crate::track::publication_label(channel.lane, &channel.topic);
-                                let track = Track::data(
-                                    crate::track::TrackMeta {
-                                        room_id: self.room_id,
-                                        shard_id: self.shard_id,
-                                        id: self
-                                            .participant_id
-                                            .derive_track_id(TrackKind::Data, &label),
-                                        origin: self.participant_id,
-                                        label: Some(label),
-                                    },
-                                    channel.topic,
-                                    channel.lane,
-                                    None,
-                                );
-                                self.upstream.data.publish(cid, &track);
-                                events.publish_track(track);
-                            }
-                            DataTrackDirection::Subscribe => {
-                                events.subscribe_tracks(
-                                    DataState::selector(&channel),
-                                    crate::track::SelectionPolicy::All,
-                                );
-                            }
+                        if let Some(track) = publication {
+                            self.upstream.data.publish(cid, &track);
+                            events.publish_track(track);
+                        } else {
+                            events.subscribe_tracks(
+                                DataState::selector(&channel),
+                                crate::track::SelectionPolicy::All,
+                            );
                         }
                     }
                 }
@@ -1126,18 +1130,13 @@ impl Participant {
 
     fn release_data_channel(
         &mut self,
-        channel: DataTopicChannel,
+        state: DataChannelState,
         events: &mut impl ParticipantSink,
     ) {
-        match channel.direction {
-            DataTrackDirection::Publish => {
-                let label = crate::track::publication_label(channel.lane, &channel.topic);
-                events
-                    .unpublish_track(self.participant_id.derive_track_id(TrackKind::Data, &label));
-            }
-            DataTrackDirection::Subscribe => {
-                events.unsubscribe_tracks(DataState::selector(&channel));
-            }
+        if let Some(meta) = state.publication {
+            events.unpublish_track(meta);
+        } else {
+            events.unsubscribe_tracks(DataState::selector(&state.channel));
         }
     }
 
@@ -1167,9 +1166,9 @@ impl Participant {
         if !*in_topology {
             return;
         }
-        let track_id = descriptor.id();
+        let meta = descriptor.meta().clone();
         *in_topology = false;
-        events.unpublish_track(track_id);
+        events.unpublish_track(meta);
     }
 
     fn handle_stream_paused(&mut self, mid: Mid, paused: bool, events: &mut impl ParticipantSink) {
@@ -1198,13 +1197,14 @@ impl Participant {
                 };
                 let label = whip_media_label(self.profile, media.kind);
                 let track_id = self
-                    .participant_id
+                    .connection_id
                     .derive_track_id(kind, label.unwrap_or(&media.mid));
                 let track_meta = track::TrackMeta {
                     room_id: self.room_id,
                     shard_id: self.shard_id,
                     id: track_id,
                     origin: self.participant_id,
+                    connection_id: self.connection_id,
                     label: label.map(str::to_owned),
                 };
                 match media.kind {
@@ -1364,7 +1364,7 @@ mod rtc_clock_tests {
 
     #[test]
     fn whip_uses_fixed_track_labels_independent_of_mid() {
-        let participant = entity::ParticipantId::new();
+        let connection = entity::ConnectionId::new();
         for (kind, track_kind, expected) in [
             (MediaKind::Audio, TrackKind::Audio, "audio"),
             (MediaKind::Video, TrackKind::Video, "video"),
@@ -1372,8 +1372,8 @@ mod rtc_clock_tests {
             let label = whip_media_label(ConnectionProfile::Whip, kind).unwrap();
             assert_eq!(label, expected);
             assert_eq!(
-                participant.derive_track_id(track_kind, label),
-                participant.derive_track_id(track_kind, expected)
+                connection.derive_track_id(track_kind, label),
+                connection.derive_track_id(track_kind, expected)
             );
             assert!(whip_media_label(ConnectionProfile::Native, kind).is_none());
         }
@@ -1406,8 +1406,7 @@ mod upstream_route_table_tests {
     use pulsebeam_runtime::rand::{RngCore, seeded_rng};
 
     fn track_id(label: &str) -> TrackId {
-        entity::ParticipantId::from_bytes([7u8; 16])
-            .derive_track_id(entity::TrackKind::Video, label)
+        entity::ConnectionId::new().derive_track_id(entity::TrackKind::Video, label)
     }
 
     fn route(ssrc: u32) -> IncomingRtpRoute {

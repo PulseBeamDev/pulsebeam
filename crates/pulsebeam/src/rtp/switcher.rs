@@ -626,7 +626,7 @@ mod test {
     // Convenience only: a test is not a shard, so nothing here is
     // cross-core. See crates/pulsebeam/docs/thread-per-core.md.
     use super::*;
-    use crate::entity::{ParticipantId, TrackKind};
+    use crate::entity::TrackKind;
     use crate::rtp;
     use crate::rtp::test_utils::{H264StreamBuilder, ParameterSetStyle};
 
@@ -635,7 +635,7 @@ mod test {
 
     /// Two distinct streams (two simulcast layers of one track) to switch between.
     fn two_streams() -> (StreamId, StreamId) {
-        let track = ParticipantId::new().derive_track_id(TrackKind::Video, "v");
+        let track = crate::entity::ConnectionId::new().derive_track_id(TrackKind::Video, "v");
         ((track, Some(Rid::from("q"))), (track, Some(Rid::from("h"))))
     }
 

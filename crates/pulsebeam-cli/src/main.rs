@@ -24,8 +24,8 @@ use pulsebeam_core::auth::{
     DEVELOPMENT_PROJECT_ID, KeyRegistry, KeyRegistryEntry,
 };
 use pulsebeam_core::identity::{
-    ApiKeyId, AudioTrackId, DataTrackId, ParticipantExternalId, ParticipantId, ProjectId,
-    RoomExternalId, RoomId, VideoTrackId,
+    ApiKeyId, AudioTrackId, ConnectionId, DataTrackId, ParticipantExternalId, ParticipantId,
+    ProjectId, RoomExternalId, RoomId, VideoTrackId,
 };
 use pulsebeam_core::net::UdpSocket;
 use std::{
@@ -244,11 +244,7 @@ enum TrackKindArg {
 #[derive(Args)]
 struct TrackIdConfig {
     #[arg(long)]
-    project_id: ProjectId,
-    #[arg(long)]
-    room_external_id: RoomExternalId,
-    #[arg(long)]
-    participant_external_id: ParticipantExternalId,
+    connection_id: ConnectionId,
     #[arg(long, value_enum)]
     kind: TrackKindArg,
     #[arg(long)]
@@ -432,15 +428,11 @@ fn derive_id(command: IdCommand) -> String {
             let room = RoomId::derive(&config.project_id, &config.room_external_id);
             ParticipantId::derive(&room, &config.participant_external_id).as_str()
         }
-        IdCommand::Track(config) => {
-            let room = RoomId::derive(&config.project_id, &config.room_external_id);
-            let participant = ParticipantId::derive(&room, &config.participant_external_id);
-            match config.kind {
-                TrackKindArg::Audio => AudioTrackId::derive(&participant, &config.label).as_str(),
-                TrackKindArg::Video => VideoTrackId::derive(&participant, &config.label).as_str(),
-                TrackKindArg::Data => DataTrackId::derive(&participant, &config.label).as_str(),
-            }
-        }
+        IdCommand::Track(config) => match config.kind {
+            TrackKindArg::Audio => AudioTrackId::derive(&config.connection_id, &config.label).as_str(),
+            TrackKindArg::Video => VideoTrackId::derive(&config.connection_id, &config.label).as_str(),
+            TrackKindArg::Data => DataTrackId::derive(&config.connection_id, &config.label).as_str(),
+        },
     }
 }
 
@@ -1049,16 +1041,15 @@ mod tests {
     fn identity_commands_use_the_canonical_core_derivation() {
         let project = ProjectId::from_bytes([0, 0, 0, 0, 0, 0, 0x70, 0, 0x80, 0, 0, 0, 0, 0, 0, 1]);
         let project_text = project.as_str();
+        let connection =
+            ConnectionId::from_bytes([0, 0, 0, 0, 0, 0, 0x70, 0, 0x80, 0, 0, 0, 0, 0, 0, 1]);
+        let connection_text = connection.as_str();
         let track_cli = Cli::try_parse_from([
             "pulsebeam-cli",
             "id",
             "track",
-            "--project-id",
-            &project_text,
-            "--room-external-id",
-            "general",
-            "--participant-external-id",
-            "alice",
+            "--connection-id",
+            &connection_text,
             "--kind",
             "video",
             "--label",
@@ -1074,7 +1065,7 @@ mod tests {
             ParticipantId::derive(&room, &ParticipantExternalId::new("alice").unwrap());
         assert_eq!(
             derive_id(command),
-            VideoTrackId::derive(&participant, "camera").as_str()
+            VideoTrackId::derive(&connection, "camera").as_str()
         );
 
         let room_cli = Cli::try_parse_from([

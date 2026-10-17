@@ -753,14 +753,16 @@ mod tests {
 
     fn remote_audio(
         publisher: crate::entity::ParticipantId,
+        connection: crate::entity::ConnectionId,
         label: &str,
     ) -> crate::track::TrackMeta {
         let (_, mut descriptor) = crate::track::test_utils::make_audio_track(
             publisher,
+            connection,
             str0m::media::Mid::from("remote-mid"),
         );
         let meta = descriptor.meta_mut();
-        meta.id = publisher.derive_track_id(TrackKind::Audio, label);
+        meta.id = connection.derive_track_id(TrackKind::Audio, label);
         meta.label = Some(label.to_owned());
         meta.clone()
     }
@@ -809,10 +811,12 @@ mod tests {
             room_id: crate::entity::RoomId::from_external(&room),
             participant_id: publisher,
         };
-        let mut upstream = super::super::upstream::Upstream::new(ctx);
+        let connection = crate::entity::ConnectionId::new();
+        let mut upstream = super::super::upstream::Upstream::new(ctx, connection);
         for (index, mid) in [(0, "a"), (3, "b")] {
             let mid = str0m::media::Mid::from(mid);
-            let (track, descriptor) = crate::track::test_utils::make_audio_track(publisher, mid);
+            let (track, descriptor) =
+                crate::track::test_utils::make_audio_track(publisher, connection, mid);
             assert!(upstream.add_published_track(index, mid, track, descriptor));
         }
         let original = upstream.track_for_sender_index(0);
@@ -860,7 +864,7 @@ mod tests {
         assert_eq!(session.intents.revision(), 2);
         assert_eq!(
             upstream.track_for_sender_index(0),
-            Some(publisher.derive_track_id(TrackKind::Audio, "mic"))
+            Some(connection.derive_track_id(TrackKind::Audio, "mic"))
         );
     }
 
@@ -1037,11 +1041,12 @@ mod tests {
         use pulsebeam_proto::signaling_v1::{catalog, server_message};
         let recipient = crate::entity::ParticipantId::new();
         let publisher = crate::entity::ParticipantId::new();
+        let connection = crate::entity::ConnectionId::new();
         let mut state = CatalogState::default();
         let plan = state
             .plan(
                 [peer(publisher, "alice")],
-                [remote_audio(publisher, "mic")],
+                [remote_audio(publisher, connection, "mic")],
                 recipient,
                 "self",
             )
@@ -1072,7 +1077,8 @@ mod tests {
         use pulsebeam_proto::signaling_v1::server_message::Payload;
         let recipient = crate::entity::ParticipantId::new();
         let publisher = crate::entity::ParticipantId::new();
-        let track = remote_audio(publisher, "mic");
+        let connection = crate::entity::ConnectionId::new();
+        let track = remote_audio(publisher, connection, "mic");
         let mut rtc = str0m::Rtc::new(std::time::Instant::now());
         let cid = rtc.direct_api().create_data_channel(Default::default());
         let mut session = NativeSession::default();
@@ -1117,12 +1123,13 @@ mod tests {
     fn mapping_only_references_committed_catalog_with_unique_coordinates() {
         let recipient = crate::entity::ParticipantId::new();
         let publisher = crate::entity::ParticipantId::new();
-        let id = remote_audio(publisher, "mic").id;
+        let connection = crate::entity::ConnectionId::new();
+        let id = remote_audio(publisher, connection, "mic").id;
         let mut state = CatalogState::default();
         let plan = state
             .plan(
                 [peer(publisher, "alice")],
-                [remote_audio(publisher, "mic")],
+                [remote_audio(publisher, connection, "mic")],
                 recipient,
                 "self",
             )
@@ -1155,11 +1162,12 @@ mod tests {
     fn catalog_refuses_identity_reuse_after_removal() {
         let recipient = crate::entity::ParticipantId::new();
         let publisher = crate::entity::ParticipantId::new();
+        let connection = crate::entity::ConnectionId::new();
         let mut state = CatalogState::default();
         let first = state
             .plan(
                 [peer(publisher, "alice")],
-                [remote_audio(publisher, "mic")],
+                [remote_audio(publisher, connection, "mic")],
                 recipient,
                 "self",
             )
@@ -1175,13 +1183,13 @@ mod tests {
         assert!(matches!(
             state.plan(
                 [peer(publisher, "alice")],
-                [remote_audio(publisher, "different")],
+                [remote_audio(publisher, connection, "different")],
                 recipient,
                 "self",
             ),
             Ok(Some(_))
         ));
-        let mut changed_track = remote_audio(publisher, "mic");
+        let mut changed_track = remote_audio(publisher, connection, "mic");
         changed_track.label = Some("renamed".to_owned());
         assert!(matches!(
             state.plan(
