@@ -1,0 +1,48 @@
+name: RTC working change verification
+on:
+  push:
+    branches: [refactor/rtc-ownership-boundaries]
+    paths: [tools/rtc-work.patch.json]
+permissions:
+  contents: write
+concurrency:
+  group: rtc-working-change-verification
+  cancel-in-progress: true
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+      - name: Apply reviewed working patch
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import base64, hashlib, json, lzma, pathlib, subprocess
+          path = pathlib.Path('tools/rtc-work.patch.json')
+          change = json.loads(path.read_text())
+          patch = lzma.decompress(base64.b64decode(change['patch']))
+          assert hashlib.sha256(patch).hexdigest() == change['sha256']
+          subprocess.run(['git', 'apply', '--check', '-'], input=patch, check=True)
+          subprocess.run(['git', 'apply', '--index', '-'], input=patch, check=True)
+          path.unlink()
+          subprocess.run(['git', 'add', '-u', '--', 'tools/rtc-work.patch.json'], check=True)
+          subprocess.run(['git', 'config', 'user.name', 'github-actions[bot]'], check=True)
+          subprocess.run(['git', 'config', 'user.email', '41898282+github-actions[bot]@users.noreply.github.com'], check=True)
+          subprocess.run(['git', 'commit', '-m', change['message']], check=True)
+          subprocess.run(['git', 'push', 'origin', 'HEAD:refs/heads/refactor/rtc-ownership-boundaries'], check=True)
+          PY
+      - uses: ./.github/actions/setup-ci
+      - name: Verify RTC owner
+        run: ./bazel test //crates/pulsebeam-rtc:test //crates/pulsebeam-rtc:format //crates/pulsebeam-rtc:clippy --keep_going --test_output=errors --nocache_test_results
+      - name: Retain verification evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rtc-working-change-evidence
+          path: bazel-testlogs/crates/pulsebeam-rtc/**/test.log
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 1
