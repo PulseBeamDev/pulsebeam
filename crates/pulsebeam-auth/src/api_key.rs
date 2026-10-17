@@ -1,33 +1,27 @@
-//! Offline V0 API key: project UUIDv7 || key UUIDv7 || Ed25519 seed.
-//! Canonical wire form: `key_0` followed by 103 Crockford Base32 digits.
-use crate::identity::CROCKFORD;
+//! One server-only API key: canonical ProjectId.KeyId.SigningSecret.
+//! The component codecs are owned by this crate.
+use crate::identity::{format_id, parse_id};
 use crate::keys::ApiSigningKey;
 use std::{fmt, str::FromStr};
 use uuid::{Uuid, Variant, Version};
 
-const PREFIX: &str = "key_0";
-const ENCODED_BYTES: usize = 64;
-const ENCODED_DIGITS: usize = 103;
 const REDACTED: &str = "[REDACTED]";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum ApiKeyError {
-    #[error("invalid API key prefix or version")]
-    InvalidPrefix,
-    #[error("invalid API key length")]
-    InvalidLength,
-    #[error("invalid API key encoding or padding")]
-    InvalidEncoding,
-    #[error("invalid API key UUIDv7 identity")]
+    #[error("invalid API key structure")]
+    InvalidFormat,
+    #[error("invalid API key identity")]
     InvalidIdentity,
+    #[error("invalid API key signing secret")]
+    InvalidSecret,
 }
 
-/// Server-only signing credential. Never log, serialize, or send to clients.
+/// Server-only signing credential. Never log or send to clients.
 ///
-/// V0 is the concatenation of 16-byte project UUIDv7, 16-byte key UUIDv7,
-/// and 32-byte Ed25519 private seed, encoded together, MSB-first. The final
-/// Base32 digit has three zero low bits.
+/// The API key combines canonical PulseBeam project and key IDs with one
+/// standard base64url-encoded PKCS#8 Ed25519 private key.
 #[derive(Clone, PartialEq, Eq)]
 pub struct ApiKey {
     project_id: [u8; 16],
@@ -72,17 +66,26 @@ impl ApiKey {
         &self.key_id
     }
 
+    pub fn project_id(&self) -> String {
+        format_id("p", Uuid::from_bytes(self.project_id))
+    }
+
+    pub fn key_id(&self) -> String {
+        format_id("kid", Uuid::from_bytes(self.key_id))
+    }
+
     pub fn signing_key(&self) -> ApiSigningKey {
         ApiSigningKey::from_seed(self.seed)
     }
 
     /// Explicit secret export; Debug/Display remain redacted.
     pub fn to_secret_string(&self) -> String {
-        let mut payload = [0u8; ENCODED_BYTES];
-        payload[..16].copy_from_slice(&self.project_id);
-        payload[16..32].copy_from_slice(&self.key_id);
-        payload[32..].copy_from_slice(&self.seed);
-        format!("{PREFIX}{}", CROCKFORD.encode(&payload))
+        format!(
+            "{}.{}.{}",
+            self.project_id(),
+            self.key_id(),
+            self.signing_key().to_secret_string()
+        )
     }
 }
 
@@ -90,41 +93,18 @@ impl FromStr for ApiKey {
     type Err = ApiKeyError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        let text = value
-            .strip_prefix(PREFIX)
-            .ok_or(ApiKeyError::InvalidPrefix)?;
-        if text.len() != ENCODED_DIGITS {
-            return Err(ApiKeyError::InvalidLength);
-        }
-        let bytes = CROCKFORD
-            .decode(text.as_bytes())
-            .map_err(|_| ApiKeyError::InvalidEncoding)?;
-        let data: [u8; ENCODED_BYTES] =
-            bytes.try_into().map_err(|_| ApiKeyError::InvalidEncoding)?;
-        // Reject noncanonical unused padding bits, including codec aliases
-        // that would alter the underlying secret's textual representation.
-        let canonical = CROCKFORD.encode(&data);
-        let normalized = text
-            .chars()
-            .map(|c| match c.to_ascii_uppercase() {
-                'O' => '0',
-                'I' | 'L' => '1',
-                other => other,
-            })
-            .collect::<String>();
-        if canonical != normalized {
-            return Err(ApiKeyError::InvalidEncoding);
-        }
-        let project_id = data[..16]
-            .try_into()
-            .map_err(|_| ApiKeyError::InvalidEncoding)?;
-        let key_id = data[16..32]
-            .try_into()
-            .map_err(|_| ApiKeyError::InvalidEncoding)?;
-        let seed = data[32..]
-            .try_into()
-            .map_err(|_| ApiKeyError::InvalidEncoding)?;
-        Self::new(project_id, key_id, seed)
+        let mut parts = value.split('.');
+        let (Some(project), Some(key), Some(secret), None) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            return Err(ApiKeyError::InvalidFormat);
+        };
+        let project_id =
+            parse_id(project, "p", Version::SortRand).map_err(|_| ApiKeyError::InvalidIdentity)?;
+        let key_id =
+            parse_id(key, "kid", Version::SortRand).map_err(|_| ApiKeyError::InvalidIdentity)?;
+        let secret: ApiSigningKey = secret.parse().map_err(|_| ApiKeyError::InvalidSecret)?;
+        Self::from_signing_key(*project_id.as_bytes(), *key_id.as_bytes(), &secret)
     }
 }
 
@@ -145,41 +125,43 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::arithmetic_side_effects)]
     use super::*;
 
-    #[test]
-    fn development_api_key_round_trip() {
-        let key: ApiKey = concat!(
-            "key_00000000001R0100000000000040000000007004000000000001",
-            "9TRDHKQQZTPK0QA24NX4JXGPC8H29RNMQPCK935R3QB033JQ7YR0"
+    fn development_key() -> ApiKey {
+        ApiKey::new(
+            [0, 0, 0, 0, 0, 0, 0x70, 0, 0x80, 0, 0, 0, 0, 0, 0, 1],
+            [0, 0, 0, 0, 0, 0, 0x70, 0, 0x80, 0, 0, 0, 0, 0, 0, 2],
+            [7; 32],
         )
-        .parse()
-        .unwrap();
-        assert_eq!(
-            key.project_id_bytes(),
-            &[0, 0, 0, 0, 0, 0, 0x70, 0, 0x80, 0, 0, 0, 0, 0, 0, 1]
-        );
-        assert_eq!(
-            key.key_id_bytes(),
-            &[0, 0, 0, 0, 0, 0, 0x70, 0, 0x80, 0, 0, 0, 0, 0, 0, 2]
-        );
-        assert!(key.to_secret_string().starts_with("key_0"));
-        assert_eq!(key.to_secret_string().len(), 108);
-        assert_eq!(format!("{key:?}"), REDACTED);
+        .unwrap()
     }
 
     #[test]
-    fn rejects_padding_version_and_wrong_uuid_kind() {
-        let good = concat!(
-            "key_00000000001R0100000000000040000000007004000000000001",
-            "9TRDHKQQZTPK0QA24NX4JXGPC8H29RNMQPCK935R3QB033JQ7YR0"
-        );
-        assert!(
-            good.replacen("key_0", "key_1", 1)
-                .parse::<ApiKey>()
-                .is_err()
-        );
-        let truncated = good.strip_suffix('0').unwrap();
-        assert!(truncated.parse::<ApiKey>().is_err());
-        assert!(good.replace("key_0", "sk_0").parse::<ApiKey>().is_err());
-        assert!(format!("{truncated}1").parse::<ApiKey>().is_err());
+    fn compound_api_key_round_trip_and_redaction() {
+        let key = development_key();
+        let encoded = key.to_secret_string();
+        assert_eq!(encoded.len(), 29 + 1 + 31 + 1 + 64);
+        assert!(encoded.starts_with("p_0"));
+        assert!(encoded.contains(".kid_0"));
+        assert!(encoded.contains(".MC4CAQ"));
+        assert_eq!(encoded.parse::<ApiKey>().unwrap(), key);
+        assert_eq!(format!("{key:?}"), REDACTED);
+        assert_eq!(format!("{key}"), REDACTED);
+    }
+
+    #[test]
+    fn rejects_invalid_components_and_extra_fields() {
+        let good = development_key().to_secret_string();
+        for candidate in [
+            format!("{good}.extra"),
+            good.replace("kid_0", "kid_1"),
+            good.replace("p_0", "p_1"),
+            good.replace("MC4CAQ", "invalid"),
+            good.replace("kid_0", "p_0"),
+            good.replacen(".", "", 1),
+            good.replace("MC4CAQ", "MCowBQ"),
+            good.get(..good.len() - 1).unwrap_or_default().to_owned(),
+            String::from("key_0bad"),
+        ] {
+            assert!(candidate.parse::<ApiKey>().is_err());
+        }
     }
 }

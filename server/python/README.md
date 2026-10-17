@@ -8,7 +8,7 @@ call, Rust signer, WASM, or language bridge. Public key-registry publication is 
 
 `from pulsebeam_server import INSECURE_DEV_API_KEY` provides one publicly known
 API key for local `--dev` servers. Pass it to
-`sign_participant_token_with_api_key(api_key, room=..., participant=..., expiration=...)`.
+`sign_participant_token(api_key, room=..., participant=..., expiration=...)`.
 **Never use these credentials in production or expose a development server.**
 
 ## Local installation
@@ -23,10 +23,10 @@ The distribution is also buildable with standard Python build tooling from
 `server/python/pyproject.toml`. Import only the public package:
 
 ```python
-from pulsebeam_server import sign_participant_token_with_api_key
+from pulsebeam_server import sign_participant_token
 
 def issue_token(api_key: str) -> str:
-    return sign_participant_token_with_api_key(
+    return sign_participant_token(
         api_key,
         room="general",
         participant="Alice",
@@ -34,17 +34,18 @@ def issue_token(api_key: str) -> str:
     )
 ```
 
-The new API takes one explicit API key plus room, participant and expiration;
-the legacy `sign_participant_token` accepts the original three-part credentials. The SDK never reads the
-environment. Expiration must be an exact int in `0..18446744073709551615`,
+The API takes one opaque API key plus room, participant and expiration.
+The SDK never reads the environment. Expiration must be an exact int in `0..18446744073709551615`,
 representing absolute Unix seconds, not a TTL. Booleans, floats and strings are
 not accepted. Invalid values raise without returning a token. No clock is
 consulted: zero and past timestamps can be signed, but the server rejects tokens
 at and after their expiration.
 
 Room and participant are case-sensitive external IDs of 1–36 ASCII characters
-in `[A-Za-z0-9_-]`. Treat the API key as an opaque server-side secret and pass it explicitly;
-the SDK validates it but does not decide how your application stores it. External IDs are never trimmed or normalized.
+in `[A-Za-z0-9_-]`. The SDK copies these and the credential's IDs into the JWT
+without interpreting them, imports the PKCS#8 private key, and signs;
+the SFU validates identity formats. Treat the API key
+as one opaque server-side secret.
 
 Keep secrets on servers only, never in clients or logs. Offline signing cannot
 check registration or whether a secret belongs to the supplied project/key.

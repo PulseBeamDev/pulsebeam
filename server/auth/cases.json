@@ -3,7 +3,7 @@
   "base": {
     "project_id": "p_0067MYZ1001R010000000000064",
     "key_id": "kid_0067MYZ1005R030010000000068",
-    "secret": "sk_00K6D12DJHZWPVAEVDGT6XG8MW3TVH8RSYDDBMRJDN37PXN7VH9QV",
+    "secret": "MC4CAQAwBQYDK2VwBCIEIEzNCJso_5banbbDRuwRTg9bijGfNaumJNqM9u1PuKb7",
     "room": "Room_9-Z",
     "participant": "Alice_-9",
     "expiration": "2000"
@@ -14,7 +14,7 @@
       "input": {
         "project_id": "p_0067MYZ1001R010000000000064",
         "key_id": "kid_0067MYZ1005R030010000000068",
-        "secret": "sk_00K6D12DJHZWPVAEVDGT6XG8MW3TVH8RSYDDBMRJDN37PXN7VH9QV",
+        "secret": "MC4CAQAwBQYDK2VwBCIEIEzNCJso_5banbbDRuwRTg9bijGfNaumJNqM9u1PuKb7",
         "room": "Room_9-Z",
         "participant": "Alice_-9",
         "expiration": "2000"
@@ -26,7 +26,7 @@
       "input": {
         "project_id": "p_0067MYZ1001R010000000000064",
         "key_id": "kid_0067MYZ1005R030010000000068",
-        "secret": "sk_00K6D12DJHZWPVAEVDGT6XG8MW3TVH8RSYDDBMRJDN37PXN7VH9QV",
+        "secret": "MC4CAQAwBQYDK2VwBCIEIEzNCJso_5banbbDRuwRTg9bijGfNaumJNqM9u1PuKb7",
         "room": "-",
         "participant": "_",
         "expiration": "0"
@@ -38,7 +38,7 @@
       "input": {
         "project_id": "p_0067MYZ1001R010000000000064",
         "key_id": "kid_0067MYZ1005R030010000000068",
-        "secret": "sk_00K6D12DJHZWPVAEVDGT6XG8MW3TVH8RSYDDBMRJDN37PXN7VH9QV",
+        "secret": "MC4CAQAwBQYDK2VwBCIEIEzNCJso_5banbbDRuwRTg9bijGfNaumJNqM9u1PuKb7",
         "room": "Room_9-Z",
         "participant": "Alice_-9",
         "expiration": "9007199254740991"
@@ -50,7 +50,7 @@
       "input": {
         "project_id": "p_0067MYZ1001R010000000000064",
         "key_id": "kid_0067MYZ1005R030010000000068",
-        "secret": "sk_00K6D12DJHZWPVAEVDGT6XG8MW3TVH8RSYDDBMRJDN37PXN7VH9QV",
+        "secret": "MC4CAQAwBQYDK2VwBCIEIEzNCJso_5banbbDRuwRTg9bijGfNaumJNqM9u1PuKb7",
         "room": "Room_9-Z",
         "participant": "Alice_-9",
         "expiration": "9007199254740993"
@@ -62,7 +62,7 @@
       "input": {
         "project_id": "p_0067MYZ1001R010000000000064",
         "key_id": "kid_0067MYZ1005R030010000000068",
-        "secret": "sk_00K6D12DJHZWPVAEVDGT6XG8MW3TVH8RSYDDBMRJDN37PXN7VH9QV",
+        "secret": "MC4CAQAwBQYDK2VwBCIEIEzNCJso_5banbbDRuwRTg9bijGfNaumJNqM9u1PuKb7",
         "room": "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
         "participant": "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
         "expiration": "18446744073709551615"
@@ -74,7 +74,7 @@
       "input": {
         "project_id": "p_oo67myzloolrolooooooooooo64",
         "key_id": "kid_OO67MYZIOO5RO3OOIOOOOOOOO68",
-        "secret": "sk_ook6dl2djhzwpvaevdgt6xg8mw3tvh8rsyddbmrjdn37pxn7vh9qv",
+        "secret": "MC4CAQAwBQYDK2VwBCIEIEzNCJso_5banbbDRuwRTg9bijGfNaumJNqM9u1PuKb7",
         "room": "Room_9-Z",
         "participant": "Alice_-9",
         "expiration": "2000"

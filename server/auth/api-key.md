@@ -1,70 +1,62 @@
-# V0 API key format (SDK maintainers only)
+# PulseBeam API key (SDK maintainers)
 
-This is an **internal codec and cross-language conformance specification**, not
-a developer-facing API. Application code treats the API key as an opaque secret and must never inspect
-or depend on the format.
+Applications treat an API key as an opaque server-side credential. The CLI
+generates it; each server SDK signs participant JWTs locally.
 
-The private server-side credential has the following V0 encoding:
-
-```text
-key_0<103 Crockford Base32 characters>
-```
-
-`key` identifies a private API key. `_` separates the type from a single
-format-version digit. `0` is **V0**; unknown versions must be rejected.
-The complete V0 string is exactly **108 ASCII characters**. It is **not** a JWT,
-not a participant access token, and not safe to expose to the browser.
-
-## Binary layout (64 bytes, exactly)
-
-| Offset | Length | Contents |
-| --- | ---: | --- |
-| 0 | 16 bytes | `project_id` — RFC 4122 UUIDv7 bytes |
-| 16 | 16 bytes | `key_id` — RFC 4122 UUIDv7 bytes |
-| 32 | 32 bytes | `seed` — raw Ed25519 signing seed |
-
-UUIDs are stored in canonical network/big-endian byte order, without their
-`p_0` or `kid_0` textual prefixes. The seed is the **32-byte seed**, not
-an expanded Ed25519 private key, a PEM document, or a public key. The API key
-is a lossless packaging of the existing project ID, API key ID and signing
-secret; it does **not** alter key generation, JWT signing, registry lookup, or
-verification. The public key registry contains one project ID and one or more
-entries with a key ID and Ed25519 public key.
-
-Encode the whole 64-byte payload as **one** MSB-first Crockford Base32 stream:
-`0123456789ABCDEFGHJKMNPQRSTVWXYZ`. This yields exactly 103 characters.
-The last encoded digit contains **three zero low padding bits**; a decoder
-must reject nonzero padding or an incorrect length. The canonical form uses
-uppercase digits and the ASCII `0` version marker. As with PulseBeam's
-existing ID codecs, decoding may accept lowercase and the Crockford aliases
-`O/o → 0`, `I/i/L/l → 1`, and always re-emits canonical uppercase.
-Reject Unicode, invalid Base32 characters, UUIDs without RFC 4122 variant
-and UUIDv7 version, and unknown credential versions. Never echo the API key
-or decoded seed in errors, diagnostics, or logs.
-
-## Development-only golden value
-
-This public example corresponds **exactly** to the canonical
-[development.json](development.json) fixture. It is unsafe for production.
+## Credential format
 
 ```text
-key_00000000001R01000000000000400000000070040000000000019TRDHKQQZTPK0QA24NX4JXGPC8H29RNMQPCK935R3QB033JQ7YR0
+<ProjectId>.<ApiKeyId>.<base64url(PKCS#8 DER)>
 ```
 
-It decodes to:
-- `project_id`: `p_00000000001R010000000000004`
-- `key_id`: `kid_00000000001R010000000000008`
-- `seed` (hex): `9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60`
+The first two components retain the canonical PulseBeam Crockford ID formats:
+`p_0<26 Crockford digits>` and `kid_0<26 Crockford digits>`.
+The third is **unpadded base64url of an Ed25519 PKCS#8 DER private key**
+(RFC 8410), not a proprietary `sk_0` seed representation.
+CLI-generated minimal PKCS#8 DER is 48 bytes / 64 base64url characters,
+making the compound credential **126 characters**. Other valid PKCS#8
+representations can be larger.
 
-## Token issuance, lifecycle, and future versions
+Server SDKs split exactly three fields, copy the first two *without
+interpreting them* into JWT `iss` and `kid`, and import the third using
+their native PKCS#8 crypto library. Keys must be Ed25519 to sign `EdDSA`.
+No SDK needs a PulseBeam identity/key codec. Errors must not expose secrets.
 
-The backend parses the API key and signs a separate, short-lived **participant
-JWT**. The existing JWT header `kid`, claims `iss`, `aud`, `sub`, `room`,
-`exp`, and EdDSA signature are unchanged. Only that JWT goes to the browser.
-Keep the API key on the application backend; treat the entire string as sensitive.
-Issue a new API key with a new `key_id` and seed to rotate keys, register its
-public key, and retire the previous public key after outstanding JWTs expire.
+## Public registry
 
-The V0 `key_0` payload is permanently the 16 + 16 + 32 byte structure above.
-If another algorithm, key length, or metadata becomes necessary, define
-`key_1` with a new, documented layout. Never silently reinterpret V0.
+```json
+{
+  "projectId": "p_0...",
+  "keys": [
+    {"keyId": "kid_0...", "publicKey": "<base64url(SPKI DER)>"}
+  ]
+}
+```
+
+The publicKey value is unpadded base64url of **SubjectPublicKeyInfo (SPKI) DER**
+(RFC 8410), not a custom `pk_0` string. Minimal Ed25519 SPKI is
+44 bytes / 59 base64url characters. SPKI contains no private key or certificate.
+The Rust auth layer imports and verifies these keys against the trusted
+project-scoped registry.
+
+## Verification and trust
+
+The JWT header and claims are unchanged:
+
+```text
+{"alg":"EdDSA","kid":"<ApiKeyId>","typ":"pb+jwt"}
+{"iss":"<ProjectId>","aud":"pb","sub":"<participant>","room":"<room>","exp":2000000000}
+```
+
+The SFU validates issuer/key identifiers against the configured project,
+selects its registered public key, requires EdDSA, verifies the signature,
+validates room/participant identity and expiration, then enforces authorization.
+Only the participant JWT is sent to the browser.
+
+Key rotation creates a fresh `kid_0` and key pair, adds its SPKI key to the
+registry, and keeps the old public key registered until outstanding tokens
+expire. Existing `key_0`, `sk_0` and `pk_0` credentials and registries must be
+regenerated; there is no automatic legacy-format fallback.
+
+The embedded [development fixture](development.json) is public and **never
+safe for production or an exposed development server**.

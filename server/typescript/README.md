@@ -35,8 +35,9 @@ to publish the package. Publication is not part of installation or testing.
 
 ## Development credentials
 
-For local `--dev` servers, `INSECURE_DEV_CREDENTIALS` is loaded from
-embedded JSON generated from the [shared fixture](../auth/development.json).
+For local `--dev` servers, use `INSECURE_DEV_API_KEY` with
+`signParticipantToken({ apiKey: INSECURE_DEV_API_KEY, ... })`. It is loaded from
+the [shared development fixture](../auth/development.json).
 Never use it in production or expose a dev server publicly.
 
 ## Configure an API key
@@ -68,15 +69,15 @@ The SDK signs locally without reading the environment itself or performing a
 network request. Only the short-lived participant JWT goes to the browser.
 A renewal must use the **same** room and participant identity.
 
-For compatibility, `signParticipantToken` also accepts the original
-`{projectId, keyId, secret}` configuration. The new single-key API produces
-the same participant JWT; the SDK owns the credential representation.
+Only the opaque `apiKey` input is supported. The SDK splits its components,
+copies issuer and key IDs unchanged, and imports the PKCS#8 Ed25519 private key.
+Applications never supply separate credential fields.
 
 The expiration must be an absolute safe-integer number or bigint within the
 unsigned 64-bit range; it is not a TTL. Room/participant IDs are case-sensitive
-1–36 ASCII characters in `[A-Za-z0-9_-]`. Offline signing cannot check public-key
-registration or user permissions. Reject invalid keys and inputs without
-printing sensitive values.
+1–36 ASCII characters in `[A-Za-z0-9_-]`. The SDK does not validate identity
+formats; the SFU enforces them. Offline signing cannot check public-key
+registration or user permissions. Errors must not print sensitive values.
 
 ## Contributor checks
 

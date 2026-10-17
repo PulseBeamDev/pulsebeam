@@ -3,10 +3,7 @@ mod destination;
 mod support;
 use destination::DestinationServer;
 
-use pulsebeam_core::{
-    auth::{DEVELOPMENT_API_KEY_ID, DEVELOPMENT_API_SIGNING_KEY, DEVELOPMENT_PROJECT_ID},
-    identity::{ParticipantExternalId, RoomExternalId},
-};
+use pulsebeam_core::identity::{ParticipantExternalId, RoomExternalId};
 use serde::Deserialize;
 use std::error::Error;
 use std::path::PathBuf;
@@ -351,25 +348,19 @@ async fn connected_agents_select_and_play_audio_without_ui() -> TestResult<()> {
     let server = StaticServer::start(root()).await?;
     let room = RoomExternalId::new("automatic-web-audio")?;
     let sender = pulsebeam_server::sign_participant_token(
-        &DEVELOPMENT_PROJECT_ID.as_str(),
-        &DEVELOPMENT_API_KEY_ID.as_str(),
-        &DEVELOPMENT_API_SIGNING_KEY.to_secret_string(),
+        &pulsebeam_server::insecure_dev_api_key().unwrap(),
         room.as_str(),
         ParticipantExternalId::new("web-sender")?.as_str(),
         u64::MAX,
     )?;
     let receiver = pulsebeam_server::sign_participant_token(
-        &DEVELOPMENT_PROJECT_ID.as_str(),
-        &DEVELOPMENT_API_KEY_ID.as_str(),
-        &DEVELOPMENT_API_SIGNING_KEY.to_secret_string(),
+        &pulsebeam_server::insecure_dev_api_key().unwrap(),
         room.as_str(),
         ParticipantExternalId::new("web-receiver")?.as_str(),
         u64::MAX,
     )?;
     let pinned = pulsebeam_server::sign_participant_token(
-        &DEVELOPMENT_PROJECT_ID.as_str(),
-        &DEVELOPMENT_API_KEY_ID.as_str(),
-        &DEVELOPMENT_API_SIGNING_KEY.to_secret_string(),
+        &pulsebeam_server::insecure_dev_api_key().unwrap(),
         room.as_str(),
         ParticipantExternalId::new("web-pinned")?.as_str(),
         u64::MAX,
@@ -402,25 +393,19 @@ async fn public_agent_connects_and_delivers_remote_media() -> TestResult<()> {
     let url = server.url("tests/fixture.html");
     let room = RoomExternalId::new("public-web-contract")?;
     let sender = pulsebeam_server::sign_participant_token(
-        &DEVELOPMENT_PROJECT_ID.as_str(),
-        &DEVELOPMENT_API_KEY_ID.as_str(),
-        &DEVELOPMENT_API_SIGNING_KEY.to_secret_string(),
+        &pulsebeam_server::insecure_dev_api_key().unwrap(),
         (room).as_str(),
         (ParticipantExternalId::new("web-sender")?).as_str(),
         u64::MAX,
     )?;
     let receiver = pulsebeam_server::sign_participant_token(
-        &DEVELOPMENT_PROJECT_ID.as_str(),
-        &DEVELOPMENT_API_KEY_ID.as_str(),
-        &DEVELOPMENT_API_SIGNING_KEY.to_secret_string(),
+        &pulsebeam_server::insecure_dev_api_key().unwrap(),
         (room).as_str(),
         (ParticipantExternalId::new("web-receiver")?).as_str(),
         u64::MAX,
     )?;
     let second_receiver = pulsebeam_server::sign_participant_token(
-        &DEVELOPMENT_PROJECT_ID.as_str(),
-        &DEVELOPMENT_API_KEY_ID.as_str(),
-        &DEVELOPMENT_API_SIGNING_KEY.to_secret_string(),
+        &pulsebeam_server::insecure_dev_api_key().unwrap(),
         (room).as_str(),
         (ParticipantExternalId::new("web-second-receiver")?).as_str(),
         u64::MAX,
@@ -482,25 +467,19 @@ async fn reliable_topics_recover_the_lost_tail_through_server_restart() -> TestR
     let url = server.url("tests/fixture.html");
     let room = RoomExternalId::new("reliable-restart-contract")?;
     let sender = pulsebeam_server::sign_participant_token(
-        &DEVELOPMENT_PROJECT_ID.as_str(),
-        &DEVELOPMENT_API_KEY_ID.as_str(),
-        &DEVELOPMENT_API_SIGNING_KEY.to_secret_string(),
+        &pulsebeam_server::insecure_dev_api_key().unwrap(),
         (room).as_str(),
         (ParticipantExternalId::new("publisher")?).as_str(),
         u64::MAX,
     )?;
     let receiver = pulsebeam_server::sign_participant_token(
-        &DEVELOPMENT_PROJECT_ID.as_str(),
-        &DEVELOPMENT_API_KEY_ID.as_str(),
-        &DEVELOPMENT_API_SIGNING_KEY.to_secret_string(),
+        &pulsebeam_server::insecure_dev_api_key().unwrap(),
         (room).as_str(),
         (ParticipantExternalId::new("subscriber")?).as_str(),
         u64::MAX,
     )?;
     let late = pulsebeam_server::sign_participant_token(
-        &DEVELOPMENT_PROJECT_ID.as_str(),
-        &DEVELOPMENT_API_KEY_ID.as_str(),
-        &DEVELOPMENT_API_SIGNING_KEY.to_secret_string(),
+        &pulsebeam_server::insecure_dev_api_key().unwrap(),
         (room).as_str(),
         (ParticipantExternalId::new("late")?).as_str(),
         u64::MAX,

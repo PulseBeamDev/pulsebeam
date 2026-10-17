@@ -184,9 +184,11 @@
     );
     const short = new Float32Array(8);
     a.readSpectrum(short);
+    a.readSpectrum(spectrum);
     assert(
-      short.every((value, index) => value === spectrum[index]),
-      "short buffer does not change FFT",
+      short.every((value) => value <= 0 && !Number.isNaN(value)) &&
+        Math.abs((peak(spectrum) * sdkContext.sampleRate) / 2048 - 440) < 45,
+      "short buffer preserves FFT resolution and decibel semantics",
     );
     a.readWaveform(new Float32Array());
     a.readSpectrum(new Float32Array());

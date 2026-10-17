@@ -1,29 +1,20 @@
 //! Native server-side participant-token signing.
 //!
-//! Credentials and absolute Unix expiration are always explicit. No clock,
+//! API keys and absolute Unix expiration are always explicit. No clock,
 //! environment lookup, service call, or registration check is performed.
-//! Keep signing secrets on your server and send only the token to clients.
+//! Keep API keys on your server and send only the token to clients.
 
 pub mod development;
-pub use development::{InsecureDevCredentials, insecure_dev_credentials};
+pub use development::insecure_dev_api_key;
 
 use data_encoding::BASE64URL_NOPAD;
-use pulsebeam_auth::api_key::{ApiKey, ApiKeyError};
-use pulsebeam_auth::identity::{IdValidationError, format_id, parse_id, validate_external};
-use pulsebeam_auth::keys::{ApiSigningKey, KeyValidationError};
+use pulsebeam_auth::api_key::ApiKeyError;
+use pulsebeam_auth::keys::ApiSigningKey;
 use serde::Serialize;
-use uuid::Version;
 
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum SigningError {
-    #[error("invalid {field}: {source}")]
-    Identity {
-        field: &'static str,
-        source: IdValidationError,
-    },
-    #[error("invalid signing secret: {0}")]
-    Secret(#[from] KeyValidationError),
     #[error("invalid API key: {0}")]
     ApiKey(#[from] ApiKeyError),
     #[error("could not encode participant token")]
@@ -33,83 +24,63 @@ pub enum SigningError {
 #[derive(Serialize)]
 struct Header<'a> {
     alg: &'a str,
-    kid: String,
+    kid: &'a str,
     typ: &'a str,
 }
 
 #[derive(Serialize)]
 struct Claims<'a> {
-    iss: String,
+    iss: &'a str,
     aud: &'a str,
     sub: &'a str,
     room: &'a str,
     exp: u64,
 }
 
-fn canonical_id(value: &str, prefix: &'static str) -> Result<String, SigningError> {
-    parse_id(value, prefix, Version::SortRand)
-        .map(|uuid| format_id(prefix, uuid))
-        .map_err(|source| SigningError::Identity {
-            field: if prefix == "p" {
-                "project ID"
-            } else {
-                "API key ID"
-            },
-            source,
-        })
-}
-
-/// Sign a participant JWT with six mandatory inputs.
+/// Sign a participant JWT using one opaque server-only API key.
 ///
-/// `expiration` is exact unsigned absolute Unix seconds, not a TTL. Zero and
-/// past expiration may be signed; the server rejects at and after expiration.
-/// Credential aliases are canonicalized, but external IDs retain their case.
-/// Errors and default diagnostics do not include credentials or seed bytes.
+/// `expiration` is exact unsigned absolute Unix seconds, not a TTL.
+/// Zero and past expiration may be signed; the server rejects at expiration.
+/// External IDs retain their case; no clock, environment or network is used.
 ///
 /// ```compile_fail
 /// // Expiration is mandatory.
-/// pulsebeam_server::sign_participant_token("p", "kid", "sk", "room", "participant");
+/// pulsebeam_server::sign_participant_token("key", "room", "participant");
 /// ```
 /// ```compile_fail
-/// pulsebeam_server::sign_participant_token("p", "kid", "sk", "room", "participant", 1.5_f64);
+/// pulsebeam_server::sign_participant_token("key", "room", "participant", 1.5_f64);
 /// ```
 /// ```compile_fail
-/// pulsebeam_server::sign_participant_token("p", "kid", "sk", "room", "participant", "2000");
+/// pulsebeam_server::sign_participant_token("key", "room", "participant", "2000");
 /// ```
 /// ```compile_fail
-/// pulsebeam_server::sign_participant_token("p", "kid", "sk", "room", "participant", true);
+/// pulsebeam_server::sign_participant_token("key", "room", "participant", true);
 /// ```
 /// ```compile_fail
-/// pulsebeam_server::sign_participant_token("p", "kid", "sk", "room", "participant", -1);
+/// pulsebeam_server::sign_participant_token("key", "room", "participant", -1);
 /// ```
 /// ```compile_fail
-/// #![deny(overflowing_literals)]
-/// pulsebeam_server::sign_participant_token("p", "kid", "sk", "room", "participant", 18446744073709551616);
+/// pulsebeam_server::sign_participant_token("key", "room", "participant", 18446744073709551616);
 /// ```
 /// ```compile_fail
-/// // Credentials and external IDs must be string references.
-/// pulsebeam_server::sign_participant_token(true, "kid", "sk", "room", "participant", 2000);
-/// ```
-/// ```compile_fail
-/// pulsebeam_server::sign_participant_token(42, "kid", "sk", "room", "participant", 2000);
+/// pulsebeam_server::sign_participant_token(true, "room", "participant", 2000);
 /// ```
 pub fn sign_participant_token(
-    project_id: &str,
-    key_id: &str,
-    secret: &str,
+    api_key: &str,
     room: &str,
     participant: &str,
     expiration: u64,
 ) -> Result<String, SigningError> {
-    let project = canonical_id(project_id, "p")?;
-    let key = canonical_id(key_id, "kid")?;
-    let signing_key: ApiSigningKey = secret.parse()?;
-    for (field, value) in [("room", room), ("participant", participant)] {
-        validate_external(value).map_err(|source| SigningError::Identity { field, source })?;
-    }
+    let mut parts = api_key.split('.');
+    let (Some(project), Some(kid), Some(secret), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return Err(ApiKeyError::InvalidFormat.into());
+    };
+    let signing_key: ApiSigningKey = secret.parse().map_err(|_| ApiKeyError::InvalidSecret)?;
     let header = serde_json::to_vec(&Header {
         alg: "EdDSA",
-        kid: key,
+        kid,
         typ: "pb+jwt",
     })?;
     let claims = serde_json::to_vec(&Claims {
@@ -129,22 +100,4 @@ pub fn sign_participant_token(
         "{signing_input}.{}",
         BASE64URL_NOPAD.encode(&signature)
     ))
-}
-
-/// Sign a participant JWT using one server-only `key_0` API key.
-///
-/// The key contains the project's UUIDv7, the key's UUIDv7, and the 32-byte
-/// Ed25519 signing seed. The emitted JWT is identical to signing with the
-/// three component credentials. The SDK does no environment or network I/O.
-pub fn sign_participant_token_with_api_key(
-    api_key: &str,
-    room: &str,
-    participant: &str,
-    expiration: u64,
-) -> Result<String, SigningError> {
-    let credential: ApiKey = api_key.parse()?;
-    let project = format_id("p", uuid::Uuid::from_bytes(*credential.project_id_bytes()));
-    let key = format_id("kid", uuid::Uuid::from_bytes(*credential.key_id_bytes()));
-    let secret = credential.signing_key().to_secret_string();
-    sign_participant_token(&project, &key, &secret, room, participant, expiration)
 }
