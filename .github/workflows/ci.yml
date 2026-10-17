@@ -15,6 +15,16 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
+      - name: Archive tracked source for RTC boundary verification
+        if: github.event.pull_request.number == 239
+        run: git archive --format=tar HEAD > "$RUNNER_TEMP/rtc-source.tar"
+      - name: Retain RTC verification source
+        if: github.event.pull_request.number == 239
+        uses: actions/upload-artifact@v4
+        with:
+          name: rtc-verification-source
+          path: ${{ runner.temp }}/rtc-source.tar
+          retention-days: 1
       - uses: ./.github/actions/setup-ci
       - name: Run complete non-privileged gate
         run: ./bazel test //:test --keep_going --test_output=errors --zip_undeclared_test_outputs

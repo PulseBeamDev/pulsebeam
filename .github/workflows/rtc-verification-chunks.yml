@@ -1,0 +1,108 @@
+name: RTC verification archive chunks
+on:
+  push:
+    branches: [refactor/rtc-ownership-boundaries]
+    paths: [.github/workflows/rtc-verification-chunks.yml]
+permissions:
+  contents: read
+  actions: read
+jobs:
+  split:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ github.token }}
+          run-id: 39034328084
+          artifact-ids: 12102275810
+          merge-multiple: true
+          path: ${{ runner.temp }}/rtc-inputs
+      - name: Split declared inputs
+        run: |
+          mkdir -p "$RUNNER_TEMP/chunks"
+          split -d -a 2 -b 400M "$RUNNER_TEMP/rtc-inputs/rtc-build-inputs.tar.gz" "$RUNNER_TEMP/chunks/inputs-"
+          sha256sum "$RUNNER_TEMP/rtc-inputs/rtc-build-inputs.tar.gz" "$RUNNER_TEMP/chunks/"* > "$RUNNER_TEMP/chunks/SHA256SUMS"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rtc-inputs-manifest
+          path: ${{ runner.temp }}/chunks/SHA256SUMS
+          retention-days: 1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rtc-inputs-00
+          path: ${{ runner.temp }}/chunks/inputs-00
+          compression-level: 0
+          retention-days: 1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rtc-inputs-01
+          path: ${{ runner.temp }}/chunks/inputs-01
+          compression-level: 0
+          retention-days: 1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rtc-inputs-02
+          path: ${{ runner.temp }}/chunks/inputs-02
+          compression-level: 0
+          retention-days: 1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rtc-inputs-03
+          path: ${{ runner.temp }}/chunks/inputs-03
+          compression-level: 0
+          retention-days: 1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rtc-inputs-04
+          path: ${{ runner.temp }}/chunks/inputs-04
+          compression-level: 0
+          retention-days: 1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rtc-inputs-05
+          path: ${{ runner.temp }}/chunks/inputs-05
+          compression-level: 0
+          retention-days: 1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rtc-inputs-06
+          path: ${{ runner.temp }}/chunks/inputs-06
+          compression-level: 0
+          retention-days: 1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rtc-inputs-07
+          path: ${{ runner.temp }}/chunks/inputs-07
+          compression-level: 0
+          retention-days: 1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rtc-inputs-08
+          path: ${{ runner.temp }}/chunks/inputs-08
+          compression-level: 0
+          retention-days: 1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rtc-inputs-09
+          path: ${{ runner.temp }}/chunks/inputs-09
+          compression-level: 0
+          retention-days: 1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rtc-inputs-10
+          path: ${{ runner.temp }}/chunks/inputs-10
+          compression-level: 0
+          retention-days: 1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rtc-inputs-11
+          path: ${{ runner.temp }}/chunks/inputs-11
+          compression-level: 0
+          retention-days: 1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rtc-inputs-12
+          path: ${{ runner.temp }}/chunks/inputs-12
+          compression-level: 0
+          retention-days: 1
