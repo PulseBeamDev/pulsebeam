@@ -125,6 +125,8 @@ pub struct TrackMeta {
     pub shard_id: ShardId,
     pub id: crate::entity::TrackId,
     pub origin: crate::entity::ParticipantId,
+    /// The connection incarnation that published this track.
+    pub connection_id: crate::entity::ConnectionId,
     /// Application-facing media identity. Pending native senders have no label.
     pub label: Option<String>,
 }
@@ -943,11 +945,13 @@ pub mod test_utils {
 
     pub fn make_video_track(
         participant_id: ParticipantId,
+        connection_id: crate::entity::ConnectionId,
         mid: Mid,
         layers: Vec<SimulcastLayer>,
     ) -> (UpstreamTrack, Track) {
-        let track_id = participant_id.derive_track_id(TrackKind::Video, &mid);
+        let track_id = connection_id.derive_track_id(TrackKind::Video, &mid);
         let meta = TrackMeta {
+            connection_id,
             label: None,
             room_id: crate::entity::RoomId::from_external(
                 &crate::entity::RoomExternalId::new("test-room").unwrap(),
@@ -959,9 +963,14 @@ pub mod test_utils {
         crate::track::new_video(mid, meta, layers)
     }
 
-    pub fn make_audio_track(participant_id: ParticipantId, mid: Mid) -> (UpstreamTrack, Track) {
-        let track_id = participant_id.derive_track_id(TrackKind::Audio, &mid);
+    pub fn make_audio_track(
+        participant_id: ParticipantId,
+        connection_id: crate::entity::ConnectionId,
+        mid: Mid,
+    ) -> (UpstreamTrack, Track) {
+        let track_id = connection_id.derive_track_id(TrackKind::Audio, &mid);
         let meta = TrackMeta {
+            connection_id,
             label: None,
             room_id: crate::entity::RoomId::from_external(
                 &crate::entity::RoomExternalId::new("test-room").unwrap(),
@@ -1755,6 +1764,7 @@ mod simulcast_pause_tests {
         let participant = ParticipantId::new();
         let (upstream, _) = test_utils::make_video_track(
             participant,
+            crate::entity::ConnectionId::new(),
             Mid::from("v"),
             vec![
                 SimulcastLayer::new("q"),

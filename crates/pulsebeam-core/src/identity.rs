@@ -241,19 +241,22 @@ impl ParticipantId {
         }
         Self(Uuid::from_bytes(bytes))
     }
+}
 
+impl Default for ParticipantId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// The same sender label yields a new media identity on every connection.
+impl ConnectionId {
     pub fn derive_track_id(&self, kind: TrackKind, label: &str) -> TrackId {
         match kind {
             TrackKind::Audio => AudioTrackId::derive(self, label).into(),
             TrackKind::Video => VideoTrackId::derive(self, label).into(),
             TrackKind::Data => DataTrackId::derive(self, label).into(),
         }
-    }
-}
-
-impl Default for ParticipantId {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -268,10 +271,10 @@ pub enum TrackKind {
 macro_rules! derived_track_id {
     ($name:ident, $kind:expr, $domain:ident) => {
         impl $name {
-            pub fn derive(participant: &ParticipantId, label: &str) -> Self {
+            pub fn derive(connection: &ConnectionId, label: &str) -> Self {
                 Self(derive_v8(
                     $domain,
-                    participant.as_bytes(),
+                    connection.as_bytes(),
                     Some($kind),
                     label,
                 ))
@@ -428,16 +431,17 @@ mod tests {
         let participant_external = ParticipantExternalId::new("alice").unwrap();
         let room = RoomId::derive(&project, &room_external);
         let participant = ParticipantId::derive(&room, &participant_external);
+        let connection =
+            ConnectionId::from_bytes([0, 0, 0, 0, 0, 0, 0x70, 0, 0x80, 0, 0, 0, 0, 0, 0, 1]);
         let values = [
             project.as_str(),
             room.as_str(),
             participant.as_str(),
-            ConnectionId::from_bytes([0, 0, 0, 0, 0, 0, 0x70, 0, 0x80, 0, 0, 0, 0, 0, 0, 1])
-                .as_str(),
+            connection.as_str(),
             ApiKeyId::from_bytes([0, 0, 0, 0, 0, 0, 0x70, 0, 0x80, 0, 0, 0, 0, 0, 0, 2]).as_str(),
-            AudioTrackId::derive(&participant, "mic").as_str(),
-            VideoTrackId::derive(&participant, "camera").as_str(),
-            DataTrackId::derive(&participant, "chat").as_str(),
+            AudioTrackId::derive(&connection, "mic").as_str(),
+            VideoTrackId::derive(&connection, "camera").as_str(),
+            DataTrackId::derive(&connection, "chat").as_str(),
         ];
         let prefixes = [
             "p_0", "rm_0", "pa_0", "c_0", "kid_0", "aud_0", "vid_0", "dat_0",
@@ -448,9 +452,9 @@ mod tests {
             "pa_0K2GMTHV9ME6YXAA5MPQ7GV7534",
             "c_00000000001R010000000000004",
             "kid_00000000001R010000000000008",
-            "aud_0WZMFN45BYJ1Y75VMH96X5J91A0",
-            "vid_00XAABXHBV6369BHJ2YMAHT8W64",
-            "dat_0QDC3TZCNQ26H7340YX0N5XRMPG",
+            "aud_0Z91QNP7AYT6MZBQWDV1YN13G88",
+            "vid_04NCB5P75CY1FN9ZPW5ZQEXDNXG",
+            "dat_053TY7A2ANE1K9BKZNBWRJS46CG",
         ];
         for ((value, prefix), expected) in values.iter().zip(prefixes).zip(expected) {
             assert!(value.starts_with(prefix));
@@ -545,17 +549,23 @@ mod tests {
             participant_c,
             ParticipantId::derive(&room_ab, &ParticipantExternalId::new("C").unwrap())
         );
-        assert_ne!(
-            participant_c.derive_track_id(TrackKind::Audio, "main"),
-            participant_c.derive_track_id(TrackKind::Video, "main")
+        let connection_a = ConnectionId::new();
+        let connection_b = ConnectionId::new();
+        assert_eq!(
+            connection_a.derive_track_id(TrackKind::Video, "main"),
+            connection_a.derive_track_id(TrackKind::Video, "main")
         );
         assert_ne!(
-            participant_c.derive_track_id(TrackKind::Video, "main"),
-            participant_c.derive_track_id(TrackKind::Video, "Main")
+            connection_a.derive_track_id(TrackKind::Audio, "main"),
+            connection_a.derive_track_id(TrackKind::Video, "main")
         );
         assert_ne!(
-            participant_c.derive_track_id(TrackKind::Video, "main"),
-            participant_bc.derive_track_id(TrackKind::Video, "main")
+            connection_a.derive_track_id(TrackKind::Video, "main"),
+            connection_a.derive_track_id(TrackKind::Video, "Main")
+        );
+        assert_ne!(
+            connection_a.derive_track_id(TrackKind::Video, "main"),
+            connection_b.derive_track_id(TrackKind::Video, "main")
         );
     }
 
@@ -595,12 +605,13 @@ mod tests {
         );
 
         let room = RoomId::derive(&project, &RoomExternalId::new("room").unwrap());
-        let participant =
+        let _participant =
             ParticipantId::derive(&room, &ParticipantExternalId::new("person").unwrap());
+        let connection = ConnectionId::new();
         for track in [
-            participant.derive_track_id(TrackKind::Audio, "label"),
-            participant.derive_track_id(TrackKind::Video, "label"),
-            participant.derive_track_id(TrackKind::Data, "label"),
+            connection.derive_track_id(TrackKind::Audio, "label"),
+            connection.derive_track_id(TrackKind::Video, "label"),
+            connection.derive_track_id(TrackKind::Data, "label"),
         ] {
             assert_eq!(track.as_str().parse::<TrackId>().unwrap(), track);
         }

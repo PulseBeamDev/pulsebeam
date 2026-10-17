@@ -50,19 +50,20 @@ ProjectId + RoomExternalId
 RoomId + ParticipantExternalId
     -> ParticipantId
 
-ParticipantId + TrackKind + TrackLabel
-    -> TrackId
-
 connection admission
     -> ConnectionId
+
+ConnectionId + TrackKind + TrackLabel
+    -> TrackId
 
 TrackId + current placement
     -> RouteAddress
     -> destination shard resolves TrackHandle
 ```
 
-`RoomId`, `ParticipantId`, and `TrackId` are deterministic hierarchical UUIDv8
-identities. `ConnectionId` is a minted UUIDv7 identity. Their V0 text encodings
+`RoomId` and `ParticipantId` are deterministic hierarchical UUIDv8 identities.
+`ConnectionId` is minted UUIDv7; `TrackId` is UUIDv8 derived from that connection,
+track kind, and immutable label. A reconnect creates fresh track IDs. Their V0 text encodings
 are `rm_0...`, `pa_0...`, `aud_0...` / `vid_0...` / `dat_0...`, and `c_0...`.
 Only the canonical identity implementation may derive, mint, parse, or format
 these values.

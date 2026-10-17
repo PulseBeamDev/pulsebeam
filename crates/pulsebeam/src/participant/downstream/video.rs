@@ -2110,7 +2110,7 @@ mod alloc_test_support {
         mid: Mid,
         layers: Vec<SimulcastLayer>,
     ) -> (UpstreamTrack, Track, LayerStates) {
-        let (tx, track) = make_video_track(pid, mid, layers);
+        let (tx, track) = make_video_track(pid, crate::entity::ConnectionId::new(), mid, layers);
         let states = states_for(&track);
         (tx, track, states)
     }
@@ -2738,8 +2738,8 @@ mod assignment_tests {
 
         allocator.rebalance();
 
-        let missing_track_id =
-            ParticipantId::new().derive_track_id(TrackKind::Video, &Mid::from("missing"));
+        let missing_track_id = crate::entity::ConnectionId::new()
+            .derive_track_id(TrackKind::Video, &Mid::from("missing"));
         let mut intents = HashMap::new();
         intents.insert(
             Mid::from("s0"),

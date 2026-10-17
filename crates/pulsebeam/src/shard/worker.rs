@@ -19,7 +19,7 @@ use pulsebeam_runtime::{
 use tokio::time::{Instant, Sleep};
 
 use crate::{
-    entity::{ParticipantId, TrackId},
+    entity::ParticipantId,
     id::ShardId,
     participant::{ParticipantConfig, RoutedTrackPacket},
     shard::metrics::ShardMetrics,
@@ -235,30 +235,29 @@ pub(crate) enum ShardEvent {
     },
     TrackSubscribed {
         subscriber: ParticipantId,
+        connection_id: crate::entity::ConnectionId,
         track: crate::track::TrackMeta,
     },
     TrackUnsubscribed {
         subscriber: ParticipantId,
+        connection_id: crate::entity::ConnectionId,
         track: crate::track::TrackMeta,
     },
     TrackSubscriptionAdded {
         room_id: crate::entity::RoomId,
         subscriber: ParticipantId,
+        connection_id: crate::entity::ConnectionId,
         selector: crate::track::TrackSelector,
         selection: crate::track::SelectionPolicy,
     },
     TrackSubscriptionRemoved {
         room_id: crate::entity::RoomId,
         subscriber: ParticipantId,
+        connection_id: crate::entity::ConnectionId,
         selector: crate::track::TrackSelector,
     },
-    TrackPublished {
-        track: Track,
-    },
-    TrackUnpublished {
-        origin: ParticipantId,
-        track_id: TrackId,
-    },
+    TrackPublished(Track),
+    TrackUnpublished(crate::track::TrackMeta),
 }
 
 #[derive(Clone)]

@@ -318,7 +318,7 @@ mod tests {
     }
 
     fn track_id(kind: crate::entity::TrackKind, label: &str) -> crate::entity::TrackId {
-        crate::entity::ParticipantId::new().derive_track_id(kind, label)
+        crate::entity::ConnectionId::new().derive_track_id(kind, label)
     }
 
     #[test]

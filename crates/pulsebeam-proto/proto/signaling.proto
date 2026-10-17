@@ -172,6 +172,8 @@ package pulsebeam.media.v1;
 //
 //   - A ParticipantId MUST NOT later identify a different
 //     ParticipantExternalId.
+//   - TrackId is scoped to one connection incarnation: reconnecting creates
+//     a new TrackId even for the same participant_id, kind, and label.
 //   - A TrackId MUST NOT later identify a different participant_id, kind, or
 //     label.
 //   - Changing a published track's label, kind, or owner creates a different
@@ -182,7 +184,7 @@ package pulsebeam.media.v1;
 // Track identity:
 //
 //   LocalTrack  = (kind, label) within one participant's desired send state.
-//   RemoteTrack = TrackId.
+//   RemoteTrack = connection-scoped TrackId.
 //
 // The client SDK resolves application-facing selectors such as
 // (participant_external_id, kind, label) to TrackId using Catalog. This selector

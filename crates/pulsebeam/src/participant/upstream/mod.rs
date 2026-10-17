@@ -7,7 +7,7 @@ mod binding_tests;
 
 use crate::keys::TrackHandle;
 use crate::{
-    entity::{TrackId, TrackKind},
+    entity::{ConnectionId, TrackId, TrackKind},
     log::{LogCtx, plog_warn},
     rtp::RtpPacket,
     track::UpstreamTrack,
@@ -141,14 +141,16 @@ impl UpstreamSlot {
 pub(crate) struct UpstreamMedia {
     ctx: LogCtx,
     kind: TrackKind,
+    connection_id: ConnectionId,
     published_tracks: Vec<UpstreamSlot>,
 }
 
 impl UpstreamMedia {
-    fn new(ctx: LogCtx, kind: TrackKind) -> Self {
+    fn new(ctx: LogCtx, kind: TrackKind, connection_id: ConnectionId) -> Self {
         Self {
             ctx,
             kind,
+            connection_id,
             published_tracks: Vec::new(),
         }
     }
@@ -217,7 +219,7 @@ impl UpstreamMedia {
         if slot.published_once {
             return Err(SenderLabelError::AlreadyPublished);
         }
-        let id = slot.track.meta.origin.derive_track_id(self.kind, label);
+        let id = self.connection_id.derive_track_id(self.kind, label);
         if self
             .published_tracks
             .iter()
@@ -265,7 +267,7 @@ impl UpstreamMedia {
             }
             replacements.push((
                 index,
-                slot.track.meta.origin.derive_track_id(self.kind, label),
+                self.connection_id.derive_track_id(self.kind, label),
                 label.to_owned(),
             ));
         }
@@ -358,10 +360,10 @@ pub struct Upstream {
 pub type UpstreamAllocator = Upstream;
 
 impl Upstream {
-    pub(crate) fn new(ctx: LogCtx) -> Self {
+    pub(crate) fn new(ctx: LogCtx, connection_id: ConnectionId) -> Self {
         Self {
-            audio: UpstreamAudio::new(ctx),
-            video: UpstreamVideo::new(ctx),
+            audio: UpstreamAudio::new(ctx, connection_id),
+            video: UpstreamVideo::new(ctx, connection_id),
             data: UpstreamData::new(),
             routes: UpstreamRouteTable::default(),
             track_handles: HashMap::new(),

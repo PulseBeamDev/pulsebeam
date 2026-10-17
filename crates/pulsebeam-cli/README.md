@@ -47,8 +47,10 @@ Use `--ttl SECONDS` to select a different positive lifetime. This command does
 not accept production signing material.
 
 Canonical entity IDs can be derived for log lookup with `id room`,
-`id participant`, and `id track`. Each command requires a canonical
-`--project-id` and the external identity chain for the requested entity.
+`id participant`, and `id track`. Room and participant derivation require
+`--project-id` and the corresponding external identity chain. Track derivation
+requires the actual `--connection-id`, `--kind`, and `--label`: a reconnect
+mints a new connection and consequently new TrackIds for the same participant.
 
 ```text
 ./bazel run --config=release //:cli -- \

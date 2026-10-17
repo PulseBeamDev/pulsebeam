@@ -8,9 +8,9 @@ pub(crate) struct UpstreamVideo {
     media: UpstreamMedia,
 }
 impl UpstreamVideo {
-    pub(super) fn new(ctx: LogCtx) -> Self {
+    pub(super) fn new(ctx: LogCtx, connection_id: crate::entity::ConnectionId) -> Self {
         Self {
-            media: UpstreamMedia::new(ctx, crate::entity::TrackKind::Video),
+            media: UpstreamMedia::new(ctx, crate::entity::TrackKind::Video, connection_id),
         }
     }
     pub(super) fn add_published_track(
