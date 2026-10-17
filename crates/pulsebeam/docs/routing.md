@@ -2,6 +2,11 @@
 
 ## The model
 
+This document specifies the currently implemented node-local compiled routing
+contract. The proposed **cross-node authority and room topology** are defined
+in [cluster.md](cluster.md); an execution `Shard` is not a node-owned `RoomShard`.
+
+
 The controller is a compiler. A shard is a packet executor.
 
 The controller owns semantic state: rooms, participants, published tracks and
