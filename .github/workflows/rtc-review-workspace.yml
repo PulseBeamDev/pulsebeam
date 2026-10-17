@@ -19,16 +19,23 @@ jobs:
           rustup toolchain install 1.99.0 --profile minimal --component rustfmt --component clippy
           cargo +1.99.0 fetch --manifest-path crates/pulsebeam-rtc/simulation/Cargo.toml --target x86_64-unknown-linux-gnu
           cargo +1.99.0 fetch --manifest-path Cargo.toml --target x86_64-unknown-linux-gnu
-          mkdir -p "$RUNNER_TEMP/rtc-tools/cargo"
-          cp -a "$HOME/.cargo/registry" "$HOME/.cargo/git" "$RUNNER_TEMP/rtc-tools/cargo/"
-          cp -a "$HOME/.rustup/toolchains/1.99.0-x86_64-unknown-linux-gnu" "$RUNNER_TEMP/rtc-tools/rust"
-          cp Cargo.lock "$RUNNER_TEMP/rtc-tools/workspace-Cargo.lock"
-          cp crates/pulsebeam-rtc/simulation/Cargo.lock "$RUNNER_TEMP/rtc-tools/native-Cargo.lock"
-          tar -C "$RUNNER_TEMP/rtc-tools" -czf "$RUNNER_TEMP/rtc-tools.tar.gz" .
+          mkdir -p "$RUNNER_TEMP/rtc-deps/cargo"
+          cp -a "$HOME/.cargo/registry" "$HOME/.cargo/git" "$RUNNER_TEMP/rtc-deps/cargo/"
+          cp Cargo.lock "$RUNNER_TEMP/rtc-deps/workspace-Cargo.lock"
+          cp crates/pulsebeam-rtc/simulation/Cargo.lock "$RUNNER_TEMP/rtc-deps/native-Cargo.lock"
+          tar -C "$RUNNER_TEMP/rtc-deps" -czf "$RUNNER_TEMP/rtc-deps.tar.gz" .
+          tar -C "$HOME/.rustup/toolchains/1.99.0-x86_64-unknown-linux-gnu" -czf "$RUNNER_TEMP/rtc-rust.tar.gz" bin lib libexec
       - uses: actions/upload-artifact@v4
         with:
-          name: rtc-review-tools
-          path: ${{ runner.temp }}/rtc-tools.tar.gz
+          name: rtc-review-deps
+          path: ${{ runner.temp }}/rtc-deps.tar.gz
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rtc-review-rust
+          path: ${{ runner.temp }}/rtc-rust.tar.gz
           compression-level: 0
           retention-days: 1
           if-no-files-found: error
