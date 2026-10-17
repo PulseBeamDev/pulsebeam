@@ -1,0 +1,68 @@
+name: RTC isolated verification inputs
+on:
+  push:
+    branches: [refactor/rtc-ownership-boundaries]
+    paths: [.github/workflows/rtc-verification-kit.yml]
+permissions:
+  contents: read
+jobs:
+  export:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-ci
+      - name: Build existing owner boundaries
+        run: ./bazel build //crates/pulsebeam-rtc:pulsebeam-rtc //crates/pulsebeam-rtc:unit_tests //crates/pulsebeam:pulsebeam //crates/pulsebeam:unit_tests @rules_rust//tools/upstream_wrapper:rustfmt
+      - name: Archive declared compiler inputs
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib, subprocess, tarfile
+          root = pathlib.Path(subprocess.check_output(['./bazel', 'info', 'execution_root'], text=True).strip())
+          targets = '//crates/pulsebeam-rtc:pulsebeam-rtc //crates/pulsebeam-rtc:unit_tests //crates/pulsebeam:pulsebeam //crates/pulsebeam:unit_tests //crates/pulsebeam-core:pulsebeam-core //crates/pulsebeam-core:pulsebeam-core-portable //crates/pulsebeam-runtime:pulsebeam-runtime //crates/pulsebeam-routing:pulsebeam-routing @rules_rust//tools/upstream_wrapper:rustfmt'
+          graph = json.loads(subprocess.check_output(['./bazel', 'aquery', 'set(' + targets + ')', '--output=jsonproto', '--include_artifacts'], text=True))
+          fragments = {x['id']: x for x in graph.get('pathFragments', [])}
+          def path(i):
+              f = fragments[i]
+              return (path(f['parentId']) + '/' if f.get('parentId') else '') + f['label']
+          artifacts = {x['id']: path(x['pathFragmentId']) for x in graph.get('artifacts', [])}
+          sets = {x['id']: x for x in graph.get('depSetOfFiles', [])}
+          def inputs(i):
+              s = sets[i]
+              yield from s.get('directArtifactIds', [])
+              for child in s.get('transitiveDepSetIds', []):
+                  yield from inputs(child)
+          names = set()
+          for action in graph.get('actions', []):
+              for i in action.get('inputDepSetIds', []):
+                  names.update(artifacts[j] for j in inputs(i))
+              names.update(artifacts[j] for j in action.get('outputIds', []))
+          destination = pathlib.Path(os.environ['RUNNER_TEMP'])
+          (destination / 'actions.json').write_text(json.dumps(graph))
+          nix_roots = set()
+          with tarfile.open(destination / 'rtc-build-inputs.tar.gz', 'w:gz', dereference=True) as archive:
+              archive.add(destination / 'actions.json', arcname='actions.json')
+              for name in sorted(names):
+                  source = root / name
+                  if not source.exists():
+                      continue
+                  archive.add(source, arcname='execroot/' + name)
+                  for candidate in ([source] if source.is_file() else source.rglob('*')):
+                      resolved = candidate.resolve()
+                      parts = resolved.parts
+                      if parts[:3] == ('/', 'nix', 'store') and len(parts) > 3:
+                          nix_roots.add('/nix/store/' + parts[3])
+              if nix_roots:
+                  closure = subprocess.check_output(['nix-store', '--query', '--requisites', *sorted(nix_roots)], text=True).splitlines()
+                  archive.dereference = False
+                  for store_path in sorted(set(closure)):
+                      archive.add(store_path, arcname=store_path.lstrip('/'))
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rtc-build-inputs
+          path: ${{ runner.temp }}/rtc-build-inputs.tar.gz
+          retention-days: 1
