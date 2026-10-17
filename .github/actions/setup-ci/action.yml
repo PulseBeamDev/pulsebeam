@@ -8,3 +8,11 @@ runs:
       with:
         extra_nix_config: |
           experimental-features = nix-command flakes
+    - uses: bazel-contrib/setup-bazel@0.19.1
+      with:
+        # Avoid downloading Bazel every time.
+        bazelisk-cache: true
+        # Store build cache per workflow.
+        disk-cache: true
+        # Share repository cache between workflows.
+        repository-cache: true
