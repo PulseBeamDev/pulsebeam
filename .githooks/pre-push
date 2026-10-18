@@ -1,13 +1,8 @@
 #!/bin/sh
-# Keep the expensive full acceptance gate in CI.
+# Require complete local acceptance before pushing.
 set -eu
-
-if [ "${PULSEBEAM_SKIP_PUSH_CHECKS:-0}" = 1 ]; then
-    printf 'Skipping PulseBeam pre-push checks (PULSEBEAM_SKIP_PUSH_CHECKS=1).\n' >&2
-    exit 0
-fi
 
 root=$(git rev-parse --show-toplevel)
 cd "$root"
-printf 'PulseBeam pre-push: running Bazel fast gate...\n' >&2
-./bazel test //:fast --test_output=errors
+printf 'PulseBeam pre-push: running complete Bazel acceptance gate...\n' >&2
+./bazel test //:test --keep_going --test_output=errors --zip_undeclared_test_outputs
