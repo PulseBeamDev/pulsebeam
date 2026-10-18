@@ -150,13 +150,40 @@ settings for libtest.
 
 ## Testing contract
 
+### Keep the QA loop fast
+
+Nearly all behavioral coverage must run very fast. Use deterministic end-to-end
+simulation of real production logic for system behavior, with virtual time and
+execution faster than real time. Broad coverage is a reason to improve the
+simulator, not to replace the system with mocks or retreat to isolated unit
+proof. Keep narrow local behavior in direct unit tests.
+
+Every QA change must maintain or improve feedback speed, reliability, meaningful
+coverage, and maintenance cost. Reuse fixtures and scenarios, remove redundant
+work, and optimize the harness before adding more machinery. Slow simulations
+are an infrastructure problem to fix; relabeling them `slow`, adding workers,
+weakening assertions, or cutting meaningful cases is not that fix.
+
+Treat browser automation as expensive and flakiness-prone. Keep it exceptional,
+narrow, and mostly smoke tests for browser-only behavior. Put behavioral and
+property matrices in fast deterministic tests, not browser sessions. Any added
+real-boundary cost must name the unique regression that simulation cannot
+faithfully detect and use the smallest smoke that detects it.
+
+For workload changes, report uncached execution cost before and after, separately
+from build/cache time, and explain preserved fidelity. New cost must earn its
+place; test counts are not an achievement. These are design and review duties,
+not flaky wall-clock assertions. Existing required gates still apply until an
+explicit migration removes their obsolete proof.
+
 ### Choose proof that earns its cost
 
 Choose the smallest deterministic, faithful proof in this default order: **unit,
-simulation, simulation property, integration, end-to-end**. Cost and fidelity
-are separate: a controlled simulation can be cheap, while codec/native or
-generated cases can be expensive. Put repeated or expensive proof in an honest
-owner route without making it optional in complete acceptance.
+simulation, simulation property, integration, end-to-end**. Scope and cost are
+separate: end-to-end application behavior can run in a fast simulation without
+a browser or wall-clock waiting. Keep genuinely irreducible expensive proof in
+an honest owner route without making it optional in complete acceptance; that
+classification does not excuse avoidable cost.
 
 Retain a higher-tier check only for a distinct failure that needs that boundary.
 Similar scenarios across language, wire or platform boundaries are not
