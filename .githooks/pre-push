@@ -1,8 +1,3 @@
 #!/bin/sh
-# Require complete local acceptance before pushing.
+# Acceptance runs at commit time, not on every push.
 set -eu
-
-root=$(git rev-parse --show-toplevel)
-cd "$root"
-printf 'PulseBeam pre-push: running complete Bazel acceptance gate...\n' >&2
-./bazel test //:test --keep_going --test_output=errors --zip_undeclared_test_outputs
