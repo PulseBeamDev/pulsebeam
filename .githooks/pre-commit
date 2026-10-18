@@ -1,0 +1,35 @@
+#!/bin/sh
+# Enforce the exact tree that will become the commit.
+set -eu
+
+root=$(git rev-parse --show-toplevel)
+cd "$root"
+
+# Bazel reads the worktree, while Git commits the index. Never validate one
+# snapshot and accidentally commit another (including partially staged files).
+if ! git diff --quiet --no-ext-diff; then
+    printf 'PulseBeam: stage or discard all tracked edits before committing.\n' >&2
+    exit 1
+fi
+
+printf 'PulseBeam: auto-formatting sources with Bazel...\n' >&2
+./bazel run //:fix
+
+# Formatters are allowed to modify staged files. Include those corrections in
+# the commit, but do not sweep in unrelated pre-existing edits.
+git add -u
+if ! git diff --cached --check --no-ext-diff; then
+    printf 'PulseBeam: staged patch contains whitespace errors.\n' >&2
+    exit 1
+fi
+
+# All lint, formatting, build and test contracts are enforced by this gate.
+# The gate can fail on lints with no mechanically safe fix.
+printf 'PulseBeam: running complete Bazel acceptance before commit...\n' >&2
+./bazel test //:test --keep_going --test_output=errors --zip_undeclared_test_outputs
+
+# Catch any source changes made by tools/tests or concurrent processes.
+if ! git diff --quiet --no-ext-diff; then
+    printf 'PulseBeam: working tree changed during verification; stage and retry.\n' >&2
+    exit 1
+fi

@@ -109,9 +109,15 @@ py_test(
 )
 filegroup(name = "workflow_inputs", srcs = glob(["*.md", "Justfile"], allow_empty = True))
 
+py_test(
+    name = "clippy_fix_contract",
+    srcs = ["tests/clippy_fix_test.py", "clippy-fix.py"],
+    main = "tests/clippy_fix_test.py",
+)
+
 py_binary(
     name = "fix",
-    srcs = ["fix.py"],
+    srcs = ["fix.py", "clippy-fix.py"],
     main = "fix.py",
     data = FIX_INPUTS.values(),
     args = [argument for key, target in FIX_INPUTS.items() for argument in ["--" + key, "$(rootpath %s)" % target]],
