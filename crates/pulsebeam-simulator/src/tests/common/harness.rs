@@ -1,13 +1,13 @@
 use crate::tests::common::client::{
-    AudioReceiveLog, MAX_CONCEALABLE_GAP, QualityVideoReference, RequestedVideo, SimClientBuilder,
-    VideoReceiveLog, VideoReceiveStats,
+    AudioReceiveLog, ClientObservation, MAX_CONCEALABLE_GAP, QualityVideoReference, RequestedVideo,
+    SimClientBuilder, VideoReceiveLog, VideoReceiveStats,
 };
 use crate::tests::common::decoder::{
     MAX_AUDIO_REFERENCE_PEAK, MAX_REFERENCE_MEAN_ABSOLUTE, MAX_REFERENCE_PEAK,
 };
 use crate::tests::common::media::{KeyframeRecoveryProbe, VbrProfile};
 use crate::tests::common::{
-    DEFAULT_SIM_SHARDS, reserve_subnet, run_sim_or_timeout, start_sfu_node_with, subnet_ip,
+    DEFAULT_SIM_SHARDS, reserve_subnet, run_sim_or_timeout, start_observed_sfu_node, subnet_ip,
     subnet_ip_v6,
 };
 use pulsebeam_agent_native::SimulcastLayer;
@@ -959,7 +959,7 @@ enum PendingDriverOp {
     SetAudioIntent(Vec<String>, bool),
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct VideoSubscription {
     pub participant_id: String,
     pub height: u32,
@@ -967,9 +967,100 @@ pub struct VideoSubscription {
     pub priority: u32,
 }
 
+#[derive(Clone, Default)]
+struct PlanIntent {
+    video: Vec<VideoSubscription>,
+    audio: Vec<String>,
+    automatic_audio: bool,
+    topics: TopicRegistrations,
+}
+
+struct OperationQueue {
+    pending: Vec<PendingDriverOp>,
+    intent: PlanIntent,
+    initial_topics: TopicRegistrations,
+}
+
+impl OperationQueue {
+    fn new(topics: TopicRegistrations) -> Self {
+        Self {
+            pending: Vec::new(),
+            intent: PlanIntent {
+                automatic_audio: true,
+                topics: topics.clone(),
+                ..Default::default()
+            },
+            initial_topics: topics,
+        }
+    }
+
+    fn restart(&mut self) {
+        *self = Self::new(self.initial_topics.clone());
+    }
+
+    fn push(&mut self, operation: PendingDriverOp) {
+        match &operation {
+            PendingDriverOp::SetSubscriptions(video) => self.intent.video.clone_from(video),
+            PendingDriverOp::SetAudioIntent(pinned, automatic) => {
+                self.intent.audio.clone_from(pinned);
+                self.intent.automatic_audio = *automatic;
+            }
+            PendingDriverOp::DeclarePublishTopic(topic)
+            | PendingDriverOp::DeclareOrderedPublisher(topic) => {
+                let mode = if matches!(operation, PendingDriverOp::DeclarePublishTopic(_)) {
+                    TopicMode::Latest
+                } else {
+                    TopicMode::Ordered
+                };
+                let registration = TopicPublisher {
+                    topic: topic.clone(),
+                    mode,
+                };
+                if !self.intent.topics.publishers.contains(&registration) {
+                    self.intent.topics.publishers.push(registration);
+                }
+            }
+            PendingDriverOp::DeclareSubscribeTopic(topic, _)
+            | PendingDriverOp::DeclareOrderedSubscriber(topic) => {
+                let (mode, publisher_id) = match &operation {
+                    PendingDriverOp::DeclareSubscribeTopic(_, publisher) => {
+                        (TopicMode::Latest, publisher.clone())
+                    }
+                    _ => (TopicMode::Ordered, None),
+                };
+                let registration = TopicSubscriber {
+                    topic: topic.clone(),
+                    mode,
+                    publisher_id,
+                };
+                if !self.intent.topics.subscribers.contains(&registration) {
+                    self.intent.topics.subscribers.push(registration);
+                }
+            }
+            PendingDriverOp::PublishData(..) | PendingDriverOp::PublishOrdered(..) => {}
+        }
+        self.pending.push(operation);
+    }
+}
+
+#[test]
+fn driver_restart_restores_initial_intent() {
+    let mut queue = OperationQueue::new(TopicRegistrations::default());
+    queue.push(PendingDriverOp::SetAudioIntent(
+        vec!["speaker".into()],
+        false,
+    ));
+    queue.push(PendingDriverOp::DeclarePublishTopic("old-topic".into()));
+    queue.restart();
+    assert!(queue.pending.is_empty() && queue.intent.audio.is_empty());
+    assert!(queue.intent.automatic_audio);
+    assert_eq!(queue.intent.topics, TopicRegistrations::default());
+}
+
 // ── Per-participant shared state ────────────────────────────────────────────
 
 struct ParticipantShared {
+    observation: Mutex<Option<ClientObservation>>,
     video_rx: Arc<Mutex<VideoReceiveLog>>,
     audio_rx: Arc<Mutex<AudioReceiveLog>>,
     quality_references: Arc<Mutex<BTreeMap<String, QualityVideoReference>>>,
@@ -987,7 +1078,7 @@ struct ParticipantShared {
     /// Set to Some(...) once the participant has connected for the first time.
     participant_id: Mutex<Option<String>>,
     /// Operations queued by the coordinator; drained on next drive tick.
-    pending_ops: Mutex<Vec<PendingDriverOp>>,
+    pending_ops: Mutex<OperationQueue>,
     /// Data received per topic, accumulated across all drive ticks.
     data_received: Mutex<HashMap<String, Vec<Vec<u8>>>>,
     /// Remote video tracks discovered via signaling (track IDs).
@@ -998,8 +1089,10 @@ impl ParticipantShared {
     fn new(
         quality_references: Arc<Mutex<BTreeMap<String, QualityVideoReference>>>,
         h264_publishers: Arc<Mutex<BTreeSet<String>>>,
+        topics: TopicRegistrations,
     ) -> Self {
         Self {
+            observation: Mutex::new(None),
             video_rx: Arc::new(Mutex::new(VideoReceiveLog::default())),
             audio_rx: Arc::new(Mutex::new(AudioReceiveLog::default())),
             quality_references,
@@ -1013,7 +1106,7 @@ impl ParticipantShared {
             media_kinds: Mutex::new(HashMap::new()),
             incarnations: Mutex::new(Vec::new()),
             participant_id: Mutex::new(None),
-            pending_ops: Mutex::new(Vec::new()),
+            pending_ops: Mutex::new(OperationQueue::new(topics)),
             data_received: Mutex::new(HashMap::new()),
             discovered_tracks: Mutex::new(HashSet::new()),
         }
@@ -1042,21 +1135,11 @@ struct ParticipantHandle {
     publishes_audio: bool,
     quality_video: Option<(QualityVideoSource, QualityVideoLayer)>,
     observes_video: bool,
+    auto_subscribe: bool,
+    video_capacity: usize,
+    retirement_deadline: Option<Instant>,
     /// Whether the plan has this participant in the room right now.
     present: bool,
-    /// How each departure ended, in order: `true` for a graceful leave, `false` for a crash.
-    ///
-    /// Per departure rather than per participant, because a rejoin makes the previous identity
-    /// superseded and how *that* one ended is what decides whether a lingering ghost of it is the
-    /// SFU's fault or the network's.
-    departures: Vec<bool>,
-    /// Whether the last departure was a clean one.
-    ///
-    /// A graceful leave tells the SFU directly, so everyone should know at once and a ghost is a
-    /// bug. A crash is only noticed when the transport times out, which takes seconds and is a
-    /// property of the network rather than of state management - so the invariant does not hold
-    /// anybody to it.
-    departed_cleanly: bool,
 }
 
 impl ParticipantHandle {
@@ -1249,7 +1332,7 @@ async fn run_participant(
             tokio::select! {
                 command = cmd_rx.recv() => break command,
                 _ = interval.tick() => {
-                    let operations = shared.pending_ops.lock().unwrap().drain(..).collect::<Vec<_>>();
+                    let operations = shared.pending_ops.lock().unwrap().pending.drain(..).collect::<Vec<_>>();
                     let mut retry = Vec::new();
                     for operation in operations {
                         let complete = match operation.clone() {
@@ -1290,11 +1373,13 @@ async fn run_participant(
                     }
                     if !retry.is_empty() {
                         let mut pending = shared.pending_ops.lock().unwrap();
-                        retry.append(&mut pending);
-                        *pending = retry;
+                        retry.append(&mut pending.pending);
+                        pending.pending = retry;
                     }
 
                     client.tick().await?;
+                    let observation = client.ctx.observation().await?;
+                    *shared.observation.lock().unwrap() = Some(observation);
                     {
                         let mut received = shared.data_received.lock().unwrap();
                         for (topic, payload) in client.ctx.received_data.drain(..) {
@@ -1430,10 +1515,12 @@ async fn execute_plan(
     handles: &mut PlanHandles,
     name_to_ip: &PlanIps,
     reports: &Mutex<HashMap<&'static str, LinkReport>>,
+    observer: &pulsebeam::sim_observation::Observer,
 ) -> anyhow::Result<()> {
     let total = plan.len();
     // Duration of the most recent Run, so interval properties know what window they describe.
     let mut window = Duration::ZERO;
+    let mut disturbances = BTreeSet::new();
 
     for (idx, step) in plan.iter().enumerate() {
         let n = idx + 1;
@@ -1459,6 +1546,9 @@ async fn execute_plan(
                 // not settling, it is a pause mid-transition.
                 if *duration >= ROOM_SETTLE_FLOOR {
                     assert_room_state_consistent(handles, description);
+                    if disturbances.is_empty() {
+                        assert_convergence(handles, observer, description).await?;
+                    }
                 }
             }
 
@@ -1490,6 +1580,7 @@ async fn execute_plan(
                     !observers.is_empty(),
                     "step \"{description}\": no video observers for {publisher}"
                 );
+                let mut pending_convergence = None;
                 tokio::time::timeout(*timeout, async {
                     loop {
                         if subject.connected()
@@ -1500,14 +1591,22 @@ async fn execute_plan(
                                         == Some((subject.publishes_video, subject.publishes_audio))
                             })
                         {
-                            break;
+                            assert_room_state_consistent(handles, description);
+                            if !disturbances.is_empty() {
+                                break;
+                            }
+                            // Receiver discovery is not an all-client barrier: publish-only
+                            // catalogs and wire-intent acknowledgments progress independently.
+                            match assert_convergence(handles, observer, description).await {
+                                Ok(()) => break,
+                                Err(error) => pending_convergence = Some(error),
+                            }
                         }
                         tokio::time::sleep(Duration::from_millis(20)).await;
                     }
                 })
                 .await
-                .map_err(|_| anyhow::anyhow!("step \"{description}\": {publisher} publication did not converge within {timeout:?}"))?;
-                assert_room_state_consistent(handles, description);
+                .map_err(|_| anyhow::anyhow!("step \"{description}\": {publisher} publication did not converge within {timeout:?}; last convergence failure: {pending_convergence:?}"))?;
             }
 
             Step::StallController { duration } => {
@@ -1622,6 +1721,7 @@ async fn execute_plan(
                 tracing::info!("[step {n}/{total}: {kind}] \"{description}\" ({from} ↔ {to})");
                 let from_ip = resolve(name_to_ip, from, description)?;
                 let to_ip = resolve(name_to_ip, to, description)?;
+                disturbances.insert((0, (*from).min(*to), (*from).max(*to)));
                 turmoil::partition(from_ip, to_ip);
             }
 
@@ -1633,6 +1733,7 @@ async fn execute_plan(
                 tracing::info!("[step {n}/{total}: {kind}] \"{description}\" ({from} ↔ {to})");
                 let from_ip = resolve(name_to_ip, from, description)?;
                 let to_ip = resolve(name_to_ip, to, description)?;
+                disturbances.remove(&(0, (*from).min(*to), (*from).max(*to)));
                 turmoil::repair(from_ip, to_ip);
             }
 
@@ -1644,6 +1745,7 @@ async fn execute_plan(
                 tracing::info!("[step {n}/{total}: {kind}] \"{description}\" ({from} ↔ {to})");
                 let from_ip = resolve(name_to_ip, from, description)?;
                 let to_ip = resolve(name_to_ip, to, description)?;
+                disturbances.insert((1, (*from).min(*to), (*from).max(*to)));
                 turmoil::hold(from_ip, to_ip);
             }
 
@@ -1655,6 +1757,7 @@ async fn execute_plan(
                 tracing::info!("[step {n}/{total}: {kind}] \"{description}\" ({from} ↔ {to})");
                 let from_ip = resolve(name_to_ip, from, description)?;
                 let to_ip = resolve(name_to_ip, to, description)?;
+                disturbances.remove(&(1, (*from).min(*to), (*from).max(*to)));
                 turmoil::release(from_ip, to_ip);
             }
 
@@ -1664,9 +1767,10 @@ async fn execute_plan(
             } => {
                 tracing::info!("[step {n}/{total}: {kind}] \"{description}\" ({participant})");
                 let handle = get_handle(handles, participant, description)?;
-                // Ground truth for the room invariant, from the plan rather than the wire.
+                if !handle.shared.incarnations.lock().unwrap().is_empty() {
+                    handle.shared.pending_ops.lock().unwrap().restart();
+                }
                 handle.present = true;
-                handle.departed_cleanly = true;
                 handle.send_command(ParticipantCmd::Reconnect);
             }
 
@@ -1678,8 +1782,8 @@ async fn execute_plan(
                 let handle = get_handle(handles, participant, description)?;
                 // Ground truth for the room invariant, from the plan rather than the wire.
                 handle.present = false;
-                handle.departed_cleanly = true;
-                handle.departures.push(true);
+                handle.retirement_deadline = None;
+                handle.shared.pending_ops.lock().unwrap().restart();
                 handle.send_command(ParticipantCmd::Shutdown);
             }
 
@@ -1691,8 +1795,7 @@ async fn execute_plan(
                 let handle = get_handle(handles, participant, description)?;
                 // Ground truth for the room invariant, from the plan rather than the wire.
                 handle.present = false;
-                handle.departed_cleanly = false;
-                handle.departures.push(false);
+                handle.retirement_deadline = Some(Instant::now() + CRASH_RETIREMENT_BUDGET);
                 handle.send_command(ParticipantCmd::Drop);
             }
 
@@ -1702,9 +1805,9 @@ async fn execute_plan(
             } => {
                 tracing::info!("[step {n}/{total}: {kind}] \"{description}\" ({participant})");
                 let handle = get_handle(handles, participant, description)?;
-                // Ground truth for the room invariant, from the plan rather than the wire.
+                // This command rebuilds the harness driver, unlike native ICE reconnection.
+                handle.shared.pending_ops.lock().unwrap().restart();
                 handle.present = true;
-                handle.departed_cleanly = true;
                 handle.send_command(ParticipantCmd::Reconnect);
             }
 
@@ -3000,6 +3103,22 @@ async fn execute_plan(
             report_metrics(handle, ip, window)
         );
         let mut report = measure(handle, ip, window);
+        let video = handle.video_rx();
+        report.decoded_video = handles
+            .iter()
+            .filter_map(|(name, publisher)| {
+                let frames = publisher
+                    .shared
+                    .incarnations
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|id| video.decoded_by_publisher.get(id))
+                    .map(|stream| stream.frames)
+                    .sum::<u64>();
+                (frames > 0).then_some((*name, frames))
+            })
+            .collect();
         report.forwarded_quality = quality_by_publisher.clone();
         report.quality_changes = changes_by_publisher.clone();
         report.quality_reversals = reversals_by_publisher.clone();
@@ -3033,134 +3152,207 @@ fn get_handle<'a>(
         .ok_or_else(|| anyhow::anyhow!("step \"{step_desc}\": unknown participant \"{name}\""))
 }
 
-/// What every client must believe about the room, checked against what the plan actually did.
-///
-/// Run after every `Step::Run` of every plan, for every participant, rather than opted into by the
-/// plans that happen to think of it. State-management bugs do not announce themselves: a ghost
-/// participant, or somebody counted twice, looks exactly like a passing test to any assertion
-/// aimed at bitrate or frames. The two failures this exists for both shipped and were found by
-/// hand.
-///
-/// It checks both safety and settled liveness: no departed or superseded identity may remain, and
-/// every live publication must be visible to every live observer after a settled run.
-fn assert_room_state_consistent(handles: &PlanHandles, after: &str) {
-    // Every participant id the plan has ever created, and what it means now.
-    #[derive(Clone, Copy)]
-    enum Identity {
-        /// The participant's current id, and they are in the room.
-        Live,
-        /// The current id of somebody the plan has removed.
-        Departed,
-        /// An id from before a reconnect. That person exists, but not under this name any more.
-        Superseded,
-        /// Gone without saying so. Nothing is asserted: detection is a timeout, not a message.
-        Vanished,
-    }
-    let mut identities: HashMap<String, (&'static str, Identity)> = HashMap::new();
+fn expected_state(handles: &PlanHandles) -> anyhow::Result<super::oracle::ControlStateOracle> {
+    let mut participants = Vec::new();
     for (name, handle) in handles {
-        let incarnations = handle.shared.incarnations.lock().unwrap().clone();
-        let last = incarnations.len().saturating_sub(1);
-        for (i, id) in incarnations.into_iter().enumerate() {
-            let state = if i < last {
-                // Superseded, but only strictly if that incarnation ended by saying so. One that
-                // crashed is found out by timeout like any other.
-                if handle.departures.get(i).copied().unwrap_or(true) {
-                    Identity::Superseded
-                } else {
-                    Identity::Vanished
-                }
-            } else if handle.present {
-                Identity::Live
-            } else if handle.departed_cleanly {
-                Identity::Departed
-            } else {
-                // Crashed. The SFU only finds out when the transport times out, so how long a
-                // ghost lingers is a fact about the network. Not this invariant's business.
-                Identity::Vanished
-            };
-            identities.insert(id, (*name, state));
-        }
-    }
-
-    for (observer, handle) in handles {
-        // Only ask this of clients that are still running. A participant who has left stopped
-        // updating its view the moment it went, so its last snapshot is stale by construction -
-        // holding it to the room's current membership would report a ghost on every plan that
-        // ends by disconnecting everybody.
-        if !handle.present {
+        let allowed = handle.present
+            || handle
+                .retirement_deadline
+                .is_some_and(|deadline| Instant::now() < deadline);
+        if !allowed {
             continue;
         }
-        let known = handle.shared.discovered_tracks.lock().unwrap().clone();
-        for id in &known {
-            let Some((name, state)) = identities.get(id).copied() else {
-                panic!(
-                    "\nroom state inconsistent after {after}\n  observer:     {observer}\n  knows:        {id}\n  problem:      no participant in this plan has ever had that id\n  note:         a client holding an id nobody owns is state invented from\n                nowhere - a tile for somebody who never existed"
-                );
-            };
-            match state {
-                // Live is fine; Vanished is a crash, whose detection is a timeout rather than a
-                // message, so how long the ghost lingers is a fact about the network.
-                Identity::Live | Identity::Vanished => {}
-                Identity::Departed => panic!(
-                    "\nroom state inconsistent after {after}\n  observer:     {observer}\n  knows:        {name} ({id})\n  problem:      {name} has left the room\n  note:         a ghost - a tile, a name and a publication for somebody who\n                is not in the call"
-                ),
-                Identity::Superseded => panic!(
-                    "\nroom state inconsistent after {after}\n  observer:     {observer}\n  knows:        {id}\n  problem:      that is {name}'s identity from before they reconnected\n  note:         a ghost of an earlier incarnation - {name} is in the room, but\n                under a new id, so this is a second tile for one person"
-                ),
-            }
-            let Some(subject) = handles.get(name) else {
-                continue;
-            };
-            if !subject.connected() {
-                continue;
-            }
-            if subject.participant_id().as_deref() != Some(id) {
-                continue;
-            }
-            assert_eq!(
-                subject.room_name, handle.room_name,
-                "\nroom state inconsistent after {after}\n  observer:     {observer} ({})\n  subject:      {name} ({})\n  problem:      a publication crossed room boundaries",
-                handle.room_name, subject.room_name
-            );
-            let Some((video, audio)) = handle.media_kinds_of(id) else {
-                continue;
-            };
-            if !video && !audio {
-                continue;
-            }
-            assert_eq!(
-                video, subject.publishes_video,
-                "\nroom state inconsistent after {after}\n  observer:     {observer}\n  subject:      {name}\n  believes video: {video}, actually publishes video: {}\n  note:         a participant believed to send video that does not is a phantom\n                tile; announcing audio in `tracks_upsert` caused exactly this,\n                and put anyone sending both on screen twice",
-                subject.publishes_video
-            );
-            assert_eq!(
-                audio, subject.publishes_audio,
-                "\nroom state inconsistent after {after}\n  observer:     {observer}\n  subject:      {name}\n  believes audio: {audio}, actually publishes audio: {}\n  note:         the participant projection must not lose or invent an audio publication",
-                subject.publishes_audio
-            );
-        }
-
-        if !handle.observes_video {
+        let Some(id) = handle.participant_id() else {
+            anyhow::ensure!(!handle.present, "{name} never completed admission");
             continue;
-        }
-        for (name, subject) in handles {
-            if name == observer
-                || subject.room_name != handle.room_name
-                || !subject.present
-                || !subject.connected()
-                || !subject.publishes_video
-            {
-                continue;
-            }
-            let Some(id) = subject.participant_id() else {
-                continue;
-            };
-            assert!(
-                known.contains(&id),
-                "\nroom state did not converge after {after}\n  observer:     {observer}\n  missing:      {name} ({id})\n  known:        {known:?}\n  note:         a live publication must eventually be visible to every live observer"
-            );
-        }
+        };
+        let observation = handle
+            .shared
+            .observation
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("{name} has no complete client observation"))?;
+        participants.push(super::oracle::ExpectedParticipant {
+            id: id.parse()?,
+            room: handle.room_name,
+            video: handle.publishes_video,
+            audio: handle.publishes_audio,
+            required: handle.present,
+            video_targets: HashSet::new(),
+            connection: observation.admission,
+            topics: handle
+                .shared
+                .pending_ops
+                .lock()
+                .unwrap()
+                .intent
+                .topics
+                .clone(),
+        });
     }
+    let targets = participants
+        .iter()
+        .map(|participant| {
+            let handle = handles
+                .values()
+                .find(|handle| handle.participant_id().as_deref() == Some(&participant.id.as_str()))
+                .expect("bound plan identity");
+            let observation = handle
+                .shared
+                .observation
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("admission observation");
+            planned_video(&participants, participant, handle, &observation)
+                .into_iter()
+                .map(|id| {
+                    let id: pulsebeam::entity::ParticipantId =
+                        id.parse().expect("admission identity");
+                    id.derive_track_id(pulsebeam::entity::TrackKind::Video, "video")
+                })
+                .collect()
+        })
+        .collect::<Vec<_>>();
+    for (participant, targets) in participants.iter_mut().zip(targets) {
+        participant.video_targets = targets;
+    }
+    Ok(super::oracle::ControlStateOracle { participants })
+}
+
+fn planned_video(
+    participants: &[super::oracle::ExpectedParticipant],
+    participant: &super::oracle::ExpectedParticipant,
+    handle: &ParticipantHandle,
+    observation: &ClientObservation,
+) -> Vec<String> {
+    let intent = handle.shared.pending_ops.lock().unwrap().intent.clone();
+    let eligible = participants
+        .iter()
+        .filter(|peer| {
+            peer.room == participant.room
+                && peer.id != participant.id
+                && peer.video
+                && (peer.required
+                    || observation
+                        .snapshot
+                        .participants
+                        .contains_key(&peer.id.as_str()))
+        })
+        .map(|peer| peer.id.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut requested = intent
+        .video
+        .iter()
+        .filter(|request| eligible.contains(&request.participant_id))
+        .map(|request| request.participant_id.clone())
+        .collect::<Vec<_>>();
+    if handle.auto_subscribe {
+        let automatic = eligible
+            .iter()
+            .filter(|id| !requested.contains(id))
+            .cloned()
+            .collect::<Vec<_>>();
+        requested.extend(automatic);
+    }
+    requested.truncate(handle.video_capacity);
+    requested
+}
+
+fn assert_room_state_consistent(handles: &PlanHandles, after: &str) {
+    let expected = expected_state(handles)
+        .unwrap_or_else(|error| panic!("room state after {after}: {error:#}"));
+    for (name, handle) in handles.iter().filter(|(_, handle)| handle.present) {
+        let allowed = expected
+            .participants
+            .iter()
+            .filter(|peer| {
+                peer.room == handle.room_name
+                    && peer.id.as_str() != handle.participant_id().as_deref().unwrap_or_default()
+            })
+            .map(|peer| peer.id.as_str())
+            .collect::<BTreeSet<_>>();
+        let known = handle.shared.discovered_tracks.lock().unwrap();
+        assert!(
+            known.iter().all(|id| allowed.contains(id)),
+            "stale or cross-room publication after {after}: observer={name}, known={known:?}, allowed={allowed:?}"
+        );
+    }
+}
+
+// Pinned str0m ICE-lite expires Binding Requests after 15 seconds and checks idle
+// pairs every 3 seconds. This bounds detection plus control/shard retirement.
+const CRASH_RETIREMENT_BUDGET: Duration = Duration::from_secs(20);
+
+async fn assert_convergence(
+    handles: &PlanHandles,
+    observer: &pulsebeam::sim_observation::Observer,
+    after: &str,
+) -> anyhow::Result<()> {
+    let expected = expected_state(handles)?;
+    let owners = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let owners = observer.observe().await.map_err(anyhow::Error::msg)?;
+            if super::oracle::ControlStateOracle::projections_ready(&owners) {
+                break Ok::<_, anyhow::Error>(owners);
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!("owner projections did not finish bounded protocol progress after {after}")
+    })??;
+    expected
+        .check_owners(&owners)
+        .map_err(|error| anyhow::anyhow!("owner convergence after {after}: {error:#}"))?;
+    for (name, handle) in handles.iter().filter(|(_, handle)| handle.present) {
+        let observation = handle
+            .shared
+            .observation
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("{name} has no client snapshot"))?;
+        let id = handle.participant_id().expect("admitted model participant");
+        let participant = expected
+            .participants
+            .iter()
+            .find(|participant| participant.id.as_str() == id)
+            .expect("plan participant");
+        let intent = handle.shared.pending_ops.lock().unwrap().intent.clone();
+        let requested = planned_video(&expected.participants, participant, handle, &observation);
+        expected
+            .check_client(participant, &observation, &requested)
+            .map_err(|error| {
+                anyhow::anyhow!("client convergence after {after}, observer {name}: {error:#}")
+            })?;
+        let accepted = observation
+            .accepted
+            .as_ref()
+            .expect("checked accepted intent");
+        let pinned = intent
+            .audio
+            .iter()
+            .map(|participant| {
+                let participant: pulsebeam::entity::ParticipantId =
+                    participant.parse().expect("admission identity");
+                participant
+                    .derive_track_id(pulsebeam::entity::TrackKind::Audio, "audio")
+                    .as_str()
+            })
+            .collect::<Vec<_>>();
+        anyhow::ensure!(
+            accepted.audio.pinned == pinned && accepted.audio.automatic == intent.automatic_audio,
+            "audio intent differs from plan for {name}"
+        );
+        anyhow::ensure!(
+            accepted.topics == intent.topics,
+            "topic intent differs from plan for {name}"
+        );
+    }
+    Ok(())
 }
 
 /// A `Step::Run` shorter than this is a pause mid-transition, not a settled room, so the state
@@ -3540,6 +3732,7 @@ pub struct LinkReport {
     pub window: Duration,
     pub received_bytes: u64,
     pub forwarded_media_bytes: u64,
+    pub decoded_video: BTreeMap<&'static str, u64>,
     /// Allocation passes recorded. Zero means the plan never exercised this participant, which a
     /// caller must not confuse with healthy behaviour.
     pub samples: usize,
@@ -3693,6 +3886,7 @@ fn measure(handle: &ParticipantHandle, ip: IpAddr, window: Duration) -> LinkRepo
             .rx_bytes()
             .saturating_sub(handle.interval_rx_baseline),
         forwarded_media_bytes: handle.forwarded_media(),
+        decoded_video: BTreeMap::new(),
         samples: series.len(),
         estimate_last_bps: series.last().map(|s| s.1).unwrap_or(0),
         estimate_min_bps: series.iter().map(|(_, b, _)| *b).min().unwrap_or(0),
@@ -4528,11 +4722,15 @@ impl LocalNodeSim {
         let num_shards = self.num_shards;
         let initial_topics = initial_topic_registrations(&plan);
 
-        sim.host(server_ip, move || async move {
-            let rng = pulsebeam_runtime::rand::seeded_rng(seed);
-            start_sfu_node_with(server_ip, rng, num_shards, tcp_only)
-                .await
-                .map_err(Into::into)
+        let (observation_tx, mut observation_rx) = mpsc::channel(1);
+        sim.host(server_ip, move || {
+            let observation_tx = observation_tx.clone();
+            async move {
+                let rng = pulsebeam_runtime::rand::seeded_rng(seed);
+                start_observed_sfu_node(server_ip, rng, num_shards, tcp_only, Some(observation_tx))
+                    .await
+                    .map_err(Into::into)
+            }
         });
 
         let mut handles = PlanHandles::new();
@@ -4588,6 +4786,10 @@ impl LocalNodeSim {
                 let shared = Arc::new(ParticipantShared::new(
                     quality_references.clone(),
                     h264_publishers.clone(),
+                    initial_topics
+                        .get(participant.name)
+                        .cloned()
+                        .unwrap_or_default(),
                 ));
                 let (cmd_tx, cmd_rx) = mpsc::channel::<ParticipantCmd>(16);
 
@@ -4606,9 +4808,10 @@ impl LocalNodeSim {
                         publishes_audio: participant.audio_level_dbov.is_some(),
                         quality_video: participant.quality_video,
                         observes_video: participant.slots > 0 || participant.subscribes,
+                        auto_subscribe: participant.auto_subscribe,
+                        video_capacity: participant.slots,
+                        retirement_deadline: None,
                         present: !participant.starts_disconnected,
-                        departed_cleanly: true,
-                        departures: Vec::new(),
                     },
                 );
 
@@ -4636,7 +4839,11 @@ impl LocalNodeSim {
         let reports_inner = reports.clone();
         sim.client(coordinator_ip, async move {
             let mut handles = handles;
-            execute_plan(plan, &mut handles, &name_to_ip, &reports_inner)
+            let observer = observation_rx
+                .recv()
+                .await
+                .expect("server supplies observer");
+            execute_plan(plan, &mut handles, &name_to_ip, &reports_inner, &observer)
                 .await
                 .map_err(Into::into)
         });

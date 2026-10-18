@@ -15,7 +15,8 @@ or failure injection.
 
 - `src/tests/common/client.rs` adapts scenario operations to complete native-agent desired-state revisions and coherent snapshots.
 - `src/tests/common/media.rs` owns deterministic encoded video and audio source behavior used only by simulation.
-- `src/tests/common/harness.rs` owns automatic discovery/subscription policy, lifecycle commands, reports, and oracles.
+- `src/tests/common/harness.rs` owns automatic discovery/subscription policy, lifecycle commands, reports, and bounded convergence checkpoints.
+- `src/tests/common/oracle.rs` models plan-derived intent and compares coherent control, shard, and client observations.
 - `src/tests/native_runtime.rs` is the narrow UniFFI-facing native-runtime vertical slice; the authored scenarios exercise the same runtime through the common harness.
 
 ## Build profile

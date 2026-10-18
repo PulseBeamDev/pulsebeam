@@ -17,7 +17,7 @@ latency, loss, shard-count or buggify combinations inline. A test may override
 one dimension when that dimension is the subject of the test; the override
 must be named and justified by the scenario.
 
-The hardened default that the harness is required to provide is:
+The shared harness default is:
 
 | Dimension | Default |
 |---|---|
@@ -35,10 +35,10 @@ placement. One-shard runs remain valid only as an explicit differential
 baseline. `LinkProfile::fiber()` and `LinkProfile::cellular()` are named
 special cases for tests whose claim is specifically about those paths.
 
-The harness defaults are intentionally not a one-shard or fault-free baseline:
-`LocalNodeSim::new()` uses four shards and a 10‰ buggify rate. The three ignored
-cross-shard tests remain visible as known gaps; the shared default does not
-make them pass by weakening their oracles.
+The harness defaults are intentionally not a one-shard or fault-free baseline.
+The [native DTLS reconnect exception](native-dtls-exception.md) does not exempt
+cross-shard media or data proof. Ignored subprocess fixtures run through their
+parent assertions and are not additional product exceptions.
 
 The permitted profile families are:
 
@@ -143,12 +143,13 @@ fake snapshot.
 
 ## Required harness assertions
 
-The common harness should provide one reusable `ControlStateOracle` rather than
-test-specific maps of discovered IDs. It should model participant, publication,
-subscription, route, assignment and topic intent from the plan operations, and
-capture value snapshots/events from control and shards for assertions.
+The common harness uses one reusable `ControlStateOracle`, not test-specific
+maps of discovered IDs. It models participant, publication, subscription,
+assignment and topic intent from plan operations, binds opaque admission IDs,
+and compares coherent control, shard and native-client values. Each owner
+produces its own value; collection does not require a global atomic snapshot.
 
-At every settle window, and after every injected failure, assert:
+Settled and post-recovery checkpoints assert:
 
 - exact live participant and publication sets for every observer;
 - exact video and audio assignments, including origin and kind, independently of forwarding state;
@@ -163,10 +164,10 @@ At every settle window, and after every injected failure, assert:
 - at least one positive frame/message/hop occurred before a success oracle can
   pass.
 
-The existing `assert_room_state_consistent` is retained as a fast safety check,
-but it must be supplemented with this positive liveness/convergence oracle. The
-current `discovered_tracks`, global `cross_shard_media_frames`, and
-presence-only data checks cannot establish these properties.
+`assert_room_state_consistent` remains a fast safety check. Settled checkpoints
+also run the independent convergence oracle. Discovery alone, global frame
+counters and presence-only data checks cannot replace exact ownership/intent
+checks or positive per-recipient origin evidence.
 
 ## Buggify contract
 

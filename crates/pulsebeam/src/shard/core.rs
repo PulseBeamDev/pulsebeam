@@ -127,6 +127,42 @@ impl ShardCore {
         cmd: ShardCommand,
         router: &impl ShardTransport,
     ) -> Option<()> {
+        #[cfg(feature = "sim")]
+        let cmd = match cmd {
+            ShardCommand::Observe(reply) => {
+                let (generation, pending_generation, pending_effects) = self.updates.observation();
+                let (participants, transports) = self.execution.registry.observation();
+                let (tracks, routes) = self.execution.runtime.observation();
+                let plans = self
+                    .execution
+                    .plans
+                    .iter()
+                    .map(|(handle, plan)| crate::sim_observation::PlanObservation {
+                        track: self.execution.runtime.track_id(handle),
+                        local: plan
+                            .local
+                            .iter()
+                            .map(|handle| self.execution.registry.identity(*handle))
+                            .collect(),
+                        remote: plan.remote.clone(),
+                        reverse: plan.reverse_route,
+                    })
+                    .collect();
+                let _ = reply.send(crate::sim_observation::ShardObservation {
+                    shard: self.execution.shard_id,
+                    generation,
+                    pending_generation,
+                    pending_effects,
+                    participants,
+                    transports,
+                    tracks,
+                    plans,
+                    routes,
+                });
+                return Some(());
+            }
+            command => command,
+        };
         let result = self.execution.on_command(cmd, router);
         self.updates
             .apply_pending_participant_effects(&mut self.execution);
@@ -633,6 +669,10 @@ impl ShardExecution {
         router: &impl ShardTransport,
     ) -> Option<()> {
         match cmd {
+            #[cfg(feature = "sim")]
+            ShardCommand::Observe(_) => {
+                debug_assert!(false, "observation is consumed by ShardCore");
+            }
             ShardCommand::MaterializeParticipant {
                 transport,
                 config,

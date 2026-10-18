@@ -266,6 +266,14 @@ impl Agent {
         &self.snapshot
     }
 
+    #[cfg(feature = "sim")]
+    pub fn simulation_sent_intent_revision(&self) -> Option<u64> {
+        if self.intent_dirty || self.pending_signal.is_some() || self.signal_retry.is_some() {
+            return None;
+        }
+        self.active.as_ref().map(|active| active.intent_revision)
+    }
+
     /// Whether accepted desired state publishes this local sender slot.
     /// Media silence/blanking is a host operation, not publication withdrawal.
     pub fn is_publishing(&self, slot: &MediaSlot) -> bool {

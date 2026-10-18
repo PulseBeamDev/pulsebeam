@@ -153,6 +153,8 @@ pub(crate) enum ShardError {
 /// Topology and lifecycle changes are published through `ShardUpdate`.
 #[derive(Debug)]
 pub(crate) enum ShardCommand {
+    #[cfg(feature = "sim")]
+    Observe(tokio::sync::oneshot::Sender<crate::sim_observation::ShardObservation>),
     MaterializeParticipant {
         transport: crate::route::NodeTransportAddress,
         config: Box<ParticipantConfig>,

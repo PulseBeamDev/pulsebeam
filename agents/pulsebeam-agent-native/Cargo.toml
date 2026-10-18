@@ -13,7 +13,7 @@ crate-type = ["cdylib", "rlib", "staticlib"]
 
 [features]
 bindgen = ["uniffi/cargo-metadata", "uniffi/cli"]
-sim = ["pulsebeam-core/sim"]
+sim = ["pulsebeam-core/sim", "agent_core/sim"]
 
 [dependencies]
 agent_core = { package = "pulsebeam-agent-core", path = "../pulsebeam-agent-core" }

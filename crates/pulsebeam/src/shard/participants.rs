@@ -59,6 +59,38 @@ pub(crate) struct ParticipantRegistry {
 }
 
 impl ParticipantRegistry {
+    #[cfg(feature = "sim")]
+    pub(crate) fn observation(
+        &self,
+    ) -> (
+        Vec<crate::sim_observation::ShardParticipantObservation>,
+        Vec<(NodeTransportAddress, Option<ParticipantId>)>,
+    ) {
+        let participants = self
+            .participants
+            .values()
+            .map(|meta| crate::sim_observation::ShardParticipantObservation {
+                id: meta.participant_id,
+                connection: meta.connection_id,
+                transport: meta.ingress,
+            })
+            .collect();
+        let transports = self
+            .transports
+            .iter()
+            .flatten()
+            .map(|(address, handle)| (*address, self.identity(*handle)))
+            .collect();
+        (participants, transports)
+    }
+
+    #[cfg(feature = "sim")]
+    pub(crate) fn identity(&self, handle: ParticipantHandle) -> Option<ParticipantId> {
+        self.participants
+            .get(handle)
+            .map(|meta| meta.participant_id)
+    }
+
     pub fn len(&self) -> usize {
         self.participants.len()
     }

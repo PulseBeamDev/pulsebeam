@@ -1,358 +1,131 @@
 # Simulation testing
 
-The profile and convergence contract for new tests is in
-[`sim.md`](sim.md). This document explains determinism, seeds, oracles and
-measurement discipline; it is not permission for each plan to invent its own
-network defaults.
+Use the [simulation contract](sim.md) for shared profiles, convergence invariants
+and fault semantics. Use the [contributor testing contract](../../../docs/build.md#testing-contract)
+for proof selection, gates and evidence reuse. [Owner commands](../README.md#commands)
+cover isolated replay, advisory seed search and scoreboard generation.
 
-The SFU is tested by running it against a simulated network — simulated clock,
-simulated randomness, modelled capacity, queueing, loss, reordering and
-partitions. The approach is FoundationDB's and TigerBeetle's: **one seed
-determines one entire run**, so anything found can be replayed exactly.
+## Choose the observation boundary
 
-## Replay and search
+Keep pure allocation, admission and generator decisions in unit tests. Use an
+authored simulation for a specific lifecycle, transport, decode or cross-shard
+regression, and generated properties for claims that hold across their declared
+network and demand premises. Remove duplicate proof only when the regression,
+premises and observation boundary are the same.
 
-Use the [contributor testing contract](../../../docs/build.md#testing-contract)
-for workspace gates, proof selection and evidence reuse.
+A differential should compare user-visible behavior at the intended granularity.
+For shard placement, compare decoded origins and whether each viewer was served,
+not byte equality: different layouts can legitimately schedule different packets.
+Frame counts do not replace decoder correctness, and a nonblank temporal-layer
+experience does not establish watchable framerate or bounded freezes.
 
-| Command | What it is |
-|---|---|
-| `./bazel run //:replay -- --seed <n> --exact --filter <name>` | replay one case and seed exactly |
-| `./bazel run //:sweep -- --seeds <count> --from-seed <first> --filter <name>` | search for seeds nobody has tried |
+## Preserve deterministic isolation
 
-## Two rules
+Each selected case runs in its own process with one libtest thread. Clock and
+randomness hooks are process-wide; do not aggregate cases by directly invoking
+the raw test binary. A subprocess fixture is marked ignored and executed by its
+parent with the required inputs, not counted as independent passing coverage.
 
-**Gates are deterministic and committed.** Every seed CI runs is a constant in
-source (`DEFAULT_SIM_SEED`, or a plan's own `QOS_SEEDS`). CI never draws a random
-seed, so a CI failure is always real and always reproducible. It cannot flake.
+One simulation seed controls clock hooks, process randomness, network impairment
+and the proptest generator. Replay the exact case and seed printed on failure.
+A seed-dependent failure is a reproducible behavior difference, not flakiness.
+Advisory sweeps discover inputs to retain; they are not additional merge gates.
 
-**Search is advisory and never blocks.** `./bazel run //:sweep` explores new seeds nightly
-in CI (`.github/workflows/nightly.yml`, over a window that advances each run) and
-on demand locally. Its only product is a seed to promote. It is not a gate, and a
-sweep failure is not a broken build.
+For measurements spanning turmoil hosts, use the shared simulated
+`std::time::Instant` clock, not independently based host-local Tokio instants.
+Match numerator and denominator scope: cumulative frame counts divided by a
+single window do not measure that window's framerate. Anchor user latency to
+the user's operation rather than an earlier connection-setup step.
 
-## The loop
+## Share reports without losing claims
 
+The ample-link family checks delivery, demand tracking and underused-link loss
+on one report. The peer-churn family shares decode, layer-stability and estimate
+checks. Shared scenarios correlate those claims; they are not independent
+samples of each claim's original generator.
+
+Preserve each claim's configured qualifying-case budget. Check every applicable
+assertion before rejecting a report for a sibling's premise, then require the
+conjunction of conditional premises for an accepted shared-family sample. This
+keeps a rejected sibling from hiding a failure and ensures each conditional
+claim receives its full accepted-case budget. Bound outcome-based rejections so
+an unreachable premise fails rather than searching indefinitely. A deliberately
+conditional assertion that does not reject must separately prove it was reached.
+
+Generate input premises before simulation. Keep axes at named decision
+boundaries and retain distinct fault, transport, decode, contention and
+placement behavior rather than adding continuous values that exercise the same
+decision repeatedly.
+
+## Compare intent with coherent observations
+
+`ControlStateOracle` models participants, publications and complete receive/topic
+intent from plan operations. Admission observations bind opaque IDs to plan
+identities; server mappings and forwarded packets are not the source of
+expected intent.
+
+Control, each shard and the native client actor produce immutable values through
+their owned command boundaries. Compare their connection generations, revisions,
+assignments and route epochs after bounded protocol progress. This is not a
+global atomic snapshot, and separately sampled counters cannot reconstruct one.
+
+Automatic audio must cover every live source when it fits, or fill the remaining
+unpinned slots with live sources under contention. Packet timing, power decay
+and slot immunity can change the contended subset, so the common oracle does not
+invent a unique ordering. Explicit speaker-selection assertions retain the
+scenario's loudness and origin claims.
+
+A publication-discovery barrier must also wait for applicable full-client
+convergence: receiving a catalog entry does not prove that publish-only peers
+have updated catalogs or that every latest wire intent has been acknowledged.
+Keep that work inside the existing bounded deadline, not a fixed extra sleep.
+
+Graceful departure and transport crashes have different retirement deadlines.
+Before crash detection, a server may legitimately retain the connection; after
+the bounded retirement condition, no old publication, binding, route or topic is
+exempt. A stopped observer need not update its final client snapshot. Check
+positive media/data origin evidence for every intended recipient and absence
+for every intentional bystander.
+
+## Retain and replay generated failures
+
+`src/tests/properties.regressions` is the declared committed corpus. Its entries
+are proptest RNG states evaluated under each current strategy family, not
+serialized historical scenarios. Historical shrink comments describe the former
+generator and are not current scenario fixtures.
+
+The persistence adapter copies that corpus into a writable per-family
+`.regressions` artifact. Bazel test actions use `TEST_UNDECLARED_OUTPUTS_DIR`;
+standalone replay uses a process-specific temporary directory. The printed
+`[simulation-regressions]` line identifies the artifact. New minimized failures
+are appended there, never written into tracked source by a normal test action.
+
+To replay a saved artifact, provide its absolute path while retaining the case
+and whole-run seed from the failure:
+
+```sh
+PULSEBEAM_SIM_REGRESSIONS=/absolute/path/to/family.regressions \
+  ./bazel run //:replay -- --seed <seed> --exact --filter <case>
 ```
-   sweep ──> "seed 4711 fails tests::bwe::foo"
-               │
-               ▼
-     ./bazel run //:replay -- --seed 4711
-               │
-               ▼
-          fix the bug
-               │
-               ▼
-     add 4711 to that plan's seed list   promote
-               │
-               ▼
-   every PR ──> ./bazel test //:test                guarded forever
-```
 
-Promotion is the point. A seed that found a bug once becomes a committed
-constant, so the bug can never come back silently. Search finds; the gate keeps.
-
-## Promoting a seed
-
-Plans that run under several seeds loop over a constant:
-
-```rust
-// pulsebeam-simulator/src/tests/bwe.rs
-const QOS_SEEDS: [u64; 4] = [0xDEAD_BEEF, 0x1234_5678, 0x0BAD_F00D, 0xFEED_FACE];
-
-#[test]
-fn some_plan_test() {
-    for seed in QOS_SEEDS {
-        LocalNodeSim::new().with_rng_seed(seed) /* ... */
-    }
-}
-```
-
-Add the discovered seed to that array — or to the individual plan, if it is only
-meaningful there. A plan that does not yet loop over seeds should start.
-
-## What the seed controls
-
-One seed reaches all of it. If any of these stopped being seeded, a failure
-would stop being reproducible, so two meta-tests guard it:
-
-| Source | Seeded via |
-|---|---|
-| Wall clock | `sim_clock.rs`, shims `clock_gettime` process-wide |
-| `getrandom` (keys, map ordering) | `sim_rand.rs` |
-| Network latency jitter, delivery | turmoil's `rng_seed` |
-| Loss, reordering, duplication | `shaper::seed_impairments` |
-| Generated scenarios | proptest runner seeded in `properties.rs::check` |
-
-- `properties.rs::the_seed_selects_the_generated_scenarios` — the seed reaches
-  the generator.
-- `bwe.rs::a_different_seed_is_a_different_network_test` — the seed reaches the
-  network.
-
-Both are cheap and both fail loudly, because a suite that *looks* randomised but
-replays one fixed run is worse than an honestly fixed one.
-
-## Four kinds of oracle
-
-An oracle is whatever decides that a run was wrong. This suite has four, and they fail in
-different ways, so a plan is stronger for using more than one.
-
-**User-visible outcome** — "the message arrived", "the tile is not black". Self-justifying, and
-every unambiguous defect found so far has been one of these. Limited to failures someone thought
-to check.
-
-**Threshold** — "the estimate reaches 80% of need". Necessary for congestion control and the
-easiest to get wrong: `QueueingDelayBelow` bounded a peak while documenting a standing queue, and
-`a_busy_room_starves_nobody` needed an estimator to hit 86% before an allocator claim could pass.
-Every threshold needs an argument that a correct implementation can meet it.
-
-**Differential** — two configurations that must agree, where the disagreement is the report.
-`sharding_does_not_change_who_is_served` runs a scenario on one shard and on three: a subscriber
-cannot tell which worker owns it, so any difference is the SFU losing a stream to its own
-placement. No number to pick and no way to measure the wrong statistic. Both cross-shard defects
-found so far are differences it reports directly. Compare coarsely — whether a subscriber was
-served, not how many bytes — because two layouts schedule packets differently and byte counts
-would report noise.
-
-**Liveness** — every other oracle reads an endpoint or an average, and a stream that freezes for
-twenty seconds and recovers looks identical in all of them. `a_started_stream_does_not_go_quiet`
-bounds the longest gap between delivered frames. Measure per frame, not per plan step: a step is
-tens of seconds long, so a freeze inside one still leaves bytes in the window and reads as zero
-silence. The first attempt did exactly that and was vacuous — it passed with the bound set to
-zero.
-
-## Measuring anything new
-
-Four QoE metrics were added in one sitting and all four were wrong before they were right. The
-failures were not subtle bugs; each produced a plausible-looking number that meant nothing. A
-metric that lies is worse than no metric, because it gets trusted.
-
-**Prove the measurement moves before trusting it.** Set the bound to zero and confirm the test
-fails. The first liveness check sampled at `Run` boundaries, where a freeze inside a
-thirty-second window still leaves bytes in the window — it passed with the bound at
-`Duration::ZERO` and would have shipped as a green test measuring nothing.
-
-**Never compare timestamps taken on different turmoil hosts.** turmoil virtualises
-`tokio::time::Instant` per host, so a stamp from the coordinator and one from inside a participant
-are on different epochs. That mismatch reported every time-to-first-frame as ~5s and every freeze
-as 0% of the session. Use `std::time::Instant`, which `sim_clock` shims process-wide via
-`clock_gettime` and which therefore *is* coherent everywhere.
-
-**Match the scope of the numerator and denominator.** Cumulative frame counts over the last
-window's duration reported 159 fps; a cumulative maximum freeze next to a per-window frozen total
-reported "5s freeze, 0% frozen". Pick session-scoped or window-scoped and apply it to both.
-
-**Measure from what the user did, not from what the plan did.** Time-to-first-frame anchored to
-participant creation captured each plan's five-second "establish connection" step, putting the
-median at 5.18s across the suite — an artefact of scaffolding presented as a product latency.
-
-**Check a new bar against the whole suite before believing it.** The first QoE bar called 491 of
-492 viewers broken. By the triage rule above that is an unrealistic expectation, not a codebase in
-ruins — and it was: freeze limits were being applied to still screen shares, which are supposed to
-go quiet.
-
-## Injecting failures
-
-Recovery code is the least tested code in any system, because it only runs when something goes
-wrong and nothing goes wrong in a simulator unless the simulator makes it. Around ninety
-`debug_assert!`/`fatal!` sites here assert a condition cannot arise, and the route-install callers
-each have a rollback that had never executed.
-
-`buggify!("site")` declares such a point; the shared simulator profile arms it at 10‰ and
-`.with_buggify(permille)` overrides that rate for a named recovery plan. It is compiled out
-entirely without the `sim` feature.
-
-Two rules learned immediately:
-
-- **Assert that something was injected.** At 80 per thousand the first chaos plan injected nothing
-  on the first seed and passed — indistinguishable from a real pass.
-- **Watch which sites are reached.** `coverage()` reports reached and fired. A site nothing reaches
-  is a failure path still untested and looks exactly like a covered one, so
-  `every_declared_failure_point_is_reachable_test` fails if none is reached or none fires.
-
-It found a defect on its first real run: a failed reverse-route install publishes the track anyway
-with no reverse handle, so keyframe requests for it are dropped for the life of the track.
-
-## Assert over every instance
-
-A plan that creates N of something and checks one is a coin flip dressed as an assertion. The
-cross-shard data-topic defect survived precisely that: two subscribers, one asserted. Where a
-participant is a deliberate bystander, assert it received *nothing* — that is a real claim about
-not over-delivering, and it was untested.
-
-## What the suite still cannot see
-
-Worth writing down, because an absent capability looks exactly like a passing test.
-
-**Anything a browser does.** Both ends of the simulation are str0m, so nothing here exercises
-libwebrtc's receive path, and the two differ in ways that decide designs - see "Why the egress SSRC
-belongs to the slot" below. A plan can be green while Chrome renders nothing. Changes to stream
-identity, SSRCs or SDP need a manual browser check; the suite cannot stand in for one.
-
-The bench fixtures have a static compatibility gate: their SPS values must stay constrained
-baseline at or below level 3.1, and the recorded Chrome SDP must still offer the corresponding
-packetization mode. That rejects an incompatible fixture before it reaches a browser, but it does
-not replace the documented manual browser check after changes to media or signaling.
-
-**Audio quality.** Who is heard, who they are, and how many streams they arrive on are asserted
-now. How *well* they are heard is not: there is no audio continuity, gap or concealment figure
-scoped to a listener's experience, and a 200ms gap is a lost syllable where the same gap in video
-is a stutter nobody remarks on. `AudioStream` has the raw material (`packets`, `longest_gap`); what
-is missing is an `AudioQoe` with its own bar, mirroring `Qoe` rather than reusing it.
-
-**Temporal layers.** One generated scenario publishes with `with_temporal_dd` and exercises
-framerate shedding. The generated suite still lacks temporal-layer coverage across the full
-cross-shard, opaque-payload, marker-only and recovery matrix; that remains a planned gap.
-
-**Torn frames.** 1,370 across a suite run, measured and reported, asserted on by nothing. A frame
-preceded by a sequence hole is visible corruption.
-
-**Time-to-first-frame and freezes** are measured and on the scoreboard, but not gated, because the
-product currently fails both. See the note in `properties.rs`.
-
-## Why the egress SSRC belongs to the slot
-
-Recorded because it was got wrong once, at length, and the simulation could not see it.
-
-A slot keeps one SSRC for the session and carries whoever the SFU puts in it. It is tempting to
-make the SSRC follow the publisher instead, so that a recording can tell where one person's media
-ends and the next begins. That does not work against a browser:
-
-- **`pc/sdp_offer_answer.cc:2765`** - when the remote description declares `a=ssrc`, the receiver
-  binds its sink to *that exact SSRC* (`VideoRtpReceiver::SetSink`). Media on any other SSRC is
-  decoded and thrown away. Not a glitch: nothing renders.
-- With `a=ssrc` omitted, each new SSRC instead builds a receive stream. Video adds a 500ms cooldown
-  that drops a second change (`kUnsignaledSsrcCooldownMs`); audio gets a cold NetEq per change,
-  four kept per m-line, oldest destroyed (`kMaxUnsignaledRecvStreams`), plus the unfixed race at
-  `crbug/webrtc/12676`.
-- A browser cannot route by SSRC regardless - one `MediaStreamTrack` per transceiver.
-
-Who is speaking travels in `AudioAssignment` / `VideoAssignment` instead, which is the only form a
-browser can act on. `CheckAudioStreams` is the guard: a listener is sent no more streams than it
-has slots.
-
-And recording does not need it. Production SFUs record at ingest, per published track - LiveKit
-fires `StartTrackEgress` on track publish, mediasoup uses a `PlainTransport` consumer per producer.
-Only a "what the room looked like" composite records a subscriber's view, and that is a headless
-browser consuming decoded output. A forwarded slot is a poor archival source anyway: top-N audio
-only, one simulcast layer, paused streams absent.
-
-## Two kinds of plan
-
-**Authored plans** (`bwe.rs`, `video.rs`, `connectivity.rs`, `data_channel.rs`)
-pin a scenario someone thought of. Good for regressions, limited to the failures
-we already imagined.
-
-**Generated plans** (`properties.rs`) generate the scenario and assert a claim
-that must hold whatever comes out. Properties are deliberately weak — they are
-claimed over every network the generator can produce, so they can only assert
-what is true of all of them. Failures persist to `proptest-regressions/`, which
-is committed and replayed before any new case.
-
-## The behaviour scoreboard
-
-`bwe-baseline.txt` is a committed, diffable record of what every authored plan
-measured — capacity, estimate, drawdown, demand, queueing, loss. Regenerate with
-`./bazel run //:scoreboard` and read the
-diff.
-
-It is not a test. Its job is that a congestion-control change rarely improves
-everything: it trades one scenario against another, and pass/fail hides that.
-The diff shows the whole matrix at once, so "helps screenshare, wrecks cellular"
-is one line rather than a discovery made days later.
-
-Generated plans are excluded from it, because their numbers move by design.
-
-Regenerate it **before and after** any change to allocation or congestion
-control, and read the diff before committing. That is not ceremony: the first
-attempt at the starvation-deadlock fix passed its own target plan and pinned an
-estimate 25% above a link's real capacity elsewhere, which the scoreboard caught
-and no single test would have.
-
-Scoreboard runs explicitly request grouped full output with one worker so each
-plan's metrics stay adjacent to its result. Normal gate output stays concise;
-use replay's `--show-output` for diagnostic traces and `RUST_LOG` for detail.
-Failed-case logs retain complete stdout/stderr in the printed location, under
-standard undeclared test outputs for Bazel tests.
-
-## What a red test means
-
-A failing simulation plan is one of four things, and they need opposite
-responses. Deciding which comes first, before touching code.
-
-| Signature | Reading |
-|---|---|
-| Wide margin, one seed | a real defect |
-| Narrow margin, several seeds | the threshold is wrong |
-| Fails at every seed | the scenario or the expectation is unrealistic |
-| A `debug_assert!` in production code | an invariant someone wrote down is false |
-
-Worked examples, all from one sweep:
-
-- **33% of a required 80%**, one seed → real: an estimate frozen at 997 kbps
-  with the link idle at 4.9%.
-- **102ms and 108ms against a 100ms bound**, two seeds → the property was
-  measuring the wrong statistic. It bounded the *peak* queue while documenting
-  itself as the *standing* queue; the standing queue was 7ms and never moved.
-- **1.6% short**, one seed → the plan was over-fitted. It needed the estimator
-  to reach 86% of capacity before the allocator could pass, so an allocator
-  claim rode on an estimator one.
-
-Two corollaries. Never "fix" a threshold by relaxing it until it passes — decide
-what it should measure. And never conclude "flaky": every plan is deterministic
-in its seed, so a seed-dependent failure is a real difference in behaviour.
-
-## Writing a plan or property
-
-**Assert what a user would notice.** "The message arrived", "the tile is not
-black", "the stream holds a layer". These are self-justifying. A claim in
-internal quantities — "the estimate is ≥80% of need" — needs a separate argument
-that a correct implementation can even meet it, and that argument is usually
-missing. In this suite every unambiguous find has been user-visible; every
-argument about whether a failure is real has been about an internal quantity.
-
-**Keep one claim per plan.** A plan that needs the estimator to hit 86% before
-the allocator can be judged is testing two things and will fail for the wrong
-one.
-
-**Generate coarsely.** An axis earns a value only if it crosses a decision
-boundary in the code. Two capacities that afford the same ladder rungs are the
-same test. `properties.rs` holds its own space to a band with a test, because
-both directions fail silently: too large and a run samples a fraction of a
-percent, too small and every seed runs the same cases.
-
-**Put input assumptions in the generator, outcome assumptions in the body.**
-`prop_assume!` on an input runs a full simulation and throws it away — one
-property discarded two thirds of its cases that way and took twice as long as
-any other.
-
-**Prefer boundaries to ranges.** Threshold bugs live at rung edges, so generate
-the rungs and the points just either side rather than sampling a wide range and
-hoping.
-
-## Fixing production code the sweep finds
-
-**Reproduce first, and confirm the fix by removing it.** A test that has never
-been seen failing pins nothing. Revert the fix, watch the test fail, restore it.
-This has caught a "passing" probe that was silently a no-op.
-
-**Test the decision, not the run.** Congestion-control predicates are pure
-functions of `(desired, allocated, estimate, now)`. Extract them and unit-test
-the shapes that must and must not trigger — milliseconds per iteration instead of
-a five-minute suite. Iterating on a behaviour change by re-running the whole
-simulation is how the first deadlock fix shipped a regression into a scoreboard
-run instead of being caught in a unit test.
-
-**Set thresholds from measurement.** The deadlock predicate fires below 25% of
-the estimate because the real deadlock sits at 15% and a healthy allocator
-backgrounding a stream sits at 44%. Write the measured figures into the comment
-so the next person can requalify the number instead of guessing at it.
-
-## Execution isolation
-
-Every selected case runs in a separate process with one libtest thread: virtual
-clock and RNG hooks are process-global. Bazel reserves the same CPU budget the
-owner wrapper uses for workers; standalone replay accepts an explicit `--jobs`.
-Do not invoke the manual raw test binary from aggregate suites. Scoreboard
-comparisons need an uncontended measurement; advisory sweeps remain separate
-from final acceptance.
+Review retained RNG states and promote useful regressions into the committed
+corpus or a focused authored case. The isolated persistence proof exercises both
+committed input under a current strategy and a newly minimized artifact in a
+fresh process with no novel cases.
+
+## Keep recovery and fidelity claims honest
+
+Recovery plans must force each required fault site, prove that it fired and
+check post-fault atomicity and convergence. Branch counters alone establish
+neither recovery nor continued delivery. Never relax a product threshold,
+substitute an easier seed or add arbitrary retries to hide a failed premise.
+
+The simulator exercises real signaling, codecs and native agents, but not a
+browser's libwebrtc receive path or production Linux socket syscalls. Keep real
+browser evidence for SSRC/SDP compatibility and production transport evidence
+distinct from simulation. Audio origin/slot checks do not establish perceptual
+audio quality. Temporal nonblank checks do not establish smooth playback.
+
+The [native DTLS reconnect exception](native-dtls-exception.md) remains explicit,
+narrow and opt-in runnable. Ignored subprocess fixtures are not product
+exceptions, and neither category counts as passing proof.

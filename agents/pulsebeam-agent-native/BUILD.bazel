@@ -36,8 +36,8 @@ rust_library(
     rustc_flags = ["-Copt-level=2", "-Cdebug-assertions=yes", "-Coverflow-checks=yes"],
     rustc_env_files = [":cargo_env"],
     lint_config = ":lints",
-    aliases = aliases() | {"//agents/pulsebeam-agent-core:pulsebeam-agent-core": "agent_core"},
-    deps = all_crate_deps(normal = True) + ["//agents/pulsebeam-agent-core:pulsebeam-agent-core", "//crates/pulsebeam-core:pulsebeam-core-sim", "//crates/pulsebeam-proto:pulsebeam-proto"],
+    aliases = aliases() | {"//agents/pulsebeam-agent-core:pulsebeam-agent-core-sim": "agent_core"},
+    deps = all_crate_deps(normal = True) + ["//agents/pulsebeam-agent-core:pulsebeam-agent-core-sim", "//crates/pulsebeam-core:pulsebeam-core-sim", "//crates/pulsebeam-proto:pulsebeam-proto"],
     proc_macro_deps = all_crate_deps(proc_macro = True),
 )
 

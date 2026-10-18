@@ -146,6 +146,18 @@ impl AudioAllocator {
     }
 
     pub fn set_intent(&mut self, intent: AudioIntent) {
+        if !intent.auto {
+            for slot in self.slots.iter_mut().flatten() {
+                if slot
+                    .occupant
+                    .is_some_and(|occupant| !intent.pinned.contains(&occupant.origin.track))
+                {
+                    slot.occupant = None;
+                    slot.pending_marker = true;
+                    self.speakers_changed = true;
+                }
+            }
+        }
         self.intent = intent;
     }
 
@@ -826,6 +838,29 @@ mod tests {
             vec![pinned],
             "the pin takes the slot even though it is quieter"
         );
+    }
+
+    #[test]
+    fn explicit_only_retracts_previous_automatic_assignments() {
+        let mut alloc = allocator_with(3);
+        let speakers = [origin(1), origin(2), origin(3)];
+        for speaker in speakers {
+            alloc.on_rtp(speaker, &speaking(-20), &mut StreamWriter::new());
+        }
+        assert_eq!(heard_origins(&alloc).len(), 3);
+        alloc.take_speakers_changed();
+        alloc.set_intent(AudioIntent {
+            pinned: vec![speakers[0].track],
+            auto: false,
+        });
+        assert_eq!(heard_origins(&alloc), vec![speakers[0]]);
+        assert!(alloc.take_speakers_changed());
+        alloc.set_intent(AudioIntent {
+            pinned: Vec::new(),
+            auto: false,
+        });
+        assert!(heard_origins(&alloc).is_empty());
+        assert!(alloc.take_speakers_changed());
     }
 
     /// `auto: false` means exactly the pins and nothing else.

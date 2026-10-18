@@ -112,7 +112,17 @@ pub enum Error {
     },
 }
 
+#[cfg(feature = "sim")]
+#[derive(Clone, Debug)]
+pub struct SimulationObservation {
+    pub snapshot: Snapshot,
+    pub sent_intent_revision: Option<u64>,
+    pub media_indices: BTreeMap<MediaSlot, u32>,
+}
+
 enum Command {
+    #[cfg(feature = "sim")]
+    SimulationObservation(oneshot::Sender<SimulationObservation>),
     ReplaceDesired {
         desired: DesiredState,
         response: oneshot::Sender<Result<(), Error>>,
@@ -257,6 +267,16 @@ impl Agent {
             .await
             .map_err(|_| Error::Closed)?;
         result.await.map_err(|_| Error::Closed)?
+    }
+
+    #[cfg(feature = "sim")]
+    pub async fn simulation_observation(&self) -> Result<SimulationObservation, Error> {
+        let (response, receive) = oneshot::channel();
+        self.commands
+            .send(Command::SimulationObservation(response))
+            .await
+            .map_err(|_| Error::Closed)?;
+        receive.await.map_err(|_| Error::Closed)
     }
 
     pub fn snapshot(&self) -> Snapshot {
@@ -770,6 +790,20 @@ impl Actor {
 
     fn handle_command(&mut self, command: Command) {
         match command {
+            #[cfg(feature = "sim")]
+            Command::SimulationObservation(response) => {
+                let snapshot = self.core.snapshot().clone();
+                let media_indices = snapshot
+                    .generation
+                    .and_then(|generation| self.peers.get(&generation))
+                    .map(|peer| peer.media_indices.clone())
+                    .unwrap_or_default();
+                let _ = response.send(SimulationObservation {
+                    snapshot,
+                    sent_intent_revision: self.core.simulation_sent_intent_revision(),
+                    media_indices,
+                });
+            }
             Command::ReplaceDesired { desired, response } => {
                 let result = self
                     .core

@@ -42,6 +42,22 @@ impl RoomRegistry {
         }
     }
 
+    #[cfg(feature = "sim")]
+    pub(crate) fn observation(&self) -> Vec<crate::sim_observation::ParticipantObservation> {
+        self.participants
+            .iter()
+            .map(
+                |(id, meta)| crate::sim_observation::ParticipantObservation {
+                    id: *id,
+                    room: meta.room_id,
+                    connection: meta.connection_id,
+                    shard: meta.shard_id,
+                    transport: meta.transport,
+                },
+            )
+            .collect()
+    }
+
     pub fn get_room(&self, room_id: &RoomId) -> Option<&Room> {
         self.rooms.get(room_id)
     }

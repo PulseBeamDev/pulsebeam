@@ -2,6 +2,7 @@ pub mod audio;
 pub mod bwe;
 pub mod common;
 pub mod connectivity;
+pub mod convergence;
 pub mod cross_shard;
 pub mod data_channel;
 pub mod native_runtime;

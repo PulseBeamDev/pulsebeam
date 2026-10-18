@@ -257,8 +257,8 @@ package pulsebeam.media.v1;
 // because another consumer of the same source is hidden. Hidden tracks' stored
 // receive policy does not reserve receiver capacity; when their demand is
 // withdrawn for reuse, omit them from the replacement wire VideoIntent.
-// While a track remains selected, its hard minimum still applies. Reclamation
-// changes selection; it does not lower that minimum. Actual receiver bindings
+// While a track remains selected, its best-effort minimum policy still applies.
+// Reclamation changes selection, not that policy. Actual receiver bindings
 // remain server-authoritative through Mapping, including playout compatibility.
 // Do not add priority admission or eviction of useful visible demand. Receive
 // priority controls media quality contention, not SDK receiver-pool admission.
@@ -660,6 +660,23 @@ message PlayoutDelay {
 
 // Receive options for one remote video track.
 //
+// Bandwidth allocation is minimum-first, then target-seeking, per subscriber:
+// - Either nonzero minimum protects a subscription. Fund available layers
+//   meeting its spatial AND temporal minimums before upgrading any stream.
+// - If minimums cannot all fit, higher-priority minimums win. Lower-priority
+//   subscriptions may degrade below their minimums or pause.
+// - Spend the remainder toward effective target heights and available full
+//   frame rates, highest priority first. Both minimums zero means opportunistic
+//   service only, not a bandwidth reservation.
+// A lower-priority minimum outranks a higher-priority upgrade, never a
+// higher-priority minimum. Equal-priority peers take turns under sustained
+// scarcity rather than starving by request order.
+// Minimums are best effort, conditional on bandwidth and source encodings, not
+// hard guarantees. Unavailable constraints degrade gracefully; paused tracks
+// remain mapped. Congestion sheds promptly; upgrades and resumes use headroom
+// and hysteresis. This is allocation policy, not packet scheduling.
+// No separate target-FPS field is defined.
+//
 // Required/common video controls occupy the lowest field numbers.
 //
 // `playout_delay` is optional and deliberately uses field 15, the highest
@@ -668,26 +685,27 @@ message VideoOptions {
   // Target rendered height in physical pixels.
   //
   // The effective target is max(height, min_height). The target is a hint,
-  // not a ceiling. Zero permits off-screen stopping only when min_height is
-  // also zero; height = 0 with min_height = 720 has effective target 720.
+  // not a ceiling. Zero permits stopping only when both minimums are zero;
+  // height = 0 with min_height = 720 has effective target 720. A frame-rate-only
+  // minimum keeps best-effort service without specifying a spatial target.
   uint32 height = 1;
 
-  // Lowest useful rendered height under contention.
+  // Best-effort minimum rendered height in physical pixels.
   //
-  // This is a hard floor. If no available, affordable layer meets it, keep
-  // an assigned track mapped and pause forwarding until one does. Reduce
-  // temporal layers first when min_fps allows; never lower this spatial floor.
-  // 0 means fully droppable.
+  // Protect this height before target upgrades, subject to priority, bandwidth,
+  // and available layers. Zero disables spatial protection, not min_fps.
   uint32 min_height = 2;
 
-  // Lowest useful frame rate under contention.
+  // Best-effort minimum frame rate, considered jointly with min_height.
   //
-  // 0 means no explicit minimum.
+  // Zero permits shedding to any available temporal layer. A nonzero value
+  // protects temporal service even when min_height is zero.
   uint32 min_fps = 3;
 
   // Relative contention priority.
   //
-  // Higher values are more important.
+  // Higher values win minimums first, then target upgrades. Priority never
+  // lets a target upgrade displace another subscription's feasible minimum.
   uint32 priority = 4;
 
   // Optional per-stream receiver playout-delay bounds.

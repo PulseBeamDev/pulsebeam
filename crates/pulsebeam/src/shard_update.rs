@@ -151,6 +151,8 @@ impl ShardUpdate {
 }
 
 pub(crate) struct ShardUpdateWriter {
+    #[cfg(feature = "sim")]
+    observed_generation: u64,
     shard: ShardId,
     tx: mailbox::Sender<Box<ShardUpdate>>,
     staged: Option<Box<ShardUpdate>>,
@@ -159,6 +161,13 @@ pub(crate) struct ShardUpdateWriter {
 }
 
 impl ShardUpdateWriter {
+    #[cfg(feature = "sim")]
+    pub(crate) fn observed_generation(&self) -> u64 {
+        self.staged
+            .as_ref()
+            .map_or(self.observed_generation, |update| update.generation)
+    }
+
     pub fn stage(&mut self, generation: u64, op: ShardUpdateOp) {
         let commit = self
             .staged
@@ -203,6 +212,10 @@ impl ShardUpdateWriter {
             return None;
         }
         let generation = commit.generation;
+        #[cfg(feature = "sim")]
+        {
+            self.observed_generation = generation;
+        }
         if self.closed || !self.flush_backlog() {
             self.backlog.push_back(commit);
             return None;
@@ -285,6 +298,8 @@ pub(crate) fn new_shard_update(
     let (tx, rx) = mailbox::new(crate::shard::worker::SHARD_UPDATE_CAPACITY);
     (
         ShardUpdateWriter {
+            #[cfg(feature = "sim")]
+            observed_generation: 0,
             shard,
             tx,
             staged: None,

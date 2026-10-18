@@ -37,6 +37,8 @@
 //! congestion controller must never do regardless of conditions - and those are exactly the ones
 //! that were being violated in production.
 
+mod persistence;
+
 use super::common::{
     Content, Experience, LinkProfile, LinkReport, LocalNodeSim, MAX_TIME_TO_FIRST_FRAME,
     Participant, Room, Step, sim_seed,
@@ -44,8 +46,8 @@ use super::common::{
 use proptest::prelude::*;
 use proptest::strategy::ValueTree;
 use proptest::test_runner::{RngAlgorithm, TestCaseResult, TestRng, TestRunner};
+use std::cell::Cell;
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 #[test]
@@ -438,13 +440,6 @@ enum Budget {
     /// them nearly vacuous: with capacity at several times demand nothing has to be given up, so
     /// an allocator that starves a co-tenant the moment budget is tight would pass.
     Tight,
-    /// Not enough for everything, so something has to be given up.
-    ///
-    /// `Tight` cannot force that: it admits only capacities at or above demand, so the allocator
-    /// can serve every stream and merely lowers quality. A property about *shedding* needs a link
-    /// that cannot carry the whole demand, or its precondition is never met and the run is spent
-    /// simulating cases it then discards.
-    Starved,
 }
 
 impl Budget {
@@ -453,11 +448,6 @@ impl Budget {
             Budget::Ample => capacity_bps >= demand_bps.saturating_mul(2),
             Budget::Tight => {
                 capacity_bps >= demand_bps && capacity_bps < demand_bps.saturating_mul(3) / 2
-            }
-            // Below demand, but not so far below that nothing can be served at all - a link that
-            // carries no stream tests the floor, not the choice of what to drop.
-            Budget::Starved => {
-                capacity_bps < demand_bps && capacity_bps.saturating_mul(4) >= demand_bps
             }
         }
     }
@@ -732,14 +722,13 @@ struct DeliverySignature {
 impl DeliverySignature {
     fn of(report: &LinkReport) -> Self {
         let mut served_origins: Vec<String> = report
-            .forwarded_quality
-            .iter()
-            .filter(|(_, quality)| **quality > 0)
-            .map(|(origin, _)| (*origin).to_owned())
+            .decoded_video
+            .keys()
+            .map(|origin| (*origin).to_owned())
             .collect();
         served_origins.sort();
         Self {
-            received_media: report.received_bytes > 0,
+            received_media: !served_origins.is_empty(),
             served_origins,
         }
     }
@@ -747,25 +736,12 @@ impl DeliverySignature {
 
 fn config(cases: u32) -> ProptestConfig {
     ProptestConfig {
-        // Each case is a full simulation. The count is worth more than it was: cases are no
-        // longer discarded after being simulated, and the space they sample is small enough that
-        // this many is a real sample of it.
         cases,
         max_shrink_iters: 8,
-        // Every case here is a full simulation, and these properties `prop_assume!` *after*
-        // running one, so a rejected case costs as much as an accepted one. proptest's default of
-        // 1024 therefore lets a precondition that has stopped being reachable spend half an hour
-        // before saying so - which reads as a hung suite rather than a failing one, and did.
-        //
-        // The assumes left here only ask that a case produced data at all, which should hold
-        // almost always, so this is a backstop rather than a working budget: the two properties
-        // that rejected selectively now skip or starve by construction instead. Sixteen per wanted
-        // case leaves room for a genuinely unlucky run while keeping an unreachable precondition
-        // distinguishable from a hang.
+        // Runtime-premise rejection costs a full simulation. Bound it so an unreachable
+        // qualifying condition fails instead of spending an unbounded workload searching.
         max_global_rejects: cases.saturating_mul(16),
-        failure_persistence: Some(Box::new(
-            proptest::test_runner::FileFailurePersistence::WithSource("regressions"),
-        )),
+        failure_persistence: Some(Box::new(persistence::persistence())),
         ..ProptestConfig::default()
     }
 }
@@ -925,9 +901,12 @@ mod slow {
                 let multi = scenario.run_two_viewers("shard_equiv", Placement::MultiShard);
 
                 prop_assert!(
-                    single.values().any(|s| s.received_media),
-                    "neither viewer received anything even on one shard, so this case proves \
-                 nothing about sharding ({scenario:?}, {single:?})"
+                    single.len() == 2
+                        && single
+                            .values()
+                            .all(|s| s.received_media && s.served_origins == ["publisher"]),
+                    "every intended viewer must decode the intended publisher before comparing \
+                 sharding ({scenario:?}, {single:?})"
                 );
                 prop_assert_eq!(
                     &single,
@@ -950,19 +929,10 @@ mod slow {
     // lands once they are. Choosing a bound large enough to pass today would leave a green test
     // asserting nothing anyone cares about.
 
-    /// A stream with framerate to shed must shed it, not stop.
-    ///
-    /// The graceful degradation a weak link should get, and the thing the original complaint was
-    /// about: on two bars of signal a tile went blank when a quarter-resolution stream at reduced
-    /// framerate would have fit. A publisher with temporal layers gives the SFU somewhere to go
-    /// between "full quality" and "nothing" - dropping the top temporal layer halves the framerate
-    /// and the picture keeps moving.
-    ///
-    /// The link is tight, so something has to give. What may not give is the picture: `Watchable`
-    /// still demands the framerate floor, so this fails both if the stream stops and if it degrades
-    /// into a slideshow.
+    /// A temporal-layer source produces a nonblank experience on a tight link.
+    /// This does not establish watchable framerate or bounded freezes.
     #[test]
-    fn a_stream_with_layers_to_shed_keeps_moving() {
+    fn a_temporal_stream_is_not_blank_on_a_tight_link() {
         check(
             SATURATED,
             scenarios(Demand::temporal_camera(), Budget::Tight, NO_FAULT),
@@ -970,19 +940,10 @@ mod slow {
                 let report = scenario.run("temporal_shedding");
                 prop_assume!(report.samples > 0 && report.received_bytes > 0);
 
-                // Gates on the stream surviving. The full claim - that it stays *watchable* by
-                // shedding a temporal layer - does not hold yet, and it is a defect rather than a
-                // wrong bar: at 150 kbps, which cannot carry the 150 kbps rung once headers are
-                // counted, the SFU forwards ~24 fps and the viewer spends 62% of the session frozen
-                // instead of dropping to the ~7.5 fps base layer. The layers are advertised (VLA
-                // reaches the SFU through `with_temporal_dd`) and `DecodeTargetSelection` exists to
-                // act on them, so the machinery is there and is not being used. Tighten to
-                // `Experience::Watchable` once it is.
                 prop_assert_ne!(
                     report.qoe.experience(scenario.content()),
                     Experience::Blank,
-                    "a publisher with temporal layers had framerate to give up and the viewer got \
-                 nothing at all ({:?}, {:?})",
+                    "a temporal-layer source produced a blank experience on a tight link ({:?}, {:?})",
                     scenario,
                     report.qoe,
                 );
@@ -991,57 +952,60 @@ mod slow {
         );
     }
 
-    /// Bytes arriving is not a picture. What arrives must be decodable.
-    ///
-    /// Every other claim here is about bytes, bitrates and layer indices, and a viewer cannot see any
-    /// of those. A stream can arrive at the right rate, on the right layer, with the right byte total,
-    /// and still render nothing: a keyframe without SPS+PPS in the same picture is not decodable, so
-    /// the decoder emits nothing and the tile stays blank while every byte-level measure looks
-    /// healthy. That is the shape of "it works in the numbers and the user sees black", and until the
-    /// report carried frame-level facts no generated property could tell the two apart.
+    /// Shared samples correlate decode, layer-stability and estimate claims. The final
+    /// fixed-capacity assumption retains twenty qualifying cases for every combined claim.
     #[test]
-    fn what_arrives_can_actually_be_decoded() {
+    fn peer_churn_preserves_decoding_layers_and_estimate() {
         check(
             SPACIOUS,
             scenarios(Demand::any(), Budget::Ample, PEER_CHURN),
             |scenario| {
                 let report = scenario.run("decodable");
                 prop_assume!(report.samples > 0 && report.received_bytes > 0);
-
-                // Gates on the part of the bar the product meets; the scoreboard carries the rest.
-                // Only the freeze clause is still held back, and only because freezes past 8s under
-                // churn are real defects rather than a wrong threshold - gating on it now would mean
-                // a permanently red suite or a bar quietly lowered until it passed.
                 prop_assert_ne!(
                     report.qoe.experience(scenario.content()),
                     Experience::Blank,
-                    "media arrived and nothing rendered: the viewer saw a blank tile while every \
-                 byte-level measure looked healthy ({:?}, {:?})",
+                    "media arrived but nothing rendered ({:?}, {:?})",
                     scenario,
                     report.qoe,
                 );
                 prop_assert_eq!(
                     report.qoe.undecodable_keyframes,
                     0,
-                    "keyframes arrived without their parameter sets, so the decoder could not render \
-                 them. Each is a stretch of blank picture no bitrate or layer figure would show \
-                 ({:?})",
+                    "keyframes arrived without their parameter sets ({:?})",
                     scenario,
                 );
-                // Motion only, for the same reason the framerate floor and the freeze bounds are.
-                // A still screen share has nothing to send, so the wait measures the source deciding
-                // to produce a frame rather than the SFU delivering one - a 7.4s first frame from a
-                // static share on an 8 Mbps link is correct behaviour, not a defect.
+                // A static source can legitimately wait before producing its first frame.
                 if let (Content::Motion, Some(ttff)) =
                     (scenario.content(), report.qoe.time_to_first_frame)
                 {
                     prop_assert!(
                         ttff <= MAX_TIME_TO_FIRST_FRAME,
-                        "the viewer waited {ttff:?} to see anything after subscribing. A blank tile \
-                     for that long is indistinguishable from a broken call ({:?})",
-                        scenario,
+                        "the viewer waited {ttff:?} to see anything after subscribing ({:?})",
+                        scenario
                     );
                 }
+                for (publisher, reversals) in &report.quality_reversals {
+                    prop_assert!(
+                        *reversals <= 2,
+                        "{publisher}'s layer reversed direction {reversals} times on a {} bps link ({scenario:?}, estimate {} bps, drawdown {:.1}%)",
+                        scenario.capacity_bps,
+                        report.estimate_last_bps,
+                        report.worst_drawdown_percent
+                    );
+                }
+                if report.capacity_fixed {
+                    prop_assert!(
+                        report.worst_drawdown_percent < 75.0,
+                        "the estimate fell {:.1}% on a fixed link, ending at {} bps against {} bps of demand ({scenario:?})",
+                        report.worst_drawdown_percent,
+                        report.estimate_last_bps,
+                        report.demand_last_bps
+                    );
+                }
+                // Preserve every predicate's original accepted-case budget. Check applicable
+                // claims before rejecting, so a conditional sibling cannot hide a failure.
+                prop_assume!(report.capacity_fixed);
                 Ok(())
             },
         );
@@ -1098,14 +1062,11 @@ mod slow {
         );
     }
 
-    /// On a link with room to spare, a subscribed stream must actually be delivered.
-    ///
-    /// The weakest possible statement of what an SFU is for, and the one production was violating:
-    /// the screen share was subscribed, the link was fine, and nothing arrived. It holds for every
-    /// network here by construction - capacity is at least twice demand - so a failure is never the
-    /// link's fault.
+    /// The final conjunction retains twenty qualifying cases for both demand and underused-loss
+    /// claims. Delivery is checked on every sample, including those rejected by either premise.
+    /// Sharing these scenarios correlates the claims rather than adding independent samples.
     #[test]
-    fn a_subscribed_stream_is_delivered_on_a_link_with_room() {
+    fn ample_links_deliver_track_demand_and_avoid_congestion_loss() {
         check(
             SPACIOUS,
             scenarios(Demand::any(), Budget::Ample, ANY_FAULT),
@@ -1113,81 +1074,41 @@ mod slow {
                 let report = scenario.run("subscribed_stream");
                 prop_assert!(
                     report.samples > 0,
-                    "no allocation passes recorded; the plan never exercised the viewer, so every \
-                 other claim here would pass vacuously ({scenario:?})"
+                    "no allocation passes recorded; the viewer was never exercised ({scenario:?})"
                 );
                 prop_assert!(
                     report.received_bytes > 0,
-                    "nothing was delivered over 30s on a {} bps link carrying {} bps of demand \
-                 ({scenario:?}, report {report:?})",
+                    "nothing delivered over 30s on a {} bps link carrying {} bps of demand ({scenario:?}, {report:?})",
                     scenario.capacity_bps,
-                    scenario.demand.bps(),
+                    scenario.demand.bps()
                 );
-                Ok(())
-            },
-        );
-    }
-
-    /// The estimate must not fall below what the application asked for, on a link that can supply it.
-    ///
-    /// This is the production failure stated as a property. The estimate is not required to find the
-    /// capacity - it cannot, when the application is not using it - only to keep up with demand it is
-    /// being asked to carry, on a link demonstrably able to carry it.
-    #[test]
-    fn the_estimate_keeps_up_with_demand_it_can_afford() {
-        check(
-            SPACIOUS,
-            scenarios(Demand::any(), Budget::Ample, ANY_FAULT),
-            |scenario| {
-                let report = scenario.run("demand");
-                prop_assume!(report.samples > 0 && report.received_bytes > 0);
-
                 let need = report.need_bps();
+                if need > 0 {
+                    let got = report.estimate_last_bps as f64 / need as f64 * 100.0;
+                    prop_assert!(
+                        got >= 60.0,
+                        "estimate ended at {} bps against a need of {need} bps ({got:.0}%) on a {} bps link, dropping {:.1}% with {:.2}% congestion loss ({scenario:?})",
+                        report.estimate_last_bps,
+                        scenario.capacity_bps,
+                        report.worst_drawdown_percent,
+                        report.congestion_loss_percent()
+                    );
+                }
+                let utilisation = report.utilisation_percent();
+                if let Some(utilisation) = utilisation.filter(|utilisation| *utilisation < 50.0) {
+                    prop_assert!(
+                        report.congestion_loss_percent() < 1.0,
+                        "{:.2}% congestion loss using only {utilisation:.1}% of the link ({} of {} packets, queue peaked at {:?}) ({scenario:?})",
+                        report.congestion_loss_percent(),
+                        report.congestion_drops,
+                        report.delivered_packets + report.congestion_drops,
+                        report.max_backlog
+                    );
+                }
+                // Retain the original twenty qualifying cases for both conditional claims.
+                // The delivery and other applicable assertions also run on rejected cases.
                 prop_assume!(need > 0);
-
-                let got = report.estimate_last_bps as f64 / need as f64 * 100.0;
-                prop_assert!(
-                    got >= 60.0,
-                    "estimate ended at {} bps against a need of {need} bps ({got:.0}%) on a {} bps \
-                 link, having dropped {:.1}% from its peak with {:.2}% congestion loss \
-                 ({scenario:?})",
-                    report.estimate_last_bps,
-                    scenario.capacity_bps,
-                    report.worst_drawdown_percent,
-                    report.congestion_loss_percent(),
-                );
-                Ok(())
-            },
-        );
-    }
-
-    /// A controller must not sustain congestion loss on a link it is not filling.
-    ///
-    /// Overuse is defined by the bottleneck's own tail-drop, not by a bitrate anyone chose, so this
-    /// holds for any capacity: if the link is not being filled, packets have no business being
-    /// dropped for congestion.
-    #[test]
-    fn an_underused_link_is_not_driven_into_loss() {
-        check(
-            SPACIOUS,
-            scenarios(Demand::any(), Budget::Ample, ANY_FAULT),
-            |scenario| {
-                let report = scenario.run("underused_link");
-                prop_assume!(report.samples > 0 && report.received_bytes > 0);
-                let Some(utilisation) = report.utilisation_percent() else {
-                    return Ok(());
-                };
-                prop_assume!(utilisation < 50.0);
-
-                prop_assert!(
-                    report.congestion_loss_percent() < 1.0,
-                    "{:.2}% congestion loss while using only {utilisation:.1}% of the link \
-                 ({} of {} packets, queue peaked at {:?}) ({scenario:?})",
-                    report.congestion_loss_percent(),
-                    report.congestion_drops,
-                    report.delivered_packets + report.congestion_drops,
-                    report.max_backlog,
-                );
+                prop_assume!(utilisation.is_some_and(|utilisation| utilisation < 50.0));
                 Ok(())
             },
         );
@@ -1211,7 +1132,7 @@ mod slow {
         // the estimate happened to land above demand. Skipping the assertion instead keeps the case,
         // and the tally makes the one risk of doing so visible: a property that silently stopped
         // asserting anything would otherwise still be green.
-        let exercised = AtomicUsize::new(0);
+        let exercised = Cell::new(0);
 
         check(
             SATURATED,
@@ -1227,7 +1148,7 @@ mod slow {
                 if report.estimate_last_bps <= report.demand_last_bps {
                     return Ok(());
                 }
-                exercised.fetch_add(1, Ordering::Relaxed);
+                exercised.set(exercised.get() + 1);
 
                 let quality = report.forwarded_quality.get("cotenant").copied();
                 prop_assert!(
@@ -1246,77 +1167,9 @@ mod slow {
         );
 
         assert!(
-            exercised.load(Ordering::Relaxed) > 0,
+            exercised.get() > 0,
             "no generated case reached the assertion: every one ended with the estimate at or below \
          demand, so this property asserted nothing and passed vacuously"
-        );
-    }
-
-    /// A settled stream must not oscillate between layers, whatever the network did to get there.
-    ///
-    /// Every other figure a plan reports is an average or an endpoint, and a stream flipping between
-    /// two layers looks healthy in all of them: right final layer, right byte count, right estimate.
-    /// Only a reversal count sees it, and only a reversal count can be asserted while the link is
-    /// still ramping - climbing q to h to f is correct, turning round is not.
-    ///
-    /// Faults are excluded rather than assumed away: an outage is a genuine reason to shed and then
-    /// climb back, so the reversal it causes is correct behaviour rather than instability.
-    #[test]
-    fn a_forwarded_stream_does_not_oscillate() {
-        check(
-            SPACIOUS,
-            scenarios(Demand::any(), Budget::Ample, PEER_CHURN),
-            |scenario| {
-                let report = scenario.run("no_oscillation");
-                prop_assume!(report.samples > 0 && report.received_bytes > 0);
-
-                for (publisher, reversals) in &report.quality_reversals {
-                    prop_assert!(
-                        *reversals <= 2,
-                        "{publisher}'s layer reversed direction {reversals} times (changing {:?} times \
-                     in total) on a {} bps link. Climbing is fine; turning round repeatedly means \
-                     the stream never settles, and every switch costs a keyframe ({scenario:?}, \
-                     estimate {} bps, drawdown {:.1}%)",
-                        report.quality_changes.get(publisher),
-                        scenario.capacity_bps,
-                        report.estimate_last_bps,
-                        report.worst_drawdown_percent,
-                    );
-                }
-                Ok(())
-            },
-        );
-    }
-
-    /// The estimate must not collapse on a link that never changed.
-    ///
-    /// Capacity here is fixed for the life of the plan, so a deep fall from peak is not the link being
-    /// withdrawn - it is the controller mistaking something else for congestion. That is exactly what
-    /// a throughput sample taken while the sender was idle used to do: a 2.6 Mbps estimate went to
-    /// 67 kbps in one step with no packet loss at all, and the allocator could only offer what the
-    /// collapsed estimate allowed, so it could not climb back out.
-    #[test]
-    fn a_fixed_link_does_not_collapse_the_estimate() {
-        check(
-            SPACIOUS,
-            scenarios(Demand::any(), Budget::Ample, PEER_CHURN),
-            |scenario| {
-                let report = scenario.run("no_collapse");
-                prop_assume!(report.samples > 0 && report.received_bytes > 0);
-                prop_assume!(report.capacity_fixed);
-
-                prop_assert!(
-                    report.worst_drawdown_percent < 75.0,
-                    "the estimate fell {:.1}% from its peak on a link whose capacity never moved, \
-                 ending at {} bps against {} bps of demand with {:.2}% congestion loss. A fixed \
-                 link gives nothing to back off from ({scenario:?})",
-                    report.worst_drawdown_percent,
-                    report.estimate_last_bps,
-                    report.demand_last_bps,
-                    report.congestion_loss_percent(),
-                );
-                Ok(())
-            },
         );
     }
 

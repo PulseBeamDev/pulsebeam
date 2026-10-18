@@ -84,6 +84,11 @@ hiding or unmounting releases it. Multiple views share the maximum size.
 
 For tuning, call
 `track.setReceiveOptions({minHeight: 180, minFps: 15, priority: 100})`.
+Minimums are protected before target upgrades, even upgrades of higher-priority
+streams. If minimums cannot all fit, higher priority wins; any stream may degrade
+or pause when bandwidth or source layers cannot meet its minimums. Both minimums
+zero means opportunistic service. Equal-priority streams share scarce service
+rather than starving by request order.
 Policy alone does not request hidden video. Excess views beyond `remoteVideos`
 stay unassigned and warn. The default is 16 remote video slots; set a custom
 topology before connection if you need more. Changing it recreates the Agent;

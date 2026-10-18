@@ -24,6 +24,7 @@ use std::time::Instant;
 
 pub struct SimClientBuilder {
     ip: IpAddr,
+    admission: Arc<Mutex<Option<pulsebeam::entity::ConnectionId>>>,
     host: Host,
     endpoint: String,
     tcp_server: Option<SocketAddr>,
@@ -100,9 +101,17 @@ fn unspecified_addr(ip: IpAddr) -> SocketAddr {
 impl SimClientBuilder {
     pub async fn bind(ip: IpAddr, server_ip: IpAddr) -> anyhow::Result<Self> {
         let socket = UdpSocket::bind(unspecified_addr(ip)).await?;
+        let admission = Arc::new(Mutex::new(None));
         Ok(Self {
             ip,
-            host: Host::new(create_http_client(), socket),
+            admission: admission.clone(),
+            host: Host::new(
+                Box::new(AdmissionClient {
+                    inner: create_http_client(),
+                    admission,
+                }),
+                socket,
+            ),
             endpoint: http_base_uri(server_ip, 7070),
             tcp_server: None,
             video_layers: None,
@@ -131,33 +140,9 @@ impl SimClientBuilder {
     /// Like `bind` but also configures a TCP active stream to the server's ICE
     /// port (3478).  Use with `start_sfu_node_tcp_only` to test TCP connectivity.
     pub async fn bind_tcp(ip: IpAddr, server_ip: IpAddr) -> anyhow::Result<Self> {
-        let socket = UdpSocket::bind(unspecified_addr(ip)).await?;
-        Ok(Self {
-            ip,
-            host: Host::new(create_http_client(), socket),
-            endpoint: http_base_uri(server_ip, 7070),
-            tcp_server: Some(SocketAddr::new(server_ip, 3478)),
-            video_layers: None,
-            video_slots: 0,
-            audio_slots: 0,
-            manual_subscriptions: false,
-            video_rx: None,
-            audio_rx: None,
-            publishes_video: false,
-            vbr_profile: None,
-            temporal_dd: None,
-            audio_level_dbov: None,
-            audio_phase_offset: 0,
-            opaque_payload: false,
-            quality_video: None,
-            corrupt_video_payload: false,
-            corrupt_audio_payload: false,
-            suppress_natural_keyframe_repeats: false,
-            keyframe_recovery: Arc::default(),
-            initial_topics: Default::default(),
-            quality_references: Arc::new(Mutex::new(BTreeMap::new())),
-            h264_publishers: Arc::new(Mutex::new(BTreeSet::new())),
-        })
+        let mut builder = Self::bind(ip, server_ip).await?;
+        builder.tcp_server = Some(SocketAddr::new(server_ip, 3478));
+        Ok(builder)
     }
 
     pub fn publish_video(mut self, simulcast_layers: Option<Vec<SimulcastLayer>>) -> Self {
@@ -389,8 +374,10 @@ impl SimClientBuilder {
             .unwrap_or_else(|| Arc::new(Mutex::new(AudioReceiveLog::default())));
         let mut ctx = ClientContext {
             agent: agent.clone(),
+            admission: self.admission,
             desired,
             video_capacity: self.video_slots,
+            audio_capacity: self.audio_slots,
             auto_subscribe: !self.manual_subscriptions,
             requested_video: None,
             discovered_tracks: HashSet::new(),
@@ -1224,10 +1211,25 @@ pub struct RequestedVideo {
     pub priority: u32,
 }
 
+#[derive(Clone, Debug)]
+pub struct ClientObservation {
+    pub admission: Option<pulsebeam::entity::ConnectionId>,
+    pub video_receivers: BTreeSet<u32>,
+    pub audio_receivers: BTreeSet<u32>,
+    pub snapshot: pulsebeam_agent_native::agent_core::Snapshot,
+    pub sent_intent_revision: Option<u64>,
+    pub accepted: Option<DesiredState>,
+    pub submitted: DesiredState,
+    pub video_capacity: usize,
+    pub audio_capacity: usize,
+}
+
 pub struct ClientContext {
     pub agent: Agent,
+    admission: Arc<Mutex<Option<pulsebeam::entity::ConnectionId>>>,
     desired: DesiredState,
     video_capacity: usize,
+    audio_capacity: usize,
     auto_subscribe: bool,
     requested_video: Option<Vec<RequestedVideo>>,
     pub video_rx: Arc<Mutex<VideoReceiveLog>>,
@@ -1244,6 +1246,47 @@ pub struct ClientContext {
 }
 
 impl ClientContext {
+    pub async fn observation(&self) -> anyhow::Result<ClientObservation> {
+        let observed = self.agent.simulation_observation().await?;
+        let snapshot = observed.snapshot;
+        // Wire revisions can advance when catalog removal changes the encoded intent without
+        // a new application revision. Correlate both namespaces at the native owner boundary.
+        let accepted = (observed.sent_intent_revision == Some(snapshot.accepted_intent_revision)
+            && snapshot.desired_revision == self.desired.revision)
+            .then(|| self.desired.clone());
+        Ok(ClientObservation {
+            admission: *self.admission.lock().unwrap(),
+            video_receivers: observed
+                .media_indices
+                .iter()
+                .filter_map(|(slot, index)| {
+                    matches!(
+                        slot,
+                        pulsebeam_agent_native::agent_core::MediaSlot::RemoteVideo(_)
+                    )
+                    .then_some(*index)
+                })
+                .collect(),
+            audio_receivers: observed
+                .media_indices
+                .iter()
+                .filter_map(|(slot, index)| {
+                    matches!(
+                        slot,
+                        pulsebeam_agent_native::agent_core::MediaSlot::RemoteAudio(_)
+                    )
+                    .then_some(*index)
+                })
+                .collect(),
+            snapshot,
+            sent_intent_revision: observed.sent_intent_revision,
+            accepted,
+            submitted: self.desired.clone(),
+            video_capacity: self.video_capacity,
+            audio_capacity: self.audio_capacity,
+        })
+    }
+
     pub fn participant_id(&self) -> Option<String> {
         self.agent.snapshot().participant_id
     }
@@ -1627,6 +1670,35 @@ fn create_vbr_source(encoding: Option<&str>, profile: VbrProfile) -> VbrSource {
         pulsebeam_testdata::RAW_H264_SCREEN_FULL_TIMING,
         profile,
     )
+}
+
+struct AdmissionClient {
+    inner: Box<dyn AsyncHttpClient>,
+    admission: Arc<Mutex<Option<pulsebeam::entity::ConnectionId>>>,
+}
+
+impl AsyncHttpClient for AdmissionClient {
+    fn execute(&self, request: HttpRequest) -> HttpResult<'_> {
+        Box::pin(async move {
+            let response = self.inner.execute(request).await?;
+            if response.status() == http::StatusCode::CREATED {
+                let location = response
+                    .headers()
+                    .get(http::header::LOCATION)
+                    .expect("admission has Location")
+                    .to_str()
+                    .expect("Location is text");
+                let connection = location
+                    .rsplit('/')
+                    .next()
+                    .expect("connection resource")
+                    .parse()
+                    .expect("admission names a canonical connection");
+                *self.admission.lock().unwrap() = Some(connection);
+            }
+            Ok(response)
+        })
+    }
 }
 
 pub fn create_http_client() -> Box<dyn AsyncHttpClient> {

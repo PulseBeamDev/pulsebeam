@@ -239,6 +239,17 @@ Use a maximum delay not below the minimum; invalid runtime policy is reported
 through Agent diagnostics. Policy survives temporary absence.
 Excess visible tracks beyond topology stay unmapped and warn.
 
+Allocation protects nonzero `minHeight` and `minFps` jointly before spending on
+target height and full available frame rate. Higher `priority` wins when
+minimums cannot all fit, then wins remaining target upgrades. A lower-priority
+minimum outranks a higher-priority upgrade, never a higher-priority minimum.
+Both minimums zero means no reservation. Minimums are best effort: unavailable
+layers or insufficient bandwidth can cause lower quality or paused forwarding
+without removing the receiver assignment. Equal-priority peers take turns
+under sustained scarcity. Congestion reduces quality promptly; recovery uses
+headroom and hysteresis to limit oscillation. This policy does not change
+receiver-capacity admission or latency-sensitive packet scheduling.
+
 **RemoteAudioTrack:** `kind`, external `participantId`, `label`, `receiving`,
 `subscribe`, `readWaveform(Float32Array)`, `readSpectrum(Float32Array)`.
 `receiving` follows receiver assignment (Mapping), not sound or autoplay.

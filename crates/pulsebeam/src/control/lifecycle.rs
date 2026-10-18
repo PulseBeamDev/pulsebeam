@@ -227,6 +227,30 @@ pub(crate) struct TrackLifecycle {
 }
 
 impl TrackLifecycle {
+    #[cfg(feature = "sim")]
+    pub(crate) fn observation(&self) -> crate::sim_observation::ControlObservation {
+        let (tracks, subscriptions) = self.topology.observation();
+        crate::sim_observation::ControlObservation {
+            generation: self.generation,
+            shard_generations: Vec::new(),
+            tracks,
+            subscriptions,
+            placements: self
+                .placements
+                .iter()
+                .map(
+                    |((ancestry, _), destination)| crate::sim_observation::PlacementObservation {
+                        track: ancestry.track_id,
+                        address: destination.placement.route,
+                        resident: destination.resident,
+                        route_installed: destination.route_installed,
+                    },
+                )
+                .collect(),
+            participants: Vec::new(),
+        }
+    }
+
     pub(crate) fn new(shard_count: usize) -> Self {
         Self {
             topology: TrackTopology::default(),

@@ -116,6 +116,8 @@ struct AuthorizationExpiryWork {
 
 #[derive(Debug, derive_more::From)]
 pub enum ControllerCommand {
+    #[cfg(feature = "sim")]
+    Observe(oneshot::Sender<crate::sim_observation::PendingObservation>),
     CreateParticipant(
         CreateParticipant,
         oneshot::Sender<Result<CreateParticipantReply, ControllerError>>,
@@ -411,6 +413,25 @@ impl ControllerActor {
 
     fn process_command(&mut self, command: ControllerCommand) -> Option<RequiredAction> {
         match command {
+            #[cfg(feature = "sim")]
+            ControllerCommand::Observe(reply) => {
+                let mut control = self.lifecycle.observation();
+                control.participants = self.core.registry.observation();
+                control.shard_generations = self
+                    .updates
+                    .iter()
+                    .map(crate::shard_update::ShardUpdateWriter::observed_generation)
+                    .collect();
+                let mut shards = Vec::with_capacity(self.router.shard_count());
+                for index in 0..self.router.shard_count() {
+                    let (send, receive) = oneshot::channel();
+                    self.command_backlog
+                        .push_back((ShardId::new(index), ShardCommand::Observe(send)));
+                    shards.push(receive);
+                }
+                let _ = reply.send(crate::sim_observation::PendingObservation { control, shards });
+                None
+            }
             ControllerCommand::CreateParticipant(message, reply) => {
                 match self.begin_create_participant(message.state, message.offer) {
                     Ok(pending) => Some(RequiredAction::Materialize {

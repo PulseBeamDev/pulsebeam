@@ -162,11 +162,9 @@ fn height_request_rounds_up_the_ladder_test() {
 
 /// A high-priority camera request must reclaim bandwidth from a lower-priority screen share.
 ///
-/// Both slots start on a low request, then the camera is explicitly raised to 720p while the
-/// screen share remains a low-priority 180p subscription. The link can carry either the camera's
-/// top layer or both streams' current layers, but not both the camera upgrade and the retained
-/// screen layer. The priority contract is that the camera wins this contention; a lower-priority
-/// stream may pause rather than pin the camera at its middle layer.
+/// Both slots start protected, then the camera is raised to 720p and the screen becomes
+/// explicitly optional. A previously retained optional stream must yield to a higher-priority
+/// target; retaining old quality cannot recreate a reservation removed by the new intent.
 #[test]
 fn high_priority_camera_reclaims_bandwidth_from_screenshare_test() {
     LocalNodeSim::new()
@@ -192,9 +190,9 @@ fn high_priority_camera_reclaims_bandwidth_from_screenshare_test() {
                 duration: Duration::from_secs(30),
             },
             Step::SubscribeToQos {
-                description: "Viewer raises the camera to 720p with higher priority",
+                description: "Viewer protects the camera and makes the background screen optional",
                 participant: "viewer",
-                targets: &[("camera", 720, 360, 200), ("screen", 180, 90, 10)],
+                targets: &[("camera", 720, 360, 200), ("screen", 180, 0, 10)],
             },
             Step::Run {
                 description: "Allow the allocator and BWE to apply the priority change",
@@ -220,19 +218,8 @@ fn screen_camera_viewer_room() -> Room {
         .with_participant(Participant::manual_subscriber("viewer", 2))
 }
 
-/// The protocol contract, exercised across a reconfiguration: when the viewer hands focus to the
-/// camera (high `priority`, 720p target), the focused stream must reach and *hold* its top layer,
-/// and the backgrounded screen share must yield cleanly rather than flap.
-///
-/// SPEC / RED under today's allocator. The allocator is floors-first-regardless-of-priority, so
-/// the low-priority screen's `min_height=90` floor — which can only be met by its single 2.5 Mbit/s
-/// layer — is guaranteed ahead of the focused camera's target and starves it at the middle layer.
-/// The ruled contract is *priority-gate floors*: a lower-priority floor yields to a higher-priority
-/// target. This test encodes that; it goes green when `run_compute` gains priority-gating.
-///
-/// (Both streams reaching quality 3 is impossible here on purpose: camera f (1.25M) + screen
-/// (2.5M) = 3.75M exceeds the ~3.0 Mbit/s estimate on a 3.5 Mbit/s link. The focused camera wins;
-/// the background screen pauses.)
+/// Reconfiguration and sustained contention across fixed deterministic seeds.
+/// Protected minimums and optional target allocation have distinct contracts.
 mod slow {
     use super::*;
 
@@ -267,9 +254,9 @@ mod slow {
                     duration: Duration::from_secs(15),
                 },
                 Step::SubscribeToQos {
-                    description: "Viewer hands focus to the camera; screen share is backgrounded",
+                    description: "Viewer protects the focused camera and removes screen protection",
                     participant: "viewer",
-                    targets: &[("camera", 720, 360, 200), ("screen", 180, 90, 10)],
+                    targets: &[("camera", 720, 360, 200), ("screen", 180, 0, 10)],
                 },
                 Step::Run {
                     description: "Require the focused camera to reach top quality after reconfiguration",
@@ -313,51 +300,56 @@ mod slow {
         }
     }
 
-    /// `priority` gates `min_height`: a lower-priority stream's floor must not preempt a
-    /// higher-priority stream's target when the two cannot both fit.
-    ///
-    /// SPEC / RED under today's allocator (same root cause as the reconfiguration test, isolated to a
-    /// single static subscription). The background screen's oversized 2.5 Mbit/s floor is guaranteed
-    /// ahead of the focused camera's 720p target, capping the camera at the middle layer. Under the
-    /// ruled priority-gate contract the focused camera reaches its top layer and the screen yields.
+    /// A lower-priority protected minimum beats a higher-priority target upgrade.
+    /// Two camera top layers exceed this link, but both requested minimums fit.
     #[test]
-    fn low_priority_floor_yields_to_high_priority_target_test() {
+    fn low_priority_minimum_precedes_high_priority_target_test() {
         for seed in QOS_SEEDS {
             LocalNodeSim::new()
-            .with_rng_seed(seed)
-            .with_bandwidth(3_500_000)
-            .with_room(screen_camera_viewer_room())
-            .run(vec![
-                Step::Run {
-                    description: "Establish connections and discover both tracks",
-                    duration: Duration::from_secs(5),
-                },
-                Step::SubscribeToQos {
-                    description: "Focused camera (720p, high priority); background screen with a floor",
-                    participant: "viewer",
-                    targets: &[("camera", 720, 360, 200), ("screen", 180, 90, 10)],
-                },
-                Step::Run {
-                    description: "Let the allocator resolve the contention",
-                    duration: Duration::from_secs(45),
-                },
-                Step::Report {
-                    description: "priority-gated floor diagnostic",
-                    participant: "viewer",
-                },
-                Step::CheckForwardedQuality {
-                    description: "The high-priority camera target beats the low-priority screen floor",
-                    origin: "camera",
-                    min_quality: 3,
-                },
-            ]);
+                .with_rng_seed(seed)
+                .with_bandwidth(2_200_000)
+                .with_room(
+                    Room::new("room1")
+                        .with_participant(Participant::publisher("camera", &["q", "h", "f"]))
+                        .with_participant(Participant::publisher("protected", &["q", "h", "f"]))
+                        .with_participant(Participant::manual_subscriber("viewer", 2)),
+                )
+                .run(vec![
+                    Step::Run {
+                        description: "Discover both constant-rate camera ladders",
+                        duration: Duration::from_secs(5),
+                    },
+                    Step::SubscribeToQos {
+                        description: "A high-priority 720p target and a lower-priority 720p minimum",
+                        participant: "viewer",
+                        targets: &[("camera", 720, 180, 200), ("protected", 720, 720, 10)],
+                    },
+                    Step::Run {
+                        description: "Converge while both targets cannot fit together",
+                        duration: Duration::from_secs(45),
+                    },
+                    Step::CheckForwardedQuality {
+                        description: "The lower-priority minimum is funded before the camera upgrade",
+                        origin: "protected",
+                        min_quality: 3,
+                    },
+                    Step::CheckForwardedQuality {
+                        description: "The higher-priority minimum remains funded too",
+                        origin: "camera",
+                        min_quality: 1,
+                    },
+                    Step::CheckVideoReceivedFrom {
+                        description: "The protected source delivers media, not just an allocator decision",
+                        participant: "viewer",
+                        publisher: "protected",
+                        min_frames: 60,
+                    },
+                ]);
         }
     }
 
-    /// The droppable counterpart to `low_priority_floor_yields_to_high_priority_target`: with the
-    /// screen explicitly droppable (`min_height=0`), Pass 1 skips it and the focused camera reaches its
-    /// top layer today. This isolates the bug to `min_height`: the same scenario differing only in the
-    /// floor is green here and red there.
+    /// Without either minimum, the background stream is opportunistic and must
+    /// yield to a higher-priority target rather than pinning its old allocation.
     #[test]
     fn droppable_background_yields_to_focused_camera_test() {
         for seed in QOS_SEEDS {
@@ -396,7 +388,7 @@ mod slow {
         }
     }
 
-    /// `target_height=0` means off: the server forwards nothing for a hidden stream and frees its
+    /// A zero target and zero minimums mean off: the server forwards nothing and frees its
     /// bandwidth for the streams that are actually on screen. The link fits only one camera at its top
     /// layer, so the visible camera reaches `f` only if the hidden one is truly off. A second plain
     /// (constant-rate) camera stands in for the hidden stream so the check turns on the target-0
@@ -2315,6 +2307,68 @@ fn deterministic_probe_plan(seed: u64) -> LinkReport {
         .expect("the viewer should have been measured")
 }
 
+/// Equal-priority subscriptions must make progress under sustained scarcity.
+/// Add peers only after the first stream has settled on the narrow link, so
+/// initial BWE optimism cannot give a permanently starved peer a passing sample.
+#[test]
+fn equal_priority_subscriptions_share_a_scarce_link_test() {
+    LocalNodeSim::new()
+        .with_bandwidth(300_000)
+        .with_room(
+            Room::new("room1")
+                .with_participant(Participant::publisher("ann", &["q"]))
+                .with_participant(Participant::publisher("ben", &["q"]))
+                .with_participant(Participant::publisher("cal", &["q"]))
+                .with_participant(Participant::manual_subscriber("viewer", 3)),
+        )
+        .run(vec![
+            Step::Run {
+                description: "Discover the equal-priority sources",
+                duration: Duration::from_secs(5),
+            },
+            Step::SubscribeToQos {
+                description: "Initially serve only the first peer",
+                participant: "viewer",
+                targets: &[("ann", 180, 180, 10)],
+            },
+            Step::Run {
+                description: "Settle the estimate before introducing contention",
+                duration: Duration::from_secs(20),
+            },
+            Step::SubscribeToQos {
+                description: "All three minimums compete at the same priority",
+                participant: "viewer",
+                targets: &[
+                    ("ann", 180, 180, 10),
+                    ("ben", 180, 180, 10),
+                    ("cal", 180, 180, 10),
+                ],
+            },
+            Step::Run {
+                description: "Allow repeated stable service turns and congestion recovery",
+                duration: Duration::from_secs(60),
+            },
+            Step::CheckVideoReceivedFrom {
+                description: "The first peer still gets service",
+                participant: "viewer",
+                publisher: "ann",
+                min_frames: 60,
+            },
+            Step::CheckVideoReceivedFrom {
+                description: "The second peer is not permanently starved",
+                participant: "viewer",
+                publisher: "ben",
+                min_frames: 60,
+            },
+            Step::CheckVideoReceivedFrom {
+                description: "The last peer is not permanently starved",
+                participant: "viewer",
+                publisher: "cal",
+                min_frames: 60,
+            },
+        ]);
+}
+
 /// Allocation with a room bigger than any other plan here exercises.
 ///
 /// Every other plan has two or three publishers, and an allocator can be very wrong in ways that
@@ -2323,9 +2377,8 @@ fn deterministic_probe_plan(seed: u64) -> LinkReport {
 /// spends everything on whoever it happens to reach first. None of that is reachable with two
 /// streams.
 ///
-/// The claim is deliberately the weak one - nobody is dropped outright, and nothing oscillates -
-/// because what a fair split between six cameras should look like is a policy question. Being
-/// forgotten entirely is not.
+/// Every requested minimum fits this budget. Minimum-first allocation must keep all
+/// tiles forwarding before upgrading the speaker; discovery order must not omit a tile.
 #[test]
 fn a_busy_room_starves_nobody_test() {
     const PUBLISHERS: [&str; 6] = ["ann", "ben", "cal", "dee", "eve", "fay"];
@@ -2336,76 +2389,72 @@ fn a_busy_room_starves_nobody_test() {
     }
     room = room.with_participant(Participant::manual_subscriber("viewer", PUBLISHERS.len()));
 
+    let mut steps = vec![
+        Step::Run {
+            description: "Establish connections and discover six cameras",
+            duration: Duration::from_secs(8),
+        },
+        Step::SubscribeToQos {
+            description: "Protect every small tile before upgrading the speaker",
+            participant: "viewer",
+            targets: &[
+                ("ann", 720, 180, 100),
+                ("ben", 180, 180, 10),
+                ("cal", 180, 180, 10),
+                ("dee", 180, 180, 10),
+                ("eve", 180, 180, 10),
+                ("fay", 180, 180, 10),
+            ],
+        },
+        Step::Run {
+            description: "Settle the gallery",
+            duration: Duration::from_secs(60),
+        },
+        // At the measured ~2Mbps estimate, all minimums and the middle
+        // speaker rung fit. The top rung plus all minimums and upgrade
+        // headroom does not. A target is not permission to displace a minimum.
+        Step::CheckForwardedQuality {
+            description: "The speaker gets the affordable upgrade above its minimum",
+            origin: "ann",
+            min_quality: 2,
+        },
+    ];
+    for origin in PUBLISHERS.into_iter().skip(1) {
+        steps.push(Step::CheckForwardedQuality {
+            description: "Every protected tile remains forwarded, regardless of discovery order",
+            origin,
+            min_quality: 1,
+        });
+    }
+    steps.extend([
+        Step::Expect {
+            description: "A tile asked for at 180p is never sent a taller layer",
+            participant: "viewer",
+            property: Property::NeverForwardedAbove {
+                origin: "fay",
+                max_quality: 1,
+            },
+        },
+        Step::Expect {
+            description: "The speaker settles rather than trading layers with the tiles",
+            participant: "viewer",
+            property: Property::QualityReversalsBelow {
+                origin: "ann",
+                max: 1,
+            },
+        },
+        Step::Expect {
+            description: "Six streams do not drive the link into congestion",
+            participant: "viewer",
+            property: Property::CongestionLossBelow(5),
+        },
+    ]);
+
     LocalNodeSim::new()
-        // Comfortably above what the asserted outcome costs - six 180p floors at 150 kbps plus
-        // the speaker's 1.25 Mbps top layer is 2.15 Mbps - while six top layers at 7.5 Mbps stay
-        // far out of reach, so the allocator still has to choose rather than being handed enough
-        // for everything.
-        //
-        // Sized at 2.5 Mbps this needed the *estimate* to reach 86% of the link before the
-        // allocator could seat all six, which made an allocator claim contingent on an estimator
-        // one. It passed at the committed seed and failed at seed 2 by 1.6%, with the estimate
-        // ranging 1.76-3.45 Mbps across the run: the verdict came down to where it happened to be
-        // at the final sample. The claim being made here is that a tile is never *overlooked*, so
-        // the budget has to be one the allocator cannot blame.
+        // The link and measured estimate carry all six minimums, but not six
+        // targets. Target progress is conditional on the estimate and headroom,
+        // not nominal link capacity or elementary-stream payload rates.
         .with_bandwidth(3_000_000)
         .with_room(room)
-        .run(vec![
-            Step::Run {
-                description: "Establish connections and discover six cameras",
-                duration: Duration::from_secs(8),
-            },
-            Step::SubscribeToQos {
-                description: "A gallery view: every tile small, one speaker large",
-                participant: "viewer",
-                targets: &[
-                    ("ann", 720, 180, 100),
-                    ("ben", 180, 180, 10),
-                    ("cal", 180, 180, 10),
-                    ("dee", 180, 180, 10),
-                    ("eve", 180, 180, 10),
-                    ("fay", 180, 180, 10),
-                ],
-            },
-            Step::Run {
-                description: "Settle the gallery",
-                duration: Duration::from_secs(60),
-            },
-            Step::CheckForwardedQualityReached {
-                description: "The speaker reaches the layer it was asked for",
-                origin: "ann",
-                min_quality: 3,
-            },
-            Step::CheckForwardedQuality {
-                description: "Every tile is still being forwarded, not dropped to pay for the speaker",
-                origin: "ben",
-                min_quality: 1,
-            },
-            Step::CheckForwardedQuality {
-                description: "The last tile discovered is served like the first",
-                origin: "fay",
-                min_quality: 1,
-            },
-            Step::Expect {
-                description: "A tile asked for at 180p is never sent a taller layer",
-                participant: "viewer",
-                property: Property::NeverForwardedAbove {
-                    origin: "fay",
-                    max_quality: 1,
-                },
-            },
-            Step::Expect {
-                description: "The speaker settles rather than trading layers with the tiles",
-                participant: "viewer",
-                property: Property::QualityReversalsBelow {
-                    origin: "ann",
-                    max: 1,
-                },
-            },
-            Step::Expect {
-                description: "Six streams do not drive the link into congestion",
-                participant: "viewer",
-                property: Property::CongestionLossBelow(5),
-            },
-        ]);
+        .run(steps);
 }

@@ -414,6 +414,8 @@ type SteeringFactory =
     Box<dyn FnOnce(&[pulsebeam_runtime::net::BoundUdpSocket]) -> Result<Box<dyn Steering>> + Send>;
 
 pub struct NodeBuilder {
+    #[cfg(feature = "sim")]
+    sim_observer: Option<tokio::sync::mpsc::Sender<crate::sim_observation::Observer>>,
     // Data-plane topology
     //
     // `data_threads` is physical executor width. Logical shard count is derived
@@ -458,6 +460,8 @@ impl Default for NodeBuilder {
 impl NodeBuilder {
     pub fn new() -> Self {
         Self {
+            #[cfg(feature = "sim")]
+            sim_observer: None,
             data_threads: 1,
             shard_runtime: ShardRuntime::ThreadPerCore,
             local_addr: None,
@@ -482,6 +486,15 @@ impl NodeBuilder {
             room_shard_slot: crate::control::core::DEFAULT_ROOM_SHARD_SLOT,
             room_placement: crate::control::core::RoomPlacement::Hashed,
         }
+    }
+
+    #[cfg(feature = "sim")]
+    pub fn with_sim_observer(
+        mut self,
+        reply: tokio::sync::mpsc::Sender<crate::sim_observation::Observer>,
+    ) -> Self {
+        self.sim_observer = Some(reply);
+        self
     }
 
     /// Place a room's slots round-robin instead of by hash.
@@ -914,6 +927,12 @@ impl NodeBuilder {
         // intentionally small so backpressure is applied early
         // with 62.5 ms pacing rate, at most we get 1s latency here.
         let (controller_command_tx, controller_command_rx) = mailbox::new(16);
+        #[cfg(feature = "sim")]
+        if let Some(reply) = self.sim_observer {
+            let _ = reply.try_send(crate::sim_observation::Observer::new(
+                controller_command_tx.clone(),
+            ));
+        }
 
         control_tasks.spawn(ignore(controller.run(
             controller_command_rx,

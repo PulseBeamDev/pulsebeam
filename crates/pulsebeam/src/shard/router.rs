@@ -100,6 +100,33 @@ pub(crate) struct ShardRuntime {
 }
 
 impl ShardRuntime {
+    #[cfg(feature = "sim")]
+    pub(crate) fn observation(
+        &self,
+    ) -> (
+        Vec<crate::entity::TrackId>,
+        Vec<crate::sim_observation::RouteObservation>,
+    ) {
+        let tracks = self.tracks.values().map(|runtime| runtime.id).collect();
+        let routes = self
+            .routes
+            .observation()
+            .into_iter()
+            .map(|(address, action)| {
+                let (target, reverse) = match action {
+                    RouteAction::Forward { target } => (target, false),
+                    RouteAction::Reverse { target } => (target, true),
+                };
+                crate::sim_observation::RouteObservation {
+                    address,
+                    track: self.track_id(target),
+                    reverse,
+                }
+            })
+            .collect();
+        (tracks, routes)
+    }
+
     pub fn new(shard_id: ShardId) -> Self {
         Self {
             tracks: SlotMap::with_key(),

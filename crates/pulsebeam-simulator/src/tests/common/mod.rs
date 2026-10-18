@@ -2,6 +2,7 @@ pub mod client;
 pub mod decoder;
 pub mod harness;
 pub mod media;
+pub mod oracle;
 
 pub use harness::{
     Capacity, Content, Experience, LinkProfile, LinkReport, LocalNodeSim, Loss,
@@ -117,6 +118,16 @@ pub async fn start_sfu_node_with(
     shards: usize,
     tcp_only: bool,
 ) -> anyhow::Result<()> {
+    start_observed_sfu_node(ip, rng, shards, tcp_only, None).await
+}
+
+pub async fn start_observed_sfu_node(
+    ip: IpAddr,
+    rng: pulsebeam_runtime::rand::Rng,
+    shards: usize,
+    tcp_only: bool,
+    observer: Option<tokio::sync::mpsc::Sender<pulsebeam::sim_observation::Observer>>,
+) -> anyhow::Result<()> {
     let rtc_port = 3478;
     let external_addr = SocketAddr::new(ip, rtc_port);
     let local_addr = unspecified_addr(ip, rtc_port);
@@ -140,6 +151,9 @@ pub async fn start_sfu_node_with(
             .expect("development registry is valid"),
         )
         .with_current_runtime();
+    if let Some(observer) = observer {
+        builder = builder.with_sim_observer(observer);
+    }
     if shards > 1 {
         builder = builder.room_shard_slot(1).round_robin_rooms();
     }
