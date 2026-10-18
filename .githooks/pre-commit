@@ -1,0 +1,9 @@
+#!/bin/sh
+# Validate exactly what is staged, without changing the working tree.
+set -eu
+
+if ! git diff --cached --check --no-ext-diff; then
+    printf '\nCommit blocked: fix whitespace errors in the staged patch.\n' >&2
+    printf 'Stage the corrected lines and commit again.\n' >&2
+    exit 1
+fi
