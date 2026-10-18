@@ -1,22 +1,23 @@
 # Local Git hooks
 
-Enable the repository's Git hooks once in your checkout:
+Enable the hooks once in your checkout:
 
 ```sh
 sh scripts/install-git-hooks.sh
 ```
 
-- **Pre-commit:** reject whitespace errors in the *staged patch* using `git diff --cached --check`. It never reformats or stages files on your behalf.
-- **Pre-push:** run the existing `./bazel test //:fast --test_output=errors` gate. The complete `//:test` acceptance gate remains in CI.
+Every commit runs the following sequence:
 
-Use `./bazel run //:fix` when you want to format source deliberately; review and stage those changes yourself. Bazel provisions the project's language tools, so the hooks do not introduce another formatter or dependency manager.
+1. Require all tracked edits to be staged. Partially staged files are rejected because Bazel validates the worktree while Git commits the index.
+2. Run `./bazel run //:fix`, PulseBeam's provisioned Rust and JavaScript formatters. Stage the resulting tracked formatting changes automatically.
+3. Reject whitespace errors in the resulting staged patch.
+4. Require `./bazel test //:test --keep_going --test_output=errors --zip_undeclared_test_outputs` to pass before Git creates the commit.
+5. Reject any working-tree changes introduced during verification.
 
-To bypass the pre-push gate for a specific push (for example, when the same commit was already validated):
+The full gate includes the project's Bazel-owned Clippy, source-formatting, architectural, build and test contracts. Rust Clippy warnings without a supported safe auto-fix are **not** silently suppressed or transformed using an alternative Cargo build graph: they fail the commit and require a source correction.
 
-```sh
-PULSEBEAM_SKIP_PUSH_CHECKS=1 git push
-```
+The pre-push hook is intentionally empty: a successful commit already passed complete local acceptance. CI independently repeats the complete gate. For changes to generated input/lockfiles, run their documented update process before committing.
 
-Use `git -c core.hooksPath=/dev/null commit ...` only when intentionally bypassing commit-time checks. Hooks are a local convenience, not security or CI enforcement. To disable the setup, run `git config --local --unset core.hooksPath`.
+Git hooks are local, voluntary controls; Git can bypass them with `--no-verify` or an alternate `core.hooksPath`. Protected-branch rules and required CI checks remain necessary for enforcement. To disable local hooks, run `git config --local --unset core.hooksPath`.
 
-The installer refuses to replace an existing custom `core.hooksPath`. For linked worktrees, Git's local configuration may be shared; the relative `.githooks` path resolves from each checkout's working-tree root.
+The installer preserves pre-existing custom `core.hooksPath` values; relative paths work with linked worktrees.
