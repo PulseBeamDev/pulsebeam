@@ -1,3 +1,0 @@
-#!/bin/sh
-# Acceptance runs at commit time, not on every push.
-set -eu
