@@ -98,7 +98,7 @@ pub(crate) struct MediaEgress {
     rtp_bytes_in_flight: u64,
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Copy, Debug, Default)]
 struct PayloadAdmission {
     debt: u128,
     updated_at: Option<Instant>,
@@ -596,7 +596,8 @@ impl MediaEgress {
         }
 
         let horizon = assignment.delivery.max_queue_residence;
-        let payload_eligible = self.senders[sender_index].admission.eligible(
+        let mut admission = self.senders[sender_index].admission;
+        let payload_eligible = admission.eligible(
             at.monotonic,
             self.senders[sender_index].selected_bitrate(),
             horizon,
@@ -623,7 +624,8 @@ impl MediaEgress {
             return Err(CommandError::WouldBlock);
         }
         self.apply_frame_admission(sender_index, &media, &packet);
-        self.senders[sender_index].admission.charge(payload_bytes);
+        admission.charge(payload_bytes);
+        self.senders[sender_index].admission = admission;
         self.admitted_bytes = self.admitted_bytes.saturating_add(payload_bytes as u64);
         self.senders[sender_index].latest_admitted_global = Some(media.packet.global_media_at());
         self.queued_payload_bytes = self.queued_payload_bytes.saturating_add(payload_bytes);
@@ -2971,7 +2973,7 @@ mod tests {
     }
 
     #[test]
-    fn descriptor_budget_rejection_preserves_facts_without_priming_source_state() {
+    fn descriptor_budget_rejection_preserves_admission_and_source_facts() {
         use pulsebeam_core::dd::temporal::TemporalDdGenerator;
         let now = Instant::now();
         let at = TimePoint {
@@ -3006,6 +3008,10 @@ mod tests {
         let rejected = media(1);
         let later = media(2);
         let original = rejected.frame.clone();
+        let admission_before = (
+            owner.senders[0].admission.debt,
+            owner.senders[0].admission.updated_at,
+        );
         owner.queued_descriptor_bytes = MAX_PACED_TRANSPORT_BYTES;
         assert_eq!(
             owner.admit(at, sender, rejected.clone()),
@@ -3014,6 +3020,13 @@ mod tests {
         assert!(owner.queued_packets == 0);
         assert_eq!(owner.admitted_bytes, 0);
         assert_eq!(rejected.frame, original);
+        assert_eq!(
+            (
+                owner.senders[0].admission.debt,
+                owner.senders[0].admission.updated_at,
+            ),
+            admission_before
+        );
         owner.queued_descriptor_bytes = 0;
         // A resolved independent frame does not need a seed packet accepted by RTC.
         owner.admit(at, sender, later).unwrap();
