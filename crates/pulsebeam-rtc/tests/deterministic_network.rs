@@ -227,6 +227,7 @@ fn run(scenario: Scenario) {
                 ),
             }
         }
+        fixture.drive_for(Duration::from_millis(1));
     }
 
     if matches!(scenario.transport, Transport::Data) {

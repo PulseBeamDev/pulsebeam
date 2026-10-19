@@ -4,11 +4,27 @@ use std::{
 };
 
 use pulsebeam_rtc::{
-    Command, Connection, ConnectionConfig, ConnectionEntropy, Event, ForwardedMedia, FrameBoundary,
-    FrameDependencies, FrameId, FrameMetadata, GlobalMediaTime, LocalCandidate, NetworkInput,
-    Output, SdpOffer, TimePoint, TransmitTarget,
+    Command, Connection, ConnectionConfig, ConnectionEntropy, DeliveryConstraints, Event,
+    ForwardedMedia, FrameBoundary, FrameDependencies, FrameId, FrameMetadata, GlobalMediaTime,
+    LocalCandidate, MediaPayloadBitrate, NetworkInput, Output, SdpOffer, SenderAssignment,
+    SourceIncarnation, TimePoint, TransmitTarget,
 };
 use pulsebeam_webrtc_sys::*;
+
+fn sender_assignment() -> SenderAssignment {
+    SenderAssignment {
+        source: SourceIncarnation::from_value(1),
+        selected_bitrate: MediaPayloadBitrate::from_bps(1_000_000),
+        potential_bitrate: MediaPayloadBitrate::from_bps(1_000_000),
+        delivery: DeliveryConstraints {
+            max_media_age: Duration::from_secs(1),
+            max_queue_residence: Duration::from_millis(200),
+            repair_window: Duration::from_secs(1),
+        },
+        playout_delay: None,
+        decode_target_mask: None,
+    }
+}
 
 fn complete(
     world: &ControlledWorld,
@@ -132,12 +148,10 @@ fn exercise(seed: u64, start: Instant) -> (u64, u64, usize) {
         server_socket.local_address().ip(),
         server_socket.local_address().port(),
     );
-    let mut config = ConnectionConfig {
+    let config = ConnectionConfig {
         local_candidates: vec![LocalCandidate::Udp(local)],
         ..ConnectionConfig::default()
     };
-    config.default_audio_policy.desired_bitrate =
-        pulsebeam_rtc::MediaPayloadBitrate::from_bps(1_000_000);
     let accepted = Connection::accept(
         config,
         SdpOffer::new(offer.sdp),
@@ -160,6 +174,15 @@ fn exercise(seed: u64, start: Instant) -> (u64, u64, usize) {
         .unwrap(),
     );
     let mut connection = accepted.connection;
+    connection
+        .command(
+            point(world.now()),
+            Command::SetSenderAssignment {
+                sender,
+                assignment: Some(sender_assignment()),
+            },
+        )
+        .unwrap();
     let mut connected = false;
     let mut peer_connected = false;
     let mut inbound = 0;
@@ -224,9 +247,9 @@ fn exercise(seed: u64, start: Instant) -> (u64, u64, usize) {
                     assert!(packet.bytes().ends_with(&[0xf8, 0xff, 0xfe]));
                     inbound += 1;
                     pending.push_back(ForwardedMedia {
+                        source: SourceIncarnation::from_value(1),
                         packet,
                         frame: FrameMetadata {
-                            decode_target_mask: None,
                             id: FrameId::from_value(inbound),
                             boundary: FrameBoundary::Complete,
                             random_access: true,
@@ -424,12 +447,10 @@ fn controlled_libwebrtc_acknowledges_rtx_padding_before_primary_media() {
         global: GlobalMediaTime::from_micros(1_000_000 + (now - origin).as_micros() as u64),
     };
     let local = SocketAddr::new(socket.local_address().ip(), socket.local_address().port());
-    let mut config = ConnectionConfig {
+    let config = ConnectionConfig {
         local_candidates: vec![LocalCandidate::Udp(local)],
         ..ConnectionConfig::default()
     };
-    config.default_video_policy.desired_bitrate =
-        pulsebeam_rtc::MediaPayloadBitrate::from_bps(1_000_000);
     let accepted = Connection::accept(
         config,
         SdpOffer::new(offer.sdp),
@@ -438,6 +459,7 @@ fn controlled_libwebrtc_acknowledges_rtx_padding_before_primary_media() {
     )
     .unwrap();
     assert_eq!(accepted.session.senders.len(), 1);
+    let sender = accepted.session.senders[0].id;
     assert!(
         accepted.session.senders[0]
             .codec
@@ -470,6 +492,15 @@ fn controlled_libwebrtc_acknowledges_rtx_padding_before_primary_media() {
         .unwrap(),
     );
     let mut connection = accepted.connection;
+    connection
+        .command(
+            point(world.now()),
+            Command::SetSenderAssignment {
+                sender,
+                assignment: Some(sender_assignment()),
+            },
+        )
+        .unwrap();
     let mut connected = false;
     let mut peer_connected = false;
     let mut probes = 0;

@@ -204,18 +204,14 @@ impl Connection {
                 }
                 self._subsystems.egress.admit(at, sender, media)
             }
-            Command::RecoverSenderMedia { sender } => {
-                self._subsystems.egress.recover_sender_media(sender)
-            }
-            Command::DiscardSenderMedia { sender } => {
-                self._subsystems.egress.discard_sender_media(sender)
-            }
-            Command::SetSenderPolicy { sender, policy } => {
-                self._subsystems.egress.set_policy(sender, policy, at)
-            }
-            Command::SetSenderDemand { sender, demand } => {
-                self._subsystems.egress.set_demand(sender, demand, at)
-            }
+            Command::RecoverSenderMedia { sender, assignment } => self
+                ._subsystems
+                .egress
+                .set_assignment(sender, Some(assignment), at, true),
+            Command::SetSenderAssignment { sender, assignment } => self
+                ._subsystems
+                .egress
+                .set_assignment(sender, assignment, at, false),
             Command::OpenDataChannel(config) => self
                 ._subsystems
                 .sctp
@@ -774,8 +770,6 @@ impl Connection {
             negotiated.facts.protocol_randomness(),
             config.limits.max_queued_media_bytes,
             config.limits.max_retransmission_bytes,
-            config.default_audio_policy,
-            config.default_video_policy,
             at.monotonic,
         );
         let feedback = negotiated.facts.feedback();
@@ -870,13 +864,19 @@ mod tests {
             },
         );
         fixture.configure_time_quantum(Duration::from_millis(5));
-        fixture.command(Command::SetSenderDemand {
+        fixture.command(Command::SetSenderAssignment {
             sender: fixture.sender,
-            demand: crate::SenderDemand::new(
-                MediaPayloadBitrate::from_bps(0),
-                MediaPayloadBitrate::from_bps(2_000_000),
-            )
-            .expect("potential-only demand"),
+            assignment: Some({
+                let (selected_bitrate, potential_bitrate) = (
+                    MediaPayloadBitrate::from_bps(0),
+                    MediaPayloadBitrate::from_bps(2_000_000),
+                );
+                pulsebeam_rtc::SenderAssignment {
+                    selected_bitrate,
+                    potential_bitrate,
+                    ..fixture.assignment(fixture.sender)
+                }
+            }),
         });
         let received_before = fixture
             .connection
@@ -949,13 +949,19 @@ mod tests {
                 _ => {}
             }
         }
-        fixture.command(Command::SetSenderDemand {
+        fixture.command(Command::SetSenderAssignment {
             sender: fixture.sender,
-            demand: crate::SenderDemand::new(
-                MediaPayloadBitrate::from_bps(0),
-                MediaPayloadBitrate::from_bps(2_000_000),
-            )
-            .expect("potential-only interest"),
+            assignment: Some({
+                let (selected_bitrate, potential_bitrate) = (
+                    MediaPayloadBitrate::from_bps(0),
+                    MediaPayloadBitrate::from_bps(2_000_000),
+                );
+                pulsebeam_rtc::SenderAssignment {
+                    selected_bitrate,
+                    potential_bitrate,
+                    ..fixture.assignment(fixture.sender)
+                }
+            }),
         });
         fixture.command(Command::SendData {
             channel: channel.expect("opened channel"),
@@ -1008,12 +1014,14 @@ mod tests {
                 PeerFixture::connected()
             };
             if repair {
-                fixture.command(Command::SetSenderPolicy {
+                fixture.command(Command::SetSenderAssignment {
                     sender: fixture.sender,
-                    policy: crate::SenderPolicy {
-                        desired_bitrate: MediaPayloadBitrate::from_bps(1_000_000),
+                    assignment: Some(pulsebeam_rtc::SenderAssignment {
                         playout_delay: None,
-                    },
+                        ..crate::test_support::sender_assignment(MediaPayloadBitrate::from_bps(
+                            1_000_000,
+                        ))
+                    }),
                 });
             }
             let packet = fixture.send_source(if repair { &[0x65; 32] } else { &[7; 32] });
@@ -1041,16 +1049,21 @@ mod tests {
                     .egress
                     .request_repair(header.ssrc, header.sequence_number);
             }
-            fixture.command(Command::SetSenderDemand {
+            fixture.command(Command::SetSenderAssignment {
                 sender: fixture.sender,
-                demand: crate::SenderDemand::new(
-                    MediaPayloadBitrate::from_bps(0),
-                    MediaPayloadBitrate::from_bps(2_000_000),
-                )
-                .expect("potential-only interest"),
+                assignment: Some({
+                    let (selected_bitrate, potential_bitrate) = (
+                        MediaPayloadBitrate::from_bps(100_000),
+                        MediaPayloadBitrate::from_bps(2_000_000),
+                    );
+                    pulsebeam_rtc::SenderAssignment {
+                        selected_bitrate,
+                        potential_bitrate,
+                        ..fixture.assignment(fixture.sender)
+                    }
+                }),
             });
             let at = fixture.at();
-            let sender = fixture.sender;
             let subsystems = &mut fixture.connection._subsystems;
             subsystems.egress.update_controller(
                 at,
@@ -1063,7 +1076,14 @@ mod tests {
             );
             assert!(subsystems.egress.test_envelope().unwrap().probe_permitted);
             let (_, senders) = subsystems.egress.stats();
-            assert_eq!(senders[0].demand.selected().as_bps(), 0);
+            assert_eq!(
+                senders[0]
+                    .assignment
+                    .expect("bound sender")
+                    .selected_bitrate
+                    .as_bps(),
+                100_000
+            );
             assert_eq!(senders[0].queued_packets, usize::from(!repair));
             assert!(matches!(
                 subsystems
@@ -1072,20 +1092,27 @@ mod tests {
                 PrepareResult::Blocked
             ));
             let mut service = None;
-            for _ in 0..2 {
+            for _ in 0..4 {
                 assert!(matches!(
                     subsystems
                         .egress
                         .prepare_one(at, 0, &mut subsystems.transport, true),
                     PrepareResult::Prepared
                 ));
-                let transmit = subsystems.transport.poll_prepared().unwrap();
-                if let Some(rtp) = transmit.rtp {
-                    service = Some(rtp.service);
-                } else {
-                    assert_eq!(transmit.kind, DatagramKind::Rtcp);
+                while let Some(transmit) = subsystems.transport.poll_prepared() {
+                    if let Some(rtp) = transmit.rtp {
+                        service = Some(rtp.service);
+                    } else {
+                        assert!(matches!(
+                            transmit.kind,
+                            DatagramKind::Rtcp | DatagramKind::Dtls
+                        ));
+                    }
+                    if transmit.rtp.is_some() || transmit.kind == DatagramKind::Rtcp {
+                        assert!(subsystems.egress.preflight_commit(&transmit));
+                        subsystems.egress.commit(at, &transmit);
+                    }
                 }
-                subsystems.egress.commit(at, &transmit);
                 if service.is_some() {
                     break;
                 }
@@ -1098,17 +1125,6 @@ mod tests {
                     crate::transport::RtpService::Original
                 })
             );
-            subsystems.egress.discard_sender_media(sender).unwrap();
-            let idle_at = TimePoint {
-                monotonic: at.monotonic + Duration::from_millis(20),
-                global: at.global.checked_add(Duration::from_millis(20)).unwrap(),
-            };
-            assert!(matches!(
-                subsystems
-                    .egress
-                    .prepare_one(idle_at, 0, &mut subsystems.transport, true),
-                PrepareResult::Prepared
-            ));
         }
     }
 
@@ -1170,12 +1186,14 @@ mod tests {
         fixture.configure_bottleneck(2_000_000);
         fixture.configure_time_quantum(Duration::from_millis(5));
         let mut source = crate::test_source::ComponentSource::audio(1);
-        let mut policy = crate::ConnectionConfig::default().default_audio_policy;
+        let mut policy =
+            crate::test_support::sender_assignment(pulsebeam_rtc::MediaPayloadBitrate::from_bps(0));
         policy.playout_delay = Some(crate::PlayoutDelay::from_ticks(0, 50).expect("500 ms"));
-        policy.desired_bitrate = MediaPayloadBitrate::from_bps(2_000_000);
-        fixture.command(Command::SetSenderPolicy {
+        policy.selected_bitrate = MediaPayloadBitrate::from_bps(2_000_000);
+        policy.potential_bitrate = MediaPayloadBitrate::from_bps(2_000_000);
+        fixture.command(Command::SetSenderAssignment {
             sender: fixture.sender,
-            policy,
+            assignment: Some(policy),
         });
         let mut frame = 0;
         for (feedback_enabled, replace_path) in
@@ -1192,9 +1210,9 @@ mod tests {
                         .reselect_path_for_test()
                         .expect("replace selected path");
                 }
-                fixture.command(Command::SetSenderPolicy {
+                fixture.command(Command::SetSenderAssignment {
                     sender: fixture.sender,
-                    policy,
+                    assignment: Some(policy),
                 });
             }
             let start = fixture.at().monotonic;
@@ -1319,12 +1337,15 @@ mod tests {
                 fixture.configure_impairment(impairment);
             }
             let mut source = crate::test_source::ComponentSource::audio(1);
-            let mut policy = crate::ConnectionConfig::default().default_audio_policy;
+            let mut policy = crate::test_support::sender_assignment(
+                pulsebeam_rtc::MediaPayloadBitrate::from_bps(0),
+            );
             policy.playout_delay = Some(crate::PlayoutDelay::from_ticks(0, 50).expect("500 ms"));
-            policy.desired_bitrate = MediaPayloadBitrate::from_bps(4_000_000);
-            fixture.command(Command::SetSenderPolicy {
+            policy.selected_bitrate = MediaPayloadBitrate::from_bps(4_000_000);
+            policy.potential_bitrate = MediaPayloadBitrate::from_bps(4_000_000);
+            fixture.command(Command::SetSenderAssignment {
                 sender: fixture.sender,
-                policy,
+                assignment: Some(policy),
             });
             let start = fixture.at().monotonic;
             let mut policed = false;
@@ -1443,12 +1464,14 @@ mod tests {
                 .native_queue_delay_target
         });
         let mut source = crate::test_source::ComponentSource::video(1);
-        let mut policy = crate::ConnectionConfig::default().default_video_policy;
+        let mut policy =
+            crate::test_support::sender_assignment(pulsebeam_rtc::MediaPayloadBitrate::from_bps(0));
         policy.playout_delay = Some(crate::PlayoutDelay::from_ticks(0, 50).expect("500 ms"));
-        policy.desired_bitrate = MediaPayloadBitrate::from_bps(2_000_000);
-        fixture.command(Command::SetSenderPolicy {
+        policy.selected_bitrate = MediaPayloadBitrate::from_bps(2_000_000);
+        policy.potential_bitrate = MediaPayloadBitrate::from_bps(2_000_000);
+        fixture.command(Command::SetSenderAssignment {
             sender: fixture.sender,
-            policy,
+            assignment: Some(policy),
         });
         let start = fixture.at().monotonic;
         for frame in 1..=1_600_u64 {
@@ -1525,12 +1548,14 @@ mod tests {
         fixture.observe_native_target(|connection| {
             connection._subsystems.egress.native_queue_delay_target()
         });
-        let mut policy = crate::ConnectionConfig::default().default_audio_policy;
-        policy.desired_bitrate = crate::MediaPayloadBitrate::from_bps(4_000_000);
+        let mut policy =
+            crate::test_support::sender_assignment(pulsebeam_rtc::MediaPayloadBitrate::from_bps(0));
+        policy.selected_bitrate = crate::MediaPayloadBitrate::from_bps(4_000_000);
+        policy.potential_bitrate = crate::MediaPayloadBitrate::from_bps(4_000_000);
         policy.playout_delay = Some(crate::PlayoutDelay::from_ticks(0, 50).expect("500 ms"));
-        fixture.command(Command::SetSenderPolicy {
+        fixture.command(Command::SetSenderAssignment {
             sender: fixture.sender,
-            policy,
+            assignment: Some(policy),
         });
         let start = fixture.at().monotonic;
         let mut source = crate::test_source::ComponentSource::audio(1);
@@ -1546,13 +1571,19 @@ mod tests {
                 Err(error) => panic!("unexpected media error: {error:?}"),
             }
         }
-        fixture.command(Command::SetSenderDemand {
+        fixture.command(Command::SetSenderAssignment {
             sender: fixture.sender,
-            demand: crate::SenderDemand::new(
-                MediaPayloadBitrate::from_bps(0),
-                MediaPayloadBitrate::from_bps(0),
-            )
-            .expect("source stopped before draining committed packets"),
+            assignment: Some({
+                let (selected_bitrate, potential_bitrate) = (
+                    MediaPayloadBitrate::from_bps(0),
+                    MediaPayloadBitrate::from_bps(0),
+                );
+                pulsebeam_rtc::SenderAssignment {
+                    selected_bitrate,
+                    potential_bitrate,
+                    ..fixture.assignment(fixture.sender)
+                }
+            }),
         });
         fixture.drive_for(Duration::from_secs(2));
         assert_eq!(fixture.network_counters().1, 0);
@@ -1614,18 +1645,21 @@ mod tests {
     }
 
     #[test]
-    fn tightening_policy_drops_queued_dependents_but_preserves_independent_frame() {
+    fn tightening_delivery_drops_queued_dependents_but_preserves_independent_frame() {
         let mut fixture = PeerFixture::connected();
         fixture.drive_for(Duration::from_millis(200));
         let mut source = PeerFixture::connected();
         let bytes = source.send_source(&[0x5a; 100]).bytes().clone();
         let at = fixture.at();
-        let mut policy = crate::ConnectionConfig::default().default_audio_policy;
-        policy.playout_delay = Some(crate::PlayoutDelay::from_ticks(0, 50).expect("500 ms"));
-        policy.desired_bitrate = crate::MediaPayloadBitrate::from_bps(2_000_000);
-        fixture.command(Command::SetSenderPolicy {
+        let mut policy =
+            crate::test_support::sender_assignment(pulsebeam_rtc::MediaPayloadBitrate::from_bps(0));
+        policy.delivery.max_media_age = Duration::from_millis(500);
+        policy.delivery.max_queue_residence = Duration::from_millis(500);
+        policy.selected_bitrate = crate::MediaPayloadBitrate::from_bps(2_000_000);
+        policy.potential_bitrate = crate::MediaPayloadBitrate::from_bps(2_000_000);
+        fixture.command(Command::RecoverSenderMedia {
             sender: fixture.sender,
-            policy,
+            assignment: policy,
         });
         for (id, offset, dependencies, random_access) in [
             (1, 0, vec![], true),
@@ -1646,9 +1680,9 @@ mod tests {
                     Command::SendMedia {
                         sender: fixture.sender,
                         media: ForwardedMedia {
+                            source: pulsebeam_rtc::SourceIncarnation::from_value(1),
                             packet,
                             frame: FrameMetadata {
-                                decode_target_mask: None,
                                 id: FrameId::from_value(id),
                                 boundary: FrameBoundary::Complete,
                                 random_access,
@@ -1662,7 +1696,7 @@ mod tests {
                 .unwrap_or_else(|error| panic!("frame {id}: {error:?}"));
         }
         assert_eq!(fixture.connection.stats().senders[0].queued_packets, 3);
-        policy.playout_delay = Some(crate::PlayoutDelay::from_ticks(0, 10).expect("100 ms"));
+        policy.delivery.max_media_age = Duration::from_millis(40);
         fixture
             .connection
             .command(
@@ -1670,12 +1704,12 @@ mod tests {
                     monotonic: at.monotonic + Duration::from_millis(50),
                     global: at.global.checked_add(Duration::from_millis(50)).unwrap(),
                 },
-                Command::SetSenderPolicy {
+                Command::SetSenderAssignment {
                     sender: fixture.sender,
-                    policy,
+                    assignment: Some(policy),
                 },
             )
-            .expect("tighten policy");
+            .expect("tighten delivery bound");
         assert_eq!(fixture.connection.stats().senders[0].queued_packets, 1);
     }
 
@@ -1683,12 +1717,14 @@ mod tests {
     fn low_rate_media_uses_actual_offer_for_application_limited_classification() {
         let mut fixture = PeerFixture::connected();
         let mut source = PeerFixture::connected();
-        let mut policy = crate::ConnectionConfig::default().default_audio_policy;
-        policy.desired_bitrate = crate::MediaPayloadBitrate::from_bps(4_000_000);
+        let mut policy =
+            crate::test_support::sender_assignment(pulsebeam_rtc::MediaPayloadBitrate::from_bps(0));
+        policy.selected_bitrate = crate::MediaPayloadBitrate::from_bps(4_000_000);
+        policy.potential_bitrate = crate::MediaPayloadBitrate::from_bps(4_000_000);
         policy.playout_delay = Some(crate::PlayoutDelay::from_ticks(0, 50).expect("500 ms"));
-        fixture.command(Command::SetSenderPolicy {
+        fixture.command(Command::SetSenderAssignment {
             sender: fixture.sender,
-            policy,
+            assignment: Some(policy),
         });
         for id in 1..=10 {
             source.drive_for(Duration::from_millis(100));
@@ -1713,13 +1749,19 @@ mod tests {
 
         let mut fixture = PeerFixture::connected();
         fixture.set_feedback_enabled(false);
-        fixture.command(Command::SetSenderDemand {
+        fixture.command(Command::SetSenderAssignment {
             sender: fixture.sender,
-            demand: crate::SenderDemand::new(
-                MediaPayloadBitrate::from_bps(0),
-                MediaPayloadBitrate::from_bps(0),
-            )
-            .expect("no live media demand"),
+            assignment: Some({
+                let (selected_bitrate, potential_bitrate) = (
+                    MediaPayloadBitrate::from_bps(0),
+                    MediaPayloadBitrate::from_bps(0),
+                );
+                pulsebeam_rtc::SenderAssignment {
+                    selected_bitrate,
+                    potential_bitrate,
+                    ..fixture.assignment(fixture.sender)
+                }
+            }),
         });
         let epoch = fixture
             .connection
@@ -1850,9 +1892,9 @@ mod tests {
                     Command::SendMedia {
                         sender: fixture.sender,
                         media: ForwardedMedia {
+                            source: pulsebeam_rtc::SourceIncarnation::from_value(1),
                             packet: packet.clone(),
                             frame: FrameMetadata {
-                                decode_target_mask: None,
                                 id: FrameId::from_value(id),
                                 boundary: FrameBoundary::Complete,
                                 random_access: true,

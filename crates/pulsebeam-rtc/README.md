@@ -136,14 +136,20 @@ semantic accessors decode metadata lazily. Local fanout uses shallow clones.
 Cross-shard or cross-node transit performs an explicit deep copy so shared
 packet reference counts do not become cross-core runtime state.
 
-Negotiated outbound media produce stable `SenderId` values. A sender's identity,
-policy, outbound SSRC, RTP sequence and timestamp spaces, extension state, RTCP
-state, and congestion state survive source and layer changes. The SFU can discard
-unprepared queued media and retained RTX payloads for a replaced assignment with
-`DiscardSenderMedia`, without rewinding committed transport continuity. Native
-audio senders mark their first committed packet and the first committed packet
-after discard as a talk-spurt start, preserving any source marker without changing
-the canonical source packet.
+Negotiated outbound media produce stable `SenderId` values, initially unbound.
+Before forwarding, the caller supplies one complete `SenderAssignment` with its
+`SourceIncarnation`, selected and potential payload rates, finite delivery
+constraints, wire playout intent, and receiver decode-target selection.
+`ForwardedMedia.source` must match that binding; an SSRC is not an incarnation.
+
+`SetSenderAssignment` replaces the complete value; `None` unbinds the sender.
+Replacing its source incarnation fences old queued media and retained RTX.
+`RecoverSenderMedia` accepts a complete same-incarnation assignment and the
+caller's decoder-ready declaration, clearing unprepared work while retaining
+useful committed repairs. Neither operation rewinds negotiated identity,
+committed RTP/RTCP progression, feedback history, or spent pacing service.
+Audio senders mark their first committed packet after recovery or replacement
+as a talk-spurt start, preserving any canonical source marker.
 
 Unsignaled authenticated ingress SSRCs or RIDs can produce stable encoding
 identities within a configured connection-wide bound. Overflow is dropped and
@@ -183,10 +189,12 @@ URI, never source wire ID.
 Protocol control remains deliverable under load and padding remains the
 lowest-value traffic.
 
-Every outbound sender has mutable SFU-provided semantic policy:
-
-* browser-managed default playout or an explicit playout-delay range;
-* desired media-payload bitrate.
+Every bound sender has caller-supplied selected and potential payload rates and
+finite `max_media_age`, `max_queue_residence`, and `repair_window` constraints.
+There are no implicit audio/video delivery profiles. Browser-managed playout,
+explicit `0/0`, and an explicit playout range are wire intents, not inputs to
+those delivery limits. Receiver decode-target selection belongs to the
+assignment, not the immutable source frame.
 
 The SFU chooses sources, layers, and sender targets. The connection reports its
 native aggregate RTP payload budget through `Event::MediaBudgetChanged` and
@@ -194,16 +202,10 @@ native aggregate RTP payload budget through `Event::MediaBudgetChanged` and
 reservation, or a redistribution of caller targets.
 
 Egress uses one connection-level SCReAM-v2-derived RTP congestion controller.
-The SCReAM core remains independently testable and self-contained. PulseBeam
-latency policy governs admission, pacing horizons, retransmission, and
-probing outside that core; it does not override SCReAM's native queue-delay target,
-congestion window, pacing equations, or estimated capacity.
-
-The latency governor uses sender policy and immutable `global_media_at` to
-derive private receiver-specific admission, pacing, shedding, retransmission,
-and probing limits. A larger playout range can trade latency headroom for
-quality recovery, but it never maps directly to an equivalently large network
-queue.
+Caller bounds govern admission, queue residence and repair usefulness outside
+the core. Measured native queue delay and RTT inform delivery feasibility; the
+bounds never override SCReAM's native queue-delay target, congestion window,
+pacing equations, or estimated capacity.
 
 Each sender's caller-selected payload rate bounds local admission. One aggregate
 media-payload pacer enforces the native budget at transmit commit, independently
@@ -219,7 +221,7 @@ DataChannel bytes never enter RTP packet-feedback history or SCReAM bytes in
 flight. RTP and SCTP service are coordinated by the connection's bounded
 top-level scheduler.
 
-The complete algorithm, fixed version-one profiles, hard bounds, alternatives
+The complete algorithm, native transport bounds, caller constraints, alternatives
 considered, and validation requirements are in
 [docs/congestion-control.md](docs/congestion-control.md).
 

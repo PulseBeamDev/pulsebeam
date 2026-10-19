@@ -12,13 +12,19 @@ use support::{PeerFixture, forwarded};
 
 fn video_fixture() -> PeerFixture {
     let mut fixture = PeerFixture::connected_video();
-    fixture.command(Command::SetSenderDemand {
+    fixture.command(Command::SetSenderAssignment {
         sender: fixture.sender,
-        demand: pulsebeam_rtc::SenderDemand::new(
-            pulsebeam_rtc::MediaPayloadBitrate::from_bps(1_000_000),
-            pulsebeam_rtc::MediaPayloadBitrate::from_bps(1_000_000),
-        )
-        .expect("selected video demand"),
+        assignment: Some({
+            let (selected_bitrate, potential_bitrate) = (
+                pulsebeam_rtc::MediaPayloadBitrate::from_bps(1_000_000),
+                pulsebeam_rtc::MediaPayloadBitrate::from_bps(1_000_000),
+            );
+            pulsebeam_rtc::SenderAssignment {
+                selected_bitrate,
+                potential_bitrate,
+                ..fixture.assignment(fixture.sender)
+            }
+        }),
     });
     fixture
 }
@@ -40,11 +46,12 @@ fn policy(fixture: &mut PeerFixture, delay: Option<PlayoutDelay>) {
         .senders
         .first()
         .expect("sender")
-        .policy;
+        .assignment
+        .expect("bound sender");
     policy.playout_delay = delay;
-    fixture.command(Command::SetSenderPolicy {
+    fixture.command(Command::SetSenderAssignment {
         sender: fixture.sender,
-        policy,
+        assignment: Some(policy),
     });
 }
 
@@ -89,14 +96,15 @@ fn browser_default_and_explicit_zero_have_distinct_wire_behavior() {
         .senders
         .first()
         .expect("sender")
-        .policy;
+        .assignment
+        .expect("bound sender");
     default.playout_delay = None;
     assert_eq!(
         fixture.connection.command(
             fixture.at(),
-            Command::SetSenderPolicy {
+            Command::SetSenderAssignment {
                 sender: fixture.sender,
-                policy: default,
+                assignment: Some(default)
             }
         ),
         Err(CommandError::PlayoutResetRequiresNewSender(fixture.sender))
@@ -133,7 +141,8 @@ fn explicit_delay_repeats_until_authenticated_receiver_report_and_resets_on_chan
             .senders
             .first()
             .expect("sender")
-            .policy
+            .assignment
+            .expect("bound sender")
             .playout_delay,
         Some(delay)
     );
@@ -183,10 +192,16 @@ fn explicit_delay_repeats_until_authenticated_receiver_report_and_resets_on_chan
 }
 
 #[test]
-fn unspecified_and_zero_delay_keep_bounded_asap_admission() {
+fn unspecified_and_zero_wire_delay_respect_explicit_media_age() {
     for delay in [None, Some(PlayoutDelay::ZERO)] {
         let mut fixture = PeerFixture::connected();
         policy(&mut fixture, delay);
+        let mut assignment = fixture.assignment(fixture.sender);
+        assignment.delivery.max_media_age = Duration::from_millis(100);
+        fixture.command(Command::SetSenderAssignment {
+            sender: fixture.sender,
+            assignment: Some(assignment),
+        });
         let packet = fixture.send_source(b"expired media");
         fixture.drive_for(Duration::from_millis(200));
         assert_eq!(

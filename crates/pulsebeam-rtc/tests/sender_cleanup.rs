@@ -8,11 +8,11 @@ mod support;
 
 use std::time::Duration;
 
-use pulsebeam_rtc::{Command, CommandError, FrameBoundary, MediaPayloadBitrate, SenderDemand};
+use pulsebeam_rtc::{Command, CommandError, FrameBoundary, MediaPayloadBitrate};
 use support::{NetworkPolicy, PeerFixture, RtpImpairment, forwarded};
 
 #[test]
-fn discard_prevents_old_source_output_without_rewinding_committed_continuity() {
+fn replacement_fences_old_source_without_rewinding_committed_continuity() {
     let mut fixture = PeerFixture::connected();
     let first = fixture.send_source(b"committed source");
     fixture.command(Command::SendMedia {
@@ -38,17 +38,29 @@ fn discard_prevents_old_source_output_without_rewinding_committed_continuity() {
             .queued_packets,
         1
     );
-    fixture.command(Command::DiscardSenderMedia {
+    let mut assignment = fixture.assignment(fixture.sender);
+    assignment.source = pulsebeam_rtc::SourceIncarnation::from_value(2);
+    fixture.command(Command::SetSenderAssignment {
         sender: fixture.sender,
+        assignment: Some(assignment),
     });
     let stats = fixture.connection.stats();
     let sender = stats.senders.first().expect("sender");
     assert_eq!(sender.queued_packets, 0);
     assert_eq!(sender.queued_payload_bytes, 0);
     assert_eq!(sender.transmitted_packets, 1);
+    assert_eq!(
+        fixture.try_command(Command::SendMedia {
+            sender: fixture.sender,
+            media: forwarded(replacement.clone(), 3)
+        }),
+        Err(CommandError::SourceIncarnationMismatch)
+    );
+    let mut media = forwarded(replacement, 3);
+    media.source = assignment.source;
     fixture.command(Command::SendMedia {
         sender: fixture.sender,
-        media: forwarded(replacement, 3),
+        media,
     });
     let (after, payload) = fixture.receive_egress();
     assert_eq!(payload, b"replacement source");
@@ -61,16 +73,22 @@ fn discard_prevents_old_source_output_without_rewinding_committed_continuity() {
 }
 
 #[test]
-fn recovery_repairs_committed_frame_but_discard_fences_old_payloads() {
+fn recovery_retains_same_incarnation_repairs_but_replacement_fences_them() {
     for recover in [true, false] {
         let mut fixture = PeerFixture::connected_video();
-        fixture.command(Command::SetSenderDemand {
+        fixture.command(Command::SetSenderAssignment {
             sender: fixture.sender,
-            demand: SenderDemand::new(
-                MediaPayloadBitrate::from_bps(1_000_000),
-                MediaPayloadBitrate::from_bps(1_000_000),
-            )
-            .expect("video demand"),
+            assignment: Some({
+                let (selected_bitrate, potential_bitrate) = (
+                    MediaPayloadBitrate::from_bps(1_000_000),
+                    MediaPayloadBitrate::from_bps(1_000_000),
+                );
+                pulsebeam_rtc::SenderAssignment {
+                    selected_bitrate,
+                    potential_bitrate,
+                    ..fixture.assignment(fixture.sender)
+                }
+            }),
         });
         let warmup = fixture.send_fragmented_video_source();
         admit_video_frame(&mut fixture, &warmup, 76);
@@ -131,10 +149,14 @@ fn recovery_repairs_committed_frame_but_discard_fences_old_payloads() {
         fixture.command(if recover {
             Command::RecoverSenderMedia {
                 sender: fixture.sender,
+                assignment: fixture.assignment(fixture.sender),
             }
         } else {
-            Command::DiscardSenderMedia {
+            let mut assignment = fixture.assignment(fixture.sender);
+            assignment.source = pulsebeam_rtc::SourceIncarnation::from_value(2);
+            Command::SetSenderAssignment {
                 sender: fixture.sender,
+                assignment: Some(assignment),
             }
         });
         fixture.configure_impairment(RtpImpairment::Random { per_mille: 0 });
@@ -168,7 +190,7 @@ fn admit_video_frame(fixture: &mut PeerFixture, sources: &[pulsebeam_rtc::MediaP
 }
 
 #[test]
-fn discard_rejects_unknown_sender_without_changing_existing_queue() {
+fn assignment_rejects_unknown_sender_without_changing_existing_queue() {
     let mut fixture = PeerFixture::connected();
     let other = PeerFixture::connected_with_senders(2);
     let missing = *other.senders.get(1).expect("second negotiated sender");
@@ -178,7 +200,7 @@ fn discard_rejects_unknown_sender_without_changing_existing_queue() {
         media: forwarded(source, 1),
     });
     assert!(
-        matches!(fixture.connection.command(fixture.at(), Command::DiscardSenderMedia { sender: missing }), Err(CommandError::UnknownSender(id)) if id == missing)
+        matches!(fixture.connection.command(fixture.at(), Command::SetSenderAssignment {sender: missing,assignment:None}), Err(CommandError::UnknownSender(id)) if id == missing)
     );
     assert_eq!(
         fixture

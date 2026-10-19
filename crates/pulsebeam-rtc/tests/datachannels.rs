@@ -13,7 +13,7 @@ use bytes::Bytes;
 use pulsebeam_rtc::{
     CloseReason, Command, DataChannelConfig, DataChannelPriority, DataMessage, DataReliability,
     ForwardedMedia, FrameBoundary, FrameDependencies, FrameId, FrameMetadata, IceTcpFlowId,
-    MediaPayloadBitrate, Output, PlayoutDelay, SenderPolicy,
+    MediaPayloadBitrate, Output, PlayoutDelay,
 };
 use support::{FixtureCoexistenceEvent, FixtureDataEvent, PeerFixture};
 
@@ -236,21 +236,21 @@ fn fragmented_data_and_rtp_share_service_without_cross_accounting_starvation() {
     let channel = channel.expect("channel");
     fixture.configure_bottleneck(500_000);
     let packet = fixture.send_source(b"coexistence");
-    fixture.command(Command::SetSenderPolicy {
+    fixture.command(Command::SetSenderAssignment {
         sender: fixture.sender,
-        policy: SenderPolicy {
+        assignment: Some(pulsebeam_rtc::SenderAssignment {
             playout_delay: Some(PlayoutDelay::from_ticks(0, 400).expect("playout policy")),
-            desired_bitrate: MediaPayloadBitrate::from_bps(1_000_000),
-        },
+            ..support::sender_assignment(MediaPayloadBitrate::from_bps(1_000_000))
+        }),
     });
     const COUNT: u64 = 16;
     for index in 0..COUNT {
         fixture.command(Command::SendMedia {
             sender: fixture.sender,
             media: ForwardedMedia {
+                source: pulsebeam_rtc::SourceIncarnation::from_value(1),
                 packet: packet.clone(),
                 frame: FrameMetadata {
-                    decode_target_mask: None,
                     id: FrameId::from_value(index + 1),
                     boundary: FrameBoundary::Complete,
                     random_access: true,

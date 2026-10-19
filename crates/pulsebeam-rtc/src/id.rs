@@ -59,6 +59,7 @@ connection_id!(EncodingId, u32);
 caller_id!(DataChannelId, u16);
 caller_id!(IceTcpFlowId, u64);
 caller_id!(FrameId, u64);
+caller_id!(SourceIncarnation, u64);
 
 impl SenderId {
     pub(crate) const fn value(self) -> u16 {

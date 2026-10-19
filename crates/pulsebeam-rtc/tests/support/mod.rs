@@ -20,10 +20,11 @@ use std::{
 use bytes::Bytes;
 use pulsebeam_rtc::{
     Command, CommandError, Connection, ConnectionConfig, ConnectionEntropy, ConnectionLimits,
-    DataChannelEvent, DataChannelId, DataMessage, Event as ConnectionEvent, ForwardedMedia,
-    FrameBoundary, FrameDependencies, FrameId, FrameMetadata, GlobalMediaTime, IceTcpFlowId,
-    LocalCandidate, MediaPacket, MediaPayloadBitrate, NetworkInput, Output as ConnectionOutput,
-    SdpOffer, SenderId, TimePoint, TransmitTarget,
+    DataChannelEvent, DataChannelId, DataMessage, DeliveryConstraints, Event as ConnectionEvent,
+    ForwardedMedia, FrameBoundary, FrameDependencies, FrameId, FrameMetadata, GlobalMediaTime,
+    IceTcpFlowId, LocalCandidate, MediaPacket, MediaPayloadBitrate, NetworkInput,
+    Output as ConnectionOutput, SdpOffer, SenderAssignment, SenderId, SourceIncarnation, TimePoint,
+    TransmitTarget,
 };
 use pulsebeam_rtc_simulation::*;
 
@@ -757,12 +758,11 @@ impl<M> PeerFixture<M> {
             }],
             ..ConnectionConfig::default()
         };
-        config.default_audio_policy.desired_bitrate = MediaPayloadBitrate::from_bps(1_000_000);
         if let Some(limits) = limits {
             config.limits = limits;
         }
         let now = world.monotonic_now();
-        let accepted = Connection::accept(
+        let mut accepted = Connection::accept(
             config,
             SdpOffer::new(offer.sdp),
             TimePoint {
@@ -782,6 +782,30 @@ impl<M> PeerFixture<M> {
             .iter()
             .map(|s| s.id)
             .collect::<Vec<_>>();
+        for &sender in &senders {
+            accepted
+                .connection
+                .command(
+                    TimePoint {
+                        monotonic: now,
+                        global: GlobalMediaTime::from_micros(
+                            1_000_000
+                                + u64::try_from(now.duration_since(start).as_micros())
+                                    .expect("bounded epoch"),
+                        ),
+                    },
+                    Command::SetSenderAssignment {
+                        sender,
+                        assignment: Some({
+                            let mut assignment =
+                                sender_assignment(MediaPayloadBitrate::from_bps(1_000_000));
+                            assignment.delivery.max_queue_residence = Duration::from_millis(200);
+                            assignment
+                        }),
+                    },
+                )
+                .expect("explicit fixture sender assignment");
+        }
         let media_state = media_state(&accepted.session.senders);
         if sender_count == 0 {
             assert!(accepted.session.inbound_media.is_empty());
@@ -1256,6 +1280,17 @@ impl<M> PeerFixture<M> {
     pub fn set_feedback_enabled(&mut self, enabled: bool) {
         self.feedback_enabled = enabled;
     }
+    pub fn assignment(&self, sender: SenderId) -> SenderAssignment {
+        self.connection
+            .stats()
+            .senders
+            .iter()
+            .find(|stats| stats.sender == sender)
+            .expect("fixture sender")
+            .assignment
+            .expect("explicit fixture assignment")
+    }
+
     pub fn command(&mut self, command: Command) {
         if let Err(error) = self.try_command(command) {
             panic!(
@@ -1984,11 +2019,26 @@ fn assert_probe_windows_with_allowance(
     );
 }
 
+pub fn sender_assignment(rate: MediaPayloadBitrate) -> SenderAssignment {
+    SenderAssignment {
+        source: SourceIncarnation::from_value(1),
+        selected_bitrate: rate,
+        potential_bitrate: rate,
+        delivery: DeliveryConstraints {
+            max_media_age: Duration::from_secs(1),
+            max_queue_residence: Duration::from_millis(80),
+            repair_window: Duration::from_secs(1),
+        },
+        playout_delay: None,
+        decode_target_mask: None,
+    }
+}
+
 pub fn forwarded(packet: MediaPacket, id: u64) -> ForwardedMedia {
     ForwardedMedia {
+        source: SourceIncarnation::from_value(1),
         packet,
         frame: FrameMetadata {
-            decode_target_mask: None,
             id: FrameId::from_value(id),
             boundary: FrameBoundary::Complete,
             random_access: true,

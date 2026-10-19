@@ -11,8 +11,8 @@ use thiserror::Error;
 use crate::IceTcpFlowId;
 use crate::{
     DataChannelConfig, DataChannelId, DataChannelPriority, DataMessage, DataReliability,
-    EncodingId, ForwardedMedia, MediaKind, MediaPacket, MediaPayloadBitrate, PolicyError,
-    SenderDemand, SenderId, SenderPolicy,
+    EncodingId, ForwardedMedia, MediaKind, MediaPacket, MediaPayloadBitrate, SenderAssignment,
+    SenderId,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -83,13 +83,9 @@ pub enum Command {
     RetireIceTcpFlow {
         flow: IceTcpFlowId,
     },
-    SetSenderPolicy {
+    SetSenderAssignment {
         sender: SenderId,
-        policy: SenderPolicy,
-    },
-    SetSenderDemand {
-        sender: SenderId,
-        demand: SenderDemand,
+        assignment: Option<SenderAssignment>,
     },
     SendMedia {
         sender: SenderId,
@@ -98,9 +94,7 @@ pub enum Command {
     /// Recover within the same publication while retaining committed repair history.
     RecoverSenderMedia {
         sender: SenderId,
-    },
-    DiscardSenderMedia {
-        sender: SenderId,
+        assignment: SenderAssignment,
     },
     RequestKeyframe {
         encoding: EncodingId,
@@ -256,8 +250,12 @@ pub enum CommandError {
     UnknownEncoding(EncodingId),
     #[error("unknown data channel {0:?}")]
     UnknownDataChannel(DataChannelId),
-    #[error("invalid sender policy: {0:?}")]
-    InvalidPolicy(PolicyError),
+    #[error("sender {0:?} has no source assignment")]
+    SenderUnbound(SenderId),
+    #[error("invalid sender assignment")]
+    InvalidSenderAssignment,
+    #[error("media belongs to a different source incarnation")]
+    SourceIncarnationMismatch,
     #[error("invalid or conflicting ICE-TCP flow binding")]
     InvalidIceTcpFlow,
     #[error("invalid frame metadata")]
@@ -329,8 +327,7 @@ pub enum PlayoutDelayStatus {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SenderStats {
     pub sender: SenderId,
-    pub policy: SenderPolicy,
-    pub demand: SenderDemand,
+    pub assignment: Option<SenderAssignment>,
     pub playout_delay: PlayoutDelayStatus,
     pub queued_packets: usize,
     pub queued_payload_bytes: usize,

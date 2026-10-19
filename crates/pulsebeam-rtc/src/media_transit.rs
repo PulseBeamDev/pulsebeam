@@ -445,7 +445,6 @@ mod tests {
     #[test]
     fn forwarded_transit_deep_copies_known_dependencies_and_keeps_unknown_unknown() {
         let frame = FrameMetadata {
-            decode_target_mask: Some(3),
             id: FrameId::from_value(9),
             boundary: FrameBoundary::Start,
             random_access: false,
@@ -453,10 +452,12 @@ mod tests {
             dependencies: FrameDependencies::Known(Arc::from([FrameId::from_value(8)])),
         };
         let original = ForwardedMedia {
+            source: pulsebeam_rtc::SourceIncarnation::from_value(1),
             packet: packet(42, ClockQuality::Discontinuous),
             frame,
         };
         let transit = original.to_transit();
+        assert_eq!(transit.source, original.source);
         assert_eq!(transit.frame, original.frame);
         assert_eq!(
             transit.packet.global_media_at(),

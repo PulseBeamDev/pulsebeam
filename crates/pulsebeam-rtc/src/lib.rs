@@ -32,7 +32,7 @@ mod test_source;
 mod test_support;
 
 pub use connection::{AcceptedConnection, Connection};
-pub use id::{DataChannelId, EncodingId, FrameId, IceTcpFlowId, SenderId};
+pub use id::{DataChannelId, EncodingId, FrameId, IceTcpFlowId, SenderId, SourceIncarnation};
 pub use io::{
     AcceptError, AuthenticatedFlow, CloseReason, Command, CommandError, ConnectionState,
     ConnectionStats, ConnectionWarning, DataChannelEvent, DataChannelStats, EcnCodepoint,
@@ -45,10 +45,10 @@ pub use media_packet::{
 pub use media_transit::{MaterializedMediaPacket, MediaTransitError};
 pub use session::{
     CodecInfo, CodecProfile, ConnectionConfig, ConnectionLimits, DataChannelConfig,
-    DataChannelConfigError, DataChannelPriority, DataMessage, DataReliability, InboundMediaInfo,
-    LocalCandidate, LocalIceCredentials, MediaKind, MediaPayloadBitrate, PacketFeedbackKind,
-    PlayoutDelay, PolicyError, SdpAnswer, SdpOffer, SenderDemand, SenderInfo, SenderPolicy,
-    SessionInfo, UnknownExtensionPolicy,
+    DataChannelConfigError, DataChannelPriority, DataMessage, DataReliability, DeliveryConstraints,
+    InboundMediaInfo, LocalCandidate, LocalIceCredentials, MediaKind, MediaPayloadBitrate,
+    PacketFeedbackKind, PlayoutDelay, PolicyError, SdpAnswer, SdpOffer, SenderAssignment,
+    SenderInfo, SessionInfo, UnknownExtensionPolicy,
 };
 pub use time::{ConnectionEntropy, GlobalMediaTime, TimePoint};
 

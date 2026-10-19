@@ -327,13 +327,9 @@ pub enum Command {
     RetireIceTcpFlow {
         flow: IceTcpFlowId,
     },
-    SetSenderPolicy {
+    SetSenderAssignment {
         sender: SenderId,
-        policy: SenderPolicy,
-    },
-    SetSenderDemand {
-        sender: SenderId,
-        demand: SenderDemand,
+        assignment: Option<SenderAssignment>,
     },
     SendMedia {
         sender: SenderId,
@@ -341,9 +337,7 @@ pub enum Command {
     },
     RecoverSenderMedia {
         sender: SenderId,
-    },
-    DiscardSenderMedia {
-        sender: SenderId,
+        assignment: SenderAssignment,
     },
     RequestKeyframe {
         encoding: EncodingId,
@@ -410,8 +404,6 @@ pub struct ConnectionConfig {
     pub local_candidates: Vec<LocalCandidate>,
     pub local_ice_credentials: Option<LocalIceCredentials>,
     pub limits: ConnectionLimits,
-    pub default_audio_policy: SenderPolicy,
-    pub default_video_policy: SenderPolicy,
     pub unknown_extension_policy: UnknownExtensionPolicy,
 }
 
@@ -715,6 +707,7 @@ impl MaterializedMediaPacket {
 }
 
 pub struct ForwardedMedia {
+    pub source: SourceIncarnation,
     pub packet: MediaPacket,
     pub frame: FrameMetadata,
 }
@@ -779,7 +772,6 @@ pub struct FrameMetadata {
     pub random_access: bool,
     pub discardable: bool,
     pub dependencies: FrameDependencies,
-    pub decode_target_mask: Option<u32>,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -802,21 +794,23 @@ is independently decodable in the caller's model. `Unknown` means the connection
 may still admit or discard the complete current frame but MUST NOT infer which
 later frames become undecodable.
 
-`decode_target_mask` is the SFU's semantic output selection, not a mutation of
-source packet bytes or source descriptor context. `None` preserves all source
-active targets. `Some(mask)` selects a nonzero subset of the source definition's
-decode-target indices; zero and out-of-definition bits are invalid frame metadata.
-When outbound DD is negotiated, selection requires a valid source DD and the
-emitted active-target mask is the intersection of selection and current source
-active targets. A source may deactivate every selected target, yielding an empty
-emitted mask without fabricating activity. Without negotiated outbound DD, a
-nonzero mask remains caller semantic metadata and generates no wire extension.
-`FrameMetadata::to_transit` preserves selection exactly.
+`SenderAssignment.decode_target_mask` is the receiver's output selection, not
+source frame metadata. `None` preserves source active targets; `Some(mask)`
+selects a nonzero subset of the source definition's decode-target indices.
+Zero is an invalid assignment. Out-of-definition bits or a missing required
+source descriptor reject media as invalid frame metadata. When outbound DD is
+negotiated, the emitted mask intersects receiver selection and source activity,
+including an empty intersection without fabricated activity. Without outbound
+DD, selection generates no wire extension. Changing selection applies through a
+complete assignment and clears unprepared work rather than changing one fragment.
+
+`ForwardedMedia` carries the caller's `SourceIncarnation` separately from
+`FrameMetadata`; transit preserves both that token and immutable source facts.
+Receiver selection is not serialized into the source frame.
 
 For every packet in one frame:
 
-- `id`, `random_access`, `discardable`, `dependencies`, and `decode_target_mask`
-  MUST be identical;
+- `id`, `random_access`, `discardable`, and `dependencies` MUST be identical;
 - `global_media_at`, canonical source SSRC and RTP timestamp MUST be identical;
 - a one-packet frame uses `Complete`;
 - a multi-packet frame uses one `Start`, zero or more `Middle`, and one `End`;
@@ -1041,170 +1035,118 @@ receiver-side A/V synchronization remains consistent. The runtime's NTP-compatib
 `GlobalMediaTime` is converted to the RTCP 64-bit NTP representation internally;
 no NTP type is exposed.
 
-### Sender-scoped recovery and discard
+### Sender-scoped recovery and replacement
 
-For interrupted-frame recovery or a source/layer change within the same
-publication, the SFU may issue `RecoverSenderMedia`. It clears that sender's
-unprepared queued media and open/started frame state and invalidates dependency
-continuity, but retains already-committed RTP originals and pending repairs.
-Repair eligibility, pacing, send-window, byte and age bounds remain unchanged.
-Keeping repair history permits late NACKs to complete frames committed before
-recovery. Recovery never refunds spent payload admission or transport service.
+A negotiated sender starts unbound. `SetSenderAssignment` installs one complete
+value or removes it with `None`. Unbound media returns `SenderUnbound`.
+`ForwardedMedia.source` must match the bound `SourceIncarnation`, otherwise
+admission returns `SourceIncarnationMismatch`. This token is caller-supplied and
+independent of RTP SSRC, including when a replacement reuses the same SSRC.
 
-Before pausing, removing or replacing a publication/assignment, the SFU MUST use
-`DiscardSenderMedia`, not recovery, to fence old repair payloads from a replacement
-occupant. Both operations preserve the identity and committed state described
-below and leave other senders unaffected.
+Replacing the incarnation or unbinding fences unprepared media, open/started
+frames, queued repairs, and retained RTX payloads. A positive-to-zero selected
+rate also clears old media and repairs. Receiver selection changes clear
+unprepared work. Invalid complete values are rejected before changing the
+previous assignment or its queued work.
 
-`DiscardSenderMedia` removes that sender's unprepared queued media,
-open/started frame state, queued repairs and retained RTX payloads in bounded
-connection-local work. Other senders are unaffected. Dependency continuity is
-invalidated; subsequent random-access or known-independent media must establish
-a fresh chain. Unknown dependencies must not be invented as empty dependencies
-to bypass that requirement.
+`RecoverSenderMedia` takes a complete assignment for the currently bound
+incarnation and the caller's decoder-ready declaration. It clears unprepared
+work, restores local dependency readiness, and retains committed originals and
+pending repairs that remain useful under the supplied bounds. Framing and
+receiver descriptor validation still apply. A different incarnation is rejected
+without converting recovery into replacement.
 
-Discard preserves negotiated identity, primary/RTX SSRCs, sequence spaces,
-global-to-RTP mapping, committed media-time fence, counters, playout confirmation
-epochs, and connection-wide TWCC/sent-history/controller/pacer state. It may
-release the admitted-time fence of discarded work only back to the latest
-committed media time. It never makes older cached media eligible to rewind the
-receiver timeline.
+These operations preserve negotiated identity, primary/RTX SSRCs, sequence
+spaces, global-to-RTP mapping, the committed media-time fence, counters, and
+connection-wide feedback/controller/pacer state. Discarded admission debt and
+spent transport service are not refunded. Other senders are unaffected.
 
-Each audio sender initially arms a talk-spurt marker. Discard rearms it for a
-replacement or resumed source. Preparing audio RTP preserves the source marker
-and adds the pending marker; only committing an original transmit consumes the
-pending marker. Queue admission, unprepared queue drops and rejected discard do
-not consume it. Repairs retain the original wire marker. Video markers continue
-to follow source frame boundaries. The canonical source packet is never changed.
+Audio talk-spurt marking is armed initially and rearmed when queued source work
+is cleared. Only an original transmit commit consumes it. Source bytes and
+markers remain immutable; RTX preserves the original wire marker.
 
-Protection consumes the SRTP index. Discard returns `InvalidState` without
-mutation if any egress preparation is pending; normal serialized public
+Protection consumes the SRTP index. Assignment changes return `InvalidState`
+without mutation while egress preparation is pending; serialized public
 `poll` prepares and commits before returning. Already emitted transmits remain
-irrevocable and must have received the caller's immediate submission attempt
-before any discard command. This is not network rollback and does not cancel
-committed traffic or its feedback accounting.
+irrevocable and require the caller's immediate submission attempt before any
+later command.
 
-## Sender policy
+## Explicit sender assignment
 
-Every negotiated outbound sender has one mutable semantic policy. Configuration
-provides the initial policy, so no sender starts undefined.
+The caller supplies the entire value atomically. There is no default assignment,
+separate rate-update command, or implicit potential-rate inheritance.
 
 ```rust
-pub struct SenderPolicy {
+pub struct SenderAssignment {
+    pub source: SourceIncarnation,
+    pub selected_bitrate: MediaPayloadBitrate,
+    pub potential_bitrate: MediaPayloadBitrate,
+    pub delivery: DeliveryConstraints,
     pub playout_delay: Option<PlayoutDelay>,
-    pub desired_bitrate: MediaPayloadBitrate,
+    pub decode_target_mask: Option<u32>,
 }
 
-#[repr(transparent)]
-pub struct MediaPayloadBitrate(u64); // bits per second of RTP media payload
-
-pub struct PlayoutDelay {
-    min_millis: u16,
-    max_millis: u16,
-}
-
-impl MediaPayloadBitrate {
-    pub const fn from_bps(value: u64) -> Self;
-    pub const fn as_bps(self) -> u64;
-}
-
-```
-
-### Playout delay
-
-Explicit bounds are in `0..=40_950 ms`, with minimum no greater than maximum.
-Construction rejects out-of-range values and does not clamp. Local latency policy
-retains the millisecond bounds; RTP extension encoding rounds each bound to the
-nearest 10 ms. The exact constructor additionally rejects non-tick-aligned inputs.
-The server normalizes client inputs to 0–2000 ms and raises maximum to minimum
-before constructing explicit policy.
-
-```rust
-impl PlayoutDelay {
-    pub fn from_ticks(min: u16, max: u16) -> Result<Self, PolicyError>;
-    pub fn from_millis(min: u64, max: u64) -> Result<Self, PolicyError>;
-    pub fn from_millis_exact(min: u64, max: u64) -> Result<Self, PolicyError>;
-    pub fn min(self) -> Duration;
-    pub fn max(self) -> Duration;
+pub struct DeliveryConstraints {
+    pub max_media_age: Duration,
+    pub max_queue_residence: Duration,
+    pub repair_window: Duration,
 }
 ```
 
-`None` is browser-managed default playout, not an explicit extension value.
-Configuration defaults to `None`. `Some(PlayoutDelay::ZERO)` explicitly requests
-rendering as soon as practical, not a literal zero network or render deadline.
-Both modes retain bounded ASAP fresh-body admission. Unspecified playout uses
-bounded decoder-repair history distinct from explicit `0/0`, as defined in
-[congestion control](congestion-control.md). It never grants unlimited queueing or
-artificial transport capacity.
+### Delivery bounds
 
-When the playout-delay RTP extension is negotiated for outbound use and policy
-is explicit, the connection writes the current value for that sender. After a change it repeats the value until an RTCP
-receiver report proves, using wrap-aware outbound RTP sequence progression, that
-a packet carrying the new value was received. TWCC acknowledgment alone is not
-used as proof of extension delivery. When the extension is absent, the local
-policy still governs admission and statistics mark it `NotSignaled`. Unspecified
-policy never writes a delay extension, and statistics mark it `Unspecified`.
-Explicit delivery status is `Pending` until an authenticated SR/RR report block
-covers a committed primary-SSRC packet carrying the current value, then
-`Confirmed`. RTX-SSRC reports and reports beyond committed progression do not
-confirm it. Changing an explicit value resets confirmation without resetting RTP
-or congestion state. Returning a sender that has committed any explicit delay
-extension to unspecified mode returns `PlayoutResetRequiresNewSender`; the SFU
-must use a fresh receiver or reconnect because omission cannot reset browser
-state. An explicit policy that has never been signaled may return to defaults.
+Every duration must fit the microsecond media-time domain and be representable
+as a local timer deadline. An unrepresentable complete value is rejected before
+mutation; RTC does not impose an audio/video policy maximum on valid values.
 
-The immutable packet timestamp and mutable receiver policy have separate roles:
+`max_media_age` bounds usefulness relative to immutable
+`MediaPacket.global_media_at`. Estimated receiver arrival includes pending
+pacing service and the native queue-delay estimate plus half the measured RTT.
+No media-kind processing reserve or clock-quality freshness profile is inferred.
 
-```text
-MediaPacket.global_media_at       cluster-global media position
-SenderPolicy.playout_delay        receiver-specific render intent
-private receiver deadline         derived by the egress connection
-```
+`max_queue_residence` bounds local queue residence and pending pacing service,
+including the service reserved by probes while selected media is active.
+`repair_window` bounds retained-original lifetime from its transmit commit.
+RTX must satisfy both its repair window and the media-age constraint. Byte
+bounds and native transport safety limits remain independently authoritative.
 
-The connection derives private receiver-specific handoff, recovery, and stale
-media horizons from `global_media_at`, the playout range, receiver/network
-estimates, and fixed uncertainty reserves. No receiver deadline is serialized
-back into `MediaPacket`.
+Tightening bounds re-evaluates queued work and repairs in the same command.
+Expiry work is bounded and continues through immediate wakeups when needed.
+Relaxing them cannot resurrect discarded media. Neither operation mutates source
+timestamps. Local video expiry emits a coalesced `KeyframeRequested` with
+`LocalRecovery`; authenticated peer PLI/FIR uses `Peer`. Pending local recovery
+is observed before `Idle`, and audio expiry does not request a keyframe.
 
-Tightening a policy immediately recomputes queued not-yet-started frames from
-their immutable `global_media_at`, removes newly obsolete RTX, and tightens shared
-path latency constraints. Relaxing is damped and never resurrects dropped media.
-When local video expiry invalidates dependency continuity, the connection emits
-one coalesced `KeyframeRequested` with `LocalRecovery` per affected sender. Pending
-recovery is exposed before returning `Idle`; callers abandon deferred dependent
-writes and select fresh independent media. Authenticated peer PLI/FIR feedback
-emits `KeyframeRequested` with `Peer`, which requests future independent media
-without abandoning useful current delivery. Local recovery takes precedence when
-both reasons are pending. Audio expiry does not request a keyframe.
+### Wire playout intent
 
-### Desired bitrate
+`None` omits the extension and leaves playout to the browser. Explicit `0/0`
+and other ranges remain distinct wire values, not local delivery profiles.
+`PlayoutDelay` accepts millisecond bounds through `from_millis` or exact
+10-ms ticks through `from_ticks`; unrepresentable or inverted bounds are rejected.
 
-`desired_bitrate` is the RTP media-payload rate the SFU could use if given the
-capacity, after choosing a source or layer. Zero rejects new media admission.
-It is not a network estimate and does not include RTP, SRTP, UDP/TCP, RTCP, or
-DataChannel overhead.
+A negotiated outbound playout extension repeats its current explicit value
+until an authenticated primary-SSRC SR/RR report block covers a committed packet
+that carried it. TWCC alone, RTX-SSRC reports, and reports beyond committed
+progression do not confirm it. Statistics distinguish `Unspecified`,
+`NotSignaled`, `Pending`, and `Confirmed`. Changing the explicit value resets
+confirmation without resetting RTP or congestion state. Once any explicit value
+has been signaled, an assignment omitting it returns
+`PlayoutResetRequiresNewSender`; omission cannot reset browser state.
 
-`Command::SetSenderDemand` atomically declares selected and potential payload
-rates using `SenderDemand::new(selected, potential)`; potential below selected
-is rejected. Selected updates `SenderPolicy.desired_bitrate` and remains the
-caller-selected payload ceiling for local admission. Potential is the bounded media rate the SFU
-could actually use from available source/layer choices, not a bandwidth estimate,
-reservation, or permission to transmit that rate. It supplies the aggregate
-application maximum to the unchanged SCReAM adapter and bounded probe interest.
-A paused, unfunded stream can declare zero selected and positive potential.
-Hiding or withdrawing interest declares both zero.
+### Selected and potential payload rates
 
-Until an explicit demand declaration, potential follows selected for existing
-policy callers. Later `SetSenderPolicy` changes retain explicit potential,
-raised to at least the newly selected rate. Statistics report the effective
-`SenderDemand`. Source/layer selection remains SFU-owned; potential does not
-grant body-media admission. Ordinary zero-to-positive application-demand updates preserve the
-native controller state on an unchanged path; they do not reset congestion
-history or manufacture available capacity.
+Both rates count RTP media-payload bits per second, excluding transport, RTCP,
+and DataChannel overhead. Potential must be at least selected.
+`selected_bitrate` is the caller's local admission ceiling. Zero rejects new
+media. `potential_bitrate` reports available source/layer interest to the native
+controller and bounded probing; it is not a reservation or a bandwidth estimate.
 
-The connection measures admitted and transmitted rates itself. Media budget events
-are expressed in RTP media-payload bits per second, so the SFU can compare the
-aggregate budget to its selected and potential layer payload rates.
+Zero selected with positive potential permits bounded discovery without body
+admission. Both zero withdraw RTP interest. Every update explicitly supplies
+both values, and statistics expose the complete optional assignment. Same-path
+application updates preserve native congestion history and never manufacture
+capacity. Aggregate budget events remain in payload bits per second for the
+caller to compare with its own source and layer choices.
 
 ## RTP extension policy
 
@@ -1254,8 +1196,8 @@ probe clusters, and histories remain private.
 The fixed design is:
 
 - one connection-level SCReAM-v2-derived RTP controller;
-- one private PulseBeam latency governor for admission, pacer horizons,
-  retransmission, and probing outside the SCReAM core;
+- explicit caller delivery bounds for admission, queue residence and repair,
+  enforced alongside private native transport and probe safety limits;
 - caller-selected sender admission ceilings and equal-byte-quantum sender service;
 - one aggregate media-payload pacer at the native budget, charged only on commit;
 - one transport-byte pacer and deadline-aware scheduler;

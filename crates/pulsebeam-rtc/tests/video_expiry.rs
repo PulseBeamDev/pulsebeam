@@ -21,11 +21,14 @@ fn video_frame_expiry_requests_recovery_before_idle_and_preserves_continuity() {
     use pulsebeam_rtc::{Event, Output};
 
     let mut fixture = PeerFixture::connected_video();
-    let mut policy = fixture.connection.stats().senders[0].policy;
-    policy.desired_bitrate = MediaPayloadBitrate::from_bps(1_000_000);
-    fixture.command(Command::SetSenderPolicy {
+    let mut policy = fixture.connection.stats().senders[0]
+        .assignment
+        .expect("bound sender");
+    policy.selected_bitrate = MediaPayloadBitrate::from_bps(1_000_000);
+    policy.potential_bitrate = MediaPayloadBitrate::from_bps(1_000_000);
+    fixture.command(Command::SetSenderAssignment {
         sender: fixture.sender,
-        policy,
+        assignment: Some(policy),
     });
     let seed = fixture.send_source(b"\x65seed");
     fixture
@@ -124,9 +127,9 @@ fn video_frame_expiry_requests_recovery_before_idle_and_preserves_continuity() {
 
 fn forwarded(packet: pulsebeam_rtc::MediaPacket, id: u64) -> ForwardedMedia {
     ForwardedMedia {
+        source: pulsebeam_rtc::SourceIncarnation::from_value(1),
         packet,
         frame: FrameMetadata {
-            decode_target_mask: None,
             id: FrameId::from_value(id),
             boundary: FrameBoundary::Complete,
             random_access: true,

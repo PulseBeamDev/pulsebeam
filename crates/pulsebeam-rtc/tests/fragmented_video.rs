@@ -29,13 +29,19 @@ fn source_sequence(source: &pulsebeam_rtc::MediaPacket) -> u16 {
 #[test]
 fn public_fragmented_frame_uses_one_timestamp_and_continuous_sequences() {
     let mut fixture = PeerFixture::connected_video();
-    fixture.command(Command::SetSenderDemand {
+    fixture.command(Command::SetSenderAssignment {
         sender: fixture.sender,
-        demand: pulsebeam_rtc::SenderDemand::new(
-            MediaPayloadBitrate::from_bps(1_000_000),
-            MediaPayloadBitrate::from_bps(1_000_000),
-        )
-        .expect("video demand"),
+        assignment: Some({
+            let (selected_bitrate, potential_bitrate) = (
+                MediaPayloadBitrate::from_bps(1_000_000),
+                MediaPayloadBitrate::from_bps(1_000_000),
+            );
+            pulsebeam_rtc::SenderAssignment {
+                selected_bitrate,
+                potential_bitrate,
+                ..fixture.assignment(fixture.sender)
+            }
+        }),
     });
     let sources = fixture.send_fragmented_video_source();
     assert!(sources.len() >= 3);
@@ -76,13 +82,19 @@ fn public_fragmented_frame_uses_one_timestamp_and_continuous_sequences() {
 #[test]
 fn source_middle_loss_interrupts_native_frame_without_committing_a_false_end() {
     let mut fixture = PeerFixture::connected_video();
-    fixture.command(Command::SetSenderDemand {
+    fixture.command(Command::SetSenderAssignment {
         sender: fixture.sender,
-        demand: pulsebeam_rtc::SenderDemand::new(
-            MediaPayloadBitrate::from_bps(1_000_000),
-            MediaPayloadBitrate::from_bps(1_000_000),
-        )
-        .expect("video demand"),
+        assignment: Some({
+            let (selected_bitrate, potential_bitrate) = (
+                MediaPayloadBitrate::from_bps(1_000_000),
+                MediaPayloadBitrate::from_bps(1_000_000),
+            );
+            pulsebeam_rtc::SenderAssignment {
+                selected_bitrate,
+                potential_bitrate,
+                ..fixture.assignment(fixture.sender)
+            }
+        }),
     });
     let sources = fixture.send_fragmented_video_source();
     assert!(sources.len() >= 3);
@@ -118,8 +130,9 @@ fn source_middle_loss_interrupts_native_frame_without_committing_a_false_end() {
     assert_eq!(rejected.senders[0].queued_packets, 0);
     assert_eq!(end.bytes(), &original);
     assert_eq!(end.global_media_at(), global);
-    fixture.command(Command::DiscardSenderMedia {
+    fixture.command(Command::RecoverSenderMedia {
         sender: fixture.sender,
+        assignment: fixture.assignment(fixture.sender),
     });
     let recovery = fixture.send_source(&[0x65, 0x55]);
     fixture
@@ -140,15 +153,22 @@ fn source_middle_loss_interrupts_native_frame_without_committing_a_false_end() {
 }
 
 #[test]
-fn selected_mask_cannot_change_mid_frame_even_without_wire_dd() {
+fn frame_metadata_must_match_all_fragments_without_wire_dd() {
     let mut fixture = PeerFixture::connected_video();
-    fixture.command(Command::SetSenderDemand {
+    fixture.command(Command::SetSenderAssignment {
         sender: fixture.sender,
-        demand: pulsebeam_rtc::SenderDemand::new(
-            MediaPayloadBitrate::from_bps(1_000_000),
-            MediaPayloadBitrate::from_bps(1_000_000),
-        )
-        .expect("video demand"),
+        assignment: Some({
+            let (selected_bitrate, potential_bitrate) = (
+                MediaPayloadBitrate::from_bps(1_000_000),
+                MediaPayloadBitrate::from_bps(1_000_000),
+            );
+            pulsebeam_rtc::SenderAssignment {
+                selected_bitrate,
+                potential_bitrate,
+                decode_target_mask: Some(1),
+                ..fixture.assignment(fixture.sender)
+            }
+        }),
     });
     let sources = fixture.send_fragmented_video_source();
     for (index, source) in sources.iter().enumerate() {
@@ -160,12 +180,11 @@ fn selected_mask_cannot_change_mid_frame_even_without_wire_dd() {
         } else {
             FrameBoundary::Middle
         };
-        media.frame.decode_target_mask = Some(1);
         if index == 1 {
             let before = fixture.connection.stats();
             let original = source.bytes().clone();
             let mut changed = media.clone();
-            changed.frame.decode_target_mask = Some(2);
+            changed.frame.random_access = false;
             assert_eq!(
                 fixture.try_command(Command::SendMedia {
                     sender: fixture.sender,
@@ -207,9 +226,9 @@ fn admit_fragment(fixture: &mut PeerFixture, media: ForwardedMedia) {
 
 fn forwarded(packet: pulsebeam_rtc::MediaPacket, id: u64) -> ForwardedMedia {
     ForwardedMedia {
+        source: pulsebeam_rtc::SourceIncarnation::from_value(1),
         packet,
         frame: FrameMetadata {
-            decode_target_mask: None,
             id: FrameId::from_value(id),
             boundary: FrameBoundary::Complete,
             random_access: true,

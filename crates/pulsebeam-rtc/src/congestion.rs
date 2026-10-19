@@ -2,8 +2,7 @@
     dead_code,
     clippy::arithmetic_side_effects,
     clippy::cast_possible_truncation,
-    clippy::cast_precision_loss,
-    reason = "the PulseBeam adapter uses bounded fixed-point policy interpolation"
+    reason = "the SCReAM adapter uses bounded timing and feedback confidence arithmetic"
 )]
 
 use std::time::Duration;
@@ -12,7 +11,6 @@ mod screamv2;
 
 pub(crate) use screamv2::{EcnMark, FeedbackSample, LossOrigin};
 
-const ONE: u64 = 65_536;
 const TARGET_BITRATE_MAX: u64 = 100_000_000;
 
 #[cfg(test)]
@@ -115,59 +113,6 @@ pub(crate) struct SafeRtpEnvelope {
     pub(crate) l4s_enabled: bool,
     pub(crate) probe_permitted: bool,
     pub(crate) reason: ControllerReason,
-}
-
-/// PulseBeam latency policy. These values govern media usefulness, allocation, pacer
-/// horizon, repair, and probing outside SCReAMv2.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct SenderOperatingPoint {
-    pub(crate) pacer_horizon: Duration,
-    pub(crate) rtx_extra_allowance: Duration,
-    pub(crate) probe_queue_impact: Duration,
-    pub(crate) probe_budget_rate: u64,
-}
-
-pub(crate) struct LatencyGovernor;
-
-impl LatencyGovernor {
-    pub(crate) fn operating_point(
-        playout_max_ticks: u16,
-        potential_media_rate: u64,
-    ) -> SenderOperatingPoint {
-        let urgent_playout_knee = Duration::from_millis(75);
-        let quality_playout_saturation = Duration::from_millis(500);
-        let playout = Duration::from_millis(u64::from(playout_max_ticks).saturating_mul(10));
-        let numerator = if playout_max_ticks == 0 || playout <= urgent_playout_knee {
-            0
-        } else {
-            micros(playout.saturating_sub(urgent_playout_knee)).min(micros(
-                quality_playout_saturation.saturating_sub(urgent_playout_knee),
-            ))
-        };
-        let denominator = micros(quality_playout_saturation.saturating_sub(urgent_playout_knee));
-        let probe_size_scale = lerp_even(52_429, 62_259, numerator, denominator);
-        SenderOperatingPoint {
-            pacer_horizon: lerp_duration_even(
-                Duration::from_millis(15),
-                Duration::from_millis(80),
-                numerator,
-                denominator,
-            ),
-            rtx_extra_allowance: lerp_duration_even(
-                Duration::ZERO,
-                Duration::from_millis(50),
-                numerator,
-                denominator,
-            ),
-            probe_queue_impact: lerp_duration_even(
-                Duration::from_millis(5),
-                Duration::from_millis(20),
-                numerator,
-                denominator,
-            ),
-            probe_budget_rate: mul_fixed(potential_media_rate, probe_size_scale),
-        }
-    }
 }
 
 pub(crate) struct ScreamController {
@@ -413,31 +358,6 @@ impl ScreamController {
 
 fn micros(value: Duration) -> u64 {
     value.as_micros().min(u128::from(u64::MAX)) as u64
-}
-
-fn mul_fixed(value: u64, factor: u64) -> u64 {
-    ((u128::from(value) * u128::from(factor)) / u128::from(ONE)).min(u128::from(u64::MAX)) as u64
-}
-
-fn duration_from_micros(value: u64) -> Duration {
-    Duration::from_micros(value)
-}
-
-fn lerp_duration_even(low: Duration, high: Duration, numerator: u64, denominator: u64) -> Duration {
-    duration_from_micros(lerp_even(micros(low), micros(high), numerator, denominator))
-}
-
-fn lerp_even(low: u64, high: u64, numerator: u64, denominator: u64) -> u64 {
-    let denominator = denominator.max(1);
-    let product = u128::from(high.saturating_sub(low)) * u128::from(numerator);
-    let divisor = u128::from(denominator);
-    let quotient = product / divisor;
-    let remainder = product % divisor;
-    let round_up = remainder.saturating_mul(2) > divisor
-        || (remainder.saturating_mul(2) == divisor && quotient % 2 == 1);
-    low.saturating_add(
-        u64::try_from(quotient.saturating_add(u128::from(round_up))).unwrap_or(u64::MAX),
-    )
 }
 
 fn half_life(base: u16, elapsed: Duration) -> u16 {
@@ -772,13 +692,5 @@ mod tests {
         );
         assert!(!cc.application_limited);
         assert_eq!(cc.confidence, u16::MAX);
-    }
-
-    #[test]
-    fn latency_governor_remains_outer_policy_only() {
-        let urgent = LatencyGovernor::operating_point(0, 1_000_000);
-        let quality = LatencyGovernor::operating_point(50, 1_000_000);
-        assert!(quality.probe_budget_rate >= urgent.probe_budget_rate);
-        assert!(quality.pacer_horizon >= urgent.pacer_horizon);
     }
 }

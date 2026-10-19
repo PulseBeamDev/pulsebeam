@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use crate::test_source::ComponentSource;
 use crate::test_support::{NetworkPolicy, PeerFixture, assert_probe_windows, forwarded};
-use crate::{Command, CommandError, ConnectionConfig, MediaPayloadBitrate, PlayoutDelay};
+use crate::{Command, CommandError, MediaPayloadBitrate, PlayoutDelay};
 
 const PAYLOAD_BYTES: usize = 1_000;
 
@@ -34,15 +34,17 @@ fn production_connection_bottleneck_emits_measured_transport_bytes() {
     fixture.configure_bottleneck(RATE_BPS);
     fixture.configure_time_quantum(Duration::from_millis(5));
     let mut source = ComponentSource::audio(1);
-    let mut policy = pulsebeam_rtc::ConnectionConfig::default().default_audio_policy;
-    policy.desired_bitrate = MediaPayloadBitrate::from_bps(1_000_000);
+    let mut policy =
+        crate::test_support::sender_assignment(pulsebeam_rtc::MediaPayloadBitrate::from_bps(0));
+    policy.selected_bitrate = MediaPayloadBitrate::from_bps(1_000_000);
+    policy.potential_bitrate = MediaPayloadBitrate::from_bps(1_000_000);
     // At 100 kbit/s, a full minimum send window alone takes hundreds of ms.
     // This is a transport-service fixture, not a low-latency policy fixture.
     policy.playout_delay =
         Some(pulsebeam_rtc::PlayoutDelay::from_ticks(0, 200).expect("2 seconds"));
-    fixture.command(Command::SetSenderPolicy {
+    fixture.command(Command::SetSenderAssignment {
         sender: fixture.sender,
-        policy,
+        assignment: Some(policy),
     });
     let started = fixture.at().monotonic;
     fixture.drive_for(started.saturating_duration_since(fixture.at().monotonic));
@@ -130,16 +132,18 @@ fn production_two_megabit_single_flow_capacity() {
     );
     fixture.configure_bottleneck(2_000_000);
     fixture.configure_time_quantum(Duration::from_millis(2));
-    let mut policy = ConnectionConfig::default().default_audio_policy;
-    policy.desired_bitrate = MediaPayloadBitrate::from_bps(4_000_000);
+    let mut policy =
+        crate::test_support::sender_assignment(pulsebeam_rtc::MediaPayloadBitrate::from_bps(0));
+    policy.selected_bitrate = MediaPayloadBitrate::from_bps(4_000_000);
+    policy.potential_bitrate = MediaPayloadBitrate::from_bps(4_000_000);
     policy.playout_delay = Some(PlayoutDelay::from_ticks(0, 50).expect("500ms playout"));
     fixture
         .connection
         .command(
             fixture.at(),
-            Command::SetSenderPolicy {
+            Command::SetSenderAssignment {
                 sender: fixture.sender,
-                policy,
+                assignment: Some(policy),
             },
         )
         .expect("demand policy");
@@ -198,12 +202,17 @@ fn production_capacity_steps_recover_stable_transport_service() {
     );
     fixture.configure_bottleneck(2_000_000);
     fixture.configure_time_quantum(Duration::from_millis(2));
-    let mut policy = ConnectionConfig::default().default_audio_policy;
-    policy.desired_bitrate = MediaPayloadBitrate::from_bps(4_000_000);
+    let mut policy =
+        crate::test_support::sender_assignment(pulsebeam_rtc::MediaPayloadBitrate::from_bps(0));
+    policy.selected_bitrate = MediaPayloadBitrate::from_bps(4_000_000);
+    policy.potential_bitrate = MediaPayloadBitrate::from_bps(4_000_000);
     policy.playout_delay = Some(PlayoutDelay::from_ticks(0, 50).expect("500ms playout"));
     let senders = fixture.senders.clone();
     for &sender in &senders {
-        fixture.command(Command::SetSenderPolicy { sender, policy });
+        fixture.command(Command::SetSenderAssignment {
+            sender,
+            assignment: Some(policy),
+        });
     }
     let mut sources = [ComponentSource::audio(1), ComponentSource::audio(2)];
     let start = fixture.at().monotonic;
@@ -219,12 +228,9 @@ fn production_capacity_steps_recover_stable_transport_service() {
         }
         if id % 6_000 == 0 {
             let stats = fixture.connection.stats();
-            assert!(
-                stats
-                    .senders
-                    .iter()
-                    .all(|sender| sender.demand.selected() == policy.desired_bitrate)
-            );
+            assert!(stats.senders.iter().all(|sender| {
+                sender.assignment.expect("bound sender").selected_bitrate == policy.selected_bitrate
+            }));
             budgets.push(stats.connection.media_budget.as_bps());
         }
         for (source, &sender) in sources.iter_mut().zip(&senders) {
@@ -300,15 +306,17 @@ fn production_homogeneous_shared_bottleneck_competition() {
         flow.configure_bottleneck(4_000_000);
         flow.share_bottleneck_departure(shared.clone());
         flow.configure_time_quantum(Duration::from_millis(2));
-        let mut policy = ConnectionConfig::default().default_audio_policy;
-        policy.desired_bitrate = MediaPayloadBitrate::from_bps(4_000_000);
+        let mut policy =
+            crate::test_support::sender_assignment(pulsebeam_rtc::MediaPayloadBitrate::from_bps(0));
+        policy.selected_bitrate = MediaPayloadBitrate::from_bps(4_000_000);
+        policy.potential_bitrate = MediaPayloadBitrate::from_bps(4_000_000);
         policy.playout_delay = Some(PlayoutDelay::from_ticks(0, 50).expect("500ms playout"));
         flow.connection
             .command(
                 flow.at(),
-                Command::SetSenderPolicy {
+                Command::SetSenderAssignment {
                     sender: flow.sender,
-                    policy,
+                    assignment: Some(policy),
                 },
             )
             .expect("demand policy");

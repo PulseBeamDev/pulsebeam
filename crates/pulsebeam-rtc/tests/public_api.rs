@@ -7,8 +7,8 @@ use std::{
 use pulsebeam_rtc::{
     AcceptError, Command, CommandError, Connection, ConnectionConfig, ConnectionLimits,
     DataChannelId, FrameDependencies, FrameId, GlobalMediaTime, IceTcpFlowId, LocalCandidate,
-    LocalIceCredentials, MediaPacket, MediaPayloadBitrate, NetworkInput, Output, PlayoutDelay,
-    PolicyError, ReceiveError, SenderDemand, StatsSnapshot, TimePoint,
+    LocalIceCredentials, MediaPacket, NetworkInput, Output, PlayoutDelay, PolicyError,
+    ReceiveError, StatsSnapshot, TimePoint,
 };
 
 fn assert_send<T: Send>() {}
@@ -51,21 +51,6 @@ fn connection_runtime_methods_have_the_public_sans_io_signatures() {
 }
 
 #[test]
-fn sender_demand_distinguishes_selected_media_from_potential_without_reservations() {
-    let selected = MediaPayloadBitrate::from_bps(100_000);
-    let potential = MediaPayloadBitrate::from_bps(1_000_000);
-    let demand = SenderDemand::new(selected, potential);
-    assert_eq!(demand.map(SenderDemand::selected), Ok(selected));
-    assert_eq!(demand.map(SenderDemand::potential), Ok(potential));
-    assert_eq!(
-        SenderDemand::new(potential, selected),
-        Err(PolicyError::BitrateOutOfRange)
-    );
-    assert_eq!(SenderDemand::default().selected().as_bps(), 0);
-    assert_eq!(SenderDemand::default().potential().as_bps(), 0);
-}
-
-#[test]
 fn negotiated_codec_facts_are_public_and_directional() {
     use pulsebeam_rtc::{CodecProfile, ConnectionEntropy, MediaKind, SdpOffer};
     let at = TimePoint {
@@ -87,6 +72,14 @@ fn negotiated_codec_facts_are_public_and_directional() {
         ConnectionEntropy::new([9; 32]),
     )
     .expect("mixed-direction session");
+    assert!(
+        accepted
+            .connection
+            .stats()
+            .senders
+            .iter()
+            .all(|sender| sender.assignment.is_none())
+    );
     let inbound = accepted
         .session
         .inbound_media
@@ -120,6 +113,14 @@ fn negotiated_codec_facts_are_public_and_directional() {
 fn stable_identifiers_are_nominally_distinct() {
     assert_ne!(TypeId::of::<DataChannelId>(), TypeId::of::<FrameId>());
     assert_ne!(TypeId::of::<FrameId>(), TypeId::of::<IceTcpFlowId>());
+    assert_ne!(
+        TypeId::of::<pulsebeam_rtc::SourceIncarnation>(),
+        TypeId::of::<FrameId>()
+    );
+    assert_eq!(
+        pulsebeam_rtc::SourceIncarnation::from_value(u64::MAX).value(),
+        u64::MAX
+    );
     assert_eq!(DataChannelId::from_value(7).value(), 7);
     assert_eq!(FrameId::from_value(9).value(), 9);
     assert_eq!(IceTcpFlowId::from_value(11).value(), 11);
@@ -345,18 +346,6 @@ fn policy_values_reject_unrepresentable_construction() {
     assert_eq!(
         PlayoutDelay::from_millis(0, 40_950).map(PlayoutDelay::max),
         Ok(Duration::from_millis(40_950))
-    );
-    assert_eq!(
-        ConnectionConfig::default()
-            .default_audio_policy
-            .playout_delay,
-        None
-    );
-    assert_eq!(
-        ConnectionConfig::default()
-            .default_video_policy
-            .playout_delay,
-        None
     );
     assert_eq!(FrameDependencies::known([FrameId::from_value(1); 9]), None);
 }

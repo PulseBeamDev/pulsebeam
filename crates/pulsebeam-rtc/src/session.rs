@@ -5,7 +5,7 @@
 
 use std::{fmt, net::SocketAddr, num::NonZeroU16, sync::Arc, time::Duration};
 
-use crate::{AcceptError, DataChannelId, SenderId};
+use crate::{AcceptError, DataChannelId, SenderId, SourceIncarnation};
 
 const MAX_PLAYOUT_TICKS: u16 = 4095;
 const MILLIS_PER_PLAYOUT_TICK: u64 = 10;
@@ -287,13 +287,11 @@ impl Default for ConnectionLimits {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ConnectionConfig {
     pub local_candidates: Vec<LocalCandidate>,
     pub local_ice_credentials: Option<LocalIceCredentials>,
     pub limits: ConnectionLimits,
-    pub default_audio_policy: SenderPolicy,
-    pub default_video_policy: SenderPolicy,
     pub unknown_extension_policy: UnknownExtensionPolicy,
 }
 
@@ -323,72 +321,21 @@ impl ConnectionConfig {
     }
 }
 
-impl Default for ConnectionConfig {
-    fn default() -> Self {
-        Self {
-            local_candidates: Vec::new(),
-            local_ice_credentials: None,
-            limits: ConnectionLimits::default(),
-            default_audio_policy: SenderPolicy {
-                playout_delay: None,
-                desired_bitrate: MediaPayloadBitrate::from_bps(0),
-            },
-            default_video_policy: SenderPolicy {
-                playout_delay: None,
-                desired_bitrate: MediaPayloadBitrate::from_bps(0),
-            },
-            unknown_extension_policy: UnknownExtensionPolicy::default(),
-        }
-    }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SenderAssignment {
+    pub source: SourceIncarnation,
+    pub selected_bitrate: MediaPayloadBitrate,
+    pub potential_bitrate: MediaPayloadBitrate,
+    pub delivery: DeliveryConstraints,
+    pub playout_delay: Option<PlayoutDelay>,
+    pub decode_target_mask: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct SenderPolicy {
-    pub playout_delay: Option<PlayoutDelay>,
-    pub desired_bitrate: MediaPayloadBitrate,
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct SenderDemand {
-    selected: MediaPayloadBitrate,
-    potential: MediaPayloadBitrate,
-}
-
-impl SenderDemand {
-    pub const fn new(
-        selected: MediaPayloadBitrate,
-        potential: MediaPayloadBitrate,
-    ) -> Result<Self, PolicyError> {
-        if selected.as_bps() > potential.as_bps() {
-            return Err(PolicyError::BitrateOutOfRange);
-        }
-        Ok(Self {
-            selected,
-            potential,
-        })
-    }
-
-    pub const fn selected(self) -> MediaPayloadBitrate {
-        self.selected
-    }
-
-    pub const fn potential(self) -> MediaPayloadBitrate {
-        self.potential
-    }
-
-    pub(crate) const fn from_policy(
-        selected: MediaPayloadBitrate,
-        potential: Option<MediaPayloadBitrate>,
-    ) -> Self {
-        let potential = match potential {
-            Some(value) if value.as_bps() > selected.as_bps() => value,
-            _ => selected,
-        };
-        Self {
-            selected,
-            potential,
-        }
-    }
+pub struct DeliveryConstraints {
+    pub max_media_age: Duration,
+    pub max_queue_residence: Duration,
+    pub repair_window: Duration,
 }
 
 #[repr(transparent)]
@@ -471,7 +418,6 @@ impl PlayoutDelay {
 pub enum PolicyError {
     PlayoutRange,
     PlayoutNotExactlyRepresentable,
-    BitrateOutOfRange,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

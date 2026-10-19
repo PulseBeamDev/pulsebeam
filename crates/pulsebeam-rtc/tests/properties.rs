@@ -9,9 +9,7 @@ mod support;
 use std::time::Duration;
 
 use proptest::prelude::*;
-use pulsebeam_rtc::{
-    Command, GlobalMediaTime, MediaPayloadBitrate, Output, PlayoutDelay, SenderPolicy,
-};
+use pulsebeam_rtc::{Command, GlobalMediaTime, MediaPayloadBitrate, Output, PlayoutDelay};
 use support::{PeerFixture, forwarded};
 
 proptest! {
@@ -59,12 +57,12 @@ fn selected_targets_remain_caller_owned_above_the_connection_budget() {
     let packet = source.send_source(b"fixed caller targets");
     let target = MediaPayloadBitrate::from_bps(4_000_000);
     for (index, sender) in fixture.senders.clone().into_iter().enumerate() {
-        fixture.command(Command::SetSenderPolicy {
-            sender,
-            policy: SenderPolicy {
+        fixture.command(Command::SetSenderAssignment {
+            sender: sender,
+            assignment: Some(pulsebeam_rtc::SenderAssignment {
                 playout_delay: None,
-                desired_bitrate: target,
-            },
+                ..support::sender_assignment(target)
+            }),
         });
         fixture.command(Command::SendMedia {
             sender,
@@ -78,10 +76,11 @@ fn selected_targets_remain_caller_owned_above_the_connection_budget() {
     let stats = fixture.connection.stats();
     assert_eq!(stats.senders.len(), 3);
     assert!(
-        stats
-            .senders
-            .iter()
-            .all(|sender| sender.demand.selected() == target)
+        stats.senders.iter().all(|sender| sender
+            .assignment
+            .expect("bound sender")
+            .selected_bitrate
+            == target)
     );
     assert!(stats.connection.media_budget.as_bps() > 0);
     assert!(stats.connection.media_budget.as_bps() < target.as_bps() * 3);

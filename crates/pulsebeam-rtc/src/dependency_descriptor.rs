@@ -159,9 +159,10 @@ impl DescriptorIngress {
         packet: &MediaPacket,
         source: u32,
         frame: &FrameMetadata,
+        decode_target_mask: Option<u32>,
     ) -> Result<Option<ParsedDescriptor>, DescriptorError> {
         let Some(bytes) = URIS.iter().find_map(|uri| packet.extension(uri)) else {
-            if frame.decode_target_mask.is_some() {
+            if decode_target_mask.is_some() {
                 return Err(DescriptorError::Invalid);
             }
             if self.source != Some(source) {
@@ -214,7 +215,7 @@ impl DescriptorIngress {
             },
             |context| context.active_targets,
         );
-        let active_targets = match frame.decode_target_mask {
+        let active_targets = match decode_target_mask {
             Some(mask) if mask == 0 || mask & !structure.all_decode_targets_bitmask() != 0 => {
                 return Err(DescriptorError::Invalid);
             }
@@ -590,7 +591,10 @@ mod tests {
         );
         let mut ingress = DescriptorIngress::default();
         let metadata = frame(1);
-        let parsed = ingress.read(&restored, 42, &metadata).unwrap().unwrap();
+        let parsed = ingress
+            .read(&restored, 42, &metadata, None)
+            .unwrap()
+            .unwrap();
         let mut continuity = DescriptorContinuity::default();
         let mut reader = DependencyDescriptorReader::new();
         let emitted = emit(&mut continuity, &mut reader, &parsed);
@@ -638,7 +642,6 @@ mod tests {
 
     fn frame(id: u64) -> FrameMetadata {
         FrameMetadata {
-            decode_target_mask: None,
             id: FrameId::from_value(id),
             boundary: FrameBoundary::Complete,
             random_access: false,
@@ -671,7 +674,9 @@ mod tests {
             let mut source = Source::new();
             let key = source.next(true);
             let mut ingress = DescriptorIngress::default();
-            ingress.read(&source.packet(&key), 42, &frame(0)).unwrap();
+            ingress
+                .read(&source.packet(&key), 42, &frame(0), None)
+                .unwrap();
             let delta = source.next(false);
             let delta_packet = source.packet(&delta);
 
@@ -685,14 +690,16 @@ mod tests {
                 let context = DescriptorSource::default().observe(&packet, 42).unwrap();
                 packet.set_descriptor_context(Some(context));
             }
-            let mut invalid = frame(2);
-            invalid.decode_target_mask = Some(8);
+            let invalid = frame(2);
             assert!(matches!(
-                ingress.read(&packet, 42, &invalid),
+                ingress.read(&packet, 42, &invalid, Some(8)),
                 Err(DescriptorError::Invalid)
             ));
 
-            let accepted = ingress.read(&delta_packet, 42, &frame(1)).unwrap().unwrap();
+            let accepted = ingress
+                .read(&delta_packet, 42, &frame(1), None)
+                .unwrap()
+                .unwrap();
             assert_eq!(accepted.active_targets, 7);
             assert_eq!(accepted.structure.get(), key.structure.get());
         }
@@ -710,10 +717,9 @@ mod tests {
             let mut key = source.next(true);
             key.descriptor.active_decode_targets = Some(source_mask);
             let packet = source.packet(&key);
-            let mut metadata = frame(u64::from(key.descriptor.frame_number));
-            metadata.decode_target_mask = selection;
+            let metadata = frame(u64::from(key.descriptor.frame_number));
             let parsed = DescriptorIngress::default()
-                .read(&packet, 42, &metadata)
+                .read(&packet, 42, &metadata, selection)
                 .unwrap()
                 .unwrap();
             let mut reader = DependencyDescriptorReader::new();
@@ -724,15 +730,14 @@ mod tests {
 
     #[test]
     fn selection_without_source_descriptor_is_rejected_not_fabricated() {
-        let mut metadata = frame(0);
-        metadata.decode_target_mask = Some(1);
+        let metadata = frame(0);
         let packet = MediaPacket::new(
             bytes::Bytes::from_static(&[0x80, 96, 0, 0, 0, 0, 0, 0, 0, 0, 0, 42, 0]),
             crate::GlobalMediaTime::from_micros(42),
             std::sync::Arc::from([]),
         );
         assert!(matches!(
-            DescriptorIngress::default().read(&packet, 42, &metadata),
+            DescriptorIngress::default().read(&packet, 42, &metadata, Some(1)),
             Err(DescriptorError::Invalid)
         ));
     }

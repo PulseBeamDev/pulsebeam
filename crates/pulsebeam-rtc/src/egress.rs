@@ -14,15 +14,13 @@ use sha2::{Digest, Sha256};
 use crate::{
     CommandError, Event, ForwardedMedia, FrameBoundary, FrameDependencies, FrameId,
     GlobalMediaTime, KeyframeRequestReason, MediaKind, MediaPacket, MediaPayloadBitrate,
-    PlayoutDelay, PlayoutDelayStatus, SenderDemand, SenderId, SenderPolicy, SenderStats, TimePoint,
+    PlayoutDelay, PlayoutDelayStatus, SenderAssignment, SenderId, SenderStats, TimePoint,
     congestion::{
-        ControllerInput, EcnValidation, FeedbackSample, LatencyGovernor, SafeRtpEnvelope,
-        ScreamController,
+        ControllerInput, EcnValidation, FeedbackSample, SafeRtpEnvelope, ScreamController,
     },
     dependency_descriptor::{
         DescriptorContinuity, DescriptorIngress, ParsedDescriptor, PreparedDescriptor,
     },
-    media_packet::ClockQuality,
     negotiation::EgressSenderFacts,
     pacer::Pacer,
     packet::RtpPacket,
@@ -39,8 +37,6 @@ const MAX_EXPIRATIONS_PER_POLL: usize = 256;
 const RTP_TRANSPORT_ALLOWANCE: usize = 96;
 const PROBE_WINDOW: Duration = Duration::from_secs(5);
 const PROBE_MIN_TARGET: u64 = 3_000;
-// Default playout permits bounded discovery debt, not an urgent receiver override.
-const DEFAULT_PROBE_PACER_HORIZON: Duration = Duration::from_millis(80);
 const PROBE_ALLOWANCE: u64 = 48 * 1024;
 const INITIAL_PROBE_DURATION: Duration = Duration::from_millis(100);
 const INITIAL_PROBE_CLUSTERS: u64 = 2;
@@ -132,8 +128,7 @@ impl PayloadAdmission {
 struct Sender {
     facts: EgressSenderFacts,
     admission: PayloadAdmission,
-    policy: SenderPolicy,
-    potential_bitrate: Option<MediaPayloadBitrate>,
+    assignment: Option<SenderAssignment>,
     ssrc: u32,
     rtx_ssrc: u32,
     primary_feedback_observed: bool,
@@ -158,13 +153,20 @@ struct Sender {
 }
 
 impl Sender {
-    fn demand(&self) -> SenderDemand {
-        SenderDemand::from_policy(self.policy.desired_bitrate, self.potential_bitrate)
+    fn selected_bitrate(&self) -> u64 {
+        self.assignment
+            .map_or(0, |assignment| assignment.selected_bitrate.as_bps())
+    }
+
+    fn potential_bitrate(&self) -> u64 {
+        self.assignment
+            .map_or(0, |assignment| assignment.potential_bitrate.as_bps())
     }
 
     fn playout_to_signal(&self) -> Option<PlayoutDelay> {
         if self.facts.playout_extension_id.is_some() && !self.playout_confirmed {
-            self.policy.playout_delay
+            self.assignment
+                .and_then(|assignment| assignment.playout_delay)
         } else {
             None
         }
@@ -180,7 +182,8 @@ impl Sender {
 
     fn playout_status(&self) -> PlayoutDelayStatus {
         match (
-            self.policy.playout_delay,
+            self.assignment
+                .and_then(|assignment| assignment.playout_delay),
             self.facts.playout_extension_id,
             self.playout_confirmed,
         ) {
@@ -199,7 +202,6 @@ struct OpenFrame {
     random_access: bool,
     discardable: bool,
     dependencies: FrameDependencies,
-    decode_target_mask: Option<u32>,
     source_ssrc: u32,
     source_timestamp: u32,
     source_sequence: u16,
@@ -207,6 +209,7 @@ struct OpenFrame {
 
 struct QueuedMedia {
     sender: usize,
+    queued_at: Instant,
     media: ForwardedMedia,
     descriptor: Option<ParsedDescriptor>,
     descriptor_bytes: usize,
@@ -252,7 +255,6 @@ struct RetainedPacket {
     retained_at: Instant,
     last_repair_at: Option<Instant>,
     global: GlobalMediaTime,
-    clock_quality: ClockQuality,
     transport_bytes: usize,
 }
 
@@ -301,8 +303,6 @@ impl MediaEgress {
         randomness: &[u8; 32],
         max_payload_bytes: usize,
         max_retransmission_bytes: usize,
-        audio_policy: SenderPolicy,
-        video_policy: SenderPolicy,
         accepted_at: Instant,
     ) -> Self {
         let senders: Box<[_]> = facts
@@ -311,11 +311,7 @@ impl MediaEgress {
             .map(|facts| {
                 let seed = sender_seed(randomness, facts.id.value());
                 Sender {
-                    policy: match facts.kind {
-                        MediaKind::Audio => audio_policy,
-                        MediaKind::Video => video_policy,
-                    },
-                    potential_bitrate: None,
+                    assignment: None,
                     ssrc: nonzero_u32([seed[0], seed[1], seed[2], seed[3]]),
                     rtx_ssrc: nonzero_u32([seed[10], seed[11], seed[12], seed[13]]),
                     next_sequence: u64::from(u16::from_be_bytes([seed[4], seed[5]])),
@@ -348,7 +344,7 @@ impl MediaEgress {
             })
             .collect();
         let desired = senders.iter().fold(0_u64, |total, sender| {
-            total.saturating_add(sender.demand().potential().as_bps())
+            total.saturating_add(sender.potential_bitrate())
         });
         let twcc_seed = sender_seed(randomness, u16::MAX);
         let sender_count = senders.len();
@@ -419,14 +415,6 @@ impl MediaEgress {
         owner
     }
 
-    pub(crate) fn discard_sender_media(&mut self, sender: SenderId) -> Result<(), CommandError> {
-        self.clear_sender_media(sender, false)
-    }
-
-    pub(crate) fn recover_sender_media(&mut self, sender: SenderId) -> Result<(), CommandError> {
-        self.clear_sender_media(sender, true)
-    }
-
     fn clear_sender_media(
         &mut self,
         sender: SenderId,
@@ -481,36 +469,69 @@ impl MediaEgress {
         Ok(())
     }
 
-    pub(crate) fn set_policy(
+    pub(crate) fn set_assignment(
         &mut self,
         sender: SenderId,
-        policy: SenderPolicy,
+        assignment: Option<SenderAssignment>,
         at: TimePoint,
+        recover: bool,
     ) -> Result<(), CommandError> {
         let index = self.sender_index(sender)?;
-        let state = &mut self.senders[index];
-        if policy.playout_delay.is_none() && state.playout_ever_signaled {
-            return Err(CommandError::PlayoutResetRequiresNewSender(sender));
+        let previous = self.senders[index].assignment;
+        if self.pending.is_some() {
+            return Err(CommandError::InvalidState);
         }
-        if state.policy.playout_delay != policy.playout_delay {
+        if let Some(next) = assignment {
+            if next.selected_bitrate > next.potential_bitrate
+                || next.decode_target_mask == Some(0)
+                || [
+                    next.delivery.max_media_age,
+                    next.delivery.max_queue_residence,
+                    next.delivery.repair_window,
+                ]
+                .into_iter()
+                .any(|limit| {
+                    limit.as_micros() > u128::from(u64::MAX)
+                        || at.monotonic.checked_add(limit).is_none()
+                })
+            {
+                return Err(CommandError::InvalidSenderAssignment);
+            }
+            if next.playout_delay.is_none() && self.senders[index].playout_ever_signaled {
+                return Err(CommandError::PlayoutResetRequiresNewSender(sender));
+            }
+        }
+        let same_source = previous
+            .zip(assignment)
+            .is_some_and(|(old, next)| old.source == next.source);
+        if recover && !same_source {
+            return Err(CommandError::SourceIncarnationMismatch);
+        }
+        let paused = previous.zip(assignment).is_some_and(|(old, next)| {
+            old.selected_bitrate.as_bps() > 0 && next.selected_bitrate.as_bps() == 0
+        });
+        let selection_changed = previous
+            .zip(assignment)
+            .is_some_and(|(old, next)| old.decode_target_mask != next.decode_target_mask);
+        if !same_source || paused || recover || selection_changed {
+            self.clear_sender_media(sender, same_source && !paused && assignment.is_some())?;
+        }
+        let state = &mut self.senders[index];
+        if recover {
+            state.dependency_chain_valid = true;
+        }
+        let old_rate = state.selected_bitrate();
+        state
+            .admission
+            .eligible(at.monotonic, old_rate, Duration::ZERO);
+        if previous.and_then(|old| old.playout_delay)
+            != assignment.and_then(|next| next.playout_delay)
+        {
             state.playout_first_sequence = None;
             state.playout_confirmed = false;
         }
-        state.policy = policy;
-        self.policy_updated(at);
-        Ok(())
-    }
-
-    pub(crate) fn set_demand(
-        &mut self,
-        sender: SenderId,
-        demand: SenderDemand,
-        at: TimePoint,
-    ) -> Result<(), CommandError> {
-        let index = self.sender_index(sender)?;
-        let state = &mut self.senders[index];
-        state.policy.desired_bitrate = demand.selected();
-        state.potential_bitrate = Some(demand.potential());
+        state.assignment = assignment;
+        self.expire_repair(at.monotonic);
         self.policy_updated(at);
         Ok(())
     }
@@ -536,6 +557,12 @@ impl MediaEgress {
         media: ForwardedMedia,
     ) -> Result<(), CommandError> {
         let sender_index = self.sender_index(sender)?;
+        let assignment = self.senders[sender_index]
+            .assignment
+            .ok_or(CommandError::SenderUnbound(sender))?;
+        if media.source != assignment.source {
+            return Err(CommandError::SourceIncarnationMismatch);
+        }
         let packet = RtpPacket::parse(media.packet.bytes())
             .map_err(|_| CommandError::InvalidFrameMetadata)?;
         let payload_bytes = packet.payload().len();
@@ -558,24 +585,14 @@ impl MediaEgress {
         self.validate_frame(at, sender_index, &media, &packet)?;
         self.offered_bytes = self.offered_bytes.saturating_add(payload_bytes as u64);
         if self
-            .latest_useful_at(
-                sender_index,
-                media.packet.global_media_at(),
-                media.packet.clock_quality(),
-            )
+            .latest_useful_at(sender_index, media.packet.global_media_at())
             .is_none_or(|deadline| at.global > deadline)
         {
             return Err(CommandError::MediaExpired);
         }
         let pacer_wait = self.predicted_pacer_wait(at.monotonic);
-        if self.senders[sender_index].policy.desired_bitrate.as_bps() == 0
-            || !self.useful_at(
-                sender_index,
-                media.packet.global_media_at(),
-                media.packet.clock_quality(),
-                at,
-                pacer_wait,
-            )
+        if self.senders[sender_index].selected_bitrate() == 0
+            || !self.useful_at(sender_index, media.packet.global_media_at(), at, pacer_wait)
         {
             return Err(CommandError::WouldBlock);
         }
@@ -590,14 +607,10 @@ impl MediaEgress {
             return Err(CommandError::WouldBlock);
         }
 
-        let horizon = LatencyGovernor::operating_point(
-            playout_max_ticks(self.senders[sender_index].policy),
-            self.senders[sender_index].policy.desired_bitrate.as_bps(),
-        )
-        .pacer_horizon;
+        let horizon = assignment.delivery.max_queue_residence;
         let payload_eligible = self.senders[sender_index].admission.eligible(
             at.monotonic,
-            self.senders[sender_index].demand().selected().as_bps(),
+            self.senders[sender_index].selected_bitrate(),
             horizon,
         );
         // Charge the entire frame, but gate its start rather than cutting its
@@ -623,7 +636,12 @@ impl MediaEgress {
         }
         let descriptor = if let Some((ingress, _)) = &mut self.senders[sender_index].descriptor {
             ingress
-                .read(&media.packet, packet.ssrc(), &media.frame)
+                .read(
+                    &media.packet,
+                    packet.ssrc(),
+                    &media.frame,
+                    assignment.decode_target_mask,
+                )
                 .map_err(|_| CommandError::InvalidFrameMetadata)?
         } else {
             None
@@ -645,6 +663,7 @@ impl MediaEgress {
         self.queued_frames.insert((sender, media.frame.id));
         self.queue.push_back(QueuedMedia {
             sender: sender_index,
+            queued_at: at.monotonic,
             media,
             descriptor,
             descriptor_bytes,
@@ -748,12 +767,12 @@ impl MediaEgress {
                 offered_media_rate: self.offered_rate,
                 admitted_media_rate: self.admitted_rate,
                 selected_media_rate: self.senders.iter().fold(0_u64, |total, sender| {
-                    total.saturating_add(sender.demand().selected().as_bps())
+                    total.saturating_add(sender.selected_bitrate())
                 }),
                 has_unserved_source_interest: self
                     .senders
                     .iter()
-                    .any(|sender| sender.demand().potential() > sender.demand().selected()),
+                    .any(|sender| sender.potential_bitrate() > sender.selected_bitrate()),
                 desired_media_rate: desired,
                 window_or_pacer_blocked: (self.queued_transport_bytes > 0
                     || !self.repair_requests.is_empty())
@@ -945,8 +964,7 @@ impl MediaEgress {
                     });
                 SenderStats {
                     sender: sender.facts.id,
-                    policy: sender.policy,
-                    demand: sender.demand(),
+                    assignment: sender.assignment,
                     playout_delay: sender.playout_status(),
                     queued_packets,
                     queued_payload_bytes,
@@ -1274,7 +1292,6 @@ impl MediaEgress {
                     timestamp,
                     &packet,
                     queued.media.packet.global_media_at(),
-                    queued.media.packet.clock_quality(),
                     at.monotonic,
                     prepared.wire_len,
                 );
@@ -1518,10 +1535,9 @@ impl MediaEgress {
             FrameDependencies::Known(dependencies)
                 if dependencies.len() > FrameDependencies::MAX_DIRECT_DEPENDENCIES
                     || dependencies.contains(&media.frame.id)
-        ) || media.frame.decode_target_mask == Some(0)
-            || sender
-                .latest_admitted_global
-                .is_some_and(|latest| media.packet.global_media_at() < latest)
+        ) || sender
+            .latest_admitted_global
+            .is_some_and(|latest| media.packet.global_media_at() < latest)
         {
             return Err(CommandError::InvalidFrameMetadata);
         }
@@ -1540,7 +1556,6 @@ impl MediaEgress {
                 && open.random_access == media.frame.random_access
                 && open.discardable == media.frame.discardable
                 && open.dependencies == media.frame.dependencies
-                && open.decode_target_mask == media.frame.decode_target_mask
         };
         match (media.frame.boundary, sender.open_frame.as_ref()) {
             (FrameBoundary::Complete | FrameBoundary::Start, None) => {}
@@ -1574,7 +1589,6 @@ impl MediaEgress {
                     && self.useful_at(
                         sender_index,
                         queued.media.packet.global_media_at(),
-                        queued.media.packet.clock_quality(),
                         at,
                         Duration::ZERO,
                     )
@@ -1603,7 +1617,6 @@ impl MediaEgress {
                     random_access: media.frame.random_access,
                     discardable: media.frame.discardable,
                     dependencies: media.frame.dependencies.clone(),
-                    decode_target_mask: media.frame.decode_target_mask,
                     source_ssrc: packet.ssrc(),
                     source_timestamp: packet.timestamp(),
                     source_sequence: packet.sequence(),
@@ -1623,64 +1636,33 @@ impl MediaEgress {
         &self,
         sender: usize,
         global: GlobalMediaTime,
-        quality: ClockQuality,
         at: TimePoint,
         pacer_wait: Duration,
     ) -> bool {
-        let state = &self.senders[sender];
-        let point = LatencyGovernor::operating_point(
-            playout_max_ticks(state.policy),
-            state.policy.desired_bitrate.as_bps(),
-        );
-        if pacer_wait > point.pacer_horizon {
-            return false;
-        }
-        let Some(latest) = self.latest_useful_at(sender, global, quality) else {
-            return false;
-        };
-        if state
-            .policy
-            .playout_delay
-            .unwrap_or(PlayoutDelay::ZERO)
-            .max()
-            .is_zero()
-        {
-            return at.global <= latest;
-        }
-        let network = self
-            .envelope
-            .map_or(Duration::from_millis(50), Self::predicted_network_delay);
-        at.global
-            .checked_add(pacer_wait.saturating_add(network))
-            .is_some_and(|arrival| arrival <= latest)
+        self.senders[sender].assignment.is_some_and(|assignment| {
+            let network = self.envelope.map_or(Duration::ZERO, |envelope| {
+                envelope
+                    .queue_delay
+                    .saturating_add(envelope.smoothed_rtt / 2)
+            });
+            pacer_wait <= assignment.delivery.max_queue_residence
+                && self
+                    .latest_useful_at(sender, global)
+                    .is_some_and(|deadline| {
+                        at.global
+                            .checked_add(pacer_wait.saturating_add(network))
+                            .is_some_and(|arrival| arrival <= deadline)
+                    })
+        })
     }
 
-    fn latest_useful_at(
-        &self,
-        sender: usize,
-        global: GlobalMediaTime,
-        quality: ClockQuality,
-    ) -> Option<GlobalMediaTime> {
-        let state = &self.senders[sender];
-        let delay = state.policy.playout_delay.unwrap_or(PlayoutDelay::ZERO);
-        if delay.max().is_zero() {
-            let age_limit = match state.facts.kind {
-                MediaKind::Audio => Duration::from_millis(100),
-                MediaKind::Video => Duration::from_millis(150),
-            };
-            return Some(
-                global
-                    .checked_add(age_limit)
-                    .unwrap_or(GlobalMediaTime::from_micros(u64::MAX)),
-            );
-        }
-        let processing = match state.facts.kind {
-            MediaKind::Audio => Duration::from_millis(10),
-            MediaKind::Video => Duration::from_millis(25),
-        };
-        global
-            .checked_add(delay.max())
-            .and_then(|value| value.checked_sub(processing.saturating_add(quality.uncertainty())))
+    fn latest_useful_at(&self, sender: usize, global: GlobalMediaTime) -> Option<GlobalMediaTime> {
+        let assignment = self.senders[sender].assignment?;
+        Some(
+            global
+                .checked_add(assignment.delivery.max_media_age)
+                .unwrap_or(GlobalMediaTime::from_micros(u64::MAX)),
+        )
     }
 
     fn expire(&mut self, at: TimePoint, limit: usize) {
@@ -1688,10 +1670,9 @@ impl MediaEgress {
         while work < limit {
             let Some((index, sender, frame, started)) =
                 self.queue.iter().enumerate().find_map(|(index, queued)| {
-                    (!self.useful_at(
+                    (self.senders[queued.sender].assignment.is_none_or(|assignment| at.monotonic.saturating_duration_since(queued.queued_at) > assignment.delivery.max_queue_residence) || !self.useful_at(
                         queued.sender,
                         queued.media.packet.global_media_at(),
-                        queued.media.packet.clock_quality(),
                         at,
                         Duration::ZERO,
                     ) || (!self.senders[queued.sender].dependency_chain_valid
@@ -1774,7 +1755,7 @@ impl MediaEgress {
 
     fn potential_bitrate(&self) -> u64 {
         self.senders.iter().fold(0_u64, |total, sender| {
-            total.saturating_add(sender.demand().potential().as_bps())
+            total.saturating_add(sender.potential_bitrate())
         })
     }
 
@@ -1793,7 +1774,6 @@ impl MediaEgress {
         timestamp: u32,
         packet: &[u8],
         global: GlobalMediaTime,
-        clock_quality: ClockQuality,
         at: Instant,
         wire_len: usize,
     ) {
@@ -1828,22 +1808,27 @@ impl MediaEgress {
             retained_at: at,
             last_repair_at: None,
             global,
-            clock_quality,
             transport_bytes: wire_len,
         });
         self.retained_bytes = self.retained_bytes.saturating_add(wire_len);
     }
 
     fn expire_repair(&mut self, now: Instant) {
-        while self.retained.front().is_some_and(|packet| {
-            now.saturating_duration_since(packet.retained_at) >= Duration::from_secs(2)
-        }) {
-            if let Some(packet) = self.retained.pop_front() {
-                self.retained_bytes = self.retained_bytes.saturating_sub(packet.transport_bytes);
-                self.repair_requests
-                    .retain(|request| *request != (packet.sender, packet.sequence));
+        let senders = &self.senders;
+        let requests = &mut self.repair_requests;
+        let mut removed_bytes = 0usize;
+        self.retained.retain(|packet| {
+            let keep = senders[packet.sender].assignment.is_some_and(|assignment| {
+                now.saturating_duration_since(packet.retained_at)
+                    < assignment.delivery.repair_window
+            });
+            if !keep {
+                removed_bytes = removed_bytes.saturating_add(packet.transport_bytes);
+                requests.retain(|request| *request != (packet.sender, packet.sequence));
             }
-        }
+            keep
+        });
+        self.retained_bytes = self.retained_bytes.saturating_sub(removed_bytes);
     }
 
     fn repair_due(&self, retained: &RetainedPacket, now: Instant) -> bool {
@@ -1856,29 +1841,13 @@ impl MediaEgress {
     }
 
     fn repair_useful_at(&self, retained: &RetainedPacket, at: TimePoint) -> bool {
-        if self.senders[retained.sender].policy.playout_delay.is_some() {
-            return self.useful_at(
-                retained.sender,
-                retained.global,
-                retained.clock_quality,
-                at,
-                Duration::ZERO,
-            );
-        }
-        let rtt = self
-            .envelope
-            .map_or(Duration::from_millis(50), |envelope| envelope.smoothed_rtt);
-        let history_window = rtt
-            .saturating_mul(3)
-            .max(Duration::from_secs(1))
-            .min(Duration::from_secs(2));
-        let network = self
-            .envelope
-            .map_or(Duration::from_millis(50), Self::predicted_network_delay);
-        at.monotonic
-            .saturating_duration_since(retained.retained_at)
-            .saturating_add(network)
-            < history_window
+        self.senders[retained.sender]
+            .assignment
+            .is_some_and(|assignment| {
+                at.monotonic.saturating_duration_since(retained.retained_at)
+                    < assignment.delivery.repair_window
+                    && self.useful_at(retained.sender, retained.global, at, Duration::ZERO)
+            })
     }
 
     fn prepare_repair(
@@ -2114,14 +2083,14 @@ impl MediaEgress {
             && self
                 .senders
                 .iter()
-                .all(|sender| sender.demand().selected().as_bps() == 0)
+                .all(|sender| sender.selected_bitrate() == 0)
     }
 
     fn discovery_followup_permitted(&self, at: Instant) -> bool {
         self.probe_followup
             && self.probe_candidate().is_some_and(|sender| {
                 self.initial_probing(at)
-                    || (self.senders[sender].demand().selected().as_bps() == 0
+                    || (self.senders[sender].selected_bitrate() == 0
                         && self.senders[sender].latest_committed_global.is_none())
             })
     }
@@ -2204,26 +2173,14 @@ impl MediaEgress {
     }
 
     fn probe_queue_impact_limit(&self) -> Duration {
-        self.senders
-            .iter()
-            .filter(|sender| sender.demand().potential().as_bps() > 0)
-            .map(|sender| {
-                LatencyGovernor::operating_point(
-                    playout_max_ticks(sender.policy),
-                    sender.demand().potential().as_bps(),
-                )
-                .probe_queue_impact
-            })
-            .min()
-            .unwrap_or(Duration::from_millis(10))
-            .min(Duration::from_millis(10))
+        Duration::from_millis(10)
     }
 
     fn padding_allowed(&self, sender: usize) -> bool {
         let sender = &self.senders[sender];
         // Keep padding out of unfinished frames, including the primary-SSRC
         // fallback where interleaving would look like source-media loss.
-        sender.open_frame.is_none() && sender.demand().potential().as_bps() > 0
+        sender.open_frame.is_none() && sender.potential_bitrate() > 0
     }
 
     fn active_probe_candidate(&self) -> Option<usize> {
@@ -2244,24 +2201,14 @@ impl MediaEgress {
             .filter(|(index, _)| self.padding_allowed(*index))
             .max_by_key(|(_, sender)| {
                 sender
-                    .demand()
-                    .potential()
-                    .as_bps()
-                    .saturating_sub(sender.demand().selected().as_bps())
+                    .potential_bitrate()
+                    .saturating_sub(sender.selected_bitrate())
             })
             .map(|(index, _)| index)
     }
 
     fn probe_budget_bitrate(&self) -> u64 {
-        self.senders.iter().fold(0_u64, |total, sender| {
-            total.saturating_add(
-                LatencyGovernor::operating_point(
-                    playout_max_ticks(sender.policy),
-                    sender.demand().potential().as_bps(),
-                )
-                .probe_budget_rate,
-            )
-        })
+        self.potential_bitrate()
     }
 
     fn probe_target_rate(&self, credible_media_rate: u64) -> u64 {
@@ -2274,9 +2221,9 @@ impl MediaEgress {
     }
 
     fn has_established_media_service(&self) -> bool {
-        self.senders.iter().any(|sender| {
-            sender.latest_committed_global.is_some() && sender.demand().selected().as_bps() > 0
-        })
+        self.senders
+            .iter()
+            .any(|sender| sender.latest_committed_global.is_some() && sender.selected_bitrate() > 0)
     }
 
     fn probe_duration(&self) -> Duration {
@@ -2308,35 +2255,10 @@ impl MediaEgress {
         );
         let wait = self.predicted_pacer_wait(now).saturating_add(service);
         self.senders.iter().all(|sender| {
-            let horizon =
-                if sender.policy.playout_delay.is_none() && sender.facts.kind == MediaKind::Video {
-                    DEFAULT_PROBE_PACER_HORIZON
-                } else {
-                    LatencyGovernor::operating_point(
-                        playout_max_ticks(sender.policy),
-                        sender.demand().selected().as_bps(),
-                    )
-                    .pacer_horizon
-                };
-            sender.demand().selected().as_bps() == 0 || wait <= horizon
-        })
-    }
-
-    fn predicted_network_delay(envelope: SafeRtpEnvelope) -> Duration {
-        envelope.smoothed_rtt / 2 + envelope.queue_delay + Duration::from_millis(5)
-    }
-
-    fn delay_blocks_media(&self, envelope: SafeRtpEnvelope) -> bool {
-        self.senders.iter().enumerate().any(|(index, sender)| {
-            let delay = sender.policy.playout_delay.unwrap_or(PlayoutDelay::ZERO);
-            let processing = match sender.facts.kind {
-                MediaKind::Audio => Duration::from_millis(10),
-                MediaKind::Video => Duration::from_millis(25),
-            };
-            self.padding_allowed(index)
-                && sender.demand().selected().as_bps() > 0
-                && !delay.max().is_zero()
-                && Self::predicted_network_delay(envelope).saturating_add(processing) > delay.max()
+            sender.assignment.is_none_or(|assignment| {
+                assignment.selected_bitrate.as_bps() == 0
+                    || wait <= assignment.delivery.max_queue_residence
+            })
         })
     }
 
@@ -2344,7 +2266,16 @@ impl MediaEgress {
         self.path_available
             && (envelope.feedback_stale
                 || self.feedback_recovery == FeedbackRecovery::Followup
-                || self.delay_blocks_media(envelope))
+                || self.senders.iter().enumerate().any(|(index, sender)| {
+                    self.padding_allowed(index)
+                        && sender.assignment.is_some_and(|assignment| {
+                            assignment.selected_bitrate.as_bps() > 0
+                                && envelope
+                                    .queue_delay
+                                    .saturating_add(envelope.smoothed_rtt / 2)
+                                    > assignment.delivery.max_media_age
+                        })
+                }))
             && self.potential_bitrate() > 0
             && self.queued_transport_bytes == 0
             && self.rtp_bytes_in_flight == 0
@@ -2411,7 +2342,7 @@ impl MediaEgress {
         self.probe_pacing_rate = if self.probe_remaining == 1 {
             0
         } else {
-            let bootstrap_sample = if self.senders[sender_index].demand().selected().as_bps() == 0
+            let bootstrap_sample = if self.senders[sender_index].selected_bitrate() == 0
                 && (self.senders[sender_index].latest_committed_global.is_none()
                     || self.initial_probing(at.monotonic))
             {
@@ -2427,11 +2358,11 @@ impl MediaEgress {
             };
             let idle_sample = if !self.initial_probing(at.monotonic)
                 && (envelope.application_limited
-                    || self.senders[sender_index].demand().selected().as_bps() == 0)
+                    || self.senders[sender_index].selected_bitrate() == 0)
             {
                 // A successful small cluster can still leave the native
                 // observed-flight growth bound below its reference window.
-                let headroom = if self.senders[sender_index].demand().selected().as_bps() == 0
+                let headroom = if self.senders[sender_index].selected_bitrate() == 0
                     && self.senders[sender_index].latest_committed_global.is_none()
                     && !self.has_established_media_service()
                 {
@@ -2499,7 +2430,7 @@ impl MediaEgress {
         };
         self.probe_sender = Some(sender_index);
         let sender = &self.senders[sender_index];
-        if sender.demand().potential().as_bps() == 0 {
+        if sender.potential_bitrate() == 0 {
             self.finish_probe(at.monotonic, true);
             return PrepareResult::Blocked;
         }
@@ -2610,18 +2541,6 @@ fn probe_padding(recovery: bool, pacing_rate: u64, overhead: usize) -> Vec<u8> {
     let mut padding = vec![0; usize::from(count)];
     padding[usize::from(count) - 1] = count;
     padding
-}
-
-fn playout_max_ticks(policy: SenderPolicy) -> u16 {
-    u16::try_from(
-        policy
-            .playout_delay
-            .unwrap_or(PlayoutDelay::ZERO)
-            .max()
-            .as_millis()
-            / 10,
-    )
-    .unwrap_or(u16::MAX)
 }
 
 fn mapped_timestamp(sender: &Sender, global: GlobalMediaTime) -> Option<u32> {
@@ -2856,12 +2775,63 @@ mod tests {
     use super::*;
     use crate::{FrameMetadata, MediaPacket, PlayoutDelay};
 
-    fn playout_owner(now: Instant, extension: Option<u8>) -> MediaEgress {
-        let policy = SenderPolicy {
-            playout_delay: Some(PlayoutDelay::from_millis(149, 204).expect("explicit bounds")),
-            desired_bitrate: MediaPayloadBitrate::from_bps(256_000),
+    fn current_assignment(owner: &MediaEgress, sender: SenderId) -> SenderAssignment {
+        owner
+            .senders
+            .iter()
+            .find(|state| state.facts.id == sender)
+            .expect("sender")
+            .assignment
+            .expect("explicit assignment")
+    }
+
+    fn bound_egress(
+        facts: Box<[EgressSenderFacts]>,
+        randomness: &[u8; 32],
+        max_payload_bytes: usize,
+        max_retransmission_bytes: usize,
+        audio: SenderAssignment,
+        video: SenderAssignment,
+        now: Instant,
+    ) -> MediaEgress {
+        let assignments = facts
+            .iter()
+            .map(|facts| {
+                (
+                    facts.id,
+                    match facts.kind {
+                        MediaKind::Audio => audio,
+                        MediaKind::Video => video,
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut owner = MediaEgress::new(
+            facts,
+            randomness,
+            max_payload_bytes,
+            max_retransmission_bytes,
+            now,
+        );
+        let at = TimePoint {
+            monotonic: now,
+            global: GlobalMediaTime::from_micros(1_000_000),
         };
-        MediaEgress::new(
+        for (sender, assignment) in assignments {
+            owner
+                .set_assignment(sender, Some(assignment), at, false)
+                .expect("explicit test assignment");
+        }
+        owner.budget_changed = None;
+        owner
+    }
+
+    fn playout_owner(now: Instant, extension: Option<u8>) -> MediaEgress {
+        let policy = pulsebeam_rtc::SenderAssignment {
+            playout_delay: Some(PlayoutDelay::from_millis(149, 204).expect("explicit bounds")),
+            ..crate::test_support::sender_assignment(MediaPayloadBitrate::from_bps(256_000))
+        };
+        bound_egress(
             (1..=2)
                 .map(|id| EgressSenderFacts {
                     id: SenderId::new(id).expect("sender"),
@@ -3022,9 +2992,9 @@ mod tests {
         let mut bytes = vec![0x80, 111, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7, 1, 2, 3];
         bytes[2..4].copy_from_slice(&sequence.to_be_bytes());
         ForwardedMedia {
+            source: pulsebeam_rtc::SourceIncarnation::from_value(1),
             packet: MediaPacket::new(bytes.into(), at.global, Arc::from([])),
             frame: FrameMetadata {
-                decode_target_mask: None,
                 id: FrameId::from_value(id),
                 boundary,
                 random_access: true,
@@ -3209,8 +3179,11 @@ mod tests {
                 owner.senders[0].facts.retransmission_payload_type = None;
             }
             owner.senders[0].primary_feedback_observed = true;
-            owner.senders[0].policy.playout_delay =
-                Some(PlayoutDelay::from_millis(10, 100).unwrap());
+            owner.senders[0]
+                .assignment
+                .as_mut()
+                .expect("bound sender")
+                .playout_delay = Some(PlayoutDelay::from_millis(10, 100).unwrap());
             let sender = &owner.senders[0];
             let primary_before = sender.next_sequence;
             let rtx_before = sender.next_rtx_sequence;
@@ -3300,17 +3273,43 @@ mod tests {
     }
 
     #[test]
-    fn default_audio_probes_reserve_the_ordinary_media_horizon() {
+    fn probes_reserve_the_explicit_queue_horizon_without_clearing_debt() {
         let now = Instant::now();
         let mut owner = playout_owner(now, None);
         for sender in &mut owner.senders {
-            sender.policy.playout_delay = None;
-            sender.policy.desired_bitrate = MediaPayloadBitrate::from_bps(1_000_000);
+            sender
+                .assignment
+                .as_mut()
+                .expect("bound sender")
+                .playout_delay = None;
+            sender
+                .assignment
+                .as_mut()
+                .expect("bound sender")
+                .selected_bitrate = MediaPayloadBitrate::from_bps(1_000_000);
+            sender
+                .assignment
+                .as_mut()
+                .expect("bound sender")
+                .potential_bitrate = MediaPayloadBitrate::from_bps(1_000_000);
+        }
+        for sender in &mut owner.senders {
+            sender
+                .assignment
+                .as_mut()
+                .unwrap()
+                .delivery
+                .max_queue_residence = Duration::from_millis(15);
         }
         owner.pacer.commit(now, 1_000, 400_000);
         assert!(!owner.probe_fits_selected_horizon(now, 300, 400_000));
         for sender in &mut owner.senders {
-            sender.facts.kind = MediaKind::Video;
+            sender
+                .assignment
+                .as_mut()
+                .unwrap()
+                .delivery
+                .max_queue_residence = Duration::from_millis(80);
         }
         assert!(owner.probe_fits_selected_horizon(now, 300, 400_000));
         assert_eq!(owner.pacer.charged_bytes(), 1_000);
@@ -3425,16 +3424,7 @@ mod tests {
             media.extension("urn:ietf:params:rtp-hdrext:sdes:mid"),
             Some(&b"source-mid"[..])
         );
-        owner.retain_original(
-            0,
-            17,
-            19,
-            &original,
-            global,
-            ClockQuality::Synchronized,
-            now,
-            original.len() + 16,
-        );
+        owner.retain_original(0, 17, 19, &original, global, now, original.len() + 16);
         let retained = owner.retained.front().expect("retained original");
         assert_eq!(retained.packet, original);
         assert_eq!(owner.retained_bytes, original.len() + 16);
@@ -3497,103 +3487,84 @@ mod tests {
     }
 
     #[test]
-    fn default_decoder_repairs_do_not_extend_fresh_body_expiry_or_explicit_zero() {
+    fn media_age_and_repair_window_are_independent_of_wire_playout() {
         let now = Instant::now();
         let at = TimePoint {
             monotonic: now,
             global: GlobalMediaTime::from_micros(1_000_000),
         };
-        let mut owner = playout_owner(now, None);
-        owner.senders[0].facts.kind = MediaKind::Video;
-        owner.senders[0].policy.playout_delay = None;
-        let packet = queued_media(at, 1, FrameBoundary::Complete).packet;
-        owner.retain_original(
-            0,
-            7,
-            19,
-            packet.bytes(),
-            at.global,
-            ClockQuality::Synchronized,
-            now,
-            40,
-        );
-        let late = TimePoint {
-            monotonic: now + Duration::from_millis(200),
-            global: at.global.checked_add(Duration::from_millis(200)).unwrap(),
-        };
-        assert!(!owner.useful_at(
-            0,
-            at.global,
-            ClockQuality::Synchronized,
-            late,
-            Duration::ZERO
-        ));
-        assert!(owner.repair_useful_at(&owner.retained[0], late));
-        assert!(
-            owner.repair_due(&owner.retained[0], late.monotonic),
-            "first NACK is not held for an RTT"
-        );
-        owner.retained[0].last_repair_at = Some(late.monotonic);
-        assert!(!owner.repair_due(
-            &owner.retained[0],
-            late.monotonic + Duration::from_millis(49)
-        ));
-        assert!(owner.repair_due(
-            &owner.retained[0],
-            late.monotonic + Duration::from_millis(50)
-        ));
-        owner.senders[0].policy.playout_delay = Some(PlayoutDelay::ZERO);
-        assert!(!owner.repair_useful_at(&owner.retained[0], late));
-        owner.senders[0].policy.playout_delay = None;
-        let deadline = TimePoint {
-            monotonic: now + Duration::from_millis(950),
-            global: at.global.checked_add(Duration::from_millis(950)).unwrap(),
-        };
-        assert!(
-            !owner.repair_useful_at(&owner.retained[0], deadline),
-            "default 1s history reserves predicted network service"
-        );
-        owner.expire_repair(now + Duration::from_secs(2));
-        assert!(owner.retained.is_empty());
+        for playout in [
+            None,
+            Some(PlayoutDelay::ZERO),
+            Some(PlayoutDelay::from_millis(0, 500).unwrap()),
+        ] {
+            let mut owner = playout_owner(now, None);
+            let assignment = owner.senders[0].assignment.as_mut().unwrap();
+            assignment.playout_delay = playout;
+            assignment.delivery.max_media_age = Duration::from_secs(1);
+            assignment.delivery.repair_window = Duration::from_millis(500);
+            let packet = queued_media(at, 1, FrameBoundary::Complete).packet;
+            owner.retain_original(0, 7, 19, packet.bytes(), at.global, now, 40);
+            let late = TimePoint {
+                monotonic: now + Duration::from_millis(250),
+                global: at.global.checked_add(Duration::from_millis(250)).unwrap(),
+            };
+            assert!(owner.useful_at(0, at.global, late, Duration::ZERO));
+            assert!(owner.repair_useful_at(&owner.retained[0], late));
+            assert!(owner.repair_due(&owner.retained[0], late.monotonic));
+            owner.retained[0].last_repair_at = Some(late.monotonic);
+            assert!(!owner.repair_due(
+                &owner.retained[0],
+                late.monotonic + Duration::from_millis(49)
+            ));
+            assert!(owner.repair_due(
+                &owner.retained[0],
+                late.monotonic + Duration::from_millis(50)
+            ));
+            let deadline = TimePoint {
+                monotonic: now + Duration::from_millis(500),
+                global: at.global.checked_add(Duration::from_millis(500)).unwrap(),
+            };
+            assert!(owner.useful_at(0, at.global, deadline, Duration::ZERO));
+            assert!(!owner.repair_useful_at(&owner.retained[0], deadline));
+            owner.senders[0]
+                .assignment
+                .as_mut()
+                .unwrap()
+                .delivery
+                .max_media_age = Duration::from_millis(150);
+            assert!(!owner.useful_at(0, at.global, late, Duration::ZERO));
+            assert!(!owner.repair_useful_at(&owner.retained[0], late));
+            owner.expire_repair(deadline.monotonic);
+            assert!(owner.retained.is_empty());
+        }
     }
 
     #[test]
-    fn default_decoder_repair_history_stays_capped_on_long_rtt_paths() {
+    fn caller_repair_window_is_not_extended_by_long_rtt() {
         let now = Instant::now();
         let at = TimePoint {
             monotonic: now,
             global: GlobalMediaTime::from_micros(1_000_000),
         };
         let mut owner = playout_owner(now, None);
-        owner.senders[0].facts.kind = MediaKind::Video;
-        owner.senders[0].policy.playout_delay = None;
+        let assignment = owner.senders[0].assignment.as_mut().unwrap();
+        assignment.delivery.max_media_age = Duration::from_secs(3);
+        assignment.delivery.repair_window = Duration::from_secs(2);
         owner.update_controller(at, Some((1, true)), &[], &[], Duration::ZERO, false, 0);
         owner.envelope.as_mut().unwrap().smoothed_rtt = Duration::from_millis(900);
         let packet = queued_media(at, 1, FrameBoundary::Complete).packet;
-        owner.retain_original(
-            0,
-            7,
-            19,
-            packet.bytes(),
-            at.global,
-            ClockQuality::Synchronized,
-            now,
-            40,
-        );
-        for (age, expected) in [(1_500, true), (1_600, false), (2_000, false)] {
+        owner.retain_original(0, 7, 19, packet.bytes(), at.global, now, 40);
+        for (age, expected) in [(1500, true), (1999, true), (2000, false)] {
             let time = TimePoint {
                 monotonic: now + Duration::from_millis(age),
                 global: at.global.checked_add(Duration::from_millis(age)).unwrap(),
             };
             assert_eq!(owner.repair_useful_at(&owner.retained[0], time), expected);
-            assert!(!owner.useful_at(
-                0,
-                at.global,
-                ClockQuality::Synchronized,
-                time,
-                Duration::ZERO
-            ));
+            assert!(owner.useful_at(0, at.global, time, Duration::ZERO));
         }
+        owner.expire_repair(now + Duration::from_secs(2));
+        assert!(owner.retained.is_empty());
     }
 
     #[test]
@@ -3618,7 +3589,6 @@ mod tests {
                 7,
                 packet.bytes(),
                 packet.global_media_at(),
-                ClockQuality::Synchronized,
                 now,
                 wire_len,
             );
@@ -3680,7 +3650,16 @@ mod tests {
     fn transport_budget_does_not_redistribute_caller_targets() {
         let now = Instant::now();
         let mut owner = playout_owner(now, None);
-        let targets = [owner.senders[0].demand(), owner.senders[1].demand()];
+        let targets = [
+            {
+                let assignment = current_assignment(&owner, owner.senders[0].facts.id);
+                (assignment.selected_bitrate, assignment.potential_bitrate)
+            },
+            {
+                let assignment = current_assignment(&owner, owner.senders[1].facts.id);
+                (assignment.selected_bitrate, assignment.potential_bitrate)
+            },
+        ];
         for budget in [512_000, 1_000_000, 50_000] {
             owner.update_media_budget(budget);
             assert_eq!(owner.media_budget, budget);
@@ -3689,23 +3668,58 @@ mod tests {
                     .stats()
                     .1
                     .iter()
-                    .map(|sender| sender.demand)
+                    .map(|sender| {
+                        let assignment = sender.assignment.expect("bound sender");
+                        (assignment.selected_bitrate, assignment.potential_bitrate)
+                    })
                     .collect::<Vec<_>>(),
                 targets
             );
         }
-        owner.senders[0].policy.playout_delay = Some(PlayoutDelay::ZERO);
-        assert_eq!(owner.senders[0].demand(), targets[0]);
-        assert_eq!(owner.senders[1].demand(), targets[1]);
+        owner.senders[0]
+            .assignment
+            .as_mut()
+            .expect("bound sender")
+            .playout_delay = Some(PlayoutDelay::ZERO);
+        assert_eq!(
+            {
+                let assignment = current_assignment(&owner, owner.senders[0].facts.id);
+                (assignment.selected_bitrate, assignment.potential_bitrate)
+            },
+            targets[0]
+        );
+        assert_eq!(
+            {
+                let assignment = current_assignment(&owner, owner.senders[1].facts.id);
+                (assignment.selected_bitrate, assignment.potential_bitrate)
+            },
+            targets[1]
+        );
     }
 
     #[test]
     fn probe_candidate_uses_actual_unmet_source_interest_not_probe_size_scale() {
         let mut owner = playout_owner(Instant::now(), None);
-        owner.senders[0].policy.playout_delay = Some(PlayoutDelay::ZERO);
-        owner.senders[1].policy.playout_delay = Some(PlayoutDelay::from_millis(0, 500).unwrap());
-        owner.senders[0].potential_bitrate = Some(MediaPayloadBitrate::from_bps(300_000));
-        owner.senders[1].potential_bitrate = Some(MediaPayloadBitrate::from_bps(290_000));
+        owner.senders[0]
+            .assignment
+            .as_mut()
+            .expect("bound sender")
+            .playout_delay = Some(PlayoutDelay::ZERO);
+        owner.senders[1]
+            .assignment
+            .as_mut()
+            .expect("bound sender")
+            .playout_delay = Some(PlayoutDelay::from_millis(0, 500).unwrap());
+        owner.senders[0]
+            .assignment
+            .as_mut()
+            .expect("bound sender")
+            .potential_bitrate = MediaPayloadBitrate::from_bps(300_000);
+        owner.senders[1]
+            .assignment
+            .as_mut()
+            .expect("bound sender")
+            .potential_bitrate = MediaPayloadBitrate::from_bps(290_000);
         assert_eq!(owner.probe_candidate(), Some(0));
     }
 
@@ -3740,16 +3754,7 @@ mod tests {
             .admit(at, b, queued_media(at, 2, FrameBoundary::Complete))
             .expect("queue sibling");
         let bytes = queued_media(at, 3, FrameBoundary::Complete).packet;
-        owner.retain_original(
-            0,
-            17,
-            19,
-            bytes.bytes(),
-            at.global,
-            ClockQuality::Synchronized,
-            now,
-            40,
-        );
+        owner.retain_original(0, 17, 19, bytes.bytes(), at.global, now, 40);
         owner.request_repair(owner.senders[0].ssrc, 17);
         owner.senders[0].latest_committed_global = Some(at.global);
         owner.senders[0]
@@ -3757,7 +3762,7 @@ mod tests {
             .insert(FrameId::from_value(1));
         let payload_debt = owner.senders[0].admission.debt;
         owner
-            .recover_sender_media(a)
+            .clear_sender_media(a, true)
             .expect("recover same publication");
         assert_eq!(owner.queue.len(), 1);
         assert_eq!(owner.queue[0].sender, 1);
@@ -3774,7 +3779,9 @@ mod tests {
         assert_eq!(owner.retained[0].sequence, 17);
         assert_eq!(owner.retained_bytes, 40);
         assert_eq!(owner.repair_requests, VecDeque::from([(0, 17)]));
-        owner.discard_sender_media(a).expect("replace publication");
+        owner
+            .clear_sender_media(a, false)
+            .expect("replace publication");
         assert!(owner.retained.is_empty());
         assert_eq!(owner.retained_bytes, 0);
         assert!(owner.repair_requests.is_empty());
@@ -3801,16 +3808,7 @@ mod tests {
             .expect("queue sibling");
         let bytes = queued_media(at, 3, FrameBoundary::Complete).packet;
         for index in 0..2 {
-            owner.retain_original(
-                index,
-                17,
-                19,
-                bytes.bytes(),
-                at.global,
-                ClockQuality::Synchronized,
-                now,
-                40,
-            );
+            owner.retain_original(index, 17, 19, bytes.bytes(), at.global, now, 40);
             owner.request_repair(owner.senders[index].ssrc, 17);
         }
         owner.senders[0]
@@ -3842,7 +3840,7 @@ mod tests {
             owner.next_twcc,
         );
         let sibling_bytes = owner.queue[1].transport_estimate;
-        owner.discard_sender_media(a).expect("discard");
+        owner.clear_sender_media(a, false).expect("discard");
         assert_eq!(owner.queue.len(), 1);
         assert_eq!(owner.queue[0].sender, 1);
         assert_eq!(owner.queued_payload_bytes, 3);
@@ -3923,15 +3921,19 @@ mod tests {
         };
         let mut owner = playout_owner(now, None);
         let sender = owner.senders[0].facts.id;
-        owner.senders[0].policy.playout_delay = Some(PlayoutDelay::from_millis(0, 500).unwrap());
-        let horizon = LatencyGovernor::operating_point(
-            playout_max_ticks(owner.senders[0].policy),
-            owner.senders[0].policy.desired_bitrate.as_bps(),
-        )
-        .pacer_horizon;
+        owner.senders[0]
+            .assignment
+            .as_mut()
+            .expect("bound sender")
+            .playout_delay = Some(PlayoutDelay::from_millis(0, 500).unwrap());
+        let horizon = owner.senders[0]
+            .assignment
+            .expect("bound sender")
+            .delivery
+            .max_queue_residence;
         let initial_debt = horizon
             .as_nanos()
-            .saturating_mul(u128::from(owner.senders[0].demand().selected().as_bps()));
+            .saturating_mul(u128::from(owner.senders[0].selected_bitrate()));
         owner.senders[0].admission.debt = initial_debt;
         let mut payload_bytes = 0;
         for (sequence, boundary) in [
@@ -4062,7 +4064,7 @@ mod tests {
                 sequence.wrapping_add(1)
             );
             owner
-                .discard_sender_media(sender)
+                .clear_sender_media(sender, false)
                 .expect("explicit recovery");
             assert_eq!(
                 owner.admit(at, sender, end),
@@ -4089,7 +4091,7 @@ mod tests {
             "admission is not transmission"
         );
         owner
-            .discard_sender_media(sender)
+            .clear_sender_media(sender, false)
             .expect("discard unprepared audio");
         assert!(owner.senders[0].audio_talkspurt_pending);
         owner
@@ -4127,7 +4129,7 @@ mod tests {
             descriptor: None,
         });
         assert_eq!(
-            owner.discard_sender_media(sender),
+            owner.clear_sender_media(sender, false),
             Err(CommandError::InvalidState)
         );
         assert!(
@@ -4149,7 +4151,7 @@ mod tests {
         owner.commit(at, &prepared);
         assert!(!owner.senders[0].audio_talkspurt_pending);
         owner
-            .discard_sender_media(sender)
+            .clear_sender_media(sender, false)
             .expect("discard after commit");
         assert!(owner.senders[0].audio_talkspurt_pending);
         assert!(
@@ -4169,7 +4171,11 @@ mod tests {
             let mut owner = playout_owner(now, None);
             owner.senders[0].facts.kind = MediaKind::Video;
             for sender in &mut owner.senders {
-                sender.policy.playout_delay = Some(PlayoutDelay::from_millis(0, 1_000).unwrap());
+                sender
+                    .assignment
+                    .as_mut()
+                    .expect("bound sender")
+                    .playout_delay = Some(PlayoutDelay::from_millis(0, 1_000).unwrap());
             }
             while owner.poll_event().is_some() {}
             let video = owner.senders[0].facts.id;
@@ -4248,7 +4254,7 @@ mod tests {
         owner
             .admit(at, id, queued_media(at, 1, FrameBoundary::Start))
             .expect("start");
-        owner.discard_sender_media(id).expect("discard");
+        owner.clear_sender_media(id, false).expect("discard");
         let mut dependent = queued_media(at, 2, FrameBoundary::Complete);
         dependent.frame.random_access = false;
         dependent.frame.dependencies =
@@ -4291,7 +4297,7 @@ mod tests {
             descriptor: None,
         });
         assert!(matches!(
-            owner.discard_sender_media(id),
+            owner.clear_sender_media(id, false),
             Err(CommandError::InvalidState)
         ));
         assert_eq!(owner.queue.len(), 1);
@@ -4335,14 +4341,21 @@ mod tests {
         };
         let mut owner = playout_owner(now, None);
         owner
-            .set_demand(
+            .set_assignment(
                 owner.senders[0].facts.id,
-                SenderDemand::new(
-                    MediaPayloadBitrate::from_bps(0),
-                    MediaPayloadBitrate::from_bps(3_000_000),
-                )
-                .unwrap(),
+                Some({
+                    let (selected_bitrate, potential_bitrate) = (
+                        MediaPayloadBitrate::from_bps(0),
+                        MediaPayloadBitrate::from_bps(3_000_000),
+                    );
+                    pulsebeam_rtc::SenderAssignment {
+                        selected_bitrate,
+                        potential_bitrate,
+                        ..current_assignment(&owner, owner.senders[0].facts.id)
+                    }
+                }),
                 at,
+                false,
             )
             .unwrap();
         owner.update_controller(at, Some((1, true)), &[], &[], Duration::ZERO, false, 0);
@@ -4379,7 +4392,22 @@ mod tests {
         );
         owner.probe_started_at = None;
         owner
-            .set_demand(owner.senders[1].facts.id, SenderDemand::default(), at)
+            .set_assignment(
+                owner.senders[1].facts.id,
+                Some({
+                    let (selected_bitrate, potential_bitrate) = (
+                        pulsebeam_rtc::MediaPayloadBitrate::from_bps(0),
+                        pulsebeam_rtc::MediaPayloadBitrate::from_bps(0),
+                    );
+                    pulsebeam_rtc::SenderAssignment {
+                        selected_bitrate,
+                        potential_bitrate,
+                        ..current_assignment(&owner, owner.senders[1].facts.id)
+                    }
+                }),
+                at,
+                false,
+            )
             .unwrap();
         assert_eq!(owner.probe_candidate(), None);
         assert_eq!(owner.next_deadline(), None);
@@ -4412,14 +4440,24 @@ mod tests {
             Some(PlayoutDelay::from_millis(149, 204).unwrap()),
         ] {
             let mut owner = playout_owner(now, None);
-            owner.senders[0].policy.playout_delay = delay;
-            owner.senders[0].admission.debt = LatencyGovernor::operating_point(
-                playout_max_ticks(owner.senders[0].policy),
-                owner.senders[0].demand().selected().as_bps(),
-            )
-            .pacer_horizon
-            .as_nanos()
-                * u128::from(owner.senders[0].demand().selected().as_bps());
+            owner.senders[0]
+                .assignment
+                .as_mut()
+                .unwrap()
+                .delivery
+                .max_media_age = Duration::from_millis(100);
+            owner.senders[0]
+                .assignment
+                .as_mut()
+                .expect("bound sender")
+                .playout_delay = delay;
+            owner.senders[0].admission.debt = owner.senders[0]
+                .assignment
+                .expect("bound sender")
+                .delivery
+                .max_queue_residence
+                .as_nanos()
+                * u128::from(owner.senders[0].selected_bitrate());
             let sender = owner.senders[0].facts.id;
             assert_eq!(
                 owner.admit(at, sender, queued_media(at, 1, FrameBoundary::Complete)),
@@ -4462,14 +4500,21 @@ mod tests {
         let ids = [owner.senders[0].facts.id, owner.senders[1].facts.id];
         for (sender, potential) in ids.into_iter().zip([3_000_000, 1_000_000]) {
             owner
-                .set_demand(
+                .set_assignment(
                     sender,
-                    SenderDemand::new(
-                        MediaPayloadBitrate::from_bps(0),
-                        MediaPayloadBitrate::from_bps(potential),
-                    )
-                    .expect("potential-only demand"),
+                    Some({
+                        let (selected_bitrate, potential_bitrate) = (
+                            MediaPayloadBitrate::from_bps(0),
+                            MediaPayloadBitrate::from_bps(potential),
+                        );
+                        pulsebeam_rtc::SenderAssignment {
+                            selected_bitrate,
+                            potential_bitrate,
+                            ..current_assignment(&owner, sender)
+                        }
+                    }),
                     at,
+                    false,
                 )
                 .expect("declare demand");
         }
@@ -4477,9 +4522,16 @@ mod tests {
             owner
                 .senders
                 .iter()
-                .all(|sender| sender.demand().selected().as_bps() == 0)
+                .all(|sender| sender.selected_bitrate() == 0)
         );
-        assert_eq!(owner.stats().1[0].demand.potential().as_bps(), 3_000_000);
+        assert_eq!(
+            owner.stats().1[0]
+                .assignment
+                .expect("bound sender")
+                .potential_bitrate
+                .as_bps(),
+            3_000_000
+        );
         assert_eq!(owner.probe_candidate(), Some(0));
         owner.update_controller(at, Some((1, true)), &[], &[], Duration::ZERO, false, 0);
         let active = owner.test_envelope().expect("active envelope");
@@ -4503,7 +4555,22 @@ mod tests {
         );
         for sender in ids {
             owner
-                .set_demand(sender, SenderDemand::default(), at)
+                .set_assignment(
+                    sender,
+                    Some({
+                        let (selected_bitrate, potential_bitrate) = (
+                            pulsebeam_rtc::MediaPayloadBitrate::from_bps(0),
+                            pulsebeam_rtc::MediaPayloadBitrate::from_bps(0),
+                        );
+                        pulsebeam_rtc::SenderAssignment {
+                            selected_bitrate,
+                            potential_bitrate,
+                            ..current_assignment(&owner, sender)
+                        }
+                    }),
+                    at,
+                    false,
+                )
                 .expect("withdraw demand");
         }
         owner.update_controller(at, None, &[], &[], Duration::ZERO, false, 0);
@@ -4514,14 +4581,21 @@ mod tests {
         assert_eq!(owner.probe_candidate(), None);
         assert_eq!(owner.next_deadline(), None);
         owner
-            .set_demand(
+            .set_assignment(
                 ids[0],
-                SenderDemand::new(
-                    MediaPayloadBitrate::from_bps(0),
-                    MediaPayloadBitrate::from_bps(3_000_000),
-                )
-                .expect("restore potential"),
+                Some({
+                    let (selected_bitrate, potential_bitrate) = (
+                        MediaPayloadBitrate::from_bps(0),
+                        MediaPayloadBitrate::from_bps(3_000_000),
+                    );
+                    pulsebeam_rtc::SenderAssignment {
+                        selected_bitrate,
+                        potential_bitrate,
+                        ..current_assignment(&owner, ids[0])
+                    }
+                }),
                 at,
+                false,
             )
             .expect("restore demand");
         owner.update_controller(at, None, &[], &[], Duration::ZERO, false, 0);
@@ -4533,7 +4607,7 @@ mod tests {
             owner
                 .senders
                 .iter()
-                .all(|sender| sender.demand().selected().as_bps() == 0)
+                .all(|sender| sender.selected_bitrate() == 0)
         );
         assert!(owner.probe_budget_available(now, PROBE_ALLOWANCE));
         assert!(!owner.probe_budget_available(now, PROBE_ALLOWANCE + 1));
@@ -4552,7 +4626,7 @@ mod tests {
             owner
                 .senders
                 .iter()
-                .any(|sender| sender.demand().selected().as_bps() > 0)
+                .any(|sender| sender.selected_bitrate() > 0)
         );
         at.monotonic += Duration::from_millis(1);
         owner.update_controller(at, None, &[], &[], Duration::ZERO, false, 0);
@@ -4580,6 +4654,9 @@ mod tests {
             global: GlobalMediaTime::from_micros(1_000_000),
         };
         let mut owner = playout_owner(now, None);
+        for sender in &mut owner.senders {
+            sender.assignment.as_mut().unwrap().delivery.max_media_age = Duration::from_millis(100);
+        }
         owner.update_controller(at, Some((1, true)), &[], &[], Duration::ZERO, false, 0);
         let mut envelope = owner.test_envelope().unwrap();
         envelope.feedback_stale = false;
@@ -4622,38 +4699,63 @@ mod tests {
         drained.queue_delay = Duration::ZERO;
         assert!(!owner.recovery_permitted(drained));
         for sender in &mut owner.senders {
-            sender.policy.playout_delay = Some(PlayoutDelay::ZERO);
+            sender
+                .assignment
+                .as_mut()
+                .expect("bound sender")
+                .playout_delay = Some(PlayoutDelay::ZERO);
         }
-        assert!(!owner.recovery_permitted(envelope));
+        assert!(owner.recovery_permitted(envelope));
         for sender in &mut owner.senders {
-            sender.policy.playout_delay = None;
+            sender
+                .assignment
+                .as_mut()
+                .expect("bound sender")
+                .playout_delay = None;
         }
-        assert!(!owner.recovery_permitted(envelope));
+        assert!(owner.recovery_permitted(envelope));
         for index in 0..owner.senders.len() {
-            owner.senders[index].policy.playout_delay =
-                Some(PlayoutDelay::from_millis(0, 200).unwrap());
+            owner.senders[index]
+                .assignment
+                .as_mut()
+                .expect("bound sender")
+                .playout_delay = Some(PlayoutDelay::from_millis(0, 200).unwrap());
             owner
-                .set_demand(
+                .set_assignment(
                     owner.senders[index].facts.id,
-                    SenderDemand::new(
-                        MediaPayloadBitrate::from_bps(0),
-                        MediaPayloadBitrate::from_bps(256_000),
-                    )
-                    .unwrap(),
+                    Some({
+                        let (selected_bitrate, potential_bitrate) = (
+                            MediaPayloadBitrate::from_bps(0),
+                            MediaPayloadBitrate::from_bps(256_000),
+                        );
+                        pulsebeam_rtc::SenderAssignment {
+                            selected_bitrate,
+                            potential_bitrate,
+                            ..current_assignment(&owner, owner.senders[index].facts.id)
+                        }
+                    }),
                     due,
+                    false,
                 )
                 .unwrap();
         }
         assert!(!owner.recovery_permitted(envelope));
         owner
-            .set_demand(
+            .set_assignment(
                 owner.senders[1].facts.id,
-                SenderDemand::new(
-                    MediaPayloadBitrate::from_bps(256_000),
-                    MediaPayloadBitrate::from_bps(256_000),
-                )
-                .unwrap(),
+                Some({
+                    let (selected_bitrate, potential_bitrate) = (
+                        MediaPayloadBitrate::from_bps(256_000),
+                        MediaPayloadBitrate::from_bps(256_000),
+                    );
+                    pulsebeam_rtc::SenderAssignment {
+                        selected_bitrate,
+                        potential_bitrate,
+                        ..current_assignment(&owner, owner.senders[1].facts.id)
+                    }
+                }),
                 due,
+                false,
             )
             .unwrap();
         assert!(owner.recovery_permitted(envelope));
@@ -4670,14 +4772,21 @@ mod tests {
             let mut owner = playout_owner(now, None);
             for index in 0..owner.senders.len() {
                 owner
-                    .set_demand(
+                    .set_assignment(
                         owner.senders[index].facts.id,
-                        SenderDemand::new(
-                            MediaPayloadBitrate::from_bps(selected),
-                            MediaPayloadBitrate::from_bps(1_000_000),
-                        )
-                        .unwrap(),
+                        Some({
+                            let (selected_bitrate, potential_bitrate) = (
+                                MediaPayloadBitrate::from_bps(selected),
+                                MediaPayloadBitrate::from_bps(1_000_000),
+                            );
+                            pulsebeam_rtc::SenderAssignment {
+                                selected_bitrate,
+                                potential_bitrate,
+                                ..current_assignment(&owner, owner.senders[index].facts.id)
+                            }
+                        }),
                         at,
+                        false,
                     )
                     .unwrap();
             }
@@ -4700,7 +4809,7 @@ mod tests {
                 owner
                     .senders
                     .iter()
-                    .any(|sender| sender.demand().selected().as_bps() > 0),
+                    .any(|sender| sender.selected_bitrate() > 0),
                 selected > 0
             );
             assert!(owner.recovery_permitted(stale));
@@ -4785,38 +4894,33 @@ mod tests {
     }
 
     #[test]
-    fn policy_changes_preserve_explicit_potential_but_legacy_demand_tracks_selection() {
+    fn complete_assignments_keep_targets_independent_of_wire_playout() {
         let now = Instant::now();
         let at = TimePoint {
             monotonic: now,
             global: GlobalMediaTime::from_micros(1_000_000),
         };
         let mut owner = playout_owner(now, None);
-        let mut policy = owner.senders[0].policy;
-        policy.desired_bitrate = MediaPayloadBitrate::from_bps(0);
         let id = owner.senders[0].facts.id;
-        owner.set_policy(id, policy, at).expect("legacy pause");
-        assert_eq!(owner.senders[0].demand(), SenderDemand::default());
+        let mut assignment = current_assignment(&owner, id);
+        assignment.selected_bitrate = MediaPayloadBitrate::from_bps(0);
+        assignment.potential_bitrate = MediaPayloadBitrate::from_bps(1_000_000);
         owner
-            .set_demand(
-                id,
-                SenderDemand::new(
-                    MediaPayloadBitrate::from_bps(0),
-                    MediaPayloadBitrate::from_bps(1_000_000),
-                )
-                .expect("potential"),
-                at,
-            )
-            .expect("declare potential");
-        policy.playout_delay = Some(PlayoutDelay::from_millis(0, 500).unwrap());
+            .set_assignment(id, Some(assignment), at, false)
+            .unwrap();
+        assignment.playout_delay = Some(PlayoutDelay::from_millis(0, 500).unwrap());
         owner
-            .set_policy(id, policy, at)
-            .expect("wire playout change");
-        assert_eq!(owner.senders[0].demand().potential().as_bps(), 1_000_000);
-        policy.desired_bitrate = MediaPayloadBitrate::from_bps(2_000_000);
-        owner.set_policy(id, policy, at).expect("select new source");
-        assert_eq!(owner.senders[0].demand().selected().as_bps(), 2_000_000);
-        assert_eq!(owner.senders[0].demand().potential().as_bps(), 2_000_000);
+            .set_assignment(id, Some(assignment), at, false)
+            .unwrap();
+        assert_eq!(current_assignment(&owner, id), assignment);
+        assert_eq!(owner.senders[0].selected_bitrate(), 0);
+        assert_eq!(owner.senders[0].potential_bitrate(), 1_000_000);
+        assignment.selected_bitrate = MediaPayloadBitrate::from_bps(2_000_000);
+        assignment.potential_bitrate = MediaPayloadBitrate::from_bps(3_000_000);
+        owner
+            .set_assignment(id, Some(assignment), at, false)
+            .unwrap();
+        assert_eq!(current_assignment(&owner, id), assignment);
     }
 
     #[test]
@@ -4852,10 +4956,10 @@ mod tests {
             );
             assert_eq!(stamped_delay(&owner.senders[0]), None);
 
-            let mut policy = owner.senders[0].policy;
+            let mut policy = owner.senders[0].assignment.expect("bound sender");
             policy.playout_delay = Some(PlayoutDelay::from_ticks(2, 30).expect("new value"));
             owner
-                .set_policy(owner.senders[0].facts.id, policy, at)
+                .set_assignment(owner.senders[0].facts.id, Some(policy), at, false)
                 .expect("policy update");
             owner.confirm_playout(ssrc, 0x1_0000);
             assert_eq!(
@@ -4886,16 +4990,17 @@ mod tests {
             owner.stats().1[0].playout_delay,
             PlayoutDelayStatus::NotSignaled
         );
-        let mut policy = owner.senders[0].policy;
+        let mut policy = owner.senders[0].assignment.expect("bound sender");
         policy.playout_delay = None;
         owner
-            .set_policy(
+            .set_assignment(
                 owner.senders[0].facts.id,
-                policy,
+                Some(policy),
                 TimePoint {
                     monotonic: now,
                     global: GlobalMediaTime::from_micros(1),
                 },
+                false,
             )
             .expect("unsignaled reset");
         assert_eq!(
@@ -4907,18 +5012,18 @@ mod tests {
     #[test]
     fn probe_allowance_survives_nonprobe_expiry() {
         let now = Instant::now();
-        let mut egress = MediaEgress::new(
+        let mut egress = bound_egress(
             Vec::new().into_boxed_slice(),
             &[0; 32],
             1,
             1,
-            SenderPolicy {
+            pulsebeam_rtc::SenderAssignment {
                 playout_delay: Some(PlayoutDelay::ZERO),
-                desired_bitrate: MediaPayloadBitrate::from_bps(0),
+                ..crate::test_support::sender_assignment(MediaPayloadBitrate::from_bps(0))
             },
-            SenderPolicy {
+            pulsebeam_rtc::SenderAssignment {
                 playout_delay: Some(PlayoutDelay::ZERO),
-                desired_bitrate: MediaPayloadBitrate::from_bps(0),
+                ..crate::test_support::sender_assignment(MediaPayloadBitrate::from_bps(0))
             },
             now,
         );
@@ -4948,11 +5053,11 @@ mod tests {
     #[test]
     fn probe_history_overflow_suppresses_credit_until_evictions_age_out() {
         let now = Instant::now();
-        let policy = SenderPolicy {
+        let policy = pulsebeam_rtc::SenderAssignment {
             playout_delay: Some(PlayoutDelay::ZERO),
-            desired_bitrate: MediaPayloadBitrate::from_bps(0),
+            ..crate::test_support::sender_assignment(MediaPayloadBitrate::from_bps(0))
         };
-        let mut egress = MediaEgress::new(
+        let mut egress = bound_egress(
             Vec::new().into_boxed_slice(),
             &[0; 32],
             1,
@@ -4993,19 +5098,26 @@ mod tests {
                     .unwrap();
                 if repair {
                     owner
-                        .discard_sender_media(owner.senders[0].facts.id)
+                        .clear_sender_media(owner.senders[0].facts.id, false)
                         .unwrap();
                     owner.repair_requests.push_back((0, 1));
                 }
                 owner
-                    .set_demand(
+                    .set_assignment(
                         owner.senders[0].facts.id,
-                        SenderDemand::new(
-                            MediaPayloadBitrate::from_bps(0),
-                            MediaPayloadBitrate::from_bps(2_000_000),
-                        )
-                        .unwrap(),
+                        Some({
+                            let (selected_bitrate, potential_bitrate) = (
+                                MediaPayloadBitrate::from_bps(100_000),
+                                MediaPayloadBitrate::from_bps(2_000_000),
+                            );
+                            pulsebeam_rtc::SenderAssignment {
+                                selected_bitrate,
+                                potential_bitrate,
+                                ..current_assignment(&owner, owner.senders[0].facts.id)
+                            }
+                        }),
                         at,
+                        false,
                     )
                     .unwrap();
                 owner.update_controller(at, Some((1, true)), &[], &[], Duration::ZERO, false, 0);
@@ -5023,7 +5135,7 @@ mod tests {
                     assert_ne!(owner.next_deadline(), Some(now + Duration::from_millis(2)));
                 }
                 owner
-                    .discard_sender_media(owner.senders[0].facts.id)
+                    .clear_sender_media(owner.senders[0].facts.id, false)
                     .unwrap();
                 assert_eq!(
                     owner.next_deadline(),
@@ -5045,16 +5157,50 @@ mod tests {
             global: GlobalMediaTime::from_micros(1_000_000),
         };
         let mut owner = playout_owner(now, None);
-        owner.senders[0].policy.desired_bitrate = MediaPayloadBitrate::from_bps(150_000);
-        owner.senders[0].potential_bitrate = Some(MediaPayloadBitrate::from_bps(166_667));
+        owner.senders[0]
+            .assignment
+            .as_mut()
+            .expect("bound sender")
+            .selected_bitrate = MediaPayloadBitrate::from_bps(150_000);
+        owner.senders[0]
+            .assignment
+            .as_mut()
+            .expect("bound sender")
+            .potential_bitrate = MediaPayloadBitrate::from_bps(166_667);
         owner.senders[0].latest_committed_global = Some(at.global);
-        owner.senders[1].policy.desired_bitrate = MediaPayloadBitrate::from_bps(0);
-        owner.senders[1].potential_bitrate = Some(MediaPayloadBitrate::from_bps(0));
-        owner.senders[0].policy.desired_bitrate = MediaPayloadBitrate::from_bps(150_000);
-        owner.senders[1].policy.desired_bitrate = MediaPayloadBitrate::from_bps(0);
+        owner.senders[1]
+            .assignment
+            .as_mut()
+            .expect("bound sender")
+            .selected_bitrate = MediaPayloadBitrate::from_bps(0);
+        owner.senders[1]
+            .assignment
+            .as_mut()
+            .expect("bound sender")
+            .potential_bitrate = MediaPayloadBitrate::from_bps(0);
+        owner.senders[1]
+            .assignment
+            .as_mut()
+            .expect("bound sender")
+            .potential_bitrate = MediaPayloadBitrate::from_bps(0);
+        owner.senders[0]
+            .assignment
+            .as_mut()
+            .expect("bound sender")
+            .selected_bitrate = MediaPayloadBitrate::from_bps(150_000);
+        owner.senders[1]
+            .assignment
+            .as_mut()
+            .expect("bound sender")
+            .selected_bitrate = MediaPayloadBitrate::from_bps(0);
+        owner.senders[1]
+            .assignment
+            .as_mut()
+            .expect("bound sender")
+            .potential_bitrate = MediaPayloadBitrate::from_bps(0);
         owner.update_controller(at, Some((1, true)), &[], &[], Duration::ZERO, false, 0);
         let envelope = owner.envelope.unwrap();
-        assert_eq!(owner.senders[0].demand().selected().as_bps(), 150_000);
+        assert_eq!(owner.senders[0].selected_bitrate(), 150_000);
         assert!(envelope.target_media_payload_rate < 166_667);
         assert!(166_667 - envelope.target_media_payload_rate < 50_000);
         assert!(166_667 * 5 < envelope.target_media_payload_rate * 6);
@@ -5071,11 +5217,37 @@ mod tests {
         for (selected, application_limited) in [(0, false), (500_000, true), (500_000, false)] {
             for reference_window in [8_598, 100_000] {
                 let mut owner = playout_owner(now, None);
-                owner.senders[0].policy.desired_bitrate = MediaPayloadBitrate::from_bps(selected);
-                owner.senders[0].potential_bitrate = Some(MediaPayloadBitrate::from_bps(2_322_813));
+                owner.senders[0]
+                    .assignment
+                    .as_mut()
+                    .expect("bound sender")
+                    .selected_bitrate = MediaPayloadBitrate::from_bps(selected);
+                owner.senders[0]
+                    .assignment
+                    .as_mut()
+                    .expect("bound sender")
+                    .potential_bitrate = MediaPayloadBitrate::from_bps(selected);
+                owner.senders[0]
+                    .assignment
+                    .as_mut()
+                    .expect("bound sender")
+                    .potential_bitrate = MediaPayloadBitrate::from_bps(2_322_813);
                 owner.senders[0].latest_committed_global = Some(at.global);
-                owner.senders[1].policy.desired_bitrate = MediaPayloadBitrate::from_bps(0);
-                owner.senders[1].potential_bitrate = Some(MediaPayloadBitrate::from_bps(0));
+                owner.senders[1]
+                    .assignment
+                    .as_mut()
+                    .expect("bound sender")
+                    .selected_bitrate = MediaPayloadBitrate::from_bps(0);
+                owner.senders[1]
+                    .assignment
+                    .as_mut()
+                    .expect("bound sender")
+                    .potential_bitrate = MediaPayloadBitrate::from_bps(0);
+                owner.senders[1]
+                    .assignment
+                    .as_mut()
+                    .expect("bound sender")
+                    .potential_bitrate = MediaPayloadBitrate::from_bps(0);
                 owner.update_controller(at, Some((1, true)), &[], &[], Duration::ZERO, false, 0);
                 owner.initial_probe_started_at = Some(now);
                 owner.initial_probe_allowance = PROBE_ALLOWANCE * INITIAL_PROBE_CLUSTERS;
@@ -5119,8 +5291,21 @@ mod tests {
         for (selected, had_media) in [(0, false), (500_000, false), (0, true), (500_000, true)] {
             let mut owner = playout_owner(now, None);
             for sender in &mut owner.senders {
-                sender.policy.desired_bitrate = MediaPayloadBitrate::from_bps(selected);
-                sender.potential_bitrate = Some(MediaPayloadBitrate::from_bps(1_000_000));
+                sender
+                    .assignment
+                    .as_mut()
+                    .expect("bound sender")
+                    .selected_bitrate = MediaPayloadBitrate::from_bps(selected);
+                sender
+                    .assignment
+                    .as_mut()
+                    .expect("bound sender")
+                    .potential_bitrate = MediaPayloadBitrate::from_bps(selected);
+                sender
+                    .assignment
+                    .as_mut()
+                    .expect("bound sender")
+                    .potential_bitrate = MediaPayloadBitrate::from_bps(1_000_000);
                 sender.latest_committed_global = had_media.then_some(at.global);
             }
             owner.update_controller(at, Some((1, true)), &[], &[], Duration::ZERO, false, 0);
@@ -5136,11 +5321,37 @@ mod tests {
             assert!(owner.probe_duration() <= INITIAL_PROBE_DURATION);
         }
         let mut owner = playout_owner(now, None);
-        owner.senders[0].policy.desired_bitrate = MediaPayloadBitrate::from_bps(500_000);
-        owner.senders[0].potential_bitrate = Some(MediaPayloadBitrate::from_bps(500_000));
+        owner.senders[0]
+            .assignment
+            .as_mut()
+            .expect("bound sender")
+            .selected_bitrate = MediaPayloadBitrate::from_bps(500_000);
+        owner.senders[0]
+            .assignment
+            .as_mut()
+            .expect("bound sender")
+            .potential_bitrate = MediaPayloadBitrate::from_bps(500_000);
+        owner.senders[0]
+            .assignment
+            .as_mut()
+            .expect("bound sender")
+            .potential_bitrate = MediaPayloadBitrate::from_bps(500_000);
         owner.senders[0].latest_committed_global = Some(at.global);
-        owner.senders[1].policy.desired_bitrate = MediaPayloadBitrate::from_bps(0);
-        owner.senders[1].potential_bitrate = Some(MediaPayloadBitrate::from_bps(1_000_000));
+        owner.senders[1]
+            .assignment
+            .as_mut()
+            .expect("bound sender")
+            .selected_bitrate = MediaPayloadBitrate::from_bps(0);
+        owner.senders[1]
+            .assignment
+            .as_mut()
+            .expect("bound sender")
+            .potential_bitrate = MediaPayloadBitrate::from_bps(0);
+        owner.senders[1]
+            .assignment
+            .as_mut()
+            .expect("bound sender")
+            .potential_bitrate = MediaPayloadBitrate::from_bps(1_000_000);
         owner.update_controller(at, Some((1, true)), &[], &[], Duration::ZERO, false, 0);
         let mut envelope = owner.envelope.unwrap();
         envelope.probe_permitted = true;
@@ -5159,8 +5370,16 @@ mod tests {
         };
         let mut owner = playout_owner(now, None);
         for sender in &mut owner.senders {
-            sender.potential_bitrate = Some(MediaPayloadBitrate::from_bps(1_000_000));
-            sender.policy.desired_bitrate = MediaPayloadBitrate::from_bps(0);
+            sender
+                .assignment
+                .as_mut()
+                .expect("bound sender")
+                .potential_bitrate = MediaPayloadBitrate::from_bps(1_000_000);
+            sender
+                .assignment
+                .as_mut()
+                .expect("bound sender")
+                .selected_bitrate = MediaPayloadBitrate::from_bps(0);
         }
         owner.update_controller(at, Some((1, true)), &[], &[], Duration::ZERO, false, 0);
         let mut envelope = owner.envelope.unwrap();
@@ -5195,8 +5414,21 @@ mod tests {
         };
         let mut owner = playout_owner(now, None);
         for sender in &mut owner.senders {
-            sender.policy.desired_bitrate = MediaPayloadBitrate::from_bps(0);
-            sender.potential_bitrate = Some(MediaPayloadBitrate::from_bps(1_000_000));
+            sender
+                .assignment
+                .as_mut()
+                .expect("bound sender")
+                .selected_bitrate = MediaPayloadBitrate::from_bps(0);
+            sender
+                .assignment
+                .as_mut()
+                .expect("bound sender")
+                .potential_bitrate = MediaPayloadBitrate::from_bps(0);
+            sender
+                .assignment
+                .as_mut()
+                .expect("bound sender")
+                .potential_bitrate = MediaPayloadBitrate::from_bps(1_000_000);
             assert_eq!(sender.latest_committed_global, None);
         }
         owner.update_controller(at, Some((1, true)), &[], &[], Duration::ZERO, false, 0);
@@ -5226,10 +5458,23 @@ mod tests {
         for potential_only in [false, true] {
             let mut owner = playout_owner(now, None);
             for sender in &mut owner.senders {
-                sender.policy.playout_delay = Some(PlayoutDelay::ZERO);
+                sender
+                    .assignment
+                    .as_mut()
+                    .expect("bound sender")
+                    .playout_delay = Some(PlayoutDelay::ZERO);
                 if potential_only {
-                    sender.potential_bitrate = Some(sender.policy.desired_bitrate);
-                    sender.policy.desired_bitrate = MediaPayloadBitrate::from_bps(0);
+                    sender
+                        .assignment
+                        .as_mut()
+                        .expect("bound sender")
+                        .potential_bitrate =
+                        sender.assignment.expect("bound sender").selected_bitrate;
+                    sender
+                        .assignment
+                        .as_mut()
+                        .expect("bound sender")
+                        .selected_bitrate = MediaPayloadBitrate::from_bps(0);
                 }
             }
             owner.update_controller(at, Some((1, true)), &[], &[], Duration::ZERO, false, 0);
@@ -5243,7 +5488,7 @@ mod tests {
                         .div_ceil(8_000_000),
                 )
                 .unwrap();
-                assert!((5_120..=5_121).contains(&rtt_sample));
+                assert_eq!(rtt_sample, 6_400);
                 assert_eq!(
                     owner.probe_target_bytes,
                     rtt_sample.min((owner.probe_pacing_rate / 80).max(PROBE_MIN_TARGET)),
@@ -5272,9 +5517,26 @@ mod tests {
                     };
                     let mut owner = playout_owner(now, None);
                     for sender in &mut owner.senders {
-                        sender.policy.playout_delay = None;
-                        sender.policy.desired_bitrate = MediaPayloadBitrate::from_bps(0);
-                        sender.potential_bitrate = Some(MediaPayloadBitrate::from_bps(2_000_000));
+                        sender
+                            .assignment
+                            .as_mut()
+                            .expect("bound sender")
+                            .playout_delay = None;
+                        sender
+                            .assignment
+                            .as_mut()
+                            .expect("bound sender")
+                            .selected_bitrate = MediaPayloadBitrate::from_bps(0);
+                        sender
+                            .assignment
+                            .as_mut()
+                            .expect("bound sender")
+                            .potential_bitrate = MediaPayloadBitrate::from_bps(0);
+                        sender
+                            .assignment
+                            .as_mut()
+                            .expect("bound sender")
+                            .potential_bitrate = MediaPayloadBitrate::from_bps(2_000_000);
                         sender.latest_committed_global = had_media.then_some(at.global);
                     }
                     owner.update_controller(
@@ -5354,8 +5616,16 @@ mod tests {
         owner.finish_probe(now + Duration::from_secs(5), true);
 
         for sender in &mut owner.senders {
-            sender.potential_bitrate = Some(sender.policy.desired_bitrate);
-            sender.policy.desired_bitrate = MediaPayloadBitrate::from_bps(0);
+            sender
+                .assignment
+                .as_mut()
+                .expect("bound sender")
+                .potential_bitrate = sender.assignment.expect("bound sender").selected_bitrate;
+            sender
+                .assignment
+                .as_mut()
+                .expect("bound sender")
+                .selected_bitrate = MediaPayloadBitrate::from_bps(0);
         }
         assert_eq!(owner.probe_interval(now, envelope), Duration::from_secs(1));
         assert_eq!(
@@ -5383,8 +5653,21 @@ mod tests {
         };
         let mut owner = playout_owner(now, None);
         for sender in &mut owner.senders {
-            sender.policy.desired_bitrate = MediaPayloadBitrate::from_bps(0);
-            sender.potential_bitrate = Some(MediaPayloadBitrate::from_bps(2_000_000));
+            sender
+                .assignment
+                .as_mut()
+                .expect("bound sender")
+                .selected_bitrate = MediaPayloadBitrate::from_bps(0);
+            sender
+                .assignment
+                .as_mut()
+                .expect("bound sender")
+                .potential_bitrate = MediaPayloadBitrate::from_bps(0);
+            sender
+                .assignment
+                .as_mut()
+                .expect("bound sender")
+                .potential_bitrate = MediaPayloadBitrate::from_bps(2_000_000);
         }
         assert_eq!(owner.probe_allowance(now), PROBE_ALLOWANCE);
         owner.update_controller(at, Some((1, true)), &[], &[], Duration::ZERO, false, 0);
@@ -5417,7 +5700,16 @@ mod tests {
         assert_eq!(owner.initial_probe_started_at, Some(now));
         assert_eq!(owner.probe_allowance(now + PROBE_WINDOW), PROBE_ALLOWANCE);
         assert!(!owner.probe_followup);
-        owner.senders[0].policy.desired_bitrate = MediaPayloadBitrate::from_bps(1);
+        owner.senders[0]
+            .assignment
+            .as_mut()
+            .expect("bound sender")
+            .selected_bitrate = MediaPayloadBitrate::from_bps(1);
+        owner.senders[0]
+            .assignment
+            .as_mut()
+            .expect("bound sender")
+            .potential_bitrate = MediaPayloadBitrate::from_bps(1);
         assert_eq!(owner.probe_allowance(now), PROBE_ALLOWANCE);
     }
 
@@ -5597,13 +5889,30 @@ mod tests {
         };
         let mut owner = playout_owner(now, None);
         for sender in &mut owner.senders {
-            sender.potential_bitrate = Some(sender.policy.desired_bitrate);
-            sender.policy.desired_bitrate = MediaPayloadBitrate::from_bps(0);
+            sender
+                .assignment
+                .as_mut()
+                .expect("bound sender")
+                .potential_bitrate = sender.assignment.expect("bound sender").selected_bitrate;
+            sender
+                .assignment
+                .as_mut()
+                .expect("bound sender")
+                .selected_bitrate = MediaPayloadBitrate::from_bps(0);
+            sender
+                .assignment
+                .as_mut()
+                .expect("bound sender")
+                .potential_bitrate = MediaPayloadBitrate::from_bps(0);
         }
         owner.update_controller(at, Some((1, true)), &[], &[], Duration::ZERO, false, 0);
         owner.initial_probe_started_at = Some(now);
         owner.initial_probe_allowance = 70_000;
-        owner.senders[0].potential_bitrate = Some(MediaPayloadBitrate::from_bps(3_000_000));
+        owner.senders[0]
+            .assignment
+            .as_mut()
+            .expect("bound sender")
+            .potential_bitrate = MediaPayloadBitrate::from_bps(3_000_000);
         let sent = now + Duration::from_secs(6);
         let received = sent + Duration::from_millis(50);
         let finished = sent + Duration::from_millis(20);
@@ -5672,8 +5981,16 @@ mod tests {
         };
         let mut owner = playout_owner(now, None);
         for sender in &mut owner.senders {
-            sender.potential_bitrate = Some(sender.policy.desired_bitrate);
-            sender.policy.desired_bitrate = MediaPayloadBitrate::from_bps(0);
+            sender
+                .assignment
+                .as_mut()
+                .expect("bound sender")
+                .potential_bitrate = sender.assignment.expect("bound sender").selected_bitrate;
+            sender
+                .assignment
+                .as_mut()
+                .expect("bound sender")
+                .selected_bitrate = MediaPayloadBitrate::from_bps(0);
         }
         owner.update_controller(at, Some((1, true)), &[], &[], Duration::ZERO, false, 0);
         assert!(owner.start_probe(at, owner.envelope.unwrap()));
@@ -5706,7 +6023,11 @@ mod tests {
         owner.pacer.commit(received, 1_000, 80_000);
         let debt = owner.pacer.next_deadline();
         assert_eq!(owner.next_deadline(), debt);
-        owner.senders[0].potential_bitrate = Some(MediaPayloadBitrate::from_bps(10_000_000));
+        owner.senders[0]
+            .assignment
+            .as_mut()
+            .expect("bound sender")
+            .potential_bitrate = MediaPayloadBitrate::from_bps(10_000_000);
         owner.feedback_recovery = FeedbackRecovery::Followup;
         assert!(owner.start_probe(
             TimePoint {
@@ -5742,7 +6063,11 @@ mod tests {
         let now = Instant::now();
         let mut owner = playout_owner(now, None);
         for sender in &mut owner.senders {
-            sender.policy.playout_delay = Some(PlayoutDelay::from_ticks(0, 50).unwrap());
+            sender
+                .assignment
+                .as_mut()
+                .expect("bound sender")
+                .playout_delay = Some(PlayoutDelay::from_ticks(0, 50).unwrap());
         }
         assert!(owner.probe_fits_selected_horizon(now, 800, 80_000));
         assert!(!owner.probe_fits_selected_horizon(now, 801, 80_000));
@@ -5754,41 +6079,23 @@ mod tests {
             Some(now + Duration::from_millis(10))
         );
         for sender in &mut owner.senders {
-            sender.potential_bitrate = Some(sender.policy.desired_bitrate);
-            sender.policy.desired_bitrate = MediaPayloadBitrate::from_bps(0);
+            sender
+                .assignment
+                .as_mut()
+                .expect("bound sender")
+                .potential_bitrate = sender.assignment.expect("bound sender").selected_bitrate;
+            sender
+                .assignment
+                .as_mut()
+                .expect("bound sender")
+                .selected_bitrate = MediaPayloadBitrate::from_bps(0);
+            sender
+                .assignment
+                .as_mut()
+                .expect("bound sender")
+                .potential_bitrate = MediaPayloadBitrate::from_bps(0);
         }
         assert!(owner.probe_fits_selected_horizon(now, 801, 80_000));
-    }
-
-    #[test]
-    fn default_video_probe_horizon_is_bounded_and_distinct_from_explicit_zero() {
-        let now = Instant::now();
-        let at = TimePoint {
-            monotonic: now,
-            global: GlobalMediaTime::from_micros(1_000_000),
-        };
-        let mut owner = playout_owner(now, None);
-        for sender in &mut owner.senders {
-            sender.facts.kind = MediaKind::Video;
-            sender.policy.playout_delay = None;
-        }
-        owner.pacer.commit(now, 100, 80_000);
-        assert!(owner.probe_fits_selected_horizon(now, 700, 80_000));
-        assert!(!owner.probe_fits_selected_horizon(now, 701, 80_000));
-        assert!(!owner.useful_at(
-            0,
-            at.global,
-            ClockQuality::Synchronized,
-            at,
-            Duration::from_millis(70),
-        ));
-        owner.senders[0].policy.playout_delay = Some(PlayoutDelay::ZERO);
-        assert!(owner.probe_fits_selected_horizon(now, 50, 80_000));
-        assert!(!owner.probe_fits_selected_horizon(now, 51, 80_000));
-        assert_eq!(
-            owner.pacer.next_deadline(),
-            Some(now + Duration::from_millis(10))
-        );
     }
 
     #[test]
@@ -5800,14 +6107,21 @@ mod tests {
         };
         let mut owner = playout_owner(now, None);
         owner
-            .set_demand(
+            .set_assignment(
                 owner.senders[0].facts.id,
-                SenderDemand::new(
-                    MediaPayloadBitrate::from_bps(0),
-                    MediaPayloadBitrate::from_bps(2_000_000),
-                )
-                .unwrap(),
+                Some({
+                    let (selected_bitrate, potential_bitrate) = (
+                        MediaPayloadBitrate::from_bps(0),
+                        MediaPayloadBitrate::from_bps(2_000_000),
+                    );
+                    pulsebeam_rtc::SenderAssignment {
+                        selected_bitrate,
+                        potential_bitrate,
+                        ..current_assignment(&owner, owner.senders[0].facts.id)
+                    }
+                }),
                 at,
+                false,
             )
             .unwrap();
         owner.update_controller(at, Some((1, true)), &[], &[], Duration::ZERO, false, 0);
@@ -5888,14 +6202,21 @@ mod tests {
         let mut egress = playout_owner(now, None);
         let sender = egress.senders[0].facts.id;
         egress
-            .set_demand(
+            .set_assignment(
                 sender,
-                SenderDemand::new(
-                    MediaPayloadBitrate::from_bps(0),
-                    MediaPayloadBitrate::from_bps(1_000_000),
-                )
-                .expect("potential-only demand"),
+                Some({
+                    let (selected_bitrate, potential_bitrate) = (
+                        MediaPayloadBitrate::from_bps(0),
+                        MediaPayloadBitrate::from_bps(1_000_000),
+                    );
+                    pulsebeam_rtc::SenderAssignment {
+                        selected_bitrate,
+                        potential_bitrate,
+                        ..current_assignment(&egress, sender)
+                    }
+                }),
                 at,
+                false,
             )
             .expect("declare demand");
         egress.update_controller(at, Some((1, true)), &[], &[], Duration::ZERO, false, 0);
@@ -5942,11 +6263,11 @@ mod tests {
     #[test]
     fn active_probe_deadline_wakes_the_connection_for_cluster_expiry() {
         let now = Instant::now();
-        let policy = SenderPolicy {
+        let policy = pulsebeam_rtc::SenderAssignment {
             playout_delay: Some(PlayoutDelay::ZERO),
-            desired_bitrate: MediaPayloadBitrate::from_bps(0),
+            ..crate::test_support::sender_assignment(MediaPayloadBitrate::from_bps(0))
         };
-        let mut egress = MediaEgress::new(
+        let mut egress = bound_egress(
             Vec::new().into_boxed_slice(),
             &[0; 32],
             1,
@@ -6007,9 +6328,9 @@ mod tests {
     #[test]
     fn probe_uses_declared_unmet_source_interest_and_bounded_target() {
         let now = Instant::now();
-        let policy = SenderPolicy {
+        let policy = pulsebeam_rtc::SenderAssignment {
             playout_delay: Some(PlayoutDelay::from_ticks(0, 50).expect("500 ms")),
-            desired_bitrate: MediaPayloadBitrate::from_bps(1_000_000),
+            ..crate::test_support::sender_assignment(MediaPayloadBitrate::from_bps(1_000_000))
         };
         let sender = |id| EgressSenderFacts {
             id: SenderId::new(id).expect("sender"),
@@ -6024,7 +6345,7 @@ mod tests {
             dependency_extension_id: None,
             forwarded_extensions: Box::new([]),
         };
-        let mut egress = MediaEgress::new(
+        let mut egress = bound_egress(
             vec![sender(1), sender(2)].into_boxed_slice(),
             &[0; 32],
             1,
@@ -6033,27 +6354,57 @@ mod tests {
             policy,
             now,
         );
-        egress.senders[1].policy.desired_bitrate = MediaPayloadBitrate::from_bps(500_000);
+        egress.senders[1]
+            .assignment
+            .as_mut()
+            .expect("bound sender")
+            .selected_bitrate = MediaPayloadBitrate::from_bps(500_000);
+        egress.senders[1]
+            .assignment
+            .as_mut()
+            .expect("bound sender")
+            .potential_bitrate = MediaPayloadBitrate::from_bps(500_000);
         assert_eq!(egress.probe_queue_impact_limit(), Duration::from_millis(10));
-        egress.senders[0].policy.playout_delay = Some(PlayoutDelay::ZERO);
-        assert_eq!(egress.probe_queue_impact_limit(), Duration::from_millis(5));
-        egress.senders[0].policy.playout_delay = policy.playout_delay;
+        egress.senders[0]
+            .assignment
+            .as_mut()
+            .expect("bound sender")
+            .playout_delay = Some(PlayoutDelay::ZERO);
+        assert_eq!(egress.probe_queue_impact_limit(), Duration::from_millis(10));
+        egress.senders[0]
+            .assignment
+            .as_mut()
+            .expect("bound sender")
+            .playout_delay = policy.playout_delay;
         assert_eq!(egress.cluster_target_bytes(100_000), 750);
-        assert_eq!(egress.cluster_target_bytes(1_000_000), 3_562);
-        egress.senders[0].policy.desired_bitrate = MediaPayloadBitrate::from_bps(u64::MAX);
+        assert_eq!(egress.cluster_target_bytes(1_000_000), 3_750);
+        egress.senders[0]
+            .assignment
+            .as_mut()
+            .expect("bound sender")
+            .selected_bitrate = MediaPayloadBitrate::from_bps(u64::MAX);
+        egress.senders[0]
+            .assignment
+            .as_mut()
+            .expect("bound sender")
+            .potential_bitrate = MediaPayloadBitrate::from_bps(u64::MAX);
         assert_eq!(egress.cluster_target_bytes(u64::MAX), 48 * 1024);
-        egress.senders[1].potential_bitrate = Some(MediaPayloadBitrate::from_bps(1_000_000));
+        egress.senders[1]
+            .assignment
+            .as_mut()
+            .expect("bound sender")
+            .potential_bitrate = MediaPayloadBitrate::from_bps(1_000_000);
         assert_eq!(egress.probe_candidate(), Some(1));
     }
 
     #[test]
     fn probe_success_requires_its_own_received_bytes_and_fails_on_loss_or_timeout() {
         let now = Instant::now();
-        let policy = SenderPolicy {
+        let policy = pulsebeam_rtc::SenderAssignment {
             playout_delay: Some(PlayoutDelay::ZERO),
-            desired_bitrate: MediaPayloadBitrate::from_bps(0),
+            ..crate::test_support::sender_assignment(MediaPayloadBitrate::from_bps(0))
         };
-        let mut egress = MediaEgress::new(
+        let mut egress = bound_egress(
             Vec::new().into_boxed_slice(),
             &[0; 32],
             1,
@@ -6162,11 +6513,11 @@ mod tests {
         };
 
         let now = Instant::now();
-        let policy = SenderPolicy {
+        let policy = pulsebeam_rtc::SenderAssignment {
             playout_delay: Some(PlayoutDelay::ZERO),
-            desired_bitrate: MediaPayloadBitrate::from_bps(0),
+            ..crate::test_support::sender_assignment(MediaPayloadBitrate::from_bps(0))
         };
-        let mut egress = MediaEgress::new(
+        let mut egress = bound_egress(
             Vec::new().into_boxed_slice(),
             &[0; 32],
             1,
@@ -6259,11 +6610,11 @@ mod tests {
     #[test]
     fn send_window_reserves_the_complete_transport_packet() {
         let now = Instant::now();
-        let policy = SenderPolicy {
+        let policy = pulsebeam_rtc::SenderAssignment {
             playout_delay: Some(PlayoutDelay::from_ticks(0, 50).expect("500 ms")),
-            desired_bitrate: MediaPayloadBitrate::from_bps(2_000_000),
+            ..crate::test_support::sender_assignment(MediaPayloadBitrate::from_bps(2_000_000))
         };
-        let mut egress = MediaEgress::new(
+        let mut egress = bound_egress(
             Vec::new().into_boxed_slice(),
             &[0; 32],
             1,
@@ -6288,12 +6639,12 @@ mod tests {
             monotonic: now,
             global: GlobalMediaTime::from_micros(1_000_000),
         };
-        let policy = SenderPolicy {
+        let policy = pulsebeam_rtc::SenderAssignment {
             playout_delay: Some(PlayoutDelay::from_ticks(0, 50).expect("500 ms playout")),
-            desired_bitrate: MediaPayloadBitrate::from_bps(100_000_000),
+            ..crate::test_support::sender_assignment(MediaPayloadBitrate::from_bps(100_000_000))
         };
         let sender = SenderId::new(1).expect("sender");
-        let mut owner = MediaEgress::new(
+        let mut owner = bound_egress(
             vec![EgressSenderFacts {
                 id: sender,
                 kind: MediaKind::Audio,
@@ -6336,13 +6687,13 @@ mod tests {
 
     fn media(id: u64) -> ForwardedMedia {
         ForwardedMedia {
+            source: pulsebeam_rtc::SourceIncarnation::from_value(1),
             packet: MediaPacket::new(
                 Bytes::from_static(&[0x80, 111, 0, 1, 0, 0, 0, 1, 0, 0, 0, 7]),
                 GlobalMediaTime::from_micros(1_000_000),
                 Arc::from([]),
             ),
             frame: FrameMetadata {
-                decode_target_mask: None,
                 id: FrameId::from_value(id),
                 boundary: FrameBoundary::Complete,
                 random_access: true,

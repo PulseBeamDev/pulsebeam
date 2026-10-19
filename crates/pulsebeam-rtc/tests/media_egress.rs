@@ -11,8 +11,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use pulsebeam_rtc::{
-    Command, CommandError, ConnectionConfig, ForwardedMedia, FrameBoundary, FrameDependencies,
-    FrameId, FrameMetadata, MediaPayloadBitrate,
+    Command, CommandError, ForwardedMedia, FrameBoundary, FrameDependencies, FrameId,
+    FrameMetadata, MediaPayloadBitrate,
 };
 use support::{PeerFixture, second_negotiated_sender};
 
@@ -201,14 +201,15 @@ fn public_command_rejects_invalid_work_without_mutating_sender_continuity() {
         ),
         Err(CommandError::UnknownSender(unknown))
     );
-    let mut policy = ConnectionConfig::default().default_audio_policy;
-    policy.desired_bitrate = MediaPayloadBitrate::from_bps(1_000_000);
+    let mut policy = support::sender_assignment(pulsebeam_rtc::MediaPayloadBitrate::from_bps(0));
+    policy.selected_bitrate = MediaPayloadBitrate::from_bps(1_000_000);
+    policy.potential_bitrate = MediaPayloadBitrate::from_bps(1_000_000);
     assert_eq!(
         fixture.connection.command(
             fixture.at(),
-            Command::SetSenderPolicy {
+            Command::SetSenderAssignment {
                 sender: fixture.sender,
-                policy,
+                assignment: Some(policy)
             },
         ),
         Ok(())
@@ -228,7 +229,7 @@ fn public_command_rejects_invalid_work_without_mutating_sender_continuity() {
 }
 
 #[test]
-fn audio_talkspurts_are_native_owned_and_rearmed_by_sender_discard() {
+fn audio_talkspurts_are_native_owned_and_rearmed_by_recovery() {
     let mut fixture = PeerFixture::connected();
     let _ = fixture.send_source(b"publisher primer");
     let first_source = fixture.send_source(b"first selected audio");
@@ -265,8 +266,9 @@ fn audio_talkspurts_are_native_owned_and_rearmed_by_sender_discard() {
         !second.marker,
         "continuous packets do not restart the talk spurt"
     );
-    fixture.command(Command::DiscardSenderMedia {
+    fixture.command(Command::RecoverSenderMedia {
         sender: fixture.sender,
+        assignment: fixture.assignment(fixture.sender),
     });
     let resumed = fixture.send_source(b"replacement or resumed source");
     assert!(resumed.bytes().get(1).is_some_and(|byte| byte & 0x80 == 0));
@@ -371,7 +373,7 @@ fn lost_frame_end_has_explicit_recovery_without_resetting_committed_identity() {
     );
     let fresh_packet = fixture.send_source(b"fresh independent frame");
     let global = fresh_packet.global_media_at();
-    let fresh = forwarded(fresh_packet.clone(), 2);
+    let mut fresh = forwarded(fresh_packet.clone(), 2);
     assert_eq!(
         fixture.try_command(Command::SendMedia {
             sender: fixture.sender,
@@ -390,9 +392,13 @@ fn lost_frame_end_has_explicit_recovery_without_resetting_committed_identity() {
     );
     assert_eq!(fixture.connection.stats().senders[0].queued_packets, 0);
 
-    fixture.command(Command::DiscardSenderMedia {
+    let mut assignment = fixture.assignment(fixture.sender);
+    assignment.source = pulsebeam_rtc::SourceIncarnation::from_value(2);
+    fixture.command(Command::SetSenderAssignment {
         sender: fixture.sender,
+        assignment: Some(assignment),
     });
+    fresh.source = assignment.source;
     let mut dependent = fresh.clone();
     dependent.frame.random_access = false;
     dependent.frame.dependencies = FrameDependencies::Known(Arc::from([FrameId::from_value(1)]));
@@ -425,6 +431,12 @@ fn selected_target_is_synthesized_on_authenticated_wire_without_mutating_source(
 
     let mut fixture = PeerFixture::connected_video_dd();
     declare_video_demand(&mut fixture);
+    let mut assignment = fixture.assignment(fixture.sender);
+    assignment.decode_target_mask = Some(1);
+    fixture.command(Command::SetSenderAssignment {
+        sender: fixture.sender,
+        assignment: Some(assignment),
+    });
     let mut source_reader = DependencyDescriptorReader::new();
     let mut reader = DependencyDescriptorReader::new();
     for id in 0..=4 {
@@ -452,7 +464,6 @@ fn selected_target_is_synthesized_on_authenticated_wire_without_mutating_source(
         let original = source.bytes().clone();
         let global = source.global_media_at();
         let mut media = forwarded(source.clone(), id);
-        media.frame.decode_target_mask = Some(0b001);
         media.frame.random_access = id == 0;
         media.frame.dependencies = FrameDependencies::Known(if id == 0 {
             Arc::from([])
@@ -460,7 +471,7 @@ fn selected_target_is_synthesized_on_authenticated_wire_without_mutating_source(
             Arc::from([FrameId::from_value(0)])
         });
         let media = media.to_transit();
-        assert_eq!(media.frame.decode_target_mask, Some(1));
+        assert_eq!(media.source, assignment.source);
         fixture
             .admit_media(media)
             .expect("selected target admission");
@@ -508,22 +519,35 @@ fn invalid_decode_target_masks_reject_before_committing_continuity() {
     declare_video_demand(&mut fixture);
     let source = fixture.send_video_temporal_source(b"\x65frame", Some(0));
     for mask in [0, 16, u32::MAX] {
-        let mut media = forwarded(source.clone(), 0);
-        media.frame.decode_target_mask = Some(mask);
-        assert_eq!(
-            fixture.try_command(Command::SendMedia {
-                sender: fixture.sender,
-                media
-            }),
-            Err(CommandError::InvalidFrameMetadata)
-        );
+        let mut assignment = fixture.assignment(fixture.sender);
+        assignment.decode_target_mask = Some(mask);
+        let updated = fixture.try_command(Command::SetSenderAssignment {
+            sender: fixture.sender,
+            assignment: Some(assignment),
+        });
+        if mask == 0 {
+            assert_eq!(updated, Err(CommandError::InvalidSenderAssignment));
+        } else {
+            updated.expect("nonzero selection requires source validation");
+            assert_eq!(
+                fixture.try_command(Command::SendMedia {
+                    sender: fixture.sender,
+                    media: forwarded(source.clone(), 0)
+                }),
+                Err(CommandError::InvalidFrameMetadata)
+            );
+        }
         assert_eq!(fixture.connection.stats().senders[0].queued_packets, 0);
     }
-    let mut media = forwarded(source, 0);
-    media.frame.decode_target_mask = Some(1);
+    let mut assignment = fixture.assignment(fixture.sender);
+    assignment.decode_target_mask = Some(1);
+    fixture.command(Command::SetSenderAssignment {
+        sender: fixture.sender,
+        assignment: Some(assignment),
+    });
     fixture.command(Command::SendMedia {
         sender: fixture.sender,
-        media,
+        media: forwarded(source, 0),
     });
     let _ = fixture.receive_video_wire_header();
     let received = fixture.receive_video_frame();
@@ -541,19 +565,21 @@ fn declare_video_demand(fixture: &mut PeerFixture) {
         .senders
         .first()
         .expect("video sender")
-        .policy;
-    policy.desired_bitrate = MediaPayloadBitrate::from_bps(1_000_000);
-    fixture.command(Command::SetSenderPolicy {
+        .assignment
+        .expect("bound sender");
+    policy.selected_bitrate = MediaPayloadBitrate::from_bps(1_000_000);
+    policy.potential_bitrate = MediaPayloadBitrate::from_bps(1_000_000);
+    fixture.command(Command::SetSenderAssignment {
         sender: fixture.sender,
-        policy,
+        assignment: Some(policy),
     });
 }
 
 fn forwarded(packet: pulsebeam_rtc::MediaPacket, id: u64) -> ForwardedMedia {
     ForwardedMedia {
+        source: pulsebeam_rtc::SourceIncarnation::from_value(1),
         packet,
         frame: FrameMetadata {
-            decode_target_mask: None,
             id: FrameId::from_value(id),
             boundary: FrameBoundary::Complete,
             random_access: true,
