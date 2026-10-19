@@ -1996,6 +1996,7 @@ mod replacement_tests {
                     participant,
                     room_id,
                     ShardId::new(0),
+                    0,
                     address,
                     connection_id,
                     ConnectionProfile::Native,
