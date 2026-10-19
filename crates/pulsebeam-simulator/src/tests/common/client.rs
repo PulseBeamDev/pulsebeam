@@ -1213,6 +1213,7 @@ pub struct RequestedVideo {
 
 #[derive(Clone, Debug)]
 pub struct ClientObservation {
+    pub ordered_cursors: Vec<(TopicSubscriber, String, u64)>,
     pub admission: Option<pulsebeam::entity::ConnectionId>,
     pub video_receivers: BTreeSet<u32>,
     pub audio_receivers: BTreeSet<u32>,
@@ -1255,6 +1256,7 @@ impl ClientContext {
             && snapshot.desired_revision == self.desired.revision)
             .then(|| self.desired.clone());
         Ok(ClientObservation {
+            ordered_cursors: observed.ordered_cursors,
             admission: *self.admission.lock().unwrap(),
             video_receivers: observed
                 .media_indices

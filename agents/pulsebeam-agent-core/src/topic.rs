@@ -378,6 +378,22 @@ impl Topics {
         self.refresh_snapshot(snapshot);
     }
 
+    #[cfg(feature = "sim")]
+    pub(crate) fn simulation_ordered_cursors(&self) -> Vec<(TopicSubscriber, String, u64)> {
+        self.subscribers
+            .iter()
+            .flat_map(|(subscriber, state)| {
+                state.publishers.iter().map(|(publisher, delivery)| {
+                    (
+                        subscriber.clone(),
+                        publisher.clone(),
+                        delivery.next_sequence,
+                    )
+                })
+            })
+            .collect()
+    }
+
     pub(crate) fn has_ordered_subscriptions(&self) -> bool {
         self.subscribers
             .keys()

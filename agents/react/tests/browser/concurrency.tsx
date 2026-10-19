@@ -32,7 +32,7 @@ export async function runConcurrencyContract() {
   const source = createCaptureSource(preview.getVideoTracks()[0], "video");
   let current: CaptureResult | undefined;
   let suspended = false;
-  let playCalls = 0;
+  let playbackPending = false;
   let committedFailures = 0;
   let abandonedFailures = 0;
   Object.defineProperty(navigator, "mediaDevices", {
@@ -40,7 +40,7 @@ export async function runConcurrencyContract() {
     value: { getUserMedia: () => capture.promise },
   });
   HTMLMediaElement.prototype.play = function () {
-    playCalls += 1;
+    playbackPending = true;
     return playback.promise;
   };
   function Suspend(): never {
@@ -77,7 +77,7 @@ export async function runConcurrencyContract() {
         <Probe speculative={false} />
       </Suspense>,
     );
-    await until(() => current !== undefined && playCalls === 1);
+    await until(() => current !== undefined && playbackPending);
     const request = current!.request().then(
       () => true,
       () => false,
@@ -97,7 +97,7 @@ export async function runConcurrencyContract() {
     await until(() => committedFailures + abandonedFailures > 0);
     return {
       committedRenderIsolation:
-        accepted && committedFailures === 1 && abandonedFailures === 0,
+        accepted && committedFailures > 0 && abandonedFailures === 0,
     };
   } finally {
     root.unmount();

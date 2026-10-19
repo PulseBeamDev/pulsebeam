@@ -1,76 +1,9 @@
 use super::support::TestResult;
-use std::{
-    env,
-    error::Error,
-    path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
-};
+use std::error::Error;
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::AsyncWriteExt,
     net::{TcpListener, TcpStream},
 };
-
-pub struct ExecutableServer {
-    child: Child,
-    _startup_lock: std::fs::File,
-}
-impl ExecutableServer {
-    #[allow(
-        clippy::disallowed_methods,
-        reason = "synchronous owned-process startup polling before browser traffic, never a production shard"
-    )]
-    pub fn start() -> TestResult<Self> {
-        // Only the production executable has fixed ports. Other owners use bound :0 listeners.
-        let startup_lock = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open("/tmp/pulsebeam-production-browser-startup.lock")?;
-        startup_lock.lock()?;
-        if std::net::TcpStream::connect("127.0.0.1:7070").is_ok() {
-            return Err("refusing to use an existing PulseBeam listener on 127.0.0.1:7070; browser contracts require an owned destination server".into());
-        }
-        let binary = env::var_os("PULSEBEAM_SERVER_BINARY").ok_or(
-            "missing PULSEBEAM_SERVER_BINARY; run the SDK browser target through ./bazel test",
-        )?;
-        let log = std::fs::OpenOptions::new().create(true).append(true).open(
-            PathBuf::from(
-                env::var_os("TEST_UNDECLARED_OUTPUTS_DIR")
-                    .ok_or("missing Bazel TEST_UNDECLARED_OUTPUTS_DIR")?,
-            )
-            .join("destination-server.log"),
-        )?;
-        let child = Command::new(Path::new(&binary).canonicalize()?)
-            .arg("--dev")
-            .current_dir(env::var_os("TEST_TMPDIR").ok_or("missing Bazel TEST_TMPDIR")?)
-            .stdout(Stdio::from(log.try_clone()?))
-            .stderr(Stdio::from(log))
-            .spawn()?;
-        let mut server = Self {
-            child,
-            _startup_lock: startup_lock,
-        };
-        for _ in 0..300 {
-            if let Some(status) = server.child.try_wait()? {
-                return Err(format!(
-                    "owned PulseBeam development server exited before readiness with {status}"
-                )
-                .into());
-            }
-            if std::net::TcpStream::connect("127.0.0.1:7070").is_ok() {
-                return Ok(server);
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
-        Err("PulseBeam development server did not listen on port 7070".into())
-    }
-}
-impl Drop for ExecutableServer {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
 
 pub struct DestinationServer {
     address: std::net::SocketAddr,

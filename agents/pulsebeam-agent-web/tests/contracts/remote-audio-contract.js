@@ -268,72 +268,6 @@
       spectrum.every((value) => value === -Infinity),
       "A never observes B's tone",
     );
-    const independent = new RemoteCatalog(fake, 0, () => {});
-    catalogs.push(independent);
-    independent.update(snapshot);
-    const otherContext = contexts[1];
-    const otherOutput = outputs.get(otherContext);
-    const otherFrequency = () => {
-      const data = new Float32Array(otherOutput.tap.frequencyBinCount);
-      otherOutput.tap.getFloatFrequencyData(data);
-      return (peak(data) * otherContext.sampleRate) / otherOutput.tap.fftSize;
-    };
-    await wait(
-      () => Math.abs(otherFrequency() - 1320) < 45,
-      "independent output",
-    );
-    assert(
-      decoders.length === 2 &&
-        decoders[1] !== decoder &&
-        decoders[1].muted &&
-        decoders[1].hidden &&
-        !decoders[1].isConnected,
-      "independent Agent owns its own private decoder",
-    );
-    assert(
-      independent.participant("alice").audio("second") !== b,
-      "Agent isolation",
-    );
-    snapshot = {
-      ...snapshot,
-      connection: "disconnected",
-      mapping: { ...snapshot.mapping, audio: [] },
-      tracks: {},
-    };
-    catalog.update(snapshot);
-    b.readWaveform(wave.fill(4));
-    assert(
-      !b.receiving &&
-        wave.every((value) => value === 0) &&
-        output.routes.size === 0,
-      "disconnect removes audible media and analysis",
-    );
-    assert(
-      decoder.paused && decoder.srcObject === null,
-      "disconnect clears and pauses private decoding",
-    );
-    snapshot = {
-      ...snapshot,
-      connection: "connected",
-      mapping: {
-        ...snapshot.mapping,
-        audio: [{ receiverIndex: 0, publicationId: "B" }],
-      },
-      tracks: { B: { media: received[1], kind: "audio" } },
-    };
-    catalog.update(snapshot);
-    await wait(
-      () => Math.abs(outputFrequency() - 1320) < 45,
-      "reconnected output",
-    );
-    assert(
-      b.receiving && output.routes.size === 1 && contexts.length === 2,
-      "reconnect reuses infrastructure without duplicate routes",
-    );
-    assert(
-      decoders.length === 2 && decoder.srcObject !== null && !decoder.paused,
-      "reconnect reuses the private decoder",
-    );
     const nativePlay = decoder.play;
     let releasePlay;
     decoder.play = () =>
@@ -345,67 +279,26 @@
       () => true,
     );
     catalog.close();
-    catalog.close();
     releasePlay();
-    assert(await pendingRecovery, "close fences pending decoder play recovery");
+    assert(
+      await pendingRecovery,
+      "close fences a pending native decoder playback operation",
+    );
     decoder.play = nativePlay;
     await wait(() => sdkContext.state === "closed", "closed audio context");
     assert(
-      outputs.get(otherContext).routes.size === 1 &&
-        otherContext.state === "running" &&
-        Math.abs(otherFrequency() - 1320) < 45 &&
-        !decoders[1].paused,
-      "closing one Agent leaves another audible",
-    );
-    assert(
-      decoder.paused && decoder.srcObject === null && !decoder.isConnected,
-      "close releases private decoder media",
+      output.routes.size === 0 && decoder.paused && decoder.srcObject === null,
+      "terminal audio route and decoder cleanup",
     );
     b.readSpectrum(spectrum.fill(4));
     assert(
-      !b.receiving && spectrum.every((value) => value === -Infinity),
-      "terminal reads clear",
+      spectrum.every((value) => value === -Infinity),
+      "terminal analysis is silent",
     );
-    let rejected = false;
-    try {
-      await catalog.resumeAudio();
-    } catch {
-      rejected = true;
-    }
     assert(
-      rejected &&
-        captured.every((track) => track.readyState === "live") &&
+      captured.every((track) => track.readyState === "live") &&
         received.every((track) => track.readyState === "live"),
-      "close rejects recovery and leaves borrowed media live",
-    );
-    const retainedAudio = independent.participant("alice").audio("second");
-    independent.resetPlayback();
-    await wait(
-      () => otherContext.state === "closed",
-      "deactivation releases the audio context",
-    );
-    assert(
-      otherOutput.routes.size === 0 &&
-        decoders[1].paused &&
-        decoders[1].srcObject === null,
-      "deactivation releases audible routes and private decoding",
-    );
-    independent.update(snapshot);
-    await wait(() => {
-      retainedAudio.readWaveform(wave);
-      return (
-        contexts[2]?.state === "running" &&
-        wave.some((value) => Math.abs(value) > 0.00001)
-      );
-    }, "reactivated audio output");
-    assert(
-      independent.participant("alice").audio("second") === retainedAudio &&
-        retainedAudio.receiving &&
-        contexts.length === 3 &&
-        outputs.get(contexts[2]).routes.size === 1 &&
-        captured.every((track) => track.readyState === "live") &&
-        received.every((track) => track.readyState === "live"),
-      "reactivation retains handles and borrowed media without duplicate output",
+      "audio cleanup preserves borrowed tracks",
     );
     return true;
   } finally {

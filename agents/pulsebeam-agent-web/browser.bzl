@@ -29,6 +29,9 @@ def browser_test(name, source, assets, env, contracts = [], live = False, featur
             "PULSEBEAM_BROWSER_BINARY": "$(rootpath @browser_chrome//:executable)",
             "PULSEBEAM_DRIVER_BINARY": "$(rootpath @browser_chromedriver//:executable)",
         }),
+        # At most two Chrome sessions and one Tokio worker per case. The live
+        # destination uses one dedicated current-thread runtime per session.
+        args = ["--test-threads=2"],
         tags = ["slow", "cpu:4"],
         size = "large",
     )

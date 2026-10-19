@@ -90,7 +90,8 @@
       .finally(() => {
         secondSettled = true;
       });
-    await new Promise((resolve) => setTimeout(resolve, 20));
+    await Promise.resolve();
+    await Promise.resolve();
     const serializedBeforeRelease = parameterCalls === 1;
 
     releases[0]();

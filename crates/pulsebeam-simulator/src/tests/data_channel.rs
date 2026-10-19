@@ -665,83 +665,141 @@ fn reliable_data_converges_across_shards_with_loss_and_feedback_impairment() {
             Room::new("room-reliable-xshard")
                 .with_participant(Participant::data_participant("pub"))
                 .with_participant(Participant::data_participant("sub_a"))
-                .with_participant(Participant::data_participant("sub_b")),
+                .with_participant(Participant::data_participant("sub_b"))
+                .with_participant(Participant::data_participant("late").starts_disconnected()),
         )
         .run(vec![
             Step::DeclareOrderedPublisher {
-                description: "Declare the reliable publisher",
+                description: "Declare reliable publisher",
                 participant: "pub",
                 topic: "state",
             },
             Step::DeclareOrderedSubscriber {
-                description: "Subscriber A declares the reliable topic",
+                description: "Declare subscriber A",
                 participant: "sub_a",
                 topic: "state",
             },
             Step::DeclareOrderedSubscriber {
-                description: "Subscriber B declares the reliable topic",
+                description: "Declare subscriber B",
                 participant: "sub_b",
                 topic: "state",
             },
+            Step::DeclareOrderedSubscriber {
+                description: "Reserve late subscriber transport topology",
+                participant: "late",
+                topic: "state",
+            },
             Step::Run {
-                description: "Open both reliable paths before sending state",
+                description: "Open reliable paths across worker shards",
                 duration: Duration::from_secs(3),
             },
             Step::PublishOrdered {
-                description: "Send state 1",
+                description: "Send first payload",
                 participant: "pub",
                 topic: "state",
-                data: b"state:1",
+                data: b"first",
             },
-            Step::PublishOrdered {
-                description: "Send state 2",
-                participant: "pub",
-                topic: "state",
-                data: b"state:2",
-            },
-            Step::PublishOrdered {
-                description: "Send state 3",
-                participant: "pub",
-                topic: "state",
-                data: b"state:3",
-            },
-            Step::PublishOrdered {
-                description: "Send state 4",
-                participant: "pub",
-                topic: "state",
-                data: b"state:4",
-            },
-            Step::PublishOrdered {
-                description: "Send state 5",
-                participant: "pub",
-                topic: "state",
-                data: b"state:5",
-            },
-            Step::PublishOrdered {
-                description: "Send state 6",
-                participant: "pub",
-                topic: "state",
-                data: b"state:6",
-            },
-            Step::Run {
-                description: "Allow forward loss and reliable reverse control to converge",
-                duration: Duration::from_secs(8),
-            },
-            Step::CheckDataSequence {
-                description: "Subscriber A receives every state exactly once and in order",
+            Step::WaitForDataSequence {
                 participant: "sub_a",
                 topic: "state",
-                expected: &[
-                    b"state:1", b"state:2", b"state:3", b"state:4", b"state:5", b"state:6",
-                ],
+                expected: &[b"first"],
             },
-            Step::CheckDataSequence {
-                description: "Subscriber B receives every state exactly once and in order",
+            Step::WaitForDataSequence {
                 participant: "sub_b",
                 topic: "state",
-                expected: &[
-                    b"state:1", b"state:2", b"state:3", b"state:4", b"state:5", b"state:6",
-                ],
+                expected: &[b"first"],
+            },
+            Step::StopServer,
+            Step::PublishOrdered {
+                description: "Admit a distinct tail while the SFU cannot deliver it",
+                participant: "pub",
+                topic: "state",
+                data: b"lost-tail",
+            },
+            Step::WaitForOrderedPublisher {
+                participant: "pub",
+                topic: "state",
+                next_sequence: 2,
+            },
+            Step::CheckDataSequence {
+                description: "The admitted tail is outstanding at subscriber A",
+                participant: "sub_a",
+                topic: "state",
+                expected: &[b"first"],
+            },
+            Step::CheckDataSequence {
+                description: "The admitted tail is outstanding at subscriber B",
+                participant: "sub_b",
+                topic: "state",
+                expected: &[b"first"],
+            },
+            Step::RestartServer,
+            Step::WaitForDataSequence {
+                participant: "sub_a",
+                topic: "state",
+                expected: &[b"first", b"lost-tail"],
+            },
+            Step::WaitForDataSequence {
+                participant: "sub_b",
+                topic: "state",
+                expected: &[b"first", b"lost-tail"],
+            },
+            Step::PublishOrdered {
+                description: "Only after tail recovery send a later payload",
+                participant: "pub",
+                topic: "state",
+                data: b"later",
+            },
+            Step::WaitForDataSequence {
+                participant: "sub_a",
+                topic: "state",
+                expected: &[b"first", b"lost-tail", b"later"],
+            },
+            Step::WaitForDataSequence {
+                participant: "sub_b",
+                topic: "state",
+                expected: &[b"first", b"lost-tail", b"later"],
+            },
+            Step::Join {
+                description: "Join after history exists",
+                participant: "late",
+            },
+            Step::WaitForOrderedSubscriber {
+                participant: "late",
+                publisher: "pub",
+                topic: "state",
+                next_sequence: 3,
+            },
+            Step::PublishOrdered {
+                description: "Live marker is an ordered-processing barrier after the history floor",
+                participant: "pub",
+                topic: "state",
+                data: b"live",
+            },
+            Step::WaitForDataSequence {
+                participant: "late",
+                topic: "state",
+                expected: &[b"live"],
+            },
+            Step::WaitForDataSequence {
+                participant: "sub_a",
+                topic: "state",
+                expected: &[b"first", b"lost-tail", b"later", b"live"],
+            },
+            Step::WaitForDataSequence {
+                participant: "sub_b",
+                topic: "state",
+                expected: &[b"first", b"lost-tail", b"later", b"live"],
+            },
+            Step::Run {
+                description: "Rejoined control, shard and native client state converge",
+                duration: Duration::from_secs(2),
+            },
+            Step::CheckDataSequence {
+                description: "Late receiver has only the live marker",
+                participant: "late",
+                topic: "state",
+                expected: &[b"live"],
             },
         ]);
 }

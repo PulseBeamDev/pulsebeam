@@ -7,8 +7,7 @@ use crate::tests::common::decoder::{
 };
 use crate::tests::common::media::{KeyframeRecoveryProbe, VbrProfile};
 use crate::tests::common::{
-    DEFAULT_SIM_SHARDS, reserve_subnet, run_sim_or_timeout, start_observed_sfu_node, subnet_ip,
-    subnet_ip_v6,
+    DEFAULT_SIM_SHARDS, reserve_subnet, start_observed_sfu_node, subnet_ip, subnet_ip_v6,
 };
 use pulsebeam_agent_native::SimulcastLayer;
 use pulsebeam_agent_native::agent_core::{
@@ -396,6 +395,24 @@ impl VideoQuality {
 
 #[allow(dead_code)]
 pub enum Step {
+    StopServer,
+    RestartServer,
+    WaitForOrderedPublisher {
+        participant: &'static str,
+        topic: &'static str,
+        next_sequence: u64,
+    },
+    WaitForOrderedSubscriber {
+        participant: &'static str,
+        publisher: &'static str,
+        topic: &'static str,
+        next_sequence: u64,
+    },
+    WaitForDataSequence {
+        participant: &'static str,
+        topic: &'static str,
+        expected: &'static [&'static [u8]],
+    },
     // ── Time ──────────────────────────────────────────────────────────────
     /// Advance simulated time. All participants run during this window.
     /// Also snapshots TX/RX byte counters for subsequent `*BytesInterval` checks.
@@ -1502,6 +1519,11 @@ fn step_name(step: &Step) -> &'static str {
         Step::CheckDataNotReceived { .. } => "CheckDataNotReceived",
         Step::CheckDataCount { .. } => "CheckDataCount",
         Step::CheckDataSequence { .. } => "CheckDataSequence",
+        Step::StopServer => "StopServer",
+        Step::RestartServer => "RestartServer",
+        Step::WaitForOrderedPublisher { .. } => "WaitForOrderedPublisher",
+        Step::WaitForOrderedSubscriber { .. } => "WaitForOrderedSubscriber",
+        Step::WaitForDataSequence { .. } => "WaitForDataSequence",
         Step::SetAudioIntent { .. } => "SetAudioIntent",
         Step::CheckSpeakerHeld { .. } => "CheckSpeakerHeld",
     }
@@ -1510,12 +1532,23 @@ fn step_name(step: &Step) -> &'static str {
 type PlanHandles = BTreeMap<&'static str, ParticipantHandle>;
 type PlanIps = BTreeMap<&'static str, IpAddr>;
 
+enum ServerCommand {
+    Stop(tokio::sync::oneshot::Sender<()>),
+    Restart,
+}
+
+struct ServerControl {
+    commands: mpsc::Sender<ServerCommand>,
+    observations: mpsc::Receiver<pulsebeam::sim_observation::Observer>,
+    observer: pulsebeam::sim_observation::Observer,
+}
+
 async fn execute_plan(
     plan: Vec<Step>,
     handles: &mut PlanHandles,
     name_to_ip: &PlanIps,
     reports: &Mutex<HashMap<&'static str, LinkReport>>,
-    observer: &pulsebeam::sim_observation::Observer,
+    server: &mut ServerControl,
 ) -> anyhow::Result<()> {
     let total = plan.len();
     // Duration of the most recent Run, so interval properties know what window they describe.
@@ -1525,8 +1558,135 @@ async fn execute_plan(
     for (idx, step) in plan.iter().enumerate() {
         let n = idx + 1;
         let kind = step_name(step);
+        let observer = &server.observer;
 
         match step {
+            Step::StopServer => {
+                let (stopped, complete) = tokio::sync::oneshot::channel();
+                server.commands.send(ServerCommand::Stop(stopped)).await?;
+                complete.await?;
+                disturbances.insert((2, "server", "server"));
+            }
+            Step::RestartServer => {
+                server.commands.send(ServerCommand::Restart).await?;
+                server.observer =
+                    server.observations.recv().await.ok_or_else(|| {
+                        anyhow::anyhow!("restarted server did not supply observer")
+                    })?;
+                disturbances.remove(&(2, "server", "server"));
+            }
+            Step::WaitForOrderedPublisher {
+                participant,
+                topic,
+                next_sequence,
+            } => {
+                let handle = get_handle(handles, participant, kind)?;
+                tokio::time::timeout(Duration::from_secs(30), async {
+                    loop {
+                        let ready = handle
+                            .shared
+                            .observation
+                            .lock()
+                            .unwrap()
+                            .as_ref()
+                            .is_some_and(|observation| {
+                                observation
+                                    .snapshot
+                                    .topics
+                                    .publishers
+                                    .iter()
+                                    .any(|publisher| {
+                                        publisher.registration.topic == *topic
+                                            && publisher.next_sequence == Some(*next_sequence)
+                                    })
+                            });
+                        if ready {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!("{participant} did not admit ordered sequence {next_sequence}")
+                })?;
+            }
+            Step::WaitForOrderedSubscriber {
+                participant,
+                publisher,
+                topic,
+                next_sequence,
+            } => {
+                let publisher_id = get_handle(handles, publisher, kind)?
+                    .participant_id()
+                    .expect("connected publisher");
+                let handle = get_handle(handles, participant, kind)?;
+                tokio::time::timeout(Duration::from_secs(30), async {
+                    loop {
+                        // Before the first live send, only a processed publisher boundary can
+                        // create this delivery state without delivering a historical payload.
+                        let ready =
+                            handle
+                                .shared
+                                .observation
+                                .lock()
+                                .unwrap()
+                                .as_ref()
+                                .is_some_and(|observation| {
+                                    observation.snapshot.topics.subscribers.iter().any(
+                                        |subscriber| {
+                                            subscriber.registration.topic == *topic
+                                                && subscriber.channel.is_some()
+                                                && subscriber.publishers == 1
+                                                && subscriber.buffered_messages == 0
+                                                && observation.ordered_cursors.iter().any(
+                                                    |(registration, id, cursor)| {
+                                                        registration == &subscriber.registration
+                                                            && id == &publisher_id
+                                                            && cursor == next_sequence
+                                                    },
+                                                )
+                                        },
+                                    )
+                                });
+                        if ready {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!("{participant} did not process ordered publisher boundary")
+                })?;
+                anyhow::ensure!(
+                    handle
+                        .shared
+                        .data_received
+                        .lock()
+                        .unwrap()
+                        .get(*topic)
+                        .is_none_or(Vec::is_empty),
+                    "late subscriber received history before live marker"
+                );
+            }
+            Step::WaitForDataSequence {
+                participant,
+                topic,
+                expected,
+            } => {
+                let handle = get_handle(handles, participant, kind)?;
+                let expected: Vec<Vec<u8>> =
+                    expected.iter().map(|payload| payload.to_vec()).collect();
+                tokio::time::timeout(Duration::from_secs(30), async {
+                    loop {
+                        let actual = handle.shared.data_received.lock().unwrap().get(*topic).cloned().unwrap_or_default();
+                        anyhow::ensure!(expected.starts_with(&actual), "{participant} received unexpected sequence: {actual:?}, expected {expected:?}");
+                        if actual == expected { return Ok::<_, anyhow::Error>(()); }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                }).await.map_err(|_| anyhow::anyhow!("{participant} did not receive ordered sequence {expected:?}"))??;
+            }
             Step::Run {
                 description,
                 duration,
@@ -4723,6 +4883,7 @@ impl LocalNodeSim {
         let initial_topics = initial_topic_registrations(&plan);
 
         let (observation_tx, mut observation_rx) = mpsc::channel(1);
+        let (server_tx, mut server_rx) = mpsc::channel(1);
         sim.host(server_ip, move || {
             let observation_tx = observation_tx.clone();
             async move {
@@ -4843,13 +5004,36 @@ impl LocalNodeSim {
                 .recv()
                 .await
                 .expect("server supplies observer");
-            execute_plan(plan, &mut handles, &name_to_ip, &reports_inner, &observer)
+            let mut server = ServerControl {
+                commands: server_tx,
+                observations: observation_rx,
+                observer,
+            };
+            execute_plan(plan, &mut handles, &name_to_ip, &reports_inner, &mut server)
                 .await
                 .map_err(Into::into)
         });
 
         let wall_budget = sim_duration * 3 + Duration::from_secs(120);
-        run_sim_or_timeout(&mut sim, wall_budget).expect("simulation failed");
+        let started = Instant::now();
+        loop {
+            assert!(
+                started.elapsed() <= wall_budget,
+                "simulation exceeded wall-clock budget"
+            );
+            while let Ok(command) = server_rx.try_recv() {
+                match command {
+                    ServerCommand::Stop(stopped) => {
+                        sim.crash(server_ip);
+                        let _ = stopped.send(());
+                    }
+                    ServerCommand::Restart => sim.bounce(server_ip),
+                }
+            }
+            if sim.step().expect("simulation failed") {
+                break;
+            }
+        }
 
         reports.lock().expect("reports poisoned").clone()
     }

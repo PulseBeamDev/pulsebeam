@@ -59,6 +59,8 @@
     return { element, attachment };
   };
   try {
+    if (devicePixelRatio !== 2)
+      throw new Error("layout smoke requires non-unit DPR=2");
     const small = mount(120);
     await until(() => wire[0]?.height === Math.ceil(120 * devicePixelRatio));
     const large = mount(230);

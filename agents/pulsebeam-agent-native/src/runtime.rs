@@ -115,6 +115,7 @@ pub enum Error {
 #[cfg(feature = "sim")]
 #[derive(Clone, Debug)]
 pub struct SimulationObservation {
+    pub ordered_cursors: Vec<(agent_core::TopicSubscriber, String, u64)>,
     pub snapshot: Snapshot,
     pub sent_intent_revision: Option<u64>,
     pub media_indices: BTreeMap<MediaSlot, u32>,
@@ -799,6 +800,7 @@ impl Actor {
                     .map(|peer| peer.media_indices.clone())
                     .unwrap_or_default();
                 let _ = response.send(SimulationObservation {
+                    ordered_cursors: self.core.simulation_ordered_cursors(),
                     snapshot,
                     sent_intent_revision: self.core.simulation_sent_intent_revision(),
                     media_indices,

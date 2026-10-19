@@ -29,6 +29,23 @@
         contexts[1].state === "running",
       "trusted gesture recovers blocked and pre-media contexts",
     );
+    const frames = state.video.getVideoPlaybackQuality().totalVideoFrames;
+    for (
+      let i = 0;
+      i < 500 &&
+      (state.video.paused ||
+        state.video.videoWidth === 0 ||
+        state.video.getVideoPlaybackQuality().totalVideoFrames <= frames);
+      i++
+    )
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    assert(
+      !state.video.paused &&
+        state.video.videoWidth > 0 &&
+        state.video.getVideoPlaybackQuality().totalVideoFrames > frames &&
+        state.video.srcObject.getVideoTracks()[0] === state.videoTrack,
+      "trusted retry restores fresh native attachment playback",
+    );
     await blocked.resumeAudio();
     await before.resumeAudio();
     assert(
@@ -134,7 +151,15 @@
     const failed = new RemoteCatalog(fake, 0, () => {});
     extras.push(failed);
     failed.update(snapshot);
-    await new Promise((resolve) => setTimeout(resolve, 30));
+    for (
+      let i = 0;
+      i < 500 &&
+      !warnings.some((args) =>
+        String(args[1]).includes("automatic resume failed"),
+      );
+      i++
+    )
+      await new Promise((resolve) => setTimeout(resolve, 10));
     assert(
       warnings.some((args) =>
         String(args[1]).includes("automatic resume failed"),
@@ -176,7 +201,7 @@
         contexts.slice(0, 2).every((context) => context.state === "closed"),
       "terminal recovery and resources",
     );
-    await new Promise((resolve) => setTimeout(resolve, 30));
+    await Promise.resolve();
     assert(
       window.__pulsebeamUnhandledRejections.length === 0,
       "no unhandled autoplay rejection",
@@ -188,6 +213,10 @@
     extras.forEach((catalog) => catalog.close());
     peers.forEach((peer) => peer.close());
     AudioNode.prototype.connect = connect;
+    state.attachment.close();
+    state.video.remove();
+    state.videoTrack.stop();
+    clearInterval(state.painting);
     button.remove();
     track.stop();
     await source.close();

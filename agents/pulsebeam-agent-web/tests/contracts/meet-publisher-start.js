@@ -5,9 +5,8 @@
   // The source may start before activation. resume() is retried in the same
   // ordinary gesture as Meet's own recovery, not by a test-only unlock button.
   void source.resume();
-  document.addEventListener("click", () => void source.resume(), {
-    capture: true,
-  });
+  const resumeSource = () => void source.resume();
+  document.addEventListener("click", resumeSource, { capture: true });
   const oscillator = source.createOscillator();
   oscillator.frequency.value = 700;
   const destination = source.createMediaStreamDestination();
@@ -60,6 +59,7 @@
   void receive(chat, chats);
   void receive(reactions, emojis);
   sender.connect();
+  let stopped = false;
   Object.assign(window.__meet, {
     sender,
     chats,
@@ -68,6 +68,9 @@
     chat,
     reactions,
     stopPublisher: async () => {
+      if (stopped) return;
+      stopped = true;
+      document.removeEventListener("click", resumeSource, { capture: true });
       abort.abort();
       sender.close();
       clearInterval(timer);

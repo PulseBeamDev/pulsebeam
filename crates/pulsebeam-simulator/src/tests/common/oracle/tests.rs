@@ -204,6 +204,7 @@ fn fixture() -> (ControlStateOracle, Observation, ClientObservation) {
         model,
         Observation { control, shards },
         ClientObservation {
+            ordered_cursors: Vec::new(),
             admission: Some(receiver_connection),
             snapshot,
             sent_intent_revision: Some(1),

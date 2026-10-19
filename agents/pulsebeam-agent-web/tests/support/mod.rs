@@ -97,6 +97,10 @@ impl StaticServer {
             wasm_requests,
         })
     }
+    pub async fn shutdown(mut self) {
+        self.task.abort();
+        let _ = (&mut self.task).await;
+    }
     pub fn url(&self, path: &str) -> String {
         format!("http://{}/{path}", self.address)
     }
@@ -156,6 +160,7 @@ pub async fn managed_driver(
     let binary = Path::new(&binary)
         .canonicalize()
         .map_err(|error| thirtyfour::error::WebDriverError::ParseError(error.to_string()))?;
+    eprintln!("browser-session: launch");
     thirtyfour::manager::WebDriverManager::builder()
         .driver_binary(thirtyfour::manager::BrowserKind::Chrome, binary)
         .stdio(thirtyfour::manager::StdioMode::Inherit)

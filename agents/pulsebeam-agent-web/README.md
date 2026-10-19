@@ -261,15 +261,21 @@ Run from a build-ready repository root:
 ./bazel test //agents/pulsebeam-agent-web:web_runtime_browser
 ```
 
-Direct JavaScript tests compile only the topic and catalog facade boundary with
-the pinned toolchain. Typed public consumers reject untyped fields and forbidden
-APIs in generated contracts. The Web browser owner covers WASM/runtime
-ownership, real layout and media, autoplay recovery, and reliable-topic recovery.
-Its live nodes own ephemeral HTTP and RTC listeners. Metrics startup remains
-in the production-executable quickstart boundary.
+Direct JavaScript tests execute production topic, catalog, immutable-state and
+local-handle modules without a DOM. Typed public consumers check package and
+generated contracts. Deterministic native/SFU simulation owns reliable-topic
+loss, restart, ordering and late-subscriber history-floor proof.
 
-`//agents/pulsebeam-agent-web:browser` selects all Web, React, Meet, and documented
-quickstart browser owners without duplicating their execution. Each owner builds
+The Web browser owner retains packaged WASM/UniFFI loading and lifetime, native
+sender ownership and close fencing, element attachment/retry, non-unit-DPR layout,
+decoded media and trusted-gesture recovery. One Web adapter round trip checks fresh
+delivery after an owned node restart. Compatible cases reuse Chrome with fresh
+documents; autoplay and initialization-failure premises stay isolated. Each owner
+runs at most two sessions and one Tokio worker per case within its four-CPU
+reservation. Live nodes own ephemeral HTTP and RTC listeners.
+
+`//agents/pulsebeam-agent-web:browser` selects the Web, React, and Meet
+browser owners without duplicating their execution. Each owner builds
 only its required fixtures. See the
 [contributor testing contract](../../docs/build.md#testing-contract) for shared
 routing and [editor setup](../../docs/ide.md). `./bazel run //:web_dev` serves the

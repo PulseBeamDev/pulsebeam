@@ -27,8 +27,8 @@ typescript.tsc_binary(name = "tsc")
 js_run_binary(
     name = "unit_javascript",
     tool = ":tsc",
-    srcs = [":node_modules", "web/topic.ts", "web/types.ts", "web/capture-source.ts", "web/remote-catalog.ts", "web/remote-media.ts", "web/remote-audio.ts"],
-    args = ["--strict", "--target", "ES2022", "--module", "ESNext", "--moduleResolution", "Bundler", "--lib", "ES2022,DOM,DOM.Iterable", "--rootDir", "web", "--outDir", "unit-javascript", "web/topic.ts", "web/remote-catalog.ts"],
+    srcs = [":node_modules", "web/topic.ts", "web/types.ts", "web/capture-source.ts", "web/agent-state.ts", "web/local-track.ts", "web/remote-catalog.ts", "web/remote-media.ts", "web/remote-audio.ts"],
+    args = ["--strict", "--target", "ES2022", "--module", "ESNext", "--moduleResolution", "Bundler", "--lib", "ES2022,DOM,DOM.Iterable", "--rootDir", "web", "--outDir", "unit-javascript", "web/topic.ts", "web/remote-catalog.ts", "web/agent-state.ts", "web/local-track.ts"],
     chdir = package_name(),
     out_dirs = ["unit-javascript"],
 )
@@ -240,7 +240,7 @@ npm_package(
 
 copy_to_directory(
     name = "browser_assets",
-    srcs = [":package", ":uniffi_proof", ":uniffi-wasm-bindgen", ":node_modules/@ubjs/core/dir"] + glob(["tests/*.html", "tests/contracts/*.js"], exclude = ["tests/contracts/meet-*.js", "tests/contracts/react-quickstart-observer.js"]),
+    srcs = [":package", ":uniffi_proof", ":uniffi-wasm-bindgen", ":node_modules/@ubjs/core/dir"] + glob(["tests/*.html", "tests/contracts/*.js"], exclude = ["tests/contracts/meet-*.js"]),
     replace_prefixes = {
         "package/": "",
         "uniffi-proof/": "dist/uniffi-proof/",
@@ -253,7 +253,7 @@ browser_test(
     name = "web_runtime_browser",
     source = "tests/browser.rs",
     features = ["browser-tests"],
-    contracts = glob(["tests/contracts/*.js"], exclude = ["tests/contracts/meet-*.js", "tests/contracts/react-quickstart-observer.js"]),
+    contracts = glob(["tests/contracts/*.js"], exclude = ["tests/contracts/meet-*.js"]),
     assets = [":browser_assets"],
     env = {"PULSEBEAM_WEB_FIXTURE_ROOT": "$(rootpath :browser_assets)"},
     live = True,
@@ -285,21 +285,9 @@ browser_test(
     live = True,
 )
 
-browser_test(
-    name = "quickstart_browser",
-    source = "tests/quickstart.rs",
-    contracts = ["tests/contracts/react-quickstart-observer.js"],
-    assets = ["//agents/react:quickstart", "//crates/pulsebeam:server"],
-    env = {
-        "PULSEBEAM_REACT_QUICKSTART_ROOT": "$(rootpath //agents/react:quickstart)",
-        "PULSEBEAM_SERVER_BINARY": "$(rootpath //crates/pulsebeam:server)",
-    },
-    live = True,
-)
-
 test_suite(
     name = "browser",
-    tests = [":web_runtime_browser", ":react_browser", ":meet_browser", ":quickstart_browser"],
+    tests = [":web_runtime_browser", ":react_browser", ":meet_browser"],
 )
 
 copy_to_directory(
@@ -321,5 +309,5 @@ tsls.typescript_language_server_binary(name = "lsp", args = ["--stdio"], data = 
 prettier.prettier_binary(name = "prettier")
 alias(name = "fix", actual = "//tools:fix")
 
-rustfmt_test(name = "format", targets = [":pulsebeam-agent-web", ":web_runtime_browser", ":react_browser", ":meet_browser", ":quickstart_browser"])
+rustfmt_test(name = "format", targets = [":pulsebeam-agent-web", ":web_runtime_browser", ":react_browser", ":meet_browser"])
 rust_clippy_test(name = "clippy", targets = [":pulsebeam-agent-web", ":unit_tests"])

@@ -118,494 +118,234 @@
     [...peers].find((peer) =>
       peer.getReceivers().some((receiver) => receiver.track === track),
     );
-  const topology = {
-    localVideos: 1,
-    localAudios: 0,
-    remoteVideos: 1,
-    remoteAudios: 0,
-  };
-  const sender = window.pulsebeam.createAgent({
+  const { createAgent, createCaptureSource, attachRemoteMedia } = pulsebeam;
+  const sender = createAgent({
     endpoint,
     token: "__SENDER_TOKEN__",
-    topology,
+    topology: {
+      localVideos: 1,
+      localAudios: 1,
+      remoteVideos: 0,
+      remoteAudios: 0,
+    },
   });
-  const receiver = window.pulsebeam.createAgent({
+  const receiver = createAgent({
     endpoint,
     token: "__RECEIVER_TOKEN__",
-    topology,
+    topology: {
+      localVideos: 0,
+      localAudios: 0,
+      remoteVideos: 1,
+      remoteAudios: 1,
+    },
   });
-
-  const secondReceiver = window.pulsebeam.createAgent({
-    endpoint,
-    token: "__SECOND_RECEIVER_TOKEN__",
-    topology,
-  });
-
-  const waitFor = (agent, predicate, label) =>
-    new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => {
-        remove();
-        reject(
-          new Error(
-            `timed out waiting for ${label}: ${JSON.stringify({ relayFailures, failure: agent.getSnapshot().failure })}`,
-          ),
+  const assert = (condition, label) => {
+    if (!condition) throw new Error(label);
+  };
+  const until = async (predicate, label) => {
+    const deadline = Date.now() + 20000;
+    while (!(await predicate())) {
+      if (Date.now() > deadline)
+        throw new Error(
+          `live media: ${label}; relay failures: ${relayFailures}`,
         );
-      }, 20000);
-      const inspect = () => {
-        const snapshot = agent.getSnapshot();
-        if (!predicate(snapshot)) return;
-        clearTimeout(timeout);
-        remove();
-        resolve(snapshot);
-      };
-      const remove = agent.subscribe(inspect);
-      inspect();
-    });
-
-  const canvas = document.createElement("canvas");
-  canvas.width = 16;
-  canvas.height = 16;
-  const context = canvas.getContext("2d");
-  context.fillStyle = "#20a0ff";
-  context.fillRect(0, 0, 16, 16);
-  const localTrack = canvas.captureStream(5).getVideoTracks()[0];
-  const painting = setInterval(() => {
-    context.fillStyle = context.fillStyle === "#20a0ff" ? "#ff8020" : "#20a0ff";
-    context.fillRect(0, 0, 16, 16);
-  }, 200);
-  await sender.replaceLocalTrack("v0", localTrack, {
-    contentHint: "motion",
-  });
-  sender.setState({
-    connected: true,
-    publications: [{ slot: "v0", label: "camera", active: true }],
-    topics: [{ name: "chat", mode: "ordered", publish: true }],
-  });
-  receiver.setState({
-    connected: true,
-    topics: [{ name: "chat", mode: "ordered", subscribe: true }],
-  });
-
-  const senderConnected = await waitFor(
-    sender,
-    (snapshot) => snapshot.connection === "connected",
-    "sender connection",
-  );
-  const receiverConnected = await waitFor(
-    receiver,
-    (snapshot) => snapshot.connection === "connected",
-    "receiver connection",
-  );
-  await waitFor(
-    sender,
-    (snapshot) => snapshot.topics.publishers[0]?.connected === true,
-    "topic publisher",
-  );
-  await waitFor(
-    receiver,
-    (snapshot) => snapshot.topics.subscribers[0]?.connected === true,
-    "topic subscriber",
-  );
-  const discovered = await waitFor(
-    receiver,
-    (snapshot) =>
-      snapshot.catalog.publications.some(
-        (publication) =>
-          publication.kind === "video" &&
-          publication.participantId === senderConnected.participantId,
-      ),
-    "remote publication",
-  );
-  const publication = discovered.catalog.publications.find(
-    (candidate) =>
-      candidate.kind === "video" &&
-      candidate.participantId === senderConnected.participantId,
-  );
-  const topicMessage = new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => {
-      remove();
-      reject(new Error("timed out waiting for ordered topic message"));
-    }, 20000);
-    const remove = receiver.subscribeEvents((event) => {
-      if (event.type !== "topic-message" || event.mode !== "ordered") return;
-      clearTimeout(timeout);
-      remove();
-      resolve(event);
-    });
-  });
-  sender.sendTopic("chat", "ordered", new Uint8Array([7, 8, 9]));
-  const receivedTopic = await topicMessage;
-  receiver.setState({
-    connected: true,
-    video: [
-      {
-        slot: 0,
-        selector: { participantExternalId: "web-sender", label: "camera" },
-        height: 180,
-        minHeight: 1,
-        minFps: 1,
-        priority: 100,
-        playoutDelay: { mode: "fixed", minMs: 100, maxMs: 100 },
-      },
-    ],
-  });
-  const delivered = await waitFor(
-    receiver,
-    (snapshot) =>
-      snapshot.mapping.acceptedIntentRevision > 0 &&
-      snapshot.mapping.video.some(
-        (entry) => entry.publicationId === publication.id,
-      ) &&
-      snapshot.tracks[publication.id]?.media.readyState === "live",
-    "fixed-policy remote media",
-  );
-
-  const previousGeneration = delivered.generation;
-  const oldTrack = delivered.tracks[publication.id].media;
-  const oldPeer = peerForTrack(oldTrack);
-  const oldReceiver = oldPeer
-    ?.getReceivers()
-    .find((entry) => entry.track === oldTrack);
-  let staleOnTrack = 0;
-  const countStaleOnTrack = () => {
-    staleOnTrack += 1;
-  };
-  oldPeer?.addEventListener("track", countStaleOnTrack);
-  const fixedRevision = delivered.mapping.acceptedIntentRevision;
-  const receivedPackets = async () => {
-    const stats = await oldReceiver.getStats();
-    let count = 0;
-    for (const report of stats.values()) {
-      if (report.type === "inbound-rtp" && report.kind === "video") {
-        count += report.packetsReceived ?? 0;
-      }
+      await new Promise((resolve) => setTimeout(resolve, 10));
     }
-    return count;
   };
-  const initialPackets = await receivedPackets();
-  let fixedPackets = initialPackets;
-  for (
-    let attempt = 0;
-    attempt < 100 && fixedPackets < initialPackets + 4;
-    attempt++
-  ) {
-    await new Promise((resolve) => setTimeout(resolve, 100));
-    fixedPackets = await receivedPackets();
-  }
-  if (fixedPackets < initialPackets + 4) {
-    throw new Error(
-      `no continuing fixed-policy RTP: initial=${initialPackets} final=${fixedPackets}`,
-    );
-  }
-  const decodedFrames = async () => {
-    const stats = await oldReceiver.getStats();
-    return [...stats.values()]
-      .filter(
-        (report) => report.type === "inbound-rtp" && report.kind === "video",
-      )
-      .reduce((sum, report) => sum + (report.framesDecoded ?? 0), 0);
+  const canvas = document.createElement("canvas");
+  canvas.width = canvas.height = 16;
+  const paint = canvas.getContext("2d");
+  let color = false;
+  const painting = setInterval(() => {
+    paint.fillStyle = (color = !color) ? "#20a0ff" : "#ff8020";
+    paint.fillRect(0, 0, 16, 16);
+  }, 100);
+  const videoTrack = canvas.captureStream(10).getVideoTracks()[0];
+  const source = new AudioContext();
+  const audio = source.createMediaStreamDestination();
+  const oscillator = source.createOscillator();
+  oscillator.frequency.value = 700;
+  oscillator.connect(audio);
+  oscillator.start();
+  const audioTrack = audio.stream.getAudioTracks()[0];
+  const outputRoutes = new Set();
+  const connect = AudioNode.prototype.connect;
+  const disconnect = AudioNode.prototype.disconnect;
+  AudioNode.prototype.connect = function (node, ...args) {
+    const result = connect.call(this, node, ...args);
+    if (this instanceof AnalyserNode && node === this.context.destination)
+      outputRoutes.add(this);
+    return result;
   };
-  const initialFrames = await decodedFrames();
-  let fixedFrames = initialFrames;
-  for (
-    let attempt = 0;
-    attempt < 100 && fixedFrames < initialFrames + 2;
-    attempt++
-  ) {
-    await new Promise((resolve) => setTimeout(resolve, 100));
-    fixedFrames = await decodedFrames();
-  }
-  if (fixedFrames < initialFrames + 2) {
-    throw new Error(
-      `no decoded fixed-policy frames: initial=${initialFrames} final=${fixedFrames}`,
-    );
-  }
-  const fixedRtp = await packetEvidence(oldPeer, oldReceiver);
-  const receiverEvents = [];
-  const removeReceiverEvents = receiver.subscribeEvents((event) => {
-    if (event.type !== "topic-message") receiverEvents.push(event.type);
-  });
-  receiver.setState({
-    connected: true,
-    video: [
-      {
-        slot: 0,
-        selector: { participantExternalId: "web-sender", label: "camera" },
-        height: 180,
-        minHeight: 1,
-        minFps: 1,
-        priority: 100,
-      },
-    ],
-  });
-  const reconnected = await waitFor(
-    receiver,
-    (snapshot) =>
-      snapshot.connection === "connected" &&
-      snapshot.generation !== previousGeneration &&
-      snapshot.mapping.acceptedIntentRevision > 0 &&
-      snapshot.mapping.video.some(
-        (entry) => entry.publicationId === publication.id,
-      ) &&
-      snapshot.tracks[publication.id]?.media.readyState === "live" &&
-      oldTrack.readyState === "ended",
-    "fresh default receiver after fixed playout",
-  ).catch((error) => {
-    const snapshot = receiver.getSnapshot();
-    throw new Error(
-      `${error.message}: ${JSON.stringify({
-        generation: String(snapshot.generation),
-        oldGeneration: String(previousGeneration),
-        acceptedRevision: String(snapshot.mapping.acceptedIntentRevision),
-        desiredRevision: String(snapshot.desiredRevision),
-        failure: snapshot.failure,
-        events: receiverEvents,
-        oldState: oldTrack.readyState,
-        oldPeerState: oldPeer?.signalingState,
-      })}`,
-    );
-  });
-  removeReceiverEvents();
-  const newTrack = reconnected.tracks[publication.id].media;
-  const newPeer = peerForTrack(newTrack);
-  const newReceiver = newPeer
-    ?.getReceivers()
-    .find((entry) => entry.track === newTrack);
-  const restoredStats = async () => {
-    if (!newReceiver) return { packets: 0, frames: 0 };
-    const stats = await newReceiver.getStats();
-    return [...stats.values()]
-      .filter(
-        (report) => report.type === "inbound-rtp" && report.kind === "video",
-      )
-      .reduce(
-        (sum, report) => ({
-          packets: sum.packets + (report.packetsReceived ?? 0),
-          frames: sum.frames + (report.framesDecoded ?? 0),
-        }),
-        { packets: 0, frames: 0 },
-      );
+  AudioNode.prototype.disconnect = function (...args) {
+    outputRoutes.delete(this);
+    return disconnect.apply(this, args);
   };
-  const restoredInitial = await restoredStats();
-  let restored = restoredInitial;
-  for (
-    let attempt = 0;
-    attempt < 100 &&
-    (restored.packets < restoredInitial.packets + 4 ||
-      restored.frames < restoredInitial.frames + 2);
-    attempt++
-  ) {
-    await new Promise((resolve) => setTimeout(resolve, 100));
-    restored = await restoredStats();
-  }
-  const defaultRtp = await packetEvidence(newPeer, newReceiver);
-  const defaultRecreated =
-    restored.packets >= restoredInitial.packets + 4 &&
-    restored.frames >= restoredInitial.frames + 2 &&
-    staleOnTrack === 0 &&
-    receiver.getSnapshot().tracks[publication.id]?.media === newTrack &&
-    fixedRevision > 0 &&
-    oldPeer !== undefined &&
-    oldPeer.signalingState === "closed" &&
-    oldReceiver !== undefined &&
-    newPeer !== undefined &&
-    newPeer !== oldPeer &&
-    newReceiver !== undefined &&
-    newReceiver !== oldReceiver &&
-    oldTrack.readyState === "ended" &&
-    newTrack.readyState === "live";
-  oldPeer?.removeEventListener("track", countStaleOnTrack);
-  RTCPeerConnection.prototype.addTransceiver = originalAddTransceiver;
-  RTCPeerConnection.prototype.setRemoteDescription =
-    originalSetRemoteDescription;
-
-  secondReceiver.setState({ connected: true });
-  const secondConnected = await waitFor(
-    secondReceiver,
-    (snapshot) =>
-      snapshot.connection === "connected" &&
-      snapshot.catalog.publications.some(
-        (entry) => entry.id === publication.id,
-      ),
-    "independent receiver discovery",
-  );
-  const mount = (agent) => {
-    const handle = agent.remote.videoTracks.find(
-      (entry) => entry.publicationId === publication.id,
+  const video = document.createElement("video");
+  video.muted = true;
+  video.playsInline = true;
+  video.style.cssText = "width:160px;height:120px";
+  document.body.append(video);
+  let attachment;
+  try {
+    await source.resume();
+    sender.local
+      .video("camera")
+      .setSource(createCaptureSource(videoTrack, "video"));
+    sender.local
+      .audio("voice")
+      .setSource(createCaptureSource(audioTrack, "audio"));
+    sender.connect();
+    receiver.connect();
+    await until(
+      () =>
+        sender.connection === "connected" &&
+        receiver.connection === "connected",
+      "public connection",
     );
-    if (!handle) throw new Error("missing remote video handle");
-    const video = document.createElement("video");
-    video.muted = true;
-    video.playsInline = true;
-    video.style.cssText = "width:160px;height:120px;display:inline-block";
-    document.body.append(video);
-    return {
-      handle,
-      video,
-      attachment: window.pulsebeam.attachRemoteVideo(handle, video),
+    assert(
+      sender.participantExternalId === "web-sender" &&
+        receiver.participantExternalId === "web-receiver",
+      "admission identity",
+    );
+    assert(receiver.roomExternalId === "public-web-contract", "room identity");
+    await until(
+      () =>
+        receiver
+          .getSnapshot()
+          .catalog.publications.some((p) => p.kind === "video"),
+      "video discovery",
+    );
+    const publication = receiver
+      .getSnapshot()
+      .catalog.publications.find((p) => p.kind === "video");
+    const demand = {
+      slot: 0,
+      trackId: publication.id,
+      height: 180,
+      minHeight: 1,
+      minFps: 1,
+      priority: 100,
     };
-  };
-  const rendered = (video) =>
-    new Promise((resolve, reject) => {
-      let count = 0;
-      let callback;
-      const timeout = setTimeout(() => {
-        video.cancelVideoFrameCallback(callback);
-        reject(new Error("timed out waiting for rendered remote frames"));
-      }, 20000);
-      const observe = () => {
-        count += 1;
-        if (count >= 2) {
-          clearTimeout(timeout);
-          resolve();
-        } else {
-          callback = video.requestVideoFrameCallback(observe);
-        }
-      };
-      callback = video.requestVideoFrameCallback(observe);
+    receiver.setState({
+      connected: true,
+      video: [
+        { ...demand, playoutDelay: { mode: "fixed", minMs: 100, maxMs: 100 } },
+      ],
     });
-  const firstView = mount(receiver);
-  const secondView = mount(secondReceiver);
-  await Promise.all([rendered(firstView.video), rendered(secondView.video)]);
-  const independentRendering =
-    receiver.getSnapshot().connection === "connected" &&
-    secondReceiver.getSnapshot().connection === "connected" &&
-    receiverConnected.participantId !== secondConnected.participantId &&
-    firstView.video.srcObject.getVideoTracks()[0] ===
-      receiver.getSnapshot().tracks[publication.id].media &&
-    secondView.video.srcObject.getVideoTracks()[0] ===
-      secondReceiver.getSnapshot().tracks[publication.id].media &&
-    firstView.video.srcObject.getVideoTracks()[0] !==
-      secondView.video.srcObject.getVideoTracks()[0];
-  firstView.attachment.close();
-  await rendered(secondView.video);
-  const independentDetach =
-    firstView.video.srcObject === null &&
-    secondReceiver.getSnapshot().connection === "connected";
-  firstView.attachment = window.pulsebeam.attachRemoteVideo(
-    firstView.handle,
-    firstView.video,
-  );
-  await rendered(firstView.video);
-
-  sender.setState({ connected: true, publications: [] });
-  const removed = (snapshot) =>
-    !snapshot.catalog.publications.some(
-      (entry) => entry.id === publication.id,
-    ) &&
-    !snapshot.mapping.video.some(
-      (entry) => entry.publicationId === publication.id,
-    ) &&
-    snapshot.tracks[publication.id] === undefined;
-  await Promise.all([
-    waitFor(receiver, removed, "first mounted publication removal"),
-    waitFor(secondReceiver, removed, "second mounted publication removal"),
-  ]);
-  const revisions = [
-    receiver.getSnapshot().desiredRevision,
-    secondReceiver.getSnapshot().desiredRevision,
-  ];
-  firstView.handle.setReceiveOptions({ minHeight: 720 });
-  secondView.handle.setReceiveOptions({ priority: 100 });
-  const stale = window.pulsebeam.attachRemoteVideo(
-    firstView.handle,
-    firstView.video,
-  );
-  const mountedRemoval =
-    !firstView.handle.active &&
-    !secondView.handle.active &&
-    (firstView.video.srcObject?.getTracks().length ?? 0) === 0 &&
-    (secondView.video.srcObject?.getTracks().length ?? 0) === 0 &&
-    !receiver.remote.videoTracks.includes(firstView.handle) &&
-    !secondReceiver.remote.videoTracks.includes(secondView.handle) &&
-    receiver.getSnapshot().desiredRevision === revisions[0] &&
-    secondReceiver.getSnapshot().desiredRevision === revisions[1];
-  stale.close();
-  firstView.attachment.close();
-  secondView.attachment.close();
-  firstView.video.remove();
-  secondView.video.remove();
-  secondReceiver.close();
-
-  const runtimeEvents = [];
-  const removeRuntimeEvents = sender.subscribeEvents((event) =>
-    runtimeEvents.push(event),
-  );
-  const originalSetParameters = RTCRtpSender.prototype.setParameters;
-  RTCRtpSender.prototype.setParameters = () =>
-    Promise.reject(new DOMException("contract runtime failure"));
-  const runtimeRejected = await sender
-    .replaceLocalTrack("v0", localTrack, { contentHint: "motion" })
-    .then(
-      () => false,
-      () => true,
+    await until(
+      () =>
+        receiver.getSnapshot().tracks[publication.id]?.media.readyState ===
+        "live",
+      "mapped fixed-delay track",
     );
-  RTCRtpSender.prototype.setParameters = originalSetParameters;
-  removeRuntimeEvents();
-  const runtimeFailureEvent =
-    runtimeRejected &&
-    runtimeEvents.some(
-      (event) => event.type === "failure" && event.class === "runtime",
+    attachment = attachRemoteMedia(receiver, video, {
+      publicationIds: [publication.id],
+    });
+    const fixedTrack = receiver.getSnapshot().tracks[publication.id].media;
+    const fixedPeer = peerForTrack(fixedTrack);
+    const fixedReceiver = fixedPeer
+      .getReceivers()
+      .find((r) => r.track === fixedTrack);
+    const decoded = async (rtpReceiver) =>
+      [...(await rtpReceiver.getStats()).values()]
+        .filter((r) => r.type === "inbound-rtp" && r.kind === "video")
+        .reduce((n, r) => n + (r.framesDecoded ?? 0), 0);
+    const frames = await decoded(fixedReceiver);
+    await until(
+      async () =>
+        (await decoded(fixedReceiver)) > frames + 1 &&
+        video.videoWidth > 0 &&
+        !video.paused,
+      "fresh fixed-delay decoded/renderable frames",
     );
-
-  let enterPendingOperation;
-  const pendingOperationEntered = new Promise(
-    (resolve) => (enterPendingOperation = resolve),
-  );
-  let releasePendingOperation;
-  const pendingOperationGate = new Promise(
-    (resolve) => (releasePendingOperation = resolve),
-  );
-  RTCRtpSender.prototype.setParameters = () => {
-    enterPendingOperation();
-    return pendingOperationGate;
-  };
-  const pendingReplacement = sender.replaceLocalTrack("v0", localTrack, {
-    contentHint: "motion",
-  });
-  await pendingOperationEntered;
-  sender.close();
-  releasePendingOperation();
-  const closeDuringLocalOperation = await pendingReplacement.then(
-    () => false,
-    (error) => error instanceof Error && error.message === "agent is closed",
-  );
-  RTCRtpSender.prototype.setParameters = originalSetParameters;
-  receiver.close();
-  const callerOwnsTrack = localTrack.readyState === "live";
-  clearInterval(painting);
-  localTrack.stop();
-  return {
-    independentRendering: independentRendering && independentDetach,
-    mountedRemoval,
-    connected:
-      senderConnected.participantId !== null &&
-      receiverConnected.participantId !== null,
-    externalIdentity:
-      senderConnected.participantExternalId === "web-sender" &&
-      senderConnected.roomExternalId === "public-web-contract" &&
-      receiverConnected.participantExternalId === "web-receiver" &&
-      receiverConnected.roomExternalId === "public-web-contract" &&
-      reconnected.participantExternalId === "web-receiver" &&
-      reconnected.roomExternalId === "public-web-contract",
-    discovered:
-      publication.id.length > 0 &&
-      publication.label === "camera" &&
-      discovered.catalog.participants.find(
-        (participant) => participant.id === senderConnected.participantId,
-      )?.externalId === "web-sender",
-    delivered: delivered.tracks[publication.id].kind === "video",
-    reconnected: reconnected.tracks[publication.id].kind === "video",
-    defaultRecreated,
-    fixedRtp,
-    defaultRtp,
-    topicMetadata:
-      receivedTopic.publisherId === senderConnected.participantId &&
-      receivedTopic.streamId > 0 &&
-      receivedTopic.sequence >= 0 &&
-      receivedTopic.payload.join(",") === "7,8,9",
-    runtimeFailureEvent,
-    closeDuringLocalOperation,
-    callerOwnsTrack,
-  };
+    assert(
+      video.srcObject.getVideoTracks()[0] === fixedTrack,
+      "element uses current native receiver",
+    );
+    const fixedRtp = await packetEvidence(fixedPeer, fixedReceiver);
+    assert(
+      fixedRtp.withExtension > 0 &&
+        fixedRtp.firstValue?.join(",") === "0,160,10",
+      "actual SSRC carries negotiated fixed playout extension",
+    );
+    const voice = receiver.remote.participant("web-sender").audio("voice");
+    const spectrum = new Float32Array(1024);
+    const audible = () => {
+      voice.readSpectrum(spectrum);
+      const bin = Math.round((700 * 2048) / source.sampleRate);
+      return (
+        Math.max(...spectrum.slice(bin - 2, bin + 3)) > -40 &&
+        outputRoutes.size === 1 &&
+        [...outputRoutes][0].context.state === "running"
+      );
+    };
+    await until(
+      audible,
+      "automatically routed real decoded tone without application audio UI",
+    );
+    assert(
+      document.querySelector("audio") === null,
+      "no application audio element",
+    );
+    receiver.setState({ connected: true, video: [demand] });
+    await until(() => {
+      const track = receiver.getSnapshot().tracks[publication.id]?.media;
+      return (
+        track &&
+        track !== fixedTrack &&
+        track.readyState === "live" &&
+        fixedTrack.readyState === "ended"
+      );
+    }, "default policy recreates actual native receiver");
+    const current = receiver.getSnapshot().tracks[publication.id].media;
+    const peer = peerForTrack(current);
+    const rtpReceiver = peer.getReceivers().find((r) => r.track === current);
+    assert(
+      peer !== fixedPeer && fixedPeer.signalingState === "closed",
+      "retired transport is closed",
+    );
+    const baseline = await decoded(rtpReceiver);
+    await until(
+      async () =>
+        (await decoded(rtpReceiver)) > baseline + 1 &&
+        video.srcObject.getVideoTracks()[0] === current &&
+        audible(),
+      "fresh current-incarnation video and decoded audio",
+    );
+    const defaultRtp = await packetEvidence(peer, rtpReceiver);
+    assert(
+      defaultRtp.relay !== fixedRtp.relay &&
+        defaultRtp.withExtension === 0 &&
+        defaultRtp.firstValue === null,
+      "fresh SSRC has no obsolete playout extension",
+    );
+    attachment.close();
+    assert(video.srcObject === null, "element cleanup");
+    receiver.close();
+    await until(
+      () => outputRoutes.size === 0,
+      "automatic audio routes released",
+    );
+    sender.close();
+    assert(
+      videoTrack.readyState === "live" && audioTrack.readyState === "live",
+      "SDK stops owned media, not caller capture",
+    );
+    return true;
+  } finally {
+    attachment?.close();
+    sender.close();
+    receiver.close();
+    video.remove();
+    clearInterval(painting);
+    videoTrack.stop();
+    audioTrack.stop();
+    await source.close();
+    RTCPeerConnection.prototype.addTransceiver = originalAddTransceiver;
+    RTCPeerConnection.prototype.setRemoteDescription =
+      originalSetRemoteDescription;
+    AudioNode.prototype.connect = connect;
+    AudioNode.prototype.disconnect = disconnect;
+  }
 })();

@@ -267,6 +267,11 @@ impl Agent {
     }
 
     #[cfg(feature = "sim")]
+    pub fn simulation_ordered_cursors(&self) -> Vec<(crate::TopicSubscriber, String, u64)> {
+        self.topics.simulation_ordered_cursors()
+    }
+
+    #[cfg(feature = "sim")]
     pub fn simulation_sent_intent_revision(&self) -> Option<u64> {
         if self.intent_dirty || self.pending_signal.is_some() || self.signal_retry.is_some() {
             return None;

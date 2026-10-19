@@ -70,9 +70,11 @@ rather than the static preview.
 
 `check` covers types, formatting, dependency boundaries, and exported entry/CNAME
 integrity. The browser owner runs the real static export with a Web peer and an
-owned local node on ephemeral listeners. It covers external identity, credential
-handling across the exercised session lifecycle, media/topic continuity, and both
-early and late audio-gesture premises. Credential observation starts before form
+owned local node on ephemeral listeners. Its focused smokes cover join, external
+identity, credential handling, actual chat/reaction rendering with fresh decoded
+media, Leave cleanup, and both early and late audio-gesture premises. Reliable
+loss/restart/order/history policy belongs to deterministic native/SFU simulation;
+the Web adapter retains its own reconnect round trip. Credential observation starts before form
 entry and includes transient storage, URL, and console effects; it is not a universal
 proof about unexercised future paths. Local fixture serving does not certify public
 hosting configuration. See the [contributor testing contract](../../docs/build.md#testing-contract).

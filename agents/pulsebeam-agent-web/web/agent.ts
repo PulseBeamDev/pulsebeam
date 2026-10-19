@@ -29,13 +29,22 @@ import type {
   TopicMode,
   TopicRegistration,
   VideoDemand,
-  TopicPublisherStatus,
   TopicSnapshot,
-  TopicSubscriberStatus,
 } from "./types.js";
 import { RemoteCatalog } from "./remote-catalog.js";
 import { TopicRegistry } from "./topic.js";
 import { BrowserRuntime, whenInitialized } from "./wasm.js";
+import {
+  copyConfig,
+  copyState,
+  desiredValue,
+  emptySnapshot,
+  freezeTopicSnapshot,
+  validatePlayoutDelay,
+  type RuntimeConfig,
+} from "./agent-state.js";
+import { LocalTrackHandle, LocalTrackCapacityError } from "./local-track.js";
+export { LocalTrackCapacityError } from "./local-track.js";
 
 type Runtime = InstanceType<typeof BrowserRuntime>;
 
@@ -56,161 +65,6 @@ interface RuntimeSnapshot {
   readonly failure?: AgentError;
 }
 
-interface RuntimeConfig {
-  readonly endpoint: string;
-  readonly token: string;
-  readonly topology: Required<MediaTopology>;
-  readonly logLevel: LogLevel;
-}
-
-const EMPTY_ARRAY: readonly never[] = Object.freeze([]);
-const EMPTY_TRACKS: Readonly<Record<string, RemoteTrack>> = Object.freeze({});
-
-function emptyTopics(): TopicSnapshot {
-  return Object.freeze({
-    publishers: EMPTY_ARRAY,
-    subscribers: EMPTY_ARRAY,
-    acceptedSends: 0,
-    droppedSends: 0,
-    deliveredMessages: 0,
-    resynchronizations: 0,
-    channelFailures: 0,
-  });
-}
-
-function emptySnapshot(connection: ConnectionState): AgentSnapshot {
-  return Object.freeze({
-    version: 0,
-    desiredRevision: 0,
-    connection,
-    generation: null,
-    participantId: null,
-    participantExternalId: null,
-    roomExternalId: null,
-    authorizationExpiresAt: null,
-    catalog: Object.freeze({
-      revision: 0,
-      participants: EMPTY_ARRAY,
-      publications: EMPTY_ARRAY,
-    }),
-    mapping: Object.freeze({
-      acceptedIntentRevision: 0,
-      video: EMPTY_ARRAY,
-      audio: EMPTY_ARRAY,
-    }),
-    tracks: EMPTY_TRACKS,
-    topics: emptyTopics(),
-    failure: null,
-  });
-}
-
-function copyConfig(config: AgentConfig): RuntimeConfig {
-  return Object.freeze({
-    endpoint: config.endpoint,
-    token: config.token,
-    topology: Object.freeze({
-      localVideos: config.topology?.localVideos ?? 2,
-      localAudios: config.topology?.localAudios ?? 2,
-      remoteVideos: config.topology?.remoteVideos ?? 16,
-      remoteAudios: config.topology?.remoteAudios ?? 8,
-    }),
-    logLevel: config.logging?.level ?? "warn",
-  });
-}
-
-function validatePlayoutDelay(state: AgentState): void {
-  const delays = [
-    ...(state.video ?? []).map((demand) => demand.playoutDelay),
-    ...(state.audio?.playoutDelays ?? []).map((entry) => entry.playoutDelay),
-    ...(state.audio?.selectorDelays ?? []).map((entry) => entry.playoutDelay),
-  ];
-  for (const delay of delays) {
-    if (delay === undefined) continue;
-    if (
-      delay.mode !== "fixed" ||
-      !Number.isInteger(delay.minMs) ||
-      !Number.isInteger(delay.maxMs) ||
-      delay.minMs < 0 ||
-      delay.maxMs < 0 ||
-      delay.minMs > 0xffffffff ||
-      delay.maxMs > 0xffffffff
-    ) {
-      throw new RangeError(
-        "playout delay requires unsigned 32-bit millisecond bounds",
-      );
-    }
-  }
-}
-
-function copyState(state: AgentState): AgentState {
-  return Object.freeze({
-    connected: state.connected,
-    publications: Object.freeze(
-      (state.publications ?? []).map((publication) =>
-        Object.freeze({ ...publication }),
-      ),
-    ),
-    video: Object.freeze(
-      (state.video ?? []).map((demand) => {
-        const fields = {
-          slot: demand.slot,
-          height: demand.height,
-          minHeight: demand.minHeight,
-          minFps: demand.minFps,
-          priority: demand.priority,
-          ...(demand.playoutDelay
-            ? { playoutDelay: Object.freeze({ ...demand.playoutDelay }) }
-            : {}),
-        };
-        return demand.selector
-          ? Object.freeze({
-              ...fields,
-              selector: Object.freeze({ ...demand.selector }),
-            })
-          : Object.freeze({ ...fields, trackId: demand.trackId! });
-      }),
-    ),
-    audio: Object.freeze({
-      pinned: Object.freeze([...(state.audio?.pinned ?? [])]),
-      selected: Object.freeze(
-        (state.audio?.selected ?? []).map((selector) =>
-          Object.freeze({ ...selector }),
-        ),
-      ),
-      automatic: state.audio?.automatic ?? true,
-      playoutDelays: Object.freeze(
-        (state.audio?.playoutDelays ?? []).map((entry) =>
-          Object.freeze({
-            trackId: entry.trackId,
-            playoutDelay: Object.freeze({ ...entry.playoutDelay }),
-          }),
-        ),
-      ),
-      selectorDelays: Object.freeze(
-        (state.audio?.selectorDelays ?? []).map((entry) =>
-          Object.freeze({
-            selector: Object.freeze({ ...entry.selector }),
-            playoutDelay: Object.freeze({ ...entry.playoutDelay }),
-          }),
-        ),
-      ),
-    }),
-    topics: Object.freeze(
-      (state.topics ?? []).map((topic) => Object.freeze({ ...topic })),
-    ),
-  });
-}
-
-function desiredValue(state: AgentState): object {
-  return {
-    connected: state.connected,
-    publications: state.publications,
-    video: state.video,
-    audio: state.audio,
-    topics: state.topics,
-  };
-}
-
 function message(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
@@ -226,88 +80,6 @@ function localFailureClass(error: unknown): AgentError["class"] {
     return error.pulsebeamClass;
   }
   return "runtime";
-}
-
-function freezeTopicSnapshot(topics: TopicSnapshot): TopicSnapshot {
-  return Object.freeze({
-    publishers: Object.freeze(
-      topics.publishers.map((publisher) => Object.freeze({ ...publisher })),
-    ) as readonly TopicPublisherStatus[],
-    subscribers: Object.freeze(
-      topics.subscribers.map((subscriber) => Object.freeze({ ...subscriber })),
-    ) as readonly TopicSubscriberStatus[],
-    acceptedSends: topics.acceptedSends,
-    droppedSends: topics.droppedSends,
-    deliveredMessages: topics.deliveredMessages,
-    resynchronizations: topics.resynchronizations,
-    channelFailures: topics.channelFailures,
-  });
-}
-
-export class LocalTrackCapacityError extends RangeError {
-  readonly kind: "video" | "audio";
-  readonly label: string;
-  readonly capacity: number;
-
-  constructor(kind: "video" | "audio", label: string, capacity: number) {
-    super(`no reserved ${kind} slot remains for ${label}`);
-    this.name = "LocalTrackCapacityError";
-    this.kind = kind;
-    this.label = label;
-    this.capacity = capacity;
-  }
-}
-
-class LocalTrackHandle<K extends "video" | "audio", S extends CapturedTrack> {
-  #source: S | null = null;
-  #enabled = true;
-  #closed = false;
-  #listeners = new Set<() => void>();
-
-  constructor(
-    readonly kind: K,
-    readonly label: string,
-    private readonly apply: (source: S | null) => void,
-    private readonly applyEnabled: (enabled: boolean) => void,
-  ) {}
-
-  get source(): S | null {
-    return this.#source;
-  }
-
-  get enabled(): boolean {
-    return this.#enabled;
-  }
-
-  setEnabled(enabled: boolean): void {
-    if (this.#closed) throw new Error("agent is closed");
-    if (typeof enabled !== "boolean")
-      throw new TypeError("enabled must be a boolean");
-    if (enabled === this.#enabled) return;
-    this.applyEnabled(enabled);
-    this.#enabled = enabled;
-    for (const listener of this.#listeners) listener();
-  }
-
-  setSource(source: S | null): void {
-    if (this.#closed) throw new Error("agent is closed");
-    if (source === this.#source) return;
-    this.apply(source);
-    this.#source = source;
-    for (const listener of this.#listeners) listener();
-  }
-
-  subscribe(listener: () => void): () => void {
-    this.#listeners.add(listener);
-    return () => this.#listeners.delete(listener);
-  }
-
-  clear(): void {
-    this.#closed = true;
-    this.#source = null;
-    for (const listener of this.#listeners) listener();
-    this.#listeners.clear();
-  }
 }
 
 class AgentFacade implements Agent {

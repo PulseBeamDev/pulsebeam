@@ -55,7 +55,52 @@
   const button = document.createElement("button");
   button.id = "resume-audio";
   button.textContent = "Resume audio";
+  const canvas = document.createElement("canvas");
+  canvas.width = canvas.height = 16;
+  const draw = canvas.getContext("2d");
+  let color = false;
+  const painting = setInterval(() => {
+    draw.fillStyle = (color = !color) ? "red" : "blue";
+    draw.fillRect(0, 0, 16, 16);
+  }, 100);
+  const videoTrack = canvas.captureStream(10).getVideoTracks()[0];
+  const video = document.createElement("video");
+  video.playsInline = true;
+  video.style.cssText = "width:160px;height:120px";
+  document.body.append(video);
+  let retryVideo;
+  const attachment = pulsebeam.attachRemoteMedia(
+    {
+      getSnapshot: () => ({
+        tracks: { video: { media: videoTrack } },
+      }),
+      subscribe: () => () => {},
+    },
+    video,
+    {
+      publicationIds: ["video"],
+      autoPlay: false,
+      onPlaybackBlocked: (_, retry) => {
+        retryVideo = retry;
+      },
+    },
+  );
+  // The attachment selects video only. A native audio track makes the browser
+  // autoplay premise audible, so rejection and retry execute native play().
+  video.srcObject.addTrack(track);
+  await attachment.retryPlayback();
+  const deadline = Date.now() + 5000;
+  while (!retryVideo) {
+    if (Date.now() > deadline)
+      throw new Error("native video was not blocked before trusted gesture");
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert(video.paused, "native video autoplay is blocked");
   const state = {
+    video,
+    videoTrack,
+    painting,
+    attachment,
     blocked,
     before,
     contexts,
@@ -75,7 +120,12 @@
     // Agent that has no media, lookup, or attachment yet.
     const unlockBefore = before.resumeAudio();
     const unlockBlocked = blocked.resumeAudio();
-    void Promise.all([unlockBefore, unlockBlocked, source.resume()]).then(
+    void Promise.all([
+      unlockBefore,
+      unlockBlocked,
+      source.resume(),
+      retryVideo(),
+    ]).then(
       () => {
         state.ready = true;
       },

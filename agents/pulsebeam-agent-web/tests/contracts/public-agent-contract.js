@@ -1,364 +1,95 @@
-globalThis.__pulsebeamPublic = (async () => {
-  const exports = Object.keys(window.pulsebeam).sort();
-  const warnings = [];
-  const consoleWarn = console.warn;
-  console.warn = (...values) => warnings.push(values.map(String).join(" "));
-  const nextEvent = (agent, accepts, label) =>
-    new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        unsubscribe();
-        reject(new Error(`timed out waiting for ${label}`));
-      }, 10_000);
-      const unsubscribe = agent.subscribeEvents((event) => {
-        if (!accepts(event)) return;
-        clearTimeout(timer);
-        unsubscribe();
-        resolve(event);
-      });
-    });
-  const coreRejection = (agent) =>
-    nextEvent(
-      agent,
-      (event) =>
-        event.type === "failure" &&
-        event.class === "validation" &&
-        event.message.startsWith("core rejected input:"),
-      "core validation delivery",
-    );
-  let endpointReads = 0;
-  let tokenReads = 0;
-  const config = {
-    get endpoint() {
-      endpointReads += 1;
-      return location.origin;
-    },
-    get token() {
-      tokenReads += 1;
-      return "contract-token";
-    },
-    topology: {
-      localVideos: 1,
-      localAudios: 1,
-      remoteVideos: 1,
-      remoteAudios: 1,
-    },
-    logging: { level: "debug" },
+(async () => {
+  const { createAgent, createCaptureSource, LocalTrackCapacityError } =
+    pulsebeam;
+  const assert = (condition, label) => {
+    if (!condition) throw new Error(label);
   };
-  const first = window.pulsebeam.createAgent(config);
-  const second = window.pulsebeam.createAgent({
+  const first = createAgent({
     endpoint: location.origin,
-    token: "closed-token",
-    topology: {},
-  });
-  const silent = window.pulsebeam.createAgent({
-    endpoint: location.origin,
-    token: "silent-token",
-    topology: {},
+    token: "public-smoke",
+    topology: { localVideos: 1, localAudios: 1 },
     logging: { level: "off" },
   });
-  const initial = first.getSnapshot();
-  const initialStable = initial === first.getSnapshot();
-  const initialFrozen =
-    Object.isFrozen(initial) &&
-    Object.isFrozen(initial.participants) &&
-    Object.isFrozen(initial.publications) &&
-    Object.isFrozen(initial.tracks) &&
-    Object.isFrozen(initial.topics);
-
-  second.close();
-  const publications = [{ slot: "v0", label: "camera", active: true }];
-  first.setState({ connected: true, publications });
-  publications.push({ slot: "mutated", label: "mutated", active: true });
-  first.setState({
-    connected: false,
-    topics: [{ name: "presence", mode: "latest", publish: true }],
-  });
-
-  const canvas = document.createElement("canvas");
-  const track = canvas.captureStream(1).getVideoTracks()[0];
-  const handleAgent = window.pulsebeam.createAgent({
+  const closedDuringInitialization = createAgent({
     endpoint: location.origin,
-    token: "handle-token",
-    topology: { localVideos: 1, localAudios: 1 },
+    token: "close-before-initialization",
   });
-  const videoHandle = handleAgent.local.video("camera");
-  const sameVideoHandle = handleAgent.local.video("camera");
-  const audioHandle = handleAgent.local.audio("camera");
-  const capture = window.pulsebeam.createCaptureSource(track, "video");
-  let capacity;
+  closedDuringInitialization.close();
+  const track = document
+    .createElement("canvas")
+    .captureStream(1)
+    .getVideoTracks()[0];
   try {
-    handleAgent.local.video("screen");
-  } catch (error) {
-    capacity = error;
-  }
-  let handleChanges = 0;
-  const unsubscribeHandle = videoHandle.subscribe(() => {
-    handleChanges += 1;
-  });
-  videoHandle.setEnabled(false);
-  videoHandle.setSource(capture);
-  const disabledBeforeCapture =
-    !videoHandle.enabled && videoHandle.source === capture && track.enabled;
-  videoHandle.setEnabled(true);
-  let wrongLabelRejected = false;
-  try {
-    handleAgent.setState({
-      connected: false,
-      publications: [{ slot: "v0", label: "screen", active: true }],
+    first.connect();
+    first.disconnect();
+    const camera = first.local.video("camera");
+    assert(first.local.video("camera") === camera, "stable local reservation");
+    assert(first.local.audio("camera") !== camera, "separate media namespaces");
+    assert(camera.source === null, "empty local source");
+    let exhausted = false;
+    try {
+      first.local.video("screen");
+    } catch (error) {
+      exhausted = error instanceof LocalTrackCapacityError;
+    }
+    assert(exhausted, "public capacity failure");
+    camera.setSource(createCaptureSource(track, "video"));
+    await first.replaceLocalTrack("v0", track, { contentHint: "motion" });
+    assert(
+      first.connection === "disconnected",
+      "latest desire crosses packaged WASM initialization",
+    );
+    const validation = new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        remove();
+        reject(new Error("missing core validation event"));
+      }, 5000);
+      const remove = first.subscribeEvents((event) => {
+        if (event.type !== "failure" || event.class !== "validation") return;
+        clearTimeout(timer);
+        remove();
+        resolve();
+      });
     });
-  } catch (error) {
-    wrongLabelRejected = error instanceof TypeError;
-  }
-  handleAgent.disconnect();
-  videoHandle.setSource(null);
-  videoHandle.setSource(capture);
-  const sourceRetained = videoHandle.source === capture;
-  unsubscribeHandle();
-  handleAgent.close();
-  let closedHandleRejected = false;
-  try {
-    videoHandle.setSource(capture);
-  } catch (error) {
-    closedHandleRejected = error.message === "agent is closed";
-  }
-  const defaulted = window.pulsebeam.createAgent({
-    endpoint: location.origin,
-    token: "default-capacity-token",
-  });
-  const defaultedCamera = defaulted.local.video("camera");
-  const defaultedScreen = defaulted.local.video("screen");
-  const defaultedMicrophone = defaulted.local.audio("microphone");
-  const defaultedSystemAudio = defaulted.local.audio("system");
-  let defaultVideoExhausted = false;
-  let defaultAudioExhausted = false;
-  try {
-    defaulted.local.video("third");
-  } catch (error) {
-    defaultVideoExhausted =
-      error instanceof window.pulsebeam.LocalTrackCapacityError &&
-      error.capacity === 2;
-  }
-  try {
-    defaulted.local.audio("third");
-  } catch (error) {
-    defaultAudioExhausted =
-      error instanceof window.pulsebeam.LocalTrackCapacityError &&
-      error.capacity === 2;
-  }
-  const defaultTopology =
-    defaultedCamera.kind === "video" &&
-    defaultedScreen.kind === "video" &&
-    defaultedMicrophone.kind === "audio" &&
-    defaultedSystemAudio.kind === "audio" &&
-    defaultVideoExhausted &&
-    defaultAudioExhausted;
-  defaulted.close();
-
-  const dual = window.pulsebeam.createAgent({
-    endpoint: location.origin,
-    token: "dual-handle-token",
-    topology: { localVideos: 2 },
-  });
-  const dualCamera = dual.local.video("camera");
-  const dualScreen = dual.local.video("screen");
-  dual.connect();
-  dual.disconnect();
-  dualScreen.setSource(capture);
-  dualScreen.setSource(null);
-  let exhaustedAfterClearing;
-  try {
-    dual.local.video("aux");
-  } catch (error) {
-    exhaustedAfterClearing = error;
-  }
-  let invalidLabelRejected = false;
-  try {
-    dual.local.video("ü".repeat(33));
-  } catch (error) {
-    invalidLabelRejected = error instanceof TypeError;
-  }
-  const retainedBindings =
-    dual.local.video("screen") === dualScreen &&
-    dual.local.video("camera") === dualCamera &&
-    exhaustedAfterClearing?.kind === "video" &&
-    exhaustedAfterClearing.label === "aux" &&
-    exhaustedAfterClearing.capacity === 2 &&
-    invalidLabelRejected;
-  dual.close();
-  const localHandles =
-    retainedBindings &&
-    videoHandle === sameVideoHandle &&
-    audioHandle.kind === "audio" &&
-    audioHandle.label === "camera" &&
-    capacity?.name === "LocalTrackCapacityError" &&
-    capacity.kind === "video" &&
-    capacity.label === "screen" &&
-    capacity.capacity === 1 &&
-    wrongLabelRejected &&
-    disabledBeforeCapture &&
-    handleChanges === 5 &&
-    sourceRetained &&
-    videoHandle.source === null &&
-    closedHandleRejected &&
-    track.readyState === "live";
-  await first.replaceLocalTrack("v0", track, {
-    contentHint: "motion",
-    encodings: [],
-  });
-  const latestOnly = first.getSnapshot().connection === "disconnected";
-  await first.setLocalMuted("v0", true);
-  const muted = track.enabled;
-  await first.setLocalMuted("v0", false);
-  const unmuted = track.enabled;
-  await first.replaceLocalTrack("v0", null, {
-    contentHint: "motion",
-  });
-
-  const events = [];
-  const removeEvents = first.subscribeEvents((event) => events.push(event));
-  let invalidStateRejected = false;
-  try {
     first.setState({
       connected: false,
       video: [
         {
-          slot: -1,
-          trackId: "invalid-slot",
-          height: 720,
+          slot: 0,
+          trackId: "a",
+          height: 180,
+          minHeight: 180,
+          minFps: 15,
+          priority: 100,
+        },
+        {
+          slot: 0,
+          trackId: "b",
+          height: 180,
           minHeight: 180,
           minFps: 15,
           priority: 100,
         },
       ],
     });
-  } catch (error) {
-    invalidStateRejected = /invalid desired state/.test(error.message);
-  }
-  const serializationFailureNonterminal =
-    invalidStateRejected &&
-    first.getSnapshot().connection !== "terminal-failure" &&
-    first.getSnapshot().failure === null;
-  const firstCoreRejection = coreRejection(first);
-  first.setState({
-    connected: false,
-    video: [
-      {
-        slot: 0,
-        trackId: "duplicate-a",
-        height: 720,
-        minHeight: 180,
-        minFps: 15,
-        priority: 100,
-      },
-      {
-        slot: 0,
-        trackId: "duplicate-b",
-        height: 720,
-        minHeight: 180,
-        minFps: 15,
-        priority: 100,
-      },
-    ],
-  });
-  await firstCoreRejection;
-  const warningsBeforeSilent = warnings.length;
-  first.setState({
-    connected: false,
-    topics: [{ name: "presence", mode: "latest", publish: true }],
-  });
-  const validationRejected = await first.setLocalMuted("missing", true).then(
-    () => false,
-    () => true,
-  );
-  const silentValidationRejected = await silent
-    .setLocalMuted("missing", true)
-    .then(
-      () => false,
-      () => true,
+    await validation;
+    first.close();
+    const terminal = first.getSnapshot();
+    first.close();
+    first.setState({ connected: true });
+    assert(
+      first.getSnapshot() === terminal && camera.source === null,
+      "terminal public facade cleanup",
     );
-  const silentCoreRejection = coreRejection(silent);
-  silent.setState({
-    connected: false,
-    video: [
-      {
-        slot: 0,
-        trackId: "silent-duplicate-a",
-        height: 720,
-        minHeight: 180,
-        minFps: 15,
-        priority: 100,
-      },
-      {
-        slot: 0,
-        trackId: "silent-duplicate-b",
-        height: 720,
-        minHeight: 180,
-        minFps: 15,
-        priority: 100,
-      },
-    ],
-  });
-  await silentCoreRejection;
-  const scopedLogging =
-    warningsBeforeSilent > 0 && warnings.length === warningsBeforeSilent;
-  const dropped = nextEvent(
-    first,
-    (event) =>
-      event.type === "topic-send-dropped" && event.topic === "presence",
-    "topic drop delivery",
-  );
-  first.sendTopic("presence", "latest", new Uint8Array([1, 2, 3]));
-  await dropped;
-  removeEvents();
-  removeEvents();
-
-  let calls = 0;
-  const remove = first.subscribe(() => {
-    calls += 1;
-  });
-  remove();
-  remove();
-  first.close();
-  silent.close();
-  const closed = first.getSnapshot();
-  first.close();
-  first.setState({ connected: true });
-  console.warn = consoleWarn;
-
-  return {
-    exports,
-    independent: first !== second,
-    configCopied: endpointReads === 1 && tokenReads === 1,
-    initialStable,
-    initialFrozen,
-    initial: initial.connection,
-    latestOnly:
-      latestOnly &&
-      events.some(
-        (event) =>
-          event.type === "topic-send-dropped" &&
-          event.topic === "presence" &&
-          event.reason !== "not-registered",
-      ),
-    closeBeforeSettlement: second.getSnapshot().connection === "disconnected",
-    localOperations: muted && unmuted,
-    localHandles,
-    defaultTopology,
-    validationRejected,
-    scopedLogging: silentValidationRejected && scopedLogging,
-    serializationFailureNonterminal,
-    failureEvent: events.some(
-      (event) => event.type === "failure" && event.class === "validation",
-    ),
-    coreValidationEvent: events.some(
-      (event) =>
-        event.type === "failure" &&
-        event.class === "validation" &&
-        event.message.startsWith("core rejected input:"),
-    ),
-    callerOwnsTrack: track.readyState === "live",
-    noRemovedListenerCalls: calls === 0,
-    closed: closed.connection,
-    postClose: first.getSnapshot() === closed,
-  };
+    assert(track.readyState === "live", "public facade borrows capture");
+    assert(
+      closedDuringInitialization.connection === "disconnected",
+      "initialization completion is fenced",
+    );
+    return true;
+  } finally {
+    first.close();
+    closedDuringInitialization.close();
+    track.stop();
+  }
 })();

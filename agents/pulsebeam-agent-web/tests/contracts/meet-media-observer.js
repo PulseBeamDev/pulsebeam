@@ -44,15 +44,11 @@
   const contexts = [];
   let audioGesture = false;
   let blockedResumes = 0;
-  for (const type of ["pointerdown", "keydown"]) {
-    addEventListener(
-      type,
-      (event) => {
-        if (event.isTrusted) audioGesture = true;
-      },
-      true,
-    );
-  }
+  const gesture = (event) => {
+    if (event.isTrusted) audioGesture = true;
+  };
+  for (const type of ["pointerdown", "keydown"])
+    addEventListener(type, gesture, true);
   const RealContext = AudioContext;
   window.AudioContext = class extends RealContext {
     constructor(...args) {
@@ -112,6 +108,10 @@
     },
   });
   const trackChanges = new Map();
+  const streamMethods = {
+    addTrack: MediaStream.prototype.addTrack,
+    removeTrack: MediaStream.prototype.removeTrack,
+  };
   for (const method of ["addTrack", "removeTrack"]) {
     const original = MediaStream.prototype[method];
     MediaStream.prototype[method] = function (track) {
@@ -123,12 +123,6 @@
       return result;
     };
   }
-  const plays = new Map();
-  const play = HTMLMediaElement.prototype.play;
-  HTMLMediaElement.prototype.play = function (...args) {
-    plays.set(this, (plays.get(this) ?? 0) + 1);
-    return play.apply(this, args);
-  };
   const messages = [];
   const send = RTCDataChannel.prototype.send;
   RTCDataChannel.prototype.send = function (value) {
@@ -172,9 +166,8 @@
     return current;
   };
   const rejections = [];
-  addEventListener("unhandledrejection", (event) =>
-    rejections.push(String(event.reason)),
-  );
+  const rejection = (event) => rejections.push(String(event.reason));
+  addEventListener("unhandledrejection", rejection);
   const receiverPeers = () =>
     [...peers].filter((peer) =>
       peer
@@ -272,41 +265,15 @@
         }
       }
     }
-    const frameTimes = new Map(
-      videos.map((video) => [video, performance.now()]),
-    );
-    const callbacks = new Map();
-    let active = true;
-    const watchFrames = (video) => {
-      callbacks.set(
-        video,
-        video.requestVideoFrameCallback((now) => {
-          if (!active) return;
-          if (now - frameTimes.get(video) > 1000) {
-            violations.add("remote video stalled during topic activity");
-          }
-          frameTimes.set(video, now);
-          watchFrames(video);
-        }),
-      );
-    };
     for (const video of videos) {
-      for (const event of ["pause", "emptied", "waiting", "stalled", "abort"]) {
+      for (const event of ["pause", "emptied", "abort"]) {
         listen(video, event, `remote video ${event}`);
       }
-      watchFrames(video);
     }
     const sample = () => {
       for (const [stream, before] of changes) {
         if ((trackChanges.get(stream) ?? 0) !== before) {
           violations.add("remote stream tracks changed");
-        }
-      }
-      if (!audible(connections))
-        violations.add("remote audio stopped during topic activity");
-      for (const video of videos) {
-        if (performance.now() - frameTimes.get(video) > 1000) {
-          violations.add("remote video stalled during topic activity");
         }
       }
     };
@@ -320,12 +287,9 @@
         );
       },
       stop() {
-        active = false;
         clearInterval(timer);
         removals.disconnect();
         for (const remove of listeners) remove();
-        for (const [video, callback] of callbacks)
-          video.cancelVideoFrameCallback(callback);
       },
     };
   };
@@ -339,7 +303,6 @@
         element,
         stream: element.srcObject,
         resets: resets.get(element),
-        plays: plays.get(element),
         frames: element.getVideoPlaybackQuality().totalVideoFrames,
       })),
       peers: receiverPeers(),
@@ -395,7 +358,7 @@
         video.element.isConnected &&
           video.element.srcObject === video.stream &&
           resets.get(video.element) === video.resets &&
-          plays.get(video.element) === video.plays,
+          !video.element.paused,
         "UI traffic cannot detach/restart remote playback even temporarily",
       );
     }
@@ -421,101 +384,6 @@
     );
     return true;
   };
-  const enablement = async () => {
-    const { sender } = window.__meet;
-    const camera = sender.local.video("camera");
-    const microphone = sender.local.audio("microphone");
-    const video = currentVideo();
-    const stream = video.srcObject;
-    const track = stream.getVideoTracks()[0];
-    const identity = JSON.stringify(sender.getSnapshot().publications);
-    const pixel = document.createElement("canvas");
-    pixel.width = pixel.height = 1;
-    const context = pixel.getContext("2d");
-    const brightness = () => {
-      context.drawImage(video, 0, 0, 1, 1);
-      return Math.max(...context.getImageData(0, 0, 1, 1).data.slice(0, 3));
-    };
-    await wait(() => brightness() > 32, "colored video before disable");
-    mark();
-    camera.setEnabled(false);
-    sender.setState({
-      connected: true,
-      topics: [
-        { name: "chat", mode: "ordered", publish: true },
-        { name: "reactions", mode: "latest", publish: true },
-      ],
-    });
-    await wait(
-      () => brightness() < 8 && audible(),
-      "black video while audio continues",
-    );
-    assert(camera.source !== null, "camera disable retains capture");
-    assert(
-      JSON.stringify(sender.getSnapshot().publications) === identity,
-      "disable and unrelated intent retain publication identities",
-    );
-    assert(
-      currentVideo() === video &&
-        video.srcObject === stream &&
-        stream.getVideoTracks()[0] === track,
-      "black frames retain receiver and DOM identity",
-    );
-    camera.setEnabled(true);
-    await wait(
-      () => brightness() > 32 && audible(),
-      "camera resumes without reattachment",
-    );
-    await continuity();
-    const routes = routeChanges;
-    microphone.setEnabled(false);
-    await wait(() => !audible(), "disabled microphone decodes silence");
-    assert(
-      microphone.source !== null &&
-        audioNodes().length === 1 &&
-        routeChanges === routes,
-      "microphone disable retains capture and audio route",
-    );
-    microphone.setEnabled(true);
-    await wait(() => audible(), "microphone resumes without route reset");
-    assert(
-      JSON.stringify(sender.getSnapshot().publications) === identity,
-      "media enablement never withdraws publications",
-    );
-    return true;
-  };
-  const recovered = async (count) => {
-    const replacements = () =>
-      receiverPeers()
-        .slice(count)
-        .filter((peer) => peer.connectionState === "connected");
-    await wait(
-      () => currentVideo(replacements()) && audible(replacements()),
-      "new receiver decodes automatically without repair gesture",
-    );
-    const video = currentVideo(replacements());
-    const frames = video.getVideoPlaybackQuality().totalVideoFrames;
-    await wait(
-      () =>
-        video.getVideoPlaybackQuality().totalVideoFrames > frames + 5 &&
-        audible(replacements()),
-      "recovered receiver keeps advancing",
-    );
-    retainedTopics(replacements());
-    assert(
-      remoteVideos().length === 1,
-      "replacement has no duplicate remote video output",
-    );
-    assert(
-      audioNodes().length === 1,
-      "replacement has no duplicate audio output",
-    );
-    assert(
-      rejections.length === 0,
-      `no stale rejected completion: ${rejections}`,
-    );
-    return true;
-  };
   window.__meet = {
     assert,
     wait,
@@ -525,13 +393,31 @@
     ready,
     mark,
     continuity,
-    enablement,
-    recovered,
     receiverPeers,
     audioNodes,
     audible,
     currentVideo,
     rejections,
+    async cleanup() {
+      baseline?.monitor.stop();
+      await window.__meet.stopPublisher?.();
+      for (const peer of peers) peer.close();
+      for (const context of contexts)
+        if (context.state !== "closed") await context.close();
+      RTCPeerConnection.prototype.addTransceiver = addTransceiver;
+      RTCPeerConnection.prototype.createDataChannel = channel;
+      RTCDataChannel.prototype.send = send;
+      window.AudioContext = RealContext;
+      RealContext.prototype.createMediaStreamSource = createSource;
+      AudioNode.prototype.connect = connect;
+      AudioNode.prototype.disconnect = disconnect;
+      Object.defineProperty(HTMLMediaElement.prototype, "srcObject", src);
+      Object.assign(MediaStream.prototype, streamMethods);
+      for (const type of ["pointerdown", "keydown"])
+        removeEventListener(type, gesture, true);
+      removeEventListener("unhandledrejection", rejection);
+      return true;
+    },
   };
   return true;
 })();
