@@ -17,7 +17,7 @@ use std::{
 use crate::{
     PacketFeedbackKind,
     congestion::{EcnMark as ControllerEcnMark, FeedbackSample, LossOrigin},
-    connection::{CommitParticipant, TransmitCommitContext},
+    connection::TransmitCommitContext,
     rtcp::{ArrivalOffset, FeedbackBatch, FeedbackReport, Rfc8888Status, TwccStatus},
     transport::{DatagramKind, PathEpoch, RtpService},
 };
@@ -468,12 +468,8 @@ impl PacketFeedback {
     }
 }
 
-impl CommitParticipant for SentHistory {
-    fn preflight(&self, context: TransmitCommitContext) -> Result<(), HistoryError> {
-        self.preflight_commit(context)
-    }
-
-    fn commit_preflighted(&mut self, context: TransmitCommitContext) {
+impl SentHistory {
+    pub(crate) fn commit_preflighted(&mut self, context: TransmitCommitContext) {
         let result = self.commit_context(context);
         debug_assert_eq!(result, Ok(()));
     }

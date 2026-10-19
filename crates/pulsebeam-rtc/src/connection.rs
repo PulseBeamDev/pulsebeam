@@ -35,10 +35,6 @@ pub struct Connection {
     _not_sync: PhantomData<Cell<()>>,
 }
 
-#[allow(
-    dead_code,
-    reason = "protocol subsystems are initialized by subsequent plans"
-)]
 struct SubsystemSlots {
     transport: Transport,
     ingress: IngressOwner,
@@ -46,16 +42,7 @@ struct SubsystemSlots {
     sctp: Option<Association>,
 }
 
-trait RuntimeSubsystem: Send {
-    fn poll(&mut self, at: TimePoint) -> Option<Output>;
-
-    fn next_deadline(&self) -> Option<Instant>;
-}
-
 struct Runtime {
-    feedback: Option<Box<dyn RuntimeSubsystem>>,
-    controller: Option<Box<dyn RuntimeSubsystem>>,
-    scheduler: Option<Box<dyn RuntimeSubsystem>>,
     service: ServiceArbiter,
     commit: CommitCoordinator,
     lifecycle: Lifecycle,
@@ -72,32 +59,10 @@ enum Lifecycle {
 impl Runtime {
     fn new(feedback: Option<PacketFeedbackKind>) -> Self {
         Self {
-            feedback: None,
-            controller: None,
-            scheduler: None,
             service: ServiceArbiter::default(),
             commit: CommitCoordinator::new(feedback),
             lifecycle: Lifecycle::Open,
         }
-    }
-
-    fn poll_subsystems(&mut self, at: TimePoint) -> Option<Output> {
-        [
-            &mut self.feedback,
-            &mut self.controller,
-            &mut self.scheduler,
-        ]
-        .into_iter()
-        .flatten()
-        .find_map(|subsystem| subsystem.poll(at))
-    }
-
-    fn next_deadline(&self) -> Option<Instant> {
-        [&self.feedback, &self.controller, &self.scheduler]
-            .into_iter()
-            .flatten()
-            .filter_map(|subsystem| subsystem.next_deadline())
-            .min()
     }
 }
 
@@ -110,17 +75,8 @@ pub(crate) struct TransmitCommitContext {
     pub(crate) rtp: Option<PreparedRtpIdentity>,
 }
 
-pub(crate) trait CommitParticipant: Send {
-    fn preflight(&self, _context: TransmitCommitContext) -> Result<(), HistoryError> {
-        Ok(())
-    }
-
-    fn commit_preflighted(&mut self, context: TransmitCommitContext);
-}
-
 struct CommitCoordinator {
     history: SentHistory,
-    participants: Vec<Box<dyn CommitParticipant>>,
     counters: CommitCounters,
 }
 
@@ -137,7 +93,6 @@ impl CommitCoordinator {
     fn new(feedback: impl Into<Option<PacketFeedbackKind>>) -> Self {
         Self {
             history: SentHistory::new(feedback),
-            participants: Vec::new(),
             counters: CommitCounters::default(),
         }
     }
@@ -155,10 +110,7 @@ impl CommitCoordinator {
             path_epoch: prepared.path_epoch,
             rtp: prepared.rtp,
         };
-        CommitParticipant::preflight(&self.history, context)?;
-        for participant in &self.participants {
-            participant.preflight(context)?;
-        }
+        self.history.preflight_commit(context)?;
         if egress
             .as_deref()
             .is_some_and(|egress| !egress.preflight_commit(&prepared))
@@ -166,9 +118,6 @@ impl CommitCoordinator {
             return Err(HistoryError::InvalidCommit);
         }
         self.history.commit_preflighted(context);
-        for participant in &mut self.participants {
-            participant.commit_preflighted(context);
-        }
         if let Some(egress) = egress {
             egress.commit(at, &prepared);
         }
@@ -582,14 +531,6 @@ impl Connection {
             return output;
         }
 
-        if !matches!(
-            self.runtime.lifecycle,
-            Lifecycle::ClosedPending(_) | Lifecycle::Closed(_)
-        ) && let Some(output) = self.runtime.poll_subsystems(at)
-        {
-            return output;
-        }
-
         if let Some(event) = self._subsystems.egress.poll_event() {
             return Output::Event(event);
         }
@@ -599,7 +540,6 @@ impl Connection {
                 .then(|| {
                     [
                         self._subsystems.transport.next_deadline(),
-                        self.runtime.next_deadline(),
                         self.runtime.commit.history.next_deadline(),
                         self._subsystems
                             .transport
@@ -893,13 +833,8 @@ mod tests {
         NetworkPolicy, PeerFixture, RtpImpairment, assert_initial_probe_windows,
         assert_probe_windows, forwarded,
     };
-    use crate::{
-        ForwardedMedia, FrameBoundary, FrameDependencies, FrameId, FrameMetadata, TransmitTarget,
-    };
-    use std::{
-        sync::{Arc, Mutex},
-        time::Duration,
-    };
+    use crate::{ForwardedMedia, FrameBoundary, FrameDependencies, FrameId, FrameMetadata};
+    use std::{sync::Arc, time::Duration};
 
     #[test]
     fn potential_only_sender_obtains_padding_feedback_without_media() {
@@ -1748,121 +1683,6 @@ mod tests {
         assert!(offered <= 100_000, "actual sparse offer={offered}");
         assert!(application_limited);
         assert!(fixture.connection.stats().connection.transmitted_rtp_bytes > 0);
-    }
-
-    struct Observer(Arc<Mutex<Option<TransmitCommitContext>>>);
-
-    impl CommitParticipant for Observer {
-        fn commit_preflighted(&mut self, context: TransmitCommitContext) {
-            *self.0.lock().expect("observer lock") = Some(context);
-        }
-    }
-
-    struct RejectingParticipant(Arc<Mutex<bool>>);
-
-    impl CommitParticipant for RejectingParticipant {
-        fn preflight(&self, _context: TransmitCommitContext) -> Result<(), HistoryError> {
-            Err(HistoryError::Exhausted)
-        }
-
-        fn commit_preflighted(&mut self, _context: TransmitCommitContext) {
-            *self.0.lock().expect("participant lock") = true;
-        }
-    }
-
-    #[test]
-    fn commit_preserves_finalized_wire_context() {
-        let monotonic = Instant::now();
-        let at = TimePoint {
-            monotonic,
-            global: crate::GlobalMediaTime::from_micros(1),
-        };
-        let mut coordinator = CommitCoordinator::new(PacketFeedbackKind::TransportWide);
-        coordinator
-            .history
-            .path_changed(PathEpoch::from_value(3), true);
-        let observed = Arc::new(Mutex::new(None));
-        coordinator
-            .participants
-            .push(Box::new(Observer(Arc::clone(&observed))));
-        let transmit = coordinator
-            .commit_transport(
-                at,
-                PreparedTransmit {
-                    target: TransmitTarget::IceTcp {
-                        flow: crate::IceTcpFlowId::from_value(11),
-                    },
-                    bytes: vec![0, 3, 1, 2, 3],
-                    kind: DatagramKind::Rtp,
-                    wire_len: 5,
-                    path_epoch: Some(PathEpoch::from_value(3)),
-                    rtp: Some(PreparedRtpIdentity {
-                        ssrc: 7,
-                        sequence: 9,
-                        twcc_sequence: Some(13),
-                        service: crate::transport::RtpService::Original,
-                    }),
-                },
-                None,
-            )
-            .expect("valid RTP commit");
-        assert_eq!(transmit.payload, Bytes::from_static(&[0, 3, 1, 2, 3]));
-        assert_eq!(
-            *observed.lock().expect("observer lock"),
-            Some(TransmitCommitContext {
-                at: monotonic,
-                kind: DatagramKind::Rtp,
-                wire_len: 5,
-                path_epoch: Some(PathEpoch::from_value(3)),
-                rtp: Some(PreparedRtpIdentity {
-                    ssrc: 7,
-                    sequence: 9,
-                    twcc_sequence: Some(13),
-                    service: crate::transport::RtpService::Original,
-                }),
-            })
-        );
-    }
-
-    #[test]
-    fn failed_commit_preflight_mutates_no_participant() {
-        let monotonic = Instant::now();
-        let at = TimePoint {
-            monotonic,
-            global: crate::GlobalMediaTime::from_micros(1),
-        };
-        let mut coordinator = CommitCoordinator::new(PacketFeedbackKind::TransportWide);
-        coordinator
-            .history
-            .path_changed(PathEpoch::from_value(3), true);
-        let touched = Arc::new(Mutex::new(false));
-        coordinator
-            .participants
-            .push(Box::new(RejectingParticipant(Arc::clone(&touched))));
-        assert_eq!(
-            coordinator.commit_transport(
-                at,
-                PreparedTransmit {
-                    target: TransmitTarget::IceTcp {
-                        flow: crate::IceTcpFlowId::from_value(11),
-                    },
-                    bytes: vec![0, 3, 1, 2, 3],
-                    kind: DatagramKind::Rtp,
-                    wire_len: 5,
-                    path_epoch: Some(PathEpoch::from_value(3)),
-                    rtp: Some(PreparedRtpIdentity {
-                        ssrc: 7,
-                        sequence: 9,
-                        twcc_sequence: Some(13),
-                        service: crate::transport::RtpService::Original,
-                    }),
-                },
-                None,
-            ),
-            Err(HistoryError::Exhausted)
-        );
-        assert_eq!(coordinator.history.controller_inputs().bytes_in_flight, 0);
-        assert!(!*touched.lock().expect("participant lock"));
     }
 
     #[test]

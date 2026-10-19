@@ -6269,7 +6269,7 @@ mod tests {
     fn reordered_probe_receipts_count_once_without_new_ack_edge_credit() {
         use crate::{
             PacketFeedbackKind,
-            connection::{CommitParticipant, TransmitCommitContext},
+            connection::TransmitCommitContext,
             rtcp::{FeedbackBatch, FeedbackReport, TwccStatus},
             sent_history::SentHistory,
             transport::{DatagramKind, PathEpoch, PreparedRtpIdentity},
@@ -6319,7 +6319,7 @@ mod tests {
                     service: RtpService::Padding,
                 }),
             };
-            history.preflight(context).unwrap();
+            history.preflight_commit(context).unwrap();
             history.commit_preflighted(context);
         }
         let report = |millis, feedback_count, statuses: Vec<TwccStatus>| FeedbackBatch {
