@@ -893,6 +893,36 @@ impl VideoReceiveLog {
         self.decoded_by_publisher.get(publisher).copied()
     }
 
+    pub fn require_decoded_from(
+        &self,
+        publisher: &str,
+        baseline_frames: u64,
+        min_frames: u64,
+    ) -> anyhow::Result<DecodedVideoStream> {
+        anyhow::ensure!(min_frames > 0, "decoded delivery needs a positive minimum");
+        let decoded = self
+            .decoded_from(publisher)
+            .ok_or_else(|| anyhow::anyhow!("{publisher}: no independently decoded video"))?;
+        let frames = decoded.frames.saturating_sub(baseline_frames);
+        anyhow::ensure!(
+            frames >= min_frames,
+            "{publisher}: decoded {frames} frames since baseline {baseline_frames}, expected at least {min_frames}"
+        );
+        Ok(decoded)
+    }
+
+    pub fn require_not_received_from(&self, publisher: &str) -> anyhow::Result<()> {
+        let received = self.frames_from(publisher);
+        let decoded = self
+            .decoded_from(publisher)
+            .map_or(0, |stream| stream.frames);
+        anyhow::ensure!(
+            received == 0 && decoded == 0,
+            "{publisher}: expected no video, received {received} frames and decoded {decoded} frames"
+        );
+        Ok(())
+    }
+
     pub fn stats(&self) -> VideoReceiveStats {
         VideoReceiveStats {
             frames: self.frames,
@@ -1146,6 +1176,57 @@ fn record_video_frame(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decoded_origin_gate_rejects_stale_missing_and_substituted_delivery() {
+        let mut receiver = VideoReceiveLog::default();
+        receiver.record_decoded("intended", 320, 180, None, true, None);
+        let baseline = receiver.decoded_from("intended").unwrap().frames;
+        assert!(receiver.require_decoded_from("intended", 0, 1).is_ok());
+        assert!(
+            receiver
+                .require_decoded_from("intended", baseline, 1)
+                .is_err()
+        );
+
+        receiver.record_decoded("foreign", 320, 180, None, true, None);
+        assert!(
+            receiver
+                .require_decoded_from("intended", baseline, 1)
+                .is_err()
+        );
+        assert!(receiver.require_not_received_from("foreign").is_err());
+
+        let missing_receiver = VideoReceiveLog::default();
+        assert!(
+            missing_receiver
+                .require_decoded_from("intended", 0, 1)
+                .is_err()
+        );
+        assert!(
+            missing_receiver
+                .require_not_received_from("foreign")
+                .is_ok()
+        );
+
+        receiver.record_decoded("intended", 320, 180, None, true, None);
+        assert!(
+            receiver
+                .require_decoded_from("intended", baseline, 1)
+                .is_ok()
+        );
+        assert!(
+            receiver
+                .require_decoded_from("intended", baseline, 2)
+                .is_err()
+        );
+        assert!(receiver.require_not_received_from("foreign").is_err());
+
+        let mut packet_only = VideoReceiveLog::default();
+        packet_only.by_publisher.insert("foreign".to_owned(), 1);
+        assert!(packet_only.require_not_received_from("foreign").is_err());
+        assert!(packet_only.require_decoded_from("foreign", 0, 1).is_err());
+    }
 
     #[test]
     fn a_keyframe_without_parameter_sets_is_recorded_as_undecodable() {

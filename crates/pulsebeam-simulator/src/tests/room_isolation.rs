@@ -59,8 +59,8 @@ fn discovery_does_not_cross_rooms_test() {
 /// thing a client can do to pull media toward itself. If the boundary holds, that request cannot
 /// name the other room's publisher and the subscriber ends up with exactly its own room's video.
 ///
-/// The received-bytes check is what stops this passing vacuously: a boundary that holds because
-/// no video flowed at all would satisfy the discovery assertion on its own.
+/// Each subscriber must decode its own publisher and receive or render no foreign video.
+/// Roster isolation and aggregate bytes alone cannot prove the source of the delivered video.
 #[test]
 fn video_does_not_cross_rooms_test() {
     LocalNodeSim::new()
@@ -80,6 +80,11 @@ fn video_does_not_cross_rooms_test() {
                 duration: Duration::from_secs(5),
             },
             Step::SubscribeAll {
+                description: "Alpha's subscriber asks for everything it can see",
+                participant: "alpha_sub",
+                heights: &[720],
+            },
+            Step::SubscribeAll {
                 description: "Beta's subscriber asks for everything it can see",
                 participant: "beta_sub",
                 heights: &[720],
@@ -93,10 +98,39 @@ fn video_does_not_cross_rooms_test() {
                 participant: "beta_sub",
                 expected: &["beta_pub"],
             },
+            Step::CheckParticipantsKnown {
+                description: "Alpha still sees only its own room's publisher",
+                participant: "alpha_sub",
+                expected: &["alpha_pub"],
+            },
             Step::CheckRxBytesInterval {
                 description: "Beta's subscriber is receiving its own room's video",
                 participant: "beta_sub",
                 min_bytes: 1,
+            },
+            Step::CheckVideoDecodedFrom {
+                description: "Alpha decodes its own room's publisher",
+                participant: "alpha_sub",
+                publisher: "alpha_pub",
+                min_frames: 1,
+                min_resolution: (1, 1),
+            },
+            Step::CheckVideoNotReceivedFrom {
+                description: "Alpha never receives or renders beta's video",
+                participant: "alpha_sub",
+                publisher: "beta_pub",
+            },
+            Step::CheckVideoDecodedFrom {
+                description: "Beta decodes its own room's publisher",
+                participant: "beta_sub",
+                publisher: "beta_pub",
+                min_frames: 1,
+                min_resolution: (1, 1),
+            },
+            Step::CheckVideoNotReceivedFrom {
+                description: "Beta never receives or renders alpha's video",
+                participant: "beta_sub",
+                publisher: "alpha_pub",
             },
         ]);
 }

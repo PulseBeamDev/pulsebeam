@@ -596,6 +596,13 @@ fn network_impairment_test() {
                 participant: "bob",
                 quality: VideoQuality::min_frames(100),
             },
+            Step::CheckVideoDecodedFrom {
+                description: "Bob decodes Alice before the outage",
+                participant: "bob",
+                publisher: "alice",
+                min_frames: 100,
+                min_resolution: (1, 1),
+            },
             Step::Partition {
                 description: "Alice ↔ server outage begins",
                 from: "alice",
@@ -614,10 +621,17 @@ fn network_impairment_test() {
                 description: "Recovery period",
                 duration: Duration::from_secs(30),
             },
-            Step::CheckVideoQuality {
+            Step::CheckVideoQualityInterval {
                 description: "Bob receives renderable video after recovery",
                 participant: "bob",
                 quality: VideoQuality::min_frames(200).allow_gaps(1),
+            },
+            Step::CheckVideoDecodedFromInterval {
+                description: "Bob decodes Alice in the post-repair window",
+                participant: "bob",
+                publisher: "alice",
+                min_frames: 200,
+                min_resolution: (1, 1),
             },
         ]);
 }
@@ -640,6 +654,13 @@ fn reconnection_recovery_test() {
                 participant: "bob",
                 quality: VideoQuality::min_frames(50),
             },
+            Step::CheckVideoDecodedFrom {
+                description: "Bob decodes Alice before the network failure",
+                participant: "bob",
+                publisher: "alice",
+                min_frames: 50,
+                min_resolution: (1, 1),
+            },
             Step::Partition {
                 description: "Alice ↔ server network failure",
                 from: "alice",
@@ -658,10 +679,17 @@ fn reconnection_recovery_test() {
                 description: "Recovery period",
                 duration: Duration::from_secs(20),
             },
-            Step::CheckVideoQuality {
+            Step::CheckVideoQualityInterval {
                 description: "Bob receives renderable video after Alice reconnects",
                 participant: "bob",
                 quality: VideoQuality::min_frames(100).allow_gaps(1),
+            },
+            Step::CheckVideoDecodedFromInterval {
+                description: "Bob decodes Alice in the post-repair window",
+                participant: "bob",
+                publisher: "alice",
+                min_frames: 100,
+                min_resolution: (1, 1),
             },
         ]);
 }

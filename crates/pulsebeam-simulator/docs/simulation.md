@@ -135,6 +135,13 @@ check post-fault atomicity and convergence. Branch counters alone establish
 neither recovery nor continued delivery. Never relax a product threshold,
 substitute an easier seed or add arbitrary retries to hide a failed premise.
 
+For a fixed recovery window, put `Step::Run` immediately after repair, then use
+`CheckVideoQualityInterval` and `CheckVideoDecodedFromInterval` for each intended
+receiver and origin. Both use baselines captured at the start of that run, so
+pre-repair decoded frames cannot establish recovery. Keep a positive decoded
+baseline before the fault. `CheckVideoNotReceivedFrom` checks cumulative received
+and decoded frames, suitable for foreign origins that must never reach a viewer.
+
 The simulator exercises real signaling, codecs and native agents, but not a
 browser's libwebrtc receive path or production Linux socket syscalls. Keep real
 browser evidence for SSRC/SDP compatibility and production transport evidence

@@ -637,6 +637,14 @@ pub enum Step {
         min_frames: u64,
         min_resolution: (usize, usize),
     },
+    /// Independently decoded video from this origin during the last measurement window.
+    CheckVideoDecodedFromInterval {
+        description: &'static str,
+        participant: &'static str,
+        publisher: &'static str,
+        min_frames: u64,
+        min_resolution: (usize, usize),
+    },
     CheckVideoNotRenderedFrom {
         description: &'static str,
         participant: &'static str,
@@ -1159,6 +1167,7 @@ struct ParticipantHandle {
     /// viewer spent waiting.
     subscribed_at: Option<Instant>,
     interval_video_baseline: VideoReceiveStats,
+    interval_decoded_video_baseline: BTreeMap<String, u64>,
     /// Ground truth, from the plan rather than from anything the SFU said.
     ///
     /// The room invariant is checked against these: what this participant actually publishes, and
@@ -1237,7 +1246,13 @@ impl ParticipantHandle {
     fn snapshot_interval(&mut self) {
         self.interval_tx_baseline = self.tx_bytes();
         self.interval_rx_baseline = self.rx_bytes();
-        self.interval_video_baseline = self.video_rx().stats();
+        let video = self.shared.video_rx.lock().unwrap();
+        self.interval_video_baseline = video.stats();
+        self.interval_decoded_video_baseline = video
+            .decoded_by_publisher
+            .iter()
+            .map(|(publisher, decoded)| (publisher.clone(), decoded.frames))
+            .collect();
     }
 }
 
@@ -1497,6 +1512,7 @@ fn step_name(step: &Step) -> &'static str {
         Step::CheckVideoNotReceivedFrom { .. } => "CheckVideoNotReceivedFrom",
         Step::CheckVideoReceivedFrom { .. } => "CheckVideoReceivedFrom",
         Step::CheckVideoDecodedFrom { .. } => "CheckVideoDecodedFrom",
+        Step::CheckVideoDecodedFromInterval { .. } => "CheckVideoDecodedFromInterval",
         Step::CheckVideoNotRenderedFrom { .. } => "CheckVideoNotRenderedFrom",
         Step::CheckKeyframeRequests { .. } => "CheckKeyframeRequests",
         Step::CheckKeyframeRequestsAtLeast { .. } => "CheckKeyframeRequestsAtLeast",
@@ -2496,11 +2512,12 @@ async fn execute_plan(
                     )
                 })?;
                 let handle = get_handle(handles, participant, description)?;
-                let actual = handle.video_rx().frames_from(&publisher_id);
-                assert_eq!(
-                    actual, 0,
-                    "step {n}/{total} {kind}: {description} ({participant} <- {publisher}): expected no frames from participant_id {publisher_id}, got {actual}"
-                );
+                handle
+                    .video_rx()
+                    .require_not_received_from(&publisher_id)
+                    .unwrap_or_else(|error| {
+                        panic!("step {n}/{total} {kind}: {description} ({participant} <- {publisher}): {error}")
+                    });
             }
 
             Step::CheckVideoReceivedFrom {
@@ -2535,6 +2552,13 @@ async fn execute_plan(
                 publisher,
                 min_frames,
                 min_resolution,
+            }
+            | Step::CheckVideoDecodedFromInterval {
+                description,
+                participant,
+                publisher,
+                min_frames,
+                min_resolution,
             } => {
                 tracing::info!(
                     "[step {n}/{total}: {kind}] \"{description}\" ({participant} <- {publisher})"
@@ -2545,17 +2569,21 @@ async fn execute_plan(
                     .participant_id()
                     .ok_or_else(|| anyhow::anyhow!("step \"{description}\": publisher {publisher} has no runtime participant id"))?;
                 let handle = get_handle(handles, participant, description)?;
-                let decoded = handle.video_rx().decoded_from(&publisher_id);
-                let Some(decoded) = decoded else {
-                    panic!(
-                        "step {n}/{total} {kind}: {description} ({participant} <- {publisher_id}) observed packets but no independently decoded video"
-                    );
+                let baseline = if matches!(step, Step::CheckVideoDecodedFromInterval { .. }) {
+                    handle
+                        .interval_decoded_video_baseline
+                        .get(&publisher_id)
+                        .copied()
+                        .unwrap_or(0)
+                } else {
+                    0
                 };
-                assert!(
-                    decoded.frames >= *min_frames,
-                    "step {n}/{total} {kind}: {description} ({participant} <- {publisher_id}) decoded {} frames, expected at least {min_frames}",
-                    decoded.frames
-                );
+                let decoded = handle
+                    .video_rx()
+                    .require_decoded_from(&publisher_id, baseline, *min_frames)
+                    .unwrap_or_else(|error| {
+                        panic!("step {n}/{total} {kind}: {description} ({participant} <- {publisher_id}): {error}")
+                    });
                 assert!(
                     decoded.width >= min_resolution.0 && decoded.height >= min_resolution.1,
                     "step {n}/{total} {kind}: {description} ({participant} <- {publisher_id}) decoded {}x{}, expected at least {}x{}",
@@ -5139,6 +5167,7 @@ impl LocalNodeSim {
                         interval_rx_baseline: 0,
                         subscribed_at: None,
                         interval_video_baseline: VideoReceiveStats::default(),
+                        interval_decoded_video_baseline: BTreeMap::new(),
                         publishes_video: matches!(participant.role, Role::Publisher)
                             || participant.subscribes && !participant.rids.is_empty(),
                         publishes_audio: participant.audio_level_dbov.is_some(),
