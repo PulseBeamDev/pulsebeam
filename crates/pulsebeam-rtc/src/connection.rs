@@ -450,6 +450,19 @@ impl Connection {
             }
         }
 
+        if matches!(self.runtime.lifecycle, Lifecycle::Open)
+            && self._subsystems.transport.can_send_user_data()
+            && let Some(packet) = self._subsystems.ingress.poll_control(at.monotonic)
+        {
+            if let Err(error) = self._subsystems.transport.send_rtcp(&packet)
+                && error != TransportError::QueueFull
+            {
+                let reason = close_reason(error);
+                self.runtime.lifecycle = Lifecycle::Closed(reason);
+                return Output::Closed(reason);
+            }
+        }
+
         if !matches!(
             self.runtime.lifecycle,
             Lifecycle::ClosedPending(_) | Lifecycle::Closed(_)
@@ -541,6 +554,10 @@ impl Connection {
                     [
                         self._subsystems.transport.next_deadline(),
                         self.runtime.commit.history.next_deadline(),
+                        (matches!(self.runtime.lifecycle, Lifecycle::Open)
+                            && self._subsystems.transport.can_send_user_data())
+                        .then(|| self._subsystems.ingress.next_deadline())
+                        .flatten(),
                         self._subsystems
                             .transport
                             .can_send_user_data()
@@ -746,6 +763,7 @@ impl Connection {
             negotiated.facts.ingress_media(),
             config.limits.max_unsignaled_encodings,
             config.limits.max_queued_media_bytes,
+            u32::from_be_bytes(entropy.take(b"receive-rtcp-ssrc")).max(1),
         );
         let egress = MediaEgress::new(
             negotiated.facts.egress_senders(),

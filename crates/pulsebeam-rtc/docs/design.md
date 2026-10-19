@@ -988,6 +988,17 @@ pub struct EncodingInfo {
 - Inactivity never retires a paused encoding. RTCP BYE or
   `Command::RetireEncoding` does.
 - Malformed or unauthenticated packets never create an encoding.
+- Primary RTP and incoming RTX share a 256-packet source sequence window.
+  Delivery remains cut-through and can be reordered; duplicates and packets
+  older than the window are dropped. RTX uses the negotiated payload `apt` and
+  FID SSRC pair, or a repaired RID associated with an existing primary encoding.
+  Its original sequence number, primary payload type and primary SSRC are
+  restored before canonical source delivery. An unknown repair association
+  cannot create a separate primary encoding.
+- When generic NACK is negotiated, gaps wait 10 ms for reordering, then receive
+  at most five NACK attempts spaced 50 ms apart. Missing-packet state is bounded
+  to the source window. Receiver reports run every second and include loss,
+  extended sequence progression, jitter and the last Sender Report relationship.
 - RTP clock state, RTCP synchronization state, retransmission input state, and
   lazy extension metadata belong to the encoding, not the SFU router.
 

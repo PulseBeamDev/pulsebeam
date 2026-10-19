@@ -72,6 +72,9 @@ pub(crate) struct IngressMediaFacts {
     pub(crate) kind: crate::MediaKind,
     pub(crate) mid: Box<str>,
     pub(crate) payloads: Box<[(u8, u32)]>,
+    pub(crate) repairs: Box<[(u8, u8)]>,
+    pub(crate) nack_payloads: Box<[u8]>,
+    pub(crate) ssrc_repairs: Box<[(u32, u32)]>,
     pub(crate) ssrcs: Box<[u32]>,
     pub(crate) rids: Box<[Box<str>]>,
     pub(crate) extensions: Box<[(u8, Box<str>)]>,
@@ -145,6 +148,27 @@ impl NegotiatedSessionFacts {
                         .codecs
                         .iter()
                         .map(|codec| (codec.payload_type, codec.clock_rate))
+                        .collect(),
+                    repairs: section
+                        .codecs
+                        .iter()
+                        .filter_map(|codec| {
+                            codec
+                                .retransmission_payload_type
+                                .map(|repair| (repair, codec.payload_type))
+                        })
+                        .collect(),
+                    nack_payloads: section
+                        .codecs
+                        .iter()
+                        .filter(|codec| codec.nack)
+                        .map(|codec| codec.payload_type)
+                        .collect(),
+                    ssrc_repairs: section
+                        .ssrc_groups
+                        .iter()
+                        .filter(|group| group.semantics.eq_ignore_ascii_case("FID"))
+                        .filter_map(|group| Some((*group.members.get(1)?, *group.members.first()?)))
                         .collect(),
                     ssrcs: section.ssrcs.clone(),
                     rids: section

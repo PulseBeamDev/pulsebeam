@@ -3,7 +3,10 @@
     reason = "NetworkInput's public contract is Bytes-backed"
 )]
 
-use std::{net::SocketAddr, time::Instant};
+use std::{
+    net::SocketAddr,
+    time::{Duration, Instant},
+};
 
 use bytes::Bytes;
 use pulsebeam_rtc::{
@@ -14,15 +17,33 @@ use pulsebeam_rtc::{
 mod support;
 
 #[test]
-fn mixed_direction_native_peer_publishes_video_while_subscribing_to_audio() {
+fn mixed_direction_native_publisher_recovers_loss_as_primary_media() {
     let mut fixture = support::PeerFixture::connected_video_publisher_audio_subscriber();
-    let packet = fixture.send_source(&[0x65, 0x88, 0x44]);
+    fixture.drop_source_packet_after(1);
+    let packets = fixture.send_fragmented_video_source();
+    let (ssrc, sequence) = fixture.lost_source_packet();
+    let recovered = packets
+        .iter()
+        .find(|packet| packet.view().unwrap().sequence_number == sequence)
+        .cloned()
+        .unwrap_or_else(|| fixture.receive_source_sequence(sequence));
+    let view = recovered.view().expect("normalized source RTP");
+    assert_eq!(view.ssrc, ssrc);
+    assert_eq!(view.sequence_number, sequence);
+    assert!(!view.payload.is_empty());
+    assert_eq!(recovered.global_media_at(), packets[0].global_media_at());
     assert!(
-        !packet
-            .view()
-            .expect("normalized source RTP")
-            .payload
-            .is_empty()
+        fixture.source_repair_packets > 0,
+        "native publisher must send real RTX"
+    );
+    assert!(
+        fixture.publisher_nacks > 0,
+        "NACK must cross the authenticated protocol boundary"
+    );
+    fixture.drive_for(Duration::from_millis(1_100));
+    assert!(
+        fixture.publisher_reports > 0,
+        "publisher must receive an RTCP receiver report"
     );
     let stats = fixture.connection.stats();
     assert_eq!(stats.senders.len(), 1);

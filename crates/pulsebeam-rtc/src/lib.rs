@@ -12,6 +12,7 @@ mod media_transit;
 mod negotiation;
 mod pacer;
 mod packet;
+mod receive_stream;
 mod rtcp;
 mod scheduler;
 mod sctp;
@@ -55,6 +56,15 @@ pub use time::{ConnectionEntropy, GlobalMediaTime, TimePoint};
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_native_fixture_contracts() {
+        crate::test_support::scenario_clock_binding_survives_later_peer_initialization();
+        crate::test_support::application_only_fixture_has_no_media();
+        crate::test_support::fixture_advance_stops_at_requested_deadline();
+        crate::test_support::wire_observer_reads_two_byte_dependency_descriptor();
+        crate::test_support::wire_observer_uses_negotiated_extension_ids();
+    }
 
     #[test]
     fn entropy_is_consumed_as_exactly_32_bytes() {

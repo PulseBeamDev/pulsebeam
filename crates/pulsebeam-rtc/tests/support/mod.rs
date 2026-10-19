@@ -61,13 +61,17 @@ pub struct PeerFixture<M = MediaFixture> {
     connection_connected: bool,
     twcc_sent: usize,
     feedback_enabled: bool,
+    drop_source_after: Option<usize>,
+    lost_source: Option<(u32, u16, u8)>,
+    pub source_repair_packets: usize,
+    pub publisher_reports: usize,
+    pub publisher_nacks: usize,
     network: DeterministicNetwork,
     native_target: Option<fn(&Connection) -> Duration>,
     world: std::rc::Rc<SimulationWorld>,
 }
 
-#[test]
-fn scenario_clock_binding_survives_later_peer_initialization() {
+pub fn scenario_clock_binding_survives_later_peer_initialization() {
     let world = SimulationWorld::acquire();
     let start = Instant::now();
     world.bind_clock(start);
@@ -77,8 +81,7 @@ fn scenario_clock_binding_survives_later_peer_initialization() {
     assert_eq!(world.monotonic_now(), start + elapsed);
 }
 
-#[test]
-fn application_only_fixture_has_no_media() {
+pub fn application_only_fixture_has_no_media() {
     let fixture = PeerFixture::connected_application_only();
     assert!(fixture.senders.is_empty());
     assert_eq!(fixture.connection.stats().connection.feedback, None);
@@ -88,8 +91,7 @@ fn application_only_fixture_has_no_media() {
     );
 }
 
-#[test]
-fn fixture_advance_stops_at_requested_deadline() {
+pub fn fixture_advance_stops_at_requested_deadline() {
     let mut fixture = PeerFixture::connected();
     fixture.configure_time_quantum(Duration::from_millis(5));
     let before = fixture.at().monotonic;
@@ -874,6 +876,11 @@ impl<M> PeerFixture<M> {
             connection_connected: false,
             twcc_sent: 0,
             feedback_enabled: true,
+            drop_source_after: None,
+            lost_source: None,
+            source_repair_packets: 0,
+            publisher_reports: 0,
+            publisher_nacks: 0,
             network: DeterministicNetwork::default(),
             native_target: None,
         }
@@ -999,6 +1006,35 @@ impl<M> PeerFixture<M> {
             }
         }
         panic!("PulseBeam connection did not time out");
+    }
+
+    pub fn drop_source_packet_after(&mut self, packets: usize) {
+        self.drop_source_after = Some(packets);
+        self.lost_source = None;
+        self.source_repair_packets = 0;
+    }
+
+    pub fn lost_source_packet(&self) -> (u32, u16) {
+        let (ssrc, sequence, _) = self.lost_source.expect("source packet was dropped");
+        (ssrc, sequence)
+    }
+
+    pub fn receive_source_sequence(&mut self, sequence: u16) -> MediaPacket {
+        for _ in 0..2_000 {
+            if let Some(PeerEvent::Inbound(packet)) = self.step()
+                && packet.view().expect("source RTP").sequence_number == sequence
+            {
+                return packet;
+            }
+        }
+        panic!(
+            "source sequence {sequence} was not recovered: nacks={}, rtx={}, reports={}, elapsed={:?}, stats={:?}",
+            self.publisher_nacks,
+            self.source_repair_packets,
+            self.publisher_reports,
+            self.now.duration_since(self.start),
+            self.connection.stats()
+        );
     }
 
     pub fn send_source(&mut self, payload: &[u8]) -> MediaPacket {
@@ -1305,6 +1341,14 @@ impl<M> PeerFixture<M> {
                     queue_sample,
                     ..
                 } => {
+                    if payload.first().is_some_and(|byte| byte >> 6 == 2) {
+                        if payload.get(1) == Some(&201) {
+                            self.publisher_reports += 1;
+                        }
+                        if payload.get(1) == Some(&205) && payload[0] & 31 == 1 {
+                            self.publisher_nacks += 1;
+                        }
+                    }
                     if self.network.bottleneck_bps.is_some() {
                         self.network.delivered_bytes =
                             self.network.delivered_bytes.saturating_add(rtp_bytes);
@@ -1401,6 +1445,26 @@ impl<M> PeerFixture<M> {
             let bytes = &packet.payload;
             let rtcp = bytes.first().is_some_and(|byte| byte >> 6 == 2)
                 && bytes.get(1).is_some_and(|byte| (192..=223).contains(byte));
+            if bytes.len() >= 12 && !rtcp && bytes[0] >> 6 == 2 && bytes[0] & 0x20 == 0 {
+                let payload_type = bytes[1] & 127;
+                let ssrc =
+                    u32::from_be_bytes(bytes[8..12].try_into().expect("fixed source SSRC width"));
+                let sequence = u16::from_be_bytes(
+                    bytes[2..4].try_into().expect("fixed source sequence width"),
+                );
+                if self.drop_source_after == Some(0) {
+                    self.drop_source_after = None;
+                    self.lost_source = Some((ssrc, sequence, payload_type));
+                    return None;
+                }
+                self.drop_source_after = self.drop_source_after.map(|remaining| remaining - 1);
+                if self
+                    .lost_source
+                    .is_some_and(|(primary, _, pt)| ssrc != primary && payload_type != pt)
+                {
+                    self.source_repair_packets += 1;
+                }
+            }
             if rtcp && !self.feedback_enabled {
                 return None;
             }
@@ -1741,8 +1805,7 @@ fn fixture_rtp_header(bytes: &[u8], ids: FixtureExtensionIds) -> Option<FixtureR
     })
 }
 
-#[test]
-fn wire_observer_reads_two_byte_dependency_descriptor() {
+pub fn wire_observer_reads_two_byte_dependency_descriptor() {
     let bytes = [
         0x90, 96, 0, 1, 0, 0, 0, 2, 0, 0, 0, 3, 0x10, 0, 0, 2, 20, 3, 0xc0, 0, 1, 0, 0, 0,
     ];
@@ -1758,8 +1821,7 @@ fn wire_observer_reads_two_byte_dependency_descriptor() {
     assert!(fixture_rtp_header(&bytes[..22], ids).is_none());
 }
 
-#[test]
-fn wire_observer_uses_negotiated_extension_ids() {
+pub fn wire_observer_uses_negotiated_extension_ids() {
     let bytes = [
         0x90, 96, 0, 1, 0, 0, 0, 2, 0, 0, 0, 3, 0xbe, 0xde, 0, 3, 0x40,
         0xff, // ID 4 is not MID in this negotiation.
