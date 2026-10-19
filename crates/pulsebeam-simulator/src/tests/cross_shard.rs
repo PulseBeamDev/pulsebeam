@@ -4,7 +4,7 @@
 //! shard owners. A passing local-delivery test is not evidence that a route,
 //! envelope, destination runtime, or subscriber key survived the shard hop.
 
-use super::common::{LinkProfile, LocalNodeSim, Participant, Room, Step};
+use super::common::{LocalNodeSim, Participant, Room, Step};
 use std::time::Duration;
 
 #[test]
@@ -40,49 +40,6 @@ fn video_candidates_do_not_cross_shards_until_allocated_test() {
                 description: "the active binding delivers media",
                 participant: "subscriber",
                 min_bytes: 1_000,
-            },
-        ]);
-}
-
-/// A paused assignment resumes when its publisher sits on another shard.
-#[test]
-fn paused_stream_resumes_across_a_shard_boundary_test() {
-    LocalNodeSim::new()
-        .with_link(LinkProfile::fiber())
-        .with_bandwidth(500_000)
-        .with_room(
-            Room::new("room1")
-                .with_participant(Participant::screensharer("screen"))
-                .with_participant(Participant::publisher("camera", &["q", "h", "f"]))
-                .with_participant(Participant::manual_subscriber("viewer", 2)),
-        )
-        .run(vec![
-            Step::Run {
-                description: "Establish both publishers and the receiver",
-                duration: Duration::from_secs(5),
-            },
-            Step::SubscribeToQos {
-                description: "Subscribe to both streams with the camera preferred",
-                participant: "viewer",
-                targets: &[("camera", 720, 0, 100), ("screen", 720, 0, 10)],
-            },
-            Step::Run {
-                description: "Force one assignment into the paused state",
-                duration: Duration::from_secs(45),
-            },
-            Step::SetBandwidth {
-                description: "Restore enough downstream capacity for both streams",
-                participant: "viewer",
-                bits_per_sec: 5_000_000,
-            },
-            Step::Run {
-                description: "Let the allocator resume and the switcher receive keyframes",
-                duration: Duration::from_secs(120),
-            },
-            Step::CheckForwardedQuality {
-                description: "The screen assignment is no longer paused",
-                origin: "screen",
-                min_quality: 1,
             },
         ]);
 }

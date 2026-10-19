@@ -290,6 +290,9 @@ fn plane_error(
     if reference.len() != expected_len {
         return None;
     }
+    let samples = u64::try_from(expected_len).ok()?;
+    // Bound the entire reduction once, allowing the pixel loop to vectorize.
+    samples.checked_mul(u64::from(u8::MAX))?;
     let mut sum = 0u64;
     let mut max = 0u16;
     for row in 0..height {
@@ -301,15 +304,11 @@ fn plane_error(
         let reference_row = reference.get(reference_start..reference_end)?;
         for (&expected, &actual) in reference_row.iter().zip(decoded_row) {
             let error = u16::from(expected.abs_diff(actual));
-            sum = sum.checked_add(u64::from(error))?;
+            sum = sum.wrapping_add(u64::from(error));
             max = max.max(error);
         }
     }
-    Some(ReferenceError {
-        sum,
-        samples: u64::try_from(expected_len).ok()?,
-        max,
-    })
+    Some(ReferenceError { sum, samples, max })
 }
 
 fn reference_error_pcm(pcm: &[i16], reference: &[u8]) -> Option<ReferenceError> {
@@ -361,26 +360,57 @@ mod tests {
     use tokio::time::Instant;
 
     #[test]
+    fn reference_error_measures_pixels_not_stride_padding() {
+        let reference: Vec<u8> = (0..21).collect();
+        let mut decoded = vec![255; 27];
+        for (row, pixels) in reference.chunks_exact(7).enumerate() {
+            for (column, expected) in pixels.iter().enumerate() {
+                decoded[row * 9 + column] = expected + 2;
+            }
+        }
+        decoded[0] = 12;
+        assert_eq!(
+            super::plane_error(&reference, &decoded, 9, 7, 3),
+            Some(super::ReferenceError {
+                sum: 52,
+                samples: 21,
+                max: 12
+            })
+        );
+        assert_eq!(
+            super::plane_error(&reference, &decoded[..24], 9, 7, 3),
+            None
+        );
+        assert_eq!(
+            super::plane_error(&reference[..20], &decoded, 9, 7, 3),
+            None
+        );
+    }
+
+    #[test]
     fn decoder_h264_returns_dimensions_and_reference_facts() {
         let corpus = quality_corpus_video(QualityVideoSource::Zero, QualityVideoLayer::P180);
-        let frame = corpus.frame(0).expect("quality H.264 frame");
         let reference = corpus.decode_reference().expect("quality H.264 reference");
-        let reference = corpus
-            .reference_frame(&reference, frame.index)
-            .expect("quality H.264 reference frame");
         let mut decoder = H264ReferenceDecoder::new("quality-zero", "video-180p");
-        let decoded = decoder.decode(frame.encoded, reference);
-        assert_eq!(
-            (decoded.width, decoded.height),
-            QualityVideoLayer::P180.dimensions()
-        );
-        assert!(decoded.reference_error.samples > 0);
-        assert!(
-            decoded.reference_error.mean_absolute().unwrap_or(u64::MAX) <= 5_500,
-            "unexpected H.264 fixture error: {:?}",
-            decoded.reference_error
-        );
-        assert!(decoded.reference_error.max <= 32);
+        let next_epoch = pulsebeam_testdata::QUALITY_CORPUS_EPOCH_FRAME_COUNT;
+        for index in [0, next_epoch, next_epoch + 1, 0, 1] {
+            let frame = corpus.frame(index).expect("quality H.264 frame");
+            let reference = corpus
+                .reference_frame(&reference, frame.index)
+                .expect("quality H.264 reference frame");
+            let decoded = decoder.decode(frame.encoded, reference);
+            assert_eq!(
+                (decoded.width, decoded.height),
+                QualityVideoLayer::P180.dimensions()
+            );
+            assert!(decoded.reference_error.samples > 0);
+            assert!(
+                decoded.reference_error.mean_absolute().unwrap_or(u64::MAX) <= 5_500,
+                "unexpected H.264 fixture error: {:?}",
+                decoded.reference_error
+            );
+            assert!(decoded.reference_error.max <= 32);
+        }
     }
 
     #[test]

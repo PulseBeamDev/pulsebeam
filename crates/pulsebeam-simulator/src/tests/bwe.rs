@@ -88,18 +88,22 @@ fn subscriber_reaches_top_layer_on_fast_link_test() {
                 .with_participant(Participant::subscriber("bob")),
         )
         .run(vec![
-            Step::Run {
-                description: "Establish connection and discover tracks",
-                duration: Duration::from_secs(5),
+            Step::WaitForPublication {
+                description: "alice publication is ready before subscribing",
+                publisher: "alice",
+                timeout: Duration::from_secs(5),
             },
             Step::SubscribeAll {
                 description: "Bob asks for 720p from the start",
                 participant: "bob",
                 heights: &[720],
             },
-            Step::Run {
-                description: "Generous settle window - the link can carry the top layer",
-                duration: Duration::from_secs(60),
+            Step::WaitForVideo {
+                description: "Bob decodes the top layer",
+                participant: "bob",
+                publishers: &["alice"],
+                min_quality: 3,
+                timeout: Duration::from_secs(60),
             },
             Step::Run {
                 description: "Measurement window",
@@ -132,18 +136,22 @@ fn height_request_rounds_up_the_ladder_test() {
                 .with_participant(Participant::multi_subscriber("viewer", 1)),
         )
         .run(vec![
-            Step::Run {
-                description: "Establish connection and discover the track",
-                duration: Duration::from_secs(5),
+            Step::WaitForPublication {
+                description: "camera publication is ready before subscribing",
+                publisher: "camera",
+                timeout: Duration::from_secs(5),
             },
             Step::SubscribeTo {
                 description: "Viewer asks for 540p, which no layer matches exactly",
                 participant: "viewer",
                 targets: &[("camera", 540)],
             },
-            Step::Run {
-                description: "Warmup: let BWE settle with room to spare",
-                duration: Duration::from_secs(30),
+            Step::WaitForVideo {
+                description: "Viewer decodes the rounded-up layer",
+                participant: "viewer",
+                publishers: &["camera"],
+                min_quality: 3,
+                timeout: Duration::from_secs(30),
             },
             Step::Run {
                 description: "Measurement window",
@@ -176,9 +184,15 @@ fn high_priority_camera_reclaims_bandwidth_from_screenshare_test() {
                 .with_participant(Participant::manual_subscriber("viewer", 2)),
         )
         .run(vec![
-            Step::Run {
-                description: "Establish connections and discover both tracks",
-                duration: Duration::from_secs(5),
+            Step::WaitForPublication {
+                description: "camera publication is ready before subscribing",
+                publisher: "camera",
+                timeout: Duration::from_secs(5),
+            },
+            Step::WaitForPublication {
+                description: "screen publication is ready before subscribing",
+                publisher: "screen",
+                timeout: Duration::from_secs(5),
             },
             Step::SubscribeToQos {
                 description: "Viewer starts both streams at low priority and height",
@@ -194,9 +208,12 @@ fn high_priority_camera_reclaims_bandwidth_from_screenshare_test() {
                 participant: "viewer",
                 targets: &[("camera", 720, 360, 200), ("screen", 180, 0, 10)],
             },
-            Step::Run {
-                description: "Allow the allocator and BWE to apply the priority change",
-                duration: Duration::from_secs(60),
+            Step::WaitForVideo {
+                description: "Viewer decodes the reclaimed camera target",
+                participant: "viewer",
+                publishers: &["camera"],
+                min_quality: 3,
+                timeout: Duration::from_secs(60),
             },
             Step::CheckForwardedQualityReached {
                 description: "The high-priority camera reaches its top layer during contention",
@@ -772,18 +789,27 @@ fn resizing_camera_keeps_single_layer_screenshare_rendering_test() {
                 .with_participant(Participant::manual_subscriber("viewer", 2)),
         )
         .run(vec![
-            Step::Run {
-                description: "Establish connections and discover both tracks",
-                duration: Duration::from_secs(5),
+            Step::WaitForPublication {
+                description: "camera publication is ready before subscribing",
+                publisher: "camera",
+                timeout: Duration::from_secs(5),
+            },
+            Step::WaitForPublication {
+                description: "screen publication is ready before subscribing",
+                publisher: "screen",
+                timeout: Duration::from_secs(5),
             },
             Step::SubscribeTo {
                 description: "Viewer asks for both streams at 720p",
                 participant: "viewer",
                 targets: &[("camera", 720), ("screen", 720)],
             },
-            Step::Run {
-                description: "Let both streams reach their requested layers",
-                duration: Duration::from_secs(30),
+            Step::WaitForVideo {
+                description: "Viewer decodes both streams before resizing",
+                participant: "viewer",
+                publishers: &["camera", "screen"],
+                min_quality: 3,
+                timeout: Duration::from_secs(30),
             },
             Step::SubscribeTo {
                 description: "Viewer resizes only the camera to 360p",
@@ -1202,18 +1228,27 @@ fn estimate_grows_to_fit_screenshare_and_camera_test() {
                 .with_participant(Participant::multi_subscriber("viewer", 2)),
         )
         .run(vec![
-            Step::Run {
-                description: "Establish connections and discover both tracks",
-                duration: Duration::from_secs(5),
+            Step::WaitForPublication {
+                description: "presenter publication is ready before subscribing",
+                publisher: "presenter",
+                timeout: Duration::from_secs(5),
+            },
+            Step::WaitForPublication {
+                description: "camera publication is ready before subscribing",
+                publisher: "camera",
+                timeout: Duration::from_secs(5),
             },
             Step::SubscribeAll {
                 description: "Viewer watches the screen share and the camera at full quality",
                 participant: "viewer",
                 heights: &[720, 720],
             },
-            Step::Run {
-                description: "Warmup: let the estimate ramp with both streams live",
-                duration: Duration::from_secs(40),
+            Step::WaitForVideo {
+                description: "Viewer decodes both streams before the soak",
+                participant: "viewer",
+                publishers: &["presenter", "camera"],
+                min_quality: 3,
+                timeout: Duration::from_secs(40),
             },
             Step::Run {
                 description: "Soak: both streams should be flowing",
@@ -1342,18 +1377,22 @@ fn capped_subscription_is_not_over_served_test() {
                 .with_participant(Participant::multi_subscriber("bob", 1)),
         )
         .run(vec![
-            Step::Run {
-                description: "Establish connection and discover the track",
-                duration: Duration::from_secs(5),
+            Step::WaitForPublication {
+                description: "alice publication is ready before subscribing",
+                publisher: "alice",
+                timeout: Duration::from_secs(5),
             },
             Step::SubscribeTo {
                 description: "Bob asks for 360p, which the h layer satisfies exactly",
                 participant: "bob",
                 targets: &[("alice", 360)],
             },
-            Step::Run {
-                description: "Warmup",
-                duration: Duration::from_secs(30),
+            Step::WaitForVideo {
+                description: "Bob decodes the requested middle layer",
+                participant: "bob",
+                publishers: &["alice"],
+                min_quality: 2,
+                timeout: Duration::from_secs(30),
             },
             Step::Run {
                 description: "Measurement window",
@@ -1480,9 +1519,10 @@ fn paused_stream_resumes_with_media_after_bandwidth_recovers_test() {
                 .with_participant(Participant::manual_subscriber("viewer", 2)),
         )
         .run(vec![
-            Step::Run {
+            Step::WaitForPublication {
                 description: "Establish both publishers and the receiver",
-                duration: Duration::from_secs(5),
+                publisher: "screen",
+                timeout: Duration::from_secs(5),
             },
             Step::SubscribeToQos {
                 description: "Subscribe to both streams with the camera preferred",
@@ -1493,34 +1533,31 @@ fn paused_stream_resumes_with_media_after_bandwidth_recovers_test() {
                 description: "Force one assignment into the paused state",
                 duration: Duration::from_secs(45),
             },
+            Step::CheckVideoPaused {
+                description: "The constrained link actually paused a subscribed stream",
+                participant: "viewer",
+                publishers: &["camera", "screen"],
+            },
             Step::SetBandwidth {
                 description: "Restore enough downstream capacity for both streams",
                 participant: "viewer",
                 bits_per_sec: 5_000_000,
             },
-            Step::Run {
-                description: "Let the allocator resume and the switcher receive keyframes",
-                duration: Duration::from_secs(120),
-            },
-            Step::CheckForwardedQuality {
-                description: "The camera assignment is no longer paused",
-                origin: "camera",
+            Step::WaitForVideo {
+                description: "Both resumed assignments deliver newly decoded video",
+                participant: "viewer",
+                publishers: &["camera", "screen"],
                 min_quality: 1,
+                timeout: Duration::from_secs(120),
             },
-            Step::CheckForwardedQuality {
-                description: "The screen assignment is no longer paused",
-                origin: "screen",
-                min_quality: 1,
+            Step::CheckCrossShardMedia {
+                description: "Resumed media crosses the owner/destination shard boundary",
+                min_frames: 1,
             },
             Step::CheckVideoQuality {
                 description: "The camera produces decodable video after resuming",
                 participant: "viewer",
                 quality: VideoQuality::min_frames(120).allow_gaps(12),
-            },
-            Step::CheckRxBytesInterval {
-                description: "The resumed streams deliver media in the recovery window",
-                participant: "viewer",
-                min_bytes: 2_000_000,
             },
         ]);
 }
@@ -1540,9 +1577,10 @@ fn every_paused_tile_resumes_after_a_busy_link_recovers_test() {
                 .with_participant(Participant::manual_subscriber("viewer", 6)),
         )
         .run(vec![
-            Step::Run {
+            Step::WaitForPublication {
                 description: "Establish the gallery and receiver",
-                duration: Duration::from_secs(8),
+                publisher: "speaker",
+                timeout: Duration::from_secs(8),
             },
             Step::SubscribeToQos {
                 description: "Keep the speaker large and every tile visible",
@@ -1556,33 +1594,33 @@ fn every_paused_tile_resumes_after_a_busy_link_recovers_test() {
                     ("tile5", 180, 180, 10),
                 ],
             },
+            // Six 150 kbps floors fit the initial 2.5 Mbps link. Put the
+            // viewer below their combined floor so this actually exercises pause.
+            Step::SetBandwidth {
+                description: "The crowded link cannot carry every visible tile",
+                participant: "viewer",
+                bits_per_sec: 500_000,
+            },
             Step::Run {
                 description: "Drive the gallery through contention and pauses",
                 duration: Duration::from_secs(60),
+            },
+            Step::CheckVideoPaused {
+                description: "The busy link actually paused intended tiles",
+                participant: "viewer",
+                publishers: &["tile1", "tile2", "tile3", "tile4", "tile5"],
             },
             Step::SetBandwidth {
                 description: "Restore a link that carries every visible layer",
                 participant: "viewer",
                 bits_per_sec: 8_000_000,
             },
-            Step::Run {
-                description: "Allow every paused assignment to recover",
-                duration: Duration::from_secs(120),
-            },
-            Step::CheckForwardedQuality {
-                description: "The speaker remains forwarded after recovery",
-                origin: "speaker",
-                min_quality: 1,
-            },
-            Step::CheckForwardedQuality {
-                description: "The last tile is forwarded after recovery",
-                origin: "tile5",
-                min_quality: 1,
-            },
-            Step::CheckRxBytesInterval {
-                description: "The recovered gallery carries media",
+            Step::WaitForVideo {
+                description: "Every tile has fresh allocation and decoded delivery after repair",
                 participant: "viewer",
-                min_bytes: 3_000_000,
+                publishers: &["speaker", "tile1", "tile2", "tile3", "tile4", "tile5"],
+                min_quality: 1,
+                timeout: Duration::from_secs(120),
             },
         ]);
 }
@@ -1715,15 +1753,12 @@ fn subscription_climbs_back_after_the_link_recovers_test() {
                 participant: "bob",
                 bits_per_sec: 3_000_000,
             },
-            // Rediscovery has to climb from 500 kbps past the 1.25 Mbps top layer over the
-            // default Wi-Fi path, where burst loss and lossy feedback both slow the ramp. Ninety
-            // seconds was enough on the pristine link this plan was written against and is
-            // marginal on this one - observed failing about one run in ten. The claim is that the
-            // subscription climbs back, not that it does so to a stopwatch, so the window is
-            // sized to the slower path rather than the assertion weakened.
-            Step::Run {
-                description: "Give the viewer BWE room to re-discover the capacity",
-                duration: Duration::from_secs(180),
+            Step::WaitForVideo {
+                description: "The recovered allocation reaches the requested top layer with fresh delivery",
+                participant: "bob",
+                publishers: &["alice"],
+                min_quality: 3,
+                timeout: Duration::from_secs(180),
             },
             Step::CheckForwardedQuality {
                 description: "Bob has actually climbed back to the top layer",
@@ -2117,9 +2152,12 @@ fn a_stream_returns_after_a_total_outage_test() {
                 participant: "bob",
                 targets: &[("alice", 720)],
             },
-            Step::Run {
-                description: "Settle on a healthy link",
-                duration: Duration::from_secs(40),
+            Step::WaitForVideo {
+                description: "Establish healthy top-layer allocation and decoded delivery",
+                participant: "bob",
+                publishers: &["alice"],
+                min_quality: 3,
+                timeout: Duration::from_secs(40),
             },
             Step::Partition {
                 description: "The viewer's network drops out entirely",
@@ -2135,9 +2173,12 @@ fn a_stream_returns_after_a_total_outage_test() {
                 from: "bob",
                 to: "server",
             },
-            Step::Run {
-                description: "Reconnect and re-establish flow",
-                duration: Duration::from_secs(45),
+            Step::WaitForVideo {
+                description: "Re-establish allocation and newly decoded delivery after the outage",
+                participant: "bob",
+                publishers: &["alice"],
+                min_quality: 3,
+                timeout: Duration::from_secs(45),
             },
             // Fresh window, so the claims describe the recovered call rather than the outage.
             Step::Run {

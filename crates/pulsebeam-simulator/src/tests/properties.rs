@@ -45,7 +45,7 @@ use super::common::{
 };
 use proptest::prelude::*;
 use proptest::strategy::ValueTree;
-use proptest::test_runner::{RngAlgorithm, TestCaseResult, TestRng, TestRunner};
+use proptest::test_runner::{RngAlgorithm, TestCaseError, TestCaseResult, TestRng, TestRunner};
 use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -604,9 +604,10 @@ impl Scenario {
             };
 
         let mut plan = vec![
-            Step::Run {
+            Step::WaitForPublication {
                 description: "Establish connection and discover the track",
-                duration: Duration::from_secs(5),
+                publisher: "publisher",
+                timeout: Duration::from_secs(5),
             },
             Step::SubscribeTo {
                 description: "Viewer subscribes",
@@ -664,9 +665,10 @@ impl Scenario {
         };
         const TARGETS: &[(&str, u32)] = &[("publisher", 720)];
         let plan = vec![
-            Step::Run {
+            Step::WaitForPublication {
                 description: "Establish connections and discover the track",
-                duration: Duration::from_secs(5),
+                publisher: "publisher",
+                timeout: Duration::from_secs(5),
             },
             Step::SubscribeTo {
                 description: "First viewer subscribes",
@@ -678,13 +680,19 @@ impl Scenario {
                 participant: "viewer2",
                 targets: TARGETS,
             },
-            Step::Run {
-                description: "Settle",
-                duration: self.path.settle(),
+            Step::WaitForVideo {
+                description: "First viewer decodes its allocated origin",
+                participant: "viewer",
+                publishers: &["publisher"],
+                min_quality: 1,
+                timeout: self.path.settle() + Duration::from_secs(20),
             },
-            Step::Run {
-                description: "Measurement window",
-                duration: Duration::from_secs(20),
+            Step::WaitForVideo {
+                description: "Second viewer independently decodes its allocated origin",
+                participant: "viewer2",
+                publishers: &["publisher"],
+                min_quality: 1,
+                timeout: self.path.settle() + Duration::from_secs(20),
             },
         ];
 
@@ -865,7 +873,26 @@ where
         TestRng::from_seed(RngAlgorithm::ChaCha, &rng_seed),
     );
 
-    if let Err(err) = runner.run(&strategy, test) {
+    let accepted = Cell::new(0u32);
+    let rejected = Cell::new(0u32);
+    let failed = Cell::new(0u32);
+    let result = runner.run(&strategy, |value| {
+        let result = test(value);
+        match &result {
+            Ok(()) => accepted.set(accepted.get() + 1),
+            Err(TestCaseError::Reject(_)) => rejected.set(rejected.get() + 1),
+            Err(TestCaseError::Fail(_)) => failed.set(failed.get() + 1),
+        }
+        result
+    });
+    // Counts include committed regressions and shrink invocations, not only novel cases.
+    println!(
+        "[simulation-generated] seed={seed} budget={cases} accepted={} rejected={} failed={}",
+        accepted.get(),
+        rejected.get(),
+        failed.get()
+    );
+    if let Err(err) = result {
         panic!(
             "{err}\n\nreplay this exact run with:\n    ./bazel run //:replay -- --seed {seed}\n"
         );
@@ -938,7 +965,10 @@ mod slow {
             scenarios(Demand::temporal_camera(), Budget::Tight, NO_FAULT),
             |scenario| {
                 let report = scenario.run("temporal_shedding");
-                prop_assume!(report.samples > 0 && report.received_bytes > 0);
+                prop_assert!(
+                    report.samples > 0 && report.received_bytes > 0,
+                    "missing allocation or media is a failed scenario, not a discarded input ({scenario:?}, {report:?})"
+                );
 
                 prop_assert_ne!(
                     report.qoe.experience(scenario.content()),
@@ -952,8 +982,8 @@ mod slow {
         );
     }
 
-    /// Shared samples correlate decode, layer-stability and estimate claims. The final
-    /// fixed-capacity assumption retains twenty qualifying cases for every combined claim.
+    /// Shared samples correlate decode, layer-stability and estimate claims across
+    /// twenty qualifying cases. Missing observations fail rather than discarding the case.
     #[test]
     fn peer_churn_preserves_decoding_layers_and_estimate() {
         check(
@@ -961,7 +991,10 @@ mod slow {
             scenarios(Demand::any(), Budget::Ample, PEER_CHURN),
             |scenario| {
                 let report = scenario.run("decodable");
-                prop_assume!(report.samples > 0 && report.received_bytes > 0);
+                prop_assert!(
+                    report.samples > 0 && report.received_bytes > 0,
+                    "missing allocation or media is a failed scenario, not a discarded input ({scenario:?}, {report:?})"
+                );
                 prop_assert_ne!(
                     report.qoe.experience(scenario.content()),
                     Experience::Blank,
@@ -1003,9 +1036,11 @@ mod slow {
                         report.demand_last_bps
                     );
                 }
-                // Preserve every predicate's original accepted-case budget. Check applicable
-                // claims before rejecting, so a conditional sibling cannot hide a failure.
-                prop_assume!(report.capacity_fixed);
+                // Capacity is fixed by the input, not an outcome-based qualifying condition.
+                prop_assert!(
+                    report.capacity_fixed,
+                    "a generated fixed-capacity link was not measured as fixed ({scenario:?})"
+                );
                 Ok(())
             },
         );
@@ -1042,9 +1077,11 @@ mod slow {
             SATURATED,
             scenarios(Demand::any(), Budget::Tight, PEER_CHURN),
             |scenario| {
-                prop_assume!(scenario.capacity_bps >= LADDER_Q_BPS);
                 let report = scenario.run("renders_floor");
-                prop_assume!(report.samples > 0);
+                prop_assert!(
+                    report.samples > 0,
+                    "no allocation was recorded on a generated link that carries the floor ({scenario:?})"
+                );
 
                 prop_assert_ne!(
                     report.qoe.experience(scenario.content()),
@@ -1139,7 +1176,10 @@ mod slow {
             scenarios(Demand::contended(), Budget::Ample, ANY_FAULT),
             |scenario| {
                 let report = scenario.run("cheap_cotenant");
-                prop_assume!(report.samples > 0 && report.received_bytes > 0);
+                prop_assert!(
+                    report.samples > 0 && report.received_bytes > 0,
+                    "missing allocation or media is a failed scenario, not a discarded input ({scenario:?}, {report:?})"
+                );
 
                 // Conditioned on the *estimate* covering demand, not the link. The allocator can only
                 // spend what it is given, so a starved co-tenant on a healthy link with a low estimate
@@ -1166,6 +1206,11 @@ mod slow {
             },
         );
 
+        println!(
+            "[simulation-premise] seed={} claim=cheap-cotenant reached={} budget={SATURATED}",
+            sim_seed(),
+            exercised.get()
+        );
         assert!(
             exercised.get() > 0,
             "no generated case reached the assertion: every one ended with the estimate at or below \
@@ -1191,14 +1236,19 @@ mod slow {
             ),
             |scenario| {
                 let report = scenario.run("no_inversion");
-                prop_assume!(report.samples > 0 && report.received_bytes > 0);
+                prop_assert!(
+                    report.samples > 0 && report.received_bytes > 0,
+                    "missing allocation or media is a failed scenario, not a discarded input ({scenario:?}, {report:?})"
+                );
                 // Both must be running for their rungs to be comparable; a paused co-tenant is the
                 // separate claim asserted above.
                 let (Some(publisher), Some(cotenant)) = (
                     report.forwarded_quality.get("publisher").copied(),
                     report.forwarded_quality.get("cotenant").copied(),
                 ) else {
-                    return Ok(());
+                    return Err(TestCaseError::fail(format!(
+                        "missing publisher or cotenant allocation ({scenario:?}, {report:?})"
+                    )));
                 };
                 prop_assume!(publisher > 0 && cotenant > 0);
 

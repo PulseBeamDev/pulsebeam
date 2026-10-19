@@ -115,6 +115,8 @@ pub struct VideoAllocator {
     desired_ctrl: BitrateController,
     current_allocation: Bitrate,
     fairness: AllocationFairness,
+    #[cfg(feature = "sim")]
+    allocation_pass: u64,
     #[cfg(test)]
     test_keys: SlotMap<TrackHandle, ()>,
     #[cfg(test)]
@@ -168,6 +170,8 @@ impl VideoAllocator {
             desired_ctrl,
             current_allocation: Bitrate::ZERO,
             fairness: AllocationFairness::default(),
+            #[cfg(feature = "sim")]
+            allocation_pass: 0,
             #[cfg(test)]
             test_keys: SlotMap::with_key(),
             #[cfg(test)]
@@ -611,6 +615,10 @@ impl VideoAllocator {
             .observe(&views, &engine, &decisions, available_bandwidth, now);
         let desired_raw = engine.run_desired(&views);
         self.current_allocation = AllocationEngine::used_bitrate(&decisions);
+        #[cfg(feature = "sim")]
+        {
+            self.allocation_pass = self.allocation_pass.saturating_add(1);
+        }
         let desired = self
             .desired_ctrl
             .update(desired_raw)
@@ -675,6 +683,31 @@ impl VideoAllocator {
         }
 
         (desired, changed, unfunded)
+    }
+
+    #[cfg(feature = "sim")]
+    pub(crate) fn observation(&self) -> crate::sim_observation::VideoAllocationObservation {
+        crate::sim_observation::VideoAllocationObservation {
+            pass: self.allocation_pass,
+            slots: self
+                .slots
+                .values()
+                .filter_map(|slot| {
+                    let track = slot.assignment?;
+                    let handle = self.track_handles.get(&track)?;
+                    let meta = self.tracks.get(*handle)?.meta();
+                    Some(crate::sim_observation::VideoSlotObservation {
+                        track,
+                        origin: meta.origin,
+                        quality: if slot.paused {
+                            0
+                        } else {
+                            slot.desired.as_ref().map_or(0, |layer| layer.quality as u8)
+                        },
+                    })
+                })
+                .collect(),
+        }
     }
 
     pub fn current_allocation(&self) -> Bitrate {

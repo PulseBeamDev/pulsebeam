@@ -87,10 +87,25 @@ pub struct RouteObservation {
 }
 
 #[derive(Clone, Debug)]
+pub struct VideoSlotObservation {
+    pub track: TrackId,
+    pub origin: ParticipantId,
+    pub quality: u8,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct VideoAllocationObservation {
+    /// Completed allocation passes, including passes that leave assignments unchanged.
+    pub pass: u64,
+    pub slots: Vec<VideoSlotObservation>,
+}
+
+#[derive(Clone, Debug)]
 pub struct ShardParticipantObservation {
     pub id: ParticipantId,
     pub connection: ConnectionId,
     pub transport: NodeTransportAddress,
+    pub video: VideoAllocationObservation,
 }
 
 #[derive(Clone, Debug)]

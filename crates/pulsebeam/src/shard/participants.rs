@@ -73,6 +73,7 @@ impl ParticipantRegistry {
                 id: meta.participant_id,
                 connection: meta.connection_id,
                 transport: meta.ingress,
+                video: meta.video_observation(),
             })
             .collect();
         let transports = self

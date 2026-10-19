@@ -48,8 +48,14 @@ pub struct KeyframeRecoveryProbe {
     pub one_shot_requests: u64,
 }
 
+pub fn video_frames(data: &[u8]) -> Arc<[Arc<[u8]>]> {
+    pulsebeam_agent_native::media::H264FrameSlicer::new(data)
+        .map(Arc::from)
+        .collect()
+}
+
 pub struct VideoSource {
-    frames: Vec<Arc<[u8]>>,
+    frames: Arc<[Arc<[u8]>]>,
     first_idr: usize,
     fps: u32,
     opaque: bool,
@@ -58,11 +64,8 @@ pub struct VideoSource {
 }
 
 impl VideoSource {
-    pub fn new(data: &[u8], fps: u32) -> Self {
-        let frames: Vec<Arc<[u8]>> = pulsebeam_agent_native::media::H264FrameSlicer::new(data)
-            .map(Arc::from)
-            .collect();
-        debug_assert!(!frames.is_empty());
+    pub fn from_frames(frames: Arc<[Arc<[u8]>]>, fps: u32) -> Self {
+        assert!(!frames.is_empty());
         let first_idr = frames
             .iter()
             .position(|frame| has_nal(frame, 5))
@@ -70,7 +73,7 @@ impl VideoSource {
         Self {
             frames,
             first_idr,
-            fps,
+            fps: fps.max(1),
             opaque: false,
             repeat_keyframes: true,
             recovery_probe: Arc::default(),
@@ -101,7 +104,7 @@ impl VideoSource {
         let mut index = 0usize;
         let mut frame_count = 0u64;
         let mut interval =
-            tokio::time::interval(Duration::from_secs_f64(1.0 / f64::from(self.fps.max(1))));
+            tokio::time::interval(Duration::from_secs_f64(1.0 / f64::from(self.fps)));
         loop {
             let capture_time = interval.tick().await;
             while let Ok(event) = events.try_recv() {
@@ -120,8 +123,7 @@ impl VideoSource {
                     index = self.first_idr;
                 }
             }
-            debug_assert!(index < self.frames.len());
-            let source = self.frames.get(index).cloned().unwrap_or_default();
+            let source = self.frames.get(index).expect("video frame index").clone();
             let data = if self.opaque {
                 opaque_frame(&source)
             } else {
@@ -130,9 +132,7 @@ impl VideoSource {
             let frame = MediaFrame {
                 audio_level: None,
                 voice_activity: None,
-                ts: MediaTime::from_90khz(
-                    frame_count.saturating_mul(90_000) / u64::from(self.fps.max(1)),
-                ),
+                ts: MediaTime::from_90khz(frame_count.saturating_mul(90_000) / u64::from(self.fps)),
                 data,
                 capture_time,
                 abs_capture_time: Some(pulsebeam_agent_native::clock::capture_wallclock()),
@@ -157,23 +157,20 @@ impl VideoSource {
 }
 
 pub struct VbrSource {
-    frames: Vec<Arc<[u8]>>,
-    frame_times: Vec<Duration>,
+    frames: Arc<[Arc<[u8]>]>,
+    frame_times: Arc<[Duration]>,
     profile: VbrProfile,
     target_bps: f64,
 }
 
 impl VbrSource {
-    pub fn scheduled(data: &[u8], timing: &str, profile: VbrProfile) -> Self {
-        let frames = pulsebeam_agent_native::media::H264FrameSlicer::new(data)
-            .map(Arc::from)
-            .collect::<Vec<_>>();
-        let frame_times = timing
-            .lines()
-            .map(|line| Duration::from_micros(line.parse().unwrap_or_default()))
-            .collect::<Vec<_>>();
-        debug_assert!(!frames.is_empty());
-        debug_assert_eq!(frames.len(), frame_times.len());
+    pub fn scheduled(
+        frames: Arc<[Arc<[u8]>]>,
+        frame_times: Arc<[Duration]>,
+        profile: VbrProfile,
+    ) -> Self {
+        assert!(!frames.is_empty());
+        assert_eq!(frames.len(), frame_times.len());
         Self {
             frames,
             frame_times,
@@ -207,14 +204,13 @@ impl VbrSource {
         let loop_duration = self
             .frame_times
             .last()
-            .copied()
-            .unwrap_or_default()
+            .expect("nonempty video schedule")
             .saturating_add(self.profile.loop_idle);
         let mut loop_started = started;
         let mut index = 0usize;
         loop {
             let due = loop_started
-                .checked_add(self.frame_times.get(index).copied().unwrap_or_default())
+                .checked_add(*self.frame_times.get(index).expect("video schedule index"))
                 .unwrap_or(loop_started);
             tokio::time::sleep_until(due).await;
             let now = tokio::time::Instant::now();
@@ -230,7 +226,7 @@ impl VbrSource {
                 audio_level: None,
                 voice_activity: None,
                 ts: MediaTime::from_90khz(saturating_u64(elapsed.as_secs_f64() * 90_000.0)),
-                data: self.frames.get(index).cloned().unwrap_or_default(),
+                data: self.frames.get(index).expect("video frame index").clone(),
                 capture_time: now,
                 abs_capture_time: Some(pulsebeam_agent_native::clock::capture_wallclock()),
                 contiguous: true,

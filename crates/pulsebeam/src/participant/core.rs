@@ -182,6 +182,11 @@ pub struct Participant {
 pub type ParticipantCore = Participant;
 
 impl Participant {
+    #[cfg(feature = "sim")]
+    pub(crate) fn video_observation(&self) -> crate::sim_observation::VideoAllocationObservation {
+        self.downstream.video.observation()
+    }
+
     pub fn new(
         cfg: ParticipantConfig,
         shard_id: ShardId,

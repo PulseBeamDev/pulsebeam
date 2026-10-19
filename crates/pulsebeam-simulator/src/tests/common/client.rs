@@ -1,5 +1,5 @@
 use super::decoder::{DecodeError, H264ReferenceDecoder, OpusReferenceDecoder, ReferenceError};
-use super::media::{KeyframeRecoveryProbe, VbrProfile, VbrSource, VideoSource};
+use super::media::{KeyframeRecoveryProbe, VbrProfile, VbrSource, VideoSource, video_frames};
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper_util::{client::legacy::Client, rt::TokioExecutor};
@@ -14,7 +14,7 @@ use pulsebeam_core::net::UdpSocket;
 use pulsebeam_core::net::{AsyncHttpClient, HttpError, HttpRequest, HttpResult};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tokio::task::JoinSet;
 // The process-wide shimmed clock, not tokio's: turmoil virtualises `tokio::time::Instant` per
@@ -53,7 +53,7 @@ pub struct SimClientBuilder {
     suppress_natural_keyframe_repeats: bool,
     keyframe_recovery: Arc<Mutex<KeyframeRecoveryProbe>>,
     initial_topics: pulsebeam_agent_native::agent_core::TopicRegistrations,
-    quality_references: Arc<Mutex<BTreeMap<String, QualityVideoReference>>>,
+    quality_references: Arc<Mutex<BTreeMap<String, &'static QualityVideoReference>>>,
     h264_publishers: Arc<Mutex<BTreeSet<String>>>,
 }
 
@@ -62,7 +62,52 @@ pub(crate) struct QualityVideoReference {
     layer: pulsebeam_testdata::QualityVideoLayer,
     corpus: pulsebeam_testdata::QualityCorpusVideo,
     decoded: Vec<u8>,
-    encoded_frames: Vec<(Vec<u8>, usize)>,
+    encoded_frames: BTreeMap<Vec<u8>, usize>,
+    frames: Arc<[Arc<[u8]>]>,
+}
+
+fn quality_video_reference(
+    source: pulsebeam_testdata::QualityVideoSource,
+    layer: pulsebeam_testdata::QualityVideoLayer,
+) -> &'static QualityVideoReference {
+    use pulsebeam_testdata::{QualityVideoLayer::*, QualityVideoSource::*};
+    // Share immutable corpus data only. Every receiver still owns its decoder.
+    static REFERENCES: [OnceLock<QualityVideoReference>; 6] = [const { OnceLock::new() }; 6];
+    let index = match (source, layer) {
+        (Zero, P180) => 0,
+        (Zero, P360) => 1,
+        (Zero, P720) => 2,
+        (One, P180) => 3,
+        (One, P360) => 4,
+        (One, P720) => 5,
+    };
+    REFERENCES
+        .get(index)
+        .expect("quality corpus index")
+        .get_or_init(|| {
+            let corpus = pulsebeam_testdata::quality_corpus_video(source, layer);
+            let decoded = corpus
+                .decode_reference()
+                .unwrap_or_else(|error| panic!("quality H.264 reference failed: {error}"));
+            let mut encoded_frames = BTreeMap::new();
+            let mut data = Vec::new();
+            for index in 0..corpus.len() {
+                let frame = corpus.frame(index).expect("quality H.264 frame");
+                // Retain the first exact match, including for repeated corpus frames.
+                encoded_frames
+                    .entry(canonical_annex_b(frame.encoded))
+                    .or_insert(frame.index);
+                data.extend_from_slice(frame.encoded);
+            }
+            QualityVideoReference {
+                source,
+                layer,
+                corpus,
+                decoded,
+                encoded_frames,
+                frames: video_frames(&data),
+            }
+        })
 }
 
 fn canonical_annex_b(data: &[u8]) -> Vec<u8> {
@@ -250,7 +295,7 @@ impl SimClientBuilder {
 
     pub(crate) fn with_quality_references(
         mut self,
-        references: Arc<Mutex<BTreeMap<String, QualityVideoReference>>>,
+        references: Arc<Mutex<BTreeMap<String, &'static QualityVideoReference>>>,
     ) -> Self {
         self.quality_references = references;
         self
@@ -343,27 +388,10 @@ impl SimClientBuilder {
                 .insert(participant_id.clone());
         }
         if let Some((source, layer)) = self.quality_video {
-            let corpus = pulsebeam_testdata::quality_corpus_video(source, layer);
-            let decoded = corpus
-                .decode_reference()
-                .unwrap_or_else(|error| panic!("quality H.264 reference failed: {error}"));
-            let encoded_frames = (0..corpus.len())
-                .filter_map(|index| {
-                    corpus
-                        .frame(index)
-                        .map(|frame| (canonical_annex_b(frame.encoded), frame.index))
-                })
-                .collect();
-            self.quality_references.lock().unwrap().insert(
-                participant_id,
-                QualityVideoReference {
-                    source,
-                    layer,
-                    corpus,
-                    decoded,
-                    encoded_frames,
-                },
-            );
+            self.quality_references
+                .lock()
+                .unwrap()
+                .insert(participant_id, quality_video_reference(source, layer));
         }
 
         let video_rx = self
@@ -390,6 +418,11 @@ impl SimClientBuilder {
             h264_publishers: self.h264_publishers.clone(),
             corrupt_video_payload: self.corrupt_video_payload,
             keyframe_recovery: self.keyframe_recovery.clone(),
+            snapshots: {
+                let mut snapshots = agent.snapshots();
+                snapshots.mark_changed();
+                snapshots
+            },
             events: agent.events(),
         };
         let mut join_set = JoinSet::new();
@@ -401,7 +434,7 @@ impl SimClientBuilder {
         for slot in 0..self.audio_slots {
             let mut remote = agent.remote_audio(u8::try_from(slot)?).await?;
             let log = ctx.audio_rx.clone();
-            let observed_agent = agent.clone();
+            let snapshots = agent.snapshots();
             let corrupt = self.corrupt_audio_payload;
             join_set.spawn(async move {
                 let mut decoders = HashMap::<String, OpusReceiver>::new();
@@ -409,8 +442,8 @@ impl SimClientBuilder {
                     let Some(track_id) = remote.publication_id() else {
                         continue;
                     };
-                    let snapshot = observed_agent.snapshot();
-                    let Some(publisher) = snapshot
+                    let Some(publisher) = snapshots
+                        .borrow()
                         .publications
                         .get(&track_id)
                         .map(|publication| publication.participant_id.clone())
@@ -971,8 +1004,7 @@ struct QualityAudioLooper {
 
 impl QualityAudioLooper {
     async fn run(self, sender: pulsebeam_agent_native::LocalMedia) {
-        let corpus =
-            pulsebeam_testdata::quality_corpus_audio(pulsebeam_testdata::QualityAudioSource::Zero);
+        let corpus = &quality_audio_reference().corpus;
         debug_assert!(!corpus.is_empty());
         let mut interval = tokio::time::interval(Duration::from_millis(20));
         let mut counter = 0u64;
@@ -1018,15 +1050,31 @@ impl QualityAudioLooper {
     }
 }
 
-struct OpusReceiver {
-    decoder: OpusReferenceDecoder,
+struct PreparedQualityAudio {
     corpus: pulsebeam_testdata::QualityCorpusAudio,
     reference: Vec<u8>,
 }
 
+fn quality_audio_reference() -> &'static PreparedQualityAudio {
+    static REFERENCE: OnceLock<PreparedQualityAudio> = OnceLock::new();
+    REFERENCE.get_or_init(|| {
+        let corpus =
+            pulsebeam_testdata::quality_corpus_audio(pulsebeam_testdata::QualityAudioSource::Zero);
+        let reference = corpus
+            .decode_reference()
+            .unwrap_or_else(|error| panic!("quality Opus reference failed: {error}"));
+        PreparedQualityAudio { corpus, reference }
+    })
+}
+
+struct OpusReceiver {
+    decoder: OpusReferenceDecoder,
+    prepared: &'static PreparedQualityAudio,
+}
+
 fn record_video_frame(
     log: &Arc<Mutex<VideoReceiveLog>>,
-    quality_references: &Arc<Mutex<BTreeMap<String, QualityVideoReference>>>,
+    quality_references: &Arc<Mutex<BTreeMap<String, &'static QualityVideoReference>>>,
     decoder: &mut H264ReferenceDecoder,
     decoder_ready: &mut bool,
     publisher: &str,
@@ -1047,26 +1095,23 @@ fn record_video_frame(
         log.lock().unwrap().record_missing_parameter_set(publisher);
         return;
     }
-    let stream_reset = is_keyframe && has_parameter_sets;
-    if stream_reset {
+    // Repeated SPS/PPS on an intact stream do not require rebuilding its decoder.
+    if is_keyframe && has_parameter_sets && !*decoder_ready {
         decoder.reset();
     }
-    let quality_reference_required = quality_references.lock().unwrap().contains_key(publisher);
-    let reference = quality_references
-        .lock()
-        .unwrap()
-        .get(publisher)
-        .and_then(|entry| {
-            entry.encoded_frames.iter().find_map(|(encoded, index)| {
-                (encoded.as_slice() == frame.data.as_ref()).then(|| {
-                    entry
-                        .corpus
-                        .reference_frame(&entry.decoded, *index)
-                        .map(|reference| (reference.to_vec(), entry.source, entry.layer))
-                })?
+    let prepared = quality_references.lock().unwrap().get(publisher).copied();
+    let reference = prepared.and_then(|entry| {
+        entry
+            .encoded_frames
+            .get(frame.data.as_ref())
+            .and_then(|index| {
+                entry
+                    .corpus
+                    .reference_frame(&entry.decoded, *index)
+                    .map(|reference| (reference, entry.source, entry.layer))
             })
-        });
-    if quality_reference_required && reference.is_none() {
+    });
+    if prepared.is_some() && reference.is_none() {
         log.lock().unwrap().record_reference_mismatch(publisher);
     }
     let mut decode_frame = frame;
@@ -1075,9 +1120,7 @@ fn record_video_frame(
     }
     let decode_result = decoder.try_decode_observation(
         &decode_frame.data,
-        reference
-            .as_ref()
-            .map(|(reference, _, _)| reference.as_slice()),
+        reference.as_ref().map(|(reference, _, _)| *reference),
     );
     let decoded_ok = decode_result.is_ok();
     match decode_result {
@@ -1164,15 +1207,9 @@ fn annex_b_has_nal_type(data: &[u8], wanted: u8) -> bool {
 
 impl OpusReceiver {
     fn new(publisher: &str) -> Self {
-        let corpus =
-            pulsebeam_testdata::quality_corpus_audio(pulsebeam_testdata::QualityAudioSource::Zero);
-        let reference = corpus
-            .decode_reference()
-            .unwrap_or_else(|error| panic!("quality Opus reference failed: {error}"));
         Self {
             decoder: OpusReferenceDecoder::new(publisher, "audio-mono"),
-            corpus,
-            reference,
+            prepared: quality_audio_reference(),
         }
     }
 
@@ -1183,9 +1220,14 @@ impl OpusReceiver {
         publisher: &str,
     ) {
         let reference = self
+            .prepared
             .corpus
             .frame_for_rtp_timestamp(packet.ts.numer())
-            .and_then(|frame| self.corpus.reference_frame(&self.reference, frame.index));
+            .and_then(|frame| {
+                self.prepared
+                    .corpus
+                    .reference_frame(&self.prepared.reference, frame.index)
+            });
         match self
             .decoder
             .try_decode_observation(&packet.payload, reference)
@@ -1235,7 +1277,7 @@ pub struct ClientContext {
     requested_video: Option<Vec<RequestedVideo>>,
     pub video_rx: Arc<Mutex<VideoReceiveLog>>,
     pub audio_rx: Arc<Mutex<AudioReceiveLog>>,
-    quality_references: Arc<Mutex<BTreeMap<String, QualityVideoReference>>>,
+    quality_references: Arc<Mutex<BTreeMap<String, &'static QualityVideoReference>>>,
     h264_publishers: Arc<Mutex<BTreeSet<String>>>,
     corrupt_video_payload: bool,
     keyframe_recovery: Arc<Mutex<KeyframeRecoveryProbe>>,
@@ -1243,6 +1285,7 @@ pub struct ClientContext {
     pub remote_tracks: HashMap<String, String>,
     pub received_data: Vec<(String, Vec<u8>)>,
     pub media_kinds: HashMap<String, (bool, bool)>,
+    snapshots: tokio::sync::watch::Receiver<pulsebeam_agent_native::agent_core::Snapshot>,
     events: tokio::sync::broadcast::Receiver<AgentEvent>,
 }
 
@@ -1317,7 +1360,10 @@ impl ClientContext {
             }
         }
 
-        let snapshot = self.agent.snapshot();
+        if !self.snapshots.has_changed()? {
+            return Ok(());
+        }
+        let snapshot = self.snapshots.borrow_and_update().clone();
         self.discovered_tracks.clear();
         self.media_kinds.clear();
         for publication in snapshot.publications.values() {
@@ -1567,6 +1613,7 @@ fn spawn_video_receiver(
     let h264_publishers = ctx.h264_publishers.clone();
     let corrupt = ctx.corrupt_video_payload;
     let recovery_probe = ctx.keyframe_recovery.clone();
+    let snapshots = agent.snapshots();
     join_set.spawn(async move {
         let mut one_shot = false;
         let mut streams = HashMap::<String, VideoStreamReceiver>::new();
@@ -1574,8 +1621,8 @@ fn spawn_video_receiver(
             let Some(track_id) = remote.publication_id() else {
                 continue;
             };
-            let snapshot = agent.snapshot();
-            let Some(publisher) = snapshot
+            let Some(publisher) = snapshots
+                .borrow()
                 .publications
                 .get(&track_id)
                 .map(|publication| publication.participant_id.clone())
@@ -1643,33 +1690,50 @@ struct VideoStreamReceiver {
 }
 
 fn create_video_source(encoding: Option<&str>) -> VideoSource {
-    let data = match encoding {
-        Some("f") => pulsebeam_testdata::RAW_H264_FULL_CBR,
-        Some("h") => pulsebeam_testdata::RAW_H264_HALF_CBR,
-        _ => pulsebeam_testdata::RAW_H264_QUARTER_CBR,
+    static FRAMES: [OnceLock<Arc<[Arc<[u8]>]>>; 3] = [const { OnceLock::new() }; 3];
+    let (index, data) = match encoding {
+        Some("f") => (0, pulsebeam_testdata::RAW_H264_FULL_CBR),
+        Some("h") => (1, pulsebeam_testdata::RAW_H264_HALF_CBR),
+        _ => (2, pulsebeam_testdata::RAW_H264_QUARTER_CBR),
     };
-    VideoSource::new(data, 30)
+    VideoSource::from_frames(
+        FRAMES
+            .get(index)
+            .expect("video fixture index")
+            .get_or_init(|| video_frames(data))
+            .clone(),
+        30,
+    )
 }
 
 fn create_quality_video_source(
     source: pulsebeam_testdata::QualityVideoSource,
     layer: pulsebeam_testdata::QualityVideoLayer,
 ) -> VideoSource {
-    let corpus = pulsebeam_testdata::quality_corpus_video(source, layer);
-    let mut data = Vec::new();
-    for index in 0..corpus.len() {
-        if let Some(frame) = corpus.frame(index) {
-            data.extend_from_slice(frame.encoded);
-        }
-    }
-    VideoSource::new(&data, pulsebeam_testdata::QUALITY_VIDEO_FPS)
+    VideoSource::from_frames(
+        quality_video_reference(source, layer).frames.clone(),
+        pulsebeam_testdata::QUALITY_VIDEO_FPS,
+    )
 }
 
 fn create_vbr_source(encoding: Option<&str>, profile: VbrProfile) -> VbrSource {
     debug_assert_eq!(encoding, Some("f"));
+    static FRAMES: OnceLock<Arc<[Arc<[u8]>]>> = OnceLock::new();
+    static TIMES: OnceLock<Arc<[Duration]>> = OnceLock::new();
     VbrSource::scheduled(
-        pulsebeam_testdata::RAW_H264_SCREEN_FULL_VBR,
-        pulsebeam_testdata::RAW_H264_SCREEN_FULL_TIMING,
+        FRAMES
+            .get_or_init(|| video_frames(pulsebeam_testdata::RAW_H264_SCREEN_FULL_VBR))
+            .clone(),
+        TIMES
+            .get_or_init(|| {
+                pulsebeam_testdata::RAW_H264_SCREEN_FULL_TIMING
+                    .lines()
+                    .map(|line| {
+                        Duration::from_micros(line.parse().expect("screen frame timestamp"))
+                    })
+                    .collect()
+            })
+            .clone(),
         profile,
     )
 }

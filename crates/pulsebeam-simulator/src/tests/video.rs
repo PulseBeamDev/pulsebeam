@@ -43,6 +43,7 @@ fn every_quality_layer_has_explicit_decoded_reference_facts_test() {
 }
 
 #[test]
+#[should_panic(expected = "Pre-fault frames cannot prove recovery: video did not converge")]
 fn video_does_not_loop_back_to_publisher_test() {
     LocalNodeSim::new()
         .with_room(
@@ -69,10 +70,27 @@ fn video_does_not_loop_back_to_publisher_test() {
                 participant: "publisher",
                 publisher: "publisher",
             },
+            Step::Partition {
+                description: "Stop delivery after establishing a positive decoded baseline",
+                from: "viewer",
+                to: "server",
+            },
+            Step::Run {
+                description: "Drain media already in flight",
+                duration: Duration::from_secs(1),
+            },
+            Step::WaitForVideo {
+                description: "Pre-fault frames cannot prove recovery",
+                participant: "viewer",
+                publishers: &["publisher"],
+                min_quality: 1,
+                timeout: Duration::from_secs(3),
+            },
         ]);
 }
 
 #[test]
+#[should_panic(expected = "A corrupt recipient cannot prove recovery: video did not converge")]
 fn each_viewer_must_report_decoded_selected_source_independently_test() {
     let (width, height) = QualityVideoLayer::P180.dimensions();
     LocalNodeSim::new()
@@ -173,6 +191,20 @@ fn each_viewer_must_report_decoded_selected_source_independently_test() {
                 description: "Viewer B remains blank for the corrupt source zero stream",
                 participant: "viewer-b",
                 publisher: "source-zero",
+            },
+            Step::WaitForVideo {
+                description: "The selected source still reaches the healthy recipient",
+                participant: "viewer-a",
+                publishers: &["source-one"],
+                min_quality: 1,
+                timeout: Duration::from_secs(5),
+            },
+            Step::WaitForVideo {
+                description: "A corrupt recipient cannot prove recovery",
+                participant: "viewer-b",
+                publishers: &["source-zero"],
+                min_quality: 1,
+                timeout: Duration::from_secs(1),
             },
         ]);
 }

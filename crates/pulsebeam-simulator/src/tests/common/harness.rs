@@ -427,6 +427,22 @@ pub enum Step {
         publisher: &'static str,
         timeout: Duration,
     },
+    /// Start a fresh measurement and wait for allocation plus newly decoded video
+    /// from every named origin. Does not replace a sustained observation window.
+    WaitForVideo {
+        description: &'static str,
+        participant: &'static str,
+        publishers: &'static [&'static str],
+        min_quality: u8,
+        timeout: Duration,
+    },
+    /// Require an owned slot observation for every origin and at least one
+    /// currently paused assignment before attempting recovery.
+    CheckVideoPaused {
+        description: &'static str,
+        participant: &'static str,
+        publishers: &'static [&'static str],
+    },
     StallController {
         duration: Duration,
     },
@@ -1080,7 +1096,7 @@ struct ParticipantShared {
     observation: Mutex<Option<ClientObservation>>,
     video_rx: Arc<Mutex<VideoReceiveLog>>,
     audio_rx: Arc<Mutex<AudioReceiveLog>>,
-    quality_references: Arc<Mutex<BTreeMap<String, QualityVideoReference>>>,
+    quality_references: Arc<Mutex<BTreeMap<String, &'static QualityVideoReference>>>,
     h264_publishers: Arc<Mutex<BTreeSet<String>>>,
     tx_bytes: Mutex<u64>,
     rx_bytes: Mutex<u64>,
@@ -1104,7 +1120,7 @@ struct ParticipantShared {
 
 impl ParticipantShared {
     fn new(
-        quality_references: Arc<Mutex<BTreeMap<String, QualityVideoReference>>>,
+        quality_references: Arc<Mutex<BTreeMap<String, &'static QualityVideoReference>>>,
         h264_publishers: Arc<Mutex<BTreeSet<String>>>,
         topics: TopicRegistrations,
     ) -> Self {
@@ -1453,6 +1469,8 @@ fn step_name(step: &Step) -> &'static str {
     match step {
         Step::Run { .. } => "Run",
         Step::WaitForPublication { .. } => "WaitForPublication",
+        Step::WaitForVideo { .. } => "WaitForVideo",
+        Step::CheckVideoPaused { .. } => "CheckVideoPaused",
         Step::StallController { .. } => "StallController",
         Step::SendToWrongShard { .. } => "SendToWrongShard",
         Step::FailNextMaterialization { .. } => "FailNextMaterialization",
@@ -1767,6 +1785,133 @@ async fn execute_plan(
                 })
                 .await
                 .map_err(|_| anyhow::anyhow!("step \"{description}\": {publisher} publication did not converge within {timeout:?}; last convergence failure: {pending_convergence:?}"))?;
+            }
+
+            Step::WaitForVideo {
+                description,
+                participant,
+                publishers,
+                min_quality,
+                timeout,
+            } => {
+                anyhow::ensure!(
+                    (1..=3).contains(min_quality),
+                    "{description}: invalid video quality {min_quality}"
+                );
+                tracing::info!(
+                    "[step {n}/{total}: {kind}] \"{description}\" ({participant}, {publishers:?}, {timeout:?})"
+                );
+                anyhow::ensure!(
+                    !publishers.is_empty(),
+                    "{description}: no video origins requested"
+                );
+                let subscriber = get_handle(handles, participant, description)?;
+                let subscriber_id = subscriber.participant_id().ok_or_else(|| {
+                    anyhow::anyhow!("{description}: {participant} is not admitted")
+                })?;
+                let received = subscriber.video_rx();
+                let origins = publishers
+                    .iter()
+                    .map(|publisher| {
+                        let id = get_handle(handles, publisher, description)?
+                            .participant_id()
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("{description}: {publisher} is not admitted")
+                            })?;
+                        let before = received
+                            .decoded_from(&id)
+                            .map_or(0, |decoded| decoded.frames);
+                        Ok((*publisher, id, before))
+                    })
+                    .collect::<anyhow::Result<Vec<_>>>()?;
+                for handle in handles.values_mut() {
+                    handle.snapshot_interval();
+                }
+                pulsebeam::sim_metrics::reset();
+                pulsebeam_runtime::net::shaper::reset_stats_for(name_to_ip.values().copied());
+                let started = std::time::Instant::now();
+                let mut last = Vec::new();
+                let mut pending_convergence = None;
+                tokio::time::timeout(*timeout, async {
+                    let baseline = observe_video(observer, &subscriber_id).await?;
+                    loop {
+                        let owned = observe_video(observer, &subscriber_id).await?;
+                        let fresh = owned.connection != baseline.connection
+                            || owned.video.pass > baseline.video.pass;
+                        last = {
+                            let log = get_handle(handles, participant, description)?.shared.video_rx.lock().unwrap();
+                            origins.iter().map(|(publisher, id, before)| {
+                                let quality = owned.video.slots.iter()
+                                    .find(|slot| slot.origin.as_str() == id.as_str())
+                                    .map(|slot| slot.quality);
+                                let frames = log.decoded_from(id).map_or(0, |decoded| decoded.frames)
+                                    .saturating_sub(*before);
+                                (*publisher, quality, frames)
+                            }).collect()
+                        };
+                        if fresh && last.iter().all(|(_, quality, frames)| {
+                            quality.is_some_and(|quality| quality >= *min_quality) && *frames > 0
+                        }) {
+                            match assert_convergence(handles, observer, description).await {
+                                Ok(()) => break Ok::<_, anyhow::Error>(()),
+                                Err(error) => pending_convergence = Some(error),
+                            }
+                        }
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                }).await.map_err(|_| anyhow::anyhow!(
+                    "{description}: video did not converge within {timeout:?}; recipient={participant}, origins={last:?}, last convergence failure={pending_convergence:?}"
+                ))??;
+                window = started.elapsed();
+            }
+
+            Step::CheckVideoPaused {
+                description,
+                participant,
+                publishers,
+            } => {
+                anyhow::ensure!(
+                    !publishers.is_empty(),
+                    "{description}: no video origins requested"
+                );
+                let subscriber = get_handle(handles, participant, description)?
+                    .participant_id()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("{description}: {participant} is not admitted")
+                    })?;
+                let owned = tokio::time::timeout(
+                    Duration::from_secs(1),
+                    observe_video(observer, &subscriber),
+                )
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!("{description}: {subscriber} observation timed out")
+                })??;
+                let allocations = publishers
+                    .iter()
+                    .map(|publisher| {
+                        let origin = get_handle(handles, publisher, description)?
+                            .participant_id()
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("{description}: {publisher} is not admitted")
+                            })?;
+                        let allocation = owned.video.slots.iter()
+                            .find(|slot| slot.origin.as_str() == origin)
+                            .ok_or_else(|| anyhow::anyhow!(
+                                "{description}: {participant} <- {publisher} had no owned slot observation"
+                            ))?;
+                        Ok((*publisher, allocation))
+                    })
+                    .collect::<anyhow::Result<Vec<_>>>()?;
+                anyhow::ensure!(
+                    allocations
+                        .iter()
+                        .any(|(_, allocation)| allocation.quality == 0),
+                    "{description}: no intended stream was paused: {allocations:?}"
+                );
+                tracing::info!(
+                    "[step {n}/{total}: {kind}] \"{description}\" ({participant}, {allocations:?})"
+                );
             }
 
             Step::StallController { duration } => {
@@ -3445,6 +3590,19 @@ fn assert_room_state_consistent(handles: &PlanHandles, after: &str) {
 // pairs every 3 seconds. This bounds detection plus control/shard retirement.
 const CRASH_RETIREMENT_BUDGET: Duration = Duration::from_secs(20);
 
+async fn observe_video(
+    observer: &pulsebeam::sim_observation::Observer,
+    participant: &str,
+) -> anyhow::Result<pulsebeam::sim_observation::ShardParticipantObservation> {
+    let owners = observer.observe().await.map_err(anyhow::Error::msg)?;
+    owners
+        .shards
+        .into_iter()
+        .flat_map(|shard| shard.participants)
+        .find(|owned| owned.id.as_str() == participant)
+        .ok_or_else(|| anyhow::anyhow!("{participant}: no shard-owned participant observation"))
+}
+
 async fn assert_convergence(
     handles: &PlanHandles,
     observer: &pulsebeam::sim_observation::Observer,
@@ -4851,15 +5009,16 @@ impl LocalNodeSim {
             self.rng_seed
         );
 
-        let sim_duration = plan
-            .iter()
-            .filter_map(|s| match s {
-                Step::Run { duration, .. } => Some(*duration),
-                Step::WaitForPublication { timeout, .. } => Some(*timeout),
-                _ => None,
-            })
-            .sum::<Duration>()
-            + Duration::from_secs(60);
+        let sim_duration =
+            plan.iter()
+                .filter_map(|s| match s {
+                    Step::Run { duration, .. } => Some(*duration),
+                    Step::WaitForPublication { timeout, .. }
+                    | Step::WaitForVideo { timeout, .. } => Some(*timeout),
+                    _ => None,
+                })
+                .sum::<Duration>()
+                + Duration::from_secs(60);
 
         let mut sim = turmoil::Builder::new()
             .ip_version(self.ip_version.clone())
@@ -4907,7 +5066,7 @@ impl LocalNodeSim {
         });
 
         let mut handles = PlanHandles::new();
-        let quality_references: Arc<Mutex<BTreeMap<String, QualityVideoReference>>> =
+        let quality_references: Arc<Mutex<BTreeMap<String, &'static QualityVideoReference>>> =
             Arc::new(Mutex::new(BTreeMap::new()));
         let h264_publishers: Arc<Mutex<BTreeSet<String>>> = Arc::new(Mutex::new(BTreeSet::new()));
         let mut name_to_ip = PlanIps::new();
