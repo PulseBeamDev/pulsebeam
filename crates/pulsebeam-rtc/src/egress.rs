@@ -43,8 +43,9 @@ const MAX_PROBE_ACCOUNTING: usize = 32_768;
 
 pub(crate) struct MediaEgress {
     senders: Box<[Sender]>,
-    queue: VecDeque<QueuedMedia>,
-    queued_frames: BTreeSet<(SenderId, FrameId)>,
+    queued_packets: usize,
+    expiry_cursor: usize,
+    eligible: Vec<Option<usize>>,
     queued_payload_bytes: usize,
     queued_descriptor_bytes: usize,
     queued_transport_bytes: usize,
@@ -137,7 +138,10 @@ struct Sender {
     latest_admitted_global: Option<GlobalMediaTime>,
     latest_committed_global: Option<GlobalMediaTime>,
     open_frame: Option<OpenFrame>,
-    started_frames: BTreeSet<FrameId>,
+    queue: VecDeque<QueuedMedia>,
+    queued_frames: BTreeSet<FrameId>,
+    queued_payload_bytes: usize,
+    expiring_frame: Option<FrameId>,
     dependency_chain_valid: bool,
     descriptor: Option<DescriptorContinuity>,
     keyframe_requested: Option<KeyframeRequestReason>,
@@ -206,7 +210,6 @@ struct OpenFrame {
 }
 
 struct QueuedMedia {
-    sender: usize,
     queued_at: Instant,
     media: ForwardedMedia,
     descriptor_bytes: usize,
@@ -257,7 +260,6 @@ struct RetainedPacket {
 
 enum PendingTransmit {
     Original {
-        queue_index: usize,
         sender: usize,
         sequence: u16,
         timestamp: u32,
@@ -319,7 +321,10 @@ impl MediaEgress {
                     latest_committed_global: None,
                     admission: PayloadAdmission::default(),
                     open_frame: None,
-                    started_frames: BTreeSet::new(),
+                    queue: VecDeque::new(),
+                    queued_frames: BTreeSet::new(),
+                    queued_payload_bytes: 0,
+                    expiring_frame: None,
                     dependency_chain_valid: true,
                     descriptor: facts
                         .dependency_extension_id
@@ -344,8 +349,9 @@ impl MediaEgress {
         let sender_count = senders.len();
         let mut owner = Self {
             senders,
-            queue: VecDeque::new(),
-            queued_frames: BTreeSet::new(),
+            queued_packets: 0,
+            expiry_cursor: 0,
+            eligible: vec![None; sender_count],
             queued_payload_bytes: 0,
             queued_descriptor_bytes: 0,
             queued_transport_bytes: 0,
@@ -419,24 +425,7 @@ impl MediaEgress {
         if self.pending.is_some() {
             return Err(CommandError::InvalidState);
         }
-        let mut payload_bytes = 0usize;
-        let mut transport_bytes = 0usize;
-        let mut descriptor_bytes = 0usize;
-        self.queue.retain(|queued| {
-            if queued.sender != index {
-                return true;
-            }
-            payload_bytes = payload_bytes.saturating_add(queued.payload_bytes);
-            transport_bytes = transport_bytes.saturating_add(queued.transport_estimate);
-            descriptor_bytes = descriptor_bytes.saturating_add(queued.descriptor_bytes);
-            false
-        });
-        self.queued_payload_bytes = self.queued_payload_bytes.saturating_sub(payload_bytes);
-        self.queued_descriptor_bytes = self
-            .queued_descriptor_bytes
-            .saturating_sub(descriptor_bytes);
-        self.queued_transport_bytes = self.queued_transport_bytes.saturating_sub(transport_bytes);
-        self.queued_frames.retain(|(owner, _)| *owner != sender);
+        while self.pop_head(index).is_some() {}
         if !retain_repairs {
             let mut retained_bytes = 0usize;
             self.retained.retain(|packet| {
@@ -451,7 +440,7 @@ impl MediaEgress {
         }
         let state = &mut self.senders[index];
         state.open_frame = None;
-        state.started_frames.clear();
+        state.expiring_frame = None;
         state.dependency_chain_valid = false;
         state.latest_admitted_global = state.latest_committed_global;
         state.keyframe_requested = None;
@@ -595,7 +584,7 @@ impl MediaEgress {
         {
             return Err(CommandError::WouldBlock);
         }
-        if self.queue.len() >= MAX_QUEUED_MEDIA_PACKETS
+        if self.queued_packets >= MAX_QUEUED_MEDIA_PACKETS
             || payload_bytes
                 > self
                     .max_payload_bytes
@@ -644,9 +633,14 @@ impl MediaEgress {
         self.queued_transport_bytes = self
             .queued_transport_bytes
             .saturating_add(transport_estimate);
-        self.queued_frames.insert((sender, media.frame.id));
-        self.queue.push_back(QueuedMedia {
-            sender: sender_index,
+        self.queued_packets = self.queued_packets.saturating_add(1);
+        self.senders[sender_index].queued_payload_bytes = self.senders[sender_index]
+            .queued_payload_bytes
+            .saturating_add(payload_bytes);
+        self.senders[sender_index]
+            .queued_frames
+            .insert(media.frame.id);
+        self.senders[sender_index].queue.push_back(QueuedMedia {
             queued_at: at.monotonic,
             media,
             descriptor_bytes,
@@ -760,7 +754,7 @@ impl MediaEgress {
                 window_or_pacer_blocked: (self.queued_transport_bytes > 0
                     || !self.repair_requests.is_empty())
                     && (!self.pacer.eligible(at.monotonic)
-                        || (!self.queue.is_empty() && !self.media_pacer.eligible(at.monotonic))
+                        || (self.queued_packets != 0 && !self.media_pacer.eligible(at.monotonic))
                         || self.envelope.is_some_and(|envelope| {
                             bytes_in_flight >= envelope.max_rtp_bytes_in_flight
                         })),
@@ -885,8 +879,13 @@ impl MediaEgress {
     }
 
     pub(crate) fn begin_shutdown(&mut self) {
-        self.queue.clear();
-        self.queued_frames.clear();
+        for sender in &mut self.senders {
+            sender.queue.clear();
+            sender.queued_frames.clear();
+            sender.queued_payload_bytes = 0;
+            sender.expiring_frame = None;
+        }
+        self.queued_packets = 0;
         self.queued_payload_bytes = 0;
         self.queued_descriptor_bytes = 0;
         self.queued_transport_bytes = 0;
@@ -933,27 +932,14 @@ impl MediaEgress {
         let senders = self
             .senders
             .iter()
-            .enumerate()
-            .map(|(index, sender)| {
-                let (queued_packets, queued_payload_bytes) = self
-                    .queue
-                    .iter()
-                    .filter(|queued| queued.sender == index)
-                    .fold((0_usize, 0_usize), |(packets, bytes), queued| {
-                        (
-                            packets.saturating_add(1),
-                            bytes.saturating_add(queued.payload_bytes),
-                        )
-                    });
-                SenderStats {
-                    sender: sender.facts.id,
-                    assignment: sender.assignment,
-                    playout_delay: sender.playout_status(),
-                    queued_packets,
-                    queued_payload_bytes,
-                    transmitted_packets: sender.committed_packets,
-                    transmitted_payload_bytes: sender.committed_payload_bytes,
-                }
+            .map(|sender| SenderStats {
+                sender: sender.facts.id,
+                assignment: sender.assignment,
+                playout_delay: sender.playout_status(),
+                queued_packets: sender.queue.len(),
+                queued_payload_bytes: sender.queued_payload_bytes,
+                transmitted_packets: sender.committed_packets,
+                transmitted_payload_bytes: sender.committed_payload_bytes,
             })
             .collect();
         (
@@ -993,7 +979,7 @@ impl MediaEgress {
             return if allow_padding
                 && self.probe_remaining > 0
                 && self.probe_pacing_rate > 0
-                && self.queue.is_empty()
+                && self.queued_packets == 0
                 && self.repair_requests.is_empty()
             {
                 self.prepare_padding(at, bytes_in_flight, transport)
@@ -1009,41 +995,24 @@ impl MediaEgress {
         if let Some(result) = self.prepare_repair(at, bytes_in_flight, transport) {
             return result;
         }
-        if !self.queue.is_empty()
+        if self.queued_packets != 0
             && (self.media_budget == 0 || !self.media_pacer.eligible(at.monotonic))
         {
             return PrepareResult::Blocked;
         }
 
-        let eligible = self
-            .senders
-            .iter()
-            .enumerate()
-            .map(|(sender, _)| {
-                self.queue
-                    .iter()
-                    .find(|queued| queued.sender == sender)
-                    .map(|queued| queued.payload_bytes)
-            })
-            .collect::<Vec<_>>();
-        let Some(sender_index) = self.scheduler.select(&eligible) else {
+        self.fill_eligible(at);
+        let Some(sender_index) = self.scheduler.select(&self.eligible) else {
             return if allow_padding {
                 self.prepare_padding(at, bytes_in_flight, transport)
             } else {
                 PrepareResult::Blocked
             };
         };
-        let Some(queue_index) = self
-            .queue
-            .iter()
-            .position(|queued| queued.sender == sender_index)
-        else {
-            return PrepareResult::Fatal;
-        };
-        let Some(queued) = self.queue.get(queue_index) else {
-            return PrepareResult::Fatal;
-        };
         let Some(sender) = self.senders.get_mut(sender_index) else {
+            return PrepareResult::Fatal;
+        };
+        let Some(queued) = sender.queue.front() else {
             return PrepareResult::Fatal;
         };
         let descriptor = if let Some(continuity) = &mut sender.descriptor {
@@ -1055,16 +1024,9 @@ impl MediaEgress {
             ) {
                 Ok(prepared) => Some(prepared),
                 Err(_) => {
-                    sender.dependency_chain_valid = false;
-                    sender.keyframe_requested = Some(KeyframeRequestReason::LocalRecovery);
-                    if sender
-                        .open_frame
-                        .as_ref()
-                        .is_some_and(|open| open.id == queued.media.frame.id)
-                    {
-                        sender.open_frame = None;
-                    }
-                    self.drop_queued(queue_index);
+                    let frame = queued.media.frame.id;
+                    self.abandon_frame(sender_index, frame);
+                    self.pop_head(sender_index);
                     return PrepareResult::Blocked;
                 }
             }
@@ -1111,7 +1073,6 @@ impl MediaEgress {
         match transport.send_rtp_with_service(&packet, RtpService::Original) {
             Ok(()) => {
                 self.pending = Some(PendingTransmit::Original {
-                    queue_index,
                     sender: sender_index,
                     sequence,
                     timestamp,
@@ -1217,7 +1178,6 @@ impl MediaEgress {
         }
         match pending {
             PendingTransmit::Original {
-                queue_index,
                 sender,
                 sequence,
                 timestamp,
@@ -1225,7 +1185,7 @@ impl MediaEgress {
                 packet,
                 descriptor,
             } => {
-                let Some(queued) = self.queue.remove(queue_index) else {
+                let Some(queued) = self.pop_head(sender) else {
                     return;
                 };
                 self.media_pacer
@@ -1236,9 +1196,6 @@ impl MediaEgress {
                 {
                     continuity.commit(prepared);
                 }
-                self.queued_descriptor_bytes = self
-                    .queued_descriptor_bytes
-                    .saturating_sub(queued.descriptor_bytes);
                 state
                     .base_global
                     .get_or_insert_with(|| queued.media.packet.global_media_at());
@@ -1258,22 +1215,6 @@ impl MediaEgress {
                 state.committed_payload_bytes = state
                     .committed_payload_bytes
                     .saturating_add(queued.payload_bytes as u64);
-                match queued.media.frame.boundary {
-                    FrameBoundary::Start => {
-                        state.started_frames.insert(queued.media.frame.id);
-                    }
-                    FrameBoundary::Complete | FrameBoundary::End => {
-                        state.started_frames.remove(&queued.media.frame.id);
-                    }
-                    FrameBoundary::Middle => {}
-                }
-                self.queued_payload_bytes = self
-                    .queued_payload_bytes
-                    .saturating_sub(queued.payload_bytes);
-                self.queued_transport_bytes = self
-                    .queued_transport_bytes
-                    .saturating_sub(queued.transport_estimate);
-                self.remove_frame_if_empty(sender, queued.media.frame.id);
                 self.retain_original(
                     sender,
                     sequence,
@@ -1363,8 +1304,8 @@ impl MediaEgress {
         }
     }
 
-    pub(crate) fn next_deadline(&self) -> Option<Instant> {
-        let queue_idle = self.queue.is_empty() && self.repair_requests.is_empty();
+    pub(crate) fn next_deadline(&self, at: TimePoint) -> Option<Instant> {
+        let queue_idle = self.queued_packets == 0 && self.repair_requests.is_empty();
         let probe_deadline = self.envelope.and_then(|envelope| {
             (queue_idle
                 && self.probe_remaining == 0
@@ -1394,7 +1335,8 @@ impl MediaEgress {
             })
         });
         [
-            (!self.queue.is_empty() || !self.repair_requests.is_empty())
+            self.queue_deadline(at),
+            (self.queued_packets != 0 || !self.repair_requests.is_empty())
                 .then(|| {
                     let transport = self.pacer.next_deadline();
                     if !self.repair_requests.is_empty() {
@@ -1532,9 +1474,7 @@ impl MediaEgress {
         if matches!(
             media.frame.boundary,
             FrameBoundary::Complete | FrameBoundary::Start
-        ) && self
-            .queued_frames
-            .contains(&(sender.facts.id, media.frame.id))
+        ) && sender.queued_frames.contains(&media.frame.id)
         {
             return Err(CommandError::InvalidFrameMetadata);
         }
@@ -1570,16 +1510,10 @@ impl MediaEgress {
             && !media.frame.random_access
             && !matches!(&media.frame.dependencies, FrameDependencies::Known(value) if value.is_empty())
         {
-            let recovery_pending = self.queue.iter().any(|queued| {
-                queued.sender == sender_index
-                    && (queued.media.frame.random_access
+            let recovery_pending = sender.queue.iter().any(|queued| {
+                (queued.media.frame.random_access
                         || matches!(&queued.media.frame.dependencies, FrameDependencies::Known(ids) if ids.is_empty()))
-                    && self.useful_at(
-                        sender_index,
-                        queued.media.packet.global_media_at(),
-                        at,
-                        Duration::ZERO,
-                    )
+                    && !self.queued_expired(sender_index, queued, at)
             });
             return Err(if recovery_pending {
                 CommandError::WouldBlock
@@ -1628,11 +1562,7 @@ impl MediaEgress {
         pacer_wait: Duration,
     ) -> bool {
         self.senders[sender].assignment.is_some_and(|assignment| {
-            let network = self.envelope.map_or(Duration::ZERO, |envelope| {
-                envelope
-                    .queue_delay
-                    .saturating_add(envelope.smoothed_rtt / 2)
-            });
+            let network = self.network_service_time();
             pacer_wait <= assignment.delivery.max_queue_residence
                 && self
                     .latest_useful_at(sender, global)
@@ -1653,93 +1583,135 @@ impl MediaEgress {
         )
     }
 
+    fn network_service_time(&self) -> Duration {
+        self.envelope.map_or(Duration::ZERO, |envelope| {
+            envelope
+                .queue_delay
+                .saturating_add(envelope.smoothed_rtt / 2)
+        })
+    }
+
+    fn queue_deadline(&self, at: TimePoint) -> Option<Instant> {
+        self.senders
+            .iter()
+            .enumerate()
+            .filter_map(|(index, sender)| {
+                let queued = sender.queue.front()?;
+                if self.queued_expired(index, queued, at) {
+                    return Some(at.monotonic);
+                }
+                let assignment = sender.assignment?;
+                let residence = queued
+                    .queued_at
+                    .checked_add(assignment.delivery.max_queue_residence)
+                    .and_then(|deadline| deadline.checked_add(Duration::from_nanos(1)));
+                let latest = self.latest_useful_at(index, queued.media.packet.global_media_at())?;
+                let arrival = at.global.checked_add(self.network_service_time())?;
+                let remaining = latest
+                    .as_micros()
+                    .saturating_sub(arrival.as_micros())
+                    .saturating_add(1);
+                let media = at.monotonic.checked_add(Duration::from_micros(remaining));
+                residence.into_iter().chain(media).min()
+            })
+            .min()
+    }
+
+    fn queued_expired(&self, sender: usize, queued: &QueuedMedia, at: TimePoint) -> bool {
+        let state = &self.senders[sender];
+        state.expiring_frame == Some(queued.media.frame.id)
+            || state.assignment.is_none_or(|assignment| {
+                at.monotonic.saturating_duration_since(queued.queued_at)
+                    > assignment.delivery.max_queue_residence
+            })
+            || !self.useful_at(
+                sender,
+                queued.media.packet.global_media_at(),
+                at,
+                Duration::ZERO,
+            )
+            || (!state.dependency_chain_valid
+                && !queued.media.frame.random_access
+                && !matches!(&queued.media.frame.dependencies, FrameDependencies::Known(ids) if ids.is_empty()))
+    }
+
+    fn fill_eligible(&mut self, at: TimePoint) {
+        for index in 0..self.senders.len() {
+            self.eligible[index] = self.senders[index]
+                .queue
+                .front()
+                .filter(|queued| !self.queued_expired(index, queued, at))
+                .map(|queued| queued.payload_bytes);
+        }
+    }
+
+    fn abandon_frame(&mut self, sender: usize, frame: FrameId) {
+        let state = &mut self.senders[sender];
+        if state.expiring_frame == Some(frame) {
+            return;
+        }
+        state.expiring_frame = Some(frame);
+        state.dependency_chain_valid = false;
+        if state.facts.kind == MediaKind::Video {
+            state.keyframe_requested = Some(KeyframeRequestReason::LocalRecovery);
+        }
+        if state
+            .open_frame
+            .as_ref()
+            .is_some_and(|open| open.id == frame)
+        {
+            state.open_frame = None;
+        }
+    }
+
     fn expire(&mut self, at: TimePoint, limit: usize) {
         let mut work = 0;
-        while work < limit {
-            let Some((index, sender, frame, started)) =
-                self.queue.iter().enumerate().find_map(|(index, queued)| {
-                    (self.senders[queued.sender].assignment.is_none_or(|assignment| at.monotonic.saturating_duration_since(queued.queued_at) > assignment.delivery.max_queue_residence) || !self.useful_at(
-                        queued.sender,
-                        queued.media.packet.global_media_at(),
-                        at,
-                        Duration::ZERO,
-                    ) || (!self.senders[queued.sender].dependency_chain_valid
-                        && !queued.media.frame.random_access
-                        && !matches!(&queued.media.frame.dependencies, FrameDependencies::Known(value) if value.is_empty())))
-                    .then(|| {
-                        (
-                            index,
-                            queued.sender,
-                            queued.media.frame.id,
-                            self.senders[queued.sender]
-                                .started_frames
-                                .contains(&queued.media.frame.id),
-                        )
-                    })
-                })
-            else {
-                break;
-            };
-            if started {
-                self.drop_queued(index);
-                work += 1;
-            } else {
-                let indexes = self
+        let mut senders = 0;
+        while work < limit && senders < self.senders.len() {
+            let index = self.expiry_cursor;
+            self.expiry_cursor = (index + 1) % self.senders.len();
+            senders += 1;
+            while work < limit {
+                let Some(frame) = self.senders[index]
                     .queue
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(index, queued)| {
-                        (queued.sender == sender && queued.media.frame.id == frame).then_some(index)
-                    })
-                    .collect::<Vec<_>>();
-                for index in indexes.into_iter().rev() {
-                    self.drop_queued(index);
-                    work += 1;
-                    if work >= limit {
-                        break;
-                    }
-                }
-            }
-            let state = &mut self.senders[sender];
-            state.started_frames.remove(&frame);
-            state.dependency_chain_valid = false;
-            if state.facts.kind == MediaKind::Video {
-                state.keyframe_requested = Some(KeyframeRequestReason::LocalRecovery);
-            }
-            if state
-                .open_frame
-                .as_ref()
-                .is_some_and(|open| open.id == frame)
-            {
-                state.open_frame = None;
+                    .front()
+                    .filter(|queued| self.queued_expired(index, queued, at))
+                    .map(|queued| queued.media.frame.id)
+                else {
+                    break;
+                };
+                self.abandon_frame(index, frame);
+                self.pop_head(index);
+                work += 1;
             }
         }
     }
 
-    fn drop_queued(&mut self, index: usize) {
-        if let Some(queued) = self.queue.remove(index) {
-            self.queued_descriptor_bytes = self
-                .queued_descriptor_bytes
-                .saturating_sub(queued.descriptor_bytes);
-            self.queued_payload_bytes = self
-                .queued_payload_bytes
-                .saturating_sub(queued.payload_bytes);
-            self.queued_transport_bytes = self
-                .queued_transport_bytes
-                .saturating_sub(queued.transport_estimate);
-            self.remove_frame_if_empty(queued.sender, queued.media.frame.id);
-        }
-    }
-
-    fn remove_frame_if_empty(&mut self, sender: usize, frame: FrameId) {
-        if !self
+    fn pop_head(&mut self, sender: usize) -> Option<QueuedMedia> {
+        let state = &mut self.senders[sender];
+        let queued = state.queue.pop_front()?;
+        state.queued_payload_bytes = state
+            .queued_payload_bytes
+            .saturating_sub(queued.payload_bytes);
+        if state
             .queue
-            .iter()
-            .any(|queued| queued.sender == sender && queued.media.frame.id == frame)
+            .front()
+            .is_none_or(|next| next.media.frame.id != queued.media.frame.id)
         {
-            self.queued_frames
-                .remove(&(self.senders[sender].facts.id, frame));
+            state.queued_frames.remove(&queued.media.frame.id);
+            state.expiring_frame = None;
         }
+        self.queued_packets = self.queued_packets.saturating_sub(1);
+        self.queued_descriptor_bytes = self
+            .queued_descriptor_bytes
+            .saturating_sub(queued.descriptor_bytes);
+        self.queued_payload_bytes = self
+            .queued_payload_bytes
+            .saturating_sub(queued.payload_bytes);
+        self.queued_transport_bytes = self
+            .queued_transport_bytes
+            .saturating_sub(queued.transport_estimate);
+        Some(queued)
     }
 
     fn potential_bitrate(&self) -> u64 {
@@ -2402,7 +2374,7 @@ impl MediaEgress {
         bytes_in_flight: u64,
         transport: &mut Transport,
     ) -> PrepareResult {
-        if !self.path_available || !self.queue.is_empty() || !self.repair_requests.is_empty() {
+        if !self.path_available || self.queued_packets != 0 || !self.repair_requests.is_empty() {
             return PrepareResult::Blocked;
         }
         let Some(envelope) = self.envelope else {
@@ -2816,12 +2788,16 @@ mod tests {
     }
 
     fn playout_owner(now: Instant, extension: Option<u8>) -> MediaEgress {
+        playout_owner_with_senders(now, extension, 2)
+    }
+
+    fn playout_owner_with_senders(now: Instant, extension: Option<u8>, count: u16) -> MediaEgress {
         let policy = pulsebeam_rtc::SenderAssignment {
             playout_delay: Some(PlayoutDelay::from_millis(149, 204).expect("explicit bounds")),
             ..crate::test_support::sender_assignment(MediaPayloadBitrate::from_bps(256_000))
         };
         bound_egress(
-            (1..=2)
+            (1..=count)
                 .map(|id| EgressSenderFacts {
                     id: SenderId::new(id).expect("sender"),
                     kind: MediaKind::Audio,
@@ -3035,13 +3011,13 @@ mod tests {
             owner.admit(at, sender, rejected.clone()),
             Err(CommandError::WouldBlock)
         );
-        assert!(owner.queue.is_empty());
+        assert!(owner.queued_packets == 0);
         assert_eq!(owner.admitted_bytes, 0);
         assert_eq!(rejected.frame, original);
         owner.queued_descriptor_bytes = 0;
         // A resolved independent frame does not need a seed packet accepted by RTC.
         owner.admit(at, sender, later).unwrap();
-        assert_eq!(owner.queue.len(), 1);
+        assert_eq!(owner.queued_packets, 1);
         assert_eq!(
             owner.queued_descriptor_bytes,
             crate::SourceDescriptor::MEMORY_CHARGE
@@ -3732,21 +3708,18 @@ mod tests {
         owner.retain_original(0, 17, 19, bytes.bytes(), at.global, now, 40);
         owner.request_repair(owner.senders[0].ssrc, 17);
         owner.senders[0].latest_committed_global = Some(at.global);
-        owner.senders[0]
-            .started_frames
-            .insert(FrameId::from_value(1));
         let payload_debt = owner.senders[0].admission.debt;
         owner
             .clear_sender_media(a, true)
             .expect("recover same publication");
-        assert_eq!(owner.queue.len(), 1);
-        assert_eq!(owner.queue[0].sender, 1);
+        assert_eq!(owner.queued_packets, 1);
+        assert!(owner.senders[0].queue.is_empty());
+        assert_eq!(owner.senders[1].queue.len(), 1);
         assert_eq!(
-            owner.queued_frames,
-            BTreeSet::from([(b, FrameId::from_value(2))])
+            owner.senders[1].queued_frames,
+            BTreeSet::from([FrameId::from_value(2)])
         );
         assert!(owner.senders[0].open_frame.is_none());
-        assert!(owner.senders[0].started_frames.is_empty());
         assert!(!owner.senders[0].dependency_chain_valid);
         assert_eq!(owner.senders[0].latest_admitted_global, Some(at.global));
         assert_eq!(owner.senders[0].admission.debt, payload_debt);
@@ -3762,7 +3735,7 @@ mod tests {
         assert!(owner.repair_requests.is_empty());
         owner.request_repair(owner.senders[0].ssrc, 17);
         assert!(owner.repair_requests.is_empty());
-        assert_eq!(owner.queue.len(), 1);
+        assert_eq!(owner.queued_packets, 1);
     }
 
     #[test]
@@ -3786,9 +3759,6 @@ mod tests {
             owner.retain_original(index, 17, 19, bytes.bytes(), at.global, now, 40);
             owner.request_repair(owner.senders[index].ssrc, 17);
         }
-        owner.senders[0]
-            .started_frames
-            .insert(FrameId::from_value(1));
         owner.senders[0].latest_committed_global = Some(at.global);
         owner.senders[0].playout_first_sequence = Some(owner.senders[0].next_sequence);
         owner.senders[0].playout_confirmed = true;
@@ -3814,15 +3784,16 @@ mod tests {
             ),
             owner.next_twcc,
         );
-        let sibling_bytes = owner.queue[1].transport_estimate;
+        let sibling_bytes = owner.senders[1].queue[0].transport_estimate;
         owner.clear_sender_media(a, false).expect("discard");
-        assert_eq!(owner.queue.len(), 1);
-        assert_eq!(owner.queue[0].sender, 1);
+        assert_eq!(owner.queued_packets, 1);
+        assert!(owner.senders[0].queue.is_empty());
+        assert_eq!(owner.senders[1].queue.len(), 1);
         assert_eq!(owner.queued_payload_bytes, 3);
         assert_eq!(owner.queued_transport_bytes, sibling_bytes);
         assert_eq!(
-            owner.queued_frames,
-            BTreeSet::from([(b, FrameId::from_value(2))])
+            owner.senders[1].queued_frames,
+            BTreeSet::from([FrameId::from_value(2)])
         );
         assert_eq!(owner.retained.len(), 1);
         assert_eq!(owner.retained[0].sender, 1);
@@ -3830,7 +3801,6 @@ mod tests {
         assert_eq!(owner.repair_requests, VecDeque::from([(1, 17)]));
         let state = &owner.senders[0];
         assert!(state.open_frame.is_none());
-        assert!(state.started_frames.is_empty());
         assert!(!state.dependency_chain_valid);
         assert_eq!(state.latest_admitted_global, state.latest_committed_global);
         assert_eq!(
@@ -3930,7 +3900,7 @@ mod tests {
                 .expect("bounded frame continuation");
         }
         assert!(owner.senders[0].open_frame.is_none());
-        assert_eq!(owner.queue.len(), 3);
+        assert_eq!(owner.queued_packets, 3);
         assert_eq!(
             owner.senders[0].admission.debt,
             initial_debt + (payload_bytes as u128) * 8_000_000_000
@@ -3962,7 +3932,7 @@ mod tests {
                 owner.admit(at, sender, queued_media(at, 1, boundary)),
                 Err(CommandError::FrameInterrupted)
             );
-            assert!(owner.queue.is_empty());
+            assert!(owner.queued_packets == 0);
         }
         let source_sequence = |mut media: ForwardedMedia, sequence: u16| {
             let mut bytes = media.packet.bytes().to_vec();
@@ -3991,7 +3961,7 @@ mod tests {
                 owner.admit(at, sender, end.clone()),
                 Err(CommandError::FrameInterrupted)
             );
-            assert_eq!(owner.queue.len(), 1);
+            assert_eq!(owner.queued_packets, 1);
             assert_eq!(
                 owner.senders[0]
                     .open_frame
@@ -4095,7 +4065,6 @@ mod tests {
             service: RtpService::Original,
         };
         owner.pending = Some(PendingTransmit::Original {
-            queue_index: 0,
             sender: 0,
             sequence,
             timestamp,
@@ -4137,85 +4106,73 @@ mod tests {
 
     #[test]
     fn expiry_coalesces_video_recovery_without_requesting_audio_keyframes() {
-        for started in [false, true] {
-            let now = Instant::now();
-            let at = TimePoint {
-                monotonic: now,
-                global: GlobalMediaTime::from_micros(1_000_000),
-            };
-            let mut owner = playout_owner(now, None);
-            owner.senders[0].facts.kind = MediaKind::Video;
-            for sender in &mut owner.senders {
-                sender
-                    .assignment
-                    .as_mut()
-                    .expect("bound sender")
-                    .playout_delay = Some(PlayoutDelay::from_millis(0, 1_000).unwrap());
-            }
-            while owner.poll_event().is_some() {}
-            let video = owner.senders[0].facts.id;
-            let audio = owner.senders[1].facts.id;
-            owner
-                .admit(at, audio, queued_media(at, 2, FrameBoundary::Complete))
-                .unwrap();
-            owner
-                .admit(at, video, queued_media(at, 1, FrameBoundary::Start))
-                .unwrap();
-            owner
-                .admit(at, video, queued_media(at, 1, FrameBoundary::Middle))
-                .unwrap();
-            if started {
-                owner.senders[0]
-                    .started_frames
-                    .insert(FrameId::from_value(1));
-            }
-            let later = TimePoint {
-                monotonic: now + Duration::from_secs(10),
-                global: GlobalMediaTime::from_micros(11_000_000),
-            };
-            let request = crate::rtcp::KeyframeRequest {
-                media_ssrc: owner.senders[0].ssrc,
-                fir: None,
-            };
-            if !started {
-                owner.request_keyframe(request);
-            }
-            owner.expire(later, MAX_EXPIRATIONS_PER_POLL);
-            if started {
-                owner.request_keyframe(request);
-            }
-            assert!(owner.queue.is_empty());
-            assert!(owner.senders[0].open_frame.is_none());
-            assert!(owner.senders[0].started_frames.is_empty());
-            assert!(!owner.senders[0].dependency_chain_valid);
-            assert!(
-                matches!(owner.poll_event(), Some(Event::KeyframeRequested { sender, reason: KeyframeRequestReason::LocalRecovery }) if sender == video)
-            );
-            assert!(
-                owner.poll_event().is_none(),
-                "one coalesced video request, no audio request"
-            );
-            let mut dependent = queued_media(later, 3, FrameBoundary::Complete);
-            dependent.frame.random_access = false;
-            dependent.frame.dependencies =
-                FrameDependencies::Known(Arc::from([FrameId::from_value(1)]));
-            assert_eq!(
-                owner.admit(later, video, dependent),
-                Err(CommandError::DependencyChainInterrupted)
-            );
-            owner
-                .admit(
-                    later,
-                    video,
-                    queued_media(later, 4, FrameBoundary::Complete),
-                )
-                .expect("fresh independent video");
-            assert_eq!(owner.queue.len(), 1);
-            assert!(
-                !owner.senders[0].dependency_chain_valid,
-                "admission is not commitment"
-            );
+        let now = Instant::now();
+        let at = TimePoint {
+            monotonic: now,
+            global: GlobalMediaTime::from_micros(1_000_000),
+        };
+        let mut owner = playout_owner(now, None);
+        owner.senders[0].facts.kind = MediaKind::Video;
+        for sender in &mut owner.senders {
+            sender
+                .assignment
+                .as_mut()
+                .expect("bound sender")
+                .playout_delay = Some(PlayoutDelay::from_millis(0, 1_000).unwrap());
         }
+        while owner.poll_event().is_some() {}
+        let video = owner.senders[0].facts.id;
+        let audio = owner.senders[1].facts.id;
+        owner
+            .admit(at, audio, queued_media(at, 2, FrameBoundary::Complete))
+            .unwrap();
+        owner
+            .admit(at, video, queued_media(at, 1, FrameBoundary::Start))
+            .unwrap();
+        owner
+            .admit(at, video, queued_media(at, 1, FrameBoundary::Middle))
+            .unwrap();
+        let later = TimePoint {
+            monotonic: now + Duration::from_secs(10),
+            global: GlobalMediaTime::from_micros(11_000_000),
+        };
+        let request = crate::rtcp::KeyframeRequest {
+            media_ssrc: owner.senders[0].ssrc,
+            fir: None,
+        };
+        owner.request_keyframe(request);
+        owner.expire(later, MAX_EXPIRATIONS_PER_POLL);
+        owner.request_keyframe(request);
+        assert!(owner.queued_packets == 0);
+        assert!(owner.senders[0].open_frame.is_none());
+        assert!(!owner.senders[0].dependency_chain_valid);
+        assert!(
+            matches!(owner.poll_event(), Some(Event::KeyframeRequested { sender, reason: KeyframeRequestReason::LocalRecovery }) if sender == video)
+        );
+        assert!(
+            owner.poll_event().is_none(),
+            "one coalesced video request, no audio request"
+        );
+        let mut dependent = queued_media(later, 3, FrameBoundary::Complete);
+        dependent.frame.random_access = false;
+        dependent.frame.dependencies =
+            FrameDependencies::Known(Arc::from([FrameId::from_value(1)]));
+        assert_eq!(
+            owner.admit(later, video, dependent),
+            Err(CommandError::DependencyChainInterrupted)
+        );
+        owner
+            .admit(
+                later,
+                video,
+                queued_media(later, 4, FrameBoundary::Complete),
+            )
+            .expect("fresh independent video");
+        assert_eq!(owner.queued_packets, 1);
+        assert!(
+            !owner.senders[0].dependency_chain_valid,
+            "admission is not commitment"
+        );
     }
 
     #[test]
@@ -4264,7 +4221,6 @@ mod tests {
         let sequence = owner.senders[0].next_sequence;
         let twcc = owner.next_twcc;
         owner.pending = Some(PendingTransmit::Original {
-            queue_index: 0,
             sender: 0,
             sequence: wire_u16(sequence),
             timestamp: 7,
@@ -4276,13 +4232,13 @@ mod tests {
             owner.clear_sender_media(id, false),
             Err(CommandError::InvalidState)
         ));
-        assert_eq!(owner.queue.len(), 1);
+        assert_eq!(owner.queued_packets, 1);
         assert_eq!(owner.queued_payload_bytes, 3);
         assert_eq!(owner.senders[0].next_sequence, sequence);
         assert_eq!(owner.next_twcc, twcc);
         assert!(matches!(
             owner.pending,
-            Some(PendingTransmit::Original { queue_index: 0, .. })
+            Some(PendingTransmit::Original { sender: 0, .. })
         ));
     }
 
@@ -4336,7 +4292,7 @@ mod tests {
             .unwrap();
         owner.update_controller(at, Some((1, true)), &[], &[], Duration::ZERO, false, 0);
         assert_eq!(owner.probe_candidate(), Some(0));
-        assert_eq!(owner.next_deadline(), Some(now));
+        assert_eq!(owner.next_deadline(at), Some(now));
 
         let packet = MediaPacket::new(
             Bytes::from_static(&[0x80, 111, 0, 1, 0, 0, 0, 1, 0, 0, 0, 7, 1]),
@@ -4386,12 +4342,12 @@ mod tests {
             )
             .unwrap();
         assert_eq!(owner.probe_candidate(), None);
-        assert_eq!(owner.next_deadline(), None);
+        assert_eq!(owner.next_deadline(at), None);
 
         owner.probe_sender = Some(0);
         owner.probe_remaining = 1;
         assert_eq!(
-            owner.next_deadline(),
+            owner.next_deadline(at),
             None,
             "an ongoing cluster also waits for frame completion"
         );
@@ -4400,7 +4356,201 @@ mod tests {
         assert!(owner.padding_allowed(0));
         assert_eq!(owner.probe_candidate(), Some(0));
         owner.probe_remaining = 0;
-        assert_eq!(owner.next_deadline(), Some(now));
+        assert_eq!(owner.next_deadline(at), Some(now));
+    }
+
+    #[test]
+    fn bounded_expiry_rotates_across_senders_and_preserves_queue_accounting() {
+        let now = Instant::now();
+        let at = TimePoint {
+            monotonic: now,
+            global: GlobalMediaTime::from_micros(1_000_000),
+        };
+        let mut owner = playout_owner_with_senders(now, None, 33);
+        owner.envelope = Some(SafeRtpEnvelope {
+            pacing_transport_rate: 100_000_000,
+            queue_delay: Duration::ZERO,
+            smoothed_rtt: Duration::ZERO,
+            ..owner.controller.snapshot(owner.potential_bitrate(), 0, 0)
+        });
+        for index in 0..32 {
+            owner.senders[index].facts.kind = MediaKind::Video;
+            owner.senders[index]
+                .assignment
+                .as_mut()
+                .unwrap()
+                .delivery
+                .max_queue_residence = Duration::from_millis(50);
+            for frame in 0..9 {
+                owner
+                    .admit(
+                        at,
+                        owner.senders[index].facts.id,
+                        queued_media(at, frame, FrameBoundary::Complete),
+                    )
+                    .unwrap();
+            }
+        }
+        let late = TimePoint {
+            monotonic: now + Duration::from_millis(60),
+            global: at.global.checked_add(Duration::from_millis(60)).unwrap(),
+        };
+        owner
+            .admit(
+                late,
+                owner.senders[32].facts.id,
+                queued_media(late, 99, FrameBoundary::Complete),
+            )
+            .unwrap();
+        let storage = owner.eligible.as_ptr();
+        owner.expire(late, MAX_EXPIRATIONS_PER_POLL);
+        assert_eq!(owner.queued_packets, 33);
+        let (_, stats) = owner.stats();
+        assert_eq!(stats.iter().map(|s| s.queued_packets).sum::<usize>(), 33);
+        assert_eq!(
+            stats.iter().map(|s| s.queued_payload_bytes).sum::<usize>(),
+            owner.queued_payload_bytes
+        );
+        assert_eq!(
+            owner
+                .senders
+                .iter()
+                .map(|s| s.queued_frames.len())
+                .sum::<usize>(),
+            33
+        );
+        assert_eq!(
+            owner
+                .senders
+                .iter()
+                .flat_map(|s| &s.queue)
+                .map(|q| q.transport_estimate)
+                .sum::<usize>(),
+            owner.queued_transport_bytes
+        );
+        owner.fill_eligible(late);
+        assert_eq!(
+            owner.eligible.iter().filter(|slot| slot.is_some()).count(),
+            1
+        );
+        assert_eq!(owner.eligible[32], Some(3));
+        assert_eq!(owner.scheduler.select(&owner.eligible), Some(32));
+        assert_eq!(owner.queue_deadline(late), Some(late.monotonic));
+        owner.expire(late, MAX_EXPIRATIONS_PER_POLL);
+        owner.fill_eligible(late);
+        assert_eq!(owner.eligible.as_ptr(), storage);
+        assert_eq!(owner.queued_packets, 1);
+        assert_eq!(owner.queued_payload_bytes, 3);
+        assert_eq!(owner.queued_descriptor_bytes, 0);
+        assert_eq!(
+            owner
+                .senders
+                .iter()
+                .map(|s| s.queued_frames.len())
+                .sum::<usize>(),
+            1
+        );
+        assert_eq!(
+            owner.queued_transport_bytes,
+            owner.senders[32].queue[0].transport_estimate
+        );
+        assert!(owner.senders[..32].iter().all(|s| s.queue.is_empty()
+            && s.queued_frames.is_empty()
+            && s.queued_payload_bytes == 0));
+    }
+
+    #[test]
+    fn expiry_budget_fences_fresh_tails_and_keeps_sibling_service_ready() {
+        for residence_limited in [true, false] {
+            let now = Instant::now();
+            let at = TimePoint {
+                monotonic: now,
+                global: GlobalMediaTime::from_micros(1_000_000),
+            };
+            let mut owner = playout_owner(now, None);
+            owner.senders[0].facts.kind = MediaKind::Video;
+            let limits = &mut owner.senders[0].assignment.as_mut().unwrap().delivery;
+            limits.max_media_age =
+                Duration::from_millis(if residence_limited { 10_000 } else { 50 });
+            limits.max_queue_residence =
+                Duration::from_millis(if residence_limited { 50 } else { 10_000 });
+            owner.envelope = Some(SafeRtpEnvelope {
+                pacing_transport_rate: 100_000_000,
+                queue_delay: Duration::ZERO,
+                smoothed_rtt: Duration::ZERO,
+                ..owner.controller.snapshot(owner.potential_bitrate(), 0, 0)
+            });
+            let video = owner.senders[0].facts.id;
+            let audio = owner.senders[1].facts.id;
+            let fragment = |sequence: u16, boundary| {
+                let mut media = queued_media(at, 10, boundary);
+                let mut bytes = media.packet.bytes().to_vec();
+                bytes[2..4].copy_from_slice(&sequence.to_be_bytes());
+                media.packet = MediaPacket::new(bytes.into(), at.global, Arc::from([]));
+                media
+            };
+            owner
+                .admit(at, video, fragment(1, FrameBoundary::Start))
+                .unwrap();
+            let tail_at = TimePoint {
+                monotonic: now + Duration::from_millis(40),
+                global: at.global.checked_add(Duration::from_millis(40)).unwrap(),
+            };
+            let count = u16::try_from(MAX_EXPIRATIONS_PER_POLL + 2).unwrap();
+            for sequence in 2..=count {
+                owner
+                    .admit(
+                        tail_at,
+                        video,
+                        fragment(
+                            sequence,
+                            if sequence == count {
+                                FrameBoundary::End
+                            } else {
+                                FrameBoundary::Middle
+                            },
+                        ),
+                    )
+                    .unwrap();
+            }
+            let late = TimePoint {
+                monotonic: now + Duration::from_millis(60),
+                global: at.global.checked_add(Duration::from_millis(60)).unwrap(),
+            };
+            owner
+                .admit(late, audio, queued_media(late, 99, FrameBoundary::Complete))
+                .unwrap();
+            let debt = owner.senders[0].admission.debt;
+            let storage = owner.eligible.as_ptr();
+            owner.expire(late, MAX_EXPIRATIONS_PER_POLL);
+            assert_eq!(owner.queued_packets, 3);
+            assert_eq!(owner.senders[0].queue.len(), 2);
+            assert_eq!(
+                owner.senders[0].queue.back().unwrap().media.frame.boundary,
+                FrameBoundary::End
+            );
+            assert_eq!(
+                owner.senders[0].expiring_frame,
+                Some(FrameId::from_value(10))
+            );
+            assert_eq!(owner.queue_deadline(late), Some(late.monotonic));
+            owner.fill_eligible(late);
+            assert_eq!(owner.eligible, vec![None, Some(3)]);
+            assert_eq!(owner.eligible.as_ptr(), storage);
+            assert_eq!(owner.scheduler.select(&owner.eligible), Some(1));
+            assert!(
+                matches!(owner.poll_event(),Some(Event::KeyframeRequested{sender,reason:KeyframeRequestReason::LocalRecovery}) if sender==video)
+            );
+            owner.expire(late, MAX_EXPIRATIONS_PER_POLL);
+            assert_eq!(owner.queued_packets, 1);
+            assert!(owner.senders[0].queue.is_empty());
+            assert!(owner.senders[0].queued_frames.is_empty());
+            assert!(owner.senders[0].expiring_frame.is_none());
+            assert_eq!(owner.senders[0].admission.debt, debt);
+            assert!(owner.poll_event().is_none());
+            assert_eq!(owner.stats().1[0].queued_packets, 0);
+            assert_eq!(owner.stats().1[1].queued_payload_bytes, 3);
+        }
     }
 
     #[test]
@@ -4454,14 +4604,14 @@ mod tests {
                 Err(CommandError::MediaExpired)
             );
             assert_eq!(owner.senders[0].admission.debt, debt);
-            assert_eq!(owner.queue.len(), 1);
+            assert_eq!(owner.queued_packets, 1);
             owner.expire(late, MAX_EXPIRATIONS_PER_POLL);
-            assert!(owner.queue.is_empty());
+            assert!(owner.queued_packets == 0);
             assert_eq!(
                 owner.admit(late, sender, queued_media(late, 3, FrameBoundary::Complete)),
                 Ok(())
             );
-            assert_eq!(owner.queue.len(), 1);
+            assert_eq!(owner.queued_packets, 1);
         }
     }
 
@@ -4514,10 +4664,10 @@ mod tests {
         assert!(active.target_media_payload_rate > 0);
         assert!(active.target_media_payload_rate < 4_000_000);
         assert!(active.probe_permitted);
-        assert_eq!(owner.next_deadline(), Some(now));
+        assert_eq!(owner.next_deadline(at), Some(now));
         owner.last_probe = Some(now);
         assert_eq!(
-            owner.next_deadline(),
+            owner.next_deadline(at),
             now.checked_add(Duration::from_secs(1).max(active.smoothed_rtt.saturating_mul(4)))
         );
         let packet = MediaPacket::new(
@@ -4555,7 +4705,7 @@ mod tests {
         assert_eq!(inactive.reference_window, active.reference_window);
         assert!(!inactive.probe_permitted);
         assert_eq!(owner.probe_candidate(), None);
-        assert_eq!(owner.next_deadline(), None);
+        assert_eq!(owner.next_deadline(at), None);
         owner
             .set_assignment(
                 ids[0],
@@ -4770,7 +4920,7 @@ mod tests {
             owner.controller.note_send(Duration::ZERO);
             owner.last_probe = Some(now);
             assert_eq!(
-                owner.next_deadline(),
+                owner.next_deadline(at),
                 Some(now + Duration::from_millis(500))
             );
             let stale_at = TimePoint {
@@ -4792,7 +4942,7 @@ mod tests {
             owner.queued_transport_bytes = 1;
             assert!(!owner.recovery_permitted(stale));
             owner.queued_transport_bytes = 0;
-            assert!(owner.next_deadline().unwrap() <= stale_at.monotonic);
+            assert!(owner.next_deadline(at).unwrap() <= stale_at.monotonic);
             owner.rtp_bytes_in_flight = 1;
             assert!(!owner.recovery_permitted(stale));
             owner.rtp_bytes_in_flight = 0;
@@ -4818,11 +4968,11 @@ mod tests {
             assert!(!recovered.feedback_stale);
             assert_eq!(recovered.reference_window, stale.reference_window);
             assert_eq!(owner.feedback_recovery, FeedbackRecovery::Followup);
-            assert!(owner.next_deadline().unwrap() <= recovered_at.monotonic);
+            assert!(owner.next_deadline(at).unwrap() <= recovered_at.monotonic);
             owner.pacer.commit(recovered_at.monotonic, 100, 8_000);
             let paced = recovered_at.monotonic + Duration::from_millis(100);
             assert!(!owner.pacer.eligible(recovered_at.monotonic));
-            assert_eq!(owner.next_deadline(), Some(paced));
+            assert_eq!(owner.next_deadline(at), Some(paced));
             assert!(owner.pacer.eligible(paced));
             owner.finish_probe(recovered_at.monotonic, true);
             assert_eq!(owner.feedback_recovery, FeedbackRecovery::Idle);
@@ -4839,7 +4989,7 @@ mod tests {
                 envelope.probe_permitted = permitted;
                 if !fresh {
                     owner.envelope = Some(envelope);
-                    assert!(owner.next_deadline().unwrap() > recovered_at.monotonic);
+                    assert!(owner.next_deadline(at).unwrap() > recovered_at.monotonic);
                     assert!(!owner.start_probe(recovered_at, envelope));
                     assert_eq!(owner.probe_remaining, expected_packets);
                     let due = TimePoint {
@@ -5104,17 +5254,27 @@ mod tests {
                     owner.probe_pacer.commit_probe_cluster(now, 100, 400_000);
                 }
                 owner.pacer.commit(now, 100, 80_000);
-                assert_eq!(owner.next_deadline(), Some(now + Duration::from_millis(10)));
+                assert_eq!(
+                    owner.next_deadline(at),
+                    Some(now + Duration::from_millis(10))
+                );
                 owner.pacer.reset();
-                assert!(owner.next_deadline().is_none_or(|deadline| deadline > now));
+                assert!(
+                    owner
+                        .next_deadline(at)
+                        .is_none_or(|deadline| deadline > now)
+                );
                 if active {
-                    assert_ne!(owner.next_deadline(), Some(now + Duration::from_millis(2)));
+                    assert_ne!(
+                        owner.next_deadline(at),
+                        Some(now + Duration::from_millis(2))
+                    );
                 }
                 owner
                     .clear_sender_media(owner.senders[0].facts.id, false)
                     .unwrap();
                 assert_eq!(
-                    owner.next_deadline(),
+                    owner.next_deadline(at),
                     Some(if active {
                         now + Duration::from_millis(2)
                     } else {
@@ -5574,7 +5734,7 @@ mod tests {
         owner.envelope = Some(envelope);
         owner.next_rtcp = now + Duration::from_secs(10);
         assert_eq!(owner.probe_interval(now, envelope), Duration::from_secs(5));
-        assert_eq!(owner.next_deadline(), Some(now + Duration::from_secs(5)));
+        assert_eq!(owner.next_deadline(at), Some(now + Duration::from_secs(5)));
         assert!(!owner.start_probe(
             TimePoint {
                 monotonic: now + Duration::from_secs(1),
@@ -5998,7 +6158,7 @@ mod tests {
         assert!(owner.probe_followup);
         owner.pacer.commit(received, 1_000, 80_000);
         let debt = owner.pacer.next_deadline();
-        assert_eq!(owner.next_deadline(), debt);
+        assert_eq!(owner.next_deadline(at), debt);
         owner.senders[0]
             .assignment
             .as_mut()
@@ -6150,7 +6310,7 @@ mod tests {
                 owner.probe_pacer.next_deadline(),
                 Some(probe_start + probe_interval),
             );
-            assert_eq!(owner.next_deadline(), owner.probe_pacer.next_deadline());
+            assert_eq!(owner.next_deadline(at), owner.probe_pacer.next_deadline());
         }
         let media_deadline = now + Duration::from_millis(24);
         assert_eq!(owner.pacer.next_deadline(), Some(media_deadline));
@@ -6196,7 +6356,7 @@ mod tests {
             )
             .expect("declare demand");
         egress.update_controller(at, Some((1, true)), &[], &[], Duration::ZERO, false, 0);
-        assert_eq!(egress.next_deadline(), Some(now));
+        assert_eq!(egress.next_deadline(at), Some(now));
 
         let started = now + Duration::from_millis(350);
         egress.probe_remaining = 31;
@@ -6205,13 +6365,13 @@ mod tests {
         egress.pacer.commit(started, 100, 800_000);
         assert_eq!(egress.last_probe, None);
         assert_eq!(
-            egress.next_deadline(),
+            egress.next_deadline(at),
             started.checked_add(Duration::from_millis(1))
         );
 
         egress.last_send_attempt = started.checked_add(Duration::from_millis(2));
         assert_eq!(
-            egress.next_deadline(),
+            egress.next_deadline(at),
             started.checked_add(Duration::from_millis(20)),
             "an attempted pacing deadline cannot spin while sending is blocked"
         );
@@ -6219,19 +6379,19 @@ mod tests {
             .pacer
             .commit(started + Duration::from_millis(2), 100, 800_000);
         assert_eq!(
-            egress.next_deadline(),
+            egress.next_deadline(at),
             started.checked_add(Duration::from_millis(3)),
             "a future pacing deadline still wakes the sender"
         );
         egress.pacer.reset();
         assert_eq!(
-            egress.next_deadline(),
+            egress.next_deadline(at),
             started.checked_add(Duration::from_millis(20))
         );
         egress.finish_probe(started + Duration::from_millis(20), true);
         assert!(
             egress
-                .next_deadline()
+                .next_deadline(at)
                 .is_none_or(|deadline| deadline > started)
         );
     }
@@ -6239,6 +6399,10 @@ mod tests {
     #[test]
     fn active_probe_deadline_wakes_the_connection_for_cluster_expiry() {
         let now = Instant::now();
+        let at = TimePoint {
+            monotonic: now,
+            global: GlobalMediaTime::from_micros(0),
+        };
         let policy = pulsebeam_rtc::SenderAssignment {
             playout_delay: Some(PlayoutDelay::ZERO),
             ..crate::test_support::sender_assignment(MediaPayloadBitrate::from_bps(0))
@@ -6255,7 +6419,7 @@ mod tests {
         egress.probe_remaining = 4;
         egress.probe_started_at = Some(now);
         assert_eq!(
-            egress.next_deadline(),
+            egress.next_deadline(at),
             now.checked_add(Duration::from_millis(20))
         );
         egress.update_controller(
@@ -6298,7 +6462,7 @@ mod tests {
             egress.probe_history.back().expect("cluster").result,
             ProbeResult::Failed
         );
-        assert!(egress.next_deadline().is_none_or(|next| next > deadline));
+        assert!(egress.next_deadline(at).is_none_or(|next| next > deadline));
     }
 
     #[test]

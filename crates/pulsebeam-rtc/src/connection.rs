@@ -557,7 +557,7 @@ impl Connection {
                         self._subsystems
                             .transport
                             .can_send_user_data()
-                            .then(|| self._subsystems.egress.next_deadline())
+                            .then(|| self._subsystems.egress.next_deadline(at))
                             .flatten(),
                         self._subsystems
                             .sctp

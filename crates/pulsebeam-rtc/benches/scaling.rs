@@ -9,37 +9,30 @@
 #[path = "../tests/support/mod.rs"]
 mod support;
 
-use std::{
-    cmp::Reverse,
-    collections::BinaryHeap,
-    hint::black_box,
-    time::{Duration, Instant},
-};
+use std::{hint::black_box, time::Duration};
 
 use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_main};
-use pulsebeam_rtc::{Command, CommandError, GlobalMediaTime, MediaPacket, Output, TimePoint};
+use pulsebeam_rtc::{Command, CommandError, MediaPacket, SenderId};
 use support::{PeerFixture, forwarded};
 
-const DURATION: Duration = Duration::from_secs(30);
-const QUANTUM: Duration = Duration::from_millis(1);
-const CONNECTION_COUNTS: [usize; 3] = [1, 16, 64];
+const FRAMES: usize = 64;
+const CAPTURE_INTERVAL: Duration = Duration::from_millis(20);
 const SENDER_COUNTS: [usize; 3] = [1, 8, 32];
+const BURST_DEPTHS: [usize; 2] = [1, 8];
 
-fn many_connections_many_streams(criterion: &mut Criterion) {
-    let mut source = PeerFixture::connected();
-    let packet = source.send_source(&vec![0x5a; 1_000]);
-    let mut group = criterion.benchmark_group("many_connections_many_streams");
+fn active_media(criterion: &mut Criterion) {
+    let mut group = criterion.benchmark_group("active_media");
     group.sample_size(10);
-    for connection_count in CONNECTION_COUNTS {
-        for sender_count in SENDER_COUNTS {
+    group.warm_up_time(Duration::from_millis(500));
+    group.measurement_time(Duration::from_secs(1));
+    for senders in SENDER_COUNTS {
+        for burst in BURST_DEPTHS {
+            report(senders, burst, ScalingCell::new(senders, burst).run());
             group.bench_function(
-                BenchmarkId::new(
-                    format!("connections_{connection_count}"),
-                    format!("senders_{sender_count}"),
-                ),
+                BenchmarkId::new(format!("senders_{senders}"), format!("burst_{burst}")),
                 |bencher| {
                     bencher.iter_batched_ref(
-                        || ScalingCell::new(connection_count, sender_count, &packet),
+                        || ScalingCell::new(senders, burst),
                         |cell| black_box(cell.run()),
                         BatchSize::PerIteration,
                     );
@@ -50,95 +43,105 @@ fn many_connections_many_streams(criterion: &mut Criterion) {
     group.finish();
 }
 
+#[allow(
+    clippy::print_stderr,
+    reason = "untimed benchmark service and backlog evidence, not application logging"
+)]
+fn report(
+    senders: usize,
+    burst: usize,
+    (admitted, blocked, originals, feedback, peak): (usize, usize, u64, usize, usize),
+) {
+    eprintln!(
+        "active_media senders={senders} burst={burst}: admitted={admitted} blocked={blocked} originals={originals} feedback={feedback} peak_queue={peak}"
+    );
+}
+
 struct ScalingCell {
-    connections: Vec<PeerFixture>,
-    start: Instant,
-    start_global: u64,
-    due: BinaryHeap<Reverse<(Instant, usize)>>,
-    pending: Vec<bool>,
+    fixture: PeerFixture,
+    senders: Vec<SenderId>,
+    burst: usize,
+    pending: Vec<(MediaPacket, u64)>,
+    payload: Vec<u8>,
 }
 
 impl ScalingCell {
-    fn new(connection_count: usize, sender_count: usize, packet: &MediaPacket) -> Self {
-        let mut connections = (0..connection_count)
-            .map(|_| PeerFixture::connected_with_senders(sender_count))
-            .collect::<Vec<_>>();
-        for fixture in &mut connections {
-            for (index, sender) in fixture.senders.clone().into_iter().enumerate() {
-                match fixture.connection.command(
-                    fixture.at(),
-                    Command::SendMedia {
-                        sender,
-                        media: forwarded(
-                            packet.clone(),
-                            u64::try_from(index).expect("bounded sender index") + 1,
-                        ),
-                    },
-                ) {
-                    Ok(()) | Err(CommandError::WouldBlock) => {}
-                    Err(error) => panic!("unexpected media admission error: {error:?}"),
+    fn new(senders: usize, burst: usize) -> Self {
+        let mut fixture = PeerFixture::connected_with_senders(senders).without_egress_observation();
+        fixture.configure_bottleneck(500_000);
+        let senders = fixture.senders.clone();
+        for sender in &senders {
+            let mut assignment = fixture.assignment(*sender);
+            assignment.delivery.max_media_age = Duration::from_secs(2);
+            assignment.delivery.max_queue_residence = Duration::from_secs(2);
+            fixture.command(Command::SetSenderAssignment {
+                sender: *sender,
+                assignment: Some(assignment),
+            });
+        }
+        Self {
+            fixture,
+            senders,
+            burst,
+            pending: Vec::with_capacity(burst),
+            payload: vec![0x5a; 160],
+        }
+    }
+
+    // Includes native capture, transport pumping and authenticated feedback. The
+    // immutable sample fanout is one publisher, not reset/replayed source state.
+    fn run(&mut self) -> (usize, usize, u64, usize, usize) {
+        let mut admitted = 0;
+        let mut blocked = 0;
+        let mut peak = 0;
+        let feedback_before = self.fixture.twcc_sent();
+        for frame in 0..FRAMES {
+            let packet = self.fixture.send_source(&self.payload);
+            self.pending
+                .push((packet, u64::try_from(frame).expect("bounded frame") + 1));
+            self.fixture.drive_for(CAPTURE_INTERVAL);
+            if self.pending.len() != self.burst {
+                continue;
+            }
+            for (packet, id) in self.pending.drain(..) {
+                for sender in &self.senders {
+                    match self.fixture.try_command(Command::SendMedia {
+                        sender: *sender,
+                        media: forwarded(packet.clone(), id),
+                    }) {
+                        Ok(()) => admitted += 1,
+                        Err(CommandError::WouldBlock) => blocked += 1,
+                        Err(error) => panic!("unexpected admission error: {error:?}"),
+                    }
                 }
             }
+            peak = peak.max(
+                self.fixture
+                    .connection
+                    .stats()
+                    .senders
+                    .iter()
+                    .map(|s| s.queued_packets)
+                    .sum(),
+            );
         }
-        let start = connections
+        self.fixture.drive_for(Duration::from_millis(500));
+        let originals = self
+            .fixture
+            .connection
+            .stats()
+            .senders
             .iter()
-            .map(|fixture| fixture.at().monotonic)
-            .max()
-            .expect("nonempty scaling cell");
-        let start_global = connections
-            .iter()
-            .map(|fixture| fixture.at().global.as_micros())
-            .max()
-            .expect("nonempty scaling cell");
-        let mut cell = Self {
-            connections,
-            start,
-            start_global,
-            due: BinaryHeap::with_capacity(connection_count),
-            pending: vec![false; connection_count],
-        };
-        for index in 0..connection_count {
-            cell.schedule(start, index);
-        }
-        cell
-    }
-
-    fn run(&mut self) -> u64 {
-        let end = self.start + DURATION;
-        let mut polls = 0_u64;
-        while let Some(Reverse((at, index))) = self.due.pop() {
-            if at > end {
-                break;
-            }
-            self.pending[index] = false;
-            polls = polls.saturating_add(1);
-            let now = TimePoint {
-                monotonic: at,
-                global: GlobalMediaTime::from_micros(self.start_global.saturating_add(
-                    u64::try_from(at.duration_since(self.start).as_micros()).unwrap_or(u64::MAX),
-                )),
-            };
-            match black_box(self.connections[index].connection.poll(now)) {
-                Output::Idle {
-                    next_wakeup: Some(next),
-                } => self.schedule(next.max(at + QUANTUM), index),
-                Output::Idle { next_wakeup: None } | Output::Closed(_) => {}
-                Output::Transmit(_) | Output::Event(_) => self.schedule(at, index),
-                _ => panic!("unreviewed future output"),
-            }
-        }
-        polls
-    }
-
-    fn schedule(&mut self, at: Instant, index: usize) {
-        assert!(
-            !self.pending[index],
-            "at most one pending wakeup per connection"
-        );
-        self.pending[index] = true;
-        self.due.push(Reverse((at, index)));
+            .map(|s| s.transmitted_packets)
+            .sum::<u64>();
+        let feedback = self.fixture.twcc_sent() - feedback_before;
+        assert!(admitted > self.senders.len());
+        assert!(originals > u64::try_from(self.senders.len()).expect("bounded sender count"));
+        assert!(feedback > 0);
+        assert!(peak >= self.burst);
+        (admitted, blocked, originals, feedback, peak)
     }
 }
 
-criterion_group!(benches, many_connections_many_streams);
+criterion_group!(benches, active_media);
 criterion_main!(benches);

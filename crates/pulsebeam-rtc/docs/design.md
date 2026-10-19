@@ -1135,8 +1135,13 @@ RTX must satisfy both its repair window and the media-age constraint. Byte
 bounds and native transport safety limits remain independently authoritative.
 
 Tightening bounds re-evaluates queued work and repairs in the same command.
-Expiry work is bounded and continues through immediate wakeups when needed.
-Relaxing them cannot resurrect discarded media. Neither operation mutates source
+Each sender owns its queue, frame membership, and payload accounting. Transport
+service considers one head per sender with reusable eligibility storage; it
+does not rediscover heads by scanning a connection-wide backlog. Expiry removes
+at most 256 queued packets per pass and resumes across senders. An abandoned
+frame remains ineligible, including its End fragment, until cleanup completes.
+Expired heads cannot be emitted after the work cap; unfinished cleanup reports
+an immediate wakeup. Relaxing bounds cannot resurrect discarded media. Neither operation mutates source
 timestamps. Local video expiry emits a coalesced `KeyframeRequested` with
 `LocalRecovery`; authenticated peer PLI/FIR uses `Peer`. Pending local recovery
 is observed before `Idle`, and audio expiry does not request a keyframe.
@@ -1389,13 +1394,15 @@ Run root `./bazel test //:test` for complete workspace acceptance, including
 consumer-owned Web and React browser coverage. Shared browser provisioning is
 retained in `tools/browser-matrix.json`.
 
-Host-performance comparisons use scaling measurements, separate from correctness
-test gates. The parameterized matrix preserves one wakeup per connection and no
-global scans. Run the Criterion matrix with
-`./bazel run //:benchmark`. It measures timer/poll
-scheduling for 1/16/64 connections and 1/8/32 senders, excluding fixture setup and
-teardown. This initial-burst workload is not sustained network throughput
-evidence. Benchmark reports and baselines are emitted under `target/criterion`.
+Host-performance comparisons use the active-media Criterion matrix, separate
+from correctness gates: `./bazel run -c opt //:benchmark`. One connection serves
+1/8/32 senders with admission bursts of 1/8 fresh native-publisher samples.
+The timed workload includes sustained admission, original transmit commits,
+native feedback, and bounded backpressure; negotiation and cell allocation/
+teardown are excluded. Native capture and transport pumping are included, so
+this is neither isolated queue cost nor production-server throughput.
+See the [crate benchmark contract](../README.md#validation-boundary) for workload
+bounds, report-directory configuration, and service/backlog counters.
 
 Stored SDP cannot prove runtime interoperability. Client-free protocol checks
 and Ericsson SCReAM comparisons establish narrower RTC component invariants,

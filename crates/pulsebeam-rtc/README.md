@@ -273,22 +273,32 @@ negotiation, media-clock normalization, source switching, RTP/RTCP continuity,
 loss, delay, reordering, VBR, pauses, probing, feedback loss, DataChannel
 coexistence, malformed traffic, overload, resource bounds, and timer scaling.
 
-Parameterized many-connection and many-stream benchmarks preserve one
-externally scheduled wakeup per connection and avoid global scans. Run the
-Criterion scaling matrix separately from test gates:
+Run the active-media Criterion matrix separately from correctness gates:
 
 ```sh
-./bazel run //:benchmark
+CRITERION_HOME="$PWD/target/criterion" ./bazel run -c opt //:benchmark
 ```
 
-The matrix covers 1/16/64 connections with 1/8/32 senders each. Criterion measures
-wall-clock execution of 30 simulated seconds of polling after attempting one
-initial packet per sender, allowing admission backpressure. Connection negotiation,
-media admission, and teardown are excluded from timing.
-Transmits are discarded, so this measures timer/poll scheduling, not sustained
-network throughput or a simulated bandwidth/RTT path. Reports and comparison
-baselines live under `target/criterion`. Criterion arguments can be passed to the
-entrypoint, for example `./bazel run //:benchmark -- --save-baseline main`.
+Each cell uses one connection with 1/8/32 senders and admission bursts of 1/8
+fresh samples. A native publisher supplies 64 samples at explicit 20-ms capture
+intervals. The caller fans out each immutable sample, while production polling
+commits output and the native peer returns authenticated feedback over a
+500-kbit/s bottleneck. Caller delivery bounds permit two seconds of media age
+and queue residence. Backpressure is part of the workload; untimed cell reports
+include admitted/backpressured attempts, original transmissions, feedback count, and
+peak queued packets.
+
+Negotiation and cell allocation/teardown are outside timing. Timing includes
+capture, admission, transport pumping, feedback, queue statistics, and a final
+500-ms virtual drain. This is a bounded active-media harness comparison, not
+isolated queue-operation cost or production-server throughput. Reports and
+comparison baselines live under `target/criterion`. To focus the busy sender
+cells, pass Criterion's filter to the entrypoint:
+
+```sh
+CRITERION_HOME="$PWD/target/criterion" ./bazel run -c opt //:benchmark -- \
+  'active_media/senders_(8|32)/burst_8'
+```
 
 Run the complete RTC unit, property, integration, and native interoperability
 suite, with cached test results disabled:
