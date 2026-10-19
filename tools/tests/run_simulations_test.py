@@ -8,7 +8,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
-from types import SimpleNamespace
+import time
 import unittest
 from unittest.mock import patch
 
@@ -30,19 +30,21 @@ class SimulationRunnerContract(unittest.TestCase):
         executed = []
         output = StringIO()
 
-        def run(command, **kwargs):
+        def run(command, trace, **kwargs):
             if "--list" in command:
                 names = [IGNORED] if "--ignored" in command else [EXCEPTION, FAST, SLOW, IGNORED]
-                return SimpleNamespace(stdout="".join(f"{name}: test\n" for name in names))
+                trace.write("".join(f"{name}: test\n" for name in names))
+                return 0, False
             name = command[2]
             executed.append((name, kwargs["env"].get("PULSEBEAM_SIM_SEED"), command))
-            kwargs["stdout"].write(f"complete trace for {name}\n")
-            return SimpleNamespace(returncode=int(name in failing))
+            trace.write(f"complete trace for {name}\n")
+            trace.write("[simulation-generated] budget=20 accepted=28 rejected=0 failed=0\n")
+            return int(name in failing), False
 
         with tempfile.TemporaryDirectory() as temp, \
              patch.dict(os.environ, {"TEST_UNDECLARED_OUTPUTS_DIR": temp, "TEST_TMPDIR": temp}), \
              patch.object(RUNNER.sys, "argv", ["runner", "fake-libtest", "--jobs", "1", *args]), \
-             patch.object(RUNNER.subprocess, "run", side_effect=run), \
+             patch.object(RUNNER, "run_process", side_effect=run), \
              redirect_stdout(output), redirect_stderr(output):
             try:
                 status = RUNNER.main()
@@ -96,6 +98,7 @@ class SimulationRunnerContract(unittest.TestCase):
         self.assertIn(f"[simulation-result] PASS {FAST} seed=4711 wall_seconds=2.500", output)
         self.assertIn(f"--seed 4711 --exact --filter {FAST}", output)
         self.assertNotIn("complete trace", output)
+        self.assertIn("[simulation-generated] budget=20 accepted=28 rejected=0 failed=0", output)
         self.assertEqual(self.traces, [])
 
     def test_complete_failure_trace_is_retained_and_attributable(self):
@@ -128,6 +131,15 @@ class SimulationRunnerContract(unittest.TestCase):
         self.assertIn("seed=73", output)
         self.assertIn("--seed 73", output)
 
+    def test_invalid_host_deadlines_fail_before_execution(self):
+        for option in ["--discovery-timeout", "--case-timeout"]:
+            for value in ["0", "-1", "nan", "inf"]:
+                with self.subTest(option=option, value=value):
+                    status, executed, output = self.invoke(option, value)
+                    self.assertEqual(status, 2)
+                    self.assertEqual(executed, [])
+                    self.assertIn("host deadlines must be finite and positive", output)
+
     def test_invalid_seed_window_fails_before_execution(self):
         status, executed, output = self.invoke("--seed", str(2**64 - 1), "--seeds", "2")
         self.assertEqual(status, 2)
@@ -140,8 +152,21 @@ class SimulationRunnerContract(unittest.TestCase):
 LIBTEST = '''import os
 from pathlib import Path
 import sys
+import signal
+import subprocess
 
 names = ["tests::first", "tests::second"]
+blocked = os.environ.get("BLOCK_PROCESS")
+if blocked == ("discovery" if "--list" in sys.argv else "case"):
+    # The descendant acknowledges startup before the parent blocks, so cleanup
+    # is checked on a process that existed, not an unobserved attempted spawn.
+    descendant = subprocess.Popen([sys.executable, "-c",
+        "import os,signal; print(os.getpid(), flush=True); signal.pause()"],
+        stdout=subprocess.PIPE, text=True)
+    Path(os.environ["DESCENDANT_PID"]).write_text(descendant.stdout.readline())
+    print("blocked " + blocked, flush=True)
+    signal.pause()
+
 if "--list" in sys.argv:
     if "--ignored" not in sys.argv:
         for name in names:
@@ -174,6 +199,46 @@ class SimulationProcessesContract(unittest.TestCase):
             env=os.environ | {"TEST_TMPDIR": str(root), "TEST_UNDECLARED_OUTPUTS_DIR": str(root)} | (env or {}),
             capture_output=True, text=True, timeout=20,
         )
+
+    def test_host_deadlines_fail_and_terminate_descendants(self):
+        for blocked, option in [("discovery", "--discovery-timeout"), ("case", "--case-timeout")]:
+            with self.subTest(blocked=blocked), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                pid_file = root / "descendant.pid"
+                result = self.run_fixture(
+                    root, "--exact", "--filter", "tests::first", "--seed", "73", option, "1",
+                    env={"BLOCK_PROCESS": blocked, "DESCENDANT_PID": str(pid_file)},
+                )
+                self.assertEqual(result.returncode, 1, result.stderr)
+                output = result.stdout + result.stderr
+                self.assertIn("FAIL", output)
+                self.assertIn("seed=73", output)
+                self.assertIn("Failure trace:", output)
+                traces = list(root.glob("simulations/*.log"))
+                self.assertEqual(len(traces), 1)
+                trace = traces[0].read_text()
+                self.assertIn("command=", trace)
+                self.assertIn("seed=73", trace)
+                self.assertIn("blocked " + blocked, trace)
+                self.assertIn("TIMEOUT after 1 host seconds; process group terminated", trace)
+                pid = int(pid_file.read_text())
+                status = Path(f"/proc/{pid}/status")
+                deadline = time.monotonic() + 2
+                while status.exists():
+                    try:
+                        state = next(line for line in status.read_text().splitlines()
+                                     if line.startswith("State:")).split()[1]
+                    except FileNotFoundError:
+                        break
+                    # An orphan may await reaping by the host init. A zombie
+                    # has exited and cannot retain resources or run helpers.
+                    if state in ["Z", "X"]:
+                        break
+                    if time.monotonic() >= deadline:
+                        self.fail("descendant survived the host deadline")
+                    time.sleep(0.01)
+                if blocked == "case":
+                    self.assertIn("--seed 73 --exact --filter tests::first", output)
 
     def test_workers_coexist_in_distinct_processes_with_grouped_metrics(self):
         with tempfile.TemporaryDirectory() as temp:

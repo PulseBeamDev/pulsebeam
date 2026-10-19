@@ -2,8 +2,10 @@
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import math
 import os
 from pathlib import Path
+import signal
 import shlex
 import subprocess
 import sys
@@ -11,9 +13,45 @@ import tempfile
 import time
 
 
-def names(binary, *flags):
-    listed = subprocess.run([binary, "--list", "--format=terse", *flags], check=True, text=True, capture_output=True)
-    return [line.removesuffix(": test") for line in listed.stdout.splitlines() if line.endswith(": test")]
+def run_process(command, trace, *, timeout, env=None):
+    trace.write(f"command={shlex.join(command)}\n")
+    trace.flush()
+    try:
+        process = subprocess.Popen(command, env=env, stdout=trace, stderr=subprocess.STDOUT,
+                                   start_new_session=True)
+    except OSError as error:
+        trace.write(f"Unable to start child: {error}\n")
+        return 127, False
+    try:
+        return process.wait(timeout=timeout), False
+    except subprocess.TimeoutExpired:
+        # Kill the session's process group, not just libtest: native helpers and
+        # descendants must not outlive a failed discovery, owner or replay.
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.wait()
+        trace.write(f"TIMEOUT after {timeout:g} host seconds; process group terminated\n")
+        return process.returncode, True
+
+
+def names(binary, logs, seed_label, timeout, *flags):
+    command = [binary, "--list", "--format=terse", *flags]
+    log = logs / ("discovery-ignored.log" if "--ignored" in flags else "discovery.log")
+    with log.open("w") as trace:
+        trace.write(f"case=discovery seed={seed_label}\n")
+        status, timed_out = run_process(command, trace, timeout=timeout)
+    if status or timed_out:
+        print(f"[simulation-discovery] FAIL seed={seed_label} timeout={timed_out}; "
+              f"command={shlex.join(command)}\nFailure trace: {log}", file=sys.stderr, flush=True)
+        return None
+    selected = [line.removesuffix(": test") for line in log.read_text().splitlines()
+                if line.endswith(": test")]
+    log.unlink()
+    return selected
+
+
 
 
 def main():
@@ -30,15 +68,28 @@ def main():
     # replay can use the host, and an explicit --jobs always wins.
     parser.add_argument("--jobs", type=int, default=1 if "TEST_TMPDIR" in os.environ else min(16, os.cpu_count() or 1))
     parser.add_argument("--show-output", action="store_true", help="emit complete, grouped case traces for diagnostics or scoreboard metrics")
+    parser.add_argument("--discovery-timeout", type=float, default=30, help="host-second deadline per discovery process")
+    parser.add_argument("--case-timeout", type=float, default=600, help="host-second deadline per isolated case, including replay")
     args = parser.parse_args()
+    if any(not math.isfinite(value) or value <= 0 for value in [args.discovery_timeout, args.case_timeout]):
+        parser.error("host deadlines must be finite and positive")
     if args.seeds < 1 or args.jobs < 1:
         parser.error("--seeds and --jobs must be positive")
     if args.from_seed is not None and not (0 <= args.from_seed <= args.from_seed + args.seeds - 1 < 2**64):
         parser.error("seed window must fit an unsigned 64-bit integer")
 
     binary = str(Path(args.binary).resolve())
-    ignored = set(names(binary, "--ignored"))
-    selected = [name for name in names(binary) if name not in ignored
+    output_root = os.environ.get("TEST_UNDECLARED_OUTPUTS_DIR")
+    logs = Path(output_root) / "simulations" if output_root else Path(tempfile.mkdtemp(prefix="pulsebeam-simulations-"))
+    logs.mkdir(parents=True, exist_ok=True)
+    seed_label = "committed" if args.from_seed is None else str(args.from_seed)
+    ignored = names(binary, logs, seed_label, args.discovery_timeout, "--ignored")
+    if ignored is None:
+        return 1
+    listed = names(binary, logs, seed_label, args.discovery_timeout)
+    if listed is None:
+        return 1
+    selected = [name for name in listed if name not in ignored
                 and (name == args.filter if args.exact else args.filter in name)
                 and (args.mode == "all" or ("::slow::" in name) == (args.mode == "slow"))]
     if not args.run_skipped:
@@ -50,9 +101,6 @@ def main():
         parser.error("no non-ignored simulations match the requested selection")
 
     print(f"[simulation-run] cases={len(selected)} seeds={args.seeds} jobs={args.jobs}", flush=True)
-    output_root = os.environ.get("TEST_UNDECLARED_OUTPUTS_DIR")
-    logs = Path(output_root) / "simulations" if output_root else Path(tempfile.mkdtemp(prefix="pulsebeam-simulations-"))
-    logs.mkdir(parents=True, exist_ok=True)
 
     def run(index, name, seed):
         env = os.environ.copy()
@@ -65,10 +113,9 @@ def main():
         started = time.perf_counter()
         with log.open("w") as trace:
             trace.write(f"case={name} seed={seed_label}\n")
-            trace.flush()
-            result = subprocess.run([binary, "--exact", name, "--nocapture", "--test-threads=1"],
-                                    env=env, stdout=trace, stderr=subprocess.STDOUT)
-        return name, seed, result.returncode, time.perf_counter() - started, log
+            status, timed_out = run_process([binary, "--exact", name, "--nocapture", "--test-threads=1"],
+                                            trace, env=env, timeout=args.case_timeout)
+        return name, seed, status, timed_out, time.perf_counter() - started, log
 
     failed = False
     with ThreadPoolExecutor(max_workers=args.jobs) as executor:
@@ -76,14 +123,14 @@ def main():
                  for offset in range(args.seeds) for name in selected]
         futures = [executor.submit(run, index, name, seed) for index, (name, seed) in enumerate(cases)]
         for future in as_completed(futures):
-            name, seed, status, elapsed, log = future.result()
-            if args.show_output:
-                # Only this thread writes child traces, so scoreboard metrics
-                # stay adjacent to their case result even with multiple workers.
-                with log.open(errors="replace") as trace:
-                    for line in trace:
+            name, seed, status, timed_out, elapsed, log = future.result()
+            # Only this thread writes child evidence, keeping generated coverage
+            # and explicit scoreboard traces adjacent to their case result.
+            with log.open(errors="replace") as trace:
+                for line in trace:
+                    if args.show_output or line.startswith(("[simulation-generated]", "[simulation-premise]")):
                         sys.stdout.write(line)
-            outcome = "FAIL" if status else "PASS"
+            outcome = "FAIL" if status or timed_out else "PASS"
             seed_label = "committed" if seed is None else str(seed)
             print(f"[simulation-result] {outcome} {name} seed={seed_label} wall_seconds={elapsed:.3f}", flush=True)
             replay = ["./bazel", "run", "//:replay", "--"]
@@ -93,8 +140,10 @@ def main():
                 replay += ["--seed", str(seed)]
             replay += ["--exact", "--filter", name]
             print(f"Replay: {shlex.join(replay)}", flush=True)
-            if status:
+            if status or timed_out:
                 failed = True
+                if timed_out:
+                    print(f"Host timeout: {args.case_timeout:g}s; child process group terminated", flush=True)
                 print(f"Failure trace: {log}", flush=True)
             else:
                 log.unlink()
