@@ -242,6 +242,10 @@ fn run(scenario: Scenario) {
             .connection
             .receive(
                 fixture.at(),
+                pulsebeam_rtc::PacketObservation {
+                    at: fixture.at(),
+                    provenance: 0,
+                },
                 NetworkInput::Udp {
                     local: "127.0.0.1:41000".parse().expect("local address"),
                     remote: "127.0.0.1:9".parse().expect("wrong-path address"),

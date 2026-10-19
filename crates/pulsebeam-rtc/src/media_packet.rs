@@ -9,10 +9,18 @@ use bytes::Bytes;
 
 use crate::{FrameId, GlobalMediaTime, SourceIncarnation};
 
+/// Portable receive observation, never refreshed by normalization, queueing or transit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PacketOrigin {
+    pub observed_at: GlobalMediaTime,
+    pub provenance: u64,
+}
+
 #[derive(Clone, Debug)]
 pub struct MediaPacket {
     bytes: Bytes,
     global_media_at: GlobalMediaTime,
+    origin: PacketOrigin,
     extensions: Arc<[(Arc<str>, Range<usize>)]>,
     clock_quality: ClockQuality,
     _not_sync: PhantomData<Cell<()>>,
@@ -48,6 +56,10 @@ impl MediaPacket {
             global_media_at,
             extensions,
             ClockQuality::Provisional,
+            PacketOrigin {
+                observed_at: global_media_at,
+                provenance: 0,
+            },
         )
     }
 
@@ -56,12 +68,14 @@ impl MediaPacket {
         global_media_at: GlobalMediaTime,
         extensions: Arc<[(Arc<str>, Range<usize>)]>,
         clock_quality: ClockQuality,
+        origin: PacketOrigin,
     ) -> Self {
         Self {
             bytes,
             global_media_at,
             extensions,
             clock_quality,
+            origin,
             _not_sync: PhantomData,
         }
     }
@@ -76,6 +90,10 @@ impl MediaPacket {
 
     pub const fn global_media_at(&self) -> GlobalMediaTime {
         self.global_media_at
+    }
+
+    pub const fn origin(&self) -> PacketOrigin {
+        self.origin
     }
 
     pub fn view(&self) -> Option<MediaPacketView<'_>> {
@@ -114,6 +132,7 @@ impl MediaPacket {
         Self {
             bytes: Bytes::copy_from_slice(&self.bytes),
             global_media_at: self.global_media_at,
+            origin: self.origin,
             clock_quality: self.clock_quality,
             extensions: self
                 .extensions
@@ -260,6 +279,10 @@ mod tests {
             GlobalMediaTime::from_micros(42),
             vec![(Arc::from("urn:example:extension"), 6..15)].into(),
             ClockQuality::Synchronized,
+            PacketOrigin {
+                observed_at: GlobalMediaTime::from_micros(71),
+                provenance: 9001,
+            },
         );
 
         let transit = packet.to_transit();
@@ -267,6 +290,7 @@ mod tests {
         assert_eq!(transit.bytes(), packet.bytes());
         assert_eq!(transit.global_media_at(), packet.global_media_at());
         assert_eq!(transit.clock_quality(), ClockQuality::Synchronized);
+        assert_eq!(transit.origin(), packet.origin());
         assert_eq!(
             transit.extension("urn:example:extension"),
             packet.extension("urn:example:extension")

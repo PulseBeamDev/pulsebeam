@@ -52,3 +52,20 @@ impl ComponentSource {
         MediaPacket::new(Bytes::from(bytes), at.global, Default::default())
     }
 }
+pub(crate) fn transmit_kind(service: crate::transport::RtpService) -> crate::TransmitKind {
+    let sender = crate::SenderId::new(1).expect("synthetic sender");
+    let global_media_at = crate::GlobalMediaTime::from_micros(0);
+    let info = crate::MediaTransmitInfo {
+        sender,
+        global_media_at,
+        origin: crate::PacketOrigin {
+            observed_at: global_media_at,
+            provenance: 0,
+        },
+    };
+    match service {
+        crate::transport::RtpService::Original => crate::TransmitKind::Original(info),
+        crate::transport::RtpService::Repair => crate::TransmitKind::Repair(info),
+        crate::transport::RtpService::Padding => crate::TransmitKind::Padding { sender },
+    }
+}

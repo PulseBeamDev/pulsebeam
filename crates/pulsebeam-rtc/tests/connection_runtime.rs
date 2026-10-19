@@ -72,6 +72,10 @@ fn malformed_input_is_dropped_without_disrupting_the_runtime_timer() -> Result<(
     assert_eq!(
         connection.receive(
             at(start + Duration::from_millis(1)),
+            pulsebeam_rtc::PacketObservation {
+                at: at(start + Duration::from_millis(1)),
+                provenance: 0
+            },
             NetworkInput::Udp {
                 local: SocketAddr::from(([192, 0, 2, 1], 5000)),
                 remote: SocketAddr::from(([192, 0, 2, 2], 5001)),

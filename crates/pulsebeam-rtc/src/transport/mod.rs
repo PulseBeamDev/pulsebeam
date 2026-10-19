@@ -81,13 +81,24 @@ pub(crate) enum RtpService {
     Padding,
 }
 
+impl crate::TransmitKind {
+    pub(crate) const fn rtp_service(self) -> Option<RtpService> {
+        match self {
+            Self::Original(_) => Some(RtpService::Original),
+            Self::Repair(_) => Some(RtpService::Repair),
+            Self::Padding { .. } => Some(RtpService::Padding),
+            Self::Control => None,
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum TransportEvent {
     StateChanged(TransportState),
     IceAuthenticated(AuthenticatedFlow),
     IceStateChanged(IceConnectionState),
     Rtp {
-        arrival: TimePoint,
+        arrival: crate::PacketObservation,
         path_epoch: PathEpoch,
         bytes: Vec<u8>,
         metadata: RtpMetadata,
@@ -119,6 +130,7 @@ pub(crate) struct TransportTransmit {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct PreparedTransmit {
     pub(crate) target: TransmitTarget,
+    pub(crate) classification: crate::TransmitKind,
     pub(crate) bytes: Vec<u8>,
     pub(crate) kind: DatagramKind,
     pub(crate) wire_len: usize,
@@ -608,6 +620,7 @@ impl Transport {
         (bytes.len() >= 12).then_some(DatagramKind::Rtp)
     }
 
+    #[cfg(test)]
     pub(crate) fn handle_datagram(
         &mut self,
         now: Instant,
@@ -617,9 +630,12 @@ impl Transport {
     ) -> Result<(), TransportError> {
         self.handle_envelope(
             now,
-            TimePoint {
-                monotonic: now,
-                global: GlobalMediaTime::from_micros(0),
+            crate::PacketObservation {
+                at: TimePoint {
+                    monotonic: now,
+                    global: GlobalMediaTime::from_micros(0),
+                },
+                provenance: 0,
             },
             SelectedPath::unselected(NetworkEnvelope::Udp {
                 local: destination,
@@ -633,7 +649,7 @@ impl Transport {
     fn handle_envelope(
         &mut self,
         now: Instant,
-        arrival: TimePoint,
+        arrival: crate::PacketObservation,
         path: SelectedPath,
         bytes: Vec<u8>,
         ecn: Option<crate::EcnCodepoint>,
@@ -744,7 +760,7 @@ impl Transport {
                                 .and_then(|selected| selected.epoch)
                                 .ok_or(TransportError::Protocol)?;
                             self.push_event(TransportEvent::Rtcp {
-                                arrival,
+                                arrival: arrival.at,
                                 path_epoch,
                                 bytes,
                             })?;
@@ -766,20 +782,7 @@ impl Transport {
     pub(crate) fn receive(
         &mut self,
         now: Instant,
-        input: NetworkInput,
-    ) -> Result<(), TransportError> {
-        self.receive_at(
-            TimePoint {
-                monotonic: now,
-                global: GlobalMediaTime::from_micros(0),
-            },
-            input,
-        )
-    }
-
-    pub(crate) fn receive_at(
-        &mut self,
-        arrival: TimePoint,
+        arrival: crate::PacketObservation,
         input: NetworkInput,
     ) -> Result<(), TransportError> {
         let (envelope, bytes, ecn) = match input {
@@ -829,13 +832,7 @@ impl Transport {
                 )
             }
         };
-        self.handle_envelope(
-            arrival.monotonic,
-            arrival,
-            SelectedPath::unselected(envelope),
-            bytes,
-            ecn,
-        )
+        self.handle_envelope(now, arrival, SelectedPath::unselected(envelope), bytes, ecn)
     }
 
     fn local_candidates_contains(&self, address: SocketAddr, proto: is::Protocol) -> bool {
@@ -864,20 +861,24 @@ impl Transport {
         self.drain_dtls(now, DatagramKind::Dtls)
     }
 
+    #[cfg(test)]
     pub(crate) fn send_rtp(&mut self, packet: &[u8]) -> Result<(), TransportError> {
-        self.send_rtp_with_service(packet, RtpService::Original)
+        self.send_rtp_with_info(
+            packet,
+            crate::test_source::transmit_kind(RtpService::Original),
+        )
     }
 
-    pub(crate) fn send_rtp_with_service(
+    pub(crate) fn send_rtp_with_info(
         &mut self,
         packet: &[u8],
-        service: RtpService,
+        classification: crate::TransmitKind,
     ) -> Result<(), TransportError> {
-        self.send_secure(packet, DatagramKind::Rtp, service)
+        self.send_secure(packet, DatagramKind::Rtp, classification)
     }
 
     pub(crate) fn send_rtcp(&mut self, packet: &[u8]) -> Result<(), TransportError> {
-        self.send_secure(packet, DatagramKind::Rtcp, RtpService::Original)
+        self.send_secure(packet, DatagramKind::Rtcp, crate::TransmitKind::Control)
     }
 
     pub(crate) fn send_sctp(&mut self, packet: &[u8], now: Instant) -> Result<(), TransportError> {
@@ -929,7 +930,7 @@ impl Transport {
         &mut self,
         packet: &[u8],
         kind: DatagramKind,
-        service: RtpService,
+        classification: crate::TransmitKind,
     ) -> Result<(), TransportError> {
         if self.state != TransportState::Connected {
             return Err(
@@ -970,7 +971,9 @@ impl Transport {
                 ssrc: metadata.ssrc,
                 sequence: metadata.sequence,
                 twcc_sequence,
-                service,
+                service: classification
+                    .rtp_service()
+                    .ok_or(TransportError::InvalidInput)?,
             })
         } else {
             None
@@ -984,7 +987,7 @@ impl Transport {
             _ => Err(SrtpError::InvalidPacket),
         }
         .map_err(|_| TransportError::Crypto)?;
-        self.prepare_transmit(path, bytes, kind, rtp)
+        self.prepare_transmit(path, bytes, kind, rtp, classification)
     }
 
     fn drain_ice(
@@ -997,7 +1000,13 @@ impl Transport {
                 self.drop_input();
                 continue;
             };
-            self.prepare_transmit(path, bytes, DatagramKind::Stun, None)?;
+            self.prepare_transmit(
+                path,
+                bytes,
+                DatagramKind::Stun,
+                None,
+                crate::TransmitKind::Control,
+            )?;
         }
         while let Some(event) = self.ice.poll_event() {
             match event {
@@ -1096,7 +1105,13 @@ impl Transport {
         // Records produced without a live path are discarded, never retargeted later.
         if let Some(path) = self.selected.clone() {
             for bytes in packets {
-                self.prepare_transmit(path.clone(), bytes, packet_kind, None)?;
+                self.prepare_transmit(
+                    path.clone(),
+                    bytes,
+                    packet_kind,
+                    None,
+                    crate::TransmitKind::Control,
+                )?;
             }
         }
         for event in events {
@@ -1195,6 +1210,7 @@ impl Transport {
         mut bytes: Vec<u8>,
         kind: DatagramKind,
         rtp: Option<PreparedRtpIdentity>,
+        classification: crate::TransmitKind,
     ) -> Result<(), TransportError> {
         if matches!(path.envelope, NetworkEnvelope::IceTcp { .. }) {
             let length = u16::try_from(bytes.len()).map_err(|_| TransportError::Protocol)?;
@@ -1202,13 +1218,15 @@ impl Transport {
             frame.extend_from_slice(&bytes);
             bytes = frame;
         }
-        if (kind == DatagramKind::Rtp) != rtp.is_some()
+        if classification.rtp_service() != rtp.map(|identity| identity.service)
+            || (kind == DatagramKind::Rtp) != rtp.is_some()
             || (kind == DatagramKind::Rtp && path.epoch.is_none())
         {
             return Err(TransportError::Protocol);
         }
         let transmission = PreparedTransmit {
             target: path.target(),
+            classification,
             wire_len: bytes.len(),
             bytes,
             kind,
@@ -1573,6 +1591,13 @@ mod tests {
                 right
                     .receive(
                         *now,
+                        pulsebeam_rtc::PacketObservation {
+                            at: pulsebeam_rtc::TimePoint {
+                                monotonic: *now,
+                                global: pulsebeam_rtc::GlobalMediaTime::from_micros(0),
+                            },
+                            provenance: 0,
+                        },
                         NetworkInput::Udp {
                             local: remote,
                             remote: local,
@@ -1589,6 +1614,13 @@ mod tests {
                 };
                 left.receive(
                     *now,
+                    pulsebeam_rtc::PacketObservation {
+                        at: pulsebeam_rtc::TimePoint {
+                            monotonic: *now,
+                            global: pulsebeam_rtc::GlobalMediaTime::from_micros(0),
+                        },
+                        provenance: 0,
+                    },
                     NetworkInput::Udp {
                         local: remote,
                         remote: local,
@@ -1777,6 +1809,13 @@ mod tests {
         transport
             .receive(
                 now,
+                pulsebeam_rtc::PacketObservation {
+                    at: pulsebeam_rtc::TimePoint {
+                        monotonic: now,
+                        global: pulsebeam_rtc::GlobalMediaTime::from_micros(0),
+                    },
+                    provenance: 0,
+                },
                 NetworkInput::IceTcp {
                     flow: IceTcpFlowId::from_value(7),
                     local,
@@ -1788,6 +1827,13 @@ mod tests {
         transport
             .receive(
                 now,
+                pulsebeam_rtc::PacketObservation {
+                    at: pulsebeam_rtc::TimePoint {
+                        monotonic: now,
+                        global: pulsebeam_rtc::GlobalMediaTime::from_micros(0),
+                    },
+                    provenance: 0,
+                },
                 NetworkInput::IceTcp {
                     flow: IceTcpFlowId::from_value(7),
                     local,
@@ -1849,6 +1895,7 @@ mod tests {
                 vec![1, 2, 3],
                 DatagramKind::Dtls,
                 None,
+                crate::TransmitKind::Control,
             )
             .expect("prepared frame");
         let prepared = transport.poll_prepared().expect("prepared output");
@@ -1913,7 +1960,15 @@ mod tests {
                 service: RtpService::Original,
             });
             transport
-                .prepare_transmit(path.clone(), vec![1, 2, 3], kind, rtp)
+                .prepare_transmit(
+                    path.clone(),
+                    vec![1, 2, 3],
+                    kind,
+                    rtp,
+                    (rtp)
+                        .map(|identity| crate::test_source::transmit_kind(identity.service))
+                        .unwrap_or(crate::TransmitKind::Control),
+                )
                 .expect("queue flow record");
         }
         transport.pending_dtls.push_back((path, vec![0x16, 0, 0]));
@@ -1928,6 +1983,7 @@ mod tests {
                 vec![1],
                 DatagramKind::Stun,
                 None,
+                crate::TransmitKind::Control,
             )
             .expect("unrelated reply");
 
@@ -2053,6 +2109,14 @@ mod tests {
                     twcc_sequence: None,
                     service: RtpService::Original,
                 }),
+                (Some(PreparedRtpIdentity {
+                    ssrc: 7,
+                    sequence: 9,
+                    twcc_sequence: None,
+                    service: RtpService::Original,
+                }))
+                .map(|identity| crate::test_source::transmit_kind(identity.service))
+                .unwrap_or(crate::TransmitKind::Control),
             )
             .expect("queued RTP");
         transport
@@ -2142,6 +2206,13 @@ mod tests {
         transport
             .receive(
                 Instant::now(),
+                pulsebeam_rtc::PacketObservation {
+                    at: pulsebeam_rtc::TimePoint {
+                        monotonic: Instant::now(),
+                        global: pulsebeam_rtc::GlobalMediaTime::from_micros(0),
+                    },
+                    provenance: 0,
+                },
                 NetworkInput::IceTcp {
                     flow: IceTcpFlowId::from_value(999),
                     local,
@@ -2190,6 +2261,13 @@ mod tests {
         transport
             .receive(
                 now,
+                pulsebeam_rtc::PacketObservation {
+                    at: pulsebeam_rtc::TimePoint {
+                        monotonic: now,
+                        global: pulsebeam_rtc::GlobalMediaTime::from_micros(0),
+                    },
+                    provenance: 0,
+                },
                 NetworkInput::Udp {
                     local: address(6400),
                     remote: address(6401),
@@ -2363,15 +2441,33 @@ mod tests {
             |event| matches!(event, TransportEvent::Rtp { metadata, .. } if metadata.sequence == 0)
         ));
 
-        let rtcp = vec![0x80, 200, 0, 1, 0, 0, 0, 7];
+        let rtcp = vec![0x80, 201, 0, 1, 0, 0, 0, 7];
         left.send_rtcp(&rtcp).expect("left protects RTCP");
         let transmit = left.poll_transmit().expect("protected RTCP transmit");
+        let observation = crate::PacketObservation {
+            at: TimePoint {
+                monotonic: now,
+                global: GlobalMediaTime::from_micros(17),
+            },
+            provenance: 23,
+        };
+        now += Duration::from_millis(50);
         right
-            .handle_datagram(now, transmit.source, transmit.destination, transmit.bytes)
-            .expect("right handles RTCP");
+            .receive(
+                now,
+                observation,
+                NetworkInput::Udp {
+                    local: transmit.destination,
+                    remote: transmit.source,
+                    ecn: None,
+                    payload: transmit.bytes.into(),
+                },
+            )
+            .expect("right handles delayed authenticated RTCP");
+        assert_eq!(right.last_now, Some(now), "protocol execution advances");
         assert!(
             std::iter::from_fn(|| right.poll_event())
-                .any(|event| matches!(event, TransportEvent::Rtcp { bytes, .. } if bytes == rtcp))
+                .any(|event| matches!(event, TransportEvent::Rtcp { bytes, arrival, .. } if bytes == rtcp && arrival == observation.at))
         );
 
         rtp[3] = 1;

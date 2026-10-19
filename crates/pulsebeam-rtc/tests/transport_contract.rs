@@ -168,7 +168,14 @@ fn ice_authentication_reports_exact_udp_and_tcp_tuples_before_nomination() {
             let payload = request(&username, Some(PASSWORD.as_bytes()));
             for _ in 0..2 {
                 connection
-                    .receive(at, input(local, remote, tcp, payload.clone()))
+                    .receive(
+                        at,
+                        pulsebeam_rtc::PacketObservation {
+                            at: at,
+                            provenance: 0,
+                        },
+                        input(local, remote, tcp, payload.clone()),
+                    )
                     .expect("STUN input");
             }
             let expected = if tcp {
@@ -186,7 +193,14 @@ fn ice_authentication_reports_exact_udp_and_tcp_tuples_before_nomination() {
             rebound.set_port(5002);
             admit_if_tcp(&mut connection, at, local, rebound, tcp);
             connection
-                .receive(at, input(local, rebound, tcp, payload))
+                .receive(
+                    at,
+                    pulsebeam_rtc::PacketObservation {
+                        at: at,
+                        provenance: 0,
+                    },
+                    input(local, rebound, tcp, payload),
+                )
                 .expect("rebinding input");
             let expected = if tcp {
                 AuthenticatedFlow::IceTcp {
@@ -221,7 +235,14 @@ fn route_hints_and_invalid_ice_credentials_never_authenticate_a_flow() {
             let (mut connection, at) = connection(local, tcp);
             admit_if_tcp(&mut connection, at, local, remote, tcp);
             connection
-                .receive(at, input(local, remote, tcp, payload.clone()))
+                .receive(
+                    at,
+                    pulsebeam_rtc::PacketObservation {
+                        at: at,
+                        provenance: 0,
+                    },
+                    input(local, remote, tcp, payload.clone()),
+                )
                 .expect("hostile input is isolated");
             assert!(observations(&mut connection, at).is_empty());
             assert!(connection.stats().connection.dropped_network_inputs > 0);
@@ -273,7 +294,14 @@ fn tcp_retirement_rejects_stale_frames_and_routes_same_tuple_replacement() {
             true,
         );
         connection
-            .receive(at, tcp_input(first, local, remote, request.clone()))
+            .receive(
+                at,
+                pulsebeam_rtc::PacketObservation {
+                    at: at,
+                    provenance: 0,
+                },
+                tcp_input(first, local, remote, request.clone()),
+            )
             .expect("nomination");
         assert_tcp_reply(&mut connection, at, first, local, remote);
 
@@ -284,7 +312,14 @@ fn tcp_retirement_rejects_stale_frames_and_routes_same_tuple_replacement() {
             .command(at, Command::RetireIceTcpFlow { flow: first })
             .expect("idempotent retirement");
         assert_eq!(
-            connection.receive(at, tcp_input(first, local, remote, request.clone())),
+            connection.receive(
+                at,
+                pulsebeam_rtc::PacketObservation {
+                    at: at,
+                    provenance: 0
+                },
+                tcp_input(first, local, remote, request.clone())
+            ),
             Err(ReceiveError::UnknownIceTcpFlow)
         );
         connection
@@ -296,11 +331,25 @@ fn tcp_retirement_rejects_stale_frames_and_routes_same_tuple_replacement() {
             true,
         );
         connection
-            .receive(at, tcp_input(second, local, remote, invalid))
+            .receive(
+                at,
+                pulsebeam_rtc::PacketObservation {
+                    at: at,
+                    provenance: 0,
+                },
+                tcp_input(second, local, remote, invalid),
+            )
             .expect("invalid credentials are isolated");
         assert!(observations(&mut connection, at).is_empty());
         connection
-            .receive(at, tcp_input(second, local, remote, request))
+            .receive(
+                at,
+                pulsebeam_rtc::PacketObservation {
+                    at: at,
+                    provenance: 0,
+                },
+                tcp_input(second, local, remote, request),
+            )
             .expect("replacement nomination");
         assert_tcp_reply(&mut connection, at, second, local, remote);
     }
@@ -364,7 +413,14 @@ fn tcp_retirement_cancels_unpublished_work_and_reclaims_capacity() {
             )
             .expect("admit next incarnation");
         connection
-            .receive(at, tcp_input(flow, local, remote, payload.clone()))
+            .receive(
+                at,
+                pulsebeam_rtc::PacketObservation {
+                    at: at,
+                    provenance: 0,
+                },
+                tcp_input(flow, local, remote, payload.clone()),
+            )
             .expect("authenticate stream");
         connection
             .command(at, Command::RetireIceTcpFlow { flow })

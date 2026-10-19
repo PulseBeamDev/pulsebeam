@@ -68,20 +68,27 @@ drains required protocol shutdown traffic to a deadline, and immediate abort.
 
 ## Time and media model
 
-PulseBeam deliberately separates local execution time from globally comparable
-media time.
+PulseBeam separates current execution time, packet observation time and globally
+comparable normalized media time.
 
 * `Instant` drives local timers, RTT, congestion control, pacing,
   retransmission, and `next_wakeup`.
 * `GlobalMediaTime` is a serializable cluster-global microsecond time domain
   supplied from the runtime's NTP/PTP-disciplined clock.
 * The runtime supplies coherent local/global `TimePoint` values; the connection
-  never reads or disciplines clocks itself.
+  never reads or disciplines clocks itself. `receive` separately requires a
+  `PacketObservation { at, provenance }`, preserving delayed receipt without
+  moving protocol execution backward.
 * First-ingress RTP is normalized into `GlobalMediaTime` using the server clock,
   RTP clock progression, and RTCP Sender Report relationships. Endpoint
   wall-clock epochs are not authoritative.
 * Every media packet carries an immutable `global_media_at`. Routing across
-  shards or nodes preserves it exactly.
+  shards or nodes preserves it exactly. Portable `PacketOrigin` retains the
+  observed global time and opaque caller provenance without refreshing either.
+* `TransmitKind` distinguishes original media, receiver repair, padding and
+  non-RTP protocol traffic. Original and repair outputs expose sender, normalized
+  media time and the original source observation, so the caller can measure
+  forwarding latency separately from socket submission without RTC callbacks.
 * `global_media_at` is comparable across media kinds, participants, connections,
   and nodes in the same PulseBeam clock domain. It is normalized server media
   time, not a claim of exact physical capture time.

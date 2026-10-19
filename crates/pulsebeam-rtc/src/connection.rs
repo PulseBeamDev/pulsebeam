@@ -143,8 +143,14 @@ impl CommitCoordinator {
                 self.counters.protocol_bytes = self.counters.protocol_bytes.saturating_add(bytes);
             }
         }
-        let PreparedTransmit { target, bytes, .. } = prepared;
+        let PreparedTransmit {
+            target,
+            bytes,
+            classification,
+            ..
+        } = prepared;
         Ok(Transmit {
+            kind: classification,
             target,
             payload: Bytes::from(bytes),
         })
@@ -305,7 +311,12 @@ impl Connection {
             .map_err(|_| CommandError::InvalidState)
     }
 
-    pub fn receive(&mut self, at: TimePoint, input: NetworkInput) -> Result<(), ReceiveError> {
+    pub fn receive(
+        &mut self,
+        at: TimePoint,
+        observation: crate::PacketObservation,
+        input: NetworkInput,
+    ) -> Result<(), ReceiveError> {
         let at = self._time.observe(at);
         if matches!(
             self.runtime.lifecycle,
@@ -313,9 +324,12 @@ impl Connection {
         ) {
             return Err(ReceiveError::Closed);
         }
+        if observation.at.monotonic > at.monotonic {
+            return Err(ReceiveError::InvalidObservation);
+        }
         self._subsystems
             .transport
-            .receive_at(at, input)
+            .receive(at.monotonic, observation, input)
             .map_err(|error| match error {
                 crate::transport::TransportError::Closed => ReceiveError::Closed,
                 crate::transport::TransportError::QueueFull => ReceiveError::InputLimitExceeded,

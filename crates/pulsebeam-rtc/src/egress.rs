@@ -255,6 +255,7 @@ struct RetainedPacket {
     retained_at: Instant,
     last_repair_at: Option<Instant>,
     global: GlobalMediaTime,
+    origin: crate::PacketOrigin,
     transport_bytes: usize,
 }
 
@@ -532,6 +533,10 @@ impl MediaEgress {
         self.update_media_budget(capacity);
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "keep caller-owned input inline instead of allocating an error wrapper"
+    )]
     pub(crate) fn admit(
         &mut self,
         at: TimePoint,
@@ -1083,10 +1088,15 @@ impl MediaEgress {
         ) else {
             return PrepareResult::Fatal;
         };
+        let classification = crate::TransmitKind::Original(crate::MediaTransmitInfo {
+            sender: sender.facts.id,
+            global_media_at: global,
+            origin: queued.media.packet.origin(),
+        });
         if !self.fits_send_window(bytes_in_flight, packet.len()) {
             return PrepareResult::Blocked;
         }
-        match transport.send_rtp_with_service(&packet, RtpService::Original) {
+        match transport.send_rtp_with_info(&packet, classification) {
             Ok(()) => {
                 self.pending = Some(PendingTransmit::Original {
                     sender: sender_index,
@@ -1237,6 +1247,7 @@ impl MediaEgress {
                     timestamp,
                     &packet,
                     queued.media.packet.global_media_at(),
+                    queued.media.packet.origin(),
                     at.monotonic,
                     prepared.wire_len,
                 );
@@ -1751,6 +1762,7 @@ impl MediaEgress {
         timestamp: u32,
         packet: &[u8],
         global: GlobalMediaTime,
+        origin: crate::PacketOrigin,
         at: Instant,
         wire_len: usize,
     ) {
@@ -1785,6 +1797,7 @@ impl MediaEgress {
             retained_at: at,
             last_repair_at: None,
             global,
+            origin,
             transport_bytes: wire_len,
         });
         self.retained_bytes = self.retained_bytes.saturating_add(wire_len);
@@ -1872,7 +1885,14 @@ impl MediaEgress {
         if !self.fits_send_window(bytes_in_flight, packet.len()) {
             return Some(PrepareResult::Blocked);
         }
-        let result = match transport.send_rtp_with_service(&packet, RtpService::Repair) {
+        let result = match transport.send_rtp_with_info(
+            &packet,
+            crate::TransmitKind::Repair(crate::MediaTransmitInfo {
+                sender: sender.facts.id,
+                global_media_at: retained.global,
+                origin: retained.origin,
+            }),
+        ) {
             Ok(()) => {
                 self.pending = Some(PendingTransmit::Repair {
                     sender: sender_index,
@@ -2468,7 +2488,12 @@ impl MediaEgress {
             self.finish_probe(at.monotonic, true);
             return PrepareResult::Blocked;
         }
-        match transport.send_rtp_with_service(&packet, RtpService::Padding) {
+        match transport.send_rtp_with_info(
+            &packet,
+            crate::TransmitKind::Padding {
+                sender: sender.facts.id,
+            },
+        ) {
             Ok(()) => {
                 self.pending = Some(PendingTransmit::Padding {
                     sender: sender_index,
@@ -3232,6 +3257,7 @@ mod tests {
                 kind: DatagramKind::Rtp,
                 path_epoch: None,
                 rtp: Some(identity),
+                classification: crate::test_source::transmit_kind(identity.service),
             };
             assert!(owner.preflight_commit(&prepared));
             prepared.rtp = Some(PreparedRtpIdentity {
@@ -3404,7 +3430,19 @@ mod tests {
             media.extension("urn:ietf:params:rtp-hdrext:sdes:mid"),
             Some(&b"source-mid"[..])
         );
-        owner.retain_original(0, 17, 19, &original, global, now, original.len() + 16);
+        owner.retain_original(
+            0,
+            17,
+            19,
+            &original,
+            global,
+            crate::PacketOrigin {
+                observed_at: global,
+                provenance: 0,
+            },
+            now,
+            original.len() + 16,
+        );
         let retained = owner.retained.front().expect("retained original");
         assert_eq!(retained.packet, original);
         assert_eq!(owner.retained_bytes, original.len() + 16);
@@ -3484,7 +3522,19 @@ mod tests {
             assignment.delivery.max_media_age = Duration::from_secs(1);
             assignment.delivery.repair_window = Duration::from_millis(500);
             let packet = queued_media(at, 1, FrameBoundary::Complete).packet;
-            owner.retain_original(0, 7, 19, packet.bytes(), at.global, now, 40);
+            owner.retain_original(
+                0,
+                7,
+                19,
+                packet.bytes(),
+                at.global,
+                crate::PacketOrigin {
+                    observed_at: at.global,
+                    provenance: 0,
+                },
+                now,
+                40,
+            );
             let late = TimePoint {
                 monotonic: now + Duration::from_millis(250),
                 global: at.global.checked_add(Duration::from_millis(250)).unwrap(),
@@ -3534,7 +3584,19 @@ mod tests {
         owner.update_controller(at, Some((1, true)), &[], &[], Duration::ZERO, false, 0);
         owner.envelope.as_mut().unwrap().smoothed_rtt = Duration::from_millis(900);
         let packet = queued_media(at, 1, FrameBoundary::Complete).packet;
-        owner.retain_original(0, 7, 19, packet.bytes(), at.global, now, 40);
+        owner.retain_original(
+            0,
+            7,
+            19,
+            packet.bytes(),
+            at.global,
+            crate::PacketOrigin {
+                observed_at: at.global,
+                provenance: 0,
+            },
+            now,
+            40,
+        );
         for (age, expected) in [(1500, true), (1999, true), (2000, false)] {
             let time = TimePoint {
                 monotonic: now + Duration::from_millis(age),
@@ -3569,6 +3631,10 @@ mod tests {
                 7,
                 packet.bytes(),
                 packet.global_media_at(),
+                crate::PacketOrigin {
+                    observed_at: packet.global_media_at(),
+                    provenance: 0,
+                },
                 now,
                 wire_len,
             );
@@ -3734,7 +3800,19 @@ mod tests {
             .admit(at, b, queued_media(at, 2, FrameBoundary::Complete))
             .expect("queue sibling");
         let bytes = queued_media(at, 3, FrameBoundary::Complete).packet;
-        owner.retain_original(0, 17, 19, bytes.bytes(), at.global, now, 40);
+        owner.retain_original(
+            0,
+            17,
+            19,
+            bytes.bytes(),
+            at.global,
+            crate::PacketOrigin {
+                observed_at: at.global,
+                provenance: 0,
+            },
+            now,
+            40,
+        );
         owner.request_repair(owner.senders[0].ssrc, 17);
         owner.senders[0].latest_committed_global = Some(at.global);
         let payload_debt = owner.senders[0].admission.debt;
@@ -3785,7 +3863,19 @@ mod tests {
             .expect("queue sibling");
         let bytes = queued_media(at, 3, FrameBoundary::Complete).packet;
         for index in 0..2 {
-            owner.retain_original(index, 17, 19, bytes.bytes(), at.global, now, 40);
+            owner.retain_original(
+                index,
+                17,
+                19,
+                bytes.bytes(),
+                at.global,
+                crate::PacketOrigin {
+                    observed_at: at.global,
+                    provenance: 0,
+                },
+                now,
+                40,
+            );
             owner.request_repair(owner.senders[index].ssrc, 17);
         }
         owner.senders[0].latest_committed_global = Some(at.global);
@@ -4138,6 +4228,7 @@ mod tests {
             kind: DatagramKind::Rtp,
             path_epoch: None,
             rtp: Some(identity),
+            classification: crate::test_source::transmit_kind(identity.service),
         };
         owner.commit(at, &prepared);
         assert!(!owner.senders[0].audio_talkspurt_pending);
@@ -6365,6 +6456,7 @@ mod tests {
                     kind: DatagramKind::Rtp,
                     path_epoch: None,
                     rtp: None,
+                    classification: crate::test_source::transmit_kind(RtpService::Padding),
                 },
             );
             assert_eq!(

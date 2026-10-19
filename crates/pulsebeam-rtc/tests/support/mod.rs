@@ -54,6 +54,7 @@ pub struct PeerFixture<M = MediaFixture> {
     start: Instant,
     source_timestamp: u32,
     headers: VecDeque<FixtureRtpHeader>,
+    transmit_observations: Option<VecDeque<(TimePoint, pulsebeam_rtc::TransmitKind)>>,
     extension_ids: FixtureExtensionIds,
     last_video_wire_header: Option<(u32, u16)>,
     observe_egress: bool,
@@ -904,6 +905,7 @@ impl<M> PeerFixture<M> {
             world,
             source_timestamp: 0,
             headers: VecDeque::new(),
+            transmit_observations: None,
             extension_ids,
             last_video_wire_header: None,
             observe_egress: true,
@@ -1085,6 +1087,20 @@ impl<M> PeerFixture<M> {
         payload: &[u8],
         temporal_index: Option<u8>,
     ) -> MediaPacket {
+        self.emit_source(payload, temporal_index);
+        for _ in 0..2_000 {
+            if let Some(PeerEvent::Inbound(packet)) = self.step() {
+                return packet;
+            }
+        }
+        panic!(
+            "RTC did not authenticate native source RTP: payload_prefix={:?}, stats={:?}",
+            &payload[..payload.len().min(32)],
+            self.connection.stats()
+        );
+    }
+
+    fn emit_source(&mut self, payload: &[u8], temporal_index: Option<u8>) {
         self.now = self.now.max(self.world.monotonic_now());
         self.world.advance_clock_to(self.now);
         self.source_timestamp = self.source_timestamp.wrapping_add(960).max(
@@ -1144,16 +1160,46 @@ impl<M> PeerFixture<M> {
                 })
                 .expect("native controlled H264 source");
         }
+    }
+
+    pub fn observe_source(&mut self, payload: &[u8]) -> (TimePoint, NetworkInput) {
+        self.emit_source(payload, None);
         for _ in 0..2_000 {
-            if let Some(PeerEvent::Inbound(packet)) = self.step() {
-                return packet;
+            let ready = self.network.pending.iter().position(|packet| {
+                let PendingPacket::Connection { due, input } = packet else {
+                    return false;
+                };
+                let bytes = match input {
+                    NetworkInput::Udp { payload, .. } => payload.as_ref(),
+                    NetworkInput::IceTcp { frame, .. } => frame.get(2..).expect("complete frame"),
+                };
+                *due <= self.at().monotonic
+                    && bytes.first().is_some_and(|byte| byte >> 6 == 2)
+                    && bytes.get(1).is_some_and(|byte| !(192..=223).contains(byte))
+            });
+            if let Some(index) = ready {
+                let PendingPacket::Connection { input, .. } =
+                    self.network.pending.remove(index).expect("observed input")
+                else {
+                    panic!("selected fixture packet is not connection input");
+                };
+                return (self.at(), input);
             }
+            let _ = self.step();
         }
-        panic!(
-            "RTC did not authenticate native source RTP: payload_prefix={:?}, stats={:?}",
-            &payload[..payload.len().min(32)],
-            self.connection.stats()
-        );
+        panic!("native publisher did not emit RTP");
+    }
+
+    pub fn record_transmits(&mut self) {
+        self.transmit_observations = Some(VecDeque::new());
+    }
+
+    pub fn take_transmit_observations(&mut self) -> Vec<(TimePoint, pulsebeam_rtc::TransmitKind)> {
+        self.transmit_observations
+            .as_mut()
+            .expect("recording")
+            .drain(..)
+            .collect()
     }
 
     pub fn send_fragmented_video_source(&mut self) -> Vec<MediaPacket> {
@@ -1384,7 +1430,14 @@ impl<M> PeerFixture<M> {
             {
                 PendingPacket::Connection { input, .. } => {
                     self.connection
-                        .receive(self.at(), input)
+                        .receive(
+                            self.at(),
+                            pulsebeam_rtc::PacketObservation {
+                                at: self.at(),
+                                provenance: 0,
+                            },
+                            input,
+                        )
                         .expect("RTC native datagram receive");
                     self.connection_idle = false;
                 }
@@ -1603,6 +1656,13 @@ impl<M> PeerFixture<M> {
         if !self.connection_idle {
             match self.connection.poll(self.at()) {
                 ConnectionOutput::Transmit(transmit) => {
+                    let at = self.at();
+                    if let Some(observations) = &mut self.transmit_observations {
+                        if observations.len() == 256 {
+                            observations.pop_front();
+                        }
+                        observations.push_back((at, transmit.kind));
+                    }
                     let (destination, payload) = match transmit.target {
                         TransmitTarget::Udp { remote, .. } => (remote, transmit.payload.as_ref()),
                         TransmitTarget::IceTcp { flow } => {

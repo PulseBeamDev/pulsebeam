@@ -1,9 +1,12 @@
 use std::ops::Range;
 
-use crate::{GlobalMediaTime, MediaPacket, media_packet::ClockQuality, packet::RtpPacket};
+use crate::{
+    GlobalMediaTime, MediaPacket, PacketOrigin, media_packet::ClockQuality, packet::RtpPacket,
+};
 
 const MAGIC: &[u8; 4] = b"PBRP";
-const VERSION: u8 = 1;
+const VERSION: u8 = 2;
+const HEADER_BYTES: usize = 40;
 const MAX_BYTES: usize = 512 * 1024;
 const MAX_PACKET_BYTES: usize = u16::MAX as usize;
 const MAX_EXTENSIONS: usize = 256;
@@ -24,6 +27,7 @@ pub struct MaterializedMediaPacket {
     wire: Box<[u8]>,
     packet_range: Range<usize>,
     global_media_at: GlobalMediaTime,
+    origin: PacketOrigin,
     clock_quality: ClockQuality,
     extensions: Box<[(Box<str>, Range<usize>)]>,
 }
@@ -55,6 +59,10 @@ impl MaterializedMediaPacket {
             return Err(MediaTransitError::TooLarge);
         }
         let global_media_at = GlobalMediaTime::from_be_bytes(reader.array()?);
+        let origin = PacketOrigin {
+            observed_at: GlobalMediaTime::from_be_bytes(reader.array()?),
+            provenance: u64::from_be_bytes(reader.array()?),
+        };
         let packet_len = reader.length()?;
         if packet_len > MAX_PACKET_BYTES {
             return Err(MediaTransitError::TooLarge);
@@ -96,6 +104,7 @@ impl MaterializedMediaPacket {
             wire,
             packet_range,
             global_media_at,
+            origin,
             clock_quality,
             extensions: extensions.into_boxed_slice(),
         })
@@ -132,6 +141,7 @@ impl MaterializedMediaPacket {
                 .collect::<Vec<_>>()
                 .into(),
             self.clock_quality,
+            self.origin,
         ))
     }
 
@@ -145,7 +155,7 @@ impl MaterializedMediaPacket {
             .transit_extensions()
             .iter()
             .try_fold(
-                24usize.saturating_add(packet.bytes().len()),
+                HEADER_BYTES.saturating_add(packet.bytes().len()),
                 |size, (uri, _)| size.checked_add(12)?.checked_add(uri.len()),
             )
             .ok_or(MediaTransitError::TooLarge)?;
@@ -167,6 +177,8 @@ impl MaterializedMediaPacket {
                 .to_be_bytes(),
         );
         wire.extend_from_slice(&packet.global_media_at().to_be_bytes());
+        wire.extend_from_slice(&packet.origin().observed_at.to_be_bytes());
+        wire.extend_from_slice(&packet.origin().provenance.to_be_bytes());
         write_length(&mut wire, packet.bytes().len())?;
         wire.extend_from_slice(&[0; 4]);
         for (uri, range) in packet.transit_extensions() {
@@ -241,6 +253,10 @@ mod tests {
             GlobalMediaTime::from_micros(time),
             vec![(Arc::from("urn:test:opaque"), 17..19)].into(),
             quality,
+            PacketOrigin {
+                observed_at: GlobalMediaTime::from_micros(time.wrapping_add(17)),
+                provenance: time ^ 0x1234_9876_4321_abcd,
+            },
         )
     }
 
@@ -269,6 +285,7 @@ mod tests {
                 assert_ne!(restored.bytes().as_ptr(), original.bytes().as_ptr());
                 assert_eq!(restored.global_media_at(), original.global_media_at());
                 assert_eq!(restored.clock_quality(), quality);
+                assert_eq!(restored.origin(), original.origin());
                 assert_eq!(
                     restored.extension("urn:test:opaque"),
                     Some([1, 2].as_slice())
@@ -298,9 +315,9 @@ mod tests {
             (0, 0, MediaTransitError::Invalid),
             (4, 255, MediaTransitError::UnsupportedVersion),
             (5, 255, MediaTransitError::Invalid),
-            (20, 1, MediaTransitError::Invalid),
-            (36, b' ', MediaTransitError::Invalid),
-            (36, 255, MediaTransitError::Invalid),
+            (HEADER_BYTES - 4, 1, MediaTransitError::Invalid),
+            (HEADER_BYTES + 12, b' ', MediaTransitError::Invalid),
+            (HEADER_BYTES + 12, 255, MediaTransitError::Invalid),
             (valid.packet_range.start, 0, MediaTransitError::Invalid),
         ] {
             let mut wire = valid.as_bytes().to_vec();
@@ -310,13 +327,13 @@ mod tests {
             );
         }
         let mut wire = valid.as_bytes().to_vec();
-        wire[32..36].copy_from_slice(&24u32.to_be_bytes());
+        wire[HEADER_BYTES + 8..HEADER_BYTES + 12].copy_from_slice(&24u32.to_be_bytes());
         assert!(matches!(
             MaterializedMediaPacket::from_bytes(wire.into_boxed_slice()),
             Err(MediaTransitError::Invalid)
         ));
         let mut wire = valid.as_bytes().to_vec();
-        wire[24..28].copy_from_slice(&u32::MAX.to_be_bytes());
+        wire[HEADER_BYTES..HEADER_BYTES + 4].copy_from_slice(&u32::MAX.to_be_bytes());
         assert!(matches!(
             MaterializedMediaPacket::from_bytes(wire.into_boxed_slice()),
             Err(MediaTransitError::Invalid)
@@ -339,7 +356,7 @@ mod tests {
             Err(MediaTransitError::TooLarge)
         ));
         let mut wire = valid.as_bytes().to_vec();
-        wire[16..20].copy_from_slice(&65_536u32.to_be_bytes());
+        wire[HEADER_BYTES - 8..HEADER_BYTES - 4].copy_from_slice(&65_536u32.to_be_bytes());
         assert!(matches!(
             MaterializedMediaPacket::from_bytes(wire.into_boxed_slice()),
             Err(MediaTransitError::TooLarge)

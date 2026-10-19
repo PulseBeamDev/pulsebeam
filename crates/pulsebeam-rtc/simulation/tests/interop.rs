@@ -219,6 +219,10 @@ fn exercise(seed: u64, start: Instant) -> (u64, u64, usize) {
             connection
                 .receive(
                     point(world.now()),
+                    pulsebeam_rtc::PacketObservation {
+                        at: point(world.now()),
+                        provenance: 0,
+                    },
                     NetworkInput::Udp {
                         local,
                         remote: SocketAddr::new(packet.source.ip(), packet.source.port()),
@@ -532,6 +536,10 @@ fn controlled_libwebrtc_acknowledges_rtx_padding_before_primary_media() {
             connection
                 .receive(
                     point(world.now()),
+                    pulsebeam_rtc::PacketObservation {
+                        at: point(world.now()),
+                        provenance: 0,
+                    },
                     NetworkInput::Udp {
                         local,
                         remote: SocketAddr::new(packet.source.ip(), packet.source.port()),

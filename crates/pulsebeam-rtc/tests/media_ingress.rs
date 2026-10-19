@@ -81,9 +81,30 @@ fn unauthenticated_rtp_never_creates_a_semantic_media_event() {
     .expect("connection")
     .connection;
 
+    assert_eq!(
+        connection.receive(
+            at(start, 1_000),
+            pulsebeam_rtc::PacketObservation {
+                at: at(start + Duration::from_millis(1), 2_000),
+                provenance: 17,
+            },
+            NetworkInput::Udp {
+                local: SocketAddr::from(([192, 0, 2, 1], 5000)),
+                remote: SocketAddr::from(([192, 0, 2, 2], 5001)),
+                ecn: None,
+                payload: Bytes::new(),
+            },
+        ),
+        Err(pulsebeam_rtc::ReceiveError::InvalidObservation)
+    );
+
     connection
         .receive(
             at(start, 1_000),
+            pulsebeam_rtc::PacketObservation {
+                at: at(start, 1_000),
+                provenance: 0,
+            },
             NetworkInput::Udp {
                 local: SocketAddr::from(([192, 0, 2, 1], 5000)),
                 remote: SocketAddr::from(([192, 0, 2, 2], 5001)),

@@ -88,7 +88,7 @@ impl IngressOwner {
 
     pub(crate) fn accept_rtp(
         &mut self,
-        arrival: TimePoint,
+        arrival: crate::PacketObservation,
         bytes: Vec<u8>,
         ecn: Option<EcnCodepoint>,
     ) {
@@ -97,7 +97,7 @@ impl IngressOwner {
 
     fn accept_packet(
         &mut self,
-        arrival: TimePoint,
+        arrival: crate::PacketObservation,
         bytes: Vec<u8>,
         repair: bool,
         ecn: Option<EcnCodepoint>,
@@ -125,7 +125,7 @@ impl IngressOwner {
                 .and_then(|value| <[u8; 2]>::try_from(value.value()).ok())
                 .map(u16::from_be_bytes);
             self.receive_feedback.observe(
-                arrival.monotonic,
+                arrival.at.monotonic,
                 packet.ssrc(),
                 packet.sequence(),
                 twcc,
@@ -270,7 +270,7 @@ impl IngressOwner {
                             .contains(&packet.payload_type()),
                     ),
                     mapper: ClockMapper::new(
-                        arrival.global,
+                        arrival.at.global,
                         packet.sequence(),
                         packet.timestamp(),
                         clock_rate,
@@ -302,7 +302,7 @@ impl IngressOwner {
             if !encoding.receiver.accept(
                 packet.sequence(),
                 packet.timestamp(),
-                arrival.monotonic,
+                arrival.at.monotonic,
                 repair,
             ) {
                 self.drop();
@@ -311,7 +311,7 @@ impl IngressOwner {
             let Some((global_media_at, warning)) =
                 encoding
                     .mapper
-                    .map(packet.sequence(), packet.timestamp(), arrival.monotonic)
+                    .map(packet.sequence(), packet.timestamp(), arrival.at.monotonic)
             else {
                 self.drop();
                 return;
@@ -332,6 +332,10 @@ impl IngressOwner {
             global_media_at,
             extensions,
             clock_quality,
+            crate::PacketOrigin {
+                observed_at: arrival.at.global,
+                provenance: arrival.provenance,
+            },
         );
         if packet.queued_bytes() > self.max_bytes.saturating_sub(self.queued_media_bytes) {
             self.drop();
@@ -789,7 +793,14 @@ mod tests {
     #[test]
     fn unsignaled_media_is_discovered_before_media_and_keeps_receive_anchor() {
         let mut owner = owner();
-        owner.accept_rtp(at(1_000), rtp(u16::MAX, u32::MAX - 1), None);
+        owner.accept_rtp(
+            pulsebeam_rtc::PacketObservation {
+                at: at(1_000),
+                provenance: 0,
+            },
+            rtp(u16::MAX, u32::MAX - 1),
+            None,
+        );
         let Event::EncodingDiscovered(info) = owner.poll_event().expect("discovery") else {
             panic!("unsignaled encoding must be discovered first");
         };
@@ -806,7 +817,14 @@ mod tests {
         assert_eq!(packet.extension("urn:test:extension"), Some(&[0xaa][..]));
         assert_eq!(packet.to_transit().bytes(), packet.bytes());
 
-        owner.accept_rtp(at(9_000_000), rtp(0, 1), None);
+        owner.accept_rtp(
+            pulsebeam_rtc::PacketObservation {
+                at: at(9_000_000),
+                provenance: 0,
+            },
+            rtp(0, 1),
+            None,
+        );
         let Event::Media { packet, .. } = owner.poll_event().expect("wrapped media") else {
             panic!("wrapped packet is media");
         };
@@ -894,15 +912,36 @@ mod tests {
     #[test]
     fn bundled_same_kind_encodings_resolve_mid_ssrc_and_retirement() {
         let mut owner = bundled_owner();
-        owner.accept_rtp(at(1_000), bundled_rtp(7, None, Some(b"hi")), None);
+        owner.accept_rtp(
+            pulsebeam_rtc::PacketObservation {
+                at: at(1_000),
+                provenance: 0,
+            },
+            bundled_rtp(7, None, Some(b"hi")),
+            None,
+        );
         let first = discovered(&mut owner, 2, Some("hi"));
-        owner.accept_rtp(at(1_000), bundled_rtp(8, Some(b"v1"), Some(b"hi")), None);
+        owner.accept_rtp(
+            pulsebeam_rtc::PacketObservation {
+                at: at(1_000),
+                provenance: 0,
+            },
+            bundled_rtp(8, Some(b"v1"), Some(b"hi")),
+            None,
+        );
         let second = discovered(&mut owner, 5, Some("hi"));
         assert_ne!(first, second);
 
         let mut next = bundled_rtp(8, None, None);
         next[3] = 2;
-        owner.accept_rtp(at(1_000), next, None);
+        owner.accept_rtp(
+            pulsebeam_rtc::PacketObservation {
+                at: at(1_000),
+                provenance: 0,
+            },
+            next,
+            None,
+        );
         assert!(
             matches!(owner.poll_event(), Some(Event::Media { encoding, .. }) if encoding == second)
         );
@@ -910,22 +949,50 @@ mod tests {
         assert!(
             matches!(owner.poll_event(), Some(Event::EncodingRetired { encoding, .. }) if encoding == first)
         );
-        owner.accept_rtp(at(1_000), bundled_rtp(7, Some(b"v0"), Some(b"hi")), None);
+        owner.accept_rtp(
+            pulsebeam_rtc::PacketObservation {
+                at: at(1_000),
+                provenance: 0,
+            },
+            bundled_rtp(7, Some(b"v0"), Some(b"hi")),
+            None,
+        );
         assert!(owner.poll_event().is_none());
     }
 
     #[test]
     fn unsignaled_mid_association_does_not_leak_between_bundled_sections() {
         let mut owner = bundled_owner();
-        owner.accept_rtp(at(1_000), bundled_rtp(99, Some(b"v1"), None), None);
+        owner.accept_rtp(
+            pulsebeam_rtc::PacketObservation {
+                at: at(1_000),
+                provenance: 0,
+            },
+            bundled_rtp(99, Some(b"v1"), None),
+            None,
+        );
         let encoding = discovered(&mut owner, 5, None);
         let mut next = bundled_rtp(99, None, None);
         next[3] = 2;
-        owner.accept_rtp(at(1_000), next, None);
+        owner.accept_rtp(
+            pulsebeam_rtc::PacketObservation {
+                at: at(1_000),
+                provenance: 0,
+            },
+            next,
+            None,
+        );
         assert!(
             matches!(owner.poll_event(), Some(Event::Media { encoding: id, .. }) if id == encoding)
         );
-        owner.accept_rtp(at(1_000), bundled_rtp(100, Some(b"v0"), None), None);
+        owner.accept_rtp(
+            pulsebeam_rtc::PacketObservation {
+                at: at(1_000),
+                provenance: 0,
+            },
+            bundled_rtp(100, Some(b"v0"), None),
+            None,
+        );
         assert!(owner.poll_event().is_none());
         assert_eq!(owner.stats().len(), 1);
     }
@@ -939,7 +1006,14 @@ mod tests {
             bundled_rtp(99, Some(&[0xff]), None),
             bundled_rtp(7, Some(b"v1"), None),
         ] {
-            owner.accept_rtp(at(1_000), packet, None);
+            owner.accept_rtp(
+                pulsebeam_rtc::PacketObservation {
+                    at: at(1_000),
+                    provenance: 0,
+                },
+                packet,
+                None,
+            );
             assert!(owner.poll_event().is_none());
             assert!(owner.stats().is_empty());
         }
@@ -952,7 +1026,14 @@ mod tests {
         owner.media[0].repairs = vec![(97, 96)].into();
         owner.media[0].ssrc_repairs = vec![(8, 7)].into();
         for sequence in [1, 3] {
-            owner.accept_rtp(at(1_000), rtp(sequence, u32::from(sequence) * 3_000), None);
+            owner.accept_rtp(
+                pulsebeam_rtc::PacketObservation {
+                    at: at(1_000),
+                    provenance: 0,
+                },
+                rtp(sequence, u32::from(sequence) * 3_000),
+                None,
+            );
         }
         let original = rtp(2, 6_000);
         let header_len = RtpPacket::parse(&original).unwrap().payload_range().start;
@@ -962,9 +1043,30 @@ mod tests {
         repair[8..12].copy_from_slice(&8_u32.to_be_bytes());
         repair.extend_from_slice(&2_u16.to_be_bytes());
         repair.extend_from_slice(&original[header_len..]);
-        owner.accept_rtp(at(1_000), repair.clone(), None);
-        owner.accept_rtp(at(1_000), original.clone(), None);
-        owner.accept_rtp(at(1_000), repair, None);
+        owner.accept_rtp(
+            pulsebeam_rtc::PacketObservation {
+                at: at(1_000),
+                provenance: 0,
+            },
+            repair.clone(),
+            None,
+        );
+        owner.accept_rtp(
+            pulsebeam_rtc::PacketObservation {
+                at: at(1_000),
+                provenance: 0,
+            },
+            original.clone(),
+            None,
+        );
+        owner.accept_rtp(
+            pulsebeam_rtc::PacketObservation {
+                at: at(1_000),
+                provenance: 0,
+            },
+            repair,
+            None,
+        );
         let packets = std::iter::from_fn(|| owner.poll_event())
             .filter_map(|event| match event {
                 Event::Media { packet, .. } => Some(packet),
@@ -990,7 +1092,14 @@ mod tests {
             ),
         ]
         .into();
-        owner.accept_rtp(at(1_000), bundled_rtp(7, None, Some(b"hi")), None);
+        owner.accept_rtp(
+            pulsebeam_rtc::PacketObservation {
+                at: at(1_000),
+                provenance: 0,
+            },
+            bundled_rtp(7, None, Some(b"hi")),
+            None,
+        );
         let encoding = discovered(&mut owner, 3, Some("hi"));
         for sequence in [2_u16, 3] {
             let rid = (sequence == 2).then_some(b"hi".as_slice());
@@ -1002,7 +1111,14 @@ mod tests {
             repair[2..4].copy_from_slice(&sequence.wrapping_add(100).to_be_bytes());
             let offset = RtpPacket::parse(&repair).unwrap().payload_range().start;
             repair.splice(offset..offset, sequence.to_be_bytes());
-            owner.accept_rtp(at(1_000), repair, None);
+            owner.accept_rtp(
+                pulsebeam_rtc::PacketObservation {
+                    at: at(1_000),
+                    provenance: 0,
+                },
+                repair,
+                None,
+            );
             let Event::Media {
                 encoding: actual,
                 packet,
@@ -1014,7 +1130,14 @@ mod tests {
             assert_eq!(packet.view().unwrap().ssrc, 7);
             assert_eq!(packet.view().unwrap().sequence_number, sequence);
         }
-        owner.accept_rtp(at(1_000), bundled_rtp(8, None, None), None);
+        owner.accept_rtp(
+            pulsebeam_rtc::PacketObservation {
+                at: at(1_000),
+                provenance: 0,
+            },
+            bundled_rtp(8, None, None),
+            None,
+        );
         assert!(owner.poll_event().is_none());
         assert_eq!(owner.stats().len(), 1);
     }

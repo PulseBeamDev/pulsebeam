@@ -68,6 +68,7 @@ impl Connection {
     pub fn receive(
         &mut self,
         at: TimePoint,
+        observation: PacketObservation,
         input: NetworkInput,
     ) -> Result<(), ReceiveError>;
 
@@ -146,13 +147,27 @@ impl GlobalMediaTime {
 RTT, retransmission, protocol timeouts, and `next_wakeup`. `global` anchors and
 compares media timelines. A `Connection` never reads either clock itself.
 
-For successive calls to one connection, `TimePoint.monotonic` and
+For successive execution arguments to one connection, `TimePoint.monotonic` and
 `TimePoint.global` MUST NOT regress. In release builds either regressing field is
 clamped to the last accepted value, counted, and surfaced once as an actionable
 warning; the call otherwise proceeds from the clamped pair. Debug builds also
 assert the caller contract. Large forward global corrections are accepted and may
 conservatively expire old media. Clock slewing and step policy remain runtime
 concerns.
+
+`receive` takes current execution time separately from
+`PacketObservation { at, provenance }`. Observation is when the complete UDP
+datagram or RFC4571 frame was observed, not the first partial TCP fragment.
+It may precede the execution call or earlier observations without regressing the
+protocol clock. Future monotonic observations return `InvalidObservation`.
+ICE, DTLS and SCTP progress use execution time; RTP/RTCP receipt and feedback use
+observation time. Initial RTP normalization anchors to the observation's global
+time, never to delayed processing time.
+
+Authenticated RTP retains `PacketOrigin { observed_at, provenance }`, with a
+global timestamp and an opaque caller-supplied u64. No local `Instant` crosses
+media transit. Neither packet observation nor normalized media time is refreshed
+by queueing, delivery or restoration.
 
 ### Stable IDs
 
@@ -265,10 +280,21 @@ pub enum TransmitTarget {
 }
 
 pub struct Transmit {
+    pub kind: TransmitKind,
     pub target: TransmitTarget,
     pub payload: Bytes,
 }
 ```
+
+The [output definitions](../src/io.rs) classify original RTP, repair RTP,
+padding and non-RTP control/protocol traffic. Original and repair outputs carry
+`MediaTransmitInfo`: sender, unchanged normalized media time and source
+`PacketOrigin`. Receiver RTX retains the original source observation rather
+than substituting NACK or retransmission time. Padding and protocol output do
+not invent source provenance. The caller can compare its supplied execution
+time with the source observation for forwarding latency and independently
+observe actual socket submission. RTC keeps no application trace registry,
+histogram or callback.
 
 Each UDP value contains exactly one datagram. Each ICE-TCP value contains exactly
 one complete RFC 4571 frame, including its two-byte frame length. Before the first
@@ -686,12 +712,13 @@ value. `MaterializedMediaPacket` is a fully owned representation for shard/node
 transit. Cloning it deep-copies all storage, and restoration creates fresh local
 packet reference-count state. Its versioned wire encoding preserves the complete
 canonical RTP plaintext, URI-based extension views, exact eight-byte
-`GlobalMediaTime`, and private clock-quality/uncertainty classification. No local
+`GlobalMediaTime`, portable source observation/provenance, and private
+clock-quality/uncertainty classification. No local
 `Instant` or reconstructed compact playout time crosses this boundary.
 
-Packet wire version one is: `PBRP` magic (4 bytes), version (1 byte), private
-clock-quality tag (1 byte), extension count (u16), global microseconds (u64), RTP
-length (u32), zero reserved field (u32), then extension records and canonical RTP.
+Packet wire version two is: `PBRP` magic (4 bytes), version (1 byte), private
+clock-quality tag (1 byte), extension count (u16), normalized global microseconds
+(u64), observed global microseconds (u64), opaque provenance (u64), RTP length (u32), zero reserved field (u32), then extension records and canonical RTP.
 Integers are big-endian. Each extension record contains URI byte length, range
 start and range end as u32 values followed by UTF-8 URI bytes. Ranges address the
 canonical RTP, not the materialized wrapper. Bounds are 512 KiB total, 65,535 RTP

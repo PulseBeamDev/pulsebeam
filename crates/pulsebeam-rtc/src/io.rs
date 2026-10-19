@@ -23,6 +23,14 @@ pub enum EcnCodepoint {
     Ce,
 }
 
+/// Observation of a complete datagram or RFC4571 frame, independent of execution time.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PacketObservation {
+    pub at: crate::TimePoint,
+    /// Caller-owned opaque value, carried with normalized RTP without interpretation.
+    pub provenance: u64,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum NetworkInput {
     Udp {
@@ -64,8 +72,24 @@ pub enum TransmitTarget {
     },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MediaTransmitInfo {
+    pub sender: SenderId,
+    pub global_media_at: crate::GlobalMediaTime,
+    pub origin: crate::PacketOrigin,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TransmitKind {
+    Original(MediaTransmitInfo),
+    Repair(MediaTransmitInfo),
+    Padding { sender: SenderId },
+    Control,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Transmit {
+    pub kind: TransmitKind,
     pub target: TransmitTarget,
     pub payload: Bytes,
 }
@@ -238,6 +262,8 @@ pub enum AcceptError {
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 #[non_exhaustive]
 pub enum ReceiveError {
+    #[error("packet observation is later than execution")]
+    InvalidObservation,
     #[error("connection is closed")]
     Closed,
     #[error("unknown ICE-TCP flow")]

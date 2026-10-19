@@ -38,13 +38,13 @@ pub use id::{DataChannelId, EncodingId, FrameId, IceTcpFlowId, SenderId, SourceI
 pub use io::{
     AcceptError, AuthenticatedFlow, CloseReason, Command, CommandError, ConnectionState,
     ConnectionStats, ConnectionWarning, DataChannelEvent, DataChannelStats, EcnCodepoint,
-    EncodingInfo, EncodingRetireReason, EncodingStats, Event, KeyframeRequestReason, NetworkInput,
-    Output, PlayoutDelayStatus, ReceiveError, RejectedCommand, SenderStats, StatsSnapshot,
-    Transmit, TransmitTarget,
+    EncodingInfo, EncodingRetireReason, EncodingStats, Event, KeyframeRequestReason,
+    MediaTransmitInfo, NetworkInput, Output, PacketObservation, PlayoutDelayStatus, ReceiveError,
+    RejectedCommand, SenderStats, StatsSnapshot, Transmit, TransmitKind, TransmitTarget,
 };
 pub use media_packet::{
     ForwardedMedia, FrameBoundary, FrameDependencies, FrameMetadata, MediaPacket, MediaPacketView,
-    SourceDescriptor,
+    PacketOrigin, SourceDescriptor,
 };
 pub use media_transit::{MaterializedMediaPacket, MediaTransitError};
 pub use session::{

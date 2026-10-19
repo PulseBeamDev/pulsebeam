@@ -117,6 +117,7 @@ fn recovery_retains_same_incarnation_repairs_but_replacement_fences_them() {
             every: 3,
             length: 1,
         });
+        fixture.record_transmits();
         admit_video_frame(&mut fixture, &sources, 77);
         let deadline = fixture
             .at()
@@ -171,6 +172,23 @@ fn recovery_retains_same_incarnation_repairs_but_replacement_fences_them() {
             repaired, recover,
             "only same-publication recovery retains RTX"
         );
+        let observations = fixture.take_transmit_observations();
+        let repairs = observations
+            .iter()
+            .filter_map(|(_, kind)| {
+                if let pulsebeam_rtc::TransmitKind::Repair(info) = kind {
+                    Some(info)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(!repairs.is_empty(), recover);
+        for info in repairs {
+            assert_eq!(info.sender, fixture.sender);
+            assert!(sources.iter().any(|packet| packet.origin() == info.origin
+                && packet.global_media_at() == info.global_media_at));
+        }
         if recover {
             fixture.receive_video_frame();
         }
