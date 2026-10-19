@@ -85,6 +85,10 @@ FlowKey               MetricSeries
 ControllerSender      TcpAcceptor           TransportAddressAllocator
 ```
 
+For the distinction between a node-owned `RoomShard`, a local `RoomPartition`,
+and an execution `Shard`, see [cluster topology and ownership](cluster.md).
+These are placement and ownership concepts, not alternate identity suffixes.
+
 ## HTTP signaling
 
 Native, WHIP, and WHEP create connection resources at:

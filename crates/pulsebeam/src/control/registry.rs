@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use crate::{
     control::controller::ConnectionProfile,
-    control::room::Room,
+    control::room::RoomShard,
     entity::{ConnectionId, ParticipantExternalId, ParticipantId, RoomId},
     id::ShardId,
     route::NodeTransportAddress,
@@ -30,14 +30,14 @@ pub struct ParticipantMeta {
 }
 
 pub struct RoomRegistry {
-    rooms: HashMap<RoomId, Room>,
+    room_shards: HashMap<RoomId, RoomShard>,
     participants: HashMap<ParticipantId, ParticipantMeta>,
 }
 
 impl RoomRegistry {
     pub fn new() -> Self {
         Self {
-            rooms: HashMap::new(),
+            room_shards: HashMap::new(),
             participants: HashMap::new(),
         }
     }
@@ -58,8 +58,8 @@ impl RoomRegistry {
             .collect()
     }
 
-    pub fn get_room(&self, room_id: &RoomId) -> Option<&Room> {
-        self.rooms.get(room_id)
+    pub fn get_room_shard(&self, room_id: &RoomId) -> Option<&RoomShard> {
+        self.room_shards.get(room_id)
     }
 
     #[cfg(test)]
@@ -83,21 +83,28 @@ impl RoomRegistry {
                 materialized: false,
             },
         ) {
-            self.remove_from_room(&previous.room_id, &participant_id, previous.shard_id);
+            self.remove_from_room_shard(&previous.room_id, &participant_id, previous.shard_id);
         }
-        let room = self.rooms.entry(room_id).or_insert_with(Room::new);
-        room.add_participant(&participant_id, shard_id);
+        let room = self
+            .room_shards
+            .entry(room_id)
+            .or_insert_with(RoomShard::new);
+        let partition_index = room.next_partition_index(
+            &participant_id,
+            1, // Test helper accepts arbitrary execution-shard placement.
+        );
+        room.add_participant(&participant_id, shard_id, partition_index);
     }
 
     pub fn get_participant(&self, participant_id: &ParticipantId) -> Option<&ParticipantMeta> {
         self.participants.get(participant_id)
     }
 
-    pub fn participant_ids_in_room(&self, room_id: &RoomId) -> Vec<ParticipantId> {
-        self.rooms
+    pub fn local_participant_ids_in_room(&self, room_id: &RoomId) -> Vec<ParticipantId> {
+        self.room_shards
             .get(room_id)
             .into_iter()
-            .flat_map(Room::participant_ids)
+            .flat_map(RoomShard::participant_ids)
             .copied()
             .collect()
     }
@@ -114,6 +121,7 @@ impl RoomRegistry {
         participant_id: ParticipantId,
         room_id: RoomId,
         shard_id: ShardId,
+        partition_index: usize,
         transport: NodeTransportAddress,
         connection_id: ConnectionId,
         profile: ConnectionProfile,
@@ -139,12 +147,20 @@ impl RoomRegistry {
             },
         );
         if let Some(previous) = &previous {
-            self.remove_from_room(&previous.room_id, &participant_id, previous.shard_id);
+            if previous.room_id == room_id {
+                // Keep the partition table alive across a same-room replacement,
+                // even when this was its only participant.
+                if let Some(room) = self.room_shards.get_mut(&room_id) {
+                    room.remove_participant(&participant_id, previous.shard_id);
+                }
+            } else {
+                self.remove_from_room_shard(&previous.room_id, &participant_id, previous.shard_id);
+            }
         }
-        self.rooms
+        self.room_shards
             .entry(room_id)
-            .or_insert_with(Room::new)
-            .add_participant(&participant_id, shard_id);
+            .or_insert_with(RoomShard::new)
+            .add_participant(&participant_id, shard_id, partition_index);
         Ok(previous)
     }
 
@@ -160,7 +176,7 @@ impl RoomRegistry {
     #[cfg(test)]
     pub fn remove_participant(&mut self, participant_id: &ParticipantId) -> Option<ShardId> {
         let meta = self.participants.remove(participant_id)?;
-        self.remove_from_room(&meta.room_id, participant_id, meta.shard_id);
+        self.remove_from_room_shard(&meta.room_id, participant_id, meta.shard_id);
         Some(meta.shard_id)
     }
 
@@ -178,7 +194,7 @@ impl RoomRegistry {
             return None;
         }
         let meta = self.participants.remove(participant_id)?;
-        self.remove_from_room(&meta.room_id, participant_id, meta.shard_id);
+        self.remove_from_room_shard(&meta.room_id, participant_id, meta.shard_id);
         Some(meta)
     }
 
@@ -195,20 +211,20 @@ impl RoomRegistry {
         }
     }
 
-    fn remove_from_room(
+    fn remove_from_room_shard(
         &mut self,
         room_id: &RoomId,
         participant_id: &ParticipantId,
         shard_id: ShardId,
     ) {
-        let empty = if let Some(room) = self.rooms.get_mut(room_id) {
+        let empty = if let Some(room) = self.room_shards.get_mut(room_id) {
             room.remove_participant(participant_id, shard_id);
             room.participant_count() == 0
         } else {
             false
         };
         if empty {
-            self.rooms.remove(room_id);
+            self.room_shards.remove(room_id);
         }
     }
 }
@@ -250,7 +266,7 @@ mod tests {
 
         reg.add_participant(pid, rid, ShardId::new(0), None);
 
-        reg.get_room(&rid).unwrap();
+        reg.get_room_shard(&rid).unwrap();
         let meta = reg.get_participant(&pid).expect("participant should exist");
         assert_eq!(meta.room_id, rid);
         assert_eq!(meta.shard_id, ShardId::new(0));
@@ -266,7 +282,7 @@ mod tests {
         reg.add_participant(pid1, rid, ShardId::new(0), None);
         reg.add_participant(pid2, rid, ShardId::new(1), None);
 
-        let room = reg.get_room(&rid).unwrap();
+        let room = reg.get_room_shard(&rid).unwrap();
         assert_eq!(room.participant_count(), 2);
     }
 
@@ -280,8 +296,11 @@ mod tests {
         reg.add_participant(pid, old_room, ShardId::new(0), None);
         reg.add_participant(pid, new_room, ShardId::new(1), None);
 
-        assert!(reg.get_room(&old_room).is_none());
-        assert_eq!(reg.get_room(&new_room).unwrap().participant_count(), 1);
+        assert!(reg.get_room_shard(&old_room).is_none());
+        assert_eq!(
+            reg.get_room_shard(&new_room).unwrap().participant_count(),
+            1
+        );
         let meta = reg.get_participant(&pid).unwrap();
         assert_eq!(meta.room_id, new_room);
         assert_eq!(meta.shard_id, ShardId::new(1));
@@ -315,7 +334,7 @@ mod tests {
         reg.add_participant(pid, rid, ShardId::new(0), None);
         reg.remove_participant(&pid);
 
-        assert!(reg.get_room(&rid).is_none());
+        assert!(reg.get_room_shard(&rid).is_none());
     }
 
     #[test]
@@ -330,8 +349,8 @@ mod tests {
 
         reg.add_participant(pid2, rid, ShardId::new(1), None);
 
-        reg.get_room(&rid).unwrap();
-        assert_eq!(reg.get_room(&rid).unwrap().participant_count(), 1);
+        reg.get_room_shard(&rid).unwrap();
+        assert_eq!(reg.get_room_shard(&rid).unwrap().participant_count(), 1);
     }
 
     #[test]
@@ -357,8 +376,8 @@ mod tests {
         reg.add_participant(pid1, rid1, ShardId::new(0), None);
         reg.add_participant(pid2, rid2, ShardId::new(1), None);
         reg.remove_participant(&pid1);
-        assert!(reg.get_room(&rid1).is_none());
-        assert!(reg.get_room(&rid2).is_some());
+        assert!(reg.get_room_shard(&rid1).is_none());
+        assert!(reg.get_room_shard(&rid2).is_some());
     }
 
     #[test]
@@ -371,6 +390,7 @@ mod tests {
             participant,
             room,
             ShardId::new(0),
+            0,
             transport(0, 1),
             current,
             ConnectionProfile::Native,
@@ -396,6 +416,7 @@ mod tests {
             participant,
             room,
             ShardId::new(0),
+            0,
             transport(0, 1),
             current,
             ConnectionProfile::Native,
@@ -423,6 +444,7 @@ mod tests {
             participant,
             room,
             ShardId::new(0),
+            0,
             transport(0, 2),
             newer,
             ConnectionProfile::Native,
@@ -434,6 +456,7 @@ mod tests {
                 participant,
                 room,
                 ShardId::new(0),
+                0,
                 transport(0, 1),
                 older,
                 ConnectionProfile::Native,
@@ -459,6 +482,7 @@ mod tests {
             participant,
             room,
             ShardId::new(0),
+            0,
             transport(0, 1),
             old,
             ConnectionProfile::Native,
@@ -469,6 +493,7 @@ mod tests {
             participant,
             room,
             ShardId::new(0),
+            0,
             transport(0, 2),
             current,
             ConnectionProfile::Native,
@@ -498,6 +523,7 @@ mod tests {
                 participant,
                 room,
                 ShardId::new(0),
+                0,
                 transport(0, 1),
                 connection_id(1),
                 ConnectionProfile::Native,
