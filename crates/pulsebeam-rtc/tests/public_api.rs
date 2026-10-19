@@ -66,6 +66,57 @@ fn sender_demand_distinguishes_selected_media_from_potential_without_reservation
 }
 
 #[test]
+fn negotiated_codec_facts_are_public_and_directional() {
+    use pulsebeam_rtc::{CodecProfile, ConnectionEntropy, MediaKind, SdpOffer};
+    let at = TimePoint {
+        monotonic: std::time::Instant::now(),
+        global: GlobalMediaTime::from_micros(0),
+    };
+    let offer =
+        include_str!("fixtures/chrome-representative.sdp").replacen("a=sendonly", "a=recvonly", 1);
+    let accepted = Connection::accept(
+        ConnectionConfig {
+            local_candidates: vec![LocalCandidate::Udp(SocketAddr::from((
+                [192, 0, 2, 1],
+                5000,
+            )))],
+            ..ConnectionConfig::default()
+        },
+        SdpOffer::new(offer),
+        at,
+        ConnectionEntropy::new([9; 32]),
+    )
+    .expect("mixed-direction session");
+    let inbound = accepted
+        .session
+        .inbound_media
+        .first()
+        .expect("video publisher");
+    assert_eq!(inbound.kind, MediaKind::Video);
+    assert_eq!(accepted.session.inbound_media.len(), 1);
+    let codec = inbound.codecs.first().expect("primary source codec");
+    assert_eq!(codec.payload_type, 102);
+    assert_eq!(codec.retransmission_payload_type, Some(121));
+    assert_eq!(codec.clock_rate, 90_000);
+    assert_eq!(codec.channels, None);
+    assert_eq!(
+        codec.profile,
+        CodecProfile::H264 {
+            profile_level_id: Some(0x42e01f),
+            packetization_mode: 1,
+            level_asymmetry_allowed: true
+        }
+    );
+    let sender = accepted.session.senders.first().expect("audio subscriber");
+    assert_eq!(accepted.session.senders.len(), 1);
+    assert_eq!(sender.codec.profile, CodecProfile::Opus);
+    assert_eq!(sender.codec.payload_type, 111);
+    assert_eq!(sender.codec.channels, Some(2));
+    assert_eq!(sender.codec.clock_rate, 48_000);
+    assert_eq!(sender.codec.retransmission_payload_type, None);
+}
+
+#[test]
 fn stable_identifiers_are_nominally_distinct() {
     assert_ne!(TypeId::of::<DataChannelId>(), TypeId::of::<FrameId>());
     assert_ne!(TypeId::of::<FrameId>(), TypeId::of::<IceTcpFlowId>());

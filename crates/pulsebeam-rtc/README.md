@@ -123,6 +123,11 @@ media without rewinding committed transport identity.
   `pulsebeam-webrtc-sys` `0.6.2` in controlled execution. Stored SDP is generic
   parser regression evidence only, not browser compatibility evidence.
 
+`SessionInfo` exposes typed `CodecInfo` values for every accepted inbound primary
+payload and each selected outbound codec. They include RTP/RTX payload mapping,
+clock rate, channel count and the negotiated Opus or H.264 profile, so callers
+can interpret source media without reparsing SDP or depending on str0m types.
+
 ## Packet and stream model
 
 After ingress authentication and decryption, one immutable `Bytes` allocation

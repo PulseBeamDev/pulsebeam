@@ -438,7 +438,12 @@ fn controlled_libwebrtc_acknowledges_rtx_padding_before_primary_media() {
     )
     .unwrap();
     assert_eq!(accepted.session.senders.len(), 1);
-    assert!(accepted.session.senders[0].supports_rtx);
+    assert!(
+        accepted.session.senders[0]
+            .codec
+            .retransmission_payload_type
+            .is_some()
+    );
     assert_eq!(
         accepted.session.feedback,
         Some(pulsebeam_rtc::PacketFeedbackKind::TransportWide)

@@ -349,19 +349,6 @@ enum SectionKind {
     Application,
 }
 
-struct CodecFacts {
-    payload_type: u8,
-    name: String,
-    clock_rate: u32,
-    channels: Option<u8>,
-    retransmission_payload_type: Option<u8>,
-    nack: bool,
-    twcc: bool,
-    rfc8888: bool,
-    pli: bool,
-    fir: bool,
-}
-
 struct HeaderExtensionFacts {
     id: u8,
     uri: String,
@@ -386,7 +373,7 @@ struct NegotiatedMediaSection {
     mid: String,
     kind: SectionKind,
     direction: Direction,
-    codecs: Box<[CodecFacts]>,
+    codecs: Box<[crate::CodecInfo]>,
     extensions: Box<[HeaderExtensionFacts]>,
     rids: Box<[String]>,
     inbound_rids: Box<[String]>,
@@ -619,6 +606,7 @@ fn negotiate_inner(
                 sender_index: section.facts.media_index,
                 kind,
                 mid: Arc::from(section.facts.mid.as_str()),
+                codecs: Arc::from(section.facts.codecs.as_ref()),
                 rids: section
                     .facts
                     .inbound_rids
@@ -658,8 +646,7 @@ fn negotiate_inner(
             receiver_index: section.facts.media_index,
             kind,
             mid: Arc::from(section.facts.mid.as_str()),
-            rtp_clock_rate: codec.clock_rate,
-            supports_rtx: codec.retransmission_payload_type.is_some(),
+            codec: *codec,
             signals_playout_delay: section.facts.extensions.iter().any(|extension| {
                 extension.direction.allows_send() && extension.uri == PLAYOUT_DELAY_URI
             }),
@@ -947,7 +934,7 @@ fn parse_codecs(
     line: &str0m::sdp::MediaLine,
     raw: &[String],
     kind: SectionKind,
-) -> Result<(Vec<CodecFacts>, Vec<u8>), NegotiationError> {
+) -> Result<(Vec<crate::CodecInfo>, Vec<u8>), NegotiationError> {
     let params = line
         .rtp_params()
         .into_iter()
@@ -959,27 +946,26 @@ fn parse_codecs(
     let mut codecs = Vec::new();
     let mut payloads = Vec::new();
     for parameter in &params {
-        let name = parameter.spec.codec.to_string();
         let clock_rate = u32::from(std::num::NonZeroU32::from(parameter.spec.clock_rate));
         let supported = match kind {
             SectionKind::Audio => {
-                name.eq_ignore_ascii_case("opus")
+                parameter.spec.codec == str0m::format::Codec::Opus
                     && clock_rate == 48_000
                     && parameter.spec.channels == Some(2)
             }
             SectionKind::Video => {
-                name.eq_ignore_ascii_case("h264")
+                parameter.spec.codec == str0m::format::Codec::H264
                     && clock_rate == 90_000
                     && parameter.spec.channels.is_none()
             }
             SectionKind::Application => false,
         };
         if supported {
-            validate_h264(raw, *parameter.pt, kind)?;
+            let profile = parse_codec_profile(raw, *parameter.pt, kind)?;
             payloads.push(*parameter.pt);
-            codecs.push(CodecFacts {
+            codecs.push(crate::CodecInfo {
                 payload_type: *parameter.pt,
-                name,
+                profile,
                 clock_rate,
                 channels: parameter.spec.channels,
                 retransmission_payload_type: None,
@@ -1054,22 +1040,37 @@ fn select_feedback(sections: &[&SectionBuild], outbound: bool) -> Option<PacketF
     }
 }
 
-fn validate_h264(raw: &[String], payload: u8, kind: SectionKind) -> Result<(), NegotiationError> {
-    if kind != SectionKind::Video {
-        return Ok(());
+fn parse_codec_profile(
+    raw: &[String],
+    payload: u8,
+    kind: SectionKind,
+) -> Result<crate::CodecProfile, NegotiationError> {
+    if kind == SectionKind::Audio {
+        return Ok(crate::CodecProfile::Opus);
     }
-    if let Some(value) = fmtp_parameter(raw, payload, "packetization-mode")?
-        && value != "0"
-        && value != "1"
-    {
-        return Err(NegotiationError::unsupported());
-    }
-    if let Some(value) = fmtp_parameter(raw, payload, "profile-level-id")?
-        && (value.len() != 6 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()))
-    {
-        return Err(NegotiationError::invalid());
-    }
-    Ok(())
+    let packetization_mode = match fmtp_parameter(raw, payload, "packetization-mode")? {
+        None | Some("0") => 0,
+        Some("1") => 1,
+        Some(_) => return Err(NegotiationError::unsupported()),
+    };
+    let profile_level_id = fmtp_parameter(raw, payload, "profile-level-id")?
+        .map(|value| {
+            if value.len() != 6 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return Err(NegotiationError::invalid());
+            }
+            u32::from_str_radix(value, 16).map_err(|_| NegotiationError::invalid())
+        })
+        .transpose()?;
+    let level_asymmetry_allowed = match fmtp_parameter(raw, payload, "level-asymmetry-allowed")? {
+        None | Some("0") => false,
+        Some("1") => true,
+        Some(_) => return Err(NegotiationError::invalid()),
+    };
+    Ok(crate::CodecProfile::H264 {
+        profile_level_id,
+        packetization_mode,
+        level_asymmetry_allowed,
+    })
 }
 
 fn fmtp_parameter<'a>(
@@ -1378,13 +1379,13 @@ fn parse_sctp(
 }
 
 fn validate_bundle_namespaces(sections: &[SectionBuild]) -> Result<(), NegotiationError> {
-    let mut payloads = std::collections::HashMap::<u8, (&str, u32, Option<u8>)>::new();
+    let mut payloads = std::collections::HashMap::<u8, (crate::MediaKind, u32, Option<u8>)>::new();
     let mut extensions = std::collections::HashMap::<u8, &str>::new();
     let mut mid_extension = None;
     let mut global_ssrcs = HashSet::new();
     for section in sections {
         for codec in &section.facts.codecs {
-            let signature = (codec.name.as_str(), codec.clock_rate, codec.channels);
+            let signature = (codec.profile.kind(), codec.clock_rate, codec.channels);
             if payloads
                 .insert(codec.payload_type, signature)
                 .is_some_and(|old| old != signature)
@@ -2006,6 +2007,26 @@ mod tests {
     }
 
     #[test]
+    fn h264_profile_facts_preserve_omission_and_reject_invalid_wire_parameters() {
+        assert_eq!(
+            parse_codec_profile(&[], 102, SectionKind::Video).unwrap(),
+            crate::CodecProfile::H264 {
+                profile_level_id: None,
+                packetization_mode: 0,
+                level_asymmetry_allowed: false,
+            }
+        );
+        for parameter in [
+            "profile-level-id=+12345",
+            "packetization-mode=2",
+            "level-asymmetry-allowed=2",
+        ] {
+            let raw = vec![format!("a=fmtp:102 {parameter}")];
+            assert!(parse_codec_profile(&raw, 102, SectionKind::Video).is_err());
+        }
+    }
+
+    #[test]
     fn session_resources_use_global_media_section_coordinates() {
         let offer = SdpOffer::new(
             fixture("firefox")
@@ -2022,15 +2043,11 @@ mod tests {
             Connection::accept(config(), offer, at(), ConnectionEntropy::new([8; 32])).unwrap();
 
         assert_eq!(accepted.session.inbound_media.len(), 1);
-        assert_eq!(
-            accepted.session.inbound_for_sender_index(0),
-            Some(&InboundMediaInfo {
-                sender_index: 0,
-                kind: crate::MediaKind::Audio,
-                mid: Arc::from("audioIn"),
-                rids: Arc::from([]),
-            })
-        );
+        let media = accepted.session.inbound_for_sender_index(0).unwrap();
+        assert_eq!(media.sender_index, 0);
+        assert_eq!(media.kind, crate::MediaKind::Audio);
+        assert_eq!(media.mid.as_ref(), "audioIn");
+        assert!(media.rids.is_empty());
         let sender = accepted.session.senders.first().unwrap();
         assert_eq!(sender.mid.as_ref(), "videoOut");
         assert_eq!(sender.receiver_index, 1);

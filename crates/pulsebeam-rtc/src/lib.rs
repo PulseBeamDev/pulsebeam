@@ -46,11 +46,11 @@ pub use media_packet::{
 };
 pub use media_transit::{MaterializedMediaPacket, MediaTransitError};
 pub use session::{
-    ConnectionConfig, ConnectionLimits, DataChannelConfig, DataChannelConfigError,
-    DataChannelPriority, DataMessage, DataReliability, InboundMediaInfo, LocalCandidate,
-    LocalIceCredentials, MediaKind, MediaPayloadBitrate, MediaPriority, PacketFeedbackKind,
-    PlayoutDelay, PolicyError, SdpAnswer, SdpOffer, SenderDemand, SenderInfo, SenderPolicy,
-    SessionCapabilities, SessionInfo, UnknownExtensionPolicy,
+    CodecInfo, CodecProfile, ConnectionConfig, ConnectionLimits, DataChannelConfig,
+    DataChannelConfigError, DataChannelPriority, DataMessage, DataReliability, InboundMediaInfo,
+    LocalCandidate, LocalIceCredentials, MediaKind, MediaPayloadBitrate, MediaPriority,
+    PacketFeedbackKind, PlayoutDelay, PolicyError, SdpAnswer, SdpOffer, SenderDemand, SenderInfo,
+    SenderPolicy, SessionInfo, UnknownExtensionPolicy,
 };
 pub use time::{ConnectionEntropy, GlobalMediaTime, TimePoint};
 

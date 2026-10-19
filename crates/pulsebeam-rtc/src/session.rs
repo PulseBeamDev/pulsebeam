@@ -11,17 +11,6 @@ const MAX_PLAYOUT_TICKS: u16 = 4095;
 const MILLIS_PER_PLAYOUT_TICK: u64 = 10;
 const MAX_LOCAL_CANDIDATES: usize = 16;
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct SessionCapabilities {
-    _private: (),
-}
-
-impl SessionCapabilities {
-    pub const fn new() -> Self {
-        Self { _private: () }
-    }
-}
-
 #[derive(Clone, Eq, PartialEq)]
 pub struct SdpOffer(Arc<str>);
 
@@ -75,6 +64,41 @@ pub enum MediaKind {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CodecProfile {
+    Opus,
+    H264 {
+        /// None means the offer omitted profile-level-id.
+        profile_level_id: Option<u32>,
+        packetization_mode: u8,
+        level_asymmetry_allowed: bool,
+    },
+}
+
+impl CodecProfile {
+    pub const fn kind(self) -> MediaKind {
+        match self {
+            Self::Opus => MediaKind::Audio,
+            Self::H264 { .. } => MediaKind::Video,
+        }
+    }
+}
+
+/// Immutable negotiated facts for one primary payload type and its repair map.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CodecInfo {
+    pub payload_type: u8,
+    pub profile: CodecProfile,
+    pub clock_rate: u32,
+    pub channels: Option<u8>,
+    pub retransmission_payload_type: Option<u8>,
+    pub(crate) nack: bool,
+    pub(crate) twcc: bool,
+    pub(crate) rfc8888: bool,
+    pub(crate) pli: bool,
+    pub(crate) fir: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PacketFeedbackKind {
     TransportWide,
     Rfc8888,
@@ -110,6 +134,7 @@ pub struct InboundMediaInfo {
     /// Incoming RID identities in offered simulcast order, including paused alternatives.
     /// Without simulcast, uses send-direction RID declaration order; empty means no RID.
     pub rids: Arc<[Arc<str>]>,
+    pub codecs: Arc<[CodecInfo]>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -118,8 +143,7 @@ pub struct SenderInfo {
     pub receiver_index: u32,
     pub kind: MediaKind,
     pub mid: Arc<str>,
-    pub rtp_clock_rate: u32,
-    pub supports_rtx: bool,
+    pub codec: CodecInfo,
     pub signals_playout_delay: bool,
 }
 
@@ -265,7 +289,6 @@ impl Default for ConnectionLimits {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConnectionConfig {
-    pub capabilities: SessionCapabilities,
     pub local_candidates: Vec<LocalCandidate>,
     pub local_ice_credentials: Option<LocalIceCredentials>,
     pub limits: ConnectionLimits,
@@ -303,7 +326,6 @@ impl ConnectionConfig {
 impl Default for ConnectionConfig {
     fn default() -> Self {
         Self {
-            capabilities: SessionCapabilities::default(),
             local_candidates: Vec::new(),
             local_ice_credentials: None,
             limits: ConnectionLimits::default(),

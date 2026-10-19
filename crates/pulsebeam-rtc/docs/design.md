@@ -207,6 +207,7 @@ pub struct InboundMediaInfo {
     pub kind: MediaKind,
     pub mid: Arc<str>,
     pub rids: Arc<[Arc<str>]>,
+    pub codecs: Arc<[CodecInfo]>,
 }
 
 pub struct SenderInfo {
@@ -214,8 +215,7 @@ pub struct SenderInfo {
     pub receiver_index: u32,
     pub kind: MediaKind,
     pub mid: Arc<str>,
-    pub rtp_clock_rate: u32,
-    pub supports_rtx: bool,
+    pub codec: CodecInfo,
     pub signals_playout_delay: bool,
 }
 
@@ -401,13 +401,12 @@ emitted output; it never scans unrelated connections.
 
 ## Connection configuration
 
-The public configuration contains capabilities, semantic defaults, and resource
+The public configuration contains transport options, semantic defaults, and resource
 budgets only. It does not expose SCReAM gains, queue targets, probe clusters,
 pacer factors, feedback filters, or controller selection.
 
 ```rust
 pub struct ConnectionConfig {
-    pub capabilities: SessionCapabilities,
     pub local_candidates: Vec<LocalCandidate>,
     pub local_ice_credentials: Option<LocalIceCredentials>,
     pub limits: ConnectionLimits,
@@ -649,8 +648,11 @@ Private controller names and mutable internal objects are not returned.
   remain usable.
 - `Connection::accept` creates a fresh ephemeral DTLS identity from the supplied
   cryptographic entropy. Its private key is never exported or reused.
-- Codecs and RTP header extensions are negotiated from immutable
-  `SessionCapabilities`. Syntactically valid optional extension mappings whose
+- Codecs and RTP header extensions are negotiated against the fixed supported
+  profile. Public `CodecInfo` values expose each inbound payload and the selected
+  outbound payload, RTX association, RTP clock rate, channel count and typed Opus
+  or H.264 profile facts. Callers do not need to parse SDP or use str0m types to
+  interpret those facts. Syntactically valid optional extension mappings whose
   direction is incompatible with active media are omitted from the answer.
   This narrow compatibility rule accommodates Firefox's receive-only
   playout-delay mapping on send-only media without advertising unusable
