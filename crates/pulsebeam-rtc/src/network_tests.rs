@@ -188,7 +188,7 @@ fn production_two_megabit_single_flow_capacity() {
 
 #[test]
 fn production_capacity_steps_recover_stable_transport_service() {
-    let mut fixture = PeerFixture::connected().without_egress_observation();
+    let mut fixture = PeerFixture::connected_with_senders(2).without_egress_observation();
     fixture.configure_network(
         0x6601,
         NetworkPolicy {
@@ -201,11 +201,11 @@ fn production_capacity_steps_recover_stable_transport_service() {
     let mut policy = ConnectionConfig::default().default_audio_policy;
     policy.desired_bitrate = MediaPayloadBitrate::from_bps(4_000_000);
     policy.playout_delay = Some(PlayoutDelay::from_ticks(0, 50).expect("500ms playout"));
-    fixture.command(Command::SetSenderPolicy {
-        sender: fixture.sender,
-        policy,
-    });
-    let mut source = ComponentSource::audio(1);
+    let senders = fixture.senders.clone();
+    for &sender in &senders {
+        fixture.command(Command::SetSenderPolicy { sender, policy });
+    }
+    let mut sources = [ComponentSource::audio(1), ComponentSource::audio(2)];
     let start = fixture.at().monotonic;
     let mut budgets = Vec::with_capacity(3);
     for id in 1..=18_000_u64 {
@@ -219,19 +219,31 @@ fn production_capacity_steps_recover_stable_transport_service() {
         }
         if id % 6_000 == 0 {
             let stats = fixture.connection.stats();
-            assert_eq!(stats.senders[0].demand.selected(), policy.desired_bitrate);
+            assert!(
+                stats
+                    .senders
+                    .iter()
+                    .all(|sender| sender.demand.selected() == policy.desired_bitrate)
+            );
             budgets.push(stats.connection.media_budget.as_bps());
         }
-        let media = forwarded(source.sample(fixture.at(), &[0x5a; PAYLOAD_BYTES]), id);
-        match fixture.try_command(Command::SendMedia {
-            sender: fixture.sender,
-            media,
-        }) {
-            Ok(()) | Err(CommandError::WouldBlock) => {}
-            Err(error) => panic!("step admission: {error:?}"),
+        for (source, &sender) in sources.iter_mut().zip(&senders) {
+            let media = forwarded(source.sample(fixture.at(), &[0x5a; PAYLOAD_BYTES]), id);
+            match fixture.try_command(Command::SendMedia { sender, media }) {
+                Ok(()) | Err(CommandError::WouldBlock) => {}
+                Err(error) => panic!("step admission: {error:?}"),
+            }
         }
     }
     fixture.drive_for(Duration::from_secs(2));
+    assert!(
+        fixture
+            .connection
+            .stats()
+            .senders
+            .iter()
+            .all(|sender| sender.transmitted_payload_bytes > 0)
+    );
     assert!(
         budgets[1] < budgets[0],
         "native budget contracts without caller target changes: {budgets:?}"
