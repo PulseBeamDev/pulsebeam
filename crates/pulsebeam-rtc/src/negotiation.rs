@@ -7,7 +7,10 @@
     reason = "the public immutable session contract uses Arc-backed values"
 )]
 
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::{BTreeSet, HashSet},
+    sync::Arc,
+};
 
 use p256::ecdsa::{DerSignature, SigningKey, signature::Signer};
 use sha2::{Digest, Sha256};
@@ -207,12 +210,27 @@ impl NegotiatedSessionFacts {
             .collect()
     }
 
+    pub(crate) fn inbound_payload_types(&self) -> Box<[u8]> {
+        self.media
+            .iter()
+            .filter(|section| section.direction.allows_receive())
+            .flat_map(|section| &section.codecs)
+            .flat_map(|codec| {
+                std::iter::once(codec.payload_type).chain(codec.retransmission_payload_type)
+            })
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
     pub(crate) fn outbound_payload_types(&self) -> Box<[u8]> {
         self.egress_senders()
             .iter()
             .flat_map(|sender| {
                 std::iter::once(sender.payload_type).chain(sender.retransmission_payload_type)
             })
+            .collect::<BTreeSet<_>>()
+            .into_iter()
             .collect()
     }
 

@@ -113,6 +113,8 @@ media without rewinding committed transport identity.
   `SRTP_AES128_CM_HMAC_SHA1_80` remains supported for compatibility and is never
   preferred when a mutually supported AEAD-GCM profile is available.
 * Codecs and RTP header extensions are negotiated from SFU configuration.
+  Inbound RTP payload acceptance is independent of outbound sender payload types,
+  including mixed publish/subscribe sessions.
 * Every accepted outbound RTP session, including audio-only RTP, requires one
   supported packet-feedback mode: transport-wide congestion-control feedback or
   RFC 8888. There is no REMB or fixed-rate egress fallback.

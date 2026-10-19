@@ -169,7 +169,8 @@ pub(crate) struct TransportConfig {
     pub max_candidate_pairs: usize,
     pub max_events: usize,
     pub max_transmissions: usize,
-    rtp_payload_types: Box<[u8]>,
+    inbound_payload_types: Box<[u8]>,
+    outbound_payload_types: Box<[u8]>,
     twcc_extension_id: Option<u8>,
     twcc_payload_map: Box<[(u8, u8)]>,
 }
@@ -217,7 +218,10 @@ impl TransportConfig {
             max_candidate_pairs: MAX_CANDIDATE_PAIRS,
             max_events: MAX_EVENTS,
             max_transmissions: MAX_TRANSMISSIONS,
-            rtp_payload_types: Box::new([]),
+            inbound_payload_types: (0..=127)
+                .filter(|payload| !(64..=95).contains(payload))
+                .collect(),
+            outbound_payload_types: Box::new([]),
             twcc_extension_id: None,
             twcc_payload_map: Box::new([]),
         }
@@ -229,8 +233,13 @@ impl TransportConfig {
         self
     }
 
-    pub(crate) fn with_rtp_payload_types(mut self, payload_types: Box<[u8]>) -> Self {
-        self.rtp_payload_types = payload_types;
+    pub(crate) fn with_rtp_payload_types(
+        mut self,
+        inbound: Box<[u8]>,
+        outbound: Box<[u8]>,
+    ) -> Self {
+        self.inbound_payload_types = inbound;
+        self.outbound_payload_types = outbound;
         self
     }
 
@@ -257,7 +266,8 @@ impl TransportConfig {
             || self.local_candidates.is_empty()
             || self.remote_fingerprint.hash_func != "sha-256"
             || self.remote_fingerprint.bytes.len() != 32
-            || Self::validate_rtp_payload_types(&self.rtp_payload_types).is_err()
+            || Self::validate_rtp_payload_types(&self.inbound_payload_types).is_err()
+            || Self::validate_rtp_payload_types(&self.outbound_payload_types).is_err()
         {
             return Err(TransportError::Configuration);
         }
@@ -288,7 +298,8 @@ pub(crate) struct Transport {
     local_fingerprint: Fingerprint,
     remote_fingerprint: Fingerprint,
     dtls_role: DtlsRole,
-    rtp_payload_types: Box<[u8]>,
+    inbound_payload_types: Box<[u8]>,
+    outbound_payload_types: Box<[u8]>,
     twcc_extension_id: Option<u8>,
     twcc_payload_map: Box<[(u8, u8)]>,
     events: VecDeque<TransportEvent>,
@@ -417,7 +428,10 @@ impl Transport {
             },
             facts.local_dtls_role,
         )
-        .with_rtp_payload_types(facts.outbound_payload_types())
+        .with_rtp_payload_types(
+            facts.inbound_payload_types(),
+            facts.outbound_payload_types(),
+        )
         .with_twcc_payload_map(facts.outbound_twcc_payload_map())
         .with_twcc_extension_id(facts.outbound_twcc_extension_id());
         Self::new(config, now)
@@ -455,7 +469,8 @@ impl Transport {
             local_fingerprint,
             remote_fingerprint,
             dtls_role: config.dtls_role,
-            rtp_payload_types: config.rtp_payload_types,
+            inbound_payload_types: config.inbound_payload_types,
+            outbound_payload_types: config.outbound_payload_types,
             twcc_extension_id: config.twcc_extension_id,
             twcc_payload_map: config.twcc_payload_map,
             events: VecDeque::new(),
@@ -697,7 +712,7 @@ impl Transport {
                 match kind {
                     DatagramKind::Rtp => match srtp.unprotect_rtp(&bytes) {
                         Ok((bytes, metadata)) => {
-                            if self.accepts_payload_type(metadata.payload_type) {
+                            if self.inbound_payload_types.contains(&metadata.payload_type) {
                                 let path_epoch = self
                                     .selected
                                     .as_ref()
@@ -1428,7 +1443,8 @@ impl Transport {
     }
 
     fn accepts_payload_type(&self, payload_type: u8) -> bool {
-        self.rtp_payload_types.is_empty() || self.rtp_payload_types.contains(&payload_type)
+        self.outbound_payload_types.is_empty()
+            || self.outbound_payload_types.contains(&payload_type)
     }
 }
 
@@ -2189,7 +2205,7 @@ mod tests {
             &right_certificate,
             true,
         )
-        .with_rtp_payload_types(vec![63, 96].into_boxed_slice());
+        .with_rtp_payload_types(Box::new([]), vec![63, 96].into_boxed_slice());
         assert!(valid_config.validate().is_ok());
 
         let invalid_config = config(
@@ -2199,7 +2215,7 @@ mod tests {
             &right_certificate,
             true,
         )
-        .with_rtp_payload_types(vec![64].into_boxed_slice());
+        .with_rtp_payload_types(Box::new([]), vec![64].into_boxed_slice());
         assert_eq!(
             invalid_config.validate(),
             Err(TransportError::Configuration)
@@ -2212,7 +2228,7 @@ mod tests {
             &right_certificate,
             true,
         )
-        .with_rtp_payload_types(vec![95].into_boxed_slice());
+        .with_rtp_payload_types(vec![95].into_boxed_slice(), Box::new([]));
         assert_eq!(
             invalid_config.validate(),
             Err(TransportError::Configuration)
@@ -2224,7 +2240,7 @@ mod tests {
             &right_certificate,
             true,
         )
-        .with_rtp_payload_types(vec![96].into_boxed_slice());
+        .with_rtp_payload_types(vec![96].into_boxed_slice(), vec![96].into_boxed_slice());
         assert!(valid_config.validate().is_ok());
     }
 

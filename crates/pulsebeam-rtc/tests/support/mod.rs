@@ -451,6 +451,16 @@ impl PeerFixture {
         Self::connect_media(FixtureTransport::Udp, None, false, 1, MediaKind::Video)
     }
 
+    pub fn connected_video_publisher_audio_subscriber() -> Self {
+        Self::connect_media(
+            FixtureTransport::Udp,
+            None,
+            false,
+            2,
+            MediaKind::VideoPublisherAudioSubscriber,
+        )
+    }
+
     fn connect_media(
         transport: FixtureTransport,
         limits: Option<ConnectionLimits>,
@@ -607,7 +617,7 @@ impl<M> PeerFixture<M> {
                 ..PeerConfiguration::default()
             })
             .expect("controlled native peer");
-        if matches!(media, MediaKind::Video | MediaKind::VideoDd) {
+        if !matches!(media, MediaKind::Audio) {
             // Sustain VBR source bursts before PulseBeam admission and pacing.
             peer.set_bitrate(Some(10_000_000), Some(10_000_000), Some(10_000_000))
                 .expect("native video source bitrate");
@@ -616,8 +626,9 @@ impl<M> PeerFixture<M> {
         let mut video_source = None;
         let mut transceivers = Vec::new();
         for index in 0..sender_count {
-            let transceiver = match media {
-                MediaKind::Audio => {
+            let mixed = matches!(media, MediaKind::VideoPublisherAudioSubscriber);
+            let transceiver = match (media, index) {
+                (MediaKind::Audio, _) | (MediaKind::VideoPublisherAudioSubscriber, 1..) => {
                     let source = factory
                         .create_encoded_audio_source(1)
                         .expect("native encoded audio source");
@@ -625,7 +636,14 @@ impl<M> PeerFixture<M> {
                         .create_encoded_audio_track(&format!("audio-{index}"), &source)
                         .expect("native encoded audio track");
                     let transceiver = peer
-                        .add_audio_transceiver(&track, RtpTransceiverDirection::SendReceive)
+                        .add_audio_transceiver(
+                            &track,
+                            if mixed {
+                                RtpTransceiverDirection::ReceiveOnly
+                            } else {
+                                RtpTransceiverDirection::SendReceive
+                            },
+                        )
                         .expect("native audio transceiver");
                     let mono = peer
                         .audio_sender_capabilities()
@@ -647,7 +665,8 @@ impl<M> PeerFixture<M> {
                     }
                     transceiver
                 }
-                MediaKind::Video | MediaKind::VideoDd => {
+                (MediaKind::Video | MediaKind::VideoDd, _)
+                | (MediaKind::VideoPublisherAudioSubscriber, 0) => {
                     let source = video_input
                         .create_source(&factory)
                         .expect("native encoded video source");
@@ -655,7 +674,14 @@ impl<M> PeerFixture<M> {
                         .create_track(&factory, &format!("video-{index}"))
                         .expect("native encoded video track");
                     let transceiver = peer
-                        .add_video_transceiver(&track, RtpTransceiverDirection::SendReceive)
+                        .add_video_transceiver(
+                            &track,
+                            if mixed {
+                                RtpTransceiverDirection::SendOnly
+                            } else {
+                                RtpTransceiverDirection::SendReceive
+                            },
+                        )
                         .expect("native video transceiver");
                     if video_dd {
                         let mut extensions = transceiver
@@ -1623,6 +1649,7 @@ enum MediaKind {
     Audio,
     Video,
     VideoDd,
+    VideoPublisherAudioSubscriber,
 }
 
 #[derive(Clone, Debug)]

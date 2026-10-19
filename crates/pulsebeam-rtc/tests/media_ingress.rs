@@ -11,6 +11,26 @@ use pulsebeam_rtc::{
     Output, SdpOffer, TimePoint,
 };
 
+mod support;
+
+#[test]
+fn mixed_direction_native_peer_publishes_video_while_subscribing_to_audio() {
+    let mut fixture = support::PeerFixture::connected_video_publisher_audio_subscriber();
+    let packet = fixture.send_source(&[0x65, 0x88, 0x44]);
+    assert!(
+        !packet
+            .view()
+            .expect("normalized source RTP")
+            .payload
+            .is_empty()
+    );
+    let stats = fixture.connection.stats();
+    assert_eq!(stats.senders.len(), 1);
+    assert_eq!(stats.encodings.len(), 1);
+    assert_eq!(stats.encodings[0].kind, pulsebeam_rtc::MediaKind::Video);
+    assert!(stats.encodings[0].received_packets > 0);
+}
+
 fn at(monotonic: Instant, global: u64) -> TimePoint {
     TimePoint {
         monotonic,
