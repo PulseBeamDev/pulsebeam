@@ -5,6 +5,11 @@ interfaces, language-server project discovery and standard artifact operations.
 Repository scripts are bounded adapters for uncovered contracts, not a general
 build framework or an alternative package compilation pipeline.
 
+`.bazelrc` shuts down Bazel servers after five minutes of inactivity and enables
+idle shutdown under low system memory. This limits memory retained across
+worktrees while preserving server reuse during active development. Each worktree
+needs the updated configuration; disk caches remain available after shutdown.
+
 ## Authoritative sources
 
 | Input | Authority | Derived consumers |

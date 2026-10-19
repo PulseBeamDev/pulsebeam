@@ -1,3 +1,6 @@
+startup --max_idle_secs=300
+startup --shutdown_on_low_sys_mem
+
 common --enable_bzlmod
 common --lockfile_mode=error
 common --repo_contents_cache=~/.cache/pulsebeam/bazel/repo-contents-cache
