@@ -1,8 +1,3 @@
-#![allow(
-    dead_code,
-    reason = "typed RTCP views are retained for the bounded Plan 07 feedback handoff"
-)]
-
 use crate::{
     PacketFeedbackKind, TimePoint,
     packet::{PacketError, RtcpCompound, RtcpPacket},
@@ -97,8 +92,8 @@ pub(crate) struct ReportReceipt {
     pub(crate) highest_sequence: u32,
 }
 
-impl From<ReportBlock<'_>> for ReportReceipt {
-    fn from(block: ReportBlock<'_>) -> Self {
+impl From<ReportBlock> for ReportReceipt {
+    fn from(block: ReportBlock) -> Self {
         Self {
             ssrc: block.ssrc(),
             highest_sequence: block.highest_sequence(),
@@ -299,19 +294,16 @@ fn u32_at(bytes: &[u8], offset: usize) -> Result<u32, PacketError> {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ReportBlock<'a> {
-    bytes: &'a [u8],
+pub struct ReportBlock {
     ssrc: u32,
-    fraction_lost: u8,
     cumulative_lost: i32,
     highest_sequence: u32,
-    jitter: u32,
     last_sender_report: u32,
     delay_since_last_sender_report: u32,
 }
 
-impl<'a> ReportBlock<'a> {
-    pub fn parse(bytes: &'a [u8]) -> Result<Self, PacketError> {
+impl ReportBlock {
+    pub fn parse(bytes: &[u8]) -> Result<Self, PacketError> {
         if bytes.len() != REPORT_BLOCK_BYTES {
             return Err(PacketError::InvalidLength);
         }
@@ -324,44 +316,35 @@ impl<'a> ReportBlock<'a> {
             i32::from_be_bytes(lost.to_be_bytes())
         };
         Ok(Self {
-            bytes,
             ssrc: u32_at(bytes, 0)?,
-            fraction_lost: u8_at(bytes, 4)?,
             cumulative_lost,
             highest_sequence: u32_at(bytes, 8)?,
-            jitter: u32_at(bytes, 12)?,
             last_sender_report: u32_at(bytes, 16)?,
             delay_since_last_sender_report: u32_at(bytes, 20)?,
         })
     }
 
-    fn parse_optional(bytes: &'a [u8]) -> Option<Self> {
+    fn parse_optional(bytes: &[u8]) -> Option<Self> {
         Self::parse(bytes).ok()
     }
 
     pub fn ssrc(&self) -> u32 {
         self.ssrc
     }
-    pub fn fraction_lost(&self) -> u8 {
-        self.fraction_lost
-    }
+    #[cfg(test)]
     pub fn cumulative_lost(&self) -> i32 {
         self.cumulative_lost
     }
-    pub fn highest_sequence(&self) -> u32 {
-        self.highest_sequence
-    }
-    pub fn jitter(&self) -> u32 {
-        self.jitter
-    }
+    #[cfg(test)]
     pub fn last_sender_report(&self) -> u32 {
         self.last_sender_report
     }
+    #[cfg(test)]
     pub fn delay_since_last_sender_report(&self) -> u32 {
         self.delay_since_last_sender_report
     }
-    pub fn bytes(&self) -> &'a [u8] {
-        self.bytes
+    pub fn highest_sequence(&self) -> u32 {
+        self.highest_sequence
     }
 }
 
@@ -371,8 +354,6 @@ pub struct SenderReport<'a> {
     ntp_seconds: u32,
     ntp_fraction: u32,
     rtp_timestamp: u32,
-    packet_count: u32,
-    octet_count: u32,
     reports: &'a [u8],
 }
 
@@ -397,8 +378,6 @@ impl<'a> SenderReport<'a> {
             ntp_seconds: u32_at(body, 4)?,
             ntp_fraction: u32_at(body, 8)?,
             rtp_timestamp: u32_at(body, 12)?,
-            packet_count: u32_at(body, 16)?,
-            octet_count: u32_at(body, 20)?,
             reports,
         })
     }
@@ -414,13 +393,7 @@ impl<'a> SenderReport<'a> {
     pub fn rtp_timestamp(&self) -> u32 {
         self.rtp_timestamp
     }
-    pub fn packet_count(&self) -> u32 {
-        self.packet_count
-    }
-    pub fn octet_count(&self) -> u32 {
-        self.octet_count
-    }
-    pub fn reports(&self) -> impl Iterator<Item = ReportBlock<'a>> {
+    pub fn reports(&self) -> impl Iterator<Item = ReportBlock> {
         self.reports
             .as_chunks::<REPORT_BLOCK_BYTES>()
             .0
@@ -431,7 +404,6 @@ impl<'a> SenderReport<'a> {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ReceiverReport<'a> {
-    receiver_ssrc: u32,
     reports: &'a [u8],
 }
 
@@ -451,15 +423,9 @@ impl<'a> ReceiverReport<'a> {
         for block in reports.as_chunks::<REPORT_BLOCK_BYTES>().0 {
             ReportBlock::parse(block)?;
         }
-        Ok(Self {
-            receiver_ssrc: u32_at(body, 0)?,
-            reports,
-        })
+        Ok(Self { reports })
     }
-    pub fn receiver_ssrc(&self) -> u32 {
-        self.receiver_ssrc
-    }
-    pub fn reports(&self) -> impl Iterator<Item = ReportBlock<'a>> {
+    pub fn reports(&self) -> impl Iterator<Item = ReportBlock> {
         self.reports
             .as_chunks::<REPORT_BLOCK_BYTES>()
             .0
@@ -472,7 +438,6 @@ impl<'a> ReceiverReport<'a> {
 pub struct Feedback<'a> {
     sender_ssrc: u32,
     media_ssrc: u32,
-    fmt: u8,
     fci: &'a [u8],
 }
 
@@ -485,7 +450,6 @@ impl<'a> Feedback<'a> {
         Ok(Self {
             sender_ssrc: u32_at(body, 0)?,
             media_ssrc: u32_at(body, 4)?,
-            fmt: packet.count(),
             fci: body.get(8..).ok_or(PacketError::InvalidLength)?,
         })
     }
@@ -494,9 +458,6 @@ impl<'a> Feedback<'a> {
     }
     pub fn media_ssrc(&self) -> u32 {
         self.media_ssrc
-    }
-    pub fn fmt(&self) -> u8 {
-        self.fmt
     }
     pub fn fci(&self) -> &'a [u8] {
         self.fci
@@ -514,9 +475,6 @@ impl<'a> Nack<'a> {
             return Err(PacketError::InvalidLength);
         }
         Ok(Self { feedback })
-    }
-    pub fn sender_ssrc(&self) -> u32 {
-        self.feedback.sender_ssrc()
     }
     pub fn media_ssrc(&self) -> u32 {
         self.feedback.media_ssrc()
@@ -542,9 +500,6 @@ impl<'a> Pli<'a> {
             return Err(PacketError::InvalidLength);
         }
         Ok(Self { feedback })
-    }
-    pub fn sender_ssrc(&self) -> u32 {
-        self.feedback.sender_ssrc()
     }
     pub fn media_ssrc(&self) -> u32 {
         self.feedback.media_ssrc()
@@ -591,9 +546,6 @@ impl<'a> Fir<'a> {
     pub fn sender_ssrc(&self) -> u32 {
         self.feedback.sender_ssrc()
     }
-    pub fn media_ssrc(&self) -> u32 {
-        self.feedback.media_ssrc()
-    }
     pub fn entries(&self) -> impl Iterator<Item = FirEntry> + 'a {
         self.feedback
             .fci()
@@ -616,9 +568,6 @@ impl TwccReferenceTime {
     pub const fn ticks(self) -> u32 {
         self.0
     }
-    pub fn seconds(self) -> f64 {
-        f64::from(self.0) * 0.064
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -627,9 +576,6 @@ pub struct TwccRecvDelta(i16);
 impl TwccRecvDelta {
     pub const fn ticks(self) -> i16 {
         self.0
-    }
-    pub fn micros(self) -> i32 {
-        i32::from(self.0).saturating_mul(250)
     }
 }
 
@@ -678,9 +624,6 @@ impl<'a> Twcc<'a> {
     }
     pub fn base_sequence(&self) -> u16 {
         self.base_sequence
-    }
-    pub fn packet_count(&self) -> u16 {
-        self.packet_count
     }
     pub const fn reference_time(&self) -> TwccReferenceTime {
         self.reference_time
@@ -1020,9 +963,6 @@ impl<'a> Sdes<'a> {
             count: packet.count(),
         })
     }
-    pub fn count(&self) -> u8 {
-        self.count
-    }
     pub fn chunks(&self) -> SdesChunks<'a> {
         SdesChunks {
             bytes: self.body,
@@ -1153,9 +1093,6 @@ impl<'a> Bye<'a> {
             .iter()
             .filter_map(|bytes| u32_at(bytes, 0).ok())
     }
-    pub fn reason(&self) -> Option<&'a [u8]> {
-        self.reason
-    }
 }
 
 impl<'a> RtcpPacket<'a> {
@@ -1199,29 +1136,6 @@ impl<'a> RtcpPacket<'a> {
             .then(|| Twcc::parse(*self))
             .transpose()
     }
-}
-
-pub fn typed(packet: RtcpPacket<'_>) -> Result<(), PacketError> {
-    match packet.packet_type() {
-        200 => SenderReport::parse(packet).map(|_| ()),
-        201 => ReceiverReport::parse(packet).map(|_| ()),
-        202 => Sdes::parse(packet).map(|_| ()),
-        203 => Bye::parse(packet).map(|_| ()),
-        205 if packet.count() == 1 => Nack::parse(packet).map(|_| ()),
-        205 if packet.count() == 15 => Twcc::parse(packet).map(|_| ()),
-        205 if packet.count() == 11 => rfc8888(packet).map(|_| ()),
-        206 if packet.count() == 1 => Pli::parse(packet).map(|_| ()),
-        206 if packet.count() == 4 => Fir::parse(packet).map(|_| ()),
-        _ => Ok(()),
-    }
-}
-
-pub fn validate_compound(bytes: &[u8]) -> Result<(), PacketError> {
-    let compound = RtcpCompound::parse(bytes)?;
-    for packet in compound {
-        typed(packet?)?;
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1273,7 +1187,12 @@ mod tests {
         rr.extend_from_slice(&[0; 4]);
         let mut bytes = sr;
         bytes.extend_from_slice(&rr);
-        assert!(validate_compound(&bytes).is_ok());
+        let parsed = parse(&bytes, at(), PathEpoch::from_value(0), None).unwrap();
+        assert!(matches!(
+            parsed.lifecycle.as_slice(),
+            [LifecycleFact::SenderReport { .. }]
+        ));
+        assert!(parsed.receipts.is_empty());
     }
     #[test]
     fn sender_and_receiver_report_blocks_publish_bounded_extension_receipts() {
@@ -1325,7 +1244,15 @@ mod tests {
     #[test]
     fn rejects_short_typed_feedback() {
         let bytes = [0x81, 205, 0, 1, 0, 0, 0, 0];
-        assert!(validate_compound(&bytes).is_err());
+        assert!(
+            parse(
+                &bytes,
+                at(),
+                PathEpoch::from_value(0),
+                PacketFeedbackKind::TransportWide
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1491,7 +1418,7 @@ mod tests {
     fn reports_feedback_and_pli_fields_are_typed() {
         let mut report = [0u8; 24];
         report[5..8].copy_from_slice(&[0xff, 0xff, 0xff]);
-        assert_eq!(ReportBlock::parse(&report).unwrap().cumulative_lost(), -1);
+        assert_eq!(ReportBlock::parse(&report).unwrap().cumulative_lost, -1);
         let nack = [
             0x81, 205, 0, 3, 0, 0, 0, 1, 0, 0, 0, 2, 0x12, 0x34, 0xaa, 0x55,
         ];
@@ -1534,8 +1461,11 @@ mod tests {
         );
 
         let bye = [0x81, 203, 0, 2, 0, 0, 0, 9, 3, b'b', b'y', b'e'];
-        let packet = RtcpPacket::parse(&bye).unwrap();
-        assert_eq!(packet.bye().unwrap().unwrap().reason(), Some(&b"bye"[..]));
+        let parsed = parse(&bye, at(), PathEpoch::from_value(0), None).unwrap();
+        assert_eq!(parsed.lifecycle, vec![LifecycleFact::Bye { ssrc: 9 }]);
+        let mut malformed = bye;
+        malformed[8] = 4;
+        assert!(parse(&malformed, at(), PathEpoch::from_value(0), None).is_err());
     }
 
     #[test]
@@ -1551,8 +1481,6 @@ mod tests {
             .unwrap();
         let twcc = packet.twcc().unwrap().unwrap();
         assert_eq!(twcc.reference_time().ticks(), 0x010203);
-        assert_eq!(TwccReferenceTime(1).seconds(), 0.064);
-        assert_eq!(TwccReferenceTime(125).seconds(), 8.0);
         assert_eq!(twcc.feedback_count(), 7);
         let statuses: Vec<_> = twcc.statuses().collect::<Result<_, _>>().unwrap();
         assert_eq!(statuses.len(), 3);

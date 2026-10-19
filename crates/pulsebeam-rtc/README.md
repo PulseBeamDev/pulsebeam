@@ -341,7 +341,7 @@ suite has an operational host elapsed-time target of fifteen seconds, including
 peer setup and teardown. This execution target is not a correctness acceptance
 threshold. Virtual-time protocol deadlines, resource bounds, and quantitative
 modeled-network/controller assertions remain correctness requirements. Use the
-Criterion matrix above for host-performance comparisons, within its polling-only
+Criterion matrix above for host-performance comparisons, within its active-media harness
 measurement boundary.
 
 High-volume egress traces in `src/network_tests.rs` and `src/connection.rs`
@@ -367,8 +367,7 @@ is inferred from the native replacement. Missing artifacts or required native
 evidence fail the gate.
 
 Other platforms, ICE restart, and renegotiation remain outside this acceptance
-profile. Criterion still measures only RTC polling; native setup and teardown
-are outside its timed region.
+profile. Native peer setup and teardown remain outside Criterion's timed region.
 
 Run root `./bazel test //:test` for complete workspace acceptance, including the
 consumer-owned Web and React browser coverage.

@@ -83,7 +83,6 @@ struct BufferedMessage {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-#[allow(dead_code, reason = "Plan 13 consumes private SCTP stats contributors")]
 pub(crate) struct AssociationStats {
     pub(crate) buffered_payload_bytes: usize,
     pub(crate) committed_transport_bytes: u64,
@@ -377,7 +376,6 @@ impl Association {
         }
     }
 
-    #[allow(dead_code, reason = "Plan 13 consumes graceful SCTP shutdown")]
     pub(crate) fn begin_shutdown(&mut self, at: TimePoint, deadline: Instant) {
         if self.stopped {
             return;
@@ -389,7 +387,6 @@ impl Association {
         self.enforce_shutdown_deadline(at.monotonic);
     }
 
-    #[allow(dead_code, reason = "Plan 13 consumes immediate SCTP abort")]
     pub(crate) fn abort(&mut self) {
         if self.stopped {
             return;
@@ -413,7 +410,6 @@ impl Association {
             .saturating_add(u64::try_from(bytes).unwrap_or(u64::MAX));
     }
 
-    #[allow(dead_code, reason = "Plan 13 consumes private SCTP stats contributors")]
     pub(crate) fn stats(&self) -> AssociationStats {
         AssociationStats {
             buffered_payload_bytes: self.buffered_payload_bytes,

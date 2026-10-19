@@ -7,10 +7,6 @@ macro_rules! connection_id {
         pub struct $name($value);
 
         impl $name {
-            #[allow(
-                dead_code,
-                reason = "connection-owned IDs are allocated by Connection beginning in Plan 02"
-            )]
             pub(crate) const fn new(value: $value) -> Option<Self> {
                 if value == 0 { None } else { Some(Self(value)) }
             }

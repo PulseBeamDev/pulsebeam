@@ -414,7 +414,19 @@ fn tcp_retirement_rejects_stale_frames_and_routes_same_tuple_replacement() {
                 tcp_input(first, local, remote, request.clone()),
             )
             .expect("nomination");
-        assert_tcp_reply(&mut connection, at, first, local, remote);
+        let held = assert_tcp_reply(&mut connection, at, first, local, remote);
+        let old = held.first().expect("committed frame");
+        let mut cursor = 0;
+        let mut closed_stream_prefix = Vec::new();
+        assert_eq!(
+            write_tcp_prefix(old, first, &mut cursor, 1, &mut closed_stream_prefix),
+            Some(1)
+        );
+        assert_eq!(
+            write_tcp_prefix(old, first, &mut cursor, 0, &mut closed_stream_prefix),
+            Some(0)
+        );
+        assert_eq!(cursor, 1, "backpressure does not replay the accepted byte");
 
         connection
             .command(at, Command::RetireIceTcpFlow { flow: first })
@@ -462,7 +474,50 @@ fn tcp_retirement_rejects_stale_frames_and_routes_same_tuple_replacement() {
                 tcp_input(second, local, remote, request),
             )
             .expect("replacement nomination");
-        assert_tcp_reply(&mut connection, at, second, local, remote);
+        let replacement = assert_tcp_reply(&mut connection, at, second, local, remote);
+        let charged = connection.stats().connection.transmitted_protocol_bytes;
+        assert_eq!(
+            write_tcp_prefix(
+                old,
+                second,
+                &mut cursor,
+                usize::MAX,
+                &mut closed_stream_prefix
+            ),
+            None
+        );
+        assert_eq!(
+            closed_stream_prefix.len(),
+            1,
+            "retirement cannot retarget an old suffix"
+        );
+        drop(held);
+        assert_eq!(
+            connection.stats().connection.transmitted_protocol_bytes,
+            charged,
+            "dropping finalized output cannot refund its charge"
+        );
+        for transmit in replacement {
+            let mut cursor = 0;
+            let mut wire = Vec::new();
+            assert_eq!(
+                write_tcp_prefix(&transmit, second, &mut cursor, 1, &mut wire),
+                Some(1)
+            );
+            assert_eq!(
+                write_tcp_prefix(&transmit, second, &mut cursor, 0, &mut wire),
+                Some(0)
+            );
+            assert_eq!(
+                write_tcp_prefix(&transmit, second, &mut cursor, usize::MAX, &mut wire),
+                Some(transmit.payload.len() - 1)
+            );
+            assert_eq!(
+                wire.as_slice(),
+                transmit.payload.as_ref(),
+                "finish the exact RFC4571 frame without prefix replay"
+            );
+        }
     }
 }
 
@@ -472,9 +527,9 @@ fn assert_tcp_reply(
     flow: IceTcpFlowId,
     local: SocketAddr,
     remote: SocketAddr,
-) {
+) -> Vec<pulsebeam_rtc::Transmit> {
     let mut authenticated = false;
-    let mut transmitted = false;
+    let mut transmits = Vec::new();
     for _ in 0..512 {
         match connection.poll(at) {
             Output::Event(Event::IceAuthenticated(observed)) => {
@@ -490,19 +545,40 @@ fn assert_tcp_reply(
             }
             Output::Transmit(transmit) => {
                 assert_eq!(transmit.target, TransmitTarget::IceTcp { flow });
-                transmitted = true;
+                transmits.push(transmit);
             }
-            Output::Idle { .. } => {
+            Output::Idle { next_wakeup } if next_wakeup.is_none_or(|next| next > at.monotonic) => {
                 assert!(authenticated, "new incarnation must authenticate");
-                assert!(transmitted, "ICE reply must reach this incarnation");
-                return;
+                assert!(
+                    !transmits.is_empty(),
+                    "ICE reply must reach this incarnation"
+                );
+                return transmits;
             }
             Output::Closed(reason) => panic!("unexpected close: {reason:?}"),
-            Output::Event(_) => {}
+            Output::Idle { .. } | Output::Event(_) => {}
             _ => panic!("unexpected RTC output"),
         }
     }
     panic!("connection did not reach idle");
+}
+
+// A bounded caller socket cursor, not RTC state or a departure receipt.
+fn write_tcp_prefix(
+    transmit: &pulsebeam_rtc::Transmit,
+    flow: IceTcpFlowId,
+    cursor: &mut usize,
+    budget: usize,
+    written: &mut Vec<u8>,
+) -> Option<usize> {
+    if !matches!(transmit.target, TransmitTarget::IceTcp { flow: target } if target == flow) {
+        return None;
+    }
+    let remaining = transmit.payload.get(*cursor..)?;
+    let accepted = remaining.len().min(budget);
+    written.extend_from_slice(remaining.get(..accepted)?);
+    *cursor = cursor.saturating_add(accepted);
+    Some(accepted)
 }
 
 #[test]

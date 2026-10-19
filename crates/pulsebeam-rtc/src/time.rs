@@ -42,10 +42,6 @@ pub struct TimePoint {
     pub global: GlobalMediaTime,
 }
 
-#[allow(
-    dead_code,
-    reason = "entropy is consumed by Connection::accept beginning in Plan 02"
-)]
 pub struct ConnectionEntropy([u8; 32]);
 
 impl ConnectionEntropy {
@@ -53,10 +49,6 @@ impl ConnectionEntropy {
         Self(bytes)
     }
 
-    #[allow(
-        dead_code,
-        reason = "entropy is consumed by Connection::accept beginning in Plan 02"
-    )]
     pub(crate) fn into_bytes(mut self) -> [u8; 32] {
         let bytes = self.0;
         self.0.fill(0);
@@ -64,25 +56,16 @@ impl ConnectionEntropy {
     }
 }
 
-#[derive(Default)]
-#[allow(
-    dead_code,
-    reason = "the observer is exercised by Connection methods beginning in Plan 02"
-)]
 pub(crate) struct MonotonicObserver {
-    last: Option<TimePoint>,
+    last: TimePoint,
     regressions: u64,
     warning_pending: bool,
 }
 
-#[allow(
-    dead_code,
-    reason = "the observer is exercised by Connection methods beginning in Plan 02"
-)]
 impl MonotonicObserver {
     pub(crate) const fn starting_at(at: TimePoint) -> Self {
         Self {
-            last: Some(at),
+            last: at,
             regressions: 0,
             warning_pending: false,
         }
@@ -96,18 +79,17 @@ impl MonotonicObserver {
         &mut self,
         mut at: TimePoint,
     ) -> TimePoint {
-        if let Some(last) = self.last {
-            let monotonic_regressed = at.monotonic < last.monotonic;
-            let global_regressed = at.global < last.global;
-            if monotonic_regressed || global_regressed {
-                assert!(!ASSERT, "connection time regressed");
-                at.monotonic = at.monotonic.max(last.monotonic);
-                at.global = at.global.max(last.global);
-                self.regressions = self.regressions.saturating_add(1);
-                self.warning_pending = true;
-            }
+        let last = self.last;
+        let monotonic_regressed = at.monotonic < last.monotonic;
+        let global_regressed = at.global < last.global;
+        if monotonic_regressed || global_regressed {
+            assert!(!ASSERT, "connection time regressed");
+            at.monotonic = at.monotonic.max(last.monotonic);
+            at.global = at.global.max(last.global);
+            self.regressions = self.regressions.saturating_add(1);
+            self.warning_pending = true;
         }
-        self.last = Some(at);
+        self.last = at;
         at
     }
 
@@ -128,7 +110,10 @@ mod tests {
     #[should_panic(expected = "connection time regressed")]
     fn debug_observer_asserts_on_regression() {
         let start = Instant::now();
-        let mut observer = MonotonicObserver::default();
+        let mut observer = MonotonicObserver::starting_at(TimePoint {
+            monotonic: start,
+            global: GlobalMediaTime::from_micros(0),
+        });
         observer.observe_with_debug_assertions::<true>(TimePoint {
             monotonic: start + Duration::from_millis(1),
             global: GlobalMediaTime::from_micros(1),
@@ -142,7 +127,10 @@ mod tests {
     #[test]
     fn release_observer_clamps_and_counts_regression() {
         let start = Instant::now();
-        let mut observer = MonotonicObserver::default();
+        let mut observer = MonotonicObserver::starting_at(TimePoint {
+            monotonic: start,
+            global: GlobalMediaTime::from_micros(0),
+        });
         let accepted = TimePoint {
             monotonic: start + Duration::from_millis(2),
             global: GlobalMediaTime::from_micros(20),

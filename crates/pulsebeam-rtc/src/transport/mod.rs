@@ -16,10 +16,11 @@ use is::{Candidate, IceConnectionState, IceCreds};
 use str0m::crypto::Fingerprint;
 use str0m::crypto::dtls::DtlsCert;
 
+#[cfg(test)]
+use crate::GlobalMediaTime;
 use crate::negotiation::{DtlsRole, NegotiatedSessionFacts};
-use crate::{
-    AuthenticatedFlow, GlobalMediaTime, IceTcpFlowId, NetworkInput, TimePoint, TransmitTarget,
-};
+
+use crate::{AuthenticatedFlow, IceTcpFlowId, NetworkInput, TimePoint, TransmitTarget};
 
 use srtp::{RtpMetadata, SrtpError, outbound_rtp_metadata, outbound_twcc_sequence};
 

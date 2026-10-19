@@ -1,8 +1,4 @@
 #![allow(
-    dead_code,
-    reason = "the RTCP parser helpers remain private Plan 06 inputs while RTP ingress uses this module"
-)]
-#![allow(
     clippy::arithmetic_side_effects,
     reason = "extension offsets were structurally validated before iterator construction"
 )]
@@ -23,13 +19,6 @@ pub enum PacketError {
     InvalidLength,
     TooManyItems,
     InvalidValue,
-    MalformedH264,
-    MalformedOpus,
-    InvalidDependencyDescriptor,
-    InvalidVideoLayerAllocation,
-    InvalidCaptureTime,
-    InvalidAudioLevel,
-    InvalidPlayoutDelay,
 }
 
 fn read_u8(bytes: &[u8], offset: usize) -> Result<u8, PacketError> {
@@ -62,13 +51,6 @@ impl fmt::Display for PacketError {
             Self::InvalidLength => "invalid packet length",
             Self::TooManyItems => "packet contains too many items",
             Self::InvalidValue => "packet contains an invalid value",
-            Self::MalformedH264 => "malformed H264 payload",
-            Self::MalformedOpus => "malformed Opus payload",
-            Self::InvalidDependencyDescriptor => "invalid dependency descriptor",
-            Self::InvalidVideoLayerAllocation => "invalid video layer allocation",
-            Self::InvalidCaptureTime => "invalid capture time",
-            Self::InvalidAudioLevel => "invalid audio level",
-            Self::InvalidPlayoutDelay => "invalid playout delay",
         })
     }
 }
@@ -81,13 +63,11 @@ pub struct RtpPacket<'a> {
     payload: Range<usize>,
     extensions: Option<Range<usize>>,
     extension_profile: Option<u16>,
-    csrc_count: u8,
     sequence: u16,
     timestamp: u32,
     ssrc: u32,
     payload_type: u8,
     marker: bool,
-    padding: u8,
 }
 
 impl<'a> RtpPacket<'a> {
@@ -168,21 +148,16 @@ impl<'a> RtpPacket<'a> {
             payload: header_len..payload_end,
             extensions,
             extension_profile,
-            csrc_count: u8::try_from(csrc_count).map_err(|_| PacketError::TooManyItems)?,
             sequence: read_u16(bytes, 2)?,
             timestamp: read_u32(bytes, 4)?,
             ssrc: read_u32(bytes, 8)?,
             payload_type: read_u8(bytes, 1)? & 0x7f,
             marker: read_u8(bytes, 1)? & 0x80 != 0,
-            padding,
         };
         debug_assert!(result.payload.end <= bytes.len());
         Ok(result)
     }
 
-    pub fn bytes(&self) -> &'a [u8] {
-        self.bytes
-    }
     pub fn payload(&self) -> &'a [u8] {
         self.bytes.get(self.payload.clone()).unwrap_or_default()
     }
@@ -204,36 +179,10 @@ impl<'a> RtpPacket<'a> {
     pub const fn marker(&self) -> bool {
         self.marker
     }
-    pub const fn padding(&self) -> u8 {
-        self.padding
-    }
-    pub const fn csrc_count(&self) -> u8 {
-        self.csrc_count
-    }
 
-    pub fn csrcs(&self) -> CsrcIter<'a> {
-        let start = 12usize;
-        let end = start.saturating_add(usize::from(self.csrc_count).saturating_mul(4));
-        debug_assert!(end <= self.bytes.len());
-        CsrcIter {
-            bytes: self.bytes,
-            offset: start,
-            end,
-        }
-    }
-
+    #[cfg(test)]
     pub const fn extension_profile(&self) -> Option<u16> {
         self.extension_profile
-    }
-
-    pub fn extension_data(&self) -> Option<&'a [u8]> {
-        self.extensions
-            .as_ref()
-            .and_then(|range| self.bytes.get(range.clone()))
-    }
-
-    pub fn extension_range(&self) -> Option<Range<usize>> {
-        self.extensions.clone()
     }
 
     pub fn extensions(&self) -> Result<ExtensionIter<'a>, PacketError> {
@@ -259,31 +208,6 @@ impl<'a> RtpPacket<'a> {
         })
     }
 }
-
-pub struct CsrcIter<'a> {
-    bytes: &'a [u8],
-    offset: usize,
-    end: usize,
-}
-impl<'a> Iterator for CsrcIter<'a> {
-    type Item = u32;
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.offset == self.end {
-            return None;
-        }
-        if self.offset.checked_add(4)? > self.end {
-            return None;
-        }
-        let value = read_u32(self.bytes, self.offset).ok()?;
-        self.offset = self.offset.checked_add(4)?;
-        Some(value)
-    }
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        let n = self.end.saturating_sub(self.offset) / 4;
-        (n, Some(n))
-    }
-}
-impl ExactSizeIterator for CsrcIter<'_> {}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RtpExtension<'a> {
@@ -459,9 +383,6 @@ impl<'a> RtcpPacket<'a> {
             padding,
         })
     }
-    pub fn bytes(&self) -> &'a [u8] {
-        self.bytes
-    }
     pub fn body(&self) -> &'a [u8] {
         let end = self.bytes.len().saturating_sub(usize::from(self.padding));
         self.bytes.get(4..end).unwrap_or_default()
@@ -601,16 +522,13 @@ mod tests {
     }
 
     #[test]
-    fn csrc_values_ranges_and_all_truncations_are_bounded() {
+    fn csrc_offsets_and_all_truncations_are_bounded() {
         let mut packet = vec![0x82, 96, 0, 1, 0, 0, 0, 2, 0, 0, 0, 3];
         packet.extend_from_slice(&[0x11, 0x22, 0x33, 0x44, 0xaa, 0xbb, 0xcc, 0xdd, 9]);
         let parsed = RtpPacket::parse(&packet).unwrap();
-        assert_eq!(
-            parsed.csrcs().collect::<Vec<_>>(),
-            vec![0x11223344, 0xaabbccdd]
-        );
+        assert_eq!(parsed.payload(), &[9]);
         assert!(parsed.payload_range().end <= packet.len());
-        assert!(parsed.extension_range().is_none());
+        assert_eq!(parsed.extensions().unwrap().count(), 0);
         for length in 0..packet.len() {
             let _ = RtpPacket::parse(&packet[..length]);
         }
@@ -659,11 +577,10 @@ mod tests {
         proptest::proptest!(|(bytes: Vec<u8>)| {
             if let Ok(packet) = RtpPacket::parse(&bytes) {
                 let _ = packet.extensions().unwrap().collect::<Vec<_>>();
-                let _ = packet.csrcs().collect::<Vec<_>>();
             }
             if let Ok(compound) = RtcpCompound::parse(&bytes) {
                 for packet in compound.flatten() {
-                    let _ = packet.bytes();
+                    let _ = packet.body();
                 }
             }
         });

@@ -56,30 +56,18 @@ impl SenderScheduler {
     }
 }
 
-#[allow(
-    dead_code,
-    reason = "Plan 12 consumes the narrow SCTP scheduler adapter"
-)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum UserLane {
     Rtp,
     Sctp,
 }
 
-#[allow(
-    dead_code,
-    reason = "Plan 12 consumes the narrow SCTP scheduler adapter"
-)]
 #[derive(Debug, Default)]
 pub(crate) struct ServiceArbiter {
     next: Option<UserLane>,
 }
 
 impl ServiceArbiter {
-    #[allow(
-        dead_code,
-        reason = "Plan 12 replaces the mock SCTP lane with association output"
-    )]
     pub(crate) fn select(&mut self, rtp: bool, sctp: bool) -> Option<UserLane> {
         let selected = match (rtp, sctp, self.next) {
             (false, false, _) => None,
@@ -99,7 +87,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn scheduler_keeps_mock_sctp_and_rtp_lanes_progressing() {
+    fn scheduler_keeps_sctp_and_rtp_lanes_progressing() {
         let mut arbiter = ServiceArbiter::default();
         assert_eq!(arbiter.select(true, true), Some(UserLane::Sctp));
         assert_eq!(arbiter.select(true, true), Some(UserLane::Rtp));

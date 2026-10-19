@@ -380,10 +380,6 @@ impl IngressOwner {
         parsed.receipts
     }
 
-    #[allow(
-        dead_code,
-        reason = "Plan 08 consumes authenticated, mode-filtered feedback through this owner seam"
-    )]
     pub(crate) fn poll_feedback(&mut self) -> Option<FeedbackBatch> {
         self.feedback.pop_front()
     }

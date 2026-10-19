@@ -36,10 +36,6 @@ impl fmt::Debug for SdpOffer {
 pub struct SdpAnswer(Arc<str>);
 
 impl SdpAnswer {
-    #[allow(
-        dead_code,
-        reason = "answers are constructed by Connection::accept in Plan 02"
-    )]
     pub(crate) fn new(value: impl Into<Arc<str>>) -> Self {
         Self(value.into())
     }
