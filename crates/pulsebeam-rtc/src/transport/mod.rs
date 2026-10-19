@@ -535,6 +535,10 @@ impl Transport {
         }
     }
 
+    pub(crate) fn has_pending_output(&self) -> bool {
+        !self.events.is_empty() || !self.authenticated.is_empty() || !self.transmissions.is_empty()
+    }
+
     pub(crate) fn poll_event(&mut self) -> Option<TransportEvent> {
         if let Some(index) = self
             .events

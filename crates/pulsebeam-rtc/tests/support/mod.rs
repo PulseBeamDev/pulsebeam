@@ -1294,6 +1294,11 @@ impl<M> PeerFixture<M> {
         panic!("native peer did not authenticate RTC RTP");
     }
 
+    pub fn tcp_flow(&self) -> IceTcpFlowId {
+        assert_eq!(self.tcp_streams.len(), 1, "one accepted fixture stream");
+        self.tcp_streams[0].flow
+    }
+
     pub fn at(&self) -> TimePoint {
         let now = self.now.max(self.world.monotonic_now());
         TimePoint {

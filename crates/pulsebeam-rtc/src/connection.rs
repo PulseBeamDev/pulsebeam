@@ -338,6 +338,10 @@ impl Connection {
             })
     }
 
+    /// Performs one bounded service turn and returns an owned value.
+    /// Callers may collect a bounded batch, then must service it promptly before
+    /// requesting more finalized work. Budget exhaustion needs an immediate
+    /// continuation; an `Idle` wakeup due now also denotes runnable work.
     pub fn poll(&mut self, at: TimePoint) -> Output {
         let at = self._time.observe(at);
 
@@ -606,6 +610,15 @@ impl Connection {
             next_wakeup: (!matches!(self.runtime.lifecycle, Lifecycle::Closed(_)))
                 .then(|| {
                     [
+                        (self._subsystems.transport.has_pending_output()
+                            || self._subsystems.ingress.has_pending_output()
+                            || self._subsystems.sctp.as_ref().is_some_and(|sctp| {
+                                sctp.has_pending_events()
+                                    || (self._subsystems.transport.can_send_user_data()
+                                        && sctp.has_packet())
+                            }))
+                        .then_some(at.monotonic),
+                        self._subsystems.egress.next_expiry(at),
                         self._subsystems.transport.next_deadline(),
                         self.runtime.commit.history.next_deadline(),
                         (matches!(self.runtime.lifecycle, Lifecycle::Open)
@@ -1893,28 +1906,37 @@ mod tests {
         );
         assert!(fixture.connection._subsystems.egress.test_flight_peak() < 19_200);
         fixture.advance_clock_without_poll(Duration::from_millis(50));
-        fixture
-            .connection
-            ._subsystems
-            .ingress
-            .test_queue_feedback(FeedbackBatch {
-                received_at: fixture.at(),
-                path_epoch: epoch,
-                sender_ssrc: 9,
-                report: FeedbackReport::Twcc {
-                    media_ssrc: 7,
-                    base_sequence: 1,
-                    reference_time: 0,
-                    feedback_count: 1,
-                    statuses: vec![TwccStatus::Received { delta_250us: 1 }; 16].into(),
-                },
-            });
+        for feedback_count in 1..=8 {
+            fixture
+                .connection
+                ._subsystems
+                .ingress
+                .test_queue_feedback(FeedbackBatch {
+                    received_at: fixture.at(),
+                    path_epoch: epoch,
+                    sender_ssrc: 9,
+                    report: FeedbackReport::Twcc {
+                        media_ssrc: 7,
+                        base_sequence: 1,
+                        reference_time: 0,
+                        feedback_count,
+                        statuses: vec![TwccStatus::Received { delta_250us: 1 }; 16].into(),
+                    },
+                });
+        }
+        let mut immediate_yields = 0;
         for _ in 0..32 {
             let output = fixture.connection.poll(fixture.at());
             assert!(
                 !matches!(output, Output::Closed(_)),
                 "unexpected closure: {output:?}"
             );
+            if fixture.connection._subsystems.ingress.has_pending_output()
+                && let Output::Idle { next_wakeup } = output
+            {
+                assert_eq!(next_wakeup, Some(fixture.at().monotonic));
+                immediate_yields += 1;
+            }
             if fixture
                 .connection
                 .runtime
@@ -1923,6 +1945,7 @@ mod tests {
                 .counters()
                 .received
                 == 16
+                && !fixture.connection._subsystems.ingress.has_pending_output()
             {
                 break;
             }
@@ -1938,6 +1961,10 @@ mod tests {
             16,
             "queued ACK must retire the committed batch: {:?}",
             fixture.connection.runtime.commit.history.counters(),
+        );
+        assert!(
+            immediate_yields > 0,
+            "queued feedback must yield an immediate continuation"
         );
         assert!(
             fixture

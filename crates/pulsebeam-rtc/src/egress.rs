@@ -1362,7 +1362,7 @@ impl MediaEgress {
             })
         });
         [
-            self.queue_deadline(at),
+            self.next_expiry(at),
             (self.queued_packets != 0 || !self.repair_requests.is_empty())
                 .then(|| {
                     let transport = self.pacer.next_deadline();
@@ -1618,7 +1618,7 @@ impl MediaEgress {
         })
     }
 
-    fn queue_deadline(&self, at: TimePoint) -> Option<Instant> {
+    pub(crate) fn next_expiry(&self, at: TimePoint) -> Option<Instant> {
         self.senders
             .iter()
             .enumerate()
@@ -4575,7 +4575,7 @@ mod tests {
         );
         assert_eq!(owner.eligible[32], Some(3));
         assert_eq!(owner.scheduler.select(&owner.eligible), Some(32));
-        assert_eq!(owner.queue_deadline(late), Some(late.monotonic));
+        assert_eq!(owner.next_expiry(late), Some(late.monotonic));
         owner.expire(late, MAX_EXPIRATIONS_PER_POLL);
         owner.fill_eligible(late);
         assert_eq!(owner.eligible.as_ptr(), storage);
@@ -4673,7 +4673,7 @@ mod tests {
                 owner.senders[0].expiring_frame,
                 Some(FrameId::from_value(10))
             );
-            assert_eq!(owner.queue_deadline(late), Some(late.monotonic));
+            assert_eq!(owner.next_expiry(late), Some(late.monotonic));
             owner.fill_eligible(late);
             assert_eq!(owner.eligible, vec![None, Some(3)]);
             assert_eq!(owner.eligible.as_ptr(), storage);

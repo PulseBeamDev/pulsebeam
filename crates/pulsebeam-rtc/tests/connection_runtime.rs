@@ -61,13 +61,23 @@ fn public_runtime_waits_for_authenticated_ice_before_transmitting() -> Result<()
 fn malformed_input_is_dropped_without_disrupting_the_runtime_timer() -> Result<(), AcceptError> {
     let start = Instant::now();
     let mut connection = connection(start)?;
-    let _ = connection.poll(at(start));
-    let Output::Idle {
-        next_wakeup: Some(before),
-    } = connection.poll(at(start))
-    else {
-        panic!("initial ICE timer is available");
-    };
+    let before = (0..16)
+        .find_map(|_| match connection.poll(at(start)) {
+            Output::Idle {
+                next_wakeup: Some(next),
+            } if next > start => Some(next),
+            Output::Idle {
+                next_wakeup: Some(next),
+            } => {
+                assert_eq!(
+                    next, start,
+                    "pending setup work requests immediate continuation"
+                );
+                None
+            }
+            output => panic!("expected bounded ICE setup progress: {output:?}"),
+        })
+        .expect("initial ICE timer after pending setup work");
 
     assert_eq!(
         connection.receive(

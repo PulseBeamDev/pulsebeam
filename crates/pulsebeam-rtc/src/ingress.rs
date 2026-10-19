@@ -401,6 +401,13 @@ impl IngressOwner {
         self.repair.pop_front()
     }
 
+    pub(crate) fn has_pending_output(&self) -> bool {
+        !self.events.is_empty()
+            || !self.feedback.is_empty()
+            || !self.keyframes.is_empty()
+            || !self.repair.is_empty()
+    }
+
     pub(crate) fn poll_event(&mut self) -> Option<Event> {
         let event = self.events.pop_front()?;
         if let Event::Media { packet, .. } = &event {

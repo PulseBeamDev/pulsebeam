@@ -84,9 +84,19 @@ impl Connection {
 }
 ```
 
-All state changes occur through `receive`, `command`, or `poll`. The caller drains
-`poll` until it returns `Idle` before sleeping or processing another connection.
-`stats` performs no protocol work and reads one coherent snapshot.
+All state changes occur through `receive`, `command`, or `poll`. Each synchronous
+call ends its borrow and each output owns its data. The caller may stop at its
+work budget, service another connection and resume without draining the first
+connection to idle. `stats` performs no protocol work and reads one coherent
+snapshot.
+
+Keep one externally scheduled next wakeup per connection. If a caller exhausts
+its budget before reaching `Idle`, schedule an immediate continuation. Otherwise
+use `Idle.next_wakeup`, which includes pending owner work as well as protocol and
+media-expiry deadlines. A wakeup at or before current execution time means
+bounded service yielded with more runnable work; it is not permission to sleep.
+Blocked media or SCTP sends do not alone request immediate continuation. Queue
+expiry remains scheduled even without a selected transport path.
 
 ### Time types
 
@@ -326,15 +336,38 @@ Emitting `Output::Transmit` is the connection's irrevocable transmission commit:
 1. the packet's transport sequence number and RTP/RTCP continuity are committed;
 2. the packet enters sent history and bytes-in-flight at `TimePoint.monotonic`;
 3. pacing tokens and sender service are charged;
-4. forwarding latency is measured through this commit point;
-5. the caller MUST attempt socket submission before calling the connection again.
+4. source observation and normalized media time remain unchanged for caller
+   latency measurements;
+5. the caller may collect a bounded promptly serviced batch, and MUST service it
+   before requesting further finalized work from that connection.
 
-There is no transmit receipt and no `report_departure` API. The connection assumes
-every emitted `Transmit` was submitted. A discarded value, failed syscall, or
-kernel drop therefore appears to feedback as loss or missing feedback. The caller
-MUST NOT place `Transmit` in another application queue or retry it through the
-connection. Runtime poll-to-syscall latency is measured and governed outside this
-crate.
+Batching is caller-owned collection of the existing owned outputs, not another
+RTC queue or transaction API. Bound collection by count, bytes and service
+latency appropriate to the caller's sockets. Interleave connection service at
+those boundaries rather than draining a busy connection indefinitely.
+
+There is no transmit receipt, rollback or `report_departure` API. Every finalized
+packet remains committed even if socket submission fails. A discarded value,
+failed syscall or kernel drop appears to feedback as local loss or missing
+feedback. Never retry a finalized output through `SendMedia` or ask RTC to
+refund pacing, continuity or history. Runtime poll-to-syscall latency and actual
+socket submission are measured and governed outside this crate.
+
+For partial submission and backpressure:
+
+- UDP batch success counts a prefix of whole datagrams. Never replay that
+  accepted prefix. The unsent suffix may receive bounded socket-level retry or
+  be dropped as local loss. Do not accumulate an unbounded output backlog.
+- TCP success can include complete frames and a prefix of the next RFC4571
+  frame. Retain the exact remaining bytes and cursor in bounded socket state.
+  Finish that frame on the same flow before later frames, or close its flow.
+  Never discard a frame suffix and continue writing later frames.
+- On TCP closure, retire its flow before replacement and discard its unsent
+  output. A new stream gets a new `IceTcpFlowId`; saved output for the old ID
+  MUST NOT target the replacement, even when local/remote tuples match.
+- A partially accepted batch cannot rewind transport accounting. Collect no
+  further finalized work for a blocked connection until its bounded handoff
+  has been serviced, locally dropped where permitted, or fenced by flow closure.
 
 UDP and fallback ICE-TCP use the same commit semantics. A TCP write can remain in
 the kernel's TCP queue; `pulsebeam-rtc` does not claim to observe physical NIC or

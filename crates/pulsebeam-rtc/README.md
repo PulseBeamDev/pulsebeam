@@ -48,20 +48,28 @@ connection.poll(...)
 connection.stats()
 ```
 
-All protocol progress occurs through explicit calls. The caller drains `poll`
-until it returns:
-
-```text
-Idle { next_wakeup }
-```
-
-`next_wakeup` is the connection's single externally scheduled timer.
+All protocol progress occurs through explicit calls. `poll` performs a bounded
+service turn and returns an owned value, so callers may stop at their work
+budget, service another connection and resume without draining to idle. Input or
+commands arrange fresh service; budget exhaustion arranges an immediate
+continuation. `Idle { next_wakeup }` supplies the connection's single externally
+scheduled wakeup. A wakeup due now requests continuation, not sleep. Pending
+queues and capped native drains remain runnable; blocked sends do not spin, and
+media expiry remains scheduled without a selected transport path.
 
 Returning `Transmit` is an irrevocable send commit. RTP/RTCP continuity,
 congestion-control sent history, bytes in flight, pacing, and forwarding
-accounting have already advanced. The caller must immediately submit the
-transmit to its selected UDP socket or ICE-TCP stream before driving the
-connection again. There is no departure receipt or rollback API.
+accounting have already advanced. Collecting a bounded promptly serviced batch
+is allowed. Service it before requesting more finalized work from that
+connection; there is no departure receipt or rollback API.
+
+UDP submission must never replay an accepted batch prefix. Unsent whole
+datagrams may receive bounded socket retry or be dropped as local loss. TCP
+submission must finish a partially written RFC4571 frame on the same flow, in
+bounded socket state, or close that flow. Never discard a suffix and continue
+with later frames. Retire closed flows before replacement and never retarget
+saved output to a new stream incarnation. See the [handoff contract](docs/design.md)
+for partial submission and backpressure obligations.
 
 A connection supports graceful close, which rejects new application work and
 drains required protocol shutdown traffic to a deadline, and immediate abort.

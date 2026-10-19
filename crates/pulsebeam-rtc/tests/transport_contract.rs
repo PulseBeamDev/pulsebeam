@@ -140,14 +140,125 @@ fn observations(connection: &mut Connection, at: TimePoint) -> Vec<Authenticated
         match connection.poll(at) {
             Output::Event(Event::IceAuthenticated(flow)) => flows.push(flow),
             Output::Event(Event::Connected) => panic!("non-nominated STUN cannot establish DTLS"),
-            Output::Idle { .. } => return flows,
+            Output::Idle { next_wakeup } if next_wakeup.is_none_or(|next| next > at.monotonic) => {
+                return flows;
+            }
             Output::Closed(reason) => panic!("unexpected close: {reason:?}"),
             // This virtual peer discards replies, which remain committed loss.
-            Output::Transmit(_) | Output::Event(_) => {}
+            Output::Idle { .. } | Output::Transmit(_) | Output::Event(_) => {}
             _ => panic!("unexpected RTC output"),
         }
     }
     panic!("connection did not reach idle");
+}
+
+#[test]
+fn caller_budgets_alternate_owned_batches_without_draining_a_connection() {
+    let mut nodes = [
+        connection("192.0.2.1:5000".parse().expect("first"), false),
+        connection("192.0.2.1:5002".parse().expect("second"), false),
+    ];
+    let remote = "192.0.2.2:5001".parse().expect("remote");
+    let payload = request(&format!("{UFRAG}:chromeufrag"), Some(PASSWORD.as_bytes()));
+    for (index, (connection, at)) in nodes.iter_mut().enumerate() {
+        let local = if index == 0 {
+            "192.0.2.1:5000"
+        } else {
+            "192.0.2.1:5002"
+        }
+        .parse()
+        .expect("local");
+        for _ in 0..3 {
+            connection
+                .receive(
+                    *at,
+                    pulsebeam_rtc::PacketObservation {
+                        at: *at,
+                        provenance: 0,
+                    },
+                    input(local, remote, false, payload.clone()),
+                )
+                .expect("authenticated STUN");
+        }
+    }
+    let mut next_wakeup = [Some(nodes[0].1.monotonic), Some(nodes[1].1.monotonic)];
+    let mut emitted = [0usize; 2];
+    let mut finalized_bytes = [0u64; 2];
+    let mut socket_accepted = Vec::new();
+    let mut local_loss = 0;
+    let mut alternated_before_idle = false;
+    for _ in 0..16 {
+        for index in 0..2 {
+            let (connection, at) = &mut nodes[index];
+            if next_wakeup[index].is_none_or(|next| next > at.monotonic) {
+                continue;
+            }
+            // Budget exhaustion schedules an immediate continuation, not a forced drain.
+            next_wakeup[index] = Some(at.monotonic);
+            let mut batch = std::collections::VecDeque::new();
+            for _ in 0..2 {
+                match connection.poll(*at) {
+                    Output::Transmit(transmit) => {
+                        assert_eq!(transmit.kind, pulsebeam_rtc::TransmitKind::Control);
+                        finalized_bytes[index] +=
+                            u64::try_from(transmit.payload.len()).expect("bounded datagram");
+                        emitted[index] += 1;
+                        batch.push_back(transmit);
+                    }
+                    Output::Idle { next_wakeup: next } => {
+                        next_wakeup[index] = next;
+                        break;
+                    }
+                    Output::Event(_) => {}
+                    output => panic!("unexpected output: {output:?}"),
+                }
+            }
+            assert!(batch.len() <= 2);
+            // A virtual UDP submission accepts one whole prefix item. Drop the
+            // unsent suffix as local loss rather than replaying/refinalizing it.
+            if let Some(accepted) = batch.pop_front() {
+                socket_accepted.push(accepted);
+            }
+            local_loss += batch.len();
+            drop(batch);
+            assert_eq!(
+                connection.stats().connection.transmitted_protocol_bytes,
+                finalized_bytes[index]
+            );
+        }
+        if emitted.iter().all(|count| *count > 0)
+            && next_wakeup.iter().flatten().count() == 2
+            && next_wakeup
+                .iter()
+                .enumerate()
+                .all(|(index, next)| *next == Some(nodes[index].1.monotonic))
+        {
+            alternated_before_idle = true;
+        }
+        if next_wakeup
+            .iter()
+            .enumerate()
+            .all(|(index, next)| next.is_none_or(|next| next > nodes[index].1.monotonic))
+        {
+            break;
+        }
+    }
+    assert!(alternated_before_idle);
+    assert_eq!(emitted, [3, 3]);
+    assert!(
+        local_loss > 0,
+        "a partial UDP prefix leaves a real finalized suffix"
+    );
+    assert_eq!(
+        socket_accepted.len() + local_loss,
+        6,
+        "no accepted prefix is replayed"
+    );
+    assert!(
+        socket_accepted
+            .iter()
+            .all(|transmit| !transmit.payload.is_empty())
+    );
 }
 
 #[test]

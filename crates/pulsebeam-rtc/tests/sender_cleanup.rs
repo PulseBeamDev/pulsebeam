@@ -12,6 +12,58 @@ use pulsebeam_rtc::{Command, CommandError, FrameBoundary, MediaPayloadBitrate};
 use support::{NetworkPolicy, PeerFixture, RtpImpairment, forwarded};
 
 #[test]
+fn retired_flow_keeps_media_expiry_scheduled_without_spinning_on_blocked_output() {
+    let mut fixture = PeerFixture::connected_tcp_datachannels();
+    let source = fixture.send_source(b"waiting for transport");
+    let mut assignment = fixture.assignment(fixture.sender);
+    assignment.delivery.max_media_age = Duration::from_secs(1);
+    assignment.delivery.max_queue_residence = Duration::from_millis(5);
+    fixture.command(Command::SetSenderAssignment {
+        sender: fixture.sender,
+        assignment: Some(assignment),
+    });
+    fixture.command(Command::SendMedia {
+        sender: fixture.sender,
+        media: forwarded(source, 1),
+    });
+    fixture.command(Command::RetireIceTcpFlow {
+        flow: fixture.tcp_flow(),
+    });
+    let at = fixture.at();
+    let next = (0..32)
+        .find_map(|_| {
+            let output = fixture.connection.poll(at);
+            assert!(
+                !matches!(output, pulsebeam_rtc::Output::Transmit(_)),
+                "retired flow cannot emit"
+            );
+            if let pulsebeam_rtc::Output::Idle { next_wakeup } = output {
+                next_wakeup
+            } else {
+                None
+            }
+        })
+        .expect("queued media expiry remains scheduled without a selected path");
+    assert!(
+        next > at.monotonic,
+        "blocked output is not immediate runnable work"
+    );
+    assert!(next <= at.monotonic + Duration::from_millis(5) + Duration::from_nanos(1));
+    fixture.advance_clock_without_poll(next.duration_since(at.monotonic));
+    let _ = fixture.connection.poll(fixture.at());
+    assert_eq!(
+        fixture
+            .connection
+            .stats()
+            .senders
+            .first()
+            .expect("sender")
+            .queued_packets,
+        0
+    );
+}
+
+#[test]
 fn replacement_fences_old_source_without_rewinding_committed_continuity() {
     let mut fixture = PeerFixture::connected();
     let first = fixture.send_source(b"committed source");

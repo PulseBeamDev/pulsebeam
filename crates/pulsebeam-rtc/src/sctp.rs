@@ -48,6 +48,8 @@ pub(crate) struct Association {
     committed_transport_bytes: u64,
     shutdown_deadline: Option<Instant>,
     stopped: bool,
+    // Native queues have no peek; an exhausted bounded drain needs a continuation.
+    native_drain_exhausted: bool,
 }
 
 // SAFETY: dcsctp 0.1.14 uses Rc/RefCell only to share bookkeeping inside one
@@ -145,6 +147,7 @@ impl Association {
             committed_transport_bytes: 0,
             shutdown_deadline: None,
             stopped: false,
+            native_drain_exhausted: false,
         }
     }
 
@@ -333,7 +336,6 @@ impl Association {
         self.advance_time(at.monotonic);
         self.socket.handle_input(packet);
         self.drain_socket();
-        self.drain_messages();
     }
 
     pub(crate) fn poll_event(&mut self, at: TimePoint) -> Option<Event> {
@@ -342,9 +344,12 @@ impl Association {
         }
         self.advance_time(at.monotonic);
         self.drain_socket();
-        self.drain_messages();
         self.enforce_shutdown_deadline(at.monotonic);
         self.events.pop_front()
+    }
+
+    pub(crate) fn has_pending_events(&self) -> bool {
+        !self.events.is_empty() || (!self.stopped && self.native_drain_exhausted)
     }
 
     pub(crate) fn has_packet(&self) -> bool {
@@ -454,75 +459,74 @@ impl Association {
     }
 
     fn drain_socket(&mut self) {
+        self.native_drain_exhausted = false;
         for _ in 0..MAX_WORK_PER_CALL {
-            let Some(event) = self.socket.poll_event() else {
-                break;
-            };
-            match event {
-                SocketEvent::SendPacket(packet) => {
-                    if self.outgoing.len() >= MAX_WORK_PER_CALL {
-                        self.abort_association();
+            let event = self.socket.poll_event();
+            let progressed = event.is_some();
+            if let Some(event) = event {
+                match event {
+                    SocketEvent::SendPacket(packet) => {
+                        if self.outgoing.len() >= MAX_WORK_PER_CALL {
+                            self.abort_association();
+                            break;
+                        }
+                        self.outgoing.push_back(packet);
+                    }
+                    SocketEvent::OnClosed() | SocketEvent::OnAborted(_, _) => {
+                        self.close_all_channels();
+                        self.stopped = true;
                         break;
                     }
-                    self.outgoing.push_back(packet);
-                }
-                SocketEvent::OnClosed() | SocketEvent::OnAborted(_, _) => {
-                    self.close_all_channels();
-                    self.stopped = true;
-                    break;
-                }
-                SocketEvent::OnConnected()
-                | SocketEvent::OnConnectionRestarted()
-                | SocketEvent::OnError(_, _)
-                | SocketEvent::OnBufferedAmountLow(_)
-                | SocketEvent::OnTotalBufferedAmountLow()
-                | SocketEvent::OnStreamsResetFailed(_)
-                | SocketEvent::OnLifecycleMessageFullySent(_)
-                | SocketEvent::OnLifecycleMessageMaybeExpired(_)
-                | SocketEvent::OnLifecycleMessageExpired(_)
-                | SocketEvent::OnLifecycleMessageDelivered(_) => {}
-                SocketEvent::OnStreamsResetPerformed(streams) => {
-                    for stream in streams {
-                        self.emit_closed(stream);
-                        self.channels.retain(|channel| channel.stream != stream);
-                    }
-                }
-                SocketEvent::OnIncomingStreamReset(streams) => {
-                    let streams = if streams.is_empty() {
-                        self.channels.iter().map(|channel| channel.stream).collect()
-                    } else {
-                        streams
-                    };
-                    for stream in streams {
-                        self.emit_closed(stream);
-                        if let Some(channel) = self.channel_mut(stream) {
-                            channel.state = ChannelState::Closing;
+                    SocketEvent::OnConnected()
+                    | SocketEvent::OnConnectionRestarted()
+                    | SocketEvent::OnError(_, _)
+                    | SocketEvent::OnBufferedAmountLow(_)
+                    | SocketEvent::OnTotalBufferedAmountLow()
+                    | SocketEvent::OnStreamsResetFailed(_)
+                    | SocketEvent::OnLifecycleMessageFullySent(_)
+                    | SocketEvent::OnLifecycleMessageMaybeExpired(_)
+                    | SocketEvent::OnLifecycleMessageExpired(_)
+                    | SocketEvent::OnLifecycleMessageDelivered(_) => {}
+                    SocketEvent::OnStreamsResetPerformed(streams) => {
+                        for stream in streams {
+                            self.emit_closed(stream);
+                            self.channels.retain(|channel| channel.stream != stream);
                         }
-                        let _ = self.socket.reset_streams(&[stream]);
                     }
-                }
-                SocketEvent::OnLifecycleEnd(id) => {
-                    if let Some(index) = self
-                        .lifecycles
-                        .iter()
-                        .position(|message| message.lifecycle == id.value())
-                        && let Some(message) = self.lifecycles.remove(index)
-                    {
-                        self.buffered_payload_bytes =
-                            self.buffered_payload_bytes.saturating_sub(message.bytes);
+                    SocketEvent::OnIncomingStreamReset(streams) => {
+                        let streams = if streams.is_empty() {
+                            self.channels.iter().map(|channel| channel.stream).collect()
+                        } else {
+                            streams
+                        };
+                        for stream in streams {
+                            self.emit_closed(stream);
+                            if let Some(channel) = self.channel_mut(stream) {
+                                channel.state = ChannelState::Closing;
+                            }
+                            let _ = self.socket.reset_streams(&[stream]);
+                        }
+                    }
+                    SocketEvent::OnLifecycleEnd(id) => {
+                        if let Some(index) = self
+                            .lifecycles
+                            .iter()
+                            .position(|message| message.lifecycle == id.value())
+                            && let Some(message) = self.lifecycles.remove(index)
+                        {
+                            self.buffered_payload_bytes =
+                                self.buffered_payload_bytes.saturating_sub(message.bytes);
+                        }
                     }
                 }
             }
+            if let Some(message) = self.socket.get_next_message() {
+                self.handle_message(message);
+            } else if !progressed {
+                return;
+            }
         }
-    }
-
-    fn drain_messages(&mut self) {
-        for _ in 0..MAX_WORK_PER_CALL {
-            let Some(message) = self.socket.get_next_message() else {
-                break;
-            };
-            self.handle_message(message);
-        }
+        self.native_drain_exhausted = !self.stopped;
     }
 
     fn handle_message(&mut self, message: Message) {
@@ -620,7 +624,6 @@ impl Association {
                     &SendOptions::default(),
                 );
                 self.emit_opened(stream);
-                self.drain_socket();
             }
             _ => self.close_stream(stream),
         }
@@ -632,7 +635,6 @@ impl Association {
             channel.state = ChannelState::Closing;
         }
         let _ = self.socket.reset_streams(&[stream]);
-        self.drain_socket();
     }
 
     fn emit_opened(&mut self, stream: StreamId) {
@@ -893,6 +895,7 @@ mod tests {
             *now = now
                 .checked_add(Duration::from_millis(10))
                 .expect("test time");
+            progress |= left.has_pending_events() || right.has_pending_events();
             if !progress
                 && left.socket.state() == SocketState::Connected
                 && right.socket.state() == SocketState::Connected
@@ -1135,6 +1138,62 @@ mod tests {
                 message: DataMessage::Text(bytes),
             }) if *channel == DataChannelId::from_value(7) && bytes.is_empty()
         )));
+    }
+
+    #[test]
+    fn capped_native_lifecycle_drain_remains_ready_without_user_events() {
+        let limits = ConnectionLimits::default();
+        let (mut left, mut right, mut now, start) = connected_pair(limits, limits);
+        left.open(at(now, start), config(DataReliability::Reliable, true))
+            .expect("open");
+        let mut left_events = Vec::new();
+        drive(
+            &mut left,
+            &mut right,
+            &mut now,
+            start,
+            &mut left_events,
+            &mut Vec::new(),
+        );
+        let channel = opened_channel(&left_events).expect("opened");
+        let mut acknowledgements = Vec::new();
+        for _ in 0..192 {
+            left.send(
+                at(now, start),
+                channel,
+                DataMessage::Binary(Bytes::from_static(&[1])),
+            )
+            .expect("bounded tiny message");
+            while let Some(packet) = left.poll_packet() {
+                right.handle_input(at(now, start), &packet);
+                while right.poll_event(at(now, start)).is_some() {}
+                while let Some(ack) = right.poll_packet() {
+                    acknowledgements.push(ack);
+                }
+            }
+        }
+        let before = left.stats().buffered_payload_bytes;
+        let cumulative = acknowledgements.pop().expect("cumulative acknowledgement");
+        left.handle_input(at(now, start), &cumulative);
+        assert!(
+            left.native_drain_exhausted,
+            "real cumulative ACK exhausts callback work"
+        );
+        assert!(left.has_pending_events());
+        for _ in 0..8 {
+            assert!(
+                left.poll_event(at(now, start)).is_none(),
+                "lifecycle work is not an application event"
+            );
+            if !left.has_pending_events() {
+                break;
+            }
+        }
+        assert!(
+            !left.has_pending_events(),
+            "bounded continuation makes progress"
+        );
+        assert!(left.stats().buffered_payload_bytes < before);
     }
 
     #[test]
