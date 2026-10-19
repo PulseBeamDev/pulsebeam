@@ -11,11 +11,26 @@ load("@meet_npm//apps/meet:prettier/package_json.bzl", prettier = "bin")
 load("@meet_npm//apps/meet:serve/package_json.bzl", serve = "bin")
 
 package(default_visibility = ["//visibility:public"])
-test_suite(name = "browser", tests = ["//agents/pulsebeam-agent-web:meet_browser"])
 filegroup(name = "workflow_inputs", srcs = glob(["*.md", "docs/**/*.md", "Justfile", "*.json", "*.yaml", "scripts/*.sh"], allow_empty = True))
 exports_files(["package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml"])
 
 npm_link_all_packages(name = "node_modules", imported_links = [link_web_for_meet])
+
+js_test(
+    name = "component_tests",
+    entry_point = "scripts/test-components.mjs",
+    args = ["tests/session.tsx"],
+    chdir = package_name(),
+    data = [
+        "//agents/react:component_support", "//agents/react:component_sources",
+        "//agents/pulsebeam-agent-web:component_sources",
+        ":node_modules/react", ":node_modules/react-dom", ":node_modules/happy-dom",
+        ":node_modules/esbuild", ":node_modules/@mui/material", ":node_modules/lucide-react",
+        ":node_modules/@emotion/react", ":node_modules/@emotion/styled",
+        "package.json",
+    ] + glob(["tests/**", "components/**", "hooks/**", "lib/**"]),
+)
+
 
 filegroup(
     name = "sources",
@@ -56,13 +71,13 @@ eslint.eslint_test(
     data = [":sources", ":node_modules"],
 )
 
-copy_to_directory(name = "format_sources", srcs = [":sources"])
+copy_to_directory(name = "format_sources", srcs = [":sources"] + glob(["tests/**"]))
 
 py_test(
     name = "format",
     srcs = ["//tools:check-js-format.py"],
     main = "//tools:check-js-format.py",
-    args = ["--formatter", "$(rootpath :prettier)", "--source", "$(rootpath :format_sources)", "--", "app/**/*.{css,ts,tsx}", "components/**/*.{ts,tsx}", "hooks/**/*.ts", "lib/**/*.ts", "scripts/**/*.mjs", "*.{json,mjs,ts}"],
+    args = ["--formatter", "$(rootpath :prettier)", "--source", "$(rootpath :format_sources)", "--", "app/**/*.{css,ts,tsx}", "components/**/*.{ts,tsx}", "hooks/**/*.ts", "lib/**/*.ts", "scripts/**/*.mjs", "tests/**/*.tsx", "*.{json,mjs,ts}"],
     data = [":prettier", ":format_sources"],
 )
 
@@ -84,4 +99,4 @@ output_files(name = "framework_types", target = ":export", paths = [package_name
 output_files(name = "static_export", target = ":export", paths = [package_name() + "/out"])
 serve.serve_binary(name = "preview", args = ["$(rootpath :static_export)"], data = [":static_export"])
 
-test_suite(name = "check", tests = [":types", ":eslint", ":format", ":boundary", ":export_contract"])
+test_suite(name = "check", tests = [":types", ":eslint", ":format", ":boundary", ":export_contract", ":component_tests"])

@@ -27,8 +27,7 @@
     "check": "../../bazel test //agents/react:fast",
     "format": "../../bazel run //:fix",
     "format:check": "../../bazel test //agents/react:format",
-    "test": "../../bazel test //agents/react:fast //agents/pulsebeam-agent-web:browser",
-    "build:browser": "../../bazel build //agents/react:browser_fixture",
+    "test": "../../bazel test //agents/react:fast",
     "test:consumer": "../../bazel test //agents/react/tests/consumer:types"
   },
   "dependencies": {
@@ -40,10 +39,11 @@
   "devDependencies": {
     "@types/react": "^18.3.24",
     "@types/react-dom": "^18.3.7",
+    "esbuild": "^0.25.0",
+    "happy-dom": "20.0.11",
     "prettier": "3.6.2",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
-    "esbuild": "^0.25.0",
     "typescript": "~5.9.3"
   }
 }

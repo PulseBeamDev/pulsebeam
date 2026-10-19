@@ -37,17 +37,18 @@ Keep signing keys on your backend.
 
 ```sh
 ./bazel test //agents/react:fast
-./bazel test //agents/react:browser
+./bazel test //agents/react:component_tests
 ./bazel test //agents/react:quickstart_build
 ```
 
 The owner `:fast` gate includes SDK/package contracts and is not the root cheap
-loop. Pure session-identity decisions run directly in the pinned JavaScript
-runtime. The component browser owner uses real React commits, effects, DOM
-attachments, and media capture. The quickstart build and type targets check the
+loop. Component tests execute production hooks with real React commits,
+effects, events and unmounts in Happy DOM, controlling only external runtime,
+capture and playback outcomes. These tests and pure session-identity decisions
+also run through root `//:fast`. The quickstart build and type targets check the
 documented example without a browser or production-server fixture.
 Run `./bazel run //agents/react:quickstart_dev` to serve its built bundle locally.
 
-The browser owner follows the
-[contributor testing contract](../../docs/build.md#testing-contract) and uses pinned
-Chrome/ChromeDriver. It does not build Meet or certify other application frameworks.
+See the [client QA boundaries](../../docs/build.md#client-qa-boundaries) for
+model limits and the required Web-platform witness. Component tests do not prove
+browser layout, decoded media, WebRTC compatibility or autoplay security.

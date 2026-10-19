@@ -26,6 +26,7 @@ jobs:
           # Browser evidence names can contain ':'; upload Bazel's archive instead.
           path: |
             bazel-testlogs/**/test.log
+            bazel-testlogs/**/test.xml
             bazel-testlogs/**/test.outputs/outputs.zip
           include-hidden-files: true
           if-no-files-found: warn

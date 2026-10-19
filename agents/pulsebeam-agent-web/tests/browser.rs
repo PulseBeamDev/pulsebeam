@@ -44,21 +44,6 @@ async fn native_platform_smoke() -> TestResult<()> {
         let context = bidi.browsing_context().top_level().await?;
         for (name, script, report) in [
             (
-                "public",
-                include_str!("contracts/public-agent-contract.js"),
-                false,
-            ),
-            (
-                "local-ownership",
-                include_str!("contracts/runtime-local-operation-contract.js"),
-                true,
-            ),
-            (
-                "element-attachment",
-                include_str!("contracts/remote-media-contract.js"),
-                true,
-            ),
-            (
                 "physical-layout",
                 include_str!("contracts/remote-catalog-contract.js"),
                 true,
@@ -105,22 +90,8 @@ async fn native_platform_smoke() -> TestResult<()> {
             include_str!("contracts/uniffi-media-contract.js"),
         )
         .await?;
-        for field in [
-            "trackIdentity",
-            "streamIdentity",
-            "foreignRejected",
-            "staleRejected",
-            "exhaustionRejected",
-        ] {
-            assert_eq!(ffi[field], true, "generated media: {field}");
-        }
-        for (field, expected) in [
-            ("retainedBeforeTrackRelease", "1"),
-            ("retainedAfterTrackRelease", "0"),
-            ("retainedBeforeStreamRelease", "1"),
-            ("retainedAfterStreamRelease", "0"),
-        ] {
-            assert_eq!(ffi[field], expected, "generated lifetime: {field}");
+        for field in ["trackIdentity", "streamIdentity"] {
+            assert_eq!(ffi[field], true, "generated real media handoff: {field}");
         }
         Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
     })
@@ -129,6 +100,41 @@ async fn native_platform_smoke() -> TestResult<()> {
         server.wasm_requests() > 0,
         "packaged WASM was actually loaded"
     );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn gesture_before_media_smoke() -> TestResult<()> {
+    let server = StaticServer::start(root()).await?;
+    let mut browser = capabilities()?;
+    browser.add_arg("--autoplay-policy=document-user-activation-required")?;
+    run_browser_test(managed_driver(browser), |driver| async move {
+        let bidi = driver.bidi().await?;
+        let context = bidi.browsing_context().top_level().await?;
+        navigate(&bidi, &context, server.url("tests/fixture.html")).await?;
+        let _: () = evaluate_json(&bidi, &context, LOAD).await?;
+        let started: bool = evaluate_json(
+            &bidi,
+            &context,
+            include_str!("contracts/early-audio-start.js"),
+        )
+        .await?;
+        assert!(started);
+        driver
+            .find(thirtyfour::By::Id("early-audio"))
+            .await?
+            .click()
+            .await?;
+        let passed: bool = evaluate_json(
+            &bidi,
+            &context,
+            include_str!("contracts/early-audio-finish.js"),
+        )
+        .await?;
+        assert!(passed);
+        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
+    })
+    .await?;
     Ok(())
 }
 
@@ -164,54 +170,6 @@ async fn gesture_required_audio_smoke() -> TestResult<()> {
         Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
     })
     .await?;
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-async fn initialization_failure_and_fixture_cleanup_smoke() -> TestResult<()> {
-    let server = StaticServer::start_with_wasm_failure(root(), true).await?;
-    let address: std::net::SocketAddr = server
-        .url("")
-        .trim_start_matches("http://")
-        .trim_end_matches('/')
-        .parse()?;
-    let url = server.url("tests/fixture.html");
-    let driver = managed_driver(capabilities()?).await?;
-    let closed = driver.clone();
-    let result = run_browser_test(async { Ok(driver) }, |driver| async move {
-        let bidi = driver.bidi().await?;
-        let context = bidi.browsing_context().top_level().await?;
-        navigate(&bidi, &context, url).await?;
-        let _: () = evaluate_json(&bidi, &context, LOAD).await?;
-        let passed: bool = evaluate_json(
-            &bidi,
-            &context,
-            include_str!("contracts/initialization-failure.js"),
-        )
-        .await?;
-        assert!(passed);
-        let rejections: usize = evaluate_json(
-            &bidi,
-            &context,
-            include_str!("contracts/unhandled-rejections.js"),
-        )
-        .await?;
-        assert_eq!(rejections, 0);
-        Err::<(), Box<dyn std::error::Error + Send + Sync>>("controlled fixture failure".into())
-    })
-    .await;
-    let failure = result.expect_err("fixture failure must propagate");
-    assert_eq!(
-        failure.body_error().map(|error| error.to_string()),
-        Some("controlled fixture failure".into())
-    );
-    assert!(failure.cleanup_error().is_none(), "{failure}");
-    assert!(
-        closed.current_url().await.is_err(),
-        "failed fixture left a live browser session"
-    );
-    server.shutdown().await;
-    let _listener = tokio::net::TcpListener::bind(address).await?;
     Ok(())
 }
 

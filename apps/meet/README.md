@@ -57,7 +57,7 @@ return to it, so close the tab when finished.
 
 ```bash
 ./bazel test //apps/meet:check
-./bazel test //apps/meet:browser
+./bazel test //apps/meet:component_tests
 ./bazel build //:meet
 ./bazel run //apps/meet:preview -- --listen 3000
 ```
@@ -69,15 +69,17 @@ you choose another endpoint. For the local quickstart, use the development serve
 rather than the static preview.
 
 `check` covers types, formatting, dependency boundaries, and exported entry/CNAME
-integrity. The browser owner runs the real static export with a Web peer and an
-owned local node on ephemeral listeners. Its focused smokes cover join, external
-identity, credential handling, actual chat/reaction rendering with fresh decoded
-media, Leave cleanup, and both early and late audio-gesture premises. Reliable
-loss/restart/order/history policy belongs to deterministic native/SFU simulation;
-the Web adapter retains its own reconnect round trip. Credential observation starts before form
-entry and includes transient storage, URL, and console effects; it is not a universal
-proof about unexercised future paths. Local fixture serving does not certify public
-hosting configuration. See the [contributor testing contract](../../docs/build.md#testing-contract).
+integrity. Component tests mount the production app and React hooks in Happy
+DOM with controlled external capture, runtime and playback outcomes. They cover
+capture-gated join, admitted identities, actual chat/reaction rendering and sends,
+playback retry wiring and Leave cleanup. Credential observation starts before form
+entry and catches transient storage, URL, cookie and console effects in these
+flows, not every possible future path.
+
+These tests also run in root `//:fast` without exporting Meet or provisioning a
+browser. Real transport, fresh decoded media and restrictive-autoplay premises
+belong to the required Web-platform owner; component models do not certify those
+boundaries or public hosting. See the [client QA boundaries](../../docs/build.md#client-qa-boundaries).
 
 ## Media and topics
 

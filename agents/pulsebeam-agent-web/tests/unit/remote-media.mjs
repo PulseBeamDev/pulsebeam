@@ -1,4 +1,11 @@
-(async () => {
+import assert from "node:assert/strict";
+import { test } from "node:test";
+import { attachRemoteMedia } from "../../unit-javascript/remote-media.js";
+
+import { Video } from "./media-platform.mjs";
+const document = { createElement: () => new Video() };
+
+test("media attachments reconcile independent consumers and fence retired playback completions", async () => {
   function trackSet(stream) {
     return new Set(stream.getTracks());
   }
@@ -28,7 +35,13 @@
   }
 
   function videoTrack() {
-    return document.createElement("canvas").captureStream().getVideoTracks()[0];
+    return {
+      kind: "video",
+      readyState: "live",
+      stop() {
+        this.readyState = "ended";
+      },
+    };
   }
 
   async function settle() {
@@ -49,7 +62,7 @@
       },
     });
 
-    const attachment = pulsebeam.attachRemoteMedia(agent, element, {
+    const attachment = attachRemoteMedia(agent, element, {
       publicationIds: ["audio", "video", "audio"],
     });
     attachments.push(attachment);
@@ -74,7 +87,7 @@
     Object.defineProperty(secondElement, "play", {
       value: () => Promise.resolve(),
     });
-    const second = pulsebeam.attachRemoteMedia(agent, secondElement, {
+    const second = attachRemoteMedia(agent, secondElement, {
       publicationIds: ["audio"],
     });
     attachments.push(second);
@@ -105,7 +118,7 @@
           : ((recovered = true), Promise.resolve());
       },
     });
-    const blocked = pulsebeam.attachRemoteMedia(blockedAgent, blockedElement, {
+    const blocked = attachRemoteMedia(blockedAgent, blockedElement, {
       publicationIds: ["audio"],
       onPlaybackBlocked: (failure, nextRetry) => {
         blockedMessage = failure.message;
@@ -127,7 +140,7 @@
     Object.defineProperty(pendingElement, "play", {
       value: () => new Promise((_, reject) => (rejectPlay = reject)),
     });
-    const pending = pulsebeam.attachRemoteMedia(pendingAgent, pendingElement, {
+    const pending = attachRemoteMedia(pendingAgent, pendingElement, {
       publicationIds: ["audio"],
       onPlaybackBlocked: () => (pendingBlocked = true),
     });
@@ -146,7 +159,7 @@
     rejectPlay?.(new Error("closed receiver rejected late"));
     await settle();
 
-    globalThis.__pulsebeamRemoteMedia = {
+    const report = {
       firstAvailable,
       unchanged,
       combined,
@@ -160,9 +173,10 @@
       pendingSuppressed:
         retiredSuppressed && replacementReported && !pendingBlocked,
     };
-    return globalThis.__pulsebeamRemoteMedia;
+    for (const [name, value] of Object.entries(report))
+      assert.equal(value, true, name);
   } finally {
     for (const attachment of attachments) attachment.close();
     for (const track of [audio, video, replacement]) track.stop();
   }
-})();
+});

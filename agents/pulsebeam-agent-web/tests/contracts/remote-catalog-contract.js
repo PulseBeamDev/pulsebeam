@@ -63,44 +63,18 @@
       throw new Error("layout smoke requires non-unit DPR=2");
     const small = mount(120);
     await until(() => wire[0]?.height === Math.ceil(120 * devicePixelRatio));
-    const large = mount(230);
+    small.element.style.height = "230px";
     await until(() => wire[0]?.height === Math.ceil(230 * devicePixelRatio));
-    const maxPhysicalHeight = wire.length === 1;
-    large.attachment.close();
-    large.element.remove();
-    await until(() => wire[0]?.height === Math.ceil(120 * devicePixelRatio));
-    small.element.style.height = "200px";
-    await until(() => wire[0]?.height === Math.ceil(200 * devicePixelRatio));
-    const height = wire[0].height;
-    for (const [property, hidden, visible] of [
-      ["opacity", "0", "1"],
-      ["visibility", "hidden", "visible"],
-      ["display", "none", "block"],
-    ]) {
-      host.style[property] = hidden;
-      await until(() => wire.length === 0);
-      host.style[property] = visible;
-      await until(() => wire[0]?.height === height);
-    }
+    const resizedPhysicalPixels = wire.length === 1;
     small.element.style.top = "-500px";
     await until(() => wire.length === 0);
-    small.element.style.top = "-50px";
-    await until(() => wire[0]?.height === height);
-    Object.defineProperty(document, "hidden", {
-      configurable: true,
-      value: true,
-    });
-    document.dispatchEvent(new Event("visibilitychange"));
-    await until(() => wire.length === 0);
-    delete document.hidden;
-    document.dispatchEvent(new Event("visibilitychange"));
-    await until(() => wire[0]?.height === height);
-    const measuredVisibility = wire[0].minHeight === 720;
+    small.element.style.top = "0";
+    await until(() => wire[0]?.height === Math.ceil(230 * devicePixelRatio));
+    const viewportNotifications = wire.length === 1;
     small.attachment.close();
     const released = wire.length === 0 && listeners.size === 0;
-    return { maxPhysicalHeight, measuredVisibility, released };
+    return { resizedPhysicalPixels, viewportNotifications, released };
   } finally {
-    delete document.hidden;
     for (const attachment of attachments) attachment.close();
     host.remove();
     catalog.close();

@@ -1,24 +1,23 @@
-(async () => {
+import { Track } from "./platform.mjs";
+
+export async function publicContract(pulsebeam) {
   const { createAgent, createCaptureSource, LocalTrackCapacityError } =
     pulsebeam;
   const assert = (condition, label) => {
     if (!condition) throw new Error(label);
   };
   const first = createAgent({
-    endpoint: location.origin,
+    endpoint: "http://localhost",
     token: "public-smoke",
     topology: { localVideos: 1, localAudios: 1 },
     logging: { level: "off" },
   });
   const closedDuringInitialization = createAgent({
-    endpoint: location.origin,
+    endpoint: "http://localhost",
     token: "close-before-initialization",
   });
   closedDuringInitialization.close();
-  const track = document
-    .createElement("canvas")
-    .captureStream(1)
-    .getVideoTracks()[0];
+  const track = new Track();
   try {
     first.connect();
     first.disconnect();
@@ -40,13 +39,8 @@
       "latest desire crosses packaged WASM initialization",
     );
     const validation = new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        remove();
-        reject(new Error("missing core validation event"));
-      }, 5000);
       const remove = first.subscribeEvents((event) => {
         if (event.type !== "failure" || event.class !== "validation") return;
-        clearTimeout(timer);
         remove();
         resolve();
       });
@@ -92,4 +86,4 @@
     closedDuringInitialization.close();
     track.stop();
   }
-})();
+}

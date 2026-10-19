@@ -155,150 +155,40 @@
         decoderStream.getAudioTracks()[0] === received[0],
       "one private detached hidden muted receiver decoder",
     );
-    const participant = catalog.participant("alice");
-    const a = participant.audio("first");
-    const b = participant.audio("second");
-    let notifications = 0;
-    a.subscribe(() => notifications++);
-    b.subscribe(() => notifications++);
-    const wave = new Float32Array(4096);
-    const spectrum = new Float32Array(2048);
-    a.readWaveform(wave);
-    a.readSpectrum(spectrum);
+    const voice = catalog.participant("alice").audio("first");
+    const spectrum = new Float32Array(1024);
+    voice.readSpectrum(spectrum);
     assert(
-      a.receiving &&
-        !b.receiving &&
-        wave.some((value) => Math.abs(value) > 0.05) &&
-        wave.every((value) => Math.abs(value) <= 1),
-      "normalized decoded waveform",
+      Math.abs((peak(spectrum) * sdkContext.sampleRate) / 2048 - 440) < 45,
+      "SDK analysis exposes the real decoded tone",
     );
-    assert(
-      wave.slice(2048).every((value) => value === 0) &&
-        spectrum.slice(1024).every((value) => value === -Infinity),
-      "oversized silence tails",
-    );
-    assert(
-      Math.abs((peak(spectrum) * sdkContext.sampleRate) / 2048 - 440) < 45 &&
-        Math.max(...spectrum) < 0,
-      "ascending decibel spectrum",
-    );
-    const short = new Float32Array(8);
-    a.readSpectrum(short);
-    a.readSpectrum(spectrum);
-    assert(
-      short.every((value) => value <= 0 && !Number.isNaN(value)) &&
-        Math.abs((peak(spectrum) * sdkContext.sampleRate) / 2048 - 440) < 45,
-      "short buffer preserves FFT resolution and decibel semantics",
-    );
-    a.readWaveform(new Float32Array());
-    a.readSpectrum(new Float32Array());
-    for (let i = 0; i < 100; i++) a.readWaveform(wave);
-    assert(
-      notifications === 0 && output.routes.size === 1,
-      "pull reads do not notify or duplicate output",
-    );
-    // Direct remapping with exactly the same native receiver track.
     snapshot = {
       ...snapshot,
-      mapping: {
-        ...snapshot.mapping,
-        audio: [{ receiverIndex: 0, publicationId: "B" }],
-      },
-      tracks: { B: { media: received[0], kind: "audio" } },
+      tracks: { A: { media: received[1], kind: "audio" } },
     };
     catalog.update(snapshot);
-    a.readWaveform(wave.fill(3));
-    a.readSpectrum(spectrum.fill(3));
-    assert(
-      !a.receiving &&
-        b.receiving &&
-        notifications === 2 &&
-        wave.every((value) => value === 0) &&
-        spectrum.every((value) => value === -Infinity),
-      "old logical handle clears on same-native reassignment",
-    );
-    assert(
-      output.routes.size === 1,
-      "reassignment replaces route instead of duplicating it",
-    );
-    assert(
-      decoders.length === 1 && decoder.srcObject === decoderStream,
-      "same-native logical reassignment does not recreate the decoder",
-    );
-    // Receiver recreation switches decoded tones and cannot retain analyser history.
-    snapshot = {
-      ...snapshot,
-      tracks: { B: { media: received[1], kind: "audio" } },
-    };
-    catalog.update(snapshot);
-    b.readSpectrum(spectrum);
-    assert(
-      !spectrum.some((value) => value > -30),
-      "new analyser has no old tone history",
-    );
     await wait(() => {
-      b.readSpectrum(spectrum);
+      voice.readSpectrum(spectrum);
       return (
         Math.abs((peak(spectrum) * sdkContext.sampleRate) / 2048 - 1320) < 45
       );
-    }, "replacement receiver signal follows B");
-    // The persistent destination probe has its own render/FFT history.
+    }, "replacement receiver reaches SDK analyser");
     await wait(
       () => Math.abs(outputFrequency() - 1320) < 45,
       "replacement receiver reaches SDK output",
-      () =>
-        JSON.stringify({
-          frequency: outputFrequency(),
-          routes: output.routes.size,
-          context: sdkContext.state,
-        }),
     );
     assert(
-      Math.abs(outputFrequency() - 1320) < 45 && output.routes.size === 1,
-      "destination follows replacement",
-    );
-    assert(
-      decoder.srcObject.getAudioTracks().length === 1 &&
-        decoder.srcObject.getAudioTracks()[0] === received[1] &&
-        received[0].readyState === "live",
-      "decoder follows receiver recreation without stopping borrowed tracks",
-    );
-    a.readSpectrum(spectrum.fill(9));
-    assert(
-      spectrum.every((value) => value === -Infinity),
-      "A never observes B's tone",
-    );
-    const nativePlay = decoder.play;
-    let releasePlay;
-    decoder.play = () =>
-      new Promise((resolve) => {
-        releasePlay = resolve;
-      });
-    const pendingRecovery = catalog.resumeAudio().then(
-      () => false,
-      () => true,
+      output.routes.size === 1 &&
+        decoders.length === 1 &&
+        decoder.srcObject === decoderStream &&
+        decoderStream.getAudioTracks().length === 1 &&
+        decoderStream.getAudioTracks()[0] === received[1],
+      "one native decoder and output route follow the fresh receiver",
     );
     catalog.close();
-    releasePlay();
-    assert(
-      await pendingRecovery,
-      "close fences a pending native decoder playback operation",
-    );
-    decoder.play = nativePlay;
-    await wait(() => sdkContext.state === "closed", "closed audio context");
-    assert(
-      output.routes.size === 0 && decoder.paused && decoder.srcObject === null,
-      "terminal audio route and decoder cleanup",
-    );
-    b.readSpectrum(spectrum.fill(4));
-    assert(
-      spectrum.every((value) => value === -Infinity),
-      "terminal analysis is silent",
-    );
-    assert(
-      captured.every((track) => track.readyState === "live") &&
-        received.every((track) => track.readyState === "live"),
-      "audio cleanup preserves borrowed tracks",
+    await wait(
+      () => sdkContext.state === "closed",
+      "closed native audio context",
     );
     return true;
   } finally {

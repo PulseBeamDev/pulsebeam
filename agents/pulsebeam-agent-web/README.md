@@ -258,6 +258,7 @@ Run from a build-ready repository root:
 ./bazel build //:web
 ./bazel test //agents/pulsebeam-agent-web:public_contract //agents/pulsebeam-agent-web:uniffi_types
 ./bazel test //agents/pulsebeam-agent-web:unit_tests //agents/pulsebeam-agent-web:js_unit_tests
+./bazel test //agents/pulsebeam-agent-web:node_runtime_tests
 ./bazel test //agents/pulsebeam-agent-web:web_runtime_browser
 ```
 
@@ -266,17 +267,15 @@ local-handle modules without a DOM. Typed public consumers check package and
 generated contracts. Deterministic native/SFU simulation owns reliable-topic
 loss, restart, ordering and late-subscriber history-floor proof.
 
-The Web browser owner retains packaged WASM/UniFFI loading and lifetime, native
-sender ownership and close fencing, element attachment/retry, non-unit-DPR layout,
-decoded media and trusted-gesture recovery. One Web adapter round trip checks fresh
-delivery after an owned node restart. Compatible cases reuse Chrome with fresh
-documents; autoplay and initialization-failure premises stay isolated. Each owner
-runs at most two sessions and one Tokio worker per case within its four-CPU
-reservation. Live nodes own ephemeral HTTP and RTC listeners.
+Pinned-Node artifact tests instantiate emitted WASM and exercise supported
+lifecycle, sender ownership, cancellation and handle-policy paths. They do not
+negotiate RTC or establish application support for Node.
 
-`//agents/pulsebeam-agent-web:browser` selects the Web, React, and Meet
-browser owners without duplicating their execution. Each owner builds
-only its required fixtures. See the
-[contributor testing contract](../../docs/build.md#testing-contract) for shared
-routing and [editor setup](../../docs/ide.md). `./bazel run //:web_dev` serves the
-repository Web example, not an installed npm consumer.
+The required Web browser owner retains only real-platform proof: shipped SDK
+media through a local SFU, generated native-track handoff, decoded receiver
+replacement, layout/observer/device-pixel plumbing, isolated early/late
+trusted-gesture premises and an adapter round trip after an owned node restart.
+It builds no Meet export or React acceptance fixture. Live nodes own ephemeral
+HTTP and RTC listeners. See the [client QA boundaries](../../docs/build.md#client-qa-boundaries)
+for ownership and fidelity limits, and [editor setup](../../docs/ide.md).
+`./bazel run //:web_dev` serves the repository Web example, not an installed npm consumer.

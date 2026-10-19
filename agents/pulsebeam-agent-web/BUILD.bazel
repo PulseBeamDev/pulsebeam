@@ -10,7 +10,7 @@ load("@bazel_lib//lib:copy_file.bzl", "copy_file")
 load("@bazel_lib//lib:output_files.bzl", "output_files")
 load("@rules_python//python:defs.bzl", "py_binary", "py_test")
 load("@web_npm//agents/pulsebeam-agent-web:typescript-language-server/package_json.bzl", tsls = "bin")
-load("@aspect_rules_js//js:defs.bzl", "js_run_binary", "js_test")
+load("@aspect_rules_js//js:defs.bzl", "js_run_binary", "js_test", "js_library")
 load("@aspect_rules_js//npm:defs.bzl", "npm_package")
 load("@web_npm//:defs.bzl", "npm_link_all_packages")
 load("@web_npm//agents/pulsebeam-agent-web:typescript/package_json.bzl", typescript = "bin")
@@ -22,6 +22,7 @@ exports_files(["Cargo.toml", "package.json", "pnpm-lock.yaml", "pnpm-workspace.y
 
 npm_link_all_packages(name = "node_modules")
 typescript.tsc_binary(name = "tsc")
+js_library(name = "component_sources", srcs = glob(["web/**"]))
 
 # Compile only the DOM-free facade boundary, not the SDK/WASM package.
 js_run_binary(
@@ -239,8 +240,21 @@ npm_package(
 )
 
 copy_to_directory(
+    name = "node_assets",
+    srcs = [":package"],
+    replace_prefixes = {"package/": ""},
+)
+
+js_test(
+    name = "node_runtime_tests",
+    entry_point = "tests/node/runtime.mjs",
+    chdir = package_name(),
+    data = [":node_assets", "package.json"] + glob(["tests/node/**"]),
+)
+
+copy_to_directory(
     name = "browser_assets",
-    srcs = [":package", ":uniffi_proof", ":uniffi-wasm-bindgen", ":node_modules/@ubjs/core/dir"] + glob(["tests/*.html", "tests/contracts/*.js"], exclude = ["tests/contracts/meet-*.js"]),
+    srcs = [":package", ":uniffi_proof", ":uniffi-wasm-bindgen", ":node_modules/@ubjs/core/dir"] + glob(["tests/*.html", "tests/contracts/*.js"]),
     replace_prefixes = {
         "package/": "",
         "uniffi-proof/": "dist/uniffi-proof/",
@@ -253,41 +267,15 @@ browser_test(
     name = "web_runtime_browser",
     source = "tests/browser.rs",
     features = ["browser-tests"],
-    contracts = glob(["tests/contracts/*.js"], exclude = ["tests/contracts/meet-*.js"]),
+    contracts = glob(["tests/contracts/*.js"]),
     assets = [":browser_assets"],
     env = {"PULSEBEAM_WEB_FIXTURE_ROOT": "$(rootpath :browser_assets)"},
     live = True,
 )
 
-browser_test(
-    name = "react_browser",
-    source = "tests/react.rs",
-    contracts = ["//agents/react:browser_observer"],
-    assets = ["//agents/react:browser_fixture"],
-    env = {"PULSEBEAM_REACT_FIXTURE_ROOT": "$(rootpath //agents/react:browser_fixture)"},
-)
-
-copy_to_directory(
-    name = "peer_assets",
-    srcs = [":package", "tests/fixture.html"],
-    replace_prefixes = {"package/": ""},
-)
-
-browser_test(
-    name = "meet_browser",
-    source = "tests/meet.rs",
-    contracts = glob(["tests/contracts/meet-*.js"]),
-    assets = [":peer_assets", "//apps/meet:static_export"],
-    env = {
-        "PULSEBEAM_WEB_FIXTURE_ROOT": "$(rootpath :peer_assets)",
-        "PULSEBEAM_MEET_ROOT": "$(rootpath //apps/meet:static_export)",
-    },
-    live = True,
-)
-
 test_suite(
     name = "browser",
-    tests = [":web_runtime_browser", ":react_browser", ":meet_browser"],
+    tests = [":web_runtime_browser"],
 )
 
 copy_to_directory(
@@ -309,5 +297,5 @@ tsls.typescript_language_server_binary(name = "lsp", args = ["--stdio"], data = 
 prettier.prettier_binary(name = "prettier")
 alias(name = "fix", actual = "//tools:fix")
 
-rustfmt_test(name = "format", targets = [":pulsebeam-agent-web", ":web_runtime_browser", ":react_browser", ":meet_browser"])
+rustfmt_test(name = "format", targets = [":pulsebeam-agent-web", ":web_runtime_browser"])
 rust_clippy_test(name = "clippy", targets = [":pulsebeam-agent-web", ":unit_tests"])

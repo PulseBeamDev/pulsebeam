@@ -23,10 +23,10 @@ for (const file of files("app").concat(
     throw new Error(`PulseBeam boundary violation in ${file}`);
   }
 }
-for (const forbiddenSurface of ["tests", "browser", "playwright.config.ts"]) {
+for (const forbiddenSurface of ["browser", "playwright.config.ts"]) {
   if (existsSync(forbiddenSurface))
     throw new Error(
-      `Meet must not contain automated test surface: ${forbiddenSurface}`,
+      `Meet must not contain a browser automation surface: ${forbiddenSurface}`,
     );
 }
 const manifest = JSON.parse(readFileSync("package.json", "utf8"));

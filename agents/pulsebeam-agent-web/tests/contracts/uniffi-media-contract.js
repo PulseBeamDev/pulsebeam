@@ -6,74 +6,26 @@
     module_or_path:
       "/dist/uniffi-proof/generated/bindings/wasm-bindgen/index_bg.wasm",
   });
-  const web = await import(
+  const { default: web } = await import(
     "/dist/uniffi-proof/generated/bindings/pulsebeam_agent_web.js"
   );
   const registry = await import("/dist/uniffi-proof/web/media-registry.js");
-  web.default.initialize();
-
-  const canvas = document.createElement("canvas");
-  const track = canvas.captureStream(5).getVideoTracks()[0];
-  const trackHandle = registry.lowerMediaStreamTrack(track);
-  const trackIdentity = registry.liftMediaStreamTrack(trackHandle) === track;
-  let foreignRejected = false;
+  web.initialize();
+  const track = document
+    .createElement("canvas")
+    .captureStream(5)
+    .getVideoTracks()[0];
+  const stream = new MediaStream([track]);
   try {
-    registry.liftMediaStream(trackHandle);
-  } catch (error) {
-    foreignRejected = error instanceof ReferenceError;
+    const tracks = web.converters.FfiConverterTypeWebMediaTrack;
+    const streams = web.converters.FfiConverterTypeWebMediaStream;
+    return {
+      trackIdentity: tracks.lift(tracks.lower(track)) === track,
+      streamIdentity: streams.lift(streams.lower(stream)) === stream,
+    };
+  } finally {
+    registry.invalidateMediaForTest(track);
+    registry.invalidateMediaForTest(stream);
+    track.stop();
   }
-  registry.invalidateMediaForTest(track);
-  let staleRejected = false;
-  try {
-    registry.liftMediaStreamTrack(trackHandle);
-  } catch (error) {
-    staleRejected = error instanceof ReferenceError;
-  }
-
-  const releaseCanvas = document.createElement("canvas");
-  const releaseTrack = releaseCanvas.captureStream(5).getVideoTracks()[0];
-  const releaseHandle = registry.lowerMediaStreamTrack(releaseTrack);
-  const retainedBeforeTrackRelease = globalThis.__pulsebeamMediaRegistry
-    .size()
-    .toString();
-  registry.invalidateMediaForTest(releaseTrack);
-  const retainedAfterTrackRelease = globalThis.__pulsebeamMediaRegistry
-    .size()
-    .toString();
-
-  const stream = new MediaStream();
-  const streamHandle = registry.lowerMediaStream(stream);
-  const streamIdentity = registry.liftMediaStream(streamHandle) === stream;
-  const retainedBeforeStreamRelease = globalThis.__pulsebeamMediaRegistry
-    .size()
-    .toString();
-  registry.invalidateMediaForTest(stream);
-  const retainedAfterStreamRelease = globalThis.__pulsebeamMediaRegistry
-    .size()
-    .toString();
-
-  registry.exhaustMediaHandlesForTest();
-  const exhaustedCanvas = document.createElement("canvas");
-  const exhaustedTrack = exhaustedCanvas.captureStream(5).getVideoTracks()[0];
-  let exhaustionRejected = false;
-  try {
-    registry.lowerMediaStreamTrack(exhaustedTrack);
-  } catch (error) {
-    exhaustionRejected = error instanceof RangeError;
-  }
-
-  track.stop();
-  releaseTrack.stop();
-  exhaustedTrack.stop();
-  return {
-    trackIdentity,
-    streamIdentity,
-    foreignRejected,
-    staleRejected,
-    exhaustionRejected,
-    retainedBeforeTrackRelease,
-    retainedAfterTrackRelease,
-    retainedBeforeStreamRelease,
-    retainedAfterStreamRelease,
-  };
 })();

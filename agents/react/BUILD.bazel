@@ -1,4 +1,4 @@
-load("@aspect_rules_js//js:defs.bzl", "js_binary", "js_run_binary", "js_test")
+load("@aspect_rules_js//js:defs.bzl", "js_binary", "js_run_binary", "js_test", "js_library")
 load("@bazel_skylib//rules:build_test.bzl", "build_test")
 load("@aspect_rules_js//npm:defs.bzl", "npm_package")
 load("@bazel_lib//lib:copy_to_directory.bzl", "copy_to_directory")
@@ -10,11 +10,26 @@ load("@react_npm//agents/react:prettier/package_json.bzl", prettier = "bin")
 package(default_visibility = ["//visibility:public"])
 filegroup(name = "workflow_inputs", srcs = glob(["*.md", "docs/**/*.md", "Justfile", "*.json", "*.yaml", "scripts/*.sh"], allow_empty = True))
 exports_files(["package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml"])
-filegroup(name = "browser_observer", srcs = ["tests/browser/observe.js"])
-test_suite(name = "browser", tests = ["//agents/pulsebeam-agent-web:react_browser"])
 
 npm_link_all_packages(name = "node_modules")
 typescript.tsc_binary(name = "tsc")
+
+js_library(name = "component_support", srcs = glob(["tests/component/**"]))
+js_library(name = "component_sources", srcs = glob(["src/**"]))
+
+js_test(
+    name = "component_tests",
+    entry_point = "tests/component/run.mjs",
+    args = ["tests/component/lifecycle.tsx"],
+    chdir = package_name(),
+    data = [
+        ":component_support", ":component_sources", "package.json",
+        ":node_modules/react", ":node_modules/react-dom",
+        ":node_modules/happy-dom", ":node_modules/esbuild",
+        "//agents/pulsebeam-agent-web:component_sources",
+    ],
+)
+
 
 # Package/type gates check the public SDK types. This target emits only the
 # pure decision module, without assembling the SDK for a type-only import.
@@ -85,39 +100,17 @@ typescript.tsc_test(
     data = [":node_modules"] + glob(["src/**", "tests/contracts/**", "tsconfig*.json"]),
 )
 
-typescript.tsc_test(
-    name = "browser_types",
-    args = ["-p", "tsconfig.browser.json"],
-    chdir = package_name(),
-    data = [":node_modules"] + glob(["src/**", "tests/browser/**", "tsconfig*.json"]),
-)
-
 copy_to_directory(
     name = "format_sources",
-    srcs = glob(["src/**", "tests/browser/**", "tests/contracts/**", "tests/*.mjs", "*.json"]) + ["//agents/react/tests/consumer:sources", "//docs:react_example"],
+    srcs = glob(["src/**", "tests/component/**", "tests/contracts/**", "tests/*.mjs", "*.json"]) + ["//agents/react/tests/consumer:sources", "//docs:react_example"],
 )
 
 py_test(
     name = "format",
     srcs = ["//tools:check-js-format.py"],
     main = "//tools:check-js-format.py",
-    args = ["--formatter", "$(rootpath :prettier)", "--source", "$(rootpath :format_sources)", "--", "src/**/*.ts", "tests/browser/{*.mjs,*.tsx,observe.js}", "docs/react/*.tsx", "tests/contracts/**/*.ts", "tests/consumer/src/**/*.ts", "tests/*.mjs", "*.json"],
+    args = ["--formatter", "$(rootpath :prettier)", "--source", "$(rootpath :format_sources)", "--", "src/**/*.ts", "tests/component/**/*.{mjs,ts,tsx}", "docs/react/*.tsx", "tests/contracts/**/*.ts", "tests/consumer/src/**/*.ts", "tests/*.mjs", "*.json"],
     data = [":prettier", ":format_sources"],
-)
-
-js_binary(
-    name = "browser_builder",
-    entry_point = "tests/browser/build.mjs",
-    data = [":node_modules"],
-)
-
-js_run_binary(
-    name = "browser_fixture",
-    tool = ":browser_builder",
-    srcs = [":package", ":node_modules", "//agents/pulsebeam-agent-web:package"] + glob(["src/**", "tests/browser/**"], exclude = ["tests/browser/dist/**"]),
-    args = ["tests/browser/dist", "../pulsebeam-agent-web/package/dist"],
-    chdir = package_name(),
-    out_dirs = ["tests/browser/dist"],
 )
 
 copy_to_directory(
@@ -135,7 +128,7 @@ typescript.tsc_test(
 
 js_binary(
     name = "quickstart_builder",
-    entry_point = "tests/browser/build-quickstart.mjs",
+    entry_point = "tests/build-quickstart.mjs",
     data = [":node_modules"],
 )
 
@@ -160,5 +153,5 @@ build_test(name = "quickstart_build", targets = [":quickstart"])
 
 test_suite(
     name = "fast",
-    tests = [":unit_tests", ":contracts", ":browser_types", ":packed_contract", ":quickstart_types", ":quickstart_build", "//agents/react/tests/consumer:contract"],
+    tests = [":unit_tests", ":component_tests", ":contracts", ":packed_contract", ":quickstart_types", ":quickstart_build", "//agents/react/tests/consumer:contract"],
 )

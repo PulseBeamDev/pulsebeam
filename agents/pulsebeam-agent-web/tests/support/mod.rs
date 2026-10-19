@@ -62,12 +62,6 @@ pub struct StaticServer {
 )]
 impl StaticServer {
     pub async fn start(root: impl Into<PathBuf>) -> io::Result<Self> {
-        Self::start_with_wasm_failure(root, false).await
-    }
-    pub async fn start_with_wasm_failure(
-        root: impl Into<PathBuf>,
-        fail_wasm: bool,
-    ) -> io::Result<Self> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let address = listener.local_addr()?.to_string();
         let root = root.into();
@@ -84,7 +78,7 @@ impl StaticServer {
                         let request_count = Arc::clone(&request_count);
                         let relays = Arc::clone(&relays);
                         connections.spawn(async move {
-                            let _ = serve(stream, &root, fail_wasm, &request_count, &relays).await;
+                            let _ = serve(stream, &root, &request_count, &relays).await;
                         });
                     }
                     _ = connections.join_next(), if !connections.is_empty() => {}
@@ -96,10 +90,6 @@ impl StaticServer {
             task,
             wasm_requests,
         })
-    }
-    pub async fn shutdown(mut self) {
-        self.task.abort();
-        let _ = (&mut self.task).await;
     }
     pub fn url(&self, path: &str) -> String {
         format!("http://{}/{path}", self.address)
@@ -233,7 +223,6 @@ fn remote_value(value: &serde_json::Value) -> serde_json::Value {
 async fn serve(
     mut stream: TcpStream,
     root: &Path,
-    fail_wasm: bool,
     wasm_requests: &AtomicUsize,
     relays: &Mutex<Relays>,
 ) -> io::Result<()> {
@@ -248,16 +237,6 @@ async fn serve(
     let target = parts.next().unwrap_or_default();
     if target.ends_with(".wasm") {
         wasm_requests.fetch_add(1, Ordering::Relaxed);
-        if fail_wasm {
-            return respond(
-                &mut stream,
-                503,
-                "text/plain",
-                b"test wasm unavailable",
-                method,
-            )
-            .await;
-        }
     }
     if method != "GET" && method != "HEAD" {
         if target.contains("/rooms/sender-stats/") {

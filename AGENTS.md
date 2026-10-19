@@ -27,4 +27,6 @@
 * Deterministic end-to-end simulation is the default for system behavior: exercise real production logic with virtual time and make it run very fast. Slow simulation is an optimization problem, not an excuse to move it to `slow`, reduce meaningful coverage, or replace it with mocks.
 * Treat browser automation as expensive and flakiness-prone. Keep it exceptional, narrowly scoped, and mostly smoke tests for behavior only a real browser can prove. Never put behavioral/property matrices there when simulation can faithfully cover them.
 
+Use the [client QA boundaries](docs/build.md#client-qa-boundaries) to place SDK and Meet tests.
+
 Follow [the contributor testing contract](docs/build.md#testing-contract) for cost justification, proof selection, gate routing, isolation, and evidence reuse. Executable owner targets remain authoritative.

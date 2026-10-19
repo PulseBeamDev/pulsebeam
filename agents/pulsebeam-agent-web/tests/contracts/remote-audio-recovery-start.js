@@ -1,9 +1,6 @@
 (async () => {
   const { RemoteCatalog } = await import("/dist/remote-catalog.js");
-  const assert = (condition, label) => {
-    if (!condition) throw new Error(label);
-  };
-  const RealContext = window.AudioContext;
+  const RealContext = AudioContext;
   const contexts = [];
   window.AudioContext = class extends RealContext {
     constructor(...args) {
@@ -36,25 +33,14 @@
     },
     tracks: { A: { media: track, kind: "audio" } },
   };
-  const agent = { getSnapshot: () => snapshot, subscribe: () => () => {} };
-  const blocked = new RemoteCatalog(agent, 0, () => {});
-  const before = new RemoteCatalog(agent, 0, () => {});
-  const warnings = [];
-  const warn = console.warn;
-  console.warn = (...args) => warnings.push(args);
-  blocked.update(snapshot);
-  const voice = blocked.participant("alice").audio("voice");
-  const wave = new Float32Array([1, 2]);
-  voice.readWaveform(wave);
-  assert(
-    contexts[0].state === "suspended" &&
-      voice.receiving &&
-      wave.every((value) => value === 0),
-    "blocked playback does not change receiving",
+  const catalog = new RemoteCatalog(
+    { getSnapshot: () => snapshot, subscribe: () => () => {} },
+    0,
+    () => {},
   );
-  const button = document.createElement("button");
-  button.id = "resume-audio";
-  button.textContent = "Resume audio";
+  catalog.update(snapshot);
+  if (contexts[0].state !== "suspended")
+    throw new Error("late-gesture premise was already activated");
   const canvas = document.createElement("canvas");
   canvas.width = canvas.height = 16;
   const draw = canvas.getContext("2d");
@@ -66,71 +52,52 @@
   const videoTrack = canvas.captureStream(10).getVideoTracks()[0];
   const video = document.createElement("video");
   video.playsInline = true;
-  video.style.cssText = "width:160px;height:120px";
   document.body.append(video);
-  let retryVideo;
+  let retry;
   const attachment = pulsebeam.attachRemoteMedia(
     {
-      getSnapshot: () => ({
-        tracks: { video: { media: videoTrack } },
-      }),
+      getSnapshot: () => ({ tracks: { video: { media: videoTrack } } }),
       subscribe: () => () => {},
     },
     video,
     {
       publicationIds: ["video"],
       autoPlay: false,
-      onPlaybackBlocked: (_, retry) => {
-        retryVideo = retry;
+      onPlaybackBlocked: (_, next) => {
+        retry = next;
       },
     },
   );
-  // The attachment selects video only. A native audio track makes the browser
-  // autoplay premise audible, so rejection and retry execute native play().
   video.srcObject.addTrack(track);
   await attachment.retryPlayback();
-  const deadline = Date.now() + 5000;
-  while (!retryVideo) {
-    if (Date.now() > deadline)
-      throw new Error("native video was not blocked before trusted gesture");
-    await new Promise((resolve) => setTimeout(resolve, 10));
-  }
-  assert(video.paused, "native video autoplay is blocked");
+  if (!retry || !video.paused)
+    throw new Error(
+      "audible attachment was not blocked before trusted gesture",
+    );
   const state = {
+    catalog,
+    source,
+    track,
     video,
     videoTrack,
     painting,
     attachment,
-    blocked,
-    before,
-    contexts,
-    source,
-    track,
-    voice,
-    warnings,
-    warn,
     RealContext,
-    button,
+    contexts,
     ready: false,
-    failure: "",
+    error: "",
   };
   window.__audioRecovery = state;
+  const button = document.createElement("button");
+  button.id = "resume-audio";
+  button.textContent = "Resume audio";
   button.onclick = () => {
-    // Both resume calls execute directly in this trusted gesture, including the
-    // Agent that has no media, lookup, or attachment yet.
-    const unlockBefore = before.resumeAudio();
-    const unlockBlocked = blocked.resumeAudio();
-    void Promise.all([
-      unlockBefore,
-      unlockBlocked,
-      source.resume(),
-      retryVideo(),
-    ]).then(
+    void Promise.all([catalog.resumeAudio(), source.resume(), retry()]).then(
       () => {
         state.ready = true;
       },
       (error) => {
-        state.failure = String(error);
+        state.error = String(error);
       },
     );
   };
