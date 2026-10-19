@@ -16,7 +16,7 @@ rust_test(
     crate_name = "pulsebeam_simulator",
     crate_root = "src/main.rs",
     srcs = glob(["src/**/*.rs"]),
-    compile_data = ["src/tests/properties.regressions", "//:Cargo.lock", "//tools:patches/turmoil-bounded-exploration.patch", "//tools:patches/getrandom-simulator-libc.patch"] + glob(["src/tests/exploration/fixtures/*"]),
+    compile_data = ["src/tests/properties.regressions"],
     edition = crate_edition(),
     crate_features = ["parking_lot"],
     lint_config = ":lints",
@@ -49,7 +49,6 @@ platform(
         "--@rules_rust//rust/settings:per_crate_rustc_flag=@-Coverflow-checks=yes",
         "--@rules_rust//rust/settings:per_crate_rustc_flag=@-Cdebuginfo=1",
         "--@rules_rust//rust/settings:per_crate_rustc_flag=@-Cstrip=none",
-        "--@rules_rust//rust/settings:per_crate_rustc_flag=@--cfg=pulsebeam_sim",
     ],
 )
 

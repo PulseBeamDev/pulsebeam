@@ -173,8 +173,9 @@ checks or positive per-recipient origin evidence.
 ## Internal fault coverage
 
 `StallController`, `SendToWrongShard` and `FailNextMaterialization` invoke real
-simulation-only production seams. The [bounded topic model](simulation.md#exhaust-bounded-topic-executions)
-records their reachable boundary, actual consumption and subsequent recovery.
+simulation-only production seams. Named scenarios in
+`src/tests/connectivity.rs` check their consumption and media recovery. These are
+authored regression cases, not exhaustive runtime-schedule exploration.
 The generic runtime `buggify!` primitive has no production call sites and does
 not establish baseline or exhaustive fault coverage.
 

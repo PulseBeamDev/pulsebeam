@@ -232,6 +232,7 @@ fn controller_stall_keeps_established_media_alive() {
                 min_bytes: 1,
             },
         ]);
+    assert_eq!(pulsebeam::sim_metrics::controller_stalls_consumed(), 1);
 }
 
 /// A datagram delivered to a shard that does not own its route reaches the
@@ -267,6 +268,7 @@ fn wrong_owner_forwards_and_media_continues() {
                 min_bytes: 1,
             },
         ]);
+    assert_eq!(pulsebeam_runtime::net::wrong_owner_injections_consumed(), 1);
 }
 
 /// Cross-shard forwarding is a bootstrap cost, not a steady-state one.
@@ -337,6 +339,23 @@ fn failed_materialization_does_not_connect_the_participant() {
                 description: "failed materialization leaves no participant key behind",
                 name: "materialization_orphan",
                 exact: 0,
+            },
+            Step::Reconnect {
+                description: "Retry admission after the one-shot materialization failure",
+                participant: "subscriber",
+            },
+            Step::Run {
+                description: "Establish a fresh subscriber after the failed admission",
+                duration: Duration::from_secs(5),
+            },
+            Step::CheckConnected {
+                description: "Fresh admission succeeds after the failure",
+                participant: "subscriber",
+            },
+            Step::CheckRxBytesInterval {
+                description: "Fresh media reaches the recovered subscriber",
+                participant: "subscriber",
+                min_bytes: 1,
             },
         ]);
 }

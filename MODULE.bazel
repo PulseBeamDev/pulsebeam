@@ -161,28 +161,6 @@ crate.annotation(
 # Cargo's custom tokio_unstable cfg is applied by .bazelrc, but crate-universe
 # does not include cfg-gated edges in its generated platform selects.
 crate.annotation(crate = "tokio", deps = ["@crates//tracing"], repositories = ["crates"])
-# Native str0m and simulator configuration must share dimpl's provider identity.
-# Both graphs pin the same package; keep feature resolution in the owner graph.
-crate.annotation(
-    crate = "dimpl",
-    version = "=0.7.2",
-    override_target_lib = "@crates//:dimpl",
-    repositories = ["str0m_native"],
-)
-crate.annotation(
-    crate = "getrandom",
-    version = "=0.2.17",
-    repositories = ["crates"],
-    patches = ["//tools:patches/getrandom-simulator-libc.patch"],
-    patch_args = ["-p1"],
-    rustc_flags = ["--check-cfg=cfg(pulsebeam_sim)"],
-)
-crate.annotation(
-    crate = "turmoil",
-    repositories = ["crates"],
-    patches = ["//tools:patches/turmoil-bounded-exploration.patch"],
-    patch_args = ["-p1"],
-)
 # Upstream emits an absolute build-script sandbox path into its RustEmbed derive.
 # Resolve OUT_DIR during compilation using rust-embed's maintained interpolation.
 crate.annotation(

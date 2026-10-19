@@ -113,80 +113,20 @@ corpus or a focused authored case. The isolated persistence proof exercises both
 committed input under a current strategy and a newly minimized artifact in a
 fresh process with no novel cases.
 
-## Exhaust bounded topic executions
+## Check ordered-topic reconfiguration
 
-Run the required finite topic model independently of seeded sweeps:
+The data-channel scenarios cover publisher-first and subscriber-first declarations
+on already-connected native agents, then exact ordered delivery before and after
+publisher rejoin. `LocalNodeSim::without_initial_topics()` keeps declarations out
+of the initial offer so these cases exercise real transport reconfiguration.
+Both intended receivers must receive the complete sequence; the publisher and
+unsubscribed bystander must receive none. These signaling/placement cases use a
+clean fiber profile; the separate reliable-data impairment case retains seeded
+loss and feedback coverage.
 
-```sh
-./bazel run //:replay -- --exact --filter tests::exploration::bounded_cross_shard
-```
-
-This case belongs to the simulator's required `fast` owner. It re-executes exact
-decision prefixes in fresh isolated processes until the declared tree is fully
-traversed, then strictly replays a materialized leaf in another fresh process.
-There is no state-hash pruning or opaque runtime snapshotting.
-
-The model uses real native agents and SFU control/shard logic: two shards, one
-publisher, two intended receivers and one unsubscribed bystander. A observes all
-four connected with no topic declarations. After the declaration batch reaches
-readiness, both receivers must observe two distinct origin-tagged 4,096-byte
-ordered payloads. The publisher then disconnects and rejoins; after readiness,
-both receivers must observe exactly the two old and two new payloads in order.
-The publisher and bystander must observe none. Independent desired-state and
-coherent owner oracles check retirement, failed-materialization atomicity,
-incarnation fencing, routes and positive cross-shard delivery.
-
-| Choice boundary | Finite alternatives |
-| --- | --- |
-| Declaration submissions, without settling between them | All six orders of one publication and two subscriptions |
-| First host quantum after declarations and after rejoin | Canonical or reverse running-host order, with pending native protocol work |
-| First eligible co-deliverable publisher UDP pair | Forward or reverse delivery |
-| First eligible publisher application datagram | Nominal or an additional 3,100 ms delay |
-| One named declaration/rejoin fault | None, one UDP loss, one UDP duplicate, 100 ms controller stall, wrong-owner steering, or failed materialization followed by an explicit fresh admission attempt |
-
-Eligibility selects live DTLS application traffic, not keepalives. The delayed
-original must remain queued while the prefix is delivered by retransmission,
-then be released before completion. The delay crosses the pinned SCTP DATA
-initial T3-RTX boundary of 3,000 ms. The quantum is 1 ms and A-to-B execution has
-a single 60-second virtual deadline. Only one loss, duplicate or internal failure
-is admitted per path; host order and finite latency are not additional faults.
-No permanent outage, additional authored churn, arbitrary byte corruption, TCP
-byte reordering or internal Tokio task-schedule enumeration is claimed.
-
-Outside these opportunities the policy is canonical host/network order on the
-seeded clean fiber profile. Protocol randomness stays fixed by the recorded seed
-and test identity. Native topic declarations can reconfigure their transport as
-part of normal agent behavior. Pre-A setup schedules are outside the theorem.
-The simulator-only bounded case selects real RustCrypto DTLS operations with a
-committed, deliberately insecure test certificate/key and seeded entropy. This
-avoids AWS-LC hardware entropy bypassing the simulator's libc shim; it is not a
-cryptographic security test. Production crypto and no-hook Turmoil scheduling
-retain their default behavior.
-
-The printed report records materialized inputs and bounds, completed branches,
-choice coverage, disabled opportunities, consumed faults, pruning and measured
-host cost. Every required alternative must actually be exercised. No branch is
-pruned in this model. `counterexample`, `incomplete`, `invalid-model`,
-`replay-divergence` and `infrastructure-failure` are non-success outcomes, not
-skips or automatically passing retries. The default operational cutoffs are
-4,096 paths and 600 host seconds. `--bounded-max-paths` and
-`--bounded-max-seconds` change those cutoffs, not the model bounds; exhaustion
-before completion reports `incomplete`.
-
-Replay the retained artifact with the same binary identity:
-
-```sh
-./bazel run //:replay -- --bounded-replay /absolute/path/to/branch-0000.json
-```
-
-Artifacts contain model/build/dependency/fixture identity, materialized payloads
-and seeds, ordered decision sites and enabled sets, selections, consumed faults,
-virtual progress and property observations. Changed identity, inputs, enabled
-sets, missing/extra/out-of-order decisions, unfired faults or changed semantic
-observations are rejected. Cross-version artifact compatibility is not promised.
-Seeded case replay, advisory seed sweeps and proptest regression files keep
-their existing meanings. A seed sweep selects seeded cases only, not repeated
-samples of this fixed bounded model.
+Use ordinary case-and-seed replay through `//:replay`. These scenarios use stock
+Turmoil and crypto, not exhaustive runtime-schedule exploration or byte-for-byte
+cryptographic replay. Named internal-fault scenarios remain in `connectivity.rs`.
 
 ## Keep recovery and fidelity claims honest
 

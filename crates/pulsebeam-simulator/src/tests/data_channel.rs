@@ -1,4 +1,4 @@
-use super::common::{LocalNodeSim, Participant, Room, Step};
+use super::common::{LinkProfile, LocalNodeSim, Participant, Room, Step};
 use std::time::Duration;
 
 /// Validates end-to-end data-channel pub/sub forwarding through the SFU.
@@ -523,6 +523,156 @@ fn ordered_data_topic_survives_same_identity_connection_recovery() {
                 expected: &[b"before", b"after"],
             },
         ]);
+}
+
+#[test]
+fn ordered_topic_reconfiguration_preserves_cross_shard_delivery() {
+    ordered_topic_reconfiguration(true);
+}
+
+#[test]
+fn ordered_topic_subscribers_can_precede_publisher() {
+    ordered_topic_reconfiguration(false);
+}
+
+fn ordered_topic_reconfiguration(publisher_first: bool) {
+    const PREFIX: &[&[u8]] = &[b"pub/v1/first", b"pub/v1/second"];
+    const COMPLETE: &[&[u8]] = &[
+        b"pub/v1/first",
+        b"pub/v1/second",
+        b"pub/v2/first",
+        b"pub/v2/second",
+    ];
+    let mut declarations = vec![
+        Step::DeclareOrderedPublisher {
+            description: "Declare the publisher after initial connection",
+            participant: "pub",
+            topic: "state",
+        },
+        Step::DeclareOrderedSubscriber {
+            description: "First receiver declares the ordered topic",
+            participant: "sub_a",
+            topic: "state",
+        },
+        Step::DeclareOrderedSubscriber {
+            description: "Second receiver declares the ordered topic",
+            participant: "sub_b",
+            topic: "state",
+        },
+    ];
+    if !publisher_first {
+        declarations.rotate_left(1);
+    }
+    let mut plan = vec![Step::Run {
+        description: "Connect all four agents without topic declarations",
+        duration: Duration::from_secs(2),
+    }];
+    for (index, declaration) in declarations.into_iter().enumerate() {
+        plan.push(declaration);
+        if index == if publisher_first { 0 } else { 1 } {
+            plan.push(Step::Run {
+                description: "Settle the first declarations before submitting the other side",
+                duration: Duration::from_secs(1),
+            });
+        }
+    }
+    plan.push(Step::Run {
+        description: "Open the ordered paths after transport reconfiguration",
+        duration: Duration::from_secs(2),
+    });
+    for data in PREFIX {
+        plan.push(Step::PublishOrdered {
+            description: "Send the original publisher's ordered prefix",
+            participant: "pub",
+            topic: "state",
+            data,
+        });
+    }
+    for participant in ["sub_a", "sub_b"] {
+        plan.push(Step::WaitForDataSequence {
+            participant,
+            topic: "state",
+            expected: PREFIX,
+        });
+    }
+    plan.push(Step::CheckCrossShardMedia {
+        description: "Data-only agents delivered the ordered prefix across shards",
+        min_frames: 1,
+    });
+    plan.extend([
+        Step::Disconnect {
+            description: "Retire the original publisher connection",
+            participant: "pub",
+        },
+        Step::Run {
+            description: "Drain the original publisher's routes",
+            duration: Duration::from_secs(1),
+        },
+        Step::Reconnect {
+            description: "Rejoin the publisher without preloaded topics",
+            participant: "pub",
+        },
+        Step::Run {
+            description: "Establish the fresh publisher connection",
+            duration: Duration::from_secs(2),
+        },
+        Step::DeclareOrderedPublisher {
+            description: "Declare the ordered publisher on the new connection",
+            participant: "pub",
+            topic: "state",
+        },
+        Step::Run {
+            description: "Reinstall the intended receiver routes",
+            duration: Duration::from_secs(2),
+        },
+    ]);
+    for data in &COMPLETE[2..] {
+        plan.push(Step::PublishOrdered {
+            description: "Send fresh ordered data after publisher rejoin",
+            participant: "pub",
+            topic: "state",
+            data,
+        });
+    }
+    for participant in ["sub_a", "sub_b"] {
+        plan.push(Step::WaitForDataSequence {
+            participant,
+            topic: "state",
+            expected: COMPLETE,
+        });
+    }
+    plan.push(Step::Run {
+        description: "Drain late traffic before checking exact delivery and isolation",
+        duration: Duration::from_secs(1),
+    });
+    for participant in ["sub_a", "sub_b"] {
+        plan.push(Step::CheckDataSequence {
+            description: "Both publisher generations arrived exactly once and in order",
+            participant,
+            topic: "state",
+            expected: COMPLETE,
+        });
+    }
+    for participant in ["pub", "bystander"] {
+        plan.push(Step::CheckDataCount {
+            description: "Unsubscribed participants receive no ordered payloads",
+            participant,
+            topic: "state",
+            expected: 0,
+        });
+    }
+    LocalNodeSim::new()
+        .without_initial_topics()
+        .with_shards(2)
+        .with_link(LinkProfile::fiber())
+        .with_room(
+            Room::new("ordered-reconfiguration")
+                .with_participant(Participant::data_participant("pub"))
+                .with_participant(Participant::data_participant("sub_a"))
+                .with_participant(Participant::data_participant("sub_b"))
+                .with_participant(Participant::data_participant("bystander")),
+        )
+        .run(plan);
 }
 
 #[test]
