@@ -1,5 +1,6 @@
 use super::packet::TrackPacket;
 use super::reverse::ReversePacket;
+#[cfg(test)]
 use crate::entity::TrackId;
 use crate::keys::TrackHandle;
 use crate::track::{SelectionPolicy, Track, TrackMeta, TrackSelector};
@@ -14,7 +15,7 @@ pub(crate) trait ParticipantSink {
     fn activate_track(&mut self, track: TrackMeta);
     fn deactivate_track(&mut self, track: TrackMeta);
     fn publish_track(&mut self, track: Track);
-    fn unpublish_track(&mut self, track_id: TrackId);
+    fn unpublish_track(&mut self, meta: TrackMeta);
     fn subscribe_tracks(&mut self, selector: TrackSelector, selection: SelectionPolicy);
     fn unsubscribe_tracks(&mut self, selector: TrackSelector);
     fn request_reverse(&mut self, stream: TrackHandle, packet: ReversePacket);
@@ -69,8 +70,8 @@ pub mod test_utils {
             self.publish_track_calls.push(track.id());
         }
 
-        fn unpublish_track(&mut self, track_id: TrackId) {
-            self.unpublish_track_calls.push(track_id);
+        fn unpublish_track(&mut self, meta: TrackMeta) {
+            self.unpublish_track_calls.push(meta.id);
         }
 
         fn subscribe_tracks(&mut self, _selector: TrackSelector, _selection: SelectionPolicy) {}

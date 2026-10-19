@@ -1,7 +1,7 @@
 use super::*;
 use crate::{entity, track};
 
-fn publisher() -> (Upstream, entity::ParticipantId) {
+fn publisher() -> (Upstream, entity::ParticipantId, entity::ConnectionId) {
     let room_id =
         entity::RoomId::from_external(&entity::RoomExternalId::new("binding-room").unwrap());
     let participant_id = entity::ParticipantId::new();
@@ -9,19 +9,26 @@ fn publisher() -> (Upstream, entity::ParticipantId) {
         room_id,
         participant_id,
     };
-    (Upstream::new(ctx), participant_id)
+    let connection = entity::ConnectionId::new();
+    (Upstream::new(ctx, connection), participant_id, connection)
 }
 
-fn add_audio(upstream: &mut Upstream, participant: entity::ParticipantId, index: u32, mid: &str) {
+fn add_audio(
+    upstream: &mut Upstream,
+    participant: entity::ParticipantId,
+    connection: entity::ConnectionId,
+    index: u32,
+    mid: &str,
+) {
     let mid = Mid::from(mid);
-    let (track, descriptor) = track::test_utils::make_audio_track(participant, mid);
+    let (track, descriptor) = track::test_utils::make_audio_track(participant, connection, mid);
     assert!(upstream.add_published_track(index, mid, track, descriptor));
 }
 
 #[test]
 fn sender_labels_replace_provisional_mid_identity_once() {
-    let (mut upstream, participant) = publisher();
-    add_audio(&mut upstream, participant, 0, "offer-mid");
+    let (mut upstream, participant, connection) = publisher();
+    add_audio(&mut upstream, participant, connection, 0, "offer-mid");
     let provisional = upstream.track_for_sender_index(0).unwrap();
     let bound = upstream
         .bind_sender_label(0, TrackKind::Audio, "microphone")
@@ -29,7 +36,7 @@ fn sender_labels_replace_provisional_mid_identity_once() {
     assert_ne!(bound, provisional);
     assert_eq!(
         bound,
-        participant.derive_track_id(TrackKind::Audio, "microphone")
+        connection.derive_track_id(TrackKind::Audio, "microphone")
     );
     assert_eq!(upstream.track_for_sender_index(0), Some(bound));
     assert_eq!(
@@ -58,9 +65,10 @@ fn sender_labels_replace_provisional_mid_identity_once() {
 
 #[test]
 fn sender_label_rebinds_video_layer_identity() {
-    let (mut upstream, participant) = publisher();
+    let (mut upstream, participant, connection) = publisher();
     let mid = Mid::from("video-mid");
-    let (track, descriptor) = track::test_utils::make_video_track(participant, mid, Vec::new());
+    let (track, descriptor) =
+        track::test_utils::make_video_track(participant, connection, mid, Vec::new());
     assert!(upstream.add_published_track(0, mid, track, descriptor));
     let bound = upstream
         .bind_sender_label(0, TrackKind::Video, "camera")
@@ -77,14 +85,15 @@ fn sender_label_rebinds_video_layer_identity() {
 
 #[test]
 fn sender_label_batch_rebinds_video_layer_identity() {
-    let (mut upstream, participant) = publisher();
+    let (mut upstream, participant, connection) = publisher();
     let mid = Mid::from("video-mid");
-    let (track, descriptor) = track::test_utils::make_video_track(participant, mid, Vec::new());
+    let (track, descriptor) =
+        track::test_utils::make_video_track(participant, connection, mid, Vec::new());
     assert!(upstream.add_published_track(0, mid, track, descriptor));
     upstream
         .bind_sender_labels_atomically(&[(0, TrackKind::Video, "camera")])
         .unwrap();
-    let bound = participant.derive_track_id(TrackKind::Video, "camera");
+    let bound = connection.derive_track_id(TrackKind::Video, "camera");
     let (descriptor, _) = upstream.announce_state_mut(mid, true).unwrap();
     assert_eq!(descriptor.id(), bound);
     assert!(
@@ -97,10 +106,11 @@ fn sender_label_batch_rebinds_video_layer_identity() {
 
 #[test]
 fn sender_label_batch_does_not_commit_audio_when_video_rejects() {
-    let (mut upstream, participant) = publisher();
-    add_audio(&mut upstream, participant, 0, "a");
+    let (mut upstream, participant, connection) = publisher();
+    add_audio(&mut upstream, participant, connection, 0, "a");
     let mid = Mid::from("v");
-    let (track, descriptor) = track::test_utils::make_video_track(participant, mid, Vec::new());
+    let (track, descriptor) =
+        track::test_utils::make_video_track(participant, connection, mid, Vec::new());
     assert!(upstream.add_published_track(1, mid, track, descriptor));
     let audio_before = upstream.track_for_sender_index(0);
     upstream.announce_state_mut(mid, true).unwrap();
@@ -116,9 +126,9 @@ fn sender_label_batch_does_not_commit_audio_when_video_rejects() {
 
 #[test]
 fn sender_label_batch_rejects_all_on_late_failure_and_permits_identity_swap() {
-    let (mut upstream, participant) = publisher();
-    add_audio(&mut upstream, participant, 0, "a");
-    add_audio(&mut upstream, participant, 1, "b");
+    let (mut upstream, participant, connection) = publisher();
+    add_audio(&mut upstream, participant, connection, 0, "a");
+    add_audio(&mut upstream, participant, connection, 1, "b");
     let provisional_a = upstream.track_for_sender_index(0);
     let provisional_b = upstream.track_for_sender_index(1);
     assert_eq!(
@@ -139,9 +149,9 @@ fn sender_label_batch_rejects_all_on_late_failure_and_permits_identity_swap() {
 
 #[test]
 fn duplicate_label_and_published_provisional_identity_are_rejected() {
-    let (mut upstream, participant) = publisher();
-    add_audio(&mut upstream, participant, 0, "a");
-    add_audio(&mut upstream, participant, 1, "b");
+    let (mut upstream, participant, connection) = publisher();
+    add_audio(&mut upstream, participant, connection, 0, "a");
+    add_audio(&mut upstream, participant, connection, 1, "b");
     assert!(
         upstream
             .bind_sender_label(0, TrackKind::Audio, "same")

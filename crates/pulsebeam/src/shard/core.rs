@@ -596,14 +596,26 @@ impl ShardExecution {
             processed = processed.saturating_add(1);
             match event {
                 ParticipantEvent::Binding(ev) => match ev {
-                    ParticipantBindingEvent::Activated { track, subscriber } => self
-                        .pipeline
-                        .push_shard_event(ShardEvent::TrackSubscribed { subscriber, track }),
+                    ParticipantBindingEvent::Activated {
+                        track,
+                        subscriber,
+                        connection_id,
+                    } => self.pipeline.push_shard_event(ShardEvent::TrackSubscribed {
+                        subscriber,
+                        connection_id,
+                        track,
+                    }),
                     ParticipantBindingEvent::Deactivated {
-                        track, subscriber, ..
+                        track,
+                        subscriber,
+                        connection_id,
                     } => self
                         .pipeline
-                        .push_shard_event(ShardEvent::TrackUnsubscribed { subscriber, track }),
+                        .push_shard_event(ShardEvent::TrackUnsubscribed {
+                            subscriber,
+                            connection_id,
+                            track,
+                        }),
                 },
                 ParticipantEvent::Lifecycle(ParticipantLifecycleEvent::Connected {
                     participant_key,
@@ -1020,7 +1032,7 @@ mod wrong_owner_tests {
             WallAnchor::new(std::time::SystemTime::UNIX_EPOCH, Instant::now()),
             update_rx,
         );
-        let track_id = crate::entity::ParticipantId::new()
+        let track_id = crate::entity::ConnectionId::new()
             .derive_track_id(crate::entity::TrackKind::Audio, "consistent");
         let route = crate::route::NodeRouteAddress::new(crate::route::RouteId::new(shard, 7), 1);
 
@@ -1105,7 +1117,8 @@ mod wrong_owner_tests {
             };
             assert!(materialize(&mut core, old_address, config()).await.unwrap());
             let old_handle = core.execution.registry.resolve(&participant).unwrap();
-            let track_id = participant.derive_track_id(crate::entity::TrackKind::Audio, "mic");
+            let track_id = crate::entity::ConnectionId::new()
+                .derive_track_id(crate::entity::TrackKind::Audio, "mic");
             writer.stage(
                 1,
                 ShardUpdateOp::InsertTrackRuntime {
@@ -1243,10 +1256,10 @@ mod wrong_owner_tests {
             update_rx,
         );
         let route = crate::route::NodeRouteAddress::new(crate::route::RouteId::new(shard, 8), 1);
-        let participant = crate::entity::ParticipantId::new();
+        let connection = crate::entity::ConnectionId::new();
         let track_ids = (0..=crate::shard::worker::SHARD_PLAN_OPERATION_BUDGET)
             .map(|index| {
-                participant.derive_track_id(crate::entity::TrackKind::Audio, &index.to_string())
+                connection.derive_track_id(crate::entity::TrackKind::Audio, &index.to_string())
             })
             .collect::<Vec<_>>();
         for track_id in &track_ids {

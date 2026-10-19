@@ -555,9 +555,19 @@ impl ControllerActor {
         }
     }
 
+    fn current_incarnation(&self, participant: ParticipantId, connection_id: ConnectionId) -> bool {
+        self.core
+            .registry
+            .get_participant(&participant)
+            .is_some_and(|meta| meta.connection_id == connection_id)
+    }
+
     fn handle_shard_event(&mut self, (_shard, event): ShardEventMessage) {
         match event {
-            ShardEvent::TrackPublished { track } => {
+            ShardEvent::TrackPublished(track) => {
+                if !self.current_incarnation(track.meta().origin, track.meta().connection_id) {
+                    return;
+                }
                 if let Some(outcome) =
                     self.lifecycle
                         .publish(track, &self.core.registry, tokio::time::Instant::now())
@@ -565,10 +575,13 @@ impl ControllerActor {
                     self.publish_track_lifecycle(outcome);
                 }
             }
-            ShardEvent::TrackUnpublished { origin, track_id } => {
+            ShardEvent::TrackUnpublished(meta) => {
+                if !self.current_incarnation(meta.origin, meta.connection_id) {
+                    return;
+                }
                 if let Some(outcome) = self.lifecycle.unpublish(
-                    origin,
-                    track_id,
+                    meta.origin,
+                    meta.id,
                     &self.core.registry,
                     tokio::time::Instant::now(),
                 ) {
@@ -577,8 +590,14 @@ impl ControllerActor {
                 }
             }
             ShardEvent::TrackSubscribed {
-                subscriber, track, ..
+                subscriber,
+                connection_id,
+                track,
+                ..
             } => {
+                if !self.current_incarnation(subscriber, connection_id) {
+                    return;
+                }
                 let outcome = self.lifecycle.activate(
                     track.room_id,
                     track.origin,
@@ -590,8 +609,14 @@ impl ControllerActor {
                 self.publish_track_lifecycle(outcome);
             }
             ShardEvent::TrackUnsubscribed {
-                subscriber, track, ..
+                subscriber,
+                connection_id,
+                track,
+                ..
             } => {
+                if !self.current_incarnation(subscriber, connection_id) {
+                    return;
+                }
                 let outcome = self.lifecycle.deactivate(
                     track.room_id,
                     track.origin,
@@ -605,9 +630,13 @@ impl ControllerActor {
             ShardEvent::TrackSubscriptionAdded {
                 room_id,
                 subscriber,
+                connection_id,
                 selector,
                 selection,
             } => {
+                if !self.current_incarnation(subscriber, connection_id) {
+                    return;
+                }
                 let outcomes = self.lifecycle.subscribe(
                     room_id,
                     subscriber,
@@ -623,8 +652,12 @@ impl ControllerActor {
             ShardEvent::TrackSubscriptionRemoved {
                 room_id,
                 subscriber,
+                connection_id,
                 selector,
             } => {
+                if !self.current_incarnation(subscriber, connection_id) {
+                    return;
+                }
                 let outcomes = self.lifecycle.unsubscribe(
                     room_id,
                     subscriber,
@@ -1920,6 +1953,89 @@ mod replacement_tests {
                 .registry
                 .get_participant(&participant_id)
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn stale_media_events_cannot_republish_or_unpublish_the_replacement() {
+        let mut actor = actor();
+        let room_id = RoomId::from_external(&RoomExternalId::new("media-fence").unwrap());
+        let participant = ParticipantId::new();
+        let stale = connection_id(1);
+        let current = connection_id(2);
+        for connection_id in [stale, current] {
+            let address = actor
+                .core
+                .reserve_transport(ShardId::new(0), tokio::time::Instant::now());
+            actor
+                .core
+                .registry
+                .commit_candidate(
+                    participant,
+                    room_id,
+                    ShardId::new(0),
+                    address,
+                    connection_id,
+                    ConnectionProfile::Native,
+                    None,
+                )
+                .unwrap();
+        }
+        let make_track = |connection_id: ConnectionId| {
+            crate::track::Track::data(
+                crate::track::TrackMeta {
+                    room_id,
+                    shard_id: ShardId::new(0),
+                    id: connection_id.derive_track_id(crate::entity::TrackKind::Data, "rt/chat"),
+                    origin: participant,
+                    connection_id,
+                    label: Some("rt/chat".to_owned()),
+                },
+                crate::track::Topic::for_test("chat"),
+                crate::track::DataLane::Realtime,
+                None,
+            )
+        };
+        let stale_track = make_track(stale);
+        let stale_meta = stale_track.meta().clone();
+        let track_id = current.derive_track_id(crate::entity::TrackKind::Data, "rt/chat");
+
+        actor.handle_shard_event((
+            ShardId::new(0),
+            ShardEvent::TrackPublished(stale_track),
+        ));
+        assert!(
+            actor
+                .lifecycle
+                .unpublish(
+                    participant,
+                    stale_meta.id,
+                    &actor.core.registry,
+                    tokio::time::Instant::now(),
+                )
+                .is_none(),
+            "a retired connection cannot add a publication"
+        );
+
+        actor.handle_shard_event((
+            ShardId::new(0),
+            ShardEvent::TrackPublished(make_track(current)),
+        ));
+        actor.handle_shard_event((
+            ShardId::new(0),
+            ShardEvent::TrackUnpublished(stale_meta),
+        ));
+        assert!(
+            actor
+                .lifecycle
+                .unpublish(
+                    participant,
+                    track_id,
+                    &actor.core.registry,
+                    tokio::time::Instant::now(),
+                )
+                .is_some(),
+            "the replacement's publication must survive stale teardown"
         );
     }
 }
