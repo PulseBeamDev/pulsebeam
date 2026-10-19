@@ -186,17 +186,16 @@ lowest-value traffic.
 Every outbound sender has mutable SFU-provided semantic policy:
 
 * browser-managed default playout or an explicit playout-delay range;
-* relative media priority;
 * desired media-payload bitrate.
 
-The SFU chooses sources and layers. The connection returns its controller-governed
-RTP payload selection budget separately from demand-capped aggregate and per-sender
-allocations and owns transport scheduling. The budget is not measured spare path
-bandwidth or a guaranteed reservation.
+The SFU chooses sources, layers, and sender targets. The connection reports its
+native aggregate RTP payload budget through `Event::MediaBudgetChanged` and
+`ConnectionStats.media_budget`. This is not measured spare path bandwidth, a
+reservation, or a redistribution of caller targets.
 
 Egress uses one connection-level SCReAM-v2-derived RTP congestion controller.
 The SCReAM core remains independently testable and self-contained. PulseBeam
-latency policy governs admission, allocation, pacing horizons, retransmission, and
+latency policy governs admission, pacing horizons, retransmission, and
 probing outside that core; it does not override SCReAM's native queue-delay target,
 congestion window, pacing equations, or estimated capacity.
 
@@ -206,11 +205,11 @@ and probing limits. A larger playout range can trade latency headroom for
 quality recovery, but it never maps directly to an equivalently large network
 queue.
 
-Constrained media capacity is divided among active senders using weighted
-max-min allocation capped by actual selected source rates, not an unconditional
-latency-dependent rate discount. A selected encoding is fully funded when
-aggregate selected demand fits the controller-governed budget. Priority controls
-relative share; it does not manufacture capacity or make stale media useful.
+Each sender's caller-selected payload rate bounds local admission. One aggregate
+media-payload pacer enforces the native budget at transmit commit, independently
+of the native transport-byte burst pacer and send window. Over-capacity caller
+targets do not override these limits. Eligible original media uses equal byte
+quanta across senders, without application priorities or target-weighted shares.
 
 Pre-media and application-limited probing uses ordinary RTP padding on a
 negotiated media or RTX SSRC. There is no synthetic SSRC-zero probe stream.
@@ -245,8 +244,8 @@ required for correctness, cryptographic failure, or timeout is terminal.
 
 Statistics are coherent snapshots with connection, sender, encoding, and
 DataChannel counters. They expose negotiated feedback, queue and in-flight
-state, target/pacing rates, transmitted byte classes, drop/feedback counters,
-sender allocation and traffic totals, encoding receive/retirement state, and
+state, native aggregate media budget and pacing rate, transmitted byte classes,
+drop/feedback counters, sender demand and traffic totals, encoding receive/retirement state, and
 DataChannel buffering/message totals. The crate has no metrics-framework
 dependency and does not expose mutable controller internals.
 

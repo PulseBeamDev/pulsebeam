@@ -7,8 +7,8 @@ use std::{
 use pulsebeam_rtc::{
     AcceptError, Command, CommandError, Connection, ConnectionConfig, ConnectionLimits,
     DataChannelId, FrameDependencies, FrameId, GlobalMediaTime, IceTcpFlowId, LocalCandidate,
-    LocalIceCredentials, MediaPacket, MediaPayloadBitrate, MediaPriority, NetworkInput, Output,
-    PlayoutDelay, PolicyError, ReceiveError, SenderDemand, StatsSnapshot, TimePoint,
+    LocalIceCredentials, MediaPacket, MediaPayloadBitrate, NetworkInput, Output, PlayoutDelay,
+    PolicyError, ReceiveError, SenderDemand, StatsSnapshot, TimePoint,
 };
 
 fn assert_send<T: Send>() {}
@@ -323,12 +323,6 @@ fn local_candidate_configuration_is_bounded_and_structural() {
 
 #[test]
 fn policy_values_reject_unrepresentable_construction() {
-    assert_eq!(MediaPriority::new(0), Err(PolicyError::PriorityOutOfRange));
-    assert_eq!(
-        MediaPriority::new(257),
-        Err(PolicyError::PriorityOutOfRange)
-    );
-    assert_eq!(MediaPriority::new(1).map(MediaPriority::weight), Ok(1));
     assert_eq!(
         PlayoutDelay::from_millis_exact(1, 10),
         Err(PolicyError::PlayoutNotExactlyRepresentable)

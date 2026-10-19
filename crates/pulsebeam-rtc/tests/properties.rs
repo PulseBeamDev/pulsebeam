@@ -10,8 +10,7 @@ use std::time::Duration;
 
 use proptest::prelude::*;
 use pulsebeam_rtc::{
-    Command, GlobalMediaTime, MediaPayloadBitrate, MediaPriority, Output, PlayoutDelay,
-    SenderPolicy,
+    Command, GlobalMediaTime, MediaPayloadBitrate, Output, PlayoutDelay, SenderPolicy,
 };
 use support::{PeerFixture, forwarded};
 
@@ -54,23 +53,17 @@ proptest! {
 }
 
 #[test]
-fn allocation_is_conserving_demand_capped_and_priority_monotonic_through_stats() {
+fn selected_targets_remain_caller_owned_above_the_connection_budget() {
     let mut source = PeerFixture::connected();
     let mut fixture = PeerFixture::connected_with_senders(3);
-    let packet = source.send_source(b"allocation");
-    let priorities = [
-        MediaPriority::VERY_LOW,
-        MediaPriority::LOW,
-        MediaPriority::HIGH,
-    ];
-    let senders = fixture.senders.clone();
-    for (index, (sender, priority)) in senders.into_iter().zip(priorities).enumerate() {
+    let packet = source.send_source(b"fixed caller targets");
+    let target = MediaPayloadBitrate::from_bps(4_000_000);
+    for (index, sender) in fixture.senders.clone().into_iter().enumerate() {
         fixture.command(Command::SetSenderPolicy {
             sender,
             policy: SenderPolicy {
-                playout_delay: Some(PlayoutDelay::from_ticks(0, 400).expect("valid playout")),
-                priority,
-                desired_bitrate: MediaPayloadBitrate::from_bps(4_000_000),
+                playout_delay: None,
+                desired_bitrate: target,
             },
         });
         fixture.command(Command::SendMedia {
@@ -82,22 +75,16 @@ fn allocation_is_conserving_demand_capped_and_priority_monotonic_through_stats()
         });
     }
     fixture.drive_for(Duration::from_millis(500));
-
     let stats = fixture.connection.stats();
-    let allocations = stats
-        .senders
-        .iter()
-        .map(|sender| sender.allocation.as_bps())
-        .collect::<Vec<_>>();
-    assert_eq!(allocations.len(), 3);
-    assert!(allocations[0] <= allocations[1]);
-    assert!(allocations[1] <= allocations[2]);
+    assert_eq!(stats.senders.len(), 3);
     assert!(
-        allocations
+        stats
+            .senders
             .iter()
-            .all(|allocation| *allocation <= 4_000_000)
+            .all(|sender| sender.demand.selected() == target)
     );
-    assert!(allocations.iter().sum::<u64>() <= stats.connection.target_media_bitrate.as_bps());
+    assert!(stats.connection.media_budget.as_bps() > 0);
+    assert!(stats.connection.media_budget.as_bps() < target.as_bps() * 3);
 }
 
 #[test]

@@ -7,7 +7,7 @@ requirements on a caller integrating this facade, not claims about the current
 
 This document contains the complete non-congestion-control design and public Rust
 contract. `README.md` owns the high-level boundary and invariants.
-`congestion-control.md` owns private congestion-control, allocation, pacing, probing,
+`congestion-control.md` owns private congestion-control, pacing, probing,
 and RTP/SCTP coordination details.
 
 The words **MUST**, **MUST NOT**, **SHOULD**, and **MAY** are normative. Public Rust
@@ -495,7 +495,7 @@ pub enum Event {
         sender: SenderId,
         reason: KeyframeRequestReason,
     },
-    AllocationChanged(AllocationSnapshot),
+    MediaBudgetChanged(MediaPayloadBitrate),
     DataChannel(DataChannelEvent),
     Warning(ConnectionWarning),
 }
@@ -527,17 +527,13 @@ Repeated malformed input, unknown feedback, drops, and controller diagnostics ar
 counters in `StatsSnapshot`; `Warning` is reserved for actionable state changes
 that a caller may need to surface.
 
-`AllocationSnapshot.media_budget` is the controller-governed RTP payload selection
-ceiling, capped by bounded potential demand. It is not measured spare bandwidth,
-physical path capacity, or a reservation. `total` is the sum of the selected-demand
-sender allocations, which can be lower or zero. A fixed selected encoding is not
-unconditionally discounted by its latency profile; if selected aggregate demand
-fits the current selection ceiling, every selected source rate is fully funded. The snapshot
-includes every negotiated sender, including zero allocations. Budget-only changes
-are observable even when allocations are unchanged. Pending updates coalesce into
-one latest-state snapshot; downward changes are not held for confirmation.
-`StatsSnapshot.connection.media_budget` reports the same current ceiling for
-startup and coherent inspection. Source/layer quality hysteresis remains SFU-owned.
+`Event::MediaBudgetChanged` reports the native aggregate RTP payload budget.
+It does not change caller-selected sender targets or grant per-sender shares.
+The value is not measured spare bandwidth, physical path capacity, or a
+reservation. Pending updates coalesce into one latest value; downward changes
+are not held for confirmation. `StatsSnapshot.connection.media_budget` reports
+the same current budget for startup and coherent inspection. The SFU owns
+source/layer selection and quality hysteresis.
 
 ## Public error types
 
@@ -613,14 +609,14 @@ pub struct StatsSnapshot {
 Required connection observations include:
 
 - connection state, negotiated packet-feedback kind, and close reason;
-- caller clock regressions, RTP bytes in flight, target media-payload bitrate,
+- caller clock regressions, RTP bytes in flight, native aggregate media budget,
   pacing bitrate, and queued media/data bytes;
 - transmitted RTP, RTCP, SCTP, other protocol, and padding bytes;
 - dropped network inputs and unknown, duplicate, stale, and wrong-path feedback.
 
 Required per-sender observations include:
 
-- sender identifier and policy, current allocation, queued packets/payload bytes,
+- sender identifier, policy and demand, queued packets/payload bytes,
   and transmitted packet/payload totals.
 
 Required per-encoding observations are the encoding identifier and media kind,
@@ -1096,15 +1092,11 @@ provides the initial policy, so no sender starts undefined.
 ```rust
 pub struct SenderPolicy {
     pub playout_delay: Option<PlayoutDelay>,
-    pub priority: MediaPriority,
     pub desired_bitrate: MediaPayloadBitrate,
 }
 
 #[repr(transparent)]
 pub struct MediaPayloadBitrate(u64); // bits per second of RTP media payload
-
-#[repr(transparent)]
-pub struct MediaPriority(NonZeroU16);
 
 pub struct PlayoutDelay {
     min_millis: u16,
@@ -1116,10 +1108,6 @@ impl MediaPayloadBitrate {
     pub const fn as_bps(self) -> u64;
 }
 
-impl MediaPriority {
-    pub fn new(weight: u16) -> Result<Self, PolicyError>;
-    pub const fn weight(self) -> u16;
-}
 ```
 
 ### Playout delay
@@ -1199,7 +1187,7 @@ DataChannel overhead.
 `Command::SetSenderDemand` atomically declares selected and potential payload
 rates using `SenderDemand::new(selected, potential)`; potential below selected
 is rejected. Selected updates `SenderPolicy.desired_bitrate` and remains the
-actual selected allocation/service demand. Potential is the bounded media rate the SFU
+caller-selected payload ceiling for local admission. Potential is the bounded media rate the SFU
 could actually use from available source/layer choices, not a bandwidth estimate,
 reservation, or permission to transmit that rate. It supplies the aggregate
 application maximum to the unchanged SCReAM adapter and bounded probe interest.
@@ -1209,34 +1197,14 @@ Hiding or withdrawing interest declares both zero.
 Until an explicit demand declaration, potential follows selected for existing
 policy callers. Later `SetSenderPolicy` changes retain explicit potential,
 raised to at least the newly selected rate. Statistics report the effective
-`SenderDemand`. Priority-first source/layer selection remains SFU-owned;
-potential never participates in weighted media allocation or grants body-media
-admission. Ordinary zero-to-positive application-demand updates preserve the
+`SenderDemand`. Source/layer selection remains SFU-owned; potential does not
+grant body-media admission. Ordinary zero-to-positive application-demand updates preserve the
 native controller state on an unchanged path; they do not reset congestion
 history or manufacture available capacity.
 
-The connection measures admitted and transmitted rates itself. Allocation events
-are also expressed in RTP media-payload bits per second, so the SFU can compare
-them directly to layer payload rates.
-
-### Media priority
-
-`MediaPriority` is a bounded positive relative weight in `1..=256`. Zero is
-invalid. The standard presets are:
-
-```rust
-impl MediaPriority {
-    pub const VERY_LOW: Self = Self::new_const(1);
-    pub const LOW: Self = Self::new_const(2);
-    pub const MEDIUM: Self = Self::new_const(4);
-    pub const HIGH: Self = Self::new_const(8);
-}
-```
-
-The allocator interprets weights over RTP payload bytes. They are shares under
-constraint, not reservations or guaranteed minimums. Media kind is not an
-immutable priority rule; configuration may default audio to `HIGH` and video to
-`MEDIUM`.
+The connection measures admitted and transmitted rates itself. Media budget events
+are expressed in RTP media-payload bits per second, so the SFU can compare the
+aggregate budget to its selected and potential layer payload rates.
 
 ## RTP extension policy
 
@@ -1279,16 +1247,17 @@ never a source wire ID.
 
 ## Scheduling and congestion control
 
-The public API exposes only semantic policy, allocation, output, and snapshots.
+The public API exposes only semantic policy, aggregate media budget, output, and snapshots.
 SCReAM, TWCC, RFC 8888 report parsing, queue targets, window gains, pacing factors,
 probe clusters, and histories remain private.
 
 The fixed design is:
 
 - one connection-level SCReAM-v2-derived RTP controller;
-- one private PulseBeam latency governor for admission, allocation, pacer horizons,
+- one private PulseBeam latency governor for admission, pacer horizons,
   retransmission, and probing outside the SCReAM core;
-- one weighted max-min allocator over sender media-payload demand;
+- caller-selected sender admission ceilings and equal-byte-quantum sender service;
+- one aggregate media-payload pacer at the native budget, charged only on commit;
 - one transport-byte pacer and deadline-aware scheduler;
 - ordinary RTP padding on a negotiated media or RTX SSRC for pre-media and
   application-limited probing; no synthetic SSRC-zero stream;
@@ -1297,8 +1266,8 @@ The fixed design is:
 - protocol control deliverable under media/DataChannel load;
 - padding always lowest value.
 
-The SFU receives the RTP payload selection budget separately from demand-capped
-aggregate and per-sender allocations and continues to choose sources and layers. See [`congestion-control.md`](congestion-control.md)
+The SFU receives the native aggregate RTP payload budget without target
+redistribution and continues to choose sources, layers, and sender targets. See [`congestion-control.md`](congestion-control.md)
 for exact units, constants, state transitions, and acceptance tests.
 
 
@@ -1352,8 +1321,8 @@ pub enum DataMessage {
 ```
 
 `DataChannelPriority` is the 16-bit SCTP weighted-fair-queueing weight used by the
-WebRTC DataChannel profile. It is intentionally a different type and scale from
-`MediaPriority`. Higher weight receives proportionally more SCTP service while
+WebRTC DataChannel profile. It does not weight RTP sender service.
+Higher weight receives proportionally more SCTP service while
 backlogged. Message interleaving is used when negotiated; without it, the
 scheduler cannot preempt an already fragmented non-interleaved message and
 statistics expose the resulting head-of-line delay.
@@ -1412,7 +1381,7 @@ Acceptance requires:
 - deterministic network simulation for loss, delay, reordering, VBR, pauses,
   probing, feedback loss, malformed traffic, and overload;
 - property tests for global-time wire round trips, non-regressing clock mappings,
-  no double acknowledgment, bounded histories, allocation conservation, and
+  no double acknowledgment, bounded histories, caller-target independence, and
   policy monotonicity;
 - actual libwebrtc `pulsebeam-webrtc-sys` `0.6.2`, source commit
   `f87f99a48e58fb9cd13767ba58e9b7cd937c71a3`, and matching released native

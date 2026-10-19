@@ -100,7 +100,7 @@ fn production_connection_bottleneck_emits_measured_transport_bytes() {
         sojourn.len(),
         stats.connection.transmitted_rtp_bytes,
         stats.connection.transmitted_padding_bytes,
-        stats.connection.target_media_bitrate.as_bps(),
+        stats.connection.media_budget.as_bps(),
         p99.as_millis()
     );
     assert!(
@@ -207,6 +207,7 @@ fn production_capacity_steps_recover_stable_transport_service() {
     });
     let mut source = ComponentSource::audio(1);
     let start = fixture.at().monotonic;
+    let mut budgets = Vec::with_capacity(3);
     for id in 1..=18_000_u64 {
         let tick = start + Duration::from_millis(id * 2);
         fixture.drive_for(tick.saturating_duration_since(fixture.at().monotonic));
@@ -215,6 +216,11 @@ fn production_capacity_steps_recover_stable_transport_service() {
         }
         if id == 12_000 {
             fixture.set_bottleneck_rate(2_000_000);
+        }
+        if id % 6_000 == 0 {
+            let stats = fixture.connection.stats();
+            assert_eq!(stats.senders[0].demand.selected(), policy.desired_bitrate);
+            budgets.push(stats.connection.media_budget.as_bps());
         }
         let media = forwarded(source.sample(fixture.at(), &[0x5a; PAYLOAD_BYTES]), id);
         match fixture.try_command(Command::SendMedia {
@@ -226,6 +232,14 @@ fn production_capacity_steps_recover_stable_transport_service() {
         }
     }
     fixture.drive_for(Duration::from_secs(2));
+    assert!(
+        budgets[1] < budgets[0],
+        "native budget contracts without caller target changes: {budgets:?}"
+    );
+    assert!(
+        budgets[2] > budgets[1],
+        "native budget recovers without caller target changes: {budgets:?}"
+    );
     for (from, to, rate) in [
         (2, 12, 2_000_000_u64),
         (14, 24, 1_000_000),
@@ -251,6 +265,7 @@ fn production_capacity_steps_recover_stable_transport_service() {
         );
         assert_eq!(delivered, emitted, "stable emission cohort must drain");
         assert!(u128::from(delivered) * 100 >= u128::from(service) * 85);
+        assert!(u128::from(delivered) * 100 <= u128::from(service) * 115);
     }
 }
 
@@ -346,12 +361,7 @@ fn production_homogeneous_shared_bottleneck_competition() {
             .duration_since(flows[0].at().monotonic.min(flows[1].at().monotonic)),
         flows
             .iter()
-            .map(|flow| flow
-                .connection
-                .stats()
-                .connection
-                .target_media_bitrate
-                .as_bps())
+            .map(|flow| flow.connection.stats().connection.media_budget.as_bps())
             .collect::<Vec<_>>(),
         flows
             .iter()
@@ -364,192 +374,5 @@ fn production_homogeneous_shared_bottleneck_competition() {
     for bytes in delivered {
         assert!(u128::from(bytes) * 100 >= u128::from(combined) * 40);
         assert!(u128::from(bytes) * 100 <= u128::from(combined) * 60);
-    }
-}
-
-#[test]
-fn production_two_sender_allocation_matches_payload_service() {
-    for (weights, desired) in [
-        ([1, 1], [4_000_000, 4_000_000]),
-        ([1, 2], [4_000_000, 4_000_000]),
-        ([1, 2], [200_000, 4_000_000]),
-        ([1, 2], [0, 4_000_000]),
-    ] {
-        check_two_sender_allocation(weights, desired);
-    }
-}
-
-#[allow(
-    clippy::indexing_slicing,
-    reason = "the two-sender fixture uses matching two-element measurement arrays"
-)]
-fn check_two_sender_allocation(weights: [u16; 2], desired: [u64; 2]) {
-    let mut fixture = PeerFixture::connected_with_senders(2).without_egress_observation();
-    fixture.configure_network(
-        0x4401,
-        NetworkPolicy {
-            delay: Duration::from_millis(25),
-            ..NetworkPolicy::default()
-        },
-    );
-    fixture.configure_bottleneck(2_000_000);
-    fixture.configure_time_quantum(Duration::from_millis(2));
-    for (index, sender) in fixture.senders.iter().enumerate() {
-        let mut policy = ConnectionConfig::default().default_audio_policy;
-        policy.priority = pulsebeam_rtc::MediaPriority::new(weights[index]).expect("priority");
-        policy.desired_bitrate = MediaPayloadBitrate::from_bps(desired[index]);
-        policy.playout_delay = Some(PlayoutDelay::from_ticks(0, 50).expect("500ms playout"));
-        fixture
-            .connection
-            .command(
-                fixture.at(),
-                Command::SetSenderPolicy {
-                    sender: *sender,
-                    policy,
-                },
-            )
-            .expect("sender demand");
-    }
-    let mut sources = [ComponentSource::audio(1), ComponentSource::audio(2)];
-    let start = fixture.at().monotonic;
-    let mut previous_at = start + Duration::from_secs(2);
-    let mut integrated = [0_u128; 2];
-    let mut expected = [0_u128; 2];
-    // The fixed 500 ms policy uses the documented Q16 utilization ceiling.
-    let governed = desired.map(|demand| demand * 62_259 / 65_536);
-    let mut payload_start = [0_u64; 2];
-    let mut admitted = [0_u64; 2];
-    let mut blocked = [0_u64; 2];
-    let mut pending = [None, None];
-    for id in 1..=6_000_u64 {
-        let tick = start + Duration::from_millis(id * 2);
-        fixture.drive_for(tick.saturating_duration_since(fixture.at().monotonic));
-        let first = usize::try_from(id % 2).unwrap_or_default();
-        for index in [first, 1 - first] {
-            // The source remains backlogged; allocation-limited admission may let
-            // the faster burst pacer drain the transport queue between packets.
-            if desired[index] == 0 || fixture.connection.stats().senders[index].queued_packets >= 1
-            {
-                continue;
-            }
-            let media = pending[index].get_or_insert_with(|| {
-                forwarded(
-                    sources[index].sample(fixture.at(), &[0x5a; PAYLOAD_BYTES]),
-                    id,
-                )
-            });
-            match fixture.try_command(Command::SendMedia {
-                sender: fixture.senders[index],
-                media: media.clone(),
-            }) {
-                Ok(()) => {
-                    pending[index] = None;
-                    admitted[index] += 1;
-                }
-                Err(CommandError::WouldBlock) => blocked[index] += 1,
-                Err(error) => panic!("two-sender admission: {error:?}"),
-            }
-        }
-        let now = fixture.at().monotonic;
-        let stats = fixture.connection.stats();
-        if now < previous_at {
-            for (index, sender) in stats.senders.iter().enumerate() {
-                payload_start[index] = sender.transmitted_payload_bytes;
-            }
-        } else {
-            let dt = now.saturating_duration_since(previous_at).as_micros();
-            let budget = stats
-                .senders
-                .iter()
-                .map(|sender| sender.allocation.as_bps())
-                .sum::<u64>();
-            let first_share = budget * u64::from(weights[0]) / u64::from(weights[0] + weights[1]);
-            let shares = if first_share > governed[0] {
-                [governed[0], (budget - governed[0]).min(governed[1])]
-            } else if budget - first_share > governed[1] {
-                [(budget - governed[1]).min(governed[0]), governed[1]]
-            } else {
-                [first_share, budget - first_share]
-            };
-            for (index, sender) in stats.senders.iter().enumerate() {
-                integrated[index] += u128::from(sender.allocation.as_bps()) * dt;
-                expected[index] += u128::from(shares[index]) * dt;
-            }
-            previous_at = now;
-        }
-    }
-    assert!(
-        fixture
-            .at()
-            .monotonic
-            .duration_since(start + Duration::from_secs(2))
-            >= Duration::from_secs(10)
-    );
-    let payload_end = fixture
-        .connection
-        .stats()
-        .senders
-        .iter()
-        .map(|sender| sender.transmitted_payload_bytes)
-        .collect::<Vec<_>>();
-    for sender in fixture.senders.clone() {
-        fixture
-            .try_command(Command::SetSenderDemand {
-                sender,
-                demand: crate::SenderDemand::default(),
-            })
-            .expect("stop offering service before draining committed packets");
-    }
-    fixture.drive_for(Duration::from_secs(2));
-    let stats = fixture.connection.stats();
-    assert_eq!(
-        fixture.network_counters().1,
-        0,
-        "loss-free allocation fixture"
-    );
-    assert_eq!(
-        fixture
-            .delivered_rtp()
-            .iter()
-            .map(|(_, bytes)| *bytes)
-            .sum::<u64>(),
-        stats
-            .connection
-            .transmitted_rtp_bytes
-            .saturating_add(stats.connection.transmitted_padding_bytes),
-        "all emitted RTP including probes delivered"
-    );
-    let delivered = [0, 1].map(|i| payload_end[i] - payload_start[i]);
-    eprintln!(
-        "two-sender seed=0x4401 weights={weights:?} desired={desired:?} admitted={admitted:?} blocked={blocked:?} integrated_allocation={integrated:?} expected={expected:?} payload={delivered:?} end_stats={:?}",
-        stats
-            .senders
-            .iter()
-            .map(|sender| (
-                sender.transmitted_packets,
-                sender.queued_packets,
-                sender.allocation.as_bps()
-            ))
-            .collect::<Vec<_>>()
-    );
-    let total = integrated.iter().sum::<u128>();
-    let total_payload = delivered.iter().sum::<u64>();
-    assert!(total > 0 && total_payload > 0);
-    for index in 0..2 {
-        let payload_service = u128::from(delivered[index]) * 8_000_000;
-        assert!(
-            payload_service.abs_diff(integrated[index]) * 10 <= integrated[index],
-            "payload service differs from absolute allocation: {delivered:?} vs {integrated:?}"
-        );
-        assert!(
-            integrated[index].abs_diff(expected[index]) * 10 <= expected[index],
-            "allocation differs from weighted demand-capped share: {integrated:?} vs {expected:?}"
-        );
-        let delivered_share = u128::from(delivered[index]) * total;
-        let allocation_share = integrated[index] * u128::from(total_payload);
-        assert!(
-            delivered_share.abs_diff(allocation_share) * 10 <= allocation_share,
-            "payload differs from normalized allocation: {delivered:?} vs {integrated:?}"
-        );
     }
 }

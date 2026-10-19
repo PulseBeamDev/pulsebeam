@@ -159,7 +159,7 @@ pub enum Event {
         sender: SenderId,
         reason: KeyframeRequestReason,
     },
-    AllocationChanged(AllocationSnapshot),
+    MediaBudgetChanged(MediaPayloadBitrate),
     DataChannel(DataChannelEvent),
     Warning(ConnectionWarning),
 }
@@ -186,21 +186,6 @@ pub struct EncodingInfo {
 pub enum EncodingRetireReason {
     RemoteBye,
     Retired,
-}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct AllocationSnapshot {
-    /// Current RTP payload selection ceiling, not measured spare path bandwidth.
-    pub media_budget: MediaPayloadBitrate,
-    /// Sum of the selected-demand-capped sender allocations.
-    pub total: MediaPayloadBitrate,
-    pub senders: Vec<SenderAllocation>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SenderAllocation {
-    pub sender: SenderId,
-    pub bitrate: MediaPayloadBitrate,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -317,7 +302,6 @@ pub struct ConnectionStats {
     pub close_reason: Option<CloseReason>,
     pub clock_regressions: u64,
     pub rtp_bytes_in_flight: u64,
-    pub target_media_bitrate: MediaPayloadBitrate,
     pub media_budget: MediaPayloadBitrate,
     pub pacing_bitrate: u64,
     pub queued_media_bytes: usize,
@@ -348,7 +332,6 @@ pub struct SenderStats {
     pub policy: SenderPolicy,
     pub demand: SenderDemand,
     pub playout_delay: PlayoutDelayStatus,
-    pub allocation: MediaPayloadBitrate,
     pub queued_packets: usize,
     pub queued_payload_bytes: usize,
     pub transmitted_packets: u64,

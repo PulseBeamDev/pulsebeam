@@ -702,7 +702,6 @@ impl Connection {
                     .history
                     .controller_inputs()
                     .bytes_in_flight,
-                target_media_bitrate: MediaPayloadBitrate::from_bps(egress.target_media_bitrate),
                 media_budget: MediaPayloadBitrate::from_bps(egress.media_budget),
                 pacing_bitrate: egress.pacing_bitrate,
                 queued_media_bytes: egress.queued_transport_bytes,
@@ -932,7 +931,7 @@ mod tests {
         let bootstrap = fixture.connection.stats().connection;
         assert_eq!(bootstrap.transmitted_rtp_bytes, 0);
         assert!(
-            bootstrap.target_media_bitrate.as_bps() >= 1_100_000,
+            bootstrap.media_budget.as_bps() >= 1_100_000,
             "potential-only demand must bootstrap native capacity within 30s: stats={bootstrap:?}",
         );
         assert_initial_probe_windows(fixture.emitted_rtp(), initial_started, 2_000_000);
@@ -1013,7 +1012,6 @@ mod tests {
                     sender: fixture.sender,
                     policy: crate::SenderPolicy {
                         desired_bitrate: MediaPayloadBitrate::from_bps(1_000_000),
-                        priority: crate::MediaPriority::MEDIUM,
                         playout_delay: None,
                     },
                 });
@@ -1065,7 +1063,7 @@ mod tests {
             );
             assert!(subsystems.egress.test_envelope().unwrap().probe_permitted);
             let (_, senders) = subsystems.egress.stats();
-            assert_eq!(senders[0].allocation.as_bps(), 0);
+            assert_eq!(senders[0].demand.selected().as_bps(), 0);
             assert_eq!(senders[0].queued_packets, usize::from(!repair));
             assert!(matches!(
                 subsystems

@@ -1,4 +1,3 @@
-mod allocator;
 mod clock;
 mod congestion;
 mod connection;
@@ -35,11 +34,10 @@ mod test_support;
 pub use connection::{AcceptedConnection, Connection};
 pub use id::{DataChannelId, EncodingId, FrameId, IceTcpFlowId, SenderId};
 pub use io::{
-    AcceptError, AllocationSnapshot, AuthenticatedFlow, CloseReason, Command, CommandError,
-    ConnectionState, ConnectionStats, ConnectionWarning, DataChannelEvent, DataChannelStats,
-    EcnCodepoint, EncodingInfo, EncodingRetireReason, EncodingStats, Event, KeyframeRequestReason,
-    NetworkInput, Output, PlayoutDelayStatus, ReceiveError, SenderAllocation, SenderStats,
-    StatsSnapshot, Transmit, TransmitTarget,
+    AcceptError, AuthenticatedFlow, CloseReason, Command, CommandError, ConnectionState,
+    ConnectionStats, ConnectionWarning, DataChannelEvent, DataChannelStats, EcnCodepoint,
+    EncodingInfo, EncodingRetireReason, EncodingStats, Event, KeyframeRequestReason, NetworkInput,
+    Output, PlayoutDelayStatus, ReceiveError, SenderStats, StatsSnapshot, Transmit, TransmitTarget,
 };
 pub use media_packet::{
     ForwardedMedia, FrameBoundary, FrameDependencies, FrameMetadata, MediaPacket, MediaPacketView,
@@ -48,9 +46,9 @@ pub use media_transit::{MaterializedMediaPacket, MediaTransitError};
 pub use session::{
     CodecInfo, CodecProfile, ConnectionConfig, ConnectionLimits, DataChannelConfig,
     DataChannelConfigError, DataChannelPriority, DataMessage, DataReliability, InboundMediaInfo,
-    LocalCandidate, LocalIceCredentials, MediaKind, MediaPayloadBitrate, MediaPriority,
-    PacketFeedbackKind, PlayoutDelay, PolicyError, SdpAnswer, SdpOffer, SenderDemand, SenderInfo,
-    SenderPolicy, SessionInfo, UnknownExtensionPolicy,
+    LocalCandidate, LocalIceCredentials, MediaKind, MediaPayloadBitrate, PacketFeedbackKind,
+    PlayoutDelay, PolicyError, SdpAnswer, SdpOffer, SenderDemand, SenderInfo, SenderPolicy,
+    SessionInfo, UnknownExtensionPolicy,
 };
 pub use time::{ConnectionEntropy, GlobalMediaTime, TimePoint};
 

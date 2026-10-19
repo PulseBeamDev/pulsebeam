@@ -13,7 +13,7 @@ use bytes::Bytes;
 use pulsebeam_rtc::{
     CloseReason, Command, DataChannelConfig, DataChannelPriority, DataMessage, DataReliability,
     ForwardedMedia, FrameBoundary, FrameDependencies, FrameId, FrameMetadata, IceTcpFlowId,
-    MediaPayloadBitrate, MediaPriority, Output, PlayoutDelay, SenderPolicy,
+    MediaPayloadBitrate, Output, PlayoutDelay, SenderPolicy,
 };
 use support::{FixtureCoexistenceEvent, FixtureDataEvent, PeerFixture};
 
@@ -240,7 +240,6 @@ fn fragmented_data_and_rtp_share_service_without_cross_accounting_starvation() {
         sender: fixture.sender,
         policy: SenderPolicy {
             playout_delay: Some(PlayoutDelay::from_ticks(0, 400).expect("playout policy")),
-            priority: MediaPriority::HIGH,
             desired_bitrate: MediaPayloadBitrate::from_bps(1_000_000),
         },
     });
@@ -295,5 +294,4 @@ fn fragmented_data_and_rtp_share_service_without_cross_accounting_starvation() {
                 .transmitted_rtp_bytes
                 .saturating_add(stats.transmitted_padding_bytes)
     );
-    assert!(stats.media_budget.as_bps() <= stats.target_media_bitrate.as_bps());
 }

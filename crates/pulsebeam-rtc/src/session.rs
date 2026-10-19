@@ -331,12 +331,10 @@ impl Default for ConnectionConfig {
             limits: ConnectionLimits::default(),
             default_audio_policy: SenderPolicy {
                 playout_delay: None,
-                priority: MediaPriority::HIGH,
                 desired_bitrate: MediaPayloadBitrate::from_bps(0),
             },
             default_video_policy: SenderPolicy {
                 playout_delay: None,
-                priority: MediaPriority::MEDIUM,
                 desired_bitrate: MediaPayloadBitrate::from_bps(0),
             },
             unknown_extension_policy: UnknownExtensionPolicy::default(),
@@ -347,7 +345,6 @@ impl Default for ConnectionConfig {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SenderPolicy {
     pub playout_delay: Option<PlayoutDelay>,
-    pub priority: MediaPriority,
     pub desired_bitrate: MediaPayloadBitrate,
 }
 
@@ -405,41 +402,6 @@ impl MediaPayloadBitrate {
 
     pub const fn as_bps(self) -> u64 {
         self.0
-    }
-}
-
-#[repr(transparent)]
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub struct MediaPriority(NonZeroU16);
-
-impl MediaPriority {
-    pub const VERY_LOW: Self = Self::new_const(1);
-    pub const LOW: Self = Self::new_const(2);
-    pub const MEDIUM: Self = Self::new_const(4);
-    pub const HIGH: Self = Self::new_const(8);
-
-    #[allow(
-        clippy::unreachable,
-        reason = "all callers pass statically known nonzero priority constants"
-    )]
-    const fn new_const(weight: u16) -> Self {
-        match NonZeroU16::new(weight) {
-            Some(weight) => Self(weight),
-            None => unreachable!(),
-        }
-    }
-
-    pub fn new(weight: u16) -> Result<Self, PolicyError> {
-        if weight > 256 {
-            return Err(PolicyError::PriorityOutOfRange);
-        }
-        NonZeroU16::new(weight)
-            .map(Self)
-            .ok_or(PolicyError::PriorityOutOfRange)
-    }
-
-    pub const fn weight(self) -> u16 {
-        self.0.get()
     }
 }
 
@@ -509,7 +471,6 @@ impl PlayoutDelay {
 pub enum PolicyError {
     PlayoutRange,
     PlayoutNotExactlyRepresentable,
-    PriorityOutOfRange,
     BitrateOutOfRange,
 }
 

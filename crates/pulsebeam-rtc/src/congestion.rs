@@ -57,9 +57,9 @@ pub(crate) struct ControllerInput<'a> {
     pub(crate) paced_queue_bytes: u64,
     pub(crate) offered_media_rate: u64,
     pub(crate) admitted_media_rate: u64,
-    pub(crate) governed_allocation_rate: u64,
-    /// Potential source service exceeds allocation, including upgrades on active senders.
-    pub(crate) has_unallocated_demand: bool,
+    pub(crate) selected_media_rate: u64,
+    /// Potential source service exceeds caller-selected service, including active-source upgrades.
+    pub(crate) has_unserved_source_interest: bool,
     pub(crate) desired_media_rate: u64,
     pub(crate) window_or_pacer_blocked: bool,
     pub(crate) ecn: EcnValidation,
@@ -277,10 +277,10 @@ impl ScreamController {
             paced_queue_bytes,
             offered_media_rate: 0,
             admitted_media_rate: 0,
-            governed_allocation_rate: 0,
+            selected_media_rate: 0,
             desired_media_rate: desired,
             window_or_pacer_blocked: false,
-            has_unallocated_demand: false,
+            has_unserved_source_interest: false,
             ecn: EcnValidation::default(),
         };
         self.envelope(output, &input, self.last_reason)
@@ -305,8 +305,12 @@ impl ScreamController {
     }
 
     fn update_application_limited(&mut self, now: Duration, input: &ControllerInput<'_>) {
+        let available = self
+            .core
+            .snapshot(input.desired_media_rate.min(TARGET_BITRATE_MAX))
+            .target_bitrate;
         let below = input.offered_media_rate.saturating_mul(100)
-            < input.governed_allocation_rate.saturating_mul(85)
+            < input.selected_media_rate.min(available).saturating_mul(85)
             && !input.window_or_pacer_blocked;
         if below {
             let since = *self.application_limited_since.get_or_insert(now);
@@ -375,7 +379,8 @@ impl ScreamController {
                 >= 50_000;
         // A lower selected layer or paused source cannot generate the feedback
         // needed to cross a small upgrade shortfall on its own.
-        let source_interest = (input.has_unallocated_demand || input.governed_allocation_rate == 0)
+        let source_interest = (input.has_unserved_source_interest
+            || input.selected_media_rate == 0)
             && input.desired_media_rate > output.target_bitrate;
         SafeRtpEnvelope {
             target_media_payload_rate: output.target_bitrate,
@@ -463,10 +468,10 @@ mod tests {
             paced_queue_bytes: 0,
             offered_media_rate: 0,
             admitted_media_rate: 0,
-            governed_allocation_rate: 0,
+            selected_media_rate: 0,
             desired_media_rate: 0,
             window_or_pacer_blocked: false,
-            has_unallocated_demand: false,
+            has_unserved_source_interest: false,
             ecn: EcnValidation::default(),
         };
         let idle = cc.update(Duration::ZERO, input);
@@ -502,9 +507,9 @@ mod tests {
         );
         input.bytes_in_flight = 0;
 
-        input.governed_allocation_rate = 150_000;
+        input.selected_media_rate = 150_000;
         assert!(!cc.update(Duration::from_millis(200), input).probe_permitted);
-        input.has_unallocated_demand = true;
+        input.has_unserved_source_interest = true;
         assert!(cc.update(Duration::from_millis(200), input).probe_permitted);
         let desired = input.desired_media_rate;
         input.desired_media_rate = output.target_bitrate;
@@ -513,7 +518,7 @@ mod tests {
                 .probe_permitted
         );
         input.desired_media_rate = desired;
-        input.governed_allocation_rate = 0;
+        input.selected_media_rate = 0;
         input.path_available = false;
         assert!(!cc.update(Duration::from_millis(300), input).probe_permitted);
         input.path_available = true;
@@ -534,10 +539,10 @@ mod tests {
             paced_queue_bytes: 0,
             offered_media_rate: 2_000_000,
             admitted_media_rate: 2_000_000,
-            governed_allocation_rate: 2_000_000,
+            selected_media_rate: 2_000_000,
             desired_media_rate: 2_000_000,
             window_or_pacer_blocked: false,
-            has_unallocated_demand: false,
+            has_unserved_source_interest: false,
             ecn: EcnValidation::default(),
         };
         cc.update(Duration::ZERO, base);
@@ -583,10 +588,10 @@ mod tests {
             paced_queue_bytes: 0,
             offered_media_rate: 4_000_000,
             admitted_media_rate: 4_000_000,
-            governed_allocation_rate: 4_000_000,
+            selected_media_rate: 4_000_000,
             desired_media_rate: 4_000_000,
             window_or_pacer_blocked: false,
-            has_unallocated_demand: false,
+            has_unserved_source_interest: false,
             ecn: EcnValidation::default(),
         };
         cc.update(Duration::ZERO, base);
@@ -617,10 +622,10 @@ mod tests {
             paced_queue_bytes: 0,
             offered_media_rate: 4_000_000,
             admitted_media_rate: 4_000_000,
-            governed_allocation_rate: 4_000_000,
+            selected_media_rate: 4_000_000,
             desired_media_rate: 4_000_000,
             window_or_pacer_blocked: false,
-            has_unallocated_demand: false,
+            has_unserved_source_interest: false,
             ecn: EcnValidation::default(),
         };
         cc.update(Duration::ZERO, base);
@@ -673,10 +678,10 @@ mod tests {
             paced_queue_bytes: 0,
             offered_media_rate: 64_000,
             admitted_media_rate: 64_000,
-            governed_allocation_rate: 4_000_000,
+            selected_media_rate: 4_000_000,
             desired_media_rate: 4_000_000,
             window_or_pacer_blocked: false,
-            has_unallocated_demand: false,
+            has_unserved_source_interest: false,
             ecn: EcnValidation::default(),
         };
         cc.update(Duration::ZERO, base);
@@ -721,10 +726,10 @@ mod tests {
             paced_queue_bytes: 0,
             offered_media_rate: 64_000,
             admitted_media_rate: 64_000,
-            governed_allocation_rate: 2_000_000,
+            selected_media_rate: 2_000_000,
             desired_media_rate: 2_000_000,
             window_or_pacer_blocked: false,
-            has_unallocated_demand: false,
+            has_unserved_source_interest: false,
             ecn: EcnValidation::default(),
         };
         cc.update(Duration::ZERO, input);
@@ -747,10 +752,10 @@ mod tests {
             paced_queue_bytes: 0,
             offered_media_rate: 0,
             admitted_media_rate: 0,
-            governed_allocation_rate: 2_000_000,
+            selected_media_rate: 2_000_000,
             desired_media_rate: 2_000_000,
             window_or_pacer_blocked: false,
-            has_unallocated_demand: false,
+            has_unserved_source_interest: false,
             ecn: EcnValidation::default(),
         };
         cc.update(Duration::ZERO, input);

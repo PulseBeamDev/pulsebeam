@@ -1,6 +1,5 @@
 #![allow(
     clippy::arithmetic_side_effects,
-    clippy::cast_precision_loss,
     clippy::indexing_slicing,
     reason = "dense scheduler indexes are bounded by equal-length per-sender arrays"
 )]
@@ -21,21 +20,10 @@ impl SenderScheduler {
         }
     }
 
-    pub(crate) fn policy_changed(&mut self, sender: usize) {
-        if let Some(deficit) = self.deficits.get_mut(sender) {
-            *deficit = (*deficit).clamp(-QUANTUM, QUANTUM);
-        }
-    }
-
-    pub(crate) fn select(
-        &mut self,
-        eligible: &[Option<usize>],
-        allocations: &[u64],
-    ) -> Option<usize> {
+    pub(crate) fn select(&mut self, eligible: &[Option<usize>]) -> Option<usize> {
         if eligible.iter().all(Option::is_none) {
             return None;
         }
-        let maximum = allocations.iter().copied().max().unwrap_or(1).max(1);
         for _ in 0..eligible.len().saturating_mul(3) {
             let index = self.cursor % eligible.len();
             let Some(bytes) = eligible[index] else {
@@ -50,13 +38,7 @@ impl SenderScheduler {
                 }
                 return Some(index);
             }
-            let quantum = u64::try_from(QUANTUM)
-                .unwrap_or_default()
-                .saturating_mul(allocations.get(index).copied().unwrap_or_default())
-                .div_ceil(maximum)
-                .max(1);
-            self.deficits[index] =
-                self.deficits[index].saturating_add(i64::try_from(quantum).unwrap_or(i64::MAX));
+            self.deficits[index] = self.deficits[index].saturating_add(QUANTUM);
             if self.deficits[index] < needed {
                 self.cursor = (index + 1) % eligible.len();
             }
@@ -72,8 +54,6 @@ impl SenderScheduler {
                 index
             })
     }
-
-    pub(crate) fn commit(&mut self, _sender: usize, _payload_bytes: usize) {}
 }
 
 #[allow(
@@ -127,16 +107,20 @@ mod tests {
     }
 
     #[test]
-    fn scheduler_converges_to_allocated_weight_ratio() {
+    fn scheduler_serves_backlogged_senders_without_target_weights() {
         let mut scheduler = SenderScheduler::new(2);
         let mut service = [0_u64; 2];
         for _ in 0..500 {
             let sender = scheduler
-                .select(&[Some(100), Some(100)], &[100, 400])
+                .select(&[Some(100), Some(1_000)])
                 .expect("backlogged sender");
-            service[sender] += 100;
+            service[sender] += if sender == 0 { 100 } else { 1_000 };
         }
-        let ratio = service[1] as f64 / service[0] as f64;
-        assert!((3.6..=4.4).contains(&ratio), "service={service:?}");
+        assert!(
+            service[0].abs_diff(service[1]) <= u64::try_from(QUANTUM * 2).unwrap(),
+            "service={service:?}"
+        );
+        assert_eq!(scheduler.select(&[None, None]), None);
+        assert_eq!(scheduler.select(&[None, Some(100)]), Some(1));
     }
 }
