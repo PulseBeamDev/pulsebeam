@@ -262,7 +262,9 @@ fn tcp_retirement_rejects_stale_frames_and_routes_same_tuple_replacement() {
             .command(at, admit(first))
             .expect("idempotent admission");
         assert_eq!(
-            connection.command(at, admit(second)),
+            connection
+                .command(at, admit(second))
+                .map_err(|rejected| rejected.reason),
             Err(CommandError::InvalidIceTcpFlow)
         );
         let request = request_with_nomination(

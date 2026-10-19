@@ -537,111 +537,125 @@ impl MediaEgress {
         at: TimePoint,
         sender: SenderId,
         media: ForwardedMedia,
-    ) -> Result<(), CommandError> {
-        let sender_index = self.sender_index(sender)?;
-        let assignment = self.senders[sender_index]
-            .assignment
-            .ok_or(CommandError::SenderUnbound(sender))?;
-        if media.source != assignment.source {
-            return Err(CommandError::SourceIncarnationMismatch);
-        }
-        let packet = RtpPacket::parse(media.packet.bytes())
+    ) -> Result<(), (CommandError, ForwardedMedia)> {
+        let admission = (|| {
+            let sender_index = self.sender_index(sender)?;
+            let assignment = self.senders[sender_index]
+                .assignment
+                .ok_or(CommandError::SenderUnbound(sender))?;
+            if media.source != assignment.source {
+                return Err(CommandError::SourceIncarnationMismatch);
+            }
+            let packet = RtpPacket::parse(media.packet.bytes())
+                .map_err(|_| CommandError::InvalidFrameMetadata)?;
+            let payload_bytes = packet.payload().len();
+            let transport_estimate = media
+                .packet
+                .bytes()
+                .len()
+                .saturating_add(RTP_TRANSPORT_ALLOWANCE)
+                .saturating_add(
+                    if self.senders[sender_index].descriptor.is_some()
+                        && media.frame.descriptor.is_some()
+                    {
+                        pulsebeam_core::dd::MAX_DD_LEN
+                    } else {
+                        0
+                    },
+                );
+            self.validate_frame(at, sender_index, &media, &packet)?;
+            crate::dependency_descriptor::validate(
+                &media.frame,
+                self.senders[sender_index]
+                    .descriptor
+                    .as_ref()
+                    .and(assignment.decode_target_mask),
+            )
             .map_err(|_| CommandError::InvalidFrameMetadata)?;
-        let payload_bytes = packet.payload().len();
-        let transport_estimate = media
-            .packet
-            .bytes()
-            .len()
-            .saturating_add(RTP_TRANSPORT_ALLOWANCE)
-            .saturating_add(
-                if self.senders[sender_index].descriptor.is_some()
-                    && media.frame.descriptor.is_some()
-                {
-                    pulsebeam_core::dd::MAX_DD_LEN
-                } else {
-                    0
-                },
+            self.offered_bytes = self.offered_bytes.saturating_add(payload_bytes as u64);
+            if self
+                .latest_useful_at(sender_index, media.packet.global_media_at())
+                .is_none_or(|deadline| at.global > deadline)
+            {
+                return Err(CommandError::MediaExpired);
+            }
+            let pacer_wait = self.predicted_pacer_wait(at.monotonic);
+            if self.senders[sender_index].selected_bitrate() == 0
+                || !self.useful_at(sender_index, media.packet.global_media_at(), at, pacer_wait)
+            {
+                return Err(CommandError::WouldBlock);
+            }
+            if self.queued_packets >= MAX_QUEUED_MEDIA_PACKETS
+                || payload_bytes
+                    > self
+                        .max_payload_bytes
+                        .saturating_sub(self.queued_payload_bytes)
+                || transport_estimate
+                    > MAX_PACED_TRANSPORT_BYTES.saturating_sub(self.queued_transport_bytes)
+            {
+                return Err(CommandError::WouldBlock);
+            }
+
+            let horizon = assignment.delivery.max_queue_residence;
+            let mut admission = self.senders[sender_index].admission;
+            let payload_eligible = admission.eligible(
+                at.monotonic,
+                self.senders[sender_index].selected_bitrate(),
+                horizon,
             );
-        self.validate_frame(at, sender_index, &media, &packet)?;
-        crate::dependency_descriptor::validate(
-            &media.frame,
-            self.senders[sender_index]
+            // Charge the entire frame, but gate its start rather than cutting its
+            // tail whenever a keyframe exceeds the nominal sender burst budget.
+            // Continuations still obey the queue, usefulness, and pacer bounds above.
+            if !payload_eligible
+                && matches!(
+                    media.frame.boundary,
+                    FrameBoundary::Start | FrameBoundary::Complete
+                )
+            {
+                return Err(CommandError::WouldBlock);
+            }
+
+            let descriptor_bytes = media
+                .frame
                 .descriptor
                 .as_ref()
-                .and(assignment.decode_target_mask),
-        )
-        .map_err(|_| CommandError::InvalidFrameMetadata)?;
-        self.offered_bytes = self.offered_bytes.saturating_add(payload_bytes as u64);
-        if self
-            .latest_useful_at(sender_index, media.packet.global_media_at())
-            .is_none_or(|deadline| at.global > deadline)
-        {
-            return Err(CommandError::MediaExpired);
-        }
-        let pacer_wait = self.predicted_pacer_wait(at.monotonic);
-        if self.senders[sender_index].selected_bitrate() == 0
-            || !self.useful_at(sender_index, media.packet.global_media_at(), at, pacer_wait)
-        {
-            return Err(CommandError::WouldBlock);
-        }
-        if self.queued_packets >= MAX_QUEUED_MEDIA_PACKETS
-            || payload_bytes
-                > self
-                    .max_payload_bytes
-                    .saturating_sub(self.queued_payload_bytes)
-            || transport_estimate
-                > MAX_PACED_TRANSPORT_BYTES.saturating_sub(self.queued_transport_bytes)
-        {
-            return Err(CommandError::WouldBlock);
-        }
-
-        let horizon = assignment.delivery.max_queue_residence;
-        let mut admission = self.senders[sender_index].admission;
-        let payload_eligible = admission.eligible(
-            at.monotonic,
-            self.senders[sender_index].selected_bitrate(),
-            horizon,
-        );
-        // Charge the entire frame, but gate its start rather than cutting its
-        // tail whenever a keyframe exceeds the nominal sender burst budget.
-        // Continuations still obey the queue, usefulness, and pacer bounds above.
-        if !payload_eligible
-            && matches!(
-                media.frame.boundary,
-                FrameBoundary::Start | FrameBoundary::Complete
-            )
-        {
-            return Err(CommandError::WouldBlock);
-        }
-
-        let descriptor_bytes = media
-            .frame
-            .descriptor
-            .as_ref()
-            .map_or(0, |_| crate::SourceDescriptor::MEMORY_CHARGE);
-        if descriptor_bytes > MAX_PACED_TRANSPORT_BYTES.saturating_sub(self.queued_descriptor_bytes)
-        {
-            return Err(CommandError::WouldBlock);
-        }
-        self.apply_frame_admission(sender_index, &media, &packet);
-        admission.charge(payload_bytes);
-        self.senders[sender_index].admission = admission;
-        self.admitted_bytes = self.admitted_bytes.saturating_add(payload_bytes as u64);
-        self.senders[sender_index].latest_admitted_global = Some(media.packet.global_media_at());
-        self.queued_payload_bytes = self.queued_payload_bytes.saturating_add(payload_bytes);
-        self.queued_descriptor_bytes = self
-            .queued_descriptor_bytes
-            .saturating_add(descriptor_bytes);
-        self.queued_transport_bytes = self
-            .queued_transport_bytes
-            .saturating_add(transport_estimate);
-        self.queued_packets = self.queued_packets.saturating_add(1);
-        self.senders[sender_index].queued_payload_bytes = self.senders[sender_index]
-            .queued_payload_bytes
-            .saturating_add(payload_bytes);
-        self.senders[sender_index]
-            .queued_frames
-            .insert(media.frame.id);
+                .map_or(0, |_| crate::SourceDescriptor::MEMORY_CHARGE);
+            if descriptor_bytes
+                > MAX_PACED_TRANSPORT_BYTES.saturating_sub(self.queued_descriptor_bytes)
+            {
+                return Err(CommandError::WouldBlock);
+            }
+            self.apply_frame_admission(sender_index, &media, &packet);
+            admission.charge(payload_bytes);
+            self.senders[sender_index].admission = admission;
+            self.admitted_bytes = self.admitted_bytes.saturating_add(payload_bytes as u64);
+            self.senders[sender_index].latest_admitted_global =
+                Some(media.packet.global_media_at());
+            self.queued_payload_bytes = self.queued_payload_bytes.saturating_add(payload_bytes);
+            self.queued_descriptor_bytes = self
+                .queued_descriptor_bytes
+                .saturating_add(descriptor_bytes);
+            self.queued_transport_bytes = self
+                .queued_transport_bytes
+                .saturating_add(transport_estimate);
+            self.queued_packets = self.queued_packets.saturating_add(1);
+            self.senders[sender_index].queued_payload_bytes = self.senders[sender_index]
+                .queued_payload_bytes
+                .saturating_add(payload_bytes);
+            self.senders[sender_index]
+                .queued_frames
+                .insert(media.frame.id);
+            Ok((
+                sender_index,
+                descriptor_bytes,
+                payload_bytes,
+                transport_estimate,
+            ))
+        })();
+        let (sender_index, descriptor_bytes, payload_bytes, transport_estimate) = match admission {
+            Ok(admission) => admission,
+            Err(reason) => return Err((reason, media)),
+        };
         self.senders[sender_index].queue.push_back(QueuedMedia {
             queued_at: at.monotonic,
             media,
@@ -3014,7 +3028,9 @@ mod tests {
         );
         owner.queued_descriptor_bytes = MAX_PACED_TRANSPORT_BYTES;
         assert_eq!(
-            owner.admit(at, sender, rejected.clone()),
+            owner
+                .admit(at, sender, rejected.clone())
+                .map_err(|(reason, _)| reason),
             Err(CommandError::WouldBlock)
         );
         assert!(owner.queued_packets == 0);
@@ -3857,15 +3873,21 @@ mod tests {
             .admit(at, sender, queued_media(at, 1, FrameBoundary::Start))
             .unwrap();
         assert_eq!(
-            owner.admit(at, sender, queued_media(at, 0, FrameBoundary::Complete)),
+            owner
+                .admit(at, sender, queued_media(at, 0, FrameBoundary::Complete))
+                .map_err(|(reason, _)| reason),
             Err(CommandError::InvalidFrameMetadata)
         );
         assert_eq!(
-            owner.admit(at, sender, queued_media(at, 1, FrameBoundary::Start)),
+            owner
+                .admit(at, sender, queued_media(at, 1, FrameBoundary::Start))
+                .map_err(|(reason, _)| reason),
             Err(CommandError::InvalidFrameMetadata)
         );
         assert_eq!(
-            owner.admit(at, sender, queued_media(at, 2, FrameBoundary::Start)),
+            owner
+                .admit(at, sender, queued_media(at, 2, FrameBoundary::Start))
+                .map_err(|(reason, _)| reason),
             Err(CommandError::FrameInterrupted)
         );
     }
@@ -3919,7 +3941,9 @@ mod tests {
             initial_debt + (payload_bytes as u128) * 8_000_000_000
         );
         assert_eq!(
-            owner.admit(at, sender, queued_media(at, 2, FrameBoundary::Complete)),
+            owner
+                .admit(at, sender, queued_media(at, 2, FrameBoundary::Complete))
+                .map_err(|(reason, _)| reason),
             Err(CommandError::WouldBlock)
         );
         let later = TimePoint {
@@ -3942,7 +3966,9 @@ mod tests {
         let sender = owner.senders[0].facts.id;
         for boundary in [FrameBoundary::Middle, FrameBoundary::End] {
             assert_eq!(
-                owner.admit(at, sender, queued_media(at, 1, boundary)),
+                owner
+                    .admit(at, sender, queued_media(at, 1, boundary))
+                    .map_err(|(reason, _)| reason),
                 Err(CommandError::FrameInterrupted)
             );
             assert!(owner.queued_packets == 0);
@@ -3971,7 +3997,9 @@ mod tests {
             );
             let original = end.packet.bytes().clone();
             assert_eq!(
-                owner.admit(at, sender, end.clone()),
+                owner
+                    .admit(at, sender, end.clone())
+                    .map_err(|(reason, _)| reason),
                 Err(CommandError::FrameInterrupted)
             );
             assert_eq!(owner.queued_packets, 1);
@@ -3992,7 +4020,9 @@ mod tests {
                 .admit(at, sender, middle.clone())
                 .expect("ordered missing packet may repair admission before discard");
             assert_eq!(
-                owner.admit(at, sender, middle),
+                owner
+                    .admit(at, sender, middle)
+                    .map_err(|(reason, _)| reason),
                 Err(CommandError::FrameInterrupted)
             );
             for offset in [4, 8] {
@@ -4005,12 +4035,16 @@ mod tests {
                     Arc::from([]),
                 );
                 assert_eq!(
-                    owner.admit(at, sender, changed),
+                    owner
+                        .admit(at, sender, changed)
+                        .map_err(|(reason, _)| reason),
                     Err(CommandError::InvalidFrameMetadata)
                 );
             }
             assert_eq!(
-                owner.admit(at, sender, end.clone()),
+                owner
+                    .admit(at, sender, end.clone())
+                    .map_err(|(reason, _)| reason),
                 Err(CommandError::WouldBlock)
             );
             assert_eq!(
@@ -4025,7 +4059,7 @@ mod tests {
                 .clear_sender_media(sender, false)
                 .expect("explicit recovery");
             assert_eq!(
-                owner.admit(at, sender, end),
+                owner.admit(at, sender, end).map_err(|(reason, _)| reason),
                 Err(CommandError::FrameInterrupted)
             );
         }
@@ -4171,7 +4205,9 @@ mod tests {
         dependent.frame.dependencies =
             FrameDependencies::Known(Arc::from([FrameId::from_value(1)]));
         assert_eq!(
-            owner.admit(later, video, dependent),
+            owner
+                .admit(later, video, dependent)
+                .map_err(|(reason, _)| reason),
             Err(CommandError::DependencyChainInterrupted)
         );
         owner
@@ -4207,13 +4243,13 @@ mod tests {
             FrameDependencies::Known(Arc::from([FrameId::from_value(1)]));
         assert!(matches!(
             owner.admit(at, id, dependent.clone()),
-            Err(CommandError::DependencyChainInterrupted)
+            Err((CommandError::DependencyChainInterrupted, _))
         ));
         owner
             .admit(at, id, queued_media(at, 3, FrameBoundary::Complete))
             .expect("fresh random access frame");
         assert_eq!(
-            owner.admit(at, id, dependent),
+            owner.admit(at, id, dependent).map_err(|(reason, _)| reason),
             Err(CommandError::WouldBlock),
             "a queued independent frame can restore the dependency chain"
         );
@@ -4599,12 +4635,16 @@ mod tests {
                 * u128::from(owner.senders[0].selected_bitrate());
             let sender = owner.senders[0].facts.id;
             assert_eq!(
-                owner.admit(at, sender, queued_media(at, 1, FrameBoundary::Complete)),
+                owner
+                    .admit(at, sender, queued_media(at, 1, FrameBoundary::Complete))
+                    .map_err(|(reason, _)| reason),
                 Ok(())
             );
             let blocked = queued_media(at, 2, FrameBoundary::Complete);
             assert_eq!(
-                owner.admit(at, sender, blocked.clone()),
+                owner
+                    .admit(at, sender, blocked.clone())
+                    .map_err(|(reason, _)| reason),
                 Err(CommandError::WouldBlock)
             );
             let debt = owner.senders[0].admission.debt;
@@ -4613,7 +4653,9 @@ mod tests {
                 global: at.global.checked_add(Duration::from_millis(201)).unwrap(),
             };
             assert_eq!(
-                owner.admit(late, sender, blocked),
+                owner
+                    .admit(late, sender, blocked)
+                    .map_err(|(reason, _)| reason),
                 Err(CommandError::MediaExpired)
             );
             assert_eq!(owner.senders[0].admission.debt, debt);
@@ -4621,7 +4663,9 @@ mod tests {
             owner.expire(late, MAX_EXPIRATIONS_PER_POLL);
             assert!(owner.queued_packets == 0);
             assert_eq!(
-                owner.admit(late, sender, queued_media(late, 3, FrameBoundary::Complete)),
+                owner
+                    .admit(late, sender, queued_media(late, 3, FrameBoundary::Complete))
+                    .map_err(|(reason, _)| reason),
                 Ok(())
             );
             assert_eq!(owner.queued_packets, 1);
@@ -4689,7 +4733,9 @@ mod tests {
             Arc::from([]),
         );
         assert_eq!(
-            owner.admit(at, ids[0], crate::test_support::forwarded(packet, 1)),
+            owner
+                .admit(at, ids[0], crate::test_support::forwarded(packet, 1))
+                .map_err(|(reason, _)| reason),
             Err(CommandError::WouldBlock)
         );
         for sender in ids {
@@ -4804,11 +4850,13 @@ mod tests {
         envelope.queue_delay = Duration::from_millis(400);
         owner.envelope = Some(envelope);
         assert_eq!(
-            owner.admit(
-                at,
-                owner.senders[0].facts.id,
-                queued_media(at, 1, FrameBoundary::Complete),
-            ),
+            owner
+                .admit(
+                    at,
+                    owner.senders[0].facts.id,
+                    queued_media(at, 1, FrameBoundary::Complete),
+                )
+                .map_err(|(reason, _)| reason),
             Err(CommandError::WouldBlock)
         );
         assert!(owner.recovery_permitted(envelope));
@@ -6828,12 +6876,16 @@ mod tests {
 
         for id in 1..=MAX_QUEUED_MEDIA_PACKETS {
             assert_eq!(
-                owner.admit(at, sender, media(u64::try_from(id).expect("bounded id"))),
+                owner
+                    .admit(at, sender, media(u64::try_from(id).expect("bounded id")))
+                    .map_err(|(reason, _)| reason),
                 Ok(())
             );
         }
         assert_eq!(
-            owner.admit(at, sender, media(9_000)),
+            owner
+                .admit(at, sender, media(9_000))
+                .map_err(|(reason, _)| reason),
             Err(CommandError::WouldBlock)
         );
     }

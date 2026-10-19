@@ -11,8 +11,8 @@ use sha2::{Digest, Sha256};
 use crate::{
     AcceptError, CloseReason, Command, CommandError, ConnectionConfig, ConnectionEntropy,
     ConnectionState, ConnectionStats, ConnectionWarning, Event, MediaPayloadBitrate, NetworkInput,
-    Output, PacketFeedbackKind, ReceiveError, SdpAnswer, SdpOffer, SessionInfo, StatsSnapshot,
-    TimePoint, Transmit,
+    Output, PacketFeedbackKind, ReceiveError, RejectedCommand, SdpAnswer, SdpOffer, SessionInfo,
+    StatsSnapshot, TimePoint, Transmit,
     egress::{MediaEgress, PrepareResult},
     ingress::IngressOwner,
     negotiation::{self, NegotiatedSessionFacts},
@@ -158,25 +158,88 @@ pub struct AcceptedConnection {
 }
 
 impl Connection {
-    pub fn command(&mut self, at: TimePoint, command: Command) -> Result<(), CommandError> {
+    #[allow(
+        clippy::result_large_err,
+        reason = "keep caller-owned input inline instead of allocating an error wrapper"
+    )]
+    pub fn command(&mut self, at: TimePoint, command: Command) -> Result<(), RejectedCommand> {
         let at = self._time.observe(at);
         if matches!(
             self.runtime.lifecycle,
             Lifecycle::ClosedPending(_) | Lifecycle::Closed(_)
         ) {
-            return Err(CommandError::Closed);
+            return Err(RejectedCommand {
+                reason: CommandError::Closed,
+                command,
+            });
         }
         if matches!(self.runtime.lifecycle, Lifecycle::Closing { .. }) {
-            return match command {
-                Command::CloseGracefully { .. } => Ok(()),
-                Command::RetireIceTcpFlow { flow } => self.retire_ice_tcp_flow(flow),
-                Command::Abort => {
-                    self.abort();
-                    Ok(())
-                }
-                _ => Err(CommandError::InvalidState),
-            };
+            if matches!(&command, Command::CloseGracefully { .. }) {
+                return Ok(());
+            }
+            if !matches!(&command, Command::RetireIceTcpFlow { .. } | Command::Abort) {
+                return Err(RejectedCommand {
+                    reason: CommandError::InvalidState,
+                    command,
+                });
+            }
         }
+        match command {
+            Command::SendMedia { sender, media } => {
+                let reason = match self._subsystems.transport.state() {
+                    TransportState::Connected => None,
+                    TransportState::Closed | TransportState::Failed => Some(CommandError::Closed),
+                    TransportState::Checking
+                    | TransportState::Connecting
+                    | TransportState::Draining => Some(CommandError::InvalidState),
+                };
+                if let Some(reason) = reason {
+                    return Err(RejectedCommand {
+                        reason,
+                        command: Command::SendMedia { sender, media },
+                    });
+                }
+                self._subsystems
+                    .egress
+                    .admit(at, sender, media)
+                    .map_err(|(reason, media)| RejectedCommand {
+                        reason,
+                        command: Command::SendMedia { sender, media },
+                    })
+            }
+            Command::OpenDataChannel(config) => {
+                let Some(sctp) = self._subsystems.sctp.as_mut() else {
+                    return Err(RejectedCommand {
+                        reason: CommandError::InvalidState,
+                        command: Command::OpenDataChannel(config),
+                    });
+                };
+                sctp.open(at, config)
+                    .map_err(|(reason, config)| RejectedCommand {
+                        reason,
+                        command: Command::OpenDataChannel(config),
+                    })
+            }
+            Command::SendData { channel, message } => {
+                let Some(sctp) = self._subsystems.sctp.as_mut() else {
+                    return Err(RejectedCommand {
+                        reason: CommandError::UnknownDataChannel(channel),
+                        command: Command::SendData { channel, message },
+                    });
+                };
+                sctp.send(at, channel, message)
+                    .map_err(|(reason, message)| RejectedCommand {
+                        reason,
+                        command: Command::SendData { channel, message },
+                    })
+            }
+            command => self
+                .command_control(at, &command)
+                .map_err(|reason| RejectedCommand { reason, command }),
+        }
+    }
+
+    fn command_control(&mut self, at: TimePoint, command: &Command) -> Result<(), CommandError> {
         match command {
             Command::AdmitIceTcpFlow {
                 flow,
@@ -185,70 +248,51 @@ impl Connection {
             } => self
                 ._subsystems
                 .transport
-                .admit_tcp_flow(flow, local, remote)
+                .admit_tcp_flow(*flow, *local, *remote)
                 .map_err(|error| match error {
                     TransportError::QueueFull => CommandError::WouldBlock,
                     TransportError::Closed => CommandError::Closed,
                     _ => CommandError::InvalidIceTcpFlow,
                 }),
-            Command::RetireIceTcpFlow { flow } => self.retire_ice_tcp_flow(flow),
-            Command::SendMedia { sender, media } => {
-                match self._subsystems.transport.state() {
-                    TransportState::Closed | TransportState::Failed => {
-                        return Err(CommandError::Closed);
-                    }
-                    TransportState::Connected => {}
-                    TransportState::Checking
-                    | TransportState::Connecting
-                    | TransportState::Draining => return Err(CommandError::InvalidState),
-                }
-                self._subsystems.egress.admit(at, sender, media)
-            }
+            Command::RetireIceTcpFlow { flow } => self.retire_ice_tcp_flow(*flow),
             Command::RecoverSenderMedia { sender, assignment } => self
                 ._subsystems
                 .egress
-                .set_assignment(sender, Some(assignment), at, true),
+                .set_assignment(*sender, Some(*assignment), at, true),
             Command::SetSenderAssignment { sender, assignment } => self
                 ._subsystems
                 .egress
-                .set_assignment(sender, assignment, at, false),
-            Command::OpenDataChannel(config) => self
-                ._subsystems
-                .sctp
-                .as_mut()
-                .ok_or(CommandError::InvalidState)?
-                .open(at, config),
-            Command::SendData { channel, message } => self
-                ._subsystems
-                .sctp
-                .as_mut()
-                .ok_or(CommandError::UnknownDataChannel(channel))?
-                .send(at, channel, message),
+                .set_assignment(*sender, *assignment, at, false),
             Command::CloseDataChannel { channel } => self
                 ._subsystems
                 .sctp
                 .as_mut()
-                .ok_or(CommandError::UnknownDataChannel(channel))?
-                .close_channel(at, channel),
+                .ok_or(CommandError::UnknownDataChannel(*channel))?
+                .close_channel(at, *channel),
             Command::RequestKeyframe { encoding } => {
-                let packet = self._subsystems.ingress.keyframe_request(encoding)?;
+                let packet = self._subsystems.ingress.keyframe_request(*encoding)?;
                 self._subsystems
                     .transport
                     .send_rtcp(&packet)
                     .map_err(|_| CommandError::InvalidState)
             }
-            Command::RetireEncoding { encoding } => self._subsystems.ingress.retire(encoding),
+            Command::RetireEncoding { encoding } => self._subsystems.ingress.retire(*encoding),
             Command::CloseGracefully { deadline } => {
-                self.runtime.lifecycle = Lifecycle::Closing { deadline };
+                self.runtime.lifecycle = Lifecycle::Closing {
+                    deadline: *deadline,
+                };
                 self._subsystems.egress.begin_shutdown();
                 if let Some(sctp) = self._subsystems.sctp.as_mut() {
-                    sctp.begin_shutdown(at, deadline);
+                    sctp.begin_shutdown(at, *deadline);
                 }
                 Ok(())
             }
             Command::Abort => {
                 self.abort();
                 Ok(())
+            }
+            Command::SendMedia { .. } | Command::OpenDataChannel(_) | Command::SendData { .. } => {
+                Err(CommandError::InvalidState)
             }
         }
     }
@@ -1226,7 +1270,11 @@ mod tests {
                     sender: fixture.sender,
                     media,
                 }) {
-                    Ok(()) | Err(CommandError::WouldBlock) => {}
+                    Ok(())
+                    | Err(pulsebeam_rtc::RejectedCommand {
+                        reason: CommandError::WouldBlock,
+                        ..
+                    }) => {}
                     Err(error) => panic!("unexpected media error: {error:?}"),
                 }
             }
@@ -1265,7 +1313,11 @@ mod tests {
                 sender: fixture.sender,
                 media,
             }) {
-                Ok(()) | Err(CommandError::WouldBlock) => {}
+                Ok(())
+                | Err(pulsebeam_rtc::RejectedCommand {
+                    reason: CommandError::WouldBlock,
+                    ..
+                }) => {}
                 Err(error) => panic!("unexpected media error: {error:?}"),
             }
         }
@@ -1383,7 +1435,11 @@ mod tests {
                         sender: fixture.sender,
                         media,
                     }) {
-                        Ok(()) | Err(CommandError::WouldBlock) => {}
+                        Ok(())
+                        | Err(pulsebeam_rtc::RejectedCommand {
+                            reason: CommandError::WouldBlock,
+                            ..
+                        }) => {}
                         Err(error) => panic!("{name} admission: {error:?}"),
                     }
                 }
@@ -1567,7 +1623,11 @@ mod tests {
                 sender: fixture.sender,
                 media,
             }) {
-                Ok(()) | Err(CommandError::WouldBlock) => {}
+                Ok(())
+                | Err(pulsebeam_rtc::RejectedCommand {
+                    reason: CommandError::WouldBlock,
+                    ..
+                }) => {}
                 Err(error) => panic!("unexpected media error: {error:?}"),
             }
         }

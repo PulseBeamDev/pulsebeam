@@ -214,7 +214,10 @@ fn run(scenario: Scenario) {
                     latest_global = Some(media.packet.global_media_at());
                     break;
                 }
-                Err(CommandError::WouldBlock) => {
+                Err(pulsebeam_rtc::RejectedCommand {
+                    reason: CommandError::WouldBlock,
+                    ..
+                }) => {
                     fixture.drive_for(FEEDBACK_INTERVAL);
                     let packet = selected_source.send_source(&vec![0x5a; PAYLOAD_BYTES]);
                     media = forwarded(packet, id);

@@ -242,8 +242,10 @@ Configuration explicitly bounds dynamic encodings, channel count, message
 sizes, buffered DataChannel data, media queues, retransmission history, protocol
 state, feedback history, and per-poll work.
 
-Outbound pressure returns a typed `WouldBlock` before exceeding configured
-bounds. Authenticated violations are isolated to their stream or channel where
+Command rejection returns `RejectedCommand { reason, command }`, preserving the
+original owned packet, message, or channel configuration without a defensive
+clone. Retry the returned command after `WouldBlock` pressure clears; discard
+intrinsically expired media rather than retrying it. Authenticated violations are isolated to their stream or channel where
 protocol semantics permit. Malformed or unauthenticated network input is
 normally dropped and counted rather than surfaced as an application error.
 

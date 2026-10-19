@@ -70,10 +70,12 @@ fn video_frame_expiry_requests_recovery_before_idle_and_preserves_continuity() {
     dependent.frame.random_access = false;
     dependent.frame.dependencies = FrameDependencies::Known(Arc::from([FrameId::from_value(1)]));
     assert_eq!(
-        fixture.try_command(Command::SendMedia {
-            sender: fixture.sender,
-            media: dependent
-        }),
+        fixture
+            .try_command(Command::SendMedia {
+                sender: fixture.sender,
+                media: dependent
+            })
+            .map_err(|rejected| rejected.reason),
         Err(CommandError::DependencyChainInterrupted)
     );
     fixture
@@ -108,7 +110,10 @@ fn video_frame_expiry_requests_recovery_before_idle_and_preserves_continuity() {
                 admitted = true;
                 break;
             }
-            Err(CommandError::WouldBlock) => fixture.drive_for(Duration::from_millis(1)),
+            Err(pulsebeam_rtc::RejectedCommand {
+                reason: CommandError::WouldBlock,
+                ..
+            }) => fixture.drive_for(Duration::from_millis(1)),
             Err(error) => panic!("dependent admission after recovery: {error:?}"),
         }
     }

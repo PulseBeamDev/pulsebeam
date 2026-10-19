@@ -161,44 +161,58 @@ impl Association {
         &mut self,
         at: TimePoint,
         config: DataChannelConfig,
-    ) -> Result<(), CommandError> {
-        if self.stopped || self.socket.state() != SocketState::Connected {
-            return Err(CommandError::InvalidState);
-        }
-        if self.channels.len() >= self.max_channels {
-            return Err(CommandError::WouldBlock);
-        }
-        let stream = match config.id {
-            Some(id) => StreamId(id.value()),
-            None => self.allocate_stream().ok_or(CommandError::WouldBlock)?,
+    ) -> Result<(), (CommandError, DataChannelConfig)> {
+        let admission = (|| {
+            if self.stopped || self.socket.state() != SocketState::Connected {
+                return Err(CommandError::InvalidState);
+            }
+            if self.channels.len() >= self.max_channels {
+                return Err(CommandError::WouldBlock);
+            }
+            let stream = match config.id {
+                Some(id) => StreamId(id.value()),
+                None => self.allocate_stream().ok_or(CommandError::WouldBlock)?,
+            };
+            if self.channels.iter().any(|channel| {
+                channel.stream == stream || config.id.is_some_and(|id| channel.id == id)
+            }) {
+                return Err(CommandError::InvalidState);
+            }
+            if config.label.len() > usize::from(u16::MAX)
+                || config.protocol.len() > usize::from(u16::MAX)
+                || 12_usize
+                    .saturating_add(config.label.len())
+                    .saturating_add(config.protocol.len())
+                    > MAX_DCEP_MESSAGE_BYTES
+                || matches!(
+                    config.reliability,
+                    DataReliability::MaxLifetime(lifetime)
+                        if lifetime.as_millis() > u128::from(u32::MAX)
+                )
+            {
+                return Err(CommandError::InvalidState);
+            }
+            self.socket
+                .set_stream_priority(stream, config.priority.weight());
+            self.advance_time(at.monotonic);
+            if !config.negotiated {
+                self.socket
+                    .send(
+                        Message::new(stream, DCEP_PPID, encode_dcep_open(&config)),
+                        &SendOptions::default(),
+                    )
+                    .map_err(map_send_error)?;
+            }
+            Ok(stream)
+        })();
+        let stream = match admission {
+            Ok(stream) => stream,
+            Err(reason) => return Err((reason, config)),
         };
-        if self
-            .channels
-            .iter()
-            .any(|channel| channel.stream == stream || config.id.is_some_and(|id| channel.id == id))
-        {
-            return Err(CommandError::InvalidState);
-        }
-        if config.label.len() > usize::from(u16::MAX)
-            || config.protocol.len() > usize::from(u16::MAX)
-            || 12_usize
-                .saturating_add(config.label.len())
-                .saturating_add(config.protocol.len())
-                > MAX_DCEP_MESSAGE_BYTES
-            || matches!(
-                config.reliability,
-                DataReliability::MaxLifetime(lifetime)
-                    if lifetime.as_millis() > u128::from(u32::MAX)
-            )
-        {
-            return Err(CommandError::InvalidState);
-        }
         let id = config
             .id
             .unwrap_or_else(|| DataChannelId::from_value(stream.0));
         let negotiated = config.negotiated;
-        self.socket
-            .set_stream_priority(stream, config.priority.weight());
         self.channels.push(Channel {
             id,
             stream,
@@ -213,23 +227,11 @@ impl Association {
             sent_messages: 0,
             received_messages: 0,
         });
-        self.advance_time(at.monotonic);
         if negotiated {
             self.emit_opened(stream);
-            return Ok(());
+        } else {
+            self.drain_socket();
         }
-        let Some(channel) = self.channel(stream) else {
-            return Err(CommandError::InvalidState);
-        };
-        let payload = encode_dcep_open(&channel.config);
-        if let Err(error) = self.socket.send(
-            Message::new(stream, DCEP_PPID, payload),
-            &SendOptions::default(),
-        ) {
-            self.channels.retain(|channel| channel.stream != stream);
-            return Err(map_send_error(error));
-        }
-        self.drain_socket();
         Ok(())
     }
 
@@ -238,45 +240,51 @@ impl Association {
         at: TimePoint,
         channel: DataChannelId,
         message: DataMessage,
-    ) -> Result<(), CommandError> {
-        let Some(entry) = self.channels.iter().find(|entry| entry.id == channel) else {
-            return Err(CommandError::UnknownDataChannel(channel));
+    ) -> Result<(), (CommandError, DataMessage)> {
+        let admission = (|| {
+            let Some(entry) = self.channels.iter().find(|entry| entry.id == channel) else {
+                return Err(CommandError::UnknownDataChannel(channel));
+            };
+            if self.stopped || entry.state != ChannelState::Open {
+                return Err(CommandError::InvalidState);
+            }
+            let stream = entry.stream;
+            let payload_bytes = match &message {
+                DataMessage::Text(bytes) | DataMessage::Binary(bytes) => bytes.len(),
+            };
+            if payload_bytes > self.max_outbound_message_bytes {
+                return Err(CommandError::MessageTooLarge);
+            }
+            if self
+                .buffered_payload_bytes
+                .checked_add(payload_bytes)
+                .is_none_or(|total| total > self.max_buffered_bytes)
+            {
+                return Err(CommandError::WouldBlock);
+            }
+            if self.lifecycles.len() >= MAX_BUFFERED_MESSAGES {
+                return Err(CommandError::WouldBlock);
+            }
+            let (ppid, payload) = match &message {
+                DataMessage::Text(bytes) if bytes.is_empty() => (EMPTY_TEXT_PPID, vec![0]),
+                DataMessage::Binary(bytes) if bytes.is_empty() => (EMPTY_BINARY_PPID, vec![0]),
+                DataMessage::Text(bytes) => (TEXT_PPID, bytes.to_vec()),
+                DataMessage::Binary(bytes) => (BINARY_PPID, bytes.to_vec()),
+            };
+            let lifecycle = self.next_lifecycle;
+            let lifecycle_id = LifecycleId::new(lifecycle).ok_or(CommandError::WouldBlock)?;
+            let options = send_options(&entry.config, lifecycle_id);
+            self.advance_time(at.monotonic);
+            self.socket
+                .send(Message::new(stream, ppid, payload), &options)
+                .map_err(map_send_error)?;
+            Ok((stream, lifecycle, payload_bytes))
+        })();
+        let (stream, lifecycle, payload_bytes) = match admission {
+            Ok(admission) => admission,
+            Err(reason) => return Err((reason, message)),
         };
-        if self.stopped || entry.state != ChannelState::Open {
-            return Err(CommandError::InvalidState);
-        }
-        let stream = entry.stream;
-        let config = entry.config.clone();
-        let payload_bytes = match &message {
-            DataMessage::Text(bytes) | DataMessage::Binary(bytes) => bytes.len(),
-        };
-        if payload_bytes > self.max_outbound_message_bytes {
-            return Err(CommandError::MessageTooLarge);
-        }
-        if self
-            .buffered_payload_bytes
-            .checked_add(payload_bytes)
-            .is_none_or(|total| total > self.max_buffered_bytes)
-        {
-            return Err(CommandError::WouldBlock);
-        }
-        if self.lifecycles.len() >= MAX_BUFFERED_MESSAGES {
-            return Err(CommandError::WouldBlock);
-        }
-        let (ppid, payload) = match message {
-            DataMessage::Text(bytes) if bytes.is_empty() => (EMPTY_TEXT_PPID, vec![0]),
-            DataMessage::Binary(bytes) if bytes.is_empty() => (EMPTY_BINARY_PPID, vec![0]),
-            DataMessage::Text(bytes) => (TEXT_PPID, bytes.to_vec()),
-            DataMessage::Binary(bytes) => (BINARY_PPID, bytes.to_vec()),
-        };
-        let lifecycle = self.next_lifecycle;
         self.next_lifecycle = self.next_lifecycle.checked_add(1).unwrap_or(1);
-        let lifecycle_id = LifecycleId::new(lifecycle).ok_or(CommandError::WouldBlock)?;
-        let options = send_options(&config, lifecycle_id);
-        self.advance_time(at.monotonic);
-        self.socket
-            .send(Message::new(stream, ppid, payload), &options)
-            .map_err(map_send_error)?;
         self.buffered_payload_bytes += payload_bytes;
         self.lifecycles.push_back(BufferedMessage {
             lifecycle,
@@ -1014,7 +1022,8 @@ mod tests {
         let channel = opened_channel(&left_events).expect("local opened");
         assert_eq!(opened_channel(&right_events), Some(channel));
         assert_eq!(
-            left.open(at(now, start), config(DataReliability::Reliable, true)),
+            left.open(at(now, start), config(DataReliability::Reliable, true))
+                .map_err(|(reason, _)| reason),
             Err(CommandError::WouldBlock)
         );
 
@@ -1162,7 +1171,8 @@ mod tests {
                 at(now, start),
                 channel,
                 DataMessage::Binary(Bytes::from_static(&[2; 24])),
-            ),
+            )
+            .map_err(|(reason, _)| reason),
             Err(CommandError::WouldBlock)
         );
         assert_eq!(left.stats().buffered_payload_bytes, 48);

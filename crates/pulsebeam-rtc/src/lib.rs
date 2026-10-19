@@ -39,7 +39,8 @@ pub use io::{
     AcceptError, AuthenticatedFlow, CloseReason, Command, CommandError, ConnectionState,
     ConnectionStats, ConnectionWarning, DataChannelEvent, DataChannelStats, EcnCodepoint,
     EncodingInfo, EncodingRetireReason, EncodingStats, Event, KeyframeRequestReason, NetworkInput,
-    Output, PlayoutDelayStatus, ReceiveError, SenderStats, StatsSnapshot, Transmit, TransmitTarget,
+    Output, PlayoutDelayStatus, ReceiveError, RejectedCommand, SenderStats, StatsSnapshot,
+    Transmit, TransmitTarget,
 };
 pub use media_packet::{
     ForwardedMedia, FrameBoundary, FrameDependencies, FrameMetadata, MediaPacket, MediaPacketView,

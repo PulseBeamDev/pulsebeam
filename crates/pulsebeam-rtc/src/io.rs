@@ -116,6 +116,15 @@ pub enum Command {
     Abort,
 }
 
+/// Inspect `reason` before retrying or discarding the original owned `command`.
+#[derive(Debug, Error)]
+#[error("{reason}")]
+pub struct RejectedCommand {
+    #[source]
+    pub reason: CommandError,
+    pub command: Command,
+}
+
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum Output {

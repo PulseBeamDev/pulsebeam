@@ -110,7 +110,10 @@ impl ScalingCell {
                         media: forwarded(packet.clone(), id),
                     }) {
                         Ok(()) => admitted += 1,
-                        Err(CommandError::WouldBlock) => blocked += 1,
+                        Err(pulsebeam_rtc::RejectedCommand {
+                            reason: CommandError::WouldBlock,
+                            ..
+                        }) => blocked += 1,
                         Err(error) => panic!("unexpected admission error: {error:?}"),
                     }
                 }

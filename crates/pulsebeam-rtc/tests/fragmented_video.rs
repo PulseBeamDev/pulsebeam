@@ -113,13 +113,16 @@ fn source_middle_loss_interrupts_native_frame_without_committing_a_false_end() {
     let mut lost_middle = forwarded(end.clone(), 77);
     lost_middle.frame.boundary = FrameBoundary::End;
     assert_eq!(
-        fixture.connection.command(
-            fixture.at(),
-            Command::SendMedia {
-                sender: fixture.sender,
-                media: lost_middle
-            }
-        ),
+        fixture
+            .connection
+            .command(
+                fixture.at(),
+                Command::SendMedia {
+                    sender: fixture.sender,
+                    media: lost_middle
+                }
+            )
+            .map_err(|rejected| rejected.reason),
         Err(CommandError::FrameInterrupted)
     );
     let rejected = fixture.connection.stats();
@@ -186,10 +189,12 @@ fn frame_metadata_must_match_all_fragments_without_wire_dd() {
             let mut changed = media.clone();
             changed.frame.random_access = false;
             assert_eq!(
-                fixture.try_command(Command::SendMedia {
-                    sender: fixture.sender,
-                    media: changed
-                }),
+                fixture
+                    .try_command(Command::SendMedia {
+                        sender: fixture.sender,
+                        media: changed
+                    })
+                    .map_err(|rejected| rejected.reason),
                 Err(CommandError::InvalidFrameMetadata),
             );
             let after = fixture.connection.stats();

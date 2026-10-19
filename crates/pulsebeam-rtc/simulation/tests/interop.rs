@@ -283,7 +283,11 @@ fn exercise(seed: u64, start: Instant) -> (u64, u64, usize) {
         }
         while let Some(media) = pending.pop_front() {
             match connection.command(point(world.now()), Command::SendMedia { sender, media }) {
-                Ok(()) | Err(pulsebeam_rtc::CommandError::WouldBlock) => {}
+                Ok(())
+                | Err(pulsebeam_rtc::RejectedCommand {
+                    reason: pulsebeam_rtc::CommandError::WouldBlock,
+                    ..
+                }) => {}
                 Err(error) => panic!("media command: {error:?}"),
             }
         }

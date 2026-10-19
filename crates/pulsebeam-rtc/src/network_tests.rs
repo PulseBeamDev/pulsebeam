@@ -60,7 +60,11 @@ fn production_connection_bottleneck_emits_measured_transport_bytes() {
             sender: fixture.sender,
             media,
         }) {
-            Ok(()) | Err(CommandError::WouldBlock) => {}
+            Ok(())
+            | Err(pulsebeam_rtc::RejectedCommand {
+                reason: CommandError::WouldBlock,
+                ..
+            }) => {}
             Err(error) => panic!("production admission at {id}: {error:?}"),
         }
         fixture.drive_for(Duration::from_millis(1));
@@ -151,13 +155,17 @@ fn production_two_megabit_single_flow_capacity() {
     let mut source = ComponentSource::audio(1);
     for id in 1..=6_000_u64 {
         let media = forwarded(source.sample(fixture.at(), &[0x5a; PAYLOAD_BYTES]), id);
-        match fixture.connection.command(
-            fixture.at(),
-            Command::SendMedia {
-                sender: fixture.sender,
-                media,
-            },
-        ) {
+        match fixture
+            .connection
+            .command(
+                fixture.at(),
+                Command::SendMedia {
+                    sender: fixture.sender,
+                    media,
+                },
+            )
+            .map_err(|rejected| rejected.reason)
+        {
             Ok(()) | Err(CommandError::WouldBlock) => {}
             Err(error) => panic!("admission: {error:?}"),
         }
@@ -236,7 +244,11 @@ fn production_capacity_steps_recover_stable_transport_service() {
         for (source, &sender) in sources.iter_mut().zip(&senders) {
             let media = forwarded(source.sample(fixture.at(), &[0x5a; PAYLOAD_BYTES]), id);
             match fixture.try_command(Command::SendMedia { sender, media }) {
-                Ok(()) | Err(CommandError::WouldBlock) => {}
+                Ok(())
+                | Err(pulsebeam_rtc::RejectedCommand {
+                    reason: CommandError::WouldBlock,
+                    ..
+                }) => {}
                 Err(error) => panic!("step admission: {error:?}"),
             }
         }
@@ -330,13 +342,17 @@ fn production_homogeneous_shared_bottleneck_competition() {
             let source = &mut sources[index];
             flow.drive_for(tick.saturating_duration_since(flow.at().monotonic));
             let media = forwarded(source.sample(flow.at(), &[0x5a; PAYLOAD_BYTES]), id);
-            match flow.connection.command(
-                flow.at(),
-                Command::SendMedia {
-                    sender: flow.sender,
-                    media,
-                },
-            ) {
+            match flow
+                .connection
+                .command(
+                    flow.at(),
+                    Command::SendMedia {
+                        sender: flow.sender,
+                        media,
+                    },
+                )
+                .map_err(|rejected| rejected.reason)
+            {
                 Ok(()) | Err(CommandError::WouldBlock) => {}
                 Err(error) => panic!("shared-flow admission: {error:?}"),
             }

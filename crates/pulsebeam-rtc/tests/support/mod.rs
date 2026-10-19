@@ -23,8 +23,8 @@ use pulsebeam_rtc::{
     DataChannelEvent, DataChannelId, DataMessage, DeliveryConstraints, Event as ConnectionEvent,
     ForwardedMedia, FrameBoundary, FrameDependencies, FrameId, FrameMetadata, GlobalMediaTime,
     IceTcpFlowId, LocalCandidate, MediaPacket, MediaPayloadBitrate, NetworkInput,
-    Output as ConnectionOutput, SdpOffer, SenderAssignment, SenderId, SourceIncarnation, TimePoint,
-    TransmitTarget,
+    Output as ConnectionOutput, RejectedCommand, SdpOffer, SenderAssignment, SenderId,
+    SourceIncarnation, TimePoint, TransmitTarget,
 };
 use pulsebeam_rtc_simulation::*;
 
@@ -331,21 +331,34 @@ impl PeerFixture<()> {
 }
 
 impl PeerFixture {
-    pub fn admit_media(&mut self, media: ForwardedMedia) -> Result<(), CommandError> {
+    #[allow(
+        clippy::result_large_err,
+        reason = "keep caller-owned input inline instead of allocating an error wrapper"
+    )]
+    pub fn admit_media(&mut self, media: ForwardedMedia) -> Result<(), RejectedCommand> {
         let deadline = self
             .at()
             .monotonic
             .checked_add(Duration::from_millis(150))
             .expect("fixture admission deadline");
+        let mut command = Command::SendMedia {
+            sender: self.sender,
+            media,
+        };
         loop {
-            match self.try_command(Command::SendMedia {
-                sender: self.sender,
-                media: media.clone(),
-            }) {
-                Err(CommandError::WouldBlock) if self.at().monotonic < deadline => {
+            match self.connection.command(self.at(), command) {
+                Ok(()) => {
+                    self.connection_idle = false;
+                    return Ok(());
+                }
+                Err(rejected)
+                    if rejected.reason == CommandError::WouldBlock
+                        && self.at().monotonic < deadline =>
+                {
+                    command = rejected.command;
                     self.drive_for(Duration::from_millis(1));
                 }
-                result => return result,
+                Err(rejected) => return Err(rejected),
             }
         }
     }
@@ -1292,14 +1305,19 @@ impl<M> PeerFixture<M> {
     }
 
     pub fn command(&mut self, command: Command) {
-        if let Err(error) = self.try_command(command) {
+        if let Err(rejected) = self.try_command(command) {
             panic!(
-                "connection command: {error:?}; stats={:?}",
+                "connection command: {:?}; stats={:?}",
+                rejected.reason,
                 self.connection.stats().connection,
             );
         }
     }
-    pub fn try_command(&mut self, command: Command) -> Result<(), CommandError> {
+    #[allow(
+        clippy::result_large_err,
+        reason = "keep caller-owned input inline instead of allocating an error wrapper"
+    )]
+    pub fn try_command(&mut self, command: Command) -> Result<(), RejectedCommand> {
         let result = self.connection.command(self.at(), command);
         if result.is_ok() {
             self.connection_idle = false;

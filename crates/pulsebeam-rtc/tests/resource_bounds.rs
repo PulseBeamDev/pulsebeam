@@ -70,33 +70,47 @@ fn media_queue_admission_is_exact_and_preserves_ownership_on_would_block() {
 
     for id in 1..=2 {
         assert_eq!(
-            fixture.connection.command(
-                fixture.at(),
-                Command::SendMedia {
-                    sender: fixture.sender,
-                    media: forwarded(packet.clone(), id),
-                },
-            ),
+            fixture
+                .connection
+                .command(
+                    fixture.at(),
+                    Command::SendMedia {
+                        sender: fixture.sender,
+                        media: forwarded(packet.clone(), id),
+                    },
+                )
+                .map_err(|rejected| rejected.reason),
             Ok(())
         );
     }
     let rejected = forwarded(packet, 3);
     let rejected_global = rejected.packet.global_media_at();
-    assert_eq!(
-        fixture.connection.command(
+    let packet_storage = rejected.packet.bytes().as_ptr();
+    let rejected = fixture
+        .connection
+        .command(
             fixture.at(),
             Command::SendMedia {
                 sender: fixture.sender,
-                media: rejected.clone(),
+                media: rejected,
             },
-        ),
-        Err(CommandError::WouldBlock)
-    );
-    assert_eq!(rejected.packet.global_media_at(), rejected_global);
+        )
+        .expect_err("queue is full");
+    assert_eq!(rejected.reason, CommandError::WouldBlock);
+    let Command::SendMedia { media, .. } = &rejected.command else {
+        panic!("rejected command retains its variant");
+    };
+    assert_eq!(media.packet.global_media_at(), rejected_global);
+    assert_eq!(media.packet.bytes().as_ptr(), packet_storage);
     assert_eq!(
         fixture.connection.stats().senders[0].queued_payload_bytes,
         2
     );
+    fixture.drive_for(std::time::Duration::from_millis(50));
+    fixture
+        .connection
+        .command(fixture.at(), rejected.command)
+        .expect("retry the original owned command");
 }
 
 #[test]
@@ -114,28 +128,41 @@ fn data_channel_count_and_buffered_payload_stop_at_configured_limits() {
     };
 
     assert_eq!(
-        fixture.connection.command(
-            fixture.at(),
-            Command::SendData {
-                channel,
-                message: DataMessage::Binary(Bytes::from_static(b"12345678")),
-            },
-        ),
+        fixture
+            .connection
+            .command(
+                fixture.at(),
+                Command::SendData {
+                    channel,
+                    message: DataMessage::Binary(Bytes::from_static(b"12345678")),
+                },
+            )
+            .map_err(|rejected| rejected.reason),
         Ok(())
     );
     assert_eq!(fixture.connection.stats().connection.buffered_data_bytes, 8);
-    let one_more = Bytes::from_static(b"x");
-    assert_eq!(
-        fixture.connection.command(
+    let one_more = Bytes::from(vec![b'x']);
+    let payload_storage = one_more.as_ptr();
+    let rejected = fixture
+        .connection
+        .command(
             fixture.at(),
             Command::SendData {
                 channel,
-                message: DataMessage::Binary(one_more.clone()),
+                message: DataMessage::Binary(one_more),
             },
-        ),
-        Err(CommandError::WouldBlock)
-    );
-    assert_eq!(one_more.as_ref(), b"x");
+        )
+        .expect_err("data buffer is full");
+    assert_eq!(rejected.reason, CommandError::WouldBlock);
+    let Command::SendData {
+        message: DataMessage::Binary(payload),
+        ..
+    } = &rejected.command
+    else {
+        panic!("rejected data keeps its channel and message");
+    };
+    assert_eq!(payload.as_ref(), b"x");
+    assert_eq!(payload.as_ptr(), payload_storage);
 
     let config = pulsebeam_rtc::DataChannelConfig {
         id: None,
@@ -146,12 +173,32 @@ fn data_channel_count_and_buffered_payload_stop_at_configured_limits() {
         priority: pulsebeam_rtc::DataChannelPriority::MEDIUM,
         negotiated: false,
     };
-    assert_eq!(
-        fixture
-            .connection
-            .command(fixture.at(), Command::OpenDataChannel(config)),
-        Err(CommandError::WouldBlock)
-    );
+    let label_storage = config.label.as_ptr();
+    let rejected_open = fixture
+        .connection
+        .command(fixture.at(), Command::OpenDataChannel(config))
+        .expect_err("channel limit");
+    assert_eq!(rejected_open.reason, CommandError::WouldBlock);
+    let Command::OpenDataChannel(config) = rejected_open.command else {
+        panic!("rejected channel retains its configuration");
+    };
+    assert_eq!(config.label.as_ref(), "second");
+    assert_eq!(config.label.as_ptr(), label_storage);
+    fixture.command(Command::Abort);
+    let rejected = fixture
+        .connection
+        .command(fixture.at(), rejected.command)
+        .expect_err("closed connection");
+    assert_eq!(rejected.reason, CommandError::Closed);
+    let Command::SendData {
+        message: DataMessage::Binary(payload),
+        ..
+    } = rejected.command
+    else {
+        panic!("closed-state rejection retains data");
+    };
+    assert_eq!(payload.as_ref(), b"x");
+    assert_eq!(payload.as_ptr(), payload_storage);
 }
 
 #[test]

@@ -100,13 +100,16 @@ fn browser_default_and_explicit_zero_have_distinct_wire_behavior() {
         .expect("bound sender");
     default.playout_delay = None;
     assert_eq!(
-        fixture.connection.command(
-            fixture.at(),
-            Command::SetSenderAssignment {
-                sender: fixture.sender,
-                assignment: Some(default)
-            }
-        ),
+        fixture
+            .connection
+            .command(
+                fixture.at(),
+                Command::SetSenderAssignment {
+                    sender: fixture.sender,
+                    assignment: Some(default)
+                }
+            )
+            .map_err(|rejected| rejected.reason),
         Err(CommandError::PlayoutResetRequiresNewSender(fixture.sender))
     );
 }
@@ -205,13 +208,16 @@ fn unspecified_and_zero_wire_delay_respect_explicit_media_age() {
         let packet = fixture.send_source(b"expired media");
         fixture.drive_for(Duration::from_millis(200));
         assert_eq!(
-            fixture.connection.command(
-                fixture.at(),
-                Command::SendMedia {
-                    sender: fixture.sender,
-                    media: forwarded(packet, 1),
-                }
-            ),
+            fixture
+                .connection
+                .command(
+                    fixture.at(),
+                    Command::SendMedia {
+                        sender: fixture.sender,
+                        media: forwarded(packet, 1),
+                    }
+                )
+                .map_err(|rejected| rejected.reason),
             Err(CommandError::MediaExpired)
         );
         assert_eq!(

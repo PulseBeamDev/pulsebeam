@@ -21,10 +21,12 @@ fn assignment_is_required_and_invalid_updates_preserve_the_previous_binding() {
     let media = forwarded(fixture.send_source(b"explicit source binding"), 1);
     let unbound = fixture.connection.stats().senders;
     assert_eq!(
-        fixture.try_command(Command::SendMedia {
-            sender: fixture.sender,
-            media: media.clone()
-        }),
+        fixture
+            .try_command(Command::SendMedia {
+                sender: fixture.sender,
+                media: media.clone()
+            })
+            .map_err(|rejected| rejected.reason),
         Err(CommandError::SenderUnbound(fixture.sender))
     );
     assert_eq!(fixture.connection.stats().senders, unbound);
@@ -37,10 +39,12 @@ fn assignment_is_required_and_invalid_updates_preserve_the_previous_binding() {
     invalid.potential_bitrate = MediaPayloadBitrate::from_bps(0);
     let before = fixture.connection.stats().senders;
     assert_eq!(
-        fixture.try_command(Command::SetSenderAssignment {
-            sender: fixture.sender,
-            assignment: Some(invalid)
-        }),
+        fixture
+            .try_command(Command::SetSenderAssignment {
+                sender: fixture.sender,
+                assignment: Some(invalid)
+            })
+            .map_err(|rejected| rejected.reason),
         Err(CommandError::InvalidSenderAssignment)
     );
     assert_eq!(fixture.connection.stats().senders, before);
@@ -53,10 +57,12 @@ fn assignment_is_required_and_invalid_updates_preserve_the_previous_binding() {
             _ => invalid.delivery.repair_window = Duration::MAX,
         }
         assert_eq!(
-            fixture.try_command(Command::SetSenderAssignment {
-                sender: fixture.sender,
-                assignment: Some(invalid)
-            }),
+            fixture
+                .try_command(Command::SetSenderAssignment {
+                    sender: fixture.sender,
+                    assignment: Some(invalid)
+                })
+                .map_err(|rejected| rejected.reason),
             Err(CommandError::InvalidSenderAssignment)
         );
         assert_eq!(fixture.connection.stats().senders, before);
@@ -65,20 +71,24 @@ fn assignment_is_required_and_invalid_updates_preserve_the_previous_binding() {
     let mut foreign_assignment = assignment;
     foreign_assignment.source = SourceIncarnation::from_value(2);
     assert_eq!(
-        fixture.try_command(Command::RecoverSenderMedia {
-            sender: fixture.sender,
-            assignment: foreign_assignment
-        }),
+        fixture
+            .try_command(Command::RecoverSenderMedia {
+                sender: fixture.sender,
+                assignment: foreign_assignment
+            })
+            .map_err(|rejected| rejected.reason),
         Err(CommandError::SourceIncarnationMismatch)
     );
     assert_eq!(fixture.connection.stats().senders, before);
     let mut foreign = media.clone();
     foreign.source = SourceIncarnation::from_value(2);
     assert_eq!(
-        fixture.try_command(Command::SendMedia {
-            sender: fixture.sender,
-            media: foreign
-        }),
+        fixture
+            .try_command(Command::SendMedia {
+                sender: fixture.sender,
+                media: foreign
+            })
+            .map_err(|rejected| rejected.reason),
         Err(CommandError::SourceIncarnationMismatch)
     );
     assert_eq!(fixture.connection.stats().senders, before);
@@ -108,10 +118,12 @@ fn finite_media_age_is_independent_of_wire_playout_intent() {
         });
         let before = fixture.connection.stats().senders;
         assert_eq!(
-            fixture.try_command(Command::SendMedia {
-                sender: fixture.sender,
-                media: media.clone()
-            }),
+            fixture
+                .try_command(Command::SendMedia {
+                    sender: fixture.sender,
+                    media: media.clone()
+                })
+                .map_err(|rejected| rejected.reason),
             Err(CommandError::MediaExpired)
         );
         assert_eq!(fixture.connection.stats().senders, before);
@@ -135,10 +147,12 @@ fn potential_interest_cannot_admit_paused_media_and_complete_assignment_can_resu
     });
     let packet = fixture.send_source(b"paused source");
     assert_eq!(
-        fixture.try_command(Command::SendMedia {
-            sender: fixture.sender,
-            media: forwarded(packet, 1)
-        }),
+        fixture
+            .try_command(Command::SendMedia {
+                sender: fixture.sender,
+                media: forwarded(packet, 1)
+            })
+            .map_err(|rejected| rejected.reason),
         Err(CommandError::WouldBlock)
     );
     fixture.drive_for(Duration::from_millis(100));
@@ -164,7 +178,10 @@ fn potential_interest_cannot_admit_paused_media_and_complete_assignment_can_resu
                 admitted = true;
                 break;
             }
-            Err(CommandError::WouldBlock) => fixture.drive_for(Duration::from_millis(2)),
+            Err(pulsebeam_rtc::RejectedCommand {
+                reason: CommandError::WouldBlock,
+                ..
+            }) => fixture.drive_for(Duration::from_millis(2)),
             Err(error) => panic!("unexpected resume error: {error:?}"),
         }
     }

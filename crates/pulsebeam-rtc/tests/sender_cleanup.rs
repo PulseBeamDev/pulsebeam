@@ -50,10 +50,12 @@ fn replacement_fences_old_source_without_rewinding_committed_continuity() {
     assert_eq!(sender.queued_payload_bytes, 0);
     assert_eq!(sender.transmitted_packets, 1);
     assert_eq!(
-        fixture.try_command(Command::SendMedia {
-            sender: fixture.sender,
-            media: forwarded(replacement.clone(), 3)
-        }),
+        fixture
+            .try_command(Command::SendMedia {
+                sender: fixture.sender,
+                media: forwarded(replacement.clone(), 3)
+            })
+            .map_err(|rejected| rejected.reason),
         Err(CommandError::SourceIncarnationMismatch)
     );
     let mut media = forwarded(replacement, 3);
@@ -200,7 +202,7 @@ fn assignment_rejects_unknown_sender_without_changing_existing_queue() {
         media: forwarded(source, 1),
     });
     assert!(
-        matches!(fixture.connection.command(fixture.at(), Command::SetSenderAssignment {sender: missing,assignment:None}), Err(CommandError::UnknownSender(id)) if id == missing)
+        matches!(fixture.connection.command(fixture.at(), Command::SetSenderAssignment {sender: missing,assignment:None}), Err(pulsebeam_rtc::RejectedCommand { reason: CommandError::UnknownSender(id), .. }) if id == missing)
     );
     assert_eq!(
         fixture

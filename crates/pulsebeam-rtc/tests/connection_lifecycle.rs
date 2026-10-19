@@ -40,7 +40,12 @@ fn abort_discards_queued_output_and_emits_terminal_once() -> Result<(), AcceptEr
     let now = Instant::now();
     let mut connection = connection(now)?;
 
-    assert_eq!(connection.command(at(now), Command::Abort), Ok(()));
+    assert_eq!(
+        connection
+            .command(at(now), Command::Abort)
+            .map_err(|rejected| rejected.reason),
+        Ok(())
+    );
     assert!(matches!(
         connection.poll(at(now)),
         Output::Closed(CloseReason::Aborted)
@@ -50,7 +55,9 @@ fn abort_discards_queued_output_and_emits_terminal_once() -> Result<(), AcceptEr
         Output::Idle { next_wakeup: None }
     ));
     assert_eq!(
-        connection.command(at(now), Command::Abort),
+        connection
+            .command(at(now), Command::Abort)
+            .map_err(|rejected| rejected.reason),
         Err(CommandError::Closed)
     );
     assert_eq!(
@@ -79,11 +86,15 @@ fn graceful_close_is_idempotent_and_honors_an_immediate_deadline() -> Result<(),
     let mut connection = connection(now)?;
 
     assert_eq!(
-        connection.command(at(now), Command::CloseGracefully { deadline: now }),
+        connection
+            .command(at(now), Command::CloseGracefully { deadline: now })
+            .map_err(|rejected| rejected.reason),
         Ok(())
     );
     assert_eq!(
-        connection.command(at(now), Command::CloseGracefully { deadline: now }),
+        connection
+            .command(at(now), Command::CloseGracefully { deadline: now })
+            .map_err(|rejected| rejected.reason),
         Ok(())
     );
     assert!(matches!(
@@ -95,7 +106,9 @@ fn graceful_close_is_idempotent_and_honors_an_immediate_deadline() -> Result<(),
         Output::Idle { next_wakeup: None }
     ));
     assert_eq!(
-        connection.command(at(now), Command::CloseGracefully { deadline: now }),
+        connection
+            .command(at(now), Command::CloseGracefully { deadline: now })
+            .map_err(|rejected| rejected.reason),
         Err(CommandError::Closed)
     );
     Ok(())

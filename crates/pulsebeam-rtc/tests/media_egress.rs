@@ -182,36 +182,45 @@ fn public_command_rejects_invalid_work_without_mutating_sender_continuity() {
     let mut invalid = forwarded(source.clone(), 1);
     invalid.frame.boundary = FrameBoundary::Middle;
     assert_eq!(
-        fixture.connection.command(
-            fixture.at(),
-            Command::SendMedia {
-                sender: fixture.sender,
-                media: invalid,
-            },
-        ),
+        fixture
+            .connection
+            .command(
+                fixture.at(),
+                Command::SendMedia {
+                    sender: fixture.sender,
+                    media: invalid,
+                },
+            )
+            .map_err(|rejected| rejected.reason),
         Err(CommandError::FrameInterrupted)
     );
     assert_eq!(
-        fixture.connection.command(
-            fixture.at(),
-            Command::SendMedia {
-                sender: unknown,
-                media: forwarded(source.clone(), 2),
-            },
-        ),
+        fixture
+            .connection
+            .command(
+                fixture.at(),
+                Command::SendMedia {
+                    sender: unknown,
+                    media: forwarded(source.clone(), 2),
+                },
+            )
+            .map_err(|rejected| rejected.reason),
         Err(CommandError::UnknownSender(unknown))
     );
     let mut policy = support::sender_assignment(pulsebeam_rtc::MediaPayloadBitrate::from_bps(0));
     policy.selected_bitrate = MediaPayloadBitrate::from_bps(1_000_000);
     policy.potential_bitrate = MediaPayloadBitrate::from_bps(1_000_000);
     assert_eq!(
-        fixture.connection.command(
-            fixture.at(),
-            Command::SetSenderAssignment {
-                sender: fixture.sender,
-                assignment: Some(policy)
-            },
-        ),
+        fixture
+            .connection
+            .command(
+                fixture.at(),
+                Command::SetSenderAssignment {
+                    sender: fixture.sender,
+                    assignment: Some(policy)
+                },
+            )
+            .map_err(|rejected| rejected.reason),
         Ok(())
     );
 
@@ -296,25 +305,31 @@ fn public_send_media_reports_invalid_and_closed_transport_states() {
     let packet = source.send_source(b"payload");
     let mut fixture = PeerFixture::unconnected();
     assert_eq!(
-        fixture.connection.command(
-            fixture.at(),
-            Command::SendMedia {
-                sender: fixture.sender,
-                media: forwarded(packet.clone(), 1),
-            },
-        ),
+        fixture
+            .connection
+            .command(
+                fixture.at(),
+                Command::SendMedia {
+                    sender: fixture.sender,
+                    media: forwarded(packet.clone(), 1),
+                },
+            )
+            .map_err(|rejected| rejected.reason),
         Err(CommandError::InvalidState)
     );
 
     fixture.expire_connection();
     assert_eq!(
-        fixture.connection.command(
-            fixture.at(),
-            Command::SendMedia {
-                sender: fixture.sender,
-                media: forwarded(packet, 2),
-            },
-        ),
+        fixture
+            .connection
+            .command(
+                fixture.at(),
+                Command::SendMedia {
+                    sender: fixture.sender,
+                    media: forwarded(packet, 2),
+                },
+            )
+            .map_err(|rejected| rejected.reason),
         Err(CommandError::Closed)
     );
 }
@@ -326,24 +341,30 @@ fn public_media_admission_enforces_exact_configured_payload_bound() {
     let packet = source.send_source(&[0xf8]);
     for id in 1..=2 {
         assert_eq!(
-            bytes.connection.command(
-                bytes.at(),
-                Command::SendMedia {
-                    sender: bytes.sender,
-                    media: forwarded(packet.clone(), id),
-                },
-            ),
+            bytes
+                .connection
+                .command(
+                    bytes.at(),
+                    Command::SendMedia {
+                        sender: bytes.sender,
+                        media: forwarded(packet.clone(), id),
+                    },
+                )
+                .map_err(|rejected| rejected.reason),
             Ok(())
         );
     }
     assert_eq!(
-        bytes.connection.command(
-            bytes.at(),
-            Command::SendMedia {
-                sender: bytes.sender,
-                media: forwarded(packet, 3),
-            },
-        ),
+        bytes
+            .connection
+            .command(
+                bytes.at(),
+                Command::SendMedia {
+                    sender: bytes.sender,
+                    media: forwarded(packet, 3),
+                },
+            )
+            .map_err(|rejected| rejected.reason),
         Err(CommandError::WouldBlock)
     );
 }
@@ -365,29 +386,35 @@ fn lost_frame_end_has_explicit_recovery_without_resetting_committed_identity() {
     let mut duplicate = forwarded(source, 1);
     duplicate.frame.boundary = FrameBoundary::Start;
     assert_eq!(
-        fixture.try_command(Command::SendMedia {
-            sender: fixture.sender,
-            media: duplicate,
-        }),
+        fixture
+            .try_command(Command::SendMedia {
+                sender: fixture.sender,
+                media: duplicate,
+            })
+            .map_err(|rejected| rejected.reason),
         Err(CommandError::InvalidFrameMetadata)
     );
     let fresh_packet = fixture.send_source(b"fresh independent frame");
     let global = fresh_packet.global_media_at();
     let mut fresh = forwarded(fresh_packet.clone(), 2);
     assert_eq!(
-        fixture.try_command(Command::SendMedia {
-            sender: fixture.sender,
-            media: fresh.clone(),
-        }),
+        fixture
+            .try_command(Command::SendMedia {
+                sender: fixture.sender,
+                media: fresh.clone(),
+            })
+            .map_err(|rejected| rejected.reason),
         Err(CommandError::FrameInterrupted)
     );
     let mut malformed = fresh.clone();
     malformed.frame.dependencies = FrameDependencies::Known(Arc::from([FrameId::from_value(2)]));
     assert_eq!(
-        fixture.try_command(Command::SendMedia {
-            sender: fixture.sender,
-            media: malformed,
-        }),
+        fixture
+            .try_command(Command::SendMedia {
+                sender: fixture.sender,
+                media: malformed,
+            })
+            .map_err(|rejected| rejected.reason),
         Err(CommandError::InvalidFrameMetadata)
     );
     assert_eq!(fixture.connection.stats().senders[0].queued_packets, 0);
@@ -403,10 +430,12 @@ fn lost_frame_end_has_explicit_recovery_without_resetting_committed_identity() {
     dependent.frame.random_access = false;
     dependent.frame.dependencies = FrameDependencies::Known(Arc::from([FrameId::from_value(1)]));
     assert_eq!(
-        fixture.try_command(Command::SendMedia {
-            sender: fixture.sender,
-            media: dependent,
-        }),
+        fixture
+            .try_command(Command::SendMedia {
+                sender: fixture.sender,
+                media: dependent,
+            })
+            .map_err(|rejected| rejected.reason),
         Err(CommandError::DependencyChainInterrupted)
     );
     fixture.command(Command::SendMedia {
@@ -572,14 +601,19 @@ fn invalid_decode_target_masks_reject_before_committing_continuity() {
             assignment: Some(assignment),
         });
         if mask == 0 {
-            assert_eq!(updated, Err(CommandError::InvalidSenderAssignment));
+            assert_eq!(
+                updated.map_err(|rejected| rejected.reason),
+                Err(CommandError::InvalidSenderAssignment)
+            );
         } else {
             updated.expect("nonzero selection requires source validation");
             assert_eq!(
-                fixture.try_command(Command::SendMedia {
-                    sender: fixture.sender,
-                    media: media.clone()
-                }),
+                fixture
+                    .try_command(Command::SendMedia {
+                        sender: fixture.sender,
+                        media: media.clone()
+                    })
+                    .map_err(|rejected| rejected.reason),
                 Err(CommandError::InvalidFrameMetadata)
             );
         }

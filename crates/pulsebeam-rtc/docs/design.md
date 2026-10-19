@@ -75,7 +75,7 @@ impl Connection {
         &mut self,
         at: TimePoint,
         command: Command,
-    ) -> Result<(), CommandError>;
+    ) -> Result<(), RejectedCommand>;
 
     pub fn poll(&mut self, at: TimePoint) -> Output;
 
@@ -365,8 +365,8 @@ successful command means the packet was accepted for immediate transmission or
 bounded queueing; it does not mean the packet will necessarily survive later
 congestion or deadline shedding. An intrinsically expired packet returns typed
 `MediaExpired`, which callers discard rather than retry. Temporary pressure
-returns typed `WouldBlock` before taking
-ownership when a configured bound would be exceeded.
+returns `RejectedCommand` with reason `WouldBlock` and the original command
+when a configured bound would be exceeded.
 
 `CloseGracefully` rejects new application work, continues required protocol
 shutdown traffic, and becomes closed no later than its deadline. `Abort` drops all
@@ -533,52 +533,20 @@ Peer-controlled malformed packets are normally dropped and counted rather than
 returned as API errors. Public errors describe caller input, negotiation, or a
 terminal connection condition.
 
-```rust
-#[non_exhaustive]
-pub enum AcceptError {
-    InvalidOffer,
-    UnsupportedSessionProfile,
-    MissingPacketFeedback,
-    CapabilityConflict,
-    SessionLimitExceeded,
-    InvalidConfiguration,
-    CryptographicFailure,
-}
+The concrete [error definitions](../src/io.rs) are authoritative.
+`Connection::command` returns `RejectedCommand { reason, command }`: the reason
+is a `CommandError`, and the command contains the original owned packet,
+message, or channel configuration. Returning it requires neither a defensive
+input clone nor an allocated error wrapper. The caller may retry the returned command after
+`WouldBlock` pressure clears. `MediaExpired` is terminal for that packet;
+binding/frame errors require correcting the command or recovering the sender
+rather than repeatedly resubmitting unchanged input.
 
-#[non_exhaustive]
-pub enum ReceiveError {
-    Closed,
-    UnknownIceTcpFlow,
-    InvalidNetworkEnvelope,
-    InputLimitExceeded,
-}
+Media rejection does not advance sender admission debt or frame continuity.
+SCTP rejection does not consume a channel or message lifecycle identity.
+Protocol time and offered-load accounting can still advance during a rejected
+call.
 
-#[non_exhaustive]
-pub enum CommandError {
-    Closed,
-    UnknownSender(SenderId),
-    UnknownEncoding(EncodingId),
-    UnknownDataChannel(DataChannelId),
-    InvalidPolicy(PolicyError),
-    InvalidIceTcpFlow,
-    InvalidFrameMetadata,
-    MediaExpired,
-    FrameInterrupted,
-    DependencyChainInterrupted,
-    PlayoutResetRequiresNewSender(SenderId),
-    InvalidState,
-    MessageTooLarge,
-    WouldBlock,
-}
-
-#[non_exhaustive]
-pub enum PolicyError {
-    PlayoutRange,
-    PlayoutNotExactlyRepresentable,
-    PriorityOutOfRange,
-    BitrateOutOfRange,
-}
-```
 
 Low-level parser, SRTP, SCTP, SCReAM, TWCC, and RTCP errors are translated into
 these semantic categories or into bounded statistics. They are never wrapped as
@@ -1307,7 +1275,8 @@ an inferred combined delivered-rate estimate or a fixed-rate reservation. Ready
 SCTP output takes precedence over padding. DataChannels cannot bypass protocol
 service or indefinitely starve eligible media; blocked SCTP does not stall RTP.
 
-Outbound pressure returns `CommandError::WouldBlock` before taking the message.
+Outbound pressure returns the original owned command in `RejectedCommand` with
+reason `CommandError::WouldBlock`.
 An oversized authenticated inbound message closes the channel where SCTP/WebRTC
 semantics permit rather than the peer connection. Malformed unauthenticated
 traffic is dropped and counted.

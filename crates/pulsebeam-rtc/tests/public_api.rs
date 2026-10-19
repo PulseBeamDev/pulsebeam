@@ -45,7 +45,7 @@ fn connection_runtime_methods_have_the_public_sans_io_signatures() {
     let _: fn(&mut Connection, TimePoint, NetworkInput) -> Result<(), ReceiveError> =
         Connection::receive;
     let _: fn(&mut Connection, TimePoint) -> Output = Connection::poll;
-    let _: fn(&mut Connection, TimePoint, Command) -> Result<(), CommandError> =
+    let _: fn(&mut Connection, TimePoint, Command) -> Result<(), pulsebeam_rtc::RejectedCommand> =
         Connection::command;
     let _: fn(&Connection) -> StatsSnapshot = Connection::stats;
 }
