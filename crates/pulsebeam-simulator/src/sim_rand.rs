@@ -63,7 +63,10 @@ fn fill_with_dev_urandom(dest: &mut [u8]) -> io::Result<()> {
 #[unsafe(no_mangle)]
 #[inline(never)]
 pub unsafe extern "C" fn getrandom(buf: *mut u8, buflen: usize, _flags: u32) -> isize {
-    if buf.is_null() || buflen == 0 {
+    if buflen == 0 {
+        return 0;
+    }
+    if buf.is_null() {
         return -1;
     }
     let dest = unsafe { std::slice::from_raw_parts_mut(buf, buflen) };

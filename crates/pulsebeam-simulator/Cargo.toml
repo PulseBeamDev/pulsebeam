@@ -19,6 +19,7 @@ anyhow.workspace = true
 bytes = "1"
 fastrand.workspace = true
 ctor = "1.0.10"
+dimpl = { version = "0.7.2", default-features = false, features = ["rust-crypto"] }
 futures = "0.3.32"
 http = "1.4.1"
 http-body-util = "0.1"  # Crucial for .collect().await
@@ -39,6 +40,9 @@ pulsebeam-core = { path = "../pulsebeam-core", features = ["sim"] }
 pulsebeam-runtime = { path = "../pulsebeam-runtime", features = ["sim"] }
 pulsebeam-testdata = { path = "../pulsebeam-testdata" }
 reqwest = "0.13.4"
+serde.workspace = true
+serde_json = "1"
+sha2.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 tower = { version = "0.5.3", features = ["util"] }

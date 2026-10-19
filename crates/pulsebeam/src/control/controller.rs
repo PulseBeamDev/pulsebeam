@@ -343,6 +343,9 @@ impl ControllerActor {
                 }
             };
 
+            #[cfg(feature = "sim")]
+            crate::sim_metrics::wait_controller_stall().await;
+
             let action = self.tick(
                 &mut command_rx,
                 &mut shard_event_rx,
@@ -1050,19 +1053,30 @@ impl ControllerActor {
     ) -> Result<PendingMaterialization, ControllerError> {
         let participant_id = state.participant_id;
         let (slot, placement) = self.core.room_slot(&state.room_id);
-        let shard = match placement {
-            RoomPlacement::Hashed => self
-                .router
-                .stable_route(&state.room_id)
-                .ok_or(ControllerError::ServiceUnavailable)?,
-            RoomPlacement::RoundRobin => {
-                let shard_count = self.router.shard_count();
-                debug_assert_ne!(shard_count, 0);
-                ShardId::new(
-                    slot.checked_rem(shard_count)
-                        .ok_or(ControllerError::ServiceUnavailable)?,
-                )
-            }
+        // A replacement (native POST or fenced PATCH) changes the transport,
+        // not placement. Counting an already-live participant as a new admission
+        // would collapse room reconfigurations onto one shard.
+        let current_owner = self
+            .core
+            .registry
+            .get_participant(&participant_id)
+            .map(|meta| meta.shard_id);
+        let shard = match current_owner {
+            Some(shard) => shard,
+            None => match placement {
+                RoomPlacement::Hashed => self
+                    .router
+                    .stable_route(&state.room_id)
+                    .ok_or(ControllerError::ServiceUnavailable)?,
+                RoomPlacement::RoundRobin => {
+                    let shard_count = self.router.shard_count();
+                    debug_assert_ne!(shard_count, 0);
+                    ShardId::new(
+                        slot.checked_rem(shard_count)
+                            .ok_or(ControllerError::ServiceUnavailable)?,
+                    )
+                }
+            },
         };
         let now = tokio::time::Instant::now();
         let address = self.core.reserve_transport(shard, now);

@@ -2,6 +2,7 @@
 
 from contextlib import redirect_stderr, redirect_stdout
 import importlib.util
+import json
 from io import StringIO
 import os
 from pathlib import Path
@@ -135,6 +136,69 @@ class SimulationRunnerContract(unittest.TestCase):
         self.assertIn("unsigned 64-bit integer", output)
 
 
+class BoundedTraversalContract(unittest.TestCase):
+    def model(self, failing=False):
+        self.visited = []
+
+        def execute(prefix, _):
+            choices = []
+
+            def choose(site, enabled):
+                index = len(choices)
+                selected = prefix[index]["selected"] if index < len(prefix) else 0
+                choices.append({"site": site, "enabled": enabled, "selected": selected})
+                return selected
+
+            root = choose("root", ["left", "right"])
+            # The left subtree has two leaves, the right three. The tree is
+            # independently countable and its enabled sets depend on the path.
+            leaf = choose(f"nested/{root}", [str(n) for n in range(2 + root)])
+            self.visited.append((root, leaf))
+            return {"choices": choices, "disabled": [],
+                    "outcome": "counterexample" if failing and (root, leaf) == (1, 2) else "satisfied"}
+        return execute
+
+    def test_all_state_dependent_leaves_exactly_once(self):
+        result = RUNNER.traverse(self.model(), 10, 100, {"root": {"left", "right"}, "nested": {"0", "1", "2"}})
+        self.assertEqual(result["status"], "complete")
+        self.assertEqual(result["completed"], 5)
+        self.assertCountEqual(self.visited, [(0, 0), (0, 1), (1, 0), (1, 1), (1, 2)])
+
+    def test_admissible_failing_leaf_is_not_pruned(self):
+        result = RUNNER.traverse(self.model(failing=True), 10, 100, {})
+        self.assertEqual(result["status"], "counterexample")
+        self.assertIn((1, 2), self.visited)
+
+    def test_path_and_wall_cutoffs_are_incomplete(self):
+        result = RUNNER.traverse(self.model(), 1, 100, {})
+        self.assertEqual(result["status"], "incomplete")
+        self.assertEqual(result["completed"], 1)
+        with patch.object(RUNNER.time, "perf_counter", side_effect=[0, 2]):
+            result = RUNNER.traverse(self.model(), 10, 1, {})
+        self.assertEqual(result["status"], "incomplete")
+        self.assertEqual(self.visited, [])
+
+    def test_replaced_alternative_cannot_satisfy_domain_coverage(self):
+        result = RUNNER.traverse(self.model(), 10, 100,
+                                 {"root": {"left", "missing-alternative"}})
+        self.assertEqual(result["status"], "invalid-model")
+        self.assertEqual(result["missing"], {"root": ["missing-alternative"]})
+
+    def test_prefix_divergence_and_unexercised_domains_fail(self):
+        result = RUNNER.traverse(self.model(), 10, 100, {"absent-fault": {"none", "forced"}})
+        self.assertEqual(result["status"], "invalid-model")
+        calls = 0
+
+        def changed(prefix, _):
+            nonlocal calls
+            calls += 1
+            return {"outcome": "satisfied", "disabled": [], "choices": [
+                {"site": "root" if calls == 1 else "changed", "enabled": ["a", "b"], "selected": 0}
+            ]}
+        result = RUNNER.traverse(changed, 10, 100, {})
+        self.assertEqual(result["status"], "replay-divergence")
+
+
 # The two cases rendezvous through a FIFO. They cannot complete in one worker,
 # and distinct PIDs prove that global clock/RNG hooks never share a process.
 LIBTEST = '''import os
@@ -164,16 +228,79 @@ if os.environ.get("FAIL_CASE") == name:
 '''
 
 
+BOUNDED_LIBTEST = '''import json
+import os
+from pathlib import Path
+import sys
+
+case = "tests::exploration::bounded_cross_shard"
+if "--list" in sys.argv:
+    if "--ignored" not in sys.argv:
+        print(case + ": test")
+    sys.exit(0)
+domains = DOMAINS
+prefix = json.loads(Path(os.environ["PULSEBEAM_BOUNDED_PREFIX"]).read_text())
+choices = []
+def choose(site, enabled):
+    index = len(choices)
+    selection = prefix[index]["selected"] if index < len(prefix) else 0
+    choices.append(dict(site=site, enabled=enabled, selected=selection))
+    return selection
+root = choose("application/declarations", domains["application"])
+families = ["fault", "host/declarations", "host/rejoin", "timing", "udp-pair"]
+if root < len(families):
+    family = families[root]
+    choose(family + "/fixture", domains[family])
+failed = root == 5 and os.environ.get("FAIL_BOUNDED")
+artifact = dict(build=os.environ["PULSEBEAM_BOUNDED_BUILD"], dependencies="fixture",
+                fixture="fixture", scenario=dict(model="runner-fixture"),
+                choices=choices, observations=["positive delivery"], consumed=[], disabled=[],
+                outcome="counterexample" if failed else "satisfied", diagnostic=None)
+if os.environ.get("PULSEBEAM_BOUNDED_REPLAY"):
+    recorded = json.loads(Path(os.environ["PULSEBEAM_BOUNDED_REPLAY"]).read_text())
+    assert recorded == artifact, "strict fixture replay diverged"
+Path(os.environ["PULSEBEAM_BOUNDED_OUTPUT"]).write_text(json.dumps(artifact))
+print("complete bounded fixture trace")
+sys.exit(int(bool(failed)))
+'''.replace("DOMAINS", repr({key: sorted(domain) for key, domain in RUNNER.BOUNDED_DOMAINS.items()}))
+
+
 class SimulationProcessesContract(unittest.TestCase):
-    def run_fixture(self, root, *args, env=None):
+    def run_fixture(self, root, *args, env=None, fixture=LIBTEST):
         binary = root / "libtest"
-        binary.write_text(f"#!{sys.executable}\n" + LIBTEST)
+        binary.write_text(f"#!{sys.executable}\n" + fixture)
         binary.chmod(0o755)
         return subprocess.run(
             [sys.executable, str(Path(RUNNER.__file__)), str(binary), *args],
             env=os.environ | {"TEST_TMPDIR": str(root), "TEST_UNDECLARED_OUTPUTS_DIR": str(root)} | (env or {}),
             capture_output=True, text=True, timeout=20,
         )
+
+    def test_bounded_children_traverse_and_strictly_replay_in_fresh_process(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            result = self.run_fixture(root, fixture=BOUNDED_LIBTEST)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            report = json.loads((root / "simulations/bounded-0000/report.json").read_text())
+            # Six leaves under root 0, two each under roots 1..4, one under 5.
+            self.assertEqual(report["completed"], 15)
+            self.assertEqual(report["status"], "complete")
+            self.assertEqual(report["replay"]["outcome"], "satisfied")
+            self.assertEqual(len(list(root.glob("simulations/bounded-0000/branch-*.json"))), 16)
+            self.assertEqual(list(root.glob("simulations/*.log")), [])
+
+    def test_bounded_failure_retains_counterexample_and_trace(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            result = self.run_fixture(root, fixture=BOUNDED_LIBTEST, env={"FAIL_BOUNDED": "1"})
+            self.assertEqual(result.returncode, 1, result.stderr)
+            report = json.loads((root / "simulations/bounded-0000/report.json").read_text())
+            self.assertEqual(report["status"], "counterexample")
+            self.assertEqual(report["completed"], 14)
+            artifact = Path(report["artifact"]["path"])
+            self.assertEqual(json.loads(artifact.read_text())["outcome"], "counterexample")
+            self.assertIn("--bounded-replay " + str(artifact), result.stdout)
+            self.assertEqual(len(list(root.glob("simulations/*.log"))), 1)
 
     def test_workers_coexist_in_distinct_processes_with_grouped_metrics(self):
         with tempfile.TemporaryDirectory() as temp:

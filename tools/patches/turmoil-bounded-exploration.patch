@@ -1,0 +1,441 @@
+diff --git a/src/exploration.rs b/src/exploration.rs
+new file mode 100644
+--- /dev/null
++++ b/src/exploration.rs
+@@ -0,0 +1,88 @@
++//! Opt-in, thread-local controls at host and UDP execution boundaries.
++//!
++//! With no guard installed all upstream scheduling and transport policies remain
++//! unchanged. TCP segments are never exposed as reorderable datagrams.
++use std::{
++    cell::RefCell,
++    marker::PhantomData,
++    net::{IpAddr, SocketAddr},
++    rc::Rc,
++    time::Duration,
++};
++
++/// An actual execution boundary, with the live inputs available there.
++pub enum Event<'a> {
++    Hosts {
++        step: usize,
++        runnable: &'a [IpAddr],
++    },
++    Udp {
++        src: SocketAddr,
++        dst: SocketAddr,
++        bytes: &'a [u8],
++    },
++    UdpPair {
++        src: SocketAddr,
++        dst: SocketAddr,
++        first: &'a [u8],
++        second: &'a [u8],
++    },
++    UdpDelivered {
++        src: SocketAddr,
++        dst: SocketAddr,
++        bytes: &'a [u8],
++    },
++}
++
++/// A local intervention. Invalid event/decision combinations are rejected.
++#[derive(Clone, Copy, Debug, Default)]
++pub enum Decision {
++    #[default]
++    Default,
++    Hosts {
++        reverse: bool,
++    },
++    Udp {
++        delay: Duration,
++        drop: bool,
++        duplicate: bool,
++    },
++    UdpPair {
++        reverse: bool,
++    },
++}
++
++type Hook = Box<dyn for<'a> FnMut(Event<'a>) -> Decision>;
++thread_local! {
++    static HOOK: RefCell<Option<Hook>> = const { RefCell::new(None) };
++}
++
++/// Removes the control on drop, including unwinding. It cannot cross threads.
++pub struct Guard(PhantomData<Rc<()>>);
++
++/// Install a control for this simulation thread. Nested controls are an error.
++pub fn install(hook: impl for<'a> FnMut(Event<'a>) -> Decision + 'static) -> Guard {
++    HOOK.with(|slot| {
++        let mut slot = slot.borrow_mut();
++        assert!(slot.is_none(), "nested exploration control");
++        *slot = Some(Box::new(hook));
++    });
++    Guard(PhantomData)
++}
++
++impl Drop for Guard {
++    fn drop(&mut self) {
++        HOOK.with(|slot| *slot.borrow_mut() = None);
++    }
++}
++
++pub(crate) fn active() -> bool {
++    HOOK.with(|slot| slot.borrow().is_some())
++}
++
++pub(crate) fn choose(event: Event<'_>) -> Decision {
++    HOOK.with(|slot| match slot.borrow_mut().as_mut() {
++        Some(hook) => hook(event),
++        None => Decision::Default,
++    })
++}
+diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -166,50 +166,52 @@
+ //!
+ //! ## tokio_unstable
+ //!
+ //! Turmoil uses [unhandled_panic] to forward host panics as test failures. See
+ //! [unstable features] to opt in.
+ //!
+ //! [unhandled_panic]:
+ //!     https://docs.rs/tokio/latest/tokio/runtime/struct.Builder.html#method.unhandled_panic
+ //! [unstable features]: https://docs.rs/tokio/latest/tokio/#unstable-features
+ 
+ #[cfg(doctest)]
+ mod readme;
+ 
+ mod builder;
+ 
+ use std::{net::IpAddr, time::Duration};
+ 
+ pub use builder::Builder;
+ 
+ mod config;
+ use config::Config;
+ 
+ mod dns;
+ use dns::Dns;
+ pub use dns::{ToIpAddr, ToIpAddrs, ToSocketAddrs};
++
++pub mod exploration;
+ 
+ mod envelope;
+ use envelope::Envelope;
+ pub use envelope::{Datagram, Protocol, Segment};
+ 
+ mod error;
+ pub use error::Result;
+ 
+ mod host;
+ use host::Host;
+ 
+ mod ip;
+ pub use ip::IpVersion;
+ 
+ #[cfg(feature = "unstable-fs")]
+ pub mod fs;
+ #[cfg(feature = "unstable-fs")]
+ pub use fs::FsConfig;
+ 
+ #[cfg(feature = "unstable-barriers")]
+ pub mod barriers;
+ 
+ pub mod net;
+ 
+ mod rt;
+diff --git a/src/sim.rs b/src/sim.rs
+--- a/src/sim.rs
++++ b/src/sim.rs
+@@ -407,52 +407,72 @@
+     /// `tick_duration` in the builder.
+     ///
+     /// The simulated network also steps, processing in flight messages, and
+     /// delivering them to their destination if appropriate.
+     ///
+     /// Returns whether or not all clients have completed.
+     pub fn step(&mut self) -> Result<bool> {
+         tracing::trace!(target: TRACING_TARGET, "step {}", self.steps);
+ 
+         let tick = self.config.tick;
+         let mut is_finished = true;
+ 
+         // Tick the networking, processing messages. This is done before
+         // ticking any other runtime, as they might be waiting on network
+         // IO. (It also might be waiting on something else, such as time.)
+         self.world.borrow_mut().topology.tick_by(tick);
+ 
+         // Tick each host runtimes with running software. If the software
+         // completes, extract the result and return early if an error is
+         // encountered.
+ 
+         let (mut running, stopped): (Vec<_>, Vec<_>) = self
+             .rts
+             .iter_mut()
+             .partition(|(_, rt)| rt.is_software_running());
+-        if self.config.random_node_order {
+-            running.shuffle(&mut self.world.borrow_mut().rng);
++        let order = if crate::exploration::active() {
++            let runnable: Vec<_> = running.iter().map(|(addr, _)| **addr).collect();
++            crate::exploration::choose(crate::exploration::Event::Hosts {
++                step: self.steps,
++                runnable: &runnable,
++            })
++        } else {
++            crate::exploration::Decision::Default
++        };
++        match order {
++            crate::exploration::Decision::Default => {
++                if self.config.random_node_order {
++                    running.shuffle(&mut self.world.borrow_mut().rng);
++                }
++            }
++            crate::exploration::Decision::Hosts { reverse } => {
++                running.sort_by_key(|(addr, _)| **addr);
++                if reverse {
++                    running.reverse();
++                }
++            }
++            _ => panic!("invalid host-order decision"),
+         }
+ 
+         for (&addr, rt) in running {
+             let _span_guard = tracing::span!(Level::INFO, "node", name = &*rt.nodename,).entered();
+             {
+                 let mut world = self.world.borrow_mut();
+                 // We need to move deliverable messages off the network and
+                 // into the dst host. This requires two mutable borrows.
+                 let World {
+                     rng,
+                     topology,
+                     hosts,
+                     ..
+                 } = world.deref_mut();
+                 topology.deliver_messages(rng, hosts.get_mut(&addr).expect("missing host"));
+ 
+                 // Set the current host (see method docs)
+                 world.current = Some(addr);
+ 
+                 world.current_host_mut().timer.now(rt.now());
+             }
+ 
+             let is_software_finished = World::enter(&self.world, || rt.tick(tick))?;
+ 
+             if rt.is_client() {
+diff --git a/src/top.rs b/src/top.rs
+--- a/src/top.rs
++++ b/src/top.rs
+@@ -358,125 +358,208 @@
+         // the exact same link. We denote one of the ends of the link as 'a',
+         // and the other 'b'. 'a' is always the one that compares smaller, i.e,
+         // `a < b` holds.
+         if src < dst {
+             self.state_a_b
+         } else {
+             self.state_b_a
+         }
+     }
+ 
+     // src -> link -> dst
+     //        ^-- you are here!
+     //
+     // Messages may be dropped, sit on the link for a while (due to latency, or
+     // because the link has stalled), or be delivered immediately.
+     // Link will return an Err(()) if the socket buffer is full.
+     fn enqueue(
+         &mut self,
+         global_config: &config::Link,
+         rand: &mut dyn RngCore,
+         src: SocketAddr,
+         dst: SocketAddr,
+         message: Protocol,
+     ) -> Result<()> {
+         let state = self.get_state_for_message(src.ip(), dst.ip());
+-        let status = match state {
++        let mut status = match state {
+             State::Healthy => {
+                 let delay = self.delay(global_config.latency(), rand);
+                 DeliveryStatus::DeliverAfter(self.now + delay)
+             }
+             // Only A->B is blocked, so B can send, so we can send if src is B
+             State::Hold => {
+                 tracing::trace!(target: TRACING_TARGET,?src, ?dst, protocol = %message, "Hold");
+                 DeliveryStatus::Hold
+             }
+             _ => {
+                 tracing::trace!(target: TRACING_TARGET,?src, ?dst, protocol = %message, "Drop");
+                 return Ok(());
+             }
+         };
+ 
++        if let Protocol::Udp(datagram) = &message {
++            match crate::exploration::choose(crate::exploration::Event::Udp {
++                src,
++                dst,
++                bytes: &datagram.0,
++            }) {
++                crate::exploration::Decision::Default => {}
++                crate::exploration::Decision::Udp {
++                    delay,
++                    drop,
++                    duplicate,
++                } => {
++                    assert!(!(drop && duplicate), "conflicting UDP intervention");
++                    if drop {
++                        return Ok(());
++                    }
++                    match &mut status {
++                        DeliveryStatus::DeliverAfter(time) => *time += delay,
++                        DeliveryStatus::Hold => assert!(delay.is_zero(), "cannot delay held UDP"),
++                    }
++                    if duplicate {
++                        let copy_status = match &status {
++                            DeliveryStatus::DeliverAfter(time) => {
++                                DeliveryStatus::DeliverAfter(*time)
++                            }
++                            DeliveryStatus::Hold => DeliveryStatus::Hold,
++                        };
++                        self.sent.push_back(Sent {
++                            src,
++                            dst,
++                            status: copy_status,
++                            protocol: Protocol::Udp(datagram.clone()),
++                        });
++                    }
++                }
++                _ => panic!("invalid UDP decision"),
++            }
++        }
+         let sent = Sent {
+             src,
+             dst,
+             status,
+             protocol: message,
+         };
+ 
+         self.sent.push_back(sent);
+         Ok(())
+     }
+ 
+     fn tick(&mut self, now: Instant) {
+         self.now = now;
+         self.process_deliverables();
+     }
+ 
+     fn process_deliverables(&mut self) {
+         // TODO: `drain_filter` is not yet stable, and so we have a low quality
+         // implementation here that avoids clones.
+         let mut deliverable = 0;
+         for i in 0..self.sent.len() {
+             let index = i - deliverable;
+             let sent = &self.sent[index];
+             if let DeliveryStatus::DeliverAfter(time) = sent.status {
+                 if time <= self.now {
+                     let sent = self.sent.remove(index).unwrap();
+                     let envelope = Envelope {
+                         src: sent.src,
+                         dst: sent.dst,
+                         message: sent.protocol,
+                     };
+                     self.deliverable
+                         .entry(sent.dst.ip())
+                         .or_default()
+                         .push_back(envelope);
+                     deliverable += 1;
+                 }
+             }
+         }
+     }
+ 
+     // FIXME: This implementation does not respect message delivery order. If
+     // host A and host B are ordered (by addr), and B sends before A, then this
+     // method will deliver A's message before B's.
+     fn deliver_messages(
+         &mut self,
+         global_config: &config::Link,
+         rand: &mut dyn RngCore,
+         host: &mut Host,
+     ) {
+-        let deliverable = self
++        let mut deliverable = self
+             .deliverable
+             .entry(host.addr)
+             .or_default()
+             .drain(..)
+             .collect::<Vec<Envelope>>();
+ 
++        // Only UDP envelopes may be swapped. Never change TCP segment order.
++        if crate::exploration::active() {
++            'pair: for a in 0..deliverable.len() {
++                for b in a + 1..deliverable.len() {
++                    let first = &deliverable[a];
++                    let second = &deliverable[b];
++                    if let (Protocol::Udp(first_data), Protocol::Udp(second_data)) =
++                        (&first.message, &second.message)
++                    {
++                        if first.src != second.src || first.dst != second.dst {
++                            continue;
++                        }
++                        match crate::exploration::choose(crate::exploration::Event::UdpPair {
++                            src: first.src,
++                            dst: first.dst,
++                            first: &first_data.0,
++                            second: &second_data.0,
++                        }) {
++                            crate::exploration::Decision::Default => {}
++                            crate::exploration::Decision::UdpPair { reverse } => {
++                                if reverse {
++                                    deliverable.swap(a, b);
++                                }
++                                break 'pair;
++                            }
++                            _ => panic!("invalid UDP-pair decision"),
++                        }
++                    }
++                }
++            }
++        }
++
+         for message in deliverable {
+             let (src, dst) = (message.src, message.dst);
++            if let Protocol::Udp(datagram) = &message.message {
++                assert!(
++                    matches!(
++                        crate::exploration::choose(crate::exploration::Event::UdpDelivered {
++                            src,
++                            dst,
++                            bytes: &datagram.0,
++                        }),
++                        crate::exploration::Decision::Default
++                    ),
++                    "delivery observation cannot intervene"
++                );
++            }
+             if let Err(message) = host.receive_from_network(message) {
+                 let _ = self.enqueue_message(global_config, rand, dst, src, message);
+             }
+         }
+     }
+ 
+     // Randomly break or repair this link.
+     fn rand_partition_or_repair(&mut self, global_config: &config::Link, rand: &mut dyn RngCore) {
+         let do_rand = self.rand_partition(global_config.message_loss(), rand);
+         match (self.state_a_b, self.state_b_a) {
+             (State::Healthy, _) | (_, State::Healthy) if do_rand => {
+                 self.state_a_b = State::RandPartition;
+                 self.state_b_a = State::RandPartition;
+ 
+                 self.sent.clear();
+             }
+             (State::RandPartition, _) | (_, State::RandPartition)
+                 if self.rand_repair(global_config.message_loss(), rand) =>
+             {
+                 self.release();
+             }
+             _ => {}
+         }
+     }
+ 

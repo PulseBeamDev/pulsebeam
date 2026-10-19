@@ -110,6 +110,7 @@ struct Samples {
 
 thread_local! {
     static SAMPLES: RefCell<Samples> = RefCell::new(Samples::default());
+    static CONTROLLER_STALLS_CONSUMED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static CONTROLLER_STALL_UNTIL: RefCell<Option<Instant>> = const { RefCell::new(None) };
     static FAIL_NEXT_MATERIALIZATION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
@@ -132,8 +133,13 @@ pub fn request_controller_stall(duration: Duration) {
 pub async fn wait_controller_stall() {
     let deadline = CONTROLLER_STALL_UNTIL.with_borrow_mut(Option::take);
     if let Some(deadline) = deadline {
+        CONTROLLER_STALLS_CONSUMED.with(|count| count.set(count.get().saturating_add(1)));
         tokio::time::sleep_until(deadline).await;
     }
+}
+
+pub fn controller_stalls_consumed() -> u64 {
+    CONTROLLER_STALLS_CONSUMED.with(std::cell::Cell::get)
 }
 
 /// Record one downstream allocation pass. Called from the allocator's reporting path.

@@ -1,0 +1,17 @@
+diff --git a/src/util_libc.rs b/src/util_libc.rs
+--- a/src/util_libc.rs
++++ b/src/util_libc.rs
+@@ -151,6 +151,13 @@
+ /// Thin wrapper around the `getrandom()` Linux system call
+ #[cfg(any(target_os = "android", target_os = "linux"))]
+ pub fn getrandom_syscall(buf: &mut [MaybeUninit<u8>]) -> libc::ssize_t {
++    // The isolated simulator links a seeded libc getrandom shim. Keep direct
++    // syscalls in every default/production configuration.
++    #[cfg(pulsebeam_sim)]
++    return unsafe {
++        libc::getrandom(buf.as_mut_ptr().cast(), buf.len(), 0)
++    };
++    #[cfg(not(pulsebeam_sim))]
+     unsafe {
+         libc::syscall(
+             libc::SYS_getrandom,

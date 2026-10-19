@@ -27,7 +27,7 @@ The shared harness default is:
 | Link | `LinkProfile::wifi()`: 8–13 ms latency, burst loss, occasional reorder and duplicate, impaired feedback, 100 µs GRO window |
 | Capacity | Unlimited unless a BWE test explicitly supplies a bottleneck |
 | Randomness | `DEFAULT_SIM_SEED`, with every clock, map, network and fault stream derived from it |
-| Buggify | 10‰ deterministic baseline on every plan; named recovery plans may override and force sites |
+| Internal faults | Explicit named simulation hooks; the generic buggify primitive has no production call sites |
 
 Four shards are the smallest stable default that exercises owner/destination
 and tuple-hash/source-shard differences without requiring every test to invent a
@@ -35,21 +35,22 @@ placement. One-shard runs remain valid only as an explicit differential
 baseline. `LinkProfile::fiber()` and `LinkProfile::cellular()` are named
 special cases for tests whose claim is specifically about those paths.
 
-The harness defaults are intentionally not a one-shard or fault-free baseline.
+The harness defaults exercise multiple shards and seeded network impairment.
+Internal faults require explicit named controls; ordinary plans do not implicitly
+exercise them.
 The [native DTLS reconnect exception](native-dtls-exception.md) does not exempt
 cross-shard media or data proof. Ignored subprocess fixtures run through their
 parent assertions and are not additional product exceptions.
 
 The permitted profile families are:
 
-- `Production`: the default above, including the baseline buggify schedule.
+- `Production`: the default above, including seeded network impairment.
 - `SingleShard`: the same link and seed, explicitly used for a one-versus-many
   differential comparison.
 - `Fiber`: clean path for isolating signaling, allocation or state-machine
   behavior from network impairment.
 - `Cellular`: the shared high-latency/loss path for mobile-specific claims.
-- `Recovery`: `Production` plus deterministic forced named faults and, where
-  useful, a higher seeded rate. It must
+- `Recovery`: `Production` plus deterministic forced named faults. It must
   force each selected failure point at least once and assert the exact site and
   count; a random percentage alone is not evidence of fault coverage.
 
@@ -169,33 +170,25 @@ also run the independent convergence oracle. Discovery alone, global frame
 counters and presence-only data checks cannot replace exact ownership/intent
 checks or positive per-recipient origin evidence.
 
-## Buggify contract
+## Internal fault coverage
 
-Buggify is a deterministic fault schedule, not a random test decoration. Every
-ordinary plan reaches production failure branches at the shared 10‰ baseline;
-recovery plans use named forced faults followed by a seeded sweep. A plan that
-needs an impairment-free BWE capacity oracle may select `LinkProfile::fiber()`
-because feedback loss is then not confused with capacity recovery; that is a
-named link-dimension override, not a second general default.
+`StallController`, `SendToWrongShard` and `FailNextMaterialization` invoke real
+simulation-only production seams. The [bounded topic model](simulation.md#exhaust-bounded-topic-executions)
+records their reachable boundary, actual consumption and subsequent recovery.
+The generic runtime `buggify!` primitive has no production call sites and does
+not establish baseline or exhaustive fault coverage.
 
-The control/shard recovery matrix must eventually cover, independently and in
-coherent combinations:
+These hooks do not imply coverage of every allocator, transaction stage,
+mailbox-pressure condition, signaling write or shard lifecycle failure. Network
+impairment and explicit connection lifecycle operations have their own witnesses.
+A plan that needs an impairment-free BWE capacity oracle may select
+`LinkProfile::fiber()` because feedback loss is then not confused with capacity
+recovery; that is a named link-dimension override, not a second general default.
 
-- endpoint reservation and route allocation for video, audio, realtime data,
-  reliable data and reverse routes;
-- transaction staging, per-shard view publication, commit and rollback;
-- materialization, authentication acknowledgment and TCP adoption commands;
-- view-delta delay, duplicate, stale-generation and mailbox-full behavior;
-- shard lifecycle-event delivery, controller event-queue pressure and replay;
-- signaling-channel write failure and retry of an unsent roster/binding diff;
-- participant timeout, graceful delete, reconnect and slot/epoch reuse;
-- forward media loss, telemetry loss, reliable reverse acknowledgment loss and
-  recovery after each.
-
-Each declared site must be observed and forced in a meta-test. A single
-`!fired.is_empty()` assertion is not enough. After each forced fault the oracle
-must prove atomicity and eventual convergence; counters only prove that the
-fault branch ran.
+Every declared fault site needs a reachable forced witness and an exact
+consumption count. A single `!fired.is_empty()` assertion is not enough. After
+each forced fault the oracle must prove atomicity, eventual convergence and
+positive fresh delivery; counters only prove that the fault branch ran.
 
 Fault injection must not turn required control events into silent permanent
 loss. If a production lane is intentionally lossy, its replay/latest-wins or

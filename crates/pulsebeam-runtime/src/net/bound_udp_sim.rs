@@ -46,6 +46,7 @@ const DEFAULT_SIM_CLUSTER_ID: u16 = 0;
 const DEFAULT_SIM_NODE_ID: u16 = 0;
 
 thread_local! {
+    static WRONG_OWNER_INJECTIONS_CONSUMED: Cell<u64> = const { Cell::new(0) };
     /// Reuseport groups already bound on this host, so a second bind to the
     /// same address joins one instead of failing.
     ///
@@ -64,6 +65,10 @@ thread_local! {
 fn wrong_owner_injection_state() -> &'static Mutex<Option<IpAddr>> {
     static STATE: OnceLock<Mutex<Option<IpAddr>>> = OnceLock::new();
     STATE.get_or_init(|| Mutex::new(None))
+}
+
+pub fn wrong_owner_injections_consumed() -> u64 {
+    WRONG_OWNER_INJECTIONS_CONSUMED.with(Cell::get)
 }
 
 fn wrong_owner_injection_state_enabled() -> Option<IpAddr> {
@@ -266,6 +271,7 @@ impl SimSteering {
             && (self.wrong_owner_injection.get()
                 || wrong_owner_injection_state_enabled().is_some_and(|source| source == src.ip()))
         {
+            WRONG_OWNER_INJECTIONS_CONSUMED.with(|count| count.set(count.get().saturating_add(1)));
             self.wrong_owner_injection.set(false);
             match wrong_owner_injection_state().lock() {
                 Ok(mut state) => *state = None,

@@ -267,6 +267,14 @@ impl SimClientBuilder {
     }
 
     pub(crate) async fn connect(self, room: &str) -> anyhow::Result<SimClient> {
+        self.connect_inner(room, false).await
+    }
+
+    pub(crate) async fn connect_once(self, room: &str) -> anyhow::Result<SimClient> {
+        self.connect_inner(room, true).await
+    }
+
+    async fn connect_inner(self, room: &str, single_attempt: bool) -> anyhow::Result<SimClient> {
         let topology = MediaTopology {
             local_video: u8::from(self.publishes_video),
             local_audio: u8::from(self.audio_level_dbov.is_some()),
@@ -279,7 +287,7 @@ impl SimClientBuilder {
         };
         let room = RoomExternalId::new(room)?;
         let participant = ParticipantExternalId::new(&participant)?;
-        let session = AgentConfig {
+        let mut session = AgentConfig {
             endpoint: self.endpoint,
             token: pulsebeam_server::sign_participant_token(
                 &pulsebeam_server::insecure_dev_api_key().unwrap(),
@@ -291,6 +299,9 @@ impl SimClientBuilder {
             retry: Default::default(),
             log_level: Default::default(),
         };
+        if single_attempt {
+            session.retry.maximum_attempts = 1;
+        }
         let mut config = Config::new(session);
         config.local_ips.push(self.ip);
         config.tcp_server = self.tcp_server;
@@ -329,6 +340,11 @@ impl SimClientBuilder {
         while snapshots.borrow().participant_id.is_none()
             || snapshots.borrow().connection != ConnectionState::Connected
         {
+            anyhow::ensure!(
+                snapshots.borrow().connection != ConnectionState::TerminalFailure,
+                "native admission failed: {:?}",
+                snapshots.borrow().terminal_failure
+            );
             snapshots.changed().await?;
         }
         let participant_id = snapshots

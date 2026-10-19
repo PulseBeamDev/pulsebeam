@@ -18,6 +18,7 @@ or failure injection.
 - `src/tests/common/harness.rs` owns automatic discovery/subscription policy, lifecycle commands, reports, and bounded convergence checkpoints.
 - `src/tests/common/oracle.rs` models plan-derived intent and compares coherent control, shard, and client observations.
 - `src/tests/native_runtime.rs` is the narrow UniFFI-facing native-runtime vertical slice; the authored scenarios exercise the same runtime through the common harness.
+- `src/tests/exploration.rs` owns finite execution choices and strict artifacts; `common/harness/bounded.rs` drives the real topic lifecycle and reuses the existing oracles. `tools/run-simulations.py` owns isolated prefix traversal and replay.
 
 ## Build profile
 
@@ -39,4 +40,7 @@ workspace gates and evidence reuse. This owner retains one
   (Bazel test actions use standard undeclared outputs).
 - `./bazel run //:sweep -- --seeds <count> --from-seed <first> --filter <name>`
   searches replayable seeds outside merge gates.
+- `./bazel run //:replay -- --exact --filter tests::exploration::bounded_cross_shard`
+  completely traverses the [bounded topic model](docs/simulation.md#exhaust-bounded-topic-executions).
+  `--bounded-replay <artifact.json>` strictly replays one materialized execution.
 - `./bazel run //:scoreboard` explicitly regenerates the diffable BWE scoreboard.

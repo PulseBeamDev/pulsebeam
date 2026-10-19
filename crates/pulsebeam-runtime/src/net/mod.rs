@@ -15,7 +15,9 @@ pub mod udp;
 
 pub use bound_udp::{BoundUdpSocket, bind_udp_socket};
 #[cfg(feature = "sim")]
-pub use bound_udp::{install_steering_flow, set_wrong_owner_injection};
+pub use bound_udp::{
+    install_steering_flow, set_wrong_owner_injection, wrong_owner_injections_consumed,
+};
 
 use std::{io, net::SocketAddr};
 

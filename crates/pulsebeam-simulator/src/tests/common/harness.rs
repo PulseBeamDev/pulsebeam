@@ -1,6 +1,6 @@
 use crate::tests::common::client::{
     AudioReceiveLog, ClientObservation, MAX_CONCEALABLE_GAP, QualityVideoReference, RequestedVideo,
-    SimClientBuilder, VideoReceiveLog, VideoReceiveStats,
+    SimClient, SimClientBuilder, VideoReceiveLog, VideoReceiveStats,
 };
 use crate::tests::common::decoder::{
     MAX_AUDIO_REFERENCE_PEAK, MAX_REFERENCE_MEAN_ABSOLUTE, MAX_REFERENCE_PEAK,
@@ -413,6 +413,8 @@ pub enum Step {
         topic: &'static str,
         expected: &'static [&'static [u8]],
     },
+    /// Execute the explicit finite model through the same native-agent operations.
+    BoundedFamily,
     // ── Time ──────────────────────────────────────────────────────────────
     /// Advance simulated time. All participants run during this window.
     /// Also snapshots TX/RX byte counters for subsequent `*BytesInterval` checks.
@@ -950,6 +952,7 @@ pub enum Step {
 // ── Internal lifecycle commands ─────────────────────────────────────────────
 
 enum ParticipantCmd {
+    Apply(PendingDriverOp, tokio::sync::oneshot::Sender<bool>),
     /// Graceful shutdown (HTTP DELETE + RTC disconnect), then wait for Reconnect.
     Shutdown,
     /// Drop the client without signaling (AbruptExit), then wait for Reconnect.
@@ -1233,7 +1236,74 @@ struct ParticipantTask {
     config: Participant,
     room_name: &'static str,
     tcp_only: bool,
+    bounded: bool,
     initial_topics: TopicRegistrations,
+}
+
+async fn apply_operation(
+    client: &mut SimClient,
+    operation: PendingDriverOp,
+) -> anyhow::Result<bool> {
+    Ok(match operation {
+        PendingDriverOp::SetSubscriptions(subscriptions) => {
+            client
+                .ctx
+                .set_video_subscriptions(
+                    subscriptions
+                        .into_iter()
+                        .map(|subscription| RequestedVideo {
+                            participant_id: subscription.participant_id,
+                            height: subscription.height,
+                            min_height: subscription.min_height,
+                            priority: subscription.priority,
+                        })
+                        .collect(),
+                )
+                .await?
+        }
+        PendingDriverOp::DeclarePublishTopic(topic) => {
+            client
+                .ctx
+                .register_publisher(topic, TopicMode::Latest)
+                .await?
+        }
+        PendingDriverOp::DeclareSubscribeTopic(topic, publisher_id) => {
+            client
+                .ctx
+                .register_subscriber(topic, TopicMode::Latest, publisher_id)
+                .await?
+        }
+        PendingDriverOp::PublishData(topic, data) => {
+            client
+                .ctx
+                .send_topic(&topic, TopicMode::Latest, data)
+                .await?
+        }
+        PendingDriverOp::DeclareOrderedPublisher(topic) => {
+            client
+                .ctx
+                .register_publisher(topic, TopicMode::Ordered)
+                .await?
+        }
+        PendingDriverOp::DeclareOrderedSubscriber(topic) => {
+            client
+                .ctx
+                .register_subscriber(topic, TopicMode::Ordered, None)
+                .await?
+        }
+        PendingDriverOp::PublishOrdered(topic, data) => {
+            client
+                .ctx
+                .send_topic(&topic, TopicMode::Ordered, data)
+                .await?
+        }
+        PendingDriverOp::SetAudioIntent(participants, automatic) => {
+            client
+                .ctx
+                .set_audio_intent(&participants, automatic)
+                .await?
+        }
+    })
 }
 
 async fn run_participant(
@@ -1247,6 +1317,7 @@ async fn run_participant(
         config,
         room_name,
         tcp_only,
+        bounded,
         initial_topics,
     } = task;
     if config.starts_disconnected {
@@ -1326,9 +1397,14 @@ async fn run_participant(
             builder = builder.manual_subscriptions();
         }
 
-        let mut client = match builder.connect(room_name).await {
+        let connected = if bounded {
+            builder.connect_once(room_name).await
+        } else {
+            builder.connect(room_name).await
+        };
+        let mut client = match connected {
             Ok(client) => client,
-            Err(error) if config.starts_disconnected => {
+            Err(error) if config.starts_disconnected || bounded => {
                 *shared.connected.lock().unwrap() = false;
                 tracing::debug!(%error, "participant materialization failed");
                 match cmd_rx.recv().await {
@@ -1347,43 +1423,18 @@ async fn run_participant(
         let mut interval = tokio::time::interval(Duration::from_millis(10));
         let command = loop {
             tokio::select! {
-                command = cmd_rx.recv() => break command,
+                command = cmd_rx.recv() => match command {
+                    Some(ParticipantCmd::Apply(operation, reply)) => {
+                        let complete = apply_operation(&mut client, operation).await?;
+                        let _ = reply.send(complete);
+                    }
+                    command => break command,
+                },
                 _ = interval.tick() => {
                     let operations = shared.pending_ops.lock().unwrap().pending.drain(..).collect::<Vec<_>>();
                     let mut retry = Vec::new();
                     for operation in operations {
-                        let complete = match operation.clone() {
-                            PendingDriverOp::SetSubscriptions(subscriptions) => client
-                                .ctx
-                                .set_video_subscriptions(subscriptions.into_iter().map(|subscription| RequestedVideo {
-                                    participant_id: subscription.participant_id,
-                                    height: subscription.height,
-                                    min_height: subscription.min_height,
-                                    priority: subscription.priority,
-                                }).collect())
-                                .await?,
-                            PendingDriverOp::DeclarePublishTopic(topic) => {
-                                client.ctx.register_publisher(topic, TopicMode::Latest).await?
-                            }
-                            PendingDriverOp::DeclareSubscribeTopic(topic, publisher_id) => {
-                                client.ctx.register_subscriber(topic, TopicMode::Latest, publisher_id).await?
-                            }
-                            PendingDriverOp::PublishData(topic, data) => {
-                                client.ctx.send_topic(&topic, TopicMode::Latest, data).await?
-                            }
-                            PendingDriverOp::DeclareOrderedPublisher(topic) => {
-                                client.ctx.register_publisher(topic, TopicMode::Ordered).await?
-                            }
-                            PendingDriverOp::DeclareOrderedSubscriber(topic) => {
-                                client.ctx.register_subscriber(topic, TopicMode::Ordered, None).await?
-                            }
-                            PendingDriverOp::PublishOrdered(topic, data) => {
-                                client.ctx.send_topic(&topic, TopicMode::Ordered, data).await?
-                            }
-                            PendingDriverOp::SetAudioIntent(participants, automatic) => {
-                                client.ctx.set_audio_intent(&participants, automatic).await?
-                            }
-                        };
+                        let complete = apply_operation(&mut client, operation.clone()).await?;
                         if !complete {
                             retry.push(operation);
                         }
@@ -1438,6 +1489,7 @@ async fn run_participant(
                     _ => break,
                 }
             }
+            Some(ParticipantCmd::Apply(..)) => unreachable!("operations run on the active client"),
             Some(ParticipantCmd::Reconnect) => {
                 client.abort().await?;
                 continue;
@@ -1451,6 +1503,7 @@ async fn run_participant(
 
 fn step_name(step: &Step) -> &'static str {
     match step {
+        Step::BoundedFamily => "BoundedFamily",
         Step::Run { .. } => "Run",
         Step::WaitForPublication { .. } => "WaitForPublication",
         Step::StallController { .. } => "StallController",
@@ -1687,6 +1740,7 @@ async fn execute_plan(
                     }
                 }).await.map_err(|_| anyhow::anyhow!("{participant} did not receive ordered sequence {expected:?}"))??;
             }
+            Step::BoundedFamily => bounded::execute(handles, name_to_ip, observer).await?,
             Step::Run {
                 description,
                 duration,
@@ -4711,6 +4765,8 @@ impl Default for LinkProfile {
     }
 }
 
+mod bounded;
+
 pub struct LocalNodeSim {
     rooms: Vec<Room>,
     tick_duration: Duration,
@@ -4848,6 +4904,9 @@ impl LocalNodeSim {
             .filter_map(|s| match s {
                 Step::Run { duration, .. } => Some(*duration),
                 Step::WaitForPublication { timeout, .. } => Some(*timeout),
+                Step::BoundedFamily => Some(Duration::from_millis(
+                    crate::tests::exploration::Scenario::default().horizon_ms,
+                )),
                 _ => None,
             })
             .sum::<Duration>()
@@ -4880,6 +4939,7 @@ impl LocalNodeSim {
         let seed = self.rng_seed;
         let tcp_only = self.tcp_only;
         let num_shards = self.num_shards;
+        let bounded = plan.iter().any(|step| matches!(step, Step::BoundedFamily));
         let initial_topics = initial_topic_registrations(&plan);
 
         let (observation_tx, mut observation_rx) = mpsc::channel(1);
@@ -4982,6 +5042,7 @@ impl LocalNodeSim {
                     config: participant.clone(),
                     room_name: room.name,
                     tcp_only,
+                    bounded,
                     initial_topics: initial_topics
                         .get(participant.name)
                         .cloned()
