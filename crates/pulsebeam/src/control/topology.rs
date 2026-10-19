@@ -714,12 +714,14 @@ mod tests {
     }
 
     fn track(kind: TrackKind, publisher: u8, room_seed: u8, label: &str) -> Track {
+        let connection = crate::entity::ConnectionId::new();
         let publisher = participant(publisher);
         let meta = crate::track::TrackMeta {
             room_id: room(room_seed),
             shard_id: ShardId::new(0),
-            id: publisher.derive_track_id(kind, label),
+            id: connection.derive_track_id(kind, label),
             origin: publisher,
+            connection_id: connection,
             label: Some(label.to_owned()),
         };
         match kind {

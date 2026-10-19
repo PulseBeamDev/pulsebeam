@@ -8,9 +8,9 @@ pub(crate) struct UpstreamAudio {
     media: UpstreamMedia,
 }
 impl UpstreamAudio {
-    pub(super) fn new(ctx: LogCtx) -> Self {
+    pub(super) fn new(ctx: LogCtx, connection_id: crate::entity::ConnectionId) -> Self {
         Self {
-            media: UpstreamMedia::new(ctx, crate::entity::TrackKind::Audio),
+            media: UpstreamMedia::new(ctx, crate::entity::TrackKind::Audio, connection_id),
         }
     }
     pub(super) fn add_published_track(

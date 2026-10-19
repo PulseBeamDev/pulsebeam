@@ -685,8 +685,9 @@ mod tests {
             },
             false,
         );
-        let fixed = ParticipantId::new().derive_track_id(TrackKind::Video, "fixed");
-        let default = ParticipantId::new().derive_track_id(TrackKind::Video, "default");
+        let fixed = crate::entity::ConnectionId::new().derive_track_id(TrackKind::Video, "fixed");
+        let default =
+            crate::entity::ConnectionId::new().derive_track_id(TrackKind::Video, "default");
         let first = Mid::from("0");
         let fresh = Mid::from("1");
         let bounds = Downstream::encode_playout_delay(&PlayoutDelay {
@@ -729,9 +730,9 @@ mod tests {
     #[test]
     fn native_audio_defaults_auto_and_preserves_first_unique_audio_preference() {
         use pulsebeam_proto::signaling_v1::{AudioIntent as WireAudio, AudioTrackIntent};
-        let publisher = ParticipantId::new();
-        let mic = publisher.derive_track_id(TrackKind::Audio, "mic");
-        let camera = publisher.derive_track_id(TrackKind::Video, "camera");
+        let connection = crate::entity::ConnectionId::new();
+        let mic = connection.derive_track_id(TrackKind::Audio, "mic");
+        let camera = connection.derive_track_id(TrackKind::Video, "camera");
         assert_eq!(decode_native_audio(None), AudioIntent::default());
         let request = WireAudio {
             mode: 999,

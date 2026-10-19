@@ -470,12 +470,20 @@ mod tests {
         }
     }
 
+    fn connection(seed: u64) -> crate::entity::ConnectionId {
+        let mut bytes = [0_u8; 16];
+        bytes[6] = 0x70;
+        bytes[8..].copy_from_slice(&seed.to_be_bytes());
+        bytes[8] = (bytes[8] & 0x3f) | 0x80;
+        crate::entity::ConnectionId::from_bytes(bytes)
+    }
+
     fn origin(seed: u64) -> AudioOrigin {
         use crate::entity::{ParticipantId, TrackKind};
         let _rng = pulsebeam_runtime::rand::seeded_rng(seed);
         let participant = ParticipantId::new();
         AudioOrigin {
-            track: participant.derive_track_id(TrackKind::Audio, "mic"),
+            track: connection(seed).derive_track_id(TrackKind::Audio, "mic"),
             participant,
         }
     }
@@ -909,11 +917,11 @@ mod tests {
         let mut alloc = allocator_with(1);
         let participant = origin(1).participant;
         let mic = AudioOrigin {
-            track: participant.derive_track_id(TrackKind::Audio, "mic"),
+            track: connection(1).derive_track_id(TrackKind::Audio, "mic"),
             participant,
         };
         let screen = AudioOrigin {
-            track: participant.derive_track_id(TrackKind::Audio, "screen"),
+            track: connection(1).derive_track_id(TrackKind::Audio, "screen"),
             participant,
         };
         assert_ne!(mic.track, screen.track);

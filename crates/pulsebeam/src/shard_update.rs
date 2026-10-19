@@ -331,7 +331,7 @@ mod tests {
     use super::*;
 
     fn track_plan() -> (TrackId, Vec<TrackPlanUpdate>) {
-        let track_id = crate::entity::ParticipantId::new()
+        let track_id = crate::entity::ConnectionId::new()
             .derive_track_id(crate::entity::TrackKind::Audio, "audio");
         let plans = vec![TrackPlanUpdate {
             track_id,

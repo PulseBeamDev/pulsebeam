@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 
 use super::worker::ShardEvent;
-use crate::entity::{ConnectionId, ParticipantId, RoomId, TrackId};
+use crate::entity::{ConnectionId, ParticipantId, RoomId};
 use crate::keys::ParticipantHandle;
 use crate::keys::TrackHandle;
 use crate::participant::TrackPacket;
@@ -32,10 +32,12 @@ pub enum ParticipantEvent {
 pub enum ParticipantBindingEvent {
     Activated {
         subscriber: ParticipantId,
+        connection_id: ConnectionId,
         track: TrackMeta,
     },
     Deactivated {
         subscriber: ParticipantId,
+        connection_id: ConnectionId,
         track: TrackMeta,
     },
 }
@@ -156,6 +158,7 @@ impl<'a> ParticipantSink for PipelineSinkRef<'a> {
             .push_back(ParticipantEvent::Binding(
                 ParticipantBindingEvent::Activated {
                     subscriber: self.id,
+                    connection_id: self.connection_id,
                     track,
                 },
             ));
@@ -168,6 +171,7 @@ impl<'a> ParticipantSink for PipelineSinkRef<'a> {
             .push_back(ParticipantEvent::Binding(
                 ParticipantBindingEvent::Deactivated {
                     subscriber: self.id,
+                    connection_id: self.connection_id,
                     track,
                 },
             ));
@@ -175,23 +179,22 @@ impl<'a> ParticipantSink for PipelineSinkRef<'a> {
 
     #[inline]
     fn publish_track(&mut self, track: Track) {
+        debug_assert_eq!(track.meta().origin, self.id);
+        debug_assert_eq!(track.meta().connection_id, self.connection_id);
         let mut track = track;
         track.set_reverse(None);
         self.pipeline
             .participant_events
-            .push_back(ParticipantEvent::Control(ShardEvent::TrackPublished {
-                track,
-            }));
+            .push_back(ParticipantEvent::Control(ShardEvent::TrackPublished(track)));
     }
 
     #[inline]
-    fn unpublish_track(&mut self, track_id: TrackId) {
+    fn unpublish_track(&mut self, meta: TrackMeta) {
+        debug_assert_eq!(meta.origin, self.id);
+        debug_assert_eq!(meta.connection_id, self.connection_id);
         self.pipeline
             .participant_events
-            .push_back(ParticipantEvent::Control(ShardEvent::TrackUnpublished {
-                origin: self.id,
-                track_id,
-            }));
+            .push_back(ParticipantEvent::Control(ShardEvent::TrackUnpublished(meta)));
     }
 
     #[inline]
@@ -202,6 +205,7 @@ impl<'a> ParticipantSink for PipelineSinkRef<'a> {
                 ShardEvent::TrackSubscriptionAdded {
                     room_id: self.room_id,
                     subscriber: self.id,
+                    connection_id: self.connection_id,
                     selector,
                     selection,
                 },
@@ -216,6 +220,7 @@ impl<'a> ParticipantSink for PipelineSinkRef<'a> {
                 ShardEvent::TrackSubscriptionRemoved {
                     room_id: self.room_id,
                     subscriber: self.id,
+                    connection_id: self.connection_id,
                     selector,
                 },
             ));
