@@ -25,6 +25,8 @@ use tokio::sync::mpsc;
 // That mismatch reported every time-to-first-frame as ~5s regardless of what happened.
 use std::time::Instant;
 
+mod histories;
+
 #[derive(Clone, Debug)]
 pub enum Role {
     Publisher,
@@ -395,6 +397,10 @@ impl VideoQuality {
 
 #[allow(dead_code)]
 pub enum Step {
+    IntentHistory {
+        history: crate::tests::histories::History,
+        witness: Arc<Mutex<crate::tests::histories::Witness>>,
+    },
     StopServer,
     RestartServer,
     WaitForOrderedPublisher {
@@ -1003,6 +1009,7 @@ enum PendingDriverOp {
 #[derive(Clone, Debug)]
 pub struct VideoSubscription {
     pub participant_id: String,
+    pub publication: Option<String>,
     pub height: u32,
     pub min_height: u32,
     pub priority: u32,
@@ -1017,7 +1024,8 @@ struct PlanIntent {
 }
 
 struct OperationQueue {
-    pending: Vec<PendingDriverOp>,
+    pending: Vec<(u64, PendingDriverOp)>,
+    sequence: u64,
     intent: PlanIntent,
     initial_topics: TopicRegistrations,
 }
@@ -1026,6 +1034,7 @@ impl OperationQueue {
     fn new(topics: TopicRegistrations) -> Self {
         Self {
             pending: Vec::new(),
+            sequence: 0,
             intent: PlanIntent {
                 automatic_audio: true,
                 topics: topics.clone(),
@@ -1039,9 +1048,14 @@ impl OperationQueue {
         *self = Self::new(self.initial_topics.clone());
     }
 
-    fn push(&mut self, operation: PendingDriverOp) {
+    fn push(&mut self, operation: PendingDriverOp) -> u64 {
+        self.sequence += 1;
         match &operation {
-            PendingDriverOp::SetSubscriptions(video) => self.intent.video.clone_from(video),
+            PendingDriverOp::SetSubscriptions(video) => {
+                self.intent.video.clone_from(video);
+                self.pending
+                    .retain(|(_, op)| !matches!(op, PendingDriverOp::SetSubscriptions(_)));
+            }
             PendingDriverOp::SetAudioIntent(pinned, automatic) => {
                 self.intent.audio.clone_from(pinned);
                 self.intent.automatic_audio = *automatic;
@@ -1080,7 +1094,8 @@ impl OperationQueue {
             }
             PendingDriverOp::PublishData(..) | PendingDriverOp::PublishOrdered(..) => {}
         }
-        self.pending.push(operation);
+        self.pending.push((self.sequence, operation));
+        self.sequence
     }
 }
 
@@ -1096,11 +1111,27 @@ fn driver_restart_restores_initial_intent() {
     assert!(queue.pending.is_empty() && queue.intent.audio.is_empty());
     assert!(queue.intent.automatic_audio);
     assert_eq!(queue.intent.topics, TopicRegistrations::default());
+    queue.push(PendingDriverOp::SetSubscriptions(vec![VideoSubscription {
+        participant_id: "old".into(),
+        publication: None,
+        height: 180,
+        min_height: 0,
+        priority: 0,
+    }]));
+    queue.push(PendingDriverOp::SetSubscriptions(Vec::new()));
+    assert_eq!(
+        queue.pending.len(),
+        1,
+        "an unresolved replacement must not overwrite its successor"
+    );
+    assert!(queue.intent.video.is_empty());
 }
 
 // ── Per-participant shared state ────────────────────────────────────────────
 
 struct ParticipantShared {
+    driver_admission_retry: Mutex<bool>,
+    failed_admissions: Mutex<u64>,
     observation: Mutex<Option<ClientObservation>>,
     video_rx: Arc<Mutex<VideoReceiveLog>>,
     audio_rx: Arc<Mutex<AudioReceiveLog>>,
@@ -1133,6 +1164,8 @@ impl ParticipantShared {
         topics: TopicRegistrations,
     ) -> Self {
         Self {
+            driver_admission_retry: Mutex::new(false),
+            failed_admissions: Mutex::new(0),
             observation: Mutex::new(None),
             video_rx: Arc::new(Mutex::new(VideoReceiveLog::default())),
             audio_rx: Arc::new(Mutex::new(AudioReceiveLog::default())),
@@ -1298,7 +1331,8 @@ async fn run_participant(
         .with_audio_rx(shared.audio_rx.clone())
         .with_video_rx(shared.video_rx.clone())
         .with_keyframe_recovery_probe(shared.keyframe_recovery.clone())
-        .with_initial_topics(initial_topics.clone());
+        .with_initial_topics(initial_topics.clone())
+        .with_driver_admission_retry(*shared.driver_admission_retry.lock().unwrap());
 
         if config.suppress_natural_keyframe_repeats {
             builder = builder.suppress_natural_keyframe_repeats();
@@ -1361,6 +1395,7 @@ async fn run_participant(
             Ok(client) => client,
             Err(error) if config.starts_disconnected => {
                 *shared.connected.lock().unwrap() = false;
+                *shared.failed_admissions.lock().unwrap() += 1;
                 tracing::debug!(%error, "participant materialization failed");
                 match cmd_rx.recv().await {
                     Some(ParticipantCmd::Reconnect) => continue,
@@ -1382,16 +1417,17 @@ async fn run_participant(
                 _ = interval.tick() => {
                     let operations = std::mem::take(&mut shared.pending_ops.lock().unwrap().pending);
                     let mut retry = Vec::new();
-                    for operation in operations {
+                    for (sequence, operation) in operations {
                         let complete = match operation.clone() {
                             PendingDriverOp::SetSubscriptions(subscriptions) => client
                                 .ctx
                                 .set_video_subscriptions(subscriptions.into_iter().map(|subscription| RequestedVideo {
                                     participant_id: subscription.participant_id,
+                                    publication: subscription.publication,
                                     height: subscription.height,
                                     min_height: subscription.min_height,
                                     priority: subscription.priority,
-                                }).collect())
+                                }).collect(), sequence)
                                 .await?,
                             PendingDriverOp::DeclarePublishTopic(topic) => {
                                 client.ctx.register_publisher(topic, TopicMode::Latest).await?
@@ -1416,11 +1452,14 @@ async fn run_participant(
                             }
                         };
                         if !complete {
-                            retry.push(operation);
+                            retry.push((sequence, operation));
                         }
                     }
                     if !retry.is_empty() {
                         let mut pending = shared.pending_ops.lock().unwrap();
+                        if pending.pending.iter().any(|(_, op)| matches!(op, PendingDriverOp::SetSubscriptions(_))) {
+                            retry.retain(|(_, op)| !matches!(op, PendingDriverOp::SetSubscriptions(_)));
+                        }
                         retry.append(&mut pending.pending);
                         pending.pending = retry;
                     }
@@ -1482,6 +1521,7 @@ async fn run_participant(
 
 fn step_name(step: &Step) -> &'static str {
     match step {
+        Step::IntentHistory { .. } => "IntentHistory",
         Step::Run { .. } => "Run",
         Step::WaitForPublication { .. } => "WaitForPublication",
         Step::WaitForVideo { .. } => "WaitForVideo",
@@ -1595,6 +1635,9 @@ async fn execute_plan(
         let observer = &server.observer;
 
         match step {
+            Step::IntentHistory { history, witness } => {
+                histories::execute(history, witness, handles, name_to_ip, observer).await?;
+            }
             Step::StopServer => {
                 let (stopped, complete) = tokio::sync::oneshot::channel();
                 server.commands.send(ServerCommand::Stop(stopped)).await?;
@@ -2168,6 +2211,7 @@ async fn execute_plan(
                     })?;
                     subs.push(VideoSubscription {
                         participant_id: id,
+                        publication: None,
                         height: *height,
                         min_height: 0,
                         priority: 0,
@@ -2203,6 +2247,7 @@ async fn execute_plan(
                     })?;
                     subs.push(VideoSubscription {
                         participant_id: id,
+                        publication: None,
                         height: *height,
                         min_height: *min_height,
                         priority: *priority,
@@ -2283,6 +2328,7 @@ async fn execute_plan(
                     .enumerate()
                     .map(|(i, participant_id)| VideoSubscription {
                         participant_id: participant_id.clone(),
+                        publication: None,
                         height: heights_slice[i % heights_slice.len()],
                         min_height: 0,
                         priority: 0,
@@ -3581,6 +3627,17 @@ fn planned_video(
         .video
         .iter()
         .filter(|request| eligible.contains(&request.participant_id))
+        .filter(|request| {
+            request.publication.as_ref().is_none_or(|id| {
+                participants.iter().any(|peer| {
+                    peer.id.as_str() == request.participant_id
+                        && peer
+                            .track_id(pulsebeam::entity::TrackKind::Video, "video")
+                            .as_str()
+                            == *id
+                })
+            })
+        })
         .map(|request| request.participant_id.clone())
         .collect::<Vec<_>>();
     if handle.auto_subscribe {

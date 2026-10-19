@@ -92,6 +92,8 @@ class Bundle:
         self.manifest["candidate"] = candidate(args.candidate)
         settings = {key: os.environ[key] for key in SETTINGS if key in os.environ}
         corpus = os.environ.get("PULSEBEAM_SIM_REGRESSIONS")
+        history = os.environ.get("PULSEBEAM_SIM_HISTORY")
+        history_checksum = None
         expected_checksum = None
         self.manifest.update(selection={key: getattr(args, key) for key in SELECTION}, settings=settings, input=None)
         self.save()
@@ -104,6 +106,10 @@ class Bundle:
                 setattr(args, key, replay["selection"][key])
             settings = replay["settings"]
             corpus = None
+            history = None
+            if replay.get("history"):
+                history = source / replay["history"]["path"]
+                history_checksum = replay["history"]["sha256"]
             if replay["input"]:
                 corpus = source / replay["input"]["path"]
                 expected_checksum = replay["input"]["sha256"]
@@ -115,25 +121,39 @@ class Bundle:
             (self.root / "inputs").mkdir()
             (self.root / "inputs" / "supplied.regressions").write_bytes(data)
             captured = {"path": "inputs/supplied.regressions", "sha256": hashlib.sha256(data).hexdigest()}
+        captured_history = None
+        if history is not None:
+            data = Path(history).read_bytes()
+            checksum = hashlib.sha256(data).hexdigest()
+            if history_checksum and checksum != history_checksum:
+                raise ValueError("retained history input checksum mismatch")
+            (self.root / "inputs").mkdir(exist_ok=True)
+            (self.root / "inputs" / "supplied.history").write_bytes(data)
+            captured_history = {"path": "inputs/supplied.history", "sha256": checksum}
         self.manifest.update(selection={key: getattr(args, key) for key in SELECTION},
-                             settings=settings, input=captured)
+                             settings=settings, input=captured, history=captured_history)
         self.save()
         self.replay(self.root, self.manifest["selection"])
         self.env = os.environ.copy()
-        for key in (*SETTINGS, "PULSEBEAM_SIM_SEED", "PULSEBEAM_SIM_REGRESSIONS"):
+        for key in (*SETTINGS, "PULSEBEAM_SIM_SEED", "PULSEBEAM_SIM_REGRESSIONS", "PULSEBEAM_SIM_HISTORY"):
             self.env.pop(key, None)
         self.env.update(settings)
         if captured:
             self.env["PULSEBEAM_SIM_REGRESSIONS"] = str(self.root / captured["path"])
+        if captured_history:
+            self.env["PULSEBEAM_SIM_HISTORY"] = str(self.root / captured_history["path"])
         if args.from_seed is not None:
             self.env["PULSEBEAM_SIM_SEED"] = str(args.from_seed)
 
-    def replay(self, directory, selection):
+    def replay(self, directory, selection, history=None):
         captured = self.manifest["input"]
         if captured:
             captured = captured | {"path": os.path.relpath(self.root / captured["path"], directory)}
+        history = self.manifest["history"] if history is None else history
+        if history:
+            history = history | {"path": os.path.relpath(self.root / history["path"], directory)}
         write_json(directory / "replay.json", {"version": 1, "candidate": self.manifest["candidate"],
-                   "selection": selection, "settings": self.manifest["settings"], "input": captured})
+                   "selection": selection, "settings": self.manifest["settings"], "input": captured, "history": history})
         return shlex.join(["./bazel", "run", "//:replay", "--", "--replay-bundle", str(directory)])
 
     def infrastructure_error(self, error):
@@ -233,6 +253,17 @@ def execute(args, bundle):
         # Preserve all files emitted under the owned case output boundary on
         # failure, including corpora and concrete scenarios if a case emits them.
         record["artifacts"] = [str(path.relative_to(directory)) for path in sorted(outputs.rglob("*")) if path.is_file()] if category else []
+        if category:
+            histories = sorted(outputs.rglob("*.reduced.history"))
+            if len(histories) > 1:
+                raise ValueError("ambiguous concrete history replay inputs")
+            if histories:
+                history = histories[0]
+                captured = {"path": str(history.relative_to(bundle.root)),
+                            "sha256": hashlib.sha256(history.read_bytes()).hexdigest()}
+                selection = json.loads((directory / "replay.json").read_text())["selection"]
+                record["replay"] = bundle.replay(directory, selection, history=captured)
+                record["history"] = captured
         write_json(directory / "result.json", record)
         return index, record, log
 

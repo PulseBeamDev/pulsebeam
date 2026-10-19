@@ -213,6 +213,7 @@ fn fixture() -> (ControlStateOracle, Observation, ClientObservation) {
             admission: Some(receiver_connection),
             snapshot,
             sent_intent_revision: Some(1),
+            video_operation: 0,
             accepted: Some(desired.clone()),
             submitted: desired,
             video_receivers: BTreeSet::from([0]),
@@ -344,6 +345,31 @@ fn automatic_audio_oracle_allows_contended_choices_but_requires_full_slots_and_p
     model
         .check_client(&model.participants[1], &client, &requested)
         .unwrap();
+}
+
+#[test]
+fn transition_safety_allows_outstanding_intent_but_rejects_invalid_assignments() {
+    let (model, _, mut client) = fixture();
+    let allowed = model.participants.iter().map(|p| p.id.as_str()).collect();
+    client.sent_intent_revision = Some(2);
+    client.accepted = None;
+    ControlStateOracle::check_client_safety(&client, &allowed).unwrap();
+    assert!(
+        model
+            .check_client(
+                &model.participants[1],
+                &client,
+                &[model.participants[0].id.as_str()]
+            )
+            .is_err()
+    );
+    client
+        .snapshot
+        .video_mapping
+        .insert(0, "retired-track".into());
+    assert!(ControlStateOracle::check_client_safety(&client, &allowed).is_err());
+    let (_, _, client) = fixture();
+    assert!(ControlStateOracle::check_client_safety(&client, &BTreeSet::new()).is_err());
 }
 
 #[test]

@@ -162,6 +162,44 @@ fresh process with no novel cases. Nightly seed sweeps upload the owned run
 evidence and summary even on failure. They preserve non-zero results but remain
 advisory searches, not merge correctness gates.
 
+## Replay semantic intent histories
+
+The required intent-history family preserves a 24-case novel lifecycle budget,
+replays retained corpus inputs, and forces outstanding receive replacement and
+withdrawal, generation replacement with held traffic, controller stall, and
+failed materialization with a driver-planned admission retry. Each concrete
+program runs in a fresh process so earlier worlds cannot affect its identities
+or randomness. Counts distinguish novel, retained and reduction executions from
+applied operations and reached claims.
+
+Failures retain `*.original.history` and `*.reduced.history` beside the runner
+traces. These are versioned concrete programs, not RNG states. They contain the
+whole-run seed, replay selection, symbolic operations and actual phase/fault
+witnesses. The failed case's portable replay bundle selects the reduced concrete
+input and checks its checksum and candidate identity. A supplied
+`PULSEBEAM_SIM_HISTORY` input is also captured before discovery. To replay a
+concrete artifact directly without invoking the generator:
+
+```sh
+PULSEBEAM_SIM_HISTORY=/absolute/path/to/case.reduced.history \
+  ./bazel run //:replay -- --seed <recorded-seed> --exact \
+  --filter tests::histories::required_intent_histories
+```
+
+Unsupported versions, instructions, invalid lifecycle operations and mismatched
+seeds fail rather than being silently reinterpreted. Reduction keeps valid
+programs with the same reached claim and failure phase; it does not count
+filtered no-ops as exercise. The bounded reducer retains the best candidate it
+actually evaluated, not a claim of global minimality.
+
+Transition checks permit outstanding intent and lagging shard projections.
+Retirement fences use each owner's generation rather than a global atomic
+snapshot. After the final repair/recovery command, exact convergence and fresh
+decoded intended-origin delivery must complete within the existing 30-second
+simulated recovery window. Crash retirement remains bounded from the crash by
+20 simulated seconds. Holds and controller stalls last at most five simulated
+seconds. These are recovery proof bounds, not new media-quality SLOs.
+
 ## Check ordered-topic reconfiguration
 
 The data-channel scenarios cover publisher-first and subscriber-first declarations

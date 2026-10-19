@@ -183,6 +183,8 @@ if blocked == ("discovery" if "--list" in sys.argv else "case"):
 if "--list" in sys.argv:
     if os.environ.get("MUTATE_CORPUS"):
         Path(os.environ["MUTATE_CORPUS"]).write_text("changed after capture")
+    if os.environ.get("MUTATE_HISTORY"):
+        Path(os.environ["MUTATE_HISTORY"]).write_text("changed after capture")
     if os.environ.get("FAIL_DISCOVERY"):
         print("discovery failure context", file=sys.stderr)
         sys.exit(9)
@@ -213,6 +215,14 @@ if os.environ.get("EXPECT_CORPUS"):
     (Path(os.environ["TEST_TMPDIR"]) / "nested.regressions").write_text(corpus)
     assert os.environ["RUST_LOG"] == "off"
     assert os.environ["PROPTEST_CASES"] == "3"
+if os.environ.get("EXPECT_HISTORY"):
+    history = Path(os.environ["PULSEBEAM_SIM_HISTORY"]).read_text()
+    assert history == os.environ["EXPECT_HISTORY"], history
+    print("captured history=" + history)
+if os.environ.get("EMIT_HISTORY"):
+    outputs = Path(os.environ["TEST_UNDECLARED_OUTPUTS_DIR"])
+    (outputs / "claim.original.history").write_text("original history")
+    (outputs / "claim.reduced.history").write_text(os.environ["EMIT_HISTORY"])
 if os.environ.get("FAIL_CASE") == name:
     print("full failure context\\n" * 100)
     sys.exit(7)
@@ -361,6 +371,41 @@ class SimulationProcessesContract(unittest.TestCase):
             mismatch = self.run_fixture(fresh, "--replay-bundle", str(fresh / "portable"))
             self.assertEqual(mismatch.returncode, 1)
             self.assertIn("checksum mismatch", mismatch.stderr)
+
+    def test_concrete_history_capture_and_emitted_reduction_replay_portably(self):
+        import shutil
+
+        with tempfile.TemporaryDirectory() as original, tempfile.TemporaryDirectory() as destination:
+            root, fresh = Path(original), Path(destination)
+            supplied = root / "external.history"
+            supplied.write_text("supplied concrete history")
+            result = self.run_fixture(root, "--filter", "tests::first", "--exact", "--seed", "73",
+                env={"PULSEBEAM_SIM_HISTORY": str(supplied), "EXPECT_HISTORY": supplied.read_text(),
+                     "MUTATE_HISTORY": str(supplied), "EMIT_HISTORY": "reduced concrete history", "FAIL_CASE": "tests::first"})
+            self.assertEqual(result.returncode, 1, result.stderr)
+            bundle = next(root.glob("simulations/run-*"))
+            manifest = json.loads((bundle / "manifest.json").read_text())
+            self.assertEqual((bundle / manifest["history"]["path"]).read_text(), "supplied concrete history")
+            copied = fresh / "copied"
+            shutil.copytree(bundle, copied)
+            case = copied / "case-0000"
+            replay = json.loads((case / "replay.json").read_text())
+            self.assertEqual(replay["selection"]["from_seed"], 73)
+            self.assertTrue(replay["selection"]["exact"])
+            concrete = case / replay["history"]["path"]
+            self.assertEqual(concrete.read_text(), "reduced concrete history")
+            self.assertEqual((case / "outputs/claim.original.history").read_text(), "original history")
+            shutil.rmtree(root)
+            result = self.run_fixture(fresh, "--replay-bundle", str(case),
+                env={"PULSEBEAM_SIM_HISTORY": "/missing/ambient.history", "EXPECT_HISTORY": "reduced concrete history", "FAIL_CASE": "tests::first"})
+            self.assertEqual(result.returncode, 1, result.stderr)
+            replayed = next(fresh.glob("simulations/run-*/case-*/trace.log")).read_text()
+            self.assertIn("captured history=reduced concrete history", replayed)
+            self.assertNotIn("AssertionError", replayed)
+            concrete.write_text("tampered")
+            result = self.run_fixture(fresh, "--replay-bundle", str(case))
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("history input checksum mismatch", result.stderr)
 
     def test_provenance_input_and_evidence_errors_are_infrastructure_failures(self):
         with tempfile.TemporaryDirectory() as temp:

@@ -74,6 +74,43 @@ pub struct ControlStateOracle {
 }
 
 impl ControlStateOracle {
+    /// Safety within a coherent client value, without requiring latest-intent convergence.
+    pub fn check_client_safety(
+        observation: &ClientObservation,
+        allowed_origins: &BTreeSet<String>,
+    ) -> Result<()> {
+        let snapshot = &observation.snapshot;
+        ensure!(
+            snapshot
+                .participants
+                .keys()
+                .all(|id| allowed_origins.contains(id)),
+            "foreign or unadmitted participant in catalog"
+        );
+        ensure!(
+            snapshot
+                .publications
+                .values()
+                .all(|p| allowed_origins.contains(&p.participant_id)),
+            "foreign or unadmitted publication origin"
+        );
+        check_mapping(
+            &snapshot.video_mapping,
+            &snapshot.publications,
+            MediaKind::Video,
+            &observation.video_receivers,
+            observation.video_capacity,
+        )?;
+        check_mapping(
+            &snapshot.audio_mapping,
+            &snapshot.publications,
+            MediaKind::Audio,
+            &observation.audio_receivers,
+            observation.audio_capacity,
+        )?;
+        Ok(())
+    }
+
     pub fn check_client(
         &self,
         observer: &ExpectedParticipant,

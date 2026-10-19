@@ -5,6 +5,7 @@ pub mod connectivity;
 pub mod convergence;
 pub mod cross_shard;
 pub mod data_channel;
+pub mod histories;
 pub mod native_runtime;
 pub mod properties;
 pub mod room_isolation;

@@ -32,6 +32,7 @@ pub struct SimClientBuilder {
     video_slots: usize,
     audio_slots: usize,
     manual_subscriptions: bool,
+    driver_admission_retry: bool,
     video_rx: Option<Arc<Mutex<VideoReceiveLog>>>,
     audio_rx: Option<Arc<Mutex<AudioReceiveLog>>>,
     publishes_video: bool,
@@ -163,6 +164,7 @@ impl SimClientBuilder {
             video_slots: 0,
             audio_slots: 0,
             manual_subscriptions: false,
+            driver_admission_retry: false,
             video_rx: None,
             audio_rx: None,
             publishes_video: false,
@@ -277,6 +279,11 @@ impl SimClientBuilder {
         self
     }
 
+    pub fn with_driver_admission_retry(mut self, enabled: bool) -> Self {
+        self.driver_admission_retry = enabled;
+        self
+    }
+
     pub fn manual_subscriptions(mut self) -> Self {
         self.manual_subscriptions = true;
         self
@@ -374,6 +381,15 @@ impl SimClientBuilder {
         while snapshots.borrow().participant_id.is_none()
             || snapshots.borrow().connection != ConnectionState::Connected
         {
+            if self.driver_admission_retry
+                && matches!(
+                    snapshots.borrow().connection,
+                    ConnectionState::RetryWaiting { .. } | ConnectionState::TerminalFailure
+                )
+            {
+                agent.abort().await?;
+                anyhow::bail!("admission failed; waiting for explicit driver retry");
+            }
             snapshots.changed().await?;
         }
         let participant_id = snapshots
@@ -408,6 +424,7 @@ impl SimClientBuilder {
             audio_capacity: self.audio_slots,
             auto_subscribe: !self.manual_subscriptions,
             requested_video: None,
+            video_operation: 0,
             discovered_tracks: HashSet::new(),
             remote_tracks: HashMap::new(),
             received_data: Vec::new(),
@@ -1329,6 +1346,7 @@ impl OpusReceiver {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RequestedVideo {
     pub participant_id: String,
+    pub publication: Option<String>,
     pub height: u32,
     pub min_height: u32,
     pub priority: u32,
@@ -1342,6 +1360,7 @@ pub struct ClientObservation {
     pub audio_receivers: BTreeSet<u32>,
     pub snapshot: pulsebeam_agent_native::agent_core::Snapshot,
     pub sent_intent_revision: Option<u64>,
+    pub video_operation: u64,
     pub accepted: Option<DesiredState>,
     pub submitted: DesiredState,
     pub video_capacity: usize,
@@ -1356,6 +1375,7 @@ pub struct ClientContext {
     audio_capacity: usize,
     auto_subscribe: bool,
     requested_video: Option<Vec<RequestedVideo>>,
+    video_operation: u64,
     pub video_rx: Arc<Mutex<VideoReceiveLog>>,
     pub audio_rx: Arc<Mutex<AudioReceiveLog>>,
     quality_references: Arc<Mutex<BTreeMap<String, &'static QualityVideoReference>>>,
@@ -1408,6 +1428,7 @@ impl ClientContext {
             sent_intent_revision: observed.sent_intent_revision,
             accepted,
             submitted: self.desired.clone(),
+            video_operation: self.video_operation,
             video_capacity: self.video_capacity,
             audio_capacity: self.audio_capacity,
         })
@@ -1486,7 +1507,9 @@ impl ClientContext {
     pub async fn set_video_subscriptions(
         &mut self,
         subscriptions: Vec<RequestedVideo>,
+        operation: u64,
     ) -> anyhow::Result<bool> {
+        self.video_operation = operation;
         self.requested_video = Some(subscriptions);
         let snapshot = self.agent.snapshot();
         self.sync_video_desired(&snapshot).await
@@ -1511,6 +1534,7 @@ impl ClientContext {
             automatic.sort();
             requests.extend(automatic.into_iter().map(|participant_id| RequestedVideo {
                 participant_id,
+                publication: None,
                 height: 720,
                 min_height: 0,
                 priority: 0,
@@ -1527,6 +1551,10 @@ impl ClientContext {
                 .values()
                 .find(|publication| {
                     publication.participant_id == request.participant_id
+                        && request
+                            .publication
+                            .as_ref()
+                            .is_none_or(|id| *id == publication.id)
                         && publication.kind == MediaKind::Video
                 })
                 .map(|publication| publication.id.clone());
