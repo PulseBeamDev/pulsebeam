@@ -429,9 +429,15 @@ fn derive_id(command: IdCommand) -> String {
             ParticipantId::derive(&room, &config.participant_external_id).as_str()
         }
         IdCommand::Track(config) => match config.kind {
-            TrackKindArg::Audio => AudioTrackId::derive(&config.connection_id, &config.label).as_str(),
-            TrackKindArg::Video => VideoTrackId::derive(&config.connection_id, &config.label).as_str(),
-            TrackKindArg::Data => DataTrackId::derive(&config.connection_id, &config.label).as_str(),
+            TrackKindArg::Audio => {
+                AudioTrackId::derive(&config.connection_id, &config.label).as_str()
+            }
+            TrackKindArg::Video => {
+                VideoTrackId::derive(&config.connection_id, &config.label).as_str()
+            }
+            TrackKindArg::Data => {
+                DataTrackId::derive(&config.connection_id, &config.label).as_str()
+            }
         },
     }
 }

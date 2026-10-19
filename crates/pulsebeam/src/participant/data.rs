@@ -56,7 +56,13 @@ impl DataState {
             publication.is_some(),
             channel.direction == DataTrackDirection::Publish
         );
-        self.channels.insert(cid, DataChannelState { channel, publication });
+        self.channels.insert(
+            cid,
+            DataChannelState {
+                channel,
+                publication,
+            },
+        );
         Ok(())
     }
 
@@ -116,7 +122,9 @@ mod tests {
         };
 
         let mut state = DataState::new();
-        state.open(cid, channel.clone(), Some(meta.clone())).unwrap();
+        state
+            .open(cid, channel.clone(), Some(meta.clone()))
+            .unwrap();
         assert_eq!(state.channel(cid), Some(&channel));
         let closed = state.close(cid).unwrap();
         assert_eq!(closed.channel, channel);

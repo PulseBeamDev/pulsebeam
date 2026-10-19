@@ -855,7 +855,7 @@ impl NodeBuilder {
 
         for (shard_idx, ((udp_sock, tcp_sock), frame_rx)) in udp_sockets
             .into_iter()
-            .zip(tcp_sockets.into_iter())
+            .zip(tcp_sockets)
             .zip(frame_rxs)
             .enumerate()
         {

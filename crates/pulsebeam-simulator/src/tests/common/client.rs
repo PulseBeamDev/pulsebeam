@@ -1690,7 +1690,8 @@ struct VideoStreamReceiver {
 }
 
 fn create_video_source(encoding: Option<&str>) -> VideoSource {
-    static FRAMES: [OnceLock<Arc<[Arc<[u8]>]>>; 3] = [const { OnceLock::new() }; 3];
+    type EncodedFrames = Arc<[Arc<[u8]>]>;
+    static FRAMES: [OnceLock<EncodedFrames>; 3] = [const { OnceLock::new() }; 3];
     let (index, data) = match encoding {
         Some("f") => (0, pulsebeam_testdata::RAW_H264_FULL_CBR),
         Some("h") => (1, pulsebeam_testdata::RAW_H264_HALF_CBR),

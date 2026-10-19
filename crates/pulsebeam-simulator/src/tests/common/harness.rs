@@ -1365,7 +1365,7 @@ async fn run_participant(
             tokio::select! {
                 command = cmd_rx.recv() => break command,
                 _ = interval.tick() => {
-                    let operations = shared.pending_ops.lock().unwrap().pending.drain(..).collect::<Vec<_>>();
+                    let operations = std::mem::take(&mut shared.pending_ops.lock().unwrap().pending);
                     let mut retry = Vec::new();
                     for operation in operations {
                         let complete = match operation.clone() {
@@ -3513,9 +3513,11 @@ fn expected_state(handles: &PlanHandles) -> anyhow::Result<super::oracle::Contro
             planned_video(&participants, participant, handle, &observation)
                 .into_iter()
                 .map(|id| {
-                    let id: pulsebeam::entity::ParticipantId =
-                        id.parse().expect("admission identity");
-                    id.derive_track_id(pulsebeam::entity::TrackKind::Video, "video")
+                    let peer = participants
+                        .iter()
+                        .find(|peer| peer.id.as_str() == id)
+                        .expect("admitted video publisher");
+                    peer.track_id(pulsebeam::entity::TrackKind::Video, "video")
                 })
                 .collect()
         })
@@ -3654,10 +3656,12 @@ async fn assert_convergence(
             .audio
             .iter()
             .map(|participant| {
-                let participant: pulsebeam::entity::ParticipantId =
-                    participant.parse().expect("admission identity");
-                participant
-                    .derive_track_id(pulsebeam::entity::TrackKind::Audio, "audio")
+                let peer = expected
+                    .participants
+                    .iter()
+                    .find(|peer| peer.id.as_str() == *participant)
+                    .expect("admitted audio publisher");
+                peer.track_id(pulsebeam::entity::TrackKind::Audio, "audio")
                     .as_str()
             })
             .collect::<Vec<_>>();

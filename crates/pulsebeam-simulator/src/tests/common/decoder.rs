@@ -363,7 +363,7 @@ mod tests {
     fn reference_error_measures_pixels_not_stride_padding() {
         let reference: Vec<u8> = (0..21).collect();
         let mut decoded = vec![255; 27];
-        for (row, pixels) in reference.chunks_exact(7).enumerate() {
+        for (row, pixels) in reference.as_chunks::<7>().0.iter().enumerate() {
             for (column, expected) in pixels.iter().enumerate() {
                 decoded[row * 9 + column] = expected + 2;
             }

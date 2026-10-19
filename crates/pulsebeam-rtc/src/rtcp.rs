@@ -389,7 +389,7 @@ impl<'a> SenderReport<'a> {
             return Err(PacketError::InvalidLength);
         }
         let reports = body.get(24..).ok_or(PacketError::InvalidLength)?;
-        for block in reports.chunks_exact(REPORT_BLOCK_BYTES) {
+        for block in reports.as_chunks::<REPORT_BLOCK_BYTES>().0 {
             ReportBlock::parse(block)?;
         }
         Ok(Self {
@@ -422,8 +422,10 @@ impl<'a> SenderReport<'a> {
     }
     pub fn reports(&self) -> impl Iterator<Item = ReportBlock<'a>> {
         self.reports
-            .chunks_exact(REPORT_BLOCK_BYTES)
-            .filter_map(ReportBlock::parse_optional)
+            .as_chunks::<REPORT_BLOCK_BYTES>()
+            .0
+            .iter()
+            .filter_map(|bytes| ReportBlock::parse_optional(bytes))
     }
 }
 
@@ -446,7 +448,7 @@ impl<'a> ReceiverReport<'a> {
             return Err(PacketError::InvalidLength);
         }
         let reports = body.get(4..).ok_or(PacketError::InvalidLength)?;
-        for block in reports.chunks_exact(REPORT_BLOCK_BYTES) {
+        for block in reports.as_chunks::<REPORT_BLOCK_BYTES>().0 {
             ReportBlock::parse(block)?;
         }
         Ok(Self {
@@ -459,8 +461,10 @@ impl<'a> ReceiverReport<'a> {
     }
     pub fn reports(&self) -> impl Iterator<Item = ReportBlock<'a>> {
         self.reports
-            .chunks_exact(REPORT_BLOCK_BYTES)
-            .filter_map(ReportBlock::parse_optional)
+            .as_chunks::<REPORT_BLOCK_BYTES>()
+            .0
+            .iter()
+            .filter_map(|bytes| ReportBlock::parse_optional(bytes))
     }
 }
 
@@ -520,7 +524,9 @@ impl<'a> Nack<'a> {
     pub fn pairs(&self) -> impl Iterator<Item = (u16, u16)> + 'a {
         self.feedback
             .fci()
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .filter_map(|bytes| Some((u16_at(bytes, 0).ok()?, u16_at(bytes, 2).ok()?)))
     }
 }
@@ -573,7 +579,7 @@ impl<'a> Fir<'a> {
         {
             return Err(PacketError::InvalidLength);
         }
-        if feedback.fci().chunks_exact(8).any(|bytes| {
+        if feedback.fci().as_chunks::<8>().0.iter().any(|bytes| {
             bytes.get(5).copied().unwrap_or_default() != 0
                 || bytes.get(6).copied().unwrap_or_default() != 0
                 || bytes.get(7).copied().unwrap_or_default() != 0
@@ -589,12 +595,17 @@ impl<'a> Fir<'a> {
         self.feedback.media_ssrc()
     }
     pub fn entries(&self) -> impl Iterator<Item = FirEntry> + 'a {
-        self.feedback.fci().chunks_exact(8).filter_map(|bytes| {
-            Some(FirEntry {
-                ssrc: u32_at(bytes, 0).ok()?,
-                sequence_number: *bytes.get(4)?,
+        self.feedback
+            .fci()
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .filter_map(|bytes| {
+                Some(FirEntry {
+                    ssrc: u32_at(bytes, 0).ok()?,
+                    sequence_number: *bytes.get(4)?,
+                })
             })
-        })
     }
 }
 
@@ -850,9 +861,8 @@ fn rfc8888(packet: RtcpPacket<'_>) -> Result<Option<ParsedRfc8888>, PacketError>
         let metrics = body
             .get(offset..metrics_end)
             .ok_or(PacketError::InvalidLength)?;
-        for metric in metrics.chunks_exact(2) {
-            let metric =
-                u16::from_be_bytes(metric.try_into().map_err(|_| PacketError::InvalidLength)?);
+        for metric in metrics.as_chunks::<2>().0 {
+            let metric = u16::from_be_bytes(*metric);
             if metric & 0x8000 == 0 {
                 if metric != 0 {
                     return Err(PacketError::InvalidValue);
@@ -1138,7 +1148,9 @@ impl<'a> Bye<'a> {
     }
     pub fn ssrcs(&self) -> impl Iterator<Item = u32> + 'a {
         self.ssrcs
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .filter_map(|bytes| u32_at(bytes, 0).ok())
     }
     pub fn reason(&self) -> Option<&'a [u8]> {

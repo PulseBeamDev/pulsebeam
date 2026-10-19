@@ -1138,7 +1138,7 @@ fn inbound_rids(raw: &[String]) -> Result<Vec<String>, NegotiationError> {
         .filter_map(|line| line.strip_prefix("a=simulcast:"))
     {
         let fields = value.split_whitespace().collect::<Vec<_>>();
-        for pair in fields.chunks_exact(2) {
+        for pair in fields.as_chunks::<2>().0 {
             let ["send", rid_list] = pair else {
                 continue;
             };
@@ -1172,10 +1172,8 @@ fn validate_simulcast(raw: &[String], kind: SectionKind) -> Result<(), Negotiati
         let fields = value.split_whitespace().collect::<Vec<_>>();
         if fields.is_empty()
             || fields.len() % 2 != 0
-            || fields.chunks_exact(2).any(|pair| {
-                let [direction, alternatives] = pair else {
-                    return true;
-                };
+            || fields.as_chunks::<2>().0.iter().any(|pair| {
+                let [direction, alternatives] = pair;
                 !matches!(*direction, "send" | "recv") || alternatives.is_empty()
             })
         {
@@ -1674,10 +1672,8 @@ fn invert_direction(line: &str) -> String {
     let value = line.strip_prefix("a=simulcast:").unwrap_or_default();
     let fields = value.split_whitespace().collect::<Vec<_>>();
     let mut output = String::from("a=simulcast:");
-    for (index, pair) in fields.chunks_exact(2).enumerate() {
-        let [direction, alternatives] = pair else {
-            continue;
-        };
+    for (index, pair) in fields.as_chunks::<2>().0.iter().enumerate() {
+        let [direction, alternatives] = pair;
         if index != 0 {
             output.push(' ');
         }

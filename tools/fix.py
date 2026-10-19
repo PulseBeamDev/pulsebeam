@@ -76,7 +76,8 @@ def main():
     for name in ("rustfmt", "web", "react", "meet"):
         parser.add_argument("--" + name, required=True)
     args = parser.parse_args()
-    tools = {key: str(Path(value).resolve()) for key, value in vars(args).items()}
+    # Keep launcher runfiles symlinks intact when changing the subprocess cwd.
+    tools = {key: str(Path(value).absolute()) for key, value in vars(args).items()}
     root = Path(os.environ["BUILD_WORKSPACE_DIRECTORY"])
     apply_clippy(root)
     workspace = tomllib.loads((root / "Cargo.toml").read_text())
@@ -102,7 +103,8 @@ def main():
         if tool == "react":
             files.extend(str(path) for path in (root / "docs/react").glob("*.tsx"))
         subprocess.run([tools[tool], "--write", *sorted(files)], cwd=package,
-                       env=os.environ | {"BAZEL_BINDIR": "."}, check=True)
+                       env=os.environ | {"BAZEL_BINDIR": ".", "JS_BINARY__CHDIR": str(package),
+                                         "JS_BINARY__PATCH_NODE_FS": "0"}, check=True)
 
 
 if __name__ == "__main__":

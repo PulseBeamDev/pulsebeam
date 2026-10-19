@@ -90,6 +90,7 @@ rust_test(
 
 rust_shared_library(
     name = "wasm_library",
+    target_compatible_with = ["@platforms//cpu:wasm32"],
     crate_name = "pulsebeam_agent_web",
     crate_root = "src/lib.rs",
     srcs = glob(["src/**/*.rs"], exclude = ["src/bin/**"]),
@@ -172,6 +173,7 @@ output_files(
 
 rust_shared_library(
     name = "uniffi_wasm_library",
+    target_compatible_with = ["@platforms//cpu:wasm32"],
     crate_name = "pulsebeam_agent_web_wasm",
     crate_root = "generated/wasm/src/lib.rs",
     srcs = ["generated/wasm/src/lib.rs", "generated/wasm/src/pulsebeam_agent_web_module.rs", "generated/wasm/src/pulsebeam_agent_core_module.rs"],

@@ -17,17 +17,18 @@ impl Pacer {
 
     pub(crate) fn reprice(&mut self, now: Instant, rate_bps: u64) {
         let rate_bps = rate_bps.max(1);
-        if self.rate_bps != 0 && self.rate_bps != rate_bps {
-            if let Some(deadline) = self.next_send.filter(|deadline| *deadline > now) {
-                // Preserve remaining byte debt, not the old rate's drain time.
-                let nanos = deadline
-                    .saturating_duration_since(now)
-                    .as_nanos()
-                    .saturating_mul(u128::from(self.rate_bps))
-                    .div_ceil(u128::from(rate_bps));
-                let remaining = Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX));
-                self.next_send = now.checked_add(remaining);
-            }
+        if self.rate_bps != 0
+            && self.rate_bps != rate_bps
+            && let Some(deadline) = self.next_send.filter(|deadline| *deadline > now)
+        {
+            // Preserve remaining byte debt, not the old rate's drain time.
+            let nanos = deadline
+                .saturating_duration_since(now)
+                .as_nanos()
+                .saturating_mul(u128::from(self.rate_bps))
+                .div_ceil(u128::from(rate_bps));
+            let remaining = Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX));
+            self.next_send = now.checked_add(remaining);
         }
         self.rate_bps = rate_bps;
     }

@@ -896,8 +896,8 @@ impl Participant {
                             self.upstream.data.close(cid);
                             self.release_data_channel(previous, events);
                         }
-                        let publication = (channel.direction == DataTrackDirection::Publish)
-                            .then(|| {
+                        let publication =
+                            (channel.direction == DataTrackDirection::Publish).then(|| {
                                 let label =
                                     crate::track::publication_label(channel.lane, &channel.topic);
                                 Track::data(
@@ -1133,11 +1133,7 @@ impl Participant {
         }
     }
 
-    fn release_data_channel(
-        &mut self,
-        state: DataChannelState,
-        events: &mut impl ParticipantSink,
-    ) {
+    fn release_data_channel(&mut self, state: DataChannelState, events: &mut impl ParticipantSink) {
         if let Some(meta) = state.publication {
             events.unpublish_track(meta);
         } else {

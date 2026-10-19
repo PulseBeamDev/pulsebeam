@@ -2000,10 +2000,7 @@ mod replacement_tests {
         let stale_meta = stale_track.meta().clone();
         let track_id = current.derive_track_id(crate::entity::TrackKind::Data, "rt/chat");
 
-        actor.handle_shard_event((
-            ShardId::new(0),
-            ShardEvent::TrackPublished(stale_track),
-        ));
+        actor.handle_shard_event((ShardId::new(0), ShardEvent::TrackPublished(stale_track)));
         assert!(
             actor
                 .lifecycle
@@ -2021,10 +2018,7 @@ mod replacement_tests {
             ShardId::new(0),
             ShardEvent::TrackPublished(make_track(current)),
         ));
-        actor.handle_shard_event((
-            ShardId::new(0),
-            ShardEvent::TrackUnpublished(stale_meta),
-        ));
+        actor.handle_shard_event((ShardId::new(0), ShardEvent::TrackUnpublished(stale_meta)));
         assert!(
             actor
                 .lifecycle

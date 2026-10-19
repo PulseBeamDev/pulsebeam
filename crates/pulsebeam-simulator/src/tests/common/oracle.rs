@@ -29,6 +29,12 @@ impl ExpectedParticipant {
         ))
     }
 
+    pub fn track_id(&self, kind: TrackKind, label: &str) -> TrackId {
+        self.connection
+            .expect("admitted plan participant")
+            .derive_track_id(kind, label)
+    }
+
     fn tracks(&self) -> impl Iterator<Item = (TrackId, String)> + '_ {
         self.publications()
             .map(|publication| {
@@ -43,7 +49,7 @@ impl ExpectedParticipant {
                     TopicMode::Ordered => "rel",
                 };
                 let label = format!("v1/{lane}/{}", publisher.topic);
-                (self.id.derive_track_id(TrackKind::Data, &label), label)
+                (self.track_id(TrackKind::Data, &label), label)
             }))
     }
 
@@ -55,7 +61,7 @@ impl ExpectedParticipant {
         .into_iter()
         .filter(|(active, ..)| *active)
         .map(|(_, kind, media, label)| Publication {
-            id: self.id.derive_track_id(kind, label).as_str(),
+            id: self.track_id(kind, label).as_str(),
             participant_id: self.id.as_str(),
             kind: media,
             label: label.into(),
@@ -147,9 +153,11 @@ impl ControlStateOracle {
             .iter()
             .map(|id| {
                 let participant: ParticipantId = id.parse()?;
-                Ok(participant
-                    .derive_track_id(TrackKind::Video, "video")
-                    .as_str())
+                let peer = peers
+                    .iter()
+                    .find(|peer| peer.id == participant)
+                    .ok_or_else(|| anyhow::anyhow!("requested video has no plan participant"))?;
+                Ok(peer.track_id(TrackKind::Video, "video").as_str())
             })
             .collect::<Result<BTreeSet<_>>>()?;
         let desired_video = accepted
@@ -214,7 +222,7 @@ impl ControlStateOracle {
             let expected_automatic = peers
                 .iter()
                 .filter(|peer| peer.required && peer.audio)
-                .map(|peer| peer.id.derive_track_id(TrackKind::Audio, "audio").as_str())
+                .map(|peer| peer.track_id(TrackKind::Audio, "audio").as_str())
                 .filter(|track| !pinned.contains(track))
                 .collect::<BTreeSet<_>>();
             let automatic_capacity = observation.audio_capacity - pinned.len();
@@ -535,6 +543,7 @@ impl ControlStateOracle {
                 .ok_or_else(|| anyhow::anyhow!("stale or invented publication {:?}", track.meta))?;
             ensure!(
                 track.meta.origin == expected.id
+                    && Some(track.meta.connection_id) == expected.connection
                     && track.meta.room_id == expected.room_id()?
                     && track.meta.label.as_ref() == Some(label),
                 "publication owner, room, kind or label mismatch"

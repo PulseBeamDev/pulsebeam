@@ -35,7 +35,7 @@ test_suite(
     tests = ["//%s:%s" % (owner, check) for owner in RUST_OWNERS + ["crates/pulsebeam-simulator"] for check in ["format", "clippy"]] + [
         ":artifacts", "//agents/pulsebeam-agent-web:js_format", "//agents/pulsebeam-agent-web:js_unit_tests", "//agents/pulsebeam-agent-web:public_contract",
         "//agents/pulsebeam-agent-web:uniffi_types", "//agents/pulsebeam-agent-web:node_runtime_tests",
-        "//agents/react:format", "//agents/react:fast", "//apps/meet:check", "//tools:workflow_contract", "//tools:simulation_runner_contract", "//tools:scoreboard_contract", "//tools:ide_contract", "//tools:launcher_contract", "//tools:rust_pins_contract", "//tools:clippy_fix_contract",
+        "//agents/react:format", "//agents/react:fast", "//apps/meet:check", "//tools:workflow_contract", "//tools:simulation_runner_contract", "//tools:scoreboard_contract", "//tools:ide_contract", "//tools:launcher_contract", "//tools:rust_pins_contract", "//tools:clippy_fix_contract", "//tools:fix_contract",
         "//server/auth:fast", "//server/typescript:fast", "//server/go:fast", "//server/python:fast", "//server/rust:fast",
         "//release:contract", "//release:elf_contract", "//release:plan_contract", "//release/npm:contract",
     ],
@@ -51,7 +51,7 @@ test_suite(
         "//agents/react:format", "//agents/react:unit_tests", "//agents/react:component_tests",
         "//apps/meet:component_tests", "//server/typescript:format",
         "//tools:workflow_contract", "//tools:simulation_runner_contract", "//tools:scoreboard_contract",
-        "//tools:ide_contract", "//tools:launcher_contract", "//tools:rust_pins_contract",
+        "//tools:ide_contract", "//tools:launcher_contract", "//tools:rust_pins_contract", "//tools:fix_contract",
         "//release:plan_contract",
     ],
 )

@@ -1095,11 +1095,15 @@ mod tests {
                 message.payload.unwrap()
             };
         assert!(matches!(
-            next(&mut session, &[track.clone()], Vec::new()),
+            next(&mut session, std::slice::from_ref(&track), Vec::new()),
             Payload::Catalog(_)
         ));
         assert!(matches!(
-            next(&mut session, &[track.clone()], vec![(2, track.id)]),
+            next(
+                &mut session,
+                std::slice::from_ref(&track),
+                vec![(2, track.id)]
+            ),
             Payload::Mapping(_)
         ));
         session.apply_participants([], [publisher]);

@@ -194,7 +194,9 @@ impl<'a> ParticipantSink for PipelineSinkRef<'a> {
         debug_assert_eq!(meta.connection_id, self.connection_id);
         self.pipeline
             .participant_events
-            .push_back(ParticipantEvent::Control(ShardEvent::TrackUnpublished(meta)));
+            .push_back(ParticipantEvent::Control(ShardEvent::TrackUnpublished(
+                meta,
+            )));
     }
 
     #[inline]

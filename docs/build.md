@@ -284,7 +284,9 @@ Web-before-React preparation order. Outputs live under `bazel-bin`.
 ./bazel build //agents/pulsebeam-agent-web:uniffi_bindings
 ```
 
-`fix` explicitly edits source using provisioned Rust/JS formatters. Normal
+`fix` applies unambiguous machine-applicable Clippy suggestions, then formats
+source with provisioned Rust/JS tools. Its Clippy pass requires compiling Rust
+code: repair compilation errors explicitly before retrying `fix`. Normal
 builds/tests never write tracked generated sources. Rust interfaces, `.proto`
 files, manifests, generator configuration and locked dependencies are declared
 inputs; change those rather than generated output. SDK and application outputs

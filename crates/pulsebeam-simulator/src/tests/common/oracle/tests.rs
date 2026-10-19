@@ -6,6 +6,8 @@ use pulsebeam::sim_observation::*;
 use pulsebeam::track::TrackMeta;
 use pulsebeam_agent_native::agent_core::{DesiredState, Participant, Snapshot, VideoSubscription};
 
+type Mutation<T> = (&'static str, fn(&mut T));
+
 fn fixture() -> (ControlStateOracle, Observation, ClientObservation) {
     let room = RoomId::derive(
         &DEVELOPMENT_PROJECT_ID,
@@ -21,7 +23,7 @@ fn fixture() -> (ControlStateOracle, Observation, ClientObservation) {
     let receiver_transport = NodeTransportAddress::new(TransportRoute::new(shard1, 0), 1);
     let source_connection = ConnectionId::new();
     let receiver_connection = ConnectionId::new();
-    let track = publisher.derive_track_id(TrackKind::Video, "video");
+    let track = source_connection.derive_track_id(TrackKind::Video, "video");
     let model = ControlStateOracle {
         participants: vec![
             ExpectedParticipant {
@@ -71,6 +73,7 @@ fn fixture() -> (ControlStateOracle, Observation, ClientObservation) {
                 shard_id: shard0,
                 id: track,
                 origin: publisher,
+                connection_id: source_connection,
                 label: Some("video".into()),
             },
             candidates: vec![publisher, viewer],
@@ -255,7 +258,7 @@ fn audio_fixture(capacity: u32) -> (ControlStateOracle, ClientObservation) {
                 .participants
                 .iter()
                 .filter(|peer| peer.audio)
-                .map(|peer| peer.id.derive_track_id(TrackKind::Audio, "audio").as_str()),
+                .map(|peer| peer.track_id(TrackKind::Audio, "audio").as_str()),
         )
         .collect();
     client.accepted.as_mut().unwrap().audio.automatic = true;
@@ -276,7 +279,7 @@ fn automatic_audio_oracle_requires_every_uncontended_live_source() {
         .check_client(&model.participants[1], &client, &requested)
         .unwrap();
 
-    let mutations: &[(&str, fn(&mut ClientObservation))] = &[
+    let mutations: &[Mutation<ClientObservation>] = &[
         ("missing automatic source", |state| {
             state.snapshot.audio_mapping.remove(&2);
         }),
@@ -317,8 +320,7 @@ fn automatic_audio_oracle_allows_contended_choices_but_requires_full_slots_and_p
         .participants
         .last()
         .unwrap()
-        .id
-        .derive_track_id(TrackKind::Audio, "audio")
+        .track_id(TrackKind::Audio, "audio")
         .as_str();
     client.snapshot.audio_mapping.insert(0, third);
     model
@@ -373,7 +375,7 @@ fn complete_plan_and_owner_values_agree() {
 
 #[test]
 fn owner_oracle_rejects_missing_duplicate_cross_room_and_retired_values() {
-    let mutations: &[(&str, fn(&mut Observation))] = &[
+    let mutations: &[Mutation<Observation>] = &[
         ("missing publication", |state| {
             state.control.tracks.clear();
         }),
@@ -382,7 +384,12 @@ fn owner_oracle_rejects_missing_duplicate_cross_room_and_retired_values() {
         }),
         ("wrong publication kind", |state| {
             let meta = &mut state.control.tracks[0].meta;
-            meta.id = meta.origin.derive_track_id(TrackKind::Audio, "video");
+            meta.id = meta
+                .connection_id
+                .derive_track_id(TrackKind::Audio, "video");
+        }),
+        ("stale publication connection", |state| {
+            state.control.tracks[0].meta.connection_id = ConnectionId::new();
         }),
         ("cross room", |state| {
             state.control.participants[0].room = RoomId::derive(
@@ -442,7 +449,7 @@ fn owner_oracle_rejects_missing_duplicate_cross_room_and_retired_values() {
 
 #[test]
 fn client_oracle_rejects_wrong_missing_duplicate_and_unrequested_assignments() {
-    let mutations: &[(&str, fn(&mut ClientObservation))] = &[
+    let mutations: &[Mutation<ClientObservation>] = &[
         ("wrong desired revision", |state| {
             state.snapshot.desired_revision += 1;
         }),
