@@ -684,7 +684,6 @@ impl MediaPacket {
     pub fn global_media_at(&self) -> GlobalMediaTime;
     pub fn view(&self) -> Option<MediaPacketView<'_>>;
     pub fn extension(&self, uri: &str) -> Option<&[u8]>;
-    pub fn dependency_descriptor_context(&self) -> Option<(&[u8], u32)>;
     pub fn to_transit(&self) -> MediaPacket;
     pub fn materialize(&self) -> Result<MaterializedMediaPacket, MediaTransitError>;
 }
@@ -733,28 +732,19 @@ nonzero reserved fields, truncation/trailing bytes, invalid RTP, duplicate or
 invalid URIs, and ranges that are not actual RTP extension values. Oversized
 materialization returns a typed resource error, not an unbounded buffer.
 
-Authenticated DD ingress retains the last source template-definition descriptor
-and current active-target mask as immutable packet metadata. The passive
-`dependency_descriptor_context` accessor returns those source facts, not a frame
-to replay, a decoded payload, or a local transport identity. It permits cold
-source joins even when the current source descriptor omits its definition.
-Local clones MAY share these immutable bytes; both transit paths MUST deep-copy
-them and preserve canonical packet bytes and global media time unchanged.
-
-Packets with this context use wire version two. After the extension records and
-before canonical RTP, it adds definition length (u16), current active-target
-mask (u32), then the definition bytes. The definition MUST be 3..=255 bytes,
-contain a valid attached structure at frame start, agree with the current
-packet's DD structure, and permit the supplied active-target mask. An explicit
-current-packet mask MUST agree with the context. Version-one packets remain
-supported and contain no context. Neither version fabricates absent source DD
-facts from generic `FrameMetadata`.
+Source interpretation belongs to the caller. Authenticated ingress exposes the
+negotiated extension bytes without retaining a source DD reader, template cache,
+or source dependency graph inside the packet. The caller can use the pure
+`pulsebeam-core::dd` helpers once per source and share the resulting immutable
+frame facts across receivers. Packet materialization contains canonical packet
+and clock facts only, not private source-interpreter or receiver state.
 
 This codec validates representation, not source authentication. It is a trusted
 SFU relay boundary, not an alternative to `Connection::receive` or ICE/SRTP
 authentication. The relay remains responsible for route/epoch/authentication
 framing and for serializing its separately owned `FrameMetadata` facts.
-`ForwardedMedia::to_transit` deep-copies packet state and known dependency IDs;
+`ForwardedMedia::to_transit` deep-copies packet state, known dependency IDs,
+resolved DD lists and template structures;
 unknown dependencies remain unknown. A relay must not replace unknown facts
 with invented independent-frame metadata.
 
@@ -772,6 +762,7 @@ pub struct FrameMetadata {
     pub random_access: bool,
     pub discardable: bool,
     pub dependencies: FrameDependencies,
+    pub descriptor: Option<Arc<SourceDescriptor>>,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -787,12 +778,44 @@ pub enum FrameDependencies {
     Unknown,
     Known(Arc<[FrameId]>),
 }
+
+pub struct SourceDescriptor {
+    pub template_id: u8,
+    pub decode_target_indications: Box<[DecodeTargetIndication]>,
+    pub chain_dependencies: Box<[Option<FrameId>]>,
+    pub structure: Arc<TemplateDependencyStructure>,
+    pub active_decode_targets: u32,
+    pub attached_structure: bool,
+}
 ```
 
 `Known` contains at most eight direct dependencies. An empty list means the frame
 is independently decodable in the caller's model. `Unknown` means the connection
 may still admit or discard the complete current frame but MUST NOT infer which
 later frames become undecodable.
+
+`SourceDescriptor` is optional resolved source syntax, not a receiver choice or
+a serialized reader. Its DTIs and immutable template structure reuse the pure
+core DD model; `DecodeTargetIndication` and `TemplateDependencyStructure` are
+also exported by RTC. Direct DD references come from `FrameDependencies::Known`;
+each chain names its predecessor with an opaque `FrameId`, or `None` for an
+independent chain. The caller resolves source wire-number wrap and frame
+identity. RTC never interprets a source frame number as that identity.
+
+A supplied descriptor requires known direct references, at most 32 DTIs, and
+one chain entry per declared chain, at most 32. A structure refresh is valid only
+at frame start. Admission checks these bounded format facts before retaining
+them. Unknown direct dependencies cannot become a DD with invented empty
+references. Without descriptor facts, RTC can forward opaque media but emits no
+DD; a required receiver selection without source facts rejects admission.
+
+Each receiver retains only its own bounded committed `FrameId`-to-output-number
+history and DD writer. Required frame or selected-chain references missing from
+that history fail closed. Output frame numbers, custom reference distances,
+active-target signaling and structure refresh are generated for that receiver.
+One receiver's selection cannot mutate another's source facts. Same-owner
+clones may share immutable snapshots; explicit transit copies the lists and
+structure into fresh owner-local storage.
 
 `SenderAssignment.decode_target_mask` is the receiver's output selection, not
 source frame metadata. `None` preserves source active targets; `Some(mask)`
@@ -801,8 +824,9 @@ Zero is an invalid assignment. Out-of-definition bits or a missing required
 source descriptor reject media as invalid frame metadata. When outbound DD is
 negotiated, the emitted mask intersects receiver selection and source activity,
 including an empty intersection without fabricated activity. Without outbound
-DD, selection generates no wire extension. Changing selection applies through a
-complete assignment and clears unprepared work rather than changing one fragment.
+DD, selection generates no wire extension. Selection changes atomically with the
+complete assignment. The caller uses `RecoverSenderMedia` when changing to a
+decoder-ready same-incarnation boundary that must clear unprepared work.
 
 `ForwardedMedia` carries the caller's `SourceIncarnation` separately from
 `FrameMetadata`; transit preserves both that token and immutable source facts.
@@ -1155,10 +1179,10 @@ never a source wire ID.
 
 - MID, RID, repaired RID, transport-wide sequence number, absolute send time,
   playout delay, and dependency descriptors requiring outbound continuity are
-  generated or rewritten by the connection. DD rewriting uses actual source
-  templates, DTIs, chains and resolutions, never payload parsing. It remaps frame
-  and active-chain references only to committed outbound frames in a bounded
-  exact source history. Missing required predecessors fail closed and request
+  generated or rewritten by the connection. DD rewriting uses caller-resolved
+  templates, DTIs, frame/chain references and resolutions, never source DD or
+  payload parsing. It remaps frame and active-chain references only to committed
+  outbound frames in a bounded receiver history keyed by opaque `FrameId`. Missing required predecessors fail closed and request
   fresh random access; zero is not a substitute for a shed predecessor. Chains
   protecting no emitted active target carry zero differences because they do
   not declare an output dependency. Source active-mask fields are never copied

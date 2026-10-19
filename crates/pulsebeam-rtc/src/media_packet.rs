@@ -7,10 +7,7 @@ use std::{cell::Cell, marker::PhantomData, ops::Range, sync::Arc};
 
 use bytes::Bytes;
 
-use crate::{
-    FrameId, GlobalMediaTime, SourceIncarnation,
-    dependency_descriptor::{DescriptorContext, TemplateSeed},
-};
+use crate::{FrameId, GlobalMediaTime, SourceIncarnation};
 
 #[derive(Clone, Debug)]
 pub struct MediaPacket {
@@ -18,7 +15,6 @@ pub struct MediaPacket {
     global_media_at: GlobalMediaTime,
     extensions: Arc<[(Arc<str>, Range<usize>)]>,
     clock_quality: ClockQuality,
-    descriptor_context: Option<DescriptorContext>,
     _not_sync: PhantomData<Cell<()>>,
 }
 
@@ -41,7 +37,7 @@ pub(crate) enum ClockQuality {
 }
 
 impl MediaPacket {
-    #[allow(dead_code, reason = "packets are constructed by ingress in Plan 03")]
+    #[cfg(test)]
     pub(crate) fn new(
         bytes: Bytes,
         global_media_at: GlobalMediaTime,
@@ -66,7 +62,6 @@ impl MediaPacket {
             global_media_at,
             extensions,
             clock_quality,
-            descriptor_context: None,
             _not_sync: PhantomData,
         }
     }
@@ -103,29 +98,8 @@ impl MediaPacket {
         self.bytes.get(range.clone())
     }
 
-    /// An authenticated source template-definition descriptor and its current
-    /// active-target mask. The definition is metadata, not a replayable frame.
-    /// It permits cold source joins without fabricating generic target semantics.
-    pub fn dependency_descriptor_context(&self) -> Option<(&[u8], u32)> {
-        self.descriptor_context
-            .as_ref()
-            .map(|context| (context.definition.as_ref(), context.active_targets))
-    }
-
     pub(crate) fn queued_bytes(&self) -> usize {
-        self.bytes.len().saturating_add(
-            self.descriptor_context
-                .as_ref()
-                .map_or(0, |context| context.definition.len()),
-        )
-    }
-
-    pub(crate) fn descriptor_context(&self) -> Option<&DescriptorContext> {
-        self.descriptor_context.as_ref()
-    }
-
-    pub(crate) fn set_descriptor_context(&mut self, context: Option<DescriptorContext>) {
-        self.descriptor_context = context;
+        self.bytes.len()
     }
 
     pub fn materialize(&self) -> Result<crate::MaterializedMediaPacket, crate::MediaTransitError> {
@@ -141,13 +115,6 @@ impl MediaPacket {
             bytes: Bytes::copy_from_slice(&self.bytes),
             global_media_at: self.global_media_at,
             clock_quality: self.clock_quality,
-            descriptor_context: self
-                .descriptor_context
-                .as_ref()
-                .map(|context| DescriptorContext {
-                    definition: TemplateSeed::copy_from_slice(&context.definition),
-                    active_targets: context.active_targets,
-                }),
             extensions: self
                 .extensions
                 .iter()
@@ -176,6 +143,40 @@ impl ForwardedMedia {
     }
 }
 
+/// Resolved source DD facts, shared locally and copied explicitly for another owner.
+/// These contain source activity only; receiver selection belongs to SenderAssignment.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SourceDescriptor {
+    pub template_id: u8,
+    pub decode_target_indications: Box<[pulsebeam_core::dd::DecodeTargetIndication]>,
+    /// One source frame reference per chain. None denotes an independent chain.
+    pub chain_dependencies: Box<[Option<FrameId>]>,
+    pub structure: Arc<pulsebeam_core::dd::TemplateDependencyStructure>,
+    pub active_decode_targets: u32,
+    /// Whether this source packet refreshed its template structure on the wire.
+    pub attached_structure: bool,
+}
+
+impl SourceDescriptor {
+    // Reserve a whole structure and the largest legal lists even when locally shared.
+    pub(crate) const MEMORY_CHARGE: usize = size_of::<Self>()
+        .saturating_add(size_of::<pulsebeam_core::dd::TemplateDependencyStructure>())
+        .saturating_add(
+            size_of::<pulsebeam_core::dd::DecodeTargetIndication>()
+                .saturating_mul(pulsebeam_core::dd::MAX_DECODE_TARGETS),
+        )
+        .saturating_add(
+            size_of::<Option<FrameId>>().saturating_mul(pulsebeam_core::dd::MAX_CHAINS),
+        );
+
+    pub fn to_transit(&self) -> Self {
+        Self {
+            structure: Arc::new(self.structure.as_ref().clone()),
+            ..self.clone()
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FrameMetadata {
     pub id: FrameId,
@@ -183,6 +184,7 @@ pub struct FrameMetadata {
     pub random_access: bool,
     pub discardable: bool,
     pub dependencies: FrameDependencies,
+    pub descriptor: Option<Arc<SourceDescriptor>>,
 }
 
 impl FrameMetadata {
@@ -199,6 +201,10 @@ impl FrameMetadata {
             random_access: self.random_access,
             discardable: self.discardable,
             dependencies,
+            descriptor: self
+                .descriptor
+                .as_ref()
+                .map(|value| Arc::new(value.to_transit())),
         }
     }
 }

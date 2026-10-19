@@ -90,7 +90,13 @@ The SFU supplies frame semantics it already knows, including frame identity,
 boundaries, random-access state, and dependencies. `pulsebeam-rtc` uses those
 facts for admission, deadline enforcement, shedding, RTX usefulness, and
 outbound dependency continuity. Core forwarding does not require codec-payload
-parsing and must carry opaque or SFrame-protected media. Within a fragmented
+parsing and must carry opaque or SFrame-protected media. Optional `SourceDescriptor`
+facts contain resolved DTIs, a shared immutable template structure, source
+activity and caller `FrameId` chain references. Direct references use
+`FrameDependencies::Known`. The caller owns source DD parsing and wire-number
+unwrapping; RTC owns only each receiver's descriptor rewriting and committed
+frame-number history. Without these facts, opaque forwarding emits no DD and
+unknown dependencies remain unknown. Within a fragmented
 frame, native admission checks canonical source RTP continuity. A missing middle
 packet interrupts the frame rather than emitting its End marker on contiguous
 output. The caller can discard unprepared work and resume at fresh independent

@@ -1,15 +1,9 @@
 use std::ops::Range;
 
-use crate::{
-    GlobalMediaTime, MediaPacket,
-    dependency_descriptor::{self, DescriptorContext, TemplateSeed},
-    media_packet::ClockQuality,
-    packet::RtpPacket,
-};
+use crate::{GlobalMediaTime, MediaPacket, media_packet::ClockQuality, packet::RtpPacket};
 
 const MAGIC: &[u8; 4] = b"PBRP";
 const VERSION: u8 = 1;
-const DESCRIPTOR_VERSION: u8 = 2;
 const MAX_BYTES: usize = 512 * 1024;
 const MAX_PACKET_BYTES: usize = u16::MAX as usize;
 const MAX_EXTENSIONS: usize = 256;
@@ -32,7 +26,6 @@ pub struct MaterializedMediaPacket {
     global_media_at: GlobalMediaTime,
     clock_quality: ClockQuality,
     extensions: Box<[(Box<str>, Range<usize>)]>,
-    descriptor_context: Option<(Range<usize>, u32)>,
 }
 
 impl MaterializedMediaPacket {
@@ -47,11 +40,9 @@ impl MaterializedMediaPacket {
         if reader.take(4)? != MAGIC {
             return Err(MediaTransitError::Invalid);
         }
-        let version = match reader.take(1)? {
-            [VERSION] => VERSION,
-            [DESCRIPTOR_VERSION] => DESCRIPTOR_VERSION,
-            _ => return Err(MediaTransitError::UnsupportedVersion),
-        };
+        if reader.take(1)? != [VERSION] {
+            return Err(MediaTransitError::UnsupportedVersion);
+        }
         let clock_quality = match reader.take(1)? {
             [0] => ClockQuality::Provisional,
             [1] => ClockQuality::Synchronized,
@@ -86,21 +77,6 @@ impl MaterializedMediaPacket {
             }
             extensions.push((uri.into(), start..end));
         }
-        let descriptor_context = if version == DESCRIPTOR_VERSION {
-            let len = usize::from(u16::from_be_bytes(reader.array()?));
-            if !(3..=255).contains(&len) {
-                return Err(MediaTransitError::Invalid);
-            }
-            let active_targets = u32::from_be_bytes(reader.array()?);
-            let start = reader.offset;
-            let definition = reader.take(len)?;
-            if !dependency_descriptor::valid_context(definition, active_targets) {
-                return Err(MediaTransitError::Invalid);
-            }
-            Some((start..reader.offset, active_targets))
-        } else {
-            None
-        };
         let packet_start = reader.offset;
         let bytes = reader.take(packet_len)?;
         if reader.offset != wire.len() {
@@ -115,22 +91,6 @@ impl MaterializedMediaPacket {
         if extensions.iter().any(|(_, range)| !ranges.contains(range)) {
             return Err(MediaTransitError::Invalid);
         }
-        if let Some((range, active_targets)) = &descriptor_context {
-            let definition = wire.get(range.clone()).ok_or(MediaTransitError::Invalid)?;
-            let descriptor = dependency_descriptor::URIS
-                .iter()
-                .find_map(|uri| {
-                    let (_, range) = extensions
-                        .iter()
-                        .find(|(candidate, _)| &**candidate == *uri)?;
-                    bytes.get(range.clone())
-                })
-                .ok_or(MediaTransitError::Invalid)?;
-            if !dependency_descriptor::valid_packet_context(definition, *active_targets, descriptor)
-            {
-                return Err(MediaTransitError::Invalid);
-            }
-        }
         let packet_range = packet_start..reader.offset;
         Ok(Self {
             wire,
@@ -138,7 +98,6 @@ impl MaterializedMediaPacket {
             global_media_at,
             clock_quality,
             extensions: extensions.into_boxed_slice(),
-            descriptor_context,
         })
     }
 
@@ -163,19 +122,7 @@ impl MaterializedMediaPacket {
             .wire
             .get(self.packet_range)
             .ok_or(MediaTransitError::Invalid)?;
-        let context = self
-            .descriptor_context
-            .map(|(range, active_targets)| {
-                self.wire
-                    .get(range)
-                    .map(|definition| DescriptorContext {
-                        definition: TemplateSeed::copy_from_slice(definition),
-                        active_targets,
-                    })
-                    .ok_or(MediaTransitError::Invalid)
-            })
-            .transpose()?;
-        let mut packet = MediaPacket::with_clock_quality(
+        Ok(MediaPacket::with_clock_quality(
             Bytes::copy_from_slice(packet),
             self.global_media_at,
             self.extensions
@@ -185,9 +132,7 @@ impl MaterializedMediaPacket {
                 .collect::<Vec<_>>()
                 .into(),
             self.clock_quality,
-        );
-        packet.set_descriptor_context(context);
-        Ok(packet)
+        ))
     }
 
     pub(crate) fn from_packet(packet: &MediaPacket) -> Result<Self, MediaTransitError> {
@@ -204,21 +149,12 @@ impl MaterializedMediaPacket {
                 |size, (uri, _)| size.checked_add(12)?.checked_add(uri.len()),
             )
             .ok_or(MediaTransitError::TooLarge)?;
-        let size = size.saturating_add(
-            packet
-                .descriptor_context()
-                .map_or(0, |context| 6usize.saturating_add(context.definition.len())),
-        );
         if size > MAX_BYTES {
             return Err(MediaTransitError::TooLarge);
         }
         let mut wire = Vec::with_capacity(size);
         wire.extend_from_slice(MAGIC);
-        wire.push(if packet.descriptor_context().is_some() {
-            DESCRIPTOR_VERSION
-        } else {
-            VERSION
-        });
+        wire.push(VERSION);
         wire.push(match packet.clock_quality() {
             ClockQuality::Provisional => 0,
             ClockQuality::Synchronized => 1,
@@ -238,15 +174,6 @@ impl MaterializedMediaPacket {
             write_length(&mut wire, range.start)?;
             write_length(&mut wire, range.end)?;
             wire.extend_from_slice(uri.as_bytes());
-        }
-        if let Some(context) = packet.descriptor_context() {
-            wire.extend_from_slice(
-                &u16::try_from(context.definition.len())
-                    .map_err(|_| MediaTransitError::TooLarge)?
-                    .to_be_bytes(),
-            );
-            wire.extend_from_slice(&context.active_targets.to_be_bytes());
-            wire.extend_from_slice(&context.definition);
         }
         wire.extend_from_slice(packet.bytes());
         Self::from_bytes(wire.into_boxed_slice())
@@ -445,6 +372,7 @@ mod tests {
     #[test]
     fn forwarded_transit_deep_copies_known_dependencies_and_keeps_unknown_unknown() {
         let frame = FrameMetadata {
+            descriptor: None,
             id: FrameId::from_value(9),
             boundary: FrameBoundary::Start,
             random_access: false,

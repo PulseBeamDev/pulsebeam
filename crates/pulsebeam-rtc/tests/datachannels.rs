@@ -251,6 +251,7 @@ fn fragmented_data_and_rtp_share_service_without_cross_accounting_starvation() {
                 source: pulsebeam_rtc::SourceIncarnation::from_value(1),
                 packet: packet.clone(),
                 frame: FrameMetadata {
+                    descriptor: None,
                     id: FrameId::from_value(index + 1),
                     boundary: FrameBoundary::Complete,
                     random_access: true,

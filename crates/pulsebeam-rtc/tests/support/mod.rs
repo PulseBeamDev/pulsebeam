@@ -2039,6 +2039,7 @@ pub fn forwarded(packet: MediaPacket, id: u64) -> ForwardedMedia {
         source: SourceIncarnation::from_value(1),
         packet,
         frame: FrameMetadata {
+            descriptor: None,
             id: FrameId::from_value(id),
             boundary: FrameBoundary::Complete,
             random_access: true,

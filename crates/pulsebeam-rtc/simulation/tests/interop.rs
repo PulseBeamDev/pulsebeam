@@ -250,6 +250,7 @@ fn exercise(seed: u64, start: Instant) -> (u64, u64, usize) {
                         source: SourceIncarnation::from_value(1),
                         packet,
                         frame: FrameMetadata {
+                            descriptor: None,
                             id: FrameId::from_value(inbound),
                             boundary: FrameBoundary::Complete,
                             random_access: true,

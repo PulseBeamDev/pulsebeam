@@ -17,7 +17,6 @@ use crate::{
     ConnectionWarning, EcnCodepoint, EncodingId, EncodingInfo, EncodingRetireReason, EncodingStats,
     Event, MediaPacket, PacketFeedbackKind, TimePoint,
     clock::{ClockMapper, ClockWarning, ntp_micros},
-    dependency_descriptor::DescriptorSource,
     negotiation::IngressMediaFacts,
     packet::RtpPacket,
     receive_feedback::ReceiveFeedback,
@@ -57,7 +56,6 @@ struct Encoding {
     retired: bool,
     receiver: ReceiveStream,
     mapper: ClockMapper,
-    descriptor: DescriptorSource,
 }
 
 impl IngressOwner {
@@ -271,7 +269,6 @@ impl IngressOwner {
                             .nack_payloads
                             .contains(&packet.payload_type()),
                     ),
-                    descriptor: DescriptorSource::default(),
                     mapper: ClockMapper::new(
                         arrival.global,
                         packet.sequence(),
@@ -290,8 +287,6 @@ impl IngressOwner {
                 index
             }
         };
-        let source_ssrc = packet.ssrc();
-        let encoding_index = encoding;
         let (encoding, global_media_at, warning, clock_quality) = {
             let encoding = &mut self.encodings[encoding];
             if encoding.ssrc.is_none() {
@@ -332,16 +327,12 @@ impl IngressOwner {
             self.push_clock_warning(warning);
         }
         let extensions = self.extensions_for(media, &packet);
-        let mut packet = MediaPacket::with_clock_quality(
+        let packet = MediaPacket::with_clock_quality(
             Bytes::from(bytes),
             global_media_at,
             extensions,
             clock_quality,
         );
-        let context = self.encodings[encoding_index]
-            .descriptor
-            .observe(&packet, source_ssrc);
-        packet.set_descriptor_context(context);
         if packet.queued_bytes() > self.max_bytes.saturating_sub(self.queued_media_bytes) {
             self.drop();
             return;

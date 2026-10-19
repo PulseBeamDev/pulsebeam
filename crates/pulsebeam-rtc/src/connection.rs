@@ -1683,6 +1683,7 @@ mod tests {
                             source: pulsebeam_rtc::SourceIncarnation::from_value(1),
                             packet,
                             frame: FrameMetadata {
+                                descriptor: None,
                                 id: FrameId::from_value(id),
                                 boundary: FrameBoundary::Complete,
                                 random_access,
@@ -1895,6 +1896,7 @@ mod tests {
                             source: pulsebeam_rtc::SourceIncarnation::from_value(1),
                             packet: packet.clone(),
                             frame: FrameMetadata {
+                                descriptor: None,
                                 id: FrameId::from_value(id),
                                 boundary: FrameBoundary::Complete,
                                 random_access: true,

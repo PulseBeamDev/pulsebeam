@@ -31,6 +31,8 @@ mod test_source;
 #[path = "../tests/support/mod.rs"]
 mod test_support;
 
+pub use pulsebeam_core::dd::{DecodeTargetIndication, TemplateDependencyStructure};
+
 pub use connection::{AcceptedConnection, Connection};
 pub use id::{DataChannelId, EncodingId, FrameId, IceTcpFlowId, SenderId, SourceIncarnation};
 pub use io::{
@@ -41,6 +43,7 @@ pub use io::{
 };
 pub use media_packet::{
     ForwardedMedia, FrameBoundary, FrameDependencies, FrameMetadata, MediaPacket, MediaPacketView,
+    SourceDescriptor,
 };
 pub use media_transit::{MaterializedMediaPacket, MediaTransitError};
 pub use session::{

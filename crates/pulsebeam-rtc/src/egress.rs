@@ -18,9 +18,7 @@ use crate::{
     congestion::{
         ControllerInput, EcnValidation, FeedbackSample, SafeRtpEnvelope, ScreamController,
     },
-    dependency_descriptor::{
-        DescriptorContinuity, DescriptorIngress, ParsedDescriptor, PreparedDescriptor,
-    },
+    dependency_descriptor::{DescriptorContinuity, PreparedDescriptor},
     negotiation::EgressSenderFacts,
     pacer::Pacer,
     packet::RtpPacket,
@@ -141,7 +139,7 @@ struct Sender {
     open_frame: Option<OpenFrame>,
     started_frames: BTreeSet<FrameId>,
     dependency_chain_valid: bool,
-    descriptor: Option<(DescriptorIngress, DescriptorContinuity)>,
+    descriptor: Option<DescriptorContinuity>,
     keyframe_requested: Option<KeyframeRequestReason>,
     fir_sequences: Vec<(u32, u8)>,
     audio_talkspurt_pending: bool,
@@ -211,7 +209,6 @@ struct QueuedMedia {
     sender: usize,
     queued_at: Instant,
     media: ForwardedMedia,
-    descriptor: Option<ParsedDescriptor>,
     descriptor_bytes: usize,
     payload_bytes: usize,
     transport_estimate: usize,
@@ -324,12 +321,9 @@ impl MediaEgress {
                     open_frame: None,
                     started_frames: BTreeSet::new(),
                     dependency_chain_valid: true,
-                    descriptor: facts.dependency_extension_id.map(|_| {
-                        (
-                            DescriptorIngress::default(),
-                            DescriptorContinuity::default(),
-                        )
-                    }),
+                    descriptor: facts
+                        .dependency_extension_id
+                        .map(|_| DescriptorContinuity::default()),
                     keyframe_requested: None,
                     fir_sequences: Vec::new(),
                     audio_talkspurt_pending: facts.kind == MediaKind::Audio,
@@ -462,8 +456,7 @@ impl MediaEgress {
         state.latest_admitted_global = state.latest_committed_global;
         state.keyframe_requested = None;
         state.audio_talkspurt_pending = state.facts.kind == MediaKind::Audio;
-        if let Some((ingress, continuity)) = &mut state.descriptor {
-            ingress.reset();
+        if let Some(continuity) = &mut state.descriptor {
             continuity.reset_source();
         }
         Ok(())
@@ -573,9 +566,7 @@ impl MediaEgress {
             .saturating_add(RTP_TRANSPORT_ALLOWANCE)
             .saturating_add(
                 if self.senders[sender_index].descriptor.is_some()
-                    && crate::dependency_descriptor::URIS
-                        .iter()
-                        .any(|uri| media.packet.extension(uri).is_some())
+                    && media.frame.descriptor.is_some()
                 {
                     pulsebeam_core::dd::MAX_DD_LEN
                 } else {
@@ -583,6 +574,14 @@ impl MediaEgress {
                 },
             );
         self.validate_frame(at, sender_index, &media, &packet)?;
+        crate::dependency_descriptor::validate(
+            &media.frame,
+            self.senders[sender_index]
+                .descriptor
+                .as_ref()
+                .and(assignment.decode_target_mask),
+        )
+        .map_err(|_| CommandError::InvalidFrameMetadata)?;
         self.offered_bytes = self.offered_bytes.saturating_add(payload_bytes as u64);
         if self
             .latest_useful_at(sender_index, media.packet.global_media_at())
@@ -625,30 +624,15 @@ impl MediaEgress {
             return Err(CommandError::WouldBlock);
         }
 
-        if self.senders[sender_index].descriptor.is_some()
-            && crate::dependency_descriptor::URIS
-                .iter()
-                .any(|uri| media.packet.extension(uri).is_some())
-            && ParsedDescriptor::MEMORY_CHARGE
-                > MAX_PACED_TRANSPORT_BYTES.saturating_sub(self.queued_descriptor_bytes)
+        let descriptor_bytes = media
+            .frame
+            .descriptor
+            .as_ref()
+            .map_or(0, |_| crate::SourceDescriptor::MEMORY_CHARGE);
+        if descriptor_bytes > MAX_PACED_TRANSPORT_BYTES.saturating_sub(self.queued_descriptor_bytes)
         {
             return Err(CommandError::WouldBlock);
         }
-        let descriptor = if let Some((ingress, _)) = &mut self.senders[sender_index].descriptor {
-            ingress
-                .read(
-                    &media.packet,
-                    packet.ssrc(),
-                    &media.frame,
-                    assignment.decode_target_mask,
-                )
-                .map_err(|_| CommandError::InvalidFrameMetadata)?
-        } else {
-            None
-        };
-        let descriptor_bytes = descriptor
-            .as_ref()
-            .map_or(0, ParsedDescriptor::memory_charge);
         self.apply_frame_admission(sender_index, &media, &packet);
         self.senders[sender_index].admission.charge(payload_bytes);
         self.admitted_bytes = self.admitted_bytes.saturating_add(payload_bytes as u64);
@@ -665,7 +649,6 @@ impl MediaEgress {
             sender: sender_index,
             queued_at: at.monotonic,
             media,
-            descriptor,
             descriptor_bytes,
             payload_bytes,
             transport_estimate,
@@ -1063,8 +1046,13 @@ impl MediaEgress {
         let Some(sender) = self.senders.get_mut(sender_index) else {
             return PrepareResult::Fatal;
         };
-        let descriptor = if let Some((_, continuity)) = &mut sender.descriptor {
-            match continuity.prepare(&queued.media.frame, queued.descriptor.as_ref()) {
+        let descriptor = if let Some(continuity) = &mut sender.descriptor {
+            match continuity.prepare(
+                &queued.media.frame,
+                sender
+                    .assignment
+                    .and_then(|assignment| assignment.decode_target_mask),
+            ) {
                 Ok(prepared) => Some(prepared),
                 Err(_) => {
                     sender.dependency_chain_valid = false;
@@ -1244,7 +1232,7 @@ impl MediaEgress {
                     .commit(at.monotonic, queued.payload_bytes, self.media_budget);
                 let state = &mut self.senders[sender];
                 if let Some(prepared) = descriptor
-                    && let Some((_, continuity)) = &mut state.descriptor
+                    && let Some(continuity) = &mut state.descriptor
                 {
                     continuity.commit(prepared);
                 }
@@ -1713,6 +1701,7 @@ impl MediaEgress {
                 }
             }
             let state = &mut self.senders[sender];
+            state.started_frames.remove(&frame);
             state.dependency_chain_valid = false;
             if state.facts.kind == MediaKind::Video {
                 state.keyframe_requested = Some(KeyframeRequestReason::LocalRecovery);
@@ -2995,6 +2984,7 @@ mod tests {
             source: pulsebeam_rtc::SourceIncarnation::from_value(1),
             packet: MediaPacket::new(bytes.into(), at.global, Arc::from([])),
             frame: FrameMetadata {
+                descriptor: None,
                 id: FrameId::from_value(id),
                 boundary,
                 random_access: true,
@@ -3005,11 +2995,8 @@ mod tests {
     }
 
     #[test]
-    fn descriptor_budget_rejection_does_not_prime_later_media() {
-        use pulsebeam_core::dd::{
-            DependencyDescriptorWriter, MAX_DD_LEN, temporal::TemporalDdGenerator,
-        };
-
+    fn descriptor_budget_rejection_preserves_facts_without_priming_source_state() {
+        use pulsebeam_core::dd::temporal::TemporalDdGenerator;
         let now = Instant::now();
         let at = TimePoint {
             monotonic: now,
@@ -3017,59 +3004,47 @@ mod tests {
         };
         let mut owner = playout_owner(now, None);
         owner.senders[0].facts.kind = MediaKind::Video;
-        owner.senders[0].descriptor = Some((
-            DescriptorIngress::default(),
-            DescriptorContinuity::default(),
-        ));
+        owner.senders[0].descriptor = Some(DescriptorContinuity::default());
         let sender = owner.senders[0].facts.id;
         let mut generator = TemporalDdGenerator::new(3);
-        let mut writer = DependencyDescriptorWriter::new();
-        let key = generator.next(true);
-        let mut later = generator.next(true);
-        later.attached_structure = None;
-        let mut media = |descriptor, id| {
-            let mut value = [0; MAX_DD_LEN];
-            let len = writer.write(descriptor, &mut value).unwrap();
-            let mut extension = vec![5, u8::try_from(len).unwrap()];
-            extension.extend_from_slice(&value[..len]);
-            while !extension.len().is_multiple_of(4) {
-                extension.push(0);
-            }
-            let mut bytes = vec![0x90, 111, 0, 1, 0, 0, 0, 0, 0, 0, 0, 7, 0x10, 0];
-            bytes.extend_from_slice(&u16::try_from(extension.len() / 4).unwrap().to_be_bytes());
-            bytes.extend_from_slice(&extension);
-            bytes.extend_from_slice(&[1, 2, 3]);
+        let structure = Arc::new(generator.structure().clone());
+        let mut media = |id| {
+            let dd = generator.next(true);
             let mut media = queued_media(at, id, FrameBoundary::Complete);
-            media.packet = MediaPacket::new(
-                bytes.into(),
-                at.global,
-                vec![(
-                    Arc::from(crate::dependency_descriptor::URIS[0]),
-                    18..18 + len,
-                )]
-                .into(),
-            );
+            media.frame.dependencies = FrameDependencies::known(Vec::new()).unwrap();
+            media.frame.descriptor = Some(Arc::new(crate::SourceDescriptor {
+                template_id: dd.template_id,
+                decode_target_indications: dd.frame_dependencies.dtis.into_iter().collect(),
+                chain_dependencies: dd
+                    .frame_dependencies
+                    .chain_diffs
+                    .into_iter()
+                    .map(|_| None)
+                    .collect(),
+                structure: structure.clone(),
+                active_decode_targets: 7,
+                attached_structure: false,
+            }));
             media
         };
-        let key_media = media(&key, 1);
-        let later_media = media(&later, 2);
+        let rejected = media(1);
+        let later = media(2);
+        let original = rejected.frame.clone();
         owner.queued_descriptor_bytes = MAX_PACED_TRANSPORT_BYTES;
         assert_eq!(
-            owner.admit(at, sender, key_media.clone()),
+            owner.admit(at, sender, rejected.clone()),
             Err(CommandError::WouldBlock)
-        );
-        owner.queued_descriptor_bytes = 0;
-        assert_eq!(
-            owner.admit(at, sender, later_media),
-            Err(CommandError::InvalidFrameMetadata)
         );
         assert!(owner.queue.is_empty());
         assert_eq!(owner.admitted_bytes, 0);
-        owner.admit(at, sender, key_media).unwrap();
+        assert_eq!(rejected.frame, original);
+        owner.queued_descriptor_bytes = 0;
+        // A resolved independent frame does not need a seed packet accepted by RTC.
+        owner.admit(at, sender, later).unwrap();
         assert_eq!(owner.queue.len(), 1);
         assert_eq!(
             owner.queued_descriptor_bytes,
-            ParsedDescriptor::MEMORY_CHARGE
+            crate::SourceDescriptor::MEMORY_CHARGE
         );
     }
 
@@ -4211,6 +4186,7 @@ mod tests {
             }
             assert!(owner.queue.is_empty());
             assert!(owner.senders[0].open_frame.is_none());
+            assert!(owner.senders[0].started_frames.is_empty());
             assert!(!owner.senders[0].dependency_chain_valid);
             assert!(
                 matches!(owner.poll_event(), Some(Event::KeyframeRequested { sender, reason: KeyframeRequestReason::LocalRecovery }) if sender == video)
@@ -6694,6 +6670,7 @@ mod tests {
                 Arc::from([]),
             ),
             frame: FrameMetadata {
+                descriptor: None,
                 id: FrameId::from_value(id),
                 boundary: FrameBoundary::Complete,
                 random_access: true,

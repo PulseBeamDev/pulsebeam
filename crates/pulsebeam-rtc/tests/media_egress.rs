@@ -427,7 +427,7 @@ fn lost_frame_end_has_explicit_recovery_without_resetting_committed_identity() {
 
 #[test]
 fn selected_target_is_synthesized_on_authenticated_wire_without_mutating_source() {
-    use pulsebeam_core::dd::{DependencyDescriptorReader, URI};
+    use pulsebeam_core::dd::{DependencyDescriptorReader, TemplateDependencyStructure, URI};
 
     let mut fixture = PeerFixture::connected_video_dd();
     declare_video_demand(&mut fixture);
@@ -438,6 +438,8 @@ fn selected_target_is_synthesized_on_authenticated_wire_without_mutating_source(
         assignment: Some(assignment),
     });
     let mut source_reader = DependencyDescriptorReader::new();
+    let mut source_structure: Option<Arc<TemplateDependencyStructure>> = None;
+    let mut source_frame_ids = std::collections::BTreeMap::new();
     let mut reader = DependencyDescriptorReader::new();
     for id in 0..=4 {
         fixture.drive_for(Duration::from_millis(33));
@@ -451,25 +453,49 @@ fn selected_target_is_synthesized_on_authenticated_wire_without_mutating_source(
         let descriptor = source_reader
             .read(source.extension(URI).expect("native source DD"))
             .expect("valid native source descriptor");
-        assert_eq!(
-            source
-                .dependency_descriptor_context()
-                .expect("source context")
-                .1,
-            15
-        );
+        if let Some(structure) = &descriptor.attached_structure {
+            source_structure = Some(Arc::new(structure.as_ref().clone()));
+        }
+        let reference = |diff: u16| {
+            *source_frame_ids
+                .get(&descriptor.frame_number.wrapping_sub(diff))
+                .expect("caller resolved source predecessor")
+        };
+        let dependencies = FrameDependencies::known(
+            descriptor
+                .frame_dependencies
+                .frame_diffs
+                .iter()
+                .map(|diff| reference(*diff))
+                .collect::<Vec<_>>(),
+        )
+        .expect("bounded source references");
+        let source_facts = Arc::new(pulsebeam_rtc::SourceDescriptor {
+            template_id: descriptor.template_id,
+            decode_target_indications: descriptor.frame_dependencies.dtis.iter().copied().collect(),
+            chain_dependencies: descriptor
+                .frame_dependencies
+                .chain_diffs
+                .iter()
+                .map(|diff| (*diff != 0).then(|| reference(u16::from(*diff))))
+                .collect(),
+            structure: source_structure
+                .clone()
+                .expect("caller resolved source structure"),
+            active_decode_targets: source_reader.active_decode_targets(),
+            attached_structure: descriptor.attached_structure.is_some(),
+        });
+        source_frame_ids.insert(descriptor.frame_number, FrameId::from_value(id));
+        assert_eq!(source_facts.active_decode_targets, 15);
         if id != 0 && id != 4 {
             continue;
         }
         let original = source.bytes().clone();
         let global = source.global_media_at();
         let mut media = forwarded(source.clone(), id);
+        media.frame.descriptor = Some(source_facts.clone());
         media.frame.random_access = id == 0;
-        media.frame.dependencies = FrameDependencies::Known(if id == 0 {
-            Arc::from([])
-        } else {
-            Arc::from([FrameId::from_value(0)])
-        });
+        media.frame.dependencies = dependencies;
         let media = media.to_transit();
         assert_eq!(media.source, assignment.source);
         fixture
@@ -503,13 +529,7 @@ fn selected_target_is_synthesized_on_authenticated_wire_without_mutating_source(
         }
         assert_eq!(source.bytes(), &original);
         assert_eq!(source.global_media_at(), global);
-        assert_eq!(
-            source
-                .dependency_descriptor_context()
-                .expect("unchanged source context")
-                .1,
-            15
-        );
+        assert_eq!(source_facts.active_decode_targets, 15);
     }
 }
 
@@ -518,6 +538,32 @@ fn invalid_decode_target_masks_reject_before_committing_continuity() {
     let mut fixture = PeerFixture::connected_video_dd();
     declare_video_demand(&mut fixture);
     let source = fixture.send_video_temporal_source(b"\x65frame", Some(0));
+    let mut reader = pulsebeam_core::dd::DependencyDescriptorReader::new();
+    let dd = reader
+        .read(
+            source
+                .extension(pulsebeam_core::dd::URI)
+                .expect("native DD"),
+        )
+        .unwrap();
+    let facts = pulsebeam_rtc::SourceDescriptor {
+        template_id: dd.template_id,
+        decode_target_indications: dd.frame_dependencies.dtis.into_iter().collect(),
+        chain_dependencies: dd
+            .frame_dependencies
+            .chain_diffs
+            .into_iter()
+            .map(|diff| {
+                assert_eq!(diff, 0);
+                None
+            })
+            .collect(),
+        structure: Arc::new(reader.structure().unwrap().clone()),
+        active_decode_targets: reader.active_decode_targets(),
+        attached_structure: dd.attached_structure.is_some(),
+    };
+    let mut media = forwarded(source, 0);
+    media.frame.descriptor = Some(Arc::new(facts));
     for mask in [0, 16, u32::MAX] {
         let mut assignment = fixture.assignment(fixture.sender);
         assignment.decode_target_mask = Some(mask);
@@ -532,7 +578,7 @@ fn invalid_decode_target_masks_reject_before_committing_continuity() {
             assert_eq!(
                 fixture.try_command(Command::SendMedia {
                     sender: fixture.sender,
-                    media: forwarded(source.clone(), 0)
+                    media: media.clone()
                 }),
                 Err(CommandError::InvalidFrameMetadata)
             );
@@ -547,7 +593,7 @@ fn invalid_decode_target_masks_reject_before_committing_continuity() {
     });
     fixture.command(Command::SendMedia {
         sender: fixture.sender,
-        media: forwarded(source, 0),
+        media,
     });
     let _ = fixture.receive_video_wire_header();
     let received = fixture.receive_video_frame();
@@ -580,6 +626,7 @@ fn forwarded(packet: pulsebeam_rtc::MediaPacket, id: u64) -> ForwardedMedia {
         source: pulsebeam_rtc::SourceIncarnation::from_value(1),
         packet,
         frame: FrameMetadata {
+            descriptor: None,
             id: FrameId::from_value(id),
             boundary: FrameBoundary::Complete,
             random_access: true,
