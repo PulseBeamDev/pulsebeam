@@ -5,6 +5,7 @@ common --watchfs
 build --disk_cache=~/.cache/pulsebeam/bazel/disk-cache
 build --incompatible_strict_action_env
 build --announce_rc
+build --workspace_status_command=tools/simulation-status.sh
 build --@rules_python//python/config_settings:bootstrap_impl=script
 build --@rules_rust//rust/settings:clippy.toml=//:clippy.toml
 build --@rules_rust//rust/settings:extra_rustc_flags=--cfg=tokio_unstable,--cfg=tracing_unstable,-Cforce-frame-pointers=yes

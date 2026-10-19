@@ -32,9 +32,11 @@ jobs:
           if [[ -z "$from" ]]; then
             from=$(( ${{ github.run_number }} * seeds + 1 ))
           fi
-          ./bazel run //:sweep -- --seeds "$seeds" --from-seed "$from" 2>&1 | tee seed-sweep.log
+          ./bazel run //:sweep -- --seeds "$seeds" --from-seed "$from" --artifacts-dir "$RUNNER_TEMP/seed-sweep-evidence" 2>&1 | tee "$RUNNER_TEMP/seed-sweep.log"
       - if: always()
         uses: actions/upload-artifact@v4
         with:
           name: seed-sweep-evidence
-          path: seed-sweep.log
+          path: |
+            ${{ runner.temp }}/seed-sweep.log
+            ${{ runner.temp }}/seed-sweep-evidence/

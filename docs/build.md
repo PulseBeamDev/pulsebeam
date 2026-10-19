@@ -236,10 +236,14 @@ worlds and browser ports/sessions retain their owner-local serialization.
 
 Normal simulator output identifies case, seed selection (`committed` means the
 case's authored defaults), outcome, elapsed host time and exact replay command.
-Full failed-case stdout/stderr stays in Bazel's undeclared test outputs; the
-runner prints its path. Replay retains failure logs in a temporary directory.
-Use `--show-output` for grouped diagnostic traces; `RUST_LOG` still selects
-tracing detail. Scoreboard regeneration explicitly consumes grouped metrics.
+Each invocation prints an owned evidence directory with candidate provenance,
+captured replay inputs and full failed-case stdout/stderr. Bazel tests use
+undeclared outputs; standalone replay accepts `--artifacts-dir` for a persistent
+parent outside the checkout. Use `--replay-bundle` to restore retained settings
+and inputs on the recorded actual source candidate. Dirty fingerprints attribute
+sources but do not package them. Use `--show-output` for grouped diagnostic
+traces; `RUST_LOG` still selects tracing detail. Scoreboard regeneration
+explicitly consumes grouped metrics.
 See the [simulator guide](https://github.com/PulseBeamDev/pulsebeam/blob/main/crates/pulsebeam-simulator/README.md)
 for seed, fidelity and exception details.
 

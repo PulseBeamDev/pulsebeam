@@ -35,8 +35,15 @@ workspace gates and evidence reuse. This owner retains one
 
 - `./bazel run //:replay -- --seed <seed> --exact --filter <name>` reproduces one case.
   Add `--jobs <count>` to select workers or `--show-output` for grouped full traces;
-  `RUST_LOG` controls diagnostic detail. Failed traces remain in the printed path
-  (Bazel test actions use standard undeclared outputs).
+  `RUST_LOG` controls diagnostic detail. Each invocation prints an owned bundle
+  directory. Bazel tests retain it in undeclared outputs; standalone replay can
+  select a persistent parent with `--artifacts-dir /absolute/path/outside/checkout`.
 - `./bazel run //:sweep -- --seeds <count> --from-seed <first> --filter <name>`
   searches replayable seeds outside merge gates.
+- `./bazel run //:replay -- --replay-bundle /absolute/path/to/run-or-case`
+  replays retained selection, settings and captured inputs on the recorded source
+  candidate. Move the whole run directory when transporting a case bundle.
 - `./bazel run //:scoreboard` explicitly regenerates the diffable BWE scoreboard.
+
+See [failure retention and replay](docs/simulation.md#retain-and-replay-generated-failures)
+for bundle contents, source identity requirements and retention limits.

@@ -95,13 +95,60 @@ serialized historical scenarios. Historical shrink comments describe the former
 generator and are not current scenario fixtures.
 
 The persistence adapter copies that corpus into a writable per-family
-`.regressions` artifact. Bazel test actions use `TEST_UNDECLARED_OUTPUTS_DIR`;
-standalone replay uses a process-specific temporary directory. The printed
-`[simulation-regressions]` line identifies the artifact. New minimized failures
-are appended there, never written into tracked source by a normal test action.
+`.regressions` artifact. The runner gives each case its own output directory;
+new minimized failures are appended there, never written into tracked source.
+The printed `[simulation-regressions]` line identifies the artifact.
 
-To replay a saved artifact, provide its absolute path while retaining the case
-and whole-run seed from the failure:
+Every owner test, replay and sweep invocation prints `[simulation-artifacts]`
+with its unique owned run directory. Bazel test actions own this directory under
+`TEST_UNDECLARED_OUTPUTS_DIR/simulations/`. Standalone commands use a temporary
+parent unless you pass `--artifacts-dir /absolute/path/outside/checkout`; the
+runner creates a unique child there, including for overlapping invocations.
+Keep output outside the checkout, or in an ignored directory, so generating
+evidence does not itself change the recorded source candidate.
+
+The run retains:
+
+- `manifest.json`: source revision, dirty status and fingerprint, selection,
+  explicit replay settings, supplied-input checksum, discovery results and
+  per-case outcomes. A null case seed means authored defaults, not seed zero.
+- `replay.json`: the run selection and replay inputs. Each `case-NNNN/` has its
+  own exact-case `replay.json` and `result.json`; per-case results also remain
+  available if a campaign is interrupted before its final manifest update.
+- `inputs/supplied.regressions`, when provided: captured before discovery and
+  consumed from that copy by every child, not from the original external path.
+- For each failed case, `trace.log` with complete combined stdout/stderr and
+  `outputs/` containing the emitted family corpus and any other case artifacts.
+  Failed discovery retains its trace and owned discovery outputs. Launch errors
+  and host timeouts retain available diagnostics; timeouts kill the process group.
+
+Success traces and emitted outputs are discarded after concise reporting.
+`--show-output` prints complete grouped traces, including successes. The runner
+retains only this invocation's metadata, replay inputs and failure diagnostics;
+it does not discover or collect arbitrary temporary files. Remove retained run
+directories when no longer needed. Unavailable required evidence or candidate
+metadata is an infrastructure failure, never passing product proof.
+
+To replay a transported failure, copy the **whole run directory**, including
+`inputs/`, to the replay host. Use the recorded actual source candidate and the
+supported toolchain, then point at the run or one case:
+
+```sh
+./bazel run //:replay -- --replay-bundle /absolute/path/to/run/case-0000
+```
+
+Replay restores the recorded selection, explicit `RUST_LOG` and proptest
+settings, including their absence, and verifies the captured corpus checksum.
+The supported Bazel build boundary supplies source provenance as declared data;
+the hermetic runner does not read `.git`. Replay rejects a different revision,
+dirty state or fingerprint. A clean revision identifies source; a dirty
+fingerprint only attributes local sources and cannot reconstruct them from the
+base commit. Bundles do not package sources, binaries or toolchains. RNG states
+remain subject to the current strategy; bundles do not preserve historical
+semantic scenarios that the case did not serialize.
+
+To replay an emitted minimized corpus rather than the originally captured input,
+provide its absolute path while retaining the case and whole-run seed:
 
 ```sh
 PULSEBEAM_SIM_REGRESSIONS=/absolute/path/to/family.regressions \
@@ -111,7 +158,9 @@ PULSEBEAM_SIM_REGRESSIONS=/absolute/path/to/family.regressions \
 Review retained RNG states and promote useful regressions into the committed
 corpus or a focused authored case. The isolated persistence proof exercises both
 committed input under a current strategy and a newly minimized artifact in a
-fresh process with no novel cases.
+fresh process with no novel cases. Nightly seed sweeps upload the owned run
+evidence and summary even on failure. They preserve non-zero results but remain
+advisory searches, not merge correctness gates.
 
 ## Check ordered-topic reconfiguration
 

@@ -32,6 +32,8 @@ py_test(
     name = "simulation_runner_contract",
     srcs = ["tests/run_simulations_test.py", "run-simulations.py"],
     main = "tests/run_simulations_test.py",
+    data = ["simulation-status.sh", "//crates/pulsebeam-simulator:candidate"],
+    args = ["--candidate", "$(rootpath //crates/pulsebeam-simulator:candidate)"],
     env = {"PYTHONDONTWRITEBYTECODE": "1"},
 )
 
