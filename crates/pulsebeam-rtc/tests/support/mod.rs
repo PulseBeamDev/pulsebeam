@@ -66,6 +66,7 @@ pub struct PeerFixture<M = MediaFixture> {
     pub source_repair_packets: usize,
     pub publisher_reports: usize,
     pub publisher_nacks: usize,
+    pub publisher_feedback: usize,
     network: DeterministicNetwork,
     native_target: Option<fn(&Connection) -> Duration>,
     world: std::rc::Rc<SimulationWorld>,
@@ -881,6 +882,7 @@ impl<M> PeerFixture<M> {
             source_repair_packets: 0,
             publisher_reports: 0,
             publisher_nacks: 0,
+            publisher_feedback: 0,
             network: DeterministicNetwork::default(),
             native_target: None,
         }
@@ -1345,8 +1347,12 @@ impl<M> PeerFixture<M> {
                         if payload.get(1) == Some(&201) {
                             self.publisher_reports += 1;
                         }
-                        if payload.get(1) == Some(&205) && payload[0] & 31 == 1 {
-                            self.publisher_nacks += 1;
+                        if payload.get(1) == Some(&205) {
+                            match payload[0] & 31 {
+                                1 => self.publisher_nacks += 1,
+                                11 | 15 => self.publisher_feedback += 1,
+                                _ => {}
+                            }
                         }
                     }
                     if self.network.bottleneck_bps.is_some() {

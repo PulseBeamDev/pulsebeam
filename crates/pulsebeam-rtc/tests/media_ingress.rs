@@ -45,6 +45,10 @@ fn mixed_direction_native_publisher_recovers_loss_as_primary_media() {
         fixture.publisher_reports > 0,
         "publisher must receive an RTCP receiver report"
     );
+    assert!(
+        fixture.publisher_feedback > 0,
+        "publisher must receive packet-level congestion feedback"
+    );
     let stats = fixture.connection.stats();
     assert_eq!(stats.senders.len(), 1);
     assert_eq!(stats.encodings.len(), 1);

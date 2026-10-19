@@ -90,7 +90,7 @@ impl ReceiveStream {
             let first = self
                 .highest
                 .saturating_add(1)
-                .max(extended.saturating_sub(REORDER_WINDOW as u64));
+                .max(extended.saturating_sub(REORDER_WINDOW.saturating_sub(1) as u64));
             for sequence in first..extended {
                 if self.missing.len() == REORDER_WINDOW {
                     self.missing.pop_front();
@@ -268,11 +268,12 @@ mod tests {
         let mut stream = ReceiveStream::new(48_000, true);
         assert!(stream.accept(1, 0, now, false));
         assert!(stream.accept(20_000, 0, now, false));
-        assert_eq!(stream.missing.len(), REORDER_WINDOW);
+        assert_eq!(stream.missing.len(), REORDER_WINDOW - 1);
+        assert_eq!(stream.missing.front().unwrap().sequence, 19_745);
         assert!(!stream.accept(1, 0, now, false));
         for retry in 0..5 {
             let time = now + NACK_DELAY + NACK_INTERVAL * retry;
-            for _ in 0..REORDER_WINDOW {
+            for _ in 1..REORDER_WINDOW {
                 assert!(stream.poll_control(time, 9, 7).is_some());
             }
         }

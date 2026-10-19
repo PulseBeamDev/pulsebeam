@@ -608,8 +608,9 @@ impl Connection {
                 path_epoch: _,
                 bytes,
                 metadata: _,
+                ecn,
             } => {
-                self._subsystems.ingress.accept_rtp(arrival, bytes);
+                self._subsystems.ingress.accept_rtp(arrival, bytes, ecn);
                 self._subsystems.ingress.poll_event().map(Output::Event)
             }
             TransportEvent::Rtcp {
@@ -764,6 +765,10 @@ impl Connection {
             config.limits.max_unsignaled_encodings,
             config.limits.max_queued_media_bytes,
             u32::from_be_bytes(entropy.take(b"receive-rtcp-ssrc")).max(1),
+            crate::receive_feedback::ReceiveFeedback::new(
+                negotiated.facts.inbound_feedback(),
+                at.monotonic,
+            ),
         );
         let egress = MediaEgress::new(
             negotiated.facts.egress_senders(),

@@ -34,7 +34,7 @@ const MAX_SSRC_GROUPS: usize = 256;
 const MAX_CANDIDATES: usize = 512;
 const MAX_SESSION_ATTRIBUTES: usize = 2048;
 
-const TWCC_URIS: [&str; 2] = [
+pub(crate) const TWCC_URIS: [&str; 2] = [
     "http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01",
     "http://www.webrtc.org/experiments/rtp-hdrext/transport-wide-cc-01",
 ];
@@ -63,6 +63,7 @@ pub(crate) struct NegotiatedSessionFacts {
     protocol_randomness: [u8; 32],
     media: Box<[NegotiatedMediaSection]>,
     feedback: Option<PacketFeedbackKind>,
+    inbound_feedback: Option<PacketFeedbackKind>,
     limits: ConnectionLimits,
     accepted_at: TimePoint,
 }
@@ -72,6 +73,7 @@ pub(crate) struct IngressMediaFacts {
     pub(crate) kind: crate::MediaKind,
     pub(crate) mid: Box<str>,
     pub(crate) payloads: Box<[(u8, u32)]>,
+    pub(crate) feedback_payloads: Box<[u8]>,
     pub(crate) repairs: Box<[(u8, u8)]>,
     pub(crate) nack_payloads: Box<[u8]>,
     pub(crate) ssrc_repairs: Box<[(u32, u32)]>,
@@ -105,6 +107,10 @@ pub(crate) struct SctpSessionFacts {
 impl NegotiatedSessionFacts {
     pub(crate) const fn feedback(&self) -> Option<PacketFeedbackKind> {
         self.feedback
+    }
+
+    pub(crate) const fn inbound_feedback(&self) -> Option<PacketFeedbackKind> {
+        self.inbound_feedback
     }
 
     pub(crate) fn sctp(&self) -> Option<SctpSessionFacts> {
@@ -148,6 +154,16 @@ impl NegotiatedSessionFacts {
                         .codecs
                         .iter()
                         .map(|codec| (codec.payload_type, codec.clock_rate))
+                        .collect(),
+                    feedback_payloads: section
+                        .codecs
+                        .iter()
+                        .filter(|codec| match self.inbound_feedback {
+                            Some(PacketFeedbackKind::TransportWide) => codec.twcc,
+                            Some(PacketFeedbackKind::Rfc8888) => codec.rfc8888,
+                            None => false,
+                        })
+                        .map(|codec| codec.payload_type)
                         .collect(),
                     repairs: section
                         .codecs
@@ -340,6 +356,8 @@ struct CodecFacts {
     channels: Option<u8>,
     retransmission_payload_type: Option<u8>,
     nack: bool,
+    twcc: bool,
+    rfc8888: bool,
     pli: bool,
     fir: bool,
 }
@@ -381,7 +399,6 @@ struct SectionBuild {
     facts: NegotiatedMediaSection,
     accepted_payloads: Vec<u8>,
     twcc: bool,
-    twcc_sendable: bool,
     rfc8888: bool,
 }
 
@@ -529,33 +546,46 @@ fn negotiate_inner(
     } else {
         &outbound
     };
+    let inbound = active
+        .iter()
+        .copied()
+        .filter(|section| section.facts.direction.allows_receive())
+        .collect::<Vec<_>>();
+    let inbound_feedback = select_feedback(&inbound, false);
     let feedback = if builds
         .iter()
         .all(|section| section.facts.kind == SectionKind::Application)
         && builds.iter().any(|section| section.facts.sctp.is_some())
     {
         None
-    } else if checked.is_empty() {
-        return Err(NegotiationError(AcceptError::MissingPacketFeedback));
-    } else if checked
-        .iter()
-        .all(|section| section.twcc && (outbound.is_empty() || section.twcc_sendable))
-    {
-        Some(PacketFeedbackKind::TransportWide)
-    } else if checked.iter().all(|section| section.rfc8888) {
-        Some(PacketFeedbackKind::Rfc8888)
     } else {
-        return Err(NegotiationError(AcceptError::MissingPacketFeedback));
+        Some(
+            select_feedback(checked, !outbound.is_empty())
+                .ok_or(NegotiationError(AcceptError::MissingPacketFeedback))?,
+        )
     };
-    if feedback == Some(PacketFeedbackKind::Rfc8888) {
-        for section in &mut builds {
-            section.facts.extensions = std::mem::take(&mut section.facts.extensions)
-                .into_vec()
-                .into_iter()
-                .filter(|extension| !TWCC_URIS.contains(&extension.uri.as_str()))
-                .collect::<Vec<_>>()
-                .into_boxed_slice();
-        }
+    for section in &mut builds {
+        section.facts.extensions = std::mem::take(&mut section.facts.extensions)
+            .into_vec()
+            .into_iter()
+            .filter_map(|mut extension| {
+                if TWCC_URIS.contains(&extension.uri.as_str()) {
+                    let send = feedback == Some(PacketFeedbackKind::TransportWide)
+                        && section.facts.direction.allows_send()
+                        && extension.direction.allows_send();
+                    let receive = inbound_feedback == Some(PacketFeedbackKind::TransportWide)
+                        && section.facts.direction.allows_receive()
+                        && extension.direction.allows_receive();
+                    extension.direction = match (send, receive) {
+                        (true, true) => Direction::Bidirectional,
+                        (true, false) => Direction::SendOnly,
+                        (false, true) => Direction::ReceiveOnly,
+                        (false, false) => return None,
+                    };
+                }
+                Some(extension)
+            })
+            .collect();
     }
 
     let (dtls_identity, local_fingerprint) = dtls_identity(entropy)?;
@@ -653,7 +683,7 @@ fn negotiate_inner(
                 &local_candidates,
                 answer_setup,
                 index == 0,
-                feedback,
+                [feedback, inbound_feedback],
             )
         })
         .collect::<Vec<_>>();
@@ -683,6 +713,7 @@ fn negotiate_inner(
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
             feedback,
+            inbound_feedback,
             limits: config.limits,
             accepted_at: at,
         },
@@ -887,27 +918,11 @@ fn parse_section(
     validate_simulcast(raw, kind)?;
     let (ssrcs, groups) = parse_ssrcs(raw, kind)?;
     let sctp = parse_sctp(line, raw, kind, disabled)?;
-    let accepted = accepted_payloads.iter().copied().collect::<HashSet<_>>();
-    let has_feedback = |name: &str| {
-        raw.iter().any(|value| {
-            let Some(value) = value.strip_prefix("a=rtcp-fb:") else {
-                return false;
-            };
-            let mut fields = value.split_whitespace();
-            let payload = fields.next().unwrap_or_default();
-            let applies =
-                payload == "*" || payload.parse::<u8>().is_ok_and(|pt| accepted.contains(&pt));
-            applies && fields.next() == Some(name)
-        })
-    };
-    let twcc = has_feedback("transport-cc")
+    let twcc = codecs.iter().all(|codec| codec.twcc)
         && extensions
             .iter()
             .any(|extension| TWCC_URIS.contains(&extension.uri.as_str()));
-    let twcc_sendable = extensions.iter().any(|extension| {
-        TWCC_URIS.contains(&extension.uri.as_str()) && extension.direction.allows_send()
-    });
-    let rfc8888 = has_feedback("ccfb");
+    let rfc8888 = codecs.iter().all(|codec| codec.rfc8888);
     Ok(SectionBuild {
         facts: NegotiatedMediaSection {
             media_index,
@@ -924,7 +939,6 @@ fn parse_section(
         },
         accepted_payloads,
         twcc,
-        twcc_sendable,
         rfc8888,
     })
 }
@@ -969,9 +983,11 @@ fn parse_codecs(
                 clock_rate,
                 channels: parameter.spec.channels,
                 retransmission_payload_type: None,
-                nack: parameter.fb_nack,
-                pli: parameter.fb_pli,
-                fir: parameter.fb_fir,
+                nack: codec_feedback(raw, *parameter.pt, "nack"),
+                twcc: codec_feedback(raw, *parameter.pt, "transport-cc"),
+                rfc8888: codec_feedback(raw, *parameter.pt, "ccfb"),
+                pli: codec_feedback(raw, *parameter.pt, "nack pli"),
+                fir: codec_feedback(raw, *parameter.pt, "ccm fir"),
             });
         }
     }
@@ -1006,6 +1022,36 @@ fn parse_codecs(
         }
     }
     Ok((codecs, payloads))
+}
+
+fn codec_feedback(raw: &[String], payload: u8, feedback: &str) -> bool {
+    raw.iter()
+        .filter_map(|line| line.strip_prefix("a=rtcp-fb:"))
+        .filter_map(|value| value.split_once(char::is_whitespace))
+        .any(|(pt, name)| (pt == "*" || pt.parse::<u8>() == Ok(payload)) && name.trim() == feedback)
+}
+
+fn select_feedback(sections: &[&SectionBuild], outbound: bool) -> Option<PacketFeedbackKind> {
+    if sections.is_empty() {
+        return None;
+    }
+    if sections.iter().all(|section| {
+        section.twcc
+            && section.facts.extensions.iter().any(|extension| {
+                TWCC_URIS.contains(&extension.uri.as_str())
+                    && if outbound {
+                        extension.direction.allows_send()
+                    } else {
+                        extension.direction.allows_receive()
+                    }
+            })
+    }) {
+        Some(PacketFeedbackKind::TransportWide)
+    } else if sections.iter().all(|section| section.rfc8888) {
+        Some(PacketFeedbackKind::Rfc8888)
+    } else {
+        None
+    }
 }
 
 fn validate_h264(raw: &[String], payload: u8, kind: SectionKind) -> Result<(), NegotiationError> {
@@ -1565,7 +1611,7 @@ fn format_answer_section(
     local_candidates: &[is::Candidate],
     setup: Setup,
     bundle_tag: bool,
-    feedback: Option<PacketFeedbackKind>,
+    feedback: [Option<PacketFeedbackKind>; 2],
 ) -> String {
     let disabled = raw.first().and_then(|line| line.split_whitespace().nth(1)) == Some("0")
         && !raw.iter().any(|line| line == "a=bundle-only");
@@ -1620,8 +1666,18 @@ fn format_answer_section(
             let name = fields.next().unwrap_or_default();
             applies
                 && match name {
-                    "transport-cc" => feedback == Some(PacketFeedbackKind::TransportWide),
-                    "ccfb" => feedback == Some(PacketFeedbackKind::Rfc8888),
+                    "transport-cc" => {
+                        (section.facts.direction.allows_send()
+                            && feedback[0] == Some(PacketFeedbackKind::TransportWide))
+                            || (section.facts.direction.allows_receive()
+                                && feedback[1] == Some(PacketFeedbackKind::TransportWide))
+                    }
+                    "ccfb" => {
+                        (section.facts.direction.allows_send()
+                            && feedback[0] == Some(PacketFeedbackKind::Rfc8888))
+                            || (section.facts.direction.allows_receive()
+                                && feedback[1] == Some(PacketFeedbackKind::Rfc8888))
+                    }
                     _ => true,
                 }
         });
@@ -1634,8 +1690,6 @@ fn format_answer_section(
                     .extensions
                     .iter()
                     .any(|extension| extension.uri == uri)
-                    && (feedback == Some(PacketFeedbackKind::TransportWide)
-                        || !TWCC_URIS.contains(&uri))
             });
         let keep = line.starts_with("a=mid:")
             || line == "a=rtcp-mux"
@@ -2479,6 +2533,72 @@ mod tests {
         assert_ne!(first.answer, different.answer);
         assert!(!format!("{:?}", first.answer).contains("ice-pwd"));
         assert!(!format!("{:?}", fixture("chrome")).contains("chromeufrag"));
+    }
+
+    #[test]
+    fn feedback_modes_and_twcc_extension_directions_are_independent() {
+        for (offered, outbound, inbound, extension_direction) in [
+            (
+                "sendonly",
+                PacketFeedbackKind::Rfc8888,
+                PacketFeedbackKind::TransportWide,
+                Direction::ReceiveOnly,
+            ),
+            (
+                "recvonly",
+                PacketFeedbackKind::TransportWide,
+                PacketFeedbackKind::Rfc8888,
+                Direction::SendOnly,
+            ),
+        ] {
+            let offer = SdpOffer::new(
+                fixture("chrome")
+                    .as_str()
+                    .replace("a=sendonly", "a=sendrecv")
+                    .replace(
+                        "a=rtcp-fb:111 transport-cc",
+                        "a=rtcp-fb:111 transport-cc\na=rtcp-fb:111 ccfb",
+                    )
+                    .replace(
+                        "a=rtcp-fb:102 transport-cc",
+                        "a=rtcp-fb:102 transport-cc\na=rtcp-fb:102 ccfb",
+                    )
+                    .replace("a=extmap:3 ", &format!("a=extmap:3/{offered} "))
+                    .replace("a=extmap:4 ", &format!("a=extmap:4/{offered} ")),
+            );
+            let mut entropy = EntropyConsumer::new(ConnectionEntropy::new([9; 32]));
+            let negotiated = negotiate_inner(&config(), &offer, at(), &mut entropy).unwrap();
+            assert_eq!(negotiated.facts.feedback(), Some(outbound));
+            assert_eq!(negotiated.facts.inbound_feedback(), Some(inbound));
+            let extensions = negotiated
+                .facts
+                .media
+                .iter()
+                .flat_map(|media| media.extensions.iter())
+                .filter(|extension| TWCC_URIS.contains(&extension.uri.as_str()))
+                .collect::<Vec<_>>();
+            assert_eq!(extensions.len(), 2);
+            assert!(
+                extensions
+                    .iter()
+                    .all(|extension| extension.direction == extension_direction)
+            );
+            assert!(
+                negotiated
+                    .answer
+                    .as_str()
+                    .contains("a=rtcp-fb:102 transport-cc")
+            );
+            assert!(negotiated.answer.as_str().contains("a=rtcp-fb:102 ccfb"));
+            assert!(negotiated.answer.as_str().contains(&format!(
+                "a=extmap:4/{} ",
+                if offered == "sendonly" {
+                    "recvonly"
+                } else {
+                    "sendonly"
+                }
+            )));
+        }
     }
 
     #[test]

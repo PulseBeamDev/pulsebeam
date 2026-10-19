@@ -321,7 +321,8 @@ adapter has no TCP listener and exposes unframed non-TLS packet-socket payloads;
 the fixture translates those payloads to and from RTC's complete RFC 4571 frames.
 This establishes native active-client ICE-TCP interoperability at the packet-socket
 boundary, not native TCP byte-stream fragmentation or passive-client coverage.
-RFC 8888 retains client-free negotiation, parsing, and accounting coverage;
+RFC 8888 retains client-free negotiation, report generation, parsing, and
+accounting coverage;
 RFC 8888 client interoperability is not claimed. Neither browser nor Pion compatibility
 is inferred from the native replacement. Missing artifacts or required native
 evidence fail the gate.

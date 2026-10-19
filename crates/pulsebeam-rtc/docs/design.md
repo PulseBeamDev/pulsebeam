@@ -999,6 +999,17 @@ pub struct EncodingInfo {
   at most five NACK attempts spaced 50 ms apart. Missing-packet state is bounded
   to the source window. Receiver reports run every second and include loss,
   extended sequence progression, jitter and the last Sender Report relationship.
+- Publisher congestion feedback is negotiated independently from subscriber
+  feedback. TWCC covers one bundled transport sequence space, including RTX and
+  padding. RFC 8888 reports original and repair SSRCs separately, retaining
+  receiver arrival offsets and observed ECN marks. Authenticated wire receipt is
+  recorded before application queue admission and before RTX normalization.
+- Publisher packet feedback runs every 50 ms with at most 512 retained wire
+  receipts and 256 statuses per report. Reports preserve sequence wrap,
+  reordering and late arrivals. Overload forgets old receipts rather than growing
+  history or generating unbounded reports; RFC 8888 holds over-range arrival
+  offsets explicitly. SRTP replay protection is not reset to admit same-SSRC
+  sequence restarts.
 - RTP clock state, RTCP synchronization state, retransmission input state, and
   lazy extension metadata belong to the encoding, not the SFU router.
 
@@ -1428,8 +1439,8 @@ optional slow gates.
 Missing artifacts or absent required media, feedback, or DataChannel evidence
 fail acceptance, never silently skip or fall back to another client.
 
-RFC 8888 retains deterministic client-free negotiation, parsing, and accounting
-evidence; RFC 8888 client interoperability is not claimed. ICE-TCP also has
+RFC 8888 retains deterministic client-free negotiation, report generation,
+parsing, and accounting evidence; RFC 8888 client interoperability is not claimed. ICE-TCP also has
 controlled active-client libwebrtc interoperability at the packet-socket boundary,
 including authenticated media, DataChannels, flow retirement, and graceful close.
 The adapter has no TCP listener and supplies unframed non-TLS packet payloads;

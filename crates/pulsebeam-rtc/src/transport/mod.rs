@@ -91,6 +91,7 @@ pub(crate) enum TransportEvent {
         path_epoch: PathEpoch,
         bytes: Vec<u8>,
         metadata: RtpMetadata,
+        ecn: Option<crate::EcnCodepoint>,
     },
     Rtcp {
         arrival: TimePoint,
@@ -625,6 +626,7 @@ impl Transport {
                 remote: source,
             }),
             bytes,
+            None,
         )
     }
 
@@ -634,6 +636,7 @@ impl Transport {
         arrival: TimePoint,
         path: SelectedPath,
         bytes: Vec<u8>,
+        ecn: Option<crate::EcnCodepoint>,
     ) -> Result<(), TransportError> {
         self.observe(now)?;
         if bytes.is_empty() {
@@ -723,6 +726,7 @@ impl Transport {
                                     path_epoch,
                                     bytes,
                                     metadata,
+                                    ecn,
                                 })?;
                             }
                         }
@@ -778,13 +782,17 @@ impl Transport {
         arrival: TimePoint,
         input: NetworkInput,
     ) -> Result<(), TransportError> {
-        let (envelope, bytes) = match input {
+        let (envelope, bytes, ecn) = match input {
             NetworkInput::Udp {
                 local,
                 remote,
                 payload,
-                ..
-            } => (NetworkEnvelope::Udp { local, remote }, payload.to_vec()),
+                ecn,
+            } => (
+                NetworkEnvelope::Udp { local, remote },
+                payload.to_vec(),
+                ecn,
+            ),
             NetworkInput::IceTcp {
                 flow,
                 local,
@@ -817,6 +825,7 @@ impl Transport {
                         remote,
                     },
                     payload.to_vec(),
+                    None,
                 )
             }
         };
@@ -825,6 +834,7 @@ impl Transport {
             arrival,
             SelectedPath::unselected(envelope),
             bytes,
+            ecn,
         )
     }
 
