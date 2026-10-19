@@ -11,10 +11,10 @@ use crate::{
 };
 use str0m::Rtc;
 
-pub const DEFAULT_ROOM_SHARD_SLOT: usize = 16;
+pub const DEFAULT_ROOM_PARTITION_SIZE: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RoomPlacement {
+pub enum RoomPartitionPlacement {
     Hashed,
     RoundRobin,
 }
@@ -61,17 +61,17 @@ impl TransportAddressAllocator {
 
 pub struct ControllerCore {
     pub(crate) registry: RoomRegistry,
-    room_shard_slot: usize,
-    placement: RoomPlacement,
+    room_partition_size: usize,
+    placement: RoomPartitionPlacement,
     transport: TransportAddressAllocator,
 }
 
 impl ControllerCore {
-    pub fn with_placement(room_shard_slot: usize, placement: RoomPlacement) -> Self {
-        debug_assert!(room_shard_slot > 0);
+    pub fn with_placement(room_partition_size: usize, placement: RoomPartitionPlacement) -> Self {
+        debug_assert!(room_partition_size > 0);
         Self {
             registry: RoomRegistry::new(),
-            room_shard_slot,
+            room_partition_size,
             placement,
             transport: TransportAddressAllocator::new(0),
         }
@@ -79,25 +79,26 @@ impl ControllerCore {
 
     pub fn with_shards(
         shard_count: usize,
-        room_shard_slot: usize,
-        placement: RoomPlacement,
+        room_partition_size: usize,
+        placement: RoomPartitionPlacement,
     ) -> Self {
         debug_assert!(shard_count > 0);
-        let mut core = Self::with_placement(room_shard_slot, placement);
+        let mut core = Self::with_placement(room_partition_size, placement);
         core.transport = TransportAddressAllocator::new(shard_count);
         core
     }
 
-    pub fn room_slot(&self, room_id: &RoomId) -> (usize, RoomPlacement) {
-        let count = self
+    pub fn next_room_partition(
+        &self,
+        room_id: &RoomId,
+        participant_id: &ParticipantId,
+    ) -> (usize, RoomPartitionPlacement) {
+        let index = self
             .registry
-            .get_room(room_id)
-            .map(super::room::Room::participant_count)
-            .unwrap_or_default();
-        (
-            count.checked_div(self.room_shard_slot).unwrap_or(0),
-            self.placement,
-        )
+            .get_room_shard(room_id)
+            .map(|room| room.next_partition_index(participant_id, self.room_partition_size))
+            .unwrap_or(0);
+        (index, self.placement)
     }
 
     pub fn reserve_transport(&mut self, shard: ShardId, now: Instant) -> NodeTransportAddress {

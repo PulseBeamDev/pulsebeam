@@ -851,7 +851,7 @@ fn abrupt_exit_chaos_test() {
 
 /// Media crossing a shard boundary, end to end, over UDP.
 ///
-/// With `room_shard_slot(1)` the publisher and each subscriber land on
+/// With `room_partition_size(1)` the publisher and each subscriber land on
 /// *different* shards, so every forwarded packet is addressed by a route the
 /// destination allocated, wrapped in a `MediaEnvelope`, resolved by index and
 /// epoch, and restamped onto the receiving shard's timeline. A room below the

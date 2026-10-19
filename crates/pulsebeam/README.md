@@ -9,6 +9,7 @@ Read these contracts before changing the corresponding subsystem:
 - [Naming boundaries](docs/naming.md)
 - [Shard-owned work-stealing dataplane](docs/shard-owned-dataplane.md)
 - [Routing and compiled plans](docs/routing.md)
+- [Cluster topology and ownership (proposed)](docs/cluster.md)
 - [Linux server requirements](docs/linux-only.md)
 - [Architecture diagram](docs/architecture.svg)
 

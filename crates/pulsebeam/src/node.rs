@@ -445,10 +445,10 @@ pub struct NodeBuilder {
 
     /// How many participants of one room share a shard before the next join
     /// spills to another.
-    room_shard_slot: usize,
+    room_partition_size: usize,
 
     /// How a spilled room chooses its next shard.
-    room_placement: crate::control::core::RoomPlacement,
+    room_placement: crate::control::core::RoomPartitionPlacement,
 }
 
 impl Default for NodeBuilder {
@@ -483,8 +483,8 @@ impl NodeBuilder {
                 }
             },
             tcp_only: false,
-            room_shard_slot: crate::control::core::DEFAULT_ROOM_SHARD_SLOT,
-            room_placement: crate::control::core::RoomPlacement::Hashed,
+            room_partition_size: crate::control::core::DEFAULT_ROOM_PARTITION_SIZE,
+            room_placement: crate::control::core::RoomPartitionPlacement::Hashed,
         }
     }
 
@@ -497,14 +497,14 @@ impl NodeBuilder {
         self
     }
 
-    /// Place a room's slots round-robin instead of by hash.
+    /// Place a room's local partitions round-robin instead of by hash.
     ///
     /// For simulations that must actually cross a shard boundary: hashing picks
     /// independently per slot, so a small room lands co-located often enough
     /// that a plan depending on the split would pass without ever running the
     /// path it claims to cover.
     pub fn round_robin_rooms(mut self) -> Self {
-        self.room_placement = crate::control::core::RoomPlacement::RoundRobin;
+        self.room_placement = crate::control::core::RoomPartitionPlacement::RoundRobin;
         self
     }
 
@@ -513,12 +513,12 @@ impl NodeBuilder {
     /// Lowering it is how a test reaches the cross-shard media path without
     /// needing a room large enough to spill naturally: below the threshold a
     /// room is co-located and its fanout never leaves one shard.
-    pub fn room_shard_slot(mut self, participants: usize) -> Self {
+    pub fn room_partition_size(mut self, participants: usize) -> Self {
         assert!(
             participants > 0,
-            "a shard slot must hold at least one participant"
+            "a room partition must hold at least one participant"
         );
-        self.room_shard_slot = participants;
+        self.room_partition_size = participants;
         self
     }
 
@@ -918,7 +918,7 @@ impl NodeBuilder {
             shard_contexts,
             candidates,
             tcp_listener,
-            self.room_shard_slot,
+            self.room_partition_size,
             self.room_placement,
             view_writers,
         );
@@ -1600,11 +1600,11 @@ mod tests {
         assert_eq!(builder.shard_runtime, ShardRuntime::ThreadPerCore);
         assert!(matches!(
             builder.room_placement,
-            crate::control::core::RoomPlacement::Hashed
+            crate::control::core::RoomPartitionPlacement::Hashed
         ));
         assert_eq!(
-            builder.room_shard_slot,
-            crate::control::core::DEFAULT_ROOM_SHARD_SLOT
+            builder.room_partition_size,
+            crate::control::core::DEFAULT_ROOM_PARTITION_SIZE
         );
     }
 
@@ -1645,18 +1645,18 @@ mod tests {
             .data_threads(4)
             .local_addr(addr)
             .external_addrs(vec![addr])
-            .room_shard_slot(9)
+            .room_partition_size(9)
             .round_robin_rooms()
             .tcp_only();
 
         assert_eq!(builder.data_threads, 4);
         assert_eq!(builder.local_addr, Some(addr));
         assert_eq!(builder.external_addrs, vec![addr]);
-        assert_eq!(builder.room_shard_slot, 9);
+        assert_eq!(builder.room_partition_size, 9);
         assert!(builder.tcp_only);
         assert!(matches!(
             builder.room_placement,
-            crate::control::core::RoomPlacement::RoundRobin
+            crate::control::core::RoomPartitionPlacement::RoundRobin
         ));
     }
 
@@ -1678,7 +1678,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "at least one participant")]
     fn a_shard_slot_must_hold_somebody() {
-        let _ = NodeBuilder::new().room_shard_slot(0);
+        let _ = NodeBuilder::new().room_partition_size(0);
     }
 
     /// `Default` and `new` must not drift: one is what most callers get and the other is what the
@@ -1688,7 +1688,7 @@ mod tests {
         let (a, b) = (NodeBuilder::default(), NodeBuilder::new());
         assert_eq!(a.data_threads, b.data_threads);
         assert_eq!(a.shard_runtime, b.shard_runtime);
-        assert_eq!(a.room_shard_slot, b.room_shard_slot);
+        assert_eq!(a.room_partition_size, b.room_partition_size);
         assert_eq!(a.tcp_only, b.tcp_only);
     }
 }
