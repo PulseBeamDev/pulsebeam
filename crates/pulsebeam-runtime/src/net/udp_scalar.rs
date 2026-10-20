@@ -185,6 +185,7 @@ mod batch_shape_tests {
         let source: SocketAddr = "192.168.1.20:49152".parse().unwrap();
         let destination: SocketAddr = "192.168.1.1:3478".parse().unwrap();
         let mut out = Vec::new();
+        let received_at = crate::net::ReceiveTime::now();
 
         UdpTransportReader::append_datagram(
             &mut out,
@@ -193,6 +194,7 @@ mod batch_shape_tests {
             vec![1, 2, 3, 4],
             true,
             UdpMode::Batch,
+            received_at,
         );
         UdpTransportReader::append_datagram(
             &mut out,
@@ -201,6 +203,7 @@ mod batch_shape_tests {
             vec![5, 6, 7, 8],
             true,
             UdpMode::Batch,
+            received_at,
         );
 
         assert_eq!(out.len(), 1);
@@ -210,6 +213,24 @@ mod batch_shape_tests {
         assert_eq!(out[0].next_packet(), Some(&[1, 2, 3, 4][..]));
         assert_eq!(out[0].next_packet(), Some(&[5, 6, 7, 8][..]));
         assert_eq!(out[0].next_packet(), None);
+        assert_eq!(out[0].received_at, received_at);
+
+        let later = crate::net::ReceiveTime {
+            monotonic: received_at.monotonic + std::time::Duration::from_micros(1),
+            wall: received_at.wall + std::time::Duration::from_micros(1),
+        };
+        UdpTransportReader::append_datagram(
+            &mut out,
+            destination,
+            source,
+            vec![9, 10, 11, 12],
+            true,
+            UdpMode::Batch,
+            later,
+        );
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].received_at, received_at);
+        assert_eq!(out[1].received_at, later);
     }
 }
 
@@ -245,7 +266,7 @@ impl UdpTransportReader {
         if let Some(member) = &self.member {
             for index in 0..crate::net::BATCH_SIZE {
                 match member.try_recv() {
-                    Ok((buf, src)) => {
+                    Ok((buf, src, received_at)) => {
                         debug_assert!(
                             buf.len() <= CHUNK_SIZE,
                             "reuseport datagram exceeds the chunk size"
@@ -257,6 +278,7 @@ impl UdpTransportReader {
                             buf,
                             gro_enabled,
                             self.mode,
+                            received_at,
                         );
                     }
                     Err(err) if index > 0 && err.kind() == ErrorKind::WouldBlock => break,
@@ -270,6 +292,7 @@ impl UdpTransportReader {
         for index in 0..crate::net::BATCH_SIZE {
             match self.sock.try_recv_from(&mut self.arena) {
                 Ok((n, source)) => {
+                    let received_at = super::ReceiveTime::now();
                     debug_assert!(
                         n <= CHUNK_SIZE,
                         "scalar recv length exceeds maximum UDP chunk size"
@@ -283,6 +306,7 @@ impl UdpTransportReader {
                         buf,
                         gro_enabled,
                         self.mode,
+                        received_at,
                     );
                 }
                 Err(err) if index > 0 && err.kind() == ErrorKind::WouldBlock => break,
@@ -300,12 +324,14 @@ impl UdpTransportReader {
         buf: Vec<u8>,
         gro_enabled: bool,
         mode: UdpMode,
+        received_at: super::ReceiveTime,
     ) {
         let len = buf.len();
         debug_assert_ne!(len, 0);
         if gro_enabled && let Some(previous) = out.last_mut() {
             let datagrams = previous.len.div_ceil(previous.stride);
             if previous.src == src
+                && previous.received_at == received_at
                 && previous.stride == len
                 && datagrams < crate::net::UDP_MAX_GSO_SEGMENTS
             {
@@ -317,6 +343,8 @@ impl UdpTransportReader {
         }
         out.push(RecvPacketBatch {
             transport: Transport::Udp(mode),
+            tcp_flow: None,
+            received_at,
             src,
             dst,
             buf,

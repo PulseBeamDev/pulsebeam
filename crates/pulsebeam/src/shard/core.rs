@@ -961,6 +961,8 @@ mod wrong_owner_tests {
             stride: len,
             len,
             transport: Transport::Udp(UdpMode::Scalar),
+            tcp_flow: None,
+            received_at: pulsebeam_runtime::net::ReceiveTime::now(),
             offset: 0,
         });
 
@@ -1009,6 +1011,8 @@ mod wrong_owner_tests {
                 stride: len,
                 len,
                 transport: Transport::Udp(UdpMode::Scalar),
+                tcp_flow: None,
+                received_at: pulsebeam_runtime::net::ReceiveTime::now(),
                 offset: 0,
             },
             &router,

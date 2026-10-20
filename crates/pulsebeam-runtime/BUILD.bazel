@@ -51,5 +51,16 @@ rust_test(
     
 )
 
+rust_test(
+    name = "steering_tests",
+    crate = ":pulsebeam-runtime-sim",
+    crate_features = ["parking_lot", "sim"],
+    args = ["net::bound_udp::tests::"],
+    lint_config = ":lints",
+    aliases = aliases(normal_dev = True, proc_macro_dev = True),
+    deps = all_crate_deps(normal_dev = True),
+    proc_macro_deps = all_crate_deps(proc_macro_dev = True),
+)
+
 rustfmt_test(name = "format", targets = [":pulsebeam-runtime"])
-rust_clippy_test(name = "clippy", targets = [":pulsebeam-runtime", ":unit_tests"])
+rust_clippy_test(name = "clippy", targets = [":pulsebeam-runtime", ":unit_tests", ":steering_tests"])

@@ -478,6 +478,8 @@ mod tests {
             stride: len,
             len,
             transport: Transport::Udp(pulsebeam_runtime::net::UdpMode::Scalar),
+            tcp_flow: None,
+            received_at: pulsebeam_runtime::net::ReceiveTime::now(),
             offset: 0,
         }
     }

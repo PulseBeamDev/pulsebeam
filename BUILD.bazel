@@ -45,6 +45,7 @@ test_suite(
     name = "fast",
     tests = ["//%s:unit_tests" % owner for owner in RUST_OWNERS] + [
         "//crates/pulsebeam-rtc:integration_tests",
+        "//crates/pulsebeam-runtime:steering_tests",
         "//crates/pulsebeam-simulator:fast",
         "//server/auth:contract", "//server/go:conformance",
         "//agents/pulsebeam-agent-web:js_format", "//agents/pulsebeam-agent-web:js_unit_tests",

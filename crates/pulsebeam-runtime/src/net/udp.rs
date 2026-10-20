@@ -338,6 +338,7 @@ impl UdpTransportReader {
             let mut received = [None; BATCH_SIZE];
             match recvmmsg(fd, &mut headers, iovs.iter_mut(), MsgFlags::empty(), None) {
                 Ok(results) => {
+                    let received_at = super::ReceiveTime::now();
                     for (slot_idx, item) in results.enumerate() {
                         debug_assert!(slot_idx < BATCH_SIZE);
                         if item
@@ -398,7 +399,7 @@ impl UdpTransportReader {
                         };
 
                         if let Some(slot) = received.get_mut(slot_idx) {
-                            *slot = Some((src, dst, stride, total_len));
+                            *slot = Some((src, dst, stride, total_len, received_at));
                         } else {
                             debug_assert!(false, "recvmmsg reported slot {slot_idx} out of range");
                         }
@@ -411,7 +412,7 @@ impl UdpTransportReader {
             }
             let prev_len = out.len();
             for (slot_idx, entry) in received.into_iter().enumerate() {
-                let Some((src, dst, stride, total_len)) = entry else {
+                let Some((src, dst, stride, total_len, received_at)) = entry else {
                     continue;
                 };
                 let buf = arena.packet(slot_idx, total_len).to_vec();
@@ -422,6 +423,8 @@ impl UdpTransportReader {
                     stride,
                     len: total_len,
                     transport: Transport::Udp(UdpMode::Batch),
+                    tcp_flow: None,
+                    received_at,
                     offset: 0,
                 });
             }

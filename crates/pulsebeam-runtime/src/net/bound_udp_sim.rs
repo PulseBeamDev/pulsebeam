@@ -1,4 +1,4 @@
-use super::{UdpMode, UnifiedSocket, udp_batch_sim, udp_scalar};
+use super::{ReceiveTime, UdpMode, UnifiedSocket, udp_batch_sim, udp_scalar};
 use crate::sync::Arc;
 use pulsebeam_core::net::UdpSocket;
 use pulsebeam_routing::steer::{self, FlowKey, SteerEnv, Verdict};
@@ -83,7 +83,7 @@ fn wrong_owner_injection_state_enabled() -> Option<IpAddr> {
 /// One member's queue of datagrams the group has already decided belong to it.
 #[derive(Default)]
 struct Inbox {
-    queue: VecDeque<(Vec<u8>, SocketAddr)>,
+    queue: VecDeque<(Vec<u8>, SocketAddr, ReceiveTime)>,
     /// Woken when `queue` goes from empty to non-empty. `notify_one` stores a
     /// permit when nobody is waiting, so a member that is between `readable`
     /// calls does not miss the wakeup.
@@ -243,7 +243,13 @@ impl SimSteering {
             .unwrap_or_default()
     }
 
-    fn deliver(&self, src: SocketAddr, dst: SocketAddr, payload: Vec<u8>) {
+    fn deliver(
+        &self,
+        src: SocketAddr,
+        dst: SocketAddr,
+        payload: Vec<u8>,
+        received_at: ReceiveTime,
+    ) {
         let mut inboxes = self.inboxes.borrow_mut();
         let members = inboxes.len();
         if members == 0 {
@@ -296,7 +302,7 @@ impl SimSteering {
             );
             return;
         };
-        inbox.queue.push_back((payload, src));
+        inbox.queue.push_back((payload, src, received_at));
         let ready = inbox.ready.clone();
         // Release the borrow before waking: the woken member reads the same
         // RefCell as soon as it runs.
@@ -470,7 +476,7 @@ impl ReuseportMember {
 
     /// Take the next datagram, or `WouldBlock` — the readiness contract the
     /// caller already expects from a socket.
-    pub(crate) fn try_recv(&self) -> io::Result<(Vec<u8>, SocketAddr)> {
+    pub(crate) fn try_recv(&self) -> io::Result<(Vec<u8>, SocketAddr, ReceiveTime)> {
         self.group
             .steering
             .inboxes
@@ -521,10 +527,17 @@ fn spawn_pump(group: &Rc<ReuseportGroup>) {
             // datagram behind can park the pump with work outstanding.
             loop {
                 match socket.try_recv_from(&mut buf) {
-                    Ok((n, src)) => match buf.get(..n) {
-                        Some(datagram) => group.steering.deliver(src, dst, datagram.to_vec()),
-                        None => return,
-                    },
+                    Ok((n, src)) => {
+                        let received_at = ReceiveTime::now();
+                        match buf.get(..n) {
+                            Some(datagram) => {
+                                group
+                                    .steering
+                                    .deliver(src, dst, datagram.to_vec(), received_at);
+                            }
+                            None => return,
+                        }
+                    }
                     Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
                     Err(_) => return,
                 }
@@ -721,7 +734,11 @@ mod tests {
         let steering = new_steering(4);
         steering.set_wrong_owner_injection(true);
         let owner = 2u16;
-        steering.deliver(addr(1024), dst_addr(), bootstrap_for(owner, 7));
+        let received_at = ReceiveTime {
+            monotonic: tokio::time::Instant::now() - std::time::Duration::from_secs(1),
+            wall: std::time::UNIX_EPOCH,
+        };
+        steering.deliver(addr(1024), dst_addr(), bootstrap_for(owner, 7), received_at);
 
         let inboxes = steering.inboxes.borrow();
         let landed = inboxes
@@ -735,6 +752,7 @@ mod tests {
             })
             .expect("packet must land somewhere");
         assert_ne!(landed, usize::from(owner));
+        assert_eq!(inboxes[landed].as_ref().unwrap().queue[0].2, received_at);
     }
 
     /// A datagram that names no route cannot be diverted: a shard that has
@@ -745,7 +763,12 @@ mod tests {
         let steering = new_steering(4);
         steering.set_wrong_owner_injection(true);
         let tuple = flow_key(addr(1024), dst_addr());
-        steering.deliver(addr(1024), dst_addr(), b"media".to_vec());
+        steering.deliver(
+            addr(1024),
+            dst_addr(),
+            b"media".to_vec(),
+            ReceiveTime::now(),
+        );
 
         let inboxes = steering.inboxes.borrow();
         let landed = inboxes

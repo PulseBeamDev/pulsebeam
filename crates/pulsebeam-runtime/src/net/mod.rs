@@ -60,6 +60,23 @@ pub enum Transport {
     Tcp,
 }
 
+/// Clock samples taken when a complete datagram or RFC 4571 frame is received.
+/// Queueing and shard handoffs must preserve both samples.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReceiveTime {
+    pub monotonic: tokio::time::Instant,
+    pub wall: std::time::SystemTime,
+}
+
+impl ReceiveTime {
+    pub fn now() -> Self {
+        Self {
+            monotonic: tokio::time::Instant::now(),
+            wall: std::time::SystemTime::now(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RecvPacketBatch {
     pub src: SocketAddr,
@@ -68,6 +85,8 @@ pub struct RecvPacketBatch {
     pub stride: usize,
     pub len: usize,
     pub transport: Transport,
+    pub tcp_flow: Option<tcp::TcpFlowId>,
+    pub received_at: ReceiveTime,
 
     pub offset: usize,
 }
@@ -254,6 +273,8 @@ mod tests {
             stride: 6,
             len: 20,
             transport: Transport::Udp(UdpMode::Scalar),
+            tcp_flow: None,
+            received_at: ReceiveTime::now(),
             offset: 0,
         };
 
@@ -273,6 +294,8 @@ mod tests {
             stride: 6,
             len: 18,
             transport: Transport::Udp(UdpMode::Scalar),
+            tcp_flow: None,
+            received_at: ReceiveTime::now(),
             offset: 0,
         };
 
@@ -291,6 +314,8 @@ mod tests {
             stride: 2,
             len: 2,
             transport: Transport::Udp(UdpMode::Batch),
+            tcp_flow: None,
+            received_at: ReceiveTime::now(),
             offset: 0,
         };
 
