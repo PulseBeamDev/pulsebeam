@@ -4,10 +4,18 @@ import type { Agent, TopicConsumerError, TopicEvent } from "@pulsebeam/react";
 const emojis = new Set(["👍", "❤️", "😂", "😮", "👏", "🔥"]);
 type ChatPayload = { text: string; ts: number };
 type Message = ChatPayload & {
+  type: "message";
   key: string;
   sender: string;
   self: boolean;
   status: "pending" | "accepted";
+};
+type ChatGap = {
+  type: "gap";
+  key: string;
+  sender: string;
+  expectedSequence: bigint;
+  availableSequence: bigint;
 };
 type ReactionPayload = { emoji: string };
 type Reaction = ReactionPayload & { key: string };
@@ -17,10 +25,9 @@ export function useTopics(agent: Agent, participantId: string | null) {
   const Reactions = agent.topic<ReactionPayload>("reactions", {
     mode: "lossy",
   });
-  const [messages, setMessages] = useState<Message[]>([]);
+  const [messages, setMessages] = useState<(Message | ChatGap)[]>([]);
   const [reactions, setReactions] = useState<Reaction[]>([]);
   const [error, setError] = useState<string | null>(null);
-  const [gap, setGap] = useState(false);
   const [subscriptionRevision, retrySubscriptions] = useState(0);
   const localKeys = useRef(0);
   const timers = useRef(new Map<string, ReturnType<typeof setTimeout>>());
@@ -43,7 +50,21 @@ export function useTopics(agent: Agent, participantId: string | null) {
   };
   const receiveChat = (event: TopicEvent<ChatPayload>) => {
     if (event.type === "gap") {
-      setGap(true);
+      const key = `gap:${event.dataTrackId}:${event.expectedSequence}:${event.availableSequence}`;
+      setMessages((old) =>
+        old.some((entry) => entry.key === key)
+          ? old
+          : [
+              ...old,
+              {
+                type: "gap",
+                key,
+                sender: event.participantId,
+                expectedSequence: event.expectedSequence,
+                availableSequence: event.availableSequence,
+              },
+            ],
+      );
       return;
     }
     const payload = event.value;
@@ -56,6 +77,7 @@ export function useTopics(agent: Agent, participantId: string | null) {
         : [
             ...old,
             {
+              type: "message",
               key,
               text: payload.text,
               ts: payload.ts,
@@ -99,9 +121,7 @@ export function useTopics(agent: Agent, participantId: string | null) {
     messages,
     reactions,
     error,
-    gap,
     clearError: () => setError(null),
-    clearGap: () => setGap(false),
     retrySubscriptions: () => {
       setError(null);
       retrySubscriptions((n) => n + 1);
@@ -115,6 +135,7 @@ export function useTopics(agent: Agent, participantId: string | null) {
         ...old,
         {
           ...payload,
+          type: "message",
           key,
           sender: participantId,
           self: true,
@@ -125,7 +146,9 @@ export function useTopics(agent: Agent, participantId: string | null) {
         await Chat.publish(payload);
         setMessages((old) =>
           old.map((message) =>
-            message.key === key ? { ...message, status: "accepted" } : message,
+            message.type === "message" && message.key === key
+              ? { ...message, status: "accepted" }
+              : message,
           ),
         );
         return true;

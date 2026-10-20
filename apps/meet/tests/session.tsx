@@ -272,7 +272,15 @@ await flush(() =>
     availableSequence: 4n,
   }),
 );
-assert.match(document.body.textContent!, /Some chat messages were skipped/);
+const transcript = document.querySelector(
+  '[role="log"][aria-label="Chat transcript"]',
+);
+assert.ok(transcript, "chat owns an inline transcript");
+assert.match(
+  transcript.lastElementChild!.textContent!,
+  /Some chat messages were skipped/,
+);
+assert.match(transcript.lastElementChild!.textContent!, /bob: 2 unavailable/);
 await flush(() =>
   runtime.event({
     type: "topic-message",
@@ -286,7 +294,25 @@ await flush(() =>
     ),
   }),
 );
-assert.match(document.body.textContent!, /after the gap/);
+const transcriptEntries = Array.from(transcript.children);
+assert.equal(transcriptEntries.length, 5);
+assert.match(
+  transcriptEntries[2].textContent!,
+  /delivered through production topics/,
+);
+assert.match(
+  transcriptEntries[3].textContent!,
+  /Some chat messages were skipped/,
+);
+assert.match(transcriptEntries[4].textContent!, /after the gap/);
+assert.equal(transcript.querySelectorAll('[role="alert"]').length, 1);
+await click("Close chat");
+await click("Chat");
+assert.match(
+  document.querySelector('[aria-label="Chat transcript"]')!.textContent!,
+  /Some chat messages were skipped.*after the gap/s,
+  "chat history retains the gap before continuation when reopened",
+);
 const chat =
   document.querySelector<HTMLTextAreaElement>("textarea") ??
   document.querySelector<HTMLInputElement>("aside input");

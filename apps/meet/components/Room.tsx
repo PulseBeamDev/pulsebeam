@@ -115,8 +115,6 @@ function RoomSession({
     sendReaction,
     error: topicError,
     clearError,
-    gap,
-    clearGap,
     retrySubscriptions,
   } = useTopics(owner, agent.participantId);
   const { remoteTracks, spotlight, setPin } = useVideoLayout(
@@ -341,11 +339,6 @@ function RoomSession({
           {failure ?? topicError ?? agent.error?.message}
         </Alert>
       )}
-      {gap && (
-        <Alert severity="warning" onClose={clearGap}>
-          Some chat messages were skipped.
-        </Alert>
-      )}
       <Box
         component="main"
         className="relative flex min-h-0 min-w-0 flex-1 flex-col gap-3 p-2 lg:flex-row lg:p-4"
@@ -468,29 +461,44 @@ function RoomSession({
                 <Icons.X size={18} />
               </IconButton>
             </Stack>
-            <Stack spacing={1.5} className="min-h-0 flex-1 overflow-y-auto p-4">
+            <Stack
+              role="log"
+              aria-label="Chat transcript"
+              spacing={1.5}
+              className="min-h-0 flex-1 overflow-y-auto p-4"
+            >
               {!messages.length && (
                 <Typography variant="body2" color="text.secondary">
                   No messages yet
                 </Typography>
               )}
-              {messages.map((message) => (
-                <Box
-                  key={message.key}
-                  className={`max-w-[90%] ${message.self ? "self-end" : "self-start"}`}
-                >
-                  <Typography variant="caption" color="text.secondary">
-                    {message.self ? "You" : message.sender}
-                    {message.status === "pending" ? " · Sending…" : ""}
-                  </Typography>
-                  <Paper
-                    elevation={0}
-                    className={`break-words px-3 py-2 ${message.self ? "bg-blue-700! text-white!" : "bg-slate-100!"}`}
+              {messages.map((message) =>
+                message.type === "gap" ? (
+                  <Alert key={message.key} severity="warning">
+                    Some chat messages were skipped. {message.sender}:{" "}
+                    {(
+                      message.availableSequence - message.expectedSequence
+                    ).toString()}{" "}
+                    unavailable.
+                  </Alert>
+                ) : (
+                  <Box
+                    key={message.key}
+                    className={`max-w-[90%] ${message.self ? "self-end" : "self-start"}`}
                   >
-                    {message.text}
-                  </Paper>
-                </Box>
-              ))}
+                    <Typography variant="caption" color="text.secondary">
+                      {message.self ? "You" : message.sender}
+                      {message.status === "pending" ? " · Sending…" : ""}
+                    </Typography>
+                    <Paper
+                      elevation={0}
+                      className={`break-words px-3 py-2 ${message.self ? "bg-blue-700! text-white!" : "bg-slate-100!"}`}
+                    >
+                      {message.text}
+                    </Paper>
+                  </Box>
+                ),
+              )}
             </Stack>
             <Stack
               component="form"
