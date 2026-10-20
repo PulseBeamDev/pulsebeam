@@ -25,6 +25,7 @@ for (const name of [
   "HTMLInputElement",
   "HTMLTextAreaElement",
   "Event",
+  "EventTarget",
   "MouseEvent",
   "KeyboardEvent",
   "MutationObserver",
@@ -65,6 +66,10 @@ await build({
   },
   alias: {
     "@pulsebeam/react": join(root, "agents/react/src/index.ts"),
+    "@pulsebeam/web/internal/react": join(
+      root,
+      "agents/pulsebeam-agent-web/web/internal/react.ts",
+    ),
     "@pulsebeam/web": join(root, "agents/pulsebeam-agent-web/web/index.ts"),
   },
   plugins: [

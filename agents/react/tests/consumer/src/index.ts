@@ -14,7 +14,8 @@ const config: AgentConfig = {
 };
 const agent: Agent = useAgent(config);
 const camera = useUserMedia({ video: true, audio: false });
-agent.local.video("camera").setSource(camera.videoTrack);
+const Camera = agent.local.video("camera");
+Camera({ source: camera.videoTrack });
 Video({
   source: agent.remote.videoTracks[0] ?? null,
   onPlaybackError: (failure: PlaybackError) => void failure.retry(),

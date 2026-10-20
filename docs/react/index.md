@@ -36,8 +36,9 @@ These concepts explain the quickstart after you have tried it:
 2. **Capture:** `useUserMedia` and `useDisplayMedia` own local capture tracks.
    Start capture from a user gesture. Connect alone does not open devices.
 3. **Publication:** `agent.local.video("camera")` and
-   `agent.local.audio("microphone")` create labeled handles. Bind captured tracks
-   to these handles as the quickstart does.
+   `agent.local.audio("microphone")` return stable labeled component handles.
+   Render `<Camera source={capture.videoTrack} />` to declare a committed
+   publication. Lookup alone does not publish or reserve a slot.
 4. **Remote media:** `agent.remote` exposes participants and publications.
    `Video` presents a track and requests reception while it is visible and
    nonzero-sized. Remote audio playback is automatic once connected; a user
@@ -50,7 +51,8 @@ not protocol constants. Logical track handles use participant identity and label
 to follow media across temporary absence or replacement. Keep labels stable.
 
 For live application messages, `agent.topic<T>(name, {mode})` creates a typed JSON
-publish/subscribe facade. It is not durable message storage. See
+component with a `publish` action. Mounting it owns a consumer; unmounting
+releases that consumer. It is not durable message storage. See
 [typed topics](/react/guides#typed-topics) for publishing, subscription cleanup,
 and recovery limits.
 
@@ -68,4 +70,6 @@ and recovery limits.
   automatic growth is not supported yet.
 
 Use the [guides](/react/guides) when adding controls, and the
-[reference](/react/reference) for exact contracts and advanced ownership APIs.
+[reference](/react/reference) for exact contracts. React owns Agents through
+`useAgent` only. Non-React applications use caller-owned `createAgent` from
+`@pulsebeam/web`; internal managed lifecycle functions are not public APIs.

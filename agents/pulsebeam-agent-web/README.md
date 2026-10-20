@@ -40,6 +40,11 @@ export default {
 For another bundler or a WASM loading failure, follow the
 [SDK initialization diagnostics](../../docs/react/troubleshooting.md#sdk-initialization).
 Initialize the SDK only in the browser, not during server-side rendering.
+`createAgent(config)` is the one public caller-owned Agent construction API in
+`@pulsebeam/web`; close it on application teardown. React applications instead
+use `useAgent` from `@pulsebeam/react`, which does not export `createAgent`.
+Managed activation/release is an internal package bridge, not a public Web
+constructor or lifecycle contract.
 
 ## Join, publish, and receive
 

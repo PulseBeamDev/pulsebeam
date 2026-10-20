@@ -4,21 +4,20 @@ title: React SDK API reference
 
 # API reference
 
-Import from `@pulsebeam/react`. Pick an API below.
-Need a working app first? [Install the SDK and add a room](/react/quickstart).
+Import React ownership, capture, and presentation APIs from `@pulsebeam/react`.
+For a working application, start with the [quickstart](/react/quickstart).
 
-## Runtime export index
+## Construction and package boundaries
 
-| Export | Contract |
+| Package | Agent ownership |
 | --- | --- |
-| `useAgent` | [React-owned Agent](#useagent) |
-| `createAgent` | [Caller-owned Agent](#createagent) |
-| `Video` | [Video presentation](#video) |
-| `useUserMedia` | [Camera/microphone capture](#capture-hooks) |
-| `useDisplayMedia` | [Display capture](#capture-hooks) |
-| `useMediaDevices` | [Device enumeration](#usemediadevices) |
-| `MediaCaptureError` | [Acquisition errors](#errors) |
-| `LocalTrackCapacityError` | [Local slot exhaustion](#errors) |
+| `@pulsebeam/react` | `useAgent(config)` owns activation and cleanup |
+| `@pulsebeam/web` | `createAgent(config)` creates a direct caller-owned imperative Agent; the caller closes it |
+
+React does not export `createAgent`. Managed activation is an internal SDK
+mechanism, not a public Web constructor or lifecycle API. The hook-owned Agent
+has no manual close, raw desired-state setter, subscription loop, or low-level
+snapshot API. There is no `agent.advanced` API.
 
 ## useAgent
 
@@ -26,156 +25,137 @@ Need a working app first? [Install the SDK and add a room](/react/quickstart).
 useAgent(config: AgentConfig): Agent
 ```
 
-Returns an Agent handle from the first render and subscribes to it internally.
-Observable Agent properties such as `connection`, `error`, admitted identity, and
-remote media are reactive during render; application code does not call
-`useSyncExternalStore`, `subscribe`, or `getSnapshot`. The handle is inert during
-rendering; React activates its runtime after commit. It does not connect or start
-capture automatically.
+Returns a stable handle immediately. Render and lookup are inert. React
+activates the runtime after commit and releases it on unmount. Activation does
+not connect or capture automatically. `connection`, `error`, admitted identity,
+authorization expiry, and remote collections are reactive without application
+subscriptions.
 
-| Lifecycle | Result |
+| Change | Result |
 | --- | --- |
-| First render | Returns a handle (no loading-time `null`) |
-| Token-only change | Renews authorization on the existing Agent |
-| Endpoint/topology change | Replaces the Agent with a new inert handle |
-| Logging change | Updates the existing Agent without replacement |
-| React key changes | Remounts the component and creates a new session |
-| Unmount | Releases Agent runtime resources; does not stop caller-owned capture |
+| Token | Renew authorization on the same Agent; obtain tokens from your backend |
+| Logging level | Update diagnostics without replacing the Agent |
+| Endpoint or topology | Replace the Agent and release the previous runtime |
+| Different React key | Start a new logical lifetime; use this for a different room or participant |
+| Unmount | Release runtime and declarations, not borrowed capture |
 
 ### Configuration types
 
-**AgentConfig**
+`AgentConfig` requires `endpoint` (absolute HTTP(S) base URL) and `token`
+(opaque participant bearer token). The runtime adds `/api/v1/native` to the
+endpoint. Optional `topology: MediaTopology` fixes track capacities, not
+participant limits, for this lifetime:
 
-| Field | Input |
-| --- | --- |
-| `endpoint` | Required absolute HTTP(S) base URL; the runtime adds `/api/v1/native` |
-| `token` | Required opaque bearer token |
-| `topology` | Optional `MediaTopology`; omitted values use the defaults below |
-| `logging` | Optional `AgentLogging` |
+| Field | Default | Maximum |
+| --- | --- | --- |
+| `localVideos` | 2 | 32 |
+| `localAudios` | 2 | 32 |
+| `remoteVideos` | 16 | 32 |
+| `remoteAudios` | 8 | 32 |
 
-**MediaTopology** fields are optional. The SDK reserves these outgoing and
-incoming **track slots** when an Agent is created; they are not participant
-limits. Capacity stays fixed for that Agent's lifetime; each individual
-field is capped at 32 slots (local video, local audio, remote video, and
-remote audio).
+Omitted fields retain defaults. Local labels bind slots only when committed,
+and keep that binding for the Agent lifetime even after withdrawal. Inert
+lookups do not consume capacity. Increasing capacity requires a new Agent and
+connection. Excess visible remote tracks remain unmapped and warn.
 
-| Field | Default |
-| --- | --- |
-| `localVideos` | 2 |
-| `localAudios` | 2 |
-| `remoteVideos` | 16 |
-| `remoteAudios` | 8 |
-
-Local publication labels permanently claim a slot for the lifetime of the
-Agent, even after withdrawal. Creating more local labels than the reserved
-slots throws `LocalTrackCapacityError`; remote media beyond reserved receiver
-slots cannot be assigned. Set only the fields you need, for example
-`topology: { remoteVideos: 4 }`; unspecified fields retain their defaults.
-**Today, increasing any capacity means replacing the Agent and reconnecting.**
-Automatic resizing is planned, not implemented.
-
-**AgentLogging / LogLevel:** optional `level`, default `warn`.
-Supported levels: `off`, `error`, `warn`, `info`, `debug`, `trace`.
-Console logging is scoped to each Agent and can be changed in place via
-`agent.setLogging(level)`. Chrome needs Verbose enabled for debug/trace.
-
-Configuration and runtime initialization errors appear through `agent.error`
-(and through diagnostic events for callers that need them). Browser assets and APIs
-must be available. Connection intent
-is not admission. See [connection diagnostics](/react/troubleshooting#admission-and-connection).
-
-## createAgent
-
-```ts
-createAgent(config: AgentConfig): Agent
-```
-
-Returns a caller-owned Agent synchronously. It starts disconnected and retains
-the latest desired state while initializing. Prefer `useAgent` for React ownership.
-
-The caller owns `subscribe`/`subscribeEvents` unsubscribe functions and
-`close()`. Unsubscribe and close are idempotent; close is terminal, fences
-pending work, detaches callbacks and releases runtime/browser resources.
-It does not stop borrowed capture. Do not create Agents on every render or
-execute browser runtime initialization in SSR.
+`logging: {level}` defaults to `warn`. Levels are `off`, `error`, `warn`, `info`,
+`debug`, and `trace`. Chrome requires Verbose enabled for debug/trace output.
 
 ## Agent interface
 
-| Member | Result and ownership |
+| Member | Meaning |
 | --- | --- |
-| `connection: ConnectionState` | Current observed connection state; reactive under `useAgent` |
-| `error: AgentError \| null` | Current Agent error; reactive under `useAgent` |
-| `participantId`, `participantExternalId`, `roomExternalId` | Current admitted identity; reactive under `useAgent` |
-| `authorizationExpiresAt` | Current authorization deadline or null; reactive under `useAgent` |
-| `local: LocalMedia` | Stable local audio/video handles by label |
-| `remote: RemoteMedia` | Logical discovery, presentation handles, audio recovery |
-| `topic<T>(name, {mode})` | Typed JSON facade, see [topics](#topics) |
-| `connect(): void` | Synchronously sets desired connection true, does not await admission |
-| `disconnect(): void` | Sets intent false and stops retrying; capture remains caller-owned |
-| `reconnect(): void` | Requests runtime reconnection, retains desired state |
-| `renewAuthorization(token): void` | Updates bearer authorization for this session, does not fetch a token |
-| `getSnapshot(): AgentSnapshot` | Low-level immutable snapshot for caller-owned/Web integrations; React code normally does not need it |
-| `subscribe(listener): () => void` | Low-level snapshot notifications; `useAgent` owns this subscription internally |
-| `subscribeEvents(listener): () => void` | Diagnostics and topic events; caller cleans up |
-| `setLogging(level): void` | Update diagnostic verbosity without restarting the session |
-| `close(): void` | Terminal, idempotent teardown |
+| `connection`, `error` | Observed connection progress and nullable typed failure |
+| `participantId` | Nullable canonical participant ID |
+| `participantExternalId`, `roomExternalId` | Nullable authoritative application identities |
+| `authorizationExpiresAt` | Nullable deadline in Unix seconds |
+| `local.video(label)`, `local.audio(label)` | Stable resource components, keyed by kind and label |
+| `remote` | Stable logical remote identities and automatic audio recovery |
+| `topic<T>(name, {mode})` | Stable typed topic component with a `publish` action |
+| `connect()` | Request connection; not an admission promise |
+| `disconnect()` | Withdraw connection intent and cancel recovery; capture remains owned by its hook |
+| `reconnect()` | Explicitly retry/recover while preserving logical relationships |
 
-Admission supplies authoritative external IDs and expiry. Renew before expiry
-with backend-issued credentials for the existing session. A different room or
-participant needs a new Agent. See [renewal](/react/guides#connection-renewal-and-errors).
-The additional low-level methods are documented [below](#low-level-agent-state).
+Transient failures use core recovery. Terminal failure and its typed reason
+persist across media, topic, token, logging, UI changes, and late transport
+events. Correct the cause, then explicitly reconnect or disconnect/connect.
+A new token alone does not clear a terminal failure.
 
 ## Local media and captured sources
 
-**LocalMedia:** `video(label): LocalVideoTrack`, `audio(label): LocalAudioTrack`.
-Repeated per-kind label lookup returns the same handle and reserved slot.
-Withdrawal does not free that slot.
+```tsx
+const Camera = agent.local.video("camera");
+const Microphone = agent.local.audio("microphone");
+// In the committed tree:
+<Camera source={capture.videoTrack} enabled={cameraOn} />;
+<Microphone source={capture.audioTrack} enabled={micOn} />;
+```
 
-**LocalVideoTrack / LocalAudioTrack**
+Each component renders no DOM. Props:
 
-| Member | Contract |
+| Prop | Contract |
 | --- | --- |
-| readonly `kind`, `label`, `source`, `enabled` | Current logical handle; enabled starts true |
-| `setSource(source \| null)` | Borrow matching capture or withdraw; never stops original tracks |
-| `setEnabled(boolean)` | False sends black/silent media and blanks local-handle video; publication remains |
-| `subscribe(listener): unsubscribe` | Observe changes; caller cleans up |
+| `source` | Required matching `CapturedVideoTrack` or `CapturedAudioTrack`, or null |
+| `enabled` | Default true; false sends black/silent media without withdrawing publication or stopping capture |
+| `preferences.content` | Video: `motion` (default), `detail`, `text`; audio: `speech` (default), `music` |
+| `preferences.degradation` | Optional `maintain-framerate`, `maintain-resolution`, or `balanced` |
 
-Enablement survives replacement/withdrawal. Kind/capture mismatches fail validation.
-Agent teardown does not stop capture; sender clones isolate mute state.
+Committed mounts exclusively own `(Agent, kind, label)`, even with null source.
+Duplicate mounts throw `RelationshipOwnershipError` without replacing the
+first owner. Capacity exhaustion throws `LocalTrackCapacityError`. Use an error
+boundary where declarations can exceed known capacity. Equal semantic props
+are no-ops. Null or ended source withdraws effective publication but retains
+ownership; unmount releases only that declaration. Neither stops caller capture.
+Replacement retains logical identity and committed enabled/preferences state.
+Tuning is best effort, not a codec guarantee or a substitute for enablement.
 
-**CapturedVideoTrack / CapturedAudioTrack:** opaque hook-owned sources with `kind`,
-not a public native-track accessor. Pass them to matching local handles or a
-captured video to `Video`; sources from another hook can be borrowed.
+`CapturedVideoTrack` and `CapturedAudioTrack` are opaque source identities,
+not browser tracks. Capture owns originals; each Agent borrows them and owns
+its sender resources. One Agent's mute does not mute another Agent or stop a device.
 
 ## Video
 
-`Video(props: VideoProps)` renders a video element, or null when `source` is null.
+`Video` accepts captured video, a local video component handle, a remote video
+handle, or null. Null renders no DOM. It supports HTML video attributes except
+`src` and `children`, plus `mirror` (false), `onPlaybackError`, and `preferences`.
+`autoPlay`, `muted`, and `playsInline` default to true.
 
-| Prop | Input / default |
-| --- | --- |
-| `source` | Required captured video source, local video handle, remote video handle, or null |
-| `autoPlay` | `true` |
-| `muted` | `true` |
-| `playsInline` | `true` |
-| `mirror` | `false`; visual transform only |
-| `onPlaybackError` | Optional callback receiving `PlaybackError` |
+`onPlaybackError` receives `{error, retry(): Promise<void>}`. Store the retry and
+invoke it from a user gesture, catching rejection. Retired presentations cannot
+invoke a callback or restart playback. A local-handle preview follows publication
+enablement; a captured-source preview shows the device independently.
 
-Other native video attributes are supported except `src` and `children`.
-Use `className`, `style`, or `controls` as needed.
+### Video preferences
 
-For remote video it attaches presentation-driven receive demand. Visible size
-in physical pixels determines demand, shared by maximum size when multiple
-elements present one handle. Unmount/source changes detach; hidden/off-screen
-presentation does not reserve receivers. `autoPlay=false` still attaches and
-requests media, but native controls/gesture must start playback.
+```tsx
+<Video source={remote} preferences={{
+  minHeight: 360, minFps: 15, priority: 100,
+  latency: {minMs: 100, maxMs: 200},
+}} />
+```
 
-For captured/local sources it binds a preview without taking capture ownership.
-`mirror` is a visual transform only. A local-handle source follows enablement;
-a captured-source preview does not reflect publication enablement.
+All numeric fields must be finite unsigned 32-bit integers. Latency requires
+`minMs <= maxMs`; invalid values throw without coercion. Minimum height, frame
+rate, and priority default to zero. Latency omission requests receiver defaults,
+which is distinct from explicit `{minMs: 0, maxMs: 0}`.
 
-**PlaybackError:** `onPlaybackError` receives `{error: unknown, retry:
-() => Promise<void>}` when automatic play fails. Store the retry and call it
-from a user gesture; catch rejection. It is not a general connection retry.
+Only visible, attached remote presentations contribute demand. Local previews
+create none. For one remote track, contributions aggregate independent of order:
+maximum physical-pixel measured height, `minHeight`, `minFps`, and `priority`;
+latency encloses specified ranges using the lowest minimum and highest maximum.
+This can relax an individual preference. Hidden, offscreen, detached, and
+unmounted consumers contribute nothing and cannot clear another's contribution.
+
+Removing the last latency preference requests default receiver policy. A
+receiver stamped with fixed bounds cannot clear them in its existing transport.
+The server may remap media to a compatible receiver or request transport
+recovery. Logical handles remain stable. A new compatible receiver/transport
+permits defaults again, not a guarantee of a browser's buffering algorithm.
+
+Minimums are best effort. Allocation protects minimum height and frame rate
+jointly before target upgrades; priority wins within those stages. Insufficient
+bandwidth or layers may reduce quality or pause forwarding without removing the
+receiver assignment. There is no competing normal React receive setter.
 
 ## Capture hooks
 
@@ -184,229 +164,144 @@ useUserMedia(options: UserMediaOptions): CaptureResult
 useDisplayMedia(options: DisplayMediaOptions): CaptureResult
 ```
 
-Both option types require `video` and `audio`, each a boolean or browser
-`MediaTrackConstraints`. For camera and microphone, use
-`useUserMedia({video: true, audio: true})`.
+Both require explicit `video` and `audio` fields. Construction is inert;
+`request()` begins acquisition. Use a user gesture, especially for display capture.
 
-No capture starts until `request()` is called. Invoke it from a gesture;
-display choosers especially require transient activation.
-
-**CaptureResult**
-
-| Member | Contract |
+| Kind | `useUserMedia` option |
 | --- | --- |
-| `videoTrack` / `audioTrack` | Readonly typed sources or null |
-| `state` | Readonly `idle`, `requesting`, `active`, or `error` |
-| `error` | Readonly `MediaCaptureError` or null |
-| `request(): Promise<void>` | Rejects on failure or supersession; catch rejection |
-| `stop(): void` | Stops native tracks and returns the hook to idle |
+| Video | false, true, or `{device?: CameraDevice, preferences?: {width?, height?, frameRate?}}` |
+| Audio | false, true, or `{device?: MicrophoneDevice, preferences?: {echoCancellation?, noiseSuppression?, autoGainControl?}}` |
 
-Stopping or unmounting also invalidates pending acquisitions; late tracks are stopped.
+True or an options object without a device selects the platform default; no
+inventory is required first. Explicit device selection is exact or fails, never
+retries another/default device. Dimensions/frame rate must be positive finite
+numbers; processing preferences must be booleans. Preferences map to best-effort
+requests, not exact/minimum constraints. Browser constraint dictionaries are not
+part of this API.
 
-| Hook | Replacement and ending behavior |
-| --- | --- |
-| `useUserMedia` | Option changes after requesting trigger replacement. Old capture stays until success; failure retains it with `active` and an error. |
-| `useDisplayMedia` | Option changes never open a chooser automatically. Ending the shared video stops the session. Display audio is not guaranteed. |
+Display options accept the same per-kind preferences but no device selector.
+The platform chooser owns selection. Video is required; display audio may be
+absent even when requested. Both user-media kinds false stops/returns idle.
+
+**CaptureResult** exposes readonly `videoTrack`, `audioTrack`, `video`, `audio`,
+`state` (`idle`, `requesting`, `active`, `error`), `error`, plus `request()` and
+`stop()`. Observed `video`/`audio` records are null without that live source:
+
+- `device`: actual typed camera/microphone, or null when identity is unknown.
+  Display selection is not fabricated as a camera/microphone.
+- `settings`: only actual track-reported values of the corresponding preferences.
+  Unknown fields are absent, never copied from the request. These are acquisition
+  observations, not adaptive telemetry or raw browser settings dictionaries.
+
+User-media option changes reconcile after an explicit request while acquiring
+or active. Equal options are no-ops. Replacement acquires and validates a full
+candidate before swapping, then stops superseded originals. Failure preserves
+working sources/settings and exposes an error without retrying unchanged failed
+options. A failed first acquisition needs another explicit request.
+
+`request()` resolves after committing the winning result. Failure rejects with
+`MediaCaptureError`; superseded requests reject with `request-cancelled` and late
+tracks are stopped. `stop()` is idempotent, invalidates pending work, releases
+originals, clears observations/error to idle, and disables option-driven restart
+until the next request. Unmount provides the same cleanup. Retained actions
+cannot acquire after unmount.
+
+Ended user-media tracks disappear from sources/observations; all ended means
+idle. Display-video ending stops the whole sharing session. Ending never
+silently restarts capture. Display options apply only to the next explicit
+request; replacement may prompt, and failure retains working sharing.
 
 ## useMediaDevices
 
-`useMediaDevices(): MediaDevicesResult` enumerates after mount, refreshes after
-capture and device changes, and removes its listeners on unmount.
-**MediaDevicesResult** contains readonly `cameras`, `microphones`, `speakers`,
-`state` (`loading`, `ready`, `error`), and nullable `error`.
-**MediaDevice** has readonly `id` and `label`, possibly empty until permission.
-This is enumeration, not a speaker-output routing API.
+`useMediaDevices(): MediaDevicesResult` has its own lifetime independent of
+capture. It returns readonly `cameras`, `microphones`, `speakers`, `state`
+(`loading`, `ready`, `error`), and nullable `error`.
+
+`CameraDevice`, `MicrophoneDevice`, and `SpeakerDevice` have `id`, `label`, and
+literal `kind` values `camera`, `microphone`, and `speaker`. IDs are opaque and
+platform-local, may change with permission, and must not be interpreted. Labels
+may initially be empty. Speaker inventory does not imply output routing.
+
+Mounted inventories refresh after successful acquisition, `devicechange`, and
+observable camera/microphone permission changes. Browser support for permission
+observation varies; unsupported changes may only become visible on device change,
+acquisition, or remount. Enumeration is revision-fenced and listeners are removed
+on unmount. Capture does not own these observers.
 
 ## Remote media
 
-**RemoteMedia** exposes readonly `participants: RemoteParticipant[]`,
-`videoTracks: RemoteVideoTrack[]`, `audioTracks: RemoteAudioTrack[]`,
-`participant(externalId)`, and `resumeAudio(): Promise<void>`.
-Collections are readonly and preserve identity until membership changes; they
-exclude self. **RemoteParticipant** has `externalId`, per-participant collections,
-and stable `video(label)` / `audio(label)` lookups. Lookup works before discovery.
-Handles survive temporary absence, unpublication, departure/rejoin, remapping,
-and publication-ID replacement. Lookup after close fails.
+`remote.participants`, `remote.videoTracks`, and `remote.audioTracks` are readonly,
+exclude self, and preserve collection identity until membership changes.
+`remote.participant(externalId)` returns a stable participant with `externalId`,
+`video(label)`, `audio(label)`, `videoTracks`, and `audioTracks`. Lookup is inert
+and works before discovery. Handles survive absence, remapping, replacement,
+and reconnect.
 
-**RemoteVideoTrack:** `kind`, `participantId` (external application identity),
-`label`, `active` (catalog publication presence, not playback),
-`setReceiveOptions(ReceiveOptions)`, and `subscribe(listener): unsubscribe`.
-Policy replacement alone never requests hidden/unmounted video.
-**ReceiveOptions:** optional `minHeight`, `minFps`, `priority`, and
-`playoutDelay: {minMs, maxMs}`. Defaults are 0, 0, 0, and no explicit delay;
-numeric values must be finite uint32 integers or the setter throws `TypeError`.
-Use a maximum delay not below the minimum; invalid runtime policy is reported
-through Agent diagnostics. Policy survives temporary absence.
-Excess visible tracks beyond topology stay unmapped and warn.
+Remote video exposes `kind`, external `participantId`, `label`, `active`, and
+`subscribe`. `active` means catalog presence, not decoded playback. Preferences
+belong to `Video`, not a handle-wide setter.
 
-Allocation protects nonzero `minHeight` and `minFps` jointly before spending on
-target height and full available frame rate. Higher `priority` wins when
-minimums cannot all fit, then wins remaining target upgrades. A lower-priority
-minimum outranks a higher-priority upgrade, never a higher-priority minimum.
-Both minimums zero means no reservation. Minimums are best effort: unavailable
-layers or insufficient bandwidth can cause lower quality or paused forwarding
-without removing the receiver assignment. Equal-priority peers take turns
-under sustained scarcity. Congestion reduces quality promptly; recovery uses
-headroom and hysteresis to limit oscillation. This policy does not change
-receiver-capacity admission or latency-sensitive packet scheduling.
+Remote audio exposes `kind`, external `participantId`, `label`, `receiving`,
+`subscribe`, `readWaveform(Float32Array)`, and `readSpectrum(Float32Array)`.
+`receiving` follows receiver assignment, not sound or autoplay. Reads use the
+default 2048-point FFT: leading amplitudes or decibel bins fill smaller buffers;
+unavailable data/oversized tails are zero or negative infinity respectively.
+Reads do not cause rerenders.
 
-**RemoteAudioTrack:** `kind`, external `participantId`, `label`, `receiving`,
-`subscribe`, `readWaveform(Float32Array)`, `readSpectrum(Float32Array)`.
-`receiving` follows receiver assignment (Mapping), not sound or autoplay.
-
-::: details Waveform and spectrum reads
-Reads synchronously fill normalized amplitudes or decibel frequency bins using
-the default 2048-point FFT and smoothing. Smaller buffers get leading samples/bins,
-not a new FFT size. Unmapped/unavailable signal and oversized tails are zero waveform
-or negative infinity spectrum. Empty buffers are valid; reads do not notify subscribers.
-:::
-
-Automatic audio selection/playback is enabled while connected. It does not
-require UI or analysis reads. `resumeAudio()` is exceptional autoplay recovery:
-call from a gesture, even before media arrives; it resolves when the context is
-running and rejects on recovery failure or close. Automatic failures are logged
-without changing Mapping or terminating the Agent. Disconnect removes routes;
-reconnect restores receivers without duplicate output. Close makes existing
-handles inactive/nonreceiving and analysis silent.
+Automatic remote audio requires no presentation component. Call
+`remote.resumeAudio()` from a gesture for exceptional autoplay recovery, even
+before arrival; catch rejection. Disconnect removes routes; reconnect restores
+receivers without duplicate output.
 
 ## Snapshots, status, and errors
 
-**AgentSnapshot** separates requested state from observed results.
-Admission means the server accepted the participant into the room.
-
-| Field | Meaning |
-| --- | --- |
-| `connection: ConnectionState` | Current connection progress/status |
-| `participantExternalId`, `roomExternalId` | Authoritative admitted app IDs; null before admission, retained during same-session reconnection, cleared on disconnect |
-| `participantId` | Opaque internal (canonical) participant ID, not the app's identity |
-| `authorizationExpiresAt` | Nullable authorization deadline in Unix seconds |
-| `catalog: CatalogSnapshot` | Discovered participants and publications |
-| `mapping: MappingSnapshot` | Publications assigned to receiver slots |
-| `tracks` | Publication-ID-keyed low-level media observations |
-| `topics: TopicSnapshot` | Topic transport status and counters |
-| `failure: AgentError \| null` | Low-level snapshot error field; normal React code reads `agent.error` |
-| `version`, `desiredRevision`, `generation` | Snapshot version, desired-state revision, and runtime generation for diagnostics |
-
-**ConnectionState** includes `disconnected`, `initializing`, `creating-offer`,
+`ConnectionState` includes `disconnected`, `initializing`, `creating-offer`,
 `joining`, `applying-answer`, `waiting-for-transport`, `waiting-for-signaling`,
-`connected`, `reconnecting`, `retry-waiting:N`, `closing`, `terminal-failure`.
-Do not infer admission from intent or an intermediate transport state.
-
-::: details Catalog, Mapping, and native-track fields
-**CatalogSnapshot** has revision, participants, publications. **Participant**
-has internal `id` and application `externalId`; **Publication** has `id`,
-canonical `participantId`, `kind: MediaKind` (`audio`/`video`), and `label`.
-**MappingSnapshot** has `acceptedIntentRevision` (the accepted desired-state
-revision) and audio/video **TrackMapping** entries. Each entry pairs a
-`receiverIndex` (a reserved receiver slot) with a `publicationId`.
-Discovery does not imply receiver assignment, called Mapping.
-`tracks` is a publication-ID-keyed record of **RemoteTrack**, a union of
-**MappedRemoteVideoTrack / MappedRemoteAudioTrack** with `kind`, `publicationId`,
-canonical `participantId`, and native `media: MediaStreamTrack`. These are
-low-level observations, not stable logical handles. Snapshot containers are
-immutable/stable until observable changes; platform tracks are not frozen.
-:::
+`connected`, `reconnecting`, `retry-waiting:N`, `closing`, and `terminal-failure`.
+Do not infer admission from intent or intermediate transport progress.
 
 ### Errors
 
-**AgentError** has `class: FailureClass` and `message`. `AgentFailure` remains a deprecated type alias for compatibility. Classes:
-`initialization`, `invalid-configuration`, `authorization`, `protocol`,
-`transient`, `resource-expired`, `retry-exhausted`, `validation`, `runtime`.
-Use connection status and class together; not every failure is terminal or
-repairable by retry. [Troubleshooting](/react/troubleshooting) describes diagnosis.
+`AgentError` has `class` and `message`. Classes include initialization,
+invalid-configuration, authorization, protocol, transient, resource-expired,
+retry-exhausted, validation, and runtime. Use class and connection state together.
 
-**MediaCaptureError extends Error:** `code: MediaCaptureErrorCode`, message,
-optional `kind` and `cause`. Codes are `permission-denied`, `device-not-found`,
+`MediaCaptureError` has machine-readable `code`, message, and optional `kind`
+and `cause` where known. Codes: `permission-denied`, `device-not-found`,
 `device-busy`, `constraint-unsatisfied`, `request-cancelled`, `not-supported`,
-`unknown`. Inspect these with capture status, especially retained replacement.
+`unknown`. Diagnostic strings are not used to infer a more specific category.
 
-**LocalTrackCapacityError extends Error:** readonly `kind`, `label`, `capacity`;
-thrown synchronously when allocating a new label exceeds reserved local slots.
-Choose stable labels or a sufficient topology rather than repeatedly withdrawing
-and reallocating.
+`LocalTrackCapacityError` exposes `kind`, `label`, and `capacity`.
+`RelationshipOwnershipError` identifies duplicate committed publication ownership.
 
 ## Topics
 
-`topic<T>(name, {mode: "reliable" | "unreliable"}): Topic<T>` creates a cached
-facade. Names use 1 to 85 ASCII letters, digits, underscores, or hyphens.
-Invalid names/modes and lookup after close throw. Construction does not register
-interest. `publish(value): Promise<void>` registers publishing and encodes UTF-8
-JSON; serialization, size above 65,536 bytes, closed Agent, or send failure rejects.
-Publishing interest remains for the Agent lifetime once activated.
-`subscribe({signal?}): AsyncIterable<T>` owns independent bounded buffering.
-Abort, iterator return, or ending iteration releases interest; an already-aborted
-signal yields no values. Malformed incoming JSON rejects iteration.
+```tsx
+const Chat = agent.topic<{text: string}>("chat", {mode: "reliable"});
+// Render a consumer; call Chat.publish({text}) for a discrete send.
+<Chat onMessage={(value, {publisherId}) => accept(value, publisherId)} />;
+```
 
-| Facade mode | Internal `TopicMode` | Per-subscription queue |
-| --- | --- | --- |
-| `reliable` | `ordered` | At most 256 values; drops oldest on overflow |
-| `unreliable` | `latest` | New queued values replace old ones |
+The snippet's `accept` is an application callback. Names contain 1 to 85 ASCII
+letters, digits, underscores, or hyphens. Lookup caches identity but creates no
+publisher/subscriber interest. Generic T does not validate runtime data.
 
-Send admission is not delivery acknowledgment. Neither mode provides arbitrary
-channels, persistent history, exactly-once semantics, or guaranteed offline
-replay. Desired interest survives reconnection; messages are not durable. See [topic recovery](/react/guides#typed-topics).
+Each committed component owns an independent consumer. `onMessage(value,
+{publisherId})` carries actual publisher identity. Optional `onGap` receives core
+recovery-gap fields including publisher, stream, expected sequence, and available
+sequence. Optional `onError` receives `{code: "decode-failed", topic, cause}` or
+`{code: "channel-failed", event}` with structured core direction/mode attribution.
+Missing optional callbacks do not suppress diagnostics. Callback changes do not
+resubscribe and only committed callbacks run.
 
-::: details Topic status and events
-**TopicSnapshot** contains publishers/subscribers and counters for accepted
-and dropped sends, delivered messages, resynchronizations, channel failures.
-**TopicPublisherStatus** includes name/mode, connected, streamId/nextSequence,
-queued, sendPending. **TopicSubscriberStatus** includes name/mode, publisherId,
-connected, publisher count and buffered count. Use these for transport diagnostics,
-not application delivery confirmation.
+Invalid UTF-8/JSON terminates and releases the affected consumer; remount retries.
+Other owners remain independent. Core gaps/channel failures retain core recovery
+semantics rather than starting an application subscription loop.
 
-**AgentEvent** covers state-change, failure, topic-message (bytes and publisher;
-ordered messages also stream/sequence), topic-send-admitted (operation),
-topic-send-dropped, topic-recovery-gap, topic-resynchronized, and
-topic-channel-failed. **TopicDropReason** includes invalid-payload, not-registered,
-channel-unavailable, queue-full, superseded, host-rejected, channel-closed,
-transport-replaced, sequence-exhausted. Clean up event subscriptions explicitly.
-:::
-
-## Low-level Agent state
-
-Prefer logical handles and capture hooks. Open this only to manage complete
-Agent state or native slots yourself.
-
-:::: details Native state, slots, and sender configuration
-A slot is a sender or receiver position reserved by topology.
-
-::: warning Complete-state replacement
-Omitted collections in `setState` retract previous low-level values. Do not
-mix native slot ownership with logical source ownership for the same slot.
-:::
-
-- `setState(state: AgentState): void` replaces complete desired state.
-  `connected` is required. Omitted publication, video, audio-pinning, and topic
-  collections are empty and retract previous low-level values. Logical handle
-  publications and mounted presentation remain managed by the facade.
-- **PublicationIntent:** slot, label, active. Labels bind to slots on first use.
-- **VideoDemand:** receiver slot, height, minHeight, minFps, priority, optional
-  `FixedPlayoutDelay`, and either internal trackId or **TrackSelector**
-  (`participantExternalId`, label). Missing selectors remain desired until
-  discovered.
-- **AudioDemand:** pinned IDs, selected selectors, automatic selection flag,
-  per-track playoutDelays or selectorDelays. `automatic: false` opts out of
-  automatic selection, not playback of explicitly selected/pinned mapped audio.
-- **FixedPlayoutDelay:** mode `fixed`, minMs/maxMs. It belongs to an explicitly
-  requested track, not connection-wide automatic audio.
-- **TopicRegistration:** name, `TopicMode` (`latest`/`ordered`), optional publish,
-  subscribe, publisherId. `sendTopic(name, mode, Uint8Array): void` is lower-level
-  byte sending with event diagnostics, not a delivery acknowledgment.
-- `replaceLocalTrack(slot, MediaStreamTrack | null, SenderConfig): Promise<void>`
-  attaches/detaches caller-owned native tracks for reserved slots. Validate kind
-  and settings and catch rejection; detaching ignores sender settings. Replacement
-  and close never stop the borrowed original track. Do not race it with logical
-  source ownership for the same slot.
-- `setLocalMuted(slot, boolean): Promise<void>` controls the reserved sender;
-  catch runtime/validation failure. Prefer logical `setEnabled` for React capture.
-
-**SenderConfig** is **VideoSenderConfig | AudioSenderConfig**. Video contentHint
-is motion/detail/text; audio is speech/music. Optional degradationPreference is
-maintain-framerate/maintain-resolution/balanced. Omitted or empty encodings use
-runtime defaults (three video layers, one audio layer); explicit arrays contain
-exactly three or one **SenderEncoding** entries respectively.
-Encoding fields include required active, optional rid, scaleResolutionDownBy,
-maxBitrate, maxFramerate, scalabilityMode (L1T1/L1T2/L1T3), and dtx
-(enabled/disabled). Invalid kinds/configuration fail validation. These settings
-are not browser-independent codec guarantees.
-::::
+`Chat.publish(value): Promise<void>` works with no mounted consumers. It retains
+JSON serialization and the 65,536-byte UTF-8 payload limit. Publishing interest
+lasts for the Agent lifetime; the last unmounted consumer releases subscription
+interest without withdrawing publishing. Success means send admission, not delivery
+acknowledgment. Reliable means live ordered recovery, not durable history;
+unreliable retains latest-value/coalescing behavior. Core owns restoration,
+bounds, and retry policy.

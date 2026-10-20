@@ -19,7 +19,10 @@ type PlaybackCallback = (
   failure: PlaybackFailure,
   retry: () => Promise<void>,
 ) => void;
-type Demand = { height: number; visible: boolean };
+type Demand = { height: number; visible: boolean; options: ReceiveOptions };
+export interface RemoteVideoAttachment extends RemoteMediaAttachment {
+  setPreferences(options: ReceiveOptions): void;
+}
 const MAX_UINT32 = 0xffff_ffff;
 const videoOwners = new WeakMap<RemoteVideoTrack, VideoHandle>();
 
@@ -27,6 +30,17 @@ function uint32(value: number, field: string): number {
   if (!Number.isInteger(value) || value < 0 || value > MAX_UINT32)
     throw new TypeError(`${field} must be a finite uint32 integer`);
   return value;
+}
+
+export function validateReceiveOptions(
+  options: ReceiveOptions,
+): ReceiveOptions {
+  if (
+    options.playoutDelay &&
+    options.playoutDelay.minMs > options.playoutDelay.maxMs
+  )
+    throw new RangeError("latency minimum must not exceed maximum");
+  return receiveOptions(options);
 }
 
 function receiveOptions(options: ReceiveOptions): ReceiveOptions {
@@ -58,7 +72,7 @@ class VideoHandle implements RemoteVideoTrack {
   readonly consumers = new Map<symbol, Demand>();
   readonly bindingListeners = new Set<() => void>();
   readonly #listeners = new Set<() => void>();
-  options: ReceiveOptions = receiveOptions({});
+  options: ReceiveOptions = validateReceiveOptions({});
   constructor(
     readonly catalog: RemoteCatalog,
     readonly participantId: string,
@@ -87,11 +101,21 @@ class VideoHandle implements RemoteVideoTrack {
     this.options = next;
     this.catalog.recompute();
   }
-  consume(token: symbol, height: number, visible: boolean): void {
+  consume(
+    token: symbol,
+    height: number,
+    visible: boolean,
+    options: ReceiveOptions = {},
+  ): void {
     if (this.catalog.closed) return;
     const prior = this.consumers.get(token);
-    if (prior?.height === height && prior.visible === visible) return;
-    this.consumers.set(token, { height, visible });
+    if (
+      prior?.height === height &&
+      prior.visible === visible &&
+      JSON.stringify(prior.options) === JSON.stringify(options)
+    )
+      return;
+    this.consumers.set(token, { height, visible, options });
     this.catalog.recompute();
   }
   release(token: symbol): void {
@@ -102,6 +126,28 @@ class VideoHandle implements RemoteVideoTrack {
     this.consumers.clear();
     this.bindingListeners.clear();
     this.#listeners.clear();
+  }
+  get preferences(): ReceiveOptions {
+    const visible = [...this.consumers.values()]
+      .filter((consumer) => consumer.visible)
+      .map((consumer) => consumer.options);
+    const all = [this.options, ...visible];
+    const delays = all.flatMap((options) =>
+      options.playoutDelay ? [options.playoutDelay] : [],
+    );
+    return {
+      minHeight: Math.max(0, ...all.map((options) => options.minHeight ?? 0)),
+      minFps: Math.max(0, ...all.map((options) => options.minFps ?? 0)),
+      priority: Math.max(0, ...all.map((options) => options.priority ?? 0)),
+      ...(delays.length
+        ? {
+            playoutDelay: {
+              minMs: Math.min(...delays.map((delay) => delay.minMs)),
+              maxMs: Math.max(...delays.map((delay) => delay.maxMs)),
+            },
+          }
+        : {}),
+    };
   }
   get height(): number {
     return Math.max(
@@ -328,22 +374,25 @@ export class RemoteCatalog implements RemoteMedia {
     this.onChange(
       [...selected]
         .sort(([, a], [, b]) => a - b)
-        .map(([handle, slot]) => ({
-          slot,
-          trackId: handle.publicationId!,
-          height: uint32(handle.height, "height"),
-          minHeight: handle.options.minHeight ?? 0,
-          minFps: handle.options.minFps ?? 0,
-          priority: handle.options.priority ?? 0,
-          ...(handle.options.playoutDelay
-            ? {
-                playoutDelay: {
-                  mode: "fixed" as const,
-                  ...handle.options.playoutDelay,
-                },
-              }
-            : {}),
-        })),
+        .map(([handle, slot]) => {
+          const preferences = handle.preferences;
+          return {
+            slot,
+            trackId: handle.publicationId!,
+            height: uint32(handle.height, "height"),
+            minHeight: preferences.minHeight ?? 0,
+            minFps: preferences.minFps ?? 0,
+            priority: preferences.priority ?? 0,
+            ...(preferences.playoutDelay
+              ? {
+                  playoutDelay: {
+                    mode: "fixed" as const,
+                    ...preferences.playoutDelay,
+                  },
+                }
+              : {}),
+          };
+        }),
     );
   }
   close(): void {
@@ -368,13 +417,16 @@ export function attachRemoteVideo(
   source: RemoteVideoTrack,
   element: HTMLVideoElement,
   onPlaybackBlocked?: PlaybackCallback,
-  options: Pick<RemoteMediaAttachmentOptions, "autoPlay"> = {},
-): RemoteMediaAttachment {
+  options: Pick<RemoteMediaAttachmentOptions, "autoPlay"> & {
+    readonly preferences?: ReceiveOptions;
+  } = {},
+): RemoteVideoAttachment {
   const handle = videoOwners.get(source);
   if (!handle) throw new TypeError("invalid remote video source");
   if (handle.catalog.closed)
     return {
       setPublicationIds() {},
+      setPreferences() {},
       retryPlayback: async () => {},
       close() {},
     };
@@ -394,7 +446,7 @@ function visibleInTree(element: HTMLElement): boolean {
       style?.display === "none" ||
       style?.visibility === "hidden" ||
       style?.visibility === "collapse" ||
-      Number(style?.opacity ?? 1) === 0
+      Number(style?.opacity || "1") === 0
     )
       return false;
   }
@@ -405,8 +457,11 @@ function attachVideoHandle(
   handle: VideoHandle,
   element: HTMLVideoElement,
   onPlaybackBlocked: PlaybackCallback | undefined,
-  options: Pick<RemoteMediaAttachmentOptions, "autoPlay">,
-): RemoteMediaAttachment {
+  options: Pick<RemoteMediaAttachmentOptions, "autoPlay"> & {
+    readonly preferences?: ReceiveOptions;
+  },
+): RemoteVideoAttachment {
+  let preferences = validateReceiveOptions(options.preferences ?? {});
   const agent = handle.catalog.agent;
   const attachment = attachRemoteMedia(agent, element, {
     publicationIds: handle.publicationId ? [handle.publicationId] : [],
@@ -421,6 +476,7 @@ function attachVideoHandle(
     if (closed) return;
     const rect = element.getBoundingClientRect();
     const visible =
+      element.isConnected &&
       intersecting &&
       visibleInTree(element) &&
       rect.width > 0 &&
@@ -436,7 +492,7 @@ function attachVideoHandle(
           Math.ceil(rect.height * (viewport?.devicePixelRatio || 1)),
         )
       : 0;
-    handle.consume(token, height, visible);
+    handle.consume(token, height, visible, preferences);
   };
   let pixelRatioQuery: MediaQueryList | null = null;
   const onPixelRatioChange = () => {
@@ -464,11 +520,12 @@ function attachVideoHandle(
         });
   intersection?.observe(element);
   const mutation = new MutationObserver(sync);
-  for (let node: HTMLElement | null = element; node; node = node.parentElement)
-    mutation.observe(node, {
-      attributes: true,
-      attributeFilter: ["style", "class", "hidden"],
-    });
+  mutation.observe(element.ownerDocument.documentElement, {
+    attributes: true,
+    attributeFilter: ["style", "class", "hidden"],
+    childList: true,
+    subtree: true,
+  });
   const onResize = () => {
     watchPixelRatio();
     sync();
@@ -484,6 +541,11 @@ function attachVideoHandle(
   sync();
   return {
     setPublicationIds: (ids) => attachment.setPublicationIds(ids),
+    setPreferences: (next) => {
+      if (closed) return;
+      preferences = validateReceiveOptions(next);
+      sync();
+    },
     retryPlayback: () => attachment.retryPlayback(),
     close: () => {
       if (closed) return;

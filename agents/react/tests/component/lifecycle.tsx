@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { StrictMode, useEffect, useState } from "react";
+import { StrictMode, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
   Video,
@@ -11,7 +11,14 @@ import { captures, deferred, flush, stream } from "./platform.js";
 import { runtimes } from "./runtime.js";
 import { concurrentRender } from "./concurrency.js";
 
+import { captureLifecycle } from "./capture.js";
+import { relationships } from "./relationships.js";
+import { videoPreferences } from "./video.js";
+
 await concurrentRender();
+await captureLifecycle();
+await relationships();
+await videoPreferences();
 
 let agent: ReturnType<typeof useAgent>;
 let capture: ReturnType<typeof useUserMedia>;
@@ -19,6 +26,7 @@ let updateToken: () => void;
 let replaceSession: () => void;
 let playback: { retry(): Promise<void> } | undefined;
 let devicesReady = false;
+let setEnabled!: (enabled: boolean) => void;
 function Room() {
   const [token, setToken] = useState("first");
   const [endpoint, setEndpoint] = useState("http://localhost");
@@ -27,16 +35,15 @@ function Room() {
   devicesReady = useMediaDevices().state === "ready";
   updateToken = () => setToken("renewed");
   replaceSession = () => setEndpoint("http://localhost/replacement");
-  const camera = agent.local.video("camera");
-  useEffect(() => {
-    camera.setSource(capture.videoTrack);
-    return () => camera.setSource(null);
-  }, [camera, capture.videoTrack]);
+  const Camera = agent.local.video("camera");
+  const [enabled, updateEnabled] = useState(true);
+  setEnabled = updateEnabled;
   return (
     <section>
-      <output>{agent.getSnapshot().desiredRevision}</output>
+      <Camera source={capture.videoTrack} enabled={enabled} />
+      <output>{agent.connection}</output>
       <Video
-        source={camera}
+        source={Camera}
         mirror
         onPlaybackError={(failure) => {
           playback = failure;
@@ -78,11 +85,11 @@ assert.equal(element.muted, true);
 assert.match(element.style.transform, /scaleX\(-1\)/);
 const first = agent!;
 const runtime = runtimes.at(-1)!;
-await flush(() => runtime.emit({ desiredRevision: 17 }));
+await flush(() => runtime.emit({ connection: "connected" }));
 assert.equal(
   host.querySelector("output")!.textContent,
-  "17",
-  "snapshot subscription renders",
+  "connected",
+  "reactive state renders",
 );
 await flush(updateToken!);
 assert.equal(agent!, first, "token renewal does not replace session");
@@ -94,7 +101,7 @@ HTMLMediaElement.prototype.play = async () => {
   throw new DOMException("blocked", "NotAllowedError");
 };
 await flush(() => {
-  agent!.local.video("camera").setEnabled(false);
+  setEnabled(false);
 });
 assert.equal(
   element.srcObject,
@@ -103,7 +110,7 @@ assert.equal(
 );
 assert.equal(owned.getVideoTracks()[0].readyState, "live");
 await flush(() => {
-  agent!.local.video("camera").setEnabled(true);
+  setEnabled(true);
 });
 assert.ok(playback, "playback rejection reaches production callback");
 HTMLMediaElement.prototype.play = async () => {
@@ -127,7 +134,7 @@ assert.equal(
   "runtime does not own caller capture",
 );
 await flush(() => completion.resolve());
-assert.equal(first.getSnapshot().connection, "disconnected");
+assert.equal(first.connection, "disconnected");
 
 let older: Promise<unknown>;
 let newer: Promise<void>;
@@ -158,8 +165,12 @@ await flush(() => {
 });
 const late = stream();
 await flush(() => root.unmount());
+assert.equal(
+  (await cancelled!).code,
+  "request-cancelled",
+  "unmount settles pending actions before the platform completes",
+);
 await flush(() => captures.at(-1)!.resolve(late));
-assert.equal((await cancelled!).code, "request-cancelled");
 assert.ok(
   [...owned.getTracks(), ...fresh.getTracks(), ...late.getTracks()].every(
     (track) => track.readyState === "ended",

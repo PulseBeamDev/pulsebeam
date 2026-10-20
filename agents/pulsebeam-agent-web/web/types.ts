@@ -225,6 +225,32 @@ export interface RemoteMedia {
   resumeAudio(): Promise<void>;
 }
 
+export type TopicGap = Extract<
+  AgentEvent,
+  { readonly type: "topic-recovery-gap" }
+>;
+export type TopicConsumerError =
+  | {
+      readonly code: "decode-failed";
+      readonly topic: string;
+      readonly cause: unknown;
+    }
+  | {
+      readonly code: "channel-failed";
+      readonly event: Extract<
+        AgentEvent,
+        { readonly type: "topic-channel-failed" }
+      >;
+    };
+export interface TopicCallbacks<T> {
+  readonly onMessage: (
+    value: T,
+    metadata: { readonly publisherId: string },
+  ) => void;
+  readonly onGap?: (gap: TopicGap) => void;
+  readonly onError?: (error: TopicConsumerError) => void;
+}
+
 export interface Topic<T> {
   publish(value: T): Promise<void>;
   subscribe(options?: { readonly signal?: AbortSignal }): AsyncIterable<T>;

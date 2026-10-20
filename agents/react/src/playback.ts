@@ -7,13 +7,19 @@ import {
 } from "react";
 import type * as React from "react";
 import { useCommittedRef } from "./committed-ref.js";
+import { localVideoView, type LocalVideo } from "./relationships.js";
+import {
+  remoteVideoSource,
+  type RemoteVideoTrack as ReactRemoteVideoTrack,
+} from "./remote.js";
 import {
   attachRemoteVideo,
   nativeCaptureTrack,
+  validateReceiveOptions,
+  type RemoteVideoAttachment,
+  type ReceiveOptions,
   type CapturedVideoTrack,
-  type LocalVideoTrack,
   type PlaybackFailure,
-  type RemoteVideoTrack,
 } from "@pulsebeam/web";
 
 export interface PlaybackError {
@@ -23,15 +29,24 @@ export interface PlaybackError {
 
 type PlaybackErrorCallback = (failure: PlaybackError) => void;
 
+export interface VideoPreferences {
+  readonly minHeight?: number;
+  readonly minFps?: number;
+  readonly priority?: number;
+  /** Removing fixed bounds may remap media or recover the transport before defaults can apply. */
+  readonly latency?: { readonly minMs: number; readonly maxMs: number };
+}
+
 export type VideoProps = Omit<
   React.VideoHTMLAttributes<HTMLVideoElement>,
   "src" | "children"
 > & {
   readonly source:
     | CapturedVideoTrack
-    | LocalVideoTrack
-    | RemoteVideoTrack
+    | LocalVideo
+    | ReactRemoteVideoTrack
     | null;
+  readonly preferences?: VideoPreferences;
   readonly mirror?: boolean;
   readonly onPlaybackError?: PlaybackErrorCallback;
 };
@@ -45,14 +60,15 @@ function report(
 }
 
 function isRemote(
-  source: CapturedVideoTrack | LocalVideoTrack | RemoteVideoTrack | null,
-): source is RemoteVideoTrack {
-  return source !== null && "setReceiveOptions" in source;
+  source: VideoProps["source"],
+): source is ReactRemoteVideoTrack {
+  return source !== null && "participantId" in source;
 }
 
 export function Video({
   source,
   mirror = false,
+  preferences,
   onPlaybackError,
   muted = true,
   autoPlay = true,
@@ -63,7 +79,16 @@ export function Video({
   const element = useRef<HTMLVideoElement>(null);
   const callback = useCommittedRef(onPlaybackError);
   const remote = isRemote(source) ? source : null;
-  const local = source && "source" in source ? source : null;
+  const local = localVideoView(source);
+  const attachment = useRef<RemoteVideoAttachment | null>(null);
+  const receive: ReceiveOptions = validateReceiveOptions({
+    minHeight: preferences?.minHeight,
+    minFps: preferences?.minFps,
+    priority: preferences?.priority,
+    ...(preferences?.latency ? { playoutDelay: preferences.latency } : {}),
+  });
+  const receiveKey = JSON.stringify(receive);
+  const committedReceive = useCommittedRef(receive);
   const captured =
     source && !remote && !local ? (source as CapturedVideoTrack) : null;
   const subscribeLocal = useCallback(
@@ -79,14 +104,22 @@ export function Video({
   useEffect(() => {
     const current = element.current;
     if (!current || !remote) return;
-    const attachment = attachRemoteVideo(
-      remote,
+    const active = attachRemoteVideo(
+      remoteVideoSource(remote),
       current,
       (failure, retry) => report(callback.current, failure, retry),
-      { autoPlay },
+      { autoPlay, preferences: committedReceive.current },
     );
-    return () => attachment.close();
+    attachment.current = active;
+    return () => {
+      active.close();
+      if (attachment.current === active) attachment.current = null;
+    };
   }, [remote, autoPlay]);
+
+  useEffect(() => {
+    attachment.current?.setPreferences(committedReceive.current);
+  }, [receiveKey]);
 
   useEffect(() => {
     const current = element.current;

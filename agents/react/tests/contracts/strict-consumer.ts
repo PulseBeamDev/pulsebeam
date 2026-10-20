@@ -1,5 +1,4 @@
 import {
-  createAgent,
   useAgent,
   useDisplayMedia,
   useMediaDevices,
@@ -7,24 +6,23 @@ import {
   Video,
   type Agent,
   type AgentConfig,
-  type AgentError,
-  type ConnectionState,
-  type CapturedVideoTrack,
-  type LocalTrackCapacityError,
-  type MediaCaptureError,
-  type RemoteVideoTrack,
-  type RemoteAudioTrack,
+  type CameraDevice,
+  type MicrophoneDevice,
+  type SpeakerDevice,
 } from "@pulsebeam/react";
-import type { ReactElement } from "react";
+import { createAgent } from "@pulsebeam/web";
+import { createElement } from "react";
 
-// @ts-expect-error Provider-based ownership was removed.
+// @ts-expect-error React owns Agents only through useAgent.
+import { createAgent as createReactAgent } from "@pulsebeam/react";
+// @ts-expect-error Managed lifecycle is not public Web API.
+import { createManagedAgent } from "@pulsebeam/web";
+// @ts-expect-error Managed lifecycle types are not public Web API.
+import type { ManagedAgent } from "@pulsebeam/web";
+// @ts-expect-error No provider hierarchy.
 import { AgentProvider } from "@pulsebeam/react";
-// @ts-expect-error Raw attachment hooks were replaced by source components.
-import { useRemoteMedia } from "@pulsebeam/react";
-// @ts-expect-error Provider snapshot adapters were removed.
-import type { UseAgentResult } from "@pulsebeam/react";
-// @ts-expect-error Raw attachment hook results were removed.
-import type { UseRemoteMediaResult } from "@pulsebeam/react";
+// @ts-expect-error No alternate Web construction spelling.
+import { createWebAgent } from "@pulsebeam/web";
 
 const config: AgentConfig = {
   endpoint: "https://pulsebeam.example",
@@ -37,59 +35,98 @@ const config: AgentConfig = {
   },
   logging: { level: "info" },
 };
-const minimal: AgentConfig = {
-  endpoint: "https://pulsebeam.example",
-  token: "opaque-token",
-};
-const defaultAgent: Agent = createAgent(minimal);
-const defaultOwned: Agent = useAgent(minimal);
-void [defaultAgent, defaultOwned];
-const agent: Agent = createAgent(config);
 const owned: Agent = useAgent(config);
-const connection: ConnectionState = owned.connection;
-const agentError: AgentError | null = owned.error;
-void [connection, agentError];
-// @ts-expect-error Each useAgent must have its own construction config.
+const direct = createAgent(config);
+direct.setState({ connected: true });
+direct.close();
+// @ts-expect-error Required ownership configuration.
 useAgent();
-const camera = useUserMedia({ video: { width: 1280 }, audio: false });
-const screen = useDisplayMedia({ video: true, audio: false });
 const devices = useMediaDevices();
-owned.connect();
-const handle = owned.local.video("camera");
-handle.setSource(camera.videoTrack);
-const source: CapturedVideoTrack | null = handle.source;
-// @ts-expect-error An audio capture cannot be bound to a video handle.
-handle.setSource(camera.audioTrack);
-owned.disconnect();
-void source;
-void screen.request();
-const firstCameraId: string | undefined = devices.cameras[0]?.id;
-declare const captureFailure: MediaCaptureError;
-declare const exhausted: LocalTrackCapacityError;
-const failureCode: string = captureFailure.code;
-const capacity: number = exhausted.capacity;
-void [firstCameraId, failureCode, capacity];
-const available: readonly RemoteVideoTrack[] = agent.remote.videoTracks;
-const mainAudio: RemoteAudioTrack = agent.remote
+const cameraDevice: CameraDevice | undefined = devices.cameras[0];
+const microphone: MicrophoneDevice | undefined = devices.microphones[0];
+const speaker: SpeakerDevice | undefined = devices.speakers[0];
+const camera = useUserMedia({
+  video: {
+    device: cameraDevice,
+    preferences: { width: 1280, height: 720, frameRate: 30 },
+  },
+  audio: { device: microphone, preferences: { echoCancellation: true } },
+});
+useUserMedia({ video: true, audio: true });
+useDisplayMedia({ video: { preferences: { height: 1080 } }, audio: true });
+// @ts-expect-error Browser constraints are not portable options.
+useUserMedia({ video: { width: { exact: 1280 } }, audio: false });
+// @ts-expect-error Device kinds are distinct.
+useUserMedia({ video: { device: microphone }, audio: false });
+// @ts-expect-error Speakers are inventory, not capture devices.
+useUserMedia({ video: false, audio: { device: speaker } });
+// @ts-expect-error Display chooser, not exact device selection.
+useDisplayMedia({ video: { device: cameraDevice }, audio: false });
+const Camera = owned.local.video("camera");
+const Microphone = owned.local.audio("microphone");
+createElement(Camera, {
+  source: camera.videoTrack,
+  enabled: false,
+  preferences: { content: "detail", degradation: "balanced" },
+});
+createElement(Microphone, {
+  source: camera.audioTrack,
+  preferences: { content: "music" },
+});
+// @ts-expect-error Audio source cannot bind video publication.
+createElement(Camera, { source: camera.audioTrack });
+// @ts-expect-error No normal imperative publication setter.
+Camera.setSource(camera.videoTrack);
+// @ts-expect-error No competing normal desired-state API.
+owned.setState({ connected: true });
+// @ts-expect-error React owns release.
+owned.close();
+// @ts-expect-error No low-level normal observation.
+owned.getSnapshot();
+// @ts-expect-error No advanced API.
+owned.advanced;
+const Chat = owned.topic<{ text: string }>("chat", { mode: "reliable" });
+createElement(Chat, {
+  onMessage: (value, { publisherId }) => {
+    const text: string = value.text;
+    void [text, publisherId];
+  },
+  onError: (error) => {
+    const code: "decode-failed" | "channel-failed" = error.code;
+    void code;
+  },
+  onGap: (gap) => {
+    const sequence: number = gap.expectedSequence;
+    void sequence;
+  },
+});
+void Chat.publish({ text: "hello" });
+// @ts-expect-error No application subscription loop.
+Chat.subscribe();
+const remote = owned.remote.participant("alice").video("camera");
+// @ts-expect-error Presentation owns receive preferences.
+remote.setReceiveOptions({});
+Video({
+  source: remote,
+  preferences: {
+    minHeight: 360,
+    minFps: 15,
+    priority: 1,
+    latency: { minMs: 0, maxMs: 100 },
+  },
+});
+Video({ source: Camera });
+Video({ source: camera.videoTrack });
+owned.remote
   .participant("alice")
-  .audio("microphone");
-const receiving: boolean = mainAudio.receiving;
-mainAudio.readWaveform(new Float32Array(2048));
-mainAudio.readSpectrum(new Float32Array(1024));
-mainAudio.subscribe(() => {});
-const remoteView: ReactElement | null = Video({
-  source: available[0] ?? null,
-  mirror: true,
-});
-const localView: ReactElement | null = Video({
-  source: agent.local.video("camera"),
-});
-// @ts-expect-error Audio playback components were removed.
-import { Audio } from "@pulsebeam/react";
-// @ts-expect-error Aggregate playback sources were removed.
-agent.remoteAudio;
-const messages = agent
-  .topic<{ text: string }>("chat", { mode: "reliable" })
-  .subscribe();
-void [remoteView, localView, receiving, messages];
-agent.close();
+  .audio("microphone")
+  .readWaveform(new Float32Array(2048));
+const actualWidth: number | undefined = camera.video?.settings.width;
+void [
+  camera.video?.device,
+  actualWidth,
+  camera.audio?.settings.echoCancellation,
+];
+owned.connect();
+owned.disconnect();
+owned.reconnect();

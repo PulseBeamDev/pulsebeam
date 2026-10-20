@@ -17,6 +17,13 @@ import {
   type RemoteAudioTrack,
 } from "../../web/index.js";
 
+// @ts-expect-error Managed activation is internal, not public construction.
+import { createManagedAgent } from "../../web/index.js";
+// @ts-expect-error Managed lifecycle types are not public.
+import type { ManagedAgent } from "../../web/index.js";
+// @ts-expect-error There is one direct constructor spelling.
+import { createWebAgent } from "../../web/index.js";
+
 declare const audioTrack: MediaStreamTrack;
 declare const audioElement: HTMLAudioElement;
 const agent = createAgent({

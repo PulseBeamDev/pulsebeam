@@ -26,7 +26,7 @@ export async function concurrentRender() {
   }
   function Probe({ speculative }: { speculative: boolean }) {
     const capture = useUserMedia({
-      video: { width: speculative ? 1280 : 640 },
+      video: { preferences: { width: speculative ? 1280 : 640 } },
       audio: false,
     });
     useLayoutEffect(() => {

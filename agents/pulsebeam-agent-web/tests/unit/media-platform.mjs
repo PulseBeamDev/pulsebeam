@@ -34,6 +34,7 @@ export const document = Object.assign(new EventTarget(), {
   defaultView: viewport,
 });
 export class Video {
+  isConnected = true;
   srcObject = null;
   parentElement = null;
   ownerDocument = document;

@@ -111,6 +111,7 @@ pub(crate) enum PublicCommand {
     ReplaceDesired(DesiredState),
     RenewAuthorization(String),
     SetConnected(bool),
+    Reconnect,
     SetLogLevel(agent_core::LogLevel),
 }
 
@@ -126,6 +127,7 @@ impl fmt::Debug for PublicCommand {
                 .debug_tuple("SetConnected")
                 .field(connected)
                 .finish(),
+            Self::Reconnect => formatter.write_str("Reconnect"),
             Self::SetLogLevel(level) => formatter.debug_tuple("SetLogLevel").field(level).finish(),
         }
     }
@@ -372,6 +374,7 @@ impl<H: Host> Actor<H> {
                     self.turn(Input::Command(AgentCommand::RenewAuthorization(token)));
                 }
                 PublicCommand::SetConnected(connected) => self.set_connected(connected),
+                PublicCommand::Reconnect => self.turn(Input::Command(AgentCommand::Reconnect)),
                 PublicCommand::SetLogLevel(level) => self.driver.set_log_level(level),
             },
             Message::Topic(topic) => match topic {

@@ -1449,10 +1449,51 @@ fn rejected_reconnect_is_terminal_without_a_legacy_fallback() {
             })
         )
     }));
+    let failure = agent.snapshot().terminal_failure.clone();
+    let mut changed = desired(2);
+    changed.video[0].height = 720;
+    changed
+        .topics
+        .publishers
+        .push(publisher("chat", TopicMode::Ordered));
+    agent
+        .command(AgentCommand::ReplaceDesired(changed))
+        .unwrap();
+    agent
+        .command(AgentCommand::RenewAuthorization("renewed".to_owned()))
+        .unwrap();
+    for event in [
+        RtcEvent::Disconnected {
+            generation: old_generation,
+        },
+        RtcEvent::Failed {
+            generation: old_generation,
+            message: "late RTC failure".to_owned(),
+        },
+        RtcEvent::Connected {
+            generation: replacement_generation,
+        },
+    ] {
+        agent.handle(HostEvent::Rtc(event)).unwrap();
+    }
+    assert_eq!(agent.snapshot().terminal_failure, failure);
+    assert_eq!(
+        agent.snapshot().connection,
+        ConnectionState::TerminalFailure
+    );
+    assert!(
+        agent.next_effect().is_none(),
+        "incidental work and late RTC events cannot create or schedule a retry"
+    );
+    agent.command(AgentCommand::Reconnect).unwrap();
+    assert!(matches!(
+        next_effect(&mut agent),
+        Effect::Rtc(RtcEffect::CreateOffer { .. })
+    ));
 }
 
 #[test]
-fn authorization_is_terminal_for_one_revision_and_a_new_revision_retries() {
+fn authorization_is_latched_across_incidental_updates_until_explicit_reconnect() {
     let mut agent = Agent::new(config()).unwrap();
     let (failed_generation, operation) = begin_connect(&mut agent, desired(1), channel(12));
     agent
@@ -1488,6 +1529,30 @@ fn authorization_is_terminal_for_one_revision_and_a_new_revision_retries() {
     let mut retry = desired(2);
     retry.video[0].height = 360;
     agent.command(AgentCommand::ReplaceDesired(retry)).unwrap();
+    agent
+        .command(AgentCommand::RenewAuthorization("new-token".to_owned()))
+        .unwrap();
+    agent.set_log_level(LogLevel::Debug);
+    agent
+        .handle(HostEvent::Rtc(RtcEvent::Connected {
+            generation: failed_generation,
+        }))
+        .unwrap();
+    agent
+        .handle(HostEvent::Rtc(RtcEvent::Disconnected {
+            generation: failed_generation,
+        }))
+        .unwrap();
+    assert!(agent.next_effect().is_none());
+    assert_eq!(
+        agent.snapshot().connection,
+        ConnectionState::TerminalFailure
+    );
+    assert_eq!(
+        agent.snapshot().terminal_failure.as_ref().unwrap().class,
+        FailureClass::Authorization
+    );
+    agent.command(AgentCommand::Reconnect).unwrap();
     assert!(matches!(
         next_effect(&mut agent),
         Effect::Rtc(RtcEffect::CreateOffer { generation, .. })
@@ -2068,9 +2133,43 @@ fn catalog_selectors_remain_unresolved_then_follow_canonical_track_changes() {
 }
 
 #[test]
-fn malformed_signaling_is_transactional() {
+fn malformed_signaling_is_transactional_and_fences_an_in_flight_replacement() {
     let (mut agent, generation, cid, send) = connected_agent();
     acknowledge_send(&mut agent, generation, cid, send);
+    let mut changed = desired(2);
+    changed
+        .topics
+        .publishers
+        .push(publisher("chat", TopicMode::Ordered));
+    agent
+        .command(AgentCommand::ReplaceDesired(changed))
+        .unwrap();
+    let (replacement, topic_label) = match next_effect(&mut agent) {
+        Effect::Rtc(RtcEffect::CreateOffer {
+            generation,
+            data_channels,
+            ..
+        }) => (generation, data_channels[1].label.clone()),
+        effect => panic!("expected replacement offer, got {effect:?}"),
+    };
+    let mut replacement_resources = resources(channel(13));
+    replacement_resources
+        .data_channels
+        .push(DataChannelBinding {
+            label: topic_label,
+            channel: channel(14),
+        });
+    agent
+        .handle(HostEvent::Rtc(RtcEvent::OfferCreated {
+            generation: replacement,
+            offer: offer(),
+            resources: replacement_resources,
+        }))
+        .unwrap();
+    let operation = match next_effect(&mut agent) {
+        Effect::Http(HttpEffect::Request { operation, .. }) => operation,
+        effect => panic!("expected replacement request, got {effect:?}"),
+    };
     let before = agent.snapshot().clone();
     let malformed = v1::Catalog {
         revision: 1,
@@ -2113,6 +2212,49 @@ fn malformed_signaling_is_transactional() {
             .map(|failure| &failure.class),
         Some(&FailureClass::Protocol)
     );
+    let failure = agent.snapshot().terminal_failure.clone();
+    assert_eq!(
+        next_effect(&mut agent),
+        Effect::Rtc(RtcEffect::Close {
+            generation: replacement
+        })
+    );
+    assert_eq!(
+        next_effect(&mut agent),
+        Effect::Http(HttpEffect::Cancel { operation })
+    );
+    agent
+        .handle(HostEvent::Http(HttpEvent::Response {
+            operation,
+            response: update_response("p1"),
+        }))
+        .unwrap();
+    for event in [
+        RtcEvent::Connected {
+            generation: replacement,
+        },
+        RtcEvent::AnswerApplied {
+            generation: replacement,
+        },
+    ] {
+        agent.handle(HostEvent::Rtc(event)).unwrap();
+    }
+    assert_eq!(
+        agent.snapshot().connection,
+        ConnectionState::TerminalFailure
+    );
+    assert_eq!(agent.snapshot().terminal_failure, failure);
+    while let Some(effect) = agent.next_effect() {
+        assert!(
+            matches!(&effect, Effect::Http(HttpEffect::Request {request, ..}) if request.method == HttpMethod::Delete),
+            "late completions can only clean orphaned resources, not activate or retry: {effect:?}"
+        );
+    }
+    agent.command(AgentCommand::Reconnect).unwrap();
+    assert!(matches!(
+        next_effect(&mut agent),
+        Effect::Rtc(RtcEffect::CreateOffer { .. })
+    ));
 }
 
 #[test]

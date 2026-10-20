@@ -1,9 +1,8 @@
 export {
   createAgent,
-  createManagedAgent,
   LocalTrackCapacityError,
+  RelationshipOwnershipError,
 } from "./agent.js";
-export type { ManagedAgent } from "./agent.js";
 export { createCaptureSource, nativeCaptureTrack } from "./capture-source.js";
 export type {
   CapturedAudioTrack,
@@ -11,7 +10,8 @@ export type {
   CapturedVideoTrack,
 } from "./capture-source.js";
 export { attachRemoteMedia } from "./remote-media.js";
-export { attachRemoteVideo } from "./remote-catalog.js";
+export { attachRemoteVideo, validateReceiveOptions } from "./remote-catalog.js";
+export type { RemoteVideoAttachment } from "./remote-catalog.js";
 export type {
   Agent,
   AgentConfig,
@@ -51,6 +51,9 @@ export type {
   SenderConfig,
   SenderEncoding,
   TopicDropReason,
+  TopicCallbacks,
+  TopicGap,
+  TopicConsumerError,
   TopicMode,
   TopicPublisherStatus,
   TopicRegistration,

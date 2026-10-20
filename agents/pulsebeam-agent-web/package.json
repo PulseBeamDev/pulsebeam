@@ -21,6 +21,10 @@
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
+    },
+    "./internal/react": {
+      "types": "./dist/internal/react.d.ts",
+      "import": "./dist/internal/react.js"
     }
   },
   "scripts": {

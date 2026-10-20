@@ -12,16 +12,20 @@ function useMeetCapture() {
   const [audioDeviceId, setAudioDeviceId] = useState("");
   const capture = useUserMedia({
     video: {
-      deviceId: videoDeviceId ? { exact: videoDeviceId } : undefined,
-      width: { ideal: 1280 },
-      height: { ideal: 720 },
-      frameRate: { ideal: 30 },
+      device: videoDeviceId
+        ? { kind: "camera", id: videoDeviceId, label: "" }
+        : undefined,
+      preferences: { width: 1280, height: 720, frameRate: 30 },
     },
     audio: {
-      deviceId: audioDeviceId ? { exact: audioDeviceId } : undefined,
-      echoCancellation: true,
-      noiseSuppression: true,
-      autoGainControl: true,
+      device: audioDeviceId
+        ? { kind: "microphone", id: audioDeviceId, label: "" }
+        : undefined,
+      preferences: {
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+      },
     },
   });
   const devices = useMediaDevices();

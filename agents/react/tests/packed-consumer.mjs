@@ -29,9 +29,24 @@ writeFileSync(
   'export * from "@pulsebeam/react";',
 );
 const sdk = await import(pathToFileURL(join(directory, "consumer.mjs")));
-for (const name of ["createAgent", "useAgent", "useUserMedia", "Video"]) {
+for (const name of ["useAgent", "useUserMedia", "Video"]) {
   assert.equal(typeof sdk[name], "function", name);
 }
+assert.equal(
+  "createAgent" in sdk,
+  false,
+  "React has only hook-owned Agent construction",
+);
+const web = await import(
+  pathToFileURL(join(directory, "node_modules/@pulsebeam/web/dist/index.js"))
+);
+assert.equal(typeof web.createAgent, "function");
+assert.equal(
+  "createManagedAgent" in web,
+  false,
+  "managed lifecycle is not a public entrypoint",
+);
+assert.equal("createWebAgent" in web, false);
 const wasm = readFileSync(
   join(
     directory,

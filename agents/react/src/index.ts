@@ -1,14 +1,19 @@
 import { useEffect, useState, useSyncExternalStore } from "react";
 import { sessionKey } from "./session-key.js";
-import {
-  createManagedAgent,
-  type Agent,
-  type AgentConfig,
-} from "@pulsebeam/web";
+import { createReactAgent, type Agent } from "./relationships.js";
+import type { AgentConfig } from "@pulsebeam/web";
+import { createManagedAgent } from "@pulsebeam/web/internal/react";
 
-export { createAgent, LocalTrackCapacityError } from "@pulsebeam/web";
+export {
+  LocalTrackCapacityError,
+  RelationshipOwnershipError,
+} from "@pulsebeam/web";
 export { Video } from "./playback.js";
-export type { VideoProps, PlaybackError } from "./playback.js";
+export type {
+  VideoProps,
+  VideoPreferences,
+  PlaybackError,
+} from "./playback.js";
 export {
   useMediaDevices,
   useUserMedia,
@@ -19,94 +24,77 @@ export type {
   CaptureResult,
   DisplayMediaOptions,
   MediaCaptureErrorCode,
-  MediaDevice,
+  CameraDevice,
+  MicrophoneDevice,
+  SpeakerDevice,
+  VideoCaptureOptions,
+  AudioCaptureOptions,
+  VideoCapturePreferences,
+  AudioCapturePreferences,
+  CapturedVideo,
+  CapturedAudio,
   MediaDevicesResult,
   UserMediaOptions,
 } from "./capture.js";
 export type {
   Agent,
-  AgentConfig,
-  AgentError,
-  AgentEvent,
-  AgentFailure,
-  AgentLogging,
-  AgentSnapshot,
-  AgentState,
-  AudioDemand,
-  CatalogSnapshot,
-  AudioSenderConfig,
-  ConnectionState,
-  FailureClass,
-  FixedPlayoutDelay,
-  MediaKind,
-  MappingSnapshot,
-  MappedRemoteAudioTrack,
-  MappedRemoteVideoTrack,
-  MediaTopology,
-  LogLevel,
-  LocalAudioTrack,
-  LocalVideoTrack,
-  CapturedAudioTrack,
-  CapturedVideoTrack,
-  Participant,
-  Publication,
-  PublicationIntent,
-  LocalMedia,
+  LocalVideo,
+  LocalAudio,
+  Topic,
   RemoteMedia,
   RemoteParticipant,
-  RemoteAudioTrack,
-  ReceiveOptions,
-  RemoteTrack,
   RemoteVideoTrack,
-  SenderConfig,
-  SenderEncoding,
-  TopicDropReason,
-  TopicMode,
-  TopicPublisherStatus,
-  TopicRegistration,
-  TopicSnapshot,
-  TopicSubscriberStatus,
-  Topic,
-  TrackMapping,
-  TrackSelector,
-  VideoDemand,
-  VideoSenderConfig,
+  VideoPublicationProps,
+  AudioPublicationProps,
+  VideoPublicationPreferences,
+  AudioPublicationPreferences,
+} from "./relationships.js";
+export type {
+  AgentConfig,
+  AgentError,
+  AgentFailure,
+  AgentLogging,
+  ConnectionState,
+  FailureClass,
+  MediaKind,
+  MediaTopology,
+  LogLevel,
+  CapturedAudioTrack,
+  CapturedVideoTrack,
+  RemoteAudioTrack,
+  TopicCallbacks,
+  TopicConsumerError,
+  TopicGap,
 } from "@pulsebeam/web";
 
-/**
- * One React-owned Agent handle per endpoint/topology configuration.
- * Construction is inert during render; effects activate the runtime after commit.
- * Use a React key when the room or participant changes.
- */
+/** React owns activation and release. Key the component for a different logical participant. */
 export function useAgent(config: AgentConfig): Agent {
   const key = sessionKey(config);
-
-  const [owned, setOwned] = useState(() => ({
-    key,
-    agent: createManagedAgent(config),
-  }));
-  // A changed immutable configuration creates a new inert handle. React retries
-  // this render before committing children, avoiding a stale-session render.
+  const create = () => {
+    const managed = createManagedAgent(config);
+    return { key, managed, facade: createReactAgent(managed) };
+  };
+  const [owned, setOwned] = useState(create);
   let current = owned;
   if (owned.key !== key) {
-    current = { key, agent: createManagedAgent(config) };
+    current = create();
     setOwned(current);
   }
-  const agent = current.agent;
-
+  const { managed, facade } = current;
   useEffect(() => {
-    agent.activate();
-    return () => agent.deactivate();
-  }, [agent]);
-
+    managed.activate();
+    return () => managed.deactivate();
+  }, [managed]);
   useEffect(() => {
-    agent.renewAuthorization(config.token);
-  }, [agent, config.token]);
-
+    managed.renewAuthorization(config.token);
+  }, [managed, config.token]);
   useEffect(() => {
-    agent.setLogging(config.logging?.level ?? "warn");
-  }, [agent, config.logging?.level]);
-
-  useSyncExternalStore(agent.subscribe, agent.getSnapshot, agent.getSnapshot);
-  return agent;
+    managed.setLogging(config.logging?.level ?? "warn");
+  }, [managed, config.logging?.level]);
+  useSyncExternalStore(
+    managed.subscribe,
+    managed.getSnapshot,
+    managed.getSnapshot,
+  );
+  return facade;
 }

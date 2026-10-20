@@ -1,12 +1,9 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useState } from "react";
 import { useDisplayMedia } from "@pulsebeam/react";
-import type { Agent, CaptureResult } from "@pulsebeam/react";
-
-export type MediaSources = Pick<CaptureResult, "videoTrack" | "audioTrack">;
+import type { Agent } from "@pulsebeam/react";
 
 export function useRoomMedia(
   agent: Agent,
-  sources: MediaSources,
   onFailure: (message: string) => void,
   initial: { cameraOn: boolean; micOn: boolean },
 ) {
@@ -16,43 +13,15 @@ export function useRoomMedia(
     request: requestDisplay,
   } = useDisplayMedia({
     video: {
-      width: { ideal: 1920 },
-      height: { ideal: 1080 },
-      frameRate: { ideal: 30 },
-      displaySurface: "monitor",
+      preferences: { width: 1920, height: 1080, frameRate: 30 },
     },
     audio: false,
   });
   const [cameraOn, setCameraOn] = useState(initial.cameraOn);
   const [micOn, setMicOn] = useState(initial.micOn);
-  const camera = agent.local.video("camera");
-  const microphone = agent.local.audio("microphone");
-  const screen = agent.local.video("screen");
-
-  useEffect(() => {
-    camera.setEnabled(cameraOn);
-  }, [camera, cameraOn]);
-  useEffect(() => {
-    camera.setSource(sources.videoTrack);
-  }, [camera, sources.videoTrack]);
-  useEffect(() => {
-    microphone.setEnabled(micOn);
-  }, [microphone, micOn]);
-  useEffect(() => {
-    microphone.setSource(sources.audioTrack);
-  }, [microphone, sources.audioTrack]);
-  useEffect(() => {
-    screen.setSource(displayTrack);
-  }, [screen, displayTrack]);
-  useEffect(
-    () => () => {
-      for (const handle of [screen, camera, microphone]) {
-        if (handle.source !== null) handle.setSource(null);
-      }
-      stopDisplay();
-    },
-    [camera, stopDisplay, microphone, screen],
-  );
+  const Camera = agent.local.video("camera");
+  const Microphone = agent.local.audio("microphone");
+  const Screen = agent.local.video("screen");
 
   const startShare = useCallback(async () => {
     try {
@@ -67,7 +36,9 @@ export function useRoomMedia(
   }, [requestDisplay, onFailure]);
   return {
     screen: displayTrack,
-    camera,
+    Camera,
+    Microphone,
+    Screen,
     cameraOn,
     micOn,
     detachScreen: stopDisplay,

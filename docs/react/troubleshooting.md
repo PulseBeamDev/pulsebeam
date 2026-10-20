@@ -23,9 +23,9 @@ Read `capture.error?.code` and catch `capture.request()` rejection.
 | Code or symptom | Try this |
 | --- | --- |
 | `permission-denied` | Allow browser/site and OS access; use HTTPS/localhost. Check iframe permissions. |
-| `device-not-found` | Choose an available device or remove a stale exact constraint. |
+| `device-not-found` | Choose an available typed device or omit device selection for the default. |
 | `device-busy` | Release competing capture and check OS access. |
-| `constraint-unsatisfied` | Relax device/resolution constraints. |
+| `constraint-unsatisfied` | Check positive finite resolution/frame-rate and boolean processing preferences. |
 | `request-cancelled` | Request again only when intended. |
 | `not-supported` | Check secure context and the required browser capture API. |
 | Error but `state === "active"` | Replacement failed; keep old capture and choose again. |
@@ -74,7 +74,7 @@ Check in order:
 
 1. **Joined?** Both participants show `connected`, with distinct external IDs in the same room.
 2. **Published?** Sender capture is active and bound to the right local handles.
-   Disabled means black/silent; `setSource(null)` means withdrawn.
+   `enabled={false}` means black/silent; `source={null}` means withdrawn.
 3. **Discovered?** `agent.remote.videoTracks` / `audioTracks` expose the remote publications.
 4. **Assigned?** For audio, check the track's `receiving`; for video, a visible
    `<Video>` drives receiver demand. Discovery alone does not prove assignment.

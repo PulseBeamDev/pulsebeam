@@ -15,6 +15,8 @@ export class Track extends EventTarget {
   readyState = "live";
   enabled = true;
   stopped = 0;
+  label = "";
+  settings: MediaTrackSettings = {};
   constructor(readonly kind: "video" | "audio") {
     super();
   }
@@ -26,7 +28,11 @@ export class Track extends EventTarget {
     return new Track(this.kind);
   }
   getSettings() {
-    return {};
+    return this.settings;
+  }
+  end() {
+    this.readyState = "ended";
+    this.dispatchEvent(new Event("ended"));
   }
 }
 export class Stream {
@@ -42,12 +48,22 @@ export class Stream {
   }
 }
 export const captures: ReturnType<typeof deferred<Stream>>[] = [];
-const devices = new EventTarget();
+export const devices = new EventTarget();
+export const captureOptions: MediaStreamConstraints[] = [];
+export const displays: ReturnType<typeof deferred<Stream>>[] = [];
+export const displayOptions: DisplayMediaStreamOptions[] = [];
 Object.assign(devices, {
   enumerateDevices: async () => [],
-  getUserMedia: () => {
+  getUserMedia: (options: MediaStreamConstraints) => {
+    captureOptions.push(options);
     const next = deferred<Stream>();
     captures.push(next);
+    return next.promise;
+  },
+  getDisplayMedia: (options: DisplayMediaStreamOptions) => {
+    displayOptions.push(options);
+    const next = deferred<Stream>();
+    displays.push(next);
     return next.promise;
   },
 });

@@ -84,7 +84,6 @@ microphone; the keyed room owns the PulseBeam session. Pass in a token from
 your application's backend.
 
 ```tsx
-import { useEffect } from "react";
 import {
   Video, useAgent, useUserMedia, type CaptureResult,
 } from "@pulsebeam/react";
@@ -113,13 +112,13 @@ export function Call({ sessionId, token }: { sessionId: string; token: string })
 function Room({ token, media }: { token: string; media: CaptureResult }) {
   const agent = useAgent({ endpoint: "http://localhost:7070", token });
 
-  useEffect(() => {
-    agent.local.video("camera").setSource(media.videoTrack);
-    agent.local.audio("microphone").setSource(media.audioTrack);
-  }, [agent, media.videoTrack, media.audioTrack]);
+  const Camera = agent.local.video("camera");
+  const Microphone = agent.local.audio("microphone");
 
   return (
     <>
+      <Camera source={media.videoTrack} />
+      <Microphone source={media.audioTrack} />
       <button onClick={() => agent.connect()}>Join room</button>
       <button onClick={() => agent.disconnect()}>Leave room</button>
       <p>Connection: {agent.connection}</p>
@@ -138,9 +137,10 @@ function Room({ token, media }: { token: string; media: CaptureResult }) {
 }
 ```
 
-The effect keeps publications synchronized with captured sources, including
-device changes. `connect()` records connection intent; the Agent handles
-retries. The browser sends media directly to PulseBeam, not through your
+Committed JSX owns publications, including source changes and withdrawal on
+unmount. No synchronization effect is needed. `connect()` records connection
+intent; the Agent handles transient retries. Terminal failures require an
+explicit retry after correcting the cause. The browser sends media directly to PulseBeam, not through your
 application backend. To switch rooms or participants, change `sessionId`
 (the React key); refreshing a token for the same session preserves its Agent.
 

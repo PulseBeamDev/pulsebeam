@@ -4,6 +4,8 @@ import type {
   Topic,
   TopicMode,
   TopicRegistration,
+  TopicCallbacks,
+  TopicConsumerError,
 } from "./types.js";
 
 const encoder = new TextEncoder();
@@ -15,7 +17,7 @@ type Entry = {
   name: string;
   mode: TopicMode;
   publisher: boolean;
-  subscribers: Set<TopicIterator<unknown>>;
+  subscribers: Set<{ close(): void }>;
 };
 
 type Pending<T> = {
@@ -184,7 +186,56 @@ export class TopicRegistry {
     return facade;
   }
 
-  release(entry: Entry, iterator: TopicIterator<unknown>): void {
+  listen<T>(
+    name: string,
+    options: { readonly mode: "reliable" | "unreliable" },
+    callbacks: TopicCallbacks<T>,
+  ): () => void {
+    this.topic<T>(name, options);
+    const mode = options.mode === "reliable" ? "ordered" : "latest";
+    const entry = this.#entries.get(`${mode}:${name}`)!;
+    let live = true;
+    const report = (error: TopicConsumerError) => {
+      if (callbacks.onError) callbacks.onError(error);
+      else console.error("PulseBeam topic consumer failed", error);
+    };
+    const consumer = {
+      close: () => {
+        if (!live) return;
+        live = false;
+        unsubscribe();
+        this.release(entry, consumer);
+      },
+    };
+    const unsubscribe = this.agent.subscribeEvents((event) => {
+      if (!live || !("topic" in event) || event.topic !== name) return;
+      if (event.type === "topic-recovery-gap" && mode === "ordered") {
+        if (callbacks.onGap) callbacks.onGap(event);
+        else console.warn("PulseBeam topic recovery gap", event);
+      } else if (
+        event.type === "topic-channel-failed" &&
+        event.direction === "subscribe" &&
+        event.mode === mode
+      ) {
+        report({ code: "channel-failed", event });
+      } else if (event.type === "topic-message" && event.mode === mode) {
+        let value: T;
+        try {
+          value = JSON.parse(decoder.decode(event.payload)) as T;
+        } catch (cause) {
+          consumer.close();
+          report({ code: "decode-failed", topic: name, cause });
+          return;
+        }
+        callbacks.onMessage(value, { publisherId: event.publisherId });
+      }
+    });
+    entry.subscribers.add(consumer);
+    this.#sync();
+    return consumer.close;
+  }
+
+  release(entry: Entry, iterator: { close(): void }): void {
     if (!entry.subscribers.delete(iterator)) return;
     this.#sync();
   }

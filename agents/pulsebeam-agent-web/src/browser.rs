@@ -634,13 +634,13 @@ impl BrowserRuntime {
 
     pub fn force_reconnect(&self) -> Result<(), JsValue> {
         self.inner.ensure_open()?;
-        let generation = self.inner.snapshot().generation;
-        let Some(generation) = generation else {
-            return Err(js_error("cannot reconnect before a transport exists"));
+        let actor = self.inner.actor.borrow();
+        let Some(actor) = actor.as_ref() else {
+            return Err(js_error("runtime actor not initialized"));
         };
-        self.inner
-            .send_event(HostEvent::Rtc(RtcEvent::Disconnected { generation }));
-        Ok(())
+        actor
+            .send_public(PublicCommand::Reconnect)
+            .map_err(js_error)
     }
 
     pub fn send_topic(&self, name: &str, mode: &str, payload: &[u8]) -> Result<(), JsValue> {

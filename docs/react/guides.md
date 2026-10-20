@@ -33,38 +33,47 @@ A captured-source preview ignores publication mute; a local-handle preview follo
 
 1. Call `useMediaDevices()`; wait for `state === "ready"`.
 2. Show `cameras` and `microphones`. Labels may be empty before permission.
-3. Pass the chosen ID to `useUserMedia`, for example
-   `{video: {deviceId: {exact: cameraId}}, audio: true}`.
-4. After the first explicit request, option changes replace capture automatically.
-   Keep the quickstart's source-binding effect.
+3. Pass the chosen typed device to `useUserMedia`, for example
+   `{video: {device: camera, preferences: {height: 720}}, audio: true}`.
+   Use `video: true` for the default camera without waiting for inventory.
+4. After an explicit request, option changes while active/acquiring replace capture
+   automatically. Keep the same JSX publication with `source={capture.videoTrack}`.
 
 **You see:** the new camera after success. Until then, the old capture stays.
 On failure it can remain `active` with an `error`; offer another device or relax
-the constraint. Do not clear a working preview. Check enumeration errors too.
-`speakers` is a list, not a speaker-selection API.
+the preferences. Exact selection never falls back to another device. Do not clear
+a working preview. `capture.video`/`.audio` expose actual device/settings; unknown
+fields remain absent. Check enumeration errors too. IDs are opaque and may change
+with permission; supported permission observations refresh inventory automatically.
+Unsupported permission changes may need device change, acquisition, or remount.
+`speakers` is inventory, not a speaker-selection API.
 
 ## Enablement, withdrawal, and release
 
-Use stable handles such as `agent.local.video("camera")`.
+Get a stable component with `const Camera = agent.local.video("camera")` and
+render `<Camera source={capture.videoTrack} enabled={cameraOn} />`.
 
 | Button | Action | What changes |
 | --- | --- | --- |
-| Mute | `handle.setEnabled(false)` | Black video/silent audio; capture and publication remain |
-| Unmute | `handle.setEnabled(true)` | Current source sends again |
-| Stop publishing | `handle.setSource(null)` | Publication disappears; capture remains |
-| Release devices | `capture.stop()` and update/clear bound sources | Devices stop |
+| Mute | Set `cameraOn` false | Black video/silent audio; capture and publication remain |
+| Unmute | Set `cameraOn` true | Current source sends again |
+| Stop publishing | Render `source={null}` or unmount the declaration | Publication disappears; capture remains |
+| Release devices | `capture.stop()` | Sources clear and devices stop |
 | Leave | `agent.disconnect()` and `capture.stop()` | Session and devices stop |
 
-A label keeps its slot even after withdrawal; enablement survives source changes.
-Catch `LocalTrackCapacityError` if allocating labels can exceed your topology.
-Do not clear handles in an effect cleanup after their Agent has closed.
+A label keeps its slot even after withdrawal. Lookup does not allocate; committed
+mounts do. One mount owns each kind/label, including null source. Duplicates fail
+without stealing the first owner. Use an error boundary for dynamic declarations
+that may exceed fixed topology. No publication synchronization effect is needed.
 
 ## Screen sharing
 
 1. Add `useDisplayMedia({video: true, audio: false})`.
 2. Call `share.request()` directly from a **Share screen** click; catch rejection.
-3. Bind `share.videoTrack` to `agent.local.video("screen")`; preview without mirroring.
-4. To stop, call `share.stop()` and clear the publication.
+3. Get `const Screen = agent.local.video("screen")`, then render
+   `<Screen source={share.videoTrack} />`; set `preferences.content` to `detail` for text-heavy sharing.
+   Preview with `<Video source={Screen} />` without mirroring.
+4. To stop, call `share.stop()`; JSX observes the cleared source.
 
 **You see:** a separate screen video. The default reserves two local video slots, enough
 for one camera and one screen publication. Additional video labels require
@@ -82,8 +91,11 @@ Display audio depends on the browser and selected surface, even with `audio: tru
 hiding or unmounting releases it. Multiple views share the maximum size.
 `autoPlay={false}` still requests video; use native controls to start playback.
 
-For tuning, call
-`track.setReceiveOptions({minHeight: 180, minFps: 15, priority: 100})`.
+For tuning, render:
+
+```tsx
+<Video source={track} preferences={{minHeight: 180, minFps: 15, priority: 100}} />
+```
 Minimums are protected before target upgrades, even upgrades of higher-priority
 streams. If minimums cannot all fit, higher priority wins; any stream may degrade
 or pause when bandwidth or source layers cannot meet its minimums. Both minimums
@@ -95,7 +107,14 @@ topology before connection if you need more. Changing it recreates the Agent;
 automatic capacity growth is not supported yet.
 
 Known participant? `agent.remote.participant("alice").video("camera")` works
-before discovery and survives republication. [Exact policies](/react/reference#remote-media).
+before discovery and survives republication.
+
+Each visible presentation owns its preferences. Numeric minimums/priority aggregate
+by maximum, while latency ranges enclose the lowest minimum and highest maximum.
+Removing the last explicit latency requests defaults, not zero buffering. Fixed
+bounds cannot reset in place on an existing receiver: removal may remap media or
+recover the transport while logical handles stay stable.
+[Exact preferences](/react/reference#video-preferences).
 
 ## Remote audio and autoplay
 
@@ -114,7 +133,8 @@ it from a button instead. [Playback diagnostics](/react/troubleshooting#autoplay
 Show `agent.connection` and `agent.error`, not just the last button clicked.
 The runtime retries temporary loss while connection is desired. `reconnect()`
 retains desired media/topic state; `disconnect()` stops retries, not capture.
-Fix a `terminal-failure` before creating a fresh Agent.
+Fix a `terminal-failure`, then explicitly reconnect or disconnect/connect.
+Incidental media, token, topic, logging, or UI changes do not clear its reason.
 
 ### Renew before expiry
 
@@ -138,42 +158,40 @@ sequenceDiagram
 
 Fetch before `agent.authorizationExpiresAt` (Unix seconds), then update only
 `config.token`. The hook renews the same Agent; changing endpoint or topology replaces it; logging changes update in place.
-Caller-owned Agents use `renewAuthorization(token)`.
 The SDK does not fetch tokens. Keep keys server-side, report renewal failures,
 and use a new Agent to change room or participant.
 
 Catch capture, playback, and topic failures at their controls. In React, read
 `agent.error` directly; `useAgent` owns the subscription and rerenders the component.
-Use `subscribeEvents` only when you specifically need the diagnostic/event stream.
 [Choose the next diagnostic](/react/troubleshooting).
 
 ## Typed topics
 
 Send live JSON messages, not durable chat history.
 
-The fragment below goes inside your component. Import `useEffect` from `react`;
-`agent` is hook-owned. `setMessages` updates a string array and `reportError`
-displays a failure; their UI definitions are omitted.
+Inside your component, get `const Chat = agent.topic<{text: string}>("chat",
+{mode: "reliable"})`. Render a consumer in its returned JSX:
 
 ```tsx
-useEffect(() => {
-  if (!agent) return;
-  const controller = new AbortController();
-  const chat = agent.topic<{ text: string }>("chat", { mode: "reliable" });
-  void (async () => {
-    for await (const message of chat.subscribe({ signal: controller.signal })) {
-      setMessages((previous) => [...previous, message.text]);
-    }
-  })().catch(reportError);
-  return () => controller.abort();
-}, [agent]);
+<Chat
+  onMessage={(message, {publisherId}) => {
+    setMessages(previous => [...previous, `${publisherId}: ${message.text}`]);
+  }}
+  onGap={() => setGap(true)}
+  onError={reportError}
+/>
 ```
 
-In your send handler, get the same `chat` facade and call
-`void chat.publish({text: "hello"}).catch(reportError)`.
+Here `setMessages`, `setGap`, and `reportError` are application state/UI callbacks;
+their definitions are omitted. In a send handler call
+`void Chat.publish({text: "hello"}).catch(reportError)`.
 
-**You receive:** live messages while subscribed. Creating the facade alone does
-not subscribe; aborting or ending iteration releases the subscription.
+**You receive:** live messages while mounted, with actual publisher identity.
+Lookup creates no interest. Every committed consumer owns its subscription;
+unmount releases exactly it. Callback-only updates do not resubscribe.
+Publishing works without a mounted consumer and retains independent interest.
+Malformed UTF-8/JSON releases that consumer with `code: "decode-failed"`; remount
+it to retry. Core gap/channel failures retain core recovery semantics.
 
 | Mode | Use |
 | --- | --- |

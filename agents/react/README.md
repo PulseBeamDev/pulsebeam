@@ -31,7 +31,15 @@ overrides and the current reconnect requirement.
 Import from `@pulsebeam/react`. `useAgent` returns an Agent immediately; React
 owns its runtime lifecycle. Use a React `key` to replace logical sessions.
 Capture hooks own the devices: disconnecting an Agent does not stop capture.
-Keep signing keys on your backend.
+Local publication and topic component handles declare ongoing relationships in
+committed JSX. Use `source`, `enabled`, and per-`Video` preferences rather than
+synchronization effects. Capture options accept typed exact devices and portable
+best-effort preferences; observations report actual settings.
+
+React exposes only `useAgent` for Agent ownership, with no `createAgent` export
+or advanced escape hatch. Non-React applications use caller-owned `createAgent`
+from `@pulsebeam/web`. Managed lifecycle functions are internal, not public SDK
+APIs. Keep signing keys on your backend.
 
 ## Check changes
 

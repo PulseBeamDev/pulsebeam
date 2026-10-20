@@ -79,18 +79,7 @@ function RoomSession({
   initial: { cameraOn: boolean; micOn: boolean };
   onLeave(): void;
 }) {
-  const agent = owner.getSnapshot();
-  useEffect(() => {
-    // Declare known publisher channels before capture and connection effects:
-    // adding a channel on the first send would replace the media transport.
-    owner.setState({
-      connected: false,
-      topics: [
-        { name: "chat", mode: "ordered", publish: true },
-        { name: "reactions", mode: "latest", publish: true },
-      ],
-    });
-  }, [owner]);
+  const agent = owner;
   const { capture, devices } = useMeetMedia();
   const [deviceAnchor, setDeviceAnchor] = useState<HTMLElement | null>(null);
   const [reactionAnchor, setReactionAnchor] = useState<HTMLElement | null>(
@@ -102,14 +91,25 @@ function RoomSession({
   const [chatOpen, setChatOpen] = useState(false);
   const [failure, setFailure] = useState<string | null>(null);
   const playbackRetry = useRef<(() => Promise<void>) | null>(null);
-  const { screen, camera, cameraOn, micOn, detachScreen, startShare, toggle } =
-    useRoomMedia(
-      owner,
-      { videoTrack: capture.videoTrack, audioTrack: capture.audioTrack },
-      setFailure,
-      initial,
-    );
   const {
+    screen,
+    Camera,
+    Microphone,
+    Screen,
+    cameraOn,
+    micOn,
+    detachScreen,
+    startShare,
+    toggle,
+  } = useRoomMedia(owner, setFailure, initial);
+  const {
+    Chat,
+    Reactions,
+    receiveChat,
+    receiveReaction,
+    onTopicError,
+    onTopicGap,
+    subscriptionRevision,
     messages,
     reactions,
     sendChat,
@@ -126,14 +126,6 @@ function RoomSession({
   useEffect(() => {
     owner.connect();
   }, [owner]);
-  useEffect(() => {
-    for (const track of remoteTracks)
-      track.setReceiveOptions({
-        minFps: 15,
-        priority: track === spotlight ? 200 : 10,
-        playoutDelay: latencyModes[latencyMode],
-      });
-  }, [latencyMode, remoteTracks, spotlight]);
   const playbackError = useCallback(
     ({ error, retry }: { error: unknown; retry: () => Promise<void> }) => {
       setFailure(
@@ -172,7 +164,16 @@ function RoomSession({
   };
   const video = (track: RemoteVideoTrack | null, fill: "contain" | "cover") => (
     <Video
-      source={track ?? camera}
+      source={track ?? Camera}
+      preferences={
+        track
+          ? {
+              minFps: 15,
+              priority: track === spotlight ? 200 : 10,
+              latency: latencyModes[latencyMode],
+            }
+          : undefined
+      }
       autoPlay
       mirror={!track}
       className={
@@ -206,6 +207,20 @@ function RoomSession({
       onClickCapture={recoverPlayback}
       onKeyDownCapture={recoverPlayback}
     >
+      <Camera source={capture.videoTrack} enabled={cameraOn} />
+      <Microphone source={capture.audioTrack} enabled={micOn} />
+      <Screen source={screen} preferences={{ content: "detail" }} />
+      <Chat
+        key={`chat:${subscriptionRevision}`}
+        onMessage={receiveChat}
+        onGap={onTopicGap}
+        onError={onTopicError}
+      />
+      <Reactions
+        key={`reactions:${subscriptionRevision}`}
+        onMessage={receiveReaction}
+        onError={onTopicError}
+      />
       <Paper
         component="header"
         square
@@ -313,7 +328,7 @@ function RoomSession({
           {(capture.error || devices.error)?.message}
         </Alert>
       )}
-      {(failure || topicError || agent.failure) && (
+      {(failure || topicError || agent.error) && (
         <Alert
           severity="error"
           onClose={closeAlert}
@@ -325,7 +340,7 @@ function RoomSession({
             </Stack>
           }
         >
-          {failure ?? topicError ?? agent.failure?.message}
+          {failure ?? topicError ?? agent.error?.message}
         </Alert>
       )}
       {gap && (

@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import {
   Video,
   useAgent,
@@ -13,16 +13,13 @@ export function Room({ config }: { config: AgentConfig }) {
   const [error, setError] = useState("");
   const [playback, setPlayback] = useState<PlaybackError | null>(null);
   const report = (failure: unknown) => setError(String(failure));
-  const camera = agent.local.video("camera");
-  const microphone = agent.local.audio("microphone");
-
-  useEffect(() => {
-    camera.setSource(capture.videoTrack);
-    microphone.setSource(capture.audioTrack);
-  }, [camera, microphone, capture.videoTrack, capture.audioTrack]);
+  const Camera = agent.local.video("camera");
+  const Microphone = agent.local.audio("microphone");
 
   return (
     <main>
+      <Camera source={capture.videoTrack} />
+      <Microphone source={capture.audioTrack} />
       <h1>PulseBeam React room</h1>
       <p role="status">
         Connection: {agent.connection}; participant:{" "}

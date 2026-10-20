@@ -38,6 +38,7 @@ macro_rules! agent_log {
 pub enum AgentCommand {
     ReplaceDesired(DesiredState),
     RenewAuthorization(String),
+    Reconnect,
     SendTopic(TopicSend),
 }
 
@@ -49,6 +50,7 @@ impl core::fmt::Debug for AgentCommand {
                 .field(desired)
                 .finish(),
             Self::RenewAuthorization(_) => formatter.write_str("RenewAuthorization([REDACTED])"),
+            Self::Reconnect => formatter.write_str("Reconnect"),
             Self::SendTopic(send) => formatter.debug_tuple("SendTopic").field(send).finish(),
         }
     }
@@ -228,6 +230,10 @@ impl Agent {
         let result = match command {
             AgentCommand::ReplaceDesired(desired) => self.replace_desired(desired),
             AgentCommand::RenewAuthorization(token) => self.renew_authorization(token),
+            AgentCommand::Reconnect => {
+                self.reconnect();
+                Ok(())
+            }
             AgentCommand::SendTopic(send) => self
                 .topics
                 .send(
@@ -305,7 +311,7 @@ impl Agent {
         {
             return Err(AgentError::InvalidAuthorizationToken);
         }
-        if !self.desired.connected {
+        if !self.desired.connected || self.snapshot.terminal_failure.is_some() {
             self.config.token = token;
             return Ok(());
         }
@@ -442,14 +448,8 @@ impl Agent {
 
         if self.desired.connected {
             if self.closing.is_none() && self.attempt.is_none() && self.retry.is_none() {
-                if self.snapshot.connection == ConnectionState::TerminalFailure {
-                    self.snapshot.terminal_failure = None;
-                    let mode = if self.active.is_some() {
-                        AttemptMode::Replace
-                    } else {
-                        AttemptMode::Fresh
-                    };
-                    self.start_attempt(mode);
+                if self.snapshot.terminal_failure.is_some() {
+                    return Ok(());
                 } else if self.active.is_none() {
                     self.start_attempt(AttemptMode::Fresh);
                 } else if topics_changed {
@@ -466,7 +466,29 @@ impl Agent {
         Ok(())
     }
 
+    fn reconnect(&mut self) {
+        if !self.desired.connected || self.closing.is_some() || self.attempt.is_some() {
+            return;
+        }
+        if let Some(retry) = self.retry.take() {
+            self.effects
+                .push_back(Effect::Timer(TimerEffect::Cancel { timer: retry.timer }));
+        }
+        self.snapshot.terminal_failure = None;
+        self.retry_attempts = 0;
+        let mode = if let Some(active) = self.active.as_ref() {
+            self.fence_signaling(active.generation);
+            AttemptMode::Replace
+        } else {
+            AttemptMode::Fresh
+        };
+        self.start_attempt(mode);
+    }
+
     fn start_attempt(&mut self, mode: AttemptMode) {
+        if self.snapshot.terminal_failure.is_some() {
+            return;
+        }
         debug_assert!(self.attempt.is_none());
         let generation = self.ids.generation();
         let topic_registrations = self.desired.topics.clone();
@@ -549,7 +571,11 @@ impl Agent {
                     .is_some_and(|session| session.generation == generation)
                 {
                     self.fence_signaling(generation);
-                    if self.desired.connected && self.attempt.is_none() && self.retry.is_none() {
+                    if self.desired.connected
+                        && self.snapshot.terminal_failure.is_none()
+                        && self.attempt.is_none()
+                        && self.retry.is_none()
+                    {
                         self.start_attempt(AttemptMode::Replace);
                     }
                 }
@@ -571,7 +597,11 @@ impl Agent {
                     .is_some_and(|session| session.generation == generation)
                 {
                     self.fence_signaling(generation);
-                    if self.desired.connected && self.attempt.is_none() && self.retry.is_none() {
+                    if self.desired.connected
+                        && self.snapshot.terminal_failure.is_none()
+                        && self.attempt.is_none()
+                        && self.retry.is_none()
+                    {
                         self.notify_failure(Failure::transient(message));
                         self.start_attempt(AttemptMode::Replace);
                     }
@@ -914,16 +944,7 @@ impl Agent {
                 let output = match output {
                     Ok(output) => output,
                     Err(error) => {
-                        active.signaling_terminal = true;
-                        self.pending_signal = None;
-                        self.cancel_signal_retry();
-                        let failure = Failure {
-                            class: FailureClass::Protocol,
-                            message: error.to_string(),
-                        };
-                        self.notify_failure(failure.clone());
-                        self.snapshot.terminal_failure = Some(failure);
-                        self.set_connection_state(ConnectionState::TerminalFailure);
+                        self.fail_terminal(Failure::protocol(error.to_string()));
                         return Err(error.into());
                     }
                 };
@@ -975,15 +996,9 @@ impl Agent {
                                 .authorization_expires_at
                                 .is_some_and(|previous| expires_at <= previous)
                         {
-                            active.signaling_terminal = true;
-                            let failure = Failure {
-                                class: FailureClass::Protocol,
-                                message: "authorization renewal did not extend the lease"
-                                    .to_string(),
-                            };
-                            self.notify_failure(failure.clone());
-                            self.snapshot.terminal_failure = Some(failure);
-                            self.set_connection_state(ConnectionState::TerminalFailure);
+                            self.fail_terminal(Failure::protocol(
+                                "authorization renewal did not extend the lease",
+                            ));
                             return Err(SignalingError::Invalid("renewal expiry").into());
                         }
                         active.authorization_expires_at = Some(expires_at);
@@ -1004,9 +1019,6 @@ impl Agent {
                             error.fatal
                         );
                         if error.fatal {
-                            active.signaling_terminal = true;
-                            self.pending_signal = None;
-                            self.cancel_signal_retry();
                             let class = if error.code
                                 == pulsebeam_proto::signaling_v1::ErrorCode::AuthorizationExpired
                                     as i32
@@ -1019,9 +1031,7 @@ impl Agent {
                                 class,
                                 message: error.message,
                             };
-                            self.notify_failure(failure.clone());
-                            self.snapshot.terminal_failure = Some(failure);
-                            self.set_connection_state(ConnectionState::TerminalFailure);
+                            self.fail_terminal(failure);
                         } else {
                             if error.code == wire::ErrorCode::AuthorizationRejected as i32 {
                                 active.pending_renewal = None;
@@ -1230,7 +1240,6 @@ impl Agent {
                 &mut self.effects,
             );
         }
-        self.snapshot.terminal_failure = None;
         self.set_connection_state(ConnectionState::Connected);
         for payload in attempt.early_signaling {
             self.handle_data_channel(DataChannelEvent::Message {
@@ -1294,18 +1303,43 @@ impl Agent {
         }
         self.pending_signal = None;
         self.intent_dirty = true;
-        self.notify_failure(failure.clone());
         match failure.class {
-            FailureClass::Transient => self.schedule_retry(attempt.mode),
+            FailureClass::Transient => {
+                self.notify_failure(failure);
+                self.schedule_retry(attempt.mode);
+            }
             FailureClass::InvalidConfiguration
             | FailureClass::Authorization
             | FailureClass::Protocol
             | FailureClass::ResourceExpired
-            | FailureClass::RetryExhausted => {
-                self.snapshot.terminal_failure = Some(failure);
-                self.set_connection_state(ConnectionState::TerminalFailure);
-            }
+            | FailureClass::RetryExhausted => self.fail_terminal(failure),
         }
+    }
+
+    fn fail_terminal(&mut self, failure: Failure) {
+        if self.snapshot.terminal_failure.is_some() {
+            return;
+        }
+        if self.attempt.is_some() {
+            self.fail_attempt(failure);
+            return;
+        }
+        if let Some(retry) = self.retry.take() {
+            self.effects
+                .push_back(Effect::Timer(TimerEffect::Cancel { timer: retry.timer }));
+        }
+        self.pending_signal = None;
+        self.cancel_signal_retry();
+        if let Some(timer) = self.topic_probe.take() {
+            self.effects
+                .push_back(Effect::Timer(TimerEffect::Cancel { timer }));
+        }
+        if let Some(active) = self.active.as_ref() {
+            self.fence_signaling(active.generation);
+        }
+        self.notify_failure(failure.clone());
+        self.snapshot.terminal_failure = Some(failure);
+        self.set_connection_state(ConnectionState::TerminalFailure);
     }
 
     fn schedule_retry(&mut self, mode: AttemptMode) {
@@ -1356,7 +1390,11 @@ impl Agent {
     }
 
     fn send_intent_if_ready(&mut self) {
-        if !self.intent_dirty || self.pending_signal.is_some() || self.signal_retry.is_some() {
+        if self.snapshot.terminal_failure.is_some()
+            || !self.intent_dirty
+            || self.pending_signal.is_some()
+            || self.signal_retry.is_some()
+        {
             return;
         }
         let Some(active) = self.active.as_mut() else {
@@ -1391,9 +1429,7 @@ impl Agent {
                     Error,
                     "failed to encode desired signaling intent: {error}"
                 );
-                self.notify_failure(failure.clone());
-                self.snapshot.terminal_failure = Some(failure);
-                self.set_connection_state(ConnectionState::TerminalFailure);
+                self.fail_terminal(failure);
                 return;
             }
         };
@@ -1448,6 +1484,7 @@ impl Agent {
 
     fn schedule_topic_probe(&mut self) {
         if self.topic_probe.is_some()
+            || self.snapshot.terminal_failure.is_some()
             || !self.desired.connected
             || !self.topics.has_ordered_subscriptions()
             || self.active.is_none()

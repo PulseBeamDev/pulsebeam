@@ -17,6 +17,8 @@ await build({
   jsx: "automatic",
   alias: {
     "@pulsebeam/react": "./package/dist/index.js",
+    "@pulsebeam/web/internal/react":
+      "../pulsebeam-agent-web/package/dist/internal/react.js",
     "@pulsebeam/web": "../pulsebeam-agent-web/package/dist/index.js",
   },
 });
