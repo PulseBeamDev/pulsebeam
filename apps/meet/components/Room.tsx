@@ -85,7 +85,6 @@ export function Room({
     receiveChat,
     receiveReaction,
     onTopicError,
-    subscriptionRevision,
     messages,
     reactions,
     dismissReaction,
@@ -93,7 +92,6 @@ export function Room({
     sendReaction,
     error: topicError,
     clearError,
-    retrySubscriptions,
   } = useTopics(agent);
   const { remoteTracks, spotlight, setPin } = useVideoLayout(
     agent.remote.videoTracks,
@@ -196,16 +194,8 @@ export function Room({
       <Camera source={capture.video} enabled={cameraOn} />
       <Microphone source={capture.audio} enabled={micOn} />
       <Screen source={screen} preferences={{ content: "detail" }} />
-      <Chat
-        key={`chat:${subscriptionRevision}`}
-        onEvent={receiveChat}
-        onError={onTopicError}
-      />
-      <Reactions
-        key={`reactions:${subscriptionRevision}`}
-        onEvent={receiveReaction}
-        onError={onTopicError}
-      />
+      <Chat onEvent={receiveChat} onError={onTopicError} />
+      <Reactions onEvent={receiveReaction} onError={onTopicError} />
       <Paper
         component="header"
         square
@@ -314,17 +304,7 @@ export function Room({
         </Alert>
       )}
       {(failure || topicError || agent.error) && (
-        <Alert
-          severity="error"
-          onClose={closeAlert}
-          action={
-            <Stack direction="row">
-              {topicError && (
-                <Button onClick={retrySubscriptions}>Retry chat</Button>
-              )}
-            </Stack>
-          }
-        >
+        <Alert severity="error" onClose={closeAlert}>
           {failure ?? topicError ?? agent.error?.message}
         </Alert>
       )}
@@ -480,7 +460,6 @@ export function Room({
                       {message.sender === agent.participantId
                         ? "You"
                         : message.sender}
-                      {message.pending ? " · Sending…" : ""}
                     </Typography>
                     <Paper
                       elevation={0}

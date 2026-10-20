@@ -94,14 +94,15 @@ has blocked it. Meet has no separate audio-unlock control.
 
 Meet uses `ordered` chat and `lossy` reactions. Chat uses finite, receiver-driven
 recovery and renders skipped ranges as inline notices before later messages;
-a warning also flags incomplete chat. **Retry chat** remounts a failed subscription,
-not a historical replay. Reactions are distinct transient events and may be lost
-or reordered.
+a warning also flags incomplete chat. A failed subscription resumes only after the
+participant rejoins. Reactions are distinct transient events and may be lost or
+reordered.
 
 Sender identity comes from the server-authored event `participantId`, not JSON.
-Received-message keys use `(dataTrackId, sequence)`; payloads carry only chat or
-reaction content. Local optimistic chat rows are UI-owned because publications
-do not loop back. Successful send means local acceptance, not remote delivery.
+The SDK suppresses duplicate `(dataTrackId, sequence)` events; payloads carry only
+chat or reaction content. Local chat rows are UI-owned and appear after local
+acceptance because publications do not loop back. Successful send does not mean
+remote delivery.
 Reconnect restores topic interest but creates fresh data tracks and sequence
 spaces, without cross-publication recovery. Use matching server and SDK versions;
 this contract has no legacy-mode or mixed-wire compatibility path.

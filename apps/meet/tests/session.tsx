@@ -257,13 +257,6 @@ const remoteChat = (dataTrackId: string, sequence: bigint) =>
     sequence,
     payload: new TextEncoder().encode(JSON.stringify(payload)),
   });
-await flush(() => remoteChat("remote-chat", 0n));
-assert.equal(
-  document.body.textContent!.match(/delivered through production topics/g)
-    ?.length,
-  1,
-  "same track and sequence deduplicate",
-);
 await flush(() => remoteChat("remote-chat", 1n));
 await flush(() => remoteChat("replacement-remote-chat", 1n));
 assert.equal(
@@ -334,6 +327,11 @@ assert.equal(
   0,
   "initial publish waits for authoritative binding",
 );
+assert.doesNotMatch(
+  transcript.textContent!,
+  /hello from component/,
+  "local chat appears only after publication succeeds",
+);
 const chatBinding = {
   name: "chat",
   mode: "ordered",
@@ -358,6 +356,12 @@ assert.ok(
         .includes("hello from component"),
   ),
 );
+await flush();
+const updatedTranscript = document.querySelector(
+  '[role="log"][aria-label="Chat transcript"]',
+)!;
+assert.match(updatedTranscript.textContent!, /hello from component/);
+assert.doesNotMatch(updatedTranscript.textContent!, /Sending…/);
 const sentChat = runtime.sent.find((message) => message.name === "chat")!;
 assert.equal(sentChat.mode, "ordered");
 assert.deepEqual(
