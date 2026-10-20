@@ -17,6 +17,15 @@ Shared mutable packet state, cross-shard handles, blocking calls, and
 multi-atomic snapshots are architectural regressions. Cross-shard and
 cross-node coordination uses owned messages.
 
+Nodes require an NTP/PTP-disciplined host wall clock in a common NTP-compatible
+time domain. Controller admission and shard service refresh paired host-clock
+samples instead of extrapolating a startup-only anchor. Backward wall-clock steps
+plateau execution time until the host catches up; ordinary clock slewing is
+followed. `clock::full_ntp_micros` converts wall-clock samples to microseconds
+since 1900 without truncating to the NTP 32.32 wire era. Packet receive samples
+remain separate and unchanged
+through queueing and shard handoffs.
+
 Run focused crate tests while iterating. Before handoff, run root `./bazel test //:check`
 and `./bazel test //:test`. UDP steering is an extension point: higher layers can provide
 a `Steering` implementation through `NodeBuilder::with_steering`. Server development and profiling entrypoints are documented in

@@ -114,6 +114,10 @@ impl ShardCore {
         }
     }
 
+    pub(crate) fn observe_execution_time(&mut self, at: net::ReceiveTime) -> net::ReceiveTime {
+        self.execution.wall.observe_execution(at)
+    }
+
     pub(crate) fn apply_updates(&mut self, budget: usize) -> usize {
         self.updates.apply(&mut self.execution, budget)
     }

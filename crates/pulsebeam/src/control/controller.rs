@@ -221,6 +221,7 @@ pub struct ControllerActor {
     router: crate::control::router::ShardRouter,
     core: ControllerCore,
     negotiator: Negotiator,
+    clock: crate::clock::WallAnchor,
     tcp_listener: Option<pulsebeam_core::net::TcpListener>,
     cluster_id: u16,
     node_id: u16,
@@ -256,6 +257,7 @@ impl ControllerActor {
             router: crate::control::router::ShardRouter::new(shard_contexts),
             core: ControllerCore::with_shards(shard_count, room_partition_size, placement),
             negotiator: Negotiator::new(candidates),
+            clock: crate::clock::WallAnchor::from(pulsebeam_runtime::net::ReceiveTime::now()),
             tcp_listener: Some(tcp_listener),
             cluster_id: 0,
             node_id: 0,
@@ -1114,11 +1116,14 @@ impl ControllerActor {
                 }
             },
         };
-        let now = tokio::time::Instant::now();
+        let at = self
+            .clock
+            .observe_execution(pulsebeam_runtime::net::ReceiveTime::now());
+        let now = at.monotonic;
         let address = self.core.reserve_transport(shard, now);
         let creds = IceUfrag::new(self.cluster_id, self.node_id, address.route, address.epoch)
             .into_ice_creds();
-        let (rtc, answer, resources) = match self.negotiator.create_answer(offer, creds) {
+        let (rtc, answer, resources) = match self.negotiator.create_answer(offer, creds, at) {
             Ok(value) => value,
             Err(error) => {
                 self.core.release_transport(address, now);
@@ -1444,6 +1449,7 @@ mod replacement_tests {
             router: crate::control::router::ShardRouter::new(vec![context]),
             core: ControllerCore::with_shards(1, 1, RoomPartitionPlacement::Hashed),
             negotiator: Negotiator::new(Vec::new()),
+            clock: crate::clock::WallAnchor::from(pulsebeam_runtime::net::ReceiveTime::now()),
             tcp_listener: None,
             cluster_id: 0,
             node_id: 0,

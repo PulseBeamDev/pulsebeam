@@ -18,7 +18,7 @@ use std::net::{Ipv6Addr, SocketAddr};
     reason = "Arc<ShardMetrics>, handed over once before any shard runs, see module note"
 )]
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 use tokio::time::Instant;
 
 use crate::clock::WallAnchor;
@@ -835,7 +835,7 @@ impl NodeBuilder {
 
         // One NTP<->Instant anchor for the whole node: read the wall clock once,
         // here, so every shard shares a timeline and nothing reads it again.
-        let wall_anchor = WallAnchor::new(SystemTime::now(), Instant::now());
+        let wall_anchor = WallAnchor::from(pulsebeam_runtime::net::ReceiveTime::now());
 
         let mut shard_contexts = Vec::with_capacity(shard_count);
 

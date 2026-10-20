@@ -21,6 +21,7 @@
 //! the correct answer.
 #![deny(clippy::arithmetic_side_effects)]
 
+use pulsebeam_runtime::net::ReceiveTime;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::time::Instant;
 
@@ -211,49 +212,85 @@ fn units_to_duration(raw: u64) -> Duration {
     Duration::new(raw >> 32, frac_nanos(raw))
 }
 
-/// Maps between the portable NTP timeline and local `Instant` scheduling time.
+/// Full-epoch NTP-compatible microseconds, without the 2036 wire-era rollover.
+/// Host NTP/PTP discipline supplies this domain; endpoint RTP/RTCP clocks do not.
+pub fn full_ntp_micros(wall: SystemTime) -> u64 {
+    let ntp_epoch = UNIX_EPOCH
+        .checked_sub(Duration::from_secs(NTP_UNIX_OFFSET_SECS))
+        .unwrap_or(UNIX_EPOCH);
+    let elapsed = wall.duration_since(ntp_epoch).unwrap_or(Duration::ZERO);
+    u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX)
+}
+
+/// A paired host-clock sample and the bridge to local scheduling time.
 ///
-/// Captured once per node at startup and shared by every shard, so all of a
-/// node's shards place the same `Instant` at the same NTP instant. It is never
-/// refreshed: the wall clock is read exactly once in the process lifetime.
+/// Owners refresh execution samples from the disciplined host clock. Projections
+/// are for local scheduling and wire-envelope conversion, not for reconstructing
+/// packet observations that were already captured at receive.
 #[derive(Debug, Clone, Copy)]
 pub struct WallAnchor {
-    ntp: NtpTime,
-    mono: Instant,
+    at: ReceiveTime,
+}
+
+impl From<ReceiveTime> for WallAnchor {
+    fn from(at: ReceiveTime) -> Self {
+        Self { at }
+    }
 }
 
 impl WallAnchor {
     pub fn new(wall: SystemTime, mono: Instant) -> Self {
         Self {
-            ntp: NtpTime::from_system_time(wall),
-            mono,
+            at: ReceiveTime {
+                wall,
+                monotonic: mono,
+            },
         }
     }
 
+    /// Follow host discipline without regressing successive execution samples.
+    /// Backward wall-clock steps plateau until the host catches up. Ordinary
+    /// negative slewing still advances and is followed, rather than projecting
+    /// a startup-only monotonic anchor indefinitely.
+    pub fn observe_execution(&mut self, mut at: ReceiveTime) -> ReceiveTime {
+        if at.monotonic < self.at.monotonic {
+            return self.at;
+        }
+        at.wall = at.wall.max(self.at.wall);
+        self.at = at;
+        at
+    }
+
+    pub fn execution_time(&self) -> ReceiveTime {
+        self.at
+    }
+
     pub fn ntp(&self) -> NtpTime {
-        self.ntp
+        NtpTime::from_system_time(self.at.wall)
     }
 
     pub fn to_ntp(&self, t: Instant) -> NtpTime {
-        if t >= self.mono {
-            self.ntp
-                .wrapping_add(t.saturating_duration_since(self.mono))
+        if t >= self.at.monotonic {
+            self.ntp()
+                .wrapping_add(t.saturating_duration_since(self.at.monotonic))
         } else {
-            self.ntp
-                .wrapping_sub(self.mono.saturating_duration_since(t))
+            self.ntp()
+                .wrapping_sub(self.at.monotonic.saturating_duration_since(t))
         }
     }
 
     pub fn to_instant(&self, t: NtpTime) -> Instant {
-        match t.units_since(self.ntp) {
+        match t.units_since(self.ntp()) {
             units if units >= 0 => self
-                .mono
+                .at
+                .monotonic
                 .checked_add(units_to_duration(units as u64))
-                .unwrap_or(self.mono),
+                .unwrap_or(self.at.monotonic),
             units => self
-                .mono
+                .at
+                .monotonic
                 .checked_sub(units_to_duration(units.unsigned_abs()))
-                .unwrap_or(self.mono),
+                .unwrap_or(self.at.monotonic),
         }
     }
 }
@@ -448,7 +485,7 @@ mod tests {
     fn anchor_conversion_stays_correct_across_the_era_rollover() {
         let before = ntp(u32::MAX as u64, 0);
         let mono = Instant::now();
-        let anchor = WallAnchor { ntp: before, mono };
+        let anchor = WallAnchor::new(before.to_system_time(), mono);
 
         let after = before.wrapping_add(Duration::from_secs(2));
         assert_eq!(
@@ -504,6 +541,56 @@ mod tests {
         let mut a = NtpExpander::new(reference);
         let mut b = NtpExpander::new(reference);
         assert_eq!(a.expand(target.middle32()), b.expand(target.middle32()));
+    }
+
+    #[test]
+    fn full_epoch_microseconds_do_not_roll_over_with_the_wire_era() {
+        assert_eq!(full_ntp_micros(UNIX_EPOCH), 2_208_988_800_000_000);
+        let rollover = UNIX_EPOCH + Duration::from_secs((1u64 << 32) - NTP_UNIX_OFFSET_SECS);
+        let before = rollover - Duration::from_micros(1);
+        let after = rollover + Duration::from_micros(1);
+        assert_eq!(full_ntp_micros(rollover), (1u64 << 32) * 1_000_000);
+        assert_eq!(full_ntp_micros(after) - full_ntp_micros(before), 2);
+        assert!(
+            NtpTime::from_system_time(after).as_raw() < NtpTime::from_system_time(before).as_raw()
+        );
+        assert_eq!(
+            full_ntp_micros(UNIX_EPOCH + Duration::from_nanos(123_456_789)),
+            2_208_988_800_123_456
+        );
+    }
+
+    #[test]
+    fn execution_samples_follow_slew_and_steps_without_regression() {
+        let mono = Instant::now();
+        let wall = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let mut anchor = WallAnchor::new(wall, mono);
+        let slow_host = ReceiveTime {
+            monotonic: mono + Duration::from_secs(1),
+            wall: wall + Duration::from_millis(999),
+        };
+        assert_eq!(anchor.observe_execution(slow_host), slow_host);
+        assert_eq!(anchor.execution_time(), slow_host);
+        assert_eq!(anchor.ntp(), NtpTime::from_system_time(slow_host.wall));
+
+        let backward_step = ReceiveTime {
+            monotonic: mono + Duration::from_secs(2),
+            wall: wall - Duration::from_secs(1),
+        };
+        let plateau = anchor.observe_execution(backward_step);
+        assert_eq!(plateau.monotonic, backward_step.monotonic);
+        assert_eq!(plateau.wall, slow_host.wall);
+        let caught_up = ReceiveTime {
+            monotonic: mono + Duration::from_secs(3),
+            wall: wall + Duration::from_secs(1),
+        };
+        assert_eq!(anchor.observe_execution(caught_up), caught_up);
+        let forward_step = ReceiveTime {
+            monotonic: mono + Duration::from_secs(4),
+            wall: wall + Duration::from_secs(60),
+        };
+        assert_eq!(anchor.observe_execution(forward_step), forward_step);
+        assert_eq!(anchor.observe_execution(caught_up), forward_step);
     }
 
     #[tokio::test(start_paused = true)]

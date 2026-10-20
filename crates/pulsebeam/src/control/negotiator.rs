@@ -2,6 +2,7 @@ use std::time::Duration;
 
 use crate::participant::downstream::INITIAL_BANDWIDTH;
 use pulsebeam_proto::rtp_extensions;
+use pulsebeam_runtime::net::ReceiveTime;
 use str0m::{
     Candidate, IceCreds, Rtc, RtcConfig, RtcError,
     change::{SdpAnswer, SdpOffer},
@@ -9,7 +10,6 @@ use str0m::{
     media::{Direction, Frequency, MediaKind, Mid, Pt},
     rtp::Extension,
 };
-use tokio::time::Instant;
 
 pub const MAX_RECV_VIDEO_SLOTS: usize = 32;
 pub const MAX_RECV_AUDIO_SLOTS: usize = 32;
@@ -123,6 +123,7 @@ impl Negotiator {
         &mut self,
         offer: SdpOffer,
         creds: IceCreds,
+        at: ReceiveTime,
     ) -> Result<(Rtc, SdpAnswer, NegotiatedResources), NegotiatorError> {
         tracing::debug!("{offer}");
         let mut rtc_config = RtcConfig::new()
@@ -167,7 +168,7 @@ impl Negotiator {
         // with the SDP negotiation path.
         let rtc_config = rtc_config.set_local_ice_credentials(creds);
 
-        let mut rtc = rtc_config.build(Instant::now().into());
+        let mut rtc = rtc_config.build(at.monotonic.into());
         for c in &self.candidates {
             rtc.add_local_candidate(c.clone());
         }
@@ -351,7 +352,11 @@ mod tests {
     fn answer_sdp() -> String {
         let mut negotiator = Negotiator::new(Vec::new());
         let (_, answer, _) = negotiator
-            .create_answer(chrome_like_offer(Direction::SendOnly), IceCreds::new())
+            .create_answer(
+                chrome_like_offer(Direction::SendOnly),
+                IceCreds::new(),
+                ReceiveTime::now(),
+            )
             .unwrap();
         answer.to_sdp_string()
     }
@@ -364,7 +369,11 @@ mod tests {
         ] {
             let mut negotiator = Negotiator::new(Vec::new());
             let (_, answer, _) = negotiator
-                .create_answer(chrome_like_offer(offer_direction), IceCreds::new())
+                .create_answer(
+                    chrome_like_offer(offer_direction),
+                    IceCreds::new(),
+                    ReceiveTime::now(),
+                )
                 .unwrap();
             assert!(answer.to_sdp_string().contains(answer_direction));
         }
@@ -379,7 +388,9 @@ mod tests {
         change.add_media(MediaKind::Video, Direction::RecvOnly, None, None, None);
         let offer = change.apply().unwrap().0;
         let mut negotiator = Negotiator::new(Vec::new());
-        let (_, _, resources) = negotiator.create_answer(offer, IceCreds::new()).unwrap();
+        let (_, _, resources) = negotiator
+            .create_answer(offer, IceCreds::new(), ReceiveTime::now())
+            .unwrap();
 
         assert_eq!(
             resources
@@ -438,7 +449,9 @@ mod tests {
         }
         let offer = with_unique_mids(change.apply().unwrap().0);
         let mut negotiator = Negotiator::new(Vec::new());
-        negotiator.create_answer(offer, IceCreds::new()).unwrap();
+        negotiator
+            .create_answer(offer, IceCreds::new(), ReceiveTime::now())
+            .unwrap();
     }
 
     #[test]
@@ -451,7 +464,7 @@ mod tests {
         let offer = with_unique_mids(change.apply().unwrap().0);
         let mut negotiator = Negotiator::new(Vec::new());
         assert!(matches!(
-            negotiator.create_answer(offer, IceCreds::new()),
+            negotiator.create_answer(offer, IceCreds::new(), ReceiveTime::now()),
             Err(NegotiatorError::SlotsLimit(
                 MediaType::Video,
                 Direction::RecvOnly,
@@ -474,7 +487,11 @@ mod tests {
             .replacen("m=video 9", "m=video 0", 1);
         let offer = SdpOffer::from_sdp_string(&offer).unwrap();
         let mut negotiator = Negotiator::new(Vec::new());
-        assert!(negotiator.create_answer(offer, IceCreds::new()).is_ok());
+        assert!(
+            negotiator
+                .create_answer(offer, IceCreds::new(), ReceiveTime::now())
+                .is_ok()
+        );
     }
 
     #[test]

@@ -448,14 +448,15 @@ impl ShardWorker {
         loop {
             self.wait_for_inputs(sleep.as_mut()).await?;
 
-            let busy_start = Instant::now();
+            let at = pulsebeam_runtime::net::ReceiveTime::now();
+            let busy_start = at.monotonic;
             self.metrics
                 .record_idle(busy_start.saturating_duration_since(loop_start));
 
             let previous_busy = self.last_busy;
             metrics::with_local_recorder(recorder, || {
                 self.observe_health(previous_busy);
-                self.tick(busy_start);
+                self.tick(at);
                 self.flush_shard_events()
             })?;
 
@@ -549,7 +550,8 @@ impl ShardWorker {
         Ok(())
     }
 
-    fn tick(&mut self, now: Instant) {
+    fn tick(&mut self, at: pulsebeam_runtime::net::ReceiveTime) {
+        let now = self.core.observe_execution_time(at).monotonic;
         // phase 1: input
         let mut commands: usize = 0;
         for _ in 0..SHARD_COMMAND_BUDGET {
