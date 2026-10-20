@@ -3,7 +3,6 @@ import { useCommittedRef } from "./committed-ref.js";
 import {
   nativeCaptureTrack,
   type Agent as WebAgent,
-  type CapturedAudioTrack,
   type CapturedVideoTrack,
   type LocalAudioTrack,
   type LocalVideoTrack,
@@ -13,10 +12,21 @@ import {
 
 import type { ManagedAgent } from "@pulsebeam/web/internal/react";
 import { createRemoteMedia, type RemoteMedia } from "./remote.js";
+import {
+  videoSource,
+  audioSource,
+  localVideoBinding,
+  publicationTrack,
+  type VideoSource,
+  type AudioSource,
+  type PublishableVideoSource,
+  type PublishableAudioSource,
+} from "./sources.js";
 export type {
   RemoteMedia,
   RemoteParticipant,
   RemoteVideoTrack,
+  RemoteAudioTrack,
 } from "./remote.js";
 
 export type PublicationDegradation =
@@ -32,21 +42,23 @@ export interface AudioPublicationPreferences {
   readonly degradation?: PublicationDegradation;
 }
 export interface VideoPublicationProps {
-  readonly source: CapturedVideoTrack | null;
+  readonly source: PublishableVideoSource | null;
   readonly enabled?: boolean;
   readonly preferences?: VideoPublicationPreferences;
 }
 export interface AudioPublicationProps {
-  readonly source: CapturedAudioTrack | null;
+  readonly source: PublishableAudioSource | null;
   readonly enabled?: boolean;
   readonly preferences?: AudioPublicationPreferences;
 }
 export type LocalVideo = ((
   props: VideoPublicationProps,
-) => ReactElement | null) & { readonly kind: "video"; readonly label: string };
+) => ReactElement | null) &
+  VideoSource & { readonly label: string };
 export type LocalAudio = ((
   props: AudioPublicationProps,
-) => ReactElement | null) & { readonly kind: "audio"; readonly label: string };
+) => ReactElement | null) &
+  AudioSource & { readonly label: string };
 export type Topic<T> = ((props: TopicCallbacks<T>) => ReactElement | null) & {
   publish(value: T): Promise<void>;
 };
@@ -72,14 +84,6 @@ export interface Agent
     name: string,
     options: { readonly mode: "reliable" | "unreliable" },
   ): Topic<T>;
-}
-
-type LocalView = Pick<LocalVideoTrack, "source" | "enabled" | "subscribe">;
-const previews = new WeakMap<LocalVideo, LocalView>();
-export function localVideoView(source: unknown): LocalView | null {
-  return typeof source === "function"
-    ? (previews.get(source as LocalVideo) ?? null)
-    : null;
 }
 
 function senderConfig(
@@ -135,7 +139,7 @@ function publication(
     const configKey = JSON.stringify(config);
     const enabled = props.enabled ?? true;
     useLayoutEffect(() => {
-      const source = props.source;
+      const source = props.source ? publicationTrack(props.source, kind) : null;
       const track = source ? nativeCaptureTrack(source, kind) : null;
       const sync = () =>
         raw.updatePublication(
@@ -156,21 +160,20 @@ function publication(
     | LocalVideo
     | LocalAudio;
   if (kind === "video")
-    previews.set(component as LocalVideo, {
-      get source() {
-        return (handle?.source ?? null) as CapturedVideoTrack | null;
-      },
-      get enabled() {
-        return handle?.enabled ?? true;
-      },
-      subscribe(listener) {
-        listeners.add(listener);
-        return () => {
-          listeners.delete(listener);
-        };
-      },
-    });
-  return component;
+    return videoSource(
+      component as LocalVideo,
+      localVideoBinding(
+        () =>
+          handle?.enabled ? (handle.source as CapturedVideoTrack | null) : null,
+        (listener) => {
+          listeners.add(listener);
+          return () => {
+            listeners.delete(listener);
+          };
+        },
+      ),
+    );
+  return audioSource(component as LocalAudio);
 }
 
 export function createReactAgent(raw: ManagedAgent): Agent {

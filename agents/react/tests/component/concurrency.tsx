@@ -3,6 +3,7 @@ import { startTransition, Suspense, useLayoutEffect } from "react";
 import { createRoot } from "react-dom/client";
 import { useUserMedia, Video, type CaptureResult } from "../../src/index.js";
 import { createCaptureSource } from "@pulsebeam/web";
+import { publishableVideoSource } from "../../src/sources.js";
 import { captures, deferred, flush, stream } from "./platform.js";
 
 export async function concurrentRender() {
@@ -10,9 +11,12 @@ export async function concurrentRender() {
   const acquired = stream();
   const playback = deferred<void>();
   const never = new Promise<void>(() => {});
-  const source = createCaptureSource(
-    preview.getVideoTracks()[0] as unknown as MediaStreamTrack,
-    "video",
+  const source = publishableVideoSource(
+    { kind: "video" },
+    createCaptureSource(
+      preview.getVideoTracks()[0] as unknown as MediaStreamTrack,
+      "video",
+    ),
   );
   let current: CaptureResult;
   let suspended = false;

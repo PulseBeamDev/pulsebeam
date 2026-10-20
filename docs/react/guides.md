@@ -23,7 +23,7 @@ All examples use `@pulsebeam/react`; `useAgent` supplies a handle from the first
 
 1. Call `useUserMedia({video: true, audio: true})` in a mounted component.
 2. From a click, call `capture.request()` and catch rejection.
-3. Render `<Video source={capture.videoTrack} mirror />`.
+3. Render `<Video source={capture.video} mirror />`.
 
 **You see:** your camera, without connecting an Agent. On join, bind the sources
 as in the quickstart. Keep the capture component mounted to keep its devices.
@@ -37,7 +37,7 @@ A captured-source preview ignores publication mute; a local-handle preview follo
    `{video: {device: camera, preferences: {height: 720}}, audio: true}`.
    Use `video: true` for the default camera without waiting for inventory.
 4. After an explicit request, option changes while active/acquiring replace capture
-   automatically. Keep the same JSX publication with `source={capture.videoTrack}`.
+   automatically. Keep the same JSX publication with `source={capture.video}`.
 
 **You see:** the new camera after success. Until then, the old capture stays.
 On failure it can remain `active` with an `error`; offer another device or relax
@@ -51,7 +51,7 @@ Unsupported permission changes may need device change, acquisition, or remount.
 ## Enablement, withdrawal, and release
 
 Get a stable component with `const Camera = agent.local.video("camera")` and
-render `<Camera source={capture.videoTrack} enabled={cameraOn} />`.
+render `<Camera source={capture.video} enabled={cameraOn} />`.
 
 | Button | Action | What changes |
 | --- | --- | --- |
@@ -71,7 +71,7 @@ that may exceed fixed topology. No publication synchronization effect is needed.
 1. Add `useDisplayMedia({video: true, audio: false})`.
 2. Call `share.request()` directly from a **Share screen** click; catch rejection.
 3. Get `const Screen = agent.local.video("screen")`, then render
-   `<Screen source={share.videoTrack} />`; set `preferences.content` to `detail` for text-heavy sharing.
+   `<Screen source={share.video} />`; set `preferences.content` to `detail` for text-heavy sharing.
    Preview with `<Video source={Screen} />` without mirroring.
 4. To stop, call `share.stop()`; JSX observes the cleared source.
 

@@ -207,8 +207,8 @@ function RoomSession({
       onClickCapture={recoverPlayback}
       onKeyDownCapture={recoverPlayback}
     >
-      <Camera source={capture.videoTrack} enabled={cameraOn} />
-      <Microphone source={capture.audioTrack} enabled={micOn} />
+      <Camera source={capture.video} enabled={cameraOn} />
+      <Microphone source={capture.audio} enabled={micOn} />
       <Screen source={screen} preferences={{ content: "detail" }} />
       <Chat
         key={`chat:${subscriptionRevision}`}

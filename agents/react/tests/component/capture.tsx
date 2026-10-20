@@ -132,10 +132,11 @@ export async function captureLifecycle() {
     "request resolves after committed result",
   );
   assert.deepEqual(capture.video, {
+    kind: "video",
     device: { kind: "camera", id: "cam", label: "Camera" },
     settings: { width: 640, frameRate: 24 },
   });
-  const source = capture.videoTrack;
+  const source = capture.video;
   const equalCount = captures.length;
   await flush(() => change({ video: { preferences: {} }, audio: false }));
   assert.equal(
@@ -166,7 +167,7 @@ export async function captureLifecycle() {
   assert.equal(capture.error?.code, "device-not-found");
   assert.equal(capture.error?.kind, "video");
   assert.equal(wrong.readyState, "ended");
-  assert.equal(capture.videoTrack, source);
+  assert.equal(capture.video, source);
   assert.equal(initial.readyState, "live");
   const failedCount = captures.length;
   await flush(() =>
@@ -180,7 +181,7 @@ export async function captureLifecycle() {
   const stopInitial = initial.stop.bind(initial);
   initial.stop = () => {
     assert.notEqual(
-      capture.videoTrack,
+      capture.video,
       source,
       "superseded originals are released after the replacement source commits",
     );
@@ -195,7 +196,7 @@ export async function captureLifecycle() {
   await pending;
   assert.deepEqual(
     capture.video,
-    { device: null, settings: { width: 960 } },
+    { kind: "video", device: null, settings: { width: 960 } },
     "unknown identity and settings are not fabricated",
   );
   assert.equal(initial.readyState, "ended");
@@ -228,7 +229,11 @@ export async function captureLifecycle() {
   await flush(() => displays.at(-1)!.resolve(new Stream([shared])));
   await pending;
   assert.equal(display.audio, null, "display audio is optional");
-  assert.deepEqual(display.video, { device: null, settings: { height: 1080 } });
+  assert.deepEqual(display.video, {
+    kind: "video",
+    device: null,
+    settings: { height: 1080 },
+  });
   const displayCount = displays.length;
   await flush(() =>
     changeDisplay({ video: { preferences: { height: 720 } }, audio: false }),

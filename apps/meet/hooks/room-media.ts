@@ -8,7 +8,7 @@ export function useRoomMedia(
   initial: { cameraOn: boolean; micOn: boolean },
 ) {
   const {
-    videoTrack: displayTrack,
+    video: displaySource,
     stop: stopDisplay,
     request: requestDisplay,
   } = useDisplayMedia({
@@ -35,7 +35,7 @@ export function useRoomMedia(
     }
   }, [requestDisplay, onFailure]);
   return {
-    screen: displayTrack,
+    screen: displaySource,
     Camera,
     Microphone,
     Screen,

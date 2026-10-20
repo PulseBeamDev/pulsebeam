@@ -1,17 +1,17 @@
 import { Box, IconButton, Stack, Typography } from "@mui/material";
 import { Mic, MicOff, Video as VideoIcon, VideoOff } from "lucide-react";
 import { Video } from "@pulsebeam/react";
-import type { CapturedVideoTrack } from "@pulsebeam/react";
+import type { VideoSource } from "@pulsebeam/react";
 
 export function MediaPreview({
-  videoTrack,
+  source,
   isCamOn,
   isMicOn,
   onToggleCam,
   onToggleMic,
   hasStream,
 }: {
-  videoTrack: CapturedVideoTrack | null;
+  source: VideoSource | null;
   isCamOn: boolean;
   isMicOn: boolean;
   onToggleCam(): void;
@@ -24,7 +24,7 @@ export function MediaPreview({
     <Box className="relative aspect-video overflow-hidden rounded-lg bg-slate-900">
       {hasStream && isCamOn ? (
         <Video
-          source={videoTrack}
+          source={source}
           autoPlay
           mirror
           className="h-full w-full object-contain"

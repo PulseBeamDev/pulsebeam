@@ -87,15 +87,15 @@ A new token alone does not clear a terminal failure.
 const Camera = agent.local.video("camera");
 const Microphone = agent.local.audio("microphone");
 // In the committed tree:
-<Camera source={capture.videoTrack} enabled={cameraOn} />;
-<Microphone source={capture.audioTrack} enabled={micOn} />;
+<Camera source={capture.video} enabled={cameraOn} />;
+<Microphone source={capture.audio} enabled={micOn} />;
 ```
 
 Each component renders no DOM. Props:
 
 | Prop | Contract |
 | --- | --- |
-| `source` | Required matching `CapturedVideoTrack` or `CapturedAudioTrack`, or null |
+| `source` | Required `PublishableVideoSource` or `PublishableAudioSource` of the matching kind, or null |
 | `enabled` | Default true; false sends black/silent media without withdrawing publication or stopping capture |
 | `preferences.content` | Video: `motion` (default), `detail`, `text`; audio: `speech` (default), `music` |
 | `preferences.degradation` | Optional `maintain-framerate`, `maintain-resolution`, or `balanced` |
@@ -109,14 +109,27 @@ ownership; unmount releases only that declaration. Neither stops caller capture.
 Replacement retains logical identity and committed enabled/preferences state.
 Tuning is best effort, not a codec guarantee or a substitute for enablement.
 
-`CapturedVideoTrack` and `CapturedAudioTrack` are opaque source identities,
-not browser tracks. Capture owns originals; each Agent borrows them and owns
-its sender resources. One Agent's mute does not mute another Agent or stop a device.
+`capture.video` and `capture.audio` are publishable sources with acquisition
+metadata. Pass them directly to publications or playback; no track extraction is
+needed. Capture owns originals; each Agent borrows them and owns its sender
+resources. One Agent's mute does not mute another Agent or stop a device.
+
+### Source types
+
+`VideoSource` and `AudioSource` are opaque, kind-specific SDK source contracts.
+Captured media, local publication handles, and remote handles satisfy the matching
+contract while exposing their own additional properties. A `{kind: "video"}` or
+browser track alone is not a source.
+
+`PublishableVideoSource` and `PublishableAudioSource` are narrower capabilities
+implemented by captured sources. Local and remote handles are not publishable
+inputs: accepting a source for playback does not enable remote forwarding or
+publication-to-publication routing.
 
 ## Video
 
-`Video` accepts captured video, a local video component handle, a remote video
-handle, or null. Null renders no DOM. It supports HTML video attributes except
+`Video.source` accepts `VideoSource` or null: pass `capture.video`, a local video
+component handle, or a remote video handle directly. Null renders no DOM. It supports HTML video attributes except
 `src` and `children`, plus `mirror` (false), `onPlaybackError`, and `preferences`.
 `autoPlay`, `muted`, and `playsInline` default to true.
 
@@ -183,14 +196,18 @@ Display options accept the same per-kind preferences but no device selector.
 The platform chooser owns selection. Video is required; display audio may be
 absent even when requested. Both user-media kinds false stops/returns idle.
 
-**CaptureResult** exposes readonly `videoTrack`, `audioTrack`, `video`, `audio`,
-`state` (`idle`, `requesting`, `active`, `error`), `error`, plus `request()` and
-`stop()`. Observed `video`/`audio` records are null without that live source:
+**CaptureResult** exposes readonly `video: CapturedVideo | null`,
+`audio: CapturedAudio | null`, `state` (`idle`, `requesting`, `active`, `error`),
+`error`, plus `request()` and `stop()`. Each captured object is both the usable
+source and its acquisition metadata; it is null without that live source:
 
+- `kind`: `video` or `audio`.
 - `device`: actual typed camera/microphone, or null when identity is unknown.
   Display selection is not fabricated as a camera/microphone.
-- `settings`: only actual track-reported values of the corresponding preferences.
-  Unknown fields are absent, never copied from the request. These are acquisition
+- `settings`: actual track-reported `VideoCaptureSettings` (width, height,
+  frameRate) or `AudioCaptureSettings` (echoCancellation, noiseSuppression,
+  autoGainControl). Unknown fields are absent, never copied from the requested
+  `VideoCapturePreferences` or `AudioCapturePreferences`. Settings are acquisition
   observations, not adaptive telemetry or raw browser settings dictionaries.
 
 User-media option changes reconcile after an explicit request while acquiring

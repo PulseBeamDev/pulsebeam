@@ -2,27 +2,39 @@ import type {
   RemoteMedia as WebRemoteMedia,
   RemoteParticipant as WebRemoteParticipant,
   RemoteVideoTrack as WebRemoteVideoTrack,
-  RemoteAudioTrack,
+  RemoteAudioTrack as WebRemoteAudioTrack,
 } from "@pulsebeam/web";
+import { attachRemoteVideo } from "@pulsebeam/web";
+import {
+  videoSource,
+  audioSource,
+  type VideoSource,
+  type AudioSource,
+} from "./sources.js";
 
-export type RemoteVideoTrack = Omit<WebRemoteVideoTrack, "setReceiveOptions">;
+export interface RemoteVideoTrack
+  extends Omit<WebRemoteVideoTrack, "setReceiveOptions">,
+    VideoSource {}
+export interface RemoteAudioTrack extends WebRemoteAudioTrack, AudioSource {}
 export interface RemoteParticipant
-  extends Omit<WebRemoteParticipant, "video" | "videoTracks"> {
+  extends Omit<
+    WebRemoteParticipant,
+    "video" | "videoTracks" | "audio" | "audioTracks"
+  > {
   video(label: string): RemoteVideoTrack;
+  audio(label: string): RemoteAudioTrack;
   readonly videoTracks: readonly RemoteVideoTrack[];
+  readonly audioTracks: readonly RemoteAudioTrack[];
 }
 export interface RemoteMedia
-  extends Omit<WebRemoteMedia, "participant" | "participants" | "videoTracks"> {
+  extends Omit<
+    WebRemoteMedia,
+    "participant" | "participants" | "videoTracks" | "audioTracks"
+  > {
   participant(externalId: string): RemoteParticipant;
   readonly participants: readonly RemoteParticipant[];
   readonly videoTracks: readonly RemoteVideoTrack[];
-}
-
-const videoSources = new WeakMap<RemoteVideoTrack, WebRemoteVideoTrack>();
-export function remoteVideoSource(
-  source: RemoteVideoTrack,
-): WebRemoteVideoTrack {
-  return videoSources.get(source) ?? (source as WebRemoteVideoTrack);
+  readonly audioTracks: readonly RemoteAudioTrack[];
 }
 
 function collections<T, U>(
@@ -41,39 +53,52 @@ function collections<T, U>(
 
 export function createRemoteMedia(raw: WebRemoteMedia): RemoteMedia {
   const videos = new WeakMap<WebRemoteVideoTrack, RemoteVideoTrack>();
-  const audios = new WeakMap<RemoteAudioTrack, RemoteAudioTrack>();
+  const audios = new WeakMap<WebRemoteAudioTrack, RemoteAudioTrack>();
   const participants = new WeakMap<WebRemoteParticipant, RemoteParticipant>();
   const video = (source: WebRemoteVideoTrack): RemoteVideoTrack => {
     let handle = videos.get(source);
     if (!handle) {
-      handle = Object.freeze({
-        kind: source.kind,
-        participantId: source.participantId,
-        label: source.label,
-        get active() {
-          return source.active;
-        },
-        subscribe: (listener: () => void) => source.subscribe(listener),
-      });
+      handle = Object.freeze(
+        videoSource(
+          {
+            kind: source.kind,
+            participantId: source.participantId,
+            label: source.label,
+            get active() {
+              return source.active;
+            },
+            subscribe: (listener: () => void) => source.subscribe(listener),
+          },
+          (element, onError, options) =>
+            attachRemoteVideo(
+              source,
+              element,
+              (failure, retry) =>
+                onError(failure.cause ?? new Error(failure.message), retry),
+              options,
+            ),
+        ),
+      );
       videos.set(source, handle);
-      videoSources.set(handle, source);
     }
     return handle;
   };
-  const audio = (source: RemoteAudioTrack): RemoteAudioTrack => {
+  const audio = (source: WebRemoteAudioTrack): RemoteAudioTrack => {
     let handle = audios.get(source);
     if (!handle) {
-      handle = Object.freeze({
-        kind: source.kind,
-        participantId: source.participantId,
-        label: source.label,
-        get receiving() {
-          return source.receiving;
-        },
-        subscribe: (listener: () => void) => source.subscribe(listener),
-        readWaveform: (buffer: Float32Array) => source.readWaveform(buffer),
-        readSpectrum: (buffer: Float32Array) => source.readSpectrum(buffer),
-      });
+      handle = Object.freeze(
+        audioSource({
+          kind: source.kind,
+          participantId: source.participantId,
+          label: source.label,
+          get receiving() {
+            return source.receiving;
+          },
+          subscribe: (listener: () => void) => source.subscribe(listener),
+          readWaveform: (buffer: Float32Array) => source.readWaveform(buffer),
+          readSpectrum: (buffer: Float32Array) => source.readSpectrum(buffer),
+        }),
+      );
       audios.set(source, handle);
     }
     return handle;

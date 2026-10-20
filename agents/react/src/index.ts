@@ -31,6 +31,8 @@ export type {
   AudioCaptureOptions,
   VideoCapturePreferences,
   AudioCapturePreferences,
+  VideoCaptureSettings,
+  AudioCaptureSettings,
   CapturedVideo,
   CapturedAudio,
   MediaDevicesResult,
@@ -44,11 +46,18 @@ export type {
   RemoteMedia,
   RemoteParticipant,
   RemoteVideoTrack,
+  RemoteAudioTrack,
   VideoPublicationProps,
   AudioPublicationProps,
   VideoPublicationPreferences,
   AudioPublicationPreferences,
 } from "./relationships.js";
+export type {
+  VideoSource,
+  AudioSource,
+  PublishableVideoSource,
+  PublishableAudioSource,
+} from "./sources.js";
 export type {
   AgentConfig,
   AgentError,
@@ -59,9 +68,6 @@ export type {
   MediaKind,
   MediaTopology,
   LogLevel,
-  CapturedAudioTrack,
-  CapturedVideoTrack,
-  RemoteAudioTrack,
   TopicCallbacks,
   TopicConsumerError,
   TopicGap,

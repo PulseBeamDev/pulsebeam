@@ -15,6 +15,7 @@ import {
   type TopicGap,
 } from "../../src/index.js";
 import { createCaptureSource } from "@pulsebeam/web";
+import { publishableVideoSource } from "../../src/sources.js";
 import { Track, flush } from "./platform.js";
 import { runtimes } from "./runtime.js";
 
@@ -48,9 +49,9 @@ export async function relationships() {
     }>,
   ) => void;
   const track = new Track("video");
-  const source = createCaptureSource(
-    track as unknown as MediaStreamTrack,
-    "video",
+  const source = publishableVideoSource(
+    { kind: "video" },
+    createCaptureSource(track as unknown as MediaStreamTrack, "video"),
   );
   const messages: {
     consumer: string;

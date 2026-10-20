@@ -18,8 +18,8 @@ export function Room({ config }: { config: AgentConfig }) {
 
   return (
     <main>
-      <Camera source={capture.videoTrack} />
-      <Microphone source={capture.audioTrack} />
+      <Camera source={capture.video} />
+      <Microphone source={capture.audio} />
       <h1>PulseBeam React room</h1>
       <p role="status">
         Connection: {agent.connection}; participant:{" "}
@@ -43,7 +43,7 @@ export function Room({ config }: { config: AgentConfig }) {
       </button>
       <h2>Local preview</h2>
       <Video
-        source={capture.videoTrack}
+        source={capture.video}
         mirror
         style={{ width: 320, height: 240 }}
         onPlaybackError={setPlayback}

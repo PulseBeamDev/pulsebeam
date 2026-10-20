@@ -37,7 +37,7 @@ These concepts explain the quickstart after you have tried it:
    Start capture from a user gesture. Connect alone does not open devices.
 3. **Publication:** `agent.local.video("camera")` and
    `agent.local.audio("microphone")` return stable labeled component handles.
-   Render `<Camera source={capture.videoTrack} />` to declare a committed
+   Render `<Camera source={capture.video} />` to declare a committed
    publication. Lookup alone does not publish or reserve a slot.
 4. **Remote media:** `agent.remote` exposes participants and publications.
    `Video` presents a track and requests reception while it is visible and

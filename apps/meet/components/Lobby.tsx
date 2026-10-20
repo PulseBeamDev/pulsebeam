@@ -28,7 +28,7 @@ export function Lobby({
   const [token, setToken] = useState("");
   const [serverURL, setServerURL] = useState(defaultServerUrl);
   const { capture, devices } = useMeetMedia();
-  const { videoTrack, audioTrack, error, request } = capture;
+  const { video, audio, error, request } = capture;
   const [isMicOn, setMicOn] = useState(true);
   const [isCamOn, setCamOn] = useState(true);
   const endpoint = normalizeEndpoint(serverURL);
@@ -65,12 +65,12 @@ export function Lobby({
             </Typography>
           </Box>
           <MediaPreview
-            videoTrack={videoTrack}
+            source={video}
             isCamOn={isCamOn}
             isMicOn={isMicOn}
             onToggleCam={() => setCamOn((value) => !value)}
             onToggleMic={() => setMicOn((value) => !value)}
-            hasStream={Boolean(videoTrack || audioTrack)}
+            hasStream={Boolean(video || audio)}
           />
           {(error || devices.error) && (
             <Alert
@@ -95,7 +95,7 @@ export function Lobby({
             spacing={2}
             onSubmit={(event) => {
               event.preventDefault();
-              if (videoTrack && audioTrack && endpoint)
+              if (video && audio && endpoint)
                 onJoin(token, endpoint, isCamOn, isMicOn);
             }}
           >
@@ -125,7 +125,7 @@ export function Lobby({
               size="large"
               variant="contained"
               fullWidth
-              disabled={!videoTrack || !audioTrack || !endpoint}
+              disabled={!video || !audio || !endpoint}
             >
               Join room
             </Button>

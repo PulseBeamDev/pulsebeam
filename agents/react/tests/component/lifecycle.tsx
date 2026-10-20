@@ -40,7 +40,7 @@ function Room() {
   setEnabled = updateEnabled;
   return (
     <section>
-      <Camera source={capture.videoTrack} enabled={enabled} />
+      <Camera source={capture.video} enabled={enabled} />
       <output>{agent.connection}</output>
       <Video
         source={Camera}
@@ -49,6 +49,7 @@ function Room() {
           playback = failure;
         }}
       />
+      <Video source={capture.video} data-testid="captured-preview" />
     </section>
   );
 }
@@ -81,6 +82,19 @@ assert.equal(
   (element.srcObject as any).getVideoTracks()[0],
   owned.getVideoTracks()[0],
 );
+const capturedPreview = host.querySelector<HTMLVideoElement>(
+  '[data-testid="captured-preview"]',
+)!;
+assert.equal(
+  (capturedPreview.srcObject as any).getVideoTracks()[0],
+  owned.getVideoTracks()[0],
+  "grouped capture sources render directly through the shared source contract",
+);
+assert.deepEqual(
+  runtimes.at(-1)!.desired.video,
+  [],
+  "local and captured previews create no remote demand",
+);
 assert.equal(element.muted, true);
 assert.match(element.style.transform, /scaleX\(-1\)/);
 const first = agent!;
@@ -109,6 +123,11 @@ assert.equal(
   "muting detaches preview without stopping capture",
 );
 assert.equal(owned.getVideoTracks()[0].readyState, "live");
+assert.equal(
+  (capturedPreview.srcObject as any).getVideoTracks()[0],
+  owned.getVideoTracks()[0],
+  "publication mute cannot detach a captured-source preview",
+);
 await flush(() => {
   setEnabled(true);
 });
@@ -178,6 +197,7 @@ assert.ok(
   "unmount releases current and stale captures, including muted audio",
 );
 assert.equal(element.srcObject, null);
+assert.equal(capturedPreview.srcObject, null);
 assert.equal(host.childElementCount, 0);
 assert.ok(runtimes.every((runtime) => runtime.closed));
 host.remove();

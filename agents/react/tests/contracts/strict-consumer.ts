@@ -9,6 +9,12 @@ import {
   type CameraDevice,
   type MicrophoneDevice,
   type SpeakerDevice,
+  type VideoSource,
+  type AudioSource,
+  type PublishableVideoSource,
+  type PublishableAudioSource,
+  type VideoCaptureSettings,
+  type AudioCaptureSettings,
 } from "@pulsebeam/react";
 import { createAgent } from "@pulsebeam/web";
 import { createElement } from "react";
@@ -65,18 +71,18 @@ useDisplayMedia({ video: { device: cameraDevice }, audio: false });
 const Camera = owned.local.video("camera");
 const Microphone = owned.local.audio("microphone");
 createElement(Camera, {
-  source: camera.videoTrack,
+  source: camera.video,
   enabled: false,
   preferences: { content: "detail", degradation: "balanced" },
 });
 createElement(Microphone, {
-  source: camera.audioTrack,
+  source: camera.audio,
   preferences: { content: "music" },
 });
 // @ts-expect-error Audio source cannot bind video publication.
-createElement(Camera, { source: camera.audioTrack });
+createElement(Camera, { source: camera.audio });
 // @ts-expect-error No normal imperative publication setter.
-Camera.setSource(camera.videoTrack);
+Camera.setSource(camera.video);
 // @ts-expect-error No competing normal desired-state API.
 owned.setState({ connected: true });
 // @ts-expect-error React owns release.
@@ -116,11 +122,51 @@ Video({
   },
 });
 Video({ source: Camera });
-Video({ source: camera.videoTrack });
+Video({ source: camera.video });
 owned.remote
   .participant("alice")
   .audio("microphone")
   .readWaveform(new Float32Array(2048));
+const videoSources: readonly (VideoSource | null)[] = [
+  camera.video,
+  Camera,
+  remote,
+];
+const audioSources: readonly (AudioSource | null)[] = [
+  camera.audio,
+  Microphone,
+  owned.remote.participant("alice").audio("microphone"),
+];
+const publishableVideo: PublishableVideoSource | null = camera.video;
+const publishableAudio: PublishableAudioSource | null = camera.audio;
+const videoSettings: VideoCaptureSettings | undefined = camera.video?.settings;
+const audioSettings: AudioCaptureSettings | undefined = camera.audio?.settings;
+for (const source of videoSources) createElement(Video, { source });
+// @ts-expect-error Remote playback is not remote forwarding.
+createElement(Camera, { source: remote });
+// @ts-expect-error Publication handles are not publishable inputs.
+createElement(Camera, { source: Camera });
+createElement(Microphone, {
+  // @ts-expect-error Remote audio is not a publishable input.
+  source: owned.remote.participant("alice").audio("microphone"),
+});
+// @ts-expect-error Audio sources cannot be rendered as video.
+createElement(Video, { source: camera.audio });
+// @ts-expect-error Kind alone is not a valid source capability.
+createElement(Video, { source: { kind: "video" } });
+// @ts-expect-error Capture no longer splits track from metadata.
+camera.videoTrack;
+// @ts-expect-error Capture no longer splits track from metadata.
+camera.audioTrack;
+// @ts-expect-error Capture sources do not expose their underlying tracks.
+camera.video?.track;
+void [
+  audioSources,
+  publishableVideo,
+  publishableAudio,
+  videoSettings,
+  audioSettings,
+];
 const actualWidth: number | undefined = camera.video?.settings.width;
 void [
   camera.video?.device,

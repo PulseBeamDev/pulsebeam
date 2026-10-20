@@ -103,7 +103,7 @@ export function Call({ sessionId, token }: { sessionId: string; token: string })
     <>
       <button onClick={enableDevices}>Enable camera & mic</button>
       {media.error && <p role="alert">{media.error.message}</p>}
-      <Video source={media.videoTrack} mirror style={{ width: 320, height: 240 }} />
+      <Video source={media.video} mirror style={{ width: 320, height: 240 }} />
       <Room key={sessionId} token={token} media={media} />
     </>
   );
@@ -117,8 +117,8 @@ function Room({ token, media }: { token: string; media: CaptureResult }) {
 
   return (
     <>
-      <Camera source={media.videoTrack} />
-      <Microphone source={media.audioTrack} />
+      <Camera source={media.video} />
+      <Microphone source={media.audio} />
       <button onClick={() => agent.connect()}>Join room</button>
       <button onClick={() => agent.disconnect()}>Leave room</button>
       <p>Connection: {agent.connection}</p>

@@ -7,11 +7,13 @@ import {
   useState,
 } from "react";
 import { useCommittedRef } from "./committed-ref.js";
+import { createCaptureSource } from "@pulsebeam/web";
 import {
-  createCaptureSource,
-  type CapturedAudioTrack,
-  type CapturedVideoTrack,
-} from "@pulsebeam/web";
+  publishableVideoSource,
+  publishableAudioSource,
+  type PublishableVideoSource,
+  type PublishableAudioSource,
+} from "./sources.js";
 
 export type MediaCaptureErrorCode =
   | "permission-denied"
@@ -184,17 +186,25 @@ export type DisplayMediaOptions = Readonly<{
   video: boolean | { readonly preferences?: VideoCapturePreferences };
   audio: boolean | { readonly preferences?: AudioCapturePreferences };
 }>;
-export interface CapturedVideo {
-  readonly device: CameraDevice | null;
-  readonly settings: VideoCapturePreferences;
+export interface VideoCaptureSettings {
+  readonly width?: number;
+  readonly height?: number;
+  readonly frameRate?: number;
 }
-export interface CapturedAudio {
+export interface AudioCaptureSettings {
+  readonly echoCancellation?: boolean;
+  readonly noiseSuppression?: boolean;
+  readonly autoGainControl?: boolean;
+}
+export interface CapturedVideo extends PublishableVideoSource {
+  readonly device: CameraDevice | null;
+  readonly settings: VideoCaptureSettings;
+}
+export interface CapturedAudio extends PublishableAudioSource {
   readonly device: MicrophoneDevice | null;
-  readonly settings: AudioCapturePreferences;
+  readonly settings: AudioCaptureSettings;
 }
 export interface CaptureResult {
-  readonly videoTrack: CapturedVideoTrack | null;
-  readonly audioTrack: CapturedAudioTrack | null;
   readonly video: CapturedVideo | null;
   readonly audio: CapturedAudio | null;
   readonly state: "idle" | "requesting" | "active" | "error";
@@ -205,8 +215,6 @@ export interface CaptureResult {
 
 type CaptureSnapshot = Omit<CaptureResult, "request" | "stop">;
 const EMPTY_CAPTURE: CaptureSnapshot = {
-  videoTrack: null,
-  audioTrack: null,
   video: null,
   audio: null,
   state: "idle",
@@ -328,12 +336,26 @@ function constraints(
   return { video: translate("video"), audio: translate("audio") };
 }
 
+type VideoObservation = Pick<CapturedVideo, "device" | "settings">;
+type AudioObservation = Pick<CapturedAudio, "device" | "settings">;
+function observe(
+  track: MediaStreamTrack,
+  kind: "video",
+  options: UserMediaOptions | DisplayMediaOptions,
+  display: boolean,
+): VideoObservation;
+function observe(
+  track: MediaStreamTrack,
+  kind: "audio",
+  options: UserMediaOptions | DisplayMediaOptions,
+  display: boolean,
+): AudioObservation;
 function observe(
   track: MediaStreamTrack,
   kind: "video" | "audio",
   options: UserMediaOptions | DisplayMediaOptions,
   display: boolean,
-): CapturedVideo | CapturedAudio {
+): VideoObservation | AudioObservation {
   const actual = track.getSettings();
   const chosen = options[kind];
   const selected =
@@ -367,7 +389,7 @@ function observe(
     )
       settings[key] = value!;
   }
-  return { device, settings } as CapturedVideo | CapturedAudio;
+  return { device, settings } as VideoObservation | AudioObservation;
 }
 
 function useCapture(
@@ -470,21 +492,19 @@ function useCapture(
           );
       }
       const next: CaptureSnapshot = {
-        videoTrack:
-          video?.readyState === "live"
-            ? createCaptureSource(video, "video")
-            : null,
-        audioTrack:
-          audio?.readyState === "live"
-            ? createCaptureSource(audio, "audio")
-            : null,
         video:
           video?.readyState === "live"
-            ? (observe(video, "video", chosen, display) as CapturedVideo)
+            ? publishableVideoSource(
+                { kind: "video", ...observe(video, "video", chosen, display) },
+                createCaptureSource(video, "video"),
+              )
             : null,
         audio:
           audio?.readyState === "live"
-            ? (observe(audio, "audio", chosen, display) as CapturedAudio)
+            ? publishableAudioSource(
+                { kind: "audio", ...observe(audio, "audio", chosen, display) },
+                createCaptureSource(audio, "audio"),
+              )
             : null,
         state: "active",
         error: null,
@@ -505,14 +525,12 @@ function useCapture(
           if (video?.readyState === "ended") {
             session.snapshot = {
               ...session.snapshot,
-              videoTrack: null,
               video: null,
             };
           }
           if (audio?.readyState === "ended") {
             session.snapshot = {
               ...session.snapshot,
-              audioTrack: null,
               audio: null,
             };
           }
