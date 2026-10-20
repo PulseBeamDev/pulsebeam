@@ -3186,7 +3186,7 @@ fn topic_boundaries_reject_malformed_cross_mode_unknown_and_oversized_input() {
 }
 
 #[test]
-fn lossy_keeps_distinct_admitted_messages_without_latest_coalescing_or_ordering() {
+fn lossy_keeps_distinct_messages_without_duplicates_coalescing_or_ordering() {
     let registrations = TopicRegistrations {
         publishers: vec![publisher("events", TopicMode::Lossy)],
         subscribers: vec![subscriber("events", TopicMode::Lossy)],
@@ -3215,7 +3215,7 @@ fn lossy_keeps_distinct_admitted_messages_without_latest_coalescing_or_ordering(
     assert_eq!(agent.snapshot().topics.dropped_sends, 0);
     drain_notifications(&mut agent);
     let id = data_id(false, "events", TopicMode::Lossy, "first");
-    for sequence in [2, 0, 1] {
+    for sequence in [2, 2, 0, 1, 0] {
         topic_input(
             &mut agent,
             generation,
@@ -3235,6 +3235,7 @@ fn lossy_keeps_distinct_admitted_messages_without_latest_coalescing_or_ordering(
             .collect::<Vec<_>>(),
         vec![2, 0, 1]
     );
+    assert_eq!(agent.snapshot().topics.delivered_messages, 3);
     assert!(events.iter().all(|event| !matches!(
         event,
         Notification::Topic(TopicNotification::RecoveryGap { .. })

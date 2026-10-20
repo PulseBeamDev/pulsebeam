@@ -313,10 +313,13 @@ Generic `T` does not validate untrusted JSON or authorize its contents.
 | --- | --- |
 | `latest` | Replaceable state per publisher data track; a newer value may supersede pending values of that track, never another publisher's value |
 | `lossy` | Distinct best-effort events; no intentional latest-value replacement, ordering, or recovery |
-| `ordered` | Distinct messages in increasing sequence per track; recovery copies are deduplicated, with finite retained history and reorder state |
+| `ordered` | Distinct messages in increasing sequence per track, with finite retained history and reorder state |
 
-Latest never delivers an older or duplicate sequence after a newer one from the
-same track. Nonrecovering modes do not replay history or synthesize ordered gaps.
+Every mode suppresses duplicate `(dataTrackId, sequence)` identities before
+calling the application. Latest never delivers an older sequence after a newer
+one from the same track. Lossy retains a finite reordering window and may discard
+a unique event that arrives after that window has advanced. Nonrecovering modes
+do not replay history or synthesize ordered gaps.
 Ordered subscriptions start at a **live frontier**, without replaying
 pre-subscription messages or calling historical traffic a gap. Once established,
 a missing range is recovered when retained state permits; otherwise a gap precedes

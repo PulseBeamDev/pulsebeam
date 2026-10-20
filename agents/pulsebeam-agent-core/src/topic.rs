@@ -24,6 +24,7 @@ pub const MAX_TOPIC_CHANNELS: usize = 64;
 pub const MAX_TOPIC_PAYLOAD_BYTES: usize = pulsebeam_proto::topic::MAX_PAYLOAD_BYTES;
 pub const TOPIC_HISTORY_CAPACITY: usize = 256;
 pub const TOPIC_REORDER_CAPACITY: usize = 256;
+const TOPIC_DEDUPLICATION_CAPACITY: usize = 256;
 pub const TOPIC_SEND_QUEUE_CAPACITY: usize = 256;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -212,6 +213,7 @@ struct PublisherState {
 #[derive(Default)]
 struct SubscriberState {
     latest: BTreeMap<String, u64>,
+    lossy: BTreeMap<String, LossyDelivery>,
     ordered: BTreeMap<String, OrderedDelivery>,
 }
 
@@ -389,6 +391,11 @@ impl Topics {
         }
         for (subscriber, state) in &mut self.subscribers {
             state.latest.retain(|id, _| {
+                self.catalog
+                    .get(id)
+                    .is_some_and(|binding| binding.matches(subscriber))
+            });
+            state.lossy.retain(|id, _| {
                 self.catalog
                     .get(id)
                     .is_some_and(|binding| binding.matches(subscriber))
@@ -868,7 +875,14 @@ impl Topics {
                         }
                     }
                     (TopicMode::Lossy, Some(Body::Message(message))) => {
-                        self.deliver(&subscriber, &binding, alloc::vec![message], notifications);
+                        if state.lossy.entry(id).or_default().accept(message.sequence) {
+                            self.deliver(
+                                &subscriber,
+                                &binding,
+                                alloc::vec![message],
+                                notifications,
+                            );
+                        }
                     }
                     (TopicMode::Ordered, body) => {
                         let delivery = state.ordered.entry(id.clone()).or_default();
@@ -1236,6 +1250,27 @@ impl Topics {
 }
 
 #[derive(Default)]
+struct LossyDelivery {
+    floor: u64,
+    seen: BTreeSet<u64>,
+}
+
+impl LossyDelivery {
+    fn accept(&mut self, sequence: u64) -> bool {
+        if sequence < self.floor || !self.seen.insert(sequence) {
+            return false;
+        }
+        if self.seen.last().is_some_and(|highest| *highest == sequence) {
+            self.floor = sequence.saturating_sub(
+                u64::try_from(TOPIC_DEDUPLICATION_CAPACITY.saturating_sub(1)).unwrap_or(u64::MAX),
+            );
+            self.seen.retain(|seen| *seen >= self.floor);
+        }
+        true
+    }
+}
+
+#[derive(Default)]
 struct OrderedDelivery {
     next_sequence: Option<u64>,
     pending: BTreeMap<u64, WireMessage>,
@@ -1330,6 +1365,21 @@ mod tests {
             sequence,
             payload: alloc::vec![42],
         }
+    }
+
+    #[test]
+    fn lossy_deduplicates_with_a_bounded_reordering_window() {
+        let mut delivery = LossyDelivery::default();
+        assert!(delivery.accept(2));
+        assert!(!delivery.accept(2));
+        assert!(delivery.accept(0));
+        assert!(delivery.accept(1));
+        for sequence in 3..300 {
+            assert!(delivery.accept(sequence));
+        }
+        assert!(delivery.seen.len() <= TOPIC_DEDUPLICATION_CAPACITY);
+        assert!(!delivery.accept(0));
+        assert!(!delivery.accept(299));
     }
 
     #[test]

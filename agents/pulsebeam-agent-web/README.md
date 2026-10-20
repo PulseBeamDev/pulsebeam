@@ -248,13 +248,15 @@ if wanted, is application-owned and is not evidence of remote delivery.
 
 | Mode | Delivery within one publisher data track |
 | --- | --- |
-| `latest` | Replaceable state; older or duplicate sequences are suppressed and queued values may coalesce for that track only |
+| `latest` | Replaceable state; older sequences are suppressed and queued values may coalesce for that track only |
 | `lossy` | Distinct best-effort events; no intentional coalescing, ordering, or recovery |
-| `ordered` | Increasing, deduplicated messages with finite recovery; an inline gap precedes continuation when a known range is skipped |
+| `ordered` | Increasing messages with finite recovery; an inline gap precedes continuation when a known range is skipped |
 
-There is no global order across publishers, initial state snapshot, offline replay,
-or durable history. New ordered consumers start at a live frontier, not at sequence
-zero. Reopening or reconnecting creates a fresh `dataTrackId` and sequence space;
+Every mode suppresses duplicate `(dataTrackId, sequence)` identities before they
+reach the application. Lossy delivery retains a finite reordering window and may
+discard a unique event that arrives after that window has advanced. There is no
+global order across publishers, initial state snapshot, offline replay, or durable
+history. New ordered consumers start at a live frontier, not at sequence zero. Reopening or reconnecting creates a fresh `dataTrackId` and sequence space;
 recovery does not span those publication lifetimes.
 
 Each yielded `TopicEvent<T>` is a tagged `message` or `gap`. Both carry
