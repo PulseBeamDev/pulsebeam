@@ -7,8 +7,9 @@ use pulsebeam_agent_native::agent_core::{MediaKind, Publication, TopicMode, Topi
 use pulsebeam_core::auth::DEVELOPMENT_PROJECT_ID;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-/// Plan identities are bound at admission. Publication identities are derived by
-/// the canonical identity owner, never learned from a receiver or forwarded RTP.
+/// Plan identities are bound at admission. Media identities are derived by the
+/// canonical owner; data identities are allocated by the server at channel open.
+/// Neither is learned from a receiver or forwarded application payload.
 #[derive(Clone, Debug)]
 pub struct ExpectedParticipant {
     pub id: ParticipantId,
@@ -35,22 +36,41 @@ impl ExpectedParticipant {
             .derive_track_id(kind, label)
     }
 
-    fn tracks(&self) -> impl Iterator<Item = (TrackId, String)> + '_ {
-        self.publications()
+    fn tracks(&self, control: &ControlObservation) -> Result<Vec<(TrackId, String)>> {
+        let mut tracks = self
+            .publications()
             .map(|publication| {
                 (
                     publication.id.parse().expect("canonical publication"),
                     publication.label,
                 )
             })
-            .chain(self.topics.publishers.iter().map(|publisher| {
-                let lane = match publisher.mode {
-                    TopicMode::Latest => "rt",
-                    TopicMode::Ordered => "rel",
-                };
-                let label = format!("v1/{lane}/{}", publisher.topic);
-                (self.track_id(TrackKind::Data, &label), label)
-            }))
+            .collect::<Vec<_>>();
+        for publisher in &self.topics.publishers {
+            let lane = match publisher.mode {
+                TopicMode::Latest => "rt",
+                TopicMode::Ordered => "rel",
+            };
+            let label = format!("v1/{lane}/{}", publisher.topic);
+            let mut publications = control.tracks.iter().filter(|track| {
+                track.meta.origin == self.id
+                    && track.meta.id.kind() == TrackKind::Data
+                    && track.meta.label.as_ref() == Some(&label)
+            });
+            let publication = publications.next();
+            ensure!(
+                publications.next().is_none(),
+                "duplicate data publication for {label}"
+            );
+            ensure!(
+                !self.required || publication.is_some(),
+                "missing required data publication {label}"
+            );
+            if let Some(publication) = publication {
+                tracks.push((publication.meta.id, label));
+            }
+        }
+        Ok(tracks)
     }
 
     fn publications(&self) -> impl Iterator<Item = Publication> + '_ {
@@ -550,15 +570,15 @@ impl ControlStateOracle {
                 "control owner/transport mismatch"
             );
         }
-        let expected_tracks = self
-            .participants
-            .iter()
-            .flat_map(|participant| {
-                participant
-                    .tracks()
-                    .map(move |(id, label)| (id, (participant, label)))
-            })
-            .collect::<HashMap<_, _>>();
+        let mut expected_tracks = HashMap::new();
+        for participant in &self.participants {
+            for (id, label) in participant.tracks(control)? {
+                ensure!(
+                    expected_tracks.insert(id, (participant, label)).is_none(),
+                    "publication identity reused across owners"
+                );
+            }
+        }
         let track_ids = control
             .tracks
             .iter()

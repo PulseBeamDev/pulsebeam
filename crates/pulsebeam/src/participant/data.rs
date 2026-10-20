@@ -20,13 +20,28 @@ pub(super) struct DataChannelState {
 
 pub(super) struct DataState {
     channels: HashMap<ChannelId, DataChannelState>,
+    next_publication: u64,
 }
 
 impl DataState {
     pub(super) fn new() -> Self {
         Self {
             channels: HashMap::new(),
+            next_publication: 0,
         }
+    }
+
+    pub(super) fn allocate_publication(
+        &mut self,
+        connection: crate::entity::ConnectionId,
+        label: &str,
+    ) -> Option<crate::entity::TrackId> {
+        let incarnation = self.next_publication.checked_add(1)?;
+        self.next_publication = incarnation;
+        Some(connection.derive_track_id(
+            crate::entity::TrackKind::Data,
+            &format!("{label}/{incarnation}"),
+        ))
     }
 
     pub(super) fn open(
@@ -74,6 +89,12 @@ impl DataState {
         self.channels.get(&cid).map(|state| &state.channel)
     }
 
+    pub(super) fn publications(&self) -> impl Iterator<Item = &TrackMeta> {
+        self.channels
+            .values()
+            .filter_map(|state| state.publication.as_ref())
+    }
+
     pub(super) fn channels_snapshot(&self) -> Vec<(ChannelId, DataTopicChannel)> {
         self.channels
             .iter()
@@ -97,6 +118,28 @@ mod tests {
         id::ShardId,
         track::{DataLane, Topic},
     };
+
+    #[test]
+    fn publication_identity_is_fresh_on_reopen_and_exhaustion_is_explicit() {
+        let connection = ConnectionId::new();
+        let mut state = DataState::new();
+        let first = state
+            .allocate_publication(connection, "v1/rel/chat")
+            .unwrap();
+        let second = state
+            .allocate_publication(connection, "v1/rel/chat")
+            .unwrap();
+        assert_ne!(first, second);
+        assert_eq!(first.kind(), TrackKind::Data);
+        assert_ne!(
+            second,
+            state
+                .allocate_publication(ConnectionId::new(), "v1/rel/chat")
+                .unwrap()
+        );
+        state.next_publication = u64::MAX;
+        assert_eq!(state.allocate_publication(connection, "v1/rel/chat"), None);
+    }
 
     #[test]
     fn data_publication_closes_with_its_original_connection_metadata() {

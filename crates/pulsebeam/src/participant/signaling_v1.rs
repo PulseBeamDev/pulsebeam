@@ -349,6 +349,7 @@ impl CatalogState {
             return Err(CatalogError::MissingIdentity);
         }
         let mut participants = HashMap::new();
+        participants.insert(recipient.as_str(), recipient_external_id.to_owned());
         let mut external_ids = HashSet::new();
         external_ids.insert(recipient_external_id.to_owned());
         for peer in peers {
@@ -369,7 +370,7 @@ impl CatalogState {
         let mut visible_tracks = HashMap::new();
         let mut labels = HashSet::new();
         for meta in tracks {
-            if meta.origin == recipient || meta.id.kind() == TrackKind::Data {
+            if meta.origin == recipient && meta.id.kind() != TrackKind::Data {
                 continue;
             }
             let publisher = meta.origin.as_str();
@@ -377,15 +378,34 @@ impl CatalogState {
                 return Err(CatalogError::MissingPublisher);
             }
             let label = meta.label.ok_or(CatalogError::MissingIdentity)?;
-            let kind = match meta.id.kind() {
-                TrackKind::Audio => WireKind::Audio,
-                TrackKind::Video => WireKind::Video,
-                TrackKind::Data => continue,
+            let (kind, label, mode) = match meta.id.kind() {
+                TrackKind::Audio => (WireKind::Audio, label, 0),
+                TrackKind::Video => (WireKind::Video, label, 0),
+                TrackKind::Data => {
+                    let (mode, topic) = label
+                        .strip_prefix("v1/")
+                        .and_then(|label| label.split_once('/'))
+                        .ok_or(CatalogError::MissingIdentity)?;
+                    let mode = match mode {
+                        "rt" => pulsebeam_proto::signaling_v1::TopicMode::Latest,
+                        "rel" => pulsebeam_proto::signaling_v1::TopicMode::Ordered,
+                        _ => return Err(CatalogError::MissingIdentity),
+                    };
+                    if topic.is_empty()
+                        || topic.len() > 85
+                        || !topic
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+                    {
+                        return Err(CatalogError::MissingIdentity);
+                    }
+                    (WireKind::Data, topic.to_owned(), mode as i32)
+                }
             };
-            if label.is_empty() || label.len() > 64 {
+            if label.is_empty() || (kind != WireKind::Data && label.len() > 64) {
                 return Err(CatalogError::MissingIdentity);
             }
-            if !labels.insert((publisher.clone(), kind as i32, label.clone())) {
+            if !labels.insert((publisher.clone(), kind as i32, label.clone(), mode)) {
                 return Err(CatalogError::DuplicateIdentity);
             }
             let id = meta.id.as_str();
@@ -394,6 +414,7 @@ impl CatalogState {
                 participant_id: publisher,
                 kind: kind as i32,
                 label,
+                mode,
             };
             if visible_tracks.insert(id, remote).is_some() {
                 return Err(CatalogError::DuplicateIdentity);
@@ -1203,6 +1224,66 @@ mod tests {
                 "self"
             ),
             Err(CatalogError::ChangedIdentity)
+        ));
+    }
+
+    #[test]
+    fn catalog_binds_local_and_remote_data_without_media_label_or_receiver_limits() {
+        use pulsebeam_proto::signaling_v1::{
+            TopicMode, TrackKind as WireKind, catalog, server_message,
+        };
+        let recipient = crate::entity::ParticipantId::new();
+        let publisher = crate::entity::ParticipantId::new();
+        let connection = crate::entity::ConnectionId::new();
+        let topic = "x".repeat(85);
+        let make_data = |owner, lane: &str| {
+            let mut meta = remote_audio(owner, connection, "unused");
+            let label = format!("v1/{lane}/{topic}");
+            meta.id =
+                connection.derive_track_id(TrackKind::Data, &format!("{label}/{}", owner.as_str()));
+            meta.label = Some(label);
+            meta
+        };
+        let local = make_data(recipient, "rt");
+        let remote = make_data(publisher, "rel");
+        let mut state = CatalogState::default();
+        let plan = state
+            .plan(
+                [peer(publisher, "alice")],
+                [
+                    local.clone(),
+                    remote.clone(),
+                    remote_audio(recipient, connection, "mic"),
+                ],
+                recipient,
+                "self",
+            )
+            .unwrap()
+            .unwrap();
+        let Some(server_message::Payload::Catalog(catalog)) = &plan.message.payload else {
+            panic!("expected Catalog");
+        };
+        let Some(catalog::State::Snapshot(snapshot)) = &catalog.state else {
+            panic!("expected snapshot");
+        };
+        assert_eq!(snapshot.participants.len(), 2);
+        assert_eq!(snapshot.tracks.len(), 2);
+        for (meta, mode) in [(&local, TopicMode::Latest), (&remote, TopicMode::Ordered)] {
+            let entry = snapshot
+                .tracks
+                .iter()
+                .find(|entry| entry.track_id == meta.id.as_str())
+                .unwrap();
+            assert_eq!(entry.participant_id, meta.origin.as_str());
+            assert_eq!(entry.kind, WireKind::Data as i32);
+            assert_eq!(entry.label, topic);
+            assert_eq!(entry.mode, mode as i32);
+        }
+        state.commit(plan);
+        assert!(state.mapping(1, [], []).is_ok());
+        assert!(matches!(
+            state.mapping(1, [], [(0, remote.id)]),
+            Err(MappingError::WrongKind)
         ));
     }
 

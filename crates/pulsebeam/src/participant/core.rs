@@ -355,6 +355,8 @@ impl Participant {
         debug_assert_ne!(participant_id, self.participant_id);
         if track.kind() != TrackKind::Data {
             self.on_track_published(key, track);
+        } else {
+            self.signaling.mark_dirty();
         }
     }
 
@@ -388,6 +390,8 @@ impl Participant {
         debug_assert_ne!(candidate.participant_id, self.participant_id);
         if track_id.kind() != TrackKind::Data {
             let _ = self.on_tracks_unpublished(std::slice::from_ref(&track_id));
+        } else {
+            self.signaling.mark_dirty();
         }
     }
 
@@ -729,7 +733,8 @@ impl Participant {
             }
 
             if self.signaling.needs_poll() {
-                let publications = self.downstream.native_publications();
+                let mut publications = self.downstream.native_publications();
+                publications.extend(self.data.publications().cloned());
                 let assignments = self.downstream.native_assignments();
                 match self.signaling.poll(
                     &publications,
@@ -896,26 +901,31 @@ impl Participant {
                             self.upstream.data.close(cid);
                             self.release_data_channel(previous, events);
                         }
-                        let publication =
-                            (channel.direction == DataTrackDirection::Publish).then(|| {
-                                let label =
-                                    crate::track::publication_label(channel.lane, &channel.topic);
-                                Track::data(
-                                    crate::track::TrackMeta {
-                                        room_id: self.room_id,
-                                        shard_id: self.shard_id,
-                                        id: self
-                                            .connection_id
-                                            .derive_track_id(TrackKind::Data, &label),
-                                        origin: self.participant_id,
-                                        connection_id: self.connection_id,
-                                        label: Some(label),
-                                    },
-                                    channel.topic.clone(),
-                                    channel.lane,
-                                    None,
-                                )
-                            });
+                        let publication = if channel.direction == DataTrackDirection::Publish {
+                            let label =
+                                crate::track::publication_label(channel.lane, &channel.topic);
+                            let Some(id) =
+                                self.data.allocate_publication(self.connection_id, &label)
+                            else {
+                                self.disconnect(DisconnectReason::SignalingOutput);
+                                return;
+                            };
+                            Some(Track::data(
+                                crate::track::TrackMeta {
+                                    room_id: self.room_id,
+                                    shard_id: self.shard_id,
+                                    id,
+                                    origin: self.participant_id,
+                                    connection_id: self.connection_id,
+                                    label: Some(label),
+                                },
+                                channel.topic.clone(),
+                                channel.lane,
+                                None,
+                            ))
+                        } else {
+                            None
+                        };
                         let meta = publication.as_ref().map(|track| track.meta().clone());
                         if let Err(error) = self.data.open(cid, channel.clone(), meta) {
                             self.disconnect(match error {
@@ -931,6 +941,7 @@ impl Participant {
                         if let Some(track) = publication {
                             self.upstream.data.publish(cid, &track);
                             events.publish_track(track);
+                            self.signaling.mark_dirty();
                         } else {
                             events.subscribe_tracks(
                                 DataState::selector(&channel),
@@ -951,6 +962,7 @@ impl Participant {
                 self.downstream.data.close(cid);
                 self.upstream.data.close(cid);
                 self.release_data_channel(channel, events);
+                self.signaling.mark_dirty();
             }
             Event::ChannelData(data) => {
                 if Some(data.id) == self.signaling.cid {

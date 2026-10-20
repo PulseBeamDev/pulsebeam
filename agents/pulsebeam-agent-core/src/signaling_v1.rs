@@ -216,11 +216,13 @@ impl CatalogState {
         recipient_external_id: &str,
     ) -> Result<(), CatalogError> {
         let mut external_ids = BTreeSet::new();
-        external_ids.insert(recipient_external_id);
         for (id, participant) in &self.participants {
             if !valid(id, 128)
                 || !valid(&participant.participant_external_id, 256)
-                || id == recipient_id
+                || (id == recipient_id
+                    && participant.participant_external_id != recipient_external_id)
+                || (id != recipient_id
+                    && participant.participant_external_id == recipient_external_id)
             {
                 return Err(CatalogError::InvalidIdentity);
             }
@@ -239,18 +241,35 @@ impl CatalogState {
         }
         let mut selectors = BTreeSet::new();
         for (id, track) in &self.tracks {
+            let data = track.kind == wire::TrackKind::Data as i32;
+            let valid_kind = if data {
+                valid(&track.label, 85)
+                    && track
+                        .label
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+                    && matches!(
+                        wire::TopicMode::try_from(track.mode),
+                        Ok(wire::TopicMode::Latest
+                            | wire::TopicMode::Lossy
+                            | wire::TopicMode::Ordered)
+                    )
+            } else {
+                valid(&track.label, 64)
+                    && track.mode == 0
+                    && track.participant_id != recipient_id
+                    && matches!(
+                        wire::TrackKind::try_from(track.kind),
+                        Ok(wire::TrackKind::Audio | wire::TrackKind::Video)
+                    )
+            };
             if !valid(id, 128)
-                || !valid(&track.label, 64)
                 || !self.participants.contains_key(&track.participant_id)
-                || track.participant_id == recipient_id
-                || !matches!(
-                    wire::TrackKind::try_from(track.kind),
-                    Ok(wire::TrackKind::Audio | wire::TrackKind::Video)
-                )
+                || !valid_kind
             {
                 return Err(CatalogError::InvalidIdentity);
             }
-            if !selectors.insert((&track.participant_id, track.kind, &track.label)) {
+            if !selectors.insert((&track.participant_id, track.kind, &track.label, track.mode)) {
                 return Err(CatalogError::Duplicate);
             }
             if self.known_tracks.get(id).is_some_and(|old| old != track) {
@@ -285,14 +304,14 @@ pub(crate) fn decode_and_apply(
             state
                 .apply(catalog, recipient_id, recipient_external_id)
                 .map_err(|_| SignalingError::Invalid("catalog"))?;
-            update_snapshot(state, snapshot, notifications, coordinates)?;
+            update_snapshot(state, snapshot, notifications, coordinates, recipient_id)?;
             Ok(ServerOutput::StateChanged)
         }
         wire::server_message::Payload::Mapping(mapping) => {
             state
                 .apply_mapping(mapping, coordinates)
                 .map_err(|_| SignalingError::Invalid("mapping"))?;
-            update_snapshot(state, snapshot, notifications, coordinates)?;
+            update_snapshot(state, snapshot, notifications, coordinates, recipient_id)?;
             Ok(ServerOutput::StateChanged)
         }
         wire::server_message::Payload::Authorization(authorization) => Ok(
@@ -323,10 +342,12 @@ fn update_snapshot(
     snapshot: &mut Snapshot,
     notifications: &mut VecDeque<Notification>,
     coordinates: &BTreeMap<MediaSlot, SlotBinding>,
+    recipient_id: &str,
 ) -> Result<(), SignalingError> {
     let participants: BTreeMap<_, _> = state
         .participants
         .iter()
+        .filter(|(id, _)| id.as_str() != recipient_id)
         .map(|(id, participant)| {
             (
                 id.clone(),
@@ -340,6 +361,9 @@ fn update_snapshot(
     let publications: BTreeMap<_, _> = state
         .tracks
         .iter()
+        .filter(|(_, track)| {
+            track.kind != wire::TrackKind::Data as i32 && track.participant_id != recipient_id
+        })
         .map(|(id, track)| {
             (
                 id.clone(),
@@ -399,6 +423,7 @@ mod tests {
             track_id: "opaque".into(),
             participant_id: "peer".into(),
             kind: wire::TrackKind::Audio.into(),
+            mode: 0,
             label: "mic".into(),
         }
     }
@@ -430,6 +455,69 @@ mod tests {
             state.audio.insert(0, String::from(*id));
         }
         state.apply(message, "self", "me")
+    }
+
+    #[test]
+    fn data_binding_includes_self_but_remote_media_projection_does_not() {
+        let data = wire::RemoteTrack {
+            track_id: "server-data-track".into(),
+            participant_id: "self".into(),
+            kind: wire::TrackKind::Data as i32,
+            label: "x".repeat(85),
+            mode: wire::TopicMode::Ordered as i32,
+        };
+        let mut state = CatalogState::default();
+        state
+            .apply(
+                snapshot(
+                    1,
+                    vec![
+                        wire::Participant {
+                            participant_id: "self".into(),
+                            participant_external_id: "me".into(),
+                        },
+                        participant(),
+                    ],
+                    vec![data.clone(), track()],
+                ),
+                "self",
+                "me",
+            )
+            .unwrap();
+        assert_eq!(state.tracks.get("server-data-track"), Some(&data));
+        let mut observed = Snapshot::default();
+        update_snapshot(
+            &state,
+            &mut observed,
+            &mut VecDeque::new(),
+            &BTreeMap::new(),
+            "self",
+        )
+        .unwrap();
+        assert_eq!(observed.participants.len(), 1);
+        assert!(!observed.participants.contains_key("self"));
+        assert_eq!(observed.publications.len(), 1);
+        assert!(!observed.publications.contains_key("server-data-track"));
+        assert!(observed.audio_mapping.is_empty());
+        assert!(observed.video_mapping.is_empty());
+
+        let mut invalid = data;
+        invalid.mode = 0;
+        assert_eq!(
+            state.apply(
+                snapshot(
+                    2,
+                    vec![wire::Participant {
+                        participant_id: "self".into(),
+                        participant_external_id: "me".into(),
+                    }],
+                    vec![invalid]
+                ),
+                "self",
+                "me"
+            ),
+            Err(CatalogError::InvalidIdentity)
+        );
     }
 
     #[test]

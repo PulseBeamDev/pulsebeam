@@ -19,8 +19,8 @@ package pulsebeam.media.v1;
 //   creating a new connection through HTTP. This protocol owns live media state
 //   after a native connection is established:
 //
-//     Catalog       — server-authoritative remote media entities visible to this
-//                     participant.
+//     Catalog       — server-authoritative participants, remote media, and data
+//                     publications visible to this participant.
 //     Intent        — client-authoritative desired send/receive media state.
 //     Mapping       — server-authoritative assignment of remote TrackIds to
 //                     negotiated local RTP receivers.
@@ -286,7 +286,8 @@ package pulsebeam.media.v1;
 //   raw LZ4 data-channel message         <= 32,912 bytes
 //   ParticipantId or TrackId             <= 128 UTF-8 bytes
 //   ParticipantExternalId                <= 256 UTF-8 bytes
-//   LocalTrack / RemoteTrack label       <= 64 UTF-8 bytes
+//   media LocalTrack / RemoteTrack label <= 64 UTF-8 bytes
+//   data RemoteTrack topic label         <= 85 ASCII bytes
 //   RenewAuthorization JWT               <= 16,384 UTF-8 bytes
 //
 // IDs and labels MUST be non-empty. String equality for IDs and labels is exact
@@ -383,12 +384,18 @@ enum TrackKind {
   TRACK_KIND_UNSPECIFIED = 0;
   AUDIO = 1;
   VIDEO = 2;
-  reserved 3;
-  reserved "DATA";
+  DATA = 3;
 }
 
 
-// One participant visible in the room.
+enum TopicMode {
+  TOPIC_MODE_UNSPECIFIED = 0;
+  LATEST = 1;
+  LOSSY = 2;
+  ORDERED = 3;
+}
+
+// One participant visible in the room, including the local participant.
 //
 // `participant_id` is the canonical ParticipantId owned by PulseBeam. It MUST be
 // non-empty and no longer than 128 UTF-8 bytes.
@@ -448,7 +455,9 @@ message LocalTrack {
 }
 
 
-// A canonical remote track visible to this participant.
+// A canonical track visible to this participant. Local data publications are
+// included so publishers learn their authoritative DataTrackId through Catalog.
+// Local media publications remain excluded.
 //
 // `track_id` is the opaque canonical TrackId owned by PulseBeam. It MUST be
 // non-empty and no longer than 128 UTF-8 bytes.
@@ -456,11 +465,12 @@ message LocalTrack {
 // `participant_id` is the canonical ParticipantId of the owning participant and
 // MUST reference a Participant in the same resulting Catalog state.
 //
-// `kind` MUST be AUDIO or VIDEO.
+// `kind` MUST be AUDIO, VIDEO, or DATA.
 //
-// `label` is the application-facing track label. It MUST be non-empty and no
-// longer than 64 UTF-8 bytes. `(participant_id, kind, label)` is unique in the
-// resulting Catalog state.
+// For media, `label` is non-empty UTF-8 of at most 64 bytes and `mode` is
+// unspecified. For data, `label` is the application topic: 1 to 85 ASCII
+// characters in [A-Za-z0-9_-], and `mode` MUST be LATEST, LOSSY, or ORDERED.
+// `(participant_id, kind, label, mode)` is unique in the resulting Catalog state.
 //
 // For a given TrackId, participant_id, kind, and label are immutable. Changing
 // any of them requires a different TrackId; implementations MUST NOT preserve a
@@ -470,14 +480,15 @@ message RemoteTrack {
   string participant_id = 2;
   TrackKind kind = 3;
   string label = 4;
+  TopicMode mode = 5;
 }
 
 
 // ============================================================================
-// 1. Catalog — canonical remote media entities visible to this participant
+// 1. Catalog — canonical participants and visible media/data publications
 // ============================================================================
 
-// Complete server-authoritative remote room state visible to this participant.
+// Complete server-authoritative room state visible to this participant.
 //
 // Applying a snapshot atomically replaces the receiver's previous Catalog
 // state. Empty participants/tracks lists are valid (for example, a participant
@@ -520,7 +531,7 @@ message CatalogDelta {
 }
 
 
-// Server-authoritative remote room state visible to this participant.
+// Server-authoritative room state visible to this participant.
 //
 // `revision` is server-owned, scoped to this signaling connection, and MUST be
 // nonzero. Revision values MUST NOT wrap.
@@ -538,12 +549,13 @@ message CatalogDelta {
 //
 //   - ParticipantId is unique.
 //   - ParticipantExternalId is unique among active room participants, including
-//     the Catalog recipient even though the recipient is omitted from its own
-//     Catalog.
+//     the Catalog recipient, which is included for local data-track binding.
 //   - TrackId is unique.
-//   - `(participant_id, kind, label)` is unique.
+//   - `(participant_id, kind, label, mode)` is unique.
 //   - Every track references a participant in the same resulting Catalog.
-//   - The Catalog contains no tracks owned by its recipient.
+//   - The Catalog contains local data publications but no local media tracks.
+//     Application remote collections MUST exclude the local participant and data
+//     tracks. DATA entries MUST NOT consume negotiated RTP receiver capacity.
 //   - Canonical identity immutability described at the top of this file holds
 //     across snapshots and deltas; resynchronization does not permit ID reuse for
 //     a different identity.

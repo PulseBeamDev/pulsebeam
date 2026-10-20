@@ -464,6 +464,7 @@ impl Downstream {
         self.video
             .tracks()
             .chain(self.audio_tracks.values())
+            .chain(self.data.publications())
             .cloned()
             .collect()
     }

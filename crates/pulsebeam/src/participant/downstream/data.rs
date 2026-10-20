@@ -10,6 +10,7 @@ use crate::{
 pub struct DownstreamData {
     delivered: VecDeque<(TrackHandle, usize)>,
     forwarding: SecondaryMap<TrackHandle, ChannelId>,
+    publications: SecondaryMap<TrackHandle, crate::track::TrackMeta>,
 }
 
 impl DownstreamData {
@@ -17,6 +18,7 @@ impl DownstreamData {
         Self {
             delivered: VecDeque::new(),
             forwarding: SecondaryMap::new(),
+            publications: SecondaryMap::new(),
         }
     }
 
@@ -29,6 +31,7 @@ impl DownstreamData {
         let Track::Data(data) = track else {
             return;
         };
+        self.publications.insert(key, data.meta.clone());
         let channel = channels.iter().find_map(|(cid, channel)| {
             (channel.direction == DataTrackDirection::Subscribe
                 && channel.topic == data.topic
@@ -46,6 +49,11 @@ impl DownstreamData {
 
     pub(crate) fn remove_candidate(&mut self, key: TrackHandle) {
         self.forwarding.remove(key);
+        self.publications.remove(key);
+    }
+
+    pub(crate) fn publications(&self) -> impl Iterator<Item = &crate::track::TrackMeta> {
+        self.publications.values()
     }
 
     pub(crate) fn forwarding(&self, key: TrackHandle) -> Option<ChannelId> {
