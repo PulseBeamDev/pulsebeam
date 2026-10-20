@@ -1,16 +1,14 @@
 import { useRef, useState } from "react";
-import type { Agent, TopicConsumerError, TopicEvent } from "@pulsebeam/react";
+import type { Agent, TopicEvent } from "@pulsebeam/react";
 
 export const reactionEmojis = ["👍", "❤️", "😂", "😮", "👏", "🔥"];
-type ReactionPayload = { emoji: string };
-type Reaction = ReactionPayload & { key: string };
+type Reaction = { key: string; emoji: string };
 
 export function useReaction(agent: Agent) {
-  const Reactions = agent.topic<ReactionPayload>("reactions", {
+  const Reactions = agent.topic<string>("reactions", {
     mode: "lossy",
   });
   const [reactions, setReactions] = useState<Reaction[]>([]);
-  const [error, setError] = useState<string | null>(null);
   const localKeys = useRef(0);
   const add = (reaction: Reaction) =>
     setReactions((current) => [...current, reaction].slice(-20));
@@ -18,26 +16,17 @@ export function useReaction(agent: Agent) {
   return {
     Reactions,
     reactions,
-    error,
-    clearError: () => setError(null),
-    onEvent(event: TopicEvent<ReactionPayload>) {
+    onEvent(event: TopicEvent<string>) {
       if (
         event.type === "message" &&
-        typeof event.value?.emoji === "string" &&
-        reactionEmojis.includes(event.value.emoji)
+        typeof event.value === "string" &&
+        reactionEmojis.includes(event.value)
       ) {
         add({
           key: `${event.dataTrackId}:${event.sequence}`,
-          emoji: event.value.emoji,
+          emoji: event.value,
         });
       }
-    },
-    onError(failure: TopicConsumerError) {
-      setError(
-        failure.code === "decode-failed"
-          ? "Invalid topic message."
-          : failure.event.message,
-      );
     },
     dismiss(key: string) {
       setReactions((current) => current.filter((item) => item.key !== key));
@@ -45,9 +34,9 @@ export function useReaction(agent: Agent) {
     send(emoji: string) {
       if (!agent.participantId || !reactionEmojis.includes(emoji)) return;
       const key = `local:${localKeys.current++}`;
-      void Reactions.publish({ emoji })
+      void Reactions.publish(emoji)
         .then(() => add({ key, emoji }))
-        .catch(() => setError("Reaction could not be sent"));
+        .catch(() => {});
     },
   };
 }

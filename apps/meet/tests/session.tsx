@@ -229,11 +229,7 @@ assert.ok(
   plays > afterRejection,
   "failed retry remains available to later keyboard interaction",
 );
-const payload = {
-  id: "ignored-payload-id",
-  sender: "forged-payload-sender",
-  text: "delivered through production topics",
-};
+const payload = "delivered through production topics";
 await flush(() =>
   runtime.event({
     type: "topic-message",
@@ -246,7 +242,6 @@ await flush(() =>
   }),
 );
 assert.match(document.body.textContent!, /delivered through production topics/);
-assert.doesNotMatch(document.body.textContent!, /forged-payload-sender/);
 const remoteChat = (dataTrackId: string, sequence: bigint) =>
   runtime.event({
     type: "topic-message",
@@ -279,11 +274,10 @@ const transcript = document.querySelector(
   '[role="log"][aria-label="Chat transcript"]',
 );
 assert.ok(transcript, "chat owns an inline transcript");
-assert.match(
-  transcript.lastElementChild!.textContent!,
-  /Some chat messages were skipped/,
+assert.equal(
+  transcript.lastElementChild!.textContent,
+  "Some messages could not be recovered.",
 );
-assert.match(transcript.lastElementChild!.textContent!, /bob: 2 unavailable/);
 await flush(() =>
   runtime.event({
     type: "topic-message",
@@ -292,9 +286,7 @@ await flush(() =>
     participantId: "bob",
     dataTrackId: "remote-chat",
     sequence: 4n,
-    payload: new TextEncoder().encode(
-      JSON.stringify({ text: "after the gap" }),
-    ),
+    payload: new TextEncoder().encode(JSON.stringify("after the gap")),
   }),
 );
 const transcriptEntries = Array.from(transcript.children);
@@ -303,9 +295,9 @@ assert.match(
   transcriptEntries[2].textContent!,
   /delivered through production topics/,
 );
-assert.match(
-  transcriptEntries[3].textContent!,
-  /Some chat messages were skipped/,
+assert.equal(
+  transcriptEntries[3].textContent,
+  "Some messages could not be recovered.",
 );
 assert.match(transcriptEntries[4].textContent!, /after the gap/);
 assert.equal(transcript.querySelectorAll('[role="alert"]').length, 1);
@@ -313,7 +305,7 @@ await click("Close chat");
 await click("Chat");
 assert.match(
   document.querySelector('[aria-label="Chat transcript"]')!.textContent!,
-  /Some chat messages were skipped.*after the gap/s,
+  /Some messages could not be recovered\..*after the gap/s,
   "chat history retains the gap before continuation when reopened",
 );
 const chat =
@@ -364,9 +356,9 @@ assert.match(updatedTranscript.textContent!, /hello from component/);
 assert.doesNotMatch(updatedTranscript.textContent!, /Sending…/);
 const sentChat = runtime.sent.find((message) => message.name === "chat")!;
 assert.equal(sentChat.mode, "ordered");
-assert.deepEqual(
-  Object.keys(JSON.parse(new TextDecoder().decode(sentChat.payload))).sort(),
-  ["text"],
+assert.equal(
+  JSON.parse(new TextDecoder().decode(sentChat.payload)),
+  "hello from component",
 );
 privateSoFar();
 await flush(() =>
@@ -377,7 +369,7 @@ await flush(() =>
     dataTrackId: "remote-reactions",
     participantId: "bob",
     sequence: 0n,
-    payload: new TextEncoder().encode(JSON.stringify({ emoji: "👍" })),
+    payload: new TextEncoder().encode(JSON.stringify("👍")),
   }),
 );
 assert.ok(
@@ -418,9 +410,7 @@ const sentReaction = runtime.sent.find(
   (message) => message.name === "reactions",
 )!;
 assert.equal(sentReaction.mode, "lossy");
-assert.deepEqual(JSON.parse(new TextDecoder().decode(sentReaction.payload)), {
-  emoji: "👍",
-});
+assert.equal(JSON.parse(new TextDecoder().decode(sentReaction.payload)), "👍");
 const visibleReaction =
   document.querySelector<HTMLElement>('[aria-label="👍"]')!;
 await flush(() =>

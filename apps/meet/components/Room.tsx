@@ -92,10 +92,7 @@ export function Room({
   const {
     Reactions,
     reactions,
-    error: reactionError,
-    clearError: clearReactionError,
     onEvent: receiveReaction,
-    onError: onReactionError,
     dismiss: dismissReaction,
     send: sendReaction,
   } = useReaction(agent);
@@ -136,7 +133,6 @@ export function Room({
     setFailure(null);
     playbackRetry.current = null;
     clearChatError();
-    clearReactionError();
   };
   const send = async () => {
     if (sending || !draft.trim()) return;
@@ -202,7 +198,7 @@ export function Room({
       <Microphone source={capture.audio} enabled={micOn} />
       <Screen source={screen} preferences={{ content: "detail" }} />
       <Chat onEvent={receiveChat} onError={onChatError} />
-      <Reactions onEvent={receiveReaction} onError={onReactionError} />
+      <Reactions onEvent={receiveReaction} />
       <Paper
         component="header"
         square
@@ -310,9 +306,9 @@ export function Room({
           {(capture.error || devices.error)?.message}
         </Alert>
       )}
-      {(failure || chatError || reactionError || agent.error) && (
+      {(failure || chatError || agent.error) && (
         <Alert severity="error" onClose={closeAlert}>
-          {failure ?? chatError ?? reactionError ?? agent.error?.message}
+          {failure ?? chatError ?? agent.error?.message}
         </Alert>
       )}
       <Box
@@ -451,28 +447,31 @@ export function Room({
               )}
               {messages.map((message) =>
                 message.type === "gap" ? (
-                  <Alert key={message.key} severity="warning">
-                    Some chat messages were skipped. {message.sender}:{" "}
-                    {(
-                      message.availableSequence - message.expectedSequence
-                    ).toString()}{" "}
-                    unavailable.
+                  <Alert
+                    key={`gap:${message.dataTrackId}:${message.expectedSequence}:${message.availableSequence}`}
+                    severity="warning"
+                  >
+                    Some messages could not be recovered.
                   </Alert>
                 ) : (
                   <Box
-                    key={message.key}
-                    className={`max-w-[90%] ${message.sender === agent.participantId ? "self-end" : "self-start"}`}
+                    key={
+                      message.type === "local"
+                        ? message.key
+                        : `${message.dataTrackId}:${message.sequence}`
+                    }
+                    className={`max-w-[90%] ${message.participantId === agent.participantId ? "self-end" : "self-start"}`}
                   >
                     <Typography variant="caption" color="text.secondary">
-                      {message.sender === agent.participantId
+                      {message.participantId === agent.participantId
                         ? "You"
-                        : message.sender}
+                        : message.participantId}
                     </Typography>
                     <Paper
                       elevation={0}
-                      className={`break-words px-3 py-2 ${message.sender === agent.participantId ? "bg-blue-700! text-white!" : "bg-slate-100!"}`}
+                      className={`break-words px-3 py-2 ${message.participantId === agent.participantId ? "bg-blue-700! text-white!" : "bg-slate-100!"}`}
                     >
-                      {message.text}
+                      {message.value}
                     </Paper>
                   </Box>
                 ),

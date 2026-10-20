@@ -1,24 +1,19 @@
 import { useRef, useState } from "react";
-import type { Agent, TopicConsumerError, TopicEvent } from "@pulsebeam/react";
+import type { Agent, TopicEvent } from "@pulsebeam/react";
 
-type ChatPayload = { text: string };
-type Message = ChatPayload & {
-  type: "message";
+type LocalMessage = {
+  type: "local";
   key: string;
-  sender: string;
-};
-type ChatGap = {
-  type: "gap";
-  key: string;
-  sender: string;
-  expectedSequence: bigint;
-  availableSequence: bigint;
+  participantId: string;
+  value: string;
 };
 
 export function useChat(agent: Agent) {
   const { participantId } = agent;
-  const Chat = agent.topic<ChatPayload>("chat", { mode: "ordered" });
-  const [messages, setMessages] = useState<(Message | ChatGap)[]>([]);
+  const Chat = agent.topic<string>("chat", { mode: "ordered" });
+  const [messages, setMessages] = useState<
+    (TopicEvent<string> | LocalMessage)[]
+  >([]);
   const [error, setError] = useState<string | null>(null);
   const localKeys = useRef(0);
 
@@ -27,59 +22,30 @@ export function useChat(agent: Agent) {
     messages,
     error,
     clearError: () => setError(null),
-    onEvent(event: TopicEvent<ChatPayload>) {
-      if (event.type === "gap") {
-        setMessages((current) => [
-          ...current,
-          {
-            type: "gap",
-            key: `gap:${event.dataTrackId}:${event.expectedSequence}:${event.availableSequence}`,
-            sender: event.participantId,
-            expectedSequence: event.expectedSequence,
-            availableSequence: event.availableSequence,
-          },
-        ]);
-        return;
-      }
-      if (typeof event.value?.text !== "string") return;
-      setMessages((current) => [
-        ...current,
-        {
-          type: "message",
-          key: `${event.dataTrackId}:${event.sequence}`,
-          text: event.value.text,
-          sender: event.participantId,
-        },
-      ]);
+    onEvent(event: TopicEvent<string>) {
+      if (event.type === "message" && typeof event.value !== "string") return;
+      setMessages((current) => [...current, event]);
     },
-    onError(failure: TopicConsumerError) {
-      setError(
-        failure.code === "decode-failed"
-          ? "Invalid topic message."
-          : failure.event.message,
-      );
+    onError() {
+      setError("Chat is unavailable. Rejoin to restore it.");
     },
     async send(text: string): Promise<boolean> {
       const value = text.trim();
       if (!value || !participantId) return false;
       try {
-        await Chat.publish({ text: value });
+        await Chat.publish(value);
         setMessages((current) => [
           ...current,
           {
-            type: "message",
+            type: "local",
             key: `local:${localKeys.current++}`,
-            text: value,
-            sender: participantId,
+            participantId,
+            value,
           },
         ]);
         return true;
-      } catch (reason) {
-        setError(
-          reason instanceof Error
-            ? reason.message
-            : "Message was not accepted. Retry sending.",
-        );
+      } catch {
+        setError("Message could not be sent.");
         return false;
       }
     },
