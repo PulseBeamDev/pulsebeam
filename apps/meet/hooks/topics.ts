@@ -1,14 +1,13 @@
-import { useEffect, useRef, useState } from "react";
+import { useRef, useState } from "react";
 import type { Agent, TopicConsumerError, TopicEvent } from "@pulsebeam/react";
 
-const emojis = new Set(["👍", "❤️", "😂", "😮", "👏", "🔥"]);
-type ChatPayload = { text: string; ts: number };
+export const reactionEmojis = ["👍", "❤️", "😂", "😮", "👏", "🔥"];
+type ChatPayload = { text: string };
 type Message = ChatPayload & {
   type: "message";
   key: string;
   sender: string;
-  self: boolean;
-  status: "pending" | "accepted";
+  pending?: true;
 };
 type ChatGap = {
   type: "gap";
@@ -20,7 +19,18 @@ type ChatGap = {
 type ReactionPayload = { emoji: string };
 type Reaction = ReactionPayload & { key: string };
 
-export function useTopics(agent: Agent, participantId: string | null) {
+function appendUnique<T extends { key: string }>(
+  items: T[],
+  item: T,
+  limit?: number,
+): T[] {
+  if (items.some(({ key }) => key === item.key)) return items;
+  const next = [...items, item];
+  return limit ? next.slice(-limit) : next;
+}
+
+export function useTopics(agent: Agent) {
+  const { participantId } = agent;
   const Chat = agent.topic<ChatPayload>("chat", { mode: "ordered" });
   const Reactions = agent.topic<ReactionPayload>("reactions", {
     mode: "lossy",
@@ -28,132 +38,96 @@ export function useTopics(agent: Agent, participantId: string | null) {
   const [messages, setMessages] = useState<(Message | ChatGap)[]>([]);
   const [reactions, setReactions] = useState<Reaction[]>([]);
   const [error, setError] = useState<string | null>(null);
-  const [subscriptionRevision, retrySubscriptions] = useState(0);
+  const [subscriptionRevision, setSubscriptionRevision] = useState(0);
   const localKeys = useRef(0);
-  const timers = useRef(new Map<string, ReturnType<typeof setTimeout>>());
-  const addReaction = (reaction: Reaction) => {
-    setReactions((old) =>
-      old.some((item) => item.key === reaction.key)
-        ? old
-        : [...old, reaction].slice(-20),
-    );
-    if (!timers.current.has(reaction.key))
-      timers.current.set(
-        reaction.key,
-        setTimeout(() => {
-          timers.current.delete(reaction.key);
-          setReactions((old) =>
-            old.filter((item) => item.key !== reaction.key),
-          );
-        }, 3000),
-      );
-  };
+  const addReaction = (reaction: Reaction) =>
+    setReactions((current) => appendUnique(current, reaction, 20));
+
   const receiveChat = (event: TopicEvent<ChatPayload>) => {
+    let entry: Message | ChatGap;
     if (event.type === "gap") {
-      const key = `gap:${event.dataTrackId}:${event.expectedSequence}:${event.availableSequence}`;
-      setMessages((old) =>
-        old.some((entry) => entry.key === key)
-          ? old
-          : [
-              ...old,
-              {
-                type: "gap",
-                key,
-                sender: event.participantId,
-                expectedSequence: event.expectedSequence,
-                availableSequence: event.availableSequence,
-              },
-            ],
-      );
-      return;
+      entry = {
+        type: "gap",
+        key: `gap:${event.dataTrackId}:${event.expectedSequence}:${event.availableSequence}`,
+        sender: event.participantId,
+        expectedSequence: event.expectedSequence,
+        availableSequence: event.availableSequence,
+      };
+    } else {
+      if (typeof event.value?.text !== "string") return;
+      entry = {
+        type: "message",
+        key: `${event.dataTrackId}:${event.sequence}`,
+        text: event.value.text,
+        sender: event.participantId,
+      };
     }
-    const payload = event.value;
-    if (typeof payload?.text !== "string" || typeof payload.ts !== "number")
-      return;
-    const key = `${event.dataTrackId}:${event.sequence}`;
-    setMessages((old) =>
-      old.some((message) => message.key === key)
-        ? old
-        : [
-            ...old,
-            {
-              type: "message",
-              key,
-              text: payload.text,
-              ts: payload.ts,
-              sender: event.participantId,
-              self: event.participantId === participantId,
-              status: "accepted",
-            },
-          ],
-    );
+    setMessages((current) => appendUnique(current, entry));
   };
   const receiveReaction = (event: TopicEvent<ReactionPayload>) => {
-    if (event.type !== "message") return;
-    const payload = event.value;
-    if (typeof payload?.emoji === "string" && emojis.has(payload.emoji))
+    if (
+      event.type === "message" &&
+      typeof event.value?.emoji === "string" &&
+      reactionEmojis.includes(event.value.emoji)
+    ) {
       addReaction({
         key: `${event.dataTrackId}:${event.sequence}`,
-        emoji: payload.emoji,
+        emoji: event.value.emoji,
       });
+    }
   };
-  const onError = (error: TopicConsumerError) =>
+  const onTopicError = (failure: TopicConsumerError) =>
     setError(
-      error.code === "decode-failed"
+      failure.code === "decode-failed"
         ? "Invalid topic message. Retry chat."
-        : error.event.message,
+        : failure.event.message,
     );
-  useEffect(() => {
-    const activeTimers = timers.current;
-    return () => {
-      for (const timer of activeTimers.values()) clearTimeout(timer);
-      activeTimers.clear();
-    };
-  }, [subscriptionRevision]);
 
   return {
     Chat,
     Reactions,
     receiveChat,
     receiveReaction,
-    onTopicError: onError,
+    onTopicError,
     subscriptionRevision,
     messages,
     reactions,
+    dismissReaction: (key: string) =>
+      setReactions((current) => current.filter((item) => item.key !== key)),
     error,
     clearError: () => setError(null),
     retrySubscriptions: () => {
       setError(null);
-      retrySubscriptions((n) => n + 1);
+      setSubscriptionRevision((revision) => revision + 1);
     },
     async sendChat(text: string): Promise<boolean> {
       const value = text.trim();
       if (!value || !participantId) return false;
-      const payload = { text: value, ts: Date.now() };
       const key = `local:${localKeys.current++}`;
-      setMessages((old) => [
-        ...old,
+      setMessages((current) => [
+        ...current,
         {
-          ...payload,
           type: "message",
           key,
+          text: value,
           sender: participantId,
-          self: true,
-          status: "pending",
+          pending: true,
         },
       ]);
       try {
-        await Chat.publish(payload);
-        setMessages((old) =>
-          old.map((message) =>
+        await Chat.publish({ text: value });
+        setMessages((current) =>
+          current.map((message) =>
             message.type === "message" && message.key === key
-              ? { ...message, status: "accepted" }
+              ? { ...message, pending: undefined }
               : message,
           ),
         );
         return true;
       } catch (reason) {
-        setMessages((old) => old.filter((message) => message.key !== key));
+        setMessages((current) =>
+          current.filter((message) => message.key !== key),
+        );
         setError(
           reason instanceof Error
             ? reason.message
@@ -163,7 +137,7 @@ export function useTopics(agent: Agent, participantId: string | null) {
       }
     },
     sendReaction(emoji: string) {
-      if (!participantId || !emojis.has(emoji)) return;
+      if (!participantId || !reactionEmojis.includes(emoji)) return;
       const key = `local:${localKeys.current++}`;
       void Reactions.publish({ emoji })
         .then(() => addReaction({ key, emoji }))

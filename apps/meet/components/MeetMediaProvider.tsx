@@ -10,6 +10,8 @@ const MediaContext = createContext<ReturnType<typeof useMeetCapture> | null>(
 function useMeetCapture() {
   const [videoDeviceId, setVideoDeviceId] = useState("");
   const [audioDeviceId, setAudioDeviceId] = useState("");
+  const [cameraOn, setCameraOn] = useState(true);
+  const [micOn, setMicOn] = useState(true);
   const capture = useUserMedia({
     video: {
       device: videoDeviceId
@@ -36,6 +38,10 @@ function useMeetCapture() {
     audioDeviceId,
     setVideoDeviceId,
     setAudioDeviceId,
+    cameraOn,
+    micOn,
+    setCameraOn,
+    setMicOn,
   };
 }
 

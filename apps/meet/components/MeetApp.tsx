@@ -34,21 +34,21 @@ function MeetSession() {
   const [session, setSession] = useState<{
     token: string;
     endpoint: string;
-    cameraOn: boolean;
-    micOn: boolean;
   } | null>(null);
-  const { stop } = useMeetMedia().capture;
+  const {
+    capture: { stop },
+    setCameraOn,
+    setMicOn,
+  } = useMeetMedia();
   const leave = useCallback(() => {
     stop();
+    setCameraOn(true);
+    setMicOn(true);
     setSession(null);
-  }, [stop]);
+  }, [stop, setCameraOn, setMicOn]);
   return session ? (
     <Room {...session} onLeave={leave} />
   ) : (
-    <Lobby
-      onJoin={(token, endpoint, cameraOn, micOn) =>
-        setSession({ token, endpoint, cameraOn, micOn })
-      }
-    />
+    <Lobby onJoin={(token, endpoint) => setSession({ token, endpoint })} />
   );
 }

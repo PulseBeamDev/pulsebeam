@@ -1,30 +1,18 @@
 import { Box, IconButton, Stack, Typography } from "@mui/material";
 import { Mic, MicOff, Video as VideoIcon, VideoOff } from "lucide-react";
 import { Video } from "@pulsebeam/react";
-import type { VideoSource } from "@pulsebeam/react";
+import { useMeetMedia } from "./MeetMediaProvider";
 
-export function MediaPreview({
-  source,
-  isCamOn,
-  isMicOn,
-  onToggleCam,
-  onToggleMic,
-  hasStream,
-}: {
-  source: VideoSource | null;
-  isCamOn: boolean;
-  isMicOn: boolean;
-  onToggleCam(): void;
-  onToggleMic(): void;
-  hasStream: boolean;
-}) {
-  const microphoneLabel = isMicOn ? "Mute microphone" : "Unmute microphone";
-  const cameraLabel = isCamOn ? "Turn camera off" : "Turn camera on";
+export function MediaPreview() {
+  const { capture, cameraOn, micOn, setCameraOn, setMicOn } = useMeetMedia();
+  const hasStream = Boolean(capture.video || capture.audio);
+  const microphoneLabel = micOn ? "Mute microphone" : "Unmute microphone";
+  const cameraLabel = cameraOn ? "Turn camera off" : "Turn camera on";
   return (
     <Box className="relative aspect-video overflow-hidden rounded-lg bg-slate-900">
-      {hasStream && isCamOn ? (
+      {hasStream && cameraOn ? (
         <Video
-          source={source}
+          source={capture.video}
           autoPlay
           mirror
           className="h-full w-full object-contain"
@@ -46,24 +34,24 @@ export function MediaPreview({
           <IconButton
             title={microphoneLabel}
             aria-label={microphoneLabel}
-            onClick={onToggleMic}
+            onClick={() => setMicOn((value) => !value)}
             sx={{
-              bgcolor: isMicOn ? "#e4edf9" : "error.main",
-              color: isMicOn ? "#12233d" : "white",
+              bgcolor: micOn ? "#e4edf9" : "error.main",
+              color: micOn ? "#12233d" : "white",
             }}
           >
-            {isMicOn ? <Mic size={20} /> : <MicOff size={20} />}
+            {micOn ? <Mic size={20} /> : <MicOff size={20} />}
           </IconButton>
           <IconButton
             title={cameraLabel}
             aria-label={cameraLabel}
-            onClick={onToggleCam}
+            onClick={() => setCameraOn((value) => !value)}
             sx={{
-              bgcolor: isCamOn ? "#e4edf9" : "error.main",
-              color: isCamOn ? "#12233d" : "white",
+              bgcolor: cameraOn ? "#e4edf9" : "error.main",
+              color: cameraOn ? "#12233d" : "white",
             }}
           >
-            {isCamOn ? <VideoIcon size={20} /> : <VideoOff size={20} />}
+            {cameraOn ? <VideoIcon size={20} /> : <VideoOff size={20} />}
           </IconButton>
         </Stack>
       )}

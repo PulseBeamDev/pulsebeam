@@ -4,6 +4,7 @@ import { createRoot } from "react-dom/client";
 import { MeetApp } from "../components/MeetApp";
 import {
   captures,
+  displays,
   flush,
   stream,
 } from "../../../agents/react/tests/component/platform";
@@ -171,6 +172,12 @@ assert.equal(
 );
 await input(endpoint, "http://localhost:7070");
 assert.equal(button("Join room").disabled, false);
+await click("Mute microphone");
+await click("Turn camera off");
+assert.ok(
+  owned.getTracks().every((track) => track.readyState === "live"),
+  "lobby toggles retain capture for joining",
+);
 let plays = 0;
 HTMLMediaElement.prototype.play = async () => {
   plays++;
@@ -202,6 +209,10 @@ assert.ok(
 assert.ok(owned.getTracks().every((track) => track.readyState === "live"));
 privateSoFar();
 
+assert.ok(button("Unmute microphone"), "lobby microphone intent survives join");
+assert.ok(button("Turn camera on"), "lobby camera intent survives join");
+await click("Unmute microphone");
+await click("Turn camera on");
 const beforeRetry = plays;
 await click("Chat");
 assert.ok(plays > beforeRetry, "ordinary interaction retries blocked playback");
@@ -222,7 +233,6 @@ const payload = {
   id: "ignored-payload-id",
   sender: "forged-payload-sender",
   text: "delivered through production topics",
-  ts: 1,
 };
 await flush(() =>
   runtime.event({
@@ -290,7 +300,7 @@ await flush(() =>
     dataTrackId: "remote-chat",
     sequence: 4n,
     payload: new TextEncoder().encode(
-      JSON.stringify({ text: "after the gap", ts: 4 }),
+      JSON.stringify({ text: "after the gap" }),
     ),
   }),
 );
@@ -352,7 +362,7 @@ const sentChat = runtime.sent.find((message) => message.name === "chat")!;
 assert.equal(sentChat.mode, "ordered");
 assert.deepEqual(
   Object.keys(JSON.parse(new TextDecoder().decode(sentChat.payload))).sort(),
-  ["text", "ts"],
+  ["text"],
 );
 privateSoFar();
 await flush(() =>
@@ -407,6 +417,12 @@ assert.equal(sentReaction.mode, "lossy");
 assert.deepEqual(JSON.parse(new TextDecoder().decode(sentReaction.payload)), {
   emoji: "👍",
 });
+const visibleReaction =
+  document.querySelector<HTMLElement>('[aria-label="👍"]')!;
+await flush(() =>
+  visibleReaction.dispatchEvent(new Event("animationend", { bubbles: true })),
+);
+assert.ok(!visibleReaction.isConnected, "reaction expires with its animation");
 await click("Mute microphone");
 await click("Turn camera off");
 assert.ok(
@@ -414,13 +430,42 @@ assert.ok(
   "muting retains capture until Leave",
 );
 
+await click("Share screen");
+await flush(() => displays.at(-1)!.reject(new Error("display denied")));
+assert.match(document.body.textContent!, /Screen share: display denied/);
+await click("Share screen");
+const shared = stream();
+await flush(() => displays.at(-1)!.resolve(shared));
+await click("Stop sharing");
+assert.ok(shared.getTracks().every((track) => track.readyState === "ended"));
+await click("Share screen");
+const sharedOnLeave = stream();
+await flush(() => displays.at(-1)!.resolve(sharedOnLeave));
+
 await click("Leave");
 assert.equal(runtime.closed, true);
+assert.ok(
+  sharedOnLeave.getTracks().every((track) => track.readyState === "ended"),
+  "Leave also releases display capture",
+);
 assert.ok(
   owned.getTracks().every((track) => track.readyState === "ended"),
   "Leave releases capture ownership",
 );
 assert.match(document.body.textContent!, /Ready to join/);
+const nextCapture = stream();
+await flush(() => captures.at(-1)!.resolve(nextCapture));
+assert.ok(button("Mute microphone"), "Leave resets lobby microphone intent");
+assert.ok(button("Turn camera off"), "Leave resets lobby camera intent");
+await input(
+  document.querySelector<HTMLInputElement>('input[type="password"]')!,
+  token,
+);
+await click("Join room");
+await click("Leave");
+assert.ok(
+  nextCapture.getTracks().every((track) => track.readyState === "ended"),
+);
 const pending = captures.at(-1)!;
 await flush(() => root.unmount());
 const late = stream();

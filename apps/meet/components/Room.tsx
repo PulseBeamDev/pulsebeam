@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useRef, useState } from "react";
-import { Video, useAgent } from "@pulsebeam/react";
-import type { Agent, RemoteVideoTrack } from "@pulsebeam/react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Video, useAgent, useDisplayMedia } from "@pulsebeam/react";
+import type { RemoteVideoTrack } from "@pulsebeam/react";
 import {
   Alert,
   Box,
@@ -16,10 +16,9 @@ import {
   Typography,
 } from "@mui/material";
 import * as Icons from "lucide-react";
-import { useRoomMedia } from "@/hooks/room-media";
 import { DeviceSettings } from "./DeviceSettings";
 import { useMeetMedia } from "./MeetMediaProvider";
-import { useTopics } from "@/hooks/topics";
+import { reactionEmojis, useTopics } from "@/hooks/topics";
 import { useVideoLayout } from "@/hooks/video-layout";
 
 const latencyModes: Record<
@@ -31,19 +30,14 @@ const latencyModes: Record<
   Balanced: { minMs: 100, maxMs: 200 },
   Zero: { minMs: 0, maxMs: 0 },
 };
-const reactionEmojis = ["👍", "❤️", "😂", "😮", "👏", "🔥"];
 
 export function Room({
   token,
   endpoint,
-  cameraOn,
-  micOn,
   onLeave,
 }: {
   token: string;
   endpoint: string;
-  cameraOn: boolean;
-  micOn: boolean;
   onLeave(): void;
 }) {
   const agent = useAgent({
@@ -57,30 +51,24 @@ export function Room({
     },
     logging: { level: "debug" },
   });
-  return agent ? (
-    <RoomSession
-      agent={agent}
-      initial={{ cameraOn, micOn }}
-      onLeave={onLeave}
-    />
-  ) : (
-    <Box component="main" className="grid h-dvh place-items-center">
-      Joining room…
-    </Box>
+  const { capture, devices, cameraOn, micOn, setCameraOn, setMicOn } =
+    useMeetMedia();
+  const {
+    video: screen,
+    stop: stopShare,
+    request: requestShare,
+  } = useDisplayMedia({
+    video: { preferences: { width: 1920, height: 1080, frameRate: 30 } },
+    audio: false,
+  });
+  const { Camera, Microphone, Screen } = useMemo(
+    () => ({
+      Camera: agent.local.video("camera"),
+      Microphone: agent.local.audio("microphone"),
+      Screen: agent.local.video("screen"),
+    }),
+    [agent],
   );
-}
-
-function RoomSession({
-  agent: owner,
-  initial,
-  onLeave,
-}: {
-  agent: Agent;
-  initial: { cameraOn: boolean; micOn: boolean };
-  onLeave(): void;
-}) {
-  const agent = owner;
-  const { capture, devices } = useMeetMedia();
   const [deviceAnchor, setDeviceAnchor] = useState<HTMLElement | null>(null);
   const [reactionAnchor, setReactionAnchor] = useState<HTMLElement | null>(
     null,
@@ -92,17 +80,6 @@ function RoomSession({
   const [failure, setFailure] = useState<string | null>(null);
   const playbackRetry = useRef<(() => Promise<void>) | null>(null);
   const {
-    screen,
-    Camera,
-    Microphone,
-    Screen,
-    cameraOn,
-    micOn,
-    detachScreen,
-    startShare,
-    toggle,
-  } = useRoomMedia(owner, setFailure, initial);
-  const {
     Chat,
     Reactions,
     receiveChat,
@@ -111,18 +88,30 @@ function RoomSession({
     subscriptionRevision,
     messages,
     reactions,
+    dismissReaction,
     sendChat,
     sendReaction,
     error: topicError,
     clearError,
     retrySubscriptions,
-  } = useTopics(owner, agent.participantId);
+  } = useTopics(agent);
   const { remoteTracks, spotlight, setPin } = useVideoLayout(
-    owner.remote.videoTracks,
+    agent.remote.videoTracks,
   );
   useEffect(() => {
-    owner.connect();
-  }, [owner]);
+    agent.connect();
+  }, [agent]);
+  const startShare = async () => {
+    try {
+      await requestShare();
+    } catch (reason) {
+      setFailure(
+        reason instanceof Error
+          ? `Screen share: ${reason.message}`
+          : "Screen sharing was cancelled",
+      );
+    }
+  };
   const playbackError = useCallback(
     ({ error, retry }: { error: unknown; retry: () => Promise<void> }) => {
       setFailure(
@@ -133,7 +122,7 @@ function RoomSession({
     [],
   );
   const recoverPlayback = () => {
-    void owner.remote.resumeAudio().catch(() => {});
+    void agent.remote.resumeAudio().catch(() => {});
     const retry = playbackRetry.current;
     playbackRetry.current = null;
     if (retry)
@@ -250,7 +239,7 @@ function RoomSession({
         >
           <IconButton
             aria-label={screen ? "Stop sharing" : "Share screen"}
-            onClick={() => (screen ? detachScreen() : void startShare())}
+            onClick={() => (screen ? stopShare() : void startShare())}
           >
             {screen ? (
               <Icons.MonitorOff size={20} />
@@ -272,7 +261,7 @@ function RoomSession({
           >
             <Icons.Settings2 size={20} />
           </IconButton>
-          <IconButton aria-label="Reconnect" onClick={() => owner.reconnect()}>
+          <IconButton aria-label="Reconnect" onClick={() => agent.reconnect()}>
             <Icons.RotateCcw size={20} />
           </IconButton>
           <Button
@@ -362,6 +351,7 @@ function RoomSession({
                 key={reaction.key}
                 aria-label={reaction.emoji}
                 className="meet-reaction"
+                onAnimationEnd={() => dismissReaction(reaction.key)}
                 style={{ left: `${24 + (index % 5) * 13}%` }}
               >
                 {reaction.emoji}
@@ -374,7 +364,7 @@ function RoomSession({
             >
               <IconButton
                 aria-label={micOn ? "Mute microphone" : "Unmute microphone"}
-                onClick={() => toggle("microphone", !micOn)}
+                onClick={() => setMicOn((value) => !value)}
                 className={
                   micOn
                     ? "bg-slate-700! text-white!"
@@ -385,7 +375,7 @@ function RoomSession({
               </IconButton>
               <IconButton
                 aria-label={cameraOn ? "Turn camera off" : "Turn camera on"}
-                onClick={() => toggle("camera", !cameraOn)}
+                onClick={() => setCameraOn((value) => !value)}
                 className={
                   cameraOn
                     ? "bg-slate-700! text-white!"
@@ -484,15 +474,17 @@ function RoomSession({
                 ) : (
                   <Box
                     key={message.key}
-                    className={`max-w-[90%] ${message.self ? "self-end" : "self-start"}`}
+                    className={`max-w-[90%] ${message.sender === agent.participantId ? "self-end" : "self-start"}`}
                   >
                     <Typography variant="caption" color="text.secondary">
-                      {message.self ? "You" : message.sender}
-                      {message.status === "pending" ? " · Sending…" : ""}
+                      {message.sender === agent.participantId
+                        ? "You"
+                        : message.sender}
+                      {message.pending ? " · Sending…" : ""}
                     </Typography>
                     <Paper
                       elevation={0}
-                      className={`break-words px-3 py-2 ${message.self ? "bg-blue-700! text-white!" : "bg-slate-100!"}`}
+                      className={`break-words px-3 py-2 ${message.sender === agent.participantId ? "bg-blue-700! text-white!" : "bg-slate-100!"}`}
                     >
                       {message.text}
                     </Paper>

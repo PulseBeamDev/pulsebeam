@@ -5,10 +5,6 @@ body {
   overscroll-behavior: none;
 }
 
-.mirror {
-  transform: scaleX(-1);
-}
-
 .meet-lobby {
   background: radial-gradient(circle at 50% 0%, #d7e7ff, #f5f7fb 58%);
 }

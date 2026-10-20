@@ -18,19 +18,12 @@ import { Radio, RefreshCw } from "lucide-react";
 export function Lobby({
   onJoin,
 }: {
-  onJoin(
-    token: string,
-    endpoint: string,
-    cameraOn: boolean,
-    micOn: boolean,
-  ): void;
+  onJoin(token: string, endpoint: string): void;
 }) {
   const [token, setToken] = useState("");
   const [serverURL, setServerURL] = useState(defaultServerUrl);
   const { capture, devices } = useMeetMedia();
   const { video, audio, error, request } = capture;
-  const [isMicOn, setMicOn] = useState(true);
-  const [isCamOn, setCamOn] = useState(true);
   const endpoint = normalizeEndpoint(serverURL);
   useEffect(() => {
     void request().catch(() => {});
@@ -64,14 +57,7 @@ export function Lobby({
               Check your camera and microphone before entering.
             </Typography>
           </Box>
-          <MediaPreview
-            source={video}
-            isCamOn={isCamOn}
-            isMicOn={isMicOn}
-            onToggleCam={() => setCamOn((value) => !value)}
-            onToggleMic={() => setMicOn((value) => !value)}
-            hasStream={Boolean(video || audio)}
-          />
+          <MediaPreview />
           {(error || devices.error) && (
             <Alert
               severity="error"
@@ -95,8 +81,7 @@ export function Lobby({
             spacing={2}
             onSubmit={(event) => {
               event.preventDefault();
-              if (video && audio && endpoint)
-                onJoin(token, endpoint, isCamOn, isMicOn);
+              if (video && audio && endpoint) onJoin(token, endpoint);
             }}
           >
             <TextField
