@@ -4,7 +4,7 @@ use crate::participant::downstream::INITIAL_BANDWIDTH;
 use pulsebeam_proto::rtp_extensions;
 use pulsebeam_runtime::net::ReceiveTime;
 use str0m::{
-    Candidate, IceCreds, Rtc, RtcConfig, RtcError,
+    Candidate, IceCreds, Rtc, RtcConfig,
     change::{SdpAnswer, SdpOffer},
     format::{Codec, CodecConfig, FormatParams},
     media::{Direction, Frequency, MediaKind, Mid, Pt},
@@ -67,8 +67,10 @@ impl std::fmt::Display for MediaType {
 
 #[derive(thiserror::Error, Debug)]
 pub enum NegotiatorError {
-    #[error("RTC engine error: {0}")]
-    Rtc(#[from] RtcError),
+    #[error("invalid SDP offer: {0}")]
+    InvalidOffer(String),
+    #[error("RTC negotiation failed: {0}")]
+    Rtc(String),
     #[error("{0} {1} slots limit exceeded (max {2})")]
     SlotsLimit(MediaType, Direction, usize),
     #[error("SendRecv direction is not supported for {0}")]
@@ -121,11 +123,13 @@ impl Negotiator {
 
     pub fn create_answer(
         &mut self,
-        offer: SdpOffer,
+        offer: String,
         creds: IceCreds,
         at: ReceiveTime,
-    ) -> Result<(Rtc, SdpAnswer, NegotiatedResources), NegotiatorError> {
+    ) -> Result<(Rtc, String, NegotiatedResources), NegotiatorError> {
         tracing::debug!("{offer}");
+        let offer = SdpOffer::from_sdp_string(&offer)
+            .map_err(|error| NegotiatorError::InvalidOffer(error.to_string()))?;
         let mut rtc_config = RtcConfig::new()
             .clear_codecs()
             .set_rtp_mode(true)
@@ -176,12 +180,12 @@ impl Negotiator {
         let answer = rtc
             .sdp_api()
             .accept_offer(offer)
-            .map_err(NegotiatorError::Rtc)?;
+            .map_err(|error| NegotiatorError::Rtc(error.to_string()))?;
         Self::enforce_media_lines(&answer)?;
         let resources = Self::negotiated_resources(&answer)?;
 
         tracing::debug!("{answer}");
-        Ok((rtc, answer, resources))
+        Ok((rtc, answer.to_sdp_string(), resources))
     }
 
     fn negotiated_resources(answer: &SdpAnswer) -> Result<NegotiatedResources, NegotiatorError> {
@@ -331,7 +335,7 @@ mod tests {
     // cross-core. See crates/pulsebeam/docs/thread-per-core.md.
     use super::*;
 
-    fn chrome_like_offer(direction: Direction) -> SdpOffer {
+    fn chrome_like_offer(direction: Direction) -> String {
         let mut config = RtcConfig::new()
             .clear_codecs()
             // Chrome's usual ids: dependency descriptor collides with str0m's
@@ -346,7 +350,7 @@ mod tests {
 
         let mut change = rtc.sdp_api();
         change.add_media(MediaKind::Video, direction, None, None, None);
-        change.apply().unwrap().0
+        change.apply().unwrap().0.to_sdp_string()
     }
 
     fn answer_sdp() -> String {
@@ -358,7 +362,7 @@ mod tests {
                 ReceiveTime::now(),
             )
             .unwrap();
-        answer.to_sdp_string()
+        answer
     }
 
     #[test]
@@ -375,7 +379,7 @@ mod tests {
                     ReceiveTime::now(),
                 )
                 .unwrap();
-            assert!(answer.to_sdp_string().contains(answer_direction));
+            assert!(answer.contains(answer_direction));
         }
     }
 
@@ -386,7 +390,7 @@ mod tests {
         change.add_media(MediaKind::Audio, Direction::SendOnly, None, None, None);
         change.add_channel("signal".to_owned());
         change.add_media(MediaKind::Video, Direction::RecvOnly, None, None, None);
-        let offer = change.apply().unwrap().0;
+        let offer = change.apply().unwrap().0.to_sdp_string();
         let mut negotiator = Negotiator::new(Vec::new());
         let (_, _, resources) = negotiator
             .create_answer(offer, IceCreds::new(), ReceiveTime::now())
@@ -405,7 +409,7 @@ mod tests {
         );
     }
 
-    fn with_unique_mids(offer: SdpOffer) -> SdpOffer {
+    fn with_unique_mids(offer: SdpOffer) -> String {
         // str0m's random MIDs can collide within a batch of pending additions.
         let sdp = offer.to_sdp_string();
         let bundle = sdp
@@ -430,7 +434,7 @@ mod tests {
                 }
             })
             .collect::<Vec<_>>();
-        SdpOffer::from_sdp_string(&(lines.join("\r\n") + "\r\n")).unwrap()
+        lines.join("\r\n") + "\r\n"
     }
 
     #[test]
@@ -485,7 +489,6 @@ mod tests {
             .0
             .to_sdp_string()
             .replacen("m=video 9", "m=video 0", 1);
-        let offer = SdpOffer::from_sdp_string(&offer).unwrap();
         let mut negotiator = Negotiator::new(Vec::new());
         assert!(
             negotiator

@@ -15,7 +15,6 @@ use pulsebeam_core::auth::{
 };
 use pulsebeam_runtime::mailbox::TrySendError;
 use serde::{Deserialize, Serialize};
-use str0m::{change::SdpOffer, error::SdpError};
 use tokio::time::Instant;
 use utoipa::{OpenApi, ToSchema};
 use utoipa_swagger_ui::SwaggerUi;
@@ -52,8 +51,6 @@ pub enum ApiError {
     Authorization(#[from] TokenError),
     #[error("invalid entity id format: {0}")]
     IdValidation(#[from] IdValidationError),
-    #[error("sdp offer is invalid: {0}")]
-    OfferInvalid(#[from] SdpError),
     #[error("join failed: {0}")]
     JoinError(#[from] controller::ControllerError),
     #[error("request body exceeds the 1 MiB limit")]
@@ -89,7 +86,6 @@ impl IntoResponse for ApiError {
                 (StatusCode::UNAUTHORIZED, "Unauthorized")
             }
             Self::IdValidation(_)
-            | Self::OfferInvalid(_)
             | Self::JoinError(controller::ControllerError::OfferRejected(_))
             | Self::BadRequest(_) => (StatusCode::BAD_REQUEST, "Bad Request"),
             Self::NotFound => (StatusCode::NOT_FOUND, "Not Found"),
@@ -351,8 +347,8 @@ async fn create_native(
     if request.offer.len() > MAX_SIGNALING_BODY_BYTES {
         return Err(ApiError::PayloadTooLarge);
     }
-    let offer = SdpOffer::from_sdp_string(&request.offer)?;
     validate_native_directions(&request.offer)?;
+    let offer = request.offer;
     let lease = controller::AuthorizationLease::from_expiry(
         authorization.expiry,
         wall_now,
@@ -404,7 +400,7 @@ async fn create_native(
             participant_external_id: authorization.participant_external_id.as_str().to_owned(),
             participant_id: authorization.participant_id,
             connection_id,
-            answer: reply.answer.to_sdp_string(),
+            answer: reply.answer,
         }),
     )
         .into_response())
@@ -473,9 +469,9 @@ async fn create_sdp_profile(
         .map_err(|_| ApiError::PayloadTooLarge)?;
     let raw_offer = std::str::from_utf8(&body)
         .map_err(|_| ApiError::BadRequest("SDP body must be UTF-8".to_owned()))?;
-    let offer = SdpOffer::from_sdp_string(raw_offer)?;
     validate_strict_directions(raw_offer, required_direction)?;
     validate_single_media_per_kind(raw_offer)?;
+    let offer = raw_offer.to_owned();
     let lease = controller::AuthorizationLease::from_expiry(
         authorization.expiry,
         wall_now,
@@ -522,12 +518,7 @@ async fn create_sdp_profile(
         HeaderValue::from_str(&location).map_err(|_| ApiError::BadUrl)?,
     );
     response_headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/sdp"));
-    Ok((
-        StatusCode::CREATED,
-        response_headers,
-        reply.answer.to_sdp_string(),
-    )
-        .into_response())
+    Ok((StatusCode::CREATED, response_headers, reply.answer).into_response())
 }
 
 #[utoipa::path(
@@ -902,7 +893,6 @@ mod tests {
     };
     use str0m::{
         RtcConfig,
-        change::SdpAnswer,
         media::{Direction, MediaKind},
     };
     use tower::ServiceExt;
@@ -993,8 +983,10 @@ mod tests {
         let (controller, mut commands) = pulsebeam_runtime::mailbox::new(4);
         let app = router(controller, cfg(), auth_registry());
         let token = live_token();
+        let offer = valid_offer();
+        let expected_offer = offer.clone();
         let body = serde_json::to_vec(&serde_json::json!({
-            "offer": valid_offer(),
+            "offer": offer.clone(),
             "manual": true
         }))
         .unwrap();
@@ -1007,7 +999,8 @@ mod tests {
             assert!(message.state.manual_sub);
             assert_eq!(message.state.profile, ConnectionProfile::Native);
             assert!(message.state.authorization.is_some());
-            let answer = SdpAnswer::from_sdp_string(&message.offer.to_sdp_string()).unwrap();
+            assert_eq!(message.offer, expected_offer);
+            let answer = message.offer;
             reply.send(Ok(CreateParticipantReply { answer })).unwrap();
         });
         let response = app.oneshot(native_post(&token, body)).await.unwrap();
@@ -1030,8 +1023,48 @@ mod tests {
         assert_eq!(body["room_id"], room_id.as_str());
         assert_eq!(body["participant_id"], participant_id.as_str());
         assert!(body["connection_id"].as_str().unwrap().starts_with("c_0"));
-        assert!(body["answer"].as_str().unwrap().starts_with("v=0"));
+        assert_eq!(body["answer"].as_str().unwrap(), offer);
         assert!(location.ends_with(body["connection_id"].as_str().unwrap()));
+        responder.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn malformed_offer_is_a_negotiation_error_response() {
+        let (controller, mut commands) = pulsebeam_runtime::mailbox::new(1);
+        let app = router(controller, cfg(), auth_registry());
+        let offer = "not SDP\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=sendonly\r\n";
+        let body = serde_json::to_vec(&serde_json::json!({"offer": offer})).unwrap();
+        let responder = tokio::spawn(async move {
+            let controller::ControllerCommand::CreateParticipant(message, reply) =
+                commands.recv().await.unwrap()
+            else {
+                panic!("expected create command")
+            };
+            assert_eq!(message.offer, offer);
+            let mut negotiator = crate::control::negotiator::Negotiator::new(Vec::new());
+            let result = negotiator.create_answer(
+                message.offer,
+                str0m::IceCreds::new(),
+                pulsebeam_runtime::net::ReceiveTime::now(),
+            );
+            let Err(error @ crate::control::negotiator::NegotiatorError::InvalidOffer(_)) = result
+            else {
+                panic!("malformed SDP must fail at admission");
+            };
+            reply.send(Err(error.into())).unwrap();
+        });
+        let response = app.oneshot(native_post(&live_token(), body)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(response.headers()[CONTENT_TYPE], "application/problem+json");
+        let body = to_bytes(response.into_body(), 4096).await.unwrap();
+        let problem: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(problem["status"], 400);
+        assert!(
+            problem["detail"]
+                .as_str()
+                .unwrap()
+                .contains("invalid SDP offer")
+        );
         responder.await.unwrap();
     }
 
@@ -1135,11 +1168,7 @@ mod tests {
                 assert_eq!(message.state.profile, profile);
                 assert!(!message.state.manual_sub);
                 assert!(message.state.authorization.is_some());
-                reply
-                    .send(Ok(CreateParticipantReply {
-                        answer: SdpAnswer::from_sdp_string(&answer).unwrap(),
-                    }))
-                    .unwrap();
+                reply.send(Ok(CreateParticipantReply { answer })).unwrap();
             });
             let response = app
                 .oneshot(sdp_post(&token, resource, offer.into_bytes()))

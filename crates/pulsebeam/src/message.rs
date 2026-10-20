@@ -1,10 +1,6 @@
 use std::fmt::Debug;
 use str0m::media::{KeyframeRequestKind, Rid};
 
-pub use str0m::change::{SdpAnswer, SdpOffer};
-pub use str0m::error::SdpError;
-pub use str0m::{Rtc, RtcError};
-
 #[derive(Debug)]
 pub struct KeyframeRequest {
     pub rid: Option<Rid>,
