@@ -18,7 +18,8 @@ import {
 import * as Icons from "lucide-react";
 import { DeviceSettings } from "./DeviceSettings";
 import { useMeetMedia } from "./MeetMediaProvider";
-import { reactionEmojis, useTopics } from "@/hooks/topics";
+import { useChat } from "@/hooks/chat";
+import { reactionEmojis, useReaction } from "@/hooks/reaction";
 import { useVideoLayout } from "@/hooks/video-layout";
 
 const latencyModes: Record<
@@ -81,18 +82,23 @@ export function Room({
   const playbackRetry = useRef<(() => Promise<void>) | null>(null);
   const {
     Chat,
-    Reactions,
-    receiveChat,
-    receiveReaction,
-    onTopicError,
     messages,
+    error: chatError,
+    clearError: clearChatError,
+    onEvent: receiveChat,
+    onError: onChatError,
+    send: sendChat,
+  } = useChat(agent);
+  const {
+    Reactions,
     reactions,
-    dismissReaction,
-    sendChat,
-    sendReaction,
-    error: topicError,
-    clearError,
-  } = useTopics(agent);
+    error: reactionError,
+    clearError: clearReactionError,
+    onEvent: receiveReaction,
+    onError: onReactionError,
+    dismiss: dismissReaction,
+    send: sendReaction,
+  } = useReaction(agent);
   const { remoteTracks, spotlight, setPin } = useVideoLayout(
     agent.remote.videoTracks,
   );
@@ -129,7 +135,8 @@ export function Room({
   const closeAlert = () => {
     setFailure(null);
     playbackRetry.current = null;
-    clearError();
+    clearChatError();
+    clearReactionError();
   };
   const send = async () => {
     if (sending || !draft.trim()) return;
@@ -194,8 +201,8 @@ export function Room({
       <Camera source={capture.video} enabled={cameraOn} />
       <Microphone source={capture.audio} enabled={micOn} />
       <Screen source={screen} preferences={{ content: "detail" }} />
-      <Chat onEvent={receiveChat} onError={onTopicError} />
-      <Reactions onEvent={receiveReaction} onError={onTopicError} />
+      <Chat onEvent={receiveChat} onError={onChatError} />
+      <Reactions onEvent={receiveReaction} onError={onReactionError} />
       <Paper
         component="header"
         square
@@ -303,9 +310,9 @@ export function Room({
           {(capture.error || devices.error)?.message}
         </Alert>
       )}
-      {(failure || topicError || agent.error) && (
+      {(failure || chatError || reactionError || agent.error) && (
         <Alert severity="error" onClose={closeAlert}>
-          {failure ?? topicError ?? agent.error?.message}
+          {failure ?? chatError ?? reactionError ?? agent.error?.message}
         </Alert>
       )}
       <Box
