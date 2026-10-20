@@ -12,7 +12,7 @@ import {
   useAgent,
   type Agent,
   type TopicConsumerError,
-  type TopicGap,
+  type TopicEvent,
 } from "../../src/index.js";
 import { createCaptureSource } from "@pulsebeam/web";
 import { publishableVideoSource } from "../../src/sources.js";
@@ -55,12 +55,10 @@ export async function relationships() {
   );
   const messages: {
     consumer: string;
-    value: number;
-    publisherId: string;
+    event: TopicEvent<number>;
     callback: number;
   }[] = [];
   const errors: TopicConsumerError[] = [];
-  const gaps: TopicGap[] = [];
   let ownershipError: Error | undefined;
   let capacityError: Error | undefined;
   let speculative = false;
@@ -88,9 +86,9 @@ export async function relationships() {
     update = (patch) => setState((prior) => ({ ...prior, ...patch }));
     const Camera = agent.local.video("camera");
     const Extra = agent.local.video("extra");
-    const Chat = agent.topic<number>("chat", { mode: "reliable" });
+    const Chat = agent.topic<number>("chat", { mode: "ordered" });
     assert.equal(Camera, agent.local.video("camera"));
-    assert.equal(Chat, agent.topic<number>("chat", { mode: "reliable" }));
+    assert.equal(Chat, agent.topic<number>("chat", { mode: "ordered" }));
     if (state.speculative)
       for (let i = 0; i < 50; i++) agent.local.video(`abandoned-${i}`);
     const callback = state.callback;
@@ -103,17 +101,16 @@ export async function relationships() {
         />
         {state.consumer && (
           <Chat
-            onMessage={(value, metadata) =>
-              messages.push({ consumer: "one", value, ...metadata, callback })
+            onEvent={(event) =>
+              messages.push({ consumer: "one", event, callback })
             }
-            onGap={(gap) => gaps.push(gap)}
             onError={(error) => errors.push(error)}
           />
         )}
         {state.second && (
           <Chat
-            onMessage={(value, metadata) =>
-              messages.push({ consumer: "two", value, ...metadata, callback })
+            onEvent={(event) =>
+              messages.push({ consumer: "two", event, callback })
             }
             onError={(error) => errors.push(error)}
           />
@@ -157,14 +154,15 @@ export async function relationships() {
     desired,
     "callback-only and equal props are external no-ops",
   );
+  let sequence = 0n;
   const event = (value: Uint8Array) =>
     runtime.event({
       type: "topic-message",
       mode: "ordered",
       topic: "chat",
-      publisherId: "actual-publisher",
-      streamId: 3,
-      sequence: 2,
+      participantId: "alice",
+      dataTrackId: "remote-chat",
+      sequence: sequence++,
       payload: value,
     });
   await flush(() => event(new TextEncoder().encode("7")));
@@ -172,8 +170,14 @@ export async function relationships() {
     messages,
     ["one", "two"].map((consumer) => ({
       consumer,
-      value: 7,
-      publisherId: "actual-publisher",
+      event: {
+        type: "message",
+        topic: "chat",
+        value: 7,
+        participantId: "alice",
+        dataTrackId: "remote-chat",
+        sequence: 0n,
+      },
       callback: 1,
     })),
   );
@@ -218,18 +222,34 @@ export async function relationships() {
   await flush(() => update({ consumer: false }));
   await flush(() => event(new TextEncoder().encode("9")));
   assert.equal(messages.at(-1)!.consumer, "two");
-  assert.equal(messages.filter((message) => message.value === 9).length, 1);
+  assert.equal(
+    messages.filter(
+      (message) =>
+        message.event.type === "message" && message.event.value === 9,
+    ).length,
+    1,
+  );
   const gap = {
     type: "topic-recovery-gap",
     topic: "chat",
-    publisherId: "actual-publisher",
-    streamId: 3,
-    expectedSequence: 2,
-    availableSequence: 4,
+    participantId: "alice",
+    dataTrackId: "remote-chat",
+    expectedSequence: 3n,
+    availableSequence: 5n,
   };
   await flush(() => update({ consumer: true }));
   await flush(() => runtime.event(gap));
-  assert.deepEqual(gaps, [gap]);
+  assert.deepEqual(
+    messages.slice(-2).map(({ event }) => event),
+    [0, 1].map(() => ({ ...gap, type: "gap" })),
+  );
+  sequence = 5n;
+  await flush(() => event(new TextEncoder().encode("10")));
+  assert.ok(
+    messages
+      .slice(-2)
+      .every(({ event }) => event.type === "message" && event.sequence === 5n),
+  );
   const channelFailure = {
     type: "topic-channel-failed",
     direction: "subscribe",
@@ -242,6 +262,16 @@ export async function relationships() {
     code: "channel-failed",
     event: channelFailure,
   });
+  const fencedCount = messages.length;
+  await flush(() => event(new Uint8Array([0xff])));
+  assert.equal(
+    errors.filter((error) => error.code === "decode-failed").length,
+    0,
+    "channel failure fenced both consumers",
+  );
+  assert.equal(messages.length, fencedCount);
+  await flush(() => update({ consumer: false, second: false }));
+  await flush(() => update({ consumer: true, second: true }));
   await flush(() => event(new Uint8Array([0xff])));
   assert.equal(
     errors.filter((error) => error.code === "decode-failed").length,
@@ -252,8 +282,31 @@ export async function relationships() {
     0,
     "decode failure releases affected consumers",
   );
-  const Chat = agent.topic<number>("chat", { mode: "reliable" });
-  await flush(() => Chat.publish(10));
+  const Chat = agent.topic<number>("chat", { mode: "ordered" });
+  agent.connect();
+  const admission = Chat.publish(10);
+  await flush(() =>
+    runtime.emit({
+      connection: "connected",
+      generation: 1n,
+      topics: {
+        ...runtime.snapshot.topics,
+        publishers: [
+          {
+            name: "chat",
+            mode: "ordered",
+            connected: true,
+            dataTrackId: "local-chat",
+            nextSequence: 0n,
+            acceptedHistory: 0,
+            queued: 0,
+            sendPending: false,
+          },
+        ],
+      },
+    }),
+  );
+  await admission;
   assert.equal(runtime.desired.topics[0].publish, true);
   assert.equal(
     runtime.desired.topics[0].subscribe,

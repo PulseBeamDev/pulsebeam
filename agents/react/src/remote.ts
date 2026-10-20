@@ -31,7 +31,7 @@ export interface RemoteMedia
     WebRemoteMedia,
     "participant" | "participants" | "videoTracks" | "audioTracks"
   > {
-  participant(externalId: string): RemoteParticipant;
+  participant(participantId: string): RemoteParticipant;
   readonly participants: readonly RemoteParticipant[];
   readonly videoTracks: readonly RemoteVideoTrack[];
   readonly audioTracks: readonly RemoteAudioTrack[];
@@ -109,7 +109,7 @@ export function createRemoteMedia(raw: WebRemoteMedia): RemoteMedia {
     let handle = participants.get(source);
     if (!handle) {
       handle = Object.freeze({
-        externalId: source.externalId,
+        participantId: source.participantId,
         video: (label: string) => video(source.video(label)),
         audio: (label: string) => audio(source.audio(label)),
         get videoTracks() {
@@ -134,8 +134,8 @@ export function createRemoteMedia(raw: WebRemoteMedia): RemoteMedia {
     get audioTracks() {
       return audioTracks(raw.audioTracks);
     },
-    participant: (externalId: string) =>
-      participant(raw.participant(externalId)),
+    participant: (participantId: string) =>
+      participant(raw.participant(participantId)),
     resumeAudio: () => raw.resumeAudio(),
   });
 }

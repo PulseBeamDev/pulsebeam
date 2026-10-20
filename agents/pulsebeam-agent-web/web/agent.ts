@@ -31,6 +31,7 @@ import type {
   VideoDemand,
   TopicSnapshot,
   TopicCallbacks,
+  TopicPublisherStatus,
 } from "./types.js";
 import { RemoteCatalog } from "./remote-catalog.js";
 import { TopicRegistry } from "./topic.js";
@@ -49,20 +50,35 @@ export { LocalTrackCapacityError } from "./local-track.js";
 
 type Runtime = InstanceType<typeof BrowserRuntime>;
 
+type RuntimeTopicCounter =
+  | "acceptedSends"
+  | "droppedSends"
+  | "deliveredMessages"
+  | "channelFailures";
+
 interface RuntimeSnapshot {
-  readonly version: number;
-  readonly desiredRevision: number;
+  readonly version: bigint;
+  readonly desiredRevision: bigint;
   readonly connection: ConnectionState;
-  readonly generation?: number;
+  readonly generation?: bigint;
   readonly participantId?: string;
-  readonly participantExternalId?: string;
-  readonly roomExternalId?: string;
-  readonly authorizationExpiresAt?: number;
-  readonly catalog: CatalogSnapshot;
-  readonly mapping: MappingSnapshot;
+  readonly roomId?: string;
+  readonly authorizationExpiresAt?: bigint;
+  readonly catalog: Omit<CatalogSnapshot, "revision"> & {
+    readonly revision: bigint;
+  };
+  readonly mapping: Omit<MappingSnapshot, "acceptedIntentRevision"> & {
+    readonly acceptedIntentRevision: bigint;
+  };
   readonly participants: readonly Participant[];
   readonly publications: readonly Publication[];
-  readonly topics: TopicSnapshot;
+  readonly topics: Omit<TopicSnapshot, RuntimeTopicCounter | "publishers"> &
+    Record<RuntimeTopicCounter, bigint> & {
+      readonly publishers: readonly (Omit<
+        TopicPublisherStatus,
+        "dataTrackId"
+      > & { readonly dataTrackId?: string })[];
+    };
   readonly failure?: AgentError;
 }
 
@@ -89,6 +105,7 @@ class AgentFacade implements Agent {
   #eventListeners = new Set<(event: AgentEvent) => void>();
   #state: AgentState = copyState({ connected: false });
   #runtime: Runtime | undefined;
+  #runtimeGeneration: bigint | null = null;
   #localSourcePresent = new Map<string, boolean>();
   #localMuted = new Map<string, boolean>();
   #localVideoHandles = new Map<
@@ -137,16 +154,16 @@ class AgentFacade implements Agent {
     );
     this.#topics = new TopicRegistry(
       this,
-      async (name, mode, payload) => {
-        const ready = this.#ready;
-        if (!ready) throw new Error("agent is not active");
-        const runtime = await ready;
-        this.#requireCurrentRuntime(runtime);
-        runtime.send_topic(name, mode, payload);
-      },
+      (name, mode, payload) => this.#publishTopic(name, mode, payload),
       (topics) => {
+        const previous = this.#managedTopics;
         this.#managedTopics = topics;
-        this.#applyState(this.#state);
+        try {
+          this.#applyState(this.#state);
+        } catch (error) {
+          this.#managedTopics = previous;
+          throw error;
+        }
       },
     );
     if (!managed) this.activate();
@@ -193,6 +210,7 @@ class AgentFacade implements Agent {
             this.#terminalFailure("invalid-configuration", message(error));
           runtime.abort();
           this.#runtime = undefined;
+          this.#runtimeGeneration = null;
           throw error;
         }
         runtime.set_snapshot_listener((snapshot: RuntimeSnapshot) => {
@@ -230,6 +248,7 @@ class AgentFacade implements Agent {
     this.#ready = undefined;
     const runtime = this.#runtime;
     this.#runtime = undefined;
+    this.#runtimeGeneration = null;
     if (runtime) {
       runtime.set_snapshot_listener();
       runtime.set_event_listener();
@@ -258,12 +277,8 @@ class AgentFacade implements Agent {
     return this.#snapshot.participantId;
   }
 
-  get participantExternalId(): string | null {
-    return this.#snapshot.participantExternalId;
-  }
-
-  get roomExternalId(): string | null {
-    return this.#snapshot.roomExternalId;
+  get roomId(): string | null {
+    return this.#snapshot.roomId;
   }
 
   get authorizationExpiresAt(): number | null {
@@ -274,16 +289,13 @@ class AgentFacade implements Agent {
     return this.#remote;
   }
 
-  topic<T>(
-    name: string,
-    options: { readonly mode: "reliable" | "unreliable" },
-  ): Topic<T> {
+  topic<T>(name: string, options: { readonly mode: TopicMode }): Topic<T> {
     return this.#topics.topic(name, options);
   }
 
   listenTopic<T>(
     name: string,
-    options: { readonly mode: "reliable" | "unreliable" },
+    options: { readonly mode: TopicMode },
     callbacks: TopicCallbacks<T>,
   ): () => void {
     return this.#topics.listen(name, options, callbacks);
@@ -542,8 +554,8 @@ class AgentFacade implements Agent {
     this.#remote.setLogLevel(level);
   }
 
-  sendTopic(name: string, mode: TopicMode, payload: Uint8Array): void {
-    this.#requireRuntime().send_topic(name, mode, payload);
+  sendTopic(name: string, mode: TopicMode, payload: Uint8Array): Promise<void> {
+    return this.#publishTopic(name, mode, payload);
   }
 
   close(): void {
@@ -552,6 +564,7 @@ class AgentFacade implements Agent {
     this.#closed = true;
     const runtime = this.#runtime;
     this.#runtime = undefined;
+    this.#runtimeGeneration = null;
     if (runtime) {
       runtime.set_snapshot_listener();
       runtime.set_event_listener();
@@ -718,6 +731,125 @@ class AgentFacade implements Agent {
       });
   }
 
+  #publishTopic(
+    name: string,
+    mode: TopicMode,
+    payload: Uint8Array,
+  ): Promise<void> {
+    const ready = this.#ready;
+    if (!ready || !this.#state.connected)
+      return Promise.reject(new Error("topic publication is unavailable"));
+    const activation = this.#activation;
+    return new Promise((resolve, reject) => {
+      let runtime: Runtime | undefined;
+      let generation: bigint | null = null;
+      let dataTrackId =
+        this.#snapshot.topics.publishers.find(
+          (status) => status.name === name && status.mode === mode,
+        )?.dataTrackId ?? null;
+      let dispatching = false;
+      let settled = false;
+      let unsubscribe = () => {};
+      let unsubscribeEvents = () => {};
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const cleanup = () => {
+        unsubscribe();
+        unsubscribeEvents();
+        if (timer !== undefined) clearTimeout(timer);
+      };
+      const fail = (error: unknown) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        reject(error);
+      };
+      const check = () => {
+        if (settled) return;
+        if (
+          this.#closed ||
+          this.#activation !== activation ||
+          !this.#state.connected ||
+          (runtime !== undefined && runtime !== this.#runtime)
+        ) {
+          fail(
+            new Error(
+              "topic publication closed while awaiting its authoritative binding",
+            ),
+          );
+          return;
+        }
+        if (generation !== null && this.#runtimeGeneration !== generation) {
+          fail(new Error("topic publication generation was replaced"));
+          return;
+        }
+        if (
+          this.#snapshot.connection === "terminal-failure" ||
+          this.#snapshot.connection === "closing"
+        ) {
+          fail(
+            new Error(
+              this.#snapshot.failure?.message ??
+                "topic publication is unavailable",
+            ),
+          );
+          return;
+        }
+        const publisher = this.#snapshot.topics.publishers.find(
+          (status) => status.name === name && status.mode === mode,
+        );
+        if (publisher?.connected || publisher?.dataTrackId)
+          generation ??= this.#runtimeGeneration;
+        if (dataTrackId !== null && publisher?.dataTrackId !== dataTrackId) {
+          fail(new Error("topic publication binding was replaced"));
+          return;
+        }
+        dataTrackId ??= publisher?.dataTrackId ?? null;
+        if (
+          dispatching ||
+          !runtime ||
+          this.#snapshot.connection !== "connected" ||
+          generation === null ||
+          !publisher?.connected ||
+          dataTrackId === null
+        )
+          return;
+        dispatching = true;
+        try {
+          this.#requireCurrentRuntime(runtime);
+          void runtime
+            .send_topic(name, mode, payload, BigInt(generation), dataTrackId)
+            .then(() => {
+              if (settled) return;
+              settled = true;
+              cleanup();
+              resolve();
+            }, fail);
+        } catch (error) {
+          fail(error);
+        }
+      };
+      unsubscribe = this.subscribe(check);
+      unsubscribeEvents = this.subscribeEvents((event) => {
+        if (
+          event.type === "topic-channel-failed" &&
+          event.direction === "publish" &&
+          event.topic === name &&
+          event.mode === mode
+        )
+          fail(new Error(event.message));
+      });
+      timer = setTimeout(
+        () => fail(new Error("topic authoritative binding timed out")),
+        10_000,
+      );
+      void ready.then((value) => {
+        runtime = value;
+        check();
+      }, fail);
+      check();
+    });
+  }
+
   #requireCurrentRuntime(runtime: Runtime): void {
     if (this.#closed || runtime !== this.#runtime) {
       throw new Error("agent is closed");
@@ -726,6 +858,8 @@ class AgentFacade implements Agent {
 
   #runtimeSnapshot(runtime: Runtime, raw: RuntimeSnapshot): void {
     if (this.#closed || runtime !== this.#runtime) return;
+    this.#runtimeGeneration =
+      raw.generation === undefined ? null : BigInt(raw.generation);
     const participants = Object.freeze(
       raw.participants.map((participant) => Object.freeze({ ...participant })),
     );
@@ -733,12 +867,12 @@ class AgentFacade implements Agent {
       raw.publications.map((publication) => Object.freeze({ ...publication })),
     );
     const catalog = Object.freeze({
-      revision: raw.catalog.revision,
+      revision: Number(raw.catalog.revision),
       participants,
       publications,
     });
     const mapping = Object.freeze({
-      acceptedIntentRevision: raw.mapping.acceptedIntentRevision,
+      acceptedIntentRevision: Number(raw.mapping.acceptedIntentRevision),
       video: Object.freeze(
         raw.mapping.video.map((entry) => Object.freeze({ ...entry })),
       ),
@@ -773,18 +907,33 @@ class AgentFacade implements Agent {
       });
     }
     const next: AgentSnapshot = Object.freeze({
-      version: raw.version,
-      desiredRevision: raw.desiredRevision,
+      version: Number(raw.version),
+      desiredRevision: Number(raw.desiredRevision),
       connection: raw.connection,
-      generation: raw.generation ?? null,
+      generation:
+        this.#runtimeGeneration === null
+          ? null
+          : Number(this.#runtimeGeneration),
       participantId: raw.participantId ?? null,
-      participantExternalId: raw.participantExternalId ?? null,
-      roomExternalId: raw.roomExternalId ?? null,
-      authorizationExpiresAt: raw.authorizationExpiresAt ?? null,
+      roomId: raw.roomId ?? null,
+      authorizationExpiresAt:
+        raw.authorizationExpiresAt === undefined
+          ? null
+          : Number(raw.authorizationExpiresAt),
       catalog,
       mapping,
       tracks: Object.freeze(tracks),
-      topics: freezeTopicSnapshot(raw.topics),
+      topics: freezeTopicSnapshot({
+        ...raw.topics,
+        publishers: raw.topics.publishers.map((publisher) => ({
+          ...publisher,
+          dataTrackId: publisher.dataTrackId ?? null,
+        })),
+        acceptedSends: Number(raw.topics.acceptedSends),
+        droppedSends: Number(raw.topics.droppedSends),
+        deliveredMessages: Number(raw.topics.deliveredMessages),
+        channelFailures: Number(raw.topics.channelFailures),
+      }),
       failure: raw.failure ? Object.freeze({ ...raw.failure }) : null,
     });
     this.#publish(next);
@@ -848,7 +997,7 @@ export interface ManagedAgent extends Agent {
   claimRelationship(owner: object): () => void;
   listenTopic<T>(
     name: string,
-    options: { readonly mode: "reliable" | "unreliable" },
+    options: { readonly mode: TopicMode },
     callbacks: TopicCallbacks<T>,
   ): () => void;
   claimPublication(

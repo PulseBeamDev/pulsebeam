@@ -66,8 +66,7 @@ connection. Excess visible remote tracks remain unmapped and warn.
 | Member | Meaning |
 | --- | --- |
 | `connection`, `error` | Observed connection progress and nullable typed failure |
-| `participantId` | Nullable canonical participant ID |
-| `participantExternalId`, `roomExternalId` | Nullable authoritative application identities |
+| `participantId`, `roomId` | Nullable authoritative application identities from admission |
 | `authorizationExpiresAt` | Nullable deadline in Unix seconds |
 | `local.video(label)`, `local.audio(label)` | Stable resource components, keyed by kind and label |
 | `remote` | Stable logical remote identities and automatic audio recovery |
@@ -249,7 +248,7 @@ on unmount. Capture does not own these observers.
 
 `remote.participants`, `remote.videoTracks`, and `remote.audioTracks` are readonly,
 exclude self, and preserve collection identity until membership changes.
-`remote.participant(externalId)` returns a stable participant with `externalId`,
+`remote.participant(participantId)` returns a stable participant with `participantId`,
 `video(label)`, `audio(label)`, `videoTracks`, and `audioTracks`. Lookup is inert
 and works before discovery. Handles survive absence, remapping, replacement,
 and reconnect.
@@ -293,32 +292,142 @@ and `cause` where known. Codes: `permission-denied`, `device-not-found`,
 
 ## Topics
 
+Every lookup requires an explicit mode and preserves identity by `(name, mode)`.
+Different modes do not cross-deliver, even with the same name.
+
 ```tsx
-const Chat = agent.topic<{text: string}>("chat", {mode: "reliable"});
-// Render a consumer; call Chat.publish({text}) for a discrete send.
-<Chat onMessage={(value, {publisherId}) => accept(value, publisherId)} />;
+const Chat = agent.topic<{text: string}>("chat", {mode: "ordered"});
+// In the committed tree; accept and reportError are application UI callbacks.
+<Chat onEvent={accept} onError={reportError} />;
+// In a user-triggered send handler:
+void Chat.publish({text: "hello"}).catch(reportError);
 ```
 
-The snippet's `accept` is an application callback. Names contain 1 to 85 ASCII
-letters, digits, underscores, or hyphens. Lookup caches identity but creates no
-publisher/subscriber interest. Generic T does not validate runtime data.
+Names contain 1 to 85 ASCII letters, digits, underscores, or hyphens.
+Lookup is inert: it creates neither publisher nor subscriber interest.
+Generic `T` does not validate untrusted JSON or authorize its contents.
 
-Each committed component owns an independent consumer. `onMessage(value,
-{publisherId})` carries actual publisher identity. Optional `onGap` receives core
-recovery-gap fields including publisher, stream, expected sequence, and available
-sequence. Optional `onError` receives `{code: "decode-failed", topic, cause}` or
-`{code: "channel-failed", event}` with structured core direction/mode attribution.
-Missing optional callbacks do not suppress diagnostics. Callback changes do not
-resubscribe and only committed callbacks run.
+### Delivery modes
 
-Invalid UTF-8/JSON terminates and releases the affected consumer; remount retries.
-Other owners remain independent. Core gaps/channel failures retain core recovery
-semantics rather than starting an application subscription loop.
+| Mode | Meaning |
+| --- | --- |
+| `latest` | Replaceable state per publisher data track; a newer value may supersede pending values of that track, never another publisher's value |
+| `lossy` | Distinct best-effort events; no intentional latest-value replacement, ordering, or recovery |
+| `ordered` | Distinct messages in increasing sequence per track; recovery copies are deduplicated, with finite retained history and reorder state |
 
-`Chat.publish(value): Promise<void>` works with no mounted consumers. It retains
-JSON serialization and the 65,536-byte UTF-8 payload limit. Publishing interest
-lasts for the Agent lifetime; the last unmounted consumer releases subscription
-interest without withdrawing publishing. Success means send admission, not delivery
-acknowledgment. Reliable means live ordered recovery, not durable history;
-unreliable retains latest-value/coalescing behavior. Core owns restoration,
-bounds, and retry policy.
+Latest never delivers an older or duplicate sequence after a newer one from the
+same track. Nonrecovering modes do not replay history or synthesize ordered gaps.
+Ordered subscriptions start at a **live frontier**, without replaying
+pre-subscription messages or calling historical traffic a gap. Once established,
+a missing range is recovered when retained state permits; otherwise a gap precedes
+continuation. There is no global order across tracks.
+
+None of the modes provides an initial state snapshot, offline replay, durable
+history, end-to-end acknowledgment, or an exactly-once application contract.
+Sending does not loop back to the publisher.
+
+### Inline events and identity
+
+`onEvent` receives the same discriminated `TopicEvent<T>` as a direct Web
+subscription. There is no separate continuity callback:
+
+```ts
+type TopicEvent<T> =
+  | {
+      readonly type: "message";
+      readonly dataTrackId: string;
+      readonly sequence: bigint;
+      readonly participantId: string;
+      readonly topic: string;
+      readonly value: T;
+    }
+  | {
+      readonly type: "gap";
+      readonly dataTrackId: string;
+      readonly participantId: string;
+      readonly topic: string;
+      readonly expectedSequence: bigint;
+      readonly availableSequence: bigint;
+    };
+```
+
+A gap skips `[expectedSequence, availableSequence)` before any later message
+from that track. Render it visibly or reload authoritative application state;
+do not present a discontinuous stream as complete.
+
+`participantId` is the server-authored application participant identity, not a
+payload field, display name, or canonical protocol ID. `dataTrackId` is the
+opaque Catalog data-publication ID. Use `(dataTrackId, sequence)` to identify
+received messages. Topic names and JSON cannot impersonate another publisher.
+
+Sequences and gap boundaries are unsigned-64-bit-backed **TypeScript `bigint`**
+through the SDK and generated JavaScript bindings. Do not convert them to
+`number`. If storing metadata in JSON, encode them as decimal strings;
+`JSON.stringify` does not serialize `bigint` directly.
+
+Every newly opened publication, including reopening the same topic in one
+connection, gets a fresh `dataTrackId` and sequence space. Reconnect restores
+desired registrations but creates new publications. Queued frames, history, and
+controls from a retired publication cannot become messages of its replacement.
+Route changes without publication replacement do not change identity.
+Recovery is not promised across these lifetimes.
+
+### Ownership and errors
+
+Each committed component owns an independent consumer. Callback changes do not
+resubscribe and only committed callbacks run. Unmount releases that consumer.
+Publishing works without mounted consumers; publishing interest lasts for the
+Agent lifetime independently of subscription interest.
+
+Optional `onError` receives `{code: "decode-failed", topic, cause}` for invalid
+UTF-8/JSON, or `{code: "channel-failed", event}` with structured core
+direction/mode attribution. Missing error callbacks do not suppress diagnostics.
+A malformed payload releases only the affected consumer; remount retries.
+Continuity gaps are ordinary inline events, not decode/channel failures.
+Core owns transport restoration and recovery policy.
+
+### Limits and send admission
+
+| Bound | Behavior |
+| --- | --- |
+| Application payload | At most 65,536 UTF-8 JSON bytes, excluding the envelope |
+| Topic channels | At most 64 registrations per Agent, counting publisher/subscriber channels |
+| Core publication send queue | At most 256 messages; latest may supersede its own pending value |
+| Ordered retained history | At most 256 accepted messages per publication |
+| Ordered reorder state | At most 256 messages per data track |
+| Pending typed publishes | At most 256 per topic handle |
+| Initial binding/admission wait | At most 10 seconds in the Web/React typed API |
+| Direct Web iterator | At most 256 buffered events and 256 pending reads |
+
+Web iterator latest coalescing is per data track. Lossy may discard buffered
+events under pressure. Ordered overflow preserves explicit skipped intervals
+before continuation, merging ranges when necessary. If finite latest/ordered
+state cannot represent all tracks safely, the affected iterator fails explicitly
+instead of silently evicting another track or its continuity marker.
+
+`Chat.publish(value): Promise<void>` resolves only after local transmission
+acceptance. It does **not** certify remote delivery, persistence, an application
+acknowledgment, or survival of supersession, queue pressure, or reconnect.
+Invalid/oversized JSON, unavailable/closed publications, capacity rejection, and
+sequence exhaustion are explicit admission failures; sequences never wrap.
+
+The publisher waits for its server-authoritative Catalog binding before emitting
+an application envelope. This initial wait is bounded and fenced to its selected
+generation/publication. Disconnect, close, a failed channel, or replacement of
+that selected generation/binding rejects pending work rather than sending it on
+a replacement publication. A new application action may retry after recovery.
+
+### Coordinated upgrade
+
+Use matching server and SDK versions for this breaking topic contract. There is
+no default mode, legacy alias, mixed-version wire negotiation, or dual-stack path.
+Replace `reliable` with `ordered`; choose `latest` for replaceable state or
+`lossy` for transient events instead of `unreliable`. Replace split message/gap
+callbacks with `onEvent` and consume tagged events rather than bare values.
+
+Normal Agent, snapshot, remote-resource, and generated app-facing identity fields
+use `participantId` and `roomId` for application identities. Remove
+`participantExternalId` / `roomExternalId` and remote `externalId` aliases.
+Canonical participant/room IDs remain protocol-internal. Remove payload sender
+IDs or message UUIDs used only to reconstruct transport identity; the event
+already supplies sender and publication-scoped message identity.

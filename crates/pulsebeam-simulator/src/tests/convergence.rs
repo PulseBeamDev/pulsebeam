@@ -1,4 +1,5 @@
 use super::common::{LocalNodeSim, Participant, Room, Step};
+use pulsebeam_agent_native::agent_core::TopicMode;
 use std::time::Duration;
 
 #[test]
@@ -9,12 +10,13 @@ fn crashed_publications_retire_from_every_owner_and_observer() {
     }];
     for participant in ["viewer1", "viewer2"] {
         plan.push(Step::DeclareSubscribeTopic {
+            mode: TopicMode::Latest,
             description: "receive latest data",
             participant,
             topic: "latest",
-            scoped_to: None,
         });
-        plan.push(Step::DeclareOrderedSubscriber {
+        plan.push(Step::DeclareSubscribeTopic {
+            mode: TopicMode::Ordered,
             description: "receive ordered data",
             participant,
             topic: "ordered",
@@ -22,11 +24,13 @@ fn crashed_publications_retire_from_every_owner_and_observer() {
     }
     plan.extend([
         Step::DeclarePublishTopic {
+            mode: TopicMode::Latest,
             description: "publish latest data",
             participant: "publisher",
             topic: "latest",
         },
-        Step::DeclareOrderedPublisher {
+        Step::DeclarePublishTopic {
+            mode: TopicMode::Ordered,
             description: "publish ordered data",
             participant: "publisher",
             topic: "ordered",
@@ -36,12 +40,14 @@ fn crashed_publications_retire_from_every_owner_and_observer() {
             duration: Duration::from_secs(3),
         },
         Step::PublishData {
+            mode: TopicMode::Latest,
             description: "send latest payload",
             participant: "publisher",
             topic: "latest",
             data: b"latest-origin",
         },
-        Step::PublishOrdered {
+        Step::PublishData {
+            mode: TopicMode::Ordered,
             description: "send reliable payload",
             participant: "publisher",
             topic: "ordered",

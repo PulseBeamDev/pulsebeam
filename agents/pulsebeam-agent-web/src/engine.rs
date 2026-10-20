@@ -2,11 +2,13 @@ use std::cell::Cell;
 use std::collections::VecDeque;
 use std::fmt;
 
+use futures_channel::oneshot;
+
 use crate::channel::{self, mpsc, mpsc::TrySendError as MpscTrySendError, watch};
 
 use agent_core::{
-    Agent, AgentCommand, AgentConfig, AgentError, DesiredState, Effect, Failure, HostEvent,
-    Notification, Snapshot, TopicSend,
+    Agent, AgentCommand, AgentConfig, AgentError, DesiredState, Effect, Failure, Generation,
+    HostEvent, Notification, Snapshot, TopicSend,
 };
 
 #[derive(Clone)]
@@ -134,11 +136,6 @@ impl fmt::Debug for PublicCommand {
 }
 
 #[derive(Debug)]
-pub(crate) enum TopicCommand {
-    SendTopic(TopicSend),
-}
-
-#[derive(Debug)]
 pub(crate) enum LifecycleCommand {
     Close,
     Abort,
@@ -147,7 +144,12 @@ pub(crate) enum LifecycleCommand {
 #[derive(Debug)]
 pub(crate) enum Message {
     Public(PublicCommand),
-    Topic(TopicCommand),
+    Topic {
+        send: TopicSend,
+        expected_generation: u64,
+        expected_data_track_id: String,
+        completion: oneshot::Sender<Result<(), String>>,
+    },
     HostEvent(HostEvent),
     Lifecycle(LifecycleCommand),
     HostFailure(Failure),
@@ -182,8 +184,20 @@ impl ActorHandle {
         self.send(Message::Public(message))
     }
 
-    pub(crate) fn send_topic(&self, message: TopicCommand) -> Result<(), String> {
-        self.send(Message::Topic(message))
+    pub(crate) fn send_topic(
+        &self,
+        send: TopicSend,
+        expected_generation: u64,
+        expected_data_track_id: String,
+    ) -> Result<oneshot::Receiver<Result<(), String>>, String> {
+        let (completion, receiver) = oneshot::channel();
+        self.send(Message::Topic {
+            send,
+            expected_generation,
+            expected_data_track_id,
+            completion,
+        })?;
+        Ok(receiver)
     }
 
     pub(crate) fn send_host_event(&self, event: HostEvent) -> Result<(), String> {
@@ -258,8 +272,34 @@ impl<H: Host> Actor<H> {
         self.turn(Input::Command(AgentCommand::ReplaceDesired(desired)));
     }
 
-    fn send_topic(&mut self, send: TopicSend) {
-        self.turn(Input::Command(AgentCommand::SendTopic(send)));
+    fn send_topic(
+        &mut self,
+        send: TopicSend,
+        expected_generation: u64,
+        expected_data_track_id: &str,
+    ) -> Result<(), String> {
+        let snapshot = self.driver.snapshot();
+        if snapshot.generation.map(Generation::get) != Some(expected_generation) {
+            return Err("topic publication generation was replaced".to_owned());
+        }
+        let binding = snapshot
+            .topics
+            .publishers
+            .iter()
+            .find(|publisher| publisher.registration == send.publisher)
+            .and_then(|publisher| publisher.data_track_id.as_deref());
+        if binding != Some(expected_data_track_id) {
+            return Err("topic publication binding was replaced".to_owned());
+        }
+        let turn = self
+            .driver
+            .turn(Input::Command(AgentCommand::SendTopic(send)));
+        let result = turn
+            .error
+            .as_ref()
+            .map_or(Ok(()), |error| Err(error.to_string()));
+        self.publish_turn(turn);
+        result
     }
 
     fn event(&mut self, event: HostEvent) {
@@ -280,7 +320,11 @@ impl<H: Host> Actor<H> {
             return;
         }
 
-        let mut turn = self.driver.turn(input);
+        let turn = self.driver.turn(input);
+        self.publish_turn(turn);
+    }
+
+    fn publish_turn(&mut self, mut turn: Turn) {
         let mut snapshot = if let Some(snapshot) = turn.snapshot.clone() {
             snapshot
         } else {
@@ -377,9 +421,18 @@ impl<H: Host> Actor<H> {
                 PublicCommand::Reconnect => self.turn(Input::Command(AgentCommand::Reconnect)),
                 PublicCommand::SetLogLevel(level) => self.driver.set_log_level(level),
             },
-            Message::Topic(topic) => match topic {
-                TopicCommand::SendTopic(send) => self.send_topic(send),
-            },
+            Message::Topic {
+                send,
+                expected_generation,
+                expected_data_track_id,
+                completion,
+            } => {
+                let _ = completion.send(self.send_topic(
+                    send,
+                    expected_generation,
+                    &expected_data_track_id,
+                ));
+            }
             Message::HostEvent(event) => self.event(event),
             Message::Lifecycle(lifecycle) => match lifecycle {
                 LifecycleCommand::Close => self.close(),
@@ -465,7 +518,7 @@ mod tests {
 
     use super::{
         Actor, Driver, Host, Input, LifecycleCommand, Message, PublicCommand, SerialQueue,
-        TopicCommand, TurnErrorSource,
+        TurnErrorSource,
     };
     use agent_core::{
         AgentCommand, ChannelId, DesiredState, Effect, Failure, FailureClass, HostEvent,
@@ -614,13 +667,25 @@ mod tests {
         let mut actor = Actor::new(config(), host).unwrap();
 
         actor.process(Message::Public(PublicCommand::SetConnected(true)));
-        actor.process(Message::Topic(TopicCommand::SendTopic(TopicSend {
-            publisher: TopicPublisher {
-                topic: "chat".into(),
-                mode: TopicMode::Latest,
-            },
-            payload: vec![1, 2, 3],
-        })));
+        let expected_generation = actor.driver.snapshot().generation.unwrap().get();
+        for generation in [expected_generation, expected_generation.saturating_add(1)] {
+            let before = actor.driver.snapshot().clone();
+            let (completion, mut receiver) = futures_channel::oneshot::channel();
+            actor.process(Message::Topic {
+                send: TopicSend {
+                    publisher: TopicPublisher {
+                        topic: "chat".into(),
+                        mode: TopicMode::Latest,
+                    },
+                    payload: vec![1, 2, 3],
+                },
+                expected_generation: generation,
+                expected_data_track_id: "unbound-track".to_owned(),
+                completion,
+            });
+            assert!(receiver.try_recv().unwrap().unwrap().is_err());
+            assert_eq!(actor.driver.snapshot(), &before);
+        }
 
         let effects = actor.host.effect_events();
         assert!(!effects.is_empty());

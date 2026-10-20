@@ -11,10 +11,7 @@
 )]
 fn main() {
     prost_build::Config::new()
-        .compile_protos(
-            &["proto/signaling.proto", "proto/reliable.proto"],
-            &["proto"],
-        )
+        .compile_protos(&["proto/signaling.proto", "proto/topic.proto"], &["proto"])
         .expect("Failed to compile .proto files");
 
     println!("cargo:rerun-if-changed=proto/");

@@ -48,10 +48,11 @@ impl ExpectedParticipant {
             .collect::<Vec<_>>();
         for publisher in &self.topics.publishers {
             let lane = match publisher.mode {
-                TopicMode::Latest => "rt",
-                TopicMode::Ordered => "rel",
+                TopicMode::Latest => "latest",
+                TopicMode::Lossy => "lossy",
+                TopicMode::Ordered => "ordered",
             };
-            let label = format!("v1/{lane}/{}", publisher.topic);
+            let label = format!("v2/{lane}/{}", publisher.topic);
             let mut publications = control.tracks.iter().filter(|track| {
                 track.meta.origin == self.id
                     && track.meta.id.kind() == TrackKind::Data
@@ -133,6 +134,7 @@ impl ControlStateOracle {
 
     pub fn check_client(
         &self,
+        data_tracks: &[pulsebeam::sim_observation::TrackObservation],
         observer: &ExpectedParticipant,
         observation: &ClientObservation,
         requested_video: &[String],
@@ -187,6 +189,53 @@ impl ControlStateOracle {
                     "missing publication: {publication:?}"
                 );
             }
+        }
+        let label = |mode, topic: &str| {
+            let mode = match mode {
+                TopicMode::Latest => "latest",
+                TopicMode::Lossy => "lossy",
+                TopicMode::Ordered => "ordered",
+            };
+            format!("v2/{mode}/{topic}")
+        };
+        for publisher in &snapshot.topics.publishers {
+            let expected_label = label(publisher.registration.mode, &publisher.registration.topic);
+            let expected = data_tracks.iter().find(|track| {
+                track.meta.origin == observer.id
+                    && track.meta.id.kind() == TrackKind::Data
+                    && track.meta.label.as_ref() == Some(&expected_label)
+            });
+            ensure!(
+                publisher.data_track_id == expected.map(|track| track.meta.id.as_str()),
+                "publisher binding differs from authoritative owner track"
+            );
+        }
+        for subscriber in &snapshot.topics.subscribers {
+            let expected_label =
+                label(subscriber.registration.mode, &subscriber.registration.topic);
+            let expected = data_tracks
+                .iter()
+                .filter(|track| {
+                    track.meta.origin != observer.id
+                        && track.meta.room_id == observer.room_id().expect("valid plan room")
+                        && track.meta.id.kind() == TrackKind::Data
+                        && track.meta.label.as_ref() == Some(&expected_label)
+                })
+                .count();
+            ensure!(
+                subscriber.publishers == expected,
+                "subscriber binding count differs from owner tracks"
+            );
+        }
+        for (registration, id, _) in &observation.ordered_cursors {
+            let expected_label = label(registration.mode, &registration.topic);
+            ensure!(
+                data_tracks.iter().any(|track| track.meta.id.as_str() == *id
+                    && track.meta.origin != observer.id
+                    && track.meta.room_id == observer.room_id().expect("valid plan room")
+                    && track.meta.label.as_ref() == Some(&expected_label)),
+                "ordered cursor does not belong to the bound data track"
+            );
         }
         ensure!(
             observation.sent_intent_revision == Some(snapshot.accepted_intent_revision),
@@ -661,16 +710,13 @@ impl ControlStateOracle {
                         .subscribers
                         .iter()
                         .any(|subscription| {
-                            let lane = if subscription.mode == TopicMode::Latest {
-                                "rt"
-                            } else {
-                                "rel"
+                            let lane = match subscription.mode {
+                                TopicMode::Latest => "latest",
+                                TopicMode::Lossy => "lossy",
+                                TopicMode::Ordered => "ordered",
                             };
                             track.meta.label.as_deref()
-                                == Some(format!("v1/{lane}/{}", subscription.topic).as_str())
-                                && subscription.publisher_id.as_ref().is_none_or(|publisher| {
-                                    *publisher == track.meta.origin.as_str()
-                                })
+                                == Some(format!("v2/{lane}/{}", subscription.topic).as_str())
                         })
                 })
                 .map(|participant| participant.id)
@@ -718,22 +764,19 @@ impl ControlStateOracle {
                 ));
             }
             for subscription in &allowed[&participant.id].topics.subscribers {
-                let lane = if subscription.mode == TopicMode::Latest {
-                    "rt"
-                } else {
-                    "rel"
+                let lane = match subscription.mode {
+                    TopicMode::Latest => "latest",
+                    TopicMode::Lossy => "lossy",
+                    TopicMode::Ordered => "ordered",
                 };
                 expected_subscriptions.insert((
                     participant.room,
                     participant.id,
                     SelectorObservation {
                         track: None,
-                        publisher: subscription
-                            .publisher_id
-                            .as_ref()
-                            .map(|id| id.parse().expect("admission identity")),
+                        publisher: None,
                         kind: Some(TrackKind::Data),
-                        label: Some(format!("v1/{lane}/{}", subscription.topic)),
+                        label: Some(format!("v2/{lane}/{}", subscription.topic)),
                     },
                     false,
                 ));

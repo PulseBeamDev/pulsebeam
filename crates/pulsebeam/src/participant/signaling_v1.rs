@@ -383,12 +383,13 @@ impl CatalogState {
                 TrackKind::Video => (WireKind::Video, label, 0),
                 TrackKind::Data => {
                     let (mode, topic) = label
-                        .strip_prefix("v1/")
+                        .strip_prefix("v2/")
                         .and_then(|label| label.split_once('/'))
                         .ok_or(CatalogError::MissingIdentity)?;
                     let mode = match mode {
-                        "rt" => pulsebeam_proto::signaling_v1::TopicMode::Latest,
-                        "rel" => pulsebeam_proto::signaling_v1::TopicMode::Ordered,
+                        "latest" => pulsebeam_proto::signaling_v1::TopicMode::Latest,
+                        "lossy" => pulsebeam_proto::signaling_v1::TopicMode::Lossy,
+                        "ordered" => pulsebeam_proto::signaling_v1::TopicMode::Ordered,
                         _ => return Err(CatalogError::MissingIdentity),
                     };
                     if topic.is_empty()
@@ -1238,20 +1239,22 @@ mod tests {
         let topic = "x".repeat(85);
         let make_data = |owner, lane: &str| {
             let mut meta = remote_audio(owner, connection, "unused");
-            let label = format!("v1/{lane}/{topic}");
+            let label = format!("v2/{lane}/{topic}");
             meta.id =
                 connection.derive_track_id(TrackKind::Data, &format!("{label}/{}", owner.as_str()));
             meta.label = Some(label);
             meta
         };
-        let local = make_data(recipient, "rt");
-        let remote = make_data(publisher, "rel");
+        let local = make_data(recipient, "latest");
+        let lossy = make_data(recipient, "lossy");
+        let remote = make_data(publisher, "ordered");
         let mut state = CatalogState::default();
         let plan = state
             .plan(
                 [peer(publisher, "alice")],
                 [
                     local.clone(),
+                    lossy.clone(),
                     remote.clone(),
                     remote_audio(recipient, connection, "mic"),
                 ],
@@ -1267,8 +1270,12 @@ mod tests {
             panic!("expected snapshot");
         };
         assert_eq!(snapshot.participants.len(), 2);
-        assert_eq!(snapshot.tracks.len(), 2);
-        for (meta, mode) in [(&local, TopicMode::Latest), (&remote, TopicMode::Ordered)] {
+        assert_eq!(snapshot.tracks.len(), 3);
+        for (meta, mode) in [
+            (&local, TopicMode::Latest),
+            (&lossy, TopicMode::Lossy),
+            (&remote, TopicMode::Ordered),
+        ] {
             let entry = snapshot
                 .tracks
                 .iter()

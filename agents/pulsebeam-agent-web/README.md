@@ -160,7 +160,7 @@ be changed or reused for another slot of the same kind during the Agent lifetime
 
 ## Remote tracks and playback
 
-`agent.remote.participant(externalId)` returns a stable participant handle even
+`agent.remote.participant(participantId)` returns a stable participant handle even
 before discovery. Its `video(label)` and `audio(label)` handles survive unpublication,
 departure/rejoin, publication replacement, remapping, and reconnection. Remote
 collections exclude self and retain identity until membership changes. Lookup
@@ -191,34 +191,94 @@ handles inactive and reads silent. New remote lookups after close fail.
 
 ## Live messages
 
-Typed topics register when used. Given the connected `agent` returned above:
+Use `ordered` for chat, `lossy` for transient events, and `latest` for replaceable
+state. Every topic requires an explicit mode. Given the connected Agent above,
+this helper takes callbacks from your existing UI:
 
 ```ts
-const chat = agent.topic<{ text: string }>("chat", { mode: "reliable" });
-const controller = new AbortController();
-const messages = (async () => {
-  for await (const message of chat.subscribe({ signal: controller.signal })) {
-    console.log(message.text);
-  }
-})();
-const stopMessages = async () => {
-  controller.abort();
-  await messages;
-};
-try {
-  await chat.publish({ text: "hello" });
-} catch (error) {
-  await stopMessages();
-  throw error;
+import type { Agent } from "@pulsebeam/web";
+
+export function liveChat(
+  agent: Agent,
+  appendMessage: (message: {
+    key: string;
+    participantId: string;
+    text: string;
+  }) => void,
+  showNotice: (message: string) => void,
+) {
+  const chat = agent.topic<{ text: string }>("chat", { mode: "ordered" });
+  const controller = new AbortController();
+  const messages = (async () => {
+    for await (const event of chat.subscribe({ signal: controller.signal })) {
+      if (event.type === "gap") {
+        showNotice(
+          `Chat skipped sequences [${event.expectedSequence}, ${event.availableSequence}) from ${event.participantId}.`,
+        );
+      } else {
+        appendMessage({
+          key: `${event.dataTrackId}:${event.sequence}`,
+          participantId: event.participantId,
+          text: event.value.text,
+        });
+      }
+    }
+  })().catch((error: unknown) => showNotice(String(error)));
+
+  return {
+    async send(text: string) {
+      try {
+        await chat.publish({ text });
+      } catch (error) {
+        showNotice(`Message not accepted: ${String(error)}`);
+      }
+    },
+    async stop() {
+      controller.abort();
+      await messages;
+    },
+  };
 }
 ```
 
-Call `stopMessages()` on application teardown. Use the same topic name on both participants. `reliable` uses ordered delivery;
-`unreliable` uses latest-value delivery. Names are 1 to 85 ASCII characters in
-`[A-Za-z0-9_-]`. Messages use UTF-8 JSON, capped at 65,536 bytes before sending.
-Each subscription queues at most 256 values; ordered overflow drops the oldest,
-and latest mode coalesces queued values. Ending iteration or aborting releases
-subscription interest. Send admission is not a delivery acknowledgment.
+Wire `send(text)` to your send control and call `stop()` on teardown. Join two
+participants with the same topic name and mode: a received row identifies its
+server-authored sender. Sending does not loop back to the publisher. Local echo,
+if wanted, is application-owned and is not evidence of remote delivery.
+
+| Mode | Delivery within one publisher data track |
+| --- | --- |
+| `latest` | Replaceable state; older or duplicate sequences are suppressed and queued values may coalesce for that track only |
+| `lossy` | Distinct best-effort events; no intentional coalescing, ordering, or recovery |
+| `ordered` | Increasing, deduplicated messages with finite recovery; an inline gap precedes continuation when a known range is skipped |
+
+There is no global order across publishers, initial state snapshot, offline replay,
+or durable history. New ordered consumers start at a live frontier, not at sequence
+zero. Reopening or reconnecting creates a fresh `dataTrackId` and sequence space;
+recovery does not span those publication lifetimes.
+
+Each yielded `TopicEvent<T>` is a tagged `message` or `gap`. Both carry
+`dataTrackId`, external `participantId`, and `topic`. Messages add `sequence`
+and `value`; gaps describe `[expectedSequence, availableSequence)`. Sequence
+fields are lossless `bigint`, not JavaScript numbers. Treat IDs as opaque and use
+`(dataTrackId, sequence)` for received-message identity, never a sender field
+inside untrusted JSON.
+
+Names are 1 to 85 ASCII characters in `[A-Za-z0-9_-]`. UTF-8 JSON payloads are
+capped at 65,536 bytes, excluding the envelope. Generic types do not validate
+received JSON. Each iterator queues at most 256 events. Latest coalesces per track;
+lossy can discard buffered events under pressure. Ordered overflow retains explicit
+skipped ranges before later messages. Latest/ordered consumers fail explicitly if
+their per-track state cannot fit safely, rather than silently losing continuity.
+Ending iteration or aborting releases only that subscription.
+
+`publish()` resolves on **local transmission acceptance**, not remote delivery,
+persistence, or an application acknowledgment. Initial authoritative binding waits
+at most 10 seconds. Invalid payloads, unavailable publications, capacity exhaustion,
+sequence exhaustion, and replacement of a selected generation/binding reject;
+pending old-publication work is not retargeted to a replacement. Queue pressure,
+latest supersession, or reconnect may still discard an accepted value.
+[Exact topic contract and coordinated upgrade](../../docs/react/reference.md#topics).
 
 ## Low-level state and runtime behavior
 
@@ -227,9 +287,15 @@ low-level intent: omitted publication, video, audio-pinning, and topic collectio
 are empty and retract previous values. Handle-managed publications remain managed
 when unrelated intent changes. Selectors resolve against the current Catalog;
 missing tracks remain desired until discovered. `trackId` and `audio.pinned`
-accept Catalog track IDs. Low-level topics use `latest`/`ordered` registrations
-and `sendTopic()`. Event subscriptions expose message bytes and publisher/stream/
-sequence metadata plus admission, drop, resynchronization, and failure events.
+accept Catalog track IDs. Low-level topics use explicit `latest`, `lossy`, or
+`ordered` registrations and `sendTopic()`. Raw events expose message bytes,
+`dataTrackId`, external `participantId`, lossless sequences, recovery gaps,
+admission/drop outcomes, and genuine channel failures. Prefer typed inline events
+for application messages.
+
+Normal public `participantId` and `roomId` are authoritative application identities,
+not protocol-internal canonical IDs. There are no `participantExternalId` or
+`roomExternalId` aliases. Remote participant handles likewise expose `participantId`.
 
 Snapshots separate `catalog` (discovery) from `mapping` (accepted Intent revision
 and receiver bindings). `snapshot.tracks` exposes available remote platform tracks
@@ -269,12 +335,14 @@ Run from a build-ready repository root:
 
 Direct JavaScript tests execute production topic, catalog, immutable-state and
 local-handle modules without a DOM. Typed public consumers check package and
-generated contracts. Deterministic native/SFU simulation owns reliable-topic
-loss, restart, ordering and late-subscriber history-floor proof.
+generated contracts. Deterministic native/SFU simulation owns three-mode delivery,
+Catalog identity, publication replacement, ordered loss/recovery/gaps, and
+live late-subscription proof.
 
 Pinned-Node artifact tests instantiate emitted WASM and exercise supported
-lifecycle, sender ownership, cancellation and handle-policy paths. They do not
-negotiate RTC or establish application support for Node.
+lifecycle, sender ownership, cancellation, handle-policy paths, and lossless topic
+sequences/gaps. Controlled peer outcomes exercise binding/admission and generation
+fences, not real WebRTC or application support for Node.
 
 The required Web browser owner retains only real-platform proof: shipped SDK
 media through a local SFU, generated native-track handoff, decoded receiver

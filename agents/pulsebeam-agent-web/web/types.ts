@@ -24,7 +24,7 @@ export interface LocalAudioTrack {
   setSource(source: CapturedAudioTrack | null): void;
   subscribe(listener: () => void): () => void;
 }
-export type TopicMode = "latest" | "ordered";
+export type TopicMode = "latest" | "lossy" | "ordered";
 export type LogLevel = "off" | "error" | "warn" | "info" | "debug" | "trace";
 
 export interface AgentLogging {
@@ -56,7 +56,7 @@ export interface PublicationIntent {
 }
 
 export interface TrackSelector {
-  readonly participantExternalId: string;
+  readonly participantId: string;
   readonly label: string;
 }
 
@@ -97,7 +97,6 @@ export interface TopicRegistration {
   readonly mode: TopicMode;
   readonly publish?: boolean;
   readonly subscribe?: boolean;
-  readonly publisherId?: string;
 }
 
 /**
@@ -147,8 +146,7 @@ export interface AgentError {
 export type AgentFailure = AgentError;
 
 export interface Participant {
-  readonly id: string;
-  readonly externalId: string;
+  readonly participantId: string;
 }
 
 export interface Publication {
@@ -209,7 +207,7 @@ export interface LocalMedia {
 }
 
 export interface RemoteParticipant {
-  readonly externalId: string;
+  readonly participantId: string;
   video(label: string): RemoteVideoTrack;
   audio(label: string): RemoteAudioTrack;
   readonly videoTracks: readonly RemoteVideoTrack[];
@@ -220,15 +218,29 @@ export interface RemoteMedia {
   readonly participants: readonly RemoteParticipant[];
   readonly videoTracks: readonly RemoteVideoTrack[];
   readonly audioTracks: readonly RemoteAudioTrack[];
-  participant(externalId: string): RemoteParticipant;
+  participant(participantId: string): RemoteParticipant;
   /** Exceptional user-gesture recovery, also valid before media arrives. */
   resumeAudio(): Promise<void>;
 }
 
-export type TopicGap = Extract<
-  AgentEvent,
-  { readonly type: "topic-recovery-gap" }
->;
+export type TopicEvent<T> =
+  | {
+      readonly type: "message";
+      readonly dataTrackId: string;
+      readonly sequence: bigint;
+      readonly participantId: string;
+      readonly topic: string;
+      readonly value: T;
+    }
+  | {
+      readonly type: "gap";
+      readonly dataTrackId: string;
+      readonly participantId: string;
+      readonly topic: string;
+      readonly expectedSequence: bigint;
+      readonly availableSequence: bigint;
+    };
+export type TopicGap = Extract<TopicEvent<never>, { readonly type: "gap" }>;
 export type TopicConsumerError =
   | {
       readonly code: "decode-failed";
@@ -243,25 +255,24 @@ export type TopicConsumerError =
       >;
     };
 export interface TopicCallbacks<T> {
-  readonly onMessage: (
-    value: T,
-    metadata: { readonly publisherId: string },
-  ) => void;
-  readonly onGap?: (gap: TopicGap) => void;
+  readonly onEvent: (event: TopicEvent<T>) => void;
   readonly onError?: (error: TopicConsumerError) => void;
 }
-
 export interface Topic<T> {
+  /** Local transmission acceptance only, not remote delivery or persistence. */
   publish(value: T): Promise<void>;
-  subscribe(options?: { readonly signal?: AbortSignal }): AsyncIterable<T>;
+  subscribe(options?: {
+    readonly signal?: AbortSignal;
+  }): AsyncIterable<TopicEvent<T>>;
 }
 
 export interface TopicPublisherStatus {
   readonly name: string;
   readonly mode: TopicMode;
   readonly connected: boolean;
-  readonly streamId: number | null;
-  readonly nextSequence: number | null;
+  readonly dataTrackId: string | null;
+  readonly nextSequence: bigint;
+  readonly acceptedHistory: number;
   readonly queued: number;
   readonly sendPending: boolean;
 }
@@ -269,7 +280,6 @@ export interface TopicPublisherStatus {
 export interface TopicSubscriberStatus {
   readonly name: string;
   readonly mode: TopicMode;
-  readonly publisherId: string | null;
   readonly connected: boolean;
   readonly publishers: number;
   readonly buffered: number;
@@ -281,7 +291,6 @@ export interface TopicSnapshot {
   readonly acceptedSends: number;
   readonly droppedSends: number;
   readonly deliveredMessages: number;
-  readonly resynchronizations: number;
   readonly channelFailures: number;
 }
 
@@ -308,9 +317,8 @@ export interface AgentSnapshot {
   readonly connection: ConnectionState;
   readonly generation: number | null;
   readonly participantId: string | null;
-  /** Authoritative application identities, retained during reconnection to this session. */
-  readonly participantExternalId: string | null;
-  readonly roomExternalId: string | null;
+  /** Authoritative application room identity, retained during reconnection. */
+  readonly roomId: string | null;
   /** Current authorization deadline, in Unix seconds. */
   readonly authorizationExpiresAt: number | null;
   readonly catalog: CatalogSnapshot;
@@ -368,42 +376,28 @@ export type TopicDropReason =
 export type AgentEvent =
   | {
       readonly type: "topic-message";
-      readonly mode: "latest";
+      readonly mode: TopicMode;
       readonly topic: string;
-      readonly publisherId: string;
-      readonly payload: Uint8Array;
-    }
-  | {
-      readonly type: "topic-message";
-      readonly mode: "ordered";
-      readonly topic: string;
-      readonly publisherId: string;
-      readonly streamId: number;
-      readonly sequence: number;
+      readonly participantId: string;
+      readonly dataTrackId: string;
+      readonly sequence: bigint;
       readonly payload: Uint8Array;
     }
   | {
       readonly type: "topic-recovery-gap";
       readonly topic: string;
-      readonly publisherId: string;
-      readonly streamId: number;
-      readonly expectedSequence: number;
-      readonly availableSequence: number;
-    }
-  | {
-      readonly type: "topic-resynchronized";
-      readonly topic: string;
-      readonly publisherId: string;
-      readonly streamId: number;
-      readonly nextSequence: number;
+      readonly participantId: string;
+      readonly dataTrackId: string;
+      readonly expectedSequence: bigint;
+      readonly availableSequence: bigint;
     }
   | {
       readonly type: "topic-send-admitted";
       readonly topic: string;
       readonly mode: TopicMode;
-      readonly operation: number;
-      readonly streamId: number | null;
-      readonly sequence: number | null;
+      readonly operation: bigint;
+      readonly dataTrackId: string;
+      readonly sequence: bigint;
     }
   | {
       readonly type: "topic-send-dropped";
@@ -427,15 +421,11 @@ export interface Agent {
   /** Current Agent error, if any. Reactive when returned by React useAgent(). */
   readonly error: AgentError | null;
   readonly participantId: string | null;
-  readonly participantExternalId: string | null;
-  readonly roomExternalId: string | null;
+  readonly roomId: string | null;
   readonly authorizationExpiresAt: number | null;
   readonly local: LocalMedia;
   readonly remote: RemoteMedia;
-  topic<T>(
-    name: string,
-    options: { readonly mode: "reliable" | "unreliable" },
-  ): Topic<T>;
+  topic<T>(name: string, options: { readonly mode: TopicMode }): Topic<T>;
   connect(): void;
   disconnect(): void;
   setState(state: AgentState): void;
@@ -448,7 +438,7 @@ export interface Agent {
   reconnect(): void;
   renewAuthorization(token: string): void;
   setLogging(level: LogLevel): void;
-  sendTopic(name: string, mode: TopicMode, payload: Uint8Array): void;
+  sendTopic(name: string, mode: TopicMode, payload: Uint8Array): Promise<void>;
   readonly getSnapshot: () => AgentSnapshot;
   readonly subscribe: (listener: () => void) => () => void;
   readonly subscribeEvents: (

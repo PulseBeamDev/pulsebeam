@@ -18,12 +18,12 @@ test("production attachment policy derives demand from controlled geometry and v
   const snapshot = {
     connection: "disconnected",
     catalog: {
-      participants: [{ id: "internal", externalId: "alice" }],
+      participants: [{ participantId: "alice" }],
       publications: [
         {
           id: "camera",
           kind: "video",
-          participantId: "internal",
+          participantId: "alice",
           label: "camera",
         },
       ],

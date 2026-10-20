@@ -71,6 +71,8 @@ export type {
   TopicCallbacks,
   TopicConsumerError,
   TopicGap,
+  TopicEvent,
+  TopicMode,
 } from "@pulsebeam/web";
 
 /** React owns activation and release. Key the component for a different logical participant. */

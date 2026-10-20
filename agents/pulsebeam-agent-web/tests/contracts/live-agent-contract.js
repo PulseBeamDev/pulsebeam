@@ -204,11 +204,11 @@
       "public connection",
     );
     assert(
-      sender.participantExternalId === "web-sender" &&
-        receiver.participantExternalId === "web-receiver",
+      sender.participantId === "web-sender" &&
+        receiver.participantId === "web-receiver",
       "admission identity",
     );
-    assert(receiver.roomExternalId === "public-web-contract", "room identity");
+    assert(receiver.roomId === "public-web-contract", "room identity");
     await until(
       () =>
         receiver

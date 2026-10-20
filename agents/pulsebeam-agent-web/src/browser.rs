@@ -10,15 +10,14 @@ use agent_core::{
     Effect, Failure, FailureClass, Generation, HostEvent, HttpEffect, HttpEvent, HttpHeader,
     HttpMethod, HttpResponse, MediaKind, MediaSlot, MediaTopology, Notification, OfferResources,
     OperationId, PlayoutDelay, PublicationIntent, RetryPolicy, RtcEffect, RtcEvent, TimerEffect,
-    TimerEvent, TopicChannel, TopicDropReason, TopicMessage, TopicMode, TopicNotification,
-    TopicPublisher, TopicRegistrations, TopicSend, TopicSubscriber, TrackSelector,
-    VideoSubscription,
+    TimerEvent, TopicChannel, TopicDropReason, TopicMode, TopicNotification, TopicPublisher,
+    TopicRegistrations, TopicSend, TopicSubscriber, TrackSelector, VideoSubscription,
 };
 use futures_channel::oneshot;
-use js_sys::{Array, Function, Object, Reflect, Uint8Array};
+use js_sys::{Array, BigInt, Function, Object, Reflect, Uint8Array};
 use serde::Deserialize;
 use wasm_bindgen::{JsCast, JsValue, closure::Closure, prelude::wasm_bindgen};
-use wasm_bindgen_futures::{JsFuture, spawn_local};
+use wasm_bindgen_futures::{JsFuture, future_to_promise, spawn_local};
 use web_sys::{
     AbortController, Event, Headers, MediaStreamTrack, MessageEvent, Request, RequestInit,
     Response, RtcBundlePolicy, RtcConfiguration, RtcDataChannel, RtcDataChannelInit,
@@ -27,9 +26,7 @@ use web_sys::{
     RtcTrackEvent,
 };
 
-use crate::engine::{
-    ActorHandle, Host, PublicCommand, TopicCommand, Turn, TurnErrorSource, spawn_actor,
-};
+use crate::engine::{ActorHandle, Host, PublicCommand, Turn, TurnErrorSource, spawn_actor};
 use crate::logger::{BrowserLogger, LogLevel};
 
 const SIGNALING_LABEL: &str = "v1/sys/signaling";
@@ -80,13 +77,13 @@ struct TopicRegistrationConfig {
     publish: bool,
     #[serde(default)]
     subscribe: bool,
-    publisher_id: Option<String>,
 }
 
 #[derive(Clone, Copy, Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum TopicModeConfig {
     Latest,
+    Lossy,
     Ordered,
 }
 
@@ -94,6 +91,7 @@ impl From<TopicModeConfig> for TopicMode {
     fn from(value: TopicModeConfig) -> Self {
         match value {
             TopicModeConfig::Latest => Self::Latest,
+            TopicModeConfig::Lossy => Self::Lossy,
             TopicModeConfig::Ordered => Self::Ordered,
         }
     }
@@ -154,14 +152,14 @@ struct AudioSubscriptionConfig {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct TrackSelectorConfig {
-    participant_external_id: String,
+    participant_id: String,
     label: String,
 }
 
 impl From<TrackSelectorConfig> for TrackSelector {
     fn from(value: TrackSelectorConfig) -> Self {
         Self {
-            participant_external_id: value.participant_external_id,
+            participant_external_id: value.participant_id,
             label: value.label,
         }
     }
@@ -643,19 +641,38 @@ impl BrowserRuntime {
             .map_err(js_error)
     }
 
-    pub fn send_topic(&self, name: &str, mode: &str, payload: &[u8]) -> Result<(), JsValue> {
+    #[wasm_bindgen(unchecked_return_type = "Promise<void>")]
+    pub fn send_topic(
+        &self,
+        name: &str,
+        mode: &str,
+        payload: &[u8],
+        expected_generation: u64,
+        expected_data_track_id: &str,
+    ) -> Result<js_sys::Promise, JsValue> {
         self.inner.ensure_open()?;
         let mode = parse_topic_mode(mode)?;
-        self.inner
-            .send_topic(TopicSend {
-                publisher: TopicPublisher {
-                    topic: name.to_owned(),
-                    mode,
+        let completion = self
+            .inner
+            .send_topic(
+                TopicSend {
+                    publisher: TopicPublisher {
+                        topic: name.to_owned(),
+                        mode,
+                    },
+                    payload: payload.to_vec(),
                 },
-                payload: payload.to_vec(),
-            })
+                expected_generation,
+                expected_data_track_id.to_owned(),
+            )
             .map_err(js_error)?;
-        Ok(())
+        Ok(future_to_promise(async move {
+            completion
+                .await
+                .map_err(|_| js_error("topic admission was canceled"))?
+                .map_err(js_error)?;
+            Ok(JsValue::UNDEFINED)
+        }))
     }
 
     pub fn close(&self) {
@@ -721,12 +738,17 @@ impl RuntimeInner {
         }
     }
 
-    fn send_topic(&self, send: TopicSend) -> Result<(), String> {
+    fn send_topic(
+        &self,
+        send: TopicSend,
+        expected_generation: u64,
+        expected_data_track_id: String,
+    ) -> Result<oneshot::Receiver<Result<(), String>>, String> {
         let actor = self.actor.borrow();
         let Some(actor) = actor.as_ref() else {
             return Err("runtime actor not initialized".to_owned());
         };
-        actor.send_topic(TopicCommand::SendTopic(send))
+        actor.send_topic(send, expected_generation, expected_data_track_id)
     }
 
     fn replace_desired(self: &Rc<Self>, desired: DesiredState) -> Result<(), String> {
@@ -1643,7 +1665,6 @@ fn topic_registrations(topics: &[TopicRegistrationConfig]) -> TopicRegistrations
             registrations.subscribers.push(TopicSubscriber {
                 topic: topic.name.clone(),
                 mode,
-                publisher_id: topic.publisher_id.clone(),
             });
         }
     }
@@ -1653,8 +1674,9 @@ fn topic_registrations(topics: &[TopicRegistrationConfig]) -> TopicRegistrations
 fn parse_topic_mode(mode: &str) -> Result<TopicMode, JsValue> {
     match mode {
         "latest" => Ok(TopicMode::Latest),
+        "lossy" => Ok(TopicMode::Lossy),
         "ordered" => Ok(TopicMode::Ordered),
-        _ => Err(js_error("topic mode must be latest or ordered")),
+        _ => Err(js_error("topic mode must be latest, lossy, or ordered")),
     }
 }
 
@@ -1973,13 +1995,12 @@ fn snapshot_value(snapshot: &agent_core::Snapshot) -> JsValue {
         "generation",
         snapshot.generation.map(Generation::get),
     );
-    set(&value, "participantId", snapshot.participant_id.clone());
     set(
         &value,
-        "participantExternalId",
+        "participantId",
         snapshot.participant_external_id.clone(),
     );
-    set(&value, "roomExternalId", snapshot.room_external_id.clone());
+    set(&value, "roomId", snapshot.room_external_id.clone());
     set(
         &value,
         "authorizationExpiresAt",
@@ -1988,16 +2009,18 @@ fn snapshot_value(snapshot: &agent_core::Snapshot) -> JsValue {
     let participants = Array::new();
     for participant in snapshot.participants.values() {
         let item = Object::new();
-        set(&item, "id", participant.id.clone());
-        set(&item, "externalId", participant.external_id.clone());
+        set(&item, "participantId", participant.external_id.clone());
         participants.push(&item);
     }
     set(&value, "participants", participants.clone());
     let publications = Array::new();
     for publication in snapshot.publications.values() {
+        let Some(owner) = snapshot.participants.get(&publication.participant_id) else {
+            continue;
+        };
         let item = Object::new();
         set(&item, "id", publication.id.clone());
-        set(&item, "participantId", publication.participant_id.clone());
+        set(&item, "participantId", owner.external_id.clone());
         set(&item, "kind", media_kind_name(publication.kind));
         set(&item, "label", publication.label.clone());
         publications.push(&item);
@@ -2045,8 +2068,9 @@ fn topic_snapshot_value(snapshot: &agent_core::TopicSnapshot) -> JsValue {
         set(&item, "name", status.registration.topic.clone());
         set(&item, "mode", topic_mode_name(status.registration.mode));
         set(&item, "connected", status.channel.is_some());
-        set(&item, "streamId", status.stream_id);
-        set(&item, "nextSequence", status.next_sequence);
+        set(&item, "dataTrackId", status.data_track_id.clone());
+        set(&item, "nextSequence", BigInt::from(status.next_sequence));
+        set(&item, "acceptedHistory", status.accepted_history);
         set(&item, "queued", status.queued_messages);
         set(&item, "sendPending", status.send_pending);
         publishers.push(&item);
@@ -2057,11 +2081,6 @@ fn topic_snapshot_value(snapshot: &agent_core::TopicSnapshot) -> JsValue {
         let item = Object::new();
         set(&item, "name", status.registration.topic.clone());
         set(&item, "mode", topic_mode_name(status.registration.mode));
-        set(
-            &item,
-            "publisherId",
-            status.registration.publisher_id.clone(),
-        );
         set(&item, "connected", status.channel.is_some());
         set(&item, "publishers", status.publishers);
         set(&item, "buffered", status.buffered_messages);
@@ -2071,7 +2090,6 @@ fn topic_snapshot_value(snapshot: &agent_core::TopicSnapshot) -> JsValue {
     set(&value, "acceptedSends", snapshot.accepted_sends);
     set(&value, "droppedSends", snapshot.dropped_sends);
     set(&value, "deliveredMessages", snapshot.delivered_messages);
-    set(&value, "resynchronizations", snapshot.resynchronizations);
     set(&value, "channelFailures", snapshot.channel_failures);
     value.into()
 }
@@ -2088,71 +2106,47 @@ fn notification_value(notification: &Notification) -> JsValue {
     match notification {
         Notification::Topic(TopicNotification::Message(message)) => {
             set(&value, "type", "topic-message");
-            match message {
-                TopicMessage::Latest {
-                    topic,
-                    publisher_id,
-                    payload,
-                } => {
-                    set(&value, "mode", "latest");
-                    set(&value, "topic", topic);
-                    set(&value, "publisherId", publisher_id.clone());
-                    set(&value, "payload", Uint8Array::from(payload.as_slice()));
-                }
-                TopicMessage::Ordered {
-                    topic,
-                    publisher_id,
-                    stream_id,
-                    sequence,
-                    payload,
-                } => {
-                    set(&value, "mode", "ordered");
-                    set(&value, "topic", topic);
-                    set(&value, "publisherId", publisher_id);
-                    set(&value, "streamId", *stream_id);
-                    set(&value, "sequence", *sequence);
-                    set(&value, "payload", Uint8Array::from(payload.as_slice()));
-                }
-            }
+            set(&value, "mode", topic_mode_name(message.mode));
+            set(&value, "topic", &message.topic);
+            set(&value, "participantId", &message.participant_id);
+            set(&value, "dataTrackId", &message.data_track_id);
+            set(&value, "sequence", BigInt::from(message.sequence));
+            set(
+                &value,
+                "payload",
+                Uint8Array::from(message.payload.as_slice()),
+            );
         }
         Notification::Topic(TopicNotification::RecoveryGap {
             subscriber,
-            publisher_id,
-            stream_id,
+            data_track_id,
+            participant_id,
             expected_sequence,
             available_sequence,
         }) => {
             set(&value, "type", "topic-recovery-gap");
             set(&value, "topic", &subscriber.topic);
-            set(&value, "publisherId", publisher_id);
-            set(&value, "streamId", *stream_id);
-            set(&value, "expectedSequence", *expected_sequence);
-            set(&value, "availableSequence", *available_sequence);
-        }
-        Notification::Topic(TopicNotification::Resynchronized {
-            subscriber,
-            publisher_id,
-            stream_id,
-            next_sequence,
-        }) => {
-            set(&value, "type", "topic-resynchronized");
-            set(&value, "topic", &subscriber.topic);
-            set(&value, "publisherId", publisher_id);
-            set(&value, "streamId", *stream_id);
-            set(&value, "nextSequence", *next_sequence);
+            set(&value, "participantId", participant_id);
+            set(&value, "dataTrackId", data_track_id);
+            set(&value, "expectedSequence", BigInt::from(*expected_sequence));
+            set(
+                &value,
+                "availableSequence",
+                BigInt::from(*available_sequence),
+            );
         }
         Notification::Topic(TopicNotification::SendAdmitted {
             publisher,
             operation,
-            stream_id,
+            data_track_id,
             sequence,
         }) => {
             set(&value, "type", "topic-send-admitted");
-            set(&value, "topic", publisher.topic.clone());
+            set(&value, "topic", &publisher.topic);
             set(&value, "mode", topic_mode_name(publisher.mode));
             set(&value, "operation", operation.get());
-            set(&value, "streamId", *stream_id);
-            set(&value, "sequence", *sequence);
+            set(&value, "dataTrackId", data_track_id);
+            set(&value, "sequence", BigInt::from(*sequence));
         }
         Notification::Topic(TopicNotification::SendDropped { publisher, reason }) => {
             set(&value, "type", "topic-send-dropped");
@@ -2207,6 +2201,7 @@ fn connection_name(state: &ConnectionState) -> String {
 fn topic_mode_name(mode: TopicMode) -> &'static str {
     match mode {
         TopicMode::Latest => "latest",
+        TopicMode::Lossy => "lossy",
         TopicMode::Ordered => "ordered",
     }
 }

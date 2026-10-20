@@ -6,6 +6,7 @@
 //! published audio at all.
 
 use super::common::{LocalNodeSim, Participant, Room, Step};
+use pulsebeam_agent_native::agent_core::TopicMode;
 use pulsebeam_testdata::QUALITY_AUDIO_FRAME_SAMPLES;
 use std::time::Duration;
 
@@ -528,6 +529,7 @@ fn an_audio_wildcard_does_not_allocate_a_data_destination_test() {
         )
         .run(vec![
             Step::DeclarePublishTopic {
+                mode: TopicMode::Latest,
                 description: "Publisher declares a data topic",
                 participant: "publisher",
                 topic: "events",
@@ -537,6 +539,7 @@ fn an_audio_wildcard_does_not_allocate_a_data_destination_test() {
                 duration: Duration::from_secs(3),
             },
             Step::PublishData {
+                mode: TopicMode::Latest,
                 description: "Publisher sends a data payload",
                 participant: "publisher",
                 topic: "events",

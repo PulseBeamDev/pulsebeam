@@ -108,7 +108,6 @@ function RoomSession({
     receiveChat,
     receiveReaction,
     onTopicError,
-    onTopicGap,
     subscriptionRevision,
     messages,
     reactions,
@@ -119,7 +118,7 @@ function RoomSession({
     gap,
     clearGap,
     retrySubscriptions,
-  } = useTopics(owner, agent.participantExternalId);
+  } = useTopics(owner, agent.participantId);
   const { remoteTracks, spotlight, setPin } = useVideoLayout(
     owner.remote.videoTracks,
   );
@@ -212,13 +211,12 @@ function RoomSession({
       <Screen source={screen} preferences={{ content: "detail" }} />
       <Chat
         key={`chat:${subscriptionRevision}`}
-        onMessage={receiveChat}
-        onGap={onTopicGap}
+        onEvent={receiveChat}
         onError={onTopicError}
       />
       <Reactions
         key={`reactions:${subscriptionRevision}`}
-        onMessage={receiveReaction}
+        onEvent={receiveReaction}
         onError={onTopicError}
       />
       <Paper
@@ -235,7 +233,7 @@ function RoomSession({
           <Chip
             size="small"
             color={agent.connection === "connected" ? "success" : "warning"}
-            label={agent.participantExternalId ?? "Joining…"}
+            label={agent.participantId ?? "Joining…"}
             className="max-w-24 sm:max-w-65"
           />
           <Typography
@@ -243,7 +241,7 @@ function RoomSession({
             color="text.secondary"
             sx={{ display: { xs: "none", sm: "block" } }}
           >
-            {agent.roomExternalId ? `Room ${agent.roomExternalId} · ` : ""}
+            {agent.roomId ? `Room ${agent.roomId} · ` : ""}
             {agent.connection}
           </Typography>
         </Stack>
@@ -345,7 +343,7 @@ function RoomSession({
       )}
       {gap && (
         <Alert severity="warning" onClose={clearGap}>
-          Some chat messages may be missing after recovery.
+          Some chat messages were skipped.
         </Alert>
       )}
       <Box
@@ -368,7 +366,7 @@ function RoomSession({
             )}
             {reactions.map((reaction, index) => (
               <span
-                key={reaction.id}
+                key={reaction.key}
                 aria-label={reaction.emoji}
                 className="meet-reaction"
                 style={{ left: `${24 + (index % 5) * 13}%` }}
@@ -478,7 +476,7 @@ function RoomSession({
               )}
               {messages.map((message) => (
                 <Box
-                  key={message.id}
+                  key={message.key}
                   className={`max-w-[90%] ${message.self ? "self-end" : "self-start"}`}
                 >
                   <Typography variant="caption" color="text.secondary">
@@ -515,9 +513,7 @@ function RoomSession({
                 type="submit"
                 color="primary"
                 aria-label="Send message"
-                disabled={
-                  !draft.trim() || sending || !agent.participantExternalId
-                }
+                disabled={!draft.trim() || sending || !agent.participantId}
               >
                 <Icons.Send size={20} />
               </IconButton>

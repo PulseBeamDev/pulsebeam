@@ -183,9 +183,9 @@ assert.equal(runtime.desired.connected, true);
 await flush(() =>
   runtime.emit({
     connection: "connected",
-    participantId: "internal-self",
-    participantExternalId: "admitted-alice",
-    roomExternalId: "admitted-room",
+    participantId: "admitted-alice",
+    roomId: "admitted-room",
+    generation: 1n,
   }),
 );
 assert.match(document.querySelector("header")!.textContent!, /admitted-alice/);
@@ -219,8 +219,8 @@ assert.ok(
   "failed retry remains available to later keyboard interaction",
 );
 const payload = {
-  id: "remote-message",
-  sender: "bob",
+  id: "ignored-payload-id",
+  sender: "forged-payload-sender",
   text: "delivered through production topics",
   ts: 1,
 };
@@ -229,16 +229,90 @@ await flush(() =>
     type: "topic-message",
     topic: "chat",
     mode: "ordered",
+    dataTrackId: "remote-chat",
+    participantId: "bob",
+    sequence: 0n,
     payload: new TextEncoder().encode(JSON.stringify(payload)),
   }),
 );
 assert.match(document.body.textContent!, /delivered through production topics/);
+assert.doesNotMatch(document.body.textContent!, /forged-payload-sender/);
+const remoteChat = (dataTrackId: string, sequence: bigint) =>
+  runtime.event({
+    type: "topic-message",
+    topic: "chat",
+    mode: "ordered",
+    participantId: "bob",
+    dataTrackId,
+    sequence,
+    payload: new TextEncoder().encode(JSON.stringify(payload)),
+  });
+await flush(() => remoteChat("remote-chat", 0n));
+assert.equal(
+  document.body.textContent!.match(/delivered through production topics/g)
+    ?.length,
+  1,
+  "same track and sequence deduplicate",
+);
+await flush(() => remoteChat("remote-chat", 1n));
+await flush(() => remoteChat("replacement-remote-chat", 1n));
+assert.equal(
+  document.body.textContent!.match(/delivered through production topics/g)
+    ?.length,
+  3,
+  "payload IDs do not replace data-track and sequence identity",
+);
+await flush(() =>
+  runtime.event({
+    type: "topic-recovery-gap",
+    topic: "chat",
+    participantId: "bob",
+    dataTrackId: "remote-chat",
+    expectedSequence: 2n,
+    availableSequence: 4n,
+  }),
+);
+assert.match(document.body.textContent!, /Some chat messages were skipped/);
+await flush(() =>
+  runtime.event({
+    type: "topic-message",
+    topic: "chat",
+    mode: "ordered",
+    participantId: "bob",
+    dataTrackId: "remote-chat",
+    sequence: 4n,
+    payload: new TextEncoder().encode(
+      JSON.stringify({ text: "after the gap", ts: 4 }),
+    ),
+  }),
+);
+assert.match(document.body.textContent!, /after the gap/);
 const chat =
   document.querySelector<HTMLTextAreaElement>("textarea") ??
   document.querySelector<HTMLInputElement>("aside input");
 assert.ok(chat, "chat composer is rendered");
 await input(chat, "hello from component");
 await click("Send message");
+assert.equal(
+  runtime.sent.length,
+  0,
+  "initial publish waits for authoritative binding",
+);
+const chatBinding = {
+  name: "chat",
+  mode: "ordered",
+  connected: true,
+  dataTrackId: "local-chat",
+  nextSequence: 0n,
+  acceptedHistory: 0,
+  queued: 0,
+  sendPending: false,
+};
+await flush(() =>
+  runtime.emit({
+    topics: { ...runtime.snapshot.topics, publishers: [chatBinding] },
+  }),
+);
 assert.ok(
   runtime.sent.some(
     (message) =>
@@ -248,15 +322,22 @@ assert.ok(
         .includes("hello from component"),
   ),
 );
+const sentChat = runtime.sent.find((message) => message.name === "chat")!;
+assert.equal(sentChat.mode, "ordered");
+assert.deepEqual(
+  Object.keys(JSON.parse(new TextDecoder().decode(sentChat.payload))).sort(),
+  ["text", "ts"],
+);
 privateSoFar();
 await flush(() =>
   runtime.event({
     type: "topic-message",
     topic: "reactions",
-    mode: "latest",
-    payload: new TextEncoder().encode(
-      JSON.stringify({ id: "reaction", sender: "bob", emoji: "👍", ts: 2 }),
-    ),
+    mode: "lossy",
+    dataTrackId: "remote-reactions",
+    participantId: "bob",
+    sequence: 0n,
+    payload: new TextEncoder().encode(JSON.stringify({ emoji: "👍" })),
   }),
 );
 assert.ok(
@@ -269,6 +350,22 @@ const reaction = document.querySelector<HTMLElement>(
 );
 assert.ok(reaction);
 await flush(() => reaction.click());
+await flush(() =>
+  runtime.emit({
+    topics: {
+      ...runtime.snapshot.topics,
+      publishers: [
+        chatBinding,
+        {
+          ...chatBinding,
+          name: "reactions",
+          mode: "lossy",
+          dataTrackId: "local-reactions",
+        },
+      ],
+    },
+  }),
+);
 assert.ok(
   runtime.sent.some(
     (message) =>
@@ -277,6 +374,13 @@ assert.ok(
   ),
   "reaction interaction publishes through production topic policy",
 );
+const sentReaction = runtime.sent.find(
+  (message) => message.name === "reactions",
+)!;
+assert.equal(sentReaction.mode, "lossy");
+assert.deepEqual(JSON.parse(new TextDecoder().decode(sentReaction.payload)), {
+  emoji: "👍",
+});
 await click("Mute microphone");
 await click("Turn camera off");
 assert.ok(

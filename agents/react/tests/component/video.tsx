@@ -105,11 +105,11 @@ export async function videoPreferences() {
     );
     await flush(() =>
       runtime.emit({
-        participants: [{ id: "alice-id", externalId: "alice" }],
+        participants: [{ participantId: "alice" }],
         publications: [
           {
             id: "camera-id",
-            participantId: "alice-id",
+            participantId: "alice",
             kind: "video",
             label: "camera",
           },

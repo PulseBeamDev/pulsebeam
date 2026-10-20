@@ -112,9 +112,20 @@ See [the quickstart](/react/quickstart) to retry a minimal integration.
 
 ## Topic failures
 
-Catch publish and iteration errors. Check JSON size, name/mode, and cleanup.
-Use `snapshot.topics` and events such as `topic-send-dropped`,
-`topic-channel-failed`, `topic-recovery-gap`, and `topic-resynchronized`.
+Catch `Chat.publish()` rejection and provide `onError` on committed consumers.
+Read `agent.connection` and `agent.error` directly in React; there is no manual
+snapshot/subscription loop. Handle continuity in `onEvent`, not as an error.
 
-Accepted sends are not delivery acknowledgments. Queues are bounded and recovery
-can lose messages; reload backend state when needed. [Exact limits](/react/reference#topics).
+| Symptom | Diagnosis and action |
+| --- | --- |
+| Publish rejects | Check connected intent, matching server/SDK versions, explicit mode/name, JSON size, and queue capacity. Initial binding waits at most 10 seconds; a replaced generation/publication rejects rather than retargeting the send. Retry a new action after recovery. |
+| `onError` reports `decode-failed` | Invalid UTF-8/JSON released that consumer. Validate publisher payloads, then remount the consumer to retry. Other consumers remain independent. |
+| `onError` reports `channel-failed` | Inspect the structured direction/mode failure and Agent connection/error. Core owns transport recovery; fix terminal configuration/authorization failures before reconnecting. |
+| An inline `gap` arrives | A known ordered range was skipped. Display the notice before later messages from that track and reload backend state if completeness matters. |
+| Latest values disappear | Supersession is expected per data track. Use `lossy` for distinct transient events or `ordered` for ordered events. |
+| No old messages after subscribing or reconnecting | Subscriptions start live; reopened publications have fresh data-track IDs and sequence spaces. There is no offline or cross-incarnation replay. |
+| Metadata fails to serialize as JSON | Sequence/gap fields are `bigint`. Store decimal strings; never round through `number`. |
+
+Confirm with two participants using the same topic name **and mode**. Sending
+does not loop back to its publisher. Accepted sends are not delivery
+acknowledgments; queues and recovery are finite. [Exact limits](/react/reference#topics).

@@ -18,12 +18,11 @@
   const snapshot = {
     connection: "connected",
     participantId: "self",
-    participantExternalId: "self",
     catalog: {
       revision: 1,
-      participants: [{ id: "remote", externalId: "alice" }],
+      participants: [{ participantId: "alice" }],
       publications: [
-        { id: "A", participantId: "remote", kind: "audio", label: "voice" },
+        { id: "A", participantId: "alice", kind: "audio", label: "voice" },
       ],
     },
     mapping: {

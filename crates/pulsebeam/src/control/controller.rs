@@ -2015,7 +2015,7 @@ mod replacement_tests {
                     label: Some("rt/chat".to_owned()),
                 },
                 crate::track::Topic::for_test("chat"),
-                crate::track::DataLane::Realtime,
+                crate::track::DataLane::Latest,
                 None,
             )
         };

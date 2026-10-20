@@ -202,13 +202,13 @@ class ParticipantHandle implements RemoteParticipant {
   audioTracks: readonly RemoteAudioTrack[] = Object.freeze([]);
   constructor(
     readonly catalog: RemoteCatalog,
-    readonly externalId: string,
+    readonly participantId: string,
   ) {}
   video(label: string): VideoHandle {
     this.catalog.requireOpen();
     let handle = this.videos.get(label);
     if (!handle) {
-      handle = new VideoHandle(this.catalog, this.externalId, label);
+      handle = new VideoHandle(this.catalog, this.participantId, label);
       this.videos.set(label, handle);
     }
     return handle;
@@ -217,7 +217,7 @@ class ParticipantHandle implements RemoteParticipant {
     this.catalog.requireOpen();
     let handle = this.audios.get(label);
     if (!handle) {
-      handle = new AudioHandle(this.catalog, this.externalId, label);
+      handle = new AudioHandle(this.catalog, this.participantId, label);
       this.audios.set(label, handle);
     }
     return handle;
@@ -251,12 +251,12 @@ export class RemoteCatalog implements RemoteMedia {
   requireOpen(): void {
     if (this.#closed) throw new Error("agent is closed");
   }
-  participant(externalId: string): ParticipantHandle {
+  participant(participantId: string): ParticipantHandle {
     this.requireOpen();
-    let handle = this.#handles.get(externalId);
+    let handle = this.#handles.get(participantId);
     if (!handle) {
-      handle = new ParticipantHandle(this, externalId);
-      this.#handles.set(externalId, handle);
+      handle = new ParticipantHandle(this, participantId);
+      this.#handles.set(participantId, handle);
     }
     return handle;
   }
@@ -275,13 +275,9 @@ export class RemoteCatalog implements RemoteMedia {
     const byId = new Map<string, ParticipantHandle>();
     const participants: ParticipantHandle[] = [];
     for (const participant of snapshot.catalog.participants) {
-      if (
-        participant.id === snapshot.participantId ||
-        participant.externalId === snapshot.participantExternalId
-      )
-        continue;
-      const handle = this.participant(participant.externalId);
-      byId.set(participant.id, handle);
+      if (participant.participantId === snapshot.participantId) continue;
+      const handle = this.participant(participant.participantId);
+      byId.set(participant.participantId, handle);
       participants.push(handle);
     }
     const videoIds = new Map<VideoHandle, string>();
@@ -317,13 +313,13 @@ export class RemoteCatalog implements RemoteMedia {
       participant.videoTracks = collection(
         participant.videoTracks,
         videos.filter(
-          (handle) => handle.participantId === participant.externalId,
+          (handle) => handle.participantId === participant.participantId,
         ),
       );
       participant.audioTracks = collection(
         participant.audioTracks,
         audios.filter(
-          (handle) => handle.participantId === participant.externalId,
+          (handle) => handle.participantId === participant.participantId,
         ),
       );
     }

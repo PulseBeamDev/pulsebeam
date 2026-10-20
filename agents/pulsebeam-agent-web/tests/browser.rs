@@ -183,7 +183,7 @@ async fn web_adapter_restart_smoke() -> TestResult<()> {
         mint_development_token(&room, &ParticipantExternalId::new("publisher")?, u64::MAX)?;
     let receiver =
         mint_development_token(&room, &ParticipantExternalId::new("subscriber")?, u64::MAX)?;
-    let start = include_str!("contracts/reliable-restart-start.js")
+    let start = include_str!("contracts/adapter-restart-start.js")
         .replace("__DESTINATION_ENDPOINT__", &destination.endpoint())
         .replace("__SENDER_TOKEN__", &sender)
         .replace("__RECEIVER_TOKEN__", &receiver);
@@ -199,7 +199,7 @@ async fn web_adapter_restart_smoke() -> TestResult<()> {
         let recovered: bool = evaluate_json(
             &bidi,
             &context,
-            include_str!("contracts/reliable-restart-finish.js"),
+            include_str!("contracts/adapter-restart-finish.js"),
         )
         .await?;
         assert!(recovered);

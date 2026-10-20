@@ -55,6 +55,19 @@ export type StrictBoundaries = [
   Assert<Equal<Snapshot["desiredRevision"], bigint>>,
   Assert<Equal<AgentError["message"], string>>,
   Assert<Equal<TransportStatistics["bytesSent"], bigint>>,
+  Assert<Equal<TopicMessage["sequence"], bigint>>,
+  Assert<
+    Equal<
+      Extract<
+        keyof Snapshot,
+        | "participantExternalId"
+        | "roomExternalId"
+        | "canonicalParticipantId"
+        | "canonicalRoomId"
+      >,
+      never
+    >
+  >,
   Assert<
     Equal<
       Extract<
@@ -100,9 +113,19 @@ const normalized: AgentConfig = config;
 const sameTrack: WebMediaTrack = track;
 const sameStream: WebMediaStream = stream;
 const bytes: Uint8Array = frame.data;
-const payload: Uint8Array = topic.inner.payload;
+const payload: Uint8Array = topic.payload;
 const published: string = desired.publications[0].label;
-const externalId: string = snapshot.catalog.participants[0].externalId;
+const participantId: string = snapshot.catalog.participants[0].participantId;
+// @ts-expect-error generated app-facing participants do not expose canonical IDs
+snapshot.catalog.participants[0].id;
+// @ts-expect-error removed generated identity alias
+snapshot.catalog.participants[0].externalId;
+// @ts-expect-error no parallel publisher identity
+topic.publisherId;
+// @ts-expect-error no stream incarnation identity
+topic.streamId;
+// @ts-expect-error topic messages are records, not legacy variants
+topic.inner;
 // @ts-expect-error canonical room identity is not client configuration
 config.roomId;
 // @ts-expect-error arbitrary authentication headers are forbidden
@@ -124,6 +147,6 @@ void [
   bytes,
   payload,
   published,
-  externalId,
+  participantId,
   invalidTrack,
 ];

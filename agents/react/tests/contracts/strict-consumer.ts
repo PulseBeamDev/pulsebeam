@@ -91,21 +91,50 @@ owned.close();
 owned.getSnapshot();
 // @ts-expect-error No advanced API.
 owned.advanced;
-const Chat = owned.topic<{ text: string }>("chat", { mode: "reliable" });
+const participantId: string | null = owned.participantId;
+const roomId: string | null = owned.roomId;
+void [participantId, roomId];
+// @ts-expect-error removed normal identity alias
+owned.participantExternalId;
+// @ts-expect-error removed normal identity alias
+owned.roomExternalId;
+// @ts-expect-error no canonical participant ID in normal remote resources
+owned.remote.participant("alice").id;
+// @ts-expect-error removed remote identity alias
+owned.remote.participant("alice").externalId;
+const Chat = owned.topic<{ text: string }>("chat", { mode: "ordered" });
+owned.topic("chat", { mode: "latest" });
+owned.topic("chat", { mode: "lossy" });
+// @ts-expect-error mode is mandatory
+owned.topic("chat", {});
+// @ts-expect-error removed mode alias
+owned.topic("chat", { mode: "reliable" });
+// @ts-expect-error removed mode alias
+owned.topic("chat", { mode: "unreliable" });
 createElement(Chat, {
-  onMessage: (value, { publisherId }) => {
-    const text: string = value.text;
-    void [text, publisherId];
+  onEvent: (event) => {
+    const participantId: string = event.participantId;
+    const dataTrackId: string = event.dataTrackId;
+    if (event.type === "message") {
+      const text: string = event.value.text;
+      const sequence: bigint = event.sequence;
+      void [text, sequence];
+    } else {
+      const expected: bigint = event.expectedSequence;
+      const available: bigint = event.availableSequence;
+      void [expected, available];
+    }
+    void [participantId, dataTrackId];
   },
   onError: (error) => {
     const code: "decode-failed" | "channel-failed" = error.code;
     void code;
   },
-  onGap: (gap) => {
-    const sequence: number = gap.expectedSequence;
-    void sequence;
-  },
 });
+// @ts-expect-error continuity is delivered inline, never a split callback
+createElement(Chat, { onGap() {} });
+// @ts-expect-error the old publisher-metadata callback was removed
+createElement(Chat, { onMessage() {} });
 void Chat.publish({ text: "hello" });
 // @ts-expect-error No application subscription loop.
 Chat.subscribe();

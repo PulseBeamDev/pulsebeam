@@ -5,12 +5,12 @@
   const snapshot = {
     connection: "disconnected",
     catalog: {
-      participants: [{ id: "participant-1", externalId: "alice" }],
+      participants: [{ participantId: "alice" }],
       publications: [
         {
           id: "video-1",
           kind: "video",
-          participantId: "participant-1",
+          participantId: "alice",
           label: "camera",
         },
       ],

@@ -11,7 +11,7 @@ use crate::tests::common::{
 };
 use pulsebeam_agent_native::SimulcastLayer;
 use pulsebeam_agent_native::agent_core::{
-    TopicMode, TopicPublisher, TopicRegistrations, TopicSubscriber,
+    TopicMode, TopicNotification, TopicPublisher, TopicRegistrations, TopicSubscriber,
 };
 pub use pulsebeam_runtime::net::shaper::{Capacity, Loss, Reorder};
 use pulsebeam_testdata::{QualityVideoLayer, QualityVideoSource};
@@ -403,9 +403,10 @@ pub enum Step {
     },
     StopServer,
     RestartServer,
-    WaitForOrderedPublisher {
+    WaitForTopicPublisher {
         participant: &'static str,
         topic: &'static str,
+        mode: TopicMode,
         next_sequence: u64,
     },
     WaitForOrderedSubscriber {
@@ -568,41 +569,23 @@ pub enum Step {
         auto: bool,
     },
 
-    /// Call driver.declare_publish_topic().
     DeclarePublishTopic {
         description: &'static str,
         participant: &'static str,
         topic: &'static str,
+        mode: TopicMode,
     },
-    /// Call driver.declare_subscribe_topic(). When `scoped_to` is set, the harness
-    /// resolves that participant's runtime participant_id automatically.
     DeclareSubscribeTopic {
         description: &'static str,
         participant: &'static str,
         topic: &'static str,
-        scoped_to: Option<&'static str>,
+        mode: TopicMode,
     },
-    /// Queue a payload to be sent on the next drive tick.
     PublishData {
         description: &'static str,
         participant: &'static str,
         topic: &'static str,
-        data: &'static [u8],
-    },
-    DeclareOrderedPublisher {
-        description: &'static str,
-        participant: &'static str,
-        topic: &'static str,
-    },
-    DeclareOrderedSubscriber {
-        description: &'static str,
-        participant: &'static str,
-        topic: &'static str,
-    },
-    PublishOrdered {
-        description: &'static str,
-        participant: &'static str,
-        topic: &'static str,
+        mode: TopicMode,
         data: &'static [u8],
     },
 
@@ -975,6 +958,14 @@ pub enum Step {
         topic: &'static str,
         expected: &'static [&'static [u8]],
     },
+    CheckTopicIdentity {
+        description: &'static str,
+        participant: &'static str,
+        topic: &'static str,
+        mode: TopicMode,
+        publishers: &'static [&'static str],
+        gap: Option<(u64, u64)>,
+    },
 }
 
 // ── Internal lifecycle commands ─────────────────────────────────────────────
@@ -995,13 +986,9 @@ enum ParticipantCmd {
 #[derive(Clone)]
 enum PendingDriverOp {
     SetSubscriptions(Vec<VideoSubscription>),
-    DeclarePublishTopic(String),
-    /// (topic, scoped_participant_id)
-    DeclareSubscribeTopic(String, Option<String>),
-    PublishData(String, Vec<u8>),
-    DeclareOrderedPublisher(String),
-    DeclareOrderedSubscriber(String),
-    PublishOrdered(String, Vec<u8>),
+    DeclarePublishTopic(String, TopicMode),
+    DeclareSubscribeTopic(String, TopicMode),
+    PublishData(String, TopicMode, Vec<u8>),
     /// (pinned participant ids, auto)
     SetAudioIntent(Vec<String>, bool),
 }
@@ -1060,39 +1047,25 @@ impl OperationQueue {
                 self.intent.audio.clone_from(pinned);
                 self.intent.automatic_audio = *automatic;
             }
-            PendingDriverOp::DeclarePublishTopic(topic)
-            | PendingDriverOp::DeclareOrderedPublisher(topic) => {
-                let mode = if matches!(operation, PendingDriverOp::DeclarePublishTopic(_)) {
-                    TopicMode::Latest
-                } else {
-                    TopicMode::Ordered
-                };
+            PendingDriverOp::DeclarePublishTopic(topic, mode) => {
                 let registration = TopicPublisher {
                     topic: topic.clone(),
-                    mode,
+                    mode: *mode,
                 };
                 if !self.intent.topics.publishers.contains(&registration) {
                     self.intent.topics.publishers.push(registration);
                 }
             }
-            PendingDriverOp::DeclareSubscribeTopic(topic, _)
-            | PendingDriverOp::DeclareOrderedSubscriber(topic) => {
-                let (mode, publisher_id) = match &operation {
-                    PendingDriverOp::DeclareSubscribeTopic(_, publisher) => {
-                        (TopicMode::Latest, publisher.clone())
-                    }
-                    _ => (TopicMode::Ordered, None),
-                };
+            PendingDriverOp::DeclareSubscribeTopic(topic, mode) => {
                 let registration = TopicSubscriber {
                     topic: topic.clone(),
-                    mode,
-                    publisher_id,
+                    mode: *mode,
                 };
                 if !self.intent.topics.subscribers.contains(&registration) {
                     self.intent.topics.subscribers.push(registration);
                 }
             }
-            PendingDriverOp::PublishData(..) | PendingDriverOp::PublishOrdered(..) => {}
+            PendingDriverOp::PublishData(..) => {}
         }
         self.pending.push((self.sequence, operation));
         self.sequence
@@ -1106,7 +1079,10 @@ fn driver_restart_restores_initial_intent() {
         vec!["speaker".into()],
         false,
     ));
-    queue.push(PendingDriverOp::DeclarePublishTopic("old-topic".into()));
+    queue.push(PendingDriverOp::DeclarePublishTopic(
+        "old-topic".into(),
+        TopicMode::Latest,
+    ));
     queue.restart();
     assert!(queue.pending.is_empty() && queue.intent.audio.is_empty());
     assert!(queue.intent.automatic_audio);
@@ -1152,7 +1128,7 @@ struct ParticipantShared {
     /// Operations queued by the coordinator; drained on next drive tick.
     pending_ops: Mutex<OperationQueue>,
     /// Data received per topic, accumulated across all drive ticks.
-    data_received: Mutex<HashMap<String, Vec<Vec<u8>>>>,
+    topic_events: Mutex<HashMap<String, Vec<TopicNotification>>>,
     /// Remote video tracks discovered via signaling (track IDs).
     discovered_tracks: Mutex<HashSet<String>>,
 }
@@ -1181,7 +1157,7 @@ impl ParticipantShared {
             incarnations: Mutex::new(Vec::new()),
             participant_id: Mutex::new(None),
             pending_ops: Mutex::new(OperationQueue::new(topics)),
-            data_received: Mutex::new(HashMap::new()),
+            topic_events: Mutex::new(HashMap::new()),
             discovered_tracks: Mutex::new(HashSet::new()),
         }
     }
@@ -1429,23 +1405,14 @@ async fn run_participant(
                                     priority: subscription.priority,
                                 }).collect(), sequence)
                                 .await?,
-                            PendingDriverOp::DeclarePublishTopic(topic) => {
-                                client.ctx.register_publisher(topic, TopicMode::Latest).await?
+                            PendingDriverOp::DeclarePublishTopic(topic, mode) => {
+                                client.ctx.register_publisher(topic, mode).await?
                             }
-                            PendingDriverOp::DeclareSubscribeTopic(topic, publisher_id) => {
-                                client.ctx.register_subscriber(topic, TopicMode::Latest, publisher_id).await?
+                            PendingDriverOp::DeclareSubscribeTopic(topic, mode) => {
+                                client.ctx.register_subscriber(topic, mode).await?
                             }
-                            PendingDriverOp::PublishData(topic, data) => {
-                                client.ctx.send_topic(&topic, TopicMode::Latest, data).await?
-                            }
-                            PendingDriverOp::DeclareOrderedPublisher(topic) => {
-                                client.ctx.register_publisher(topic, TopicMode::Ordered).await?
-                            }
-                            PendingDriverOp::DeclareOrderedSubscriber(topic) => {
-                                client.ctx.register_subscriber(topic, TopicMode::Ordered, None).await?
-                            }
-                            PendingDriverOp::PublishOrdered(topic, data) => {
-                                client.ctx.send_topic(&topic, TopicMode::Ordered, data).await?
+                            PendingDriverOp::PublishData(topic, mode, data) => {
+                                client.ctx.send_topic(&topic, mode, data).await?
                             }
                             PendingDriverOp::SetAudioIntent(participants, automatic) => {
                                 client.ctx.set_audio_intent(&participants, automatic).await?
@@ -1468,9 +1435,14 @@ async fn run_participant(
                     let observation = client.ctx.observation().await?;
                     *shared.observation.lock().unwrap() = Some(observation);
                     {
-                        let mut received = shared.data_received.lock().unwrap();
-                        for (topic, payload) in client.ctx.received_data.drain(..) {
-                            received.entry(topic).or_default().push(payload);
+                        let mut received = shared.topic_events.lock().unwrap();
+                        for event in client.ctx.topic_events.drain(..) {
+                            let topic = match &event {
+                                TopicNotification::Message(message) => &message.topic,
+                                TopicNotification::RecoveryGap { subscriber, .. } => &subscriber.topic,
+                                _ => unreachable!("client observation only retains application events"),
+                            };
+                            received.entry(topic.clone()).or_default().push(event);
                         }
                     }
                     *shared.discovered_tracks.lock().unwrap() = client.ctx.discovered_tracks.clone();
@@ -1544,9 +1516,6 @@ fn step_name(step: &Step) -> &'static str {
         Step::DeclarePublishTopic { .. } => "DeclarePublishTopic",
         Step::DeclareSubscribeTopic { .. } => "DeclareSubscribeTopic",
         Step::PublishData { .. } => "PublishData",
-        Step::DeclareOrderedPublisher { .. } => "DeclareOrderedPublisher",
-        Step::DeclareOrderedSubscriber { .. } => "DeclareOrderedSubscriber",
-        Step::PublishOrdered { .. } => "PublishOrdered",
         Step::CheckVideoQuality { .. } => "CheckVideoQuality",
         Step::CheckVideoQualityInterval { .. } => "CheckVideoQualityInterval",
         Step::CheckVideoNotReceivedFrom { .. } => "CheckVideoNotReceivedFrom",
@@ -1593,9 +1562,10 @@ fn step_name(step: &Step) -> &'static str {
         Step::CheckDataNotReceived { .. } => "CheckDataNotReceived",
         Step::CheckDataCount { .. } => "CheckDataCount",
         Step::CheckDataSequence { .. } => "CheckDataSequence",
+        Step::CheckTopicIdentity { .. } => "CheckTopicIdentity",
         Step::StopServer => "StopServer",
         Step::RestartServer => "RestartServer",
-        Step::WaitForOrderedPublisher { .. } => "WaitForOrderedPublisher",
+        Step::WaitForTopicPublisher { .. } => "WaitForTopicPublisher",
         Step::WaitForOrderedSubscriber { .. } => "WaitForOrderedSubscriber",
         Step::WaitForDataSequence { .. } => "WaitForDataSequence",
         Step::SetAudioIntent { .. } => "SetAudioIntent",
@@ -1652,9 +1622,10 @@ async fn execute_plan(
                     })?;
                 disturbances.remove(&(2, "server", "server"));
             }
-            Step::WaitForOrderedPublisher {
+            Step::WaitForTopicPublisher {
                 participant,
                 topic,
+                mode,
                 next_sequence,
             } => {
                 let handle = get_handle(handles, participant, kind)?;
@@ -1674,7 +1645,11 @@ async fn execute_plan(
                                     .iter()
                                     .any(|publisher| {
                                         publisher.registration.topic == *topic
-                                            && publisher.next_sequence == Some(*next_sequence)
+                                            && publisher.registration.mode == *mode
+                                            && publisher.data_track_id.is_some()
+                                            && !publisher.send_pending
+                                            && publisher.queued_messages == 0
+                                            && publisher.next_sequence == *next_sequence
                                     })
                             });
                         if ready {
@@ -1685,7 +1660,7 @@ async fn execute_plan(
                 })
                 .await
                 .map_err(|_| {
-                    anyhow::anyhow!("{participant} did not admit ordered sequence {next_sequence}")
+                    anyhow::anyhow!("{participant} did not transmit topic sequence {next_sequence}")
                 })?;
             }
             Step::WaitForOrderedSubscriber {
@@ -1694,12 +1669,27 @@ async fn execute_plan(
                 topic,
                 next_sequence,
             } => {
-                let publisher_id = get_handle(handles, publisher, kind)?
-                    .participant_id()
-                    .expect("connected publisher");
+                let publisher_shared = get_handle(handles, publisher, kind)?.shared.clone();
                 let handle = get_handle(handles, participant, kind)?;
                 tokio::time::timeout(Duration::from_secs(30), async {
                     loop {
+                        let expected_data_track = publisher_shared
+                            .observation
+                            .lock()
+                            .unwrap()
+                            .as_ref()
+                            .and_then(|publisher| {
+                                publisher
+                                    .snapshot
+                                    .topics
+                                    .publishers
+                                    .iter()
+                                    .find(|status| {
+                                        status.registration.topic == *topic
+                                            && status.registration.mode == TopicMode::Ordered
+                                    })
+                                    .and_then(|status| status.data_track_id.clone())
+                            });
                         // Before the first live send, only a processed publisher boundary can
                         // create this delivery state without delivering a historical payload.
                         let ready =
@@ -1719,7 +1709,8 @@ async fn execute_plan(
                                                 && observation.ordered_cursors.iter().any(
                                                     |(registration, id, cursor)| {
                                                         registration == &subscriber.registration
-                                                            && id == &publisher_id
+                                                            && expected_data_track.as_ref()
+                                                                == Some(id)
                                                             && cursor == next_sequence
                                                     },
                                                 )
@@ -1739,7 +1730,7 @@ async fn execute_plan(
                 anyhow::ensure!(
                     handle
                         .shared
-                        .data_received
+                        .topic_events
                         .lock()
                         .unwrap()
                         .get(*topic)
@@ -1757,7 +1748,7 @@ async fn execute_plan(
                     expected.iter().map(|payload| payload.to_vec()).collect();
                 tokio::time::timeout(Duration::from_secs(30), async {
                     loop {
-                        let actual = handle.shared.data_received.lock().unwrap().get(*topic).cloned().unwrap_or_default();
+                        let actual = handle.shared.topic_events.lock().unwrap().get(*topic).map(|events| events.iter().filter_map(topic_payload).map(<[u8]>::to_vec).collect::<Vec<_>>()).unwrap_or_default();
                         anyhow::ensure!(expected.starts_with(&actual), "{participant} received unexpected sequence: {actual:?}, expected {expected:?}");
                         if actual == expected { return Ok::<_, anyhow::Error>(()); }
                         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -2346,60 +2337,31 @@ async fn execute_plan(
                 description,
                 participant,
                 topic,
+                mode,
             } => {
-                tracing::info!(
-                    "[step {n}/{total}: {kind}] \"{description}\" ({participant}, topic={topic})"
-                );
                 let handle = get_handle(handles, participant, description)?;
-                handle
-                    .shared
-                    .pending_ops
-                    .lock()
-                    .unwrap()
-                    .push(PendingDriverOp::DeclarePublishTopic(topic.to_string()));
+                handle.shared.pending_ops.lock().unwrap().push(
+                    PendingDriverOp::DeclarePublishTopic(topic.to_string(), *mode),
+                );
             }
-
             Step::DeclareSubscribeTopic {
                 description,
                 participant,
                 topic,
-                scoped_to,
+                mode,
             } => {
-                tracing::info!(
-                    "[step {n}/{total}: {kind}] \"{description}\" ({participant}, topic={topic}, scoped_to={scoped_to:?})"
-                );
-                let resolved_id: Option<String> = match scoped_to {
-                    None => None,
-                    Some(pub_name) => {
-                        let pub_handle = handles.get(*pub_name).ok_or_else(|| {
-                            anyhow::anyhow!("step \"{description}\": unknown publisher participant \"{pub_name}\"")
-                        })?;
-                        let id = pub_handle.shared.participant_id.lock().unwrap().clone();
-                        match id {
-                            Some(id) => Some(id),
-                            None => anyhow::bail!(
-                                "step \"{description}\": DeclareSubscribeTopic scoped_to \"{pub_name}\" \
-                                 but that participant has not connected yet; add a Step::Run before this step"
-                            ),
-                        }
-                    }
-                };
                 let handle = get_handle(handles, participant, description)?;
                 handle.shared.pending_ops.lock().unwrap().push(
-                    PendingDriverOp::DeclareSubscribeTopic(topic.to_string(), resolved_id),
+                    PendingDriverOp::DeclareSubscribeTopic(topic.to_string(), *mode),
                 );
             }
-
             Step::PublishData {
                 description,
                 participant,
                 topic,
+                mode,
                 data,
             } => {
-                tracing::info!(
-                    "[step {n}/{total}: {kind}] \"{description}\" ({participant}, topic={topic}, {} bytes)",
-                    data.len()
-                );
                 let handle = get_handle(handles, participant, description)?;
                 handle
                     .shared
@@ -2408,52 +2370,7 @@ async fn execute_plan(
                     .unwrap()
                     .push(PendingDriverOp::PublishData(
                         topic.to_string(),
-                        data.to_vec(),
-                    ));
-            }
-
-            Step::DeclareOrderedPublisher {
-                description,
-                participant,
-                topic,
-            } => {
-                let handle = get_handle(handles, participant, description)?;
-                handle
-                    .shared
-                    .pending_ops
-                    .lock()
-                    .unwrap()
-                    .push(PendingDriverOp::DeclareOrderedPublisher(topic.to_string()));
-            }
-
-            Step::DeclareOrderedSubscriber {
-                description,
-                participant,
-                topic,
-            } => {
-                let handle = get_handle(handles, participant, description)?;
-                handle
-                    .shared
-                    .pending_ops
-                    .lock()
-                    .unwrap()
-                    .push(PendingDriverOp::DeclareOrderedSubscriber(topic.to_string()));
-            }
-
-            Step::PublishOrdered {
-                description,
-                participant,
-                topic,
-                data,
-            } => {
-                let handle = get_handle(handles, participant, description)?;
-                handle
-                    .shared
-                    .pending_ops
-                    .lock()
-                    .unwrap()
-                    .push(PendingDriverOp::PublishOrdered(
-                        topic.to_string(),
+                        *mode,
                         data.to_vec(),
                     ));
             }
@@ -3361,14 +3278,17 @@ async fn execute_plan(
                     "[step {n}/{total}: {kind}] \"{description}\" ({participant}, topic={topic})"
                 );
                 let handle = get_handle(handles, participant, description)?;
-                let data_received = handle.shared.data_received.lock().unwrap();
+                let data_received = handle.shared.topic_events.lock().unwrap();
                 let received = data_received
                     .get(*topic)
                     .map(std::vec::Vec::as_slice)
                     .unwrap_or(&[]);
-                let expected_vec = expected.to_vec();
+                let received = received
+                    .iter()
+                    .filter_map(topic_payload)
+                    .collect::<Vec<_>>();
                 assert!(
-                    received.contains(&expected_vec),
+                    received.contains(expected),
                     "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  participant:  {participant}\n  topic:        {topic}\n  expected:     payload {expected:?} in received list\n  actual:       {received:?}"
                 );
             }
@@ -3383,14 +3303,17 @@ async fn execute_plan(
                     "[step {n}/{total}: {kind}] \"{description}\" ({participant}, topic={topic})"
                 );
                 let handle = get_handle(handles, participant, description)?;
-                let data_received = handle.shared.data_received.lock().unwrap();
+                let data_received = handle.shared.topic_events.lock().unwrap();
                 let received = data_received
                     .get(*topic)
                     .map(std::vec::Vec::as_slice)
                     .unwrap_or(&[]);
-                let excluded_vec = excluded.to_vec();
+                let received = received
+                    .iter()
+                    .filter_map(topic_payload)
+                    .collect::<Vec<_>>();
                 assert!(
-                    !received.contains(&excluded_vec),
+                    !received.contains(excluded),
                     "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  participant:  {participant}\n  topic:        {topic}\n  expected:     payload {excluded:?} NOT in received list\n  actual:       {received:?}"
                 );
             }
@@ -3405,8 +3328,10 @@ async fn execute_plan(
                     "[step {n}/{total}: {kind}] \"{description}\" ({participant}, topic={topic})"
                 );
                 let handle = get_handle(handles, participant, description)?;
-                let data_received = handle.shared.data_received.lock().unwrap();
-                let actual = data_received.get(*topic).map_or(0, Vec::len);
+                let data_received = handle.shared.topic_events.lock().unwrap();
+                let actual = data_received
+                    .get(*topic)
+                    .map_or(0, |events| events.iter().filter_map(topic_payload).count());
                 assert_eq!(
                     actual, *expected,
                     "step {n}/{total} {kind}: {description} ({participant}, {topic}): expected exactly {expected} payloads, got {actual}"
@@ -3420,16 +3345,140 @@ async fn execute_plan(
                 expected,
             } => {
                 let handle = get_handle(handles, participant, description)?;
-                let data_received = handle.shared.data_received.lock().unwrap();
+                let data_received = handle.shared.topic_events.lock().unwrap();
                 let received = data_received
                     .get(*topic)
                     .map(Vec::as_slice)
                     .unwrap_or_default();
-                let expected: Vec<Vec<u8>> =
-                    expected.iter().map(|payload| payload.to_vec()).collect();
+                let received = received
+                    .iter()
+                    .filter_map(topic_payload)
+                    .collect::<Vec<_>>();
                 assert_eq!(
-                    received, expected,
+                    received.as_slice(),
+                    *expected,
                     "step {n}/{total} {kind}: {description} ({participant}, {topic})"
+                );
+            }
+            Step::CheckTopicIdentity {
+                description,
+                participant,
+                topic,
+                mode,
+                publishers,
+                gap,
+            } => {
+                let mut expected = BTreeMap::new();
+                for publisher in *publishers {
+                    let handle = get_handle(handles, publisher, description)?;
+                    let observation = handle.shared.observation.lock().unwrap();
+                    let id = observation
+                        .as_ref()
+                        .and_then(|observation| {
+                            observation
+                                .snapshot
+                                .topics
+                                .publishers
+                                .iter()
+                                .find(|status| {
+                                    status.registration.topic == *topic
+                                        && status.registration.mode == *mode
+                                })
+                                .and_then(|status| status.data_track_id.clone())
+                        })
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "publisher {publisher} has no authoritative topic binding"
+                            )
+                        })?;
+                    let participant_id = observation
+                        .as_ref()
+                        .and_then(|observation| {
+                            observation.snapshot.participant_external_id.clone()
+                        })
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "publisher {publisher} has no admitted external identity"
+                            )
+                        })?;
+                    anyhow::ensure!(
+                        expected.insert(participant_id, id).is_none(),
+                        "duplicate admitted publisher identity"
+                    );
+                }
+                let handle = get_handle(handles, participant, description)?;
+                let events = handle.shared.topic_events.lock().unwrap();
+                let mut next_sequence = BTreeMap::<String, u64>::new();
+                let mut latest_sequence = BTreeMap::<String, u64>::new();
+                let mut seen = BTreeSet::new();
+                let mut gaps = Vec::new();
+                for event in events.get(*topic).into_iter().flatten() {
+                    match event {
+                        TopicNotification::Message(message) if message.mode == *mode => {
+                            anyhow::ensure!(
+                                message.topic == *topic
+                                    && expected.get(&message.participant_id)
+                                        == Some(&message.data_track_id),
+                                "{description}: message identity is not the publisher's authoritative track: {message:?}"
+                            );
+                            seen.insert(message.participant_id.clone());
+                            if *mode == TopicMode::Latest {
+                                if let Some(previous) = latest_sequence
+                                    .insert(message.data_track_id.clone(), message.sequence)
+                                {
+                                    anyhow::ensure!(
+                                        message.sequence > previous,
+                                        "{description}: latest sequence regressed or duplicated"
+                                    );
+                                }
+                            } else if *mode == TopicMode::Ordered {
+                                if let Some(next) = next_sequence.get(&message.data_track_id) {
+                                    anyhow::ensure!(
+                                        message.sequence == *next,
+                                        "{description}: ordered message skipped a sequence without an inline gap"
+                                    );
+                                }
+                                next_sequence.insert(
+                                    message.data_track_id.clone(),
+                                    message
+                                        .sequence
+                                        .checked_add(1)
+                                        .expect("valid wire sequence"),
+                                );
+                            }
+                        }
+                        TopicNotification::RecoveryGap {
+                            subscriber,
+                            data_track_id,
+                            participant_id,
+                            expected_sequence,
+                            available_sequence,
+                        } if *mode == TopicMode::Ordered => {
+                            anyhow::ensure!(
+                                subscriber.mode == *mode
+                                    && expected.get(participant_id) == Some(data_track_id)
+                                    && expected_sequence < available_sequence,
+                                "{description}: invalid inline gap identity or range"
+                            );
+                            if let Some(next) = next_sequence.get(data_track_id) {
+                                anyhow::ensure!(
+                                    next == expected_sequence,
+                                    "{description}: gap does not start at the last confirmed sequence"
+                                );
+                            }
+                            next_sequence.insert(data_track_id.clone(), *available_sequence);
+                            gaps.push((*expected_sequence, *available_sequence));
+                        }
+                        _ => {}
+                    }
+                }
+                anyhow::ensure!(
+                    seen == expected.keys().cloned().collect::<BTreeSet<_>>(),
+                    "{description}: missing application messages from an expected publisher"
+                );
+                anyhow::ensure!(
+                    gaps.as_slice() == gap.as_slice(),
+                    "{description}: wrong inline gaps: {gaps:?}, expected {gap:?}"
                 );
             }
         }
@@ -3729,7 +3778,12 @@ async fn assert_convergence(
         let intent = handle.shared.pending_ops.lock().unwrap().intent.clone();
         let requested = planned_video(&expected.participants, participant, handle, &observation);
         expected
-            .check_client(participant, &observation, &requested)
+            .check_client(
+                &owners.control.tracks,
+                participant,
+                &observation,
+                &requested,
+            )
             .map_err(|error| {
                 anyhow::anyhow!("client convergence after {after}, observer {name}: {error:#}")
             })?;
@@ -4809,6 +4863,13 @@ pub struct FeedbackProfile {
     pub reorder: Reorder,
 }
 
+fn topic_payload(event: &TopicNotification) -> Option<&[u8]> {
+    match event {
+        TopicNotification::Message(message) => Some(&message.payload),
+        _ => None,
+    }
+}
+
 fn initial_topic_registrations(plan: &[Step]) -> BTreeMap<&'static str, TopicRegistrations> {
     // Data-channel labels are transport topology; scenario steps still control when each API
     // declaration becomes observable, but fixed labels belong in the initial offer.
@@ -4816,48 +4877,29 @@ fn initial_topic_registrations(plan: &[Step]) -> BTreeMap<&'static str, TopicReg
     for step in plan {
         let (participant, publisher, subscriber) = match step {
             Step::DeclarePublishTopic {
-                participant, topic, ..
+                participant,
+                topic,
+                mode,
+                ..
             } => (
                 *participant,
                 Some(TopicPublisher {
                     topic: (*topic).to_string(),
-                    mode: TopicMode::Latest,
+                    mode: *mode,
                 }),
                 None,
             ),
             Step::DeclareSubscribeTopic {
                 participant,
                 topic,
-                scoped_to: None,
+                mode,
                 ..
             } => (
                 *participant,
                 None,
                 Some(TopicSubscriber {
                     topic: (*topic).to_string(),
-                    mode: TopicMode::Latest,
-                    publisher_id: None,
-                }),
-            ),
-            Step::DeclareOrderedPublisher {
-                participant, topic, ..
-            } => (
-                *participant,
-                Some(TopicPublisher {
-                    topic: (*topic).to_string(),
-                    mode: TopicMode::Ordered,
-                }),
-                None,
-            ),
-            Step::DeclareOrderedSubscriber {
-                participant, topic, ..
-            } => (
-                *participant,
-                None,
-                Some(TopicSubscriber {
-                    topic: (*topic).to_string(),
-                    mode: TopicMode::Ordered,
-                    publisher_id: None,
+                    mode: *mode,
                 }),
             ),
             _ => continue,

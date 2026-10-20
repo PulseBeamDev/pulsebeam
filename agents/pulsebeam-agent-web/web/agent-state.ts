@@ -28,7 +28,6 @@ export function emptyTopics(): TopicSnapshot {
     acceptedSends: 0,
     droppedSends: 0,
     deliveredMessages: 0,
-    resynchronizations: 0,
     channelFailures: 0,
   });
 }
@@ -40,8 +39,7 @@ export function emptySnapshot(connection: ConnectionState): AgentSnapshot {
     connection,
     generation: null,
     participantId: null,
-    participantExternalId: null,
-    roomExternalId: null,
+    roomId: null,
     authorizationExpiresAt: null,
     catalog: Object.freeze({
       revision: 0,
@@ -177,7 +175,6 @@ export function freezeTopicSnapshot(topics: TopicSnapshot): TopicSnapshot {
     acceptedSends: topics.acceptedSends,
     droppedSends: topics.droppedSends,
     deliveredMessages: topics.deliveredMessages,
-    resynchronizations: topics.resynchronizations,
     channelFailures: topics.channelFailures,
   });
 }

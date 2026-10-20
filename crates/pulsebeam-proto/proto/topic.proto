@@ -1,0 +1,46 @@
+syntax = "proto3";
+package topic;
+
+// All application modes share this envelope. Identity is allocated by the SFU
+// and discovered through Catalog; mode and topic belong to channel metadata.
+message TopicMessage {
+  string data_track_id = 1;
+  uint64 sequence = 2;
+  bytes payload = 3;
+}
+
+message TopicNack {
+  string data_track_id = 1;
+  uint64 from_sequence = 2;
+}
+
+// A new subscription requests a live frontier, never retained history. An
+// established subscription probes from its existing cursor after route churn.
+message TopicProbe {
+  string data_track_id = 1;
+  uint64 from_sequence = 2;
+  bool live = 3;
+}
+
+// Establishes the starting cursor of a live subscription. It is not a message.
+message TopicFrontier {
+  string data_track_id = 1;
+  uint64 next_sequence = 2;
+}
+
+// History before available_sequence is no longer retained. An established
+// receiver emits an inline gap before continuing at this sequence.
+message TopicFloor {
+  string data_track_id = 1;
+  uint64 available_sequence = 2;
+}
+
+message TopicFrame {
+  oneof body {
+    TopicMessage message = 1;
+    TopicNack nack = 2;
+    TopicProbe probe = 3;
+    TopicFrontier frontier = 4;
+    TopicFloor floor = 5;
+  }
+}

@@ -167,38 +167,86 @@ Catch capture, playback, and topic failures at their controls. In React, read
 
 ## Typed topics
 
-Send live JSON messages, not durable chat history.
-
-Inside your component, get `const Chat = agent.topic<{text: string}>("chat",
-{mode: "reliable"})`. Render a consumer in its returned JSX:
+Use `ordered` for live chat and `lossy` for transient reactions. Neither is
+durable history. Add this component to your connected room:
 
 ```tsx
-<Chat
-  onMessage={(message, {publisherId}) => {
-    setMessages(previous => [...previous, `${publisherId}: ${message.text}`]);
-  }}
-  onGap={() => setGap(true)}
-  onError={reportError}
-/>
+import { useState } from "react";
+import type { Agent, TopicEvent } from "@pulsebeam/react";
+
+type ChatValue = { text: string };
+
+export function ChatPanel({ agent }: { agent: Agent }) {
+  const Chat = agent.topic<ChatValue>("chat", { mode: "ordered" });
+  const [events, setEvents] = useState<TopicEvent<ChatValue>[]>([]);
+  const [error, setError] = useState<string | null>(null);
+
+  return (
+    <section aria-label="Chat">
+      <Chat
+        onEvent={(event) =>
+          setEvents((previous) => [...previous, event].slice(-100))
+        }
+        onError={(failure) => setError(`Chat error: ${failure.code}`)}
+      />
+      <ul>
+        {events.map((event) =>
+          event.type === "gap" ? (
+            <li
+              key={`${event.dataTrackId}:gap:${event.expectedSequence}:${event.availableSequence}`}
+            >
+              Some chat from {event.participantId} was skipped.
+            </li>
+          ) : (
+            <li key={`${event.dataTrackId}:${event.sequence}`}>
+              {event.participantId}: {event.value.text}
+            </li>
+          ),
+        )}
+      </ul>
+      <button
+        type="button"
+        disabled={agent.connection !== "connected"}
+        onClick={() => {
+          void Chat.publish({ text: "hello" }).catch((cause: unknown) =>
+            setError(String(cause)),
+          );
+        }}
+      >
+        Send hello
+      </button>
+      {error && <p role="alert">{error}</p>}
+    </section>
+  );
+}
 ```
 
-Here `setMessages`, `setGap`, and `reportError` are application state/UI callbacks;
-their definitions are omitted. In a send handler call
-`void Chat.publish({text: "hello"}).catch(reportError)`.
+**You see:** in two participants' tabs, **Send hello** in one adds a sender-authored
+row in the other. Sending does not loop back to the publisher. The UI retains its
+100 most recent message/gap rows; that view is not a history store. Gaps appear
+inline, rather than making a discontinuous chat look complete.
 
-**You receive:** live messages while mounted, with actual publisher identity.
+Use event `participantId` for the external sender and `(dataTrackId, sequence)`
+for received-message keys, not IDs copied from JSON. Sequence and gap fields are
+`bigint`. A new publication after reopen/reconnect has a new `dataTrackId` and
+sequence space, even for the same participant and topic.
+
 Lookup creates no interest. Every committed consumer owns its subscription;
 unmount releases exactly it. Callback-only updates do not resubscribe.
 Publishing works without a mounted consumer and retains independent interest.
 Malformed UTF-8/JSON releases that consumer with `code: "decode-failed"`; remount
-it to retry. Core gap/channel failures retain core recovery semantics.
+it to retry. Channel failures remain errors; gaps are normal `onEvent` events.
 
 | Mode | Use |
 | --- | --- |
-| `reliable` | Ordered messages; bounded queue |
-| `unreliable` | Latest values; new messages can replace queued ones |
+| `latest` | Replaceable state per publisher data track, such as cursor position |
+| `lossy` | Distinct transient events, such as reactions; loss and reordering are allowed |
+| `ordered` | Increasing messages per data track, with finite recovery and explicit gaps |
 
-Neither mode promises offline replay or exactly-once delivery. Recovery can lose
-messages; reload backend state when gaps matter. JSON above 65,536 bytes rejects;
-the generic type does not validate untrusted data or authorize users.
-[Queue limits and diagnostics](/react/reference#topics).
+Every mode is explicit; different modes do not match the same subscription.
+There is no global publisher order, initial state snapshot, or offline replay.
+New ordered subscriptions start live, not by replaying older traffic. Reload
+backend state when a gap matters. Successful publish means local acceptance,
+not remote delivery. JSON above 65,536 UTF-8 bytes rejects; generic types do not
+validate untrusted data or authorize users.
+[Exact event shapes, bounds, and upgrade rules](/react/reference#topics).

@@ -23,7 +23,7 @@ export function Room({ config }: { config: AgentConfig }) {
       <h1>PulseBeam React room</h1>
       <p role="status">
         Connection: {agent.connection}; participant:{" "}
-        {agent.participantExternalId ?? "not admitted"}
+        {agent.participantId ?? "not admitted"}
       </p>
       <p>Capture: {capture.state}</p>
       <button onClick={() => agent.connect()}>Join</button>

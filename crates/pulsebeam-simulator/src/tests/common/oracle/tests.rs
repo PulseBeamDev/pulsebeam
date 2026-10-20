@@ -272,12 +272,12 @@ fn automatic_audio_oracle_requires_every_uncontended_live_source() {
     let (mut model, mut client) = audio_fixture(3);
     let requested = [model.participants[0].id.as_str()];
     model
-        .check_client(&model.participants[1], &client, &requested)
+        .check_client(&[], &model.participants[1], &client, &requested)
         .unwrap();
     model.participants.last_mut().unwrap().required = false;
     client.snapshot.audio_mapping.remove(&2);
     model
-        .check_client(&model.participants[1], &client, &requested)
+        .check_client(&[], &model.participants[1], &client, &requested)
         .unwrap();
 
     let mutations: &[Mutation<ClientObservation>] = &[
@@ -299,6 +299,7 @@ fn automatic_audio_oracle_requires_every_uncontended_live_source() {
         assert!(
             model
                 .check_client(
+                    &[],
                     &model.participants[1],
                     &client,
                     &[model.participants[0].id.as_str()],
@@ -314,7 +315,7 @@ fn automatic_audio_oracle_allows_contended_choices_but_requires_full_slots_and_p
     let (model, mut client) = audio_fixture(2);
     let requested = [model.participants[0].id.as_str()];
     model
-        .check_client(&model.participants[1], &client, &requested)
+        .check_client(&[], &model.participants[1], &client, &requested)
         .unwrap();
     let first = client.snapshot.audio_mapping.get(&0).unwrap().clone();
     let third = model
@@ -325,12 +326,12 @@ fn automatic_audio_oracle_allows_contended_choices_but_requires_full_slots_and_p
         .as_str();
     client.snapshot.audio_mapping.insert(0, third);
     model
-        .check_client(&model.participants[1], &client, &requested)
+        .check_client(&[], &model.participants[1], &client, &requested)
         .unwrap();
     let second = client.snapshot.audio_mapping.remove(&1).unwrap();
     assert!(
         model
-            .check_client(&model.participants[1], &client, &requested)
+            .check_client(&[], &model.participants[1], &client, &requested)
             .is_err()
     );
     client.snapshot.audio_mapping.insert(1, second);
@@ -338,12 +339,12 @@ fn automatic_audio_oracle_allows_contended_choices_but_requires_full_slots_and_p
     client.submitted.audio.pinned = vec![first.clone()];
     assert!(
         model
-            .check_client(&model.participants[1], &client, &requested)
+            .check_client(&[], &model.participants[1], &client, &requested)
             .is_err()
     );
     client.snapshot.audio_mapping.insert(0, first);
     model
-        .check_client(&model.participants[1], &client, &requested)
+        .check_client(&[], &model.participants[1], &client, &requested)
         .unwrap();
 }
 
@@ -357,6 +358,7 @@ fn transition_safety_allows_outstanding_intent_but_rejects_invalid_assignments()
     assert!(
         model
             .check_client(
+                &[],
                 &model.participants[1],
                 &client,
                 &[model.participants[0].id.as_str()]
@@ -379,6 +381,7 @@ fn application_and_wire_revisions_are_independent() {
     client.snapshot.accepted_intent_revision = 4;
     model
         .check_client(
+            &[],
             &model.participants[1],
             &client,
             &[model.participants[0].id.as_str()],
@@ -392,6 +395,7 @@ fn complete_plan_and_owner_values_agree() {
     model.check_owners(&owners).unwrap();
     model
         .check_client(
+            &[],
             &model.participants[1],
             &client,
             &[model.participants[0].id.as_str()],
@@ -536,6 +540,7 @@ fn client_oracle_rejects_wrong_missing_duplicate_and_unrequested_assignments() {
         assert!(
             model
                 .check_client(
+                    &[],
                     &model.participants[1],
                     &state,
                     &[model.participants[0].id.as_str()]

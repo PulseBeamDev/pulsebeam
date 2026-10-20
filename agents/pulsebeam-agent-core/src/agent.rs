@@ -9,7 +9,7 @@ use pulsebeam_proto::signaling_v1 as wire;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AgentConfig, ChannelId, ConnectionId, ConnectionState, DataChannelEffect, DataChannelEvent,
+    AgentConfig, ChannelId, ConnectionState, DataChannelEffect, DataChannelEvent,
     DataChannelReliability, DataChannelSpec, DesiredState, Effect, Failure, FailureClass,
     Generation, HostEvent, HttpEffect, HttpEvent, HttpHeader, HttpMethod, HttpRequest,
     HttpResponse, MediaSlot, Notification, OfferResources, OperationId, ParticipantId, RoomId,
@@ -87,7 +87,6 @@ struct Session {
     _room_id: RoomId,
     participant_external_id: String,
     _opaque_participant_id: ParticipantId,
-    connection_id: ConnectionId,
     coordinates: BTreeMap<MediaSlot, SlotBinding>,
     observed: CatalogState,
     intent_revision: u64,
@@ -118,7 +117,6 @@ struct Candidate {
     participant_external_id: String,
     participant_id: String,
     opaque_participant_id: ParticipantId,
-    connection_id: ConnectionId,
 }
 
 #[derive(Serialize)]
@@ -133,7 +131,8 @@ struct NativeResponse {
     room_id: String,
     participant_external_id: String,
     participant_id: String,
-    connection_id: String,
+    #[serde(rename = "connection_id")]
+    _canonical_connection_id: String,
     answer: String,
 }
 
@@ -779,11 +778,8 @@ impl Agent {
                 } else if self.topic_probe == Some(timer) {
                     self.topic_probe = None;
                     if self.active.is_some() && self.desired.connected {
-                        self.topics.probe_remote_publishers(
-                            self.snapshot.participants.keys().map(String::as_str),
-                            &mut self.ids,
-                            &mut self.effects,
-                        );
+                        self.topics
+                            .probe_remote_publishers(&mut self.ids, &mut self.effects);
                     }
                     self.schedule_topic_probe();
                 }
@@ -955,11 +951,16 @@ impl Agent {
                         {
                             self.retry_attempts = 0;
                         }
-                        self.topics.probe_remote_publishers(
-                            self.snapshot.participants.keys().map(String::as_str),
+                        self.topics.sync_catalog(
+                            generation,
+                            &active.observed,
+                            &mut self.snapshot,
+                            &mut self.notifications,
                             &mut self.ids,
                             &mut self.effects,
                         );
+                        self.topics
+                            .probe_remote_publishers(&mut self.ids, &mut self.effects);
                         agent_log!(
                             self,
                             Debug,
@@ -1192,7 +1193,6 @@ impl Agent {
             _room_id: candidate.room_id,
             participant_external_id: candidate.participant_external_id,
             _opaque_participant_id: candidate.opaque_participant_id,
-            connection_id: candidate.connection_id,
             coordinates,
             observed: CatalogState::default(),
             intent_revision: 0,
@@ -1226,7 +1226,6 @@ impl Agent {
             self.topics.bind(
                 active.generation,
                 active.participant_id.clone(),
-                active.connection_id.as_str(),
                 &attempt.topic_registrations,
                 topic_bindings,
                 &mut self.ids,
@@ -1234,11 +1233,8 @@ impl Agent {
                 &mut self.snapshot,
                 &mut self.notifications,
             );
-            self.topics.probe_remote_publishers(
-                self.snapshot.participants.keys().map(String::as_str),
-                &mut self.ids,
-                &mut self.effects,
-            );
+            self.topics
+                .probe_remote_publishers(&mut self.ids, &mut self.effects);
         }
         self.set_connection_state(ConnectionState::Connected);
         for payload in attempt.early_signaling {
@@ -1837,7 +1833,6 @@ fn parse_create_response(response: &HttpResponse) -> Result<(Candidate, String),
             participant_external_id: body.participant_external_id,
             participant_id: body.participant_id.clone(),
             opaque_participant_id: ParticipantId::from_server(body.participant_id),
-            connection_id: ConnectionId::from_server(body.connection_id),
         },
         body.answer,
     ))
@@ -1918,10 +1913,6 @@ mod response_tests {
         assert_eq!(
             candidate.opaque_participant_id.as_str(),
             "not canonical / participant"
-        );
-        assert_eq!(
-            candidate.connection_id.as_str(),
-            "not canonical / connection"
         );
         assert_eq!(answer, "v=0\r\n");
 

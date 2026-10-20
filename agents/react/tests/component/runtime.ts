@@ -15,14 +15,21 @@ export class BrowserRuntime {
   replacements: { slot: string; track: MediaStreamTrack | null }[] = [];
   replaceCompletion: Promise<void> = Promise.resolve();
   snapshot = {
-    version: 1,
-    desiredRevision: 0,
+    version: 1n,
+    desiredRevision: 0n,
     connection: "disconnected",
-    catalog: { revision: 0 },
-    mapping: { acceptedIntentRevision: 0, video: [], audio: [] },
+    catalog: { revision: 0n },
+    mapping: { acceptedIntentRevision: 0n, video: [], audio: [] },
     participants: [],
     publications: [],
-    topics: { publishers: [], subscribers: [] },
+    topics: {
+      publishers: [],
+      subscribers: [],
+      acceptedSends: 0n,
+      droppedSends: 0n,
+      deliveredMessages: 0n,
+      channelFailures: 0n,
+    },
   };
   constructor(config: unknown) {
     this.config = config;
@@ -53,14 +60,20 @@ export class BrowserRuntime {
   remote_track(index: number) {
     return this.tracks.get(index);
   }
-  send_topic(name: string, mode: string, payload: Uint8Array) {
+  async send_topic(
+    name: string,
+    mode: string,
+    payload: Uint8Array,
+    _generation: bigint,
+    _dataTrackId: string,
+  ) {
     this.sent.push({ name, mode, payload });
   }
   emit(patch: Record<string, unknown>) {
     this.snapshot = {
       ...this.snapshot,
       ...patch,
-      version: this.snapshot.version + 1,
+      version: this.snapshot.version + 1n,
     };
     this.snapshotListener?.(this.snapshot);
   }

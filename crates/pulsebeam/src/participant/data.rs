@@ -59,10 +59,6 @@ impl DataState {
                 && existing.direction == channel.direction
                 && existing.topic == channel.topic
                 && existing.lane == channel.lane
-                && (channel.direction == DataTrackDirection::Publish
-                    || existing.scope == channel.scope
-                    || existing.scope.is_none()
-                    || channel.scope.is_none())
         });
         if duplicate {
             return Err(DataOpenError::DuplicateDataChannelLabel(channel));
@@ -89,6 +85,31 @@ impl DataState {
         self.channels.get(&cid).map(|state| &state.channel)
     }
 
+    pub(super) fn accepts_publisher_frame(
+        &self,
+        cid: ChannelId,
+        frame: &pulsebeam_proto::topic::TopicFrame,
+    ) -> bool {
+        let Some(state) = self.channels.get(&cid) else {
+            return false;
+        };
+        let Some(publication) = state.publication.as_ref() else {
+            return false;
+        };
+        state.channel.direction == DataTrackDirection::Publish
+            && frame.data_track_id() == Some(publication.id.as_str().as_str())
+            && frame.is_publisher_output()
+            && (state.channel.lane == crate::track::DataLane::Ordered
+                || matches!(
+                    frame.body,
+                    Some(pulsebeam_proto::topic::topic_frame::Body::Message(_))
+                ))
+    }
+
+    pub(super) fn publication(&self, cid: ChannelId) -> Option<&TrackMeta> {
+        self.channels.get(&cid)?.publication.as_ref()
+    }
+
     pub(super) fn publications(&self) -> impl Iterator<Item = &TrackMeta> {
         self.channels
             .values()
@@ -104,7 +125,7 @@ impl DataState {
 
     pub(super) fn selector(channel: &DataTopicChannel) -> TrackSelector {
         TrackSelector::data_topic(
-            channel.scope,
+            None,
             crate::track::publication_label(channel.lane, &channel.topic),
         )
     }
@@ -124,21 +145,24 @@ mod tests {
         let connection = ConnectionId::new();
         let mut state = DataState::new();
         let first = state
-            .allocate_publication(connection, "v1/rel/chat")
+            .allocate_publication(connection, "v2/ordered/chat")
             .unwrap();
         let second = state
-            .allocate_publication(connection, "v1/rel/chat")
+            .allocate_publication(connection, "v2/ordered/chat")
             .unwrap();
         assert_ne!(first, second);
         assert_eq!(first.kind(), TrackKind::Data);
         assert_ne!(
             second,
             state
-                .allocate_publication(ConnectionId::new(), "v1/rel/chat")
+                .allocate_publication(ConnectionId::new(), "v2/ordered/chat")
                 .unwrap()
         );
         state.next_publication = u64::MAX;
-        assert_eq!(state.allocate_publication(connection, "v1/rel/chat"), None);
+        assert_eq!(
+            state.allocate_publication(connection, "v2/ordered/chat"),
+            None
+        );
     }
 
     #[test]
@@ -147,7 +171,7 @@ mod tests {
         let cid = rtc.direct_api().create_data_channel(Default::default());
         let connection_id = ConnectionId::new();
         let topic = Topic::for_test("chat");
-        let lane = DataLane::Realtime;
+        let lane = DataLane::Latest;
         let label = crate::track::publication_label(lane, &topic);
         let meta = TrackMeta {
             room_id: RoomId::from_external(&RoomExternalId::new("data-lifecycle").unwrap()),
@@ -160,7 +184,6 @@ mod tests {
         let channel = DataTopicChannel {
             direction: DataTrackDirection::Publish,
             topic,
-            scope: None,
             lane,
         };
 
@@ -169,10 +192,51 @@ mod tests {
             .open(cid, channel.clone(), Some(meta.clone()))
             .unwrap();
         assert_eq!(state.channel(cid), Some(&channel));
+        use pulsebeam_proto::topic::{
+            TopicFrame, TopicFrontier, TopicMessage, TopicNack, topic_frame::Body,
+        };
+        let message = |id: crate::entity::TrackId| TopicFrame {
+            body: Some(Body::Message(TopicMessage {
+                data_track_id: id.as_str(),
+                sequence: 0,
+                payload: vec![1],
+            })),
+        };
+        assert!(state.accepts_publisher_frame(cid, &message(meta.id)));
+        assert!(!state.accepts_publisher_frame(
+            cid,
+            &message(connection_id.derive_track_id(TrackKind::Data, "another-publication"))
+        ));
+        assert!(!state.accepts_publisher_frame(
+            cid,
+            &TopicFrame {
+                body: Some(Body::Frontier(TopicFrontier {
+                    data_track_id: meta.id.as_str(),
+                    next_sequence: 0
+                }))
+            }
+        ));
+        assert!(!state.accepts_publisher_frame(
+            cid,
+            &TopicFrame {
+                body: Some(Body::Nack(TopicNack {
+                    data_track_id: meta.id.as_str(),
+                    from_sequence: 0
+                }))
+            }
+        ));
         let closed = state.close(cid).unwrap();
         assert_eq!(closed.channel, channel);
-        assert_eq!(closed.publication, Some(meta));
+        assert_eq!(closed.publication, Some(meta.clone()));
         assert!(state.close(cid).is_none());
+        assert!(!state.accepts_publisher_frame(cid, &message(meta.id)));
+        let mut replacement = meta.clone();
+        replacement.id = state
+            .allocate_publication(connection_id, meta.label.as_deref().unwrap())
+            .unwrap();
+        state.open(cid, channel, Some(replacement.clone())).unwrap();
+        assert!(!state.accepts_publisher_frame(cid, &message(meta.id)));
+        assert!(state.accepts_publisher_frame(cid, &message(replacement.id)));
     }
 
     #[test]
@@ -182,8 +246,7 @@ mod tests {
         let channel = DataTopicChannel {
             direction: DataTrackDirection::Subscribe,
             topic: Topic::for_test("chat"),
-            scope: None,
-            lane: DataLane::Reliable,
+            lane: DataLane::Ordered,
         };
         let mut state = DataState::new();
         state.open(cid, channel.clone(), None).unwrap();

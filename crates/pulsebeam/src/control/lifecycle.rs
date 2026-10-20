@@ -1145,8 +1145,8 @@ mod tests {
             TrackKind::Data => {
                 let (lane, topic) = label
                     .strip_prefix("rel:")
-                    .map_or((DataLane::Realtime, label), |topic| {
-                        (DataLane::Reliable, topic)
+                    .map_or((DataLane::Latest, label), |topic| {
+                        (DataLane::Ordered, topic)
                     });
                 Track::data(meta, Topic::for_test(topic), lane, None)
             }

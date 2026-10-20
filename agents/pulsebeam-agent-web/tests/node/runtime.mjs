@@ -119,6 +119,11 @@ if (process.argv[2] === "initialization-failure") {
     await publicContract(await import("../../node_assets/dist/index.js")),
     true,
   );
+  const { topicContract } = await import("./topic-contract.mjs");
+  await topicContract(await import("../../node_assets/dist/index.js"));
+  console.log(
+    "emitted WASM authoritative binding, lossless u64 events and admission cancellation passed",
+  );
   await import("./media-handles.mjs");
   assert.ok(
     Object.values(local).every((value) => value === true),

@@ -53,6 +53,7 @@ export type {
   TopicDropReason,
   TopicCallbacks,
   TopicGap,
+  TopicEvent,
   TopicConsumerError,
   TopicMode,
   TopicPublisherStatus,

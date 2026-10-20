@@ -108,7 +108,7 @@ pub struct AudioTrackDelay {
 
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct TrackSelector {
-    pub participant_external_id: String,
+    pub participant_id: String,
     pub label: String,
 }
 
@@ -131,6 +131,7 @@ pub enum PlayoutDelay {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
 pub enum TopicMode {
     Latest,
+    Lossy,
     Ordered,
 }
 
@@ -144,7 +145,6 @@ pub struct TopicPublisher {
 pub struct TopicSubscriber {
     pub name: String,
     pub mode: TopicMode,
-    pub publisher_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, uniffi::Record)]
@@ -165,8 +165,7 @@ pub enum MediaKind {
 
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct Participant {
-    pub id: String,
-    pub external_id: String,
+    pub participant_id: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
@@ -234,10 +233,9 @@ pub struct Failure {
 pub struct TopicPublisherState {
     pub publisher: TopicPublisher,
     pub connected: bool,
-    pub stream_id: Option<u64>,
-    pub next_sequence: Option<u64>,
+    pub data_track_id: Option<String>,
+    pub next_sequence: u64,
     pub accepted_history: u64,
-    pub replay_messages: u64,
     pub queued_messages: u64,
     pub send_pending: bool,
 }
@@ -257,7 +255,6 @@ pub struct TopicState {
     pub accepted_sends: u64,
     pub dropped_sends: u64,
     pub delivered_messages: u64,
-    pub resynchronizations: u64,
     pub channel_failures: u64,
 }
 
@@ -268,8 +265,7 @@ pub struct Snapshot {
     pub connection: ConnectionState,
     pub generation: Option<u64>,
     pub participant_id: Option<String>,
-    pub participant_external_id: Option<String>,
-    pub room_external_id: Option<String>,
+    pub room_id: Option<String>,
     pub authorization_expires_at: Option<i64>,
     pub catalog: CatalogSnapshot,
     pub mapping: MappingSnapshot,
@@ -290,20 +286,14 @@ pub enum TopicDropReason {
     SequenceExhausted,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, uniffi::Enum)]
-pub enum TopicMessage {
-    Latest {
-        name: String,
-        publisher_id: Option<String>,
-        payload: Vec<u8>,
-    },
-    Ordered {
-        name: String,
-        publisher_id: String,
-        stream_id: u64,
-        sequence: u64,
-        payload: Vec<u8>,
-    },
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct TopicMessage {
+    pub name: String,
+    pub mode: TopicMode,
+    pub data_track_id: String,
+    pub sequence: u64,
+    pub participant_id: String,
+    pub payload: Vec<u8>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Enum)]
@@ -311,8 +301,8 @@ pub enum TopicNotification {
     SendAdmitted {
         publisher: TopicPublisher,
         operation_id: u64,
-        stream_id: Option<u64>,
-        sequence: Option<u64>,
+        data_track_id: String,
+        sequence: u64,
     },
     SendDropped {
         publisher: TopicPublisher,
@@ -325,19 +315,12 @@ pub enum TopicNotification {
         name: String,
         mode: TopicMode,
         publishing: bool,
-        publisher_id: Option<String>,
         message: String,
-    },
-    Resynchronized {
-        subscriber: TopicSubscriber,
-        publisher_id: String,
-        stream_id: u64,
-        next_sequence: u64,
     },
     RecoveryGap {
         subscriber: TopicSubscriber,
-        publisher_id: String,
-        stream_id: u64,
+        data_track_id: String,
+        participant_id: String,
         expected_sequence: u64,
         available_sequence: u64,
     },
@@ -652,7 +635,7 @@ impl From<model::AudioSubscription> for AudioDemand {
 impl From<TrackSelector> for model::TrackSelector {
     fn from(value: TrackSelector) -> Self {
         Self {
-            participant_external_id: value.participant_external_id,
+            participant_external_id: value.participant_id,
             label: value.label,
         }
     }
@@ -661,7 +644,7 @@ impl From<TrackSelector> for model::TrackSelector {
 impl From<model::TrackSelector> for TrackSelector {
     fn from(value: model::TrackSelector) -> Self {
         Self {
-            participant_external_id: value.participant_external_id,
+            participant_id: value.participant_external_id,
             label: value.label,
         }
     }
@@ -689,6 +672,7 @@ impl From<TopicMode> for model::TopicMode {
     fn from(value: TopicMode) -> Self {
         match value {
             TopicMode::Latest => Self::Latest,
+            TopicMode::Lossy => Self::Lossy,
             TopicMode::Ordered => Self::Ordered,
         }
     }
@@ -698,6 +682,7 @@ impl From<model::TopicMode> for TopicMode {
     fn from(value: model::TopicMode) -> Self {
         match value {
             model::TopicMode::Latest => Self::Latest,
+            model::TopicMode::Lossy => Self::Lossy,
             model::TopicMode::Ordered => Self::Ordered,
         }
     }
@@ -726,7 +711,6 @@ impl From<TopicSubscriber> for model::TopicSubscriber {
         Self {
             topic: value.name,
             mode: value.mode.into(),
-            publisher_id: value.publisher_id,
         }
     }
 }
@@ -736,7 +720,6 @@ impl From<model::TopicSubscriber> for TopicSubscriber {
         Self {
             name: value.topic,
             mode: value.mode.into(),
-            publisher_id: value.publisher_id,
         }
     }
 }
@@ -753,19 +736,7 @@ impl From<model::MediaKind> for MediaKind {
 impl From<model::Participant> for Participant {
     fn from(value: model::Participant) -> Self {
         Self {
-            id: value.id,
-            external_id: value.external_id,
-        }
-    }
-}
-
-impl From<model::Publication> for Publication {
-    fn from(value: model::Publication) -> Self {
-        Self {
-            id: value.id,
-            participant_id: value.participant_id,
-            kind: value.kind.into(),
-            label: value.label,
+            participant_id: value.external_id,
         }
     }
 }
@@ -823,10 +794,9 @@ impl From<&model::TopicSnapshot> for TopicState {
                 .map(|status| TopicPublisherState {
                     publisher: status.registration.into(),
                     connected: status.channel.is_some(),
-                    stream_id: status.stream_id,
+                    data_track_id: status.data_track_id,
                     next_sequence: status.next_sequence,
                     accepted_history: count(status.accepted_history),
-                    replay_messages: count(status.replay_messages),
                     queued_messages: count(status.queued_messages),
                     send_pending: status.send_pending,
                 })
@@ -845,7 +815,6 @@ impl From<&model::TopicSnapshot> for TopicState {
             accepted_sends: value.accepted_sends,
             dropped_sends: value.dropped_sends,
             delivered_messages: value.delivered_messages,
-            resynchronizations: value.resynchronizations,
             channel_failures: value.channel_failures,
         }
     }
@@ -858,9 +827,8 @@ impl From<&model::Snapshot> for Snapshot {
             desired_revision: value.desired_revision,
             connection: value.connection.clone().into(),
             generation: value.generation.map(model::Generation::get),
-            participant_id: value.participant_id.clone(),
-            participant_external_id: value.participant_external_id.clone(),
-            room_external_id: value.room_external_id.clone(),
+            participant_id: value.participant_external_id.clone(),
+            room_id: value.room_external_id.clone(),
             authorization_expires_at: value.authorization_expires_at,
             catalog: CatalogSnapshot {
                 revision: value.catalog_revision,
@@ -873,8 +841,15 @@ impl From<&model::Snapshot> for Snapshot {
                 publications: value
                     .publications
                     .values()
-                    .cloned()
-                    .map(Into::into)
+                    .filter_map(|publication| {
+                        let owner = value.participants.get(&publication.participant_id)?;
+                        Some(Publication {
+                            id: publication.id.clone(),
+                            participant_id: owner.external_id.clone(),
+                            kind: publication.kind.into(),
+                            label: publication.label.clone(),
+                        })
+                    })
                     .collect(),
             },
             mapping: MappingSnapshot {
@@ -920,29 +895,13 @@ impl From<model::TopicDropReason> for TopicDropReason {
 
 impl From<model::TopicMessage> for TopicMessage {
     fn from(value: model::TopicMessage) -> Self {
-        match value {
-            model::TopicMessage::Latest {
-                topic,
-                publisher_id,
-                payload,
-            } => Self::Latest {
-                name: topic,
-                publisher_id,
-                payload,
-            },
-            model::TopicMessage::Ordered {
-                topic,
-                publisher_id,
-                stream_id,
-                sequence,
-                payload,
-            } => Self::Ordered {
-                name: topic,
-                publisher_id,
-                stream_id,
-                sequence,
-                payload,
-            },
+        Self {
+            name: value.topic,
+            mode: value.mode.into(),
+            data_track_id: value.data_track_id,
+            sequence: value.sequence,
+            participant_id: value.participant_id,
+            payload: value.payload,
         }
     }
 }
@@ -953,12 +912,12 @@ impl From<model::TopicNotification> for TopicNotification {
             model::TopicNotification::SendAdmitted {
                 publisher,
                 operation,
-                stream_id,
+                data_track_id,
                 sequence,
             } => Self::SendAdmitted {
                 publisher: publisher.into(),
                 operation_id: operation.get(),
-                stream_id,
+                data_track_id,
                 sequence,
             },
             model::TopicNotification::SendDropped { publisher, reason } => Self::SendDropped {
@@ -969,43 +928,29 @@ impl From<model::TopicNotification> for TopicNotification {
                 message: message.into(),
             },
             model::TopicNotification::ChannelFailed { channel, message } => {
-                let (name, mode, publishing, publisher_id) = match channel {
-                    model::TopicChannel::Publisher(value) => {
-                        (value.topic, value.mode.into(), true, None)
-                    }
+                let (name, mode, publishing) = match channel {
+                    model::TopicChannel::Publisher(value) => (value.topic, value.mode.into(), true),
                     model::TopicChannel::Subscriber(value) => {
-                        (value.topic, value.mode.into(), false, value.publisher_id)
+                        (value.topic, value.mode.into(), false)
                     }
                 };
                 Self::ChannelFailed {
                     name,
                     mode,
                     publishing,
-                    publisher_id,
                     message,
                 }
             }
-            model::TopicNotification::Resynchronized {
-                subscriber,
-                publisher_id,
-                stream_id,
-                next_sequence,
-            } => Self::Resynchronized {
-                subscriber: subscriber.into(),
-                publisher_id,
-                stream_id,
-                next_sequence,
-            },
             model::TopicNotification::RecoveryGap {
                 subscriber,
-                publisher_id,
-                stream_id,
+                data_track_id,
+                participant_id,
                 expected_sequence,
                 available_sequence,
             } => Self::RecoveryGap {
                 subscriber: subscriber.into(),
-                publisher_id,
-                stream_id,
+                data_track_id,
+                participant_id,
                 expected_sequence,
                 available_sequence,
             },
@@ -1159,53 +1104,103 @@ mod tests {
     }
 
     #[test]
-    fn snapshots_are_deterministic_owned_values() {
-        let mut snapshot = model::Snapshot::default();
-        snapshot.participants.insert(
-            "z".to_string(),
-            model::Participant {
-                id: "z".to_string(),
-                external_id: "external-z".to_string(),
-            },
-        );
-        snapshot.participants.insert(
-            "a".to_string(),
-            model::Participant {
-                id: "a".to_string(),
-                external_id: "external-a".to_string(),
-            },
-        );
+    fn snapshots_are_deterministic_owned_external_identity_values() {
+        let mut snapshot = model::Snapshot {
+            participant_id: Some("canonical-self".to_string()),
+            participant_external_id: Some("local-user".to_string()),
+            room_external_id: Some("room".to_string()),
+            ..model::Snapshot::default()
+        };
+        for suffix in ["z", "a"] {
+            let canonical = format!("canonical-{suffix}");
+            snapshot.participants.insert(
+                canonical.clone(),
+                model::Participant {
+                    id: canonical,
+                    external_id: format!("external-{suffix}"),
+                },
+            );
+        }
+        for (id, owner) in [("video", "canonical-a"), ("orphan", "absent-canonical")] {
+            snapshot.publications.insert(
+                id.to_string(),
+                model::Publication {
+                    id: id.to_string(),
+                    participant_id: owner.to_string(),
+                    kind: model::MediaKind::Video,
+                    label: "camera".to_string(),
+                },
+            );
+        }
         let projected = Snapshot::from(&snapshot);
+        assert_eq!(projected.participant_id.as_deref(), Some("local-user"));
+        assert_eq!(projected.room_id.as_deref(), Some("room"));
         assert_eq!(
             projected
                 .catalog
                 .participants
-                .into_iter()
-                .map(|value| value.id)
+                .iter()
+                .map(|value| value.participant_id.as_str())
                 .collect::<Vec<_>>(),
-            vec!["a".to_string(), "z".to_string()],
+            vec!["external-a", "external-z"],
+        );
+        assert_eq!(
+            projected.catalog.publications,
+            vec![Publication {
+                id: "video".to_string(),
+                participant_id: "external-a".to_string(),
+                kind: MediaKind::Video,
+                label: "camera".to_string(),
+            }]
+        );
+        snapshot.participant_id = Some("replacement-canonical-self".to_string());
+        let mut participant = snapshot.participants.remove("canonical-a").unwrap();
+        participant.id = "replacement-canonical-a".to_string();
+        snapshot
+            .participants
+            .insert(participant.id.clone(), participant);
+        let mut publication = snapshot.publications.remove("video").unwrap();
+        publication.id = "replacement-video".to_string();
+        publication.participant_id = "replacement-canonical-a".to_string();
+        snapshot
+            .publications
+            .insert(publication.id.clone(), publication);
+        let reconnected = Snapshot::from(&snapshot);
+        assert_eq!(reconnected.participant_id, projected.participant_id);
+        let mut participants = reconnected.catalog.participants;
+        participants.sort_by(|left, right| left.participant_id.cmp(&right.participant_id));
+        assert_eq!(participants, projected.catalog.participants);
+        assert_eq!(
+            reconnected.catalog.publications,
+            vec![Publication {
+                id: "replacement-video".to_string(),
+                participant_id: "external-a".to_string(),
+                kind: MediaKind::Video,
+                label: "camera".to_string(),
+            }]
         );
     }
 
     #[test]
     fn notification_conversion_keeps_topic_payload_and_identity() {
-        let notification = model::Notification::Topic(model::TopicNotification::Message(
-            model::TopicMessage::Ordered {
+        let notification =
+            model::Notification::Topic(model::TopicNotification::Message(model::TopicMessage {
                 topic: "chat".to_string(),
-                publisher_id: "participant".to_string(),
-                stream_id: 4,
+                mode: model::TopicMode::Ordered,
+                participant_id: "participant".to_string(),
+                data_track_id: "data-track".to_string(),
                 sequence: 9,
                 payload: vec![1, 2, 3],
-            },
-        ));
+            }));
         assert_eq!(
             Notification::from(notification),
             Notification::Topic {
                 notification: TopicNotification::Message {
-                    message: TopicMessage::Ordered {
+                    message: TopicMessage {
                         name: "chat".to_string(),
-                        publisher_id: "participant".to_string(),
-                        stream_id: 4,
+                        mode: TopicMode::Ordered,
+                        participant_id: "participant".to_string(),
+                        data_track_id: "data-track".to_string(),
                         sequence: 9,
                         payload: vec![1, 2, 3],
                     },
@@ -1223,7 +1218,6 @@ mod tests {
         let subscriber = TopicSubscriber {
             name: "chat".to_string(),
             mode: TopicMode::Ordered,
-            publisher_id: Some("participant".to_string()),
         };
         let publication = Publication {
             id: "participant/video".to_string(),
@@ -1238,10 +1232,9 @@ mod tests {
         let publisher_state = TopicPublisherState {
             publisher: publisher.clone(),
             connected: true,
-            stream_id: Some(4),
-            next_sequence: Some(9),
+            data_track_id: Some("data-track".to_string()),
+            next_sequence: 9,
             accepted_history: 3,
-            replay_messages: 2,
             queued_messages: 1,
             send_pending: true,
         };
@@ -1257,7 +1250,6 @@ mod tests {
             accepted_sends: 8,
             dropped_sends: 1,
             delivered_messages: 7,
-            resynchronizations: 2,
             channel_failures: 1,
         };
 
@@ -1283,7 +1275,7 @@ mod tests {
             },
         });
         let selector = TrackSelector {
-            participant_external_id: "web-sender".to_string(),
+            participant_id: "web-sender".to_string(),
             label: "camera".to_string(),
         };
         assert_ffi_round_trip(selector.clone());
@@ -1322,8 +1314,7 @@ mod tests {
             topic_subscribers: vec![subscriber],
         });
         assert_ffi_round_trip(Participant {
-            id: "participant".to_string(),
-            external_id: "user".to_string(),
+            participant_id: "user".to_string(),
         });
         assert_ffi_round_trip(publication.clone());
         assert_ffi_round_trip(failure.clone());
@@ -1338,15 +1329,13 @@ mod tests {
                 after_ms: 500,
             },
             generation: Some(3),
-            participant_id: Some("participant".to_string()),
-            participant_external_id: Some("user".to_string()),
-            room_external_id: Some("room".to_string()),
+            participant_id: Some("user".to_string()),
+            room_id: Some("room".to_string()),
             authorization_expires_at: Some(1_720_000_000),
             catalog: CatalogSnapshot {
                 revision: 2,
                 participants: vec![Participant {
-                    id: "participant".to_string(),
-                    external_id: "user".to_string(),
+                    participant_id: "user".to_string(),
                 }],
                 publications: vec![publication],
             },
@@ -1414,7 +1403,7 @@ mod tests {
         ] {
             assert_ffi_round_trip(value);
         }
-        for value in [TopicMode::Latest, TopicMode::Ordered] {
+        for value in [TopicMode::Latest, TopicMode::Lossy, TopicMode::Ordered] {
             assert_ffi_round_trip(value);
         }
         for value in [MediaKind::Video, MediaKind::Audio] {
@@ -1472,18 +1461,16 @@ mod tests {
         ] {
             assert_ffi_round_trip(value);
         }
-        assert_ffi_round_trip(TopicMessage::Latest {
-            name: "cursor".to_string(),
-            publisher_id: None,
-            payload: vec![1],
-        });
-        assert_ffi_round_trip(TopicMessage::Ordered {
-            name: "chat".to_string(),
-            publisher_id: "participant".to_string(),
-            stream_id: 3,
-            sequence: 4,
-            payload: vec![2],
-        });
+        for mode in [TopicMode::Latest, TopicMode::Lossy, TopicMode::Ordered] {
+            assert_ffi_round_trip(TopicMessage {
+                name: "chat".to_string(),
+                mode,
+                participant_id: "participant".to_string(),
+                data_track_id: "data-track".to_string(),
+                sequence: u64::MAX.saturating_sub(1),
+                payload: vec![2],
+            });
+        }
         let publisher = TopicPublisher {
             name: "chat".to_string(),
             mode: TopicMode::Ordered,
@@ -1491,23 +1478,25 @@ mod tests {
         let subscriber = TopicSubscriber {
             name: "chat".to_string(),
             mode: TopicMode::Ordered,
-            publisher_id: Some("participant".to_string()),
         };
         for value in [
             TopicNotification::SendAdmitted {
                 publisher: publisher.clone(),
                 operation_id: 1,
-                stream_id: Some(2),
-                sequence: Some(3),
+                data_track_id: "data-track".to_string(),
+                sequence: 3,
             },
             TopicNotification::SendDropped {
                 publisher: publisher.clone(),
                 reason: TopicDropReason::QueueFull,
             },
             TopicNotification::Message {
-                message: TopicMessage::Latest {
+                message: TopicMessage {
                     name: "chat".to_string(),
-                    publisher_id: Some("participant".to_string()),
+                    mode: TopicMode::Latest,
+                    data_track_id: "data-track".to_string(),
+                    participant_id: "participant".to_string(),
+                    sequence: 0,
                     payload: vec![1, 2],
                 },
             },
@@ -1515,14 +1504,14 @@ mod tests {
                 name: "chat".to_string(),
                 mode: TopicMode::Ordered,
                 publishing: false,
-                publisher_id: Some("participant".to_string()),
                 message: "closed".to_string(),
             },
-            TopicNotification::Resynchronized {
+            TopicNotification::RecoveryGap {
                 subscriber,
-                publisher_id: "participant".to_string(),
-                stream_id: 2,
-                next_sequence: 3,
+                participant_id: "participant".to_string(),
+                data_track_id: "data-track".to_string(),
+                expected_sequence: 2,
+                available_sequence: 3,
             },
         ] {
             assert_ffi_round_trip(value);

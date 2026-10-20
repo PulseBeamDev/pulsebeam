@@ -15,6 +15,7 @@ import {
   type RemoteMediaAttachment,
   type RemoteVideoTrack,
   type RemoteAudioTrack,
+  type TopicEvent,
 } from "../../web/index.js";
 
 // @ts-expect-error Managed activation is internal, not public construction.
@@ -69,7 +70,11 @@ const desired: AgentState = {
       playoutDelay: { mode: "fixed", minMs: 100, maxMs: 250 },
     },
   ],
-  audio: { pinned: ["publication-audio"], automatic: true },
+  audio: {
+    pinned: ["publication-audio"],
+    selected: [{ participantId: "alice", label: "microphone" }],
+    automatic: true,
+  },
   topics: [
     { name: "presence", mode: "latest", publish: true, subscribe: true },
     { name: "chat", mode: "ordered", subscribe: true },
@@ -147,14 +152,60 @@ if (discoveredVideo) {
   void [participant, label];
 }
 if (discoveredAudio) void discoveredAudio.label;
-const roomChat = agent.topic<{ message: string }>("chat", { mode: "reliable" });
+const roomChat = agent.topic<{ message: string }>("chat", { mode: "ordered" });
+agent.topic("chat", { mode: "latest" });
+agent.topic("chat", { mode: "lossy" });
 void roomChat.publish({ message: "hello" });
-const liveMessages: AsyncIterable<{ message: string }> = roomChat.subscribe();
+const liveMessages: AsyncIterable<TopicEvent<{ message: string }>> =
+  roomChat.subscribe();
 void liveMessages;
 // @ts-expect-error topic payload must match its declared type
 void roomChat.publish({ message: 42 });
-// @ts-expect-error public topic API selects reliable or unreliable, not core wire mode
-agent.topic("chat", { mode: "ordered" });
+// @ts-expect-error removed transport-named aliases cannot select a mode
+agent.topic("chat", { mode: "reliable" });
+// @ts-expect-error unreliable is not a delivery policy
+agent.topic("chat", { mode: "unreliable" });
+// @ts-expect-error topic mode is mandatory
+agent.topic("chat", {});
+// @ts-expect-error subscriptions are topic-wide, not publisher-scoped
+roomChat.subscribe({ publisherId: "alice" });
+const participantId: string | null = agent.participantId;
+const roomId: string | null = agent.roomId;
+const catalogParticipantId: string =
+  snapshot.catalog.participants[0].participantId;
+void [participantId, roomId, catalogParticipantId];
+// @ts-expect-error normal snapshots do not expose canonical participant IDs
+snapshot.catalog.participants[0].id;
+// @ts-expect-error removed identity alias
+snapshot.participantExternalId;
+// @ts-expect-error removed identity alias
+snapshot.roomExternalId;
+// @ts-expect-error removed Agent identity alias
+agent.participantExternalId;
+// @ts-expect-error removed Agent identity alias
+agent.roomExternalId;
+declare const topicEvent: TopicEvent<{ message: string }>;
+if (topicEvent.type === "message") {
+  const sequence: bigint = topicEvent.sequence;
+  const track: string = topicEvent.dataTrackId;
+  const sender: string = topicEvent.participantId;
+  const value: string = topicEvent.value.message;
+  void [sequence, track, sender, value];
+} else {
+  const expected: bigint = topicEvent.expectedSequence;
+  const available: bigint = topicEvent.availableSequence;
+  void [expected, available];
+  // @ts-expect-error gaps do not carry a pretend application message
+  topicEvent.value;
+}
+// @ts-expect-error no parallel publisher identity
+topicEvent.publisherId;
+// @ts-expect-error no parallel stream identity
+topicEvent.streamId;
+// @ts-expect-error no epoch identity
+topicEvent.streamEpoch;
+// @ts-expect-error continuity is an inline gap, not an application-frame flag
+topicEvent.resyncRequired;
 const replacement: Promise<void> = agent.replaceLocalTrack("a0", audioTrack, {
   contentHint: "speech",
   encodings: [],
@@ -173,6 +224,10 @@ const attachment: RemoteMediaAttachment = attachRemoteMedia(
 );
 attachment.setPublicationIds(["publication-audio"]);
 const participant = agent.remote.participant("alice");
+const remoteParticipantId: string = participant.participantId;
+void remoteParticipantId;
+// @ts-expect-error removed remote identity alias
+participant.externalId;
 const voice = participant.audio("microphone");
 const receiving: boolean = voice.receiving;
 voice.readWaveform(new Float32Array(2048));

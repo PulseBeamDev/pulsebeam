@@ -92,9 +92,19 @@ Camera and microphone controls enable or disable media handles rather than
 detaching sources. Ordinary room interactions retry audio playback if the browser
 has blocked it. Meet has no separate audio-unlock control.
 
-Meet predeclares chat and reaction publisher channels before connecting. Reliable
-topics use receiver-driven bounded recovery. A warning reports chat messages that
-may be missing after recovery; **Retry chat** retries a failed subscription.
+Meet uses `ordered` chat and `lossy` reactions. Chat uses finite, receiver-driven
+recovery and renders skipped ranges as inline notices before later messages;
+a warning also flags incomplete chat. **Retry chat** remounts a failed subscription,
+not a historical replay. Reactions are distinct transient events and may be lost
+or reordered.
+
+Sender identity comes from the server-authored event `participantId`, not JSON.
+Received-message keys use `(dataTrackId, sequence)`; payloads carry only chat or
+reaction content. Local optimistic chat rows are UI-owned because publications
+do not loop back. Successful send means local acceptance, not remote delivery.
+Reconnect restores topic interest but creates fresh data tracks and sequence
+spaces, without cross-publication recovery. Use matching server and SDK versions;
+this contract has no legacy-mode or mixed-wire compatibility path.
 
 ## Native reconnect limitation
 

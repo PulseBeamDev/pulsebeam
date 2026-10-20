@@ -306,7 +306,7 @@ mod tests {
         sink.publish_track_packet(
             Some(TrackHandle::default()),
             TrackPacket::Data {
-                lane: DataLane::Realtime,
+                lane: DataLane::Latest,
                 bytes: vec![1],
             },
         );
@@ -362,7 +362,7 @@ mod tests {
             sink.publish_track_packet(
                 Some(TrackHandle::default()),
                 TrackPacket::Data {
-                    lane: DataLane::Realtime,
+                    lane: DataLane::Latest,
                     bytes: vec![n],
                 },
             );
@@ -386,21 +386,21 @@ mod tests {
         sink.publish_track_packet(
             Some(key),
             TrackPacket::Data {
-                lane: DataLane::Realtime,
+                lane: DataLane::Latest,
                 bytes: vec![1],
             },
         );
         sink.publish_track_packet(
             Some(key),
             TrackPacket::Data {
-                lane: DataLane::Reliable,
+                lane: DataLane::Ordered,
                 bytes: vec![2],
             },
         );
         sink.publish_track_packet(
             Some(key),
             TrackPacket::Data {
-                lane: DataLane::Realtime,
+                lane: DataLane::Latest,
                 bytes: vec![3],
             },
         );
@@ -413,14 +413,14 @@ mod tests {
         assert!(matches!(
             pipeline.pop_packet().unwrap().1,
             TrackPacket::Data {
-                lane: DataLane::Realtime,
+                lane: DataLane::Latest,
                 ..
             }
         ));
         assert!(matches!(
             pipeline.pop_packet().unwrap().1,
             TrackPacket::Data {
-                lane: DataLane::Reliable,
+                lane: DataLane::Ordered,
                 ..
             }
         ));

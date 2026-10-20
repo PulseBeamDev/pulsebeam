@@ -728,8 +728,8 @@ mod tests {
             TrackKind::Data => {
                 let (lane, topic) = label
                     .strip_prefix("rel:")
-                    .map_or((crate::track::DataLane::Realtime, label), |topic| {
-                        (crate::track::DataLane::Reliable, topic)
+                    .map_or((crate::track::DataLane::Latest, label), |topic| {
+                        (crate::track::DataLane::Ordered, topic)
                     });
                 Track::data(meta, crate::track::Topic::for_test(topic), lane, None)
             }
@@ -776,7 +776,8 @@ mod tests {
         let other_publisher = topology
             .publish(track(TrackKind::Data, 2, 1, "chat"))
             .unwrap();
-        let selector = TrackSelector::data_topic(Some(participant(1)), "v1/rt/chat".to_string());
+        let selector =
+            TrackSelector::data_topic(Some(participant(1)), "v2/latest/chat".to_string());
         let _ = topology.subscribe(room(1), participant(3), selector, SelectionPolicy::All);
 
         assert_eq!(topology.matches(realtime_identity).count(), 1);

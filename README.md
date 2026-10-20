@@ -29,7 +29,7 @@ PulseBeam is opinionated about media handling to prioritize battery efficiency, 
 
 - **Video:** H.264 Baseline profile up to Level 4.1
 - **Audio:** Opus
-- **Data channels:** Native SDK signaling and reliable/unreliable topics are implemented. WHIP publishing is media-only.
+- **Data channels:** Native SDK signaling supports explicit `latest` state, `lossy` events, and `ordered` events with bounded recovery and inline gaps. Topic identity comes from Catalog data tracks. WHIP publishing is media-only.
 
 ## Development
 
@@ -100,7 +100,7 @@ the CLI's development tokens for production.
 4. Each tab should show its own participant identity, `Room demo`, a `connected`
    status, and a remote video tile in addition to its local camera. Select the
    remote tile to view the other participant's video. Send a message through
-   **Chat** to try a reliable topic.
+   **Chat** to try an ordered topic with bounded recovery.
 
 If **Join room** stays disabled, enable camera and microphone permissions and
 select **Retry** after a capture error. If admission fails, check that the server

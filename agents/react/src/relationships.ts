@@ -8,6 +8,7 @@ import {
   type LocalVideoTrack,
   type SenderConfig,
   type TopicCallbacks,
+  type TopicMode,
 } from "@pulsebeam/web";
 
 import type { ManagedAgent } from "@pulsebeam/web/internal/react";
@@ -68,8 +69,7 @@ export interface Agent
     | "connection"
     | "error"
     | "participantId"
-    | "participantExternalId"
-    | "roomExternalId"
+    | "roomId"
     | "authorizationExpiresAt"
     | "connect"
     | "disconnect"
@@ -80,10 +80,7 @@ export interface Agent
     audio(label: string): LocalAudio;
   };
   readonly remote: RemoteMedia;
-  topic<T>(
-    name: string,
-    options: { readonly mode: "reliable" | "unreliable" },
-  ): Topic<T>;
+  topic<T>(name: string, options: { readonly mode: TopicMode }): Topic<T>;
 }
 
 function senderConfig(
@@ -208,11 +205,8 @@ export function createReactAgent(raw: ManagedAgent): Agent {
     get participantId() {
       return raw.participantId;
     },
-    get participantExternalId() {
-      return raw.participantExternalId;
-    },
-    get roomExternalId() {
-      return raw.roomExternalId;
+    get roomId() {
+      return raw.roomId;
     },
     get authorizationExpiresAt() {
       return raw.authorizationExpiresAt;
@@ -225,10 +219,7 @@ export function createReactAgent(raw: ManagedAgent): Agent {
       video: (label: string) => local("video", label, videos),
       audio: (label: string) => local("audio", label, audios),
     }),
-    topic<T>(
-      name: string,
-      options: { readonly mode: "reliable" | "unreliable" },
-    ): Topic<T> {
+    topic<T>(name: string, options: { readonly mode: TopicMode }): Topic<T> {
       const imperative = raw.topic<T>(name, options);
       const key = `${options.mode}:${name}`;
       let component = topics.get(key) as Topic<T> | undefined;
@@ -239,12 +230,7 @@ export function createReactAgent(raw: ManagedAgent): Agent {
             const owner = {};
             const release = raw.claimRelationship(owner);
             const unsubscribe = raw.listenTopic<T>(name, options, {
-              onMessage: (value, metadata) =>
-                callbacks.current.onMessage(value, metadata),
-              onGap: (gap) => {
-                if (callbacks.current.onGap) callbacks.current.onGap(gap);
-                else console.warn("PulseBeam topic recovery gap", gap);
-              },
+              onEvent: (event) => callbacks.current.onEvent(event),
               onError: (error) => {
                 if (callbacks.current.onError) callbacks.current.onError(error);
                 else console.error("PulseBeam topic consumer failed", error);

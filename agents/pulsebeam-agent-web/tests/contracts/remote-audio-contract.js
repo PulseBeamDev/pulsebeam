@@ -89,15 +89,14 @@
       id,
       label,
       kind: "audio",
-      participantId: "remote",
+      participantId: "alice",
     });
     let snapshot = {
       connection: "connected",
       participantId: "self",
-      participantExternalId: "self",
       catalog: {
         revision: 1,
-        participants: [{ id: "remote", externalId: "alice" }],
+        participants: [{ participantId: "alice" }],
         publications: [publication("A", "first"), publication("B", "second")],
       },
       mapping: {

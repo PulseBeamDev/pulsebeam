@@ -5,8 +5,7 @@ import { RemoteCatalog } from "../../unit-javascript/remote-catalog.js";
 function fixture(capacity = 2) {
   let snapshot = {
     connection: "disconnected",
-    participantId: "self-id",
-    participantExternalId: "self",
+    participantId: "self",
     catalog: { participants: [], publications: [] },
     mapping: { video: [], audio: [] },
     tracks: {},
@@ -32,21 +31,21 @@ function fixture(capacity = 2) {
     },
   };
 }
-const alice = { id: "alice-id", externalId: "alice" };
+const alice = { participantId: "alice" };
 const camera = {
   id: "camera-id",
-  participantId: alice.id,
+  participantId: alice.participantId,
   kind: "video",
   label: "camera",
 };
 const microphone = {
   id: "microphone-id",
-  participantId: alice.id,
+  participantId: alice.participantId,
   kind: "audio",
   label: "microphone",
 };
 
-test("catalog reconciles external identity and preserves handles across absence and canonical ID replacement", () => {
+test("catalog preserves external-identity handles across absence and publication replacement", () => {
   const f = fixture();
   const aliceHandle = f.catalog.participant("alice");
   const video = aliceHandle.video("camera");
@@ -73,10 +72,7 @@ test("catalog reconciles external identity and preserves handles across absence 
   f.update([], []);
   assert.equal(video.active, false);
   assert.equal(notifications, 1);
-  f.update(
-    [{ ...alice, id: "new-alice" }],
-    [{ ...camera, id: "new-camera", participantId: "new-alice" }],
-  );
+  f.update([alice], [{ ...camera, id: "new-camera" }]);
   assert.equal(f.catalog.videoTracks[0], video);
   assert.equal(f.catalog.participants[0], aliceHandle);
   assert.equal(video.active, true);
@@ -119,20 +115,20 @@ test("audio receiving follows mapping, not catalog or media availability, and cl
   assert.ok(spectrum.every((value) => value === -Infinity));
 });
 
-test("self is excluded by either canonical or external identity", () => {
+test("self is excluded by admitted application participant identity", () => {
   const f = fixture();
   f.update(
+    [{ participantId: "self" }, alice],
     [
-      { id: "self-id", externalId: "old-self" },
-      { id: "new-self", externalId: "self" },
-    ],
-    [
-      { ...camera, participantId: "self-id" },
-      { ...microphone, participantId: "new-self" },
+      { ...camera, id: "self-camera", participantId: "self" },
+      { ...microphone, participantId: "self" },
+      camera,
     ],
   );
-  assert.deepEqual(f.catalog.participants, []);
-  assert.deepEqual(f.catalog.videoTracks, []);
+  assert.deepEqual(f.catalog.participants, [f.catalog.participant("alice")]);
+  assert.deepEqual(f.catalog.videoTracks, [
+    f.catalog.participant("alice").video("camera"),
+  ]);
   assert.deepEqual(f.catalog.audioTracks, []);
   f.catalog.close();
 });

@@ -184,12 +184,10 @@ async fn run_peer(
             core_ffi::TopicSubscriber {
                 name: latest.name.clone(),
                 mode: latest.mode,
-                publisher_id: None,
             },
             core_ffi::TopicSubscriber {
                 name: ordered.name.clone(),
                 mode: ordered.mode,
-                publisher_id: None,
             },
         ],
         ..Default::default()
@@ -361,7 +359,7 @@ async fn wait_connected(
                 .topics
                 .publishers
                 .iter()
-                .all(|publisher| publisher.connected)
+                .all(|publisher| publisher.connected && publisher.data_track_id.is_some())
                 && snapshot
                     .topics
                     .subscribers
@@ -390,10 +388,12 @@ async fn wait_ordered_send(
             let SnapshotUpdate::Snapshot { snapshot } = snapshots.next().await else {
                 anyhow::bail!("native snapshot stream closed")
             };
-            if snapshot.topics.publishers.iter().any(|state| {
-                state.publisher == *publisher
-                    && state.next_sequence.is_some_and(|next| next > previous)
-            }) {
+            if snapshot
+                .topics
+                .publishers
+                .iter()
+                .any(|state| state.publisher == *publisher && state.next_sequence > previous)
+            {
                 return Ok(());
             }
         }
@@ -436,7 +436,7 @@ async fn prime_ordered_topic(
         .publishers
         .iter()
         .find(|state| state.publisher == *publisher)
-        .and_then(|state| state.next_sequence)
+        .map(|state| state.next_sequence)
         .ok_or_else(|| anyhow::anyhow!("native ordered topic publisher is not connected"))?;
     for sequence in 0..2 {
         agent
@@ -559,7 +559,7 @@ async fn exchange(
         .publishers
         .iter()
         .find(|state| state.publisher == *ordered)
-        .and_then(|state| state.next_sequence)
+        .map(|state| state.next_sequence)
         .ok_or_else(|| anyhow::anyhow!("native ordered topic publisher is not connected"))?;
     agent
         .send_topic(ordered.clone(), format!("ordered-{round}-0").into_bytes())
@@ -638,13 +638,14 @@ async fn exchange(
                             notification: core_ffi::Notification::Topic {
                                 notification: core_ffi::TopicNotification::Message { message }
                             }
-                        }} => match message {
-                            core_ffi::TopicMessage::Latest { .. } => {
+                        }} => match message.mode {
+                            core_ffi::TopicMode::Latest => {
                                 latest_messages = latest_messages.saturating_add(1);
                             }
-                            core_ffi::TopicMessage::Ordered { .. } => {
+                            core_ffi::TopicMode::Ordered => {
                                 ordered_messages = ordered_messages.saturating_add(1);
                             }
+                            core_ffi::TopicMode::Lossy => anyhow::bail!("undeclared lossy mode delivered to native fixture"),
                         },
                         EventUpdate::Lagged { skipped } => {
                             anyhow::bail!("native event receiver dropped {skipped} events")

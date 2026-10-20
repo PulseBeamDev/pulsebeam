@@ -1,7 +1,6 @@
 use super::signaling_v1::{AppliedInput, NativeSession};
 use ahash::{HashMap, HashMapExt, HashSet, HashSetExt};
-use pulsebeam_proto::prelude::Message;
-use pulsebeam_proto::reliable::{RelControl, rel_control};
+use pulsebeam_proto::topic::TopicFrame;
 use pulsebeam_runtime::net::{self};
 use std::time::Duration;
 use str0m::bwe::BweKind;
@@ -531,6 +530,17 @@ impl Participant {
                     );
                     return;
                 };
+                let Ok(frame) = TopicFrame::decode_bounded(&bytes) else {
+                    return;
+                };
+                let Some(publication) = self.data.publication(channel) else {
+                    return;
+                };
+                if !frame.is_subscriber_control()
+                    || frame.data_track_id() != Some(publication.id.as_str().as_str())
+                {
+                    return;
+                }
                 self.enqueue_fanout(TransportMutation::Data { channel, bytes });
             }
             None => {
@@ -982,6 +992,12 @@ impl Participant {
                 }
                 match (channel.lane, channel.direction) {
                     (lane, DataTrackDirection::Publish) => {
+                        let Ok(frame) = TopicFrame::decode_bounded(data.data.as_ref()) else {
+                            return;
+                        };
+                        if !self.data.accepts_publisher_frame(data.id, &frame) {
+                            return;
+                        }
                         events.publish_track_packet(
                             self.upstream.data.published_stream(data.id),
                             TrackPacket::Data {
@@ -990,26 +1006,26 @@ impl Participant {
                             },
                         );
                     }
-                    (DataLane::Reliable, DataTrackDirection::Subscribe) => {
-                        let Ok(control) = RelControl::decode(data.data.as_ref()) else {
+                    (DataLane::Ordered, DataTrackDirection::Subscribe) => {
+                        let Ok(control) = TopicFrame::decode_bounded(data.data.as_ref()) else {
                             return;
                         };
-                        let publisher = match control.msg {
-                            Some(rel_control::Msg::Nack(nack)) => nack.publisher_id,
-                            Some(rel_control::Msg::Probe(probe)) => probe.publisher_id,
-                            None => return,
-                        };
-                        let Ok(publisher) = publisher.parse::<crate::entity::ParticipantId>()
+                        if !control.is_subscriber_control() {
+                            return;
+                        }
+                        let Some(track_id) = control
+                            .data_track_id()
+                            .and_then(|id| id.parse::<TrackId>().ok())
                         else {
                             return;
                         };
                         if let Some(stream) =
                             self.downstream
                                 .data
-                                .subscribed_stream(data.id, &publisher, &|key| {
+                                .subscribed_stream(data.id, &track_id, &|key| {
                                     self.downstream
                                         .track_candidate(key)
-                                        .map(|entry| entry.participant_id)
+                                        .map(|entry| entry.track_id)
                                 })
                         {
                             events.request_reverse(
@@ -1018,7 +1034,7 @@ impl Participant {
                             );
                         }
                     }
-                    (DataLane::Realtime, DataTrackDirection::Subscribe) => {}
+                    (DataLane::Latest | DataLane::Lossy, DataTrackDirection::Subscribe) => {}
                 }
             }
             Event::StreamPaused(stream) => {

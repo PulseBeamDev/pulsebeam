@@ -14,6 +14,7 @@
 //! the two sides picked different names is not a boundary.
 
 use super::common::{LocalNodeSim, Participant, Room, Step};
+use pulsebeam_agent_native::agent_core::TopicMode;
 use std::time::Duration;
 
 /// A participant discovers publishers in its own room and nowhere else.
@@ -158,38 +159,42 @@ fn unreliable_data_does_not_cross_rooms_test() {
         )
         .run(vec![
             Step::DeclarePublishTopic {
+                mode: TopicMode::Latest,
                 description: "Alpha publishes the topic",
                 participant: "alpha_pub",
                 topic: "shared_name",
             },
             Step::DeclarePublishTopic {
+                mode: TopicMode::Latest,
                 description: "Beta publishes a topic of the same name",
                 participant: "beta_pub",
                 topic: "shared_name",
             },
             Step::DeclareSubscribeTopic {
+                mode: TopicMode::Latest,
                 description: "Alpha subscribes unscoped - every publisher on the topic",
                 participant: "alpha_sub",
                 topic: "shared_name",
-                scoped_to: None,
             },
             Step::DeclareSubscribeTopic {
+                mode: TopicMode::Latest,
                 description: "Beta subscribes unscoped too",
                 participant: "beta_sub",
                 topic: "shared_name",
-                scoped_to: None,
             },
             Step::Run {
                 description: "Let both lanes come up",
                 duration: Duration::from_millis(500),
             },
             Step::PublishData {
+                mode: TopicMode::Latest,
                 description: "Alpha sends something only alpha should see",
                 participant: "alpha_pub",
                 topic: "shared_name",
                 data: b"alpha-secret",
             },
             Step::PublishData {
+                mode: TopicMode::Latest,
                 description: "Beta sends something only beta should see",
                 participant: "beta_pub",
                 topic: "shared_name",
@@ -248,22 +253,26 @@ fn reliable_data_does_not_cross_rooms_test() {
                 .with_participant(Participant::data_participant("beta_sub")),
         )
         .run(vec![
-            Step::DeclareOrderedPublisher {
+            Step::DeclarePublishTopic {
+                mode: TopicMode::Ordered,
                 description: "Alpha declares the ordered topic",
                 participant: "alpha_pub",
                 topic: "shared_name",
             },
-            Step::DeclareOrderedPublisher {
+            Step::DeclarePublishTopic {
+                mode: TopicMode::Ordered,
                 description: "Beta declares an ordered topic of the same name",
                 participant: "beta_pub",
                 topic: "shared_name",
             },
-            Step::DeclareOrderedSubscriber {
+            Step::DeclareSubscribeTopic {
+                mode: TopicMode::Ordered,
                 description: "Alpha subscribes",
                 participant: "alpha_sub",
                 topic: "shared_name",
             },
-            Step::DeclareOrderedSubscriber {
+            Step::DeclareSubscribeTopic {
+                mode: TopicMode::Ordered,
                 description: "Beta subscribes",
                 participant: "beta_sub",
                 topic: "shared_name",
@@ -272,13 +281,15 @@ fn reliable_data_does_not_cross_rooms_test() {
                 description: "Open the ordered channels",
                 duration: Duration::from_millis(500),
             },
-            Step::PublishOrdered {
+            Step::PublishData {
+                mode: TopicMode::Ordered,
                 description: "Alpha sends",
                 participant: "alpha_pub",
                 topic: "shared_name",
                 data: b"alpha-1",
             },
-            Step::PublishOrdered {
+            Step::PublishData {
+                mode: TopicMode::Ordered,
                 description: "Beta sends",
                 participant: "beta_pub",
                 topic: "shared_name",

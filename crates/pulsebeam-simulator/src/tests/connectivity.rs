@@ -1,4 +1,5 @@
 use super::common::{LinkProfile, LocalNodeSim, Participant, Room, Step, VideoQuality};
+use pulsebeam_agent_native::agent_core::TopicMode;
 use std::time::Duration;
 
 #[test]
@@ -420,21 +421,23 @@ fn ipv6_tcp_simulation_test() {
                 quality: VideoQuality::min_frames(50),
             },
             Step::DeclarePublishTopic {
+                mode: TopicMode::Latest,
                 description: "Alice declares a TCP data topic",
                 participant: "alice",
                 topic: "ipv6_tcp_topic",
             },
             Step::DeclareSubscribeTopic {
+                mode: TopicMode::Latest,
                 description: "Bob subscribes to the IPv6 TCP data topic",
                 participant: "bob",
                 topic: "ipv6_tcp_topic",
-                scoped_to: None,
             },
             Step::Run {
                 description: "Open the application data channel over IPv6 TCP",
                 duration: Duration::from_secs(1),
             },
             Step::PublishData {
+                mode: TopicMode::Latest,
                 description: "Alice sends one valid framed data payload",
                 participant: "alice",
                 topic: "ipv6_tcp_topic",
@@ -521,21 +524,23 @@ fn tcp_multi_shard_simulation_test() {
                 quality: VideoQuality::min_frames(50),
             },
             Step::DeclarePublishTopic {
+                mode: TopicMode::Latest,
                 description: "Alice declares a multi-shard TCP data topic",
                 participant: "alice",
                 topic: "tcp_topic",
             },
             Step::DeclareSubscribeTopic {
+                mode: TopicMode::Latest,
                 description: "Bob subscribes to the multi-shard TCP data topic",
                 participant: "bob",
                 topic: "tcp_topic",
-                scoped_to: None,
             },
             Step::Run {
                 description: "Open the multi-shard TCP data channel",
                 duration: Duration::from_secs(1),
             },
             Step::PublishData {
+                mode: TopicMode::Latest,
                 description: "Alice sends one multi-shard TCP data payload",
                 participant: "alice",
                 topic: "tcp_topic",

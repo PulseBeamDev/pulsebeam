@@ -5,8 +5,8 @@ use http_body_util::{BodyExt, Full};
 use hyper_util::{client::legacy::Client, rt::TokioExecutor};
 use pulsebeam_agent_native::agent_core::{
     AgentConfig, AudioSubscription, ConnectionState, DesiredState, MediaKind, MediaTopology,
-    PublicationIntent, TopicMessage, TopicMode, TopicNotification, TopicPublisher, TopicSend,
-    TopicSubscriber, VideoSubscription,
+    PublicationIntent, TopicMode, TopicNotification, TopicPublisher, TopicSend, TopicSubscriber,
+    VideoSubscription,
 };
 use pulsebeam_agent_native::{Agent, AgentEvent, Config, Host, MediaFrame, SimulcastLayer};
 use pulsebeam_core::identity::{ParticipantExternalId, RoomExternalId};
@@ -427,7 +427,7 @@ impl SimClientBuilder {
             video_operation: 0,
             discovered_tracks: HashSet::new(),
             remote_tracks: HashMap::new(),
-            received_data: Vec::new(),
+            topic_events: Vec::new(),
             media_kinds: HashMap::new(),
             video_rx,
             audio_rx,
@@ -1384,7 +1384,7 @@ pub struct ClientContext {
     keyframe_recovery: Arc<Mutex<KeyframeRecoveryProbe>>,
     pub discovered_tracks: HashSet<String>,
     pub remote_tracks: HashMap<String, String>,
-    pub received_data: Vec<(String, Vec<u8>)>,
+    pub topic_events: Vec<TopicNotification>,
     pub media_kinds: HashMap<String, (bool, bool)>,
     snapshots: tokio::sync::watch::Receiver<pulsebeam_agent_native::agent_core::Snapshot>,
     events: tokio::sync::broadcast::Receiver<AgentEvent>,
@@ -1450,13 +1450,9 @@ impl ClientContext {
         while let Ok(event) = self.events.try_recv() {
             match event {
                 AgentEvent::Core(pulsebeam_agent_native::agent_core::Notification::Topic(
-                    TopicNotification::Message(message),
-                )) => match message {
-                    TopicMessage::Latest { topic, payload, .. }
-                    | TopicMessage::Ordered { topic, payload, .. } => {
-                        self.received_data.push((topic, payload));
-                    }
-                },
+                    notification @ (TopicNotification::Message(_)
+                    | TopicNotification::RecoveryGap { .. }),
+                )) => self.topic_events.push(notification),
                 AgentEvent::RuntimeFailed(message) => anyhow::bail!(message),
                 _ => {}
             }
@@ -1626,20 +1622,19 @@ impl ClientContext {
             .topics
             .publishers
             .iter()
-            .any(|status| status.registration == registration && status.channel.is_some()))
+            .any(|status| {
+                status.registration == registration
+                    && status.channel.is_some()
+                    && status.data_track_id.is_some()
+            }))
     }
 
     pub async fn register_subscriber(
         &mut self,
         topic: String,
         mode: TopicMode,
-        publisher_id: Option<String>,
     ) -> anyhow::Result<bool> {
-        let registration = TopicSubscriber {
-            topic,
-            mode,
-            publisher_id,
-        };
+        let registration = TopicSubscriber { topic, mode };
         if !self.desired.topics.subscribers.contains(&registration) {
             let mut desired = self.desired.clone();
             desired.topics.subscribers.push(registration.clone());
@@ -1670,7 +1665,11 @@ impl ClientContext {
             .topics
             .publishers
             .iter()
-            .any(|status| status.registration == publisher && status.channel.is_some());
+            .any(|status| {
+                status.registration == publisher
+                    && status.channel.is_some()
+                    && status.data_track_id.is_some()
+            });
         if !ready {
             return Ok(false);
         }

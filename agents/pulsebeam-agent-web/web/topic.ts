@@ -6,6 +6,7 @@ import type {
   TopicRegistration,
   TopicCallbacks,
   TopicConsumerError,
+  TopicEvent,
 } from "./types.js";
 
 const encoder = new TextEncoder();
@@ -17,18 +18,60 @@ type Entry = {
   name: string;
   mode: TopicMode;
   publisher: boolean;
+  pendingPublishes: number;
   subscribers: Set<{ close(): void }>;
 };
 
+function requireFields(value: object, allowed: readonly string[]): void {
+  if (Object.keys(value).some((field) => !allowed.includes(field)))
+    throw new TypeError("unknown topic option");
+}
+
 type Pending<T> = {
-  resolve: (value: IteratorResult<T>) => void;
+  resolve: (value: IteratorResult<TopicEvent<T>>) => void;
   reject: (reason: unknown) => void;
 };
 
-class TopicIterator<T> implements AsyncIterableIterator<T> {
+function decodeEvent<T>(
+  event: AgentEvent,
+  entry: Entry,
+): TopicEvent<T> | undefined {
+  if (!("topic" in event) || event.topic !== entry.name) return;
+  if (event.type === "topic-message" && event.mode === entry.mode) {
+    return Object.freeze({
+      type: "message",
+      dataTrackId: event.dataTrackId,
+      sequence: event.sequence,
+      participantId: event.participantId,
+      topic: event.topic,
+      value: JSON.parse(decoder.decode(event.payload)) as T,
+    });
+  }
+  if (event.type === "topic-recovery-gap" && entry.mode === "ordered") {
+    return Object.freeze({
+      type: "gap",
+      dataTrackId: event.dataTrackId,
+      participantId: event.participantId,
+      topic: event.topic,
+      expectedSequence: event.expectedSequence,
+      availableSequence: event.availableSequence,
+    });
+  }
+}
+
+function channelFailure(event: AgentEvent, entry: Entry): boolean {
+  return (
+    event.type === "topic-channel-failed" &&
+    event.direction === "subscribe" &&
+    event.topic === entry.name &&
+    event.mode === entry.mode
+  );
+}
+
+class TopicIterator<T> implements AsyncIterableIterator<TopicEvent<T>> {
   readonly #registry: TopicRegistry;
   readonly #entry: Entry;
-  readonly #queue: T[] = [];
+  readonly #queue: TopicEvent<T>[] = [];
   readonly #pending: Pending<T>[] = [];
   readonly #unsubscribe: () => void;
   readonly #signal?: AbortSignal;
@@ -43,26 +86,31 @@ class TopicIterator<T> implements AsyncIterableIterator<T> {
     signal?.addEventListener("abort", this.#abort, { once: true });
   }
 
-  [Symbol.asyncIterator](): AsyncIterableIterator<T> {
+  [Symbol.asyncIterator](): AsyncIterableIterator<TopicEvent<T>> {
     return this;
   }
 
-  next(): Promise<IteratorResult<T>> {
+  next(): Promise<IteratorResult<TopicEvent<T>>> {
     if (this.#failure !== undefined) return Promise.reject(this.#failure);
     if (this.#queue.length > 0)
       return Promise.resolve({ value: this.#queue.shift()!, done: false });
     if (this.#closed) return Promise.resolve({ value: undefined, done: true });
+    if (this.#pending.length === MAX_BUFFERED) {
+      const error = new RangeError("topic consumer has too many pending reads");
+      this.close(error);
+      return Promise.reject(error);
+    }
     return new Promise((resolve, reject) =>
       this.#pending.push({ resolve, reject }),
     );
   }
 
-  async return(): Promise<IteratorResult<T>> {
+  async return(): Promise<IteratorResult<TopicEvent<T>>> {
     this.close();
     return { value: undefined, done: true };
   }
 
-  async throw(error: unknown): Promise<IteratorResult<T>> {
+  async throw(error: unknown): Promise<IteratorResult<TopicEvent<T>>> {
     this.close(error);
     throw error;
   }
@@ -74,7 +122,7 @@ class TopicIterator<T> implements AsyncIterableIterator<T> {
     this.#queue.length = 0;
     this.#unsubscribe();
     this.#signal?.removeEventListener("abort", this.#abort);
-    this.#registry.release(this.#entry, this as TopicIterator<unknown>);
+    this.#registry.release(this.#entry, this);
     for (const pending of this.#pending.splice(0)) {
       if (error !== undefined) pending.reject(error);
       else pending.resolve({ value: undefined, done: true });
@@ -83,30 +131,80 @@ class TopicIterator<T> implements AsyncIterableIterator<T> {
 
   readonly #abort = (): void => this.close();
 
-  readonly #event = (event: AgentEvent): void => {
+  readonly #event = (raw: AgentEvent): void => {
+    if (this.#closed) return;
     if (
-      this.#closed ||
-      event.type !== "topic-message" ||
-      event.topic !== this.#entry.name ||
-      event.mode !== this.#entry.mode
-    )
+      channelFailure(raw, this.#entry) &&
+      raw.type === "topic-channel-failed"
+    ) {
+      this.close(new Error(raw.message));
       return;
-    let value: T;
+    }
+    let event: TopicEvent<T> | undefined;
     try {
-      value = JSON.parse(decoder.decode(event.payload)) as T;
+      event = decodeEvent<T>(raw, this.#entry);
     } catch (error) {
       this.close(error);
       return;
     }
+    if (!event) return;
     const pending = this.#pending.shift();
     if (pending) {
-      pending.resolve({ value, done: false });
-    } else {
-      if (this.#entry.mode === "latest") this.#queue.length = 0;
-      if (this.#queue.length === MAX_BUFFERED) this.#queue.shift();
-      this.#queue.push(value);
+      pending.resolve({ value: event, done: false });
+      return;
     }
+    if (this.#entry.mode === "latest") {
+      const previous = this.#queue.findIndex(
+        (queued) => queued.dataTrackId === event.dataTrackId,
+      );
+      if (previous !== -1) this.#queue.splice(previous, 1);
+    }
+    if (this.#queue.length === MAX_BUFFERED) {
+      if (this.#entry.mode === "lossy") this.#queue.shift();
+      else if (this.#entry.mode === "latest") {
+        this.close(
+          new RangeError("topic consumer cannot retain all latest tracks"),
+        );
+        return;
+      }
+    }
+    this.#queue.push(event);
+    if (this.#queue.length > MAX_BUFFERED) this.#compactOrdered();
   };
+
+  #compactOrdered(): void {
+    const firstByTrack = new Map<string, number>();
+    for (let second = 0; second < this.#queue.length; second += 1) {
+      const later = this.#queue[second]!;
+      const first = firstByTrack.get(later.dataTrackId);
+      if (first === undefined) {
+        firstByTrack.set(later.dataTrackId, second);
+        continue;
+      }
+      const earlier = this.#queue[first]!;
+      const expectedSequence =
+        earlier.type === "gap" ? earlier.expectedSequence : earlier.sequence;
+      const end =
+        later.type === "gap" ? later.availableSequence : later.sequence + 1n;
+      const availableSequence =
+        earlier.type === "gap" && earlier.availableSequence > end
+          ? earlier.availableSequence
+          : end;
+      this.#queue[first] = Object.freeze({
+        type: "gap",
+        dataTrackId: earlier.dataTrackId,
+        participantId: earlier.participantId,
+        topic: earlier.topic,
+        expectedSequence,
+        availableSequence,
+      });
+      this.#queue.splice(second, 1);
+      return;
+    }
+    this.close(
+      new RangeError("topic consumer overflow cannot retain all track gaps"),
+    );
+  }
 }
 
 export class TopicRegistry {
@@ -131,16 +229,14 @@ export class TopicRegistry {
     this.#onChange = onChange;
   }
 
-  topic<T>(
-    name: string,
-    options: { readonly mode: "reliable" | "unreliable" },
-  ): Topic<T> {
+  topic<T>(name: string, options: { readonly mode: TopicMode }): Topic<T> {
     if (this.#closed) throw new Error("agent is closed");
-    if (!/^[A-Za-z0-9_-]{1,85}$/.test(name))
+    if (typeof name !== "string" || !/^[A-Za-z0-9_-]{1,85}$/.test(name))
       throw new TypeError("invalid topic name");
-    if (options.mode !== "reliable" && options.mode !== "unreliable")
+    if (!["latest", "lossy", "ordered"].includes(options?.mode))
       throw new TypeError("invalid topic mode");
-    const mode: TopicMode = options.mode === "reliable" ? "ordered" : "latest";
+    requireFields(options, ["mode"]);
+    const mode = options.mode;
     const key = `${mode}:${name}`;
     const existing = this.#facades.get(key);
     if (existing) return existing as Topic<T>;
@@ -148,6 +244,7 @@ export class TopicRegistry {
       name,
       mode,
       publisher: false,
+      pendingPublishes: 0,
       subscribers: new Set(),
     };
     this.#entries.set(key, entry);
@@ -160,25 +257,39 @@ export class TopicRegistry {
         const payload = encoder.encode(serialized);
         if (payload.byteLength > MAX_PAYLOAD)
           throw new RangeError("topic payload exceeds 65536 bytes");
+        if (entry.pendingPublishes === MAX_BUFFERED)
+          throw new RangeError("topic publish admission queue is full");
         if (!entry.publisher) {
           entry.publisher = true;
-          this.#sync();
+          try {
+            this.#sync();
+          } catch (error) {
+            entry.publisher = false;
+            throw error;
+          }
         }
-        await this.#send(name, mode, payload);
+        entry.pendingPublishes += 1;
+        try {
+          await this.#send(name, mode, payload);
+        } finally {
+          entry.pendingPublishes -= 1;
+        }
       },
-      subscribe: (subscriptionOptions?: {
+      subscribe: (options?: {
         readonly signal?: AbortSignal;
-      }): AsyncIterable<T> => {
+      }): AsyncIterable<TopicEvent<T>> => {
         if (this.#closed) throw new Error("agent is closed");
-        if (subscriptionOptions?.signal?.aborted)
+        if (options !== undefined) requireFields(options, ["signal"]);
+        if (options?.signal?.aborted)
           return { async *[Symbol.asyncIterator]() {} };
-        const iterator = new TopicIterator<T>(
-          this,
-          entry,
-          subscriptionOptions?.signal,
-        );
-        entry.subscribers.add(iterator as TopicIterator<unknown>);
-        this.#sync();
+        const iterator = new TopicIterator<T>(this, entry, options?.signal);
+        entry.subscribers.add(iterator);
+        try {
+          this.#sync();
+        } catch (error) {
+          iterator.close();
+          throw error;
+        }
         return iterator;
       },
     });
@@ -188,12 +299,18 @@ export class TopicRegistry {
 
   listen<T>(
     name: string,
-    options: { readonly mode: "reliable" | "unreliable" },
+    options: { readonly mode: TopicMode },
     callbacks: TopicCallbacks<T>,
   ): () => void {
+    requireFields(callbacks, ["onEvent", "onError"]);
+    if (
+      typeof callbacks.onEvent !== "function" ||
+      (callbacks.onError !== undefined &&
+        typeof callbacks.onError !== "function")
+    )
+      throw new TypeError("invalid topic callbacks");
     this.topic<T>(name, options);
-    const mode = options.mode === "reliable" ? "ordered" : "latest";
-    const entry = this.#entries.get(`${mode}:${name}`)!;
+    const entry = this.#entries.get(`${options.mode}:${name}`)!;
     let live = true;
     const report = (error: TopicConsumerError) => {
       if (callbacks.onError) callbacks.onError(error);
@@ -207,44 +324,42 @@ export class TopicRegistry {
         this.release(entry, consumer);
       },
     };
-    const unsubscribe = this.agent.subscribeEvents((event) => {
-      if (!live || !("topic" in event) || event.topic !== name) return;
-      if (event.type === "topic-recovery-gap" && mode === "ordered") {
-        if (callbacks.onGap) callbacks.onGap(event);
-        else console.warn("PulseBeam topic recovery gap", event);
-      } else if (
-        event.type === "topic-channel-failed" &&
-        event.direction === "subscribe" &&
-        event.mode === mode
-      ) {
-        report({ code: "channel-failed", event });
-      } else if (event.type === "topic-message" && event.mode === mode) {
-        let value: T;
-        try {
-          value = JSON.parse(decoder.decode(event.payload)) as T;
-        } catch (cause) {
-          consumer.close();
-          report({ code: "decode-failed", topic: name, cause });
-          return;
-        }
-        callbacks.onMessage(value, { publisherId: event.publisherId });
+    const unsubscribe = this.agent.subscribeEvents((raw) => {
+      if (!live) return;
+      if (channelFailure(raw, entry) && raw.type === "topic-channel-failed") {
+        consumer.close();
+        report({ code: "channel-failed", event: raw });
+        return;
       }
+      let event: TopicEvent<T> | undefined;
+      try {
+        event = decodeEvent<T>(raw, entry);
+      } catch (cause) {
+        consumer.close();
+        report({ code: "decode-failed", topic: name, cause });
+        return;
+      }
+      if (event) callbacks.onEvent(event);
     });
     entry.subscribers.add(consumer);
-    this.#sync();
+    try {
+      this.#sync();
+    } catch (error) {
+      consumer.close();
+      throw error;
+    }
     return consumer.close;
   }
 
-  release(entry: Entry, iterator: { close(): void }): void {
-    if (!entry.subscribers.delete(iterator)) return;
-    this.#sync();
+  release(entry: Entry, consumer: { close(): void }): void {
+    if (entry.subscribers.delete(consumer)) this.#sync();
   }
 
   close(): void {
     if (this.#closed) return;
     this.#closed = true;
     for (const entry of this.#entries.values())
-      for (const iterator of [...entry.subscribers]) iterator.close();
+      for (const consumer of [...entry.subscribers]) consumer.close();
     this.#entries.clear();
     this.#facades.clear();
   }
