@@ -250,6 +250,7 @@ pub struct Snapshot {
     pub audio_mapping: BTreeMap<u32, String>,
     pub participants: BTreeMap<String, Participant>,
     pub publications: BTreeMap<String, Publication>,
+    pub remote_tracks: BTreeMap<String, crate::RemoteTrack>,
     pub topics: TopicSnapshot,
     pub terminal_failure: Option<Failure>,
 }
@@ -271,6 +272,7 @@ impl Default for Snapshot {
             audio_mapping: BTreeMap::new(),
             participants: BTreeMap::new(),
             publications: BTreeMap::new(),
+            remote_tracks: BTreeMap::new(),
             topics: TopicSnapshot::default(),
             terminal_failure: None,
         }

@@ -176,11 +176,52 @@ pub struct Publication {
     pub label: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum TrackSpec {
+    Video { label: String },
+    Audio { label: String },
+    Data { label: String, delivery: TopicMode },
+}
+
+impl From<model::TrackSpec> for TrackSpec {
+    fn from(value: model::TrackSpec) -> Self {
+        match value {
+            model::TrackSpec::Video { label } => Self::Video { label },
+            model::TrackSpec::Audio { label } => Self::Audio { label },
+            model::TrackSpec::Data { label, delivery } => Self::Data {
+                label,
+                delivery: delivery.into(),
+            },
+        }
+    }
+}
+
+impl From<TrackSpec> for model::TrackSpec {
+    fn from(value: TrackSpec) -> Self {
+        match value {
+            TrackSpec::Video { label } => Self::Video { label },
+            TrackSpec::Audio { label } => Self::Audio { label },
+            TrackSpec::Data { label, delivery } => Self::Data {
+                label,
+                delivery: delivery.into(),
+            },
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct RemoteTrack {
+    pub id: String,
+    pub participant_id: String,
+    pub spec: TrackSpec,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct CatalogSnapshot {
     pub revision: u64,
     pub participants: Vec<Participant>,
     pub publications: Vec<Publication>,
+    pub tracks: Vec<RemoteTrack>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
@@ -832,6 +873,15 @@ impl From<&model::Snapshot> for Snapshot {
             authorization_expires_at: value.authorization_expires_at,
             catalog: CatalogSnapshot {
                 revision: value.catalog_revision,
+                tracks: value
+                    .remote_tracks
+                    .values()
+                    .map(|track| RemoteTrack {
+                        id: track.id.clone(),
+                        participant_id: track.participant_id.clone(),
+                        spec: track.spec.clone().into(),
+                    })
+                    .collect(),
                 participants: value
                     .participants
                     .values()
@@ -1338,6 +1388,14 @@ mod tests {
                     participant_id: "user".to_string(),
                 }],
                 publications: vec![publication],
+                tracks: vec![RemoteTrack {
+                    id: "data-track".into(),
+                    participant_id: "alice".into(),
+                    spec: TrackSpec::Data {
+                        label: "chat".into(),
+                        delivery: TopicMode::Ordered,
+                    },
+                }],
             },
             mapping: MappingSnapshot {
                 accepted_intent_revision: 4,
@@ -1384,6 +1442,24 @@ mod tests {
 
     #[test]
     fn every_portable_enum_variant_survives_uniffi_serialization() {
+        for value in [
+            TrackSpec::Video {
+                label: "camera".into(),
+            },
+            TrackSpec::Audio {
+                label: "mic".into(),
+            },
+            TrackSpec::Data {
+                label: "events".into(),
+                delivery: TopicMode::Ordered,
+            },
+        ] {
+            assert_eq!(
+                TrackSpec::from(model::TrackSpec::from(value.clone())),
+                value
+            );
+            assert_ffi_round_trip(value);
+        }
         for value in [
             LogLevel::Off,
             LogLevel::Error,

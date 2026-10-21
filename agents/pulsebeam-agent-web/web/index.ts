@@ -24,6 +24,7 @@ export type {
   AudioSenderConfig,
   AudioDemand,
   CatalogSnapshot,
+  CatalogTrack,
   ConnectionState,
   FailureClass,
   FixedPlayoutDelay,

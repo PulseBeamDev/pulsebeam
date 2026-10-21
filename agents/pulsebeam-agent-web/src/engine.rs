@@ -259,6 +259,9 @@ impl<H: Host> Actor<H> {
     fn set_connected(&mut self, connected: bool) {
         let mut desired = self.desired.clone();
         if desired.connected == connected {
+            if connected {
+                self.turn(Input::Command(AgentCommand::Connect));
+            }
             return;
         }
         desired.connected = connected;

@@ -18,7 +18,7 @@ export class BrowserRuntime {
     version: 1n,
     desiredRevision: 0n,
     connection: "disconnected",
-    catalog: { revision: 0n },
+    catalog: { revision: 0n, tracks: [] },
     mapping: { acceptedIntentRevision: 0n, video: [], audio: [] },
     participants: [],
     publications: [],

@@ -18,6 +18,23 @@ SANS-I/O PulseBeam client agent.
 * Production diagnostics and per-agent filtering through the `log` facade
 * Shared UniFFI-compatible domain types
 
+## Track resources
+
+`TrackSpec` identifies media by kind and label, and data by label and delivery
+mode. Constructing or comparing a specification does not reserve transport
+capacity. `TrackResources` accounts for explicit publication, video presentation,
+audio playback, and data receive owners independently of connection generations.
+Give each declaration or stream lifetime a fresh `new_owner()` token, including
+when replaying a committed declaration. Releasing an owner cannot release a
+replacement owner's resource.
+
+The resource model projects publication intents, shared video demand, and topic
+registrations for the existing reconciler. Feed its receive queues only validated,
+deduplicated `TopicNotification` values from the topic transport. Queues preserve
+opaque bytes, participant filtering, delivery-mode bounds, and inline ordered
+gaps. Hosts own browser objects, pending reads, and physical teardown, not a
+second copy of this policy.
+
 ## Does not own
 
 * HTTP execution

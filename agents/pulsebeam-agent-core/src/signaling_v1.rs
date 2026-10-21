@@ -397,6 +397,21 @@ fn update_snapshot(
     snapshot.accepted_intent_revision = state.intent_revision;
     snapshot.video_mapping = state.video.clone();
     snapshot.audio_mapping = state.audio.clone();
+    snapshot.remote_tracks = state
+        .tracks
+        .iter()
+        .filter_map(|(id, track)| {
+            let participant = participants.get(&track.participant_id)?;
+            Some((
+                id.clone(),
+                crate::RemoteTrack {
+                    id: id.clone(),
+                    participant_id: participant.external_id.clone(),
+                    spec: crate::TrackSpec::from_catalog(track)?,
+                },
+            ))
+        })
+        .collect();
     snapshot.participants = participants;
     snapshot.publications = publications;
     snapshot.version = snapshot.version.saturating_add(1);
@@ -478,7 +493,21 @@ mod tests {
                         },
                         participant(),
                     ],
-                    vec![data.clone(), track()],
+                    vec![
+                        data.clone(),
+                        track(),
+                        wire::RemoteTrack {
+                            track_id: "peer-data-track".into(),
+                            participant_id: "peer".into(),
+                            ..data.clone()
+                        },
+                        wire::RemoteTrack {
+                            track_id: "peer-lossy-track".into(),
+                            participant_id: "peer".into(),
+                            mode: wire::TopicMode::Lossy as i32,
+                            ..data.clone()
+                        },
+                    ],
                 ),
                 "self",
                 "me",
@@ -498,6 +527,26 @@ mod tests {
         assert!(!observed.participants.contains_key("self"));
         assert_eq!(observed.publications.len(), 1);
         assert!(!observed.publications.contains_key("server-data-track"));
+        assert_eq!(observed.remote_tracks.len(), 3);
+        assert!(!observed.remote_tracks.contains_key("server-data-track"));
+        assert_eq!(
+            observed.remote_tracks["peer-data-track"],
+            crate::RemoteTrack {
+                id: "peer-data-track".into(),
+                participant_id: "alice".into(),
+                spec: crate::TrackSpec::Data {
+                    label: "x".repeat(85),
+                    delivery: crate::TopicMode::Ordered
+                },
+            }
+        );
+        assert_eq!(
+            observed.remote_tracks["peer-lossy-track"].spec,
+            crate::TrackSpec::Data {
+                label: "x".repeat(85),
+                delivery: crate::TopicMode::Lossy,
+            }
+        );
         assert!(observed.audio_mapping.is_empty());
         assert!(observed.video_mapping.is_empty());
 

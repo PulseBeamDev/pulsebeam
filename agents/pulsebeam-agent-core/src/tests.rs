@@ -1602,6 +1602,53 @@ fn rejected_reconnect_is_terminal_without_a_legacy_fallback() {
 }
 
 #[test]
+fn explicit_connect_retries_terminal_intent_but_not_an_in_flight_attempt() {
+    let mut agent = Agent::new(config()).unwrap();
+    let (failed_generation, operation) = begin_connect(&mut agent, desired(1), channel(12));
+    agent.command(AgentCommand::Connect).unwrap();
+    assert!(agent.next_effect().is_none());
+    agent
+        .handle(HostEvent::Http(HttpEvent::Response {
+            operation,
+            response: HttpResponse {
+                status: 401,
+                headers: vec![],
+                body: vec![],
+            },
+        }))
+        .unwrap();
+    assert_eq!(
+        next_effect(&mut agent),
+        Effect::Rtc(RtcEffect::Close {
+            generation: failed_generation
+        })
+    );
+    assert_eq!(
+        agent.snapshot().connection,
+        ConnectionState::TerminalFailure
+    );
+    agent.command(AgentCommand::Connect).unwrap();
+    assert!(
+        matches!(next_effect(&mut agent), Effect::Rtc(RtcEffect::CreateOffer { generation, .. }) if generation != failed_generation)
+    );
+    assert_eq!(agent.snapshot().terminal_failure, None);
+    agent.command(AgentCommand::Connect).unwrap();
+    assert!(agent.next_effect().is_none());
+}
+
+#[test]
+fn explicit_connect_establishes_connected_intent_from_idle() {
+    let mut agent = Agent::new(config()).unwrap();
+    agent.command(AgentCommand::Connect).unwrap();
+    assert!(matches!(
+        next_effect(&mut agent),
+        Effect::Rtc(RtcEffect::CreateOffer { .. })
+    ));
+    agent.command(AgentCommand::Connect).unwrap();
+    assert!(agent.next_effect().is_none());
+}
+
+#[test]
 fn authorization_is_latched_across_incidental_updates_until_explicit_reconnect() {
     let mut agent = Agent::new(config()).unwrap();
     let (failed_generation, operation) = begin_connect(&mut agent, desired(1), channel(12));

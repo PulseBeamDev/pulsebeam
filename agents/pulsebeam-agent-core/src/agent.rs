@@ -38,6 +38,7 @@ macro_rules! agent_log {
 pub enum AgentCommand {
     ReplaceDesired(DesiredState),
     RenewAuthorization(String),
+    Connect,
     Reconnect,
     SendTopic(TopicSend),
 }
@@ -50,6 +51,7 @@ impl core::fmt::Debug for AgentCommand {
                 .field(desired)
                 .finish(),
             Self::RenewAuthorization(_) => formatter.write_str("RenewAuthorization([REDACTED])"),
+            Self::Connect => formatter.write_str("Connect"),
             Self::Reconnect => formatter.write_str("Reconnect"),
             Self::SendTopic(send) => formatter.debug_tuple("SendTopic").field(send).finish(),
         }
@@ -229,6 +231,7 @@ impl Agent {
         let result = match command {
             AgentCommand::ReplaceDesired(desired) => self.replace_desired(desired),
             AgentCommand::RenewAuthorization(token) => self.renew_authorization(token),
+            AgentCommand::Connect => self.connect(),
             AgentCommand::Reconnect => {
                 self.reconnect();
                 Ok(())
@@ -461,6 +464,19 @@ impl Agent {
             }
         } else {
             self.begin_close();
+        }
+        Ok(())
+    }
+
+    fn connect(&mut self) -> Result<(), AgentError> {
+        if !self.desired.connected {
+            let mut desired = self.desired.clone();
+            desired.revision = desired.revision.saturating_add(1);
+            desired.connected = true;
+            self.replace_desired(desired)?;
+        }
+        if self.snapshot.terminal_failure.is_some() {
+            self.reconnect();
         }
         Ok(())
     }
@@ -1636,6 +1652,7 @@ impl Agent {
         self.snapshot.audio_mapping.clear();
         self.snapshot.participants.clear();
         self.snapshot.publications.clear();
+        self.snapshot.remote_tracks.clear();
         self.bump_snapshot();
     }
 

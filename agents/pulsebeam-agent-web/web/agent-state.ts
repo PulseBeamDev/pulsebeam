@@ -45,6 +45,7 @@ export function emptySnapshot(connection: ConnectionState): AgentSnapshot {
       revision: 0,
       participants: EMPTY_ARRAY,
       publications: EMPTY_ARRAY,
+      tracks: EMPTY_ARRAY,
     }),
     mapping: Object.freeze({
       acceptedIntentRevision: 0,

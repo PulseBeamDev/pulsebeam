@@ -413,6 +413,7 @@ class AgentFacade implements Agent {
     if (this.#closed) throw new Error("agent is closed");
     if (!this.#state.connected)
       this.#applyState({ ...this.#state, connected: true });
+    else this.#runtime?.connect();
   }
 
   disconnect(): void {
@@ -870,6 +871,9 @@ class AgentFacade implements Agent {
       revision: Number(raw.catalog.revision),
       participants,
       publications,
+      tracks: Object.freeze(
+        raw.catalog.tracks.map((track) => Object.freeze({ ...track })),
+      ),
     });
     const mapping = Object.freeze({
       acceptedIntentRevision: Number(raw.mapping.acceptedIntentRevision),

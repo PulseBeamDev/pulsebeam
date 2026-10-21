@@ -294,10 +294,21 @@ export interface TopicSnapshot {
   readonly channelFailures: number;
 }
 
+export type CatalogTrack = Readonly<{
+  id: string;
+  participantId: string;
+  label: string;
+}> &
+  (
+    | Readonly<{ kind: MediaKind }>
+    | Readonly<{ kind: "data"; delivery: TopicMode }>
+  );
+
 export interface CatalogSnapshot {
   readonly revision: number;
   readonly participants: readonly Participant[];
   readonly publications: readonly Publication[];
+  readonly tracks: readonly CatalogTrack[];
 }
 
 export interface TrackMapping {

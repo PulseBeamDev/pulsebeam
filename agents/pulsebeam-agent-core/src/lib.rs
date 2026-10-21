@@ -20,6 +20,7 @@ mod model;
 mod signaling;
 mod signaling_v1;
 mod topic;
+mod track;
 
 pub mod ffi;
 
@@ -34,6 +35,7 @@ pub use identity::*;
 pub use model::*;
 pub use signaling::SignalingError;
 pub use topic::*;
+pub use track::*;
 
 #[cfg(test)]
 mod tests;

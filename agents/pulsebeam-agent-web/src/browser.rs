@@ -2030,6 +2030,23 @@ fn snapshot_value(snapshot: &agent_core::Snapshot) -> JsValue {
     set(&catalog, "revision", snapshot.catalog_revision);
     set(&catalog, "participants", participants);
     set(&catalog, "publications", publications);
+    let tracks = Array::new();
+    for track in snapshot.remote_tracks.values() {
+        let item = Object::new();
+        set(&item, "id", track.id.clone());
+        set(&item, "participantId", track.participant_id.clone());
+        set(&item, "label", track.spec.label());
+        match &track.spec {
+            agent_core::TrackSpec::Video { .. } => set(&item, "kind", "video"),
+            agent_core::TrackSpec::Audio { .. } => set(&item, "kind", "audio"),
+            agent_core::TrackSpec::Data { delivery, .. } => {
+                set(&item, "kind", "data");
+                set(&item, "delivery", topic_mode_name(*delivery));
+            }
+        }
+        tracks.push(&item);
+    }
+    set(&catalog, "tracks", tracks);
     set(&value, "catalog", catalog);
     let mapping = Object::new();
     set(

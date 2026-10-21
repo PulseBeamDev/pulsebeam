@@ -89,6 +89,7 @@ export async function topicContract(pulsebeam) {
   const peers = [];
   const timers = new Map();
   let timerId = 0;
+  let rejectAdmission = false;
   class Channel {
     readyState = "connecting";
     sent = [];
@@ -148,22 +149,24 @@ export async function topicContract(pulsebeam) {
     Window,
     window: globalThis,
     fetch: async (request) =>
-      request.method === "POST"
-        ? new Response(
-            JSON.stringify({
-              room_external_id: "room",
-              room_id: "canonical-room",
-              participant_external_id: "self",
-              participant_id: "canonical-self",
-              connection_id: "connection",
-              answer: "v=0\r\n",
-            }),
-            {
-              status: 201,
-              headers: { Location: "http://localhost/connection" },
-            },
-          )
-        : new Response(null, { status: 204 }),
+      request.method === "POST" && rejectAdmission
+        ? new Response(null, { status: 401 })
+        : request.method === "POST"
+          ? new Response(
+              JSON.stringify({
+                room_external_id: "room",
+                room_id: "canonical-room",
+                participant_external_id: "self",
+                participant_id: "canonical-self",
+                connection_id: "connection",
+                answer: "v=0\r\n",
+              }),
+              {
+                status: 201,
+                headers: { Location: "http://localhost/connection" },
+              },
+            )
+          : new Response(null, { status: 204 }),
     setTimeout: (callback, delay) => {
       const id = ++timerId;
       timers.set(id, { callback, delay });
@@ -282,6 +285,16 @@ export async function topicContract(pulsebeam) {
     ])
       assert.equal(typeof value, "number");
     assert.deepEqual(snapshot.catalog.publications, []);
+    assert.deepEqual(snapshot.catalog.tracks, [
+      {
+        id: "server-remote-track",
+        participantId: "alice",
+        kind: "data",
+        label: "events",
+        delivery: "ordered",
+      },
+    ]);
+    assert.equal(Object.isFrozen(snapshot.catalog.tracks[0]), true);
     assert.deepEqual(
       agent.remote.participants.map((entry) => entry.participantId),
       ["alice"],
@@ -336,8 +349,23 @@ export async function topicContract(pulsebeam) {
       () => agent.connection === "disconnected",
       "disconnect did not finish",
     );
+    rejectAdmission = true;
+    const rejectedPeer = nextPeer++;
+    agent.connect();
+    await until(
+      () => agent.connection === "terminal-failure",
+      "authorization did not fail",
+    );
+    assert.equal(peers.length, rejectedPeer + 1);
+    assert.equal(agent.error.class, "authorization");
+    rejectAdmission = false;
     agent.connect();
     const last = await connectPeer();
+    assert.equal(
+      agent.error,
+      null,
+      "explicit connect clears terminal failure without withdrawing intent",
+    );
     const timedOut = topic.publish({ text: "deadline" });
     const deadline = timerId;
     assert.equal(timers.get(deadline).delay, 10_000);
