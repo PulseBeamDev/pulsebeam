@@ -8,7 +8,6 @@ export { track } from "@pulsebeam/web";
 export type {
   AgentConfig,
   AgentError,
-  AgentFailure,
   AgentLogging,
   AudioTrackSpec,
   ConnectionState,

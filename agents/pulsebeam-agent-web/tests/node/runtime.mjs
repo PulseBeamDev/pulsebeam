@@ -30,7 +30,7 @@ if (process.argv[2] === "initialization-failure") {
   agent.connect();
   const observed = await failure;
   assert.equal(observed.class, "initialization");
-  agent.setState({ connected: false });
+  agent.disconnect();
   assert.equal(agent.getSnapshot().failure, observed);
   assert.equal(agent.connection, "terminal-failure");
   await import("./platform.mjs");
@@ -147,8 +147,6 @@ if (process.argv[2] === "initialization-failure") {
   const { resourceContract } = await import("./resource-contract.mjs");
   await resourceContract(BrowserRuntime);
   const pulsebeam = await import("../../node_assets/dist/index.js");
-  const { topicContract } = await import("./topic-contract.mjs");
-  await topicContract(pulsebeam);
   const { mediaResourceContract } = await import(
     "./media-resource-contract.mjs"
   );

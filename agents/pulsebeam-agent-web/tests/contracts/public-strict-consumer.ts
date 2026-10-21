@@ -1,26 +1,17 @@
 import {
-  createAgent,
-  track,
-  type DataEvent,
-  createCaptureSource,
-  attachRemoteMedia,
   attachLocalTrack,
-  attachRemoteVideo,
   attachRemoteAudio,
+  attachRemoteVideo,
+  createAgent,
+  createCaptureSource,
+  track,
   ResourceOwnershipError,
-  LocalTrackCapacityError,
   type AgentError,
-  type AgentEvent,
-  type AgentFailure,
   type AgentSnapshot,
-  type AgentState,
-  type ConnectionState,
-  type FailureClass,
+  type DataEvent,
   type PlaybackFailure,
-  type RemoteMediaAttachment,
-  type RemoteVideoTrack,
   type RemoteAudioTrack,
-  type TopicEvent,
+  type RemoteVideoTrack,
 } from "../../web/index.js";
 
 // @ts-expect-error Managed activation is internal, not public construction.
@@ -29,317 +20,136 @@ import { createManagedAgent } from "../../web/index.js";
 import type { ManagedAgent } from "../../web/index.js";
 // @ts-expect-error There is one direct constructor spelling.
 import { createWebAgent } from "../../web/index.js";
+// @ts-expect-error Raw media attachment is not a competing ownership path.
+import { attachRemoteMedia } from "../../web/index.js";
+// @ts-expect-error The JSON topic facade was removed.
+import type { Topic } from "../../web/index.js";
+// @ts-expect-error Desired-state mutation is not a normal public API.
+import type { AgentState } from "../../web/index.js";
 
-const binaryAgent = createAgent({
+const agent = createAgent({
   endpoint: "https://pulsebeam.example",
   token: "opaque",
 });
-const audioPlayback = attachRemoteAudio(binaryAgent, {
-  onPlaybackError(failure) {
-    const retry: () => Promise<void> = failure.retry;
-    void retry;
-  },
-});
-const playbackReady: Promise<void> = audioPlayback.ready;
-const playbackClosed: Promise<void> = audioPlayback.close();
-const ownershipError: Error = new ResourceOwnershipError("already owned");
-void [playbackReady, playbackClosed, ownershipError];
+agent.connect();
+agent.disconnect();
+agent.renewAuthorization("renewed");
+agent.setLogging("info");
+const snapshot: AgentSnapshot = agent.getSnapshot();
+const error: AgentError | null = agent.error;
+const unsubscribe = agent.subscribe(() => {});
+void [snapshot, error, unsubscribe];
+// @ts-expect-error Binary streams replace raw topic event observation.
+agent.subscribeEvents(() => {});
+
 const binarySpec = track.data("chat", "ordered");
-const binary = binaryAgent.track(binarySpec);
+const binary = agent.track(binarySpec);
 const binarySend: Promise<void> = binary.send(new Uint8Array([0, 255]));
 const binaryEvents: AsyncIterableIterator<DataEvent<"ordered">> = binary.events(
   { signal: new AbortController().signal },
 );
-const remoteBinary = binaryAgent.remote.participant("alice").track(binarySpec);
-const remoteId: string | null = remoteBinary.id;
-const remoteActive: boolean = remoteBinary.active;
+const participant = agent.remote.participant("alice");
+const remoteBinary = participant.track(binarySpec);
 const remoteEvents: AsyncIterableIterator<DataEvent<"ordered">> =
   remoteBinary.events();
-void [binarySend, binaryEvents, remoteEvents, remoteId, remoteActive];
+void [binarySend, binaryEvents, remoteEvents];
 // @ts-expect-error Descriptors are immutable values.
 binarySpec.label = "different";
 // @ts-expect-error Data delivery is explicit.
 track.data("chat");
 // @ts-expect-error No string codec in the SDK.
 binary.send("text");
-// @ts-expect-error No JSON codec in the SDK.
-binary.send({ text: "text" });
 // @ts-expect-error Remote data handles are receive-only.
 remoteBinary.send(new Uint8Array());
-// @ts-expect-error Local data handles have no publication method.
-binary.publish(new Uint8Array());
-declare const lossyEvent: DataEvent<"lossy">;
-// @ts-expect-error Only ordered data streams include gaps.
-lossyEvent.from;
-declare const binaryMessage: Extract<DataEvent, { type: "message" }>;
-const binarySequence: bigint = binaryMessage.sequence;
-const binaryPayload: Uint8Array = binaryMessage.data;
-// @ts-expect-error Message identity is trackId, not the old topic identity API.
-binaryMessage.dataTrackId;
-void [binarySequence, binaryPayload];
+declare const orderedEvent: DataEvent<"ordered">;
+if (orderedEvent.type === "message") {
+  const sequence: bigint = orderedEvent.sequence;
+  const payload: Uint8Array = orderedEvent.data;
+  const trackId: string = orderedEvent.trackId;
+  void [sequence, payload, trackId];
+} else {
+  const from: bigint = orderedEvent.from;
+  const to: bigint = orderedEvent.to;
+  void [from, to];
+}
 
-const videoSpec = track.video("camera");
-const localVideo = binaryAgent.track(videoSpec);
-const remoteVideoBySpec = binaryAgent.remote
-  .participant("alice")
-  .track(videoSpec);
 declare const videoMediaTrack: MediaStreamTrack;
+declare const audioMediaTrack: MediaStreamTrack;
 const capturedVideo = createCaptureSource(videoMediaTrack, "video");
-const localVideoOwner = attachLocalTrack(localVideo, {
+const capturedAudio = createCaptureSource(audioMediaTrack, "audio");
+const localVideo = agent.track(track.video("camera"));
+const localAudio = agent.track(track.audio("microphone"));
+const videoOwner = attachLocalTrack(localVideo, {
   source: capturedVideo,
   enabled: false,
+  config: { contentHint: "text" },
 });
-const localVideoReady: Promise<void> = localVideoOwner.ready;
-localVideoOwner.setEnabled(true);
-localVideoOwner.setSource(null);
-localVideoOwner.setConfig({ contentHint: "text" });
+const audioOwner = attachLocalTrack(localAudio, {
+  source: capturedAudio,
+  config: { contentHint: "music" },
+});
+const videoReady: Promise<void> = videoOwner.ready;
+videoOwner.setEnabled(true);
+videoOwner.setSource(null);
+const videoClosed: Promise<void> = videoOwner.close();
+void [videoReady, videoClosed, audioOwner];
+// @ts-expect-error Kind-incompatible capture cannot be published.
+attachLocalTrack(localVideo, { source: capturedAudio });
 // @ts-expect-error Video publication options reject audio content hints.
-localVideoOwner.setConfig({ contentHint: "speech" });
-const localVideoClosed: Promise<void> = localVideoOwner.close();
-const remoteVideoId: string | null = remoteVideoBySpec.id;
-void [localVideoReady, localVideoClosed, remoteVideoId];
-// @ts-expect-error Video descriptors do not produce data handles.
-localVideo.send(new Uint8Array());
-// @ts-expect-error Remote video handles cannot publish a local source.
-remoteVideoBySpec.setSource(capturedVideo);
+videoOwner.setConfig({ contentHint: "speech" });
+const ownershipError: Error = new ResourceOwnershipError("already owned");
+void ownershipError;
 
-declare const audioTrack: MediaStreamTrack;
-declare const audioElement: HTMLAudioElement;
-const agent = createAgent({
-  endpoint: "https://pulsebeam.example",
-  token: "opaque-token",
-  topology: {
-    localAudios: 1,
-    localVideos: 2,
-    remoteAudios: 3,
-    remoteVideos: 7,
-  },
-  logging: { level: "debug" },
-});
-
-const defaults = createAgent({
-  endpoint: "https://pulsebeam.example",
-  token: "opaque-token",
-});
-const overridden = createAgent({
-  endpoint: "https://pulsebeam.example",
-  token: "opaque-token",
-  topology: { remoteVideos: 3 },
-});
-void [defaults, overridden];
-
-declare const legacyConfig: import("../../web/index.js").AgentConfig;
-// @ts-expect-error room identity is owned by the bearer token
-legacyConfig.roomId;
-// @ts-expect-error arbitrary request headers are not part of the public API
-legacyConfig.requestHeaders;
-
-const desired: AgentState = {
-  connected: true,
-  publications: [{ slot: "a0", label: "microphone", active: true }],
-  video: [
-    {
-      slot: 0,
-      trackId: "publication-video",
-      height: 720,
-      minHeight: 180,
-      minFps: 15,
-      priority: 100,
-      playoutDelay: { mode: "fixed", minMs: 100, maxMs: 250 },
-    },
-  ],
-  audio: {
-    pinned: ["publication-audio"],
-    selected: [{ participantId: "alice", label: "microphone" }],
-    automatic: true,
-  },
-  topics: [
-    { name: "presence", mode: "latest", publish: true, subscribe: true },
-    { name: "chat", mode: "ordered", subscribe: true },
-  ],
-};
-agent.setState(desired);
-
-agent.connect();
-const camera = agent.local.video("camera");
-const microphone = agent.local.audio("camera");
-const videoSource = createCaptureSource(audioTrack, "video");
-const audioSource = createCaptureSource(audioTrack, "audio");
-camera.setSource(videoSource);
-microphone.setSource(audioSource);
-// @ts-expect-error Audio sources cannot attach to video handles.
-camera.setSource(audioSource);
-// @ts-expect-error Logical handle sources are not raw browser tracks.
-camera.setSource(audioTrack);
-const videoCapacity: LocalTrackCapacityError = new LocalTrackCapacityError(
-  "video",
-  "screen",
-  1,
+const remoteVideo: RemoteVideoTrack = participant.track(track.video("camera"));
+const remoteAudio: RemoteAudioTrack = participant.track(
+  track.audio("microphone"),
 );
-void videoCapacity;
-agent.disconnect();
-const snapshot: AgentSnapshot = agent.getSnapshot();
-const connection: ConnectionState = agent.connection;
-const agentError: AgentError | null = agent.error;
-void [connection, agentError];
-const catalogRevision: number = snapshot.catalog.revision;
-const acceptedIntentRevision: number = snapshot.mapping.acceptedIntentRevision;
-const mappedPublication: string | undefined =
-  snapshot.mapping.audio[0]?.publicationId;
-void catalogRevision;
-void acceptedIntentRevision;
-void mappedPublication;
-if (snapshot.failure) {
-  const failure: AgentFailure = snapshot.failure;
-  const failureClass: FailureClass = failure.class;
-  const failureMessage: string = failure.message;
-  void failureClass;
-  void failureMessage;
-}
-const media: MediaStreamTrack | undefined =
-  snapshot.tracks["publication-audio"]?.media;
-const removeSnapshot = agent.subscribe(() => agent.getSnapshot());
-const removeEvents = agent.subscribeEvents((event: AgentEvent) => {
-  if (event.type === "topic-message") {
-    const payload: Uint8Array = event.payload;
-    void payload;
-  }
-  if (event.type === "failure") {
-    const failureClass: FailureClass = event.class;
-    const failureMessage: string = event.message;
-    void failureClass;
-    void failureMessage;
-  }
-});
-const discoveredVideo: RemoteVideoTrack | undefined =
-  agent.remote.videoTracks[0];
-const discoveredAudio: RemoteAudioTrack | undefined =
-  agent.remote.audioTracks[0];
-if (discoveredVideo) {
-  const participant: string = discoveredVideo.participantId;
-  const label: string = discoveredVideo.label;
-  discoveredVideo.setReceiveOptions({
-    minHeight: 360,
-    minFps: 24,
-    priority: 2,
-  });
-  const unsubscribeVideo = discoveredVideo.subscribe(
-    () => discoveredVideo.active,
-  );
-  unsubscribeVideo();
-  void [participant, label];
-}
-if (discoveredAudio) void discoveredAudio.label;
-const roomChat = agent.topic<{ message: string }>("chat", { mode: "ordered" });
-agent.topic("chat", { mode: "latest" });
-agent.topic("chat", { mode: "lossy" });
-void roomChat.publish({ message: "hello" });
-const liveMessages: AsyncIterable<TopicEvent<{ message: string }>> =
-  roomChat.subscribe();
-void liveMessages;
-// @ts-expect-error topic payload must match its declared type
-void roomChat.publish({ message: 42 });
-// @ts-expect-error removed transport-named aliases cannot select a mode
-agent.topic("chat", { mode: "reliable" });
-// @ts-expect-error unreliable is not a delivery policy
-agent.topic("chat", { mode: "unreliable" });
-// @ts-expect-error topic mode is mandatory
-agent.topic("chat", {});
-// @ts-expect-error subscriptions are topic-wide, not publisher-scoped
-roomChat.subscribe({ publisherId: "alice" });
-const participantId: string | null = agent.participantId;
-const roomId: string | null = agent.roomId;
-const catalogParticipantId: string =
-  snapshot.catalog.participants[0].participantId;
-void [participantId, roomId, catalogParticipantId];
-// @ts-expect-error normal snapshots do not expose canonical participant IDs
-snapshot.catalog.participants[0].id;
-// @ts-expect-error removed identity alias
-snapshot.participantExternalId;
-// @ts-expect-error removed identity alias
-snapshot.roomExternalId;
-// @ts-expect-error removed Agent identity alias
-agent.participantExternalId;
-// @ts-expect-error removed Agent identity alias
-agent.roomExternalId;
-declare const topicEvent: TopicEvent<{ message: string }>;
-if (topicEvent.type === "message") {
-  const sequence: bigint = topicEvent.sequence;
-  const track: string = topicEvent.dataTrackId;
-  const sender: string = topicEvent.participantId;
-  const value: string = topicEvent.value.message;
-  void [sequence, track, sender, value];
-} else {
-  const expected: bigint = topicEvent.expectedSequence;
-  const available: bigint = topicEvent.availableSequence;
-  void [expected, available];
-  // @ts-expect-error gaps do not carry a pretend application message
-  topicEvent.value;
-}
-// @ts-expect-error no parallel publisher identity
-topicEvent.publisherId;
-// @ts-expect-error no parallel stream identity
-topicEvent.streamId;
-// @ts-expect-error no epoch identity
-topicEvent.streamEpoch;
-// @ts-expect-error continuity is an inline gap, not an application-frame flag
-topicEvent.resyncRequired;
-const replacement: Promise<void> = agent.replaceLocalTrack("a0", audioTrack, {
-  contentHint: "speech",
-  encodings: [],
-});
-const muted: Promise<void> = agent.setLocalMuted("a0", true);
-const attachment: RemoteMediaAttachment = attachRemoteMedia(
-  agent,
-  videoElement,
-  {
-    publicationIds: ["publication-audio"],
-    onPlaybackBlocked: (failure: PlaybackFailure, retry) => {
-      void failure.message;
-      void retry();
-    },
-  },
-);
-attachment.setPublicationIds(["publication-audio"]);
-const participant = agent.remote.participant("alice");
-const remoteParticipantId: string = participant.participantId;
-void remoteParticipantId;
-// @ts-expect-error removed remote identity alias
-participant.externalId;
-const voice = participant.audio("microphone");
-const receiving: boolean = voice.receiving;
-voice.readWaveform(new Float32Array(2048));
-voice.readSpectrum(new Float32Array(1024));
-voice.subscribe(() => {});
-void agent.remote.resumeAudio();
-void receiving;
-// @ts-expect-error Native media is only available on the low-level snapshot.
-voice.media;
-// @ts-expect-error Audio level telemetry is not part of the logical API.
-voice.level;
-// @ts-expect-error Aggregate audio playback sources were removed.
-agent.remoteAudio;
-// @ts-expect-error Top-level discovery was removed.
-agent.remoteAudioTracks;
-// @ts-expect-error Old local lookup methods were removed.
-agent.localVideoTrack("camera");
-// @ts-expect-error Generic attachment cannot provide an alternate audio playback model.
-attachRemoteMedia(agent, audioElement, { publicationIds: [] });
-
 declare const videoElement: HTMLVideoElement;
-if (discoveredVideo) attachRemoteVideo(discoveredVideo, videoElement).close();
-if (discoveredVideo) {
-  // @ts-expect-error video source cannot be attached to an audio element
-  attachRemoteVideo(discoveredVideo, audioElement);
-}
-void attachment.retryPlayback();
-attachment.close();
-agent.sendTopic("presence", "latest", new Uint8Array([1]));
-agent.sendTopic("chat", "ordered", new Uint8Array([2]));
-agent.reconnect();
-removeSnapshot();
-removeEvents();
+const videoAttachment = attachRemoteVideo(
+  remoteVideo,
+  videoElement,
+  undefined,
+  {
+    preferences: {
+      minHeight: 360,
+      minFps: 15,
+      priority: 1,
+      playoutDelay: { minMs: 0, maxMs: 100 },
+    },
+  },
+);
+const videoAttachmentReady: Promise<void> = videoAttachment.ready;
+videoAttachment.setPreferences({ minHeight: 720 });
+videoAttachment.close();
+void videoAttachmentReady;
+const audioAttachment = attachRemoteAudio(agent, {
+  onPlaybackError(failure: PlaybackFailure) {
+    void failure.retry();
+  },
+});
+const audioReady: Promise<void> = audioAttachment.ready;
+const audioClosed: Promise<void> = audioAttachment.close();
+void [audioReady, audioClosed, remoteAudio];
 
-void media;
-void replacement;
-void muted;
+const participants = agent.remote.participants;
+const tracks = participant.tracks;
+void [participants, tracks];
+// @ts-expect-error Parallel kind-specific collection roots were removed.
+agent.remote.videoTracks;
+// @ts-expect-error Parallel kind-specific collection roots were removed.
+participant.audioTracks;
+// @ts-expect-error Imperative receive policy belongs to an attachment.
+remoteVideo.setReceiveOptions({});
+// @ts-expect-error Per-track audio analysis is not a normal ownership path.
+remoteAudio.readWaveform(new Float32Array());
+// @ts-expect-error Callable local roots were removed.
+agent.local;
+// @ts-expect-error Typed JSON topics were removed.
+agent.topic("chat", { mode: "ordered" });
+// @ts-expect-error Desired-state mutation was removed.
+agent.setState({ connected: true });
+// @ts-expect-error Retry uses connect(), not a second session operation.
+agent.reconnect();
+// @ts-expect-error Raw sender replacement is attachment-owned.
+agent.replaceLocalTrack("v0", null, { contentHint: "motion" });
+agent.close();

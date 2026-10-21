@@ -1,9 +1,9 @@
-import {
-  nativeCaptureTrack,
-  type CapturedAudioTrack,
-  type CapturedVideoTrack,
-  type ReceiveOptions,
+import type {
+  CapturedAudioTrack,
+  CapturedVideoTrack,
+  ReceiveOptions,
 } from "@pulsebeam/web";
+import { nativeCaptureTrack } from "@pulsebeam/web/internal/react";
 
 const sourceBrand = Symbol("PulseBeam source");
 const publishableBrand = Symbol("PulseBeam publishable source");

@@ -118,7 +118,13 @@
     [...peers].find((peer) =>
       peer.getReceivers().some((receiver) => receiver.track === track),
     );
-  const { createAgent, createCaptureSource, attachRemoteMedia } = pulsebeam;
+  const {
+    attachLocalTrack,
+    attachRemoteVideo,
+    createAgent,
+    createCaptureSource,
+    track,
+  } = pulsebeam;
   const sender = createAgent({
     endpoint,
     token: "__SENDER_TOKEN__",
@@ -187,16 +193,19 @@
   video.style.cssText = "width:160px;height:120px";
   document.body.append(video);
   let attachment;
+  let videoPublication;
+  let audioPublication;
   try {
     await source.resume();
     const audioPlayback = pulsebeam.attachRemoteAudio(receiver);
     await audioPlayback.ready;
-    sender.local
-      .video("camera")
-      .setSource(createCaptureSource(videoTrack, "video"));
-    sender.local
-      .audio("voice")
-      .setSource(createCaptureSource(audioTrack, "audio"));
+    videoPublication = attachLocalTrack(sender.track(track.video("camera")), {
+      source: createCaptureSource(videoTrack, "video"),
+    });
+    audioPublication = attachLocalTrack(sender.track(track.audio("voice")), {
+      source: createCaptureSource(audioTrack, "audio"),
+    });
+    await Promise.all([videoPublication.ready, audioPublication.ready]);
     sender.connect();
     receiver.connect();
     await until(
@@ -221,29 +230,24 @@
     const publication = receiver
       .getSnapshot()
       .catalog.publications.find((p) => p.kind === "video");
-    const demand = {
-      slot: 0,
-      trackId: publication.id,
-      height: 180,
-      minHeight: 1,
-      minFps: 1,
-      priority: 100,
-    };
-    receiver.setState({
-      connected: true,
-      video: [
-        { ...demand, playoutDelay: { mode: "fixed", minMs: 100, maxMs: 100 } },
-      ],
+    const remoteVideo = receiver.remote
+      .participant("web-sender")
+      .track(track.video("camera"));
+    attachment = attachRemoteVideo(remoteVideo, video, undefined, {
+      preferences: {
+        minHeight: 1,
+        minFps: 1,
+        priority: 100,
+        playoutDelay: { minMs: 100, maxMs: 100 },
+      },
     });
+    await attachment.ready;
     await until(
       () =>
         receiver.getSnapshot().tracks[publication.id]?.media.readyState ===
         "live",
       "mapped fixed-delay track",
     );
-    attachment = attachRemoteMedia(receiver, video, {
-      publicationIds: [publication.id],
-    });
     const fixedTrack = receiver.getSnapshot().tracks[publication.id].media;
     const fixedPeer = peerForTrack(fixedTrack);
     const fixedReceiver = fixedPeer
@@ -271,15 +275,15 @@
         fixedRtp.firstValue?.join(",") === "0,160,10",
       "actual SSRC carries negotiated fixed playout extension",
     );
-    const voice = receiver.remote.participant("web-sender").audio("voice");
     const spectrum = new Float32Array(1024);
     const audible = () => {
-      voice.readSpectrum(spectrum);
+      if (outputRoutes.size !== 1) return false;
+      const analyser = [...outputRoutes][0];
+      analyser.getFloatFrequencyData(spectrum);
       const bin = Math.round((700 * 2048) / source.sampleRate);
       return (
         Math.max(...spectrum.slice(bin - 2, bin + 3)) > -40 &&
-        outputRoutes.size === 1 &&
-        [...outputRoutes][0].context.state === "running"
+        analyser.context.state === "running"
       );
     };
     await until(
@@ -290,7 +294,7 @@
       document.querySelector("audio") === null,
       "no application audio element",
     );
-    receiver.setState({ connected: true, video: [demand] });
+    attachment.setPreferences({ minHeight: 1, minFps: 1, priority: 100 });
     await until(() => {
       const track = receiver.getSnapshot().tracks[publication.id]?.media;
       return (
@@ -334,6 +338,8 @@
     return true;
   } finally {
     attachment?.close();
+    void videoPublication?.close();
+    void audioPublication?.close();
     sender.close();
     receiver.close();
     video.remove();

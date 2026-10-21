@@ -1,8 +1,4 @@
-export {
-  createAgent,
-  LocalTrackCapacityError,
-  RelationshipOwnershipError,
-} from "./agent.js";
+export { createAgent } from "./agent.js";
 export { track } from "./track.js";
 export type {
   TrackSpec,
@@ -12,11 +8,6 @@ export type {
   Delivery,
 } from "./track.js";
 export { DataError } from "./data.js";
-export { attachLocalTrack } from "./media.js";
-export type {
-  LocalMediaAttachment,
-  LocalMediaAttachmentOptions,
-} from "./media.js";
 export type {
   LocalDataTrack,
   RemoteDataTrack,
@@ -25,18 +16,18 @@ export type {
   DataGap,
   DataEventsOptions,
 } from "./data.js";
-export { createCaptureSource, nativeCaptureTrack } from "./capture-source.js";
+export { attachLocalTrack } from "./media.js";
+export type {
+  LocalMediaAttachment,
+  LocalMediaAttachmentOptions,
+} from "./media.js";
+export { createCaptureSource } from "./capture-source.js";
 export type {
   CapturedAudioTrack,
   CapturedTrack,
   CapturedVideoTrack,
 } from "./capture-source.js";
-export { attachRemoteMedia } from "./remote-media.js";
-export {
-  attachRemoteAudio,
-  attachRemoteVideo,
-  validateReceiveOptions,
-} from "./remote-catalog.js";
+export { attachRemoteAudio, attachRemoteVideo } from "./remote-catalog.js";
 export { ResourceError, ResourceOwnershipError } from "./resources.js";
 export type {
   RemoteAudioAttachment,
@@ -47,54 +38,26 @@ export type {
   Agent,
   AgentConfig,
   AgentError,
-  AgentEvent,
-  AgentFailure,
   AgentLogging,
   AgentSnapshot,
-  AgentState,
   AudioSenderConfig,
-  AudioDemand,
   CatalogSnapshot,
   CatalogTrack,
   ConnectionState,
   FailureClass,
-  FixedPlayoutDelay,
-  MediaKind,
-  MappingSnapshot,
-  MappedRemoteAudioTrack,
-  MappedRemoteVideoTrack,
-  MediaTopology,
   LogLevel,
   LocalAudioTrack,
   LocalVideoTrack,
-  Participant,
+  MediaKind,
+  MediaTopology,
   PlaybackFailure,
-  Publication,
-  PublicationIntent,
-  LocalMedia,
+  ReceiveOptions,
+  RemoteAudioTrack,
   RemoteMedia,
   RemoteParticipant,
-  RemoteAudioTrack,
-  ReceiveOptions,
-  RemoteMediaAttachment,
-  RemoteMediaAttachmentOptions,
-  RemoteTrack,
+  RemotePublishedTrack,
   RemoteVideoTrack,
   SenderConfig,
   SenderEncoding,
-  TopicDropReason,
-  TopicCallbacks,
-  TopicGap,
-  TopicEvent,
-  TopicConsumerError,
-  TopicMode,
-  TopicPublisherStatus,
-  TopicRegistration,
-  TopicSnapshot,
-  TopicSubscriberStatus,
-  Topic,
-  TrackMapping,
-  TrackSelector,
-  VideoDemand,
   VideoSenderConfig,
 } from "./types.js";

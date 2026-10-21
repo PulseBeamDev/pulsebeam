@@ -194,7 +194,6 @@ export interface RemoteVideoTrack {
   readonly participantId: string;
   readonly label: string;
   readonly active: boolean;
-  setReceiveOptions(options: ReceiveOptions): void;
   subscribe(listener: () => void): () => void;
 }
 
@@ -204,12 +203,7 @@ export interface RemoteAudioTrack {
   readonly active: boolean;
   readonly participantId: string;
   readonly label: string;
-  readonly receiving: boolean;
   subscribe(listener: () => void): () => void;
-  /** Normalized amplitudes, leading samples of the default 2048-point FFT. Oversized tails are zero. */
-  readWaveform(buffer: Float32Array): void;
-  /** Decibel bins in ascending frequency order with default smoothing. Oversized tails are -Infinity. */
-  readSpectrum(buffer: Float32Array): void;
 }
 
 export interface LocalMedia {
@@ -229,19 +223,11 @@ export interface RemoteParticipant {
   track(spec: VideoTrackSpec): RemoteVideoTrack;
   track(spec: AudioTrackSpec): RemoteAudioTrack;
   track<D extends Delivery>(spec: DataTrackSpec<D>): RemoteDataTrack<D>;
-  video(label: string): RemoteVideoTrack;
-  audio(label: string): RemoteAudioTrack;
-  readonly videoTracks: readonly RemoteVideoTrack[];
-  readonly audioTracks: readonly RemoteAudioTrack[];
 }
 
 export interface RemoteMedia {
   readonly participants: readonly RemoteParticipant[];
-  readonly videoTracks: readonly RemoteVideoTrack[];
-  readonly audioTracks: readonly RemoteAudioTrack[];
   participant(participantId: string): RemoteParticipant;
-  /** Exceptional user-gesture recovery, also valid before media arrives. */
-  resumeAudio(): Promise<void>;
 }
 
 export type TopicEvent<T> =
@@ -455,30 +441,16 @@ export interface Agent {
   readonly participantId: string | null;
   readonly roomId: string | null;
   readonly authorizationExpiresAt: number | null;
-  readonly local: LocalMedia;
   readonly remote: RemoteMedia;
   track(spec: VideoTrackSpec): LocalVideoTrack;
   track(spec: AudioTrackSpec): LocalAudioTrack;
   track<D extends Delivery>(spec: DataTrackSpec<D>): LocalDataTrack<D>;
-  topic<T>(name: string, options: { readonly mode: TopicMode }): Topic<T>;
   connect(): void;
   disconnect(): void;
-  setState(state: AgentState): void;
-  replaceLocalTrack(
-    slot: string,
-    track: MediaStreamTrack | null,
-    config: SenderConfig,
-  ): Promise<void>;
-  setLocalMuted(slot: string, muted: boolean): Promise<void>;
-  reconnect(): void;
   renewAuthorization(token: string): void;
   setLogging(level: LogLevel): void;
-  sendTopic(name: string, mode: TopicMode, payload: Uint8Array): Promise<void>;
   readonly getSnapshot: () => AgentSnapshot;
   readonly subscribe: (listener: () => void) => () => void;
-  readonly subscribeEvents: (
-    listener: (event: AgentEvent) => void,
-  ) => () => void;
   close(): void;
 }
 

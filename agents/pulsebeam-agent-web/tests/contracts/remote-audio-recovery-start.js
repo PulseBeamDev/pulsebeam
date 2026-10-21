@@ -3,6 +3,7 @@
     "/dist/remote-catalog.js"
   );
   const { DataRegistry } = await import("/dist/data.js");
+  const { attachRemoteMedia } = await import("/dist/remote-media.js");
   const { ResourceOwners } = await import("/dist/resources.js");
   const { BrowserRuntime, whenInitialized } = await import("/dist/wasm.js");
   const RealContext = AudioContext;
@@ -79,7 +80,7 @@
   video.playsInline = true;
   document.body.append(video);
   let retry;
-  const attachment = pulsebeam.attachRemoteMedia(
+  const attachment = attachRemoteMedia(
     {
       getSnapshot: () => ({ tracks: { video: { media: videoTrack } } }),
       subscribe: () => () => {},

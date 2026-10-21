@@ -1,26 +1,30 @@
 (async () => {
-  const { sender, receiver, events, remove, wait, previousGeneration } =
-    globalThis.__adapterRestart;
+  const {
+    sender,
+    receiver,
+    publisher,
+    stream,
+    pumping,
+    events,
+    wait,
+    previousGeneration,
+  } = globalThis.__adapterRestart;
   try {
     await wait(
       sender,
       (snapshot) =>
         snapshot.connection === "connected" &&
-        snapshot.generation !== previousGeneration &&
-        snapshot.topics.publishers[0]?.connected &&
-        snapshot.topics.publishers[0].dataTrackId !== null,
+        snapshot.generation !== previousGeneration,
       "Web publisher adapter rejoin",
     );
     await wait(
       receiver,
       (snapshot) =>
         snapshot.connection === "connected" &&
-        snapshot.generation !== previousGeneration &&
-        snapshot.topics.subscribers[0]?.connected &&
-        snapshot.topics.subscribers[0].publishers === 1,
+        snapshot.generation !== previousGeneration,
       "Web subscriber adapter rejoin",
     );
-    await sender.sendTopic("chat", "lossy", new Uint8Array([2]));
+    await publisher.send(new Uint8Array([2]));
     const deadline = Date.now() + 20000;
     while (!events.some((event) => event.payload.join(",") === "2")) {
       if (Date.now() > deadline)
@@ -31,7 +35,8 @@
       receiver.connection === "connected" && sender.connection === "connected"
     );
   } finally {
-    remove();
+    await stream.return();
+    await pumping;
     sender.close();
     receiver.close();
     delete globalThis.__adapterRestart;

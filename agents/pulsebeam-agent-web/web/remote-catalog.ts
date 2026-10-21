@@ -230,6 +230,21 @@ class ParticipantHandle implements RemoteParticipant {
 
 export class RemoteCatalog implements RemoteMedia {
   readonly #handles = new Map<string, ParticipantHandle>();
+  readonly #publicParticipants = new WeakMap<
+    ParticipantHandle,
+    RemoteParticipant
+  >();
+  readonly #publicVideos = new WeakMap<VideoHandle, RemoteVideoTrack>();
+  readonly #publicAudios = new WeakMap<AudioHandle, RemoteAudioTrack>();
+  readonly #publicCollections = new WeakMap<
+    object,
+    readonly RemotePublishedTrack[]
+  >();
+  readonly #publicParticipantCollections = new WeakMap<
+    object,
+    readonly RemoteParticipant[]
+  >();
+  #facade: RemoteMedia | undefined;
   #playback: RemoteAudioPlayback | undefined;
   #closed = false;
   participants: readonly RemoteParticipant[] = Object.freeze([]);
@@ -241,6 +256,107 @@ export class RemoteCatalog implements RemoteMedia {
     readonly owners: ResourceOwners,
     private logLevel: LogLevel = "warn",
   ) {
+    audioCatalogs.set(agent, this);
+  }
+  facade(): RemoteMedia {
+    const thisCatalog = this;
+    const wrapVideo = (handle: VideoHandle): RemoteVideoTrack => {
+      let value = this.#publicVideos.get(handle);
+      if (!value) {
+        value = Object.freeze({
+          kind: handle.kind,
+          label: handle.label,
+          participantId: handle.participantId,
+          get id() {
+            return handle.id;
+          },
+          get active() {
+            return handle.active;
+          },
+          subscribe: (listener: () => void) => handle.subscribe(listener),
+        });
+        this.#publicVideos.set(handle, value);
+        videoOwners.set(value, handle);
+      }
+      return value;
+    };
+    const wrapAudio = (handle: AudioHandle): RemoteAudioTrack => {
+      let value = this.#publicAudios.get(handle);
+      if (!value) {
+        value = Object.freeze({
+          kind: handle.kind,
+          label: handle.label,
+          participantId: handle.participantId,
+          get id() {
+            return handle.id;
+          },
+          get active() {
+            return handle.active;
+          },
+          subscribe: (listener: () => void) => handle.subscribe(listener),
+        });
+        this.#publicAudios.set(handle, value);
+      }
+      return value;
+    };
+    const wrapParticipant = (handle: ParticipantHandle): RemoteParticipant => {
+      let value = this.#publicParticipants.get(handle);
+      if (value) return value;
+      const wrapTrack = (entry: RemotePublishedTrack): RemotePublishedTrack =>
+        entry.kind === "video"
+          ? wrapVideo(entry as VideoHandle)
+          : entry.kind === "audio"
+            ? wrapAudio(entry as AudioHandle)
+            : entry;
+      value = Object.freeze({
+        participantId: handle.participantId,
+        get active() {
+          return handle.active;
+        },
+        get tracks() {
+          let collection = thisCatalog.#publicCollections.get(
+            handle.tracks as object,
+          );
+          if (!collection) {
+            collection = Object.freeze(handle.tracks.map(wrapTrack));
+            thisCatalog.#publicCollections.set(
+              handle.tracks as object,
+              collection,
+            );
+          }
+          return collection;
+        },
+        track: ((spec: VideoTrackSpec | AudioTrackSpec | DataTrackSpec) =>
+          spec.kind === "video"
+            ? wrapVideo(handle.video(spec.label))
+            : spec.kind === "audio"
+              ? wrapAudio(handle.audio(spec.label))
+              : handle.track(spec)) as RemoteParticipant["track"],
+      });
+      this.#publicParticipants.set(handle, value);
+      return value;
+    };
+    this.#facade ??= Object.freeze({
+      get participants() {
+        const source = thisCatalog.participants as readonly ParticipantHandle[];
+        let collection = thisCatalog.#publicParticipantCollections.get(
+          source as object,
+        );
+        if (!collection) {
+          collection = Object.freeze(source.map(wrapParticipant));
+          thisCatalog.#publicParticipantCollections.set(
+            source as object,
+            collection,
+          );
+        }
+        return collection;
+      },
+      participant: (participantId: string) =>
+        wrapParticipant(this.participant(participantId)),
+    });
+    return this.#facade;
+  }
+  bindAgent(agent: Agent): void {
     audioCatalogs.set(agent, this);
   }
   setLogLevel(level: LogLevel): void {

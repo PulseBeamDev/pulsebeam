@@ -1,12 +1,12 @@
 import { Track } from "./platform.mjs";
 
 export async function publicContract(pulsebeam) {
-  const { createAgent, createCaptureSource, LocalTrackCapacityError } =
+  const { attachLocalTrack, createAgent, createCaptureSource, track } =
     pulsebeam;
   const assert = (condition, label) => {
     if (!condition) throw new Error(label);
   };
-  const first = createAgent({
+  const agent = createAgent({
     endpoint: "http://localhost",
     token: "public-smoke",
     topology: { localVideos: 1, localAudios: 1 },
@@ -17,73 +17,38 @@ export async function publicContract(pulsebeam) {
     token: "close-before-initialization",
   });
   closedDuringInitialization.close();
-  const track = new Track();
+  const borrowed = new Track("video");
   try {
-    first.connect();
-    first.disconnect();
-    const camera = first.local.video("camera");
-    assert(first.local.video("camera") === camera, "stable local reservation");
-    assert(first.local.audio("camera") !== camera, "separate media namespaces");
-    assert(camera.source === null, "empty local source");
-    let exhausted = false;
-    try {
-      first.local.video("screen");
-    } catch (error) {
-      exhausted = error instanceof LocalTrackCapacityError;
-    }
-    assert(exhausted, "public capacity failure");
-    camera.setSource(createCaptureSource(track, "video"));
-    await first.replaceLocalTrack("v0", track, { contentHint: "motion" });
+    agent.connect();
+    agent.disconnect();
+    const camera = agent.track(track.video("camera"));
     assert(
-      first.connection === "disconnected",
-      "latest desire crosses packaged WASM initialization",
+      agent.track(track.video("camera")) === camera,
+      "stable local handle",
     );
-    const validation = new Promise((resolve, reject) => {
-      const remove = first.subscribeEvents((event) => {
-        if (event.type !== "failure" || event.class !== "validation") return;
-        remove();
-        resolve();
-      });
+    assert(!("local" in agent), "callable local root was removed");
+    assert(!("topic" in agent), "JSON topic facade was removed");
+    assert(!("setState" in agent), "desired-state mutation was removed");
+    assert(!("reconnect" in agent), "second retry operation was removed");
+    assert(!("videoTracks" in agent.remote), "parallel video root was removed");
+    const owner = attachLocalTrack(camera, {
+      source: createCaptureSource(borrowed, "video"),
     });
-    first.setState({
-      connected: false,
-      video: [
-        {
-          slot: 0,
-          trackId: "a",
-          height: 180,
-          minHeight: 180,
-          minFps: 15,
-          priority: 100,
-        },
-        {
-          slot: 0,
-          trackId: "b",
-          height: 180,
-          minHeight: 180,
-          minFps: 15,
-          priority: 100,
-        },
-      ],
-    });
-    await validation;
-    first.close();
-    const terminal = first.getSnapshot();
-    first.close();
-    first.setState({ connected: true });
-    assert(
-      first.getSnapshot() === terminal && camera.source === null,
-      "terminal public facade cleanup",
-    );
-    assert(track.readyState === "live", "public facade borrows capture");
+    await owner.ready;
+    await owner.close();
+    assert(borrowed.readyState === "live", "publication borrows capture");
+    agent.close();
+    const terminal = agent.getSnapshot();
+    agent.close();
+    assert(agent.getSnapshot() === terminal, "terminal public facade cleanup");
     assert(
       closedDuringInitialization.connection === "disconnected",
       "initialization completion is fenced",
     );
     return true;
   } finally {
-    first.close();
+    agent.close();
     closedDuringInitialization.close();
-    track.stop();
+    borrowed.stop();
   }
 }

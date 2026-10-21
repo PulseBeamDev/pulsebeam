@@ -13,15 +13,17 @@
     });
   const sender = create("__SENDER_TOKEN__");
   const receiver = create("__RECEIVER_TOKEN__");
+  const spec = window.pulsebeam.track.data("chat", "lossy");
+  const publisher = sender.track(spec);
+  const stream = receiver.remote.participant("publisher").track(spec).events();
   const events = [];
-  const remove = receiver.subscribeEvents((event) => {
-    if (event.type === "topic-message" && event.mode === "lossy") {
-      events.push({
-        sequence: event.sequence,
-        payload: [...event.payload],
-      });
+  const pumping = (async () => {
+    for await (const event of stream) {
+      if (event.type === "message") {
+        events.push({ sequence: event.sequence, payload: [...event.data] });
+      }
     }
-  });
+  })();
   const wait = (agent, predicate, label) =>
     new Promise((resolve, reject) => {
       const timeout = setTimeout(() => {
@@ -41,29 +43,14 @@
       const removeListener = agent.subscribe(inspect);
       inspect();
     });
-  sender.setState({
-    connected: true,
-    topics: [{ name: "chat", mode: "lossy", publish: true }],
-  });
-  receiver.setState({
-    connected: true,
-    topics: [{ name: "chat", mode: "lossy", subscribe: true }],
-  });
-  await wait(
-    sender,
-    (snapshot) =>
-      snapshot.topics.publishers[0]?.connected &&
-      snapshot.topics.publishers[0].dataTrackId !== null,
-    "publisher",
-  );
+  sender.connect();
+  receiver.connect();
   const before = await wait(
     receiver,
-    (snapshot) =>
-      snapshot.topics.subscribers[0]?.connected &&
-      snapshot.topics.subscribers[0].publishers === 1,
+    (snapshot) => snapshot.connection === "connected",
     "subscriber",
   );
-  await sender.sendTopic("chat", "lossy", new Uint8Array([1]));
+  await publisher.send(new Uint8Array([1]));
   await new Promise((resolve, reject) => {
     const deadline = setTimeout(
       () => reject(new Error("initial message missing")),
@@ -79,8 +66,10 @@
   globalThis.__adapterRestart = {
     sender,
     receiver,
+    publisher,
+    stream,
+    pumping,
     events,
-    remove,
     wait,
     previousGeneration: before.generation,
   };

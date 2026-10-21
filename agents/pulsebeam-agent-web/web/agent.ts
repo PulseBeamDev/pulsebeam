@@ -303,7 +303,11 @@ class AgentFacade implements Agent {
   }
 
   get remote(): RemoteMedia {
-    return this.#remote;
+    return this.#remote.facade();
+  }
+
+  bindPublicAgent(agent: Agent): void {
+    this.#remote.bindAgent(agent);
   }
 
   track(spec: VideoTrackSpec): LocalVideoTrack;
@@ -1030,30 +1034,6 @@ export class RelationshipOwnershipError extends Error {
 export interface ManagedAgent extends Agent {
   activate(): void;
   deactivate(): void;
-  claimRelationship(owner: object): () => void;
-  listenTopic<T>(
-    name: string,
-    options: { readonly mode: TopicMode },
-    callbacks: TopicCallbacks<T>,
-  ): () => void;
-  claimPublication(
-    owner: object,
-    kind: "video" | "audio",
-    label: string,
-  ): LocalVideoTrack | LocalAudioTrack;
-  updatePublication(
-    owner: object,
-    kind: "video" | "audio",
-    label: string,
-    source: CapturedTrack | null,
-    enabled: boolean,
-    config: SenderConfig,
-  ): void;
-  releasePublication(
-    owner: object,
-    kind: "video" | "audio",
-    label: string,
-  ): void;
 }
 
 export function createManagedAgent(config: AgentConfig): ManagedAgent {
@@ -1061,5 +1041,35 @@ export function createManagedAgent(config: AgentConfig): ManagedAgent {
 }
 
 export function createAgent(config: AgentConfig): Agent {
-  return new AgentFacade(config);
+  const raw = new AgentFacade(config);
+  const agent: Agent = Object.freeze({
+    get connection() {
+      return raw.connection;
+    },
+    get error() {
+      return raw.error;
+    },
+    get participantId() {
+      return raw.participantId;
+    },
+    get roomId() {
+      return raw.roomId;
+    },
+    get authorizationExpiresAt() {
+      return raw.authorizationExpiresAt;
+    },
+    get remote() {
+      return raw.remote;
+    },
+    track: raw.track.bind(raw) as Agent["track"],
+    connect: () => raw.connect(),
+    disconnect: () => raw.disconnect(),
+    renewAuthorization: (token: string) => raw.renewAuthorization(token),
+    setLogging: (level: LogLevel) => raw.setLogging(level),
+    getSnapshot: raw.getSnapshot,
+    subscribe: raw.subscribe,
+    close: () => raw.close(),
+  });
+  raw.bindPublicAgent(agent);
+  return agent;
 }

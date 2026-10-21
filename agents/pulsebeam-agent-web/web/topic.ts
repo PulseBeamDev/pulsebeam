@@ -1,5 +1,4 @@
 import type {
-  Agent,
   AgentEvent,
   Topic,
   TopicMode,
@@ -8,6 +7,10 @@ import type {
   TopicConsumerError,
   TopicEvent,
 } from "./types.js";
+
+interface TopicAgent {
+  subscribeEvents(listener: (event: AgentEvent) => void): () => void;
+}
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder("utf-8", { fatal: true });
@@ -208,7 +211,7 @@ class TopicIterator<T> implements AsyncIterableIterator<TopicEvent<T>> {
 }
 
 export class TopicRegistry {
-  readonly agent: Agent;
+  readonly agent: TopicAgent;
   readonly #send: (
     name: string,
     mode: TopicMode,
@@ -220,7 +223,7 @@ export class TopicRegistry {
   #closed = false;
 
   constructor(
-    agent: Agent,
+    agent: TopicAgent,
     send: (name: string, mode: TopicMode, payload: Uint8Array) => Promise<void>,
     onChange: (registrations: readonly TopicRegistration[]) => void,
   ) {
