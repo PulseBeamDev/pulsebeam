@@ -9,14 +9,18 @@
 //! the correct answer.
 
 use crate::clock::NtpTime;
-use crate::rtp::RtpPacket;
+use crate::rtp::{Frequency, MediaTime, RtpPacket};
 use ahash::HashMap;
 use std::time::Duration;
-use str0m::{
-    media::{Frequency, MediaTime},
-    rtp::{Ssrc, rtcp::SenderInfo},
-};
+use str0m::rtp::Ssrc;
 use tokio::time::Instant;
+
+#[derive(Clone, Copy, Debug)]
+pub struct SenderInfo {
+    pub ssrc: Ssrc,
+    pub rtp_time: MediaTime,
+    pub ntp_time: NtpTime,
+}
 
 const MIN_SR_UPDATE_INTERVAL: Duration = Duration::from_millis(200);
 const MAX_DRIFT_PPM: f64 = 50_000.0;
@@ -218,7 +222,7 @@ impl Synchronizer {
 
         let current = ClockReference {
             rtp_time: sr.rtp_time,
-            ntp_time: NtpTime::from_system_time(sr.ntp_time),
+            ntp_time: sr.ntp_time,
             arrival_ts: now,
         };
 
@@ -391,9 +395,7 @@ mod tests {
         SenderInfo {
             ssrc: 1.into(),
             rtp_time: rtp_ts,
-            ntp_time,
-            sender_packet_count: 0,
-            sender_octet_count: 0,
+            ntp_time: NtpTime::from_system_time(ntp_time),
         }
     }
 
@@ -746,9 +748,7 @@ mod tests {
         let sr = |ssrc: u32, rtp: u64, ntp: SystemTime| SenderInfo {
             ssrc: ssrc.into(),
             rtp_time: MediaTime::from_90khz(rtp),
-            ntp_time: ntp,
-            sender_packet_count: 0,
-            sender_octet_count: 0,
+            ntp_time: NtpTime::from_system_time(ntp),
         };
         let frame = |ssrc: u32, rtp: u64, at: Instant| RtpPacket {
             ssrc: ssrc.into(),

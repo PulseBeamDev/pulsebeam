@@ -5,10 +5,10 @@
 //! either record a gap of billions or hide a real one, and the switcher would
 //! hold or release a switch on a number that was never true.
 
+use crate::rtp::{Frequency, MediaTime};
 use ahash::HashMap;
 use std::collections::BTreeSet;
 use std::time::Duration;
-use str0m::media::{Frequency, MediaTime};
 use str0m::rtp::SeqNo;
 use tokio::time::Instant;
 
