@@ -1,5 +1,6 @@
 import { attachRemoteMedia } from "./remote-media.js";
 import { RemoteAudioPlayback } from "./remote-audio.js";
+import { ResourceError, ResourceOwners } from "./resources.js";
 import type { DataRegistry, RemoteDataTrack } from "./data.js";
 import { track, type DataTrackSpec, type Delivery } from "./track.js";
 import type {
@@ -28,6 +29,24 @@ export interface RemoteVideoAttachment extends RemoteMediaAttachment {
 }
 const MAX_UINT32 = 0xffff_ffff;
 const videoOwners = new WeakMap<RemoteVideoTrack, VideoHandle>();
+const audioCatalogs = new WeakMap<Agent, RemoteCatalog>();
+
+export interface RemoteAudioAttachment {
+  readonly ready: Promise<void>;
+  close(): Promise<void>;
+}
+export interface RemoteAudioAttachmentOptions {
+  readonly onPlaybackError?: (failure: PlaybackFailure) => void;
+}
+
+export function attachRemoteAudio(
+  agent: Agent,
+  options: RemoteAudioAttachmentOptions = {},
+): RemoteAudioAttachment {
+  const catalog = audioCatalogs.get(agent);
+  if (!catalog) throw new TypeError("invalid agent");
+  return catalog.attachAudio(options);
+}
 
 function uint32(value: number, field: string): number {
   if (!Number.isInteger(value) || value < 0 || value > MAX_UINT32)
@@ -247,7 +266,7 @@ export class RemoteCatalog implements RemoteMedia {
   readonly #handles = new Map<string, ParticipantHandle>();
   readonly #slots = new Map<VideoHandle, number>();
   readonly #warned = new Set<VideoHandle>();
-  readonly #playback: RemoteAudioPlayback;
+  #playback: RemoteAudioPlayback | undefined;
   #closed = false;
   participants: readonly RemoteParticipant[] = Object.freeze([]);
   videoTracks: readonly RemoteVideoTrack[] = Object.freeze([]);
@@ -257,12 +276,68 @@ export class RemoteCatalog implements RemoteMedia {
     readonly data: DataRegistry,
     private readonly capacity: number,
     private readonly onChange: (video: readonly VideoDemand[]) => void,
-    logLevel: LogLevel = "warn",
+    private readonly owners: ResourceOwners,
+    private logLevel: LogLevel = "warn",
   ) {
-    this.#playback = new RemoteAudioPlayback(logLevel);
+    audioCatalogs.set(agent, this);
   }
   setLogLevel(level: LogLevel): void {
-    this.#playback.setLogLevel(level);
+    this.logLevel = level;
+    this.#playback?.setLogLevel(level);
+  }
+
+  attachAudio(options: RemoteAudioAttachmentOptions): RemoteAudioAttachment {
+    this.requireOpen();
+    let playback: RemoteAudioPlayback | undefined;
+    const retry = async () => {
+      const binding = owner.binding;
+      const current = playback;
+      if (!binding || !owner.current(binding) || !current) return;
+      current.update(this.agent.getSnapshot());
+      try {
+        await current.resume();
+      } catch (error) {
+        if (owner.current(binding)) throw error;
+      }
+    };
+    const report = (error: unknown) => {
+      const binding = owner.binding;
+      if (!binding || !owner.current(binding)) return;
+      const failure: PlaybackFailure = Object.freeze({
+        message: error instanceof Error ? error.message : String(error),
+        cause: error,
+        retry,
+      });
+      if (options.onPlaybackError) {
+        try {
+          options.onPlaybackError(failure);
+        } catch (error) {
+          console.error("PulseBeam playback error callback failed", error);
+        }
+      } else if (this.logLevel !== "off" && this.logLevel !== "error") {
+        console.warn(
+          "PulseBeam audio playback unavailable; retry from a user gesture",
+          failure,
+        );
+      }
+    };
+    const owner = this.owners.acquire(
+      { op: "claimAudio" },
+      {
+        bind: () => {
+          playback = new RemoteAudioPlayback(this.logLevel, report);
+          this.#playback = playback;
+          playback.start(this.agent.getSnapshot());
+        },
+        unbind: () => {
+          playback?.close();
+          if (playback && this.#playback === playback)
+            this.#playback = undefined;
+          playback = undefined;
+        },
+      },
+    );
+    return Object.freeze({ ready: owner.ready, close: () => owner.close() });
   }
 
   get closed(): boolean {
@@ -281,17 +356,26 @@ export class RemoteCatalog implements RemoteMedia {
     return handle;
   }
   resumeAudio(): Promise<void> {
-    return this.#playback.resume();
+    return (
+      this.#playback?.resume() ??
+      Promise.reject(
+        new ResourceError(
+          "unavailable",
+          "audio playback has no committed owner",
+        ),
+      )
+    );
   }
   resetPlayback(): void {
-    this.#playback.reset();
+    this.#playback?.reset();
   }
   read(id: string | undefined, buffer: Float32Array, spectrum: boolean): void {
-    this.#playback.read(id, buffer, spectrum);
+    if (this.#playback) this.#playback.read(id, buffer, spectrum);
+    else buffer.fill(spectrum ? -Infinity : 0);
   }
   update(snapshot: AgentSnapshot): void {
     if (this.#closed) return;
-    this.#playback.update(snapshot);
+    this.#playback?.update(snapshot);
     const byId = new Map<string, ParticipantHandle>();
     const participants: ParticipantHandle[] = [];
     for (const participant of snapshot.catalog.participants) {
@@ -426,7 +510,10 @@ export class RemoteCatalog implements RemoteMedia {
   close(): void {
     if (this.#closed) return;
     this.#closed = true;
-    this.#playback.close();
+    this.owners.close();
+    this.#playback?.close();
+    this.#playback = undefined;
+    audioCatalogs.delete(this.agent);
     for (const participant of this.#handles.values()) {
       for (const handle of participant.videos.values()) handle.close();
       for (const handle of participant.audios.values()) handle.close();

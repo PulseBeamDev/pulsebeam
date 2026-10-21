@@ -28,7 +28,7 @@ js_library(name = "component_sources", srcs = glob(["web/**"]))
 js_run_binary(
     name = "unit_javascript",
     tool = ":tsc",
-    srcs = [":node_modules", "web/topic.ts", "web/types.ts", "web/track.ts", "web/data.ts", "web/capture-source.ts", "web/agent-state.ts", "web/local-track.ts", "web/remote-catalog.ts", "web/remote-media.ts", "web/remote-audio.ts"],
+    srcs = [":node_modules", "web/topic.ts", "web/types.ts", "web/track.ts", "web/data.ts", "web/capture-source.ts", "web/agent-state.ts", "web/local-track.ts", "web/resources.ts", "web/remote-catalog.ts", "web/remote-media.ts", "web/remote-audio.ts"],
     args = ["--strict", "--target", "ES2022", "--module", "ESNext", "--moduleResolution", "Bundler", "--lib", "ES2022,DOM,DOM.Iterable", "--rootDir", "web", "--outDir", "unit-javascript", "web/topic.ts", "web/remote-catalog.ts", "web/agent-state.ts", "web/local-track.ts"],
     chdir = package_name(),
     out_dirs = ["unit-javascript"],

@@ -189,6 +189,8 @@
   let attachment;
   try {
     await source.resume();
+    const audioPlayback = pulsebeam.attachRemoteAudio(receiver);
+    await audioPlayback.ready;
     sender.local
       .video("camera")
       .setSource(createCaptureSource(videoTrack, "video"));
@@ -282,7 +284,7 @@
     };
     await until(
       audible,
-      "automatically routed real decoded tone without application audio UI",
+      "explicitly owned real decoded tone without application audio element",
     );
     assert(
       document.querySelector("audio") === null,
@@ -323,10 +325,7 @@
     attachment.close();
     assert(video.srcObject === null, "element cleanup");
     receiver.close();
-    await until(
-      () => outputRoutes.size === 0,
-      "automatic audio routes released",
-    );
+    await until(() => outputRoutes.size === 0, "owned audio routes released");
     sender.close();
     assert(
       videoTrack.readyState === "live" && audioTrack.readyState === "live",

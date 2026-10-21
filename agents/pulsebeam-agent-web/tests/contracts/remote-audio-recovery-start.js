@@ -1,5 +1,10 @@
 (async () => {
-  const { RemoteCatalog } = await import("/dist/remote-catalog.js");
+  const { RemoteCatalog, attachRemoteAudio } = await import(
+    "/dist/remote-catalog.js"
+  );
+  const { DataRegistry } = await import("/dist/data.js");
+  const { ResourceOwners } = await import("/dist/resources.js");
+  const { BrowserRuntime, whenInitialized } = await import("/dist/wasm.js");
   const RealContext = AudioContext;
   const contexts = [];
   window.AudioContext = class extends RealContext {
@@ -32,12 +37,39 @@
     },
     tracks: { A: { media: track, kind: "audio" } },
   };
+  snapshot.catalog.tracks = snapshot.catalog.publications;
+  const agent = { getSnapshot: () => snapshot, subscribe: () => () => {} };
+  const owners = new ResourceOwners(() => {});
   const catalog = new RemoteCatalog(
-    { getSnapshot: () => snapshot, subscribe: () => () => {} },
+    agent,
+    new DataRegistry(agent),
     0,
     () => {},
+    owners,
   );
   catalog.update(snapshot);
+  if (contexts.length !== 0)
+    throw new Error("observation created playback without an owner");
+  await whenInitialized();
+  const runtime = new BrowserRuntime({
+    endpoint: "http://localhost",
+    token: "late-owned-audio",
+    logLevel: "off",
+    topology: {
+      localVideos: 0,
+      localAudios: 0,
+      remoteVideos: 0,
+      remoteAudios: 2,
+    },
+  });
+  owners.activate(runtime);
+  let audioFailure;
+  const ownedAudio = attachRemoteAudio(agent, {
+    onPlaybackError: (failure) => {
+      audioFailure = failure;
+    },
+  });
+  await ownedAudio.ready;
   if (contexts[0].state !== "suspended")
     throw new Error("late-gesture premise was already activated");
   const canvas = document.createElement("canvas");
@@ -62,8 +94,8 @@
     {
       publicationIds: ["video"],
       autoPlay: false,
-      onPlaybackBlocked: (_, next) => {
-        retry = next;
+      onPlaybackBlocked: (failure) => {
+        retry = failure.retry;
       },
     },
   );
@@ -75,6 +107,7 @@
     );
   const state = {
     catalog,
+    runtime,
     source,
     track,
     video,
@@ -91,7 +124,7 @@
   button.id = "resume-audio";
   button.textContent = "Resume audio";
   button.onclick = () => {
-    void Promise.all([catalog.resumeAudio(), source.resume(), retry()]).then(
+    void Promise.all([audioFailure.retry(), source.resume(), retry()]).then(
       () => {
         state.ready = true;
       },

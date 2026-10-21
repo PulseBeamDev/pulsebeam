@@ -9,14 +9,17 @@ interface Route {
   readonly spectrum: Float32Array<ArrayBuffer>;
 }
 
-/** One decoded, audible route per negotiated receiver, owned by one Agent. */
+/** Physical routes for one committed core audio owner. */
 export class RemoteAudioPlayback {
   #context: AudioContext | undefined;
   #decoder: HTMLAudioElement | undefined;
   #routes = new Map<number, Route>();
   #closed = false;
 
-  constructor(private logLevel: LogLevel) {}
+  constructor(
+    private logLevel: LogLevel,
+    private onFailure?: (error: unknown) => void,
+  ) {}
 
   setLogLevel(level: LogLevel): void {
     this.logLevel = level;
@@ -46,7 +49,28 @@ export class RemoteAudioPlayback {
     }
   }
 
+  start(snapshot: AgentSnapshot): void {
+    if (this.#closed) return;
+    try {
+      this.#contextForPlayback();
+    } catch (error) {
+      this.#warn(error);
+      return;
+    }
+    this.#update(snapshot, true);
+  }
+
   update(snapshot: AgentSnapshot): void {
+    this.#update(snapshot, false);
+  }
+
+  #resumeAutomatically(): void {
+    if (this.#context?.state !== "running")
+      this.#warn(new Error("browser audio context is suspended"));
+    void this.resume().catch(() => {});
+  }
+
+  #update(snapshot: AgentSnapshot, starting: boolean): void {
     if (this.#closed) return;
     const bindings = new Map(
       snapshot.mapping.audio.map((entry) => [entry.receiverIndex, entry]),
@@ -66,6 +90,7 @@ export class RemoteAudioPlayback {
     }
     if (!available) {
       this.#syncDecoder();
+      if (starting) this.#resumeAutomatically();
       return;
     }
     for (const [index, binding] of bindings) {
@@ -100,11 +125,14 @@ export class RemoteAudioPlayback {
     try {
       const changed = this.#syncDecoder();
       const context = this.#context;
-      if (!context || !this.#routes.size) return;
-      if (context.state !== "running")
-        this.#warn(new Error("browser audio context is suspended"));
-      if (changed || context.state !== "running" || this.#decoder?.paused)
-        void this.resume().catch(() => {});
+      if (!context || (!this.#routes.size && !starting)) return;
+      if (
+        starting ||
+        changed ||
+        context.state !== "running" ||
+        this.#decoder?.paused
+      )
+        this.#resumeAutomatically();
     } catch (error) {
       this.#warn(error);
     }
@@ -168,10 +196,14 @@ export class RemoteAudioPlayback {
   }
 
   #warn(error: unknown): void {
-    if (this.#closed || this.logLevel === "off" || this.logLevel === "error")
+    if (this.#closed) return;
+    if (this.onFailure) {
+      this.onFailure(error);
       return;
+    }
+    if (this.logLevel === "off" || this.logLevel === "error") return;
     console.warn(
-      "PulseBeam remote audio playback unavailable; call agent.remote.resumeAudio() from a user gesture",
+      "PulseBeam remote audio playback unavailable; retry from a user gesture",
       error,
     );
   }

@@ -2,6 +2,8 @@
   const { RemoteCatalog, attachRemoteVideo } = await import(
     "/dist/remote-catalog.js"
   );
+  const { DataRegistry } = await import("/dist/data.js");
+  const { ResourceOwners } = await import("/dist/resources.js");
   const snapshot = {
     connection: "disconnected",
     catalog: {
@@ -27,9 +29,16 @@
     },
   };
   let wire = [];
-  const catalog = new RemoteCatalog(agent, 1, (next) => {
-    wire = next;
-  });
+  snapshot.catalog.tracks = snapshot.catalog.publications;
+  const catalog = new RemoteCatalog(
+    agent,
+    new DataRegistry(agent),
+    1,
+    (next) => {
+      wire = next;
+    },
+    new ResourceOwners(() => {}),
+  );
   catalog.update(snapshot);
   const handle = catalog.participant("alice").video("camera");
   handle.setReceiveOptions({ minHeight: 720 });

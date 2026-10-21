@@ -120,6 +120,71 @@ export async function localOperationContract(BrowserRuntime) {
       contentHint: "motion",
     });
 
+    await runtime.replace_local_track("v0", null, { contentHint: "motion" });
+    const publication = await runtime.resource({
+      op: "claimPublication",
+      spec: { kind: "video", label: "camera" },
+    });
+    releaseReplacement = undefined;
+    RTCRtpSender.prototype.replaceTrack = function (track) {
+      pendingTrack = track;
+      return new Promise((resolve, reject) => {
+        releaseReplacement = () =>
+          originalReplaceTrack.call(this, track).then(resolve, reject);
+      });
+    };
+    const ownedClonesBefore = ownedTracks.length;
+    const ownedReplacing = runtime
+      .replace_owned_track(publication.owner, firstTrack, {
+        contentHint: "motion",
+      })
+      .then(
+        () => false,
+        (error) => error.pulsebeamCode === "released",
+      );
+    await waitFor(() => releaseReplacement, "owned blocked replacement");
+    await runtime.set_owned_muted(publication.owner, true);
+    const mutedOwnedClone = !pendingTrack.enabled && firstTrack.enabled;
+    const staleReplacement = runtime
+      .replace_owned_track(publication.owner, thirdTrack, {
+        contentHint: "motion",
+      })
+      .then(
+        () => false,
+        (error) => error.pulsebeamCode === "released",
+      );
+    await runtime.resource({ op: "release", owner: publication.owner });
+    const releasedImmediately =
+      pendingTrack.readyState === "ended" && firstTrack.readyState === "live";
+    const reused = await runtime.resource({
+      op: "claimPublication",
+      spec: { kind: "video", label: "screen" },
+    });
+    const reusedReplacing = runtime.replace_owned_track(
+      reused.owner,
+      secondTrack,
+      { contentHint: "text" },
+    );
+    RTCRtpSender.prototype.replaceTrack = originalReplaceTrack;
+    releaseReplacement();
+    const [oldFenced, queuedFenced] = await Promise.all([
+      ownedReplacing,
+      staleReplacement,
+      reusedReplacing,
+    ]);
+    const reusedClone = ownedTracks.at(-1);
+    const ownerReuseFenced =
+      oldFenced &&
+      queuedFenced &&
+      mutedOwnedClone &&
+      releasedImmediately &&
+      reused.slot === publication.slot &&
+      reused.owner !== publication.owner &&
+      ownedTracks.length === ownedClonesBefore + 2 &&
+      cloneSources.get(reusedClone) === secondTrack &&
+      reusedClone.enabled;
+    await runtime.resource({ op: "release", owner: reused.owner });
+
     holdParameters = true;
     const callsBeforeClosing = parameterCalls;
     const closing = runtime.replace_local_track("v0", thirdTrack, {
@@ -147,6 +212,7 @@ export async function localOperationContract(BrowserRuntime) {
 
     return {
       serializedBeforeRelease,
+      ownerReuseFenced: ownerReuseFenced && reusedClone.readyState === "ended",
       finalTrackWins:
         finalTrackWins &&
         disabledRetainsSender &&

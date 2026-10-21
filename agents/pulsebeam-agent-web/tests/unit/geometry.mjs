@@ -5,6 +5,7 @@ import {
   attachRemoteVideo,
 } from "../../unit-javascript/remote-catalog.js";
 import { DataRegistry } from "../../unit-javascript/data.js";
+import { ResourceOwners } from "../../unit-javascript/resources.js";
 import {
   Video,
   Resize,
@@ -42,6 +43,7 @@ test("production attachment policy derives demand from controlled geometry and v
     (next) => {
       demand = next;
     },
+    new ResourceOwners(() => {}),
   );
   catalog.update(snapshot);
   const handle = catalog.participant("alice").video("camera");

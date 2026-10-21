@@ -27,8 +27,17 @@ export type {
   CapturedVideoTrack,
 } from "./capture-source.js";
 export { attachRemoteMedia } from "./remote-media.js";
-export { attachRemoteVideo, validateReceiveOptions } from "./remote-catalog.js";
-export type { RemoteVideoAttachment } from "./remote-catalog.js";
+export {
+  attachRemoteAudio,
+  attachRemoteVideo,
+  validateReceiveOptions,
+} from "./remote-catalog.js";
+export { ResourceError, ResourceOwnershipError } from "./resources.js";
+export type {
+  RemoteAudioAttachment,
+  RemoteAudioAttachmentOptions,
+  RemoteVideoAttachment,
+} from "./remote-catalog.js";
 export type {
   Agent,
   AgentConfig,

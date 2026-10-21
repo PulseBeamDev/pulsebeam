@@ -28,6 +28,8 @@
   } finally {
     state.attachment.close();
     state.catalog.close();
+    state.runtime.abort();
+    state.runtime.free();
     clearInterval(state.painting);
     state.track.stop();
     state.videoTrack.stop();

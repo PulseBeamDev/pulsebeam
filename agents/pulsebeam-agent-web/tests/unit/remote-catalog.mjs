@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { RemoteCatalog } from "../../unit-javascript/remote-catalog.js";
 import { DataRegistry } from "../../unit-javascript/data.js";
+import { ResourceOwners } from "../../unit-javascript/resources.js";
 
 function fixture(capacity = 2) {
   let snapshot = {
@@ -18,6 +19,7 @@ function fixture(capacity = 2) {
     new DataRegistry(agent),
     capacity,
     (next) => (intent = next),
+    new ResourceOwners(() => {}),
   );
   return {
     catalog,

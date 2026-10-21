@@ -476,6 +476,7 @@ export interface Agent {
 export type PlaybackFailure = Readonly<{
   message: string;
   cause?: unknown;
+  retry(): Promise<void>;
 }>;
 
 export type RemoteMediaAttachmentOptions = Readonly<{

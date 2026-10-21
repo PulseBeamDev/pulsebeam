@@ -154,6 +154,8 @@ pub(crate) trait Host {
     fn execute_effect(&self, effect: Effect);
     fn host_failed(&self, failure: &Failure);
     fn shutdown(&self);
+    fn publication_claimed(&self, _owner: u64, _slot: &str) {}
+    fn resource_released(&self, _owner: u64) {}
 }
 
 pub(crate) enum PublicCommand {
@@ -526,7 +528,17 @@ impl<H: Host> Actor<H> {
                 command,
                 completion,
             } => {
+                let release = match &command {
+                    agent_core::ResourceCommand::Release { owner } => Some(*owner),
+                    _ => None,
+                };
                 let (result, turn) = self.driver.resource(command);
+                if let Ok(agent_core::ResourceResult::Publication { owner, slot }) = &result {
+                    self.host.publication_claimed(*owner, slot);
+                }
+                if let Some(owner) = release {
+                    self.host.resource_released(owner);
+                }
                 self.publish_turn(turn);
                 let _ = completion.send(result);
             }

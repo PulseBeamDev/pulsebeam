@@ -18,10 +18,11 @@ function samePublicationIds(
   return left.size === right.size && [...left].every((id) => right.has(id));
 }
 
-function failure(error: unknown): PlaybackFailure {
+function failure(error: unknown, retry: () => Promise<void>): PlaybackFailure {
   return Object.freeze({
     message: error instanceof Error ? error.message : String(error),
     cause: error,
+    retry,
   });
 }
 
@@ -123,7 +124,8 @@ class Attachment implements RemoteMediaAttachment {
       ) {
         return;
       }
-      this.#onPlaybackBlocked?.(failure(error), () => this.#play());
+      const retry = () => this.#play();
+      this.#onPlaybackBlocked?.(failure(error, retry), retry);
     });
   }
 }

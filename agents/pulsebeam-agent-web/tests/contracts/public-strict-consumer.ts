@@ -5,6 +5,8 @@ import {
   createCaptureSource,
   attachRemoteMedia,
   attachRemoteVideo,
+  attachRemoteAudio,
+  ResourceOwnershipError,
   LocalTrackCapacityError,
   type AgentError,
   type AgentEvent,
@@ -31,6 +33,16 @@ const binaryAgent = createAgent({
   endpoint: "https://pulsebeam.example",
   token: "opaque",
 });
+const audioPlayback = attachRemoteAudio(binaryAgent, {
+  onPlaybackError(failure) {
+    const retry: () => Promise<void> = failure.retry;
+    void retry;
+  },
+});
+const playbackReady: Promise<void> = audioPlayback.ready;
+const playbackClosed: Promise<void> = audioPlayback.close();
+const ownershipError: Error = new ResourceOwnershipError("already owned");
+void [playbackReady, playbackClosed, ownershipError];
 const binarySpec = track.data("chat", "ordered");
 const binary = binaryAgent.track(binarySpec);
 const binarySend: Promise<void> = binary.send(new Uint8Array([0, 255]));
@@ -285,8 +297,6 @@ agent.remoteAudio;
 agent.remoteAudioTracks;
 // @ts-expect-error Old local lookup methods were removed.
 agent.localVideoTrack("camera");
-// @ts-expect-error Explicit audio attachments were removed.
-import { attachRemoteAudio } from "../../web/index.js";
 // @ts-expect-error Generic attachment cannot provide an alternate audio playback model.
 attachRemoteMedia(agent, audioElement, { publicationIds: [] });
 

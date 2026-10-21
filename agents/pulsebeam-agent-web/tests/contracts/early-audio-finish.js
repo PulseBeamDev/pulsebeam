@@ -1,5 +1,5 @@
 (async () => {
-  const { catalog, contexts, RealContext } = window.__earlyAudio;
+  const { catalog, contexts, RealContext, runtime } = window.__earlyAudio;
   const wait = async (condition, label) => {
     for (let i = 0; i < 500; i++) {
       if (condition()) return;
@@ -62,15 +62,20 @@
       return connect.call(this, destination, ...args);
     };
     try {
+      const publication = {
+        id: "A",
+        participantId: "alice",
+        kind: "audio",
+        label: "voice",
+      };
       catalog.update({
         connection: "connected",
         participantId: "self",
         catalog: {
           revision: 1,
           participants: [{ participantId: "alice" }],
-          publications: [
-            { id: "A", participantId: "alice", kind: "audio", label: "voice" },
-          ],
+          publications: [publication],
+          tracks: [publication],
         },
         mapping: {
           acceptedIntentRevision: 1,
@@ -101,6 +106,8 @@
     return true;
   } finally {
     catalog.close();
+    runtime.abort();
+    runtime.free();
     window.AudioContext = RealContext;
     for (const peer of peers) peer.close();
     track?.stop();

@@ -80,6 +80,8 @@ export async function resourceContract(BrowserRuntime) {
       [],
       "mailbox backpressure cannot discard owner release",
     );
+    const { audioOwnershipContract } = await import("./audio-ownership.mjs");
+    await audioOwnershipContract(runtime);
     runtime.replace_desired({
       connected: false,
       topics: Array.from({ length: 64 }, (_, index) => ({

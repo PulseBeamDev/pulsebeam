@@ -37,6 +37,7 @@ import type {
 } from "./types.js";
 import { RemoteCatalog } from "./remote-catalog.js";
 import { TopicRegistry } from "./topic.js";
+import { ResourceOwners } from "./resources.js";
 import { BrowserRuntime, whenInitialized } from "./wasm.js";
 import {
   copyConfig,
@@ -129,6 +130,13 @@ class AgentFacade implements Agent {
   #jsxMutation = false;
   #localOperations = new Map<string, number>();
   readonly #data = new DataRegistry(this);
+  readonly #resources = new ResourceOwners((error) => {
+    if (
+      this.#runtimeConfig.logLevel !== "off" &&
+      this.#runtimeConfig.logLevel !== "error"
+    )
+      console.warn("PulseBeam resource ownership failed", error);
+  });
   readonly #remote: RemoteCatalog;
   readonly #topics: TopicRegistry;
   #managedVideo: readonly VideoDemand[] = [];
@@ -154,6 +162,7 @@ class AgentFacade implements Agent {
         this.#managedVideo = video;
         this.#applyState(this.#state);
       },
+      this.#resources,
       runtimeConfig.logLevel,
     );
     this.#topics = new TopicRegistry(
@@ -199,6 +208,7 @@ class AgentFacade implements Agent {
         }
         this.#runtime = runtime;
         this.#data.activate(runtime);
+        this.#resources.activate(runtime);
         runtime.set_event_listener((event: unknown) => {
           if (active()) this.#runtimeEvent(event);
         });
@@ -214,6 +224,7 @@ class AgentFacade implements Agent {
           if (active())
             this.#terminalFailure("invalid-configuration", message(error));
           this.#data.deactivate();
+          this.#resources.deactivate();
           runtime.abort();
           this.#runtime = undefined;
           this.#runtimeGeneration = null;
@@ -256,6 +267,7 @@ class AgentFacade implements Agent {
     this.#runtime = undefined;
     this.#runtimeGeneration = null;
     this.#data.deactivate();
+    this.#resources.deactivate();
     if (runtime) {
       runtime.set_snapshot_listener();
       runtime.set_event_listener();
@@ -590,6 +602,7 @@ class AgentFacade implements Agent {
       runtime.close();
       runtime.abort();
     }
+    this.#resources.close();
     this.#data.close();
     this.#topics.close();
     this.#remote.close();

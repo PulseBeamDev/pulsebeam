@@ -1,5 +1,10 @@
 (async () => {
-  const { RemoteCatalog } = await import("/dist/remote-catalog.js");
+  const { RemoteCatalog, attachRemoteAudio } = await import(
+    "/dist/remote-catalog.js"
+  );
+  const { DataRegistry } = await import("/dist/data.js");
+  const { ResourceOwners } = await import("/dist/resources.js");
+  const { BrowserRuntime, whenInitialized } = await import("/dist/wasm.js");
   const RealContext = window.AudioContext;
   const connect = AudioNode.prototype.connect;
   const disconnect = AudioNode.prototype.disconnect;
@@ -52,6 +57,7 @@
   const left = new RTCPeerConnection();
   const right = new RTCPeerConnection();
   const catalogs = [];
+  const runtimes = [];
   const captured = [];
   try {
     await sourceContext.resume();
@@ -107,10 +113,37 @@
       tracks: { A: { media: received[0], kind: "audio" } },
     };
     const fake = { getSnapshot: () => snapshot, subscribe: () => () => {} };
-    const catalog = new RemoteCatalog(fake, 0, () => {});
+    snapshot.catalog.tracks = snapshot.catalog.publications;
+    const owners = new ResourceOwners(() => {});
+    const catalog = new RemoteCatalog(
+      fake,
+      new DataRegistry(fake),
+      0,
+      () => {},
+      owners,
+    );
     catalogs.push(catalog);
-    // No lookup, pull read or UI mount starts playback.
     catalog.update(snapshot);
+    assert(
+      contexts.length === 0 && decoders.length === 0,
+      "catalog observation cannot start playback",
+    );
+    await whenInitialized();
+    const runtime = new BrowserRuntime({
+      endpoint: "http://localhost",
+      token: "audio-playback-witness",
+      logLevel: "off",
+      topology: {
+        localVideos: 0,
+        localAudios: 0,
+        remoteVideos: 0,
+        remoteAudios: 2,
+      },
+    });
+    runtimes.push(runtime);
+    owners.activate(runtime);
+    const attachment = attachRemoteAudio(fake);
+    await attachment.ready;
     const sdkContext = contexts[0];
     const output = outputs.get(sdkContext);
     const peak = (data) =>
@@ -125,7 +158,7 @@
     };
     await wait(
       () => Math.abs(outputFrequency() - 440) < 45,
-      "SDK output without UI",
+      "explicitly owned SDK output without application audio element",
       async () =>
         JSON.stringify({
           context: sdkContext.state,
@@ -192,6 +225,10 @@
     return true;
   } finally {
     catalogs.forEach((catalog) => catalog.close());
+    runtimes.forEach((runtime) => {
+      runtime.abort();
+      runtime.free();
+    });
     left.close();
     right.close();
     captured.forEach((track) => track.stop());

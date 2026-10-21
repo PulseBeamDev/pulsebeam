@@ -428,6 +428,27 @@ impl Host for BrowserHost {
         };
         inner.shutdown();
     }
+
+    fn publication_claimed(&self, owner: u64, slot: &str) {
+        let Some(inner) = self.inner.upgrade() else {
+            return;
+        };
+        inner
+            .publication_slots
+            .borrow_mut()
+            .insert(owner, slot.into());
+        inner.invalidate_local_slot(slot);
+    }
+
+    fn resource_released(&self, owner: u64) {
+        let Some(inner) = self.inner.upgrade() else {
+            return;
+        };
+        let slot = inner.publication_slots.borrow_mut().remove(&owner);
+        if let Some(slot) = slot {
+            inner.invalidate_local_slot(&slot);
+        }
+    }
 }
 
 struct RuntimeInner {
@@ -438,6 +459,7 @@ struct RuntimeInner {
     local_tracks: RefCell<BTreeMap<String, LocalTrackState>>,
     local_muted: RefCell<BTreeMap<String, bool>>,
     local_source_revisions: RefCell<BTreeMap<String, u64>>,
+    publication_slots: RefCell<BTreeMap<u64, String>>,
     peers: RefCell<BTreeMap<u64, Peer>>,
     requests: RefCell<BTreeMap<u64, AbortController>>,
     timers: RefCell<BTreeMap<u64, TimerHandle>>,
@@ -518,6 +540,7 @@ impl BrowserRuntime {
             local_tracks: RefCell::new(BTreeMap::new()),
             local_muted: RefCell::new(BTreeMap::new()),
             local_source_revisions: RefCell::new(BTreeMap::new()),
+            publication_slots: RefCell::new(BTreeMap::new()),
             peers: RefCell::new(BTreeMap::new()),
             requests: RefCell::new(BTreeMap::new()),
             timers: RefCell::new(BTreeMap::new()),
@@ -617,7 +640,10 @@ impl BrowserRuntime {
             LocalOperationError::validation(format!("invalid sender configuration: {error}"))
                 .into_js()
         })?;
-        let result = self.inner.replace_local_track(slot, track, config).await;
+        let result = self
+            .inner
+            .replace_local_track(slot, track, config, None)
+            .await;
         self.inner.ensure_open()?;
         result.map_err(LocalOperationError::into_js)
     }
@@ -627,6 +653,52 @@ impl BrowserRuntime {
         let result = self.inner.set_local_muted(slot, muted).await;
         self.inner.ensure_open()?;
         result.map_err(LocalOperationError::into_js)
+    }
+
+    #[wasm_bindgen(unchecked_return_type = "Promise<void>")]
+    pub fn replace_owned_track(
+        &self,
+        owner: u64,
+        track: Option<MediaStreamTrack>,
+        config: JsValue,
+    ) -> Result<js_sys::Promise, JsValue> {
+        self.inner.ensure_open()?;
+        let slot = self.inner.publication_slot(owner)?;
+        let config: SenderConfig = serde_wasm_bindgen::from_value(config).map_err(|error| {
+            LocalOperationError::validation(format!("invalid sender configuration: {error}"))
+                .into_js()
+        })?;
+        let inner = Rc::downgrade(&self.inner);
+        Ok(future_to_promise(async move {
+            let inner = inner
+                .upgrade()
+                .ok_or_else(|| js_error("runtime is closed"))?;
+            let result = inner
+                .replace_local_track(slot, track, config, Some(owner))
+                .await;
+            inner.ensure_open()?;
+            inner.publication_slot(owner)?;
+            result.map_err(LocalOperationError::into_js)?;
+            Ok(JsValue::UNDEFINED)
+        }))
+    }
+
+    #[wasm_bindgen(unchecked_return_type = "Promise<void>")]
+    pub fn set_owned_muted(&self, owner: u64, muted: bool) -> Result<js_sys::Promise, JsValue> {
+        self.inner.ensure_open()?;
+        let slot = self.inner.publication_slot(owner)?;
+        let inner = Rc::downgrade(&self.inner);
+        Ok(future_to_promise(async move {
+            let inner = inner
+                .upgrade()
+                .ok_or_else(|| js_error("runtime is closed"))?;
+            inner.publication_slot(owner)?;
+            inner
+                .set_local_muted(slot, muted)
+                .await
+                .map_err(LocalOperationError::into_js)?;
+            Ok(JsValue::UNDEFINED)
+        }))
     }
 
     pub fn remote_track(&self, receiver_index: u32) -> Option<MediaStreamTrack> {
@@ -857,11 +929,63 @@ impl RuntimeInner {
             .map_or_else(agent_core::Snapshot::default, |actor| actor.snapshot())
     }
 
+    fn publication_slot(&self, owner: u64) -> Result<String, JsValue> {
+        self.publication_slots
+            .borrow()
+            .get(&owner)
+            .cloned()
+            .ok_or_else(|| {
+                resources::error(agent_core::AgentError::InvalidResource(
+                    agent_core::TrackResourceError::Released,
+                ))
+            })
+    }
+
+    fn invalidate_local_slot(self: &Rc<Self>, slot: &str) {
+        let revision = {
+            let mut revisions = self.local_source_revisions.borrow_mut();
+            let current = revisions.entry(slot.into()).or_default();
+            let Some(next) = current.checked_add(1) else {
+                drop(revisions);
+                self.report_error("local source revision exhausted".into());
+                self.shutdown();
+                return;
+            };
+            *current = next;
+            next
+        };
+        if let Some(state) = self.local_tracks.borrow_mut().remove(slot) {
+            state.track.stop();
+        }
+        self.local_muted.borrow_mut().remove(slot);
+        if self.peers.borrow().is_empty() {
+            return;
+        }
+        let inner = Rc::downgrade(self);
+        let slot = slot.to_owned();
+        spawn_local(async move {
+            let Some(inner) = inner.upgrade() else { return };
+            let Some(gate) = inner.local_operation_gates.get(&slot) else {
+                return;
+            };
+            let _permit = gate.enter().await;
+            if inner.is_closed()
+                || inner.local_source_revisions.borrow().get(&slot) != Some(&revision)
+            {
+                return;
+            }
+            if let Err(error) = inner.sync_local_slot(&slot).await {
+                inner.report_error(error);
+            }
+        });
+    }
+
     async fn replace_local_track(
         self: &Rc<Self>,
         slot: String,
         track: Option<MediaStreamTrack>,
         config: SenderConfig,
+        owner: Option<u64>,
     ) -> Result<(), LocalOperationError> {
         let kind = self.local_slots.get(&slot).copied().ok_or_else(|| {
             LocalOperationError::validation(format!("unknown local publication slot: {slot}"))
@@ -872,6 +996,10 @@ impl RuntimeInner {
             ))
         })?;
         self.ensure_local_operation_open()?;
+        if let Some(owner) = owner {
+            self.publication_slot(owner)
+                .map_err(|_| LocalOperationError::runtime("publication owner was released"))?;
+        }
         let config = if track.is_some() {
             normalize_sender_config(kind, config).map_err(LocalOperationError::validation)?
         } else {
@@ -903,6 +1031,10 @@ impl RuntimeInner {
         self.ensure_local_operation_open()?;
         if self.local_source_revisions.borrow().get(&slot) != Some(&revision) {
             return Ok(());
+        }
+        if let Some(owner) = owner {
+            self.publication_slot(owner)
+                .map_err(|_| LocalOperationError::runtime("publication owner was released"))?;
         }
         let previous = if let Some(track) = &track {
             let muted = self
@@ -939,6 +1071,10 @@ impl RuntimeInner {
         self.sync_local_slot(&slot)
             .await
             .map_err(LocalOperationError::runtime)?;
+        if let Some(owner) = owner {
+            self.publication_slot(owner)
+                .map_err(|_| LocalOperationError::runtime("publication owner was released"))?;
+        }
         self.ensure_local_operation_open()
     }
 
@@ -963,6 +1099,7 @@ impl RuntimeInner {
     }
 
     async fn sync_local_slot(&self, slot: &str) -> Result<(), String> {
+        let revision = self.local_source_revisions.borrow().get(slot).copied();
         let state = self.local_tracks.borrow().get(slot).cloned();
         let senders: Vec<RtcRtpSender> = self
             .peers
@@ -977,7 +1114,14 @@ impl RuntimeInner {
             })
             .collect();
         for sender in senders {
-            apply_sender_state(&self.logger, &sender, state.as_ref()).await?;
+            if self.local_source_revisions.borrow().get(slot).copied() != revision {
+                return Ok(());
+            }
+            let result = apply_sender_state(&self.logger, &sender, state.as_ref()).await;
+            if self.local_source_revisions.borrow().get(slot).copied() != revision {
+                return Ok(());
+            }
+            result?;
         }
         Ok(())
     }
@@ -1671,6 +1815,7 @@ impl RuntimeInner {
         }
         self.local_muted.borrow_mut().clear();
         self.local_source_revisions.borrow_mut().clear();
+        self.publication_slots.borrow_mut().clear();
     }
 
     fn shutdown(&self) {
