@@ -4,18 +4,51 @@ load("@rules_rust_wasm_bindgen//:defs.bzl", "rust_wasm_bindgen_toolchain")
 
 package(default_visibility = ["//visibility:public"])
 
+py_test(
+    name = "webrtc_candidate_contract",
+    srcs = ["tests/webrtc_candidate_test.py", "prepare-webrtc-candidate.py", "webrtc_candidate.py"],
+    main = "tests/webrtc_candidate_test.py",
+    data = ["@webrtc_source//:Cargo.toml", "@webrtc_source//:provenance", "@libwebrtc_core//:manifest.json", "@libwebrtc_core//:candidate"],
+    args = ["$(rootpath @webrtc_source//:Cargo.toml)", "$(rootpath @libwebrtc_core//:manifest.json)"],
+    env = {"PYTHONDONTWRITEBYTECODE": "1"},
+)
+
+py_binary(
+    name = "prepare-webrtc-candidate",
+    srcs = ["prepare-webrtc-candidate.py", "webrtc_candidate.py"],
+    main = "prepare-webrtc-candidate.py",
+    imports = ["."],
+    data = ["webrtc-candidate.json"],
+)
+
+py_binary(
+    name = "validate-webrtc-candidate",
+    srcs = ["webrtc_candidate.py"],
+    main = "webrtc_candidate.py",
+)
+
+genrule(
+    name = "webrtc_candidate_validated",
+    srcs = ["@webrtc_source//:Cargo.toml", "@webrtc_source//:provenance", "@libwebrtc_core//:manifest.json", "@libwebrtc_core//:candidate"],
+    tools = [":validate-webrtc-candidate"],
+    outs = ["webrtc-candidate.validated"],
+    cmd = "$(location :validate-webrtc-candidate) --source-manifest $(location @webrtc_source//:Cargo.toml) --native-manifest $(location @libwebrtc_core//:manifest.json) --output $@",
+)
+
 cc_import(
     name = "libwebrtc_core",
+    visibility = ["//visibility:private"],
     static_library = "@libwebrtc_core//:lib/libwebrtc.a",
 )
 
 cc_library(
     name = "libwebrtc_native",
     deps = [":libwebrtc_core"],
+    data = [":webrtc_candidate_validated"],
     linkopts = ["-lpthread", "-ldl", "-lrt", "-lm"],
 )
 
-exports_files(["browser-matrix.json", "rust-pins.MODULE.bazel", "rust-metadata.bzl", "wasm-deps.bzl", "generators.toml", "run-simulations.py", "check-js-format.py", "scoreboard.py", "static-server.py", "cmake.sh"] + glob(["rust/**", "patches/**"]))
+exports_files(["browser-matrix.json", "rust-pins.MODULE.bazel", "rust-metadata.bzl", "wasm-deps.bzl", "generators.toml", "run-simulations.py", "check-js-format.py", "scoreboard.py", "static-server.py", "cmake.sh", "webrtc-candidate.json", "webrtc-source.BUILD.bazel", "webrtc-native.BUILD.bazel"] + glob(["rust/**", "patches/**"]))
 
 rust_wasm_bindgen_toolchain(
     name = "wasm_bindgen_toolchain_impl",

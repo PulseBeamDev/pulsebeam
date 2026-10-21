@@ -1,0 +1,4 @@
+package(default_visibility = ["//visibility:public"])
+exports_files(["lib/libwebrtc.a", "manifest.json"])
+filegroup(name = "candidate", srcs = glob(["**"], exclude = ["BUILD.bazel"]))
+filegroup(name = "licenses", srcs = glob(["LICENSES/**"]))
