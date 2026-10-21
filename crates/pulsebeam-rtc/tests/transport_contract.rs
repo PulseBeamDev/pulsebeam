@@ -95,14 +95,19 @@ fn input(local: SocketAddr, remote: SocketAddr, tcp: bool, payload: Bytes) -> Ne
     }
 }
 
-fn replies(connection: &mut Connection, at: Instant) -> Vec<Transmit> {
+fn replies(
+    connection: &mut Connection,
+    at: Instant,
+) -> (Vec<Transmit>, Vec<pulsebeam_rtc::AuthenticatedPath>) {
     let mut replies = Vec::new();
+    let mut paths = Vec::new();
     for _ in 0..512 {
         match connection.poll(at) {
             Output::Transmit(packet) => replies.push(packet),
             Output::Idle { next_wakeup } if next_wakeup.is_none_or(|next| next > at) => {
-                return replies;
+                return (replies, paths);
             }
+            Output::Event(Event::AuthenticatedPath(path)) => paths.push(path),
             Output::Idle { .. } | Output::Event(Event::BandwidthEstimate(_)) => {}
             output => panic!("unexpected protocol output: {output:?}"),
         }
@@ -147,7 +152,8 @@ fn caller_budgets_alternate_owned_batches_without_draining_a_connection() {
             // Budget exhaustion schedules an immediate continuation, not a forced drain.
             next_wakeup[index] = Some(*at);
             let mut batch = std::collections::VecDeque::new();
-            for _ in 0..2 {
+            // Protocol facts consume service budget, not socket batch capacity.
+            for _ in 0..8 {
                 match connection.poll(*at) {
                     Output::Transmit(transmit) => {
                         assert_eq!(transmit.kind, pulsebeam_rtc::TransmitKind::Control);
@@ -162,6 +168,9 @@ fn caller_budgets_alternate_owned_batches_without_draining_a_connection() {
                     }
                     Output::Event(_) => {}
                     output => panic!("unexpected output: {output:?}"),
+                }
+                if batch.len() == 2 {
+                    break;
                 }
             }
             assert!(batch.len() <= 2);
@@ -227,7 +236,20 @@ fn authenticated_ice_replies_use_exact_udp_and_tcp_tuples() {
                 connection
                     .receive(at, at, input(local, remote, tcp, payload.clone()))
                     .expect("authenticated input");
-                let replies = replies(&mut connection, at);
+                let (replies, paths) = replies(&mut connection, at);
+                assert_eq!(
+                    paths,
+                    vec![pulsebeam_rtc::AuthenticatedPath {
+                        protocol: if tcp {
+                            pulsebeam_rtc::NetworkProtocol::IceTcp
+                        } else {
+                            pulsebeam_rtc::NetworkProtocol::Udp
+                        },
+                        local,
+                        remote,
+                        arrival: at,
+                    }]
+                );
                 assert!(!replies.is_empty());
                 for packet in replies {
                     let expected = if tcp {
@@ -259,6 +281,30 @@ fn authenticated_ice_replies_use_exact_udp_and_tcp_tuples() {
 }
 
 #[test]
+fn delayed_budgeted_service_preserves_each_authenticated_input_tuple_and_arrival() {
+    let local = "192.0.2.1:5000".parse().unwrap();
+    let (mut connection, start) = connection(local, false);
+    let now = start + std::time::Duration::from_millis(20);
+    let mut expected = Vec::new();
+    for (index, peer) in ["192.0.2.2:5001", "192.0.2.3:5002"].iter().enumerate() {
+        let remote = peer.parse().unwrap();
+        let arrival = start + std::time::Duration::from_millis(index as u64);
+        let payload = request(&format!("{UFRAG}:chromeufrag"), Some(PASSWORD.as_bytes()));
+        connection
+            .receive(now, arrival, input(local, remote, false, payload))
+            .unwrap();
+        expected.push(pulsebeam_rtc::AuthenticatedPath {
+            protocol: pulsebeam_rtc::NetworkProtocol::Udp,
+            local,
+            remote,
+            arrival,
+        });
+    }
+    let (_, paths) = replies(&mut connection, now);
+    assert_eq!(paths, expected);
+}
+
+#[test]
 fn route_hints_and_invalid_credentials_never_get_success_replies() {
     let local = "192.0.2.1:5000".parse().expect("local");
     let remote = "192.0.2.2:5001".parse().expect("remote");
@@ -275,7 +321,9 @@ fn route_hints_and_invalid_credentials_never_get_success_replies() {
             connection
                 .receive(at, at, input(local, remote, tcp, payload.clone()))
                 .expect("hostile input is isolated");
-            assert!(replies(&mut connection, at).is_empty());
+            let (replies, paths) = replies(&mut connection, at);
+            assert!(replies.is_empty());
+            assert!(paths.is_empty());
             assert!(connection.stats().connection.dropped_network_inputs > 0);
         }
     }
@@ -299,7 +347,9 @@ fn tcp_input_requires_exactly_one_complete_rfc4571_frame() {
                 },
             )
             .expect("malformed input is isolated");
-        assert!(replies(&mut connection, at).is_empty());
+        let (replies, paths) = replies(&mut connection, at);
+        assert!(replies.is_empty());
+        assert!(paths.is_empty());
         assert_eq!(
             connection.stats().connection.dropped_network_inputs,
             dropped + 1
@@ -309,5 +359,5 @@ fn tcp_input_requires_exactly_one_complete_rfc4571_frame() {
     connection
         .receive(at, at, input(local, remote, true, payload))
         .expect("complete authenticated frame");
-    assert!(!replies(&mut connection, at).is_empty());
+    assert!(!replies(&mut connection, at).0.is_empty());
 }

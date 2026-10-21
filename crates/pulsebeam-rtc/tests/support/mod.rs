@@ -66,6 +66,7 @@ pub struct PeerFixture<M = MediaFixture> {
     pub publisher_reports: usize,
     pub publisher_nacks: usize,
     pub publisher_feedback: usize,
+    pub receiver_report: Option<pulsebeam_rtc::ReceiverReport>,
     network: DeterministicNetwork,
     native_target: Option<fn(&Connection) -> Duration>,
     world: std::rc::Rc<SimulationWorld>,
@@ -878,6 +879,7 @@ impl<M> PeerFixture<M> {
             publisher_reports: 0,
             publisher_nacks: 0,
             publisher_feedback: 0,
+            receiver_report: None,
             network: DeterministicNetwork::default(),
             native_target: None,
         }
@@ -1690,6 +1692,10 @@ impl<M> PeerFixture<M> {
                 }
                 ConnectionOutput::Event(ConnectionEvent::DataChannel(event)) => {
                     return Some(PeerEvent::ConnectionData(event));
+                }
+                ConnectionOutput::Event(ConnectionEvent::ReceiverReport(report)) => {
+                    self.receiver_report = Some(report);
+                    return None;
                 }
                 ConnectionOutput::Event(_) => return None,
                 ConnectionOutput::Idle { next_wakeup } => {

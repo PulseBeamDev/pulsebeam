@@ -103,6 +103,8 @@ struct Sender {
     queue: VecDeque<QueuedMedia>,
     queued_payload_bytes: usize,
     keyframe_requested: bool,
+    reported_sequence: Option<u32>,
+    pending_report: Option<(Instant, u32)>,
     fir_sequences: Vec<(u32, u8)>,
     committed_packets: u64,
     committed_payload_bytes: u64,
@@ -214,6 +216,8 @@ impl MediaEgress {
                     queue: VecDeque::new(),
                     queued_payload_bytes: 0,
                     keyframe_requested: false,
+                    reported_sequence: None,
+                    pending_report: None,
                     fir_sequences: Vec::new(),
                     committed_packets: 0,
                     committed_payload_bytes: 0,
@@ -563,16 +567,52 @@ impl MediaEgress {
         }
     }
 
+    pub(crate) fn observe_receipt(
+        &mut self,
+        arrival: Instant,
+        receipt: crate::rtcp::ReportReceipt,
+    ) {
+        let Some(sender) = self
+            .senders
+            .iter_mut()
+            .find(|sender| sender.ssrc == receipt.ssrc)
+        else {
+            return;
+        };
+        let sequence = receipt.highest_sequence;
+        if sender.reported_sequence.is_some_and(|previous| {
+            let advance = sequence.wrapping_sub(previous);
+            advance == 0 || advance >= (1_u32 << 31)
+        }) {
+            return;
+        }
+        sender.reported_sequence = Some(sequence);
+        sender.pending_report = Some((arrival, sequence));
+    }
+
     pub(crate) fn poll_event(&mut self) -> Option<Event> {
         if let Some(estimate) = self.estimate_changed.take() {
             return Some(Event::BandwidthEstimate(estimate));
         }
+        if let Some(sender) = self
+            .senders
+            .iter_mut()
+            .find(|sender| sender.keyframe_requested)
+        {
+            sender.keyframe_requested = false;
+            return Some(Event::KeyframeRequested { ssrc: sender.ssrc });
+        }
         let sender = self
             .senders
             .iter_mut()
-            .find(|sender| sender.keyframe_requested)?;
-        sender.keyframe_requested = false;
-        Some(Event::KeyframeRequested { ssrc: sender.ssrc })
+            .find(|sender| sender.pending_report.is_some())?;
+        let (arrival, sequence) = sender.pending_report.take()?;
+        Some(Event::ReceiverReport(crate::ReceiverReport {
+            mid: sender.facts.mid.as_ref().into(),
+            ssrc: sender.ssrc,
+            arrival,
+            extended_highest_sequence: sequence,
+        }))
     }
 
     pub(crate) fn abort(&mut self) {
@@ -1953,9 +1993,7 @@ mod tests {
     use super::*;
     use std::time::UNIX_EPOCH;
 
-    #[test]
-    fn sender_report_correspondence_and_incoming_wire_facts_use_the_fixed_anchor() {
-        let start = Instant::now();
+    fn audio_egress(start: Instant) -> MediaEgress {
         let facts = EgressSenderFacts {
             id: crate::id::SenderId::new(1).unwrap(),
             kind: MediaKind::Audio,
@@ -1969,14 +2007,67 @@ mod tests {
             dependency_extension_id: None,
             forwarded_extensions: Box::new([]),
         };
-        let mut egress = MediaEgress::new(
+        MediaEgress::new(
             Box::new([facts]),
             &[7; 32],
             1_024,
             1_024,
             start,
             ProtocolClock::new(start, UNIX_EPOCH + Duration::from_secs(17)),
+        )
+    }
+
+    #[test]
+    fn receiver_progress_is_sender_associated_bounded_and_wrap_safe() {
+        let start = Instant::now();
+        let mut egress = audio_egress(start);
+        let ssrc = egress.senders[0].ssrc;
+        // Local writes and commits are not receiver confirmation.
+        egress.senders[0].committed_packets = 100;
+        assert!(egress.poll_event().is_none());
+        egress.observe_receipt(
+            start,
+            crate::rtcp::ReportReceipt {
+                ssrc: ssrc ^ 1,
+                highest_sequence: 99,
+            },
         );
+        assert!(egress.poll_event().is_none());
+        for sequence in [u32::MAX - 1, u32::MAX, 0, 2, 1, 2] {
+            egress.observe_receipt(
+                start,
+                crate::rtcp::ReportReceipt {
+                    ssrc,
+                    highest_sequence: sequence,
+                },
+            );
+        }
+        assert!(
+            matches!(egress.poll_event(), Some(Event::ReceiverReport(report))
+            if report.mid.as_ref() == "audio" && report.ssrc == ssrc
+                && report.arrival == start && report.extended_highest_sequence == 2)
+        );
+        assert!(
+            egress.poll_event().is_none(),
+            "reports coalesce into one fact per sender"
+        );
+        egress.observe_receipt(
+            start,
+            crate::rtcp::ReportReceipt {
+                ssrc,
+                highest_sequence: u32::MAX,
+            },
+        );
+        assert!(
+            egress.poll_event().is_none(),
+            "a delayed old report cannot reverse progress"
+        );
+    }
+
+    #[test]
+    fn sender_report_correspondence_and_incoming_wire_facts_use_the_fixed_anchor() {
+        let start = Instant::now();
+        let mut egress = audio_egress(start);
         let sender = &mut egress.senders[0];
         sender.latest_rtp = Some((u32::MAX - 11_999, start + Duration::from_millis(250)));
         sender.committed_packets = 2;

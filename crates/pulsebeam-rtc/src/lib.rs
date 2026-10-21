@@ -33,8 +33,8 @@ pub use rtp::{RtpExtension, RtpHeader, RtpPacket, RtpWrite, SenderReport};
 pub use session::{
     CodecInfo, CodecProfile, ConnectionConfig, ConnectionLimits, DataChannelConfig,
     DataChannelConfigError, DataChannelPriority, DataMessage, DataReliability, InboundMediaInfo,
-    LocalCandidate, LocalIceCredentials, MediaKind, MediaPayloadBitrate, PacketFeedbackKind,
-    PlayoutDelay, PlayoutDelayError, RtpExtensionInfo, SdpAnswer, SdpOffer, SenderInfo,
-    SessionInfo, UnknownExtensionPolicy,
+    LocalCandidate, LocalIceCredentials, MediaDirection, MediaKind, MediaPayloadBitrate,
+    MediaSectionKind, OfferedMediaSection, PacketFeedbackKind, PlayoutDelay, PlayoutDelayError,
+    RtpExtensionInfo, SdpAnswer, SdpOffer, SenderInfo, SessionInfo, UnknownExtensionPolicy,
 };
 pub use time::ConnectionEntropy;
