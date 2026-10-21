@@ -1510,37 +1510,34 @@ mod dd_tests {
 
     #[test]
     fn derives_the_keyframe_flag_from_the_descriptor_under_an_opaque_payload() {
-        // packet_carrying starts from an opaque payload (is_keyframe = false, empty
-        // NAL flags) — the SFrame/E2EE case where from_str0m's H.264 probe sees
-        // nothing. The descriptor's attached structure is then the only keyframe
-        // signal, so ingress must set is_keyframe from it.
+        // Opaque media has no codec hint. Resolved dependencies, not structure
+        // attachment, determine whether the frame is independent.
         let structure = test_utils::structure_l1t3();
         let mut writer = DependencyDescriptorWriter::new();
         let mut buf = [0u8; MAX_DD_LEN];
         let mut layer = layer();
+        let mut independent = test_utils::keyframe(&structure);
+        independent.frame_dependencies.frame_diffs.clear();
+        independent.fields.set_custom_fdiffs(true);
 
-        let len = writer
-            .write(&test_utils::keyframe(&structure), &mut buf)
-            .unwrap();
+        let len = writer.write(&independent, &mut buf).unwrap();
         let mut kf = packet_carrying(&buf[..len]);
         assert!(
             !kf.is_keyframe,
             "opaque payload gives no keyframe signal on its own"
         );
         layer.process(&mut kf);
-        assert!(
-            kf.is_keyframe,
-            "the descriptor's structure marks the keyframe"
-        );
+        assert!(kf.is_keyframe, "empty dependencies mark independent media");
 
-        let len = writer
-            .write(&test_utils::delta(&structure, 1, 1), &mut buf)
-            .unwrap();
+        let mut dependent = test_utils::delta(&structure, 1, 1);
+        dependent.attached_structure = Some(Box::new(structure));
+        let len = writer.write(&dependent, &mut buf).unwrap();
         let mut delta = packet_carrying(&buf[..len]);
+        delta.is_keyframe = true;
         layer.process(&mut delta);
         assert!(
             !delta.is_keyframe,
-            "a descriptor without a structure is a delta frame"
+            "a dependent DD clears a false codec hint even with a structure refresh"
         );
     }
 

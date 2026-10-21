@@ -212,12 +212,9 @@ impl StreamNormalizer {
         };
         match self.dd.read(&raw.0) {
             Ok(dd) => {
-                // Under SFrame/E2EE the media payload is opaque, so the H.264
-                // IDR probe in `from_str0m` sees nothing. The Dependency
-                // Descriptor rides in the clear and carries the template
-                // structure on a keyframe's first packet, so it is the authoritative
-                // keyframe signal whenever present.
-                pkt.is_keyframe |= dd.attached_structure.is_some();
+                // A resolved DD overrides codec hints, including opaque payloads
+                // and structure refreshes on dependent frames.
+                pkt.is_keyframe = dd.frame_dependencies.frame_diffs.is_empty();
                 pkt.is_frame_start = dd.start_of_frame;
                 pkt.ext_vals.user_values.set_arc(std::sync::Arc::new(dd));
                 Some(StreamFacts {
@@ -381,6 +378,11 @@ mod tests {
             vec![9, 10, 11]
         );
         assert!(packets[0].0.is_keyframe);
+        let raw = source.next_frame(false, 1).unwrap().remove(0);
+        let mut dependent = packet(12, raw);
+        dependent.is_keyframe = true;
+        let dependent = normalizer.normalize(dependent).first.unwrap().0;
+        assert!(!dependent.is_keyframe, "usable DD overrides the codec hint");
         assert!(packets[0].0.is_frame_start);
         assert_eq!(packets[0].1.temporal_only, Some(true));
         assert_eq!(packets[0].1.decode_target_heights, Some([1, 0, 0]));
