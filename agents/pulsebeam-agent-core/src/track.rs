@@ -70,7 +70,7 @@ impl TrackSpec {
         }
     }
 
-    fn subscriber(&self) -> Result<TopicSubscriber, TrackResourceError> {
+    pub(crate) fn subscriber(&self) -> Result<TopicSubscriber, TrackResourceError> {
         self.validate()?;
         match self {
             Self::Data { label, delivery } => Ok(TopicSubscriber {
@@ -91,7 +91,7 @@ pub struct RemoteTrack {
 
 /// One declaration or stream lifetime, including a fresh token for Strict Mode replay.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct TrackOwner(u64);
+pub struct TrackOwner(pub(crate) u64);
 
 impl TrackOwner {
     pub const fn id(self) -> u64 {
@@ -105,6 +105,8 @@ pub enum TrackResourceError {
     InvalidSpec(#[from] ValidationError),
     #[error("track kind does not support this operation")]
     WrongKind,
+    #[error("data send requires connected intent")]
+    NotConnected,
     #[error("resource already has an exclusive owner")]
     AlreadyOwned,
     #[error("owner already owns another resource")]
@@ -191,6 +193,12 @@ pub struct VideoProjection {
     pub unmapped: Vec<TrackSelector>,
 }
 
+#[derive(Default)]
+pub struct ReceiveUpdate {
+    pub ready: Vec<TrackOwner>,
+    pub registrations_changed: bool,
+}
+
 struct PublicationOwner {
     owner: TrackOwner,
     slot: String,
@@ -270,6 +278,46 @@ impl DataReceiver {
         self.queue.clear();
         self.failure = Some(error);
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ResourceCommand {
+    ClaimPublication {
+        spec: TrackSpec,
+    },
+    UpdatePublication {
+        owner: u64,
+        present: bool,
+    },
+    ClaimVideo {
+        selector: TrackSelector,
+    },
+    ObserveVideo {
+        owner: u64,
+        observation: VideoObservation,
+    },
+    ClaimAudio,
+    RetainProducer {
+        spec: TrackSpec,
+    },
+    ReceiveData {
+        spec: TrackSpec,
+        participant_id: Option<String>,
+    },
+    ReadData {
+        owner: u64,
+    },
+    Release {
+        owner: u64,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ResourceResult {
+    Publication { owner: u64, slot: String },
+    Owned { owner: u64 },
+    Event { event: Option<DataEvent> },
+    Updated,
 }
 
 /// Portable resource policy. Browser objects and pending promises remain in the host.
@@ -358,6 +406,43 @@ impl TrackResources {
             return None;
         }
         self.publications.remove(spec).map(|entry| entry.slot)
+    }
+
+    pub(crate) fn publication_spec(&self, owner: TrackOwner) -> Option<TrackSpec> {
+        self.publications
+            .iter()
+            .find(|(_, entry)| entry.owner == owner)
+            .map(|(spec, _)| spec.clone())
+    }
+
+    pub(crate) fn has_publication(&self, spec: &TrackSpec) -> bool {
+        self.publications.contains_key(spec)
+    }
+
+    pub(crate) fn has_video(&self) -> bool {
+        !self.video.is_empty()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.publications.is_empty()
+            && self.audio.is_none()
+            && self.video.is_empty()
+            && self.producers.is_empty()
+            && self.receivers.is_empty()
+    }
+
+    pub(crate) fn publication_slots(&self) -> BTreeSet<String> {
+        self.publications
+            .values()
+            .map(|entry| entry.slot.clone())
+            .collect()
+    }
+
+    pub(crate) fn release(&mut self, owner: TrackOwner) {
+        self.publications.retain(|_, entry| entry.owner != owner);
+        self.release_audio(owner);
+        self.release_video(owner);
+        self.release_receiver(owner);
     }
 
     pub fn publications(&self) -> Vec<PublicationIntent> {
@@ -583,8 +668,8 @@ impl TrackResources {
     }
 
     /// Feed only notifications already validated and deduplicated by the topic transport.
-    pub fn notify(&mut self, notification: &TopicNotification) -> Vec<TrackOwner> {
-        let mut ready = Vec::new();
+    pub fn notify(&mut self, notification: &TopicNotification) -> ReceiveUpdate {
+        let mut update = ReceiveUpdate::default();
         for (owner, receiver) in &mut self.receivers {
             if receiver.failure.is_some() {
                 continue;
@@ -626,10 +711,11 @@ impl TrackResources {
                 _ => continue,
             }
             if !receiver.queue.is_empty() || receiver.failure.is_some() {
-                ready.push(*owner);
+                update.ready.push(*owner);
             }
+            update.registrations_changed |= receiver.failure.is_some();
         }
-        ready
+        update
     }
 }
 

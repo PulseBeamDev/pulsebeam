@@ -29,6 +29,8 @@ use web_sys::{
 use crate::engine::{ActorHandle, Host, PublicCommand, Turn, TurnErrorSource, spawn_actor};
 use crate::logger::{BrowserLogger, LogLevel};
 
+mod resources;
+
 const SIGNALING_LABEL: &str = "v1/sys/signaling";
 const LOG_TARGET: &str = "pulsebeam_agent_web::browser";
 
@@ -575,6 +577,24 @@ impl BrowserRuntime {
         Ok(())
     }
 
+    pub async fn resource(&self, command: JsValue) -> Result<JsValue, JsValue> {
+        self.inner.ensure_open()?;
+        let command = resources::command(command)?;
+        let completion = self
+            .inner
+            .actor
+            .borrow()
+            .as_ref()
+            .ok_or_else(|| js_error("runtime actor not initialized"))?
+            .send_resource(command)
+            .map_err(js_error)?;
+        let result = completion
+            .await
+            .map_err(|_| js_error("resource operation was canceled"))?;
+        self.inner.ensure_open()?;
+        result.map(resources::result).map_err(resources::error)
+    }
+
     pub fn renew_authorization(&self, token: String) -> Result<(), JsValue> {
         self.inner.ensure_open()?;
         self.inner.renew_authorization(token).map_err(js_error)
@@ -704,6 +724,8 @@ impl BrowserRuntime {
 impl Drop for BrowserRuntime {
     fn drop(&mut self) {
         self.inner.request_abort();
+        // The actor holds a weak host reference and cannot finish teardown after free.
+        self.inner.shutdown();
     }
 }
 
@@ -2121,6 +2143,7 @@ fn failure_value(failure: &agent_core::Failure) -> JsValue {
 fn notification_value(notification: &Notification) -> JsValue {
     let value = Object::new();
     match notification {
+        Notification::DataReady { owners } => return resources::ready(owners).into(),
         Notification::Topic(TopicNotification::Message(message)) => {
             set(&value, "type", "topic-message");
             set(&value, "mode", topic_mode_name(message.mode));

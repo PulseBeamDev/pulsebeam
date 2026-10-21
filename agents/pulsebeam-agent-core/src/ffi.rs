@@ -374,6 +374,9 @@ pub enum Notification {
         to: ConnectionState,
     },
     SnapshotChanged,
+    DataReady {
+        owners: Vec<u64>,
+    },
     Topic {
         notification: TopicNotification,
     },
@@ -1016,6 +1019,7 @@ impl From<model::Notification> for Notification {
                 to: to.into(),
             },
             model::Notification::SnapshotChanged => Self::SnapshotChanged,
+            model::Notification::DataReady { owners } => Self::DataReady { owners },
             model::Notification::Topic(notification) => Self::Topic {
                 notification: notification.into(),
             },
@@ -1033,7 +1037,8 @@ impl From<model::AgentError> for AgentError {
             model::AgentError::InvalidConfiguration(_) => ErrorCode::InvalidConfiguration,
             model::AgentError::StaleDesiredRevision { .. }
             | model::AgentError::ConflictingDesiredRevision(_)
-            | model::AgentError::InvalidAuthorizationToken => ErrorCode::InvalidDesiredState,
+            | model::AgentError::InvalidAuthorizationToken
+            | model::AgentError::InvalidResource(_) => ErrorCode::InvalidDesiredState,
             model::AgentError::RenewalBusy => ErrorCode::RenewalBusy,
             model::AgentError::InvalidTopic(_) => ErrorCode::InvalidTopic,
             model::AgentError::RenewalNotReady
@@ -1598,6 +1603,9 @@ mod tests {
                 to: ConnectionState::Connected,
             },
             Notification::SnapshotChanged,
+            Notification::DataReady {
+                owners: vec![1, u64::MAX],
+            },
             Notification::Topic {
                 notification: TopicNotification::SendDropped {
                     publisher,

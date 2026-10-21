@@ -302,6 +302,9 @@ pub enum Notification {
         to: ConnectionState,
     },
     SnapshotChanged,
+    DataReady {
+        owners: Vec<u64>,
+    },
     Topic(TopicNotification),
     Failure(Failure),
     ServerError(String),

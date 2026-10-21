@@ -75,6 +75,19 @@ impl Driver {
         .err()
         .map(|error| TurnError { source, error });
 
+        self.finish_turn(error)
+    }
+
+    pub(crate) fn resource(
+        &mut self,
+        command: agent_core::ResourceCommand,
+    ) -> (Result<agent_core::ResourceResult, AgentError>, Turn) {
+        let result = self.agent.resource(command);
+        let turn = self.finish_turn(None);
+        (result, turn)
+    }
+
+    fn finish_turn(&mut self, error: Option<TurnError>) -> Turn {
         let mut effects = Vec::new();
         while let Some(effect) = self.agent.next_effect() {
             effects.push(effect);
@@ -150,6 +163,10 @@ pub(crate) enum Message {
         expected_data_track_id: String,
         completion: oneshot::Sender<Result<(), String>>,
     },
+    Resource {
+        command: agent_core::ResourceCommand,
+        completion: oneshot::Sender<Result<agent_core::ResourceResult, AgentError>>,
+    },
     HostEvent(HostEvent),
     Lifecycle(LifecycleCommand),
     HostFailure(Failure),
@@ -195,6 +212,18 @@ impl ActorHandle {
             send,
             expected_generation,
             expected_data_track_id,
+            completion,
+        })?;
+        Ok(receiver)
+    }
+
+    pub(crate) fn send_resource(
+        &self,
+        command: agent_core::ResourceCommand,
+    ) -> Result<oneshot::Receiver<Result<agent_core::ResourceResult, AgentError>>, String> {
+        let (completion, receiver) = oneshot::channel();
+        self.send(Message::Resource {
+            command,
             completion,
         })?;
         Ok(receiver)
@@ -435,6 +464,14 @@ impl<H: Host> Actor<H> {
                     expected_generation,
                     &expected_data_track_id,
                 ));
+            }
+            Message::Resource {
+                command,
+                completion,
+            } => {
+                let (result, turn) = self.driver.resource(command);
+                self.publish_turn(turn);
+                let _ = completion.send(result);
             }
             Message::HostEvent(event) => self.event(event),
             Message::Lifecycle(lifecycle) => match lifecycle {

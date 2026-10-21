@@ -78,6 +78,8 @@ pub enum AgentError {
     InvalidSignaling(#[from] SignalingError),
     #[error(transparent)]
     InvalidTopic(#[from] TopicError),
+    #[error(transparent)]
+    InvalidResource(#[from] crate::TrackResourceError),
 }
 
 #[derive(Clone)]
@@ -173,12 +175,16 @@ struct Closing {
 pub struct Agent {
     config: AgentConfig,
     desired: DesiredState,
+    declared: DesiredState,
+    resources: crate::TrackResources,
+    unmapped_video: BTreeSet<crate::TrackSelector>,
     local_bindings: BTreeMap<MediaSlot, String>,
     retired_tracks: BTreeSet<String>,
     snapshot: Snapshot,
     ids: IdGenerator,
     effects: VecDeque<Effect>,
     notifications: VecDeque<Notification>,
+    published_notifications: VecDeque<Notification>,
     active: Option<Session>,
     attempt: Option<Attempt>,
     retry: Option<Retry>,
@@ -199,12 +205,16 @@ impl Agent {
         Ok(Self {
             config,
             desired: DesiredState::default(),
+            declared: DesiredState::default(),
+            resources: crate::TrackResources::default(),
+            unmapped_video: BTreeSet::new(),
             local_bindings: BTreeMap::new(),
             retired_tracks: BTreeSet::new(),
             snapshot: Snapshot::default(),
             ids: IdGenerator::new(),
             effects: VecDeque::new(),
             notifications: VecDeque::new(),
+            published_notifications: VecDeque::new(),
             active: None,
             attempt: None,
             retry: None,
@@ -247,6 +257,8 @@ impl Agent {
                 )
                 .map_err(AgentError::from),
         };
+        let flushed = self.flush_notifications();
+        let result = result.and(flushed);
         if let Err(error) = &result {
             agent_log!(self, Warn, "agent command rejected: {error}");
         }
@@ -260,10 +272,127 @@ impl Agent {
             HostEvent::Timer(event) => self.handle_timer(event),
             HostEvent::DataChannel(event) => self.handle_data_channel(event),
         };
+        let refreshed = self.refresh_resources();
+        self.send_intent_if_ready();
+        let flushed = self.flush_notifications();
+        let result = result.and(refreshed).and(flushed);
         if let Err(error) = &result {
             agent_log!(self, Warn, "host event rejected: {error}");
         }
         result
+    }
+
+    pub fn resource(
+        &mut self,
+        command: crate::ResourceCommand,
+    ) -> Result<crate::ResourceResult, AgentError> {
+        let result = self.resource_command(command);
+        let flushed = self.flush_notifications();
+        result.and_then(|value| flushed.map(|()| value))
+    }
+
+    fn resource_command(
+        &mut self,
+        command: crate::ResourceCommand,
+    ) -> Result<crate::ResourceResult, AgentError> {
+        use crate::{ResourceCommand, ResourceResult, TrackOwner, TrackResourceError};
+        let result = match command {
+            ResourceCommand::ClaimPublication { spec } => {
+                spec.validate()?;
+                let kind = spec.media_kind().ok_or(TrackResourceError::WrongKind)?;
+                if self
+                    .local_bindings
+                    .iter()
+                    .any(|(slot, label)| slot.kind() == kind && label == spec.label())
+                {
+                    return Err(TrackResourceError::AlreadyOwned.into());
+                }
+                let occupied = self
+                    .local_bindings
+                    .keys()
+                    .filter_map(|slot| match slot {
+                        MediaSlot::LocalVideo(name) | MediaSlot::LocalAudio(name) => {
+                            Some(name.clone())
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                let owner = self.resources.new_owner()?;
+                let slot = self.resources.claim_publication(
+                    owner,
+                    spec,
+                    &self.config.topology,
+                    &occupied,
+                )?;
+                ResourceResult::Publication {
+                    owner: owner.id(),
+                    slot,
+                }
+            }
+            ResourceCommand::UpdatePublication { owner, present } => {
+                let owner = TrackOwner(owner);
+                let spec = self
+                    .resources
+                    .publication_spec(owner)
+                    .ok_or(TrackResourceError::Released)?;
+                self.resources.update_publication(owner, &spec, present)?;
+                ResourceResult::Updated
+            }
+            ResourceCommand::ClaimVideo { selector } => {
+                if !self.declared.video.is_empty() {
+                    return Err(TrackResourceError::AlreadyOwned.into());
+                }
+                let owner = self.resources.new_owner()?;
+                self.resources.claim_video(owner, selector)?;
+                ResourceResult::Owned { owner: owner.id() }
+            }
+            ResourceCommand::ObserveVideo { owner, observation } => {
+                self.resources
+                    .observe_video(TrackOwner(owner), observation)?;
+                ResourceResult::Updated
+            }
+            ResourceCommand::ClaimAudio => {
+                let owner = self.resources.new_owner()?;
+                self.resources.claim_audio(owner)?;
+                ResourceResult::Owned { owner: owner.id() }
+            }
+            ResourceCommand::RetainProducer { spec } => {
+                if !self.desired.connected {
+                    return Err(TrackResourceError::NotConnected.into());
+                }
+                let subscriber = spec.subscriber()?;
+                let mut owned = self.resources.registrations();
+                owned.publishers.push(crate::TopicPublisher {
+                    topic: subscriber.topic,
+                    mode: subscriber.mode,
+                });
+                self.merged_topics(owned)?;
+                self.resources.retain_producer(&spec)?;
+                ResourceResult::Updated
+            }
+            ResourceCommand::ReceiveData {
+                spec,
+                participant_id,
+            } => {
+                let mut owned = self.resources.registrations();
+                owned.subscribers.push(spec.subscriber()?);
+                self.merged_topics(owned)?;
+                let owner = self.resources.new_owner()?;
+                self.resources.receive(owner, &spec, participant_id)?;
+                ResourceResult::Owned { owner: owner.id() }
+            }
+            ResourceCommand::ReadData { owner } => {
+                return Ok(ResourceResult::Event {
+                    event: self.resources.read(TrackOwner(owner))?,
+                });
+            }
+            ResourceCommand::Release { owner } => {
+                self.resources.release(TrackOwner(owner));
+                ResourceResult::Updated
+            }
+        };
+        self.refresh_resources()?;
+        Ok(result)
     }
 
     pub fn next_effect(&mut self) -> Option<Effect> {
@@ -303,7 +432,28 @@ impl Agent {
     }
 
     pub fn next_notification(&mut self) -> Option<Notification> {
-        self.notifications.pop_front()
+        self.published_notifications.pop_front()
+    }
+
+    fn flush_notifications(&mut self) -> Result<(), AgentError> {
+        let mut ready = BTreeSet::new();
+        while let Some(notification) = self.notifications.pop_front() {
+            if let Notification::Topic(topic) = &notification {
+                let update = self.resources.notify(topic);
+                ready.extend(update.ready.into_iter().map(crate::TrackOwner::id));
+                if update.registrations_changed {
+                    self.refresh_resources()?;
+                }
+            }
+            self.published_notifications.push_back(notification);
+        }
+        if !ready.is_empty() {
+            self.published_notifications
+                .push_back(Notification::DataReady {
+                    owners: ready.into_iter().collect(),
+                });
+        }
+        Ok(())
     }
 
     fn renew_authorization(&mut self, token: String) -> Result<(), AgentError> {
@@ -352,19 +502,42 @@ impl Agent {
     fn replace_desired(&mut self, mut desired: DesiredState) -> Result<(), AgentError> {
         desired.normalize();
         desired.validate(&self.config.topology)?;
-        if desired.revision < self.desired.revision {
+        if desired.revision < self.declared.revision {
             return Err(AgentError::StaleDesiredRevision {
                 received: desired.revision,
-                accepted: self.desired.revision,
+                accepted: self.declared.revision,
             });
         }
-        if desired.revision == self.desired.revision {
-            return if desired == self.desired {
+        if desired.revision == self.declared.revision {
+            return if desired == self.declared {
                 Ok(())
             } else {
                 Err(AgentError::ConflictingDesiredRevision(desired.revision))
             };
         }
+        let owned_slots = self.resources.publication_slots();
+        for publication in &desired.publications {
+            let spec = match self.config.topology.local_slot_kind(&publication.slot) {
+                Some(crate::MediaKind::Video) => crate::TrackSpec::Video {
+                    label: publication.label.clone(),
+                },
+                Some(crate::MediaKind::Audio) => crate::TrackSpec::Audio {
+                    label: publication.label.clone(),
+                },
+                None => {
+                    return Err(
+                        ValidationError::UnknownPublicationSlot(publication.slot.clone()).into(),
+                    );
+                }
+            };
+            if owned_slots.contains(&publication.slot) || self.resources.has_publication(&spec) {
+                return Err(crate::TrackResourceError::AlreadyOwned.into());
+            }
+        }
+        if !desired.video.is_empty() && self.resources.has_video() {
+            return Err(crate::TrackResourceError::AlreadyOwned.into());
+        }
+        let effective = self.effective_desired(&desired)?;
         let local_slot = |name: &str| match self.config.topology.local_slot_kind(name) {
             Some(crate::MediaKind::Video) => Ok(MediaSlot::LocalVideo(name.to_string())),
             Some(crate::MediaKind::Audio) => Ok(MediaSlot::LocalAudio(name.to_string())),
@@ -388,6 +561,73 @@ impl Agent {
         for publication in &desired.publications {
             self.local_bindings
                 .insert(local_slot(&publication.slot)?, publication.label.clone());
+        }
+        self.declared = desired;
+        self.apply_desired(effective)
+    }
+
+    fn merged_topics(
+        &self,
+        mut owned: crate::TopicRegistrations,
+    ) -> Result<crate::TopicRegistrations, AgentError> {
+        owned
+            .publishers
+            .extend(self.declared.topics.publishers.iter().cloned());
+        owned
+            .subscribers
+            .extend(self.declared.topics.subscribers.iter().cloned());
+        owned.normalize();
+        owned.publishers.dedup();
+        owned.subscribers.dedup();
+        owned.validate()?;
+        Ok(owned)
+    }
+
+    fn effective_desired(&mut self, declared: &DesiredState) -> Result<DesiredState, AgentError> {
+        let mut desired = declared.clone();
+        desired.publications.extend(self.resources.publications());
+        let owned = self.resources.registrations();
+        desired.topics.publishers.extend(owned.publishers);
+        desired.topics.subscribers.extend(owned.subscribers);
+        desired.normalize();
+        desired.topics.publishers.dedup();
+        desired.topics.subscribers.dedup();
+        if self.resources.has_video() {
+            let projection = self.resources.video_projection(
+                &self.snapshot.remote_tracks,
+                self.config.topology.remote_video,
+            );
+            let unmapped: BTreeSet<_> = projection.unmapped.into_iter().collect();
+            for selector in unmapped.difference(&self.unmapped_video) {
+                agent_log!(
+                    self,
+                    Warn,
+                    "remote video demand exceeds receiver capacity participant={} label={} capacity={}",
+                    selector.participant_external_id,
+                    selector.label,
+                    self.config.topology.remote_video
+                );
+            }
+            self.unmapped_video = unmapped;
+            desired.video = projection.subscriptions;
+        } else {
+            self.unmapped_video.clear();
+        }
+        desired.validate(&self.config.topology)?;
+        Ok(desired)
+    }
+
+    fn refresh_resources(&mut self) -> Result<(), AgentError> {
+        if self.resources.is_empty() && self.desired == self.declared {
+            return Ok(());
+        }
+        let effective = self.effective_desired(&self.declared.clone())?;
+        self.apply_desired(effective)
+    }
+
+    fn apply_desired(&mut self, desired: DesiredState) -> Result<(), AgentError> {
+        if self.desired == desired {
+            return Ok(());
         }
         if let Some(active) = self.active.as_ref() {
             for video in &desired.video {
@@ -470,7 +710,7 @@ impl Agent {
 
     fn connect(&mut self) -> Result<(), AgentError> {
         if !self.desired.connected {
-            let mut desired = self.desired.clone();
+            let mut desired = self.declared.clone();
             desired.revision = desired.revision.saturating_add(1);
             desired.connected = true;
             self.replace_desired(desired)?;
@@ -1004,7 +1244,6 @@ impl Agent {
                                 != signaling::resolved_selectors(&self.desired, &active.observed)
                         {
                             self.intent_dirty = true;
-                            self.send_intent_if_ready();
                         }
                     }
                     ServerOutput::Authorization(expires_at) => {
@@ -1260,6 +1499,7 @@ impl Agent {
                 payload,
             })?;
         }
+        self.refresh_resources()?;
         self.send_intent_if_ready();
         self.schedule_topic_probe();
         if attempt.topic_registrations != self.desired.topics {

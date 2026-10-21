@@ -119,8 +119,13 @@ if (process.argv[2] === "initialization-failure") {
     await publicContract(await import("../../node_assets/dist/index.js")),
     true,
   );
+  const { resourceContract } = await import("./resource-contract.mjs");
+  await resourceContract(BrowserRuntime);
   const { topicContract } = await import("./topic-contract.mjs");
-  await topicContract(await import("../../node_assets/dist/index.js"));
+  await topicContract(
+    await import("../../node_assets/dist/index.js"),
+    BrowserRuntime,
+  );
   console.log(
     "emitted WASM authoritative binding, lossless u64 events and admission cancellation passed",
   );

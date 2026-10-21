@@ -28,8 +28,14 @@ Give each declaration or stream lifetime a fresh `new_owner()` token, including
 when replaying a committed declaration. Releasing an owner cannot release a
 replacement owner's resource.
 
+`Agent::resource` applies owned declarations through the existing reconciler,
+independently of the revisioned slot-based desired state. Resource-owned sender
+slots become reusable on release; legacy native slot-label bindings retain their
+existing lifetime. Slot-based intent cannot replace a live owned publication or
+video presentation.
+
 The resource model projects publication intents, shared video demand, and topic
-registrations for the existing reconciler. Feed its receive queues only validated,
+registrations. Feed its receive queues only validated,
 deduplicated `TopicNotification` values from the topic transport. Queues preserve
 opaque bytes, participant filtering, delivery-mode bounds, and inline ordered
 gaps. Hosts own browser objects, pending reads, and physical teardown, not a

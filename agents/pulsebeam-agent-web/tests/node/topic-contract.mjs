@@ -75,7 +75,7 @@ const frame = (kind, sequence, payload) =>
 
 // Control only platform and server outcomes. Production WASM owns admission,
 // Catalog validation, identity projection, topic decoding and cancellation.
-export async function topicContract(pulsebeam) {
+export async function topicContract(pulsebeam, BrowserRuntime) {
   const previous = Object.fromEntries(
     [
       "RTCPeerConnection",
@@ -385,6 +385,96 @@ export async function topicContract(pulsebeam) {
     agent.close();
     await closed;
     assert.deepEqual(await iterator.next(), { done: true, value: undefined });
+    const owned = new BrowserRuntime({
+      endpoint: "http://localhost",
+      token: "owned-binary",
+      logLevel: "off",
+      topology: {
+        localVideos: 0,
+        localAudios: 0,
+        remoteVideos: 0,
+        remoteAudios: 0,
+      },
+    });
+    try {
+      const resource = (command) => owned.resource(command);
+      const spec = { kind: "data", label: "events", delivery: "ordered" };
+      const all = await resource({ op: "receiveData", spec });
+      const alice = await resource({
+        op: "receiveData",
+        spec,
+        participantId: "alice",
+      });
+      const bob = await resource({
+        op: "receiveData",
+        spec,
+        participantId: "bob",
+      });
+      const ready = new Set();
+      owned.set_event_listener((event) => {
+        if (event.type === "data-ready")
+          for (const owner of event.owners) ready.add(owner);
+      });
+      const index = peers.length;
+      owned.connect();
+      await until(
+        () => peers[index]?.answerApplied,
+        "owned receive answer was not applied",
+      );
+      const peer = peers[index];
+      peer.open();
+      await until(
+        () => owned.snapshot().connection === "connected",
+        "owned receive did not connect",
+      );
+      const signal = peer.channels.get("v1/sys/signaling");
+      signal.receive(signalingWire(catalog(1, true)));
+      signal.receive(signalingWire(mapping));
+      await until(
+        () => BigInt(owned.snapshot().catalog.revision) === 1n,
+        "owned catalog was not applied",
+      );
+      const channel = peer.channels.get("v2/ordered/sub/events");
+      channel.receive(frame(4, expected));
+      channel.receive(frame(1, available, Uint8Array.of(255, 0, 128)));
+      channel.receive(frame(5, available));
+      await until(
+        () => ready.has(all.owner) && ready.has(alice.owner),
+        "owned receive was not notified",
+      );
+      assert.equal(ready.has(bob.owner), false);
+      for (const owner of [all.owner, alice.owner]) {
+        assert.deepEqual(await resource({ op: "readData", owner }), {
+          type: "gap",
+          participantId: "alice",
+          trackId: "server-remote-track",
+          from: expected,
+          to: available,
+        });
+      }
+      const first = await resource({ op: "readData", owner: all.owner });
+      assert.deepEqual(first, {
+        type: "message",
+        participantId: "alice",
+        trackId: "server-remote-track",
+        sequence: available,
+        data: Uint8Array.of(255, 0, 128),
+      });
+      first.data.fill(1);
+      const independent = await resource({
+        op: "readData",
+        owner: alice.owner,
+      });
+      assert.deepEqual(independent.data, Uint8Array.of(255, 0, 128));
+      assert.equal(await resource({ op: "readData", owner: bob.owner }), null);
+      for (const owner of [all.owner, alice.owner, bob.owner])
+        await resource({ op: "release", owner });
+      assert.deepEqual(owned.snapshot().topics.subscribers, []);
+    } finally {
+      owned.close();
+      owned.abort();
+      owned.free();
+    }
     for (const peer of peers)
       for (const channel of peer.channels.values())
         assert.equal(

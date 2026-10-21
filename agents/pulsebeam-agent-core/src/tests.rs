@@ -2145,157 +2145,207 @@ fn catalog_removal_retracts_direct_video_and_pinned_audio_intent() {
 
 #[test]
 fn catalog_selectors_remain_unresolved_then_follow_canonical_track_changes() {
-    let mut selected = desired(1);
-    selected.video[0].track_id.clear();
-    selected.video[0].selector = Some(TrackSelector {
-        participant_external_id: "remote-user".to_string(),
-        label: "camera".to_string(),
-    });
-    selected.audio.pinned.clear();
-    let audio_selector = TrackSelector {
-        participant_external_id: "remote-user".to_string(),
-        label: "microphone".to_string(),
-    };
-    selected.audio.selected.push(audio_selector.clone());
-    selected.audio.selector_delays.insert(
-        audio_selector,
-        PlayoutDelay::Fixed {
-            min_ms: 0,
-            max_ms: 0,
-        },
-    );
-    let mut agent = Agent::new(config()).unwrap();
-    let cid = channel(9);
-    let (generation, operation) = begin_connect(&mut agent, selected, cid);
-    let send = finish_connect(&mut agent, generation, operation, cid);
-    acknowledge_send(&mut agent, generation, cid, send);
+    for owned in [false, true] {
+        let mut selected = desired(1);
+        selected.video[0].track_id.clear();
+        selected.video[0].selector = Some(TrackSelector {
+            participant_external_id: "remote-user".to_string(),
+            label: "camera".to_string(),
+        });
+        selected.audio.pinned.clear();
+        let audio_selector = TrackSelector {
+            participant_external_id: "remote-user".to_string(),
+            label: "microphone".to_string(),
+        };
+        selected.audio.selected.push(audio_selector.clone());
+        selected.audio.selector_delays.insert(
+            audio_selector,
+            PlayoutDelay::Fixed {
+                min_ms: 0,
+                max_ms: 0,
+            },
+        );
+        let mut agent = Agent::new(config()).unwrap();
+        let view = if owned {
+            let video = selected.video.remove(0);
+            let ResourceResult::Owned { owner } = agent
+                .resource(ResourceCommand::ClaimVideo {
+                    selector: video.selector.unwrap(),
+                })
+                .unwrap()
+            else {
+                panic!("video lease")
+            };
+            agent
+                .resource(ResourceCommand::ObserveVideo {
+                    owner,
+                    observation: VideoObservation {
+                        visible: true,
+                        height: video.height,
+                        min_height: video.min_height,
+                        min_fps: video.min_fps,
+                        priority: video.priority,
+                        playout_delay: video.playout_delay,
+                    },
+                })
+                .unwrap();
+            Some(owner)
+        } else {
+            None
+        };
+        let cid = channel(9);
+        let (generation, operation) = begin_connect(&mut agent, selected, cid);
+        let send = finish_connect(&mut agent, generation, operation, cid);
+        acknowledge_send(&mut agent, generation, cid, send);
 
-    let deliver = |agent: &mut Agent, catalog: v1::Catalog| {
-        agent
-            .handle(HostEvent::DataChannel(DataChannelEvent::Message {
-                generation,
-                channel: cid,
-                payload: server_payload(server_message::Payload::Catalog(catalog)),
-            }))
+        let deliver = |agent: &mut Agent, catalog: v1::Catalog| {
+            agent
+                .handle(HostEvent::DataChannel(DataChannelEvent::Message {
+                    generation,
+                    channel: cid,
+                    payload: server_payload(server_message::Payload::Catalog(catalog)),
+                }))
+                .unwrap();
+        };
+        deliver(
+            &mut agent,
+            v1::Catalog {
+                revision: 1,
+                state: Some(v1::catalog::State::Snapshot(v1::CatalogSnapshot {
+                    participants: vec![v1::Participant {
+                        participant_id: "remote".to_string(),
+                        participant_external_id: "remote-user".to_string(),
+                    }],
+                    tracks: vec![],
+                })),
+            },
+        );
+        assert!(agent.next_effect().is_none());
+
+        deliver(
+            &mut agent,
+            v1::Catalog {
+                revision: 2,
+                state: Some(v1::catalog::State::Delta(v1::CatalogDelta {
+                    added_tracks: vec![
+                        v1::RemoteTrack {
+                            track_id: "video-one".to_string(),
+                            participant_id: "remote".to_string(),
+                            kind: v1::TrackKind::Video.into(),
+                            mode: 0,
+                            label: "camera".to_string(),
+                        },
+                        v1::RemoteTrack {
+                            track_id: "audio-one".to_string(),
+                            participant_id: "remote".to_string(),
+                            kind: v1::TrackKind::Audio.into(),
+                            mode: 0,
+                            label: "microphone".to_string(),
+                        },
+                    ],
+                    ..Default::default()
+                })),
+            },
+        );
+        let Effect::DataChannel(DataChannelEffect::Send {
+            operation, payload, ..
+        }) = next_effect(&mut agent)
+        else {
+            panic!("expected resolved intent");
+        };
+        let receive = decode_intent(&payload).receive.unwrap();
+        assert_eq!(receive.video.unwrap().tracks[0].track_id, "video-one");
+        let audio = receive.audio.unwrap().tracks;
+        assert_eq!(audio[0].track_id, "audio-one");
+        let delay = audio[0]
+            .options
+            .as_ref()
+            .unwrap()
+            .playout_delay
+            .as_ref()
             .unwrap();
-    };
-    deliver(
-        &mut agent,
-        v1::Catalog {
-            revision: 1,
-            state: Some(v1::catalog::State::Snapshot(v1::CatalogSnapshot {
-                participants: vec![v1::Participant {
-                    participant_id: "remote".to_string(),
-                    participant_external_id: "remote-user".to_string(),
-                }],
-                tracks: vec![],
-            })),
-        },
-    );
-    assert!(agent.next_effect().is_none());
+        assert_eq!((delay.min_ms, delay.max_ms), (0, 0));
+        acknowledge_send(&mut agent, generation, cid, operation);
 
-    deliver(
-        &mut agent,
-        v1::Catalog {
-            revision: 2,
-            state: Some(v1::catalog::State::Delta(v1::CatalogDelta {
-                added_tracks: vec![
-                    v1::RemoteTrack {
-                        track_id: "video-one".to_string(),
+        deliver(
+            &mut agent,
+            v1::Catalog {
+                revision: 3,
+                state: Some(v1::catalog::State::Delta(v1::CatalogDelta {
+                    removed_track_ids: vec!["video-one".to_string()],
+                    ..Default::default()
+                })),
+            },
+        );
+        let Effect::DataChannel(DataChannelEffect::Send {
+            operation, payload, ..
+        }) = next_effect(&mut agent)
+        else {
+            panic!("expected cleared video intent");
+        };
+        assert!(
+            decode_intent(&payload)
+                .receive
+                .unwrap()
+                .video
+                .unwrap()
+                .tracks
+                .is_empty()
+        );
+        acknowledge_send(&mut agent, generation, cid, operation);
+
+        deliver(
+            &mut agent,
+            v1::Catalog {
+                revision: 4,
+                state: Some(v1::catalog::State::Delta(v1::CatalogDelta {
+                    added_tracks: vec![v1::RemoteTrack {
+                        track_id: "video-two".to_string(),
                         participant_id: "remote".to_string(),
                         kind: v1::TrackKind::Video.into(),
                         mode: 0,
                         label: "camera".to_string(),
-                    },
-                    v1::RemoteTrack {
-                        track_id: "audio-one".to_string(),
-                        participant_id: "remote".to_string(),
-                        kind: v1::TrackKind::Audio.into(),
-                        mode: 0,
-                        label: "microphone".to_string(),
-                    },
-                ],
-                ..Default::default()
-            })),
-        },
-    );
-    let Effect::DataChannel(DataChannelEffect::Send {
-        operation, payload, ..
-    }) = next_effect(&mut agent)
-    else {
-        panic!("expected resolved intent");
-    };
-    let receive = decode_intent(&payload).receive.unwrap();
-    assert_eq!(receive.video.unwrap().tracks[0].track_id, "video-one");
-    let audio = receive.audio.unwrap().tracks;
-    assert_eq!(audio[0].track_id, "audio-one");
-    let delay = audio[0]
-        .options
-        .as_ref()
-        .unwrap()
-        .playout_delay
-        .as_ref()
-        .unwrap();
-    assert_eq!((delay.min_ms, delay.max_ms), (0, 0));
-    acknowledge_send(&mut agent, generation, cid, operation);
-
-    deliver(
-        &mut agent,
-        v1::Catalog {
-            revision: 3,
-            state: Some(v1::catalog::State::Delta(v1::CatalogDelta {
-                removed_track_ids: vec!["video-one".to_string()],
-                ..Default::default()
-            })),
-        },
-    );
-    let Effect::DataChannel(DataChannelEffect::Send {
-        operation, payload, ..
-    }) = next_effect(&mut agent)
-    else {
-        panic!("expected cleared video intent");
-    };
-    assert!(
-        decode_intent(&payload)
-            .receive
-            .unwrap()
-            .video
-            .unwrap()
-            .tracks
-            .is_empty()
-    );
-    acknowledge_send(&mut agent, generation, cid, operation);
-
-    deliver(
-        &mut agent,
-        v1::Catalog {
-            revision: 4,
-            state: Some(v1::catalog::State::Delta(v1::CatalogDelta {
-                added_tracks: vec![v1::RemoteTrack {
-                    track_id: "video-two".to_string(),
-                    participant_id: "remote".to_string(),
-                    kind: v1::TrackKind::Video.into(),
-                    mode: 0,
-                    label: "camera".to_string(),
-                }],
-                ..Default::default()
-            })),
-        },
-    );
-    let Effect::DataChannel(DataChannelEffect::Send { payload, .. }) = next_effect(&mut agent)
-    else {
-        panic!("expected re-resolved video intent");
-    };
-    assert_eq!(
-        decode_intent(&payload)
-            .receive
-            .unwrap()
-            .video
-            .unwrap()
-            .tracks[0]
-            .track_id,
-        "video-two"
-    );
+                    }],
+                    ..Default::default()
+                })),
+            },
+        );
+        let Effect::DataChannel(DataChannelEffect::Send {
+            operation, payload, ..
+        }) = next_effect(&mut agent)
+        else {
+            panic!("expected re-resolved video intent");
+        };
+        assert_eq!(
+            decode_intent(&payload)
+                .receive
+                .unwrap()
+                .video
+                .unwrap()
+                .tracks[0]
+                .track_id,
+            "video-two"
+        );
+        acknowledge_send(&mut agent, generation, cid, operation);
+        assert!(agent.next_effect().is_none());
+        if let Some(owner) = view {
+            agent.resource(ResourceCommand::Release { owner }).unwrap();
+            let Effect::DataChannel(DataChannelEffect::Send { payload, .. }) =
+                next_effect(&mut agent)
+            else {
+                panic!("withdrawn view intent")
+            };
+            assert!(
+                decode_intent(&payload)
+                    .receive
+                    .unwrap()
+                    .video
+                    .unwrap()
+                    .tracks
+                    .is_empty()
+            );
+        }
+    }
 }
 
 #[test]
@@ -2705,6 +2755,171 @@ fn latest_topic_send_admission_freshness_and_failures_are_explicit() {
             payload: vec![0; MAX_TOPIC_PAYLOAD_BYTES + 1]
         })),
         Err(AgentError::InvalidTopic(TopicError::PayloadTooLarge { .. }))
+    ));
+}
+
+#[test]
+fn owned_publications_reconcile_without_legacy_lifetime_binding_or_cross_owner_cleanup() {
+    let mut configuration = config();
+    configuration.topology.local_video = 1;
+    let mut agent = Agent::new(configuration).unwrap();
+    let spec = TrackSpec::Video {
+        label: "camera".into(),
+    };
+    let ResourceResult::Publication { owner, slot } = agent
+        .resource(ResourceCommand::ClaimPublication { spec: spec.clone() })
+        .unwrap()
+    else {
+        panic!("publication lease")
+    };
+    assert_eq!(slot, "v0");
+    let sender = MediaSlot::LocalVideo(slot.clone());
+    assert!(!agent.is_publishing(&sender));
+    agent
+        .resource(ResourceCommand::UpdatePublication {
+            owner,
+            present: true,
+        })
+        .unwrap();
+    assert!(agent.is_publishing(&sender));
+    assert_eq!(
+        agent.resource(ResourceCommand::ClaimPublication { spec }),
+        Err(AgentError::InvalidResource(
+            TrackResourceError::AlreadyOwned
+        ))
+    );
+    let legacy = DesiredState {
+        revision: 1,
+        publications: vec![PublicationIntent {
+            slot: slot.clone(),
+            label: "legacy".into(),
+            active: true,
+        }],
+        ..DesiredState::default()
+    };
+    assert_eq!(
+        agent.command(AgentCommand::ReplaceDesired(legacy)),
+        Err(AgentError::InvalidResource(
+            TrackResourceError::AlreadyOwned
+        ))
+    );
+    assert!(agent.is_publishing(&sender));
+    agent.resource(ResourceCommand::Release { owner }).unwrap();
+    assert!(!agent.is_publishing(&sender));
+    let ResourceResult::Publication {
+        owner: next,
+        slot: reused,
+    } = agent
+        .resource(ResourceCommand::ClaimPublication {
+            spec: TrackSpec::Video {
+                label: "screen".into(),
+            },
+        })
+        .unwrap()
+    else {
+        panic!("replacement lease")
+    };
+    assert_eq!(reused, slot);
+    assert_ne!(next, owner);
+    agent
+        .resource(ResourceCommand::UpdatePublication {
+            owner: next,
+            present: true,
+        })
+        .unwrap();
+    assert_eq!(
+        agent.resource(ResourceCommand::UpdatePublication {
+            owner,
+            present: false
+        }),
+        Err(AgentError::InvalidResource(TrackResourceError::Released))
+    );
+    agent.resource(ResourceCommand::Release { owner }).unwrap();
+    assert!(agent.is_publishing(&sender));
+}
+
+#[test]
+fn owned_receive_uses_transport_deduplication_and_last_owner_registration_lifetime() {
+    let registrations = TopicRegistrations {
+        publishers: vec![],
+        subscribers: vec![subscriber("events", TopicMode::Lossy)],
+    };
+    let (mut agent, generation, _, channels) = connect_with_topics(registrations);
+    let spec = TrackSpec::Data {
+        label: "events".into(),
+        delivery: TopicMode::Lossy,
+    };
+    let mut owners = Vec::new();
+    for participant_id in [None, Some("remote-app-user".into()), Some("bob".into())] {
+        let ResourceResult::Owned { owner } = agent
+            .resource(ResourceCommand::ReceiveData {
+                spec: spec.clone(),
+                participant_id,
+            })
+            .unwrap()
+        else {
+            panic!("receive lease")
+        };
+        owners.push(owner);
+    }
+    agent
+        .command(AgentCommand::ReplaceDesired(desired(2)))
+        .unwrap();
+    assert_eq!(agent.snapshot().topics.subscribers.len(), 1);
+    assert!(agent.next_effect().is_none());
+    drain_notifications(&mut agent);
+    let remote = data_id(false, "events", TopicMode::Lossy, "first");
+    for _ in 0..2 {
+        topic_input(
+            &mut agent,
+            generation,
+            channels["v2/lossy/sub/events"],
+            wire_message(&remote, 0, &[255, 0]),
+        )
+        .unwrap();
+    }
+    let notifications = drain_notifications(&mut agent);
+    assert_eq!(notifications.iter().filter(|notification| matches!(notification, Notification::DataReady { owners: ready } if ready == &owners[..2])).count(), 1);
+    for owner in &owners[..2] {
+        assert_eq!(
+            agent
+                .resource(ResourceCommand::ReadData { owner: *owner })
+                .unwrap(),
+            ResourceResult::Event {
+                event: Some(DataEvent::Message {
+                    participant_id: "remote-app-user".into(),
+                    track_id: remote.clone(),
+                    sequence: 0,
+                    data: vec![255, 0],
+                })
+            }
+        );
+        assert_eq!(
+            agent
+                .resource(ResourceCommand::ReadData { owner: *owner })
+                .unwrap(),
+            ResourceResult::Event { event: None }
+        );
+    }
+    assert_eq!(
+        agent
+            .resource(ResourceCommand::ReadData { owner: owners[2] })
+            .unwrap(),
+        ResourceResult::Event { event: None }
+    );
+    for owner in &owners[..2] {
+        agent
+            .resource(ResourceCommand::Release { owner: *owner })
+            .unwrap();
+        assert_eq!(agent.snapshot().topics.subscribers.len(), 1);
+    }
+    agent
+        .resource(ResourceCommand::Release { owner: owners[2] })
+        .unwrap();
+    assert!(agent.snapshot().topics.subscribers.is_empty());
+    assert!(matches!(
+        next_effect(&mut agent),
+        Effect::Rtc(RtcEffect::CreateOffer { .. })
     ));
 }
 
