@@ -41,7 +41,8 @@ def main():
                  "entrypoint", "next", "native"):
         parser.add_argument("--" + name, required=True)
     args = parser.parse_args()
-    inputs = {key: Path(value).resolve() for key, value in vars(args).items()}
+    # Preserve runfiles symlinks so child tool launchers can locate their runtime.
+    inputs = {key: Path(value).absolute() for key, value in vars(args).items()}
     root = Path(os.environ["BUILD_WORKSPACE_DIRECTORY"])
     web = root / "agents/pulsebeam-agent-web"
     copy(inputs["web"] / "dist", web / "dist")
