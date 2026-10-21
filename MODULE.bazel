@@ -95,11 +95,18 @@ http_file(
 )
 
 http_archive = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
-http_archive(
+webrtc_candidate = use_repo_rule("//tools:webrtc-candidate.bzl", "webrtc_candidate")
+webrtc_candidate(
     name = "libwebrtc_core",
-    urls = ["https://github.com/PulseBeamDev/pulsebeam-libwebrtc-sys/releases/download/v0.6.2/webrtc-core-linux-x86_64.tar.gz"],
-    sha256 = "de8126e5bcdba66fa531edbb3c92c63eac64fd4397ca8cdb7ea3b8aab8fb128f",
-    build_file_content = 'exports_files(["lib/libwebrtc.a", "manifest.json"])\nfilegroup(name = "licenses", srcs = glob(["LICENSES/**"]), visibility = ["//visibility:public"])',
+    kind = "native",
+    lock = "//tools:webrtc-candidate.json",
+    build_file = "//tools:webrtc-native.BUILD.bazel",
+)
+webrtc_candidate(
+    name = "webrtc_source",
+    kind = "source",
+    lock = "//tools:webrtc-candidate.json",
+    build_file = "//tools:webrtc-source.BUILD.bazel",
 )
 
 # npm >=11.5.1 supports GitHub OIDC trusted publishing. Its bundled dependencies
@@ -152,11 +159,10 @@ crate.annotation(
 )
 crate.annotation(
     crate = "pulsebeam-webrtc-sys",
-    version = "=0.6.2",
-    repositories = ["rtc_libwebrtc"],
+    version = "=0.8.0",
+    repositories = ["crates"],
+    override_target_lib = "@webrtc_source//:pulsebeam-webrtc-sys",
     gen_build_script = "off",
-    link_deps = ["@pulsebeam//tools:libwebrtc_native"],
-    label_injections = {"//tools:libwebrtc_native": "@pulsebeam"},
 )
 # Cargo's custom tokio_unstable cfg is applied by .bazelrc, but crate-universe
 # does not include cfg-gated edges in its generated platform selects.
@@ -174,13 +180,8 @@ crate.annotation(
 )
 use_repo(crate, "crates")
 
-crate.spec(
-    package = "pulsebeam-webrtc-sys",
-    version = "=0.6.2",
-    git = "https://github.com/PulseBeamDev/pulsebeam-libwebrtc-sys",
-    rev = "f87f99a48e58fb9cd13767ba58e9b7cd937c71a3",
-    repositories = ["rtc_libwebrtc"],
-)
+crate.spec(package = "cxxbridge-macro", version = "=1.0.200", repositories = ["rtc_libwebrtc"])
+crate.spec(package = "foldhash", version = "=0.2.0", default_features = False, features = ["std"], repositories = ["rtc_libwebrtc"])
 crate.from_specs(
     name = "rtc_libwebrtc",
     supported_platform_triples = ["x86_64-unknown-linux-gnu"],

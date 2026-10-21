@@ -25,7 +25,7 @@ needs the updated configuration; disk caches remain available after shutdown.
 | Go server SDK | `server/go/go.mod`, standard library only | Go compilation toolchain and consumer-owned verification share the derived SDK |
 | Python server SDK dependencies | `server/python/pyproject.toml` (public requirements), `requirements.in`/hashed `requirements.lock` (repository tools and concrete test resolution) | rules_python pip hub |
 | Browser binaries/drivers | `tools/browser-matrix.json` | Browser extension and consumer-owned Web/React coverage |
-| RTC native client | Pinned `pulsebeam-webrtc-sys` `0.6.2` source revision and released native archive hash in `MODULE.bazel` | Test-only controlled RTC simulation |
+| Native WebRTC inputs | Sys source archive and prebuilt native archive checksums in `tools/webrtc-candidate.json` | Native SDK and controlled RTC simulation, using one sys/CXX target |
 | Runtime image | Immutable cc-debian13 manifest digest in `MODULE.bazel` | rules_oci image |
 | Release identity/version/layout | Server Cargo manifest and `release/distribution.toml` | Archives, installer, plans and publication |
 
@@ -36,6 +36,36 @@ After editing authoritative Rust/generator inputs, explicitly run
 `tools/rust/*/Cargo.toml` or `tools/patches/str0m-rtc-visibility.patch` by hand.
 Cargo/pnpm lock maintenance remains separate from supported application
 compilation; CI does not install parallel host tools.
+
+### Use the local native WebRTC candidate
+
+Native SDK and controlled RTC builds require the unpublished Linux x86_64
+candidate recorded in `tools/webrtc-candidate.json`. There is no release URL
+fallback. Obtain both archives from the candidate producer, then select them:
+
+```sh
+export PULSEBEAM_WEBRTC_SOURCE_ARCHIVE=/absolute/path/webrtc-sys-source-linux-x86_64.tar.gz
+export PULSEBEAM_WEBRTC_NATIVE_ARCHIVE=/absolute/path/webrtc-core-linux-x86_64.tar.gz
+./bazel run //tools:prepare-webrtc-candidate -- \
+  --source "$PULSEBEAM_WEBRTC_SOURCE_ARCHIVE" \
+  --native "$PULSEBEAM_WEBRTC_NATIVE_ARCHIVE"
+./bazel test //tools:webrtc_candidate_contract //crates/pulsebeam-rtc/simulation:interop
+```
+
+Preparation verifies the locked archive checksums, source Git archive revision,
+producer bridge/configuration provenance, native library checksum, and license
+inventory. It installs ignored source/native inputs under `.native-candidate`;
+Cargo metadata uses that prepared source. Do not edit these extracted inputs.
+Bazel independently extracts the same checksum-pinned archives and validates
+their pairing before compiling the single Rust sys/CXX target. Consumer actions
+never compile the producer's C++ sources. The shell exports are passed to
+repository rules by `.bazelrc`; keep them set for native builds and Rust metadata
+maintenance. Wrong or missing inputs fail instead of selecting an older archive.
+
+To update the candidate, package a committed producer source using
+`git archive <revision> | gzip -n`, build its matching native artifact, update the
+lock's revision and archive checksums, and repeat preparation and Rust dependency
+maintenance. Remote publication and non-Linux runtime qualification are separate.
 
 ### Update RTC's upstream str0m
 

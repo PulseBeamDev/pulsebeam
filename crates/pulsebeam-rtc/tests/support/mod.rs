@@ -617,7 +617,6 @@ impl<M> PeerFixture<M> {
                     .encoded_receive_factory()
                     .expect("native encoded video receiver factory"),
             )
-            .controlled_media()
             .build()
             .expect("controlled native factory");
         let peer = factory

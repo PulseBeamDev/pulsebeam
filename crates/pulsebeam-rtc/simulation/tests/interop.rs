@@ -73,7 +73,6 @@ fn exercise(seed: u64, start: Instant) -> (u64, u64, usize) {
         .audio_decoder_factory(AudioDecoderFactory::builtin_opus().unwrap())
         .video_encoder_factory(video.encoder_factory())
         .video_decoder_factory(VideoDecoderFactoryHandle::builtin_vp8().unwrap())
-        .controlled_media()
         .build()
         .unwrap();
     let peer = factory
@@ -383,7 +382,6 @@ fn controlled_libwebrtc_acknowledges_rtx_padding_before_primary_media() {
         .audio_decoder_factory(AudioDecoderFactory::builtin_opus().unwrap())
         .video_encoder_factory(video.encoder_factory())
         .video_decoder_factory(video.encoded_receive_factory().unwrap())
-        .controlled_media()
         .build()
         .unwrap();
     let peer = factory

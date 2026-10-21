@@ -23,6 +23,7 @@ http = "1.4.1"
 if-addrs = "0.15.0"
 pulsebeam-core = { path = "../../crates/pulsebeam-core", features = ["reqwest", "str0m"] }
 pulsebeam-proto = { path = "../../crates/pulsebeam-proto" }
+pulsebeam-webrtc-sys.workspace = true
 reqwest = "0.13.4"
 str0m.workspace = true
 thiserror.workspace = true
