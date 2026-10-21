@@ -13,30 +13,27 @@
 use std::{
     collections::VecDeque,
     net::SocketAddr,
-    sync::{Arc, OnceLock},
+    sync::OnceLock,
     time::{Duration, Instant},
 };
 
 use bytes::Bytes;
 use pulsebeam_rtc::{
-    Command, CommandError, Connection, ConnectionConfig, ConnectionEntropy, ConnectionLimits,
-    DataChannelEvent, DataChannelId, DataMessage, DeliveryConstraints, Event as ConnectionEvent,
-    ForwardedMedia, FrameBoundary, FrameDependencies, FrameId, FrameMetadata, GlobalMediaTime,
-    IceTcpFlowId, LocalCandidate, MediaPacket, MediaPayloadBitrate, NetworkInput,
-    Output as ConnectionOutput, RejectedCommand, SdpOffer, SenderAssignment, SenderId,
-    SourceIncarnation, TimePoint, TransmitTarget,
+    Connection, ConnectionConfig, ConnectionEntropy, ConnectionLimits, DataChannelEvent,
+    DataChannelId, DataMessage, Event as ConnectionEvent, LocalCandidate, MediaPayloadBitrate,
+    NetworkInput, Output as ConnectionOutput, RejectedRtp, RtpPacket, RtpWrite, SdpOffer,
+    TransmitTarget, WriteError,
 };
 use pulsebeam_rtc_simulation::*;
 
 pub struct MediaFixture {
-    pub sender: SenderId,
     pub sender_mid: String,
 }
 
 pub struct PeerFixture<M = MediaFixture> {
     media: M,
     pub connection: Connection,
-    pub senders: Vec<SenderId>,
+    pub senders: Vec<String>,
     peer: PeerConnection,
     audio_source: Option<EncodedAudioSource>,
     video_source: Option<EncodedVideoSource>,
@@ -54,7 +51,7 @@ pub struct PeerFixture<M = MediaFixture> {
     start: Instant,
     source_timestamp: u32,
     headers: VecDeque<FixtureRtpHeader>,
-    transmit_observations: Option<VecDeque<(TimePoint, pulsebeam_rtc::TransmitKind)>>,
+    transmit_observations: Option<VecDeque<(Instant, pulsebeam_rtc::TransmitKind)>>,
     extension_ids: FixtureExtensionIds,
     last_video_wire_header: Option<(u32, u16)>,
     observe_egress: bool,
@@ -97,9 +94,9 @@ pub fn application_only_fixture_has_no_media() {
 pub fn fixture_advance_stops_at_requested_deadline() {
     let mut fixture = PeerFixture::connected();
     fixture.configure_time_quantum(Duration::from_millis(5));
-    let before = fixture.at().monotonic;
+    let before = fixture.at();
     fixture.drive_for(Duration::from_millis(1));
-    assert_eq!(fixture.at().monotonic, before + Duration::from_millis(1));
+    assert_eq!(fixture.at(), before + Duration::from_millis(1));
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -126,7 +123,6 @@ pub enum RtpImpairment {
 }
 
 struct FixtureTcpStream {
-    flow: IceTcpFlowId,
     local: NetworkAddress,
     remote: NetworkAddress,
 }
@@ -336,27 +332,19 @@ impl PeerFixture {
         clippy::result_large_err,
         reason = "keep caller-owned input inline instead of allocating an error wrapper"
     )]
-    pub fn admit_media(&mut self, media: ForwardedMedia) -> Result<(), RejectedCommand> {
-        let deadline = self
-            .at()
-            .monotonic
-            .checked_add(Duration::from_millis(150))
-            .expect("fixture admission deadline");
-        let mut command = Command::SendMedia {
-            sender: self.sender,
-            media,
-        };
+    pub fn write_rtp(&mut self, mut packet: RtpWrite) -> Result<(), RejectedRtp> {
+        let deadline = self.at() + Duration::from_millis(150);
+        let mid = self.sender_mid.clone();
         loop {
-            match self.connection.command(self.at(), command) {
+            match self.connection.write_rtp(self.at(), &mid, packet) {
                 Ok(()) => {
                     self.connection_idle = false;
                     return Ok(());
                 }
                 Err(rejected)
-                    if rejected.reason == CommandError::WouldBlock
-                        && self.at().monotonic < deadline =>
+                    if rejected.reason == WriteError::WouldBlock && self.at() < deadline =>
                 {
-                    command = rejected.command;
+                    packet = rejected.packet;
                     self.drive_for(Duration::from_millis(1));
                 }
                 Err(rejected) => return Err(rejected),
@@ -452,7 +440,6 @@ impl PeerFixture {
             MediaKind::VideoDd,
             Self::default_start(),
             |senders| MediaFixture {
-                sender: senders[0].id,
                 sender_mid: senders[0].mid.to_string(),
             },
         );
@@ -558,7 +545,6 @@ impl PeerFixture {
             |senders| {
                 let sender = senders.first().expect("negotiated media sender");
                 MediaFixture {
-                    sender: sender.id,
                     sender_mid: sender.mid.to_string(),
                 }
             },
@@ -776,17 +762,11 @@ impl<M> PeerFixture<M> {
             config.limits = limits;
         }
         let now = world.monotonic_now();
-        let mut accepted = Connection::accept(
+        let accepted = Connection::accept(
             config,
             SdpOffer::new(offer.sdp),
-            TimePoint {
-                monotonic: now,
-                global: GlobalMediaTime::from_micros(
-                    1_000_000
-                        + u64::try_from(now.duration_since(start).as_micros())
-                            .expect("bounded simulation epoch"),
-                ),
-            },
+            now,
+            std::time::UNIX_EPOCH + Duration::from_secs(1),
             ConnectionEntropy::new([11; 32]),
         )
         .expect("RTC accepts actual native offer");
@@ -794,32 +774,8 @@ impl<M> PeerFixture<M> {
             .session
             .senders
             .iter()
-            .map(|s| s.id)
+            .map(|s| s.mid.to_string())
             .collect::<Vec<_>>();
-        for &sender in &senders {
-            accepted
-                .connection
-                .command(
-                    TimePoint {
-                        monotonic: now,
-                        global: GlobalMediaTime::from_micros(
-                            1_000_000
-                                + u64::try_from(now.duration_since(start).as_micros())
-                                    .expect("bounded epoch"),
-                        ),
-                    },
-                    Command::SetSenderAssignment {
-                        sender,
-                        assignment: Some({
-                            let mut assignment =
-                                sender_assignment(MediaPayloadBitrate::from_bps(1_000_000));
-                            assignment.delivery.max_queue_residence = Duration::from_millis(200);
-                            assignment
-                        }),
-                    },
-                )
-                .expect("explicit fixture sender assignment");
-        }
         let media_state = media_state(&accepted.session.senders);
         if sender_count == 0 {
             assert!(accepted.session.inbound_media.is_empty());
@@ -1060,10 +1016,10 @@ impl<M> PeerFixture<M> {
         (ssrc, sequence)
     }
 
-    pub fn receive_source_sequence(&mut self, sequence: u16) -> MediaPacket {
+    pub fn receive_source_sequence(&mut self, sequence: u16) -> RtpPacket {
         for _ in 0..2_000 {
             if let Some(PeerEvent::Inbound(packet)) = self.step()
-                && packet.view().expect("source RTP").sequence_number == sequence
+                && packet.header.sequence == sequence
             {
                 return packet;
             }
@@ -1078,7 +1034,7 @@ impl<M> PeerFixture<M> {
         );
     }
 
-    pub fn send_source(&mut self, payload: &[u8]) -> MediaPacket {
+    pub fn send_source(&mut self, payload: &[u8]) -> RtpPacket {
         self.send_video_temporal_source(payload, None)
     }
 
@@ -1086,7 +1042,7 @@ impl<M> PeerFixture<M> {
         &mut self,
         payload: &[u8],
         temporal_index: Option<u8>,
-    ) -> MediaPacket {
+    ) -> RtpPacket {
         self.emit_source(payload, temporal_index);
         for _ in 0..2_000 {
             if let Some(PeerEvent::Inbound(packet)) = self.step() {
@@ -1162,7 +1118,7 @@ impl<M> PeerFixture<M> {
         }
     }
 
-    pub fn observe_source(&mut self, payload: &[u8]) -> (TimePoint, NetworkInput) {
+    pub fn observe_source(&mut self, payload: &[u8]) -> (Instant, NetworkInput) {
         self.emit_source(payload, None);
         for _ in 0..2_000 {
             let ready = self.network.pending.iter().position(|packet| {
@@ -1173,7 +1129,7 @@ impl<M> PeerFixture<M> {
                     NetworkInput::Udp { payload, .. } => payload.as_ref(),
                     NetworkInput::IceTcp { frame, .. } => frame.get(2..).expect("complete frame"),
                 };
-                *due <= self.at().monotonic
+                *due <= self.at()
                     && bytes.first().is_some_and(|byte| byte >> 6 == 2)
                     && bytes.get(1).is_some_and(|byte| !(192..=223).contains(byte))
             });
@@ -1194,7 +1150,7 @@ impl<M> PeerFixture<M> {
         self.transmit_observations = Some(VecDeque::new());
     }
 
-    pub fn take_transmit_observations(&mut self) -> Vec<(TimePoint, pulsebeam_rtc::TransmitKind)> {
+    pub fn take_transmit_observations(&mut self) -> Vec<(Instant, pulsebeam_rtc::TransmitKind)> {
         self.transmit_observations
             .as_mut()
             .expect("recording")
@@ -1202,14 +1158,14 @@ impl<M> PeerFixture<M> {
             .collect()
     }
 
-    pub fn send_fragmented_video_source(&mut self) -> Vec<MediaPacket> {
+    pub fn send_fragmented_video_source(&mut self, temporal_index: Option<u8>) -> Vec<RtpPacket> {
         assert!(self.video_source.is_some());
         let mut payload = vec![0x55; 3_500];
         payload[0] = 0x65;
-        let first = self.send_source(&payload);
+        let first = self.send_video_temporal_source(&payload, temporal_index);
         let mut packets = vec![first];
         for _ in 0..2_000 {
-            if packets.last().expect("first source packet").bytes()[1] & 0x80 != 0 {
+            if packets.last().expect("first source packet").header.marker {
                 assert!(
                     packets.len() >= 3,
                     "native frame includes a middle fragment"
@@ -1217,7 +1173,7 @@ impl<M> PeerFixture<M> {
                 return packets;
             }
             if let Some(PeerEvent::Inbound(packet)) = self.step() {
-                assert_eq!(packet.global_media_at(), packets[0].global_media_at());
+                assert_eq!(packet.header.timestamp, packets[0].header.timestamp);
                 packets.push(packet);
             }
         }
@@ -1294,21 +1250,8 @@ impl<M> PeerFixture<M> {
         panic!("native peer did not authenticate RTC RTP");
     }
 
-    pub fn tcp_flow(&self) -> IceTcpFlowId {
-        assert_eq!(self.tcp_streams.len(), 1, "one accepted fixture stream");
-        self.tcp_streams[0].flow
-    }
-
-    pub fn at(&self) -> TimePoint {
-        let now = self.now.max(self.world.monotonic_now());
-        TimePoint {
-            monotonic: now,
-            global: GlobalMediaTime::from_micros(
-                1_000_000
-                    + u64::try_from(now.duration_since(self.start).as_micros())
-                        .expect("bounded simulation epoch"),
-            ),
-        }
+    pub fn at(&self) -> Instant {
+        self.now.max(self.world.monotonic_now())
     }
 
     pub fn advance_clock_without_poll(&mut self, duration: Duration) {
@@ -1320,7 +1263,7 @@ impl<M> PeerFixture<M> {
     }
 
     pub fn drive_for(&mut self, duration: Duration) {
-        self.now = self.at().monotonic;
+        self.now = self.at();
         let deadline = self.now + duration;
         let mut stalled_steps = 0;
         while self.now < deadline {
@@ -1338,43 +1281,18 @@ impl<M> PeerFixture<M> {
         }
     }
 
+    pub fn set_desired_bitrate(&mut self, rate: Option<MediaPayloadBitrate>) {
+        self.connection.set_desired_bitrate(rate);
+        self.connection_idle = false;
+    }
+
     pub fn twcc_sent(&self) -> usize {
         self.twcc_sent
     }
     pub fn set_feedback_enabled(&mut self, enabled: bool) {
         self.feedback_enabled = enabled;
     }
-    pub fn assignment(&self, sender: SenderId) -> SenderAssignment {
-        self.connection
-            .stats()
-            .senders
-            .iter()
-            .find(|stats| stats.sender == sender)
-            .expect("fixture sender")
-            .assignment
-            .expect("explicit fixture assignment")
-    }
 
-    pub fn command(&mut self, command: Command) {
-        if let Err(rejected) = self.try_command(command) {
-            panic!(
-                "connection command: {:?}; stats={:?}",
-                rejected.reason,
-                self.connection.stats().connection,
-            );
-        }
-    }
-    #[allow(
-        clippy::result_large_err,
-        reason = "keep caller-owned input inline instead of allocating an error wrapper"
-    )]
-    pub fn try_command(&mut self, command: Command) -> Result<(), RejectedCommand> {
-        let result = self.connection.command(self.at(), command);
-        if result.is_ok() {
-            self.connection_idle = false;
-        }
-        result
-    }
     pub fn peer_send(&mut self, binary: bool, payload: &[u8]) {
         assert_eq!(
             self.peer_channel
@@ -1419,7 +1337,7 @@ impl<M> PeerFixture<M> {
     }
 
     fn step_until(&mut self, deadline: Option<Instant>) -> Option<PeerEvent> {
-        self.now = self.at().monotonic;
+        self.now = self.at();
         self.world.pump();
         if let Some(index) = self
             .network
@@ -1433,16 +1351,9 @@ impl<M> PeerFixture<M> {
                 .remove(index)
                 .expect("controlled native fixture operation")
             {
-                PendingPacket::Connection { input, .. } => {
+                PendingPacket::Connection { due, input } => {
                     self.connection
-                        .receive(
-                            self.at(),
-                            pulsebeam_rtc::PacketObservation {
-                                at: self.at(),
-                                provenance: 0,
-                            },
-                            input,
-                        )
+                        .receive(self.at(), due, input)
                         .expect("RTC native datagram receive");
                     self.connection_idle = false;
                 }
@@ -1504,14 +1415,7 @@ impl<M> PeerFixture<M> {
         if let Some(packet) = self.network_adapter.next_packet() {
             match packet.kind {
                 OutboundKind::TcpConnect => {
-                    let flow = IceTcpFlowId::from_value(self.tcp_streams.len() as u64 + 1);
-                    self.command(Command::AdmitIceTcpFlow {
-                        flow,
-                        local: SocketAddr::new(packet.destination.ip(), packet.destination.port()),
-                        remote: SocketAddr::new(packet.source.ip(), packet.source.port()),
-                    });
                     self.tcp_streams.push(FixtureTcpStream {
-                        flow,
                         local: packet.destination,
                         remote: packet.source,
                     });
@@ -1536,7 +1440,6 @@ impl<M> PeerFixture<M> {
                     self.network.enqueue(PendingPacket::Connection {
                         due: self.now,
                         input: NetworkInput::IceTcp {
-                            flow: stream.flow,
                             local: SocketAddr::new(stream.local.ip(), stream.local.port()),
                             remote: SocketAddr::new(stream.remote.ip(), stream.remote.port()),
                             frame: Bytes::from(frame),
@@ -1670,11 +1573,15 @@ impl<M> PeerFixture<M> {
                     }
                     let (destination, payload) = match transmit.target {
                         TransmitTarget::Udp { remote, .. } => (remote, transmit.payload.as_ref()),
-                        TransmitTarget::IceTcp { flow } => {
+                        TransmitTarget::IceTcp { local, remote } => {
                             let stream = self
                                 .tcp_streams
                                 .iter()
-                                .find(|stream| stream.flow == flow)
+                                .find(|stream| {
+                                    SocketAddr::new(stream.local.ip(), stream.local.port()) == local
+                                        && SocketAddr::new(stream.remote.ip(), stream.remote.port())
+                                            == remote
+                                })
                                 .expect("output identifies an admitted TCP stream");
                             let length = u16::from_be_bytes(
                                 transmit.payload[..2].try_into().expect("RFC 4571 prefix"),
@@ -1778,7 +1685,7 @@ impl<M> PeerFixture<M> {
                     self.connection_connected = true;
                     return Some(PeerEvent::Connected);
                 }
-                ConnectionOutput::Event(ConnectionEvent::Media { packet, .. }) => {
+                ConnectionOutput::Event(ConnectionEvent::Rtp { packet, .. }) => {
                     return Some(PeerEvent::Inbound(packet));
                 }
                 ConnectionOutput::Event(ConnectionEvent::DataChannel(event)) => {
@@ -1826,10 +1733,6 @@ impl<M> PeerFixture<M> {
         self.connection_idle = false;
         None
     }
-}
-
-pub fn second_negotiated_sender() -> SenderId {
-    PeerFixture::new_with(FixtureTransport::Udp, None, false, 2, MediaKind::Audio).senders[1]
 }
 
 #[derive(Clone, Copy)]
@@ -2060,7 +1963,7 @@ fn assert_probe_windows_with_allowance(
     let (mut peak_ratio, mut peak_allowance) = (0_u64, 0_u64);
     let mut check = |at: Instant, nonprobe: u64, probes: u64, new_probe: bool| {
         let total = probes + nonprobe;
-        peak_ratio = peak_ratio.max(if total == 0 { 0 } else { probes * 100 / total });
+        peak_ratio = peak_ratio.max(probes.saturating_mul(100).checked_div(total).unwrap_or(0));
         peak_allowance = peak_allowance.max(probes.saturating_sub(nonprobe / 19));
         assert!(
             probes <= nonprobe / 19 + allowance(at, new_probe),
@@ -2102,39 +2005,37 @@ fn assert_probe_windows_with_allowance(
     );
 }
 
-pub fn sender_assignment(rate: MediaPayloadBitrate) -> SenderAssignment {
-    SenderAssignment {
-        source: SourceIncarnation::from_value(1),
-        selected_bitrate: rate,
-        potential_bitrate: rate,
-        delivery: DeliveryConstraints {
-            max_media_age: Duration::from_secs(1),
-            max_queue_residence: Duration::from_millis(80),
-            repair_window: Duration::from_secs(1),
-        },
-        playout_delay: None,
-        decode_target_mask: None,
+pub fn rtp_write(packet: RtpPacket, sequence: u64) -> RtpWrite {
+    RtpWrite {
+        sequence, timestamp: packet.header.timestamp, wallclock: packet.arrival,
+        marker: packet.header.marker, payload: packet.payload,
+        extensions: packet.extensions.into_iter().filter(|value| !matches!(value.uri.as_ref(),
+            "urn:ietf:params:rtp-hdrext:sdes:mid"
+            | "urn:ietf:params:rtp-hdrext:sdes:rtp-stream-id"
+            | "urn:ietf:params:rtp-hdrext:sdes:repaired-rtp-stream-id"
+            | "http://www.webrtc.org/experiments/rtp-hdrext/abs-send-time"
+            | "http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01"
+            | "urn:ietf:params:rtp-hdrext:transport-wide-cc-02"
+        )).collect(),
     }
 }
 
-pub fn forwarded(packet: MediaPacket, id: u64) -> ForwardedMedia {
-    ForwardedMedia {
-        source: SourceIncarnation::from_value(1),
-        packet,
-        frame: FrameMetadata {
-            descriptor: None,
-            id: FrameId::from_value(id),
-            boundary: FrameBoundary::Complete,
-            random_access: true,
-            discardable: false,
-            dependencies: FrameDependencies::Known(Arc::from([])),
-        },
+pub fn sample(at: Instant, sequence: u64, payload_bytes: usize, clock_rate: u32) -> RtpWrite {
+    RtpWrite {
+        sequence,
+        timestamp: u32::try_from(sequence)
+            .expect("short sample trace")
+            .wrapping_mul(clock_rate / 50),
+        wallclock: at,
+        marker: true,
+        payload: Bytes::from(vec![0x55; payload_bytes]),
+        extensions: Vec::new(),
     }
 }
 
 enum PeerEvent {
     Connected,
-    Inbound(MediaPacket),
+    Inbound(RtpPacket),
     Outbound(FixtureRtpHeader, Vec<u8>),
     ConnectionData(DataChannelEvent),
     PeerOpened,

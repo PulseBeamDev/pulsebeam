@@ -1,14 +1,12 @@
 use std::{
-    any::TypeId,
     net::{Ipv6Addr, SocketAddr, SocketAddrV6},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use pulsebeam_rtc::{
-    AcceptError, Command, Connection, ConnectionConfig, ConnectionLimits, DataChannelId,
-    FrameDependencies, FrameId, GlobalMediaTime, IceTcpFlowId, LocalCandidate, LocalIceCredentials,
-    MediaPacket, NetworkInput, Output, PlayoutDelay, PolicyError, ReceiveError, StatsSnapshot,
-    TimePoint,
+    AcceptError, Connection, ConnectionConfig, ConnectionLimits, LocalCandidate,
+    LocalIceCredentials, NetworkInput, Output, PlayoutDelay, PlayoutDelayError, ReceiveError,
+    RtpPacket, RtpWrite, StatsSnapshot,
 };
 
 fn assert_send<T: Send>() {}
@@ -32,35 +30,30 @@ macro_rules! assert_not_impl {
 }
 
 assert_not_impl!(Connection, Sync);
-assert_not_impl!(MediaPacket, Sync);
 
 #[test]
-fn facade_values_are_send_but_connection_owned_values_are_not_sync() {
+fn direct_values_are_send_but_the_connection_is_not_sync() {
     assert_send::<Connection>();
-    assert_send::<MediaPacket>();
+    assert_send::<RtpPacket>();
+    assert_send::<RtpWrite>();
 }
 
 #[test]
 fn connection_runtime_methods_have_the_public_sans_io_signatures() {
-    let _: fn(
-        &mut Connection,
-        TimePoint,
-        pulsebeam_rtc::PacketObservation,
-        NetworkInput,
-    ) -> Result<(), ReceiveError> = Connection::receive;
-    let _: fn(&mut Connection, TimePoint) -> Output = Connection::poll;
-    let _: fn(&mut Connection, TimePoint, Command) -> Result<(), pulsebeam_rtc::RejectedCommand> =
-        Connection::command;
+    let _: fn(&mut Connection, Instant, Instant, NetworkInput) -> Result<(), ReceiveError> =
+        Connection::receive;
+    let _: fn(&mut Connection, Instant) -> Output = Connection::poll;
+    let _: fn(&mut Connection, Instant, &str, RtpWrite) -> Result<(), pulsebeam_rtc::RejectedRtp> =
+        Connection::write_rtp;
+    let _: fn(&mut Connection, Option<pulsebeam_rtc::MediaPayloadBitrate>) =
+        Connection::set_desired_bitrate;
     let _: fn(&Connection) -> StatsSnapshot = Connection::stats;
 }
 
 #[test]
 fn negotiated_codec_facts_are_public_and_directional() {
     use pulsebeam_rtc::{CodecProfile, ConnectionEntropy, MediaKind, SdpOffer};
-    let at = TimePoint {
-        monotonic: std::time::Instant::now(),
-        global: GlobalMediaTime::from_micros(0),
-    };
+    let at = Instant::now();
     let offer =
         include_str!("fixtures/chrome-representative.sdp").replacen("a=sendonly", "a=recvonly", 1);
     let accepted = Connection::accept(
@@ -73,17 +66,10 @@ fn negotiated_codec_facts_are_public_and_directional() {
         },
         SdpOffer::new(offer),
         at,
+        std::time::UNIX_EPOCH,
         ConnectionEntropy::new([9; 32]),
     )
     .expect("mixed-direction session");
-    assert!(
-        accepted
-            .connection
-            .stats()
-            .senders
-            .iter()
-            .all(|sender| sender.assignment.is_none())
-    );
     let inbound = accepted
         .session
         .inbound_media
@@ -111,50 +97,6 @@ fn negotiated_codec_facts_are_public_and_directional() {
     assert_eq!(sender.codec.channels, Some(2));
     assert_eq!(sender.codec.clock_rate, 48_000);
     assert_eq!(sender.codec.retransmission_payload_type, None);
-}
-
-#[test]
-fn stable_identifiers_are_nominally_distinct() {
-    assert_ne!(TypeId::of::<DataChannelId>(), TypeId::of::<FrameId>());
-    assert_ne!(TypeId::of::<FrameId>(), TypeId::of::<IceTcpFlowId>());
-    assert_ne!(
-        TypeId::of::<pulsebeam_rtc::SourceIncarnation>(),
-        TypeId::of::<FrameId>()
-    );
-    assert_eq!(
-        pulsebeam_rtc::SourceIncarnation::from_value(u64::MAX).value(),
-        u64::MAX
-    );
-    assert_eq!(DataChannelId::from_value(7).value(), 7);
-    assert_eq!(FrameId::from_value(9).value(), 9);
-    assert_eq!(IceTcpFlowId::from_value(11).value(), 11);
-}
-
-#[test]
-fn global_media_time_has_exact_big_endian_wire_representation() {
-    assert_eq!(GlobalMediaTime::from_micros(0).to_be_bytes(), [0; 8]);
-    assert_eq!(
-        GlobalMediaTime::from_micros(1).to_be_bytes(),
-        [0, 0, 0, 0, 0, 0, 0, 1]
-    );
-    assert_eq!(
-        GlobalMediaTime::from_micros(u64::MAX).to_be_bytes(),
-        [u8::MAX; 8]
-    );
-
-    let encoded = 0x0102_0304_0506_0708_u64.to_be_bytes();
-    assert_eq!(
-        GlobalMediaTime::from_be_bytes(encoded).as_micros(),
-        0x0102_0304_0506_0708
-    );
-    assert_eq!(
-        GlobalMediaTime::from_micros(u64::MAX).checked_add(Duration::from_micros(1)),
-        None
-    );
-    assert_eq!(
-        GlobalMediaTime::from_micros(0).checked_sub(Duration::from_micros(1)),
-        None
-    );
 }
 
 #[test]
@@ -327,29 +269,28 @@ fn local_candidate_configuration_is_bounded_and_structural() {
 }
 
 #[test]
-fn policy_values_reject_unrepresentable_construction() {
+fn explicit_playout_values_reject_unrepresentable_construction() {
     assert_eq!(
         PlayoutDelay::from_millis_exact(1, 10),
-        Err(PolicyError::PlayoutNotExactlyRepresentable)
+        Err(PlayoutDelayError::NotExactlyRepresentable)
     );
     assert_eq!(
         PlayoutDelay::from_ticks(2, 1),
-        Err(PolicyError::PlayoutRange)
+        Err(PlayoutDelayError::Range)
     );
     let delay = PlayoutDelay::from_millis(149, 204).expect("valid millisecond bounds");
     assert_eq!(delay.min(), Duration::from_millis(149));
     assert_eq!(delay.max(), Duration::from_millis(204));
     assert_eq!(
         PlayoutDelay::from_millis(0, 40_951),
-        Err(PolicyError::PlayoutRange)
+        Err(PlayoutDelayError::Range)
     );
     assert_eq!(
         PlayoutDelay::from_millis(2, 1),
-        Err(PolicyError::PlayoutRange)
+        Err(PlayoutDelayError::Range)
     );
     assert_eq!(
         PlayoutDelay::from_millis(0, 40_950).map(PlayoutDelay::max),
         Ok(Duration::from_millis(40_950))
     );
-    assert_eq!(FrameDependencies::known([FrameId::from_value(1); 9]), None);
 }

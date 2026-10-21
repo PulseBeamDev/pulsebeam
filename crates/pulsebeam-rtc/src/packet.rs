@@ -180,11 +180,6 @@ impl<'a> RtpPacket<'a> {
         self.marker
     }
 
-    #[cfg(test)]
-    pub const fn extension_profile(&self) -> Option<u16> {
-        self.extension_profile
-    }
-
     pub fn extensions(&self) -> Result<ExtensionIter<'a>, PacketError> {
         let Some(range) = &self.extensions else {
             return Ok(ExtensionIter {

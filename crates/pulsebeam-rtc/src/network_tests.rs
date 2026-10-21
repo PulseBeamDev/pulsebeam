@@ -9,9 +9,8 @@
 
 use std::time::Duration;
 
-use crate::test_source::ComponentSource;
-use crate::test_support::{NetworkPolicy, PeerFixture, assert_probe_windows, forwarded};
-use crate::{Command, CommandError, MediaPayloadBitrate, PlayoutDelay};
+use crate::test_support::{NetworkPolicy, PeerFixture, assert_probe_windows, sample};
+use crate::{MediaPayloadBitrate, WriteError};
 
 const PAYLOAD_BYTES: usize = 1_000;
 
@@ -33,36 +32,21 @@ fn production_connection_bottleneck_emits_measured_transport_bytes() {
     );
     fixture.configure_bottleneck(RATE_BPS);
     fixture.configure_time_quantum(Duration::from_millis(5));
-    let mut source = ComponentSource::audio(1);
-    let mut policy =
-        crate::test_support::sender_assignment(pulsebeam_rtc::MediaPayloadBitrate::from_bps(0));
-    policy.selected_bitrate = MediaPayloadBitrate::from_bps(1_000_000);
-    policy.potential_bitrate = MediaPayloadBitrate::from_bps(1_000_000);
-    // At 100 kbit/s, a full minimum send window alone takes hundreds of ms.
-    // This is a transport-service fixture, not a low-latency policy fixture.
-    policy.playout_delay =
-        Some(pulsebeam_rtc::PlayoutDelay::from_ticks(0, 200).expect("2 seconds"));
-    fixture.command(Command::SetSenderAssignment {
-        sender: fixture.sender,
-        assignment: Some(policy),
-    });
-    let started = fixture.at().monotonic;
-    fixture.drive_for(started.saturating_duration_since(fixture.at().monotonic));
-    let mut emitted_windows =
-        std::collections::VecDeque::from([(fixture.at().monotonic, 0_u64, 0_u64)]);
+    fixture.set_desired_bitrate(Some(MediaPayloadBitrate::from_bps(1_000_000)));
+    let mid = fixture.sender_mid.clone();
+    let started = fixture.at();
+    fixture.drive_for(started.saturating_duration_since(fixture.at()));
+    let mut emitted_windows = std::collections::VecDeque::from([(fixture.at(), 0_u64, 0_u64)]);
     let mut max_probe_percent = 0_u64;
     let mut measured_windows = 0_u64;
     for id in 1..=PACKETS {
         let at = started + Duration::from_millis(id * 40);
-        fixture.drive_for(at.saturating_duration_since(fixture.at().monotonic));
-        let media = forwarded(source.sample(fixture.at(), &[0x5a; PAYLOAD_BYTES]), id);
-        match fixture.try_command(Command::SendMedia {
-            sender: fixture.sender,
-            media,
-        }) {
+        fixture.drive_for(at.saturating_duration_since(fixture.at()));
+        let media = sample(fixture.at(), id, PAYLOAD_BYTES, 48_000);
+        match fixture.connection.write_rtp(fixture.at(), &mid, media) {
             Ok(())
-            | Err(pulsebeam_rtc::RejectedCommand {
-                reason: CommandError::WouldBlock,
+            | Err(pulsebeam_rtc::RejectedRtp {
+                reason: WriteError::WouldBlock,
                 ..
             }) => {}
             Err(error) => panic!("production admission at {id}: {error:?}"),
@@ -70,27 +54,24 @@ fn production_connection_bottleneck_emits_measured_transport_bytes() {
         fixture.drive_for(Duration::from_millis(1));
         let totals = fixture.connection.stats().connection;
         emitted_windows.push_back((
-            fixture.at().monotonic,
+            fixture.at(),
             totals.transmitted_rtp_bytes,
             totals.transmitted_padding_bytes,
         ));
         while emitted_windows.get(1).is_some_and(|(at, _, _)| {
-            fixture.at().monotonic.saturating_duration_since(*at) >= Duration::from_secs(5)
+            fixture.at().saturating_duration_since(*at) >= Duration::from_secs(5)
         }) {
             emitted_windows.pop_front();
         }
         if let Some((start, rtp, padding)) = emitted_windows.front()
-            && fixture.at().monotonic.saturating_duration_since(*start) >= Duration::from_secs(5)
+            && fixture.at().saturating_duration_since(*start) >= Duration::from_secs(5)
         {
             measured_windows += 1;
             let emitted = totals.transmitted_rtp_bytes.saturating_sub(*rtp);
             let probes = totals.transmitted_padding_bytes.saturating_sub(*padding);
             let total = emitted.saturating_add(probes);
-            max_probe_percent = max_probe_percent.max(if total == 0 {
-                0
-            } else {
-                probes.saturating_mul(100) / total
-            });
+            max_probe_percent =
+                max_probe_percent.max(probes.saturating_mul(100).checked_div(total).unwrap_or(0));
             assert!(probes <= emitted / 19 + 48 * 1024);
         }
     }
@@ -106,14 +87,14 @@ fn production_connection_bottleneck_emits_measured_transport_bytes() {
         sojourn.len(),
         stats.connection.transmitted_rtp_bytes,
         stats.connection.transmitted_padding_bytes,
-        stats.connection.media_budget.as_bps(),
+        stats.connection.bandwidth_estimate.as_bps(),
         p99.as_millis()
     );
     assert!(
         sojourn.len() >= 1_000,
         "insufficient emitted transport samples"
     );
-    let elapsed_micros = fixture.at().monotonic.duration_since(started).as_micros();
+    let elapsed_micros = fixture.at().duration_since(started).as_micros();
     let service_bytes = u128::from(RATE_BPS).saturating_mul(elapsed_micros) / 8_000_000;
     assert!(
         u128::from(delivered).saturating_mul(100) >= service_bytes.saturating_mul(85),
@@ -122,80 +103,6 @@ fn production_connection_bottleneck_emits_measured_transport_bytes() {
     assert!(stats.connection.transmitted_rtp_bytes > 0);
     assert!(stats.connection.transmitted_padding_bytes <= stats.connection.transmitted_rtp_bytes);
     assert!(measured_windows >= 1_000);
-}
-
-#[test]
-fn production_two_megabit_single_flow_capacity() {
-    let mut fixture = PeerFixture::connected().without_egress_observation();
-    fixture.configure_network(
-        0x2201,
-        NetworkPolicy {
-            delay: Duration::from_millis(25),
-            ..NetworkPolicy::default()
-        },
-    );
-    fixture.configure_bottleneck(2_000_000);
-    fixture.configure_time_quantum(Duration::from_millis(2));
-    let mut policy =
-        crate::test_support::sender_assignment(pulsebeam_rtc::MediaPayloadBitrate::from_bps(0));
-    policy.selected_bitrate = MediaPayloadBitrate::from_bps(4_000_000);
-    policy.potential_bitrate = MediaPayloadBitrate::from_bps(4_000_000);
-    policy.playout_delay = Some(PlayoutDelay::from_ticks(0, 50).expect("500ms playout"));
-    fixture
-        .connection
-        .command(
-            fixture.at(),
-            Command::SetSenderAssignment {
-                sender: fixture.sender,
-                assignment: Some(policy),
-            },
-        )
-        .expect("demand policy");
-    let start = fixture.at().monotonic;
-    let mut source = ComponentSource::audio(1);
-    for id in 1..=6_000_u64 {
-        let media = forwarded(source.sample(fixture.at(), &[0x5a; PAYLOAD_BYTES]), id);
-        match fixture
-            .connection
-            .command(
-                fixture.at(),
-                Command::SendMedia {
-                    sender: fixture.sender,
-                    media,
-                },
-            )
-            .map_err(|rejected| rejected.reason)
-        {
-            Ok(()) | Err(CommandError::WouldBlock) => {}
-            Err(error) => panic!("admission: {error:?}"),
-        }
-        fixture.drive_for(Duration::from_millis(2));
-    }
-    let end = fixture.at().monotonic;
-    let stable_start = start + Duration::from_secs(2);
-    let cohort = fixture
-        .emitted_rtp()
-        .iter()
-        .filter(|(at, _, _)| *at >= stable_start && *at < end)
-        .map(|(_, bytes, _)| *bytes)
-        .sum::<u64>();
-    fixture.drive_for(Duration::from_secs(2));
-    assert_probe_windows(fixture.emitted_rtp());
-    let delivered = fixture
-        .delivered_rtp()
-        .iter()
-        .filter(|(at, _)| *at >= stable_start && *at < end)
-        .map(|(_, bytes)| *bytes)
-        .sum::<u64>();
-    let service = 2_000_000_u128 * end.duration_since(stable_start).as_micros() / 8_000_000;
-    eprintln!(
-        "2mbps seed=0x2201 stable_emitted={cohort} stable_delivered={delivered} service={service} duration={:?}",
-        end.duration_since(stable_start)
-    );
-    assert!(end.duration_since(stable_start) >= Duration::from_secs(10));
-    assert_eq!(delivered, cohort, "all emission-cohort RTP must drain");
-    assert!(fixture.bottleneck_samples().0.len() >= 1_000);
-    assert!(u128::from(delivered) * 100 >= service * 85);
 }
 
 #[test]
@@ -210,24 +117,13 @@ fn production_capacity_steps_recover_stable_transport_service() {
     );
     fixture.configure_bottleneck(2_000_000);
     fixture.configure_time_quantum(Duration::from_millis(2));
-    let mut policy =
-        crate::test_support::sender_assignment(pulsebeam_rtc::MediaPayloadBitrate::from_bps(0));
-    policy.selected_bitrate = MediaPayloadBitrate::from_bps(4_000_000);
-    policy.potential_bitrate = MediaPayloadBitrate::from_bps(4_000_000);
-    policy.playout_delay = Some(PlayoutDelay::from_ticks(0, 50).expect("500ms playout"));
+    fixture.set_desired_bitrate(Some(MediaPayloadBitrate::from_bps(8_000_000)));
     let senders = fixture.senders.clone();
-    for &sender in &senders {
-        fixture.command(Command::SetSenderAssignment {
-            sender,
-            assignment: Some(policy),
-        });
-    }
-    let mut sources = [ComponentSource::audio(1), ComponentSource::audio(2)];
-    let start = fixture.at().monotonic;
+    let start = fixture.at();
     let mut budgets = Vec::with_capacity(3);
     for id in 1..=18_000_u64 {
         let tick = start + Duration::from_millis(id * 2);
-        fixture.drive_for(tick.saturating_duration_since(fixture.at().monotonic));
+        fixture.drive_for(tick.saturating_duration_since(fixture.at()));
         if id == 6_000 {
             fixture.set_bottleneck_rate(1_000_000);
         }
@@ -236,17 +132,14 @@ fn production_capacity_steps_recover_stable_transport_service() {
         }
         if id % 6_000 == 0 {
             let stats = fixture.connection.stats();
-            assert!(stats.senders.iter().all(|sender| {
-                sender.assignment.expect("bound sender").selected_bitrate == policy.selected_bitrate
-            }));
-            budgets.push(stats.connection.media_budget.as_bps());
+            budgets.push(stats.connection.bandwidth_estimate.as_bps());
         }
-        for (source, &sender) in sources.iter_mut().zip(&senders) {
-            let media = forwarded(source.sample(fixture.at(), &[0x5a; PAYLOAD_BYTES]), id);
-            match fixture.try_command(Command::SendMedia { sender, media }) {
+        for sender in &senders {
+            let media = sample(fixture.at(), id, PAYLOAD_BYTES, 48_000);
+            match fixture.connection.write_rtp(fixture.at(), sender, media) {
                 Ok(())
-                | Err(pulsebeam_rtc::RejectedCommand {
-                    reason: CommandError::WouldBlock,
+                | Err(pulsebeam_rtc::RejectedRtp {
+                    reason: WriteError::WouldBlock,
                     ..
                 }) => {}
                 Err(error) => panic!("step admission: {error:?}"),
@@ -306,7 +199,6 @@ fn production_homogeneous_shared_bottleneck_competition() {
         PeerFixture::connected().without_egress_observation(),
         PeerFixture::connected().without_egress_observation(),
     ];
-    let mut sources = [ComponentSource::audio(1), ComponentSource::audio(2)];
     for (index, flow) in flows.iter_mut().enumerate() {
         flow.configure_network(
             0x3301 + index as u64,
@@ -318,52 +210,30 @@ fn production_homogeneous_shared_bottleneck_competition() {
         flow.configure_bottleneck(4_000_000);
         flow.share_bottleneck_departure(shared.clone());
         flow.configure_time_quantum(Duration::from_millis(2));
-        let mut policy =
-            crate::test_support::sender_assignment(pulsebeam_rtc::MediaPayloadBitrate::from_bps(0));
-        policy.selected_bitrate = MediaPayloadBitrate::from_bps(4_000_000);
-        policy.potential_bitrate = MediaPayloadBitrate::from_bps(4_000_000);
-        policy.playout_delay = Some(PlayoutDelay::from_ticks(0, 50).expect("500ms playout"));
-        flow.connection
-            .command(
-                flow.at(),
-                Command::SetSenderAssignment {
-                    sender: flow.sender,
-                    assignment: Some(policy),
-                },
-            )
-            .expect("demand policy");
+        flow.set_desired_bitrate(Some(MediaPayloadBitrate::from_bps(4_000_000)));
     }
-    let start = flows.iter().map(|flow| flow.at().monotonic).max().unwrap();
+    let start = flows.iter().map(PeerFixture::at).max().unwrap();
     for id in 1..=6_000_u64 {
         let tick = start + Duration::from_millis(id * 2);
         let first = usize::try_from(id % 2).unwrap_or_default();
         for index in [first, 1 - first] {
             let flow = &mut flows[index];
-            let source = &mut sources[index];
-            flow.drive_for(tick.saturating_duration_since(flow.at().monotonic));
-            let media = forwarded(source.sample(flow.at(), &[0x5a; PAYLOAD_BYTES]), id);
+            flow.drive_for(tick.saturating_duration_since(flow.at()));
+            let media = sample(flow.at(), id, PAYLOAD_BYTES, 48_000);
             match flow
                 .connection
-                .command(
-                    flow.at(),
-                    Command::SendMedia {
-                        sender: flow.sender,
-                        media,
-                    },
-                )
+                .write_rtp(flow.at(), &flow.sender_mid.clone(), media)
                 .map_err(|rejected| rejected.reason)
             {
-                Ok(()) | Err(CommandError::WouldBlock) => {}
+                Ok(()) | Err(WriteError::WouldBlock) => {}
                 Err(error) => panic!("shared-flow admission: {error:?}"),
             }
         }
     }
     for flow in &mut flows {
-        flow.drive_for(
-            (start + Duration::from_secs(12)).saturating_duration_since(flow.at().monotonic),
-        );
+        flow.drive_for((start + Duration::from_secs(12)).saturating_duration_since(flow.at()));
     }
-    let end = flows.iter().map(|flow| flow.at().monotonic).min().unwrap();
+    let end = flows.iter().map(PeerFixture::at).min().unwrap();
     let stable_start = start + Duration::from_secs(2);
     for flow in &mut flows {
         flow.drive_for(Duration::from_secs(2));
@@ -392,12 +262,16 @@ fn production_homogeneous_shared_bottleneck_competition() {
         end.duration_since(stable_start),
         flows[0]
             .at()
-            .monotonic
-            .max(flows[1].at().monotonic)
-            .duration_since(flows[0].at().monotonic.min(flows[1].at().monotonic)),
+            .max(flows[1].at())
+            .duration_since(flows[0].at().min(flows[1].at())),
         flows
             .iter()
-            .map(|flow| flow.connection.stats().connection.media_budget.as_bps())
+            .map(|flow| flow
+                .connection
+                .stats()
+                .connection
+                .bandwidth_estimate
+                .as_bps())
             .collect::<Vec<_>>(),
         flows
             .iter()

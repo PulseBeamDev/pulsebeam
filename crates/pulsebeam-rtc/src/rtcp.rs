@@ -1,5 +1,7 @@
+use std::time::Instant;
+
 use crate::{
-    PacketFeedbackKind, TimePoint,
+    PacketFeedbackKind,
     packet::{PacketError, RtcpCompound, RtcpPacket},
     transport::PathEpoch,
 };
@@ -27,7 +29,7 @@ pub(crate) enum LifecycleFact {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct FeedbackBatch {
-    pub(crate) received_at: TimePoint,
+    pub(crate) received_at: Instant,
     pub(crate) path_epoch: PathEpoch,
     pub(crate) sender_ssrc: u32,
     pub(crate) report: FeedbackReport,
@@ -115,7 +117,7 @@ pub(crate) struct KeyframeRequest {
 
 pub(crate) fn parse(
     bytes: &[u8],
-    received_at: TimePoint,
+    received_at: Instant,
     path_epoch: PathEpoch,
     mode: impl Into<Option<PacketFeedbackKind>>,
 ) -> Result<ParsedRtcp, PacketError> {
@@ -1143,13 +1145,9 @@ mod tests {
     use std::time::Instant;
 
     use super::*;
-    use crate::GlobalMediaTime;
 
-    fn at() -> TimePoint {
-        TimePoint {
-            monotonic: Instant::now(),
-            global: GlobalMediaTime::from_micros(7),
-        }
+    fn at() -> Instant {
+        Instant::now()
     }
 
     fn rfc8888(blocks: &[(u32, u16, Vec<u16>)], timestamp: u32) -> Vec<u8> {

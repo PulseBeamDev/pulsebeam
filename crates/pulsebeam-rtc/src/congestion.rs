@@ -13,6 +13,14 @@ pub(crate) use screamv2::{EcnMark, FeedbackSample, LossOrigin};
 
 const TARGET_BITRATE_MAX: u64 = 100_000_000;
 
+fn application_max(desired: u64) -> u64 {
+    if desired == 0 {
+        TARGET_BITRATE_MAX
+    } else {
+        desired.min(TARGET_BITRATE_MAX)
+    }
+}
+
 #[cfg(test)]
 #[path = "congestion/scenario.rs"]
 mod scenario;
@@ -54,10 +62,6 @@ pub(crate) struct ControllerInput<'a> {
     pub(crate) bytes_in_flight: u64,
     pub(crate) paced_queue_bytes: u64,
     pub(crate) offered_media_rate: u64,
-    pub(crate) admitted_media_rate: u64,
-    pub(crate) selected_media_rate: u64,
-    /// Potential source service exceeds caller-selected service, including active-source upgrades.
-    pub(crate) has_unserved_source_interest: bool,
     pub(crate) desired_media_rate: u64,
     pub(crate) window_or_pacer_blocked: bool,
     pub(crate) ecn: EcnValidation,
@@ -133,10 +137,7 @@ pub(crate) struct ScreamController {
 impl ScreamController {
     pub(crate) fn new(desired_media_rate: u64, path_payload_max: Option<u32>) -> Self {
         Self {
-            core: screamv2::ScreamV2::new(
-                desired_media_rate.min(TARGET_BITRATE_MAX),
-                path_payload_max,
-            ),
+            core: screamv2::ScreamV2::new(application_max(desired_media_rate), path_payload_max),
             path_epoch: None,
             path_available: false,
             last_feedback: None,
@@ -168,7 +169,7 @@ impl ScreamController {
         self.update_path(
             input.path_epoch,
             input.path_available,
-            input.desired_media_rate.min(TARGET_BITRATE_MAX),
+            application_max(input.desired_media_rate),
         );
         self.feedback_hold = input.feedback_hold;
         self.update_application_limited(now, &input);
@@ -191,7 +192,7 @@ impl ScreamController {
                     && !self.feedback_stale
                     && !recovering,
                 bytes_in_flight: input.bytes_in_flight,
-                target_bitrate_max: input.desired_media_rate.min(TARGET_BITRATE_MAX),
+                target_bitrate_max: application_max(input.desired_media_rate),
                 ecn_mode: input.ecn.mode(),
             },
         );
@@ -211,7 +212,7 @@ impl ScreamController {
         bytes_in_flight: u64,
         paced_queue_bytes: u64,
     ) -> SafeRtpEnvelope {
-        let output = self.core.snapshot(desired.min(TARGET_BITRATE_MAX));
+        let output = self.core.snapshot(application_max(desired));
         let input = ControllerInput {
             path_epoch: self.path_epoch,
             path_available: self.path_available,
@@ -221,11 +222,8 @@ impl ScreamController {
             bytes_in_flight,
             paced_queue_bytes,
             offered_media_rate: 0,
-            admitted_media_rate: 0,
-            selected_media_rate: 0,
             desired_media_rate: desired,
             window_or_pacer_blocked: false,
-            has_unserved_source_interest: false,
             ecn: EcnValidation::default(),
         };
         self.envelope(output, &input, self.last_reason)
@@ -252,10 +250,9 @@ impl ScreamController {
     fn update_application_limited(&mut self, now: Duration, input: &ControllerInput<'_>) {
         let available = self
             .core
-            .snapshot(input.desired_media_rate.min(TARGET_BITRATE_MAX))
+            .snapshot(application_max(input.desired_media_rate))
             .target_bitrate;
-        let below = input.offered_media_rate.saturating_mul(100)
-            < input.selected_media_rate.min(available).saturating_mul(85)
+        let below = input.offered_media_rate.saturating_mul(100) < available.saturating_mul(85)
             && !input.window_or_pacer_blocked;
         if below {
             let since = *self.application_limited_since.get_or_insert(now);
@@ -317,16 +314,7 @@ impl ScreamController {
         input: &ControllerInput<'_>,
         reason: ControllerReason,
     ) -> SafeRtpEnvelope {
-        let unmet = input.desired_media_rate > output.target_bitrate.saturating_mul(6) / 5
-            && input
-                .desired_media_rate
-                .saturating_sub(output.target_bitrate)
-                >= 50_000;
-        // A lower selected layer or paused source cannot generate the feedback
-        // needed to cross a small upgrade shortfall on its own.
-        let source_interest = (input.has_unserved_source_interest
-            || input.selected_media_rate == 0)
-            && input.desired_media_rate > output.target_bitrate;
+        let unmet = input.desired_media_rate > output.target_bitrate;
         SafeRtpEnvelope {
             target_media_payload_rate: output.target_bitrate,
             max_rtp_bytes_in_flight: output.max_bytes_in_flight,
@@ -345,7 +333,7 @@ impl ScreamController {
             l4s_enabled: output.l4s_enabled,
             probe_permitted: self.path_available
                 && !self.feedback_stale
-                && (unmet || source_interest)
+                && unmet
                 && output.queue_delay <= output.queue_delay_target
                 && input
                     .bytes_in_flight
@@ -376,7 +364,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn paused_interest_can_probe_below_the_ordinary_growth_trigger() {
+    fn aggregate_demand_enables_probes_without_gating_primary_startup() {
         let mut cc = ScreamController::new(0, None);
         let mut input = ControllerInput {
             path_epoch: Some(1),
@@ -387,31 +375,25 @@ mod tests {
             bytes_in_flight: 0,
             paced_queue_bytes: 0,
             offered_media_rate: 0,
-            admitted_media_rate: 0,
-            selected_media_rate: 0,
             desired_media_rate: 0,
             window_or_pacer_blocked: false,
-            has_unserved_source_interest: false,
             ecn: EcnValidation::default(),
         };
         let idle = cc.update(Duration::ZERO, input);
+        assert!(idle.target_media_payload_rate > 0);
+        assert!(idle.pacing_transport_rate > 0);
+        assert!(idle.max_rtp_bytes_in_flight > 0);
         assert!(!idle.probe_permitted);
-        input.desired_media_rate = 166_667;
-        let paused = cc.update(Duration::from_millis(100), input);
-        assert!(paused.target_media_payload_rate < input.desired_media_rate);
-        assert!(input.desired_media_rate - paused.target_media_payload_rate < 50_000);
-        assert!(paused.probe_permitted);
-        assert_eq!(paused.reference_window, idle.reference_window);
-
-        let mut output = cc.core.snapshot(input.desired_media_rate);
-        output.queue_delay = output.queue_delay_target + Duration::from_micros(1);
-        assert!(
-            !cc.envelope(output, &input, ControllerReason::Delay)
-                .probe_permitted
-        );
-        output.queue_delay = Duration::ZERO;
+        input.desired_media_rate = idle.target_media_payload_rate.saturating_add(10_000);
+        let output = cc.core.snapshot(input.desired_media_rate);
         assert!(
             cc.envelope(output, &input, ControllerReason::Feedback)
+                .probe_permitted
+        );
+        let mut congested = output;
+        congested.queue_delay = output.queue_delay_target + Duration::from_micros(1);
+        assert!(
+            !cc.envelope(congested, &input, ControllerReason::Delay)
                 .probe_permitted
         );
         cc.feedback_stale = true;
@@ -426,23 +408,12 @@ mod tests {
                 .probe_permitted
         );
         input.bytes_in_flight = 0;
-
-        input.selected_media_rate = 150_000;
-        assert!(!cc.update(Duration::from_millis(200), input).probe_permitted);
-        input.has_unserved_source_interest = true;
-        assert!(cc.update(Duration::from_millis(200), input).probe_permitted);
-        let desired = input.desired_media_rate;
-        input.desired_media_rate = output.target_bitrate;
+        input.desired_media_rate = 0;
         assert!(
             !cc.envelope(output, &input, ControllerReason::Feedback)
                 .probe_permitted
         );
-        input.desired_media_rate = desired;
-        input.selected_media_rate = 0;
         input.path_available = false;
-        assert!(!cc.update(Duration::from_millis(300), input).probe_permitted);
-        input.path_available = true;
-        input.desired_media_rate = 0;
         assert!(!cc.update(Duration::from_millis(400), input).probe_permitted);
     }
 
@@ -458,11 +429,8 @@ mod tests {
             bytes_in_flight: 0,
             paced_queue_bytes: 0,
             offered_media_rate: 2_000_000,
-            admitted_media_rate: 2_000_000,
-            selected_media_rate: 2_000_000,
             desired_media_rate: 2_000_000,
             window_or_pacer_blocked: false,
-            has_unserved_source_interest: false,
             ecn: EcnValidation::default(),
         };
         cc.update(Duration::ZERO, base);
@@ -507,11 +475,8 @@ mod tests {
             bytes_in_flight: 20_000,
             paced_queue_bytes: 0,
             offered_media_rate: 4_000_000,
-            admitted_media_rate: 4_000_000,
-            selected_media_rate: 4_000_000,
             desired_media_rate: 4_000_000,
             window_or_pacer_blocked: false,
-            has_unserved_source_interest: false,
             ecn: EcnValidation::default(),
         };
         cc.update(Duration::ZERO, base);
@@ -541,11 +506,8 @@ mod tests {
             bytes_in_flight: 20_000,
             paced_queue_bytes: 0,
             offered_media_rate: 4_000_000,
-            admitted_media_rate: 4_000_000,
-            selected_media_rate: 4_000_000,
             desired_media_rate: 4_000_000,
             window_or_pacer_blocked: false,
-            has_unserved_source_interest: false,
             ecn: EcnValidation::default(),
         };
         cc.update(Duration::ZERO, base);
@@ -597,11 +559,8 @@ mod tests {
             bytes_in_flight: 1_000,
             paced_queue_bytes: 0,
             offered_media_rate: 64_000,
-            admitted_media_rate: 64_000,
-            selected_media_rate: 4_000_000,
             desired_media_rate: 4_000_000,
             window_or_pacer_blocked: false,
-            has_unserved_source_interest: false,
             ecn: EcnValidation::default(),
         };
         cc.update(Duration::ZERO, base);
@@ -645,11 +604,8 @@ mod tests {
             bytes_in_flight: 0,
             paced_queue_bytes: 0,
             offered_media_rate: 64_000,
-            admitted_media_rate: 64_000,
-            selected_media_rate: 2_000_000,
             desired_media_rate: 2_000_000,
             window_or_pacer_blocked: false,
-            has_unserved_source_interest: false,
             ecn: EcnValidation::default(),
         };
         cc.update(Duration::ZERO, input);
@@ -671,11 +627,8 @@ mod tests {
             bytes_in_flight: 0,
             paced_queue_bytes: 0,
             offered_media_rate: 0,
-            admitted_media_rate: 0,
-            selected_media_rate: 2_000_000,
             desired_media_rate: 2_000_000,
             window_or_pacer_blocked: false,
-            has_unserved_source_interest: false,
             ecn: EcnValidation::default(),
         };
         cc.update(Duration::ZERO, input);

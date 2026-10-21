@@ -12,8 +12,8 @@ mod support;
 use std::{hint::black_box, time::Duration};
 
 use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_main};
-use pulsebeam_rtc::{Command, CommandError, MediaPacket, SenderId};
-use support::{PeerFixture, forwarded};
+use pulsebeam_rtc::{RtpPacket, WriteError};
+use support::{PeerFixture, rtp_write};
 
 const FRAMES: usize = 64;
 const CAPTURE_INTERVAL: Duration = Duration::from_millis(20);
@@ -59,9 +59,9 @@ fn report(
 
 struct ScalingCell {
     fixture: PeerFixture,
-    senders: Vec<SenderId>,
+    senders: Vec<String>,
     burst: usize,
-    pending: Vec<(MediaPacket, u64)>,
+    pending: Vec<(RtpPacket, u64)>,
     payload: Vec<u8>,
 }
 
@@ -70,15 +70,6 @@ impl ScalingCell {
         let mut fixture = PeerFixture::connected_with_senders(senders).without_egress_observation();
         fixture.configure_bottleneck(500_000);
         let senders = fixture.senders.clone();
-        for sender in &senders {
-            let mut assignment = fixture.assignment(*sender);
-            assignment.delivery.max_media_age = Duration::from_secs(2);
-            assignment.delivery.max_queue_residence = Duration::from_secs(2);
-            fixture.command(Command::SetSenderAssignment {
-                sender: *sender,
-                assignment: Some(assignment),
-            });
-        }
         Self {
             fixture,
             senders,
@@ -105,13 +96,14 @@ impl ScalingCell {
             }
             for (packet, id) in self.pending.drain(..) {
                 for sender in &self.senders {
-                    match self.fixture.try_command(Command::SendMedia {
-                        sender: *sender,
-                        media: forwarded(packet.clone(), id),
-                    }) {
+                    match self.fixture.connection.write_rtp(
+                        self.fixture.at(),
+                        sender,
+                        rtp_write(packet.clone(), id),
+                    ) {
                         Ok(()) => admitted += 1,
-                        Err(pulsebeam_rtc::RejectedCommand {
-                            reason: CommandError::WouldBlock,
+                        Err(pulsebeam_rtc::RejectedRtp {
+                            reason: WriteError::WouldBlock,
                             ..
                         }) => blocked += 1,
                         Err(error) => panic!("unexpected admission error: {error:?}"),

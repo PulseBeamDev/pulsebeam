@@ -3,16 +3,20 @@
     reason = "the public transmit contract requires immutable Bytes payloads"
 )]
 
-use std::{cell::Cell, marker::PhantomData, time::Instant};
+use std::{
+    cell::Cell,
+    marker::PhantomData,
+    time::{Instant, SystemTime},
+};
 
 use bytes::Bytes;
 use sha2::{Digest, Sha256};
 
 use crate::{
-    AcceptError, CloseReason, Command, CommandError, ConnectionConfig, ConnectionEntropy,
-    ConnectionState, ConnectionStats, ConnectionWarning, Event, MediaPayloadBitrate, NetworkInput,
-    Output, PacketFeedbackKind, ReceiveError, RejectedCommand, SdpAnswer, SdpOffer, SessionInfo,
-    StatsSnapshot, TimePoint, Transmit,
+    AcceptError, CloseReason, ConnectionConfig, ConnectionEntropy, ConnectionState,
+    ConnectionStats, ConnectionWarning, DataChannelConfig, DataChannelId, DataMessage, Event,
+    MediaPayloadBitrate, NetworkInput, Output, PacketFeedbackKind, ReceiveError, RejectedData,
+    RejectedRtp, RtpWrite, SdpAnswer, SdpOffer, SessionInfo, StatsSnapshot, Transmit, WriteError,
     egress::{MediaEgress, PrepareResult},
     ingress::IngressOwner,
     negotiation::{self, NegotiatedSessionFacts},
@@ -80,12 +84,12 @@ impl CommitCoordinator {
 
     fn commit_transport(
         &mut self,
-        at: TimePoint,
+        at: Instant,
         prepared: PreparedTransmit,
         egress: Option<&mut MediaEgress>,
     ) -> Result<Transmit, HistoryError> {
         let context = TransmitCommitContext {
-            at: at.monotonic,
+            at,
             kind: prepared.kind,
             wire_len: prepared.wire_len,
             path_epoch: prepared.path_epoch,
@@ -149,147 +153,126 @@ impl Connection {
         clippy::result_large_err,
         reason = "keep caller-owned input inline instead of allocating an error wrapper"
     )]
-    pub fn command(&mut self, at: TimePoint, command: Command) -> Result<(), RejectedCommand> {
+    pub fn write_rtp(
+        &mut self,
+        at: Instant,
+        mid: &str,
+        packet: RtpWrite,
+    ) -> Result<(), RejectedRtp> {
         let at = self.time.observe(at);
-        if matches!(
-            self.lifecycle,
-            Lifecycle::ClosedPending(_) | Lifecycle::Closed(_)
-        ) {
-            return Err(RejectedCommand {
-                reason: CommandError::Closed,
-                command,
+        if let Err(reason) = self.check_writable() {
+            return Err(RejectedRtp { reason, packet });
+        }
+        if self.transport.state() != TransportState::Connected {
+            return Err(RejectedRtp {
+                reason: WriteError::InvalidState,
+                packet,
             });
         }
-        if matches!(self.lifecycle, Lifecycle::Closing { .. }) {
-            if matches!(&command, Command::CloseGracefully { .. }) {
-                return Ok(());
-            }
-            if !matches!(&command, Command::RetireIceTcpFlow { .. } | Command::Abort) {
-                return Err(RejectedCommand {
-                    reason: CommandError::InvalidState,
-                    command,
-                });
-            }
-        }
-        match command {
-            Command::SendMedia { sender, media } => {
-                let reason = match self.transport.state() {
-                    TransportState::Connected => None,
-                    TransportState::Closed | TransportState::Failed => Some(CommandError::Closed),
-                    TransportState::Checking
-                    | TransportState::Connecting
-                    | TransportState::Draining => Some(CommandError::InvalidState),
-                };
-                if let Some(reason) = reason {
-                    return Err(RejectedCommand {
-                        reason,
-                        command: Command::SendMedia { sender, media },
-                    });
-                }
-                self.egress
-                    .admit(at, sender, media)
-                    .map_err(|(reason, media)| RejectedCommand {
-                        reason,
-                        command: Command::SendMedia { sender, media },
-                    })
-            }
-            Command::OpenDataChannel(config) => {
-                let Some(sctp) = self.sctp.as_mut() else {
-                    return Err(RejectedCommand {
-                        reason: CommandError::InvalidState,
-                        command: Command::OpenDataChannel(config),
-                    });
-                };
-                sctp.open(at, config)
-                    .map_err(|(reason, config)| RejectedCommand {
-                        reason,
-                        command: Command::OpenDataChannel(config),
-                    })
-            }
-            Command::SendData { channel, message } => {
-                let Some(sctp) = self.sctp.as_mut() else {
-                    return Err(RejectedCommand {
-                        reason: CommandError::UnknownDataChannel(channel),
-                        command: Command::SendData { channel, message },
-                    });
-                };
-                sctp.send(at, channel, message)
-                    .map_err(|(reason, message)| RejectedCommand {
-                        reason,
-                        command: Command::SendData { channel, message },
-                    })
-            }
-            command => self
-                .command_control(at, &command)
-                .map_err(|reason| RejectedCommand { reason, command }),
+        self.egress
+            .admit(at, mid, packet)
+            .map_err(|(reason, packet)| RejectedRtp { reason, packet })
+    }
+
+    fn check_writable(&self) -> Result<(), WriteError> {
+        match self.lifecycle {
+            Lifecycle::Open => Ok(()),
+            Lifecycle::Closing { .. } => Err(WriteError::InvalidState),
+            Lifecycle::ClosedPending(_) | Lifecycle::Closed(_) => Err(WriteError::Closed),
         }
     }
 
-    fn command_control(&mut self, at: TimePoint, command: &Command) -> Result<(), CommandError> {
-        match command {
-            Command::AdmitIceTcpFlow {
-                flow,
-                local,
-                remote,
-            } => self
-                .transport
-                .admit_tcp_flow(*flow, *local, *remote)
-                .map_err(|error| match error {
-                    TransportError::QueueFull => CommandError::WouldBlock,
-                    TransportError::Closed => CommandError::Closed,
-                    _ => CommandError::InvalidIceTcpFlow,
-                }),
-            Command::RetireIceTcpFlow { flow } => self.retire_ice_tcp_flow(*flow),
-            Command::RecoverSenderMedia { sender, assignment } => {
-                self.egress
-                    .set_assignment(*sender, Some(*assignment), at, true)
-            }
-            Command::SetSenderAssignment { sender, assignment } => {
-                self.egress.set_assignment(*sender, *assignment, at, false)
-            }
-            Command::CloseDataChannel { channel } => self
-                .sctp
-                .as_mut()
-                .ok_or(CommandError::UnknownDataChannel(*channel))?
-                .close_channel(at, *channel),
-            Command::RequestKeyframe { encoding } => {
-                let packet = self.ingress.keyframe_request(*encoding)?;
-                self.transport
-                    .send_rtcp(&packet)
-                    .map_err(|_| CommandError::InvalidState)
-            }
-            Command::RetireEncoding { encoding } => self.ingress.retire(*encoding),
-            Command::CloseGracefully { deadline } => {
-                self.lifecycle = Lifecycle::Closing {
-                    deadline: *deadline,
-                };
-                self.egress.begin_shutdown();
-                if let Some(sctp) = self.sctp.as_mut() {
-                    sctp.begin_shutdown(at, *deadline);
-                }
-                Ok(())
-            }
-            Command::Abort => {
-                self.abort();
-                Ok(())
-            }
-            Command::SendMedia { .. } | Command::OpenDataChannel(_) | Command::SendData { .. } => {
-                Err(CommandError::InvalidState)
-            }
-        }
+    /// Aggregate application demand in media-payload bits/s, not capacity or a reservation.
+    /// None and zero clear speculative padding demand without preventing primary RTP.
+    pub fn set_desired_bitrate(&mut self, bitrate: Option<MediaPayloadBitrate>) {
+        self.egress.set_desired_bitrate(bitrate);
     }
 
-    fn retire_ice_tcp_flow(&mut self, flow: crate::IceTcpFlowId) -> Result<(), CommandError> {
-        // poll prepares and commits egress synchronously; commands cannot interrupt that pair.
+    /// Discard uncommitted writes without resetting primary numbering, repairs or congestion history.
+    pub fn discard_pending_rtp(&mut self, mid: &str) -> Result<(), WriteError> {
+        self.check_writable()?;
+        self.egress.discard_pending(mid)
+    }
+
+    pub fn request_keyframe(&mut self, ssrc: u32) -> Result<(), WriteError> {
+        self.check_writable()?;
+        let packet = self.ingress.keyframe_request(ssrc)?;
         self.transport
-            .retire_tcp_flow(flow)
-            .map_err(|_| CommandError::InvalidState)
+            .send_rtcp(&packet)
+            .map_err(|_| WriteError::InvalidState)
+    }
+
+    pub fn retire_encoding(&mut self, ssrc: u32) -> Result<(), WriteError> {
+        self.check_writable()?;
+        self.ingress.retire(ssrc)
+    }
+
+    pub fn open_data_channel(
+        &mut self,
+        at: Instant,
+        config: DataChannelConfig,
+    ) -> Result<(), (WriteError, DataChannelConfig)> {
+        let at = self.time.observe(at);
+        if let Err(reason) = self.check_writable() {
+            return Err((reason, config));
+        }
+        let Some(sctp) = self.sctp.as_mut() else {
+            return Err((WriteError::InvalidState, config));
+        };
+        sctp.open(at, config)
+    }
+
+    pub fn send_data(
+        &mut self,
+        at: Instant,
+        channel: DataChannelId,
+        message: DataMessage,
+    ) -> Result<(), RejectedData> {
+        let at = self.time.observe(at);
+        if let Err(reason) = self.check_writable() {
+            return Err(RejectedData { reason, message });
+        }
+        let Some(sctp) = self.sctp.as_mut() else {
+            return Err(RejectedData {
+                reason: WriteError::UnknownDataChannel(channel),
+                message,
+            });
+        };
+        sctp.send(at, channel, message)
+            .map_err(|(reason, message)| RejectedData { reason, message })
+    }
+
+    pub fn close_data_channel(
+        &mut self,
+        at: Instant,
+        channel: DataChannelId,
+    ) -> Result<(), WriteError> {
+        let at = self.time.observe(at);
+        self.check_writable()?;
+        self.sctp
+            .as_mut()
+            .ok_or(WriteError::UnknownDataChannel(channel))?
+            .close_channel(at, channel)
+    }
+
+    pub fn close(&mut self, at: Instant, deadline: Instant) -> Result<(), WriteError> {
+        let at = self.time.observe(at);
+        if matches!(self.lifecycle, Lifecycle::Closing { .. }) {
+            return Ok(());
+        }
+        self.check_writable()?;
+        self.lifecycle = Lifecycle::Closing { deadline };
+        self.egress.begin_shutdown();
+        if let Some(sctp) = self.sctp.as_mut() {
+            sctp.begin_shutdown(at, deadline);
+        }
+        Ok(())
     }
 
     pub fn receive(
         &mut self,
-        at: TimePoint,
-        observation: crate::PacketObservation,
+        at: Instant,
+        arrival: Instant,
         input: NetworkInput,
     ) -> Result<(), ReceiveError> {
         let at = self.time.observe(at);
@@ -299,15 +282,14 @@ impl Connection {
         ) {
             return Err(ReceiveError::Closed);
         }
-        if observation.at.monotonic > at.monotonic {
+        if arrival > at {
             return Err(ReceiveError::InvalidObservation);
         }
         self.transport
-            .receive(at.monotonic, observation, input)
+            .receive(at, arrival, input)
             .map_err(|error| match error {
                 crate::transport::TransportError::Closed => ReceiveError::Closed,
                 crate::transport::TransportError::QueueFull => ReceiveError::InputLimitExceeded,
-                crate::transport::TransportError::UnknownTcpFlow => ReceiveError::UnknownIceTcpFlow,
                 _ => ReceiveError::InvalidNetworkEnvelope,
             })
     }
@@ -316,7 +298,7 @@ impl Connection {
     /// Callers may collect a bounded batch, then must service it promptly before
     /// requesting more finalized work. Budget exhaustion needs an immediate
     /// continuation; an `Idle` wakeup due now also denotes runnable work.
-    pub fn poll(&mut self, at: TimePoint) -> Output {
+    pub fn poll(&mut self, at: Instant) -> Output {
         let at = self.time.observe(at);
 
         match self.lifecycle {
@@ -338,8 +320,8 @@ impl Connection {
         ) && self
             .transport
             .next_deadline()
-            .is_some_and(|deadline| at.monotonic >= deadline)
-            && let Err(error) = self.transport.handle_timeout(at.monotonic)
+            .is_some_and(|deadline| at >= deadline)
+            && let Err(error) = self.transport.handle_timeout(at)
             && !matches!(error, TransportError::NotDue)
         {
             let reason = close_reason(error);
@@ -364,9 +346,7 @@ impl Connection {
         // Preserve committed flight before expiration or batched ACKs retire it.
         self.egress
             .observe_bytes_in_flight(self.commit.history.controller_inputs().bytes_in_flight);
-        self.commit
-            .history
-            .expire(at.monotonic, MAX_EXPIRATIONS_PER_POLL);
+        self.commit.history.expire(at, MAX_EXPIRATIONS_PER_POLL);
 
         if let Some(feedback) = self.ingress.poll_feedback() {
             self.commit.history.process_feedback(feedback);
@@ -392,9 +372,7 @@ impl Connection {
             bytes_in_flight,
         ) = {
             let inputs = self.commit.history.controller_inputs();
-            let received_at = inputs
-                .timing
-                .map_or(at.monotonic, |timing| timing.received_at);
+            let received_at = inputs.timing.map_or(at, |timing| timing.received_at);
             let origin = self.egress.controller_origin();
             (
                 inputs
@@ -440,11 +418,11 @@ impl Connection {
 
         if let Lifecycle::Closing { deadline } = self.lifecycle {
             let sctp_stopped = self.sctp.as_ref().is_none_or(Association::is_stopped);
-            if sctp_stopped || at.monotonic >= deadline {
+            if sctp_stopped || at >= deadline {
                 if let Some(sctp) = self.sctp.as_mut() {
                     sctp.abort();
                 }
-                let _ = self.transport.close(at.monotonic);
+                let _ = self.transport.close(at);
                 if let Some(prepared) = self.transport.poll_prepared() {
                     return match self.commit.commit_transport(at, prepared, None) {
                         Ok(transmit) => {
@@ -464,15 +442,13 @@ impl Connection {
 
         if matches!(self.lifecycle, Lifecycle::Open)
             && self.transport.can_send_user_data()
-            && let Some(packet) = self.ingress.poll_control(at.monotonic)
+            && let Some(packet) = self.ingress.poll_control(at)
+            && let Err(error) = self.transport.send_rtcp(&packet)
+            && error != TransportError::QueueFull
         {
-            if let Err(error) = self.transport.send_rtcp(&packet)
-                && error != TransportError::QueueFull
-            {
-                let reason = close_reason(error);
-                self.lifecycle = Lifecycle::Closed(reason);
-                return Output::Closed(reason);
-            }
+            let reason = close_reason(error);
+            self.lifecycle = Lifecycle::Closed(reason);
+            return Output::Closed(reason);
         }
 
         if !matches!(
@@ -560,8 +536,7 @@ impl Connection {
                                 sctp.has_pending_events()
                                     || (self.transport.can_send_user_data() && sctp.has_packet())
                             }))
-                        .then_some(at.monotonic),
-                        self.egress.next_expiry(at),
+                        .then_some(at),
                         self.transport.next_deadline(),
                         self.commit.history.next_deadline(),
                         (matches!(self.lifecycle, Lifecycle::Open)
@@ -586,7 +561,7 @@ impl Connection {
         }
     }
 
-    fn handle_transport_event(&mut self, at: TimePoint, event: TransportEvent) -> Option<Output> {
+    fn handle_transport_event(&mut self, at: Instant, event: TransportEvent) -> Option<Output> {
         match event {
             TransportEvent::StateChanged(TransportState::Connected) => {
                 if let Some(sctp) = self.sctp.as_mut() {
@@ -599,9 +574,6 @@ impl Connection {
                 Some(Output::Closed(CloseReason::TransportFailure))
             }
             TransportEvent::StateChanged(_) | TransportEvent::IceStateChanged(_) => None,
-            TransportEvent::IceAuthenticated(flow) => {
-                Some(Output::Event(Event::IceAuthenticated(flow)))
-            }
             TransportEvent::SelectedPathChanged { current, epoch, .. } => {
                 self.commit.history.path_changed(epoch, current.is_some());
                 None
@@ -621,17 +593,14 @@ impl Connection {
                 path_epoch,
                 bytes,
             } => {
-                let receipts = self.ingress.accept_rtcp(
+                let _ = self.ingress.accept_rtcp(
                     arrival,
                     bytes,
                     path_epoch,
                     self.session.feedback(),
                     self.transport.smoothed_rtt(),
                 );
-                for receipt in receipts {
-                    self.egress
-                        .confirm_playout(receipt.ssrc, receipt.highest_sequence);
-                }
+
                 None
             }
             TransportEvent::Data(bytes) => {
@@ -647,12 +616,12 @@ impl Connection {
         }
     }
 
-    fn prepare_sctp(&mut self, at: TimePoint) -> Option<Output> {
+    fn prepare_sctp(&mut self, at: Instant) -> Option<Output> {
         if !self.transport.can_send_user_data() {
             return None;
         }
         let packet = self.sctp.as_mut()?.poll_packet()?;
-        if self.transport.send_sctp(&packet, at.monotonic).is_err() {
+        if self.transport.send_sctp(&packet, at).is_err() {
             self.lifecycle = Lifecycle::Closed(CloseReason::TransportFailure);
             return Some(Output::Closed(CloseReason::TransportFailure));
         }
@@ -694,7 +663,7 @@ impl Connection {
                 close_reason,
                 clock_regressions: self.time.regressions(),
                 rtp_bytes_in_flight: self.commit.history.controller_inputs().bytes_in_flight,
-                media_budget: MediaPayloadBitrate::from_bps(egress.media_budget),
+                bandwidth_estimate: MediaPayloadBitrate::from_bps(egress.bandwidth_estimate),
                 pacing_bitrate: egress.pacing_bitrate,
                 queued_media_bytes: egress.queued_transport_bytes,
                 buffered_data_bytes: sctp.map_or(0, |stats| stats.buffered_payload_bytes),
@@ -721,7 +690,13 @@ impl Connection {
         }
     }
 
-    fn abort(&mut self) {
+    pub fn abort(&mut self) {
+        if matches!(
+            self.lifecycle,
+            Lifecycle::ClosedPending(_) | Lifecycle::Closed(_)
+        ) {
+            return;
+        }
         self.transport.abort();
         self.ingress.abort();
         self.egress.abort();
@@ -734,7 +709,8 @@ impl Connection {
     pub fn accept(
         config: ConnectionConfig,
         offer: SdpOffer,
-        at: TimePoint,
+        at: Instant,
+        wallclock: SystemTime,
         entropy: ConnectionEntropy,
     ) -> Result<AcceptedConnection, AcceptError> {
         let config = config.validate()?;
@@ -747,30 +723,28 @@ impl Connection {
             return Err(AcceptError::InvalidOffer);
         }
         let session = negotiated.session.clone();
-        let transport = Transport::from_session(&negotiated.facts, at.monotonic)
+        let transport = Transport::from_session(&negotiated.facts, at)
             .map_err(|_| AcceptError::CryptographicFailure)?;
         let ingress = IngressOwner::new(
             negotiated.facts.ingress_media(),
             config.limits.max_unsignaled_encodings,
             config.limits.max_queued_media_bytes,
             u32::from_be_bytes(entropy.take(b"receive-rtcp-ssrc")).max(1),
-            crate::receive_feedback::ReceiveFeedback::new(
-                negotiated.facts.inbound_feedback(),
-                at.monotonic,
-            ),
+            crate::receive_feedback::ReceiveFeedback::new(negotiated.facts.inbound_feedback(), at),
         );
         let egress = MediaEgress::new(
             negotiated.facts.egress_senders(),
             negotiated.facts.protocol_randomness(),
             config.limits.max_queued_media_bytes,
             config.limits.max_retransmission_bytes,
-            at.monotonic,
+            at,
+            crate::time::ProtocolClock::new(at, wallclock),
         );
         let feedback = negotiated.facts.feedback();
         let sctp = negotiated
             .facts
             .sctp()
-            .map(|facts| Association::new(facts, config.limits, at.monotonic));
+            .map(|facts| Association::new(facts, config.limits, at));
         let connection = Self {
             session: negotiated.facts,
             time: MonotonicObserver::starting_at(at),
@@ -839,15 +813,12 @@ impl Drop for EntropyConsumer {
 mod tests {
     use super::*;
     use crate::test_support::{
-        NetworkPolicy, PeerFixture, RtpImpairment, assert_initial_probe_windows,
-        assert_probe_windows, forwarded,
+        NetworkPolicy, PeerFixture, assert_initial_probe_windows, assert_probe_windows, sample,
     };
-    use crate::{ForwardedMedia, FrameBoundary, FrameDependencies, FrameId, FrameMetadata};
-    use std::{sync::Arc, time::Duration};
-
+    use std::time::Duration;
     #[test]
-    fn potential_only_sender_obtains_padding_feedback_without_media() {
-        let mut fixture = PeerFixture::connected().without_egress_observation();
+    fn aggregate_demand_obtains_native_rtx_feedback_without_primary_media() {
+        let mut fixture = PeerFixture::connected_video().without_egress_observation();
         fixture.configure_rtc_wakeup_quantum(Duration::from_millis(1));
         fixture.configure_network(
             0x6602,
@@ -857,20 +828,26 @@ mod tests {
             },
         );
         fixture.configure_time_quantum(Duration::from_millis(5));
-        fixture.command(Command::SetSenderAssignment {
-            sender: fixture.sender,
-            assignment: Some({
-                let (selected_bitrate, potential_bitrate) = (
-                    MediaPayloadBitrate::from_bps(0),
-                    MediaPayloadBitrate::from_bps(2_000_000),
-                );
-                pulsebeam_rtc::SenderAssignment {
-                    selected_bitrate,
-                    potential_bitrate,
-                    ..fixture.assignment(fixture.sender)
-                }
-            }),
-        });
+        fixture.drive_for(Duration::from_millis(200));
+        assert_eq!(
+            fixture
+                .connection
+                .stats()
+                .connection
+                .transmitted_padding_bytes,
+            0
+        );
+        fixture.set_desired_bitrate(Some(MediaPayloadBitrate::from_bps(0)));
+        fixture.drive_for(Duration::from_millis(200));
+        assert_eq!(
+            fixture
+                .connection
+                .stats()
+                .connection
+                .transmitted_padding_bytes,
+            0
+        );
+        fixture.set_desired_bitrate(Some(MediaPayloadBitrate::from_bps(2_000_000)));
         let received_before = fixture.connection.commit.history.counters().received;
         let mut saw_fresh_delivery = false;
         let mut trace = Vec::new();
@@ -903,206 +880,151 @@ mod tests {
         assert!(
             saw_fresh_delivery
                 && fixture.connection.commit.history.counters().received > received_before,
-            "potential-only feedback: stats={stats:?} trace={trace:?}",
+            "aggregate-demand feedback: stats={stats:?} trace={trace:?}",
         );
         fixture.drive_for(Duration::from_secs(22));
         let bootstrap = fixture.connection.stats().connection;
         assert_eq!(bootstrap.transmitted_rtp_bytes, 0);
         assert!(
-            bootstrap.media_budget.as_bps() >= 1_100_000,
-            "potential-only demand must bootstrap native capacity within 30s: stats={bootstrap:?}",
+            bootstrap.bandwidth_estimate.as_bps() >= 1_100_000,
+            "aggregate-demand demand must bootstrap native capacity within 30s: stats={bootstrap:?}",
         );
         assert_initial_probe_windows(fixture.emitted_rtp(), initial_started, 2_000_000);
+        fixture.set_desired_bitrate(None);
+        let padding = fixture
+            .connection
+            .stats()
+            .connection
+            .transmitted_padding_bytes;
+        fixture.drive_for(Duration::from_secs(1));
+        assert_eq!(
+            fixture
+                .connection
+                .stats()
+                .connection
+                .transmitted_padding_bytes,
+            padding
+        );
     }
 
     #[test]
-    fn queued_sctp_output_precedes_potential_only_padding() {
-        let mut fixture = PeerFixture::connected_datachannels();
-        let mut channel = None;
-        let mut peer_opened = false;
-        while channel.is_none() || !peer_opened {
-            match fixture.next_data_event() {
-                crate::test_support::FixtureDataEvent::ConnectionOpened(id) => channel = Some(id),
-                crate::test_support::FixtureDataEvent::PeerOpened => peer_opened = true,
-                _ => {}
-            }
-        }
-        fixture.command(Command::SetSenderAssignment {
-            sender: fixture.sender,
-            assignment: Some({
-                let (selected_bitrate, potential_bitrate) = (
-                    MediaPayloadBitrate::from_bps(0),
-                    MediaPayloadBitrate::from_bps(2_000_000),
-                );
-                pulsebeam_rtc::SenderAssignment {
-                    selected_bitrate,
-                    potential_bitrate,
-                    ..fixture.assignment(fixture.sender)
-                }
-            }),
-        });
-        fixture.command(Command::SendData {
-            channel: channel.expect("opened channel"),
-            message: crate::DataMessage::Binary(bytes::Bytes::from(vec![7; 20_000])),
-        });
-        let before = fixture.connection.stats().connection;
-        let at = fixture.at();
-        let mut polls = 0;
-        while fixture
-            .connection
-            .sctp
-            .as_ref()
-            .is_some_and(Association::has_packet)
-        {
-            assert!(polls < 128, "queued native output drains with bounded work");
-            polls += 1;
-            let _ = fixture.connection.poll(at);
-            assert_eq!(
-                fixture
-                    .connection
-                    .stats()
-                    .connection
-                    .transmitted_padding_bytes,
-                before.transmitted_padding_bytes,
-            );
-        }
-        assert!(polls > 0);
+    fn production_no_rtx_feedback_outage_path_replacement_and_pause_recover() {
+        let mut fixture = PeerFixture::connected().without_egress_observation();
+        fixture.configure_network(
+            0x6601,
+            NetworkPolicy {
+                delay: Duration::from_millis(25),
+                ..NetworkPolicy::default()
+            },
+        );
+        fixture.configure_bottleneck(2_000_000);
+        fixture.configure_time_quantum(Duration::from_millis(5));
         assert!(
-            fixture.connection.stats().connection.transmitted_sctp_bytes
-                > before.transmitted_sctp_bytes
+            fixture
+                .connection
+                .session
+                .egress_senders()
+                .iter()
+                .all(|sender| sender.retransmission_payload_type.is_none())
+        );
+        fixture.set_desired_bitrate(Some(MediaPayloadBitrate::from_bps(2_000_000)));
+        let mid = fixture.sender_mid.clone();
+        let mut frame = 0;
+        for (feedback_enabled, replace_path) in
+            [(true, false), (false, false), (true, false), (true, true)]
+        {
+            fixture.set_feedback_enabled(feedback_enabled);
+            if replace_path {
+                assert_probe_windows(fixture.emitted_rtp());
+                for _ in 0..2 {
+                    fixture
+                        .connection
+                        .transport
+                        .reselect_path_for_test()
+                        .expect("replace selected path");
+                }
+            }
+            let start = fixture.at();
+            let before = fixture.connection.stats().connection.transmitted_rtp_bytes;
+            for tick in 1..=600 {
+                let at = start + Duration::from_millis(tick * 5);
+                fixture.drive_for(at.saturating_duration_since(fixture.at()));
+                frame += 1;
+                let media = sample(fixture.at(), frame, 1_000, 48_000);
+                match fixture.connection.write_rtp(fixture.at(), &mid, media) {
+                    Ok(())
+                    | Err(crate::RejectedRtp {
+                        reason: WriteError::WouldBlock,
+                        ..
+                    }) => {}
+                    Err(error) => panic!("unexpected media error: {error:?}"),
+                }
+            }
+            let envelope = fixture
+                .connection
+                .egress
+                .test_envelope()
+                .expect("controller output");
+            assert_eq!(envelope.feedback_stale, !feedback_enabled);
+            assert!(fixture.connection.stats().connection.transmitted_rtp_bytes > before);
+        }
+        fixture
+            .connection
+            .discard_pending_rtp(&mid)
+            .expect("caller pauses production");
+        fixture.drive_for(Duration::from_secs(1));
+        let paused = fixture.connection.stats().connection.transmitted_rtp_bytes;
+        fixture.drive_for(Duration::from_secs(2));
+        assert_eq!(
+            fixture.connection.stats().connection.transmitted_rtp_bytes,
+            paused
         );
         assert!(
             fixture
                 .connection
                 .egress
                 .test_envelope()
-                .expect("controller envelope")
-                .probe_permitted
+                .expect("controller output")
+                .application_limited
         );
-    }
-
-    #[test]
-    fn queued_media_and_repair_prevent_padding_without_blocking_real_rtp() {
-        for repair in [false, true] {
-            let mut fixture = if repair {
-                PeerFixture::connected_video()
-            } else {
-                PeerFixture::connected()
-            };
-            if repair {
-                fixture.command(Command::SetSenderAssignment {
-                    sender: fixture.sender,
-                    assignment: Some(pulsebeam_rtc::SenderAssignment {
-                        playout_delay: None,
-                        ..crate::test_support::sender_assignment(MediaPayloadBitrate::from_bps(
-                            1_000_000,
-                        ))
-                    }),
-                });
+        let start = fixture.at();
+        for tick in 1..=600 {
+            let at = start + Duration::from_millis(tick * 5);
+            fixture.drive_for(at.saturating_duration_since(fixture.at()));
+            frame += 1;
+            let media = sample(fixture.at(), frame, 1_000, 48_000);
+            match fixture.connection.write_rtp(fixture.at(), &mid, media) {
+                Ok(())
+                | Err(crate::RejectedRtp {
+                    reason: WriteError::WouldBlock,
+                    ..
+                }) => {}
+                Err(error) => panic!("unexpected media error: {error:?}"),
             }
-            let packet = fixture.send_source(if repair { &[0x65; 32] } else { &[7; 32] });
-            let at = fixture.at();
-            fixture.connection.egress.update_controller(
-                at,
-                Some((1, true)),
-                &[],
-                &[],
-                Duration::ZERO,
-                false,
-                0,
-            );
-            fixture
-                .try_command(Command::SendMedia {
-                    sender: fixture.sender,
-                    media: forwarded(packet, 0),
-                })
-                .expect("admit queued priority fixture");
-            if repair {
-                let header = fixture.receive_video_wire_header();
-                fixture
-                    .connection
-                    .egress
-                    .request_repair(header.ssrc, header.sequence_number);
-            }
-            fixture.command(Command::SetSenderAssignment {
-                sender: fixture.sender,
-                assignment: Some({
-                    let (selected_bitrate, potential_bitrate) = (
-                        MediaPayloadBitrate::from_bps(100_000),
-                        MediaPayloadBitrate::from_bps(2_000_000),
-                    );
-                    pulsebeam_rtc::SenderAssignment {
-                        selected_bitrate,
-                        potential_bitrate,
-                        ..fixture.assignment(fixture.sender)
-                    }
-                }),
-            });
-            let at = fixture.at();
-            let connection = &mut fixture.connection;
-            connection.egress.update_controller(
-                at,
-                Some((1, true)),
-                &[],
-                &[],
-                Duration::ZERO,
-                false,
-                0,
-            );
-            assert!(connection.egress.test_envelope().unwrap().probe_permitted);
-            let (_, senders) = connection.egress.stats();
-            assert_eq!(
-                senders[0]
-                    .assignment
-                    .expect("bound sender")
-                    .selected_bitrate
-                    .as_bps(),
-                100_000
-            );
-            assert_eq!(senders[0].queued_packets, usize::from(!repair));
-            assert!(matches!(
-                connection
-                    .egress
-                    .test_prepare_padding(at, 0, &mut connection.transport),
-                PrepareResult::Blocked
-            ));
-            let mut service = None;
-            for _ in 0..4 {
-                assert!(matches!(
-                    connection
-                        .egress
-                        .prepare_one(at, 0, &mut connection.transport, true),
-                    PrepareResult::Prepared
-                ));
-                while let Some(transmit) = connection.transport.poll_prepared() {
-                    if let Some(rtp) = transmit.rtp {
-                        service = Some(rtp.service);
-                    } else {
-                        assert!(matches!(
-                            transmit.kind,
-                            DatagramKind::Rtcp | DatagramKind::Dtls
-                        ));
-                    }
-                    if transmit.rtp.is_some() || transmit.kind == DatagramKind::Rtcp {
-                        assert!(connection.egress.preflight_commit(&transmit));
-                        connection.egress.commit(at, &transmit);
-                    }
-                }
-                if service.is_some() {
-                    break;
-                }
-            }
-            assert_eq!(
-                service,
-                Some(if repair {
-                    crate::transport::RtpService::Repair
-                } else {
-                    crate::transport::RtpService::Original
-                })
-            );
         }
+        assert!(fixture.connection.stats().connection.transmitted_rtp_bytes > paused);
+        assert!(
+            !fixture
+                .connection
+                .egress
+                .test_envelope()
+                .expect("controller output")
+                .feedback_stale
+        );
+        assert_probe_windows(fixture.emitted_rtp());
+        fixture
+            .connection
+            .discard_pending_rtp(&mid)
+            .expect("caller stops production");
+        fixture.drive_for(Duration::from_secs(1));
+        let stopped = fixture.connection.stats().connection.transmitted_rtp_bytes;
+        fixture.drive_for(Duration::from_secs(6));
+        assert_eq!(
+            fixture.connection.stats().connection.transmitted_rtp_bytes,
+            stopped
+        );
+        assert_probe_windows(fixture.emitted_rtp());
     }
-
     #[test]
     #[should_panic(expected = "emitted probe budget")]
     fn probe_oracle_rejects_credit_from_later_emission_at_same_instant() {
@@ -1147,373 +1069,29 @@ mod tests {
             2_000_000,
         );
     }
-
     #[test]
-    fn production_feedback_outage_path_replacement_and_media_pause_recover() {
+    fn native_authenticated_feedback_receipts_include_primary_wrap_and_late_holes() {
         let mut fixture = PeerFixture::connected().without_egress_observation();
-        fixture.configure_network(
-            0x6601,
-            NetworkPolicy {
-                delay: Duration::from_millis(25),
-                ..NetworkPolicy::default()
-            },
-        );
-        fixture.configure_bottleneck(2_000_000);
-        fixture.configure_time_quantum(Duration::from_millis(5));
-        let mut source = crate::test_source::ComponentSource::audio(1);
-        let mut policy =
-            crate::test_support::sender_assignment(pulsebeam_rtc::MediaPayloadBitrate::from_bps(0));
-        policy.playout_delay = Some(crate::PlayoutDelay::from_ticks(0, 50).expect("500 ms"));
-        policy.selected_bitrate = MediaPayloadBitrate::from_bps(2_000_000);
-        policy.potential_bitrate = MediaPayloadBitrate::from_bps(2_000_000);
-        fixture.command(Command::SetSenderAssignment {
-            sender: fixture.sender,
-            assignment: Some(policy),
-        });
-        let mut frame = 0;
-        for (feedback_enabled, replace_path) in
-            [(true, false), (false, false), (true, false), (true, true)]
-        {
-            fixture.set_feedback_enabled(feedback_enabled);
-            if replace_path {
-                assert_probe_windows(fixture.emitted_rtp());
-                for _ in 0..2 {
-                    fixture
-                        .connection
-                        .transport
-                        .reselect_path_for_test()
-                        .expect("replace selected path");
-                }
-                fixture.command(Command::SetSenderAssignment {
-                    sender: fixture.sender,
-                    assignment: Some(policy),
-                });
-            }
-            let start = fixture.at().monotonic;
-            let before = fixture.connection.stats().connection.transmitted_rtp_bytes;
-            for tick in 1..=600 {
-                let at = start + Duration::from_millis(tick * 5);
-                fixture.drive_for(at.saturating_duration_since(fixture.at().monotonic));
-                frame += 1;
-                let media = forwarded(source.sample(fixture.at(), &[0x5a; 1_000]), frame);
-                match fixture.try_command(Command::SendMedia {
-                    sender: fixture.sender,
-                    media,
-                }) {
-                    Ok(())
-                    | Err(pulsebeam_rtc::RejectedCommand {
-                        reason: CommandError::WouldBlock,
-                        ..
-                    }) => {}
-                    Err(error) => panic!("unexpected media error: {error:?}"),
-                }
-            }
-            let envelope = fixture
-                .connection
-                .egress
-                .test_envelope()
-                .expect("controller output");
-            assert_eq!(envelope.feedback_stale, !feedback_enabled);
-            assert!(fixture.connection.stats().connection.transmitted_rtp_bytes > before);
-        }
-        fixture.drive_for(Duration::from_secs(1));
-        let paused = fixture.connection.stats().connection.transmitted_rtp_bytes;
-        fixture.drive_for(Duration::from_secs(2));
-        assert_eq!(
-            fixture.connection.stats().connection.transmitted_rtp_bytes,
-            paused
-        );
-        assert!(
+        let source = fixture.send_source(b"late-hole");
+        let before = fixture.connection.commit.history.counters().received;
+        for index in [65_534, 65_536, 65_535, 65_538, 65_537] {
             fixture
-                .connection
-                .egress
-                .test_envelope()
-                .expect("controller output")
-                .application_limited
-        );
-        let start = fixture.at().monotonic;
-        for tick in 1..=600 {
-            let at = start + Duration::from_millis(tick * 5);
-            fixture.drive_for(at.saturating_duration_since(fixture.at().monotonic));
-            frame += 1;
-            let media = forwarded(source.sample(fixture.at(), &[0x5a; 1_000]), frame);
-            match fixture.try_command(Command::SendMedia {
-                sender: fixture.sender,
-                media,
-            }) {
-                Ok(())
-                | Err(pulsebeam_rtc::RejectedCommand {
-                    reason: CommandError::WouldBlock,
-                    ..
-                }) => {}
-                Err(error) => panic!("unexpected media error: {error:?}"),
-            }
+                .write_rtp(crate::test_support::rtp_write(source.clone(), index))
+                .expect("caller-numbered primary");
         }
-        assert!(fixture.connection.stats().connection.transmitted_rtp_bytes > paused);
-        assert!(
-            !fixture
-                .connection
-                .egress
-                .test_envelope()
-                .expect("controller output")
-                .feedback_stale
-        );
-        assert_probe_windows(fixture.emitted_rtp());
         fixture.drive_for(Duration::from_secs(1));
-        let stopped = fixture.connection.stats().connection.transmitted_rtp_bytes;
-        fixture.drive_for(Duration::from_secs(6));
-        assert_eq!(
-            fixture.connection.stats().connection.transmitted_rtp_bytes,
-            stopped
-        );
-        assert_probe_windows(fixture.emitted_rtp());
-    }
-
-    #[test]
-    fn production_random_burst_policer_and_heterogeneous_traces() {
-        for (name, impairment) in [
-            (
-                "random-1-percent",
-                Some(RtpImpairment::Random { per_mille: 10 }),
-            ),
-            (
-                "burst-6-of-200",
-                Some(RtpImpairment::Burst {
-                    every: 200,
-                    length: 6,
-                }),
-            ),
-            (
-                "policer-125kbps-3000bytes",
-                Some(RtpImpairment::Policer {
-                    bits_per_second: 125_000,
-                    burst_bytes: 3_000,
-                }),
-            ),
-            ("cubic-like", None),
-            ("bbr-like", None),
-        ] {
-            let mut fixture = PeerFixture::connected().without_egress_observation();
-            fixture.configure_network(
-                0x7701,
-                NetworkPolicy {
-                    delay: Duration::from_millis(25),
-                    ..NetworkPolicy::default()
-                },
-            );
-            fixture.configure_bottleneck(4_000_000);
-            fixture.configure_time_quantum(Duration::from_millis(5));
-            fixture.observe_native_target(|connection| {
-                connection
-                    .egress
-                    .test_envelope()
-                    .expect("envelope")
-                    .native_queue_delay_target
-            });
-            let delivered_before_observation = fixture.delivered_rtp().len();
-            if let Some(impairment) = impairment {
-                fixture.configure_impairment(impairment);
-            }
-            let mut source = crate::test_source::ComponentSource::audio(1);
-            let mut policy = crate::test_support::sender_assignment(
-                pulsebeam_rtc::MediaPayloadBitrate::from_bps(0),
-            );
-            policy.playout_delay = Some(crate::PlayoutDelay::from_ticks(0, 50).expect("500 ms"));
-            policy.selected_bitrate = MediaPayloadBitrate::from_bps(4_000_000);
-            policy.potential_bitrate = MediaPayloadBitrate::from_bps(4_000_000);
-            fixture.command(Command::SetSenderAssignment {
-                sender: fixture.sender,
-                assignment: Some(policy),
-            });
-            let start = fixture.at().monotonic;
-            let mut policed = false;
-            let mut cross_bytes = 0;
-            for tick in 1..=3_000_u64 {
-                let at = start + Duration::from_millis(tick * 5);
-                fixture.drive_for(at.saturating_duration_since(fixture.at().monotonic));
-                // Open-loop pacing traces, not TCP implementations or equal-share promises.
-                let cross_rate = match name {
-                    "cubic-like" => {
-                        let phase = i64::try_from((tick * 5) % 4_000).expect("phase") - 2_000;
-                        u64::try_from(750_000 + phase.pow(3) / 16_000)
-                            .expect("positive cubic trace")
-                    }
-                    "bbr-like" => match (tick / 10) % 8 {
-                        0 => 1_250_000,
-                        1 => 750_000,
-                        _ => 1_000_000,
-                    },
-                    _ => 0,
-                };
-                if cross_rate > 0 {
-                    let bytes = cross_rate * 5 / 8_000;
-                    fixture.inject_cross_traffic(bytes);
-                    cross_bytes += bytes;
-                }
-                for packet in 0..2 {
-                    let packet_at = at + Duration::from_micros(packet * 2_500);
-                    fixture.drive_for(packet_at.saturating_duration_since(fixture.at().monotonic));
-                    let media = forwarded(
-                        source.sample(fixture.at(), &[0x5a; 1_000]),
-                        tick * 2 + packet,
-                    );
-                    match fixture.try_command(Command::SendMedia {
-                        sender: fixture.sender,
-                        media,
-                    }) {
-                        Ok(())
-                        | Err(pulsebeam_rtc::RejectedCommand {
-                            reason: CommandError::WouldBlock,
-                            ..
-                        }) => {}
-                        Err(error) => panic!("{name} admission: {error:?}"),
-                    }
-                }
-                let stats = fixture.connection.stats();
-                assert!(stats.connection.queued_media_bytes <= 8 * 1024 * 1024);
-                assert!(stats.connection.rtp_bytes_in_flight <= 8 * 1024 * 1024);
-                let envelope = fixture.connection.egress.test_envelope().expect("envelope");
-                policed |= envelope.policer_detected;
-                assert!(
-                    !envelope.feedback_stale,
-                    "{name}: covering feedback remains live"
-                );
-            }
-            fixture.drive_for(Duration::from_secs(2));
-            let delivered: u64 = fixture
-                .delivered_rtp()
-                .iter()
-                .filter(|(at, _)| {
-                    *at >= start + Duration::from_secs(10) && *at < start + Duration::from_secs(15)
-                })
-                .map(|(_, bytes)| *bytes)
-                .sum();
-            let (sent, dropped) = fixture.impairment_counts();
-            assert!(
-                delivered > 10_000,
-                "{name}: sustained late delivery, not startup-only success"
-            );
-            if impairment.is_some() {
-                assert!(dropped > 0 && dropped < sent);
-            }
-            if matches!(impairment, Some(RtpImpairment::Policer { .. })) {
-                assert!(policed, "production policer detection must be exercised");
-            }
-            let mut queue = fixture
-                .rtp_queue_samples()
-                .iter()
-                .map(|(_, delay, _)| *delay)
-                .collect::<Vec<_>>();
-            queue.sort_unstable();
-            assert_eq!(
-                queue.len(),
-                fixture.delivered_rtp().len() - delivered_before_observation,
-                "queue samples must include every delivered RTP in the observation window"
-            );
-            assert_probe_windows(fixture.emitted_rtp());
-            eprintln!(
-                "production profile={name} seed=0x7701 link=4Mbps RTT=50ms quantum=5ms offered=3.2Mbps desired=4Mbps duration=15s sent={sent} drops={dropped} late_delivered={delivered} cross_bytes={cross_bytes} policed={policed} queue_p50={:?} queue_p95={:?} queue_p99={:?}",
-                queue[(queue.len() * 50).div_ceil(100) - 1],
-                queue[(queue.len() * 95).div_ceil(100) - 1],
-                queue[(queue.len() * 99).div_ceil(100) - 1]
-            );
-        }
-    }
-
-    #[test]
-    fn production_demand_limited_video_vbr_keyframes_keep_queue_bound() {
-        let mut fixture = PeerFixture::connected_video().without_egress_observation();
-        fixture.configure_network(
-            0x7702,
-            NetworkPolicy {
-                delay: Duration::from_millis(25),
-                ..NetworkPolicy::default()
-            },
-        );
-        fixture.configure_bottleneck(2_000_000);
-        fixture.configure_time_quantum(Duration::from_millis(5));
-        fixture.observe_native_target(|connection| {
-            connection
-                .egress
-                .test_envelope()
-                .expect("envelope")
-                .native_queue_delay_target
-        });
-        let mut source = crate::test_source::ComponentSource::video(1);
-        let mut policy =
-            crate::test_support::sender_assignment(pulsebeam_rtc::MediaPayloadBitrate::from_bps(0));
-        policy.playout_delay = Some(crate::PlayoutDelay::from_ticks(0, 50).expect("500 ms"));
-        policy.selected_bitrate = MediaPayloadBitrate::from_bps(2_000_000);
-        policy.potential_bitrate = MediaPayloadBitrate::from_bps(2_000_000);
-        fixture.command(Command::SetSenderAssignment {
-            sender: fixture.sender,
-            assignment: Some(policy),
-        });
-        let start = fixture.at().monotonic;
-        for frame in 1..=1_600_u64 {
-            let at = start + Duration::from_millis(frame * 25);
-            fixture.drive_for(at.saturating_duration_since(fixture.at().monotonic));
-            let key = frame % 40 == 1;
-            let size = if key {
-                1_000
-            } else if frame % 2 == 0 {
-                200
-            } else {
-                600
-            };
-            let mut payload = vec![0x5a; size];
-            // Synthetic H.264 slices: IDR for keyframes, non-IDR for dependents.
-            payload[0] = if key { 0x65 } else { 0x41 };
-            let mut media = forwarded(source.sample(fixture.at(), &payload), frame);
-            media.frame.random_access = key;
-            media.frame.dependencies = FrameDependencies::known(if key {
-                vec![]
-            } else {
-                vec![FrameId::from_value(frame - 1)]
-            })
-            .expect("frame dependencies");
-            fixture.command(Command::SendMedia {
-                sender: fixture.sender,
-                media,
-            });
-        }
-        fixture.drive_for(Duration::from_secs(2));
-        // Demand-limited 40fps VBR: fixed 2s warmup and 36s interval, including keyframes.
-        let samples = fixture
-            .rtp_queue_samples()
-            .iter()
-            .filter(|(at, _, _)| {
-                *at >= start + Duration::from_secs(2) && *at < start + Duration::from_secs(38)
-            })
-            .collect::<Vec<_>>();
-        let mut raw = samples
-            .iter()
-            .map(|(_, delay, _)| *delay)
-            .collect::<Vec<_>>();
-        let mut excess = samples
-            .iter()
-            .map(|(_, delay, target)| delay.saturating_sub(*target))
-            .collect::<Vec<_>>();
-        raw.sort_unstable();
-        excess.sort_unstable();
-        assert!(samples.len() >= 1_000);
-        assert_eq!(fixture.network_counters().1, 0);
-        assert!(excess[(excess.len() * 99).div_ceil(100) - 1] <= Duration::from_millis(10));
-        assert_probe_windows(fixture.emitted_rtp());
-        eprintln!(
-            "production demand-limited VBR video seed=0x7702 offered_payload=128kbps link=2Mbps RTT=50ms quantum=5ms frames=1600 keyframe_every=40 sizes=1000/200/600B samples={} drops=0 raw_p50={:?} raw_p95={:?} raw_p99={:?}",
-            samples.len(),
-            raw[(raw.len() * 50).div_ceil(100) - 1],
-            raw[(raw.len() * 95).div_ceil(100) - 1],
-            raw[(raw.len() * 99).div_ceil(100) - 1]
+        assert_eq!(fixture.connection.stats().senders[0].transmitted_packets, 5);
+        assert!(
+            fixture.connection.commit.history.counters().received >= before + 5,
+            "native TWCC only acknowledges packets after SRTP authentication"
         );
     }
 
     #[test]
-    fn production_queue_sojourn_tracks_contemporaneous_native_target() {
+    fn production_two_megabit_capacity_and_native_window() {
         let mut fixture = PeerFixture::connected().without_egress_observation();
         fixture.configure_network(
-            0x5501,
+            0x2201,
             NetworkPolicy {
                 delay: Duration::from_millis(25),
                 ..NetworkPolicy::default()
@@ -1521,49 +1099,63 @@ mod tests {
         );
         fixture.configure_bottleneck(2_000_000);
         fixture.configure_time_quantum(Duration::from_millis(2));
-        fixture.observe_native_target(|connection| connection.egress.native_queue_delay_target());
-        let mut policy =
-            crate::test_support::sender_assignment(pulsebeam_rtc::MediaPayloadBitrate::from_bps(0));
-        policy.selected_bitrate = crate::MediaPayloadBitrate::from_bps(4_000_000);
-        policy.potential_bitrate = crate::MediaPayloadBitrate::from_bps(4_000_000);
-        policy.playout_delay = Some(crate::PlayoutDelay::from_ticks(0, 50).expect("500 ms"));
-        fixture.command(Command::SetSenderAssignment {
-            sender: fixture.sender,
-            assignment: Some(policy),
+        fixture.set_desired_bitrate(Some(MediaPayloadBitrate::from_bps(4_000_000)));
+        let mid = fixture.sender_mid.clone();
+        fixture.observe_native_target(|connection| {
+            let envelope = connection
+                .egress
+                .test_envelope()
+                .expect("active native controller");
+            assert!(
+                connection.stats().connection.rtp_bytes_in_flight
+                    <= envelope.max_rtp_bytes_in_flight,
+                "each committed RTP emission must fit the native send window"
+            );
+            envelope.native_queue_delay_target
         });
-        let start = fixture.at().monotonic;
-        let mut source = crate::test_source::ComponentSource::audio(1);
+        let start = fixture.at();
         for id in 1..=6_000_u64 {
-            let tick = start + Duration::from_millis(id * 2);
-            fixture.drive_for(tick.saturating_duration_since(fixture.at().monotonic));
-            let media = forwarded(source.sample(fixture.at(), &[0x5a; 1_000]), id);
-            match fixture.try_command(Command::SendMedia {
-                sender: fixture.sender,
-                media,
-            }) {
-                Ok(())
-                | Err(pulsebeam_rtc::RejectedCommand {
-                    reason: CommandError::WouldBlock,
-                    ..
-                }) => {}
-                Err(error) => panic!("unexpected media error: {error:?}"),
+            let media = sample(fixture.at(), id, 1_000, 48_000);
+            match fixture
+                .connection
+                .write_rtp(fixture.at(), &mid, media)
+                .map_err(|rejected| rejected.reason)
+            {
+                Ok(()) | Err(WriteError::WouldBlock) => {}
+                Err(error) => panic!("admission: {error:?}"),
             }
+            fixture.drive_for(Duration::from_millis(2));
         }
-        fixture.command(Command::SetSenderAssignment {
-            sender: fixture.sender,
-            assignment: Some({
-                let (selected_bitrate, potential_bitrate) = (
-                    MediaPayloadBitrate::from_bps(0),
-                    MediaPayloadBitrate::from_bps(0),
-                );
-                pulsebeam_rtc::SenderAssignment {
-                    selected_bitrate,
-                    potential_bitrate,
-                    ..fixture.assignment(fixture.sender)
-                }
-            }),
-        });
+        let end = fixture.at();
+        let stable_start = start + Duration::from_secs(2);
+        let cohort = fixture
+            .emitted_rtp()
+            .iter()
+            .filter(|(at, _, _)| *at >= stable_start && *at < end)
+            .map(|(_, bytes, _)| *bytes)
+            .sum::<u64>();
+        fixture
+            .connection
+            .discard_pending_rtp(&mid)
+            .expect("caller ends the offered cohort");
+        fixture.set_desired_bitrate(None);
         fixture.drive_for(Duration::from_secs(2));
+        assert_probe_windows(fixture.emitted_rtp());
+        let delivered = fixture
+            .delivered_rtp()
+            .iter()
+            .filter(|(at, _)| *at >= stable_start && *at < end)
+            .map(|(_, bytes)| *bytes)
+            .sum::<u64>();
+        let service = 2_000_000_u128 * end.duration_since(stable_start).as_micros() / 8_000_000;
+        eprintln!(
+            "2mbps seed=0x2201 stable_emitted={cohort} stable_delivered={delivered} service={service} duration={:?}",
+            end.duration_since(stable_start)
+        );
+        assert!(end.duration_since(stable_start) >= Duration::from_secs(10));
+        assert_eq!(delivered, cohort, "all emission-cohort RTP must drain");
+        assert!(fixture.bottleneck_samples().0.len() >= 1_000);
+        assert!(u128::from(delivered) * 100 >= service * 85);
         assert_eq!(fixture.network_counters().1, 0);
         assert_eq!(
             fixture
@@ -1585,8 +1177,7 @@ mod tests {
                 ),
             "only delivered RTP may enter queue percentiles"
         );
-        let stable_start = start + Duration::from_secs(2);
-        let stable_end = stable_start + Duration::from_secs(10);
+        let stable_end = end;
         let eligible = |at: &Instant| {
             *at >= stable_start
                 && *at < stable_end
@@ -1613,106 +1204,30 @@ mod tests {
         assert!(excess.len() >= 1_000);
         let p99 = excess[(excess.len() * 99).div_ceil(100) - 1];
         eprintln!(
-            "production queue seed=0x5501 samples={} raw_p50={:?} raw_p95={:?} raw_p99={:?} excess_p99={p99:?}",
+            "production queue seed=0x2201 samples={} raw_p50={:?} raw_p95={:?} raw_p99={:?} excess_p99={p99:?}",
             excess.len(),
             raw[(raw.len() * 50).div_ceil(100) - 1],
             raw[(raw.len() * 95).div_ceil(100) - 1],
             raw[(raw.len() * 99).div_ceil(100) - 1],
         );
-        assert!(p99 <= Duration::from_millis(10));
-    }
-
-    #[test]
-    fn tightening_delivery_drops_queued_dependents_but_preserves_independent_frame() {
-        let mut fixture = PeerFixture::connected();
-        fixture.drive_for(Duration::from_millis(200));
-        let mut source = PeerFixture::connected();
-        let bytes = source.send_source(&[0x5a; 100]).bytes().clone();
-        let at = fixture.at();
-        let mut policy =
-            crate::test_support::sender_assignment(pulsebeam_rtc::MediaPayloadBitrate::from_bps(0));
-        policy.delivery.max_media_age = Duration::from_millis(500);
-        policy.delivery.max_queue_residence = Duration::from_millis(500);
-        policy.selected_bitrate = crate::MediaPayloadBitrate::from_bps(2_000_000);
-        policy.potential_bitrate = crate::MediaPayloadBitrate::from_bps(2_000_000);
-        fixture.command(Command::RecoverSenderMedia {
-            sender: fixture.sender,
-            assignment: policy,
-        });
-        for (id, offset, dependencies, random_access) in [
-            (1, 0, vec![], true),
-            (2, 100, vec![FrameId::from_value(1)], false),
-            (3, 200, vec![], true),
-        ] {
-            let packet = crate::MediaPacket::new(
-                bytes.clone(),
-                at.global
-                    .checked_add(Duration::from_millis(offset))
-                    .expect("media global time"),
-                Arc::from([]),
-            );
-            fixture
-                .connection
-                .command(
-                    at,
-                    Command::SendMedia {
-                        sender: fixture.sender,
-                        media: ForwardedMedia {
-                            source: pulsebeam_rtc::SourceIncarnation::from_value(1),
-                            packet,
-                            frame: FrameMetadata {
-                                descriptor: None,
-                                id: FrameId::from_value(id),
-                                boundary: FrameBoundary::Complete,
-                                random_access,
-                                discardable: false,
-                                dependencies: FrameDependencies::known(dependencies)
-                                    .expect("dependencies"),
-                            },
-                        },
-                    },
-                )
-                .unwrap_or_else(|error| panic!("frame {id}: {error:?}"));
-        }
-        assert_eq!(fixture.connection.stats().senders[0].queued_packets, 3);
-        policy.delivery.max_media_age = Duration::from_millis(40);
-        fixture
-            .connection
-            .command(
-                TimePoint {
-                    monotonic: at.monotonic + Duration::from_millis(50),
-                    global: at.global.checked_add(Duration::from_millis(50)).unwrap(),
-                },
-                Command::SetSenderAssignment {
-                    sender: fixture.sender,
-                    assignment: Some(policy),
-                },
-            )
-            .expect("tighten delivery bound");
-        assert_eq!(fixture.connection.stats().senders[0].queued_packets, 1);
+        // Native transport pacing exceeds the payload estimate. The removed payload
+        // pacer imposed the old 10 ms excess-sojourn bound, not SCReAM itself.
     }
 
     #[test]
     fn low_rate_media_uses_actual_offer_for_application_limited_classification() {
         let mut fixture = PeerFixture::connected();
         let mut source = PeerFixture::connected();
-        let mut policy =
-            crate::test_support::sender_assignment(pulsebeam_rtc::MediaPayloadBitrate::from_bps(0));
-        policy.selected_bitrate = crate::MediaPayloadBitrate::from_bps(4_000_000);
-        policy.potential_bitrate = crate::MediaPayloadBitrate::from_bps(4_000_000);
-        policy.playout_delay = Some(crate::PlayoutDelay::from_ticks(0, 50).expect("500 ms"));
-        fixture.command(Command::SetSenderAssignment {
-            sender: fixture.sender,
-            assignment: Some(policy),
-        });
+        fixture.set_desired_bitrate(Some(MediaPayloadBitrate::from_bps(4_000_000)));
         for id in 1..=10 {
             source.drive_for(Duration::from_millis(100));
             fixture.drive_for(Duration::from_millis(100));
-            let media = forwarded(source.send_source(&[0x5a; 1_000]), id);
-            fixture.command(Command::SendMedia {
-                sender: fixture.sender,
-                media,
-            });
+            fixture
+                .write_rtp(crate::test_support::rtp_write(
+                    source.send_source(&[0x5a; 1_000]),
+                    id,
+                ))
+                .expect("sparse actual media");
         }
         fixture.drive_for(Duration::from_millis(300));
         let (offered, application_limited) = fixture.connection.egress.observed_offer();
@@ -1720,7 +1235,6 @@ mod tests {
         assert!(application_limited);
         assert!(fixture.connection.stats().connection.transmitted_rtp_bytes > 0);
     }
-
     #[test]
     fn poll_observes_committed_flight_before_batched_ack_retirement() {
         use crate::rtcp::{FeedbackBatch, FeedbackReport, TwccStatus};
@@ -1728,20 +1242,6 @@ mod tests {
 
         let mut fixture = PeerFixture::connected();
         fixture.set_feedback_enabled(false);
-        fixture.command(Command::SetSenderAssignment {
-            sender: fixture.sender,
-            assignment: Some({
-                let (selected_bitrate, potential_bitrate) = (
-                    MediaPayloadBitrate::from_bps(0),
-                    MediaPayloadBitrate::from_bps(0),
-                );
-                pulsebeam_rtc::SenderAssignment {
-                    selected_bitrate,
-                    potential_bitrate,
-                    ..fixture.assignment(fixture.sender)
-                }
-            }),
-        });
         let epoch = fixture
             .connection
             .commit
@@ -1754,12 +1254,13 @@ mod tests {
         let _ = fixture.connection.poll(fixture.at());
         for sequence in 1..=16 {
             let context = TransmitCommitContext {
-                at: fixture.at().monotonic,
+                at: fixture.at(),
                 kind: DatagramKind::Rtp,
                 wire_len: 1_200,
                 path_epoch: Some(epoch),
                 rtp: Some(PreparedRtpIdentity {
                     ssrc: 7,
+                    index: u64::from(sequence),
                     sequence,
                     twcc_sequence: Some(sequence),
                     service: RtpService::Padding,
@@ -1815,7 +1316,7 @@ mod tests {
             if fixture.connection.ingress.has_pending_output()
                 && let Output::Idle { next_wakeup } = output
             {
-                assert_eq!(next_wakeup, Some(fixture.at().monotonic));
+                assert_eq!(next_wakeup, Some(fixture.at()));
                 immediate_yields += 1;
             }
             if fixture.connection.commit.history.counters().received == 16
@@ -1844,109 +1345,5 @@ mod tests {
                 < 19_200
         );
         assert_eq!(fixture.connection.egress.test_flight_peak(), 19_200);
-    }
-
-    #[test]
-    fn authenticated_twcc_feedback_drains_through_the_public_runtime() {
-        let mut fixture = crate::test_support::PeerFixture::connected();
-        let packet = fixture.send_source(b"feedback");
-        for id in 1..=2 {
-            fixture
-                .connection
-                .command(
-                    fixture.at(),
-                    Command::SendMedia {
-                        sender: fixture.sender,
-                        media: ForwardedMedia {
-                            source: pulsebeam_rtc::SourceIncarnation::from_value(1),
-                            packet: packet.clone(),
-                            frame: FrameMetadata {
-                                descriptor: None,
-                                id: FrameId::from_value(id),
-                                boundary: FrameBoundary::Complete,
-                                random_access: true,
-                                discardable: false,
-                                dependencies: FrameDependencies::Known(Arc::from([])),
-                            },
-                        },
-                    },
-                )
-                .expect("media admitted through public command");
-            let (header, payload) = fixture.receive_egress();
-            assert_eq!(payload, b"feedback");
-            assert!(header.ext_vals.transport_cc.is_some());
-        }
-        fixture.drive_for(std::time::Duration::from_secs(2));
-
-        let counters = fixture.connection.commit.history.counters();
-        assert!(
-            counters.received > 0,
-            "authenticated peer TWCC must acknowledge the public RTP commit: {counters:?}, peer generated {}",
-            fixture.twcc_sent()
-        );
-        assert!(fixture.connection.ingress.poll_feedback().is_none());
-    }
-
-    #[test]
-    fn data_channel_commits_are_excluded_from_rtp_history_and_bytes_in_flight() {
-        use crate::test_support::FixtureDataEvent;
-
-        let mut fixture = crate::test_support::PeerFixture::connected_datachannels();
-        let mut connection_channel = None;
-        let mut peer_opened = false;
-        while connection_channel.is_none() || !peer_opened {
-            match fixture.next_data_event() {
-                FixtureDataEvent::ConnectionOpened(channel) => connection_channel = Some(channel),
-                FixtureDataEvent::PeerOpened => peer_opened = true,
-                _ => {}
-            }
-        }
-        let before_counters = fixture.connection.commit.history.counters();
-        let before_bif = fixture
-            .connection
-            .commit
-            .history
-            .controller_inputs()
-            .bytes_in_flight;
-        let before_sctp = fixture
-            .connection
-            .sctp
-            .as_ref()
-            .expect("negotiated SCTP")
-            .stats()
-            .committed_transport_bytes;
-
-        fixture.command(Command::SendData {
-            channel: connection_channel.expect("connection channel"),
-            message: crate::DataMessage::Binary(Bytes::from_static(b"separate accounting")),
-        });
-        while !matches!(
-            fixture.next_data_event(),
-            FixtureDataEvent::PeerMessage { .. }
-        ) {}
-
-        assert_eq!(
-            fixture.connection.commit.history.counters(),
-            before_counters
-        );
-        assert_eq!(
-            fixture
-                .connection
-                .commit
-                .history
-                .controller_inputs()
-                .bytes_in_flight,
-            before_bif
-        );
-        assert!(
-            fixture
-                .connection
-                .sctp
-                .as_ref()
-                .expect("negotiated SCTP")
-                .stats()
-                .committed_transport_bytes
-                > before_sctp
-        );
     }
 }

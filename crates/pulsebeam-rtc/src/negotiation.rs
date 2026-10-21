@@ -10,16 +10,17 @@
 use std::{
     collections::{BTreeSet, HashSet},
     sync::Arc,
+    time::Instant,
 };
 
 use p256::ecdsa::{DerSignature, SigningKey, signature::Signer};
 use sha2::{Digest, Sha256};
 use str0m::sdp::{MediaAttribute, MediaType, Proto, Sdp, SessionAttribute, Setup};
 
+use crate::id::SenderId;
 use crate::{
     AcceptError, ConnectionConfig, ConnectionLimits, InboundMediaInfo, LocalCandidate,
-    PacketFeedbackKind, SdpAnswer, SdpOffer, SenderId, SenderInfo, SessionInfo, TimePoint,
-    connection::EntropyConsumer,
+    PacketFeedbackKind, SdpAnswer, SdpOffer, SenderInfo, SessionInfo, connection::EntropyConsumer,
 };
 
 const MAX_SDP_BYTES: usize = 256 * 1024;
@@ -37,6 +38,10 @@ const MAX_SESSION_ATTRIBUTES: usize = 2048;
 pub(crate) const TWCC_URIS: [&str; 2] = [
     "http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01",
     "http://www.webrtc.org/experiments/rtp-hdrext/transport-wide-cc-01",
+];
+pub(crate) const DEPENDENCY_URIS: [&str; 2] = [
+    pulsebeam_core::dd::URI,
+    "http://www.webrtc.org/experiments/rtp-hdrext/video-dependency-descriptor",
 ];
 const PLAYOUT_DELAY_URI: &str = "http://www.webrtc.org/experiments/rtp-hdrext/playout-delay";
 const MID_URI: &str = "urn:ietf:params:rtp-hdrext:sdes:mid";
@@ -65,7 +70,7 @@ pub(crate) struct NegotiatedSessionFacts {
     feedback: Option<PacketFeedbackKind>,
     inbound_feedback: Option<PacketFeedbackKind>,
     limits: ConnectionLimits,
-    accepted_at: TimePoint,
+    accepted_at: Instant,
 }
 
 pub(crate) struct IngressMediaFacts {
@@ -236,7 +241,7 @@ impl NegotiatedSessionFacts {
                     mid_extension_id: extension_id(MID_URI),
                     twcc_extension_id: TWCC_URIS.iter().find_map(|uri| extension_id(uri)),
                     playout_extension_id: extension_id(PLAYOUT_DELAY_URI),
-                    dependency_extension_id: crate::dependency_descriptor::URIS
+                    dependency_extension_id: DEPENDENCY_URIS
                         .iter()
                         .find_map(|uri| extension_id(uri)),
                     forwarded_extensions: section
@@ -416,7 +421,7 @@ impl From<NegotiationError> for AcceptError {
 pub(crate) fn negotiate(
     config: &ConnectionConfig,
     offer: &SdpOffer,
-    at: TimePoint,
+    at: Instant,
     entropy: &mut EntropyConsumer,
 ) -> Result<NegotiationResult, AcceptError> {
     negotiate_inner(config, offer, at, entropy).map_err(Into::into)
@@ -425,7 +430,7 @@ pub(crate) fn negotiate(
 fn negotiate_inner(
     config: &ConnectionConfig,
     offer: &SdpOffer,
-    at: TimePoint,
+    at: Instant,
     entropy: &mut EntropyConsumer,
 ) -> Result<NegotiationResult, NegotiationError> {
     if offer.as_str().len() > MAX_SDP_BYTES {
@@ -1178,19 +1183,19 @@ fn supported_extension(uri: &str) -> bool {
         || uri == "urn:3gpp:video-orientation"
         || uri == "http://www.webrtc.org/experiments/rtp-hdrext/abs-capture-time"
         || TWCC_URIS.contains(&uri)
-        || crate::dependency_descriptor::URIS.contains(&uri)
+        || DEPENDENCY_URIS.contains(&uri)
         || uri.contains("video-layers-allocation")
         || uri == PLAYOUT_DELAY_URI
 }
 
 fn forward_extension(uri: &str) -> bool {
-    matches!(
+    !matches!(
         uri,
-        "urn:ietf:params:rtp-hdrext:ssrc-audio-level"
-            | "urn:3gpp:video-orientation"
-            | "http://www.webrtc.org/experiments/rtp-hdrext/abs-capture-time"
-    ) || (!supported_extension(uri)
-        && uri != "http://www.webrtc.org/experiments/rtp-hdrext/abs-send-time")
+        "urn:ietf:params:rtp-hdrext:sdes:mid"
+            | "urn:ietf:params:rtp-hdrext:sdes:rtp-stream-id"
+            | "urn:ietf:params:rtp-hdrext:sdes:repaired-rtp-stream-id"
+            | "http://www.webrtc.org/experiments/rtp-hdrext/abs-send-time"
+    ) && !TWCC_URIS.contains(&uri)
 }
 
 fn parse_rids(raw: &[String], kind: SectionKind) -> Result<Vec<String>, NegotiationError> {
@@ -1632,6 +1637,16 @@ fn format_answer_section(
         .unwrap_or_default()
         .split_whitespace()
         .collect::<Vec<_>>();
+    // Rejected sections still need mappings for their offered dynamic payloads.
+    let payloads = if disabled {
+        fields
+            .iter()
+            .skip(3)
+            .filter_map(|value| value.parse::<u8>().ok())
+            .collect::<Vec<_>>()
+    } else {
+        section.accepted_payloads.clone()
+    };
     let mut output = String::new();
     if section.facts.kind == SectionKind::Application {
         output.push_str(&format!(
@@ -1645,16 +1660,7 @@ fn format_answer_section(
             if disabled { 0 } else { 9 },
             fields.get(2).copied().unwrap_or("UDP/TLS/RTP/SAVPF")
         ));
-        let payloads = if disabled {
-            fields
-                .iter()
-                .skip(3)
-                .filter_map(|value| value.parse::<u8>().ok())
-                .collect::<Vec<_>>()
-        } else {
-            section.accepted_payloads.clone()
-        };
-        for payload in payloads {
+        for payload in &payloads {
             output.push_str(&format!(" {payload}"));
         }
         output.push_str("\r\n");
@@ -1666,7 +1672,7 @@ fn format_answer_section(
             .or_else(|| line.strip_prefix("a=fmtp:"))
             .and_then(|value| value.split_whitespace().next())
             .and_then(|value| value.parse::<u8>().ok())
-            .is_some_and(|payload| section.accepted_payloads.contains(&payload));
+            .is_some_and(|payload| payloads.contains(&payload));
         let keep_feedback = line.strip_prefix("a=rtcp-fb:").is_some_and(|value| {
             let mut fields = value.split_whitespace();
             let payload = fields.next().unwrap_or_default();
@@ -1838,14 +1844,11 @@ fn format_answer(mids: &[String], sections: &[String], allow_mixed: bool) -> Str
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Connection, ConnectionEntropy, GlobalMediaTime};
+    use crate::{Connection, ConnectionEntropy};
     use std::{net::SocketAddr, time::Instant};
 
-    fn at() -> TimePoint {
-        TimePoint {
-            monotonic: Instant::now(),
-            global: GlobalMediaTime::from_micros(7),
-        }
+    fn at() -> Instant {
+        Instant::now()
     }
 
     fn config() -> ConnectionConfig {
@@ -1885,8 +1888,7 @@ mod tests {
     }
 
     #[test]
-    fn extension_policy_negotiates_opaque_values_only_when_enabled_and_never_copies_managed_state()
-    {
+    fn extension_policy_keeps_media_values_and_regenerates_transport_values() {
         let offer = SdpOffer::new(
             fixture("chrome")
                 .as_str()
@@ -1945,15 +1947,28 @@ mod tests {
             ));
             assert!(!forwarded(MID_URI));
             assert!(!forwarded(TWCC_URIS[0]));
-            assert!(
-                senders
+            assert!(senders.iter().all(|sender| {
+                sender
+                    .forwarded_extensions
                     .iter()
-                    .all(|sender| sender.forwarded_extensions.iter().all(|(_, uri)| {
-                        !uri.contains("dependency-descriptor")
-                            && !uri.contains("video-layers-allocation")
-                            && &**uri != PLAYOUT_DELAY_URI
-                    }))
-            );
+                    .all(|(_, uri)| &**uri != MID_URI && !TWCC_URIS.contains(&uri.as_ref()))
+            }));
+            let video = senders
+                .iter()
+                .find(|sender| sender.kind == crate::MediaKind::Video)
+                .expect("video sender");
+            for uri in [
+                DEPENDENCY_URIS[1],
+                "http://www.webrtc.org/experiments/rtp-hdrext/video-layers-allocation00",
+                PLAYOUT_DELAY_URI,
+            ] {
+                assert!(
+                    video
+                        .forwarded_extensions
+                        .iter()
+                        .any(|(_, value)| value.as_ref() == uri)
+                );
+            }
             let inbound = result.facts.ingress_media();
             assert_eq!(
                 inbound
@@ -1981,8 +1996,14 @@ mod tests {
             header.replace("a=group:BUNDLE audio video data", "a=group:BUNDLE data"),
             application,
         ));
-        let accepted = Connection::accept(config(), offer, at(), ConnectionEntropy::new([7; 32]))
-            .expect("application-only admission");
+        let accepted = Connection::accept(
+            config(),
+            offer,
+            at(),
+            std::time::UNIX_EPOCH,
+            ConnectionEntropy::new([7; 32]),
+        )
+        .expect("application-only admission");
         assert_eq!(accepted.session.feedback, None);
         assert!(accepted.session.inbound_media.is_empty());
         assert!(accepted.session.senders.is_empty());
@@ -2000,6 +2021,7 @@ mod tests {
                 config(),
                 fixture(name),
                 at(),
+                std::time::UNIX_EPOCH,
                 ConnectionEntropy::new([7; 32]),
             );
             let accepted = match result {
@@ -2049,8 +2071,14 @@ mod tests {
                 .replace("a=mid:1", "a=mid:videoOut")
                 .replace("a=mid:2", "a=mid:data"),
         );
-        let accepted =
-            Connection::accept(config(), offer, at(), ConnectionEntropy::new([8; 32])).unwrap();
+        let accepted = Connection::accept(
+            config(),
+            offer,
+            at(),
+            std::time::UNIX_EPOCH,
+            ConnectionEntropy::new([8; 32]),
+        )
+        .unwrap();
 
         assert_eq!(accepted.session.inbound_media.len(), 1);
         let media = accepted.session.inbound_for_sender_index(0).unwrap();
@@ -2061,10 +2089,7 @@ mod tests {
         let sender = accepted.session.senders.first().unwrap();
         assert_eq!(sender.mid.as_ref(), "videoOut");
         assert_eq!(sender.receiver_index, 1);
-        assert_eq!(
-            accepted.session.receiver_index_for_sender(sender.id),
-            Some(1)
-        );
+        assert_eq!(Some(sender.receiver_index), Some(1));
         assert_eq!(accepted.answer.as_str().matches("\nm=").count(), 3);
     }
 
@@ -2075,6 +2100,7 @@ mod tests {
                 ConnectionConfig::default(),
                 SdpOffer::new("not an SDP offer"),
                 at(),
+                std::time::UNIX_EPOCH,
                 ConnectionEntropy::new([7; 32]),
             )
             .err(),
@@ -2163,6 +2189,7 @@ mod tests {
             tcp_only,
             fixture("chrome"),
             at(),
+            std::time::UNIX_EPOCH,
             ConnectionEntropy::new([8; 32]),
         )
         .unwrap();
@@ -2180,6 +2207,7 @@ mod tests {
             sixteen,
             fixture("firefox"),
             at(),
+            std::time::UNIX_EPOCH,
             ConnectionEntropy::new([8; 32]),
         )
         .unwrap();
@@ -2249,8 +2277,14 @@ mod tests {
             "a=sendonly",
             &format!("a=sendonly\na=extmap:6/recvonly {PLAYOUT_DELAY_URI}"),
         ));
-        let accepted =
-            Connection::accept(config(), offer, at(), ConnectionEntropy::new([10; 32])).unwrap();
+        let accepted = Connection::accept(
+            config(),
+            offer,
+            at(),
+            std::time::UNIX_EPOCH,
+            ConnectionEntropy::new([10; 32]),
+        )
+        .unwrap();
         assert!(
             !accepted
                 .answer
@@ -2348,6 +2382,7 @@ mod tests {
                     config(),
                     without_fallback,
                     at(),
+                    std::time::UNIX_EPOCH,
                     ConnectionEntropy::new([10; 32])
                 )
                 .err(),
@@ -2372,6 +2407,7 @@ mod tests {
                 config(),
                 with_fallback,
                 at(),
+                std::time::UNIX_EPOCH,
                 ConnectionEntropy::new([10; 32]),
             )
             .unwrap();
@@ -2387,6 +2423,7 @@ mod tests {
                 config(),
                 incompatible,
                 at(),
+                std::time::UNIX_EPOCH,
                 ConnectionEntropy::new([10; 32])
             )
             .err(),
@@ -2413,6 +2450,7 @@ mod tests {
             config(),
             one_ineligible,
             at(),
+            std::time::UNIX_EPOCH,
             ConnectionEntropy::new([10; 32]),
         )
         .unwrap();
@@ -2428,6 +2466,7 @@ mod tests {
                 config(),
                 no_active_rtp,
                 at(),
+                std::time::UNIX_EPOCH,
                 ConnectionEntropy::new([10; 32])
             )
             .err(),
@@ -2484,6 +2523,7 @@ mod tests {
             config(),
             fixture("chrome"),
             at(),
+            std::time::UNIX_EPOCH,
             ConnectionEntropy::new([11; 32]),
         )
         .unwrap();
@@ -2515,6 +2555,7 @@ mod tests {
             config(),
             two_directions,
             at(),
+            std::time::UNIX_EPOCH,
             ConnectionEntropy::new([12; 32]),
         )
         .unwrap();
@@ -2544,6 +2585,7 @@ mod tests {
             config(),
             fixture("chrome"),
             at(),
+            std::time::UNIX_EPOCH,
             ConnectionEntropy::new([11; 32]),
         );
         let first = match first_result {
@@ -2554,6 +2596,7 @@ mod tests {
             config(),
             fixture("chrome"),
             at(),
+            std::time::UNIX_EPOCH,
             ConnectionEntropy::new([11; 32]),
         );
         let second = match second_result {
@@ -2564,6 +2607,7 @@ mod tests {
             config(),
             fixture("chrome"),
             at(),
+            std::time::UNIX_EPOCH,
             ConnectionEntropy::new([12; 32]),
         );
         let different = match different_result {
@@ -2649,7 +2693,13 @@ mod tests {
             "a=rtcp-fb:120 transport-cc",
             "a=rtcp-fb:120 transport-cc\r\na=rtcp-fb:120 ccfb",
         ));
-        let both_result = Connection::accept(config(), both, at(), ConnectionEntropy::new([1; 32]));
+        let both_result = Connection::accept(
+            config(),
+            both,
+            at(),
+            std::time::UNIX_EPOCH,
+            ConnectionEntropy::new([1; 32]),
+        );
         let accepted = match both_result {
             Ok(accepted) => accepted,
             Err(error) => panic!("both modes failed: {error}"),
@@ -2663,7 +2713,13 @@ mod tests {
                 .as_str()
                 .replace("a=rtcp-fb:120 transport-cc", "a=rtcp-fb:120 ccfb"),
         );
-        let rfc_result = Connection::accept(config(), rfc, at(), ConnectionEntropy::new([2; 32]));
+        let rfc_result = Connection::accept(
+            config(),
+            rfc,
+            at(),
+            std::time::UNIX_EPOCH,
+            ConnectionEntropy::new([2; 32]),
+        );
         let accepted = match rfc_result {
             Ok(accepted) => accepted,
             Err(error) => panic!("RFC 8888 failed: {error}"),
@@ -2672,13 +2728,39 @@ mod tests {
     }
 
     #[test]
+    fn rejected_video_preserves_dynamic_payload_mappings() {
+        let source = fixture("chrome");
+        assert!(source.as_str().contains("m=video 9 "));
+        let offer = SdpOffer::new(source.as_str().replace("m=video 9 ", "m=video 0 "));
+        let accepted = Connection::accept(
+            config(),
+            offer,
+            at(),
+            std::time::UNIX_EPOCH,
+            ConnectionEntropy::new([14; 32]),
+        )
+        .expect("a rejected media section is a valid initial offer");
+        let answer = accepted.answer.as_str();
+        assert!(answer.contains("m=video 0 UDP/TLS/RTP/SAVPF 102 121"));
+        assert!(answer.contains("a=rtpmap:102"));
+        assert!(answer.contains("a=rtpmap:121"));
+        Sdp::parse(answer).expect("the answer retains mappings for rejected dynamic payloads");
+    }
+
+    #[test]
     fn accepts_zero_port_bundle_only_sections() {
         let offer = SdpOffer::new(fixture("firefox").as_str().replace(
             "m=application 9 UDP/DTLS/SCTP webrtc-datachannel\nc=IN IP4 0.0.0.0",
             "m=application 0 UDP/DTLS/SCTP webrtc-datachannel\nc=IN IP4 0.0.0.0\na=bundle-only",
         ));
-        let accepted = Connection::accept(config(), offer, at(), ConnectionEntropy::new([13; 32]))
-            .expect("BUNDLE-only sections use the shared transport despite port zero");
+        let accepted = Connection::accept(
+            config(),
+            offer,
+            at(),
+            std::time::UNIX_EPOCH,
+            ConnectionEntropy::new([13; 32]),
+        )
+        .expect("BUNDLE-only sections use the shared transport despite port zero");
         assert!(
             accepted
                 .answer
@@ -2698,12 +2780,25 @@ mod tests {
                 .replace("a=rtcp-fb:102 transport-cc", ""),
         );
         assert_eq!(
-            Connection::accept(config(), no_feedback, at(), ConnectionEntropy::new([3; 32])).err(),
+            Connection::accept(
+                config(),
+                no_feedback,
+                at(),
+                std::time::UNIX_EPOCH,
+                ConnectionEntropy::new([3; 32])
+            )
+            .err(),
             Some(AcceptError::MissingPacketFeedback)
         );
         let no_bundle = SdpOffer::new(source.as_str().replace("a=group:BUNDLE 0 1 2", ""));
         assert!(matches!(
-            Connection::accept(config(), no_bundle, at(), ConnectionEntropy::new([3; 32])),
+            Connection::accept(
+                config(),
+                no_bundle,
+                at(),
+                std::time::UNIX_EPOCH,
+                ConnectionEntropy::new([3; 32])
+            ),
             Err(AcceptError::InvalidOffer)
         ));
         let remote_lite = SdpOffer::new(
@@ -2712,7 +2807,13 @@ mod tests {
                 .replace("a=setup:actpass", "a=setup:actpass\r\na=ice-lite"),
         );
         assert!(matches!(
-            Connection::accept(config(), remote_lite, at(), ConnectionEntropy::new([3; 32])),
+            Connection::accept(
+                config(),
+                remote_lite,
+                at(),
+                std::time::UNIX_EPOCH,
+                ConnectionEntropy::new([3; 32])
+            ),
             Err(AcceptError::UnsupportedSessionProfile)
         ));
     }
@@ -2721,7 +2822,13 @@ mod tests {
     fn input_bounds_are_enforced() {
         let oversized = SdpOffer::new("x".repeat(MAX_SDP_BYTES + 1));
         assert!(matches!(
-            Connection::accept(config(), oversized, at(), ConnectionEntropy::new([0; 32])),
+            Connection::accept(
+                config(),
+                oversized,
+                at(),
+                std::time::UNIX_EPOCH,
+                ConnectionEntropy::new([0; 32])
+            ),
             Err(AcceptError::SessionLimitExceeded)
         ));
     }
@@ -2731,7 +2838,14 @@ mod tests {
         let source = fixture("chrome");
         let no_mux = SdpOffer::new(source.as_str().replacen("a=rtcp-mux", "", 1));
         assert_eq!(
-            Connection::accept(config(), no_mux, at(), ConnectionEntropy::new([4; 32])).err(),
+            Connection::accept(
+                config(),
+                no_mux,
+                at(),
+                std::time::UNIX_EPOCH,
+                ConnectionEntropy::new([4; 32])
+            )
+            .err(),
             Some(AcceptError::InvalidOffer)
         );
         let no_fingerprint = SdpOffer::new(
@@ -2744,6 +2858,7 @@ mod tests {
                 config(),
                 no_fingerprint,
                 at(),
+                std::time::UNIX_EPOCH,
                 ConnectionEntropy::new([4; 32])
             )
             .err(),

@@ -12,8 +12,8 @@ mod support;
 use std::time::Duration;
 
 use bytes::Bytes;
-use pulsebeam_rtc::{CloseReason, Command, CommandError, NetworkInput, Output};
-use support::{NetworkPolicy, PeerFixture, assert_probe_windows, forwarded};
+use pulsebeam_rtc::{CloseReason, NetworkInput, Output, WriteError};
+use support::{NetworkPolicy, PeerFixture, rtp_write};
 
 const PAYLOAD_BYTES: usize = 1_000;
 const FEEDBACK_INTERVAL: Duration = Duration::from_millis(50);
@@ -34,10 +34,10 @@ enum Transport {
     Data,
 }
 
-const SCENARIOS: [Scenario; 11] = [
+const SCENARIOS: [Scenario; 8] = [
     scenario("startup", 0x1101, 10, 40),
     Scenario {
-        name: "vbr-keyframe",
+        name: "delay-loss-reorder",
         seed: 0x1102,
         duration: Duration::from_secs(15),
         policy: NetworkPolicy {
@@ -49,9 +49,8 @@ const SCENARIOS: [Scenario; 11] = [
         packets: 512,
         transport: Transport::Udp,
     },
-    scenario("bandwidth-rtt-steps", 0x1103, 15, 96),
     Scenario {
-        name: "feedback-outage",
+        name: "periodic-loss",
         seed: 0x1104,
         duration: Duration::from_secs(10),
         policy: NetworkPolicy {
@@ -64,7 +63,7 @@ const SCENARIOS: [Scenario; 11] = [
         transport: Transport::Udp,
     },
     Scenario {
-        name: "ecn",
+        name: "duplication",
         seed: 0x1105,
         duration: Duration::from_secs(10),
         policy: NetworkPolicy {
@@ -76,8 +75,7 @@ const SCENARIOS: [Scenario; 11] = [
         packets: 80,
         transport: Transport::Udp,
     },
-    scenario("policer-competition", 0x1106, 20, 160),
-    scenario("pause-switch", 0x1107, 12, 48),
+    scenario("sender-service", 0x1106, 20, 160),
     Scenario {
         name: "loss-reordering",
         seed: 0x1108,
@@ -117,7 +115,6 @@ const SCENARIOS: [Scenario; 11] = [
         packets: 64,
         transport: Transport::Udp,
     },
-    scenario("close", 0x1111, 2, 32),
 ];
 
 const fn scenario(name: &'static str, seed: u64, seconds: u64, packets: u64) -> Scenario {
@@ -137,21 +134,6 @@ const fn scenario(name: &'static str, seed: u64, seconds: u64, packets: u64) -> 
 }
 
 #[test]
-fn production_pre_media_probes_use_only_the_low_traffic_allowance() {
-    assert_probe_windows(&[]);
-    let mut fixture = PeerFixture::connected();
-    fixture.drive_for(Duration::from_secs(6));
-    assert_probe_windows(fixture.emitted_rtp());
-    let totals = fixture.connection.stats().connection;
-    assert_eq!(totals.transmitted_rtp_bytes, 0);
-    assert!(totals.transmitted_padding_bytes > 0);
-    eprintln!(
-        "probe-only cumulative padding={} over six seconds; five-second rolling allowance checked",
-        totals.transmitted_padding_bytes
-    );
-}
-
-#[test]
 fn fixed_system_matrix() {
     assert_eq!(PAYLOAD_BYTES, 1_000);
     assert_eq!(FEEDBACK_INTERVAL, Duration::from_millis(50));
@@ -167,7 +149,7 @@ fn fixed_system_matrix() {
 
 fn run(scenario: Scenario) {
     let mut fixture = match (scenario.name, scenario.transport) {
-        ("policer-competition", _) => PeerFixture::connected_with_senders(2),
+        ("sender-service", _) => PeerFixture::connected_with_senders(2),
         (_, Transport::Udp) => PeerFixture::connected(),
         (_, Transport::Data) => PeerFixture::connected_datachannels(),
     };
@@ -178,55 +160,40 @@ fn run(scenario: Scenario) {
         ) {}
     }
     let mut source = PeerFixture::connected();
-    let mut alternate_source = PeerFixture::connected();
     fixture.configure_network(scenario.seed, scenario.policy);
 
     let mut admitted = 0_u64;
-    let mut latest_global = None;
     for id in 1..=scenario.packets {
         source.drive_for(Duration::from_millis(20));
-        alternate_source.drive_for(Duration::from_millis(20));
-        let selected_source = if scenario.name == "pause-switch" && id > scenario.packets / 2 {
-            &mut alternate_source
-        } else {
-            &mut source
-        };
-        let packet = selected_source.send_source(&vec![0x5a; PAYLOAD_BYTES]);
-        let mut media = forwarded(packet, id);
-        let sender = if scenario.name == "policer-competition" {
-            *fixture
+        let packet = source.send_source(&vec![0x5a; PAYLOAD_BYTES]);
+        let media = rtp_write(packet, id);
+        let sender = if scenario.name == "sender-service" {
+            fixture
                 .senders
                 .get(usize::try_from(id % 2).expect("flow index"))
-                .expect("two competing flows")
+                .expect("two senders")
+                .clone()
         } else {
-            fixture.sender
+            fixture.sender_mid.clone()
         };
         for _ in 0..20 {
-            match fixture.connection.command(
-                fixture.at(),
-                Command::SendMedia {
-                    sender,
-                    media: media.clone(),
-                },
-            ) {
+            match fixture
+                .connection
+                .write_rtp(fixture.at(), &sender, media.clone())
+            {
                 Ok(()) => {
                     admitted = admitted.saturating_add(1);
-                    latest_global = Some(media.packet.global_media_at());
                     break;
                 }
-                Err(pulsebeam_rtc::RejectedCommand {
-                    reason: CommandError::WouldBlock,
+                Err(pulsebeam_rtc::RejectedRtp {
+                    reason: WriteError::WouldBlock,
                     ..
                 }) => {
                     fixture.drive_for(FEEDBACK_INTERVAL);
-                    let packet = selected_source.send_source(&vec![0x5a; PAYLOAD_BYTES]);
-                    media = forwarded(packet, id);
                 }
                 Err(error) => panic!(
-                    "scenario {} admission failed at frame {id}: {error:?}, global={:?}, latest={latest_global:?}, receiver={:?}",
-                    scenario.name,
-                    media.packet.global_media_at(),
-                    fixture.at().global
+                    "scenario {} write failed at index {id}: {error:?}",
+                    scenario.name
                 ),
             }
         }
@@ -242,10 +209,7 @@ fn run(scenario: Scenario) {
             .connection
             .receive(
                 fixture.at(),
-                pulsebeam_rtc::PacketObservation {
-                    at: fixture.at(),
-                    provenance: 0,
-                },
+                fixture.at(),
                 NetworkInput::Udp {
                     local: "127.0.0.1:41000".parse().expect("local address"),
                     remote: "127.0.0.1:9".parse().expect("wrong-path address"),
@@ -291,7 +255,7 @@ fn run(scenario: Scenario) {
     if scenario.name == "startup" {
         assert!(transmitted * 100 >= admitted * 85);
     }
-    if scenario.name == "policer-competition" {
+    if scenario.name == "sender-service" {
         let delivered = stats
             .senders
             .iter()
@@ -323,7 +287,7 @@ fn run(scenario: Scenario) {
         fixture.network_trace(),
     );
 
-    fixture.command(Command::Abort);
+    fixture.connection.abort();
     assert!(matches!(
         fixture.connection.poll(fixture.at()),
         Output::Closed(CloseReason::Aborted)

@@ -17,7 +17,7 @@ impl SentHistory {
             self.add_unknown(feedback_status_count(&batch.report));
             return;
         }
-        let received_at = batch.received_at.monotonic;
+        let received_at = batch.received_at;
         let prior_evidence = self.inputs.feedback.len();
         let feedback_hold = match batch.report {
             FeedbackReport::Twcc {

@@ -401,7 +401,7 @@ mod tests {
         let mut server_srtp =
             SrtpLayer::new(server_material, pair.profile, false, &provider).expect("server SRTP");
         let rtp = [0x80, 96, 0, 1, 0, 0, 0, 1, 0, 0, 0, 7, 1, 2, 3];
-        let protected = client_srtp.protect_rtp(&rtp).expect("protect RTP");
+        let protected = client_srtp.protect_rtp(&rtp, 1).expect("protect RTP");
         assert_ne!(protected, rtp);
         assert_eq!(
             server_srtp

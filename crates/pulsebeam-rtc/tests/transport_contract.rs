@@ -7,9 +7,8 @@
 
 use bytes::Bytes;
 use pulsebeam_rtc::{
-    AuthenticatedFlow, Command, CommandError, Connection, ConnectionConfig, ConnectionEntropy,
-    Event, GlobalMediaTime, IceTcpFlowId, LocalCandidate, LocalIceCredentials, NetworkInput,
-    Output, ReceiveError, SdpOffer, TimePoint, TransmitTarget,
+    Connection, ConnectionConfig, ConnectionEntropy, Event, LocalCandidate, LocalIceCredentials,
+    NetworkInput, Output, SdpOffer, Transmit, TransmitTarget,
 };
 use std::{net::SocketAddr, time::Instant};
 
@@ -39,11 +38,8 @@ fn request_with_nomination(username: &str, password: Option<&[u8]>, nominate: bo
     Bytes::copy_from_slice(bytes.get(..length).expect("serialized STUN length"))
 }
 
-fn connection(local: SocketAddr, tcp: bool) -> (Connection, TimePoint) {
-    let at = TimePoint {
-        monotonic: Instant::now(),
-        global: GlobalMediaTime::from_micros(1_000_000),
-    };
+fn connection(local: SocketAddr, tcp: bool) -> (Connection, Instant) {
+    let at = Instant::now();
     let accepted = Connection::accept(
         ConnectionConfig {
             local_candidates: vec![if tcp {
@@ -58,6 +54,7 @@ fn connection(local: SocketAddr, tcp: bool) -> (Connection, TimePoint) {
         },
         SdpOffer::new(include_str!("fixtures/chrome-representative.sdp")),
         at,
+        std::time::UNIX_EPOCH,
         ConnectionEntropy::new([42; 32]),
     )
     .expect("accept session");
@@ -78,12 +75,16 @@ fn connection(local: SocketAddr, tcp: bool) -> (Connection, TimePoint) {
 
 fn input(local: SocketAddr, remote: SocketAddr, tcp: bool, payload: Bytes) -> NetworkInput {
     if tcp {
-        tcp_input(
-            IceTcpFlowId::from_value(u64::from(remote.port())),
+        let mut frame = u16::try_from(payload.len())
+            .expect("frame length")
+            .to_be_bytes()
+            .to_vec();
+        frame.extend_from_slice(&payload);
+        NetworkInput::IceTcp {
             local,
             remote,
-            payload,
-        )
+            frame: Bytes::from(frame),
+        }
     } else {
         NetworkInput::Udp {
             local,
@@ -94,62 +95,19 @@ fn input(local: SocketAddr, remote: SocketAddr, tcp: bool, payload: Bytes) -> Ne
     }
 }
 
-fn tcp_input(
-    flow: IceTcpFlowId,
-    local: SocketAddr,
-    remote: SocketAddr,
-    payload: Bytes,
-) -> NetworkInput {
-    let mut frame = u16::try_from(payload.len())
-        .expect("STUN frame length")
-        .to_be_bytes()
-        .to_vec();
-    frame.extend_from_slice(&payload);
-    NetworkInput::IceTcp {
-        flow,
-        local,
-        remote,
-        frame: Bytes::from(frame),
-    }
-}
-
-fn admit_if_tcp(
-    connection: &mut Connection,
-    at: TimePoint,
-    local: SocketAddr,
-    remote: SocketAddr,
-    tcp: bool,
-) {
-    if tcp {
-        connection
-            .command(
-                at,
-                Command::AdmitIceTcpFlow {
-                    flow: IceTcpFlowId::from_value(u64::from(remote.port())),
-                    local,
-                    remote,
-                },
-            )
-            .expect("admit accepted stream");
-    }
-}
-
-fn observations(connection: &mut Connection, at: TimePoint) -> Vec<AuthenticatedFlow> {
-    let mut flows = Vec::new();
+fn replies(connection: &mut Connection, at: Instant) -> Vec<Transmit> {
+    let mut replies = Vec::new();
     for _ in 0..512 {
         match connection.poll(at) {
-            Output::Event(Event::IceAuthenticated(flow)) => flows.push(flow),
-            Output::Event(Event::Connected) => panic!("non-nominated STUN cannot establish DTLS"),
-            Output::Idle { next_wakeup } if next_wakeup.is_none_or(|next| next > at.monotonic) => {
-                return flows;
+            Output::Transmit(packet) => replies.push(packet),
+            Output::Idle { next_wakeup } if next_wakeup.is_none_or(|next| next > at) => {
+                return replies;
             }
-            Output::Closed(reason) => panic!("unexpected close: {reason:?}"),
-            // This virtual peer discards replies, which remain committed loss.
-            Output::Idle { .. } | Output::Transmit(_) | Output::Event(_) => {}
-            _ => panic!("unexpected RTC output"),
+            Output::Idle { .. } | Output::Event(Event::BandwidthEstimate(_)) => {}
+            output => panic!("unexpected protocol output: {output:?}"),
         }
     }
-    panic!("connection did not reach idle");
+    panic!("bounded protocol work did not reach idle");
 }
 
 #[test]
@@ -170,18 +128,11 @@ fn caller_budgets_alternate_owned_batches_without_draining_a_connection() {
         .expect("local");
         for _ in 0..3 {
             connection
-                .receive(
-                    *at,
-                    pulsebeam_rtc::PacketObservation {
-                        at: *at,
-                        provenance: 0,
-                    },
-                    input(local, remote, false, payload.clone()),
-                )
+                .receive(*at, *at, input(local, remote, false, payload.clone()))
                 .expect("authenticated STUN");
         }
     }
-    let mut next_wakeup = [Some(nodes[0].1.monotonic), Some(nodes[1].1.monotonic)];
+    let mut next_wakeup = [Some(nodes[0].1), Some(nodes[1].1)];
     let mut emitted = [0usize; 2];
     let mut finalized_bytes = [0u64; 2];
     let mut socket_accepted = Vec::new();
@@ -190,11 +141,11 @@ fn caller_budgets_alternate_owned_batches_without_draining_a_connection() {
     for _ in 0..16 {
         for index in 0..2 {
             let (connection, at) = &mut nodes[index];
-            if next_wakeup[index].is_none_or(|next| next > at.monotonic) {
+            if next_wakeup[index].is_none_or(|next| next > *at) {
                 continue;
             }
             // Budget exhaustion schedules an immediate continuation, not a forced drain.
-            next_wakeup[index] = Some(at.monotonic);
+            next_wakeup[index] = Some(*at);
             let mut batch = std::collections::VecDeque::new();
             for _ in 0..2 {
                 match connection.poll(*at) {
@@ -231,14 +182,14 @@ fn caller_budgets_alternate_owned_batches_without_draining_a_connection() {
             && next_wakeup
                 .iter()
                 .enumerate()
-                .all(|(index, next)| *next == Some(nodes[index].1.monotonic))
+                .all(|(index, next)| *next == Some(nodes[index].1))
         {
             alternated_before_idle = true;
         }
         if next_wakeup
             .iter()
             .enumerate()
-            .all(|(index, next)| next.is_none_or(|next| next > nodes[index].1.monotonic))
+            .all(|(index, next)| next.is_none_or(|next| next > nodes[index].1))
         {
             break;
         }
@@ -262,76 +213,53 @@ fn caller_budgets_alternate_owned_batches_without_draining_a_connection() {
 }
 
 #[test]
-fn ice_authentication_reports_exact_udp_and_tcp_tuples_before_nomination() {
-    for local in ["192.0.2.1:5000", "[2001:db8::1]:5000"] {
-        let local: SocketAddr = local.parse().expect("local");
-        let remote: SocketAddr = if local.is_ipv4() {
-            "192.0.2.2:5001"
-        } else {
-            "[2001:db8::2]:5001"
-        }
-        .parse()
-        .expect("remote");
+fn authenticated_ice_replies_use_exact_udp_and_tcp_tuples() {
+    for (local, remote) in [
+        ("192.0.2.1:5000", "192.0.2.2:5001"),
+        ("[2001:db8::1]:5000", "[2001:db8::2]:5001"),
+    ] {
+        let local = local.parse().expect("local");
+        let remote: SocketAddr = remote.parse().expect("remote");
         for tcp in [false, true] {
             let (mut connection, at) = connection(local, tcp);
-            admit_if_tcp(&mut connection, at, local, remote, tcp);
-            let username = format!("{UFRAG}:chromeufrag");
-            let payload = request(&username, Some(PASSWORD.as_bytes()));
-            for _ in 0..2 {
+            let payload = request(&format!("{UFRAG}:chromeufrag"), Some(PASSWORD.as_bytes()));
+            for remote in [remote, SocketAddr::new(remote.ip(), 5002)] {
                 connection
-                    .receive(
-                        at,
-                        pulsebeam_rtc::PacketObservation {
-                            at: at,
-                            provenance: 0,
-                        },
-                        input(local, remote, tcp, payload.clone()),
-                    )
-                    .expect("STUN input");
+                    .receive(at, at, input(local, remote, tcp, payload.clone()))
+                    .expect("authenticated input");
+                let replies = replies(&mut connection, at);
+                assert!(!replies.is_empty());
+                for packet in replies {
+                    let expected = if tcp {
+                        TransmitTarget::IceTcp { local, remote }
+                    } else {
+                        TransmitTarget::Udp {
+                            local,
+                            remote,
+                            ecn: None,
+                        }
+                    };
+                    assert_eq!(packet.target, expected);
+                    let message = if tcp {
+                        let length = u16::from_be_bytes(packet.payload[..2].try_into().unwrap());
+                        assert_eq!(usize::from(length), packet.payload.len() - 2);
+                        &packet.payload[2..]
+                    } else {
+                        packet.payload.as_ref()
+                    };
+                    assert_eq!(
+                        &message[..2],
+                        &[0x01, 0x01],
+                        "STUN success, not an unauthenticated error or DTLS"
+                    );
+                }
             }
-            let expected = if tcp {
-                AuthenticatedFlow::IceTcp {
-                    flow: IceTcpFlowId::from_value(5001),
-                    local,
-                    remote,
-                }
-            } else {
-                AuthenticatedFlow::Udp { local, remote }
-            };
-            assert_eq!(observations(&mut connection, at), vec![expected]);
-
-            let mut rebound = remote;
-            rebound.set_port(5002);
-            admit_if_tcp(&mut connection, at, local, rebound, tcp);
-            connection
-                .receive(
-                    at,
-                    pulsebeam_rtc::PacketObservation {
-                        at: at,
-                        provenance: 0,
-                    },
-                    input(local, rebound, tcp, payload),
-                )
-                .expect("rebinding input");
-            let expected = if tcp {
-                AuthenticatedFlow::IceTcp {
-                    flow: IceTcpFlowId::from_value(5002),
-                    local,
-                    remote: rebound,
-                }
-            } else {
-                AuthenticatedFlow::Udp {
-                    local,
-                    remote: rebound,
-                }
-            };
-            assert_eq!(observations(&mut connection, at), vec![expected]);
         }
     }
 }
 
 #[test]
-fn route_hints_and_invalid_ice_credentials_never_authenticate_a_flow() {
+fn route_hints_and_invalid_credentials_never_get_success_replies() {
     let local = "192.0.2.1:5000".parse().expect("local");
     let remote = "192.0.2.2:5001".parse().expect("remote");
     let username = format!("{UFRAG}:chromeufrag");
@@ -344,284 +272,42 @@ fn route_hints_and_invalid_ice_credentials_never_authenticate_a_flow() {
     ] {
         for tcp in [false, true] {
             let (mut connection, at) = connection(local, tcp);
-            admit_if_tcp(&mut connection, at, local, remote, tcp);
             connection
-                .receive(
-                    at,
-                    pulsebeam_rtc::PacketObservation {
-                        at: at,
-                        provenance: 0,
-                    },
-                    input(local, remote, tcp, payload.clone()),
-                )
+                .receive(at, at, input(local, remote, tcp, payload.clone()))
                 .expect("hostile input is isolated");
-            assert!(observations(&mut connection, at).is_empty());
+            assert!(replies(&mut connection, at).is_empty());
             assert!(connection.stats().connection.dropped_network_inputs > 0);
         }
     }
 }
 
 #[test]
-fn ice_tcp_input_carries_one_complete_frame_and_an_opaque_flow() {
-    let local = SocketAddr::from(([127, 0, 0, 1], 5000));
-    let input = NetworkInput::IceTcp {
-        flow: IceTcpFlowId::from_value(9),
-        local,
-        remote: local,
-        frame: Bytes::from_static(&[0, 1, 0]),
-    };
-    assert!(matches!(input, NetworkInput::IceTcp { .. }));
-}
-
-#[test]
-fn tcp_retirement_rejects_stale_frames_and_routes_same_tuple_replacement() {
-    for (local, remote) in [
-        ("192.0.2.1:5000", "192.0.2.2:5001"),
-        ("[2001:db8::1]:5000", "[2001:db8::2]:5001"),
-    ] {
-        let local = local.parse().expect("local");
-        let remote = remote.parse().expect("remote");
-        let (mut connection, at) = connection(local, true);
-        let first = IceTcpFlowId::from_value(1);
-        let second = IceTcpFlowId::from_value(2);
-        let admit = |flow| Command::AdmitIceTcpFlow {
-            flow,
-            local,
-            remote,
-        };
-        connection.command(at, admit(first)).expect("first stream");
-        connection
-            .command(at, admit(first))
-            .expect("idempotent admission");
-        assert_eq!(
-            connection
-                .command(at, admit(second))
-                .map_err(|rejected| rejected.reason),
-            Err(CommandError::InvalidIceTcpFlow)
-        );
-        let request = request_with_nomination(
-            &format!("{UFRAG}:chromeufrag"),
-            Some(PASSWORD.as_bytes()),
-            true,
-        );
-        connection
-            .receive(
-                at,
-                pulsebeam_rtc::PacketObservation {
-                    at: at,
-                    provenance: 0,
-                },
-                tcp_input(first, local, remote, request.clone()),
-            )
-            .expect("nomination");
-        let held = assert_tcp_reply(&mut connection, at, first, local, remote);
-        let old = held.first().expect("committed frame");
-        let mut cursor = 0;
-        let mut closed_stream_prefix = Vec::new();
-        assert_eq!(
-            write_tcp_prefix(old, first, &mut cursor, 1, &mut closed_stream_prefix),
-            Some(1)
-        );
-        assert_eq!(
-            write_tcp_prefix(old, first, &mut cursor, 0, &mut closed_stream_prefix),
-            Some(0)
-        );
-        assert_eq!(cursor, 1, "backpressure does not replay the accepted byte");
-
-        connection
-            .command(at, Command::RetireIceTcpFlow { flow: first })
-            .expect("close first");
-        connection
-            .command(at, Command::RetireIceTcpFlow { flow: first })
-            .expect("idempotent retirement");
-        assert_eq!(
-            connection.receive(
-                at,
-                pulsebeam_rtc::PacketObservation {
-                    at: at,
-                    provenance: 0
-                },
-                tcp_input(first, local, remote, request.clone())
-            ),
-            Err(ReceiveError::UnknownIceTcpFlow)
-        );
-        connection
-            .command(at, admit(second))
-            .expect("replacement stream");
-        let invalid = request_with_nomination(
-            &format!("{UFRAG}:chromeufrag"),
-            Some(b"wrongpasswordlongenough22"),
-            true,
-        );
-        connection
-            .receive(
-                at,
-                pulsebeam_rtc::PacketObservation {
-                    at: at,
-                    provenance: 0,
-                },
-                tcp_input(second, local, remote, invalid),
-            )
-            .expect("invalid credentials are isolated");
-        assert!(observations(&mut connection, at).is_empty());
-        connection
-            .receive(
-                at,
-                pulsebeam_rtc::PacketObservation {
-                    at: at,
-                    provenance: 0,
-                },
-                tcp_input(second, local, remote, request),
-            )
-            .expect("replacement nomination");
-        let replacement = assert_tcp_reply(&mut connection, at, second, local, remote);
-        let charged = connection.stats().connection.transmitted_protocol_bytes;
-        assert_eq!(
-            write_tcp_prefix(
-                old,
-                second,
-                &mut cursor,
-                usize::MAX,
-                &mut closed_stream_prefix
-            ),
-            None
-        );
-        assert_eq!(
-            closed_stream_prefix.len(),
-            1,
-            "retirement cannot retarget an old suffix"
-        );
-        drop(held);
-        assert_eq!(
-            connection.stats().connection.transmitted_protocol_bytes,
-            charged,
-            "dropping finalized output cannot refund its charge"
-        );
-        for transmit in replacement {
-            let mut cursor = 0;
-            let mut wire = Vec::new();
-            assert_eq!(
-                write_tcp_prefix(&transmit, second, &mut cursor, 1, &mut wire),
-                Some(1)
-            );
-            assert_eq!(
-                write_tcp_prefix(&transmit, second, &mut cursor, 0, &mut wire),
-                Some(0)
-            );
-            assert_eq!(
-                write_tcp_prefix(&transmit, second, &mut cursor, usize::MAX, &mut wire),
-                Some(transmit.payload.len() - 1)
-            );
-            assert_eq!(
-                wire.as_slice(),
-                transmit.payload.as_ref(),
-                "finish the exact RFC4571 frame without prefix replay"
-            );
-        }
-    }
-}
-
-fn assert_tcp_reply(
-    connection: &mut Connection,
-    at: TimePoint,
-    flow: IceTcpFlowId,
-    local: SocketAddr,
-    remote: SocketAddr,
-) -> Vec<pulsebeam_rtc::Transmit> {
-    let mut authenticated = false;
-    let mut transmits = Vec::new();
-    for _ in 0..512 {
-        match connection.poll(at) {
-            Output::Event(Event::IceAuthenticated(observed)) => {
-                assert_eq!(
-                    observed,
-                    AuthenticatedFlow::IceTcp {
-                        flow,
-                        local,
-                        remote
-                    }
-                );
-                authenticated = true;
-            }
-            Output::Transmit(transmit) => {
-                assert_eq!(transmit.target, TransmitTarget::IceTcp { flow });
-                transmits.push(transmit);
-            }
-            Output::Idle { next_wakeup } if next_wakeup.is_none_or(|next| next > at.monotonic) => {
-                assert!(authenticated, "new incarnation must authenticate");
-                assert!(
-                    !transmits.is_empty(),
-                    "ICE reply must reach this incarnation"
-                );
-                return transmits;
-            }
-            Output::Closed(reason) => panic!("unexpected close: {reason:?}"),
-            Output::Idle { .. } | Output::Event(_) => {}
-            _ => panic!("unexpected RTC output"),
-        }
-    }
-    panic!("connection did not reach idle");
-}
-
-// A bounded caller socket cursor, not RTC state or a departure receipt.
-fn write_tcp_prefix(
-    transmit: &pulsebeam_rtc::Transmit,
-    flow: IceTcpFlowId,
-    cursor: &mut usize,
-    budget: usize,
-    written: &mut Vec<u8>,
-) -> Option<usize> {
-    if !matches!(transmit.target, TransmitTarget::IceTcp { flow: target } if target == flow) {
-        return None;
-    }
-    let remaining = transmit.payload.get(*cursor..)?;
-    let accepted = remaining.len().min(budget);
-    written.extend_from_slice(remaining.get(..accepted)?);
-    *cursor = cursor.saturating_add(accepted);
-    Some(accepted)
-}
-
-#[test]
-fn tcp_retirement_cancels_unpublished_work_and_reclaims_capacity() {
+fn tcp_input_requires_exactly_one_complete_rfc4571_frame() {
     let local = "192.0.2.1:5000".parse().expect("local");
     let remote = "192.0.2.2:5001".parse().expect("remote");
     let (mut connection, at) = connection(local, true);
-    let payload = request(&format!("{UFRAG}:chromeufrag"), Some(PASSWORD.as_bytes()));
-    for value in 0..128 {
-        let flow = IceTcpFlowId::from_value(value);
-        connection
-            .command(
-                at,
-                Command::AdmitIceTcpFlow {
-                    flow,
-                    local,
-                    remote,
-                },
-            )
-            .expect("admit next incarnation");
+    for bytes in [vec![], vec![0], vec![0, 2, 0], vec![0, 1, 0, 0]] {
+        let dropped = connection.stats().connection.dropped_network_inputs;
         connection
             .receive(
                 at,
-                pulsebeam_rtc::PacketObservation {
-                    at: at,
-                    provenance: 0,
+                at,
+                NetworkInput::IceTcp {
+                    local,
+                    remote,
+                    frame: Bytes::from(bytes),
                 },
-                tcp_input(flow, local, remote, payload.clone()),
             )
-            .expect("authenticate stream");
-        connection
-            .command(at, Command::RetireIceTcpFlow { flow })
-            .expect("retire before polling");
-        for _ in 0..512 {
-            match connection.poll(at) {
-                Output::Idle { .. } => break,
-                Output::Event(Event::IceAuthenticated(_)) | Output::Transmit(_) => {
-                    panic!("retired work escaped")
-                }
-                Output::Closed(reason) => panic!("unexpected close: {reason:?}"),
-                Output::Event(_) => {}
-                _ => panic!("unexpected RTC output"),
-            }
-        }
+            .expect("malformed input is isolated");
+        assert!(replies(&mut connection, at).is_empty());
+        assert_eq!(
+            connection.stats().connection.dropped_network_inputs,
+            dropped + 1
+        );
     }
+    let payload = request(&format!("{UFRAG}:chromeufrag"), Some(PASSWORD.as_bytes()));
+    connection
+        .receive(at, at, input(local, remote, true, payload))
+        .expect("complete authenticated frame");
+    assert!(!replies(&mut connection, at).is_empty());
 }

@@ -331,7 +331,6 @@ fn extend(highest: Option<u64>, sequence: u16) -> u64 {
 mod tests {
     use super::*;
     use crate::{
-        GlobalMediaTime, TimePoint,
         rtcp::{self, ArrivalOffset, FeedbackReport, Rfc8888Status, TwccStatus},
         transport::PathEpoch,
     };
@@ -343,16 +342,8 @@ mod tests {
     fn report(receiver: &mut ReceiveFeedback, now: Instant) -> FeedbackReport {
         let bytes = receiver.poll(now, 9).expect("due report");
         assert!(bytes.len() <= 1200);
-        let mut parsed = rtcp::parse(
-            &bytes,
-            TimePoint {
-                monotonic: now,
-                global: GlobalMediaTime::from_micros(0),
-            },
-            PathEpoch::from_value(1),
-            receiver.mode,
-        )
-        .expect("valid wire RTCP");
+        let mut parsed = rtcp::parse(&bytes, now, PathEpoch::from_value(1), receiver.mode)
+            .expect("valid wire RTCP");
         assert_eq!(parsed.feedback.len(), 1);
         let feedback = parsed.feedback.pop().unwrap();
         assert_eq!(feedback.sender_ssrc, 9);

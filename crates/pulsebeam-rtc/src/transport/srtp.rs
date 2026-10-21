@@ -189,7 +189,6 @@ impl ReplayWindow {
 pub(crate) struct SrtpLayer {
     tx: SrtpContext,
     rx: SrtpContext,
-    tx_last: Vec<ReplayWindow>,
     rx_last: Vec<ReplayWindow>,
     rtcp_rx_last: Vec<ReplayWindow>,
     profile: SrtpProfile,
@@ -213,36 +212,19 @@ impl SrtpLayer {
         Ok(Self {
             tx: SrtpContext::new(provider, profile, &material, active),
             rx: SrtpContext::new(provider, profile, &material, !active),
-            tx_last: Vec::new(),
             rx_last: Vec::new(),
             rtcp_rx_last: Vec::new(),
             profile,
         })
     }
 
-    pub(crate) fn protect_rtp(&mut self, packet: &[u8]) -> Result<Vec<u8>, SrtpError> {
+    pub(crate) fn protect_rtp(&mut self, packet: &[u8], index: u64) -> Result<Vec<u8>, SrtpError> {
         let parsed = RtpHeaderFacts::parse(packet)?;
-        let index = self.next_tx_index(parsed.ssrc, parsed.sequence)?;
+        if index >= (1_u64 << 48) || u16::try_from(index & 0xffff).ok() != Some(parsed.sequence) {
+            return Err(SrtpError::InvalidPacket);
+        }
         let header = to_str0m_header_facts(&parsed);
         Ok(self.tx.protect_rtp(packet, &header, index))
-    }
-
-    fn next_tx_index(&mut self, ssrc: u32, sequence: u16) -> Result<u64, SrtpError> {
-        if let Some(window) = self.tx_last.iter_mut().find(|window| window.ssrc == ssrc) {
-            let index = extend_sequence(Some(window.highest), sequence);
-            window.highest = index;
-            return Ok(index);
-        }
-        if self.tx_last.len() >= MAX_SSRC_STATES {
-            return Err(SrtpError::OutputFull);
-        }
-        let index = extend_sequence(None, sequence);
-        self.tx_last.push(ReplayWindow {
-            ssrc,
-            highest: index,
-            bitmap: 0,
-        });
-        Ok(index)
     }
 
     pub(crate) fn protect_rtcp(&mut self, packet: &[u8]) -> Result<Vec<u8>, SrtpError> {
@@ -471,7 +453,7 @@ mod tests {
             SrtpLayer::new(KeyingMaterial::new(&material), profile, false, &provider)
                 .expect("receiver profile");
         let rtp = [0x80, 96, 0, 1, 0, 0, 0, 1, 0, 0, 0, 7, 1, 2, 3];
-        let protected = sender.protect_rtp(&rtp).expect("protected RTP");
+        let protected = sender.protect_rtp(&rtp, 1).expect("protected RTP");
         assert_ne!(protected, rtp);
         assert_eq!(
             receiver

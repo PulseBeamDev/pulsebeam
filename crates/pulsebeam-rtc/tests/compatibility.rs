@@ -1,8 +1,8 @@
 use std::{net::SocketAddr, time::Instant};
 
 use pulsebeam_rtc::{
-    AcceptError, Connection, ConnectionConfig, ConnectionEntropy, GlobalMediaTime, LocalCandidate,
-    PacketFeedbackKind, SdpOffer, TimePoint,
+    AcceptError, Connection, ConnectionConfig, ConnectionEntropy, LocalCandidate,
+    PacketFeedbackKind, SdpOffer,
 };
 
 fn accepts(offer: &'static str) -> Result<(), AcceptError> {
@@ -15,10 +15,8 @@ fn accepts(offer: &'static str) -> Result<(), AcceptError> {
             ..ConnectionConfig::default()
         },
         SdpOffer::new(offer),
-        TimePoint {
-            monotonic: Instant::now(),
-            global: GlobalMediaTime::from_micros(1),
-        },
+        Instant::now(),
+        std::time::UNIX_EPOCH,
         ConnectionEntropy::new([0x5a; 32]),
     )?;
     assert_eq!(

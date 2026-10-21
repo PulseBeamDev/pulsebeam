@@ -1,11 +1,8 @@
-startup 0x1101 10s 2Mbit 50ms
-vbr-keyframe 0x1102 15s 4Mbit 80ms
-bandwidth-rtt-steps 0x1103 15s 4-1-4Mbit 50-200ms
-feedback-outage 0x1104 10s 2Mbit 100ms outage=3-6s
-ecn 0x1105 10s 2Mbit 50ms ce=20 bleach=5-7s
-policer-competition 0x1106 20s 5Mbit policer=2Mbit flows=2
-pause-switch 0x1107 12s 4Mbit pause=4-6s switch=8s
-loss-reordering 0x1108 12s udp4-to-tcp6=5s loss=2pct
-sctp-coexistence 0x1109 10s 4Mbit rtp=3Mbit data=64KiB
-overload-malformed 0x1110 bounds=default,hard,limit+1
-close 0x1111 graceful=2s abort=separate
+startup 0x1101 delay=25ms packets=40 drain=10s
+delay-loss-reorder 0x1102 delay=40ms drop-every=100 reorder-every=50 packets=512 drain=15s
+periodic-loss 0x1104 delay=50ms drop-every=3 packets=80 drain=10s
+duplication 0x1105 delay=25ms duplicate-every=20 packets=80 drain=10s
+sender-service 0x1106 delay=25ms senders=2 packets=160 drain=20s
+loss-reordering 0x1108 delay=25ms drop-every=2 reorder-every=1 packets=48 drain=12s
+sctp-coexistence 0x1109 delay=40ms packets=64 data=64KiB drain=10s
+overload-malformed 0x1110 reorder-every=7 packets=64 malformed=wrong-tuple drain=1s

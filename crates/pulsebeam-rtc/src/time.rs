@@ -1,46 +1,4 @@
-use std::time::{Duration, Instant};
-
-#[repr(transparent)]
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct GlobalMediaTime(u64);
-
-impl GlobalMediaTime {
-    pub const fn from_micros(value: u64) -> Self {
-        Self(value)
-    }
-
-    pub const fn as_micros(self) -> u64 {
-        self.0
-    }
-
-    pub const fn to_be_bytes(self) -> [u8; 8] {
-        self.0.to_be_bytes()
-    }
-
-    pub const fn from_be_bytes(bytes: [u8; 8]) -> Self {
-        Self(u64::from_be_bytes(bytes))
-    }
-
-    pub fn checked_add(self, duration: Duration) -> Option<Self> {
-        let micros = u64::try_from(duration.as_micros()).ok()?;
-        self.0.checked_add(micros).map(Self)
-    }
-
-    pub fn checked_sub(self, duration: Duration) -> Option<Self> {
-        let micros = u64::try_from(duration.as_micros()).ok()?;
-        self.0.checked_sub(micros).map(Self)
-    }
-
-    pub fn checked_duration_since(self, earlier: Self) -> Option<Duration> {
-        self.0.checked_sub(earlier.0).map(Duration::from_micros)
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct TimePoint {
-    pub monotonic: Instant,
-    pub global: GlobalMediaTime,
-}
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 pub struct ConnectionEntropy([u8; 32]);
 
@@ -56,14 +14,52 @@ impl ConnectionEntropy {
     }
 }
 
+/// Fixed protocol wall-clock anchor. Subsequent progress uses monotonic time only.
+pub(crate) struct ProtocolClock {
+    instant: Instant,
+    ntp_nanos: i128,
+}
+
+impl ProtocolClock {
+    pub(crate) fn new(instant: Instant, wallclock: SystemTime) -> Self {
+        let unix_nanos = match wallclock.duration_since(UNIX_EPOCH) {
+            Ok(duration) => i128::try_from(duration.as_nanos()).unwrap_or(i128::MAX),
+            Err(error) => i128::try_from(error.duration().as_nanos())
+                .unwrap_or(i128::MAX)
+                .saturating_neg(),
+        };
+        Self {
+            instant,
+            ntp_nanos: unix_nanos.saturating_add(2_208_988_800_000_000_000),
+        }
+    }
+
+    pub(crate) fn ntp(&self, at: Instant) -> (u32, u32) {
+        let delta = if at >= self.instant {
+            i128::try_from(at.duration_since(self.instant).as_nanos()).unwrap_or(i128::MAX)
+        } else {
+            i128::try_from(self.instant.duration_since(at).as_nanos())
+                .unwrap_or(i128::MAX)
+                .saturating_neg()
+        };
+        let nanos = self.ntp_nanos.saturating_add(delta);
+        let seconds = nanos.div_euclid(1_000_000_000).rem_euclid(1_i128 << 32);
+        let fraction = (nanos.rem_euclid(1_000_000_000) << 32) / 1_000_000_000;
+        (
+            u32::try_from(seconds).unwrap_or_default(),
+            u32::try_from(fraction).unwrap_or_default(),
+        )
+    }
+}
+
 pub(crate) struct MonotonicObserver {
-    last: TimePoint,
+    last: Instant,
     regressions: u64,
     warning_pending: bool,
 }
 
 impl MonotonicObserver {
-    pub(crate) const fn starting_at(at: TimePoint) -> Self {
+    pub(crate) const fn starting_at(at: Instant) -> Self {
         Self {
             last: at,
             regressions: 0,
@@ -71,26 +67,14 @@ impl MonotonicObserver {
         }
     }
 
-    pub(crate) fn observe(&mut self, at: TimePoint) -> TimePoint {
-        self.observe_with_debug_assertions::<{ cfg!(debug_assertions) }>(at)
-    }
-
-    fn observe_with_debug_assertions<const ASSERT: bool>(
-        &mut self,
-        mut at: TimePoint,
-    ) -> TimePoint {
-        let last = self.last;
-        let monotonic_regressed = at.monotonic < last.monotonic;
-        let global_regressed = at.global < last.global;
-        if monotonic_regressed || global_regressed {
-            assert!(!ASSERT, "connection time regressed");
-            at.monotonic = at.monotonic.max(last.monotonic);
-            at.global = at.global.max(last.global);
+    pub(crate) fn observe(&mut self, at: Instant) -> Instant {
+        if at < self.last {
+            debug_assert!(false, "connection time regressed");
             self.regressions = self.regressions.saturating_add(1);
             self.warning_pending = true;
         }
-        self.last = at;
-        at
+        self.last = at.max(self.last);
+        self.last
     }
 
     pub(crate) const fn regressions(&self) -> u64 {
@@ -105,47 +89,20 @@ impl MonotonicObserver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
-    #[should_panic(expected = "connection time regressed")]
-    fn debug_observer_asserts_on_regression() {
+    fn fixed_anchor_preserves_fraction_and_ntp_era_wrap() {
         let start = Instant::now();
-        let mut observer = MonotonicObserver::starting_at(TimePoint {
-            monotonic: start,
-            global: GlobalMediaTime::from_micros(0),
-        });
-        observer.observe_with_debug_assertions::<true>(TimePoint {
-            monotonic: start + Duration::from_millis(1),
-            global: GlobalMediaTime::from_micros(1),
-        });
-        observer.observe_with_debug_assertions::<true>(TimePoint {
-            monotonic: start,
-            global: GlobalMediaTime::from_micros(0),
-        });
-    }
-
-    #[test]
-    fn release_observer_clamps_and_counts_regression() {
-        let start = Instant::now();
-        let mut observer = MonotonicObserver::starting_at(TimePoint {
-            monotonic: start,
-            global: GlobalMediaTime::from_micros(0),
-        });
-        let accepted = TimePoint {
-            monotonic: start + Duration::from_millis(2),
-            global: GlobalMediaTime::from_micros(20),
-        };
-        observer.observe_with_debug_assertions::<false>(accepted);
-
-        let clamped = observer.observe_with_debug_assertions::<false>(TimePoint {
-            monotonic: start,
-            global: GlobalMediaTime::from_micros(10),
-        });
-
-        assert_eq!(clamped.monotonic, accepted.monotonic);
-        assert_eq!(clamped.global, accepted.global);
-        assert_eq!(observer.regressions(), 1);
-        assert!(observer.take_warning());
-        assert!(!observer.take_warning());
+        let clock = ProtocolClock::new(
+            start,
+            UNIX_EPOCH + Duration::new(2_085_978_495, 500_000_000),
+        );
+        assert_eq!(clock.ntp(start), (u32::MAX, 1 << 31));
+        assert_eq!(clock.ntp(start + Duration::from_secs(1)), (0, 1 << 31));
+        assert_eq!(
+            clock.ntp(start - Duration::from_millis(250)),
+            (u32::MAX, 1 << 30)
+        );
     }
 }
