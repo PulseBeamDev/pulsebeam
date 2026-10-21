@@ -14,6 +14,7 @@ pub mod monitor;
 pub mod normalize;
 pub mod switcher;
 pub mod sync;
+pub mod time;
 pub mod timeline;
 
 #[cfg(test)]
@@ -24,9 +25,9 @@ pub mod conformance;
     reason = "str0m's RtpWrite::new takes payload: Arc<[u8]>; kept core-local, see module note"
 )]
 use std::sync::Arc;
-use str0m::media::{Frequency, MediaTime};
-use str0m::rtp::rtcp::SenderInfo;
 use str0m::rtp::{ExtensionValues, SeqNo, Ssrc};
+use sync::SenderInfo;
+pub use time::{Frequency, MediaTime};
 use tokio::time::Instant;
 
 use crate::entity::{ParticipantId, TrackId};
@@ -133,14 +134,24 @@ impl RtpPacket {
             Codec::Opus => true, // audio frame has not dependencies,
         };
 
-        let sr = rtp.last_sender_info;
+        let sr = rtp.last_sender_info.map(|report| SenderInfo {
+            ssrc: report.ssrc,
+            rtp_time: MediaTime::new(
+                report.rtp_time.numer(),
+                Frequency::from_nonzero(report.rtp_time.frequency().into()),
+            ),
+            ntp_time: crate::clock::NtpTime::from_system_time(report.ntp_time),
+        });
         let pkt = Self {
             ssrc: rtp.header.ssrc,
             marker: rtp.header.marker,
             ext_vals: rtp.header.ext_vals,
             header_len: rtp.header.header_len,
             seq_no: rtp.seq_no,
-            rtp_ts: rtp.time,
+            rtp_ts: MediaTime::new(
+                rtp.time.numer(),
+                Frequency::from_nonzero(rtp.time.frequency().into()),
+            ),
             arrival_ts: rtp.timestamp.into(),
             playout_time: rtp.timestamp.into(),
             is_keyframe: is_keyframe_start,

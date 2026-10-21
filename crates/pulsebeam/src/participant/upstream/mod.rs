@@ -6,6 +6,7 @@ mod video;
 mod binding_tests;
 
 use crate::keys::TrackHandle;
+use crate::rtp::sync::SenderInfo;
 use crate::{
     entity::{ConnectionId, TrackId, TrackKind},
     log::{LogCtx, plog_warn},
@@ -17,7 +18,6 @@ pub(crate) use audio::UpstreamAudio;
 pub(crate) use data::UpstreamData;
 use str0m::media::Mid;
 use str0m::rtp::Ssrc;
-use str0m::rtp::rtcp::SenderInfo;
 use tokio::time::Instant;
 pub(crate) use video::UpstreamVideo;
 

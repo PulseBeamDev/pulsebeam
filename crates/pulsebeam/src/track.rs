@@ -13,6 +13,7 @@ use crate::entity::TrackId;
 use crate::entity::{ParticipantId, TrackKind};
 use crate::id::ShardId;
 use crate::rtp::normalize::{Normalization, StreamFacts, StreamNormalizer};
+use crate::rtp::sync::SenderInfo;
 use crate::rtp::{
     self, RtpPacket,
     monitor::{StreamMonitor, StreamStats},
@@ -22,7 +23,6 @@ pub use data_track::*;
 pub use pulsebeam_core::simulcast::LayerQuality;
 use str0m::media::{Mid, Pt, Rid, SimulcastLayer};
 use str0m::rtp::Ssrc;
-use str0m::rtp::rtcp::SenderInfo;
 use tokio::time::Instant;
 
 pub type StreamId = (TrackId, Option<Rid>);

@@ -5,8 +5,9 @@
 //! would replay the wrong window and hand the decoder a segment that does not
 //! start at a keyframe.
 
+use crate::rtp::MediaTime;
 use crate::rtp::RtpPacket;
-use str0m::media::{MediaTime, Rid};
+use str0m::media::Rid;
 use str0m::rtp::SeqNo;
 
 /// No packet in this slot.

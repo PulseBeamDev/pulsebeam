@@ -2,11 +2,11 @@ use std::collections::VecDeque;
 use std::net::SocketAddr;
 
 use crate::participant::batcher::{Batcher, NetworkEgress, OwnedPacketQueue};
-use crate::rtp::{Codec as RtpCodec, RtpPacket};
+use crate::rtp::{Codec as RtpCodec, MediaTime, RtpPacket};
 use pulsebeam_runtime::net::RecvPacketBatch;
 use str0m::channel::ChannelId;
 use str0m::format::Codec;
-use str0m::media::{KeyframeRequest, KeyframeRequestKind, MediaKind, MediaTime, Mid, Pt, Rid};
+use str0m::media::{KeyframeRequest, KeyframeRequestKind, MediaKind, Mid, Pt, Rid};
 use str0m::net::Protocol;
 use str0m::rtp::RtpWrite;
 use str0m::{Event, Output, Rtc, RtcError};
@@ -21,8 +21,14 @@ fn egress_extension_values(
     ext_vals
         .user_values
         .remove::<str0m::rtp::vla::VideoLayersAllocation>();
-    ext_vals.play_delay_min = playout_delay.map(|(min, _)| min);
-    ext_vals.play_delay_max = playout_delay.map(|(_, max)| max);
+    let transport_time = |time: MediaTime| {
+        str0m::media::MediaTime::new(
+            time.numer(),
+            str0m::media::Frequency::from_nonzero(time.frequency().nonzero()),
+        )
+    };
+    ext_vals.play_delay_min = playout_delay.map(|(min, _)| transport_time(min));
+    ext_vals.play_delay_max = playout_delay.map(|(_, max)| transport_time(max));
     ext_vals
 }
 
@@ -68,7 +74,7 @@ pub(crate) struct RtpIngress {
     pub(crate) mid: Mid,
     pub(crate) rid: Option<Rid>,
     pub(crate) packet: RtpPacket,
-    pub(crate) sender_info: Option<str0m::rtp::rtcp::SenderInfo>,
+    pub(crate) sender_info: Option<crate::rtp::sync::SenderInfo>,
 }
 
 pub(crate) enum AppliedMutation {
@@ -531,7 +537,10 @@ mod tests {
         assert_eq!(default.play_delay_max, None);
         let fixed = egress_extension_values(
             ingress,
-            Some((MediaTime::from_millis(50), MediaTime::from_millis(80))),
+            Some((
+                crate::rtp::MediaTime::from_millis(50),
+                crate::rtp::MediaTime::from_millis(80),
+            )),
         );
         assert_eq!(fixed.play_delay_min, Some(MediaTime::from_millis(50)));
         assert_eq!(fixed.play_delay_max, Some(MediaTime::from_millis(80)));

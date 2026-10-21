@@ -1,7 +1,7 @@
 use super::UpstreamMedia;
+use crate::rtp::sync::SenderInfo;
 use crate::{entity::TrackId, log::LogCtx, rtp::RtpPacket, track::UpstreamTrack};
 use str0m::media::Mid;
-use str0m::rtp::rtcp::SenderInfo;
 use tokio::time::Instant;
 
 pub(crate) struct UpstreamVideo {
