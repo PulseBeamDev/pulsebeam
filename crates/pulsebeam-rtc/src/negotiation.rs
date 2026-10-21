@@ -647,6 +647,16 @@ fn negotiate_inner(
             kind,
             mid: Arc::from(section.facts.mid.as_str()),
             codec: *codec,
+            extensions: section
+                .facts
+                .extensions
+                .iter()
+                .filter(|extension| extension.direction.allows_send())
+                .map(|extension| crate::RtpExtensionInfo {
+                    id: extension.id,
+                    uri: Arc::from(extension.uri.as_str()),
+                })
+                .collect(),
             signals_playout_delay: section.facts.extensions.iter().any(|extension| {
                 extension.direction.allows_send() && extension.uri == PLAYOUT_DELAY_URI
             }),
@@ -2305,6 +2315,20 @@ mod tests {
                 })
                 .unwrap();
             assert_eq!(extension.direction, expected);
+            let sender = result
+                .session
+                .senders
+                .iter()
+                .find(|sender| sender.receiver_index == 1)
+                .unwrap();
+            let mapping = sender
+                .extensions
+                .iter()
+                .find(|mapping| mapping.uri.as_ref() == extension.uri);
+            assert_eq!(
+                mapping.map(|mapping| mapping.id),
+                expected.allows_send().then_some(5)
+            );
             assert!(
                 result.answer.as_str().contains(&format!(
                     "a=extmap:5{answered} http://www.webrtc.org/experiments/rtp-hdrext/video-dependency-descriptor"

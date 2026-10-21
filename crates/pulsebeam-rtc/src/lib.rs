@@ -51,8 +51,8 @@ pub use session::{
     CodecInfo, CodecProfile, ConnectionConfig, ConnectionLimits, DataChannelConfig,
     DataChannelConfigError, DataChannelPriority, DataMessage, DataReliability, DeliveryConstraints,
     InboundMediaInfo, LocalCandidate, LocalIceCredentials, MediaKind, MediaPayloadBitrate,
-    PacketFeedbackKind, PlayoutDelay, PolicyError, SdpAnswer, SdpOffer, SenderAssignment,
-    SenderInfo, SessionInfo, UnknownExtensionPolicy,
+    PacketFeedbackKind, PlayoutDelay, PolicyError, RtpExtensionInfo, SdpAnswer, SdpOffer,
+    SenderAssignment, SenderInfo, SessionInfo, UnknownExtensionPolicy,
 };
 pub use time::{ConnectionEntropy, GlobalMediaTime, TimePoint};
 

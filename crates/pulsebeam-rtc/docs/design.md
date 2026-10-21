@@ -235,12 +235,18 @@ pub struct InboundMediaInfo {
     pub codecs: Arc<[CodecInfo]>,
 }
 
+pub struct RtpExtensionInfo {
+    pub id: u8,
+    pub uri: Arc<str>,
+}
+
 pub struct SenderInfo {
     pub id: SenderId,
     pub receiver_index: u32,
     pub kind: MediaKind,
     pub mid: Arc<str>,
     pub codec: CodecInfo,
+    pub extensions: Arc<[RtpExtensionInfo]>,
     pub signals_playout_delay: bool,
 }
 
@@ -256,9 +262,12 @@ pub enum EcnCodepoint {
 `SessionInfo` is immutable. `sender_index` and `receiver_index` are the remote
 endpoint's zero-based SDP media-section positions, including non-RTP sections in
 the count. They resolve signaling coordinates to inbound media and stable
-`SenderId` resources without making MID public signaling identity. Payload types,
-SSRCs, ICE credentials, fingerprints, RTCP parser values, and extension wire IDs
-remain connection internals.
+`SenderId` resources without making MID public signaling identity. Codec payload
+types and outbound extension wire IDs are negotiated packet-construction facts.
+`SenderInfo.extensions` includes only mappings that permit sending to that
+receiver; receive-only and inactive mappings are absent. Exposing those IDs does
+not transfer negotiation or transport-feedback ownership to the SFU. SSRCs, ICE
+credentials, fingerprints, and RTCP parser values remain connection internals.
 
 ### Network input and output
 

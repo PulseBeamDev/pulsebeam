@@ -133,6 +133,13 @@ pub struct InboundMediaInfo {
     pub codecs: Arc<[CodecInfo]>,
 }
 
+/// An outbound negotiated RTP extension mapping, independent of media semantics.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RtpExtensionInfo {
+    pub id: u8,
+    pub uri: Arc<str>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SenderInfo {
     pub id: SenderId,
@@ -140,6 +147,8 @@ pub struct SenderInfo {
     pub kind: MediaKind,
     pub mid: Arc<str>,
     pub codec: CodecInfo,
+    /// Mappings the SFU uses to construct receiver-facing RTP extensions.
+    pub extensions: Arc<[RtpExtensionInfo]>,
     pub signals_playout_delay: bool,
 }
 
