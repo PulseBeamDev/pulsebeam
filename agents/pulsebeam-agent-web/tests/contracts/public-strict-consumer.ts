@@ -1,5 +1,7 @@
 import {
   createAgent,
+  track,
+  type DataEvent,
   createCaptureSource,
   attachRemoteMedia,
   attachRemoteVideo,
@@ -24,6 +26,44 @@ import { createManagedAgent } from "../../web/index.js";
 import type { ManagedAgent } from "../../web/index.js";
 // @ts-expect-error There is one direct constructor spelling.
 import { createWebAgent } from "../../web/index.js";
+
+const binaryAgent = createAgent({
+  endpoint: "https://pulsebeam.example",
+  token: "opaque",
+});
+const binarySpec = track.data("chat", "ordered");
+const binary = binaryAgent.track(binarySpec);
+const binarySend: Promise<void> = binary.send(new Uint8Array([0, 255]));
+const binaryEvents: AsyncIterableIterator<DataEvent<"ordered">> = binary.events(
+  { signal: new AbortController().signal },
+);
+const remoteBinary = binaryAgent.remote.participant("alice").track(binarySpec);
+const remoteId: string | null = remoteBinary.id;
+const remoteActive: boolean = remoteBinary.active;
+const remoteEvents: AsyncIterableIterator<DataEvent<"ordered">> =
+  remoteBinary.events();
+void [binarySend, binaryEvents, remoteEvents, remoteId, remoteActive];
+// @ts-expect-error Descriptors are immutable values.
+binarySpec.label = "different";
+// @ts-expect-error Data delivery is explicit.
+track.data("chat");
+// @ts-expect-error No string codec in the SDK.
+binary.send("text");
+// @ts-expect-error No JSON codec in the SDK.
+binary.send({ text: "text" });
+// @ts-expect-error Remote data handles are receive-only.
+remoteBinary.send(new Uint8Array());
+// @ts-expect-error Local data handles have no publication method.
+binary.publish(new Uint8Array());
+declare const lossyEvent: DataEvent<"lossy">;
+// @ts-expect-error Only ordered data streams include gaps.
+lossyEvent.from;
+declare const binaryMessage: Extract<DataEvent, { type: "message" }>;
+const binarySequence: bigint = binaryMessage.sequence;
+const binaryPayload: Uint8Array = binaryMessage.data;
+// @ts-expect-error Message identity is trackId, not the old topic identity API.
+binaryMessage.dataTrackId;
+void [binarySequence, binaryPayload];
 
 declare const audioTrack: MediaStreamTrack;
 declare const audioElement: HTMLAudioElement;

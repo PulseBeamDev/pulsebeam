@@ -68,6 +68,18 @@ export async function resourceContract(BrowserRuntime) {
       pulsebeamCode: "ownership",
     });
     await resource({ op: "release", owner: replacementAudio.owner });
+    const concurrent = await Promise.all(
+      Array.from({ length: 40 }, () => resource({ op: "receiveData", spec })),
+    );
+    assert.equal(runtime.snapshot().topics.subscribers.length, 1);
+    await Promise.all(
+      concurrent.map(({ owner }) => resource({ op: "release", owner })),
+    );
+    assert.deepEqual(
+      runtime.snapshot().topics.subscribers,
+      [],
+      "mailbox backpressure cannot discard owner release",
+    );
     runtime.replace_desired({
       connected: false,
       topics: Array.from({ length: 64 }, (_, index) => ({
@@ -86,8 +98,10 @@ export async function resourceContract(BrowserRuntime) {
       "resource ownership alone does not establish transport",
     );
   } finally {
+    const unfinished = resource({ op: "claimAudio" });
     runtime.close();
     runtime.abort();
     runtime.free();
+    await assert.rejects(unfinished, /closed|canceled|running/);
   }
 }

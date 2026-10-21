@@ -4,6 +4,7 @@ import {
   RemoteCatalog,
   attachRemoteVideo,
 } from "../../unit-javascript/remote-catalog.js";
+import { DataRegistry } from "../../unit-javascript/data.js";
 import {
   Video,
   Resize,
@@ -33,9 +34,15 @@ test("production attachment policy derives demand from controlled geometry and v
   };
   const agent = { getSnapshot: () => snapshot, subscribe: () => () => {} };
   let demand = [];
-  const catalog = new RemoteCatalog(agent, 1, (next) => {
-    demand = next;
-  });
+  snapshot.catalog.tracks = snapshot.catalog.publications;
+  const catalog = new RemoteCatalog(
+    agent,
+    new DataRegistry(agent),
+    1,
+    (next) => {
+      demand = next;
+    },
+  );
   catalog.update(snapshot);
   const handle = catalog.participant("alice").video("camera");
   handle.setReceiveOptions({ minHeight: 720 });

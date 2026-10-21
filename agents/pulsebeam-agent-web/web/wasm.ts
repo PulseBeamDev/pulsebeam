@@ -2,14 +2,15 @@ import initializeWasm, {
   BrowserRuntime,
 } from "../dist/wasm/pulsebeam_agent_web.js";
 
-const initialization = initializeWasm().then((wasm) => {
-  return wasm;
-});
-
-void initialization.catch(() => {});
+let initialization: Promise<void> | undefined;
 
 export { BrowserRuntime };
 
 export function whenInitialized(): Promise<void> {
-  return initialization.then(() => undefined);
+  return (initialization ??= initializeWasm()
+    .then(() => undefined)
+    .catch((error: unknown) => {
+      initialization = undefined;
+      throw error;
+    }));
 }

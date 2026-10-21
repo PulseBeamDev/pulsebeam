@@ -3,6 +3,9 @@ import type {
   CapturedVideoTrack,
 } from "./capture-source.js";
 
+import type { DataTrackSpec, Delivery } from "./track.js";
+import type { LocalDataTrack, RemoteDataTrack } from "./data.js";
+
 export type MediaKind = "audio" | "video";
 
 export interface LocalVideoTrack {
@@ -181,6 +184,7 @@ export interface ReceiveOptions {
 
 export interface RemoteVideoTrack {
   readonly kind: "video";
+  readonly id: string | null;
   /** External application participant identity, not a canonical runtime ID. */
   readonly participantId: string;
   readonly label: string;
@@ -191,6 +195,8 @@ export interface RemoteVideoTrack {
 
 export interface RemoteAudioTrack {
   readonly kind: "audio";
+  readonly id: string | null;
+  readonly active: boolean;
   readonly participantId: string;
   readonly label: string;
   readonly receiving: boolean;
@@ -206,8 +212,16 @@ export interface LocalMedia {
   audio(label: string): LocalAudioTrack;
 }
 
+export type RemotePublishedTrack =
+  | RemoteVideoTrack
+  | RemoteAudioTrack
+  | RemoteDataTrack;
+
 export interface RemoteParticipant {
   readonly participantId: string;
+  readonly active: boolean;
+  readonly tracks: readonly RemotePublishedTrack[];
+  track<D extends Delivery>(spec: DataTrackSpec<D>): RemoteDataTrack<D>;
   video(label: string): RemoteVideoTrack;
   audio(label: string): RemoteAudioTrack;
   readonly videoTracks: readonly RemoteVideoTrack[];
@@ -436,6 +450,7 @@ export interface Agent {
   readonly authorizationExpiresAt: number | null;
   readonly local: LocalMedia;
   readonly remote: RemoteMedia;
+  track<D extends Delivery>(spec: DataTrackSpec<D>): LocalDataTrack<D>;
   topic<T>(name: string, options: { readonly mode: TopicMode }): Topic<T>;
   connect(): void;
   disconnect(): void;

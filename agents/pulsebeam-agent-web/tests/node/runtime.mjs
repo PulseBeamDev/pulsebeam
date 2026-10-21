@@ -14,7 +14,9 @@ const config = {
   topology: { localVideos: 1 },
 };
 if (process.argv[2] === "initialization-failure") {
+  let attempts = 0;
   globalThis.fetch = async () => {
+    attempts++;
     throw new Error("controlled artifact fetch failure");
   };
   const { createAgent } = await import("../../node_assets/dist/index.js");
@@ -31,9 +33,32 @@ if (process.argv[2] === "initialization-failure") {
   agent.setState({ connected: false });
   assert.equal(agent.getSnapshot().failure, observed);
   assert.equal(agent.connection, "terminal-failure");
+  await import("./platform.mjs");
+  globalThis.fetch = async () => {
+    attempts++;
+    return new Response(bytes, {
+      headers: { "Content-Type": "application/wasm" },
+    });
+  };
+  const recovered = new Promise((resolve) => {
+    const unsubscribe = agent.subscribe(() => {
+      if (agent.getSnapshot().desiredRevision > 0) {
+        unsubscribe();
+        resolve();
+      }
+    });
+  });
+  agent.connect();
+  await recovered;
+  assert.equal(
+    attempts,
+    2,
+    "explicit connect permits another initialization attempt",
+  );
+  assert.equal(agent.error, null);
   agent.close();
   console.log(
-    "artifact fetch failure remains terminal through desired-state updates",
+    "artifact fetch failure persists through state updates and explicit connect retries initialization",
   );
 } else if (process.argv[2] === "raw-loader-race") {
   const { default: initialize, BrowserRuntime } = await import(
@@ -122,10 +147,7 @@ if (process.argv[2] === "initialization-failure") {
   const { resourceContract } = await import("./resource-contract.mjs");
   await resourceContract(BrowserRuntime);
   const { topicContract } = await import("./topic-contract.mjs");
-  await topicContract(
-    await import("../../node_assets/dist/index.js"),
-    BrowserRuntime,
-  );
+  await topicContract(await import("../../node_assets/dist/index.js"));
   console.log(
     "emitted WASM authoritative binding, lossless u64 events and admission cancellation passed",
   );

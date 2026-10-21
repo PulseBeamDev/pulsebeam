@@ -3,6 +3,23 @@ export {
   LocalTrackCapacityError,
   RelationshipOwnershipError,
 } from "./agent.js";
+export { track } from "./track.js";
+export type {
+  TrackSpec,
+  VideoTrackSpec,
+  AudioTrackSpec,
+  DataTrackSpec,
+  Delivery,
+} from "./track.js";
+export { DataError } from "./data.js";
+export type {
+  LocalDataTrack,
+  RemoteDataTrack,
+  DataEvent,
+  DataMessage,
+  DataGap,
+  DataEventsOptions,
+} from "./data.js";
 export { createCaptureSource, nativeCaptureTrack } from "./capture-source.js";
 export type {
   CapturedAudioTrack,

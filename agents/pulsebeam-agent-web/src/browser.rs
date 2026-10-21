@@ -577,22 +577,28 @@ impl BrowserRuntime {
         Ok(())
     }
 
-    pub async fn resource(&self, command: JsValue) -> Result<JsValue, JsValue> {
+    #[wasm_bindgen(unchecked_return_type = "Promise<any>")]
+    pub fn resource(&self, command: JsValue) -> Result<js_sys::Promise, JsValue> {
         self.inner.ensure_open()?;
         let command = resources::command(command)?;
-        let completion = self
+        let actor = self
             .inner
             .actor
             .borrow()
-            .as_ref()
-            .ok_or_else(|| js_error("runtime actor not initialized"))?
-            .send_resource(command)
-            .map_err(js_error)?;
-        let result = completion
-            .await
-            .map_err(|_| js_error("resource operation was canceled"))?;
-        self.inner.ensure_open()?;
-        result.map(resources::result).map_err(resources::error)
+            .clone()
+            .ok_or_else(|| js_error("runtime actor not initialized"))?;
+        let inner = Rc::downgrade(&self.inner);
+        Ok(future_to_promise(async move {
+            let completion = actor.send_resource(command).await.map_err(js_error)?;
+            let result = completion
+                .await
+                .map_err(|_| js_error("resource operation was canceled"))?;
+            inner
+                .upgrade()
+                .ok_or_else(|| js_error("runtime is closed"))?
+                .ensure_open()?;
+            result.map(resources::result).map_err(resources::error)
+        }))
     }
 
     pub fn renew_authorization(&self, token: String) -> Result<(), JsValue> {

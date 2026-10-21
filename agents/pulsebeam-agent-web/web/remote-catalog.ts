@@ -1,5 +1,7 @@
 import { attachRemoteMedia } from "./remote-media.js";
 import { RemoteAudioPlayback } from "./remote-audio.js";
+import type { DataRegistry, RemoteDataTrack } from "./data.js";
+import { track, type DataTrackSpec, type Delivery } from "./track.js";
 import type {
   Agent,
   AgentSnapshot,
@@ -8,6 +10,7 @@ import type {
   ReceiveOptions,
   RemoteAudioTrack,
   RemoteParticipant,
+  RemotePublishedTrack,
   RemoteMediaAttachment,
   RemoteMediaAttachmentOptions,
   RemoteVideoTrack,
@@ -79,6 +82,9 @@ class VideoHandle implements RemoteVideoTrack {
     readonly label: string,
   ) {
     videoOwners.set(this, this);
+  }
+  get id(): string | null {
+    return this.publicationId ?? null;
   }
   get active(): boolean {
     return this.publicationId !== undefined;
@@ -169,6 +175,12 @@ class AudioHandle implements RemoteAudioTrack {
     readonly participantId: string,
     readonly label: string,
   ) {}
+  get id(): string | null {
+    return this.publicationId ?? null;
+  }
+  get active(): boolean {
+    return this.publicationId !== undefined;
+  }
   get receiving(): boolean {
     return this.#binding !== undefined;
   }
@@ -200,6 +212,13 @@ class ParticipantHandle implements RemoteParticipant {
   readonly audios = new Map<string, AudioHandle>();
   videoTracks: readonly RemoteVideoTrack[] = Object.freeze([]);
   audioTracks: readonly RemoteAudioTrack[] = Object.freeze([]);
+  tracks: readonly RemotePublishedTrack[] = Object.freeze([]);
+  get active(): boolean {
+    return this.catalog.participants.includes(this);
+  }
+  track<D extends Delivery>(spec: DataTrackSpec<D>): RemoteDataTrack<D> {
+    return this.catalog.data.remote(spec, this.participantId);
+  }
   constructor(
     readonly catalog: RemoteCatalog,
     readonly participantId: string,
@@ -235,6 +254,7 @@ export class RemoteCatalog implements RemoteMedia {
   audioTracks: readonly RemoteAudioTrack[] = Object.freeze([]);
   constructor(
     readonly agent: Agent,
+    readonly data: DataRegistry,
     private readonly capacity: number,
     private readonly onChange: (video: readonly VideoDemand[]) => void,
     logLevel: LogLevel = "warn",
@@ -310,6 +330,18 @@ export class RemoteCatalog implements RemoteMedia {
         const id = audioIds.get(handle);
         handle.bind(id, id === undefined ? undefined : receivers.get(id));
       }
+      participant.tracks = collection(
+        participant.tracks,
+        snapshot.catalog.tracks
+          .filter((entry) => entry.participantId === participant.participantId)
+          .map((entry) =>
+            entry.kind === "data"
+              ? participant.track(track.data(entry.label, entry.delivery))
+              : entry.kind === "video"
+                ? participant.video(entry.label)
+                : participant.audio(entry.label),
+          ),
+      );
       participant.videoTracks = collection(
         participant.videoTracks,
         videos.filter(
@@ -400,6 +432,7 @@ export class RemoteCatalog implements RemoteMedia {
       for (const handle of participant.audios.values()) handle.close();
       participant.videoTracks = Object.freeze([]);
       participant.audioTracks = Object.freeze([]);
+      participant.tracks = Object.freeze([]);
     }
     this.#slots.clear();
     this.#warned.clear();

@@ -75,7 +75,7 @@ const frame = (kind, sequence, payload) =>
 
 // Control only platform and server outcomes. Production WASM owns admission,
 // Catalog validation, identity projection, topic decoding and cancellation.
-export async function topicContract(pulsebeam, BrowserRuntime) {
+export async function topicContract(pulsebeam) {
   const previous = Object.fromEntries(
     [
       "RTCPeerConnection",
@@ -389,43 +389,77 @@ export async function topicContract(pulsebeam, BrowserRuntime) {
     agent.close();
     await closed;
     assert.deepEqual(await iterator.next(), { done: true, value: undefined });
-    const owned = new BrowserRuntime({
+    const ownedConfig = {
       endpoint: "http://localhost",
       token: "owned-binary",
-      logLevel: "off",
+      logging: { level: "off" },
       topology: {
         localVideos: 0,
         localAudios: 0,
         remoteVideos: 0,
         remoteAudios: 0,
       },
-    });
+    };
+    const owned = pulsebeam.createAgent(ownedConfig);
     try {
-      const resource = (command) => owned.resource(command);
-      const spec = { kind: "data", label: "events", delivery: "ordered" };
-      const all = await resource({ op: "receiveData", spec });
-      const alice = await resource({
-        op: "receiveData",
-        spec,
-        participantId: "alice",
+      await until(
+        () => owned.getSnapshot().desiredRevision > 0,
+        "binary facade was not initialized",
+      );
+      const spec = pulsebeam.track.data("events", "ordered");
+      const local = owned.track(spec);
+      assert.equal(Object.isFrozen(spec), true);
+      assert.equal(
+        local,
+        owned.track(pulsebeam.track.data("events", "ordered")),
+      );
+      assert.notEqual(
+        local,
+        owned.track(pulsebeam.track.data("events", "latest")),
+      );
+      const other = pulsebeam.createAgent(ownedConfig);
+      assert.notEqual(local, other.track(spec));
+      other.close();
+      const aliceHandle = owned.remote.participant("alice");
+      const remote = aliceHandle.track(spec);
+      assert.equal(
+        remote,
+        owned.remote.participant("alice").track({ ...spec }),
+      );
+      assert.equal(remote.id, null);
+      assert.equal(remote.active, false);
+      assert.equal(aliceHandle.active, false);
+      assert.deepEqual(aliceHandle.tracks, []);
+      assert.deepEqual(owned.getSnapshot().topics.publishers, []);
+      assert.deepEqual(owned.getSnapshot().topics.subscribers, []);
+      await assert.rejects(local.send(Uint8Array.of(255)), {
+        code: "not-connected",
       });
-      const bob = await resource({
-        op: "receiveData",
-        spec,
-        participantId: "bob",
-      });
-      const ready = new Set();
-      owned.set_event_listener((event) => {
-        if (event.type === "data-ready")
-          for (const owner of event.owners) ready.add(owner);
-      });
-      await assert.rejects(owned.send_data(spec, Uint8Array.of(255)), {
-        pulsebeamCode: "not-connected",
-      });
+      const alreadyAborted = new AbortController();
+      alreadyAborted.abort();
+      assert.deepEqual(
+        await local.events({ signal: alreadyAborted.signal }).next(),
+        { done: true, value: undefined },
+      );
+      assert.deepEqual(owned.getSnapshot().topics.subscribers, []);
+      const all = local.events();
+      const alice = remote.events();
+      const controller = new AbortController();
+      const bob = owned.remote
+        .participant("bob")
+        .track(spec)
+        .events({ signal: controller.signal });
+      await until(
+        () => owned.getSnapshot().topics.subscribers.length === 1,
+        "owned stream interest was not committed",
+      );
+      const gap = all.next();
+      const remoteGap = alice.next();
+      const filtered = bob.next();
       const index = peers.length;
       owned.connect();
       const payload = Uint8Array.of(255, 0, 128);
-      const sent = owned.send_data(spec, payload);
+      const sent = local.send(payload);
       payload.fill(1);
       await until(
         () => peers[index]?.answerApplied,
@@ -439,17 +473,21 @@ export async function topicContract(pulsebeam, BrowserRuntime) {
       const peer = peers[index + 1];
       peer.open();
       await until(
-        () => owned.snapshot().connection === "connected",
+        () => owned.connection === "connected",
         "owned receive did not connect",
       );
       const signal = peer.channels.get("v1/sys/signaling");
       signal.receive(signalingWire(catalog(1, true)));
       signal.receive(signalingWire(mapping));
       await until(
-        () => BigInt(owned.snapshot().catalog.revision) === 1n,
+        () => owned.getSnapshot().catalog.revision === 1,
         "owned catalog was not applied",
       );
       await sent;
+      assert.equal(aliceHandle.active, true);
+      assert.equal(remote.id, "server-remote-track");
+      assert.equal(remote.active, true);
+      assert.deepEqual(aliceHandle.tracks, [remote]);
       const publisher = peer.channels.get("v2/ordered/pub/events");
       assert.deepEqual(publisher.sent, [
         bytes(
@@ -461,28 +499,26 @@ export async function topicContract(pulsebeam, BrowserRuntime) {
         ),
       ]);
       publisher.rejectNextSend = true;
-      await assert.rejects(owned.send_data(spec, Uint8Array.of(2)), {
-        pulsebeamCode: "host-rejected",
+      await assert.rejects(local.send(Uint8Array.of(2)), {
+        code: "host-rejected",
       });
       const channel = peer.channels.get("v2/ordered/sub/events");
       channel.receive(frame(4, expected));
       channel.receive(frame(1, available, Uint8Array.of(255, 0, 128)));
+      channel.receive(frame(1, available, Uint8Array.of(255, 0, 128)));
       channel.receive(frame(5, available));
-      await until(
-        () => ready.has(all.owner) && ready.has(alice.owner),
-        "owned receive was not notified",
-      );
-      assert.equal(ready.has(bob.owner), false);
-      for (const owner of [all.owner, alice.owner]) {
-        assert.deepEqual(await resource({ op: "readData", owner }), {
-          type: "gap",
-          participantId: "alice",
-          trackId: "server-remote-track",
-          from: expected,
-          to: available,
+      for (const result of [await gap, await remoteGap])
+        assert.deepEqual(result, {
+          done: false,
+          value: {
+            type: "gap",
+            participantId: "alice",
+            trackId: "server-remote-track",
+            from: expected,
+            to: available,
+          },
         });
-      }
-      const first = await resource({ op: "readData", owner: all.owner });
+      const first = (await all.next()).value;
       assert.deepEqual(first, {
         type: "message",
         participantId: "alice",
@@ -491,25 +527,46 @@ export async function topicContract(pulsebeam, BrowserRuntime) {
         data: Uint8Array.of(255, 0, 128),
       });
       first.data.fill(1);
-      const independent = await resource({
-        op: "readData",
-        owner: alice.owner,
-      });
-      assert.deepEqual(independent.data, Uint8Array.of(255, 0, 128));
-      assert.equal(await resource({ op: "readData", owner: bob.owner }), null);
-      for (const owner of [all.owner, alice.owner, bob.owner])
-        await resource({ op: "release", owner });
-      assert.deepEqual(owned.snapshot().topics.subscribers, []);
-      const canceledSend = assert.rejects(
-        owned.send_data(spec, Uint8Array.of(3)),
-        { pulsebeamCode: "not-connected" },
+      assert.deepEqual(
+        (await alice.next()).value.data,
+        Uint8Array.of(255, 0, 128),
       );
+      controller.abort();
+      assert.deepEqual(await filtered, { done: true, value: undefined });
+      const transient = local.events();
+      const returnedRead = transient.next();
+      await transient.return();
+      assert.deepEqual(await returnedRead, { done: true, value: undefined });
+      assert.equal(
+        owned.getSnapshot().topics.subscribers.length,
+        1,
+        "early return releases only its pending claim",
+      );
+      const failedReads = Promise.all(
+        [all, alice].map((stream) =>
+          assert.rejects(stream.next(), { code: "receive-channel-failed" }),
+        ),
+      );
+      channel.close();
+      await failedReads;
+      await Promise.all([all.return(), alice.return(), bob.return()]);
+      assert.deepEqual(owned.getSnapshot().topics.subscribers, []);
+      assert.equal(
+        owned.getSnapshot().topics.publishers.length,
+        1,
+        "last receive owner does not release producer interest",
+      );
+      const canceledSend = assert.rejects(local.send(Uint8Array.of(3)), {
+        code: "not-connected",
+      });
+      const teardownStream = local.events();
+      const teardownRead = teardownStream.next();
       owned.close();
       await canceledSend;
+      assert.deepEqual(await teardownRead, { done: true, value: undefined });
+      await teardownStream.return();
     } finally {
       owned.close();
-      owned.abort();
-      owned.free();
     }
     for (const peer of peers)
       for (const channel of peer.channels.values())

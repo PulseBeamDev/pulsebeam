@@ -1,18 +1,21 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { RemoteCatalog } from "../../unit-javascript/remote-catalog.js";
+import { DataRegistry } from "../../unit-javascript/data.js";
 
 function fixture(capacity = 2) {
   let snapshot = {
     connection: "disconnected",
     participantId: "self",
-    catalog: { participants: [], publications: [] },
+    catalog: { participants: [], publications: [], tracks: [] },
     mapping: { video: [], audio: [] },
     tracks: {},
   };
   let intent = [];
+  const agent = { getSnapshot: () => snapshot, subscribe: () => () => {} };
   const catalog = new RemoteCatalog(
-    { getSnapshot: () => snapshot },
+    agent,
+    new DataRegistry(agent),
     capacity,
     (next) => (intent = next),
   );
@@ -24,7 +27,7 @@ function fixture(capacity = 2) {
     update(participants, publications, audio = []) {
       snapshot = {
         ...snapshot,
-        catalog: { participants, publications },
+        catalog: { participants, publications, tracks: publications },
         mapping: { video: [], audio },
       };
       catalog.update(snapshot);

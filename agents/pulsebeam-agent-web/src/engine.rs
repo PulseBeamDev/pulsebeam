@@ -270,15 +270,21 @@ impl ActorHandle {
         Ok(receiver)
     }
 
-    pub(crate) fn send_resource(
+    pub(crate) async fn send_resource(
         &self,
         command: agent_core::ResourceCommand,
     ) -> Result<oneshot::Receiver<Result<agent_core::ResourceResult, AgentError>>, String> {
+        if self.closed.get() {
+            return Err("actor is not running".to_owned());
+        }
         let (completion, receiver) = oneshot::channel();
-        self.send(Message::Resource {
-            command,
-            completion,
-        })?;
+        self.sender
+            .send(Message::Resource {
+                command,
+                completion,
+            })
+            .await
+            .map_err(|_| "actor is not running".to_owned())?;
         Ok(receiver)
     }
 

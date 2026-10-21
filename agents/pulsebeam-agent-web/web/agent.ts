@@ -4,6 +4,8 @@ import {
   type CapturedTrack,
   type CapturedVideoTrack,
 } from "./capture-source.js";
+import { DataRegistry, type LocalDataTrack } from "./data.js";
+import type { DataTrackSpec, Delivery } from "./track.js";
 import type {
   Agent,
   AgentConfig,
@@ -126,6 +128,7 @@ class AgentFacade implements Agent {
   #localConfigs = new Map<string, SenderConfig>();
   #jsxMutation = false;
   #localOperations = new Map<string, number>();
+  readonly #data = new DataRegistry(this);
   readonly #remote: RemoteCatalog;
   readonly #topics: TopicRegistry;
   #managedVideo: readonly VideoDemand[] = [];
@@ -143,6 +146,7 @@ class AgentFacade implements Agent {
     this.#topology = runtimeConfig.topology;
     this.#remote = new RemoteCatalog(
       this,
+      this.#data,
       this.#topology.remoteVideos,
       (video) => {
         if (JSON.stringify(this.#managedVideo) === JSON.stringify(video))
@@ -194,6 +198,7 @@ class AgentFacade implements Agent {
           throw error;
         }
         this.#runtime = runtime;
+        this.#data.activate(runtime);
         runtime.set_event_listener((event: unknown) => {
           if (active()) this.#runtimeEvent(event);
         });
@@ -208,6 +213,7 @@ class AgentFacade implements Agent {
         } catch (error) {
           if (active())
             this.#terminalFailure("invalid-configuration", message(error));
+          this.#data.deactivate();
           runtime.abort();
           this.#runtime = undefined;
           this.#runtimeGeneration = null;
@@ -249,6 +255,7 @@ class AgentFacade implements Agent {
     const runtime = this.#runtime;
     this.#runtime = undefined;
     this.#runtimeGeneration = null;
+    this.#data.deactivate();
     if (runtime) {
       runtime.set_snapshot_listener();
       runtime.set_event_listener();
@@ -287,6 +294,12 @@ class AgentFacade implements Agent {
 
   get remote(): RemoteMedia {
     return this.#remote;
+  }
+
+  track<D extends Delivery>(spec: DataTrackSpec<D>): LocalDataTrack<D> {
+    if (spec.kind !== "data")
+      throw new TypeError("expected data track descriptor");
+    return this.#data.local(spec);
   }
 
   topic<T>(name: string, options: { readonly mode: TopicMode }): Topic<T> {
@@ -411,6 +424,10 @@ class AgentFacade implements Agent {
 
   connect(): void {
     if (this.#closed) throw new Error("agent is closed");
+    if (this.#snapshot.connection === "terminal-failure" && !this.#runtime) {
+      this.deactivate();
+      this.activate();
+    }
     if (!this.#state.connected)
       this.#applyState({ ...this.#state, connected: true });
     else this.#runtime?.connect();
@@ -573,6 +590,7 @@ class AgentFacade implements Agent {
       runtime.close();
       runtime.abort();
     }
+    this.#data.close();
     this.#topics.close();
     this.#remote.close();
     this.#state = copyState({ connected: false });
@@ -945,6 +963,7 @@ class AgentFacade implements Agent {
 
   #runtimeEvent(raw: unknown): void {
     if (this.#closed || typeof raw !== "object" || raw === null) return;
+    if (this.#data.notify(raw)) return;
     const value = raw as AgentEvent;
     const event = Object.freeze(
       value.type === "topic-message"
