@@ -13,8 +13,8 @@ use dcsctp::api::{
 };
 
 use crate::{
-    CommandError, ConnectionLimits, DataChannelConfig, DataChannelEvent, DataChannelId,
-    DataChannelPriority, DataChannelStats, DataMessage, DataReliability, Event, TimePoint,
+    ConnectionLimits, DataChannelConfig, DataChannelEvent, DataChannelId, DataChannelPriority,
+    DataChannelStats, DataMessage, DataReliability, Event, WriteError,
     negotiation::{DtlsRole, SctpSessionFacts},
 };
 
@@ -150,35 +150,35 @@ impl Association {
         }
     }
 
-    pub(crate) fn connect(&mut self, at: TimePoint) {
+    pub(crate) fn connect(&mut self, at: Instant) {
         if self.stopped || self.socket.state() != SocketState::Closed {
             return;
         }
-        self.advance_time(at.monotonic);
+        self.advance_time(at);
         self.socket.connect();
         self.drain_socket();
     }
 
     pub(crate) fn open(
         &mut self,
-        at: TimePoint,
+        at: Instant,
         config: DataChannelConfig,
-    ) -> Result<(), (CommandError, DataChannelConfig)> {
+    ) -> Result<(), (WriteError, DataChannelConfig)> {
         let admission = (|| {
             if self.stopped || self.socket.state() != SocketState::Connected {
-                return Err(CommandError::InvalidState);
+                return Err(WriteError::InvalidState);
             }
             if self.channels.len() >= self.max_channels {
-                return Err(CommandError::WouldBlock);
+                return Err(WriteError::WouldBlock);
             }
             let stream = match config.id {
                 Some(id) => StreamId(id.value()),
-                None => self.allocate_stream().ok_or(CommandError::WouldBlock)?,
+                None => self.allocate_stream().ok_or(WriteError::WouldBlock)?,
             };
             if self.channels.iter().any(|channel| {
                 channel.stream == stream || config.id.is_some_and(|id| channel.id == id)
             }) {
-                return Err(CommandError::InvalidState);
+                return Err(WriteError::InvalidState);
             }
             if config.label.len() > usize::from(u16::MAX)
                 || config.protocol.len() > usize::from(u16::MAX)
@@ -192,11 +192,11 @@ impl Association {
                         if lifetime.as_millis() > u128::from(u32::MAX)
                 )
             {
-                return Err(CommandError::InvalidState);
+                return Err(WriteError::InvalidState);
             }
             self.socket
                 .set_stream_priority(stream, config.priority.weight());
-            self.advance_time(at.monotonic);
+            self.advance_time(at);
             if !config.negotiated {
                 self.socket
                     .send(
@@ -239,33 +239,33 @@ impl Association {
 
     pub(crate) fn send(
         &mut self,
-        at: TimePoint,
+        at: Instant,
         channel: DataChannelId,
         message: DataMessage,
-    ) -> Result<(), (CommandError, DataMessage)> {
+    ) -> Result<(), (WriteError, DataMessage)> {
         let admission = (|| {
             let Some(entry) = self.channels.iter().find(|entry| entry.id == channel) else {
-                return Err(CommandError::UnknownDataChannel(channel));
+                return Err(WriteError::UnknownDataChannel(channel));
             };
             if self.stopped || entry.state != ChannelState::Open {
-                return Err(CommandError::InvalidState);
+                return Err(WriteError::InvalidState);
             }
             let stream = entry.stream;
             let payload_bytes = match &message {
                 DataMessage::Text(bytes) | DataMessage::Binary(bytes) => bytes.len(),
             };
             if payload_bytes > self.max_outbound_message_bytes {
-                return Err(CommandError::MessageTooLarge);
+                return Err(WriteError::MessageTooLarge);
             }
             if self
                 .buffered_payload_bytes
                 .checked_add(payload_bytes)
                 .is_none_or(|total| total > self.max_buffered_bytes)
             {
-                return Err(CommandError::WouldBlock);
+                return Err(WriteError::WouldBlock);
             }
             if self.lifecycles.len() >= MAX_BUFFERED_MESSAGES {
-                return Err(CommandError::WouldBlock);
+                return Err(WriteError::WouldBlock);
             }
             let (ppid, payload) = match &message {
                 DataMessage::Text(bytes) if bytes.is_empty() => (EMPTY_TEXT_PPID, vec![0]),
@@ -274,9 +274,9 @@ impl Association {
                 DataMessage::Binary(bytes) => (BINARY_PPID, bytes.to_vec()),
             };
             let lifecycle = self.next_lifecycle;
-            let lifecycle_id = LifecycleId::new(lifecycle).ok_or(CommandError::WouldBlock)?;
+            let lifecycle_id = LifecycleId::new(lifecycle).ok_or(WriteError::WouldBlock)?;
             let options = send_options(&entry.config, lifecycle_id);
-            self.advance_time(at.monotonic);
+            self.advance_time(at);
             self.socket
                 .send(Message::new(stream, ppid, payload), &options)
                 .map_err(map_send_error)?;
@@ -302,21 +302,21 @@ impl Association {
 
     pub(crate) fn close_channel(
         &mut self,
-        at: TimePoint,
+        at: Instant,
         id: DataChannelId,
-    ) -> Result<(), CommandError> {
+    ) -> Result<(), WriteError> {
         let Some(index) = self.channels.iter().position(|channel| channel.id == id) else {
-            return Err(CommandError::UnknownDataChannel(id));
+            return Err(WriteError::UnknownDataChannel(id));
         };
         let Some(entry) = self.channels.get_mut(index) else {
-            return Err(CommandError::UnknownDataChannel(id));
+            return Err(WriteError::UnknownDataChannel(id));
         };
         if entry.state == ChannelState::Closing {
             return Ok(());
         }
         let stream = entry.stream;
         entry.state = ChannelState::Closing;
-        self.advance_time(at.monotonic);
+        self.advance_time(at);
         match self.socket.reset_streams(&[stream]) {
             Ok(()) => {}
             Err(ResetStreamsError::NotConnected | ResetStreamsError::NotSupported) => {
@@ -328,22 +328,22 @@ impl Association {
         Ok(())
     }
 
-    pub(crate) fn handle_input(&mut self, at: TimePoint, packet: &[u8]) {
+    pub(crate) fn handle_input(&mut self, at: Instant, packet: &[u8]) {
         if self.stopped {
             return;
         }
-        self.advance_time(at.monotonic);
+        self.advance_time(at);
         self.socket.handle_input(packet);
         self.drain_socket();
     }
 
-    pub(crate) fn poll_event(&mut self, at: TimePoint) -> Option<Event> {
+    pub(crate) fn poll_event(&mut self, at: Instant) -> Option<Event> {
         if self.stopped {
             return self.events.pop_front();
         }
-        self.advance_time(at.monotonic);
+        self.advance_time(at);
         self.drain_socket();
-        self.enforce_shutdown_deadline(at.monotonic);
+        self.enforce_shutdown_deadline(at);
         self.events.pop_front()
     }
 
@@ -376,15 +376,15 @@ impl Association {
         }
     }
 
-    pub(crate) fn begin_shutdown(&mut self, at: TimePoint, deadline: Instant) {
+    pub(crate) fn begin_shutdown(&mut self, at: Instant, deadline: Instant) {
         if self.stopped {
             return;
         }
-        self.advance_time(at.monotonic);
+        self.advance_time(at);
         self.shutdown_deadline = Some(deadline);
         self.socket.shutdown();
         self.drain_socket();
-        self.enforce_shutdown_deadline(at.monotonic);
+        self.enforce_shutdown_deadline(at);
     }
 
     pub(crate) fn abort(&mut self) {
@@ -726,11 +726,11 @@ fn send_options(config: &DataChannelConfig, lifecycle_id: LifecycleId) -> SendOp
     options
 }
 
-fn map_send_error(error: SendError) -> CommandError {
+fn map_send_error(error: SendError) -> WriteError {
     match error {
-        SendError::MessageTooLarge { .. } => CommandError::MessageTooLarge,
-        SendError::ResourceExhaustion => CommandError::WouldBlock,
-        SendError::EmptyPayload | SendError::ShuttingDown => CommandError::InvalidState,
+        SendError::MessageTooLarge { .. } => WriteError::MessageTooLarge,
+        SendError::ResourceExhaustion => WriteError::WouldBlock,
+        SendError::EmptyPayload | SendError::ShuttingDown => WriteError::InvalidState,
     }
 }
 
@@ -799,7 +799,6 @@ fn decode_dcep_open(payload: &[u8]) -> Option<DataChannelConfig> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::GlobalMediaTime;
     use std::time::Duration;
 
     fn config(reliability: DataReliability, ordered: bool) -> DataChannelConfig {
@@ -853,13 +852,8 @@ mod tests {
         }
     }
 
-    fn at(now: Instant, start: Instant) -> TimePoint {
-        TimePoint {
-            monotonic: now,
-            global: GlobalMediaTime::from_micros(
-                u64::try_from(now.duration_since(start).as_micros()).unwrap_or(u64::MAX),
-            ),
-        }
+    fn at(now: Instant, _start: Instant) -> Instant {
+        now
     }
 
     fn drive(
@@ -1023,7 +1017,7 @@ mod tests {
         assert_eq!(
             left.open(at(now, start), config(DataReliability::Reliable, true))
                 .map_err(|(reason, _)| reason),
-            Err(CommandError::WouldBlock)
+            Err(WriteError::WouldBlock)
         );
 
         let stream = StreamId(channel.value());
@@ -1228,7 +1222,7 @@ mod tests {
                 DataMessage::Binary(Bytes::from_static(&[2; 24])),
             )
             .map_err(|(reason, _)| reason),
-            Err(CommandError::WouldBlock)
+            Err(WriteError::WouldBlock)
         );
         assert_eq!(left.stats().buffered_payload_bytes, 48);
     }

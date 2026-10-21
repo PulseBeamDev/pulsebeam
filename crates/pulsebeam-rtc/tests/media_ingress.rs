@@ -10,8 +10,7 @@ use std::{
 
 use bytes::Bytes;
 use pulsebeam_rtc::{
-    Connection, ConnectionConfig, ConnectionEntropy, GlobalMediaTime, LocalCandidate, NetworkInput,
-    Output, SdpOffer, TimePoint,
+    Connection, ConnectionConfig, ConnectionEntropy, LocalCandidate, NetworkInput, Output, SdpOffer,
 };
 
 mod support;
@@ -20,18 +19,18 @@ mod support;
 fn mixed_direction_native_publisher_recovers_loss_as_primary_media() {
     let mut fixture = support::PeerFixture::connected_video_publisher_audio_subscriber();
     fixture.drop_source_packet_after(1);
-    let packets = fixture.send_fragmented_video_source();
+    let packets = fixture.send_fragmented_video_source(None);
     let (ssrc, sequence) = fixture.lost_source_packet();
     let recovered = packets
         .iter()
-        .find(|packet| packet.view().unwrap().sequence_number == sequence)
+        .find(|packet| packet.header.sequence == sequence)
         .cloned()
         .unwrap_or_else(|| fixture.receive_source_sequence(sequence));
-    let view = recovered.view().expect("normalized source RTP");
+    let view = recovered.header;
     assert_eq!(view.ssrc, ssrc);
-    assert_eq!(view.sequence_number, sequence);
-    assert!(!view.payload.is_empty());
-    assert_eq!(recovered.global_media_at(), packets[0].global_media_at());
+    assert_eq!(view.sequence, sequence);
+    assert!(!recovered.payload.is_empty());
+    assert_eq!(recovered.header.timestamp, packets[0].header.timestamp);
     assert!(
         fixture.source_repair_packets > 0,
         "native publisher must send real RTX"
@@ -56,13 +55,6 @@ fn mixed_direction_native_publisher_recovers_loss_as_primary_media() {
     assert!(stats.encodings[0].received_packets > 0);
 }
 
-fn at(monotonic: Instant, global: u64) -> TimePoint {
-    TimePoint {
-        monotonic,
-        global: GlobalMediaTime::from_micros(global),
-    }
-}
-
 #[test]
 fn unauthenticated_rtp_never_creates_a_semantic_media_event() {
     let start = Instant::now();
@@ -75,7 +67,8 @@ fn unauthenticated_rtp_never_creates_a_semantic_media_event() {
             ..ConnectionConfig::default()
         },
         SdpOffer::new(include_str!("fixtures/chrome-representative.sdp")),
-        at(start, 1_000),
+        start,
+        std::time::UNIX_EPOCH,
         ConnectionEntropy::new([9; 32]),
     )
     .expect("connection")
@@ -83,11 +76,8 @@ fn unauthenticated_rtp_never_creates_a_semantic_media_event() {
 
     assert_eq!(
         connection.receive(
-            at(start, 1_000),
-            pulsebeam_rtc::PacketObservation {
-                at: at(start + Duration::from_millis(1), 2_000),
-                provenance: 17,
-            },
+            start,
+            start + Duration::from_millis(1),
             NetworkInput::Udp {
                 local: SocketAddr::from(([192, 0, 2, 1], 5000)),
                 remote: SocketAddr::from(([192, 0, 2, 2], 5001)),
@@ -100,11 +90,8 @@ fn unauthenticated_rtp_never_creates_a_semantic_media_event() {
 
     connection
         .receive(
-            at(start, 1_000),
-            pulsebeam_rtc::PacketObservation {
-                at: at(start, 1_000),
-                provenance: 0,
-            },
+            start,
+            start,
             NetworkInput::Udp {
                 local: SocketAddr::from(([192, 0, 2, 1], 5000)),
                 remote: SocketAddr::from(([192, 0, 2, 2], 5001)),
@@ -114,8 +101,12 @@ fn unauthenticated_rtp_never_creates_a_semantic_media_event() {
         )
         .expect("network input is dropped, not an API error");
 
-    assert!(!matches!(
-        connection.poll(at(start, 9_000_000)),
-        Output::Event(_)
-    ));
+    for _ in 0..16 {
+        match connection.poll(start) {
+            Output::Idle { .. } => return,
+            Output::Event(pulsebeam_rtc::Event::BandwidthEstimate(_)) => {}
+            output => panic!("unauthenticated input produced output: {output:?}"),
+        }
+    }
+    panic!("bounded unauthenticated input did not become idle");
 }

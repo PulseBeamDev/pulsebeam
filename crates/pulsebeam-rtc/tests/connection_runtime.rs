@@ -10,15 +10,12 @@ use std::{
 
 use bytes::Bytes;
 use pulsebeam_rtc::{
-    AcceptError, Connection, ConnectionConfig, ConnectionEntropy, GlobalMediaTime, LocalCandidate,
-    NetworkInput, Output, SdpOffer, TimePoint,
+    AcceptError, Connection, ConnectionConfig, ConnectionEntropy, LocalCandidate, NetworkInput,
+    Output, SdpOffer,
 };
 
-fn at(monotonic: Instant) -> TimePoint {
-    TimePoint {
-        monotonic,
-        global: GlobalMediaTime::from_micros(7),
-    }
+fn at(monotonic: Instant) -> Instant {
+    monotonic
 }
 
 fn connection(start: Instant) -> Result<Connection, AcceptError> {
@@ -32,9 +29,30 @@ fn connection(start: Instant) -> Result<Connection, AcceptError> {
         },
         SdpOffer::new(include_str!("fixtures/chrome-representative.sdp")),
         at(start),
+        std::time::UNIX_EPOCH,
         ConnectionEntropy::new([7; 32]),
     )?
     .connection)
+}
+
+#[allow(
+    clippy::panic,
+    reason = "bounded test fixture stops at the first protocol invariant violation"
+)]
+fn next_deadline(connection: &mut Connection, at: Instant) -> Instant {
+    for _ in 0..16 {
+        match connection.poll(at) {
+            Output::Idle {
+                next_wakeup: Some(next),
+            } if next > at => return next,
+            Output::Idle {
+                next_wakeup: Some(next),
+            } => assert_eq!(next, at),
+            Output::Event(pulsebeam_rtc::Event::BandwidthEstimate(_)) => {}
+            output => panic!("expected bounded ICE setup progress: {output:?}"),
+        }
+    }
+    panic!("ICE did not expose a future timer");
 }
 
 #[test]
@@ -42,12 +60,7 @@ fn public_runtime_waits_for_authenticated_ice_before_transmitting() -> Result<()
     let start = Instant::now();
     let mut connection = connection(start)?;
 
-    let Output::Idle {
-        next_wakeup: Some(deadline),
-    } = connection.poll(at(start))
-    else {
-        panic!("ICE-lite must wait for inbound checks and expose its timer");
-    };
+    let deadline = next_deadline(&mut connection, start);
 
     assert!(deadline >= start);
     assert!(!matches!(
@@ -61,31 +74,12 @@ fn public_runtime_waits_for_authenticated_ice_before_transmitting() -> Result<()
 fn malformed_input_is_dropped_without_disrupting_the_runtime_timer() -> Result<(), AcceptError> {
     let start = Instant::now();
     let mut connection = connection(start)?;
-    let before = (0..16)
-        .find_map(|_| match connection.poll(at(start)) {
-            Output::Idle {
-                next_wakeup: Some(next),
-            } if next > start => Some(next),
-            Output::Idle {
-                next_wakeup: Some(next),
-            } => {
-                assert_eq!(
-                    next, start,
-                    "pending setup work requests immediate continuation"
-                );
-                None
-            }
-            output => panic!("expected bounded ICE setup progress: {output:?}"),
-        })
-        .expect("initial ICE timer after pending setup work");
+    let before = next_deadline(&mut connection, start);
 
     assert_eq!(
         connection.receive(
             at(start + Duration::from_millis(1)),
-            pulsebeam_rtc::PacketObservation {
-                at: at(start + Duration::from_millis(1)),
-                provenance: 0
-            },
+            at(start + Duration::from_millis(1)),
             NetworkInput::Udp {
                 local: SocketAddr::from(([192, 0, 2, 1], 5000)),
                 remote: SocketAddr::from(([192, 0, 2, 2], 5001)),
@@ -96,11 +90,9 @@ fn malformed_input_is_dropped_without_disrupting_the_runtime_timer() -> Result<(
         Ok(())
     );
 
-    assert!(matches!(
-        connection.poll(at(start + Duration::from_millis(1))),
-        Output::Idle {
-            next_wakeup: Some(after)
-        } if after == before
-    ));
+    assert_eq!(
+        next_deadline(&mut connection, start + Duration::from_millis(1)),
+        before
+    );
     Ok(())
 }

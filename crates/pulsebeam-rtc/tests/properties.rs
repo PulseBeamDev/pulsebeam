@@ -8,92 +8,16 @@ mod support;
 
 use std::time::Duration;
 
-use proptest::prelude::*;
-use pulsebeam_rtc::{Command, GlobalMediaTime, MediaPayloadBitrate, Output, PlayoutDelay};
-use support::{PeerFixture, forwarded};
-
-proptest! {
-    #![proptest_config(ProptestConfig {
-        cases: 256,
-        failure_persistence: Some(Box::new(proptest::test_runner::FileFailurePersistence::WithSource("properties-regressions"))),
-        ..ProptestConfig::default()
-    })]
-
-    #[test]
-    fn global_time_wire_round_trip_is_exact(value in any::<u64>()) {
-        let time = GlobalMediaTime::from_micros(value);
-        prop_assert_eq!(GlobalMediaTime::from_be_bytes(time.to_be_bytes()), time);
-    }
-
-    #[test]
-    fn checked_global_time_arithmetic_never_wraps(value in any::<u64>(), delta in any::<u32>()) {
-        let time = GlobalMediaTime::from_micros(value);
-        let duration = Duration::from_micros(u64::from(delta));
-        match time.checked_add(duration) {
-            Some(later) => {
-                prop_assert!(later >= time);
-                prop_assert_eq!(later.checked_duration_since(time), Some(duration));
-            }
-            None => prop_assert!(value.checked_add(u64::from(delta)).is_none()),
-        }
-    }
-
-    #[test]
-    fn playout_policy_is_monotonic_over_the_complete_wire_domain(
-        first in 0_u16..=4095,
-        second in 0_u16..=4095,
-    ) {
-        let (tighter, looser) = if first <= second { (first, second) } else { (second, first) };
-        let tight = PlayoutDelay::from_ticks(0, tighter).expect("generated valid policy");
-        let loose = PlayoutDelay::from_ticks(0, looser).expect("generated valid policy");
-        prop_assert!(tight.max() <= loose.max());
-    }
-}
-
-#[test]
-fn selected_targets_remain_caller_owned_above_the_connection_budget() {
-    let mut source = PeerFixture::connected();
-    let mut fixture = PeerFixture::connected_with_senders(3);
-    let packet = source.send_source(b"fixed caller targets");
-    let target = MediaPayloadBitrate::from_bps(4_000_000);
-    for (index, sender) in fixture.senders.clone().into_iter().enumerate() {
-        fixture.command(Command::SetSenderAssignment {
-            sender: sender,
-            assignment: Some(pulsebeam_rtc::SenderAssignment {
-                playout_delay: None,
-                ..support::sender_assignment(target)
-            }),
-        });
-        fixture.command(Command::SendMedia {
-            sender,
-            media: forwarded(
-                packet.clone(),
-                u64::try_from(index).expect("small index") + 1,
-            ),
-        });
-    }
-    fixture.drive_for(Duration::from_millis(500));
-    let stats = fixture.connection.stats();
-    assert_eq!(stats.senders.len(), 3);
-    assert!(
-        stats.senders.iter().all(|sender| sender
-            .assignment
-            .expect("bound sender")
-            .selected_bitrate
-            == target)
-    );
-    assert!(stats.connection.media_budget.as_bps() > 0);
-    assert!(stats.connection.media_budget.as_bps() < target.as_bps() * 3);
-}
+use pulsebeam_rtc::Output;
+use support::{PeerFixture, rtp_write};
 
 #[test]
 fn commit_and_terminal_output_are_atomic_and_once_only() {
     let mut fixture = PeerFixture::connected();
     let packet = fixture.send_source(b"commit");
-    fixture.command(Command::SendMedia {
-        sender: fixture.sender,
-        media: forwarded(packet, 1),
-    });
+    fixture
+        .write_rtp(rtp_write(packet, 1))
+        .expect("write direct media");
     let before = fixture.connection.stats();
     let _ = fixture.receive_egress();
     let committed = fixture.connection.stats();
@@ -103,7 +27,7 @@ fn commit_and_terminal_output_are_atomic_and_once_only() {
     );
     assert!(committed.connection.transmitted_rtp_bytes > before.connection.transmitted_rtp_bytes);
 
-    fixture.command(Command::Abort);
+    fixture.connection.abort();
     assert!(matches!(
         fixture.connection.poll(fixture.at()),
         Output::Closed(_)
@@ -131,10 +55,9 @@ fn bounded_network_trace_replays_exactly_for_the_recorded_seed() {
             },
         );
         for id in 1..=3 {
-            fixture.command(Command::SendMedia {
-                sender: fixture.sender,
-                media: forwarded(packet.clone(), id),
-            });
+            fixture
+                .write_rtp(rtp_write(packet.clone(), id))
+                .expect("write direct media");
         }
         fixture.drive_for(Duration::from_secs(2));
         (fixture.network_counters(), fixture.network_trace().to_vec())

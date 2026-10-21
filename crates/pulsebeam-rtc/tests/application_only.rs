@@ -6,7 +6,7 @@
 
 mod support;
 
-use pulsebeam_rtc::{Command, DataMessage};
+use pulsebeam_rtc::DataMessage;
 use support::{FixtureDataEvent, PeerFixture};
 
 #[test]
@@ -23,10 +23,14 @@ fn application_only_peer_exchanges_messages_without_rtp_accounting() {
         }
     }
     fixture.peer_send(true, b"from peer");
-    fixture.command(Command::SendData {
-        channel: channel.expect("application-only channel"),
-        message: DataMessage::Binary(b"from connection".to_vec().into()),
-    });
+    fixture
+        .connection
+        .send_data(
+            fixture.at(),
+            channel.expect("application-only channel"),
+            DataMessage::Binary(b"from connection".to_vec().into()),
+        )
+        .expect("send application-only message");
     let mut peer_received = false;
     let mut connection_received = false;
     for _ in 0..32 {

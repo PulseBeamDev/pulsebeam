@@ -1,26 +1,17 @@
-#![allow(
-    clippy::disallowed_types,
-    reason = "the public network input contract is intentionally Bytes-backed"
-)]
-
-use std::{net::SocketAddr, time::Instant};
+#![allow(clippy::disallowed_types, reason = "network input owns Bytes")]
 
 use bytes::Bytes;
 use pulsebeam_rtc::{
-    AcceptError, CloseReason, Command, CommandError, Connection, ConnectionConfig,
-    ConnectionEntropy, ConnectionState, GlobalMediaTime, LocalCandidate, NetworkInput, Output,
-    ReceiveError, SdpOffer, TimePoint,
+    AcceptError, CloseReason, Connection, ConnectionConfig, ConnectionEntropy, ConnectionState,
+    LocalCandidate, NetworkInput, Output, ReceiveError, SdpOffer, WriteError,
+};
+use std::{
+    net::SocketAddr,
+    time::{Instant, UNIX_EPOCH},
 };
 
-fn at(monotonic: Instant) -> TimePoint {
-    TimePoint {
-        monotonic,
-        global: GlobalMediaTime::from_micros(1),
-    }
-}
-
 fn connection(start: Instant) -> Result<Connection, AcceptError> {
-    let accepted = Connection::accept(
+    Ok(Connection::accept(
         ConnectionConfig {
             local_candidates: vec![LocalCandidate::Udp(SocketAddr::from((
                 [192, 0, 2, 1],
@@ -28,55 +19,43 @@ fn connection(start: Instant) -> Result<Connection, AcceptError> {
             )))],
             ..ConnectionConfig::default()
         },
-        SdpOffer::new(include_str!("fixtures/chrome-representative.sdp")),
-        at(start),
+        SdpOffer::new(
+            include_str!("fixtures/chrome-representative.sdp").replace("a=sendonly", "a=sendrecv"),
+        ),
+        start,
+        UNIX_EPOCH,
         ConnectionEntropy::new([13; 32]),
-    )?;
-    Ok(accepted.connection)
+    )?
+    .connection)
 }
 
 #[test]
-fn abort_discards_queued_output_and_emits_terminal_once() -> Result<(), AcceptError> {
+fn abort_discards_output_and_emits_terminal_once() -> Result<(), AcceptError> {
     let now = Instant::now();
     let mut connection = connection(now)?;
-
-    assert_eq!(
-        connection
-            .command(at(now), Command::Abort)
-            .map_err(|rejected| rejected.reason),
-        Ok(())
-    );
+    connection.abort();
     assert!(matches!(
-        connection.poll(at(now)),
+        connection.poll(now),
         Output::Closed(CloseReason::Aborted)
     ));
+    connection.abort();
     assert!(matches!(
-        connection.poll(at(now)),
+        connection.poll(now),
         Output::Idle { next_wakeup: None }
     ));
     assert_eq!(
-        connection
-            .command(at(now), Command::Abort)
-            .map_err(|rejected| rejected.reason),
-        Err(CommandError::Closed)
-    );
-    assert_eq!(
         connection.receive(
-            at(now),
-            pulsebeam_rtc::PacketObservation {
-                at: at(now),
-                provenance: 0
-            },
+            now,
+            now,
             NetworkInput::Udp {
                 local: SocketAddr::from(([192, 0, 2, 1], 5000)),
                 remote: SocketAddr::from(([192, 0, 2, 2], 5001)),
                 ecn: None,
                 payload: Bytes::new(),
-            },
+            }
         ),
         Err(ReceiveError::Closed)
     );
-
     let stats = connection.stats();
     assert_eq!(stats.connection.state, ConnectionState::Closed);
     assert_eq!(stats.connection.close_reason, Some(CloseReason::Aborted));
@@ -88,33 +67,20 @@ fn abort_discards_queued_output_and_emits_terminal_once() -> Result<(), AcceptEr
 fn graceful_close_is_idempotent_and_honors_an_immediate_deadline() -> Result<(), AcceptError> {
     let now = Instant::now();
     let mut connection = connection(now)?;
-
-    assert_eq!(
-        connection
-            .command(at(now), Command::CloseGracefully { deadline: now })
-            .map_err(|rejected| rejected.reason),
-        Ok(())
-    );
-    assert_eq!(
-        connection
-            .command(at(now), Command::CloseGracefully { deadline: now })
-            .map_err(|rejected| rejected.reason),
-        Ok(())
-    );
+    assert_eq!(connection.close(now, now), Ok(()));
+    assert_eq!(connection.close(now, now), Ok(()));
+    for _ in 0..16 {
+        match connection.poll(now) {
+            Output::Closed(CloseReason::Graceful) => break,
+            Output::Event(pulsebeam_rtc::Event::BandwidthEstimate(_)) => {}
+            output => panic!("unexpected close output: {output:?}"),
+        }
+    }
     assert!(matches!(
-        connection.poll(at(now)),
-        Output::Closed(CloseReason::Graceful)
-    ));
-    assert!(matches!(
-        connection.poll(at(now)),
+        connection.poll(now),
         Output::Idle { next_wakeup: None }
     ));
-    assert_eq!(
-        connection
-            .command(at(now), Command::CloseGracefully { deadline: now })
-            .map_err(|rejected| rejected.reason),
-        Err(CommandError::Closed)
-    );
+    assert_eq!(connection.close(now, now), Err(WriteError::Closed));
     Ok(())
 }
 
@@ -125,11 +91,10 @@ fn stats_are_owned_snapshots_and_include_negotiated_senders() -> Result<(), Acce
     let before = connection.stats();
     let mut owned = before.clone();
     owned.senders.clear();
-
-    let after = connection.stats();
-    assert_eq!(before, after);
-    assert_eq!(after.connection.state, ConnectionState::Open);
-    assert_eq!(after.connection.close_reason, None);
-    assert!(after.connection.feedback.is_some());
+    assert_eq!(before, connection.stats());
+    assert_eq!(before.connection.state, ConnectionState::Open);
+    assert_eq!(before.connection.close_reason, None);
+    assert!(before.connection.feedback.is_some());
+    assert!(!before.senders.is_empty());
     Ok(())
 }

@@ -5,7 +5,8 @@
 
 use std::{fmt, net::SocketAddr, num::NonZeroU16, sync::Arc, time::Duration};
 
-use crate::{AcceptError, DataChannelId, SenderId, SourceIncarnation};
+use crate::id::SenderId;
+use crate::{AcceptError, DataChannelId};
 
 const MAX_PLAYOUT_TICKS: u16 = 4095;
 const MILLIS_PER_PLAYOUT_TICK: u64 = 10;
@@ -113,13 +114,6 @@ impl SessionInfo {
             .iter()
             .find(|media| media.sender_index == sender_index)
     }
-
-    pub fn receiver_index_for_sender(&self, sender: SenderId) -> Option<u32> {
-        self.senders
-            .iter()
-            .find(|info| info.id == sender)
-            .map(|info| info.receiver_index)
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -142,7 +136,7 @@ pub struct RtpExtensionInfo {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SenderInfo {
-    pub id: SenderId,
+    pub(crate) id: SenderId,
     pub receiver_index: u32,
     pub kind: MediaKind,
     pub mid: Arc<str>,
@@ -326,23 +320,6 @@ impl ConnectionConfig {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct SenderAssignment {
-    pub source: SourceIncarnation,
-    pub selected_bitrate: MediaPayloadBitrate,
-    pub potential_bitrate: MediaPayloadBitrate,
-    pub delivery: DeliveryConstraints,
-    pub playout_delay: Option<PlayoutDelay>,
-    pub decode_target_mask: Option<u32>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct DeliveryConstraints {
-    pub max_media_age: Duration,
-    pub max_queue_residence: Duration,
-    pub repair_window: Duration,
-}
-
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
 pub struct MediaPayloadBitrate(u64);
@@ -369,9 +346,9 @@ impl PlayoutDelay {
         max_millis: 0,
     };
 
-    pub const fn from_ticks(min: u16, max: u16) -> Result<Self, PolicyError> {
+    pub const fn from_ticks(min: u16, max: u16) -> Result<Self, PlayoutDelayError> {
         if min > max || max > MAX_PLAYOUT_TICKS {
-            return Err(PolicyError::PlayoutRange);
+            return Err(PlayoutDelayError::Range);
         }
         Ok(Self {
             min_millis: min.saturating_mul(10),
@@ -379,26 +356,26 @@ impl PlayoutDelay {
         })
     }
 
-    pub fn from_millis(min: u64, max: u64) -> Result<Self, PolicyError> {
+    pub fn from_millis(min: u64, max: u64) -> Result<Self, PlayoutDelayError> {
         if min > max || max > u64::from(MAX_PLAYOUT_TICKS).saturating_mul(MILLIS_PER_PLAYOUT_TICK) {
-            return Err(PolicyError::PlayoutRange);
+            return Err(PlayoutDelayError::Range);
         }
         Ok(Self {
-            min_millis: u16::try_from(min).map_err(|_| PolicyError::PlayoutRange)?,
-            max_millis: u16::try_from(max).map_err(|_| PolicyError::PlayoutRange)?,
+            min_millis: u16::try_from(min).map_err(|_| PlayoutDelayError::Range)?,
+            max_millis: u16::try_from(max).map_err(|_| PlayoutDelayError::Range)?,
         })
     }
 
-    pub fn from_millis_exact(min: u64, max: u64) -> Result<Self, PolicyError> {
+    pub fn from_millis_exact(min: u64, max: u64) -> Result<Self, PlayoutDelayError> {
         if !min.is_multiple_of(MILLIS_PER_PLAYOUT_TICK)
             || !max.is_multiple_of(MILLIS_PER_PLAYOUT_TICK)
         {
-            return Err(PolicyError::PlayoutNotExactlyRepresentable);
+            return Err(PlayoutDelayError::NotExactlyRepresentable);
         }
         let min_ticks =
-            u16::try_from(min / MILLIS_PER_PLAYOUT_TICK).map_err(|_| PolicyError::PlayoutRange)?;
+            u16::try_from(min / MILLIS_PER_PLAYOUT_TICK).map_err(|_| PlayoutDelayError::Range)?;
         let max_ticks =
-            u16::try_from(max / MILLIS_PER_PLAYOUT_TICK).map_err(|_| PolicyError::PlayoutRange)?;
+            u16::try_from(max / MILLIS_PER_PLAYOUT_TICK).map_err(|_| PlayoutDelayError::Range)?;
         Self::from_ticks(min_ticks, max_ticks)
     }
 
@@ -410,7 +387,8 @@ impl PlayoutDelay {
         Duration::from_millis(self.max_millis as u64)
     }
 
-    pub(crate) fn wire_value(self) -> [u8; 3] {
+    /// Encode the explicitly requested bounds in 10 ms wire units, rounded to nearest.
+    pub fn to_bytes(self) -> [u8; 3] {
         let min = u32::from(self.min_millis.saturating_add(5) / 10);
         let max = u32::from(self.max_millis.saturating_add(5) / 10);
         let [_, a, b, c] = ((min << 12) | max).to_be_bytes();
@@ -420,9 +398,9 @@ impl PlayoutDelay {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
-pub enum PolicyError {
-    PlayoutRange,
-    PlayoutNotExactlyRepresentable,
+pub enum PlayoutDelayError {
+    Range,
+    NotExactlyRepresentable,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

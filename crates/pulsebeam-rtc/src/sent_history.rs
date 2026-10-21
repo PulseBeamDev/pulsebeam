@@ -235,15 +235,15 @@ impl SentHistory {
         }
         let ssrc_index = self.ssrc_index_or_insert(rtp.ssrc, rtp.sequence);
         let empty_history = self.ssrcs[ssrc_index].sent_ids.is_empty();
-        let rtp_sequence = if empty_history {
-            u64::from(rtp.sequence)
-        } else {
-            unwrap_forward(rtp.sequence, self.ssrcs[ssrc_index].newest_sequence)
-        };
+        let rtp_sequence = rtp.index;
+        let state = &mut self.ssrcs[ssrc_index];
         if empty_history {
-            self.ssrcs[ssrc_index].first_sequence = rtp_sequence;
+            state.first_sequence = rtp_sequence;
+            state.newest_sequence = rtp_sequence;
+        } else {
+            state.first_sequence = state.first_sequence.min(rtp_sequence);
+            state.newest_sequence = state.newest_sequence.max(rtp_sequence);
         }
-        self.ssrcs[ssrc_index].newest_sequence = rtp_sequence;
         let twcc_sequence = rtp.twcc_sequence.map(|sequence| {
             let unwrapped = self.newest_twcc.map_or_else(
                 || u64::from(sequence),

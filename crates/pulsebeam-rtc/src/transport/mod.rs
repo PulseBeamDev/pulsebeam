@@ -16,11 +16,9 @@ use is::{Candidate, IceConnectionState, IceCreds};
 use str0m::crypto::Fingerprint;
 use str0m::crypto::dtls::DtlsCert;
 
-#[cfg(test)]
-use crate::GlobalMediaTime;
 use crate::negotiation::{DtlsRole, NegotiatedSessionFacts};
 
-use crate::{AuthenticatedFlow, IceTcpFlowId, NetworkInput, TimePoint, TransmitTarget};
+use crate::{NetworkInput, TransmitTarget};
 
 use srtp::{RtpMetadata, SrtpError, outbound_rtp_metadata, outbound_twcc_sequence};
 
@@ -28,8 +26,6 @@ const MAX_EVENTS: usize = 256;
 const MAX_TRANSMISSIONS: usize = 256;
 const MAX_CANDIDATE_PAIRS: usize = 128;
 const MAX_PENDING_DTLS: usize = 64;
-const MAX_TCP_FLOWS: usize = 64;
-const MAX_AUTHENTICATED_OBSERVATIONS: usize = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TransportState {
@@ -71,6 +67,7 @@ impl PathEpoch {
 pub(crate) struct PreparedRtpIdentity {
     pub(crate) ssrc: u32,
     pub(crate) sequence: u16,
+    pub(crate) index: u64,
     pub(crate) twcc_sequence: Option<u16>,
     pub(crate) service: RtpService,
 }
@@ -85,8 +82,8 @@ pub(crate) enum RtpService {
 impl crate::TransmitKind {
     pub(crate) const fn rtp_service(self) -> Option<RtpService> {
         match self {
-            Self::Original(_) => Some(RtpService::Original),
-            Self::Repair(_) => Some(RtpService::Repair),
+            Self::Original { .. } => Some(RtpService::Original),
+            Self::Repair { .. } => Some(RtpService::Repair),
             Self::Padding { .. } => Some(RtpService::Padding),
             Self::Control => None,
         }
@@ -96,17 +93,16 @@ impl crate::TransmitKind {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum TransportEvent {
     StateChanged(TransportState),
-    IceAuthenticated(AuthenticatedFlow),
     IceStateChanged(IceConnectionState),
     Rtp {
-        arrival: crate::PacketObservation,
+        arrival: Instant,
         path_epoch: PathEpoch,
         bytes: Vec<u8>,
         metadata: RtpMetadata,
         ecn: Option<crate::EcnCodepoint>,
     },
     Rtcp {
-        arrival: TimePoint,
+        arrival: Instant,
         path_epoch: PathEpoch,
         bytes: Vec<u8>,
     },
@@ -143,7 +139,6 @@ pub(crate) struct PreparedTransmit {
 pub(crate) enum TransportError {
     Closed,
     InvalidInput,
-    UnknownTcpFlow,
     NotDue,
     QueueFull,
     Configuration,
@@ -157,7 +152,6 @@ impl fmt::Display for TransportError {
         f.write_str(match self {
             Self::Closed => "transport is closed",
             Self::InvalidInput => "invalid transport input",
-            Self::UnknownTcpFlow => "unknown ICE-TCP flow",
             Self::NotDue => "transport deadline is not due",
             Self::QueueFull => "transport queue is full",
             Self::Configuration => "invalid transport configuration",
@@ -317,21 +311,12 @@ pub(crate) struct Transport {
     twcc_extension_id: Option<u8>,
     twcc_payload_map: Box<[(u8, u8)]>,
     events: VecDeque<TransportEvent>,
-    authenticated: VecDeque<AuthenticatedFlow>,
     transmissions: VecDeque<PreparedTransmit>,
     pending_dtls: VecDeque<(SelectedPath, Vec<u8>)>,
     next_deadline: Option<Instant>,
     max_events: usize,
     max_transmissions: usize,
-    tcp_flows: Vec<TcpFlowBinding>,
     dropped_inputs: u64,
-}
-
-struct TcpFlowBinding {
-    flow: IceTcpFlowId,
-    local: SocketAddr,
-    remote: SocketAddr,
-    authenticated: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -341,17 +326,12 @@ pub(crate) enum NetworkEnvelope {
         remote: SocketAddr,
     },
     IceTcp {
-        flow: IceTcpFlowId,
         local: SocketAddr,
         remote: SocketAddr,
     },
 }
 
 impl NetworkEnvelope {
-    fn is_tcp_flow(&self, flow: IceTcpFlowId) -> bool {
-        matches!(self, Self::IceTcp { flow: id, .. } if *id == flow)
-    }
-
     fn source(&self) -> SocketAddr {
         match self {
             Self::Udp { remote, .. } | Self::IceTcp { remote, .. } => *remote,
@@ -377,7 +357,10 @@ impl NetworkEnvelope {
                 remote: *remote,
                 ecn: None,
             },
-            Self::IceTcp { flow, .. } => TransmitTarget::IceTcp { flow: *flow },
+            Self::IceTcp { local, remote } => TransmitTarget::IceTcp {
+                local: *local,
+                remote: *remote,
+            },
         }
     }
 }
@@ -488,13 +471,11 @@ impl Transport {
             twcc_extension_id: config.twcc_extension_id,
             twcc_payload_map: config.twcc_payload_map,
             events: VecDeque::new(),
-            authenticated: VecDeque::new(),
             transmissions: VecDeque::new(),
             pending_dtls: VecDeque::new(),
             next_deadline: None,
             max_events: config.max_events,
             max_transmissions: config.max_transmissions,
-            tcp_flows: Vec::new(),
             dropped_inputs: 0,
         };
         transport.push_event(TransportEvent::StateChanged(TransportState::Checking))?;
@@ -537,7 +518,7 @@ impl Transport {
     }
 
     pub(crate) fn has_pending_output(&self) -> bool {
-        !self.events.is_empty() || !self.authenticated.is_empty() || !self.transmissions.is_empty()
+        !self.events.is_empty() || !self.transmissions.is_empty()
     }
 
     pub(crate) fn poll_event(&mut self) -> Option<TransportEvent> {
@@ -552,10 +533,7 @@ impl Transport {
                 .retain(|event| !matches!(event, TransportEvent::SelectedPathChanged { .. }));
             return latest;
         }
-        self.authenticated
-            .pop_front()
-            .map(TransportEvent::IceAuthenticated)
-            .or_else(|| self.events.pop_front())
+        self.events.pop_front()
     }
 
     #[cfg(test)]
@@ -635,13 +613,7 @@ impl Transport {
     ) -> Result<(), TransportError> {
         self.handle_envelope(
             now,
-            crate::PacketObservation {
-                at: TimePoint {
-                    monotonic: now,
-                    global: GlobalMediaTime::from_micros(0),
-                },
-                provenance: 0,
-            },
+            now,
             SelectedPath::unselected(NetworkEnvelope::Udp {
                 local: destination,
                 remote: source,
@@ -654,7 +626,7 @@ impl Transport {
     fn handle_envelope(
         &mut self,
         now: Instant,
-        arrival: crate::PacketObservation,
+        arrival: Instant,
         path: SelectedPath,
         bytes: Vec<u8>,
         ecn: Option<crate::EcnCodepoint>,
@@ -682,17 +654,6 @@ impl Transport {
                     .handle_packet(now, source, destination, proto, &bytes)
                 {
                     Ok(authenticated) => {
-                        if authenticated {
-                            if let NetworkEnvelope::IceTcp { flow, .. } = path.envelope
-                                && let Some(binding) = self
-                                    .tcp_flows
-                                    .iter_mut()
-                                    .find(|binding| binding.flow == flow)
-                            {
-                                binding.authenticated = true;
-                            }
-                            self.observe_authenticated(&path.envelope);
-                        }
                         let provider = str0m::crypto::from_feature_flags();
                         self.drain_ice(now, &provider)?;
                         // ICE nomination is tuple-based and may not repeat on a new stream.
@@ -765,7 +726,7 @@ impl Transport {
                                 .and_then(|selected| selected.epoch)
                                 .ok_or(TransportError::Protocol)?;
                             self.push_event(TransportEvent::Rtcp {
-                                arrival: arrival.at,
+                                arrival,
                                 path_epoch,
                                 bytes,
                             })?;
@@ -787,7 +748,7 @@ impl Transport {
     pub(crate) fn receive(
         &mut self,
         now: Instant,
-        arrival: crate::PacketObservation,
+        arrival: Instant,
         input: NetworkInput,
     ) -> Result<(), TransportError> {
         let (envelope, bytes, ecn) = match input {
@@ -802,7 +763,6 @@ impl Transport {
                 ecn,
             ),
             NetworkInput::IceTcp {
-                flow,
                 local,
                 remote,
                 frame,
@@ -815,23 +775,8 @@ impl Transport {
                     self.drop_input();
                     return Ok(());
                 }
-                match self.tcp_flows.iter().find(|binding| binding.flow == flow) {
-                    Some(binding) if binding.local != local || binding.remote != remote => {
-                        self.drop_input();
-                        return Ok(());
-                    }
-                    None => {
-                        self.drop_input();
-                        return Err(TransportError::UnknownTcpFlow);
-                    }
-                    Some(_) => {}
-                }
                 (
-                    NetworkEnvelope::IceTcp {
-                        flow,
-                        local,
-                        remote,
-                    },
+                    NetworkEnvelope::IceTcp { local, remote },
                     payload.to_vec(),
                     None,
                 )
@@ -866,24 +811,22 @@ impl Transport {
         self.drain_dtls(now, DatagramKind::Dtls)
     }
 
-    #[cfg(test)]
-    pub(crate) fn send_rtp(&mut self, packet: &[u8]) -> Result<(), TransportError> {
-        self.send_rtp_with_info(
-            packet,
-            crate::test_source::transmit_kind(RtpService::Original),
-        )
-    }
-
     pub(crate) fn send_rtp_with_info(
         &mut self,
         packet: &[u8],
+        index: u64,
         classification: crate::TransmitKind,
     ) -> Result<(), TransportError> {
-        self.send_secure(packet, DatagramKind::Rtp, classification)
+        self.send_secure(packet, Some(index), DatagramKind::Rtp, classification)
     }
 
     pub(crate) fn send_rtcp(&mut self, packet: &[u8]) -> Result<(), TransportError> {
-        self.send_secure(packet, DatagramKind::Rtcp, crate::TransmitKind::Control)
+        self.send_secure(
+            packet,
+            None,
+            DatagramKind::Rtcp,
+            crate::TransmitKind::Control,
+        )
     }
 
     pub(crate) fn send_sctp(&mut self, packet: &[u8], now: Instant) -> Result<(), TransportError> {
@@ -902,7 +845,6 @@ impl Transport {
         }
         self.transmissions.clear();
         self.events.clear();
-        self.authenticated.clear();
         self.pending_dtls.clear();
         if let Some(dtls) = self.dtls.as_mut() {
             dtls.clear_pending();
@@ -924,7 +866,6 @@ impl Transport {
         self.next_deadline = None;
         self.transmissions.clear();
         self.events.clear();
-        self.authenticated.clear();
         self.pending_dtls.clear();
         self.dtls = None;
         self.srtp = None;
@@ -934,6 +875,7 @@ impl Transport {
     fn send_secure(
         &mut self,
         packet: &[u8],
+        index: Option<u64>,
         kind: DatagramKind,
         classification: crate::TransmitKind,
     ) -> Result<(), TransportError> {
@@ -975,6 +917,7 @@ impl Transport {
             Some(PreparedRtpIdentity {
                 ssrc: metadata.ssrc,
                 sequence: metadata.sequence,
+                index: index.ok_or(TransportError::InvalidInput)?,
                 twcc_sequence,
                 service: classification
                     .rtp_service()
@@ -987,7 +930,9 @@ impl Transport {
             return Err(TransportError::Protocol);
         };
         let bytes = match kind {
-            DatagramKind::Rtp => srtp.protect_rtp(packet),
+            DatagramKind::Rtp => {
+                srtp.protect_rtp(packet, index.ok_or(TransportError::InvalidInput)?)
+            }
             DatagramKind::Rtcp => srtp.protect_rtcp(packet),
             _ => Err(SrtpError::InvalidPacket),
         }
@@ -1253,27 +1198,15 @@ impl Transport {
         local: SocketAddr,
         remote: SocketAddr,
     ) -> Option<SelectedPath> {
-        match proto {
-            is::Protocol::Udp => {
-                self.local_candidates_contains(local, proto)
-                    .then_some(SelectedPath::unselected(NetworkEnvelope::Udp {
-                        local,
-                        remote,
-                    }))
-            }
-            is::Protocol::Tcp => self
-                .tcp_flows
-                .iter()
-                .find(|binding| binding.local == local && binding.remote == remote)
-                .map(|binding| {
-                    SelectedPath::unselected(NetworkEnvelope::IceTcp {
-                        flow: binding.flow,
-                        local,
-                        remote,
-                    })
-                }),
-            _ => None,
+        if !self.local_candidates_contains(local, proto) {
+            return None;
         }
+        let envelope = match proto {
+            is::Protocol::Udp => NetworkEnvelope::Udp { local, remote },
+            is::Protocol::Tcp => NetworkEnvelope::IceTcp { local, remote },
+            _ => return None,
+        };
+        Some(SelectedPath::unselected(envelope))
     }
 
     fn accepts_path(&self, path: &SelectedPath) -> bool {
@@ -1289,19 +1222,7 @@ impl Transport {
         {
             return false;
         }
-        match path.envelope {
-            NetworkEnvelope::Udp { .. } => true,
-            NetworkEnvelope::IceTcp {
-                flow,
-                local,
-                remote,
-            } => self.tcp_flows.iter().any(|binding| {
-                binding.authenticated
-                    && binding.flow == flow
-                    && binding.local == local
-                    && binding.remote == remote
-            }),
-        }
+        true
     }
 
     fn select_path(&mut self, mut path: SelectedPath) -> Result<(), TransportError> {
@@ -1350,100 +1271,6 @@ impl Transport {
     fn can_queue_path(&self, path: &SelectedPath) -> bool {
         self.ice
             .can_queue_tuple(path.source(), path.destination(), path.protocol())
-            && match path.envelope {
-                NetworkEnvelope::Udp { .. } => true,
-                NetworkEnvelope::IceTcp {
-                    flow,
-                    local,
-                    remote,
-                } => self.tcp_flows.iter().any(|binding| {
-                    binding.authenticated
-                        && binding.flow == flow
-                        && binding.local == local
-                        && binding.remote == remote
-                }),
-            }
-    }
-
-    fn observe_authenticated(&mut self, envelope: &NetworkEnvelope) {
-        let flow = match *envelope {
-            NetworkEnvelope::Udp { local, remote } => AuthenticatedFlow::Udp { local, remote },
-            NetworkEnvelope::IceTcp {
-                flow,
-                local,
-                remote,
-            } => AuthenticatedFlow::IceTcp {
-                flow,
-                local,
-                remote,
-            },
-        };
-        if self.authenticated.contains(&flow) {
-            return;
-        }
-        if self.authenticated.len() == MAX_AUTHENTICATED_OBSERVATIONS {
-            self.authenticated.pop_front();
-        }
-        self.authenticated.push_back(flow);
-    }
-
-    pub(crate) fn admit_tcp_flow(
-        &mut self,
-        flow: IceTcpFlowId,
-        local: SocketAddr,
-        remote: SocketAddr,
-    ) -> Result<(), TransportError> {
-        if matches!(self.state, TransportState::Closed | TransportState::Failed) {
-            return Err(TransportError::Closed);
-        }
-        if !self.local_candidates_contains(local, is::Protocol::Tcp) {
-            return Err(TransportError::InvalidInput);
-        }
-        if let Some(binding) = self.tcp_flows.iter().find(|binding| binding.flow == flow) {
-            return if (binding.local, binding.remote) == (local, remote) {
-                Ok(())
-            } else {
-                Err(TransportError::InvalidInput)
-            };
-        }
-        if self
-            .tcp_flows
-            .iter()
-            .any(|binding| (binding.local, binding.remote) == (local, remote))
-        {
-            return Err(TransportError::InvalidInput);
-        }
-        if self.tcp_flows.len() == MAX_TCP_FLOWS {
-            return Err(TransportError::QueueFull);
-        }
-        self.tcp_flows.push(TcpFlowBinding {
-            flow,
-            local,
-            remote,
-            authenticated: false,
-        });
-        Ok(())
-    }
-
-    pub(crate) fn retire_tcp_flow(&mut self, flow: IceTcpFlowId) -> Result<(), TransportError> {
-        self.tcp_flows.retain(|binding| binding.flow != flow);
-        self.transmissions
-            .retain(|prepared| prepared.target != TransmitTarget::IceTcp { flow });
-        self.pending_dtls
-            .retain(|(path, _)| !path.envelope.is_tcp_flow(flow));
-        self.authenticated
-            .retain(|observation| !matches!(observation, AuthenticatedFlow::IceTcp { flow: id, .. } if *id == flow));
-        self.events.retain(|event| {
-            !matches!(event, TransportEvent::IceAuthenticated(AuthenticatedFlow::IceTcp { flow: id, .. }) if *id == flow)
-        });
-        if self
-            .selected
-            .as_ref()
-            .is_some_and(|path| path.envelope.is_tcp_flow(flow))
-        {
-            self.clear_selected_path()?;
-        }
-        Ok(())
     }
 
     fn drop_input(&mut self) {
@@ -1465,7 +1292,6 @@ impl Transport {
         self.next_deadline = None;
         self.transmissions.clear();
         self.events.clear();
-        self.authenticated.clear();
         self.pending_dtls.clear();
         self.dtls = None;
         self.srtp = None;
@@ -1596,13 +1422,7 @@ mod tests {
                 right
                     .receive(
                         *now,
-                        pulsebeam_rtc::PacketObservation {
-                            at: pulsebeam_rtc::TimePoint {
-                                monotonic: *now,
-                                global: pulsebeam_rtc::GlobalMediaTime::from_micros(0),
-                            },
-                            provenance: 0,
-                        },
+                        *now,
                         NetworkInput::Udp {
                             local: remote,
                             remote: local,
@@ -1619,13 +1439,7 @@ mod tests {
                 };
                 left.receive(
                     *now,
-                    pulsebeam_rtc::PacketObservation {
-                        at: pulsebeam_rtc::TimePoint {
-                            monotonic: *now,
-                            global: pulsebeam_rtc::GlobalMediaTime::from_micros(0),
-                        },
-                        provenance: 0,
-                    },
+                    *now,
                     NetworkInput::Udp {
                         local: remote,
                         remote: local,
@@ -1662,629 +1476,113 @@ mod tests {
     }
 
     #[test]
-    fn authenticated_observations_coalesce_and_shed_without_consuming_protocol_capacity() {
-        use is::Sha1HmacProvider;
-        let now = Instant::now();
-        let local = address(5000);
-        let peer = certificate();
-        let mut transport = Transport::new(
-            config(local, address(5001), certificate(), &peer, false),
-            now,
-        )
-        .expect("transport");
-        let message = is::stun::StunMessage::binding_request(
-            "right:left",
-            is::stun::TransId::new(),
-            true,
-            2,
-            1000,
-            false,
-        );
-        let mut packet = [0; 512];
-        let length = message
-            .to_bytes(
-                Some(b"rightpasswordabcdefghijklmnop"),
-                &mut packet,
-                |key, payloads| is::DefaultSha1HmacProvider.sha1_hmac(key, payloads),
-            )
-            .expect("request");
-        for port in 5100..5180 {
-            for _ in 0..2 {
-                transport
-                    .handle_datagram(now, address(port), local, packet[..length].to_vec())
-                    .expect("authenticated STUN");
-                while transport.poll_prepared().is_some() {}
-            }
-        }
-        let mut observed = Vec::new();
-        while let Some(event) = transport.poll_event() {
-            if let TransportEvent::IceAuthenticated(flow) = event {
-                observed.push(flow);
-            }
-        }
-        let expected = (5116..5180)
-            .map(|port| AuthenticatedFlow::Udp {
-                local,
-                remote: address(port),
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(observed, expected);
-        assert_ne!(transport.state(), TransportState::Failed);
-
-        transport
-            .handle_datagram(now, address(5180), local, packet[..length].to_vec())
-            .expect("next STUN");
-        transport.abort();
-        assert!(transport.poll_event().is_none());
-    }
-
-    #[test]
-    fn classification_is_unambiguous() {
-        assert_eq!(
-            Transport::classify(&[0, 1, 0, 0, 0x21, 0x12, 0xa4, 0x42]),
-            None
-        );
-        assert_eq!(Transport::classify(&[0x16, 0, 0]), Some(DatagramKind::Dtls));
-        assert_eq!(
-            Transport::classify(&[0x80, 192, 0, 1, 0, 0, 0, 0]),
-            Some(DatagramKind::Rtcp)
-        );
-        assert_eq!(
-            Transport::classify(&[0x80, 200, 0, 1, 0, 0, 0, 0]),
-            Some(DatagramKind::Rtcp)
-        );
-        assert_eq!(
-            Transport::classify(&[0x80, 201, 0, 1, 0, 0, 0, 0]),
-            Some(DatagramKind::Rtcp)
-        );
-        assert_eq!(
-            Transport::classify(&[0x80, 203, 0, 1, 0, 0, 0, 0]),
-            Some(DatagramKind::Rtcp)
-        );
-        assert_eq!(
-            Transport::classify(&[0x80, 223, 0, 1, 0, 0, 0, 0]),
-            Some(DatagramKind::Rtcp)
-        );
-        assert_eq!(
-            Transport::classify(&[0x80, 224, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0]),
-            Some(DatagramKind::Rtp)
-        );
-        assert_eq!(Transport::classify(&[0x80, 224, 0, 0, 0, 0, 0, 0]), None);
-        assert_eq!(Transport::classify(&[0x80, 224, 0, 1, 0, 0, 0, 0]), None);
-        assert_eq!(
-            Transport::classify(&[0x80, 224, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0]),
-            Some(DatagramKind::Rtp)
-        );
-        assert_eq!(Transport::classify(&[0xff; 12]), None);
-        assert_eq!(Transport::classify(&[0x80]), None);
-        assert_eq!(Transport::classify(&[0x80, 200]), None);
-    }
-
-    #[test]
-    #[allow(
-        clippy::disallowed_types,
-        reason = "NetworkInput is intentionally Bytes-backed"
-    )]
-    fn ice_tcp_frames_are_complete_and_flow_bound() {
-        let local_certificate = certificate();
-        let remote_certificate = certificate();
-        let local = address(6100);
-        let remote = address(6101);
-        let mut transport = Transport::new(
-            TransportConfig::new(
-                IceCreds {
-                    ufrag: "local".to_owned(),
-                    pass: "localpasswordabcdefghijklmnop".to_owned(),
-                },
-                Candidate::builder()
-                    .tcp()
-                    .host(local)
-                    .tcptype(str0m::net::TcpType::Passive)
-                    .build()
-                    .expect("passive local"),
-                IceCreds {
-                    ufrag: "remote".to_owned(),
-                    pass: "remotepasswordabcdefghijklmnop".to_owned(),
-                },
-                vec![
-                    Candidate::builder()
-                        .tcp()
-                        .host(remote)
-                        .tcptype(str0m::net::TcpType::Passive)
-                        .build()
-                        .expect("passive remote"),
-                ]
-                .into_boxed_slice(),
-                local_certificate,
-                fingerprint(&remote_certificate),
-                DtlsRole::Active,
-            ),
-            Instant::now(),
-        )
-        .expect("mixed transport configuration");
-        let now = Instant::now();
-        assert_eq!(
-            validate_rfc4571(&[0, 2, 1]),
-            Err(TransportError::InvalidInput)
-        );
-        assert_eq!(validate_rfc4571(&[0, 0]), Err(TransportError::InvalidInput));
-        transport
-            .admit_tcp_flow(IceTcpFlowId::from_value(7), local, remote)
-            .expect("admit accepted stream");
-        transport
-            .receive(
-                now,
-                pulsebeam_rtc::PacketObservation {
-                    at: pulsebeam_rtc::TimePoint {
-                        monotonic: now,
-                        global: pulsebeam_rtc::GlobalMediaTime::from_micros(0),
-                    },
-                    provenance: 0,
-                },
-                NetworkInput::IceTcp {
-                    flow: IceTcpFlowId::from_value(7),
-                    local,
-                    remote,
-                    frame: bytes::Bytes::from_static(&[0, 1, 0]),
-                },
-            )
-            .expect("complete unknown frame is dropped");
-        transport
-            .receive(
-                now,
-                pulsebeam_rtc::PacketObservation {
-                    at: pulsebeam_rtc::TimePoint {
-                        monotonic: now,
-                        global: pulsebeam_rtc::GlobalMediaTime::from_micros(0),
-                    },
-                    provenance: 0,
-                },
-                NetworkInput::IceTcp {
-                    flow: IceTcpFlowId::from_value(7),
-                    local,
-                    remote: address(6102),
-                    frame: bytes::Bytes::from_static(&[0, 1, 0]),
-                },
-            )
-            .expect("rebound flow is dropped");
-        assert_eq!(transport.tcp_flows.len(), 1);
-        assert!(transport.dropped_inputs >= 2);
-    }
-
-    #[test]
-    fn prepared_ice_tcp_is_framed_and_flow_targeted() {
-        let local_certificate = certificate();
-        let remote_certificate = certificate();
-        let local = address(6200);
-        let remote = address(6201);
-        let mut transport = Transport::new(
-            TransportConfig::new(
-                IceCreds {
-                    ufrag: "local".to_owned(),
-                    pass: "localpasswordabcdefghijklmnop".to_owned(),
-                },
-                Candidate::builder()
-                    .tcp()
-                    .host(local)
-                    .tcptype(str0m::net::TcpType::Passive)
-                    .build()
-                    .expect("passive local"),
-                IceCreds {
-                    ufrag: "remote".to_owned(),
-                    pass: "remotepasswordabcdefghijklmnop".to_owned(),
-                },
-                vec![
-                    Candidate::builder()
-                        .tcp()
-                        .host(remote)
-                        .tcptype(str0m::net::TcpType::Passive)
-                        .build()
-                        .expect("passive remote"),
-                ]
-                .into_boxed_slice(),
-                local_certificate,
-                fingerprint(&remote_certificate),
-                DtlsRole::Active,
-            ),
-            Instant::now(),
-        )
-        .expect("transport");
-        transport.transmissions.clear();
-        transport
-            .prepare_transmit(
-                SelectedPath::unselected(NetworkEnvelope::IceTcp {
-                    flow: IceTcpFlowId::from_value(9),
-                    local,
-                    remote,
-                }),
-                vec![1, 2, 3],
-                DatagramKind::Dtls,
-                None,
-                crate::TransmitKind::Control,
-            )
-            .expect("prepared frame");
-        let prepared = transport.poll_prepared().expect("prepared output");
-        assert_eq!(
-            prepared.target,
-            TransmitTarget::IceTcp {
-                flow: IceTcpFlowId::from_value(9)
-            }
-        );
-        assert_eq!(prepared.bytes, vec![0, 3, 1, 2, 3]);
-        assert_eq!(prepared.wire_len, prepared.bytes.len());
-        assert_eq!(prepared.path_epoch, None);
-        assert_eq!(prepared.rtp, None);
-    }
-
-    #[test]
-    fn retirement_cancels_all_flow_records_and_publishes_path_loss_first() {
-        let local = address(6240);
-        let remote = address(6241);
-        let mut cfg = config(local, remote, certificate(), &certificate(), true);
-        cfg.local_candidates = vec![
-            Candidate::builder()
-                .tcp()
-                .host(local)
-                .tcptype(str0m::net::TcpType::Passive)
-                .build()
-                .expect("passive candidate"),
-        ]
-        .into_boxed_slice();
-        let mut transport = Transport::new(cfg, Instant::now()).expect("transport");
-        let flow = IceTcpFlowId::from_value(1);
-        let other = IceTcpFlowId::from_value(2);
-        let other_remote = address(6242);
-        transport
-            .admit_tcp_flow(flow, local, remote)
-            .expect("first stream");
-        transport
-            .admit_tcp_flow(other, local, other_remote)
-            .expect("other stream");
-        transport.events.clear();
-        transport.transmissions.clear();
-        let envelope = NetworkEnvelope::IceTcp {
-            flow,
-            local,
-            remote,
-        };
-        transport
-            .select_path(SelectedPath::unselected(envelope.clone()))
-            .expect("select");
-        let path = transport.selected.clone().expect("selected");
-        for kind in [
-            DatagramKind::Stun,
-            DatagramKind::Dtls,
-            DatagramKind::Rtcp,
-            DatagramKind::Sctp,
-            DatagramKind::Rtp,
-        ] {
-            let rtp = (kind == DatagramKind::Rtp).then_some(PreparedRtpIdentity {
-                ssrc: 7,
-                sequence: 9,
-                twcc_sequence: None,
-                service: RtpService::Original,
-            });
-            transport
-                .prepare_transmit(
-                    path.clone(),
-                    vec![1, 2, 3],
-                    kind,
-                    rtp,
-                    (rtp)
-                        .map(|identity| crate::test_source::transmit_kind(identity.service))
-                        .unwrap_or(crate::TransmitKind::Control),
-                )
-                .expect("queue flow record");
-        }
-        transport.pending_dtls.push_back((path, vec![0x16, 0, 0]));
-        transport.observe_authenticated(&envelope);
-        transport
-            .prepare_transmit(
-                SelectedPath::unselected(NetworkEnvelope::IceTcp {
-                    flow: other,
-                    local,
-                    remote: other_remote,
-                }),
-                vec![1],
-                DatagramKind::Stun,
-                None,
-                crate::TransmitKind::Control,
-            )
-            .expect("unrelated reply");
-
-        transport.retire_tcp_flow(flow).expect("retire selected");
-        assert!(transport.selected.is_none());
-        assert!(!transport.can_send_user_data());
-        assert!(transport.pending_dtls.is_empty());
-        assert_eq!(transport.tcp_flows.len(), 1);
-        assert!(
-            matches!(transport.poll_event(), Some(TransportEvent::SelectedPathChanged {
-            previous: Some(previous), current: None, epoch: PathEpoch(2),
-        }) if previous == envelope)
-        );
-        assert!(
-            transport.poll_event().is_none(),
-            "retired authentication is removed"
-        );
-        let remaining = transport.poll_prepared().expect("unrelated reply survives");
-        assert_eq!(remaining.target, TransmitTarget::IceTcp { flow: other });
-        assert!(
-            transport.poll_prepared().is_none(),
-            "all retired records were discarded"
-        );
-    }
-
-    #[test]
-    fn latest_selected_path_precedes_queued_old_path_feedback() {
-        let local_certificate = certificate();
-        let remote_certificate = certificate();
-        let local = address(6260);
-        let remote = address(6261);
-        let now = Instant::now();
-        let mut transport = Transport::new(
-            config(local, remote, local_certificate, &remote_certificate, true),
-            now,
-        )
-        .expect("transport");
-        transport.events.clear();
-        transport.transmissions.clear();
-        let path = || SelectedPath::unselected(NetworkEnvelope::Udp { local, remote });
-        transport.select_path(path()).expect("initial path");
-        transport.poll_event().expect("initial selection");
-        let old_feedback = TransportEvent::Rtcp {
-            arrival: TimePoint {
-                monotonic: now,
-                global: GlobalMediaTime::from_micros(0),
-            },
-            path_epoch: PathEpoch(1),
-            bytes: vec![0x80, 201, 0, 1, 0, 0, 0, 7],
-        };
-        transport.push_event(old_feedback).expect("old feedback");
-        transport.clear_selected_path().expect("unavailable");
-        transport.select_path(path()).expect("replacement");
-        assert!(matches!(
-            transport.poll_event(),
-            Some(TransportEvent::SelectedPathChanged {
-                current: Some(_),
-                epoch: PathEpoch(3),
-                ..
-            })
-        ));
-        assert!(matches!(
-            transport.poll_event(),
-            Some(TransportEvent::Rtcp {
-                path_epoch: PathEpoch(1),
-                ..
-            })
-        ));
-        assert!(
-            transport.poll_event().is_none(),
-            "superseded transitions must not rewind history"
-        );
-        transport
-            .push_event(TransportEvent::Data(vec![1]))
-            .expect("data");
-        transport.clear_selected_path().expect("unavailable");
-        assert!(matches!(
-            transport.poll_event(),
-            Some(TransportEvent::SelectedPathChanged {
-                current: None,
-                epoch: PathEpoch(4),
-                ..
-            })
-        ));
-        assert_eq!(transport.poll_event(), Some(TransportEvent::Data(vec![1])));
-    }
-
-    #[test]
-    fn selected_path_epochs_do_not_reuse_tuples_and_drop_stale_rtp() {
-        let local_certificate = certificate();
-        let remote_certificate = certificate();
-        let local = address(6250);
-        let remote = address(6251);
-        let mut transport = Transport::new(
-            config(local, remote, local_certificate, &remote_certificate, true),
-            Instant::now(),
-        )
-        .expect("transport");
-        transport.events.clear();
-        transport.transmissions.clear();
-
-        let path = || SelectedPath::unselected(NetworkEnvelope::Udp { local, remote });
-        transport.select_path(path()).expect("first selection");
-        let first = transport.selected.clone().expect("selected path");
-        assert_eq!(first.epoch, Some(PathEpoch(1)));
-        assert!(matches!(
-            transport.poll_event(),
-            Some(TransportEvent::SelectedPathChanged {
-                previous: None,
-                current: Some(NetworkEnvelope::Udp { local: event_local, remote: event_remote }),
-                epoch: PathEpoch(1),
-            }) if event_local == local && event_remote == remote
-        ));
-
-        transport
-            .prepare_transmit(
-                first,
-                vec![0x80; 12],
-                DatagramKind::Rtp,
-                Some(PreparedRtpIdentity {
-                    ssrc: 7,
-                    sequence: 9,
-                    twcc_sequence: None,
-                    service: RtpService::Original,
-                }),
-                (Some(PreparedRtpIdentity {
-                    ssrc: 7,
-                    sequence: 9,
-                    twcc_sequence: None,
-                    service: RtpService::Original,
-                }))
-                .map(|identity| crate::test_source::transmit_kind(identity.service))
-                .unwrap_or(crate::TransmitKind::Control),
-            )
-            .expect("queued RTP");
-        transport
-            .select_path(path())
-            .expect("same tuple replacement");
-        assert!(transport.poll_prepared().is_none());
-        assert!(matches!(
-            transport.poll_event(),
-            Some(TransportEvent::SelectedPathChanged {
-                epoch: PathEpoch(2),
-                ..
-            })
-        ));
-
-        transport
-            .clear_selected_path()
-            .expect("clear selected path");
-        assert!(matches!(
-            transport.poll_event(),
-            Some(TransportEvent::SelectedPathChanged {
-                current: None,
-                epoch: PathEpoch(3),
-                ..
-            })
-        ));
-        transport.select_path(path()).expect("reselect tuple");
-        assert_eq!(
-            transport.selected.and_then(|selected| selected.epoch),
-            Some(PathEpoch(4))
-        );
-    }
-
-    #[test]
-    #[allow(
-        clippy::disallowed_types,
-        reason = "NetworkInput is intentionally Bytes-backed"
-    )]
-    fn tcp_flow_bindings_are_bounded() {
-        let local_certificate = certificate();
-        let remote_certificate = certificate();
-        let local = address(6300);
-        let remote = address(6301);
-        let mut transport = Transport::new(
-            TransportConfig::new(
-                IceCreds {
-                    ufrag: "local".to_owned(),
-                    pass: "localpasswordabcdefghijklmnop".to_owned(),
-                },
-                Candidate::builder()
-                    .tcp()
-                    .host(local)
-                    .tcptype(str0m::net::TcpType::Passive)
-                    .build()
-                    .expect("passive local"),
-                IceCreds {
-                    ufrag: "remote".to_owned(),
-                    pass: "remotepasswordabcdefghijklmnop".to_owned(),
-                },
-                vec![
-                    Candidate::builder()
-                        .tcp()
-                        .host(remote)
-                        .tcptype(str0m::net::TcpType::Passive)
-                        .build()
-                        .expect("passive remote"),
-                ]
-                .into_boxed_slice(),
-                local_certificate,
-                fingerprint(&remote_certificate),
-                DtlsRole::Active,
-            ),
-            Instant::now(),
-        )
-        .expect("transport");
-        for value in 0..MAX_TCP_FLOWS {
-            let mut remote = remote;
-            remote.set_port(7_000 + u16::try_from(value).expect("bounded flow count"));
-            transport
-                .admit_tcp_flow(IceTcpFlowId::from_value(value as u64), local, remote)
-                .expect("bounded admission");
-        }
-        assert_eq!(
-            transport.admit_tcp_flow(IceTcpFlowId::from_value(999), local, remote),
-            Err(TransportError::QueueFull)
-        );
-        transport.dropped_inputs = 0;
-        transport
-            .receive(
-                Instant::now(),
-                pulsebeam_rtc::PacketObservation {
-                    at: pulsebeam_rtc::TimePoint {
-                        monotonic: Instant::now(),
-                        global: pulsebeam_rtc::GlobalMediaTime::from_micros(0),
-                    },
-                    provenance: 0,
-                },
-                NetworkInput::IceTcp {
-                    flow: IceTcpFlowId::from_value(999),
-                    local,
-                    remote,
-                    frame: bytes::Bytes::from_static(&[0, 1, 0]),
-                },
-            )
-            .expect_err("unknown flow input is rejected");
-        assert_eq!(transport.tcp_flows.len(), MAX_TCP_FLOWS);
-        assert_eq!(transport.dropped_inputs, 1);
-        transport
-            .retire_tcp_flow(IceTcpFlowId::from_value(0))
-            .expect("retire first flow");
-        assert_eq!(transport.tcp_flows.len(), MAX_TCP_FLOWS - 1);
-        transport
-            .admit_tcp_flow(IceTcpFlowId::from_value(999), local, remote)
-            .expect("retirement reclaims capacity");
-        assert_eq!(transport.tcp_flows.len(), MAX_TCP_FLOWS);
-    }
-
-    #[test]
-    #[allow(
-        clippy::disallowed_types,
-        reason = "NetworkInput is intentionally Bytes-backed"
-    )]
-    fn rejected_stun_is_counted_once_without_progress() {
+    fn secure_transport_preserves_caller_indices_arrivals_and_crypto_boundaries() {
         let left_certificate = certificate();
         let right_certificate = certificate();
-        let now = Instant::now();
-        let mut transport = Transport::new(
+        let mut now = Instant::now();
+        let mut left = Transport::new(
             config(
-                address(6400),
-                address(6401),
-                left_certificate,
+                address(4000),
+                address(4001),
+                left_certificate.clone(),
                 &right_certificate,
                 true,
             ),
             now,
         )
-        .expect("transport");
-        let events = transport.events.len();
-        let dropped = transport.dropped_inputs;
-        let mut malformed_stun = vec![0; 20];
-        malformed_stun[4..8].copy_from_slice(&[0x21, 0x12, 0xa4, 0x42]);
+        .unwrap();
+        let mut right = Transport::new(
+            config(
+                address(4001),
+                address(4000),
+                right_certificate,
+                &left_certificate,
+                false,
+            ),
+            now,
+        )
+        .unwrap();
+        connect(&mut left, &mut right, &mut now);
+        assert_eq!(left.negotiated_security(), right.negotiated_security());
+        assert!(left.negotiated_security().is_some());
+        let mut replay = None;
+        for index in [65_534_u64, 65_536, 65_535, 65_538, 65_537] {
+            let mut packet = vec![0xa0, 96];
+            packet.extend_from_slice(&u16::try_from(index & 0xffff).unwrap().to_be_bytes());
+            packet.extend_from_slice(&[0, 0, 0, 1, 0, 0, 0, 7, 9, 8, 7, 0, 0, 3]);
+            left.send_rtp_with_info(&packet, index, crate::TransmitKind::Original { ssrc: 7 })
+                .expect("caller-indexed SRTP");
+            let prepared = left.poll_prepared().expect("protected packet");
+            assert_eq!(prepared.wire_len, prepared.bytes.len());
+            assert_eq!(prepared.rtp.unwrap().index, index);
+            if replay.is_none() {
+                replay = Some(prepared.bytes.clone());
+            }
+            let TransmitTarget::Udp { local, remote, .. } = prepared.target else {
+                panic!("UDP fixture");
+            };
+            right
+                .receive(
+                    now,
+                    now,
+                    NetworkInput::Udp {
+                        local: remote,
+                        remote: local,
+                        ecn: None,
+                        payload: prepared.bytes.into(),
+                    },
+                )
+                .unwrap();
+            let event = std::iter::from_fn(|| right.poll_event())
+                .find(|event| matches!(event, TransportEvent::Rtp { .. }))
+                .expect("authenticated late/wrapped primary");
+            assert!(
+                matches!(event, TransportEvent::Rtp { bytes, arrival, .. } if bytes == packet && arrival == now)
+            );
+        }
+        right
+            .handle_datagram(now, address(4000), address(4001), replay.unwrap())
+            .expect("ciphertext replay is dropped");
+        assert!(
+            !std::iter::from_fn(|| right.poll_event())
+                .any(|event| matches!(event, TransportEvent::Rtp { .. }))
+        );
 
-        transport
+        let rtcp = vec![0x80, 201, 0, 1, 0, 0, 0, 7];
+        left.send_rtcp(&rtcp).expect("SRTCP");
+        let packet = left.poll_transmit().unwrap();
+        let arrival = now;
+        now += Duration::from_millis(50);
+        right
             .receive(
                 now,
-                pulsebeam_rtc::PacketObservation {
-                    at: pulsebeam_rtc::TimePoint {
-                        monotonic: now,
-                        global: pulsebeam_rtc::GlobalMediaTime::from_micros(0),
-                    },
-                    provenance: 0,
-                },
+                arrival,
                 NetworkInput::Udp {
-                    local: address(6400),
-                    remote: address(6401),
+                    local: packet.destination,
+                    remote: packet.source,
                     ecn: None,
-                    payload: Bytes::from(malformed_stun),
+                    payload: packet.bytes.into(),
                 },
             )
-            .expect("malformed STUN is dropped");
+            .unwrap();
+        assert_eq!(right.last_now, Some(now));
+        assert!(std::iter::from_fn(|| right.poll_event()).any(|event| matches!(event, TransportEvent::Rtcp { bytes, arrival: at, .. } if bytes == rtcp && at == arrival)));
 
-        assert_eq!(transport.dropped_inputs, dropped + 1);
-        assert_eq!(transport.events.len(), events);
-        assert_eq!(transport.state(), TransportState::Checking);
+        let packet = [0x80, 96, 0, 3, 0, 0, 0, 1, 0, 0, 0, 8, 1];
+        left.send_rtp_with_info(&packet, 3, crate::TransmitKind::Original { ssrc: 8 })
+            .unwrap();
+        let mut encrypted = left.poll_transmit().unwrap();
+        *encrypted.bytes.last_mut().unwrap() ^= 1;
+        assert_eq!(
+            right.handle_datagram(
+                now,
+                encrypted.source,
+                encrypted.destination,
+                encrypted.bytes
+            ),
+            Err(TransportError::Crypto)
+        );
+        assert_eq!(right.state(), TransportState::Failed);
     }
 
     #[test]
@@ -2335,173 +1633,6 @@ mod tests {
         )
         .with_rtp_payload_types(vec![96].into_boxed_slice(), vec![96].into_boxed_slice());
         assert!(valid_config.validate().is_ok());
-    }
-
-    #[test]
-    fn secure_transport_connects_and_exchanges_protected_media() {
-        let left_certificate = certificate();
-        let right_certificate = certificate();
-        let mut left = Transport::new(
-            config(
-                address(4000),
-                address(4001),
-                left_certificate.clone(),
-                &right_certificate,
-                true,
-            ),
-            Instant::now(),
-        )
-        .expect("left transport");
-        let mut right = Transport::new(
-            config(
-                address(4001),
-                address(4000),
-                right_certificate,
-                &left_certificate,
-                false,
-            ),
-            Instant::now(),
-        )
-        .expect("right transport");
-        let mut now = Instant::now();
-        connect(&mut left, &mut right, &mut now);
-        assert_eq!(
-            left.negotiated_security(),
-            Some((
-                str0m::crypto::dtls::ProtocolVersion::DTLS1_3,
-                str0m::crypto::dtls::SrtpProfile::AEAD_AES_256_GCM,
-            ))
-        );
-        assert_eq!(left.negotiated_security(), right.negotiated_security());
-        assert_eq!(left.next_deadline(), None);
-        assert_eq!(right.next_deadline(), None);
-
-        right
-            .handle_datagram(
-                now,
-                address(4000),
-                address(4001),
-                vec![0x90, 96, 0, 1, 0, 0, 0, 1, 0, 0, 0, 7],
-            )
-            .expect("truncated clear RTP extension is ignored");
-        assert!(
-            !std::iter::from_fn(|| right.poll_event())
-                .any(|event| matches!(event, TransportEvent::Rtp { .. }))
-        );
-
-        let mut rtp = vec![0x80, 96, 0, 1, 0, 0, 0, 1, 0, 0, 0, 7, 1, 2, 3];
-        left.send_rtp(&rtp).expect("left protects RTP");
-        let transmit = left.poll_prepared().expect("protected RTP transmit");
-        assert_eq!(transmit.kind, DatagramKind::Rtp);
-        assert_eq!(transmit.wire_len, transmit.bytes.len());
-        assert_eq!(transmit.path_epoch, Some(PathEpoch(1)));
-        assert_eq!(
-            transmit.rtp,
-            Some(PreparedRtpIdentity {
-                ssrc: 7,
-                sequence: 1,
-                twcc_sequence: None,
-                service: RtpService::Original,
-            })
-        );
-        let TransmitTarget::Udp { local, remote, .. } = transmit.target else {
-            panic!("UDP fixture routes UDP transmissions");
-        };
-        right
-            .handle_datagram(now, local, remote, transmit.bytes)
-            .expect("right handles RTP");
-        let event = std::iter::from_fn(|| right.poll_event())
-            .find(|event| matches!(event, TransportEvent::Rtp { .. }))
-            .expect("authenticated RTP event");
-        if let TransportEvent::Rtp {
-            bytes, metadata, ..
-        } = event
-        {
-            assert_eq!(bytes, rtp);
-            assert_eq!(metadata.ssrc, 7);
-        }
-
-        let padded_rtp = vec![
-            0xa0, 96, 0xff, 0xff, 0, 0, 0, 1, 0, 0, 0, 8, 9, 8, 7, 0, 0, 3,
-        ];
-        left.send_rtp(&padded_rtp)
-            .expect("left protects padded RTP");
-        let transmit = left.poll_transmit().expect("padded RTP transmit");
-        right
-            .handle_datagram(now, transmit.source, transmit.destination, transmit.bytes)
-            .expect("right handles padded RTP");
-        assert!(std::iter::from_fn(|| right.poll_event()).any(
-            |event| matches!(event, TransportEvent::Rtp { bytes, metadata, .. } if bytes == padded_rtp && metadata.ssrc == 8)
-        ));
-
-        let mut wrapped_rtp = padded_rtp;
-        wrapped_rtp[2..4].copy_from_slice(&0_u16.to_be_bytes());
-        left.send_rtp(&wrapped_rtp)
-            .expect("left protects post-wrap RTP");
-        let transmit = left.poll_transmit().expect("post-wrap RTP transmit");
-        right
-            .handle_datagram(now, transmit.source, transmit.destination, transmit.bytes)
-            .expect("right handles post-wrap RTP");
-        assert!(std::iter::from_fn(|| right.poll_event()).any(
-            |event| matches!(event, TransportEvent::Rtp { metadata, .. } if metadata.sequence == 0)
-        ));
-
-        let rtcp = vec![0x80, 201, 0, 1, 0, 0, 0, 7];
-        left.send_rtcp(&rtcp).expect("left protects RTCP");
-        let transmit = left.poll_transmit().expect("protected RTCP transmit");
-        let observation = crate::PacketObservation {
-            at: TimePoint {
-                monotonic: now,
-                global: GlobalMediaTime::from_micros(17),
-            },
-            provenance: 23,
-        };
-        now += Duration::from_millis(50);
-        right
-            .receive(
-                now,
-                observation,
-                NetworkInput::Udp {
-                    local: transmit.destination,
-                    remote: transmit.source,
-                    ecn: None,
-                    payload: transmit.bytes.into(),
-                },
-            )
-            .expect("right handles delayed authenticated RTCP");
-        assert_eq!(right.last_now, Some(now), "protocol execution advances");
-        assert!(
-            std::iter::from_fn(|| right.poll_event())
-                .any(|event| matches!(event, TransportEvent::Rtcp { bytes, arrival, .. } if bytes == rtcp && arrival == observation.at))
-        );
-
-        rtp[3] = 1;
-        left.send_rtp(&rtp).expect("second RTP");
-        let transmit = left.poll_transmit().expect("second RTP transmit");
-        let duplicate = transmit.bytes.clone();
-        right
-            .handle_datagram(now, transmit.source, transmit.destination, transmit.bytes)
-            .expect("first packet accepted");
-        right
-            .handle_datagram(now, transmit.source, transmit.destination, duplicate)
-            .expect("replay dropped");
-        assert!(!std::iter::from_fn(|| right.poll_event()).any(
-            |event| matches!(event, TransportEvent::Rtp { metadata, .. } if metadata.sequence == 1)
-        ));
-
-        rtp[3] = 2;
-        left.send_rtp(&rtp).expect("corruption source packet");
-        let mut corrupt = left.poll_transmit().expect("corruption transmit");
-        let last = corrupt.bytes.len().checked_sub(1).expect("auth tag exists");
-        *corrupt
-            .bytes
-            .get_mut(last)
-            .expect("last index was derived from packet length") ^= 1;
-        assert_eq!(
-            right.handle_datagram(now, corrupt.source, corrupt.destination, corrupt.bytes),
-            Err(TransportError::Crypto)
-        );
-        assert_eq!(right.state(), TransportState::Failed);
     }
 
     #[test]

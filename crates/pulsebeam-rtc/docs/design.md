@@ -1,1464 +1,234 @@
-# `pulsebeam-rtc` design
-
-Status: normative implementation contract for `pulsebeam-rtc` version one.
-Production-server integration is separate; runtime responsibilities below are
-requirements on a caller integrating this facade, not claims about the current
-`pulsebeam` server.
-
-This document contains the complete non-congestion-control design and public Rust
-contract. `README.md` owns the high-level boundary and invariants.
-`congestion-control.md` owns private congestion-control, pacing, probing,
-and RTP/SCTP coordination details.
-
-The words **MUST**, **MUST NOT**, **SHOULD**, and **MAY** are normative. Public Rust
-names and representations are part of the initial contract; changing them requires
-revising this document before implementation.
-
-## Design decisions considered
-
-This section records the consequential alternatives considered before implementation.
-It is intentionally concise: implementations MUST follow the chosen contract rather
-than reopen rejected alternatives for convenience.
-
-| Topic | Decision | Alternatives considered | Why this direction |
-| --- | --- | --- | --- |
-| Public boundary | One `Connection` facade with `accept`, `receive`, `command`, `poll`, `stats` | Expose protocol/controller subsystems or many specialized methods | Keeps the crate deep and stable; low-level state remains replaceable and testable internally. |
-| I/O ownership | Sans-I/O; caller owns sockets and scheduling | Let the crate own sockets/tasks | Required for shard ownership, deterministic simulation, and avoiding hidden runtime policy. |
-| Send accounting | `Output::Transmit` is the irreversible sent commit | Departure receipts; async send acknowledgments; rollback | Smaller API and deterministic controller state. Caller-side send failure conservatively appears as loss. |
-| TCP fallback | Same `Transmit` abstraction as UDP | Separate public TCP congestion/departure mode | ICE-TCP is fallback; exposing kernel/TCP queue semantics would complicate the core boundary without improving the primary UDP path. |
-| Clock ownership | Runtime supplies paired `TimePoint { monotonic, global }` | Hidden clock reads; connection-owned NTP/PTP discipline; mutable clock-anchor API | Keeps clock discipline outside RTC, deterministic tests possible, and time domains explicit. |
-| Global media time | `GlobalMediaTime` is cluster-global, serializable microseconds | Endpoint Absolute Capture Time; endpoint NTP epoch; cross-machine `Instant` | Endpoint clocks are not trusted and `Instant` is local-only. Server NTP/PTP provides one comparable cluster domain. |
-| RTP/RTCP mapping | Edge ingress anchors RTP to server global time; SR relationships refine/synchronize streams | Trust SR absolute NTP epoch; wait for SR before media | Preserves startup and A/V relationships without trusting broken endpoint wall clocks. |
-| Transit time | Preserve `global_media_at` exactly across shards/nodes | Rebase/reconstruct at every hop | Makes media age comparable cluster-wide and prevents relay-induced clock drift. |
-| Source switching | Stable outbound `SenderId`; map `GlobalMediaTime` into one outbound RTP clock | Copy source RTP timestamps; create a new sender per source | Allows packet-boundary source/layer switches without RTP/RTCP/RTX/CC reset. |
-| Frame semantics | SFU supplies `FrameMetadata`; RTC acts on it | Codec-parse inside RTC; expose only raw packets | SFU already knows source/layer semantics and opaque/SFrame payload may be unparseable; RTC still owns transport decisions. |
-| Payload parsing | Core forwarding remains payload-opaque | Require codec payload parsing for all transport behavior | Preserves SFrame/opaque forwarding and keeps codec knowledge out of the connection core. |
-| Packet sharing | Local fanout may shallow-clone; explicit transit deep-copies | Share refcounted packet payload across shard/node ownership | Avoids cross-core packet-runtime refcount sharing while retaining cheap same-owner fanout. |
-| Session lifecycle | One immutable offer/answer session; changed session creates a new `Connection` | Trickle ICE, ICE restart, media renegotiation inside this boundary | Keeps lifecycle bounded and reconstruction declarative; these features can be added only with an explicit contract revision. |
-| Feedback requirement | Outbound RTP requires TWCC or RFC 8888 | REMB; fixed-rate fallback; video-only requirement | One aggregate RTP controller needs packet-level feedback even for audio-only operation. |
-| DataChannels | SCTP owns reliability/congestion; connection coordinates its bounded service with RTP | Feed SCTP bytes into SCReAM/TWCC; one pseudo-cwnd for all traffic | RTP feedback cannot acknowledge SCTP. Keeping controllers distinct avoids false accounting while still preventing starvation. |
-| Error handling | Malformed peer traffic is generally dropped/counted; semantic caller errors are returned | Bubble low-level parser/protocol errors publicly | Keeps hostile input from expanding API/error state and prevents implementation types from leaking. |
-| Resource policy | Explicit public limits plus fixed private hard bounds | Unbounded maps/queues; best-effort cleanup after overflow | Correctness and predictable per-connection work outrank preserving every packet/state under overload. |
-| Client acceptance | Pinned libwebrtc `0.6.2` in controlled simulation; stored SDP only parser evidence | Infer browser/Pion compatibility from fixtures or native acceptance | Required media, TWCC, and DataChannel delivery must cross the actual native engine. |
-
-## Minimal public surface
-
-The normative surface is one stateful facade, typed input commands, typed
-outputs, immutable media values, stable IDs, and coherent snapshots.
-Convenience wrappers MAY be added only when they are exact forwards to this
-surface and introduce no second semantics.
-
-```rust
-pub struct Connection { /* private */ }
-
-pub struct AcceptedConnection {
-    pub connection: Connection,
-    pub answer: SdpAnswer,
-    pub session: SessionInfo,
-}
-
-impl Connection {
-    pub fn accept(
-        config: ConnectionConfig,
-        offer: SdpOffer,
-        at: TimePoint,
-        entropy: ConnectionEntropy,
-    ) -> Result<AcceptedConnection, AcceptError>;
-
-    pub fn receive(
-        &mut self,
-        at: TimePoint,
-        observation: PacketObservation,
-        input: NetworkInput,
-    ) -> Result<(), ReceiveError>;
-
-    pub fn command(
-        &mut self,
-        at: TimePoint,
-        command: Command,
-    ) -> Result<(), RejectedCommand>;
-
-    pub fn poll(&mut self, at: TimePoint) -> Output;
-
-    pub fn stats(&self) -> StatsSnapshot;
-}
-```
-
-All state changes occur through `receive`, `command`, or `poll`. Each synchronous
-call ends its borrow and each output owns its data. The caller may stop at its
-work budget, service another connection and resume without draining the first
-connection to idle. `stats` performs no protocol work and reads one coherent
-snapshot.
-
-Keep one externally scheduled next wakeup per connection. If a caller exhausts
-its budget before reaching `Idle`, schedule an immediate continuation. Otherwise
-use `Idle.next_wakeup`, which includes pending owner work as well as protocol and
-media-expiry deadlines. A wakeup at or before current execution time means
-bounded service yielded with more runnable work; it is not permission to sleep.
-Blocked media or SCTP sends do not alone request immediate continuation. Queue
-expiry remains scheduled even without a selected transport path.
-
-### Time types
-
-```rust
-#[repr(transparent)]
-#[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd, Hash)]
-pub struct GlobalMediaTime(u64);
-
-#[derive(Clone, Copy)]
-pub struct TimePoint {
-    pub monotonic: std::time::Instant,
-    pub global: GlobalMediaTime,
-}
-
-pub struct ConnectionEntropy([u8; 32]);
-```
-
-`ConnectionEntropy` is consumed by `Connection::accept`, expanded by a private
-cryptographic generator, and zeroized after the per-connection DTLS identity,
-ICE tie-breakers, RTP bases, and other required randomness are derived. The
-caller MUST fill it from a cryptographically secure source and MUST NOT reuse it.
-The crate exposes no RNG trait or provider-specific cryptographic type.
-
-`GlobalMediaTime` is PulseBeam's cluster-global media-time domain:
-
-- the integer is unsigned microseconds in the cluster's NTP-compatible global
-  timescale;
-- every node in one PulseBeam cluster MUST use the same epoch and clock
-  discipline;
-- its canonical wire encoding is exactly eight unsigned big-endian bytes;
-- it is directly comparable across media kinds, participants, connections,
-  shards, and nodes in the same cluster;
-- it is not interchangeable with `Instant`, `SystemTime`, RTP timestamps, or an
-  application timestamp;
-- the runtime MUST derive it from a cluster clock synchronized by NTP/PTP or an
-  equivalent mechanism and MUST present it monotonically to a live connection;
-- a PTP/TAI source MUST be converted to the cluster's NTP-compatible timescale
-  before constructing a `TimePoint`;
-- crossing between clusters with different clock domains is unsupported unless
-  an outer relay explicitly translates the domain.
-
-The type provides only explicit arithmetic and wire conversion:
-
-```rust
-impl GlobalMediaTime {
-    pub const fn from_micros(value: u64) -> Self;
-    pub const fn as_micros(self) -> u64;
-    pub const fn to_be_bytes(self) -> [u8; 8];
-    pub const fn from_be_bytes(bytes: [u8; 8]) -> Self;
-
-    pub fn checked_add(self, duration: Duration) -> Option<Self>;
-    pub fn checked_sub(self, duration: Duration) -> Option<Self>;
-    pub fn checked_duration_since(self, earlier: Self) -> Option<Duration>;
-}
-```
-
-`TimePoint` is local and is never serialized. `monotonic` drives SCReAM, pacing,
-RTT, retransmission, protocol timeouts, and `next_wakeup`. `global` anchors and
-compares media timelines. A `Connection` never reads either clock itself.
-
-For successive execution arguments to one connection, `TimePoint.monotonic` and
-`TimePoint.global` MUST NOT regress. In release builds either regressing field is
-clamped to the last accepted value, counted, and surfaced once as an actionable
-warning; the call otherwise proceeds from the clamped pair. Debug builds also
-assert the caller contract. Large forward global corrections are accepted and may
-conservatively expire old media. Clock slewing and step policy remain runtime
-concerns.
-
-`receive` takes current execution time separately from
-`PacketObservation { at, provenance }`. Observation is when the complete UDP
-datagram or RFC4571 frame was observed, not the first partial TCP fragment.
-It may precede the execution call or earlier observations without regressing the
-protocol clock. Future monotonic observations return `InvalidObservation`.
-ICE, DTLS and SCTP progress use execution time; RTP/RTCP receipt and feedback use
-observation time. Initial RTP normalization anchors to the observation's global
-time, never to delayed processing time.
-
-Authenticated RTP retains `PacketOrigin { observed_at, provenance }`, with a
-global timestamp and an opaque caller-supplied u64. No local `Instant` crosses
-media transit. Neither packet observation nor normalized media time is refreshed
-by queueing, delivery or restoration.
-
-### Stable IDs
-
-```rust
-#[repr(transparent)] pub struct SenderId(u16);
-#[repr(transparent)] pub struct EncodingId(u32);
-#[repr(transparent)] pub struct DataChannelId(u16);
-#[repr(transparent)] pub struct IceTcpFlowId(u64);
-#[repr(transparent)] pub struct FrameId(u64);
-```
-
-IDs are opaque values, not SSRCs, MIDs, RIDs, SCTP stream IDs, or array indexes in
-caller code.
-
-- `SenderId` identifies one negotiated outbound RTP sender. Its policy and wire
-  identity survive source, encoding, primary SSRC, RTX SSRC, and layer changes.
-- `EncodingId` identifies one inbound encoding. Negotiated encodings are stable;
-  unsignaled encodings remain stable until RTCP BYE or explicit retirement.
-- `FrameId` is supplied by the SFU with `FrameMetadata`. It MUST be unique among
-  frames simultaneously queued or retained for retransmission on a given
-  `SenderId`; it need not be globally unique or monotonic.
-
-### Session support types
-
-SDP text and negotiated facts are wrapped so raw parser/implementation types do
-not escape:
-
-```rust
-pub struct SdpOffer(Arc<str>);
-pub struct SdpAnswer(Arc<str>);
-
-#[derive(Clone, Copy, Eq, PartialEq)]
-pub enum MediaKind {
-    Audio,
-    Video,
-}
-
-#[derive(Clone, Copy, Eq, PartialEq)]
-pub enum PacketFeedbackKind {
-    TransportWide,
-    Rfc8888,
-}
-
-pub struct SessionInfo {
-    pub feedback: Option<PacketFeedbackKind>,
-    pub inbound_media: Arc<[InboundMediaInfo]>,
-    pub senders: Arc<[SenderInfo]>,
-}
-
-pub struct InboundMediaInfo {
-    pub sender_index: u32,
-    pub kind: MediaKind,
-    pub mid: Arc<str>,
-    pub rids: Arc<[Arc<str>]>,
-    pub codecs: Arc<[CodecInfo]>,
-}
-
-pub struct RtpExtensionInfo {
-    pub id: u8,
-    pub uri: Arc<str>,
-}
-
-pub struct SenderInfo {
-    pub id: SenderId,
-    pub receiver_index: u32,
-    pub kind: MediaKind,
-    pub mid: Arc<str>,
-    pub codec: CodecInfo,
-    pub extensions: Arc<[RtpExtensionInfo]>,
-    pub signals_playout_delay: bool,
-}
-
-#[derive(Clone, Copy, Eq, PartialEq)]
-pub enum EcnCodepoint {
-    NotEct,
-    Ect0,
-    Ect1,
-    Ce,
-}
-```
-
-`SessionInfo` is immutable. `sender_index` and `receiver_index` are the remote
-endpoint's zero-based SDP media-section positions, including non-RTP sections in
-the count. They resolve signaling coordinates to inbound media and stable
-`SenderId` resources without making MID public signaling identity. Codec payload
-types and outbound extension wire IDs are negotiated packet-construction facts.
-`SenderInfo.extensions` includes only mappings that permit sending to that
-receiver; receive-only and inactive mappings are absent. Exposing those IDs does
-not transfer negotiation or transport-feedback ownership to the SFU. SSRCs, ICE
-credentials, fingerprints, and RTCP parser values remain connection internals.
-
-### Network input and output
-
-```rust
-pub enum NetworkInput {
-    Udp {
-        local: SocketAddr,
-        remote: SocketAddr,
-        ecn: Option<EcnCodepoint>,
-        payload: Bytes,
-    },
-    IceTcp {
-        flow: IceTcpFlowId,
-        local: SocketAddr,
-        remote: SocketAddr,
-        frame: Bytes,
-    },
-}
-
-pub enum TransmitTarget {
-    Udp {
-        local: SocketAddr,
-        remote: SocketAddr,
-        ecn: Option<EcnCodepoint>,
-    },
-    IceTcp {
-        flow: IceTcpFlowId,
-    },
-}
-
-pub struct Transmit {
-    pub kind: TransmitKind,
-    pub target: TransmitTarget,
-    pub payload: Bytes,
-}
-```
-
-The [output definitions](../src/io.rs) classify original RTP, repair RTP,
-padding and non-RTP control/protocol traffic. Original and repair outputs carry
-`MediaTransmitInfo`: sender, unchanged normalized media time and source
-`PacketOrigin`. Receiver RTX retains the original source observation rather
-than substituting NACK or retransmission time. Padding and protocol output do
-not invent source provenance. The caller can compare its supplied execution
-time with the source observation for forwarding latency and independently
-observe actual socket submission. RTC keeps no application trace registry,
-histogram or callback.
-
-Each UDP value contains exactly one datagram. Each ICE-TCP value contains exactly
-one complete RFC 4571 frame, including its two-byte frame length. Before the first
-frame, the caller registers its accepted stream and exact local/remote tuple with
-`AdmitIceTcpFlow`. Every frame MUST repeat that tuple. Admission does not
-authenticate the peer: a new incarnation must pass ICE authentication before it
-can carry DTLS or media, even when its tuple was previously nominated.
-
-An `IceTcpFlowId` identifies one stream incarnation and MUST never be reused by
-the caller. On stream close, the caller issues `RetireIceTcpFlow` before admitting
-another incarnation of the same tuple. At most 64 streams are active per
-connection. Admission returns `WouldBlock` at this fixed bound, and retirement
-reclaims capacity without retaining lifetime tombstones. Unknown or retired flow
-input returns `UnknownIceTcpFlow`. Conflicting IDs/tuples or a local address that
-is not a passive TCP candidate return `InvalidIceTcpFlow`; repeating an identical
-active admission or retiring an inactive ID is idempotent.
-
-Retirement removes pending authentication observations, queued path-bound records
-and DTLS input. A retired selected path becomes unavailable under a fresh path
-epoch. Protected records are discarded, never retargeted or reconstructed; crypto
-state and committed transport identity are not rewound. Established DTLS/SRTP
-associations survive a newly authenticated incarnation of their nominated tuple.
-Already returned transmits remain irrevocable. Retirement remains available during
-graceful close. The caller owns stream reassembly before `receive`, stream writes
-after `poll`, and fencing closed stream events before connection delivery.
-
-Emitting `Output::Transmit` is the connection's irrevocable transmission commit:
-
-1. the packet's transport sequence number and RTP/RTCP continuity are committed;
-2. the packet enters sent history and bytes-in-flight at `TimePoint.monotonic`;
-3. pacing tokens and sender service are charged;
-4. source observation and normalized media time remain unchanged for caller
-   latency measurements;
-5. the caller may collect a bounded promptly serviced batch, and MUST service it
-   before requesting further finalized work from that connection.
-
-Batching is caller-owned collection of the existing owned outputs, not another
-RTC queue or transaction API. Bound collection by count, bytes and service
-latency appropriate to the caller's sockets. Interleave connection service at
-those boundaries rather than draining a busy connection indefinitely.
-
-There is no transmit receipt, rollback or `report_departure` API. Every finalized
-packet remains committed even if socket submission fails. A discarded value,
-failed syscall or kernel drop appears to feedback as local loss or missing
-feedback. Never retry a finalized output through `SendMedia` or ask RTC to
-refund pacing, continuity or history. Runtime poll-to-syscall latency and actual
-socket submission are measured and governed outside this crate.
-
-For partial submission and backpressure:
-
-- UDP batch success counts a prefix of whole datagrams. Never replay that
-  accepted prefix. The unsent suffix may receive bounded socket-level retry or
-  be dropped as local loss. Do not accumulate an unbounded output backlog.
-- TCP success can include complete frames and a prefix of the next RFC4571
-  frame. Retain the exact remaining bytes and cursor in bounded socket state.
-  Finish that frame on the same flow before later frames, or close its flow.
-  Never discard a frame suffix and continue writing later frames.
-- On TCP closure, retire its flow before replacement and discard its unsent
-  output. A new stream gets a new `IceTcpFlowId`; saved output for the old ID
-  MUST NOT target the replacement, even when local/remote tuples match.
-- A partially accepted batch cannot rewind transport accounting. Collect no
-  further finalized work for a blocked connection until its bounded handoff
-  has been serviced, locally dropped where permitted, or fenced by flow closure.
-
-UDP and fallback ICE-TCP use the same commit semantics. A TCP write can remain in
-the kernel's TCP queue; `pulsebeam-rtc` does not claim to observe physical NIC or
-wire departure and does not expose a second TCP congestion mode.
-
-### Commands
-
-```rust
-#[non_exhaustive]
-pub enum Command {
-    AdmitIceTcpFlow {
-        flow: IceTcpFlowId,
-        local: SocketAddr,
-        remote: SocketAddr,
-    },
-    RetireIceTcpFlow {
-        flow: IceTcpFlowId,
-    },
-    SetSenderAssignment {
-        sender: SenderId,
-        assignment: Option<SenderAssignment>,
-    },
-    SendMedia {
-        sender: SenderId,
-        media: ForwardedMedia,
-    },
-    RecoverSenderMedia {
-        sender: SenderId,
-        assignment: SenderAssignment,
-    },
-    RequestKeyframe {
-        encoding: EncodingId,
-    },
-    RetireEncoding {
-        encoding: EncodingId,
-    },
-    OpenDataChannel(DataChannelConfig),
-    SendData {
-        channel: DataChannelId,
-        message: DataMessage,
-    },
-    CloseDataChannel {
-        channel: DataChannelId,
-    },
-    CloseGracefully {
-        deadline: Instant,
-    },
-    Abort,
-}
-```
-
-`SendMedia` transfers one immutable packet reference into egress admission. A
-successful command means the packet was accepted for immediate transmission or
-bounded queueing; it does not mean the packet will necessarily survive later
-congestion or deadline shedding. An intrinsically expired packet returns typed
-`MediaExpired`, which callers discard rather than retry. Temporary pressure
-returns `RejectedCommand` with reason `WouldBlock` and the original command
-when a configured bound would be exceeded.
-
-`CloseGracefully` rejects new application work, continues required protocol
-shutdown traffic, and becomes closed no later than its deadline. `Abort` drops all
-state immediately and emits no further transmit.
-
-### Poll output
-
-```rust
-#[non_exhaustive]
-pub enum Output {
-    Transmit(Transmit),
-    Event(Event),
-    Idle {
-        next_wakeup: Option<Instant>,
-    },
-    Closed(CloseReason),
-}
-```
-
-One call returns at most one output. `Closed(reason)` is emitted exactly once and
-is terminal. `Idle.next_wakeup` is the only externally scheduled connection timer
-and is the earliest local monotonic instant at which calling `poll` can make
-progress without new input. `None` means only external input can make progress. A
-connection does work proportional to new input, expired bounded state, or one
-emitted output; it never scans unrelated connections.
-
-## Connection configuration
-
-The public configuration contains transport options, semantic defaults, and resource
-budgets only. It does not expose SCReAM gains, queue targets, probe clusters,
-pacer factors, feedback filters, or controller selection.
-
-```rust
-pub struct ConnectionConfig {
-    pub local_candidates: Vec<LocalCandidate>,
-    pub local_ice_credentials: Option<LocalIceCredentials>,
-    pub limits: ConnectionLimits,
-    pub unknown_extension_policy: UnknownExtensionPolicy,
-}
-
-pub enum LocalCandidate {
-    Udp(SocketAddr),
-    TcpPassive(SocketAddr),
-}
-
-pub struct ConnectionLimits {
-    pub max_unsignaled_encodings: u16,
-    pub max_data_channels: u16,
-    pub max_inbound_data_message_bytes: usize,
-    pub max_buffered_data_bytes: usize,
-    pub max_queued_media_bytes: usize,
-    pub max_retransmission_bytes: usize,
-}
-```
-
-`LocalIceCredentials::new(ufrag, password)` accepts opaque caller-owned ICE
-credentials. RTC MUST use them unchanged in the SDP answer and ICE agent, without
-interpreting routing hints. Ufrag length is 4..=256 bytes, password length is
-22..=256 bytes, and both contain only RFC 8445 ICE characters (ASCII letters,
-digits, `+`, `/`). Invalid values return `AcceptError::InvalidConfiguration`.
-The password is omitted from Debug output. Callers MUST generate a fresh password
-from cryptographic entropy for each new connection. `None` retains RTC-generated
-credentials derived from the supplied connection entropy. Supplying ICE
-credentials does not change the per-connection DTLS identity or key isolation.
-
-```rust
-pub struct LocalIceCredentials { /* private */ }
-
-impl LocalIceCredentials {
-    pub fn new(ufrag: impl Into<String>, password: impl Into<String>)
-        -> Result<Self, AcceptError>;
-    pub fn ufrag(&self) -> &str;
-}
-```
-
-Version-one defaults and hard maxima are:
-
-| Limit | Default | Hard maximum |
-| --- | ---: | ---: |
-| Unsignaled encodings | 32 | 1,024 |
-| DataChannels | 256 | 4,096 |
-| One inbound DataChannel message | 1 MiB | 16 MiB |
-| Total buffered DataChannel payload | 8 MiB | 64 MiB |
-| Queued outbound media payload | 8 MiB | 64 MiB |
-| Retained retransmission payload | 16 MiB | 128 MiB |
-
-A configured value above a hard maximum is rejected at construction. Candidate
-configuration is caller-owned because the caller also owns the corresponding UDP
-sockets and passive TCP listeners. Structural validation permits the default
-empty list, accepts at most 16 component-1 host candidates, and rejects duplicate
-transport/address pairs, zero ports, wildcard or non-unicast addresses, and IPv6
-addresses with flow information or a scope ID. UDP and passive TCP candidates at
-the same address are distinct. `Connection::accept` requires at least one
-candidate and advertises the complete validated list without interface discovery,
-STUN, TURN, or truncation.
-
-Internal
-packet counts, feedback histories, timers, and queue horizons have additional
-fixed bounds in the congestion-control contract and are not public knobs.
-
-## Events
-
-```rust
-#[non_exhaustive]
-pub enum Event {
-    Connected,
-    IceAuthenticated(AuthenticatedFlow),
-    Media {
-        encoding: EncodingId,
-        packet: MediaPacket,
-    },
-    EncodingDiscovered(EncodingInfo),
-    EncodingRetired {
-        encoding: EncodingId,
-        reason: EncodingRetireReason,
-    },
-    KeyframeRequested {
-        sender: SenderId,
-        reason: KeyframeRequestReason,
-    },
-    MediaBudgetChanged(MediaPayloadBitrate),
-    DataChannel(DataChannelEvent),
-    Warning(ConnectionWarning),
-}
-```
-
-```rust
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum AuthenticatedFlow {
-    Udp { local: SocketAddr, remote: SocketAddr },
-    IceTcp { flow: IceTcpFlowId, local: SocketAddr, remote: SocketAddr },
-}
-```
-
-`IceAuthenticated` reports a tuple from an accepted ICE Binding Request whose
-USERNAME and MESSAGE-INTEGRITY RTC validated against the immutable session
-credentials. It is not a nomination, selected-path, DTLS-connected, or media
-notification. A routing hint alone, invalid credentials, a malformed packet, or
-an accepted success/error response MUST NOT produce this observation. Success
-and error response validation authenticates a transaction, not its source tuple.
-The event may report a new rebinding tuple before nomination and carries the
-caller-owned TCP flow when applicable. Pending identical observations coalesce;
-a separate 64-entry bound retains the newest observations under pressure, without
-exhausting protocol/media event capacity. Later valid Binding Requests can repeat
-an observation. Steering is an optional optimization: the caller MUST remain
-correct without receiving or applying a pinning observation.
-
-Events are semantic and bounded. There are no per-packet congestion events.
-Repeated malformed input, unknown feedback, drops, and controller diagnostics are
-counters in `StatsSnapshot`; `Warning` is reserved for actionable state changes
-that a caller may need to surface.
-
-`Event::MediaBudgetChanged` reports the native aggregate RTP payload budget.
-It does not change caller-selected sender targets or grant per-sender shares.
-The value is not measured spare bandwidth, physical path capacity, or a
-reservation. Pending updates coalesce into one latest value; downward changes
-are not held for confirmation. `StatsSnapshot.connection.media_budget` reports
-the same current budget for startup and coherent inspection. The SFU owns
-source/layer selection and quality hysteresis.
-
-## Public error types
-
-Peer-controlled malformed packets are normally dropped and counted rather than
-returned as API errors. Public errors describe caller input, negotiation, or a
-terminal connection condition.
-
-The concrete [error definitions](../src/io.rs) are authoritative.
-`Connection::command` returns `RejectedCommand { reason, command }`: the reason
-is a `CommandError`, and the command contains the original owned packet,
-message, or channel configuration. Returning it requires neither a defensive
-input clone nor an allocated error wrapper. The caller may retry the returned command after
-`WouldBlock` pressure clears. `MediaExpired` is terminal for that packet;
-binding/frame errors require correcting the command or recovering the sender
-rather than repeatedly resubmitting unchanged input.
-
-Media rejection does not advance sender admission debt or frame continuity.
-SCTP rejection does not consume a channel or message lifecycle identity.
-Protocol time and offered-load accounting can still advance during a rejected
-call.
-
-
-Low-level parser, SRTP, SCTP, SCReAM, TWCC, and RTCP errors are translated into
-these semantic categories or into bounded statistics. They are never wrapped as
-public implementation errors.
-
-## Statistics
-
-`stats()` returns an owned coherent snapshot and never registers a metrics
-backend.
-
-```rust
-pub struct StatsSnapshot {
-    pub connection: ConnectionStats,
-    pub senders: Vec<SenderStats>,
-    pub encodings: Vec<EncodingStats>,
-    pub data_channels: Vec<DataChannelStats>,
-}
-```
-
-Required connection observations include:
-
-- connection state, negotiated packet-feedback kind, and close reason;
-- caller clock regressions, RTP bytes in flight, native aggregate media budget,
-  pacing bitrate, and queued media/data bytes;
-- transmitted RTP, RTCP, SCTP, other protocol, and padding bytes;
-- dropped network inputs and unknown, duplicate, stale, and wrong-path feedback.
-
-Required per-sender observations include:
-
-- sender identifier, policy and demand, queued packets/payload bytes,
-  and transmitted packet/payload totals.
-
-Required per-encoding observations are the encoding identifier and media kind,
-received packet count, and retirement state. Required per-DataChannel
-observations are identifier, priority, reliability, buffered amount, and sent
-and received message counts.
-
-Private controller names and mutable internal objects are not returned.
-
-
-## Session and interoperability contract
-
-- The session is one immutable ICE-lite remote-offer/local-answer exchange.
-- The caller supplies every advertised local host candidate and retains ownership
-  of its matching socket or listener. Negotiation converts that ordered set once
-  and retains it with the immutable ICE credentials for answer construction and
-  later transport initialization.
-- BUNDLE, RTCP mux, inline candidates, all SDP media directions, UDP, and passive
-  ICE-TCP over IPv4 and IPv6 are supported.
-- Local server-reflexive and relay gathering, active or simultaneous-open TCP,
-  interface discovery, STUN discovery, and a TURN client are outside the local
-  candidate profile. Remote relay candidates remain supported.
-- Trickle ICE, ICE restart, media renegotiation, and a TURN client are outside this
-  boundary. A changed session creates a new connection. Client relay candidates
-  remain usable.
-- `Connection::accept` creates a fresh ephemeral DTLS identity from the supplied
-  cryptographic entropy. Its private key is never exported or reused.
-- Codecs and RTP header extensions are negotiated against the fixed supported
-  profile. Public `CodecInfo` values expose each inbound payload and the selected
-  outbound payload, RTX association, RTP clock rate, channel count and typed Opus
-  or H.264 profile facts. Callers do not need to parse SDP or use str0m types to
-  interpret those facts. Syntactically valid optional extension mappings whose
-  direction is incompatible with active media are omitted from the answer.
-  This narrow compatibility rule accommodates Firefox's receive-only
-  playout-delay mapping on send-only media without advertising unusable
-  capability. MID and TWCC direction checks, extension syntax, IDs, duplicate
-  mappings and the inline-candidate requirement remain strict.
-- Core forwarding does not require codec-payload parsing and MUST carry opaque or
-  SFrame-protected media.
-- Every accepted outbound RTP session, including audio-only RTP, MUST negotiate
-  one supported packet-feedback mode: transport-wide congestion-control feedback
-  or RFC 8888 congestion-control feedback. Absence is a specific
-  `AcceptError::MissingPacketFeedback`; there is no REMB or fixed-rate fallback.
-- A valid SCTP application-only session has no packet-feedback mode and no RTP
-  senders. It does not enable a fixed-rate RTP fallback or RTP sent accounting.
-- The selected packet-feedback mode is immutable and applies to every bundled
-  outbound RTP sender. TWCC and RFC 8888 are not run concurrently for the same
-  RTP path.
-- Compatibility means compatibility with the negotiated PulseBeam WebRTC
-  profile, not every theoretically standards-compliant SDP. Client acceptance
-  uses only pinned libwebrtc `0.6.2` in controlled execution. Stored SDP is generic
-  parser regression evidence only; browser and Pion compatibility are not claimed.
-
-The maximum accepted session is 128 negotiated media sections. The implementation
-allocates dense storage from the accepted answer; it does not reserve runtime
-encoding, RTX, probe, or DataChannel entities as media slots.
-
-
-## Media packet contract
-
-After ingress authentication and decryption, one immutable `Bytes` allocation is
-the canonical plaintext RTP packet. Parsing stores compact byte ranges; semantic
-accessors decode metadata lazily. Local fanout uses shallow clones. `to_transit`
-performs an explicit deep copy before a packet crosses a shard or node boundary,
-so packet reference counts never become shared runtime state across cores.
-
-```rust
-#[derive(Clone)]
-pub struct MediaPacket { /* private */ }
-
-impl MediaPacket {
-    pub fn bytes(&self) -> &Bytes;
-    pub fn global_media_at(&self) -> GlobalMediaTime;
-    pub fn view(&self) -> Option<MediaPacketView<'_>>;
-    pub fn extension(&self, uri: &str) -> Option<&[u8]>;
-    pub fn to_transit(&self) -> MediaPacket;
-    pub fn materialize(&self) -> Result<MaterializedMediaPacket, MediaTransitError>;
-}
-
-pub struct MediaPacketView<'a> {
-    pub ssrc: u32,
-    pub sequence_number: u16,
-    pub timestamp: u32,
-    pub marker: bool,
-    pub header_len: usize,
-    pub payload: &'a [u8],
-}
-
-pub struct MaterializedMediaPacket { /* owned, no shared packet refcounts */ }
-impl MaterializedMediaPacket {
-    pub fn from_bytes(bytes: Box<[u8]>) -> Result<Self, MediaTransitError>;
-    pub fn as_bytes(&self) -> &[u8];
-    pub fn into_bytes(self) -> Box<[u8]>;
-    pub fn into_packet(self) -> Result<MediaPacket, MediaTransitError>;
-}
-
-pub struct ForwardedMedia {
-    pub source: SourceIncarnation,
-    pub packet: MediaPacket,
-    pub frame: FrameMetadata,
-}
-```
-
-`MediaPacket.global_media_at` is immutable. A relay MUST serialize and preserve it
-exactly; an egress connection never reconstructs or rebases a transit packet's
-value. `MaterializedMediaPacket` is a fully owned representation for shard/node
-transit. Cloning it deep-copies all storage, and restoration creates fresh local
-packet reference-count state. Its versioned wire encoding preserves the complete
-canonical RTP plaintext, URI-based extension views, exact eight-byte
-`GlobalMediaTime`, portable source observation/provenance, and private
-clock-quality/uncertainty classification. No local
-`Instant` or reconstructed compact playout time crosses this boundary.
-
-Packet wire version two is: `PBRP` magic (4 bytes), version (1 byte), private
-clock-quality tag (1 byte), extension count (u16), normalized global microseconds
-(u64), observed global microseconds (u64), opaque provenance (u64), RTP length (u32), zero reserved field (u32), then extension records and canonical RTP.
-Integers are big-endian. Each extension record contains URI byte length, range
-start and range end as u32 values followed by UTF-8 URI bytes. Ranges address the
-canonical RTP, not the materialized wrapper. Bounds are 512 KiB total, 65,535 RTP
-bytes and 256 extension records. Decoding MUST reject unknown versions/tags,
-nonzero reserved fields, truncation/trailing bytes, invalid RTP, duplicate or
-invalid URIs, and ranges that are not actual RTP extension values. Oversized
-materialization returns a typed resource error, not an unbounded buffer.
-
-Source interpretation belongs to the caller. Authenticated ingress exposes the
-negotiated extension bytes without retaining a source DD reader, template cache,
-or source dependency graph inside the packet. The caller can use the pure
-`pulsebeam-core::dd` helpers once per source and share the resulting immutable
-frame facts across receivers. Packet materialization contains canonical packet
-and clock facts only, not private source-interpreter or receiver state.
-
-This codec validates representation, not source authentication. It is a trusted
-SFU relay boundary, not an alternative to `Connection::receive` or ICE/SRTP
-authentication. The relay remains responsible for route/epoch/authentication
-framing and for serializing its separately owned `FrameMetadata` facts.
-`ForwardedMedia::to_transit` deep-copies packet state, known dependency IDs,
-resolved DD lists and template structures;
-unknown dependencies remain unknown. A relay must not replace unknown facts
-with invented independent-frame metadata.
-
-### Frame metadata supplied by the SFU
-
-The SFU owns semantic knowledge that cannot reliably be recovered from opaque
-payload. `pulsebeam-rtc` owns the transport action made possible by that
-knowledge.
-
-```rust
-#[derive(Clone)]
-pub struct FrameMetadata {
-    pub id: FrameId,
-    pub boundary: FrameBoundary,
-    pub random_access: bool,
-    pub discardable: bool,
-    pub dependencies: FrameDependencies,
-    pub descriptor: Option<Arc<SourceDescriptor>>,
-}
-
-#[derive(Clone, Copy, Eq, PartialEq)]
-pub enum FrameBoundary {
-    Complete,
-    Start,
-    Middle,
-    End,
-}
-
-#[derive(Clone)]
-pub enum FrameDependencies {
-    Unknown,
-    Known(Arc<[FrameId]>),
-}
-
-pub struct SourceDescriptor {
-    pub template_id: u8,
-    pub decode_target_indications: Box<[DecodeTargetIndication]>,
-    pub chain_dependencies: Box<[Option<FrameId>]>,
-    pub structure: Arc<TemplateDependencyStructure>,
-    pub active_decode_targets: u32,
-    pub attached_structure: bool,
-}
-```
-
-`Known` contains at most eight direct dependencies. An empty list means the frame
-is independently decodable in the caller's model. `Unknown` means the connection
-may still admit or discard the complete current frame but MUST NOT infer which
-later frames become undecodable.
-
-`SourceDescriptor` is optional resolved source syntax, not a receiver choice or
-a serialized reader. Its DTIs and immutable template structure reuse the pure
-core DD model; `DecodeTargetIndication` and `TemplateDependencyStructure` are
-also exported by RTC. Direct DD references come from `FrameDependencies::Known`;
-each chain names its predecessor with an opaque `FrameId`, or `None` for an
-independent chain. The caller resolves source wire-number wrap and frame
-identity. RTC never interprets a source frame number as that identity.
-
-A supplied descriptor requires known direct references, at most 32 DTIs, and
-one chain entry per declared chain, at most 32. A structure refresh is valid only
-at frame start. Admission checks these bounded format facts before retaining
-them. Unknown direct dependencies cannot become a DD with invented empty
-references. Without descriptor facts, RTC can forward opaque media but emits no
-DD; a required receiver selection without source facts rejects admission.
-
-Each receiver retains only its own bounded committed `FrameId`-to-output-number
-history and DD writer. Required frame or selected-chain references missing from
-that history fail closed. Output frame numbers, custom reference distances,
-active-target signaling and structure refresh are generated for that receiver.
-One receiver's selection cannot mutate another's source facts. Same-owner
-clones may share immutable snapshots; explicit transit copies the lists and
-structure into fresh owner-local storage.
-
-`SenderAssignment.decode_target_mask` is the receiver's output selection, not
-source frame metadata. `None` preserves source active targets; `Some(mask)`
-selects a nonzero subset of the source definition's decode-target indices.
-Zero is an invalid assignment. Out-of-definition bits or a missing required
-source descriptor reject media as invalid frame metadata. When outbound DD is
-negotiated, the emitted mask intersects receiver selection and source activity,
-including an empty intersection without fabricated activity. Without outbound
-DD, selection generates no wire extension. Selection changes atomically with the
-complete assignment. The caller uses `RecoverSenderMedia` when changing to a
-decoder-ready same-incarnation boundary that must clear unprepared work.
-
-`ForwardedMedia` carries the caller's `SourceIncarnation` separately from
-`FrameMetadata`; transit preserves both that token and immutable source facts.
-Receiver selection is not serialized into the source frame.
-
-For every packet in one frame:
-
-- `id`, `random_access`, `discardable`, and `dependencies` MUST be identical;
-- `global_media_at`, canonical source SSRC and RTP timestamp MUST be identical;
-- a one-packet frame uses `Complete`;
-- a multi-packet frame uses one `Start`, zero or more `Middle`, and one `End`;
-- dependencies MUST NOT contain the current frame ID;
-- metadata inconsistency is `CommandError::InvalidFrameMetadata` and rejects the
-  packet without mutating RTP continuity.
-
-A `Start` or `Complete` for a different frame while an admitted frame is still
-open returns `CommandError::FrameInterrupted`, even for random-access media.
-This does not accept the new packet or automatically discard prior work. It lets
-the caller distinguish interrupted source framing from ordinary queue pressure
-and malformed continuation metadata. A `Middle` or `End` without an admitted
-open frame also returns `FrameInterrupted`: its starting fragment is missing.
-A dependent frame with an invalidated dependency chain returns
-`DependencyChainInterrupted` when no useful independent packet is queued for that
-sender. It requires recovery, not retrying the same dependent packet indefinitely.
-While a useful independent packet is queued, the dependent frame returns
-`WouldBlock` until that recovery packet commits or expires.
-For an otherwise matching `Middle` or
-`End`, canonical source RTP sequence MUST be the admitted predecessor plus one,
-including 16-bit wrap. A missing, duplicated or reordered source fragment returns
-`FrameInterrupted` without admitting or transmitting that continuation. This
-prevents renumbering a missing-middle frame into contiguous output with a false
-End marker. Whole-frame selection and shedding may skip arbitrary source sequence
-numbers between frames. Within the same publication the caller may issue
-`RecoverSenderMedia` to cancel unprepared media and source-dependent continuity
-while retaining committed repair history, then resume at a fresh
-independent `Start` or `Complete`, or request one from the source. An independent
-`Middle` or `End` cannot restart a discarded frame. Committed RTP/feedback identity
-and the global-time fence remain intact. A duplicate start for the same frame,
-a queued duplicate frame, and mismatched continuation facts remain invalid
-metadata, not interruption. Expiry is not a recovery guarantee after a start has
-already been transmitted and its queue is empty.
-
-The caller SHOULD pass dependency information from a negotiated dependency
-descriptor or codec-aware source selector. It MUST NOT make `pulsebeam-rtc` parse
-protected codec payload merely to recover facts already known by the SFU.
-
-`pulsebeam-rtc` uses this metadata for whole-frame admission, stale-frame
-shedding, dependency-aware discard where known, keyframe protection, RTX
-usefulness, and outbound dependency-descriptor continuity. It never chooses the
-source or layer.
-
-## Cluster-global media timeline
-
-Every first-ingress RTP stream is normalized into the same `GlobalMediaTime`
-domain. This is server-anchored media time, not trusted endpoint wall time and not
-a claim of exact physical camera capture time.
-
-### Edge ingress
-
-For a packet arriving directly from an endpoint:
-
-1. the first accepted RTP timestamp is provisionally anchored to
-   `TimePoint.global` at server arrival;
-2. the RTP clock rate maps later unwrapped RTP timestamps into microseconds, so
-   packet-arrival jitter does not become media-timeline jitter;
-3. RTCP Sender Reports refine the RTP-to-media mapping and relate audio/video RTP
-   clocks in one RTCP synchronization group;
-4. the endpoint's absolute NTP epoch is not trusted. Only differences and the
-   relationship between RTP clocks are used;
-5. previously emitted `global_media_at` values are immutable;
-6. corrections affect future mapping through bounded slew and never make the
-   mapping for increasing media time run backward.
-
-For one continuous RTP-clock segment, the mapping from unwrapped RTP timestamp to
-`GlobalMediaTime` is monotonic. Packets can arrive reordered and therefore an
-older reordered packet may legitimately carry an earlier `global_media_at` than
-a packet emitted before it.
-
-If an encoder restarts or the RTP timestamp jumps beyond the accepted
-reordering/drift model, the connection starts a new internal clock segment. The
-new segment is anchored to the earliest reasonable global time not earlier than
-the preceding segment's next expected media time. `EncodingId` need not change.
-
-Before a usable Sender Report exists, media continues with a provisional mapping.
-Cross-stream synchronization is then marked `Provisional`. Valid SR relationships
-move it to `Synchronized`. Missing, contradictory, or discontinuous reports move
-it to `Unverified` or `Discontinuous` without stopping media.
-
-RTCP SDES CNAME and valid SR relationships determine synchronization groups.
-Audio and video in one group are normalized by `pulsebeam-rtc`; the SFU receives
-packets already expressed in one cluster-global domain.
-
-For a usable SR pair `(sender_ntp, rtp_timestamp)`, the connection first evaluates
-the provisional RTP mapping at `rtp_timestamp` to obtain `provisional_global`.
-The group offset is the filtered difference:
-
-```text
-group_offset = provisional_global - sender_ntp
-mapped_global = sender_ntp_for_packet + group_offset
-```
-
-Only sender-NTP differences are used. The absolute sender epoch cancels through
-the offset. Offset and residual arithmetic uses signed 128-bit fixed-point
-microseconds; an endpoint NTP value is never cast directly to
-`GlobalMediaTime`. The first accepted stream establishes the synchronization-group
-offset; later streams join it. Residuals are filtered over at least three SRs and
-one RTT before a stream becomes `Synchronized`. A residual above `100 ms` or a
-sender-NTP regression starts bounded revalidation instead of stepping emitted
-media time.
-
-### `MediaClockProfileV1`
-
-The ingress mapper has one private fixed profile:
-
-| Field | Version-one value |
-| --- | ---: |
-| RTP sequence reordering window used by the clock mapper | `2,048` packets |
-| SRs required before `Synchronized` | `3` valid reports spanning at least `1` smoothed RTT |
-| Maximum SR residual accepted for normal slew | `100 ms` |
-| Maximum mapping correction slew | `1,000 ppm` relative to the negotiated RTP clock rate |
-| Sender-NTP regression tolerance | `1 ms`; larger regression starts revalidation |
-| SR stale interval | `10 s` without a valid report |
-| RTP/global discontinuity threshold | `500 ms` from the current predicted mapping after reordering is excluded |
-| Maximum clock segments retained per encoding | `4`; older completed segments collapse into statistics |
-
-A correction within `100 ms` changes only the rate/offset used for future RTP
-positions and is absorbed at no more than `1,000 ppm`. A larger residual, an RTP
-timestamp jump beyond the discontinuity threshold, or contradictory sender-NTP
-progression starts a new segment. Existing packets are never rewritten. For a
-new stream joining a synchronization group before its first emitted media, the
-validated group offset can be applied immediately because no public timestamp is
-yet immutable.
-
-### PulseBeam transit
-
-For a packet received from another PulseBeam shard or node, the incoming
-`global_media_at` is authoritative and MUST be preserved byte-for-byte. The local
-connection does not inspect the original endpoint clock or recreate its RTCP
-mapping.
-
-### Cross-participant meaning
-
-All packets are comparable in the same server clock domain. Equal values mean
-equal positions in PulseBeam's normalized cluster timeline. Because first-edge
-anchoring includes unknown endpoint-to-edge delay, equal values do not prove that
-two cameras exposed a frame at exactly the same physical instant. This uncertainty
-is observable in statistics and never converted into false capture-time claims.
-
-## Inbound encodings
-
-```rust
-pub struct EncodingInfo {
-    pub id: EncodingId,
-    pub sender_index: u32,
-    pub kind: MediaKind,
-    pub rid: Option<Arc<str>>,
-}
-```
-
-- Negotiated inbound encodings are admitted and receive stable `EncodingId`
-  values.
-- Every authenticated encoding, including a negotiated SSRC or RID, emits
-  `EncodingDiscovered` before its first `Media` event. Discovery includes the
-  immutable inbound `sender_index`, media kind, and optional RID so the SFU can
-  associate the encoding with a publication and simulcast layer without parsing
-  SDP or accessing protocol internals.
-- Bundled media sections may share a payload type. Ingress resolves the negotiated
-  MID first, then the negotiated or previously authenticated SSRC association,
-  and uses payload type alone only when it identifies one inbound section.
-  Unknown or malformed MID, conflicting MID/SSRC associations, and ambiguous
-  packets are dropped without creating an encoding. A retired association cannot
-  be resurrected by later packets.
-- Unsignaled encodings consume the configured connection-wide budget. Overflow
-  is dropped and counted without closing the connection.
-- Inactivity never retires a paused encoding. RTCP BYE or
-  `Command::RetireEncoding` does.
-- Malformed or unauthenticated packets never create an encoding.
-- Primary RTP and incoming RTX share a 256-packet source sequence window.
-  Delivery remains cut-through and can be reordered; duplicates and packets
-  older than the window are dropped. RTX uses the negotiated payload `apt` and
-  FID SSRC pair, or a repaired RID associated with an existing primary encoding.
-  Its original sequence number, primary payload type and primary SSRC are
-  restored before canonical source delivery. An unknown repair association
-  cannot create a separate primary encoding.
-- When generic NACK is negotiated, gaps wait 10 ms for reordering, then receive
-  at most five NACK attempts spaced 50 ms apart. Missing-packet state is bounded
-  to the source window. Receiver reports run every second and include loss,
-  extended sequence progression, jitter and the last Sender Report relationship.
-- Publisher congestion feedback is negotiated independently from subscriber
-  feedback. TWCC covers one bundled transport sequence space, including RTX and
-  padding. RFC 8888 reports original and repair SSRCs separately, retaining
-  receiver arrival offsets and observed ECN marks. Authenticated wire receipt is
-  recorded before application queue admission and before RTX normalization.
-- Publisher packet feedback runs every 50 ms with at most 512 retained wire
-  receipts and 256 statuses per report. Reports preserve sequence wrap,
-  reordering and late arrivals. Overload forgets old receipts rather than growing
-  history or generating unbounded reports; RFC 8888 holds over-range arrival
-  offsets explicitly. SRTP replay protection is not reset to admit same-SSRC
-  sequence restarts.
-- RTP clock state, RTCP synchronization state, retransmission input state, and
-  lazy extension metadata belong to the encoding, not the SFU router.
-
-## Outbound senders and source switching
-
-`Command::SendMedia` can select a different source packet at any packet boundary.
-The connection preserves the negotiated outbound sender's SSRC, payload type,
-sequence-number space, RTP timestamp mapping, header-extension state, RTX state,
-RTCP reports, and congestion policy.
-
-An outbound sender creates one mapping from cluster-global media time to its RTP
-clock:
-
-```text
-outbound_rtp_timestamp = base_rtp_timestamp
-                       + round((global_media_at - base_global_media_at)
-                               * rtp_clock_rate / 1_000_000)
-```
-
-All packets of one frame use the same mapped RTP timestamp. Source RTP timestamps
-are never copied as outbound continuity. Switching from camera A to camera B is
-therefore safe even when their original RTP timestamps and SSRCs are unrelated.
-
-A packet whose global media position would move an already committed outbound
-frame backward is stale and is rejected or shed; the connection never rewinds the
-outbound RTP clock. A long pause advances RTP time according to elapsed
-`GlobalMediaTime` rather than compressing the pause.
-
-Outgoing RTCP Sender Reports use the same global clock mapping for all senders so
-receiver-side A/V synchronization remains consistent. The runtime's NTP-compatible
-`GlobalMediaTime` is converted to the RTCP 64-bit NTP representation internally;
-no NTP type is exposed.
-
-### Sender-scoped recovery and replacement
-
-A negotiated sender starts unbound. `SetSenderAssignment` installs one complete
-value or removes it with `None`. Unbound media returns `SenderUnbound`.
-`ForwardedMedia.source` must match the bound `SourceIncarnation`, otherwise
-admission returns `SourceIncarnationMismatch`. This token is caller-supplied and
-independent of RTP SSRC, including when a replacement reuses the same SSRC.
-
-Replacing the incarnation or unbinding fences unprepared media, open/started
-frames, queued repairs, and retained RTX payloads. A positive-to-zero selected
-rate also clears old media and repairs. Receiver selection changes clear
-unprepared work. Invalid complete values are rejected before changing the
-previous assignment or its queued work.
-
-`RecoverSenderMedia` takes a complete assignment for the currently bound
-incarnation and the caller's decoder-ready declaration. It clears unprepared
-work, restores local dependency readiness, and retains committed originals and
-pending repairs that remain useful under the supplied bounds. Framing and
-receiver descriptor validation still apply. A different incarnation is rejected
-without converting recovery into replacement.
-
-These operations preserve negotiated identity, primary/RTX SSRCs, sequence
-spaces, global-to-RTP mapping, the committed media-time fence, counters, and
-connection-wide feedback/controller/pacer state. Discarded admission debt and
-spent transport service are not refunded. Other senders are unaffected.
-
-Audio talk-spurt marking is armed initially and rearmed when queued source work
-is cleared. Only an original transmit commit consumes it. Source bytes and
-markers remain immutable; RTX preserves the original wire marker.
-
-Protection consumes the SRTP index. Assignment changes return `InvalidState`
-without mutation while egress preparation is pending; serialized public
-`poll` prepares and commits before returning. Already emitted transmits remain
-irrevocable and require the caller's immediate submission attempt before any
-later command.
-
-## Explicit sender assignment
-
-The caller supplies the entire value atomically. There is no default assignment,
-separate rate-update command, or implicit potential-rate inheritance.
-
-```rust
-pub struct SenderAssignment {
-    pub source: SourceIncarnation,
-    pub selected_bitrate: MediaPayloadBitrate,
-    pub potential_bitrate: MediaPayloadBitrate,
-    pub delivery: DeliveryConstraints,
-    pub playout_delay: Option<PlayoutDelay>,
-    pub decode_target_mask: Option<u32>,
-}
-
-pub struct DeliveryConstraints {
-    pub max_media_age: Duration,
-    pub max_queue_residence: Duration,
-    pub repair_window: Duration,
-}
-```
-
-### Delivery bounds
-
-Every duration must fit the microsecond media-time domain and be representable
-as a local timer deadline. An unrepresentable complete value is rejected before
-mutation; RTC does not impose an audio/video policy maximum on valid values.
-
-`max_media_age` bounds usefulness relative to immutable
-`MediaPacket.global_media_at`. Estimated receiver arrival includes pending
-pacing service and the native queue-delay estimate plus half the measured RTT.
-No media-kind processing reserve or clock-quality freshness profile is inferred.
-
-`max_queue_residence` bounds local queue residence and pending pacing service,
-including the service reserved by probes while selected media is active.
-`repair_window` bounds retained-original lifetime from its transmit commit.
-RTX must satisfy both its repair window and the media-age constraint. Byte
-bounds and native transport safety limits remain independently authoritative.
-
-Tightening bounds re-evaluates queued work and repairs in the same command.
-Each sender owns its queue, frame membership, and payload accounting. Transport
-service considers one head per sender with reusable eligibility storage; it
-does not rediscover heads by scanning a connection-wide backlog. Expiry removes
-at most 256 queued packets per pass and resumes across senders. An abandoned
-frame remains ineligible, including its End fragment, until cleanup completes.
-Expired heads cannot be emitted after the work cap; unfinished cleanup reports
-an immediate wakeup. Relaxing bounds cannot resurrect discarded media. Neither operation mutates source
-timestamps. Local video expiry emits a coalesced `KeyframeRequested` with
-`LocalRecovery`; authenticated peer PLI/FIR uses `Peer`. Pending local recovery
-is observed before `Idle`, and audio expiry does not request a keyframe.
-
-### Wire playout intent
-
-`None` omits the extension and leaves playout to the browser. Explicit `0/0`
-and other ranges remain distinct wire values, not local delivery profiles.
-`PlayoutDelay` accepts millisecond bounds through `from_millis` or exact
-10-ms ticks through `from_ticks`; unrepresentable or inverted bounds are rejected.
-
-A negotiated outbound playout extension repeats its current explicit value
-until an authenticated primary-SSRC SR/RR report block covers a committed packet
-that carried it. TWCC alone, RTX-SSRC reports, and reports beyond committed
-progression do not confirm it. Statistics distinguish `Unspecified`,
-`NotSignaled`, `Pending`, and `Confirmed`. Changing the explicit value resets
-confirmation without resetting RTP or congestion state. Once any explicit value
-has been signaled, an assignment omitting it returns
-`PlayoutResetRequiresNewSender`; omission cannot reset browser state.
-
-### Selected and potential payload rates
-
-Both rates count RTP media-payload bits per second, excluding transport, RTCP,
-and DataChannel overhead. Potential must be at least selected.
-`selected_bitrate` is the caller's local admission ceiling. Zero rejects new
-media. `potential_bitrate` reports available source/layer interest to the native
-controller and bounded probing; it is not a reservation or a bandwidth estimate.
-
-Zero selected with positive potential permits bounded discovery without body
-admission. Both zero withdraw RTP interest. Every update explicitly supplies
-both values, and statistics expose the complete optional assignment. Same-path
-application updates preserve native congestion history and never manufacture
-capacity. Aggregate budget events remain in payload bits per second for the
-caller to compare with its own source and layer choices.
-
-## RTP extension policy
-
-Extension policy is immutable per negotiated sender and keyed by semantic URI,
-never a source wire ID.
-
-- MID, RID, repaired RID, transport-wide sequence number, absolute send time,
-  playout delay, and dependency descriptors requiring outbound continuity are
-  generated or rewritten by the connection. DD rewriting uses caller-resolved
-  templates, DTIs, frame/chain references and resolutions, never source DD or
-  payload parsing. It remaps frame and active-chain references only to committed
-  outbound frames in a bounded receiver history keyed by opaque `FrameId`. Missing required predecessors fail closed and request
-  fresh random access; zero is not a substitute for a shed predecessor. Chains
-  protecting no emitted active target carry zero differences because they do
-  not declare an output dependency. Source active-mask fields are never copied
-  over the SFU's semantic selection. A cold independent
-  frame carries its real source definition without replaying older media. RTX
-  preserves the original outbound DD value. DD-capable senders use a stable
-  two-byte extension format, and queue estimates account for forced definitions.
-- Known endpoint-independent values such as audio level and video orientation can
-  be forwarded after URI-based remapping.
-- Absolute Capture Time can be exposed for diagnostics or forwarded when policy
-  allows, but it is never authoritative for `GlobalMediaTime`, deadlines, A/V
-  synchronization, or congestion control.
-- Unknown extensions are dropped by default. `UnknownExtensionPolicy::Opaque`
-  permits byte-preserving pass-through only after URI negotiation and RTP's
-  255-byte per-value bound. Audio level and video orientation require one byte;
-  Absolute Capture Time requires eight or sixteen bytes. Invalid values are
-  omitted rather than emitted as malformed extensions. A sender with an opaque
-  value or an extension ID outside the one-byte range always uses the two-byte
-  wire format, even when that packet omits the optional value. Optional values
-  must not make a stream switch extension formats without negotiated mixing.
-- All authenticated negotiated ingress extensions remain available through lazy
-  URI-based accessors even when not forwarded.
-- RTX retains the original canonical outbound RTP within the retransmission byte
-  budget. Repairs preserve endpoint-independent extension values and the original
-  marker, but generate new transport-owned RTX identity, MID and feedback state.
-  Unretained originals do not create repair requests; eviction retires queued
-  requests for the evicted original.
-
-## Scheduling and congestion control
-
-The public API exposes only semantic policy, aggregate media budget, output, and snapshots.
-SCReAM, TWCC, RFC 8888 report parsing, queue targets, window gains, pacing factors,
-probe clusters, and histories remain private.
-
-The fixed design is:
-
-- one connection-level SCReAM-v2-derived RTP controller;
-- explicit caller delivery bounds for admission, queue residence and repair,
-  enforced alongside private native transport and probe safety limits;
-- caller-selected sender admission ceilings and equal-byte-quantum sender service;
-- one aggregate media-payload pacer at the native budget, charged only on commit;
-- one transport-byte pacer and deadline-aware scheduler;
-- ordinary RTP padding on a negotiated media or RTX SSRC for pre-media and
-  application-limited probing; no synthetic SSRC-zero stream;
-- SCTP retaining its own congestion control and bounded buffering, coordinated
-  through eligible connection-level packet service without inferred ACK-rate reservations;
-- protocol control deliverable under media/DataChannel load;
-- padding always lowest value.
-
-The SFU receives the native aggregate RTP payload budget without target
-redistribution and continues to choose sources, layers, and sender targets. See [`congestion-control.md`](congestion-control.md)
-for exact units, constants, state transitions, and acceptance tests.
-
-
-## DataChannels
-
-DataChannels support local and remote DCEP opening, externally negotiated
-channels, ordered and unordered delivery, reliability by retransmit count or
-lifetime, text and binary message boundaries, buffered-amount backpressure, and
-graceful close. No `dcsctp` type is public.
-
-`DataChannelEvent::Opened` carries the assigned channel ID and a complete
-`DataChannelConfig` snapshot for local, remote DCEP, and externally negotiated
-channels. The snapshot's `id` is always the assigned ID, not an unresolved opening
-request. Labels, protocols, ordering, reliability, and priority remain available
-for application classification without consulting private SCTP state.
-
-```rust
-pub struct DataChannelConfig {
-    pub id: Option<DataChannelId>,
-    pub label: Arc<str>,
-    pub protocol: Arc<str>,
-    pub ordered: bool,
-    pub reliability: DataReliability,
-    pub priority: DataChannelPriority,
-    pub negotiated: bool,
-}
-
-pub enum DataReliability {
-    Reliable,
-    MaxRetransmits(u16),
-    MaxLifetime(Duration),
-}
-
-#[repr(transparent)]
-pub struct DataChannelPriority(NonZeroU16);
-
-impl DataChannelPriority {
-    pub const VERY_LOW: Self = Self::new_const(128);
-    pub const LOW: Self = Self::new_const(256);
-    pub const MEDIUM: Self = Self::new_const(512);
-    pub const HIGH: Self = Self::new_const(1024);
-
-    pub fn new(weight: u16) -> Result<Self, DataChannelConfigError>;
-    pub const fn weight(self) -> u16;
-}
-
-pub enum DataMessage {
-    Text(Bytes),
-    Binary(Bytes),
-}
-```
-
-`DataChannelPriority` is the 16-bit SCTP weighted-fair-queueing weight used by the
-WebRTC DataChannel profile. It does not weight RTP sender service.
-Higher weight receives proportionally more SCTP service while
-backlogged. Message interleaving is used when negotiated; without it, the
-scheduler cannot preempt an already fragmented non-interleaved message and
-statistics expose the resulting head-of-line delay.
-
-SCTP keeps its own acknowledgment, retransmission, and congestion window. SCTP
-packets never enter RTP/TWCC/RFC-8888 sent history and never count as SCReAM
-bytes-in-flight. The connection records committed SCTP transport bytes as sends,
-not acknowledged delivery or spare path bandwidth. Bounded protocol service and
-alternating eligible RTP/SCTP packet service coordinate the two controllers without
-an inferred combined delivered-rate estimate or a fixed-rate reservation. Ready
-SCTP output takes precedence over padding. DataChannels cannot bypass protocol
-service or indefinitely starve eligible media; blocked SCTP does not stall RTP.
-
-Outbound pressure returns the original owned command in `RejectedCommand` with
-reason `CommandError::WouldBlock`.
-An oversized authenticated inbound message closes the channel where SCTP/WebRTC
-semantics permit rather than the peer connection. Malformed unauthenticated
-traffic is dropped and counted.
-
-
-## Error and isolation contract
-
-- Malformed, unauthenticated, replayed, unknown-tuple, and SRTP-authentication
-  failures are dropped with bounded cumulative counters and do not create state.
-- Authenticated violations are isolated to their RTP stream or DataChannel where
-  protocol semantics permit.
-- Unknown, duplicate, stale, or reordered feedback cannot acknowledge bytes more
-  than once and cannot allocate unbounded state.
-- Dynamic-encoding overflow drops the candidate encoding without closing the
-  connection.
-- Media/DataChannel queue overflow returns `WouldBlock` or sheds media according
-  to deadline policy; it never allocates beyond configured bounds.
-- Only unrecoverable authenticated transport state, mandatory resource exhaustion
-  required to preserve protocol correctness, cryptographic failure, or timeout is
-  terminal. Caller clock regressions are clamped and diagnosed rather than made
-  terminal.
-- Public errors identify the semantic operation and reason. They do not expose
-  `str0m`, `dcsctp`, SCReAM, TWCC, or RTCP implementation types.
-
-## Validation boundary
-
-Crate-local deterministic tests and the controlled native harness live under
-`crates/pulsebeam-rtc`. Private controller assertions, including the fixed SCReAM
-scenario matrix, run once in the unit target. Integration tests protect the
-public `Connection` boundary, and controlled native peers protect interoperability.
-Web and React retain consumer browser coverage. The
-[shared development workflow](../../../README.md#development) defines workspace
-gates.
-
-Acceptance requires:
-
-- compile-time API tests proving only the documented types cross the crate
-  boundary;
-- deterministic tests for negotiation, ICE/DTLS/SRTP/SCTP, RTP/RTCP continuity,
-  clock normalization, source switching, frame metadata, extension rewriting,
-  close behavior, and every resource bound;
-- deterministic network simulation for loss, delay, reordering, VBR, pauses,
-  probing, feedback loss, malformed traffic, and overload;
-- property tests for global-time wire round trips, non-regressing clock mappings,
-  no double acknowledgment, bounded histories, caller-target independence, and
-  policy monotonicity;
-- actual libwebrtc `pulsebeam-webrtc-sys` `0.6.2`, source commit
-  `f87f99a48e58fb9cd13767ba58e9b7cd937c71a3`, and matching released native
-  artifacts provisioned through Bazel on Linux x86_64;
-- controlled execution with explicit task pumping, simulated clocks, virtual
-  packet delivery, and bounded progress; no production scheduling or live sockets;
-- authenticated bidirectional media, actual native TWCC affecting send accounting,
-  text/binary DataChannel delivery and media coexistence, lifecycle handling,
-  and repeatable same-seed results.
-
-The canonical complete RTC local and CI command is:
-
-```sh
-./bazel test --config=sim //crates/pulsebeam-rtc:test --nocache_test_results
-```
-
-This includes all unit, property, integration, and native simulation tests.
-With built binaries and cached test results disabled, the operational host
-elapsed-time target is fifteen seconds per complete invocation, including peer
-setup and teardown. Dependency fetching, compilation, lint/format checks,
-benchmarks, and other owners are excluded. This target is not a correctness
-acceptance threshold or a host-performance benchmark. Virtual-time protocol
-deadlines, resource limits, and quantitative modeled-network/controller assertions
-remain correctness requirements. Required native scenarios cannot be moved to
-optional slow gates.
-Missing artifacts or absent required media, feedback, or DataChannel evidence
-fail acceptance, never silently skip or fall back to another client.
-
-RFC 8888 retains deterministic client-free negotiation, report generation,
-parsing, and accounting evidence; RFC 8888 client interoperability is not claimed. ICE-TCP also has
-controlled active-client libwebrtc interoperability at the packet-socket boundary,
-including authenticated media, DataChannels, flow retirement, and graceful close.
-The adapter has no TCP listener and supplies unframed non-TLS packet payloads;
-the fixture translates these to and from RTC's complete RFC 4571 frames. Native
-TCP byte-stream fragmentation and passive-client coverage are not claimed.
-Other platforms, ICE restart, and renegotiation remain outside this profile.
-
-Run root `./bazel test //:test` for complete workspace acceptance, including
-consumer-owned Web and React browser coverage. Shared browser provisioning is
-retained in `tools/browser-matrix.json`.
-
-Host-performance comparisons use the active-media Criterion matrix, separate
-from correctness gates: `./bazel run -c opt //:benchmark`. One connection serves
-1/8/32 senders with admission bursts of 1/8 fresh native-publisher samples.
-The timed workload includes sustained admission, original transmit commits,
-native feedback, and bounded backpressure; negotiation and cell allocation/
-teardown are excluded. Native capture and transport pumping are included, so
-this is neither isolated queue cost nor production-server throughput.
-See the [crate benchmark contract](../README.md#validation-boundary) for workload
-bounds, report-directory configuration, and service/backlog counters.
-
-Stored SDP cannot prove runtime interoperability. Client-free protocol checks
-and Ericsson SCReAM comparisons establish narrower RTC component invariants,
-not production-server integration or additional client compatibility. Only controlled actual libwebrtc delivery
-establishes the native interoperability baseline.
-
-
-## Primary references
-
-- [SCReAM v2, pinned draft revision 01](https://datatracker.ietf.org/doc/html/draft-ietf-ccwg-rfc8298bis-screamv2-01)
-- [RFC 3550: RTP and RTCP Sender Reports](https://www.rfc-editor.org/rfc/rfc3550.html)
-- [RFC 4571: RTP/RTCP framing over connection-oriented transport](https://www.rfc-editor.org/rfc/rfc4571.html)
-- [RFC 6544: TCP candidates with ICE](https://www.rfc-editor.org/rfc/rfc6544.html)
-- [RFC 8831: WebRTC DataChannels](https://www.rfc-editor.org/rfc/rfc8831.html)
-- [RFC 8832: WebRTC DataChannel establishment](https://www.rfc-editor.org/rfc/rfc8832.html)
-- [RFC 8260: SCTP stream schedulers and message interleaving](https://www.rfc-editor.org/rfc/rfc8260.html)
-- [RFC 8835: WebRTC media transport priority](https://www.rfc-editor.org/rfc/rfc8835.html)
-- [RFC 8888: RTP congestion-control feedback](https://www.rfc-editor.org/rfc/rfc8888.html)
-- [libwebrtc transport-wide congestion-control extension](https://webrtc.googlesource.com/src/+/refs/heads/main/docs/native-code/rtp-hdrext/transport-wide-cc-02/README.md)
-- [libwebrtc playout-delay extension](https://webrtc.googlesource.com/src/+/refs/heads/main/docs/native-code/rtp-hdrext/playout-delay/README.md)
-- [libwebrtc Absolute Capture Time extension](https://webrtc.googlesource.com/src/+/refs/heads/main/docs/native-code/rtp-hdrext/abs-capture-time/README.md)
+# Lean RTC connection contract
+
+This document describes the independently exercised `pulsebeam-rtc` transport
+engine. Production PulseBeam still uses direct str0m; this is not a production
+cutover contract or a Rust-compatible replacement for str0m.
+
+The public Rust definitions are authoritative. The [README](../README.md) gives
+the shortest development path; [congestion control](congestion-control.md)
+defines the private controller profile and quantitative proof.
+
+## Ownership and scope
+
+One `Connection` owns one peer's immutable initial negotiation and transport
+state: ICE, DTLS, SRTP/SRTCP, RTP/RTCP, SCTP, feedback, congestion control,
+pacing, ordinary retransmission, protocol timers, and mechanical resource
+bounds. Protocol progress is explicit and connection-local. There is no hidden
+transport task, cross-connection controller, global registry, or socket retry
+queue.
+
+The caller owns routing, allocation, source/layer selection, receiver sequence
+and timestamp translation, frame/DD interpretation and rewriting, keyframe
+caches, source switching, recovery and playback policy, global media
+normalization, and node serialization. These responsibilities are not encoded
+as RTC commands or moved into alternate RTC packet/frame types.
+
+This crate exposes RTC-owned values, not public str0m, SCTP, or native-controller
+types. The production SFU retains its native packet utilities and dependency
+wiring. Neither side depends on completing a cutover first.
+
+## Initial negotiation
+
+`Connection::accept(config, offer, instant, system_time, entropy)` returns the
+connection, SDP answer, and `SessionInfo`. The caller sends that answer through
+its signaling mechanism. Supply valid local candidates and fresh cryptographic
+entropy for every peer. Reusing entropy across peers is not an identity or key
+management strategy.
+
+The existing supported profile is:
+
+* one immutable remote offer/local answer, ICE-lite, BUNDLE, RTCP mux, inline
+  candidates, and all initial SDP media directions;
+* UDP and passive ICE-TCP over IPv4 or IPv6, with active-client TCP covered at
+  the controlled packet-socket boundary;
+* the negotiated Opus/H.264 codec profile and directional RTP/RTX payload maps;
+* DTLS 1.3 preferred, DTLS 1.2 compatibility fallback, preferred mutually
+  supported AEAD SRTP, and the existing legacy SRTP compatibility profile;
+* one supported outbound packet-feedback mode, TWCC or RFC 8888, including
+  audio-only outbound RTP. There is no REMB or fixed-rate fallback.
+
+Application-only sessions do not require RTP feedback. Rejected media sections
+retain valid dynamic payload mappings in the answer. Trickle ICE, ICE restart,
+renegotiation, a TURN client, additional codecs, and additional browser/platform
+compatibility are not implied by this contract.
+
+`SessionInfo` exposes negotiated inbound media, outbound senders addressed by
+MID, codec/RTX payload mappings, clock rates, profiles, and directional extension
+facts. The caller need not parse the answer again or depend on native types.
+
+## Service loop and commits
+
+Feed one `NetworkInput` to `receive(now, arrival, input)`. `now` is execution
+time; `arrival` is the actual receive timestamp and must not be later than
+`now`. Preserve it when socket processing is delayed. UDP input owns one
+datagram. ICE-TCP input owns exactly one complete RFC 4571 frame, including its
+length prefix. Malformed network traffic is isolated and counted rather than
+made into media events.
+
+Call `poll(now)` for protocol progress, including due timers. Its owned result
+is one of:
+
+| Output | Caller obligation |
+| --- | --- |
+| `Event` | Consume the connection, RTP, Sender Report, keyframe, estimate, encoding, or channel fact. |
+| `Transmit` | Submit the already committed bytes promptly, or treat them as local loss. |
+| `Idle { next_wakeup }` | Schedule that wakeup; a due-now wakeup means runnable continuation. |
+| `Closed` | Observe the terminal reason once; later polls are idle. |
+
+Internal drains and event queues are bounded. A caller may collect a bounded
+batch, yield to other connections, and resume without draining one connection
+to idle. Service finalized output promptly before requesting more finalized
+work from that connection. Blocked sends must not create a busy loop; pending
+protocol work must not disappear from the next wakeup.
+
+Returning `Transmit` is the irrevocable send commit for continuity, sent history,
+bytes in flight, pacing, and byte counters. There is no departure receipt or
+rollback API. Unsent UDP datagrams may receive bounded adapter retry or be
+counted as local loss. An accepted batch prefix must never be replayed.
+
+`close(now, deadline)` rejects new application work and drains required shutdown
+traffic to a bounded deadline. `abort()` discards pending work and publishes one
+terminal result. Neither operation promises delivery of queued media.
+
+## RTP values and caller numbering
+
+Authenticated ingress emits `Event::Rtp { mid, rid, packet }`. `RtpPacket`
+contains actual arrival, ordinary primary RTP header facts, payload bytes, and
+negotiated URI-addressed extension values. RTX is authenticated and decapsulated
+into its primary identity before this event. Payload and extension values remain
+opaque to frame and playback policy.
+
+Write directly to an outbound MID with `write_rtp(now, mid, RtpWrite)`:
+
+* `sequence` is the caller's extended primary index, below `2^48`;
+* `timestamp` and `wallclock: Instant` establish the caller's RTP clock
+  correspondence used by Sender Reports;
+* marker, payload, and negotiated media extension values are caller supplied;
+* negotiated transport SSRC/payload mapping, MID, TWCC, protection, pacing, and
+  send-history accounting remain RTC-owned.
+
+Gaps, wrap, and valid late holes are allowed. RTC does not impose a strictly
+increasing gate or allocate hidden primary numbers. **The caller must never
+reuse an accepted original extended index under the same sender/key**, including
+after discarding queued work. There is no unbounded lifetime index registry or
+promise to detect caller nonce misuse. Rejected writes return their owned
+packet and do not consume an index; retrying that rejected work is allowed.
+
+Admission enforces structural and mechanical bounds, not selected source rates,
+frame usefulness, or playback deadlines. The caller owns packetization and
+receiver continuity. Oversized packets and invalid/unsupported extension writes
+are rejected; a full queue returns `WouldBlock` with the original packet.
+
+`discard_pending_rtp(mid)` discards uncommitted originals. It does not reset
+committed primary/RTX identity, sent history, spent pacing service, congestion
+state, or retained repair packets. It is not a source-switch, decoder-ready, or
+keyframe-recovery operation.
+
+## RTP extension ownership
+
+Extensions are addressed by negotiated semantic URI, not source wire ID. Their
+wire IDs can differ between ingress and egress.
+
+RTC generates negotiated transport identity and transport-wide sequence
+numbers. Do not submit MID, RID, repaired RID, or TWCC as media extension values.
+Caller-owned media values can include audio level, video orientation, Absolute
+Capture Time, DD, VLA, and explicit playout delay when negotiated. RTC remaps
+and serializes them; it does not resolve DD templates, rewrite frame references,
+choose decode targets, or infer keyframe/dependency meaning.
+
+Absolute Capture Time is not authoritative for RTC normalization or congestion
+control. Unknown extensions are dropped by default; `UnknownExtensionPolicy`
+can permit bounded negotiated opaque values. Absence remains absence. RTC does
+not manufacture a default playout-delay extension or keep receiver-confirmed
+playout policy. `PlayoutDelay::to_bytes` is only an explicit wire-value encoder,
+with rounding to 10 ms units, not an admission, queue, or repair setting.
+
+## Time and Sender Reports
+
+All routine timed operations use `Instant`. The initial `Instant`/`SystemTime`
+anchor converts subsequent monotonic progress into RTCP NTP seconds/fraction,
+including NTP era wrap. RTC does not read a new wall clock on each packet or
+require a coherent cluster-global timestamp/provenance context.
+
+Outgoing Sender Reports relate the advancing committed primary RTP clock to
+that fixed protocol anchor. Incoming `SenderReport` exposes actual arrival,
+SSRC, raw NTP seconds/fraction, and raw RTP timestamp. The caller owns any
+synchronization or normalization derived from those facts. Packet arrival,
+execution time, media correspondence, and protocol wall-clock conversion are
+not interchangeable.
+
+TWCC and RFC 8888 arrival/report calculations continue to use monotonic time.
+Removing the global timeline does not remove wire NTP fields, change their
+fractions, or authorize clock-dependent feedback accounting.
+
+## Congestion, repair, and resources
+
+`set_desired_bitrate(Option<MediaPayloadBitrate>)` supplies one aggregate
+application-demand hint. `None` and zero are neutral: primary RTP remains
+sendable without a hint, while speculative padding is disabled. A positive hint
+can enable negotiated RTX startup without a source binding. The native
+bandwidth estimate is exposed through `Event::BandwidthEstimate` and connection
+statistics, not a reservation or allocation of caller targets.
+
+Desired rate and estimate use RTP media-payload bits/s. Native pacing and the
+send window account RTP transport bytes. There is no second payload-admission
+pacer, per-source rate policer, or additional delivery-feasibility budget.
+SCReAM, TWCC, and RFC 8888 remain supported; only the negotiated mode accounts
+acknowledgments. SCTP retains its own congestion control and is excluded from
+RTP feedback history.
+
+Padding uses negotiated RTX identity and continuous RTX numbering. Without RTX,
+startup and feedback-outage recovery use actual primary media and feedback,
+not fabricated primary padding. Repairs use ordinary committed packet retention,
+byte/age bounds, and resend spacing. The mechanical retention horizon is not an
+estimate of playback usefulness, a frame deadline, or a caller repair policy.
+
+`ConnectionLimits` bounds encodings, channels, message buffering, queued media,
+and retained repair bytes. Packet/history/probe queues also have fixed internal
+bounds. Authenticated unsignaled SSRC discovery is bounded and counted; paused
+encodings are not retired merely because they are inactive. Callers can request
+keyframes and explicitly retire an ingress SSRC using direct operations.
+
+## Channels
+
+`open_data_channel(now, config)`, `send_data(now, channel, message)`, and
+`close_data_channel(now, channel)` operate directly. An open rejection returns
+its configuration; a send rejection returns its message. Count, message, and
+buffer bounds apply before consuming application work. Channel open/message/
+close facts are events, with ordinary reliability and ordering settings. RTP and
+SCTP share bounded service without sharing acknowledgment or capacity accounting.
+
+## TCP adapter responsibilities
+
+The caller owns stream admission, socket incarnations, framing, and retirement.
+RTC input/output carries socket tuples, not public flow IDs. Snapshot the chosen
+socket incarnation when accepting output for adapter submission. Later output at
+the same tuple does not authorize moving saved bytes to a different socket.
+
+A pending or partially written frame must finish on its original socket or cause
+that socket to close. Never drop a suffix and continue with a later frame, append
+old bytes to a replacement stream, or feed stale closed-socket input into RTC.
+The adapter must filter retired incarnations before receive and preserve any
+required ordering around replacement. These are socket ownership obligations,
+not an RTC registry or retry service.
+
+The native interoperability fixture proves an active client against a passive
+RTC candidate at the controlled packet-socket boundary. It translates unframed
+native packet-socket payloads to/from complete RFC 4571 frames. Runtime socket
+proof separately covers partial byte-stream writes and stale-socket filtering;
+packet-socket interoperability is not that byte-stream proof.
+
+## Evidence and limits
+
+Use the owner targets in the [README](../README.md#contributor-verification).
+Controlled native peers prove authenticated bidirectional media, fragmented
+video, negotiated extension bytes, primary wrap/late-hole feedback receipts,
+repair continuity, native TWCC, channels, passive TCP, and same-seed replay.
+Protocol unit tests retain SR NTP/RTP correspondence, crypto/index boundaries,
+delayed arrival, parser/report/accounting, and negotiated RFC 8888 coverage.
+
+Production routing, DD/keyframe/cache correctness, source/layer switching, and
+node behavior remain in the direct-str0m SFU and simulator proof. RTC metadata
+assertions alone do not establish those behaviors. Stored SDP, RFC 8888 component
+tests, and the controlled native baseline must not be described as new browser,
+Pion, platform, or production-cutover compatibility.

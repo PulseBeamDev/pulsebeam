@@ -9,14 +9,13 @@
     reason = "all indexes derive from bounded negotiated facts and mapper arithmetic deliberately uses RTP wrapping"
 )]
 
-use std::{collections::VecDeque, ops::Range, sync::Arc, time::Instant};
+use std::{collections::VecDeque, sync::Arc, time::Instant};
 
 use bytes::Bytes;
 
 use crate::{
-    ConnectionWarning, EcnCodepoint, EncodingId, EncodingInfo, EncodingRetireReason, EncodingStats,
-    Event, MediaPacket, PacketFeedbackKind, TimePoint,
-    clock::{ClockMapper, ClockWarning, ntp_micros},
+    EcnCodepoint, EncodingInfo, EncodingRetireReason, EncodingStats, Event, PacketFeedbackKind,
+    RtpExtension, RtpHeader, RtpPacket as ReceivedRtp, SenderReport,
     negotiation::IngressMediaFacts,
     packet::RtpPacket,
     receive_feedback::ReceiveFeedback,
@@ -37,17 +36,13 @@ pub(crate) struct IngressOwner {
     feedback: VecDeque<FeedbackBatch>,
     repair: VecDeque<RepairRequest>,
     keyframes: VecDeque<rtcp::KeyframeRequest>,
-    cname_by_ssrc: Vec<(u32, Box<str>)>,
-    groups: Vec<(Box<str>, i128)>,
     max_unsignaled: usize,
     max_bytes: usize,
     queued_media_bytes: usize,
-    next_encoding: u32,
     dropped: u64,
 }
 
 struct Encoding {
-    id: EncodingId,
     media: usize,
     ssrc: Option<u32>,
     repair_ssrc: Option<u32>,
@@ -55,7 +50,6 @@ struct Encoding {
     unsignaled: bool,
     retired: bool,
     receiver: ReceiveStream,
-    mapper: ClockMapper,
 }
 
 impl IngressOwner {
@@ -76,19 +70,16 @@ impl IngressOwner {
             feedback: VecDeque::new(),
             repair: VecDeque::new(),
             keyframes: VecDeque::new(),
-            cname_by_ssrc: Vec::new(),
-            groups: Vec::new(),
             max_unsignaled: usize::from(max_unsignaled),
             max_bytes,
             queued_media_bytes: 0,
-            next_encoding: 1,
             dropped: 0,
         }
     }
 
     pub(crate) fn accept_rtp(
         &mut self,
-        arrival: crate::PacketObservation,
+        arrival: Instant,
         bytes: Vec<u8>,
         ecn: Option<EcnCodepoint>,
     ) {
@@ -97,11 +88,12 @@ impl IngressOwner {
 
     fn accept_packet(
         &mut self,
-        arrival: crate::PacketObservation,
+        arrival: Instant,
         bytes: Vec<u8>,
         repair: bool,
         ecn: Option<EcnCodepoint>,
     ) {
+        let bytes = Bytes::from(bytes);
         let Ok(packet) = RtpPacket::parse(&bytes) else {
             self.drop();
             return;
@@ -124,13 +116,8 @@ impl IngressOwner {
                 .and_then(|(id, _)| packet.extensions().ok()?.find(|value| value.id() == *id))
                 .and_then(|value| <[u8; 2]>::try_from(value.value()).ok())
                 .map(u16::from_be_bytes);
-            self.receive_feedback.observe(
-                arrival.at.monotonic,
-                packet.ssrc(),
-                packet.sequence(),
-                twcc,
-                ecn,
-            );
+            self.receive_feedback
+                .observe(arrival, packet.ssrc(), packet.sequence(), twcc, ecn);
         }
         if self.events.len() >= MAX_RECORDS
             || bytes.len() > self.max_bytes.saturating_sub(self.queued_media_bytes)
@@ -250,13 +237,7 @@ impl IngressOwner {
                     self.drop();
                     return;
                 }
-                let Some(id) = EncodingId::new(self.next_encoding) else {
-                    self.drop();
-                    return;
-                };
-                self.next_encoding = self.next_encoding.saturating_add(1);
                 self.encodings.push(Encoding {
-                    id,
                     media,
                     ssrc: Some(packet.ssrc()),
                     repair_ssrc: None,
@@ -269,91 +250,82 @@ impl IngressOwner {
                             .nack_payloads
                             .contains(&packet.payload_type()),
                     ),
-                    mapper: ClockMapper::new(
-                        arrival.at.global,
-                        packet.sequence(),
-                        packet.timestamp(),
-                        clock_rate,
-                    ),
                 });
                 let index = self.encodings.len() - 1;
                 self.events
                     .push_back(Event::EncodingDiscovered(EncodingInfo {
-                        id,
-                        sender_index: self.media[media].sender_index,
+                        mid: self.media[media].mid.clone().into(),
+                        ssrc: packet.ssrc(),
                         kind: self.media[media].kind,
                         rid: rid.map(Arc::from),
                     }));
                 index
             }
         };
-        let (encoding, global_media_at, warning, clock_quality) = {
-            let encoding = &mut self.encodings[encoding];
-            if encoding.ssrc.is_none() {
-                encoding.ssrc = Some(packet.ssrc());
-            }
-            if encoding.rid.is_none() {
-                encoding.rid = rid.map(Box::<str>::from);
-            }
-            if encoding.retired {
-                self.drop();
-                return;
-            }
-            if !encoding.receiver.accept(
-                packet.sequence(),
-                packet.timestamp(),
-                arrival.at.monotonic,
-                repair,
-            ) {
-                self.drop();
-                return;
-            }
-            let Some((global_media_at, warning)) =
-                encoding
-                    .mapper
-                    .map(packet.sequence(), packet.timestamp(), arrival.at.monotonic)
-            else {
-                self.drop();
-                return;
-            };
-            (
-                encoding.id,
-                global_media_at,
-                warning,
-                encoding.mapper.quality(),
-            )
-        };
-        if let Some(warning) = warning {
-            self.push_clock_warning(warning);
+        let state = &mut self.encodings[encoding];
+        if state.ssrc.is_none() {
+            state.ssrc = Some(packet.ssrc());
         }
-        let extensions = self.extensions_for(media, &packet);
-        let packet = MediaPacket::with_clock_quality(
-            Bytes::from(bytes),
-            global_media_at,
-            extensions,
-            clock_quality,
-            crate::PacketOrigin {
-                observed_at: arrival.at.global,
-                provenance: arrival.provenance,
-            },
-        );
-        if packet.queued_bytes() > self.max_bytes.saturating_sub(self.queued_media_bytes) {
+        if state.rid.is_none() {
+            state.rid = rid.map(Box::<str>::from);
+        }
+        if state.retired
+            || !state
+                .receiver
+                .accept(packet.sequence(), packet.timestamp(), arrival, repair)
+        {
             self.drop();
             return;
         }
+        let header = RtpHeader {
+            sequence: packet.sequence(),
+            timestamp: packet.timestamp(),
+            ssrc: packet.ssrc(),
+            payload_type: packet.payload_type(),
+            marker: packet.marker(),
+        };
+        let payload_range = packet.payload_range();
+        let extension_ranges = packet
+            .extensions()
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter_map(|value| {
+                self.media[media]
+                    .extensions
+                    .iter()
+                    .find(|(id, _)| *id == value.id())
+                    .map(|(_, uri)| (Arc::<str>::from(uri.as_ref()), value.range()))
+            });
+        let rid = rid.map(Arc::from);
+        let packet = ReceivedRtp {
+            arrival,
+            header,
+            payload: bytes.slice(payload_range),
+            extensions: extension_ranges
+                .map(|(uri, range)| RtpExtension {
+                    uri,
+                    value: bytes.slice(range),
+                })
+                .collect(),
+        };
         self.queued_media_bytes = self
             .queued_media_bytes
             .saturating_add(packet.queued_bytes());
-        self.events.push_back(Event::Media { encoding, packet });
+        self.events.push_back(Event::Rtp {
+            mid: self.media[media].mid.clone().into(),
+            rid,
+            packet,
+        });
     }
 
     pub(crate) fn accept_rtcp(
         &mut self,
-        arrival: TimePoint,
+        arrival: Instant,
         bytes: Vec<u8>,
         path_epoch: PathEpoch,
         mode: Option<PacketFeedbackKind>,
-        smoothed_rtt: Option<std::time::Duration>,
+        _smoothed_rtt: Option<std::time::Duration>,
     ) -> Vec<rtcp::ReportReceipt> {
         if bytes.len() > self.max_bytes {
             self.drop();
@@ -372,7 +344,7 @@ impl IngressOwner {
             return Vec::new();
         }
         for fact in parsed.lifecycle {
-            self.apply_rtcp_fact(arrival, smoothed_rtt, fact);
+            self.apply_rtcp_fact(arrival, fact);
         }
         self.feedback.extend(parsed.feedback);
         self.repair.extend(parsed.repair);
@@ -406,7 +378,7 @@ impl IngressOwner {
 
     pub(crate) fn poll_event(&mut self) -> Option<Event> {
         let event = self.events.pop_front()?;
-        if let Event::Media { packet, .. } = &event {
+        if let Event::Rtp { packet, .. } = &event {
             self.queued_media_bytes = self
                 .queued_media_bytes
                 .saturating_sub(packet.queued_bytes());
@@ -414,29 +386,29 @@ impl IngressOwner {
         Some(event)
     }
 
-    pub(crate) fn retire(&mut self, id: EncodingId) -> Result<(), crate::CommandError> {
+    pub(crate) fn retire(&mut self, ssrc: u32) -> Result<(), crate::WriteError> {
         let encoding = self
             .encodings
             .iter_mut()
-            .find(|encoding| encoding.id == id)
-            .ok_or(crate::CommandError::UnknownEncoding(id))?;
+            .find(|encoding| encoding.ssrc == Some(ssrc))
+            .ok_or(crate::WriteError::UnknownEncoding)?;
         if !encoding.retired {
             encoding.retired = true;
             self.events.push_back(Event::EncodingRetired {
-                encoding: id,
+                ssrc,
                 reason: EncodingRetireReason::Retired,
             });
         }
         Ok(())
     }
 
-    pub(crate) fn keyframe_request(&self, id: EncodingId) -> Result<[u8; 12], crate::CommandError> {
+    pub(crate) fn keyframe_request(&self, ssrc: u32) -> Result<[u8; 12], crate::WriteError> {
         let ssrc = self
             .encodings
             .iter()
-            .find(|encoding| encoding.id == id && !encoding.retired)
+            .find(|encoding| encoding.ssrc == Some(ssrc) && !encoding.retired)
             .and_then(|encoding| encoding.ssrc)
-            .ok_or(crate::CommandError::UnknownEncoding(id))?;
+            .ok_or(crate::WriteError::UnknownEncoding)?;
         let mut packet = [0_u8; 12];
         packet[..4].copy_from_slice(&[0x81, 206, 0, 2]);
         packet[4..8].copy_from_slice(&self.receiver_ssrc.to_be_bytes());
@@ -457,7 +429,8 @@ impl IngressOwner {
         self.encodings
             .iter()
             .map(|encoding| EncodingStats {
-                encoding: encoding.id,
+                mid: self.media[encoding.media].mid.clone().into(),
+                ssrc: encoding.ssrc,
                 kind: self.media[encoding.media].kind,
                 received_packets: encoding.receiver.received(),
                 retired: encoding.retired,
@@ -582,48 +555,13 @@ impl IngressOwner {
         })
     }
 
-    fn extensions_for(
-        &self,
-        media: usize,
-        packet: &RtpPacket<'_>,
-    ) -> Arc<[(Arc<str>, Range<usize>)]> {
-        let Ok(values) = packet.extensions() else {
-            return Arc::from([]);
-        };
-        values
-            .filter_map(|value| {
-                self.media[media]
-                    .extensions
-                    .iter()
-                    .find(|(id, _)| *id == value.id())
-                    .map(|(_, uri)| (Arc::from(uri.as_ref()), value.range()))
-            })
-            .collect::<Vec<_>>()
-            .into()
-    }
-
     fn drop(&mut self) {
         self.dropped = self.dropped.saturating_add(1);
     }
 
-    fn apply_rtcp_fact(
-        &mut self,
-        arrival: TimePoint,
-        smoothed_rtt: Option<std::time::Duration>,
-        fact: LifecycleFact,
-    ) {
+    fn apply_rtcp_fact(&mut self, arrival: Instant, fact: LifecycleFact) {
         match fact {
-            LifecycleFact::Cname { ssrc, cname } => {
-                if let Some((_, known)) = self
-                    .cname_by_ssrc
-                    .iter_mut()
-                    .find(|(known, _)| *known == ssrc)
-                {
-                    *known = cname;
-                } else if self.cname_by_ssrc.len() < MAX_RECORDS {
-                    self.cname_by_ssrc.push((ssrc, cname));
-                }
-            }
+            LifecycleFact::Cname { .. } => {}
             LifecycleFact::Bye { ssrc } => {
                 if let Some(encoding) = self
                     .encodings
@@ -633,7 +571,7 @@ impl IngressOwner {
                 {
                     encoding.retired = true;
                     self.events.push_back(Event::EncodingRetired {
-                        encoding: encoding.id,
+                        ssrc,
                         reason: EncodingRetireReason::RemoteBye,
                     });
                 }
@@ -644,71 +582,23 @@ impl IngressOwner {
                 ntp_fraction,
                 rtp_timestamp,
             } => {
-                let Some(ntp) = ntp_micros(ntp_seconds, ntp_fraction) else {
-                    self.drop();
-                    return;
-                };
-                let Some(index) = self
+                if let Some(encoding) = self
                     .encodings
-                    .iter()
-                    .position(|encoding| encoding.ssrc == Some(ssrc) && !encoding.retired)
-                else {
-                    return;
-                };
-                self.encodings[index].receiver.sender_report(
+                    .iter_mut()
+                    .find(|encoding| encoding.ssrc == Some(ssrc) && !encoding.retired)
+                {
+                    encoding
+                        .receiver
+                        .sender_report(ntp_seconds, ntp_fraction, arrival);
+                }
+                self.events.push_back(Event::SenderReport(SenderReport {
+                    arrival,
+                    ssrc,
                     ntp_seconds,
                     ntp_fraction,
-                    arrival.monotonic,
-                );
-                let cname = self
-                    .cname_by_ssrc
-                    .iter()
-                    .find(|(known, _)| *known == ssrc)
-                    .map(|(_, cname)| cname.clone());
-                let relation = self.encodings[index].mapper.relation_at(rtp_timestamp, ntp);
-                let group_offset = cname
-                    .as_ref()
-                    .and_then(|cname| {
-                        self.groups
-                            .iter()
-                            .find(|(known, _)| known == cname)
-                            .map(|(_, offset)| *offset)
-                    })
-                    .or(relation);
-                let Some(group_offset) = group_offset else {
-                    return;
-                };
-                if let Some(cname) = cname
-                    && !self.groups.iter().any(|(known, _)| known == &cname)
-                    && self.groups.len() < MAX_RECORDS
-                {
-                    self.groups.push((cname, group_offset));
-                }
-                if let Some(warning) = self.encodings[index].mapper.observe_sender_report(
                     rtp_timestamp,
-                    ntp,
-                    arrival.monotonic,
-                    smoothed_rtt,
-                    group_offset,
-                ) {
-                    self.push_clock_warning(warning);
-                }
+                }));
             }
-        }
-    }
-
-    fn push_clock_warning(&mut self, warning: ClockWarning) {
-        let warning = match warning {
-            ClockWarning::Synchronized => ConnectionWarning::MediaClockSynchronized,
-            ClockWarning::Stale => ConnectionWarning::MediaClockStale,
-            ClockWarning::Discontinuous => ConnectionWarning::MediaClockDiscontinuous,
-        };
-        if !self
-            .events
-            .iter()
-            .any(|event| matches!(event, Event::Warning(known) if *known == warning))
-        {
-            self.events.push_back(Event::Warning(warning));
         }
     }
 }
@@ -730,438 +620,4 @@ fn extension_value<'a>(
     std::str::from_utf8(value)
         .ok()
         .filter(|value| !value.is_empty())
-}
-
-#[cfg(test)]
-mod tests {
-    use std::time::Instant;
-
-    use super::*;
-    use crate::{GlobalMediaTime, MediaKind};
-
-    #[test]
-    fn keyframe_requests_are_bounded_and_cleared_on_abort() {
-        let mut ingress = owner();
-        let pli = [0x81, 206, 0, 2, 0, 0, 0, 9, 0, 0, 0, 7];
-        for _ in 0..MAX_RECORDS {
-            ingress.accept_rtcp(at(1), pli.to_vec(), PathEpoch::from_value(1), None, None);
-        }
-        assert_eq!(ingress.keyframes.len(), MAX_RECORDS);
-        let dropped = ingress.dropped;
-        ingress.accept_rtcp(at(1), pli.to_vec(), PathEpoch::from_value(1), None, None);
-        assert_eq!(ingress.dropped, dropped + 1);
-        ingress.abort();
-        assert!(ingress.poll_keyframe().is_none());
-    }
-
-    fn owner() -> IngressOwner {
-        IngressOwner::new(
-            vec![IngressMediaFacts {
-                sender_index: 3,
-                kind: MediaKind::Video,
-                mid: "video".into(),
-                payloads: vec![(96, 90_000)].into(),
-                feedback_payloads: Box::new([]),
-                repairs: Box::new([]),
-                nack_payloads: Box::new([]),
-                ssrc_repairs: Box::new([]),
-                ssrcs: Box::new([]),
-                rids: Box::new([]),
-                extensions: vec![(1, "urn:test:extension".into())].into(),
-            }]
-            .into(),
-            1,
-            1024,
-            9,
-            ReceiveFeedback::new(None, Instant::now()),
-        )
-    }
-
-    fn rtp(sequence: u16, timestamp: u32) -> Vec<u8> {
-        let mut bytes = vec![0x90, 96, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7];
-        bytes[2..4].copy_from_slice(&sequence.to_be_bytes());
-        bytes[4..8].copy_from_slice(&timestamp.to_be_bytes());
-        bytes.extend_from_slice(&[0xbe, 0xde, 0, 1, 0x10, 0xaa, 0, 0]);
-        bytes.extend_from_slice(&[1, 2]);
-        bytes
-    }
-
-    fn at(global: u64) -> TimePoint {
-        TimePoint {
-            monotonic: Instant::now(),
-            global: GlobalMediaTime::from_micros(global),
-        }
-    }
-
-    #[test]
-    fn unsignaled_media_is_discovered_before_media_and_keeps_receive_anchor() {
-        let mut owner = owner();
-        owner.accept_rtp(
-            pulsebeam_rtc::PacketObservation {
-                at: at(1_000),
-                provenance: 0,
-            },
-            rtp(u16::MAX, u32::MAX - 1),
-            None,
-        );
-        let Event::EncodingDiscovered(info) = owner.poll_event().expect("discovery") else {
-            panic!("unsignaled encoding must be discovered first");
-        };
-        let Event::Media { encoding, packet } = owner.poll_event().expect("media") else {
-            panic!("media follows discovery");
-        };
-        assert_eq!(encoding, info.id);
-        assert_eq!(info.sender_index, 3);
-        assert_eq!(info.rid, None);
-        assert_eq!(
-            packet.global_media_at(),
-            GlobalMediaTime::from_micros(1_000)
-        );
-        assert_eq!(packet.extension("urn:test:extension"), Some(&[0xaa][..]));
-        assert_eq!(packet.to_transit().bytes(), packet.bytes());
-
-        owner.accept_rtp(
-            pulsebeam_rtc::PacketObservation {
-                at: at(9_000_000),
-                provenance: 0,
-            },
-            rtp(0, 1),
-            None,
-        );
-        let Event::Media { packet, .. } = owner.poll_event().expect("wrapped media") else {
-            panic!("wrapped packet is media");
-        };
-        assert_eq!(
-            packet.global_media_at(),
-            GlobalMediaTime::from_micros(1_033)
-        );
-    }
-
-    fn bundled_owner() -> IngressOwner {
-        IngressOwner::new(
-            [(2, "v0", 7), (5, "v1", 8)]
-                .into_iter()
-                .map(|(sender_index, mid, ssrc)| IngressMediaFacts {
-                    sender_index,
-                    kind: MediaKind::Video,
-                    mid: mid.into(),
-                    payloads: vec![(96, 90_000)].into(),
-                    feedback_payloads: Box::new([]),
-                    repairs: Box::new([]),
-                    nack_payloads: Box::new([]),
-                    ssrc_repairs: Box::new([]),
-                    ssrcs: vec![ssrc].into(),
-                    rids: vec!["hi".into()].into(),
-                    extensions: vec![
-                        (1, "urn:ietf:params:rtp-hdrext:sdes:mid".into()),
-                        (2, "urn:ietf:params:rtp-hdrext:sdes:rtp-stream-id".into()),
-                    ]
-                    .into(),
-                })
-                .collect(),
-            1,
-            4096,
-            9,
-            ReceiveFeedback::new(None, Instant::now()),
-        )
-    }
-
-    fn bundled_rtp(ssrc: u32, mid: Option<&[u8]>, rid: Option<&[u8]>) -> Vec<u8> {
-        let mut bytes = vec![0x80, 96, 0, 1, 0, 0, 0, 1];
-        bytes.extend_from_slice(&ssrc.to_be_bytes());
-        if mid.is_some() || rid.is_some() {
-            bytes[0] |= 0x10;
-            let mut extensions = Vec::new();
-            for (id, value) in [(1_u8, mid), (2_u8, rid)] {
-                if let Some(value) = value {
-                    let length = u8::try_from(value.len() - 1).expect("short extension");
-                    extensions.push((id << 4) | length);
-                    extensions.extend_from_slice(value);
-                }
-            }
-            while !extensions.len().is_multiple_of(4) {
-                extensions.push(0);
-            }
-            bytes.extend_from_slice(&[0xbe, 0xde]);
-            bytes.extend_from_slice(
-                &u16::try_from(extensions.len() / 4)
-                    .expect("length")
-                    .to_be_bytes(),
-            );
-            bytes.extend_from_slice(&extensions);
-        }
-        bytes.extend_from_slice(&[1, 2]);
-        bytes
-    }
-
-    fn discovered(owner: &mut IngressOwner, sender_index: u32, rid: Option<&str>) -> EncodingId {
-        let Event::EncodingDiscovered(info) = owner.poll_event().expect("discovery") else {
-            panic!("all encodings must be discovered before media");
-        };
-        assert_eq!(info.sender_index, sender_index);
-        assert_eq!(info.kind, MediaKind::Video);
-        assert_eq!(info.rid.as_deref(), rid);
-        let Event::Media { encoding, packet } = owner.poll_event().expect("media") else {
-            panic!("media follows discovery");
-        };
-        assert_eq!(encoding, info.id);
-        assert_eq!(
-            packet.global_media_at(),
-            GlobalMediaTime::from_micros(1_000)
-        );
-        info.id
-    }
-
-    #[test]
-    fn bundled_same_kind_encodings_resolve_mid_ssrc_and_retirement() {
-        let mut owner = bundled_owner();
-        owner.accept_rtp(
-            pulsebeam_rtc::PacketObservation {
-                at: at(1_000),
-                provenance: 0,
-            },
-            bundled_rtp(7, None, Some(b"hi")),
-            None,
-        );
-        let first = discovered(&mut owner, 2, Some("hi"));
-        owner.accept_rtp(
-            pulsebeam_rtc::PacketObservation {
-                at: at(1_000),
-                provenance: 0,
-            },
-            bundled_rtp(8, Some(b"v1"), Some(b"hi")),
-            None,
-        );
-        let second = discovered(&mut owner, 5, Some("hi"));
-        assert_ne!(first, second);
-
-        let mut next = bundled_rtp(8, None, None);
-        next[3] = 2;
-        owner.accept_rtp(
-            pulsebeam_rtc::PacketObservation {
-                at: at(1_000),
-                provenance: 0,
-            },
-            next,
-            None,
-        );
-        assert!(
-            matches!(owner.poll_event(), Some(Event::Media { encoding, .. }) if encoding == second)
-        );
-        owner.retire(first).expect("retire");
-        assert!(
-            matches!(owner.poll_event(), Some(Event::EncodingRetired { encoding, .. }) if encoding == first)
-        );
-        owner.accept_rtp(
-            pulsebeam_rtc::PacketObservation {
-                at: at(1_000),
-                provenance: 0,
-            },
-            bundled_rtp(7, Some(b"v0"), Some(b"hi")),
-            None,
-        );
-        assert!(owner.poll_event().is_none());
-    }
-
-    #[test]
-    fn unsignaled_mid_association_does_not_leak_between_bundled_sections() {
-        let mut owner = bundled_owner();
-        owner.accept_rtp(
-            pulsebeam_rtc::PacketObservation {
-                at: at(1_000),
-                provenance: 0,
-            },
-            bundled_rtp(99, Some(b"v1"), None),
-            None,
-        );
-        let encoding = discovered(&mut owner, 5, None);
-        let mut next = bundled_rtp(99, None, None);
-        next[3] = 2;
-        owner.accept_rtp(
-            pulsebeam_rtc::PacketObservation {
-                at: at(1_000),
-                provenance: 0,
-            },
-            next,
-            None,
-        );
-        assert!(
-            matches!(owner.poll_event(), Some(Event::Media { encoding: id, .. }) if id == encoding)
-        );
-        owner.accept_rtp(
-            pulsebeam_rtc::PacketObservation {
-                at: at(1_000),
-                provenance: 0,
-            },
-            bundled_rtp(100, Some(b"v0"), None),
-            None,
-        );
-        assert!(owner.poll_event().is_none());
-        assert_eq!(owner.stats().len(), 1);
-    }
-
-    #[test]
-    fn ambiguous_or_conflicting_bundle_packets_create_no_encoding() {
-        let mut owner = bundled_owner();
-        for packet in [
-            bundled_rtp(99, None, None),
-            bundled_rtp(99, Some(b"xx"), None),
-            bundled_rtp(99, Some(&[0xff]), None),
-            bundled_rtp(7, Some(b"v1"), None),
-        ] {
-            owner.accept_rtp(
-                pulsebeam_rtc::PacketObservation {
-                    at: at(1_000),
-                    provenance: 0,
-                },
-                packet,
-                None,
-            );
-            assert!(owner.poll_event().is_none());
-            assert!(owner.stats().is_empty());
-        }
-        assert_eq!(owner.dropped(), 4);
-    }
-
-    #[test]
-    fn incoming_rtx_recovers_one_primary_packet_without_duplicate_source_delivery() {
-        let mut owner = owner();
-        owner.media[0].repairs = vec![(97, 96)].into();
-        owner.media[0].ssrc_repairs = vec![(8, 7)].into();
-        for sequence in [1, 3] {
-            owner.accept_rtp(
-                pulsebeam_rtc::PacketObservation {
-                    at: at(1_000),
-                    provenance: 0,
-                },
-                rtp(sequence, u32::from(sequence) * 3_000),
-                None,
-            );
-        }
-        let original = rtp(2, 6_000);
-        let header_len = RtpPacket::parse(&original).unwrap().payload_range().start;
-        let mut repair = original[..header_len].to_vec();
-        repair[1] = 97;
-        repair[2..4].copy_from_slice(&100_u16.to_be_bytes());
-        repair[8..12].copy_from_slice(&8_u32.to_be_bytes());
-        repair.extend_from_slice(&2_u16.to_be_bytes());
-        repair.extend_from_slice(&original[header_len..]);
-        owner.accept_rtp(
-            pulsebeam_rtc::PacketObservation {
-                at: at(1_000),
-                provenance: 0,
-            },
-            repair.clone(),
-            None,
-        );
-        owner.accept_rtp(
-            pulsebeam_rtc::PacketObservation {
-                at: at(1_000),
-                provenance: 0,
-            },
-            original.clone(),
-            None,
-        );
-        owner.accept_rtp(
-            pulsebeam_rtc::PacketObservation {
-                at: at(1_000),
-                provenance: 0,
-            },
-            repair,
-            None,
-        );
-        let packets = std::iter::from_fn(|| owner.poll_event())
-            .filter_map(|event| match event {
-                Event::Media { packet, .. } => Some(packet),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(packets.len(), 3);
-        assert_eq!(packets[2].bytes().as_ref(), original);
-        assert_eq!(owner.stats().len(), 1);
-        assert_eq!(owner.stats()[0].received_packets, 3);
-    }
-
-    #[test]
-    fn repaired_rid_learns_only_a_bounded_primary_transport_association() {
-        let mut owner = owner();
-        owner.media[0].repairs = vec![(97, 96)].into();
-        owner.media[0].rids = vec!["hi".into()].into();
-        owner.media[0].extensions = vec![
-            (2, "urn:ietf:params:rtp-hdrext:sdes:rtp-stream-id".into()),
-            (
-                3,
-                "urn:ietf:params:rtp-hdrext:sdes:repaired-rtp-stream-id".into(),
-            ),
-        ]
-        .into();
-        owner.accept_rtp(
-            pulsebeam_rtc::PacketObservation {
-                at: at(1_000),
-                provenance: 0,
-            },
-            bundled_rtp(7, None, Some(b"hi")),
-            None,
-        );
-        let encoding = discovered(&mut owner, 3, Some("hi"));
-        for sequence in [2_u16, 3] {
-            let rid = (sequence == 2).then_some(b"hi".as_slice());
-            let mut repair = bundled_rtp(8, None, rid);
-            if rid.is_some() {
-                repair[16] = 0x31;
-            }
-            repair[1] = 97;
-            repair[2..4].copy_from_slice(&sequence.wrapping_add(100).to_be_bytes());
-            let offset = RtpPacket::parse(&repair).unwrap().payload_range().start;
-            repair.splice(offset..offset, sequence.to_be_bytes());
-            owner.accept_rtp(
-                pulsebeam_rtc::PacketObservation {
-                    at: at(1_000),
-                    provenance: 0,
-                },
-                repair,
-                None,
-            );
-            let Event::Media {
-                encoding: actual,
-                packet,
-            } = owner.poll_event().expect("repaired primary")
-            else {
-                panic!("repair must not discover an encoding");
-            };
-            assert_eq!(actual, encoding);
-            assert_eq!(packet.view().unwrap().ssrc, 7);
-            assert_eq!(packet.view().unwrap().sequence_number, sequence);
-        }
-        owner.accept_rtp(
-            pulsebeam_rtc::PacketObservation {
-                at: at(1_000),
-                provenance: 0,
-            },
-            bundled_rtp(8, None, None),
-            None,
-        );
-        assert!(owner.poll_event().is_none());
-        assert_eq!(owner.stats().len(), 1);
-    }
-
-    #[test]
-    fn old_reordered_packets_map_earlier_without_moving_the_frontier() {
-        let mut mapper = ClockMapper::new(GlobalMediaTime::from_micros(1_000), 10, 90_000, 90_000);
-        assert_eq!(
-            mapper
-                .map(11, 180_000, Instant::now())
-                .map(|(time, _)| time),
-            Some(GlobalMediaTime::from_micros(1_001_000))
-        );
-        assert_eq!(
-            mapper.map(10, 90_000, Instant::now()).map(|(time, _)| time),
-            Some(GlobalMediaTime::from_micros(1_000))
-        );
-        assert!(
-            mapper
-                .map(10_u16.wrapping_sub(2_049), 0, Instant::now())
-                .is_none()
-        );
-    }
 }

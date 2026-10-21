@@ -1,5 +1,5 @@
 use super::*;
-use crate::{GlobalMediaTime, TimePoint, transport::PreparedRtpIdentity};
+use crate::transport::PreparedRtpIdentity;
 
 fn context(at: Instant, epoch: PathEpoch, sequence: u16) -> TransmitCommitContext {
     TransmitCommitContext {
@@ -10,17 +10,15 @@ fn context(at: Instant, epoch: PathEpoch, sequence: u16) -> TransmitCommitContex
         rtp: Some(PreparedRtpIdentity {
             ssrc: 7,
             sequence,
+            index: u64::from(sequence),
             twcc_sequence: Some(sequence),
             service: RtpService::Original,
         }),
     }
 }
 
-fn at(monotonic: Instant) -> TimePoint {
-    TimePoint {
-        monotonic,
-        global: GlobalMediaTime::from_micros(1),
-    }
+fn at(monotonic: Instant) -> Instant {
+    monotonic
 }
 
 fn batch(now: Instant, epoch: PathEpoch, statuses: Vec<TwccStatus>) -> FeedbackBatch {
@@ -321,6 +319,7 @@ fn rfc_context(at: Instant, epoch: PathEpoch, sequence: u16) -> TransmitCommitCo
         rtp: Some(PreparedRtpIdentity {
             ssrc: 7,
             sequence,
+            index: u64::from(sequence),
             twcc_sequence: None,
             service: RtpService::Original,
         }),

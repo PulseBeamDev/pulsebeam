@@ -10,11 +10,7 @@ mod support;
 use std::{sync::Arc, time::Duration};
 
 use bytes::Bytes;
-use pulsebeam_rtc::{
-    CloseReason, Command, DataChannelConfig, DataChannelPriority, DataMessage, DataReliability,
-    ForwardedMedia, FrameBoundary, FrameDependencies, FrameId, FrameMetadata, IceTcpFlowId,
-    MediaPayloadBitrate, Output, PlayoutDelay,
-};
+use pulsebeam_rtc::{DataChannelConfig, DataChannelPriority, DataMessage, DataReliability};
 use support::{FixtureCoexistenceEvent, FixtureDataEvent, PeerFixture};
 
 fn config(reliability: DataReliability, ordered: bool) -> DataChannelConfig {
@@ -30,7 +26,7 @@ fn config(reliability: DataReliability, ordered: bool) -> DataChannelConfig {
 }
 
 #[test]
-fn tcp_path_loss_holds_user_data_without_closing_or_reusing_protected_output() {
+fn passive_tcp_peer_exchanges_authenticated_rtp_and_channels() {
     let mut fixture = PeerFixture::connected_tcp_datachannels();
     let mut channel = None;
     let mut peer_opened = false;
@@ -41,62 +37,27 @@ fn tcp_path_loss_holds_user_data_without_closing_or_reusing_protected_output() {
             _ => {}
         }
     }
-    let packet = fixture.send_source(b"committed-before-close");
-    fixture.command(Command::SendMedia {
-        sender: fixture.sender,
-        media: support::forwarded(packet, 1),
-    });
-    assert_eq!(fixture.receive_egress().1, b"committed-before-close");
-    let packet = fixture.send_source(b"not-submitted-on-closed-stream");
-    fixture.command(Command::SendMedia {
-        sender: fixture.sender,
-        media: support::forwarded(packet, 2),
-    });
-    fixture.command(Command::SendData {
-        channel: channel.expect("channel opened"),
-        message: DataMessage::Binary(Bytes::from_static(b"queued-during-path-loss")),
-    });
-    fixture.command(Command::RetireIceTcpFlow {
-        flow: IceTcpFlowId::from_value(1),
-    });
-    let committed = fixture.connection.stats().connection.transmitted_rtp_bytes;
-    for _ in 0..20 {
-        fixture.advance_clock_without_poll(Duration::from_millis(100));
-        let at = fixture.at();
-        let mut idle = false;
-        for _ in 0..512 {
-            match fixture.connection.poll(at) {
-                Output::Idle { next_wakeup } => {
-                    assert!(
-                        next_wakeup.is_none_or(|deadline| deadline > at.monotonic),
-                        "unavailable path must not spin on a transmit deadline"
-                    );
-                    idle = true;
-                    break;
-                }
-                Output::Transmit(_) => panic!("output escaped to retired stream"),
-                Output::Closed(reason) => panic!("temporary path loss closed RTC: {reason:?}"),
-                Output::Event(_) => {}
-                _ => panic!("unexpected RTC output"),
-            }
-        }
-        assert!(idle, "RTC must reach its scheduled boundary");
-    }
-    assert_eq!(
-        fixture.connection.stats().connection.transmitted_rtp_bytes,
-        committed
-    );
-    fixture.command(Command::CloseGracefully {
-        deadline: fixture.at().monotonic,
-    });
-    for _ in 0..512 {
-        match fixture.connection.poll(fixture.at()) {
-            Output::Closed(CloseReason::Graceful) => return,
-            Output::Event(_) => {}
-            output => panic!("unexpected graceful-close output: {output:?}"),
+    let packet = fixture.send_source(b"tcp-media");
+    fixture
+        .write_rtp(support::rtp_write(packet, 1))
+        .expect("write RTP");
+    assert_eq!(fixture.receive_egress().1, b"tcp-media");
+    fixture
+        .connection
+        .send_data(
+            fixture.at(),
+            channel.expect("opened channel"),
+            DataMessage::Binary(Bytes::from_static(b"tcp-channel")),
+        )
+        .expect("send TCP data");
+    for _ in 0..32 {
+        if let FixtureDataEvent::PeerMessage { binary, payload } = fixture.next_data_event() {
+            assert!(binary);
+            assert_eq!(payload, b"tcp-channel");
+            return;
         }
     }
-    panic!("graceful close did not reach its terminal boundary");
+    panic!("native TCP peer did not receive its channel message");
 }
 
 #[test]
@@ -112,12 +73,19 @@ fn queued_control_reply_reaches_peer_during_bounded_graceful_close() {
         }
     }
     let channel = channel.expect("control channel opened");
-    fixture.command(Command::SendData {
-        channel,
-        message: DataMessage::Binary(Bytes::from_static(b"terminal-control-reply")),
-    });
-    let deadline = fixture.at().monotonic + Duration::from_secs(1);
-    fixture.command(Command::CloseGracefully { deadline });
+    fixture
+        .connection
+        .send_data(
+            fixture.at(),
+            channel,
+            DataMessage::Binary(Bytes::from_static(b"terminal-control-reply")),
+        )
+        .expect("send channel message");
+    let deadline = fixture.at() + Duration::from_secs(1);
+    fixture
+        .connection
+        .close(fixture.at(), deadline)
+        .expect("close gracefully");
     for _ in 0..32 {
         if let FixtureDataEvent::PeerMessage { binary, payload } = fixture.next_data_event() {
             assert!(binary);
@@ -151,10 +119,13 @@ fn local_and_remote_channels_preserve_messages_and_close() {
         } if channel == remote && bytes.as_ref() == b"from peer"
     ));
 
-    fixture.command(Command::OpenDataChannel(config(
-        DataReliability::MaxRetransmits(2),
-        false,
-    )));
+    fixture
+        .connection
+        .open_data_channel(
+            fixture.at(),
+            config(DataReliability::MaxRetransmits(2), false),
+        )
+        .expect("open channel");
     let local = loop {
         if let FixtureDataEvent::ConnectionOpened(channel) = fixture.next_data_event()
             && channel != remote
@@ -162,10 +133,14 @@ fn local_and_remote_channels_preserve_messages_and_close() {
             break channel;
         }
     };
-    fixture.command(Command::SendData {
-        channel: local,
-        message: DataMessage::Binary(Bytes::from(vec![7; 8_000])),
-    });
+    fixture
+        .connection
+        .send_data(
+            fixture.at(),
+            local,
+            DataMessage::Binary(Bytes::from(vec![7; 8_000])),
+        )
+        .expect("send channel message");
     loop {
         if let FixtureDataEvent::PeerMessage { binary, payload } = fixture.next_data_event() {
             assert!(binary);
@@ -174,7 +149,10 @@ fn local_and_remote_channels_preserve_messages_and_close() {
         }
     }
 
-    fixture.command(Command::CloseDataChannel { channel: local });
+    fixture
+        .connection
+        .close_data_channel(fixture.at(), local)
+        .expect("close channel");
     let mut local_closed = 0;
     let mut peer_closed = 0;
     while local_closed == 0 || peer_closed == 0 {
@@ -208,7 +186,10 @@ fn all_reliability_modes_open_over_the_runtime_transport_seam() {
             true,
         ),
     ] {
-        fixture.command(Command::OpenDataChannel(config(reliability, ordered)));
+        fixture
+            .connection
+            .open_data_channel(fixture.at(), config(reliability, ordered))
+            .expect("open channel");
         let mut connection_opened = false;
         let mut peer_opened = false;
         while !connection_opened || !peer_opened {
@@ -236,37 +217,24 @@ fn fragmented_data_and_rtp_share_service_without_cross_accounting_starvation() {
     let channel = channel.expect("channel");
     fixture.configure_bottleneck(500_000);
     let packet = fixture.send_source(b"coexistence");
-    fixture.command(Command::SetSenderAssignment {
-        sender: fixture.sender,
-        assignment: Some(pulsebeam_rtc::SenderAssignment {
-            playout_delay: Some(PlayoutDelay::from_ticks(0, 400).expect("playout policy")),
-            ..support::sender_assignment(MediaPayloadBitrate::from_bps(1_000_000))
-        }),
-    });
     const COUNT: u64 = 16;
     for index in 0..COUNT {
-        fixture.command(Command::SendMedia {
-            sender: fixture.sender,
-            media: ForwardedMedia {
-                source: pulsebeam_rtc::SourceIncarnation::from_value(1),
-                packet: packet.clone(),
-                frame: FrameMetadata {
-                    descriptor: None,
-                    id: FrameId::from_value(index + 1),
-                    boundary: FrameBoundary::Complete,
-                    random_access: true,
-                    discardable: false,
-                    dependencies: FrameDependencies::Known(Arc::from([])),
-                },
-            },
-        });
-        fixture.command(Command::SendData {
-            channel,
-            message: DataMessage::Binary(Bytes::from(vec![
-                u8::try_from(index).unwrap_or(u8::MAX);
-                4_000
-            ])),
-        });
+        let mut write = support::rtp_write(packet.clone(), index + 1);
+        write.timestamp = write
+            .timestamp
+            .wrapping_add(u32::try_from(index).expect("short trace") * 960);
+        fixture.write_rtp(write).expect("queue original RTP");
+        fixture
+            .connection
+            .send_data(
+                fixture.at(),
+                channel,
+                DataMessage::Binary(Bytes::from(vec![
+                    u8::try_from(index).expect("message index");
+                    4_000
+                ])),
+            )
+            .expect("queue fragmented data");
     }
     let mut rtp = 0;
     let mut data = 0;

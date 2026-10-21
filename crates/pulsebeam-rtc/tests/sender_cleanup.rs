@@ -1,289 +1,125 @@
 #![allow(
+    clippy::arithmetic_side_effects,
     clippy::disallowed_types,
     clippy::expect_used,
-    reason = "sender cleanup fixtures stop at violated public protocol invariants"
+    clippy::indexing_slicing,
+    reason = "bounded native repair fixture stops at violated wire invariants"
 )]
 
 mod support;
 
+use pulsebeam_rtc::{MediaPayloadBitrate, TransmitKind};
 use std::time::Duration;
+use support::{NetworkPolicy, PeerFixture, RtpImpairment, rtp_write};
 
-use pulsebeam_rtc::{Command, CommandError, FrameBoundary, MediaPayloadBitrate};
-use support::{NetworkPolicy, PeerFixture, RtpImpairment, forwarded};
-
-#[test]
-fn retired_flow_keeps_media_expiry_scheduled_without_spinning_on_blocked_output() {
-    let mut fixture = PeerFixture::connected_tcp_datachannels();
-    let source = fixture.send_source(b"waiting for transport");
-    let mut assignment = fixture.assignment(fixture.sender);
-    assignment.delivery.max_media_age = Duration::from_secs(1);
-    assignment.delivery.max_queue_residence = Duration::from_millis(5);
-    fixture.command(Command::SetSenderAssignment {
-        sender: fixture.sender,
-        assignment: Some(assignment),
-    });
-    fixture.command(Command::SendMedia {
-        sender: fixture.sender,
-        media: forwarded(source, 1),
-    });
-    fixture.command(Command::RetireIceTcpFlow {
-        flow: fixture.tcp_flow(),
-    });
-    let at = fixture.at();
-    let next = (0..32)
-        .find_map(|_| {
-            let output = fixture.connection.poll(at);
-            assert!(
-                !matches!(output, pulsebeam_rtc::Output::Transmit(_)),
-                "retired flow cannot emit"
-            );
-            if let pulsebeam_rtc::Output::Idle { next_wakeup } = output {
-                next_wakeup
-            } else {
-                None
-            }
-        })
-        .expect("queued media expiry remains scheduled without a selected path");
-    assert!(
-        next > at.monotonic,
-        "blocked output is not immediate runnable work"
-    );
-    assert!(next <= at.monotonic + Duration::from_millis(5) + Duration::from_nanos(1));
-    fixture.advance_clock_without_poll(next.duration_since(at.monotonic));
-    let _ = fixture.connection.poll(fixture.at());
-    assert_eq!(
+fn write_frame(fixture: &mut PeerFixture, packets: &[pulsebeam_rtc::RtpPacket], first: u64) {
+    for (index, packet) in packets.iter().enumerate() {
         fixture
-            .connection
-            .stats()
-            .senders
-            .first()
-            .expect("sender")
-            .queued_packets,
-        0
-    );
+            .write_rtp(rtp_write(
+                packet.clone(),
+                first + u64::try_from(index).expect("test packet index fits u64"),
+            ))
+            .expect("write original fragment");
+    }
 }
 
 #[test]
-fn replacement_fences_old_source_without_rewinding_committed_continuity() {
-    let mut fixture = PeerFixture::connected();
-    let first = fixture.send_source(b"committed source");
-    fixture.command(Command::SendMedia {
-        sender: fixture.sender,
-        media: forwarded(first, 1),
-    });
-    let (before, payload) = fixture.receive_egress();
-    assert_eq!(payload, b"committed source");
-
-    let stale = fixture.send_source(b"discarded source");
-    let replacement = fixture.send_source(b"replacement source");
-    fixture.command(Command::SendMedia {
-        sender: fixture.sender,
-        media: forwarded(stale, 2),
-    });
-    assert_eq!(
-        fixture
-            .connection
-            .stats()
-            .senders
-            .first()
-            .expect("sender")
-            .queued_packets,
-        1
+fn discarding_uncommitted_work_preserves_native_repairs_and_rtx_numbering() {
+    let mut fixture = PeerFixture::connected_video();
+    fixture.set_desired_bitrate(Some(MediaPayloadBitrate::from_bps(1_000_000)));
+    fixture.drive_for(Duration::from_millis(200));
+    let padding = fixture
+        .take_video_wire_packets()
+        .into_iter()
+        .filter(|packet| packet.padding)
+        .collect::<Vec<_>>();
+    assert!(!padding.is_empty(), "source-free RTX bootstrap");
+    fixture.set_desired_bitrate(None);
+    let warmup = fixture.send_fragmented_video_source(None);
+    write_frame(&mut fixture, &warmup, 1_000);
+    fixture.receive_video_frame();
+    fixture.drive_for(Duration::from_millis(200));
+    let committed = fixture.connection.stats().senders[0].transmitted_packets;
+    let sources = fixture.send_fragmented_video_source(None);
+    let first = 1_000 + u64::try_from(warmup.len()).unwrap();
+    fixture.drive_for(Duration::from_millis(1));
+    fixture.take_video_wire_packets();
+    fixture.configure_network(
+        7,
+        NetworkPolicy {
+            delay: Duration::from_millis(100),
+            ..NetworkPolicy::default()
+        },
     );
-    let mut assignment = fixture.assignment(fixture.sender);
-    assignment.source = pulsebeam_rtc::SourceIncarnation::from_value(2);
-    fixture.command(Command::SetSenderAssignment {
-        sender: fixture.sender,
-        assignment: Some(assignment),
+    fixture.configure_impairment(RtpImpairment::Burst {
+        every: 3,
+        length: 1,
     });
-    let stats = fixture.connection.stats();
-    let sender = stats.senders.first().expect("sender");
-    assert_eq!(sender.queued_packets, 0);
-    assert_eq!(sender.queued_payload_bytes, 0);
-    assert_eq!(sender.transmitted_packets, 1);
-    assert_eq!(
-        fixture
-            .try_command(Command::SendMedia {
-                sender: fixture.sender,
-                media: forwarded(replacement.clone(), 3)
-            })
-            .map_err(|rejected| rejected.reason),
-        Err(CommandError::SourceIncarnationMismatch)
-    );
-    let mut media = forwarded(replacement, 3);
-    media.source = assignment.source;
-    fixture.command(Command::SendMedia {
-        sender: fixture.sender,
-        media,
-    });
-    let (after, payload) = fixture.receive_egress();
-    assert_eq!(payload, b"replacement source");
-    assert_eq!(after.ssrc, before.ssrc);
-    assert_eq!(
-        after.sequence_number,
-        before.sequence_number.wrapping_add(1)
-    );
-    assert!(after.timestamp.wrapping_sub(before.timestamp) > 0);
-}
-
-#[test]
-fn recovery_retains_same_incarnation_repairs_but_replacement_fences_them() {
-    for recover in [true, false] {
-        let mut fixture = PeerFixture::connected_video();
-        fixture.command(Command::SetSenderAssignment {
-            sender: fixture.sender,
-            assignment: Some({
-                let (selected_bitrate, potential_bitrate) = (
-                    MediaPayloadBitrate::from_bps(1_000_000),
-                    MediaPayloadBitrate::from_bps(1_000_000),
-                );
-                pulsebeam_rtc::SenderAssignment {
-                    selected_bitrate,
-                    potential_bitrate,
-                    ..fixture.assignment(fixture.sender)
-                }
-            }),
-        });
-        let warmup = fixture.send_fragmented_video_source();
-        admit_video_frame(&mut fixture, &warmup, 76);
-        fixture.receive_video_frame();
-        fixture.drive_for(Duration::from_millis(200));
-        let committed_before = fixture
-            .connection
-            .stats()
-            .senders
-            .first()
-            .expect("video sender")
-            .transmitted_packets;
-        let sources = fixture.send_fragmented_video_source();
+    fixture.record_transmits();
+    write_frame(&mut fixture, &sources, first);
+    let deadline = fixture.at() + Duration::from_millis(150);
+    while fixture.connection.stats().senders[0].queued_packets > 0 {
+        assert!(fixture.at() < deadline, "bounded frame commit");
         fixture.drive_for(Duration::from_millis(1));
-        fixture.take_video_wire_packets();
-        fixture.configure_network(
-            7,
-            NetworkPolicy {
-                delay: Duration::from_millis(100),
-                ..NetworkPolicy::default()
-            },
-        );
-        fixture.configure_impairment(RtpImpairment::Burst {
-            every: 3,
-            length: 1,
-        });
-        fixture.record_transmits();
-        admit_video_frame(&mut fixture, &sources, 77);
-        let deadline = fixture
-            .at()
-            .monotonic
-            .checked_add(Duration::from_millis(150))
-            .expect("bounded commit deadline");
-        while fixture
-            .connection
-            .stats()
-            .senders
-            .first()
-            .expect("video sender")
-            .queued_packets
-            > 0
-        {
-            assert!(fixture.at().monotonic < deadline, "bounded frame commit");
-            fixture.drive_for(Duration::from_millis(1));
-        }
-        assert_eq!(
-            fixture
-                .connection
-                .stats()
-                .senders
-                .first()
-                .expect("video sender")
-                .transmitted_packets,
-            committed_before
-                .saturating_add(u64::try_from(sources.len()).expect("bounded frame packet count"))
-        );
-        let primary_ssrc = fixture.receive_video_wire_header().ssrc;
-        assert!(fixture.impairment_counts().1 > 0);
-        fixture.command(if recover {
-            Command::RecoverSenderMedia {
-                sender: fixture.sender,
-                assignment: fixture.assignment(fixture.sender),
-            }
-        } else {
-            let mut assignment = fixture.assignment(fixture.sender);
-            assignment.source = pulsebeam_rtc::SourceIncarnation::from_value(2);
-            Command::SetSenderAssignment {
-                sender: fixture.sender,
-                assignment: Some(assignment),
-            }
-        });
-        fixture.configure_impairment(RtpImpairment::Random { per_mille: 0 });
-        fixture.drive_for(Duration::from_millis(700));
-        let repaired = fixture
-            .take_video_wire_packets()
-            .iter()
-            .any(|header| !header.padding && header.ssrc != primary_ssrc);
-        assert_eq!(
-            repaired, recover,
-            "only same-publication recovery retains RTX"
-        );
-        let observations = fixture.take_transmit_observations();
-        let repairs = observations
-            .iter()
-            .filter_map(|(_, kind)| {
-                if let pulsebeam_rtc::TransmitKind::Repair(info) = kind {
-                    Some(info)
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(!repairs.is_empty(), recover);
-        for info in repairs {
-            assert_eq!(info.sender, fixture.sender);
-            assert!(sources.iter().any(|packet| packet.origin() == info.origin
-                && packet.global_media_at() == info.global_media_at));
-        }
-        if recover {
-            fixture.receive_video_frame();
-        }
     }
-}
-
-fn admit_video_frame(fixture: &mut PeerFixture, sources: &[pulsebeam_rtc::MediaPacket], id: u64) {
-    for (index, source) in sources.iter().enumerate() {
-        let mut media = forwarded(source.clone(), id);
-        media.frame.boundary = if index == 0 {
-            FrameBoundary::Start
-        } else if index.saturating_add(1) == sources.len() {
-            FrameBoundary::End
-        } else {
-            FrameBoundary::Middle
-        };
-        fixture.admit_media(media).expect("fragment admission");
-    }
-}
-
-#[test]
-fn assignment_rejects_unknown_sender_without_changing_existing_queue() {
-    let mut fixture = PeerFixture::connected();
-    let other = PeerFixture::connected_with_senders(2);
-    let missing = *other.senders.get(1).expect("second negotiated sender");
-    let source = fixture.send_source(b"retained source");
-    fixture.command(Command::SendMedia {
-        sender: fixture.sender,
-        media: forwarded(source, 1),
-    });
-    assert!(
-        matches!(fixture.connection.command(fixture.at(), Command::SetSenderAssignment {sender: missing,assignment:None}), Err(pulsebeam_rtc::RejectedCommand { reason: CommandError::UnknownSender(id), .. }) if id == missing)
-    );
     assert_eq!(
-        fixture
-            .connection
-            .stats()
-            .senders
-            .first()
-            .expect("sender")
-            .queued_packets,
-        1
+        fixture.connection.stats().senders[0].transmitted_packets,
+        committed + u64::try_from(sources.len()).unwrap()
     );
-    let (_, payload) = fixture.receive_egress();
-    assert_eq!(payload, b"retained source");
+    let primary_ssrc = fixture.receive_video_wire_header().ssrc;
+    assert!(fixture.impairment_counts().1 > 0);
+    let discarded_index = first + u64::try_from(sources.len()).unwrap();
+    let mid = fixture.sender_mid.clone();
+    fixture
+        .connection
+        .write_rtp(
+            fixture.at(),
+            &mid,
+            rtp_write(sources[0].clone(), discarded_index),
+        )
+        .expect("queue uncommitted work");
+    fixture
+        .connection
+        .discard_pending_rtp(&mid)
+        .expect("discard only pending originals");
+    fixture.configure_impairment(RtpImpairment::Random { per_mille: 0 });
+    fixture.drive_for(Duration::from_millis(700));
+    let repairs = fixture
+        .take_video_wire_packets()
+        .into_iter()
+        .filter(|header| !header.padding && header.ssrc != primary_ssrc)
+        .collect::<Vec<_>>();
+    assert!(
+        !repairs.is_empty(),
+        "authenticated native NACK produces RTX after queue clearing"
+    );
+    let mut previous = padding.last().unwrap();
+    for packet in &repairs {
+        assert_eq!(packet.ssrc, previous.ssrc);
+        assert!(
+            (1..32_768).contains(
+                &packet
+                    .sequence_number
+                    .wrapping_sub(previous.sequence_number)
+            ),
+            "padding and repairs share continuous RTX numbering"
+        );
+        previous = packet;
+    }
+    assert!(
+        fixture
+            .take_transmit_observations()
+            .iter()
+            .any(|(_, kind)| matches!(kind, TransmitKind::Repair { .. }))
+    );
+    fixture.receive_video_frame();
+    let next = fixture.send_fragmented_video_source(None);
+    write_frame(&mut fixture, &next, discarded_index + 1);
+    let header = fixture.receive_video_wire_header();
+    assert_eq!(header.ssrc, primary_ssrc);
+    assert_eq!(
+        u64::from(header.sequence_number),
+        (discarded_index + 1) & 0xffff
+    );
+    fixture.receive_video_frame();
 }

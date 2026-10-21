@@ -4,27 +4,10 @@ use std::{
 };
 
 use pulsebeam_rtc::{
-    Command, Connection, ConnectionConfig, ConnectionEntropy, DeliveryConstraints, Event,
-    ForwardedMedia, FrameBoundary, FrameDependencies, FrameId, FrameMetadata, GlobalMediaTime,
-    LocalCandidate, MediaPayloadBitrate, NetworkInput, Output, SdpOffer, SenderAssignment,
-    SourceIncarnation, TimePoint, TransmitTarget,
+    Connection, ConnectionConfig, ConnectionEntropy, Event, LocalCandidate, MediaPayloadBitrate,
+    NetworkInput, Output, RtpWrite, SdpOffer, TransmitTarget,
 };
 use pulsebeam_webrtc_sys::*;
-
-fn sender_assignment() -> SenderAssignment {
-    SenderAssignment {
-        source: SourceIncarnation::from_value(1),
-        selected_bitrate: MediaPayloadBitrate::from_bps(1_000_000),
-        potential_bitrate: MediaPayloadBitrate::from_bps(1_000_000),
-        delivery: DeliveryConstraints {
-            max_media_age: Duration::from_secs(1),
-            max_queue_residence: Duration::from_millis(200),
-            repair_window: Duration::from_secs(1),
-        },
-        playout_delay: None,
-        decode_target_mask: None,
-    }
-}
 
 fn complete(
     world: &ControlledWorld,
@@ -70,7 +53,6 @@ fn feedback_classifier_excludes_dtls13_records() {
 )]
 fn exercise(seed: u64, start: Instant) -> (u64, u64, usize) {
     use bytes::Bytes;
-    use std::sync::Arc;
 
     let world = ControlledWorld::acquire(seed, Duration::from_secs(10)).unwrap();
     let network = world.create_network().unwrap();
@@ -140,10 +122,7 @@ fn exercise(seed: u64, start: Instant) -> (u64, u64, usize) {
     assert!(gathered, "native ICE gathering stalled");
     let offer = peer.descriptions().unwrap().pending_local.unwrap();
     let origin = world.now();
-    let point = |now: Duration| TimePoint {
-        monotonic: start + (now - origin),
-        global: GlobalMediaTime::from_micros(1_000_000 + (now - origin).as_micros() as u64),
-    };
+    let point = |now: Duration| start + (now - origin);
     let local = SocketAddr::new(
         server_socket.local_address().ip(),
         server_socket.local_address().port(),
@@ -156,10 +135,11 @@ fn exercise(seed: u64, start: Instant) -> (u64, u64, usize) {
         config,
         SdpOffer::new(offer.sdp),
         point(world.now()),
+        std::time::UNIX_EPOCH,
         ConnectionEntropy::new([11; 32]),
     )
     .expect("native offer accepted");
-    let sender = accepted.session.senders[0].id;
+    let sender = accepted.session.senders[0].mid.to_string();
     assert_eq!(
         accepted.session.feedback,
         Some(pulsebeam_rtc::PacketFeedbackKind::TransportWide)
@@ -174,15 +154,7 @@ fn exercise(seed: u64, start: Instant) -> (u64, u64, usize) {
         .unwrap(),
     );
     let mut connection = accepted.connection;
-    connection
-        .command(
-            point(world.now()),
-            Command::SetSenderAssignment {
-                sender,
-                assignment: Some(sender_assignment()),
-            },
-        )
-        .unwrap();
+
     let mut connected = false;
     let mut peer_connected = false;
     let mut inbound = 0;
@@ -219,10 +191,7 @@ fn exercise(seed: u64, start: Instant) -> (u64, u64, usize) {
             connection
                 .receive(
                     point(world.now()),
-                    pulsebeam_rtc::PacketObservation {
-                        at: point(world.now()),
-                        provenance: 0,
-                    },
+                    point(world.now()),
                     NetworkInput::Udp {
                         local,
                         remote: SocketAddr::new(packet.source.ip(), packet.source.port()),
@@ -247,20 +216,16 @@ fn exercise(seed: u64, start: Instant) -> (u64, u64, usize) {
                         .unwrap();
                 }
                 Output::Event(Event::Connected) => connected = true,
-                Output::Event(Event::Media { packet, .. }) => {
-                    assert!(packet.bytes().ends_with(&[0xf8, 0xff, 0xfe]));
+                Output::Event(Event::Rtp { packet, .. }) => {
+                    assert!(packet.payload.ends_with(&[0xf8, 0xff, 0xfe]));
                     inbound += 1;
-                    pending.push_back(ForwardedMedia {
-                        source: SourceIncarnation::from_value(1),
-                        packet,
-                        frame: FrameMetadata {
-                            descriptor: None,
-                            id: FrameId::from_value(inbound),
-                            boundary: FrameBoundary::Complete,
-                            random_access: true,
-                            discardable: false,
-                            dependencies: FrameDependencies::Known(Arc::from([])),
-                        },
+                    pending.push_back(RtpWrite {
+                        sequence: inbound,
+                        timestamp: packet.header.timestamp,
+                        wallclock: packet.arrival,
+                        marker: packet.header.marker,
+                        payload: packet.payload,
+                        extensions: Vec::new(),
                     });
                 }
                 Output::Event(Event::DataChannel(pulsebeam_rtc::DataChannelEvent::Message {
@@ -269,7 +234,7 @@ fn exercise(seed: u64, start: Instant) -> (u64, u64, usize) {
                 })) => {
                     server_data.push(message.clone());
                     connection
-                        .command(point(world.now()), Command::SendData { channel, message })
+                        .send_data(point(world.now()), channel, message)
                         .unwrap();
                 }
                 Output::Event(_) => {}
@@ -286,10 +251,10 @@ fn exercise(seed: u64, start: Instant) -> (u64, u64, usize) {
             accounted_feedback = true;
         }
         while let Some(media) = pending.pop_front() {
-            match connection.command(point(world.now()), Command::SendMedia { sender, media }) {
+            match connection.write_rtp(point(world.now()), &sender, media) {
                 Ok(())
-                | Err(pulsebeam_rtc::RejectedCommand {
-                    reason: pulsebeam_rtc::CommandError::WouldBlock,
+                | Err(pulsebeam_rtc::RejectedRtp {
+                    reason: pulsebeam_rtc::WriteError::WouldBlock,
                     ..
                 }) => {}
                 Err(error) => panic!("media command: {error:?}"),
@@ -451,10 +416,7 @@ fn controlled_libwebrtc_acknowledges_rtx_padding_before_primary_media() {
     assert!(gathered, "native video ICE gathering stalled");
     let offer = peer.descriptions().unwrap().pending_local.unwrap();
     let origin = world.now();
-    let point = |now: Duration| TimePoint {
-        monotonic: start + (now - origin),
-        global: GlobalMediaTime::from_micros(1_000_000 + (now - origin).as_micros() as u64),
-    };
+    let point = |now: Duration| start + (now - origin);
     let local = SocketAddr::new(socket.local_address().ip(), socket.local_address().port());
     let config = ConnectionConfig {
         local_candidates: vec![LocalCandidate::Udp(local)],
@@ -464,11 +426,12 @@ fn controlled_libwebrtc_acknowledges_rtx_padding_before_primary_media() {
         config,
         SdpOffer::new(offer.sdp),
         point(world.now()),
+        std::time::UNIX_EPOCH,
         ConnectionEntropy::new([19; 32]),
     )
     .unwrap();
     assert_eq!(accepted.session.senders.len(), 1);
-    let sender = accepted.session.senders[0].id;
+
     assert!(
         accepted.session.senders[0]
             .codec
@@ -501,15 +464,7 @@ fn controlled_libwebrtc_acknowledges_rtx_padding_before_primary_media() {
         .unwrap(),
     );
     let mut connection = accepted.connection;
-    connection
-        .command(
-            point(world.now()),
-            Command::SetSenderAssignment {
-                sender,
-                assignment: Some(sender_assignment()),
-            },
-        )
-        .unwrap();
+    connection.set_desired_bitrate(Some(MediaPayloadBitrate::from_bps(1_000_000)));
     let mut connected = false;
     let mut peer_connected = false;
     let mut probes = 0;
@@ -536,10 +491,7 @@ fn controlled_libwebrtc_acknowledges_rtx_padding_before_primary_media() {
             connection
                 .receive(
                     point(world.now()),
-                    pulsebeam_rtc::PacketObservation {
-                        at: point(world.now()),
-                        provenance: 0,
-                    },
+                    point(world.now()),
                     NetworkInput::Udp {
                         local,
                         remote: SocketAddr::new(packet.source.ip(), packet.source.port()),
@@ -575,7 +527,7 @@ fn controlled_libwebrtc_acknowledges_rtx_padding_before_primary_media() {
                         .unwrap();
                 }
                 Output::Event(Event::Connected) => connected = true,
-                Output::Event(Event::Media { .. }) => {
+                Output::Event(Event::Rtp { .. }) => {
                     panic!("padding must not deliver bogus media")
                 }
                 Output::Event(_) => {}

@@ -1,19 +1,15 @@
 #![allow(
     clippy::disallowed_types,
-    reason = "the v3 public wire-value contract uses immutable Bytes payloads"
+    reason = "owned network and RTP values use immutable Bytes and negotiated URI strings"
 )]
 
-use std::{net::SocketAddr, time::Instant};
-
-use bytes::Bytes;
-use thiserror::Error;
-
-use crate::IceTcpFlowId;
 use crate::{
-    DataChannelConfig, DataChannelId, DataChannelPriority, DataMessage, DataReliability,
-    EncodingId, ForwardedMedia, MediaKind, MediaPacket, MediaPayloadBitrate, SenderAssignment,
-    SenderId,
+    DataChannelConfig, DataChannelId, DataChannelPriority, DataMessage, DataReliability, MediaKind,
+    MediaPayloadBitrate, RtpPacket, RtpWrite, SenderReport,
 };
+use bytes::Bytes;
+use std::{net::SocketAddr, sync::Arc, time::Instant};
+use thiserror::Error;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EcnCodepoint {
@@ -21,14 +17,6 @@ pub enum EcnCodepoint {
     Ect0,
     Ect1,
     Ce,
-}
-
-/// Observation of a complete datagram or RFC4571 frame, independent of execution time.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct PacketObservation {
-    pub at: crate::TimePoint,
-    /// Caller-owned opaque value, carried with normalized RTP without interpretation.
-    pub provenance: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -39,24 +27,11 @@ pub enum NetworkInput {
         ecn: Option<EcnCodepoint>,
         payload: Bytes,
     },
+    /// One complete RFC4571 frame. The caller filters retired socket incarnations.
     IceTcp {
-        flow: IceTcpFlowId,
         local: SocketAddr,
         remote: SocketAddr,
         frame: Bytes,
-    },
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum AuthenticatedFlow {
-    Udp {
-        local: SocketAddr,
-        remote: SocketAddr,
-    },
-    IceTcp {
-        flow: IceTcpFlowId,
-        local: SocketAddr,
-        remote: SocketAddr,
     },
 }
 
@@ -67,23 +42,19 @@ pub enum TransmitTarget {
         remote: SocketAddr,
         ecn: Option<EcnCodepoint>,
     },
+    /// Bytes belong to the currently selected socket at this tuple and must not
+    /// be redirected to a replacement stream after partial writes.
     IceTcp {
-        flow: IceTcpFlowId,
+        local: SocketAddr,
+        remote: SocketAddr,
     },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct MediaTransmitInfo {
-    pub sender: SenderId,
-    pub global_media_at: crate::GlobalMediaTime,
-    pub origin: crate::PacketOrigin,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TransmitKind {
-    Original(MediaTransmitInfo),
-    Repair(MediaTransmitInfo),
-    Padding { sender: SenderId },
+    Original { ssrc: u32 },
+    Repair { ssrc: u32 },
+    Padding { ssrc: u32 },
     Control,
 }
 
@@ -94,59 +65,18 @@ pub struct Transmit {
     pub payload: Bytes,
 }
 
-#[derive(Debug)]
-#[non_exhaustive]
-pub enum Command {
-    /// Register an accepted stream before delivering its first frame. IDs must never be reused.
-    AdmitIceTcpFlow {
-        flow: IceTcpFlowId,
-        local: SocketAddr,
-        remote: SocketAddr,
-    },
-    /// Remove a closed stream before admitting another incarnation of its tuple.
-    RetireIceTcpFlow {
-        flow: IceTcpFlowId,
-    },
-    SetSenderAssignment {
-        sender: SenderId,
-        assignment: Option<SenderAssignment>,
-    },
-    SendMedia {
-        sender: SenderId,
-        media: ForwardedMedia,
-    },
-    /// Recover within the same publication while retaining committed repair history.
-    RecoverSenderMedia {
-        sender: SenderId,
-        assignment: SenderAssignment,
-    },
-    RequestKeyframe {
-        encoding: EncodingId,
-    },
-    RetireEncoding {
-        encoding: EncodingId,
-    },
-    OpenDataChannel(DataChannelConfig),
-    SendData {
-        channel: DataChannelId,
-        message: DataMessage,
-    },
-    CloseDataChannel {
-        channel: DataChannelId,
-    },
-    CloseGracefully {
-        deadline: Instant,
-    },
-    Abort,
-}
-
-/// Inspect `reason` before retrying or discarding the original owned `command`.
 #[derive(Debug, Error)]
 #[error("{reason}")]
-pub struct RejectedCommand {
-    #[source]
-    pub reason: CommandError,
-    pub command: Command,
+pub struct RejectedRtp {
+    pub reason: WriteError,
+    pub packet: RtpWrite,
+}
+
+#[derive(Debug, Error)]
+#[error("{reason}")]
+pub struct RejectedData {
+    pub reason: WriteError,
+    pub message: DataMessage,
 }
 
 #[derive(Debug)]
@@ -171,41 +101,31 @@ pub enum CloseReason {
 #[non_exhaustive]
 pub enum Event {
     Connected,
-    IceAuthenticated(AuthenticatedFlow),
-    Media {
-        encoding: EncodingId,
-        packet: MediaPacket,
+    Rtp {
+        mid: Arc<str>,
+        rid: Option<Arc<str>>,
+        packet: RtpPacket,
     },
+    SenderReport(SenderReport),
     EncodingDiscovered(EncodingInfo),
     EncodingRetired {
-        encoding: EncodingId,
+        ssrc: u32,
         reason: EncodingRetireReason,
     },
-    /// The peer or local video delivery requires fresh independent media.
     KeyframeRequested {
-        sender: SenderId,
-        reason: KeyframeRequestReason,
+        ssrc: u32,
     },
-    MediaBudgetChanged(MediaPayloadBitrate),
+    BandwidthEstimate(MediaPayloadBitrate),
     DataChannel(DataChannelEvent),
     Warning(ConnectionWarning),
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[non_exhaustive]
-pub enum KeyframeRequestReason {
-    /// Authenticated peer feedback requests fresh media without abandoning current delivery.
-    Peer,
-    /// Local expiry or descriptor failure invalidated the sender's dependency chain.
-    LocalRecovery,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EncodingInfo {
-    pub id: EncodingId,
-    pub sender_index: u32,
+    pub mid: Arc<str>,
+    pub ssrc: u32,
     pub kind: MediaKind,
-    pub rid: Option<std::sync::Arc<str>>,
+    pub rid: Option<Arc<str>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -235,9 +155,6 @@ pub enum DataChannelEvent {
 #[non_exhaustive]
 pub enum ConnectionWarning {
     ClockRegression,
-    MediaClockSynchronized,
-    MediaClockStale,
-    MediaClockDiscontinuous,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
@@ -262,12 +179,10 @@ pub enum AcceptError {
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 #[non_exhaustive]
 pub enum ReceiveError {
-    #[error("packet observation is later than execution")]
+    #[error("packet arrival is later than execution")]
     InvalidObservation,
     #[error("connection is closed")]
     Closed,
-    #[error("unknown ICE-TCP flow")]
-    UnknownIceTcpFlow,
     #[error("invalid network envelope")]
     InvalidNetworkEnvelope,
     #[error("network input exceeds a configured limit")]
@@ -276,34 +191,20 @@ pub enum ReceiveError {
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 #[non_exhaustive]
-pub enum CommandError {
+pub enum WriteError {
     #[error("connection is closed")]
     Closed,
-    #[error("unknown sender {0:?}")]
-    UnknownSender(SenderId),
-    #[error("unknown encoding {0:?}")]
-    UnknownEncoding(EncodingId),
+    #[error("unknown negotiated RTP stream")]
+    UnknownStream,
+    #[error("unknown RTP encoding")]
+    UnknownEncoding,
     #[error("unknown data channel {0:?}")]
     UnknownDataChannel(DataChannelId),
-    #[error("sender {0:?} has no source assignment")]
-    SenderUnbound(SenderId),
-    #[error("invalid sender assignment")]
-    InvalidSenderAssignment,
-    #[error("media belongs to a different source incarnation")]
-    SourceIncarnationMismatch,
-    #[error("invalid or conflicting ICE-TCP flow binding")]
-    InvalidIceTcpFlow,
-    #[error("invalid frame metadata")]
-    InvalidFrameMetadata,
-    #[error("media has passed its receiver usefulness deadline")]
-    MediaExpired,
-    #[error("source packets interrupt an incomplete admitted frame")]
-    FrameInterrupted,
-    #[error("sender dependency chain requires fresh independent media")]
-    DependencyChainInterrupted,
-    #[error("sender {0:?} needs a fresh receiver to restore browser-default playout")]
-    PlayoutResetRequiresNewSender(SenderId),
-    #[error("command is invalid in the current state")]
+    #[error("invalid RTP write or extension value")]
+    InvalidRtp,
+    #[error("RTP index exceeds the SRTP key lifetime")]
+    IndexExhausted,
+    #[error("operation is invalid in the current state")]
     InvalidState,
     #[error("data channel message is too large")]
     MessageTooLarge,
@@ -335,7 +236,7 @@ pub struct ConnectionStats {
     pub close_reason: Option<CloseReason>,
     pub clock_regressions: u64,
     pub rtp_bytes_in_flight: u64,
-    pub media_budget: MediaPayloadBitrate,
+    pub bandwidth_estimate: MediaPayloadBitrate,
     pub pacing_bitrate: u64,
     pub queued_media_bytes: usize,
     pub buffered_data_bytes: usize,
@@ -351,19 +252,10 @@ pub struct ConnectionStats {
     pub wrong_path_feedback: u64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum PlayoutDelayStatus {
-    Unspecified,
-    NotSignaled,
-    Pending,
-    Confirmed,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SenderStats {
-    pub sender: SenderId,
-    pub assignment: Option<SenderAssignment>,
-    pub playout_delay: PlayoutDelayStatus,
+    pub mid: Arc<str>,
+    pub ssrc: u32,
     pub queued_packets: usize,
     pub queued_payload_bytes: usize,
     pub transmitted_packets: u64,
@@ -372,7 +264,8 @@ pub struct SenderStats {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EncodingStats {
-    pub encoding: EncodingId,
+    pub mid: Arc<str>,
+    pub ssrc: Option<u32>,
     pub kind: MediaKind,
     pub received_packets: u64,
     pub retired: bool,

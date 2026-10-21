@@ -51,11 +51,7 @@ macro_rules! caller_id {
 }
 
 connection_id!(SenderId, u16);
-connection_id!(EncodingId, u32);
 caller_id!(DataChannelId, u16);
-caller_id!(IceTcpFlowId, u64);
-caller_id!(FrameId, u64);
-caller_id!(SourceIncarnation, u64);
 
 impl SenderId {
     pub(crate) const fn value(self) -> u16 {
@@ -70,8 +66,6 @@ mod tests {
     #[test]
     fn connection_allocated_ids_are_distinct_values() {
         assert_ne!(SenderId::new(1), SenderId::new(2));
-        assert_ne!(EncodingId::new(1), EncodingId::new(2));
         assert_eq!(SenderId::new(0), None);
-        assert_eq!(EncodingId::new(0), None);
     }
 }
