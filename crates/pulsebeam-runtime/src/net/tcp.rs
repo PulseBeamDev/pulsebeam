@@ -12,7 +12,7 @@ use crate::{mailbox, net::SendPacket};
 use bytes::{Buf, BufMut, BytesMut};
 use pulsebeam_core::net::{TcpReadHalf, TcpStream, TcpWriteHalf, split_tcp};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     io,
     net::{IpAddr, SocketAddr},
     time::Duration,
@@ -177,7 +177,8 @@ struct TcpConn {
 /// Runs on the same thread as the shard (`spawn_local`).  Owns the read half
 /// of the stream so the shard's hot-path never touches it.  Decodes RFC 4571
 /// frames and forwards them through `tx`.  Exits on EOF, I/O error, idle
-/// timeout, or cancellation; always sends `TcpEvent::Closed` before exiting.
+/// timeout, or cancellation. EOF, error and timeout produce `TcpEvent::Closed`;
+/// the owning transport reports local cancellation.
 async fn tcp_read_task(
     peer_addr: SocketAddr,
     flow: TcpFlowId,
@@ -304,6 +305,7 @@ pub struct TcpTransport {
     event_rx: mailbox::Receiver<TcpEvent>,
     /// One event stashed by `readable()` so `try_recv_batch` can always find it.
     peeked: Option<TcpEvent>,
+    closed: VecDeque<(SocketAddr, TcpFlowId)>,
     next_flow: Option<u64>,
 }
 
@@ -317,6 +319,7 @@ impl TcpTransport {
             event_tx,
             event_rx,
             peeked: None,
+            closed: VecDeque::new(),
             next_flow: Some(1),
         }
     }
@@ -349,7 +352,8 @@ impl TcpTransport {
             .ok_or_else(|| io::Error::other("TCP flow identity space exhausted"))?;
         let flow = TcpFlowId(raw_flow);
         self.next_flow = raw_flow.checked_add(1);
-        if self.conns.len() >= MAX_CONNECTIONS {
+        // Retired flows keep their admission slot until the caller drains the notice.
+        if self.conns.len().saturating_add(self.closed.len()) >= MAX_CONNECTIONS {
             return Err(io::Error::new(
                 io::ErrorKind::ConnectionRefused,
                 "TCP connection limit reached",
@@ -445,7 +449,9 @@ impl TcpTransport {
     }
 
     pub fn close_peer(&mut self, peer_addr: &SocketAddr) {
-        self.remove_conn(peer_addr);
+        if let Some(flow) = self.remove_conn(peer_addr) {
+            self.closed.push_back((*peer_addr, flow));
+        }
     }
 
     pub fn flow_for_peer(&self, peer_addr: &SocketAddr) -> Option<TcpFlowId> {
@@ -454,23 +460,22 @@ impl TcpTransport {
 
     pub fn close_flow(&mut self, peer_addr: &SocketAddr, flow: TcpFlowId) {
         if self.flow_for_peer(peer_addr) == Some(flow) {
-            self.remove_conn(peer_addr);
+            self.close_peer(peer_addr);
         }
     }
 
-    fn remove_conn(&mut self, peer_addr: &SocketAddr) {
-        if let Some(conn) = self.conns.remove(peer_addr) {
-            // A queued close from this task must not retire a replacement flow.
-            conn.cancel.cancel();
-            let ip = peer_addr.ip();
-            if let Some(c) = self.ip_counts.get_mut(&ip) {
-                *c = c.saturating_sub(1);
-                if *c == 0 {
-                    self.ip_counts.remove(&ip);
-                }
+    fn remove_conn(&mut self, peer_addr: &SocketAddr) -> Option<TcpFlowId> {
+        let conn = self.conns.remove(peer_addr)?;
+        conn.cancel.cancel();
+        let ip = peer_addr.ip();
+        if let Some(c) = self.ip_counts.get_mut(&ip) {
+            *c = c.saturating_sub(1);
+            if *c == 0 {
+                self.ip_counts.remove(&ip);
             }
-            tracing::info!(%peer_addr, "TCP connection removed from shard");
         }
+        tracing::info!(%peer_addr, "TCP connection removed from shard");
+        Some(conn.flow)
     }
 
     /// Resolves when at least one TCP event (frame or close notification) is
@@ -479,8 +484,8 @@ impl TcpTransport {
     ///
     /// O(1): waits on a single channel regardless of the number of connections.
     pub async fn readable(&mut self) -> io::Result<()> {
-        if self.peeked.is_some() {
-            return Ok(()); // previous readable() result not yet consumed
+        if self.peeked.is_some() || !self.closed.is_empty() {
+            return Ok(());
         }
         match self.event_rx.recv().await {
             Some(event) => {
@@ -497,16 +502,8 @@ impl TcpTransport {
     /// Returns `WouldBlock` when no frames were produced (closed-connection
     /// events are processed but produce no output frames).
     pub fn try_recv_batch(&mut self, out: &mut Vec<RecvPacketBatch>) -> io::Result<usize> {
-        let local_addr = self.local_addr;
         let start = out.len();
-        for _ in 0..super::BATCH_SIZE {
-            let event = self.peeked.take().or_else(|| self.event_rx.try_recv().ok());
-            let Some(event) = event else {
-                break;
-            };
-            self.handle_event(event, out, local_addr);
-        }
-
+        let _ = self.try_recv_events(out, &mut Vec::new());
         let received = out.len().saturating_sub(start);
         if received == 0 {
             Err(io::Error::from(io::ErrorKind::WouldBlock))
@@ -515,11 +512,42 @@ impl TcpTransport {
         }
     }
 
+    /// Drain one bounded batch, retaining exact EOF, error and local retirement
+    /// identities alongside frames. The result counts consumed events, including
+    /// stale frames. Retirement notices are moved out, not retained as history.
+    pub fn try_recv_events(
+        &mut self,
+        out: &mut Vec<RecvPacketBatch>,
+        closed: &mut Vec<(SocketAddr, TcpFlowId)>,
+    ) -> io::Result<usize> {
+        let local_addr = self.local_addr;
+        let mut consumed = 0usize;
+        for _ in 0..super::BATCH_SIZE {
+            if let Some(flow) = self.closed.pop_front() {
+                closed.push(flow);
+                consumed = consumed.saturating_add(1);
+                continue;
+            }
+            let event = self.peeked.take().or_else(|| self.event_rx.try_recv().ok());
+            let Some(event) = event else {
+                break;
+            };
+            consumed = consumed.saturating_add(1);
+            self.handle_event(event, out, local_addr, closed);
+        }
+        if consumed == 0 {
+            Err(io::ErrorKind::WouldBlock.into())
+        } else {
+            Ok(consumed)
+        }
+    }
+
     fn handle_event(
         &mut self,
         event: TcpEvent,
         out: &mut Vec<RecvPacketBatch>,
         local_addr: SocketAddr,
+        closed: &mut Vec<(SocketAddr, TcpFlowId)>,
     ) {
         match event {
             TcpEvent::Frame {
@@ -529,7 +557,10 @@ impl TcpTransport {
                 received_at,
             } => {
                 // An address can already belong to a replacement stream.
-                if self.flow_for_peer(&src) != Some(flow) {
+                let Some(conn) = self.conns.get(&src) else {
+                    return;
+                };
+                if conn.flow != flow {
                     return;
                 }
                 let len = payload.len();
@@ -546,7 +577,10 @@ impl TcpTransport {
                 });
             }
             TcpEvent::Closed { src, flow } => {
-                self.close_flow(&src, flow);
+                if self.flow_for_peer(&src) == Some(flow) {
+                    let _ = self.remove_conn(&src);
+                }
+                closed.push((src, flow));
             }
         }
     }
@@ -680,7 +714,7 @@ impl TcpTransport {
             Ok(false) => return Ok(false),
             Err(error) => {
                 tracing::warn!(peer_addr = %batch.dst, %error, "TCP write error");
-                self.remove_conn(&batch.dst);
+                self.close_peer(&batch.dst);
             }
         }
         Ok(true)
@@ -871,7 +905,8 @@ mod tests {
 
             let (mut client, server_stream, peer_addr) = make_pair(&listener).await;
             client.set_nodelay(true).unwrap();
-            sock.add_connection(BufferedTcpStream::new(server_stream), peer_addr)
+            let flow = sock
+                .add_connection(BufferedTcpStream::new(server_stream), peer_addr)
                 .unwrap();
 
             // Ingress: client → server, RFC 4571 framing
@@ -916,6 +951,24 @@ mod tests {
                 client.read_exact(&mut buf).await.unwrap();
                 assert_eq!(buf, expected);
             }
+
+            client.shutdown().await.unwrap();
+            tokio::time::timeout(Duration::from_secs(2), sock.readable())
+                .await
+                .unwrap()
+                .unwrap();
+            out.clear();
+            let mut closed = Vec::new();
+            assert_eq!(sock.try_recv_events(&mut out, &mut closed).unwrap(), 1);
+            assert!(out.is_empty());
+            assert_eq!(closed, vec![(peer_addr, flow)]);
+            assert_eq!(sock.active_connections(), 0);
+            assert_eq!(
+                sock.try_recv_events(&mut out, &mut closed)
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::WouldBlock
+            );
         });
     }
 
@@ -987,6 +1040,10 @@ mod tests {
             assert_ne!(flow, replacement);
 
             out.clear();
+            let mut closed = Vec::new();
+            sock.try_recv_events(&mut out, &mut closed).unwrap();
+            assert_eq!(closed, vec![(peer_addr, flow)]);
+            closed.clear();
             sock.handle_event(
                 TcpEvent::Frame {
                     src: peer_addr,
@@ -996,6 +1053,7 @@ mod tests {
                 },
                 &mut out,
                 server_addr,
+                &mut closed,
             );
             sock.handle_event(
                 TcpEvent::Closed {
@@ -1004,8 +1062,26 @@ mod tests {
                 },
                 &mut out,
                 server_addr,
+                &mut closed,
             );
+            assert_eq!(closed, vec![(peer_addr, flow)]);
             assert!(out.is_empty());
+            closed.clear();
+            for _ in 0..=super::super::BATCH_SIZE {
+                sock.event_tx
+                    .try_send(TcpEvent::Closed {
+                        src: peer_addr,
+                        flow,
+                    })
+                    .unwrap_or_else(|_| panic!("test inbox has capacity"));
+            }
+            assert_eq!(
+                sock.try_recv_events(&mut out, &mut closed).unwrap(),
+                super::super::BATCH_SIZE
+            );
+            assert_eq!(closed.len(), super::super::BATCH_SIZE);
+            assert_eq!(sock.try_recv_events(&mut out, &mut closed).unwrap(), 1);
+            assert_eq!(closed.len(), super::super::BATCH_SIZE + 1);
             assert_eq!(sock.flow_for_peer(&peer_addr), Some(replacement));
 
             let packet = SendPacket {
@@ -1022,6 +1098,34 @@ mod tests {
             let mut received = [0; 11];
             replacement_client.read_exact(&mut received).await.unwrap();
             assert_eq!(&received, b"replacement");
+
+            sock.close_flow(&peer_addr, replacement);
+            closed.clear();
+            assert_eq!(sock.try_recv_events(&mut out, &mut closed).unwrap(), 1);
+            assert_eq!(closed, vec![(peer_addr, replacement)]);
+
+            // Unconsumed local retirements cannot allow unbounded connection churn.
+            sock.closed
+                .resize(MAX_CONNECTIONS, (peer_addr, replacement));
+            let (_client, stream, peer) = make_pair(&listener).await;
+            assert_eq!(
+                sock.add_connection(BufferedTcpStream::new(stream), peer)
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::ConnectionRefused
+            );
+            closed.clear();
+            assert_eq!(
+                sock.try_recv_events(&mut out, &mut closed).unwrap(),
+                super::super::BATCH_SIZE
+            );
+            assert_eq!(
+                sock.closed.len(),
+                MAX_CONNECTIONS - super::super::BATCH_SIZE
+            );
+            let (_client, stream, peer) = make_pair(&listener).await;
+            sock.add_connection(BufferedTcpStream::new(stream), peer)
+                .unwrap();
         });
     }
 
