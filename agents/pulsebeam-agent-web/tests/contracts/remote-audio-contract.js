@@ -115,13 +115,7 @@
     const fake = { getSnapshot: () => snapshot, subscribe: () => () => {} };
     snapshot.catalog.tracks = snapshot.catalog.publications;
     const owners = new ResourceOwners(() => {});
-    const catalog = new RemoteCatalog(
-      fake,
-      new DataRegistry(fake),
-      0,
-      () => {},
-      owners,
-    );
+    const catalog = new RemoteCatalog(fake, new DataRegistry(fake), owners);
     catalogs.push(catalog);
     catalog.update(snapshot);
     assert(

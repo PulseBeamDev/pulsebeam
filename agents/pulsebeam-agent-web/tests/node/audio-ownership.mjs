@@ -75,8 +75,6 @@ export async function audioOwnershipContract(runtime) {
   const catalog = new RemoteCatalog(
     agent,
     new DataRegistry(agent),
-    0,
-    () => {},
     owners,
     "off",
   );

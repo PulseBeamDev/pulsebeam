@@ -5,7 +5,12 @@ import {
   type CapturedVideoTrack,
 } from "./capture-source.js";
 import { DataRegistry, type LocalDataTrack } from "./data.js";
-import type { DataTrackSpec, Delivery } from "./track.js";
+import type {
+  AudioTrackSpec,
+  DataTrackSpec,
+  Delivery,
+  VideoTrackSpec,
+} from "./track.js";
 import type {
   Agent,
   AgentConfig,
@@ -30,7 +35,6 @@ import type {
   Topic,
   TopicMode,
   TopicRegistration,
-  VideoDemand,
   TopicSnapshot,
   TopicCallbacks,
   TopicPublisherStatus,
@@ -38,6 +42,7 @@ import type {
 import { RemoteCatalog } from "./remote-catalog.js";
 import { TopicRegistry } from "./topic.js";
 import { ResourceOwners } from "./resources.js";
+import { LocalMediaRegistry } from "./media.js";
 import { BrowserRuntime, whenInitialized } from "./wasm.js";
 import {
   copyConfig,
@@ -137,9 +142,9 @@ class AgentFacade implements Agent {
     )
       console.warn("PulseBeam resource ownership failed", error);
   });
+  readonly #media = new LocalMediaRegistry(this.#resources);
   readonly #remote: RemoteCatalog;
   readonly #topics: TopicRegistry;
-  #managedVideo: readonly VideoDemand[] = [];
   #managedTopics: readonly TopicRegistration[] = [];
   readonly #topology: Required<MediaTopology>;
   #closed = false;
@@ -155,13 +160,6 @@ class AgentFacade implements Agent {
     this.#remote = new RemoteCatalog(
       this,
       this.#data,
-      this.#topology.remoteVideos,
-      (video) => {
-        if (JSON.stringify(this.#managedVideo) === JSON.stringify(video))
-          return;
-        this.#managedVideo = video;
-        this.#applyState(this.#state);
-      },
       this.#resources,
       runtimeConfig.logLevel,
     );
@@ -308,10 +306,15 @@ class AgentFacade implements Agent {
     return this.#remote;
   }
 
-  track<D extends Delivery>(spec: DataTrackSpec<D>): LocalDataTrack<D> {
-    if (spec.kind !== "data")
-      throw new TypeError("expected data track descriptor");
-    return this.#data.local(spec);
+  track(spec: VideoTrackSpec): LocalVideoTrack;
+  track(spec: AudioTrackSpec): LocalAudioTrack;
+  track<D extends Delivery>(spec: DataTrackSpec<D>): LocalDataTrack<D>;
+  track(
+    spec: VideoTrackSpec | AudioTrackSpec | DataTrackSpec,
+  ): LocalVideoTrack | LocalAudioTrack | LocalDataTrack {
+    if (spec.kind === "data") return this.#data.local(spec);
+    if (spec.kind === "video") return this.#media.track(spec);
+    return this.#media.track(spec);
   }
 
   topic<T>(name: string, options: { readonly mode: TopicMode }): Topic<T> {
@@ -470,7 +473,6 @@ class AgentFacade implements Agent {
   }
 
   #effectiveState(state: AgentState): AgentState {
-    const usedSlots = new Set((state.video ?? []).map(({ slot }) => slot));
     const topics = new Map<string, TopicRegistration>();
     for (const topic of state.topics ?? [])
       topics.set(`${topic.mode}:${topic.name}`, topic);
@@ -492,10 +494,7 @@ class AgentFacade implements Agent {
         ),
         ...this.#localPublications.values(),
       ],
-      video: [
-        ...(state.video ?? []),
-        ...this.#managedVideo.filter(({ slot }) => !usedSlots.has(slot)),
-      ],
+      video: state.video ?? [],
       topics: [...topics.values()],
     };
   }
@@ -602,6 +601,7 @@ class AgentFacade implements Agent {
       runtime.close();
       runtime.abort();
     }
+    this.#media.close();
     this.#resources.close();
     this.#data.close();
     this.#topics.close();

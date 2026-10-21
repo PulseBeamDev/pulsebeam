@@ -40,13 +40,7 @@
   snapshot.catalog.tracks = snapshot.catalog.publications;
   const agent = { getSnapshot: () => snapshot, subscribe: () => () => {} };
   const owners = new ResourceOwners(() => {});
-  const catalog = new RemoteCatalog(
-    agent,
-    new DataRegistry(agent),
-    0,
-    () => {},
-    owners,
-  );
+  const catalog = new RemoteCatalog(agent, new DataRegistry(agent), owners);
   catalog.update(snapshot);
   if (contexts.length !== 0)
     throw new Error("observation created playback without an owner");

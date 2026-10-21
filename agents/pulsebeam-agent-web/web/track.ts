@@ -19,8 +19,14 @@ export interface DataTrackSpec<D extends Delivery = Delivery> {
 export type TrackSpec = VideoTrackSpec | AudioTrackSpec | DataTrackSpec;
 
 function label(value: string): string {
-  if (typeof value !== "string")
-    throw new TypeError("track label must be a string");
+  if (
+    typeof value !== "string" ||
+    value.length === 0 ||
+    new TextEncoder().encode(value).length > 64
+  )
+    throw new TypeError(
+      "track label must be a non-empty UTF-8 string of at most 64 bytes",
+    );
   return value;
 }
 
@@ -32,6 +38,8 @@ export const track = Object.freeze({
     return Object.freeze({ kind: "audio", label: label(value) });
   },
   data<D extends Delivery>(value: string, delivery: D): DataTrackSpec<D> {
+    if (delivery !== "latest" && delivery !== "lossy" && delivery !== "ordered")
+      throw new TypeError("invalid data delivery mode");
     return Object.freeze({ kind: "data", label: label(value), delivery });
   },
 });

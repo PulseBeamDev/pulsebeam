@@ -39,7 +39,7 @@ export interface ResourceBinding {
   readonly owner: bigint;
   readonly slot?: string;
 }
-interface Observer {
+export interface ResourceObserver {
   bind(binding: ResourceBinding): void;
   unbind(): void;
   error?(error: ResourceError): void;
@@ -52,7 +52,7 @@ export class ResourceOwners {
   readonly #owners = new Set<ResourceOwner>();
   constructor(readonly report: (error: ResourceError) => void) {}
 
-  acquire(command: unknown, observer: Observer): ResourceOwner {
+  acquire(command: unknown, observer: ResourceObserver): ResourceOwner {
     if (this.#closed) throw new ResourceError("closed", "agent is closed");
     const owner = new ResourceOwner(this, command, observer);
     this.#owners.add(owner);
@@ -95,7 +95,7 @@ export class ResourceOwner {
   constructor(
     private registry: ResourceOwners,
     private command: unknown,
-    private observer: Observer,
+    private observer: ResourceObserver,
   ) {
     this.ready = new Promise((resolve, reject) => {
       this.#resolve = resolve;

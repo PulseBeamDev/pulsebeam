@@ -3,7 +3,12 @@ import type {
   CapturedVideoTrack,
 } from "./capture-source.js";
 
-import type { DataTrackSpec, Delivery } from "./track.js";
+import type {
+  AudioTrackSpec,
+  DataTrackSpec,
+  Delivery,
+  VideoTrackSpec,
+} from "./track.js";
 import type { LocalDataTrack, RemoteDataTrack } from "./data.js";
 
 export type MediaKind = "audio" | "video";
@@ -221,6 +226,8 @@ export interface RemoteParticipant {
   readonly participantId: string;
   readonly active: boolean;
   readonly tracks: readonly RemotePublishedTrack[];
+  track(spec: VideoTrackSpec): RemoteVideoTrack;
+  track(spec: AudioTrackSpec): RemoteAudioTrack;
   track<D extends Delivery>(spec: DataTrackSpec<D>): RemoteDataTrack<D>;
   video(label: string): RemoteVideoTrack;
   audio(label: string): RemoteAudioTrack;
@@ -450,6 +457,8 @@ export interface Agent {
   readonly authorizationExpiresAt: number | null;
   readonly local: LocalMedia;
   readonly remote: RemoteMedia;
+  track(spec: VideoTrackSpec): LocalVideoTrack;
+  track(spec: AudioTrackSpec): LocalAudioTrack;
   track<D extends Delivery>(spec: DataTrackSpec<D>): LocalDataTrack<D>;
   topic<T>(name: string, options: { readonly mode: TopicMode }): Topic<T>;
   connect(): void;

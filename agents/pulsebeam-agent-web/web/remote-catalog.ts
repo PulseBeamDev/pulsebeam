@@ -1,8 +1,18 @@
 import { attachRemoteMedia } from "./remote-media.js";
 import { RemoteAudioPlayback } from "./remote-audio.js";
-import { ResourceError, ResourceOwners } from "./resources.js";
+import {
+  ResourceError,
+  ResourceOwners,
+  type ResourceBinding,
+} from "./resources.js";
 import type { DataRegistry, RemoteDataTrack } from "./data.js";
-import { track, type DataTrackSpec, type Delivery } from "./track.js";
+import {
+  track,
+  type AudioTrackSpec,
+  type DataTrackSpec,
+  type Delivery,
+  type VideoTrackSpec,
+} from "./track.js";
 import type {
   Agent,
   AgentSnapshot,
@@ -16,15 +26,14 @@ import type {
   RemoteMediaAttachmentOptions,
   RemoteVideoTrack,
   RemoteMedia,
-  VideoDemand,
 } from "./types.js";
 
 type PlaybackCallback = (
   failure: PlaybackFailure,
   retry: () => Promise<void>,
 ) => void;
-type Demand = { height: number; visible: boolean; options: ReceiveOptions };
 export interface RemoteVideoAttachment extends RemoteMediaAttachment {
+  readonly ready: Promise<void>;
   setPreferences(options: ReceiveOptions): void;
 }
 const MAX_UINT32 = 0xffff_ffff;
@@ -91,8 +100,8 @@ function collection<T>(prior: readonly T[], next: T[]): readonly T[] {
 class VideoHandle implements RemoteVideoTrack {
   readonly kind = "video" as const;
   publicationId: string | undefined;
-  readonly consumers = new Map<symbol, Demand>();
   readonly bindingListeners = new Set<() => void>();
+  readonly optionListeners = new Set<() => void>();
   readonly #listeners = new Set<() => void>();
   options: ReceiveOptions = validateReceiveOptions({});
   constructor(
@@ -121,66 +130,16 @@ class VideoHandle implements RemoteVideoTrack {
   }
   setReceiveOptions(options: ReceiveOptions): void {
     if (this.catalog.closed) return;
-    const next = receiveOptions(options);
+    const next = validateReceiveOptions(options);
     if (JSON.stringify(this.options) === JSON.stringify(next)) return;
     this.options = next;
-    this.catalog.recompute();
-  }
-  consume(
-    token: symbol,
-    height: number,
-    visible: boolean,
-    options: ReceiveOptions = {},
-  ): void {
-    if (this.catalog.closed) return;
-    const prior = this.consumers.get(token);
-    if (
-      prior?.height === height &&
-      prior.visible === visible &&
-      JSON.stringify(prior.options) === JSON.stringify(options)
-    )
-      return;
-    this.consumers.set(token, { height, visible, options });
-    this.catalog.recompute();
-  }
-  release(token: symbol): void {
-    if (this.consumers.delete(token)) this.catalog.recompute();
+    for (const listener of this.optionListeners) listener();
   }
   close(): void {
     this.bind(undefined);
-    this.consumers.clear();
     this.bindingListeners.clear();
+    this.optionListeners.clear();
     this.#listeners.clear();
-  }
-  get preferences(): ReceiveOptions {
-    const visible = [...this.consumers.values()]
-      .filter((consumer) => consumer.visible)
-      .map((consumer) => consumer.options);
-    const all = [this.options, ...visible];
-    const delays = all.flatMap((options) =>
-      options.playoutDelay ? [options.playoutDelay] : [],
-    );
-    return {
-      minHeight: Math.max(0, ...all.map((options) => options.minHeight ?? 0)),
-      minFps: Math.max(0, ...all.map((options) => options.minFps ?? 0)),
-      priority: Math.max(0, ...all.map((options) => options.priority ?? 0)),
-      ...(delays.length
-        ? {
-            playoutDelay: {
-              minMs: Math.min(...delays.map((delay) => delay.minMs)),
-              maxMs: Math.max(...delays.map((delay) => delay.maxMs)),
-            },
-          }
-        : {}),
-    };
-  }
-  get height(): number {
-    return Math.max(
-      0,
-      ...[...this.consumers.values()]
-        .filter(({ visible }) => visible)
-        .map(({ height }) => height),
-    );
   }
 }
 
@@ -235,7 +194,14 @@ class ParticipantHandle implements RemoteParticipant {
   get active(): boolean {
     return this.catalog.participants.includes(this);
   }
-  track<D extends Delivery>(spec: DataTrackSpec<D>): RemoteDataTrack<D> {
+  track(spec: VideoTrackSpec): RemoteVideoTrack;
+  track(spec: AudioTrackSpec): RemoteAudioTrack;
+  track<D extends Delivery>(spec: DataTrackSpec<D>): RemoteDataTrack<D>;
+  track(
+    spec: VideoTrackSpec | AudioTrackSpec | DataTrackSpec,
+  ): RemotePublishedTrack {
+    if (spec.kind === "video") return this.video(track.video(spec.label).label);
+    if (spec.kind === "audio") return this.audio(track.audio(spec.label).label);
     return this.catalog.data.remote(spec, this.participantId);
   }
   constructor(
@@ -264,8 +230,6 @@ class ParticipantHandle implements RemoteParticipant {
 
 export class RemoteCatalog implements RemoteMedia {
   readonly #handles = new Map<string, ParticipantHandle>();
-  readonly #slots = new Map<VideoHandle, number>();
-  readonly #warned = new Set<VideoHandle>();
   #playback: RemoteAudioPlayback | undefined;
   #closed = false;
   participants: readonly RemoteParticipant[] = Object.freeze([]);
@@ -274,9 +238,7 @@ export class RemoteCatalog implements RemoteMedia {
   constructor(
     readonly agent: Agent,
     readonly data: DataRegistry,
-    private readonly capacity: number,
-    private readonly onChange: (video: readonly VideoDemand[]) => void,
-    private readonly owners: ResourceOwners,
+    readonly owners: ResourceOwners,
     private logLevel: LogLevel = "warn",
   ) {
     audioCatalogs.set(agent, this);
@@ -442,70 +404,6 @@ export class RemoteCatalog implements RemoteMedia {
     this.participants = collection(this.participants, participants);
     this.videoTracks = collection(this.videoTracks, videos);
     this.audioTracks = collection(this.audioTracks, audios);
-    this.recompute();
-  }
-  recompute(): void {
-    if (this.#closed) return;
-    const candidates = (this.videoTracks as readonly VideoHandle[]).filter(
-      (handle) => handle.height > 0,
-    );
-    const selected = new Map<VideoHandle, number>();
-    const occupied = new Set<number>();
-    for (const handle of candidates) {
-      const slot = this.#slots.get(handle);
-      if (slot !== undefined && slot < this.capacity && !occupied.has(slot)) {
-        selected.set(handle, slot);
-        occupied.add(slot);
-      }
-    }
-    for (const handle of candidates) {
-      if (selected.has(handle)) continue;
-      for (let slot = 0; slot < this.capacity; slot++) {
-        if (occupied.has(slot)) continue;
-        selected.set(handle, slot);
-        occupied.add(slot);
-        break;
-      }
-    }
-    this.#slots.clear();
-    for (const [handle, slot] of selected) this.#slots.set(handle, slot);
-    for (const handle of candidates) {
-      if (!selected.has(handle) && !this.#warned.has(handle)) {
-        console.warn(
-          "PulseBeam remote video demand exceeds receiver capacity",
-          {
-            participantId: handle.participantId,
-            label: handle.label,
-            capacity: this.capacity,
-          },
-        );
-        this.#warned.add(handle);
-      }
-      if (selected.has(handle)) this.#warned.delete(handle);
-    }
-    this.onChange(
-      [...selected]
-        .sort(([, a], [, b]) => a - b)
-        .map(([handle, slot]) => {
-          const preferences = handle.preferences;
-          return {
-            slot,
-            trackId: handle.publicationId!,
-            height: uint32(handle.height, "height"),
-            minHeight: preferences.minHeight ?? 0,
-            minFps: preferences.minFps ?? 0,
-            priority: preferences.priority ?? 0,
-            ...(preferences.playoutDelay
-              ? {
-                  playoutDelay: {
-                    mode: "fixed" as const,
-                    ...preferences.playoutDelay,
-                  },
-                }
-              : {}),
-          };
-        }),
-    );
   }
   close(): void {
     if (this.#closed) return;
@@ -521,8 +419,6 @@ export class RemoteCatalog implements RemoteMedia {
       participant.audioTracks = Object.freeze([]);
       participant.tracks = Object.freeze([]);
     }
-    this.#slots.clear();
-    this.#warned.clear();
     this.participants = Object.freeze([]);
     this.videoTracks = Object.freeze([]);
     this.audioTracks = Object.freeze([]);
@@ -541,6 +437,7 @@ export function attachRemoteVideo(
   if (!handle) throw new TypeError("invalid remote video source");
   if (handle.catalog.closed)
     return {
+      ready: Promise.resolve(),
       setPublicationIds() {},
       setPreferences() {},
       retryPlayback: async () => {},
@@ -578,17 +475,36 @@ function attachVideoHandle(
   },
 ): RemoteVideoAttachment {
   let preferences = validateReceiveOptions(options.preferences ?? {});
+  let binding: ResourceBinding | undefined;
+  let sync = () => {};
+  const resource = handle.catalog.owners.acquire(
+    {
+      op: "claimVideo",
+      selector: {
+        participantId: handle.participantId,
+        label: handle.label,
+      },
+    },
+    {
+      bind: (next) => {
+        binding = next;
+        sync();
+      },
+      unbind: () => {
+        binding = undefined;
+      },
+    },
+  );
   const agent = handle.catalog.agent;
   const attachment = attachRemoteMedia(agent, element, {
     publicationIds: handle.publicationId ? [handle.publicationId] : [],
     onPlaybackBlocked,
     autoPlay: options.autoPlay,
   });
-  const token = Symbol("video-consumer");
   const viewport = element.ownerDocument.defaultView;
   let intersecting = true;
   let closed = false;
-  const sync = () => {
+  sync = () => {
     if (closed) return;
     const rect = element.getBoundingClientRect();
     const visible =
@@ -608,7 +524,39 @@ function attachVideoHandle(
           Math.ceil(rect.height * (viewport?.devicePixelRatio || 1)),
         )
       : 0;
-    handle.consume(token, height, visible, preferences);
+    const current = binding;
+    if (!current || !resource.current(current)) return;
+    const baseline = handle.options;
+    const delay = [baseline.playoutDelay, preferences.playoutDelay].filter(
+      (value) => value !== undefined,
+    );
+    void current.runtime
+      .resource({
+        op: "observeVideo",
+        owner: current.owner,
+        observation: {
+          visible,
+          height,
+          minHeight: Math.max(
+            baseline.minHeight ?? 0,
+            preferences.minHeight ?? 0,
+          ),
+          minFps: Math.max(baseline.minFps ?? 0, preferences.minFps ?? 0),
+          priority: Math.max(baseline.priority ?? 0, preferences.priority ?? 0),
+          ...(delay.length
+            ? {
+                playoutDelay: {
+                  mode: "fixed",
+                  minMs: Math.min(...delay.map((value) => value!.minMs)),
+                  maxMs: Math.max(...delay.map((value) => value!.maxMs)),
+                },
+              }
+            : {}),
+        },
+      })
+      .catch((error) => {
+        if (resource.current(current)) resource.fail(error);
+      });
   };
   let pixelRatioQuery: MediaQueryList | null = null;
   const onPixelRatioChange = () => {
@@ -654,8 +602,10 @@ function attachVideoHandle(
       handle.publicationId ? [handle.publicationId] : [],
     );
   handle.bindingListeners.add(updateBinding);
+  handle.optionListeners.add(sync);
   sync();
   return {
+    ready: resource.ready,
     setPublicationIds: (ids) => attachment.setPublicationIds(ids),
     setPreferences: (next) => {
       if (closed) return;
@@ -674,7 +624,8 @@ function attachVideoHandle(
       viewport?.removeEventListener("scroll", sync, true);
       element.ownerDocument.removeEventListener("visibilitychange", sync);
       handle.bindingListeners.delete(updateBinding);
-      handle.release(token);
+      handle.optionListeners.delete(sync);
+      void resource.close();
       attachment.close();
     },
   };

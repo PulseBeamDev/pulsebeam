@@ -29,16 +29,24 @@
     },
   };
   let wire = [];
-  snapshot.catalog.tracks = snapshot.catalog.publications;
-  const catalog = new RemoteCatalog(
-    agent,
-    new DataRegistry(agent),
-    1,
-    (next) => {
-      wire = next;
+  let owner = 0n;
+  const owners = new ResourceOwners(() => {});
+  owners.activate({
+    async resource(command) {
+      if (command.op === "claimVideo") return { owner: ++owner };
+      if (command.op === "observeVideo") {
+        wire = command.observation.visible ? [command.observation] : [];
+        return { type: "updated" };
+      }
+      if (command.op === "release") {
+        wire = [];
+        return { type: "released" };
+      }
+      throw new Error(`unexpected resource command ${command.op}`);
     },
-    new ResourceOwners(() => {}),
-  );
+  });
+  snapshot.catalog.tracks = snapshot.catalog.publications;
+  const catalog = new RemoteCatalog(agent, new DataRegistry(agent), owners);
   catalog.update(snapshot);
   const handle = catalog.participant("alice").video("camera");
   handle.setReceiveOptions({ minHeight: 720 });

@@ -16,7 +16,7 @@ import {
   queries,
 } from "./media-platform.mjs";
 
-test("production attachment policy derives demand from controlled geometry and visibility notifications", () => {
+test("production attachment reports controlled geometry and visibility to core", async () => {
   const snapshot = {
     connection: "disconnected",
     catalog: {
@@ -35,16 +35,27 @@ test("production attachment policy derives demand from controlled geometry and v
   };
   const agent = { getSnapshot: () => snapshot, subscribe: () => () => {} };
   let demand = [];
-  snapshot.catalog.tracks = snapshot.catalog.publications;
-  const catalog = new RemoteCatalog(
-    agent,
-    new DataRegistry(agent),
-    1,
-    (next) => {
-      demand = next;
+  let nextOwner = 1n;
+  const observations = new Map();
+  const owners = new ResourceOwners(() => {});
+  owners.activate({
+    async resource(command) {
+      if (command.op === "claimVideo") return { owner: nextOwner++ };
+      if (command.op === "observeVideo") {
+        observations.set(command.owner, command.observation);
+        demand = [...observations.values()].filter(({ visible }) => visible);
+        return { type: "updated" };
+      }
+      if (command.op === "release") {
+        observations.delete(command.owner);
+        demand = [...observations.values()].filter(({ visible }) => visible);
+        return { type: "released" };
+      }
+      throw new Error(`unexpected resource command ${command.op}`);
     },
-    new ResourceOwners(() => {}),
-  );
+  });
+  snapshot.catalog.tracks = snapshot.catalog.publications;
+  const catalog = new RemoteCatalog(agent, new DataRegistry(agent), owners);
   catalog.update(snapshot);
   const handle = catalog.participant("alice").video("camera");
   handle.setReceiveOptions({ minHeight: 720 });
@@ -52,13 +63,16 @@ test("production attachment policy derives demand from controlled geometry and v
   const small = new Video();
   small.parentElement = parent;
   const first = attachRemoteVideo(handle, small);
+  await first.ready;
   assert.equal(demand[0].height, 240);
   const large = new Video();
   large.rect.height = 230;
   const second = attachRemoteVideo(handle, large);
-  assert.equal(demand.length, 1);
-  assert.equal(demand[0].height, 460);
+  await second.ready;
+  assert.equal(demand.length, 2);
+  assert.equal(demand[1].height, 460);
   second.close();
+  await Promise.resolve();
   assert.equal(demand[0].height, 240);
   small.rect.height = 200;
   Resize.notify();

@@ -4,6 +4,7 @@ import {
   type DataEvent,
   createCaptureSource,
   attachRemoteMedia,
+  attachLocalTrack,
   attachRemoteVideo,
   attachRemoteAudio,
   ResourceOwnershipError,
@@ -76,6 +77,31 @@ const binaryPayload: Uint8Array = binaryMessage.data;
 // @ts-expect-error Message identity is trackId, not the old topic identity API.
 binaryMessage.dataTrackId;
 void [binarySequence, binaryPayload];
+
+const videoSpec = track.video("camera");
+const localVideo = binaryAgent.track(videoSpec);
+const remoteVideoBySpec = binaryAgent.remote
+  .participant("alice")
+  .track(videoSpec);
+declare const videoMediaTrack: MediaStreamTrack;
+const capturedVideo = createCaptureSource(videoMediaTrack, "video");
+const localVideoOwner = attachLocalTrack(localVideo, {
+  source: capturedVideo,
+  enabled: false,
+});
+const localVideoReady: Promise<void> = localVideoOwner.ready;
+localVideoOwner.setEnabled(true);
+localVideoOwner.setSource(null);
+localVideoOwner.setConfig({ contentHint: "text" });
+// @ts-expect-error Video publication options reject audio content hints.
+localVideoOwner.setConfig({ contentHint: "speech" });
+const localVideoClosed: Promise<void> = localVideoOwner.close();
+const remoteVideoId: string | null = remoteVideoBySpec.id;
+void [localVideoReady, localVideoClosed, remoteVideoId];
+// @ts-expect-error Video descriptors do not produce data handles.
+localVideo.send(new Uint8Array());
+// @ts-expect-error Remote video handles cannot publish a local source.
+remoteVideoBySpec.setSource(capturedVideo);
 
 declare const audioTrack: MediaStreamTrack;
 declare const audioElement: HTMLAudioElement;

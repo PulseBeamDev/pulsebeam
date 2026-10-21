@@ -12,6 +12,11 @@ export type {
   Delivery,
 } from "./track.js";
 export { DataError } from "./data.js";
+export { attachLocalTrack } from "./media.js";
+export type {
+  LocalMediaAttachment,
+  LocalMediaAttachmentOptions,
+} from "./media.js";
 export type {
   LocalDataTrack,
   RemoteDataTrack,
