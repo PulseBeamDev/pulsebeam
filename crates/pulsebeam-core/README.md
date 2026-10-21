@@ -1,9 +1,10 @@
 # `pulsebeam-core`
 
 Portable protocol and media helpers shared by the PulseBeam server, clients,
-and simulator. It contains Dependency Descriptor parsing, H.264 and simulcast
-helpers, canonical server identity and authentication types, the public single-project key
-registry, framing, and the abstract network interfaces used by real and
+and simulator. It contains Dependency Descriptor and Video Layers Allocation
+decoding, H.264 and simulcast helpers, canonical server identity and authentication
+types, the public single-project key registry, framing, and the abstract network
+interfaces used by real and
 simulated transports. Shared ID/key codecs come from
 [`pulsebeam-auth`](../pulsebeam-auth/README.md), with existing core type paths
 preserved. Participant-JWT generation belongs to the Rust server SDK; core does

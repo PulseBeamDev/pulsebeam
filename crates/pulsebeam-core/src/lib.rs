@@ -20,6 +20,7 @@ pub mod h264;
 pub mod identity;
 pub mod net;
 pub mod simulcast;
+pub mod vla;
 
 pub mod prelude {
     pub use super::net::AsyncHttpClient;
