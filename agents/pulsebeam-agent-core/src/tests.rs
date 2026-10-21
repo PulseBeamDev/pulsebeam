@@ -2768,13 +2768,18 @@ fn owned_publications_reconcile_without_legacy_lifetime_binding_or_cross_owner_c
     let spec = TrackSpec::Video {
         label: "camera".into(),
     };
-    let ResourceResult::Publication { owner, slot } = agent
+    let ResourceResult::Publication {
+        owner,
+        slot,
+        after_generation,
+    } = agent
         .resource(ResourceCommand::ClaimPublication { spec: spec.clone() })
         .unwrap()
     else {
         panic!("publication lease")
     };
     assert_eq!(slot, "v0");
+    assert_eq!(after_generation, None);
     let sender = MediaSlot::LocalVideo(slot.clone());
     assert!(!agent.is_publishing(&sender));
     agent
@@ -2811,6 +2816,7 @@ fn owned_publications_reconcile_without_legacy_lifetime_binding_or_cross_owner_c
     let ResourceResult::Publication {
         owner: next,
         slot: reused,
+        after_generation: next_generation,
     } = agent
         .resource(ResourceCommand::ClaimPublication {
             spec: TrackSpec::Video {
@@ -2822,6 +2828,7 @@ fn owned_publications_reconcile_without_legacy_lifetime_binding_or_cross_owner_c
         panic!("replacement lease")
     };
     assert_eq!(reused, slot);
+    assert_eq!(next_generation, None);
     assert_ne!(next, owner);
     agent
         .resource(ResourceCommand::UpdatePublication {
@@ -2838,6 +2845,97 @@ fn owned_publications_reconcile_without_legacy_lifetime_binding_or_cross_owner_c
     );
     agent.resource(ResourceCommand::Release { owner }).unwrap();
     assert!(agent.is_publishing(&sender));
+}
+
+#[test]
+fn owned_publication_relabel_replaces_the_wire_session_and_fences_the_new_source() {
+    let mut agent = Agent::new(config()).unwrap();
+    let camera = TrackSpec::Video {
+        label: "camera".into(),
+    };
+    let ResourceResult::Publication {
+        owner,
+        slot,
+        after_generation,
+    } = agent
+        .resource(ResourceCommand::ClaimPublication { spec: camera })
+        .unwrap()
+    else {
+        panic!("camera owner")
+    };
+    assert_eq!(after_generation, None);
+    agent
+        .resource(ResourceCommand::UpdatePublication {
+            owner,
+            present: true,
+        })
+        .unwrap();
+
+    let channel = channel(21);
+    let (generation, request) = begin_connect(
+        &mut agent,
+        DesiredState {
+            revision: 1,
+            connected: true,
+            ..DesiredState::default()
+        },
+        channel,
+    );
+    let signal = finish_connect(&mut agent, generation, request, channel);
+    acknowledge_send(&mut agent, generation, channel, signal);
+
+    agent.resource(ResourceCommand::Release { owner }).unwrap();
+    let omitted = match next_effect(&mut agent) {
+        Effect::DataChannel(DataChannelEffect::Send {
+            operation,
+            generation: actual,
+            channel: actual_channel,
+            payload,
+            ..
+        }) => {
+            assert_eq!(actual, generation);
+            assert_eq!(actual_channel, channel);
+            assert!(decode_intent(&payload).send.unwrap().tracks.is_empty());
+            operation
+        }
+        effect => panic!("expected publication withdrawal, got {effect:?}"),
+    };
+    acknowledge_send(&mut agent, generation, channel, omitted);
+
+    let ResourceResult::Publication {
+        owner: replacement,
+        slot: reused,
+        after_generation,
+    } = agent
+        .resource(ResourceCommand::ClaimPublication {
+            spec: TrackSpec::Video {
+                label: "screen".into(),
+            },
+        })
+        .unwrap()
+    else {
+        panic!("screen owner")
+    };
+    assert_eq!(reused, slot);
+    assert_eq!(after_generation, Some(generation));
+    agent
+        .resource(ResourceCommand::UpdatePublication {
+            owner: replacement,
+            present: true,
+        })
+        .unwrap();
+
+    let next_generation = match next_effect(&mut agent) {
+        Effect::Rtc(RtcEffect::CreateOffer {
+            generation: next, ..
+        }) => next,
+        effect => panic!("expected fresh wire session, got {effect:?}"),
+    };
+    assert_ne!(next_generation, generation);
+    assert!(
+        agent.next_effect().is_none(),
+        "relabel must not reach the bound session"
+    );
 }
 
 #[test]

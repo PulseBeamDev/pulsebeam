@@ -27,9 +27,10 @@ use std::time::Instant;
 
 mod histories;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub enum Role {
     Publisher,
+    OwnedPublisher,
     Subscriber,
     /// Data-channel-only participant: no video tracks added.
     DataOnly,
@@ -78,6 +79,12 @@ pub struct Participant {
 }
 
 impl Participant {
+    pub fn owned_publisher(name: &'static str) -> Self {
+        let mut participant = Self::single_publisher(name);
+        participant.role = Role::OwnedPublisher;
+        participant
+    }
+
     pub fn publisher(name: &'static str, rids: &[&'static str]) -> Self {
         Self {
             name,
@@ -513,6 +520,11 @@ pub enum Step {
         participant: &'static str,
         subscriptions: Vec<VideoSubscription>,
     },
+    RelabelOwnedVideo {
+        description: &'static str,
+        participant: &'static str,
+        label: &'static str,
+    },
     /// Subscribe to specific participants by name, at the given heights.
     ///
     /// Prefer this over [`Step::SubscribeAll`] whenever *which* track gets which height matters.
@@ -625,6 +637,12 @@ pub enum Step {
         publisher: &'static str,
         min_frames: u64,
         min_resolution: (usize, usize),
+    },
+    CheckVideoDecodedPublication {
+        description: &'static str,
+        participant: &'static str,
+        publisher: &'static str,
+        min_frames: u64,
     },
     /// Independently decoded video from this origin during the last measurement window.
     CheckVideoDecodedFromInterval {
@@ -986,6 +1004,7 @@ enum ParticipantCmd {
 #[derive(Clone)]
 enum PendingDriverOp {
     SetSubscriptions(Vec<VideoSubscription>),
+    RelabelOwnedVideo(String),
     DeclarePublishTopic(String, TopicMode),
     DeclareSubscribeTopic(String, TopicMode),
     PublishData(String, TopicMode, Vec<u8>),
@@ -1065,7 +1084,7 @@ impl OperationQueue {
                     self.intent.topics.subscribers.push(registration);
                 }
             }
-            PendingDriverOp::PublishData(..) => {}
+            PendingDriverOp::RelabelOwnedVideo(_) | PendingDriverOp::PublishData(..) => {}
         }
         self.pending.push((self.sequence, operation));
         self.sequence
@@ -1131,6 +1150,7 @@ struct ParticipantShared {
     topic_events: Mutex<HashMap<String, Vec<TopicNotification>>>,
     /// Remote video tracks discovered via signaling (track IDs).
     discovered_tracks: Mutex<HashSet<String>>,
+    video_label: Mutex<String>,
 }
 
 impl ParticipantShared {
@@ -1159,6 +1179,7 @@ impl ParticipantShared {
             pending_ops: Mutex::new(OperationQueue::new(topics)),
             topic_events: Mutex::new(HashMap::new()),
             discovered_tracks: Mutex::new(HashSet::new()),
+            video_label: Mutex::new("video".into()),
         }
     }
 }
@@ -1297,6 +1318,9 @@ async fn run_participant(
     }
 
     loop {
+        if matches!(config.role, Role::OwnedPublisher) {
+            *shared.video_label.lock().unwrap() = "video".into();
+        }
         let mut builder = if tcp_only {
             SimClientBuilder::bind_tcp(ip, server_ip).await?
         } else {
@@ -1317,8 +1341,10 @@ async fn run_participant(
             builder = builder.without_dependency_descriptor();
         }
         match config.role {
-            Role::Publisher => {
-                if let Some((source, layer)) = config.quality_video {
+            Role::Publisher | Role::OwnedPublisher => {
+                if matches!(config.role, Role::OwnedPublisher) {
+                    builder = builder.publish_owned_video("video");
+                } else if let Some((source, layer)) = config.quality_video {
                     builder = builder.publish_quality_video(source, layer);
                 } else {
                     let layers = (!config.rids.is_empty()).then(|| {
@@ -1405,6 +1431,11 @@ async fn run_participant(
                                     priority: subscription.priority,
                                 }).collect(), sequence)
                                 .await?,
+                            PendingDriverOp::RelabelOwnedVideo(label) => {
+                                let complete = client.ctx.relabel_owned_video(label.clone()).await?;
+                                if complete { *shared.video_label.lock().unwrap() = label; }
+                                complete
+                            }
                             PendingDriverOp::DeclarePublishTopic(topic, mode) => {
                                 client.ctx.register_publisher(topic, mode).await?
                             }
@@ -1510,6 +1541,7 @@ fn step_name(step: &Step) -> &'static str {
         Step::AbruptExit { .. } => "AbruptExit",
         Step::Reconnect { .. } => "Reconnect",
         Step::SetSubscriptions { .. } => "SetSubscriptions",
+        Step::RelabelOwnedVideo { .. } => "RelabelOwnedVideo",
         Step::SubscribeAll { .. } => "SubscribeAll",
         Step::SubscribeTo { .. } => "SubscribeTo",
         Step::SubscribeToQos { .. } => "SubscribeToQos",
@@ -1521,6 +1553,7 @@ fn step_name(step: &Step) -> &'static str {
         Step::CheckVideoNotReceivedFrom { .. } => "CheckVideoNotReceivedFrom",
         Step::CheckVideoReceivedFrom { .. } => "CheckVideoReceivedFrom",
         Step::CheckVideoDecodedFrom { .. } => "CheckVideoDecodedFrom",
+        Step::CheckVideoDecodedPublication { .. } => "CheckVideoDecodedPublication",
         Step::CheckVideoDecodedFromInterval { .. } => "CheckVideoDecodedFromInterval",
         Step::CheckVideoNotRenderedFrom { .. } => "CheckVideoNotRenderedFrom",
         Step::CheckKeyframeRequests { .. } => "CheckKeyframeRequests",
@@ -2183,6 +2216,23 @@ async fn execute_plan(
                     .push(PendingDriverOp::SetSubscriptions(subscriptions.clone()));
             }
 
+            Step::RelabelOwnedVideo {
+                description,
+                participant,
+                label,
+            } => {
+                tracing::info!(
+                    "[step {n}/{total}: {kind}] \"{description}\" ({participant}, label={label})"
+                );
+                let handle = get_handle(handles, participant, description)?;
+                handle
+                    .shared
+                    .pending_ops
+                    .lock()
+                    .unwrap()
+                    .push(PendingDriverOp::RelabelOwnedVideo((*label).into()));
+            }
+
             Step::SubscribeTo {
                 description,
                 participant,
@@ -2506,6 +2556,41 @@ async fn execute_plan(
                 assert!(
                     actual >= *min_frames,
                     "step {n}/{total} {kind}: {description} ({participant} <- {publisher}): expected at least {min_frames} frames from participant_id {publisher_id}, got {actual}"
+                );
+            }
+
+            Step::CheckVideoDecodedPublication {
+                description,
+                participant,
+                publisher,
+                min_frames,
+            } => {
+                let publisher = handles.get(publisher).ok_or_else(|| {
+                    anyhow::anyhow!("step \"{description}\": unknown publisher {publisher}")
+                })?;
+                let connection = publisher
+                    .shared
+                    .observation
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .and_then(|observation| observation.admission)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("step \"{description}\": publisher has no admission")
+                    })?;
+                let label = publisher.shared.video_label.lock().unwrap().clone();
+                let track_id = connection
+                    .derive_track_id(pulsebeam::entity::TrackKind::Video, &label)
+                    .as_str();
+                let actual = get_handle(handles, participant, description)?
+                    .video_rx()
+                    .decoded_by_track
+                    .get(&track_id)
+                    .copied()
+                    .unwrap_or(0);
+                assert!(
+                    actual >= *min_frames,
+                    "step {n}/{total} {kind}: {description} expected {min_frames} decoded frames from publication {track_id} ({label}), got {actual}"
                 );
             }
 
@@ -3605,6 +3690,7 @@ fn expected_state(handles: &PlanHandles) -> anyhow::Result<super::oracle::Contro
             id: id.parse()?,
             room: handle.room_name,
             video: handle.publishes_video,
+            video_label: handle.shared.video_label.lock().unwrap().clone(),
             audio: handle.publishes_audio,
             required: handle.present,
             video_targets: HashSet::new(),
@@ -3640,7 +3726,7 @@ fn expected_state(handles: &PlanHandles) -> anyhow::Result<super::oracle::Contro
                         .iter()
                         .find(|peer| peer.id.as_str() == id)
                         .expect("admitted video publisher");
-                    peer.track_id(pulsebeam::entity::TrackKind::Video, "video")
+                    peer.track_id(pulsebeam::entity::TrackKind::Video, &peer.video_label)
                 })
                 .collect()
         })
@@ -3681,7 +3767,7 @@ fn planned_video(
                 participants.iter().any(|peer| {
                     peer.id.as_str() == request.participant_id
                         && peer
-                            .track_id(pulsebeam::entity::TrackKind::Video, "video")
+                            .track_id(pulsebeam::entity::TrackKind::Video, &peer.video_label)
                             .as_str()
                             == *id
                 })
@@ -5267,8 +5353,11 @@ impl LocalNodeSim {
                         subscribed_at: None,
                         interval_video_baseline: VideoReceiveStats::default(),
                         interval_decoded_video_baseline: BTreeMap::new(),
-                        publishes_video: matches!(participant.role, Role::Publisher)
-                            || participant.subscribes && !participant.rids.is_empty(),
+                        publishes_video: matches!(
+                            participant.role,
+                            Role::Publisher | Role::OwnedPublisher
+                        ) || participant.subscribes
+                            && !participant.rids.is_empty(),
                         publishes_audio: participant.audio_level_dbov.is_some(),
                         quality_video: participant.quality_video,
                         observes_video: participant.slots > 0 || participant.subscribes,

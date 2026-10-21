@@ -314,9 +314,18 @@ pub enum ResourceCommand {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ResourceResult {
-    Publication { owner: u64, slot: String },
-    Owned { owner: u64 },
-    Event { event: Option<DataEvent> },
+    Publication {
+        owner: u64,
+        slot: String,
+        /// Earlier sessions retain an incompatible wire binding for this slot.
+        after_generation: Option<crate::Generation>,
+    },
+    Owned {
+        owner: u64,
+    },
+    Event {
+        event: Option<DataEvent>,
+    },
     Updated,
 }
 

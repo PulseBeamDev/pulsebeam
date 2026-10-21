@@ -5,8 +5,8 @@ use http_body_util::{BodyExt, Full};
 use hyper_util::{client::legacy::Client, rt::TokioExecutor};
 use pulsebeam_agent_native::agent_core::{
     AgentConfig, AudioSubscription, ConnectionState, DesiredState, MediaKind, MediaTopology,
-    PublicationIntent, TopicMode, TopicNotification, TopicPublisher, TopicSend, TopicSubscriber,
-    VideoSubscription,
+    PublicationIntent, ResourceCommand, ResourceResult, TopicMode, TopicNotification,
+    TopicPublisher, TopicSend, TopicSubscriber, TrackSpec, VideoSubscription,
 };
 use pulsebeam_agent_native::{Agent, AgentEvent, Config, Host, MediaFrame, SimulcastLayer};
 use pulsebeam_core::identity::{ParticipantExternalId, RoomExternalId};
@@ -36,6 +36,7 @@ pub struct SimClientBuilder {
     video_rx: Option<Arc<Mutex<VideoReceiveLog>>>,
     audio_rx: Option<Arc<Mutex<AudioReceiveLog>>>,
     publishes_video: bool,
+    owned_video_label: Option<String>,
     /// When set, publish with a variable-bitrate source instead of the constant-rate looper.
     vbr_profile: Option<VbrProfile>,
     /// When set, attach a synthetic L1T{n} temporal Dependency Descriptor per frame.
@@ -168,6 +169,7 @@ impl SimClientBuilder {
             video_rx: None,
             audio_rx: None,
             publishes_video: false,
+            owned_video_label: None,
             vbr_profile: None,
             temporal_dd: None,
             audio_level_dbov: None,
@@ -195,6 +197,12 @@ impl SimClientBuilder {
     pub fn publish_video(mut self, simulcast_layers: Option<Vec<SimulcastLayer>>) -> Self {
         self.video_layers = simulcast_layers;
         self.publishes_video = true;
+        self
+    }
+
+    pub fn publish_owned_video(mut self, label: &str) -> Self {
+        self.publishes_video = true;
+        self.owned_video_label = Some(label.into());
         self
     }
 
@@ -355,11 +363,32 @@ impl SimClientBuilder {
         }
 
         let agent = Agent::spawn(config, self.host).await?;
+        let owned_video = if let Some(label) = &self.owned_video_label {
+            let ResourceResult::Publication { owner, slot, .. } = agent
+                .resource(ResourceCommand::ClaimPublication {
+                    spec: TrackSpec::Video {
+                        label: label.clone(),
+                    },
+                })
+                .await?
+            else {
+                anyhow::bail!("owned video claim returned the wrong resource")
+            };
+            anyhow::ensure!(slot == "v0", "owned video did not receive v0");
+            agent
+                .resource(ResourceCommand::UpdatePublication {
+                    owner,
+                    present: true,
+                })
+                .await?;
+            Some(owner)
+        } else {
+            None
+        };
         let desired = DesiredState {
             revision: 1,
             connected: true,
-            publications: self
-                .publishes_video
+            publications: (self.publishes_video && self.owned_video_label.is_none())
                 .then(|| PublicationIntent {
                     slot: "v0".into(),
                     label: "video".into(),
@@ -441,6 +470,7 @@ impl SimClientBuilder {
                 snapshots
             },
             events: agent.events(),
+            owned_video,
         };
         let mut join_set = JoinSet::new();
 
@@ -547,6 +577,7 @@ impl SimClientBuilder {
 pub struct VideoReceiveLog {
     pub by_publisher: BTreeMap<String, u64>,
     pub decoded_by_publisher: BTreeMap<String, DecodedVideoStream>,
+    pub decoded_by_track: BTreeMap<String, u64>,
     pub frames: u64,
     pub keyframes: u64,
     pub non_contiguous: u64,
@@ -1124,10 +1155,11 @@ fn record_video_frame(
     quality_references: &Arc<Mutex<BTreeMap<String, &'static QualityVideoReference>>>,
     decoder: &mut H264ReferenceDecoder,
     decoder_ready: &mut bool,
-    publisher: &str,
+    identity: (&str, &str),
     frame: MediaFrame,
     corrupt_payload: bool,
 ) {
+    let (publisher, track_id) = identity;
     log.lock().unwrap().record(publisher, &frame);
     if !frame.contiguous {
         *decoder_ready = false;
@@ -1171,14 +1203,18 @@ fn record_video_frame(
     );
     let decoded_ok = decode_result.is_ok();
     match decode_result {
-        Ok(observation) => log.lock().unwrap().record_decoded(
-            publisher,
-            observation.width,
-            observation.height,
-            observation.reference_error,
-            is_keyframe,
-            reference.map(|(_, source, layer)| (source, layer)),
-        ),
+        Ok(observation) => {
+            let mut log = log.lock().unwrap();
+            log.record_decoded(
+                publisher,
+                observation.width,
+                observation.height,
+                observation.reference_error,
+                is_keyframe,
+                reference.map(|(_, source, layer)| (source, layer)),
+            );
+            *log.decoded_by_track.entry(track_id.into()).or_default() += 1;
+        }
         Err(DecodeError::Decoder(_)) | Err(DecodeError::ReferenceMismatch(_)) => {
             log.lock()
                 .unwrap()
@@ -1271,7 +1307,7 @@ mod tests {
             &references,
             &mut decoder,
             &mut decoder_ready,
-            "source",
+            ("source", "track"),
             frame,
             false,
         );
@@ -1388,6 +1424,7 @@ pub struct ClientContext {
     pub media_kinds: HashMap<String, (bool, bool)>,
     snapshots: tokio::sync::watch::Receiver<pulsebeam_agent_native::agent_core::Snapshot>,
     events: tokio::sync::broadcast::Receiver<AgentEvent>,
+    owned_video: Option<u64>,
 }
 
 impl ClientContext {
@@ -1498,6 +1535,34 @@ impl ClientContext {
             }
         }
         self.sync_video_desired(&snapshot).await.map(|_| ())
+    }
+
+    pub async fn relabel_owned_video(&mut self, label: String) -> anyhow::Result<bool> {
+        let owner = self
+            .owned_video
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("participant has no owned video"))?;
+        self.agent
+            .resource(ResourceCommand::Release { owner })
+            .await?;
+        let ResourceResult::Publication { owner, slot, .. } = self
+            .agent
+            .resource(ResourceCommand::ClaimPublication {
+                spec: TrackSpec::Video { label },
+            })
+            .await?
+        else {
+            anyhow::bail!("replacement video claim returned the wrong resource")
+        };
+        anyhow::ensure!(slot == "v0", "replacement video did not reuse v0");
+        self.agent
+            .resource(ResourceCommand::UpdatePublication {
+                owner,
+                present: true,
+            })
+            .await?;
+        self.owned_video = Some(owner);
+        Ok(true)
     }
 
     pub async fn set_video_subscriptions(
@@ -1781,7 +1846,7 @@ fn spawn_video_receiver(
                     &references,
                     &mut stream.decoder,
                     &mut stream.decoder_ready,
-                    &publisher,
+                    (&publisher, &track_id),
                     frame,
                     corrupt,
                 );

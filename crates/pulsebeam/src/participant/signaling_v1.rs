@@ -888,6 +888,44 @@ mod tests {
             upstream.track_for_sender_index(0),
             Some(connection.derive_track_id(TrackKind::Audio, "mic"))
         );
+        assert!(matches!(
+            session.apply_input(&encode(3, vec![]), &media(), 0, &mut upstream),
+            Ok(AppliedInput::Intent { published, .. }) if published.is_empty()
+        ));
+        assert!(matches!(
+            session.apply_input(
+                &encode(4, vec![track(0, WireTrackKind::Audio, "speaker")]),
+                &media(),
+                0,
+                &mut upstream,
+            ),
+            Err(InputError::Intent {
+                revision: 4,
+                cause: IntentError::SendBinding(SendBindingError::RelabeledSender),
+            })
+        ));
+        assert_eq!(session.intents.revision(), 3);
+
+        let next_connection = crate::entity::ConnectionId::new();
+        let mut next_upstream = super::super::upstream::Upstream::new(ctx, next_connection);
+        let mid = str0m::media::Mid::from("a");
+        let (next_track, descriptor) =
+            crate::track::test_utils::make_audio_track(publisher, next_connection, mid);
+        assert!(next_upstream.add_published_track(0, mid, next_track, descriptor));
+        let mut next_session = NativeSession::default();
+        assert!(matches!(
+            next_session.apply_input(
+                &encode(1, vec![track(0, WireTrackKind::Audio, "speaker")]),
+                &media(),
+                0,
+                &mut next_upstream,
+            ),
+            Ok(AppliedInput::Intent { published, .. }) if published.len() == 1
+        ));
+        assert_eq!(
+            next_upstream.track_for_sender_index(0),
+            Some(next_connection.derive_track_id(TrackKind::Audio, "speaker"))
+        );
     }
 
     #[test]

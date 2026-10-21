@@ -15,6 +15,7 @@ pub struct ExpectedParticipant {
     pub id: ParticipantId,
     pub room: &'static str,
     pub video: bool,
+    pub video_label: String,
     pub audio: bool,
     pub required: bool,
     pub connection: Option<ConnectionId>,
@@ -76,7 +77,12 @@ impl ExpectedParticipant {
 
     fn publications(&self) -> impl Iterator<Item = Publication> + '_ {
         [
-            (self.video, TrackKind::Video, MediaKind::Video, "video"),
+            (
+                self.video,
+                TrackKind::Video,
+                MediaKind::Video,
+                self.video_label.as_str(),
+            ),
             (self.audio, TrackKind::Audio, MediaKind::Audio, "audio"),
         ]
         .into_iter()
@@ -263,7 +269,7 @@ impl ControlStateOracle {
                     .iter()
                     .find(|peer| peer.id == participant)
                     .ok_or_else(|| anyhow::anyhow!("requested video has no plan participant"))?;
-                Ok(peer.track_id(TrackKind::Video, "video").as_str())
+                Ok(peer.track_id(TrackKind::Video, &peer.video_label).as_str())
             })
             .collect::<Result<BTreeSet<_>>>()?;
         let desired_video = accepted

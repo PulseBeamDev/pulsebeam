@@ -139,7 +139,7 @@ pub(super) fn command(value: JsValue) -> Result<ResourceCommand, JsValue> {
 
 pub(super) fn result(value: ResourceResult) -> JsValue {
     match value {
-        ResourceResult::Publication { owner, slot } => {
+        ResourceResult::Publication { owner, slot, .. } => {
             let value = Object::new();
             set(&value, "owner", BigInt::from(owner));
             set(&value, "slot", slot);

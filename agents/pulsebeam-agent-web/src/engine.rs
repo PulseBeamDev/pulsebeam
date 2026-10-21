@@ -154,7 +154,8 @@ pub(crate) trait Host {
     fn execute_effect(&self, effect: Effect);
     fn host_failed(&self, failure: &Failure);
     fn shutdown(&self);
-    fn publication_claimed(&self, _owner: u64, _slot: &str) {}
+    fn publication_claimed(&self, _owner: u64, _slot: &str, _after_generation: Option<Generation>) {
+    }
     fn resource_released(&self, _owner: u64) {}
 }
 
@@ -533,8 +534,14 @@ impl<H: Host> Actor<H> {
                     _ => None,
                 };
                 let (result, turn) = self.driver.resource(command);
-                if let Ok(agent_core::ResourceResult::Publication { owner, slot }) = &result {
-                    self.host.publication_claimed(*owner, slot);
+                if let Ok(agent_core::ResourceResult::Publication {
+                    owner,
+                    slot,
+                    after_generation,
+                }) = &result
+                {
+                    self.host
+                        .publication_claimed(*owner, slot, *after_generation);
                 }
                 if let Some(owner) = release {
                     self.host.resource_released(owner);

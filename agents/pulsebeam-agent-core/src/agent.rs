@@ -94,6 +94,7 @@ struct Session {
     coordinates: BTreeMap<MediaSlot, SlotBinding>,
     observed: CatalogState,
     intent_revision: u64,
+    publication_bindings: BTreeMap<String, String>,
     authorization_expires_at: Option<i64>,
     pending_renewal: Option<String>,
     renewal_send: Option<OperationId>,
@@ -350,6 +351,7 @@ impl Agent {
                         _ => None,
                     })
                     .collect();
+                let label = spec.label().to_owned();
                 let owner = self.resources.new_owner()?;
                 let slot = self.resources.claim_publication(
                     owner,
@@ -357,9 +359,20 @@ impl Agent {
                     &self.config.topology,
                     &occupied,
                 )?;
+                let after_generation = self
+                    .active
+                    .as_ref()
+                    .filter(|session| {
+                        session
+                            .publication_bindings
+                            .get(&slot)
+                            .is_some_and(|bound| bound != &label)
+                    })
+                    .map(|session| session.generation);
                 ResourceResult::Publication {
                     owner: owner.id(),
                     slot,
+                    after_generation,
                 }
             }
             ResourceCommand::UpdatePublication { owner, present } => {
@@ -1499,6 +1512,7 @@ impl Agent {
             coordinates,
             observed: CatalogState::default(),
             intent_revision: 0,
+            publication_bindings: BTreeMap::new(),
             authorization_expires_at: None,
             pending_renewal: None,
             renewal_send: None,
@@ -1689,7 +1703,28 @@ impl Agent {
         });
     }
 
+    fn publication_handoff_required(&self) -> bool {
+        self.active.as_ref().is_some_and(|session| {
+            self.desired.publications.iter().any(|publication| {
+                session
+                    .publication_bindings
+                    .get(&publication.slot)
+                    .is_some_and(|label| label != &publication.label)
+            })
+        })
+    }
+
     fn send_intent_if_ready(&mut self) {
+        if self.publication_handoff_required() {
+            if self.desired.connected
+                && self.closing.is_none()
+                && self.attempt.is_none()
+                && self.retry.is_none()
+            {
+                self.start_attempt(AttemptMode::Replace);
+            }
+            return;
+        }
         if self.snapshot.terminal_failure.is_some()
             || !self.intent_dirty
             || self.pending_signal.is_some()
@@ -1733,6 +1768,13 @@ impl Agent {
                 return;
             }
         };
+        // The SFU retains sender-index labels even when a later intent omits them.
+        active.publication_bindings.extend(
+            desired
+                .publications
+                .iter()
+                .map(|publication| (publication.slot.clone(), publication.label.clone())),
+        );
         active.intent_revision = revision;
         let operation = self.ids.operation();
         let generation = active.generation;

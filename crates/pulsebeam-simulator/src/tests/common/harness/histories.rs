@@ -74,6 +74,7 @@ impl Transition {
                 id: id.parse()?,
                 room: handle.room_name,
                 video: handle.publishes_video,
+                video_label: handle.shared.video_label.lock().unwrap().clone(),
                 audio: handle.publishes_audio,
                 required: true,
                 connection: Some(connection),

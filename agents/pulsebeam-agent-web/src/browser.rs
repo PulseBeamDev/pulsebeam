@@ -263,6 +263,13 @@ struct LocalTrackState {
     track: MediaStreamTrack,
     config: SenderConfig,
     source_id: String,
+    after_generation: Option<Generation>,
+}
+
+#[derive(Clone)]
+struct PublicationSlot {
+    slot: String,
+    after_generation: Option<Generation>,
 }
 
 impl DesiredConfig {
@@ -429,14 +436,17 @@ impl Host for BrowserHost {
         inner.shutdown();
     }
 
-    fn publication_claimed(&self, owner: u64, slot: &str) {
+    fn publication_claimed(&self, owner: u64, slot: &str, after_generation: Option<Generation>) {
         let Some(inner) = self.inner.upgrade() else {
             return;
         };
-        inner
-            .publication_slots
-            .borrow_mut()
-            .insert(owner, slot.into());
+        inner.publication_slots.borrow_mut().insert(
+            owner,
+            PublicationSlot {
+                slot: slot.into(),
+                after_generation,
+            },
+        );
         inner.invalidate_local_slot(slot);
     }
 
@@ -446,7 +456,7 @@ impl Host for BrowserHost {
         };
         let slot = inner.publication_slots.borrow_mut().remove(&owner);
         if let Some(slot) = slot {
-            inner.invalidate_local_slot(&slot);
+            inner.invalidate_local_slot(&slot.slot);
         }
     }
 }
@@ -459,7 +469,7 @@ struct RuntimeInner {
     local_tracks: RefCell<BTreeMap<String, LocalTrackState>>,
     local_muted: RefCell<BTreeMap<String, bool>>,
     local_source_revisions: RefCell<BTreeMap<String, u64>>,
-    publication_slots: RefCell<BTreeMap<u64, String>>,
+    publication_slots: RefCell<BTreeMap<u64, PublicationSlot>>,
     peers: RefCell<BTreeMap<u64, Peer>>,
     requests: RefCell<BTreeMap<u64, AbortController>>,
     timers: RefCell<BTreeMap<u64, TimerHandle>>,
@@ -933,7 +943,7 @@ impl RuntimeInner {
         self.publication_slots
             .borrow()
             .get(&owner)
-            .cloned()
+            .map(|binding| binding.slot.clone())
             .ok_or_else(|| {
                 resources::error(agent_core::AgentError::InvalidResource(
                     agent_core::TrackResourceError::Released,
@@ -1060,6 +1070,12 @@ impl RuntimeInner {
                     track,
                     config,
                     source_id,
+                    after_generation: owner.and_then(|owner| {
+                        self.publication_slots
+                            .borrow()
+                            .get(&owner)
+                            .and_then(|binding| binding.after_generation)
+                    }),
                 },
             )
         } else {
@@ -1101,23 +1117,33 @@ impl RuntimeInner {
     async fn sync_local_slot(&self, slot: &str) -> Result<(), String> {
         let revision = self.local_source_revisions.borrow().get(slot).copied();
         let state = self.local_tracks.borrow().get(slot).cloned();
-        let senders: Vec<RtcRtpSender> = self
+        let senders: Vec<(u64, RtcRtpSender)> = self
             .peers
             .borrow()
-            .values()
-            .flat_map(|peer| &peer.transceivers)
-            .filter_map(|(media_slot, transceiver)| match media_slot {
-                MediaSlot::LocalVideo(name) | MediaSlot::LocalAudio(name) if name == slot => {
-                    Some(transceiver.sender())
-                }
-                _ => None,
+            .iter()
+            .flat_map(|(generation, peer)| {
+                peer.transceivers
+                    .iter()
+                    .filter_map(move |(media_slot, transceiver)| match media_slot {
+                        MediaSlot::LocalVideo(name) | MediaSlot::LocalAudio(name)
+                            if name == slot =>
+                        {
+                            Some((*generation, transceiver.sender()))
+                        }
+                        _ => None,
+                    })
             })
             .collect();
-        for sender in senders {
+        for (generation, sender) in senders {
             if self.local_source_revisions.borrow().get(slot).copied() != revision {
                 return Ok(());
             }
-            let result = apply_sender_state(&self.logger, &sender, state.as_ref()).await;
+            let eligible = state.as_ref().filter(|state| {
+                state
+                    .after_generation
+                    .is_none_or(|after| generation > after.get())
+            });
+            let result = apply_sender_state(&self.logger, &sender, eligible).await;
             if self.local_source_revisions.borrow().get(slot).copied() != revision {
                 return Ok(());
             }

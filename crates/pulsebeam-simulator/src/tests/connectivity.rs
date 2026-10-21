@@ -95,6 +95,44 @@ fn simulation_test() {
 }
 
 #[test]
+fn owned_publication_relabel_uses_a_fresh_wire_session() {
+    LocalNodeSim::new()
+        .with_room(
+            Room::new("owned-relabel")
+                .with_participant(Participant::owned_publisher("alice"))
+                .with_participant(Participant::subscriber("bob")),
+        )
+        .run(vec![
+            Step::Run {
+                description: "connect owned publisher and subscriber",
+                duration: Duration::from_secs(10),
+            },
+            Step::WaitForVideo {
+                description: "initial owned publication reaches Bob",
+                participant: "bob",
+                publishers: &["alice"],
+                min_quality: 1,
+                timeout: Duration::from_secs(20),
+            },
+            Step::RelabelOwnedVideo {
+                description: "release camera and reuse v0 for screen",
+                participant: "alice",
+                label: "screen",
+            },
+            Step::Run {
+                description: "fresh session publishes the relabeled source",
+                duration: Duration::from_secs(20),
+            },
+            Step::CheckVideoDecodedPublication {
+                description: "Bob decodes the relabeled publication",
+                participant: "bob",
+                publisher: "alice",
+                min_frames: 25,
+            },
+        ]);
+}
+
+#[test]
 fn tcp_simulation_test() {
     LocalNodeSim::new()
         .with_tcp_only()

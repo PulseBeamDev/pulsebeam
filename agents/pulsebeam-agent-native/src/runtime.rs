@@ -124,6 +124,11 @@ pub struct SimulationObservation {
 enum Command {
     #[cfg(feature = "sim")]
     SimulationObservation(oneshot::Sender<SimulationObservation>),
+    #[cfg(feature = "sim")]
+    Resource {
+        command: agent_core::ResourceCommand,
+        response: oneshot::Sender<Result<agent_core::ResourceResult, Error>>,
+    },
     ReplaceDesired {
         desired: DesiredState,
         response: oneshot::Sender<Result<(), Error>>,
@@ -210,6 +215,19 @@ impl Agent {
             statistics,
             events,
         })
+    }
+
+    #[cfg(feature = "sim")]
+    pub async fn resource(
+        &self,
+        command: agent_core::ResourceCommand,
+    ) -> Result<agent_core::ResourceResult, Error> {
+        let (response, result) = oneshot::channel();
+        self.commands
+            .send(Command::Resource { command, response })
+            .await
+            .map_err(|_| Error::Closed)?;
+        result.await.map_err(|_| Error::Closed)?
     }
 
     pub async fn replace_desired(&self, desired: DesiredState) -> Result<(), Error> {
@@ -805,6 +823,11 @@ impl Actor {
                     sent_intent_revision: self.core.simulation_sent_intent_revision(),
                     media_indices,
                 });
+            }
+            #[cfg(feature = "sim")]
+            Command::Resource { command, response } => {
+                let result = self.core.resource(command).map_err(Error::Core);
+                let _ = response.send(result);
             }
             Command::ReplaceDesired { desired, response } => {
                 let result = self
