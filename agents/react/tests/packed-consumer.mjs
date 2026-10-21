@@ -29,9 +29,18 @@ writeFileSync(
   'export * from "@pulsebeam/react";',
 );
 const sdk = await import(pathToFileURL(join(directory, "consumer.mjs")));
-for (const name of ["useAgent", "useUserMedia", "Video"]) {
+for (const name of [
+  "useAgent",
+  "useDevices",
+  "useCapture",
+  "Publish",
+  "Data",
+  "Video",
+  "Audio",
+]) {
   assert.equal(typeof sdk[name], "function", name);
 }
+assert.equal(typeof sdk.track, "object", "track");
 assert.equal(
   "createAgent" in sdk,
   false,

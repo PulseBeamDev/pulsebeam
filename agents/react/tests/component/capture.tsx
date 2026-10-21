@@ -7,7 +7,7 @@ import {
   useMediaDevices,
   type UserMediaOptions,
   type DisplayMediaOptions,
-} from "../../src/index.js";
+} from "../../src/capture.js";
 import {
   captures,
   captureOptions,

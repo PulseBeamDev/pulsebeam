@@ -1,12 +1,13 @@
 import {
-  useAgent,
-  useUserMedia,
+  Audio,
+  Publish,
   Video,
+  track,
+  useAgent,
+  useCapture,
   type Agent,
   type AgentConfig,
   type PlaybackError,
-  type VideoSource,
-  type PublishableVideoSource,
   type VideoCaptureSettings,
 } from "@pulsebeam/react";
 
@@ -16,22 +17,16 @@ const config: AgentConfig = {
   topology: { localVideos: 1, localAudios: 1 },
 };
 const agent: Agent = useAgent(config);
-const camera = useUserMedia({ video: true, audio: false });
-const Camera = agent.local.video("camera");
-const publicationSource: PublishableVideoSource | null = camera.video;
-const settings: VideoCaptureSettings | undefined = camera.video?.settings;
-Camera({ source: publicationSource });
-const sources: readonly (VideoSource | null)[] = [
-  camera.video,
-  Camera,
-  agent.remote.participant("alice").video("camera"),
-];
-for (const source of sources) Video({ source });
-void settings;
+const capture = useCapture("device", { video: true, audio: false });
+const camera = agent.track(track.video("camera"));
+const settings: VideoCaptureSettings | undefined = capture.video?.settings;
+Publish({ track: camera, source: capture.video });
+Video({ source: capture.video });
 Video({
-  source: agent.remote.videoTracks[0] ?? null,
+  source: agent.remote.participant("alice").track(track.video("camera")),
   onPlaybackError: (failure: PlaybackError) => void failure.retry(),
 });
-void agent.remote.resumeAudio();
+Audio({ agent });
+void settings;
 agent.connect();
 agent.disconnect();

@@ -17,6 +17,18 @@ export class BrowserRuntime {
   nextOwner = 1n;
   videoOwners = new Map<bigint, { selector: any; observation?: any }>();
   videoSlots = new Map<string, number>();
+  publicationOwners = new Map<bigint, { key: string; slot: string }>();
+  claimedPublications = new Set<string>();
+  resourceCommands: any[] = [];
+  ownedReplacements: {
+    owner: bigint;
+    track: MediaStreamTrack | null;
+    config: any;
+  }[] = [];
+  ownedMuted = new Map<bigint, boolean>();
+  audioOwner?: bigint;
+  dataEvents: any[] = [];
+  dataOwners = new Set<bigint>();
   snapshot = {
     version: 1n,
     desiredRevision: 0n,
@@ -53,6 +65,7 @@ export class BrowserRuntime {
     this.recomputeVideo();
   }
   async resource(command: any) {
+    this.resourceCommands.push(command);
     if (command.op === "claimVideo") {
       const owner = this.nextOwner++;
       this.videoOwners.set(owner, { selector: command.selector });
@@ -65,13 +78,49 @@ export class BrowserRuntime {
       this.recomputeVideo();
       return { type: "updated" };
     }
+    if (command.op === "claimPublication") {
+      const key = `${command.spec.kind}:${command.spec.label}`;
+      if (this.claimedPublications.has(key)) {
+        const error = new Error("publication already has an owner") as Error & {
+          pulsebeamCode?: string;
+        };
+        error.pulsebeamCode = "ownership";
+        throw error;
+      }
+      const owner = this.nextOwner++;
+      const slot = `${command.spec.kind === "video" ? "v" : "a"}0`;
+      this.claimedPublications.add(key);
+      this.publicationOwners.set(owner, { key, slot });
+      return { owner, slot };
+    }
+    if (command.op === "receiveData") {
+      const owner = this.nextOwner++;
+      this.dataOwners.add(owner);
+      return { owner };
+    }
+    if (command.op === "readData") return this.dataEvents.shift() ?? null;
+    if (command.op === "claimAudio") {
+      if (this.audioOwner !== undefined) {
+        const error = new Error("audio already has an owner") as Error & {
+          pulsebeamCode?: string;
+        };
+        error.pulsebeamCode = "ownership";
+        throw error;
+      }
+      const owner = this.nextOwner++;
+      this.audioOwner = owner;
+      return { owner };
+    }
     if (command.op === "release") {
       this.videoOwners.delete(command.owner);
+      const publication = this.publicationOwners.get(command.owner);
+      if (publication) this.claimedPublications.delete(publication.key);
+      this.publicationOwners.delete(command.owner);
+      this.dataOwners.delete(command.owner);
+      if (this.audioOwner === command.owner) this.audioOwner = undefined;
       this.recomputeVideo();
       return { type: "released" };
     }
-    if (command.op === "claimAudio" || command.op === "claimPublication")
-      return { owner: this.nextOwner++ };
     if (command.op === "updatePublication") return { type: "updated" };
     throw new Error(`unsupported resource command ${command.op}`);
   }
@@ -130,6 +179,16 @@ export class BrowserRuntime {
   }
   set_log_level() {}
   async set_local_muted() {}
+  async replace_owned_track(
+    owner: bigint,
+    track: MediaStreamTrack | null,
+    config: any,
+  ) {
+    this.ownedReplacements.push({ owner, track, config });
+  }
+  async set_owned_muted(owner: bigint, muted: boolean) {
+    this.ownedMuted.set(owner, muted);
+  }
   async replace_local_track(slot: string, track: MediaStreamTrack | null) {
     await this.replaceCompletion;
     this.replacements.push({ slot, track });

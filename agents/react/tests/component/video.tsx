@@ -2,10 +2,11 @@ import assert from "node:assert/strict";
 import { useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
+  track,
   useAgent,
   Video,
   type Agent,
-  type VideoPreferences,
+  type ReceiveOptions,
 } from "../../src/index.js";
 import { flush } from "./platform.js";
 import { runtimes } from "./runtime.js";
@@ -14,8 +15,8 @@ export async function videoPreferences() {
   let agent!: Agent;
   let change!: (
     patch: Partial<{
-      first: VideoPreferences;
-      second: VideoPreferences;
+      first: ReceiveOptions;
+      second: ReceiveOptions;
       hide: boolean;
       remove: boolean;
       reverse: boolean;
@@ -45,32 +46,34 @@ export async function videoPreferences() {
         minHeight: 360,
         minFps: 15,
         priority: 1,
-        latency: { minMs: 100, maxMs: 200 },
-      } as VideoPreferences,
+        playoutDelay: { minMs: 100, maxMs: 200 },
+      } as ReceiveOptions,
       second: {
         minHeight: 720,
         minFps: 30,
         priority: 5,
-        latency: { minMs: 0, maxMs: 50 },
-      } as VideoPreferences,
+        playoutDelay: { minMs: 0, maxMs: 50 },
+      } as ReceiveOptions,
       hide: false,
       remove: false,
       reverse: false,
     });
     change = (patch) => setState((before) => ({ ...before, ...patch }));
-    const remote = agent.remote.participant("alice").video("camera");
+    const remote = agent.remote
+      .participant("alice")
+      .track(track.video("camera"));
     const views = [
       <Video
         key="one"
         source={remote}
-        preferences={state.first}
+        receive={state.first}
         data-size="small"
       />,
       !state.remove && (
         <Video
           key="two"
           source={remote}
-          preferences={state.second}
+          receive={state.second}
           hidden={state.hide}
           data-size="large"
         />
@@ -84,12 +87,9 @@ export async function videoPreferences() {
   try {
     await flush(() => root.render(<Room />));
     const runtime = runtimes.at(-1)!;
-    const remote = agent.remote.participant("alice").video("camera");
-    assert.equal(
-      "setReceiveOptions" in remote,
-      false,
-      "normal runtime handle has no competing imperative setter",
-    );
+    const remote = agent.remote
+      .participant("alice")
+      .track(track.video("camera"));
     assert.equal(
       "agent" in agent.remote,
       false,
@@ -140,7 +140,9 @@ export async function videoPreferences() {
       priority: 1,
       playoutDelay: { mode: "fixed", minMs: 100, maxMs: 200 },
     });
-    await flush(() => change({ first: { latency: { minMs: 0, maxMs: 0 } } }));
+    await flush(() =>
+      change({ first: { playoutDelay: { minMs: 0, maxMs: 0 } } }),
+    );
     assert.deepEqual(desired().playoutDelay, {
       mode: "fixed",
       minMs: 0,
@@ -162,7 +164,10 @@ export async function videoPreferences() {
       [],
       "detached presentation contributes no demand",
     );
-    assert.equal(agent.remote.participant("alice").video("camera"), remote);
+    assert.equal(
+      agent.remote.participant("alice").track(track.video("camera")),
+      remote,
+    );
   } finally {
     await flush(() => root.unmount());
     HTMLVideoElement.prototype.getBoundingClientRect = original;

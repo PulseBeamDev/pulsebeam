@@ -1,7 +1,12 @@
 import { createElement, useEffect, useRef } from "react";
 import type * as React from "react";
 import { useCommittedRef } from "./committed-ref.js";
-import { validateReceiveOptions } from "@pulsebeam/web";
+import {
+  attachRemoteVideo,
+  validateReceiveOptions,
+  type ReceiveOptions,
+} from "@pulsebeam/web";
+import { remoteVideo, type RemoteVideoTrack } from "./agent.js";
 import {
   attachVideoSource,
   type VideoAttachment,
@@ -15,20 +20,12 @@ export interface PlaybackError {
 
 type PlaybackErrorCallback = (failure: PlaybackError) => void;
 
-export interface VideoPreferences {
-  readonly minHeight?: number;
-  readonly minFps?: number;
-  readonly priority?: number;
-  /** Removing fixed bounds may remap media or recover the transport before defaults can apply. */
-  readonly latency?: { readonly minMs: number; readonly maxMs: number };
-}
-
 export type VideoProps = Omit<
   React.VideoHTMLAttributes<HTMLVideoElement>,
   "src" | "children"
 > & {
-  readonly source: VideoSource | null;
-  readonly preferences?: VideoPreferences;
+  readonly source: VideoSource | RemoteVideoTrack | null;
+  readonly receive?: ReceiveOptions;
   readonly mirror?: boolean;
   readonly onPlaybackError?: PlaybackErrorCallback;
 };
@@ -36,7 +33,7 @@ export type VideoProps = Omit<
 export function Video({
   source,
   mirror = false,
-  preferences,
+  receive,
   onPlaybackError,
   muted = true,
   autoPlay = true,
@@ -47,24 +44,25 @@ export function Video({
   const element = useRef<HTMLVideoElement>(null);
   const callback = useCommittedRef(onPlaybackError);
   const attachment = useRef<VideoAttachment | null>(null);
-  const receive = validateReceiveOptions({
-    minHeight: preferences?.minHeight,
-    minFps: preferences?.minFps,
-    priority: preferences?.priority,
-    ...(preferences?.latency ? { playoutDelay: preferences.latency } : {}),
-  });
-  const receiveKey = JSON.stringify(receive);
-  const committedReceive = useCommittedRef(receive);
+  const validatedReceive = validateReceiveOptions(receive ?? {});
+  const receiveKey = JSON.stringify(validatedReceive);
+  const committedReceive = useCommittedRef(validatedReceive);
 
   useEffect(() => {
     const current = element.current;
     if (!current || !source) return;
-    const active = attachVideoSource(
-      source,
-      current,
-      (error, retry) => callback.current?.({ error, retry }),
-      { autoPlay, preferences: committedReceive.current },
-    );
+    const report = (error: unknown, retry: () => Promise<void>) =>
+      callback.current?.({ error, retry });
+    const active =
+      "participantId" in source
+        ? attachRemoteVideo(remoteVideo(source), current, report, {
+            autoPlay,
+            preferences: committedReceive.current,
+          })
+        : attachVideoSource(source as VideoSource, current, report, {
+            autoPlay,
+            preferences: committedReceive.current,
+          });
     attachment.current = active;
     return () => {
       active.close();

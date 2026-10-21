@@ -1,23 +1,19 @@
 import assert from "node:assert/strict";
 import { StrictMode, useState } from "react";
 import { createRoot } from "react-dom/client";
-import {
-  Video,
-  useAgent,
-  useUserMedia,
-  useMediaDevices,
-} from "../../src/index.js";
+import { Publish, Video, track, useAgent } from "../../src/index.js";
+import { useUserMedia, useMediaDevices } from "../../src/capture.js";
 import { captures, deferred, flush, stream } from "./platform.js";
 import { runtimes } from "./runtime.js";
 import { concurrentRender } from "./concurrency.js";
 
 import { captureLifecycle } from "./capture.js";
-import { relationships } from "./relationships.js";
+import { ownershipAdapters } from "./ownership.js";
 import { videoPreferences } from "./video.js";
 
 await concurrentRender();
 await captureLifecycle();
-await relationships();
+await ownershipAdapters();
 await videoPreferences();
 
 let agent: ReturnType<typeof useAgent>;
@@ -35,15 +31,15 @@ function Room() {
   devicesReady = useMediaDevices().state === "ready";
   updateToken = () => setToken("renewed");
   replaceSession = () => setEndpoint("http://localhost/replacement");
-  const Camera = agent.local.video("camera");
+  const camera = agent.track(track.video("camera"));
   const [enabled, updateEnabled] = useState(true);
   setEnabled = updateEnabled;
   return (
     <section>
-      <Camera source={capture.video} enabled={enabled} />
+      <Publish track={camera} source={capture.video} enabled={enabled} />
       <output>{agent.connection}</output>
       <Video
-        source={Camera}
+        source={enabled ? capture.video : null}
         mirror
         onPlaybackError={(failure) => {
           playback = failure;

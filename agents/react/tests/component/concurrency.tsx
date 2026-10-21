@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { startTransition, Suspense, useLayoutEffect } from "react";
 import { createRoot } from "react-dom/client";
-import { useUserMedia, Video, type CaptureResult } from "../../src/index.js";
+import { Video } from "../../src/index.js";
+import { useUserMedia, type CaptureResult } from "../../src/capture.js";
 import { createCaptureSource } from "@pulsebeam/web";
 import { publishableVideoSource } from "../../src/sources.js";
 import { captures, deferred, flush, stream } from "./platform.js";

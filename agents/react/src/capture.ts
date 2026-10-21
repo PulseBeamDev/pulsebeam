@@ -392,7 +392,7 @@ function observe(
   return { device, settings } as VideoObservation | AudioObservation;
 }
 
-function useCapture(
+function useCaptureImpl(
   options: UserMediaOptions | DisplayMediaOptions,
   display: boolean,
 ): CaptureResult {
@@ -594,8 +594,115 @@ function useCapture(
 }
 
 export function useUserMedia(options: UserMediaOptions): CaptureResult {
-  return useCapture(options, false);
+  return useCaptureImpl(options, false);
 }
 export function useDisplayMedia(options: DisplayMediaOptions): CaptureResult {
-  return useCapture(options, true);
+  return useCaptureImpl(options, true);
+}
+
+export interface DevicesResult {
+  readonly cameras: readonly CameraDevice[];
+  readonly microphones: readonly MicrophoneDevice[];
+  readonly state: "loading" | "ready" | "error";
+  readonly error: MediaCaptureError | null;
+}
+
+export function useDevices(): DevicesResult {
+  const { cameras, microphones, state, error } = useMediaDevices();
+  return useMemo(
+    () => ({ cameras, microphones, state, error }),
+    [cameras, microphones, state, error],
+  );
+}
+
+export interface DeviceCapture {
+  readonly video:
+    | boolean
+    | {
+        readonly device?: CameraDevice;
+        readonly width?: number;
+        readonly height?: number;
+        readonly frameRate?: number;
+      };
+  readonly audio:
+    | boolean
+    | {
+        readonly device?: MicrophoneDevice;
+        readonly echoCancellation?: boolean;
+        readonly noiseSuppression?: boolean;
+        readonly autoGainControl?: boolean;
+      };
+}
+
+export interface DisplayCapture {
+  readonly video:
+    | true
+    | {
+        readonly width?: number;
+        readonly height?: number;
+        readonly frameRate?: number;
+      };
+  readonly audio: boolean;
+}
+
+export function useCapture(
+  source: "device",
+  options: DeviceCapture,
+): CaptureResult;
+export function useCapture(
+  source: "display",
+  options: DisplayCapture,
+): CaptureResult;
+export function useCapture(
+  source: "device" | "display",
+  options: DeviceCapture | DisplayCapture,
+): CaptureResult {
+  if (source === "display") {
+    const display = options as DisplayCapture;
+    const video = display.video;
+    return useCaptureImpl(
+      {
+        video:
+          video === true
+            ? true
+            : {
+                preferences: {
+                  width: video.width,
+                  height: video.height,
+                  frameRate: video.frameRate,
+                },
+              },
+        audio: display.audio,
+      },
+      true,
+    );
+  }
+  const device = options as DeviceCapture;
+  return useCaptureImpl(
+    {
+      video:
+        typeof device.video === "boolean"
+          ? device.video
+          : {
+              device: device.video.device,
+              preferences: {
+                width: device.video.width,
+                height: device.video.height,
+                frameRate: device.video.frameRate,
+              },
+            },
+      audio:
+        typeof device.audio === "boolean"
+          ? device.audio
+          : {
+              device: device.audio.device,
+              preferences: {
+                echoCancellation: device.audio.echoCancellation,
+                noiseSuppression: device.audio.noiseSuppression,
+                autoGainControl: device.audio.autoGainControl,
+              },
+            },
+    },
+    false,
+  );
 }
