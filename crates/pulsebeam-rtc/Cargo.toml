@@ -11,12 +11,12 @@ license.workspace = true
 [dependencies]
 bytes.workspace = true
 dcsctp = "=0.1.14"
-is = { git = "https://github.com/PulseBeamDev/str0m.git", branch = "patch/0.23.1" }
+is = { git = "https://github.com/algesten/str0m.git", rev = "120401c9affd97fd4246d9e7faf0ad4ca099c1bc" }
 p256 = { version = "0.13.2", default-features = false, features = ["ecdsa", "std"] }
 pulsebeam-core = { path = "../pulsebeam-core", default-features = false }
 rcgen = { version = "0.14.7", default-features = false, features = ["aws_lc_rs"] }
 sha2.workspace = true
-str0m = { git = "https://github.com/PulseBeamDev/str0m.git", branch = "patch/0.23.1", default-features = false, features = ["aws-lc-rs"] }
+str0m = { git = "https://github.com/algesten/str0m.git", rev = "120401c9affd97fd4246d9e7faf0ad4ca099c1bc", default-features = false, features = ["aws-lc-rs"] }
 thiserror.workspace = true
 
 [dev-dependencies]

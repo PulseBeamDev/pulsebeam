@@ -1,0 +1,1468 @@
+diff --git a/src/change/mod.rs b/src/change/mod.rs
+--- a/src/change/mod.rs
++++ b/src/change/mod.rs
+@@ -12,9 +12,9 @@
+ //! The direct API is a lower level API which typically can't be mixed with the SDP API. If you make
+ //! changes directly to the session, the remote side would not be aware of them unless you construct
+ //! some "other way" keeping the two peers in sync.
+-mod sdp;
+-pub(crate) use sdp::AddMedia;
++pub mod sdp;
++pub use sdp::AddMedia;
+ pub use sdp::{SdpAnswer, SdpApi, SdpOffer, SdpPendingOffer};
+ 
+-mod direct;
++pub mod direct;
+ pub use direct::DirectApi;
+diff --git a/src/change/sdp.rs b/src/change/sdp.rs
+--- a/src/change/sdp.rs
++++ b/src/change/sdp.rs
+@@ -33,7 +33,7 @@
+ }
+ 
+ impl<'a> SdpApi<'a> {
+-    pub(crate) fn new(rtc: &'a mut Rtc) -> Self {
++    pub fn new(rtc: &'a mut Rtc) -> Self {
+         SdpApi {
+             rtc,
+             changes: Changes::default(),
+@@ -613,7 +613,7 @@
+ }
+ 
+ #[derive(Default)]
+-pub(crate) struct Changes(pub Vec<Change>);
++pub struct Changes(pub Vec<Change>);
+ 
+ impl Changes {
+     /// Details of the active ICE restart, if any.
+@@ -632,7 +632,7 @@
+ 
+ #[derive(Debug)]
+ #[allow(clippy::large_enum_variant)]
+-pub(crate) enum Change {
++pub enum Change {
+     AddMedia(AddMedia),
+     AddApp(Mid),
+     AddChannel((ChannelId, ChannelConfig)),
+@@ -641,7 +641,7 @@
+ }
+ 
+ #[derive(Debug, Clone, PartialEq, Eq)]
+-pub(crate) struct AddMedia {
++pub struct AddMedia {
+     pub mid: Mid,
+     pub cname: String,
+     pub msid: Msid,
+@@ -1782,7 +1782,7 @@
+         })
+     }
+ 
+-    pub(crate) fn apply_to(&self, lines: &mut [MediaLine]) {
++    pub fn apply_to(&self, lines: &mut [MediaLine]) {
+         for change in &self.0 {
+             if let Change::Direction(mid, dir) = change {
+                 if let Some(line) = lines.iter_mut().find(|l| l.mid() == *mid) {
+@@ -1840,7 +1840,7 @@
+ }
+ 
+ #[cfg(test)]
+-mod test {
++pub mod test {
+     use std::time::Instant;
+ 
+     use sdp::RestrictionId;
+diff --git a/src/crypto/finger.rs b/src/crypto/finger.rs
+--- a/src/crypto/finger.rs
++++ b/src/crypto/finger.rs
+@@ -71,7 +71,7 @@
+ }
+ 
+ #[cfg(test)]
+-mod test {
++pub mod test {
+     use super::*;
+ 
+     #[test]
+diff --git a/src/crypto/mod.rs b/src/crypto/mod.rs
+--- a/src/crypto/mod.rs
++++ b/src/crypto/mod.rs
+@@ -21,7 +21,7 @@
+ 
+ #[cfg(any(test, feature = "_internal_test_exports"))]
+ #[allow(unused)]
+-pub(crate) fn test_default_provider() -> &'static CryptoProvider {
++pub fn test_default_provider() -> &'static CryptoProvider {
+     use std::sync::OnceLock;
+     static TEST_PROVIDER: OnceLock<CryptoProvider> = OnceLock::new();
+     TEST_PROVIDER.get_or_init(from_feature_flags)
+@@ -60,7 +60,7 @@
+     );
+ }
+ 
+-mod finger;
++pub mod finger;
+ pub use finger::Fingerprint;
+ 
+ pub use str0m_proto::crypto::{CryptoError, DtlsError};
+diff --git a/src/crypto/srtp.rs b/src/crypto/srtp.rs
+--- a/src/crypto/srtp.rs
++++ b/src/crypto/srtp.rs
+@@ -16,7 +16,7 @@
+ #[allow(dead_code)]
+ impl SrtpProfile {
+     // All the profiles we support, ordered from most preferred to least.
+-    pub(crate) const ALL: &'static [SrtpProfile] = &[
++    pub const ALL: &'static [SrtpProfile] = &[
+         SrtpProfile::AeadAes256Gcm,
+         SrtpProfile::AeadAes128Gcm,
+         SrtpProfile::Aes128CmSha1_80,
+@@ -24,7 +24,7 @@
+ 
+     /// The length of keying material to extract from the DTLS session in bytes.
+     #[rustfmt::skip]
+-    pub(crate) fn keying_material_len(&self) -> usize {
++    pub fn keying_material_len(&self) -> usize {
+         match self {
+             #[cfg(feature = "_internal_test_exports")]
+             SrtpProfile::PassThrough => 0,
+diff --git a/src/dtls.rs b/src/dtls.rs
+--- a/src/dtls.rs
++++ b/src/dtls.rs
+@@ -38,7 +38,7 @@
+     mtu: RangeInclusive<usize>,
+ }
+ 
+-pub(crate) fn is_would_block(error: &DtlsError) -> bool {
++pub fn is_would_block(error: &DtlsError) -> bool {
+     match error {
+         DtlsError::Io(e) => e.kind() == io::ErrorKind::WouldBlock,
+         DtlsError::CryptoError(crypto_err) => match crypto_err {
+diff --git a/src/format/codec.rs b/src/format/codec.rs
+--- a/src/format/codec.rs
++++ b/src/format/codec.rs
+@@ -35,7 +35,7 @@
+     ///
+     /// See RFC 3551 §4.5.2 and
+     /// <https://en.wikipedia.org/wiki/RTP_payload_formats#cite_note-55>
+-    pub(crate) fn rtp_clock_rate(&self) -> Frequency {
++    pub fn rtp_clock_rate(&self) -> Frequency {
+         if self.codec == Codec::G722 {
+             Frequency::EIGHT_KHZ
+         } else {
+@@ -146,7 +146,7 @@
+ }
+ 
+ #[cfg(test)]
+-mod test {
++pub mod test {
+     use super::*;
+     use crate::format::FormatParams;
+     use crate::rtp_::{Frequency, MediaTime};
+diff --git a/src/format/codec_config.rs b/src/format/codec_config.rs
+--- a/src/format/codec_config.rs
++++ b/src/format/codec_config.rs
+@@ -11,49 +11,49 @@
+ use super::payload_params::{Claimed, PREFERED_RANGES, PayloadParams};
+ 
+ /// Default payload type for PCMU (G.711 μ-law).
+-pub(crate) const PT_PCMU: Pt = Pt::new_with_value(0);
++pub const PT_PCMU: Pt = Pt::new_with_value(0);
+ 
+ /// Default payload type for PCMA (G.711 A-law).
+-pub(crate) const PT_PCMA: Pt = Pt::new_with_value(8);
++pub const PT_PCMA: Pt = Pt::new_with_value(8);
+ 
+ /// Default payload type for G722.
+-pub(crate) const PT_G722: Pt = Pt::new_with_value(9);
++pub const PT_G722: Pt = Pt::new_with_value(9);
+ 
+ /// Static payload type for Comfort Noise at 8000 Hz (RFC 3389).
+-pub(crate) const PT_COMFORT_NOISE: Pt = Pt::new_with_value(13);
++pub const PT_COMFORT_NOISE: Pt = Pt::new_with_value(13);
+ 
+ /// Default payload type for VP8.
+-pub(crate) const PT_VP8: Pt = Pt::new_with_value(96);
++pub const PT_VP8: Pt = Pt::new_with_value(96);
+ 
+ /// Default payload type for VP8 RTX.
+-pub(crate) const PT_VP8_RTX: Pt = Pt::new_with_value(97);
++pub const PT_VP8_RTX: Pt = Pt::new_with_value(97);
+ 
+ /// Default payload type for VP9 profile 0.
+-pub(crate) const PT_VP9: Pt = Pt::new_with_value(98);
++pub const PT_VP9: Pt = Pt::new_with_value(98);
+ 
+ /// Default payload type for VP9 profile 0 RTX.
+-pub(crate) const PT_VP9_RTX: Pt = Pt::new_with_value(99);
++pub const PT_VP9_RTX: Pt = Pt::new_with_value(99);
+ 
+ /// Default payload type for AV1.
+-pub(crate) const PT_AV1: Pt = Pt::new_with_value(45);
++pub const PT_AV1: Pt = Pt::new_with_value(45);
+ 
+ /// Default payload type for AV1 RTX.
+-pub(crate) const PT_AV1_RTX: Pt = Pt::new_with_value(46);
++pub const PT_AV1_RTX: Pt = Pt::new_with_value(46);
+ 
+ /// Default payload type for H265.
+-pub(crate) const PT_H265: Pt = Pt::new_with_value(102);
++pub const PT_H265: Pt = Pt::new_with_value(102);
+ 
+ /// Default payload type for H265 RTX.
+-pub(crate) const PT_H265_RTX: Pt = Pt::new_with_value(103);
++pub const PT_H265_RTX: Pt = Pt::new_with_value(103);
+ 
+ /// Default payload type for H266 (VVC).
+-pub(crate) const PT_H266: Pt = Pt::new_with_value(104);
++pub const PT_H266: Pt = Pt::new_with_value(104);
+ 
+ /// Default payload type for H266 RTX.
+-pub(crate) const PT_H266_RTX: Pt = Pt::new_with_value(105);
++pub const PT_H266_RTX: Pt = Pt::new_with_value(105);
+ 
+ /// Default payload type for Opus.
+-pub(crate) const PT_OPUS: Pt = Pt::new_with_value(111);
++pub const PT_OPUS: Pt = Pt::new_with_value(111);
+ 
+ /// Session config for all codecs.
+ #[derive(Debug, Clone, Default)]
+@@ -426,7 +426,7 @@
+     }
+ 
+     /// When we get remote payload parameters, we need to match differently depending on direction.
+-    pub(crate) fn sdp_match_remote(
++    pub fn sdp_match_remote(
+         &self,
+         remote_params: PayloadParams,
+         remote_dir: Direction,
+@@ -449,7 +449,7 @@
+         self.params.iter().find(move |p| f(p))
+     }
+ 
+-    pub(crate) fn all_for_kind(&self, kind: MediaKind) -> impl Iterator<Item = &PayloadParams> {
++    pub fn all_for_kind(&self, kind: MediaKind) -> impl Iterator<Item = &PayloadParams> {
+         self.params.iter().filter(move |params| {
+             if kind == MediaKind::Video {
+                 params.spec.codec.is_video()
+@@ -459,7 +459,7 @@
+         })
+     }
+ 
+-    pub(crate) fn update_params(&mut self, remote_params: &[PayloadParams], remote_dir: Direction) {
++    pub fn update_params(&mut self, remote_params: &[PayloadParams], remote_dir: Direction) {
+         // 0-128 of "claimed" PTs. I.e. PTs that we already allocated to something.
+         let mut claimed: [bool; 128] = [false; 128];
+ 
+@@ -540,7 +540,7 @@
+         }
+     }
+ 
+-    pub(crate) fn has_pt(&self, pt: Pt) -> bool {
++    pub fn has_pt(&self, pt: Pt) -> bool {
+         self.params.iter().any(|p| p.pt() == pt)
+     }
+ }
+@@ -561,7 +561,7 @@
+ 
+ impl CodecSpec {
+     /// Get the standardized codec definition for a static RTP payload type.
+-    pub(crate) fn from_static_pt(pt: Pt) -> Option<Self> {
++    pub fn from_static_pt(pt: Pt) -> Option<Self> {
+         let (codec, clock_rate) = if pt == PT_PCMU {
+             (Codec::PCMU, Frequency::EIGHT_KHZ)
+         } else if pt == PT_PCMA {
+@@ -586,7 +586,7 @@
+ }
+ 
+ #[cfg(test)]
+-mod test {
++pub mod test {
+     use crate::packet::MediaKind;
+     use crate::rtp_::Direction;
+     use crate::rtp_::Frequency;
+diff --git a/src/format/format_params.rs b/src/format/format_params.rs
+--- a/src/format/format_params.rs
++++ b/src/format/format_params.rs
+@@ -138,7 +138,7 @@
+         p
+     }
+ 
+-    pub(crate) fn set_param(&mut self, param: &FormatParam) {
++    pub fn set_param(&mut self, param: &FormatParam) {
+         use FormatParam::*;
+         match param {
+             MinPTime(v) => self.min_p_time = Some(*v),
+@@ -161,7 +161,7 @@
+         }
+     }
+ 
+-    pub(crate) fn to_format_param(self) -> Vec<FormatParam> {
++    pub fn to_format_param(self) -> Vec<FormatParam> {
+         use FormatParam::*;
+         let mut r = Vec::with_capacity(5);
+ 
+@@ -230,7 +230,7 @@
+ }
+ 
+ #[cfg(test)]
+-mod test {
++pub mod test {
+     use super::*;
+ 
+     #[test]
+diff --git a/src/format/mod.rs b/src/format/mod.rs
+--- a/src/format/mod.rs
++++ b/src/format/mod.rs
+@@ -18,10 +18,10 @@
+ pub use crate::packet::{H265Level, H265Profile, H265ProfileTierLevel, H265Tier};
+ pub use crate::packet::{H266Level, H266Profile, H266ProfileTierLevel, H266Tier};
+ 
+-mod codec;
+-mod codec_config;
+-mod format_params;
+-mod payload_params;
++pub mod codec;
++pub mod codec_config;
++pub mod format_params;
++pub mod payload_params;
+ 
+ pub use codec::{Codec, CodecSpec};
+ pub use codec_config::CodecConfig;
+diff --git a/src/format/payload_params.rs b/src/format/payload_params.rs
+--- a/src/format/payload_params.rs
++++ b/src/format/payload_params.rs
+@@ -10,7 +10,7 @@
+ use super::codec::{Codec, CodecSpec};
+ 
+ /// Preferred ranges for dynamic payload type allocation.
+-pub(crate) const PREFERED_RANGES: &[RangeInclusive<usize>] = &[
++pub const PREFERED_RANGES: &[RangeInclusive<usize>] = &[
+     // Payload identifiers 96–127 are used for payloads defined dynamically during a session.
+     96..=127,
+     // "unassigned" ranged. note that RTCP packet type 207 (XR, Extended Reports) would be
+@@ -24,7 +24,7 @@
+     35..=71,
+ ];
+ 
+-pub(crate) trait Claimed {
++pub trait Claimed {
+     fn assert_claim_once(&mut self, pt: Pt);
+     fn is_claimed(&self, pt: Pt) -> bool;
+     fn find_unclaimed(
+@@ -79,36 +79,36 @@
+ #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+ pub struct PayloadParams {
+     /// The payload type that groups these parameters.
+-    pub(crate) pt: Pt,
++    pub pt: Pt,
+ 
+     /// Whether these parameters are repairing some other set of parameters.
+     /// This is used to, via PT, separate RTX resend streams from the main stream.
+-    pub(crate) resend: Option<Pt>,
++    pub resend: Option<Pt>,
+ 
+     /// The codec with settings for this group of parameters.
+-    pub(crate) spec: CodecSpec,
++    pub spec: CodecSpec,
+ 
+     /// Whether the payload use the TWCC feedback mechanic.
+-    pub(crate) fb_transport_cc: bool,
++    pub fb_transport_cc: bool,
+ 
+     /// Whether the payload uses NACK to request resends.
+-    pub(crate) fb_nack: bool,
++    pub fb_nack: bool,
+ 
+     /// Whether the payload uses the PLI (Picture Loss Indication) mechanic.
+-    pub(crate) fb_pli: bool,
++    pub fb_pli: bool,
+ 
+     /// Whether the payload uses the FIR (Full Intra Request) mechanic.
+-    pub(crate) fb_fir: bool,
++    pub fb_fir: bool,
+ 
+     /// Whether the payload uses the REMB (Receiver Estimated Maximum Bitrate) mechanic.
+-    pub(crate) fb_remb: bool,
++    pub fb_remb: bool,
+ 
+     /// Whether the payload is locked by negotiation or can still be debated.
+     ///
+     /// If we make an OFFER or ANSWER and the direction is sendrecv/recvonly, the parameters are locked
+     /// can't be further changed. If we make an OFFER for a sendonly, the parameters are only proposed
+     /// and don't lock.
+-    pub(crate) locked: bool,
++    pub locked: bool,
+ }
+ 
+ // we don't want to compare "locked"
+@@ -175,7 +175,7 @@
+     ///
+     /// These probes don't carry real media, only padding for bandwidth estimation.
+     /// Uses 90kHz clock rate (video rate) and enables only transport_cc feedback.
+-    pub(crate) fn new_probe(pt: Pt) -> Self {
++    pub fn new_probe(pt: Pt) -> Self {
+         use super::codec::Codec;
+         use super::format_params::FormatParams;
+         use crate::rtp_::Frequency;
+@@ -264,7 +264,7 @@
+         self.fb_remb
+     }
+ 
+-    pub(crate) fn match_score(&self, o: &PayloadParams) -> Option<usize> {
++    pub fn match_score(&self, o: &PayloadParams) -> Option<usize> {
+         // we don't want to compare PT
+         let c0 = self.spec;
+         let c1 = o.spec;
+@@ -406,7 +406,7 @@
+         Some(Self::EXACT_MATCH_SCORE)
+     }
+ 
+-    pub(crate) fn match_h264_score(c0: CodecSpec, c1: CodecSpec) -> Option<usize> {
++    pub fn match_h264_score(c0: CodecSpec, c1: CodecSpec) -> Option<usize> {
+         // Default packetization mode is 0. https://www.rfc-editor.org/rfc/rfc6184#section-6.2
+         let c0_packetization_mode = c0.format.packetization_mode.unwrap_or(0);
+         let c1_packetization_mode = c1.format.packetization_mode.unwrap_or(0);
+@@ -471,7 +471,7 @@
+     /// - `Some(100 - level_gap)` for profile/tier match with level difference
+     /// - `Some(90)` for profile-only match (when tier/level unavailable)
+     /// - `None` for profile or tier mismatch
+-    pub(crate) fn match_h265_score(c0: CodecSpec, c1: CodecSpec) -> Option<usize> {
++    pub fn match_h265_score(c0: CodecSpec, c1: CodecSpec) -> Option<usize> {
+         match (
+             c0.format.h265_profile_tier_level,
+             c1.format.h265_profile_tier_level,
+@@ -534,7 +534,7 @@
+         }
+     }
+ 
+-    pub(crate) fn match_h266_score(c0: CodecSpec, c1: CodecSpec) -> Option<usize> {
++    pub fn match_h266_score(c0: CodecSpec, c1: CodecSpec) -> Option<usize> {
+         match (
+             c0.format.h266_profile_tier_level,
+             c1.format.h266_profile_tier_level,
+@@ -590,7 +590,7 @@
+         }
+     }
+ 
+-    pub(crate) fn update_param(
++    pub fn update_param(
+         &mut self,
+         remote_pts: &[PayloadParams],
+         claimed: &mut [bool; 128],
+@@ -755,13 +755,13 @@
+ }
+ 
+ #[cfg(test)]
+-mod test {
++pub mod test {
+     use crate::rtp_::Frequency;
+ 
+     use super::*;
+     use crate::format::{CodecSpec, FormatParams};
+ 
+-    mod h264 {
++    pub mod h264 {
+         use super::*;
+ 
+         fn h264_codec_spec(
+@@ -941,7 +941,7 @@
+         }
+     }
+ 
+-    mod h265 {
++    pub mod h265 {
+         use super::*;
+         use crate::packet::Packetizer;
+ 
+@@ -1410,7 +1410,7 @@
+         }
+     }
+ 
+-    mod h266 {
++    pub mod h266 {
+         use super::*;
+         use crate::packet::H266ProfileTierLevel;
+         use crate::packet::Packetizer;
+diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -715,7 +715,7 @@
+ pub mod crypto;
+ use crypto::Fingerprint;
+ 
+-mod dtls;
++pub mod dtls;
+ use crate::crypto::dtls::DtlsOutput;
+ use crate::crypto::{CryptoProvider, DtlsError, from_feature_flags};
+ use crate::dtls::is_would_block;
+@@ -762,7 +762,7 @@
+ mod packet;
+ 
+ #[path = "rtp/mod.rs"]
+-mod rtp_;
++pub mod rtp_;
+ use rtp_::{Bitrate, DataSize};
+ 
+ /// Low level RTP access.
+@@ -821,7 +821,7 @@
+ mod sctp;
+ use sctp::{RtcSctp, SctpEvent, SctpInitData};
+ 
+-mod sdp;
++pub mod sdp;
+ 
+ pub mod format;
+ use format::CodecConfig;
+diff --git a/src/rtp/dir.rs b/src/rtp/dir.rs
+--- a/src/rtp/dir.rs
++++ b/src/rtp/dir.rs
+@@ -42,7 +42,7 @@
+ 
+     /// When negotiating SDP, in certain cases, we need to treat `Inactive`
+     /// as if it is receiving.
+-    pub(crate) fn sdp_is_receiving(&self) -> bool {
++    pub fn sdp_is_receiving(&self) -> bool {
+         // The spec says:
+         //
+         // > For streams marked as inactive in the answer, the list of media
+diff --git a/src/rtp/ext.rs b/src/rtp/ext.rs
+--- a/src/rtp/ext.rs
++++ b/src/rtp/ext.rs
+@@ -75,7 +75,7 @@
+ // The form must be the two-byte variety for all of them.
+ #[repr(u16)]
+ #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+-pub(crate) enum ExtensionsForm {
++pub enum ExtensionsForm {
+     // See RFC 8285 Section 4.2
+     // ID Range: 1..=14
+     // Length Range: 1..=16
+@@ -92,16 +92,16 @@
+ pub const MAX_ID: u8 = 16;
+ 
+ impl ExtensionsForm {
+-    pub(crate) fn as_u16(self) -> u16 {
++    pub fn as_u16(self) -> u16 {
+         self as u16
+     }
+ 
+-    pub(crate) fn serialize(self) -> [u8; 2] {
++    pub fn serialize(self) -> [u8; 2] {
+         // App bits set to 0
+         self.as_u16().to_be_bytes()
+     }
+ 
+-    pub(crate) fn parse(bytes: [u8; 2]) -> Option<Self> {
++    pub fn parse(bytes: [u8; 2]) -> Option<Self> {
+         let serialized = u16::from_be_bytes(bytes);
+         if serialized == ExtensionsForm::OneByte.as_u16() {
+             Some(ExtensionsForm::OneByte)
+@@ -234,7 +234,7 @@
+     /// Parses an extension from a URI. This only happens for incoming SDP OFFER/ANSWER
+     /// while the corresponding Extension with a potential ExtensionSerializer is
+     /// in Rtc::session.
+-    pub(crate) fn from_sdp_uri(uri: &str) -> Self {
++    pub fn from_sdp_uri(uri: &str) -> Self {
+         for (t, spec) in EXT_URI.iter() {
+             if *spec == uri {
+                 return t.clone();
+@@ -264,7 +264,7 @@
+         "unknown"
+     }
+ 
+-    pub(crate) fn is_serialized(&self) -> bool {
++    pub fn is_serialized(&self) -> bool {
+         if let Self::UnknownUri(_, s) = self {
+             // Check if this Arc contains the SdpUnknownUri.
+             let is_sdp = (s as &(dyn Any + 'static))
+@@ -382,7 +382,7 @@
+         exts
+     }
+ 
+-    pub(crate) fn clear(&mut self) {
++    pub fn clear(&mut self) {
+         for i in &mut self.0 {
+             *i = None;
+         }
+@@ -457,7 +457,7 @@
+         self.iter_by_media_type(false)
+     }
+ 
+-    pub(crate) fn cloned_with_type(&self, audio: bool) -> Self {
++    pub fn cloned_with_type(&self, audio: bool) -> Self {
+         let mut x = ExtensionMap::empty();
+         for (id, ext) in self.iter_by_media_type(audio) {
+             x.set(id, ext.clone());
+@@ -466,7 +466,7 @@
+     }
+ 
+     // https://tools.ietf.org/html/rfc5285
+-    pub(crate) fn parse(
++    pub fn parse(
+         &self,
+         mut buf: &[u8],
+         form: ExtensionsForm,
+@@ -525,7 +525,7 @@
+         }
+     }
+ 
+-    pub(crate) fn form(&self, ev: &ExtensionValues) -> ExtensionsForm {
++    pub fn form(&self, ev: &ExtensionValues) -> ExtensionsForm {
+         if self
+             .iter()
+             .any(|(id, ext)| id > MAX_ID_ONE_BYTE_FORM || ext.requires_two_byte_form(ev))
+@@ -536,7 +536,7 @@
+         }
+     }
+ 
+-    pub(crate) fn write_to(
++    pub fn write_to(
+         &self,
+         ext_buf: &mut [u8],
+         ev: &ExtensionValues,
+@@ -570,7 +570,7 @@
+         orig_len - b.len()
+     }
+ 
+-    pub(crate) fn remap(&mut self, remote_exts: &[(u8, &Extension)]) {
++    pub fn remap(&mut self, remote_exts: &[(u8, &Extension)]) {
+         // Match remote numbers and lock down those we see for the first time.
+         for (id, ext) in remote_exts {
+             self.swap(*id, ext);
+@@ -621,7 +621,7 @@
+ }
+ 
+ impl Extension {
+-    pub(crate) fn write_to(&self, buf: &mut [u8], ev: &ExtensionValues) -> Option<usize> {
++    pub fn write_to(&self, buf: &mut [u8], ev: &ExtensionValues) -> Option<usize> {
+         use Extension::*;
+         match self {
+             AbsoluteSendTime => {
+@@ -744,7 +744,7 @@
+         }
+     }
+ 
+-    pub(crate) fn parse_value(&self, buf: &[u8], ev: &mut ExtensionValues) -> Option<()> {
++    pub fn parse_value(&self, buf: &[u8], ev: &mut ExtensionValues) -> Option<()> {
+         use Extension::*;
+         match self {
+             // 3
+@@ -923,7 +923,7 @@
+     pub user_values: UserExtensionValues,
+ }
+ impl ExtensionValues {
+-    pub(crate) fn update_absolute_send_time(&mut self, now: Instant) {
++    pub fn update_absolute_send_time(&mut self, now: Instant) {
+         let Some(v) = self.abs_send_time else {
+             return;
+         };
+@@ -1275,7 +1275,7 @@
+ impl Eq for Extension {}
+ 
+ #[cfg(test)]
+-mod test {
++pub mod test {
+     use super::*;
+ 
+     #[test]
+diff --git a/src/rtp/header.rs b/src/rtp/header.rs
+--- a/src/rtp/header.rs
++++ b/src/rtp/header.rs
+@@ -37,7 +37,7 @@
+ }
+ 
+ impl RtpHeader {
+-    pub(crate) fn write_to(&self, buf: &mut [u8], exts: &ExtensionMap) -> usize {
++    pub fn write_to(&self, buf: &mut [u8], exts: &ExtensionMap) -> usize {
+         assert!(self.csrc_count <= 15, "CSRC count must be <= 15");
+         buf[0] = 0b10_0_0_0000
+             | if self.has_padding { 1 << 5 } else { 0 }
+@@ -117,7 +117,7 @@
+ 
+     /// Returns `buf` with any trailing SRTP padding removed, or `None` if the
+     /// trailing padding length is invalid.
+-    pub(crate) fn unpad_payload(buf: &[u8]) -> Option<&[u8]> {
++    pub fn unpad_payload(buf: &[u8]) -> Option<&[u8]> {
+         if buf.is_empty() {
+             return Some(buf);
+         }
+@@ -126,7 +126,7 @@
+         Some(&buf[..unpadded_len])
+     }
+ 
+-    pub(crate) fn parse(buf: &[u8], exts: &ExtensionMap) -> Option<RtpHeader> {
++    pub fn parse(buf: &[u8], exts: &ExtensionMap) -> Option<RtpHeader> {
+         let orig_len = buf.len();
+         if buf.len() < 12 {
+             trace!("RTP header too short < 12: {}", buf.len());
+@@ -330,7 +330,7 @@
+ }
+ 
+ #[cfg(test)]
+-mod test {
++pub mod test {
+     use crate::util::already_happened;
+     use crate::{io::DATAGRAM_MAX_PACKET_SIZE, rtp_::Extension};
+     use std::time::Duration;
+diff --git a/src/rtp/id.rs b/src/rtp/id.rs
+--- a/src/rtp/id.rs
++++ b/src/rtp/id.rs
+@@ -215,7 +215,7 @@
+ num_id!(TwccSeq, u64);
+ 
+ impl SeqNo {
+-    pub(crate) const MAX: SeqNo = SeqNo(u64::MAX);
++    pub const MAX: SeqNo = SeqNo(u64::MAX);
+ 
+     /// Check if the `other` sequence number is directly following this.
+     #[inline(always)]
+@@ -235,7 +235,7 @@
+     }
+ 
+     #[inline(always)]
+-    pub(crate) fn is_max(&self) -> bool {
++    pub fn is_max(&self) -> bool {
+         self.0 == Self::MAX.0
+     }
+ 
+@@ -355,7 +355,7 @@
+ ///
+ /// In many cases they go hand-in-hand.
+ #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+-pub(crate) struct MidRid(pub Mid, pub Option<Rid>);
++pub struct MidRid(pub Mid, pub Option<Rid>);
+ 
+ impl MidRid {
+     #[inline(always)]
+diff --git a/src/rtp/mod.rs b/src/rtp/mod.rs
+--- a/src/rtp/mod.rs
++++ b/src/rtp/mod.rs
+@@ -1,27 +1,27 @@
+-mod id;
+-pub(crate) use id::MidRid;
++pub mod id;
++pub use id::MidRid;
+ pub use id::{Mid, Pt, Rid, SeqNo, SessionId, Ssrc, TwccClusterId, TwccSeq};
+ 
+-mod ext;
++pub mod ext;
+ pub use ext::{AbsCaptureTime, UserExtensionValues, VideoOrientation};
+ pub use ext::{Extension, ExtensionMap, ExtensionSerializer, ExtensionValues};
+ 
+-mod dir;
++pub mod dir;
+ pub use dir::Direction;
+ 
+-mod mtime;
++pub mod mtime;
+ pub use mtime::Frequency;
+ pub use mtime::MediaTime;
+ 
+-mod header;
++pub mod header;
+ pub use header::RtpHeader;
+-pub(crate) use header::{extend_u7, extend_u8, extend_u15, extend_u16, extend_u32};
++pub use header::{extend_u7, extend_u8, extend_u15, extend_u16, extend_u32};
+ 
+-mod srtp;
+-pub(crate) use srtp::SrtpContext;
+-pub(crate) use srtp::{SRTCP_OVERHEAD, SRTP_BLOCK_SIZE, SRTP_OVERHEAD};
++pub mod srtp;
++pub use srtp::SrtpContext;
++pub use srtp::{SRTCP_OVERHEAD, SRTP_BLOCK_SIZE, SRTP_OVERHEAD};
+ 
+-mod rtcp;
++pub mod rtcp;
+ pub use rtcp::*;
+ 
+ pub use str0m_proto::{Bitrate, DataSize};
+@@ -30,5 +30,5 @@
+ pub const MAX_BLANK_PADDING_PAYLOAD_SIZE: usize = 240;
+ 
+ /// Errors that can arise in RTP.
+-mod error;
++pub mod error;
+ pub use error::RtpError;
+diff --git a/src/rtp/mtime.rs b/src/rtp/mtime.rs
+--- a/src/rtp/mtime.rs
++++ b/src/rtp/mtime.rs
+@@ -435,7 +435,7 @@
+ }
+ 
+ #[cfg(test)]
+-mod test {
++pub mod test {
+     use super::*;
+ 
+     #[test]
+diff --git a/src/rtp/rtcp/header.rs b/src/rtp/rtcp/header.rs
+--- a/src/rtp/rtcp/header.rs
++++ b/src/rtp/rtcp/header.rs
+@@ -2,13 +2,13 @@
+ 
+ use super::{FeedbackMessageType, PayloadType, TransportType};
+ 
+-pub(crate) const LEN_HEADER: usize = 4;
++pub const LEN_HEADER: usize = 4;
+ 
+ #[derive(Debug, PartialEq, Eq)]
+ pub struct RtcpHeader {
+-    pub(crate) rtcp_type: RtcpType,
+-    pub(crate) feedback_message_type: FeedbackMessageType,
+-    pub(crate) words_less_one: u16,
++    pub rtcp_type: RtcpType,
++    pub feedback_message_type: FeedbackMessageType,
++    pub words_less_one: u16,
+ }
+ 
+ impl RtcpHeader {
+@@ -93,7 +93,7 @@
+     }
+ 
+     /// Write header to buffer.
+-    pub(crate) fn write_to(&self, buf: &mut [u8]) -> usize {
++    pub fn write_to(&self, buf: &mut [u8]) -> usize {
+         let fmt: u8 = self.feedback_message_type.into();
+ 
+         buf[0] = 0b10_0_00000 | fmt;
+diff --git a/src/rtp/rtcp/list.rs b/src/rtp/rtcp/list.rs
+--- a/src/rtp/rtcp/list.rs
++++ b/src/rtp/rtcp/list.rs
+@@ -6,7 +6,7 @@
+ pub struct ReportList<T>([Option<T>; 31]);
+ 
+ impl<T> ReportList<T> {
+-    pub(crate) fn new() -> Self {
++    pub fn new() -> Self {
+         ReportList::default()
+     }
+ 
+@@ -15,7 +15,7 @@
+         self.0.iter().position(|i| i.is_none()).unwrap_or(31)
+     }
+ 
+-    pub(crate) fn push(&mut self, v: T) {
++    pub fn push(&mut self, v: T) {
+         let pos = self.len();
+         self.0[pos] = Some(v);
+     }
+@@ -35,7 +35,7 @@
+         self.len() == 0
+     }
+ 
+-    pub(crate) fn lists_from_iter(iterator: impl IntoIterator<Item = T>) -> Vec<Self> {
++    pub fn lists_from_iter(iterator: impl IntoIterator<Item = T>) -> Vec<Self> {
+         let mut result = vec![];
+         let mut current = Self::default();
+ 
+@@ -55,13 +55,13 @@
+         result
+     }
+ 
+-    pub(crate) fn is_full(&self) -> bool {
++    pub fn is_full(&self) -> bool {
+         self.len() == 31
+     }
+ }
+ 
+ impl<T: private::WordSized> ReportList<T> {
+-    pub(crate) fn append_all_possible(&mut self, other: &mut Self, mut words_left: usize) -> usize {
++    pub fn append_all_possible(&mut self, other: &mut Self, mut words_left: usize) -> usize {
+         // Position where we start inserting in self.
+         let pos = self.len();
+ 
+@@ -103,7 +103,7 @@
+     }
+ }
+ 
+-pub(crate) mod private {
++pub mod private {
+     pub trait WordSized {
+         fn word_size(&self) -> usize;
+     }
+@@ -207,7 +207,7 @@
+ }
+ 
+ #[cfg(test)]
+-mod test {
++pub mod test {
+     use super::ReportList;
+ 
+     #[test]
+diff --git a/src/rtp/rtcp/mod.rs b/src/rtp/rtcp/mod.rs
+--- a/src/rtp/rtcp/mod.rs
++++ b/src/rtp/rtcp/mod.rs
+@@ -1,49 +1,49 @@
+ #![allow(clippy::unusual_byte_groupings)]
+ 
+-mod header;
++pub mod header;
+ use std::collections::VecDeque;
+ 
+ pub use header::{RtcpHeader, RtcpType};
+ 
+-mod list;
++pub mod list;
+ pub use list::ReportList;
+ use list::private::WordSized;
+ 
+-mod fmt;
++pub mod fmt;
+ pub use fmt::{FeedbackMessageType, PayloadType, TransportType};
+ 
+-mod sr;
++pub mod sr;
+ pub use sr::{SenderInfo, SenderReport};
+ 
+-mod rr;
++pub mod rr;
+ pub use rr::{ReceiverReport, ReceptionReport};
+ 
+-mod xr;
++pub mod xr;
+ pub use xr::{Dlrr, DlrrItem, ExtendedReport, ReportBlock, Rrtr};
+ 
+-mod sdes;
++pub mod sdes;
+ pub use sdes::{Descriptions, Sdes, SdesType};
+ 
+-mod bb;
++pub mod bb;
+ pub use bb::Goodbye;
+ 
+-mod nack;
++pub mod nack;
+ pub use nack::{Nack, NackEntry};
+ 
+-mod pli;
++pub mod pli;
+ pub use pli::Pli;
+ 
+-mod fir;
++pub mod fir;
+ pub use fir::{Fir, FirEntry};
+ 
+-mod twcc;
++pub mod twcc;
+ pub use twcc::{Twcc, TwccPacketId, TwccRecvRegister, TwccSendRecord, TwccSendRegister};
+ 
+-mod rtcpfb;
++pub mod rtcpfb;
+ pub use rtcpfb::RtcpFb;
+ 
+-mod psfbapp;
+-mod remb;
++pub mod psfbapp;
++pub mod remb;
+ pub use psfbapp::AppSpecificFeedback;
+ pub use remb::Remb;
+ 
+@@ -96,7 +96,7 @@
+ }
+ 
+ impl Rtcp {
+-    pub(crate) fn read_packet(buf: &[u8], feedback: &mut VecDeque<Rtcp>) {
++    pub fn read_packet(buf: &[u8], feedback: &mut VecDeque<Rtcp>) {
+         let mut buf = buf;
+         loop {
+             if buf.is_empty() {
+@@ -138,7 +138,7 @@
+         }
+     }
+ 
+-    pub(crate) fn write_packet(
++    pub fn write_packet(
+         feedback: &mut VecDeque<Rtcp>,
+         buf: &mut [u8],
+         mut output: impl FnMut(Rtcp),
+@@ -480,7 +480,7 @@
+ }
+ 
+ #[cfg(test)]
+-mod test {
++pub mod test {
+     use std::time::{Duration, SystemTime};
+ 
+     use crate::rtp_::MediaTime;
+diff --git a/src/rtp/rtcp/nack.rs b/src/rtp/rtcp/nack.rs
+--- a/src/rtp/rtcp/nack.rs
++++ b/src/rtp/rtcp/nack.rs
+@@ -128,7 +128,7 @@
+ }
+ 
+ #[cfg(test)]
+-mod test {
++pub mod test {
+     use super::*;
+ 
+     #[test]
+diff --git a/src/rtp/rtcp/psfbapp.rs b/src/rtp/rtcp/psfbapp.rs
+--- a/src/rtp/rtcp/psfbapp.rs
++++ b/src/rtp/rtcp/psfbapp.rs
+@@ -84,7 +84,7 @@
+ }
+ 
+ #[cfg(test)]
+-mod tests {
++pub mod tests {
+     use super::*;
+ 
+     #[test]
+diff --git a/src/rtp/rtcp/remb.rs b/src/rtp/rtcp/remb.rs
+--- a/src/rtp/rtcp/remb.rs
++++ b/src/rtp/rtcp/remb.rs
+@@ -178,7 +178,7 @@
+ }
+ 
+ #[cfg(test)]
+-mod tests {
++pub mod tests {
+     use super::*;
+ 
+     #[test]
+diff --git a/src/rtp/rtcp/rr.rs b/src/rtp/rtcp/rr.rs
+--- a/src/rtp/rtcp/rr.rs
++++ b/src/rtp/rtcp/rr.rs
+@@ -60,7 +60,7 @@
+ }
+ 
+ impl ReceptionReport {
+-    pub(crate) fn write_to(&self, buf: &mut [u8]) {
++    pub fn write_to(&self, buf: &mut [u8]) {
+         buf[0..4].copy_from_slice(&self.ssrc.to_be_bytes());
+         buf[4..8].copy_from_slice(&self.packets_lost.to_be_bytes());
+         buf[4] = self.fraction_lost;
+diff --git a/src/rtp/rtcp/rtcpfb.rs b/src/rtp/rtcp/rtcpfb.rs
+--- a/src/rtp/rtcp/rtcpfb.rs
++++ b/src/rtp/rtcp/rtcpfb.rs
+@@ -100,7 +100,7 @@
+ }
+ 
+ #[cfg(test)]
+-mod tests {
++pub mod tests {
+     use super::super::AppSpecificFeedback;
+     use super::*;
+     use std::collections::VecDeque;
+diff --git a/src/rtp/rtcp/sdes.rs b/src/rtp/rtcp/sdes.rs
+--- a/src/rtp/rtcp/sdes.rs
++++ b/src/rtp/rtcp/sdes.rs
+@@ -283,7 +283,7 @@
+ }
+ 
+ #[cfg(test)]
+-mod test {
++pub mod test {
+     use super::*;
+ 
+     #[test]
+diff --git a/src/rtp/rtcp/twcc.rs b/src/rtp/rtcp/twcc.rs
+--- a/src/rtp/rtcp/twcc.rs
++++ b/src/rtp/rtcp/twcc.rs
+@@ -1125,7 +1125,7 @@
+     ///
+     /// This is used by unit tests for BWE/probing, allowing them to model received vs lost packets
+     /// without constructing full RTCP TWCC reports.
+-    pub(crate) fn test_new(
++    pub fn test_new(
+         packet_id: TwccPacketId,
+         local_send_time: Instant,
+         size: usize,
+@@ -1478,7 +1478,7 @@
+ 
+ #[allow(clippy::assign_op_pattern)]
+ #[cfg(test)]
+-mod test {
++pub mod test {
+     use std::time::Duration;
+ 
+     use super::*;
+diff --git a/src/rtp/rtcp/xr.rs b/src/rtp/rtcp/xr.rs
+--- a/src/rtp/rtcp/xr.rs
++++ b/src/rtp/rtcp/xr.rs
+@@ -119,7 +119,7 @@
+ }
+ 
+ impl ReportBlock {
+-    pub(crate) fn len(&self) -> usize {
++    pub fn len(&self) -> usize {
+         match self {
+             Self::Rrtr(_) => Rrtr::len(),
+             Self::Dlrr(v) => v.len(),
+diff --git a/src/rtp/srtp.rs b/src/rtp/srtp.rs
+--- a/src/rtp/srtp.rs
++++ b/src/rtp/srtp.rs
+@@ -967,7 +967,7 @@
+ }
+ 
+ #[cfg(test)]
+-mod test {
++pub mod test {
+     use super::*;
+ 
+     #[test]
+@@ -1030,7 +1030,7 @@
+         );
+     }
+ 
+-    mod test_aes128_cm_sha1_80 {
++    pub mod test_aes128_cm_sha1_80 {
+         use super::*;
+ 
+         const MAT: [u8; 60] = [
+@@ -1087,7 +1087,7 @@
+         }
+     }
+ 
+-    mod test_aead_aes_128_gcm {
++    pub mod test_aead_aes_128_gcm {
+         use crate::crypto::AeadAes128Gcm;
+         use crate::rtp_::ExtensionMap;
+ 
+@@ -1095,7 +1095,7 @@
+ 
+         const TAG_LEN: usize = AeadAes128Gcm::TAG_LEN;
+ 
+-        mod rfc7714 {
++        pub mod rfc7714 {
+             // Test vectors from RFC7714
+ 
+             // Session Key (RTP and RTCP)
+@@ -1313,7 +1313,7 @@
+         }
+     }
+ 
+-    mod test_aead_aes_256_gcm {
++    pub mod test_aead_aes_256_gcm {
+         use crate::crypto::AeadAes256Gcm;
+         use crate::rtp_::ExtensionMap;
+ 
+@@ -1321,7 +1321,7 @@
+ 
+         const TAG_LEN: usize = AeadAes256Gcm::TAG_LEN;
+ 
+-        mod rfc7714 {
++        pub mod rfc7714 {
+             // Test vectors from RFC7714
+ 
+             // Session Key (RTP and RTCP)
+diff --git a/src/rtp/vla.rs b/src/rtp/vla.rs
+--- a/src/rtp/vla.rs
++++ b/src/rtp/vla.rs
+@@ -483,7 +483,7 @@
+ }
+ 
+ #[cfg(test)]
+-mod test {
++pub mod test {
+     use super::*;
+ 
+     fn serialize(vla: Option<&VideoLayersAllocation>) -> Vec<u8> {
+diff --git a/src/sdp/data.rs b/src/sdp/data.rs
+--- a/src/sdp/data.rs
++++ b/src/sdp/data.rs
+@@ -27,7 +27,7 @@
+ }
+ 
+ impl Sdp {
+-    pub(crate) fn parse(input: &str) -> Result<Sdp, SdpError> {
++    pub fn parse(input: &str) -> Result<Sdp, SdpError> {
+         sdp_parser()
+             .easy_parse(input)
+             .map(|(sdp, _)| sdp)
+@@ -35,7 +35,7 @@
+     }
+ 
+     /// Get the MIDs listed in the BUNDLE group, if any.
+-    pub(crate) fn bundle_mids(&self) -> Option<&[Mid]> {
++    pub fn bundle_mids(&self) -> Option<&[Mid]> {
+         self.session.attrs.iter().find_map(|a| {
+             if let SessionAttribute::Group { typ, mids } = a {
+                 if typ == "BUNDLE" {
+@@ -46,26 +46,26 @@
+         })
+     }
+ 
+-    pub(crate) fn assert_consistency(&self) -> Result<(), SdpError> {
++    pub fn assert_consistency(&self) -> Result<(), SdpError> {
+         match self.do_assert_consistency() {
+             None => Ok(()),
+             Some(error) => Err(SdpError::Inconsistent(error)),
+         }
+     }
+ 
+-    pub(crate) fn fingerprint(&self) -> Option<Fingerprint> {
++    pub fn fingerprint(&self) -> Option<Fingerprint> {
+         self.session
+             .fingerprint()
+             .or_else(|| self.media_lines.iter().find_map(|m| m.fingerprint()))
+     }
+ 
+-    pub(crate) fn ice_creds(&self) -> Option<IceCreds> {
++    pub fn ice_creds(&self) -> Option<IceCreds> {
+         self.session
+             .ice_creds()
+             .or_else(|| self.media_lines.iter().find_map(|m| m.ice_creds()))
+     }
+ 
+-    pub(crate) fn ice_candidates(&self) -> impl Iterator<Item = &Candidate> {
++    pub fn ice_candidates(&self) -> impl Iterator<Item = &Candidate> {
+         let mut candidates: HashSet<&Candidate> = HashSet::new();
+ 
+         // Session level ice candidates.
+@@ -82,14 +82,14 @@
+     /// Get the `a=sctp-init` value from the application m-line, if present.
+     ///
+     /// Returns the base64-encoded SCTP INIT value.
+-    pub(crate) fn sctp_init(&self) -> Option<&str> {
++    pub fn sctp_init(&self) -> Option<&str> {
+         self.media_lines
+             .iter()
+             .find(|m| m.typ.is_channel())
+             .and_then(|m| m.sctp_init())
+     }
+ 
+-    pub(crate) fn setup(&self) -> Option<Setup> {
++    pub fn setup(&self) -> Option<Setup> {
+         self.session
+             .setup()
+             .or_else(|| self.media_lines.iter().find_map(|m| m.setup()))
+@@ -1107,7 +1107,7 @@
+ }
+ 
+ impl PayloadParams {
+-    pub(crate) fn as_media_attrs(&self, attrs: &mut Vec<MediaAttribute>) {
++    pub fn as_media_attrs(&self, attrs: &mut Vec<MediaAttribute>) {
+         attrs.push(MediaAttribute::RtpMap {
+             pt: self.pt,
+             value: self.spec.into(),
+@@ -1564,7 +1564,7 @@
+ }
+ 
+ #[cfg(test)]
+-mod test {
++pub mod test {
+     use crate::VERSION;
+     use crate::packet::H265ProfileTierLevel;
+     use crate::rtp_::{Extension, Frequency};
+@@ -1573,7 +1573,7 @@
+ 
+     /// Tests for general format parameter serialization and parsing.
+     /// These tests verify that format parameters can be correctly converted to/from strings.
+-    mod format_params {
++    pub mod format_params {
+         use super::*;
+ 
+         #[test]
+@@ -1590,7 +1590,7 @@
+ 
+     /// Tests for SDP parsing, structure validation, and serialization.
+     /// Covers error handling, SDP generation, BUNDLE groups, and media line configuration.
+-    mod sdp_parsing {
++    pub mod sdp_parsing {
+         use super::*;
+ 
+         #[test]
+@@ -1914,7 +1914,7 @@
+ 
+     /// Opus codec-specific tests.
+     /// These tests are mainly verify SDP format params.
+-    mod opus_codec {
++    pub mod opus_codec {
+         use super::*;
+ 
+         #[test]
+@@ -1951,7 +1951,7 @@
+     /// Core H.265 (HEVC) codec-specific tests.
+     /// Tests basic H.265 parameter handling including profile-tier-level parsing,
+     /// serialization, and format parameter combinations.
+-    mod h265_codec {
++    pub mod h265_codec {
+         use super::*;
+ 
+         /// Test that H.265 format parameters can be serialized to a string and parsed back
+@@ -2136,7 +2136,7 @@
+     /// Verifies that H.265's three-parameter format (profile-id, tier-flag, level-id)
+     /// is correctly distinguished from H.264's profile-level-id, VP9's profile-id,
+     /// and AV1's profile/tier/level-idx parameters.
+-    mod no_confusion {
++    pub mod no_confusion {
+         use super::*;
+ 
+         /// Test that H.264's profile-level-id parameter (single hex value) is not confused
+@@ -2234,7 +2234,7 @@
+ 
+     /// Additional H.265 parsing and validation tests.
+     /// Covers incomplete parameter handling and complete SDP integration scenarios.
+-    mod h265_additional {
++    pub mod h265_additional {
+         use super::*;
+ 
+         /// Test that incomplete H.265 parameter sets do not create a composite ProfileTierLevel.
+@@ -2312,7 +2312,7 @@
+     /// Multi-codec integration tests.
+     /// Verifies that multiple video codecs (H.264, H.265, VP8, VP9) can coexist
+     /// in the same SDP without parameter conflicts or interference.
+-    mod multi_codec {
++    pub mod multi_codec {
+         use super::*;
+ 
+         /// Test that H.264, H.265, and other video codecs can coexist in the same SDP
+@@ -2379,7 +2379,7 @@
+     /// H.265 serialization and edge case tests.
+     /// Tests media attribute generation, empty parameter handling, extreme values,
+     /// parameter ordering independence, DONL parameters, and invalid value handling.
+-    mod h265_serialization {
++    pub mod h265_serialization {
+         use super::*;
+ 
+         /// Test that H.265 parameters are correctly serialized as media attributes,
+@@ -2600,7 +2600,7 @@
+     /// H.265 integration with RTCP feedback mechanisms.
+     /// Tests H.265 behavior with multiple codecs and various RTCP feedback types
+     /// including NACK, PLI, FIR, and transport-cc.
+-    mod h265_integration {
++    pub mod h265_integration {
+         use super::*;
+ 
+         /// Test H.265 in SDP with multiple video codecs and feedback mechanisms.
+@@ -2671,7 +2671,7 @@
+     /// Covers SDP round-trip serialization, incomplete parameter permutations,
+     /// browser compatibility (Chrome profile-only mode), and validation of all
+     /// standard H.265 level values (1.0 through 6.2).
+-    mod h265_advanced {
++    pub mod h265_advanced {
+         use super::*;
+ 
+         /// Test H.265 SDP serialization maintains parameter integrity.
+@@ -2837,7 +2837,7 @@
+     /// Core H.266 (VVC) codec-specific tests, mirrored from h265_codec.
+     /// Tests basic H.266 parameter handling including profile-tier-level parsing,
+     /// serialization, and format parameter combinations.
+-    mod h266_codec {
++    pub mod h266_codec {
+         use super::*;
+ 
+         /// Test that H.266 format parameters can be serialized to a string and parsed back
+@@ -3022,7 +3022,7 @@
+     /// Verifies that H.266's three-parameter format (profile-id, tier-flag, level-id)
+     /// is correctly distinguished from H.264's profile-level-id, VP9's profile-id,
+     /// and AV1's profile/tier/level-idx parameters.
+-    mod no_confusion_h266 {
++    pub mod no_confusion_h266 {
+         use super::*;
+ 
+         /// Test that H.264's profile-level-id parameter (single hex value) is not confused
+@@ -3120,7 +3120,7 @@
+ 
+     /// Additional H.266 parsing and validation tests.
+     /// Covers incomplete parameter handling and complete SDP integration scenarios.
+-    mod h266_additional {
++    pub mod h266_additional {
+         use super::*;
+ 
+         /// Test that incomplete H.266 parameter sets do not create a composite ProfileTierLevel.
+@@ -3198,7 +3198,7 @@
+     /// Multi-codec integration tests.
+     /// Verifies that multiple video codecs (H.264, H.266, VP8, VP9) can coexist
+     /// in the same SDP without parameter conflicts or interference.
+-    mod multi_codec_h266 {
++    pub mod multi_codec_h266 {
+         use super::*;
+ 
+         /// Test that H.264, H.266, and other video codecs can coexist in the same SDP
+@@ -3265,7 +3265,7 @@
+     /// H.266 serialization and edge case tests.
+     /// Tests media attribute generation, empty parameter handling, extreme values,
+     /// parameter ordering independence, DONL parameters, and invalid value handling.
+-    mod h266_serialization {
++    pub mod h266_serialization {
+         use super::*;
+ 
+         /// Test that H.266 parameters are correctly serialized as media attributes,
+@@ -3486,7 +3486,7 @@
+     /// H.266 integration with RTCP feedback mechanisms.
+     /// Tests H.266 behavior with multiple codecs and various RTCP feedback types
+     /// including NACK, PLI, FIR, and transport-cc.
+-    mod h266_integration {
++    pub mod h266_integration {
+         use super::*;
+ 
+         /// Test H.266 in SDP with multiple video codecs and feedback mechanisms.
+@@ -3557,7 +3557,7 @@
+     /// Covers SDP round-trip serialization, incomplete parameter permutations,
+     /// browser compatibility (Chrome profile-only mode), and validation of all
+     /// standard H.266 level values (1.0 through 6.2).
+-    mod h266_advanced {
++    pub mod h266_advanced {
+         use super::*;
+ 
+         /// Test H.266 SDP serialization maintains parameter integrity.
+diff --git a/src/sdp/mod.rs b/src/sdp/mod.rs
+--- a/src/sdp/mod.rs
++++ b/src/sdp/mod.rs
+@@ -3,16 +3,16 @@
+ 
+ use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
+ 
+-mod data;
++pub mod data;
+ #[cfg(test)]
+-pub(crate) use data::RtpMap;
+-pub(crate) use data::{FormatParam, Sdp, Session, SessionAttribute, Setup};
+-pub(crate) use data::{MediaAttribute, MediaLine, MediaType, Msid, Proto};
+-pub(crate) use data::{RestrictionId, Simulcast, SimulcastGroups, SimulcastLayer};
+-
+-mod parser;
+-
+-mod error;
++pub use data::RtpMap;
++pub use data::{FormatParam, Sdp, Session, SessionAttribute, Setup};
++pub use data::{MediaAttribute, MediaLine, MediaType, Msid, Proto};
++pub use data::{RestrictionId, Simulcast, SimulcastGroups, SimulcastLayer};
++
++pub mod parser;
++
++pub mod error;
+ pub use error::SdpError;
+ 
+ #[derive(Debug, PartialEq, Eq)]
+@@ -32,7 +32,7 @@
+     }
+ 
+     #[cfg(test)]
+-    pub(crate) fn into_inner(self) -> Sdp {
++    pub fn into_inner(self) -> Sdp {
+         self.0
+     }
+ }
+@@ -148,7 +148,7 @@
+ sdp_ser!(SdpAnswer, "Answer", "answer");
+ 
+ #[cfg(test)]
+-mod test {
++pub mod test {
+     use crate::VERSION;
+     use crate::rtp_::SessionId;
+ 
+diff --git a/src/sdp/parser.rs b/src/sdp/parser.rs
+--- a/src/sdp/parser.rs
++++ b/src/sdp/parser.rs
+@@ -316,7 +316,7 @@
+ }
+ 
+ /// Parser for a=candidate lines.
+-pub(crate) fn candidate_attribute<Input>() -> impl Parser<Input, Output = Candidate>
++pub fn candidate_attribute<Input>() -> impl Parser<Input, Output = Candidate>
+ where
+     Input: Stream<Token = char>,
+     Input::Error: ParseError<Input::Token, Input::Range, Input::Position>,
+@@ -869,7 +869,7 @@
+ }
+ 
+ #[cfg(test)]
+-mod test {
++pub mod test {
+     use super::*;
+     use crate::format::Codec;
+     use crate::io::Protocol;

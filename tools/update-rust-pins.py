@@ -5,6 +5,7 @@ translation, not dependency resolution; crate-universe resolves the crates.
 """
 
 import argparse
+import difflib
 import json
 import os
 from pathlib import Path
@@ -38,13 +39,75 @@ def rust_archive_hashes(version):
     return dict(sorted(hashes.items()))
 
 
+def locked_package(lock, name, spec):
+    selectors = {key: [spec[key]] for key in ("branch", "rev", "tag") if key in spec}
+    matches = []
+    for package in lock:
+        source = urlsplit(package.get("source", "").removeprefix("git+"))
+        if (package["name"] == name and source._replace(query="", fragment="").geturl() == spec["git"]
+                and parse_qs(source.query) == selectors):
+            matches.append(package)
+    if len(matches) != 1:
+        raise ValueError(f"expected one locked {name} package for {spec}, found {len(matches)}")
+    return matches[0]
+
+
+def str0m_visibility_patch(source):
+    """Expose only RTC's required internals, without modifying Cargo's checkout."""
+    source = Path(source)
+    files = {source / "src/lib.rs", source / "src/dtls.rs"}
+    for module in ("crypto", "change", "format", "sdp", "rtp"):
+        folder = source / "src" / module
+        children = set(folder.rglob("*.rs"))
+        if not folder.is_dir() or not children:
+            raise ValueError(f"str0m visibility: missing Rust source tree {folder}")
+        files.update(children)
+    for required in files:
+        if not required.is_file():
+            raise ValueError(f"str0m visibility: missing required file {required}")
+    result = []
+    for path in sorted(files):
+        before = path.read_bytes()
+        after = before
+        if path == source / "src/lib.rs":
+            for module in ("crypto", "dtls", "change", "format", "sdp", "rtp_"):
+                declaration = rb"^([ \t]*)(pub(?:\(crate\))?[ \t]+)?(mod[ \t]+" + module.encode() + rb"[ \t]*;)"
+                matches = list(re.finditer(declaration, after, re.MULTILINE))
+                if len(matches) != 1:
+                    raise ValueError(f"str0m visibility: expected one root declaration for {module} in {path}, found {len(matches)}")
+                after = re.sub(declaration, lambda m: m[1] + (m[2].replace(b"pub(crate)", b"pub") if m[2] else b"pub ") + m[3],
+                               after, flags=re.MULTILINE)
+        else:
+            after = re.sub(rb"^([ \t]*)pub\(crate\)", rb"\1pub", after, flags=re.MULTILINE)
+            after = re.sub(rb"^([ \t]*)mod(?=[ \t]+[A-Za-z_])", rb"\1pub mod", after, flags=re.MULTILINE)
+        relative = path.relative_to(source).as_posix().encode()
+        if before != after:
+            result.append(b"diff --git a/" + relative + b" b/" + relative + b"\n")
+        for line in difflib.diff_bytes(difflib.unified_diff, before.splitlines(keepends=True),
+                                      after.splitlines(keepends=True), b"a/" + relative, b"b/" + relative):
+            result.append(line if line.endswith(b"\n") else line + b"\n\\ No newline at end of file\n")
+    return b"".join(result)
+
+
+def rtc_visibility(root, lock, deps, metadata):
+    packages = {name: locked_package(lock, name, deps[name]) for name in ("str0m", "is")}
+    if packages["str0m"]["source"] != packages["is"]["source"]:
+        raise ValueError("RTC str0m and is must resolve from the same Git source and revision")
+    selected = packages["str0m"]
+    matches = [p for p in metadata["packages"]
+               if (p["name"], p["version"], p.get("source")) == (selected["name"], selected["version"], selected["source"])]
+    if len(matches) != 1:
+        raise ValueError(f"expected one resolved RTC str0m manifest for {selected}, found {len(matches)}")
+    patch = str0m_visibility_patch(Path(matches[0]["manifest_path"]).parent)
+    (root / "tools/patches/str0m-rtc-visibility.patch").write_bytes(patch)
+    return selected, bool(patch)
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--cargo")
-    parser.add_argument("--rustc")
+    parser.add_argument("--cargo", required=True)
+    parser.add_argument("--rustc", required=True)
     args = parser.parse_args()
-    if bool(args.cargo) != bool(args.rustc):
-        parser.error("--cargo and --rustc must be supplied together")
     root = Path(os.environ.get("BUILD_WORKSPACE_DIRECTORY", Path(__file__).resolve().parents[1]))
     rust = tomllib.loads((root / "rust-toolchain.toml").read_text())["toolchain"]["channel"]
     lock = tomllib.loads((root / "Cargo.lock").read_text())["package"]
@@ -134,16 +197,17 @@ def main():
             fields = ", ".join(f"{key} = {json.dumps(value)}" for key, value in spec.items())
             manifest += f"{dep} = {{ {fields} }}\n"
         (folder / "Cargo.toml").write_text(manifest)
-        if args.cargo:
-            (folder / "Cargo.lock").write_bytes((root / "Cargo.lock").read_bytes())
-            env = os.environ | {"RUSTC": str(Path(args.rustc).resolve()), "RUSTC_WRAPPER": "", "RUSTC_WORKSPACE_WRAPPER": ""}
-            subprocess.run([str(Path(args.cargo).resolve()), "metadata", "--format-version=1", "--manifest-path", str(folder / "Cargo.toml")],
-                           env=env, check=True, stdout=subprocess.DEVNULL)
-            derived = tomllib.loads((folder / "Cargo.lock").read_text())["package"]
-            identities = {(p["name"], p["version"], p.get("source")) for p in lock}
-            unexpected = [p for p in derived if p["name"] != name and (p["name"], p["version"], p.get("source")) not in identities]
-            if unexpected:
-                raise ValueError(f"{name} resolved dependencies outside the authoritative root lock: {unexpected}")
+        (folder / "Cargo.lock").write_bytes((root / "Cargo.lock").read_bytes())
+        env = os.environ | {"RUSTC": str(Path(args.rustc).resolve()), "RUSTC_WRAPPER": "", "RUSTC_WORKSPACE_WRAPPER": ""}
+        resolved = subprocess.run([str(Path(args.cargo).resolve()), "metadata", "--format-version=1", "--manifest-path", str(folder / "Cargo.toml")],
+                                  env=env, check=True, stdout=subprocess.PIPE, text=True)
+        derived = tomllib.loads((folder / "Cargo.lock").read_text())["package"]
+        identities = {(p["name"], p["version"], p.get("source")) for p in lock}
+        unexpected = [p for p in derived if p["name"] != name and (p["name"], p["version"], p.get("source")) not in identities]
+        if unexpected:
+            raise ValueError(f"{name} resolved dependencies outside the authoritative root lock: {unexpected}")
+        if name == "str0m_rtc":
+            rtc_package, has_visibility_patch = rtc_visibility(root, lock, deps, json.loads(resolved.stdout))
     hashes = json.dumps(rust_archive_hashes(rust), indent=4)
     fragment = f'''# Generated by //tools:update-rust-pins. Do not edit.
 RUST_ARCHIVE_SHA256S = {hashes}
@@ -200,12 +264,11 @@ use_repo(crate, "{name}")
 '''
     for name in ("str0m_native", "str0m_rtc"):
         spec = sources[name]["str0m"]
-        matches = [p for p in lock if p["name"] == "str0m" and p.get("source", "").startswith("git+" + spec["git"] + "?")
-                   and parse_qs(urlsplit(p["source"].removeprefix("git+")).query).get("branch") == [spec["branch"]]]
-        if len(matches) != 1:
-            raise ValueError(f"expected one locked str0m package for {name}, found {len(matches)}")
-        fragment += f'crate.annotation(crate = "str0m", version = "={matches[0]["version"]}", override_target_lib = "@{name}//:str0m", repositories = ["crates"])\n'
+        package = locked_package(lock, "str0m", spec)
+        fragment += f'crate.annotation(crate = "str0m", version = "={package["version"]}", override_target_lib = "@{name}//:str0m", repositories = ["crates"])\n'
     fragment += 'crate.annotation(crate = "is", override_target_lib = "@str0m_rtc//:is", repositories = ["crates"])\n'
+    if has_visibility_patch:
+        fragment += f'crate.annotation(crate = "str0m", version = "={rtc_package["version"]}", patches = ["//tools:patches/str0m-rtc-visibility.patch"], patch_args = ["-p1"], repositories = ["str0m_rtc"])\n'
     (root / "tools/rust-pins.MODULE.bazel").write_text(fragment)
 
 

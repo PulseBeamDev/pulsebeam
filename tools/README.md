@@ -33,8 +33,35 @@ After editing authoritative Rust/generator inputs, explicitly run
 `./bazel run --lockfile_mode=update //tools:update-rust-pins`, then
 `./bazel mod deps --lockfile_mode=update`, and review derived files. Never edit
 `rust-pins.MODULE.bazel`, `rust-metadata.bzl`, `wasm-deps.bzl` or
-`tools/rust/*/Cargo.toml` by hand. Cargo/pnpm lock maintenance remains separate
-from supported application compilation; CI does not install parallel host tools.
+`tools/rust/*/Cargo.toml` or `tools/patches/str0m-rtc-visibility.patch` by hand.
+Cargo/pnpm lock maintenance remains separate from supported application
+compilation; CI does not install parallel host tools.
+
+### Update RTC's upstream str0m
+
+1. Change `str0m` and `is` in `crates/pulsebeam-rtc/Cargo.toml` to the same
+   upstream Git revision and refresh the root `Cargo.lock` through Cargo dependency
+   maintenance. Preserve RTC's feature selection.
+2. Run the pin-refresh and module-lock commands above. Pin refresh selects the
+   locked RTC package from Cargo metadata and derives the visibility patch from
+   its resolved source without modifying Cargo's checkout. Review the generated
+   patch, RTC universe manifest/lock, annotations and module lock.
+3. Run the affected [verification gates](../docs/build.md#testing-contract) and
+   refresh [editor assets](../docs/ide.md#setup-and-refresh).
+
+Bazel applies the declared patch only to RTC's str0m universe. Normal builds,
+checks and rules_rust IDE discovery consume that patched source without
+regenerating it. No fork-publishing script, sibling checkout, GitHub write access,
+manual patch rebase or separate visibility-generation command is required.
+The native `feat/bwe-6` str0m fork and its separate universe remain unchanged.
+
+The transform exposes root `crypto`, `dtls`, `change`, `format`, `sdp` and `rtp_`
+modules. It widens line-leading `pub(crate)` and bare child-module declarations
+only in `src/{crypto,change,format,sdp,rtp}/**/*.rs` and `src/dtls.rs`. Missing
+required files/trees or missing/ambiguous root declarations fail pin refresh. Upstream internals are not a stable API:
+future source changes may require adapting the transform or RTC consumers, and
+compilation failures must be repaired rather than bypassing exposure. Standalone
+Cargo compilation is not a supported patched build path.
 
 ## Adopted upstream integrations
 
