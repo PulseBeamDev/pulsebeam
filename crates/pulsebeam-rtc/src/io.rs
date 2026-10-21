@@ -51,6 +51,31 @@ pub enum TransmitTarget {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NetworkProtocol {
+    Udp,
+    IceTcp,
+}
+
+/// A tuple authenticated by ICE, attributed to the input that proved it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AuthenticatedPath {
+    pub protocol: NetworkProtocol,
+    pub local: SocketAddr,
+    pub remote: SocketAddr,
+    pub arrival: Instant,
+}
+
+/// Authenticated SR/RR reception progress for a negotiated primary sender.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReceiverReport {
+    pub mid: Arc<str>,
+    pub ssrc: u32,
+    pub arrival: Instant,
+    /// RFC 3550 extended highest sequence, modulo 2^32. Not a local send counter.
+    pub extended_highest_sequence: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TransmitKind {
     Original { ssrc: u32 },
     Repair { ssrc: u32 },
@@ -101,6 +126,8 @@ pub enum CloseReason {
 #[non_exhaustive]
 pub enum Event {
     Connected,
+    AuthenticatedPath(AuthenticatedPath),
+    ReceiverReport(ReceiverReport),
     Rtp {
         mid: Arc<str>,
         rid: Option<Arc<str>>,

@@ -101,8 +101,36 @@ pub enum PacketFeedbackKind {
     Rfc8888,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MediaSectionKind {
+    Audio,
+    Video,
+    Application,
+}
+
+/// Direction from the local connection's perspective.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MediaDirection {
+    SendOnly,
+    ReceiveOnly,
+    Bidirectional,
+    Inactive,
+}
+
+/// Every offered section, including disabled and non-RTP sections.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OfferedMediaSection {
+    pub media_index: u32,
+    pub mid: Arc<str>,
+    pub kind: MediaSectionKind,
+    pub direction: MediaDirection,
+    /// Port-zero rejection, excluding BUNDLE-only sections.
+    pub disabled: bool,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionInfo {
+    pub offered_media: Arc<[OfferedMediaSection]>,
     pub feedback: Option<PacketFeedbackKind>,
     pub inbound_media: Arc<[InboundMediaInfo]>,
     pub senders: Arc<[SenderInfo]>,

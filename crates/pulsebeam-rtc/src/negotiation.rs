@@ -22,6 +22,7 @@ use crate::{
     AcceptError, ConnectionConfig, ConnectionLimits, InboundMediaInfo, LocalCandidate,
     PacketFeedbackKind, SdpAnswer, SdpOffer, SenderInfo, SessionInfo, connection::EntropyConsumer,
 };
+use crate::{MediaDirection as Direction, MediaSectionKind as SectionKind, OfferedMediaSection};
 
 const MAX_SDP_BYTES: usize = 256 * 1024;
 const MAX_MEDIA_SECTIONS: usize = 128;
@@ -311,14 +312,6 @@ pub(crate) enum DtlsRole {
     Passive,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Direction {
-    SendOnly,
-    ReceiveOnly,
-    Bidirectional,
-    Inactive,
-}
-
 impl Direction {
     const fn allows_send(self) -> bool {
         matches!(self, Self::SendOnly | Self::Bidirectional)
@@ -345,13 +338,6 @@ const fn inherited_extension_direction(media: Direction) -> Direction {
     } else {
         media
     }
-}
-
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum SectionKind {
-    Audio,
-    Video,
-    Application,
 }
 
 struct HeaderExtensionFacts {
@@ -668,6 +654,18 @@ fn negotiate_inner(
         });
     }
     let session = SessionInfo {
+        offered_media: builds
+            .iter()
+            .zip(&parsed.media_lines)
+            .zip(&raw.sections)
+            .map(|((section, line), raw)| OfferedMediaSection {
+                media_index: section.facts.media_index,
+                mid: Arc::from(section.facts.mid.as_str()),
+                kind: section.facts.kind,
+                direction: section.facts.direction,
+                disabled: line.disabled && !raw.iter().any(|value| value == "a=bundle-only"),
+            })
+            .collect(),
         feedback,
         inbound_media: Arc::from(inbound_media),
         senders: Arc::from(senders),

@@ -563,6 +563,9 @@ impl Connection {
 
     fn handle_transport_event(&mut self, at: Instant, event: TransportEvent) -> Option<Output> {
         match event {
+            TransportEvent::AuthenticatedPath(path) => {
+                Some(Output::Event(Event::AuthenticatedPath(path)))
+            }
             TransportEvent::StateChanged(TransportState::Connected) => {
                 if let Some(sctp) = self.sctp.as_mut() {
                     sctp.connect(at);
@@ -593,14 +596,16 @@ impl Connection {
                 path_epoch,
                 bytes,
             } => {
-                let _ = self.ingress.accept_rtcp(
+                let receipts = self.ingress.accept_rtcp(
                     arrival,
                     bytes,
                     path_epoch,
                     self.session.feedback(),
                     self.transport.smoothed_rtt(),
                 );
-
+                for receipt in receipts {
+                    self.egress.observe_receipt(arrival, receipt);
+                }
                 None
             }
             TransportEvent::Data(bytes) => {
@@ -1085,6 +1090,14 @@ mod tests {
             fixture.connection.commit.history.counters().received >= before + 5,
             "native TWCC only acknowledges packets after SRTP authentication"
         );
+        fixture.drive_for(Duration::from_secs(5));
+        let report = fixture
+            .receiver_report
+            .as_ref()
+            .expect("authenticated native RR");
+        assert_eq!(report.mid.as_ref(), fixture.sender_mid);
+        assert_eq!(report.ssrc, fixture.connection.stats().senders[0].ssrc);
+        assert_eq!(report.extended_highest_sequence, 65_538);
     }
 
     #[test]

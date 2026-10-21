@@ -94,6 +94,7 @@ impl crate::TransmitKind {
 pub(crate) enum TransportEvent {
     StateChanged(TransportState),
     IceStateChanged(IceConnectionState),
+    AuthenticatedPath(crate::AuthenticatedPath),
     Rtp {
         arrival: Instant,
         path_epoch: PathEpoch,
@@ -654,6 +655,21 @@ impl Transport {
                     .handle_packet(now, source, destination, proto, &bytes)
                 {
                     Ok(authenticated) => {
+                        if authenticated {
+                            self.push_event(TransportEvent::AuthenticatedPath(
+                                crate::AuthenticatedPath {
+                                    protocol: match path.envelope {
+                                        NetworkEnvelope::Udp { .. } => crate::NetworkProtocol::Udp,
+                                        NetworkEnvelope::IceTcp { .. } => {
+                                            crate::NetworkProtocol::IceTcp
+                                        }
+                                    },
+                                    local: destination,
+                                    remote: source,
+                                    arrival,
+                                },
+                            ))?;
+                        }
                         let provider = str0m::crypto::from_feature_flags();
                         self.drain_ice(now, &provider)?;
                         // ICE nomination is tuple-based and may not repeat on a new stream.

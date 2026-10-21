@@ -54,7 +54,10 @@ compatibility are not implied by this contract.
 
 `SessionInfo` exposes negotiated inbound media, outbound senders addressed by
 MID, codec/RTX payload mappings, clock rates, profiles, and directional extension
-facts. The caller need not parse the answer again or depend on native types.
+facts. `offered_media` retains every offered section, including application,
+inactive, and disabled sections, with its original index and local direction.
+Callers enforce admission from those facts, not just accepted RTP lists. The
+caller need not parse the answer again or depend on native types.
 
 ## Service loop and commits
 
@@ -74,6 +77,12 @@ is one of:
 | `Transmit` | Submit the already committed bytes promptly, or treat them as local loss. |
 | `Idle { next_wakeup }` | Schedule that wakeup; a due-now wakeup means runnable continuation. |
 | `Closed` | Observe the terminal reason once; later polls are idle. |
+
+`Event::AuthenticatedPath` reports an ICE-authenticated protocol/local/remote
+tuple and the arrival observation of the input that proved it. It does not
+identify a socket incarnation or a shard. Preserve adapter input attribution
+until consuming the fact; neither the latest input nor `Connected` is a route
+proof. Unauthenticated route hints do not produce this event.
 
 Internal drains and event queues are bounded. A caller may collect a bounded
 batch, yield to other connections, and resume without draining one connection
@@ -156,6 +165,13 @@ SSRC, raw NTP seconds/fraction, and raw RTP timestamp. The caller owns any
 synchronization or normalization derived from those facts. Packet arrival,
 execution time, media correspondence, and protocol wall-clock conversion are
 not interchangeable.
+
+`Event::ReceiverReport` exposes authenticated SR/RR reception progress for a
+negotiated primary sender, associated with its MID and SSRC. The extended highest
+sequence is the RFC 3550 32-bit value, not a local write or transmit count.
+Progress coalesces to one pending fact per sender and uses serial-number
+comparison across 32-bit wrap; stale reports cannot reverse it. The caller owns
+mapping it to its extended primary numbering and any playout confirmation.
 
 TWCC and RFC 8888 arrival/report calculations continue to use monotonic time.
 Removing the global timeline does not remove wire NTP fields, change their

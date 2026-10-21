@@ -97,6 +97,66 @@ fn negotiated_codec_facts_are_public_and_directional() {
     assert_eq!(sender.codec.channels, Some(2));
     assert_eq!(sender.codec.clock_rate, 48_000);
     assert_eq!(sender.codec.retransmission_payload_type, None);
+    let sections = &accepted.session.offered_media;
+    assert_eq!(sections.len(), 3);
+    assert_eq!(sections[0].media_index, 0);
+    assert_eq!(sections[0].mid.as_ref(), "audio");
+    assert_eq!(
+        sections[0].direction,
+        pulsebeam_rtc::MediaDirection::SendOnly
+    );
+    assert_eq!(
+        sections[1].direction,
+        pulsebeam_rtc::MediaDirection::ReceiveOnly
+    );
+    assert_eq!(
+        sections[2].kind,
+        pulsebeam_rtc::MediaSectionKind::Application
+    );
+    assert!(sections.iter().all(|section| !section.disabled));
+}
+
+#[test]
+fn offer_facts_retain_inactive_disabled_and_bidirectional_sections() {
+    use pulsebeam_rtc::{ConnectionEntropy, MediaDirection, SdpOffer};
+    for (replacement, direction, disabled) in [
+        ("a=inactive", MediaDirection::Inactive, false),
+        ("a=sendrecv", MediaDirection::Bidirectional, false),
+        ("a=sendonly", MediaDirection::Inactive, true),
+    ] {
+        let mut offer = include_str!("fixtures/chrome-representative.sdp").replace(
+            "a=mid:video\na=sendonly",
+            &format!("a=mid:video\n{replacement}"),
+        );
+        if disabled {
+            offer = offer.replace("m=video 9 ", "m=video 0 ");
+        }
+        let accepted = Connection::accept(
+            ConnectionConfig {
+                local_candidates: vec![LocalCandidate::Udp("192.0.2.1:5000".parse().unwrap())],
+                ..ConnectionConfig::default()
+            },
+            SdpOffer::new(offer),
+            Instant::now(),
+            std::time::UNIX_EPOCH,
+            ConnectionEntropy::new([9; 32]),
+        )
+        .expect("supported RTC section direction");
+        let section = &accepted.session.offered_media[1];
+        assert_eq!(section.media_index, 1);
+        assert_eq!(section.mid.as_ref(), "video");
+        assert_eq!(section.direction, direction);
+        assert_eq!(section.disabled, disabled);
+        assert_eq!(accepted.session.offered_media.len(), 3);
+        assert_eq!(
+            accepted.session.inbound_media.len(),
+            if direction == MediaDirection::Bidirectional {
+                2
+            } else {
+                1
+            }
+        );
+    }
 }
 
 #[test]
