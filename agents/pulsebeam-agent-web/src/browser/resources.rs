@@ -98,6 +98,12 @@ enum CommandConfig {
     },
 }
 
+pub(super) fn spec(value: JsValue) -> Result<TrackSpec, JsValue> {
+    let config: SpecConfig = serde_wasm_bindgen::from_value(value)
+        .map_err(|error| js_error(format!("invalid track descriptor: {error}")))?;
+    Ok(config.into())
+}
+
 pub(super) fn command(value: JsValue) -> Result<ResourceCommand, JsValue> {
     let config: CommandConfig = serde_wasm_bindgen::from_value(value)
         .map_err(|error| js_error(format!("invalid resource command: {error}")))?;
@@ -212,10 +218,42 @@ pub(super) fn error(error: AgentError) -> JsValue {
             TrackResourceError::ReceiveOverflow => "receive-overflow",
             TrackResourceError::ReceiveChannelFailed(_) => "receive-channel-failed",
         },
+        AgentError::InvalidTopic(agent_core::TopicError::PayloadTooLarge { .. }) => {
+            "payload-too-large"
+        }
+        AgentError::InvalidTopic(agent_core::TopicError::SendQueueFull(_)) => "capacity",
+        AgentError::InvalidTopic(agent_core::TopicError::InvalidTopic(_)) => "validation",
+        AgentError::InvalidTopic(agent_core::TopicError::PublisherUnavailable(_)) => "unavailable",
         AgentError::InvalidConfiguration(_) => "validation",
         _ => "runtime",
     };
-    let value = js_sys::Error::new(&error.to_string());
+    coded_error(code, &error.to_string())
+}
+
+pub(super) fn send_error(error: crate::engine::DataSendError) -> JsValue {
+    use crate::engine::DataSendError;
+    use agent_core::DataSendFailure;
+    let message = error.to_string();
+    let code = match error {
+        DataSendError::Admission(error) => return self::error(error),
+        DataSendError::Closed => "closed",
+        DataSendError::Delivery(failure) => match failure {
+            DataSendFailure::Disconnected => "not-connected",
+            DataSendFailure::TerminalFailure => "terminal-failure",
+            DataSendFailure::TimedOut => "send-timeout",
+            DataSendFailure::TransportReplaced => "stale-binding",
+            DataSendFailure::ChannelFailed => "send-channel-failed",
+            DataSendFailure::Superseded => "superseded",
+            DataSendFailure::HostRejected => "host-rejected",
+            DataSendFailure::QueueFull => "capacity",
+            DataSendFailure::SequenceExhausted => "sequence-exhausted",
+        },
+    };
+    coded_error(code, &message)
+}
+
+fn coded_error(code: &str, message: &str) -> JsValue {
+    let value = js_sys::Error::new(message);
     set(value.as_ref(), "pulsebeamCode", code);
     value.into()
 }

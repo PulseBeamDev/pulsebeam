@@ -305,6 +305,10 @@ pub enum Notification {
     DataReady {
         owners: Vec<u64>,
     },
+    DataSendFinished {
+        send: crate::OperationId,
+        error: Option<crate::DataSendFailure>,
+    },
     Topic(TopicNotification),
     Failure(Failure),
     ServerError(String),

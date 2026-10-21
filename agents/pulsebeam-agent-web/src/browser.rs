@@ -662,6 +662,27 @@ impl BrowserRuntime {
     }
 
     #[wasm_bindgen(unchecked_return_type = "Promise<void>")]
+    pub fn send_data(&self, spec: JsValue, payload: &[u8]) -> Result<js_sys::Promise, JsValue> {
+        self.inner.ensure_open()?;
+        let spec = resources::spec(spec)?;
+        let completion = self
+            .inner
+            .actor
+            .borrow()
+            .as_ref()
+            .ok_or_else(|| js_error("runtime actor not initialized"))?
+            .send_data(spec, payload.to_vec())
+            .map_err(js_error)?;
+        Ok(future_to_promise(async move {
+            completion
+                .await
+                .map_err(|_| js_error("data send was canceled"))?
+                .map_err(resources::send_error)?;
+            Ok(JsValue::UNDEFINED)
+        }))
+    }
+
+    #[wasm_bindgen(unchecked_return_type = "Promise<void>")]
     pub fn send_topic(
         &self,
         name: &str,

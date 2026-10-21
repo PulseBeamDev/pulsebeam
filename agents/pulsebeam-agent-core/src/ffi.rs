@@ -377,6 +377,10 @@ pub enum Notification {
     DataReady {
         owners: Vec<u64>,
     },
+    DataSendFinished {
+        send: u64,
+        error: Option<String>,
+    },
     Topic {
         notification: TopicNotification,
     },
@@ -1020,6 +1024,10 @@ impl From<model::Notification> for Notification {
             },
             model::Notification::SnapshotChanged => Self::SnapshotChanged,
             model::Notification::DataReady { owners } => Self::DataReady { owners },
+            model::Notification::DataSendFinished { send, error } => Self::DataSendFinished {
+                send: send.get(),
+                error: error.map(|error| error.to_string()),
+            },
             model::Notification::Topic(notification) => Self::Topic {
                 notification: notification.into(),
             },

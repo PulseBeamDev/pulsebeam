@@ -97,6 +97,10 @@ export async function topicContract(pulsebeam, BrowserRuntime) {
       this.label = label;
     }
     send(value) {
+      if (this.rejectNextSend) {
+        this.rejectNextSend = false;
+        throw new Error("controlled host rejection");
+      }
       this.sent.push(Uint8Array.from(value));
     }
     open() {
@@ -415,13 +419,24 @@ export async function topicContract(pulsebeam, BrowserRuntime) {
         if (event.type === "data-ready")
           for (const owner of event.owners) ready.add(owner);
       });
+      await assert.rejects(owned.send_data(spec, Uint8Array.of(255)), {
+        pulsebeamCode: "not-connected",
+      });
       const index = peers.length;
       owned.connect();
+      const payload = Uint8Array.of(255, 0, 128);
+      const sent = owned.send_data(spec, payload);
+      payload.fill(1);
       await until(
         () => peers[index]?.answerApplied,
         "owned receive answer was not applied",
       );
-      const peer = peers[index];
+      peers[index].open();
+      await until(
+        () => peers[index + 1]?.answerApplied,
+        "lazy producer handoff was not applied",
+      );
+      const peer = peers[index + 1];
       peer.open();
       await until(
         () => owned.snapshot().connection === "connected",
@@ -434,6 +449,21 @@ export async function topicContract(pulsebeam, BrowserRuntime) {
         () => BigInt(owned.snapshot().catalog.revision) === 1n,
         "owned catalog was not applied",
       );
+      await sent;
+      const publisher = peer.channels.get("v2/ordered/pub/events");
+      assert.deepEqual(publisher.sent, [
+        bytes(
+          1,
+          join(
+            text(1, "server-local-track"),
+            bytes(3, Uint8Array.of(255, 0, 128)),
+          ),
+        ),
+      ]);
+      publisher.rejectNextSend = true;
+      await assert.rejects(owned.send_data(spec, Uint8Array.of(2)), {
+        pulsebeamCode: "host-rejected",
+      });
       const channel = peer.channels.get("v2/ordered/sub/events");
       channel.receive(frame(4, expected));
       channel.receive(frame(1, available, Uint8Array.of(255, 0, 128)));
@@ -470,6 +500,12 @@ export async function topicContract(pulsebeam, BrowserRuntime) {
       for (const owner of [all.owner, alice.owner, bob.owner])
         await resource({ op: "release", owner });
       assert.deepEqual(owned.snapshot().topics.subscribers, []);
+      const canceledSend = assert.rejects(
+        owned.send_data(spec, Uint8Array.of(3)),
+        { pulsebeamCode: "not-connected" },
+      );
+      owned.close();
+      await canceledSend;
     } finally {
       owned.close();
       owned.abort();

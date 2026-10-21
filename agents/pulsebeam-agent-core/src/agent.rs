@@ -282,6 +282,39 @@ impl Agent {
         result
     }
 
+    pub fn host_failed(&mut self, failure: Failure) -> Result<(), AgentError> {
+        self.fail_terminal(failure);
+        self.flush_notifications()
+    }
+
+    pub fn send_data(
+        &mut self,
+        spec: crate::TrackSpec,
+        payload: Vec<u8>,
+    ) -> Result<OperationId, AgentError> {
+        if !self.desired.connected {
+            return Err(crate::TrackResourceError::NotConnected.into());
+        }
+        let subscriber = spec.subscriber()?;
+        let send = crate::TopicSend {
+            publisher: crate::TopicPublisher {
+                topic: subscriber.topic,
+                mode: subscriber.mode,
+            },
+            payload,
+        };
+        if self.snapshot.terminal_failure.is_some() {
+            return Err(crate::TopicError::PublisherUnavailable(send.publisher.topic).into());
+        }
+        self.topics.validate_data_send(&send)?;
+        self.resource_command(crate::ResourceCommand::RetainProducer { spec })?;
+        let ticket = self
+            .topics
+            .begin_data_send(send, &mut self.ids, &mut self.effects);
+        self.flush_notifications()?;
+        Ok(ticket)
+    }
+
     pub fn resource(
         &mut self,
         command: crate::ResourceCommand,
@@ -436,6 +469,13 @@ impl Agent {
     }
 
     fn flush_notifications(&mut self) -> Result<(), AgentError> {
+        self.topics.progress_data_sends(
+            self.desired.connected,
+            &mut self.ids,
+            &mut self.effects,
+            &mut self.snapshot,
+            &mut self.notifications,
+        );
         let mut ready = BTreeSet::new();
         while let Some(notification) = self.notifications.pop_front() {
             if let Notification::Topic(topic) = &notification {
@@ -1038,6 +1078,13 @@ impl Agent {
                             .probe_remote_publishers(&mut self.ids, &mut self.effects);
                     }
                     self.schedule_topic_probe();
+                } else {
+                    self.topics.expire_data_send(
+                        timer,
+                        &mut self.effects,
+                        &mut self.snapshot,
+                        &mut self.notifications,
+                    );
                 }
             }
         }
@@ -1123,6 +1170,7 @@ impl Agent {
                     let topic_closed = self.topics.channel_closed(
                         generation,
                         channel,
+                        &mut self.effects,
                         &mut self.snapshot,
                         &mut self.notifications,
                     );

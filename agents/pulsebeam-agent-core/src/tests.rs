@@ -18,6 +18,8 @@ use pulsebeam_proto::{
 
 use crate::*;
 
+mod data_send;
+
 const PARTICIPANT_URI: &str = "https://other-origin.test/an%20opaque/path?value=%2Fexact";
 const LOCAL_PUBLISHER: &str = "pa_00000000000000000000000000";
 const REMOTE_PUBLISHER: &str = "pa_11111111111111111111111111";

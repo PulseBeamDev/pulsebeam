@@ -20,6 +20,9 @@ use crate::{
     id::IdGenerator,
 };
 
+mod admission;
+pub use admission::DataSendFailure;
+
 pub const MAX_TOPIC_CHANNELS: usize = 64;
 pub const MAX_TOPIC_PAYLOAD_BYTES: usize = pulsebeam_proto::topic::MAX_PAYLOAD_BYTES;
 pub const TOPIC_HISTORY_CAPACITY: usize = 256;
@@ -199,6 +202,12 @@ struct PendingSend {
     operation: OperationId,
     generation: Generation,
     channel: ChannelId,
+    admission: Option<OperationId>,
+}
+
+struct QueuedMessage {
+    message: WireMessage,
+    admission: Option<OperationId>,
 }
 
 #[derive(Default)]
@@ -206,7 +215,7 @@ struct PublisherState {
     data_track_id: Option<String>,
     next_sequence: u64,
     history: VecDeque<WireMessage>,
-    queue: VecDeque<WireMessage>,
+    queue: VecDeque<QueuedMessage>,
     pending: Option<PendingSend>,
 }
 
@@ -245,6 +254,7 @@ pub(crate) struct Topics {
     active: Option<ActiveTopics>,
     catalog: BTreeMap<String, CatalogBinding>,
     auxiliary_sends: BTreeMap<OperationId, AuxiliarySend>,
+    admissions: BTreeMap<OperationId, admission::Admission>,
     accepted_sends: u64,
     dropped_sends: u64,
     delivered_messages: u64,
@@ -610,6 +620,22 @@ impl Topics {
         snapshot: &mut Snapshot,
         notifications: &mut VecDeque<Notification>,
     ) -> Result<(), TopicError> {
+        self.send_owned(send, None, ids, effects, snapshot, notifications)
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "owned sends reuse the native topic queue and correlation"
+    )]
+    fn send_owned(
+        &mut self,
+        send: TopicSend,
+        admission: Option<OperationId>,
+        ids: &mut IdGenerator,
+        effects: &mut VecDeque<Effect>,
+        snapshot: &mut Snapshot,
+        notifications: &mut VecDeque<Notification>,
+    ) -> Result<(), TopicError> {
         if validate_topic(&send.publisher.topic).is_err() {
             self.record_drop(
                 &send.publisher,
@@ -632,6 +658,7 @@ impl Topics {
             });
         }
         let channel = self.channel_for_publisher(&send.publisher);
+        let waiting = self.waiting_data_sends(&send.publisher);
         let Some(state) = self.publishers.get_mut(&send.publisher) else {
             self.record_drop(
                 &send.publisher,
@@ -668,6 +695,7 @@ impl Topics {
             .queue
             .len()
             .saturating_add(usize::from(state.pending.is_some()))
+            .saturating_add(waiting)
             >= TOPIC_SEND_QUEUE_CAPACITY
         {
             self.record_drop(&send.publisher, TopicDropReason::QueueFull, notifications);
@@ -689,7 +717,7 @@ impl Topics {
             }
             state.history.push_back(message.clone());
         }
-        state.queue.push_back(message);
+        state.queue.push_back(QueuedMessage { message, admission });
         if superseded {
             self.record_drop(&send.publisher, TopicDropReason::Superseded, notifications);
         }
@@ -717,7 +745,7 @@ impl Topics {
         ids: &mut IdGenerator,
         effects: &mut VecDeque<Effect>,
         snapshot: &mut Snapshot,
-        _notifications: &mut VecDeque<Notification>,
+        notifications: &mut VecDeque<Notification>,
     ) -> bool {
         if self
             .auxiliary_sends
@@ -730,8 +758,13 @@ impl Topics {
         let Some(publisher) = self.pending_publisher(operation, generation, channel) else {
             return false;
         };
-        if let Some(state) = self.publishers.get_mut(&publisher) {
-            state.pending = None;
+        if let Some(ticket) = self
+            .publishers
+            .get_mut(&publisher)
+            .and_then(|state| state.pending.take())
+            .and_then(|pending| pending.admission)
+        {
+            self.finish_data_send(ticket, None, effects, notifications);
         }
         self.dispatch_publisher(&publisher, ids, effects);
         self.refresh_snapshot(snapshot);
@@ -759,7 +792,7 @@ impl Topics {
             .is_some_and(|pending| pending.generation == generation && pending.channel == channel)
         {
             if let Some(pending) = self.auxiliary_sends.remove(&operation) {
-                self.record_channel_failure(pending.registration, message, notifications);
+                self.record_channel_failure(pending.registration, message, effects, notifications);
             }
             self.refresh_snapshot(snapshot);
             return true;
@@ -770,10 +803,17 @@ impl Topics {
         if let Some(state) = self.publishers.get_mut(&publisher) {
             state.pending = None;
         }
+        self.fail_publisher_sends(
+            &publisher,
+            DataSendFailure::HostRejected,
+            effects,
+            notifications,
+        );
         self.record_drop(&publisher, TopicDropReason::HostRejected, notifications);
         self.record_channel_failure(
             TopicChannel::Publisher(publisher.clone()),
             message,
+            effects,
             notifications,
         );
         self.dispatch_publisher(&publisher, ids, effects);
@@ -947,6 +987,7 @@ impl Topics {
         &mut self,
         generation: Generation,
         channel: ChannelId,
+        effects: &mut VecDeque<Effect>,
         snapshot: &mut Snapshot,
         notifications: &mut VecDeque<Notification>,
     ) -> bool {
@@ -978,7 +1019,12 @@ impl Topics {
                 TopicChannel::Subscriber(subscriber)
             }
         };
-        self.record_channel_failure(failed, "data channel closed".to_string(), notifications);
+        self.record_channel_failure(
+            failed,
+            "data channel closed".to_string(),
+            effects,
+            notifications,
+        );
         self.refresh_snapshot(snapshot);
         true
     }
@@ -1082,7 +1128,7 @@ impl Topics {
         let Some(channel) = self.channel_for_publisher(publisher) else {
             return;
         };
-        let Some(active) = self.active.as_ref() else {
+        let Some(generation) = self.active.as_ref().map(|active| active.generation) else {
             return;
         };
         let Some(state) = self.publishers.get_mut(publisher) else {
@@ -1097,16 +1143,20 @@ impl Topics {
         let operation = ids.operation();
         state.pending = Some(PendingSend {
             operation,
-            generation: active.generation,
+            generation,
             channel,
+            admission: message.admission,
         });
+        if let Some(ticket) = message.admission {
+            self.dispatch_data_send(ticket, effects);
+        }
         effects.push_back(Effect::DataChannel(DataChannelEffect::Send {
             operation,
-            generation: active.generation,
+            generation,
             channel,
             binary: true,
             payload: TopicFrame {
-                body: Some(Body::Message(message)),
+                body: Some(Body::Message(message.message)),
             }
             .encode_to_vec(),
         }));
@@ -1186,8 +1236,17 @@ impl Topics {
         &mut self,
         channel: TopicChannel,
         message: String,
+        effects: &mut VecDeque<Effect>,
         notifications: &mut VecDeque<Notification>,
     ) {
+        if let TopicChannel::Publisher(publisher) = &channel {
+            self.fail_publisher_sends(
+                publisher,
+                DataSendFailure::ChannelFailed,
+                effects,
+                notifications,
+            );
+        }
         self.channel_failures = self.channel_failures.saturating_add(1);
         if self.log_level.allows(log::Level::Warn) {
             log::warn!("topic channel failed channel={channel:?}: {message}");

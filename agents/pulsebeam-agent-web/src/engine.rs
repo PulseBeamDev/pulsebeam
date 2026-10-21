@@ -1,5 +1,5 @@
 use std::cell::Cell;
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 
 use futures_channel::oneshot;
@@ -16,6 +16,18 @@ pub(crate) enum Input {
     Command(AgentCommand),
     Event(HostEvent),
 }
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum DataSendError {
+    #[error(transparent)]
+    Admission(#[from] AgentError),
+    #[error(transparent)]
+    Delivery(#[from] agent_core::DataSendFailure),
+    #[error("data send runtime is closed")]
+    Closed,
+}
+
+type DataSendCompletion = oneshot::Sender<Result<(), DataSendError>>;
 
 #[derive(Default)]
 pub(crate) struct Turn {
@@ -76,6 +88,28 @@ impl Driver {
         .map(|error| TurnError { source, error });
 
         self.finish_turn(error)
+    }
+
+    fn host_failed(&mut self, failure: Failure) -> Turn {
+        let error = self
+            .agent
+            .host_failed(failure)
+            .err()
+            .map(|error| TurnError {
+                source: TurnErrorSource::HostEvent,
+                error,
+            });
+        self.finish_turn(error)
+    }
+
+    pub(crate) fn send_data(
+        &mut self,
+        spec: agent_core::TrackSpec,
+        payload: Vec<u8>,
+    ) -> (Result<agent_core::OperationId, AgentError>, Turn) {
+        let result = self.agent.send_data(spec, payload);
+        let turn = self.finish_turn(None);
+        (result, turn)
     }
 
     pub(crate) fn resource(
@@ -163,6 +197,11 @@ pub(crate) enum Message {
         expected_data_track_id: String,
         completion: oneshot::Sender<Result<(), String>>,
     },
+    DataSend {
+        spec: agent_core::TrackSpec,
+        payload: Vec<u8>,
+        completion: DataSendCompletion,
+    },
     Resource {
         command: agent_core::ResourceCommand,
         completion: oneshot::Sender<Result<agent_core::ResourceResult, AgentError>>,
@@ -217,6 +256,20 @@ impl ActorHandle {
         Ok(receiver)
     }
 
+    pub(crate) fn send_data(
+        &self,
+        spec: agent_core::TrackSpec,
+        payload: Vec<u8>,
+    ) -> Result<oneshot::Receiver<Result<(), DataSendError>>, String> {
+        let (completion, receiver) = oneshot::channel();
+        self.send(Message::DataSend {
+            spec,
+            payload,
+            completion,
+        })?;
+        Ok(receiver)
+    }
+
     pub(crate) fn send_resource(
         &self,
         command: agent_core::ResourceCommand,
@@ -261,8 +314,8 @@ pub(crate) struct Actor<H: Host> {
     snapshots: watch::Sender<Snapshot>,
     running: bool,
     closed: bool,
-    failure: Option<Failure>,
     last_snapshot: Option<Snapshot>,
+    data_sends: BTreeMap<agent_core::OperationId, DataSendCompletion>,
 }
 
 impl<H: Host> Actor<H> {
@@ -280,8 +333,8 @@ impl<H: Host> Actor<H> {
             snapshots,
             running: true,
             closed: false,
-            failure: None,
             last_snapshot: None,
+            data_sends: BTreeMap::new(),
         })
     }
 
@@ -339,12 +392,9 @@ impl<H: Host> Actor<H> {
     }
 
     fn host_failure(&mut self, failure: Failure) {
-        let changed = self.failure.as_ref() != Some(&failure);
-        self.failure = Some(failure);
-        self.host.host_failed(self.failure.as_ref().unwrap());
-        if changed {
-            self.publish_snapshot(true);
-        }
+        self.host.host_failed(&failure);
+        let turn = self.driver.host_failed(failure);
+        self.publish_turn(turn);
     }
 
     fn turn(&mut self, input: Input) {
@@ -357,15 +407,11 @@ impl<H: Host> Actor<H> {
     }
 
     fn publish_turn(&mut self, mut turn: Turn) {
-        let mut snapshot = if let Some(snapshot) = turn.snapshot.clone() {
+        let snapshot = if let Some(snapshot) = turn.snapshot.clone() {
             snapshot
         } else {
             self.driver.snapshot().clone()
         };
-        if let Some(failure) = self.failure.as_ref() {
-            snapshot.terminal_failure = Some(failure.clone());
-        }
-
         let should_publish_snapshot = self
             .last_snapshot
             .as_ref()
@@ -380,38 +426,21 @@ impl<H: Host> Actor<H> {
             }
         }
 
+        for notification in &turn.notifications {
+            if let Notification::DataSendFinished { send, error } = notification
+                && let Some(completion) = self.data_sends.remove(send)
+            {
+                let _ = completion
+                    .send(error.map_or(Ok(()), |error| Err(DataSendError::Delivery(error))));
+            }
+        }
+
         for effect in turn.effects.drain(..) {
             self.host.execute_effect(effect);
         }
 
         if !turn.notifications.is_empty() || turn.error.is_some() {
             self.host.publish_turn(&turn);
-        }
-    }
-
-    fn publish_snapshot(&mut self, force: bool) {
-        if self.closed {
-            return;
-        }
-
-        let mut snapshot = self.driver.snapshot().clone();
-        if let Some(failure) = self.failure.as_ref() {
-            snapshot.terminal_failure = Some(failure.clone());
-        }
-
-        let should_publish = force
-            || self
-                .last_snapshot
-                .as_ref()
-                .is_none_or(|previous| *previous != snapshot);
-        if should_publish {
-            let published = self.snapshots.send(snapshot.clone());
-            if published {
-                self.last_snapshot = Some(snapshot);
-            }
-            if !published {
-                self.shutdown();
-            }
         }
     }
 
@@ -431,6 +460,9 @@ impl<H: Host> Actor<H> {
 
         self.closed = true;
         self.running = false;
+        for (_, completion) in std::mem::take(&mut self.data_sends) {
+            let _ = completion.send(Err(DataSendError::Closed));
+        }
         self.host.shutdown();
         self.snapshots.close();
         if self.last_snapshot.is_some() {
@@ -440,6 +472,9 @@ impl<H: Host> Actor<H> {
 
     fn process(&mut self, message: Message) {
         if self.closed {
+            if let Message::DataSend { completion, .. } = message {
+                let _ = completion.send(Err(DataSendError::Closed));
+            }
             return;
         }
 
@@ -464,6 +499,22 @@ impl<H: Host> Actor<H> {
                     expected_generation,
                     &expected_data_track_id,
                 ));
+            }
+            Message::DataSend {
+                spec,
+                payload,
+                completion,
+            } => {
+                let (result, turn) = self.driver.send_data(spec, payload);
+                match result {
+                    Ok(ticket) => {
+                        self.data_sends.insert(ticket, completion);
+                    }
+                    Err(error) => {
+                        let _ = completion.send(Err(DataSendError::Admission(error)));
+                    }
+                }
+                self.publish_turn(turn);
             }
             Message::Resource {
                 command,
@@ -554,6 +605,7 @@ impl<T> SerialQueue<T> {
 
 #[cfg(test)]
 mod tests {
+    use futures_channel::oneshot;
     use std::cell::RefCell;
 
     use super::{
@@ -561,8 +613,8 @@ mod tests {
         TurnErrorSource,
     };
     use agent_core::{
-        AgentCommand, ChannelId, DesiredState, Effect, Failure, FailureClass, HostEvent,
-        OfferResources, RtcEffect, RtcEvent, TopicMode, TopicPublisher, TopicSend,
+        AgentCommand, ChannelId, ConnectionState, DesiredState, Effect, Failure, FailureClass,
+        HostEvent, OfferResources, RtcEffect, RtcEvent, TopicMode, TopicPublisher, TopicSend,
     };
 
     #[derive(Default)]
@@ -762,37 +814,56 @@ mod tests {
 
         let after = actor.published_snapshot().unwrap();
         assert_eq!(after.terminal_failure.unwrap().message, "boom");
-        assert_eq!(after.version, before_version);
+        assert!(after.version > before_version);
+        assert_eq!(
+            actor.driver.snapshot().connection,
+            ConnectionState::TerminalFailure
+        );
 
         actor.process(Message::HostFailure(Failure {
             class: FailureClass::Protocol,
             message: "boom".into(),
         }));
-        let final_failure = actor
-            .published_snapshot()
-            .unwrap()
-            .terminal_failure
-            .expect("failure should remain");
-        assert_eq!(final_failure.message, "boom");
+        let final_snapshot = actor.published_snapshot().unwrap();
+        assert_eq!(final_snapshot.version, after.version);
+        assert_eq!(final_snapshot.terminal_failure.unwrap().message, "boom");
     }
 
     #[test]
-    fn duplicate_public_failures_are_not_republished() {
-        let host = FakeHost::default();
-        let mut actor = Actor::new(config(), host).unwrap();
-
+    fn host_failure_rejects_owned_sends_and_explicit_connect_retries_core_state() {
+        let mut actor = Actor::new(config(), FakeHost::default()).unwrap();
+        actor.process(Message::Public(PublicCommand::SetConnected(true)));
+        let (completion, mut pending) = oneshot::channel();
+        actor.process(Message::DataSend {
+            spec: agent_core::TrackSpec::Data {
+                label: "pending".into(),
+                delivery: agent_core::TopicMode::Lossy,
+            },
+            payload: vec![0, 255],
+            completion,
+        });
+        assert!(pending.try_recv().unwrap().is_none());
         actor.process(Message::HostFailure(Failure {
             class: FailureClass::Protocol,
             message: "boom".into(),
         }));
-        let first_version = actor.published_snapshot().unwrap().version;
-
-        actor.process(Message::HostFailure(Failure {
-            class: FailureClass::Protocol,
-            message: "boom".into(),
-        }));
-        let second_version = actor.published_snapshot().unwrap().version;
-        assert_eq!(first_version, second_version);
+        assert!(matches!(
+            pending.try_recv().unwrap(),
+            Some(Err(super::DataSendError::Delivery(
+                agent_core::DataSendFailure::TerminalFailure
+            )))
+        ));
+        assert_eq!(
+            actor.driver.snapshot().connection,
+            ConnectionState::TerminalFailure
+        );
+        actor.process(Message::Public(PublicCommand::SetConnected(true)));
+        assert!(actor.driver.snapshot().terminal_failure.is_none());
+        assert!(matches!(
+            actor.driver.snapshot().connection,
+            ConnectionState::CreatingOffer
+        ));
+        assert!(actor.data_sends.is_empty());
     }
 
     #[test]

@@ -41,6 +41,20 @@ opaque bytes, participant filtering, delivery-mode bounds, and inline ordered
 gaps. Hosts own browser objects, pending reads, and physical teardown, not a
 second copy of this policy.
 
+`Agent::send_data` admits owned binary payloads and retains producer interest for
+the Agent lifetime. Binding and dispatch wait is bounded to ten seconds, with at
+most 256 pending sends per publisher and a 65,536-byte payload limit. Dispatch
+cancels the admission deadline; host acceptance or failure then settles the
+returned ticket through `Notification::DataSendFinished`. Success is not a remote
+receipt acknowledgment. Latest
+supersession, disconnect, terminal or channel failure, binding replacement,
+timeout, and host rejection settle affected tickets without retargeting bytes.
+The legacy native `SendTopic` command retains its queue-admission semantics.
+
+Report host failures through `Agent::host_failed` rather than overriding a
+snapshot. Core owns failure notification, pending-send rejection, and explicit
+`connect` retry through the same connection state machine.
+
 ## Does not own
 
 * HTTP execution
