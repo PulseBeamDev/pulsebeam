@@ -8,7 +8,7 @@
 
 use super::{ReceiveTime, RecvPacketBatch, SendPacketBatch};
 use crate::net::Transport;
-use crate::{mailbox, net::SendPacket};
+use crate::{mailbox, net::SendPacket, sync::Arc};
 use bytes::{Buf, BufMut, BytesMut};
 use pulsebeam_core::net::{TcpReadHalf, TcpStream, TcpWriteHalf, split_tcp};
 use std::{
@@ -17,6 +17,7 @@ use std::{
     net::{IpAddr, SocketAddr},
     time::Duration,
 };
+use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
 /// RFC 4571 carries a 16-bit unsigned payload length. TCP does not inherit
@@ -134,7 +135,7 @@ const MAX_RECV_BUF: usize = MAX_FRAME_SIZE + 2 + 64;
 const MAX_TCP_WRITE_BUF: usize = 256 * 1024;
 /// How long a connection may be idle before the read task reaps it.
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
-/// Channel capacity for TCP events (frames + close notifications).
+/// Channel capacity for decoded frames, write readiness and close notifications.
 const TCP_EVENT_CAPACITY: usize = 8_192;
 
 /// A stream incarnation, unique for the lifetime of its owning TCP transport.
@@ -147,7 +148,7 @@ impl TcpFlowId {
     }
 }
 
-/// Events produced by per-connection read tasks and consumed by `TcpTransport`.
+/// Events produced by per-connection IO tasks and consumed by `TcpTransport`.
 enum TcpEvent {
     /// A fully-decoded RFC 4571 payload ready to hand to the shard.
     Frame {
@@ -156,6 +157,8 @@ enum TcpEvent {
         payload: Vec<u8>,
         received_at: ReceiveTime,
     },
+    /// A stalled stream can resume its original pending write buffer.
+    Writable { src: SocketAddr, flow: TcpFlowId },
     /// The read task exited (EOF, error, idle timeout, or cancellation).
     Closed { src: SocketAddr, flow: TcpFlowId },
 }
@@ -168,109 +171,177 @@ struct TcpConn {
     /// Bytes already framed but not yet accepted by the kernel. A partial TCP
     /// write must be resumed before a later frame can be sent.
     pending: BytesMut,
-    /// Cancels the associated read task when the connection is removed.
+    /// Cancels the associated IO task when the connection is removed.
     cancel: CancellationToken,
+    // Coalesced pressure-edge notification only; write bytes remain shard-owned.
+    write_ready: Arc<Notify>,
+    write_watch_armed: bool,
 }
 
-/// Read task for a single TCP connection.
+impl TcpConn {
+    fn flush_pending(&mut self) -> io::Result<()> {
+        for _ in 0..super::BATCH_SIZE {
+            if self.pending.is_empty() {
+                break;
+            }
+            match self.write.try_write(&self.pending) {
+                Ok(0) => return Err(io::Error::from(io::ErrorKind::BrokenPipe)),
+                Ok(count) => {
+                    if count > self.pending.len() {
+                        return Err(io::Error::from(io::ErrorKind::InvalidData));
+                    }
+                    self.pending.advance(count);
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+
+    fn arm_write_ready(&mut self) {
+        if !self.pending.is_empty() && !self.write_watch_armed {
+            self.write_watch_armed = true;
+            self.write_ready.notify_one();
+        }
+    }
+}
+
+/// Read and writable-readiness task for a single TCP connection.
 ///
-/// Runs on the same thread as the shard (`spawn_local`).  Owns the read half
-/// of the stream so the shard's hot-path never touches it.  Decodes RFC 4571
+/// Runs on the shard runtime and owns the read half, so the shard's hot path
+/// never touches it. Decodes RFC 4571
 /// frames and forwards them through `tx`.  Exits on EOF, I/O error, idle
 /// timeout, or cancellation. EOF, error and timeout produce `TcpEvent::Closed`;
 /// the owning transport reports local cancellation.
-async fn tcp_read_task(
+struct TcpIoTask {
     peer_addr: SocketAddr,
     flow: TcpFlowId,
     read: TcpReadHalf,
-    mut pending: BytesMut,
-    mut received_at: ReceiveTime,
+    pending: BytesMut,
+    received_at: ReceiveTime,
     tx: mailbox::Sender<TcpEvent>,
     cancel: CancellationToken,
-) {
-    let mut recv_buf = BytesMut::with_capacity(MAX_FRAME_SIZE + 2);
-    // Carry over any bytes already decoded by the controller's first-frame read.
-    if !pending.is_empty() {
-        recv_buf.extend_from_slice(&pending);
-        pending.clear();
-    }
+    write_ready: Arc<Notify>,
+}
 
-    'outer: loop {
-        // Decode all complete frames currently in the buffer before waiting.
-        while let Some(len) = frame_len_at(&recv_buf, 0) {
-            if len == 0 || len > MAX_FRAME_SIZE {
-                tracing::warn!(%peer_addr, len, "Invalid TCP frame length, closing connection");
-                break 'outer;
-            }
-            if recv_buf.len() < len.saturating_add(2) {
-                break; // partial frame
-            }
-            recv_buf.advance(2);
-            let payload = recv_buf.split_to(len).to_vec();
-            let event = TcpEvent::Frame {
-                src: peer_addr,
-                flow,
-                payload,
-                received_at,
-            };
-            tokio::select! {
-                biased;
-                _ = cancel.cancelled() => return,
-                result = tx.send(event) => {
-                    if result.is_err() {
-                        return;
+impl TcpIoTask {
+    async fn run(self) {
+        let Self {
+            peer_addr,
+            flow,
+            read,
+            mut pending,
+            mut received_at,
+            tx,
+            cancel,
+            write_ready,
+        } = self;
+        let mut recv_buf = BytesMut::with_capacity(MAX_FRAME_SIZE + 2);
+        // Carry over any bytes already decoded by the controller's first-frame read.
+        if !pending.is_empty() {
+            recv_buf.extend_from_slice(&pending);
+            pending.clear();
+        }
+
+        let mut watch_write = false;
+        'outer: loop {
+            // Decode all complete frames currently in the buffer before waiting.
+            while let Some(len) = frame_len_at(&recv_buf, 0) {
+                if len == 0 || len > MAX_FRAME_SIZE {
+                    tracing::warn!(%peer_addr, len, "Invalid TCP frame length, closing connection");
+                    break 'outer;
+                }
+                if recv_buf.len() < len.saturating_add(2) {
+                    break; // partial frame
+                }
+                recv_buf.advance(2);
+                let payload = recv_buf.split_to(len).to_vec();
+                let event = TcpEvent::Frame {
+                    src: peer_addr,
+                    flow,
+                    payload,
+                    received_at,
+                };
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => return,
+                    result = tx.send(event) => {
+                        if result.is_err() {
+                            return;
+                        }
                     }
                 }
             }
-        }
 
-        if recv_buf.len() > MAX_RECV_BUF {
-            tracing::warn!(%peer_addr, "TCP recv_buf overflow, closing connection");
-            break;
-        }
-
-        // Wait for readability, cancellation, or idle timeout.
-        tokio::select! {
-            biased;
-            _ = cancel.cancelled() => break,
-            result = tokio::time::timeout(READ_TIMEOUT, read.readable()) => {
-                match result {
-                    Err(_) => {
-                        tracing::warn!(%peer_addr, "TCP connection idle timeout");
-                        break;
-                    }
-                    Ok(Err(e)) => {
-                        tracing::warn!(%peer_addr, error = ?e, "TCP readable error");
-                        break;
-                    }
-                    Ok(Ok(())) => {}
-                }
-            }
-        }
-
-        // Non-blocking read from the kernel.
-        let mut tmp = [0u8; 4096];
-        match read.try_read(&mut tmp) {
-            Ok(0) => break, // EOF
-            Ok(n) => {
-                received_at = ReceiveTime::now();
-                match tmp.get(..n) {
-                    Some(chunk) => recv_buf.put_slice(chunk),
-                    None => break,
-                }
-            }
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
-            Err(e) => {
-                tracing::warn!(%peer_addr, error = ?e, "TCP read error");
+            if recv_buf.len() > MAX_RECV_BUF {
+                tracing::warn!(%peer_addr, "TCP recv_buf overflow, closing connection");
                 break;
             }
-        }
-    }
 
-    tokio::select! {
-        biased;
-        _ = cancel.cancelled() => {}
-        _ = tx.send(TcpEvent::Closed { src: peer_addr, flow }) => {}
+            let read_ready = tokio::time::timeout(READ_TIMEOUT, read.readable());
+            tokio::pin!(read_ready);
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => break 'outer,
+                    _ = write_ready.notified(), if !watch_write => watch_write = true,
+                    result = pulsebeam_core::net::tcp_write_ready(&read), if watch_write => {
+                        if let Err(error) = result {
+                            tracing::warn!(%peer_addr, %error, "TCP writable error");
+                            break 'outer;
+                        }
+                        tokio::select! {
+                            biased;
+                            _ = cancel.cancelled() => return,
+                            result = tx.send(TcpEvent::Writable { src: peer_addr, flow }) => {
+                                if result.is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                        watch_write = false;
+                    }
+                    result = &mut read_ready => {
+                        match result {
+                            Err(_) => {
+                                tracing::warn!(%peer_addr, "TCP connection idle timeout");
+                                break 'outer;
+                            }
+                            Ok(Err(error)) => {
+                                tracing::warn!(%peer_addr, %error, "TCP readable error");
+                                break 'outer;
+                            }
+                            Ok(Ok(())) => break,
+                        }
+                    }
+                }
+            }
+
+            // Non-blocking read from the kernel.
+            let mut tmp = [0u8; 4096];
+            match read.try_read(&mut tmp) {
+                Ok(0) => break, // EOF
+                Ok(n) => {
+                    received_at = ReceiveTime::now();
+                    match tmp.get(..n) {
+                        Some(chunk) => recv_buf.put_slice(chunk),
+                        None => break,
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+                Err(e) => {
+                    tracing::warn!(%peer_addr, error = ?e, "TCP read error");
+                    break;
+                }
+            }
+        }
+
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {}
+            _ = tx.send(TcpEvent::Closed { src: peer_addr, flow }) => {}
+        }
     }
 }
 
@@ -278,10 +349,10 @@ async fn tcp_read_task(
 ///
 /// ## Thread-per-core design
 ///
-/// One `spawn_local` task is created per accepted connection.  Each task owns
-/// the read half of the stream and runs on the **same OS thread** as the shard
-/// (Tokio `LocalSet`).  The shard's hot-path only touches a single
-/// `mpsc::Receiver` — O(1) regardless of how many streams are open — so TCP
+/// One IO task is created per accepted connection. Each task owns the read
+/// half and watches readiness; all pending writes remain shard-owned. The
+/// shard's hot path only consumes a single mailbox, independent of the number
+/// of open streams, so TCP
 /// has zero overhead on the UDP forwarding path when no TCP data is arriving.
 ///
 /// ## Complexity
@@ -422,18 +493,23 @@ impl TcpTransport {
 
         let (read, write) = split_tcp(raw);
         let cancel = CancellationToken::new();
+        let write_ready = Arc::new(Notify::new());
 
-        // Spawn the read task on the same thread.  It owns `read` and forwards
-        // decoded frames through `event_tx` until cancelled or the stream closes.
-        tokio::task::spawn(tcp_read_task(
-            peer_addr,
-            flow,
-            read,
-            pending,
-            received_at,
-            self.event_tx.clone(),
-            cancel.clone(),
-        ));
+        // The IO task owns only the read half and readiness watches. Pending
+        // framed writes remain exclusively owned and drained by the shard.
+        tokio::task::spawn(
+            TcpIoTask {
+                peer_addr,
+                flow,
+                read,
+                pending,
+                received_at,
+                tx: self.event_tx.clone(),
+                cancel: cancel.clone(),
+                write_ready: Arc::clone(&write_ready),
+            }
+            .run(),
+        );
 
         self.conns.insert(
             peer_addr,
@@ -442,6 +518,8 @@ impl TcpTransport {
                 write,
                 pending: BytesMut::new(),
                 cancel,
+                write_ready,
+                write_watch_armed: false,
             },
         );
         tracing::debug!(%peer_addr, "TCP connection added to shard");
@@ -478,7 +556,7 @@ impl TcpTransport {
         Some(conn.flow)
     }
 
-    /// Resolves when at least one TCP event (frame or close notification) is
+    /// Resolves when a decoded frame, write readiness or close notice is
     /// available.  Parks forever when no events are queued, letting the shard's
     /// `select!` fall through to other arms (e.g. UDP).
     ///
@@ -576,6 +654,18 @@ impl TcpTransport {
                     offset: 0,
                 });
             }
+            TcpEvent::Writable { src, flow } => {
+                let Some(conn) = self.conns.get_mut(&src).filter(|conn| conn.flow == flow) else {
+                    return;
+                };
+                conn.write_watch_armed = false;
+                let result = conn.flush_pending();
+                conn.arm_write_ready();
+                if let Err(error) = result {
+                    tracing::warn!(peer_addr = %src, %error, "TCP pending write error");
+                    self.close_flow(&src, flow);
+                }
+            }
             TcpEvent::Closed { src, flow } => {
                 if self.flow_for_peer(&src) == Some(flow) {
                     let _ = self.remove_conn(&src);
@@ -641,34 +731,14 @@ impl TcpTransport {
                 return Ok(true);
             };
 
-            while !conn.pending.is_empty() {
-                match conn.write.try_write(&conn.pending) {
-                    Ok(0) => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::BrokenPipe,
-                            "TCP write accepted zero bytes",
-                        ));
-                    }
-                    Ok(n) => {
-                        debug_assert!(n <= conn.pending.len());
-                        if n > conn.pending.len() {
-                            return Err(io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                "TCP write returned more bytes than supplied",
-                            ));
-                        }
-                        conn.pending.advance(n);
-                    }
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                        if conn.pending.len().saturating_add(buf.len()) > MAX_TCP_WRITE_BUF {
-                            return Ok(false);
-                        }
-                        conn.pending.extend_from_slice(&buf);
-                        debug_assert!(conn.pending.len() <= MAX_TCP_WRITE_BUF);
-                        return Ok(true);
-                    }
-                    Err(e) => return Err(e),
+            conn.flush_pending()?;
+            if !conn.pending.is_empty() {
+                if conn.pending.len().saturating_add(buf.len()) > MAX_TCP_WRITE_BUF {
+                    return Ok(false);
                 }
+                conn.pending.extend_from_slice(&buf);
+                debug_assert!(conn.pending.len() <= MAX_TCP_WRITE_BUF);
+                return Ok(true);
             }
 
             if buf.len() > MAX_TCP_WRITE_BUF {
@@ -680,7 +750,10 @@ impl TcpTransport {
                 return Ok(true);
             }
 
-            while !buf.is_empty() {
+            for _ in 0..super::BATCH_SIZE {
+                if buf.is_empty() {
+                    break;
+                }
                 match conn.write.try_write(&buf) {
                     Ok(0) => {
                         return Err(io::Error::new(
@@ -706,12 +779,19 @@ impl TcpTransport {
                     Err(e) => return Err(e),
                 }
             }
+            if !buf.is_empty() {
+                conn.pending.extend_from_slice(&buf);
+            }
             Ok(true)
         })();
 
         match outcome {
-            Ok(true) => {}
-            Ok(false) => return Ok(false),
+            Ok(accepted) => {
+                if let Some(conn) = self.conns.get_mut(&batch.dst) {
+                    conn.arm_write_ready();
+                }
+                return Ok(accepted);
+            }
             Err(error) => {
                 tracing::warn!(peer_addr = %batch.dst, %error, "TCP write error");
                 self.close_peer(&batch.dst);
@@ -1066,6 +1146,17 @@ mod tests {
             );
             assert_eq!(closed, vec![(peer_addr, flow)]);
             assert!(out.is_empty());
+            sock.handle_event(
+                TcpEvent::Writable {
+                    src: peer_addr,
+                    flow,
+                },
+                &mut out,
+                server_addr,
+                &mut closed,
+            );
+            assert_eq!(sock.flow_for_peer(&peer_addr), Some(replacement));
+            assert!(!sock.conns.get(&peer_addr).unwrap().write_watch_armed);
             closed.clear();
             for _ in 0..=super::super::BATCH_SIZE {
                 sock.event_tx

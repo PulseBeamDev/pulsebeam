@@ -25,6 +25,18 @@ pub fn split_tcp(stream: TcpStream) -> (TcpReadHalf, TcpWriteHalf) {
     stream.into_split()
 }
 
+// Readiness can be watched without sharing the owner's write buffer or write half.
+pub async fn tcp_write_ready(read: &TcpReadHalf) -> std::io::Result<()> {
+    #[cfg(not(feature = "sim"))]
+    {
+        read.as_ref().writable().await
+    }
+    #[cfg(feature = "sim")]
+    {
+        read.writable().await
+    }
+}
+
 #[cfg(feature = "sim")]
 mod sim {
     use axum::serve::Listener;
@@ -181,6 +193,20 @@ mod sim {
                 };
                 drop(guard); // release before returning Pending
                 result
+            })
+            .await
+        }
+
+        pub async fn writable(&self) -> io::Result<()> {
+            let inner = Arc::clone(&self.inner);
+            futures::future::poll_fn(move |cx| {
+                let Ok(guard) = inner.try_lock() else {
+                    cx.waker().wake_by_ref();
+                    return Poll::Pending;
+                };
+                let ready = guard.writable();
+                let mut ready = std::pin::pin!(ready);
+                std::future::Future::poll(ready.as_mut(), cx)
             })
             .await
         }
