@@ -442,6 +442,30 @@ export async function topicContract(pulsebeam) {
         { done: true, value: undefined },
       );
       assert.deepEqual(owned.getSnapshot().topics.subscribers, []);
+      const longLabel = "x".repeat(85);
+      const longNamed = owned
+        .track(pulsebeam.track.data(longLabel, "ordered"))
+        .events();
+      await until(
+        () =>
+          owned
+            .getSnapshot()
+            .topics.subscribers.some(({ name }) => name === longLabel),
+        "core-valid 85-character data label was rejected by the facade",
+      );
+      await longNamed.return();
+      await until(
+        () => owned.getSnapshot().topics.subscribers.length === 0,
+        "long-label stream did not release its interest",
+      );
+      for (const label of ["", "x".repeat(86), "with/slash", "é"]) {
+        const invalid = owned
+          .track(pulsebeam.track.data(label, "ordered"))
+          .events();
+        await assert.rejects(invalid.next(), { code: "validation" });
+        await invalid.return();
+      }
+      assert.deepEqual(owned.getSnapshot().topics.subscribers, []);
       const all = local.events();
       const alice = remote.events();
       const controller = new AbortController();

@@ -19,14 +19,8 @@ export interface DataTrackSpec<D extends Delivery = Delivery> {
 export type TrackSpec = VideoTrackSpec | AudioTrackSpec | DataTrackSpec;
 
 function label(value: string): string {
-  if (
-    typeof value !== "string" ||
-    value.length === 0 ||
-    new TextEncoder().encode(value).length > 64
-  )
-    throw new TypeError(
-      "track label must be a non-empty UTF-8 string of at most 64 bytes",
-    );
+  if (typeof value !== "string")
+    throw new TypeError("track label must be a string");
   return value;
 }
 
