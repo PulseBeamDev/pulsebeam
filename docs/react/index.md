@@ -11,6 +11,10 @@ media. Your application provides the server endpoint and participant token.
 
 **[Install the SDK and add your first room →](/react/quickstart)**
 
+These pages describe the track-centric API in the current source tree. Use
+matching Web and React packages that export this API; older released packages
+may expose a different interface.
+
 You build your application's backend and React frontend. PulseBeam supplies
 the media server, which you run with Docker or Podman. The
 [quickstart](/react/quickstart) shows the ownership and connection flow:
@@ -33,16 +37,17 @@ These concepts explain the quickstart after you have tried it:
 
 1. **Agent:** one room session handle for one participant. `useAgent` returns
    a handle immediately and owns its runtime while the component is mounted.
-2. **Capture:** `useUserMedia` and `useDisplayMedia` own local capture tracks.
-   Start capture from a user gesture. Connect alone does not open devices.
-3. **Publication:** `agent.local.video("camera")` and
-   `agent.local.audio("microphone")` return stable labeled component handles.
-   Render `<Camera source={capture.video} />` to declare a committed
-   publication. Lookup alone does not publish or reserve a slot.
-4. **Remote media:** `agent.remote` exposes participants and publications.
-   `Video` presents a track and requests reception while it is visible and
-   nonzero-sized. Remote audio playback is automatic once connected; a user
-   gesture may be needed to unblock it.
+2. **Capture:** `useCapture("device", options)` and
+   `useCapture("display", options)` own local capture tracks. Start capture
+   from a user gesture. Connect alone does not open devices.
+3. **Publication:** define stable descriptors with `track.video(...)` and
+   `track.audio(...)`, resolve them with `agent.track(descriptor)`, and mount
+   `<Publish>` to own publication. Lookup alone does not publish or reserve a
+   slot.
+4. **Remote media:** `agent.remote.participants` exposes immutable participant
+   snapshots and their tracks. `Video` presents one video track and controls
+   reception while visible and nonzero-sized. Mount `<Audio agent={agent}>` to
+   own remote audio playback; a user gesture may be needed to retry it.
 
 A room groups participants authorized to join it. The admitted external IDs are
 your application's room and participant identities, not opaque transport IDs.
@@ -50,11 +55,12 @@ The `camera` and `microphone` strings are labels chosen by your application,
 not protocol constants. Logical track handles use participant identity and label
 to follow media across temporary absence or replacement. Keep labels stable.
 
-For live application messages, `agent.topic<T>(name, {mode})` creates a typed JSON
-component with a `publish` action. Mounting it owns a consumer; unmounting
-releases that consumer. It is not durable message storage. See
-[typed topics](/react/guides#typed-topics) for publishing, subscription cleanup,
-and recovery limits.
+For live application messages, define a descriptor with
+`track.data(label, delivery)`, resolve it with `agent.track(descriptor)`, and
+mount `<Data>` to own its event stream. Data payloads are bytes; your application
+owns encoding, decoding, validation, and malformed-payload policy. It is not
+durable message storage. See [data tracks](/react/guides#data-tracks) for
+publication, subscription cleanup, and recovery limits.
 
 ## What your application owns
 

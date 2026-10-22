@@ -1,25 +1,42 @@
 import { useState } from "react";
 import {
+  Audio,
+  Publish,
   Video,
+  track,
   useAgent,
-  useUserMedia,
+  useCapture,
   type AgentConfig,
   type PlaybackError,
+  type PlaybackFailure,
+  type RemoteVideoTrack,
 } from "@pulsebeam/react";
+
+const camera = track.video("camera");
+const microphone = track.audio("microphone");
 
 export function Room({ config }: { config: AgentConfig }) {
   const agent = useAgent(config);
-  const capture = useUserMedia({ video: true, audio: true });
+  const capture = useCapture("device", { video: true, audio: true });
   const [error, setError] = useState("");
-  const [playback, setPlayback] = useState<PlaybackError | null>(null);
+  const [videoPlayback, setVideoPlayback] = useState<PlaybackError | null>(
+    null,
+  );
+  const [audioPlayback, setAudioPlayback] = useState<PlaybackFailure | null>(
+    null,
+  );
   const report = (failure: unknown) => setError(String(failure));
-  const Camera = agent.local.video("camera");
-  const Microphone = agent.local.audio("microphone");
+  const remoteVideos = agent.remote.participants.flatMap((participant) =>
+    participant.tracks.filter(
+      (value): value is RemoteVideoTrack => value.kind === "video",
+    ),
+  );
 
   return (
     <main>
-      <Camera source={capture.video} />
-      <Microphone source={capture.audio} />
+      <Publish track={agent.track(camera)} source={capture.video} />
+      <Publish track={agent.track(microphone)} source={capture.audio} />
+      <Audio agent={agent} onPlaybackError={setAudioPlayback} />
       <h1>PulseBeam React room</h1>
       <p role="status">
         Connection: {agent.connection}; participant:{" "}
@@ -38,36 +55,44 @@ export function Room({ config }: { config: AgentConfig }) {
       >
         Leave and stop capture
       </button>
-      <button onClick={() => void agent.remote.resumeAudio().catch(report)}>
-        Enable remote audio
-      </button>
       <h2>Local preview</h2>
       <Video
         source={capture.video}
         mirror
         style={{ width: 320, height: 240 }}
-        onPlaybackError={setPlayback}
+        onPlaybackError={setVideoPlayback}
       />
-      <h2>Remote video ({agent.remote.videoTracks.length})</h2>
-      {agent.remote.videoTracks.map((track) => (
-        <section key={`${track.participantId}:${track.label}`}>
+      <h2>Remote video ({remoteVideos.length})</h2>
+      {remoteVideos.map((remote) => (
+        <section key={`${remote.participantId}:${remote.label}`}>
           <p>
-            {track.participantId}: {track.label}
+            {remote.participantId}: {remote.label}
           </p>
           <Video
-            source={track}
+            source={remote}
             style={{ width: 320, height: 240 }}
-            onPlaybackError={setPlayback}
+            onPlaybackError={setVideoPlayback}
           />
         </section>
       ))}
-      <p>Remote audio publications: {agent.remote.audioTracks.length}</p>
-      {playback && (
+      {audioPlayback && (
         <button
           onClick={() =>
-            void playback
+            void audioPlayback
               .retry()
-              .then(() => setPlayback(null))
+              .then(() => setAudioPlayback(null))
+              .catch(report)
+          }
+        >
+          Enable remote audio
+        </button>
+      )}
+      {videoPlayback && (
+        <button
+          onClick={() =>
+            void videoPlayback
+              .retry()
+              .then(() => setVideoPlayback(null))
               .catch(report)
           }
         >

@@ -2,7 +2,7 @@
 
 A browser meeting client built with the local `@pulsebeam/react` SDK. Use it to
 publish camera/microphone media, view remote participants, and exchange chat and
-reactions through topics.
+reactions through data tracks.
 
 ## Join a local room
 
@@ -81,11 +81,11 @@ browser. Real transport, fresh decoded media and restrictive-autoplay premises
 belong to the required Web-platform owner; component models do not certify those
 boundaries or public hosting. See the [client QA boundaries](../../docs/build.md#client-qa-boundaries).
 
-## Media and topics
+## Media and data tracks
 
 Application identities come from admission. Remote video demand follows mounted
 consumers. Reconnect retains logical media consumers, receive policies, local
-publications, and topic subscriptions; replacement receivers restore playback
+publications, and data subscriptions; replacement receivers restore playback
 without remounting.
 
 Camera and microphone controls enable or disable media handles rather than
@@ -94,16 +94,21 @@ has blocked it. Meet has no separate audio-unlock control.
 
 Meet uses `ordered` chat and `lossy` reactions. Chat uses finite, receiver-driven
 recovery and renders skipped ranges as inline notices before later messages;
-a warning also flags incomplete chat. A failed subscription resumes only after the
+a failed subscription resumes only after the
 participant rejoins. Reactions are distinct transient events and may be lost or
 reordered.
 
+Meet encodes text as UTF-8 JSON strings and validates decoded values at the
+application boundary. Malformed UTF-8, invalid JSON, and non-string values are
+ignored without ending the SDK stream. The SDK transports binary payloads and
+provides no application codec.
+
 Sender identity comes from the server-authored event `participantId`, not JSON.
-The SDK suppresses duplicate `(dataTrackId, sequence)` events; payloads carry only
+The SDK suppresses duplicate `(trackId, sequence)` events; payloads carry only
 chat or reaction content. Local chat rows are UI-owned and appear after local
 acceptance because publications do not loop back. Successful send does not mean
 remote delivery.
-Reconnect restores topic interest but creates fresh data tracks and sequence
+Reconnect restores data interest but creates fresh data tracks and sequence
 spaces, without cross-publication recovery. Use matching server and SDK versions;
 this contract has no legacy-mode or mixed-wire compatibility path.
 
@@ -112,4 +117,4 @@ this contract has no legacy-mode or mixed-wire compatibility path.
 The native DTLS reconnect simulation is excluded from ordinary acceptance under
 its [documented exception](../../crates/pulsebeam-simulator/docs/native-dtls-exception.md).
 It remains available through the opt-in command in that document. This limitation
-does not exclude the browser media and topic recovery contracts.
+does not exclude the browser media and data recovery contracts.

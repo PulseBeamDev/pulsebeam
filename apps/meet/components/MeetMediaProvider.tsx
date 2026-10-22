@@ -1,7 +1,7 @@
 "use client";
 
 import { createContext, useContext, useState, type ReactNode } from "react";
-import { useMediaDevices, useUserMedia } from "@pulsebeam/react";
+import { useCapture, useDevices } from "@pulsebeam/react";
 
 const MediaContext = createContext<ReturnType<typeof useMeetCapture> | null>(
   null,
@@ -12,25 +12,25 @@ function useMeetCapture() {
   const [audioDeviceId, setAudioDeviceId] = useState("");
   const [cameraOn, setCameraOn] = useState(true);
   const [micOn, setMicOn] = useState(true);
-  const capture = useUserMedia({
+  const capture = useCapture("device", {
     video: {
       device: videoDeviceId
         ? { kind: "camera", id: videoDeviceId, label: "" }
         : undefined,
-      preferences: { width: 1280, height: 720, frameRate: 30 },
+      width: 1280,
+      height: 720,
+      frameRate: 30,
     },
     audio: {
       device: audioDeviceId
         ? { kind: "microphone", id: audioDeviceId, label: "" }
         : undefined,
-      preferences: {
-        echoCancellation: true,
-        noiseSuppression: true,
-        autoGainControl: true,
-      },
+      echoCancellation: true,
+      noiseSuppression: true,
+      autoGainControl: true,
     },
   });
-  const devices = useMediaDevices();
+  const devices = useDevices();
   return {
     capture,
     devices,

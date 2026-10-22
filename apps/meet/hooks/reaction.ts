@@ -1,31 +1,26 @@
 import { useRef, useState } from "react";
-import type { Agent, TopicEvent } from "@pulsebeam/react";
+import { track, type Agent, type DataEvent } from "@pulsebeam/react";
+import { decodeText, encodeText } from "@/lib/data-codec";
+
+const reaction = track.data("reactions", "lossy");
 
 export const reactionEmojis = ["👍", "❤️", "😂", "😮", "👏", "🔥"];
 type Reaction = { key: string; emoji: string };
 
 export function useReaction(agent: Agent) {
-  const Reactions = agent.topic<string>("reactions", {
-    mode: "lossy",
-  });
+  const Reactions = agent.track(reaction);
   const [reactions, setReactions] = useState<Reaction[]>([]);
   const localKeys = useRef(0);
-  const add = (reaction: Reaction) =>
-    setReactions((current) => [...current, reaction].slice(-20));
+  const add = (value: Reaction) =>
+    setReactions((current) => [...current, value].slice(-20));
 
   return {
     Reactions,
     reactions,
-    onEvent(event: TopicEvent<string>) {
-      if (
-        event.type === "message" &&
-        typeof event.value === "string" &&
-        reactionEmojis.includes(event.value)
-      ) {
-        add({
-          key: `${event.dataTrackId}:${event.sequence}`,
-          emoji: event.value,
-        });
+    onEvent(event: DataEvent<"lossy">) {
+      const emoji = decodeText(event.data);
+      if (emoji !== null && reactionEmojis.includes(emoji)) {
+        add({ key: `${event.trackId}:${event.sequence}`, emoji });
       }
     },
     dismiss(key: string) {
@@ -34,7 +29,7 @@ export function useReaction(agent: Agent) {
     send(emoji: string) {
       if (!agent.participantId || !reactionEmojis.includes(emoji)) return;
       const key = `local:${localKeys.current++}`;
-      void Reactions.publish(emoji)
+      void Reactions.send(encodeText(emoji))
         .then(() => add({ key, emoji }))
         .catch(() => {});
     },

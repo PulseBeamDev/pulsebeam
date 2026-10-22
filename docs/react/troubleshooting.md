@@ -14,7 +14,7 @@ Pick the symptom. Fix the first failing step, then try again.
 | Connected, but no video or sound | [Media](#missing-media) |
 | Playback blocked | [Autoplay](#autoplay) |
 | SDK won't initialize | [SDK initialization](#sdk-initialization) |
-| Messages fail or disappear | [Topics](#topic-failures) |
+| Messages fail or disappear | [Data](#data-failures) |
 
 ## Permission and capture failures
 
@@ -73,16 +73,18 @@ Native Linux host networking avoids this extra VM boundary.
 Check in order:
 
 1. **Joined?** Both participants show `connected`, with distinct external IDs in the same room.
-2. **Published?** Sender capture is active and bound to the right local handles.
-   `enabled={false}` means black/silent; `source={null}` means withdrawn.
-3. **Discovered?** `agent.remote.videoTracks` / `audioTracks` expose the remote publications.
-4. **Assigned?** For audio, check the track's `receiving`; for video, a visible
-   `<Video>` drives receiver demand. Discovery alone does not prove assignment.
-5. **Playing?** Remote `Video` is visible and sized; topology has capacity.
-   For audio, check autoplay, sender silence, and browser/OS output.
+2. **Published?** Sender capture is active and mounted in `Publish` with the
+   intended descriptor. `enabled={false}` disables sending; `source={null}`
+   withdraws it.
+3. **Discovered?** Inspect `agent.remote.participants` and each participant's
+   `tracks`. Discovery alone does not prove receive ownership.
+4. **Owned?** A visible, nonzero-sized `Video` owns remote video reception. A
+   mounted `Audio` owns remote audio reception. Confirm topology has capacity.
+5. **Playing?** Handle `Video.onPlaybackError` and `Audio.onPlaybackError`.
+   Also check sender silence and browser or OS output.
 
-A local preview proves capture, not delivery. Audio `receiving` proves assignment,
-not sound. Match logical handles by external participant ID and label.
+A local preview proves capture, not delivery. Match logical handles by external
+participant ID, kind, and label.
 
 ## Autoplay
 
@@ -90,8 +92,8 @@ Run recovery **directly from a button click** and catch rejection:
 
 | Media | Recovery |
 | --- | --- |
-| Audio | `agent.remote.resumeAudio()` |
-| Video | The `retry` supplied to `onPlaybackError` |
+| Audio | The `retry()` supplied by `Audio.onPlaybackError` |
+| Video | The `retry()` supplied by `Video.onPlaybackError` |
 
 Do not defer the gesture behind a network request or replace it with a timer.
 With `autoPlay={false}`, video still requests media; provide native controls.
@@ -110,22 +112,22 @@ Report it with the SDK version, your framework/bundler version, and the failing 
 
 See [the quickstart](/react/quickstart) to retry a minimal integration.
 
-## Topic failures
+## Data failures
 
-Catch `Chat.publish()` rejection and provide `onError` on committed consumers.
-Read `agent.connection` and `agent.error` directly in React; there is no manual
-snapshot/subscription loop. Handle continuity in `onEvent`, not as an error.
+Catch `LocalDataTrack.send()` rejection and provide `onError` on mounted `Data`
+owners. Read `agent.connection` and `agent.error` directly in React. Decode and
+validate payloads inside `onEvent`; malformed application payloads should be
+ignored or reported by the application without ending the SDK event stream.
 
 | Symptom | Diagnosis and action |
 | --- | --- |
-| Publish rejects | Check connected intent, matching server/SDK versions, explicit mode/name, JSON size, and queue capacity. Initial binding waits at most 10 seconds; a replaced generation/publication rejects rather than retargeting the send. Retry a new action after recovery. |
-| `onError` reports `decode-failed` | Invalid UTF-8/JSON released that consumer. Validate publisher payloads, then remount the consumer to retry. Other consumers remain independent. |
-| `onError` reports `channel-failed` | Inspect the structured direction/mode failure and Agent connection/error. Core owns transport recovery; fix terminal configuration/authorization failures before reconnecting. |
-| An inline `gap` arrives | A known ordered range was skipped. Display the notice before later messages from that track and reload backend state if completeness matters. |
-| Latest values disappear | Supersession is expected per data track. Use `lossy` for distinct transient events or `ordered` for ordered events. |
-| No old messages after subscribing or reconnecting | Subscriptions start live; reopened publications have fresh data-track IDs and sequence spaces. There is no offline or cross-incarnation replay. |
-| Metadata fails to serialize as JSON | Sequence/gap fields are `bigint`. Store decimal strings; never round through `number`. |
+| Send rejects | Check connection intent, matching server and SDK versions, descriptor label and delivery, payload size, and queue capacity. Retry as a new application action after recovery. |
+| `onError` fires | The SDK event stream failed. Inspect Agent connection and error state, then remount after correcting terminal configuration or authorization failures. |
+| An inline `gap` arrives | An ordered range was skipped. Display the notice before later messages from that track and reload backend state if completeness matters. |
+| Latest values disappear | Supersession is expected per data track. Use `lossy` for distinct transient events or `ordered` when ordered recovery matters. |
+| No old messages after subscribing or reconnecting | Subscriptions start live; replacement tracks have fresh IDs and sequence spaces. There is no offline replay. |
+| Metadata fails to serialize as JSON | Sequence and gap fields are `bigint`. Store decimal strings; never round through `number`. |
 
-Confirm with two participants using the same topic name **and mode**. Sending
-does not loop back to its publisher. Accepted sends are not delivery
-acknowledgments; queues and recovery are finite. [Exact limits](/react/reference#topics).
+Confirm with two participants using the same descriptor label and delivery.
+Sending does not loop back to its publisher. Accepted sends are not delivery
+acknowledgments. Queues and recovery are finite. See the [data reference](/react/reference#data).

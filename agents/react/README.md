@@ -18,8 +18,7 @@ Use the [framework-independent quickstart](../../docs/react/quickstart.md) to
 start PulseBeam, issue tokens, and join or publish media in React.
 `useAgent({endpoint, token})` uses fixed defaults of 2 local videos,
 2 local audios, 16 remote videos, and 8 remote audios. See
-[capacity limits](../../docs/react/reference.md#configuration-types) for
-overrides and the current reconnect requirement.
+[capacity limits](../../docs/react/reference.md#capacity) for overrides.
 
 ## Build your next feature
 
@@ -31,10 +30,12 @@ overrides and the current reconnect requirement.
 Import from `@pulsebeam/react`. `useAgent` returns an Agent immediately; React
 owns its runtime lifecycle. Use a React `key` to replace logical sessions.
 Capture hooks own the devices: disconnecting an Agent does not stop capture.
-Local publication and topic component handles declare ongoing relationships in
-committed JSX. Use `source`, `enabled`, and per-`Video` preferences rather than
-synchronization effects. Capture options accept typed exact devices and portable
-best-effort preferences; observations report actual settings.
+Define descriptors with `track.video`, `track.audio`, or `track.data`, then
+resolve them with `agent.track`. `Publish`, `Data`, `Video`, and `Audio` own their
+resources only while committed. Use `source`, `enabled`, and `Video.receive`
+rather than synchronization effects. `useCapture` accepts typed exact devices
+and portable best-effort settings; `useDevices` inventories cameras and
+microphones. Applications own data codecs and schema validation.
 
 React exposes only `useAgent` for Agent ownership, with no `createAgent` export
 or advanced escape hatch. Non-React applications use caller-owned `createAgent`

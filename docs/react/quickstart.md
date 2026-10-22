@@ -85,23 +85,27 @@ your application's backend.
 
 ```tsx
 import {
-  Video, useAgent, useUserMedia, type CaptureResult,
+  Audio,
+  Publish,
+  Video,
+  track,
+  useAgent,
+  useCapture,
+  type CaptureResult,
+  type RemoteVideoTrack,
 } from "@pulsebeam/react";
 
-export function Call({ sessionId, token }: { sessionId: string; token: string }) {
-  const media = useUserMedia({ video: true, audio: true });
+const camera = track.video("camera");
+const microphone = track.audio("microphone");
 
-  async function enableDevices() {
-    try {
-      await media.request();
-    } catch {
-      // useUserMedia exposes the failure through media.error.
-    }
-  }
+export function Call({ sessionId, token }: { sessionId: string; token: string }) {
+  const media = useCapture("device", { video: true, audio: true });
 
   return (
     <>
-      <button onClick={enableDevices}>Enable camera & mic</button>
+      <button onClick={() => void media.request().catch(() => {})}>
+        Enable camera & mic
+      </button>
       {media.error && <p role="alert">{media.error.message}</p>}
       <Video source={media.video} mirror style={{ width: 320, height: 240 }} />
       <Room key={sessionId} token={token} media={media} />
@@ -111,24 +115,25 @@ export function Call({ sessionId, token }: { sessionId: string; token: string })
 
 function Room({ token, media }: { token: string; media: CaptureResult }) {
   const agent = useAgent({ endpoint: "http://localhost:7070", token });
-
-  const Camera = agent.local.video("camera");
-  const Microphone = agent.local.audio("microphone");
+  const remoteVideos = agent.remote.participants.flatMap((participant) =>
+    participant.tracks.filter(
+      (value): value is RemoteVideoTrack => value.kind === "video",
+    ),
+  );
 
   return (
     <>
-      <Camera source={media.video} />
-      <Microphone source={media.audio} />
+      <Publish track={agent.track(camera)} source={media.video} />
+      <Publish track={agent.track(microphone)} source={media.audio} />
+      <Audio agent={agent} />
       <button onClick={() => agent.connect()}>Join room</button>
       <button onClick={() => agent.disconnect()}>Leave room</button>
       <p>Connection: {agent.connection}</p>
-      {agent.error && (
-        <p role="alert">{agent.error.message}</p>
-      )}
-      {agent.remote.videoTracks.map((track) => (
+      {agent.error && <p role="alert">{agent.error.message}</p>}
+      {remoteVideos.map((remote) => (
         <Video
-          key={`${track.participantId}:${track.label}`}
-          source={track}
+          key={`${remote.participantId}:${remote.label}`}
+          source={remote}
           style={{ width: 320, height: 240 }}
         />
       ))}
@@ -153,7 +158,7 @@ other's video and play remote audio. Use headphones to avoid feedback.
 ## Complete example
 
 Explore the [complete React example](https://github.com/PulseBeamDev/pulsebeam/tree/main/apps/meet)
-or see [capacity and configuration](/react/reference#configuration-types).
+or see [capacity and configuration](/react/reference#capacity).
 
 Next: [screen sharing and controls](/react/guides) ·
 [API reference](/react/reference) · [Troubleshooting](/react/troubleshooting).

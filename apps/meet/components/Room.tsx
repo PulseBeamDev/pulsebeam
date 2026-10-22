@@ -1,6 +1,14 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Video, useAgent, useDisplayMedia } from "@pulsebeam/react";
-import type { RemoteVideoTrack } from "@pulsebeam/react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  Audio,
+  Data,
+  Publish,
+  Video,
+  track,
+  useAgent,
+  useCapture,
+  type RemoteVideoTrack,
+} from "@pulsebeam/react";
 import {
   Alert,
   Box,
@@ -21,6 +29,10 @@ import { useMeetMedia } from "./MeetMediaProvider";
 import { useChat } from "@/hooks/chat";
 import { reactionEmojis, useReaction } from "@/hooks/reaction";
 import { useVideoLayout } from "@/hooks/video-layout";
+
+const camera = track.video("camera");
+const microphone = track.audio("microphone");
+const screenShare = track.video("screen");
 
 const latencyModes: Record<
   string,
@@ -58,18 +70,13 @@ export function Room({
     video: screen,
     stop: stopShare,
     request: requestShare,
-  } = useDisplayMedia({
-    video: { preferences: { width: 1920, height: 1080, frameRate: 30 } },
+  } = useCapture("display", {
+    video: { width: 1920, height: 1080, frameRate: 30 },
     audio: false,
   });
-  const { Camera, Microphone, Screen } = useMemo(
-    () => ({
-      Camera: agent.local.video("camera"),
-      Microphone: agent.local.audio("microphone"),
-      Screen: agent.local.video("screen"),
-    }),
-    [agent],
-  );
+  const Camera = agent.track(camera);
+  const Microphone = agent.track(microphone);
+  const Screen = agent.track(screenShare);
   const [deviceAnchor, setDeviceAnchor] = useState<HTMLElement | null>(null);
   const [reactionAnchor, setReactionAnchor] = useState<HTMLElement | null>(
     null,
@@ -96,9 +103,12 @@ export function Room({
     dismiss: dismissReaction,
     send: sendReaction,
   } = useReaction(agent);
-  const { remoteTracks, spotlight, setPin } = useVideoLayout(
-    agent.remote.videoTracks,
+  const remoteVideoTracks = agent.remote.participants.flatMap((participant) =>
+    participant.tracks.filter(
+      (value): value is RemoteVideoTrack => value.kind === "video",
+    ),
   );
+  const { remoteTracks, spotlight, setPin } = useVideoLayout(remoteVideoTracks);
   useEffect(() => {
     agent.connect();
   }, [agent]);
@@ -123,7 +133,6 @@ export function Room({
     [],
   );
   const recoverPlayback = () => {
-    void agent.remote.resumeAudio().catch(() => {});
     const retry = playbackRetry.current;
     playbackRetry.current = null;
     if (retry)
@@ -151,13 +160,13 @@ export function Room({
   };
   const video = (track: RemoteVideoTrack | null, fill: "contain" | "cover") => (
     <Video
-      source={track ?? Camera}
-      preferences={
+      source={track ?? (cameraOn ? capture.video : null)}
+      receive={
         track
           ? {
               minFps: 15,
               priority: track === spotlight ? 200 : 10,
-              latency: latencyModes[latencyMode],
+              playoutDelay: latencyModes[latencyMode],
             }
           : undefined
       }
@@ -194,11 +203,20 @@ export function Room({
       onClickCapture={recoverPlayback}
       onKeyDownCapture={recoverPlayback}
     >
-      <Camera source={capture.video} enabled={cameraOn} />
-      <Microphone source={capture.audio} enabled={micOn} />
-      <Screen source={screen} preferences={{ content: "detail" }} />
-      <Chat onEvent={receiveChat} onError={onChatError} />
-      <Reactions onEvent={receiveReaction} />
+      <Publish track={Camera} source={capture.video} enabled={cameraOn} />
+      <Publish track={Microphone} source={capture.audio} enabled={micOn} />
+      <Publish track={Screen} source={screen} content="detail" />
+      <Audio
+        agent={agent}
+        onPlaybackError={(failure) =>
+          playbackError({
+            error: failure.cause ?? new Error(failure.message),
+            retry: failure.retry,
+          })
+        }
+      />
+      <Data track={Chat} onEvent={receiveChat} onError={onChatError} />
+      <Data track={Reactions} onEvent={receiveReaction} />
       <Paper
         component="header"
         square
@@ -254,7 +272,10 @@ export function Room({
           >
             <Icons.Settings2 size={20} />
           </IconButton>
-          <IconButton aria-label="Reconnect" onClick={() => agent.reconnect()}>
+          <IconButton
+            aria-label="Retry connection"
+            onClick={() => agent.connect()}
+          >
             <Icons.RotateCcw size={20} />
           </IconButton>
           <Button

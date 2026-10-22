@@ -186,6 +186,7 @@ HTMLMediaElement.prototype.play = async () => {
 await click("Join room");
 assert.equal(runtimes.filter((runtime) => !runtime.closed).length, 1);
 const runtime = runtimes.at(-1)!;
+const deliver = (event: unknown) => runtime.deliverData("chat", event);
 assert.equal(runtime.desired.connected, true);
 await flush(() =>
   runtime.emit({
@@ -229,45 +230,43 @@ assert.ok(
   plays > afterRejection,
   "failed retry remains available to later keyboard interaction",
 );
-const payload = "delivered through production topics";
+const payload = "delivered through production data tracks";
 await flush(() =>
-  runtime.event({
-    type: "topic-message",
-    topic: "chat",
-    mode: "ordered",
-    dataTrackId: "remote-chat",
+  deliver({
+    type: "message",
+    trackId: "remote-chat",
     participantId: "bob",
     sequence: 0n,
-    payload: new TextEncoder().encode(JSON.stringify(payload)),
+    data: new TextEncoder().encode(JSON.stringify(payload)),
   }),
 );
-assert.match(document.body.textContent!, /delivered through production topics/);
-const remoteChat = (dataTrackId: string, sequence: bigint) =>
-  runtime.event({
-    type: "topic-message",
-    topic: "chat",
-    mode: "ordered",
+assert.match(
+  document.body.textContent!,
+  /delivered through production data tracks/,
+);
+const remoteChat = (trackId: string, sequence: bigint) =>
+  deliver({
+    type: "message",
     participantId: "bob",
-    dataTrackId,
+    trackId,
     sequence,
-    payload: new TextEncoder().encode(JSON.stringify(payload)),
+    data: new TextEncoder().encode(JSON.stringify(payload)),
   });
 await flush(() => remoteChat("remote-chat", 1n));
 await flush(() => remoteChat("replacement-remote-chat", 1n));
 assert.equal(
-  document.body.textContent!.match(/delivered through production topics/g)
+  document.body.textContent!.match(/delivered through production data tracks/g)
     ?.length,
   3,
   "payload IDs do not replace data-track and sequence identity",
 );
 await flush(() =>
-  runtime.event({
-    type: "topic-recovery-gap",
-    topic: "chat",
+  deliver({
+    type: "gap",
     participantId: "bob",
-    dataTrackId: "remote-chat",
-    expectedSequence: 2n,
-    availableSequence: 4n,
+    trackId: "remote-chat",
+    from: 2n,
+    to: 4n,
   }),
 );
 const transcript = document.querySelector(
@@ -279,21 +278,41 @@ assert.equal(
   "Some messages could not be recovered.",
 );
 await flush(() =>
-  runtime.event({
-    type: "topic-message",
-    topic: "chat",
-    mode: "ordered",
+  deliver({
+    type: "message",
     participantId: "bob",
-    dataTrackId: "remote-chat",
+    trackId: "remote-chat",
     sequence: 4n,
-    payload: new TextEncoder().encode(JSON.stringify("after the gap")),
+    data: new TextEncoder().encode(JSON.stringify("after the gap")),
   }),
 );
+await flush(() => {
+  for (const data of [
+    new Uint8Array([255]),
+    new TextEncoder().encode("{"),
+    new TextEncoder().encode("42"),
+  ]) {
+    deliver({
+      type: "message",
+      trackId: "remote-chat",
+      participantId: "bob",
+      sequence: 5n,
+      data,
+    });
+    runtime.deliverData("reactions", {
+      type: "message",
+      trackId: "remote-reactions",
+      participantId: "bob",
+      sequence: 5n,
+      data,
+    });
+  }
+});
 const transcriptEntries = Array.from(transcript.children);
 assert.equal(transcriptEntries.length, 5);
 assert.match(
   transcriptEntries[2].textContent!,
-  /delivered through production topics/,
+  /delivered through production data tracks/,
 );
 assert.equal(
   transcriptEntries[3].textContent,
@@ -313,32 +332,17 @@ const chat =
   document.querySelector<HTMLInputElement>("aside input");
 assert.ok(chat, "chat composer is rendered");
 await input(chat, "hello from component");
+let completeSend!: () => void;
+runtime.sendCompletion = new Promise((resolve) => (completeSend = resolve));
 await click("Send message");
-assert.equal(
-  runtime.sent.length,
-  0,
-  "initial publish waits for authoritative binding",
-);
+assert.equal(runtime.sent.length, 0, "send waits for runtime completion");
 assert.doesNotMatch(
   transcript.textContent!,
   /hello from component/,
-  "local chat appears only after publication succeeds",
+  "local chat appears only after the send succeeds",
 );
-const chatBinding = {
-  name: "chat",
-  mode: "ordered",
-  connected: true,
-  dataTrackId: "local-chat",
-  nextSequence: 0n,
-  acceptedHistory: 0,
-  queued: 0,
-  sendPending: false,
-};
-await flush(() =>
-  runtime.emit({
-    topics: { ...runtime.snapshot.topics, publishers: [chatBinding] },
-  }),
-);
+await flush(() => completeSend());
+runtime.sendCompletion = Promise.resolve();
 assert.ok(
   runtime.sent.some(
     (message) =>
@@ -362,14 +366,12 @@ assert.equal(
 );
 privateSoFar();
 await flush(() =>
-  runtime.event({
-    type: "topic-message",
-    topic: "reactions",
-    mode: "lossy",
-    dataTrackId: "remote-reactions",
+  runtime.deliverData("reactions", {
+    type: "message",
+    trackId: "remote-reactions",
     participantId: "bob",
     sequence: 0n,
-    payload: new TextEncoder().encode(JSON.stringify("👍")),
+    data: new TextEncoder().encode(JSON.stringify("👍")),
   }),
 );
 assert.ok(
@@ -382,29 +384,13 @@ const reaction = document.querySelector<HTMLElement>(
 );
 assert.ok(reaction);
 await flush(() => reaction.click());
-await flush(() =>
-  runtime.emit({
-    topics: {
-      ...runtime.snapshot.topics,
-      publishers: [
-        chatBinding,
-        {
-          ...chatBinding,
-          name: "reactions",
-          mode: "lossy",
-          dataTrackId: "local-reactions",
-        },
-      ],
-    },
-  }),
-);
 assert.ok(
   runtime.sent.some(
     (message) =>
       message.name === "reactions" &&
       new TextDecoder().decode(message.payload).includes("👍"),
   ),
-  "reaction interaction publishes through production topic policy",
+  "reaction interaction sends through the production data handle",
 );
 const sentReaction = runtime.sent.find(
   (message) => message.name === "reactions",
@@ -469,5 +455,5 @@ assert.ok(runtimes.every((runtime) => runtime.closed));
 privateSoFar();
 host.remove();
 console.log(
-  "Meet capture-gated join, admission, topics, transient credential observation and Leave passed",
+  "Meet capture-gated join, admission, binary data codecs, transient credential observation and Leave passed",
 );
