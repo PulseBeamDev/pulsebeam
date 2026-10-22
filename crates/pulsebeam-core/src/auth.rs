@@ -12,6 +12,7 @@ use std::{collections::HashMap, fmt, sync::LazyLock};
 
 #[cfg(test)]
 const KEY_BYTES: usize = 32;
+#[cfg(test)]
 const REDACTED: &str = "[REDACTED]";
 pub const MAX_COMPACT_TOKEN_LEN: usize = 16_384;
 

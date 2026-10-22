@@ -515,7 +515,14 @@ impl UdpTransportWriter {
                 debug_assert!(false, "group {i}..{j} escapes the batch");
                 break;
             };
-            sent = sent.saturating_add(self.send_group(group, gso_seg)?);
+            match self.send_group(group, gso_seg) {
+                Ok(count) => sent = sent.saturating_add(count),
+                Err(error) => {
+                    // The caller discards this failed group and all unattempted groups.
+                    self.record_drop(packets.len().saturating_sub(i));
+                    return Err(error);
+                }
+            }
             i = j;
         }
 
@@ -791,6 +798,63 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(&buf[..n2], &p2[..]);
+    }
+
+    #[tokio::test]
+    async fn group_failures_account_unsent_entries_without_replaying_accepted_packets() {
+        let mut transport = bind("127.0.0.1:0".parse().unwrap(), None).await.unwrap();
+        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let destination = receiver.local_addr().unwrap();
+        let packets = [
+            SendPacket {
+                dst: destination,
+                buf: b"before",
+                segment_size: 6,
+            },
+            SendPacket {
+                dst: "[::1]:9".parse().unwrap(),
+                buf: b"failed",
+                segment_size: 6,
+            },
+            SendPacket {
+                dst: destination,
+                buf: b"after!",
+                segment_size: 6,
+            },
+        ];
+        let batch = SendPacketBatch { packets: &packets };
+        let mut expected_drops = 0usize;
+        for (group_bytes, dropped, delivered) in [(6, 2, 1), (12, 1, 2)] {
+            transport.writer.send_batch_limit = group_bytes;
+            transport.writable().await.unwrap();
+            let result = transport.try_send_batch(&batch);
+            if delivered == 1 {
+                assert!(
+                    result.is_err(),
+                    "the IPv4 socket must reject an IPv6 destination"
+                );
+            } else {
+                assert_eq!(result.unwrap(), delivered);
+            }
+            let mut buffer = [0; 64];
+            for expected in [b"before", b"after!"].into_iter().take(delivered) {
+                let (length, source) = tokio::time::timeout(
+                    Duration::from_millis(250),
+                    receiver.recv_from(&mut buffer),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                assert_eq!(&buffer[..length], expected);
+                assert_eq!(source, transport.local_addr());
+            }
+            expected_drops = expected_drops.saturating_add(dropped);
+            assert_eq!(transport.writer.drop_count, expected_drops);
+            assert_eq!(
+                receiver.try_recv_from(&mut buffer).unwrap_err().kind(),
+                ErrorKind::WouldBlock
+            );
+        }
     }
 
     #[tokio::test]
