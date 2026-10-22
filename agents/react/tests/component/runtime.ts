@@ -1,4 +1,4 @@
-// Only the external WASM transport boundary is modeled. Facade, topic,
+// Only the external WASM transport boundary is modeled. Facade, data,
 // resource, capture and component policy are the production implementations.
 export const runtimes: BrowserRuntime[] = [];
 export const whenInitialized = async () => {};
@@ -11,6 +11,7 @@ export class BrowserRuntime {
   eventListener?: (event: any) => void;
   errorListener?: (error: any) => void;
   sent: { name: string; mode: string; payload: Uint8Array }[] = [];
+  sendCompletion: Promise<void> = Promise.resolve();
   tracks = new Map<number, MediaStreamTrack>();
   replacements: { slot: string; track: MediaStreamTrack | null }[] = [];
   replaceCompletion: Promise<void> = Promise.resolve();
@@ -27,8 +28,10 @@ export class BrowserRuntime {
   }[] = [];
   ownedMuted = new Map<bigint, boolean>();
   audioOwner?: bigint;
-  dataEvents: any[] = [];
-  dataOwners = new Set<bigint>();
+  dataOwners = new Map<
+    bigint,
+    { spec: { label: string; delivery: string }; events: any[] }
+  >();
   snapshot = {
     version: 1n,
     desiredRevision: 0n,
@@ -95,10 +98,11 @@ export class BrowserRuntime {
     }
     if (command.op === "receiveData") {
       const owner = this.nextOwner++;
-      this.dataOwners.add(owner);
+      this.dataOwners.set(owner, { spec: command.spec, events: [] });
       return { owner };
     }
-    if (command.op === "readData") return this.dataEvents.shift() ?? null;
+    if (command.op === "readData")
+      return this.dataOwners.get(command.owner)?.events.shift() ?? null;
     if (command.op === "claimAudio") {
       if (this.audioOwner !== undefined) {
         const error = new Error("audio already has an owner") as Error & {
@@ -196,14 +200,21 @@ export class BrowserRuntime {
   remote_track(index: number) {
     return this.tracks.get(index);
   }
-  async send_topic(
-    name: string,
-    mode: string,
+  async send_data(
+    spec: { label: string; delivery: string },
     payload: Uint8Array,
-    _generation: bigint,
-    _dataTrackId: string,
   ) {
-    this.sent.push({ name, mode, payload });
+    await this.sendCompletion;
+    this.sent.push({ name: spec.label, mode: spec.delivery, payload });
+  }
+  deliverData(label: string, event: unknown) {
+    const owners: bigint[] = [];
+    for (const [owner, receiver] of this.dataOwners) {
+      if (receiver.spec.label !== label) continue;
+      receiver.events.push(event);
+      owners.push(owner);
+    }
+    this.event({ type: "data-ready", owners });
   }
   emit(patch: Record<string, unknown>) {
     this.snapshot = {

@@ -149,11 +149,19 @@ export function Audio({ agent, onPlaybackError }: AudioProps): null {
   if (failure) throw failure;
   useLayoutEffect(() => {
     setFailure(null);
+    let active = true;
     const owner = attachRemoteAudio(managedAgent(agent), {
-      onPlaybackError: (value) => callback.current?.(value),
+      onPlaybackError: (value) => {
+        if (active) callback.current?.(value);
+      },
     });
-    void owner.ready.catch(setFailure);
-    return () => void owner.close();
+    void owner.ready.catch((error) => {
+      if (active) setFailure(error);
+    });
+    return () => {
+      active = false;
+      void owner.close();
+    };
   }, [agent]);
   return null;
 }

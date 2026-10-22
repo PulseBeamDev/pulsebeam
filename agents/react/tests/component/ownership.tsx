@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { Component, useState, type ReactNode } from "react";
+import { Component, StrictMode, useState, type ReactNode } from "react";
 import { createRoot } from "react-dom/client";
 import {
   Audio,
@@ -75,19 +75,24 @@ export async function ownershipAdapters() {
 
   const host = document.createElement("div");
   const root = createRoot(host);
-  await flush(() => root.render(<Room />));
+  await flush(() =>
+    root.render(
+      <StrictMode>
+        <Room />
+      </StrictMode>,
+    ),
+  );
   const runtime = runtimes.at(-1)!;
   assert.equal(runtime.claimedPublications.size, 1);
   assert.notEqual(runtime.audioOwner, undefined);
   assert.equal(runtime.dataOwners.size, 1);
-  runtime.dataEvents.push({
+  runtime.deliverData("messages", {
     type: "message",
     participantId: "alice",
     trackId: "message-id",
     sequence: 1n,
     data: new Uint8Array([0, 255]),
   });
-  runtime.event({ type: "data-ready", owners: [...runtime.dataOwners] });
   await flush();
   assert.equal(events.length, 1);
   assert.deepEqual(events[0]?.data, new Uint8Array([0, 255]));
