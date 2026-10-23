@@ -48,3 +48,10 @@ core-owned byte arrays and strictness follow the core namespace.
 
 Run `./bazel test //agents/pulsebeam-agent-core:unit_tests` while iterating.
 The repository gates are `./bazel test //:check` and `./bazel test //:test`.
+
+## Native cutover checkpoint
+
+Native ordered recovery across reconnects remains blocked, despite passing Core
+component tests. See the [ordered-recovery checkpoint](ORDERED_RECOVERY_CHECKPOINT.md)
+for the partial repair, exact reproducer, evidence, and unresolved catalog lifecycle
+boundary. This is not final native MVP qualification.
