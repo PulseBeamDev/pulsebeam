@@ -1075,6 +1075,77 @@ fn a_dropped_connection_recovers_as_the_same_participant_test() {
         ]);
 }
 
+// This qualifies the simulator's generation supervisor with genuine native
+// pixels and advancing decoder stats, not arrival-ordered transformer bytes.
+// Keep the separate encoded recovery contract above unchanged.
+#[test]
+fn native_video_reacquires_sources_and_observers_after_reconnect_test() {
+    LocalNodeSim::new()
+        .with_room(
+            Room::new("native-generation-media")
+                .with_participant(Participant::single_publisher("alice"))
+                .with_participant(Participant::subscriber("viewer").with_native_decoded_video()),
+        )
+        .run(vec![
+            Step::Run {
+                description: "Initial native video is playing",
+                duration: Duration::from_secs(6),
+            },
+            Step::CheckNativeDecodedVideo {
+                description: "Initial observer receives genuine changing native pixels",
+                participant: "viewer",
+                dimensions: (320, 180),
+                min_fresh_frames: 50,
+            },
+            Step::Partition {
+                description: "Retire the publisher's native source generation",
+                from: "alice",
+                to: "server",
+            },
+            Step::Partition {
+                description: "Retire the viewer's native observer generation too",
+                from: "viewer",
+                to: "server",
+            },
+            Step::Run {
+                description: "Both native peers lose their media graph",
+                duration: Duration::from_secs(12),
+            },
+            Step::Repair {
+                description: "Restore the publisher's route",
+                from: "alice",
+                to: "server",
+            },
+            Step::Repair {
+                description: "Restore the viewer's route",
+                from: "viewer",
+                to: "server",
+            },
+            Step::Run {
+                description: "Both clients reconnect and reacquire native media handles",
+                duration: Duration::from_secs(30),
+            },
+            Step::CheckIdentityStable {
+                description: "The publisher keeps her admitted identity",
+                participant: "alice",
+            },
+            Step::CheckIdentityStable {
+                description: "The viewer keeps the admitted identity too",
+                participant: "viewer",
+            },
+            Step::CheckNativeDecodedVideo {
+                description: "Fresh-generation native pixels and decoder statistics advance",
+                participant: "viewer",
+                dimensions: (320, 180),
+                min_fresh_frames: 50,
+            },
+            Step::CheckMediaRouted {
+                description: "The restored native media still traverses the SFU",
+                participant: "viewer",
+            },
+        ]);
+}
+
 #[test]
 fn a_tcp_connection_recovers_as_the_same_participant_test() {
     LocalNodeSim::new()

@@ -126,6 +126,19 @@ impl VideoSource {
             recovery_probe: Arc::default(),
         }
     }
+    /// Restart the fixture at its genuine IDR for a fresh native source handle.
+    /// Only immutable corpus bytes and observation probes are shared.
+    pub fn fresh(&self) -> Self {
+        Self {
+            frames: self.frames.clone(),
+            first_idr: self.first_idr,
+            index: self.first_idr,
+            fps: self.fps,
+            opaque: self.opaque,
+            repeat_keyframes: self.repeat_keyframes,
+            recovery_probe: self.recovery_probe.clone(),
+        }
+    }
     pub fn dimensions(&self) -> (u16, u16) {
         let frame = &self.frames[self.first_idr];
         (frame.width, frame.height)
@@ -287,6 +300,14 @@ impl VbrSource {
             target_bps: 0.0,
         }
     }
+    pub fn fresh(&self) -> Self {
+        Self {
+            source: self.source.fresh(),
+            frame_times: self.frame_times.clone(),
+            profile: self.profile,
+            target_bps: 0.0,
+        }
+    }
     pub fn dimensions(&self) -> (u16, u16) {
         self.source.dimensions()
     }
@@ -409,6 +430,41 @@ fn has_nal(frame: &[u8], wanted: u8) -> bool {
 mod tests {
     use super::*;
     use pulsebeam_agent_native::{ProducerFeedback, VideoEncoderError};
+
+    #[test]
+    fn fresh_generation_resets_fixture_state_not_shared_observations() {
+        // State-only values, never submitted as RTC media.
+        let frame = H264Frame {
+            payload: Vec::new(),
+            timestamp_us: 0,
+            width: 2,
+            height: 2,
+            keyframe: true,
+            temporal_index: None,
+            base_layer_sync: false,
+        };
+        let mut source = VideoSource::new(vec![frame.clone(), frame].into(), 0, 30)
+            .opaque()
+            .without_natural_keyframe_repeats();
+        source.index = 1;
+        let fresh = source.fresh();
+        assert_eq!(fresh.index, fresh.first_idr);
+        assert_eq!(source.index, 1);
+        assert!(fresh.opaque);
+        assert!(!fresh.repeat_keyframes);
+        assert!(Arc::ptr_eq(&source.frames, &fresh.frames));
+        assert!(Arc::ptr_eq(&source.recovery_probe, &fresh.recovery_probe));
+        let vbr = VbrSource {
+            source,
+            frame_times: vec![Duration::ZERO, Duration::from_millis(33)].into(),
+            profile: VbrProfile::screenshare(),
+            target_bps: 123.0,
+        };
+        let fresh = vbr.fresh();
+        assert_eq!(fresh.source.index, fresh.source.first_idr);
+        assert_eq!(fresh.target_bps, 0.0);
+        assert!(Arc::ptr_eq(&vbr.frame_times, &fresh.frame_times));
+    }
 
     #[test]
     fn recover_only_a_rejected_delta_for_an_actual_keyframe_request() {

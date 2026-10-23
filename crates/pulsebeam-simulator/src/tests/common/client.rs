@@ -541,7 +541,7 @@ impl SimClientBuilder {
                 .collect(),
         };
 
-        let mut join_set = JoinSet::new();
+        let join_set = JoinSet::new();
         let (agent, actor) =
             Agent::managed_with_services(config, self.host, move || self.native_host.runtime())?;
         let actor = tokio::task::spawn_local(actor);
@@ -642,7 +642,7 @@ impl SimClientBuilder {
         let audio_rx = self
             .audio_rx
             .unwrap_or_else(|| Arc::new(Mutex::new(AudioReceiveLog::default())));
-        let mut ctx = ClientContext {
+        let ctx = ClientContext {
             agent: agent.clone(),
             admission: self.admission,
             desired,
@@ -668,130 +668,28 @@ impl SimClientBuilder {
             events: agent.events(),
             owned_video,
         };
-        for slot in 0..self.video_slots {
-            let remote = agent
-                .remote(
-                    pulsebeam_agent_native::agent_core::MediaSlot::RemoteVideo(u8::try_from(slot)?),
-                    self.video_receive_mode,
-                )
-                .await?;
-            spawn_video_receiver(&mut join_set, remote, &ctx, agent.clone());
-        }
-        for slot in 0..self.audio_slots {
-            let remote = agent
-                .remote(
-                    pulsebeam_agent_native::agent_core::MediaSlot::RemoteAudio(u8::try_from(slot)?),
-                    self.audio_receive_mode,
-                )
-                .await?;
-            let log = ctx.audio_rx.clone();
-            if self.audio_receive_mode == pulsebeam_agent_native::ReceiveMode::Encoded {
-                log.lock().unwrap().encoded_observers += 1;
-            }
-            let snapshots = agent.snapshots();
-            let corrupt = self.corrupt_audio_payload;
-            join_set.spawn(async move {
-                let mut decoders = HashMap::<NativeAudioStream, OpusReceiver>::new();
-                loop {
-                    let frame = match remote.next().await {
-                        pulsebeam_agent_native::MediaStreamUpdate::Frame { frame } => frame,
-                        pulsebeam_agent_native::MediaStreamUpdate::Track { .. } => continue,
-                        pulsebeam_agent_native::MediaStreamUpdate::Closed => break,
-                        other => panic!("native audio observer lost media: {other:?}"),
-                    };
-                    if snapshots
-                        .borrow()
-                        .generation
-                        .map(pulsebeam_agent_native::agent_core::Generation::get)
-                        != Some(frame.track.generation)
-                    {
-                        continue;
-                    }
-                    if matches!(
-                        &frame.frame,
-                        pulsebeam_agent_native::OutputFrame::Pcm { .. }
-                    ) {
-                        assert!(
-                            !corrupt,
-                            "encoded corruption oracle requires encoded output"
-                        );
-                        log.lock()
-                            .unwrap()
-                            .native_pcm
-                            .observe(&frame, Instant::now());
-                        continue;
-                    }
-                    // Catalog mapping is not the provenance of buffered native
-                    // media. Keep actual receiver/SSRC identity in this oracle.
-                    let stream = NativeAudioStream {
-                        generation: frame.track.generation,
-                        receiver: frame.track.receiver,
-                        ssrc: frame.metadata.ssrc.expect("native encoded Opus SSRC"),
-                    };
-                    log.lock()
-                        .unwrap()
-                        .tracks
-                        .insert(stream.clone(), frame.track.clone());
-                    let pulsebeam_agent_native::OutputFrame::Opus { mut payload, .. } = frame.frame
-                    else {
-                        panic!("encoded audio observer returned another media kind");
-                    };
-                    if corrupt {
-                        payload.fill(0xff);
-                    }
-                    log.lock().unwrap().record(
-                        &stream,
-                        stream.ssrc,
-                        frame
-                            .metadata
-                            .sequence_number
-                            .expect("native encoded Opus sequence"),
-                        payload.len(),
-                        Instant::now(),
-                    );
-                    decoders
-                        .entry(stream.clone())
-                        .or_insert_with(|| OpusReceiver::new(&format!("{stream:?}")))
-                        .decode_packet(&payload, &log, &stream);
-                }
-            });
-        }
-
-        if self.publishes_video {
-            let media = agent
-                .source(pulsebeam_agent_native::agent_core::MediaSlot::LocalVideo(
-                    "v0".into(),
-                ))
-                .await?;
-            if let Some(source) = vbr_source {
-                join_set.spawn(source.run(media));
-            } else {
-                join_set.spawn(VideoSource::run_batch(video_sources, media));
-            }
-        }
-        if let Some(level) = self.audio_level_dbov {
-            join_set.spawn(
-                QualityAudioLooper {
-                    level_dbov: level,
-                    phase_offset: self.audio_phase_offset,
-                }
-                .run(
-                    self.audio_input,
-                    agent.snapshots(),
-                    agent
-                        .source(pulsebeam_agent_native::agent_core::MediaSlot::LocalAudio(
-                            "a0".into(),
-                        ))
-                        .await?,
-                ),
-            );
-        }
-        ctx.refresh().await?;
-        Ok(SimClient {
+        let mut client = SimClient {
             ctx,
             join_set,
             actor: Some(actor),
-        })
+            media_generation: None,
+            media: ClientMediaPlan {
+                video_slots: self.video_slots,
+                audio_slots: self.audio_slots,
+                video_receive_mode: self.video_receive_mode,
+                audio_receive_mode: self.audio_receive_mode,
+                publishes_video: self.publishes_video,
+                video_sources,
+                vbr_source,
+                audio_level_dbov: self.audio_level_dbov,
+                audio_phase_offset: self.audio_phase_offset,
+                audio_input: self.audio_input,
+                corrupt_audio_payload: self.corrupt_audio_payload,
+            },
+        };
+        client.rearm_media().await?;
+        client.ctx.refresh().await?;
+        Ok(client)
     }
 }
 
@@ -2597,10 +2495,28 @@ impl ClientContext {
     }
 }
 
+// Keep application recipes across reconnect, never generation-scoped native
+// sources, clocks or observer leases. Each replacement gets fresh public handles.
+struct ClientMediaPlan {
+    video_slots: usize,
+    audio_slots: usize,
+    video_receive_mode: pulsebeam_agent_native::ReceiveMode,
+    audio_receive_mode: pulsebeam_agent_native::ReceiveMode,
+    publishes_video: bool,
+    video_sources: Vec<(Option<String>, VideoSource)>,
+    vbr_source: Option<VbrSource>,
+    audio_level_dbov: Option<i8>,
+    audio_phase_offset: u64,
+    audio_input: AudioInput,
+    corrupt_audio_payload: bool,
+}
+
 pub struct SimClient {
     pub ctx: ClientContext,
     join_set: JoinSet<()>,
     actor: Option<tokio::task::JoinHandle<()>>,
+    media_generation: Option<u64>,
+    media: ClientMediaPlan,
 }
 
 impl Drop for SimClient {
@@ -2612,6 +2528,160 @@ impl Drop for SimClient {
 }
 
 impl SimClient {
+    async fn rearm_media(&mut self) -> anyhow::Result<()> {
+        let generation = {
+            let snapshot = self.ctx.snapshots.borrow();
+            if snapshot.connection != ConnectionState::Connected {
+                return Ok(());
+            }
+            snapshot
+                .generation
+                .map(pulsebeam_agent_native::agent_core::Generation::get)
+                .ok_or_else(|| anyhow::anyhow!("connected native graph has no generation"))?
+        };
+        if self.media_generation == Some(generation) {
+            return Ok(());
+        }
+        // The actor owns retirement. Cancel only application feeds/observers;
+        // never carry an old handle or capture clock into its replacement.
+        self.join_set.abort_all();
+        while let Some(result) = self.join_set.join_next().await {
+            match result {
+                Ok(()) => {}
+                Err(error) if error.is_cancelled() => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        let ctx = &self.ctx;
+        let agent = ctx.agent.clone();
+        let plan = &self.media;
+        for slot in 0..plan.video_slots {
+            let remote = agent
+                .remote(
+                    pulsebeam_agent_native::agent_core::MediaSlot::RemoteVideo(u8::try_from(slot)?),
+                    plan.video_receive_mode,
+                )
+                .await?;
+            spawn_video_receiver(&mut self.join_set, remote, ctx, agent.clone());
+        }
+        for slot in 0..plan.audio_slots {
+            let remote = agent
+                .remote(
+                    pulsebeam_agent_native::agent_core::MediaSlot::RemoteAudio(u8::try_from(slot)?),
+                    plan.audio_receive_mode,
+                )
+                .await?;
+            let log = ctx.audio_rx.clone();
+            if plan.audio_receive_mode == pulsebeam_agent_native::ReceiveMode::Encoded {
+                log.lock().unwrap().encoded_observers += 1;
+            }
+            let snapshots = agent.snapshots();
+            let corrupt = plan.corrupt_audio_payload;
+            self.join_set.spawn(async move {
+                let mut decoders = HashMap::<NativeAudioStream, OpusReceiver>::new();
+                loop {
+                    let frame = match remote.next().await {
+                        pulsebeam_agent_native::MediaStreamUpdate::Frame { frame } => frame,
+                        pulsebeam_agent_native::MediaStreamUpdate::Track { .. } => continue,
+                        pulsebeam_agent_native::MediaStreamUpdate::Closed => break,
+                        other => panic!("native audio observer lost media: {other:?}"),
+                    };
+                    if snapshots
+                        .borrow()
+                        .generation
+                        .map(pulsebeam_agent_native::agent_core::Generation::get)
+                        != Some(frame.track.generation)
+                    {
+                        continue;
+                    }
+                    if matches!(
+                        &frame.frame,
+                        pulsebeam_agent_native::OutputFrame::Pcm { .. }
+                    ) {
+                        assert!(
+                            !corrupt,
+                            "encoded corruption oracle requires encoded output"
+                        );
+                        log.lock()
+                            .unwrap()
+                            .native_pcm
+                            .observe(&frame, Instant::now());
+                        continue;
+                    }
+                    // Catalog mapping is not the provenance of buffered native
+                    // media. Keep actual receiver/SSRC identity in this oracle.
+                    let stream = NativeAudioStream {
+                        generation: frame.track.generation,
+                        receiver: frame.track.receiver,
+                        ssrc: frame.metadata.ssrc.expect("native encoded Opus SSRC"),
+                    };
+                    log.lock()
+                        .unwrap()
+                        .tracks
+                        .insert(stream.clone(), frame.track.clone());
+                    let pulsebeam_agent_native::OutputFrame::Opus { mut payload, .. } = frame.frame
+                    else {
+                        panic!("encoded audio observer returned another media kind");
+                    };
+                    if corrupt {
+                        payload.fill(0xff);
+                    }
+                    log.lock().unwrap().record(
+                        &stream,
+                        stream.ssrc,
+                        frame
+                            .metadata
+                            .sequence_number
+                            .expect("native encoded Opus sequence"),
+                        payload.len(),
+                        Instant::now(),
+                    );
+                    decoders
+                        .entry(stream.clone())
+                        .or_insert_with(|| OpusReceiver::new(&format!("{stream:?}")))
+                        .decode_packet(&payload, &log, &stream);
+                }
+            });
+        }
+        if plan.publishes_video {
+            let media = agent
+                .source(pulsebeam_agent_native::agent_core::MediaSlot::LocalVideo(
+                    "v0".into(),
+                ))
+                .await?;
+            if let Some(source) = &plan.vbr_source {
+                self.join_set.spawn(source.fresh().run(media));
+            } else {
+                let sources = plan
+                    .video_sources
+                    .iter()
+                    .map(|(encoding, source)| (encoding.clone(), source.fresh()))
+                    .collect();
+                self.join_set.spawn(VideoSource::run_batch(sources, media));
+            }
+        }
+        if let Some(level) = plan.audio_level_dbov {
+            self.join_set.spawn(
+                QualityAudioLooper {
+                    level_dbov: level,
+                    phase_offset: plan.audio_phase_offset,
+                }
+                .run(
+                    plan.audio_input,
+                    agent.snapshots(),
+                    agent
+                        .source(pulsebeam_agent_native::agent_core::MediaSlot::LocalAudio(
+                            "a0".into(),
+                        ))
+                        .await?,
+                ),
+            );
+        }
+        tracing::debug!(target: "pulsebeam_sim_recovery", generation, "application media attached to connected native generation");
+        self.media_generation = Some(generation);
+        Ok(())
+    }
+
     pub async fn tick(&mut self) -> anyhow::Result<()> {
         while let Some(result) = self.join_set.try_join_next() {
             result?;
@@ -2626,7 +2696,8 @@ impl SimClient {
             }
             anyhow::bail!("native fixture actor stopped before close");
         }
-        self.ctx.refresh().await
+        self.ctx.refresh().await?;
+        self.rearm_media().await
     }
 
     pub async fn close(mut self) -> anyhow::Result<()> {
