@@ -263,6 +263,17 @@ impl IngressOwner {
             }
         };
         let state = &mut self.encodings[encoding];
+        // MID/RID may stop repeating after SSRC acknowledgment. Preserve the
+        // authenticated association, but never hide an explicit RID conflict.
+        if state
+            .rid
+            .as_deref()
+            .zip(rid)
+            .is_some_and(|(known, signaled)| known != signaled)
+        {
+            self.drop();
+            return;
+        }
         if state.ssrc.is_none() {
             state.ssrc = Some(packet.ssrc());
         }
@@ -277,6 +288,7 @@ impl IngressOwner {
             self.drop();
             return;
         }
+        let rid = state.rid.as_deref().map(Arc::from);
         let header = RtpHeader {
             sequence: packet.sequence(),
             timestamp: packet.timestamp(),
@@ -297,7 +309,6 @@ impl IngressOwner {
                     .find(|(id, _)| *id == value.id())
                     .map(|(_, uri)| (Arc::<str>::from(uri.as_ref()), value.range()))
             });
-        let rid = rid.map(Arc::from);
         let packet = ReceivedRtp {
             arrival,
             header,
@@ -555,13 +566,15 @@ impl IngressOwner {
     }
 
     fn find_encoding(&self, media: usize, ssrc: u32, rid: Option<&str>) -> Option<usize> {
-        self.encodings.iter().position(|encoding| {
-            encoding.media == media
-                && ((encoding.ssrc == Some(ssrc))
-                    || rid.is_some_and(|rid| encoding.rid.as_deref() == Some(rid)))
-                && !(encoding.ssrc.is_some_and(|known| known != ssrc)
-                    && rid.is_some_and(|rid| encoding.rid.as_deref() != Some(rid)))
-        })
+        self.encodings
+            .iter()
+            .position(|encoding| encoding.media == media && encoding.ssrc == Some(ssrc))
+            .or_else(|| {
+                self.encodings.iter().position(|encoding| {
+                    encoding.media == media
+                        && rid.is_some_and(|rid| encoding.rid.as_deref() == Some(rid))
+                })
+            })
     }
 
     fn drop(&mut self) {
@@ -634,6 +647,107 @@ fn extension_value<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn rid_ingress(now: Instant) -> IngressOwner {
+        IngressOwner::new(
+            Box::new([IngressMediaFacts {
+                sender_index: 0,
+                kind: crate::MediaKind::Video,
+                mid: "v".into(),
+                payloads: Box::new([(96, 90_000)]),
+                feedback_payloads: Box::new([96]),
+                repairs: Box::new([]),
+                nack_payloads: Box::new([96]),
+                ssrc_repairs: Box::new([]),
+                ssrcs: Box::new([]),
+                rids: Box::new(["q".into(), "h".into()]),
+                extensions: Box::new([
+                    (1, "urn:ietf:params:rtp-hdrext:sdes:mid".into()),
+                    (2, "urn:ietf:params:rtp-hdrext:sdes:rtp-stream-id".into()),
+                ]),
+            }]),
+            2,
+            4096,
+            99,
+            ReceiveFeedback::new(None, now),
+        )
+    }
+
+    fn rid_packet(ssrc: u32, sequence: u16, rid: Option<u8>) -> Vec<u8> {
+        let mut bytes = vec![if rid.is_some() { 0x90 } else { 0x80 }, 96];
+        bytes.extend_from_slice(&sequence.to_be_bytes());
+        bytes.extend_from_slice(&u32::from(sequence).to_be_bytes());
+        bytes.extend_from_slice(&ssrc.to_be_bytes());
+        if let Some(rid) = rid {
+            bytes.extend_from_slice(&[0xbe, 0xde, 0, 1, 0x10, b'v', 0x20, rid]);
+        }
+        bytes.push(0x65);
+        bytes
+    }
+
+    fn received_rids(ingress: &mut IngressOwner) -> Vec<(u32, Option<String>)> {
+        std::iter::from_fn(|| ingress.poll_event())
+            .filter_map(|event| match event {
+                Event::Rtp { rid, packet, .. } => {
+                    Some((packet.header.ssrc, rid.as_deref().map(str::to_owned)))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn established_ssrc_retains_rid_when_sdes_headers_are_omitted() {
+        let now = Instant::now();
+        let mut ingress = rid_ingress(now);
+        ingress.accept_rtp(now, rid_packet(11, 1, Some(b'q')), None);
+        ingress.accept_rtp(now, rid_packet(22, 100, Some(b'h')), None);
+        assert_eq!(
+            received_rids(&mut ingress),
+            [(11, Some("q".into())), (22, Some("h".into()))]
+        );
+        // Acknowledged libwebrtc senders may stop repeating both MID and RID.
+        ingress.accept_rtp(now, rid_packet(11, 2, None), None);
+        ingress.accept_rtp(now, rid_packet(22, 101, None), None);
+        assert_eq!(
+            received_rids(&mut ingress),
+            [(11, Some("q".into())), (22, Some("h".into()))]
+        );
+    }
+
+    #[test]
+    fn established_ssrc_rejects_conflicting_rid_without_rebinding() {
+        let now = Instant::now();
+        let mut ingress = rid_ingress(now);
+        ingress.accept_rtp(now, rid_packet(11, 1, Some(b'q')), None);
+        ingress.accept_rtp(now, rid_packet(22, 100, Some(b'h')), None);
+        assert_eq!(
+            received_rids(&mut ingress),
+            [(11, Some("q".into())), (22, Some("h".into()))]
+        );
+        // Neither insertion order may let a RID override an established SSRC.
+        ingress.accept_rtp(now, rid_packet(11, 2, Some(b'h')), None);
+        ingress.accept_rtp(now, rid_packet(22, 101, Some(b'q')), None);
+        assert!(received_rids(&mut ingress).is_empty());
+        ingress.accept_rtp(now, rid_packet(11, 3, None), None);
+        ingress.accept_rtp(now, rid_packet(22, 102, None), None);
+        assert_eq!(
+            received_rids(&mut ingress),
+            [(11, Some("q".into())), (22, Some("h".into()))]
+        );
+    }
+
+    #[test]
+    fn established_ssrc_retirement_rejects_headerless_late_packets() {
+        let now = Instant::now();
+        let mut ingress = rid_ingress(now);
+        ingress.accept_rtp(now, rid_packet(11, 1, Some(b'q')), None);
+        assert_eq!(received_rids(&mut ingress), [(11, Some("q".into()))]);
+        ingress.retire(11).unwrap();
+        assert!(received_rids(&mut ingress).is_empty());
+        ingress.accept_rtp(now, rid_packet(11, 2, None), None);
+        assert!(received_rids(&mut ingress).is_empty());
+    }
 
     #[test]
     fn offered_primary_can_bootstrap_a_keyframe_without_discovering_an_encoding() {
