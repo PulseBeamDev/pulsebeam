@@ -56,8 +56,8 @@ fn egress_extensions(
     writer: &mut pulsebeam_core::dd::DependencyDescriptorWriter,
     mappings: &[pulsebeam_rtc::RtpExtensionInfo],
 ) -> Result<Vec<RtpExtension>, pulsebeam_rtc::WriteError> {
-    let mut extensions = values
-        .opaque
+    let mut values = values;
+    let mut extensions = std::mem::take(&mut values.opaque)
         .into_iter()
         .filter(|extension| mappings.iter().any(|mapping| mapping.uri == extension.uri))
         .filter(|extension| {
@@ -83,16 +83,9 @@ fn egress_extensions(
         )
     }) {
         let mut descriptor = [0; pulsebeam_core::dd::MAX_DD_LEN];
-        let rewritten = values
-            .dependency_descriptor
-            .as_deref()
-            .and_then(|dd| writer.write(dd, &mut descriptor).ok());
-        let bytes = rewritten.and_then(|len| descriptor.get(..len)).or_else(|| {
-            values
-                .raw_dependency_descriptor
-                .as_ref()
-                .map(|raw| raw.0.as_slice())
-        });
+        let bytes = values
+            .write_dependency_descriptor(writer, &mut descriptor)
+            .and_then(|len| descriptor.get(..len));
         if let Some(bytes) = bytes {
             extensions.push(RtpExtension {
                 uri: mapping.uri.clone(),

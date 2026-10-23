@@ -722,7 +722,7 @@ impl SimClientBuilder {
                     decoders
                         .entry(stream.clone())
                         .or_insert_with(|| OpusReceiver::new(&format!("{stream:?}")))
-                        .push(&payload, &log, &stream);
+                        .decode_packet(&payload, &log, &stream);
                 }
             });
         }
