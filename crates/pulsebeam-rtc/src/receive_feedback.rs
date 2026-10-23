@@ -65,7 +65,7 @@ impl ReceiveFeedback {
                 let Some(sequence) = twcc else {
                     return;
                 };
-                (0, extend(self.twcc_highest, sequence))
+                (ssrc, extend(self.twcc_highest, sequence))
             }
             Some(PacketFeedbackKind::Rfc8888) => {
                 let highest = self
@@ -167,11 +167,19 @@ impl ReceiveFeedback {
     fn twcc(&mut self, now: Instant, sender_ssrc: u32) -> Option<Vec<u8>> {
         let base = self.twcc_next?;
         let end = (base + REPORT_STATUSES).min(self.twcc_highest? + 1);
-        let first_time = self
+        let first_receipt = self
             .receipts
-            .get(self.receipts.partition_point(|r| r.sequence < base))
-            .filter(|r| r.sequence < end)
-            .map_or(now, |r| r.arrival);
+            .get(self.receipts.partition_point(|r| r.sequence < base))?;
+        // libwebrtc dispatches TWCC only for a local/registered media SSRC.
+        // Anchor to an actual transport receipt, including when this bounded
+        // slice contains only losses and its next received packet is later.
+        // Sequence accounting remains transport-wide, not per media stream.
+        let media_ssrc = first_receipt.ssrc;
+        let first_time = if first_receipt.sequence < end {
+            first_receipt.arrival
+        } else {
+            now
+        };
         let reference_ticks = self.ticks(first_time) / 256;
         let mut previous = reference_ticks * 256;
         let mut statuses = Vec::with_capacity(REPORT_STATUSES as usize);
@@ -215,7 +223,7 @@ impl ReceiveFeedback {
             .collect();
         let report = Twcc {
             sender_ssrc: sender_ssrc.into(),
-            ssrc: 0.into(),
+            ssrc: media_ssrc.into(),
             base_seq: base as u16,
             status_count: count,
             reference_time: reference_ticks as u32 & 0x00ff_ffff,
@@ -360,6 +368,7 @@ mod tests {
         receiver.observe(at(start, 3), 9, 1, Some(u16::MAX), None);
         assert!(receiver.poll(at(start, 49), 9).is_none());
         let FeedbackReport::Twcc {
+            media_ssrc,
             base_sequence,
             feedback_count,
             statuses,
@@ -368,6 +377,10 @@ mod tests {
         else {
             panic!("TWCC");
         };
+        assert_eq!(
+            media_ssrc, 7,
+            "anchor one actual stream in transport feedback"
+        );
         assert_eq!(base_sequence, u16::MAX - 1);
         assert_eq!(feedback_count, 0);
         assert_eq!(
@@ -437,10 +450,11 @@ mod tests {
         }
         assert_eq!(reported, HISTORY);
         receiver.clear();
-        receiver.observe(start, 7, 10, Some(10), None);
-        receiver.observe(at(start, 30_000), 7, 11, Some(11), None);
-        for expected in [10, 11] {
+        receiver.observe(start, 11, 10, Some(10), None);
+        receiver.observe(at(start, 30_000), 12, 11, Some(11), None);
+        for (expected_sequence, expected_ssrc) in [(10, 11), (11, 12)] {
             let FeedbackReport::Twcc {
+                media_ssrc,
                 base_sequence,
                 statuses,
                 ..
@@ -448,9 +462,55 @@ mod tests {
             else {
                 panic!("TWCC");
             };
-            assert_eq!(base_sequence, expected);
+            assert_eq!(
+                media_ssrc, expected_ssrc,
+                "clear must retire the old source"
+            );
+            assert_eq!(base_sequence, expected_sequence);
             assert_eq!(statuses.len(), 1);
         }
+        assert_eq!(receiver.deadline(), None);
+    }
+
+    #[test]
+    fn twcc_anchors_loss_only_ranges_without_splitting_transport_space() {
+        let start = Instant::now();
+        let mut receiver = ReceiveFeedback::new(Some(PacketFeedbackKind::TransportWide), start);
+        receiver.observe(start, 7, 10, Some(0), None);
+        let FeedbackReport::Twcc { media_ssrc, .. } = report(&mut receiver, at(start, 50)) else {
+            panic!("TWCC");
+        };
+        assert_eq!(media_ssrc, 7);
+        receiver.observe(at(start, 60), 8, 20, Some(300), None);
+        let FeedbackReport::Twcc {
+            media_ssrc,
+            base_sequence,
+            statuses,
+            ..
+        } = report(&mut receiver, at(start, 110))
+        else {
+            panic!("TWCC");
+        };
+        assert_eq!(
+            media_ssrc, 8,
+            "even a loss-only slice uses an observed source"
+        );
+        assert_eq!(base_sequence, 1);
+        assert_eq!(statuses.len(), REPORT_STATUSES as usize);
+        assert!(statuses.iter().all(|s| *s == TwccStatus::NotReceived));
+        let FeedbackReport::Twcc {
+            media_ssrc,
+            base_sequence,
+            statuses,
+            ..
+        } = report(&mut receiver, at(start, 110))
+        else {
+            panic!("TWCC");
+        };
+        assert_eq!(media_ssrc, 8);
+        assert_eq!(base_sequence, 257);
+        assert_eq!(statuses.len(), 44);
+        assert!(matches!(statuses.last(), Some(TwccStatus::Received { .. })));
         assert_eq!(receiver.deadline(), None);
     }
 
