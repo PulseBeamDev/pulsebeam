@@ -1175,7 +1175,10 @@ async fn exchange(
                     let mut frame = fixtures[index].clone();
                     let cycle = *frame_number / u64::try_from(fixtures.len()).unwrap();
                     frame.timestamp = frame.timestamp.checked_add(u32::try_from(cycle.checked_mul(48_000).unwrap()).unwrap()).unwrap();
-                    audio.submit(InputFrame::Opus { frame }).await?;
+                    audio.submit(InputFrame::Opus { frame }).await.inspect_err(|error| {
+                        let native_rtp = native_rtp_report();
+                        tracing::error!(round, generation, submitted = *frame_number, ?error, ?native_rtp, "native Opus producer admission failed");
+                    })?;
                     *frame_number = frame_number.checked_add(1).unwrap();
                 }
             }

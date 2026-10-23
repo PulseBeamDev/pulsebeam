@@ -3491,6 +3491,22 @@ async fn execute_plan(
                 })?;
                 let actual = pulsebeam::sim_metrics::forwarded_quality(&id);
                 let bwe = pulsebeam::sim_metrics::downstream_bwe_summary();
+                if !actual.is_some_and(|q| q >= *min_quality) {
+                    let statistics = handle.shared.statistics.lock().unwrap();
+                    match statistics.as_ref() {
+                        Some(stats) => tracing::error!(
+                            participant = origin,
+                            generation = stats.generation,
+                            timestamp_us = stats.timestamp_us,
+                            report = %String::from_utf8_lossy(&stats.report_json),
+                            "native publisher statistics at forwarded-quality failure"
+                        ),
+                        None => tracing::error!(
+                            participant = origin,
+                            "native publisher statistics unavailable at forwarded-quality failure"
+                        ),
+                    }
+                }
                 assert!(
                     actual.is_some_and(|q| q >= *min_quality),
                     "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  origin:       {origin}\n  expected:     >= quality {min_quality}\n  actual:       {actual:?} (0=paused, None=never observed)\n  BWE window:   {bwe:?} (min, max, last, samples)"
