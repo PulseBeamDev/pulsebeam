@@ -1883,7 +1883,24 @@ async fn execute_plan(
                         if actual == expected { return Ok::<_, anyhow::Error>(()); }
                         tokio::time::sleep(Duration::from_millis(10)).await;
                     }
-                }).await.map_err(|_| anyhow::anyhow!("{participant} did not receive ordered sequence {expected:?}"))??;
+                }).await.map_err(|_| {
+                    let events = handle.shared.topic_events.lock().unwrap();
+                    let events = events.get(*topic).map(Vec::as_slice).unwrap_or_default();
+                    let actual_len = events.iter().filter_map(topic_payload).count();
+                    let sequences = events.iter().filter_map(|event| match event {
+                        TopicNotification::Message(message) => Some(message.sequence),
+                        _ => None,
+                    }).collect::<Vec<_>>();
+                    let first = &sequences[..sequences.len().min(40)];
+                    let last = &sequences[sequences.len().saturating_sub(40)..];
+                    let gaps = events.iter().filter(|event| matches!(event, TopicNotification::RecoveryGap { .. })).collect::<Vec<_>>();
+                    let observation = handle.shared.observation.lock().unwrap();
+                    let generation = observation.as_ref().and_then(|state| state.snapshot.generation).map(pulsebeam_agent_native::agent_core::Generation::get);
+                    let connection = observation.as_ref().map(|state| &state.snapshot.connection);
+                    let subscribers = observation.as_ref().map(|state| state.snapshot.topics.subscribers.iter().filter(|status| status.registration.topic == *topic).take(16).collect::<Vec<_>>());
+                    let cursors = observation.as_ref().map(|state| state.ordered_cursors.iter().filter(|(registration, _, _)| registration.topic == *topic).take(16).collect::<Vec<_>>());
+                    anyhow::anyhow!("{participant} did not receive ordered sequence on {topic}: actual_len={actual_len} expected_len={} first_sequences={first:?} last_sequences={last:?} gaps={gaps:?} generation={generation:?} connection={connection:?} subscribers={subscribers:?} cursors={cursors:?}", expected.len())
+                })??;
             }
             Step::Run {
                 description,
