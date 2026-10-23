@@ -434,7 +434,13 @@ fn video_unit(
             },
             simulcast_index,
             spatial_index: None,
-            temporal_index: frame.temporal_index,
+            // Core accepts an explicit base layer for L1T1; the native single-
+            // layer encoder represents that same stream without a temporal ID.
+            temporal_index: if temporal_layers == 1 {
+                None
+            } else {
+                frame.temporal_index
+            },
             end_of_picture: true,
         },
     })
@@ -691,5 +697,28 @@ mod tests {
                 base_layer_sync: false
             }
         ));
+    }
+
+    #[test]
+    fn single_temporal_layer_uses_native_absent_temporal_index() {
+        let frame = |temporal_index| H264Frame {
+            timestamp_us: 1,
+            width: 16,
+            height: 16,
+            keyframe: false,
+            temporal_index,
+            base_layer_sync: false,
+            payload: Vec::new(),
+        };
+        for simulcast_index in [None, Some(0), Some(1), Some(2)] {
+            for temporal_index in [None, Some(0)] {
+                let unit = video_unit(frame(temporal_index), simulcast_index, 1).unwrap();
+                assert_eq!(unit.metadata.temporal_index, None);
+                assert_eq!(unit.metadata.simulcast_index, simulcast_index);
+            }
+            for temporal_index in [Some(1), Some(2)] {
+                assert!(video_unit(frame(temporal_index), simulcast_index, 1).is_err());
+            }
+        }
     }
 }

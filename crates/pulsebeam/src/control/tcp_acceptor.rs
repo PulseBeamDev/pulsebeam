@@ -209,7 +209,12 @@ fn validate_and_route(
     config: TcpAcceptorConfig,
 ) -> Option<PendingTcpConn> {
     let Some(raw_ufrag) = extract_stun_server_ufrag(payload) else {
-        tracing::warn!(%peer_addr, "TCP first frame carries no STUN ufrag, dropping");
+        tracing::warn!(
+            %peer_addr,
+            frame_bytes = payload.len(),
+            valid_stun_header = pulsebeam_routing::stun::is_stun(payload),
+            "TCP first frame carries no STUN ufrag, dropping"
+        );
         return None; // stream dropped here, OS socket closed
     };
 
