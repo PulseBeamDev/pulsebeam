@@ -1095,7 +1095,18 @@ impl Topics {
             self.publishers.insert(publisher, PublisherState::default());
         }
         for state in self.subscribers.values_mut() {
-            *state = SubscriberState::default();
+            if reason == TopicDropReason::TransportReplaced {
+                // A transport fence is not an unsubscription. Keep the delivery
+                // frontier, not payload buffers. Catalog pruning is unchanged;
+                // see ORDERED_RECOVERY_CHECKPOINT.md for the bootstrap blocker.
+                state.latest.clear();
+                state.lossy.clear();
+                for delivery in state.ordered.values_mut() {
+                    delivery.pending.clear();
+                }
+            } else {
+                *state = SubscriberState::default();
+            }
         }
         self.refresh_snapshot(snapshot);
     }
@@ -1423,6 +1434,160 @@ mod tests {
             data_track_id: "authoritative".into(),
             sequence,
             payload: alloc::vec![42],
+        }
+    }
+
+    fn ordered_topics(ids: &mut IdGenerator) -> (Topics, TopicSubscriber, Generation) {
+        let subscriber = TopicSubscriber {
+            topic: "state".into(),
+            mode: TopicMode::Ordered,
+        };
+        let generation = ids.generation();
+        let channel = ChannelId::new(1).unwrap();
+        let mut topics = Topics {
+            active: Some(ActiveTopics {
+                generation,
+                canonical_participant_id: "local".into(),
+                channels: BTreeMap::from([(
+                    channel,
+                    ChannelRegistration::Subscriber(subscriber.clone()),
+                )]),
+            }),
+            ..Topics::default()
+        };
+        topics.catalog.insert(
+            "authoritative".into(),
+            CatalogBinding {
+                topic: subscriber.topic.clone(),
+                mode: subscriber.mode,
+                participant_id: "remote".into(),
+                local: false,
+            },
+        );
+        topics.subscribers.insert(
+            subscriber.clone(),
+            SubscriberState {
+                ordered: BTreeMap::from([(
+                    "authoritative".into(),
+                    OrderedDelivery {
+                        next_sequence: Some(4),
+                        pending: BTreeMap::from([(5, message(5))]),
+                    },
+                )]),
+                ..SubscriberState::default()
+            },
+        );
+        (topics, subscriber, generation)
+    }
+
+    #[test]
+    fn ordered_cursor_survives_transport_rebind_and_probes_for_recovery() {
+        let mut ids = IdGenerator::new();
+        let (mut topics, subscriber, generation) = ordered_topics(&mut ids);
+        let catalog = topics.catalog.clone();
+        let mut snapshot = Snapshot::default();
+        let mut notifications = VecDeque::new();
+        let mut effects = VecDeque::new();
+        topics.unbind_generation(
+            generation,
+            TopicDropReason::TransportReplaced,
+            &mut snapshot,
+            &mut notifications,
+        );
+        assert!(topics.active.is_none());
+        assert!(topics.catalog.is_empty());
+        assert_eq!(
+            topics.subscribers[&subscriber]
+                .ordered
+                .get("authoritative")
+                .and_then(|delivery| delivery.next_sequence),
+            Some(4)
+        );
+        assert!(
+            topics.subscribers[&subscriber].ordered["authoritative"]
+                .pending
+                .is_empty()
+        );
+        let replacement = ids.generation();
+        let channel = ChannelId::new(2).unwrap();
+        topics.bind(
+            replacement,
+            "local".into(),
+            &TopicRegistrations {
+                subscribers: alloc::vec![subscriber.clone()],
+                ..TopicRegistrations::default()
+            },
+            alloc::vec![DataChannelBinding {
+                label: subscriber_label(&subscriber),
+                channel,
+            }],
+            &mut ids,
+            &mut effects,
+            &mut snapshot,
+            &mut notifications,
+        );
+        // A late close from the retired graph cannot fence the replacement.
+        topics.unbind_generation(
+            generation,
+            TopicDropReason::ChannelClosed,
+            &mut snapshot,
+            &mut notifications,
+        );
+        // This unit restores the known catalog directly, not through signaling
+        // bootstrap. The on-wire gap is recorded in ORDERED_RECOVERY_CHECKPOINT.md.
+        // Catalog removal is separately checked below, not inferred from unbind.
+        topics.catalog = catalog;
+        topics.probe_remote_publishers(&mut ids, &mut effects);
+        let Some(Effect::DataChannel(DataChannelEffect::Send {
+            generation,
+            channel: actual_channel,
+            payload,
+            ..
+        })) = effects.pop_front()
+        else {
+            panic!("replacement must probe the retained ordered cursor");
+        };
+        assert_eq!(generation, replacement);
+        assert_eq!(actual_channel, channel);
+        let frame = TopicFrame::decode_bounded(&payload).unwrap();
+        let Some(Body::Probe(probe)) = frame.body else {
+            panic!("ordered recovery probe");
+        };
+        assert_eq!(probe.data_track_id, "authoritative");
+        assert_eq!(probe.from_sequence, 4);
+        assert!(!probe.live, "reconnect is not a new live-only subscription");
+    }
+
+    #[test]
+    fn ordered_cursor_is_fenced_by_close_catalog_removal_or_unsubscribe() {
+        for boundary in 0..3 {
+            let mut ids = IdGenerator::new();
+            let (mut topics, subscriber, generation) = ordered_topics(&mut ids);
+            let mut snapshot = Snapshot::default();
+            let mut notifications = VecDeque::new();
+            match boundary {
+                0 => topics.end_session(&mut snapshot, &mut notifications),
+                1 => topics.sync_catalog(
+                    generation,
+                    &crate::signaling_v1::CatalogState::default(),
+                    &mut snapshot,
+                    &mut notifications,
+                    &mut ids,
+                    &mut VecDeque::new(),
+                ),
+                _ => topics.reconcile(
+                    &TopicRegistrations::default(),
+                    &mut snapshot,
+                    &mut notifications,
+                ),
+            }
+            assert!(
+                topics
+                    .subscribers
+                    .get(&subscriber)
+                    .is_none_or(|state| state.ordered.is_empty()),
+                "boundary {boundary} must discard the old publication cursor"
+            );
         }
     }
 
