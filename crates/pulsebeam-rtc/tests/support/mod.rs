@@ -1446,17 +1446,22 @@ impl<M> PeerFixture<M> {
                             stream.local == packet.destination && stream.remote == packet.source
                         })
                         .expect("admitted native TCP stream");
-                    // Native non-TLS TCP exposes AsyncPacketSocket payloads, not stream framing.
-                    let size = u16::try_from(packet.payload.len()).expect("RFC 4571 packet length");
-                    let mut frame = Vec::with_capacity(packet.payload.len() + 2);
-                    frame.extend_from_slice(&size.to_be_bytes());
-                    frame.extend_from_slice(&packet.payload);
+                    // The controlled native socket accepts whole writes here;
+                    // AsyncTCPSocket has already supplied the RFC 4571 prefix.
+                    let length = u16::from_be_bytes(
+                        packet.payload[..2].try_into().expect("RFC 4571 prefix"),
+                    );
+                    assert_eq!(
+                        usize::from(length),
+                        packet.payload.len() - 2,
+                        "complete native RFC 4571 output"
+                    );
                     self.network.enqueue(PendingPacket::Connection {
                         due: self.now,
                         input: NetworkInput::IceTcp {
                             local: SocketAddr::new(stream.local.ip(), stream.local.port()),
                             remote: SocketAddr::new(stream.remote.ip(), stream.remote.port()),
-                            frame: Bytes::from(frame),
+                            frame: Bytes::from(packet.payload),
                         },
                     });
                     self.network_adapter
@@ -1631,7 +1636,7 @@ impl<M> PeerFixture<M> {
                                 self.headers.push_back(header);
                             }
                             self.network_adapter
-                                .inject_tcp_data(stream.local, stream.remote, packet)
+                                .inject_tcp_data(stream.local, stream.remote, &transmit.payload)
                                 .expect("native TCP client receives framed RTC output");
                             return None;
                         }

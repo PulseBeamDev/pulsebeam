@@ -229,10 +229,11 @@ required ordering around replacement. These are socket ownership obligations,
 not an RTC registry or retry service.
 
 The native interoperability fixture proves an active client against a passive
-RTC candidate at the controlled packet-socket boundary. It translates unframed
-native packet-socket payloads to/from complete RFC 4571 frames. Runtime socket
-proof separately covers partial byte-stream writes and stale-socket filtering;
-packet-socket interoperability is not that byte-stream proof.
+RTC candidate using libwebrtc's native `AsyncTCPSocket` framing. The controlled
+socket accepts whole writes in this fixture; it passes complete RFC 4571 frames
+unchanged in both directions, rather than adding or stripping another prefix.
+Runtime socket proof separately covers partial byte-stream writes and stale-socket
+filtering; this whole-write fixture is not that byte-stream proof.
 
 ## Evidence and limits
 
@@ -244,7 +245,7 @@ Protocol unit tests retain SR NTP/RTP correspondence, crypto/index boundaries,
 delayed arrival, parser/report/accounting, and negotiated RFC 8888 coverage.
 
 Production routing, DD/keyframe/cache correctness, source/layer switching, and
-node behavior remain in the direct-str0m SFU and simulator proof. RTC metadata
+node behavior remain in the SFU and simulator proof, above this transport engine. RTC metadata
 assertions alone do not establish those behaviors. Stored SDP, RFC 8888 component
 tests, and the controlled native baseline must not be described as new browser,
 Pion, platform, or production-cutover compatibility.

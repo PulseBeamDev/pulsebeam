@@ -1,8 +1,9 @@
 # `pulsebeam-rtc`
 
-An experimental, sans-I/O WebRTC transport engine for transport contributors.
-The production PulseBeam SFU still uses direct str0m. Integrating this crate into
-that server is a separate, unimplemented cutover.
+The sans-I/O WebRTC transport engine used by the PulseBeam SFU. This contributor
+guide covers its transport boundary; source/layer selection and media projection
+remain in the server. Focused transport proofs do not establish full native-agent
+or simulator qualification.
 
 For a first development check, run the owner suite from the workspace root:
 
@@ -118,10 +119,12 @@ opaque values. See [extension ownership](docs/design.md#rtp-extension-ownership)
 ## Contributor verification
 
 The RTC owner suite includes controlled native libwebrtc peers, public boundary
-tests, and private protocol/congestion proofs. Its Linux x86_64 client baseline
-is `pulsebeam-webrtc-sys` `0.6.2`, revision
-`f87f99a48e58fb9cd13767ba58e9b7cd937c71a3`. Virtual time and packet delivery drive
-real protocol implementations without real sockets or sleeps. Stored SDP is
+tests, and private protocol/congestion proofs. Its Linux x86_64 client uses the
+same checksum-pinned `pulsebeam-webrtc-sys` candidate as the native agent; follow
+the [local candidate setup](../../tools/README.md#use-the-local-native-webrtc-candidate)
+before running these commands. The lock, not an older SDK version or filename,
+identifies the compatible source/native pair. Virtual time and packet delivery
+drive real protocol implementations without real sockets or sleeps. Stored SDP is
 parser evidence, not browser compatibility. RFC 8888 retains parser, report,
 accounting, and ECN coverage, not a native-client interoperability claim.
 
