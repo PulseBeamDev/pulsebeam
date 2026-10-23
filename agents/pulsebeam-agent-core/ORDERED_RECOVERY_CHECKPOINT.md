@@ -26,11 +26,17 @@ used for the investigation was removed before this checkpoint.
 
 ## Reproduce the known failure
 
-Run from the consumer repository root with the [Bazel prerequisites](../../docs/build.md#host-prerequisites) and the
+This section records the **historical checkpoint pair**, not necessarily the
+latest candidate pin. For this exact reproduction, use a consumer checkout at
+`bd4d563e929e6091ff90d323b6bd2e51ea6af828` and the matching archives below; do not
+substitute a newer SDK into that older pin.
+
+Run from that consumer repository root with the [Bazel prerequisites](../../docs/build.md#host-prerequisites) and the
 local SDK candidate archives. The exact producer revision is
 `f91f2fb16a5fe45e152f398e70dd9961f8c26dc4`; the consumer base for the investigation
 is `eb4dfc0129ea8deea0196aab8ee2191a4a95f490`. The producer must have the matching
-archives in `dist/`; `tools/webrtc-candidate.json` records their identities:
+archives available locally; that checkpoint's `tools/webrtc-candidate.json`
+records their identities:
 
 | Archive | SHA-256 |
 | --- | --- |
@@ -39,11 +45,20 @@ archives in `dist/`; `tools/webrtc-candidate.json` records their identities:
 
 Set `SYS_WORKTREE` to the absolute producer checkout path. The investigation used
 `/home/lukas/wt/pulsebeam-libwebrtc-sys/native-libwebrtc-mvp/integrated-cutover`.
+Its original source archive was preserved before subsequent candidate updates:
+
+```sh
+SOURCE_ARCHIVE="$SYS_WORKTREE/dist/webrtc-sys-source-f91f2fb16a5fe45e152f398e70dd9961f8c26dc4.tar.gz"
+NATIVE_ARCHIVE="$SYS_WORKTREE/dist/webrtc-core-d838b78261f93265e5d651ae9aacffe4b03821d19c8732fdbba1e5ae4f5595a8.tar.gz"
+```
+
+If using another checkout, set `SOURCE_ARCHIVE` and `NATIVE_ARCHIVE` to archives
+with the respective checksums above.
 
 ```sh
 ./bazel run \
-  --repo_env=PULSEBEAM_WEBRTC_SOURCE_ARCHIVE="$SYS_WORKTREE/dist/webrtc-sys-source-linux-x86_64.tar.gz" \
-  --repo_env=PULSEBEAM_WEBRTC_NATIVE_ARCHIVE="$SYS_WORKTREE/dist/webrtc-core-linux-x86_64.tar.gz" \
+  --repo_env=PULSEBEAM_WEBRTC_SOURCE_ARCHIVE="$SOURCE_ARCHIVE" \
+  --repo_env=PULSEBEAM_WEBRTC_NATIVE_ARCHIVE="$NATIVE_ARCHIVE" \
   //:replay -- --exact \
   --filter tests::data_channel::ordered_recovery_reports_retention_gaps_without_replaying_late_history \
   --show-output --artifacts-dir /tmp/native-cutover-ordered-recovery-checkpoint
@@ -58,8 +73,8 @@ For the passing component and hygiene gates, use the same archive flags with:
 
 ```sh
 ./bazel test \
-  --repo_env=PULSEBEAM_WEBRTC_SOURCE_ARCHIVE="$SYS_WORKTREE/dist/webrtc-sys-source-linux-x86_64.tar.gz" \
-  --repo_env=PULSEBEAM_WEBRTC_NATIVE_ARCHIVE="$SYS_WORKTREE/dist/webrtc-core-linux-x86_64.tar.gz" \
+  --repo_env=PULSEBEAM_WEBRTC_SOURCE_ARCHIVE="$SOURCE_ARCHIVE" \
+  --repo_env=PULSEBEAM_WEBRTC_NATIVE_ARCHIVE="$NATIVE_ARCHIVE" \
   //agents/pulsebeam-agent-core:unit_tests \
   //agents/pulsebeam-agent-core:format \
   //agents/pulsebeam-agent-core:clippy \
