@@ -68,8 +68,7 @@ impl NetworkEgress for ShardNetworkEgress<'_> {
         if batcher.is_empty() {
             return AppendStatus::Drained;
         }
-        self.tcp.append_batcher(batcher);
-        AppendStatus::Drained
+        self.tcp.append_batcher(batcher)
     }
 
     fn flush(&mut self) -> bool {
@@ -190,6 +189,52 @@ impl ShardCore {
         self.execution.on_udp_batch_routed(batch, router);
     }
 
+    pub(crate) fn has_transport(&self, address: NodeTransportAddress) -> bool {
+        self.execution.registry.resolve_transport(address).is_some()
+    }
+
+    pub(crate) fn bind_tcp_flow(
+        &mut self,
+        address: NodeTransportAddress,
+        peer: std::net::SocketAddr,
+        flow: net::tcp::TcpFlowId,
+    ) {
+        if let Some(key) = self.execution.registry.resolve_transport(address)
+            && let Some(participant) = self.execution.registry.resolve_mut(key)
+        {
+            participant.bind_tcp_flow(peer, flow);
+        }
+    }
+
+    pub(crate) fn retire_tcp_flow(
+        &mut self,
+        address: NodeTransportAddress,
+        peer: std::net::SocketAddr,
+        flow: net::tcp::TcpFlowId,
+    ) {
+        if let Some(key) = self.execution.registry.resolve_transport(address)
+            && let Some(participant) = self.execution.registry.resolve_mut(key)
+        {
+            participant.retire_tcp_flow(peer, flow);
+        }
+    }
+
+    pub(crate) fn on_tcp_batch(
+        &mut self,
+        batch: net::RecvPacketBatch,
+        address: NodeTransportAddress,
+    ) {
+        if batch.transport != net::Transport::Tcp
+            || batch.tcp_flow.is_none()
+            || address.shard() != self.execution.shard_id
+        {
+            record_routing_drop("transport", "tcp_owner", "local");
+            return;
+        }
+        self.execution
+            .on_owned_udp_batch(batch, address, self.execution.shard_id);
+    }
+
     pub(crate) fn flush_stream_buffers(
         &mut self,
         router: &impl ShardTransport,
@@ -232,12 +277,10 @@ impl ShardCore {
             .poll_and_flush_dirty(udp_socket, tcp_socket, budget)
     }
 
-    pub(crate) fn flush_close_peers(
+    pub(crate) fn drain_pending_close(
         &mut self,
-        udp_socket: &mut UnifiedSocket,
-        tcp_socket: &mut net::tcp::TcpTransport,
-    ) {
-        self.execution.flush_close_peers(udp_socket, tcp_socket);
+    ) -> impl Iterator<Item = (NodeTransportAddress, Vec<std::net::SocketAddr>)> + '_ {
+        self.execution.registry.drain_pending_close()
     }
 }
 
@@ -511,6 +554,10 @@ impl ShardExecution {
         batch: net::RecvPacketBatch,
         router: &impl ShardTransport,
     ) {
+        if batch.transport == net::Transport::Tcp {
+            record_routing_drop("transport", "tcp_owner", "local");
+            return;
+        }
         let Some(address) = self.registry.demux(&batch) else {
             return;
         };
@@ -762,6 +809,10 @@ impl ShardExecution {
                 address,
                 source_shard,
             } => {
+                if batch.transport == net::Transport::Tcp {
+                    record_routing_drop("transport", "tcp_owner", "forwarded");
+                    return;
+                }
                 // A datagram that reached the node on another shard's socket.
                 // Ordinary while a flow is bootstrapping — the steering map is
                 // a cache, and a miss lands on whatever the kernel's tuple hash
@@ -894,17 +945,6 @@ impl ShardExecution {
         self.udp_send_batch.flush(udp_socket);
         self.tcp_send_batcher.flush(tcp_socket);
         processed
-    }
-
-    pub(crate) fn flush_close_peers(
-        &mut self,
-        udp_socket: &mut UnifiedSocket,
-        tcp_socket: &mut net::tcp::TcpTransport,
-    ) {
-        for addr in self.registry.drain_pending_close() {
-            udp_socket.close_peer(&addr);
-            tcp_socket.close_peer(&addr);
-        }
     }
 }
 
@@ -1108,7 +1148,7 @@ mod wrong_owner_tests {
                 connection_id: crate::entity::ConnectionId::new(),
                 profile: crate::control::controller::ConnectionProfile::Native,
                 authorization_expiry: None,
-                rtc: str0m::Rtc::new(std::time::Instant::now()),
+                rtc: crate::control::application_only_test_connection(),
                 resources: crate::control::NegotiatedResources::empty_for_test(),
             };
             let materialize = |core: &mut ShardCore, address, config| {

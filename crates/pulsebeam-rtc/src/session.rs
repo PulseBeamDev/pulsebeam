@@ -152,6 +152,9 @@ pub struct InboundMediaInfo {
     /// Incoming RID identities in offered simulcast order, including paused alternatives.
     /// Without simulcast, uses send-direction RID declaration order; empty means no RID.
     pub rids: Arc<[Arc<str>]>,
+    /// Offered primary SSRCs, excluding FID repair members. These are signaling
+    /// facts, not authenticated encoding discovery or an SSRC-to-RID binding.
+    pub primary_ssrcs: Arc<[u32]>,
     pub codecs: Arc<[CodecInfo]>,
 }
 

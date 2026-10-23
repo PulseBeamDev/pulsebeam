@@ -19,10 +19,9 @@ use std::net::{Ipv6Addr, SocketAddr};
 )]
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::time::Instant;
 
 use crate::clock::WallAnchor;
-use str0m::Candidate;
+use pulsebeam_rtc::LocalCandidate;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tower_http::compression::CompressionLayer;
@@ -795,18 +794,7 @@ impl NodeBuilder {
             };
 
             for addr in tcp_candidate_addrs {
-                candidates.push(
-                    Candidate::builder()
-                        .tcp()
-                        .host(addr)
-                        .tcptype(str0m::net::TcpType::Passive)
-                        .build()
-                        .unwrap_or_else(|err| {
-                            pulsebeam_runtime::fatal!(
-                                "cannot advertise a TCP candidate for {addr}: {err}"
-                            )
-                        }),
-                );
+                candidates.push(LocalCandidate::TcpPassive(addr));
             }
         }
 
@@ -1057,7 +1045,7 @@ async fn bind_udp_sockets(
 fn sockets_to_candidates(
     sockets: &[net::BoundUdpSocket],
     advertised_addrs: &[SocketAddr],
-) -> Vec<Candidate> {
+) -> Vec<LocalCandidate> {
     let candidate_addrs = if advertised_addrs.is_empty() {
         let mut unique = Vec::with_capacity(sockets.len());
         let mut seen = HashSet::with_capacity(sockets.len());
@@ -1074,13 +1062,7 @@ fn sockets_to_candidates(
 
     let mut candidates = Vec::with_capacity(candidate_addrs.len());
     for addr in candidate_addrs {
-        let candidate = Candidate::builder()
-            .udp()
-            .host(addr)
-            .build()
-            .unwrap_or_else(|err| {
-                pulsebeam_runtime::fatal!("cannot advertise a UDP candidate for {addr}: {err}")
-            });
+        let candidate = LocalCandidate::Udp(addr);
         candidates.push(candidate);
     }
 

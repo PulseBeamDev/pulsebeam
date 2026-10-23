@@ -1,7 +1,7 @@
 use super::alloc_test_support::{state_of_mut, video_track_with_states};
 use super::*;
 use crate::entity::ParticipantId;
-use str0m::media::SimulcastLayer;
+use crate::media::SimulcastLayer;
 
 fn camera() -> (Track, LayerStates) {
     let (tx, built, mut states) = video_track_with_states(
@@ -60,6 +60,41 @@ fn forwarded_quality(decision: AllocationDecision<'_>) -> Option<LayerQuality> {
         }
         AllocationDecision::Pause(_, _) => None,
     }
+}
+
+#[test]
+fn positive_target_enforces_one_aggregate_minimum_but_zero_still_suspends() {
+    let (track, states) = camera();
+    let mut keys = SlotMap::<DownstreamSlotKey, ()>::with_key();
+    let first = keys.insert(());
+    let second = keys.insert(());
+    let views = [
+        SlotView {
+            forwarding: false,
+            ..view(&track, first, "a", 200)
+        },
+        SlotView {
+            forwarding: false,
+            ..view(&track, second, "b", 100)
+        },
+    ];
+    let engine = AllocationEngine::new(&views, &states);
+    let mut gates = views
+        .iter()
+        .map(|slot| (slot.key, ResumeGate { required: true }))
+        .collect();
+    let decisions = engine.run_compute_with_resume(Bitrate::from(1_000), &views, &mut gates);
+    assert_eq!(forwarded_quality(decisions[first]), Some(LayerQuality::Low));
+    assert_eq!(forwarded_quality(decisions[second]), None);
+    assert_eq!(
+        AllocationEngine::used_bitrate(&decisions),
+        Bitrate::from(150_000)
+    );
+
+    let suspended = engine.run_compute_with_resume(Bitrate::ZERO, &views, &mut gates);
+    assert_eq!(forwarded_quality(suspended[first]), None);
+    assert_eq!(forwarded_quality(suspended[second]), None);
+    assert_eq!(AllocationEngine::used_bitrate(&suspended), Bitrate::ZERO);
 }
 
 #[test]
@@ -310,7 +345,9 @@ fn spatial_decode_target_minimum_is_joint_with_the_temporal_minimum() {
     }];
     let engine = AllocationEngine::new(&views, &states);
     let choices = engine.choices(&views[0]);
-    let minimum = AllocationEngine::minimum_choice(&choices, &views[0], 300_000.0).unwrap();
+    let minimum =
+        AllocationEngine::minimum_choice(&choices, &views[0], 300_000.0, ResumeGate::default())
+            .unwrap();
     assert_eq!(minimum.target, DecodeTargetSelection::Target(1));
     assert_eq!(minimum.minimum_rank(&views[0]), (true, 360, 30));
     let decisions = engine.run_compute(Bitrate::from(200_000), &views);
@@ -341,7 +378,19 @@ fn protected_minimums_fit_for_every_feasible_budget_without_overspend() {
     let minimum_cost = 150_000 + 400_000 + 1_250_000 + 150_000 + 400_000;
     for budget in (100_000..8_000_000).step_by(50_000) {
         let decisions = engine.run_compute(Bitrate::from(budget), &views);
-        assert!(AllocationEngine::used_bitrate(&decisions) <= Bitrate::from(budget));
+        let used = AllocationEngine::used_bitrate(&decisions);
+        if budget < 150_000 {
+            assert_eq!(used, Bitrate::from(150_000));
+            assert_eq!(
+                decisions
+                    .values()
+                    .filter(|decision| forwarded_quality(**decision).is_some())
+                    .count(),
+                1,
+            );
+        } else {
+            assert!(used <= Bitrate::from(budget));
+        }
         if budget >= minimum_cost {
             for view in &views {
                 match decisions[view.key] {
@@ -400,8 +449,7 @@ fn equal_priority_congestion_serves_every_peer(min_height: u32) {
         let now = start + Duration::from_millis(tick * 100);
         fairness.order(&mut views, now);
         let engine = AllocationEngine::new(&views, &states);
-        let decisions =
-            engine.run_compute_with_resume(Bitrate::from(200_000), &views, now, &mut gates);
+        let decisions = engine.run_compute_with_resume(Bitrate::from(200_000), &views, &mut gates);
         fairness.observe(&views, &engine, &decisions, Bitrate::from(200_000), now);
         let outcomes: Vec<_> = decisions
             .iter()
@@ -415,13 +463,7 @@ fn equal_priority_congestion_serves_every_peer(min_height: u32) {
                 v.current_quality = quality;
                 gates.insert(v.key, ResumeGate::default());
             } else if v.forwarding {
-                gates.insert(
-                    v.key,
-                    ResumeGate {
-                        required: true,
-                        affordable: None,
-                    },
-                );
+                gates.insert(v.key, ResumeGate { required: true });
             }
             v.forwarding = quality.is_some();
         }
@@ -434,12 +476,12 @@ fn equal_priority_congestion_serves_every_peer(min_height: u32) {
 }
 
 #[test]
-fn equal_priority_protected_peers_survive_mid_order_and_resume_dwell() {
+fn equal_priority_protected_peers_survive_mid_order_and_resume_headroom() {
     equal_priority_congestion_serves_every_peer(180);
 }
 
 #[test]
-fn equal_priority_optional_peers_survive_mid_order_and_resume_dwell() {
+fn equal_priority_optional_peers_survive_mid_order_and_resume_headroom() {
     equal_priority_congestion_serves_every_peer(0);
 }
 
@@ -519,7 +561,6 @@ fn affordable_equal_priority_minimums_keep_a_stable_order() {
         let decisions = engine.run_compute_with_resume(
             Bitrate::from(500_000),
             &views,
-            now,
             &mut SecondaryMap::new(),
         );
         fairness.observe(&views, &engine, &decisions, Bitrate::from(500_000), now);

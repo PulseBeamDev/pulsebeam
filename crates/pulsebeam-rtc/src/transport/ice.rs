@@ -204,7 +204,7 @@ mod tests {
                 ufrag: "remote".into(),
                 pass: "remotepasswordlongenough22".into(),
             },
-            &[Candidate::host(remote, is::Protocol::Udp).expect("remote candidate")],
+            &[],
             false,
             128,
             1,

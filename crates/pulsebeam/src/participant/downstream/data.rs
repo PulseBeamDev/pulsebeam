@@ -1,6 +1,6 @@
+use crate::media::ChannelId;
 use slotmap::SecondaryMap;
 use std::collections::VecDeque;
-use str0m::channel::ChannelId;
 
 use crate::{
     keys::TrackHandle,
@@ -97,9 +97,8 @@ mod tests {
         let mut tracks = SlotMap::<TrackHandle, _>::with_key();
         let first_key = tracks.insert(first);
         let second_key = tracks.insert(second);
-        let mut rtc = str0m::Rtc::new(std::time::Instant::now());
-        let first_channel = rtc.direct_api().create_data_channel(Default::default());
-        let second_channel = rtc.direct_api().create_data_channel(Default::default());
+        let first_channel = ChannelId::from_value(0);
+        let second_channel = ChannelId::from_value(2);
         let mut data = DownstreamData::new();
         data.forwarding.insert(first_key, first_channel);
         data.forwarding.insert(second_key, second_channel);

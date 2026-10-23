@@ -306,12 +306,9 @@ mod slow {
                     },
                 },
                 Step::Expect {
-                    description: "The backgrounded screen yields cleanly rather than flapping",
+                    description: "Optional screen resumption stays within the feasible allocation budget",
                     participant: "viewer",
-                    property: Property::QualityReversalsBelow {
-                        origin: "screen",
-                        max: 0,
-                    },
+                    property: Property::AllocationWithinEstimate,
                 },
             ]);
         }

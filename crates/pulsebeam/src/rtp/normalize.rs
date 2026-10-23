@@ -9,12 +9,11 @@
 //! reads the result and never writes to it, so the two can run on different
 //! nodes without either duplicating the other's work.
 
-use str0m::media::{Mid, Rid};
-use str0m::rtp::vla::VideoLayersAllocation;
+use crate::media::{Mid, Rid};
 
 use pulsebeam_core::dd::{
-    DdReadError, DecodeTargetIndication, DependencyDescriptorReader, RawDependencyDescriptor,
-    TemplateDependencyStructure, read_mandatory,
+    DdReadError, DecodeTargetIndication, DependencyDescriptorReader, TemplateDependencyStructure,
+    read_mandatory,
 };
 
 use crate::rtp::monitor::MAX_LADDER_TARGETS;
@@ -121,11 +120,7 @@ impl StreamNormalizer {
 
     /// Bring `pkt` into the SFU's internal form and report what it declared.
     pub fn normalize(&mut self, mut pkt: RtpPacket) -> Normalization {
-        let carries_dd = pkt
-            .ext_vals
-            .user_values
-            .get::<RawDependencyDescriptor>()
-            .is_some();
+        let carries_dd = pkt.ext_vals.raw_dependency_descriptor().is_some();
         let cold = self.dd.structure().is_none();
         let mut parse_error = None;
         let Some(facts) = self.normalize_ready(&mut pkt, &mut parse_error) else {
@@ -192,7 +187,7 @@ impl StreamNormalizer {
     }
 
     fn learn_vla_index(&mut self, pkt: &RtpPacket) {
-        if let Some(vla) = pkt.ext_vals.user_values.get::<VideoLayersAllocation>() {
+        if let Some(vla) = pkt.ext_vals.video_layers_allocation() {
             self.vla_index = Some(vla.current_simulcast_stream_index);
         }
     }
@@ -207,7 +202,7 @@ impl StreamNormalizer {
         parse_error: &mut Option<DdReadError>,
     ) -> Option<StreamFacts> {
         self.learn_vla_index(pkt);
-        let Some(raw) = pkt.ext_vals.user_values.get::<RawDependencyDescriptor>() else {
+        let Some(raw) = pkt.ext_vals.raw_dependency_descriptor() else {
             return Some(StreamFacts::default());
         };
         match self.dd.read(&raw.0) {
@@ -216,7 +211,7 @@ impl StreamNormalizer {
                 // and structure refreshes on dependent frames.
                 pkt.is_keyframe = dd.frame_dependencies.frame_diffs.is_empty();
                 pkt.is_frame_start = dd.start_of_frame;
-                pkt.ext_vals.user_values.set_arc(std::sync::Arc::new(dd));
+                pkt.ext_vals.set_descriptor_arc(std::sync::Arc::new(dd));
                 Some(StreamFacts {
                     decode_targets: self.dd.structure().map(|s| s.decode_target_count),
                     decode_target_heights: self.dd.structure().map(decode_target_heights),
@@ -236,8 +231,7 @@ impl StreamNormalizer {
     fn release_cold_start(&mut self, packet: RtpPacket, facts: StreamFacts) -> Normalization {
         let frame_number = packet
             .ext_vals
-            .user_values
-            .get::<RawDependencyDescriptor>()
+            .raw_dependency_descriptor()
             .and_then(|raw| read_mandatory(&raw.0).ok())
             .map(|mandatory| mandatory.frame_number);
         let Some(frame_number) = frame_number else {
@@ -253,8 +247,7 @@ impl StreamNormalizer {
         for held in self.pending_dd.take_all_sorted() {
             let belongs_to_template = held
                 .ext_vals
-                .user_values
-                .get::<RawDependencyDescriptor>()
+                .raw_dependency_descriptor()
                 .and_then(|raw| read_mandatory(&raw.0).ok())
                 .is_some_and(|mandatory| mandatory.frame_number == frame_number);
             if !belongs_to_template {
@@ -304,6 +297,7 @@ impl StreamNormalizer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pulsebeam_core::dd::RawDependencyDescriptor;
     use pulsebeam_core::dd::temporal::TemporalDdSource;
 
     fn packet(seq: u64, raw: RawDependencyDescriptor) -> RtpPacket {
@@ -311,7 +305,7 @@ mod tests {
             seq_no: seq.into(),
             ..RtpPacket::default()
         };
-        packet.ext_vals.user_values.set(raw);
+        packet.ext_vals.set_raw_descriptor(raw);
         packet
     }
 

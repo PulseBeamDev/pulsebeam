@@ -65,6 +65,9 @@ pub(crate) struct PacketFeedback {
     pub(crate) received: bool,
     pub(crate) newly_acked: bool,
     pub(crate) lost: bool,
+    pub(crate) reported_lost_for_the_first_time: bool,
+    pub(crate) recovered: bool,
+    pub(crate) observed_at: Option<Instant>,
     pub(crate) loss_origin: Option<LossOrigin>,
     pub(crate) receiver_arrival: Option<ReceiverTime>,
     pub(crate) ecn: Option<EcnMark>,
@@ -136,6 +139,7 @@ struct SentEntry {
     twcc_sequence: Option<u64>,
     service: RtpService,
     acknowledgment: Acknowledgment,
+    controller_loss_reported: bool,
     missing_since: Option<Instant>,
     frozen_reorder_deadline: Option<Instant>,
     in_flight: bool,
@@ -268,6 +272,7 @@ impl SentHistory {
             twcc_sequence,
             service: rtp.service,
             acknowledgment: Acknowledgment::Pending,
+            controller_loss_reported: false,
             missing_since: None,
             frozen_reorder_deadline: None,
             in_flight: true,
@@ -354,7 +359,8 @@ impl SentHistory {
         self.twcc_feedback_count = None;
         self.highest_twcc_acked = None;
         self.oldest_twcc = None;
-        self.newest_twcc = None;
+        // Keep the connection-wide unwrap anchor across a route change, including
+        // a 16-bit rollover. The cleared path floor fences all earlier receipts.
         self.missing.clear();
         self.reordering_window = INITIAL_REORDERING_WINDOW;
         self.observed_reordering_window = INITIAL_REORDERING_WINDOW;
@@ -448,12 +454,15 @@ impl PacketFeedback {
     pub(crate) fn controller_sample(self, received_at: Instant, origin: Instant) -> FeedbackSample {
         FeedbackSample {
             sent_at: self.committed_at.saturating_duration_since(origin),
-            received_at: received_at.saturating_duration_since(origin),
+            received_at: self
+                .observed_at
+                .unwrap_or(received_at)
+                .saturating_duration_since(origin),
             transport_bytes: self.transport_bytes,
             received: self.received,
             newly_acked: self.newly_acked,
-            lost: self.lost,
-            loss_origin: self.loss_origin,
+            lost: self.reported_lost_for_the_first_time,
+            recovered: self.recovered,
             receiver_arrival_micros: match self.receiver_arrival {
                 Some(ReceiverTime::Micros(value)) => Some(value),
                 Some(ReceiverTime::OverRange | ReceiverTime::Unavailable) | None => None,

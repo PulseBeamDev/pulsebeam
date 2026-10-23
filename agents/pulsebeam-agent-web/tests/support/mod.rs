@@ -179,9 +179,20 @@ pub async fn evaluate_json<T: DeserializeOwned>(
         .script()
         .evaluate(context.clone(), expression.to_owned(), true)
         .await?;
-    let value = result
-        .ok_value()
-        .ok_or_else(|| format!("browser expression raised an exception: {result:?}"))?;
+    let Some(value) = result.ok_value() else {
+        let http = bidi
+            .script()
+            .evaluate(
+                context.clone(),
+                "JSON.stringify(globalThis.__pulsebeamHttpFailures ?? [])".to_owned(),
+                true,
+            )
+            .await?;
+        return Err(format!(
+            "browser expression raised an exception: {result:?}; HTTP failures: {http:?}"
+        )
+        .into());
+    };
     Ok(serde_json::from_value(remote_value(value))?)
 }
 

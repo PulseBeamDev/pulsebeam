@@ -8,11 +8,11 @@
 //! `checked_` to fall back, `wrapping_` where an era boundary makes wrapping
 //! the correct answer.
 
+use crate::media::SeqNo;
 use crate::rtp::RtpPacket;
 use crate::rtp::{Frequency, MediaTime};
 use pulsebeam_runtime::rand::RngCore;
 use std::time::Duration;
-use str0m::rtp::SeqNo;
 use tokio::time::Instant;
 
 // Timeline maps a succession of input streams onto one output stream that looks

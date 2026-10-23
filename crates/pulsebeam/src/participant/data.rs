@@ -1,5 +1,5 @@
+use crate::media::ChannelId;
 use ahash::{HashMap, HashMapExt};
-use str0m::channel::ChannelId;
 
 use crate::track::{DataTopicChannel, DataTrackDirection, TrackMeta, TrackSelector};
 
@@ -167,8 +167,7 @@ mod tests {
 
     #[test]
     fn data_publication_closes_with_its_original_connection_metadata() {
-        let mut rtc = str0m::Rtc::new(std::time::Instant::now());
-        let cid = rtc.direct_api().create_data_channel(Default::default());
+        let cid = crate::media::ChannelId::from_value(0);
         let connection_id = ConnectionId::new();
         let topic = Topic::for_test("chat");
         let lane = DataLane::Latest;
@@ -241,8 +240,7 @@ mod tests {
 
     #[test]
     fn subscription_channel_has_no_publication_metadata() {
-        let mut rtc = str0m::Rtc::new(std::time::Instant::now());
-        let cid = rtc.direct_api().create_data_channel(Default::default());
+        let cid = crate::media::ChannelId::from_value(0);
         let channel = DataTopicChannel {
             direction: DataTrackDirection::Subscribe,
             topic: Topic::for_test("chat"),

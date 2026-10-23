@@ -485,6 +485,12 @@ impl SimClientBuilder {
             let corrupt = self.corrupt_audio_payload;
             join_set.spawn(async move {
                 let mut decoders = HashMap::<String, OpusReceiver>::new();
+                // Stateful Opus decoding needs RTP order, not transport arrival order.
+                let mut jitter = pulsebeam_agent_native::JitterBuffer::new(
+                    pulsebeam_agent_native::pipeline::DEFAULT_INITIAL_COMMIT_WAIT,
+                );
+                // Assignment can change while a packet waits in the jitter buffer.
+                let mut publishers = HashMap::new();
                 while let Ok(mut packet) = remote.recv_packet().await {
                     let Some(track_id) = remote.publication_id() else {
                         continue;
@@ -507,10 +513,19 @@ impl SimClientBuilder {
                         packet.payload.len(),
                         Instant::now(),
                     );
-                    decoders
-                        .entry(publisher.clone())
-                        .or_insert_with(|| OpusReceiver::new(&publisher))
-                        .push(&packet, &log, &publisher);
+                    let sequence = *packet.seq;
+                    if jitter.push(packet) {
+                        publishers.insert(sequence, publisher);
+                    }
+                    while let Some(packet) = jitter.pop() {
+                        let publisher = publishers
+                            .remove(&*packet.seq)
+                            .expect("accepted audio packet retains publisher attribution");
+                        decoders
+                            .entry(publisher.clone())
+                            .or_insert_with(|| OpusReceiver::new(&publisher))
+                            .decode_packet(&packet, &log, &publisher);
+                    }
                 }
             });
         }
@@ -643,16 +658,6 @@ pub struct AudioStream {
     /// Audio is far less forgiving than video here. A picture that misses 200ms is a stutter
     /// nobody remarks on; a voice that drops 200ms loses a syllable.
     pub longest_gap: Duration,
-    /// The most recent rank the SFU gave this speaker, as signalled.
-    ///
-    /// Packets alone say a speaker got through; the rank says where the SFU placed them. A test
-    /// that the loudest voice wins needs both, because "heard" and "heard as the loudest" are
-    /// different claims and only the second is the selector's contract.
-    ///
-    /// The *latest* rank, not the best one ever held. A room does not form instantly, and while
-    /// only one person has connected they are trivially rank 0 - so a minimum over the whole run
-    /// reports the join order rather than the selector's judgement.
-    pub last_rank: Option<u32>,
     first_at: Option<Instant>,
     last_at: Option<Instant>,
     decoded_first_at: Option<Instant>,
@@ -737,6 +742,7 @@ impl AudioStream {
 #[derive(Default, Debug, Clone, PartialEq)]
 pub struct AudioReceiveLog {
     pub by_publisher: std::collections::BTreeMap<String, AudioStream>,
+    mapping: std::collections::BTreeMap<u32, String>,
     /// Every RTP stream this listener was sent, and whether each stayed whole.
     ///
     /// Keyed by SSRC rather than by speaker on purpose. Several speakers share a slot's stream
@@ -774,11 +780,6 @@ impl AudioReceiveLog {
         }
     }
 
-    fn record_rank(&mut self, publisher: &str, rank: u32) {
-        let entry = self.by_publisher.entry(publisher.to_owned()).or_default();
-        entry.last_rank = Some(rank);
-    }
-
     fn record_decoded(
         &mut self,
         publisher: &str,
@@ -805,12 +806,9 @@ impl AudioReceiveLog {
         self.by_publisher.get(publisher).copied()
     }
 
-    /// Speakers this listener was told about, whether or not media arrived.
-    pub fn ranked(&self) -> std::collections::BTreeMap<String, u32> {
-        self.by_publisher
-            .iter()
-            .filter_map(|(publisher, s)| s.last_rank.map(|rank| (publisher.clone(), rank)))
-            .collect()
+    /// Current negotiated receiver assignments, independently of received media.
+    pub fn mapped(&self) -> std::collections::BTreeMap<u32, String> {
+        self.mapping.clone()
     }
 
     /// Speakers this listener heard for a meaningful part of the call.
@@ -1347,7 +1345,7 @@ impl OpusReceiver {
         }
     }
 
-    fn push(
+    fn decode_packet(
         &mut self,
         packet: &pulsebeam_agent_native::RtpPacket,
         log: &Arc<Mutex<AudioReceiveLog>>,
@@ -1526,14 +1524,16 @@ impl ClientContext {
                     .map(|publication| (publication.participant_id.clone(), track_id.clone()))
             })
             .collect();
-        for (rank, track_id) in snapshot.audio_mapping.values().enumerate() {
-            if let Some(publication) = snapshot.publications.get(track_id) {
-                self.audio_rx.lock().unwrap().record_rank(
-                    &publication.participant_id,
-                    u32::try_from(rank).unwrap_or(u32::MAX),
-                );
-            }
-        }
+        self.audio_rx.lock().unwrap().mapping = snapshot
+            .audio_mapping
+            .iter()
+            .filter_map(|(receiver_index, track_id)| {
+                snapshot
+                    .publications
+                    .get(track_id)
+                    .map(|publication| (*receiver_index, publication.participant_id.clone()))
+            })
+            .collect();
         self.sync_video_desired(&snapshot).await.map(|_| ())
     }
 

@@ -24,8 +24,8 @@ use crate::{
 };
 use crate::{MediaDirection as Direction, MediaSectionKind as SectionKind, OfferedMediaSection};
 
-const MAX_SDP_BYTES: usize = 256 * 1024;
-const MAX_MEDIA_SECTIONS: usize = 128;
+const MAX_SDP_BYTES: usize = 1024 * 1024;
+const MAX_MEDIA_SECTIONS: usize = 256;
 const MAX_SECTION_ATTRIBUTES: usize = 1024;
 const MAX_PAYLOAD_TYPES: usize = 256;
 const MAX_EXTENSIONS: usize = 256;
@@ -423,23 +423,6 @@ fn negotiate_inner(
         return Err(NegotiationError::limit());
     }
     let parsed = Sdp::parse(offer.as_str()).map_err(|_| NegotiationError::invalid())?;
-    if parsed
-        .media_lines
-        .iter()
-        .any(|line| line.typ != MediaType::Application)
-        && !offer.as_str().lines().any(|line| {
-            line.trim_end_matches('\r')
-                .strip_prefix("a=rtcp-fb:")
-                .is_some_and(|value| {
-                    value
-                        .split_whitespace()
-                        .nth(1)
-                        .is_some_and(|feedback| feedback == "transport-cc" || feedback == "ccfb")
-                })
-        })
-    {
-        return Err(NegotiationError(AcceptError::MissingPacketFeedback));
-    }
     let raw = RawSdp::parse(offer.as_str())?;
     if raw.sections.is_empty() || raw.sections.len() != parsed.media_lines.len() {
         return Err(NegotiationError::invalid());
@@ -509,6 +492,13 @@ fn negotiate_inner(
                 && section.facts.direction != Direction::Inactive
         })
         .collect::<Vec<_>>();
+    if active.is_empty()
+        && builds
+            .iter()
+            .any(|section| section.facts.kind != SectionKind::Application)
+    {
+        return Err(NegotiationError(AcceptError::MissingPacketFeedback));
+    }
     let outbound = active
         .iter()
         .copied()
@@ -519,26 +509,17 @@ fn negotiate_inner(
             )
         })
         .collect::<Vec<_>>();
-    let checked = if outbound.is_empty() {
-        &active
-    } else {
-        &outbound
-    };
     let inbound = active
         .iter()
         .copied()
         .filter(|section| section.facts.direction.allows_receive())
         .collect::<Vec<_>>();
     let inbound_feedback = select_feedback(&inbound, false);
-    let feedback = if builds
-        .iter()
-        .all(|section| section.facts.kind == SectionKind::Application)
-        && builds.iter().any(|section| section.facts.sctp.is_some())
-    {
+    let feedback = if outbound.is_empty() {
         None
     } else {
         Some(
-            select_feedback(checked, !outbound.is_empty())
+            select_feedback(&outbound, true)
                 .ok_or(NegotiationError(AcceptError::MissingPacketFeedback))?,
         )
     };
@@ -598,6 +579,18 @@ fn negotiate_inner(
                 kind,
                 mid: Arc::from(section.facts.mid.as_str()),
                 codecs: Arc::from(section.facts.codecs.as_ref()),
+                primary_ssrcs: section
+                    .facts
+                    .ssrcs
+                    .iter()
+                    .copied()
+                    .filter(|ssrc| {
+                        !section.facts.ssrc_groups.iter().any(|group| {
+                            group.semantics.eq_ignore_ascii_case("FID")
+                                && group.members.get(1) == Some(ssrc)
+                        })
+                    })
+                    .collect(),
                 rids: section
                     .facts
                     .inbound_rids
@@ -670,12 +663,18 @@ fn negotiate_inner(
         inbound_media: Arc::from(inbound_media),
         senders: Arc::from(senders),
     };
+    let cname = token(
+        &Sha256::new()
+            .chain_update(b"pulsebeam rtc cname v1")
+            .chain_update(protocol_randomness)
+            .finalize(),
+    );
     let answer_sections = builds
         .iter()
         .zip(&raw.sections)
         .enumerate()
         .map(|(index, (section, raw))| {
-            format_answer_section(
+            let mut answer = format_answer_section(
                 raw,
                 section,
                 &local_ice,
@@ -684,7 +683,24 @@ fn negotiate_inner(
                 answer_setup,
                 index == 0,
                 [feedback, inbound_feedback],
-            )
+            );
+            if let Some(sender) = session
+                .senders
+                .iter()
+                .find(|sender| sender.receiver_index == section.facts.media_index)
+            {
+                let (ssrc, rtx_ssrc, _) =
+                    crate::egress::sender_rtp_identity(&protocol_randomness, sender.id);
+                // Declare the primary before any RTX-only probe: an RTX SSRC
+                // cannot identify its primary through MID and apt alone.
+                answer.push_str(&format!("a=ssrc:{ssrc} cname:{cname}\r\n"));
+                if sender.codec.retransmission_payload_type.is_some() {
+                    answer.push_str(&format!(
+                        "a=ssrc-group:FID {ssrc} {rtx_ssrc}\r\na=ssrc:{rtx_ssrc} cname:{cname}\r\n"
+                    ));
+                }
+            }
+            answer
         })
         .collect::<Vec<_>>();
     let answer_text = format_answer(&mids, &answer_sections, allow_mixed);
@@ -1867,6 +1883,28 @@ mod tests {
     }
 
     #[test]
+    fn ice_lite_accepts_candidate_free_offers() {
+        for name in ["chrome", "firefox"] {
+            let value = fixture(name)
+                .as_str()
+                .lines()
+                .filter(|line| !line.starts_with("a=candidate:"))
+                .collect::<Vec<_>>()
+                .join("\r\n");
+            assert!(!value.contains("a=candidate:"));
+            let result = Connection::accept(
+                config(),
+                SdpOffer::new(value),
+                at(),
+                std::time::UNIX_EPOCH,
+                ConnectionEntropy::new([8; 32]),
+            )
+            .expect("ICE-lite accepts candidate-free browser offers");
+            assert_eq!(result.session.offered_media.len(), 3);
+        }
+    }
+
+    #[test]
     fn offered_rtx_mapping_survives_primary_codec_normalization() {
         let offer = SdpOffer::new(
             fixture("chrome")
@@ -2014,7 +2052,10 @@ mod tests {
 
     #[test]
     fn representative_browser_offers_are_accepted() {
-        for name in ["chrome", "firefox"] {
+        for (name, expected_feedback) in [
+            ("chrome", None),
+            ("firefox", Some(PacketFeedbackKind::TransportWide)),
+        ] {
             let result = Connection::accept(
                 config(),
                 fixture(name),
@@ -2026,13 +2067,32 @@ mod tests {
                 Ok(accepted) => accepted,
                 Err(error) => panic!("representative offer failed: {error}"),
             };
-            assert_eq!(
-                accepted.session.feedback,
-                Some(PacketFeedbackKind::TransportWide)
-            );
+            assert_eq!(accepted.session.feedback, expected_feedback);
             assert!(accepted.answer.as_str().contains("a=ice-lite"));
             assert!(accepted.answer.as_str().contains("a=setup:passive"));
             assert!(accepted.answer.as_str().contains("a=end-of-candidates"));
+            for sender in accepted.connection.stats().senders {
+                assert!(
+                    accepted
+                        .answer
+                        .as_str()
+                        .contains(&format!("a=ssrc:{} cname:", sender.ssrc))
+                );
+                let negotiated = accepted
+                    .session
+                    .senders
+                    .iter()
+                    .find(|info| info.mid == sender.mid)
+                    .unwrap();
+                if negotiated.codec.retransmission_payload_type.is_some() {
+                    assert!(
+                        accepted
+                            .answer
+                            .as_str()
+                            .contains(&format!("a=ssrc-group:FID {} ", sender.ssrc))
+                    );
+                }
+            }
         }
     }
 
@@ -2537,6 +2597,7 @@ mod tests {
             video.rids.iter().map(AsRef::as_ref).collect::<Vec<&str>>(),
             ["q", "h", "f"]
         );
+        assert_eq!(video.primary_ssrcs.as_ref(), [11_111_111]);
 
         let firefox = fixture("firefox");
         let two_directions = SdpOffer::new(
@@ -2774,8 +2835,18 @@ mod tests {
         let no_feedback = SdpOffer::new(
             chrome
                 .as_str()
-                .replace("a=rtcp-fb:111 transport-cc", "")
-                .replace("a=rtcp-fb:102 transport-cc", ""),
+                .lines()
+                .filter(|line| !line.starts_with("a=rtcp-fb:"))
+                .map(|line| {
+                    if line == "a=sendonly" {
+                        "a=recvonly"
+                    } else {
+                        line
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\r\n")
+                + "\r\n",
         );
         assert_eq!(
             Connection::accept(

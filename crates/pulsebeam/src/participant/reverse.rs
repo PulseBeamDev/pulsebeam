@@ -1,6 +1,6 @@
+use crate::media::{KeyframeRequestKind, Rid};
 use sha3::{Digest, Sha3_256};
 use std::time::Duration;
-use str0m::media::{KeyframeRequestKind, Rid};
 
 const KEYFRAME: u8 = 1;
 const RELIABLE_CONTROL: u8 = 2;
@@ -116,7 +116,7 @@ impl ReversePacket {
                 {
                     return None;
                 }
-                Some(Rid::from(std::str::from_utf8(bytes).ok()?))
+                Some(Rid::new(std::str::from_utf8(bytes).ok()?).ok()?)
             }
             _ => return None,
         };

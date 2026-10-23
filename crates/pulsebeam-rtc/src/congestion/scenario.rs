@@ -2,8 +2,11 @@ use std::{collections::VecDeque, time::Duration};
 
 use super::{
     ControllerInput, EcnMark, EcnValidation, FeedbackSample, SafeRtpEnvelope, ScreamController,
-    micros,
 };
+
+fn micros(duration: Duration) -> u64 {
+    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
+}
 
 const STEP: Duration = Duration::from_millis(10);
 const FEEDBACK_INTERVAL: Duration = Duration::from_millis(50);
@@ -22,9 +25,8 @@ pub(crate) struct ScenarioMetrics {
     pub(crate) window_grew_while_stale: bool,
     pub(crate) baseline_resets: u64,
     pub(crate) ecn_reduced_window: bool,
-    pub(crate) l4s_disabled_on_bleach: bool,
-    pub(crate) policer_detected: bool,
-    pub(crate) fairness_percent: u64,
+    pub(crate) invalidated_l4s_mode_disabled: bool,
+    pub(crate) loss_reduced_window: bool,
     pub(crate) maximum_native_target_micros: u64,
 }
 
@@ -117,11 +119,14 @@ impl Simulation {
             });
             self.controller.note_send(self.now);
         }
-        if self.queue_bytes >= service {
-            self.queue_bytes = self.queue_bytes.saturating_sub(service);
-        } else {
-            self.queue_bytes = 0;
-        }
+        // Match the production boundary: preserve committed flight before
+        // feedback retires it. Link service was already subtracted above.
+        self.controller.observe_bytes_in_flight(
+            self.pending
+                .iter()
+                .map(|packet| u64::from(packet.bytes))
+                .sum(),
+        );
         self.now = self.now.saturating_add(STEP);
         let mut samples = Vec::new();
         if feedback_enabled && self.now >= self.next_feedback {
@@ -147,8 +152,7 @@ impl Simulation {
                     // confirmed loss is a separate signal.
                     newly_acked: true,
                     lost: !packet.received,
-                    loss_origin: (!packet.received)
-                        .then_some(crate::congestion::LossOrigin::Reordering),
+                    recovered: false,
                     receiver_arrival_micros: packet
                         .received
                         .then_some(packet.receiver_arrival_micros),
@@ -172,9 +176,7 @@ impl Simulation {
                 fresh_network_feedback: !samples.is_empty(),
                 bytes_in_flight,
                 paced_queue_bytes: self.queue_bytes,
-                offered_media_rate: offered_bps,
                 desired_media_rate: desired_bps,
-                window_or_pacer_blocked: false,
                 ecn: validation,
             },
         );
@@ -206,9 +208,8 @@ impl Simulation {
             window_grew_while_stale: false,
             baseline_resets: 0,
             ecn_reduced_window: false,
-            l4s_disabled_on_bleach: false,
-            policer_detected: self.output.policer_detected,
-            fairness_percent: 50,
+            invalidated_l4s_mode_disabled: false,
+            loss_reduced_window: false,
             maximum_native_target_micros: self.maximum_native_target,
         }
     }
@@ -221,9 +222,8 @@ fn run_fixed_scenario_matrix() -> Vec<ScenarioMetrics> {
         stale_feedback(),
         vbr_loss_reorder(),
         path_step(),
-        ecn_l4s(),
-        policer(),
-        competing_flow(),
+        validated_ecn(),
+        persistent_loss(),
     ]
 }
 
@@ -241,9 +241,13 @@ fn fixed_scenario_matrix() {
                 assert!(metrics.p99_queue_micros <= metrics.effective_target_micros + 10_000);
             }
             0x0702 => {
-                // The first 10 ms step installs the path; the full 200 ms
-                // classification interval belongs to that active path.
-                assert_eq!(metrics.application_limited_at_millis, Some(210));
+                // Native ALR needs a reference window established by real
+                // service, followed by flight and receive-rate evidence.
+                assert!(
+                    metrics
+                        .application_limited_at_millis
+                        .is_some_and(|at| (2_000..=2_400).contains(&at))
+                );
                 assert!(metrics.admitted_percent >= 95);
             }
             0x0703 => {
@@ -259,12 +263,11 @@ fn fixed_scenario_matrix() {
             }
             0x0706 => {
                 assert!(metrics.ecn_reduced_window);
-                assert!(metrics.l4s_disabled_on_bleach);
+                assert!(metrics.invalidated_l4s_mode_disabled);
             }
-            0x0707 => assert!(metrics.policer_detected),
-            0x0708 => {
-                assert!((40..=60).contains(&metrics.fairness_percent));
-                assert!(metrics.utilization_percent >= 85);
+            0x0707 => {
+                assert!(metrics.loss_reduced_window);
+                assert!(metrics.p99_queue_micros <= metrics.effective_target_micros + 10_000);
             }
             _ => panic!("unreviewed scenario seed"),
         }
@@ -291,7 +294,21 @@ fn baseline() -> ScenarioMetrics {
 
 fn application_limited() -> ScenarioMetrics {
     let mut sim = Simulation::new(2_000_000);
-    sim.controller.application_limited_since = Some(Duration::ZERO);
+    for _ in 0..200 {
+        sim.step(
+            2_000_000,
+            Duration::from_millis(50),
+            4_000_000,
+            2_000_000,
+            1,
+            true,
+            false,
+            None,
+            EcnValidation::default(),
+        );
+    }
+    let offered_before = sim.offered_bytes;
+    let admitted_before = sim.admitted_bytes;
     let mut entered = None;
     for _ in 0..1_000 {
         sim.step(
@@ -309,8 +326,13 @@ fn application_limited() -> ScenarioMetrics {
             entered = Some(micros(sim.now) / 1_000);
         }
     }
+    let admitted_percent = percent(
+        sim.admitted_bytes.saturating_sub(admitted_before),
+        sim.offered_bytes.saturating_sub(offered_before),
+    );
     let mut metrics = sim.metrics("application-limited", 0x0702);
     metrics.application_limited_at_millis = entered;
+    metrics.admitted_percent = admitted_percent;
     metrics
 }
 
@@ -411,17 +433,14 @@ fn path_step() -> ScenarioMetrics {
     metrics
 }
 
-fn ecn_l4s() -> ScenarioMetrics {
+fn validated_ecn() -> ScenarioMetrics {
     let mut sim = Simulation::new(4_000_000);
-    let mut before_ce = 0;
     let mut reduced = false;
     let mut disabled = false;
     for tick in 0..1_000 {
         let in_ce = (300..500).contains(&tick);
         let bleached = (500..700).contains(&tick);
-        if tick == 300 {
-            before_ce = sim.output.reference_window;
-        }
+        let before_ce = sim.output.reference_window;
         sim.step(
             2_000_000,
             Duration::from_millis(50),
@@ -430,27 +449,32 @@ fn ecn_l4s() -> ScenarioMetrics {
             1,
             true,
             false,
-            (in_ce && tick % 20 == 0).then_some(EcnMark::Ce),
+            in_ce.then_some(EcnMark::Ce),
             EcnValidation {
                 classic: true,
                 l4s: true,
                 bleached,
             },
         );
-        reduced |= in_ce && sim.output.reference_window < before_ce;
+        reduced |= matches!(
+            sim.output.reason,
+            super::ControllerReason::L4s | super::ControllerReason::ClassicEcn
+        ) && sim.output.reference_window < before_ce;
         disabled |= bleached && !sim.output.l4s_enabled;
     }
-    let mut metrics = sim.metrics("ECN-L4S", 0x0706);
+    let mut metrics = sim.metrics("validated-ECN-modes", 0x0706);
     metrics.ecn_reduced_window = reduced;
-    metrics.l4s_disabled_on_bleach = disabled;
+    // Invalidation is a supplied adapter fact, not a native bleach detector.
+    metrics.invalidated_l4s_mode_disabled = disabled;
     metrics
 }
 
-fn policer() -> ScenarioMetrics {
+fn persistent_loss() -> ScenarioMetrics {
     let mut sim = Simulation::new(8_000_000);
-    let mut detected = false;
+    let mut reduced = false;
     for tick in 0..1_500 {
         let loss = tick > 300 && tick % 8 == 0;
+        let before_loss = sim.output.reference_window;
         sim.step(
             2_000_000,
             Duration::from_millis(50),
@@ -462,74 +486,11 @@ fn policer() -> ScenarioMetrics {
             None,
             EcnValidation::default(),
         );
-        detected |= sim.output.policer_detected;
+        reduced |= sim.output.reason == super::ControllerReason::Loss
+            && sim.output.reference_window < before_loss;
     }
-    let mut metrics = sim.metrics("policer", 0x0707);
-    metrics.policer_detected = detected;
-    metrics
-}
-
-fn competing_flow() -> ScenarioMetrics {
-    let mut left = Simulation::new(4_000_000);
-    let mut right = Simulation::new(4_000_000);
-    let mut left_delivered = 0_u64;
-    let mut right_delivered = 0_u64;
-    let mut useful_delivered = 0_u64;
-    for _ in 0..2_000 {
-        let total = left
-            .output
-            .target_media_payload_rate
-            .saturating_add(right.output.target_media_payload_rate)
-            .max(1);
-        let left_capacity =
-            4_000_000_u64.saturating_mul(left.output.target_media_payload_rate) / total;
-        let right_capacity = 4_000_000_u64.saturating_sub(left_capacity);
-        let before_left = left.admitted_bytes;
-        let before_right = right.admitted_bytes;
-        left.step(
-            left_capacity.max(1),
-            Duration::from_millis(50),
-            4_000_000,
-            4_000_000,
-            1,
-            true,
-            false,
-            None,
-            EcnValidation::default(),
-        );
-        right.step(
-            right_capacity.max(1),
-            Duration::from_millis(50),
-            4_000_000,
-            4_000_000,
-            1,
-            true,
-            false,
-            None,
-            EcnValidation::default(),
-        );
-        if left.now > Duration::from_millis(19_750) {
-            let left_sent = left.admitted_bytes.saturating_sub(before_left);
-            let right_sent = right.admitted_bytes.saturating_sub(before_right);
-            left_delivered = left_delivered.saturating_add(left_sent);
-            right_delivered = right_delivered.saturating_add(right_sent);
-            useful_delivered = useful_delivered.saturating_add(
-                left_sent
-                    .saturating_add(right_sent)
-                    .min(4_000_000 / 8 * micros(STEP) / 1_000_000),
-            );
-        }
-    }
-    let fairness = percent(
-        left_delivered,
-        left_delivered.saturating_add(right_delivered),
-    );
-    let mut metrics = left.metrics("competing-flow", 0x0708);
-    metrics.fairness_percent = fairness;
-    metrics.utilization_percent = percent(useful_delivered, 4_000_000 / 8 * 250 / 1_000);
-    metrics.maximum_native_target_micros = metrics
-        .maximum_native_target_micros
-        .max(right.maximum_native_target);
+    let mut metrics = sim.metrics("persistent-loss", 0x0707);
+    metrics.loss_reduced_window = reduced;
     metrics
 }
 

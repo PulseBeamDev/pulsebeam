@@ -9,10 +9,10 @@
 //! the correct answer.
 
 use crate::clock::NtpTime;
+use crate::media::Ssrc;
 use crate::rtp::{Frequency, MediaTime, RtpPacket};
 use ahash::HashMap;
 use std::time::Duration;
-use str0m::rtp::Ssrc;
 use tokio::time::Instant;
 
 #[derive(Clone, Copy, Debug)]
@@ -348,6 +348,24 @@ impl TrackSynchronizer {
         }
     }
 
+    pub(crate) fn sender_report(&mut self, sr: SenderInfo, arrival: Instant) {
+        let clock_rate = self.clock_rate;
+        let sync = self
+            .streams
+            .entry(sr.ssrc)
+            .or_insert_with(|| Synchronizer::new(clock_rate));
+        if sync.base_rtp.is_none() {
+            sync.reset_baseline(sr.rtp_time, arrival);
+        }
+        sync.add_sender_report(sr, arrival);
+        if let Some(anchor) = sync.ntp_anchor() {
+            self.shared_anchor = Some(match self.shared_anchor {
+                Some(current) => current.lower_delay(anchor),
+                None => anchor,
+            });
+        }
+    }
+
     /// Stamp `packet.playout_time` on the track's shared clock, routing it to its
     /// encoding's synchronizer and reconciling the connection anchor.
     pub fn process(&mut self, packet: &mut RtpPacket, sr: Option<SenderInfo>) {
@@ -397,6 +415,31 @@ mod tests {
             rtp_time: rtp_ts,
             ntp_time: NtpTime::from_system_time(ntp_time),
         }
+    }
+
+    #[test]
+    fn standalone_reports_before_media_keep_their_actual_arrival() {
+        let arrival = Instant::now();
+        let ntp = NtpTime::from_system_time(std::time::UNIX_EPOCH);
+        let mut sync = TrackSynchronizer::new(Frequency::NINETY_KHZ);
+        for (millis, ticks) in [(0, 0), (500, 45_000)] {
+            sync.sender_report(
+                SenderInfo {
+                    ssrc: 1234.into(),
+                    rtp_time: MediaTime::from_90khz(ticks),
+                    ntp_time: ntp.saturating_add(Duration::from_millis(millis)),
+                },
+                arrival + Duration::from_millis(millis),
+            );
+        }
+        let mut packet = RtpPacket {
+            rtp_ts: MediaTime::from_90khz(90_000),
+            arrival_ts: arrival + Duration::from_secs(5),
+            ..Default::default()
+        };
+        sync.process(&mut packet, None);
+        assert!(sync.is_synchronized());
+        assert_eq!(packet.playout_time, arrival + Duration::from_secs(1));
     }
 
     #[test]

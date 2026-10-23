@@ -431,6 +431,7 @@ impl Association {
                     .filter(|message| message.stream == channel.stream)
                     .map(|message| message.bytes)
                     .fold(0_usize, usize::saturating_add),
+                queued_payload_bytes: self.socket.buffered_amount(channel.stream),
                 sent_messages: channel.sent_messages,
                 received_messages: channel.received_messages,
             })
@@ -1184,6 +1185,44 @@ mod tests {
             "bounded continuation makes progress"
         );
         assert!(left.stats().buffered_payload_bytes < before);
+    }
+
+    #[test]
+    fn channel_queue_observation_distinguishes_unsent_from_in_flight() {
+        let (mut left, mut right, mut now, start) =
+            connected_pair(ConnectionLimits::default(), ConnectionLimits::default());
+        left.open(
+            at(now, start),
+            config(DataReliability::MaxRetransmits(0), false),
+        )
+        .expect("open");
+        let mut events = Vec::new();
+        drive(
+            &mut left,
+            &mut right,
+            &mut now,
+            start,
+            &mut events,
+            &mut Vec::new(),
+        );
+        let channel = opened_channel(&events).expect("opened");
+        left.send(
+            at(now, start),
+            channel,
+            DataMessage::Binary(Bytes::from_static(&[1; 48])),
+        )
+        .expect("fits the native send window");
+        assert_eq!(left.channel_stats()[0].queued_payload_bytes, 0);
+        assert_eq!(left.channel_stats()[0].buffered_amount, 48);
+        left.send(
+            at(now, start),
+            channel,
+            DataMessage::Binary(Bytes::from(vec![2; 65_536])),
+        )
+        .expect("bounded fragmented message");
+        let queued = left.channel_stats()[0].queued_payload_bytes;
+        assert!(queued > 0 && queued <= 65_536);
+        assert_eq!(left.channel_stats()[0].buffered_amount, 65_584);
     }
 
     #[test]

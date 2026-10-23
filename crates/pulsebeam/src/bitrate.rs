@@ -1,4 +1,39 @@
-use str0m::bwe::Bitrate;
+#[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
+pub struct Bitrate(u64);
+
+impl Bitrate {
+    pub const ZERO: Self = Self(0);
+    pub const fn kbps(value: u64) -> Self {
+        Self(value.saturating_mul(1_000))
+    }
+    pub const fn mbps(value: u64) -> Self {
+        Self(value.saturating_mul(1_000_000))
+    }
+    pub fn as_f64(self) -> f64 {
+        self.0 as f64
+    }
+    pub const fn as_bps(self) -> u64 {
+        self.0
+    }
+}
+
+impl From<u64> for Bitrate {
+    fn from(value: u64) -> Self {
+        Self(value)
+    }
+}
+
+impl From<f64> for Bitrate {
+    fn from(value: f64) -> Self {
+        Self(saturating_bps(value))
+    }
+}
+
+impl std::fmt::Display for Bitrate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} bps", self.0)
+    }
+}
 
 /// Convert a computed bitrate to an integer without letting a NaN or a negative
 /// silently become a plausible rate — `as u64` yields 0 for both, which the

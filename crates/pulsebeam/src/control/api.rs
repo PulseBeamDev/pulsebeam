@@ -85,6 +85,13 @@ impl IntoResponse for ApiError {
             | Self::JoinError(controller::ControllerError::AuthorizationExpired) => {
                 (StatusCode::UNAUTHORIZED, "Unauthorized")
             }
+            Self::JoinError(controller::ControllerError::OfferRejected(
+                crate::control::negotiator::NegotiatorError::Initialization(_),
+            ))
+            | Self::JoinError(controller::ControllerError::Unknown(_))
+            | Self::JoinError(controller::ControllerError::IOError(_))
+            | Self::BadUrl
+            | Self::Unknown(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error"),
             Self::IdValidation(_)
             | Self::JoinError(controller::ControllerError::OfferRejected(_))
             | Self::BadRequest(_) => (StatusCode::BAD_REQUEST, "Bad Request"),
@@ -96,10 +103,6 @@ impl IntoResponse for ApiError {
             Self::RateLimited => (StatusCode::TOO_MANY_REQUESTS, "Too Many Requests"),
             Self::JoinError(controller::ControllerError::ServiceUnavailable)
             | Self::ServiceUnavailable => (StatusCode::SERVICE_UNAVAILABLE, "Service Unavailable"),
-            Self::JoinError(controller::ControllerError::Unknown(_))
-            | Self::JoinError(controller::ControllerError::IOError(_))
-            | Self::BadUrl
-            | Self::Unknown(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error"),
         };
         let challenge = (status == StatusCode::UNAUTHORIZED).then(|| {
             if matches!(self, Self::AuthorizationRequired) {
@@ -1041,10 +1044,12 @@ mod tests {
                 panic!("expected create command")
             };
             assert_eq!(message.offer, offer);
-            let mut negotiator = crate::control::negotiator::Negotiator::new(Vec::new());
+            let mut negotiator = crate::control::negotiator::Negotiator::new(vec![
+                pulsebeam_rtc::LocalCandidate::Udp("127.0.0.1:6000".parse().unwrap()),
+            ]);
             let result = negotiator.create_answer(
                 message.offer,
-                str0m::IceCreds::new(),
+                crate::control::ufrag::test_credentials(),
                 pulsebeam_runtime::net::ReceiveTime::now(),
             );
             let Err(error @ crate::control::negotiator::NegotiatorError::InvalidOffer(_)) = result
@@ -1275,6 +1280,27 @@ mod tests {
         assert!(
             serde_json::from_str::<NativeRequest>(r#"{"offer":"v=0","room":"other"}"#).is_err()
         );
+    }
+
+    #[test]
+    fn internal_rtc_initialization_is_not_an_offer_rejection() {
+        for error in [
+            pulsebeam_rtc::AcceptError::InvalidConfiguration,
+            pulsebeam_rtc::AcceptError::CryptographicFailure,
+        ] {
+            let response = ApiError::JoinError(controller::ControllerError::OfferRejected(
+                crate::control::negotiator::NegotiatorError::Initialization(error),
+            ))
+            .into_response();
+            assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        }
+        let response = ApiError::JoinError(controller::ControllerError::OfferRejected(
+            crate::control::negotiator::NegotiatorError::Rtc(
+                pulsebeam_rtc::AcceptError::MissingPacketFeedback,
+            ),
+        ))
+        .into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[test]

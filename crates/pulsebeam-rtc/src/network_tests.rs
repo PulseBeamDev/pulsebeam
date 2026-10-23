@@ -9,7 +9,7 @@
 
 use std::time::Duration;
 
-use crate::test_support::{NetworkPolicy, PeerFixture, assert_probe_windows, sample};
+use crate::test_support::{NetworkPolicy, PeerFixture, assert_native_rtp_pacing, sample};
 use crate::{MediaPayloadBitrate, WriteError};
 
 const PAYLOAD_BYTES: usize = 1_000;
@@ -23,6 +23,7 @@ fn production_connection_bottleneck_emits_measured_transport_bytes() {
     const PACKETS: u64 = 4_000;
     let origin = std::time::Instant::now();
     let mut fixture = PeerFixture::connected_at(origin).without_egress_observation();
+    fixture.observe_pacing_profile(crate::Connection::test_pacing_profile);
     fixture.configure_network(
         SEED,
         NetworkPolicy {
@@ -72,11 +73,11 @@ fn production_connection_bottleneck_emits_measured_transport_bytes() {
             let total = emitted.saturating_add(probes);
             max_probe_percent =
                 max_probe_percent.max(probes.saturating_mul(100).checked_div(total).unwrap_or(0));
-            assert!(probes <= emitted / 19 + 48 * 1024);
+            assert_eq!(probes, 0, "a sender without RTX cannot generate padding");
         }
     }
     fixture.drive_for(Duration::from_secs(2));
-    assert_probe_windows(fixture.emitted_rtp());
+    assert_native_rtp_pacing(fixture.emitted_rtp(), fixture.pacing_trace());
     let (sojourn, delivered) = fixture.bottleneck_samples();
     let mut ordered = sojourn.to_vec();
     ordered.sort_unstable();
@@ -101,13 +102,14 @@ fn production_connection_bottleneck_emits_measured_transport_bytes() {
         "non-outage bottleneck utilization must be at least 85%; delivered={delivered} service={service_bytes} elapsed_us={elapsed_micros}"
     );
     assert!(stats.connection.transmitted_rtp_bytes > 0);
-    assert!(stats.connection.transmitted_padding_bytes <= stats.connection.transmitted_rtp_bytes);
+    assert_eq!(stats.connection.transmitted_padding_bytes, 0);
     assert!(measured_windows >= 1_000);
 }
 
 #[test]
 fn production_capacity_steps_recover_stable_transport_service() {
     let mut fixture = PeerFixture::connected_with_senders(2).without_egress_observation();
+    fixture.observe_pacing_profile(crate::Connection::test_pacing_profile);
     fixture.configure_network(
         0x6601,
         NetworkPolicy {
@@ -163,6 +165,7 @@ fn production_capacity_steps_recover_stable_transport_service() {
         budgets[2] > budgets[1],
         "native budget recovers without caller target changes: {budgets:?}"
     );
+    assert_native_rtp_pacing(fixture.emitted_rtp(), fixture.pacing_trace());
     for (from, to, rate) in [
         (2, 12, 2_000_000_u64),
         (14, 24, 1_000_000),
@@ -200,6 +203,7 @@ fn production_homogeneous_shared_bottleneck_competition() {
         PeerFixture::connected().without_egress_observation(),
     ];
     for (index, flow) in flows.iter_mut().enumerate() {
+        flow.observe_pacing_profile(crate::Connection::test_pacing_profile);
         flow.configure_network(
             0x3301 + index as u64,
             NetworkPolicy {
@@ -239,7 +243,7 @@ fn production_homogeneous_shared_bottleneck_competition() {
         flow.drive_for(Duration::from_secs(2));
     }
     let emitted: [u64; 2] = std::array::from_fn(|index| {
-        assert_probe_windows(flows[index].emitted_rtp());
+        assert_native_rtp_pacing(flows[index].emitted_rtp(), flows[index].pacing_trace());
         flows[index]
             .emitted_rtp()
             .iter()

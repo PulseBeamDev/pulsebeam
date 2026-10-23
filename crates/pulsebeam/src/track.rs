@@ -12,6 +12,7 @@ use std::time::Duration;
 use crate::entity::TrackId;
 use crate::entity::{ParticipantId, TrackKind};
 use crate::id::ShardId;
+use crate::media::{Mid, Pt, Rid, SimulcastLayer, Ssrc};
 use crate::rtp::normalize::{Normalization, StreamFacts, StreamNormalizer};
 use crate::rtp::sync::SenderInfo;
 use crate::rtp::{
@@ -21,8 +22,6 @@ use crate::rtp::{
 };
 pub use data_track::*;
 pub use pulsebeam_core::simulcast::LayerQuality;
-use str0m::media::{Mid, Pt, Rid, SimulcastLayer};
-use str0m::rtp::Ssrc;
 use tokio::time::Instant;
 
 pub type StreamId = (TrackId, Option<Rid>);
@@ -38,8 +37,8 @@ pub struct ProcessedRtp {
 pub const KEYFRAME_DEBOUNCE: Duration = Duration::from_millis(500);
 pub const MAX_SIMULCAST_LAYERS: usize = 3;
 
-/// Deferred outbound RTP write.  Applying it to `Rtc` is deliberately the
-/// participant core's responsibility so it can drain str0m between writes.
+/// Deferred outbound RTP write, applied by the participant core so it can
+/// service RTC output between writes.
 pub enum StreamWrite {
     Video {
         pkt: RtpPacket,
@@ -57,6 +56,8 @@ pub enum StreamWrite {
         pt: Pt,
     },
 }
+
+const MAX_PENDING_STREAM_WRITES: usize = 256;
 
 /// Reusable packet queue shared by all downstream allocators for one
 /// participant. It never touches `Rtc`; callers only enqueue writes.
@@ -86,7 +87,7 @@ impl StreamWriter {
         ssrc: Ssrc,
         pt: Pt,
     ) {
-        self.pending.push_back(StreamWrite::Video {
+        self.push(StreamWrite::Video {
             pkt,
             track_id,
             mid,
@@ -104,7 +105,7 @@ impl StreamWriter {
         ssrc: Ssrc,
         pt: Pt,
     ) {
-        self.pending.push_back(StreamWrite::Audio {
+        self.push(StreamWrite::Audio {
             pkt,
             track_id,
             mid,
@@ -113,8 +114,59 @@ impl StreamWriter {
         });
     }
 
+    fn push(&mut self, write: StreamWrite) {
+        if self.pending.len() >= MAX_PENDING_STREAM_WRITES {
+            metrics::counter!("participant_stream_write_shed").increment(1);
+            return;
+        }
+        self.pending.push_back(write);
+    }
+
     pub fn pop(&mut self) -> Option<StreamWrite> {
         self.pending.pop_front()
+    }
+
+    pub fn discard(&mut self) {
+        self.pending.clear();
+    }
+}
+
+#[cfg(test)]
+mod stream_writer_tests {
+    use super::*;
+
+    #[test]
+    fn pending_fanout_is_bounded_and_preserves_accepted_order() {
+        let connection = crate::entity::ConnectionId::new();
+        let audio = connection.derive_track_id(TrackKind::Audio, "a");
+        let video = connection.derive_track_id(TrackKind::Video, "v");
+        let mut writer = StreamWriter::new();
+        for index in 0..MAX_PENDING_STREAM_WRITES.saturating_mul(2) {
+            let packet = RtpPacket {
+                seq_no: u64::try_from(index).unwrap().into(),
+                ..Default::default()
+            };
+            if index.is_multiple_of(2) {
+                writer.write_video_owned(packet, video, Mid::from("v"), None, 1.into(), 96.into());
+            } else {
+                writer.write_audio_owned(packet, audio, Mid::from("a"), 2.into(), 111.into());
+            }
+        }
+        for index in 0..MAX_PENDING_STREAM_WRITES {
+            let (StreamWrite::Video { pkt, .. } | StreamWrite::Audio { pkt, .. }) =
+                writer.pop().unwrap();
+            assert_eq!(*pkt.seq_no, u64::try_from(index).unwrap());
+        }
+        assert!(writer.pop().is_none());
+        writer.write_audio_owned(
+            RtpPacket::default(),
+            audio,
+            Mid::from("a"),
+            2.into(),
+            111.into(),
+        );
+        writer.discard();
+        assert!(writer.pop().is_none());
     }
 }
 
@@ -256,12 +308,12 @@ impl UpstreamTrackLayer {
     /// Apply a (track-wide) Video Layers Allocation to this layer using its
     /// learned stream index: the sender's declared target bitrate, resolution,
     /// and active/inactive state.
-    fn apply_vla(&mut self, vla: &str0m::rtp::vla::VideoLayersAllocation) {
+    fn apply_vla(&mut self, vla: &pulsebeam_core::vla::VideoLayersAllocation) {
         let Some(idx) = self.normalizer.vla_index().map(usize::from) else {
             return;
         };
         let target_bps = vla_stream_target_bps(vla, idx).unwrap_or(0);
-        let height = vla_stream_height_px(vla, idx).map(u32::from);
+        let height = vla_stream_height_px(vla, idx);
         let first_declaration = self.monitor.apply_vla(target_bps, height);
 
         // Record the per-decode-target cost ladder and frame rate so the allocator
@@ -287,7 +339,7 @@ impl UpstreamTrackLayer {
 /// Allocation: the highest cumulative temporal bitrate across its spatial
 /// layers. `None` when the stream is absent or declared inactive.
 pub(crate) fn vla_stream_target_bps(
-    vla: &str0m::rtp::vla::VideoLayersAllocation,
+    vla: &pulsebeam_core::vla::VideoLayersAllocation,
     idx: usize,
 ) -> Option<u64> {
     let stream = vla.simulcast_streams.get(idx)?;
@@ -302,9 +354,9 @@ pub(crate) fn vla_stream_target_bps(
 /// Declared frame height (px) for simulcast stream `idx`: the tallest spatial
 /// layer that carries a resolution. `None` when absent (VLA omits resolution).
 pub(crate) fn vla_stream_height_px(
-    vla: &str0m::rtp::vla::VideoLayersAllocation,
+    vla: &pulsebeam_core::vla::VideoLayersAllocation,
     idx: usize,
-) -> Option<u16> {
+) -> Option<u32> {
     let stream = vla.simulcast_streams.get(idx)?;
     stream
         .spatial_layers
@@ -317,7 +369,7 @@ pub(crate) fn vla_stream_height_px(
 /// its first spatial layer's temporal ladder — the per-temporal costs the SFU
 /// allocates each decode target against. Empty when the sender declared none.
 pub(crate) fn vla_stream_temporal_cumulative_kbps(
-    vla: &str0m::rtp::vla::VideoLayersAllocation,
+    vla: &pulsebeam_core::vla::VideoLayersAllocation,
     idx: usize,
 ) -> Vec<u64> {
     vla.simulcast_streams
@@ -335,7 +387,7 @@ pub(crate) fn vla_stream_temporal_cumulative_kbps(
 /// Declared full frame rate for simulcast stream `idx`: the highest framerate any
 /// of its spatial layers reports. `None` when the VLA omits resolution/framerate.
 pub(crate) fn vla_stream_framerate(
-    vla: &str0m::rtp::vla::VideoLayersAllocation,
+    vla: &pulsebeam_core::vla::VideoLayersAllocation,
     idx: usize,
 ) -> Option<u32> {
     let stream = vla.simulcast_streams.get(idx)?;
@@ -388,6 +440,10 @@ impl PartialEq for UpstreamTrack {
 impl Eq for UpstreamTrack {}
 
 impl UpstreamTrack {
+    pub(crate) fn sender_report(&mut self, report: SenderInfo, arrival: Instant) {
+        self.synchronizer.sender_report(report, arrival);
+    }
+
     pub fn process(
         &mut self,
         rid: Option<&Rid>,
@@ -488,12 +544,7 @@ impl TrackMonitor {
         };
         encoding.process_normalized(&packet, facts);
 
-        if let Some(vla) = packet
-            .ext_vals
-            .user_values
-            .get::<str0m::rtp::vla::VideoLayersAllocation>()
-            .cloned()
-        {
+        if let Some(vla) = packet.ext_vals.video_layers_allocation().cloned() {
             for encoding in &mut self.encodings {
                 encoding.apply_vla(&vla);
             }
@@ -986,7 +1037,7 @@ pub mod test_utils {
 mod data_track {
     use std::fmt::Display;
 
-    use str0m::channel::{ChannelConfig, Reliability};
+    use crate::media::{ChannelConfig, Reliability};
 
     const MAX_DATA_TRACK_NAMESPACE_LEN: usize = 104;
 
@@ -1177,13 +1228,11 @@ mod data_track {
                         _ => DataLane::Latest,
                     };
 
-                    let supported_delivery_guarantee = matches!(
-                        cfg.reliability,
-                        Reliability::MaxRetransmits { retransmits: 0 }
-                    ) && !cfg.ordered;
+                    let supported_delivery_guarantee =
+                        matches!(cfg.reliability, Reliability::MaxRetransmits(0)) && !cfg.ordered;
                     if !supported_delivery_guarantee {
                         return Err(DataTrackIntentError::UnsupportedDataChannelConfig {
-                            label: s.clone(),
+                            label: s.to_string(),
                             ordered: cfg.ordered,
                             reliability: cfg.reliability,
                         });
@@ -1239,21 +1288,25 @@ mod data_track {
 
         fn cfg(label: &str) -> ChannelConfig {
             ChannelConfig {
-                label: label.to_string(),
+                label: label.into(),
                 ordered: false,
-                reliability: Reliability::MaxRetransmits { retransmits: 0 },
-                negotiated: None,
-                protocol: "".to_string(),
+                reliability: Reliability::MaxRetransmits(0),
+                negotiated: false,
+                id: None,
+                priority: pulsebeam_rtc::DataChannelPriority::MEDIUM,
+                protocol: "".into(),
             }
         }
 
         fn reliable_cfg(label: &str) -> ChannelConfig {
             ChannelConfig {
-                label: label.to_string(),
+                label: label.into(),
                 ordered: true,
                 reliability: Reliability::Reliable,
-                negotiated: None,
-                protocol: "".to_string(),
+                negotiated: false,
+                id: None,
+                priority: pulsebeam_rtc::DataChannelPriority::MEDIUM,
+                protocol: "".into(),
             }
         }
 
@@ -1326,7 +1379,7 @@ mod data_track {
                     let mut ordered = cfg(&label);
                     ordered.ordered = true;
                     let mut retransmitting = cfg(&label);
-                    retransmitting.reliability = Reliability::MaxRetransmits { retransmits: 1 };
+                    retransmitting.reliability = Reliability::MaxRetransmits(1);
                     for config in [reliable_cfg(&label), ordered, retransmitting] {
                         assert!(matches!(
                             DataTrackIntent::try_from(&config),
@@ -1427,9 +1480,7 @@ mod dd_tests {
     // Convenience only: a test is not a shard, so nothing here is
     // cross-core. See crates/pulsebeam/docs/thread-per-core.md.
     use super::*;
-    use pulsebeam_core::dd::{
-        DependencyDescriptor, DependencyDescriptorWriter, MAX_DD_LEN, test_utils,
-    };
+    use pulsebeam_core::dd::{DependencyDescriptorWriter, MAX_DD_LEN, test_utils};
 
     fn layer() -> UpstreamTrackLayer {
         let state = StreamStats::new(true, 500_000, 360);
@@ -1445,8 +1496,7 @@ mod dd_tests {
     fn packet_carrying(bytes: &[u8]) -> RtpPacket {
         let mut pkt = RtpPacket::default();
         pkt.ext_vals
-            .user_values
-            .set(pulsebeam_core::dd::RawDependencyDescriptor(
+            .set_raw_descriptor(pulsebeam_core::dd::RawDependencyDescriptor(
                 bytes.iter().copied().collect(),
             ));
         pkt
@@ -1464,12 +1514,7 @@ mod dd_tests {
             .unwrap();
         let mut pkt = packet_carrying(&buf[..len]);
         assert!(layer.process(&mut pkt));
-        assert!(
-            pkt.ext_vals
-                .user_values
-                .get::<DependencyDescriptor>()
-                .is_some()
-        );
+        assert!(pkt.ext_vals.dependency_descriptor().is_some());
 
         // A later delta frame carries only a template id, so it is decodable
         // only because the layer retained the structure.
@@ -1478,7 +1523,7 @@ mod dd_tests {
         let mut pkt = packet_carrying(&buf[..len]);
         assert!(layer.process(&mut pkt));
 
-        let got = pkt.ext_vals.user_values.get::<DependencyDescriptor>();
+        let got = pkt.ext_vals.dependency_descriptor();
         assert_eq!(got, Some(&sent));
         assert_eq!(layer.normalizer.dd_errors(), 0);
     }
@@ -1547,12 +1592,7 @@ mod dd_tests {
         let mut pkt = packet_carrying(&[0xff; 12]);
 
         assert!(!layer.process(&mut pkt));
-        assert!(
-            pkt.ext_vals
-                .user_values
-                .get::<DependencyDescriptor>()
-                .is_none()
-        );
+        assert!(pkt.ext_vals.dependency_descriptor().is_none());
         assert_eq!(layer.normalizer.dd_errors(), 1);
     }
 
@@ -1571,7 +1611,7 @@ mod vla_tests {
     // Convenience only: a test is not a shard, so nothing here is
     // cross-core. See crates/pulsebeam/docs/thread-per-core.md.
     use super::vla_stream_target_bps;
-    use str0m::rtp::vla::{
+    use pulsebeam_core::vla::{
         SimulcastStreamAllocation, SpatialLayerAllocation, TemporalLayerAllocation,
         VideoLayersAllocation,
     };
@@ -1602,7 +1642,7 @@ mod vla_tests {
     fn temporal_ladder_and_framerate_flow_into_stream_state() {
         use super::{vla_stream_framerate, vla_stream_temporal_cumulative_kbps};
         use crate::rtp::monitor::StreamStats;
-        use str0m::rtp::vla::ResolutionAndFramerate;
+        use pulsebeam_core::vla::ResolutionAndFramerate;
 
         let mut s = stream(&[300, 450, 600]);
         s.spatial_layers
@@ -1646,7 +1686,7 @@ mod vla_tests {
 
     #[test]
     fn height_is_tallest_declared_spatial_layer_or_none() {
-        use str0m::rtp::vla::ResolutionAndFramerate;
+        use pulsebeam_core::vla::ResolutionAndFramerate;
         let with_height = |h: u16| SimulcastStreamAllocation {
             spatial_layers: vec![SpatialLayerAllocation {
                 temporal_layers: vec![TemporalLayerAllocation {
@@ -1654,7 +1694,7 @@ mod vla_tests {
                 }],
                 resolution_and_framerate: Some(ResolutionAndFramerate {
                     width: 640,
-                    height: h,
+                    height: u32::from(h),
                     framerate: 30,
                 }),
             }],
@@ -1675,9 +1715,9 @@ mod simulcast_pause_tests {
     // cross-core. See crates/pulsebeam/docs/thread-per-core.md.
     use super::*;
     use crate::entity::ParticipantId;
+    use crate::media::SimulcastLayer;
     use crate::rtp::RtpPacket;
     use std::time::Duration;
-    use str0m::media::SimulcastLayer;
 
     /// A three-encoding video track and a starting instant.
     fn track() -> (UpstreamTrack, Instant) {

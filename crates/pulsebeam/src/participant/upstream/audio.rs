@@ -1,7 +1,7 @@
 use super::UpstreamMedia;
+use crate::media::Mid;
 use crate::rtp::sync::SenderInfo;
 use crate::{entity::TrackId, log::LogCtx, rtp::RtpPacket, track::UpstreamTrack};
-use str0m::media::Mid;
 use tokio::time::Instant;
 
 pub(crate) struct UpstreamAudio {
@@ -48,11 +48,15 @@ impl UpstreamAudio {
     pub(super) fn slot_for_mid(&self, mid: Mid) -> Option<(usize, TrackId)> {
         self.media.slot_for_mid(mid)
     }
+    pub(super) fn sender_report(&mut self, mid: Mid, report: SenderInfo, arrival: Instant) {
+        self.media.sender_report(mid, report, arrival);
+    }
+
     pub(super) fn handle_incoming_rtp(
         &mut self,
         index: usize,
         mid: Mid,
-        rid: Option<&str0m::media::Rid>,
+        rid: Option<&crate::media::Rid>,
         rtp: RtpPacket,
         sr: Option<SenderInfo>,
     ) -> crate::track::ProcessedRtp {

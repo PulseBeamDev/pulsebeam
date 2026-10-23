@@ -403,12 +403,21 @@ impl IngressOwner {
     }
 
     pub(crate) fn keyframe_request(&self, ssrc: u32) -> Result<[u8; 12], crate::WriteError> {
-        let ssrc = self
+        let permitted = match self
             .encodings
             .iter()
-            .find(|encoding| encoding.ssrc == Some(ssrc) && !encoding.retired)
-            .and_then(|encoding| encoding.ssrc)
-            .ok_or(crate::WriteError::UnknownEncoding)?;
+            .find(|encoding| encoding.ssrc == Some(ssrc))
+        {
+            Some(encoding) => !encoding.retired,
+            None => self.media.iter().any(|media| {
+                media.kind == crate::MediaKind::Video
+                    && media.ssrcs.contains(&ssrc)
+                    && !media.ssrc_repairs.iter().any(|(repair, _)| *repair == ssrc)
+            }),
+        };
+        if !permitted {
+            return Err(crate::WriteError::UnknownEncoding);
+        }
         let mut packet = [0_u8; 12];
         packet[..4].copy_from_slice(&[0x81, 206, 0, 2]);
         packet[4..8].copy_from_slice(&self.receiver_ssrc.to_be_bytes());
@@ -620,4 +629,63 @@ fn extension_value<'a>(
     std::str::from_utf8(value)
         .ok()
         .filter(|value| !value.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn offered_primary_can_bootstrap_a_keyframe_without_discovering_an_encoding() {
+        let facts = IngressMediaFacts {
+            sender_index: 0,
+            kind: crate::MediaKind::Video,
+            mid: "video".into(),
+            payloads: Box::new([(96, 90_000)]),
+            feedback_payloads: Box::new([96]),
+            repairs: Box::new([(97, 96)]),
+            nack_payloads: Box::new([96]),
+            ssrc_repairs: Box::new([(12, 11)]),
+            ssrcs: Box::new([11, 12]),
+            rids: Box::new([]),
+            extensions: Box::new([]),
+        };
+        let now = Instant::now();
+        let mut ingress = IngressOwner::new(
+            Box::new([facts]),
+            1,
+            4096,
+            99,
+            ReceiveFeedback::new(None, now),
+        );
+        let request = ingress.keyframe_request(11).unwrap();
+        assert_eq!(&request[..4], &[0x81, 206, 0, 2]);
+        assert_eq!(&request[4..8], &99_u32.to_be_bytes());
+        assert_eq!(&request[8..], &11_u32.to_be_bytes());
+        for ssrc in [0, 12, 13] {
+            assert_eq!(
+                ingress.keyframe_request(ssrc).unwrap_err(),
+                crate::WriteError::UnknownEncoding
+            );
+        }
+        assert!(ingress.poll_event().is_none());
+        assert!(
+            ingress.stats().is_empty(),
+            "signaling is not authenticated encoding discovery"
+        );
+        ingress.accept_rtp(
+            now,
+            vec![0x80, 96, 0, 1, 0, 0, 0, 0, 0, 0, 0, 11, 0x65],
+            None,
+        );
+        assert!(matches!(
+            ingress.poll_event(),
+            Some(Event::EncodingDiscovered { .. })
+        ));
+        ingress.retire(11).unwrap();
+        assert_eq!(
+            ingress.keyframe_request(11).unwrap_err(),
+            crate::WriteError::UnknownEncoding
+        );
+    }
 }

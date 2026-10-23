@@ -44,13 +44,25 @@ impl OwnedPacketQueue {
         }
     }
 
-    pub fn push_back(&mut self, dst: SocketAddr, contents: Vec<u8>) {
+    pub fn push_back(&mut self, dst: SocketAddr, contents: Vec<u8>) -> bool {
+        if self.is_full() {
+            return false;
+        }
         debug_assert!(!contents.is_empty(), "Pushed content must not be empty");
         debug_assert!(
             contents.len() <= net::MAX_UDP_GSO_PAYLOAD_SIZE,
             "Packet exceeds the maximum framed payload"
         );
         self.packets.push_back(OwnedPacket { dst, contents });
+        true
+    }
+
+    pub fn is_full(&self) -> bool {
+        self.packets.len() >= net::BATCH_SIZE
+    }
+
+    pub fn discard(&mut self) {
+        self.packets.clear();
     }
 
     pub fn is_empty(&self) -> bool {
@@ -213,30 +225,60 @@ impl Batcher {
         self.active_states.is_empty()
     }
 
+    pub fn is_full(&self) -> bool {
+        self.active_states.len() >= net::BATCH_SIZE
+    }
+
+    pub fn discard(&mut self) {
+        while let Some(state) = self.pop_front() {
+            self.reclaim(state);
+        }
+    }
+
     /// Pushes a content slice into an appropriate batch.
     ///
     /// It attempts to find an existing batch for the same destination that is not yet sealed.
     /// If no suitable batch is found, it takes one from the free pool or allocates a new one.
-    pub fn push_back(&mut self, dst: SocketAddr, content: &[u8]) {
-        let accepted = self.try_push_back(dst, content);
+    #[cfg(test)]
+    fn push_back(&mut self, dst: SocketAddr, content: &[u8]) {
+        let accepted = self.try_push_back(dst, content, None);
         debug_assert!(accepted, "content is larger than the batcher's capacity");
     }
 
-    fn try_push_back(&mut self, dst: SocketAddr, content: &[u8]) -> bool {
+    pub fn push_on_flow(
+        &mut self,
+        dst: SocketAddr,
+        flow: net::tcp::TcpFlowId,
+        content: &[u8],
+    ) -> bool {
+        self.try_push_back(dst, content, Some(flow))
+    }
+
+    fn try_push_back(
+        &mut self,
+        dst: SocketAddr,
+        content: &[u8],
+        flow: Option<net::tcp::TcpFlowId>,
+    ) -> bool {
         debug_assert!(!content.is_empty(), "Pushed content must not be empty");
 
         if let Some(state) = self.active_states.back_mut()
+            && state.flow == flow
             && state.try_push(dst, content)
         {
             return true;
         }
 
+        if self.is_full() {
+            return false;
+        }
         let mut new_state = match self.free_states.pop() {
             Some(state) => state,
             None => BatcherState::with_capacity(self.cap),
         };
 
         new_state.reset(dst);
+        new_state.flow = flow;
 
         if new_state.try_push(dst, content) {
             self.active_states.push_back(new_state);
@@ -247,10 +289,11 @@ impl Batcher {
         }
     }
 
-    pub fn append_from(&mut self, queue: &mut OwnedPacketQueue) -> bool {
+    #[cfg(test)]
+    fn append_from(&mut self, queue: &mut OwnedPacketQueue) -> bool {
         while let Some(packet) = queue.packets.front() {
             let before = self.active_states.len();
-            if !self.try_push_back(packet.dst, &packet.contents) {
+            if !self.try_push_back(packet.dst, &packet.contents, None) {
                 return false;
             }
             let Some(_) = queue.packets.pop_front() else {
@@ -262,9 +305,23 @@ impl Batcher {
         queue.packets.is_empty()
     }
 
-    pub fn append_batcher(&mut self, other: &mut Batcher) {
-        self.active_states.append(&mut other.active_states);
-        debug_assert!(other.active_states.is_empty());
+    pub fn append_batcher(&mut self, other: &mut Batcher) -> AppendStatus {
+        while !other.is_empty() {
+            if self.is_full() {
+                return AppendStatus::Full;
+            }
+            let Some(state) = other.pop_front() else {
+                break;
+            };
+            if state.flow.is_some() {
+                self.active_states.push_back(state);
+            } else {
+                metrics::counter!("participant_tcp_egress_dropped_bytes", "reason" => "missing_flow")
+                    .increment(state.buf.len() as u64);
+                other.reclaim(state);
+            }
+        }
+        AppendStatus::Drained
     }
 
     /// Pops a single batch from the front of the queue.
@@ -272,6 +329,7 @@ impl Batcher {
         self.active_states.pop_front()
     }
 
+    #[cfg(test)]
     pub fn front(&mut self) -> Option<&BatcherState> {
         self.active_states.front()
     }
@@ -285,7 +343,16 @@ impl Batcher {
 
     pub fn flush(&mut self, socket: &mut net::tcp::TcpTransport) -> bool {
         let mut progressed = false;
-        while let Some(state) = self.front() {
+        let mut blocked_flows = ArrayVec::<net::tcp::TcpFlowId, { net::BATCH_SIZE }>::new();
+        for _ in 0..self.active_states.len() {
+            let Some(state) = self.pop_front() else {
+                break;
+            };
+            // Later batches on a blocked flow cannot overtake its head.
+            if state.flow.is_some_and(|flow| blocked_flows.contains(&flow)) {
+                self.active_states.push_back(state);
+                continue;
+            }
             debug_assert!(state.segment_count > 0, "Attempted to flush an empty batch");
             debug_assert!(
                 state.segment_size != 0,
@@ -303,26 +370,29 @@ impl Batcher {
                 buf: &state.buf,
                 segment_size: state.segment_size,
             }];
-            match socket.try_send_batch(&net::SendPacketBatch { packets: &packet }) {
-                Ok(_) => {
-                    let Some(state) = self.pop_front() else {
-                        debug_assert!(false, "a flushed batch must remain queued");
-                        break;
-                    };
-                    self.reclaim(state);
-                    progressed = true;
+            let result = state.flow.map_or_else(
+                || Err(std::io::Error::from(std::io::ErrorKind::NotConnected)),
+                |flow| socket.try_send_on_flow(flow, &packet[0]),
+            );
+            if matches!(&result, Ok(false))
+                || result
+                    .as_ref()
+                    .is_err_and(|error| error.kind() == std::io::ErrorKind::WouldBlock)
+            {
+                if let Some(flow) = state.flow {
+                    let recorded = blocked_flows.try_push(flow);
+                    debug_assert!(recorded.is_ok(), "one blocked marker per bounded batch");
                 }
-                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
-                Err(err) => {
-                    tracing::trace!("error on writing to TCP socket: {:?}", err);
-                    let Some(state) = self.pop_front() else {
-                        debug_assert!(false, "a failed batch must remain queued");
-                        break;
-                    };
-                    self.reclaim(state);
-                    progressed = true;
-                }
+                self.active_states.push_back(state);
+                continue;
             }
+            if let Err(error) = result {
+                tracing::trace!(?error, "error writing to TCP socket");
+                metrics::counter!("participant_tcp_egress_dropped_bytes", "reason" => "retired_flow")
+                    .increment(state.buf.len() as u64);
+            }
+            self.reclaim(state);
+            progressed = true;
         }
         progressed
     }
@@ -331,6 +401,7 @@ impl Batcher {
 /// Holds the state for a single GSO-compatible batch.
 pub struct BatcherState {
     pub dst: SocketAddr,
+    flow: Option<net::tcp::TcpFlowId>,
     pub segment_size: usize,
     segment_count: usize,
     max_segments: usize,
@@ -343,6 +414,7 @@ impl BatcherState {
         debug_assert_ne!(cap, 0);
         Self {
             dst: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+            flow: None,
             segment_size: 0,
             segment_count: 0,
             max_segments: cap,
@@ -426,6 +498,7 @@ impl BatcherState {
     /// Resets the state's properties for reuse.
     fn reset(&mut self, dst: SocketAddr) {
         self.dst = dst;
+        self.flow = None;
         self.segment_size = 0;
         self.segment_count = 0;
         self.sealed = false;
@@ -443,6 +516,114 @@ mod tests {
     // cross-core. See crates/pulsebeam/docs/thread-per-core.md.
     use super::*;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    #[cfg(feature = "sim")]
+    #[test]
+    fn slow_tcp_peer_preserves_bounded_backlog_and_healthy_peer_progress() {
+        use pulsebeam_core::net::{TcpListener, TcpStream};
+        use pulsebeam_runtime::net::tcp::{BufferedTcpStream, TcpTransport};
+        use tokio::io::AsyncReadExt;
+
+        let mut sim = turmoil::Builder::new().tcp_capacity(1).build();
+        sim.client("192.168.250.17", async {
+            let listener = TcpListener::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())
+                .await
+                .unwrap();
+            let address = listener.local_addr().unwrap();
+            let (client, accepted) = tokio::join!(TcpStream::connect(address), listener.accept());
+            let mut slow_client = client.unwrap();
+            let (stream, slow_peer) = accepted.unwrap();
+            let mut socket = TcpTransport::new(address);
+            let slow = socket
+                .add_connection(BufferedTcpStream::new(stream), slow_peer)
+                .unwrap();
+            let (client, accepted) = tokio::join!(TcpStream::connect(address), listener.accept());
+            let mut healthy_client = client.unwrap();
+            let (stream, healthy_peer) = accepted.unwrap();
+            let healthy = socket
+                .add_connection(BufferedTcpStream::new(stream), healthy_peer)
+                .unwrap();
+            let payload = vec![7; net::MAX_UDP_GSO_PAYLOAD_SIZE];
+            let packet = net::SendPacket {
+                dst: slow_peer,
+                buf: &payload,
+                segment_size: payload.len(),
+            };
+            let mut primed = 0usize;
+            for _ in 0..net::BATCH_SIZE {
+                if !socket.try_send_on_flow(slow, &packet).unwrap() {
+                    break;
+                }
+                primed = primed.saturating_add(1);
+            }
+            assert!(primed > 0 && primed < net::BATCH_SIZE);
+            let mut participant = Batcher::with_capacity(1);
+            let mut indexed_payload = payload.clone();
+            for index in 0..net::BATCH_SIZE {
+                indexed_payload[..2].copy_from_slice(&u16::try_from(index).unwrap().to_be_bytes());
+                assert!(participant.try_push_back(slow_peer, &indexed_payload, Some(slow)));
+            }
+            assert!(!participant.try_push_back(slow_peer, b"overflow", Some(slow)));
+            let mut submitted = Batcher::with_capacity(1);
+            submitted.push_on_flow(slow_peer, slow, &payload);
+            submitted.push_on_flow(healthy_peer, healthy, b"healthy");
+            submitted.append_batcher(&mut participant);
+            assert!(submitted.active_states.len() <= net::BATCH_SIZE);
+            assert!(!participant.is_empty());
+            assert!(submitted.flush(&mut socket));
+            let mut received = [0; 9];
+            healthy_client.read_exact(&mut received).await.unwrap();
+            assert_eq!(&received, b"\0\x07healthy");
+            assert!(!submitted.is_empty());
+            let read_slow = async {
+                let mut received = vec![0; payload.len()];
+                for _ in 0..primed {
+                    assert_eq!(
+                        usize::from(slow_client.read_u16().await.unwrap()),
+                        payload.len()
+                    );
+                    slow_client.read_exact(&mut received).await.unwrap();
+                    assert_eq!(received, payload);
+                }
+                assert_eq!(
+                    usize::from(slow_client.read_u16().await.unwrap()),
+                    payload.len()
+                );
+                slow_client.read_exact(&mut received).await.unwrap();
+                assert_eq!(received, payload);
+                for index in 0..net::BATCH_SIZE {
+                    assert_eq!(
+                        usize::from(slow_client.read_u16().await.unwrap()),
+                        payload.len()
+                    );
+                    slow_client.read_exact(&mut received).await.unwrap();
+                    assert_eq!(&received[..2], &u16::try_from(index).unwrap().to_be_bytes());
+                    assert_eq!(&received[2..], &payload[2..]);
+                }
+            };
+            tokio::pin!(read_slow);
+            let mut frames = Vec::new();
+            let mut closed = Vec::new();
+            for _ in 0..net::BATCH_SIZE.saturating_mul(16) {
+                submitted.append_batcher(&mut participant);
+                submitted.flush(&mut socket);
+                assert!(submitted.active_states.len() <= net::BATCH_SIZE);
+                tokio::select! {
+                    _ = &mut read_slow => {
+                        assert!(submitted.is_empty() && participant.is_empty());
+                        return Ok(());
+                    }
+                    ready = socket.readable() => {
+                        ready.unwrap();
+                        socket.try_recv_events(&mut frames, &mut closed).unwrap();
+                        assert!(frames.is_empty() && closed.is_empty());
+                    }
+                }
+            }
+            panic!("a reading peer must drain all committed frames in bounded turns");
+        });
+        sim.run().unwrap();
+    }
 
     /// GSO segment accounting at its edges.
     ///

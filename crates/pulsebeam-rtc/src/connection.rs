@@ -363,14 +363,7 @@ impl Connection {
                 .request_repair(repair.media_ssrc, repair.sequence);
         }
 
-        let (
-            path_change,
-            feedback,
-            probe_feedback,
-            feedback_hold,
-            fresh_network_feedback,
-            bytes_in_flight,
-        ) = {
+        let (path_change, feedback, feedback_hold, fresh_network_feedback, bytes_in_flight) = {
             let inputs = self.commit.history.controller_inputs();
             let received_at = inputs.timing.map_or(at, |timing| timing.received_at);
             let origin = self.egress.controller_origin();
@@ -385,12 +378,6 @@ impl Connection {
                     .map(|feedback| feedback.controller_sample(received_at, origin))
                     .collect::<Vec<_>>(),
                 inputs
-                    .feedback
-                    .iter()
-                    .chain(&inputs.synthetic)
-                    .copied()
-                    .collect::<Vec<_>>(),
-                inputs
                     .timing
                     .and_then(|timing| timing.feedback_hold)
                     .unwrap_or_default(),
@@ -402,7 +389,6 @@ impl Connection {
             at,
             path_change,
             &feedback,
-            &probe_feedback,
             feedback_hold,
             fresh_network_feedback,
             bytes_in_flight,
@@ -649,6 +635,11 @@ impl Connection {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_pacing_profile(&self) -> (u64, u64) {
+        self.egress.test_pacing_profile()
+    }
+
     pub fn stats(&self) -> StatsSnapshot {
         let (egress, senders) = self.egress.stats();
         let history = self.commit.history.counters();
@@ -724,9 +715,6 @@ impl Connection {
         }
         let mut entropy = EntropyConsumer::new(entropy);
         let negotiated = negotiation::negotiate(&config, &offer, at, &mut entropy)?;
-        if negotiated.facts.remote_candidates.is_empty() {
-            return Err(AcceptError::InvalidOffer);
-        }
         let session = negotiated.session.clone();
         let transport = Transport::from_session(&negotiated.facts, at)
             .map_err(|_| AcceptError::CryptographicFailure)?;
@@ -817,13 +805,12 @@ impl Drop for EntropyConsumer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{
-        NetworkPolicy, PeerFixture, assert_initial_probe_windows, assert_probe_windows, sample,
-    };
+    use crate::test_support::{NetworkPolicy, PeerFixture, assert_native_rtp_pacing, sample};
     use std::time::Duration;
     #[test]
     fn aggregate_demand_obtains_native_rtx_feedback_without_primary_media() {
         let mut fixture = PeerFixture::connected_video().without_egress_observation();
+        fixture.observe_pacing_profile(Connection::test_pacing_profile);
         fixture.configure_rtc_wakeup_quantum(Duration::from_millis(1));
         fixture.configure_network(
             0x6602,
@@ -832,6 +819,21 @@ mod tests {
                 ..NetworkPolicy::default()
             },
         );
+        fixture.configure_bottleneck(4_000_000);
+        fixture.observe_native_target(|connection| {
+            let envelope = connection.egress.test_envelope().expect("native envelope");
+            assert!(
+                connection.stats().connection.rtp_bytes_in_flight
+                    <= envelope.max_rtp_bytes_in_flight
+            );
+            if let Some(rate) = connection.egress.test_startup_probe_rate() {
+                assert!(
+                    rate <= envelope.pacing_transport_rate,
+                    "startup uses the native transport-byte pacing ceiling"
+                );
+            }
+            envelope.native_queue_delay_target
+        });
         fixture.configure_time_quantum(Duration::from_millis(5));
         fixture.drive_for(Duration::from_millis(200));
         assert_eq!(
@@ -881,7 +883,7 @@ mod tests {
             .egress
             .test_initial_probe_started_at()
             .expect("ordinary startup probe");
-        assert_initial_probe_windows(fixture.emitted_rtp(), initial_started, 2_000_000);
+        assert_native_rtp_pacing(fixture.emitted_rtp(), fixture.pacing_trace());
         assert!(
             saw_fresh_delivery
                 && fixture.connection.commit.history.counters().received > received_before,
@@ -894,7 +896,11 @@ mod tests {
             bootstrap.bandwidth_estimate.as_bps() >= 1_100_000,
             "aggregate-demand demand must bootstrap native capacity within 30s: stats={bootstrap:?}",
         );
-        assert_initial_probe_windows(fixture.emitted_rtp(), initial_started, 2_000_000);
+        assert_native_rtp_pacing(fixture.emitted_rtp(), fixture.pacing_trace());
+        assert_eq!(
+            fixture.connection.egress.test_initial_probe_started_at(),
+            Some(initial_started)
+        );
         fixture.set_desired_bitrate(None);
         let padding = fixture
             .connection
@@ -915,6 +921,7 @@ mod tests {
     #[test]
     fn production_no_rtx_feedback_outage_path_replacement_and_pause_recover() {
         let mut fixture = PeerFixture::connected().without_egress_observation();
+        fixture.observe_pacing_profile(Connection::test_pacing_profile);
         fixture.configure_network(
             0x6601,
             NetworkPolicy {
@@ -940,7 +947,7 @@ mod tests {
         {
             fixture.set_feedback_enabled(feedback_enabled);
             if replace_path {
-                assert_probe_windows(fixture.emitted_rtp());
+                assert_native_rtp_pacing(fixture.emitted_rtp(), fixture.pacing_trace());
                 for _ in 0..2 {
                     fixture
                         .connection
@@ -970,7 +977,12 @@ mod tests {
                 .egress
                 .test_envelope()
                 .expect("controller output");
-            assert_eq!(envelope.feedback_stale, !feedback_enabled);
+            assert_eq!(
+                envelope.feedback_stale,
+                !feedback_enabled,
+                "feedback={feedback_enabled} replace_path={replace_path} stats={:?} envelope={envelope:?}",
+                fixture.connection.stats().connection
+            );
             assert!(fixture.connection.stats().connection.transmitted_rtp_bytes > before);
         }
         fixture
@@ -979,18 +991,29 @@ mod tests {
             .expect("caller pauses production");
         fixture.drive_for(Duration::from_secs(1));
         let paused = fixture.connection.stats().connection.transmitted_rtp_bytes;
+        let settled = fixture
+            .connection
+            .egress
+            .test_envelope()
+            .expect("settled native output");
         fixture.drive_for(Duration::from_secs(2));
         assert_eq!(
             fixture.connection.stats().connection.transmitted_rtp_bytes,
             paused
         );
-        assert!(
-            fixture
-                .connection
-                .egress
-                .test_envelope()
-                .expect("controller output")
-                .application_limited
+        let quiet = fixture
+            .connection
+            .egress
+            .test_envelope()
+            .expect("quiet native output");
+        assert!(quiet.feedback_stale);
+        // No packets means no new native ALR or window evidence. Polling must
+        // neither manufacture classification nor decay nominal capacity.
+        assert_eq!(quiet.application_limited, settled.application_limited);
+        assert_eq!(quiet.reference_window, settled.reference_window);
+        assert_eq!(
+            quiet.target_media_payload_rate,
+            settled.target_media_payload_rate
         );
         let start = fixture.at();
         for tick in 1..=600 {
@@ -1016,7 +1039,7 @@ mod tests {
                 .expect("controller output")
                 .feedback_stale
         );
-        assert_probe_windows(fixture.emitted_rtp());
+        assert_native_rtp_pacing(fixture.emitted_rtp(), fixture.pacing_trace());
         fixture
             .connection
             .discard_pending_rtp(&mid)
@@ -1028,50 +1051,65 @@ mod tests {
             fixture.connection.stats().connection.transmitted_rtp_bytes,
             stopped
         );
-        assert_probe_windows(fixture.emitted_rtp());
+        assert_native_rtp_pacing(fixture.emitted_rtp(), fixture.pacing_trace());
     }
     #[test]
-    #[should_panic(expected = "emitted probe budget")]
-    fn probe_oracle_rejects_credit_from_later_emission_at_same_instant() {
+    #[should_panic(expected = "native RTP pacing budget")]
+    fn pacing_oracle_rejects_unpaced_primary_bytes() {
         let now = Instant::now();
-        assert_probe_windows(&[(now, 48 * 1024 + 1, true), (now, 19, false)]);
-    }
-
-    #[test]
-    #[should_panic(expected = "emitted probe budget")]
-    fn probe_oracle_rejects_overspend_when_media_credit_expires() {
-        let now = Instant::now();
-        assert_probe_windows(&[
-            (now, 19_000, false),
-            (now + Duration::from_secs(1), 48 * 1024 + 1_000, true),
-        ]);
-    }
-
-    #[test]
-    #[should_panic(expected = "emitted probe budget")]
-    fn initial_probe_oracle_rejects_more_than_demand_sized_service() {
-        let now = Instant::now();
-        assert_initial_probe_windows(&[(now, 60_001, true)], now, 1_200_000);
-    }
-
-    #[test]
-    #[should_panic(expected = "emitted probe budget")]
-    fn initial_probe_oracle_rejects_refreshed_credit_after_initial_period() {
-        let now = Instant::now();
-        assert_initial_probe_windows(
-            &[(now + Duration::from_secs(5), 48 * 1024 + 1, true)],
-            now,
-            2_000_000,
+        assert_native_rtp_pacing(
+            &[(now, 1_000, false), (now, 1, false)],
+            &[(now, 0, 80_000, 0)],
         );
     }
 
     #[test]
-    fn initial_probe_oracle_retains_spent_service_without_granting_new_credit() {
+    #[should_panic(expected = "native RTP pacing budget")]
+    fn pacing_oracle_rejects_unpaced_padding_bytes() {
         let now = Instant::now();
-        assert_initial_probe_windows(
-            &[(now + Duration::from_secs(4), 96 * 1024, true)],
-            now,
-            2_000_000,
+        assert_native_rtp_pacing(
+            &[(now, 1_000, true), (now, 1, true)],
+            &[(now, 0, 80_000, 0)],
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "native RTP pacing budget")]
+    fn pacing_oracle_rejects_future_same_time_rate_credit() {
+        let now = Instant::now();
+        assert_native_rtp_pacing(
+            &[(now, 1_000, true), (now, 1, true), (now, 1, false)],
+            &[(now, 0, 80_000, 0), (now, 2, 8_000_000, 0)],
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "native RTP pacing budget")]
+    fn pacing_oracle_rate_changes_do_not_clear_debt() {
+        let now = Instant::now();
+        assert_native_rtp_pacing(
+            &[(now, 1_000, true), (now, 1, true)],
+            &[(now, 0, 80_000, 0), (now, 1, 40_000, 0)],
+        );
+    }
+
+    #[test]
+    fn pacing_oracle_fresh_path_resets_only_its_own_byte_debt() {
+        let now = Instant::now();
+        assert_native_rtp_pacing(
+            &[(now, 1_000, true), (now, 1_000, true)],
+            &[(now, 0, 80_000, 1), (now, 1, 80_000, 2)],
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "native RTP pacing budget")]
+    fn pacing_oracle_idle_time_cannot_bank_unbounded_service() {
+        let now = Instant::now();
+        let later = now + Duration::from_secs(10);
+        assert_native_rtp_pacing(
+            &[(later, 1_000, false), (later, 1, false)],
+            &[(now, 0, 80_000, 0)],
         );
     }
     #[test]
@@ -1103,6 +1141,7 @@ mod tests {
     #[test]
     fn production_two_megabit_capacity_and_native_window() {
         let mut fixture = PeerFixture::connected().without_egress_observation();
+        fixture.observe_pacing_profile(Connection::test_pacing_profile);
         fixture.configure_network(
             0x2201,
             NetworkPolicy {
@@ -1153,7 +1192,7 @@ mod tests {
             .expect("caller ends the offered cohort");
         fixture.set_desired_bitrate(None);
         fixture.drive_for(Duration::from_secs(2));
-        assert_probe_windows(fixture.emitted_rtp());
+        assert_native_rtp_pacing(fixture.emitted_rtp(), fixture.pacing_trace());
         let delivered = fixture
             .delivered_rtp()
             .iter()
@@ -1228,11 +1267,31 @@ mod tests {
     }
 
     #[test]
-    fn low_rate_media_uses_actual_offer_for_application_limited_classification() {
+    fn feedback_driven_alr_tracks_sparse_media_after_saturated_service() {
         let mut fixture = PeerFixture::connected();
         let mut source = PeerFixture::connected();
+        fixture.configure_network(
+            0x6603,
+            NetworkPolicy {
+                delay: Duration::from_millis(25),
+                ..NetworkPolicy::default()
+            },
+        );
+        fixture.configure_bottleneck(2_000_000);
         fixture.set_desired_bitrate(Some(MediaPayloadBitrate::from_bps(4_000_000)));
-        for id in 1..=10 {
+        // Establish a real flight-supported reference window before reducing the
+        // source. A low offered rate alone is not native SCReAM ALR evidence.
+        for id in 1..=150 {
+            source.drive_for(Duration::from_millis(20));
+            fixture.drive_for(Duration::from_millis(20));
+            fixture
+                .write_rtp(crate::test_support::rtp_write(
+                    source.send_source(&[0x5a; 1_000]),
+                    id,
+                ))
+                .expect("warm native flight");
+        }
+        for id in 151..=170 {
             source.drive_for(Duration::from_millis(100));
             fixture.drive_for(Duration::from_millis(100));
             fixture
@@ -1245,7 +1304,11 @@ mod tests {
         fixture.drive_for(Duration::from_millis(300));
         let (offered, application_limited) = fixture.connection.egress.observed_offer();
         assert!(offered <= 100_000, "actual sparse offer={offered}");
-        assert!(application_limited);
+        assert!(
+            application_limited,
+            "native sparse-flow envelope={:?}",
+            fixture.connection.egress.test_envelope()
+        );
         assert!(fixture.connection.stats().connection.transmitted_rtp_bytes > 0);
     }
     #[test]

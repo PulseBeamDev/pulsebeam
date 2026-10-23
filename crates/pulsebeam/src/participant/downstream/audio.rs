@@ -3,8 +3,7 @@ use std::time::Duration;
 
 use ahash::{HashSet, HashSetExt};
 
-use str0m::media::{Mid, Pt};
-use str0m::rtp::Ssrc;
+use crate::media::{Mid, Pt, Ssrc};
 use tokio::time::Instant;
 
 use crate::control::MAX_SEND_AUDIO_SLOTS;
@@ -267,18 +266,6 @@ impl AudioAllocator {
             .map(|slot| slot.media_index)
     }
 
-    pub fn refresh_ssrc(&mut self, mid: Mid, ssrc: Ssrc) -> bool {
-        for slot_entry in &mut self.slots {
-            if let Some(slot) = slot_entry.as_mut()
-                && slot.mid == mid
-            {
-                slot.ssrc = ssrc;
-                return true;
-            }
-        }
-        false
-    }
-
     /// Whether someone new took over a slot since this was last asked.
     pub fn take_speakers_changed(&mut self) -> bool {
         std::mem::take(&mut self.speakers_changed)
@@ -458,9 +445,9 @@ mod tests {
     // Convenience only: a test is not a shard, so nothing here is
     // cross-core. See crates/pulsebeam/docs/thread-per-core.md.
     use super::*;
+    use crate::media::Ssrc;
+    use crate::media::{MediaKind, Mid, Pt};
     use crate::participant::downstream::SlotConfig;
-    use str0m::media::{MediaKind, Mid, Pt};
-    use str0m::rtp::Ssrc;
 
     fn test_ctx() -> LogCtx {
         use crate::entity::{ParticipantId, RoomExternalId, RoomId};

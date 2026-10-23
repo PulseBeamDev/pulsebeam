@@ -1,14 +1,10 @@
 use super::signaling_v1::{AppliedInput, NativeSession};
+use crate::media::{Direction, KeyframeRequestKind, MediaKind, Mid, Pt, Ssrc};
 use ahash::{HashMap, HashMapExt, HashSet, HashSetExt};
 use pulsebeam_proto::topic::TopicFrame;
+use pulsebeam_rtc::{DataChannelEvent, DataMessage, Event};
 use pulsebeam_runtime::net::{self};
 use std::time::Duration;
-use str0m::bwe::BweKind;
-use str0m::media::{KeyframeRequestKind, MediaKind, Mid};
-use str0m::{
-    Event, Rtc, RtcError,
-    media::{Direction, MediaAdded, Pt},
-};
 use tokio::time::Instant;
 
 use crate::control::{NegotiatedResources, controller::ConnectionProfile};
@@ -41,11 +37,15 @@ use crate::track::{
     self, DataLane, DataTopicChannel, DataTrackDirection, DataTrackIntent, DataTrackIntentError,
     KEYFRAME_DEBOUNCE, StreamId, StreamWrite, StreamWriter, Track,
 };
-#[cfg(test)]
-use str0m::rtp::Ssrc;
 
 const SLOW_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const POLL_WORK_BUDGET: usize = 256;
+
+enum RtcDrainResult {
+    Quiescent(Instant),
+    Pending,
+    Closed,
+}
 
 fn inline_rtc_timeout(deadline: Instant, wall_now: Instant) -> Option<Instant> {
     let latest = wall_now
@@ -60,14 +60,10 @@ pub struct TrackMapping {
     pub kind: MediaKind,
 }
 
-/// Routing is not allowed to mutate an `Rtc`; it only queues work for the
-/// participant's mutate-then-drain loop.
-/// One deferred str0m mutation. The poll loop applies one item and immediately
-/// returns to `poll_rtc()` before applying another mutation.
 #[derive(thiserror::Error, Debug)]
 pub enum DisconnectReason {
-    #[error("RTC engine error")]
-    RtcError(#[from] RtcError),
+    #[error("RTC connection closed: {0:?}")]
+    RtcClosed(pulsebeam_rtc::CloseReason),
     #[error("Native signaling input error")]
     SignalingInput,
     #[error("Native signaling output error")]
@@ -94,7 +90,6 @@ pub enum DisconnectReason {
     SystemTerminated,
 }
 
-#[derive(Debug)]
 pub struct ParticipantConfig {
     pub manual_sub: bool,
     pub room_id: entity::RoomId,
@@ -103,8 +98,19 @@ pub struct ParticipantConfig {
     pub connection_id: entity::ConnectionId,
     pub profile: ConnectionProfile,
     pub authorization_expiry: Option<pulsebeam_core::auth::AuthorizationExpiry>,
-    pub rtc: Rtc,
+    pub rtc: pulsebeam_rtc::AcceptedConnection,
     pub resources: NegotiatedResources,
+}
+
+impl std::fmt::Debug for ParticipantConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ParticipantConfig")
+            .field("participant_id", &self.participant_id)
+            .field("connection_id", &self.connection_id)
+            .field("profile", &self.profile)
+            .field("resources", &self.resources)
+            .finish_non_exhaustive()
+    }
 }
 
 pub(crate) enum ParticipantInput<'a> {
@@ -126,9 +132,8 @@ pub(crate) enum ParticipantInput<'a> {
 }
 
 impl ParticipantConfig {
-    // TODO: wrap rtc instead
-    pub fn ufrag(&mut self) -> String {
-        self.rtc.direct_api().local_ice_credentials().ufrag
+    pub fn ufrag(&self) -> String {
+        self.resources.local_ufrag.clone()
     }
 }
 
@@ -144,8 +149,8 @@ pub struct Participant {
     pub(crate) participant_id: entity::ParticipantId,
     participant_external_id: entity::ParticipantExternalId,
     pub(crate) connection_id: entity::ConnectionId,
-    last_keyframe_request: HashMap<(Mid, Option<str0m::media::Rid>), Instant>,
-    pending_keyframe_requests: HashSet<(Mid, Option<str0m::media::Rid>)>,
+    last_keyframe_request: HashMap<(Mid, Option<crate::media::Rid>), Instant>,
+    pending_keyframe_requests: HashSet<(Mid, Option<crate::media::Rid>)>,
 
     /// The compiled stream a published channel forwards into, recorded by the
     /// shard once it has minted one. Keyed by channel so an arriving SCTP
@@ -205,7 +210,7 @@ impl Participant {
             participant_id = %cfg.participant_id,
             room_id = %cfg.room_id
         );
-        Self {
+        let mut participant = Self {
             transport: Transport::new(
                 rtc,
                 udp_gso_size,
@@ -234,7 +239,11 @@ impl Participant {
             data: DataState::new(),
             room_id: cfg.room_id,
             shard_id,
+        };
+        for media in participant.negotiated.media_sections().to_vec() {
+            participant.handle_media_added(media);
         }
+        participant
     }
 
     fn log_ctx(&self) -> LogCtx {
@@ -412,11 +421,22 @@ impl Participant {
                 debug_assert!(false, "a data forwarding plan must have a receiver binding");
                 return;
             };
+            let required = if matches!(lane, DataLane::Ordered) {
+                let Ok(frame) = pulsebeam_proto::topic::TopicFrame::decode_bounded(bytes) else {
+                    return;
+                };
+                !matches!(
+                    frame.body,
+                    Some(pulsebeam_proto::topic::topic_frame::Body::Message(_))
+                )
+            } else {
+                false
+            };
             self.downstream.data.record_delivery(stream, bytes.len());
-            let _ = lane;
             self.enqueue_fanout(TransportMutation::Data {
                 channel,
                 bytes: bytes.to_vec(),
+                required,
             });
             return;
         };
@@ -472,6 +492,18 @@ impl Participant {
         self.transport.enqueue_ingress(batch, source_shard);
     }
 
+    pub(crate) fn bind_tcp_flow(&mut self, peer: std::net::SocketAddr, flow: net::tcp::TcpFlowId) {
+        self.transport.bind_tcp_flow(peer, flow);
+    }
+
+    pub(crate) fn retire_tcp_flow(
+        &mut self,
+        peer: std::net::SocketAddr,
+        flow: net::tcp::TcpFlowId,
+    ) {
+        self.transport.retire_tcp_flow(peer, flow);
+    }
+
     pub fn drain_network(&mut self, egress: &mut impl NetworkEgress) {
         self.transport.drain_network(egress);
     }
@@ -507,7 +539,12 @@ impl Participant {
     }
 
     fn enqueue_fanout(&mut self, work: TransportMutation) -> bool {
-        self.transport.enqueue_mutation(work)
+        let required = matches!(&work, TransportMutation::Data { required: true, .. });
+        let accepted = self.transport.enqueue_mutation(work);
+        if required && !accepted {
+            self.disconnect(DisconnectReason::SignalingOutput);
+        }
+        accepted
     }
 
     fn on_reverse(&mut self, stream: TrackHandle, packet: ReversePacket) {
@@ -541,7 +578,11 @@ impl Participant {
                 {
                     return;
                 }
-                self.enqueue_fanout(TransportMutation::Data { channel, bytes });
+                self.enqueue_fanout(TransportMutation::Data {
+                    channel,
+                    bytes,
+                    required: true,
+                });
             }
             None => {
                 debug_assert!(false, "reverse route carried an invalid endpoint envelope");
@@ -587,9 +628,9 @@ impl Participant {
         // Measure before allocating: the monitors produce this tick's numbers,
         // and running the allocator first would decide against last tick's.
         self.upstream.poll_slow(now);
-        let assignments_changed = self
-            .transport
-            .with_bwe(|bwe| self.downstream.poll_slow(now, bwe, events));
+        let assignments_changed = self.downstream.poll_slow(now, events);
+        self.transport
+            .set_desired_bitrate(self.downstream.desired_bitrate());
         if assignments_changed {
             self.signaling.mark_mapping_dirty();
         }
@@ -621,6 +662,7 @@ impl Participant {
             };
             let result = self.transport.apply_rtp_command(RtpWriteCommand {
                 pkt,
+                track_id,
                 mid,
                 rid,
                 ssrc,
@@ -630,17 +672,8 @@ impl Participant {
                 playout_delay,
             });
             match result {
-                AppliedMutation::RecoveredStream {
-                    kind,
-                    mid,
-                    rid,
-                    ssrc,
-                } => {
-                    let refreshed = self.downstream.refresh_ssrc(kind, mid, rid, ssrc);
-                    debug_assert!(refreshed, "recovered stream has no downstream slot");
-                    if playout_delay.is_some() {
-                        self.downstream.record_playout_delay_stamp(mid, rid, seq_no);
-                    }
+                AppliedMutation::ControlNotWritten => {
+                    self.disconnect(DisconnectReason::SignalingOutput);
                 }
                 AppliedMutation::RtpWritten if playout_delay.is_some() => {
                     self.downstream.record_playout_delay_stamp(mid, rid, seq_no);
@@ -650,6 +683,7 @@ impl Participant {
                 }
                 AppliedMutation::KeyframeRequested { .. }
                 | AppliedMutation::Applied
+                | AppliedMutation::DataNotWritten
                 | AppliedMutation::RtpWritten
                 | AppliedMutation::RtpNotWritten => {}
             }
@@ -657,6 +691,9 @@ impl Participant {
         }
         let applied = self.transport.apply_next_mutation(now);
         match applied {
+            Some(AppliedMutation::ControlNotWritten) => {
+                self.disconnect(DisconnectReason::SignalingOutput);
+            }
             Some(AppliedMutation::KeyframeRequested { mid, rid }) => {
                 debug_assert!(self.pending_keyframe_requests.remove(&(mid, rid)));
                 self.last_keyframe_request.insert((mid, rid), now);
@@ -700,13 +737,20 @@ impl Participant {
             }
             work_budget = work_budget.saturating_sub(1);
             if self.transport.needs_drain() {
-                let Some(rtc_deadline) = self.poll_rtc(now, events) else {
-                    self.transport.set_drain_result(None);
-                    // Controller is responsible to clean up tracks
-                    events.exit();
-                    return None;
-                };
-                self.transport.set_drain_result(Some(rtc_deadline));
+                match self.poll_rtc(now, events, &mut work_budget) {
+                    RtcDrainResult::Quiescent(deadline) => {
+                        self.transport.set_drain_result(Some(deadline));
+                    }
+                    RtcDrainResult::Pending => {
+                        return Some(now.checked_add(Duration::from_micros(1)).unwrap_or(now));
+                    }
+                    RtcDrainResult::Closed => {
+                        self.transport.set_drain_result(None);
+                        // Controller is responsible to clean up tracks.
+                        events.exit();
+                        return None;
+                    }
+                }
             }
             debug_assert!(self.transport.deadline().is_some());
 
@@ -728,16 +772,11 @@ impl Participant {
                 continue;
             }
 
-            let ctx = self.log_ctx();
             self.advance_rtc_clock(now, now);
             let receive_at = self.transport.clock();
             while self.transport.has_pending_ingress() {
                 match self.transport.receive_pending(receive_at) {
                     IngressResult::Empty => continue,
-                    IngressResult::Malformed(src) => {
-                        plog_warn!(ctx, %src, "Dropping malformed UDP packet");
-                        continue;
-                    }
                     IngressResult::Received => continue 'drain,
                 }
             }
@@ -774,9 +813,9 @@ impl Participant {
             }
 
             if self.downstream.dirty_allocation {
-                let assignments_changed = self
-                    .transport
-                    .with_bwe(|bwe| self.downstream.update_allocations(now, bwe));
+                let assignments_changed = self.downstream.update_allocations(now);
+                self.transport
+                    .set_desired_bitrate(self.downstream.desired_bitrate());
                 if assignments_changed {
                     self.signaling.mark_mapping_dirty();
                 }
@@ -811,28 +850,27 @@ impl Participant {
         self.transport.advance_clock(candidate, wall_now);
     }
 
-    /// Internal helper: Drains the RTC engine until it yields a Timeout.
-    /// Handles Transmits (UDP/TCP) and Events (Logic).
-    fn poll_rtc(&mut self, now: Instant, events: &mut impl ParticipantSink) -> Option<Instant> {
+    fn poll_rtc(
+        &mut self,
+        now: Instant,
+        events: &mut impl ParticipantSink,
+        work_budget: &mut usize,
+    ) -> RtcDrainResult {
         loop {
+            if *work_budget == 0 {
+                return RtcDrainResult::Pending;
+            }
+            *work_budget = work_budget.saturating_sub(1);
             match self.transport.poll_output() {
-                Ok(Some(TransportPollOutput::Timeout(deadline))) => {
-                    return Some(deadline);
+                TransportPollOutput::Pending => return RtcDrainResult::Pending,
+                TransportPollOutput::Timeout(deadline) => {
+                    return RtcDrainResult::Quiescent(deadline);
                 }
-
-                Ok(Some(TransportPollOutput::Transmit)) => {}
-
-                Ok(Some(TransportPollOutput::Event(event))) => {
-                    self.handle_event(now, *event, events);
-                }
-
-                Ok(None) => {
-                    return None;
-                }
-
-                Err(error) => {
-                    self.disconnect(error.into());
-                    return None;
+                TransportPollOutput::Transmit => {}
+                TransportPollOutput::Event(event) => self.handle_event(now, *event, events),
+                TransportPollOutput::Closed(reason) => {
+                    self.disconnect(DisconnectReason::RtcClosed(reason));
+                    return RtcDrainResult::Closed;
                 }
             }
         }
@@ -840,50 +878,59 @@ impl Participant {
 
     fn handle_event(&mut self, now: Instant, e: Event, events: &mut impl ParticipantSink) {
         match e {
-            // `Connected` is DTLS; ICE reaching connected is what tells the
-            // shard the peer address is authenticated, and that is handled
-            // below. Falls through to the catch-all with every other event this
-            // participant does not act on.
-            Event::IceConnectionStateChange(state) if state.is_connected() => {
-                let (ingress, source_shard) = self.transport.connection_context();
-                if let (Some((source, destination)), Some(source_shard)) = (ingress, source_shard) {
-                    events.connected(source, destination, source_shard);
+            Event::AuthenticatedPath(path) => {
+                if let Some(source_shard) = self.transport.authenticated_source(path)
+                    && path.protocol == pulsebeam_rtc::NetworkProtocol::Udp
+                {
+                    // TCP is already bound to its owner at stream adoption, not UDP steering.
+                    events.connected(path.remote, path.local, source_shard);
                 }
             }
-            Event::IceConnectionStateChange(state) if state.is_disconnected() => {
-                self.disconnect(DisconnectReason::IceDisconnected);
+            Event::Rtp { mid, rid, packet } => {
+                let Ok(mid) = Mid::new(&mid) else {
+                    return;
+                };
+                let Ok(rid) = rid.as_deref().map(crate::media::Rid::new).transpose() else {
+                    return;
+                };
+                self.handle_incoming_rtp(packet, mid, rid, events);
             }
-            Event::MediaAdded(media) => {
+            Event::SenderReport(report) => self.handle_sender_report(report),
+            Event::EncodingDiscovered(info) => {
+                let Ok(mid) = Mid::new(&info.mid) else {
+                    return;
+                };
+                if let Some(report) = self.transport.register_encoding(info) {
+                    self.handle_sender_report(report);
+                }
+                self.handle_stream_paused(mid, false, events);
+            }
+            Event::EncodingRetired { ssrc, .. } => {
+                self.transport.retire_encoding(ssrc);
                 self.upstream.clear_routes();
-                self.handle_media_added(media, events);
             }
-            Event::MediaChanged(_) => self.upstream.clear_routes(),
-            Event::RtpPacket(rtp) => self.handle_incoming_rtp(rtp, events),
-            Event::KeyframeRequest(req) => {
-                if let Some((fanout, layer)) = self.downstream.handle_keyframe_request(now, req) {
+            Event::KeyframeRequested { ssrc } => {
+                if let Some(req) = self.transport.keyframe_request(ssrc)
+                    && let Some((fanout, layer)) = self.downstream.handle_keyframe_request(now, req)
+                {
                     events.request_reverse(
                         fanout,
                         ReversePacket::keyframe(layer.rid, KeyframeRequestKind::Pli),
                     );
                 }
             }
-            Event::EgressBitrateEstimate(BweKind::Twcc(available)) => {
-                self.downstream.update_bitrate(now, available);
-            }
-            Event::MediaEgressStats(stats) => {
-                if let Some(remote) = stats.remote {
-                    self.downstream.handle_egress_stats(
-                        stats.mid,
-                        stats.rid,
-                        remote.maximum_sequence_number,
-                    );
+            Event::BandwidthEstimate(available) => self
+                .downstream
+                .update_bitrate(now, crate::bitrate::Bitrate::from(available.as_bps())),
+            Event::ReceiverReport(report) => {
+                if let Some((mid, sequence)) = self.transport.receiver_report(report) {
+                    self.downstream.handle_egress_stats(mid, None, sequence);
                 }
             }
-            Event::ChannelOpen(cid, _label) => {
-                let Some(cfg) = self.transport.channel_config(cid) else {
-                    return;
-                };
-
+            Event::DataChannel(DataChannelEvent::Opened {
+                channel: cid,
+                config: cfg,
+            }) => {
                 let intent = match DataTrackIntent::try_from(&cfg) {
                     Ok(intent) => intent,
                     Err(err) => {
@@ -961,7 +1008,7 @@ impl Participant {
                     }
                 }
             }
-            Event::ChannelClose(cid) => {
+            Event::DataChannel(DataChannelEvent::Closed { channel: cid }) => {
                 if Some(cid) == self.signaling.cid {
                     self.disconnect(DisconnectReason::SignalingClosed);
                     return;
@@ -974,40 +1021,41 @@ impl Participant {
                 self.release_data_channel(channel, events);
                 self.signaling.mark_dirty();
             }
-            Event::ChannelData(data) => {
-                if Some(data.id) == self.signaling.cid {
-                    if !data.binary {
+            Event::DataChannel(DataChannelEvent::Message {
+                channel: cid,
+                message,
+            }) => {
+                let DataMessage::Binary(bytes) = message else {
+                    if Some(cid) == self.signaling.cid {
                         self.disconnect(DisconnectReason::SignalingClosed);
-                        return;
                     }
-                    self.handle_native_signaling(&data.data, events);
-                    return;
-                }
-
-                let Some(channel) = self.data.channel(data.id).cloned() else {
                     return;
                 };
-                if !data.binary {
+                if Some(cid) == self.signaling.cid {
+                    self.handle_native_signaling(&bytes, events);
                     return;
                 }
+                let Some(channel) = self.data.channel(cid).cloned() else {
+                    return;
+                };
                 match (channel.lane, channel.direction) {
                     (lane, DataTrackDirection::Publish) => {
-                        let Ok(frame) = TopicFrame::decode_bounded(data.data.as_ref()) else {
+                        let Ok(frame) = TopicFrame::decode_bounded(bytes.as_ref()) else {
                             return;
                         };
-                        if !self.data.accepts_publisher_frame(data.id, &frame) {
+                        if !self.data.accepts_publisher_frame(cid, &frame) {
                             return;
                         }
                         events.publish_track_packet(
-                            self.upstream.data.published_stream(data.id),
+                            self.upstream.data.published_stream(cid),
                             TrackPacket::Data {
                                 lane,
-                                bytes: data.data.to_vec(),
+                                bytes: bytes.to_vec(),
                             },
                         );
                     }
                     (DataLane::Ordered, DataTrackDirection::Subscribe) => {
-                        let Ok(control) = TopicFrame::decode_bounded(data.data.as_ref()) else {
+                        let Ok(control) = TopicFrame::decode_bounded(bytes.as_ref()) else {
                             return;
                         };
                         if !control.is_subscriber_control() {
@@ -1022,7 +1070,7 @@ impl Participant {
                         if let Some(stream) =
                             self.downstream
                                 .data
-                                .subscribed_stream(data.id, &track_id, &|key| {
+                                .subscribed_stream(cid, &track_id, &|key| {
                                     self.downstream
                                         .track_candidate(key)
                                         .map(|entry| entry.track_id)
@@ -1030,15 +1078,12 @@ impl Participant {
                         {
                             events.request_reverse(
                                 stream,
-                                ReversePacket::reliable_control(data.data.to_vec()),
+                                ReversePacket::reliable_control(bytes.to_vec()),
                             );
                         }
                     }
                     (DataLane::Latest | DataLane::Lossy, DataTrackDirection::Subscribe) => {}
                 }
-            }
-            Event::StreamPaused(stream) => {
-                self.handle_stream_paused(stream.mid, stream.paused, events);
             }
             _ => {
                 // tracing::warn!("unhandled event: {e:?}");
@@ -1209,7 +1254,7 @@ impl Participant {
         }
     }
 
-    fn handle_media_added(&mut self, media: MediaAdded, _events: &mut impl ParticipantSink) {
+    fn handle_media_added(&mut self, media: crate::control::NegotiatedMedia) {
         let Some(resource) = self.negotiated.media(media.mid) else {
             self.disconnect(DisconnectReason::InvalidMediaDirection);
             return;
@@ -1252,7 +1297,7 @@ impl Participant {
                         let (tx, track) = track::new_video(
                             media.mid,
                             track_meta,
-                            media.simulcast.map(|s| s.recv).unwrap_or_default(),
+                            self.transport.incoming_layers(media.mid),
                         );
                         if !self.upstream.add_published_track(
                             resource.media_index,
@@ -1306,12 +1351,17 @@ impl Participant {
 
     fn handle_incoming_rtp(
         &mut self,
-        rtp: str0m::rtp::RtpPacket,
+        rtp: pulsebeam_rtc::RtpPacket,
+        mid: Mid,
+        rid: Option<crate::media::Rid>,
         events: &mut impl ParticipantSink,
     ) {
-        plog_trace!(self.log_ctx(), "tracing:rtp_event={}", rtp.seq_no);
-        let ssrc = rtp.header.ssrc;
+        plog_trace!(self.log_ctx(), "tracing:rtp_event={}", rtp.header.sequence);
+        let ssrc: Ssrc = rtp.header.ssrc.into();
         let incoming = if let Some(route) = self.upstream.route_for_ssrc(ssrc) {
+            if route.mid != mid || route.rid != rid {
+                return;
+            }
             self.transport
                 .convert_rtp(rtp, route.mid, route.rid)
                 .map(|incoming| (route, incoming))
@@ -1321,19 +1371,21 @@ impl Participant {
             metrics::counter!("upstream_route_miss").increment(1);
             #[cfg(feature = "sim")]
             crate::sim_metrics::record_routing_counter("upstream_route_miss");
-            self.transport.lookup_rtp(rtp).and_then(|incoming| {
-                let (upstream_slot, track_id) = self.upstream.slot_for_mid(incoming.mid)?;
-                let route = IncomingRtpRoute {
-                    ssrc,
-                    mid: incoming.mid,
-                    rid: incoming.rid,
-                    upstream_slot,
-                    track_id,
-                    fanout: self.upstream.track_fanout(track_id),
-                };
-                self.upstream.cache_route(route);
-                Some((route, incoming))
-            })
+            self.transport
+                .convert_rtp(rtp, mid, rid)
+                .and_then(|incoming| {
+                    let (upstream_slot, track_id) = self.upstream.slot_for_mid(incoming.mid)?;
+                    let route = IncomingRtpRoute {
+                        ssrc,
+                        mid: incoming.mid,
+                        rid: incoming.rid,
+                        upstream_slot,
+                        track_id,
+                        fanout: self.upstream.track_fanout(track_id),
+                    };
+                    self.upstream.cache_route(route);
+                    Some((route, incoming))
+                })
         };
         let Some((route, incoming)) = incoming else {
             return;
@@ -1352,7 +1404,7 @@ impl Participant {
             route.mid,
             route.rid.as_ref(),
             incoming.packet,
-            incoming.sender_info,
+            None,
         );
         if !processed.valid_route {
             self.upstream.remove_route(route.ssrc);
@@ -1369,12 +1421,20 @@ impl Participant {
         }
     }
 
+    fn handle_sender_report(&mut self, report: pulsebeam_rtc::SenderReport) {
+        let arrival = report.arrival.into();
+        if let Some((mid, report)) = self.transport.sender_report(report) {
+            self.upstream.sender_report(mid, report, arrival);
+        }
+    }
+
     fn disconnect(&mut self, reason: DisconnectReason) {
         if self.disconnect_reason.is_some() {
             return;
         }
         plog_info!(self.log_ctx(), %reason, "Participant core disconnecting");
         self.disconnect_reason = Some(reason);
+        self.stream_writer.discard();
         self.transport.disconnect();
     }
 }
@@ -1406,6 +1466,78 @@ mod rtc_clock_tests {
             );
             assert!(whip_media_label(ConnectionProfile::Native, kind).is_none());
         }
+    }
+
+    #[test]
+    fn authenticated_route_uses_processed_input_across_budget_continuations() {
+        pulsebeam_runtime::testing::run_local(
+            pulsebeam_runtime::testing::test_host_ip("192.168.251.10"),
+            async {
+                let now = Instant::now();
+                let remote = "127.0.0.1:5000".parse().unwrap();
+                let local = "127.0.0.1:6000".parse().unwrap();
+                let (rtc, resources, valid) =
+                    crate::control::application_only_test_connection_and_binding();
+                let received_at = net::ReceiveTime {
+                    monotonic: now,
+                    wall: std::time::SystemTime::UNIX_EPOCH,
+                };
+                assert_eq!(valid.get(4..8), Some([0x21, 0x12, 0xa4, 0x42].as_slice()));
+                let mut invalid = valid.clone();
+                invalid.get_mut(20..).unwrap().fill(0);
+                let mut participant = Participant::new(
+                    ParticipantConfig {
+                        manual_sub: false,
+                        room_id: entity::RoomId::from_external(
+                            &entity::RoomExternalId::new("route-proof").unwrap(),
+                        ),
+                        participant_id: entity::ParticipantId::new(),
+                        participant_external_id: entity::ParticipantExternalId::new("peer")
+                            .unwrap(),
+                        connection_id: entity::ConnectionId::new(),
+                        profile: ConnectionProfile::Native,
+                        authorization_expiry: None,
+                        rtc,
+                        resources,
+                    },
+                    ShardId::new(0),
+                    8,
+                    1,
+                );
+                let input = |payload: &[u8], source_shard| ParticipantInput::Network {
+                    batch: net::RecvPacketBatch {
+                        src: remote,
+                        dst: local,
+                        buf: payload.to_vec(),
+                        stride: payload.len(),
+                        len: payload.len(),
+                        offset: 0,
+                        transport: net::Transport::Udp(net::UdpMode::Scalar),
+                        tcp_flow: None,
+                        received_at,
+                    },
+                    source_shard,
+                };
+                for _ in 1..super::super::transport::MAX_PENDING_INGRESS {
+                    participant.input(input(&invalid, ShardId::new(1)));
+                }
+                participant.input(input(&valid, ShardId::new(2)));
+                let mut sink = crate::participant::event::test_utils::MockParticipantSink::new();
+                let mut next = participant.poll(now, &mut sink).unwrap();
+                assert!(sink.connected_calls.is_empty());
+                assert!(next <= now + pulsebeam_runtime::SHARD_TIMER_QUANTUM);
+                for _ in 0..4 {
+                    let deadline = participant.poll(next, &mut sink).unwrap();
+                    if !sink.connected_calls.is_empty() {
+                        break;
+                    }
+                    assert!(deadline > next);
+                    next = deadline;
+                }
+                assert_eq!(sink.connected_calls, vec![(remote, local, ShardId::new(2))]);
+                assert_eq!(sink.exit_count, 0);
+            },
+        );
     }
 
     #[test]
