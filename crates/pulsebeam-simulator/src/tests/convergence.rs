@@ -1,5 +1,6 @@
 use super::common::{LocalNodeSim, Participant, Room, Step};
 use pulsebeam_agent_native::agent_core::TopicMode;
+use pulsebeam_testdata::QualityVideoSource;
 use std::time::Duration;
 
 #[test]
@@ -66,10 +67,17 @@ fn crashed_publications_retire_from_every_owner_and_observer() {
                 publisher: "publisher",
                 min_frames: 1,
             },
-            Step::CheckHeardFrom {
-                description: "every intended listener decoded the publisher",
+            Step::CheckAudioQueuedFrom {
+                description: "every intended listener was queued publisher audio",
                 participant,
                 expected: &["publisher"],
+            },
+            Step::CheckNativeAudioDecoded {
+                description: "Actual native PCM and SDK decode progress, without per-block source attribution",
+                participant,
+                min_samples: 4_800,
+                min_receivers: 1,
+                max_silence: None,
             },
             Step::CheckDataReceived {
                 description: "every intended latest recipient received the payload",
@@ -98,10 +106,14 @@ fn crashed_publications_retire_from_every_owner_and_observer() {
                 participant,
                 publisher: "publisher",
             },
-            Step::CheckHeardFrom {
+            Step::CheckAudioQueuedFrom {
                 description: "intentional bystanders heard no audio",
                 participant,
                 expected: &[],
+            },
+            Step::CheckNativeAudioSilent {
+                description: "No native ingress or nontrivial PCM for an excluded listener",
+                participant,
             },
             Step::CheckDataNotReceived {
                 description: "intentional bystanders received no latest payload",
@@ -130,7 +142,10 @@ fn crashed_publications_retire_from_every_owner_and_observer() {
     LocalNodeSim::new()
         .with_room(
             Room::new("retirement")
-                .with_participant(Participant::single_publisher("publisher").speaking_at(-20))
+                .with_participant(
+                    Participant::quality_publisher("publisher", QualityVideoSource::Zero)
+                        .speaking_at(-20),
+                )
                 .with_participant(Participant::subscriber("viewer1").hearing(1))
                 .with_participant(Participant::subscriber("viewer2").hearing(1))
                 .with_participant(Participant::manual_subscriber("bystander", 1)),

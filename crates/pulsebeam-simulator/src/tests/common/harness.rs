@@ -1,6 +1,7 @@
+use super::media::FixtureEncoding;
 use crate::tests::common::client::{
-    AudioReceiveLog, ClientObservation, MAX_CONCEALABLE_GAP, QualityVideoReference, RequestedVideo,
-    SimClientBuilder, VideoReceiveLog, VideoReceiveStats,
+    AudioReceiveLog, ClientObservation, NativeTrafficStatistics, QualityVideoReference,
+    RequestedVideo, SimClientBuilder, VideoReceiveLog, VideoReceiveStats,
 };
 use crate::tests::common::decoder::{
     MAX_AUDIO_REFERENCE_PEAK, MAX_REFERENCE_MEAN_ABSOLUTE, MAX_REFERENCE_PEAK,
@@ -9,7 +10,7 @@ use crate::tests::common::media::{KeyframeRecoveryProbe, VbrProfile};
 use crate::tests::common::{
     DEFAULT_SIM_SHARDS, reserve_subnet, start_observed_sfu_node, subnet_ip, subnet_ip_v6,
 };
-use pulsebeam_agent_native::SimulcastLayer;
+use anyhow::Context;
 use pulsebeam_agent_native::agent_core::{
     TopicMode, TopicNotification, TopicPublisher, TopicRegistrations, TopicSubscriber,
 };
@@ -67,6 +68,9 @@ pub struct Participant {
     /// Publish a synthetic temporal Dependency Descriptor with this many layers,
     /// so the SFU can exercise decode-target shedding.
     pub temporal_dd: Option<u8>,
+    pub video_receive_mode: pulsebeam_agent_native::ReceiveMode,
+    pub audio_receive_mode: pulsebeam_agent_native::ReceiveMode,
+    pub audio_input: pulsebeam_agent_native::AudioInput,
     /// Make the published payload opaque (simulating SFrame/E2EE), forcing the SFU
     /// to forward on the Dependency Descriptor alone.
     pub opaque_payload: bool,
@@ -90,6 +94,9 @@ impl Participant {
             name,
             role: Role::Publisher,
             rids: rids.to_vec(),
+            video_receive_mode: pulsebeam_agent_native::ReceiveMode::Encoded,
+            audio_receive_mode: pulsebeam_agent_native::ReceiveMode::Decoded,
+            audio_input: pulsebeam_agent_native::AudioInput::Pcm,
             quality_video: None,
             slots: 0,
             starts_disconnected: false,
@@ -112,6 +119,9 @@ impl Participant {
         Self {
             name,
             role: Role::Publisher,
+            video_receive_mode: pulsebeam_agent_native::ReceiveMode::Encoded,
+            audio_receive_mode: pulsebeam_agent_native::ReceiveMode::Decoded,
+            audio_input: pulsebeam_agent_native::AudioInput::Pcm,
             rids: Vec::new(),
             quality_video: None,
             slots: 0,
@@ -135,6 +145,14 @@ impl Participant {
         Self::quality_publisher_at(name, source, QualityVideoLayer::P180)
     }
 
+    /// Genuine distinct-content q/h/f inputs at their actual corpus dimensions.
+    pub fn quality_ladder_publisher(name: &'static str, source: QualityVideoSource) -> Self {
+        Self {
+            quality_video: Some((source, QualityVideoLayer::P720)),
+            ..Self::publisher(name, &["q", "h", "f"])
+        }
+    }
+
     pub fn quality_publisher_at(
         name: &'static str,
         source: QualityVideoSource,
@@ -150,6 +168,9 @@ impl Participant {
         Self {
             name,
             role: Role::Subscriber,
+            video_receive_mode: pulsebeam_agent_native::ReceiveMode::Encoded,
+            audio_receive_mode: pulsebeam_agent_native::ReceiveMode::Decoded,
+            audio_input: pulsebeam_agent_native::AudioInput::Pcm,
             rids: Vec::new(),
             quality_video: None,
             slots: 1,
@@ -174,6 +195,9 @@ impl Participant {
         Self {
             name,
             role: Role::Subscriber,
+            video_receive_mode: pulsebeam_agent_native::ReceiveMode::Encoded,
+            audio_receive_mode: pulsebeam_agent_native::ReceiveMode::Decoded,
+            audio_input: pulsebeam_agent_native::AudioInput::Pcm,
             rids: Vec::new(),
             quality_video: None,
             slots,
@@ -206,6 +230,9 @@ impl Participant {
         Self {
             name,
             role: Role::DataOnly,
+            video_receive_mode: pulsebeam_agent_native::ReceiveMode::Encoded,
+            audio_receive_mode: pulsebeam_agent_native::ReceiveMode::Decoded,
+            audio_input: pulsebeam_agent_native::AudioInput::Pcm,
             rids: Vec::new(),
             quality_video: None,
             slots: 0,
@@ -300,6 +327,21 @@ impl Participant {
 
     /// Publish a synthetic L1T{layers} temporal Dependency Descriptor so the SFU
     /// can shed decode targets.
+    pub fn with_native_pcm_audio(mut self) -> Self {
+        self.audio_input = pulsebeam_agent_native::AudioInput::Pcm;
+        self
+    }
+
+    pub fn with_native_decoded_audio(mut self) -> Self {
+        self.audio_receive_mode = pulsebeam_agent_native::ReceiveMode::Decoded;
+        self
+    }
+
+    pub fn with_native_decoded_video(mut self) -> Self {
+        self.video_receive_mode = pulsebeam_agent_native::ReceiveMode::Decoded;
+        self
+    }
+
     pub fn with_temporal_dd(mut self, layers: u8) -> Self {
         self.temporal_dd = Some(layers);
         self
@@ -326,7 +368,13 @@ impl Participant {
         self
     }
 
+    pub fn with_encoded_audio(mut self) -> Self {
+        self.audio_receive_mode = pulsebeam_agent_native::ReceiveMode::Encoded;
+        self
+    }
+
     pub fn with_corrupt_audio_payload(mut self) -> Self {
+        self.audio_receive_mode = pulsebeam_agent_native::ReceiveMode::Encoded;
         self.corrupt_audio_payload = true;
         self
     }
@@ -366,6 +414,7 @@ pub struct VideoQuality {
     pub max_decoder_error_keyframes: u64,
     pub max_missing_parameter_set_keyframes: u64,
     pub max_non_contiguous: u64,
+    pub native_temporal_indices: &'static [i32],
 }
 
 impl VideoQuality {
@@ -378,7 +427,13 @@ impl VideoQuality {
             max_decoder_error_keyframes: 0,
             max_missing_parameter_set_keyframes: 0,
             max_non_contiguous: 0,
+            native_temporal_indices: &[],
         }
+    }
+
+    pub fn require_native_temporal_indices(mut self, indices: &'static [i32]) -> Self {
+        self.native_temporal_indices = indices;
+        self
     }
 
     pub fn min_keyframes(mut self, n: u64) -> Self {
@@ -556,8 +611,8 @@ pub enum Step {
     // ── Data channels ─────────────────────────────────────────────────────
     /// A named speaker currently holds one of this subscriber's audio slots.
     ///
-    /// Unlike cumulative `CheckHeardFrom`, this checks the current native mapping. A pin does not
-    /// promise nobody else was ever heard; it promises this speaker still holds a receiver.
+    /// Requires both the current client catalog binding and the actual owned SFU assignment.
+    /// Neither cumulative queueing nor receiver-index order proves this current pin claim.
     CheckSpeakerHeld {
         description: &'static str,
         participant: &'static str,
@@ -602,6 +657,12 @@ pub enum Step {
     // ── Assertions ─────────────────────────────────────────────────────────
     /// Deep QoE check: frames are renderable, SPS/PPS present before keyframes,
     /// no backward timestamp jumps, bounded sequence gaps.
+    CheckNativeDecodedVideo {
+        description: &'static str,
+        participant: &'static str,
+        dimensions: (u32, u32),
+        min_fresh_frames: u64,
+    },
     CheckVideoQuality {
         description: &'static str,
         participant: &'static str,
@@ -745,59 +806,53 @@ pub enum Step {
         participant: &'static str,
         min_bytes: u64,
     },
-    /// Exactly these speakers were heard, and no others.
-    ///
-    /// The claim the SFU's speaker selection actually makes. A byte count says audio arrived; only
-    /// naming the speakers says the right ones did, which is the difference between a selector
-    /// that works and one that forwards whoever happens to be first.
-    CheckHeardFrom {
+    /// Sustained successful server queueing, not PCM publication attribution.
+    /// Negative expectations reject any queueing, including short transients.
+    CheckAudioQueuedFrom {
         description: &'static str,
         participant: &'static str,
         expected: &'static [&'static str],
     },
-    CheckAudioPacketsFrom {
+    CheckNativeAudioDecoded {
         description: &'static str,
         participant: &'static str,
-        expected: &'static [&'static str],
-    },
-    CheckAudioDecodedFrom {
-        description: &'static str,
-        participant: &'static str,
-        publisher: &'static str,
         min_samples: u64,
+        min_receivers: usize,
+        max_silence: Option<Duration>,
     },
-    CheckAudioNotHeardFrom {
+    WaitForNativeAudioRecovery {
         description: &'static str,
         participant: &'static str,
-        publisher: &'static str,
+        min_samples: u64,
+        timeout: Duration,
     },
-    /// A listener is never handed more audio streams than it has slots, and none of them is torn.
-    ///
-    /// The browser-facing invariant, and the reason the egress SSRC belongs to the slot rather
-    /// than the speaker. libwebrtc answers an SSRC it did not see in the SDP by building a whole
-    /// new `AudioReceiveStream` - a cold NetEq, four kept per m-line and the oldest destroyed - so
-    /// minting one per speaker churns jitter buffers several times a minute to express something a
-    /// browser cannot read anyway: it has one `MediaStreamTrack` per transceiver and routes by
-    /// mid. Worse, when the SDP *did* declare an SSRC, the receiver binds its sink to that one
-    /// specifically and media on any other is decoded and thrown away.
-    ///
-    /// So slots keep their stream whoever is in it, and who that is travels in the assignment.
-    /// What the SFU owes in exchange is a stream that does not tear across the changes: a hole is
-    /// loss to the receiver, however deliberate it was.
-    CheckAudioStreams {
+    CheckNativeAudioSilent {
         description: &'static str,
         participant: &'static str,
-        /// How many distinct speakers must have been heard, so the plan cannot pass on silence.
-        min_speakers: usize,
-        /// How many RTP streams the listener may be sent - its slot count, never more.
+    },
+    /// Native encoded packets and independent decoder results, without publisher tags.
+    CheckEncodedAudio {
+        description: &'static str,
+        participant: &'static str,
+        corrupt: bool,
+    },
+    CheckAudioSlotStreams {
+        description: &'static str,
+        participant: &'static str,
+        min_sources: usize,
         max_streams: usize,
     },
-    /// Exact speakers assigned in the current native mapping, independently of received media.
-    /// Receiver indices identify SDP sections, not loudness ranks.
-    CheckAudioMapping {
+    CheckAudioCatalogFrom {
         description: &'static str,
         participant: &'static str,
         expected: &'static [&'static str],
+    },
+    /// Actual active-source selector ordering. The wire does not carry speaker rank.
+    WaitForAudioSelectionRank {
+        description: &'static str,
+        participant: &'static str,
+        expected: &'static [(&'static str, u32)],
+        timeout: Duration,
     },
     /// At least this many media frames actually crossed a shard boundary.
     ///
@@ -1126,13 +1181,9 @@ struct ParticipantShared {
     audio_rx: Arc<Mutex<AudioReceiveLog>>,
     quality_references: Arc<Mutex<BTreeMap<String, &'static QualityVideoReference>>>,
     h264_publishers: Arc<Mutex<BTreeSet<String>>>,
-    tx_bytes: Mutex<u64>,
-    rx_bytes: Mutex<u64>,
+    statistics: Mutex<Option<NativeTrafficStatistics>>,
     connected: Mutex<bool>,
-    /// Cumulative keyframe (PLI) requests this participant's publisher received.
-    keyframe_requests: Mutex<u64>,
     keyframe_recovery: Arc<Mutex<KeyframeRecoveryProbe>>,
-    unroutable_media_dropped: Mutex<u64>,
     media_kinds: Mutex<HashMap<String, (bool, bool)>>,
     /// Every participant id this name has had, oldest first. All but the last are dead identities.
     incarnations: Mutex<Vec<String>>,
@@ -1161,12 +1212,9 @@ impl ParticipantShared {
             audio_rx: Arc::new(Mutex::new(AudioReceiveLog::default())),
             quality_references,
             h264_publishers,
-            tx_bytes: Mutex::new(0),
-            rx_bytes: Mutex::new(0),
+            statistics: Mutex::new(None),
             connected: Mutex::new(false),
-            keyframe_requests: Mutex::new(0),
             keyframe_recovery: Arc::default(),
-            unroutable_media_dropped: Mutex::new(0),
             media_kinds: Mutex::new(HashMap::new()),
             incarnations: Mutex::new(Vec::new()),
             participant_id: Mutex::new(None),
@@ -1182,16 +1230,17 @@ struct ParticipantHandle {
     shared: Arc<ParticipantShared>,
     cmd_tx: mpsc::Sender<ParticipantCmd>,
     room_name: &'static str,
-    /// TX bytes at the start of the most recent Step::Run (for interval checks).
-    interval_tx_baseline: u64,
-    /// RX bytes at the start of the most recent Step::Run (for interval checks).
-    interval_rx_baseline: u64,
+    /// Actual SDK sample preceding this measurement, including its epoch/time.
+    interval_statistics: Option<NativeTrafficStatistics>,
     /// When this participant last asked for a stream. Time-to-first-frame is measured from here,
     /// not from the start of the plan: the settle steps before a subscription are not time the
     /// viewer spent waiting.
     subscribed_at: Option<Instant>,
     interval_video_baseline: VideoReceiveStats,
     interval_decoded_video_baseline: BTreeMap<String, u64>,
+    native_video_baseline: super::native_video::NativeDecodedVideoLog,
+    native_video_stats_timestamp: Option<i64>,
+    native_video_decoder_frames: Option<(u64, String, u64)>,
     /// Ground truth, from the plan rather than from anything the SFU said.
     ///
     /// The room invariant is checked against these: what this participant actually publishes, and
@@ -1217,13 +1266,57 @@ impl ParticipantHandle {
     }
 
     fn tx_bytes(&self) -> u64 {
-        *self.shared.tx_bytes.lock().unwrap()
+        self.shared
+            .statistics
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|stats| stats.bytes_sent)
+            .expect("traffic assertion requires actual native bytesSent")
     }
     fn rx_bytes(&self) -> u64 {
-        *self.shared.rx_bytes.lock().unwrap()
+        self.shared
+            .statistics
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|stats| stats.bytes_received)
+            .expect("traffic assertion requires actual native bytesReceived")
     }
     fn keyframe_requests(&self) -> u64 {
-        *self.shared.keyframe_requests.lock().unwrap()
+        self.shared
+            .statistics
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|stats| stats.keyframe_requests)
+            .expect("PLI assertion requires actual outbound-video native pliCount")
+    }
+    fn interval_delta(
+        &self,
+        field: fn(&NativeTrafficStatistics) -> Option<u64>,
+    ) -> Result<u64, String> {
+        let guard = self.shared.statistics.lock().unwrap();
+        let current = guard
+            .as_ref()
+            .ok_or("native interval ending sample unavailable")?;
+        current.interval_delta(self.interval_statistics.as_ref(), field)
+    }
+    fn interval_baseline(&self, field: fn(&NativeTrafficStatistics) -> Option<u64>) -> u64 {
+        let guard = self.shared.statistics.lock().unwrap();
+        let current = guard
+            .as_ref()
+            .expect("native interval ending sample unavailable");
+        let delta = current
+            .interval_delta(self.interval_statistics.as_ref(), field)
+            .expect("traffic assertion requires a valid native interval");
+        field(current).expect("validated native field") - delta
+    }
+    fn interval_tx_baseline(&self) -> u64 {
+        self.interval_baseline(|stats| stats.bytes_sent)
+    }
+    fn interval_rx_baseline(&self) -> u64 {
+        self.interval_baseline(|stats| stats.bytes_received)
     }
 
     /// What kinds of media this client believes `publisher_id` is sending.
@@ -1236,9 +1329,40 @@ impl ParticipantHandle {
             .copied()
     }
 
-    /// Media this participant received and could not hand to anyone. Should always be zero.
-    fn unroutable_media_dropped(&self) -> u64 {
-        *self.shared.unroutable_media_dropped.lock().unwrap()
+    fn check_native_media_routes(&self) {
+        let guard = self.shared.observation.lock().unwrap();
+        let observation = guard
+            .as_ref()
+            .expect("native media routing needs a graph observation");
+        let generation = observation
+            .snapshot
+            .generation
+            .map(pulsebeam_agent_native::agent_core::Generation::get);
+        let video = self.video_rx();
+        assert_eq!(
+            video.native_queue_drops, 0,
+            "native video observer lost frames"
+        );
+        for timeline in video.by_receiver.values() {
+            if let Some(track) = &timeline.track
+                && Some(track.generation) == generation
+            {
+                assert!(
+                    observation.video_receivers.contains(&track.media_index),
+                    "observed video belongs to an unadvertised native slot"
+                );
+            }
+        }
+        for track in self.audio_rx().tracks.values() {
+            if Some(track.generation) == generation {
+                assert!(
+                    observation.audio_receivers.contains(&track.media_index),
+                    "observed audio belongs to an unadvertised native slot"
+                );
+            }
+        }
+        // This checks real callback ownership and observer loss, not an
+        // unavailable SDK-internal packet-demux discard counter.
     }
     fn connected(&self) -> bool {
         *self.shared.connected.lock().unwrap()
@@ -1268,8 +1392,13 @@ impl ParticipantHandle {
     }
 
     fn snapshot_interval(&mut self) {
-        self.interval_tx_baseline = self.tx_bytes();
-        self.interval_rx_baseline = self.rx_bytes();
+        self.interval_statistics = self.shared.statistics.lock().unwrap().clone();
+        self.shared
+            .audio_rx
+            .lock()
+            .unwrap()
+            .native_pcm
+            .begin_window();
         let video = self.shared.video_rx.lock().unwrap();
         self.interval_video_baseline = video.stats();
         self.interval_decoded_video_baseline = video
@@ -1322,6 +1451,9 @@ async fn run_participant(
         }
         .with_quality_references(shared.quality_references.clone())
         .with_h264_publishers(shared.h264_publishers.clone())
+        .with_video_receive_mode(config.video_receive_mode)
+        .with_audio_receive_mode(config.audio_receive_mode)
+        .with_audio_input(config.audio_input)
         .with_audio_rx(shared.audio_rx.clone())
         .with_video_rx(shared.video_rx.clone())
         .with_keyframe_recovery_probe(shared.keyframe_recovery.clone())
@@ -1336,19 +1468,21 @@ async fn run_participant(
         }
         match config.role {
             Role::Publisher | Role::OwnedPublisher => {
-                if matches!(config.role, Role::OwnedPublisher) {
-                    builder = builder.publish_owned_video("video");
-                } else if let Some((source, layer)) = config.quality_video {
+                let layers = (!config.rids.is_empty()).then(|| {
+                    config
+                        .rids
+                        .iter()
+                        .map(|rid| FixtureEncoding::new(*rid))
+                        .collect()
+                });
+                builder = if matches!(config.role, Role::OwnedPublisher) {
+                    builder.publish_owned_video("video")
+                } else {
+                    builder.publish_video(layers)
+                };
+                if let Some((source, layer)) = config.quality_video {
                     builder = builder.publish_quality_video(source, layer);
                 } else {
-                    let layers = (!config.rids.is_empty()).then(|| {
-                        config
-                            .rids
-                            .iter()
-                            .map(|rid| SimulcastLayer::new(rid))
-                            .collect()
-                    });
-                    builder = builder.publish_video(layers);
                     if let Some(profile) = config.vbr {
                         builder = builder.with_vbr(profile);
                     }
@@ -1472,19 +1606,13 @@ async fn run_participant(
                     }
                     *shared.discovered_tracks.lock().unwrap() = client.ctx.discovered_tracks.clone();
                     *shared.media_kinds.lock().unwrap() = client.ctx.media_kinds.clone();
-                    let stats = client.ctx.statistics();
-                    *shared.tx_bytes.lock().unwrap() = stats.bytes_sent;
-                    *shared.rx_bytes.lock().unwrap() = stats.bytes_received;
+                    *shared.statistics.lock().unwrap() = client.ctx.statistics()?;
                     *shared.connected.lock().unwrap() = client.ctx.connected();
-                    *shared.keyframe_requests.lock().unwrap() = stats.keyframe_requests;
-                    *shared.unroutable_media_dropped.lock().unwrap() = stats.unroutable_media_dropped;
                 }
             }
         };
 
-        let stats = client.ctx.statistics();
-        *shared.tx_bytes.lock().unwrap() = stats.bytes_sent;
-        *shared.rx_bytes.lock().unwrap() = stats.bytes_received;
+        *shared.statistics.lock().unwrap() = client.ctx.statistics()?;
         *shared.connected.lock().unwrap() = false;
         match command {
             None | Some(ParticipantCmd::Done) => {
@@ -1542,6 +1670,7 @@ fn step_name(step: &Step) -> &'static str {
         Step::DeclarePublishTopic { .. } => "DeclarePublishTopic",
         Step::DeclareSubscribeTopic { .. } => "DeclareSubscribeTopic",
         Step::PublishData { .. } => "PublishData",
+        Step::CheckNativeDecodedVideo { .. } => "CheckNativeDecodedVideo",
         Step::CheckVideoQuality { .. } => "CheckVideoQuality",
         Step::CheckVideoQualityInterval { .. } => "CheckVideoQualityInterval",
         Step::CheckVideoNotReceivedFrom { .. } => "CheckVideoNotReceivedFrom",
@@ -1563,12 +1692,14 @@ fn step_name(step: &Step) -> &'static str {
         Step::CheckConnected { .. } => "CheckConnected",
         Step::CheckNotConnected { .. } => "CheckNotConnected",
         Step::CheckRxBytes { .. } => "CheckRxBytes",
-        Step::CheckHeardFrom { .. } => "CheckHeardFrom",
-        Step::CheckAudioPacketsFrom { .. } => "CheckAudioPacketsFrom",
-        Step::CheckAudioDecodedFrom { .. } => "CheckAudioDecodedFrom",
-        Step::CheckAudioNotHeardFrom { .. } => "CheckAudioNotHeardFrom",
-        Step::CheckAudioMapping { .. } => "CheckAudioMapping",
-        Step::CheckAudioStreams { .. } => "CheckAudioStreams",
+        Step::CheckAudioQueuedFrom { .. } => "CheckAudioQueuedFrom",
+        Step::CheckNativeAudioDecoded { .. } => "CheckNativeAudioDecoded",
+        Step::WaitForNativeAudioRecovery { .. } => "WaitForNativeAudioRecovery",
+        Step::CheckNativeAudioSilent { .. } => "CheckNativeAudioSilent",
+        Step::CheckEncodedAudio { .. } => "CheckEncodedAudio",
+        Step::CheckAudioCatalogFrom { .. } => "CheckAudioCatalogFrom",
+        Step::WaitForAudioSelectionRank { .. } => "WaitForAudioSelectionRank",
+        Step::CheckAudioSlotStreams { .. } => "CheckAudioSlotStreams",
         Step::CheckCrossShardMedia { .. } => "CheckCrossShardMedia",
         Step::CheckNoCrossShardMedia { .. } => "CheckNoCrossShardMedia",
         Step::CheckTxBytes { .. } => "CheckTxBytes",
@@ -2426,6 +2557,77 @@ async fn execute_plan(
                     ));
             }
 
+            Step::CheckNativeDecodedVideo {
+                description,
+                participant,
+                dimensions,
+                min_fresh_frames,
+            } => {
+                tracing::info!("[step {n}/{total}: {kind}] \"{description}\" ({participant})");
+                let handle = get_handle(handles, participant, description)?;
+                let generation = handle
+                    .shared
+                    .observation
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .and_then(|observation| observation.snapshot.generation)
+                    .context("native decoded proof requires a live generation")?
+                    .get();
+                let mut log = handle.shared.video_rx.lock().unwrap();
+                let track = log
+                    .native_decoded
+                    .require(
+                        &handle.native_video_baseline,
+                        generation,
+                        *dimensions,
+                        *min_fresh_frames,
+                        Instant::now(),
+                    )
+                    .with_context(|| format!("{description}: {:?}", log.native_decoded))?;
+                let statistics = handle.shared.statistics.lock().unwrap();
+                let stats = statistics
+                    .as_ref()
+                    .context("native decoder statistics unavailable")?;
+                anyhow::ensure!(
+                    stats.generation == generation,
+                    "native decoder statistics are from an old generation"
+                );
+                anyhow::ensure!(
+                    handle
+                        .native_video_stats_timestamp
+                        .is_none_or(|previous| stats.timestamp_us > previous),
+                    "native decoder report did not advance"
+                );
+                let decoded = super::native_video::require_decoder_report(
+                    &stats.report_json,
+                    &track.mid,
+                    *dimensions,
+                    *min_fresh_frames,
+                )?;
+                tracing::info!(
+                    ?track,
+                    ?dimensions,
+                    min_fresh_frames,
+                    "fresh native decoded rung verified; native decoder-error counter is unavailable"
+                );
+                if let Some((previous_generation, previous_mid, previous_frames)) =
+                    &handle.native_video_decoder_frames
+                    && *previous_generation == generation
+                    && previous_mid == &track.mid
+                {
+                    let fresh = decoded
+                        .checked_sub(*previous_frames)
+                        .context("native SDK decoder count reset")?;
+                    // RTCStats is sampled asynchronously from pixel delivery.
+                    // Require actual SDK progress, not an identical interval count.
+                    anyhow::ensure!(fresh > 0, "native SDK decoder count did not advance");
+                }
+                handle.native_video_decoder_frames = Some((generation, track.mid.clone(), decoded));
+                handle.native_video_stats_timestamp = Some(stats.timestamp_us);
+                handle.native_video_baseline = log.native_decoded.checkpoint();
+            }
+
             Step::CheckVideoQuality {
                 description,
                 participant,
@@ -2434,7 +2636,53 @@ async fn execute_plan(
                 tracing::info!("[step {n}/{total}: {kind}] \"{description}\" ({participant})");
                 let handle = get_handle(handles, participant, description)?;
                 let log = handle.video_rx();
+                let native_generation = handle
+                    .shared
+                    .observation
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .and_then(|observation| observation.snapshot.generation);
+                if log.frames < quality.min_frames
+                    || log
+                        .decoder_errors
+                        .saturating_sub(log.missing_parameter_set_keyframes)
+                        > quality.max_decoder_errors
+                    || log.ts_regression_count > 0
+                    || log.non_contiguous > quality.max_non_contiguous
+                {
+                    for (name, peer) in handles.iter() {
+                        let statistics = peer.shared.statistics.lock().unwrap();
+                        match statistics.as_ref() {
+                            Some(stats) => tracing::error!(
+                                participant = name,
+                                generation = stats.generation,
+                                timestamp_us = stats.timestamp_us,
+                                report = %String::from_utf8_lossy(&stats.report_json),
+                                "native SDK statistics at video delivery failure"
+                            ),
+                            None => tracing::error!(
+                                participant = name,
+                                "native SDK statistics unavailable at video delivery failure"
+                            ),
+                        }
+                    }
+                    tracing::error!(native_queue_drops = log.native_queue_drops, receivers = ?log.by_receiver, "native receiver timelines at video delivery failure");
+                }
                 assert_video_quality(n, total, description, participant, quality, &log);
+                if !quality.native_temporal_indices.is_empty() {
+                    let generation = native_generation
+                        .expect("native temporal witness requires a live graph")
+                        .get();
+                    log.require_native_temporal_indices(
+                        generation,
+                        quality.min_frames,
+                        quality.native_temporal_indices,
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!("step {n}/{total} {kind}: {description} ({participant}): {error}")
+                    });
+                }
             }
 
             Step::CheckVideoQualityInterval {
@@ -2444,6 +2692,10 @@ async fn execute_plan(
             } => {
                 tracing::info!("[step {n}/{total}: {kind}] \"{description}\" ({participant})");
                 let handle = get_handle(handles, participant, description)?;
+                assert!(
+                    !handle.video_rx().native_decoded.has_observations(),
+                    "encoded independent-decoder oracle cannot qualify native playout; use CheckNativeDecodedVideo"
+                );
                 let stats = handle.video_stats_since_interval();
                 assert!(
                     stats.frames >= quality.min_frames,
@@ -2780,10 +3032,15 @@ async fn execute_plan(
                         )
                     })?;
                 let handle = get_handle(handles, participant, description)?;
-                let mapped = handle.audio_rx().mapped();
+                let catalog = current_audio_catalog(handle)?;
+                let subscriber = handle
+                    .participant_id()
+                    .context("audio subscriber identity unavailable")?;
+                let owned = observe_video(observer, &subscriber).await?;
                 assert!(
-                    mapped.values().any(|publisher| publisher == &want),
-                    "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  participant:  {participant}\n  expected:     {speaker} to hold a slot\n  signalled:    {mapped:?}"
+                    catalog.values().any(|origin| origin == &want)
+                        && owned.audio.iter().any(|slot| slot.origin.as_str() == want),
+                    "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  participant:  {participant}\n  expected:     {speaker} to hold a slot\n  signalled:    {catalog:?}"
                 );
             }
 
@@ -2793,11 +3050,7 @@ async fn execute_plan(
             } => {
                 tracing::info!("[step {n}/{total}: {kind}] \"{description}\" ({participant})");
                 let handle = get_handle(handles, participant, description)?;
-                let dropped = handle.unroutable_media_dropped();
-                assert_eq!(
-                    dropped, 0,
-                    "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  participant:  {participant}\n  expected:     no media discarded for want of a slot to put it in\n  actual:       {dropped} packets\n  note:         these arrived, were decrypted and demuxed, and then went\n                nowhere - invisible at both ends"
-                );
+                handle.check_native_media_routes();
             }
 
             Step::CheckConnected {
@@ -2967,213 +3220,266 @@ async fn execute_plan(
                 );
             }
 
-            Step::CheckHeardFrom {
+            Step::CheckAudioQueuedFrom {
                 description,
                 participant,
                 expected,
             } => {
-                tracing::info!(
-                    "[step {n}/{total}: {kind}] \"{description}\" ({participant}, expected {expected:?})"
-                );
-                let handle = get_handle(handles, participant, description)?;
-                let audio = handle.audio_rx();
-                let heard = audio.heard_from();
-                let want: BTreeSet<String> =
-                    expected.iter().map(|name| (*name).to_owned()).collect();
-                // Names in the plan are harness names; the wire carries participant ids, so
-                // compare on the ids those names resolve to.
-                let want: BTreeSet<String> = want
-                    .iter()
-                    .filter_map(|name| {
-                        handles
-                            .get(name.as_str())
-                            .and_then(|h| h.shared.participant_id.lock().unwrap().clone())
-                    })
-                    .collect();
-                assert_eq!(
-                    heard, want,
-                    "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  participant:  {participant}\n  expected:     {expected:?}\n  heard from:   {heard:?}\n  per speaker:  {:?}",
-                    audio.by_publisher
-                );
-            }
-
-            Step::CheckAudioPacketsFrom {
-                description,
-                participant,
-                expected,
-            } => {
-                tracing::info!(
-                    "[step {n}/{total}: {kind}] \"{description}\" ({participant}, expected {expected:?})"
-                );
-                let handle = get_handle(handles, participant, description)?;
-                let audio = handle.audio_rx();
-                let heard = audio.packet_heard_from();
-                let want: BTreeSet<String> = expected
-                    .iter()
-                    .filter_map(|name| {
-                        handles
-                            .get(*name)
-                            .and_then(|h| h.shared.participant_id.lock().unwrap().clone())
-                    })
-                    .collect();
-                assert_eq!(
-                    heard, want,
-                    "\\nassertion failed\\n  plan step:   {n}/{total} {kind}\\n  description: \"{description}\"\\n  participant:  {participant}\\n  expected packet speakers: {expected:?}\\n  heard packet speakers:   {heard:?}\\n  per speaker:  {:?}",
-                    audio.by_publisher
-                );
-            }
-
-            Step::CheckAudioDecodedFrom {
-                description,
-                participant,
-                publisher,
-                min_samples,
-            } => {
-                tracing::info!(
-                    "[step {n}/{total}: {kind}] \"{description}\" ({participant} <- {publisher})"
-                );
-                let publisher_id = handles
-                    .get(publisher)
-                    .ok_or_else(|| anyhow::anyhow!("step \"{description}\": unknown publisher {publisher}"))?
+                let subscriber = handles
+                    .get(participant)
+                    .context("unknown audio subscriber")?
                     .participant_id()
-                    .ok_or_else(|| anyhow::anyhow!("step \"{description}\": publisher {publisher} has no runtime participant id"))?;
-                let handle = get_handle(handles, participant, description)?;
-                let decoded = handle.audio_rx().decoded_from(&publisher_id);
-                let Some(decoded) = decoded else {
-                    panic!(
-                        "step {n}/{total} {kind}: {description} ({participant} <- {publisher_id}) observed packets but no independently decoded Opus"
-                    );
+                    .context("audio subscriber has no runtime identity")?;
+                let queued = pulsebeam::sim_metrics::queued_audio_for(subscriber.parse()?);
+                let actual = if expected.is_empty() {
+                    queued
+                        .keys()
+                        .map(|origin| origin.participant.as_str())
+                        .collect()
+                } else {
+                    sustained_audio_sources(&subscriber)?
                 };
-                assert!(
-                    decoded.decoded_samples >= *min_samples,
-                    "step {n}/{total} {kind}: {description} ({participant} <- {publisher_id}) decoded {} samples, expected at least {min_samples}",
-                    decoded.decoded_samples
-                );
-                assert_eq!(
-                    decoded.decoder_errors, 0,
-                    "step {n}/{total} {kind}: {description} ({participant} <- {publisher_id}) observed {} Opus decoder errors",
-                    decoded.decoder_errors
-                );
-                assert_eq!(
-                    decoded.reference_mismatches, 0,
-                    "step {n}/{total} {kind}: {description} ({participant} <- {publisher_id}) observed {} Opus reference mismatches",
-                    decoded.reference_mismatches
-                );
-                if decoded.reference_error.samples > 0 {
-                    assert!(
-                        decoded
-                            .reference_error
-                            .mean_absolute()
-                            .is_some_and(|mean| mean <= MAX_REFERENCE_MEAN_ABSOLUTE),
-                        "step {n}/{total} {kind}: {description} ({participant} <- {publisher_id}) Opus reference mean exceeds {MAX_REFERENCE_MEAN_ABSOLUTE}: {:?}",
-                        decoded.reference_error
-                    );
-                    assert!(
-                        decoded.reference_error.max <= MAX_AUDIO_REFERENCE_PEAK,
-                        "step {n}/{total} {kind}: {description} ({participant} <- {publisher_id}) Opus reference peak exceeds {MAX_AUDIO_REFERENCE_PEAK}: {:?}",
-                        decoded.reference_error
-                    );
-                }
-            }
-
-            Step::CheckAudioNotHeardFrom {
-                description,
-                participant,
-                publisher,
-            } => {
-                tracing::info!(
-                    "[step {n}/{total}: {kind}] \"{description}\" ({participant} <- {publisher})"
-                );
-                let publisher_id = handles
-                    .get(publisher)
-                    .ok_or_else(|| anyhow::anyhow!("step \"{description}\": unknown publisher {publisher}"))?
-                    .participant_id()
-                    .ok_or_else(|| anyhow::anyhow!("step \"{description}\": publisher {publisher} has no runtime participant id"))?;
-                let handle = get_handle(handles, participant, description)?;
-                let decoded = handle.audio_rx().decoded_from(&publisher_id);
-                let Some(decoded) = decoded else {
-                    panic!(
-                        "step {n}/{total} {kind}: {description} ({participant} <- {publisher_id}) has no decoder observation for invalid Opus"
-                    );
-                };
-                assert_eq!(
-                    decoded.decoded_samples, 0,
-                    "step {n}/{total} {kind}: {description} ({participant} <- {publisher_id}) counted {} invalid Opus samples as heard",
-                    decoded.decoded_samples
-                );
-                assert!(
-                    decoded.decoder_errors > 0,
-                    "step {n}/{total} {kind}: {description} ({participant} <- {publisher_id}) reported no decoder error for invalid Opus"
-                );
-            }
-
-            Step::CheckAudioStreams {
-                description,
-                participant,
-                min_speakers,
-                max_streams,
-            } => {
-                tracing::info!(
-                    "[step {n}/{total}: {kind}] \"{description}\" ({participant}, ≥{min_speakers} speakers, ≤{max_streams} streams)"
-                );
-                let handle = get_handle(handles, participant, description)?;
-                let audio = handle.audio_rx();
-                let heard = audio.heard_from();
-                assert!(
-                    heard.len() >= *min_speakers,
-                    "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  expected:     ≥ {min_speakers} distinct speakers heard\n  actual:       {}\n  per speaker:  {:?}\n  note:         fewer speakers than slots means no slot was ever stolen, so\n                the plan proved nothing",
-                    heard.len(),
-                    audio.by_publisher
-                );
-                assert!(
-                    audio.by_stream.len() <= *max_streams,
-                    "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  expected:     at most {max_streams} RTP streams, one per slot\n  actual:       {}\n  streams:      {:?}\n  note:         a stream per speaker costs a browser a fresh receive stream and\n                a cold jitter buffer every time a slot changes hands",
-                    audio.by_stream.len(),
-                    audio.by_stream.keys().collect::<Vec<_>>()
-                );
-                for (ssrc, stream) in &audio.by_stream {
-                    assert!(
-                        stream.max_seq_gap <= MAX_CONCEALABLE_GAP,
-                        "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  stream:       {ssrc}\n  expected:     at most {MAX_CONCEALABLE_GAP} packets missing\n  actual:       a gap of {} packets\n  note:         this plan configures no loss, so a hole in a slot's stream is the\n                SFU splicing two speakers onto it badly",
-                        stream.max_seq_gap
-                    );
-                }
-            }
-
-            Step::CheckAudioMapping {
-                description,
-                participant,
-                expected,
-            } => {
-                tracing::info!(
-                    "[step {n}/{total}: {kind}] \"{description}\" ({participant}, expected {expected:?})"
-                );
-                let handle = get_handle(handles, participant, description)?;
-                let mapped = handle.audio_rx().mapped();
-                let actual: std::collections::BTreeSet<_> = mapped.values().cloned().collect();
-                let want: std::collections::BTreeSet<String> = expected
+                let want: BTreeSet<_> = expected
                     .iter()
                     .map(|name| {
-                        get_handle(handles, name, description)?
-                            .shared
-                            .participant_id
-                            .lock()
-                            .unwrap()
-                            .clone()
-                            .ok_or_else(|| {
-                                anyhow::anyhow!("speaker {name} has no runtime participant id")
-                            })
+                        handles
+                            .get(name)
+                            .context("unknown expected audio publisher")?
+                            .participant_id()
+                            .context("audio publisher has no runtime identity")
                     })
                     .collect::<anyhow::Result<_>>()?;
-                assert_eq!(
-                    mapped.len(),
-                    expected.len(),
-                    "expected one receiver per speaker"
+                anyhow::ensure!(
+                    actual == want,
+                    "{description} ({participant}): server queued audio from {actual:?}, expected {want:?}; enqueues={queued:?}"
                 );
-                assert_eq!(
-                    actual, want,
-                    "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  participant:  {participant}\n  expected:     {expected:?}\n  signalled:    {mapped:?}"
+                tracing::info!(
+                    participant,
+                    ?queued,
+                    "actual server audio queueing; not native PCM attribution"
                 );
+            }
+
+            Step::CheckNativeAudioDecoded {
+                description,
+                participant,
+                min_samples,
+                min_receivers,
+                max_silence,
+            } => {
+                let handle = get_handle(handles, participant, description)?;
+                require_native_audio(handle, *min_samples, *min_receivers, *max_silence)?;
+            }
+
+            Step::WaitForNativeAudioRecovery {
+                description,
+                participant,
+                min_samples,
+                timeout,
+            } => {
+                let handle = get_handle(handles, participant, description)?;
+                let generation = audio_generation(handle)?;
+                let waiting = tokio::time::timeout(*timeout, async {
+                    while handle
+                        .audio_rx()
+                        .native_pcm
+                        .require(
+                            generation,
+                            *min_samples,
+                            1,
+                            Some(Duration::from_millis(300)),
+                            Instant::now(),
+                        )
+                        .is_err()
+                    {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                })
+                .await;
+                require_native_audio(handle, *min_samples, 1, Some(Duration::from_millis(300)))
+                    .with_context(|| format!("{description}: native PCM recovery proof"))?;
+                waiting.with_context(|| format!("{description}: native PCM recovery timed out"))?;
+            }
+
+            Step::CheckNativeAudioSilent {
+                description,
+                participant,
+            } => {
+                let handle = get_handle(handles, participant, description)?;
+                let generation = audio_generation(handle)?;
+                handle.audio_rx().native_pcm.require_silent(generation)?;
+                let statistics = handle.shared.statistics.lock().unwrap();
+                let stats = statistics
+                    .as_ref()
+                    .context("native silence requires actual native report")?;
+                anyhow::ensure!(
+                    stats.generation == generation,
+                    "native silence report belongs to an old generation"
+                );
+                super::native_audio::require_no_audio(&stats.report_json)?;
+            }
+
+            Step::CheckEncodedAudio {
+                description,
+                participant,
+                corrupt,
+            } => {
+                let handle = get_handle(handles, participant, description)?;
+                let generation = audio_generation(handle)?;
+                let audio = handle.audio_rx();
+                anyhow::ensure!(
+                    audio.encoded_observers > 0,
+                    "{description}: requires an attached encoded audio observer"
+                );
+                let streams: Vec<_> = audio
+                    .by_receiver
+                    .iter()
+                    .filter(|(key, _)| key.generation == generation)
+                    .map(|(_, stream)| stream)
+                    .collect();
+                anyhow::ensure!(
+                    !streams.is_empty() && streams.iter().any(|stream| stream.packets > 0),
+                    "{description}: no actual encoded Opus receiver packets"
+                );
+                anyhow::ensure!(
+                    streams
+                        .iter()
+                        .all(|stream| stream.packet_span() >= Duration::from_millis(300)),
+                    "{description}: encoded receiver observation is only a startup transient"
+                );
+                if *corrupt {
+                    anyhow::ensure!(
+                        streams.iter().all(|stream| stream.decoded_samples == 0)
+                            && streams.iter().any(|stream| stream.decoder_errors > 0),
+                        "{description}: independent decoder accepted corrupted Opus: {streams:?}"
+                    );
+                } else {
+                    anyhow::ensure!(
+                        streams
+                            .iter()
+                            .all(|stream| stream.decoded_span() >= Duration::from_millis(300)
+                                && stream.decoder_errors == 0
+                                && stream.reference_mismatches == 0),
+                        "{description}: receiver-scoped independent Opus decode failed: {streams:?}"
+                    );
+                }
+                for stream in streams
+                    .iter()
+                    .filter(|stream| stream.reference_error.samples > 0)
+                {
+                    anyhow::ensure!(
+                        stream
+                            .reference_error
+                            .mean_absolute()
+                            .is_some_and(|mean| mean <= MAX_REFERENCE_MEAN_ABSOLUTE)
+                            && stream.reference_error.max <= MAX_AUDIO_REFERENCE_PEAK,
+                        "{description}: actual available Opus reference error exceeds bounds: {:?}",
+                        stream.reference_error
+                    );
+                }
+                tracing::info!(
+                    ?streams,
+                    "encoded receiver proof; unavailable reference comparisons are not errors or source identities"
+                );
+            }
+
+            Step::CheckAudioSlotStreams {
+                description,
+                participant,
+                min_sources,
+                max_streams,
+            } => {
+                let handle = get_handle(handles, participant, description)?;
+                let generation = audio_generation(handle)?;
+                let subscriber = handle
+                    .participant_id()
+                    .context("audio subscriber identity unavailable")?;
+                let sources = sustained_audio_sources(&subscriber)?;
+                anyhow::ensure!(
+                    sources.len() >= *min_sources,
+                    "{description}: only {} sustained queued sources, expected {min_sources}: {sources:?}",
+                    sources.len()
+                );
+                let audio = handle.audio_rx();
+                anyhow::ensure!(
+                    audio.encoded_observers > 0,
+                    "{description}: SSRC observations require encoded native metadata"
+                );
+                let streams: BTreeSet<_> = audio
+                    .by_receiver
+                    .keys()
+                    .filter(|key| key.generation == generation)
+                    .map(|key| key.ssrc)
+                    .collect();
+                anyhow::ensure!(
+                    !streams.is_empty() && streams.len() <= *max_streams,
+                    "{description}: expected 1..={max_streams} actual SSRC streams, got {streams:?}"
+                );
+                for (receiver, observed) in audio
+                    .by_stream
+                    .iter()
+                    .filter(|(key, _)| key.generation == generation)
+                {
+                    tracing::info!(
+                        ?receiver,
+                        observed.packets,
+                        observed.max_seq_gap,
+                        "actual native encoded sequence observations; holes are not an audio-loss or playout verdict"
+                    );
+                }
+            }
+
+            Step::CheckAudioCatalogFrom {
+                description,
+                participant,
+                expected,
+            } => {
+                let actual: BTreeSet<_> =
+                    current_audio_catalog(get_handle(handles, participant, description)?)?
+                        .into_values()
+                        .collect();
+                let want = audio_expected(handles, expected)?;
+                anyhow::ensure!(
+                    actual == want,
+                    "{description}: current catalog assignments {actual:?}, expected {want:?}"
+                );
+            }
+
+            Step::WaitForAudioSelectionRank {
+                description,
+                participant,
+                expected,
+                timeout,
+            } => {
+                let want = expected
+                    .iter()
+                    .map(|(name, rank)| {
+                        Ok((
+                            get_handle(handles, name, description)?
+                                .participant_id()
+                                .context("speaker identity unavailable")?,
+                            *rank,
+                        ))
+                    })
+                    .collect::<anyhow::Result<BTreeMap<_, _>>>()?;
+                let handle = get_handle(handles, participant, description)?;
+                let subscriber = handle
+                    .participant_id()
+                    .context("audio subscriber identity unavailable")?;
+                tokio::time::timeout(*timeout, async {
+                    loop {
+                        let owned = observe_video(observer, &subscriber).await?;
+                        let ranked: BTreeMap<_, _> = owned.audio.iter().enumerate().map(|(rank, slot)| (slot.origin.as_str(), u32::try_from(rank).unwrap())).collect();
+                        let catalog = current_audio_catalog(handle)?;
+                        let current = owned.audio.iter().all(|slot| catalog.get(&slot.track.as_str()).is_some_and(|origin| origin == &slot.origin.as_str()));
+                        let talking = owned.audio.iter().all(|slot| slot.level_dbov > -60);
+                        if current && talking && ranked == want {
+                            tracing::info!(?ranked, slots = ?owned.audio, "actual SFU selector ordering, not a client-visible rank");
+                            break Ok::<_, anyhow::Error>(());
+                        }
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                }).await.with_context(|| format!("{description}: actual active-source selector rank did not converge to {want:?}"))??;
             }
 
             Step::CheckCrossShardMedia {
@@ -3323,7 +3629,7 @@ async fn execute_plan(
                     "[step {n}/{total}: {kind}] \"{description}\" ({participant}, max {max_bytes} B)"
                 );
                 let handle = get_handle(handles, participant, description)?;
-                let baseline = handle.interval_rx_baseline;
+                let baseline = handle.interval_rx_baseline();
                 let actual = handle.rx_bytes().saturating_sub(baseline);
                 assert!(
                     actual <= *max_bytes,
@@ -3340,7 +3646,7 @@ async fn execute_plan(
                     "[step {n}/{total}: {kind}] \"{description}\" ({participant}, min {min_bytes} B)"
                 );
                 let handle = get_handle(handles, participant, description)?;
-                let baseline = handle.interval_rx_baseline;
+                let baseline = handle.interval_rx_baseline();
                 let actual = handle.rx_bytes().saturating_sub(baseline);
                 assert!(
                     actual >= *min_bytes,
@@ -3357,7 +3663,7 @@ async fn execute_plan(
                     "[step {n}/{total}: {kind}] \"{description}\" ({participant}, min {min_bytes} B)"
                 );
                 let handle = get_handle(handles, participant, description)?;
-                let baseline = handle.interval_tx_baseline;
+                let baseline = handle.interval_tx_baseline();
                 let actual = handle.tx_bytes().saturating_sub(baseline);
                 assert!(
                     actual >= *min_bytes,
@@ -3824,6 +4130,102 @@ fn assert_room_state_consistent(handles: &PlanHandles, after: &str) {
 // pairs every 3 seconds. This bounds detection plus control/shard retirement.
 const CRASH_RETIREMENT_BUDGET: Duration = Duration::from_secs(20);
 
+fn require_native_audio(
+    handle: &ParticipantHandle,
+    min_samples: u64,
+    min_receivers: usize,
+    max_silence: Option<Duration>,
+) -> anyhow::Result<()> {
+    let generation = audio_generation(handle)?;
+    let tracks = handle.audio_rx().native_pcm.require(
+        generation,
+        min_samples,
+        min_receivers,
+        max_silence,
+        Instant::now(),
+    )?;
+    let statistics = handle.shared.statistics.lock().unwrap();
+    let stats = statistics
+        .as_ref()
+        .context("native audio statistics unavailable")?;
+    anyhow::ensure!(
+        stats.generation == generation,
+        "native audio statistics belong to an old generation"
+    );
+    for track in tracks {
+        super::native_audio::require_decoder_report(&stats.report_json, &track.mid)?;
+        tracing::info!(
+            ?track,
+            min_samples,
+            "native PCM decode verified without per-block publication or decoder-error claims"
+        );
+    }
+    Ok(())
+}
+
+fn audio_generation(handle: &ParticipantHandle) -> anyhow::Result<u64> {
+    handle
+        .shared
+        .observation
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|observation| observation.snapshot.generation)
+        .map(pulsebeam_agent_native::agent_core::Generation::get)
+        .context("audio oracle requires a live native generation")
+}
+
+fn audio_expected(handles: &PlanHandles, expected: &[&str]) -> anyhow::Result<BTreeSet<String>> {
+    expected
+        .iter()
+        .map(|name| {
+            handles
+                .get(name)
+                .context("unknown expected audio publisher")?
+                .participant_id()
+                .context("audio publisher identity unavailable")
+        })
+        .collect()
+}
+
+fn sustained_audio_sources(subscriber: &str) -> anyhow::Result<BTreeSet<String>> {
+    let queued = pulsebeam::sim_metrics::queued_audio_for(subscriber.parse()?);
+    // Preserve the old transient exclusion, but claim queueing, not attributed PCM.
+    let longest = queued
+        .values()
+        .map(pulsebeam::sim_metrics::AudioEnqueues::span)
+        .max()
+        .unwrap_or_default();
+    let floor = (longest / 2).max(Duration::from_millis(300));
+    Ok(queued
+        .into_iter()
+        .filter(|(_, queued)| queued.span() >= floor)
+        .map(|(origin, _)| origin.participant.as_str())
+        .collect())
+}
+
+fn current_audio_catalog(handle: &ParticipantHandle) -> anyhow::Result<BTreeMap<String, String>> {
+    let observation = handle.shared.observation.lock().unwrap();
+    let snapshot = &observation
+        .as_ref()
+        .context("audio catalog observation unavailable")?
+        .snapshot;
+    snapshot
+        .audio_mapping
+        .values()
+        .map(|track| {
+            let publication = snapshot
+                .publications
+                .get(track)
+                .context("audio assignment has no catalog publication")?;
+            Ok((
+                track.as_str().to_owned(),
+                publication.participant_id.as_str().to_owned(),
+            ))
+        })
+        .collect()
+}
+
 async fn observe_video(
     observer: &pulsebeam::sim_observation::Observer,
     participant: &str,
@@ -3858,7 +4260,21 @@ async fn assert_convergence(
     })??;
     expected
         .check_owners(&owners)
-        .map_err(|error| anyhow::anyhow!("owner convergence after {after}: {error:#}"))?;
+        .map_err(|error| {
+            let clients: Vec<_> = handles.iter().filter(|(_, handle)| handle.present)
+                .map(|(name, handle)| {
+                    let observation = handle.shared.observation.lock().unwrap().clone();
+                    (*name, handle.participant_id(), handle.connected(), observation.map(|value| (
+                        value.admission,
+                        value.snapshot.connection,
+                        value.snapshot.generation,
+                        value.snapshot.participant_id,
+                        value.snapshot.version,
+                        value.snapshot.terminal_failure,
+                    )))
+                }).collect();
+            anyhow::anyhow!("owner convergence after {after}: {error:#}; client(name, expected_id, connected, admission/connection/generation/id/version/failure)={clients:?}; control={:?}", owners.control)
+        })?;
     for (name, handle) in handles.iter().filter(|(_, handle)| handle.present) {
         let observation = handle
             .shared
@@ -3927,6 +4343,10 @@ fn assert_video_quality(
     log: &VideoReceiveLog,
 ) {
     let kind = "CheckVideoQuality";
+    assert!(
+        !log.native_decoded.has_observations(),
+        "encoded independent-decoder oracle cannot qualify native playout; use CheckNativeDecodedVideo"
+    );
     assert!(
         log.frames >= quality.min_frames,
         "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  participant:  {participant}\n  expected:     ≥ {} decoded frames\n  actual:       frames={}, keyframes={}, decoder_errors={}, decoder_error_keyframes={}, missing_parameter_set_keyframes={}, ts_regression_count={}, non_contiguous={}",
@@ -4292,7 +4712,9 @@ pub struct LinkReport {
     pub capacity_bps: Option<u64>,
     pub capacity_fixed: bool,
     pub window: Duration,
-    pub received_bytes: u64,
+    /// Actual native interval bytes, unavailable without two fresh reports in
+    /// the same generation. Diagnostics do not invent an initial zero sample.
+    pub received_bytes: Option<u64>,
     pub forwarded_media_bytes: u64,
     pub decoded_video: BTreeMap<&'static str, u64>,
     /// Allocation passes recorded. Zero means the plan never exercised this participant, which a
@@ -4355,7 +4777,7 @@ impl LinkReport {
     pub fn utilisation_percent(&self) -> Option<f64> {
         let capacity = self.capacity_bps.filter(|_| self.capacity_fixed)?;
         let deliverable = capacity as f64 * self.window.as_secs_f64() / 8.0;
-        Some(pct(self.received_bytes as f64, deliverable))
+        Some(pct(self.received_bytes? as f64, deliverable))
     }
 
     /// Congestion tail-drop as a percentage of packets offered to the bottleneck. Distinct from
@@ -4368,11 +4790,11 @@ impl LinkReport {
     /// Media payload as a percentage of bytes received. Exceeds 100% under loss - see
     /// [`Property::MediaEfficiencyAtLeast`].
     #[allow(dead_code)] // Report accessor, kept alongside the rest of the surface.
-    pub fn media_percent(&self) -> f64 {
-        pct(
+    pub fn media_percent(&self) -> Option<f64> {
+        Some(pct(
             self.forwarded_media_bytes as f64,
-            self.received_bytes as f64,
-        )
+            self.received_bytes? as f64,
+        ))
     }
 
     /// What the controller ought to have found: the lesser of what was asked for and what the
@@ -4444,9 +4866,7 @@ fn measure(handle: &ParticipantHandle, ip: IpAddr, window: Duration) -> LinkRepo
         capacity_bps: pulsebeam_runtime::net::shaper::capacity_at(ip, now),
         capacity_fixed: pulsebeam_runtime::net::shaper::capacity_is_fixed(ip),
         window,
-        received_bytes: handle
-            .rx_bytes()
-            .saturating_sub(handle.interval_rx_baseline),
+        received_bytes: handle.interval_delta(|stats| stats.bytes_received).ok(),
         forwarded_media_bytes: handle.forwarded_media(),
         decoded_video: BTreeMap::new(),
         samples: series.len(),
@@ -4476,9 +4896,7 @@ fn report_metrics(handle: &ParticipantHandle, ip: IpAddr, window: Duration) -> S
     let now = tokio::time::Instant::now();
     let stats = pulsebeam_runtime::net::shaper::stats(ip);
     let capacity = pulsebeam_runtime::net::shaper::capacity_at(ip, now);
-    let received = handle
-        .rx_bytes()
-        .saturating_sub(handle.interval_rx_baseline);
+    let received = handle.interval_delta(|stats| stats.bytes_received);
     let forwarded = handle.forwarded_media();
 
     let series = handle
@@ -4492,21 +4910,24 @@ fn report_metrics(handle: &ParticipantHandle, ip: IpAddr, window: Duration) -> S
 
     let mut out = String::new();
     let fixed = pulsebeam_runtime::net::shaper::capacity_is_fixed(ip);
-    match capacity {
+    match (capacity, received.as_ref()) {
+        (capacity, Err(reason)) => out.push_str(&format!(
+            "capacity {capacity:?} bps | received unavailable ({reason})"
+        )),
         // Utilisation needs a capacity that held for the window. On a schedule the instantaneous
         // value is the wrong denominator and produces nonsense - a ramp ending at 700 kbps whose
         // window averaged ~1.6 Mbps reported 137% - so report the rate and omit the ratio.
-        Some(c) if !fixed => out.push_str(&format!(
+        (Some(c), Ok(received)) if !fixed => out.push_str(&format!(
             "capacity {c} bps (scheduled) | received {received} B"
         )),
-        Some(c) => {
+        (Some(c), Ok(received)) => {
             let deliverable = c as f64 * window.as_secs_f64() / 8.0;
             out.push_str(&format!(
                 "capacity {c} bps | utilisation {:.1}% ({received} B / ~{deliverable:.0} B)",
-                pct(received as f64, deliverable)
+                pct(*received as f64, deliverable)
             ));
         }
-        None => out.push_str(&format!("capacity unshaped | received {received} B")),
+        (None, Ok(received)) => out.push_str(&format!("capacity unshaped | received {received} B")),
     }
 
     if series.is_empty() {
@@ -4550,7 +4971,7 @@ fn report_metrics(handle: &ParticipantHandle, ip: IpAddr, window: Duration) -> S
 
     let offered = stats.delivered + stats.dropped_overflow;
     out.push_str(&format!(
-        " | qoe {} fps={:.1} key={} undecodable={} torn={} ttff={:?} freeze={:?}/{:.0}% | queue standing {:?} max {:?} | congestion loss {:.2}% ({}/{offered}) | link loss {}          | media {:.1}%",
+        " | qoe {} fps={:.1} key={} undecodable={} torn={} ttff={:?} freeze={:?}/{:.0}% | queue standing {:?} max {:?} | congestion loss {:.2}% ({}/{offered}) | link loss {}          | media {}",
         qoe_now.frames,
         qoe_now.mean_fps,
         qoe_now.keyframes,
@@ -4564,7 +4985,10 @@ fn report_metrics(handle: &ParticipantHandle, ip: IpAddr, window: Duration) -> S
         pct(stats.dropped_overflow as f64, offered as f64),
         stats.dropped_overflow,
         stats.dropped_loss,
-        pct(forwarded as f64, received as f64),
+        match received {
+            Ok(bytes) => format!("{:.1}%", pct(forwarded as f64, bytes as f64)),
+            Err(reason) => format!("unavailable ({reason})"),
+        },
     ));
     out
 }
@@ -4629,9 +5053,7 @@ fn check_property(
         }
         Property::UtilisationAtLeast(min) => {
             let capacity = capacity()?;
-            let received = handle
-                .rx_bytes()
-                .saturating_sub(handle.interval_rx_baseline);
+            let received = handle.interval_delta(|stats| stats.bytes_received)?;
             let deliverable = capacity * window.as_secs_f64() / 8.0;
             let got = pct(received as f64, deliverable);
             if got + 0.5 < min as f64 {
@@ -4678,9 +5100,7 @@ fn check_property(
             // possible reason: a frozen estimate never moves. Caught in practice - a plan whose
             // publisher went dead reported a 0.0% drawdown over 600 samples having received 0
             // bytes, and passed.
-            let received = handle
-                .rx_bytes()
-                .saturating_sub(handle.interval_rx_baseline);
+            let received = handle.interval_delta(|stats| stats.bytes_received)?;
             if received == 0 {
                 return Err(
                     "nothing was received, so a stable estimate means nothing moved at all"
@@ -4714,9 +5134,7 @@ fn check_property(
             }
         }
         Property::EstimateRecovers { of_peak_percent } => {
-            let received = handle
-                .rx_bytes()
-                .saturating_sub(handle.interval_rx_baseline);
+            let received = handle.interval_delta(|stats| stats.bytes_received)?;
             if received == 0 {
                 return Err(
                     "nothing was received, so a recovered estimate means nothing moved at all"
@@ -4872,9 +5290,7 @@ fn check_property(
             }
         }
         Property::MediaEfficiencyAtLeast(min) => {
-            let received = handle
-                .rx_bytes()
-                .saturating_sub(handle.interval_rx_baseline);
+            let received = handle.interval_delta(|stats| stats.bytes_received)?;
             if received == 0 {
                 return Err("nothing was received, so the ratio would be meaningless".to_string());
             }
@@ -5376,11 +5792,13 @@ impl LocalNodeSim {
                         shared: shared.clone(),
                         cmd_tx,
                         room_name: room.name,
-                        interval_tx_baseline: 0,
-                        interval_rx_baseline: 0,
+                        interval_statistics: None,
                         subscribed_at: None,
                         interval_video_baseline: VideoReceiveStats::default(),
                         interval_decoded_video_baseline: BTreeMap::new(),
+                        native_video_baseline: Default::default(),
+                        native_video_stats_timestamp: None,
+                        native_video_decoder_frames: None,
                         publishes_video: matches!(
                             participant.role,
                             Role::Publisher | Role::OwnedPublisher
@@ -5450,7 +5868,7 @@ impl LocalNodeSim {
                     ServerCommand::Restart => sim.bounce(server_ip),
                 }
             }
-            if sim.step().expect("simulation failed") {
+            if super::native::step(&mut sim).expect("simulation failed") {
                 break;
             }
         }

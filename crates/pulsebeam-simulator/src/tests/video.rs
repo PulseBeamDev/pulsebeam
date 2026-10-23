@@ -530,11 +530,10 @@ fn a_pli_recovers_decoding_without_natural_keyframe_repeats_test() {
         ]);
 }
 
-/// A publisher that attaches a synthetic L1T3 Dependency Descriptor to every
-/// frame flows end-to-end and the subscriber decodes it — exercising the agent's
-/// DD emission and the SFU's DD-aware forwarder (parse + Full-target forward)
-/// against the egress invariants. Shedding is unit/allocation-tested; here the
-/// point is that carrying DD never breaks the stream.
+/// Genuine stock-encoder L1T3 elementary frames pass through the native sender,
+/// the real SFU and the native receiver. Require actual DD metadata, all three
+/// temporal indices and independently decoded payload on the same live receiver.
+/// The fixture never fabricates a dependency descriptor or reference schedule.
 #[test]
 fn dependency_descriptor_stream_is_forwarded_decodably_test() {
     LocalNodeSim::new()
@@ -549,9 +548,11 @@ fn dependency_descriptor_stream_is_forwarded_decodably_test() {
                 duration: Duration::from_secs(10),
             },
             Step::CheckVideoQuality {
-                description: "Bob decodes the DD-annotated stream end to end",
+                description: "Bob decodes native L1T3 output with actual DD and temporal indices",
                 participant: "bob",
-                quality: VideoQuality::min_frames(150).allow_gaps(3),
+                quality: VideoQuality::min_frames(150)
+                    .allow_gaps(3)
+                    .require_native_temporal_indices(&[0, 1, 2]),
             },
         ]);
 }
@@ -769,68 +770,66 @@ fn fast_initial_ramp_up_on_good_network_test() {
 
 #[test]
 fn repeated_simulcast_switching_stays_decodable_test() {
+    let mut plan = vec![
+        Step::Run {
+            description: "Establish native signaling and publication discovery",
+            duration: Duration::from_secs(1),
+        },
+        Step::CheckConnected {
+            description: "Publisher connected before subscription",
+            participant: "alice",
+        },
+        Step::CheckConnected {
+            description: "Subscriber connected before subscription",
+            participant: "bob",
+        },
+        Step::SubscribeAll {
+            description: "Subscribe at 720p",
+            participant: "bob",
+            heights: &[720],
+        },
+        Step::Run {
+            description: "Accumulate native decoded frames at 720p",
+            duration: Duration::from_secs(10),
+        },
+        Step::CheckNativeDecodedVideo {
+            description: "Initial native decoder delivers fresh 720p pixels",
+            participant: "bob",
+            dimensions: (1280, 720),
+            min_fresh_frames: 100,
+        },
+    ];
+    for (description, heights, dimensions) in [
+        ("Switch 1: 180p", &[180][..], (320, 180)),
+        ("Switch 2: 720p", &[720][..], (1280, 720)),
+        ("Switch 3: 180p", &[180][..], (320, 180)),
+        ("Switch 4: 720p", &[720][..], (1280, 720)),
+    ] {
+        plan.extend([
+            Step::SubscribeAll {
+                description,
+                participant: "bob",
+                heights,
+            },
+            Step::Run {
+                description: "Settle",
+                duration: Duration::from_millis(2500),
+            },
+            Step::CheckNativeDecodedVideo {
+                description: "Native playout reaches the requested rung with fresh nontrivial pixels",
+                participant: "bob",
+                dimensions,
+                min_fresh_frames: 30,
+            },
+        ]);
+    }
     LocalNodeSim::new()
         .with_room(
             Room::new("room1")
                 .with_participant(Participant::publisher("alice", &["q", "h", "f"]))
-                .with_participant(Participant::subscriber("bob")),
+                .with_participant(Participant::subscriber("bob").with_native_decoded_video()),
         )
-        .run(vec![
-            Step::Run {
-                description: "Establish initial flow and let highest layer settle",
-                duration: Duration::from_secs(15),
-            },
-            Step::SubscribeAll {
-                description: "Subscribe at 720p",
-                participant: "bob",
-                heights: &[720],
-            },
-            Step::Run {
-                description: "Accumulate frames at 720p",
-                duration: Duration::from_secs(10),
-            },
-            Step::SubscribeAll {
-                description: "Switch 1: 180p",
-                participant: "bob",
-                heights: &[180],
-            },
-            Step::Run {
-                description: "Settle",
-                duration: Duration::from_millis(2500),
-            },
-            Step::SubscribeAll {
-                description: "Switch 2: 720p",
-                participant: "bob",
-                heights: &[720],
-            },
-            Step::Run {
-                description: "Settle",
-                duration: Duration::from_millis(2500),
-            },
-            Step::SubscribeAll {
-                description: "Switch 3: 180p",
-                participant: "bob",
-                heights: &[180],
-            },
-            Step::Run {
-                description: "Settle",
-                duration: Duration::from_millis(2500),
-            },
-            Step::SubscribeAll {
-                description: "Switch 4: 720p",
-                participant: "bob",
-                heights: &[720],
-            },
-            Step::Run {
-                description: "Settle",
-                duration: Duration::from_millis(2500),
-            },
-            Step::CheckVideoQuality {
-                description: "Frames remain decodable across 4 simulcast switches",
-                participant: "bob",
-                quality: VideoQuality::min_frames(100).allow_gaps(4),
-            },
-        ]);
+        .run(plan);
 }
 
 // The EgressGuard backward-timestamp violation is fixed (cache monotonicity

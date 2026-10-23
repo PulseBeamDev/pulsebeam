@@ -191,6 +191,20 @@ impl Participant {
         self.downstream.video.observation()
     }
 
+    #[cfg(feature = "sim")]
+    pub(crate) fn audio_observation(&self) -> Vec<crate::sim_observation::AudioSlotObservation> {
+        self.downstream
+            .audio_assignments()
+            .into_iter()
+            .map(|heard| crate::sim_observation::AudioSlotObservation {
+                track: heard.origin.track,
+                origin: heard.origin.participant,
+                mid: heard.mid.to_string(),
+                level_dbov: heard.level_dbov,
+            })
+            .collect()
+    }
+
     pub fn new(
         cfg: ParticipantConfig,
         shard_id: ShardId,

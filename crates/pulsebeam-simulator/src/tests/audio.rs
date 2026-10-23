@@ -1,9 +1,8 @@
 //! Audio forwarding and speaker selection.
 //!
-//! The SFU forwards a limited number of speakers at a time, ranked by loudness, so audio has a
-//! selection stage video does not. `TopNAudioSelector` is unit tested; until these plans existed
-//! none of it had ever run against a real participant, and no simulated participant had ever
-//! published audio at all.
+//! Libwebrtc owns encoding, transport, receive buffering, decoding and playout. These plans
+//! observe its actual outputs. SFU queueing and current catalog/selector facts are separate
+//! assertions, never reconstructed publication identity for buffered PCM.
 
 use super::common::{LocalNodeSim, Participant, Room, Step};
 use pulsebeam_agent_native::agent_core::TopicMode;
@@ -12,10 +11,9 @@ use std::time::Duration;
 
 /// Audio published by a participant reaches the people in the room.
 ///
-/// The weakest possible claim about audio, and it did not hold. The SFU ranks speakers by RFC 6464
-/// loudness and drops any packet arriving without a level, and the agent never stamped one - so
-/// every audio packet a client published was discarded at the selector. Removing the stamp again
-/// puts 499 drops in a ten-second run and fails this plan.
+/// Native PCM encoding supplies RFC 6464 levels for the SFU selector. A decoded listener proves
+/// actual native playout; an explicit encoded listener separately observes stream identity and
+/// payloads. Sequence holes may include native padding the SFU does not forward, not missing audio.
 #[test]
 fn audio_reaches_the_room_test() {
     LocalNodeSim::new()
@@ -23,7 +21,8 @@ fn audio_reaches_the_room_test() {
             Room::new("room1")
                 // Audio only, so the byte check below cannot be satisfied by video.
                 .with_participant(Participant::data_participant("speaker").speaking_at(-30))
-                .with_participant(Participant::subscriber("listener").hearing(3)),
+                .with_participant(Participant::subscriber("listener").hearing(3))
+                .with_participant(Participant::subscriber("packet-listener").hearing(3).with_encoded_audio()),
         )
         .run(vec![
             Step::Run {
@@ -35,16 +34,28 @@ fn audio_reaches_the_room_test() {
                 participant: "listener",
                 min_bytes: 1,
             },
-            Step::CheckHeardFrom {
+            Step::CheckAudioQueuedFrom {
                 description: "The listener attributes the audio to the speaker",
                 participant: "listener",
                 expected: &["speaker"],
             },
-            Step::CheckAudioStreams {
-                description: "The listener uses one intact audio stream",
-                participant: "listener",
-                min_speakers: 1,
+            Step::CheckEncodedAudio {
+                description: "Actual native encoded Opus independently decodes at the receiver",
+                participant: "packet-listener",
+                corrupt: false,
+            },
+            Step::CheckAudioSlotStreams {
+                description: "Native encoded observations use one stable slot stream",
+                participant: "packet-listener",
+                min_sources: 1,
                 max_streams: 3,
+            },
+            Step::CheckNativeAudioDecoded {
+                description: "Actual native PCM cadence and SDK decode progress across the measured scenario",
+                participant: "listener",
+                min_samples: 4_800,
+                min_receivers: 1,
+                max_silence: Some(Duration::from_millis(1_500)),
             },
         ]);
 }
@@ -54,42 +65,66 @@ fn each_listener_must_count_only_decoded_opus_as_heard_test() {
     LocalNodeSim::new()
         .with_room(
             Room::new("decoded-audio-boundary")
-                .with_participant(Participant::data_participant("speaker").speaking_at(-30))
-                .with_participant(Participant::subscriber("listener-a").hearing(1))
-                .with_participant(Participant::subscriber("listener-b").hearing(1)),
+                .with_participant(
+                    Participant::data_participant("speaker")
+                        .speaking_at(-30)
+                        .with_native_pcm_audio(),
+                )
+                .with_participant(
+                    Participant::subscriber("listener-a")
+                        .hearing(1)
+                        .with_native_decoded_audio(),
+                )
+                .with_participant(
+                    Participant::subscriber("listener-b")
+                        .hearing(1)
+                        .with_native_decoded_audio(),
+                ),
         )
         .run(vec![
             Step::Run {
                 description: "Deliver the speaker to both independent listeners",
                 duration: Duration::from_secs(5),
             },
-            Step::CheckHeardFrom {
-                description: "Listener A packet oracle attributes the speaker",
+            Step::CheckAudioQueuedFrom {
+                description: "The SFU actually queued the speaker for listener A",
                 participant: "listener-a",
                 expected: &["speaker"],
             },
-            Step::CheckHeardFrom {
-                description: "Listener B packet oracle attributes the speaker",
+            Step::CheckAudioQueuedFrom {
+                description: "The SFU actually queued the speaker for listener B",
                 participant: "listener-b",
                 expected: &["speaker"],
             },
-            Step::CheckAudioDecodedFrom {
-                description: "Listener A reports decoded Opus for the speaker",
+            Step::CheckAudioCatalogFrom {
+                description: "The catalog identifies the source separately from PCM",
                 participant: "listener-a",
-                publisher: "speaker",
-                min_samples: QUALITY_AUDIO_FRAME_SAMPLES as u64,
+                expected: &["speaker"],
             },
-            Step::CheckAudioDecodedFrom {
-                description: "Listener B reports independent decoded Opus for the speaker",
+            Step::CheckAudioCatalogFrom {
+                description: "Listener B also receives the source assignment",
                 participant: "listener-b",
-                publisher: "speaker",
-                min_samples: QUALITY_AUDIO_FRAME_SAMPLES as u64,
+                expected: &["speaker"],
+            },
+            Step::CheckNativeAudioDecoded {
+                description: "Listener A has native nontrivial PCM and NetEq decode progress",
+                participant: "listener-a",
+                min_samples: 4_800,
+                min_receivers: 1,
+                max_silence: None,
+            },
+            Step::CheckNativeAudioDecoded {
+                description: "Listener B independently has native PCM and NetEq progress",
+                participant: "listener-b",
+                min_samples: 4_800,
+                min_receivers: 1,
+                max_silence: None,
             },
         ]);
 }
 
 #[test]
-fn decoded_invalid_opus_packets_must_not_count_as_heard_test() {
+fn encoded_opus_corruption_fails_independent_decoder_test() {
     LocalNodeSim::new()
         .with_room(
             Room::new("corrupt-audio-oracle")
@@ -110,21 +145,21 @@ fn decoded_invalid_opus_packets_must_not_count_as_heard_test() {
                 participant: "listener",
                 min_bytes: 1,
             },
-            Step::CheckAudioPacketsFrom {
-                description: "The packet-only oracle attributes the packets",
+            Step::CheckAudioQueuedFrom {
+                description: "The server actually queued the speaker before receiver-side corruption",
                 participant: "listener",
                 expected: &["speaker"],
             },
-            Step::CheckAudioNotHeardFrom {
-                description: "Invalid Opus does not count as heard audio",
+            Step::CheckEncodedAudio {
+                description: "Receiver-side corrupted Opus must fail the independent decoder",
                 participant: "listener",
-                publisher: "speaker",
+                corrupt: true,
             },
         ]);
 }
 
 #[test]
-fn decoded_opus_recovers_after_corpus_dtx_test() {
+fn native_pcm_recovers_after_encoder_dtx_test() {
     LocalNodeSim::new()
         .with_room(
             Room::new("decoded-audio-dtx")
@@ -133,23 +168,30 @@ fn decoded_opus_recovers_after_corpus_dtx_test() {
         )
         .run(vec![
             Step::Run {
-                description: "Decode active audio before the corpus DTX interval",
+                description: "Decode native PCM before the encoder DTX interval",
                 duration: Duration::from_secs(2),
             },
             Step::Run {
-                description: "Cross the corpus DTX interval and recover active audio",
+                description: "Cross native encoder DTX and recover active PCM",
                 duration: Duration::from_secs(4),
             },
-            Step::CheckHeardFrom {
+            Step::CheckAudioQueuedFrom {
                 description: "The listener hears sustained decoded audio after DTX",
                 participant: "listener",
                 expected: &["speaker"],
             },
-            Step::CheckAudioDecodedFrom {
-                description: "Decoded sample progress survives DTX recovery",
+            Step::CheckNativeAudioDecoded {
+                description: "Actual native PCM and SDK decode progress, without per-block source attribution",
                 participant: "listener",
-                publisher: "speaker",
+                min_samples: 4_800,
+                min_receivers: 1,
+                max_silence: None,
+            },
+            Step::WaitForNativeAudioRecovery {
+                description: "Native PCM recovers after the second DTX region and meets the retained sample bound",
+                participant: "listener",
                 min_samples: (QUALITY_AUDIO_FRAME_SAMPLES * 150) as u64,
+                timeout: Duration::from_secs(2),
             },
         ]);
 }
@@ -171,15 +213,26 @@ fn audio_does_not_loop_back_to_speaker_test() {
                 description: "Speaker talks to the room",
                 duration: Duration::from_secs(10),
             },
-            Step::CheckHeardFrom {
+            Step::CheckAudioQueuedFrom {
                 description: "Listener hears the speaker",
                 participant: "listener",
                 expected: &["speaker"],
             },
-            Step::CheckHeardFrom {
+            Step::CheckNativeAudioDecoded {
+                description: "Actual native PCM and SDK decode progress, without per-block source attribution",
+                participant: "listener",
+                min_samples: 4_800,
+                min_receivers: 1,
+                max_silence: None,
+            },
+            Step::CheckAudioQueuedFrom {
                 description: "Speaker does not hear its own audio",
                 participant: "speaker",
                 expected: &[],
+            },
+            Step::CheckNativeAudioSilent {
+                description: "No native ingress or nontrivial PCM for an excluded listener",
+                participant: "speaker",
             },
         ]);
 }
@@ -224,10 +277,17 @@ fn the_loudest_speakers_are_the_ones_forwarded_test() {
                 description: "Three talk over each other; there are three slots",
                 duration: Duration::from_secs(10),
             },
-            Step::CheckHeardFrom {
+            Step::CheckAudioQueuedFrom {
                 description: "The talkers got the slots, and the quiet one did not",
                 participant: "listener",
                 expected: &["loud", "louder", "loudest"],
+            },
+            Step::CheckNativeAudioDecoded {
+                description: "Actual native PCM and SDK decode progress, without per-block source attribution",
+                participant: "listener",
+                min_samples: 4_800,
+                min_receivers: 3,
+                max_silence: None,
             },
         ]);
 }
@@ -255,15 +315,23 @@ fn the_listener_is_told_who_it_is_hearing_test() {
                 description: "Both talk, and both fit",
                 duration: Duration::from_secs(10),
             },
-            Step::CheckHeardFrom {
+            Step::CheckAudioQueuedFrom {
                 description: "Both speakers reach the listener",
                 participant: "listener",
                 expected: &["loud", "quiet"],
             },
-            Step::CheckAudioMapping {
-                description: "Both speakers are identified in the current receiver mapping",
+            Step::CheckNativeAudioDecoded {
+                description: "Actual native PCM and SDK decode progress, without per-block source attribution",
                 participant: "listener",
-                expected: &["loud", "quiet"],
+                min_samples: 4_800,
+                min_receivers: 2,
+                max_silence: None,
+            },
+            Step::WaitForAudioSelectionRank {
+                description: "The actual selector ranks active voices by loudness",
+                participant: "listener",
+                expected: &[("loud", 0), ("quiet", 1)],
+                timeout: Duration::from_secs(3),
             },
         ]);
 }
@@ -306,18 +374,31 @@ fn a_slot_carries_many_speakers_without_tearing_test() {
                         .speaking_at(-25)
                         .taking_turns_after(120),
                 )
-                .with_participant(Participant::subscriber("listener").hearing(3)),
+                .with_participant(Participant::subscriber("listener").hearing(3))
+                .with_participant(Participant::subscriber("packet-listener").hearing(3).with_encoded_audio()),
         )
         .run(vec![
             Step::Run {
                 description: "They take turns; three slots cannot hold four voices",
                 duration: Duration::from_secs(20),
             },
-            Step::CheckAudioStreams {
-                description: "Three slots carried four voices, and none of them tore",
-                participant: "listener",
-                min_speakers: 4,
+            Step::CheckAudioSlotStreams {
+                description: "At most three native SSRC streams carry the four queued sources",
+                participant: "packet-listener",
+                min_sources: 4,
                 max_streams: 3,
+            },
+            Step::CheckNativeAudioDecoded {
+                description: "Actual native PCM cadence and SDK decode progress across the measured scenario",
+                participant: "listener",
+                min_samples: 4_800,
+                min_receivers: 3,
+                max_silence: Some(Duration::from_millis(1_500)),
+            },
+            Step::CheckEncodedAudio {
+                description: "Every actual encoded receiver stream independently decodes across source switching",
+                participant: "packet-listener",
+                corrupt: false,
             },
         ]);
 }
@@ -359,11 +440,19 @@ fn a_pinned_speaker_is_heard_over_louder_ones_test() {
                 participant: "listener",
                 min_bytes: 1,
             },
-            // Cumulative reception cannot prove the quiet pinned speaker still holds a slot.
+            // Check current catalog and owned SFU assignment, not historical queueing or an
+            // invented rank from receiver-index order. The quiet source cannot win on loudness.
             Step::CheckSpeakerHeld {
                 description: "The quietest speaker holds a slot because it was pinned",
                 participant: "listener",
                 speaker: "quiet_pinned",
+            },
+            Step::CheckNativeAudioDecoded {
+                description: "The remaining audible native receivers keep decoding while the quiet source is pinned",
+                participant: "listener",
+                min_samples: 4_800,
+                min_receivers: 2,
+                max_silence: None,
             },
         ]);
 }
@@ -398,22 +487,27 @@ fn auto_off_hears_exactly_the_pins_test() {
                 description: "The louder two keep talking into slots that stay empty",
                 duration: Duration::from_secs(15),
             },
-            Step::CheckHeardFrom {
+            Step::CheckAudioQueuedFrom {
                 description: "Only the pinned speaker is heard, though two slots are free",
                 participant: "listener",
                 expected: &["chosen"],
             },
+            Step::CheckNativeAudioDecoded {
+                description: "Actual native PCM and SDK decode progress, without per-block source attribution",
+                participant: "listener",
+                min_samples: 4_800,
+                min_receivers: 1,
+                max_silence: None,
+            },
         ]);
 }
 
-/// Pinning one of a participant's audio tracks does not pin the other.
+/// Explicit track pinning excludes a competing participant.
 ///
-/// This is why the wire pins tracks rather than people. A participant sharing a screen publishes
-/// its audio as a second track, and "pin Alice" is ambiguous the moment she does: a recording has
-/// to be able to say which of the two it captured, and a listener who pinned her microphone must
-/// not silently get her screen instead.
+/// This scenario has one audio publication per participant. It checks pin exclusion, not
+/// isolation between multiple publications owned by the same participant.
 #[test]
-fn pinning_one_audio_track_does_not_pin_another_from_the_same_participant_test() {
+fn pinning_one_participant_does_not_select_another_test() {
     LocalNodeSim::new()
         .with_room(
             Room::new("room1")
@@ -436,10 +530,17 @@ fn pinning_one_audio_track_does_not_pin_another_from_the_same_participant_test()
                 description: "Bob talks far louder into the one slot alice holds",
                 duration: Duration::from_secs(15),
             },
-            Step::CheckHeardFrom {
+            Step::CheckAudioQueuedFrom {
                 description: "The single slot carries the pinned track, not the louder one",
                 participant: "listener",
                 expected: &["alice"],
+            },
+            Step::CheckNativeAudioDecoded {
+                description: "Actual native PCM and SDK decode progress, without per-block source attribution",
+                participant: "listener",
+                min_samples: 4_800,
+                min_receivers: 1,
+                max_silence: None,
             },
         ]);
 }
@@ -464,15 +565,23 @@ fn saying_nothing_about_audio_keeps_automatic_selection_test() {
                 description: "Nobody sets an audio intent",
                 duration: Duration::from_secs(10),
             },
-            Step::CheckHeardFrom {
+            Step::CheckAudioQueuedFrom {
                 description: "Both speakers are forwarded, chosen by loudness alone",
                 participant: "listener",
                 expected: &["loud", "quiet"],
             },
-            Step::CheckAudioMapping {
-                description: "Both selected speakers have current receiver assignments",
+            Step::CheckNativeAudioDecoded {
+                description: "Actual native PCM and SDK decode progress, without per-block source attribution",
                 participant: "listener",
-                expected: &["loud", "quiet"],
+                min_samples: 4_800,
+                min_receivers: 2,
+                max_silence: None,
+            },
+            Step::WaitForAudioSelectionRank {
+                description: "Actual selector rank is separate from receiver-index catalog order",
+                participant: "listener",
+                expected: &[("loud", 0), ("quiet", 1)],
+                timeout: Duration::from_secs(3),
             },
         ]);
 }
@@ -485,7 +594,7 @@ fn saying_nothing_about_audio_keeps_automatic_selection_test() {
 /// on the destination, granting the route, forwarding over it — had no coverage at all, which is
 /// how a video track could be granted audio routes nobody would ever notice.
 ///
-/// Enough participants to make the placement hash split them; `CheckHeardFrom` then only passes if
+/// Enough participants to make the placement hash split them; queued-source checks only pass if
 /// audio survived the crossing.
 #[test]
 fn audio_crosses_a_shard_boundary_test() {
@@ -503,15 +612,29 @@ fn audio_crosses_a_shard_boundary_test() {
                 description: "Two speakers talk; listeners are spread across both shards",
                 duration: Duration::from_secs(10),
             },
-            Step::CheckHeardFrom {
+            Step::CheckAudioQueuedFrom {
                 description: "a listener hears both speakers wherever it was placed",
                 participant: "far",
                 expected: &["speaker", "second"],
             },
-            Step::CheckHeardFrom {
+            Step::CheckNativeAudioDecoded {
+                description: "Actual native PCM and SDK decode progress, without per-block source attribution",
+                participant: "far",
+                min_samples: 4_800,
+                min_receivers: 2,
+                max_silence: None,
+            },
+            Step::CheckAudioQueuedFrom {
                 description: "and so does another, over its own route",
                 participant: "further",
                 expected: &["speaker", "second"],
+            },
+            Step::CheckNativeAudioDecoded {
+                description: "Actual native PCM and SDK decode progress, without per-block source attribution",
+                participant: "further",
+                min_samples: 4_800,
+                min_receivers: 2,
+                max_silence: None,
             },
         ]);
 }
@@ -573,10 +696,17 @@ fn final_automatic_audio_listener_departure_retires_routes_test() {
                 description: "Install the automatic audio listener route",
                 duration: Duration::from_secs(8),
             },
-            Step::CheckHeardFrom {
+            Step::CheckAudioQueuedFrom {
                 description: "Listener receives the speaker before departure",
                 participant: "listener",
                 expected: &["speaker"],
+            },
+            Step::CheckNativeAudioDecoded {
+                description: "Actual native PCM and SDK decode progress, without per-block source attribution",
+                participant: "listener",
+                min_samples: 4_800,
+                min_receivers: 1,
+                max_silence: None,
             },
             Step::Disconnect {
                 description: "The final automatic audio listener leaves",

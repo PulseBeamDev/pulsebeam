@@ -131,9 +131,11 @@ execution from disk-cache hits and internal materialization.
 Owner targets are authoritative for selection and dependencies. An owner's
 `:fast` may include package contracts and need not have the root cheap gate's
 cost. Ignored exploratory cases, advisory seed sweeps and privileged diagnostics
-remain outside ordinary acceptance. The sole documented gate exclusion is the
-[native DTLS reconnect case](https://github.com/PulseBeamDev/pulsebeam/blob/main/crates/pulsebeam-simulator/docs/native-dtls-exception.md):
-it is reported as skipped, not passed, and remains explicitly runnable.
+remain outside ordinary acceptance. The native lifecycle case is required in
+the ordinary simulation gate, replay and sweep. Its
+[historical native-str0m DTLS exclusion](https://github.com/PulseBeamDev/pulsebeam/blob/main/crates/pulsebeam-simulator/docs/native-dtls-exception.md)
+was retired by the native-agent libwebrtc cutover, not by a server DTLS patch.
+Focused simulation evidence does not waive shared browser or production checks.
 
 Targeted selection uses the owning target and its harness:
 

@@ -235,6 +235,8 @@ browser evidence for SSRC/SDP compatibility and production transport evidence
 distinct from simulation. Audio origin/slot checks do not establish perceptual
 audio quality. Temporal nonblank checks do not establish smooth playback.
 
-The [native DTLS reconnect exception](native-dtls-exception.md) remains explicit,
-narrow and opt-in runnable. Ignored subprocess fixtures are not product
-exceptions, and neither category counts as passing proof.
+The [historical native-str0m DTLS exception](native-dtls-exception.md) is retired
+after replacement libwebrtc lifecycle proof. The native case is required by
+ordinary fast, replay and sweep selection. Ignored subprocess fixtures remain
+separate from product acceptance; focused native proof does not waive shared
+browser or production checks.

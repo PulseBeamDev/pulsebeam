@@ -2,15 +2,33 @@ load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
 
 package(default_visibility = ["//visibility:public"])
 exports_files(["Cargo.toml"])
-filegroup(name = "cargo_metadata_inputs", srcs = ["Cargo.toml", "src/lib.rs"])
+filegroup(name = "cargo_metadata_inputs", srcs = ["Cargo.toml", "src/lib.rs", "src/h264_fixture.rs"])
 
 rust_library(
     name = "pulsebeam-rtc-simulation",
     testonly = True,
     crate_root = "src/lib.rs",
-    srcs = ["src/lib.rs"],
+    srcs = ["src/lib.rs", "src/h264_fixture.rs"],
     edition = "2024",
     deps = ["@webrtc_source//:pulsebeam-webrtc-sys"],
+)
+
+rust_test(
+    name = "h264_fixture",
+    args = ["--test-threads=1"],
+    crate_root = "tests/h264_fixture.rs",
+    srcs = ["tests/h264_fixture.rs"],
+    edition = "2024",
+    deps = [":pulsebeam-rtc-simulation"],
+)
+
+rust_test(
+    name = "packet_bridge",
+    args = ["--test-threads=1"],
+    crate_root = "tests/packet_bridge.rs",
+    srcs = ["tests/packet_bridge.rs"],
+    edition = "2024",
+    deps = [":pulsebeam-rtc-simulation"],
 )
 
 rust_test(

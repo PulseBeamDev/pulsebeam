@@ -45,6 +45,13 @@ mod serializer {
                 return 0;
             };
             dst.copy_from_slice(&raw.0);
+            // Forward source-dependent fields verbatim, but honor the SFU's
+            // parsed output counter without requiring a template writer here.
+            if let Some(dd) = ev.user_values.get::<DependencyDescriptor>()
+                && let Some(counter) = dst.get_mut(1..MANDATORY_LEN)
+            {
+                counter.copy_from_slice(&dd.frame_number.to_be_bytes());
+            }
             raw.0.len()
         }
 

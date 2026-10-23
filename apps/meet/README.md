@@ -112,9 +112,11 @@ Reconnect restores data interest but creates fresh data tracks and sequence
 spaces, without cross-publication recovery. Use matching server and SDK versions;
 this contract has no legacy-mode or mixed-wire compatibility path.
 
-## Native reconnect limitation
+## Native reconnect acceptance
 
-The native DTLS reconnect simulation is excluded from ordinary acceptance under
-its [documented exception](../../crates/pulsebeam-simulator/docs/native-dtls-exception.md).
-It remains available through the opt-in command in that document. This limitation
-does not exclude the browser media and data recovery contracts.
+The native-agent libwebrtc lifecycle case is required again in ordinary
+simulation and replay after replacement media/topics/reconnect/close proof.
+The [former native-str0m DTLS exclusion](../../crates/pulsebeam-simulator/docs/native-dtls-exception.md)
+is historical, not a claim that the server's DTLS dependency was patched.
+Shared browser media/topic recovery and production transport acceptance remain
+separate requirements.

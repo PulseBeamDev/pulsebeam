@@ -12,13 +12,14 @@
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use pulsebeam_agent_native::agent_core::{
-    AgentConfig, ConnectionState, DesiredState, MediaKind, MediaTopology, PublicationIntent,
-    Snapshot, VideoSubscription,
+    AgentConfig, ConnectionState, DesiredState, MediaKind, MediaSlot, MediaTopology,
+    PublicationIntent, Snapshot, VideoSubscription,
 };
 use pulsebeam_agent_native::{
-    Agent, AgentEvent, Config, Host, LocalMedia, MediaFrame, MediaTime, RemoteMedia, SimulcastLayer,
+    Agent, Config, Encoding, H264Frame, Host, InputFrame, LocalSource, MediaStreamUpdate,
+    NativeStatistics, ReceiveMode, RemoteMedia, StreamUpdate, VideoInput, VideoPublicationConfig,
+    VideoSourceConfig,
 };
-use pulsebeam_agent_native::{clock::clock_anchor, wallclock_at};
 use pulsebeam_core::auth::{
     ApiKey, ApiSigningKey, DEVELOPMENT_API_KEY_ID, DEVELOPMENT_API_SIGNING_KEY,
     DEVELOPMENT_PROJECT_ID, KeyRegistry, KeyRegistryEntry,
@@ -27,7 +28,6 @@ use pulsebeam_core::identity::{
     ApiKeyId, AudioTrackId, ConnectionId, DataTrackId, ParticipantExternalId, ParticipantId,
     ProjectId, RoomExternalId, RoomId, VideoTrackId,
 };
-use pulsebeam_core::net::UdpSocket;
 use std::{
     collections::HashSet,
     io::Read,
@@ -35,7 +35,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tachyonix as mpsc;
-use tokio::sync::{broadcast, watch};
+use tokio::sync::watch;
 use tokio::{fs::File, io::BufWriter};
 use tokio::{io::AsyncWriteExt, task::JoinSet};
 use tokio::{runtime::Builder, time::Instant};
@@ -56,12 +56,13 @@ struct VideoAssets {
 }
 
 impl VideoAssets {
-    fn new() -> Self {
-        Self {
-            full: VideoAsset::new(pulsebeam_testdata::RAW_H264_FULL_CBR),
-            half: VideoAsset::new(pulsebeam_testdata::RAW_H264_HALF_CBR),
-            quarter: VideoAsset::new(pulsebeam_testdata::RAW_H264_QUARTER_CBR),
-        }
+    fn new() -> Result<Self> {
+        use pulsebeam_testdata::QualityVideoLayer::{P180, P360, P720};
+        Ok(Self {
+            full: VideoAsset::new(P720)?,
+            half: VideoAsset::new(P360)?,
+            quarter: VideoAsset::new(P180)?,
+        })
     }
 
     fn for_encoding(&self, encoding: Option<&str>) -> VideoAsset {
@@ -77,91 +78,115 @@ impl VideoAssets {
 struct VideoAsset {
     frames: Arc<[Arc<[u8]>]>,
     first_keyframe: usize,
+    width: u16,
+    height: u16,
 }
 
 impl VideoAsset {
-    fn new(data: &[u8]) -> Self {
-        let frames: Arc<[Arc<[u8]>]> = pulsebeam_agent_native::media::H264FrameSlicer::new(data)
-            .map(Arc::from)
+    fn new(layer: pulsebeam_testdata::QualityVideoLayer) -> Result<Self> {
+        let corpus = pulsebeam_testdata::quality_corpus_video(
+            pulsebeam_testdata::QualityVideoSource::Zero,
+            layer,
+        );
+        let frames: Arc<[Arc<[u8]>]> = (0..corpus.len())
+            .filter_map(|index| corpus.frame(index).map(|frame| Arc::from(frame.encoded)))
             .collect::<Vec<_>>()
             .into();
-        debug_assert!(!frames.is_empty());
+        anyhow::ensure!(
+            frames.len() == corpus.len() && !frames.is_empty(),
+            "incomplete encoded video fixture"
+        );
         let first_keyframe = frames
             .iter()
             .position(|frame| annex_b_has_nal(frame, 5))
-            .unwrap_or(0);
-        Self {
+            .context("video fixture has no keyframe")?;
+        let (width, height) = layer.dimensions();
+        Ok(Self {
             frames,
             first_keyframe,
-        }
+            width: width.try_into()?,
+            height: height.try_into()?,
+        })
+    }
+
+    fn frame(&self, index: usize, timestamp_us: i64) -> Option<H264Frame> {
+        let payload = self.frames.get(index)?.to_vec();
+        Some(H264Frame {
+            timestamp_us,
+            width: self.width,
+            height: self.height,
+            keyframe: annex_b_has_nal(&payload, 5),
+            temporal_index: None,
+            base_layer_sync: false,
+            payload,
+        })
     }
 }
 
 struct VideoSource {
-    asset: VideoAsset,
+    assets: Vec<VideoAsset>,
     index: usize,
     fps: u32,
 }
 
 impl VideoSource {
-    fn new(asset: VideoAsset, fps: u32) -> Self {
+    fn new(assets: Vec<VideoAsset>, fps: u32) -> Self {
         Self {
-            asset,
+            assets,
             index: 0,
             fps: fps.max(1),
         }
     }
 
-    async fn run(
-        mut self,
-        media: LocalMedia,
-        encoding: Option<String>,
-        mut events: broadcast::Receiver<AgentEvent>,
-    ) {
-        let mut frame_count = 0u64;
+    fn rewind(&mut self) {
+        if let Some(asset) = self.assets.first() {
+            self.index = asset.first_keyframe;
+        }
+    }
+
+    async fn run(mut self, media: LocalSource) {
+        let capture_origin = match media.capture_time_us().await {
+            Ok(time) => time,
+            Err(error) => {
+                tracing::warn!(%error, "native producer capture clock unavailable");
+                return;
+            }
+        };
+        let feedback = media.feedback();
+        let started = tokio::time::Instant::now();
         let mut interval =
             tokio::time::interval(Duration::from_secs_f64(1.0 / f64::from(self.fps)));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
-            let capture_time = interval.tick().await;
-            while let Ok(event) = events.try_recv() {
-                if keyframe_matches(&event, encoding.as_deref()) {
-                    self.index = self.asset.first_keyframe;
+            tokio::select! {
+                update = feedback.next() => match update {
+                    StreamUpdate::Closed => return,
+                    StreamUpdate::Lagged { skipped } => { tracing::warn!(skipped, "bench producer feedback lagged"); self.rewind(); },
+                    StreamUpdate::Value(feedback) => {
+                        if let Some(error) = feedback.encoder_error { tracing::warn!(?error, "native encoder feedback"); }
+                        if feedback.keyframe_requested || feedback.encoding_keyframes_requested.iter().any(|request| *request) { self.rewind(); }
+                    }
+                },
+                capture = interval.tick() => {
+                    let Some(timestamp_us) = i64::try_from(capture.duration_since(started).as_micros()).ok()
+                        .and_then(|offset| capture_origin.checked_add(offset)) else {
+                            tracing::warn!("native producer capture timestamp exhausted");
+                            return;
+                        };
+                    let Some(mut frames): Option<Vec<_>> = self.assets.iter().map(|asset| asset.frame(self.index, timestamp_us)).collect() else { return; };
+                    let frame = match frames.len() {
+                        1 => { let Some(frame) = frames.pop() else { return; }; InputFrame::H264 { frame } },
+                        3 => InputFrame::H264Simulcast { frames },
+                        _ => return,
+                    };
+                    if let Err(error) = media.submit(frame).await {
+                        if matches!(error, pulsebeam_agent_native::Error::Closed) { return; }
+                        tracing::warn!(%error, "bench native input admission refused");
+                    }
+                    self.index = self.index.saturating_add(1);
+                    if self.assets.first().is_some_and(|asset| self.index >= asset.frames.len()) { self.index = 0; }
                 }
             }
-            debug_assert!(self.index < self.asset.frames.len());
-            let is_keyframe = self.index == self.asset.first_keyframe;
-            let data = self
-                .asset
-                .frames
-                .get(self.index)
-                .cloned()
-                .unwrap_or_default();
-            let frame = MediaFrame {
-                audio_level: None,
-                voice_activity: None,
-                ts: MediaTime::from_90khz(
-                    frame_count
-                        .saturating_mul(90_000)
-                        .checked_div(u64::from(self.fps))
-                        .unwrap_or(0),
-                ),
-                data,
-                capture_time,
-                abs_capture_time: Some(pulsebeam_agent_native::clock::capture_wallclock()),
-                contiguous: true,
-                is_keyframe,
-                target_bitrate_bps: None,
-                resolution: None,
-                dependency_descriptor: None,
-                temporal_layers: None,
-            };
-            let _ = media.send_encoding(encoding.clone(), frame).await;
-            frame_count = frame_count.saturating_add(1);
-            self.index = if self.index.saturating_add(1) < self.asset.frames.len() {
-                self.index.saturating_add(1)
-            } else {
-                0
-            };
         }
     }
 }
@@ -286,17 +311,17 @@ pub struct EventLatency {
     captured_at: Instant,
     room_id: usize,
     agent_id: usize,
-    delay_us: u64,
+    delay_us: Option<u64>,
 }
 
 pub struct EventSnapshot {
     captured_at: Instant,
     room_id: usize,
     agent_id: usize,
-    tx_bytes: u64,
-    rx_bytes: u64,
-    rtt_us: u64,
-    loss_pct: f32,
+    tx_bytes: Option<u64>,
+    rx_bytes: Option<u64>,
+    rtt_us: Option<u64>,
+    loss_pct: Option<f64>,
 }
 
 #[derive(Clone)]
@@ -452,11 +477,13 @@ async fn run_bench(api_url: String, config: BenchConfig) -> Result<()> {
         latency: latency_tx,
         snapshot: snapshot_tx,
     };
-    let assets = VideoAssets::new();
+    let assets = VideoAssets::new()?;
+    let started = Instant::now();
     let mut join_set = JoinSet::new();
 
-    let latency_writer_handle = tokio::spawn(latency_writer_task(latency_rx, latency_csv));
-    let snapshot_writer_handle = tokio::spawn(snapshot_writer_task(snapshot_rx, snapshots_csv));
+    let latency_writer_handle = tokio::spawn(latency_writer_task(latency_rx, latency_csv, started));
+    let snapshot_writer_handle =
+        tokio::spawn(snapshot_writer_task(snapshot_rx, snapshots_csv, started));
 
     let mut total_rooms = 0usize;
     for room_id in 0..config.rooms {
@@ -548,36 +575,26 @@ async fn spawn_agent(
     simulcast: bool,
     duration: Duration,
 ) -> Result<()> {
-    let socket = UdpSocket::bind("0.0.0.0:0").await?;
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
     let session = benchmark_agent_config(&ctx.api_url, &room_name, ctx.agent_id, duration, now)?;
     let mut config = Config::new(session);
-    let encodings = if simulcast {
-        vec![
-            SimulcastLayer::new("q"),
-            SimulcastLayer::new("h"),
-            SimulcastLayer::new("f"),
-        ]
-    } else {
-        Vec::new()
-    };
-    if !encodings.is_empty() {
-        config
-            .video_encodings
-            .insert("camera".into(), encodings.clone());
-    }
-    let agent = Agent::spawn(config, Host::new(Box::new(reqwest::Client::new()), socket)).await?;
+    config.media.video_input = VideoInput::EncodedH264;
+    config.media.video_publications = vec![VideoPublicationConfig {
+        slot: "v0".into(),
+        source: benchmark_video_profile(simulcast),
+    }];
+    let agent = Agent::spawn(config, Host::new(Box::new(reqwest::Client::new()))).await?;
     let mut desired = DesiredState {
         revision: 1,
         connected: true,
         publications: vec![
             PublicationIntent {
-                slot: "camera".into(),
+                slot: "v0".into(),
                 label: "camera".into(),
                 active: true,
             },
             PublicationIntent {
-                slot: "microphone".into(),
+                slot: "a0".into(),
                 label: "microphone".into(),
                 active: true,
             },
@@ -589,23 +606,22 @@ async fn spawn_agent(
     wait_until_connected(&mut snapshots).await?;
 
     let mut media_tasks = JoinSet::new();
-    let camera = agent.local_media("camera");
-    let source_encodings = if encodings.is_empty() {
-        vec![None]
-    } else {
-        encodings
-            .iter()
-            .map(|layer| Some(layer.rid.to_string()))
+    let camera = agent.source(MediaSlot::LocalVideo("v0".into())).await?;
+    let assets = if simulcast {
+        ["q", "h", "f"]
+            .into_iter()
+            .map(|encoding| ctx.assets.for_encoding(Some(encoding)))
             .collect()
+    } else {
+        vec![ctx.assets.for_encoding(None)]
     };
-    for encoding in source_encodings {
-        let source = VideoSource::new(ctx.assets.for_encoding(encoding.as_deref()), 30);
-        media_tasks.spawn(source.run(camera.clone(), encoding, agent.events()));
-    }
+    media_tasks.spawn(VideoSource::new(assets, pulsebeam_testdata::QUALITY_VIDEO_FPS).run(camera));
 
     let (received_video_tx, received_video) = watch::channel(false);
     for slot in 0..REMOTE_VIDEO_SLOTS {
-        let remote = agent.remote_video(slot).await?;
+        let remote = agent
+            .remote(MediaSlot::RemoteVideo(slot), ReceiveMode::Encoded)
+            .await?;
         media_tasks.spawn(handle_receiving(
             remote,
             ctx.clone(),
@@ -636,20 +652,18 @@ async fn spawn_agent(
             _ = &mut session_end => break,
             _ = stats_interval.tick() => {
                 let stats = statistics.borrow().clone();
-                let rtt_us = stats
-                    .round_trip_time
-                    .map(|rtt| u64::try_from(rtt.as_micros()).unwrap_or(u64::MAX))
-                    .unwrap_or(0);
-
-                let _ = ctx.logger.snapshot.try_send(EventSnapshot {
-                    captured_at: Instant::now(),
-                    room_id: ctx.room_id,
-                    agent_id: ctx.agent_id,
-                    tx_bytes: stats.bytes_sent,
-                    rx_bytes: stats.bytes_received,
-                    rtt_us,
-                    loss_pct: stats.receive_loss.unwrap_or(0.0),
-                });
+                if let Some(stats) = stats {
+                    match native_counters(&stats) {
+                        Ok(counters) => {
+                            let _ = ctx.logger.snapshot.try_send(EventSnapshot {
+                                captured_at: Instant::now(), room_id: ctx.room_id, agent_id: ctx.agent_id,
+                                tx_bytes: counters.tx_bytes, rx_bytes: counters.rx_bytes,
+                                rtt_us: counters.rtt_us, loss_pct: counters.loss_pct,
+                            });
+                        }
+                        Err(error) => tracing::warn!(%error, "native statistics report is unreadable"),
+                    }
+                }
             }
             result = snapshots.changed() => {
                 result?;
@@ -708,29 +722,38 @@ fn benchmark_agent_config(
 }
 
 async fn handle_receiving(
-    mut media: RemoteMedia,
+    media: RemoteMedia,
     ctx: AgentContext,
     received_video: watch::Sender<bool>,
 ) {
     let mut received = false;
-    while let Ok(rtp) = media.recv_packet().await {
-        if !received {
-            received = true;
-            received_video.send_replace(true);
-            tracing::info!(
-                room_id = ctx.room_id,
-                agent_id = ctx.agent_id,
-                "bench agent received remote video"
-            );
-        }
-        if let Some(abs_capture_time) = rtp.ext_vals.abs_capture_time.map(|a| a.capture_time) {
-            let wallclock = wallclock_at(Instant::now());
-            if let Ok(latency) = wallclock.duration_since(abs_capture_time) {
+    loop {
+        match media.next().await {
+            MediaStreamUpdate::Closed => return,
+            MediaStreamUpdate::Track { .. } => {}
+            MediaStreamUpdate::Lagged { skipped } => {
+                tracing::warn!(skipped, "bench media observer lagged");
+            }
+            MediaStreamUpdate::NativeDropped { skipped } => {
+                tracing::warn!(skipped, "native media sink dropped frames");
+            }
+            MediaStreamUpdate::Frame { .. } => {
+                if !received {
+                    received = true;
+                    received_video.send_replace(true);
+                    tracing::info!(
+                        room_id = ctx.room_id,
+                        agent_id = ctx.agent_id,
+                        "bench agent received native video; uncorrelated capture timestamps are not end-to-end latency"
+                    );
+                }
                 let _ = ctx.logger.latency.try_send(EventLatency {
                     captured_at: Instant::now(),
                     room_id: ctx.room_id,
                     agent_id: ctx.agent_id,
-                    delay_us: u64::try_from(latency.as_micros()).unwrap_or(u64::MAX),
+                    // Native capture metadata does not establish a common sender/
+                    // observer clock. Preserve observations without inventing latency.
+                    delay_us: None,
                 });
             }
         }
@@ -806,7 +829,11 @@ fn video_subscriptions(snapshot: &Snapshot) -> (Vec<VideoSubscription>, HashSet<
     (subscriptions, participants)
 }
 
-async fn latency_writer_task(mut rx: mpsc::Receiver<EventLatency>, file: File) -> Result<()> {
+async fn latency_writer_task(
+    mut rx: mpsc::Receiver<EventLatency>,
+    file: File,
+    started: Instant,
+) -> Result<()> {
     let mut writer = BufWriter::with_capacity(16 * 1024, file);
     let _ = writer
         .write_all("elapsed_ms,room_id,agent_id,delay_us\n".as_bytes())
@@ -818,10 +845,10 @@ async fn latency_writer_task(mut rx: mpsc::Receiver<EventLatency>, file: File) -
             .write_all(
                 format!(
                     "{},{},{},{}\n",
-                    clock_anchor().since(e.captured_at).as_millis(),
+                    e.captured_at.saturating_duration_since(started).as_millis(),
                     e.room_id,
                     e.agent_id,
-                    e.delay_us,
+                    csv_cell(e.delay_us),
                 )
                 .as_bytes(),
             )
@@ -837,7 +864,11 @@ async fn latency_writer_task(mut rx: mpsc::Receiver<EventLatency>, file: File) -
     Ok(())
 }
 
-async fn snapshot_writer_task(mut rx: mpsc::Receiver<EventSnapshot>, file: File) -> Result<()> {
+async fn snapshot_writer_task(
+    mut rx: mpsc::Receiver<EventSnapshot>,
+    file: File,
+    started: Instant,
+) -> Result<()> {
     let mut writer = BufWriter::with_capacity(4 * 1024, file);
     let _ = writer
         .write_all("elapsed_ms,room_id,agent_id,tx_bytes,rx_bytes,rtt_us,loss_pct\n".as_bytes())
@@ -847,14 +878,16 @@ async fn snapshot_writer_task(mut rx: mpsc::Receiver<EventSnapshot>, file: File)
         let _ = writer
             .write_all(
                 format!(
-                    "{},{},{},{},{},{},{:.4}\n",
-                    clock_anchor().since(e.captured_at).as_millis(),
+                    "{},{},{},{},{},{},{}\n",
+                    e.captured_at.saturating_duration_since(started).as_millis(),
                     e.room_id,
                     e.agent_id,
-                    e.tx_bytes,
-                    e.rx_bytes,
-                    e.rtt_us,
+                    csv_cell(e.tx_bytes),
+                    csv_cell(e.rx_bytes),
+                    csv_cell(e.rtt_us),
                     e.loss_pct
+                        .map(|value| format!("{value:.4}"))
+                        .unwrap_or_default()
                 )
                 .as_bytes(),
             )
@@ -865,14 +898,113 @@ async fn snapshot_writer_task(mut rx: mpsc::Receiver<EventSnapshot>, file: File)
     Ok(())
 }
 
-fn keyframe_matches(event: &AgentEvent, encoding: Option<&str>) -> bool {
-    matches!(
-        event,
-        AgentEvent::KeyframeRequested {
-            slot,
-            encoding: requested,
-        } if slot == "camera" && requested.as_deref() == encoding
-    )
+fn csv_cell<T: ToString>(value: Option<T>) -> String {
+    value.map(|value| value.to_string()).unwrap_or_default()
+}
+
+fn benchmark_video_profile(simulcast: bool) -> VideoSourceConfig {
+    let encodings = if simulcast {
+        [
+            ("q", 4.0, 100_000),
+            ("h", 2.0, 400_000),
+            ("f", 1.0, 1_000_000),
+        ]
+        .into_iter()
+        .map(|(rid, scale_down_by, max_bitrate_bps)| Encoding {
+            rid: Some(rid.into()),
+            scale_down_by,
+            max_bitrate_bps: Some(max_bitrate_bps),
+            max_framerate: Some(30.0),
+            temporal_layers: 1,
+        })
+        .collect()
+    } else {
+        vec![Encoding {
+            max_bitrate_bps: Some(400_000),
+            max_framerate: Some(30.0),
+            ..Encoding::default()
+        }]
+    };
+    VideoSourceConfig {
+        encodings,
+        ..VideoSourceConfig::default()
+    }
+}
+
+#[derive(Debug, PartialEq)]
+struct NativeCounters {
+    tx_bytes: Option<u64>,
+    rx_bytes: Option<u64>,
+    rtt_us: Option<u64>,
+    loss_pct: Option<f64>,
+}
+
+fn sum_counter<'a>(
+    records: impl Iterator<Item = &'a serde_json::Value>,
+    field: &str,
+) -> Option<u64> {
+    let mut total: Option<u64> = None;
+    for record in records {
+        total = Some(
+            total
+                .unwrap_or(0)
+                .checked_add(record.get(field)?.as_u64()?)?,
+        );
+    }
+    total
+}
+
+#[allow(
+    clippy::arithmetic_side_effects,
+    clippy::cast_precision_loss,
+    reason = "Presentation ratio of native counters with a nonzero checked denominator"
+)]
+fn loss_percentage(lost: u64, received: u64) -> Option<f64> {
+    let total = lost.checked_add(received)?;
+    (total > 0).then(|| (lost as f64) * 100.0 / (total as f64))
+}
+
+fn native_counters(report: &NativeStatistics) -> Result<NativeCounters> {
+    let json: serde_json::Value = serde_json::from_slice(&report.report_json)?;
+    let records: Vec<_> = match &json {
+        serde_json::Value::Array(records) => records.iter().collect(),
+        serde_json::Value::Object(records) => records.values().collect(),
+        _ => anyhow::bail!("native RTC statistics are not a collection"),
+    };
+    let transports: Vec<_> = records
+        .iter()
+        .copied()
+        .filter(|record| {
+            record.get("type").and_then(serde_json::Value::as_str) == Some("transport")
+        })
+        .collect();
+    let inbound: Vec<_> = records
+        .iter()
+        .copied()
+        .filter(|record| {
+            record.get("type").and_then(serde_json::Value::as_str) == Some("inbound-rtp")
+        })
+        .collect();
+    let rtt_us = transports
+        .iter()
+        .filter_map(|transport| {
+            let selected = transport.get("selectedCandidatePairId")?.as_str()?;
+            let pair = records.iter().find(|record| {
+                record.get("id").and_then(serde_json::Value::as_str) == Some(selected)
+            })?;
+            let seconds = pair.get("currentRoundTripTime")?.as_f64()?;
+            u64::try_from(Duration::try_from_secs_f64(seconds).ok()?.as_micros()).ok()
+        })
+        .max();
+    let loss_pct = sum_counter(inbound.iter().copied(), "packetsLost")
+        .zip(sum_counter(inbound.iter().copied(), "packetsReceived"))
+        .and_then(|(lost, received)| loss_percentage(lost, received));
+    Ok(NativeCounters {
+        tx_bytes: sum_counter(transports.iter().copied(), "bytesSent"),
+        rx_bytes: sum_counter(transports.iter().copied(), "bytesReceived"),
+        rtt_us,
+        loss_pct,
+    })
 }
 
 fn annex_b_has_nal(data: &[u8], wanted: u8) -> bool {
@@ -913,6 +1045,90 @@ mod tests {
             }],
         )
         .unwrap()
+    }
+
+    #[test]
+    fn native_fixture_rungs_have_genuine_units_and_matching_dimensions() {
+        let assets = VideoAssets::new().unwrap();
+        let frames: Vec<_> = ["q", "h", "f"]
+            .into_iter()
+            .map(|rid| {
+                let asset = assets.for_encoding(Some(rid));
+                assert_eq!(
+                    asset.frames.len(),
+                    pulsebeam_testdata::QUALITY_CORPUS_VIDEO_FRAME_COUNT
+                );
+                asset.frame(asset.first_keyframe, 42).unwrap()
+            })
+            .collect();
+        assert_eq!(
+            frames
+                .iter()
+                .map(|frame| (frame.width, frame.height))
+                .collect::<Vec<_>>(),
+            [(320, 180), (640, 360), (1280, 720)]
+        );
+        assert!(
+            frames
+                .iter()
+                .all(|frame| frame.keyframe && frame.timestamp_us == 42)
+        );
+        let mut payloads = frames.iter().map(|frame| &frame.payload);
+        let q = payloads.next().unwrap();
+        let h = payloads.next().unwrap();
+        let f = payloads.next().unwrap();
+        assert_ne!(q, h);
+        assert_ne!(h, f);
+        assert_ne!(q, f);
+        let profile = benchmark_video_profile(true);
+        assert_eq!(
+            profile
+                .encodings
+                .iter()
+                .map(|encoding| encoding.rid.as_deref())
+                .collect::<Vec<_>>(),
+            [Some("q"), Some("h"), Some("f")]
+        );
+        assert_eq!(
+            profile
+                .encodings
+                .iter()
+                .map(|encoding| encoding.scale_down_by.to_bits())
+                .collect::<Vec<_>>(),
+            [4.0f64.to_bits(), 2.0f64.to_bits(), 1.0f64.to_bits()]
+        );
+        assert_eq!(benchmark_video_profile(false).encodings.len(), 1);
+    }
+
+    #[test]
+    fn csv_projects_native_counters_without_fabricating_missing_values() {
+        let report = NativeStatistics { generation: 1, timestamp_us: 0, report_json: br#"[
+            {"type":"transport","bytesSent":1200,"bytesReceived":2400,"selectedCandidatePairId":"pair"},
+            {"id":"pair","type":"candidate-pair","currentRoundTripTime":0.0125},
+            {"type":"inbound-rtp","packetsLost":2,"packetsReceived":98}
+        ]"#.to_vec() };
+        let counters = native_counters(&report).unwrap();
+        assert_eq!(counters.tx_bytes, Some(1200));
+        assert_eq!(counters.rx_bytes, Some(2400));
+        assert_eq!(counters.rtt_us, Some(12_500));
+        assert_eq!(counters.loss_pct.map(f64::to_bits), Some(2.0f64.to_bits()));
+        let empty = native_counters(&NativeStatistics {
+            report_json: b"[]".to_vec(),
+            ..report
+        })
+        .unwrap();
+        assert_eq!(
+            empty,
+            NativeCounters {
+                tx_bytes: None,
+                rx_bytes: None,
+                rtt_us: None,
+                loss_pct: None
+            }
+        );
+        assert_eq!(csv_cell(empty.tx_bytes), "");
+        assert_eq!(csv_cell(Some(0)), "0");
+        assert!(loss_percentage(0, 0).is_none());
     }
 
     #[test]

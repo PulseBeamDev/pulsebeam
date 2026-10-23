@@ -324,13 +324,17 @@ mod slow {
                 .with_bandwidth(2_200_000)
                 .with_room(
                     Room::new("room1")
-                        .with_participant(Participant::publisher("camera", &["q", "h", "f"]))
-                        .with_participant(Participant::publisher("protected", &["q", "h", "f"]))
+                        .with_participant(Participant::quality_ladder_publisher(
+                            "camera", pulsebeam_testdata::QualityVideoSource::Zero,
+                        ))
+                        .with_participant(Participant::quality_ladder_publisher(
+                            "protected", pulsebeam_testdata::QualityVideoSource::One,
+                        ))
                         .with_participant(Participant::manual_subscriber("viewer", 2)),
                 )
                 .run(vec![
                     Step::Run {
-                        description: "Discover both constant-rate camera ladders",
+                        description: "Discover both distinguishable native camera ladders",
                         duration: Duration::from_secs(5),
                     },
                     Step::SubscribeToQos {
@@ -925,13 +929,11 @@ fn screenshare_and_camera_conference_test() {
 
 #[test]
 fn late_joiner_receives_earlier_participant_in_both_directions_test() {
-    let mut first = Participant::publisher("first", &["q", "h", "f"])
-        .with_temporal_dd(3)
-        .and_subscribes();
+    // Native H264 simulcast is S3T1, with DD still negotiated. This regression
+    // checks bidirectional late-join delivery, not temporal-layer shedding.
+    let mut first = Participant::publisher("first", &["q", "h", "f"]).and_subscribes();
     first.auto_subscribe = false;
-    let mut second = Participant::publisher("second", &["q", "h", "f"])
-        .with_temporal_dd(3)
-        .and_subscribes();
+    let mut second = Participant::publisher("second", &["q", "h", "f"]).and_subscribes();
     second.auto_subscribe = false;
     second.starts_disconnected = true;
 
@@ -2230,7 +2232,7 @@ fn a_plan_measures_identically_when_replayed_test() {
 /// variance was the globally-cleared stats map wiping a running plan's counters mid-window.
 fn deterministic_core(report: &LinkReport) -> String {
     format!(
-        "window={:?} received={} forwarded={} samples={} estimate={}/{}/{} drawdown={:.6} \
+        "window={:?} received={:?} forwarded={} samples={} estimate={}/{}/{} drawdown={:.6} \
          demand={}/{}/{} backlog={:?} delivered={} congestion_drops={} link_loss={} changes={:?} \
          reversals={:?} quality={:?}",
         report.window,
@@ -2350,12 +2352,21 @@ fn deterministic_probe_plan(seed: u64) -> LinkReport {
 /// initial BWE optimism cannot give a permanently starved peer a passing sample.
 #[test]
 fn equal_priority_subscriptions_share_a_scarce_link_test() {
+    use pulsebeam_testdata::{QualityVideoLayer::P180, QualityVideoSource::*};
+    // Keep the native q encoding/limits and 180p asks, but use three genuinely
+    // distinct inputs: two quality clips plus the original quarter-CBR clip.
     LocalNodeSim::new()
         .with_bandwidth(300_000)
         .with_room(
             Room::new("room1")
-                .with_participant(Participant::publisher("ann", &["q"]))
-                .with_participant(Participant::publisher("ben", &["q"]))
+                .with_participant(Participant {
+                    quality_video: Some((Zero, P180)),
+                    ..Participant::publisher("ann", &["q"])
+                })
+                .with_participant(Participant {
+                    quality_video: Some((One, P180)),
+                    ..Participant::publisher("ben", &["q"])
+                })
                 .with_participant(Participant::publisher("cal", &["q"]))
                 .with_participant(Participant::manual_subscriber("viewer", 3)),
         )

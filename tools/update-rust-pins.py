@@ -52,6 +52,21 @@ def locked_package(lock, name, spec):
     return matches[0]
 
 
+def native_tracing_override(lock, native_lock):
+    """Preserve the application's subscriber across the isolated str0m source."""
+    versions = {}
+    for name in ("tracing", "tracing-core"):
+        application = [(p["version"], p.get("source")) for p in lock if p["name"] == name]
+        native = [(p["version"], p.get("source")) for p in native_lock if p["name"] == name]
+        if len(application) != 1 or native != application:
+            raise ValueError(f"shared native {name} requires one matching application/native lock identity")
+        versions[name] = application[0][0]
+    # Overriding tracing also shares its tracing-core dependency. A second
+    # tracing-core instance would otherwise own an unconfigured dispatcher.
+    return (f'crate.annotation(crate = "tracing", version = "={versions["tracing"]}", '
+            'override_target_lib = "@crates//:tracing", repositories = ["str0m_native"])\n')
+
+
 def str0m_visibility_patch(source):
     """Expose only RTC's required internals, without modifying Cargo's checkout."""
     source = Path(source)
@@ -206,6 +221,8 @@ def main():
         unexpected = [p for p in derived if p["name"] != name and (p["name"], p["version"], p.get("source")) not in identities]
         if unexpected:
             raise ValueError(f"{name} resolved dependencies outside the authoritative root lock: {unexpected}")
+        if name == "str0m_native":
+            tracing_override = native_tracing_override(lock, derived)
         if name == "str0m_rtc":
             rtc_package, has_visibility_patch = rtc_visibility(root, lock, deps, json.loads(resolved.stdout))
     hashes = json.dumps(rust_archive_hashes(rust), indent=4)
@@ -267,6 +284,7 @@ use_repo(crate, "{name}")
         package = locked_package(lock, "str0m", spec)
         fragment += f'crate.annotation(crate = "str0m", version = "={package["version"]}", override_target_lib = "@{name}//:str0m", repositories = ["crates"])\n'
     fragment += 'crate.annotation(crate = "is", override_target_lib = "@str0m_rtc//:is", repositories = ["crates"])\n'
+    fragment += tracing_override
     if has_visibility_patch:
         fragment += f'crate.annotation(crate = "str0m", version = "={rtc_package["version"]}", patches = ["//tools:patches/str0m-rtc-visibility.patch"], patch_args = ["-p1"], repositories = ["str0m_rtc"])\n'
     (root / "tools/rust-pins.MODULE.bazel").write_text(fragment)

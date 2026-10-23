@@ -30,6 +30,11 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
+[dev-dependencies]
+pulsebeam = { path = "../pulsebeam" }
+pulsebeam-runtime = { path = "../pulsebeam-runtime" }
+tokio-util.workspace = true
+
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 # tikv-jemallocator = { version = "0.7.0", features = [
 #   "disable_initial_exec_tls",

@@ -575,6 +575,36 @@ impl VideoAllocator {
                 crate::bitrate::saturating_bps(available_bandwidth.as_f64()),
             );
             for view in &views {
+                if tracing::enabled!(target: "pulsebeam_sim_qos", tracing::Level::DEBUG) {
+                    let layers: Vec<_> = view
+                        .track
+                        .layers()
+                        .iter()
+                        .map(|layer| (layer.stream_id(), layer.quality))
+                        .collect();
+                    // Exact frozen inputs and charged decision from this pass.
+                    // Layer measurements are ingress estimates, not wire egress.
+                    tracing::debug!(target: "pulsebeam_sim_qos",
+                        participant = ?self.ctx.participant_id,
+                        pass = self.allocation_pass,
+                        slot = ?view.key,
+                        origin = ?view.track.meta().origin,
+                        target_height = view.max_height,
+                        min_height = view.min_height,
+                        min_fps = view.min_fps,
+                        priority = view.priority,
+                        forwarding = view.forwarding,
+                        current_quality = ?view.current_quality,
+                        current_decode_target = ?view.current_decode_target,
+                        available_bps = available_bandwidth.as_f64(),
+                        desired_raw_bps = desired_raw.as_f64(),
+                        desired_bps = desired.as_f64(),
+                        allocated_bps = self.current_allocation.as_f64(),
+                        ?layers,
+                        measurements = ?engine.snaps,
+                        decision = ?decisions.get(view.key),
+                        "same-pass QoS inputs and decision");
+                }
                 let quality = match decisions.get(view.key) {
                     Some(
                         AllocationDecision::Forward(layer, _)
@@ -2299,6 +2329,55 @@ mod assignment_tests {
             engine.decode_target_count(plain),
             1,
             "a non-scalable encoding is a single rung"
+        );
+    }
+
+    #[test]
+    fn native_h264_t1_capacity_does_not_create_cheaper_temporal_choices() {
+        let (tx, built, mut states) = video_track_with_states(
+            ParticipantId::new(),
+            Mid::from("v0"),
+            vec![SimulcastLayer::new("f")],
+        );
+        let track = Track::video(tx.meta, built.layers().to_vec(), None);
+        let high = track.by_quality(LayerQuality::High).unwrap();
+        let state = state_of_mut(&mut states, high);
+        state.bitrate(1_000_000).set_height(720);
+        state.decode_targets = 4;
+        state.temporal_only = true;
+        state.decode_target_heights = [1; crate::rtp::monitor::MAX_LADDER_TARGETS];
+        state.set_temporal_ladder(&[1000], 30);
+        let mut keys: SlotMap<DownstreamSlotKey, ()> = SlotMap::with_key();
+        let view = SlotView {
+            key: keys.insert(()),
+            mid: Mid::from("s0"),
+            max_height: 720,
+            min_height: 720,
+            min_fps: 0,
+            priority: 10,
+            track: &track,
+            current_quality: LayerQuality::High,
+            current_decode_target: DecodeTargetSelection::Full,
+            forwarding: true,
+        };
+        let engine = AllocationEngine::new(std::slice::from_ref(&view), &states);
+        let choices = engine.choices(&view);
+        assert_eq!(engine.decode_target_count(high), 1);
+        assert_eq!(choices.len(), 1);
+        assert_eq!(choices[0].target, DecodeTargetSelection::Full);
+        assert_eq!(choices[0].cost, 1_000_000.0);
+        assert_eq!((choices[0].height, choices[0].fps), (720, 30));
+
+        state_of_mut(&mut states, high).set_temporal_ladder(&[250, 500, 1000], 30);
+        let engine = AllocationEngine::new(std::slice::from_ref(&view), &states);
+        assert_eq!(engine.decode_target_count(high), 3);
+        assert_eq!(
+            engine
+                .choices(&view)
+                .iter()
+                .map(|choice| choice.cost)
+                .collect::<Vec<_>>(),
+            [250_000.0, 500_000.0, 1_000_000.0]
         );
     }
 

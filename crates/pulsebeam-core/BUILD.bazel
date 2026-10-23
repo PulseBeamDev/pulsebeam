@@ -40,6 +40,42 @@ rust_library(
     proc_macro_deps = all_crate_deps(proc_macro = True),
 )
 
+# The native SDK needs HTTP services, not the SFU's optional RTP serializers.
+# crate-universe resolves the workspace feature union, so omit that optional
+# dependency as well as its feature for these narrower native edges.
+_HTTP_DEPS = [dep for dep in all_crate_deps(normal = True) if not str(dep).rsplit(":", 1)[-1].startswith("str0m")] + ["//crates/pulsebeam-auth"]
+
+rust_library(
+    name = "pulsebeam-core-http",
+    crate_name = "pulsebeam_core",
+    crate_root = "src/lib.rs",
+    srcs = glob(["src/**/*.rs"], exclude = ["src/bin/**"]),
+    compile_data = glob(["README.md", "src/**"], exclude = ["src/**/*.rs"]) + ["//server/auth:development.json"],
+    edition = crate_edition(),
+    crate_features = ["reqwest"],
+    rustc_env_files = [":cargo_env"],
+    lint_config = ":lints",
+    aliases = aliases(),
+    deps = _HTTP_DEPS,
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+)
+
+rust_library(
+    name = "pulsebeam-core-http-sim",
+    crate_name = "pulsebeam_core",
+    crate_root = "src/lib.rs",
+    srcs = glob(["src/**/*.rs"], exclude = ["src/bin/**"]),
+    compile_data = glob(["README.md", "src/**"], exclude = ["src/**/*.rs"]) + ["//server/auth:development.json"],
+    edition = crate_edition(),
+    crate_features = ["reqwest", "sim"],
+    rustc_flags = ["-Copt-level=2", "-Cdebug-assertions=yes", "-Coverflow-checks=yes"],
+    rustc_env_files = [":cargo_env"],
+    lint_config = ":lints",
+    aliases = aliases(),
+    deps = _HTTP_DEPS,
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+)
+
 rust_library(
     name = "pulsebeam-core-sim",
     crate_name = "pulsebeam_core",

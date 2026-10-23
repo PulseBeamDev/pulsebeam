@@ -19,6 +19,7 @@ load("@web_npm//agents/pulsebeam-agent-web:prettier/package_json.bzl", prettier 
 package(default_visibility = ["//visibility:public"])
 filegroup(name = "workflow_inputs", srcs = glob(["*.md", "docs/**/*.md", "Justfile", "*.json", "*.yaml", "scripts/*.sh"], allow_empty = True))
 exports_files(["Cargo.toml", "package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml"])
+filegroup(name = "destination_test_support", testonly = True, srcs = ["tests/support/destination.rs"])
 
 npm_link_all_packages(name = "node_modules")
 typescript.tsc_binary(name = "tsc")

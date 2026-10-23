@@ -360,6 +360,8 @@ impl AudioAllocator {
             slot.pending_marker = false;
         }
         writer.write_audio_owned(pkt, origin.track, slot.mid, slot.ssrc, slot.pt);
+        #[cfg(feature = "sim")]
+        crate::sim_metrics::record_queued_audio(self.ctx.participant_id, origin);
         Some(())
     }
 
@@ -528,6 +530,38 @@ mod tests {
                 .on_rtp(origin(1), &speaking(-30), &mut StreamWriter::new())
                 .is_none()
         );
+    }
+
+    #[cfg(feature = "sim")]
+    #[test]
+    fn audio_queue_observation_counts_only_accepted_subscriber_writes_and_resets() {
+        crate::sim_metrics::reset();
+        let mut alloc = allocator_with(1);
+        let subscriber = alloc.ctx.participant_id;
+        let source = origin(1);
+        let mut writer = StreamWriter::new();
+        assert!(
+            alloc
+                .on_rtp(source, &RtpPacket::default(), &mut writer)
+                .is_none()
+        );
+        assert!(crate::sim_metrics::queued_audio_for(subscriber).is_empty());
+        assert!(alloc.on_rtp(source, &speaking(-20), &mut writer).is_some());
+        assert_eq!(
+            crate::sim_metrics::queued_audio_for(subscriber)
+                .get(&source)
+                .map(|queued| queued.packets),
+            Some(1)
+        );
+        assert!(crate::sim_metrics::queued_audio_for(origin(9).participant).is_empty());
+        assert!(
+            alloc
+                .on_rtp(origin(2), &speaking(-70), &mut writer)
+                .is_none()
+        );
+        assert_eq!(crate::sim_metrics::queued_audio_for(subscriber).len(), 1);
+        crate::sim_metrics::reset();
+        assert!(crate::sim_metrics::queued_audio_for(subscriber).is_empty());
     }
 
     #[test]

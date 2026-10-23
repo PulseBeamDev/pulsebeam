@@ -100,12 +100,22 @@ pub struct VideoAllocationObservation {
     pub slots: Vec<VideoSlotObservation>,
 }
 
+/// Current assigned receiver and source, in actual selector loudness order.
+#[derive(Clone, Debug)]
+pub struct AudioSlotObservation {
+    pub track: TrackId,
+    pub origin: ParticipantId,
+    pub mid: String,
+    pub level_dbov: i8,
+}
+
 #[derive(Clone, Debug)]
 pub struct ShardParticipantObservation {
     pub id: ParticipantId,
     pub connection: ConnectionId,
     pub transport: NodeTransportAddress,
     pub video: VideoAllocationObservation,
+    pub audio: Vec<AudioSlotObservation>,
 }
 
 #[derive(Clone, Debug)]

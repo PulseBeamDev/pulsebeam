@@ -318,9 +318,8 @@ fn reference_error_pcm(pcm: &[i16], reference: &[u8]) -> Option<ReferenceError> 
     }
     let mut sum = 0u64;
     let mut max = 0u16;
-    for (actual, bytes) in pcm.iter().zip(reference.chunks_exact(2)) {
-        let bytes = <[u8; 2]>::try_from(bytes).ok()?;
-        let expected = i16::from_le_bytes(bytes);
+    for (actual, bytes) in pcm.iter().zip(reference.as_chunks::<2>().0) {
+        let expected = i16::from_le_bytes(*bytes);
         let error = actual.abs_diff(expected);
         sum = sum.checked_add(u64::from(error))?;
         max = max.max(error);
@@ -351,13 +350,10 @@ fn combine_errors(errors: [ReferenceError; 3]) -> ReferenceError {
 #[cfg(test)]
 mod tests {
     use super::{H264ReferenceDecoder, OpusReferenceDecoder};
-    use pulsebeam_agent_native::{FrameReceiver, FrameSender, MediaFrame, MediaTime};
     use pulsebeam_testdata::{
         QualityVideoLayer, QualityVideoSource, RAW_H264_FULL_CBR, RAW_H264_HALF_CBR,
         RAW_H264_QUARTER_CBR, quality_corpus_audio, quality_corpus_video,
     };
-    use std::sync::Arc;
-    use tokio::time::Instant;
 
     #[test]
     fn reference_error_measures_pixels_not_stride_padding() {
@@ -433,49 +429,20 @@ mod tests {
     }
 
     #[test]
-    fn raw_h264_round_trips_through_agent_pipeline_and_decodes() {
+    fn raw_h264_fixture_access_units_decode_in_order() {
+        // Elementary-stream validation only. Packetization and transport belong
+        // to the native real-SFU acceptance scenario, not a fixture packetizer.
         let access_units: Vec<_> =
             pulsebeam_agent_native::media::H264FrameSlicer::new(RAW_H264_FULL_CBR)
                 .take(180)
                 .collect();
         assert!(access_units.len() >= 100);
-        let mut sender = FrameSender::h264(pulsebeam_agent_native::Mid::from("v0"), None, 1, 1);
-        let mut receiver = FrameReceiver::with_h264();
         let mut decoder = H264ReferenceDecoder::new("raw", "video");
-        let mut decoded = 0usize;
-        let mut received_frames = 0usize;
-        for (index, access_unit) in access_units.iter().enumerate() {
-            let frame = MediaFrame {
-                ts: MediaTime::from_90khz(u64::try_from(index).unwrap_or(0) * 3_000),
-                data: Arc::from(*access_unit),
-                capture_time: Instant::now(),
-                abs_capture_time: None,
-                contiguous: true,
-                is_keyframe: index == 0,
-                audio_level: None,
-                voice_activity: None,
-                target_bitrate_bps: None,
-                resolution: None,
-                dependency_descriptor: None,
-                temporal_layers: None,
-            };
-            for packet in sender.packetize(&frame) {
-                for received in receiver.push(packet) {
-                    received_frames += 1;
-                    if decoder.try_decode_observation(&received.data, None).is_ok() {
-                        decoded += 1;
-                    }
-                }
-            }
+        for access_unit in &access_units {
+            decoder
+                .try_decode_observation(access_unit, None)
+                .expect("fixture access unit must decode");
         }
-        for received in receiver.flush() {
-            received_frames += 1;
-            if decoder.try_decode_observation(&received.data, None).is_ok() {
-                decoded += 1;
-            }
-        }
-        assert_eq!(received_frames, access_units.len());
-        assert_eq!(decoded, access_units.len());
     }
 
     #[test]

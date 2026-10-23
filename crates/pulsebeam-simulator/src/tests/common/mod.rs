@@ -2,6 +2,9 @@ pub mod client;
 pub mod decoder;
 pub mod harness;
 pub mod media;
+pub mod native;
+pub mod native_audio;
+pub mod native_video;
 pub mod oracle;
 
 pub use harness::{
@@ -183,7 +186,7 @@ pub fn run_sim_or_timeout(sim: &mut turmoil::Sim<'_>, timeout: Duration) -> turm
             .into());
         }
 
-        let is_finished = sim.step()?;
+        let is_finished = native::step(sim)?;
         if is_finished {
             return Ok(());
         }

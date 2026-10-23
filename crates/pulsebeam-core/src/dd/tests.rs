@@ -462,6 +462,36 @@ mod serializer {
     }
 
     #[test]
+    fn projected_frame_number_reaches_wire_without_reencoding_source_fields() {
+        let original = keyframe(&structure_l1t3());
+        let bytes = encode(&original);
+        let mut ev = ExtensionValues::default();
+        assert!(Serializer.parse_value(&bytes, &mut ev));
+        let mut projected = original;
+        projected.frame_number = 23;
+        ev.user_values.set(projected.clone());
+
+        let mut out = [0u8; MAX_DD_LEN];
+        let n = Serializer.write_to(&mut out, &ev);
+        assert_eq!(n, bytes.len());
+        assert_eq!(out[0], bytes[0]);
+        assert_eq!(&out[3..n], &bytes[3..]);
+        assert_eq!(
+            DependencyDescriptorReader::new().read(&out[..n]).unwrap(),
+            projected
+        );
+        assert_eq!(
+            ev.user_values
+                .get::<RawDependencyDescriptor>()
+                .unwrap()
+                .0
+                .as_slice(),
+            bytes.as_slice(),
+            "source bytes remain immutable"
+        );
+    }
+
+    #[test]
     fn rejects_under_and_oversized_buffers() {
         let mut ev = ExtensionValues::default();
         assert!(!Serializer.parse_value(&[0x80, 0x00], &mut ev));

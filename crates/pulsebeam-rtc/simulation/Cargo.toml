@@ -1,5 +1,3 @@
-[workspace]
-
 [package]
 name = "pulsebeam-rtc-simulation"
 version = "0.0.0"
@@ -7,7 +5,7 @@ edition = "2024"
 publish = false
 
 [dependencies]
-pulsebeam-webrtc-sys = { version = "=0.8.0", path = "../../../.native-candidate/current/source" }
+pulsebeam-webrtc-sys.workspace = true
 [dev-dependencies]
 pulsebeam-rtc = { path = ".." }
 bytes = "1.11.1"
