@@ -346,7 +346,9 @@ pub(crate) fn session<R: rtc::SessionRuntime>(
         message: error.to_string(),
     })?;
     #[cfg(feature = "sim")]
-    if tracing::enabled!(target: crate::native_packet_diagnostics::TARGET, tracing::Level::TRACE) {
+    if tracing::enabled!(target: crate::native_packet_diagnostics::TARGET, tracing::Level::TRACE)
+        || tracing::enabled!(target: crate::native_packet_diagnostics::CC_TARGET, tracing::Level::TRACE)
+    {
         builder = builder.event_log_factory(crate::native_packet_diagnostics::Factory::new());
     }
     builder.video_decoder_factory(&decoder).build()
