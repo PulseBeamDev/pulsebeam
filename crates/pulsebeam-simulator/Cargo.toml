@@ -36,9 +36,11 @@ pulsebeam = { path = "../pulsebeam", features = ["sim"] }
 pulsebeam-agent-native = { path = "../../agents/pulsebeam-agent-native", features = ["sim"] }
 pulsebeam-agent-core = { path = "../../agents/pulsebeam-agent-core" }
 pulsebeam-core = { path = "../pulsebeam-core", features = ["sim"] }
+pulsebeam-rtc-simulation = { path = "../pulsebeam-rtc/simulation" }
 pulsebeam-runtime = { path = "../pulsebeam-runtime", features = ["sim"] }
 pulsebeam-testdata = { path = "../pulsebeam-testdata" }
 reqwest = "0.13.4"
+serde_json = "1.0.150"
 tokio.workspace = true
 tokio-util.workspace = true
 tower = { version = "0.5.3", features = ["util"] }

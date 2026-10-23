@@ -1,4 +1,5 @@
 load("@crates//:defs.bzl", "aliases", "all_crate_deps", "crate_edition")
+load("@rules_python//python:defs.bzl", "py_binary")
 load("@rules_rust//cargo:defs.bzl", "cargo_toml_env_vars", "extract_cargo_lints")
 load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_clippy_test", "rust_test", "rustfmt_test")
 
@@ -19,7 +20,7 @@ rust_binary(
     aliases = aliases(),
     deps = all_crate_deps(normal = True) + [
         "//agents/pulsebeam-agent-native",
-        "//crates/pulsebeam-core",
+        "//crates/pulsebeam-core:pulsebeam-core-http",
         "//crates/pulsebeam-proto",
         "//crates/pulsebeam-testdata",
         "//server/rust:pulsebeam-server",
@@ -28,5 +29,38 @@ rust_binary(
 )
 
 rust_test(name = "unit_tests", crate = ":pulsebeam-cli", lint_config = ":lints")
-rustfmt_test(name = "format", targets = [":pulsebeam-cli"])
-rust_clippy_test(name = "clippy", targets = [":pulsebeam-cli", ":unit_tests"])
+
+py_binary(
+    name = "native_foreign_smoke",
+    testonly = True,
+    srcs = ["tests/native_foreign_smoke.py"],
+    main = "tests/native_foreign_smoke.py",
+)
+
+rust_test(
+    name = "production_native",
+    crate_root = "tests/production_native.rs",
+    srcs = ["tests/production_native.rs", "//agents/pulsebeam-agent-web:destination_test_support"],
+    data = [":native_foreign_smoke", "//agents/pulsebeam-agent-native:bindings", "//agents/pulsebeam-agent-native:native_library"],
+    env = {
+        "PULSEBEAM_FOREIGN_SMOKE": "$(rootpath :native_foreign_smoke)",
+        "PULSEBEAM_NATIVE_BINDINGS": "$(rootpath //agents/pulsebeam-agent-native:bindings)",
+        "PULSEBEAM_NATIVE_LIBRARY": "$(rootpath //agents/pulsebeam-agent-native:native_library)",
+    },
+    edition = crate_edition(),
+    lint_config = ":lints",
+    aliases = aliases(normal = True, normal_dev = True),
+    deps = all_crate_deps(normal = True, normal_dev = True) + [
+        "//agents/pulsebeam-agent-native",
+        "//crates/pulsebeam:pulsebeam",
+        "//crates/pulsebeam-core:pulsebeam-core",
+        "//crates/pulsebeam-runtime:pulsebeam-runtime",
+        "//server/rust:pulsebeam-server",
+    ],
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    size = "medium",
+    tags = ["cpu:2"],
+)
+
+rustfmt_test(name = "format", targets = [":pulsebeam-cli", ":production_native"])
+rust_clippy_test(name = "clippy", targets = [":pulsebeam-cli", ":unit_tests", ":production_native"])

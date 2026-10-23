@@ -62,6 +62,39 @@ class RustArchivePinsTests(unittest.TestCase):
             self.fetch(manifest)
 
 
+class NativeTracingPinsTests(unittest.TestCase):
+    def setUp(self):
+        self.lock = [
+            {"name": "tracing", "version": "1.2.3", "source": "registry+example"},
+            {"name": "tracing-core", "version": "4.5.6", "source": "registry+example"},
+        ]
+
+    def test_matching_identities_share_application_tracing_and_its_core(self):
+        self.assertEqual(
+            pins.native_tracing_override(self.lock, self.lock + [{"name": "unrelated", "version": "1"}]),
+            'crate.annotation(crate = "tracing", version = "=1.2.3", '
+            'override_target_lib = "@crates//:tracing", repositories = ["str0m_native"])\n',
+        )
+
+    def test_missing_or_ambiguous_identity_is_not_silently_overridden(self):
+        for index in range(2):
+            name = self.lock[index]["name"]
+            for changed in (self.lock[:index] + self.lock[index + 1:], self.lock + [self.lock[index]]):
+                for application, native in ((changed, self.lock), (self.lock, changed)):
+                    with self.subTest(name=name, application=application, native=native):
+                        with self.assertRaisesRegex(ValueError, f"shared native {name}"):
+                            pins.native_tracing_override(application, native)
+
+    def test_version_or_source_drift_is_not_silently_overridden(self):
+        for index in range(2):
+            for key in ("version", "source"):
+                changed = [p.copy() for p in self.lock]
+                changed[index][key] = "different"
+                with self.subTest(name=changed[index]["name"], key=key):
+                    with self.assertRaisesRegex(ValueError, f'shared native {changed[index]["name"]}'):
+                        pins.native_tracing_override(self.lock, changed)
+
+
 class RtcVisibilityTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()

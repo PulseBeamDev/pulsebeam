@@ -966,7 +966,7 @@ mod slow {
             |scenario| {
                 let report = scenario.run("temporal_shedding");
                 prop_assert!(
-                    report.samples > 0 && report.received_bytes > 0,
+                    report.samples > 0 && report.received_bytes.is_some_and(|bytes| bytes > 0),
                     "missing allocation or media is a failed scenario, not a discarded input ({scenario:?}, {report:?})"
                 );
 
@@ -992,7 +992,7 @@ mod slow {
             |scenario| {
                 let report = scenario.run("decodable");
                 prop_assert!(
-                    report.samples > 0 && report.received_bytes > 0,
+                    report.samples > 0 && report.received_bytes.is_some_and(|bytes| bytes > 0),
                     "missing allocation or media is a failed scenario, not a discarded input ({scenario:?}, {report:?})"
                 );
                 prop_assert_ne!(
@@ -1114,7 +1114,7 @@ mod slow {
                     "no allocation passes recorded; the viewer was never exercised ({scenario:?})"
                 );
                 prop_assert!(
-                    report.received_bytes > 0,
+                    report.received_bytes.is_some_and(|bytes| bytes > 0),
                     "nothing delivered over 30s on a {} bps link carrying {} bps of demand ({scenario:?}, {report:?})",
                     scenario.capacity_bps,
                     scenario.demand.bps()
@@ -1177,7 +1177,7 @@ mod slow {
             |scenario| {
                 let report = scenario.run("cheap_cotenant");
                 prop_assert!(
-                    report.samples > 0 && report.received_bytes > 0,
+                    report.samples > 0 && report.received_bytes.is_some_and(|bytes| bytes > 0),
                     "missing allocation or media is a failed scenario, not a discarded input ({scenario:?}, {report:?})"
                 );
 
@@ -1237,7 +1237,7 @@ mod slow {
             |scenario| {
                 let report = scenario.run("no_inversion");
                 prop_assert!(
-                    report.samples > 0 && report.received_bytes > 0,
+                    report.samples > 0 && report.received_bytes.is_some_and(|bytes| bytes > 0),
                     "missing allocation or media is a failed scenario, not a discarded input ({scenario:?}, {report:?})"
                 );
                 // Both must be running for their rungs to be comparable; a paused co-tenant is the

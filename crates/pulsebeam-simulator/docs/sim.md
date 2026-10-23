@@ -38,9 +38,10 @@ special cases for tests whose claim is specifically about those paths.
 The harness defaults exercise multiple shards and seeded network impairment.
 Internal faults require explicit named controls; ordinary plans do not implicitly
 exercise them.
-The [native DTLS reconnect exception](native-dtls-exception.md) does not exempt
-cross-shard media or data proof. Ignored subprocess fixtures run through their
-parent assertions and are not additional product exceptions.
+The [historical native-str0m DTLS exception](native-dtls-exception.md) is retired.
+Native lifecycle, cross-shard media and data proof remain required in ordinary
+selection. Ignored subprocess fixtures run through their parent assertions and
+are not product exceptions.
 
 The permitted profile families are:
 

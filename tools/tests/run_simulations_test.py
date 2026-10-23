@@ -65,7 +65,7 @@ class SimulationRunnerContract(unittest.TestCase):
         self.assertEqual(status, 0)
         self.assertEqual([item[0] for item in executed], [FAST])
         self.assertIn(f"SKIP {EXCEPTION}", output)
-        self.assertIn("native-dtls-exception.md", output)
+        self.assertIn("explicit --skip selection", output)
         self.assertEqual(executed[0][2][1:], ["--exact", FAST, "--nocapture", "--test-threads=1"])
 
     def test_explicit_opt_in_runs_exception_and_propagates_failure(self):

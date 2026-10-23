@@ -135,6 +135,9 @@ pub struct StreamStats {
     /// unambiguous. Unknown targets have height zero and cannot satisfy a floor.
     pub decode_target_heights: [u16; MAX_LADDER_TARGETS],
     pub temporal_only: bool,
+    /// Number of temporal entries declared by the sender's VLA; zero is unknown.
+    /// Only bounds selectable DD targets for a temporal-only structure.
+    pub temporal_ladder_count: u8,
     /// Cumulative bitrate (kbps) per decode target, from the sender's
     /// per-temporal Video Layers Allocation. `0` = not declared.
     pub decode_target_kbps: [u32; MAX_LADDER_TARGETS],
@@ -161,6 +164,7 @@ impl StreamStats {
             decode_targets: 1,
             decode_target_heights: [0; MAX_LADDER_TARGETS],
             temporal_only: false,
+            temporal_ladder_count: 0,
             decode_target_kbps: [0; MAX_LADDER_TARGETS],
             full_fps: 0,
         }
@@ -196,9 +200,17 @@ impl StreamStats {
         self.quality
     }
 
-    /// The number of decode targets the encoding advertises (>= 1).
+    /// Selectable target count (>= 1), not merely DD structure capacity.
     pub fn decode_target_count(&self) -> u8 {
-        self.decode_targets.max(1)
+        let advertised = self.decode_targets.max(1);
+        if self.temporal_only && self.temporal_ladder_count > 0 {
+            // Native H264 advertises the maximum generic temporal structure
+            // even for T1. A nonempty sender VLA bounds its actual temporal
+            // ladder; unused structure slots are not cheaper forwarding rungs.
+            advertised.min(self.temporal_ladder_count)
+        } else {
+            advertised
+        }
     }
 
     /// Cost (bps) of decode target `dt`, or `0` when the sender declared none.
@@ -278,6 +290,7 @@ impl StreamStats {
     /// a stream dropping from three temporal layers to one would keep costing
     /// rungs it no longer has.
     pub fn set_temporal_ladder(&mut self, cumulative_kbps: &[u64], full_fps: u32) {
+        self.temporal_ladder_count = u8::try_from(cumulative_kbps.len()).unwrap_or(u8::MAX);
         for (i, slot) in self.decode_target_kbps.iter_mut().enumerate() {
             *slot = u32::try_from(cumulative_kbps.get(i).copied().unwrap_or(0)).unwrap_or(u32::MAX);
         }
@@ -845,6 +858,49 @@ mod test {
         // close to nominal (4s fall tau: ~e^(-8/4) ≈ 0.135 decay ratio
         // over 8s, so bitrate stays well above nominal * 0.5).
         assert_ge!(monitor.stats().bitrate_bps(), nominal as f64 * 0.5);
+    }
+
+    #[test]
+    fn temporal_only_selectable_targets_follow_the_declared_vla_not_dd_capacity() {
+        let mut stats = StreamStats::new(false, 1_000_000, 720);
+        stats.decode_targets = 4;
+        stats.temporal_only = true;
+        assert_eq!(
+            stats.decode_target_count(),
+            4,
+            "absent VLA retains existing behavior"
+        );
+        stats.set_temporal_ladder(&[1000], 30);
+        assert_eq!(
+            stats.decode_targets, 4,
+            "retain the native structure capacity"
+        );
+        assert_eq!(stats.decode_target_count(), 1);
+        assert_eq!(stats.decode_target_bps(0), 1_000_000);
+        assert_eq!(
+            stats.decode_target_bps(1),
+            0,
+            "do not invent another declared cost"
+        );
+        stats.set_temporal_ladder(&[250, 500, 1000], 30);
+        assert_eq!(stats.decode_target_count(), 3);
+        stats.decode_targets = 2;
+        assert_eq!(stats.decode_target_count(), 2, "VLA cannot add DD targets");
+        stats.set_temporal_ladder(&[0], 0);
+        assert_eq!(
+            stats.decode_target_count(),
+            1,
+            "count entries, not nonzero rates"
+        );
+        stats.set_temporal_ladder(&[], 0);
+        assert_eq!(stats.decode_target_count(), 2, "empty VLA clears the bound");
+        stats.temporal_only = false;
+        stats.set_temporal_ladder(&[1000], 30);
+        assert_eq!(
+            stats.decode_target_count(),
+            2,
+            "one spatial ladder cannot bound a multispatial structure"
+        );
     }
 
     #[test]

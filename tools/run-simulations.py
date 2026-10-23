@@ -209,7 +209,7 @@ def execute(args, bundle):
         for name in args.skip:
             if name in selected:
                 selected.remove(name)
-                print(f"[simulation-result] SKIP {name}; documented gate exception in crates/pulsebeam-simulator/docs/native-dtls-exception.md", flush=True)
+                print(f"[simulation-result] SKIP {name}; explicit --skip selection", flush=True)
     if not selected:
         bundle.manifest.update(status="failed", failure="selection")
         bundle.save()

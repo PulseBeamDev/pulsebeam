@@ -1,78 +1,53 @@
-# Native DTLS reconnect acceptance exception
+# Historical native DTLS reconnect acceptance exception
 
-## Authorization and scope
+## Current status: retired
 
-During the Bazel migration, the human explicitly directed:
+The native-agent cutover replaces the former client str0m transport/media
+implementation with the shared libwebrtc session path. The replacement controlled
+real-SFU lifecycle case has passed actual native media, topics, reconnect, stale
+handle rejection, retained owning frames and graceful graph retirement.
 
-> Let's actually ignore that test, by skipping the test with a document here.
-
-The sole excluded case is:
+The case is selected normally by fast, replay, sweep and scoreboard owners:
 
 ```text
 tests::native_runtime::native_agents_prove_media_topics_reconnect_and_close
 ```
 
-This is an explicit acceptance exception, not a successful test, a flaky-test
-classification, or proof that reconnect works. All other committed simulation
-cases, seeds, assertions and browser boundaries remain required. The migration
-must not claim unqualified complete acceptance without mentioning this exception.
-
-## Why it is excluded
-
-The case was already recorded as a delivery blocker before the Bazel migration
-in [Meet's delivery status](../../../apps/meet/README.md#blocker-native-dtls-reconnect).
-It also fails under the current Cargo owner workflow. The consolidated Bazel
-run reproduced the same native connection timeout after a DTLS decryption error;
-this is not established as a migration regression.
-
-The locked `dimpl` 0.7.2 DTLS 1.2 implementation sets peer encryption, removes a
-suffix of buffered epoch-1 records using `queue_rx.split_off`, and reparses each
-record with `self.parse_packet(&buf)?`. An authentication/decryption error can
-abort that iteration and discard later detached records, including a valid
-Finished message. The handshake then remains in `AwaitChangeCipherSpec`.
-The origin of the offending packet, potentially late protected traffic from a
-prior transport on the reused UDP tuple, is not conclusively captured.
-
-The suggested repair is confined to buffered record reprocessing: drop a record
-only for the precise crypto decrypt failure, continue with subsequent records,
-and propagate unrelated errors. AEAD authentication, replay-window updates and
-Finished verification must remain intact. No such patch is applied by this
-migration and no test oracle is changed.
-
-## How the exception is enforced
-
-The simulator `BUILD.bazel` supplies an exact `--skip` name to the fast gate,
-replay and advisory sweep. The process-isolating runner prints a visible
-`[simulation-result] SKIP` record with this document's path. It neither catches
-test failures nor alters the compiled test binary. Existing exploratory
-`#[ignore]` cases retain their distinct semantics. Slow-case selection is
-unchanged because this case is not in the slow namespace.
-
-The source case and all of its assertions remain available. Explicitly opt in:
+There is no case-specific default skip and no opt-in requirement:
 
 ```sh
 ./bazel test //crates/pulsebeam-simulator:fast \
-  --test_arg=--run-skipped --test_arg=--filter \
+  --test_arg=--filter \
   --test_arg=tests::native_runtime::native_agents_prove_media_topics_reconnect_and_close
 
-./bazel run //:replay -- --run-skipped --seed 4711 \
+./bazel run //:replay -- --seed 4711 \
   --filter tests::native_runtime::native_agents_prove_media_topics_reconnect_and_close
 ```
 
-The test target is expected to fail until the underlying boundary is repaired.
-An exact selection without opt-in fails with no runnable cases, rather than
-reporting a skipped-only invocation as a successful regression run.
+Same-seed replay must compare stable semantic outcomes, not cryptographic
+ciphertext or timing-adaptive encoded bytes. The scenario prints a bounded
+`[native-lifecycle]` report after its media, topic, generation, ownership and
+close assertions. Focused controlled acceptance does not waive shared full-suite,
+browser or production socket/constructor qualification. Generated bindings are
+not mobile runtime certification.
 
-## Reinstatement criteria
+## Historical authorization and cause
 
-1. Capture or faithfully reproduce the invalid buffered record followed by a
-   genuine Finished message at the dependency boundary.
-2. Add a regression proving the invalid record is discarded without losing
-   subsequent valid records, without bypassing crypto validation or state errors.
-3. Repair the dependency boundary while preserving the locked compatibility
-   contract, then pass the exact native vertical slice and relevant seed replay.
-4. Remove `NATIVE_DTLS_EXCEPTION` from the simulator BUILD targets and renew
-   affected owner and shared browser acceptance evidence.
+During the earlier Bazel migration, the human directed:
 
-Until these criteria are met, retain this document and report the exception
-alongside passing gate evidence. No production publication is authorized by it.
+> Let's actually ignore that test, by skipping the test with a document here.
+
+That exception excluded only the exact case above. It was reported as skipped,
+not passed, and did not waive browser or other native regression obligations.
+
+The old native-agent str0m path could time out after a DTLS decryption error.
+The locked `dimpl` 0.7.2 buffered-record reprocessing removed a suffix of epoch-1
+records and could abort processing after an authentication/decryption failure,
+potentially losing a later Finished record. The origin of the offending packet,
+including possible late protected traffic on a reused UDP tuple, was not
+conclusively captured.
+
+The cutover does **not** claim to patch that dependency or establish the original
+packet's cause. The server RTC engine is unchanged. Reinstatement rests on actual
+replacement native-client lifecycle and replay evidence, not suppressed crypto
+errors, relaxed media/topic assertions or a simulated decoder.

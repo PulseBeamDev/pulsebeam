@@ -30,8 +30,10 @@ optimize runtime dependencies.
 ## Commands
 
 See the [contributor testing contract](../../docs/build.md#testing-contract) for
-workspace gates and evidence reuse. This owner retains one
-[human-authorized native DTLS exception](docs/native-dtls-exception.md).
+workspace gates and evidence reuse. Native media/topics/reconnect/close runs
+in the ordinary fast gate and replay. The
+[historical native-str0m DTLS exception](docs/native-dtls-exception.md) is retired;
+focused controlled proof does not replace shared browser or production evidence.
 
 - `./bazel run //:replay -- --seed <seed> --exact --filter <name>` reproduces one case.
   Add `--jobs <count>` to select workers or `--show-output` for grouped full traces;

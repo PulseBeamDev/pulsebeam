@@ -11,6 +11,7 @@
 use crate::media::SeqNo;
 use crate::rtp::RtpPacket;
 use crate::rtp::{Frequency, MediaTime};
+use pulsebeam_core::dd::DependencyDescriptor;
 use pulsebeam_runtime::rand::RngCore;
 use std::time::Duration;
 use tokio::time::Instant;
@@ -47,6 +48,10 @@ pub struct Timeline {
     /// Set by a rebase: the first frame of a new source must not teach the
     /// cadence, because the interval across the seam is the one being chosen.
     awaiting_first_frame: bool,
+    /// The DD counter belongs to the continuous output SSRC, not its sources.
+    max_output_dd_frame: Option<u16>,
+    /// Learned from the first DD after rebase, which may follow synthetic SPS/PPS.
+    dd_frame_base: Option<u16>,
 }
 
 impl std::fmt::Debug for Timeline {
@@ -70,6 +75,8 @@ impl Timeline {
             epoch: None,
             frame_interval: None,
             awaiting_first_frame: false,
+            max_output_dd_frame: None,
+            dd_frame_base: None,
         }
     }
 
@@ -160,6 +167,7 @@ impl Timeline {
             }
         };
         self.awaiting_first_frame = true;
+        self.dd_frame_base = None;
     }
 
     /// Rewrite `pkt` preserving its position relative to its own stream, so gaps
@@ -201,6 +209,24 @@ impl Timeline {
         self.ts_base
     }
 
+    pub fn dd_frame_base(&self) -> u16 {
+        self.dd_frame_base.unwrap_or(0)
+    }
+
+    /// Translate only the absolute counter. Template IDs and dependency/chain
+    /// differences stay in their source's coordinate system under this offset.
+    /// The cached descriptor is immutable and may serve other subscribers.
+    pub(super) fn translate_dd_frame(pkt: &mut RtpPacket, base: u16) {
+        if base == 0 {
+            return;
+        }
+        if let Some(dd) = pkt.ext_vals.user_values.get::<DependencyDescriptor>() {
+            let mut translated = dd.clone();
+            translated.frame_number = translated.frame_number.wrapping_add(base);
+            pkt.ext_vals.user_values.set(translated);
+        }
+    }
+
     /// Burn `n` output sequence numbers without emitting anything.
     ///
     /// Leaves a hole the subscriber will read as loss. Used to mark a frame the
@@ -231,6 +257,22 @@ impl Timeline {
     }
 
     fn apply(&mut self, pkt: &mut RtpPacket, output_seq: SeqNo, output_ts: u64) {
+        if let Some(dd) = pkt.ext_vals.user_values.get::<DependencyDescriptor>() {
+            let base = *self.dd_frame_base.get_or_insert_with(|| {
+                self.max_output_dd_frame
+                    .map_or(0, |last| last.wrapping_add(1).wrapping_sub(dd.frame_number))
+            });
+            let output_frame = dd.frame_number.wrapping_add(base);
+            // Serial-number order prevents a reordered packet from moving the
+            // frontier backwards, including around the 16-bit wrap.
+            if self.max_output_dd_frame.is_none_or(|last| {
+                let advance = output_frame.wrapping_sub(last);
+                advance > 0 && advance < 0x8000
+            }) {
+                self.max_output_dd_frame = Some(output_frame);
+            }
+            Self::translate_dd_frame(pkt, base);
+        }
         pkt.seq_no = output_seq;
         pkt.rtp_ts = MediaTime::new(output_ts, self.clock_rate);
 
@@ -270,6 +312,95 @@ mod test {
             playout_time: at,
             arrival_ts: at,
             ..Default::default()
+        }
+    }
+
+    #[test]
+    fn dd_continuity_preserves_dependencies_gaps_wrap_and_reordering() {
+        for initial in [22u16, u16::MAX.wrapping_sub(1)] {
+            let at = Instant::now();
+            let mut timeline = Timeline::new_with_base(Frequency::NINETY_KHZ, 0);
+            let with_dd = |seq, ts, frame_number| {
+                let mut packet = pkt(seq, ts, at);
+                let mut dd = DependencyDescriptor {
+                    frame_number,
+                    template_id: 3,
+                    ..Default::default()
+                };
+                dd.frame_dependencies.frame_diffs.push(2);
+                dd.frame_dependencies.chain_diffs.push(1);
+                packet.ext_vals.user_values.set(dd);
+                let [hi, lo] = frame_number.to_be_bytes();
+                packet
+                    .ext_vals
+                    .user_values
+                    .set(pulsebeam_core::dd::RawDependencyDescriptor(
+                        [3, hi, lo].into_iter().collect(),
+                    ));
+                packet
+            };
+            let mut first = with_dd(100, 1000, initial);
+            timeline.rebase(&first);
+            timeline.rewrite(&mut first);
+            let mut next = with_dd(101, 4000, initial.wrapping_add(1));
+            timeline.rewrite(&mut next);
+            let mut reordered = with_dd(100, 1000, initial);
+            timeline.rewrite(&mut reordered);
+
+            // Rebase may start on synthesized parameter sets with no DD.
+            let mut parameters = pkt(500, 10_000, at);
+            timeline.rebase(&parameters);
+            timeline.rewrite_sequential(&mut parameters);
+            for (index, input_frame) in [2u16, 2, 4, 3].into_iter().enumerate() {
+                let original = with_dd(501 + index as u64, 13_000, input_frame);
+                let mut output = original.clone();
+                timeline.rewrite_sequential(&mut output);
+                let mut expected = original
+                    .ext_vals
+                    .user_values
+                    .get::<DependencyDescriptor>()
+                    .unwrap()
+                    .clone();
+                expected.frame_number = initial.wrapping_add(input_frame);
+                assert_eq!(
+                    output.ext_vals.user_values.get::<DependencyDescriptor>(),
+                    Some(&expected)
+                );
+                use str0m::rtp::ExtensionSerializer;
+                let mut wire = [0; pulsebeam_core::dd::MAX_DD_LEN];
+                let len = pulsebeam_core::dd::Serializer.write_to(&mut wire, &output.ext_vals);
+                assert_eq!(
+                    pulsebeam_core::dd::read_mandatory(&wire[..len])
+                        .unwrap()
+                        .frame_number,
+                    expected.frame_number,
+                    "projection must reach the emitted extension, not only parsed metadata"
+                );
+                assert_eq!(
+                    original
+                        .ext_vals
+                        .user_values
+                        .get::<DependencyDescriptor>()
+                        .unwrap()
+                        .frame_number,
+                    input_frame,
+                    "another subscriber's cached descriptor must stay unchanged"
+                );
+            }
+
+            let mut third = with_dd(900, 90_000, 99);
+            timeline.rebase(&third);
+            timeline.rewrite_sequential(&mut third);
+            assert_eq!(
+                third
+                    .ext_vals
+                    .user_values
+                    .get::<DependencyDescriptor>()
+                    .unwrap()
+                    .frame_number,
+                initial.wrapping_add(5),
+                "a reordered frame must not rewind the next source's DD counter"
+            );
         }
     }
 

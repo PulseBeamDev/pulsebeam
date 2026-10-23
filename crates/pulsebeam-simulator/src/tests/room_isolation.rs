@@ -360,8 +360,8 @@ fn audio_selection_does_not_cross_rooms_test() {
                 participant: "beta_listener",
                 min_bytes: 1,
             },
-            Step::CheckHeardFrom {
-                description: "And it is hearing the speaker from its own room",
+            Step::CheckAudioQueuedFrom {
+                description: "The selected and queued source belongs to its own room",
                 participant: "beta_listener",
                 expected: &["beta_speaker"],
             },

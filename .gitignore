@@ -1,5 +1,6 @@
 /target
 /.native-candidate/
+__pycache__/
 /bazel-*
 /.rules_rust_analyzer/
 /rust-project.json

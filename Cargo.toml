@@ -9,6 +9,7 @@ members = [
   "crates/pulsebeam-proto",
   "crates/pulsebeam-routing",
   "crates/pulsebeam-rtc",
+  "crates/pulsebeam-rtc/simulation",
   "crates/pulsebeam-runtime",
   "crates/pulsebeam-simulator",
   "crates/pulsebeam-testdata",

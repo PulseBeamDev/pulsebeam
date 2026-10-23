@@ -1,9 +1,21 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use super::decoder::H264ReferenceDecoder;
 use pulsebeam_agent_native::agent_core::MediaSlot;
-use pulsebeam_agent_native::{AgentEvent, LocalMedia, MediaFrame, MediaTime};
-use tokio::sync::broadcast;
+use pulsebeam_agent_native::{EncodingLimits, H264Frame, InputFrame, LocalSource, StreamUpdate};
+use pulsebeam_rtc_simulation::NativeH264AccessUnit;
+
+/// Application fixture declaration, not an RTP-engine encoding object.
+#[derive(Clone, Debug)]
+pub struct FixtureEncoding {
+    pub rid: String,
+}
+impl FixtureEncoding {
+    pub fn new(rid: impl Into<String>) -> Self {
+        Self { rid: rid.into() }
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct VbrProfile {
@@ -14,7 +26,6 @@ pub struct VbrProfile {
     pub idle_target_bps: u64,
     pub target_step: f64,
 }
-
 impl VbrProfile {
     pub fn screenshare() -> Self {
         Self {
@@ -26,11 +37,9 @@ impl VbrProfile {
             target_step: 0.25,
         }
     }
-
     pub fn screenshare_detail() -> Self {
         Self::screenshare()
     }
-
     pub fn screenshare_static() -> Self {
         Self {
             loop_idle: Duration::from_secs(20),
@@ -55,114 +64,214 @@ pub fn video_frames(data: &[u8]) -> Arc<[Arc<[u8]>]> {
 }
 
 pub struct VideoSource {
-    frames: Arc<[Arc<[u8]>]>,
+    frames: Arc<[H264Frame]>,
     first_idr: usize,
+    index: usize,
     fps: u32,
     opaque: bool,
     repeat_keyframes: bool,
     recovery_probe: Arc<Mutex<KeyframeRecoveryProbe>>,
 }
-
 impl VideoSource {
     pub fn from_frames(frames: Arc<[Arc<[u8]>]>, fps: u32) -> Self {
-        assert!(!frames.is_empty());
         let first_idr = frames
             .iter()
             .position(|frame| has_nal(frame, 5))
-            .unwrap_or(0);
+            .expect("H264 fixture needs an actual keyframe");
+        // Read the elementary stream, rather than guessing dimensions from RID.
+        let dimensions = H264ReferenceDecoder::new("fixture", "dimensions")
+            .try_decode_observation(&frames[first_idr], None)
+            .expect("fixture keyframe must decode");
+        let frames = frames
+            .iter()
+            .map(|data| H264Frame {
+                payload: data.to_vec(),
+                timestamp_us: 0,
+                width: u16::try_from(dimensions.width).unwrap(),
+                height: u16::try_from(dimensions.height).unwrap(),
+                keyframe: has_nal(data, 5),
+                temporal_index: None,
+                base_layer_sync: false,
+            })
+            .collect();
+        Self::new(frames, first_idr, fps)
+    }
+    pub fn from_native(frames: &[NativeH264AccessUnit], fps: u32) -> Self {
+        let first_idr = frames
+            .iter()
+            .position(|frame| frame.keyframe)
+            .expect("native keyframe");
+        let frames = frames
+            .iter()
+            .map(|frame| H264Frame {
+                payload: frame.data.clone(),
+                timestamp_us: 0,
+                width: u16::try_from(frame.width).unwrap(),
+                height: u16::try_from(frame.height).unwrap(),
+                keyframe: frame.keyframe,
+                temporal_index: frame.temporal_index,
+                base_layer_sync: frame.base_layer_sync,
+            })
+            .collect();
+        Self::new(frames, first_idr, fps)
+    }
+    fn new(frames: Arc<[H264Frame]>, first_idr: usize, fps: u32) -> Self {
         Self {
             frames,
             first_idr,
+            index: first_idr,
             fps: fps.max(1),
             opaque: false,
             repeat_keyframes: true,
             recovery_probe: Arc::default(),
         }
     }
-
+    pub fn dimensions(&self) -> (u16, u16) {
+        let frame = &self.frames[self.first_idr];
+        (frame.width, frame.height)
+    }
     pub fn opaque(mut self) -> Self {
         self.opaque = true;
         self
     }
-
     pub fn without_natural_keyframe_repeats(mut self) -> Self {
         self.repeat_keyframes = false;
         self
     }
-
     pub fn with_recovery_probe(mut self, probe: Arc<Mutex<KeyframeRecoveryProbe>>) -> Self {
         self.recovery_probe = probe;
         self
     }
-
-    pub async fn run(
-        self,
-        media: LocalMedia,
-        encoding: Option<String>,
-        mut events: broadcast::Receiver<AgentEvent>,
-    ) {
-        let mut index = 0usize;
-        let mut frame_count = 0u64;
-        let mut interval =
-            tokio::time::interval(Duration::from_secs_f64(1.0 / f64::from(self.fps)));
+    fn request(&mut self, slot: &MediaSlot, encoding: &Option<String>) {
+        let mut probe = self.recovery_probe.lock().unwrap();
+        if probe.armed {
+            let MediaSlot::LocalVideo(slot) = slot else {
+                panic!("video source slot")
+            };
+            probe.requests.push((slot.clone(), encoding.clone()));
+            if probe.requests.len() == 1 {
+                probe.discarded_responses += 1;
+                return;
+            }
+        }
+        self.index = self.first_idr;
+    }
+    fn frame(&mut self, timestamp_us: i64) -> H264Frame {
+        let mut frame = self.frames[self.index].clone();
+        frame.timestamp_us = timestamp_us;
+        if frame.keyframe {
+            tracing::debug!(timestamp_us, width = frame.width, height = frame.height, temporal_index = ?frame.temporal_index, bytes = frame.payload.len(), "submitting fixture H264 keyframe to native source");
+        }
+        if self.opaque {
+            frame.payload = opaque_frame(&frame.payload);
+        }
+        self.index = if self.index + 1 < self.frames.len() {
+            self.index + 1
+        } else if self.repeat_keyframes {
+            self.first_idr
+        } else {
+            self.frames.len() - 1
+        };
+        frame
+    }
+    /// One caller capture batch, with actual encoding-specific elementary
+    /// streams. Never submit independent per-RID frames to a native sender.
+    pub async fn run_batch(mut sources: Vec<(Option<String>, Self)>, media: LocalSource) {
+        assert!(!sources.is_empty());
+        let fps = sources[0].1.fps;
+        assert!(sources.iter().all(|(_, source)| source.fps == fps));
+        let capture_origin = media.capture_time_us().await.expect("native capture clock");
+        let feedback = media.feedback();
+        let mut last_keyframes = vec![true; sources.len()];
+        let started = tokio::time::Instant::now();
+        let mut interval = tokio::time::interval(Duration::from_secs_f64(1.0 / f64::from(fps)));
         loop {
-            let capture_time = interval.tick().await;
-            while let Ok(event) = events.try_recv() {
-                if keyframe_matches(&event, media.slot(), encoding.as_deref()) {
-                    let mut probe = self.recovery_probe.lock().unwrap();
-                    if probe.armed {
-                        let MediaSlot::LocalVideo(slot) = media.slot() else {
-                            unreachable!("keyframe_matches requires a local video slot");
-                        };
-                        probe.requests.push((slot.clone(), encoding.clone()));
-                        if probe.requests.len() == 1 {
-                            probe.discarded_responses += 1;
-                            continue;
+            let capture = interval.tick().await;
+            while let Some(update) = feedback.try_next() {
+                match update {
+                    StreamUpdate::Value(feedback) => {
+                        require_encoder_feedback(&feedback, &last_keyframes)
+                            .expect("unrecoverable native encoder rejection");
+                        let indexed = feedback
+                            .encoding_keyframes_requested
+                            .iter()
+                            .any(|requested| *requested);
+                        for (index, (encoding, source)) in sources.iter_mut().enumerate() {
+                            if feedback.encoding_keyframes_requested.get(index) == Some(&true)
+                                || (feedback.keyframe_requested && !indexed)
+                            {
+                                source.request(media.slot(), encoding);
+                            }
                         }
                     }
-                    index = self.first_idr;
+                    StreamUpdate::Lagged { .. } => panic!("fixture producer feedback lagged"),
+                    StreamUpdate::Closed => return,
                 }
             }
-            let source = self.frames.get(index).expect("video frame index").clone();
-            let data = if self.opaque {
-                opaque_frame(&source)
+            let timestamp = capture_origin
+                .checked_add(i64::try_from(capture.duration_since(started).as_micros()).unwrap())
+                .expect("capture timestamp range");
+            let mut frames: Vec<_> = sources
+                .iter_mut()
+                .map(|(_, source)| source.frame(timestamp))
+                .collect();
+            last_keyframes = frames.iter().map(|frame| frame.keyframe).collect();
+            let input = if frames.len() == 1 {
+                InputFrame::H264 {
+                    frame: frames.remove(0),
+                }
             } else {
-                source
+                InputFrame::H264Simulcast { frames }
             };
-            let frame = MediaFrame {
-                audio_level: None,
-                voice_activity: None,
-                ts: MediaTime::from_90khz(frame_count.saturating_mul(90_000) / u64::from(self.fps)),
-                data,
-                capture_time,
-                abs_capture_time: Some(pulsebeam_agent_native::clock::capture_wallclock()),
-                contiguous: true,
-                is_keyframe: index == self.first_idr,
-                target_bitrate_bps: None,
-                resolution: None,
-                dependency_descriptor: None,
-                temporal_layers: None,
-            };
-            let _ = media.send_encoding(encoding.clone(), frame).await;
-            frame_count = frame_count.saturating_add(1);
-            index = if index.saturating_add(1) < self.frames.len() {
-                index.saturating_add(1)
-            } else if self.repeat_keyframes {
-                0
-            } else {
-                self.frames.len().saturating_sub(1)
-            };
+            media
+                .submit(input)
+                .await
+                .expect("native fixture submission");
         }
     }
 }
 
+// Native keyframe feedback is observed only after an encode attempt. An
+// already-submitted delta can be rejected for that request. Recover precisely
+// that case by honoring the request with genuine fixture IDR bytes; all other
+// errors remain fatal and no rejected frame is counted as output.
+fn require_encoder_feedback(
+    feedback: &pulsebeam_agent_native::ProducerFeedback,
+    last_keyframes: &[bool],
+) -> anyhow::Result<()> {
+    let Some(error) = &feedback.encoder_error else {
+        return Ok(());
+    };
+    let indexed = feedback
+        .encoding_keyframes_requested
+        .iter()
+        .any(|request| *request);
+    let requested_delta = if indexed {
+        feedback
+            .encoding_keyframes_requested
+            .iter()
+            .enumerate()
+            .any(|(index, request)| *request && last_keyframes.get(index) == Some(&false))
+    } else {
+        feedback.keyframe_requested && last_keyframes.contains(&false)
+    };
+    anyhow::ensure!(
+        *error == pulsebeam_agent_native::VideoEncoderError::InvalidFrame && requested_delta,
+        "native encoder rejection: {error:?}; feedback={feedback:?}; last_keyframes={last_keyframes:?}"
+    );
+    tracing::debug!(
+        ?error,
+        "native rejected an already-submitted delta for a keyframe request"
+    );
+    Ok(())
+}
+
 pub struct VbrSource {
-    frames: Arc<[Arc<[u8]>]>,
+    source: VideoSource,
     frame_times: Arc<[Duration]>,
     profile: VbrProfile,
     target_bps: f64,
 }
-
 impl VbrSource {
     pub fn scheduled(
         frames: Arc<[Arc<[u8]>]>,
@@ -172,94 +281,83 @@ impl VbrSource {
         assert!(!frames.is_empty());
         assert_eq!(frames.len(), frame_times.len());
         Self {
-            frames,
+            source: VideoSource::from_frames(frames, 30),
             frame_times,
             profile,
             target_bps: 0.0,
         }
     }
-
+    pub fn dimensions(&self) -> (u16, u16) {
+        self.source.dimensions()
+    }
     fn active(&self, elapsed: Duration) -> bool {
         let cycle = self.profile.active.saturating_add(self.profile.idle);
         cycle.is_zero() || elapsed.as_nanos() % cycle.as_nanos() < self.profile.active.as_nanos()
     }
-
-    fn step_target(&mut self, active: bool) -> u64 {
+    fn step_target(&mut self, active: bool) -> u32 {
         let goal = if active {
             self.profile.declared_target_bps
         } else {
             self.profile.idle_target_bps
         } as f64;
         self.target_bps += (goal - self.target_bps) * self.profile.target_step;
-        saturating_u64(self.target_bps.round())
+        u32::try_from(saturating_u64(self.target_bps.round()))
+            .expect("fixture bitrate must fit native limit")
     }
-
-    pub async fn run(
-        mut self,
-        media: LocalMedia,
-        encoding: Option<String>,
-        mut events: broadcast::Receiver<AgentEvent>,
-    ) {
+    pub async fn run(mut self, media: LocalSource) {
+        let mut last_keyframe = true;
+        let capture_origin = media.capture_time_us().await.expect("native capture clock");
+        let feedback = media.feedback();
         let started = tokio::time::Instant::now();
         let loop_duration = self
             .frame_times
             .last()
-            .expect("nonempty video schedule")
+            .unwrap()
             .saturating_add(self.profile.loop_idle);
         let mut loop_started = started;
-        let mut index = 0usize;
         loop {
-            let due = loop_started
-                .checked_add(*self.frame_times.get(index).expect("video schedule index"))
-                .unwrap_or(loop_started);
+            let due = loop_started + self.frame_times[self.source.index];
             tokio::time::sleep_until(due).await;
             let now = tokio::time::Instant::now();
-            while let Ok(event) = events.try_recv() {
-                if keyframe_matches(&event, media.slot(), encoding.as_deref()) {
-                    index = 0;
-                    loop_started = now;
+            while let Some(update) = feedback.try_next() {
+                match update {
+                    StreamUpdate::Value(feedback) => {
+                        require_encoder_feedback(&feedback, &[last_keyframe])
+                            .expect("unrecoverable native VBR encoder rejection");
+                        if feedback.keyframe_requested {
+                            self.source.index = self.source.first_idr;
+                            loop_started = now;
+                        }
+                    }
+                    StreamUpdate::Lagged { .. } => panic!("VBR feedback lagged"),
+                    StreamUpdate::Closed => return,
                 }
             }
             let elapsed = now.duration_since(started);
             let active = self.active(elapsed);
-            let frame = MediaFrame {
-                audio_level: None,
-                voice_activity: None,
-                ts: MediaTime::from_90khz(saturating_u64(elapsed.as_secs_f64() * 90_000.0)),
-                data: self.frames.get(index).expect("video frame index").clone(),
-                capture_time: now,
-                abs_capture_time: Some(pulsebeam_agent_native::clock::capture_wallclock()),
-                contiguous: true,
-                is_keyframe: index == 0,
-                target_bitrate_bps: Some(self.step_target(active)),
-                resolution: None,
-                dependency_descriptor: None,
-                temporal_layers: None,
-            };
-            let _ = media.send_encoding(encoding.clone(), frame).await;
-            index = index.saturating_add(1);
-            if index == self.frame_times.len() {
-                index = 0;
-                loop_started = loop_started
-                    .checked_add(loop_duration)
-                    .unwrap_or(loop_started);
+            let target = self.step_target(active);
+            media
+                .set_limits(vec![EncodingLimits {
+                    max_bitrate_bps: Some(target),
+                    max_framerate: None,
+                }])
+                .await
+                .expect("native VBR limits");
+            let frame = self.source.frame(
+                capture_origin
+                    .checked_add(i64::try_from(elapsed.as_micros()).unwrap())
+                    .expect("capture timestamp range"),
+            );
+            last_keyframe = frame.keyframe;
+            media
+                .submit(InputFrame::H264 { frame })
+                .await
+                .expect("native VBR frame");
+            if self.source.index == self.source.first_idr {
+                loop_started += loop_duration;
             }
         }
     }
-}
-
-fn keyframe_matches(event: &AgentEvent, slot: &MediaSlot, encoding: Option<&str>) -> bool {
-    let AgentEvent::KeyframeRequested {
-        slot: requested_slot,
-        encoding: requested_encoding,
-    } = event
-    else {
-        return false;
-    };
-    let MediaSlot::LocalVideo(slot) = slot else {
-        return false;
-    };
-    requested_slot == slot && requested_encoding.as_deref() == encoding
 }
 
 fn saturating_u64(value: f64) -> u64 {
@@ -267,14 +365,13 @@ fn saturating_u64(value: f64) -> u64 {
     #[allow(
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
-        reason = "the finite value is clamped to the target integer range"
+        reason = "finite value is clamped to the target integer range"
     )]
     {
         value.clamp(0.0, u64::MAX as f64) as u64
     }
 }
-
-fn opaque_frame(frame: &[u8]) -> Arc<[u8]> {
+fn opaque_frame(frame: &[u8]) -> Vec<u8> {
     let mut frame = frame.to_vec();
     let mut index = 0usize;
     while index.saturating_add(3) < frame.len() {
@@ -287,9 +384,8 @@ fn opaque_frame(frame: &[u8]) -> Arc<[u8]> {
             index = index.saturating_add(1);
         }
     }
-    frame.into()
+    frame
 }
-
 fn has_nal(frame: &[u8], wanted: u8) -> bool {
     let mut index = 0usize;
     while index.saturating_add(3) < frame.len() {
@@ -307,4 +403,30 @@ fn has_nal(frame: &[u8], wanted: u8) -> bool {
         index = header;
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pulsebeam_agent_native::{ProducerFeedback, VideoEncoderError};
+
+    #[test]
+    fn recover_only_a_rejected_delta_for_an_actual_keyframe_request() {
+        let mut feedback = ProducerFeedback {
+            keyframe_requested: true,
+            encoding_keyframes_requested: vec![true],
+            rates: None,
+            encoder_error: Some(VideoEncoderError::InvalidFrame),
+        };
+        assert!(require_encoder_feedback(&feedback, &[false]).is_ok());
+        assert!(require_encoder_feedback(&feedback, &[true]).is_err());
+        feedback.encoding_keyframes_requested = vec![false, true];
+        assert!(require_encoder_feedback(&feedback, &[false, true]).is_err());
+        feedback.encoding_keyframes_requested = vec![false];
+        feedback.keyframe_requested = false;
+        assert!(require_encoder_feedback(&feedback, &[false]).is_err());
+        feedback.keyframe_requested = true;
+        feedback.encoder_error = Some(VideoEncoderError::InvalidConfiguration);
+        assert!(require_encoder_feedback(&feedback, &[false]).is_err());
+    }
 }

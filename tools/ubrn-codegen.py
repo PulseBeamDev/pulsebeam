@@ -45,7 +45,11 @@ def main():
         workspace.mkdir()
         for name in ("Cargo.toml", "Cargo.lock"):
             shutil.copyfile(source / name, workspace / name)
-        for member in manifest["workspace"]["members"]:
+        members = {Path(member) for member in manifest["workspace"]["members"]}
+        for member in sorted(members):
+            # A copied parent already includes its nested workspace members.
+            if any(parent in members for parent in member.parents):
+                continue
             shutil.copytree(source / member, workspace / member)
         empty = Path("tools/rust/empty.rs")
         shutil.copyfile(source / empty, workspace / empty)

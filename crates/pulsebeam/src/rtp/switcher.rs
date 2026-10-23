@@ -52,6 +52,7 @@ const FRAME_ALIGN_GRACE: Duration = Duration::from_millis(15);
 struct Tail {
     seq_base: SeqNo,
     ts_base: u64,
+    dd_frame_base: u16,
     expires_at: Instant,
     /// The gaps this stream left behind. Scoped to the tail so a later stream
     /// can never be translated into a gap belonging to an earlier one.
@@ -467,6 +468,7 @@ impl Switcher {
         self.tail = Some(Tail {
             seq_base,
             ts_base: self.timeline.ts_base(),
+            dd_frame_base: self.timeline.dd_frame_base(),
             expires_at: now.checked_add(TAIL_DRAIN_WINDOW).unwrap_or(now),
             holes,
         });
@@ -492,6 +494,7 @@ impl Switcher {
 
         let seq_base = tail.seq_base;
         let ts_base = tail.ts_base;
+        let dd_frame_base = tail.dd_frame_base;
         let holes: Vec<u64> = tail.holes.iter().copied().collect();
         for output_seq in holes {
             let input_seq: SeqNo = output_seq.wrapping_sub(*seq_base).into();
@@ -504,6 +507,7 @@ impl Switcher {
                 pkt.rtp_ts.numer().wrapping_add(ts_base),
                 pkt.rtp_ts.frequency(),
             );
+            Timeline::translate_dd_frame(&mut out, dd_frame_base);
             emit(out);
             if let Some(tail) = self.tail.as_mut() {
                 tail.holes.remove(&output_seq);
@@ -1019,6 +1023,74 @@ mod test {
     /// Shedding a temporal target must leave a stream that is decodable by its own
     /// dependency structure, not just one whose RTP is well-formed. Uses the real
     /// `TemporalDdGenerator` so frames carry genuine `frame_diffs`.
+    #[test]
+    fn dd_switch_and_stop_resume_keep_one_output_counter_and_old_tail_mapping() {
+        use pulsebeam_core::dd::{DependencyDescriptor, temporal::TemporalDdGenerator};
+
+        let (q, h) = two_streams();
+        let mut switcher = Switcher::new(rtp::VIDEO_FREQUENCY);
+        let mut cache = TrackStreamCache::new();
+        let mut bq = builder(1);
+        let mut bh = builder(2);
+        let mut q_dd = TemporalDdGenerator::new(1);
+        let mut h_dd = TemporalDdGenerator::new(1);
+        let mut out = Vec::new();
+        let frame_number = |p: &RtpPacket| {
+            p.ext_vals
+                .user_values
+                .get::<DependencyDescriptor>()
+                .unwrap()
+                .frame_number
+        };
+
+        switcher.switch_to(q);
+        let mut key = bq.keyframe(2);
+        stamp_generated_dd(&mut key, &q_dd.next(true));
+        ingest(&mut switcher, q, &mut cache, &key, &mut out);
+        assert_eq!(frame_number(out.last().unwrap()), 0);
+
+        switcher.switch_to(h);
+        let mut key = bh.keyframe(2);
+        stamp_generated_dd(&mut key, &h_dd.next(true));
+        ingest(&mut switcher, h, &mut cache, &key, &mut out);
+        assert_eq!(frame_number(out.last().unwrap()), 1);
+
+        let mut partial = bh.delta_frame(3);
+        stamp_generated_dd(&mut partial, &h_dd.next(false));
+        ingest(&mut switcher, h, &mut cache, &partial[..1], &mut out);
+        ingest(&mut switcher, h, &mut cache, &partial[2..], &mut out);
+        assert_eq!(frame_number(out.last().unwrap()), 2);
+
+        switcher.switch_to(q);
+        let mut key = bq.keyframe(2);
+        stamp_generated_dd(&mut key, &q_dd.next(true));
+        ingest(&mut switcher, q, &mut cache, &key, &mut out);
+        let after_grace =
+            key.last().unwrap().arrival_ts + FRAME_ALIGN_GRACE + Duration::from_millis(1);
+        switcher.feed(q.0, &cache, after_grace, &mut |p| out.push(p));
+        assert_eq!(frame_number(out.last().unwrap()), 3);
+        let before_tail = out.len();
+        ingest(&mut switcher, h, &mut cache, &partial[1..2], &mut out);
+        assert_eq!(out.len(), before_tail + 1, "old source fills its hole");
+        assert_eq!(
+            frame_number(out.last().unwrap()),
+            2,
+            "tail keeps old offset"
+        );
+
+        switcher.stop();
+        switcher.switch_to(h);
+        // A replacement publication has a new cache and source counter, while
+        // the subscriber's output SSRC and timeline survive.
+        let mut cache = TrackStreamCache::new();
+        let mut restarted_dd = TemporalDdGenerator::new(1);
+        let mut key = bh.keyframe(2);
+        stamp_generated_dd(&mut key, &restarted_dd.next(true));
+        ingest(&mut switcher, h, &mut cache, &key, &mut out);
+        assert_eq!(frame_number(out.last().unwrap()), 4);
+        assert_dd_decodable(&out);
+    }
+
     #[test]
     fn dd_shedding_to_a_lower_target_stays_dd_decodable() {
         use crate::rtp::frame_selector::DecodeTargetSelection;

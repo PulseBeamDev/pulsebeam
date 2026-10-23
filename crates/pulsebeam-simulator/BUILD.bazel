@@ -1,7 +1,7 @@
 load("//tools:simulation-provenance.bzl", "simulation_provenance")
 load("@crates//:defs.bzl", "aliases", "all_crate_deps", "crate_edition")
 load("@rules_rust//cargo:defs.bzl", "cargo_toml_env_vars", "extract_cargo_lints")
-load("@rules_rust//rust:defs.bzl", "rust_clippy_test", "rust_test", "rustfmt_test")
+load("@rules_rust//rust:defs.bzl", "rust_clippy_test", "rust_library", "rust_test", "rustfmt_test")
 load("@rules_python//python:defs.bzl", "py_binary", "py_test")
 load("@bazel_lib//lib:transitions.bzl", "platform_transition_filegroup")
 
@@ -11,6 +11,26 @@ exports_files(["Cargo.toml"])
 filegroup(name = "cargo_metadata_inputs", srcs = glob(["Cargo.toml", "uniffi.toml", "src/**/*.rs", "benches/**/*.rs", "examples/**/*.rs"], allow_empty = True))
 cargo_toml_env_vars(name = "cargo_env", src = "Cargo.toml", workspace = "//:Cargo.toml")
 extract_cargo_lints(name = "lints", manifest = "Cargo.toml", workspace = "//:Cargo.toml")
+
+# Compile the same external services module independently while migrating the
+# fixture consumers. This does not qualify the integrated SFU scenario.
+rust_library(
+    name = "native_runtime_services",
+    testonly = True,
+    crate_root = "src/tests/common/native.rs",
+    srcs = ["src/tests/common/native.rs"],
+    edition = crate_edition(),
+    lint_config = ":lints",
+    deps = [
+        "@crates//:anyhow",
+        "@crates//:tokio",
+        "@crates//:tokio-util",
+        "@crates//:turmoil",
+        "//crates/pulsebeam-core:pulsebeam-core-sim",
+        "//crates/pulsebeam-rtc/simulation:pulsebeam-rtc-simulation",
+        "//agents/pulsebeam-agent-native:pulsebeam-agent-native-sim",
+    ],
+)
 
 rust_test(
     name = "test_binary",
@@ -29,6 +49,7 @@ rust_test(
         "//crates/pulsebeam-core:pulsebeam-core-sim",
         "//crates/pulsebeam-runtime:pulsebeam-runtime-sim",
         "//crates/pulsebeam-testdata",
+        "//crates/pulsebeam-rtc/simulation:pulsebeam-rtc-simulation",
         "//server/rust:pulsebeam-server",
         "//agents/pulsebeam-agent-core:pulsebeam-agent-core-sim",
         "//agents/pulsebeam-agent-native:pulsebeam-agent-native-sim",
@@ -60,10 +81,6 @@ platform_transition_filegroup(
     target_platform = ":sim_platform",
 )
 
-# Human-authorized exception; keep the oracle and explicit replay intact.
-# See docs/native-dtls-exception.md for cause and reinstatement criteria.
-NATIVE_DTLS_EXCEPTION = ["--skip", "tests::native_runtime::native_agents_prove_media_topics_reconnect_and_close"]
-
 # Reserve one CPU per isolated child, from the same budget used by the runner.
 SIMULATION_JOBS = 4
 
@@ -75,7 +92,7 @@ py_test(
     name = "fast",
     srcs = ["//tools:run-simulations.py"],
     main = "//tools:run-simulations.py",
-    args = ["$(rootpath :sim_binary)", "--mode", "fast", "--jobs", str(SIMULATION_JOBS)] + CANDIDATE_ARGS + NATIVE_DTLS_EXCEPTION,
+    args = ["$(rootpath :sim_binary)", "--mode", "fast", "--jobs", str(SIMULATION_JOBS)] + CANDIDATE_ARGS,
     data = [":sim_binary", ":candidate"],
     size = "large",
     tags = ["cpu:%s" % SIMULATION_JOBS],
@@ -91,7 +108,7 @@ py_test(
     tags = ["slow", "cpu:%s" % SIMULATION_JOBS],
 )
 
-REPLAY_ARGS = ["$(rootpath :sim_binary)", "--mode", "all"] + CANDIDATE_ARGS + NATIVE_DTLS_EXCEPTION
+REPLAY_ARGS = ["$(rootpath :sim_binary)", "--mode", "all"] + CANDIDATE_ARGS
 
 py_binary(
     name = "replay",
@@ -107,7 +124,7 @@ py_binary(
     testonly = True,
     srcs = ["//tools:run-simulations.py"],
     main = "//tools:run-simulations.py",
-    args = ["$(rootpath :sim_binary)", "--mode", "all", "--seeds", "20", "--from-seed", "1"] + CANDIDATE_ARGS + NATIVE_DTLS_EXCEPTION,
+    args = ["$(rootpath :sim_binary)", "--mode", "all", "--seeds", "20", "--from-seed", "1"] + CANDIDATE_ARGS,
     data = [":sim_binary", ":candidate"],
 )
 

@@ -30,7 +30,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 use tokio::time::Instant;
 
-use crate::entity::ParticipantId;
+use crate::entity::{AudioOrigin, ParticipantId};
 
 /// Downstream bandwidth estimate observations, since the last [`reset`].
 #[derive(Debug, Default, Clone)]
@@ -52,6 +52,9 @@ struct Samples {
     /// two-viewer plan measured 1024% "efficiency", being everyone's forwarded bytes over one
     /// viewer's received bytes.
     forwarded_media_bytes: HashMap<ParticipantId, u64>,
+    /// Successful audio enqueues, not wire delivery or buffered PCM provenance.
+    /// Reset with the measured window and scoped to the actual subscriber.
+    queued_audio_packets: HashMap<(ParticipantId, AudioOrigin), AudioEnqueues>,
     /// Last-seen forwarded quality per track origin (the publisher's participant id, as a
     /// string), across every subscriber and slot forwarding from that origin. 0 = paused, else
     /// [`pulsebeam_core::simulcast::LayerQuality`] as its numeric rank (Low=1 .. High=3).
@@ -271,6 +274,49 @@ pub fn forwarded_media_bytes_for(subscriber: ParticipantId) -> u64 {
             .get(&subscriber)
             .copied()
             .unwrap_or(0)
+    })
+}
+
+/// Actual queueing extent in one measured window, not decoded PCM provenance.
+#[derive(Clone, Copy, Debug)]
+pub struct AudioEnqueues {
+    pub packets: u64,
+    first_at: Instant,
+    last_at: Instant,
+}
+impl AudioEnqueues {
+    pub fn span(&self) -> Duration {
+        self.last_at.saturating_duration_since(self.first_at)
+    }
+}
+
+/// Record a successful audio enqueue after slot selection and timeline rewrite.
+pub fn record_queued_audio(subscriber: ParticipantId, origin: AudioOrigin) {
+    SAMPLES.with_borrow_mut(|samples| {
+        let now = Instant::now();
+        let observation = samples
+            .queued_audio_packets
+            .entry((subscriber, origin))
+            .or_insert(AudioEnqueues {
+                packets: 0,
+                first_at: now,
+                last_at: now,
+            });
+        observation.packets += 1;
+        observation.last_at = now;
+    });
+}
+
+/// Audio enqueues since [`reset`], never an attribution of native PCM samples.
+pub fn queued_audio_for(subscriber: ParticipantId) -> HashMap<AudioOrigin, AudioEnqueues> {
+    SAMPLES.with_borrow(|samples| {
+        samples
+            .queued_audio_packets
+            .iter()
+            .filter_map(|((receiver, origin), count)| {
+                (*receiver == subscriber).then_some((*origin, *count))
+            })
+            .collect()
     })
 }
 
