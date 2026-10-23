@@ -733,6 +733,31 @@ fn marker_only_publisher_streams_to_a_dd_subscriber_test() {
         ]);
 }
 
+/// Exercise the same legacy simulcast ingress with libwebrtc's actual decoder.
+/// This is separate from the encoded-capture/independent-decoder oracle above:
+/// neither its frame assertions nor its currently failing result are replaced.
+#[test]
+fn marker_only_simulcast_reaches_native_decoded_video_test() {
+    LocalNodeSim::new()
+        .with_room(
+            Room::new("room1")
+                .with_participant(Participant::publisher("alice", &["q", "h", "f"]).marker_only())
+                .with_participant(Participant::subscriber("bob").with_native_decoded_video()),
+        )
+        .run(vec![
+            Step::Run {
+                description: "A marker-only Alice publishes to a native-decoded DD-capable Bob",
+                duration: Duration::from_secs(10),
+            },
+            Step::CheckNativeDecodedVideo {
+                description: "Native decoder delivers fresh changing 720p pixels and advancing stats",
+                participant: "bob",
+                dimensions: (1280, 720),
+                min_fresh_frames: 150,
+            },
+        ]);
+}
+
 #[test]
 fn fast_initial_ramp_up_on_good_network_test() {
     LocalNodeSim::new()
