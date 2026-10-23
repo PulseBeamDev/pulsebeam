@@ -60,7 +60,13 @@ Bazel independently extracts the same checksum-pinned archives and validates
 their pairing before compiling the single Rust sys/CXX target. Consumer actions
 never compile the producer's C++ sources. The shell exports are passed to
 repository rules by `.bazelrc`; keep them set for native builds and Rust metadata
-maintenance. Wrong or missing inputs fail instead of selecting an older archive.
+maintenance. Wrong or missing inputs fail instead of selecting an older archive. Filenames
+alone do not identify a compatible pair: the lock is authoritative. In particular,
+a producer native-adapter change requires rebuilding/exporting the matching native
+artifact, not just replacing its source archive or editing its manifest checksum.
+Keep the selected pair fixed throughout a verification batch. Candidate preparation
+and passing component checks are not full qualification; see the native owner's
+[support and verification scope](../agents/pulsebeam-agent-native/QUALIFICATION.md).
 
 To update the candidate, package a committed producer source using
 `git archive <revision> | gzip -n`, build its matching native artifact, update the
@@ -83,7 +89,10 @@ Bazel applies the declared patch only to RTC's str0m universe. Normal builds,
 checks and rules_rust IDE discovery consume that patched source without
 regenerating it. No fork-publishing script, sibling checkout, GitHub write access,
 manual patch rebase or separate visibility-generation command is required.
-The native `feat/bwe-6` str0m fork and its separate universe remain unchanged.
+The workspace `feat/bwe-6` str0m fork and its `str0m_native` universe remain
+for other consumers; the universe name does not imply native-agent execution.
+The native agent's normal and simulation-feature libraries use libwebrtc, not
+that fork.
 
 The transform exposes root `crypto`, `dtls`, `change`, `format`, `sdp` and `rtp_`
 modules. It widens line-leading `pub(crate)` and bare child-module declarations
