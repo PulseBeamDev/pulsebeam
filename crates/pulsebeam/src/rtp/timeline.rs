@@ -11,6 +11,7 @@
 use crate::media::SeqNo;
 use crate::rtp::RtpPacket;
 use crate::rtp::{Frequency, MediaTime};
+#[cfg(test)]
 use pulsebeam_core::dd::DependencyDescriptor;
 use pulsebeam_runtime::rand::RngCore;
 use std::time::Duration;
@@ -220,10 +221,9 @@ impl Timeline {
         if base == 0 {
             return;
         }
-        if let Some(dd) = pkt.ext_vals.user_values.get::<DependencyDescriptor>() {
-            let mut translated = dd.clone();
+        if let Some(mut translated) = pkt.ext_vals.dependency_descriptor().cloned() {
             translated.frame_number = translated.frame_number.wrapping_add(base);
-            pkt.ext_vals.user_values.set(translated);
+            pkt.ext_vals.set_descriptor(translated);
         }
     }
 
@@ -257,7 +257,7 @@ impl Timeline {
     }
 
     fn apply(&mut self, pkt: &mut RtpPacket, output_seq: SeqNo, output_ts: u64) {
-        if let Some(dd) = pkt.ext_vals.user_values.get::<DependencyDescriptor>() {
+        if let Some(dd) = pkt.ext_vals.dependency_descriptor() {
             let base = *self.dd_frame_base.get_or_insert_with(|| {
                 self.max_output_dd_frame
                     .map_or(0, |last| last.wrapping_add(1).wrapping_sub(dd.frame_number))
@@ -329,12 +329,11 @@ mod test {
                 };
                 dd.frame_dependencies.frame_diffs.push(2);
                 dd.frame_dependencies.chain_diffs.push(1);
-                packet.ext_vals.user_values.set(dd);
+                packet.ext_vals.set_descriptor(dd);
                 let [hi, lo] = frame_number.to_be_bytes();
                 packet
                     .ext_vals
-                    .user_values
-                    .set(pulsebeam_core::dd::RawDependencyDescriptor(
+                    .set_raw_descriptor(pulsebeam_core::dd::RawDependencyDescriptor(
                         [3, hi, lo].into_iter().collect(),
                     ));
                 packet
@@ -355,20 +354,14 @@ mod test {
                 let original = with_dd(501 + index as u64, 13_000, input_frame);
                 let mut output = original.clone();
                 timeline.rewrite_sequential(&mut output);
-                let mut expected = original
-                    .ext_vals
-                    .user_values
-                    .get::<DependencyDescriptor>()
-                    .unwrap()
-                    .clone();
+                let mut expected = original.ext_vals.dependency_descriptor().unwrap().clone();
                 expected.frame_number = initial.wrapping_add(input_frame);
-                assert_eq!(
-                    output.ext_vals.user_values.get::<DependencyDescriptor>(),
-                    Some(&expected)
-                );
-                use str0m::rtp::ExtensionSerializer;
+                assert_eq!(output.ext_vals.dependency_descriptor(), Some(&expected));
                 let mut wire = [0; pulsebeam_core::dd::MAX_DD_LEN];
-                let len = pulsebeam_core::dd::Serializer.write_to(&mut wire, &output.ext_vals);
+                let len = output
+                    .ext_vals
+                    .write_dependency_descriptor(&mut Default::default(), &mut wire)
+                    .unwrap();
                 assert_eq!(
                     pulsebeam_core::dd::read_mandatory(&wire[..len])
                         .unwrap()
@@ -379,8 +372,7 @@ mod test {
                 assert_eq!(
                     original
                         .ext_vals
-                        .user_values
-                        .get::<DependencyDescriptor>()
+                        .dependency_descriptor()
                         .unwrap()
                         .frame_number,
                     input_frame,
@@ -392,12 +384,7 @@ mod test {
             timeline.rebase(&third);
             timeline.rewrite_sequential(&mut third);
             assert_eq!(
-                third
-                    .ext_vals
-                    .user_values
-                    .get::<DependencyDescriptor>()
-                    .unwrap()
-                    .frame_number,
+                third.ext_vals.dependency_descriptor().unwrap().frame_number,
                 initial.wrapping_add(5),
                 "a reordered frame must not rewind the next source's DD counter"
             );

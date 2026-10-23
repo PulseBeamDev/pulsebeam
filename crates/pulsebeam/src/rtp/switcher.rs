@@ -1025,7 +1025,7 @@ mod test {
     /// `TemporalDdGenerator` so frames carry genuine `frame_diffs`.
     #[test]
     fn dd_switch_and_stop_resume_keep_one_output_counter_and_old_tail_mapping() {
-        use pulsebeam_core::dd::{DependencyDescriptor, temporal::TemporalDdGenerator};
+        use pulsebeam_core::dd::temporal::TemporalDdGenerator;
 
         let (q, h) = two_streams();
         let mut switcher = Switcher::new(rtp::VIDEO_FREQUENCY);
@@ -1035,13 +1035,7 @@ mod test {
         let mut q_dd = TemporalDdGenerator::new(1);
         let mut h_dd = TemporalDdGenerator::new(1);
         let mut out = Vec::new();
-        let frame_number = |p: &RtpPacket| {
-            p.ext_vals
-                .user_values
-                .get::<DependencyDescriptor>()
-                .unwrap()
-                .frame_number
-        };
+        let frame_number = |p: &RtpPacket| p.ext_vals.dependency_descriptor().unwrap().frame_number;
 
         switcher.switch_to(q);
         let mut key = bq.keyframe(2);

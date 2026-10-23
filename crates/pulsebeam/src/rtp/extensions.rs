@@ -22,6 +22,29 @@ pub struct RtpExtensions {
 }
 
 impl RtpExtensions {
+    /// Serialize the receiver descriptor, preserving the projected counter when
+    /// source template context requires falling back to the original bytes.
+    pub fn write_dependency_descriptor(
+        &self,
+        writer: &mut pulsebeam_core::dd::DependencyDescriptorWriter,
+        buf: &mut [u8],
+    ) -> Option<usize> {
+        if let Some(dd) = self.dependency_descriptor()
+            && let Ok(len) = writer.write(dd, buf)
+        {
+            return Some(len);
+        }
+        let raw = self.raw_dependency_descriptor()?;
+        let dst = buf.get_mut(..raw.0.len())?;
+        dst.copy_from_slice(&raw.0);
+        if let Some(dd) = self.dependency_descriptor()
+            && let Some(counter) = dst.get_mut(1..pulsebeam_core::dd::MANDATORY_LEN)
+        {
+            counter.copy_from_slice(&dd.frame_number.to_be_bytes());
+        }
+        Some(dst.len())
+    }
+
     pub fn raw_dependency_descriptor(&self) -> Option<&RawDependencyDescriptor> {
         self.raw_dependency_descriptor.as_deref()
     }
