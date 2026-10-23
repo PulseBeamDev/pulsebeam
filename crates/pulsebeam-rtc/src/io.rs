@@ -304,6 +304,8 @@ pub struct DataChannelStats {
     pub priority: DataChannelPriority,
     pub reliability: DataReliability,
     pub buffered_amount: usize,
+    /// SCTP payload bytes not yet packetized by the association.
+    pub queued_payload_bytes: usize,
     pub sent_messages: u64,
     pub received_messages: u64,
 }

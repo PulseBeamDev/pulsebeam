@@ -5,11 +5,11 @@
 //! either record a gap of billions or hide a real one, and the switcher would
 //! hold or release a switch on a number that was never true.
 
+use crate::media::SeqNo;
 use crate::rtp::{Frequency, MediaTime};
 use ahash::HashMap;
 use std::collections::BTreeSet;
 use std::time::Duration;
-use str0m::rtp::SeqNo;
 use tokio::time::Instant;
 
 use crate::entity::TrackId;
@@ -630,7 +630,7 @@ mod test {
     use crate::rtp;
     use crate::rtp::test_utils::{H264StreamBuilder, ParameterSetStyle};
 
-    use str0m::media::Rid;
+    use crate::media::Rid;
     use tokio::time::Instant;
 
     /// Two distinct streams (two simulcast layers of one track) to switch between.
@@ -694,7 +694,7 @@ mod test {
 
     #[test]
     fn replayed_parameter_sets_are_one_ordered_egress_frame() {
-        use pulsebeam_core::dd::{DependencyDescriptor, temporal::TemporalDdGenerator};
+        use pulsebeam_core::dd::temporal::TemporalDdGenerator;
 
         let (q, h) = two_streams();
         let mut switcher = Switcher::new(rtp::VIDEO_FREQUENCY);
@@ -718,10 +718,9 @@ mod test {
             packets
                 .into_iter()
                 .map(|mut packet| {
-                    packet
-                        .ext_vals
-                        .user_values
-                        .set_arc(std::sync::Arc::new(dd.next(keyframe && packet.is_keyframe)));
+                    packet.ext_vals.set_descriptor_arc(std::sync::Arc::new(
+                        dd.next(keyframe && packet.is_keyframe),
+                    ));
                     packet
                 })
                 .collect::<Vec<_>>()
@@ -763,7 +762,7 @@ mod test {
 
         let descriptors: Vec<_> = replay
             .iter()
-            .filter_map(|packet| packet.ext_vals.user_values.get::<DependencyDescriptor>())
+            .filter_map(|packet| packet.ext_vals.dependency_descriptor())
             .collect();
         assert!(!descriptors.is_empty());
         assert!(descriptors[0].start_of_frame);
@@ -899,7 +898,7 @@ mod test {
                 },
                 ..Default::default()
             };
-            p.ext_vals.user_values.set_arc(std::sync::Arc::new(dd));
+            p.ext_vals.set_descriptor_arc(std::sync::Arc::new(dd));
         }
     }
 
@@ -980,8 +979,7 @@ mod test {
     fn stamp_generated_dd(frame: &mut [RtpPacket], dd: &pulsebeam_core::dd::DependencyDescriptor) {
         for p in frame.iter_mut() {
             p.ext_vals
-                .user_values
-                .set_arc(std::sync::Arc::new(dd.clone()));
+                .set_descriptor_arc(std::sync::Arc::new(dd.clone()));
         }
     }
 
@@ -991,17 +989,16 @@ mod test {
     /// structure) is an entry point with no references. This proves the SFU shed a
     /// self-consistent set — not merely that egress RTP is well-formed.
     fn assert_dd_decodable(forwarded: &[RtpPacket]) {
-        use pulsebeam_core::dd::DependencyDescriptor;
         use std::collections::HashSet;
 
         let present: HashSet<u16> = forwarded
             .iter()
-            .filter_map(|p| p.ext_vals.user_values.get::<DependencyDescriptor>())
+            .filter_map(|p| p.ext_vals.dependency_descriptor())
             .map(|dd| dd.frame_number)
             .collect();
 
         for p in forwarded {
-            let Some(dd) = p.ext_vals.user_values.get::<DependencyDescriptor>() else {
+            let Some(dd) = p.ext_vals.dependency_descriptor() else {
                 continue;
             };
             if dd.attached_structure.is_some() {

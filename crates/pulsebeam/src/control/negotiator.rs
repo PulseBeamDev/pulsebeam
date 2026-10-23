@@ -1,15 +1,11 @@
-use std::time::Duration;
-
-use crate::participant::downstream::INITIAL_BANDWIDTH;
-use pulsebeam_proto::rtp_extensions;
-use pulsebeam_runtime::net::ReceiveTime;
-use str0m::{
-    Candidate, IceCreds, Rtc, RtcConfig,
-    change::{SdpAnswer, SdpOffer},
-    format::{Codec, CodecConfig, FormatParams},
-    media::{Direction, Frequency, MediaKind, Mid, Pt},
-    rtp::Extension,
+use crate::control::ufrag::IceCredentials;
+use crate::media::{Direction, MediaKind, Mid};
+use pulsebeam_rtc::{
+    AcceptError, AcceptedConnection, Connection, ConnectionConfig, ConnectionEntropy,
+    LocalCandidate, LocalIceCredentials, MediaSectionKind, SessionInfo,
 };
+use pulsebeam_runtime::net::ReceiveTime;
+use pulsebeam_runtime::rand::RngCore;
 
 pub const MAX_RECV_VIDEO_SLOTS: usize = 32;
 pub const MAX_RECV_AUDIO_SLOTS: usize = 32;
@@ -22,46 +18,15 @@ pub enum MediaType {
     Video,
     Audio,
     Application,
-    Unknown,
-}
-
-impl MediaType {
-    fn as_str(&self) -> &str {
-        match self {
-            Self::Video => "video",
-            Self::Audio => "audio",
-            Self::Application => "application",
-            Self::Unknown => "unknown",
-        }
-    }
-}
-
-impl From<&str> for MediaType {
-    fn from(value: &str) -> Self {
-        match value {
-            "video" => MediaType::Video,
-            "audio" => MediaType::Audio,
-            "application" => MediaType::Application,
-            _ => MediaType::Unknown,
-        }
-    }
-}
-
-impl TryFrom<MediaType> for MediaKind {
-    type Error = MediaType;
-
-    fn try_from(value: MediaType) -> Result<Self, Self::Error> {
-        match value {
-            MediaType::Video => Ok(MediaKind::Video),
-            MediaType::Audio => Ok(MediaKind::Audio),
-            other => Err(other),
-        }
-    }
 }
 
 impl std::fmt::Display for MediaType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
+        f.write_str(match self {
+            Self::Video => "video",
+            Self::Audio => "audio",
+            Self::Application => "application",
+        })
     }
 }
 
@@ -70,13 +35,28 @@ pub enum NegotiatorError {
     #[error("invalid SDP offer: {0}")]
     InvalidOffer(String),
     #[error("RTC negotiation failed: {0}")]
-    Rtc(String),
+    Rtc(AcceptError),
+    #[error("RTC initialization failed: {0}")]
+    Initialization(AcceptError),
     #[error("{0} {1} slots limit exceeded (max {2})")]
     SlotsLimit(MediaType, Direction, usize),
-    #[error("SendRecv direction is not supported for {0}")]
+    #[error("SendRecv or inactive direction is not supported for {0}")]
     DirectionNotSupported(MediaType),
     #[error("negotiated media resources are inconsistent")]
     InvalidResources,
+}
+
+impl NegotiatorError {
+    fn from_accept(error: AcceptError) -> Self {
+        match error {
+            AcceptError::InvalidOffer => Self::InvalidOffer(error.to_string()),
+            AcceptError::UnsupportedSessionProfile
+            | AcceptError::MissingPacketFeedback
+            | AcceptError::CapabilityConflict
+            | AcceptError::SessionLimitExceeded => Self::Rtc(error),
+            _ => Self::Initialization(error),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -90,22 +70,23 @@ pub struct NegotiatedMedia {
 #[derive(Debug)]
 pub struct NegotiatedResources {
     media: Vec<NegotiatedMedia>,
+    pub(crate) local_ufrag: String,
 }
 
 impl NegotiatedResources {
     #[cfg(test)]
     pub(crate) fn empty_for_test() -> Self {
-        Self { media: Vec::new() }
+        Self {
+            media: Vec::new(),
+            local_ufrag: "test".to_owned(),
+        }
     }
-
     pub fn media(&self, mid: Mid) -> Option<NegotiatedMedia> {
         self.media.iter().find(|media| media.mid == mid).copied()
     }
-
     pub(crate) fn media_sections(&self) -> &[NegotiatedMedia] {
         &self.media
     }
-
     #[cfg(test)]
     fn as_slice(&self) -> &[NegotiatedMedia] {
         &self.media
@@ -113,219 +94,227 @@ impl NegotiatedResources {
 }
 
 pub struct Negotiator {
-    candidates: Vec<Candidate>,
+    candidates: Vec<LocalCandidate>,
 }
 
 impl Negotiator {
-    pub fn new(candidates: Vec<Candidate>) -> Self {
+    pub fn new(candidates: Vec<LocalCandidate>) -> Self {
         Self { candidates }
     }
 
     pub fn create_answer(
         &mut self,
         offer: String,
-        creds: IceCreds,
+        creds: IceCredentials,
         at: ReceiveTime,
-    ) -> Result<(Rtc, String, NegotiatedResources), NegotiatorError> {
-        tracing::debug!("{offer}");
-        let offer = SdpOffer::from_sdp_string(&offer)
-            .map_err(|error| NegotiatorError::InvalidOffer(error.to_string()))?;
-        let mut rtc_config = RtcConfig::new()
-            .clear_codecs()
-            .set_rtp_mode(true)
-            .set_extension(
-                rtp_extensions::ABS_CAPTURE_TIME,
-                Extension::AbsoluteCaptureTime,
-            )
-            // Sender-declared per-layer target bitrates. Browsers emit this for
-            // simulcast/SVC; we allocate on the declared targets instead of
-            // measured (VBR) throughput. Falls back to measurement when absent.
-            .set_extension(
-                rtp_extensions::VIDEO_LAYERS_ALLOCATION,
-                Extension::with_serializer(str0m::rtp::vla::URI, str0m::rtp::vla::Serializer),
-            )
-            // Lets the SFU bound each subscriber's jitter buffer (latency cap)
-            // by stamping min/max playout delay on egress RTP.
-            .set_extension(rtp_extensions::PLAYOUT_DELAY, Extension::PlayoutDelay)
-            // Per-frame dependency structure for SVC codecs. Captured verbatim
-            // here; parsing needs per-stream template state (see rtp::dd).
-            .set_extension(
-                rtp_extensions::DEPENDENCY_DESCRIPTOR,
-                Extension::with_serializer(pulsebeam_core::dd::URI, pulsebeam_core::dd::Serializer),
-            )
-            // .set_stats_interval(Some(Duration::from_millis(200)))
-            // TODO: enable bwe
-            .enable_bwe(Some(INITIAL_BANDWIDTH))
-            // Uncomment this to see statistics
-            // .set_stats_interval(Some(Duration::from_secs(1)))
-            .set_ice_lite(true)
-            .set_snap_enabled(true)
-            .set_dtls_version(str0m::config::DtlsVersion::Auto);
-        rtc_config.set_initial_stun_rto(Duration::from_millis(200));
-        rtc_config.set_max_stun_rto(Duration::from_millis(1500));
-        rtc_config.set_max_stun_retransmits(5);
-        configure_room_codecs(rtc_config.codec_config());
-
-        // Stamp the ICE credentials with routing metadata before building the Rtc
-        // so they are used by str0m's ICE agent from the start.  Using RtcConfig
-        // is the correct path — direct_api().set_local_ice_credentials() conflicts
-        // with the SDP negotiation path.
-        let rtc_config = rtc_config.set_local_ice_credentials(creds);
-
-        let mut rtc = rtc_config.build(at.monotonic.into());
-        for c in &self.candidates {
-            rtc.add_local_candidate(c.clone());
-        }
-
-        let answer = rtc
-            .sdp_api()
-            .accept_offer(offer)
-            .map_err(|error| NegotiatorError::Rtc(error.to_string()))?;
-        Self::enforce_media_lines(&answer)?;
-        let resources = Self::negotiated_resources(&answer)?;
-
-        tracing::debug!("{answer}");
-        Ok((rtc, answer.to_sdp_string(), resources))
+    ) -> Result<(AcceptedConnection, String, NegotiatedResources), NegotiatorError> {
+        let local_ufrag = creds.ufrag.clone();
+        let credentials = LocalIceCredentials::new(creds.ufrag, creds.pass)
+            .map_err(NegotiatorError::Initialization)?;
+        let mut seed = [0; 32];
+        pulsebeam_runtime::rand::os_rng().fill_bytes(&mut seed);
+        let accepted = Connection::accept(
+            ConnectionConfig {
+                local_candidates: self.candidates.clone(),
+                local_ice_credentials: Some(credentials),
+                limits: pulsebeam_rtc::ConnectionLimits {
+                    max_unsignaled_encodings: 128,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            pulsebeam_rtc::SdpOffer::new(offer),
+            at.monotonic.into(),
+            at.wall,
+            ConnectionEntropy::new(seed),
+        )
+        .map_err(NegotiatorError::from_accept)?;
+        Self::enforce_media_lines(&accepted.session)?;
+        let resources = Self::negotiated_resources(&accepted.session, local_ufrag)?;
+        let answer = accepted.answer.as_str().to_owned();
+        Ok((accepted, answer, resources))
     }
 
-    fn negotiated_resources(answer: &SdpAnswer) -> Result<NegotiatedResources, NegotiatorError> {
+    fn negotiated_resources(
+        session: &SessionInfo,
+        local_ufrag: String,
+    ) -> Result<NegotiatedResources, NegotiatorError> {
         let mut media = Vec::new();
-        for (index, section) in answer.media_lines.iter().enumerate() {
-            if section.disabled {
-                continue;
-            }
-            let kind = match section.typ.to_string().as_str() {
-                "video" => MediaKind::Video,
-                "audio" => MediaKind::Audio,
-                _ => continue,
+        for section in session
+            .offered_media
+            .iter()
+            .filter(|section| !section.disabled)
+        {
+            let kind = match section.kind {
+                MediaSectionKind::Audio => MediaKind::Audio,
+                MediaSectionKind::Video => MediaKind::Video,
+                MediaSectionKind::Application => continue,
             };
-            let direction = section.direction();
+            let direction = Direction::from(section.direction);
             if !matches!(direction, Direction::SendOnly | Direction::RecvOnly) {
                 return Err(NegotiatorError::InvalidResources);
             }
-            let media_index =
-                u32::try_from(index).map_err(|_| NegotiatorError::InvalidResources)?;
-            let mid = section.mid();
+            let mid = Mid::new(&section.mid).map_err(|_| NegotiatorError::InvalidResources)?;
+            if session
+                .inbound_media
+                .iter()
+                .filter(|info| info.mid == section.mid)
+                .any(|info| {
+                    info.rids
+                        .iter()
+                        .any(|rid| crate::media::Rid::new(rid).is_err())
+                })
+            {
+                return Err(NegotiatorError::InvalidResources);
+            }
             if media
                 .iter()
                 .any(|resource: &NegotiatedMedia| resource.mid == mid)
             {
                 return Err(NegotiatorError::InvalidResources);
             }
+            let accepted = match direction {
+                Direction::RecvOnly => session.inbound_media.iter().any(|value| {
+                    value.sender_index == section.media_index
+                        && value.mid == section.mid
+                        && value.kind == kind
+                }),
+                Direction::SendOnly => session.senders.iter().any(|value| {
+                    value.receiver_index == section.media_index
+                        && value.mid == section.mid
+                        && value.kind == kind
+                }),
+                _ => false,
+            };
+            if !accepted {
+                return Err(NegotiatorError::InvalidResources);
+            }
             media.push(NegotiatedMedia {
-                media_index,
+                media_index: section.media_index,
                 mid,
                 kind,
                 direction,
             });
         }
-        Ok(NegotiatedResources { media })
+        Ok(NegotiatedResources { media, local_ufrag })
     }
 
-    fn enforce_media_lines(answer: &SdpAnswer) -> Result<(), NegotiatorError> {
-        let mut video_recv_count = 0usize;
-        let mut video_send_count = 0usize;
-        let mut audio_recv_count = 0usize;
-        let mut audio_send_count = 0usize;
-        let mut data_channel_count = 0usize;
-
-        for m in &answer.media_lines {
-            if m.disabled {
-                continue;
+    fn enforce_media_lines(session: &SessionInfo) -> Result<(), NegotiatorError> {
+        let (mut video_recv, mut video_send, mut audio_recv, mut audio_send, mut application) =
+            (0usize, 0usize, 0usize, 0usize, 0usize);
+        for section in session
+            .offered_media
+            .iter()
+            .filter(|section| !section.disabled)
+        {
+            let dir = Direction::from(section.direction);
+            if matches!(dir, Direction::SendRecv | Direction::Inactive)
+                && section.kind != MediaSectionKind::Application
+            {
+                return Err(NegotiatorError::DirectionNotSupported(match section.kind {
+                    MediaSectionKind::Audio => MediaType::Audio,
+                    _ => MediaType::Video,
+                }));
             }
-            let kind = m.typ.to_string();
-            let dir = m.direction();
-            let media_type = kind.as_str().into();
-
-            if (dir == Direction::SendRecv || dir == Direction::Inactive) && kind != "application" {
-                return Err(NegotiatorError::DirectionNotSupported(media_type));
-            }
-
-            match (media_type, dir) {
-                (MediaType::Video, Direction::RecvOnly) => {
-                    video_recv_count = video_recv_count.saturating_add(1);
-                    if video_recv_count > MAX_RECV_VIDEO_SLOTS {
-                        return Err(NegotiatorError::SlotsLimit(
-                            MediaType::Video,
-                            Direction::SendOnly,
-                            MAX_RECV_VIDEO_SLOTS,
-                        ));
-                    }
-                }
-                (MediaType::Video, Direction::SendOnly) => {
-                    video_send_count = video_send_count.saturating_add(1);
-                    if video_send_count > MAX_SEND_VIDEO_SLOTS {
-                        return Err(NegotiatorError::SlotsLimit(
-                            MediaType::Video,
-                            Direction::RecvOnly,
-                            MAX_SEND_VIDEO_SLOTS,
-                        ));
-                    }
-                }
-                (MediaType::Audio, Direction::RecvOnly) => {
-                    audio_recv_count = audio_recv_count.saturating_add(1);
-                    if audio_recv_count > MAX_RECV_AUDIO_SLOTS {
-                        return Err(NegotiatorError::SlotsLimit(
-                            MediaType::Audio,
-                            Direction::SendOnly,
-                            MAX_RECV_AUDIO_SLOTS,
-                        ));
-                    }
-                }
-                (MediaType::Audio, Direction::SendOnly) => {
-                    audio_send_count = audio_send_count.saturating_add(1);
-                    if audio_send_count > MAX_SEND_AUDIO_SLOTS {
-                        return Err(NegotiatorError::SlotsLimit(
-                            MediaType::Audio,
-                            Direction::RecvOnly,
-                            MAX_SEND_AUDIO_SLOTS,
-                        ));
-                    }
-                }
-                (MediaType::Application, dir) => {
-                    data_channel_count = data_channel_count.saturating_add(1);
-                    if data_channel_count > MAX_DATA_CHANNELS {
-                        return Err(NegotiatorError::SlotsLimit(
-                            MediaType::Application,
-                            dir,
-                            MAX_DATA_CHANNELS,
-                        ));
-                    }
-                }
-                _ => {}
+            let (count, limit, kind, offered_direction) = match (section.kind, dir) {
+                (MediaSectionKind::Video, Direction::RecvOnly) => (
+                    &mut video_recv,
+                    MAX_RECV_VIDEO_SLOTS,
+                    MediaType::Video,
+                    Direction::SendOnly,
+                ),
+                (MediaSectionKind::Video, Direction::SendOnly) => (
+                    &mut video_send,
+                    MAX_SEND_VIDEO_SLOTS,
+                    MediaType::Video,
+                    Direction::RecvOnly,
+                ),
+                (MediaSectionKind::Audio, Direction::RecvOnly) => (
+                    &mut audio_recv,
+                    MAX_RECV_AUDIO_SLOTS,
+                    MediaType::Audio,
+                    Direction::SendOnly,
+                ),
+                (MediaSectionKind::Audio, Direction::SendOnly) => (
+                    &mut audio_send,
+                    MAX_SEND_AUDIO_SLOTS,
+                    MediaType::Audio,
+                    Direction::RecvOnly,
+                ),
+                (MediaSectionKind::Application, _) => (
+                    &mut application,
+                    MAX_DATA_CHANNELS,
+                    MediaType::Application,
+                    dir,
+                ),
+                _ => return Err(NegotiatorError::InvalidResources),
+            };
+            *count = count.saturating_add(1);
+            if *count > limit {
+                return Err(NegotiatorError::SlotsLimit(kind, offered_direction, limit));
             }
         }
-
         Ok(())
     }
 }
 
-/// The codec set every room negotiates. Static for now: the same fixed codecs
-/// apply to all rooms — per-room selection is not yet plumbed through.
-///
-/// H.264 only for now. It is the lowest common denominator for small clients
-/// (embedded devices, smartphones, OBS), so it maximizes compatibility. VP9/AV1
-/// (needed for codec-agnostic E2EE) are intentionally left off until per-room
-/// codec configuration lands.
-fn configure_room_codecs(codec_config: &mut CodecConfig) {
-    const PT_OPUS: Pt = Pt::new_with_value(111);
+#[cfg(test)]
+pub(crate) fn application_only_test_connection() -> AcceptedConnection {
+    application_only_test_pair().0
+}
 
-    codec_config.add_config(
-        PT_OPUS,
-        None,
-        Codec::Opus,
-        Frequency::FORTY_EIGHT_KHZ,
-        Some(2),
-        FormatParams {
-            min_p_time: Some(10),
-            use_inband_fec: Some(true),
-            use_dtx: Some(true),
-            stereo: Some(true),
-            sprop_stereo: Some(true),
-            ..Default::default()
-        },
+#[cfg(test)]
+pub(crate) fn application_only_test_connection_and_binding()
+-> (AcceptedConnection, NegotiatedResources, Vec<u8>) {
+    let (accepted, resources, mut peer) = application_only_test_pair();
+    let binding = (0..64)
+        .find_map(|_| match peer.poll_output().unwrap() {
+            str0m::Output::Transmit(tx) => {
+                assert_eq!(tx.source, "127.0.0.1:5000".parse().unwrap());
+                assert_eq!(tx.destination, "127.0.0.1:6000".parse().unwrap());
+                Some(tx.contents.to_vec())
+            }
+            str0m::Output::Timeout(at) => {
+                peer.handle_input(str0m::Input::Timeout(at)).unwrap();
+                None
+            }
+            _ => None,
+        })
+        .expect("native peer must emit its ICE binding request");
+    (accepted, resources, binding)
+}
+
+#[cfg(test)]
+fn application_only_test_pair() -> (AcceptedConnection, NegotiatedResources, str0m::Rtc) {
+    let mut peer = str0m::RtcConfig::new().build(std::time::Instant::now());
+    peer.add_local_candidate(
+        str0m::Candidate::builder()
+            .udp()
+            .host("127.0.0.1:5000".parse().unwrap())
+            .build()
+            .unwrap(),
     );
-    codec_config.enable_h264(true);
+    let mut changes = peer.sdp_api();
+    changes.add_channel("test".to_owned());
+    let (offer, pending) = changes.apply().unwrap();
+    let local = "127.0.0.1:6000".parse().unwrap();
+    let (accepted, answer, resources) = Negotiator::new(vec![
+        LocalCandidate::Udp(local),
+        LocalCandidate::TcpPassive(local),
+    ])
+    .create_answer(
+        offer.to_sdp_string(),
+        crate::control::ufrag::test_credentials(),
+        ReceiveTime::now(),
+    )
+    .unwrap();
+    peer.sdp_api()
+        .accept_answer(
+            pending,
+            str0m::change::SdpAnswer::from_sdp_string(&answer).unwrap(),
+        )
+        .unwrap();
+    (accepted, resources, peer)
 }
 
 #[cfg(test)]
@@ -334,6 +323,28 @@ mod tests {
     // Convenience only: a test is not a shard, so nothing here is
     // cross-core. See crates/pulsebeam/docs/thread-per-core.md.
     use super::*;
+    use crate::control::ufrag::test_credentials;
+    use str0m::{
+        RtcConfig,
+        change::SdpOffer,
+        media::{Direction, MediaKind},
+        rtp::Extension,
+    };
+
+    fn with_candidate(mut rtc: str0m::Rtc) -> str0m::Rtc {
+        rtc.add_local_candidate(
+            str0m::Candidate::builder()
+                .udp()
+                .host("127.0.0.1:5000".parse().unwrap())
+                .build()
+                .unwrap(),
+        );
+        rtc
+    }
+
+    fn negotiator() -> Negotiator {
+        Negotiator::new(vec![LocalCandidate::Udp("127.0.0.1:6000".parse().unwrap())])
+    }
 
     fn chrome_like_offer(direction: Direction) -> String {
         let mut config = RtcConfig::new()
@@ -346,7 +357,7 @@ mod tests {
             )
             .set_extension(14, Extension::VideoOrientation);
         config.codec_config().enable_h264(true);
-        let mut rtc = config.build(std::time::Instant::now());
+        let mut rtc = with_candidate(config.build(std::time::Instant::now()));
 
         let mut change = rtc.sdp_api();
         change.add_media(MediaKind::Video, direction, None, None, None);
@@ -354,11 +365,11 @@ mod tests {
     }
 
     fn answer_sdp() -> String {
-        let mut negotiator = Negotiator::new(Vec::new());
+        let mut negotiator = negotiator();
         let (_, answer, _) = negotiator
             .create_answer(
                 chrome_like_offer(Direction::SendOnly),
-                IceCreds::new(),
+                test_credentials(),
                 ReceiveTime::now(),
             )
             .unwrap();
@@ -371,11 +382,11 @@ mod tests {
             (Direction::SendOnly, "a=recvonly"),
             (Direction::RecvOnly, "a=sendonly"),
         ] {
-            let mut negotiator = Negotiator::new(Vec::new());
+            let mut negotiator = negotiator();
             let (_, answer, _) = negotiator
                 .create_answer(
                     chrome_like_offer(offer_direction),
-                    IceCreds::new(),
+                    test_credentials(),
                     ReceiveTime::now(),
                 )
                 .unwrap();
@@ -385,15 +396,15 @@ mod tests {
 
     #[test]
     fn resources_preserve_media_positions_across_data_sections() {
-        let mut rtc = RtcConfig::new().build(std::time::Instant::now());
+        let mut rtc = with_candidate(RtcConfig::new().build(std::time::Instant::now()));
         let mut change = rtc.sdp_api();
         change.add_media(MediaKind::Audio, Direction::SendOnly, None, None, None);
         change.add_channel("signal".to_owned());
         change.add_media(MediaKind::Video, Direction::RecvOnly, None, None, None);
         let offer = change.apply().unwrap().0.to_sdp_string();
-        let mut negotiator = Negotiator::new(Vec::new());
+        let mut negotiator = negotiator();
         let (_, _, resources) = negotiator
-            .create_answer(offer, IceCreds::new(), ReceiveTime::now())
+            .create_answer(offer, test_credentials(), ReceiveTime::now())
             .unwrap();
 
         assert_eq!(
@@ -403,14 +414,33 @@ mod tests {
                 .map(|resource| (resource.media_index, resource.kind, resource.direction))
                 .collect::<Vec<_>>(),
             vec![
-                (0, MediaKind::Audio, Direction::RecvOnly),
-                (2, MediaKind::Video, Direction::SendOnly),
+                (
+                    0,
+                    crate::media::MediaKind::Audio,
+                    crate::media::Direction::RecvOnly
+                ),
+                (
+                    2,
+                    crate::media::MediaKind::Video,
+                    crate::media::Direction::SendOnly
+                ),
             ]
         );
     }
 
-    fn with_unique_mids(offer: SdpOffer) -> String {
-        // str0m's random MIDs can collide within a batch of pending additions.
+    fn with_unique_media_identities(offer: SdpOffer) -> String {
+        // Pending MID collisions also reuse the first pending media's SSRCs in str0m.
+        fn remap_ssrc(
+            value: &str,
+            section: &mut std::collections::HashMap<String, u32>,
+            next: &mut u32,
+        ) -> u32 {
+            *section.entry(value.to_owned()).or_insert_with(|| {
+                let assigned = *next;
+                *next = next.saturating_add(1);
+                assigned
+            })
+        }
         let sdp = offer.to_sdp_string();
         let bundle = sdp
             .lines()
@@ -420,15 +450,33 @@ mod tests {
             .collect::<Vec<_>>()
             .join(" ");
         let mut index = 0;
+        let mut ssrcs = std::collections::HashMap::new();
+        let mut next_ssrc = 1;
         let lines = sdp
             .lines()
             .map(|line| {
+                if line.starts_with("m=") {
+                    ssrcs.clear();
+                }
                 if line.starts_with("a=group:BUNDLE ") {
                     format!("a=group:BUNDLE {bundle}")
                 } else if line.starts_with("a=mid:") {
                     let mid = format!("a=mid:m{index}");
                     index += 1;
                     mid
+                } else if let Some(group) = line.strip_prefix("a=ssrc-group:") {
+                    let (semantics, sources) = group.split_once(' ').expect("native SSRC group");
+                    let sources = sources
+                        .split_whitespace()
+                        .map(|value| remap_ssrc(value, &mut ssrcs, &mut next_ssrc).to_string())
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    format!("a=ssrc-group:{semantics} {sources}")
+                } else if let Some(attribute) = line.strip_prefix("a=ssrc:") {
+                    let (value, attribute) =
+                        attribute.split_once(' ').expect("native SSRC attribute");
+                    let ssrc = remap_ssrc(value, &mut ssrcs, &mut next_ssrc);
+                    format!("a=ssrc:{ssrc} {attribute}")
                 } else {
                     line.to_owned()
                 }
@@ -439,7 +487,7 @@ mod tests {
 
     #[test]
     fn negotiated_capacity_is_independent_per_kind_and_direction() {
-        let mut rtc = RtcConfig::new().build(std::time::Instant::now());
+        let mut rtc = with_candidate(RtcConfig::new().build(std::time::Instant::now()));
         let mut change = rtc.sdp_api();
         for (kind, direction) in [
             (MediaKind::Audio, Direction::SendOnly),
@@ -451,27 +499,28 @@ mod tests {
                 change.add_media(kind, direction, None, None, None);
             }
         }
-        let offer = with_unique_mids(change.apply().unwrap().0);
-        let mut negotiator = Negotiator::new(Vec::new());
+        change.add_channel("signal".to_owned());
+        let offer = with_unique_media_identities(change.apply().unwrap().0);
+        let mut negotiator = negotiator();
         negotiator
-            .create_answer(offer, IceCreds::new(), ReceiveTime::now())
+            .create_answer(offer, test_credentials(), ReceiveTime::now())
             .unwrap();
     }
 
     #[test]
     fn rejects_thirty_third_video_receiver() {
-        let mut rtc = RtcConfig::new().build(std::time::Instant::now());
+        let mut rtc = with_candidate(RtcConfig::new().build(std::time::Instant::now()));
         let mut change = rtc.sdp_api();
         for _ in 0..33 {
             change.add_media(MediaKind::Video, Direction::RecvOnly, None, None, None);
         }
-        let offer = with_unique_mids(change.apply().unwrap().0);
-        let mut negotiator = Negotiator::new(Vec::new());
+        let offer = with_unique_media_identities(change.apply().unwrap().0);
+        let mut negotiator = negotiator();
         assert!(matches!(
-            negotiator.create_answer(offer, IceCreds::new(), ReceiveTime::now()),
+            negotiator.create_answer(offer, test_credentials(), ReceiveTime::now()),
             Err(NegotiatorError::SlotsLimit(
                 MediaType::Video,
-                Direction::RecvOnly,
+                crate::media::Direction::RecvOnly,
                 32
             ))
         ));
@@ -479,7 +528,7 @@ mod tests {
 
     #[test]
     fn port_zero_rtp_sections_do_not_fail_direction_validation() {
-        let mut rtc = RtcConfig::new().build(std::time::Instant::now());
+        let mut rtc = with_candidate(RtcConfig::new().build(std::time::Instant::now()));
         let mut change = rtc.sdp_api();
         change.add_media(MediaKind::Audio, Direction::SendOnly, None, None, None);
         change.add_media(MediaKind::Video, Direction::SendOnly, None, None, None);
@@ -489,12 +538,42 @@ mod tests {
             .0
             .to_sdp_string()
             .replacen("m=video 9", "m=video 0", 1);
-        let mut negotiator = Negotiator::new(Vec::new());
+        let mut negotiator = negotiator();
         assert!(
             negotiator
-                .create_answer(offer, IceCreds::new(), ReceiveTime::now())
+                .create_answer(offer, test_credentials(), ReceiveTime::now())
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn only_subscribers_require_packet_feedback_including_audio_only() {
+        for direction in [Direction::SendOnly, Direction::RecvOnly] {
+            let mut peer = with_candidate(RtcConfig::new().build(std::time::Instant::now()));
+            let mut change = peer.sdp_api();
+            change.add_media(MediaKind::Audio, direction, None, None, None);
+            let offer = change
+                .apply()
+                .unwrap()
+                .0
+                .to_sdp_string()
+                .lines()
+                .filter(|line| {
+                    !line.starts_with("a=rtcp-fb:") && !line.contains("transport-wide-cc")
+                })
+                .collect::<Vec<_>>()
+                .join("\r\n")
+                + "\r\n";
+            let result = negotiator().create_answer(offer, test_credentials(), ReceiveTime::now());
+            match direction {
+                Direction::SendOnly => assert!(result.is_ok()),
+                Direction::RecvOnly => assert!(matches!(
+                    result,
+                    Err(NegotiatorError::Rtc(AcceptError::MissingPacketFeedback))
+                )),
+                _ => unreachable!(),
+            }
+        }
     }
 
     #[test]

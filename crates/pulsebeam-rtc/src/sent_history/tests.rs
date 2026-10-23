@@ -250,6 +250,15 @@ fn missing_packet_becomes_loss_only_after_reordering_window() {
             TwccStatus::Received { delta_250us: 1 },
         ],
     ));
+    assert_eq!(
+        history
+            .inputs
+            .feedback
+            .iter()
+            .filter(|sample| sample.reported_lost_for_the_first_time)
+            .count(),
+        0
+    );
     history.clear_controller_inputs();
     history.expire(now + Duration::from_millis(49), 256);
     assert!(history.inputs.synthetic.is_empty());
@@ -257,10 +266,9 @@ fn missing_packet_becomes_loss_only_after_reordering_window() {
     assert!(history.inputs.synthetic.iter().any(|sample| sample.lost));
     assert!(history.inputs.synthetic.iter().all(|sample| {
         sample.loss_origin == Some(LossOrigin::Reordering)
-            && sample
+            && !sample
                 .controller_sample(now + Duration::from_millis(50), now)
-                .loss_origin
-                == Some(LossOrigin::Reordering)
+                .lost
     }));
 }
 
@@ -284,7 +292,7 @@ fn expiry_retirement_preserves_an_earlier_confirmation_under_backlog() {
     assert!(history.inputs.synthetic.iter().all(|sample| {
         sample.lost
             && sample.loss_origin == Some(LossOrigin::Reordering)
-            && sample.controller_sample(expired_at, now).loss_origin == Some(LossOrigin::Reordering)
+            && !sample.controller_sample(expired_at, now).lost
     }));
     assert_eq!(history.bytes_in_flight, 0);
 }
@@ -359,6 +367,99 @@ fn stale_rfc8888_generation_is_rejected_per_ssrc() {
     assert_eq!(history.inputs.bytes_in_flight, bytes_in_flight);
     assert!(history.inputs.feedback.is_empty());
     assert!(history.ssrcs[0].highest_acked_sequence.is_none());
+}
+
+#[test]
+fn mixed_path_feedback_only_credits_the_committed_current_suffix_including_rollover() {
+    for mode in [
+        PacketFeedbackKind::TransportWide,
+        PacketFeedbackKind::Rfc8888,
+    ] {
+        for rollover in [false, true] {
+            let now = Instant::now();
+            let old = PathEpoch::from_value(40);
+            let current = PathEpoch::from_value(41);
+            let mut history = SentHistory::new(mode);
+            let first = if rollover { 65_534_u64 } else { 1 };
+            history.path_changed(old, true);
+            for offset in 0..4 {
+                if offset == 2 {
+                    history.path_changed(current, true);
+                }
+                let epoch = if offset < 2 { old } else { current };
+                let index = first + offset;
+                let sequence = u16::try_from(index % 65_536).unwrap();
+                let mut packet = if mode == PacketFeedbackKind::TransportWide {
+                    context(now, epoch, sequence)
+                } else {
+                    rfc_context(now, epoch, sequence)
+                };
+                packet.rtp.as_mut().unwrap().index = index;
+                history.commit(packet).unwrap();
+            }
+            history.clear_controller_inputs();
+            let report = |count, delay| FeedbackBatch {
+                received_at: at(now + Duration::from_millis(delay)),
+                path_epoch: current,
+                sender_ssrc: 9,
+                report: if mode == PacketFeedbackKind::TransportWide {
+                    FeedbackReport::Twcc {
+                        media_ssrc: 7,
+                        base_sequence: u16::try_from(first).unwrap(),
+                        reference_time: 0,
+                        feedback_count: 1,
+                        statuses: vec![TwccStatus::Received { delta_250us: 1 }; count].into(),
+                    }
+                } else {
+                    FeedbackReport::Rfc8888 {
+                        report_timestamp: 65_536,
+                        reports: vec![crate::rtcp::Rfc8888Report {
+                            ssrc: 7,
+                            begin_sequence: u16::try_from(first).unwrap(),
+                            report_count: u16::try_from(count).unwrap(),
+                            statuses: vec![
+                                Rfc8888Status::Received {
+                                    ecn: 0,
+                                    arrival_offset: ArrivalOffset::Ticks(1)
+                                };
+                                count
+                            ]
+                            .into(),
+                        }]
+                        .into(),
+                    }
+                },
+            };
+            history.process_feedback(report(2, 10));
+            assert_eq!(history.bytes_in_flight, 2_400);
+            assert!(history.inputs.feedback.is_empty());
+            assert!(!history.inputs.fresh_network_feedback);
+            history.process_feedback(report(4, 20));
+            assert_eq!(history.bytes_in_flight, 0);
+            assert_eq!(history.counters.received, 2);
+            assert_eq!(history.inputs.feedback.len(), 2);
+            assert!(
+                history
+                    .inputs
+                    .feedback
+                    .iter()
+                    .all(|sample| sample.sent_id.0 >= 2 && sample.received && sample.newly_acked)
+            );
+            assert!(history.inputs.fresh_network_feedback);
+            if mode == PacketFeedbackKind::TransportWide {
+                assert_eq!(history.highest_twcc_acked, Some(first + 3));
+                assert_eq!(
+                    history.inputs.feedback.last().unwrap().receiver_arrival,
+                    Some(ReceiverTime::Micros(1_000))
+                );
+            }
+            history.clear_controller_inputs();
+            history.process_feedback(report(4, 30));
+            assert_eq!(history.counters.received, 2);
+            assert!(history.inputs.feedback.is_empty());
+            assert!(!history.inputs.fresh_network_feedback);
+        }
+    }
 }
 
 #[test]
@@ -573,7 +674,17 @@ fn all_missing_rfc8888_report_does_not_advance_either_ssrc() {
         },
     });
     assert_eq!(history.bytes_in_flight, 4_800);
-    assert!(history.inputs.feedback.is_empty());
+    assert_eq!(history.inputs.feedback.len(), 2);
+    assert!(
+        history
+            .inputs
+            .feedback
+            .iter()
+            .all(|sample| sample.reported_lost_for_the_first_time
+                && !sample.received
+                && !sample.newly_acked
+                && !sample.lost)
+    );
     assert_eq!(history.ssrcs[0].highest_acked_sequence, None);
     assert_eq!(history.ssrcs[1].highest_acked_sequence, None);
     assert!(history.inputs.fresh_network_feedback);
@@ -623,7 +734,17 @@ fn all_missing_twcc_report_does_not_advance_credit() {
     ));
     assert_eq!(history.bytes_in_flight, 3_600);
     assert_eq!(history.highest_twcc_acked, None);
-    assert!(history.inputs.feedback.is_empty());
+    assert_eq!(history.inputs.feedback.len(), 3);
+    assert!(
+        history
+            .inputs
+            .feedback
+            .iter()
+            .all(|sample| !sample.reported_lost_for_the_first_time
+                && !sample.received
+                && !sample.newly_acked
+                && !sample.lost)
+    );
     assert!(history.inputs.fresh_network_feedback);
     history.clear_controller_inputs();
     history.process_feedback(batch(
@@ -710,6 +831,58 @@ fn all_missing_then_received_advances_credit_once_without_double_delivery() {
     ));
     assert_eq!(history.bytes_in_flight, 1_200);
     assert!(history.inputs.feedback.is_empty());
+}
+
+#[test]
+fn expiry_of_unreported_prefix_is_not_network_loss_alongside_fresh_receipts() {
+    let now = Instant::now();
+    let epoch = PathEpoch::from_value(16);
+    let mut history = SentHistory::new(PacketFeedbackKind::TransportWide);
+    history.path_changed(epoch, true);
+    for sequence in 1..=3 {
+        history.commit(context(now, epoch, sequence)).unwrap();
+    }
+    let mut first = batch(
+        now + Duration::from_millis(10),
+        epoch,
+        vec![TwccStatus::Received { delta_250us: 1 }],
+    );
+    if let FeedbackReport::Twcc { base_sequence, .. } = &mut first.report {
+        *base_sequence = 3;
+    }
+    history.process_feedback(first);
+    assert_eq!(history.bytes_in_flight, 0);
+    history.clear_controller_inputs();
+    let expired = now + SENT_HISTORY_MAX_AGE;
+    history.expire(expired, MAX_EXPIRATIONS_PER_POLL);
+    assert_eq!(history.inputs.synthetic.len(), 2);
+    history.commit(context(expired, epoch, 4)).unwrap();
+    let arrival = expired + Duration::from_millis(10);
+    let mut next = batch(
+        arrival,
+        epoch,
+        vec![TwccStatus::Received { delta_250us: 2 }],
+    );
+    if let FeedbackReport::Twcc {
+        base_sequence,
+        feedback_count,
+        ..
+    } = &mut next.report
+    {
+        *base_sequence = 4;
+        *feedback_count = 2;
+    }
+    history.process_feedback(next);
+    assert!(history.inputs.fresh_network_feedback);
+    for sample in history
+        .inputs
+        .feedback
+        .iter()
+        .chain(&history.inputs.synthetic)
+    {
+        let sample = sample.controller_sample(arrival, now);
+        assert!(!sample.lost && !sample.recovered);
+    }
 }
 
 #[test]
@@ -864,7 +1037,7 @@ fn all_missing_waits_for_higher_receipt_before_reorder_loss() {
 }
 
 #[test]
-fn late_receipt_after_logical_deadline_cannot_erase_loss() {
+fn late_twcc_receipt_preserves_ledger_loss_without_native_loss_or_recovery() {
     let now = Instant::now();
     let epoch = PathEpoch::from_value(32);
     let mut history = SentHistory::new(PacketFeedbackKind::TransportWide);
@@ -898,9 +1071,23 @@ fn late_receipt_after_logical_deadline_cannot_erase_loss() {
         history.entry(SentPacketId(1)).unwrap().acknowledgment,
         Acknowledgment::Lost
     );
-    assert!(!history.inputs.feedback.iter().any(|sample| sample.received));
-    assert!(!history.inputs.fresh_network_feedback);
+    assert_eq!(history.counters.not_received, 1);
+    assert_eq!(history.counters.received, 2);
+    let recovery = history
+        .inputs
+        .feedback
+        .iter()
+        .find(|sample| sample.sent_id == SentPacketId(1) && sample.received)
+        .unwrap();
+    assert!(recovery.received);
+    assert!(!recovery.newly_acked);
+    let native = recovery.controller_sample(now + Duration::from_secs(1), now);
+    assert!(!native.recovered);
+    assert!(!native.lost);
+    assert_eq!(native.received_at, Duration::from_millis(40));
+    assert!(history.inputs.fresh_network_feedback);
     assert_eq!(history.reordering_window, INITIAL_REORDERING_WINDOW);
+    history.clear_controller_inputs();
     history.process_feedback(FeedbackBatch {
         received_at: at(now + Duration::from_millis(80)),
         path_epoch: epoch,
@@ -914,6 +1101,10 @@ fn late_receipt_after_logical_deadline_cannot_erase_loss() {
         },
     });
     assert_eq!(history.reordering_window, INITIAL_REORDERING_WINDOW);
+    assert_eq!(history.counters.not_received, 1);
+    assert_eq!(history.counters.received, 2);
+    assert!(history.inputs.feedback.is_empty());
+    assert!(!history.inputs.fresh_network_feedback);
 }
 
 #[test]
@@ -1036,8 +1227,7 @@ fn feedback_confirmation_shares_the_expiry_budget_and_defers_without_losing_evid
     assert!(history.inputs.synthetic.iter().all(|sample| {
         sample.lost
             && sample.loss_origin == Some(LossOrigin::HistoryExpiry)
-            && sample.controller_sample(expired_at, now).loss_origin
-                == Some(LossOrigin::HistoryExpiry)
+            && !sample.controller_sample(expired_at, now).lost
     }));
     assert!(history.inputs.feedback.is_empty());
     assert!(!history.inputs.fresh_network_feedback);
@@ -1171,7 +1361,7 @@ fn terminal_late_receipt_cannot_refresh_replayed_report_covering_live_missing() 
 }
 
 #[test]
-fn rfc8888_logically_lost_receipt_cannot_refresh_feedback_or_hold() {
+fn new_rfc8888_report_can_recover_native_loss_without_erasing_terminal_loss() {
     let now = Instant::now();
     let epoch = PathEpoch::from_value(32);
     let mut history = SentHistory::new(PacketFeedbackKind::Rfc8888);
@@ -1199,14 +1389,27 @@ fn rfc8888_logically_lost_receipt_cannot_refresh_feedback_or_hold() {
             .into(),
         },
     });
-    assert!(!history.inputs.fresh_network_feedback);
-    assert!(
-        history
-            .inputs
-            .timing
-            .is_none_or(|timing| timing.feedback_hold.is_none())
+    assert!(history.inputs.fresh_network_feedback);
+    assert_eq!(
+        history.inputs.timing.unwrap().feedback_hold,
+        Some(Duration::from_micros(976))
     );
-    assert!(!history.inputs.feedback.iter().any(|sample| sample.received));
+    assert_eq!(
+        history.entry(SentPacketId(0)).unwrap().acknowledgment,
+        Acknowledgment::Lost
+    );
+    assert_eq!(history.counters.not_received, 1);
+    assert_eq!(history.counters.received, 0);
+    let recovery = history
+        .inputs
+        .feedback
+        .iter()
+        .find(|sample| sample.recovered)
+        .unwrap();
+    assert!(recovery.received);
+    // This report advances the physical ACK edge for the first time, independently
+    // of the frozen terminal-loss classification.
+    assert!(recovery.newly_acked);
 }
 
 #[test]

@@ -1,6 +1,6 @@
+use crate::media::ChannelId;
 use ahash::{HashMap, HashMapExt};
 use slotmap::SecondaryMap;
-use str0m::channel::ChannelId;
 
 use crate::{entity::TrackId, keys::TrackHandle, track::Track};
 

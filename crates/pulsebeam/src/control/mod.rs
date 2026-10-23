@@ -13,4 +13,8 @@ pub(crate) mod topology;
 pub mod ufrag;
 
 pub use negotiator::MAX_SEND_AUDIO_SLOTS;
-pub(crate) use negotiator::NegotiatedResources;
+pub(crate) use negotiator::{NegotiatedMedia, NegotiatedResources};
+#[cfg(test)]
+pub(crate) use negotiator::{
+    application_only_test_connection, application_only_test_connection_and_binding,
+};

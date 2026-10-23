@@ -1,5 +1,16 @@
 use crate::route::{NodeTransportAddress, TransportRoute};
-use str0m::IceCreds;
+pub struct IceCredentials {
+    pub ufrag: String,
+    pub pass: String,
+}
+
+#[cfg(test)]
+pub(crate) fn test_credentials() -> IceCredentials {
+    IceCredentials {
+        ufrag: "server".to_owned(),
+        pass: "testonlyicepassword1234567890".to_owned(),
+    }
+}
 
 /// Wire layout — 10 bytes → 16 Crockford base32 chars (80 bits / 5 = 16, exact):
 ///
@@ -118,9 +129,8 @@ impl IceUfrag {
         Some(Self::from_shared(shared))
     }
 
-    /// Build complete `IceCreds` (encoded ufrag + random password) ready to
-    /// pass to `rtc.direct_api().set_local_ice_credentials(...)`.
-    pub fn into_ice_creds(self) -> IceCreds {
+    /// Build routing credentials with a fresh authentication secret.
+    pub fn into_ice_creds(self) -> IceCredentials {
         // The ICE password is the only thing authenticating a peer against this
         // route, so it comes from OS entropy directly. Under simulation the
         // `getrandom(2)` override makes that reproducible without any seed
@@ -129,7 +139,7 @@ impl IceUfrag {
         use pulsebeam_runtime::rand::RngCore;
         pulsebeam_runtime::rand::os_rng().fill_bytes(&mut pass_raw);
         let pass = base32::encode(base32::Alphabet::Crockford, &pass_raw);
-        IceCreds {
+        IceCredentials {
             ufrag: self.encode(),
             pass,
         }

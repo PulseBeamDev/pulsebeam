@@ -33,6 +33,11 @@ pub mod test_utils {
 
     #[derive(Debug, Default)]
     pub struct MockParticipantSink {
+        pub connected_calls: Vec<(
+            std::net::SocketAddr,
+            std::net::SocketAddr,
+            crate::id::ShardId,
+        )>,
         pub activate_track_calls: Vec<TrackMeta>,
         pub deactivate_track_calls: Vec<TrackMeta>,
         pub publish_track_calls: Vec<TrackId>,
@@ -52,10 +57,12 @@ pub mod test_utils {
     impl ParticipantSink for MockParticipantSink {
         fn connected(
             &mut self,
-            _source: std::net::SocketAddr,
-            _destination: std::net::SocketAddr,
-            _source_shard: crate::id::ShardId,
+            source: std::net::SocketAddr,
+            destination: std::net::SocketAddr,
+            source_shard: crate::id::ShardId,
         ) {
+            self.connected_calls
+                .push((source, destination, source_shard));
         }
 
         fn activate_track(&mut self, track: TrackMeta) {

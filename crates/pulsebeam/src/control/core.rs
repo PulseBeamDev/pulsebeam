@@ -9,7 +9,7 @@ use crate::{
     participant::ParticipantConfig,
     route::{NodeTransportAddress, PackedRoute, SlotAllocator, TransportRoute},
 };
-use str0m::Rtc;
+use pulsebeam_rtc::AcceptedConnection;
 
 pub const DEFAULT_ROOM_PARTITION_SIZE: usize = 16;
 
@@ -111,7 +111,7 @@ impl ControllerCore {
 
     pub fn prepare_participant(
         &self,
-        rtc: Rtc,
+        rtc: AcceptedConnection,
         resources: NegotiatedResources,
         state: ParticipantState,
     ) -> ParticipantConfig {

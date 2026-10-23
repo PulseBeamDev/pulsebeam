@@ -5,10 +5,9 @@
 //! would replay the wrong window and hand the decoder a segment that does not
 //! start at a keyframe.
 
+use crate::media::{Rid, SeqNo};
 use crate::rtp::MediaTime;
 use crate::rtp::RtpPacket;
-use str0m::media::Rid;
-use str0m::rtp::SeqNo;
 
 /// No packet in this slot.
 ///
@@ -428,12 +427,7 @@ impl StreamCache {
         debug_assert!(prefix_len > 0 && prefix_len < frame_end && frame_end <= packets.len());
         let Some(anchor_dd) = packets
             .get(prefix_len)
-            .and_then(|packet| {
-                packet
-                    .ext_vals
-                    .user_values
-                    .get::<pulsebeam_core::dd::DependencyDescriptor>()
-            })
+            .and_then(|packet| packet.ext_vals.dependency_descriptor())
             .cloned()
         else {
             return;
@@ -444,12 +438,7 @@ impl StreamCache {
             let end_of_frame = index == last;
             packet.is_frame_start = start_of_frame;
             packet.marker = end_of_frame;
-            if let Some(mut raw) = packet
-                .ext_vals
-                .user_values
-                .get::<pulsebeam_core::dd::RawDependencyDescriptor>()
-                .cloned()
-            {
+            if let Some(mut raw) = packet.ext_vals.raw_dependency_descriptor().cloned() {
                 let Some(flags) = raw.0.first_mut() else {
                     debug_assert!(false, "a dependency descriptor has mandatory fields");
                     continue;
@@ -457,13 +446,9 @@ impl StreamCache {
                 *flags = (*flags & !0b1100_0000)
                     | if start_of_frame { 0b1000_0000 } else { 0 }
                     | if end_of_frame { 0b0100_0000 } else { 0 };
-                packet.ext_vals.user_values.set(raw);
+                packet.ext_vals.set_raw_descriptor(raw);
             }
-            let Some(existing) = packet
-                .ext_vals
-                .user_values
-                .get::<pulsebeam_core::dd::DependencyDescriptor>()
-            else {
+            let Some(existing) = packet.ext_vals.dependency_descriptor() else {
                 continue;
             };
             let mut dd = if index < prefix_len {
@@ -473,7 +458,7 @@ impl StreamCache {
             };
             dd.start_of_frame = index == 0;
             dd.end_of_frame = index == last;
-            packet.ext_vals.user_values.set(dd);
+            packet.ext_vals.set_descriptor(dd);
         }
     }
 
@@ -834,8 +819,7 @@ mod test {
         kf.marker = true;
         kf.is_keyframe = true;
         kf.ext_vals
-            .user_values
-            .set_arc(std::sync::Arc::new(g.next(true)));
+            .set_descriptor_arc(std::sync::Arc::new(g.next(true)));
         cache.push(kf.clone());
 
         let mut delta = RtpPacket::default();
@@ -844,8 +828,7 @@ mod test {
         delta.marker = true;
         delta
             .ext_vals
-            .user_values
-            .set_arc(std::sync::Arc::new(g.next(false)));
+            .set_descriptor_arc(std::sync::Arc::new(g.next(false)));
         cache.push(delta.clone());
 
         let replay = cache
@@ -876,8 +859,7 @@ mod test {
         let mut with_dd = |pkts: Vec<RtpPacket>, keyframe: bool| {
             for mut p in pkts {
                 p.ext_vals
-                    .user_values
-                    .set_arc(std::sync::Arc::new(g.next(keyframe && p.is_keyframe)));
+                    .set_descriptor_arc(std::sync::Arc::new(g.next(keyframe && p.is_keyframe)));
                 cache.push(p.clone());
             }
         };
@@ -898,14 +880,14 @@ mod test {
 
     #[test]
     fn synthesized_parameter_sets_share_one_dependency_descriptor_frame() {
-        use pulsebeam_core::dd::{DependencyDescriptor, temporal::TemporalDdGenerator};
+        use pulsebeam_core::dd::temporal::TemporalDdGenerator;
 
         let mut generator = TemporalDdGenerator::new(3);
         let mut b = builder(ParameterSetStyle::OnceAtStreamStart);
         let mut cache = StreamCache::new();
         let mut push = |packets: Vec<RtpPacket>, keyframe: bool| {
             for mut packet in packets {
-                packet.ext_vals.user_values.set_arc(std::sync::Arc::new(
+                packet.ext_vals.set_descriptor_arc(std::sync::Arc::new(
                     generator.next(keyframe && packet.is_keyframe),
                 ));
                 cache.push(packet);
@@ -921,8 +903,7 @@ mod test {
             expected_later_delta.push((packet.marker, descriptor.clone()));
             packet
                 .ext_vals
-                .user_values
-                .set_arc(std::sync::Arc::new(descriptor));
+                .set_descriptor_arc(std::sync::Arc::new(descriptor));
             cache.push(packet);
         }
 
@@ -951,14 +932,11 @@ mod test {
             later_delta_packets.iter().zip(expected_later_delta.iter())
         {
             assert_eq!(packet.marker, *marker);
-            assert_eq!(
-                packet.ext_vals.user_values.get::<DependencyDescriptor>(),
-                Some(descriptor)
-            );
+            assert_eq!(packet.ext_vals.dependency_descriptor(), Some(descriptor));
         }
         let descriptors: Vec<_> = replay
             .iter()
-            .filter_map(|packet| packet.ext_vals.user_values.get::<DependencyDescriptor>())
+            .filter_map(|packet| packet.ext_vals.dependency_descriptor())
             .collect();
         assert!(!descriptors.is_empty());
         assert!(descriptors[0].start_of_frame);

@@ -38,24 +38,13 @@ impl DerefMut for ParticipantMeta {
 pub(crate) struct ParticipantRegistry {
     shard_id: ShardId,
     max_gso_segments: usize,
-    /// Boxed, and that is the point.
-    ///
-    /// `SlotMap` is a dense `Vec` indexed by the handle, so its element size
-    /// is its stride. `ParticipantMeta` is ~10.9KB — three quarters of it
-    /// str0m's `Rtc` — and growing the map `Vec::extend`s, which reallocates
-    /// and memcpies every participant already in it. On a shard filling to 500
-    /// that is ~2.7MB copied in one go, on a `SCHED_FIFO` thread, while media
-    /// is flowing. A pointer costs 16 bytes of stride instead of 10,904, so the
-    /// same growth moves 8KB.
-    ///
-    /// The indirection is free where it matters: resolving a participant always
-    /// missed on a 10.9KB object anyway, and the pointer array it now goes
-    /// through is dense enough to stay resident (500 participants = 8KB).
+    /// Boxing keeps `SlotMap` growth from copying full participants on the
+    /// shard's real-time media thread.
     participants: SlotMap<ParticipantHandle, Box<ParticipantMeta>>,
     by_id: HashMap<ParticipantId, ParticipantHandle>,
     transports: Vec<Option<(NodeTransportAddress, ParticipantHandle)>>,
     demuxer: Demuxer,
-    pending_close: VecDeque<SocketAddr>,
+    pending_close: VecDeque<(NodeTransportAddress, Vec<SocketAddr>)>,
 }
 
 impl ParticipantRegistry {
@@ -150,7 +139,7 @@ impl ParticipantRegistry {
         }
         self.retire_transport(meta.ingress);
         let addrs = self.demuxer.unregister(meta.ingress.route);
-        self.pending_close.extend(addrs);
+        self.pending_close.push_back((meta.ingress, addrs));
         Some(meta)
     }
 
@@ -222,7 +211,9 @@ impl ParticipantRegistry {
         Some(meta.ingress)
     }
 
-    pub fn drain_pending_close(&mut self) -> impl Iterator<Item = SocketAddr> + '_ {
+    pub fn drain_pending_close(
+        &mut self,
+    ) -> impl Iterator<Item = (NodeTransportAddress, Vec<SocketAddr>)> + '_ {
         self.pending_close.drain(..)
     }
 }

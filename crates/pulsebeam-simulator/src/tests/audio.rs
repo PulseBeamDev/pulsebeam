@@ -232,15 +232,15 @@ fn the_loudest_speakers_are_the_ones_forwarded_test() {
         ]);
 }
 
-/// The listener is told who it is hearing, and where they rank.
+/// The listener is told who it is hearing.
 ///
 /// Audio slots are shared and stolen: the mid and the SSRC carrying a voice stay put across a
 /// switch, so nothing in the media says the speaker changed. Without the assignment an
 /// application can play the audio and still not know whose face to light up - which is the
 /// difference between a conference call and a noise.
 ///
-/// Two speakers and two slots, so both are heard and the ordering is the claim. The louder one
-/// must be signalled as rank 0.
+/// Two speakers and two slots, so both must be heard and assigned to negotiated receivers.
+/// Receiver indices are stable coordinates, not loudness ranks.
 #[test]
 fn the_listener_is_told_who_it_is_hearing_test() {
     LocalNodeSim::new()
@@ -260,10 +260,10 @@ fn the_listener_is_told_who_it_is_hearing_test() {
                 participant: "listener",
                 expected: &["loud", "quiet"],
             },
-            Step::CheckSpeakerRank {
-                description: "The louder speaker is signalled as the loudest",
+            Step::CheckAudioMapping {
+                description: "Both speakers are identified in the current receiver mapping",
                 participant: "listener",
-                expected: &[("loud", 0), ("quiet", 1)],
+                expected: &["loud", "quiet"],
             },
         ]);
 }
@@ -359,10 +359,7 @@ fn a_pinned_speaker_is_heard_over_louder_ones_test() {
                 participant: "listener",
                 min_bytes: 1,
             },
-            // Asserted on who holds a slot *now*. `heard from` accumulates over the whole run and
-            // `CheckSpeakerRank` keeps a displaced speaker's last rank, so neither can state the
-            // claim: that the quietest voice in the room is still being carried, which it could
-            // never have won on loudness.
+            // Cumulative reception cannot prove the quiet pinned speaker still holds a slot.
             Step::CheckSpeakerHeld {
                 description: "The quietest speaker holds a slot because it was pinned",
                 participant: "listener",
@@ -472,10 +469,10 @@ fn saying_nothing_about_audio_keeps_automatic_selection_test() {
                 participant: "listener",
                 expected: &["loud", "quiet"],
             },
-            Step::CheckSpeakerRank {
-                description: "And ranked loudest first, as the list order carries",
+            Step::CheckAudioMapping {
+                description: "Both selected speakers have current receiver assignments",
                 participant: "listener",
-                expected: &[("loud", 0), ("quiet", 1)],
+                expected: &["loud", "quiet"],
             },
         ]);
 }

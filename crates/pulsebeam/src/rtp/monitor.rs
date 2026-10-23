@@ -5,8 +5,8 @@
 //! wrap does not fail — it reports a bitrate that was never observed and the
 //! allocator sizes the ladder to it.
 
+use crate::bitrate::Bitrate;
 use std::time::Duration;
-use str0m::bwe::Bitrate;
 use tokio::time::Instant;
 
 use crate::entity::TrackKind;
@@ -17,12 +17,10 @@ const SIMULCAST_LAYER_PAUSE_TIMEOUT_VLA: Duration = Duration::from_secs(10);
 const STREAM_DEAD_TIMEOUT: Duration = Duration::from_millis(3000);
 const LOSS_MEASUREMENT_WINDOW: Duration = Duration::from_millis(500);
 const RATE_RISE_TIME_CONSTANT: Duration = Duration::from_millis(150);
-/// Reactive-cost fall constant — matches str0m's `EstimateSmoother::ESTIMATE_WINDOW` (3 s)
-/// so per-layer allocator costs converge on the same timescale as the reported BWE.
+/// Reactive costs smooth brief reductions in the producer's declared rate.
 const RATE_FALL_TIME_CONSTANT: Duration = Duration::from_secs(3);
-/// Stable-cost fall constant — very slow decay keeps the desired-bitrate signal high,
-/// motivating str0m's probe controller to maintain headroom even when the sender
-/// temporarily reduces its declared rate.
+/// Stable costs keep allocation and aggregate demand from chasing brief
+/// reductions in the producer's declared rate.
 const STABLE_RATE_FALL_TIME_CONSTANT: Duration = Duration::from_secs(30);
 // An eligibility signal, not a per-packet alarm: small 500ms windows on a
 // lossy WAN regularly contain one late/missing packet, and treating those
@@ -757,9 +755,7 @@ impl BitrateEstimate {
 
     pub fn record(&mut self, pkt: &RtpPacket) {
         self.advance_time(pkt.playout_time);
-        self.accumulated_bytes = self
-            .accumulated_bytes
-            .saturating_add(pkt.header_len.saturating_add(pkt.payload.len()));
+        self.accumulated_bytes = self.accumulated_bytes.saturating_add(pkt.payload.len());
     }
 
     pub fn poll(&mut self, now: Instant) {
@@ -1287,7 +1283,7 @@ mod test {
             playout_time: now,
             ..Default::default()
         };
-        let payload_len = size_bytes.saturating_sub(pkt.header_len);
+        let payload_len = size_bytes;
         pkt.payload = std::sync::Arc::from(vec![0; payload_len].as_slice());
         pkt
     }

@@ -41,6 +41,9 @@ struct Samples {
     /// Number of allocation passes observed. Distinguishes "estimate stayed high" from
     /// "nothing was ever recorded", which would otherwise both satisfy a minimum.
     count: u64,
+    /// Allocation passes and passes whose selected media rate exceeded the estimate.
+    /// Below-minimum native producer service can legitimately exceed the estimate.
+    allocation_budget: HashMap<ParticipantId, (u64, u64)>,
     /// Media payload bytes the SFU handed to str0m for forwarding, keyed by the *subscriber*
     /// receiving them.
     ///
@@ -80,9 +83,8 @@ struct Samples {
     ///
     /// Climbing q -> h -> f as bandwidth is discovered is correct behaviour, so counting raw
     /// transitions cannot tell a healthy ramp from a stream oscillating between two layers. A
-    /// reversal - an upgrade after a downgrade, or a downgrade after an upgrade - is the thing that
-    /// is never desirable, and it is just as wrong during the cold-start ramp as it is in steady
-    /// state, which is where a viewer notices it most.
+    /// reversal identifies oscillation when budget and intent are stable. Budget-driven
+    /// suspension and resumption can legitimately reverse an optional stream's direction.
     quality_reversals: HashMap<ParticipantId, u64>,
     routing_counters: HashMap<String, u64>,
     /// Direction of each origin's last forwarded-layer change: `true` for an upgrade.
@@ -150,6 +152,20 @@ pub fn record_downstream_bwe(subscriber: &str, bwe_bps: u64, desired_bps: u64) {
         return;
     };
     record_downstream_bwe_for(subscriber, bwe_bps, desired_bps);
+}
+
+pub fn record_allocation_budget_for(subscriber: ParticipantId, allocated_bps: u64, bwe_bps: u64) {
+    SAMPLES.with_borrow_mut(|s| {
+        let counts = s.allocation_budget.entry(subscriber).or_default();
+        counts.0 = counts.0.saturating_add(1);
+        counts.1 = counts.1.saturating_add(u64::from(allocated_bps > bwe_bps));
+    });
+}
+
+/// Window-scoped `(passes, above_estimate_passes)`, or `None` without observations.
+pub fn allocation_budget(subscriber: &str) -> Option<(u64, u64)> {
+    let subscriber = subscriber.parse().ok()?;
+    SAMPLES.with_borrow(|s| s.allocation_budget.get(&subscriber).copied())
 }
 
 pub fn record_downstream_bwe_for(subscriber: ParticipantId, bwe_bps: u64, desired_bps: u64) {
@@ -275,6 +291,7 @@ pub fn record_forwarded_quality_for(origin: ParticipantId, quality: Option<u8>) 
         if let Some(previous) = s.forwarded_quality.get(&origin).copied()
             && previous != rank
         {
+            tracing::debug!(%origin, previous, rank, "forwarded quality transition");
             *s.quality_changes.entry(origin).or_default() += 1;
 
             let up = rank > previous;
@@ -368,4 +385,27 @@ pub fn bwe_series_for(subscriber: ParticipantId) -> Vec<(Duration, u64, u64)> {
 /// Subscribers that recorded at least one estimate since [`reset`].
 pub fn bwe_subscribers() -> Vec<String> {
     SAMPLES.with_borrow(|s| s.bwe_series.keys().map(ToString::to_string).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn allocation_budget_counts_only_windowed_subscriber_samples() {
+        reset();
+        let a = ParticipantId::new();
+        let b = ParticipantId::new();
+        assert_eq!(allocation_budget(&a.to_string()), None);
+        record_allocation_budget_for(a, 100, 100);
+        record_allocation_budget_for(a, 99, 100);
+        record_allocation_budget_for(b, 101, 100);
+        assert_eq!(allocation_budget(&a.to_string()), Some((2, 0)));
+        assert_eq!(allocation_budget(&b.to_string()), Some((1, 1)));
+        record_allocation_budget_for(a, 101, 100);
+        assert_eq!(allocation_budget(&a.to_string()), Some((3, 1)));
+        reset();
+        assert_eq!(allocation_budget(&a.to_string()), None);
+        assert_eq!(allocation_budget(&b.to_string()), None);
+    }
 }

@@ -357,7 +357,7 @@ mod tests {
         let descriptor = crate::shard_update::TrackDescriptor {
             origin: crate::entity::ParticipantId::new(),
             kind: crate::entity::TrackKind::Video,
-            encodings: vec![Some(str0m::media::Rid::from("q"))],
+            encodings: vec![Some(crate::media::Rid::from("q"))],
         };
         let track_id = track_id(crate::entity::TrackKind::Video, "video");
         let key = runtime.install_track(track_id, Some(&descriptor), Some(origin_key), None);
@@ -365,7 +365,7 @@ mod tests {
         let descriptor = crate::shard_update::TrackDescriptor {
             origin: descriptor.origin,
             kind: crate::entity::TrackKind::Video,
-            encodings: vec![Some(str0m::media::Rid::from("f"))],
+            encodings: vec![Some(crate::media::Rid::from("f"))],
         };
         assert_eq!(
             runtime.install_track(track_id, Some(&descriptor), Some(origin_key), None),

@@ -6,6 +6,7 @@ mod video;
 mod binding_tests;
 
 use crate::keys::TrackHandle;
+use crate::media::{Mid, Ssrc};
 use crate::rtp::sync::SenderInfo;
 use crate::{
     entity::{ConnectionId, TrackId, TrackKind},
@@ -16,8 +17,6 @@ use crate::{
 use ahash::{HashMap, HashMapExt, HashSetExt};
 pub(crate) use audio::UpstreamAudio;
 pub(crate) use data::UpstreamData;
-use str0m::media::Mid;
-use str0m::rtp::Ssrc;
 use tokio::time::Instant;
 pub(crate) use video::UpstreamVideo;
 
@@ -29,7 +28,7 @@ pub(crate) const MAX_UPSTREAM_ENCODED_STREAMS: usize =
 pub(crate) struct IncomingRtpRoute {
     pub(crate) ssrc: Ssrc,
     pub(crate) mid: Mid,
-    pub(crate) rid: Option<str0m::media::Rid>,
+    pub(crate) rid: Option<crate::media::Rid>,
     pub(crate) upstream_slot: UpstreamSlotKey,
     pub(crate) track_id: TrackId,
     pub(crate) fanout: Option<TrackHandle>,
@@ -295,11 +294,21 @@ impl UpstreamMedia {
         changed
     }
 
+    fn sender_report(&mut self, mid: Mid, report: SenderInfo, arrival: Instant) {
+        if let Some(slot) = self
+            .published_tracks
+            .iter_mut()
+            .find(|slot| slot.mid == mid)
+        {
+            slot.track.sender_report(report, arrival);
+        }
+    }
+
     fn handle_incoming_rtp(
         &mut self,
         index: usize,
         mid: Mid,
-        rid: Option<&str0m::media::Rid>,
+        rid: Option<&crate::media::Rid>,
         rtp: RtpPacket,
         sr: Option<SenderInfo>,
     ) -> crate::track::ProcessedRtp {
@@ -444,11 +453,16 @@ impl Upstream {
                     .map(|(index, id)| (UpstreamSlotKey::Video(index), id))
             })
     }
+    pub(crate) fn sender_report(&mut self, mid: Mid, report: SenderInfo, arrival: Instant) {
+        self.audio.sender_report(mid, report, arrival);
+        self.video.sender_report(mid, report, arrival);
+    }
+
     pub fn handle_incoming_rtp(
         &mut self,
         slot: UpstreamSlotKey,
         mid: Mid,
-        rid: Option<&str0m::media::Rid>,
+        rid: Option<&crate::media::Rid>,
         rtp: RtpPacket,
         sr: Option<SenderInfo>,
     ) -> crate::track::ProcessedRtp {

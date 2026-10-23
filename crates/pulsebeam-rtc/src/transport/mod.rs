@@ -270,7 +270,7 @@ impl TransportConfig {
             || self.max_events > MAX_EVENTS
             || self.max_transmissions > MAX_TRANSMISSIONS
             || self.ice_tie_breaker == 0
-            || self.remote_candidates.is_empty()
+            || self.ice_controlling && self.remote_candidates.is_empty()
             || self.remote_candidates.len() > self.max_candidate_pairs
             || self.local_candidates.is_empty()
             || self.remote_fingerprint.hash_func != "sha-256"
@@ -508,10 +508,7 @@ impl Transport {
     }
 
     pub(crate) fn next_deadline(&self) -> Option<Instant> {
-        if matches!(
-            self.state,
-            TransportState::Connected | TransportState::Closed | TransportState::Failed
-        ) {
+        if matches!(self.state, TransportState::Closed | TransportState::Failed) {
             None
         } else {
             self.next_deadline

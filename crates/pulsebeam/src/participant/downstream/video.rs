@@ -1,4 +1,6 @@
+use crate::bitrate::Bitrate;
 use crate::bitrate::{BitrateController, BitrateControllerConfig};
+use crate::media::{KeyframeRequest, Mid, Pt, Rid, Ssrc};
 use crate::participant::downstream::SlotConfig;
 use crate::participant::event::ParticipantSink;
 use crate::rtp;
@@ -13,9 +15,6 @@ use slotmap::{SecondaryMap, SlotMap};
 use std::cmp::Ordering;
 use std::ops::{Deref, DerefMut};
 use std::time::Duration;
-use str0m::bwe::Bitrate;
-use str0m::media::{KeyframeRequest, Mid, Pt, Rid};
-use str0m::rtp::Ssrc;
 use tokio::time::Instant;
 
 use crate::entity::TrackId;
@@ -54,51 +53,16 @@ const KEYFRAME_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
 /// Maximum number of aggressive PLI retries before falling back to keep-alive mode.
 const KEYFRAME_MAX_RETRIES: u32 = 5;
 
-/// The lowest rate the bandwidth estimate may report.
-///
-/// Distinct from [`START_BANDWIDTH`] in meaning, and currently equal to it in
-/// value. Named separately because they are different decisions: this is the
-/// floor on what the estimator is *allowed to believe*, and that is where the
-/// estimate *begins*. Sharing one constant hid that.
-///
-/// **It should be lower.** libwebrtc's congestion controller floors its
-/// estimate far below its start bitrate, precisely so a link smaller than the
-/// start value can still be measured; at 300 kbps this SFU reports a 150 kbps
-/// link as 300 kbps and the allocator believes it has twice what it has.
-/// Lowering it currently fails `properties::sharding_does_not_change_who_is_served`
-/// — a single-shard viewer stops being served — which is a real defect this
-/// floor is masking rather than a reason to keep the floor. Diagnose that
-/// before moving this number.
+/// Existing floor on the caller's video allocation budget, not on RTC's
+/// measured bandwidth estimate.
 pub const MIN_ESTIMATE: Bitrate = START_BANDWIDTH;
 
-/// Where the estimate starts before any feedback has arrived.
-///
-/// libwebrtc's default start bitrate. Optimistic enough to reach a usable layer
-/// quickly, low enough that a constrained first link is not immediately
-/// overdriven.
+/// Initial caller bandwidth-filter value and minimum desired-rate hint.
 pub const START_BANDWIDTH: Bitrate = Bitrate::kbps(300);
 
 pub const MAX_BANDWIDTH: Bitrate = Bitrate::mbps(5);
 
-/// What the SFU announces to str0m as the starting estimate.
-///
-/// Deliberately above [`START_BANDWIDTH`]: the estimate this SFU starts its own
-/// allocator from is not the same number as the one it tells the transport to
-/// probe from.
-///
-/// **Lowering this to libwebrtc's 300 kbps trades one defect for another, and
-/// both were measured.** It fixes `a_rejoining_publisher_is_shown_to_an_existing_viewer`
-/// at every seed it currently fails: 2 Mbps overshoots a cellular link, and the
-/// burst at a slot switch overruns the client's 128-packet routing buffer, so
-/// media arrives and is discarded. It also costs `a_reordering_path_does_not_churn_keyframes`
-/// an extra layer reversal at the default seed, and
-/// `marker_only_publisher_streams_to_a_dd_subscriber` about 3% of its frames.
-///
-/// The reason it cannot simply be lowered is that libwebrtc pairs a 300 kbps
-/// start with probe clusters that reach a usable rate in a second or two. This
-/// SFU has no probing, so 300 kbps is a genuinely slower climb, and climbing
-/// through layers is what produces the extra reversal. Probing first, then this
-/// number.
+/// Default desired-rate hint for the SFU caller, independent of measured BWE.
 pub const INITIAL_BANDWIDTH: Bitrate = Bitrate::mbps(2);
 
 pub struct VideoAllocator {
@@ -340,22 +304,7 @@ impl VideoAllocator {
         intent: Option<&Intent>,
     ) -> Option<()> {
         let previous_assignment = slot.assignment;
-        let mut resume_gate = slot.resume_gate;
-        if intent.is_some_and(|intent| {
-            (
-                slot.max_height,
-                slot.min_height,
-                slot.min_fps,
-                slot.priority,
-            ) != (
-                intent.target_height,
-                intent.min_height,
-                intent.min_fps,
-                intent.priority,
-            )
-        }) {
-            resume_gate.affordable = None;
-        }
+        let resume_gate = slot.resume_gate;
         slot.assignment = intent
             .map(|request| request.track_id)
             .filter(|track_id| track_handles.contains_key(track_id));
@@ -413,9 +362,6 @@ impl VideoAllocator {
             slot.priority = intent.priority;
             if let Some(layer) = layer {
                 if resume_gate.required && slot.assignment == previous_assignment {
-                    if slot.target() != Some(&layer) {
-                        resume_gate.affordable = None;
-                    }
                     slot.pause_at(&layer);
                     slot.resume_gate = resume_gate;
                 } else {
@@ -441,17 +387,15 @@ impl VideoAllocator {
         self.tracks.values().map(Track::meta)
     }
 
-    pub fn slots(&self) -> impl Iterator<Item = SlotAssignment> + '_ {
-        self.slots.values().filter_map(|s| {
-            Some(SlotAssignment {
-                mid: s.mid,
-                paused: s.paused || matches!(s.state(), SlotState::Idle | SlotState::Starting),
-                track: {
-                    let layer = s.target()?;
-                    self.track(&layer.meta.id)?.meta().clone()
-                },
+    #[cfg(test)]
+    fn assigned_slot_count(&self) -> usize {
+        self.slots
+            .values()
+            .filter(|slot| {
+                slot.target()
+                    .is_some_and(|layer| self.track(&layer.meta.id).is_some())
             })
-        })
+            .count()
     }
 
     #[allow(
@@ -473,16 +417,6 @@ impl VideoAllocator {
             .values()
             .find(|slot| slot.mid == mid)
             .map(|slot| slot.media_index)
-    }
-
-    pub fn refresh_ssrc(&mut self, mid: Mid, rid: Option<Rid>, ssrc: Ssrc) -> bool {
-        for slot in self.slots.values_mut() {
-            if slot.mid == mid && slot.rid == rid {
-                slot.ssrc = ssrc;
-                return true;
-            }
-        }
-        false
     }
 
     pub fn add_slot(&mut self, config: SlotConfig) {
@@ -610,7 +544,7 @@ impl VideoAllocator {
             .map(|(key, slot)| (key, slot.resume_gate))
             .collect();
         let decisions =
-            engine.run_compute_with_resume(available_bandwidth, &views, now, &mut resume_gates);
+            engine.run_compute_with_resume(available_bandwidth, &views, &mut resume_gates);
         self.fairness
             .observe(&views, &engine, &decisions, available_bandwidth, now);
         let desired_raw = engine.run_desired(&views);
@@ -634,6 +568,11 @@ impl VideoAllocator {
                 self.ctx.participant_id,
                 crate::bitrate::saturating_bps(available_bandwidth.as_f64()),
                 crate::bitrate::saturating_bps(desired.as_f64()),
+            );
+            crate::sim_metrics::record_allocation_budget_for(
+                self.ctx.participant_id,
+                crate::bitrate::saturating_bps(self.current_allocation.as_f64()),
+                crate::bitrate::saturating_bps(available_bandwidth.as_f64()),
             );
             for view in &views {
                 let quality = match decisions.get(view.key) {
@@ -710,7 +649,8 @@ impl VideoAllocator {
         }
     }
 
-    pub fn current_allocation(&self) -> Bitrate {
+    #[cfg(test)]
+    fn current_allocation(&self) -> Bitrate {
         self.current_allocation
     }
 
@@ -929,6 +869,7 @@ impl VideoAllocator {
         true
     }
 
+    #[cfg(test)]
     fn track(&self, track_id: &TrackId) -> Option<&Track> {
         self.track_handles
             .get(track_id)
@@ -981,41 +922,20 @@ enum SlotState {
     Switching,
 }
 
-// A resumed stream needs several feedback cycles of affordable residual budget.
-// Initial activation bypasses this dwell; congestion shedding remains immediate.
-const RESUME_DWELL: Duration = Duration::from_secs(2);
-
 #[derive(Clone, Copy, Debug, Default)]
 struct ResumeGate {
     required: bool,
-    affordable: Option<(StreamId, DecodeTargetSelection, Instant)>,
 }
 
 impl ResumeGate {
-    fn admit(
-        &mut self,
-        now: Instant,
-        candidate: Option<(StreamId, DecodeTargetSelection)>,
-    ) -> bool {
-        if !self.required {
-            return true;
+    // Native AllocatableTrack::MinBitrateWithHysteresis at 326fd06.
+    // This opaque producer has no encoder protection-bitrate observer.
+    fn extra_cost(self, minimum: f64) -> f64 {
+        if self.required {
+            (minimum * 0.1).trunc().max(20_000.0)
+        } else {
+            0.0
         }
-        let Some((stream, target)) = candidate else {
-            self.affordable = None;
-            return false;
-        };
-        let since = match self.affordable {
-            Some((previous_stream, previous_target, since))
-                if previous_stream == stream && previous_target == target =>
-            {
-                since
-            }
-            _ => {
-                self.affordable = Some((stream, target, now));
-                now
-            }
-        };
-        now.saturating_duration_since(since) >= RESUME_DWELL
     }
 }
 
@@ -1179,7 +1099,7 @@ impl Slot {
             fanout,
             crate::participant::reverse::ReversePacket::keyframe(
                 staging.stream_id().1,
-                str0m::media::KeyframeRequestKind::Pli,
+                crate::media::KeyframeRequestKind::Pli,
             ),
         );
     }
@@ -1273,10 +1193,7 @@ impl Slot {
 
         if !self.paused {
             self.pli_reset();
-            self.resume_gate = ResumeGate {
-                required: true,
-                affordable: None,
-            };
+            self.resume_gate = ResumeGate { required: true };
             self.paused = true;
             changed = true;
             plog_debug!(self.ctx, mid=%self.mid, target=?layer.stream_id(), "slot paused");
@@ -1391,15 +1308,14 @@ pub fn log_allocation(
                 };
                 format!("{}:{}({})", slot.mid, q, bw)
             }
-            Some(AllocationDecision::ForwardTarget(l, _, bw)) => {
+            Some(AllocationDecision::ForwardTarget(l, target, bw)) => {
                 total_used_bps += bw.as_f64();
-                // Lowercase 'b' suffix marks a base-temporal-layer degrade.
                 let q = match l.quality {
                     LayerQuality::High => "H",
                     LayerQuality::Medium => "M",
                     LayerQuality::Low => "L",
                 };
-                format!("{}:{}b({})", slot.mid, q, bw)
+                format!("{}:{}/{target:?}({})", slot.mid, q, bw)
             }
             Some(AllocationDecision::Pause(_, needed)) => format!("{}:PAUSE({})", slot.mid, needed),
             _ => format!("{}:IDLE", slot.mid),
@@ -1415,12 +1331,6 @@ pub fn log_allocation(
         streams = %reports.join(" "),
         "downstream"
     );
-}
-
-pub struct SlotAssignment {
-    pub mid: Mid,
-    pub paused: bool,
-    pub track: TrackMeta,
 }
 
 /// Frozen layer measurements for one allocation pass and its demand calculation.
@@ -1647,9 +1557,9 @@ impl AllocationChoice<'_> {
     }
 }
 
-// A turn includes the recovery dwell and useful forwarding time. Rotate only
+// A turn provides useful forwarding time. Rotate only
 // contended tiers, not every tick: packet scheduling and stable tiers are untouched.
-const FAIRNESS_TURN: Duration = RESUME_DWELL.saturating_mul(2);
+const FAIRNESS_TURN: Duration = Duration::from_secs(4);
 
 #[derive(Default)]
 struct AllocationFairness {
@@ -1718,9 +1628,13 @@ impl AllocationFairness {
                     None => return false,
                 };
                 let choices = engine.choices(slot);
-                let minimum_can_fit =
-                    AllocationEngine::minimum_choice(&choices, slot, budget.as_f64())
-                        .is_some_and(|choice| choice.minimum_rank(slot).0);
+                let minimum_can_fit = AllocationEngine::minimum_choice(
+                    &choices,
+                    slot,
+                    budget.as_f64(),
+                    ResumeGate::default(),
+                )
+                .is_some_and(|choice| choice.minimum_rank(slot).0);
                 slot.protected()
                     && minimum_can_fit
                     && !choices
@@ -1997,7 +1911,8 @@ impl AllocationEngine {
         // A frame-rate minimum may require a taller encoding than the spatial
         // target. Keep that joint minimum available before gating upgrades.
         if slot.protected()
-            && let Some(minimum) = Self::minimum_choice(&choices, slot, f64::INFINITY)
+            && let Some(minimum) =
+                Self::minimum_choice(&choices, slot, f64::INFINITY, ResumeGate::default())
             && minimum.minimum_rank(slot).0
         {
             ceiling = ceiling.max(minimum.height);
@@ -2010,11 +1925,12 @@ impl AllocationEngine {
         choices: &[AllocationChoice<'a>],
         slot: &SlotView<'_>,
         budget: f64,
+        gate: ResumeGate,
     ) -> Option<AllocationChoice<'a>> {
         choices
             .iter()
             .copied()
-            .filter(|choice| choice.cost <= budget)
+            .filter(|choice| choice.cost + gate.extra_cost(choice.cost) <= budget)
             .max_by(|a, b| {
                 a.minimum_rank(slot)
                     .cmp(&b.minimum_rank(slot))
@@ -2031,16 +1947,15 @@ impl AllocationEngine {
             })
     }
 
-    fn recovery_budget(
+    fn resume_gate(
         slot: &SlotView<'_>,
         gates: &SecondaryMap<DownstreamSlotKey, ResumeGate>,
-        budget: f64,
-        reserve: f64,
-    ) -> f64 {
-        if !slot.forwarding && gates.get(slot.key).is_some_and(|gate| gate.required) {
-            (budget - reserve).max(0.0)
+        enforce_minimum: bool,
+    ) -> ResumeGate {
+        if slot.forwarding || enforce_minimum {
+            ResumeGate::default()
         } else {
-            budget
+            gates.get(slot.key).copied().unwrap_or_default()
         }
     }
 
@@ -2050,7 +1965,7 @@ impl AllocationEngine {
         bwe: Bitrate,
         slots: &'a [SlotView<'a>],
     ) -> SecondaryMap<DownstreamSlotKey, AllocationDecision<'a>> {
-        self.run_compute_with_resume(bwe, slots, Instant::now(), &mut SecondaryMap::new())
+        self.run_compute_with_resume(bwe, slots, &mut SecondaryMap::new())
     }
 
     /// Reserve protected minimums across all priorities before spending on
@@ -2060,15 +1975,12 @@ impl AllocationEngine {
         &self,
         bwe: Bitrate,
         slots: &'a [SlotView<'a>],
-        now: Instant,
         resume_gates: &mut SecondaryMap<DownstreamSlotKey, ResumeGate>,
     ) -> SecondaryMap<DownstreamSlotKey, AllocationDecision<'a>> {
         debug_assert!(
             slots.is_sorted_by(|a, b| a.priority >= b.priority),
             "compute expects descending priority tiers",
         );
-        let reserve = bwe.as_f64() * Self::UPGRADE_RESERVE_FRACTION;
-        let mut budget = bwe.as_f64();
         let choices: SecondaryMap<_, _> = slots
             .iter()
             .map(|slot| (slot.key, self.choices(slot)))
@@ -2081,22 +1993,35 @@ impl AllocationEngine {
                 })
                 .as_slice()
         };
+        let minimum = choices
+            .values()
+            .flatten()
+            .map(|choice| choice.cost)
+            .min_by(f64::total_cmp)
+            .unwrap_or_default();
+        // Native BitrateAllocator::LowRateAllocation enforces a producer's minimum
+        // for positive targets (326fd06, default suspend_below_min_bitrate=false).
+        // This aggregate producer needs one eligible base layer, not a new BWE.
+        let enforce_minimum = bwe > Bitrate::ZERO && bwe.as_f64() < minimum;
+        let mut budget = if enforce_minimum {
+            minimum
+        } else {
+            bwe.as_f64()
+        };
+        let reserve = if enforce_minimum {
+            0.0
+        } else {
+            bwe.as_f64() * Self::UPGRADE_RESERVE_FRACTION
+        };
         let mut planned: SecondaryMap<_, AllocationChoice<'a>> = SecondaryMap::new();
-        let mut waiting = HashSet::new();
 
         // Higher-priority minimums win scarcity, but even the lowest-priority
         // feasible minimum outranks the highest-priority speculative upgrade.
         for slot in slots.iter().filter(|slot| slot.protected()) {
-            let available = Self::recovery_budget(slot, resume_gates, budget, reserve);
-            if let Some(choice) = Self::minimum_choice(choices_for(slot.key), slot, available) {
-                budget -= choice.cost;
+            let gate = Self::resume_gate(slot, resume_gates, enforce_minimum);
+            if let Some(choice) = Self::minimum_choice(choices_for(slot.key), slot, budget, gate) {
+                budget -= choice.cost + gate.extra_cost(choice.cost);
                 planned.insert(slot.key, choice);
-            }
-            if !slot.forwarding
-                && let Some(gate) = resume_gates.get_mut(slot.key)
-                && !gate.admit(now, planned.get(slot.key).map(AllocationChoice::identity))
-            {
-                waiting.insert(slot.key);
             }
         }
 
@@ -2104,21 +2029,15 @@ impl AllocationEngine {
             // Optional streams have no reservation. Within one priority tier,
             // give each an affordable base before upgrading any of its peers.
             for slot in tier.iter().filter(|slot| !slot.protected()) {
-                let available = Self::recovery_budget(slot, resume_gates, budget, reserve);
+                let gate = Self::resume_gate(slot, resume_gates, enforce_minimum);
                 if let Some(choice) = choices_for(slot.key)
                     .iter()
                     .copied()
-                    .filter(|choice| choice.cost <= available)
+                    .filter(|choice| choice.cost + gate.extra_cost(choice.cost) <= budget)
                     .min_by(|a, b| a.cost.total_cmp(&b.cost))
                 {
-                    budget -= choice.cost;
+                    budget -= choice.cost + gate.extra_cost(choice.cost);
                     planned.insert(slot.key, choice);
-                }
-                if !slot.forwarding
-                    && let Some(gate) = resume_gates.get_mut(slot.key)
-                    && !gate.admit(now, planned.get(slot.key).map(AllocationChoice::identity))
-                {
-                    waiting.insert(slot.key);
                 }
             }
 
@@ -2126,9 +2045,6 @@ impl AllocationEngine {
                 let Some(mut current) = planned.get(slot.key).copied() else {
                     continue;
                 };
-                if waiting.contains(&slot.key) {
-                    continue;
-                }
                 // Retention may use headroom, never another stream's reserved
                 // minimum or more than the estimate. New upgrades must leave
                 // headroom: this is the asymmetric downgrade/upgrade dead band.
@@ -2162,14 +2078,18 @@ impl AllocationEngine {
             }
         }
 
-        // A pending resume keeps its reservation during the dwell. Otherwise
-        // a later peer could consume it on every pass and prevent recovery.
+        for slot in slots {
+            resume_gates.insert(
+                slot.key,
+                ResumeGate {
+                    required: !planned.contains_key(slot.key),
+                },
+            );
+        }
         slots
             .iter()
             .filter_map(|slot| {
-                let decision = if !waiting.contains(&slot.key)
-                    && let Some(choice) = planned.get(slot.key)
-                {
+                let decision = if let Some(choice) = planned.get(slot.key) {
                     match choice.target {
                         DecodeTargetSelection::Full => AllocationDecision::Forward(
                             choice.layer,
@@ -2204,11 +2124,8 @@ impl AllocationEngine {
     /// The cheapest layer the allocator was allowed to forward and could not
     /// afford, if any. See [`Self::eligible_but_unfunded`].
     ///
-    /// Both halves of the starvation signal in one value: `Some` means
-    /// something was unfundable, and the rate is what it would take to unblock
-    /// it. Resetting the estimate to *that* probes the one thing that could
-    /// restart feedback; resetting to full demand overshoots a small link and
-    /// costs the stream a layer reversal on the way back down.
+    /// This is an allocation shortfall, not spare path capacity or permission
+    /// to reset the transport estimate.
     pub fn cheapest_unfunded<'a>(
         &self,
         slots: &'a [SlotView<'a>],
@@ -2235,10 +2152,10 @@ mod alloc_test_support {
     // cross-core. See crates/pulsebeam/docs/thread-per-core.md.
     use super::*;
     use crate::entity::ParticipantId;
+    use crate::media::SimulcastLayer;
     use crate::rtp::monitor::StreamStats;
     use crate::track::UpstreamTrack;
     use crate::track::test_utils::make_video_track;
-    use str0m::media::SimulcastLayer;
 
     /// Measurement handles standing in for what the publisher's shard would
     /// have supplied. Seeded active, which is what the old `inactive(false)`
@@ -2294,8 +2211,8 @@ mod assignment_tests {
     use crate::rtp::RtpPacket;
     use crate::track::{LayerQuality, UpstreamTrack};
 
-    use str0m::bwe::Bitrate;
-    use str0m::media::{Mid, SimulcastLayer};
+    use crate::bitrate::Bitrate;
+    use crate::media::{Mid, SimulcastLayer};
 
     struct TestTracks {
         pub senders: Vec<UpstreamTrack>,
@@ -2386,7 +2303,7 @@ mod assignment_tests {
     }
 
     #[test]
-    fn congestion_resume_requires_sustained_residual_budget() {
+    fn congestion_resume_uses_native_minimum_headroom_without_dwell() {
         let (tx, built, mut states) = video_track_with_states(
             ParticipantId::new(),
             Mid::from("v0"),
@@ -2428,62 +2345,37 @@ mod assignment_tests {
         ];
         let engine = AllocationEngine::new(&views, &states);
         let mut gates = SecondaryMap::new();
-        gates.insert(
-            background,
-            ResumeGate {
-                required: true,
-                affordable: None,
-            },
-        );
-        let start = Instant::now();
+        gates.insert(background, ResumeGate { required: true });
         let demand = engine.run_desired(&views);
-        // Peaks fit both streams, but the intervening residual only fits the focus.
-        for (millis, bandwidth) in [
-            (0, 4_500_000),
-            (500, 4_500_000),
-            (1_000, 3_000_000),
-            (2_000, 4_500_000),
-            (3_000, 4_500_000),
+        for (bandwidth, admitted) in [
+            (4_199_999, false),
+            (4_200_000, true),
+            (3_000_000, false),
+            (4_200_000, true),
         ] {
-            let decisions = engine.run_compute_with_resume(
-                Bitrate::from(bandwidth),
-                &views,
-                start + Duration::from_millis(millis),
-                &mut gates,
+            gates.insert(background, ResumeGate { required: true });
+            let decisions =
+                engine.run_compute_with_resume(Bitrate::from(bandwidth), &views, &mut gates);
+            assert_eq!(
+                matches!(
+                    decisions.get(background),
+                    Some(AllocationDecision::Forward(_, _))
+                ),
+                admitted,
             );
-            assert!(matches!(
-                decisions.get(background),
-                Some(AllocationDecision::Pause(_, _))
-            ));
             assert!(matches!(
                 decisions.get(focused),
                 Some(AllocationDecision::Forward(_, _))
             ));
             assert_eq!(
                 AllocationEngine::used_bitrate(&decisions),
-                Bitrate::from(2_000_000)
+                Bitrate::from(if admitted { 4_000_000 } else { 2_000_000 }),
             );
             assert_eq!(engine.run_desired(&views), demand);
         }
-        let recovered = engine.run_compute_with_resume(
-            Bitrate::from(4_500_000),
-            &views,
-            start + Duration::from_secs(4),
-            &mut gates,
-        );
-        assert!(matches!(
-            recovered.get(background),
-            Some(AllocationDecision::Forward(_, _))
-        ));
-        assert_eq!(
-            AllocationEngine::used_bitrate(&recovered),
-            Bitrate::from(4_000_000)
-        );
 
-        // New subscriptions do not pay the congestion recovery dwell.
         gates.insert(background, ResumeGate::default());
-        let initial =
-            engine.run_compute_with_resume(Bitrate::from(4_500_000), &views, start, &mut gates);
+        let initial = engine.run_compute_with_resume(Bitrate::from(4_000_000), &views, &mut gates);
         assert!(matches!(
             initial.get(background),
             Some(AllocationDecision::Forward(_, _))
@@ -2547,43 +2439,25 @@ mod assignment_tests {
         ];
         let engine = AllocationEngine::new(&views, &states);
         let mut gates = SecondaryMap::new();
-        gates.insert(
-            background_key,
-            ResumeGate {
-                required: true,
-                affordable: None,
-            },
-        );
-        let start = Instant::now();
-        for millis in [0, 1_000, 2_000] {
-            let decisions = engine.run_compute_with_resume(
-                Bitrate::from(1_000_000),
-                &views,
-                start + Duration::from_millis(millis),
-                &mut gates,
-            );
-            if millis < 2_000 {
-                assert!(matches!(
-                    decisions.get(background_key),
-                    Some(AllocationDecision::Pause(_, _))
-                ));
-            } else {
-                assert!(matches!(
+        gates.insert(background_key, ResumeGate { required: true });
+        for (bandwidth, admitted) in [(889_999, false), (890_000, true), (1_000_000, true)] {
+            gates.insert(background_key, ResumeGate { required: true });
+            let decisions =
+                engine.run_compute_with_resume(Bitrate::from(bandwidth), &views, &mut gates);
+            assert_eq!(
+                matches!(
                     decisions.get(background_key),
                     Some(AllocationDecision::ForwardTarget(
                         _,
                         DecodeTargetSelection::Target(0),
-                        _
+                        _,
                     ))
-                ));
-                assert_eq!(
-                    AllocationEngine::used_bitrate(&decisions),
-                    Bitrate::from(870_000)
-                );
-            }
+                ),
+                admitted,
+            );
             assert_eq!(
-                gates[background_key].affordable.unwrap().1,
-                DecodeTargetSelection::Target(0)
+                AllocationEngine::used_bitrate(&decisions),
+                Bitrate::from(if admitted { 870_000 } else { 820_000 }),
             );
         }
     }
@@ -2760,7 +2634,7 @@ mod assignment_tests {
         let mut allocator = setup_allocator();
         let _tracks = add_tracks(&mut allocator, 3);
         add_slots(&mut allocator, 3);
-        assert_eq!(allocator.slots().count(), 3);
+        assert_eq!(allocator.assigned_slot_count(), 3);
     }
 
     #[test]
@@ -2771,7 +2645,7 @@ mod assignment_tests {
 
         // Empty intent should idle all slots.
         allocator.configure(&HashMap::new());
-        assert_eq!(allocator.slots().count(), 0);
+        assert_eq!(allocator.assigned_slot_count(), 0);
 
         // Re-activate all slots.
         let mut intents = HashMap::new();
@@ -2807,11 +2681,11 @@ mod assignment_tests {
         );
 
         allocator.configure(&intents);
-        assert_eq!(allocator.slots().count(), 3);
+        assert_eq!(allocator.assigned_slot_count(), 3);
     }
 
     #[test]
-    fn reconfiguration_preserves_congestion_pause_and_resets_changed_policy_dwell() {
+    fn reconfiguration_preserves_congestion_resume_headroom() {
         let mut allocator = setup_allocator();
         let tracks = add_tracks(&mut allocator, 2);
         add_slots(&mut allocator, 1);
@@ -2830,22 +2704,18 @@ mod assignment_tests {
         let slot = allocator.slots.values_mut().next().unwrap();
         let layer = slot.target().unwrap().clone();
         slot.pause_at(&layer);
-        let start = Instant::now();
-        assert!(!slot.resume_gate.admit(
-            start,
-            Some((layer.stream_id(), DecodeTargetSelection::Full))
-        ));
+        assert_eq!(slot.resume_gate.extra_cost(100_000.0), 20_000.0);
 
         allocator.configure(&intents);
         let slot = allocator.slots.values().next().unwrap();
         assert!(slot.paused && slot.resume_gate.required);
-        assert_eq!(slot.resume_gate.affordable.unwrap().2, start);
+        assert_eq!(slot.resume_gate.extra_cost(2_000_000.0), 200_000.0);
 
         intents.get_mut(&mid).unwrap().priority = 200;
         allocator.configure(&intents);
         let slot = allocator.slots.values().next().unwrap();
         assert!(slot.paused && slot.resume_gate.required);
-        assert!(slot.resume_gate.affordable.is_none());
+        assert_eq!(slot.resume_gate.extra_cost(100_000.0), 20_000.0);
 
         intents.get_mut(&mid).unwrap().track_id = tracks.ids[1];
         allocator.configure(&intents);
@@ -2908,7 +2778,7 @@ mod assignment_tests {
         allocator.configure(&intents);
         assert_eq!(allocator.native_mapping_slots().count(), 1);
         assert_eq!(allocator.native_mapping_slots().next().unwrap().1, track_id);
-        assert_eq!(allocator.slots().count(), 0);
+        assert_eq!(allocator.assigned_slot_count(), 0);
         let key = allocator.track_handles[&track_id];
         allocator.deactivate_track_binding(key, track_id);
         allocator.remove_track(&track_id);
@@ -2932,7 +2802,7 @@ mod assignment_tests {
         allocator.configure_native(&requests, &HashSet::new());
         let before = allocator.native_mapping_slots().collect::<Vec<_>>();
         assert_eq!(before.len(), 2);
-        assert_eq!(allocator.slots().count(), 0);
+        assert_eq!(allocator.assigned_slot_count(), 0);
         allocator.configure_native(
             &requests.into_iter().rev().collect::<Vec<_>>(),
             &HashSet::new(),
@@ -2982,7 +2852,7 @@ mod assignment_tests {
         let mut allocator = setup_allocator();
         let _tracks = add_tracks(&mut allocator, 5);
         add_slots(&mut allocator, 2);
-        assert_eq!(allocator.slots().count(), 2);
+        assert_eq!(allocator.assigned_slot_count(), 2);
     }
 
     #[test]
@@ -2990,7 +2860,7 @@ mod assignment_tests {
         let mut allocator = setup_allocator();
         let _tracks = add_tracks(&mut allocator, 2);
         add_slots(&mut allocator, 2);
-        assert_eq!(allocator.slots().count(), 2);
+        assert_eq!(allocator.assigned_slot_count(), 2);
     }
 
     /// The fanout bindings a subscription has once its view delta has landed.
@@ -3014,7 +2884,7 @@ mod assignment_tests {
         let request = KeyframeRequest {
             mid: slot.mid,
             rid: slot.rid,
-            kind: str0m::media::KeyframeRequestKind::Pli,
+            kind: crate::media::KeyframeRequestKind::Pli,
         };
 
         let now = Instant::now();
@@ -3217,11 +3087,11 @@ mod assignment_tests {
         let mut allocator = setup_allocator();
         let tracks = add_tracks(&mut allocator, 1);
         add_slots(&mut allocator, 1);
-        assert_eq!(allocator.slots().count(), 1);
+        assert_eq!(allocator.assigned_slot_count(), 1);
         let key = allocator.track_handles[&tracks.ids[0]];
         allocator.deactivate_track_binding(key, tracks.ids[0]);
         allocator.remove_track(&tracks.ids[0]);
-        assert_eq!(allocator.slots().count(), 0);
+        assert_eq!(allocator.assigned_slot_count(), 0);
     }
 
     #[test]
@@ -3229,7 +3099,7 @@ mod assignment_tests {
         let mut allocator = setup_allocator();
         let _tracks = add_tracks(&mut allocator, 3);
         add_slots(&mut allocator, 3);
-        assert_eq!(allocator.slots().count(), 3);
+        assert_eq!(allocator.assigned_slot_count(), 3);
     }
 
     #[test]
@@ -3545,7 +3415,7 @@ mod assignment_tests {
         tracks.senders.push(tx);
         allocator.seed_layer_states(&states);
         allocator.add_track(Track::video(meta, track.layers().to_vec(), None));
-        assert_eq!(allocator.slots().count(), 3);
+        assert_eq!(allocator.assigned_slot_count(), 3);
     }
 
     #[test]
@@ -3605,7 +3475,7 @@ mod slot_switch_tests {
 
     use crate::track::{StreamWrite, StreamWriter};
 
-    use str0m::media::SimulcastLayer;
+    use crate::media::SimulcastLayer;
 
     fn test_ctx() -> LogCtx {
         use crate::entity::{RoomExternalId, RoomId};
@@ -3845,7 +3715,7 @@ mod slot_switch_tests {
         assert_eq!(sink.reverse_requests, [fanout, fanout, fanout]);
         for packet in sink.reverse_packets {
             assert!(
-                matches!(packet.decode(), Some(crate::participant::reverse::ReverseInput::Keyframe { rid, kind: str0m::media::KeyframeRequestKind::Pli }) if rid == high.rid)
+                matches!(packet.decode(), Some(crate::participant::reverse::ReverseInput::Keyframe { rid, kind: crate::media::KeyframeRequestKind::Pli }) if rid == high.rid)
             );
         }
 

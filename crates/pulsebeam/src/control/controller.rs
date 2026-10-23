@@ -26,8 +26,8 @@ use pulsebeam_core::auth::{
     AuthorizationExpiry, KeyRegistry, MAX_COMPACT_TOKEN_LEN, TokenError, VerifiedAuthorization,
     verify_participant_token,
 };
+use pulsebeam_rtc::LocalCandidate;
 use pulsebeam_runtime::mailbox;
-use str0m::Candidate;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
@@ -241,7 +241,7 @@ impl ControllerActor {
     pub(crate) fn with_placement(
         _rng: pulsebeam_runtime::rand::Rng,
         shard_contexts: Vec<ShardContext>,
-        candidates: Vec<Candidate>,
+        candidates: Vec<LocalCandidate>,
         tcp_listener: pulsebeam_core::net::TcpListener,
         room_partition_size: usize,
         placement: RoomPartitionPlacement,
@@ -1075,6 +1075,7 @@ impl ControllerActor {
             ShardCommand::AdoptTcpConnection {
                 stream: connection.stream,
                 peer_addr: connection.peer_addr,
+                address: connection.address,
             },
         ));
     }

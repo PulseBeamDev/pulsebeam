@@ -1,5 +1,7 @@
 #![allow(clippy::disallowed_types, reason = "network input owns Bytes")]
 
+mod support;
+
 use bytes::Bytes;
 use pulsebeam_rtc::{
     AcceptError, CloseReason, Connection, ConnectionConfig, ConnectionEntropy, ConnectionState,
@@ -27,6 +29,16 @@ fn connection(start: Instant) -> Result<Connection, AcceptError> {
         ConnectionEntropy::new([13; 32]),
     )?
     .connection)
+}
+
+#[test]
+fn connected_idle_peer_is_retired_after_ice_consent_expires() {
+    let mut fixture = support::PeerFixture::connected();
+    fixture.expire_connection();
+    let stats = fixture.connection.stats().connection;
+    assert_eq!(stats.state, ConnectionState::Closed);
+    assert_eq!(stats.close_reason, Some(CloseReason::Timeout));
+    assert_eq!(stats.transmitted_rtp_bytes, 0);
 }
 
 #[test]

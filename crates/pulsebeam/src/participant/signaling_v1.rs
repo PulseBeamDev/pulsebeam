@@ -549,7 +549,7 @@ pub(crate) enum OutputError {
 }
 
 pub(crate) struct NativeOutput {
-    pub(crate) cid: str0m::channel::ChannelId,
+    pub(crate) cid: crate::media::ChannelId,
     pub(crate) bytes: Vec<u8>,
 }
 
@@ -560,7 +560,7 @@ enum PendingOutput {
 
 #[derive(Default)]
 pub(crate) struct NativeSession {
-    pub(crate) cid: Option<str0m::channel::ChannelId>,
+    pub(crate) cid: Option<crate::media::ChannelId>,
     pub(crate) intents: IntentState,
     catalog: CatalogState,
     peers: HashMap<crate::entity::ParticipantId, super::effect::RoomPeer>,
@@ -571,7 +571,7 @@ pub(crate) struct NativeSession {
 }
 
 impl NativeSession {
-    pub(crate) fn set_cid(&mut self, cid: str0m::channel::ChannelId) {
+    pub(crate) fn set_cid(&mut self, cid: crate::media::ChannelId) {
         self.cid = Some(cid);
         self.catalog = CatalogState::default();
         self.mapping = None;
@@ -781,7 +781,7 @@ mod tests {
         let (_, mut descriptor) = crate::track::test_utils::make_audio_track(
             publisher,
             connection,
-            str0m::media::Mid::from("remote-mid"),
+            crate::media::Mid::from("remote-mid"),
         );
         let meta = descriptor.meta_mut();
         meta.id = connection.derive_track_id(TrackKind::Audio, label);
@@ -836,14 +836,14 @@ mod tests {
         let connection = crate::entity::ConnectionId::new();
         let mut upstream = super::super::upstream::Upstream::new(ctx, connection);
         for (index, mid) in [(0, "a"), (3, "b")] {
-            let mid = str0m::media::Mid::from(mid);
+            let mid = crate::media::Mid::from(mid);
             let (track, descriptor) =
                 crate::track::test_utils::make_audio_track(publisher, connection, mid);
             assert!(upstream.add_published_track(index, mid, track, descriptor));
         }
         let original = upstream.track_for_sender_index(0);
         upstream
-            .announce_state_mut(str0m::media::Mid::from("b"), true)
+            .announce_state_mut(crate::media::Mid::from("b"), true)
             .unwrap();
         let encode = |revision, tracks| {
             pulsebeam_proto::codec::encode_client(&ClientMessage {
@@ -1101,8 +1101,7 @@ mod tests {
         let publisher = crate::entity::ParticipantId::new();
         let connection = crate::entity::ConnectionId::new();
         let track = remote_audio(publisher, connection, "mic");
-        let mut rtc = str0m::Rtc::new(std::time::Instant::now());
-        let cid = rtc.direct_api().create_data_channel(Default::default());
+        let cid = crate::media::ChannelId::from_value(0);
         let mut session = NativeSession::default();
         session.set_cid(cid);
         session.apply_participants([peer(publisher, "alice")], []);

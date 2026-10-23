@@ -544,10 +544,8 @@ pub enum Step {
     // ── Data channels ─────────────────────────────────────────────────────
     /// A named speaker currently holds one of this subscriber's audio slots.
     ///
-    /// Distinct from `CheckHeardFrom` and `CheckSpeakerRank`, which both carry history: the first
-    /// accumulates everyone heard over the whole run, and the second keeps a displaced speaker's
-    /// last rank. Neither can say who is being carried *now*, which is the only thing a pin
-    /// claims - it does not promise nobody else was ever heard, it promises this one is.
+    /// Unlike cumulative `CheckHeardFrom`, this checks the current native mapping. A pin does not
+    /// promise nobody else was ever heard; it promises this speaker still holds a receiver.
     CheckSpeakerHeld {
         description: &'static str,
         participant: &'static str,
@@ -776,16 +774,12 @@ pub enum Step {
         /// How many RTP streams the listener may be sent - its slot count, never more.
         max_streams: usize,
     },
-    /// Where the SFU said each speaker sat, loudest first, at their best moment.
-    ///
-    /// Distinct from `CheckHeardFrom`: that one asserts audio arrived, this one asserts the
-    /// listener was *told* who it was and in what order. The two come apart exactly where the
-    /// bug did - the media can flow while the assignment carrying the speaker's name does not,
-    /// and then no application can attribute a voice to a face.
-    CheckSpeakerRank {
+    /// Exact speakers assigned in the current native mapping, independently of received media.
+    /// Receiver indices identify SDP sections, not loudness ranks.
+    CheckAudioMapping {
         description: &'static str,
         participant: &'static str,
-        expected: &'static [(&'static str, u32)],
+        expected: &'static [&'static str],
     },
     /// At least this many media frames actually crossed a shard boundary.
     ///
@@ -1540,7 +1534,7 @@ fn step_name(step: &Step) -> &'static str {
         Step::CheckAudioPacketsFrom { .. } => "CheckAudioPacketsFrom",
         Step::CheckAudioDecodedFrom { .. } => "CheckAudioDecodedFrom",
         Step::CheckAudioNotHeardFrom { .. } => "CheckAudioNotHeardFrom",
-        Step::CheckSpeakerRank { .. } => "CheckSpeakerRank",
+        Step::CheckAudioMapping { .. } => "CheckAudioMapping",
         Step::CheckAudioStreams { .. } => "CheckAudioStreams",
         Step::CheckCrossShardMedia { .. } => "CheckCrossShardMedia",
         Step::CheckNoCrossShardMedia { .. } => "CheckNoCrossShardMedia",
@@ -1749,7 +1743,14 @@ async fn execute_plan(
                 tokio::time::timeout(Duration::from_secs(30), async {
                     loop {
                         let actual = handle.shared.topic_events.lock().unwrap().get(*topic).map(|events| events.iter().filter_map(topic_payload).map(<[u8]>::to_vec).collect::<Vec<_>>()).unwrap_or_default();
-                        anyhow::ensure!(expected.starts_with(&actual), "{participant} received unexpected sequence: {actual:?}, expected {expected:?}");
+                        if !expected.starts_with(&actual) {
+                            let mismatch = actual.iter().zip(expected.iter()).position(|(actual, expected)| actual != expected).unwrap_or(expected.len());
+                            let events = handle.shared.topic_events.lock().unwrap();
+                            let events = events.get(*topic).map(Vec::as_slice).unwrap_or_default();
+                            let sequences = events.iter().filter_map(|event| match event { TopicNotification::Message(message) => Some(message.sequence), _ => None }).take(40).collect::<Vec<_>>();
+                            let gaps = events.iter().filter(|event| matches!(event, TopicNotification::RecoveryGap { .. })).collect::<Vec<_>>();
+                            anyhow::bail!("{participant} received unexpected sequence at index {mismatch}: actual_len={} expected_len={} actual={:?} expected={:?} first_sequences={sequences:?} gaps={gaps:?}", actual.len(), expected.len(), actual.get(mismatch), expected.get(mismatch));
+                        }
                         if actual == expected { return Ok::<_, anyhow::Error>(()); }
                         tokio::time::sleep(Duration::from_millis(10)).await;
                     }
@@ -2694,10 +2695,10 @@ async fn execute_plan(
                         )
                     })?;
                 let handle = get_handle(handles, participant, description)?;
-                let ranked = handle.audio_rx().ranked();
+                let mapped = handle.audio_rx().mapped();
                 assert!(
-                    ranked.contains_key(&want),
-                    "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  participant:  {participant}\n  expected:     {speaker} to hold a slot\n  signalled:    {ranked:?}"
+                    mapped.values().any(|publisher| publisher == &want),
+                    "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  participant:  {participant}\n  expected:     {speaker} to hold a slot\n  signalled:    {mapped:?}"
                 );
             }
 
@@ -3054,7 +3055,7 @@ async fn execute_plan(
                 }
             }
 
-            Step::CheckSpeakerRank {
+            Step::CheckAudioMapping {
                 description,
                 participant,
                 expected,
@@ -3063,19 +3064,30 @@ async fn execute_plan(
                     "[step {n}/{total}: {kind}] \"{description}\" ({participant}, expected {expected:?})"
                 );
                 let handle = get_handle(handles, participant, description)?;
-                let ranked = handle.audio_rx().ranked();
-                let want: std::collections::BTreeMap<String, u32> = expected
+                let mapped = handle.audio_rx().mapped();
+                let actual: std::collections::BTreeSet<_> = mapped.values().cloned().collect();
+                let want: std::collections::BTreeSet<String> = expected
                     .iter()
-                    .filter_map(|(name, rank)| {
-                        handles
-                            .get(name)
-                            .and_then(|h| h.shared.participant_id.lock().unwrap().clone())
-                            .map(|id| (id, *rank))
+                    .map(|name| {
+                        get_handle(handles, name, description)?
+                            .shared
+                            .participant_id
+                            .lock()
+                            .unwrap()
+                            .clone()
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("speaker {name} has no runtime participant id")
+                            })
                     })
-                    .collect();
+                    .collect::<anyhow::Result<_>>()?;
                 assert_eq!(
-                    ranked, want,
-                    "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  participant:  {participant}\n  expected:     {expected:?}\n  signalled:    {ranked:?}"
+                    mapped.len(),
+                    expected.len(),
+                    "expected one receiver per speaker"
+                );
+                assert_eq!(
+                    actual, want,
+                    "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  participant:  {participant}\n  expected:     {expected:?}\n  signalled:    {mapped:?}"
                 );
             }
 
@@ -4031,11 +4043,14 @@ pub enum Property {
     ///
     /// Climbing through layers as bandwidth is discovered is correct, so a raw change count cannot
     /// separate a healthy ramp from a stream oscillating between two layers - it fails both. A
-    /// reversal is the part that is never right, which makes this assertable across the whole run
-    /// including the cold-start ramp, where a joining viewer notices flapping most.
+    /// reversal can reveal flapping when budget and intent are stable. Optional streams can
+    /// legitimately reverse direction when their available budget changes.
     ///
     /// A monotonic q -> h -> f climb reports zero however many layers it passes through.
     QualityReversalsBelow { origin: &'static str, max: u64 },
+    /// Every observed selected media rate fits the estimate. Use in feasible-budget
+    /// windows, not below-minimum native producer-service scenarios.
+    AllocationWithinEstimate,
     /// The origin's forwarded layer never rose above this rank at any point in the window.
     ///
     /// `target_height` is a ceiling as much as a request: a viewer showing a 180p tile is asking
@@ -4708,6 +4723,19 @@ fn check_property(
             if rate > max as f64 {
                 return Err(format!(
                     "{origin}'s layer changed {changes} times in {window:?} ({rate:.0}/min);                      expected at most {max}/min. Each change costs a keyframe and stutters the                      picture, so at this rate the stream never holds a layer long enough to                      decode and the viewer sees nothing at all"
+                ));
+            }
+        }
+        Property::AllocationWithinEstimate => {
+            let id = handle
+                .participant_id()
+                .ok_or_else(|| "participant never connected".to_string())?;
+            let (passes, above) = pulsebeam::sim_metrics::allocation_budget(&id)
+                .filter(|(passes, _)| *passes > 0)
+                .ok_or_else(|| "no allocation budget observations in this window".to_string())?;
+            if above > 0 {
+                return Err(format!(
+                    "selected media rate exceeded the estimate in {above}/{passes} allocation passes"
                 ));
             }
         }

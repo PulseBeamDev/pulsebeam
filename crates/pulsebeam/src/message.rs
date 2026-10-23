@@ -1,5 +1,5 @@
+use crate::media::{KeyframeRequestKind, Rid};
 use std::fmt::Debug;
-use str0m::media::{KeyframeRequestKind, Rid};
 
 #[derive(Debug)]
 pub struct KeyframeRequest {
@@ -7,8 +7,8 @@ pub struct KeyframeRequest {
     pub kind: KeyframeRequestKind,
 }
 
-impl From<str0m::media::KeyframeRequest> for KeyframeRequest {
-    fn from(value: str0m::media::KeyframeRequest) -> Self {
+impl From<crate::media::KeyframeRequest> for KeyframeRequest {
+    fn from(value: crate::media::KeyframeRequest) -> Self {
         Self {
             rid: value.rid,
             kind: value.kind,

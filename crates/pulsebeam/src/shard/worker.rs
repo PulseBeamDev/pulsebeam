@@ -2,7 +2,9 @@
 //! startup and never again. Carries the sanctioned exception in
 //! `shard::metrics`; nothing else here may share.
 
-use std::{collections::VecDeque, pin::Pin};
+use std::{collections::VecDeque, net::SocketAddr, pin::Pin};
+
+use ahash::{HashMap, HashMapExt};
 #[allow(
     clippy::disallowed_types,
     reason = "Arc<ShardMetrics>, one per shard, see module note"
@@ -163,6 +165,7 @@ pub(crate) enum ShardCommand {
     AdoptTcpConnection {
         stream: pulsebeam_runtime::net::tcp::BufferedTcpStream,
         peer_addr: std::net::SocketAddr,
+        address: crate::route::NodeTransportAddress,
     },
     AuthenticateTransport {
         source: std::net::SocketAddr,
@@ -314,9 +317,75 @@ impl ShardTransport for ChannelTransport {
     }
 }
 
+struct TcpFlowRoutes {
+    flows: HashMap<net::tcp::TcpFlowId, (SocketAddr, crate::route::NodeTransportAddress)>,
+    transports: HashMap<crate::route::NodeTransportAddress, Vec<(SocketAddr, net::tcp::TcpFlowId)>>,
+}
+
+impl TcpFlowRoutes {
+    fn new() -> Self {
+        Self {
+            flows: HashMap::new(),
+            transports: HashMap::new(),
+        }
+    }
+
+    fn insert(
+        &mut self,
+        flow: net::tcp::TcpFlowId,
+        peer: SocketAddr,
+        address: crate::route::NodeTransportAddress,
+    ) {
+        let previous = self.flows.insert(flow, (peer, address));
+        debug_assert!(previous.is_none(), "TCP flow identities must not be reused");
+        self.transports
+            .entry(address)
+            .or_default()
+            .push((peer, flow));
+    }
+
+    fn route(&self, batch: &RecvPacketBatch) -> Option<crate::route::NodeTransportAddress> {
+        if batch.transport != net::Transport::Tcp {
+            return None;
+        }
+        let (peer, address) = self.flows.get(&batch.tcp_flow?)?;
+        (*peer == batch.src).then_some(*address)
+    }
+
+    fn retire(
+        &mut self,
+        flow: net::tcp::TcpFlowId,
+    ) -> Option<(SocketAddr, crate::route::NodeTransportAddress)> {
+        let (peer, address) = self.flows.remove(&flow)?;
+        if let Some(flows) = self.transports.get_mut(&address) {
+            flows.retain(|(_, installed)| *installed != flow);
+            if flows.is_empty() {
+                self.transports.remove(&address);
+            }
+        }
+        Some((peer, address))
+    }
+
+    fn close_transport(
+        &mut self,
+        address: crate::route::NodeTransportAddress,
+        socket: &mut net::tcp::TcpTransport,
+    ) {
+        if let Some(flows) = self.transports.remove(&address) {
+            for (peer, flow) in flows {
+                self.flows.remove(&flow);
+                socket.close_flow(&peer, flow);
+            }
+        }
+    }
+}
+
 pub(crate) struct ShardWorker {
     core: ShardCore,
     recv_batch: Vec<RecvPacketBatch>,
+    tcp_recv_batch: Vec<RecvPacketBatch>,
+    tcp_closed_batch: Vec<(SocketAddr, net::tcp::TcpFlowId)>,
+    tcp_routes: TcpFlowRoutes,
     udp_socket: UnifiedSocket,
     tcp_socket: net::tcp::TcpTransport,
     command_rx: mailbox::Receiver<ShardCommand>,
@@ -414,6 +483,9 @@ impl ShardWorker {
         Self {
             core,
             recv_batch: Vec::with_capacity(net::BATCH_SIZE),
+            tcp_recv_batch: Vec::with_capacity(net::BATCH_SIZE),
+            tcp_closed_batch: Vec::with_capacity(net::BATCH_SIZE),
+            tcp_routes: TcpFlowRoutes::new(),
             udp_socket,
             tcp_socket,
             command_rx,
@@ -560,9 +632,22 @@ impl ShardWorker {
             };
             commands = commands.saturating_add(1);
             match cmd {
-                ShardCommand::AdoptTcpConnection { stream, peer_addr } => {
-                    if let Err(err) = self.tcp_socket.add_connection(stream, peer_addr) {
-                        tracing::warn!(%peer_addr, error = ?err, "Failed to add new TCP connection to shard");
+                ShardCommand::AdoptTcpConnection {
+                    stream,
+                    peer_addr,
+                    address,
+                } => {
+                    if !self.core.has_transport(address) {
+                        continue;
+                    }
+                    match self.tcp_socket.add_connection(stream, peer_addr) {
+                        Ok(flow) => {
+                            self.core.bind_tcp_flow(address, peer_addr, flow);
+                            self.tcp_routes.insert(flow, peer_addr, address);
+                        }
+                        Err(err) => {
+                            tracing::warn!(%peer_addr, error = ?err, "Failed to add new TCP connection to shard");
+                        }
                     }
                 }
                 cmd => {
@@ -591,7 +676,6 @@ impl ShardWorker {
             self.tick_budget_hit("frames");
         }
         let _ = self.udp_socket.try_recv_batch(&mut self.recv_batch);
-        let _ = self.tcp_socket.try_recv_batch(&mut self.recv_batch);
         let received = self.recv_batch.len();
         for batch in self
             .recv_batch
@@ -601,6 +685,29 @@ impl ShardWorker {
         }
         if received >= SHARD_UDP_BATCH_BUDGET {
             self.tick_budget_hit("udp");
+        }
+
+        self.tcp_recv_batch.clear();
+        self.tcp_closed_batch.clear();
+        let tcp_events = self
+            .tcp_socket
+            .try_recv_events(&mut self.tcp_recv_batch, &mut self.tcp_closed_batch)
+            .unwrap_or(0);
+        for batch in self.tcp_recv_batch.drain(..) {
+            if let Some(address) = self.tcp_routes.route(&batch) {
+                self.core.on_tcp_batch(batch, address);
+            } else {
+                metrics::counter!("shard_tcp_retired_input_drop").increment(1);
+            }
+        }
+        // Complete frames precede their EOF notice and retain their original transport address.
+        for (_, flow) in self.tcp_closed_batch.drain(..) {
+            if let Some((peer, address)) = self.tcp_routes.retire(flow) {
+                self.core.retire_tcp_flow(address, peer, flow);
+            }
+        }
+        if tcp_events == net::BATCH_SIZE {
+            self.tick_budget_hit("tcp");
         }
 
         if self.core.poll_and_flush_dirty(
@@ -634,8 +741,13 @@ impl ShardWorker {
             self.tick_budget_hit("participant_events");
         }
 
-        self.core
-            .flush_close_peers(&mut self.udp_socket, &mut self.tcp_socket);
+        for (address, peers) in self.core.drain_pending_close() {
+            for peer in peers {
+                self.udp_socket.close_peer(&peer);
+            }
+            self.tcp_routes
+                .close_transport(address, &mut self.tcp_socket);
+        }
     }
 
     /// Hand this tick's topology events to the controller without dropping
@@ -688,6 +800,85 @@ mod tests {
             }
         }
         panic!("missing metric {name}");
+    }
+
+    #[test]
+    fn tcp_eof_preserves_decoded_frames_without_rebinding_retired_input_or_closes() {
+        use crate::route::{NodeTransportAddress, TransportRoute};
+        use pulsebeam_core::net::{TcpListener, TcpStream};
+        use pulsebeam_runtime::net::tcp::{BufferedTcpStream, TcpTransport};
+        use std::net::Ipv4Addr;
+
+        let host = pulsebeam_runtime::testing::test_host_ip("192.168.250.15");
+        pulsebeam_runtime::testing::run_local(host, async move {
+            let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+                .await
+                .unwrap();
+            let local = listener.local_addr().unwrap();
+            let (client, accepted) = tokio::join!(TcpStream::connect(local), listener.accept());
+            let client = client.unwrap();
+            let (stream, peer) = accepted.unwrap();
+            let mut socket = TcpTransport::new(local);
+            let at = net::ReceiveTime::now();
+            let original = socket
+                .add_connection(
+                    BufferedTcpStream::with_buffered(stream, b"\0\x03old".to_vec(), at),
+                    peer,
+                )
+                .unwrap();
+            let route = TransportRoute::new(ShardId::new(0), 7);
+            let original_address = NodeTransportAddress::new(route, 1);
+            let replacement_address = NodeTransportAddress::new(route, 2);
+            let mut routes = TcpFlowRoutes::new();
+            routes.insert(original, peer, original_address);
+            drop(client);
+
+            let mut frames = Vec::new();
+            let mut closed = Vec::new();
+            let mut delivered = Vec::new();
+            let mut retired_input = None;
+            while closed.is_empty() {
+                socket.readable().await.unwrap();
+                let _ = socket.try_recv_events(&mut frames, &mut closed);
+                assert!(frames.len().saturating_add(closed.len()) <= net::BATCH_SIZE);
+                for frame in frames.drain(..) {
+                    assert_eq!(routes.route(&frame), Some(original_address));
+                    assert_eq!(frame.received_at, at);
+                    delivered.extend_from_slice(frame.data());
+                    retired_input = Some(frame);
+                }
+            }
+            assert_eq!(delivered, b"old");
+            assert_eq!(closed, vec![(peer, original)]);
+            for (_, flow) in closed.drain(..) {
+                assert_eq!(routes.retire(flow), Some((peer, original_address)));
+            }
+            assert_eq!(routes.route(retired_input.as_ref().unwrap()), None);
+
+            let (client, accepted) = tokio::join!(TcpStream::connect(local), listener.accept());
+            let _client = client.unwrap();
+            let (stream, _) = accepted.unwrap();
+            let replacement = socket
+                .add_connection(
+                    BufferedTcpStream::with_buffered(stream, b"\0\x03new".to_vec(), at),
+                    peer,
+                )
+                .unwrap();
+            routes.insert(replacement, peer, replacement_address);
+            assert!(routes.retire(original).is_none());
+            routes.close_transport(original_address, &mut socket);
+            assert_eq!(socket.flow_for_peer(&peer), Some(replacement));
+            assert_eq!(routes.route(retired_input.as_ref().unwrap()), None);
+            socket.try_recv_events(&mut frames, &mut closed).unwrap();
+            assert_eq!(frames.len(), 1);
+            assert_eq!(routes.route(&frames[0]), Some(replacement_address));
+            assert_eq!(frames[0].data(), b"new");
+            assert!(closed.is_empty());
+            routes.close_transport(replacement_address, &mut socket);
+            assert_eq!(socket.flow_for_peer(&peer), None);
+            assert!(routes.flows.is_empty());
+            assert!(routes.transports.is_empty());
+        });
     }
 
     #[test]

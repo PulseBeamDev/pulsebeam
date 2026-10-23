@@ -100,7 +100,7 @@ impl DependencyDescriptorSelector {
 
 impl FrameSelector for DependencyDescriptorSelector {
     fn decide(&mut self, pkt: &RtpPacket) -> FrameDecision {
-        match pkt.ext_vals.user_values.get::<DependencyDescriptor>() {
+        match pkt.ext_vals.dependency_descriptor() {
             Some(dd) if !self.keep(dd) => FrameDecision::Drop,
             // In target, or no descriptor to reason about: forward.
             _ => FrameDecision::Forward,
@@ -128,7 +128,7 @@ mod test {
             ..Default::default()
         };
         let mut pkt = RtpPacket::default();
-        pkt.ext_vals.user_values.set_arc(Arc::new(dd));
+        pkt.ext_vals.set_descriptor_arc(Arc::new(dd));
         pkt
     }
 

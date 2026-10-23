@@ -5,9 +5,9 @@ use std::collections::{HashSet, VecDeque};
 
 use crate::entity::{ParticipantId, TrackId};
 use crate::id::ShardId;
+use crate::media::Rid;
 use crate::route::{NodeRouteAddress, NodeTransportAddress};
 use pulsebeam_runtime::mailbox;
-use str0m::media::Rid;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct TrackPlan {

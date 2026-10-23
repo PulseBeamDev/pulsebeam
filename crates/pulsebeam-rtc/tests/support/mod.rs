@@ -30,6 +30,8 @@ pub struct MediaFixture {
     pub sender_mid: String,
 }
 
+type PacingProfileReader = fn(&Connection) -> (u64, u64);
+
 pub struct PeerFixture<M = MediaFixture> {
     media: M,
     pub connection: Connection,
@@ -69,6 +71,7 @@ pub struct PeerFixture<M = MediaFixture> {
     pub receiver_report: Option<pulsebeam_rtc::ReceiverReport>,
     network: DeterministicNetwork,
     native_target: Option<fn(&Connection) -> Duration>,
+    pacing_profile: Option<PacingProfileReader>,
     world: std::rc::Rc<SimulationWorld>,
 }
 
@@ -175,6 +178,7 @@ struct DeterministicNetwork {
     last_committed_rtp_bytes: u64,
     last_committed_padding_bytes: u64,
     emitted_rtp: Vec<(Instant, u64, bool)>,
+    pacing_trace: Vec<(Instant, usize, u64, u64)>,
     delivered_rtp: Vec<(Instant, u64)>,
     time_quantum: Option<Duration>,
     rtc_wakeup_quantum: Option<Duration>,
@@ -882,6 +886,7 @@ impl<M> PeerFixture<M> {
             receiver_report: None,
             network: DeterministicNetwork::default(),
             native_target: None,
+            pacing_profile: None,
         }
     }
 
@@ -892,6 +897,14 @@ impl<M> PeerFixture<M> {
 
     pub fn observe_native_target(&mut self, reader: fn(&Connection) -> Duration) {
         self.native_target = Some(reader);
+    }
+
+    pub fn observe_pacing_profile(&mut self, reader: PacingProfileReader) {
+        self.pacing_profile = Some(reader);
+    }
+
+    pub fn pacing_trace(&self) -> &[(Instant, usize, u64, u64)] {
+        &self.network.pacing_trace
     }
 
     pub fn rtp_queue_samples(&self) -> &[(Instant, Duration, Duration)] {
@@ -1564,7 +1577,23 @@ impl<M> PeerFixture<M> {
         }
         let mut connection_wakeup = None;
         if !self.connection_idle {
-            match self.connection.poll(self.at()) {
+            let output = self.connection.poll(self.at());
+            if let Some(read) = self.pacing_profile {
+                let (rate, epoch) = read(&self.connection);
+                if self.network.pacing_trace.last().is_none_or(
+                    |&(_, _, previous_rate, previous_epoch)| {
+                        (previous_rate, previous_epoch) != (rate, epoch)
+                    },
+                ) {
+                    self.network.pacing_trace.push((
+                        self.now,
+                        self.network.emitted_rtp.len(),
+                        rate,
+                        epoch,
+                    ));
+                }
+            }
+            match output {
                 ConnectionOutput::Transmit(transmit) => {
                     let at = self.at();
                     if let Some(observations) = &mut self.transmit_observations {
@@ -1925,88 +1954,87 @@ fn unpack_opus_payload(packet: &[u8]) -> Vec<u8> {
     packet[packet.len() - padding..].to_vec()
 }
 
-pub fn assert_probe_windows(emitted: &[(Instant, u64, bool)]) {
-    assert_probe_windows_with_allowance(emitted, |_, _| 48 * 1024);
-}
-
-pub fn assert_initial_probe_windows(
-    emitted: &[(Instant, u64, bool)],
-    started_at: Instant,
-    potential_bps: u64,
-) {
-    let initial_allowance = potential_bps.div_ceil(20).clamp(48 * 1024, 96 * 1024);
-    assert_probe_windows_with_allowance(emitted, |at, new_probe| {
-        let elapsed = at.saturating_duration_since(started_at);
-        if at >= started_at
-            && (elapsed < Duration::from_secs(5)
-                || (!new_probe && elapsed < Duration::from_secs(10)))
-        {
-            initial_allowance
-        } else {
-            48 * 1024
-        }
-    });
-}
-
 #[allow(
     clippy::print_stderr,
-    reason = "report actual production probe overhead separately from the allowance"
+    reason = "retain measured full-wire RTP and padding totals"
 )]
-fn assert_probe_windows_with_allowance(
+pub fn assert_native_rtp_pacing(
     emitted: &[(Instant, u64, bool)],
-    allowance: impl Fn(Instant, bool) -> u64,
+    configured: &[(Instant, usize, u64, u64)],
 ) {
-    assert!(emitted.windows(2).all(|pair| pair[0].0 <= pair[1].0));
-    let mut checkpoints = Vec::with_capacity(emitted.len() * 2);
-    for (at, _, _) in emitted {
-        checkpoints.push(*at);
-        checkpoints.push(*at + Duration::from_secs(5));
-    }
-    checkpoints.sort_unstable();
-    checkpoints.dedup();
-    let (mut next, mut expired) = (0, 0);
-    let (mut nonprobe, mut probes) = (0_u64, 0_u64);
-    let (mut peak_ratio, mut peak_allowance) = (0_u64, 0_u64);
-    let mut check = |at: Instant, nonprobe: u64, probes: u64, new_probe: bool| {
-        let total = probes + nonprobe;
-        peak_ratio = peak_ratio.max(probes.saturating_mul(100).checked_div(total).unwrap_or(0));
-        peak_allowance = peak_allowance.max(probes.saturating_sub(nonprobe / 19));
-        assert!(
-            probes <= nonprobe / 19 + allowance(at, new_probe),
-            "emitted probe budget at {at:?}: probes={probes} nonprobe={nonprobe}"
-        );
+    let Some(&(first, _, _)) = emitted.first() else {
+        return;
     };
-    for at in checkpoints {
-        while expired < next && at.duration_since(emitted[expired].0) >= Duration::from_secs(5) {
-            let (_, bytes, probe) = emitted[expired];
-            if probe {
-                probes -= bytes;
-            } else {
-                nonprobe -= bytes;
+    assert!(emitted.windows(2).all(|pair| pair[0].0 <= pair[1].0));
+    assert!(
+        configured
+            .windows(2)
+            .all(|pair| (pair[0].0, pair[0].1) <= (pair[1].0, pair[1].1))
+    );
+    let mut at = configured.first().map_or(first, |entry| entry.0);
+    let (mut next_config, mut rate, mut epoch) = (0, 0_u64, 0_u64);
+    let mut debt = 0_u128;
+    let mut padding_clock = false;
+    for (index, &(now, bytes, padding)) in emitted.iter().enumerate() {
+        let mut service_rate = rate;
+        while let Some(&(changed_at, before, new_rate, new_epoch)) = configured.get(next_config) {
+            if before > index {
+                break;
             }
-            expired += 1;
-        }
-        check(at, nonprobe, probes, false);
-        while next < emitted.len() && emitted[next].0 == at {
-            let (_, bytes, probe) = emitted[next];
-            if probe {
-                probes += bytes;
-            } else {
-                nonprobe += bytes;
+            assert!(
+                changed_at >= at && changed_at <= now,
+                "causal native pacing configuration"
+            );
+            if epoch != new_epoch {
+                debt = 0;
+                padding_clock = false;
+                at = changed_at;
+                service_rate = new_rate;
             }
-            next += 1;
-            // Later media at this same clock instant cannot fund an earlier probe.
-            check(at, nonprobe, probes, probe);
+            (rate, epoch) = (new_rate, new_epoch);
+            service_rate = service_rate.max(rate);
+            next_config += 1;
         }
+        assert!(
+            rate != 0,
+            "native RTP pacing requires a configured data rate"
+        );
+        // SetPacerConfig can reprice still-unprocessed elapsed time. The largest
+        // rate observed since the previous wire commit bounds that service,
+        // without borrowing any future configuration or emission.
+        debt = debt.saturating_sub(
+            u128::from(service_rate).saturating_mul(now.duration_since(at).as_nanos()),
+        );
+        at = now;
+        // Wire-level upper envelope, not a second implementation of eligibility:
+        // native 40 ms/63 KB bursts, one-packet overshoot, and at most 50 ms of
+        // padding-clock replay. Rate changes cannot fund earlier same-time sends.
+        // Exact debt, 5 ms generation and full-drain gates have focused pacer proof.
+        let burst = u128::from(rate)
+            .saturating_mul(Duration::from_millis(40).as_nanos())
+            .min(63_000 * 8_000_000_000_u128);
+        let replay = if padding || padding_clock {
+            u128::from(service_rate).saturating_mul(Duration::from_millis(50).as_nanos())
+        } else {
+            0
+        };
+        assert!(
+            debt <= burst.saturating_add(replay),
+            "native RTP pacing budget at {now:?}: debt={debt} rate={rate} padding={padding} epoch={epoch}"
+        );
+        debt = debt
+            .saturating_add(u128::from(bytes).saturating_mul(8_000_000_000))
+            .min(u128::from(rate).saturating_mul(Duration::from_millis(500).as_nanos()));
+        padding_clock = padding;
     }
-    let total: u64 = emitted.iter().map(|(_, bytes, _)| *bytes).sum();
+    let total: u64 = emitted.iter().map(|entry| entry.1).sum();
     let padding: u64 = emitted
         .iter()
-        .filter(|(_, _, probe)| *probe)
-        .map(|(_, bytes, _)| *bytes)
+        .filter(|entry| entry.2)
+        .map(|entry| entry.1)
         .sum();
     eprintln!(
-        "production probe windows events={} total_bytes={total} probe_bytes={padding} peak_raw_ratio={peak_ratio}% peak_allowance_used={peak_allowance}",
+        "native RTP pacing events={} full_wire_bytes={total} padding_wire_bytes={padding}",
         emitted.len()
     );
 }

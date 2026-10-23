@@ -121,6 +121,17 @@ impl SentHistory {
                 .is_some_and(|deadline| now >= deadline)
     }
 
+    fn is_recoverable_entry(&self, entry: &SentEntry, now: Instant) -> bool {
+        (matches!(entry.acknowledgment, Acknowledgment::Missing { .. })
+            || entry.acknowledgment == Acknowledgment::Lost && entry.missing_since.is_some())
+            && now.saturating_duration_since(entry.committed_at) < SENT_HISTORY_MAX_AGE
+    }
+
+    fn recovery_is_fresh(&self, entry: &SentEntry, now: Instant, report_is_new: bool) -> bool {
+        self.is_recoverable_entry(entry, now)
+            && (report_is_new || self.is_live_feedback_entry(entry, now))
+    }
+
     fn reorder_deadline(&self, entry: &SentEntry) -> Option<Instant> {
         match entry.acknowledgment {
             Acknowledgment::Missing {
@@ -162,7 +173,7 @@ impl SentHistory {
         epoch: PathEpoch,
         received_at: Instant,
     ) {
-        let Some(newest) = self.newest_twcc else {
+        let (Some(newest), Some(floor)) = (self.newest_twcc, self.oldest_twcc) else {
             self.add_unknown(statuses.len());
             return;
         };
@@ -183,6 +194,13 @@ impl SentHistory {
             self.add_unknown(statuses.len());
             return;
         }
+        if last_reported < floor {
+            self.counters.stale_feedback = self
+                .counters
+                .stale_feedback
+                .saturating_add(statuses.len() as u64);
+            return;
+        }
         let reference = unwrap_near_signed(i64::from(reference_time), self.twcc_reference, 1 << 24);
         let count = unwrap_near_signed(i64::from(feedback_count), self.twcc_feedback_count, 1 << 8);
         let mut arrivals = Vec::with_capacity(statuses.len());
@@ -201,13 +219,18 @@ impl SentHistory {
         let old_edge = self.highest_twcc_acked;
         let received_edge = statuses
             .iter()
-            .rposition(|status| matches!(status, TwccStatus::Received { .. }))
+            .enumerate()
+            .rposition(|(offset, status)| {
+                base.saturating_add(offset as u64) >= floor
+                    && matches!(status, TwccStatus::Received { .. })
+            })
             .map(|offset| base.saturating_add(offset as u64));
         if !statuses.is_empty() {
             let edge = received_edge.unwrap_or(last_reported);
-            let floor = self.oldest_twcc.unwrap_or(base);
             let start = old_edge.map_or(floor, |previous| floor.max(previous.saturating_add(1)));
-            let unknown_reported = (base..=last_reported)
+            // A receiver report can straddle a route change. Only the committed
+            // current-path suffix can contribute evidence or ACK-edge credit.
+            let unknown_reported = (base.max(floor)..=last_reported)
                 .filter(|&sequence| {
                     self.twcc_sent_id(sequence)
                         .and_then(|id| self.entry(id))
@@ -236,26 +259,25 @@ impl SentHistory {
                 return;
             }
         }
+        let report_is_new = self
+            .twcc_feedback_count
+            .is_none_or(|previous| count > previous);
         let late_receipt = statuses.iter().enumerate().any(|(offset, status)| {
-            matches!(status, TwccStatus::Received { .. })
+            base.saturating_add(offset as u64) >= floor
+                && matches!(status, TwccStatus::Received { .. })
                 && self
                     .twcc_sent_id(base.saturating_add(offset as u64))
                     .and_then(|id| self.entry(id))
-                    .is_some_and(|entry| {
-                        matches!(entry.acknowledgment, Acknowledgment::Missing { .. })
-                            && self.is_live_feedback_entry(entry, received_at)
-                    })
+                    .is_some_and(|entry| self.recovery_is_fresh(entry, received_at, report_is_new))
         });
         let fresh = !statuses.is_empty()
-            && (self
-                .twcc_feedback_count
-                .is_none_or(|previous| count > previous)
-                || late_receipt)
-            && (base..=last_reported).any(|sequence| {
-                self.twcc_sent_id(sequence)
-                    .and_then(|id| self.entry(id))
-                    .is_some_and(|entry| self.is_live_feedback_entry(entry, received_at))
-            });
+            && (report_is_new || late_receipt)
+            && (late_receipt
+                || (base.max(floor)..=last_reported).any(|sequence| {
+                    self.twcc_sent_id(sequence)
+                        .and_then(|id| self.entry(id))
+                        .is_some_and(|entry| self.is_live_feedback_entry(entry, received_at))
+                }));
         if self
             .twcc_reference
             .is_none_or(|previous| reference >= previous)
@@ -276,13 +298,23 @@ impl SentHistory {
         }
         for (offset, status) in statuses.iter().enumerate() {
             let sequence = base.saturating_add(offset as u64);
+            if sequence < floor {
+                continue;
+            }
             let sent_id = self.twcc_sent_id(sequence);
             if matches!(status, TwccStatus::NotReceived) {
                 if let Some(sent_id) = sent_id {
                     self.set_missing(sent_id, received_at);
                 }
             } else if old_edge.is_some_and(|edge| sequence <= edge) {
-                self.recover(sent_id, epoch, arrivals[offset], None, received_at);
+                if !self.reject_replayed_terminal_receipt(
+                    sent_id,
+                    epoch,
+                    received_at,
+                    report_is_new,
+                ) {
+                    self.recover(sent_id, epoch, arrivals[offset], None, received_at);
+                }
             }
         }
         if let Some(edge) = received_edge {
@@ -368,6 +400,11 @@ impl SentHistory {
                 self.add_unknown(report.statuses.len());
                 continue;
             };
+            if self.ssrcs[ssrc_index].sent_ids.is_empty() {
+                self.add_unknown(report.statuses.len());
+                continue;
+            }
+            let floor = self.ssrcs[ssrc_index].first_sequence;
             let newest = self.ssrcs[ssrc_index].newest_sequence;
             let Some(base) = unwrap_near(u64::from(report.begin_sequence), newest, 1 << 16) else {
                 self.add_unknown(report.statuses.len());
@@ -387,11 +424,21 @@ impl SentHistory {
                 self.add_unknown(report.statuses.len());
                 continue;
             }
+            if last_reported < floor {
+                self.counters.stale_feedback = self
+                    .counters
+                    .stale_feedback
+                    .saturating_add(report.statuses.len() as u64);
+                continue;
+            }
             let timestamp = unwrap_near_signed(
                 i64::from(report_timestamp),
                 self.ssrcs[ssrc_index].last_report_timestamp,
                 1_i64 << 32,
             );
+            let report_is_new = self.ssrcs[ssrc_index]
+                .last_report_timestamp
+                .is_none_or(|previous| timestamp > previous);
             let report_micros = timestamp.saturating_mul(1_000_000) / 65_536;
             let mut normalized = Vec::with_capacity(report.statuses.len());
             for status in &report.statuses {
@@ -429,17 +476,17 @@ impl SentHistory {
                 normalized.push(value);
             }
             let late_receipt = normalized.iter().enumerate().any(|(offset, status)| {
-                status.0
+                base.saturating_add(offset as u64) >= floor
+                    && status.0
                     && self
                         .lookup_rtp(ssrc_index, base.saturating_add(offset as u64))
                         .and_then(|id| self.entry(id))
                         .is_some_and(|entry| {
-                            matches!(entry.acknowledgment, Acknowledgment::Missing { .. })
-                                && self.is_live_feedback_entry(entry, received_at)
+                            self.recovery_is_fresh(entry, received_at, report_is_new)
                         })
             });
             let has_nonterminal = !report.statuses.is_empty()
-                && (base..=last_reported).any(|sequence| {
+                && (base.max(floor)..=last_reported).any(|sequence| {
                     self.lookup_rtp(ssrc_index, sequence)
                         .and_then(|id| self.entry(id))
                         .is_some_and(|entry| self.is_live_feedback_entry(entry, received_at))
@@ -447,11 +494,11 @@ impl SentHistory {
             let old_edge = self.ssrcs[ssrc_index].highest_acked_sequence;
             let received_edge = normalized
                 .iter()
-                .rposition(|value| value.0)
+                .enumerate()
+                .rposition(|(offset, value)| base.saturating_add(offset as u64) >= floor && value.0)
                 .map(|offset| base.saturating_add(offset as u64));
             if !report.statuses.is_empty() {
                 let edge = received_edge.unwrap_or(last_reported);
-                let floor = self.ssrcs[ssrc_index].first_sequence;
                 let start =
                     old_edge.map_or(floor, |previous| floor.max(previous.saturating_add(1)));
                 if received_edge.is_some_and(|edge| {
@@ -460,7 +507,7 @@ impl SentHistory {
                     self.add_unknown(report.statuses.len());
                     continue;
                 }
-                let unresolved_reported = (base..=last_reported)
+                let unresolved_reported = (base.max(floor)..=last_reported)
                     .filter(|&sequence| {
                         self.lookup_rtp(ssrc_index, sequence)
                             .and_then(|id| self.entry(id))
@@ -488,7 +535,10 @@ impl SentHistory {
                         && self
                             .lookup_rtp(ssrc_index, base.saturating_add(offset as u64))
                             .and_then(|id| self.entry(id))
-                            .is_some_and(|entry| self.is_live_feedback_entry(entry, received_at))
+                            .is_some_and(|entry| {
+                                self.is_live_feedback_entry(entry, received_at)
+                                    || self.recovery_is_fresh(entry, received_at, report_is_new)
+                            })
                     {
                         minimum_hold = Some(minimum_hold.map_or(*hold, |known| known.min(*hold)));
                     }
@@ -509,11 +559,7 @@ impl SentHistory {
                     self.ssrcs[ssrc_index].highest_acked_sequence = Some(edge);
                 }
             }
-            let fresh = has_nonterminal
-                && (self.ssrcs[ssrc_index]
-                    .last_report_timestamp
-                    .is_none_or(|previous| timestamp > previous)
-                    || late_receipt);
+            let fresh = (has_nonterminal || late_receipt) && (report_is_new || late_receipt);
             self.inputs.fresh_network_feedback |= fresh;
             if self.ssrcs[ssrc_index]
                 .last_report_timestamp
@@ -523,13 +569,23 @@ impl SentHistory {
             }
             for (offset, (received, arrival, ecn, _)) in normalized.iter().copied().enumerate() {
                 let sequence = base.saturating_add(offset as u64);
+                if sequence < floor {
+                    continue;
+                }
                 let sent_id = self.lookup_rtp(ssrc_index, sequence);
                 if !received {
                     if let Some(sent_id) = sent_id {
                         self.set_missing(sent_id, received_at);
                     }
                 } else if old_edge.is_some_and(|edge| sequence <= edge) {
-                    self.recover(sent_id, epoch, arrival, ecn, received_at);
+                    if !self.reject_replayed_terminal_receipt(
+                        sent_id,
+                        epoch,
+                        received_at,
+                        report_is_new,
+                    ) {
+                        self.recover(sent_id, epoch, arrival, ecn, received_at);
+                    }
                 }
             }
             if let Some(edge) = received_edge {
@@ -597,14 +653,52 @@ impl SentHistory {
                 .reorder_deadline(&entry)
                 .is_some_and(|deadline| received_at >= deadline)
             {
-                self.mark_lost(sent_id, LossOrigin::Reordering);
-                return;
+                if !self.mark_lost(sent_id, LossOrigin::Reordering) {
+                    return;
+                }
             }
             self.set_received(sent_id, true, receiver_arrival, ecn, received_at);
         } else {
             self.set_missing(sent_id, received_at);
             self.emit(sent_id, false, true, None, None, None);
         }
+    }
+
+    fn reject_replayed_terminal_receipt(
+        &mut self,
+        sent_id: Option<SentPacketId>,
+        epoch: PathEpoch,
+        received_at: Instant,
+        report_is_new: bool,
+    ) -> bool {
+        if !report_is_new
+            && let Some(id) = sent_id
+            && let Some(entry) = self.entry(id).copied()
+            && entry.path_epoch == epoch
+            && received_at.saturating_duration_since(entry.committed_at) < SENT_HISTORY_MAX_AGE
+            && (entry.acknowledgment == Acknowledgment::Lost
+                || self
+                    .reorder_deadline(&entry)
+                    .is_some_and(|deadline| received_at >= deadline))
+        {
+            if let Some(since) = self
+                .entry_mut(id)
+                .and_then(|entry| entry.missing_since.take())
+            {
+                self.observed_reordering_window = self.observed_reordering_window.max(
+                    received_at
+                        .saturating_duration_since(since)
+                        .min(MAX_REORDERING_WINDOW),
+                );
+            }
+            // Learn bounded reordering without accepting a replay as path evidence.
+            if self.mark_lost(id, LossOrigin::Reordering) {
+                self.counters.duplicate_feedback =
+                    self.counters.duplicate_feedback.saturating_add(1);
+            }
+            return true;
+        }
+        false
     }
 
     pub(super) fn recover(
@@ -651,31 +745,26 @@ impl SentHistory {
                 let deadline_passed = self
                     .reorder_deadline(&entry)
                     .is_some_and(|deadline| received_at >= deadline);
-                if deadline_passed {
-                    if !self.mark_lost(sent_id, LossOrigin::Reordering) {
-                        return;
-                    }
-                    if let Some(entry) = self.entry_mut(sent_id) {
-                        entry.missing_since = None;
-                    }
-                } else {
-                    self.set_received(sent_id, false, receiver_arrival, ecn, received_at);
+                if deadline_passed && !self.mark_lost(sent_id, LossOrigin::Reordering) {
+                    return;
                 }
+                self.set_received(sent_id, false, receiver_arrival, ecn, received_at);
                 self.observed_reordering_window = self.observed_reordering_window.max(observed);
             }
             Acknowledgment::Lost => {
-                if let Some(since) = self
-                    .entry_mut(sent_id)
-                    .and_then(|entry| entry.missing_since.take())
-                {
-                    self.observed_reordering_window = self.observed_reordering_window.max(
-                        received_at
-                            .saturating_duration_since(since)
-                            .min(MAX_REORDERING_WINDOW),
-                    );
+                if entry.missing_since.is_some() {
+                    if let Some(since) = entry.missing_since {
+                        self.observed_reordering_window = self.observed_reordering_window.max(
+                            received_at
+                                .saturating_duration_since(since)
+                                .min(MAX_REORDERING_WINDOW),
+                        );
+                    }
+                    self.set_received(sent_id, false, receiver_arrival, ecn, received_at);
+                } else {
+                    self.counters.duplicate_feedback =
+                        self.counters.duplicate_feedback.saturating_add(1);
                 }
-                self.counters.duplicate_feedback =
-                    self.counters.duplicate_feedback.saturating_add(1);
             }
             Acknowledgment::Received | Acknowledgment::Retired => {
                 self.counters.duplicate_feedback =
@@ -694,19 +783,34 @@ impl SentHistory {
         newly_acked: bool,
         receiver_arrival: Option<ReceiverTime>,
         ecn: Option<EcnMark>,
-        _received_at: Instant,
+        received_at: Instant,
     ) {
         let Some(entry) = self.entry_mut(sent_id) else {
             return;
         };
-        if entry.acknowledgment.is_terminal() {
+        if entry.acknowledgment.is_terminal()
+            && !(entry.acknowledgment == Acknowledgment::Lost && entry.missing_since.is_some())
+        {
             self.counters.duplicate_feedback = self.counters.duplicate_feedback.saturating_add(1);
             return;
         }
-        entry.acknowledgment = Acknowledgment::Received;
+        let terminal_loss = entry.acknowledgment == Acknowledgment::Lost;
+        if !terminal_loss {
+            entry.acknowledgment = Acknowledgment::Received;
+        }
         entry.missing_since = None;
-        self.counters.received = self.counters.received.saturating_add(1);
-        self.emit(sent_id, true, newly_acked, None, receiver_arrival, ecn);
+        if !terminal_loss {
+            self.counters.received = self.counters.received.saturating_add(1);
+        }
+        self.emit_observed(
+            sent_id,
+            true,
+            newly_acked,
+            None,
+            receiver_arrival,
+            ecn,
+            Some(received_at),
+        );
     }
 
     pub(super) fn set_missing(&mut self, sent_id: SentPacketId, now: Instant) {
@@ -721,6 +825,7 @@ impl SentHistory {
                 };
                 entry.missing_since = Some(now);
                 self.missing.push_back(sent_id);
+                self.emit_observed(sent_id, false, false, None, None, None, Some(now));
             }
             Acknowledgment::Missing { .. }
             | Acknowledgment::Received
@@ -820,9 +925,56 @@ impl SentHistory {
         receiver_arrival: Option<ReceiverTime>,
         ecn: Option<EcnMark>,
     ) {
-        let Some(entry) = self.entry(sent_id).copied() else {
+        self.emit_observed(
+            sent_id,
+            received,
+            newly_acked,
+            loss_origin,
+            receiver_arrival,
+            ecn,
+            None,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn emit_observed(
+        &mut self,
+        sent_id: SentPacketId,
+        received: bool,
+        newly_acked: bool,
+        loss_origin: Option<LossOrigin>,
+        receiver_arrival: Option<ReceiverTime>,
+        ecn: Option<EcnMark>,
+        observed_at: Option<Instant>,
+    ) {
+        if newly_acked
+            && !received
+            && loss_origin.is_none()
+            && let Some(previous) = self.inputs.feedback.last_mut()
+            && previous.sent_id == sent_id
+            && previous.reported_lost_for_the_first_time
+            && !previous.received
+        {
+            previous.newly_acked = true;
+            return;
+        }
+        // Native TWCC PacketResults leave loss/recovery flags unset. Only CCFB
+        // qualifies provisional receiver loss for SCReAM; ledger loss is separate.
+        let reports_controller_loss = self.mode == Some(PacketFeedbackKind::Rfc8888);
+        let Some(entry) = self.entry_mut(sent_id) else {
             return;
         };
+        let reported_lost_for_the_first_time = reports_controller_loss
+            && !received
+            && !entry.controller_loss_reported
+            && (loss_origin == Some(LossOrigin::Reordering)
+                || matches!(entry.acknowledgment, Acknowledgment::Missing { .. }));
+        let recovered = received && entry.controller_loss_reported;
+        if reported_lost_for_the_first_time {
+            entry.controller_loss_reported = true;
+        } else if recovered {
+            entry.controller_loss_reported = false;
+        }
         let sample = PacketFeedback {
             sent_id,
             ssrc: entry.ssrc,
@@ -832,6 +984,9 @@ impl SentHistory {
             received,
             newly_acked,
             lost: loss_origin.is_some(),
+            reported_lost_for_the_first_time,
+            recovered,
+            observed_at,
             loss_origin,
             receiver_arrival,
             ecn,
