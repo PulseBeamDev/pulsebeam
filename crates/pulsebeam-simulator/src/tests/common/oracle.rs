@@ -245,7 +245,12 @@ impl ControlStateOracle {
         }
         ensure!(
             observation.sent_intent_revision == Some(snapshot.accepted_intent_revision),
-            "latest transmitted wire intent not accepted"
+            "latest transmitted wire intent not accepted: sent={:?} accepted={} desired={} submitted={} pending_acceptance={}",
+            observation.sent_intent_revision,
+            snapshot.accepted_intent_revision,
+            snapshot.desired_revision,
+            observation.submitted.revision,
+            observation.accepted.is_none(),
         );
         let accepted = observation.accepted.as_ref().ok_or_else(|| {
             anyhow::anyhow!(

@@ -1,14 +1,17 @@
 use super::media::FixtureEncoding;
+pub use super::native_video::{Playback, PlaybackExpectation};
+use super::provenance::FixturePublishers;
 use crate::tests::common::client::{
-    AudioReceiveLog, ClientObservation, NativeTrafficStatistics, QualityVideoReference,
-    RequestedVideo, SimClientBuilder, VideoReceiveLog, VideoReceiveStats,
+    AudioReceiveLog, ClientObservation, NativeTrafficBaseline, NativeTrafficStatistics,
+    QualityVideoReference, RequestedVideo, SimClientBuilder, VideoReceiveLog, VideoReceiveStats,
 };
 use crate::tests::common::decoder::{
     MAX_AUDIO_REFERENCE_PEAK, MAX_REFERENCE_MEAN_ABSOLUTE, MAX_REFERENCE_PEAK,
 };
 use crate::tests::common::media::{KeyframeRecoveryProbe, VbrProfile};
 use crate::tests::common::{
-    DEFAULT_SIM_SHARDS, reserve_subnet, start_observed_sfu_node, subnet_ip, subnet_ip_v6,
+    DEFAULT_SIM_SHARDS, reserve_subnet, start_observed_sfu_node_with_transport, subnet_ip,
+    subnet_ip_v6,
 };
 use anyhow::Context;
 use pulsebeam_agent_native::agent_core::{
@@ -75,6 +78,7 @@ pub struct Participant {
     /// to forward on the Dependency Descriptor alone.
     pub opaque_payload: bool,
     pub corrupt_video_payload: bool,
+    pub native_playback_only: bool,
     pub corrupt_audio_payload: bool,
     pub suppress_natural_keyframe_repeats: bool,
     /// Model a legacy peer that never negotiates the Dependency Descriptor
@@ -109,6 +113,7 @@ impl Participant {
             audio_slots: 0,
             opaque_payload: false,
             corrupt_video_payload: false,
+            native_playback_only: false,
             corrupt_audio_payload: false,
             suppress_natural_keyframe_repeats: false,
             marker_only: false,
@@ -135,6 +140,7 @@ impl Participant {
             audio_slots: 0,
             opaque_payload: false,
             corrupt_video_payload: false,
+            native_playback_only: false,
             corrupt_audio_payload: false,
             suppress_natural_keyframe_repeats: false,
             marker_only: false,
@@ -184,6 +190,7 @@ impl Participant {
             audio_slots: 0,
             opaque_payload: false,
             corrupt_video_payload: false,
+            native_playback_only: false,
             corrupt_audio_payload: false,
             suppress_natural_keyframe_repeats: false,
             marker_only: false,
@@ -211,6 +218,7 @@ impl Participant {
             audio_slots: 0,
             opaque_payload: false,
             corrupt_video_payload: false,
+            native_playback_only: false,
             corrupt_audio_payload: false,
             suppress_natural_keyframe_repeats: false,
             marker_only: false,
@@ -246,6 +254,7 @@ impl Participant {
             audio_slots: 0,
             opaque_payload: false,
             corrupt_video_payload: false,
+            native_playback_only: false,
             corrupt_audio_payload: false,
             suppress_natural_keyframe_repeats: false,
             marker_only: false,
@@ -342,17 +351,13 @@ impl Participant {
         self
     }
 
-    pub fn with_temporal_dd(mut self, layers: u8) -> Self {
-        self.temporal_dd = Some(layers);
+    pub fn with_encoded_and_native_decoded_video(mut self) -> Self {
+        self.video_receive_mode = pulsebeam_agent_native::ReceiveMode::EncodedAndDecoded;
         self
     }
 
-    /// Publish an L1T{layers} DD stream whose payload is opaque, simulating
-    /// SFrame/E2EE: the SFU cannot inspect the bitstream and must forward on the
-    /// Dependency Descriptor alone.
-    pub fn with_opaque_dd(mut self, layers: u8) -> Self {
+    pub fn with_temporal_dd(mut self, layers: u8) -> Self {
         self.temporal_dd = Some(layers);
-        self.opaque_payload = true;
         self
     }
 
@@ -360,6 +365,14 @@ impl Participant {
     /// peer. Used to test mixed rooms (DD on one side, marker-only on the other).
     pub fn marker_only(mut self) -> Self {
         self.marker_only = true;
+        self
+    }
+
+    /// End-user native playback: encoded samples authenticate origin only.
+    /// No independent decoder or observer-driven keyframe retry controls RTC.
+    pub fn with_native_playback(mut self) -> Self {
+        self.video_receive_mode = pulsebeam_agent_native::ReceiveMode::EncodedAndDecoded;
+        self.native_playback_only = true;
         self
     }
 
@@ -503,6 +516,15 @@ pub enum Step {
         participant: &'static str,
         publishers: &'static [&'static str],
         min_quality: u8,
+        timeout: Duration,
+    },
+    /// Keep the same bounded convergence deadline, but require fresh decoded
+    /// pixels at this size instead of an unavailable lone native RID label.
+    WaitForVideoAtResolution {
+        description: &'static str,
+        participant: &'static str,
+        publishers: &'static [&'static str],
+        min_resolution: (usize, usize),
         timeout: Duration,
     },
     /// Require an owned slot observation for every origin and at least one
@@ -654,6 +676,29 @@ pub enum Step {
         data: &'static [u8],
     },
 
+    /// Explicit measurement boundary, not a wait. Only an intentional absence
+    /// may exclude the gap before the first resumed frame.
+    BeginNativePlayback {
+        description: &'static str,
+        participant: &'static str,
+        after_pause: bool,
+    },
+    /// Bounded first-visible-output contract, anchored at this step's start.
+    WaitForNativeVideo {
+        description: &'static str,
+        participant: &'static str,
+        publisher: &'static str,
+        min_resolution: (u32, u32),
+        timeout: Duration,
+    },
+    CheckNativePlayback {
+        description: &'static str,
+        participant: &'static str,
+        publisher: &'static str,
+        expected: PlaybackExpectation,
+        same_receiver: bool,
+    },
+
     // ── Assertions ─────────────────────────────────────────────────────────
     /// Deep QoE check: frames are renderable, SPS/PPS present before keyframes,
     /// no backward timestamp jumps, bounded sequence gaps.
@@ -662,6 +707,15 @@ pub enum Step {
         participant: &'static str,
         dimensions: (u32, u32),
         min_fresh_frames: u64,
+    },
+    /// Admission-specific actual native I420 progress, separate from the
+    /// encoded observer and its independent H264 decoder.
+    CheckNativeVideoDecodedFromInterval {
+        description: &'static str,
+        participant: &'static str,
+        publisher: &'static str,
+        min_frames: u64,
+        min_resolution: (u32, u32),
     },
     CheckVideoQuality {
         description: &'static str,
@@ -762,6 +816,7 @@ pub enum Step {
         description: &'static str,
         publisher: &'static str,
         subscriber: &'static str,
+        encoding: &'static str,
     },
     CheckKeyframeRecovery {
         description: &'static str,
@@ -933,7 +988,11 @@ pub enum Step {
         participant: &'static str,
         capacity: Capacity,
     },
-    /// Configure the loss model for a participant's downlink.
+    /// Configure UDP datagram loss for a participant's downlink.
+    ///
+    /// `LocalNodeSim` advertises only UDP by default, so this governs the
+    /// selected RTC path. The simulator does not pretend that dropping bytes
+    /// from a reliable TCP stream models segment loss.
     SetLoss {
         description: &'static str,
         participant: &'static str,
@@ -1180,8 +1239,9 @@ struct ParticipantShared {
     video_rx: Arc<Mutex<VideoReceiveLog>>,
     audio_rx: Arc<Mutex<AudioReceiveLog>>,
     quality_references: Arc<Mutex<BTreeMap<String, &'static QualityVideoReference>>>,
-    h264_publishers: Arc<Mutex<BTreeSet<String>>>,
+    h264_publishers: Arc<Mutex<FixturePublishers>>,
     statistics: Mutex<Option<NativeTrafficStatistics>>,
+    interval_statistics: Mutex<NativeTrafficBaseline>,
     connected: Mutex<bool>,
     keyframe_recovery: Arc<Mutex<KeyframeRecoveryProbe>>,
     media_kinds: Mutex<HashMap<String, (bool, bool)>>,
@@ -1199,9 +1259,18 @@ struct ParticipantShared {
 }
 
 impl ParticipantShared {
+    fn record_statistics(&self, sample: Option<NativeTrafficStatistics>) -> anyhow::Result<()> {
+        if let Some(stats) = &sample {
+            let at = super::native::callback_clock()?.project(stats.timestamp_us)?;
+            self.interval_statistics.lock().unwrap().observe(stats, at);
+        }
+        *self.statistics.lock().unwrap() = sample;
+        Ok(())
+    }
+
     fn new(
         quality_references: Arc<Mutex<BTreeMap<String, &'static QualityVideoReference>>>,
-        h264_publishers: Arc<Mutex<BTreeSet<String>>>,
+        h264_publishers: Arc<Mutex<FixturePublishers>>,
         topics: TopicRegistrations,
     ) -> Self {
         Self {
@@ -1213,6 +1282,7 @@ impl ParticipantShared {
             quality_references,
             h264_publishers,
             statistics: Mutex::new(None),
+            interval_statistics: Mutex::new(NativeTrafficBaseline::default()),
             connected: Mutex::new(false),
             keyframe_recovery: Arc::default(),
             media_kinds: Mutex::new(HashMap::new()),
@@ -1230,8 +1300,6 @@ struct ParticipantHandle {
     shared: Arc<ParticipantShared>,
     cmd_tx: mpsc::Sender<ParticipantCmd>,
     room_name: &'static str,
-    /// Actual SDK sample preceding this measurement, including its epoch/time.
-    interval_statistics: Option<NativeTrafficStatistics>,
     /// When this participant last asked for a stream. Time-to-first-frame is measured from here,
     /// not from the start of the plan: the settle steps before a subscription are not time the
     /// viewer spent waiting.
@@ -1239,6 +1307,9 @@ struct ParticipantHandle {
     interval_video_baseline: VideoReceiveStats,
     interval_decoded_video_baseline: BTreeMap<String, u64>,
     native_video_baseline: super::native_video::NativeDecodedVideoLog,
+    native_playback_track: Option<pulsebeam_agent_native::RemoteTrack>,
+    native_playback_started: bool,
+    native_origin_interval: Instant,
     native_video_stats_timestamp: Option<i64>,
     native_video_decoder_frames: Option<(u64, String, u64)>,
     /// Ground truth, from the plan rather than from anything the SFU said.
@@ -1300,15 +1371,17 @@ impl ParticipantHandle {
         let current = guard
             .as_ref()
             .ok_or("native interval ending sample unavailable")?;
-        current.interval_delta(self.interval_statistics.as_ref(), field)
+        let baseline = self.shared.interval_statistics.lock().unwrap();
+        current.interval_delta(baseline.sample(), field)
     }
     fn interval_baseline(&self, field: fn(&NativeTrafficStatistics) -> Option<u64>) -> u64 {
         let guard = self.shared.statistics.lock().unwrap();
         let current = guard
             .as_ref()
             .expect("native interval ending sample unavailable");
+        let baseline = self.shared.interval_statistics.lock().unwrap();
         let delta = current
-            .interval_delta(self.interval_statistics.as_ref(), field)
+            .interval_delta(baseline.sample(), field)
             .expect("traffic assertion requires a valid native interval");
         field(current).expect("validated native field") - delta
     }
@@ -1339,10 +1412,20 @@ impl ParticipantHandle {
             .generation
             .map(pulsebeam_agent_native::agent_core::Generation::get);
         let video = self.video_rx();
-        assert_eq!(
-            video.native_queue_drops, 0,
-            "native video observer lost frames"
-        );
+        // Routing is about advertised slots, not best-effort polling retention.
+        // Native playback/encoded component oracles own their respective loss.
+        for track in video.native_decoded.observed_tracks() {
+            if Some(track.generation) == generation {
+                video
+                    .native_decoded
+                    .require_valid_receiver(track.generation, track.receiver)
+                    .expect("native route observer is invalid");
+                assert!(
+                    observation.video_receivers.contains(&track.media_index),
+                    "native decoded output belongs to an unadvertised slot"
+                );
+            }
+        }
         for timeline in video.by_receiver.values() {
             if let Some(track) = &timeline.track
                 && Some(track.generation) == generation
@@ -1392,7 +1475,21 @@ impl ParticipantHandle {
     }
 
     fn snapshot_interval(&mut self) {
-        self.interval_statistics = self.shared.statistics.lock().unwrap().clone();
+        self.native_origin_interval = Instant::now();
+        let sample = self.shared.statistics.lock().unwrap().clone();
+        let generation = self
+            .shared
+            .observation
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|observation| observation.snapshot.generation)
+            .map(pulsebeam_agent_native::agent_core::Generation::get);
+        self.shared.interval_statistics.lock().unwrap().begin(
+            sample,
+            generation,
+            self.native_origin_interval,
+        );
         self.shared
             .audio_rx
             .lock()
@@ -1452,6 +1549,7 @@ async fn run_participant(
         .with_quality_references(shared.quality_references.clone())
         .with_h264_publishers(shared.h264_publishers.clone())
         .with_video_receive_mode(config.video_receive_mode)
+        .with_native_playback_only(config.native_playback_only)
         .with_audio_receive_mode(config.audio_receive_mode)
         .with_audio_input(config.audio_input)
         .with_audio_rx(shared.audio_rx.clone())
@@ -1544,6 +1642,7 @@ async fn run_participant(
         let command = loop {
             tokio::select! {
                 command = cmd_rx.recv() => break command,
+                event = client.ctx.receive_event(), if !client.ctx.events_closed() => event?,
                 _ = interval.tick() => {
                     let operations = std::mem::take(&mut shared.pending_ops.lock().unwrap().pending);
                     let mut retry = Vec::new();
@@ -1580,6 +1679,7 @@ async fn run_participant(
                         if !complete {
                             retry.push((sequence, operation));
                         }
+                        client.ctx.drain_events()?;
                     }
                     if !retry.is_empty() {
                         let mut pending = shared.pending_ops.lock().unwrap();
@@ -1606,13 +1706,13 @@ async fn run_participant(
                     }
                     *shared.discovered_tracks.lock().unwrap() = client.ctx.discovered_tracks.clone();
                     *shared.media_kinds.lock().unwrap() = client.ctx.media_kinds.clone();
-                    *shared.statistics.lock().unwrap() = client.ctx.statistics()?;
+                    shared.record_statistics(client.ctx.statistics()?)?;
                     *shared.connected.lock().unwrap() = client.ctx.connected();
                 }
             }
         };
 
-        *shared.statistics.lock().unwrap() = client.ctx.statistics()?;
+        shared.record_statistics(client.ctx.statistics()?)?;
         *shared.connected.lock().unwrap() = false;
         match command {
             None | Some(ParticipantCmd::Done) => {
@@ -1650,6 +1750,7 @@ fn step_name(step: &Step) -> &'static str {
         Step::Run { .. } => "Run",
         Step::WaitForPublication { .. } => "WaitForPublication",
         Step::WaitForVideo { .. } => "WaitForVideo",
+        Step::WaitForVideoAtResolution { .. } => "WaitForVideoAtResolution",
         Step::CheckVideoPaused { .. } => "CheckVideoPaused",
         Step::StallController { .. } => "StallController",
         Step::SendToWrongShard { .. } => "SendToWrongShard",
@@ -1670,7 +1771,11 @@ fn step_name(step: &Step) -> &'static str {
         Step::DeclarePublishTopic { .. } => "DeclarePublishTopic",
         Step::DeclareSubscribeTopic { .. } => "DeclareSubscribeTopic",
         Step::PublishData { .. } => "PublishData",
+        Step::BeginNativePlayback { .. } => "BeginNativePlayback",
+        Step::WaitForNativeVideo { .. } => "WaitForNativeVideo",
+        Step::CheckNativePlayback { .. } => "CheckNativePlayback",
         Step::CheckNativeDecodedVideo { .. } => "CheckNativeDecodedVideo",
+        Step::CheckNativeVideoDecodedFromInterval { .. } => "CheckNativeVideoDecodedFromInterval",
         Step::CheckVideoQuality { .. } => "CheckVideoQuality",
         Step::CheckVideoQualityInterval { .. } => "CheckVideoQualityInterval",
         Step::CheckVideoNotReceivedFrom { .. } => "CheckVideoNotReceivedFrom",
@@ -1733,6 +1838,73 @@ fn step_name(step: &Step) -> &'static str {
 
 type PlanHandles = BTreeMap<&'static str, ParticipantHandle>;
 type PlanIps = BTreeMap<&'static str, IpAddr>;
+
+fn native_source_proof(
+    handles: &PlanHandles,
+    participant: &str,
+    publisher: &str,
+    min_frames: u64,
+    min_resolution: (u32, u32),
+) -> anyhow::Result<super::native_origin::NativeOriginProof> {
+    let source = handles
+        .get(publisher)
+        .context("native publisher unavailable")?;
+    let admission = source
+        .shared
+        .observation
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|observation| observation.admission)
+        .context("native publisher admission unavailable")?;
+    let origin = super::provenance::source_key(&admission.to_string(), "v0");
+    let handle = handles
+        .get(participant)
+        .context("native viewer unavailable")?;
+    let generation = handle
+        .shared
+        .observation
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|observation| observation.snapshot.generation)
+        .context("native viewer generation unavailable")?
+        .get();
+    let log = handle.shared.video_rx.lock().unwrap();
+    let proof = log.native_origin.require_since(
+        &origin,
+        generation,
+        handle.native_origin_interval,
+        min_frames,
+        min_resolution,
+    )?;
+    log.native_decoded
+        .require_valid_receiver(generation, proof.track.receiver)?;
+    let statistics = handle.shared.statistics.lock().unwrap();
+    let stats = statistics
+        .as_ref()
+        .context("native decoder statistics unavailable")?;
+    anyhow::ensure!(
+        stats.generation == generation,
+        "native decoder report is from an old generation"
+    );
+    let interval = handle.shared.interval_statistics.lock().unwrap();
+    if let Some(previous) = interval.sample()
+        && previous.generation == generation
+    {
+        anyhow::ensure!(
+            stats.timestamp_us > previous.timestamp_us,
+            "native decoder report did not advance"
+        );
+    }
+    super::native_video::require_decoder_report(
+        &stats.report_json,
+        &proof.track.mid,
+        proof.dimensions,
+        min_frames,
+    )?;
+    Ok(proof)
+}
 
 enum ServerCommand {
     Stop(tokio::sync::oneshot::Sender<()>),
@@ -2023,11 +2195,25 @@ async fn execute_plan(
                 description,
                 participant,
                 publishers,
-                min_quality,
                 timeout,
+                ..
+            }
+            | Step::WaitForVideoAtResolution {
+                description,
+                participant,
+                publishers,
+                timeout,
+                ..
             } => {
+                let (min_quality, min_resolution) = match step {
+                    Step::WaitForVideo { min_quality, .. } => (*min_quality, None),
+                    Step::WaitForVideoAtResolution { min_resolution, .. } => {
+                        (1, Some(*min_resolution))
+                    }
+                    _ => unreachable!(),
+                };
                 anyhow::ensure!(
-                    (1..=3).contains(min_quality),
+                    (1..=3).contains(&min_quality),
                     "{description}: invalid video quality {min_quality}"
                 );
                 tracing::info!(
@@ -2078,11 +2264,13 @@ async fn execute_plan(
                                     .map(|slot| slot.quality);
                                 let frames = log.decoded_from(id).map_or(0, |decoded| decoded.frames)
                                     .saturating_sub(*before);
-                                (*publisher, quality, frames)
+                                let resolution = log.decoded_from(id).map(|decoded| (decoded.width, decoded.height));
+                                (*publisher, quality, frames, resolution)
                             }).collect()
                         };
-                        if fresh && last.iter().all(|(_, quality, frames)| {
-                            quality.is_some_and(|quality| quality >= *min_quality) && *frames > 0
+                        if fresh && last.iter().all(|(_, quality, frames, resolution)| {
+                            quality.is_some_and(|quality| quality >= min_quality) && *frames > 0
+                                && min_resolution.is_none_or(|minimum| resolution.is_some_and(|actual| actual.0 >= minimum.0 && actual.1 >= minimum.1))
                         }) {
                             match assert_convergence(handles, observer, description).await {
                                 Ok(()) => break Ok::<_, anyhow::Error>(()),
@@ -2148,6 +2336,9 @@ async fn execute_plan(
 
             Step::StallController { duration } => {
                 tracing::info!("[step {n}/{total}: {kind}] controller stalled for {duration:?}");
+                for handle in handles.values_mut() {
+                    handle.snapshot_interval();
+                }
                 pulsebeam::sim_metrics::request_controller_stall(*duration);
                 tokio::time::sleep(*duration).await;
             }
@@ -2645,6 +2836,121 @@ async fn execute_plan(
                 handle.native_video_baseline = log.native_decoded.checkpoint();
             }
 
+            Step::BeginNativePlayback {
+                description,
+                participant,
+                after_pause,
+            } => {
+                let handle = get_handle(handles, participant, description)?;
+                handle.native_playback_started = true;
+                handle.native_origin_interval = Instant::now();
+                let mut log = handle.shared.video_rx.lock().unwrap();
+                handle.native_video_baseline = if *after_pause {
+                    log.native_decoded.checkpoint_after_pause()
+                } else {
+                    log.native_decoded.checkpoint()
+                };
+            }
+            Step::WaitForNativeVideo {
+                description,
+                participant,
+                publisher,
+                min_resolution,
+                timeout,
+            } => {
+                get_handle(handles, participant, description)?.native_origin_interval =
+                    Instant::now();
+                let mut pending = None;
+                tokio::time::timeout(*timeout, async {
+                    loop {
+                        match native_source_proof(handles, participant, publisher, 2, *min_resolution)
+                            .and_then(|proof| {
+                                let handle = handles.get(participant).context("viewer unavailable")?;
+                                let log = handle.shared.video_rx.lock().unwrap();
+                                // First visible output is distinct from the subsequent
+                                // continuous-playback contract.
+                                log.native_decoded.require_recent(&proof.track, Instant::now())?;
+                                Ok(proof)
+                            }) {
+                            Ok(_) => match assert_convergence(handles, observer, description).await {
+                                Ok(()) => break,
+                                Err(error) => pending = Some(error),
+                            },
+                            Err(error) => pending = Some(error),
+                        }
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                    anyhow::Ok(())
+                }).await.with_context(|| format!("{description}: first native output did not arrive within {timeout:?}; last={pending:?}"))??;
+            }
+            Step::CheckNativePlayback {
+                description,
+                participant,
+                publisher,
+                expected,
+                same_receiver,
+            } => {
+                let proof = native_source_proof(
+                    handles,
+                    participant,
+                    publisher,
+                    2,
+                    expected.min_resolution,
+                )?;
+                let handle = get_handle(handles, participant, description)?;
+                anyhow::ensure!(
+                    handle.native_playback_started,
+                    "native playback window was not started"
+                );
+                if *same_receiver {
+                    let previous = handle
+                        .native_playback_track
+                        .as_ref()
+                        .context("no previous slot playback")?;
+                    anyhow::ensure!(
+                        previous.generation == proof.track.generation
+                            && previous.receiver == proof.track.receiver
+                            && previous.track_id == proof.track.track_id
+                            && previous.mid == proof.track.mid
+                            && previous.media_index == proof.track.media_index,
+                        "replacement did not reuse the original native receiver"
+                    );
+                }
+                handle
+                    .shared
+                    .video_rx
+                    .lock()
+                    .unwrap()
+                    .native_decoded
+                    .require_playback(
+                        &handle.native_video_baseline,
+                        &proof.track,
+                        *expected,
+                        Instant::now(),
+                    )?;
+                handle.native_playback_track = Some(proof.track.clone());
+                tracing::info!(description, participant, publisher, ?expected, ?proof.track, "source-authenticated native playback verified");
+            }
+            Step::CheckNativeVideoDecodedFromInterval {
+                description,
+                participant,
+                publisher,
+                min_frames,
+                min_resolution,
+            } => {
+                let proof = native_source_proof(
+                    handles,
+                    participant,
+                    publisher,
+                    *min_frames,
+                    *min_resolution,
+                )
+                .with_context(|| format!("{description}: {participant} <- {publisher}"))?;
+                tracing::info!(description, participant, publisher, ?proof.track,
+                    ?proof.dimensions, native_frames = proof.frames,
+                    "authenticated admission-specific native I420 progress verified");
+            }
+
             Step::CheckVideoQuality {
                 description,
                 participant,
@@ -2710,7 +3016,7 @@ async fn execute_plan(
                 tracing::info!("[step {n}/{total}: {kind}] \"{description}\" ({participant})");
                 let handle = get_handle(handles, participant, description)?;
                 assert!(
-                    !handle.video_rx().native_decoded.has_observations(),
+                    !handle.video_rx().native_decoded_only(),
                     "encoded independent-decoder oracle cannot qualify native playout; use CheckNativeDecodedVideo"
                 );
                 let stats = handle.video_stats_since_interval();
@@ -3130,10 +3436,12 @@ async fn execute_plan(
                 description,
                 publisher,
                 subscriber,
+                encoding,
             } => {
                 let source = get_handle(handles, publisher, description)?;
                 *source.shared.keyframe_recovery.lock().unwrap() = KeyframeRecoveryProbe {
                     armed: true,
+                    drop_target: Some(("v0".into(), Some((*encoding).into()))),
                     ..Default::default()
                 };
                 let viewer = get_handle(handles, subscriber, description)?;
@@ -3157,24 +3465,46 @@ async fn execute_plan(
                     1,
                     "{description}: receiver must send exactly one recovery PLI"
                 );
+                let log = viewer.video_rx();
+                let decoded_baselines = viewer.interval_decoded_video_baseline.clone();
                 let source = get_handle(handles, publisher, description)?;
                 let probe = source.shared.keyframe_recovery.lock().unwrap();
                 assert_eq!(
                     probe.discarded_responses, 1,
                     "{description}: exactly one response must be discarded"
                 );
-                assert!(
-                    probe.requests.len() >= 2,
-                    "{description}: first response must be lost, then retried: {:?}",
-                    probe.requests
+                let target = ("v0".to_owned(), Some((*encoding).to_owned()));
+                assert_eq!(
+                    probe.discarded_targets.as_slice(),
+                    std::slice::from_ref(&target),
+                    "{description}: only the selected encoding's first response is lost"
                 );
                 assert!(
                     probe
                         .requests
                         .iter()
-                        .all(|(slot, rid)| slot == "v0" && rid.as_deref() == Some(*encoding)),
-                    "{description}: PLI must reach the current local slot/RID: {:?}",
+                        .filter(|request| **request == target)
+                        .count()
+                        >= 2,
+                    "{description}: selected slot/RID must be requested and retried; native sibling requests cannot substitute: {:?}",
                     probe.requests
+                );
+                let source_id = source.participant_id().expect("admitted source");
+                let rendered = log
+                    .decoded_from(&source_id)
+                    .expect("the selected source must independently decode");
+                let baseline = decoded_baselines.get(&source_id).copied().unwrap_or(0);
+                assert!(
+                    rendered.frames > baseline,
+                    "{description}: recovery needs fresh decoded source output"
+                );
+                let expected = probe
+                    .target_resolution
+                    .expect("a native target request was observed");
+                assert_eq!(
+                    (rendered.width, rendered.height),
+                    (usize::from(expected.0), usize::from(expected.1)),
+                    "{description}: fresh decoding must be the actual selected encoding, not a native sibling"
                 );
             }
 
@@ -3210,6 +3540,9 @@ async fn execute_plan(
                 over,
             } => {
                 tracing::info!("[step {n}/{total}: {kind}] \"{description}\" ({name}, {over:?})");
+                for handle in handles.values_mut() {
+                    handle.snapshot_interval();
+                }
                 let before = pulsebeam::sim_metrics::routing_counter(name);
                 tokio::time::sleep(*over).await;
                 let after = pulsebeam::sim_metrics::routing_counter(name);
@@ -4377,7 +4710,7 @@ fn assert_video_quality(
 ) {
     let kind = "CheckVideoQuality";
     assert!(
-        !log.native_decoded.has_observations(),
+        !log.native_decoded_only(),
         "encoded independent-decoder oracle cannot qualify native playout; use CheckNativeDecodedVideo"
     );
     assert!(
@@ -5569,6 +5902,7 @@ pub struct LocalNodeSim {
     rng_seed: u64,
     subnet: Option<u8>,
     tcp_only: bool,
+    udp_only: bool,
     num_shards: usize,
     link: LinkProfile,
     ip_version: turmoil::IpVersion,
@@ -5589,6 +5923,9 @@ impl LocalNodeSim {
             rng_seed: super::sim_seed(),
             subnet: None,
             tcp_only: false,
+            // The shaper models datagrams. Keep its default path truthful and
+            // exercise reliable-stream framing only in explicit TCP scenarios.
+            udp_only: true,
             num_shards: DEFAULT_SIM_SHARDS,
             link: LinkProfile::default(),
             ip_version: turmoil::IpVersion::V4,
@@ -5645,6 +5982,14 @@ impl LocalNodeSim {
     /// Use TCP-only SFU + TCP client connections.
     pub fn with_tcp_only(mut self) -> Self {
         self.tcp_only = true;
+        self.udp_only = false;
+        self
+    }
+
+    /// Advertise only UDP candidates (the simulation default).
+    pub fn with_udp_only(mut self) -> Self {
+        self.udp_only = true;
+        self.tcp_only = false;
         self
     }
 
@@ -5703,16 +6048,17 @@ impl LocalNodeSim {
             self.rng_seed
         );
 
-        let sim_duration =
-            plan.iter()
-                .filter_map(|s| match s {
-                    Step::Run { duration, .. } => Some(*duration),
-                    Step::WaitForPublication { timeout, .. }
-                    | Step::WaitForVideo { timeout, .. } => Some(*timeout),
-                    _ => None,
-                })
-                .sum::<Duration>()
-                + Duration::from_secs(60);
+        let sim_duration = plan
+            .iter()
+            .filter_map(|s| match s {
+                Step::Run { duration, .. } => Some(*duration),
+                Step::WaitForPublication { timeout, .. }
+                | Step::WaitForVideo { timeout, .. }
+                | Step::WaitForVideoAtResolution { timeout, .. } => Some(*timeout),
+                _ => None,
+            })
+            .sum::<Duration>()
+            + Duration::from_secs(60);
 
         let mut sim = turmoil::Builder::new()
             .ip_version(self.ip_version.clone())
@@ -5740,6 +6086,7 @@ impl LocalNodeSim {
         };
         let seed = self.rng_seed;
         let tcp_only = self.tcp_only;
+        let udp_only = self.udp_only;
         let num_shards = self.num_shards;
         let initial_topics = if self.predeclare_topics {
             initial_topic_registrations(&plan)
@@ -5753,16 +6100,23 @@ impl LocalNodeSim {
             let observation_tx = observation_tx.clone();
             async move {
                 let rng = pulsebeam_runtime::rand::seeded_rng(seed);
-                start_observed_sfu_node(server_ip, rng, num_shards, tcp_only, Some(observation_tx))
-                    .await
-                    .map_err(Into::into)
+                start_observed_sfu_node_with_transport(
+                    server_ip,
+                    rng,
+                    num_shards,
+                    tcp_only,
+                    udp_only,
+                    Some(observation_tx),
+                )
+                .await
+                .map_err(Into::into)
             }
         });
 
         let mut handles = PlanHandles::new();
         let quality_references: Arc<Mutex<BTreeMap<String, &'static QualityVideoReference>>> =
             Arc::new(Mutex::new(BTreeMap::new()));
-        let h264_publishers: Arc<Mutex<BTreeSet<String>>> = Arc::new(Mutex::new(BTreeSet::new()));
+        let h264_publishers: Arc<Mutex<FixturePublishers>> = Arc::new(Mutex::new(BTreeMap::new()));
         let mut name_to_ip = PlanIps::new();
         name_to_ip.insert("server", server_ip);
         pulsebeam_runtime::net::shaper::set_gro_window(server_ip, self.link.gro_window);
@@ -5825,11 +6179,13 @@ impl LocalNodeSim {
                         shared: shared.clone(),
                         cmd_tx,
                         room_name: room.name,
-                        interval_statistics: None,
                         subscribed_at: None,
                         interval_video_baseline: VideoReceiveStats::default(),
                         interval_decoded_video_baseline: BTreeMap::new(),
                         native_video_baseline: Default::default(),
+                        native_playback_track: None,
+                        native_playback_started: false,
+                        native_origin_interval: Instant::now(),
                         native_video_stats_timestamp: None,
                         native_video_decoder_frames: None,
                         publishes_video: matches!(

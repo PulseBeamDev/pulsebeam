@@ -11,6 +11,13 @@ struct Bound {
     retirement_generation: Option<u64>,
 }
 
+struct HeldNativeMedia {
+    participant_id: String,
+    admission: pulsebeam::entity::ConnectionId,
+    held_at_us: i64,
+    baseline: NativeTrafficStatistics,
+}
+
 struct Transition {
     bindings: Vec<Bound>,
     seen: BTreeMap<String, BTreeSet<String>>,
@@ -527,9 +534,11 @@ impl Transition {
             .iter()
             .copied()
             .find(|(_, baseline)| {
-                before.sent_intent_revision.is_some_and(|sent| {
-                    sent > *baseline && sent > before.snapshot.accepted_intent_revision
-                })
+                before
+                    .last_successfully_sent_wire_revision
+                    .is_some_and(|sent| {
+                        sent > *baseline && sent > before.snapshot.accepted_intent_revision
+                    })
             });
         self.recovery_at = self.recovery_at.max(Instant::now());
         let command =
@@ -567,9 +576,9 @@ impl Transition {
                         }
                     }
                     if who == "viewer" && after.submitted.revision > before.submitted.revision {
-                        self.outstanding_changes.push((command, before.sent_intent_revision.unwrap_or(before.snapshot.accepted_intent_revision)));
+                        self.outstanding_changes.push((command, before.last_successfully_sent_wire_revision.unwrap_or(before.snapshot.accepted_intent_revision)));
                     }
-                    witness.record(format!("issued receiver={who} command={command} predecessor={predecessor:?} app_revision={} wire_revision={:?} accepted_revision={} accepted={} targets={targets:?}", after.submitted.revision, after.sent_intent_revision, after.snapshot.accepted_intent_revision, after.accepted.is_some()));
+                    witness.record(format!("issued receiver={who} command={command} predecessor={predecessor:?} app_revision={} wire_revision={:?} successful_wire_revision={:?} accepted_revision={} accepted={} targets={targets:?}", after.submitted.revision, after.sent_intent_revision, after.last_successfully_sent_wire_revision, after.snapshot.accepted_intent_revision, after.accepted.is_some()));
                     return Ok::<_, anyhow::Error>(());
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -649,7 +658,7 @@ async fn execute_inner(
         .await?;
     recover(&mut state, handles, observer, false).await?;
     let mut continuing_before = decoded(handles, "continuing", &anchor);
-    let mut held_tx = BTreeMap::new();
+    let mut held_media = BTreeMap::<u8, HeldNativeMedia>::new();
     for (index, op) in history.ops.iter().enumerate() {
         witness.phase = format!("operation:{op:?}");
         witness.record(format!("operation={index} program={op:?}"));
@@ -689,10 +698,54 @@ async fn execute_inner(
             }
             Op::Leave(i) | Op::Crash(i) => {
                 let who = CAST[usize::from(*i)];
-                let handle = handles.get_mut(who).unwrap();
-                let id = handle
+                let id = handles[who]
                     .participant_id()
                     .context("retire admitted identity")?;
+                if let Some(held) = held_media.remove(&(*i + 1)) {
+                    let before = observation(&handles[who]).context("held source observation")?;
+                    ensure!(
+                        held.participant_id == id
+                            && before.admission == Some(held.admission)
+                            && before
+                                .snapshot
+                                .generation
+                                .map(pulsebeam_agent_native::agent_core::Generation::get)
+                                == Some(held.baseline.generation),
+                        "held media source changed admission or native generation before retirement"
+                    );
+                    let mut pending = None;
+                    let ending = tokio::time::timeout(Duration::from_secs(2), async {
+                        loop {
+                            let sample = handles[who].shared.statistics.lock().unwrap().clone();
+                            if let Some(sample) = sample {
+                                ensure!(sample.generation == held.baseline.generation,
+                                    "held media native generation changed before retirement");
+                                match sample.video_progress_since(&held.baseline, "v0") {
+                                    Ok(true) => break Ok::<_, anyhow::Error>(sample),
+                                    Ok(false) => pending = Some("old video sender has not emitted another frame".to_owned()),
+                                    Err(reason) => pending = Some(reason),
+                                }
+                            }
+                            state.wait(handles, Duration::from_millis(10)).await?;
+                        }
+                    }).await.with_context(|| format!("no actual previous-generation video RTP produced while held: {pending:?}"))??;
+                    let binding = state
+                        .bindings
+                        .iter()
+                        .rev()
+                        .find(|binding| {
+                            binding.expected.id.as_str() == id && binding.retired.is_none()
+                        })
+                        .context("held source admission binding")?;
+                    witness.record(format!("held-media participant={id} admission={} publication={} native_generation={} held_at_us={} baseline_us={} ending_us={} old_senders={:?} ending_senders={:?}",
+                        held.admission, binding.expected.track_id(pulsebeam::entity::TrackKind::Video, "video").as_str(),
+                        held.baseline.generation, held.held_at_us, held.baseline.timestamp_us, ending.timestamp_us,
+                        held.baseline.outbound_video, ending.outbound_video));
+                    witness.reach("previous-generation-in-flight");
+                }
+                // Retire only after the real old sender's held-media witness.
+                // Waiting for evidence must not start the product recovery clock.
+                let handle = handles.get_mut(who).unwrap();
                 let bound = state
                     .bindings
                     .iter_mut()
@@ -706,13 +759,6 @@ async fn execute_inner(
                 handle.retirement_deadline =
                     matches!(op, Op::Crash(_)).then(|| Instant::now() + CRASH_RETIREMENT_BUDGET);
                 handle.shared.pending_ops.lock().unwrap().restart();
-                if let Some(tx) = held_tx.get(&(*i + 1)) {
-                    ensure!(
-                        handle.tx_bytes() > *tx,
-                        "no previous-generation traffic produced while link held"
-                    );
-                    witness.reach("previous-generation-in-flight");
-                }
                 handle.send_command(if matches!(op, Op::Crash(_)) {
                     ParticipantCmd::Drop
                 } else {
@@ -771,15 +817,52 @@ async fn execute_inner(
             }
             Op::Hold(i) => {
                 let who = name(*i);
+                let held_at_us = super::super::native::now_us()?;
                 state.holds.insert(*i, Instant::now());
-                held_tx.insert(*i, handles[who].tx_bytes());
                 turmoil::hold(ips[who], ips["server"]);
+                if *i > 0 {
+                    let before =
+                        observation(&handles[who]).context("held publisher observation")?;
+                    let generation = before
+                        .snapshot
+                        .generation
+                        .context("held native generation")?
+                        .get();
+                    let admission = before.admission.context("held source admission")?;
+                    let participant_id = handles[who]
+                        .participant_id()
+                        .context("held source identity")?;
+                    let baseline = tokio::time::timeout(Duration::from_secs(2), async {
+                        loop {
+                            let sample = handles[who].shared.statistics.lock().unwrap().clone();
+                            if let Some(sample) = sample
+                                && sample.generation == generation
+                                && sample.timestamp_us > held_at_us
+                                && sample.has_video_sender("v0")
+                            {
+                                break Ok::<_, anyhow::Error>(sample);
+                            }
+                            state.wait(handles, Duration::from_millis(10)).await?;
+                        }
+                    })
+                    .await
+                    .context("no fresh native video sender report after hold")??;
+                    held_media.insert(
+                        *i,
+                        HeldNativeMedia {
+                            participant_id,
+                            admission,
+                            held_at_us,
+                            baseline,
+                        },
+                    );
+                }
             }
             Op::Release(i) => {
                 let who = name(*i);
                 turmoil::release(ips[who], ips["server"]);
                 state.holds.remove(i);
-                held_tx.remove(i);
+                held_media.remove(i);
                 state.recovery_at = state.recovery_at.max(Instant::now());
                 if *i > 0 && state.admitting.contains(who) {
                     let previous = state
@@ -961,9 +1044,36 @@ async fn recover(
     }
     // Withdrawal is valid, but the final positive claim must not be vacuous.
     ensure!(!intended.is_empty(), "empty final media oracle");
+    // Bind data-plane freshness to the SAME independent admission that
+    // supplies the expected publication ID, not a reusable logical publisher.
+    let origins = intended
+        .iter()
+        .map(|(_, id)| {
+            let binding = state
+                .bindings
+                .iter()
+                .rev()
+                .find(|binding| binding.expected.id.as_str() == *id && binding.retired.is_none())
+                .context("intended media admission binding")?;
+            let admission = binding
+                .expected
+                .connection
+                .context("intended media HTTP admission")?;
+            Ok(super::super::provenance::source_key(
+                &admission.to_string(),
+                "v0",
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
     let before = intended
         .iter()
-        .map(|(receiver, id)| decoded(handles, receiver, id))
+        .zip(&origins)
+        .map(|((receiver, _), origin)| {
+            handles[*receiver]
+                .video_rx()
+                .decoded_from_incarnation(origin)
+                .map_or(0, |decoded| decoded.frames)
+        })
         .collect::<Vec<_>>();
     let expected_tracks = state
         .desired_tracks
@@ -1007,16 +1117,25 @@ async fn recover(
                                     .collect::<BTreeSet<_>>()
                                     == expected_tracks
                             }))
-                        && intended.iter().zip(&before).all(|((receiver, id), count)| {
-                            handles[*receiver]
-                                .video_rx()
-                                .require_decoded_from(id, *count, 1)
-                                .is_ok()
+                        && intended.iter().zip(&origins).zip(&before).all(|(((receiver, _), origin), count)| {
+                            handles[*receiver].video_rx().require_decoded_from_incarnation(origin, *count, 1).is_ok()
                         }) =>
                 {
                     break Ok::<_, anyhow::Error>(());
                 }
-                Ok(()) => {}
+                Ok(()) => {
+                    let progress = intended
+                        .iter()
+                        .zip(&origins)
+                        .zip(&before)
+                        .map(|(((receiver, id), origin), count)| {
+                            (*receiver, id, origin, *count, handles[*receiver].video_rx().decoded_from_incarnation(origin).map_or(0, |decoded| decoded.frames))
+                        })
+                        .collect::<Vec<_>>();
+                    last = Some(anyhow::anyhow!(
+                        "control converged; waiting for intended track acceptance and fresh decoded media: {progress:?}"
+                    ));
+                }
                 Err(error) => last = Some(error),
             }
             state.wait(handles, Duration::from_millis(20)).await?;

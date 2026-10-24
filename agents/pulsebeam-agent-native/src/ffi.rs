@@ -115,6 +115,7 @@ impl Agent {
             Config {
                 session,
                 media: config.media,
+                decoded_video_observer: None,
             },
             Host::new(Box::new(reqwest::Client::new())),
         )

@@ -217,6 +217,7 @@ fn fixture() -> (ControlStateOracle, Observation, ClientObservation) {
             admission: Some(receiver_connection),
             snapshot,
             sent_intent_revision: Some(1),
+            last_successfully_sent_wire_revision: Some(1),
             video_operation: 0,
             accepted: Some(desired.clone()),
             submitted: desired,

@@ -452,9 +452,10 @@ fn stable_receiver_decodes_after_the_first_pli_response_is_lost_test() {
                 quality: VideoQuality::min_frames(1),
             },
             Step::RecoverVideoAfterLostKeyframe {
-                description: "Reset decoding, send one native PLI, and discard its first response",
+                description: "Reset decoding, send one native PLI, and discard its first q response",
                 publisher: "source",
                 subscriber: "viewer",
+                encoding: "q",
             },
             Step::Run {
                 description: "Observe server retry and the returned usable keyframe",
@@ -603,61 +604,60 @@ fn dependency_descriptor_stream_survives_congestion_test() {
         ]);
 }
 
-/// SFrame/E2EE: the publisher's payload is opaque, so the SFU's H.264 probe finds
-/// no IDR, SPS, or PPS — the Dependency Descriptor is the only forwarding signal.
-/// A subscribe forces a switch-up, which must replay the DD keyframe segment
-/// despite the opaque payload; before the DD-native keyframe/cache path that
-/// replay returned nothing and the subscriber would have been starved. This is the
-/// end-to-end proof that the SFU forwards on DD alone.
+/// A single L1T3 source carries native Dependency Descriptor metadata. A
+/// subscribe forces a switch-up, which must replay the DD keyframe segment;
+/// before the DD-native keyframe/cache path that replay returned nothing and
+/// the subscriber would have been starved. Opaque-payload interpretation is
+/// covered below the native sender boundary, where ciphertext is valid input.
 #[test]
-fn opaque_dependency_descriptor_stream_forwards_on_dd_alone_test() {
+fn dependency_descriptor_stream_forwards_from_descriptor_metadata_test() {
     LocalNodeSim::new()
         .with_room(
             Room::new("room1")
-                .with_participant(Participant::publisher("alice", &["q"]).with_opaque_dd(3))
+                .with_participant(Participant::publisher("alice", &["q"]).with_temporal_dd(3))
                 .with_participant(Participant::subscriber("bob")),
         )
         .run(vec![
             Step::Run {
-                description: "Alice publishes an opaque (E2EE) L1T3 DD stream; Bob subscribes",
+                description: "Alice publishes an L1T3 DD stream; Bob subscribes",
                 duration: Duration::from_secs(10),
             },
             Step::CheckVideoReceivedFrom {
-                description: "Bob keeps receiving forwarded frames with no readable bitstream",
+                description: "Bob keeps receiving frames selected from native DD metadata",
                 participant: "bob",
                 publisher: "alice",
                 min_frames: 120,
             },
             Step::CheckKeyframeRequests {
-                // If the encrypted stream did not forward decodably, the SFU/decoder
-                // would hammer the publisher with PLIs (the fps→1 "storm" seen in
-                // the browser). A healthy stream needs only a handful.
-                description: "no PLI storm on the opaque stream",
+                // If DD forwarding did not remain decodable, the SFU/decoder
+                // would hammer the publisher with PLIs. A healthy stream needs
+                // only a handful.
+                description: "no PLI storm on the DD stream",
                 participant: "alice",
                 max: 10,
             },
         ]);
 }
 
-/// The encrypted-frame path under real loss — the conditions that surfaced the
-/// browser's fps→1 collapse and constant-PLI storm. The SFU forwards on the DD
-/// alone (opaque payload), the subscriber reassembles from raw RTP, and both the
-/// frame rate must hold and keyframe requests must stay bounded. This is the sim
-/// guard for the whole class of "DD-only + encrypted" reassembly bugs.
+/// Native three-encoding L1T1 simulcast carries DD metadata under real loss.
+/// The subscriber reassembles from raw RTP, and both frame rate and keyframe
+/// requests must stay bounded. Ciphertext-specific interpretation remains
+/// covered at the SFU packet/cache boundary rather than being fed illegally
+/// into libwebrtc's pre-packetization H264 source.
 #[test]
-fn opaque_dependency_descriptor_holds_framerate_under_loss_test() {
+fn dependency_descriptor_simulcast_holds_framerate_under_loss_test() {
     LocalNodeSim::new()
         .with_link(LinkProfile::cellular())
         .with_room(
             Room::new("room1")
                 .with_participant(
-                    Participant::publisher("alice", &["q", "h", "f"]).with_opaque_dd(3),
+                    Participant::publisher("alice", &["q", "h", "f"]).with_temporal_dd(1),
                 )
                 .with_participant(Participant::subscriber("bob")),
         )
         .run(vec![
             Step::Run {
-                description: "Establish the opaque stream over lossy cellular",
+                description: "Establish DD simulcast over lossy cellular",
                 duration: Duration::from_secs(20),
             },
             Step::SubscribeAll {
@@ -737,6 +737,34 @@ fn marker_only_publisher_streams_to_a_dd_subscriber_test() {
 /// This is separate from the encoded-capture/independent-decoder oracle above:
 /// neither its frame assertions nor its currently failing result are replaced.
 #[test]
+fn same_receiver_encoded_and_native_decoded_video_test() {
+    LocalNodeSim::new()
+        .with_room(
+            Room::new("room1")
+                .with_participant(Participant::publisher("alice", &["q", "h", "f"]))
+                .with_participant(Participant::subscriber("bob").with_encoded_and_native_decoded_video()),
+        )
+        .run(vec![
+            Step::Run {
+                description: "Deliver both actual observer boundaries from the same native receiver",
+                duration: Duration::from_secs(10),
+            },
+            Step::CheckVideoDecodedFromInterval {
+                description: "Authenticated encoded AUs remain independently decodable",
+                participant: "bob", publisher: "alice", min_frames: 150, min_resolution: (1280, 720),
+            },
+            Step::CheckNativeDecodedVideo {
+                description: "Actual native decoder delivers changing fresh 720p I420 with advancing stats",
+                participant: "bob", dimensions: (1280, 720), min_fresh_frames: 150,
+            },
+            Step::CheckNativeVideoDecodedFromInterval {
+                description: "Native pixels correlate to Alice's actual current HTTP admission",
+                participant: "bob", publisher: "alice", min_frames: 150, min_resolution: (1280, 720),
+            },
+        ]);
+}
+
+#[test]
 fn marker_only_simulcast_reaches_native_decoded_video_test() {
     LocalNodeSim::new()
         .with_room(
@@ -764,7 +792,9 @@ fn fast_initial_ramp_up_on_good_network_test() {
         .with_room(
             Room::new("room1")
                 .with_participant(Participant::publisher("alice", &["q", "h", "f"]))
-                .with_participant(Participant::subscriber("bob")),
+                .with_participant(
+                    Participant::subscriber("bob").with_encoded_and_native_decoded_video(),
+                ),
         )
         .run(vec![
             Step::Run {
@@ -789,6 +819,12 @@ fn fast_initial_ramp_up_on_good_network_test() {
                 description: "Bob received renderable frames throughout ramp",
                 participant: "bob",
                 quality: VideoQuality::min_frames(200).allow_gaps(3),
+            },
+            Step::CheckNativeDecodedVideo {
+                description: "Bob received native-decoded 720p frames throughout ramp",
+                participant: "bob",
+                dimensions: (1280, 720),
+                min_fresh_frames: 200,
             },
         ]);
 }
@@ -957,7 +993,7 @@ fn cross_shard_simulcast_switching_stays_decodable_test() {
     LocalNodeSim::new()
         .with_room(
             Room::new("room1")
-                .with_participant(Participant::publisher("alice", &["f", "h", "q"]))
+                .with_participant(Participant::publisher("alice", &["q", "h", "f"]))
                 .with_participant(Participant::subscriber("bob")),
         )
         .run(vec![

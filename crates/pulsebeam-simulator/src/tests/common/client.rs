@@ -3,6 +3,7 @@ use super::media::{
     FixtureEncoding, KeyframeRecoveryProbe, VbrProfile, VbrSource, VideoSource, video_frames,
 };
 use super::native::NativeHost;
+use super::provenance::{self, FixturePublisher, FixturePublishers};
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper_util::{client::legacy::Client, rt::TokioExecutor};
@@ -47,6 +48,7 @@ pub struct SimClientBuilder {
     /// Request an actual stock-encoder temporal fixture. Zero disables DD.
     temporal_dd: Option<u8>,
     video_receive_mode: pulsebeam_agent_native::ReceiveMode,
+    native_playback_only: bool,
     audio_receive_mode: pulsebeam_agent_native::ReceiveMode,
     audio_input: AudioInput,
     /// Publish audio at this loudness, in negative dBov. `None` publishes no audio.
@@ -64,7 +66,7 @@ pub struct SimClientBuilder {
     keyframe_recovery: Arc<Mutex<KeyframeRecoveryProbe>>,
     initial_topics: pulsebeam_agent_native::agent_core::TopicRegistrations,
     quality_references: Arc<Mutex<BTreeMap<String, &'static QualityVideoReference>>>,
-    h264_publishers: Arc<Mutex<BTreeSet<String>>>,
+    h264_publishers: Arc<Mutex<FixturePublishers>>,
 }
 
 /// Exact encoded-input evidence. Pixel-quality references are optional: generic
@@ -192,22 +194,7 @@ fn quality_ladder_reference(
 }
 
 fn canonical_annex_b(data: &[u8]) -> Vec<u8> {
-    let mut canonical = Vec::with_capacity(data.len());
-    let mut index = 0;
-    while index < data.len() {
-        let start_code_len = if data.get(index..index.saturating_add(4)) == Some(&[0, 0, 0, 1]) {
-            4
-        } else if data.get(index..index.saturating_add(3)) == Some(&[0, 0, 1]) {
-            3
-        } else {
-            canonical.push(data[index]);
-            index = index.saturating_add(1);
-            continue;
-        };
-        canonical.extend_from_slice(&[0, 0, 0, 1]);
-        index = index.saturating_add(start_code_len);
-    }
-    canonical
+    provenance::inspect(data).map_or_else(|_| data.to_vec(), |(_, canonical)| canonical)
 }
 
 fn http_base_uri(ip: IpAddr, port: u16) -> String {
@@ -242,6 +229,7 @@ impl SimClientBuilder {
             vbr_profile: None,
             temporal_dd: None,
             video_receive_mode: pulsebeam_agent_native::ReceiveMode::Encoded,
+            native_playback_only: false,
             audio_receive_mode: pulsebeam_agent_native::ReceiveMode::Decoded,
             audio_input: AudioInput::Pcm,
             audio_level_dbov: None,
@@ -254,7 +242,7 @@ impl SimClientBuilder {
             keyframe_recovery: Arc::default(),
             initial_topics: Default::default(),
             quality_references: Arc::new(Mutex::new(BTreeMap::new())),
-            h264_publishers: Arc::new(Mutex::new(BTreeSet::new())),
+            h264_publishers: Arc::new(Mutex::new(BTreeMap::new())),
         })
     }
 
@@ -336,6 +324,11 @@ impl SimClientBuilder {
         self
     }
 
+    pub fn with_native_playback_only(mut self, enabled: bool) -> Self {
+        self.native_playback_only = enabled;
+        self
+    }
+
     pub fn with_corrupt_video_payload(mut self) -> Self {
         self.corrupt_video_payload = true;
         self
@@ -401,7 +394,10 @@ impl SimClientBuilder {
         self
     }
 
-    pub(crate) fn with_h264_publishers(mut self, publishers: Arc<Mutex<BTreeSet<String>>>) -> Self {
+    pub(crate) fn with_h264_publishers(
+        mut self,
+        publishers: Arc<Mutex<FixturePublishers>>,
+    ) -> Self {
         self.h264_publishers = publishers;
         self
     }
@@ -527,7 +523,56 @@ impl SimClientBuilder {
                 })
                 .collect(),
         };
+        // Install the complete native callback collector before creating or
+        // attaching a receiver. It never depends on catalog assignments.
+        let video_rx = self
+            .video_rx
+            .clone()
+            .unwrap_or_else(|| Arc::new(Mutex::new(VideoReceiveLog::default())));
+        let dual =
+            self.video_receive_mode == pulsebeam_agent_native::ReceiveMode::EncodedAndDecoded;
+        {
+            let mut log = video_rx.lock().unwrap();
+            anyhow::ensure!(
+                !self.native_playback_only || (dual && !self.corrupt_video_payload),
+                "native playback needs dual observations and cannot corrupt only a probe"
+            );
+            log.native_callback_enabled = true;
+            log.native_origin_enabled = dual;
+            log.native_playback_only = self.native_playback_only;
+        }
         let mut config = Config::new(session);
+        let callback_log = video_rx.clone();
+        let callback_clock = super::native::callback_clock()?;
+        let callback_failures = video_rx
+            .lock()
+            .unwrap()
+            .native_decoded
+            .callback_failure_counter();
+        config.decoded_video_observer = Some(pulsebeam_agent_native::DecodedVideoObserver::new(
+            move |observation| {
+                // Never wait on application log retention from a native
+                // callback. Any inability to collect a fact is a sticky failure.
+                let Ok(mut log) = callback_log.try_lock() else {
+                    callback_failures.fetch_add(1, std::sync::atomic::Ordering::Release);
+                    return;
+                };
+                let Ok(at) = callback_clock.project(observation.native_observed_at_us) else {
+                    callback_failures.fetch_add(1, std::sync::atomic::Ordering::Release);
+                    return;
+                };
+                match observation.frame {
+                    Ok(frame) if dual => {
+                        log.record_dual_native_decoded(&frame, at);
+                    }
+                    Ok(frame) => log.record_native_decoded(&frame, at),
+                    Err(error) => {
+                        log.native_decoded.malformed_callback(&observation.track);
+                        let _ = error; // Invalid is cumulative, never a fabricated frame.
+                    }
+                }
+            },
+        ));
         config.media = MediaConfig {
             audio_input: self.audio_input,
             video_input: VideoInput::EncodedH264,
@@ -608,12 +653,6 @@ impl SimClientBuilder {
             .participant_id
             .clone()
             .expect("connected snapshot has an identity");
-        if self.publishes_video && !self.opaque_payload {
-            self.h264_publishers
-                .lock()
-                .unwrap()
-                .insert(participant_id.clone());
-        }
         let reference = if let Some((source, layer)) = self.quality_video {
             Some(if encodings.len() > 1 {
                 quality_ladder_reference(source)
@@ -636,9 +675,6 @@ impl SimClientBuilder {
                 .insert(participant_id, reference);
         }
 
-        let video_rx = self
-            .video_rx
-            .unwrap_or_else(|| Arc::new(Mutex::new(VideoReceiveLog::default())));
         let audio_rx = self
             .audio_rx
             .unwrap_or_else(|| Arc::new(Mutex::new(AudioReceiveLog::default())));
@@ -658,6 +694,7 @@ impl SimClientBuilder {
             video_rx,
             audio_rx,
             quality_references: self.quality_references.clone(),
+            h264_publishers: self.h264_publishers.clone(),
             corrupt_video_payload: self.corrupt_video_payload,
             keyframe_recovery: self.keyframe_recovery.clone(),
             snapshots: {
@@ -679,6 +716,7 @@ impl SimClientBuilder {
                 video_receive_mode: self.video_receive_mode,
                 audio_receive_mode: self.audio_receive_mode,
                 publishes_video: self.publishes_video,
+                opaque_payload: self.opaque_payload,
                 video_sources,
                 vbr_source,
                 audio_level_dbov: self.audio_level_dbov,
@@ -699,9 +737,15 @@ impl SimClientBuilder {
 #[derive(Default, Debug, Clone)]
 pub struct VideoReceiveLog {
     pub native_decoded: super::native_video::NativeDecodedVideoLog,
+    pub native_origin: super::native_origin::NativeOriginCorrelation,
+    native_origin_enabled: bool,
+    native_callback_enabled: bool,
+    native_playback_only: bool,
     pub by_publisher: BTreeMap<String, u64>,
     pub decoded_by_publisher: BTreeMap<String, DecodedVideoStream>,
     pub decoded_by_track: BTreeMap<String, u64>,
+    /// Successful real decodes keyed by the wire-proven source admission/slot.
+    pub decoded_by_incarnation: BTreeMap<String, DecodedVideoStream>,
     /// Native frames without unambiguous content-origin evidence. They cannot
     /// establish absence of any particular publisher.
     pub unattributed_frames: u64,
@@ -1027,22 +1071,38 @@ impl VideoReceiveStats {
 }
 
 impl VideoReceiveLog {
-    fn record_native_decoded(&mut self, frame: &pulsebeam_agent_native::RemoteFrame) {
-        let pulsebeam_agent_native::OutputFrame::I420 { frame: pixels } = &frame.frame else {
+    fn record_native_decoded(&mut self, frame: &pulsebeam_agent_native::RemoteFrame, at: Instant) {
+        let pulsebeam_agent_native::OutputFrame::I420 { .. } = &frame.frame else {
             panic!("native decoded video requires actual I420 output");
         };
-        self.native_decoded.observe(frame, Instant::now());
+        self.native_decoded.observe(frame, at);
         self.unattributed_frames += 1;
         // Count real decoded output for shared progress/timing reports. There is
         // no encoded keyframe classification or corpus-origin proof on this path.
-        self.record_decoded(
-            None,
-            usize::try_from(pixels.width).unwrap(),
-            usize::try_from(pixels.height).unwrap(),
-            None,
-            false,
-            None,
-        );
+        self.record_arrival(at);
+        self.frames = self.frames.saturating_add(1);
+    }
+
+    pub fn native_decoded_only(&self) -> bool {
+        self.native_playback_only
+            || (self.native_decoded.has_observations() && !self.native_origin_enabled)
+    }
+
+    fn record_dual_native_decoded(
+        &mut self,
+        frame: &pulsebeam_agent_native::RemoteFrame,
+        now: Instant,
+    ) {
+        let nontrivial = self.native_decoded.observe(frame, now);
+        self.native_origin.decoded(frame, now, nontrivial);
+        if self.native_playback_only {
+            // Shared progress reports count actual native output, not encoded
+            // identity samples or a now-disabled independent test decoder.
+            self.record_arrival(now);
+            self.frames = self.frames.saturating_add(1);
+        }
+        // Do not count a second copy of the same picture in encoded quality,
+        // independent-decode totals, or unattributed encoded-source evidence.
     }
 
     pub fn frames_from(&self, publisher: &str) -> u64 {
@@ -1071,6 +1131,31 @@ impl VideoReceiveLog {
         Ok(decoded)
     }
 
+    pub fn decoded_from_incarnation(&self, origin: &str) -> Option<DecodedVideoStream> {
+        self.decoded_by_incarnation.get(origin).copied()
+    }
+
+    pub fn require_decoded_from_incarnation(
+        &self,
+        origin: &str,
+        baseline_frames: u64,
+        min_frames: u64,
+    ) -> anyhow::Result<DecodedVideoStream> {
+        anyhow::ensure!(
+            min_frames > 0,
+            "incarnation delivery needs a positive minimum"
+        );
+        let decoded = self
+            .decoded_from_incarnation(origin)
+            .ok_or_else(|| anyhow::anyhow!("{origin}: no independently decoded incarnation"))?;
+        let frames = decoded.frames.saturating_sub(baseline_frames);
+        anyhow::ensure!(
+            frames >= min_frames,
+            "{origin}: decoded {frames} incarnation frames since baseline {baseline_frames}, expected at least {min_frames}"
+        );
+        Ok(decoded)
+    }
+
     pub fn require_native_temporal_indices(
         &self,
         generation: u64,
@@ -1092,6 +1177,10 @@ impl VideoReceiveLog {
     }
 
     pub fn require_not_received_from(&self, publisher: &str) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.native_origin_enabled || !self.native_decoded.has_observations(),
+            "{publisher}: bounded positive native-origin receipts cannot prove cumulative native source absence"
+        );
         anyhow::ensure!(
             self.unattributed_frames == 0,
             "{publisher}: cannot prove source absence with {} unattributed native frames",
@@ -1224,16 +1313,7 @@ impl VideoReceiveLog {
             pulsebeam_testdata::QualityVideoLayer,
         )>,
     ) {
-        let now = Instant::now();
-        if let Some(previous) = self.last_frame_at {
-            let gap = now.saturating_duration_since(previous);
-            self.longest_frame_gap = self.longest_frame_gap.max(gap);
-            if gap > FREEZE_THRESHOLD {
-                self.frozen_time = self.frozen_time.saturating_add(gap);
-            }
-        }
-        self.first_frame_at.get_or_insert(now);
-        self.last_frame_at = Some(now);
+        self.record_arrival(Instant::now());
         self.frames = self.frames.saturating_add(1);
         if is_keyframe {
             self.keyframes = self.keyframes.saturating_add(1);
@@ -1244,6 +1324,18 @@ impl VideoReceiveLog {
                 .or_default()
                 .record(width, height, reference, quality_identity);
         }
+    }
+
+    fn record_arrival(&mut self, now: Instant) {
+        if let Some(previous) = self.last_frame_at {
+            let gap = now.saturating_duration_since(previous);
+            self.longest_frame_gap = self.longest_frame_gap.max(gap);
+            if gap > FREEZE_THRESHOLD {
+                self.frozen_time = self.frozen_time.saturating_add(gap);
+            }
+        }
+        self.first_frame_at.get_or_insert(now);
+        self.last_frame_at = Some(now);
     }
 
     fn record_decoder_error(&mut self, publisher: Option<&str>, is_keyframe: bool) {
@@ -1483,11 +1575,71 @@ fn matching_video_inputs(
         .collect()
 }
 
+#[cfg(test)]
 fn record_video_frame(
     log: &Arc<Mutex<VideoReceiveLog>>,
     quality_references: &Arc<Mutex<BTreeMap<String, &'static QualityVideoReference>>>,
     decoder: &mut H264ReferenceDecoder,
     decoder_ready: &mut bool,
+    retained_publisher: &mut Option<String>,
+    frame: pulsebeam_agent_native::RemoteFrame,
+    corrupt_payload: bool,
+) {
+    record_fixture_video_frame(
+        log,
+        FixtureOracle {
+            references: quality_references,
+            publishers: None,
+        },
+        decoder,
+        decoder_ready,
+        retained_publisher,
+        frame,
+        corrupt_payload,
+    );
+}
+
+struct FixtureOracle<'a> {
+    references: &'a Arc<Mutex<BTreeMap<String, &'static QualityVideoReference>>>,
+    publishers: Option<&'a FixturePublishers>,
+}
+
+fn authenticated_fixture_origin(payload: &[u8], publishers: &FixturePublishers) -> Option<String> {
+    let (origin, bare) = provenance::inspect(payload).ok()?;
+    let origin = origin?;
+    publishers
+        .get(&origin)?
+        .frames
+        .contains(&bare)
+        .then_some(origin)
+}
+
+fn record_native_fixture_sample(
+    log: &Arc<Mutex<VideoReceiveLog>>,
+    publishers: &FixturePublishers,
+    frame: &pulsebeam_agent_native::RemoteFrame,
+) {
+    let pulsebeam_agent_native::OutputFrame::H264 { payload, .. } = &frame.frame else {
+        panic!("native source sample requires an encoded access unit");
+    };
+    let origin = authenticated_fixture_origin(payload, publishers);
+    let publisher = origin
+        .as_ref()
+        .and_then(|origin| publishers.get(origin))
+        .map(|source| source.participant_id.as_str());
+    let mut observed = log.lock().unwrap();
+    observed.native_origin.encoded(frame, origin.as_deref());
+    // Retain observed-slot/encoded diagnostics, but neither independently decode
+    // nor turn polling loss into an application-generated keyframe request.
+    observed.record(publisher, frame);
+}
+
+fn record_fixture_video_frame(
+    log: &Arc<Mutex<VideoReceiveLog>>,
+    oracle: FixtureOracle<'_>,
+    decoder: &mut H264ReferenceDecoder,
+    decoder_ready: &mut bool,
+    retained_publisher: &mut Option<String>,
     frame: pulsebeam_agent_native::RemoteFrame,
     corrupt_payload: bool,
 ) {
@@ -1497,13 +1649,46 @@ fn record_video_frame(
     else {
         panic!("encoded video observer returned another media kind");
     };
-    let matches = matching_video_inputs(payload, &quality_references.lock().unwrap());
-    let publisher = if matches.len() == 1 {
-        Some(matches[0].0.as_str())
-    } else {
-        None
+    let inspected = provenance::inspect(payload);
+    let marker = inspected
+        .as_ref()
+        .ok()
+        .and_then(|(identity, _)| identity.as_deref());
+    let admitted = marker.and_then(|source| oracle.publishers?.get(source));
+    let authenticated = admitted.filter(|source| {
+        inspected
+            .as_ref()
+            .is_ok_and(|(_, bare)| source.frames.contains(bare))
+    });
+    let authenticated_source = authenticated.map(|source| source.participant_id.as_str());
+    let mut matches = matching_video_inputs(payload, &oracle.references.lock().unwrap());
+    if oracle.publishers.is_some() || marker.is_some() || inspected.is_err() {
+        matches.retain(|(source, _, _)| authenticated_source == Some(source.as_str()));
+        // Every runtime fixture AU must prove its own origin. Even a familiar
+        // marker cannot authenticate unknown picture bytes or an unmarked AU.
+        *retained_publisher = authenticated_source.map(str::to_owned);
+    } else if matches.len() == 1 {
+        *retained_publisher = Some(matches[0].0.clone());
+    }
+    // Pure unmarked oracle regressions retain only a previously observed,
+    // unique content identity. Runtime fixture attribution above is stricter:
+    // every AU needs both its actual wire marker and known source bytes.
+    // Neither path infers an origin from a catalog or an unmatched first frame.
+    let publisher = matches
+        .first()
+        .filter(|_| matches.len() == 1)
+        .map(|value| value.0.as_str())
+        .or(retained_publisher.as_deref());
+    let missing_dependency = {
+        let mut observed = log.lock().unwrap();
+        if observed.native_origin_enabled {
+            observed
+                .native_origin
+                .encoded(&frame, marker.filter(|_| authenticated.is_some()));
+        }
+        observed.record(publisher, &frame)
     };
-    if log.lock().unwrap().record(publisher, &frame) {
+    if missing_dependency {
         *decoder_ready = false;
     }
     let is_keyframe = *keyframe || annex_b_has_nal_type(payload, 5);
@@ -1537,6 +1722,7 @@ fn record_video_frame(
         reference.as_ref().map(|(reference, _, _)| *reference),
     );
     let decoded_ok = decode_result.is_ok();
+    tracing::trace!(target: "pulsebeam_fixture_video", metadata = ?frame.metadata, publisher = ?publisher, wire_origin = ?marker, authenticated_source = ?authenticated_source, corpus_indices = ?matches.iter().map(|(publisher, _, index)| (publisher, index)).collect::<Vec<_>>(), is_keyframe, decoded_ok, "fixture receive");
     match decode_result {
         Ok(observation) => {
             let mut log = log.lock().unwrap();
@@ -1560,6 +1746,19 @@ fn record_video_frame(
                 identity,
             );
             *log.decoded_by_track.entry(frame.track.track_id.clone()).or_default() += 1;
+            if let Some(origin) = marker
+                && authenticated.is_some()
+            {
+                log.decoded_by_incarnation
+                    .entry(origin.to_owned())
+                    .or_default()
+                    .record(
+                        observation.width,
+                        observation.height,
+                        observation.reference_error,
+                        identity,
+                    );
+            }
         }
         Err(DecodeError::ReferenceMismatch(_)) => {
             let mut log = log.lock().unwrap();
@@ -1641,7 +1840,15 @@ mod tests {
             let mut frame = owned_video(u64::try_from(index).unwrap(), 90_000, true, payload);
             frame.track.track_id = "foreign-catalog-name".into();
             let mut decoder = H264ReferenceDecoder::new(publisher, "unit input");
-            record_video_frame(&log, &references, &mut decoder, &mut false, frame, false);
+            record_video_frame(
+                &log,
+                &references,
+                &mut decoder,
+                &mut false,
+                &mut None,
+                frame,
+                false,
+            );
             assert_eq!(log.lock().unwrap().frames_from(publisher), 1);
         }
         let duplicates = Arc::new(Mutex::new(duplicates));
@@ -1651,6 +1858,7 @@ mod tests {
             &duplicates,
             &mut decoder,
             &mut false,
+            &mut None,
             owned_video(10, 90_000, true, quarter.frames[0].to_vec()),
             false,
         );
@@ -1658,6 +1866,40 @@ mod tests {
         assert_eq!(observed.frames_from("first"), 0);
         assert_eq!(observed.frames_from("second"), 0);
         assert_eq!(observed.unattributed_frames, 1);
+    }
+
+    #[test]
+    fn decoder_errors_retain_only_payload_authenticated_stream_identity() {
+        use pulsebeam_testdata::{QualityVideoLayer::P180, QualityVideoSource::Zero};
+        let reference = quality_video_reference(Zero, P180);
+        let references = Arc::new(Mutex::new(BTreeMap::from([("source".into(), reference)])));
+        let log = Arc::new(Mutex::new(VideoReceiveLog::default()));
+        let mut decoder = H264ReferenceDecoder::new("source", "unit input");
+        let mut decoder_ready = false;
+        let mut retained_publisher = None;
+        record_video_frame(
+            &log,
+            &references,
+            &mut decoder,
+            &mut decoder_ready,
+            &mut retained_publisher,
+            owned_video(1, 90_000, true, reference.frames[0].to_vec()),
+            false,
+        );
+        assert_eq!(retained_publisher.as_deref(), Some("source"));
+
+        record_video_frame(
+            &log,
+            &references,
+            &mut decoder,
+            &mut decoder_ready,
+            &mut retained_publisher,
+            owned_video(1, 93_000, true, vec![0, 0, 0, 1, 0x65, 0xff]),
+            true,
+        );
+        let observed = log.lock().unwrap();
+        assert_eq!(observed.frames_from("source"), 2);
+        assert!(observed.decoded_from("source").unwrap().decoder_errors > 0);
     }
 
     #[test]
@@ -1698,12 +1940,277 @@ mod tests {
             &references,
             &mut H264ReferenceDecoder::new("camera", "unit input"),
             &mut false,
+            &mut None,
             frame,
             false,
         );
         let observed = log.lock().unwrap();
         assert_eq!(observed.frames_from("camera"), 1);
         assert_eq!(observed.frames_from("protected"), 0);
+    }
+
+    #[test]
+    fn native_playback_progress_counts_actual_native_callbacks() {
+        let mut log = VideoReceiveLog {
+            native_playback_only: true,
+            ..VideoReceiveLog::default()
+        };
+        let mut frame = owned_video(1, 90_000, true, vec![]);
+        frame.metadata.rtp_timestamp = Some(90_000);
+        frame.frame = pulsebeam_agent_native::OutputFrame::I420 {
+            frame: pulsebeam_agent_native::I420Frame {
+                width: 4,
+                height: 4,
+                timestamp_us: 0,
+                data: [16, 200].repeat(12),
+                rotation_degrees: 0,
+            },
+        };
+        log.record_dual_native_decoded(&frame, Instant::now());
+        assert_eq!(log.frames, 1);
+        assert!(log.first_frame_at.is_some());
+        assert!(log.decoded_by_publisher.is_empty());
+    }
+
+    #[test]
+    fn wire_markers_disambiguate_identical_sources_without_receiver_or_catalog_hints() {
+        let input = generic_video_reference(&[None]);
+        let references = Arc::new(Mutex::new(BTreeMap::from([
+            ("left".into(), input),
+            ("right".into(), input),
+        ])));
+        let codebook: BTreeSet<_> = input
+            .frames
+            .iter()
+            .map(|frame| canonical_annex_b(frame))
+            .collect();
+        let publishers = BTreeMap::from([
+            (
+                "left".into(),
+                FixturePublisher {
+                    participant_id: "left".into(),
+                    frames: codebook.clone(),
+                },
+            ),
+            (
+                "right".into(),
+                FixturePublisher {
+                    participant_id: "right".into(),
+                    frames: codebook,
+                },
+            ),
+        ]);
+        let log = Arc::new(Mutex::new(VideoReceiveLog::default()));
+        let mut decoder = H264ReferenceDecoder::new("wire", "fixture");
+        let mut ready = false;
+        let mut retained = None;
+        // Keep the exact same native receiver and SSRC while changing sources.
+        // A familiar marker with unknown bytes, and an unmarked AU after a
+        // valid source, must both lose attribution rather than inherit it.
+        let unmatched = generic_video_reference(&[Some("f".into())]);
+        let cases = [
+            (Some("left"), &input.frames[0], Some("left")),
+            (Some("left"), &unmatched.frames[0], None),
+            (Some("right"), &input.frames[0], Some("right")),
+            (None, &input.frames[0], None),
+            (Some("right"), &input.frames[0], Some("right")),
+            (Some("unregistered"), &input.frames[0], None),
+        ];
+        let native_log = Arc::new(Mutex::new(VideoReceiveLog {
+            native_playback_only: true,
+            native_origin_enabled: true,
+            ..VideoReceiveLog::default()
+        }));
+        for (index, (publisher, payload, expected)) in cases.into_iter().enumerate() {
+            let payload = publisher.map_or_else(
+                || payload.to_vec(),
+                |source| provenance::stamp(payload, source),
+            );
+            assert_eq!(
+                authenticated_fixture_origin(&payload, &publishers).as_deref(),
+                expected
+            );
+            let frame = owned_video(1, u32::try_from(index).unwrap() * 90_000, true, payload);
+            record_native_fixture_sample(&native_log, &publishers, &frame);
+            record_fixture_video_frame(
+                &log,
+                FixtureOracle {
+                    references: &references,
+                    publishers: Some(&publishers),
+                },
+                &mut decoder,
+                &mut ready,
+                &mut retained,
+                frame,
+                false,
+            );
+            assert_eq!(retained.as_deref(), expected);
+        }
+        let native_log = native_log.lock().unwrap();
+        assert_eq!(
+            native_log.frames, 0,
+            "encoded samples are not decoded output"
+        );
+        assert_eq!(native_log.frames_from("left"), 1);
+        assert_eq!(native_log.frames_from("right"), 2);
+        assert_eq!(native_log.unattributed_frames, 3);
+        assert!(
+            native_log.decoded_by_publisher.is_empty(),
+            "source sampling does not independently decode"
+        );
+        assert!(
+            native_log.native_decoded_only(),
+            "encoded quality assertions cannot use source-only samples"
+        );
+        let log = log.lock().unwrap();
+        assert_eq!(log.unattributed_frames, 3);
+        assert_eq!(log.decoded_from("left").unwrap().frames, 1);
+        assert_eq!(log.decoded_from("right").unwrap().frames, 2);
+        assert!(log.decoded_from("unregistered").is_none());
+        assert!(
+            retained.is_none(),
+            "unknown markers must clear retained attribution"
+        );
+    }
+
+    #[test]
+    fn old_admission_decodes_cannot_satisfy_readmitted_source_progress() {
+        let input = generic_video_reference(&[None]);
+        let references = Arc::new(Mutex::new(BTreeMap::from([("source".into(), input)])));
+        let old = provenance::source_key("old-admission", "v0");
+        let new = provenance::source_key("new-admission", "v0");
+        let frames: BTreeSet<_> = input
+            .frames
+            .iter()
+            .map(|frame| canonical_annex_b(frame))
+            .collect();
+        let publishers = BTreeMap::from([
+            (
+                old.clone(),
+                FixturePublisher {
+                    participant_id: "source".into(),
+                    frames: frames.clone(),
+                },
+            ),
+            (
+                new.clone(),
+                FixturePublisher {
+                    participant_id: "source".into(),
+                    frames,
+                },
+            ),
+        ]);
+        let log = Arc::new(Mutex::new(VideoReceiveLog::default()));
+        let mut decoder = H264ReferenceDecoder::new("wire", "admission fixture");
+        let mut ready = false;
+        let mut retained = None;
+        let mut feed = |origin: &str, timestamp| {
+            record_fixture_video_frame(
+                &log,
+                FixtureOracle {
+                    references: &references,
+                    publishers: Some(&publishers),
+                },
+                &mut decoder,
+                &mut ready,
+                &mut retained,
+                owned_video(
+                    1,
+                    timestamp,
+                    true,
+                    provenance::stamp(&input.frames[0], origin),
+                ),
+                false,
+            );
+        };
+        feed(&old, 90_000);
+        let baseline = log.lock().unwrap().decoded_from("source").unwrap().frames;
+        feed(&old, 180_000);
+        assert!(
+            log.lock()
+                .unwrap()
+                .require_decoded_from("source", baseline, 1)
+                .is_ok(),
+            "the old logical-publisher-only witness would accept buffered old media"
+        );
+        assert!(
+            log.lock()
+                .unwrap()
+                .require_decoded_from_incarnation(&new, 0, 1)
+                .is_err()
+        );
+        assert_eq!(
+            log.lock()
+                .unwrap()
+                .decoded_from_incarnation(&old)
+                .unwrap()
+                .frames,
+            2
+        );
+        feed(&new, 270_000);
+        assert!(
+            log.lock()
+                .unwrap()
+                .require_decoded_from_incarnation(&new, 0, 1)
+                .is_ok()
+        );
+        assert!(
+            log.lock()
+                .unwrap()
+                .require_decoded_from_incarnation(&new, 1, 1)
+                .is_err(),
+            "a stale sample of the correct incarnation is not fresh progress"
+        );
+    }
+
+    #[test]
+    fn wire_identity_requires_a_registered_codebook_and_still_requires_real_decode() {
+        let input = generic_video_reference(&[None]);
+        let references = Arc::new(Mutex::new(BTreeMap::from([("source".into(), input)])));
+        let publishers = BTreeMap::from([(
+            "source".into(),
+            FixturePublisher {
+                participant_id: "source".into(),
+                frames: input
+                    .frames
+                    .iter()
+                    .map(|frame| canonical_annex_b(frame))
+                    .collect(),
+            },
+        )]);
+        for (payload, corrupt) in [
+            (
+                generic_video_reference(&[Some("f".into())]).frames[0].clone(),
+                false,
+            ),
+            (input.frames[0].clone(), true),
+        ] {
+            let log = Arc::new(Mutex::new(VideoReceiveLog::default()));
+            record_fixture_video_frame(
+                &log,
+                FixtureOracle {
+                    references: &references,
+                    publishers: Some(&publishers),
+                },
+                &mut H264ReferenceDecoder::new("wire", "fixture"),
+                &mut false,
+                &mut None,
+                owned_video(1, 90_000, true, provenance::stamp(&payload, "source")),
+                corrupt,
+            );
+            let log = log.lock().unwrap();
+            assert_eq!(
+                log.decoded_from("source")
+                    .map_or(0, |decoded| decoded.frames),
+                0,
+                "neither an unmatched codebook nor an undecodable payload is successful media"
+            );
+            if corrupt {
+                assert_eq!(log.decoder_errors, 1);
+            } else {
+                assert_eq!(log.frames_from("source"), 0);
+            }
+        }
     }
 
     #[test]
@@ -1745,12 +2252,30 @@ mod tests {
             },
         };
         let mut log = VideoReceiveLog::default();
-        log.record_native_decoded(&frame);
+        log.record_native_decoded(&frame, Instant::now());
         assert_eq!(log.stats().frames, 1);
         assert!(log.stats().first_frame_at.is_some());
         assert!(log.native_decoded.has_observations());
         assert!(log.by_publisher.is_empty());
         assert!(log.require_not_received_from("foreign").is_err());
+        let mut dual = VideoReceiveLog {
+            native_origin_enabled: true,
+            ..VideoReceiveLog::default()
+        };
+        dual.record_dual_native_decoded(&frame, Instant::now());
+        assert_eq!(
+            dual.stats().frames,
+            0,
+            "I420 must not inflate encoded metrics"
+        );
+        assert_eq!(
+            dual.unattributed_frames, 0,
+            "raw observations stay separate"
+        );
+        assert!(
+            dual.require_not_received_from("foreign").is_err(),
+            "positive native receipts are not an absence oracle"
+        );
     }
 
     #[test]
@@ -1770,6 +2295,24 @@ mod tests {
         assert_eq!(log.ts_regression_count, 1);
         assert_eq!(log.max_ts_regression, 1);
         assert!(log.by_publisher.is_empty());
+    }
+
+    #[test]
+    fn late_feedback_ack_does_not_restore_a_recovered_decoder_throttle() {
+        let now = tokio::time::Instant::now();
+        for decoder_ready in [false, true] {
+            let mut stream = VideoStreamReceiver {
+                decoder: H264ReferenceDecoder::new("feedback", "state-only unit"),
+                decoder_ready,
+                retained_publisher: None,
+                last_keyframe_request: None,
+            };
+            stream.acknowledge_keyframe(now);
+            assert_eq!(
+                stream.last_keyframe_request,
+                (!decoder_ready).then_some(now)
+            );
+        }
     }
 
     #[test]
@@ -1879,6 +2422,102 @@ mod tests {
     }
 
     #[test]
+    fn native_video_witness_needs_old_source_frames_not_transport_padding_or_new_ssrc() {
+        // Statistics projection only, never synthesized as RTC input.
+        let baseline = NativeTrafficStatistics::from_report(&pulsebeam_agent_native::NativeStatistics {
+            generation: 7, timestamp_us: 10,
+            report_json: br#"[{"type":"media-source","id":"SV1","kind":"video","trackIdentifier":"v0"},
+                {"type":"outbound-rtp","kind":"video","ssrc":10,"mediaSourceId":"SV1","bytesSent":100,"packetsSent":5,"framesSent":1},
+                {"type":"transport","bytesSent":1000}]"#.to_vec(),
+        }).unwrap();
+        assert!(baseline.has_video_sender("v0"));
+        assert!(!baseline.has_video_sender("other"));
+        let mut current = baseline.clone();
+        current.timestamp_us = 20;
+        current.bytes_sent = Some(50_000);
+        assert_eq!(current.video_progress_since(&baseline, "v0"), Ok(false));
+        current.outbound_video.get_mut(&10).unwrap().bytes_sent = Some(200);
+        current.outbound_video.get_mut(&10).unwrap().packets_sent = Some(10);
+        assert_eq!(current.video_progress_since(&baseline, "v0"), Ok(false));
+        current.outbound_video.get_mut(&10).unwrap().frames_sent = Some(2);
+        assert_eq!(current.video_progress_since(&baseline, "v0"), Ok(true));
+        let mut wrong = current.clone();
+        wrong.timestamp_us = 10;
+        assert!(wrong.video_progress_since(&baseline, "v0").is_err());
+        wrong = current.clone();
+        wrong.generation = 8;
+        assert!(wrong.video_progress_since(&baseline, "v0").is_err());
+        wrong = current.clone();
+        wrong.outbound_video.get_mut(&10).unwrap().slot = Some("other".into());
+        assert!(wrong.video_progress_since(&baseline, "v0").is_err());
+        wrong = current.clone();
+        wrong.outbound_video.get_mut(&10).unwrap().bytes_sent = None;
+        assert!(wrong.video_progress_since(&baseline, "v0").is_err());
+        wrong = current.clone();
+        let replacement = wrong.outbound_video.remove(&10).unwrap();
+        wrong.outbound_video.insert(11, replacement);
+        assert!(wrong.video_progress_since(&baseline, "v0").is_err());
+    }
+
+    #[test]
+    fn initial_native_baseline_uses_only_a_real_in_window_same_generation_counter() {
+        let now = Instant::now();
+        let sample = NativeTrafficStatistics {
+            generation: 1,
+            timestamp_us: 10,
+            bytes_sent: Some(100),
+            bytes_received: Some(200),
+            keyframe_requests: None,
+            outbound_video: BTreeMap::new(),
+            report_json: vec![],
+        };
+        let mut baseline = NativeTrafficBaseline::default();
+        baseline.begin(None, Some(1), now + Duration::from_millis(10));
+        baseline.observe(&sample, now);
+        assert!(
+            baseline.sample().is_none(),
+            "pre-window report is inadmissible"
+        );
+        let at = now + Duration::from_millis(20);
+        baseline.observe(
+            &NativeTrafficStatistics {
+                generation: 2,
+                ..sample.clone()
+            },
+            at,
+        );
+        baseline.observe(
+            &NativeTrafficStatistics {
+                bytes_sent: None,
+                ..sample.clone()
+            },
+            at,
+        );
+        assert!(
+            baseline.sample().is_none(),
+            "epoch or missing field cannot become zero"
+        );
+        baseline.observe(&sample, at);
+        let ending = NativeTrafficStatistics {
+            timestamp_us: 20,
+            bytes_sent: Some(150),
+            ..sample.clone()
+        };
+        assert_eq!(
+            ending.interval_delta(baseline.sample(), |stats| stats.bytes_sent),
+            Ok(50)
+        );
+        baseline.observe(&ending, at + Duration::from_millis(20));
+        assert_eq!(
+            baseline.sample().unwrap().bytes_sent,
+            Some(100),
+            "do not move a valid start"
+        );
+        baseline.begin(Some(ending.clone()), Some(1), at);
+        assert_eq!(baseline.sample().unwrap().timestamp_us, ending.timestamp_us);
+    }
+
+    #[test]
     fn native_interval_rejects_missing_stale_reset_and_regressing_samples() {
         let baseline = NativeTrafficStatistics {
             generation: 1,
@@ -1886,6 +2525,7 @@ mod tests {
             bytes_sent: Some(100),
             bytes_received: Some(200),
             keyframe_requests: None,
+            outbound_video: BTreeMap::new(),
             report_json: vec![],
         };
         let mut current = NativeTrafficStatistics {
@@ -1972,6 +2612,7 @@ mod tests {
             &references,
             &mut decoder,
             &mut decoder_ready,
+            &mut None,
             frame,
             false,
         );
@@ -2053,6 +2694,57 @@ pub struct RequestedVideo {
     pub priority: u32,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NativeOutboundVideo {
+    /// Resolved through the report's actual mediaSourceId -> trackIdentifier.
+    pub slot: Option<String>,
+    pub bytes_sent: Option<u64>,
+    pub packets_sent: Option<u64>,
+    pub frames_sent: Option<u64>,
+}
+
+/// A real starting sample, never an invented zero. If a window begins before
+/// native statistics exist, retain the first usable report INSIDE that window.
+/// Its shorter measured interval makes the original byte threshold stricter;
+/// neither the window nor its deadline is extended.
+#[derive(Default, Debug)]
+pub struct NativeTrafficBaseline {
+    sample: Option<NativeTrafficStatistics>,
+    expected_generation: Option<u64>,
+    opened_at: Option<Instant>,
+}
+impl NativeTrafficBaseline {
+    pub fn begin(
+        &mut self,
+        sample: Option<NativeTrafficStatistics>,
+        generation: Option<u64>,
+        at: Instant,
+    ) {
+        self.expected_generation =
+            generation.or_else(|| sample.as_ref().map(|stats| stats.generation));
+        self.sample = sample;
+        self.opened_at = Some(at);
+    }
+
+    pub fn observe(&mut self, sample: &NativeTrafficStatistics, at: Instant) {
+        if self.sample.is_none()
+            && self.opened_at.is_some_and(|opened| at >= opened)
+            && self
+                .expected_generation
+                .is_none_or(|generation| sample.generation == generation)
+            && sample.bytes_sent.is_some()
+            && sample.bytes_received.is_some()
+        {
+            self.expected_generation = Some(sample.generation);
+            self.sample = Some(sample.clone());
+        }
+    }
+
+    pub fn sample(&self) -> Option<&NativeTrafficStatistics> {
+        self.sample.as_ref()
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct NativeTrafficStatistics {
     pub generation: u64,
@@ -2061,10 +2753,61 @@ pub struct NativeTrafficStatistics {
     pub bytes_received: Option<u64>,
     /// Actual outbound-video RTCStats PLI count, not producer feedback polls.
     pub keyframe_requests: Option<u64>,
+    pub outbound_video: BTreeMap<u32, NativeOutboundVideo>,
     /// Retain the actual report for failure diagnostics, not reconstructed stats.
     pub report_json: Vec<u8>,
 }
 impl NativeTrafficStatistics {
+    pub fn has_video_sender(&self, slot: &str) -> bool {
+        self.outbound_video.values().any(|video| {
+            video.slot.as_deref() == Some(slot)
+                && video.bytes_sent.is_some()
+                && video.packets_sent.is_some()
+                && video.frames_sent.is_some()
+        })
+    }
+
+    /// Progress on a previously observed native sender, not just padding,
+    /// retransmissions, control bytes, or a replacement generation's counters.
+    pub fn video_progress_since(&self, baseline: &Self, slot: &str) -> Result<bool, String> {
+        if self.generation != baseline.generation {
+            return Err("native video sample crossed generations".into());
+        }
+        if self.timestamp_us <= baseline.timestamp_us {
+            return Err("native video ending report is not fresh".into());
+        }
+        let mut observed = false;
+        let mut progress = false;
+        for (ssrc, before) in baseline
+            .outbound_video
+            .iter()
+            .filter(|(_, video)| video.slot.as_deref() == Some(slot))
+        {
+            observed = true;
+            let after = self
+                .outbound_video
+                .get(ssrc)
+                .ok_or("old native video SSRC disappeared")?;
+            if after.slot != before.slot {
+                return Err("native video SSRC changed source slot".into());
+            }
+            let delta = |after: Option<u64>, before: Option<u64>| {
+                after
+                    .ok_or("native video counter unavailable")?
+                    .checked_sub(before.ok_or("native video baseline counter unavailable")?)
+                    .ok_or("native video counter regressed")
+            };
+            let bytes = delta(after.bytes_sent, before.bytes_sent)?;
+            let packets = delta(after.packets_sent, before.packets_sent)?;
+            let frames = delta(after.frames_sent, before.frames_sent)?;
+            progress |= bytes > 0 && packets > 0 && frames > 0;
+        }
+        if !observed {
+            return Err("native video baseline has no identified source sender".into());
+        }
+        Ok(progress)
+    }
+
     pub fn interval_delta(
         &self,
         baseline: Option<&Self>,
@@ -2109,20 +2852,61 @@ impl NativeTrafficStatistics {
                 record.get("type").and_then(|value| value.as_str()) == Some("transport")
             })
         };
-        let outbound_video = records.iter().copied().filter(|record| {
-            record.get("type").and_then(|value| value.as_str()) == Some("outbound-rtp")
-                && record
-                    .get("kind")
-                    .or_else(|| record.get("mediaType"))
-                    .and_then(|value| value.as_str())
-                    == Some("video")
-        });
+        let outbound_video = || {
+            records.iter().copied().filter(|record| {
+                record.get("type").and_then(|value| value.as_str()) == Some("outbound-rtp")
+                    && record
+                        .get("kind")
+                        .or_else(|| record.get("mediaType"))
+                        .and_then(|value| value.as_str())
+                        == Some("video")
+            })
+        };
         Ok(Self {
             generation: report.generation,
             timestamp_us: report.timestamp_us,
             bytes_sent: sum(transports(), "bytesSent"),
             bytes_received: sum(transports(), "bytesReceived"),
-            keyframe_requests: sum(outbound_video, "pliCount"),
+            keyframe_requests: sum(outbound_video(), "pliCount"),
+            outbound_video: {
+                let mut video = BTreeMap::new();
+                for record in outbound_video() {
+                    let Some(ssrc) = record
+                        .get("ssrc")
+                        .and_then(serde_json::Value::as_u64)
+                        .and_then(|value| u32::try_from(value).ok())
+                    else {
+                        continue;
+                    };
+                    let source_id = record.get("mediaSourceId").and_then(|value| value.as_str());
+                    let slot = records
+                        .iter()
+                        .find(|source| {
+                            source.get("type").and_then(|value| value.as_str())
+                                == Some("media-source")
+                                && source.get("id").and_then(|value| value.as_str()) == source_id
+                                && source_id.is_some()
+                                && source.get("kind").and_then(|value| value.as_str())
+                                    == Some("video")
+                        })
+                        .and_then(|source| source.get("trackIdentifier"))
+                        .and_then(|value| value.as_str())
+                        .map(str::to_owned);
+                    let sender = NativeOutboundVideo {
+                        slot,
+                        bytes_sent: record.get("bytesSent").and_then(serde_json::Value::as_u64),
+                        packets_sent: record
+                            .get("packetsSent")
+                            .and_then(serde_json::Value::as_u64),
+                        frames_sent: record.get("framesSent").and_then(serde_json::Value::as_u64),
+                    };
+                    anyhow::ensure!(
+                        video.insert(ssrc, sender).is_none(),
+                        "duplicate native outbound video SSRC"
+                    );
+                }
+                video
+            },
             report_json: report.report_json.clone(),
         })
     }
@@ -2136,6 +2920,7 @@ pub struct ClientObservation {
     pub audio_receivers: BTreeSet<u32>,
     pub snapshot: pulsebeam_agent_native::agent_core::Snapshot,
     pub sent_intent_revision: Option<u64>,
+    pub last_successfully_sent_wire_revision: Option<u64>,
     pub video_operation: u64,
     pub accepted: Option<DesiredState>,
     pub submitted: DesiredState,
@@ -2155,6 +2940,7 @@ pub struct ClientContext {
     pub video_rx: Arc<Mutex<VideoReceiveLog>>,
     pub audio_rx: Arc<Mutex<AudioReceiveLog>>,
     quality_references: Arc<Mutex<BTreeMap<String, &'static QualityVideoReference>>>,
+    h264_publishers: Arc<Mutex<FixturePublishers>>,
     corrupt_video_payload: bool,
     keyframe_recovery: Arc<Mutex<KeyframeRecoveryProbe>>,
     pub discovered_tracks: HashSet<String>,
@@ -2202,6 +2988,7 @@ impl ClientContext {
                 .collect(),
             snapshot,
             sent_intent_revision: observed.sent_intent_revision,
+            last_successfully_sent_wire_revision: observed.last_successfully_sent_wire_revision,
             accepted,
             submitted: self.desired.clone(),
             video_operation: self.video_operation,
@@ -2227,24 +3014,50 @@ impl ClientContext {
         self.agent.snapshot().connection == ConnectionState::Connected
     }
 
-    pub async fn refresh(&mut self) -> anyhow::Result<()> {
+    pub fn events_closed(&self) -> bool {
+        self.events.is_closed()
+    }
+
+    fn record_event(
+        &mut self,
+        update: pulsebeam_agent_native::StreamUpdate<AgentEvent>,
+    ) -> anyhow::Result<()> {
+        let event = match update {
+            pulsebeam_agent_native::StreamUpdate::Value(event) => event,
+            pulsebeam_agent_native::StreamUpdate::Lagged { skipped } => {
+                anyhow::bail!("native fixture events lagged by {skipped}")
+            }
+            pulsebeam_agent_native::StreamUpdate::Closed => return Ok(()),
+        };
+        match event {
+            AgentEvent::Core(pulsebeam_agent_native::agent_core::Notification::Topic(
+                notification @ (TopicNotification::Message(_)
+                | TopicNotification::RecoveryGap { .. }),
+            )) => self.topic_events.push(notification),
+            AgentEvent::RuntimeFailed(message) => anyhow::bail!(message),
+            _ => {}
+        }
+        Ok(())
+    }
+
+    pub async fn receive_event(&mut self) -> anyhow::Result<()> {
+        let update = self.events.next().await;
+        self.record_event(update)
+    }
+
+    pub fn drain_events(&mut self) -> anyhow::Result<()> {
         while let Some(update) = self.events.try_next() {
-            let event = match update {
-                pulsebeam_agent_native::StreamUpdate::Value(event) => event,
-                pulsebeam_agent_native::StreamUpdate::Lagged { skipped } => {
-                    anyhow::bail!("native fixture events lagged by {skipped}")
-                }
-                pulsebeam_agent_native::StreamUpdate::Closed => break,
-            };
-            match event {
-                AgentEvent::Core(pulsebeam_agent_native::agent_core::Notification::Topic(
-                    notification @ (TopicNotification::Message(_)
-                    | TopicNotification::RecoveryGap { .. }),
-                )) => self.topic_events.push(notification),
-                AgentEvent::RuntimeFailed(message) => anyhow::bail!(message),
-                _ => {}
+            let closed = matches!(update, pulsebeam_agent_native::StreamUpdate::Closed);
+            self.record_event(update)?;
+            if closed {
+                break;
             }
         }
+        Ok(())
+    }
+
+    pub async fn refresh(&mut self) -> anyhow::Result<()> {
+        self.drain_events()?;
 
         if !self.snapshots.has_changed()? {
             return Ok(());
@@ -2503,6 +3316,7 @@ struct ClientMediaPlan {
     video_receive_mode: pulsebeam_agent_native::ReceiveMode,
     audio_receive_mode: pulsebeam_agent_native::ReceiveMode,
     publishes_video: bool,
+    opaque_payload: bool,
     video_sources: Vec<(Option<String>, VideoSource)>,
     vbr_source: Option<VbrSource>,
     audio_level_dbov: Option<i8>,
@@ -2562,7 +3376,13 @@ impl SimClient {
                     plan.video_receive_mode,
                 )
                 .await?;
-            spawn_video_receiver(&mut self.join_set, remote, ctx, agent.clone());
+            spawn_video_receiver(
+                &mut self.join_set,
+                remote,
+                ctx,
+                agent.clone(),
+                plan.video_receive_mode,
+            );
         }
         for slot in 0..plan.audio_slots {
             let remote = agent
@@ -2644,19 +3464,60 @@ impl SimClient {
             });
         }
         if plan.publishes_video {
+            let mut sources = plan
+                .video_sources
+                .iter()
+                .map(|(encoding, source)| (encoding.clone(), source.fresh()))
+                .collect::<Vec<_>>();
+            let mut vbr = plan.vbr_source.as_ref().map(VbrSource::fresh);
+            if !plan.opaque_payload {
+                let participant_id =
+                    ctx.snapshots
+                        .borrow()
+                        .participant_id
+                        .clone()
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("connected source has no participant identity")
+                        })?;
+                let admission = (*ctx.admission.lock().unwrap()).ok_or_else(|| {
+                    anyhow::anyhow!("connected source has no HTTP admission identity")
+                })?;
+                let origin = provenance::source_key(&admission.to_string(), "v0");
+                let mut frames = BTreeSet::new();
+                for (_, source) in &mut sources {
+                    frames.extend(source.reference_frames().map(|frame| {
+                        provenance::inspect(frame)
+                            .expect("valid source access unit")
+                            .1
+                    }));
+                    source.identify_as(&origin);
+                }
+                if let Some(source) = &mut vbr {
+                    frames.extend(
+                        source.reference_frames().map(|frame| {
+                            provenance::inspect(frame).expect("valid VBR access unit").1
+                        }),
+                    );
+                    source.identify_as(&origin);
+                }
+                // Register actual input bytes for THIS source admission. Rearm
+                // may reuse the logical participant, but never its old marker.
+                ctx.h264_publishers.lock().unwrap().insert(
+                    origin,
+                    FixturePublisher {
+                        participant_id,
+                        frames,
+                    },
+                );
+            }
             let media = agent
                 .source(pulsebeam_agent_native::agent_core::MediaSlot::LocalVideo(
                     "v0".into(),
                 ))
                 .await?;
-            if let Some(source) = &plan.vbr_source {
-                self.join_set.spawn(source.fresh().run(media));
+            if let Some(source) = vbr {
+                self.join_set.spawn(source.run(media));
             } else {
-                let sources = plan
-                    .video_sources
-                    .iter()
-                    .map(|(encoding, source)| (encoding.clone(), source.fresh()))
-                    .collect();
                 self.join_set.spawn(VideoSource::run_batch(sources, media));
             }
         }
@@ -2727,22 +3588,81 @@ fn spawn_video_receiver(
     remote: pulsebeam_agent_native::RemoteMedia,
     ctx: &ClientContext,
     agent: Agent,
+    mode: pulsebeam_agent_native::ReceiveMode,
 ) {
     let log = ctx.video_rx.clone();
+    if mode == pulsebeam_agent_native::ReceiveMode::EncodedAndDecoded {
+        log.lock().unwrap().native_origin_enabled = true;
+    }
     let references = ctx.quality_references.clone();
+    let publishers = ctx.h264_publishers.clone();
     let corrupt = ctx.corrupt_video_payload;
+    let native_playback_only = log.lock().unwrap().native_playback_only;
     let recovery_probe = ctx.keyframe_recovery.clone();
     let snapshots = agent.snapshots();
     join_set.spawn(async move {
         let mut one_shot = false;
         let mut streams = HashMap::<NativeVideoStream, VideoStreamReceiver>::new();
+        type FeedbackRequest<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>>;
+        let mut feedback: Option<FeedbackRequest<'_>> = None;
+        let mut feedback_context: Option<(NativeVideoStream, tokio::time::Instant, bool)> = None;
+        let mut queued_one_shot = None;
         loop {
-            let frame = match remote.next().await {
+            // A control-command acknowledgement must not stop collecting a
+            // best-effort media stream. Keep exactly one request in flight;
+            // retain the existing retry interval and one-shot probe semantics.
+            let update = tokio::select! {
+                biased;
+                succeeded = async {
+                    match feedback.as_mut() {
+                        Some(request) => request.await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    feedback = None;
+                    let (identity, issued, once) = feedback_context.take().expect("in-flight feedback context");
+                    if succeeded {
+                        if let Some(stream) = streams.get_mut(&identity) {
+                            stream.acknowledge_keyframe(issued);
+                        }
+                        if once { recovery_probe.lock().unwrap().one_shot_requests += 1; }
+                    }
+                    if let Some(identity) = queued_one_shot.take() {
+                        feedback_context = Some((identity, tokio::time::Instant::now(), true));
+                        feedback = Some(Box::pin(async { remote.request_keyframe().await.is_ok() }));
+                    }
+                    continue;
+                },
+                update = remote.next() => update,
+            };
+            let frame = match update {
                 pulsebeam_agent_native::MediaStreamUpdate::Frame { frame } => frame,
                 pulsebeam_agent_native::MediaStreamUpdate::Track { .. } => continue,
                 pulsebeam_agent_native::MediaStreamUpdate::Closed => break,
                 pulsebeam_agent_native::MediaStreamUpdate::NativeDropped { skipped } => {
-                    record_video_drop(&log, &mut streams, skipped, "native SDK sink");
+                    if mode == pulsebeam_agent_native::ReceiveMode::Decoded
+                        && log.lock().unwrap().native_callback_enabled
+                    {
+                        log.lock().unwrap().native_decoded.polling_dropped(skipped);
+                        continue;
+                    }
+                    record_video_drop(
+                        &log,
+                        &mut streams,
+                        skipped,
+                        "native SDK sink",
+                        mode != pulsebeam_agent_native::ReceiveMode::EncodedAndDecoded,
+                    );
+                    continue;
+                }
+                pulsebeam_agent_native::MediaStreamUpdate::NativeDecodedDropped { skipped } => {
+                    tracing::warn!(skipped, cause = "native decoded SDK sink", "native video observation loss");
+                    let mut observed = log.lock().unwrap();
+                    if observed.native_callback_enabled {
+                        observed.native_decoded.polling_dropped(skipped);
+                    } else {
+                        observed.native_decoded.dropped(skipped);
+                    }
                     continue;
                 }
                 pulsebeam_agent_native::MediaStreamUpdate::Lagged { skipped } => {
@@ -2751,6 +3671,7 @@ fn spawn_video_receiver(
                         &mut streams,
                         skipped,
                         "application observation buffer",
+                        true,
                     );
                     continue;
                 }
@@ -2767,7 +3688,20 @@ fn spawn_video_receiver(
                 &frame.frame,
                 pulsebeam_agent_native::OutputFrame::I420 { .. }
             ) {
-                log.lock().unwrap().record_native_decoded(&frame);
+                let mut observed = log.lock().unwrap();
+                // Polling remains available to application consumers, but is
+                // not a second native callback and cannot alter its cadence.
+                if !observed.native_callback_enabled {
+                    if mode == pulsebeam_agent_native::ReceiveMode::EncodedAndDecoded {
+                        observed.record_dual_native_decoded(&frame, Instant::now());
+                    } else {
+                        observed.record_native_decoded(&frame, Instant::now());
+                    }
+                }
+                continue;
+            }
+            if native_playback_only {
+                record_native_fixture_sample(&log, &publishers.lock().unwrap(), &frame);
                 continue;
             }
             let identity = NativeVideoStream::from(&frame);
@@ -2776,18 +3710,24 @@ fn spawn_video_receiver(
                 .or_insert_with(|| VideoStreamReceiver {
                     decoder: H264ReferenceDecoder::new(format!("{identity:?}"), "native video"),
                     decoder_ready: false,
+                    retained_publisher: None,
                     last_keyframe_request: None,
                 });
             let request_once = std::mem::take(&mut recovery_probe.lock().unwrap().request_once);
             if request_once {
                 one_shot = true;
                 stream.decoder_ready = false;
+                queued_one_shot = Some(identity.clone());
             }
-            record_video_frame(
+            record_fixture_video_frame(
                 &log,
-                &references,
+                FixtureOracle {
+                    references: &references,
+                    publishers: Some(&publishers.lock().unwrap()),
+                },
                 &mut stream.decoder,
                 &mut stream.decoder_ready,
+                &mut stream.retained_publisher,
                 frame,
                 corrupt,
             );
@@ -2797,14 +3737,15 @@ fn spawn_video_receiver(
                     .last_keyframe_request
                     .is_none_or(|last| now.duration_since(last) >= Duration::from_millis(500));
             // A one-shot probe must not be rescued by this caller retry loop.
-            if (request_once || (!one_shot && should_request))
-                && remote.request_keyframe().await.is_ok()
-            {
-                stream.last_keyframe_request = Some(now);
-                if request_once {
-                    recovery_probe.lock().unwrap().one_shot_requests += 1;
+            if feedback.is_none() {
+                let request = queued_one_shot.take().map(|identity| (identity, true))
+                    .or_else(|| (!one_shot && should_request).then_some((identity, false)));
+                if let Some((identity, once)) = request {
+                    feedback_context = Some((identity, now, once));
+                    feedback = Some(Box::pin(async { remote.request_keyframe().await.is_ok() }));
                 }
-            } else if stream.decoder_ready {
+            }
+            if stream.decoder_ready {
                 stream.last_keyframe_request = None;
             }
         }
@@ -2816,12 +3757,16 @@ fn record_video_drop(
     streams: &mut HashMap<NativeVideoStream, VideoStreamReceiver>,
     skipped: u64,
     cause: &str,
+    affects_native_decoded: bool,
 ) {
     tracing::warn!(skipped, cause, "native video observation loss");
     let mut log = log.lock().unwrap();
     log.non_contiguous += skipped;
     log.native_queue_drops += skipped;
-    log.native_decoded.dropped(skipped);
+    log.native_origin.encoded_observation_lost();
+    if affects_native_decoded && !log.native_callback_enabled {
+        log.native_decoded.dropped(skipped);
+    }
     for stream in streams.values_mut() {
         stream.decoder_ready = false;
     }
@@ -2830,7 +3775,16 @@ fn record_video_drop(
 struct VideoStreamReceiver {
     decoder: H264ReferenceDecoder,
     decoder_ready: bool,
+    retained_publisher: Option<String>,
     last_keyframe_request: Option<tokio::time::Instant>,
+}
+
+impl VideoStreamReceiver {
+    fn acknowledge_keyframe(&mut self, issued: tokio::time::Instant) {
+        // Collection may already have recovered while this command awaited its
+        // acknowledgement. Do not resurrect a throttle cleared by that frame.
+        self.last_keyframe_request = (!self.decoder_ready).then_some(issued);
+    }
 }
 
 fn generic_video_reference(encodings: &[Option<String>]) -> &'static QualityVideoReference {

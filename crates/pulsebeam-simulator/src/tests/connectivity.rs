@@ -1,4 +1,6 @@
-use super::common::{LinkProfile, LocalNodeSim, Participant, Room, Step, VideoQuality};
+use super::common::{
+    LinkProfile, LocalNodeSim, Participant, Playback, PlaybackExpectation, Room, Step, VideoQuality,
+};
 use pulsebeam_agent_native::agent_core::TopicMode;
 use std::time::Duration;
 
@@ -390,6 +392,10 @@ fn failed_materialization_does_not_connect_the_participant() {
             Step::CheckConnected {
                 description: "Fresh admission succeeds after the failure",
                 participant: "subscriber",
+            },
+            Step::Run {
+                description: "Measure media within the fresh admitted generation",
+                duration: Duration::from_secs(2),
             },
             Step::CheckRxBytesInterval {
                 description: "Fresh media reaches the recovered subscriber",
@@ -976,22 +982,28 @@ fn a_rejoining_publisher_is_shown_to_an_existing_viewer_test() {
         .with_room(
             Room::new("room1")
                 .with_participant(Participant::single_publisher("alice"))
-                .with_participant(Participant::subscriber("viewer")),
+                .with_participant(Participant::subscriber("viewer").with_native_playback()),
         )
         .run(vec![
+            Step::BeginNativePlayback {
+                description: "Measure the initial native camera playback",
+                participant: "viewer",
+                after_pause: false,
+            },
             Step::Run {
                 description: "Alice is on screen",
                 duration: Duration::from_secs(8),
             },
-            Step::CheckVideoQuality {
-                description: "The viewer can see her",
+            Step::CheckNativePlayback {
+                description: "The viewer sees fresh changing native camera output from Alice",
                 participant: "viewer",
-                // One unrecovered gap is what a cellular link does: 1% loss over
-                // this many packets outruns retransmission occasionally. Zero is
-                // the right budget for `fiber()`, not for this one. A botched
-                // switch is still caught — it produces gaps by the handful, and
-                // a timestamp regression with them.
-                quality: VideoQuality::min_frames(50).allow_gaps(2),
+                publisher: "alice",
+                expected: PlaybackExpectation {
+                    content: Playback::Camera,
+                    min_frames: 50,
+                    min_resolution: (180, 180),
+                },
+                same_receiver: false,
             },
             Step::Disconnect {
                 description: "Alice drops out",
@@ -1005,16 +1017,25 @@ fn a_rejoining_publisher_is_shown_to_an_existing_viewer_test() {
                 description: "Alice comes back, as a participant the room has never seen",
                 participant: "alice",
             },
+            Step::BeginNativePlayback {
+                description: "Exclude only the intentional absence before resumed playback",
+                participant: "viewer",
+                after_pause: true,
+            },
             Step::Run {
-                description: "Settle on the new publisher",
+                description: "The rejoined publisher becomes visible within ten seconds",
                 duration: Duration::from_secs(10),
             },
-            Step::CheckVideoQualityInterval {
-                description: "The viewer can see the publisher who replaced her",
+            Step::CheckNativePlayback {
+                description: "The viewer sees fresh native output from Alice's new admission",
                 participant: "viewer",
-                // The new publication starts a fresh RTP stream while the cellular
-                // path may lose a few packets during the route transition.
-                quality: VideoQuality::min_frames(50).allow_gaps(5),
+                publisher: "alice",
+                expected: PlaybackExpectation {
+                    content: Playback::Camera,
+                    min_frames: 50,
+                    min_resolution: (180, 180),
+                },
+                same_receiver: false,
             },
             Step::CheckMediaRouted {
                 description: "And nothing was thrown away on the way in",

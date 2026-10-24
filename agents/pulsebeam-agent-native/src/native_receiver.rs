@@ -6,11 +6,30 @@ use crate::native_media::{
     RemoteTrack,
 };
 
+fn decoded_frame(frame: rtc::VideoFrame) -> (OutputFrame, FrameMetadata) {
+    (
+        OutputFrame::I420 {
+            frame: I420Frame {
+                width: frame.width,
+                height: frame.height,
+                timestamp_us: frame.timestamp_us,
+                data: frame.buffer.into_bytes(),
+                rotation_degrees: frame.rotation as u16,
+            },
+        },
+        FrameMetadata {
+            rtp_timestamp: Some(frame.rtp_timestamp),
+            ..FrameMetadata::default()
+        },
+    )
+}
+
 pub(crate) struct NativeReceiver {
     pub id: rtc::SessionReceiverId,
     pub track: RemoteTrack,
     pub kind: rtc::MediaType,
     pub mode: Option<ReceiveMode>,
+    prefer_decoded: bool,
 }
 
 impl NativeReceiver {
@@ -46,6 +65,7 @@ impl NativeReceiver {
             },
             kind: session.receiver_media_type(id)?,
             mode: None,
+            prefer_decoded: false,
         })
     }
 
@@ -53,6 +73,7 @@ impl NativeReceiver {
         &mut self,
         session: &mut rtc::Session<R>,
         mode: ReceiveMode,
+        observer: Option<&crate::DecodedVideoObserver>,
     ) -> Result<(), rtc::PeerError> {
         if self.mode == Some(mode) {
             return Ok(());
@@ -63,14 +84,48 @@ impl NativeReceiver {
                 message: "detach the current receiver mode before attaching another".into(),
             });
         }
-        match (self.kind, mode) {
-            (rtc::MediaType::Audio, ReceiveMode::Decoded) => session.attach_pcm(self.id)?,
-            (rtc::MediaType::Audio, ReceiveMode::Encoded) => {
+        let callback = observer.map(|observer| {
+            let observer = observer.clone();
+            let track = self.track.clone();
+            move |native: rtc::DecodedVideoFrameObservation| {
+                let frame = native
+                    .frame
+                    .map(|frame| {
+                        let (frame, metadata) = decoded_frame(frame);
+                        RemoteFrame {
+                            track: track.clone(),
+                            metadata,
+                            frame,
+                        }
+                    })
+                    .map_err(|error| format!("{error:?}"));
+                observer.observe(crate::DecodedVideoObservation {
+                    track: track.clone(),
+                    observed_at: native.observed_at,
+                    native_observed_at_us: native.native_observed_at_us,
+                    frame,
+                });
+            }
+        });
+        match (self.kind, mode, callback) {
+            (rtc::MediaType::Audio, ReceiveMode::Decoded, _) => session.attach_pcm(self.id)?,
+            (rtc::MediaType::Audio, ReceiveMode::Encoded, _) => {
                 session.attach_encoded_audio(self.id)?;
             }
-            (rtc::MediaType::Video, ReceiveMode::Decoded) => session.attach_raw_video(self.id)?,
-            (rtc::MediaType::Video, ReceiveMode::Encoded) => {
+            (rtc::MediaType::Video, ReceiveMode::Decoded, Some(callback)) => {
+                session.attach_raw_video_with_observer(self.id, callback)?;
+            }
+            (rtc::MediaType::Video, ReceiveMode::Decoded, None) => {
+                session.attach_raw_video(self.id)?;
+            }
+            (rtc::MediaType::Video, ReceiveMode::Encoded, _) => {
                 session.attach_encoded_video(self.id)?;
+            }
+            (rtc::MediaType::Video, ReceiveMode::EncodedAndDecoded, Some(callback)) => {
+                session.attach_raw_and_encoded_video_with_observer(self.id, callback)?;
+            }
+            (rtc::MediaType::Video, ReceiveMode::EncodedAndDecoded, None) => {
+                session.attach_raw_and_encoded_video(self.id)?;
             }
             _ => {
                 return Err(rtc::PeerError {
@@ -80,6 +135,7 @@ impl NativeReceiver {
             }
         }
         self.mode = Some(mode);
+        self.prefer_decoded = false;
         Ok(())
     }
 
@@ -96,11 +152,46 @@ impl NativeReceiver {
     /// Its caller must schedule one pull per native playout interval. Repeated
     /// calls in a drain loop would incorrectly manufacture playout progress.
     pub fn next<R: rtc::SessionRuntime>(
-        &self,
+        &mut self,
         session: &mut rtc::Session<R>,
         playout_due: bool,
     ) -> Result<Option<RemoteFrame>, rtc::PeerError> {
-        let value = match (self.kind, self.mode) {
+        if self.kind == rtc::MediaType::Video
+            && matches!(
+                self.mode,
+                Some(ReceiveMode::Decoded | ReceiveMode::EncodedAndDecoded)
+            )
+            && session.raw_video_observer_failed(self.id)?
+        {
+            return Err(rtc::PeerError {
+                kind: rtc::PeerErrorKind::InvalidState,
+                message: "native decoded callback observer panicked and retired".into(),
+            });
+        }
+        if self.kind == rtc::MediaType::Video && self.mode == Some(ReceiveMode::EncodedAndDecoded) {
+            // Fairly drain two independent native observer queues. This never
+            // sorts/reorders media or manufactures either kind of output.
+            let modes = if self.prefer_decoded {
+                [ReceiveMode::Decoded, ReceiveMode::Encoded]
+            } else {
+                [ReceiveMode::Encoded, ReceiveMode::Decoded]
+            };
+            self.prefer_decoded = !self.prefer_decoded;
+            if let Some(frame) = self.next_in_mode(session, Some(modes[0]), playout_due)? {
+                return Ok(Some(frame));
+            }
+            return self.next_in_mode(session, Some(modes[1]), playout_due);
+        }
+        self.next_in_mode(session, self.mode, playout_due)
+    }
+
+    fn next_in_mode<R: rtc::SessionRuntime>(
+        &self,
+        session: &mut rtc::Session<R>,
+        mode: Option<ReceiveMode>,
+        playout_due: bool,
+    ) -> Result<Option<RemoteFrame>, rtc::PeerError> {
+        let value = match (self.kind, mode) {
             (rtc::MediaType::Audio, Some(ReceiveMode::Decoded)) if playout_due => {
                 session.try_pcm_frame(self.id)?.map(|frame| {
                     (
@@ -141,23 +232,7 @@ impl NativeReceiver {
                 })
             }
             (rtc::MediaType::Video, Some(ReceiveMode::Decoded)) => {
-                session.try_raw_video_frame(self.id)?.map(|frame| {
-                    (
-                        OutputFrame::I420 {
-                            frame: I420Frame {
-                                width: frame.width,
-                                height: frame.height,
-                                timestamp_us: frame.timestamp_us,
-                                data: frame.buffer.into_bytes(),
-                                rotation_degrees: frame.rotation as u16,
-                            },
-                        },
-                        FrameMetadata {
-                            rtp_timestamp: Some(frame.rtp_timestamp),
-                            ..FrameMetadata::default()
-                        },
-                    )
-                })
+                session.try_raw_video_frame(self.id)?.map(decoded_frame)
             }
             (rtc::MediaType::Video, Some(ReceiveMode::Encoded)) => {
                 session.try_video_frame(self.id)?.map(|frame| {

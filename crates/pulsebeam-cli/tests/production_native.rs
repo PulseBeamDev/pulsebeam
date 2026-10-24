@@ -177,7 +177,7 @@ async fn production_native_i420_crosses_real_sfu_and_closes() -> Result<()> {
                         break anyhow::Ok(pixels);
                     }
                     MediaStreamUpdate::Track { .. } => {},
-                    MediaStreamUpdate::Lagged { skipped } | MediaStreamUpdate::NativeDropped { skipped } => bail!("production video observation lost {skipped} frames"),
+                    MediaStreamUpdate::Lagged { skipped } | MediaStreamUpdate::NativeDropped { skipped } | MediaStreamUpdate::NativeDecodedDropped { skipped } => bail!("production video observation lost {skipped} frames"),
                     MediaStreamUpdate::Closed => bail!("production video closed before delivery"),
                 }
             }

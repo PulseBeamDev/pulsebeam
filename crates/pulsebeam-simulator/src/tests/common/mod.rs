@@ -4,12 +4,15 @@ pub mod harness;
 pub mod media;
 pub mod native;
 pub mod native_audio;
+pub mod native_origin;
 pub mod native_video;
 pub mod oracle;
+pub mod provenance;
 
 pub use harness::{
     Capacity, Content, Experience, LinkProfile, LinkReport, LocalNodeSim, Loss,
-    MAX_TIME_TO_FIRST_FRAME, Participant, Property, Reorder, Room, Step, VideoQuality,
+    MAX_TIME_TO_FIRST_FRAME, Participant, Playback, PlaybackExpectation, Property, Reorder, Room,
+    Step, VideoQuality,
 };
 
 use pulsebeam_core::auth::{
@@ -131,6 +134,17 @@ pub async fn start_observed_sfu_node(
     tcp_only: bool,
     observer: Option<tokio::sync::mpsc::Sender<pulsebeam::sim_observation::Observer>>,
 ) -> anyhow::Result<()> {
+    start_observed_sfu_node_with_transport(ip, rng, shards, tcp_only, false, observer).await
+}
+
+pub async fn start_observed_sfu_node_with_transport(
+    ip: IpAddr,
+    rng: pulsebeam_runtime::rand::Rng,
+    shards: usize,
+    tcp_only: bool,
+    udp_only: bool,
+    observer: Option<tokio::sync::mpsc::Sender<pulsebeam::sim_observation::Observer>>,
+) -> anyhow::Result<()> {
     let rtc_port = 3478;
     let external_addr = SocketAddr::new(ip, rtc_port);
     let local_addr = unspecified_addr(ip, rtc_port);
@@ -162,6 +176,8 @@ pub async fn start_observed_sfu_node(
     }
     if tcp_only {
         builder = builder.tcp_only();
+    } else if udp_only {
+        builder = builder.udp_only();
     }
     builder
         .run(tokio_util::sync::CancellationToken::new())

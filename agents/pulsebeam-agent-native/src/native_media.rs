@@ -27,6 +27,9 @@ pub enum ReceiveMode {
     Encoded,
     #[default]
     Decoded,
+    /// Video only: passive ordered encoded observations and native I420
+    /// from the same receiver, without changing its decoder or interception.
+    EncodedAndDecoded,
 }
 
 #[derive(Clone, Debug, PartialEq, uniffi::Record)]
@@ -286,6 +289,37 @@ pub struct FrameMetadata {
     pub decode_target_indications: Vec<DecodeTargetIndication>,
 }
 
+/// Actual decoded callback facts, not polling delivery or UI presentation.
+/// Track identity is captured from the native receiver before sink attachment.
+#[derive(Debug)]
+pub struct DecodedVideoObservation {
+    pub track: RemoteTrack,
+    pub observed_at: std::time::Instant,
+    /// SDK global monotonic callback clock, controlled by an exclusive world.
+    pub native_observed_at_us: i64,
+    pub frame: Result<RemoteFrame, String>,
+}
+
+/// Optional Rust-only synchronous observation. Do not block or synchronously
+/// control the SDK. Callback panics fail the native generation.
+#[derive(Clone)]
+pub struct DecodedVideoObserver(
+    std::sync::Arc<dyn Fn(DecodedVideoObservation) + Send + Sync + 'static>,
+);
+impl std::fmt::Debug for DecodedVideoObserver {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("DecodedVideoObserver(..)")
+    }
+}
+impl DecodedVideoObserver {
+    pub fn new(observer: impl Fn(DecodedVideoObservation) + Send + Sync + 'static) -> Self {
+        Self(std::sync::Arc::new(observer))
+    }
+    pub(crate) fn observe(&self, observation: DecodedVideoObservation) {
+        (self.0)(observation);
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, uniffi::Record)]
 pub struct RemoteFrame {
     pub track: RemoteTrack,
@@ -313,6 +347,11 @@ pub enum MediaStreamUpdate {
         skipped: u64,
     },
     Closed,
+    /// Decoded-video observer retention loss in combined mode. This is not an
+    /// encoded queue drop, decoder loss, or lag in the application observer.
+    NativeDecodedDropped {
+        skipped: u64,
+    },
 }
 
 pub(crate) fn h264_format() -> rtc::VideoCodecFormat {

@@ -734,7 +734,8 @@ async fn handle_receiving(
             MediaStreamUpdate::Lagged { skipped } => {
                 tracing::warn!(skipped, "bench media observer lagged");
             }
-            MediaStreamUpdate::NativeDropped { skipped } => {
+            MediaStreamUpdate::NativeDropped { skipped }
+            | MediaStreamUpdate::NativeDecodedDropped { skipped } => {
                 tracing::warn!(skipped, "native media sink dropped frames");
             }
             MediaStreamUpdate::Frame { .. } => {

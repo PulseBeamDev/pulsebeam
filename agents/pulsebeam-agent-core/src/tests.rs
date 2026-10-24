@@ -2555,6 +2555,97 @@ fn complete_intent_retracts_omitted_state_and_allows_per_track_playout_changes()
 }
 
 #[test]
+fn simulation_successful_wire_revision_is_not_a_queued_or_failed_send() {
+    let (mut agent, generation, cid, first_send) = connected_agent();
+    assert_eq!(
+        agent.simulation_last_successfully_sent_wire_revision(),
+        None
+    );
+    let mut replacement = desired(2);
+    replacement.video[0].height = 360;
+    agent
+        .command(AgentCommand::ReplaceDesired(replacement))
+        .unwrap();
+    assert_eq!(
+        agent.simulation_last_successfully_sent_wire_revision(),
+        None
+    );
+    acknowledge_send(&mut agent, generation, cid, first_send);
+    assert_eq!(
+        agent.simulation_last_successfully_sent_wire_revision(),
+        Some(1)
+    );
+    let second_send = match next_effect(&mut agent) {
+        Effect::DataChannel(DataChannelEffect::Send {
+            operation, payload, ..
+        }) => {
+            assert_eq!(decode_intent(&payload).revision, 2);
+            operation
+        }
+        effect => panic!("expected queued successor, got {effect:?}"),
+    };
+    let mut latest = desired(3);
+    latest.video[0].height = 720;
+    agent.command(AgentCommand::ReplaceDesired(latest)).unwrap();
+    assert_eq!(
+        agent.simulation_last_successfully_sent_wire_revision(),
+        Some(1)
+    );
+    agent
+        .handle(HostEvent::DataChannel(DataChannelEvent::SendFailed {
+            operation: second_send,
+            generation,
+            channel: cid,
+            message: "full".into(),
+        }))
+        .unwrap();
+    assert_eq!(
+        agent.simulation_last_successfully_sent_wire_revision(),
+        Some(1)
+    );
+    let timer = match next_effect(&mut agent) {
+        Effect::Timer(TimerEffect::Schedule { timer, .. }) => timer,
+        effect => panic!("expected retry, got {effect:?}"),
+    };
+    agent
+        .handle(HostEvent::Timer(TimerEvent::Fired { timer }))
+        .unwrap();
+    let third_send = match next_effect(&mut agent) {
+        Effect::DataChannel(DataChannelEffect::Send {
+            operation, payload, ..
+        }) => {
+            assert_eq!(decode_intent(&payload).revision, 3);
+            operation
+        }
+        effect => panic!("expected latest retry, got {effect:?}"),
+    };
+    assert_eq!(
+        agent.simulation_last_successfully_sent_wire_revision(),
+        Some(1)
+    );
+    acknowledge_send(&mut agent, generation, cid, third_send);
+    assert_eq!(
+        agent.simulation_last_successfully_sent_wire_revision(),
+        Some(3)
+    );
+    agent
+        .command(AgentCommand::ReplaceDesired(DesiredState {
+            revision: 4,
+            ..DesiredState::default()
+        }))
+        .unwrap();
+    assert_eq!(
+        agent.simulation_last_successfully_sent_wire_revision(),
+        None
+    );
+    acknowledge_send(&mut agent, generation, cid, third_send);
+    assert_eq!(
+        agent.simulation_last_successfully_sent_wire_revision(),
+        None
+    );
+}
+
+#[test]
 fn failed_signaling_send_retries_only_the_latest_complete_intent() {
     let (mut agent, generation, cid, send) = connected_agent();
     agent

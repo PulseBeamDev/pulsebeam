@@ -1040,6 +1040,7 @@ fn ordered_recovery_reports_retention_gaps_without_replaying_late_history() {
         duration: Duration::from_millis(500),
     });
     LocalNodeSim::new()
+        .with_udp_only()
         .with_room(
             Room::new("room-reliable-xshard")
                 .with_participant(Participant::data_participant("pub"))

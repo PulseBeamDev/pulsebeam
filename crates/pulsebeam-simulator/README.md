@@ -19,6 +19,43 @@ or failure injection.
 - `src/tests/common/oracle.rs` models plan-derived intent and compares coherent control, shard, and client observations.
 - `src/tests/native_runtime.rs` is the narrow UniFFI-facing native-runtime vertical slice; the authored scenarios exercise the same runtime through the common harness.
 
+## Native playback contracts
+
+Use `Participant::with_native_playback()` for user-visible playback scenarios.
+It observes actual native I420 and uses authenticated encoded samples only to
+identify the source by admission, generation, receiver and RTP timestamp. It
+does not run an independent decoder or issue keyframe requests because a
+polling observer fell behind. Native decoder feedback remains authoritative.
+
+- `BeginNativePlayback` opens a measurement window without waiting. Set
+  `after_pause` only after an intentional publication absence; it excludes
+  that absence from cadence, not accumulated errors or collector loss.
+- `CheckNativePlayback` requires new nontrivial native pictures, changing
+  content, the requested dimensions, authenticated current-source samples and
+  an actual SDK decoder report. Camera output must be at most 250 ms old with
+  no inter-output gap above 500 ms. `DesktopUpdates` uses the existing
+  five-second visible-output bound rather than imposing camera cadence.
+- `WaitForNativeVideo` bounds first visibility from the step's start. It
+  requires new source-authenticated output, current native pictures and exact
+  room convergence. A subsequent playback window is a separate, explicitly
+  timed continuity claim. Slot replacement also checks the original native
+  receiver identity.
+
+Encoded polling loss remains diagnostic and invalidates retained source
+pairings until new observations authenticate them. It is not native decoder
+loss or proof of misrouting. Native callback collection failure still fails
+playback. Source samples do not establish complete encoded-stream continuity.
+
+Keep `with_encoded_and_native_decoded_video()` and encoded quality assertions
+for scenarios specifically testing encoded forwarding or independent codec
+correctness. Those probes retain their own loss/error budgets. Encoded quality
+assertions reject native-playback-only observations.
+
+These checks establish native decoded output, not UI presentation. Browser and
+production integration evidence remain distinct. A real active-camera freeze
+still fails; redesigning the oracle does not qualify unresolved recovery or
+publication failures.
+
 ## Build profile
 
 Simulator runners apply the workspace's Cargo `sim` optimization and safety
