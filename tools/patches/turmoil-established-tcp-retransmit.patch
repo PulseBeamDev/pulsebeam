@@ -1,0 +1,334 @@
+diff --git a/src/envelope.rs b/src/envelope.rs
+index eb111ee51d16984db05f715ee26c2ffb73529616..a80cb9a90318ee086018e3e65e37a1445b7e9998 100644
+--- a/src/envelope.rs
++++ b/src/envelope.rs
+@@ -30,6 +30,7 @@ pub struct Datagram(pub Bytes);
+ pub enum Segment {
+     Syn(Syn),
+     Data(u64, Bytes),
++    Ack(u64),
+     Fin(u64),
+     Rst,
+ }
+@@ -60,6 +61,7 @@ impl Display for Segment {
+             Segment::Syn(_) => write!(f, "TCP SYN"),
+             Segment::Data(_, data) => hex("TCP", data, f),
+             Segment::Fin(_) => write!(f, "TCP FIN"),
++            Segment::Ack(next) => write!(f, "TCP ACK {next}"),
+             Segment::Rst => write!(f, "TCP RST"),
+         }
+     }
+diff --git a/src/host.rs b/src/host.rs
+index a6b352a3f889f9ce63a4934bbd74bdcb16dd3c03..c752fe45144d126fb2349bda995853c3874aa996 100644
+--- a/src/host.rs
++++ b/src/host.rs
+@@ -7,7 +7,7 @@ use crate::{Envelope, TRACING_TARGET};
+ 
+ use bytes::Bytes;
+ use indexmap::IndexMap;
+-use std::collections::VecDeque;
++use std::collections::{BTreeMap, VecDeque};
+ use std::fmt::Display;
+ use std::io;
+ use std::net::{IpAddr, SocketAddr};
+@@ -15,6 +15,7 @@ use std::ops::RangeInclusive;
+ use std::sync::Arc;
+ #[cfg(feature = "unstable-fs")]
+ use std::sync::Mutex;
++use std::task::Waker;
+ use tokio::sync::{mpsc, Notify};
+ use tokio::time::{Duration, Instant};
+ 
+@@ -118,8 +119,7 @@ impl Host {
+ 
+     /// Receive the `envelope` from the network.
+     ///
+-    /// Returns an Err if a message needs to be sent in response to a failed
+-    /// delivery, e.g. TCP RST.
++    /// Returns an Err if a transport response must be sent, e.g. TCP ACK or RST.
+     // FIXME: This funkiness is necessary due to how message sending works. The
+     // key problem is that the Host doesn't actually send messages, rather the
+     // World is borrowed, and it sends.
+@@ -333,6 +333,7 @@ pub(crate) struct Tcp {
+ 
+     /// TcpStream channel capacity
+     socket_capacity: usize,
++    elapsed: Duration,
+ }
+ 
+ struct ServerSocket {
+@@ -354,11 +355,17 @@ struct StreamSocket {
+     /// A simple reference counter for tracking read/write half drops. Once 0, the
+     /// socket may be removed from the host.
+     ref_ct: usize,
++    unacked: BTreeMap<u64, SequencedSegment>,
++    ack_seq: u64,
++    retransmit_at: Option<Duration>,
++    rto: Duration,
++    retries: u8,
++    send_waker: Option<Waker>,
+ }
+ 
+ /// Stripped down version of [`Segment`] for delivery out to the application
+ /// layer.
+-#[derive(Debug)]
++#[derive(Clone, Debug)]
+ pub(crate) enum SequencedSegment {
+     Data(Bytes),
+     Fin,
+@@ -384,6 +391,12 @@ impl StreamSocket {
+             sender: tx,
+             flow_control: flow_control.clone(),
+             ref_ct: 2,
++            unacked: BTreeMap::new(),
++            ack_seq: 1,
++            retransmit_at: None,
++            rto: Duration::from_secs(1),
++            retries: 0,
++            send_waker: None,
+         };
+ 
+         (sock, rx, flow_control)
+@@ -400,9 +413,12 @@ impl StreamSocket {
+     fn buffer(&mut self, seq: u64, segment: SequencedSegment) -> Result<(), Protocol> {
+         use mpsc::error::TrySendError::*;
+ 
+-        let exists = self.buf.insert(seq, segment);
+-
+-        assert!(exists.is_none(), "duplicate segment {seq}");
++        if seq <= self.recv_seq {
++            return Ok(());
++        }
++        // A duplicate of a buffered segment must still retry draining after
++        // application reads have freed space in the receive channel.
++        self.buf.entry(seq).or_insert(segment);
+ 
+         while self.buf.contains_key(&(self.recv_seq + 1)) {
+             self.recv_seq += 1;
+@@ -424,6 +440,14 @@ impl StreamSocket {
+     }
+ }
+ 
++impl Drop for StreamSocket {
++    fn drop(&mut self) {
++        if let Some(waker) = self.send_waker.take() {
++            waker.wake();
++        }
++    }
++}
++
+ impl Tcp {
+     fn new(capacity: usize) -> Self {
+         Self {
+@@ -431,6 +455,7 @@ impl Tcp {
+             sockets: IndexMap::new(),
+             server_socket_capacity: capacity,
+             socket_capacity: capacity,
++            elapsed: Duration::ZERO,
+         }
+     }
+ 
+@@ -494,6 +519,54 @@ impl Tcp {
+         Some(sock.assign_seq())
+     }
+ 
++    pub(crate) fn send_capacity(
++        &mut self,
++        pair: SocketPair,
++        waker: Option<&Waker>,
++    ) -> Option<bool> {
++        let sock = self.sockets.get_mut(&pair)?;
++        if let Some(waker) = waker {
++            sock.send_waker = Some(waker.clone());
++        }
++        Some(sock.unacked.len() < self.socket_capacity)
++    }
++
++    pub(crate) fn track(&mut self, pair: SocketPair, seq: u64, segment: SequencedSegment) {
++        if let Some(sock) = self.sockets.get_mut(&pair) {
++            sock.unacked.insert(seq, segment);
++            sock.retransmit_at.get_or_insert(self.elapsed + sock.rto);
++        }
++    }
++
++    // Compatibility backport of upstream turmoil-net's unacked-window retry
++    // mechanism (ad57de6). Existing slot sequences/reassembly are retained.
++    // RFC 6298's initial RTO and bounded exponential backoff use virtual time.
++    // SYN and final socket teardown retain the legacy implementation's semantics.
++    pub(crate) fn tick(&mut self, duration: Duration) -> Vec<(SocketPair, Segment)> {
++        self.elapsed += duration;
++        let now = self.elapsed;
++        let mut retransmissions = Vec::new();
++        self.sockets.retain(|pair, sock| {
++            if sock.retransmit_at.is_some_and(|at| at <= now) {
++                if sock.retries == 15 {
++                    return false;
++                }
++                for (&seq, segment) in &sock.unacked {
++                    let segment = match segment {
++                        SequencedSegment::Data(bytes) => Segment::Data(seq, bytes.clone()),
++                        SequencedSegment::Fin => Segment::Fin(seq),
++                    };
++                    retransmissions.push((*pair, segment));
++                }
++                sock.retries += 1;
++                sock.rto = (sock.rto * 2).min(Duration::from_secs(60));
++                sock.retransmit_at = Some(now + sock.rto);
++            }
++            true
++        });
++        retransmissions
++    }
++
+     fn receive_from_network(
+         &mut self,
+         src: SocketAddr,
+@@ -516,13 +589,34 @@ impl Tcp {
+                 }
+             }
+             Segment::Data(seq, data) => match self.sockets.get_mut(&SocketPair::new(dst, src)) {
+-                Some(sock) => sock.buffer(seq, SequencedSegment::Data(data))?,
++                Some(sock) => {
++                    sock.buffer(seq, SequencedSegment::Data(data))?;
++                    return Err(Protocol::Tcp(Segment::Ack(sock.recv_seq + 1)));
++                }
+                 None => return Err(Protocol::Tcp(Segment::Rst)),
+             },
+             Segment::Fin(seq) => match self.sockets.get_mut(&SocketPair::new(dst, src)) {
+-                Some(sock) => sock.buffer(seq, SequencedSegment::Fin)?,
++                Some(sock) => {
++                    sock.buffer(seq, SequencedSegment::Fin)?;
++                    return Err(Protocol::Tcp(Segment::Ack(sock.recv_seq + 1)));
++                }
+                 None => return Err(Protocol::Tcp(Segment::Rst)),
+             },
++            Segment::Ack(next) => {
++                if let Some(sock) = self.sockets.get_mut(&SocketPair::new(dst, src)) {
++                    if next > sock.ack_seq && next <= sock.next_send_seq {
++                        sock.ack_seq = next;
++                        sock.unacked.retain(|seq, _| *seq >= next);
++                        sock.rto = Duration::from_secs(1);
++                        sock.retries = 0;
++                        sock.retransmit_at =
++                            (!sock.unacked.is_empty()).then_some(self.elapsed + sock.rto);
++                        if let Some(waker) = sock.send_waker.take() {
++                            waker.wake();
++                        }
++                    }
++                }
++            }
+             Segment::Rst => {
+                 if self.sockets.get(&SocketPair::new(dst, src)).is_some() {
+                     self.sockets
+diff --git a/src/net/tcp/stream.rs b/src/net/tcp/stream.rs
+index 8a5c9f00db96790dde5b3d1fe7b2de785f88370c..14721b03053a92a75b711d5dfe041274bef0c761 100644
+--- a/src/net/tcp/stream.rs
++++ b/src/net/tcp/stream.rs
+@@ -338,14 +338,18 @@ impl WriteHalf {
+             return Err(io::Error::new(io::ErrorKind::BrokenPipe, "Broken pipe"));
+         }
+ 
+-        if !self.flow_control.try_acquire() {
+-            return Err(io::Error::new(
+-                io::ErrorKind::WouldBlock,
+-                "send buffer full",
+-            ));
+-        }
+-
+         World::current(|world| {
++            let capacity = world
++                .current_host_mut()
++                .tcp
++                .send_capacity(*self.pair, None)
++                .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "Broken pipe"))?;
++            if !capacity || !self.flow_control.try_acquire() {
++                return Err(io::Error::new(
++                    io::ErrorKind::WouldBlock,
++                    "send buffer full",
++                ));
++            }
+             let bytes = Bytes::copy_from_slice(buf);
+             let len = bytes.len();
+             let seq = self.seq(world)?;
+@@ -361,11 +365,23 @@ impl WriteHalf {
+                 "Broken pipe",
+             )));
+         }
+-        if self.flow_control.has_credits() {
+-            return Poll::Ready(Ok(()));
++        let capacity = World::current(|world| {
++            world
++                .current_host_mut()
++                .tcp
++                .send_capacity(*self.pair, Some(cx.waker()))
++        });
++        match capacity {
++            None => Poll::Ready(Err(io::Error::new(
++                io::ErrorKind::BrokenPipe,
++                "Broken pipe",
++            ))),
++            Some(true) if self.flow_control.has_credits() => Poll::Ready(Ok(())),
++            Some(_) => {
++                self.flow_control.register_waker(cx.waker().clone());
++                Poll::Pending
++            }
+         }
+-        self.flow_control.register_waker(cx.waker().clone());
+-        Poll::Pending
+     }
+ 
+     fn poll_write_priv(&self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<Result<usize>> {
+@@ -378,6 +394,12 @@ impl WriteHalf {
+             // for the socket to become writable again.
+             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                 self.flow_control.register_waker(cx.waker().clone());
++                World::current(|world| {
++                    world
++                        .current_host_mut()
++                        .tcp
++                        .send_capacity(*self.pair, Some(cx.waker()));
++                });
+                 Poll::Pending
+             }
+             result => Poll::Ready(result),
+@@ -415,11 +437,19 @@ impl WriteHalf {
+     }
+ 
+     fn send(&self, world: &mut World, segment: Segment) -> Result<()> {
++        let retained = match &segment {
++            Segment::Data(seq, bytes) => Some((*seq, SequencedSegment::Data(bytes.clone()))),
++            Segment::Fin(seq) => Some((*seq, SequencedSegment::Fin)),
++            _ => None,
++        };
+         let message = Protocol::Tcp(segment);
+         if is_same(self.pair.local, self.pair.remote) {
+             send_loopback(self.pair.local, self.pair.remote, message);
+         } else {
+             world.send_message(self.pair.local, self.pair.remote, message)?;
++            if let Some((seq, segment)) = retained {
++                world.current_host_mut().tcp.track(*self.pair, seq, segment);
++            }
+         }
+         Ok(())
+     }
+diff --git a/src/world.rs b/src/world.rs
+index 04229be8d6a464e75b80beb92a8b5fe8dd5ef430..86b8d07f5f15eedaa7ed5cf6d51ff62948f423ce 100644
+--- a/src/world.rs
++++ b/src/world.rs
+@@ -272,10 +272,11 @@ impl World {
+ 
+     /// Tick the host at `addr` by `duration`.
+     pub(crate) fn tick(&mut self, addr: IpAddr, duration: Duration) {
+-        self.hosts
+-            .get_mut(&addr)
+-            .expect("missing host")
+-            .timer
+-            .tick(duration);
++        let host = self.hosts.get_mut(&addr).expect("missing host");
++        host.timer.tick(duration);
++        let retransmissions = host.tcp.tick(duration);
++        for (pair, segment) in retransmissions {
++            let _ = self.send_message(pair.local, pair.remote, Protocol::Tcp(segment));
++        }
+     }
+ }

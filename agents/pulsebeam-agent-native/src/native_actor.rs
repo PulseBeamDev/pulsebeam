@@ -45,6 +45,9 @@ pub struct Config {
     pub media: MediaConfig,
     /// Rust-only callback before polling retention. Defaults to no observer.
     pub decoded_video_observer: Option<crate::DecodedVideoObserver>,
+    /// Rust-only combined-mode observation before encoded polling retention.
+    /// Requires a decoded observer. Defaults to no encoded observer.
+    pub encoded_video_observer: Option<crate::EncodedVideoObserver>,
 }
 impl Config {
     pub fn new(session: agent_core::AgentConfig) -> Self {
@@ -52,6 +55,7 @@ impl Config {
             session,
             media: MediaConfig::default(),
             decoded_video_observer: None,
+            encoded_video_observer: None,
         }
     }
 }
@@ -1111,7 +1115,10 @@ where
             }
         }
         let observer = self.config.decoded_video_observer.clone();
-        let track = self.peer_mut()?.attach(&slot, mode, observer.as_ref())?;
+        let encoded = self.config.encoded_video_observer.clone();
+        let track = self
+            .peer_mut()?
+            .attach(&slot, mode, observer.as_ref(), encoded.as_ref())?;
         let stream = self.streams.entry(slot.clone()).or_insert_with(|| {
             let (sender, _) = broadcast::channel(STREAM_FRAMES);
             StreamObservation {

@@ -320,6 +320,34 @@ impl DecodedVideoObserver {
     }
 }
 
+/// Actual native ordered encoded output, independent of polling retention.
+/// Dropped means unavailable native identity/metadata, not polling queue loss.
+#[derive(Debug)]
+pub enum EncodedVideoObservation {
+    Frame { frame: Box<RemoteFrame> },
+    Dropped { track: RemoteTrack, skipped: u64 },
+}
+
+/// Optional Rust-only synchronous observation of combined video reception.
+/// Do not block or synchronously control the SDK. Panics fail the generation.
+#[derive(Clone)]
+pub struct EncodedVideoObserver(
+    std::sync::Arc<dyn Fn(EncodedVideoObservation) + Send + Sync + 'static>,
+);
+impl std::fmt::Debug for EncodedVideoObserver {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("EncodedVideoObserver(..)")
+    }
+}
+impl EncodedVideoObserver {
+    pub fn new(observer: impl Fn(EncodedVideoObservation) + Send + Sync + 'static) -> Self {
+        Self(std::sync::Arc::new(observer))
+    }
+    pub(crate) fn observe(&self, observation: EncodedVideoObservation) {
+        (self.0)(observation);
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, uniffi::Record)]
 pub struct RemoteFrame {
     pub track: RemoteTrack,
@@ -387,6 +415,7 @@ pub(crate) fn session<R: rtc::SessionRuntime>(
     #[cfg(feature = "sim")]
     if tracing::enabled!(target: crate::native_packet_diagnostics::TARGET, tracing::Level::TRACE)
         || tracing::enabled!(target: crate::native_packet_diagnostics::CC_TARGET, tracing::Level::TRACE)
+        || tracing::enabled!(target: crate::native_packet_diagnostics::TRANSPORT_TARGET, tracing::Level::TRACE)
     {
         builder = builder.event_log_factory(crate::native_packet_diagnostics::Factory::new());
     }

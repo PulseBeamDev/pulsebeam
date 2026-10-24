@@ -31,7 +31,7 @@ successful input admission does not promise encoding or remote delivery.
 | --- | --- | --- |
 | Play or inspect decoded video | `ReceiveMode::Decoded`, owned I420 frames and native receiver statistics | Actual built-in decoding and native playout output. |
 | Inspect encoded access units or run an independent decoder | `ReceiveMode::Encoded`, native-ordered H.264 payload and available metadata | Actual complete-AU observations, not proof of built-in decoding or presentation. |
-| Correlate native decoded output with encoded evidence | `ReceiveMode::EncodedAndDecoded`, both outputs from the same receiver | Native I420 and ordered encoded observations with actual generation/receiver/RTP identity. |
+| Correlate native decoded output with encoded evidence | `ReceiveMode::EncodedAndDecoded`, both outputs from the same receiver | Native I420 and ordered encoded observations with actual generation/receiver/track/RTP identity. |
 | Play decoded audio | `ReceiveMode::Decoded`, owned PCM | Actual native decoded audio, without invented per-block publisher/SSRC attribution. |
 | Inspect native transport or codec statistics | Generation-tagged SDK report JSON | Native fields that the SDK actually reports, not synthesized missing counters. |
 
@@ -66,6 +66,17 @@ callback has no Tokio context. Polling drops are not callback losses. Callback
 collection/conversion failures invalidate strict native qualification. These
 facts establish decoded output, not UI rendering or presentation completion.
 
+For source correlation in combined mode, Rust callers can also configure
+`Config::encoded_video_observer` alongside the decoded observer. It receives
+owned access units through the existing native ordered tap before independent
+polling retention can lose them. Encoded and I420 callbacks may arrive in either
+order. Missing native identity or pending metadata produces an explicit `Dropped`
+observation, which revokes source evidence; polling eviction does not revoke
+independent callback facts. The simulator joins authenticated fixture bytes to
+actual I420 using the full native track identity and RTP timestamp, never a
+catalog assignment or guessed SSRC. Default and generated-language callers
+install neither callback.
+
 ## Focused contributor proof owners
 
 Set up the candidate first. The table names executable owners, not a claim that
@@ -89,6 +100,10 @@ The existing simulator replay owner also includes distinct focused scenarios:
 - `tests::connectivity::a_tcp_connection_recovers_as_the_same_participant_test`:
   controlled plain-TCP framing and same-participant recovery. This is not general
   production TCP/TLS or TURN qualification.
+- `tests::tcp_transport::`: established-stream simulator reliability, including
+  one pooled HTTP connection with exactly one POST admission and capacity-one
+  receive backpressure through FIN retransmission. SYN and final socket teardown
+  retain the simulator's existing semantics; this is not general TCP qualification.
 - `tests::video::marker_only_simulcast_reaches_native_decoded_video_test`:
   marker-only three-rung ingress to a DD-capable receiver, requiring at least 150
   fresh changing 720p native I420 frames in a ten-second world and native decoder
@@ -112,15 +127,16 @@ samples. Dedicated encoded-forwarding/codec scenarios retain their independent
 decoder assertions. The initial-ramp scenario retains its original two-second
 window and encoded quality checks in addition to native proof.
 
-The latest scoped regression ran 178 fast and 15 slow scenarios with only the
-two exclusions below. All four redesigned playback cases passed in both focused
-and aggregate execution. One fast case still failed recovery roster convergence
-(`tests::connectivity::simulation_test`); one slow case failed its five-second
-publication setup before comparing shard layouts
-(`tests::properties::slow::sharding_does_not_change_who_is_served`). Controlled
-RTC interoperability and browser checks passed using unchanged cached inputs.
-The native lifecycle case passed this run, but its earlier native continuity
-freeze is retained as unresolved reliability evidence, not a proven causal fix.
+The latest scoped regression passes all 182 fast and 15 slow committed cases
+with only the two exclusions below, using the same pinned source/native pair.
+Root checks, all non-simulator fast owners, controlled RTC interoperability and
+browser checks also pass. The original recovery roster and five-second
+publication setup cases pass without changing their deadlines or assertions.
+Established-stream TCP retransmission repairs the lost signaling request;
+BoringSSL DTLS retransmission now uses the controlled native clock. Playback
+source proof uses actual native callbacks rather than requiring complete encoded
+polling. The native lifecycle case also passes; earlier retained freeze traces
+have not been individually causally attributed by this renewal.
 
 These scoped witnesses are not a replacement for whole-workspace acceptance.
 The catalog-sensitive

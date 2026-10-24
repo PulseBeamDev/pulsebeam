@@ -28,5 +28,7 @@ mod native_source;
 
 pub use native_actor::*;
 pub use native_media::*;
+#[cfg(feature = "sim")]
+pub use native_packet_diagnostics::capture_native_transport;
 
 uniffi::setup_scaffolding!();

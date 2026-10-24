@@ -10,6 +10,7 @@ pub mod native_runtime;
 pub mod properties;
 pub mod room_isolation;
 pub mod subscriptions;
+pub mod tcp_transport;
 pub mod video;
 
 #[cfg(test)]

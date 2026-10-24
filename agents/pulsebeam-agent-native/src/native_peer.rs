@@ -818,12 +818,13 @@ impl<R: rtc::SessionRuntime> NativePeer<R> {
         slot: &MediaSlot,
         mode: ReceiveMode,
         observer: Option<&crate::DecodedVideoObserver>,
+        encoded: Option<&crate::EncodedVideoObserver>,
     ) -> Result<crate::RemoteTrack, rtc::PeerError> {
         let receiver = self
             .receivers
             .get_mut(slot)
             .ok_or_else(|| error("native remote track is not available"))?;
-        receiver.attach(&mut self.session, mode, observer)?;
+        receiver.attach(&mut self.session, mode, observer, encoded)?;
         Ok(receiver.track.clone())
     }
     pub fn detach(&mut self, slot: &MediaSlot) -> Result<(), rtc::PeerError> {
@@ -1008,22 +1009,27 @@ mod tests {
         assert!(!peer.enable(&local, &current, false).unwrap());
         assert!(peer.enable(&local, &current, true).unwrap());
         let remote = MediaSlot::RemoteAudio(0);
-        let track = peer.attach(&remote, ReceiveMode::Decoded, None).unwrap();
+        let track = peer
+            .attach(&remote, ReceiveMode::Decoded, None, None)
+            .unwrap();
         assert_eq!(track.generation, generation.get());
         assert!(!track.track_id.is_empty());
         assert!(peer.frame(&remote, false).unwrap().is_none());
-        assert!(peer.attach(&remote, ReceiveMode::Encoded, None).is_err());
+        assert!(
+            peer.attach(&remote, ReceiveMode::Encoded, None, None)
+                .is_err()
+        );
         peer.detach(&remote).unwrap();
         // Native PCM attachment can precede negotiation. Encoded interception
         // additionally requires Opus in the receiver's actual GetParameters.
         let refused = peer
-            .attach(&remote, ReceiveMode::Encoded, None)
+            .attach(&remote, ReceiveMode::Encoded, None, None)
             .unwrap_err();
         assert_eq!(refused.kind, rtc::PeerErrorKind::InvalidState);
         assert_eq!(peer.receivers.get(&remote).unwrap().mode, None);
         assert!(peer.dropped_frames(&remote).is_err());
         let refused = peer
-            .attach(&remote, ReceiveMode::EncodedAndDecoded, None)
+            .attach(&remote, ReceiveMode::EncodedAndDecoded, None, None)
             .unwrap_err();
         assert_eq!(refused.kind, rtc::PeerErrorKind::UnsupportedParameter);
         assert_eq!(peer.receivers.get(&remote).unwrap().mode, None);

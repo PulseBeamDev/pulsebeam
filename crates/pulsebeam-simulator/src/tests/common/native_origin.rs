@@ -27,6 +27,7 @@ struct NativePicture {
 
 #[derive(Clone, Debug, Default)]
 struct Picture {
+    track: Option<RemoteTrack>,
     origin: Origin,
     native: Option<NativePicture>,
     credited: bool,
@@ -77,6 +78,21 @@ impl NativeOriginCorrelation {
         self.pictures.insert(key, Picture::default());
     }
 
+    fn bind_track(&mut self, key: Key, track: &RemoteTrack) -> bool {
+        self.admit(key);
+        let picture = self.pictures.get_mut(&key).unwrap();
+        if let Some(previous) = &picture.track {
+            if previous != track {
+                picture.origin = Origin::Conflict;
+                self.receipts.retain(|receipt| receipt.key != key);
+                return false;
+            }
+        } else {
+            picture.track = Some(track.clone());
+        }
+        true
+    }
+
     /// A missing encoded observation can conceal conflicting provenance. No
     /// pre-loss mapping or receipt remains admissible; only newly paired actual
     /// observations can establish a subsequent positive source witness.
@@ -92,7 +108,9 @@ impl NativeOriginCorrelation {
         let Some(key) = Self::key(frame) else {
             return;
         };
-        self.admit(key);
+        if !self.bind_track(key, &frame.track) {
+            return;
+        }
         let picture = self.pictures.get_mut(&key).unwrap();
         picture.origin = match (&picture.origin, origin) {
             (Origin::Unseen, Some(origin)) => Origin::Unique(origin.to_owned()),
@@ -117,8 +135,10 @@ impl NativeOriginCorrelation {
         let Some(key) = Self::key(frame) else {
             return;
         };
-        self.admit(key);
         self.latest.insert((key.0, key.1), key);
+        if !self.bind_track(key, &frame.track) {
+            return;
+        }
         // Duplicate callbacks never become fresh output a second time.
         self.pictures
             .get_mut(&key)
@@ -208,8 +228,23 @@ impl NativeOriginCorrelation {
                 });
             }
         }
+        // Retain only bounded observation metadata in a failed witness. In
+        // particular, distinguish missing native output from a pending or
+        // conflicting encoded-source correlation without dumping pixel data.
+        let latest: Vec<_> = self
+            .latest
+            .iter()
+            .take(8)
+            .map(|(receiver, key)| (receiver, key, self.pictures.get(key)))
+            .collect();
+        let matching = self
+            .receipts
+            .iter()
+            .filter(|receipt| receipt.origin == origin && receipt.key.0 == generation)
+            .count();
         anyhow::bail!(
-            "no fresh native I420 source proof for {origin}, generation {generation}, minimum {min_frames} frames at {min_dimensions:?}"
+            "no fresh native I420 source proof for {origin}, generation {generation}, minimum {min_frames} frames at {min_dimensions:?}; pictures={}, matching_receipts={matching}, latest={latest:?}",
+            self.pictures.len()
         )
     }
 }
@@ -325,6 +360,52 @@ mod tests {
         log.encoded(&missing, Some("new/v0"));
         log.decoded(&frame(10, 4, true), output, true);
         assert!(log.require_since("new/v0", 1, start, 1, (4, 4)).is_err());
+    }
+
+    #[test]
+    fn track_identity_must_match_even_if_the_native_rtp_key_collides() {
+        let start = Instant::now();
+        let output = start + Duration::from_millis(1);
+        for field in 0..3 {
+            for decoded_first in [false, true] {
+                let encoded = frame(10, 1, false);
+                let mut decoded = frame(10, 1, true);
+                match field {
+                    0 => decoded.track.track_id = "another-native-track".into(),
+                    1 => decoded.track.mid = "another-mid".into(),
+                    _ => decoded.track.media_index += 1,
+                }
+                let mut log = NativeOriginCorrelation::default();
+                if decoded_first {
+                    log.decoded(&decoded, output, true);
+                }
+                log.encoded(&encoded, Some("admission/v0"));
+                if !decoded_first {
+                    log.decoded(&decoded, output, true);
+                }
+                assert!(
+                    log.require_since("admission/v0", 1, start, 1, (4, 4))
+                        .is_err(),
+                    "different native track identities cannot be paired"
+                );
+
+                let mut log = NativeOriginCorrelation::default();
+                log.encoded(&encoded, Some("admission/v0"));
+                log.decoded(&frame(10, 1, true), output, true);
+                assert!(
+                    log.require_since("admission/v0", 1, start, 1, (4, 4))
+                        .is_ok()
+                );
+                let mut conflicting = encoded.clone();
+                conflicting.track = decoded.track;
+                log.encoded(&conflicting, Some("admission/v0"));
+                assert!(
+                    log.require_since("admission/v0", 1, start, 1, (4, 4))
+                        .is_err(),
+                    "conflicting track evidence must revoke a prior receipt"
+                );
+            }
+        }
     }
 
     #[test]
