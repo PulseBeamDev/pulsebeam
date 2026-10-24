@@ -10,7 +10,7 @@ rust_library(
     crate_root = "src/lib.rs",
     srcs = ["src/lib.rs", "src/h264_fixture.rs"],
     edition = "2024",
-    deps = ["@webrtc_source//:pulsebeam-webrtc-sys"],
+    deps = ["//crates/pulsebeam-libwebrtc-sys:pulsebeam-webrtc-sys"],
 )
 
 rust_test(
@@ -39,5 +39,5 @@ rust_test(
     crate_root = "tests/interop.rs",
     srcs = ["tests/interop.rs"],
     edition = "2024",
-    deps = ["@webrtc_source//:pulsebeam-webrtc-sys", "@crates//:bytes", "//crates/pulsebeam-rtc:pulsebeam-rtc"],
+    deps = ["//crates/pulsebeam-libwebrtc-sys:pulsebeam-webrtc-sys", "@crates//:bytes", "//crates/pulsebeam-rtc:pulsebeam-rtc"],
 )

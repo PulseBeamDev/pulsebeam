@@ -25,7 +25,7 @@ needs the updated configuration; disk caches remain available after shutdown.
 | Go server SDK | `server/go/go.mod`, standard library only | Go compilation toolchain and consumer-owned verification share the derived SDK |
 | Python server SDK dependencies | `server/python/pyproject.toml` (public requirements), `requirements.in`/hashed `requirements.lock` (repository tools and concrete test resolution) | rules_python pip hub |
 | Browser binaries/drivers | `tools/browser-matrix.json` | Browser extension and consumer-owned Web/React coverage |
-| Native WebRTC inputs | Sys source archive and prebuilt native archive checksums in `tools/webrtc-candidate.json` | Native SDK and controlled RTC simulation, using one sys/CXX target |
+| Native WebRTC inputs | Package-owned pins, patches and GN configuration in `crates/pulsebeam-libwebrtc-sys` | Local Rust sys target, GN native build and controlled RTC simulation |
 | Runtime image | Immutable cc-debian13 manifest digest in `MODULE.bazel` | rules_oci image |
 | Release identity/version/layout | Server Cargo manifest and `release/distribution.toml` | Archives, installer, plans and publication |
 
@@ -37,41 +37,34 @@ After editing authoritative Rust/generator inputs, explicitly run
 Cargo/pnpm lock maintenance remains separate from supported application
 compilation; CI does not install parallel host tools.
 
-### Use the local native WebRTC candidate
+### Build the local WebRTC bindings
 
-Native SDK and controlled RTC builds require the unpublished Linux x86_64
-candidate recorded in `tools/webrtc-candidate.json`. There is no release URL
-fallback. Obtain both archives from the candidate producer, then select them:
+Native SDK and controlled RTC builds consume
+[`crates/pulsebeam-libwebrtc-sys`](../crates/pulsebeam-libwebrtc-sys/README.md).
+Normal Bazel commands acquire pinned WebRTC/DEPS sources and tools through the
+package repository rule, then compile WebRTC, CXX and the adapters with GN/Ninja
+in a declared action. No candidate archives, preparation command, archive
+environment variables or external sys worktree are required.
 
 ```sh
-export PULSEBEAM_WEBRTC_SOURCE_ARCHIVE=/absolute/path/webrtc-sys-source-linux-x86_64.tar.gz
-export PULSEBEAM_WEBRTC_NATIVE_ARCHIVE=/absolute/path/webrtc-core-linux-x86_64.tar.gz
-./bazel run //tools:prepare-webrtc-candidate -- \
-  --source "$PULSEBEAM_WEBRTC_SOURCE_ARCHIVE" \
-  --native "$PULSEBEAM_WEBRTC_NATIVE_ARCHIVE"
-./bazel test //tools:webrtc_candidate_contract //crates/pulsebeam-rtc/simulation:interop
+./bazel test //crates/pulsebeam-libwebrtc-sys:fast \
+  //crates/pulsebeam-rtc/simulation:h264_fixture \
+  //crates/pulsebeam-rtc/simulation:packet_bridge
 ```
 
-Preparation verifies the locked archive checksums, source Git archive revision,
-producer bridge/configuration provenance, native library checksum, and license
-inventory. It installs ignored source/native inputs under `.native-candidate`;
-Cargo metadata uses that prepared source. Do not edit these extracted inputs.
-Bazel independently extracts the same checksum-pinned archives and validates
-their pairing before compiling the single Rust sys/CXX target. Consumer actions
-never compile the producer's C++ sources. The shell exports are passed to
-repository rules by `.bazelrc`; keep them set for native builds and Rust metadata
-maintenance. Wrong or missing inputs fail instead of selecting an older archive. Filenames
-alone do not identify a compatible pair: the lock is authoritative. In particular,
-a producer native-adapter change requires rebuilding/exporting the matching native
-artifact, not just replacing its source archive or editing its manifest checksum.
-Keep the selected pair fixed throughout a verification batch. Candidate preparation
-and passing component checks are not full qualification; see the native owner's
-[support and verification scope](../agents/pulsebeam-agent-native/QUALIFICATION.md).
+Linux x86_64 core is the default. The package-owned `flavor` setting selects
+native consistently across the configured graph, including Rust feature cfgs.
+The native package owns desktop libraries from its pinned target sysroot, not
+the global application SDK. Both configurations retain software codecs and
+protobuf events. See the package guide for native and focused ASan commands.
 
-To update the candidate, package a committed producer source using
-`git archive <revision> | gzip -n`, build its matching native artifact, update the
-lock's revision and archive checksums, and repeat preparation and Rust dependency
-maintenance. Remote publication and non-Linux runtime qualification are separate.
+Whole-native-build caching is intentional. Ordinary Rust edits reuse the native
+result; bridge, adapter, patch, pin, toolchain or GN configuration edits may
+rebuild the whole native graph. Acquisition may use the network; native compile
+and link actions may not. Update native pins and behavior patches in the package,
+then run both configurations and the affected consumer proofs. Runtime limits
+remain documented by the native owner's
+[support and verification scope](../agents/pulsebeam-agent-native/QUALIFICATION.md).
 
 ### Update RTC's upstream str0m
 

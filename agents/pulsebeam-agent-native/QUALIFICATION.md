@@ -1,23 +1,23 @@
-# Native candidate support and verification scope
+# Native support and verification scope
 
 Use this page to choose a receive mode, identify the relevant contributor proof,
-and understand what the local candidate does not establish. Start with the
+and understand what the local integration does not establish. Start with the
 [native API guide](README.md) for source ownership and session setup.
 
 ## Supported local integration
 
-The candidate is unpublished and targets Linux x86_64. Applications provide
+The native integration is unpublished and targets Linux x86_64. Applications provide
 capture, device permissions, rendering and credentials. The same libwebrtc actor
 runs with production `ThreadedRuntime` services or controlled execution services;
 core owns session, topology, topics and recovery policy.
 
-Use the matching source/native archives selected by
-[`tools/webrtc-candidate.json`](../../tools/webrtc-candidate.json), not an arbitrary
-producer checkout or an archive with the same filename. Follow the
-[candidate preparation procedure](../../tools/README.md#use-the-local-native-webrtc-candidate).
-The source Git revision, both archive digests and producer provenance must agree.
-Native C++ adapter changes require a matching native artifact export. Extracted
-candidate inputs and generated foreign bindings are not editable source.
+Use the [local sys package](../../crates/pulsebeam-libwebrtc-sys/README.md), which
+owns pinned upstream acquisition, behavior patches and the declared GN native
+build. Core is the default; the package-owned flavor setting selects native for
+the complete configured dependency graph. Rust bridge declarations and C++
+adapters are editable local source and invalidate the applicable native action.
+Bazel owns the resulting libraries and native desktop runtime closure. Generated
+foreign bindings remain build outputs, not editable source.
 
 Local inputs are owned PCM/I420 or admitted encoded Opus/Annex-B H.264. H.264
 supports L1T1, single-encoding L1T3, and the documented three-encoding L1T1
@@ -79,13 +79,13 @@ install neither callback.
 
 ## Focused contributor proof owners
 
-Set up the candidate first. The table names executable owners, not a claim that
+Use the local source build described above. The table names executable owners, not a claim that
 every aggregate gate is green. Use the [testing contract](../../docs/build.md#testing-contract)
 to select affected checks and reuse unchanged evidence.
 
 | Boundary | Executable owner |
 | --- | --- |
-| Archive pairing and negative mismatch checks | `//tools:webrtc_candidate_contract` |
+| Sys codec/runtime behavior, native linking and lifetime | `//crates/pulsebeam-libwebrtc-sys:fast`, `:runtime_tests`, `:lifetime` in separate core/native configurations |
 | Native API, admission, controls and lifecycle components | `//agents/pulsebeam-agent-native:unit_tests`, `:format`, `:clippy` |
 | Current dynamic ABI, generated Python use, real-SFU I420 media and retirement | `//crates/pulsebeam-cli:production_native` |
 | Generated Swift/Kotlin/Python artifacts and native library variants | `//agents/pulsebeam-agent-native:bindings`, `:native_static`, `:pulsebeam-agent-native-sim` |

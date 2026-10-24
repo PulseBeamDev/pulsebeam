@@ -21,7 +21,7 @@ rust_library(
     rustc_env_files = [":cargo_env"],
     lint_config = ":lints",
     aliases = aliases() | {"//agents/pulsebeam-agent-core:pulsebeam-agent-core": "agent_core"},
-    deps = all_crate_deps(normal = True) + ["@webrtc_source//:pulsebeam-webrtc-sys", "//agents/pulsebeam-agent-core:pulsebeam-agent-core", "//crates/pulsebeam-core:pulsebeam-core-http"],
+    deps = all_crate_deps(normal = True) + ["//crates/pulsebeam-libwebrtc-sys:pulsebeam-webrtc-sys", "//agents/pulsebeam-agent-core:pulsebeam-agent-core", "//crates/pulsebeam-core:pulsebeam-core-http"],
     proc_macro_deps = all_crate_deps(proc_macro = True),
 )
 
@@ -37,7 +37,7 @@ rust_library(
     rustc_env_files = [":cargo_env"],
     lint_config = ":lints",
     aliases = aliases() | {"//agents/pulsebeam-agent-core:pulsebeam-agent-core-sim": "agent_core"},
-    deps = all_crate_deps(normal = True) + ["@webrtc_source//:pulsebeam-webrtc-sys", "//agents/pulsebeam-agent-core:pulsebeam-agent-core-sim", "//crates/pulsebeam-core:pulsebeam-core-http-sim"],
+    deps = all_crate_deps(normal = True) + ["//crates/pulsebeam-libwebrtc-sys:pulsebeam-webrtc-sys", "//agents/pulsebeam-agent-core:pulsebeam-agent-core-sim", "//crates/pulsebeam-core:pulsebeam-core-http-sim"],
     proc_macro_deps = all_crate_deps(proc_macro = True),
 )
 
@@ -62,7 +62,7 @@ rust_shared_library(
     rustc_env_files = [":cargo_env"],
     lint_config = ":lints",
     aliases = aliases() | {"//agents/pulsebeam-agent-core:pulsebeam-agent-core": "agent_core"},
-    deps = all_crate_deps(normal = True) + ["@webrtc_source//:pulsebeam-webrtc-sys", "//agents/pulsebeam-agent-core", "//crates/pulsebeam-core:pulsebeam-core-http"],
+    deps = all_crate_deps(normal = True) + ["//crates/pulsebeam-libwebrtc-sys:pulsebeam-webrtc-sys", "//agents/pulsebeam-agent-core", "//crates/pulsebeam-core:pulsebeam-core-http"],
     proc_macro_deps = all_crate_deps(proc_macro = True),
 )
 
@@ -77,7 +77,7 @@ rust_static_library(
     rustc_env_files = [":cargo_env"],
     lint_config = ":lints",
     aliases = aliases() | {"//agents/pulsebeam-agent-core:pulsebeam-agent-core": "agent_core"},
-    deps = all_crate_deps(normal = True) + ["@webrtc_source//:pulsebeam-webrtc-sys", "//agents/pulsebeam-agent-core", "//crates/pulsebeam-core:pulsebeam-core-http"],
+    deps = all_crate_deps(normal = True) + ["//crates/pulsebeam-libwebrtc-sys:pulsebeam-webrtc-sys", "//agents/pulsebeam-agent-core", "//crates/pulsebeam-core:pulsebeam-core-http"],
     proc_macro_deps = all_crate_deps(proc_macro = True),
 )
 

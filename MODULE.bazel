@@ -95,19 +95,6 @@ http_file(
 )
 
 http_archive = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
-webrtc_candidate = use_repo_rule("//tools:webrtc-candidate.bzl", "webrtc_candidate")
-webrtc_candidate(
-    name = "libwebrtc_core",
-    kind = "native",
-    lock = "//tools:webrtc-candidate.json",
-    build_file = "//tools:webrtc-native.BUILD.bazel",
-)
-webrtc_candidate(
-    name = "webrtc_source",
-    kind = "source",
-    lock = "//tools:webrtc-candidate.json",
-    build_file = "//tools:webrtc-source.BUILD.bazel",
-)
 
 # npm >=11.5.1 supports GitHub OIDC trusted publishing. Its bundled dependencies
 # are provisioned with the CLI, independently of application package lockfiles.
@@ -118,6 +105,10 @@ http_archive(
     strip_prefix = "package",
     build_file_content = 'load("@aspect_rules_js//js:defs.bzl", "js_binary")\njs_binary(name = "npm", entry_point = "bin/npm-cli.js", data = glob(["**"], exclude = ["BUILD.bazel"]), visibility = ["//visibility:public"])',
 )
+
+webrtc = use_extension("//crates/pulsebeam-libwebrtc-sys:repositories.bzl", "webrtc")
+use_repo(webrtc, "webrtc_upstream", "webrtc_host", "webrtc_test_tools")
+include("//crates/pulsebeam-libwebrtc-sys:deps.MODULE.bazel")
 
 include("//tools:rust-pins.MODULE.bazel")
 
@@ -157,13 +148,6 @@ crate.annotation(
     build_script_tools = ["@nasm//:nasm"],
     build_script_env = {"NASM": "$(execpath @nasm//:nasm)"},
 )
-crate.annotation(
-    crate = "pulsebeam-webrtc-sys",
-    version = "=0.9.0",
-    repositories = ["crates"],
-    override_target_lib = "@webrtc_source//:pulsebeam-webrtc-sys",
-    gen_build_script = "off",
-)
 # Cargo's custom tokio_unstable cfg is applied by .bazelrc, but crate-universe
 # does not include cfg-gated edges in its generated platform selects.
 crate.annotation(crate = "tokio", deps = ["@crates//tracing"], repositories = ["crates"])
@@ -188,11 +172,3 @@ crate.annotation(
 )
 use_repo(crate, "crates")
 
-crate.spec(package = "cxxbridge-macro", version = "=1.0.200", repositories = ["rtc_libwebrtc"])
-crate.spec(package = "foldhash", version = "=0.2.0", default_features = False, features = ["std"], repositories = ["rtc_libwebrtc"])
-crate.from_specs(
-    name = "rtc_libwebrtc",
-    supported_platform_triples = ["x86_64-unknown-linux-gnu"],
-    host_tools = "@pulsebeam_rust_host_tools//:BUILD.bazel",
-)
-use_repo(crate, "rtc_libwebrtc")

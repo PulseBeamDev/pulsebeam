@@ -1,0 +1,85 @@
+load("@bazel_skylib//rules:common_settings.bzl", "bool_flag", "string_flag")
+load("@rules_cc//cc:defs.bzl", "cc_import", "cc_library")
+load("@rules_python//python:defs.bzl", "py_test")
+load("@rules_rust//rust:defs.bzl", "rust_clippy_test", "rust_library", "rust_shared_library", "rust_test", "rustfmt_test")
+load(":native_build.bzl", "native_build")
+load(":tests.bzl", "ASAN_FLAGS", "runtime_tests")
+
+package(default_visibility = ["//visibility:public"])
+exports_files(glob(["patches/*.patch", "gn/**"]) + ["Cargo.toml", "repositories.bzl", "deps.MODULE.bazel"])
+filegroup(name = "cargo_metadata_inputs", srcs = ["Cargo.toml"] + glob(["src/**/*.rs", "examples/*.rs"]))
+filegroup(name = "workflow_inputs", srcs = ["README.md"])
+
+string_flag(name = "flavor", build_setting_default = "core", values = ["core", "native"])
+bool_flag(name = "asan", build_setting_default = False)
+config_setting(name = "native_selected", flag_values = {":flavor": "native"})
+config_setting(name = "asan_selected", flag_values = {":asan": "true"})
+
+native_build(
+    name = "gn_native",
+    bridge = "src/bridge.rs",
+    adapters = glob(["native/**"]),
+)
+
+[
+    filegroup(name = name + "_archive", srcs = [":gn_native"], output_group = name)
+    for name in ["pulsebeam", "webrtc", "runtime"]
+]
+[
+    cc_import(name = name + "_import", static_library = ":" + name + "_archive", visibility = ["//visibility:private"])
+    for name in ["pulsebeam", "webrtc", "runtime"]
+]
+cc_library(
+    name = "native_link",
+    deps = [":pulsebeam_import", ":webrtc_import", ":runtime_import"] + select({
+        ":native_selected": ["@webrtc_upstream//:desktop"],
+        "//conditions:default": [],
+    }),
+    linkopts = ["-lpthread", "-ldl", "-lrt", "-lm"],
+)
+
+rust_library(
+    name = "pulsebeam-webrtc-sys",
+    crate_name = "pulsebeam_webrtc_sys",
+    crate_root = "src/lib.rs",
+    srcs = glob(["src/**/*.rs"]),
+    edition = "2024",
+    crate_features = select({":native_selected": ["native"], "//conditions:default": []}),
+    deps = ["@crates//:cxx"],
+    link_deps = [":native_link"],
+)
+
+rust_test(
+    name = "unit_tests",
+    crate = ":pulsebeam-webrtc-sys",
+    args = ["--test-threads=1"],
+    rustc_flags = select({":asan_selected": ASAN_FLAGS, "//conditions:default": []}),
+    compile_data = select({":asan_selected": ["@webrtc_upstream//:clang_tools", "@webrtc_upstream//:clang++"], "//conditions:default": []}),
+)
+
+runtime_tests(
+    sources = glob(["tests/*.rs"], exclude = ["tests/device_smoke.rs", "tests/camera_callbacks.rs", "tests/desktop_callbacks.rs"]),
+    support = glob(["tests/common/**/*.rs", "tests/support/**/*.rs", "tests/installed_packet_socket/**/*.rs", "tests/production_sdk_wake_drop/**/*.rs"]),
+    fixtures = glob(["tests/fixtures/*.opus", "tests/fixtures/*.vp8"]),
+)
+
+rust_shared_library(
+    name = "native_dynamic",
+    crate_root = "examples/native_dynamic.rs",
+    srcs = ["examples/native_dynamic.rs"],
+    edition = "2024",
+    deps = [":pulsebeam-webrtc-sys"],
+)
+py_test(
+    name = "shared_smoke",
+    srcs = ["shared_smoke.py"],
+    data = [":native_dynamic"],
+    args = ["$(rootpath :native_dynamic)"],
+)
+
+rustfmt_test(name = "format", targets = [":pulsebeam-webrtc-sys"])
+rust_clippy_test(name = "clippy", targets = [":pulsebeam-webrtc-sys"])
+test_suite(
+    name = "fast",
+    tests = [":unit_tests", ":lifetime", ":managed_h264", ":managed_vp8", ":managed_vp9", ":managed_av1", ":event_log_codec", ":audio_processing", ":shared_smoke"],
+)

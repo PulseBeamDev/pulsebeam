@@ -1,0 +1,35 @@
+# PulseBeam packages GN native outputs for a Rust linker, without GN Rust rlibs.
+# Restrict the extra visibility to those two native-only packaging targets.
+diff --git a/BUILD.gn b/BUILD.gn
+--- a/BUILD.gn
++++ b/BUILD.gn
+@@ -523,6 +523,7 @@ if (!build_with_chromium) {
+     visibility = [
+       "//:default",
+       "//:webrtc_lib_link_test",
++      "//pulsebeam:pulsebeam",
+     ]
+ 
+     sources = []
+diff --git a/buildtools/third_party/libc++/BUILD.gn b/buildtools/third_party/libc++/BUILD.gn
+--- a/buildtools/third_party/libc++/BUILD.gn
++++ b/buildtools/third_party/libc++/BUILD.gn
+@@ -399,6 +399,7 @@ target(libcxx_target_type, "libc++") {
+   visibility = [
+     "//build/config:common_deps",
+     "//third_party/catapult/devil",
++    "//pulsebeam:runtime",
+   ]
+   if (is_linux) {
+     # This target packages libc++.so, so must have an explicit dependency on
+diff --git a/buildtools/third_party/libc++abi/BUILD.gn b/buildtools/third_party/libc++abi/BUILD.gn
+--- a/buildtools/third_party/libc++abi/BUILD.gn
++++ b/buildtools/third_party/libc++abi/BUILD.gn
+@@ -12,6 +12,7 @@ target(libcxxabi_target_type, "libc++abi") {
+   } else {
+     visibility = [ "//buildtools/third_party/libc++" ]
+   }
++  visibility += [ "//pulsebeam:runtime" ]
+ 
+   # Fuchsia builds don't link against any libraries that provide stack
+   # unwinding symbols, unlike Linux does with glibc (same applies for Android).

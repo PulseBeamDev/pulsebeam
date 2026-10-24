@@ -1,0 +1,23 @@
+# CXX native code and the C++ runtime belong exclusively to the GN action.
+crate = use_extension("@rules_rust//crate_universe:extensions.bzl", "crate")
+crate.annotation(
+    crate = "cxx",
+    version = "=1.0.194",
+    gen_build_script = "off",
+    # Bzlmod drops empty overrides; forward the upstream native target to GN.
+    additive_build_file_content = """
+alias(
+    name = "cxx_cc",
+    actual = "@pulsebeam//crates/pulsebeam-libwebrtc-sys:native_link",
+)
+""",
+    label_injections = {"//:BUILD.bazel": "@pulsebeam"},
+    rustc_flags = ["--cfg=built_with_cargo"],
+    repositories = ["crates"],
+)
+crate.annotation(
+    crate = "link-cplusplus",
+    gen_build_script = "off",
+    crate_features = ["nothing"],
+    repositories = ["crates"],
+)

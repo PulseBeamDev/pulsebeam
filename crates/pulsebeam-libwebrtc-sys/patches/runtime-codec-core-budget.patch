@@ -1,0 +1,65 @@
+diff --git a/call/call.cc b/call/call.cc
+index 15b8d57b2f512f72a8231b97e5f29a5e1903d50c..1f69253bc894b4bd0b1c16ac40835e5123622f6b 100644
+--- a/call/call.cc
++++ b/call/call.cc
+@@ -717,7 +717,8 @@ Call::Call(CallConfig config,
+                                                      config.decode_metronome,
+                                                      worker_thread_)
+               : nullptr),
+-      num_cpu_cores_(cpu_info::DetectNumberOfCores()),
++      num_cpu_cores_(config.codec_core_budget ? *config.codec_core_budget
++                                            : cpu_info::DetectNumberOfCores()),
+       call_stats_(new CallStats(&env_.clock(), worker_thread_)),
+       bitrate_allocator_(new BitrateAllocator(
+           this,
+@@ -739,6 +740,7 @@ Call::Call(CallConfig config,
+       start_of_call_(env_.clock().CurrentTime()),
+       transport_send_ptr_(transport_send.get()),
+       transport_send_(std::move(transport_send)) {
++  RTC_CHECK_GT(num_cpu_cores_, 0);
+   RTC_DCHECK(network_thread_);
+   RTC_DCHECK(worker_thread_->IsCurrent());
+ 
+diff --git a/call/call_config.h b/call/call_config.h
+index d4a2a37e0d98c3b79a29c510184ee975387cf3b4..f440533f2ed9c9bf03c0f29e48ca8277f55cc143 100644
+--- a/call/call_config.h
++++ b/call/call_config.h
+@@ -47,6 +47,11 @@ struct CallConfig {
+ 
+   Environment env;
+ 
++  // Optional execution-resource budget for video codec cores. Must be positive
++  // when set. Unset preserves host core detection. This is not a process-wide
++  // worker limit and does not change standalone codec initialization settings.
++  std::optional<int> codec_core_budget;
++
+   // Bitrate config used until valid bitrate estimates are calculated. Also
+   // used to cap total bitrate used. This comes from the remote connection.
+   BitrateConstraints bitrate_config;
+diff --git a/rtc_base/openssl_stream_adapter.cc b/rtc_base/openssl_stream_adapter.cc
+index a40c4ec6dc6bc76125db476a6ae1b7578d9005d7..45e866a4bd3d3865cc9ed67dc901e233c33dd449 100644
+--- a/rtc_base/openssl_stream_adapter.cc
++++ b/rtc_base/openssl_stream_adapter.cc
+@@ -52,6 +52,7 @@
+ #include "rtc_base/string_encode.h"
+ #include "rtc_base/synchronization/mutex.h"
+ #include "rtc_base/task_utils/repeating_task.h"
++#include "rtc_base/time_utils.h"
+ #include "system_wrappers/include/clock.h"
+ 
+ #ifdef OPENSSL_IS_BORINGSSL
+@@ -1167,6 +1168,14 @@ SSL_CTX* OpenSSLStreamAdapter::SetupSSLContext() {
+     // Clock should be injected to set one for testing.
+     RTC_CHECK(env_.has_value());
+     clock_for_testing_.emplace(ctx, &env_->clock());
++  } else if (GetClockForTesting()) {
++    // Controlled execution must drive BoringSSL deadlines from the same native
++    // clock as delayed tasks. The callback's SSL argument may be null.
++    SSL_CTX_set_current_time_cb(ctx, +[](const SSL*, timeval* out_clock) {
++      const int64_t time_us = TimeMicros();
++      out_clock->tv_sec = time_us / TimeDelta::Seconds(1).us();
++      out_clock->tv_usec = time_us % TimeDelta::Seconds(1).us();
++    });
+   }
+   SSL_CTX_set0_buffer_pool(ctx, openssl::GetBufferPool());
+ #endif

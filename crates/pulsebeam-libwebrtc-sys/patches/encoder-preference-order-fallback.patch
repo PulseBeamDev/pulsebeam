@@ -1,0 +1,76 @@
+diff --git a/media/engine/webrtc_video_engine.cc b/media/engine/webrtc_video_engine.cc
+index fd1b4a4ca87efff42215ebee2337ff062dd2d12a..dda833dcb57eaa98d92404ca67a1ab7a5751f25b 100644
+--- a/media/engine/webrtc_video_engine.cc
++++ b/media/engine/webrtc_video_engine.cc
+@@ -1264,8 +1264,8 @@ void WebRtcVideoSendChannel::ApplyEncoderSwitch(
+     std::optional<SdpVideoFormat> format,
+     bool allow_default_fallback) {
+   RTC_DCHECK_RUN_ON(worker_thread_);
+-  RTC_DCHECK(format.has_value() || allow_default_fallback);
+-
++  // A missing preferred format requests the next negotiated codec. This is
++  // also valid when falling back to an arbitrary default codec is forbidden.
+   ChangedSenderParameters params;
+   if (!format) {
+     if (negotiated_codecs_.size() <= 1) {
+diff --git a/media/engine/webrtc_video_engine_unittest.cc b/media/engine/webrtc_video_engine_unittest.cc
+index ad64a61653038415f6377d9426c22286c661ee43..d1e0f11b6204d0807323a1240494b9656433cc09 100644
+--- a/media/engine/webrtc_video_engine_unittest.cc
++++ b/media/engine/webrtc_video_engine_unittest.cc
+@@ -2632,31 +2632,35 @@ TEST_F(WebRtcVideoChannelBaseTest,
+        RequestEncoderFallbackNextCodecFollowNegotiatedOrder) {
+   field_trials_.Set("WebRTC-SwitchEncoderFollowCodecPreferenceOrder",
+                     "Enabled");
+-  VideoSenderParameters parameters;
+-  parameters.codecs.push_back(GetEngineCodec("VP9"));
+-  parameters.codecs.push_back(GetEngineCodec("AV1"));
+-  parameters.codecs.push_back(GetEngineCodec("VP8"));
+-  EXPECT_TRUE(send_channel_->SetSenderParameters(parameters));
+-
+-  std::optional<Codec> codec = send_channel_->GetSendCodec();
+-  ASSERT_TRUE(codec);
+-  EXPECT_EQ("VP9", codec->name);
++  for (bool allow_default_fallback : {false, true}) {
++    VideoSenderParameters parameters;
++    parameters.codecs.push_back(GetEngineCodec("VP9"));
++    parameters.codecs.push_back(GetEngineCodec("AV1"));
++    parameters.codecs.push_back(GetEngineCodec("VP8"));
++    EXPECT_TRUE(send_channel_->SetSenderParameters(parameters));
+ 
+-  SendImpl()->RequestEncoderSwitch(std::nullopt, true);
+-  time_controller_.AdvanceTime(kFrameDuration);
+-  codec = send_channel_->GetSendCodec();
+-  ASSERT_TRUE(codec);
+-  EXPECT_EQ("AV1", codec->name);
++    std::optional<Codec> codec = send_channel_->GetSendCodec();
++    ASSERT_TRUE(codec);
++    EXPECT_EQ("VP9", codec->name);
+ 
+-  SendImpl()->RequestEncoderSwitch(std::nullopt, true);
+-  time_controller_.AdvanceTime(kFrameDuration);
+-  codec = send_channel_->GetSendCodec();
+-  ASSERT_TRUE(codec);
+-  EXPECT_EQ("VP8", codec->name);
++    SendImpl()->RequestEncoderSwitch(std::nullopt, allow_default_fallback);
++    time_controller_.AdvanceTime(kFrameDuration);
++    codec = send_channel_->GetSendCodec();
++    ASSERT_TRUE(codec);
++    EXPECT_EQ("AV1", codec->name);
+ 
+-  SendImpl()->RequestEncoderSwitch(std::nullopt, true);
+-  time_controller_.AdvanceTime(kFrameDuration);
++    SendImpl()->RequestEncoderSwitch(std::nullopt, allow_default_fallback);
++    time_controller_.AdvanceTime(kFrameDuration);
++    codec = send_channel_->GetSendCodec();
++    ASSERT_TRUE(codec);
++    EXPECT_EQ("VP8", codec->name);
+ 
++    SendImpl()->RequestEncoderSwitch(std::nullopt, allow_default_fallback);
++    time_controller_.AdvanceTime(kFrameDuration);
++    codec = send_channel_->GetSendCodec();
++    ASSERT_TRUE(codec);
++    EXPECT_EQ("VP8", codec->name);
++  }
+   FrameForwarder frame_forwarder;
+   EXPECT_TRUE(send_channel_->SetVideoSend(kSsrc, nullptr, &frame_forwarder));
+   EXPECT_TRUE(send_channel_->RemoveSendStream(kSsrc));

@@ -1,0 +1,81 @@
+diff --git a/api/video/recordable_encoded_frame.h b/api/video/recordable_encoded_frame.h
+index ff771a0024d0ce5b607f9b8f5f4c833c403dcb99..67c8584b12c9637ed6ad84cd2c6c0bf5c7e556b4 100644
+--- a/api/video/recordable_encoded_frame.h
++++ b/api/video/recordable_encoded_frame.h
+@@ -11,6 +11,7 @@
+ #ifndef API_VIDEO_RECORDABLE_ENCODED_FRAME_H_
+ #define API_VIDEO_RECORDABLE_ENCODED_FRAME_H_
+ 
++#include <cstdint>
+ #include <optional>
+ 
+ #include "api/scoped_refptr.h"
+@@ -60,6 +61,14 @@ class RecordableEncodedFrame {
+ 
+   // Returns the computed render time
+   virtual Timestamp render_time() const = 0;
++
++  // Identifies the native RTP frame selected by receive-side reference finding
++  // and frame-buffer ordering. Optional defaults preserve source compatibility
++  // for non-RTP test implementations.
++  virtual std::optional<uint32_t> rtp_timestamp() const {
++    return std::nullopt;
++  }
++  virtual std::optional<uint32_t> ssrc() const { return std::nullopt; }
+ };
+ 
+ }  // namespace webrtc
+diff --git a/video/video_receive_stream2.cc b/video/video_receive_stream2.cc
+index bd1770456eb15c934776c16e5fc29b9bb761bfef..3718d6478d0d284a87e64ae4205e253e886029ab 100644
+--- a/video/video_receive_stream2.cc
++++ b/video/video_receive_stream2.cc
+@@ -113,12 +113,15 @@ class WebRtcRecordableEncodedFrame : public RecordableEncodedFrame {
+  public:
+   explicit WebRtcRecordableEncodedFrame(
+       const EncodedFrame& frame,
+-      RecordableEncodedFrame::EncodedResolution resolution)
++      RecordableEncodedFrame::EncodedResolution resolution,
++      uint32_t ssrc)
+       : buffer_(frame.GetEncodedData()),
+         render_time_ms_(frame.RenderTime()),
+         codec_(frame.CodecSpecific()->codecType),
+         is_key_frame_(frame.IsKey()),
+-        resolution_(resolution) {
++        resolution_(resolution),
++        rtp_timestamp_(frame.RtpTimestamp()),
++        ssrc_(ssrc) {
+     if (frame.ColorSpace()) {
+       color_space_ = *frame.ColorSpace();
+     }
+@@ -151,12 +154,20 @@ class WebRtcRecordableEncodedFrame : public RecordableEncodedFrame {
+     return Timestamp::Millis(render_time_ms_);
+   }
+ 
++  std::optional<uint32_t> rtp_timestamp() const override {
++    return rtp_timestamp_;
++  }
++
++  std::optional<uint32_t> ssrc() const override { return ssrc_; }
++
+  private:
+   scoped_refptr<EncodedImageBufferInterface> buffer_;
+   int64_t render_time_ms_;
+   VideoCodecType codec_;
+   bool is_key_frame_;
+   EncodedResolution resolution_;
++  uint32_t rtp_timestamp_;
++  uint32_t ssrc_;
+   std::optional<ColorSpace> color_space_;
+   std::optional<VideoRotation> video_rotation_;
+ };
+@@ -1036,8 +1047,8 @@ int VideoReceiveStream2::DecodeAndMaybeDispatchEncodedFrame(
+           RTC_DCHECK(!pending_resolution->empty());
+           resolution = *pending_resolution;
+         }
+-        encoded_frame_buffer_function_(
+-            WebRtcRecordableEncodedFrame(*buffered_frame, resolution));
++        encoded_frame_buffer_function_(WebRtcRecordableEncodedFrame(
++            *buffered_frame, resolution, remote_ssrc()));
+       }
+       buffered_encoded_frames_.clear();
+     }

@@ -1,0 +1,13 @@
+diff --git a/BUILD.gn b/BUILD.gn
+--- a/BUILD.gn
++++ b/BUILD.gn
+@@ -590,9 +590,6 @@
+     if (!build_with_chromium) {
+       if (is_android) {
+         deps += [ "sdk/android" ]
+       }
+-      if (is_ios) {
+-        deps += [ "sdk:framework_objc" ]
+-      }
+     }
+   }

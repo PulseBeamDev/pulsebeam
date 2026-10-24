@@ -1,0 +1,130 @@
+import("//webrtc.gni")
+import("//build/config/rust.gni")
+import("//build/config/c++/c++.gni")
+
+declare_args() {
+  pulsebeam_native = false
+}
+
+_generator = "//third_party/rust/cxxbridge_cmd/v1:cxxbridge($rust_macro_toolchain)"
+_generator_exe = get_label_info(_generator, "root_out_dir") + "/cxxbridge"
+_header = "$root_gen_dir/pulsebeam/pulsebeam-webrtc-sys/src/lib.rs.h"
+_implementation = "$target_gen_dir/bridge.cc"
+
+action("bridge") {
+  script = "bridge.py"
+  sources = [ "pulsebeam-webrtc-sys/src/bridge.rs" ]
+  inputs = [ _generator_exe ]
+  outputs = [ _header, _implementation ]
+  deps = [ _generator ]
+  args = [
+    rebase_path(_generator_exe, root_build_dir),
+    rebase_path(sources[0], root_build_dir),
+    rebase_path(_header, root_build_dir),
+    rebase_path(_implementation, root_build_dir),
+  ]
+}
+
+rtc_static_library("pulsebeam") {
+  complete_static_lib = true
+  suppressed_configs = [ "//build/config/compiler:thin_archive" ]
+  include_dirs = [
+    ".",
+    "$root_gen_dir/pulsebeam",
+  ]
+  sources = [
+    "pulsebeam-webrtc-sys/native/async_dns.cc",
+    "pulsebeam-webrtc-sys/native/audio.cc",
+    "pulsebeam-webrtc-sys/native/audio_device.cc",
+    "pulsebeam-webrtc-sys/native/audio_echo_config.cc",
+    "pulsebeam-webrtc-sys/native/audio_frame_values.cc",
+    "pulsebeam-webrtc-sys/native/audio_processor.cc",
+    "pulsebeam-webrtc-sys/native/certificate_generator.cc",
+    "pulsebeam-webrtc-sys/native/clock.cc",
+    "pulsebeam-webrtc-sys/native/codec.cc",
+    "pulsebeam-webrtc-sys/native/data_channel.cc",
+    "pulsebeam-webrtc-sys/native/desktop_frame.cc",
+    "pulsebeam-webrtc-sys/native/desktop_memory.cc",
+    "pulsebeam-webrtc-sys/native/encoded_image.cc",
+    "pulsebeam-webrtc-sys/native/event_log.cc",
+    "pulsebeam-webrtc-sys/native/event_log_codec.cc",
+    "pulsebeam-webrtc-sys/native/execution.cc",
+    "pulsebeam-webrtc-sys/native/fec.cc",
+    "pulsebeam-webrtc-sys/native/frame_transformer.cc",
+    "pulsebeam-webrtc-sys/native/live_frame_transformer.cc",
+    "pulsebeam-webrtc-sys/native/local_network_permission.cc",
+    "pulsebeam-webrtc-sys/native/media_stream.cc",
+    "pulsebeam-webrtc-sys/native/media_values.cc",
+    "pulsebeam-webrtc-sys/native/metronome.cc",
+    "pulsebeam-webrtc-sys/native/network.cc",
+    "pulsebeam-webrtc-sys/native/network_control.cc",
+    "pulsebeam-webrtc-sys/native/network_predictor.cc",
+    "pulsebeam-webrtc-sys/native/network_values.cc",
+    "pulsebeam-webrtc-sys/native/packet_socket.cc",
+    "pulsebeam-webrtc-sys/native/peer.cc",
+    "pulsebeam-webrtc-sys/native/probe.cc",
+    "pulsebeam-webrtc-sys/native/raw_video_frame.cc",
+    "pulsebeam-webrtc-sys/native/rtc_error.cc",
+    "pulsebeam-webrtc-sys/native/rtp_values.cc",
+    "pulsebeam-webrtc-sys/native/socket_address.cc",
+    "pulsebeam-webrtc-sys/native/stats.cc",
+    "pulsebeam-webrtc-sys/native/string_builder.cc",
+    "pulsebeam-webrtc-sys/native/task_queue_provider.cc",
+    "pulsebeam-webrtc-sys/native/tls.cc",
+    "pulsebeam-webrtc-sys/native/transport.cc",
+    "pulsebeam-webrtc-sys/native/video_bitrate.cc",
+    "pulsebeam-webrtc-sys/native/video.cc",
+    "pulsebeam-webrtc-sys/native/video_codec_callbacks.cc",
+    "pulsebeam-webrtc-sys/native/video_codec_values.cc",
+    "pulsebeam-webrtc-sys/native/video_encoder_selector.cc",
+    "pulsebeam-webrtc-sys/native/video_metadata.cc",
+    _implementation,
+    "//third_party/rust/chromium_crates_io/vendor/cxx-v1/src/cxx.cc",
+  ]
+  deps = [
+    ":bridge",
+    "//:webrtc",
+    "//third_party/boringssl",
+    "//api:field_trials",
+    "//api:frame_transformer_factory",
+    "//api:rtc_event_log_output_file",
+    "//api/rtc_event_log:rtc_event_log_factory",
+    "//api/video_codecs:builtin_video_encoder_factory",
+    "//api/video_codecs:builtin_video_decoder_factory",
+    "//api/audio:builtin_audio_processing_builder",
+    "//api/audio:aec3_factory",
+    "//modules/rtp_rtcp:rtp_rtcp_format",
+    "//logging:rtc_event_audio",
+    "//logging:rtc_event_begin_end",
+    "//logging:rtc_event_bwe",
+    "//logging:rtc_event_pacing",
+    "//logging:rtc_event_rtp_rtcp",
+    "//logging:rtc_event_video",
+    "//logging:rtc_event_bwe_update_scream",
+    "//logging:rtc_event_frame_events",
+    "//logging:ice_log",
+    "//logging:rtc_event_log_parser",
+  ]
+  if (pulsebeam_native) {
+    defines = [ "PULSEBEAM_WEBRTC_NATIVE_AUDIO=1" ]
+    deps += [ "//modules/desktop_capture" ]
+    configs += [ "//modules/portal:gio" ]
+  }
+}
+
+# Capture libc++abi's source-set form under ASan as well as its static form.
+static_library("runtime") {
+  complete_static_lib = true
+  configs -= [ "//build/config/compiler:thin_archive" ]
+  deps = [
+    "//buildtools/third_party/libc++",
+    "//buildtools/third_party/libc++abi",
+  ]
+  if (use_llvm_libatomic) {
+    deps += [ "//third_party/compiler-rt:atomic" ]
+  }
+}
+
+group("native") {
+  deps = [ ":pulsebeam", ":runtime" ]
+}

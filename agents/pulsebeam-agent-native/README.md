@@ -2,7 +2,7 @@
 
 Native Rust and generated foreign APIs for caller-fed media and PulseBeam session control. The shared actor executes `agent-core` effects through libwebrtc; applications own capture, device permissions and rendering.
 
-This is an unpublished, not fully qualified Linux x86_64 candidate. Obtain the matching local sys source/native archives and follow the [candidate setup](../../tools/README.md#use-the-local-native-webrtc-candidate) before building. Contributor proofs cover controlled real-SFU media/topics/reconnect, native decoded marker-only simulcast, simulated TCP recovery, and a bounded production raw-I420 encode/decode witness. The production witness also calls the generated Python API through the native dynamic library. See [support and verification scope](QUALIFICATION.md) for the proof owners and limits. Swift/Kotlin binding generation does not qualify mobile runtime execution; hardware qualification and release publication are separate.
+This is an unpublished, not fully qualified Linux x86_64 integration. Bazel builds the [local WebRTC bindings](../../crates/pulsebeam-libwebrtc-sys/README.md) from pinned sources; no source/native candidate archives or separate preparation are needed. Contributor proofs cover controlled real-SFU media/topics/reconnect, native decoded marker-only simulcast, simulated TCP recovery, and a bounded production raw-I420 encode/decode witness. The production witness also calls the generated Python API through the native dynamic library. See [support and verification scope](QUALIFICATION.md) for the proof owners and limits. Swift/Kotlin binding generation does not qualify mobile runtime execution; hardware qualification and release publication are separate.
 
 ## Configure and connect
 
@@ -45,7 +45,7 @@ Snapshot, event and producer-feedback observations are bounded and report `Lagge
 
 ## Contributor checks
 
-With candidate archive environment variables set:
+Run from the repository root with the [host prerequisites](../../docs/build.md#host-prerequisites). Core is the default; use the sys package's graph-wide flavor setting when enabling Linux desktop device support:
 
 ```sh
 ./bazel test //agents/pulsebeam-agent-native:unit_tests \

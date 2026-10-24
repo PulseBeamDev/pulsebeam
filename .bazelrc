@@ -5,8 +5,6 @@ common --enable_bzlmod
 common --lockfile_mode=error
 common --repo_contents_cache=~/.cache/pulsebeam/bazel/repo-contents-cache
 common --watchfs
-common --repo_env=PULSEBEAM_WEBRTC_SOURCE_ARCHIVE
-common --repo_env=PULSEBEAM_WEBRTC_NATIVE_ARCHIVE
 build --disk_cache=~/.cache/pulsebeam/bazel/disk-cache
 build --incompatible_strict_action_env
 build --announce_rc
