@@ -127,10 +127,15 @@ samples. Dedicated encoded-forwarding/codec scenarios retain their independent
 decoder assertions. The initial-ramp scenario retains its original two-second
 window and encoded quality checks in addition to native proof.
 
-The latest scoped regression passes all 182 fast and 15 slow committed cases
-with only the two exclusions below, using the same pinned source/native pair.
-Root checks, all non-simulator fast owners, controlled RTC interoperability and
-browser checks also pass. The original recovery roster and five-second
+After rebasing onto main's resource/catalog ownership changes, the latest
+scoped regression passes all 183 fast and 15 slow committed cases with only the
+two exclusions below, using the same pinned source/native pair. This includes
+owned-publication relabel through a fresh native wire session: protocol identity
+is checked against the actual receiver mapping/catalog, while successful source
+decodes are independently authenticated to the current admission. Native receiver
+track IDs are not treated as protocol publication IDs. Root checks, all
+non-simulator fast owners, controlled RTC interoperability and browser checks
+also pass. The original recovery roster and five-second
 publication setup cases pass without changing their deadlines or assertions.
 Established-stream TCP retransmission repairs the lost signaling request;
 BoringSSL DTLS retransmission now uses the controlled native clock. Playback

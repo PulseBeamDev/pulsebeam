@@ -779,7 +779,6 @@ pub struct VideoReceiveLog {
     native_playback_only: bool,
     pub by_publisher: BTreeMap<String, u64>,
     pub decoded_by_publisher: BTreeMap<String, DecodedVideoStream>,
-    pub decoded_by_track: BTreeMap<String, u64>,
     /// Successful real decodes keyed by the wire-proven source admission/slot.
     pub decoded_by_incarnation: BTreeMap<String, DecodedVideoStream>,
     /// Native frames without unambiguous content-origin evidence. They cannot
@@ -1783,7 +1782,6 @@ fn record_fixture_video_frame(
                 is_keyframe,
                 identity,
             );
-            *log.decoded_by_track.entry(frame.track.track_id.clone()).or_default() += 1;
             if let Some(origin) = marker
                 && authenticated.is_some()
             {

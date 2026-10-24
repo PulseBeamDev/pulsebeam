@@ -3174,16 +3174,37 @@ async fn execute_plan(
                 let track_id = connection
                     .derive_track_id(pulsebeam::entity::TrackKind::Video, &label)
                     .as_str();
-                let actual = get_handle(handles, participant, description)?
+                let receiver = get_handle(handles, participant, description)?;
+                {
+                    let observation = receiver.shared.observation.lock().unwrap();
+                    let snapshot = &observation
+                        .as_ref()
+                        .context("publication receiver has no observation")?
+                        .snapshot;
+                    anyhow::ensure!(
+                        snapshot.video_mapping.values().any(|id| id == &track_id)
+                            && snapshot
+                                .publications
+                                .get(&track_id)
+                                .is_some_and(|publication| {
+                                    publication.kind
+                                        == pulsebeam_agent_native::agent_core::MediaKind::Video
+                                        && publication.label == label
+                                }),
+                        "{description}: receiver is not bound to publication {track_id} ({label})"
+                    );
+                }
+                // Native track IDs identify receiver bindings, not publications.
+                // This fixture has one v0 source; authenticate its actual coded
+                // bytes and decode under the current admission independently
+                // of the separately checked catalog/mapping.
+                let origin = super::provenance::source_key(&connection.to_string(), "v0");
+                receiver
                     .video_rx()
-                    .decoded_by_track
-                    .get(&track_id)
-                    .copied()
-                    .unwrap_or(0);
-                assert!(
-                    actual >= *min_frames,
-                    "step {n}/{total} {kind}: {description} expected {min_frames} decoded frames from publication {track_id} ({label}), got {actual}"
-                );
+                    .require_decoded_from_incarnation(&origin, 0, *min_frames)
+                    .with_context(|| {
+                        format!("{description}: publication {track_id} ({label}) has no current-source decode")
+                    })?;
             }
 
             Step::CheckVideoDecodedFrom {

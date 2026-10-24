@@ -908,7 +908,7 @@ mod tests {
 
         let next_connection = crate::entity::ConnectionId::new();
         let mut next_upstream = super::super::upstream::Upstream::new(ctx, next_connection);
-        let mid = str0m::media::Mid::from("a");
+        let mid = crate::media::Mid::from("a");
         let (next_track, descriptor) =
             crate::track::test_utils::make_audio_track(publisher, next_connection, mid);
         assert!(next_upstream.add_published_track(0, mid, next_track, descriptor));
