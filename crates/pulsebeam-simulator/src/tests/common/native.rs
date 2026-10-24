@@ -4,7 +4,7 @@ use std::{
     net::{IpAddr, SocketAddr},
     rc::{Rc, Weak},
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use pulsebeam_agent_native::Error;
@@ -33,6 +33,7 @@ struct Services {
     bridge: PacketBridge,
     sim_origin: Duration,
     native_origin: Duration,
+    callback_clock: NativeCallbackClock,
     hosts: BTreeMap<IpAddr, Weak<HostState>>,
     failure: Option<String>,
     dropped_egress: u64,
@@ -46,11 +47,21 @@ impl Services {
             }
             let world = SimulationWorld::acquire();
             let native_origin = world.controlled.now();
+            let sim_origin = turmoil::sim_elapsed()
+                .ok_or_else(|| anyhow::anyhow!("native host requires a Turmoil context"))?;
+            anyhow::ensure!(
+                tokio::runtime::Handle::try_current().is_ok(),
+                "native callback clock anchor requires the simulator Tokio context"
+            );
+            let callback_clock = NativeCallbackClock {
+                native_origin_us: i64::try_from(native_origin.as_micros())?,
+                sim_origin: Instant::now(),
+            };
             let services = Rc::new(RefCell::new(Self {
                 bridge: PacketBridge::new(world)?,
-                sim_origin: turmoil::sim_elapsed()
-                    .ok_or_else(|| anyhow::anyhow!("native host requires a Turmoil context"))?,
+                sim_origin,
                 native_origin,
+                callback_clock,
                 hosts: BTreeMap::new(),
                 failure: None,
                 dropped_egress: 0,
@@ -122,6 +133,38 @@ pub fn step(sim: &mut turmoil::Sim<'_>) -> turmoil::Result<bool> {
 
 #[derive(Clone)]
 pub struct NativeHost(Rc<HostState>);
+
+/// Same controlled native clock used by RTCStats, not Rust's wall clock or a
+/// guessed capture-time offset. Used only to bound real native observations.
+pub fn now_us() -> anyhow::Result<i64> {
+    let services = Services::acquire()?;
+    let now = services.borrow().bridge.world.controlled.now();
+    Ok(i64::try_from(now.as_micros())?)
+}
+
+/// Exact anchor pair from the existing native/simulator scheduling relation.
+/// Callback projection is pure arithmetic, Send, and never reenters the SDK or
+/// depends on Tokio context being present on a native callback sequence.
+#[derive(Clone, Copy, Debug)]
+pub struct NativeCallbackClock {
+    native_origin_us: i64,
+    sim_origin: Instant,
+}
+impl NativeCallbackClock {
+    pub fn project(self, native_observed_at_us: i64) -> anyhow::Result<Instant> {
+        let delta = native_observed_at_us
+            .checked_sub(self.native_origin_us)
+            .and_then(|value| u64::try_from(value).ok())
+            .ok_or_else(|| anyhow::anyhow!("native callback precedes its actual clock anchor"))?;
+        self.sim_origin
+            .checked_add(Duration::from_micros(delta))
+            .ok_or_else(|| anyhow::anyhow!("native callback clock projection overflow"))
+    }
+}
+
+pub fn callback_clock() -> anyhow::Result<NativeCallbackClock> {
+    Ok(Services::acquire()?.borrow().callback_clock)
+}
 
 struct HostState {
     interface: Rc<NetworkEndpoint>,
@@ -484,6 +527,22 @@ impl Transport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_callback_clock_uses_the_explicit_anchor_without_runtime_context() {
+        let origin = Instant::now();
+        let clock = NativeCallbackClock {
+            native_origin_us: 7_000_000,
+            sim_origin: origin,
+        };
+        assert_eq!(clock.project(7_000_000).unwrap(), origin);
+        assert_eq!(
+            clock.project(7_123_456).unwrap(),
+            origin + Duration::from_micros(123_456)
+        );
+        assert!(clock.project(6_999_999).is_err());
+        assert!(clock.project(i64::MIN).is_err());
+    }
 
     #[test]
     fn retired_udp_receivers_release_the_socket_before_tuple_reuse() {

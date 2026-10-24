@@ -1,4 +1,4 @@
-use super::common::{LocalNodeSim, Participant, Room, Step};
+use super::common::{LocalNodeSim, Participant, Playback, PlaybackExpectation, Room, Step};
 use std::time::Duration;
 
 /// Validates the declarative subscription API end-to-end:
@@ -97,7 +97,7 @@ fn one_slot_track_replacement_keeps_media_flow_test() {
             Room::new("room1")
                 .with_participant(Participant::publisher("pub1", &["q"]).with_temporal_dd(3))
                 .with_participant(Participant::publisher("pub2", &["q"]).with_temporal_dd(3))
-                .with_participant(Participant::manual_subscriber("sub", 1)),
+                .with_participant(Participant::manual_subscriber("sub", 1).with_native_playback()),
         )
         .run(vec![
             Step::Run {
@@ -109,27 +109,56 @@ fn one_slot_track_replacement_keeps_media_flow_test() {
                 participant: "sub",
                 targets: &[("pub1", 720, 0, 100), ("pub2", 720, 0, 10)],
             },
+            Step::BeginNativePlayback {
+                description: "Observe the preferred publisher's actual native playback",
+                participant: "sub",
+                after_pause: false,
+            },
             Step::Run {
                 description: "Receive the first publisher through the slot",
                 duration: Duration::from_secs(10),
             },
-            Step::CheckRxBytesInterval {
-                description: "The first assignment carries media",
+            Step::CheckNativePlayback {
+                description: "The preferred publisher is actually visible",
                 participant: "sub",
-                min_bytes: 1_000,
+                publisher: "pub1",
+                expected: PlaybackExpectation {
+                    content: Playback::Camera,
+                    min_frames: 2,
+                    min_resolution: (180, 180),
+                },
+                same_receiver: false,
             },
             Step::Disconnect {
                 description: "Remove the publisher occupying the only slot",
                 participant: "pub1",
             },
-            Step::Run {
-                description: "Assign the same slot to the remaining publisher",
-                duration: Duration::from_secs(10),
-            },
-            Step::CheckRxBytesInterval {
-                description: "The replacement assignment carries media",
+            Step::WaitForNativeVideo {
+                description: "The remaining publisher becomes visible within ten seconds",
                 participant: "sub",
-                min_bytes: 100_000,
+                publisher: "pub2",
+                min_resolution: (180, 180),
+                timeout: Duration::from_secs(10),
+            },
+            Step::BeginNativePlayback {
+                description: "Measure playback after the explicitly bounded replacement",
+                participant: "sub",
+                after_pause: false,
+            },
+            Step::Run {
+                description: "Replacement video keeps playing",
+                duration: Duration::from_secs(5),
+            },
+            Step::CheckNativePlayback {
+                description: "The remaining publisher keeps playing through the original receiver",
+                participant: "sub",
+                publisher: "pub2",
+                expected: PlaybackExpectation {
+                    content: Playback::Camera,
+                    min_frames: 2,
+                    min_resolution: (180, 180),
+                },
+                same_receiver: true,
             },
         ]);
 }

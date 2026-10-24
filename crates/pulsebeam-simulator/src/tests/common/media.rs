@@ -54,6 +54,9 @@ pub struct KeyframeRecoveryProbe {
     pub request_once: bool,
     pub requests: Vec<(String, Option<String>)>,
     pub discarded_responses: u64,
+    pub drop_target: Option<(String, Option<String>)>,
+    pub discarded_targets: Vec<(String, Option<String>)>,
+    pub target_resolution: Option<(u16, u16)>,
     pub one_shot_requests: u64,
 }
 
@@ -70,6 +73,7 @@ pub struct VideoSource {
     fps: u32,
     opaque: bool,
     repeat_keyframes: bool,
+    publisher: Option<String>,
     recovery_probe: Arc<Mutex<KeyframeRecoveryProbe>>,
 }
 impl VideoSource {
@@ -123,6 +127,7 @@ impl VideoSource {
             fps: fps.max(1),
             opaque: false,
             repeat_keyframes: true,
+            publisher: None,
             recovery_probe: Arc::default(),
         }
     }
@@ -136,12 +141,19 @@ impl VideoSource {
             fps: self.fps,
             opaque: self.opaque,
             repeat_keyframes: self.repeat_keyframes,
+            publisher: self.publisher.clone(),
             recovery_probe: self.recovery_probe.clone(),
         }
     }
     pub fn dimensions(&self) -> (u16, u16) {
         let frame = &self.frames[self.first_idr];
         (frame.width, frame.height)
+    }
+    pub fn reference_frames(&self) -> impl Iterator<Item = &[u8]> {
+        self.frames.iter().map(|frame| frame.payload.as_slice())
+    }
+    pub fn identify_as(&mut self, publisher: &str) {
+        self.publisher = Some(publisher.to_owned());
     }
     pub fn opaque(mut self) -> Self {
         self.opaque = true;
@@ -161,10 +173,15 @@ impl VideoSource {
             let MediaSlot::LocalVideo(slot) = slot else {
                 panic!("video source slot")
             };
-            probe.requests.push((slot.clone(), encoding.clone()));
-            if probe.requests.len() == 1 {
-                probe.discarded_responses += 1;
-                return;
+            let target = (slot.clone(), encoding.clone());
+            probe.requests.push(target.clone());
+            if probe.drop_target.as_ref() == Some(&target) {
+                probe.target_resolution = Some(self.dimensions());
+                if probe.discarded_responses == 0 {
+                    probe.discarded_responses += 1;
+                    probe.discarded_targets.push(target);
+                    return;
+                }
             }
         }
         self.index = self.first_idr;
@@ -172,11 +189,14 @@ impl VideoSource {
     fn frame(&mut self, timestamp_us: i64) -> H264Frame {
         let mut frame = self.frames[self.index].clone();
         frame.timestamp_us = timestamp_us;
+        tracing::trace!(target: "pulsebeam_fixture_video", corpus_index = self.index, timestamp_us, width = frame.width, height = frame.height, keyframe = frame.keyframe, "fixture capture");
         if frame.keyframe {
             tracing::debug!(timestamp_us, width = frame.width, height = frame.height, temporal_index = ?frame.temporal_index, bytes = frame.payload.len(), "submitting fixture H264 keyframe to native source");
         }
         if self.opaque {
             frame.payload = opaque_frame(&frame.payload);
+        } else if let Some(publisher) = &self.publisher {
+            frame.payload = super::provenance::stamp(&frame.payload, publisher);
         }
         self.index = if self.index + 1 < self.frames.len() {
             self.index + 1
@@ -310,6 +330,12 @@ impl VbrSource {
     }
     pub fn dimensions(&self) -> (u16, u16) {
         self.source.dimensions()
+    }
+    pub fn reference_frames(&self) -> impl Iterator<Item = &[u8]> {
+        self.source.reference_frames()
+    }
+    pub fn identify_as(&mut self, publisher: &str) {
+        self.source.identify_as(publisher);
     }
     fn active(&self, elapsed: Duration) -> bool {
         let cycle = self.profile.active.saturating_add(self.profile.idle);
@@ -446,9 +472,11 @@ mod tests {
         let mut source = VideoSource::new(vec![frame.clone(), frame].into(), 0, 30)
             .opaque()
             .without_natural_keyframe_repeats();
+        source.identify_as("fixture-source");
         source.index = 1;
         let fresh = source.fresh();
         assert_eq!(fresh.index, fresh.first_idr);
+        assert_eq!(fresh.publisher.as_deref(), Some("fixture-source"));
         assert_eq!(source.index, 1);
         assert!(fresh.opaque);
         assert!(!fresh.repeat_keyframes);
@@ -462,8 +490,52 @@ mod tests {
         };
         let fresh = vbr.fresh();
         assert_eq!(fresh.source.index, fresh.source.first_idr);
+        assert_eq!(fresh.source.publisher.as_deref(), Some("fixture-source"));
         assert_eq!(fresh.target_bps, 0.0);
         assert!(Arc::ptr_eq(&vbr.frame_times, &fresh.frame_times));
+    }
+
+    #[test]
+    fn loss_probe_discards_only_the_first_requested_target_not_native_sibling_requests() {
+        // State-only values, never submitted as RTC media.
+        let frame = H264Frame {
+            payload: Vec::new(),
+            timestamp_us: 0,
+            width: 320,
+            height: 180,
+            keyframe: true,
+            temporal_index: None,
+            base_layer_sync: false,
+        };
+        let probe = Arc::new(Mutex::new(KeyframeRecoveryProbe {
+            armed: true,
+            drop_target: Some(("v0".into(), Some("q".into()))),
+            ..Default::default()
+        }));
+        let mut source = VideoSource::new(vec![frame.clone(), frame].into(), 0, 30)
+            .with_recovery_probe(probe.clone());
+        let slot = MediaSlot::LocalVideo("v0".into());
+        source.index = 1;
+        source.request(&slot, &Some("h".into()));
+        assert_eq!(
+            source.index, 0,
+            "native sibling responses are not discarded"
+        );
+        assert_eq!(probe.lock().unwrap().discarded_responses, 0);
+        source.index = 1;
+        source.request(&slot, &Some("q".into()));
+        assert_eq!(source.index, 1, "first genuine target response is lost");
+        source.request(&slot, &Some("q".into()));
+        assert_eq!(source.index, 0, "the target retry supplies a genuine IDR");
+        let probe = probe.lock().unwrap();
+        assert_eq!(probe.discarded_responses, 1);
+        assert_eq!(probe.discarded_targets, [("v0".into(), Some("q".into()))]);
+        assert_eq!(probe.target_resolution, Some((320, 180)));
+        assert_eq!(
+            probe.requests.len(),
+            3,
+            "all native requests remain visible"
+        );
     }
 
     #[test]

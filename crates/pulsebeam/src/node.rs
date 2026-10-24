@@ -442,6 +442,10 @@ pub struct NodeBuilder {
     /// connectivity.
     tcp_only: bool,
 
+    /// When `true`, TCP candidates are suppressed. This lets tests that model
+    /// UDP datagram loss select exactly the transport their shaper controls.
+    udp_only: bool,
+
     /// How many participants of one room share a shard before the next join
     /// spills to another.
     room_partition_size: usize,
@@ -482,6 +486,7 @@ impl NodeBuilder {
                 }
             },
             tcp_only: false,
+            udp_only: false,
             room_partition_size: crate::control::core::DEFAULT_ROOM_PARTITION_SIZE,
             room_placement: crate::control::core::RoomPartitionPlacement::Hashed,
         }
@@ -655,6 +660,16 @@ impl NodeBuilder {
     /// Useful for integration / simulation tests that exercise the TCP path.
     pub fn tcp_only(mut self) -> Self {
         self.tcp_only = true;
+        self.udp_only = false;
+        self
+    }
+
+    /// Suppress TCP candidates so that clients use UDP. This is useful when a
+    /// test intentionally applies datagram loss and must not silently select a
+    /// reliable stream transport that the datagram shaper does not model.
+    pub fn udp_only(mut self) -> Self {
+        self.udp_only = true;
+        self.tcp_only = false;
         self
     }
 
@@ -786,7 +801,7 @@ impl NodeBuilder {
         if self.tcp_only {
             candidates.clear();
         }
-        if !tcp_sockets.is_empty() {
+        if !self.udp_only && !tcp_sockets.is_empty() {
             let tcp_candidate_addrs = if advertised_addrs.is_empty() {
                 vec![tcp_local_addr]
             } else {
@@ -1574,6 +1589,7 @@ mod tests {
         assert!(builder.http_api.is_none(), "no API is exposed unless asked");
         assert!(builder.internal_metrics.is_none());
         assert!(!builder.tcp_only, "UDP candidates are offered by default");
+        assert!(!builder.udp_only, "TCP candidates are offered by default");
         assert!(matches!(builder.udp_mode, UdpMode::Batch));
         #[cfg(feature = "sim")]
         assert!(builder.steering.is_some());
@@ -1636,6 +1652,9 @@ mod tests {
         assert_eq!(builder.external_addrs, vec![addr]);
         assert_eq!(builder.room_partition_size, 9);
         assert!(builder.tcp_only);
+        assert!(!builder.udp_only);
+        assert!(NodeBuilder::new().udp_only().udp_only);
+        assert!(!NodeBuilder::new().udp_only().tcp_only);
         assert!(matches!(
             builder.room_placement,
             crate::control::core::RoomPartitionPlacement::RoundRobin
@@ -1672,5 +1691,6 @@ mod tests {
         assert_eq!(a.shard_runtime, b.shard_runtime);
         assert_eq!(a.room_partition_size, b.room_partition_size);
         assert_eq!(a.tcp_only, b.tcp_only);
+        assert_eq!(a.udp_only, b.udp_only);
     }
 }

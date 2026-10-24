@@ -31,7 +31,7 @@ repository = "https://github.com/PulseBeamDev/pulsebeam"
 license = "AGPL-3.0"
 
 [workspace.dependencies]
-pulsebeam-webrtc-sys = { version = "=0.8.0", path = ".native-candidate/current/source" }
+pulsebeam-webrtc-sys = { version = "=0.9.0", path = ".native-candidate/current/source" }
 arc-swap = "1.7.1"
 anyhow = "1"
 bytes = "1.11.1"

@@ -28,9 +28,11 @@ const STREAM_FRAMES: usize = 4;
 const OBSERVERS: usize = 32;
 const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 // Never overwrite a live consumer solely within one actor turn. Reserve one
-// channel entry for an explicit SDK-drop observation, then yield before draining
-// the next native batch. Queue memory limits remain unchanged.
+// channel entry for each possible SDK-drop observation, then yield before
+// draining the next native batch. Combined mode has two independent counters.
+// Queue memory limits remain unchanged.
 const FRAME_BUDGET: usize = STREAM_FRAMES - 1;
+const COMBINED_FRAME_BUDGET: usize = STREAM_FRAMES - 2;
 const PLAYOUT: Duration = Duration::from_millis(10);
 const STATS_INTERVAL: Duration = Duration::from_millis(200);
 // Bound the host I/O future, including connect, headers and body. A timeout is
@@ -41,12 +43,15 @@ const SIGNALING_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 pub struct Config {
     pub session: agent_core::AgentConfig,
     pub media: MediaConfig,
+    /// Rust-only callback before polling retention. Defaults to no observer.
+    pub decoded_video_observer: Option<crate::DecodedVideoObserver>,
 }
 impl Config {
     pub fn new(session: agent_core::AgentConfig) -> Self {
         Self {
             session,
             media: MediaConfig::default(),
+            decoded_video_observer: None,
         }
     }
 }
@@ -213,6 +218,7 @@ pub struct SimulationObservation {
     pub ordered_cursors: Vec<(agent_core::TopicSubscriber, String, u64)>,
     pub snapshot: Snapshot,
     pub sent_intent_revision: Option<u64>,
+    pub last_successfully_sent_wire_revision: Option<u64>,
     pub media_indices: BTreeMap<MediaSlot, u32>,
 }
 
@@ -762,6 +768,7 @@ struct StreamObservation {
     sender: broadcast::Sender<MediaStreamUpdate>,
     leases: Vec<Weak<StreamLease>>,
     native_dropped: u64,
+    native_decoded_dropped: u64,
 }
 struct HttpCompletion {
     operation: OperationId,
@@ -1041,6 +1048,9 @@ where
                     ordered_cursors: self.core.simulation_ordered_cursors(),
                     snapshot: self.core.snapshot().clone(),
                     sent_intent_revision: self.core.simulation_sent_intent_revision(),
+                    last_successfully_sent_wire_revision: self
+                        .core
+                        .simulation_last_successfully_sent_wire_revision(),
                     media_indices,
                 });
             }
@@ -1085,6 +1095,11 @@ where
         if !matches!(slot, MediaSlot::RemoteAudio(_) | MediaSlot::RemoteVideo(_)) {
             return Err(Error::UnknownSlot(slot));
         }
+        if mode == ReceiveMode::EncodedAndDecoded && !matches!(slot, MediaSlot::RemoteVideo(_)) {
+            return Err(Error::InvalidInput(
+                "combined observation is video-only".into(),
+            ));
+        }
         if let Some(stream) = self.streams.get(&slot) {
             if stream.mode != mode {
                 return Err(Error::InvalidInput(
@@ -1095,7 +1110,8 @@ where
                 return Err(Error::Backpressure);
             }
         }
-        let track = self.peer_mut()?.attach(&slot, mode)?;
+        let observer = self.config.decoded_video_observer.clone();
+        let track = self.peer_mut()?.attach(&slot, mode, observer.as_ref())?;
         let stream = self.streams.entry(slot.clone()).or_insert_with(|| {
             let (sender, _) = broadcast::channel(STREAM_FRAMES);
             StreamObservation {
@@ -1105,6 +1121,7 @@ where
                 sender,
                 leases: Vec::new(),
                 native_dropped: 0,
+                native_decoded_dropped: 0,
             }
         });
         let receiver = stream.sender.subscribe();
@@ -1341,7 +1358,17 @@ where
             if pcm != playout {
                 continue;
             }
-            let budget = if pcm { 1 } else { FRAME_BUDGET };
+            let budget = if pcm {
+                1
+            } else if self
+                .streams
+                .get(&slot)
+                .is_some_and(|stream| stream.mode == ReceiveMode::EncodedAndDecoded)
+            {
+                COMBINED_FRAME_BUDGET
+            } else {
+                FRAME_BUDGET
+            };
             for index in 0..budget {
                 let result = self
                     .peer
@@ -1377,6 +1404,25 @@ where
                 let _ = stream
                     .sender
                     .send(MediaStreamUpdate::NativeDropped { skipped });
+            }
+            if self
+                .streams
+                .get(&slot)
+                .is_some_and(|stream| stream.mode == ReceiveMode::EncodedAndDecoded)
+            {
+                let drops = self
+                    .peer
+                    .as_mut()
+                    .and_then(|peer| peer.dropped_decoded_frames(&slot).ok());
+                if let (Some(drops), Some(stream)) = (drops, self.streams.get_mut(&slot))
+                    && drops > stream.native_decoded_dropped
+                {
+                    let skipped = drops.saturating_sub(stream.native_decoded_dropped);
+                    stream.native_decoded_dropped = drops;
+                    let _ = stream
+                        .sender
+                        .send(MediaStreamUpdate::NativeDecodedDropped { skipped });
+                }
             }
         }
         more
@@ -1834,6 +1880,38 @@ mod tests {
         assert!(matches!(
             receiver.try_recv(),
             Ok(MediaStreamUpdate::NativeDropped { skipped: u64::MAX })
+        ));
+    }
+
+    #[test]
+    fn combined_media_turn_and_both_drop_notices_fit_the_unchanged_queue() {
+        let (sender, mut receiver) = broadcast::channel(STREAM_FRAMES);
+        // Queue arithmetic only, not simulated native frames or loss evidence.
+        for index in 0..COMBINED_FRAME_BUDGET {
+            sender
+                .send(MediaStreamUpdate::NativeDropped {
+                    skipped: index as u64,
+                })
+                .unwrap();
+        }
+        sender
+            .send(MediaStreamUpdate::NativeDropped { skipped: u64::MAX })
+            .unwrap();
+        sender
+            .send(MediaStreamUpdate::NativeDecodedDropped { skipped: u64::MAX })
+            .unwrap();
+        for index in 0..COMBINED_FRAME_BUDGET {
+            assert!(
+                matches!(receiver.try_recv(), Ok(MediaStreamUpdate::NativeDropped { skipped }) if skipped == index as u64)
+            );
+        }
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(MediaStreamUpdate::NativeDropped { skipped: u64::MAX })
+        ));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(MediaStreamUpdate::NativeDecodedDropped { skipped: u64::MAX })
         ));
     }
 

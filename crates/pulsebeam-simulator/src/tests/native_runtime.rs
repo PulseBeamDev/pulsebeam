@@ -175,6 +175,12 @@ impl MediaProbe {
                         ));
                         return;
                     }
+                    MediaStreamUpdate::NativeDecodedDropped { skipped } => {
+                        state.failure = Some(format!(
+                            "native {expected_kind:?} decoded observer dropped {skipped} frames"
+                        ));
+                        return;
+                    }
                     MediaStreamUpdate::NativeDropped { skipped } => {
                         state.failure = Some(format!(
                             "native {expected_kind:?} sink dropped {skipped} frames"

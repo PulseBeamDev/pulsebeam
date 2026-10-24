@@ -5,8 +5,8 @@
 //! probe controller, and the failure modes only appear once both are in the loop.
 
 use super::common::{
-    Capacity, LinkProfile, LinkReport, LocalNodeSim, Loss, Participant, Property, Reorder, Room,
-    Step, VideoQuality,
+    Capacity, LinkProfile, LinkReport, LocalNodeSim, Loss, Participant, Playback,
+    PlaybackExpectation, Property, Reorder, Room, Step, VideoQuality,
 };
 use std::time::Duration;
 
@@ -641,7 +641,7 @@ fn priority_swap_reaches_every_requested_top_layer_on_fast_link_test() {
             Room::new("room1")
                 .with_participant(Participant::screensharer("screen"))
                 .with_participant(Participant::publisher("camera", &["q", "h", "f"]))
-                .with_participant(Participant::manual_subscriber("viewer", 2)),
+                .with_participant(Participant::manual_subscriber("viewer", 2).with_encoded_and_native_decoded_video()),
         )
         .run(vec![
             Step::Run {
@@ -676,10 +676,18 @@ fn priority_swap_reaches_every_requested_top_layer_on_fast_link_test() {
                 origin: "camera",
                 min_quality: 3,
             },
-            Step::CheckForwardedQuality {
-                description: "Screen share remains on its top layer",
-                origin: "screen",
-                min_quality: 3,
+            // Native removes a lone RID. Prove recent full-size pixels, not
+            // a simulcast quality label that this unlayered source cannot emit.
+            Step::CheckNativeVideoDecodedFromInterval {
+                description: "Screen share renders full-size native frames: actual admission-correlated native I420",
+                participant: "viewer", publisher: "screen", min_frames: 1, min_resolution: (1280, 720),
+            },
+            Step::CheckVideoDecodedFromInterval {
+                description: "Screen share renders full-size native frames",
+                participant: "viewer",
+                publisher: "screen",
+                min_frames: 1,
+                min_resolution: (1280, 720),
             },
         ]);
 }
@@ -693,7 +701,7 @@ fn screenshare_recovers_after_competing_camera_pause_test() {
             Room::new("room1")
                 .with_participant(Participant::screensharer("screen"))
                 .with_participant(Participant::publisher("camera", &["q", "h", "f"]))
-                .with_participant(Participant::manual_subscriber("viewer", 2)),
+                .with_participant(Participant::manual_subscriber("viewer", 2).with_encoded_and_native_decoded_video()),
         )
         .run(vec![
             Step::Run {
@@ -753,10 +761,16 @@ fn screenshare_recovers_after_competing_camera_pause_test() {
             },
             // The user-visible consequence of the above, kept because it is what a viewer
             // actually experiences.
-            Step::CheckForwardedQuality {
-                description: "Screen share is not stranded after the link recovers",
-                origin: "screen",
-                min_quality: 3,
+            Step::CheckNativeVideoDecodedFromInterval {
+                description: "Screen share renders full-size frames after recovery: actual admission-correlated native I420",
+                participant: "viewer", publisher: "screen", min_frames: 1, min_resolution: (1280, 720),
+            },
+            Step::CheckVideoDecodedFromInterval {
+                description: "Screen share renders full-size frames after recovery",
+                participant: "viewer",
+                publisher: "screen",
+                min_frames: 1,
+                min_resolution: (1280, 720),
             },
             // Stability, which none of the claims above can see: a stream flipping between two
             // layers many times a second satisfies every one of them - right final layer, right
@@ -787,7 +801,7 @@ fn resizing_camera_keeps_single_layer_screenshare_rendering_test() {
             Room::new("room1")
                 .with_participant(Participant::publisher("camera", &["q", "h", "f"]))
                 .with_participant(Participant::screensharer("screen"))
-                .with_participant(Participant::manual_subscriber("viewer", 2)),
+                .with_participant(Participant::manual_subscriber("viewer", 2).with_encoded_and_native_decoded_video()),
         )
         .run(vec![
             Step::WaitForPublication {
@@ -805,11 +819,11 @@ fn resizing_camera_keeps_single_layer_screenshare_rendering_test() {
                 participant: "viewer",
                 targets: &[("camera", 720), ("screen", 720)],
             },
-            Step::WaitForVideo {
-                description: "Viewer decodes both streams before resizing",
+            Step::WaitForVideoAtResolution {
+                description: "Viewer decodes both full-size streams before resizing",
                 participant: "viewer",
                 publishers: &["camera", "screen"],
-                min_quality: 3,
+                min_resolution: (1280, 720),
                 timeout: Duration::from_secs(30),
             },
             Step::SubscribeTo {
@@ -831,10 +845,16 @@ fn resizing_camera_keeps_single_layer_screenshare_rendering_test() {
                 origin: "camera",
                 min_quality: 2,
             },
-            Step::CheckForwardedQuality {
-                description: "Single-layer screen share keeps rendering",
-                origin: "screen",
-                min_quality: 3,
+            Step::CheckNativeVideoDecodedFromInterval {
+                description: "Single-layer screen share keeps rendering full-size frames: actual admission-correlated native I420",
+                participant: "viewer", publisher: "screen", min_frames: 1, min_resolution: (1280, 720),
+            },
+            Step::CheckVideoDecodedFromInterval {
+                description: "Single-layer screen share keeps rendering full-size frames",
+                participant: "viewer",
+                publisher: "screen",
+                min_frames: 1,
+                min_resolution: (1280, 720),
             },
         ]);
 }
@@ -1007,7 +1027,7 @@ fn late_joiner_receives_earlier_participant_in_both_directions_test() {
 /// should be absorbed as inherent loss rather than triggering a backoff.
 #[test]
 fn screenshare_and_camera_over_wifi_test() {
-    conference_plan(LinkProfile::default(), 3_000_000, 700_000, 600, 96, 8, 2);
+    conference_plan(LinkProfile::default(), 600);
 }
 
 /// The same call over mobile: ~50ms latency and 1% loss.
@@ -1020,40 +1040,31 @@ fn screenshare_and_camera_over_wifi_test() {
 /// that clears in-flight packets, and is therefore unsuitable for a packet-loss profile.
 #[test]
 fn screenshare_and_camera_over_cellular_test() {
-    conference_plan(LinkProfile::cellular(), 900_000, 250_000, 300, 90, 30, 2);
+    conference_plan(LinkProfile::cellular(), 300);
 }
 
-/// Shared plan for the conference tests so the link profile is the only variable.
-///
-/// `allowed_missing_parameter_sets` is non-zero for the lossy profiles. Losing the SPS/PPS that
-/// precedes a keyframe is a genuine event when the link drops packets, and the property that
-/// actually matters is that the stream *recovers* - which the `min_frames` and `allow_gaps`
-/// bounds assert. Demanding zero here would be asserting the link is lossless, not that the
-/// implementation handles loss.
-fn conference_plan(
-    link: LinkProfile,
-    camera_min_bytes: u64,
-    screen_min_bytes: u64,
-    camera_min_frames: u64,
-    screen_min_frames: u64,
-    allowed_gaps: u64,
-    allowed_missing_parameter_sets: u64,
-) {
+/// Native playback is the user contract, not encoded polling retention or
+/// byte volume. Camera cadence and sparse desktop updates have distinct bounds.
+fn conference_plan(link: LinkProfile, camera_min_frames: u64) {
     LocalNodeSim::new()
         .with_link(link)
         .with_room(
             Room::new("room1")
-                .with_participant(Participant::screensharer("screen").and_subscribes())
+                .with_participant(Participant::screensharer("screen").and_subscribes().with_native_playback())
                 .with_participant(
-                    Participant::publisher("camera", &["q", "h", "f"]).and_subscribes(),
+                    Participant::publisher("camera", &["q", "h", "f"]).and_subscribes().with_native_playback(),
                 ),
         )
         .run(vec![
-            // Generous: track discovery is signalling round-trips, which take noticeably
-            // longer on the higher-latency, lossier profiles.
-            Step::Run {
-                description: "Establish both connections and discover tracks",
-                duration: Duration::from_secs(60),
+            Step::BeginNativePlayback {
+                description: "Measure desktop updates across the call, including quiet periods",
+                participant: "camera",
+                after_pause: false,
+            },
+            Step::WaitForPublication {
+                description: "Both admissions, publications and room views converge within the existing setup deadline",
+                publisher: "screen",
+                timeout: Duration::from_secs(60),
             },
             Step::SubscribeAll {
                 description: "Screen-sharer subscribes to the camera at full quality",
@@ -1069,33 +1080,36 @@ fn conference_plan(
                 description: "Warmup: let BWE settle on both connections",
                 duration: Duration::from_secs(20),
             },
+            Step::BeginNativePlayback {
+                description: "Measure continuous camera playback throughout the soak",
+                participant: "screen",
+                after_pause: false,
+            },
             Step::Run {
                 description: "Soak across captured static and active screen periods",
                 duration: Duration::from_secs(48),
             },
-            Step::CheckRxBytesInterval {
-                description: "Camera stream is not starved by the screen share",
+            Step::CheckNativePlayback {
+                description: "Camera remains fresh, changing and continuous at full size",
                 participant: "screen",
-                min_bytes: camera_min_bytes,
+                publisher: "camera",
+                expected: PlaybackExpectation {
+                    content: Playback::Camera,
+                    min_frames: camera_min_frames,
+                    min_resolution: (1280, 720),
+                },
+                same_receiver: false,
             },
-            Step::CheckRxBytesInterval {
-                description: "Screen-share bursts survive the quiet phases",
+            Step::CheckNativePlayback {
+                description: "The actual desktop produces full-size updates, including after quiet periods",
                 participant: "camera",
-                min_bytes: screen_min_bytes,
-            },
-            Step::CheckVideoQuality {
-                description: "Screen-sharer renders the camera without freezes",
-                participant: "screen",
-                quality: VideoQuality::min_frames(camera_min_frames)
-                    .allow_gaps(allowed_gaps)
-                    .allow_keyframe_parameter_set_losses(allowed_missing_parameter_sets),
-            },
-            Step::CheckVideoQuality {
-                description: "Camera participant renders the screen share without freezes",
-                participant: "camera",
-                quality: VideoQuality::min_frames(screen_min_frames)
-                    .allow_gaps(allowed_gaps)
-                    .allow_keyframe_parameter_set_losses(allowed_missing_parameter_sets),
+                publisher: "screen",
+                expected: PlaybackExpectation {
+                    content: Playback::DesktopUpdates,
+                    min_frames: 2,
+                    min_resolution: (1280, 720),
+                },
+                same_receiver: false,
             },
         ]);
 }
@@ -1242,11 +1256,11 @@ fn estimate_grows_to_fit_screenshare_and_camera_test() {
                 participant: "viewer",
                 heights: &[720, 720],
             },
-            Step::WaitForVideo {
-                description: "Viewer decodes both streams before the soak",
+            Step::WaitForVideoAtResolution {
+                description: "Viewer decodes both full-size streams before the soak",
                 participant: "viewer",
                 publishers: &["presenter", "camera"],
-                min_quality: 3,
+                min_resolution: (1280, 720),
                 timeout: Duration::from_secs(40),
             },
             Step::Run {
@@ -1922,6 +1936,7 @@ fn estimate_follows_a_sliding_link_without_riding_the_queue_test() {
 #[test]
 fn estimate_survives_an_oscillating_lossy_link_test() {
     LocalNodeSim::new()
+        .with_udp_only()
         .with_bandwidth(2_500_000)
         .with_room(
             Room::new("room1")
@@ -2065,10 +2080,12 @@ fn still_screenshare_does_not_talk_down_a_healthy_link_test() {
             // The user-visible consequence first, because it is what a viewer reports: the
             // stream is simply gone. A single-layer screen share has no lower rung to fall to,
             // so once the estimate drops under its cost the slot pauses outright.
-            Step::CheckForwardedQuality {
-                description: "The screen share is still being forwarded",
-                origin: "presenter",
-                min_quality: 3,
+            Step::CheckVideoDecodedFromInterval {
+                description: "The still screen share renders recent full-size native frames",
+                participant: "viewer",
+                publisher: "presenter",
+                min_frames: 1,
+                min_resolution: (1280, 720),
             },
             // The cause. Demand is ~1.4 Mbps and the link carries 3 Mbps, so the estimate has no
             // business sitting below what was asked for.

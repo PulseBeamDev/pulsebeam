@@ -90,6 +90,8 @@ struct Session {
     coordinates: BTreeMap<MediaSlot, SlotBinding>,
     observed: CatalogState,
     intent_revision: u64,
+    #[cfg(any(test, feature = "sim"))]
+    last_successfully_sent_wire_revision: Option<u64>,
     authorization_expires_at: Option<i64>,
     pending_renewal: Option<String>,
     renewal_send: Option<OperationId>,
@@ -282,6 +284,17 @@ impl Agent {
             return None;
         }
         self.active.as_ref().map(|active| active.intent_revision)
+    }
+
+    /// Last intent accepted for transmission by the native data-channel host.
+    /// Unlike the convergence observation, dirty/pending/retrying successors
+    /// do not hide an earlier successful send. Never expose a merely queued
+    /// revision as proof of transmission. This state is generation-local.
+    #[cfg(any(test, feature = "sim"))]
+    pub fn simulation_last_successfully_sent_wire_revision(&self) -> Option<u64> {
+        self.active
+            .as_ref()
+            .and_then(|active| active.last_successfully_sent_wire_revision)
     }
 
     /// Whether accepted desired state publishes this local sender slot.
@@ -1084,6 +1097,12 @@ impl Agent {
                         operation.get(),
                         channel.get(),
                     );
+                    #[cfg(any(test, feature = "sim"))]
+                    if let Some(active) = self.active.as_mut().filter(|active| {
+                        active.generation == generation && active.signaling_channel == channel
+                    }) {
+                        active.last_successfully_sent_wire_revision = Some(active.intent_revision);
+                    }
                     self.pending_signal = None;
                     self.send_intent_if_ready();
                 } else {
@@ -1196,6 +1215,8 @@ impl Agent {
             coordinates,
             observed: CatalogState::default(),
             intent_revision: 0,
+            #[cfg(any(test, feature = "sim"))]
+            last_successfully_sent_wire_revision: None,
             authorization_expires_at: None,
             pending_renewal: None,
             renewal_send: None,

@@ -1,11 +1,11 @@
 {
   "source": {
-    "revision": "c8ba2dfa29ff898fb2d051e55c466f18ceea05c3",
+    "revision": "a04587df44c6cdd241f19bc4b474094bf469106b",
     "filename": "webrtc-sys-source-linux-x86_64.tar.gz",
-    "sha256": "930d00f533d346d0e09228470be667da7de6fd6764c7d1f5868f34af11138c06"
+    "sha256": "f4f5fe461eb1effeb55443b3152f5e3d0027da389a974b54a81742d7af99fe5d"
   },
   "native": {
     "filename": "webrtc-core-linux-x86_64.tar.gz",
-    "sha256": "55a60880cf229957438fd8a33410e4408afc9fb733312fbc0a0813b71463309f"
+    "sha256": "225cbf5fd1a55a9231c5a30d184dcee7359c5dd9b9368c0860413b8843ee11f1"
   }
 }
