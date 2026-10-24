@@ -167,6 +167,14 @@ crate.annotation(
 # Cargo's custom tokio_unstable cfg is applied by .bazelrc, but crate-universe
 # does not include cfg-gated edges in its generated platform selects.
 crate.annotation(crate = "tokio", deps = ["@crates//tracing"], repositories = ["crates"])
+# Established-stream retry mechanism adapted from upstream turmoil-net ad57de6.
+# Keep legacy Sim integration; SYN and final-close semantics remain upstream 0.7.2.
+crate.annotation(
+    crate = "turmoil",
+    repositories = ["crates"],
+    patches = ["//tools:patches/turmoil-established-tcp-retransmit.patch"],
+    patch_args = ["-p1"],
+)
 # Upstream emits an absolute build-script sandbox path into its RustEmbed derive.
 # Resolve OUT_DIR during compilation using rust-embed's maintained interpolation.
 crate.annotation(

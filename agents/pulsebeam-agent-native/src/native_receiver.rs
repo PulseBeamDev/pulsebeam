@@ -24,6 +24,40 @@ fn decoded_frame(frame: rtc::VideoFrame) -> (OutputFrame, FrameMetadata) {
     )
 }
 
+fn encoded_frame(frame: rtc::EncodedReceivedVideoFrame) -> (OutputFrame, FrameMetadata) {
+    (
+        OutputFrame::H264 {
+            timestamp: frame.rtp_timestamp,
+            keyframe: frame.key_frame,
+            payload: frame.data,
+        },
+        FrameMetadata {
+            rtp_timestamp: Some(frame.rtp_timestamp),
+            ssrc: Some(frame.ssrc),
+            payload_type: Some(frame.payload_type),
+            codec_mime_type: Some(frame.mime_type),
+            rid: frame.rid,
+            capture_time_us: frame.capture_time_us,
+            receive_time_us: frame.receive_time_us,
+            frame_id: frame.frame_id,
+            spatial_index: frame.spatial_index,
+            temporal_index: frame.temporal_index,
+            dependencies: frame.dependencies,
+            decode_target_indications: frame
+                .decode_target_indications
+                .into_iter()
+                .map(|value| match value {
+                    rtc::DecodeTargetIndication::NotPresent => DecodeTargetIndication::NotPresent,
+                    rtc::DecodeTargetIndication::Discardable => DecodeTargetIndication::Discardable,
+                    rtc::DecodeTargetIndication::Switch => DecodeTargetIndication::Switch,
+                    rtc::DecodeTargetIndication::Required => DecodeTargetIndication::Required,
+                })
+                .collect(),
+            ..FrameMetadata::default()
+        },
+    )
+}
+
 pub(crate) struct NativeReceiver {
     pub id: rtc::SessionReceiverId,
     pub track: RemoteTrack,
@@ -74,6 +108,7 @@ impl NativeReceiver {
         session: &mut rtc::Session<R>,
         mode: ReceiveMode,
         observer: Option<&crate::DecodedVideoObserver>,
+        encoded_observer: Option<&crate::EncodedVideoObserver>,
     ) -> Result<(), rtc::PeerError> {
         if self.mode == Some(mode) {
             return Ok(());
@@ -82,6 +117,15 @@ impl NativeReceiver {
             return Err(rtc::PeerError {
                 kind: rtc::PeerErrorKind::InvalidState,
                 message: "detach the current receiver mode before attaching another".into(),
+            });
+        }
+        if mode == ReceiveMode::EncodedAndDecoded
+            && encoded_observer.is_some()
+            && observer.is_none()
+        {
+            return Err(rtc::PeerError {
+                kind: rtc::PeerErrorKind::InvalidParameter,
+                message: "combined encoded observation requires a decoded observer".into(),
             });
         }
         let callback = observer.map(|observer| {
@@ -122,7 +166,37 @@ impl NativeReceiver {
                 session.attach_encoded_video(self.id)?;
             }
             (rtc::MediaType::Video, ReceiveMode::EncodedAndDecoded, Some(callback)) => {
-                session.attach_raw_and_encoded_video_with_observer(self.id, callback)?;
+                if let Some(observer) = encoded_observer {
+                    let observer = observer.clone();
+                    let track = self.track.clone();
+                    session.attach_raw_and_encoded_video_with_observers(
+                        self.id,
+                        callback,
+                        move |native| {
+                            let observation = match native {
+                                rtc::EncodedVideoFrameObservation::Frame(frame) => {
+                                    let (frame, metadata) = encoded_frame(frame);
+                                    crate::EncodedVideoObservation::Frame {
+                                        frame: Box::new(RemoteFrame {
+                                            track: track.clone(),
+                                            metadata,
+                                            frame,
+                                        }),
+                                    }
+                                }
+                                rtc::EncodedVideoFrameObservation::Dropped { skipped } => {
+                                    crate::EncodedVideoObservation::Dropped {
+                                        track: track.clone(),
+                                        skipped,
+                                    }
+                                }
+                            };
+                            observer.observe(observation);
+                        },
+                    )?;
+                } else {
+                    session.attach_raw_and_encoded_video_with_observer(self.id, callback)?;
+                }
             }
             (rtc::MediaType::Video, ReceiveMode::EncodedAndDecoded, None) => {
                 session.attach_raw_and_encoded_video(self.id)?;
@@ -166,6 +240,18 @@ impl NativeReceiver {
             return Err(rtc::PeerError {
                 kind: rtc::PeerErrorKind::InvalidState,
                 message: "native decoded callback observer panicked and retired".into(),
+            });
+        }
+        if self.kind == rtc::MediaType::Video
+            && matches!(
+                self.mode,
+                Some(ReceiveMode::Encoded | ReceiveMode::EncodedAndDecoded)
+            )
+            && session.encoded_video_observer_failed(self.id)?
+        {
+            return Err(rtc::PeerError {
+                kind: rtc::PeerErrorKind::InvalidState,
+                message: "native encoded callback observer panicked and retired".into(),
             });
         }
         if self.kind == rtc::MediaType::Video && self.mode == Some(ReceiveMode::EncodedAndDecoded) {
@@ -235,47 +321,7 @@ impl NativeReceiver {
                 session.try_raw_video_frame(self.id)?.map(decoded_frame)
             }
             (rtc::MediaType::Video, Some(ReceiveMode::Encoded)) => {
-                session.try_video_frame(self.id)?.map(|frame| {
-                    (
-                        OutputFrame::H264 {
-                            timestamp: frame.rtp_timestamp,
-                            keyframe: frame.key_frame,
-                            payload: frame.data,
-                        },
-                        FrameMetadata {
-                            rtp_timestamp: Some(frame.rtp_timestamp),
-                            ssrc: Some(frame.ssrc),
-                            payload_type: Some(frame.payload_type),
-                            codec_mime_type: Some(frame.mime_type),
-                            rid: frame.rid,
-                            capture_time_us: frame.capture_time_us,
-                            receive_time_us: frame.receive_time_us,
-                            frame_id: frame.frame_id,
-                            spatial_index: frame.spatial_index,
-                            temporal_index: frame.temporal_index,
-                            dependencies: frame.dependencies,
-                            decode_target_indications: frame
-                                .decode_target_indications
-                                .into_iter()
-                                .map(|value| match value {
-                                    rtc::DecodeTargetIndication::NotPresent => {
-                                        DecodeTargetIndication::NotPresent
-                                    }
-                                    rtc::DecodeTargetIndication::Discardable => {
-                                        DecodeTargetIndication::Discardable
-                                    }
-                                    rtc::DecodeTargetIndication::Switch => {
-                                        DecodeTargetIndication::Switch
-                                    }
-                                    rtc::DecodeTargetIndication::Required => {
-                                        DecodeTargetIndication::Required
-                                    }
-                                })
-                                .collect(),
-                            ..FrameMetadata::default()
-                        },
-                    )
-                })
+                session.try_video_frame(self.id)?.map(encoded_frame)
             }
             _ => None,
         };

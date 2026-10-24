@@ -1,11 +1,72 @@
 //! Opt-in, bounded native header and congestion-control event observations.
 //! No media payloads, protocol parser, actor reentry or receiver oracle lives here.
 use pulsebeam_webrtc_sys as rtc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::{
+    cell::RefCell,
+    collections::VecDeque,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 pub(crate) const TARGET: &str = "pulsebeam_agent_native::native_rtp";
 pub(crate) const CC_TARGET: &str = "pulsebeam_agent_native::native_cc";
+pub(crate) const TRANSPORT_TARGET: &str = "pulsebeam_agent_native::native_transport";
 const PACKET_BUDGET: usize = 2048;
+const TRANSPORT_BUDGET: usize = 256;
+
+struct TransportObservation {
+    span: tracing::Span,
+    native_time: rtc::Timestamp,
+    event_time_us: i64,
+    data: rtc::RtcEventData,
+}
+
+#[derive(Default)]
+struct TransportTrace {
+    observations: VecDeque<TransportObservation>,
+    dropped: usize,
+}
+
+thread_local! {
+    // Controlled native callbacks execute on the simulator's one OS thread.
+    static TRANSPORT_TRACE: RefCell<Option<TransportTrace>> = const { RefCell::new(None) };
+}
+
+/// Capture bounded ICE/DTLS metadata without formatting it during execution.
+/// The simulator scope emits the retained observations only while unwinding.
+pub fn capture_native_transport() -> impl Drop {
+    let enabled = tracing::enabled!(target: TRANSPORT_TARGET, tracing::Level::TRACE);
+    if enabled {
+        TRANSPORT_TRACE.with_borrow_mut(|trace| *trace = Some(TransportTrace::default()));
+    }
+    TransportCapture(enabled)
+}
+
+struct TransportCapture(bool);
+
+impl Drop for TransportCapture {
+    fn drop(&mut self) {
+        if !self.0 {
+            return;
+        }
+        let Some(trace) = TRANSPORT_TRACE.with_borrow_mut(Option::take) else {
+            return;
+        };
+        if std::thread::panicking() {
+            for observation in trace.observations {
+                let _entered = observation.span.enter();
+                tracing::trace!(
+                    target: TRANSPORT_TARGET,
+                    observer = ?observation.span.id(),
+                    native_time = ?observation.native_time,
+                    event_time_us = observation.event_time_us,
+                    data = ?observation.data,
+                    dropped = trace.dropped,
+                    "Buffered native transport observation"
+                );
+            }
+        }
+    }
+}
 
 pub(crate) struct Factory(tracing::Span);
 
@@ -17,7 +78,9 @@ impl Factory {
 
 impl rtc::RtcEventLogFactory for Factory {
     fn create(&self, environment: rtc::EventLogEnvironment) -> Box<dyn rtc::RtcEventLogger> {
-        let span = if tracing::enabled!(target: CC_TARGET, tracing::Level::TRACE) {
+        let span = if tracing::enabled!(target: TRANSPORT_TARGET, tracing::Level::TRACE) {
+            tracing::trace_span!(target: TRANSPORT_TARGET, parent: &self.0, "native_event_log")
+        } else if tracing::enabled!(target: CC_TARGET, tracing::Level::TRACE) {
             tracing::trace_span!(target: CC_TARGET, parent: &self.0, "native_event_log")
         } else {
             self.0.clone()
@@ -45,6 +108,29 @@ impl rtc::RtcEventLogger for Logger {
     fn stop(&self) {}
 
     fn log(&self, event: rtc::RtcEvent) {
+        if matches!(
+            event.kind(),
+            rtc::RtcEventKind::DtlsTransportState
+                | rtc::RtcEventKind::DtlsWritableState
+                | rtc::RtcEventKind::IceCandidatePairConfig
+                | rtc::RtcEventKind::IceCandidatePair
+        ) && tracing::enabled!(target: TRANSPORT_TARGET, tracing::Level::TRACE)
+        {
+            TRANSPORT_TRACE.with_borrow_mut(|trace| {
+                if let Some(trace) = trace {
+                    if trace.observations.len() == TRANSPORT_BUDGET {
+                        trace.observations.pop_front();
+                        trace.dropped = trace.dropped.saturating_add(1);
+                    }
+                    trace.observations.push_back(TransportObservation {
+                        span: self.span.clone(),
+                        native_time: self.environment.timestamp(),
+                        event_time_us: event.timestamp_us(),
+                        data: event.data(),
+                    });
+                }
+            });
+        }
         let congestion_event = matches!(
             event.kind(),
             rtc::RtcEventKind::AlrState

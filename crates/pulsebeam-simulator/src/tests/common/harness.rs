@@ -2896,7 +2896,23 @@ async fn execute_plan(
                     publisher,
                     2,
                     expected.min_resolution,
-                )?;
+                )
+                .inspect_err(|_| {
+                    if let Some(handle) = handles.get(participant)
+                        && let Some(stats) = handle.shared.statistics.lock().unwrap().as_ref()
+                    {
+                        tracing::error!(
+                            participant,
+                            publisher,
+                            generation = stats.generation,
+                            timestamp_us = stats.timestamp_us,
+                            report = %String::from_utf8_lossy(
+                                &stats.report_json[..stats.report_json.len().min(65_536)]
+                            ),
+                            "native decoder statistics at source-proof failure"
+                        );
+                    }
+                })?;
                 let handle = get_handle(handles, participant, description)?;
                 anyhow::ensure!(
                     handle.native_playback_started,
@@ -6036,6 +6052,7 @@ impl LocalNodeSim {
         // The guard is dropped at the end of this function rather than at process exit, so the
         // real clock is back in force before the runtime tears down.
         let _sim_clocks = crate::sim_clock::SimClocksGuard::init();
+        let _transport_capture = pulsebeam_agent_native::capture_native_transport();
         crate::sim_rand::set_thread_rng(self.rng_seed);
         fastrand::seed(self.rng_seed);
         // Loss, reordering and duplication come from the shaper's own stream, not

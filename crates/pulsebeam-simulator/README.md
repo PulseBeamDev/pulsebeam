@@ -23,7 +23,8 @@ or failure injection.
 
 Use `Participant::with_native_playback()` for user-visible playback scenarios.
 It observes actual native I420 and uses authenticated encoded samples only to
-identify the source by admission, generation, receiver and RTP timestamp. It
+identify the source by admission, generation, full native track identity and RTP
+timestamp. It
 does not run an independent decoder or issue keyframe requests because a
 polling observer fell behind. Native decoder feedback remains authoritative.
 
@@ -41,10 +42,13 @@ polling observer fell behind. Native decoder feedback remains authoritative.
   timed continuity claim. Slot replacement also checks the original native
   receiver identity.
 
-Encoded polling loss remains diagnostic and invalidates retained source
-pairings until new observations authenticate them. It is not native decoder
-loss or proof of misrouting. Native callback collection failure still fails
-playback. Source samples do not establish complete encoded-stream continuity.
+Playback source correlation joins actual native ordered-encoded and I420
+callbacks independently of best-effort polling retention. Polling loss remains
+diagnostic and cannot erase those callback facts. Missing native identity or
+metadata revokes source pairings until new actual observations authenticate
+them; pre-loss native output is not reused. Native callback collection or
+conversion failure still fails playback. Source samples do not establish
+complete encoded-stream continuity.
 
 Keep `with_encoded_and_native_decoded_video()` and encoded quality assertions
 for scenarios specifically testing encoded forwarding or independent codec

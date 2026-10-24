@@ -538,6 +538,7 @@ impl SimClientBuilder {
                 "native playback needs dual observations and cannot corrupt only a probe"
             );
             log.native_callback_enabled = true;
+            log.native_encoded_callback_enabled = self.native_playback_only;
             log.native_origin_enabled = dual;
             log.native_playback_only = self.native_playback_only;
         }
@@ -549,6 +550,40 @@ impl SimClientBuilder {
             .unwrap()
             .native_decoded
             .callback_failure_counter();
+        if self.native_playback_only {
+            let callback_log = video_rx.clone();
+            let publishers = self.h264_publishers.clone();
+            let failures = callback_failures.clone();
+            config.encoded_video_observer = Some(
+                pulsebeam_agent_native::EncodedVideoObserver::new(move |observation| {
+                    // Collect actual native callbacks, never replay polling
+                    // records or retain an origin across native metadata loss.
+                    let Ok(mut log) = callback_log.try_lock() else {
+                        failures.fetch_add(1, std::sync::atomic::Ordering::Release);
+                        return;
+                    };
+                    match observation {
+                        pulsebeam_agent_native::EncodedVideoObservation::Frame { frame } => {
+                            let Ok(publishers) = publishers.try_lock() else {
+                                failures.fetch_add(1, std::sync::atomic::Ordering::Release);
+                                return;
+                            };
+                            let pulsebeam_agent_native::OutputFrame::H264 { payload, .. } =
+                                &frame.frame
+                            else {
+                                failures.fetch_add(1, std::sync::atomic::Ordering::Release);
+                                return;
+                            };
+                            let origin = authenticated_fixture_origin(payload, &publishers);
+                            log.native_origin.encoded(&frame, origin.as_deref());
+                        }
+                        pulsebeam_agent_native::EncodedVideoObservation::Dropped { .. } => {
+                            log.native_origin.encoded_observation_lost();
+                        }
+                    }
+                }),
+            );
+        }
         config.decoded_video_observer = Some(pulsebeam_agent_native::DecodedVideoObserver::new(
             move |observation| {
                 // Never wait on application log retention from a native
@@ -740,6 +775,7 @@ pub struct VideoReceiveLog {
     pub native_origin: super::native_origin::NativeOriginCorrelation,
     native_origin_enabled: bool,
     native_callback_enabled: bool,
+    native_encoded_callback_enabled: bool,
     native_playback_only: bool,
     pub by_publisher: BTreeMap<String, u64>,
     pub decoded_by_publisher: BTreeMap<String, DecodedVideoStream>,
@@ -1628,7 +1664,9 @@ fn record_native_fixture_sample(
         .and_then(|origin| publishers.get(origin))
         .map(|source| source.participant_id.as_str());
     let mut observed = log.lock().unwrap();
-    observed.native_origin.encoded(frame, origin.as_deref());
+    if !observed.native_encoded_callback_enabled {
+        observed.native_origin.encoded(frame, origin.as_deref());
+    }
     // Retain observed-slot/encoded diagnostics, but neither independently decode
     // nor turn polling loss into an application-generated keyframe request.
     observed.record(publisher, frame);
@@ -1804,6 +1842,58 @@ mod tests {
                 payload,
             },
         }
+    }
+
+    #[test]
+    fn polling_loss_does_not_revoke_independent_native_callback_evidence() {
+        let start = Instant::now();
+        let mut encoded = owned_video(1, 90_000, true, vec![]);
+        encoded.metadata.rtp_timestamp = Some(90_000);
+        let mut decoded = encoded.clone();
+        decoded.frame = pulsebeam_agent_native::OutputFrame::I420 {
+            frame: pulsebeam_agent_native::I420Frame {
+                width: 4,
+                height: 4,
+                timestamp_us: 1,
+                rotation_degrees: 0,
+                data: vec![1; 24],
+            },
+        };
+        let log = Arc::new(Mutex::new(VideoReceiveLog {
+            native_callback_enabled: true,
+            native_encoded_callback_enabled: true,
+            ..VideoReceiveLog::default()
+        }));
+        {
+            let mut observed = log.lock().unwrap();
+            observed
+                .native_origin
+                .encoded(&encoded, Some("admission/v0"));
+            observed
+                .native_origin
+                .decoded(&decoded, start + Duration::from_millis(1), true);
+        }
+        let mut streams = HashMap::new();
+        record_video_drop(&log, &mut streams, 1, "native SDK sink", false);
+        assert!(
+            log.lock()
+                .unwrap()
+                .native_origin
+                .require_since("admission/v0", 1, start, 1, (4, 4))
+                .is_ok()
+        );
+        // Without independent callbacks the same loss MUST revoke polling
+        // evidence. Actual native metadata loss uses this same fail-closed
+        // correlation reset even when independent capture is enabled.
+        log.lock().unwrap().native_encoded_callback_enabled = false;
+        record_video_drop(&log, &mut streams, 1, "native SDK sink", false);
+        assert!(
+            log.lock()
+                .unwrap()
+                .native_origin
+                .require_since("admission/v0", 1, start, 1, (4, 4))
+                .is_err()
+        );
     }
 
     #[test]
@@ -3763,7 +3853,12 @@ fn record_video_drop(
     let mut log = log.lock().unwrap();
     log.non_contiguous += skipped;
     log.native_queue_drops += skipped;
-    log.native_origin.encoded_observation_lost();
+    // Native callback evidence is independent of these best-effort polling
+    // queues. Actual pre-observation metadata loss still revokes it through
+    // the synchronous encoded observer, not through a replayed queue record.
+    if !log.native_encoded_callback_enabled {
+        log.native_origin.encoded_observation_lost();
+    }
     if affects_native_decoded && !log.native_callback_enabled {
         log.native_decoded.dropped(skipped);
     }
