@@ -159,13 +159,23 @@ opaque values. See [extension ownership](docs/design.md#rtp-extension-ownership)
 
 The RTC owner suite includes controlled native libwebrtc peers, public boundary
 tests, and private protocol/congestion proofs. Its Linux x86_64 client uses the
-same checksum-pinned `pulsebeam-webrtc-sys` candidate as the native agent; follow
-the [local candidate setup](../../tools/README.md#use-the-local-native-webrtc-candidate)
-before running these commands. The lock, not an older SDK version or filename,
-identifies the compatible source/native pair. Virtual time and packet delivery
-drive real protocol implementations without real sockets or sleeps. Stored SDP is
-parser evidence, not browser compatibility. RFC 8888 retains parser, report,
-accounting, and ECN coverage, not a native-client interoperability claim.
+same pinned source build and tracked WebRTC patches as the native agent. Bazel
+acquires and builds the SDK; follow the [host prerequisites](../../docs/build.md#host-prerequisites)
+and [SDK build ownership](../pulsebeam-libwebrtc-sys/README.md#build-ownership-and-caching).
+Virtual time and packet delivery drive real protocol implementations without real
+sockets or sleeps. Stored SDP is parser evidence, not browser compatibility.
+RFC 8888 retains parser, report, accounting, and ECN coverage, not a native-client
+interoperability claim.
+
+`simulation/tests/sdpless.rs` starts one native peer and RTC connection with SCTP
+only, then applies the actual client module's local answers before declaring typed
+media. It checks Opus/VP8/H.264/VP9 payload attribution, duplex directions,
+independent tiers and runtime-observed RID/SSRC/RTX identities, pause/reactivation,
+invalid-update isolation, retirement/re-add, and audio/data/TWCC continuity. Its
+isolated fragmented VP8 frame must recover through negotiated RTX before any
+later video input; exact-binding re-add must retain repair numbering. Compatible
+fixture source changes prove transport flexibility, not production routing,
+frame rewriting, quality selection or replay policy.
 
 ```sh
 ./bazel test //crates/pulsebeam-rtc:test --nocache_test_results
@@ -178,8 +188,8 @@ correctness gates. `src/network_tests.rs` and connection unit tests offer direct
 RTP to real native receivers for capacity, competition, queue-sojourn,
 application-limited, and feedback-outage proofs. Native ingress, fragmented
 video, repair, channel, TCP, and same-seed replay tests cover separate wire
-obligations. Source/frame/cache behavior remains in the native SFU's owner
-proof, not RTC fixtures.
+obligations. Production source/frame/cache policy remains in the native SFU's
+owner proof, not RTC fixtures.
 
 The existing active-media Criterion matrix remains separate from correctness
 acceptance:

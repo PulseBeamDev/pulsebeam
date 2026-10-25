@@ -284,8 +284,19 @@ impl RtpConfigurationState {
                     }
                 }
                 validate_codec(&binding.codec.parameters)?;
-                if !caps.codecs.contains(&binding.codec.parameters)
-                    || binding.codec.repair_payload_type.is_some() && !caps.repair
+                if !caps.codecs.iter().any(|supported| {
+                    supported
+                        .name
+                        .eq_ignore_ascii_case(&binding.codec.parameters.name)
+                        && supported.clock_rate == binding.codec.parameters.clock_rate
+                        && supported.channels == binding.codec.parameters.channels
+                        && supported.fmtp == binding.codec.parameters.fmtp
+                        && binding
+                            .codec
+                            .parameters
+                            .feedback
+                            .is_subset(&supported.feedback)
+                }) || binding.codec.repair_payload_type.is_some() && !caps.repair
                 {
                     return Err(RtpConfigurationError::Unsupported);
                 }

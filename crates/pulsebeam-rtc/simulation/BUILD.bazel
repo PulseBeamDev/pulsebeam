@@ -37,7 +37,7 @@ rust_test(
     # ControlledWorld exclusively owns process-global clock and randomness hooks.
     args = ["--test-threads=1"],
     crate_root = "tests/interop.rs",
-    srcs = ["tests/interop.rs"],
+    srcs = ["tests/interop.rs", "tests/sdpless.rs"],
     edition = "2024",
-    deps = ["//crates/pulsebeam-libwebrtc-sys:pulsebeam-webrtc-sys", "@crates//:bytes", "//crates/pulsebeam-rtc:pulsebeam-rtc"],
+    deps = ["//crates/pulsebeam-libwebrtc-sys:pulsebeam-webrtc-sys", "@crates//:bytes", "//crates/pulsebeam-rtc:pulsebeam-rtc", "//agents/pulsebeam-agent-core:pulsebeam-agent-core"],
 )

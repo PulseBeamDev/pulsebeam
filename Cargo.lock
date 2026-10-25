@@ -3700,6 +3700,7 @@ name = "pulsebeam-rtc-simulation"
 version = "0.0.0"
 dependencies = [
  "bytes",
+ "pulsebeam-agent-core",
  "pulsebeam-rtc",
  "pulsebeam-webrtc-sys",
 ]

@@ -1,0 +1,17 @@
+diff --git a/pc/video_rtp_receiver.cc b/pc/video_rtp_receiver.cc
+--- a/pc/video_rtp_receiver.cc
++++ b/pc/video_rtp_receiver.cc
+@@ -175,8 +175,9 @@ void VideoRtpReceiver::GetRestartFunctionForMediaChannel_w(
+   const bool encoded_sink_enabled = saved_encoded_sink_enabled_;
+-
++
+   if (state != MediaSourceInterface::kInitializing) {
+-    if (ssrc == signaled_ssrc_)
+-      return;
++    // Direction changes can recreate the channel's receive stream without
++    // changing its SSRC. Rebind output and transform hooks even in that case;
++    // the replacement stream does not inherit them from the previous stream.
+-
++
+     // Disconnect from a previous ssrc.
+     SetSink(nullptr);

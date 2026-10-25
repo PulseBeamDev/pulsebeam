@@ -128,6 +128,7 @@ def _webrtc_impl(ctx):
             "encoder-preference-order-fallback",
             "runtime-codec-core-budget",
             "recordable-encoded-frame-rtp-identity",
+            "receiver-rebind-same-ssrc",
         ]],
         libvpx_patch = Label("//crates/pulsebeam-libwebrtc-sys:patches/runtime-libvpx-workers.patch"),
     )
