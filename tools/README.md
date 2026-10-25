@@ -157,10 +157,11 @@ Cargo compilation is not a supported patched build path.
   dereferences only declared snapshots inside the test's temporary directory:
   Prettier otherwise rejects explicit Bazel runfiles symlinks and silently omits
   globbed symlink inputs. Every original check pattern remains required.
-* `npm-links.bzl` uses the upstream package linker for Meet's transitive local
-  Web SDK dependency. Meet's independent lockfile does not encode that edge
-  through its linked React package; the bridge references the existing package
-  output, with no duplicate version pin or application resolver alias.
+* `npm-links.bzl` uses the upstream package linker for the transitive local Web
+  SDK dependency of Meet and the React consumer contract. Their independent
+  lockfiles do not encode that edge through the linked React package; the bridge
+  references the existing package output, with no duplicate version pin or
+  application resolver alias.
 - `rules_pkg` owns release archives. `release/package.py` adds hashes and assembly
   metadata; `global.py` and the installer template preserve package-scoped tags
   and CARGO_HOME installation. Updates reuse the explicitly selected release's

@@ -1,8 +1,6 @@
 import { useRef, useState } from "react";
-import { track, type Agent, type DataEvent } from "@pulsebeam/react";
+import { type Agent, type DataEvent } from "@pulsebeam/react";
 import { decodeText, encodeText } from "@/lib/data-codec";
-
-const chat = track.data("chat", "ordered");
 
 type LocalMessage = {
   type: "local";
@@ -27,7 +25,7 @@ type Gap = {
 
 export function useChat(agent: Agent) {
   const { participantId } = agent;
-  const Chat = agent.track(chat);
+  const Chat = agent.data("chat", "ordered");
   const [messages, setMessages] = useState<
     (RemoteMessage | Gap | LocalMessage)[]
   >([]);

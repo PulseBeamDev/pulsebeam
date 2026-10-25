@@ -1,4 +1,4 @@
-load("//tools:npm-links.bzl", "link_web_for_meet")
+load("//tools:npm-links.bzl", "link_web_for_react_consumers")
 load("@aspect_rules_js//js:defs.bzl", "js_binary", "js_run_binary", "js_test")
 load("@bazel_lib//lib:output_files.bzl", "output_files")
 load("@bazel_lib//lib:copy_to_directory.bzl", "copy_to_directory")
@@ -14,7 +14,7 @@ package(default_visibility = ["//visibility:public"])
 filegroup(name = "workflow_inputs", srcs = glob(["*.md", "docs/**/*.md", "Justfile", "*.json", "*.yaml", "scripts/*.sh"], allow_empty = True))
 exports_files(["package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml"])
 
-npm_link_all_packages(name = "node_modules", imported_links = [link_web_for_meet])
+npm_link_all_packages(name = "node_modules", imported_links = [link_web_for_react_consumers])
 
 js_test(
     name = "component_tests",

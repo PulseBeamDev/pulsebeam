@@ -7,18 +7,20 @@ import {
   type CapturedVideoTrack,
   type DataEvent,
   type Delivery,
-  type LocalAudioTrack,
   type LocalMediaAttachment,
-  type LocalVideoTrack,
   type PlaybackFailure,
   type VideoSenderConfig,
 } from "@pulsebeam/web";
 import { useCommittedRef } from "./committed-ref.js";
 import {
   dataEvents,
+  localMedia,
+  trackIdentity,
   managedAgent,
   type Agent,
   type LocalDataTrack,
+  type LocalVideoTrack,
+  type LocalAudioTrack,
   type RemoteDataTrack,
 } from "./agent.js";
 import {
@@ -45,6 +47,7 @@ export type PublishProps =
 
 export function Publish(props: PublishProps): null {
   const committed = useCommittedRef(props);
+  const target = trackIdentity(props.track);
   const attachment = useRef<LocalMediaAttachment | null>(null);
   const [failure, setFailure] = useState<unknown>(null);
   if (failure) throw failure;
@@ -68,12 +71,12 @@ export function Publish(props: PublishProps): null {
     };
     const owner =
       current.track.kind === "video"
-        ? attachLocalTrack(current.track, {
+        ? attachLocalTrack(localMedia(current.track), {
             ...options,
             source: source as CapturedVideoTrack | null,
             config: options.config as VideoSenderConfig,
           })
-        : attachLocalTrack(current.track, {
+        : attachLocalTrack(localMedia(current.track), {
             ...options,
             source: source as CapturedAudioTrack | null,
             config: options.config as AudioSenderConfig,
@@ -86,7 +89,7 @@ export function Publish(props: PublishProps): null {
       if (attachment.current === owner) attachment.current = null;
       void owner.close();
     };
-  }, [props.track]);
+  }, [target]);
 
   const configKey = `${props.track.kind}:${props.content ?? ""}`;
   useLayoutEffect(() => {
@@ -108,7 +111,7 @@ export function Publish(props: PublishProps): null {
 
 export interface DataProps<D extends Delivery = Delivery> {
   readonly track: LocalDataTrack<D> | RemoteDataTrack<D>;
-  readonly onEvent: (event: DataEvent<D>) => void;
+  readonly onEvent: (event: DataEvent<D>) => void | Promise<void>;
   readonly onError?: (error: unknown) => void;
 }
 
@@ -118,23 +121,37 @@ export function Data<D extends Delivery>({
   onError,
 }: DataProps<D>): null {
   const callbacks = useCommittedRef({ onEvent, onError });
+  const target = trackIdentity(track);
   useLayoutEffect(() => {
     const controller = new AbortController();
-    const events = dataEvents(track, { signal: controller.signal });
+    let events: AsyncIterableIterator<DataEvent<D>> | undefined;
+    const release = () => {
+      controller.abort();
+      void events?.return?.();
+    };
     void (async () => {
       try {
-        for await (const event of events) callbacks.current.onEvent(event);
+        events = dataEvents(track, { signal: controller.signal });
+        while (!controller.signal.aborted) {
+          const next = await events.next();
+          if (next.done || controller.signal.aborted) break;
+          await callbacks.current.onEvent(next.value);
+        }
       } catch (error) {
         if (controller.signal.aborted) return;
-        if (callbacks.current.onError) callbacks.current.onError(error);
-        else console.error("PulseBeam data receive failed", error);
+        release();
+        try {
+          if (callbacks.current.onError) callbacks.current.onError(error);
+          else console.error("PulseBeam data receive failed", error);
+        } catch (reportingError) {
+          console.error("PulseBeam data error handler failed", reportingError);
+        }
+      } finally {
+        release();
       }
     })();
-    return () => {
-      controller.abort();
-      void events.return?.();
-    };
-  }, [track]);
+    return release;
+  }, [target]);
   return null;
 }
 
@@ -145,12 +162,13 @@ export interface AudioProps {
 
 export function Audio({ agent, onPlaybackError }: AudioProps): null {
   const callback = useCommittedRef(onPlaybackError);
+  const target = managedAgent(agent);
   const [failure, setFailure] = useState<unknown>(null);
   if (failure) throw failure;
   useLayoutEffect(() => {
     setFailure(null);
     let active = true;
-    const owner = attachRemoteAudio(managedAgent(agent), {
+    const owner = attachRemoteAudio(target, {
       onPlaybackError: (value) => {
         if (active) callback.current?.(value);
       },
@@ -162,6 +180,6 @@ export function Audio({ agent, onPlaybackError }: AudioProps): null {
       active = false;
       void owner.close();
     };
-  }, [agent]);
+  }, [target]);
   return null;
 }

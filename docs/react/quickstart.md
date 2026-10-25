@@ -88,15 +88,12 @@ import {
   Audio,
   Publish,
   Video,
-  track,
   useAgent,
   useCapture,
   type CaptureResult,
   type RemoteVideoTrack,
 } from "@pulsebeam/react";
 
-const camera = track.video("camera");
-const microphone = track.audio("microphone");
 
 export function Call({ sessionId, token }: { sessionId: string; token: string }) {
   const media = useCapture("device", { video: true, audio: true });
@@ -123,8 +120,8 @@ function Room({ token, media }: { token: string; media: CaptureResult }) {
 
   return (
     <>
-      <Publish track={agent.track(camera)} source={media.video} />
-      <Publish track={agent.track(microphone)} source={media.audio} />
+      <Publish track={agent.video("camera")} source={media.video} />
+      <Publish track={agent.audio("microphone")} source={media.audio} />
       <Audio agent={agent} />
       <button onClick={() => agent.connect()}>Join room</button>
       <button onClick={() => agent.disconnect()}>Leave room</button>

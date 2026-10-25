@@ -4,30 +4,25 @@ import { createReactAgent, type Agent } from "./agent.js";
 import type { AgentConfig } from "@pulsebeam/web";
 import { createManagedAgent } from "@pulsebeam/web/internal/react";
 
-export { track } from "@pulsebeam/web";
 export type {
   AgentConfig,
   AgentError,
   AgentLogging,
-  AudioTrackSpec,
   ConnectionState,
   DataEvent,
   DataGap,
   DataMessage,
-  DataTrackSpec,
   Delivery,
   FailureClass,
-  LocalAudioTrack,
-  LocalVideoTrack,
   LogLevel,
   MediaTopology,
   PlaybackFailure,
   ReceiveOptions,
-  TrackSpec,
-  VideoTrackSpec,
 } from "@pulsebeam/web";
 export type {
   Agent,
+  LocalAudioTrack,
+  LocalVideoTrack,
   LocalDataTrack,
   RemoteAudioTrack,
   RemoteDataTrack,

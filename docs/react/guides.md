@@ -5,16 +5,9 @@ description: Add capture, publication, playback, data, renewal, and recovery to 
 
 # Add one feature
 
-These guides build on the [quickstart](/react/quickstart). Keep track descriptors
-at module scope so their identity and labels remain stable.
-
-```tsx
-import { track } from "@pulsebeam/react";
-
-const camera = track.video("camera");
-const microphone = track.audio("microphone");
-const screen = track.video("screen");
-```
+These guides build on the [quickstart](/react/quickstart). Look up logical
+tracks directly from the Agent. Labels should remain stable; repeating a lookup
+during rendering does not acquire resources or replace a committed owner.
 
 ## Pre-join preview
 
@@ -36,7 +29,7 @@ stop capture.
 Call `useDevices()` to enumerate typed camera and microphone devices. Pass a
 selected device into `useCapture`. Changing capture options replaces the owned
 capture session; publication follows the new captured source without replacing
-the descriptor.
+the publication owner.
 
 ```tsx
 const devices = useDevices();
@@ -51,19 +44,20 @@ Device labels may be empty until the user grants permission. Treat
 
 ## Enablement, withdrawal, and release
 
-Resolve a descriptor through the Agent, then mount `Publish` to own publication.
+Look up a local handle, then mount `Publish` to own publication.
 
 ```tsx
 <Publish
-  track={agent.track(camera)}
+  track={agent.video("camera")}
   source={capture.video}
   enabled={cameraOn}
 />
 ```
 
-`enabled={false}` mutes the retained source. A null source or unmounting
-`Publish` withdraws the publication. The capture remains owned by `useCapture`
-until `stop()` or unmount. Descriptor lookup alone has no publication side effect.
+`enabled={false}` disables media while retaining ownership. A null source keeps
+the declaration without a source; unmounting `Publish` releases it. The capture
+remains owned by `useCapture` until `stop()` or unmount. Lookup alone has no
+publication side effect.
 
 ## Screen sharing
 
@@ -77,7 +71,7 @@ const display = useCapture("display", {
 
 <button onClick={() => void display.request()}>Share screen</button>
 <Publish
-  track={agent.track(screen)}
+  track={agent.video("screen")}
   source={display.video}
   content="detail"
 />
@@ -155,12 +149,11 @@ PulseBeam data tracks carry bytes. The application owns its wire format,
 validation, versioning, and malformed-payload policy.
 
 ```tsx
-const chat = track.data("chat", "ordered");
 const encoder = new TextEncoder();
 const decoder = new TextDecoder("utf-8", { fatal: true });
 
 function Chat({ agent }: { agent: Agent }) {
-  const ChatTrack = agent.track(chat);
+  const ChatTrack = agent.data("chat", "ordered");
 
   async function send(message: string) {
     await ChatTrack.send(encoder.encode(JSON.stringify(message)));
@@ -193,5 +186,16 @@ function Chat({ agent }: { agent: Agent }) {
 Mounting `Data` owns one subscription and unmounting releases it. `lossy` emits
 messages only. `ordered` may also emit a `gap` when unavailable history prevents
 continuous recovery. Consumers must preserve the gap before later messages.
+`onEvent` may return a promise. Each mount awaits its current handler before
+taking the next event, using the latest committed callback. Other mounts keep
+processing independently. Buffering is bounded, so awaiting does not provide
+transport backpressure or guarantee against overload loss. If a handler throws
+or rejects, or reception fails, that mount releases its subscription and reports
+the error through `onError` (or a diagnostic when absent). Callback changes do
+not restart it; remount to restart. Catch processing errors inside `onEvent` to
+continue deliberately. Unmount and target changes release receive ownership
+without waiting for application work, and suppress late callbacks. Already
+running application side effects cannot be cancelled or undone.
+
 Data is live transport, not durable storage. Use application storage when late
 joiners need complete history.

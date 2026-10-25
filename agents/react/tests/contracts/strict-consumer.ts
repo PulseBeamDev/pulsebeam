@@ -3,7 +3,6 @@ import {
   Data,
   Publish,
   Video,
-  track,
   useAgent,
   useCapture,
   useDevices,
@@ -73,9 +72,20 @@ useCapture("display", { video: { device: cameraDevice }, audio: false });
 // @ts-expect-error Display video is required.
 useCapture("display", { video: false, audio: false });
 
-const localVideo = agent.track(track.video("camera"));
-const localAudio = agent.track(track.audio("microphone"));
-const chat = agent.track(track.data("chat", "ordered"));
+// @ts-expect-error React descriptors were removed; Web retains its descriptor API.
+import { track } from "@pulsebeam/react";
+// @ts-expect-error Descriptor-only types are not React API.
+import type { TrackSpec } from "@pulsebeam/react";
+// @ts-expect-error Descriptor-only types are not React API.
+import type { VideoTrackSpec } from "@pulsebeam/react";
+// @ts-expect-error Descriptor-only types are not React API.
+import type { AudioTrackSpec } from "@pulsebeam/react";
+// @ts-expect-error Descriptor-only types are not React API.
+import type { DataTrackSpec } from "@pulsebeam/react";
+
+const localVideo = agent.video("camera");
+const localAudio = agent.audio("microphone");
+const chat = agent.data("chat", "ordered");
 createElement(Publish, {
   track: localVideo,
   source: capture.video,
@@ -93,11 +103,39 @@ Publish({ track: localVideo, source: capture.audio });
 Publish({ track: localVideo, source: capture.video, content: "speech" });
 // @ts-expect-error No normal imperative publication setter.
 localVideo.setSource(capture.video);
+// @ts-expect-error Publication enabled state belongs to Publish.
+localVideo.setEnabled(false);
+// @ts-expect-error Local handles do not expose borrowed capture.
+localVideo.source;
+// @ts-expect-error Descriptors are not React lookup API.
+agent.track({ kind: "video", label: "camera" });
+// @ts-expect-error Delivery is required.
+agent.data("chat");
 
 const participant = agent.remote.participant("alice");
-const remoteVideo = participant.track(track.video("camera"));
-const remoteAudio = participant.track(track.audio("microphone"));
-const remoteChat = participant.track(track.data("chat", "ordered"));
+const remoteVideo = participant.video("camera");
+const remoteAudio = participant.audio("microphone");
+const remoteChat = participant.data("chat", "ordered");
+// @ts-expect-error Participant descriptor lookup was removed.
+participant.track({ kind: "video", label: "camera" });
+// @ts-expect-error Remote delivery is also required.
+participant.data("chat");
+Data({
+  track: participant.data("live", "lossy"),
+  async onEvent(event) {
+    const bytes: Uint8Array = event.data;
+    // @ts-expect-error Lossy delivery cannot emit a gap.
+    event.from;
+    await Promise.resolve(bytes);
+  },
+});
+Data({
+  track: agent.data("state", "latest"),
+  onEvent(event) {
+    const message: "message" = event.type;
+    void message;
+  },
+});
 createElement(Video, {
   source: remoteVideo,
   receive: {

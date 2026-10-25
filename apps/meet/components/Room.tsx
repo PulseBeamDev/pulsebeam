@@ -4,7 +4,6 @@ import {
   Data,
   Publish,
   Video,
-  track,
   useAgent,
   useCapture,
   type RemoteVideoTrack,
@@ -29,10 +28,6 @@ import { useMeetMedia } from "./MeetMediaProvider";
 import { useChat } from "@/hooks/chat";
 import { reactionEmojis, useReaction } from "@/hooks/reaction";
 import { useVideoLayout } from "@/hooks/video-layout";
-
-const camera = track.video("camera");
-const microphone = track.audio("microphone");
-const screenShare = track.video("screen");
 
 const latencyModes: Record<
   string,
@@ -74,9 +69,9 @@ export function Room({
     video: { width: 1920, height: 1080, frameRate: 30 },
     audio: false,
   });
-  const Camera = agent.track(camera);
-  const Microphone = agent.track(microphone);
-  const Screen = agent.track(screenShare);
+  const Camera = agent.video("camera");
+  const Microphone = agent.audio("microphone");
+  const Screen = agent.video("screen");
   const [deviceAnchor, setDeviceAnchor] = useState<HTMLElement | null>(null);
   const [reactionAnchor, setReactionAnchor] = useState<HTMLElement | null>(
     null,

@@ -1,3 +1,4 @@
+load("//tools:npm-links.bzl", "link_web_for_react_consumers")
 load("@consumer_npm//:defs.bzl", "npm_link_all_packages")
 load("@consumer_npm//agents/react/tests/consumer:typescript/package_json.bzl", typescript = "bin")
 
@@ -5,7 +6,7 @@ package(default_visibility = ["//visibility:public"])
 exports_files(["package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml"])
 filegroup(name = "sources", srcs = glob(["src/**"]))
 
-npm_link_all_packages(name = "node_modules")
+npm_link_all_packages(name = "node_modules", imported_links = [link_web_for_react_consumers])
 
 typescript.tsc_test(
     name = "contract",

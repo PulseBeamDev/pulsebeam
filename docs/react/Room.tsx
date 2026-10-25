@@ -3,7 +3,6 @@ import {
   Audio,
   Publish,
   Video,
-  track,
   useAgent,
   useCapture,
   type AgentConfig,
@@ -11,9 +10,6 @@ import {
   type PlaybackFailure,
   type RemoteVideoTrack,
 } from "@pulsebeam/react";
-
-const camera = track.video("camera");
-const microphone = track.audio("microphone");
 
 export function Room({ config }: { config: AgentConfig }) {
   const agent = useAgent(config);
@@ -34,8 +30,8 @@ export function Room({ config }: { config: AgentConfig }) {
 
   return (
     <main>
-      <Publish track={agent.track(camera)} source={capture.video} />
-      <Publish track={agent.track(microphone)} source={capture.audio} />
+      <Publish track={agent.video("camera")} source={capture.video} />
+      <Publish track={agent.audio("microphone")} source={capture.audio} />
       <Audio agent={agent} onPlaybackError={setAudioPlayback} />
       <h1>PulseBeam React room</h1>
       <p role="status">

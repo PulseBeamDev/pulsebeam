@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { startTransition, Suspense, useLayoutEffect } from "react";
 import { createRoot } from "react-dom/client";
-import { Video } from "../../src/index.js";
+import { Audio, Data, Publish, Video, useAgent } from "../../src/index.js";
+import { runtimes } from "./runtime.js";
 import { useUserMedia, type CaptureResult } from "../../src/capture.js";
 import { createCaptureSource } from "@pulsebeam/web";
 import { publishableVideoSource } from "../../src/sources.js";
@@ -30,6 +31,13 @@ export async function concurrentRender() {
     throw never;
   }
   function Probe({ speculative }: { speculative: boolean }) {
+    const agent = useAgent({
+      endpoint: "http://localhost",
+      token: "abandoned",
+    });
+    const camera = agent.video("camera");
+    const messages = agent.data("messages", "ordered");
+    const remote = agent.remote.participant("alice").video("camera");
     const capture = useUserMedia({
       video: { preferences: { width: speculative ? 1280 : 640 } },
       audio: false,
@@ -46,7 +54,20 @@ export async function concurrentRender() {
             else committedFailures++;
           }}
         />
-        {speculative && <Suspend />}
+        {speculative && (
+          <>
+            <Publish track={camera} source={source} />
+            <Audio agent={agent} />
+            <Data
+              track={messages}
+              onEvent={() => {
+                abandonedFailures++;
+              }}
+            />
+            <Video source={remote} />
+            <Suspend />
+          </>
+        )}
       </>
     );
   }
@@ -79,6 +100,11 @@ export async function concurrentRender() {
       suspended,
       true,
       "speculative render actually reached suspension",
+    );
+    assert.deepEqual(
+      runtimes.at(-1)!.resourceCommands,
+      [],
+      "lookup and abandoned owners acquire no resources",
     );
     await flush(() => {
       pending.resolve(acquired);

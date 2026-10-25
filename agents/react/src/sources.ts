@@ -24,6 +24,7 @@ export interface PublishableAudioSource extends AudioSource {
 }
 
 export interface VideoAttachment {
+  setAutoPlay(autoPlay: boolean): void;
   setPreferences(preferences: ReceiveOptions): void;
   close(): void;
 }
@@ -97,10 +98,20 @@ export function localVideoBinding(
   read: () => CapturedVideoTrack | null,
   subscribe: (listener: () => void) => () => void = () => () => {},
 ): VideoBinding {
-  return (element, onError, { autoPlay }) => {
+  return (element, onError, options) => {
+    let autoPlay = options.autoPlay;
     let live = true;
     let current: CapturedVideoTrack | null | undefined;
     let stream: MediaStream | null = null;
+    const play = () => {
+      const attached = stream;
+      const retry = async () => {
+        if (live && attached && stream === attached) await element.play();
+      };
+      void retry().catch((error: unknown) => {
+        if (live && stream === attached && autoPlay) onError(error, retry);
+      });
+    };
     const sync = () => {
       const next = read();
       if (next === current) return;
@@ -110,18 +121,16 @@ export function localVideoBinding(
       stream = track?.readyState === "live" ? new MediaStream([track]) : null;
       if (!stream) return;
       element.srcObject = stream;
-      const attached = stream;
-      const retry = async () => {
-        if (live && stream === attached) await element.play();
-      };
-      if (autoPlay)
-        void retry().catch((error: unknown) => {
-          if (live && stream === attached) onError(error, retry);
-        });
+      if (autoPlay) play();
     };
     const unsubscribe = subscribe(sync);
     sync();
     return {
+      setAutoPlay(value) {
+        if (!live || value === autoPlay) return;
+        autoPlay = value;
+        if (autoPlay && stream) play();
+      },
       setPreferences() {},
       close() {
         live = false;

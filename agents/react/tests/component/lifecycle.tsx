@@ -1,19 +1,23 @@
 import assert from "node:assert/strict";
 import { StrictMode, useState } from "react";
 import { createRoot } from "react-dom/client";
-import { Publish, Video, track, useAgent } from "../../src/index.js";
+import { Publish, Video, useAgent } from "../../src/index.js";
+import { dataLifetimes, staleDataClaims } from "./data.js";
 import { useUserMedia, useMediaDevices } from "../../src/capture.js";
 import { captures, deferred, flush, stream } from "./platform.js";
 import { runtimes } from "./runtime.js";
 import { concurrentRender } from "./concurrency.js";
 
 import { captureLifecycle } from "./capture.js";
-import { ownershipAdapters } from "./ownership.js";
+import { ownershipAdapters, stalePublicationClaim } from "./ownership.js";
 import { videoPreferences } from "./video.js";
 
 await concurrentRender();
 await captureLifecycle();
 await ownershipAdapters();
+await stalePublicationClaim();
+await dataLifetimes();
+await staleDataClaims();
 await videoPreferences();
 
 let agent: ReturnType<typeof useAgent>;
@@ -31,7 +35,7 @@ function Room() {
   devicesReady = useMediaDevices().state === "ready";
   updateToken = () => setToken("renewed");
   replaceSession = () => setEndpoint("http://localhost/replacement");
-  const camera = agent.track(track.video("camera"));
+  const camera = agent.video("camera");
   const [enabled, updateEnabled] = useState(true);
   setEnabled = updateEnabled;
   return (

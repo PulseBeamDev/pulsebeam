@@ -2,7 +2,6 @@ import assert from "node:assert/strict";
 import { useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
-  track,
   useAgent,
   Video,
   type Agent,
@@ -10,6 +9,7 @@ import {
 } from "../../src/index.js";
 import { flush } from "./platform.js";
 import { runtimes } from "./runtime.js";
+import { createReactAgent, managedAgent } from "../../src/agent.js";
 
 export async function videoPreferences() {
   let agent!: Agent;
@@ -20,6 +20,7 @@ export async function videoPreferences() {
       hide: boolean;
       remove: boolean;
       reverse: boolean;
+      autoPlay: boolean;
     }>,
   ) => void;
   const original = HTMLVideoElement.prototype.getBoundingClientRect;
@@ -57,15 +58,18 @@ export async function videoPreferences() {
       hide: false,
       remove: false,
       reverse: false,
+      autoPlay: true,
     });
     change = (patch) => setState((before) => ({ ...before, ...patch }));
-    const remote = agent.remote
-      .participant("alice")
-      .track(track.video("camera"));
+    const remote = createReactAgent(managedAgent(agent))
+      .remote.participant("alice")
+      .video("camera");
     const views = [
       <Video
         key="one"
         source={remote}
+        autoPlay={state.autoPlay}
+        mirror={!state.autoPlay}
         receive={state.first}
         data-size="small"
       />,
@@ -87,9 +91,7 @@ export async function videoPreferences() {
   try {
     await flush(() => root.render(<Room />));
     const runtime = runtimes.at(-1)!;
-    const remote = agent.remote
-      .participant("alice")
-      .track(track.video("camera"));
+    const remote = agent.remote.participant("alice").video("camera");
     assert.equal(
       "agent" in agent.remote,
       false,
@@ -127,6 +129,24 @@ export async function videoPreferences() {
       playoutDelay: { mode: "fixed", minMs: 0, maxMs: 200 },
     });
     const aggregate = { ...desired() };
+    const owners = [...runtime.videoOwners.keys()];
+    await flush(() => change({ autoPlay: false, first: { priority: 2 } }));
+    assert.deepEqual(
+      [...runtime.videoOwners.keys()],
+      owners,
+      "equivalent wrappers and presentation update existing views",
+    );
+    await flush(() =>
+      change({
+        autoPlay: true,
+        first: {
+          minHeight: 360,
+          minFps: 15,
+          priority: 1,
+          playoutDelay: { minMs: 100, maxMs: 200 },
+        },
+      }),
+    );
     await flush(() => change({ reverse: true }));
     assert.deepEqual(desired(), aggregate, "aggregation is order independent");
     await flush(() => change({ hide: true }));
@@ -164,10 +184,7 @@ export async function videoPreferences() {
       [],
       "detached presentation contributes no demand",
     );
-    assert.equal(
-      agent.remote.participant("alice").track(track.video("camera")),
-      remote,
-    );
+    assert.equal(agent.remote.participant("alice").video("camera"), remote);
   } finally {
     await flush(() => root.unmount());
     HTMLVideoElement.prototype.getBoundingClientRect = original;

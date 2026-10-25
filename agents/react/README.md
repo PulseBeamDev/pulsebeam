@@ -30,12 +30,27 @@ start PulseBeam, issue tokens, and join or publish media in React.
 Import from `@pulsebeam/react`. `useAgent` returns an Agent immediately; React
 owns its runtime lifecycle. Use a React `key` to replace logical sessions.
 Capture hooks own the devices: disconnecting an Agent does not stop capture.
-Define descriptors with `track.video`, `track.audio`, or `track.data`, then
-resolve them with `agent.track`. `Publish`, `Data`, `Video`, and `Audio` own their
-resources only while committed. Use `source`, `enabled`, and `Video.receive`
+Look up local handles with `agent.video(label)`, `agent.audio(label)`, or
+`agent.data(label, delivery)`. Look up a remote handle with
+`agent.remote.participant(id).video(label)`, `.audio(label)`, or
+`.data(label, delivery)`. Lookup is inert. `Publish`, `Data`, `Video`, and `Audio`
+own their resources only while committed. Use `source`, `enabled`, and `Video.receive`
 rather than synchronization effects. `useCapture` accepts typed exact devices
 and portable best-effort settings; `useDevices` inventories cameras and
 microphones. Applications own data codecs and schema validation.
+
+`Data.onEvent` accepts synchronous or async handlers. Each mount awaits its
+handler before taking the next event, independently of other mounts. This uses
+bounded receive buffering, not transport backpressure or durable storage. A
+handler or receive failure releases that mount and reports through `onError`
+(or a diagnostic when absent). Remount to restart. Catch processing errors inside
+`onEvent` when reception should continue. Unmount releases ownership without
+waiting for application promises; it cannot undo their side effects.
+
+This API replaces React descriptors and `.track(spec)` without compatibility
+aliases. Local media handles expose only readonly `kind` and `label`; use
+`Publish` props instead of imperative media setters. The Web SDK descriptor API
+is unchanged.
 
 React exposes only `useAgent` for Agent ownership, with no `createAgent` export
 or advanced escape hatch. Non-React applications use caller-owned `createAgent`

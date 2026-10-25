@@ -1,14 +1,12 @@
 import { useRef, useState } from "react";
-import { track, type Agent, type DataEvent } from "@pulsebeam/react";
+import { type Agent, type DataEvent } from "@pulsebeam/react";
 import { decodeText, encodeText } from "@/lib/data-codec";
-
-const reaction = track.data("reactions", "lossy");
 
 export const reactionEmojis = ["👍", "❤️", "😂", "😮", "👏", "🔥"];
 type Reaction = { key: string; emoji: string };
 
 export function useReaction(agent: Agent) {
-  const Reactions = agent.track(reaction);
+  const Reactions = agent.data("reactions", "lossy");
   const [reactions, setReactions] = useState<Reaction[]>([]);
   const localKeys = useRef(0);
   const add = (value: Reaction) =>

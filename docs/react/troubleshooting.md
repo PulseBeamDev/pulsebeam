@@ -74,7 +74,7 @@ Check in order:
 
 1. **Joined?** Both participants show `connected`, with distinct external IDs in the same room.
 2. **Published?** Sender capture is active and mounted in `Publish` with the
-   intended descriptor. `enabled={false}` disables sending; `source={null}`
+   intended logical handle. `enabled={false}` disables sending; `source={null}`
    withdraws it.
 3. **Discovered?** Inspect `agent.remote.participants` and each participant's
    `tracks`. Discovery alone does not prove receive ownership.
@@ -121,13 +121,13 @@ ignored or reported by the application without ending the SDK event stream.
 
 | Symptom | Diagnosis and action |
 | --- | --- |
-| Send rejects | Check connection intent, matching server and SDK versions, descriptor label and delivery, payload size, and queue capacity. Retry as a new application action after recovery. |
-| `onError` fires | The SDK event stream failed. Inspect Agent connection and error state, then remount after correcting terminal configuration or authorization failures. |
+| Send rejects | Check connection intent, matching server and SDK versions, logical label and delivery, payload size, and queue capacity. Retry as a new application action after recovery. |
+| `onError` fires | A receive operation or application handler failed and this mount released its subscription. Correct the cause, then remount to restart. Catch expected processing errors inside `onEvent` when reception should continue. |
 | An inline `gap` arrives | An ordered range was skipped. Display the notice before later messages from that track and reload backend state if completeness matters. |
 | Latest values disappear | Supersession is expected per data track. Use `lossy` for distinct transient events or `ordered` when ordered recovery matters. |
 | No old messages after subscribing or reconnecting | Subscriptions start live; replacement tracks have fresh IDs and sequence spaces. There is no offline replay. |
 | Metadata fails to serialize as JSON | Sequence and gap fields are `bigint`. Store decimal strings; never round through `number`. |
 
-Confirm with two participants using the same descriptor label and delivery.
+Confirm with two participants using the same logical label and delivery.
 Sending does not loop back to its publisher. Accepted sends are not delivery
 acknowledgments. Queues and recovery are finite. See the [data reference](/react/reference#data).

@@ -40,7 +40,7 @@ for (const name of [
 ]) {
   assert.equal(typeof sdk[name], "function", name);
 }
-assert.equal(typeof sdk.track, "object", "track");
+assert.equal("track" in sdk, false, "React descriptor export was removed");
 assert.equal(
   "createAgent" in sdk,
   false,
@@ -50,6 +50,7 @@ const web = await import(
   pathToFileURL(join(directory, "node_modules/@pulsebeam/web/dist/index.js"))
 );
 assert.equal(typeof web.createAgent, "function");
+assert.equal(typeof web.track, "object", "Web descriptor API remains public");
 assert.equal(
   "createManagedAgent" in web,
   false,

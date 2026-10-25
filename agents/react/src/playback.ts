@@ -3,7 +3,7 @@ import type * as React from "react";
 import { useCommittedRef } from "./committed-ref.js";
 import { attachRemoteVideo, type ReceiveOptions } from "@pulsebeam/web";
 import { validateReceiveOptions } from "@pulsebeam/web/internal/react";
-import { remoteVideo, type RemoteVideoTrack } from "./agent.js";
+import { remoteVideo, trackIdentity, type RemoteVideoTrack } from "./agent.js";
 import {
   attachVideoSource,
   type VideoAttachment,
@@ -44,28 +44,37 @@ export function Video({
   const validatedReceive = validateReceiveOptions(receive ?? {});
   const receiveKey = JSON.stringify(validatedReceive);
   const committedReceive = useCommittedRef(validatedReceive);
+  const committedAutoPlay = useCommittedRef(autoPlay);
+  const target = source ? trackIdentity(source) : null;
 
   useEffect(() => {
     const current = element.current;
     if (!current || !source) return;
-    const report = (error: unknown, retry: () => Promise<void>) =>
-      callback.current?.({ error, retry });
+    let live = true;
+    const report = (error: unknown, retry: () => Promise<void>) => {
+      if (live) callback.current?.({ error, retry });
+    };
     const active =
       "participantId" in source
         ? attachRemoteVideo(remoteVideo(source), current, report, {
-            autoPlay,
+            autoPlay: committedAutoPlay.current,
             preferences: committedReceive.current,
           })
         : attachVideoSource(source as VideoSource, current, report, {
-            autoPlay,
+            autoPlay: committedAutoPlay.current,
             preferences: committedReceive.current,
           });
     attachment.current = active;
     return () => {
+      live = false;
       active.close();
       if (attachment.current === active) attachment.current = null;
     };
-  }, [source, autoPlay]);
+  }, [target]);
+
+  useEffect(() => {
+    attachment.current?.setAutoPlay(autoPlay);
+  }, [autoPlay]);
 
   useEffect(() => {
     attachment.current?.setPreferences(committedReceive.current);
