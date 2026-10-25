@@ -122,6 +122,9 @@ Keep the returned context for subsequent offers. `inspect` exposes offered
 MID, codec/FMTP/PT/RTX, directional extension, SSRC/FID and RID facts; callers do
 not need another SDP parser or MID map. A preparation correlates publication
 and reception facts to opaque caller keys, with optional logical grouping.
+If bootstrap already contains media, call `adopt_bootstrap_media(&requests)` once
+before preparing subsequent offers to attach caller keys to its applied RTP
+facts. This does not apply another answer. SCTP-only bootstrap needs no adoption.
 Unchanged sections are reconciled automatically. Codec replacement requires an
 explicitly prepared fresh compatible section. Inactivation retains identities;
 stopped-MID reuse requires fresh identities. Receive identities are allocated
@@ -131,7 +134,7 @@ candidates.
 An RID-only publication is not ready for admission: `Binding::complete()` stays
 false until the host passes actual sender encodings to
 `context.observe_sender(mid, &encodings)` after successful application. Submit
-only complete publication bindings to the server's typed API. Runtime
+only complete bindings to the server's typed API. Runtime
 bitrate/framerate, activation and scalability observations remain separate from
 negotiated identities. Source or quality selection behind a compatible receive
 binding is caller policy and does not require SDP.

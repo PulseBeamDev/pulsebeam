@@ -149,6 +149,151 @@ impl Context {
         })
     }
 
+    /// Correlate media already applied during bootstrap without applying another
+    /// answer. Call once before preparing subsequent candidates. SCTP-only
+    /// bootstrap needs no adoption. Keys remain caller-owned even for bootstrap.
+    pub fn adopt_bootstrap_media(&mut self, requests: &[Preparation]) -> Result<&Bindings, Error> {
+        if self.next_candidate != 0 || self.pending.is_some() || self.accepted.declarable {
+            return Err(Error::CandidateState);
+        }
+        if requests.len() > self.limits.max_sections {
+            return Err(Error::Capacity);
+        }
+        let mut requested = BTreeMap::new();
+        for request in requests {
+            if requested.insert(request.mid.as_str(), request).is_some() {
+                return Err(Error::Identifier);
+            }
+        }
+        let mut bindings = Bindings::default();
+        for remote in &self.accepted.document.media {
+            if remote.section.kind == Kind::Application || remote.section.stopped {
+                continue;
+            }
+            let mid = &remote.section.mid;
+            let request = requested.remove(mid.as_str());
+            if remote.section.direction == super::Direction::Inactive && request.is_none() {
+                continue;
+            }
+            let request = request.ok_or_else(|| Error::MissingConfiguration(mid.clone()))?;
+            let local = self
+                .accepted
+                .local
+                .media
+                .iter()
+                .find(|m| m.section.mid == *mid)
+                .ok_or(Error::Identifier)?;
+            let codec = remote
+                .section
+                .codecs
+                .iter()
+                .find(|c| c.payload_type == request.payload_type)
+                .ok_or_else(|| Error::Envelope(mid.clone()))?;
+            let codec = self.select_codec(codec)?;
+            let offered = local
+                .section
+                .codecs
+                .iter()
+                .find(|c| c.payload_type == codec.payload_type)
+                .ok_or_else(|| Error::Envelope(mid.clone()))?;
+            if offered.parameters.name != codec.parameters.name
+                || offered.parameters.clock_rate != codec.parameters.clock_rate
+                || offered.parameters.channels != codec.parameters.channels
+                || offered.parameters.fmtp != codec.parameters.fmtp
+                || codec.repair.is_some() && codec.repair != offered.repair
+            {
+                return Err(Error::Envelope(mid.clone()));
+            }
+            if remote.section.direction.receives() && !local.section.direction.sends()
+                || remote.section.direction.sends() && !local.section.direction.receives()
+            {
+                return Err(Error::Envelope(mid.clone()));
+            }
+            for (publication, sending, owner, encodings, target) in [
+                (
+                    true,
+                    remote.section.direction.receives(),
+                    &request.publication,
+                    &local.section.encodings,
+                    &mut bindings.publications,
+                ),
+                (
+                    false,
+                    remote.section.direction.sends(),
+                    &request.reception,
+                    &remote.section.encodings,
+                    &mut bindings.receptions,
+                ),
+            ] {
+                if !sending {
+                    if owner.is_some() {
+                        return Err(Error::Envelope(mid.clone()));
+                    }
+                    continue;
+                }
+                let owner = owner
+                    .as_ref()
+                    .ok_or_else(|| Error::MissingConfiguration(mid.clone()))?;
+                validate_owner(owner)?;
+                let mut encodings = encodings.clone();
+                if codec.repair.is_none() {
+                    for e in &mut encodings {
+                        e.repair = None;
+                    }
+                }
+                if encodings.is_empty() {
+                    encodings.push(Encoding {
+                        rid: None,
+                        primary: None,
+                        repair: None,
+                        paused: false,
+                        runtime: RuntimeEncoding::default(),
+                    });
+                }
+                let extensions = remote
+                    .section
+                    .extensions
+                    .iter()
+                    .filter(|e| {
+                        self.capabilities.extensions.contains(&e.uri)
+                            && if publication {
+                                e.direction.receives()
+                            } else {
+                                e.direction.sends()
+                            }
+                    })
+                    .map(|e| {
+                        let mut e = e.clone();
+                        e.direction = e.direction.inverse();
+                        e
+                    })
+                    .collect();
+                target.push(Binding {
+                    key: owner.key.clone(),
+                    group: owner.group.clone(),
+                    mid: mid.clone(),
+                    kind: remote.section.kind,
+                    codec: codec.clone(),
+                    extensions,
+                    encodings,
+                });
+            }
+        }
+        if !requested.is_empty() {
+            return Err(Error::Identifier);
+        }
+        for list in [&bindings.publications, &bindings.receptions] {
+            let mut keys = BTreeSet::new();
+            if list.iter().any(|b| !keys.insert(&b.key)) {
+                return Err(Error::Identifier);
+            }
+        }
+        self.accepted.retained = bindings.clone();
+        self.accepted.bindings = bindings;
+        self.accepted.declarable = true;
+        Ok(&self.accepted.bindings)
+    }
+
     /// Reconcile the current actual offer. Only new/replaced media need requests.
     pub fn prepare(&mut self, offer: &str, requests: &[Preparation]) -> Result<Candidate, Error> {
         if self.pending.is_some() {
@@ -191,15 +336,7 @@ impl Context {
                 .into_iter()
                 .flatten()
             {
-                if owner.key.0.is_empty()
-                    || owner.key.0.len() > 256
-                    || owner
-                        .group
-                        .as_ref()
-                        .is_some_and(|g| g.0.is_empty() || g.0.len() > 256)
-                {
-                    return Err(Error::Identifier);
-                }
+                validate_owner(owner)?;
             }
         }
         let mut bindings = Bindings::default();
@@ -284,13 +421,13 @@ impl Context {
                 .find(|b| b.mid == mid)
                 .cloned();
             let (codec, publication_owner, reception_owner) = if let Some(request) = request {
-                let codec = media
+                let offered = media
                     .section
                     .codecs
                     .iter()
                     .find(|c| c.payload_type == request.payload_type)
-                    .cloned()
                     .ok_or_else(|| Error::Envelope(mid.clone()))?;
+                let mut codec = self.select_codec(offered)?;
                 if !media.section.direction.sends() && request.publication.is_some()
                     || !media.section.direction.receives() && request.reception.is_some()
                 {
@@ -298,9 +435,8 @@ impl Context {
                 }
                 if let Some(old) = publication_prior.as_ref().or(reception_prior.as_ref()) {
                     // Explicit replacement needs a fresh physical section.
-                    if old.codec != self.select_codec(&codec)? {
-                        return Err(Error::Envelope(mid));
-                    }
+                    codec = retain_codec_envelope(codec, &old.codec)
+                        .ok_or_else(|| Error::Envelope(mid.clone()))?;
                 }
                 (
                     codec,
@@ -326,9 +462,8 @@ impl Context {
                     .find(|c| c.payload_type == old_codec.payload_type)
                     .cloned()
                     .ok_or_else(|| Error::Envelope(mid.clone()))?;
-                if self.select_codec(&codec)? != *old_codec {
-                    return Err(Error::Envelope(mid));
-                }
+                let codec = retain_codec_envelope(self.select_codec(&codec)?, old_codec)
+                    .ok_or_else(|| Error::Envelope(mid.clone()))?;
                 (
                     codec,
                     publication_prior.as_ref().map(binding_owner),
@@ -762,6 +897,37 @@ fn same_encoding(accepted: &Encoding, observed: &Encoding, count: usize) -> bool
         && (accepted.rid.is_some() || count == 1 || accepted.primary == observed.primary)
 }
 
+fn retain_codec_envelope(mut selected: Codec, prior: &Codec) -> Option<Codec> {
+    if !prior
+        .parameters
+        .feedback
+        .is_subset(&selected.parameters.feedback)
+    {
+        return None;
+    }
+    selected
+        .parameters
+        .feedback
+        .clone_from(&prior.parameters.feedback);
+    if prior.repair.is_none() {
+        selected.repair = None;
+    }
+    (selected == *prior).then_some(selected)
+}
+
+fn validate_owner(owner: &MediaOwner) -> Result<(), Error> {
+    if owner.key.0.is_empty()
+        || owner.key.0.len() > 256
+        || owner
+            .group
+            .as_ref()
+            .is_some_and(|g| g.0.is_empty() || g.0.len() > 256)
+    {
+        return Err(Error::Identifier);
+    }
+    Ok(())
+}
+
 fn binding_owner(b: &Binding) -> MediaOwner {
     MediaOwner {
         key: b.key.clone(),
@@ -914,14 +1080,29 @@ fn render(document: &Document, bindings: &Bindings) -> Result<String, Error> {
                 extension.uri
             ));
         }
+        // MSID names the transport output, never the currently selected source.
+        let msid = section
+            .encodings
+            .first()
+            .and_then(|e| e.primary)
+            .map(|primary| format!("pulsebeam-{} output-{primary}", section.mid));
+        if let Some(msid) = &msid {
+            lines.push(format!("a=msid:{msid}"));
+        }
         for encoding in &section.encodings {
             if let Some(primary) = encoding.primary {
                 lines.push(format!("a=ssrc:{primary} cname:pulsebeam"));
+                if let Some(msid) = &msid {
+                    lines.push(format!("a=ssrc:{primary} msid:{msid}"));
+                }
                 if let Some(repair) = encoding.repair {
                     lines.extend([
                         format!("a=ssrc:{repair} cname:pulsebeam"),
                         format!("a=ssrc-group:FID {primary} {repair}"),
                     ]);
+                    if let Some(msid) = &msid {
+                        lines.push(format!("a=ssrc:{repair} msid:{msid}"));
+                    }
                 }
             }
         }

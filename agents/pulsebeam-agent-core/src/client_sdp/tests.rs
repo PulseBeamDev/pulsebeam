@@ -78,6 +78,79 @@ fn data_only_bootstrap_prepares_duplex_with_independent_identities_and_rtp_facts
 }
 
 #[test]
+fn bootstrap_media_is_adopted_once_with_caller_keys_and_retained_without_restating_it() {
+    let mut generator = context();
+    let actual = offer(
+        "v",
+        "sendrecv",
+        "a=ssrc:200 cname:native\r\na=ssrc:201 cname:native\r\na=ssrc-group:FID 200 201\r\n",
+    );
+    let applied = generator
+        .prepare(&actual, &[request("v", true, true)])
+        .unwrap();
+    let mut ctx = Context::new(&actual, applied.answer(), caps(), 900, Limits::default()).unwrap();
+    assert!(matches!(
+        ctx.adopt_bootstrap_media(&[]),
+        Err(Error::MissingConfiguration(_))
+    ));
+    assert!(ctx.bindings().is_none());
+    assert_eq!(
+        ctx.adopt_bootstrap_media(&[request("v", true, true)])
+            .unwrap(),
+        applied.bindings()
+    );
+    assert_eq!(
+        ctx.adopt_bootstrap_media(&[request("v", true, true)]),
+        Err(Error::CandidateState)
+    );
+    let retained = ctx.prepare(&actual, &[]).unwrap();
+    assert_eq!(retained.bindings(), applied.bindings());
+    assert!(retained.answer().contains("o=- 7 4 IN IP4"));
+    let primary = retained.bindings().receptions[0].encodings[0]
+        .primary
+        .unwrap();
+    assert!(
+        retained
+            .answer()
+            .contains(&format!("a=msid:pulsebeam-v output-{primary}\r\n"))
+    );
+}
+
+#[test]
+fn bootstrap_selected_feedback_is_retained_when_capabilities_allow_more() {
+    let mut generator = context();
+    let actual = offer(
+        "v",
+        "sendonly",
+        "a=ssrc:200 cname:native\r\na=ssrc:201 cname:native\r\na=ssrc-group:FID 200 201\r\n",
+    );
+    let applied = generator
+        .prepare(&actual, &[request("v", true, false)])
+        .unwrap();
+    let answer = applied
+        .answer()
+        .replace("a=rtcp-fb:96 transport-cc\r\n", "");
+    let mut ctx = Context::new(&actual, &answer, caps(), 900, Limits::default()).unwrap();
+    let adopted = ctx
+        .adopt_bootstrap_media(&[request("v", true, false)])
+        .unwrap()
+        .clone();
+    assert_eq!(
+        adopted.publications[0].codec.parameters.feedback,
+        ["nack".into()].into_iter().collect()
+    );
+    let retained = ctx.prepare(&actual, &[]).unwrap();
+    assert_eq!(retained.bindings(), &adopted);
+    ctx.finish(retained.id(), ApplyOutcome::Applied).unwrap();
+    assert_eq!(
+        ctx.prepare(&actual, &[request("v", true, false)])
+            .unwrap()
+            .bindings(),
+        &adopted
+    );
+}
+
+#[test]
 fn failed_application_does_not_advance_origin_and_cancel_after_apply_does() {
     let mut ctx = context();
     let actual = offer("v", "recvonly", "");
