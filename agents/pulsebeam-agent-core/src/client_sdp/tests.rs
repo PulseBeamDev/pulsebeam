@@ -259,6 +259,44 @@ fn inactivation_retains_identity_and_stopped_mid_reuse_allocates_fresh_identity(
 }
 
 #[test]
+fn only_stopped_sections_may_leave_the_current_offer_during_mline_recycling() {
+    let mut ctx = context();
+    let actual = offer("old", "recvonly", "");
+    let first = ctx
+        .prepare(&actual, &[request("old", false, true)])
+        .unwrap();
+    let retired_identity = first.bindings().receptions[0].encodings.clone();
+    ctx.finish(first.id(), ApplyOutcome::Applied).unwrap();
+    let replacement = offer("fresh", "recvonly", "");
+    assert_eq!(
+        ctx.prepare(&replacement, &[request("fresh", false, true)])
+            .unwrap_err(),
+        Error::Envelope("m-line history".into())
+    );
+    let stopped = ctx
+        .prepare(&actual.replace("a=bundle-only\r\n", ""), &[])
+        .unwrap();
+    ctx.finish(stopped.id(), ApplyOutcome::Applied).unwrap();
+    let fresh = ctx
+        .prepare(&replacement, &[request("fresh", false, true)])
+        .unwrap();
+    assert_ne!(fresh.bindings().receptions[0].encodings, retired_identity);
+    assert_eq!(
+        inspect(fresh.answer())
+            .unwrap()
+            .iter()
+            .map(|section| section.mid.as_str())
+            .collect::<Vec<_>>(),
+        vec!["data", "fresh"]
+    );
+    ctx.finish(fresh.id(), ApplyOutcome::Applied).unwrap();
+    assert!(
+        ctx.prepare(&bootstrap(), &[]).is_err(),
+        "a live replacement still cannot disappear"
+    );
+}
+
+#[test]
 fn failed_sender_preparation_can_be_retried_without_reusing_receive_reservations() {
     let mut ctx = context();
     let actual = offer(

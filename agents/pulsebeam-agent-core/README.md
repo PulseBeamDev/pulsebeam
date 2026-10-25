@@ -94,7 +94,8 @@ This native-independent helper shows the prepare/apply/accept boundary:
 
 ```rust
 use pulsebeam_agent_core::client_sdp::{
-    ApplyOutcome, Bindings, Capabilities, Context, Error, Limits, Preparation,
+    ApplyOutcome, Binding, Bindings, Capabilities, Context, Encoding, Error,
+    Limits, Preparation,
 };
 
 fn prepare_media(
@@ -116,6 +117,17 @@ fn prepare_media(
     let bindings = context.bindings().cloned();
     Ok((context, bindings))
 }
+
+fn finalize_sender(
+    context: &mut Context,
+    mid: &str,
+    actual_encodings: &[Encoding],
+) -> Result<Option<Bindings>, Error> {
+    let facts = context.observe_sender(mid, actual_encodings)?;
+    let complete = facts.publications.iter().chain(&facts.receptions)
+        .all(Binding::complete);
+    Ok(complete.then(|| facts.clone()))
+}
 ```
 
 Keep the returned context for subsequent offers. `inspect` exposes offered
@@ -127,7 +139,9 @@ before preparing subsequent offers to attach caller keys to its applied RTP
 facts. This does not apply another answer. SCTP-only bootstrap needs no adoption.
 Unchanged sections are reconciled automatically. Codec replacement requires an
 explicitly prepared fresh compatible section. Inactivation retains identities;
-stopped-MID reuse requires fresh identities. Receive identities are allocated
+stopped-MID reuse requires fresh identities. A stopped section can disappear
+when the current offer recycles its m-line under a new MID; its reserved
+identities remain unavailable. Receive identities are allocated
 without collisions across the context's bounded history, including cancelled
 candidates.
 

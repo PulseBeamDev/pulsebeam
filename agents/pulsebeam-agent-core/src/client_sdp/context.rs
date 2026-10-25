@@ -309,9 +309,10 @@ impl Context {
             }
         }
         if self.accepted.document.media.iter().any(|old| {
-            !offered.media.iter().any(|new| {
-                new.section.mid == old.section.mid && new.section.kind == old.section.kind
-            })
+            !old.section.stopped
+                && !offered.media.iter().any(|new| {
+                    new.section.mid == old.section.mid && new.section.kind == old.section.kind
+                })
         }) {
             return Err(Error::Envelope("m-line history".into()));
         }
