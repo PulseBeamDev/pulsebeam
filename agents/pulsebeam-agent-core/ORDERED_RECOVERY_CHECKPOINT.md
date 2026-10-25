@@ -6,6 +6,25 @@ regressions; it does not establish end-to-end ordered recovery or completion of
 the native MVP. The selected scope is to record the blocker, not extend the
 catalog contract or introduce a cursor-retention policy.
 
+## Temporary test exclusion
+
+`tests::data_channel::ordered_recovery_reports_retention_gaps_without_replaying_late_history`
+is marked `#[ignore]` because reconnect-time catalog pruning loses the ordered
+cursor: the subscriber receives 4 messages instead of 260, without a recovery gap.
+Normal simulator gates and replay exclude ignored cases, so a green gate does
+not qualify this recovery behavior. Remove the ignore only when the unchanged
+scenario proves retained-history delivery, the exact gap, and continued delivery.
+
+Explicitly run the ignored case through its Bazel owner:
+
+```sh
+./bazel test //crates/pulsebeam-simulator:test_binary \
+  --platforms=//crates/pulsebeam-simulator:sim_platform \
+  --test_arg=--ignored --test_arg=--exact \
+  --test_arg=tests::data_channel::ordered_recovery_reports_retention_gaps_without_replaying_late_history \
+  --test_arg=--test-threads=1 --test_output=errors
+```
+
 ## Partial repair
 
 `Topics::unbind(TransportReplaced)` preserves each ordered delivery frontier while
