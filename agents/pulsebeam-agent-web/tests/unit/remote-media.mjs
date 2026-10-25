@@ -56,14 +56,17 @@ test("media attachments reconcile independent consumers and fence retired playba
   try {
     const agent = fakeAgent();
     const element = document.createElement("video");
+    let plays = 0;
     Object.defineProperty(element, "play", {
       value: () => {
+        plays++;
         return Promise.resolve();
       },
     });
 
     const attachment = attachRemoteMedia(agent, element, {
       publicationIds: ["audio", "video", "audio"],
+      autoPlay: false,
     });
     attachments.push(attachment);
     const stream = element.srcObject;
@@ -82,6 +85,21 @@ test("media attachments reconcile independent consumers and fence retired playba
     const removed = hasTracks(stream, audio);
     agent.publish({ audio: { media: audio }, video: { media: replacement } });
     const restored = hasTracks(stream, audio, replacement);
+    assert.equal(plays, 0);
+    attachment.setAutoPlay(true);
+    assert.equal(plays, 1);
+    attachment.setAutoPlay(true);
+    assert.equal(plays, 1, "unchanged autoplay does not retry");
+    attachment.setAutoPlay(false);
+    agent.publish({ audio: { media: audio }, video: { media: video } });
+    assert.equal(plays, 1, "disabled autoplay applies to replacement media");
+    attachment.setAutoPlay(true);
+    assert.equal(plays, 2);
+    assert.equal(
+      element.srcObject,
+      stream,
+      "autoplay updates preserve the attachment",
+    );
 
     const secondElement = document.createElement("video");
     Object.defineProperty(secondElement, "play", {

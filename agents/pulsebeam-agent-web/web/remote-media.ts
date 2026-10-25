@@ -37,7 +37,7 @@ class Attachment implements RemoteMediaAttachment {
   #playAttempt = 0;
   readonly #agent: Agent;
   readonly #element: HTMLMediaElement;
-  readonly #autoPlay: boolean;
+  #autoPlay: boolean;
   readonly #onPlaybackBlocked: RemoteMediaAttachmentOptions["onPlaybackBlocked"];
   readonly #stream = new MediaStream();
   readonly #unsubscribe: () => void;
@@ -67,6 +67,13 @@ class Attachment implements RemoteMediaAttachment {
     if (samePublicationIds(this.#publicationIds, normalized)) return;
     this.#publicationIds = normalized;
     this.#reconcile();
+  }
+
+  setAutoPlay(autoPlay: boolean): void {
+    if (this.#closed || autoPlay === this.#autoPlay) return;
+    this.#autoPlay = autoPlay;
+    this.#playAttempt += 1;
+    if (autoPlay) void this.#play();
   }
 
   retryPlayback(): Promise<void> {

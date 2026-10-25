@@ -555,6 +555,7 @@ export function attachRemoteVideo(
     return {
       ready: Promise.resolve(),
       setPublicationIds() {},
+      setAutoPlay() {},
       setPreferences() {},
       retryPlayback: async () => {},
       close() {},
@@ -723,6 +724,7 @@ function attachVideoHandle(
   return {
     ready: resource.ready,
     setPublicationIds: (ids) => attachment.setPublicationIds(ids),
+    setAutoPlay: (autoPlay) => attachment.setAutoPlay(autoPlay),
     setPreferences: (next) => {
       if (closed) return;
       preferences = validateReceiveOptions(next);

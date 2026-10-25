@@ -471,6 +471,7 @@ export type RemoteMediaAttachmentOptions = Readonly<{
 
 export interface RemoteMediaAttachment {
   setPublicationIds(publicationIds: readonly string[]): void;
+  setAutoPlay(autoPlay: boolean): void;
   retryPlayback(): Promise<void>;
   close(): void;
 }
