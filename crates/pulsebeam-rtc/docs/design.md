@@ -10,7 +10,7 @@ defines the private controller profile and quantitative proof.
 
 ## Ownership and scope
 
-One `Connection` owns one peer's immutable initial negotiation and transport
+One `Connection` owns one peer's initial negotiation, current RTP bindings and transport
 state: ICE, DTLS, SRTP/SRTCP, RTP/RTCP, SCTP, feedback, congestion control,
 pacing, ordinary retransmission, protocol timers, and mechanical resource
 bounds. Protocol progress is explicit and connection-local. There is no hidden
@@ -47,7 +47,9 @@ The existing supported profile is:
 * one supported outbound packet-feedback mode, TWCC or RFC 8888, including
   audio-only outbound RTP. There is no REMB or fixed-rate fallback.
 
-Application-only sessions do not require RTP feedback. Rejected media sections
+Application-only bootstrap sessions do not require RTP feedback. The explicit
+ongoing capability envelope can initialize TWCC before their first media update.
+Rejected media sections
 retain valid dynamic payload mappings in the answer. Trickle ICE, ICE restart,
 renegotiation, a TURN client, additional codecs, and additional browser/platform
 compatibility are not implied by this contract.
@@ -58,6 +60,43 @@ facts. `offered_media` retains every offered section, including application,
 inactive, and disabled sections, with its original index and local direction.
 Callers enforce admission from those facts, not just accepted RTP lists. The
 caller need not parse the answer again or depend on native types.
+
+## Typed ongoing RTP configuration
+
+`set_rtp_capabilities` declares supported exact codec/FMTP/feedback and extension
+envelopes and mechanical bounds, independently of bootstrap media sections. It
+selects TWCC without reconstructing transport or history. Conflicting feedback
+profiles and capability changes are errors; existing SDP-only RFC 8888 sessions
+retain their bootstrap contract.
+
+`configure_rtp` takes the complete desired inbound/outbound binding set. Its
+codec-parameter model supports Opus, VP8, H.264 packetization-mode 1 and VP9
+profile 0/2. MID/PT/extension ambiguity, cross-direction SSRC collisions,
+incomplete repair associations, unsupported formats and capacity failures are
+rejected before any active binding changes. Typed configuration is direct Rust
+API data, not a new signaling protocol or hidden server SDP negotiation.
+
+Bootstrap and typed bindings feed the same ingress, egress, protection, feedback,
+pacing and repair engines. Typed ingress requires configured SSRC/PT/MID/RID
+associations; discovering a native sender's runtime identities is not admission.
+URI-addressed extension values and caller-owned primary translation retain the
+same write contract. Multiple outbound encodings use `write_rtp_encoding`;
+`write_rtp` rejects ambiguous MID-only writes.
+
+Withdrawal or inactivation rejects new writes/admission and discards queued
+originals, but cannot retract a returned `Transmit`. Re-admitting the exact
+physical binding preserves protocol state and independent primary/repair
+indices. New physical envelopes need fresh primary/repair identities, including
+when reusing a MID. Physical history and crypto replay capacity are bounded;
+capacity failure never evicts an identity or resets indices to admit new work.
+Retained repairs stay subject to the existing byte/age bounds and are not sent
+while their binding is inactive.
+
+`rtp_configuration()` is the accepted typed set after a successful update.
+`SessionInfo` and `offered_media` remain bootstrap snapshots, not competing
+mutable configuration. Before a typed update, existing bootstrap media and
+bounded unsignaled discovery retain their supported SDP behavior. Source,
+quality, replay and playback policy remain outside RTC.
 
 ## Service loop and commits
 

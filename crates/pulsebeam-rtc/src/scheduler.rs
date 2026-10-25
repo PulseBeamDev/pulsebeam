@@ -20,6 +20,10 @@ impl SenderScheduler {
         }
     }
 
+    pub(crate) fn resize(&mut self, senders: usize) {
+        self.deficits.resize(senders, 0);
+    }
+
     pub(crate) fn select(&mut self, eligible: &[Option<usize>]) -> Option<usize> {
         if eligible.iter().all(Option::is_none) {
             return None;

@@ -303,6 +303,7 @@ pub(crate) struct Transport {
     ice: ice::IceLayer,
     dtls: Option<dtls::DtlsLayer>,
     srtp: Option<srtp::SrtpLayer>,
+    allowed_inbound_ssrcs: Option<Box<[u32]>>,
     certificate: Option<DtlsCert>,
     local_fingerprint: Fingerprint,
     remote_fingerprint: Fingerprint,
@@ -467,6 +468,7 @@ impl Transport {
             local_fingerprint,
             remote_fingerprint,
             dtls_role: config.dtls_role,
+            allowed_inbound_ssrcs: None,
             inbound_payload_types: config.inbound_payload_types,
             outbound_payload_types: config.outbound_payload_types,
             twcc_extension_id: config.twcc_extension_id,
@@ -701,6 +703,18 @@ impl Transport {
             }
             DatagramKind::Rtp | DatagramKind::Rtcp => {
                 if self.state != TransportState::Connected || !self.accepts_path(&path) {
+                    self.drop_input();
+                    return Ok(());
+                }
+                if kind == DatagramKind::Rtp
+                    && self.allowed_inbound_ssrcs.as_ref().is_some_and(|allowed| {
+                        bytes
+                            .get(8..12)
+                            .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
+                            .map(u32::from_be_bytes)
+                            .is_none_or(|ssrc| !allowed.contains(&ssrc))
+                    })
+                {
                     self.drop_input();
                     return Ok(());
                 }
@@ -1312,6 +1326,28 @@ impl Transport {
         self.events
             .push_back(TransportEvent::StateChanged(TransportState::Failed));
         Err(error)
+    }
+
+    pub(crate) fn can_admit_ssrcs(&self, identities: &[u32]) -> bool {
+        identities.len() <= 512
+            && self
+                .srtp
+                .as_ref()
+                .is_none_or(|srtp| srtp.can_admit_ssrcs(identities))
+    }
+
+    pub(crate) fn configure_rtp_mappings(
+        &mut self,
+        inbound: Box<[u8]>,
+        outbound: Box<[u8]>,
+        twcc: Box<[(u8, u8)]>,
+        identities: Box<[u32]>,
+    ) {
+        self.inbound_payload_types = inbound;
+        self.outbound_payload_types = outbound;
+        self.twcc_extension_id = None;
+        self.twcc_payload_map = twcc;
+        self.allowed_inbound_ssrcs = Some(identities);
     }
 
     fn accepts_payload_type(&self, payload_type: u8) -> bool {

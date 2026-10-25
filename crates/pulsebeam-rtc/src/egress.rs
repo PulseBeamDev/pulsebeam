@@ -30,7 +30,7 @@ const MAX_QUEUED_MEDIA_PACKETS: usize = 8_192;
 const MAX_PACED_TRANSPORT_BYTES: usize = 8 * 1024 * 1024;
 const RTP_TRANSPORT_ALLOWANCE: usize = 96;
 pub(crate) struct MediaEgress {
-    senders: Box<[Sender]>,
+    senders: Vec<Sender>,
     queued_packets: usize,
     eligible: Vec<Option<usize>>,
     queued_payload_bytes: usize,
@@ -66,8 +66,17 @@ pub(crate) struct MediaEgress {
     rtp_bytes_in_flight: u64,
 }
 
+pub(crate) struct EgressUpdate {
+    new_senders: Vec<Sender>,
+    active: Vec<bool>,
+}
+
 struct Sender {
     facts: EgressSenderFacts,
+    active: bool,
+    rid: Option<String>,
+    rid_extension_id: Option<u8>,
+    repaired_rid_extension_id: Option<u8>,
     ssrc: u32,
     rtx_ssrc: u32,
     next_rtx_sequence: u64,
@@ -146,12 +155,16 @@ impl MediaEgress {
         accepted_at: Instant,
         clock: ProtocolClock,
     ) -> Self {
-        let senders: Box<[_]> = facts
+        let senders: Vec<_> = facts
             .into_vec()
             .into_iter()
             .map(|facts| {
                 let (ssrc, rtx_ssrc, rtx_sequence) = sender_rtp_identity(randomness, facts.id);
                 Sender {
+                    active: true,
+                    rid: None,
+                    rid_extension_id: None,
+                    repaired_rid_extension_id: None,
                     ssrc,
                     rtx_ssrc,
                     next_rtx_sequence: u64::from(rtx_sequence),
@@ -230,12 +243,33 @@ impl MediaEgress {
         mid: &str,
         media: RtpWrite,
     ) -> Result<(), (WriteError, RtpWrite)> {
+        self.admit_encoding(at, mid, None, media)
+    }
+
+    #[allow(
+        clippy::result_large_err,
+        reason = "preserve caller-owned packet on rejection"
+    )]
+    pub(crate) fn admit_encoding(
+        &mut self,
+        at: Instant,
+        mid: &str,
+        ssrc: Option<u32>,
+        media: RtpWrite,
+    ) -> Result<(), (WriteError, RtpWrite)> {
         let result = (|| {
-            let index = self
-                .senders
-                .iter()
-                .position(|sender| sender.facts.mid.as_ref() == mid)
+            let mut matches = self.senders.iter().enumerate().filter(|(_, sender)| {
+                sender.active
+                    && sender.facts.mid.as_ref() == mid
+                    && ssrc.is_none_or(|ssrc| sender.ssrc == ssrc)
+            });
+            let index = matches
+                .next()
+                .map(|(index, _)| index)
                 .ok_or(WriteError::UnknownStream)?;
+            if matches.next().is_some() {
+                return Err(WriteError::UnknownStream);
+            }
             if media.sequence >= (1_u64 << 48) {
                 return Err(WriteError::IndexExhausted);
             }
@@ -319,17 +353,139 @@ impl MediaEgress {
     }
 
     pub(crate) fn discard_pending(&mut self, mid: &str) -> Result<(), WriteError> {
-        let index = self
-            .senders
-            .iter()
-            .position(|sender| sender.facts.mid.as_ref() == mid)
-            .ok_or(WriteError::UnknownStream)?;
         if self.pending.is_some() {
             return Err(WriteError::InvalidState);
         }
-        while self.pop_head(index).is_some() {}
+        let indexes: Vec<_> = self
+            .senders
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.facts.mid.as_ref() == mid)
+            .map(|(index, _)| index)
+            .collect();
+        if indexes.is_empty() {
+            return Err(WriteError::UnknownStream);
+        }
+        for index in indexes {
+            while self.pop_head(index).is_some() {}
+        }
         self.refresh_pacer_queue(self.queue_time_updated_at);
         Ok(())
+    }
+
+    pub(crate) fn stage_configuration(
+        &self,
+        desired: &[(crate::rtp_config::PhysicalBinding, bool)],
+        randomness: &[u8; 32],
+        limit: usize,
+    ) -> Result<EgressUpdate, crate::RtpConfigurationError> {
+        use crate::RtpConfigurationError as Error;
+        if self.pending.is_some() {
+            return Err(Error::ConnectionState);
+        }
+        let mut update = EgressUpdate {
+            new_senders: Vec::new(),
+            active: vec![false; self.senders.len()],
+        };
+        for (physical, active) in desired.iter().filter(|(physical, _)| physical.outbound) {
+            let encoding = physical.encoding();
+            if let Some((index, sender)) = self
+                .senders
+                .iter()
+                .enumerate()
+                .find(|(_, s)| s.ssrc == encoding.primary.get())
+            {
+                let facts = physical.egress_facts(sender.facts.id);
+                let mut previous = sender.facts.clone();
+                previous.forwarded_extensions.sort_by(|a, b| a.0.cmp(&b.0));
+                if previous != facts
+                    || encoding
+                        .repair
+                        .is_some_and(|ssrc| ssrc.get() != sender.rtx_ssrc)
+                    || sender.rid != encoding.rid
+                {
+                    return Err(Error::Collision);
+                }
+                update.active[index] = *active;
+                continue;
+            }
+            if self.senders.iter().any(|s| {
+                s.ssrc == encoding.primary.get()
+                    || s.facts.retransmission_payload_type.is_some()
+                        && s.rtx_ssrc == encoding.primary.get()
+                    || encoding.repair.is_some_and(|repair| {
+                        repair.get() == s.ssrc
+                            || s.facts.retransmission_payload_type.is_some()
+                                && repair.get() == s.rtx_ssrc
+                    })
+            }) {
+                return Err(Error::Collision);
+            }
+            let count = self
+                .senders
+                .len()
+                .saturating_add(update.new_senders.len())
+                .saturating_add(1);
+            if count > limit {
+                return Err(Error::Capacity);
+            }
+            let id = u16::try_from(count)
+                .ok()
+                .and_then(crate::id::SenderId::new)
+                .ok_or(Error::Capacity)?;
+            let facts = physical.egress_facts(id);
+            let (_, fallback_repair, rtx_sequence) = sender_rtp_identity(randomness, id);
+            update.new_senders.push(Sender {
+                facts,
+                active: *active,
+                rid: encoding.rid.clone(),
+                rid_extension_id: physical.extension_id(crate::RID_EXTENSION),
+                repaired_rid_extension_id: physical.extension_id(crate::REPAIRED_RID_EXTENSION),
+                ssrc: encoding.primary.get(),
+                rtx_ssrc: encoding
+                    .repair
+                    .map_or(fallback_repair, std::num::NonZeroU32::get),
+                next_rtx_sequence: u64::from(rtx_sequence),
+                latest_rtp: None,
+                highest_sequence: None,
+                queue: VecDeque::new(),
+                queued_payload_bytes: 0,
+                keyframe_requested: false,
+                reported_sequence: None,
+                pending_report: None,
+                fir_sequences: Vec::new(),
+                committed_packets: 0,
+                committed_payload_bytes: 0,
+            });
+            update.active.push(*active);
+        }
+        Ok(update)
+    }
+
+    pub(crate) fn commit_configuration(&mut self, update: EgressUpdate) {
+        for (index, active) in update.active.iter().take(self.senders.len()).enumerate() {
+            if !*active {
+                while self.pop_head(index).is_some() {}
+                self.senders[index].keyframe_requested = false;
+            }
+            self.senders[index].active = *active;
+        }
+        self.repair_requests
+            .retain(|(index, _)| update.active.get(*index) == Some(&true));
+        self.senders.extend(update.new_senders);
+        self.eligible.resize(self.senders.len(), None);
+        self.scheduler.resize(self.senders.len());
+        self.refresh_pacer_queue(self.queue_time_updated_at);
+    }
+
+    pub(crate) fn physical_identities(&self) -> Vec<u32> {
+        self.senders
+            .iter()
+            .flat_map(|s| {
+                std::iter::once(s.ssrc)
+                    .chain(s.facts.retransmission_payload_type.map(|_| s.rtx_ssrc))
+            })
+            .collect()
     }
 
     #[cfg(test)]
@@ -403,7 +559,9 @@ impl MediaEgress {
 
     pub(crate) fn request_keyframe(&mut self, request: crate::rtcp::KeyframeRequest) {
         let Some(sender) = self.senders.iter_mut().find(|sender| {
-            sender.ssrc == request.media_ssrc && sender.facts.kind == MediaKind::Video
+            sender.active
+                && sender.ssrc == request.media_ssrc
+                && sender.facts.kind == MediaKind::Video
         }) else {
             return;
         };
@@ -1019,6 +1177,10 @@ impl MediaEgress {
             return Some(PrepareResult::Blocked);
         }
         let sender = &self.senders[sender_index];
+        if !sender.active {
+            self.repair_requests.pop_front();
+            return None;
+        }
         let payload_type = sender.facts.retransmission_payload_type?;
         let sequence = wire_u16(sender.next_rtx_sequence);
         let twcc = sender
@@ -1069,7 +1231,9 @@ impl MediaEgress {
     fn prepare_rtcp(&mut self, at: Instant, transport: &mut Transport) -> Option<PrepareResult> {
         let sender_index = (0..self.senders.len())
             .map(|offset| (self.rtcp_cursor + offset) % self.senders.len())
-            .find(|index| self.senders[*index].committed_packets > 0)?;
+            .find(|index| {
+                self.senders[*index].active && self.senders[*index].committed_packets > 0
+            })?;
         let sender = &self.senders[sender_index];
         let packet = sender_report(sender, at, &self.clock)?;
         match transport.send_rtcp(&packet) {
@@ -1097,9 +1261,9 @@ impl MediaEgress {
     fn padding_candidate(&self) -> Option<usize> {
         (self.desired_bitrate > 0)
             .then(|| {
-                self.senders
-                    .iter()
-                    .position(|sender| sender.facts.retransmission_payload_type.is_some())
+                self.senders.iter().position(|sender| {
+                    sender.active && sender.facts.retransmission_payload_type.is_some()
+                })
             })
             .flatten()
     }
@@ -1275,6 +1439,14 @@ fn build_rtp(
     if let Some(id) = sender.facts.mid_extension_id {
         extensions.push((id, sender.facts.mid.as_bytes().to_vec()));
     }
+    let rid_id = if ssrc == sender.rtx_ssrc {
+        sender.repaired_rid_extension_id
+    } else {
+        sender.rid_extension_id
+    };
+    if let (Some(id), Some(rid)) = (rid_id, &sender.rid) {
+        extensions.push((id, rid.as_bytes().to_vec()));
+    }
     if let (Some(id), Some(sequence)) = (sender.facts.twcc_extension_id, twcc) {
         extensions.push((id, sequence.to_be_bytes().to_vec()));
     }
@@ -1300,6 +1472,11 @@ fn build_rtp(
 
 fn sender_uses_one_byte_extensions(sender: &Sender) -> bool {
     sender.facts.dependency_extension_id.is_none()
+        && sender.rid.as_ref().is_none_or(|rid| rid.len() <= 16)
+        && [sender.rid_extension_id, sender.repaired_rid_extension_id]
+            .into_iter()
+            .flatten()
+            .all(|id| (1..=14).contains(&id))
         && sender.facts.mid.len() <= 16
         && [
             sender.facts.mid_extension_id,

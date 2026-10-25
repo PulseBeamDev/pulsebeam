@@ -52,6 +52,10 @@ impl ReceiveFeedback {
         }
     }
 
+    pub(crate) fn set_profile(&mut self, profile: PacketFeedbackKind) {
+        self.mode = Some(profile);
+    }
+
     pub(crate) fn observe(
         &mut self,
         now: Instant,

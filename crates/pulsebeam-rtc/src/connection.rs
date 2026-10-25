@@ -32,6 +32,7 @@ use crate::{
 
 pub struct Connection {
     session: NegotiatedSessionFacts,
+    rtp_configuration: crate::rtp_config::RtpConfigurationState,
     time: MonotonicObserver,
     transport: Transport,
     ingress: IngressOwner,
@@ -149,6 +150,191 @@ pub struct AcceptedConnection {
 }
 
 impl Connection {
+    /// Declare bounded ongoing RTP support once, even after an SCTP-only start.
+    /// This selects the connection-wide feedback profile without rebuilding its
+    /// transport, receive feedback or committed send history.
+    pub fn set_rtp_capabilities(
+        &mut self,
+        capabilities: crate::RtpCapabilities,
+    ) -> Result<(), crate::RtpConfigurationError> {
+        use crate::RtpConfigurationError as Error;
+        self.check_writable().map_err(|_| Error::ConnectionState)?;
+        capabilities.validate()?;
+        if let Some(current) = &self.rtp_configuration.capabilities {
+            return if *current == capabilities {
+                Ok(())
+            } else {
+                Err(Error::CapabilityState)
+            };
+        }
+        if [self.session.feedback(), self.session.inbound_feedback()]
+            .into_iter()
+            .flatten()
+            .any(|feedback| feedback != capabilities.feedback)
+        {
+            return Err(Error::Unsupported);
+        }
+        self.session.set_feedback_profile(capabilities.feedback);
+        self.commit
+            .history
+            .set_feedback_profile(capabilities.feedback);
+        self.ingress.set_feedback_profile(capabilities.feedback);
+        if self.session.ingress_media().is_empty() && self.session.egress_senders().is_empty() {
+            self.transport.configure_rtp_mappings(
+                Box::new([]),
+                Box::new([]),
+                Box::new([]),
+                Box::new([]),
+            );
+        }
+        self.rtp_configuration.capabilities = Some(capabilities);
+        Ok(())
+    }
+
+    /// Atomically replace the complete desired RTP set. Primary/repair identities
+    /// are explicit; incomplete sender observations cannot be represented here.
+    pub fn configure_rtp(
+        &mut self,
+        configuration: crate::RtpConfiguration,
+    ) -> Result<(), crate::RtpConfigurationError> {
+        use crate::RtpConfigurationError as Error;
+        use std::collections::BTreeSet;
+        self.check_writable().map_err(|_| Error::ConnectionState)?;
+        let staged = self.rtp_configuration.stage(&configuration)?;
+        let limit = self
+            .rtp_configuration
+            .capabilities
+            .as_ref()
+            .ok_or(Error::CapabilityState)?
+            .limits
+            .max_retained_encodings;
+        let ingress_identities = self.ingress.physical_identities();
+        let egress_identities = self.egress.physical_identities();
+        for (physical, _) in &staged {
+            let opposite = if physical.outbound {
+                &ingress_identities
+            } else {
+                &egress_identities
+            };
+            let encoding = physical.encoding();
+            if [Some(encoding.primary), encoding.repair]
+                .into_iter()
+                .flatten()
+                .any(|id| opposite.contains(&id.get()) || id.get() == self.ingress.control_ssrc())
+            {
+                return Err(Error::Collision);
+            }
+        }
+        let ingress = self.ingress.stage_configuration(&staged, limit)?;
+        let egress =
+            self.egress
+                .stage_configuration(&staged, self.session.protocol_randomness(), limit)?;
+        let mut history = self.rtp_configuration.history.clone();
+        history
+            .try_reserve(staged.len())
+            .map_err(|_| Error::Capacity)?;
+        for (physical, _) in &staged {
+            if !history.iter().any(|old| old.same_identity(physical)) {
+                history.push(physical.clone());
+            }
+        }
+        let retained_inbound: BTreeSet<_> = history
+            .iter()
+            .filter(|p| !p.outbound)
+            .flat_map(|p| {
+                [
+                    Some(p.encoding().primary.get()),
+                    p.encoding().repair.map(std::num::NonZeroU32::get),
+                ]
+                .into_iter()
+                .flatten()
+            })
+            .collect();
+        let retained_inbound: Vec<_> = retained_inbound.into_iter().collect();
+        if !self.transport.can_admit_ssrcs(&retained_inbound) {
+            return Err(Error::Capacity);
+        }
+        let payloads = |outbound| {
+            staged
+                .iter()
+                .filter(move |(p, active)| p.outbound == outbound && *active)
+                .flat_map(|(p, _)| {
+                    std::iter::once(p.binding.codec.payload_type)
+                        .chain(p.binding.codec.repair_payload_type)
+                })
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Box<[_]>>()
+        };
+        let inbound = payloads(false);
+        let outbound = payloads(true);
+        let twcc: Box<[_]> = staged
+            .iter()
+            .filter(|(p, active)| p.outbound && *active)
+            .flat_map(|(p, _)| {
+                let id = crate::negotiation::TWCC_URIS
+                    .iter()
+                    .find_map(|uri| p.extension_id(uri));
+                std::iter::once(p.binding.codec.payload_type)
+                    .chain(p.binding.codec.repair_payload_type)
+                    .filter_map(move |pt| id.map(|id| (pt, id)))
+            })
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let identities: Box<[_]> = staged
+            .iter()
+            .filter(|(p, active)| !p.outbound && *active)
+            .flat_map(|(p, _)| {
+                [
+                    Some(p.encoding().primary.get()),
+                    p.encoding().repair.map(std::num::NonZeroU32::get),
+                ]
+                .into_iter()
+                .flatten()
+            })
+            .collect();
+        self.ingress.commit_configuration(ingress);
+        self.egress.commit_configuration(egress);
+        self.transport
+            .configure_rtp_mappings(inbound, outbound, twcc, identities);
+        self.rtp_configuration.history = history;
+        self.rtp_configuration.current = Some(configuration);
+        Ok(())
+    }
+
+    /// Accepted typed configuration. The initial SessionInfo remains a bootstrap
+    /// snapshot; None means no typed update has yet been accepted.
+    pub fn rtp_configuration(&self) -> Option<&crate::RtpConfiguration> {
+        self.rtp_configuration.current.as_ref()
+    }
+
+    #[allow(
+        clippy::result_large_err,
+        reason = "return the original packet on rejection"
+    )]
+    pub fn write_rtp_encoding(
+        &mut self,
+        at: Instant,
+        mid: &str,
+        primary: std::num::NonZeroU32,
+        packet: RtpWrite,
+    ) -> Result<(), RejectedRtp> {
+        let at = self.time.observe(at);
+        if let Err(reason) = self.check_writable() {
+            return Err(RejectedRtp { reason, packet });
+        }
+        if self.transport.state() != TransportState::Connected {
+            return Err(RejectedRtp {
+                reason: WriteError::InvalidState,
+                packet,
+            });
+        }
+        self.egress
+            .admit_encoding(at, mid, Some(primary.get()), packet)
+            .map_err(|(reason, packet)| RejectedRtp { reason, packet })
+    }
+
     #[allow(
         clippy::result_large_err,
         reason = "keep caller-owned input inline instead of allocating an error wrapper"
@@ -740,6 +926,7 @@ impl Connection {
             .map(|facts| Association::new(facts, config.limits, at));
         let connection = Self {
             session: negotiated.facts,
+            rtp_configuration: crate::rtp_config::RtpConfigurationState::default(),
             time: MonotonicObserver::starting_at(at),
             transport,
             ingress,

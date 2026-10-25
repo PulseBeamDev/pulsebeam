@@ -224,6 +224,10 @@ impl SentHistory {
         }
     }
 
+    pub(crate) fn set_feedback_profile(&mut self, profile: PacketFeedbackKind) {
+        self.mode = Some(profile);
+    }
+
     fn commit_context(&mut self, context: TransmitCommitContext) -> Result<(), HistoryError> {
         self.preflight_commit(context)?;
         if context.kind != DatagramKind::Rtp {

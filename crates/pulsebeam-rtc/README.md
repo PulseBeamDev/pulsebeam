@@ -81,6 +81,43 @@ Then use the connection directly:
   resetting transport history or retained repairs. `close` performs bounded
   graceful shutdown; `abort` discards pending work and closes immediately.
 
+## Configure media after bootstrap
+
+SDP remains the initial native, WHIP and WHEP interface. For ongoing native
+configuration, call `set_rtp_capabilities` once with the server's bounded exact
+codec-parameter and extension envelopes. This also initializes TWCC for an
+SCTP-only bootstrap. It does not reconstruct ICE, DTLS, SCTP or feedback history.
+The typed path currently requires TWCC; bootstrap SDP still supports RFC 8888.
+
+Pass a complete desired `RtpConfiguration` to `configure_rtp`. `inbound` and
+`outbound` are from RTC's perspective. Each `RtpBinding` supplies its MID, media
+kind, selected codec/FMTP/PT/RTX and extension maps, and complete primary/repair
+SSRCs with optional RIDs. Opus, VP8, H.264 packetization-mode 1 and VP9 profile
+0/2 parameter envelopes are supported. Capabilities are explicit server support,
+not a general codec negotiator. No ongoing server SDP is constructed or parsed.
+
+The update validates and stages both directions together before commit. Unknown
+identities are not admitted by sender discovery. Invalid formats, inconsistent
+mappings, collisions and capacity errors preserve the prior accepted set.
+`rtp_configuration()` exposes that set; `SessionInfo` remains the immutable
+bootstrap snapshot and is not a second mutable media registry. Before the first
+typed update, `rtp_configuration()` returns `None` and bootstrap facts apply.
+
+An encoding's `active` flag can pause admission without changing its identity.
+Omitting it withdraws it. Withdrawal discards queued originals and stops new
+media/repair admission after already committed outputs drain. Exact physical
+re-admission keeps receive state, primary/RTX numbering, protection, congestion
+and transport-wide history. A changed physical envelope requires fresh SSRCs;
+a retired identity cannot be retargeted to another MID or direction. Retained
+physical history is bounded by `RtpConfigurationLimits`, at most 256 encodings
+per connection. Exhaustion rejects new bindings instead of forgetting history.
+
+`write_rtp` addresses an unambiguous active outbound MID. Use
+`write_rtp_encoding` with its configured primary SSRC when that MID has multiple
+encodings. Packet ownership, primary sequence/timestamp translation and source
+selection remain with the caller. Selecting another compatible source behind
+a binding does not change this configuration.
+
 ## Numbering, clocks, and socket handoff
 
 The caller owns primary RTP numbering. Gaps, wrap, and valid late holes are
@@ -104,10 +141,12 @@ admission/retirement API.
 
 ## Negotiation and extensions
 
-The supported profile is an immutable ICE-lite initial offer/answer with BUNDLE,
+The supported bootstrap profile is an ICE-lite initial offer/answer with BUNDLE,
 RTCP mux, UDP or passive ICE-TCP, negotiated Opus/H.264, and the existing DTLS and
 SRTP profiles. Outbound RTP requires one packet-feedback mode, TWCC or RFC 8888.
-There is no REMB/fixed-rate fallback, renegotiation, ICE restart, or TURN client.
+Typed ongoing media configuration uses the same transport and execution state.
+There is no REMB/fixed-rate fallback, ongoing SDP negotiation, ICE restart, or
+TURN client.
 
 RTP values own ordinary headers, payloads, and URI-addressed extensions. RTC
 regenerates transport identity and TWCC. The caller supplies media extension

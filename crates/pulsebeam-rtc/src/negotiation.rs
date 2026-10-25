@@ -74,6 +74,7 @@ pub(crate) struct NegotiatedSessionFacts {
     accepted_at: Instant,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct IngressMediaFacts {
     pub(crate) sender_index: u32,
     pub(crate) kind: crate::MediaKind,
@@ -88,6 +89,7 @@ pub(crate) struct IngressMediaFacts {
     pub(crate) extensions: Box<[(u8, Box<str>)]>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct EgressSenderFacts {
     pub(crate) id: SenderId,
     pub(crate) kind: crate::MediaKind,
@@ -113,6 +115,11 @@ pub(crate) struct SctpSessionFacts {
 impl NegotiatedSessionFacts {
     pub(crate) const fn feedback(&self) -> Option<PacketFeedbackKind> {
         self.feedback
+    }
+
+    pub(crate) fn set_feedback_profile(&mut self, profile: PacketFeedbackKind) {
+        self.feedback = Some(profile);
+        self.inbound_feedback = Some(profile);
     }
 
     pub(crate) const fn inbound_feedback(&self) -> Option<PacketFeedbackKind> {

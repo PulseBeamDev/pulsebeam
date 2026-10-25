@@ -11,10 +11,12 @@ mod receive_feedback;
 mod receive_stream;
 mod rtcp;
 mod rtp;
+mod rtp_config;
 mod scheduler;
 mod sctp;
 mod sent_history;
 mod session;
+pub use rtp_config::*;
 mod time;
 mod transport;
 

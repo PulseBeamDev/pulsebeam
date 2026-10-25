@@ -218,6 +218,15 @@ impl SrtpLayer {
         })
     }
 
+    pub(crate) fn can_admit_ssrcs(&self, identities: &[u32]) -> bool {
+        self.rx_last.len().saturating_add(
+            identities
+                .iter()
+                .filter(|ssrc| !self.rx_last.iter().any(|window| window.ssrc == **ssrc))
+                .count(),
+        ) <= MAX_SSRC_STATES
+    }
+
     pub(crate) fn protect_rtp(&mut self, packet: &[u8], index: u64) -> Result<Vec<u8>, SrtpError> {
         let parsed = RtpHeaderFacts::parse(packet)?;
         if index >= (1_u64 << 48) || u16::try_from(index & 0xffff).ok() != Some(parsed.sequence) {

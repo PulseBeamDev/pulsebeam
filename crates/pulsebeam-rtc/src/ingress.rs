@@ -27,7 +27,9 @@ use crate::{
 const MAX_RECORDS: usize = 256;
 
 pub(crate) struct IngressOwner {
-    media: Box<[IngressMediaFacts]>,
+    media: Vec<IngressMediaFacts>,
+    active: Vec<bool>,
+    strict: bool,
     receiver_ssrc: u32,
     receive_feedback: ReceiveFeedback,
     control_cursor: usize,
@@ -40,6 +42,12 @@ pub(crate) struct IngressOwner {
     max_bytes: usize,
     queued_media_bytes: usize,
     dropped: u64,
+}
+
+pub(crate) struct IngressUpdate {
+    new_media: Vec<IngressMediaFacts>,
+    active: Vec<bool>,
+    remap: Vec<(usize, usize)>,
 }
 
 struct Encoding {
@@ -61,7 +69,9 @@ impl IngressOwner {
         receive_feedback: ReceiveFeedback,
     ) -> Self {
         Self {
-            media,
+            active: vec![true; media.len()],
+            strict: false,
+            media: media.into_vec(),
             receiver_ssrc,
             receive_feedback,
             control_cursor: 0,
@@ -75,6 +85,112 @@ impl IngressOwner {
             queued_media_bytes: 0,
             dropped: 0,
         }
+    }
+
+    pub(crate) fn set_feedback_profile(&mut self, profile: PacketFeedbackKind) {
+        self.receive_feedback.set_profile(profile);
+    }
+
+    pub(crate) fn stage_configuration(
+        &self,
+        desired: &[(crate::rtp_config::PhysicalBinding, bool)],
+        limit: usize,
+    ) -> Result<IngressUpdate, crate::RtpConfigurationError> {
+        use crate::RtpConfigurationError as Error;
+        let mut update = IngressUpdate {
+            new_media: Vec::new(),
+            active: vec![false; self.media.len()],
+            remap: Vec::new(),
+        };
+        for (physical, active) in desired.iter().filter(|(physical, _)| !physical.outbound) {
+            let encoding = physical.encoding();
+            if let Some((index, _)) = self
+                .media
+                .iter()
+                .enumerate()
+                .find(|(_, media)| **media == physical.ingress_facts(media.sender_index))
+            {
+                update.active[index] = *active;
+                continue;
+            }
+            let index = self.media.len().saturating_add(update.new_media.len());
+            if index >= limit {
+                return Err(Error::Capacity);
+            }
+            let facts = physical.ingress_facts(u32::try_from(index).map_err(|_| Error::Capacity)?);
+            // Bootstrap and typed mappings use the same receive streams. Moving
+            // a known SSRC to a narrower selected envelope retains its receiver.
+            for (old_index, old) in self.media.iter().enumerate() {
+                let shares = old.ssrcs.iter().any(|ssrc| {
+                    *ssrc == encoding.primary.get()
+                        || encoding.repair.is_some_and(|r| r.get() == *ssrc)
+                }) || old.ssrc_repairs.iter().any(|(repair, primary)| {
+                    *repair == encoding.primary.get()
+                        || *primary == encoding.primary.get()
+                        || encoding
+                            .repair
+                            .is_some_and(|r| r.get() == *repair || r.get() == *primary)
+                });
+                if shares
+                    && (self.strict
+                        || old.mid != facts.mid
+                        || old.kind != facts.kind
+                        || !facts.payloads.iter().all(|p| old.payloads.contains(p))
+                        || !facts.repairs.iter().all(|p| old.repairs.contains(p))
+                        || !facts.extensions.iter().all(|p| old.extensions.contains(p)))
+                {
+                    return Err(Error::Collision);
+                }
+                if shares {
+                    for (encoding_index, _) in self.encodings.iter().enumerate().filter(|(_, e)| {
+                        e.media == old_index && e.ssrc == Some(encoding.primary.get())
+                    }) {
+                        update.remap.push((encoding_index, index));
+                    }
+                }
+            }
+            update.new_media.push(facts);
+            update.active.push(*active);
+        }
+        Ok(update)
+    }
+
+    pub(crate) fn commit_configuration(&mut self, update: IngressUpdate) {
+        for (index, media) in update.remap {
+            self.encodings[index].media = media;
+        }
+        for encoding in &mut self.encodings {
+            let active = update.active.get(encoding.media) == Some(&true);
+            if !active {
+                encoding.retired = true;
+            } else if self.active.get(encoding.media) != Some(&true) {
+                encoding.retired = false;
+            }
+        }
+        self.media.extend(update.new_media);
+        self.active = update.active;
+        self.strict = true;
+    }
+
+    pub(crate) const fn control_ssrc(&self) -> u32 {
+        self.receiver_ssrc
+    }
+
+    pub(crate) fn physical_identities(&self) -> Vec<u32> {
+        self.media
+            .iter()
+            .flat_map(|m| {
+                m.ssrcs
+                    .iter()
+                    .copied()
+                    .chain(m.ssrc_repairs.iter().map(|(repair, _)| *repair))
+            })
+            .chain(
+                self.encodings
+                    .iter()
+                    .flat_map(|e| [e.ssrc, e.repair_ssrc].into_iter().flatten()),
+            )
+            .collect()
     }
 
     pub(crate) fn accept_rtp(
@@ -494,44 +610,56 @@ impl IngressOwner {
     fn resolve<'a>(&self, packet: &'a RtpPacket<'a>) -> Option<(usize, u32, Option<&'a str>)> {
         // BUNDLE negotiation guarantees one shared MID extension ID. MID and
         // authenticated SSRC association take precedence over payload type.
-        let mid_id = self.media.iter().find_map(|media| {
-            media.extensions.iter().find_map(|(id, uri)| {
-                (uri.as_ref() == "urn:ietf:params:rtp-hdrext:sdes:mid").then_some(*id)
-            })
-        });
+        let mid_id = self
+            .media
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| self.active[*i])
+            .find_map(|(_, media)| {
+                media.extensions.iter().find_map(|(id, uri)| {
+                    (uri.as_ref() == "urn:ietf:params:rtp-hdrext:sdes:mid").then_some(*id)
+                })
+            });
         let mid = packet
             .extensions()
             .ok()?
             .find(|value| Some(value.id()) == mid_id);
-        let by_mid = match mid {
-            Some(value) => {
-                let mid = std::str::from_utf8(value.value()).ok()?;
-                Some(
-                    self.media
-                        .iter()
-                        .position(|media| media.mid.as_ref() == mid)?,
-                )
-            }
-            None => None,
-        };
+        let by_mid = mid
+            .map(|value| std::str::from_utf8(value.value()))
+            .transpose()
+            .ok()?;
         let by_ssrc = self
             .encodings
             .iter()
             .find(|encoding| {
-                encoding.ssrc == Some(packet.ssrc()) || encoding.repair_ssrc == Some(packet.ssrc())
+                self.active[encoding.media]
+                    && (encoding.ssrc == Some(packet.ssrc())
+                        || encoding.repair_ssrc == Some(packet.ssrc()))
             })
             .map(|encoding| encoding.media)
             .or_else(|| {
                 self.media
                     .iter()
-                    .position(|media| media.ssrcs.contains(&packet.ssrc()))
+                    .enumerate()
+                    .find(|(i, media)| {
+                        self.active[*i]
+                            && (media.ssrcs.contains(&packet.ssrc())
+                                || media
+                                    .ssrc_repairs
+                                    .iter()
+                                    .any(|(repair, _)| *repair == packet.ssrc()))
+                    })
+                    .map(|(i, _)| i)
             });
-        if by_mid.zip(by_ssrc).is_some_and(|(mid, ssrc)| mid != ssrc) {
+        if self.strict && by_ssrc.is_none() {
             return None;
         }
-        let selected = by_mid.or(by_ssrc);
+        let selected = by_ssrc;
         let mut candidates = self.media.iter().enumerate().filter_map(|(index, media)| {
-            if selected.is_some_and(|selected| selected != index) {
+            if !self.active[index]
+                || selected.is_some_and(|selected| selected != index)
+                || by_mid.is_some_and(|mid| media.mid.as_ref() != mid)
+            {
                 return None;
             }
             media
@@ -562,6 +690,16 @@ impl IngressOwner {
                 "urn:ietf:params:rtp-hdrext:sdes:rtp-stream-id"
             },
         );
+        if self.strict
+            && rid.is_some_and(|rid| {
+                !self.media[index]
+                    .rids
+                    .iter()
+                    .any(|known| known.as_ref() == rid)
+            })
+        {
+            return None;
+        }
         Some((index, clock_rate, rid))
     }
 
