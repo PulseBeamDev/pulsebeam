@@ -22,6 +22,7 @@ mod signaling_v1;
 mod topic;
 mod track;
 
+pub mod client_sdp;
 pub mod ffi;
 
 pub use ffi::UniFfiTag;

@@ -81,6 +81,74 @@ consume those types as external UniFFI types instead of defining platform
 copies. TypeScript generation settings live in this crate's `uniffi.toml` so
 core-owned byte arrays and strictness follow the core namespace.
 
+## Reconcile local SDP without server renegotiation
+
+`client_sdp` is an independent, sans-I/O local-offerer utility. Create one
+`Context` from the successfully applied bootstrap offer/answer and an explicit
+server `Capabilities` envelope. SCTP-only bootstrap is supported: capabilities
+are never inferred from a data-only answer. Supply a connection-specific SSRC
+seed and `Limits`; no randomness or identity set is required from the host.
+
+The adapter serializes operations and applies answers to its PeerConnection.
+This native-independent helper shows the prepare/apply/accept boundary:
+
+```rust
+use pulsebeam_agent_core::client_sdp::{
+    ApplyOutcome, Bindings, Capabilities, Context, Error, Limits, Preparation,
+};
+
+fn prepare_media(
+    bootstrap_offer: &str,
+    applied_bootstrap_answer: &str,
+    capabilities: Capabilities,
+    seed: u32,
+    current_offer: &str,
+    requests: &[Preparation],
+    apply_answer: impl FnOnce(&str) -> ApplyOutcome,
+) -> Result<(Context, Option<Bindings>), Error> {
+    let mut context = Context::new(
+        bootstrap_offer, applied_bootstrap_answer, capabilities, seed,
+        Limits::default(),
+    )?;
+    let candidate = context.prepare(current_offer, requests)?;
+    let outcome = apply_answer(candidate.answer());
+    context.finish(candidate.id(), outcome)?;
+    let bindings = context.bindings().cloned();
+    Ok((context, bindings))
+}
+```
+
+Keep the returned context for subsequent offers. `inspect` exposes offered
+MID, codec/FMTP/PT/RTX, directional extension, SSRC/FID and RID facts; callers do
+not need another SDP parser or MID map. A preparation correlates publication
+and reception facts to opaque caller keys, with optional logical grouping.
+Unchanged sections are reconciled automatically. Codec replacement requires an
+explicitly prepared fresh compatible section. Inactivation retains identities;
+stopped-MID reuse requires fresh identities. Receive identities are allocated
+without collisions across the context's bounded history, including cancelled
+candidates.
+
+An RID-only publication is not ready for admission: `Binding::complete()` stays
+false until the host passes actual sender encodings to
+`context.observe_sender(mid, &encodings)` after successful application. Submit
+only complete publication bindings to the server's typed API. Runtime
+bitrate/framerate, activation and scalability observations remain separate from
+negotiated identities. Source or quality selection behind a compatible receive
+binding is caller policy and does not require SDP.
+
+Report `NotApplied` for failure or cancellation before application.
+`AppliedButCancelled` preserves actual SDP history while suppressing declaration;
+the adapter owns physical cleanup and stale-completion fencing. Reconnect uses
+a new context. Pending candidates are limited to one. Errors do not include SDP
+or ICE credentials.
+
+The supported subset is one bundled ICE/DTLS transport, RTCP mux, an existing
+SCTP association, and explicitly selected offered codec/extension envelopes.
+ICE restart, DTLS identity/role changes, SCTP replacement and simulcast RID
+alternatives require higher-layer recovery or a different negotiator. This
+utility neither executes PeerConnection operations nor integrates a production
+signaling protocol or media-routing policy.
+
 ## Verification
 
 Run `./bazel test //agents/pulsebeam-agent-core:unit_tests` while iterating.
