@@ -1,5 +1,8 @@
 [package]
 name = "pulsebeam-agent-native"
+description = "Native PulseBeam client for caller-fed audio, video, and session control"
+readme = "README.md"
+include = ["src/**", "Cargo.toml", "README.md", "BUILDING.md", "QUALIFICATION.md", "LICENSE", "uniffi.toml"]
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
@@ -16,9 +19,9 @@ bindgen = ["uniffi/cargo-metadata", "uniffi/cli"]
 sim = ["pulsebeam-core/sim", "agent_core/sim"]
 
 [dependencies]
-agent_core = { package = "pulsebeam-agent-core", path = "../pulsebeam-agent-core" }
+agent_core = { package = "pulsebeam-agent-core", version = "0.1.0", path = "../pulsebeam-agent-core" }
 http = "1.4.1"
-pulsebeam-core = { path = "../../crates/pulsebeam-core", features = ["reqwest"] }
+pulsebeam-core = { version = "0.3.2", path = "../../crates/pulsebeam-core", features = ["reqwest"] }
 pulsebeam-webrtc-sys.workspace = true
 reqwest = "0.13.4"
 thiserror.workspace = true

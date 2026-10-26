@@ -4,6 +4,8 @@ Native Rust and generated foreign APIs for caller-fed media and PulseBeam sessio
 
 This is an unpublished, not fully qualified Linux x86_64 integration. Bazel builds the [local WebRTC bindings](../../crates/pulsebeam-libwebrtc-sys/README.md) from pinned sources; no source/native candidate archives or separate preparation are needed. Contributor proofs cover controlled real-SFU media/topics/reconnect, native decoded marker-only simulcast, simulated TCP recovery, and a bounded production raw-I420 encode/decode witness. The production witness also calls the generated Python API through the native dynamic library. See [support and verification scope](QUALIFICATION.md) for the proof owners and limits. Swift/Kotlin binding generation does not qualify mobile runtime execution; hardware qualification and release publication are separate.
 
+For source builds, generated library outputs, and crates.io release requirements, see [Build and publish](BUILDING.md). Standalone Cargo builds are not supported yet.
+
 ## Configure and connect
 
 Rust callers supply a core `AgentConfig`, native `MediaConfig`, and an HTTP `Host`, then call `Agent::spawn`. This selects `ThreadedRuntime` with normal native sockets. Submit a complete core `DesiredState` to connect and publish/subscribe; core remains the owner of topology, authorization, topics and recovery policy.
@@ -45,17 +47,6 @@ Snapshot, event and producer-feedback observations are bounded and report `Lagge
 
 ## Contributor checks
 
-Run from the repository root with the [host prerequisites](../../docs/build.md#host-prerequisites). Core is the default; use the sys package's graph-wide flavor setting when enabling Linux desktop device support:
-
-```sh
-./bazel test //agents/pulsebeam-agent-native:unit_tests \
-  //agents/pulsebeam-agent-native:clippy \
-  //agents/pulsebeam-agent-native:format \
-  //crates/pulsebeam-cli:production_native
-./bazel build //agents/pulsebeam-agent-native:bindings \
-  //agents/pulsebeam-agent-native:pulsebeam-agent-native-sim
-```
-
-Binding generation reads the native shared library and emits the native and core namespaces. Core-owned portable types remain in core. Generated files are build artifacts; change Rust definitions and run the owner generator, never edit generated output.
+Use the commands in [Build and publish](BUILDING.md#check-the-build). Binding generation reads the native shared library and emits the native and core namespaces. Core-owned portable types remain in core. Generated files are build artifacts; change Rust definitions and run the owner generator, never edit generated output.
 
 Implementation owners are `native_actor` (effects and lifecycle), `native_peer` (one generation), `native_source`/`native_receiver` (native resources), `native_media` (owned values), and `ffi` (thin foreign boundary). `media` retains an application-side Annex-B fixture slicer. The former str0m transport, RTP packetization, jitter and socket-pumping modules are removed.
