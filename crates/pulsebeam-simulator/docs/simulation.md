@@ -122,6 +122,17 @@ The run retains:
   Failed discovery retains its trace and owned discovery outputs. Launch errors
   and host timeouts retain available diagnostics; timeouts kill the process group.
 
+The runner measures host work with its own monotonic clock, not the child's
+virtual process clock. Each discovery record has `wall_seconds`; each case has
+child `wall_seconds` and separate `evidence_wall_seconds`. The manifest's
+`timings` separates discovery, summed child execution, campaign wall time,
+reporting and total runner time. Campaign time includes scheduling, evidence
+processing and reporting, which can overlap other children. These values are
+not additive CPU attribution and do not include Bazel build/cache time.
+Compare uncached child execution under fixed candidate, selection, settings,
+seed and jobs with repeated observations; report host variability rather than
+asserting a CI speed threshold.
+
 Success traces and emitted outputs are discarded after concise reporting.
 `--show-output` prints complete grouped traces, including successes. The runner
 retains only this invocation's metadata, replay inputs and failure diagnostics;
@@ -173,7 +184,16 @@ or randomness. Counts distinguish novel, retained and reduction executions from
 applied operations and reached claims.
 
 Failures retain `*.original.history` and `*.reduced.history` beside the runner
-traces. These are versioned concrete programs, not RNG states. They contain the
+traces. Failed-case `artifact_checksums` covers all retained owned output
+files, including original semantic inputs and any supplied nearby variations.
+Only the unambiguous top-level `*.reduced.history` selects a concrete replay;
+scratch files are retained diagnostics, not replay selectors. Ambiguous reductions
+or unavailable artifact checksums fail evidence retention as infrastructure;
+`evidence_error` records that problem without replacing the original child exit,
+launch or timeout failure. Artifact links outside the owned output boundary are
+not followed. Existing version-1 replay bundles remain valid; unsupported replay
+versions are rejected before discovery.
+These are versioned concrete programs, not RNG states. They contain the
 whole-run seed, replay selection, symbolic operations and actual phase/fault
 witnesses. The failed case's portable replay bundle selects the reduced concrete
 input and checks its checksum and candidate identity. A supplied

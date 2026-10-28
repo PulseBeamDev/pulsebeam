@@ -149,12 +149,51 @@ class CalibrationContract(unittest.TestCase):
                 self.assertEqual(CALIBRATE.main(), 1)
             self.assertEqual(len(invoked), 6)
             self.assertEqual([binary for binary, _ in invoked], [str(control)] * 3 + list(binaries.values()))
-            manifests = [json.loads(path.read_text()) for path in root.glob("simulations/run-*/manifest.json")]
-            mutant = next(m for m in manifests if m["variant"]["id"] == "local-fanout")
+            manifests = {path.parent: json.loads(path.read_text()) for path in root.glob("simulations/run-*/manifest.json")}
+            mutant_root, mutant = next((directory, manifest) for directory, manifest in manifests.items()
+                                       if manifest["variant"]["id"] == "local-fanout")
             self.assertEqual(mutant["cases"][0]["classification"], "survived-defect")
             self.assertEqual(mutant["variant"]["binary_sha256"], CALIBRATE.sha256(binaries["local-fanout"]))
+            self.assertEqual(mutant["cases"][0]["artifact_checksums"]["outputs/calibration.jsonl"],
+                             CALIBRATE.sha256(mutant_root / "case-0000/outputs/calibration.jsonl"))
             self.assertEqual(len(list(root.glob("simulations/run-*/case-*/trace.log"))), 6)
             self.assertEqual(len(list(root.glob("simulations/run-*/case-*/outputs/calibration.jsonl"))), 2)
+
+    def test_detected_defect_cannot_hide_an_evidence_retention_failure(self):
+        runner = CALIBRATE.runner
+        with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, {"TEST_UNDECLARED_OUTPUTS_DIR": temp}), redirect_stdout(StringIO()):
+            root = Path(temp)
+            candidate = root / "candidate"
+            candidate.write_text("STABLE_SIM_REVISION " + "a" * 40 + "\nSTABLE_SIM_DIRTY false\nSTABLE_SIM_FINGERPRINT " + "b" * 64 + "\n")
+            external = root / "external"
+            external.write_text("not an owned artifact")
+            args = argparse.Namespace(binary="fake-libtest", candidate=str(candidate), artifacts_dir=None, show_output=False,
+                replay_bundle=None, mode="all", filter="tests::calibration::local_fanout", exact=True,
+                skip=[], run_skipped=False, seeds=1, from_seed=1, jobs=1, discovery_timeout=30, case_timeout=120)
+            bundle = runner.Bundle(args)
+            bundle.prepare(args)
+
+            def process(command, trace, **kwargs):
+                if "--list" in command:
+                    if "--ignored" not in command:
+                        trace.write(args.filter + ": test\n")
+                    return 0, None
+                (Path(kwargs["env"]["TEST_UNDECLARED_OUTPUTS_DIR"]) / "linked-artifact").symlink_to(external)
+                trace.write("complete child failure trace\n")
+                return 101, "exit"
+
+            def assess(record, outputs):
+                return CALIBRATE.classify("local-fanout", "local-fanout", record, fanout_events([0]))
+
+            with patch.object(runner, "run_process", side_effect=process):
+                self.assertEqual(runner.execute(args, bundle, assess=assess), 1)
+            record = bundle.manifest["cases"][0]
+            self.assertEqual(record["classification"], "detected-public-defect")
+            self.assertEqual(record["child_failure"], "exit")
+            self.assertEqual(record["status"], "failed")
+            self.assertEqual(bundle.manifest["status"], "infrastructure")
+            self.assertIn("inside owned outputs", record["evidence_error"])
+            self.assertIn("complete child failure trace", (bundle.root / record["directory"] / "trace.log").read_text())
 
     def test_variant_replay_is_owned_and_ordinary_v1_still_has_meaning(self):
         runner = CALIBRATE.runner

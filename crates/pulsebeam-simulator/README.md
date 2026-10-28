@@ -60,6 +60,23 @@ production integration evidence remain distinct. A real active-camera freeze
 still fails; redesigning the oracle does not qualify unresolved recovery or
 publication failures.
 
+## Observation boundaries
+
+System fidelity claims use documented SDK/API behavior and end-user media/data
+output with expectations derived from application inputs. SDK admission,
+remote delivery, native decoding and UI presentation are different boundaries.
+Existing production snapshots, events, native statistics and encoded/decoded
+observers prove their actual contracts, not hidden state behind those APIs.
+Put private structural invariants inline in their production owners with
+`assert!` or `debug_assert!`; simulation gates enable those assertions.
+Principled named BUGGIFY injection remains valid fault control, not a public
+correctness oracle.
+
+Do not add SDK observations for fixture convenience or report population.
+A new public observation needs a concrete production consumer and action,
+inadequate existing alternatives, a minimal stable semantic surface and
+justified compatibility, portability, privacy and maintenance costs.
+
 ## Build profile
 
 Simulator runners apply the workspace's Cargo `sim` optimization and safety

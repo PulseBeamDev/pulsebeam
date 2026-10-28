@@ -41,6 +41,14 @@ Snapshot, event and producer-feedback observations are bounded and report `Lagge
 
 `close` requests graceful core disconnection and waits for its disconnected/native-retired state. `abort` cancels work and retires resources without completing graceful signaling. Abort and source closure are idempotent. Dropping the final agent handle requests abort; retained media and observation handles do not retain the RTC graph.
 
+Observation APIs must serve a concrete production consumer and action. Before
+expanding them, show why existing source, remote, snapshot/event or statistics
+contracts are inadequate, choose the minimum stable semantics and justify
+compatibility, portability, privacy and maintenance costs. Test summaries and
+public wrappers around private state are not sufficient reasons. Keep private
+structural invariants inline in production owners; principled simulation fault
+injection does not turn its bookkeeping into an application observation.
+
 ## Controlled execution
 
 `Agent::managed(config, host, runtime_factory)` returns the same agent API and a non-Send actor future. The outer driver launches that future on its controlled world's OS thread and supplies a managed runtime for each generation. It owns one process-exclusive `ControlledWorld`, native packet delivery, pumping and deadline/time advancement. Threaded libwebrtc graphs must not coexist with that controlled world. There is no alternate simulated media backend or decoder injection.

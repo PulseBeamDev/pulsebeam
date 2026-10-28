@@ -3,6 +3,7 @@
 from contextlib import redirect_stderr, redirect_stdout
 import argparse
 import importlib.util
+import hashlib
 import json
 from io import StringIO
 import os
@@ -58,7 +59,22 @@ class SimulationRunnerContract(unittest.TestCase):
             manifests = list(Path(temp).rglob("manifest.json"))
             self.manifest = json.loads(manifests[0].read_text()) if manifests else None
             self.replays = [json.loads(path.read_text()) for path in Path(temp).glob("simulations/run-*/case-*/replay.json")]
+            self.results = [json.loads(path.read_text()) for path in Path(temp).glob("simulations/run-*/case-*/result.json")]
         return status, executed, output.getvalue()
+
+    def test_success_keeps_host_timings_after_trace_cleanup(self):
+        status, _, output = self.invoke("--filter", FAST)
+        self.assertEqual(status, 0, output)
+        self.assertEqual(self.traces, [])
+        self.assertEqual(self.manifest["cases"][0], self.results[0])
+        self.assertEqual(set(self.manifest["timings"]), {
+            "discovery_wall_seconds", "campaign_wall_seconds", "child_wall_seconds",
+            "reporting_wall_seconds", "runner_wall_seconds",
+        })
+        self.assertTrue(all(value >= 0 for value in self.manifest["timings"].values()))
+        self.assertTrue(all(item["wall_seconds"] >= 0 for item in self.manifest["discovery"]))
+        self.assertGreaterEqual(self.results[0]["evidence_wall_seconds"], 0)
+        self.assertIn("[simulation-timing]", output)
 
     def test_exact_exception_does_not_exclude_other_fast_cases(self):
         status, executed, output = self.invoke("--skip", EXCEPTION)
@@ -101,12 +117,12 @@ class SimulationRunnerContract(unittest.TestCase):
                             for item in self.manifest["cases"]))
 
     def test_concise_result_and_replay_are_reported_outside_child(self):
-        with patch.object(RUNNER.time, "perf_counter", side_effect=[10.0, 12.5]):
-            status, executed, output = self.invoke("--filter", FAST, "--seed", "4711")
+        status, executed, output = self.invoke("--filter", FAST, "--seed", "4711")
         self.assertEqual(status, 0)
         self.assertEqual(len(executed), 1)
         self.assertIn("[simulation-run] cases=1 seeds=1 jobs=1", output)
-        self.assertIn(f"[simulation-result] PASS {FAST} seed=4711 wall_seconds=2.500", output)
+        self.assertRegex(output, rf"\[simulation-result\] PASS {FAST} seed=4711 wall_seconds=\d+\.\d{{3}}")
+        self.assertGreaterEqual(self.results[0]["wall_seconds"], 0)
         self.assertEqual(self.replays[0]["selection"]["from_seed"], 4711)
         self.assertEqual(self.replays[0]["selection"]["filter"], FAST)
         self.assertIn("--replay-bundle", output)
@@ -222,7 +238,13 @@ if os.environ.get("EXPECT_HISTORY"):
 if os.environ.get("EMIT_HISTORY"):
     outputs = Path(os.environ["TEST_UNDECLARED_OUTPUTS_DIR"])
     (outputs / "claim.original.history").write_text("original history")
+    (outputs / "claim.nearby.history").write_text("nearby semantic variation")
+    (Path(os.environ["TEST_TMPDIR"]) / "unrelated.reduced.history").write_text("not the replay input")
     (outputs / "claim.reduced.history").write_text(os.environ["EMIT_HISTORY"])
+    if os.environ.get("EXTRA_REDUCTION"):
+        (outputs / "second.reduced.history").write_text("ambiguous reduction")
+if os.environ.get("LINK_ARTIFACT"):
+    (Path(os.environ["TEST_UNDECLARED_OUTPUTS_DIR"]) / "linked-artifact").symlink_to(os.environ["LINK_ARTIFACT"])
 if os.environ.get("FAIL_CASE") == name:
     print("full failure context\\n" * 100)
     sys.exit(7)
@@ -395,6 +417,11 @@ class SimulationProcessesContract(unittest.TestCase):
             concrete = case / replay["history"]["path"]
             self.assertEqual(concrete.read_text(), "reduced concrete history")
             self.assertEqual((case / "outputs/claim.original.history").read_text(), "original history")
+            for name, expected in [("claim.original.history", "original history"),
+                                   ("claim.nearby.history", "nearby semantic variation"),
+                                   ("claim.reduced.history", "reduced concrete history")]:
+                self.assertEqual(manifest["cases"][0]["artifact_checksums"]["outputs/" + name],
+                                 hashlib.sha256(expected.encode()).hexdigest())
             shutil.rmtree(root)
             result = self.run_fixture(fresh, "--replay-bundle", str(case),
                 env={"PULSEBEAM_SIM_HISTORY": "/missing/ambient.history", "EXPECT_HISTORY": "reduced concrete history", "FAIL_CASE": "tests::first"})
@@ -406,6 +433,47 @@ class SimulationProcessesContract(unittest.TestCase):
             result = self.run_fixture(fresh, "--replay-bundle", str(case))
             self.assertEqual(result.returncode, 1)
             self.assertIn("history input checksum mismatch", result.stderr)
+
+    def test_retention_errors_preserve_the_child_failure_and_complete_trace(self):
+        for kind, message in [("ambiguous", "ambiguous concrete history"),
+                              ("external-link", "inside owned outputs")]:
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                external = root / "external"
+                external.write_text("do not capture external bytes")
+                env = {"FAIL_CASE": "tests::first", "EMIT_HISTORY": "reduced"}
+                env.update({"EXTRA_REDUCTION": "1"} if kind == "ambiguous" else {"LINK_ARTIFACT": str(external)})
+                result = self.run_fixture(root, "--exact", "--filter", "tests::first", env=env)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                bundle = next(root.glob("simulations/run-*"))
+                manifest = json.loads((bundle / "manifest.json").read_text())
+                record = manifest["cases"][0]
+                self.assertEqual(manifest["status"], "infrastructure")
+                self.assertEqual(record["failure"], "exit")
+                self.assertEqual(record["exit_status"], 7)
+                self.assertIn(message, record["evidence_error"])
+                self.assertNotIn("history", record)
+                self.assertEqual((bundle / "case-0000/trace.log").read_text().count("full failure context"), 100)
+                self.assertNotIn(external.read_text(), json.dumps(record))
+
+    def test_replay_rejects_unsupported_versions_without_discovery(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            result = self.run_fixture(root, "--exact", "--filter", "tests::first")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            bundle = next(root.glob("simulations/run-*"))
+            for version in [2, True]:
+                replay = json.loads((bundle / "replay.json").read_text())
+                replay["version"] = version
+                (bundle / "replay.json").write_text(json.dumps(replay))
+                result = self.run_fixture(root, "--replay-bundle", str(bundle))
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn("unsupported replay bundle version", result.stderr)
+                artifact_root = next(line.split(" ", 1)[1] for line in result.stdout.splitlines()
+                                     if line.startswith("[simulation-artifacts] "))
+                manifest = json.loads((Path(artifact_root) / "manifest.json").read_text())
+                self.assertEqual(manifest["status"], "infrastructure")
+                self.assertEqual(manifest["discovery"], [])
 
     def test_provenance_input_and_evidence_errors_are_infrastructure_failures(self):
         with tempfile.TemporaryDirectory() as temp:

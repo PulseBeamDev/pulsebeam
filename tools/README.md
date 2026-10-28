@@ -144,6 +144,10 @@ Cargo compilation is not a supported patched build path.
 - `run-simulations.py` preserves nextest-style per-case process isolation and
   slow namespace selection with libtest, including seed replay and advisory
   windows. It runs actual Bazel-built test binaries, not Cargo commands.
+  Its owned bundles retain host timing and checksummed failure artifacts,
+  including concrete history inputs. Evidence-retention errors remain separate
+  from the child failure phase. See the [evidence and replay contract](../crates/pulsebeam-simulator/docs/simulation.md#retain-and-replay-generated-failures).
+  These diagnostics do not introduce SDK observations or private-state oracles.
 - Two bounded `rules_rust` patches keep its editor setup/discovery/flycheck
   ownership: setup supplies declared tool paths through upstream launchers,
   forwards tool runtime closures, and emits saved-file checks/default formatting;

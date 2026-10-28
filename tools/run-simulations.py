@@ -102,8 +102,8 @@ class Bundle:
         if args.replay_bundle:
             source = Path(args.replay_bundle).resolve()
             replay = json.loads((source / "replay.json").read_text())
-            if replay["version"] != self.replay_version:
-                raise ValueError("unsupported replay provenance; SFU variants require //crates/pulsebeam-simulator:calibration_replay")
+            if type(replay["version"]) is not int or replay["version"] != self.replay_version:
+                raise ValueError("unsupported replay bundle version; SFU variants require //crates/pulsebeam-simulator:calibration_replay")
             if replay["candidate"] != self.manifest["candidate"]:
                 raise ValueError("replay requires the recorded actual source candidate (revision, dirty state and fingerprint)")
             for key in SELECTION:
@@ -175,12 +175,14 @@ def names(binary, bundle, seed_label, timeout, *flags):
     log = bundle.root / ("discovery-ignored.log" if "--ignored" in flags else "discovery.log")
     outputs = bundle.root / (log.stem + "-outputs")
     outputs.mkdir()
+    started = time.perf_counter()
     with log.open("w") as trace:
         trace.write(f"case=discovery seed={seed_label}\n")
         status, category = run_process(command, trace, timeout=timeout,
                                        env=bundle.env | {"TEST_UNDECLARED_OUTPUTS_DIR": str(outputs)})
     bundle.manifest["discovery"].append({"command": command, "status": status,
-                                        "failure": category or None, "trace": log.name if category else None})
+                                        "failure": category or None, "trace": log.name if category else None,
+                                        "wall_seconds": time.perf_counter() - started})
     bundle.save()
     if category:
         bundle.manifest["status"] = "failed"
@@ -254,32 +256,49 @@ def execute(args, bundle, assess=None):
                                             trace, env=env, timeout=args.case_timeout)
         record.update(status="failed" if category else "passed", exit_status=status, failure=category,
                       wall_seconds=time.perf_counter() - started)
-        # Preserve all files emitted under the owned case output boundary on
-        # failure, including corpora and concrete scenarios if a case emits them.
-        record["artifacts"] = [str(path.relative_to(directory)) for path in sorted(outputs.rglob("*")) if path.is_file()] if category else []
-        if category:
-            histories = sorted(outputs.rglob("*.reduced.history"))
-            if len(histories) > 1:
-                raise ValueError("ambiguous concrete history replay inputs")
-            if histories:
-                history = histories[0]
-                captured = {"path": str(history.relative_to(bundle.root)),
-                            "sha256": hashlib.sha256(history.read_bytes()).hexdigest()}
-                selection = json.loads((directory / "replay.json").read_text())["selection"]
-                record["replay"] = bundle.replay(directory, selection, history=captured)
-                record["history"] = captured
+        evidence_started = time.perf_counter()
+        record["artifacts"] = []
+        if category or assess is not None:
+            # Keep the original semantic input, reductions and supplied nearby
+            # variations, not just RNG states or a chosen reduced replay input.
+            try:
+                files = [path for path in sorted(outputs.rglob("*")) if path.is_file()]
+                if any(path.is_symlink() or not path.resolve().is_relative_to(outputs.resolve()) for path in files):
+                    raise ValueError("case artifacts must stay inside owned outputs")
+                record["artifacts"] = [str(path.relative_to(directory)) for path in files]
+                record["artifact_checksums"] = {}
+                for path in files:
+                    with path.open("rb") as artifact:
+                        record["artifact_checksums"][str(path.relative_to(directory))] = hashlib.file_digest(artifact, "sha256").hexdigest()
+                histories = sorted(outputs.glob("*.reduced.history")) if category else []
+                if len(histories) > 1:
+                    raise ValueError("ambiguous concrete history replay inputs")
+                if histories:
+                    history = histories[0]
+                    captured = {"path": str(history.relative_to(bundle.root)),
+                                "sha256": record["artifact_checksums"][str(history.relative_to(directory))]}
+                    selection = json.loads((directory / "replay.json").read_text())["selection"]
+                    record["replay"] = bundle.replay(directory, selection, history=captured)
+                    record["history"] = captured
+            except (OSError, ValueError) as error:
+                record["evidence_error"] = str(error)
         if assess is not None:
-            record["child_failure"] = record["failure"]
+            record["child_failure"] = category
             record.update(assess(record, outputs))
-            record["artifacts"] = [str(path.relative_to(directory)) for path in sorted(outputs.rglob("*")) if path.is_file()]
+        if record.get("evidence_error"):
+            record["status"] = "failed"
+        record["evidence_wall_seconds"] = time.perf_counter() - evidence_started
         write_json(directory / "result.json", record)
         return index, record, log
 
     failed = False
+    campaign_started = time.perf_counter()
+    reporting_seconds = 0.0
     with ThreadPoolExecutor(max_workers=args.jobs) as executor:
         futures = [executor.submit(run, index) for index in range(len(cases))]
         for future in as_completed(futures):
             index, record, log = future.result()
+            report_started = time.perf_counter()
             bundle.manifest["cases"][index] = record
             # Only this thread emits traces, so metrics stay adjacent to results.
             with log.open(errors="replace") as trace:
@@ -287,18 +306,27 @@ def execute(args, bundle, assess=None):
                     if args.show_output or line.startswith(("[simulation-generated]", "[simulation-premise]")):
                         sys.stdout.write(line)
             seed_label = "committed" if record["seed"] is None else str(record["seed"])
-            outcome = "FAIL" if record["failure"] else "PASS"
+            outcome = "FAIL" if record["failure"] or record.get("evidence_error") else "PASS"
             print(f"[simulation-result] {outcome} {record['case']} seed={seed_label} wall_seconds={record['wall_seconds']:.3f}", flush=True)
             print(f"Replay: {record['replay']}", flush=True)
-            if record["failure"]:
+            if record["failure"] or record.get("evidence_error"):
                 failed = True
                 if record["failure"] == "timeout":
                     print(f"Host timeout: {args.case_timeout:g}s; child process group terminated", flush=True)
+                if record.get("evidence_error"):
+                    print(f"[simulation-infrastructure] {record['case']}: {record['evidence_error']}", flush=True)
                 print(f"Failure trace: {log}", flush=True)
             elif assess is None:
                 log.unlink()
                 shutil.rmtree(log.parent / "outputs")
-    bundle.manifest["status"] = "failed" if failed else "passed"
+            reporting_seconds += time.perf_counter() - report_started
+    bundle.manifest["timings"] = {
+        "campaign_wall_seconds": time.perf_counter() - campaign_started,
+        "child_wall_seconds": sum(item["wall_seconds"] for item in bundle.manifest["cases"]),
+        "reporting_wall_seconds": reporting_seconds,
+    }
+    bundle.manifest["status"] = ("infrastructure" if any(item.get("evidence_error") for item in bundle.manifest["cases"])
+                                 else "failed" if failed else "passed")
     bundle.save()
     return int(failed)
 
@@ -331,11 +359,18 @@ def main():
             parser.error("seed window must fit an unsigned 64-bit integer")
     validate()
     bundle = None
+    started = time.perf_counter()
     try:
         bundle = Bundle(args)
         bundle.prepare(args)
         validate()
-        return execute(args, bundle)
+        result = execute(args, bundle)
+        timings = bundle.manifest.setdefault("timings", {})
+        timings["discovery_wall_seconds"] = sum(item["wall_seconds"] for item in bundle.manifest["discovery"])
+        timings["runner_wall_seconds"] = time.perf_counter() - started
+        bundle.save()
+        print("[simulation-timing] " + " ".join(f"{key}={value:.3f}" for key, value in timings.items()), flush=True)
+        return result
     except (OSError, ValueError, KeyError, TypeError) as error:
         if bundle:
             bundle.infrastructure_error(error)
