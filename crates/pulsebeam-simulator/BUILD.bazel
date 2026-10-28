@@ -1,3 +1,4 @@
+load("//tools:calibration.bzl", "VARIANTS")
 load("//tools:simulation-provenance.bzl", "simulation_provenance")
 load("@crates//:defs.bzl", "aliases", "all_crate_deps", "crate_edition")
 load("@rules_rust//cargo:defs.bzl", "cargo_toml_env_vars", "extract_cargo_lints")
@@ -32,8 +33,8 @@ rust_library(
     ],
 )
 
-rust_test(
-    name = "test_binary",
+[rust_test(
+    name = "test_binary" if variant == "control" else "test_binary_" + variant,
     crate_name = "pulsebeam_simulator",
     crate_root = "src/main.rs",
     srcs = glob(["src/**/*.rs"]),
@@ -43,9 +44,11 @@ rust_test(
     lint_config = ":lints",
     rustc_env_files = [":cargo_env"],
     rustc_flags = ["-Copt-level=2", "-Cdebug-assertions=yes", "-Coverflow-checks=yes"],
-    aliases = aliases(normal_dev = True, proc_macro_dev = True),
+    aliases = aliases(normal_dev = True, proc_macro_dev = True) | {
+        ("//crates/pulsebeam:pulsebeam-sim" if variant == "control" else "//crates/pulsebeam:pulsebeam-sim-" + variant): "pulsebeam",
+    },
     deps = all_crate_deps(normal_dev = True) + [
-        "//crates/pulsebeam:pulsebeam-sim",
+        "//crates/pulsebeam:pulsebeam-sim" if variant == "control" else "//crates/pulsebeam:pulsebeam-sim-" + variant,
         "//crates/pulsebeam-core:pulsebeam-core-sim",
         "//crates/pulsebeam-runtime:pulsebeam-runtime-sim",
         "//crates/pulsebeam-testdata",
@@ -56,7 +59,7 @@ rust_test(
     ],
     proc_macro_deps = all_crate_deps(proc_macro_dev = True),
     tags = ["manual"],
-)
+) for variant in ["control"] + VARIANTS]
 
 # Target-local rustc_flags do not optimize dependencies. Apply the simulation
 # profile to the complete dependency closure without changing other owners.
@@ -74,12 +77,13 @@ platform(
     ],
 )
 
-platform_transition_filegroup(
-    name = "sim_binary",
+[platform_transition_filegroup(
+    name = "sim_binary" if variant == "control" else "sim_binary_" + variant,
     testonly = True,
-    srcs = [":test_binary"],
+    srcs = [":test_binary" if variant == "control" else ":test_binary_" + variant],
     target_platform = ":sim_platform",
-)
+    tags = ["manual"],
+) for variant in ["control"] + VARIANTS]
 
 # Reserve one CPU per isolated child, from the same budget used by the runner.
 SIMULATION_JOBS = 4
@@ -138,6 +142,36 @@ py_binary(
         "--runner-arg=" + arg for arg in REPLAY_ARGS + ["--jobs", "1", "--show-output"]
     ],
     data = [":replay", ":sim_binary", ":candidate", "//tools:scoreboard_parser"],
+)
+
+CALIBRATION_DATA = [":candidate", ":sim_binary"] + [":sim_binary_" + variant for variant in VARIANTS] + [
+    "//crates/pulsebeam:calibration-" + variant + "-provenance" for variant in VARIANTS
+]
+
+CALIBRATION_ARGS = CANDIDATE_ARGS + ["--control", "$(rootpath :sim_binary)"] + [
+    arg
+    for variant in VARIANTS
+    for arg in ["--variant", variant, "$(rootpath :sim_binary_" + variant + ")", "$(rootpath //crates/pulsebeam:calibration-" + variant + "-provenance)"]
+]
+
+py_test(
+    name = "calibration",
+    srcs = ["//tools:calibrate.py", "//tools:run-simulations.py"],
+    main = "//tools:calibrate.py",
+    args = CALIBRATION_ARGS,
+    data = CALIBRATION_DATA,
+    size = "large",
+    tags = ["manual", "cpu:1"],
+)
+
+py_binary(
+    name = "calibration_replay",
+    testonly = True,
+    srcs = ["//tools:calibrate.py", "//tools:run-simulations.py"],
+    main = "//tools:calibrate.py",
+    args = CALIBRATION_ARGS,
+    data = CALIBRATION_DATA,
+    tags = ["manual"],
 )
 
 rustfmt_test(name = "format", targets = [":test_binary"])

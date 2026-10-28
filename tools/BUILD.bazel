@@ -3,7 +3,7 @@ load("@rules_rust_wasm_bindgen//:defs.bzl", "rust_wasm_bindgen_toolchain")
 
 package(default_visibility = ["//visibility:public"])
 
-exports_files(["browser-matrix.json", "rust-pins.MODULE.bazel", "rust-metadata.bzl", "wasm-deps.bzl", "generators.toml", "run-simulations.py", "check-js-format.py", "scoreboard.py", "static-server.py", "cmake.sh"] + glob(["rust/**", "patches/**"]))
+exports_files(["browser-matrix.json", "rust-pins.MODULE.bazel", "rust-metadata.bzl", "wasm-deps.bzl", "generators.toml", "run-simulations.py", "calibrate.py", "check-js-format.py", "scoreboard.py", "static-server.py", "cmake.sh"] + glob(["rust/**", "patches/**"]))
 
 rust_wasm_bindgen_toolchain(
     name = "wasm_bindgen_toolchain_impl",
@@ -14,6 +14,20 @@ toolchain(
     name = "wasm_bindgen_toolchain",
     toolchain_type = "@rules_rust_wasm_bindgen//:toolchain_type",
     toolchain = ":wasm_bindgen_toolchain_impl",
+)
+
+py_binary(
+    name = "calibration_transform",
+    srcs = ["calibration-transform.py"],
+    main = "calibration-transform.py",
+)
+
+py_test(
+    name = "calibration_contract",
+    srcs = ["tests/calibration_test.py", "calibrate.py", "calibration-transform.py", "run-simulations.py"],
+    main = "tests/calibration_test.py",
+    data = ["//crates/pulsebeam:calibration_inputs", "//crates/pulsebeam-simulator:BUILD.bazel", "//:BUILD.bazel"],
+    env = {"PYTHONDONTWRITEBYTECODE": "1"},
 )
 
 py_test(

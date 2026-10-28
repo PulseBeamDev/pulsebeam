@@ -74,6 +74,8 @@ def run_process(command, trace, *, timeout, env=None):
 
 
 class Bundle:
+    replay_version = 1
+
     def __init__(self, args):
         # Even an explicit destination is a parent, never a shared mutable run.
         base = os.environ.get("TEST_UNDECLARED_OUTPUTS_DIR")
@@ -100,7 +102,9 @@ class Bundle:
         if args.replay_bundle:
             source = Path(args.replay_bundle).resolve()
             replay = json.loads((source / "replay.json").read_text())
-            if replay["version"] != 1 or replay["candidate"] != self.manifest["candidate"]:
+            if replay["version"] != self.replay_version:
+                raise ValueError("unsupported replay provenance; SFU variants require //crates/pulsebeam-simulator:calibration_replay")
+            if replay["candidate"] != self.manifest["candidate"]:
                 raise ValueError("replay requires the recorded actual source candidate (revision, dirty state and fingerprint)")
             for key in SELECTION:
                 setattr(args, key, replay["selection"][key])
@@ -193,7 +197,7 @@ def names(binary, bundle, seed_label, timeout, *flags):
     return selected
 
 
-def execute(args, bundle):
+def execute(args, bundle, assess=None):
     binary = str(Path(args.binary).resolve())
     seed_label = "committed" if args.from_seed is None else str(args.from_seed)
     ignored = names(binary, bundle, seed_label, args.discovery_timeout, "--ignored")
@@ -264,6 +268,10 @@ def execute(args, bundle):
                 selection = json.loads((directory / "replay.json").read_text())["selection"]
                 record["replay"] = bundle.replay(directory, selection, history=captured)
                 record["history"] = captured
+        if assess is not None:
+            record["child_failure"] = record["failure"]
+            record.update(assess(record, outputs))
+            record["artifacts"] = [str(path.relative_to(directory)) for path in sorted(outputs.rglob("*")) if path.is_file()]
         write_json(directory / "result.json", record)
         return index, record, log
 
@@ -287,7 +295,7 @@ def execute(args, bundle):
                 if record["failure"] == "timeout":
                     print(f"Host timeout: {args.case_timeout:g}s; child process group terminated", flush=True)
                 print(f"Failure trace: {log}", flush=True)
-            else:
+            elif assess is None:
                 log.unlink()
                 shutil.rmtree(log.parent / "outputs")
     bundle.manifest["status"] = "failed" if failed else "passed"

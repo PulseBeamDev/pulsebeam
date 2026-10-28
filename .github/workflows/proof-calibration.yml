@@ -1,0 +1,27 @@
+name: Public-contract proof calibration
+on:
+  schedule:
+    - cron: '0 5 * * 1'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  calibration:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/setup-ci
+      - name: Calibrate the finite SFU defects
+        run: ./bazel test //crates/pulsebeam-simulator:calibration --nocache_test_results --test_output=errors --zip_undeclared_test_outputs
+      - name: Retain control, variant and infrastructure evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: proof-calibration-evidence
+          path: |
+            bazel-testlogs/crates/pulsebeam-simulator/calibration/test.log
+            bazel-testlogs/crates/pulsebeam-simulator/calibration/test.xml
+            bazel-testlogs/crates/pulsebeam-simulator/calibration/test.outputs/outputs.zip
+          include-hidden-files: true
+          if-no-files-found: warn
