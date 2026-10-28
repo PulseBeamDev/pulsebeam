@@ -37,7 +37,24 @@ dependencies.
 
 ## CI
 
-The OSS CI has no privileged kernel steering job. Root `./bazel test //:fast` covers
-static checks and fast owner tests; `./bazel test //:slow` covers the slower browser
-and simulation gates. Any proprietary steering implementation owns its own
-build, verifier, capability, and attach/load tests outside this repository.
+Complete acceptance requires a Linux host with working IPv4 and IPv6 loopback,
+a dual-stack UDP listener, `UDP_SEGMENT` and `UDP_GRO` support. IPv6 must be
+enabled on `lo`; global/routed IPv6, hardware NIC offload and privileged
+network setup are not required. If a required capability is unavailable, use
+an appropriately configured host/kernel. The tests report unsupported capability
+as a failure and never change sysctls or silently skip it.
+
+Root `./bazel test //:check` includes
+`//crates/pulsebeam-runtime:transport_conformance` for actual packet/offload
+contracts and `//crates/pulsebeam:transport_conformance` for one concurrent
+dual-family SDK/SFU witness. The latter supplies explicit loopback interfaces
+but retains real native OS sockets. It does not certify stock deployed
+interface discovery or global IPv6. Connection/family evidence, recipient
+payloads and cleanup have bounded event-driven operation deadlines of 30, 30
+and 10 seconds; these are infrastructure limits, not application SLAs.
+
+`//:fast` retains fallback/component/simulation proof and the distinct stock
+production-native media witness. `//:slow` covers browser and broader simulation
+gates; `//:test` includes all three routes. The OSS CI has no privileged kernel
+steering job. Any proprietary steering implementation owns its own build,
+verifier, capability and attach/load tests outside this repository.

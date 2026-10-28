@@ -54,8 +54,10 @@ pub mod track;
 #[cfg(test)]
 #[ctor::ctor(unsafe)]
 fn init() {
-    let _ = tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::DEBUG)
-        .with_test_writer()
-        .try_init();
+    let subscriber = tracing_subscriber::fmt().with_test_writer();
+    #[cfg(feature = "transport-conformance")]
+    let subscriber = subscriber.with_env_filter("warn,pulsebeam::node=info");
+    #[cfg(not(feature = "transport-conformance"))]
+    let subscriber = subscriber.with_max_level(tracing::Level::DEBUG);
+    let _ = subscriber.try_init();
 }

@@ -639,7 +639,7 @@ impl UdpTransportWriter {
 mod tests {
     // Tests assert by panicking; the process ending is the mechanism.
     use super::*;
-    use crate::net::{SendPacket, SendPacketBatch};
+    use crate::net::{ReceiveTime, SendPacket, SendPacketBatch};
     use std::{net::SocketAddr, time::Duration};
     use tokio::net::UdpSocket;
 
@@ -684,11 +684,15 @@ mod tests {
 
     #[tokio::test]
     async fn dual_stack_reader_preserves_actual_ipv4_and_ipv6_destinations() {
-        let mut transport = bind("[::]:0".parse().unwrap(), None).await.unwrap();
+        let mut transport = bind("[::]:0".parse().unwrap(), None).await.expect(
+            "UNSUPPORTED: dual-stack UDP; enable IPv6 and IPv4/IPv6 loopback on this Linux test host",
+        );
         let port = transport.local_addr().port();
 
         let v4 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let v6 = UdpSocket::bind("[::1]:0").await.unwrap();
+        let v6 = UdpSocket::bind("[::1]:0")
+            .await
+            .expect("UNSUPPORTED: IPv6 loopback; enable IPv6 on lo in the Linux test host");
 
         v4.send_to(b"v4", SocketAddr::from(([127, 0, 0, 1], port)))
             .await
@@ -717,6 +721,9 @@ mod tests {
             v6_batch.dst,
             SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), port)
         );
+        assert_eq!(v4_batch.src, v4.local_addr().unwrap());
+        assert_eq!(v6_batch.src, v6.local_addr().unwrap());
+        println!("EXERCISED real IPv4/IPv6 payload, source and actual destination integrity");
     }
 
     #[tokio::test]
@@ -857,19 +864,74 @@ mod tests {
         }
     }
 
+    #[derive(Debug, PartialEq, Eq)]
+    enum OffloadOutcome {
+        Exercised,
+        Unsupported(&'static str),
+        Failed(&'static str),
+    }
+
+    fn offload_outcome(gso: bool, gro: bool, aggregate: bool, payload: bool) -> OffloadOutcome {
+        if !gso {
+            OffloadOutcome::Unsupported(
+                "UDP_SEGMENT: use a Linux kernel/loopback supporting UDP segmentation",
+            )
+        } else if !gro {
+            OffloadOutcome::Unsupported(
+                "UDP_GRO: use a Linux kernel/loopback supporting UDP receive offload",
+            )
+        } else if !aggregate {
+            OffloadOutcome::Failed("UDP_GRO ancillary segment result was not exercised")
+        } else if !payload {
+            OffloadOutcome::Failed("offloaded payload/source/destination/segment integrity")
+        } else {
+            OffloadOutcome::Exercised
+        }
+    }
+
+    #[test]
+    fn strict_offload_policy_rejects_unexercised_capabilities() {
+        assert_eq!(
+            offload_outcome(true, true, true, true),
+            OffloadOutcome::Exercised
+        );
+        for (gso, gro, aggregate, payload) in [
+            (false, true, true, true),
+            (true, false, true, true),
+            (true, true, false, true),
+            (true, true, true, false),
+        ] {
+            assert_ne!(
+                offload_outcome(gso, gro, aggregate, payload),
+                OffloadOutcome::Exercised
+            );
+        }
+        assert!(matches!(
+            offload_outcome(false, true, false, false),
+            OffloadOutcome::Unsupported(_)
+        ));
+        assert!(matches!(
+            offload_outcome(true, true, false, true),
+            OffloadOutcome::Failed(_)
+        ));
+    }
+
     #[tokio::test]
     async fn gso_gro_preserves_a_full_segment_batch() {
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
         let mut sender = bind(addr, None).await.unwrap();
         let mut receiver = bind(addr, None).await.unwrap();
-        if sender.max_gso_segments() == SINGLE_SEGMENT || !receiver.reader.gro_enabled() {
-            return;
+        let gso = sender.max_gso_segments() > SINGLE_SEGMENT;
+        let gro = receiver.reader.gro_enabled();
+        if !gso || !gro {
+            panic!(
+                "UNSUPPORTED required offload: {:?}",
+                offload_outcome(gso, gro, false, false)
+            );
         }
 
-        let segment_size = MAX_UDP_PAYLOAD_SIZE;
-        let segment_count = sender
-            .max_gso_segments()
-            .min(MAX_UDP_GSO_PAYLOAD_SIZE / segment_size);
+        let segment_count = sender.max_gso_segments().min(UDP_MAX_GSO_SEGMENTS);
+        let segment_size = (MAX_UDP_GSO_PAYLOAD_SIZE / segment_count).min(MAX_UDP_PAYLOAD_SIZE);
         let mut payload = vec![0; segment_size * segment_count];
         for (index, segment) in payload.chunks_exact_mut(segment_size).enumerate() {
             segment.fill(u8::try_from(index % 256).expect("masked to a byte"));
@@ -880,31 +942,69 @@ mod tests {
             segment_size,
         }];
 
-        sender.writable().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), sender.writable())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(
             sender
                 .try_send_batch(&SendPacketBatch { packets: &packets })
                 .unwrap(),
-            1
+            1,
+            "FAILED: actual UDP_SEGMENT send"
         );
-
-        receiver.readable().await.unwrap();
+        let before = ReceiveTime::now();
         let mut batches = Vec::new();
-        receiver.try_recv_batch(&mut batches).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while batches
+                .iter()
+                .map(|batch: &RecvPacketBatch| batch.len)
+                .sum::<usize>()
+                < payload.len()
+            {
+                receiver.readable().await.unwrap();
+                receiver.try_recv_batch(&mut batches).unwrap();
+            }
+        })
+        .await
+        .expect("FAILED: required UDP_SEGMENT/UDP_GRO payload receive deadline");
+        let after = ReceiveTime::now();
+        let aggregate = batches
+            .iter()
+            .any(|batch| batch.stride == segment_size && batch.len > batch.stride);
         let mut received = Vec::new();
+        let mut valid = true;
         for batch in &mut batches {
+            valid &= batch.src == sender.local_addr()
+                && batch.dst == receiver.local_addr()
+                && batch.stride == segment_size
+                && batch.len.is_multiple_of(segment_size)
+                && batch.received_at.monotonic >= before.monotonic
+                && batch.received_at.monotonic <= after.monotonic;
+            let timestamp = batch.received_at;
             while let Some(packet) = batch.next_packet() {
                 received.push(packet.to_vec());
             }
-        }
-
-        assert_eq!(received.len(), segment_count);
-        for (index, packet) in received.iter().enumerate() {
             assert_eq!(
-                packet,
-                &vec![u8::try_from(index % 256).expect("masked to a byte"); segment_size]
+                batch.received_at, timestamp,
+                "receive clock changed during segment iteration"
             );
         }
+        // UDP arrival order is not a contract. Every complete marked segment is.
+        received.sort();
+        let mut expected: Vec<_> = payload
+            .chunks_exact(segment_size)
+            .map(<[u8]>::to_vec)
+            .collect();
+        expected.sort();
+        valid &= received == expected;
+        assert_eq!(
+            offload_outcome(gso, gro, aggregate, valid),
+            OffloadOutcome::Exercised
+        );
+        println!(
+            "EXERCISED actual UDP_SEGMENT payload and UDP_GRO ancillary segment boundaries: {segment_count} segments"
+        );
     }
 
     #[tokio::test]
@@ -947,48 +1047,6 @@ mod tests {
                 packet
                     .iter()
                     .all(|&byte| byte == u8::try_from(index % 256).expect("masked to a byte"))
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn gro_preserves_a_full_receive_aggregate() {
-        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let mut receiver = bind(addr, None).await.unwrap();
-        if !receiver.reader.gro_enabled() {
-            return;
-        }
-        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-
-        for index in 0..UDP_MAX_GSO_SEGMENTS {
-            let payload =
-                vec![u8::try_from(index % 256).expect("masked to a byte"); MAX_UDP_PAYLOAD_SIZE];
-            sender
-                .send_to(&payload, receiver.local_addr())
-                .await
-                .unwrap();
-        }
-
-        let mut received = Vec::with_capacity(UDP_MAX_GSO_SEGMENTS);
-        while received.len() < UDP_MAX_GSO_SEGMENTS {
-            tokio::time::timeout(Duration::from_millis(250), receiver.readable())
-                .await
-                .unwrap()
-                .unwrap();
-            let mut batches = Vec::new();
-            receiver.try_recv_batch(&mut batches).unwrap();
-            for batch in &mut batches {
-                while let Some(packet) = batch.next_packet() {
-                    received.push(packet.to_vec());
-                }
-            }
-        }
-
-        assert_eq!(received.len(), UDP_MAX_GSO_SEGMENTS);
-        for (index, packet) in received.iter().enumerate() {
-            assert_eq!(
-                packet,
-                &vec![u8::try_from(index % 256).expect("masked to a byte"); MAX_UDP_PAYLOAD_SIZE]
             );
         }
     }

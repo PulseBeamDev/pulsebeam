@@ -25,6 +25,8 @@ mod native_packet_diagnostics;
 mod native_peer;
 mod native_receiver;
 mod native_source;
+#[cfg(feature = "transport-conformance")]
+mod qualification_network;
 
 pub use native_actor::*;
 pub use native_media::*;

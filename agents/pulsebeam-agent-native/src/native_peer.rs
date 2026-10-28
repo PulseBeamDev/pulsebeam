@@ -155,7 +155,16 @@ impl<R: rtc::SessionRuntime> NativePeer<R> {
             }
         }
         let mut session = native_media::session(runtime, config.audio_input, config.video_input)?;
+        #[cfg(not(feature = "transport-conformance"))]
         let peer = session.create_peer(rtc::PeerConfiguration::default())?;
+        #[cfg(feature = "transport-conformance")]
+        let peer = {
+            session.set_factory_options(rtc::FactoryOptions {
+                ignored_network_adapters: rtc::NetworkAdapterMask::NONE,
+                ..Default::default()
+            })?;
+            session.create_peer_with_configuration(crate::qualification_network::configuration())?
+        };
         let mut channels = BTreeMap::new();
         let mut channel_bindings = Vec::new();
         let mut signaling_channel = None;

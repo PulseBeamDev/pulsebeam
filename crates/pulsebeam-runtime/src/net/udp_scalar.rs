@@ -231,6 +231,54 @@ mod batch_shape_tests {
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].received_at, received_at);
         assert_eq!(out[1].received_at, later);
+
+        for (dst, src, mode, bytes) in [
+            (
+                "192.168.1.2:3478".parse().unwrap(),
+                source,
+                UdpMode::Batch,
+                vec![13; 4],
+            ),
+            (
+                destination,
+                "192.168.1.21:49152".parse().unwrap(),
+                UdpMode::Batch,
+                vec![14; 4],
+            ),
+            (destination, source, UdpMode::Scalar, vec![15; 4]),
+            (destination, source, UdpMode::Batch, vec![16; 3]),
+        ] {
+            let mut batches = Vec::new();
+            UdpTransportReader::append_datagram(
+                &mut batches,
+                destination,
+                source,
+                vec![1; 4],
+                true,
+                UdpMode::Batch,
+                received_at,
+            );
+            UdpTransportReader::append_datagram(
+                &mut batches,
+                dst,
+                src,
+                bytes.clone(),
+                true,
+                mode,
+                received_at,
+            );
+            assert_eq!(
+                batches.len(),
+                2,
+                "different packet contracts must not coalesce"
+            );
+            assert_eq!(batches[1].src, src);
+            assert_eq!(batches[1].dst, dst);
+            assert_eq!(batches[1].transport, Transport::Udp(mode));
+            assert_eq!(batches[1].next_packet(), Some(bytes.as_slice()));
+            assert_eq!(batches[1].next_packet(), None);
+            assert_eq!(batches[1].received_at, received_at);
+        }
     }
 }
 
@@ -331,6 +379,8 @@ impl UdpTransportReader {
         if gro_enabled && let Some(previous) = out.last_mut() {
             let datagrams = previous.len.div_ceil(previous.stride);
             if previous.src == src
+                && previous.dst == dst
+                && previous.transport == Transport::Udp(mode)
                 && previous.received_at == received_at
                 && previous.stride == len
                 && datagrams < crate::net::UDP_MAX_GSO_SEGMENTS

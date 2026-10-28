@@ -419,5 +419,11 @@ pub(crate) fn session<R: rtc::SessionRuntime>(
     {
         builder = builder.event_log_factory(crate::native_packet_diagnostics::Factory::new());
     }
+    #[cfg(feature = "transport-conformance")]
+    {
+        builder = builder.network_manager_factory(&rtc::NetworkManagerFactory::from_provider(
+            crate::qualification_network::LoopbackInterfaces,
+        ));
+    }
     builder.video_decoder_factory(&decoder).build()
 }

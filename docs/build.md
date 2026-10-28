@@ -199,6 +199,26 @@ because they cost more. Executable owner targets define exact membership. The
 Web browser owner needs pinned tooling, built Web artifacts and owned local
 SFU/assets, but no Meet export or React acceptance fixture.
 
+### Required Linux transport host
+
+Root `//:check` and complete `//:test` require IPv4/IPv6 loopback, dual-stack
+UDP and actual UDP segmentation/GRO payload exercise. The runtime
+`//crates/pulsebeam-runtime:transport_conformance` owner covers raw packet
+contracts. `//crates/pulsebeam:transport_conformance` adds one production SFU
+with concurrent threaded native IPv4/IPv6 selected pairs and bidirectional
+recipient application payloads. Missing capability, missing evidence or failed
+cleanup fails qualification rather than passing as a skip.
+
+Use a Linux host with IPv6 enabled on loopback and kernel UDP offload support.
+No routed/global IPv6, hardware NIC, sysctl mutation or privileged test networking
+is required. The SDK witness supplies explicit loopback interface enumeration,
+not a virtual packet network; stock native interface discovery retains its
+separate production-native proof. Simulation still owns behavioral matrices,
+while these small real-boundary witnesses catch kernel and native socket/family
+integration regressions it cannot establish. See the
+[server host contract](https://github.com/PulseBeamDev/pulsebeam/blob/main/crates/pulsebeam/docs/linux-only.md#ci) and
+[native claim boundaries](https://github.com/PulseBeamDev/pulsebeam/blob/main/agents/pulsebeam-agent-native/QUALIFICATION.md).
+
 ### Choose proof that earns its cost
 
 Choose the smallest deterministic, faithful proof in this default order: **unit,

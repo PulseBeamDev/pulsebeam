@@ -72,6 +72,8 @@ zerocopy = { version = "0.8.56", features = ["derive"] }
 parking_lot = "0.12.5"
 
 [dev-dependencies]
+pulsebeam-agent-native = { path = "../../agents/pulsebeam-agent-native", features = ["transport-conformance"] }
+reqwest = "0.13.4"
 str0m = { workspace = true }
 pulsebeam-server = { path = "../../server/rust" }
 pulsebeam-core = { path = "../pulsebeam-core", features = [
@@ -99,3 +101,4 @@ default = []
 unpace = []
 parking_lot = ["pulsebeam-runtime/parking_lot"]
 sim = ["pulsebeam-core/sim", "pulsebeam-runtime/sim"]
+transport-conformance = []

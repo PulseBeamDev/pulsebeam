@@ -87,11 +87,23 @@ to select affected checks and reuse unchanged evidence.
 | --- | --- |
 | Sys codec/runtime behavior, native linking and lifetime | `//crates/pulsebeam-libwebrtc-sys:fast`, `:runtime_tests`, `:lifetime` in separate core/native configurations |
 | Native API, admission, controls and lifecycle components | `//agents/pulsebeam-agent-native:unit_tests`, `:format`, `:clippy` |
-| Current dynamic ABI, generated Python use, real-SFU I420 media and retirement | `//crates/pulsebeam-cli:production_native` |
+| Current dynamic ABI, generated Python use, real-SFU I420 media and retirement with stock native discovery | `//crates/pulsebeam-cli:production_native` |
+| Concurrent real IPv4/IPv6 ICE selection and bidirectional application topics | `//crates/pulsebeam:transport_conformance` |
 | Generated Swift/Kotlin/Python artifacts and native library variants | `//agents/pulsebeam-agent-native:bindings`, `:native_static`, `:pulsebeam-agent-native-sim` |
 | Shared controlled/native RTC interoperability | `//crates/pulsebeam-rtc/simulation:interop` |
 | Web artifact/type/runtime contracts | `//agents/pulsebeam-agent-web:node_runtime_tests`, `:uniffi_types`, `:public_contract` |
 | Irreducible browser glue against the local SFU | `//agents/pulsebeam-agent-web:browser` |
+
+The dual-stack owner uses a test-only native library variant with explicit
+IPv4/IPv6 loopback enumeration through the existing network-manager provider.
+It retains threaded execution, stock OS packet sockets, ICE/DTLS/SCTP and the
+production SFU. Only that variant removes the loopback adapter ignore mask and
+enables IPv6 gathering; shipping constructors, configuration and packaging are
+unchanged. Its claim is real loopback connectivity with supplied interfaces,
+not default deployed discovery, routed/global IPv6, media quality or ordered
+topic recovery. The stock production-native witness remains a separate boundary.
+The [Linux test-host prerequisites](../../crates/pulsebeam/docs/linux-only.md#ci)
+are mandatory in complete acceptance.
 
 The existing simulator replay owner also includes distinct focused scenarios:
 

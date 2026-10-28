@@ -17,6 +17,8 @@ crate-type = ["cdylib", "rlib", "staticlib"]
 [features]
 bindgen = ["uniffi/cargo-metadata", "uniffi/cli"]
 sim = ["pulsebeam-core/sim", "agent_core/sim"]
+# Private owner qualification variant, never enabled by packaging targets.
+transport-conformance = []
 
 [dependencies]
 agent_core = { package = "pulsebeam-agent-core", version = "0.1.0", path = "../pulsebeam-agent-core" }

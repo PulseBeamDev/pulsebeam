@@ -27,7 +27,14 @@ remain separate and unchanged
 through queueing and shard handoffs.
 
 Run focused crate tests while iterating. Before handoff, run root `./bazel test //:check`
-and `./bazel test //:test`. UDP steering is an extension point: higher layers can provide
+and `./bazel test //:test`. The production-configured owner target
+`//crates/pulsebeam:transport_conformance` uses one once-bound dual-stack UDP
+listener and two concurrent threaded native SDK peers. It requires actual
+IPv4/IPv6 HTTP candidate advertisements, selected-pair statistics and distinct
+bidirectional application topic payloads, followed by owned graph/node cleanup.
+Its explicit loopback interface enumeration is test-only, not qualification of
+default deployed interface discovery. See [Linux host requirements](docs/linux-only.md#ci).
+UDP steering is an extension point: higher layers can provide
 a `Steering` implementation through `NodeBuilder::with_steering`. Server development and profiling entrypoints are documented in
 [the Bazel workflow](../../docs/build.md). Privileged traffic shaping remains
 an optional manual diagnostic, not package preparation or acceptance.

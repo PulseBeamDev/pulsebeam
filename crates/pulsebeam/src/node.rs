@@ -348,15 +348,32 @@ mod shard_executor {
                 !matches!(self.execution, Execution::CurrentRuntime)
             }
 
-            /// Finish ownership of the data executor after the control tasks are
-            /// gone. TPC threads are joined; dropping WorkStealingRuntime starts
-            /// non-blocking runtime shutdown and cancels its shard tasks.
-            pub(in crate::node) fn finish(self) {
-                if let Execution::ThreadPerCore { threads, .. } = self.execution {
-                    for handle in threads {
-                        let _ = handle.join();
+            /// Join data execution off the control runtime. Returning acknowledges
+            /// task/socket retirement, not just initiation of background shutdown.
+            pub(in crate::node) async fn finish(self) -> Result<()> {
+                let execution = self.execution;
+                #[allow(
+                    clippy::disallowed_methods,
+                    reason = "node shutdown joins owned native executors, never on a shard or control thread"
+                )]
+                tokio::task::spawn_blocking(move || -> Result<()> {
+                    match execution {
+                        Execution::CurrentRuntime => {}
+                        Execution::ThreadPerCore { threads, .. } => {
+                            for handle in threads {
+                                handle
+                                    .join()
+                                    .map_err(|_| anyhow::anyhow!("data thread panicked"))?;
+                            }
+                        }
+                        Execution::WorkStealing { mut runtime } => {
+                            drop(runtime.runtime.take());
+                        }
                     }
-                }
+                    Ok(())
+                })
+                .await
+                .context("joining data executor")?
             }
         }
     }
@@ -400,7 +417,9 @@ mod shard_executor {
                 false
             }
 
-            pub(in crate::node) fn finish(self) {}
+            pub(in crate::node) async fn finish(self) -> Result<()> {
+                Ok(())
+            }
         }
     }
 
@@ -675,25 +694,34 @@ impl NodeBuilder {
 
     /// Consumes the builder and runs the node until `shutdown` is cancelled.
     pub async fn run(self, shutdown: CancellationToken) -> Result<()> {
-        let data_threads = self.data_threads;
-        let shard_runtime = self.shard_runtime;
-        let requested_shard_count = self.configured_shard_count();
-
         // Default to an IPv6-any listener and disable v6-only mode so one socket can serve
         // both IPv6 and IPv4 peers.
         let local_addr = self
             .local_addr
             .unwrap_or_else(|| SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), 0));
+        let advertised_addrs = self.advertised_udp_addrs()?;
+        let udp_sockets = bind_udp_sockets(
+            local_addr,
+            advertised_addrs.first().copied(),
+            self.configured_shard_count(),
+            self.udp_mode,
+        )
+        .await?;
+        self.run_bound(udp_sockets, advertised_addrs, shutdown)
+            .await
+    }
+
+    fn advertised_udp_addrs(&self) -> Result<Vec<SocketAddr>> {
         if self.external_addrs.is_empty() && !self.advertise_bound_udp {
             return Err(anyhow::anyhow!(
                 "NodeBuilder requires external addresses; call `.external_addrs(...)` or `.advertise_bound_udp()` for loopback :0"
             ));
         }
 
-        let advertised_addrs = self.external_addrs;
+        let advertised_addrs = self.external_addrs.iter().copied();
 
-        let mut deduped = Vec::with_capacity(advertised_addrs.len());
-        let mut seen = HashSet::with_capacity(advertised_addrs.len());
+        let mut deduped = Vec::with_capacity(self.external_addrs.len());
+        let mut seen = HashSet::with_capacity(self.external_addrs.len());
         for addr in advertised_addrs {
             if seen.insert(addr) {
                 deduped.push(addr);
@@ -723,6 +751,21 @@ impl NodeBuilder {
         let mut advertised_addrs = Vec::with_capacity(2);
         advertised_addrs.extend(v4_addrs);
         advertised_addrs.extend(v6_addrs);
+        Ok(advertised_addrs)
+    }
+
+    async fn run_bound(
+        self,
+        udp_sockets: Vec<net::BoundUdpSocket>,
+        advertised_addrs: Vec<SocketAddr>,
+        shutdown: CancellationToken,
+    ) -> Result<()> {
+        let data_threads = self.data_threads;
+        let shard_runtime = self.shard_runtime;
+        let requested_shard_count = self.configured_shard_count();
+        let local_addr = self
+            .local_addr
+            .unwrap_or_else(|| SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), 0));
         let primary_external_addr = advertised_addrs.first().copied();
 
         let mut control_tasks = JoinSet::new();
@@ -755,14 +798,6 @@ impl NodeBuilder {
                 "detected CPU cores for data-plane affinity"
             );
         }
-
-        let udp_sockets = bind_udp_sockets(
-            local_addr,
-            primary_external_addr,
-            requested_shard_count,
-            self.udp_mode,
-        )
-        .await?;
 
         debug_assert!(!udp_sockets.is_empty());
         let shard_count = udp_sockets.len();
@@ -1014,7 +1049,7 @@ impl NodeBuilder {
 
         // At this point the control task set has been consumed/dropped by the
         // select above. Finish the independently-owned data executor afterwards.
-        shard_executor.finish();
+        shard_executor.finish().await?;
 
         Ok(())
     }
@@ -1566,6 +1601,10 @@ mod internal {
         StatusCode::OK
     }
 }
+
+#[cfg(all(test, feature = "transport-conformance"))]
+#[path = "node/transport_conformance.rs"]
+mod transport_conformance;
 
 #[cfg(test)]
 mod tests {
