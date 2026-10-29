@@ -20,4 +20,6 @@ if [[ ! -f "$launcher" ]]; then
 fi
 echo "$sha  $launcher" | sha256sum --check --status || { echo "Corrupt launcher: remove $launcher and retry." >&2; exit 1; }
 export BAZELISK_SKIP_WRAPPER=1
-exec "$launcher" "$@"
+# Keep disposable output state with the checkout, including analyzer output-base siblings.
+workspace=$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")
+exec "$launcher" "--output_base=$workspace/.bazel/output" "$@"

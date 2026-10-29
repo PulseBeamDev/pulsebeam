@@ -1,6 +1,7 @@
 /target
 __pycache__/
 /bazel-*
+/.bazel/
 /.rules_rust_analyzer/
 /rust-project.json
 /agents/pulsebeam-agent-web/generated/

@@ -12,7 +12,8 @@ class LauncherContractTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
+        self.root = Path(self.temp.name) / "checkout with spaces"
+        self.root.mkdir()
         arch = "amd64" if os.uname().machine == "x86_64" else "arm64"
         source = Path(options.launcher).read_text()
         cache_name = re.search(r"/pulsebeam/(bazelisk-[0-9.]+-)", source).group(1) + arch
@@ -28,15 +29,37 @@ class LauncherContractTest(unittest.TestCase):
         self.binary.chmod(0o755)
         self.env = dict(os.environ, XDG_CACHE_HOME=str(cache))
 
-    def run_launcher(self, *arguments):
-        return subprocess.run([str(self.launcher), *arguments], env=self.env,
-                              capture_output=True)
+    def run_launcher(self, *arguments, cwd=None, launcher=None):
+        return subprocess.run([str(launcher or self.launcher), *arguments], env=self.env,
+                              cwd=cwd, capture_output=True)
+
+    def forwarded_arguments(self, result):
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        return result.stdout.decode().split("\0")[:-1]
+
+    @property
+    def output_base(self):
+        return f"--output_base={self.root}/.bazel/output"
+
+    def test_default_output_stays_in_checkout_from_nested_directory(self):
+        nested = self.root / "package"
+        nested.mkdir()
+        result = self.run_launcher("info", "output_base", cwd=nested)
+        self.assertEqual(self.forwarded_arguments(result),
+                         ["1", self.output_base, "info", "output_base"])
+
+    def test_symlinked_launcher_uses_real_checkout(self):
+        link = self.root.parent / "bazel-link"
+        link.symlink_to(self.launcher)
+        result = self.run_launcher("version", launcher=link)
+        self.assertEqual(self.forwarded_arguments(result),
+                         ["1", self.output_base, "version"])
 
     def test_normal_host_and_exact_argument_forwarding(self):
         arguments = ["--output_base=/tmp/with spaces", "test", "//:example", "--test_arg=quote ' \""]
         result = self.run_launcher(*arguments)
-        self.assertEqual(result.returncode, 0, result.stderr.decode())
-        self.assertEqual(result.stdout.decode().split("\0")[:-1], ["1", *arguments])
+        self.assertEqual(self.forwarded_arguments(result),
+                         ["1", self.output_base, *arguments])
 
     def test_corrupt_cached_launcher_fails_actionably(self):
         self.binary.write_bytes(b"corrupt")

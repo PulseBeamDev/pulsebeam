@@ -83,10 +83,31 @@ property. This persistent, per-user directory is shared by local worktrees and
 concurrent agents. Bazel supports concurrent cache readers/writers and validates
 artifact digests; no cache daemon, wrapper protocol or remote service is needed.
 
-Output state is **not** shared: the native workspace-hashed `output_base` retains
-separate servers, analysis state, execution roots and locks for each worktree.
-Do not configure a common `--output_base` or copy one worktree's output state into
-another. `clean --expunge` removes worktree output state, not the shared cache.
+Output state is **not** shared: `./bazel` defaults to the worktree-local
+`.bazel/output` directory for its `output_base`, with separate servers, analysis
+state, execution roots and locks. `.bazel/` is ignored by both Git and Bazel's
+package discovery. Removing the worktree, including with `git worktree remove`,
+removes its output state too. Stop active builds first; `./bazel shutdown` stops
+that worktree's server before removal. Shared caches remain available to other
+worktrees and need their own retention policy.
+
+Use `./bazel clean --expunge` to discard output state without deleting the
+worktree. Explicit `--output_base` startup arguments still override the local
+default; outputs outside the worktree are then your responsibility. Do not
+configure a common output base or copy one worktree's output state into another.
+
+Existing output bases under `~/.cache/bazel/_bazel_<user>/` are not moved or
+automatically deleted. The first run with the local layout recreates output
+state using the shared caches. For a one-time cleanup, identify an old output
+base by its `DO_NOT_BUILD_HERE` file, which records its workspace path. Confirm
+that no build needs it, then run from a surviving checkout:
+
+```sh
+./bazel --output_base=/absolute/path/to/old-output-base clean --expunge
+```
+
+This also works for output bases whose worktrees were already deleted. Clean
+only individually identified output bases, not the whole user cache directory.
 
 Declared SDK/browser files, toolchains and action arguments remain part of the
 action keys. The cache does not weaken checks or make results from a different

@@ -9,6 +9,9 @@ build framework or an alternative package compilation pipeline.
 idle shutdown under low system memory. This limits memory retained across
 worktrees while preserving server reuse during active development. Each worktree
 needs the updated configuration; disk caches remain available after shutdown.
+The launcher keeps disposable output state inside each checkout's ignored
+`.bazel/` directory, so deleting the worktree deletes those outputs. Shared
+caches stay outside the checkout. See [cache ownership and legacy output cleanup](../docs/build.md#shared-local-caches).
 
 ## Authoritative sources
 
