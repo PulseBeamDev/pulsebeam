@@ -46,10 +46,14 @@ as a failure and never change sysctls or silently skip it.
 
 Root `./bazel test //:check` includes
 `//crates/pulsebeam-runtime:transport_conformance` for actual packet/offload
-contracts and `//crates/pulsebeam:transport_conformance` for one concurrent
-dual-family SDK/SFU witness. The latter supplies explicit loopback interfaces
-but retains real native OS sockets. It does not certify stock deployed
-interface discovery or global IPv6. Connection/family evidence, recipient
+contracts and `//crates/pulsebeam:transport_conformance` for concurrent
+dual-family SDK/SFU witnesses over UDP and passive ICE-TCP. Each supplies
+explicit loopback interfaces but retains real native OS sockets. The TCP witness
+also exercises the required low-priority executor startup. These do not certify stock deployed
+interface discovery, global IPv6 or UDP isolation under TCP floods. Deployment
+qualification must measure UDP forwarding CPU, loss and latency percentiles and
+control/API responsiveness against a UDP-only baseline, with actual CPU policy
+and affinity recorded on the target Linux hardware. Connection/family evidence, recipient
 payloads and cleanup have bounded event-driven operation deadlines of 30, 30
 and 10 seconds; these are infrastructure limits, not application SLAs.
 

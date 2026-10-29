@@ -205,12 +205,7 @@ impl Participant {
             .collect()
     }
 
-    pub fn new(
-        cfg: ParticipantConfig,
-        shard_id: ShardId,
-        udp_gso_size: usize,
-        tcp_gso_size: usize,
-    ) -> Self {
+    pub fn new(cfg: ParticipantConfig, shard_id: ShardId, udp_gso_size: usize) -> Self {
         let rtc = cfg.rtc;
         let ctx = LogCtx {
             room_id: cfg.room_id,
@@ -228,7 +223,6 @@ impl Participant {
             transport: Transport::new(
                 rtc,
                 udp_gso_size,
-                tcp_gso_size,
                 now,
                 #[cfg(feature = "sim")]
                 sim_span,
@@ -506,16 +500,16 @@ impl Participant {
         self.transport.enqueue_ingress(batch, source_shard);
     }
 
-    pub(crate) fn bind_tcp_flow(&mut self, peer: std::net::SocketAddr, flow: net::tcp::TcpFlowId) {
-        self.transport.bind_tcp_flow(peer, flow);
+    pub(crate) fn bind_tcp_flow(&mut self, flow: crate::ice_tcp::TcpFlow) -> bool {
+        self.transport.bind_tcp_flow(flow)
     }
 
-    pub(crate) fn retire_tcp_flow(
-        &mut self,
-        peer: std::net::SocketAddr,
-        flow: net::tcp::TcpFlowId,
-    ) {
-        self.transport.retire_tcp_flow(peer, flow);
+    pub(crate) fn retire_tcp_flow(&mut self, route: crate::ice_tcp::FlowRoute) {
+        self.transport.retire_tcp_flow(route);
+    }
+
+    pub(crate) fn enqueue_tcp(&mut self, packet: crate::ice_tcp::TcpPacket) -> bool {
+        self.transport.enqueue_tcp(packet)
     }
 
     pub fn drain_network(&mut self, egress: &mut impl NetworkEgress) {
@@ -1516,7 +1510,6 @@ mod rtc_clock_tests {
                     },
                     ShardId::new(0),
                     8,
-                    1,
                 );
                 let input = |payload: &[u8], source_shard| ParticipantInput::Network {
                     batch: net::RecvPacketBatch {
@@ -1527,7 +1520,6 @@ mod rtc_clock_tests {
                         len: payload.len(),
                         offset: 0,
                         transport: net::Transport::Udp(net::UdpMode::Scalar),
-                        tcp_flow: None,
                         received_at,
                     },
                     source_shard,

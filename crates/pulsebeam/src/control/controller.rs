@@ -12,7 +12,6 @@ use crate::{
         core::{ControllerCore, RoomPartitionPlacement},
         lifecycle::{TrackLifecycle, TrackLifecycleOperation, TrackLifecycleOutcome},
         negotiator::{Negotiator, NegotiatorError},
-        tcp_acceptor::{PendingTcpConn, TcpAcceptor},
         ufrag::IceUfrag,
     },
     entity::{ConnectionId, ParticipantId, RoomId},
@@ -174,7 +173,6 @@ pub enum ControllerError {
 
 const SHARD_LOAD_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const SHARD_EVENT_BUDGET: usize = 1_024;
-const TCP_HANDOFF_BUDGET: usize = 64;
 const API_COMMAND_BUDGET: usize = 16;
 const SHARD_COMMAND_EGRESS_BUDGET: usize = 64;
 const SHARD_UPDATE_EGRESS_BUDGET: usize = 64;
@@ -219,7 +217,6 @@ pub struct ControllerActor {
     core: ControllerCore,
     negotiator: Negotiator,
     clock: crate::clock::WallAnchor,
-    tcp_listener: Option<pulsebeam_core::net::TcpListener>,
     cluster_id: u16,
     node_id: u16,
     updates: Vec<crate::shard_update::ShardUpdateWriter>,
@@ -242,7 +239,6 @@ impl ControllerActor {
         _rng: pulsebeam_runtime::rand::Rng,
         shard_contexts: Vec<ShardContext>,
         candidates: Vec<LocalCandidate>,
-        tcp_listener: pulsebeam_core::net::TcpListener,
         room_partition_size: usize,
         placement: RoomPartitionPlacement,
         updates: Vec<crate::shard_update::ShardUpdateWriter>,
@@ -255,7 +251,6 @@ impl ControllerActor {
             core: ControllerCore::with_shards(shard_count, room_partition_size, placement),
             negotiator: Negotiator::new(candidates),
             clock: crate::clock::WallAnchor::from(pulsebeam_runtime::net::ReceiveTime::now()),
-            tcp_listener: Some(tcp_listener),
             cluster_id: 0,
             node_id: 0,
             update_touched: vec![false; shard_count],
@@ -300,19 +295,6 @@ impl ControllerActor {
         mut shard_event_rx: mailbox::Receiver<ShardEventMessage>,
         shutdown: CancellationToken,
     ) {
-        let Some(listener) = self.tcp_listener.take() else {
-            pulsebeam_runtime::fatal!("ControllerActor::run called twice")
-        };
-        let acceptor = TcpAcceptor::spawn(
-            listener,
-            crate::control::tcp_acceptor::TcpAcceptorConfig {
-                cluster_id: self.cluster_id,
-                node_id: self.node_id,
-                shard_count: self.router.shard_count(),
-            },
-            shutdown.child_token(),
-        );
-        let mut pending_rx = acceptor.event_rx;
         let mut poll_interval = tokio::time::interval(SHARD_LOAD_POLL_INTERVAL);
         poll_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -338,7 +320,6 @@ impl ControllerActor {
                         false
                     },
                     _ = poll_interval.tick() => true,
-                    true = pending_rx.readable() => false,
                     true = command_rx.readable() => false,
                 }
             };
@@ -346,12 +327,7 @@ impl ControllerActor {
             #[cfg(feature = "sim")]
             crate::sim_metrics::wait_controller_stall().await;
 
-            let action = self.tick(
-                &mut command_rx,
-                &mut shard_event_rx,
-                &mut pending_rx,
-                maintenance_due,
-            );
+            let action = self.tick(&mut command_rx, &mut shard_event_rx, maintenance_due);
             if let Some(action) = action {
                 self.run_required_action(action).await;
             }
@@ -362,7 +338,6 @@ impl ControllerActor {
         &mut self,
         command_rx: &mut mailbox::Receiver<ControllerCommand>,
         shard_event_rx: &mut mailbox::Receiver<ShardEventMessage>,
-        pending_rx: &mut mailbox::Receiver<crate::control::tcp_acceptor::TcpAcceptorEvent>,
         maintenance_due: bool,
     ) -> Option<RequiredAction> {
         let started = tokio::time::Instant::now();
@@ -380,18 +355,6 @@ impl ControllerActor {
         if maintenance_due {
             self.router.poll_loads();
         }
-
-        let mut tcp_handoffs: usize = 0;
-        for _ in 0..TCP_HANDOFF_BUDGET {
-            let Ok(event) = pending_rx.try_recv() else {
-                break;
-            };
-            tcp_handoffs = tcp_handoffs.saturating_add(1);
-            if let Some(connection) = event.result {
-                self.route_tcp_connection(connection);
-            }
-        }
-        self.record_budget_hit("tcp_handoffs", tcp_handoffs, TCP_HANDOFF_BUDGET);
 
         let mut action = None;
         let mut commands: usize = 0;
@@ -1068,18 +1031,6 @@ impl ControllerActor {
         }
     }
 
-    fn route_tcp_connection(&mut self, connection: PendingTcpConn) {
-        debug_assert!(connection.address.shard().index() < self.router.shard_count());
-        self.command_backlog.push_back((
-            connection.address.shard(),
-            ShardCommand::AdoptTcpConnection {
-                stream: connection.stream,
-                peer_addr: connection.peer_addr,
-                address: connection.address,
-            },
-        ));
-    }
-
     fn begin_create_participant(
         &mut self,
         state: ParticipantState,
@@ -1449,7 +1400,6 @@ mod replacement_tests {
             core: ControllerCore::with_shards(1, 1, RoomPartitionPlacement::Hashed),
             negotiator: Negotiator::new(Vec::new()),
             clock: crate::clock::WallAnchor::from(pulsebeam_runtime::net::ReceiveTime::now()),
-            tcp_listener: None,
             cluster_id: 0,
             node_id: 0,
             updates: vec![update],

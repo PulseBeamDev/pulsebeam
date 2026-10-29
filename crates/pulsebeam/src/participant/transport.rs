@@ -12,10 +12,11 @@ use tokio::time::Instant;
 
 use crate::bitrate::Bitrate;
 use crate::entity::TrackId;
+use crate::ice_tcp::{FlowRoute, TcpFlow, TcpFlowId, TcpPacket};
 use crate::media::{
     ChannelId, KeyframeRequest, KeyframeRequestKind, MediaKind, Mid, Pt, Rid, SeqNo, Ssrc,
 };
-use crate::participant::batcher::{Batcher, NetworkEgress, OwnedPacketQueue};
+use crate::participant::batcher::{NetworkEgress, OwnedPacketQueue};
 use crate::rtp::{Codec as RtpCodec, Frequency, MediaTime, RtpExtensions, RtpPacket};
 
 pub(crate) const MAX_PENDING_INGRESS: usize = 256;
@@ -169,7 +170,7 @@ struct PendingIngress {
 struct InputObservation {
     path: AuthenticatedPath,
     source_shard: crate::id::ShardId,
-    tcp_flow: Option<pulsebeam_runtime::net::tcp::TcpFlowId>,
+    tcp_flow: Option<TcpFlowId>,
 }
 struct Encoding {
     mid: Mid,
@@ -233,8 +234,8 @@ pub(crate) struct Transport {
     pending_reports: indexmap::IndexMap<u32, pulsebeam_rtc::SenderReport>,
     input_observation: Option<InputObservation>,
     udp_packets: OwnedPacketQueue,
-    tcp_batcher: Batcher,
-    tcp_flows: HashMap<SocketAddr, pulsebeam_runtime::net::tcp::TcpFlowId>,
+    tcp_flows: HashMap<SocketAddr, TcpFlow>,
+    pending_tcp: VecDeque<TcpPacket>,
     pending_ingress: VecDeque<PendingIngress>,
     pending_timeout: Option<Instant>,
     pending_mutations: VecDeque<TransportMutation>,
@@ -252,7 +253,6 @@ impl Transport {
     pub(crate) fn new(
         accepted: AcceptedConnection,
         udp_gso_size: usize,
-        tcp_gso_size: usize,
         now: Instant,
         #[cfg(feature = "sim")] sim_span: tracing::Span,
     ) -> Self {
@@ -288,8 +288,8 @@ impl Transport {
             pending_reports: Default::default(),
             input_observation: None,
             udp_packets: OwnedPacketQueue::with_capacity(udp_gso_size),
-            tcp_batcher: Batcher::with_capacity(tcp_gso_size),
             tcp_flows: HashMap::new(),
+            pending_tcp: VecDeque::new(),
             pending_ingress: VecDeque::new(),
             pending_timeout: None,
             pending_mutations: VecDeque::new(),
@@ -304,22 +304,39 @@ impl Transport {
         }
     }
 
-    pub(crate) fn bind_tcp_flow(
-        &mut self,
-        peer: SocketAddr,
-        flow: pulsebeam_runtime::net::tcp::TcpFlowId,
-    ) {
-        self.tcp_flows.insert(peer, flow);
+    pub(crate) fn bind_tcp_flow(&mut self, flow: TcpFlow) -> bool {
+        if !flow.is_open() {
+            return false;
+        }
+        self.tcp_flows.insert(flow.route.remote, flow);
+        true
     }
 
-    pub(crate) fn retire_tcp_flow(
-        &mut self,
-        peer: SocketAddr,
-        flow: pulsebeam_runtime::net::tcp::TcpFlowId,
-    ) {
-        if self.tcp_flows.get(&peer) == Some(&flow) {
-            self.tcp_flows.remove(&peer);
+    pub(crate) fn retire_tcp_flow(&mut self, route: FlowRoute) {
+        if self
+            .tcp_flows
+            .get(&route.remote)
+            .is_some_and(|flow| flow.route == route)
+        {
+            self.tcp_flows.remove(&route.remote);
         }
+    }
+
+    pub(crate) fn enqueue_tcp(&mut self, packet: TcpPacket) -> bool {
+        if !self
+            .tcp_flows
+            .get(&packet.route.remote)
+            .is_some_and(|flow| flow.route == packet.route)
+        {
+            return false;
+        }
+        if self.pending_tcp.len() >= 8 {
+            self.retire_tcp_flow(packet.route);
+            metrics::counter!("participant_tcp_ingress_close", "reason" => "full").increment(1);
+            return false;
+        }
+        self.pending_tcp.push_back(packet);
+        true
     }
 
     pub(crate) fn incoming_layers(&self, mid: Mid) -> Vec<crate::media::SimulcastLayer> {
@@ -409,16 +426,9 @@ impl Transport {
                 super::batcher::AppendStatus::Full => {}
             }
         }
-        loop {
-            match egress.append_tcp(&mut self.tcp_batcher) {
-                super::batcher::AppendStatus::Drained => break,
-                super::batcher::AppendStatus::Full if !egress.flush() => break,
-                super::batcher::AppendStatus::Full => {}
-            }
-        }
     }
     pub(crate) fn poll_output(&mut self) -> TransportPollOutput {
-        if self.udp_packets.is_full() || self.tcp_batcher.is_full() {
+        if self.udp_packets.is_full() {
             return TransportPollOutput::Pending;
         }
         match self.rtc.poll(self.rtc_clock.into()) {
@@ -443,7 +453,7 @@ impl Transport {
                         }
                     }
                     TransmitTarget::IceTcp { local, remote, .. } => {
-                        // The runtime adds RFC 4571 framing to queued datagrams.
+                        // The I/O task owns RFC 4571 framing and all partial writes.
                         match tcp_frame_payload(&tx.payload) {
                             Some([]) => {}
                             Some(payload) => {
@@ -457,13 +467,18 @@ impl Transport {
                                             && observation.path.remote == remote
                                     })
                                     .map_or_else(
-                                        || self.tcp_flows.get(&remote).copied(),
+                                        || self.tcp_flows.get(&remote).map(|flow| flow.route.id),
                                         |observation| observation.tcp_flow,
                                     );
-                                if let Some(flow) = flow {
-                                    if !self.tcp_batcher.push_on_flow(remote, flow, payload) {
-                                        metrics::counter!("participant_tcp_egress_dropped_bytes", "reason" => "queue_full")
-                                            .increment(payload.len() as u64);
+                                if let Some(id) = flow {
+                                    // Attribution includes the original flow incarnation. Never
+                                    // move a deferred reply to a replacement with the same peer.
+                                    if let Some(handle) = self.tcp_flows.get(&remote)
+                                        && handle.route.id == id
+                                        && !handle.try_send(payload)
+                                    {
+                                        tracing::debug!(%remote, ?id, "ICE-TCP egress full or closed; retiring flow");
+                                        self.tcp_flows.remove(&remote);
                                     }
                                 } else {
                                     metrics::counter!("participant_tcp_egress_dropped_bytes", "reason" => "missing_flow")
@@ -631,7 +646,7 @@ impl Transport {
         })
     }
     pub(crate) fn has_pending_ingress(&self) -> bool {
-        !self.pending_ingress.is_empty()
+        !self.pending_ingress.is_empty() || !self.pending_tcp.is_empty()
     }
     pub(crate) fn clock(&self) -> Instant {
         self.rtc_clock
@@ -764,47 +779,58 @@ impl Transport {
         AppliedMutation::RtpWritten
     }
     pub(crate) fn receive_pending(&mut self, at: Instant) -> IngressResult {
-        let Some(pending) = self.pending_ingress.front_mut() else {
-            return IngressResult::Empty;
-        };
-        let source_shard = pending.source_shard;
-        let batch = &mut pending.batch;
-        let protocol = match batch.transport {
-            pulsebeam_runtime::net::Transport::Udp(_) => NetworkProtocol::Udp,
-            pulsebeam_runtime::net::Transport::Tcp => NetworkProtocol::IceTcp,
-        };
-        let (remote, local, arrival, tcp_flow) = (
-            batch.src,
-            batch.dst,
-            batch.received_at.monotonic,
-            batch.tcp_flow,
-        );
-        let Some(packet) = batch.next_packet() else {
-            self.pending_ingress.pop_front();
-            return IngressResult::Empty;
-        };
-        let input = match protocol {
-            NetworkProtocol::Udp => NetworkInput::Udp {
-                local,
-                remote,
-                ecn: None,
-                payload: rtc_bytes(packet),
-            },
-            NetworkProtocol::IceTcp => {
-                let Ok(length) = u16::try_from(packet.len()) else {
-                    metrics::counter!("participant_ingress_rtc_rejected").increment(1);
-                    return IngressResult::Received;
+        let (protocol, local, remote, arrival, tcp_flow, source_shard, input) =
+            if let Some(pending) = self.pending_ingress.front_mut() {
+                let source_shard = pending.source_shard;
+                let batch = &mut pending.batch;
+                let (remote, local, arrival) = (batch.src, batch.dst, batch.received_at.monotonic);
+                let Some(packet) = batch.next_packet() else {
+                    self.pending_ingress.pop_front();
+                    return IngressResult::Empty;
                 };
-                let mut frame = Vec::with_capacity(packet.len().saturating_add(2));
-                frame.extend_from_slice(&length.to_be_bytes());
-                frame.extend_from_slice(packet);
-                NetworkInput::IceTcp {
+                (
+                    NetworkProtocol::Udp,
                     local,
                     remote,
-                    frame: rtc_bytes(&frame),
-                }
-            }
-        };
+                    arrival,
+                    None,
+                    source_shard,
+                    NetworkInput::Udp {
+                        local,
+                        remote,
+                        ecn: None,
+                        payload: rtc_bytes(packet),
+                    },
+                )
+            } else if let Some(packet) = self.pending_tcp.pop_front() {
+                let FlowRoute {
+                    local,
+                    remote,
+                    id,
+                    address,
+                } = packet.route;
+                let Ok(length) = u16::try_from(packet.packet.len()) else {
+                    return IngressResult::Received;
+                };
+                let mut frame = Vec::with_capacity(packet.packet.len().saturating_add(2));
+                frame.extend_from_slice(&length.to_be_bytes());
+                frame.extend_from_slice(&packet.packet);
+                (
+                    NetworkProtocol::IceTcp,
+                    local,
+                    remote,
+                    packet.received_at.monotonic,
+                    Some(id),
+                    address.shard(),
+                    NetworkInput::IceTcp {
+                        local,
+                        remote,
+                        frame: rtc_bytes(&frame),
+                    },
+                )
+            } else {
+                return IngressResult::Empty;
+            };
         self.input_observation = Some(InputObservation {
             path: AuthenticatedPath {
                 protocol,
@@ -831,7 +857,8 @@ impl Transport {
         self.pending_timeout = None;
         self.input_observation = None;
         self.udp_packets.discard();
-        self.tcp_batcher.discard();
+        self.pending_tcp.clear();
+        self.tcp_flows.clear();
         self.rtc.abort();
         self.rtc_needs_drain = true;
     }
@@ -843,65 +870,36 @@ mod tests {
 
     #[test]
     fn deferred_tcp_ingress_never_moves_its_output_to_a_replacement_flow() {
-        use pulsebeam_core::net::{TcpListener, TcpStream};
-        use pulsebeam_runtime::net::tcp::{BufferedTcpStream, TcpTransport};
-        use tokio::io::AsyncReadExt;
-
         let host = pulsebeam_runtime::testing::test_host_ip("192.168.250.16");
         pulsebeam_runtime::testing::run_local(host, async move {
             let (accepted, _, binding) =
                 crate::control::application_only_test_connection_and_binding();
             let local = "127.0.0.1:6000".parse().unwrap();
             let remote = "127.0.0.1:5000".parse().unwrap();
+            let address = crate::route::NodeTransportAddress::new(
+                crate::route::TransportRoute::new(crate::id::ShardId::new(0), 7),
+                1,
+            );
             let mut transport = Transport::new(
                 accepted,
-                8,
                 8,
                 Instant::now(),
                 #[cfg(feature = "sim")]
                 tracing::Span::none(),
             );
-            let listener = TcpListener::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())
-                .await
-                .unwrap();
-            let address = listener.local_addr().unwrap();
-            let (client, stream) = tokio::join!(TcpStream::connect(address), listener.accept());
-            let original_client = client.unwrap();
-            let (stream, _) = stream.unwrap();
-            let mut framed = Vec::new();
+            let (flow, mut original_output) = crate::ice_tcp::fixture(address, local, remote, 4);
+            let original = flow.route;
+            assert!(transport.bind_tcp_flow(flow));
             for _ in 0..2 {
-                framed.extend_from_slice(&u16::try_from(binding.len()).unwrap().to_be_bytes());
-                framed.extend_from_slice(&binding);
-            }
-            let mut socket = TcpTransport::new(local);
-            let original = socket
-                .add_connection(
-                    BufferedTcpStream::with_buffered(
-                        stream,
-                        framed,
-                        pulsebeam_runtime::net::ReceiveTime::now(),
-                    ),
-                    remote,
-                )
-                .unwrap();
-            transport.bind_tcp_flow(remote, original);
-            let mut frames = Vec::new();
-            let mut closed = Vec::new();
-            socket.try_recv_events(&mut frames, &mut closed).unwrap();
-            assert_eq!(frames.len(), 2);
-            assert!(closed.is_empty());
-            for frame in frames.drain(..) {
-                transport.enqueue_ingress(frame, crate::id::ShardId::new(0));
+                assert!(transport.enqueue_tcp(TcpPacket::fixture(original, &binding)));
             }
             let receive_and_drain = |transport: &mut Transport| {
                 let now = Instant::now();
                 transport.advance_clock(now, now);
-                loop {
-                    match transport.receive_pending(now) {
-                        IngressResult::Received => break,
-                        IngressResult::Empty => assert!(transport.has_pending_ingress()),
-                    }
-                }
+                assert!(matches!(
+                    transport.receive_pending(now),
+                    IngressResult::Received
+                ));
                 loop {
                     match transport.poll_output() {
                         TransportPollOutput::Timeout(_) => break,
@@ -921,31 +919,23 @@ mod tests {
                 }
             };
             receive_and_drain(&mut transport);
-            assert!(!transport.tcp_batcher.is_empty());
-            drop(original_client);
-            while closed.is_empty() {
-                socket.readable().await.unwrap();
-                let _ = socket.try_recv_events(&mut frames, &mut closed);
-                assert!(frames.is_empty());
-            }
-            assert_eq!(closed, vec![(remote, original)]);
-            transport.retire_tcp_flow(remote, original);
-            let (client, stream) = tokio::join!(TcpStream::connect(address), listener.accept());
-            let mut client = client.unwrap();
-            let (stream, _) = stream.unwrap();
-            let replacement = socket
-                .add_connection(BufferedTcpStream::new(stream), remote)
-                .unwrap();
-            transport.bind_tcp_flow(remote, replacement);
+            assert!(original_output.try_recv().is_ok());
+            transport.retire_tcp_flow(original);
+            let (replacement, mut replacement_output) =
+                crate::ice_tcp::fixture(address, local, remote, 4);
+            let replacement_route = replacement.route;
+            assert!(transport.bind_tcp_flow(replacement));
             receive_and_drain(&mut transport);
-            transport
-                .tcp_batcher
-                .push_on_flow(remote, replacement, b"new");
-            assert!(transport.tcp_batcher.flush(&mut socket));
-            assert!(transport.tcp_batcher.is_empty());
-            let mut received = [0; 5];
-            client.read_exact(&mut received).await.unwrap();
-            assert_eq!(&received, b"\0\x03new");
+            assert!(replacement_output.try_recv().is_err());
+            // Late close and frame events cannot retire or feed a successor.
+            transport.retire_tcp_flow(original);
+            assert!(!transport.enqueue_tcp(TcpPacket::fixture(original, &binding)));
+            assert_eq!(
+                transport.tcp_flows.get(&remote).unwrap().route,
+                replacement_route
+            );
+            assert!(transport.tcp_flows.get(&remote).unwrap().try_send(b"new"));
+            assert_eq!(replacement_output.try_recv().unwrap(), b"new");
             for _ in 0..pulsebeam_runtime::net::BATCH_SIZE {
                 assert!(transport.udp_packets.push_back(remote, vec![1]));
             }
@@ -960,6 +950,7 @@ mod tests {
                 TransportPollOutput::Closed(_)
             ));
             assert!(transport.pending_ingress.is_empty());
+            assert!(transport.tcp_flows.is_empty());
         });
     }
 

@@ -67,6 +67,12 @@ pub fn split<T: AsyncRead + AsyncWrite + Unpin>(
     reason = "each Bytes allocation is transferred to the caller, never cloned or shared here"
 )]
 impl<R: AsyncRead + Unpin> FrameReader<R> {
+    /// Whether an incomplete frame has consumed any stream bytes.
+    /// Callers can use this to distinguish an idle peer from a stalled frame.
+    pub fn is_partial(&self) -> bool {
+        self.header_read != 0
+    }
+
     /// Receive a complete frame. `None` is clean EOF; an empty frame is legal.
     ///
     /// Partial headers/payloads at EOF are errors. Invalid lengths are rejected
@@ -199,8 +205,10 @@ mod tests {
                 _ = std::future::ready(()) => {}
             }
         }
+        assert!(reader.is_partial());
         raw.write_all(&[2, 3]).await.unwrap();
         assert_eq!(&reader.recv().await.unwrap().unwrap()[..], &[1, 2, 3]);
+        assert!(!reader.is_partial());
     }
 
     #[tokio::test]

@@ -109,7 +109,7 @@ impl ParticipantRegistry {
         if let Some(previous) = self.by_id.get(&participant_id).copied() {
             let _ = self.remove_handle(previous);
         }
-        let core = ParticipantCore::new(cfg, self.shard_id, self.max_gso_segments, 1);
+        let core = ParticipantCore::new(cfg, self.shard_id, self.max_gso_segments);
         let handle = self.participants.insert(Box::new(ParticipantMeta {
             core,
             queued_dirty: false,

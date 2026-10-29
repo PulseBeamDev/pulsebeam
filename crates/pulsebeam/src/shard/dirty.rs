@@ -78,7 +78,6 @@ impl DirtyTracker {
         }
     }
 
-    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.participants.is_empty()
     }

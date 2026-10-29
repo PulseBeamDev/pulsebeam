@@ -2,7 +2,6 @@
 mod bound_udp;
 #[cfg(feature = "sim")]
 pub mod shaper;
-pub mod tcp;
 #[cfg(feature = "sim")]
 pub mod udp_batch_sim;
 pub mod udp_scalar;
@@ -57,7 +56,6 @@ pub enum UdpMode {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Transport {
     Udp(UdpMode),
-    Tcp,
 }
 
 /// Clock samples taken when a complete datagram or RFC 4571 frame is received.
@@ -85,7 +83,6 @@ pub struct RecvPacketBatch {
     pub stride: usize,
     pub len: usize,
     pub transport: Transport,
-    pub tcp_flow: Option<tcp::TcpFlowId>,
     pub received_at: ReceiveTime,
 
     pub offset: usize,
@@ -153,12 +150,6 @@ pub async fn bind(
         Transport::Udp(mode) => bind_udp_socket(addr, mode, external_addr, shard_index)
             .await?
             .into_unified_socket()?,
-        Transport::Tcp => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "UnifiedSocket does not support TCP transports",
-            ));
-        }
     };
     tracing::debug!("bound to {addr} ({transport:?})");
     Ok(sock)
@@ -273,7 +264,6 @@ mod tests {
             stride: 6,
             len: 20,
             transport: Transport::Udp(UdpMode::Scalar),
-            tcp_flow: None,
             received_at: ReceiveTime::now(),
             offset: 0,
         };
@@ -294,7 +284,6 @@ mod tests {
             stride: 6,
             len: 18,
             transport: Transport::Udp(UdpMode::Scalar),
-            tcp_flow: None,
             received_at: ReceiveTime::now(),
             offset: 0,
         };
@@ -314,7 +303,6 @@ mod tests {
             stride: 2,
             len: 2,
             transport: Transport::Udp(UdpMode::Batch),
-            tcp_flow: None,
             received_at: ReceiveTime::now(),
             offset: 0,
         };

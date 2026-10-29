@@ -85,9 +85,7 @@ mod platform {
     mod imp {
         use super::*;
 
-        pub(in crate::node) async fn bind_tcp_listener(
-            addr: SocketAddr,
-        ) -> std::io::Result<TcpListener> {
+        pub(crate) async fn bind_tcp_listener(addr: SocketAddr) -> std::io::Result<TcpListener> {
             let socket = socket2::Socket::new(
                 socket2::Domain::for_address(addr),
                 socket2::Type::STREAM,
@@ -113,14 +111,12 @@ mod platform {
     mod imp {
         use super::*;
 
-        pub(in crate::node) async fn bind_tcp_listener(
-            addr: SocketAddr,
-        ) -> std::io::Result<TcpListener> {
+        pub(crate) async fn bind_tcp_listener(addr: SocketAddr) -> std::io::Result<TcpListener> {
             TcpListener::bind(addr).await
         }
     }
 
-    pub(super) use imp::bind_tcp_listener;
+    pub(crate) use imp::bind_tcp_listener;
 }
 
 mod shard_executor {
@@ -426,10 +422,22 @@ mod shard_executor {
     pub(super) use imp::Executor;
 }
 
-use platform::bind_tcp_listener;
+pub(crate) use platform::bind_tcp_listener;
 
 type SteeringFactory =
     Box<dyn FnOnce(&[pulsebeam_runtime::net::BoundUdpSocket]) -> Result<Box<dyn Steering>> + Send>;
+
+pub use crate::ice_tcp::Limits as IceTcpLimits;
+
+/// Media TCP is independent of HTTP signaling and metrics listeners.
+#[derive(Clone, Debug)]
+pub enum IceTcpConfig {
+    Disabled,
+    Passive {
+        bind: SocketAddr,
+        limits: IceTcpLimits,
+    },
+}
 
 pub struct NodeBuilder {
     #[cfg(feature = "sim")]
@@ -464,6 +472,7 @@ pub struct NodeBuilder {
     /// When `true`, TCP candidates are suppressed. This lets tests that model
     /// UDP datagram loss select exactly the transport their shaper controls.
     udp_only: bool,
+    ice_tcp: Option<IceTcpConfig>,
 
     /// How many participants of one room share a shard before the next join
     /// spills to another.
@@ -506,6 +515,7 @@ impl NodeBuilder {
             },
             tcp_only: false,
             udp_only: false,
+            ice_tcp: None,
             room_partition_size: crate::control::core::DEFAULT_ROOM_PARTITION_SIZE,
             room_placement: crate::control::core::RoomPartitionPlacement::Hashed,
         }
@@ -680,6 +690,7 @@ impl NodeBuilder {
     pub fn tcp_only(mut self) -> Self {
         self.tcp_only = true;
         self.udp_only = false;
+        self.ice_tcp = None;
         self
     }
 
@@ -689,6 +700,18 @@ impl NodeBuilder {
     pub fn udp_only(mut self) -> Self {
         self.udp_only = true;
         self.tcp_only = false;
+        self.ice_tcp = Some(IceTcpConfig::Disabled);
+        self
+    }
+
+    /// Configure media ICE-TCP explicitly. A disabled fallback creates no media
+    /// TCP listener, executor, tasks, shard inboxes or candidates.
+    pub fn ice_tcp(mut self, config: IceTcpConfig) -> Self {
+        self.udp_only = matches!(config, IceTcpConfig::Disabled);
+        if self.udp_only {
+            self.tcp_only = false;
+        }
+        self.ice_tcp = Some(config);
         self
     }
 
@@ -766,8 +789,6 @@ impl NodeBuilder {
         let local_addr = self
             .local_addr
             .unwrap_or_else(|| SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), 0));
-        let primary_external_addr = advertised_addrs.first().copied();
-
         let mut control_tasks = JoinSet::new();
         // Initialised here so the global recorder is in place before anything
         // runs, but served after the shards exist — it needs their metrics lane.
@@ -815,38 +836,60 @@ impl NodeBuilder {
             None => None,
         };
 
-        let tcp_listener = bind_tcp_listener(local_addr)
-            .await
-            .context("binding tcp listener")?;
-        let bound_tcp_addr = tcp_listener.local_addr()?;
-        tracing::info!(
-            local_addr = ?bound_tcp_addr,
-            data_threads,
-            shards = shard_count,
-            runtime = ?shard_runtime,
-            "RTC listeners ready"
-        );
-        let tcp_local_addr = primary_external_addr.unwrap_or(bound_tcp_addr);
-
-        let tcp_sockets: Vec<net::tcp::TcpTransport> = (0..shard_count)
-            .map(|_| net::tcp::TcpTransport::new(tcp_local_addr))
-            .collect();
-
+        let mut tcp_rxs = Vec::with_capacity(shard_count);
+        let mut tcp_txs = Vec::new();
+        let tcp_config = self.ice_tcp.unwrap_or_else(|| {
+            if self.udp_only {
+                IceTcpConfig::Disabled
+            } else {
+                IceTcpConfig::Passive {
+                    bind: local_addr,
+                    limits: IceTcpLimits::default(),
+                }
+            }
+        });
         let mut candidates = sockets_to_candidates(&udp_sockets, &advertised_addrs);
         if self.tcp_only {
             candidates.clear();
         }
-        if !self.udp_only && !tcp_sockets.is_empty() {
-            let tcp_candidate_addrs = if advertised_addrs.is_empty() {
-                vec![tcp_local_addr]
-            } else {
-                advertised_addrs.clone()
-            };
-
-            for addr in tcp_candidate_addrs {
-                candidates.push(LocalCandidate::TcpPassive(addr));
+        let tcp_service = match tcp_config {
+            IceTcpConfig::Disabled => {
+                tcp_rxs.resize_with(shard_count, || None);
+                None
             }
-        }
+            IceTcpConfig::Passive { bind, limits } => {
+                limits.validate(shard_count)?;
+                for _ in 0..shard_count {
+                    let (tx, rx) =
+                        crate::ice_tcp::inbox(limits.inbox_capacity, limits.max_frame_bytes)?;
+                    tcp_txs.push(tx);
+                    tcp_rxs.push(Some(rx));
+                }
+                let spare_core = cpu_cores.get(data_threads).copied();
+                let (service, bound) = crate::ice_tcp::Service::start(
+                    bind,
+                    advertised_addrs.clone(),
+                    crate::ice_tcp::Routing {
+                        cluster_id: 0,
+                        node_id: 0,
+                        shard_count,
+                    },
+                    limits,
+                    tcp_txs,
+                    spare_core,
+                    shutdown.child_token(),
+                )
+                .await
+                .context("starting passive ICE-TCP")?;
+                let tcp_addrs = if advertised_addrs.is_empty() {
+                    vec![bound]
+                } else {
+                    advertised_addrs.clone()
+                };
+                candidates.extend(tcp_addrs.into_iter().map(LocalCandidate::TcpPassive));
+                Some(service)
+            }
+        };
 
         // This is the only owner of data-plane execution. The caller runtime
         // remains the control runtime for controller/API/metrics tasks.
@@ -904,9 +947,9 @@ impl NodeBuilder {
 
         let mut view_writers = Vec::with_capacity(shard_count);
 
-        for (shard_idx, ((udp_sock, tcp_sock), frame_rx)) in udp_sockets
+        for (shard_idx, ((udp_sock, tcp_rx), frame_rx)) in udp_sockets
             .into_iter()
-            .zip(tcp_sockets)
+            .zip(tcp_rxs)
             .zip(frame_rxs)
             .enumerate()
         {
@@ -934,7 +977,7 @@ impl NodeBuilder {
                 Ok(ShardWorker::new(
                     shard_id,
                     udp_sock,
-                    tcp_sock,
+                    tcp_rx,
                     shard_command_rx,
                     update_reader,
                     shard_event_tx,
@@ -972,7 +1015,6 @@ impl NodeBuilder {
             controller_rng,
             shard_contexts,
             candidates,
-            tcp_listener,
             self.room_partition_size,
             self.room_placement,
             view_writers,
@@ -1067,6 +1109,9 @@ impl NodeBuilder {
 
         // At this point the control task set has been consumed/dropped by the
         // select above. Finish the independently-owned data executor afterwards.
+        if let Some(service) = tcp_service {
+            service.finish().await?;
+        }
         shard_executor.finish().await?;
 
         Ok(())
@@ -1662,6 +1707,35 @@ mod tests {
             builder.room_partition_size,
             crate::control::core::DEFAULT_ROOM_PARTITION_SIZE
         );
+    }
+
+    #[cfg(feature = "sim")]
+    #[test]
+    fn disabled_media_tcp_does_not_bind_an_occupied_tcp_port() {
+        let host = pulsebeam_runtime::testing::test_host_ip("192.168.250.102");
+        pulsebeam_runtime::testing::run_local(host, async {
+            let occupied = TcpListener::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())
+                .await
+                .unwrap();
+            let media = occupied.local_addr().unwrap();
+            let (observer, mut ready) = tokio::sync::mpsc::channel(1);
+            let shutdown = CancellationToken::new();
+            let builder = NodeBuilder::new()
+                .with_current_runtime()
+                .local_addr(media)
+                .external_addrs(vec![media])
+                .ice_tcp(IceTcpConfig::Disabled)
+                .rng(rand::Rng::seed_from_u64(9))
+                .with_sim_observer(observer);
+            let mut node = tokio::task::spawn_local(builder.run(shutdown.clone()));
+            tokio::select! {
+                observer = ready.recv() => assert!(observer.is_some()),
+                result = &mut node => panic!("disabled node failed startup: {result:?}"),
+            }
+            shutdown.cancel();
+            node.await.unwrap().unwrap();
+            drop(occupied);
+        });
     }
 
     #[test]

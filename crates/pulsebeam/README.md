@@ -17,6 +17,45 @@ Shared mutable packet state, cross-shard handles, blocking calls, and
 multi-atomic snapshots are architectural regressions. Cross-shard and
 cross-node coordination uses owned messages.
 
+## Media TCP fallback
+
+UDP is the optimized dataplane. Passive ICE-TCP uses one optional
+`pb-ice-tcp` OS thread with a Tokio current-thread runtime and one task per
+admitted connection. The thread uses Linux `SCHED_IDLE` and a spare non-dataplane
+core when available. Startup fails rather than advertising TCP if binding or
+the required scheduling policy fails. Thread separation does not isolate kernel,
+cache or NIC work; qualify interference on deployment hardware.
+
+`NodeBuilder::ice_tcp(IceTcpConfig::Disabled)` and `udp_only()` create no media
+TCP listener, executor, tasks, shard inboxes or candidate. HTTP signaling and
+metrics listeners are independent. Default configuration retains passive TCP;
+`IceTcpConfig::Passive { bind, limits }` supplies an explicit listener and
+`IceTcpLimits`. External candidate addresses must be reachable at their
+advertised TCP ports. Direct ICE-TCP is not HTTPS, TURN or TLS multiplexing.
+
+TCP admission caps pending, active, per-IP and total connection tasks. The total
+task cap also bounds delayed terminal notices. Each enabled shard has a separate
+TCP inbox drained after UDP and normal shard work, with at most eight items and
+65,535 payload bytes per tick. A frame quota follows input through deferred RTC
+processing, so removing an inbox item cannot escape its byte limit. Initial
+limits use a 1,500-byte frame cap and 32-frame ingress/outbound queues. Configure
+a larger frame cap explicitly for endpoints that require it. These are finite
+defaults, not deployment capacity guarantees; size them using simulation and
+measured host workloads.
+
+The controller is not in the connection or packet path. First-STUN ufrags are
+untrusted routing hints; the destination shard checks the current route epoch
+and RTC performs authentication. Adoption precedes subsequent input, and flow
+incarnations fence delayed frames, replies and close events. Full ingress or
+egress closes that flow instead of dropping middle frames or blocking a shard.
+Sockets and admission release before bounded terminal-notice waits.
+
+Observe `ice_tcp_pending`, `ice_tcp_active`, `ice_tcp_rejected`,
+`ice_tcp_ingress_close`, `ice_tcp_egress_close`,
+`ice_tcp_stalled_write_close` and `ice_tcp_thread_cpu_ns` separately from UDP and
+control-plane metrics. Thread CPU is sampled on the TCP executor in production,
+not estimated from simulation time.
+
 Nodes require an NTP/PTP-disciplined host wall clock in a common NTP-compatible
 time domain. Controller admission and shard service refresh paired host-clock
 samples instead of extrapolating a startup-only anchor. Backward wall-clock steps
@@ -29,7 +68,7 @@ through queueing and shard handoffs.
 Run focused crate tests while iterating. Before handoff, run root `./bazel test //:check`
 and `./bazel test //:test`. The production-configured owner target
 `//crates/pulsebeam:transport_conformance` uses one once-bound dual-stack UDP
-listener and two concurrent threaded native SDK peers. It requires actual
+listener and two concurrent threaded native SDK peers per UDP/TCP witness. It requires actual
 IPv4/IPv6 HTTP candidate advertisements, selected-pair statistics and distinct
 bidirectional application topic payloads, followed by owned graph/node cleanup.
 Its explicit loopback interface enumeration is test-only, not qualification of

@@ -34,6 +34,7 @@ mod bitrate;
 pub mod clock;
 pub mod control;
 pub mod entity;
+mod ice_tcp;
 pub mod id;
 pub(crate) mod keys;
 pub(crate) mod log;
@@ -56,7 +57,8 @@ pub mod track;
 fn init() {
     let subscriber = tracing_subscriber::fmt().with_test_writer();
     #[cfg(feature = "transport-conformance")]
-    let subscriber = subscriber.with_env_filter("warn,pulsebeam::node=info");
+    let subscriber =
+        subscriber.with_env_filter("warn,pulsebeam::node=info,pulsebeam::ice_tcp=debug");
     #[cfg(not(feature = "transport-conformance"))]
     let subscriber = subscriber.with_max_level(tracing::Level::DEBUG);
     let _ = subscriber.try_init();

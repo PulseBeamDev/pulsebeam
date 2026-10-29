@@ -393,7 +393,6 @@ impl UdpTransportReader {
         }
         out.push(RecvPacketBatch {
             transport: Transport::Udp(mode),
-            tcp_flow: None,
             received_at,
             src,
             dst,

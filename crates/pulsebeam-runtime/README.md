@@ -1,7 +1,7 @@
 # `pulsebeam-runtime`
 
 Runtime seams underneath PulseBeam's shard model: task spawning, deterministic
-randomness, fatal handling, network adapters, and real or simulated UDP/TCP
+randomness, fatal handling, network adapters, and real or simulated UDP
 implementations.
 
 Bounded ownership handoff lives in [pulsebeam-queue](../pulsebeam-queue/README.md).
@@ -13,12 +13,12 @@ moves between workers. Read the
 [shard-owned work-stealing contract](../pulsebeam/docs/shard-owned-dataplane.md)
 before changing an ownership or synchronization boundary.
 
-Network implementations preserve complete-packet receive clock samples through
-batching, TCP first-frame routing, and simulated steering queues. Keep
-`RecvPacketBatch.received_at` unchanged through application handoffs. A TCP batch
-also carries its `TcpFlowId`, a non-reused incarnation within the owning transport.
-Use `try_send_on_flow` and `close_flow` for saved output and retirement so an old
-stream cannot affect its replacement at the same peer address.
+UDP implementations preserve complete-packet receive clock samples through
+batching and simulated steering queues. Keep `RecvPacketBatch.received_at`
+unchanged through application handoffs. Media TCP is not a UDP batch backend:
+[`pulsebeam-tcp`](../pulsebeam-tcp/README.md) owns RFC 4571 framing, and the
+server's private `ice_tcp` integration owns optional listener, executor, admission
+and bounded flow queues. HTTP sockets remain ordinary Tokio or Turmoil streams.
 
 Run `./bazel test //crates/pulsebeam-runtime:unit_tests //crates/pulsebeam-runtime:steering_tests`
 for fallback, packet-shape and simulated steering boundaries.

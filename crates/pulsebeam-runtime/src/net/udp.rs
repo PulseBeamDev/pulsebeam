@@ -423,7 +423,6 @@ impl UdpTransportReader {
                     stride,
                     len: total_len,
                     transport: Transport::Udp(UdpMode::Batch),
-                    tcp_flow: None,
                     received_at,
                     offset: 0,
                 });

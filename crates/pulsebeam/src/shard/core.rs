@@ -10,7 +10,7 @@ use crate::{
     keys::ParticipantHandle,
     participant::{
         ParticipantConfig,
-        batcher::{AppendStatus, Batcher, GsoSendBatch, NetworkEgress, OwnedPacketQueue},
+        batcher::{AppendStatus, GsoSendBatch, NetworkEgress, OwnedPacketQueue},
     },
     shard::{
         dirty::DirtyTracker,
@@ -41,9 +41,7 @@ fn record_routing_drop(lane: &'static str, stage: &'static str, origin: &'static
 
 struct ShardNetworkEgress<'a> {
     udp: &'a mut GsoSendBatch,
-    tcp: &'a mut Batcher,
     udp_socket: &'a mut UnifiedSocket,
-    tcp_socket: &'a mut net::tcp::TcpTransport,
 }
 
 impl NetworkEgress for ShardNetworkEgress<'_> {
@@ -62,17 +60,8 @@ impl NetworkEgress for ShardNetworkEgress<'_> {
         }
     }
 
-    fn append_tcp(&mut self, batcher: &mut Batcher) -> AppendStatus {
-        if batcher.is_empty() {
-            return AppendStatus::Drained;
-        }
-        self.tcp.append_batcher(batcher)
-    }
-
     fn flush(&mut self) -> bool {
-        let udp_progress = self.udp.flush(self.udp_socket);
-        let tcp_progress = self.tcp.flush(self.tcp_socket);
-        udp_progress || tcp_progress
+        self.udp.flush(self.udp_socket)
     }
 }
 
@@ -91,7 +80,6 @@ pub(crate) struct ShardExecution {
     timers: TimerWheel,
     dirty: DirtyTracker,
     udp_send_batch: GsoSendBatch,
-    tcp_send_batcher: Batcher,
     pipeline: EventPipeline,
     wall: WallAnchor,
 }
@@ -187,50 +175,38 @@ impl ShardCore {
         self.execution.on_udp_batch_routed(batch, router);
     }
 
-    pub(crate) fn has_transport(&self, address: NodeTransportAddress) -> bool {
-        self.execution.registry.resolve_transport(address).is_some()
-    }
-
-    pub(crate) fn bind_tcp_flow(
-        &mut self,
-        address: NodeTransportAddress,
-        peer: std::net::SocketAddr,
-        flow: net::tcp::TcpFlowId,
-    ) {
-        if let Some(key) = self.execution.registry.resolve_transport(address)
-            && let Some(participant) = self.execution.registry.resolve_mut(key)
-        {
-            participant.bind_tcp_flow(peer, flow);
-        }
-    }
-
-    pub(crate) fn retire_tcp_flow(
-        &mut self,
-        address: NodeTransportAddress,
-        peer: std::net::SocketAddr,
-        flow: net::tcp::TcpFlowId,
-    ) {
-        if let Some(key) = self.execution.registry.resolve_transport(address)
-            && let Some(participant) = self.execution.registry.resolve_mut(key)
-        {
-            participant.retire_tcp_flow(peer, flow);
-        }
-    }
-
-    pub(crate) fn on_tcp_batch(
-        &mut self,
-        batch: net::RecvPacketBatch,
-        address: NodeTransportAddress,
-    ) {
-        if batch.transport != net::Transport::Tcp
-            || batch.tcp_flow.is_none()
-            || address.shard() != self.execution.shard_id
-        {
-            record_routing_drop("transport", "tcp_owner", "local");
+    pub(crate) fn on_tcp_ingress(&mut self, event: crate::ice_tcp::TcpIngress) {
+        use crate::ice_tcp::TcpIngress;
+        let route = match &event {
+            TcpIngress::Adopt { flow, .. } => flow.route,
+            TcpIngress::Frame(packet) => packet.route,
+            TcpIngress::Closed { route } => *route,
+        };
+        if route.address.shard() != self.execution.shard_id {
             return;
         }
-        self.execution
-            .on_owned_udp_batch(batch, address, self.execution.shard_id);
+        let Some(key) = self.execution.registry.resolve_transport(route.address) else {
+            return;
+        };
+        let Some(participant) = self.execution.registry.resolve_mut(key) else {
+            return;
+        };
+        match event {
+            TcpIngress::Adopt {
+                flow,
+                first_stun,
+                reply,
+            } => {
+                let accepted =
+                    participant.bind_tcp_flow(flow) && participant.enqueue_tcp(first_stun);
+                let _ = reply.send(accepted);
+            }
+            TcpIngress::Frame(packet) => {
+                participant.enqueue_tcp(packet);
+            }
+            TcpIngress::Closed { .. } => participant.retire_tcp_flow(route),
+        }
+        self.execution.dirty.mark(key, participant);
     }
 
     pub(crate) fn flush_stream_buffers(
@@ -262,17 +238,19 @@ impl ShardCore {
     }
 
     pub(crate) fn next_timer_deadline(&mut self) -> Option<Instant> {
-        self.execution.next_timer_deadline()
+        if !self.execution.dirty.is_empty() {
+            Some(Instant::now())
+        } else {
+            self.execution.next_timer_deadline()
+        }
     }
 
     pub(crate) fn poll_and_flush_dirty(
         &mut self,
         udp_socket: &mut UnifiedSocket,
-        tcp_socket: &mut net::tcp::TcpTransport,
         budget: usize,
     ) -> usize {
-        self.execution
-            .poll_and_flush_dirty(udp_socket, tcp_socket, budget)
+        self.execution.poll_and_flush_dirty(udp_socket, budget)
     }
 
     pub(crate) fn drain_pending_close(
@@ -306,7 +284,6 @@ impl ShardExecution {
             timers: TimerWheel::new(PARTICIPANT_CAPACITY_HINT),
             dirty: DirtyTracker::with_capacity(PARTICIPANT_CAPACITY_HINT),
             udp_send_batch: GsoSendBatch::preallocated(),
-            tcp_send_batcher: Batcher::with_capacity(max_gso_segments),
             pipeline: EventPipeline::with_capacity(PARTICIPANT_CAPACITY_HINT),
             wall,
         }
@@ -316,20 +293,13 @@ impl ShardExecution {
         &mut self,
         key: ParticipantHandle,
         udp_socket: &mut UnifiedSocket,
-        tcp_socket: &mut net::tcp::TcpTransport,
     ) {
         let registry = &mut self.registry;
         let udp = &mut self.udp_send_batch;
-        let tcp = &mut self.tcp_send_batcher;
         let Some(participant) = registry.resolve_mut(key) else {
             return;
         };
-        let mut egress = ShardNetworkEgress {
-            udp,
-            tcp,
-            udp_socket,
-            tcp_socket,
-        };
+        let mut egress = ShardNetworkEgress { udp, udp_socket };
         participant.drain_network(&mut egress);
     }
 
@@ -552,10 +522,6 @@ impl ShardExecution {
         batch: net::RecvPacketBatch,
         router: &impl ShardTransport,
     ) {
-        if batch.transport == net::Transport::Tcp {
-            record_routing_drop("transport", "tcp_owner", "local");
-            return;
-        }
         let Some(address) = self.registry.demux(&batch) else {
             return;
         };
@@ -762,9 +728,6 @@ impl ShardExecution {
                 };
                 let _ = ack.send(materialized);
             }
-            ShardCommand::AdoptTcpConnection { .. } => {
-                debug_assert!(false, "TCP handoff is consumed by the worker");
-            }
             ShardCommand::AuthenticateTransport { source, address } => {
                 self.registry.authenticate_addr(source, address);
                 metrics::counter!("demux_flow_authenticated").increment(1);
@@ -807,10 +770,6 @@ impl ShardExecution {
                 address,
                 source_shard,
             } => {
-                if batch.transport == net::Transport::Tcp {
-                    record_routing_drop("transport", "tcp_owner", "forwarded");
-                    return;
-                }
                 // A datagram that reached the node on another shard's socket.
                 // Ordinary while a flow is bootstrapping — the steering map is
                 // a cache, and a miss lands on whatever the kernel's tuple hash
@@ -902,7 +861,6 @@ impl ShardExecution {
     pub(crate) fn poll_and_flush_dirty(
         &mut self,
         udp_socket: &mut UnifiedSocket,
-        tcp_socket: &mut net::tcp::TcpTransport,
         budget: usize,
     ) -> usize {
         // Commands and update retirements can create transports after the
@@ -933,7 +891,7 @@ impl ShardExecution {
             if let Some(deadline) = participant.poll(now, &mut sink) {
                 self.timers.schedule(key, deadline);
             }
-            self.drain_participant_network(key, udp_socket, tcp_socket);
+            self.drain_participant_network(key, udp_socket);
         }
         if !self.dirty.exhausted() {
             self.dirty.finish_partial();
@@ -941,7 +899,6 @@ impl ShardExecution {
             self.dirty.finish_phase();
         }
         self.udp_send_batch.flush(udp_socket);
-        self.tcp_send_batcher.flush(tcp_socket);
         processed
     }
 }
@@ -1003,7 +960,6 @@ mod wrong_owner_tests {
             stride: len,
             len,
             transport: Transport::Udp(UdpMode::Scalar),
-            tcp_flow: None,
             received_at: pulsebeam_runtime::net::ReceiveTime::now(),
             offset: 0,
         });
@@ -1053,7 +1009,6 @@ mod wrong_owner_tests {
                 stride: len,
                 len,
                 transport: Transport::Udp(UdpMode::Scalar),
-                tcp_flow: None,
                 received_at: pulsebeam_runtime::net::ReceiveTime::now(),
                 offset: 0,
             },
@@ -1265,10 +1220,9 @@ mod wrong_owner_tests {
             )
             .await
             .unwrap();
-            let mut tcp = net::tcp::TcpTransport::new(udp.local_addr());
             let wall_now = Instant::now();
             assert!(wall_now > turn_started + pulsebeam_runtime::SHARD_TIMER_QUANTUM);
-            assert_eq!(core.poll_and_flush_dirty(&mut udp, &mut tcp, 256), 2);
+            assert_eq!(core.poll_and_flush_dirty(&mut udp, 256), 2);
             let deadline = core.next_timer_deadline().unwrap();
             assert!(deadline >= wall_now);
             assert!(deadline <= wall_now + Duration::from_millis(101));

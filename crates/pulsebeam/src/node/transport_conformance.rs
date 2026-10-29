@@ -1,4 +1,4 @@
-//! One real dual-stack ICE/DTLS/SCTP/application witness, not a protocol matrix.
+//! Real dual-stack UDP and isolated ICE-TCP SDK/application witnesses.
 use super::*;
 use anyhow::{anyhow, bail, ensure};
 use pulsebeam_agent_native::agent_core::{
@@ -21,6 +21,21 @@ const CLEANUP: Duration = Duration::from_secs(10);
 const TOPIC: &str = "dual-stack-probe";
 const A_TO_B: &[u8] = b"application-owned IPv4 to IPv6 probe";
 const B_TO_A: &[u8] = b"application-owned IPv6 to IPv4 probe";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Protocol {
+    Udp,
+    Tcp,
+}
+
+impl Protocol {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Udp => "udp",
+            Self::Tcp => "tcp",
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Family {
@@ -46,16 +61,29 @@ struct AnswerEvidence {
     candidates: Vec<SocketAddr>,
 }
 
-fn constrain_answer(answer: &str, family: Family, port: u16) -> Result<(String, AnswerEvidence)> {
+fn constrain_answer(
+    answer: &str,
+    family: Family,
+    port: u16,
+    protocol: Protocol,
+) -> Result<(String, AnswerEvidence)> {
     let mut candidates = Vec::new();
     let mut filtered = Vec::new();
     for line in answer.split("\r\n") {
         if line.starts_with("a=candidate:") {
             let fields: Vec<_> = line.split_ascii_whitespace().collect();
             ensure!(
-                fields.get(2).is_some_and(|p| p.eq_ignore_ascii_case("udp")),
-                "server advertised non-UDP candidate"
+                fields
+                    .get(2)
+                    .is_some_and(|p| p.eq_ignore_ascii_case(protocol.as_str())),
+                "server advertised an unexpected transport"
             );
+            if protocol == Protocol::Tcp {
+                ensure!(
+                    fields.windows(2).any(|pair| pair == ["tcptype", "passive"]),
+                    "server ICE-TCP candidate is not passive"
+                );
+            }
             let ip: IpAddr = fields
                 .get(4)
                 .context("candidate address missing")?
@@ -81,7 +109,7 @@ fn constrain_answer(answer: &str, family: Family, port: u16) -> Result<(String, 
     for required in [Family::V4.address(port), Family::V6.address(port)] {
         ensure!(
             candidates.contains(&required),
-            "actual server answer lacks required UDP candidate {required}"
+            "actual server answer lacks required candidate {required}"
         );
     }
     Ok((filtered.join("\r\n"), AnswerEvidence { candidates }))
@@ -91,6 +119,7 @@ struct FamilyHttp {
     client: reqwest::Client,
     family: Family,
     port: u16,
+    protocol: Protocol,
     answer: watch::Sender<Option<AnswerEvidence>>,
 }
 impl AsyncHttpClient for FamilyHttp {
@@ -116,7 +145,8 @@ impl AsyncHttpClient for FamilyHttp {
                 .get("answer")
                 .and_then(Value::as_str)
                 .context("native HTTP answer missing")?;
-            let (filtered, evidence) = constrain_answer(answer, self.family, self.port)?;
+            let (filtered, evidence) =
+                constrain_answer(answer, self.family, self.port, self.protocol)?;
             *body
                 .get_mut("answer")
                 .context("native HTTP answer missing")? = Value::String(filtered);
@@ -139,6 +169,7 @@ fn selected_pair(
     stats: &NativeStatistics,
     generation: u64,
     remote: SocketAddr,
+    protocol: Protocol,
 ) -> Result<SelectedPair> {
     ensure!(
         stats.generation == generation,
@@ -195,9 +226,17 @@ fn selected_pair(
             "candidate kind mismatch"
         );
         ensure!(
-            candidate.get("protocol").and_then(Value::as_str) == Some("udp"),
-            "selected candidate is not UDP"
+            candidate.get("protocol").and_then(Value::as_str) == Some(protocol.as_str()),
+            "selected candidate protocol mismatch"
         );
+        // Native peer-reflexive local candidates can retain "passive" after
+        // initiating TCP. Require the advertised server's role, not a local role.
+        if protocol == Protocol::Tcp && kind == "remote-candidate" {
+            ensure!(
+                candidate.get("tcpType").and_then(Value::as_str) == Some("passive"),
+                "selected server ICE-TCP candidate is not passive: {candidate}"
+            );
+        }
         let address: IpAddr = candidate
             .get("address")
             .and_then(Value::as_str)
@@ -215,7 +254,7 @@ fn selected_pair(
     let selected_remote = candidate("remoteCandidateId", "remote-candidate")?;
     ensure!(
         selected_remote == remote && Family::of(local.ip()) == Family::of(remote.ip()),
-        "selected pair family/address does not match constrained UDP server"
+        "selected pair family/address does not match constrained server"
     );
     Ok(SelectedPair {
         generation,
@@ -250,6 +289,7 @@ async fn ready(
     agent: &Agent,
     remote: SocketAddr,
     prior: Option<&SelectedPair>,
+    protocol: Protocol,
 ) -> Result<SelectedPair> {
     let mut snapshots = agent.snapshots();
     let mut statistics = agent.statistics();
@@ -275,11 +315,21 @@ async fn ready(
         }) && snapshot.topics.subscribers.iter().any(|status| {
             status.registration.topic == TOPIC && status.channel.is_some() && status.publishers >= 1
         });
+        tracing::info!(?protocol, %remote, connection = ?snapshot.connection, topics_ready,
+            has_statistics = statistics.borrow().is_some(), "qualification readiness");
         if snapshot.connection == ConnectionState::Connected
             && topics_ready
             && let (Some(generation), Some(stats)) =
                 (snapshot.generation, statistics.borrow().as_ref())
-            && let Ok(pair) = selected_pair(stats, generation.get(), remote)
+            && let Err(error) = selected_pair(stats, generation.get(), remote, protocol)
+        {
+            tracing::info!(?error, ?protocol, %remote, "waiting for qualified selected pair");
+        }
+        if snapshot.connection == ConnectionState::Connected
+            && topics_ready
+            && let (Some(generation), Some(stats)) =
+                (snapshot.generation, statistics.borrow().as_ref())
+            && let Ok(pair) = selected_pair(stats, generation.get(), remote, protocol)
             && prior.is_none_or(|prior| pair.timestamp_us > prior.timestamp_us)
         {
             return Ok(pair);
@@ -380,14 +430,17 @@ fn config(endpoint: &str, participant: &str) -> Result<Config> {
     Ok(Config::new(session))
 }
 
-async fn witness(a: &Agent, b: &Agent, port: u16) -> Result<()> {
+async fn witness(a: &Agent, b: &Agent, port: u16, protocol: Protocol) -> Result<()> {
     let events_a = a.events();
     let events_b = b.events();
     let (pair_a, pair_b) = tokio::time::timeout(CONNECT, async {
         tokio::try_join!(a.replace_desired(desired()), b.replace_desired(desired()))?;
-        tokio::try_join!(ready(a, Family::V4.address(port), None), ready(b, Family::V6.address(port), None))
-    }).await.context("FAILED: 30s dual-stack connection/topic/selected-pair evidence deadline; require IPv4/IPv6 loopback and native UDP candidates")??;
-    tracing::info!("EXERCISED both UDP selected families and public topic readiness");
+        tokio::try_join!(ready(a, Family::V4.address(port), None, protocol), ready(b, Family::V6.address(port), None, protocol))
+    }).await.context("FAILED: 30s dual-stack connection/topic/selected-pair evidence deadline; require IPv4/IPv6 loopback and compatible native candidates")??;
+    tracing::info!(
+        ?protocol,
+        "EXERCISED both selected families and public topic readiness"
+    );
     let sender_a = a
         .snapshot()
         .participant_external_id
@@ -413,8 +466,8 @@ async fn witness(a: &Agent, b: &Agent, port: u16) -> Result<()> {
         )?;
         tracing::info!("EXERCISED both recipient application payloads");
         tokio::try_join!(
-            ready(a, pair_a.remote, Some(&pair_a)),
-            ready(b, pair_b.remote, Some(&pair_b))
+            ready(a, pair_a.remote, Some(&pair_a), protocol),
+            ready(b, pair_b.remote, Some(&pair_b), protocol)
         )?;
         for (agent, pair) in [(a, &pair_a), (b, &pair_b)] {
             let snapshot = agent.snapshot();
@@ -429,12 +482,12 @@ async fn witness(a: &Agent, b: &Agent, port: u16) -> Result<()> {
     .await
     .context("FAILED: 30s bidirectional application payload/live-family deadline")??;
     tracing::info!(
-        "EXERCISED concurrent real UDP IPv4/IPv6 selected pairs, DTLS/SCTP, bidirectional recipient application probes"
+        protocol = ?protocol, "EXERCISED concurrent real IPv4/IPv6 selected pairs, DTLS/SCTP, bidirectional recipient application probes"
     );
     Ok(())
 }
 
-async fn run() -> Result<()> {
+async fn run(protocol: Protocol) -> Result<()> {
     use pulsebeam_core::auth::{
         DEVELOPMENT_API_KEY_ID, DEVELOPMENT_API_PUBLIC_KEY, DEVELOPMENT_PROJECT_ID,
         KeyRegistryEntry,
@@ -454,9 +507,8 @@ async fn run() -> Result<()> {
     let builder = NodeBuilder::new()
         .data_threads(1)
         .work_stealing(1)
-        .local_addr("[::]:0".parse()?)
+        .local_addr(SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), port))
         .external_addrs(vec![Family::V4.address(port), Family::V6.address(port)])
-        .udp_only()
         .rng(pulsebeam_runtime::rand::os_rng())
         .with_http_api_listener(http)
         .with_key_registry(KeyRegistry::new(
@@ -466,6 +518,10 @@ async fn run() -> Result<()> {
                 public_key: *DEVELOPMENT_API_PUBLIC_KEY,
             }],
         )?);
+    let builder = match protocol {
+        Protocol::Udp => builder.udp_only(),
+        Protocol::Tcp => builder.tcp_only(),
+    };
     let advertised = builder.advertised_udp_addrs()?;
     let shutdown = CancellationToken::new();
     let mut node =
@@ -482,6 +538,7 @@ async fn run() -> Result<()> {
                     client: reqwest::Client::new(),
                     family,
                     port,
+                    protocol,
                     answer,
                 })),
             )
@@ -492,7 +549,7 @@ async fn run() -> Result<()> {
         let a = agents.first().context("IPv4 agent missing")?;
         let b = agents.get(1).context("IPv6 agent missing")?;
         tokio::select! {
-            result = witness(a, b, port) => result?,
+            result = witness(a, b, port, protocol) => result?,
             result = &mut node => {
                 node_observed = true;
                 bail!("production node exited before qualification: {result:?}");
@@ -506,7 +563,7 @@ async fn run() -> Result<()> {
             ensure!(
                 evidence.candidates.contains(&Family::V4.address(port))
                     && evidence.candidates.contains(&Family::V6.address(port)),
-                "both actual answers must advertise both UDP families"
+                "both actual answers must advertise both IP families"
             );
         }
         anyhow::Ok(())
@@ -562,13 +619,22 @@ async fn run() -> Result<()> {
 
 #[tokio::test]
 async fn concurrent_dual_stack_sdk_payloads() -> Result<()> {
-    tokio::task::LocalSet::new().run_until(run()).await
+    tokio::task::LocalSet::new()
+        .run_until(run(Protocol::Udp))
+        .await
+}
+
+#[tokio::test]
+async fn concurrent_dual_stack_tcp_sdk_payloads() -> Result<()> {
+    tokio::task::LocalSet::new()
+        .run_until(run(Protocol::Tcp))
+        .await
 }
 
 #[test]
 fn answer_evidence_rejects_missing_family_and_preserves_non_candidates() -> Result<()> {
     let answer = "v=0\r\na=ice-ufrag:redacted\r\na=candidate:1 1 udp 1 127.0.0.1 9000 typ host\r\na=candidate:2 1 udp 1 ::1 9000 typ host\r\n";
-    let (filtered, _) = constrain_answer(answer, Family::V6, 9000)?;
+    let (filtered, _) = constrain_answer(answer, Family::V6, 9000, Protocol::Udp)?;
     ensure!(
         filtered == "v=0\r\na=ice-ufrag:redacted\r\na=candidate:2 1 udp 1 ::1 9000 typ host\r\n",
         "non-candidate SDP changed"
@@ -580,7 +646,7 @@ fn answer_evidence_rejects_missing_family_and_preserves_non_candidates() -> Resu
         filtered,
     ] {
         ensure!(
-            constrain_answer(&invalid, Family::V6, 9000).is_err(),
+            constrain_answer(&invalid, Family::V6, 9000, Protocol::Udp).is_err(),
             "invalid advertisement accepted"
         );
     }
@@ -650,7 +716,42 @@ fn selected_pair_rejects_unqualified_reports() -> Result<()> {
             report_json: serde_json::to_vec(report)?,
         })
     };
-    selected_pair(&stats(&report)?, generation, Family::V6.address(9000))?;
+    selected_pair(
+        &stats(&report)?,
+        generation,
+        Family::V6.address(9000),
+        Protocol::Udp,
+    )?;
+    let mut tcp = report.clone();
+    for (index, kind) in [(2, "prflx"), (3, "host")] {
+        let candidate = tcp
+            .get_mut(index)
+            .and_then(Value::as_object_mut)
+            .context("test TCP candidate")?;
+        candidate.insert("protocol".into(), json!("tcp"));
+        candidate.insert("candidateType".into(), json!(kind));
+        candidate.insert("tcpType".into(), json!("passive"));
+    }
+    selected_pair(
+        &stats(&tcp)?,
+        generation,
+        Family::V6.address(9000),
+        Protocol::Tcp,
+    )?;
+    tcp.get_mut(3)
+        .and_then(Value::as_object_mut)
+        .context("test server TCP candidate")?
+        .insert("tcpType".into(), json!("active"));
+    ensure!(
+        selected_pair(
+            &stats(&tcp)?,
+            generation,
+            Family::V6.address(9000),
+            Protocol::Tcp
+        )
+        .is_err(),
+        "non-passive server candidate accepted"
+    );
     for (index, key, value) in [
         (0, "selectedCandidatePairId", Value::Null),
         (0, "selectedCandidatePairId", json!("missing")),
@@ -669,14 +770,20 @@ fn selected_pair_rejects_unqualified_reports() -> Result<()> {
             .get_mut(key)
             .context("test report field")? = value;
         ensure!(
-            selected_pair(&stats(&invalid)?, generation, Family::V6.address(9000)).is_err(),
+            selected_pair(
+                &stats(&invalid)?,
+                generation,
+                Family::V6.address(9000),
+                Protocol::Udp
+            )
+            .is_err(),
             "invalid selected-pair evidence accepted"
         );
     }
     let mut stale = stats(&report)?;
     stale.generation = 2;
     ensure!(
-        selected_pair(&stale, generation, Family::V6.address(9000)).is_err(),
+        selected_pair(&stale, generation, Family::V6.address(9000), Protocol::Udp).is_err(),
         "stale generation accepted"
     );
     Ok(())
