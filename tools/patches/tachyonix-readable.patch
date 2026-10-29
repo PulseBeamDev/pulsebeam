@@ -4,7 +4,8 @@ diff --git a/src/lib.rs b/src/lib.rs
 @@ -288,6 +288,41 @@
          }
      }
- 
+-
++
 +    /// Waits for an item or terminal closure without consuming a queue slot.
 +    ///
 +    /// Cancellation leaves every item in the queue. Returns false only when
@@ -49,7 +50,8 @@ diff --git a/src/queue.rs b/src/queue.rs
 @@ -198,6 +198,29 @@
          }
      }
- 
+-
++
 +    /// Checks the next slot without popping it or releasing capacity.
 +    ///
 +    /// # Safety
