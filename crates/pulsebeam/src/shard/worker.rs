@@ -14,10 +14,8 @@ use std::{sync::Arc, time::Duration};
 use crate::clock::WallAnchor;
 use crate::route::Envelope;
 
-use pulsebeam_runtime::{
-    mailbox::{self},
-    net::{self, RecvPacketBatch, UnifiedSocket},
-};
+use pulsebeam_queue as mailbox;
+use pulsebeam_runtime::net::{self, RecvPacketBatch, UnifiedSocket};
 use tokio::time::{Instant, Sleep};
 
 use crate::{
@@ -610,11 +608,11 @@ impl ShardWorker {
         // Block until at least one source is ready.
         tokio::select! {
             biased;
-            Some(_) = self.core.update_readable() => {}
+            true = self.core.update_readable() => {}
             Ok(_) = self.udp_socket.readable() => {}
-            Some(_) = self.frame_rx.readable() => {}
+            true = self.frame_rx.readable() => {}
             Ok(_) = self.tcp_socket.readable() => {}
-            Some(_) = self.command_rx.readable() => {}
+            true = self.command_rx.readable() => {}
             _ = sleep.as_mut(), if has_timer => {}
             else => return Err(ShardError::ManagerDisconnected),
         }

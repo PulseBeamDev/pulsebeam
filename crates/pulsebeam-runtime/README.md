@@ -1,8 +1,11 @@
 # `pulsebeam-runtime`
 
-Runtime seams underneath PulseBeam's shard model: bounded mailboxes, task
-spawning, deterministic randomness, fatal handling, network adapters, and real
-or simulated UDP/TCP implementations.
+Runtime seams underneath PulseBeam's shard model: task spawning, deterministic
+randomness, fatal handling, network adapters, and real or simulated UDP/TCP
+implementations.
+
+Bounded ownership handoff lives in [pulsebeam-queue](../pulsebeam-queue/README.md).
+Consumers that only need a queue should depend on that crate directly.
 
 This crate may contain shared primitives at the boundary on which shards run.
 Mutable packet runtime in `pulsebeam` must remain shard-owned, even when a shard

@@ -1,0 +1,25 @@
+[package]
+name = "pulsebeam-queue"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+documentation.workspace = true
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+tachyonix = "=0.3.1"
+
+[[bench]]
+name = "handoff"
+harness = false
+
+[dev-dependencies]
+libc = "0.2.186"
+futures-lite.workspace = true
+tokio.workspace = true

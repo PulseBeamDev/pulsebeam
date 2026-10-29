@@ -7,7 +7,7 @@ use crate::entity::{ParticipantId, TrackId};
 use crate::id::ShardId;
 use crate::media::Rid;
 use crate::route::{NodeRouteAddress, NodeTransportAddress};
-use pulsebeam_runtime::mailbox;
+use pulsebeam_queue as mailbox;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct TrackPlan {
@@ -295,7 +295,9 @@ impl ShardUpdateWriter {
 pub(crate) fn new_shard_update(
     shard: ShardId,
 ) -> (ShardUpdateWriter, mailbox::Receiver<Box<ShardUpdate>>) {
-    let (tx, rx) = mailbox::new(crate::shard::worker::SHARD_UPDATE_CAPACITY);
+    let (tx, rx) = mailbox::bounded(
+        const { core::num::NonZeroUsize::new(crate::shard::worker::SHARD_UPDATE_CAPACITY).unwrap() },
+    );
     (
         ShardUpdateWriter {
             #[cfg(feature = "sim")]

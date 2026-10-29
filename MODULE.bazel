@@ -151,6 +151,14 @@ crate.annotation(
 # Cargo's custom tokio_unstable cfg is applied by .bazelrc, but crate-universe
 # does not include cfg-gated edges in its generated platform selects.
 crate.annotation(crate = "tokio", deps = ["@crates//tracing"], repositories = ["crates"])
+# Readiness must not prefetch outside the bounded ring. Keep the existing
+# tachyonix send/pop path and expose its slot predicate with its native waker.
+crate.annotation(
+    crate = "tachyonix",
+    repositories = ["crates"],
+    patches = ["//tools:patches/tachyonix-readable.patch"],
+    patch_args = ["-p1"],
+)
 # Established-stream retry mechanism adapted from upstream turmoil-net ad57de6.
 # Keep legacy Sim integration; SYN and final-close semantics remain upstream 0.7.2.
 crate.annotation(

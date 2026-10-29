@@ -7,7 +7,7 @@ use crate::{
     route::{NodeRouteAddress, NodeTransportAddress},
     track::{SelectionPolicy, TrackMeta, TrackSelector},
 };
-use pulsebeam_runtime::mailbox;
+use pulsebeam_queue as mailbox;
 use tokio::sync::oneshot;
 
 #[derive(Clone, Debug)]

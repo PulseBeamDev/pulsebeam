@@ -1,0 +1,78 @@
+diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -288,6 +288,41 @@
+         }
+     }
+ 
++    /// Waits for an item or terminal closure without consuming a queue slot.
++    ///
++    /// Cancellation leaves every item in the queue. Returns false only when
++    /// the channel is closed and drained.
++    pub async fn readable(&mut self) -> bool {
++        std::future::poll_fn(|cx| {
++            // Safety: the exclusive receiver borrow serializes queue inspection
++            // and waker registration, just as in Stream::poll_next.
++            unsafe {
++                match self.inner.queue.readable() {
++                    Ok(()) => return Poll::Ready(true),
++                    Err(PopError::Closed) => return Poll::Ready(false),
++                    Err(PopError::Empty) => {}
++                }
++
++                self.inner.receiver_signal.register(cx.waker());
++
++                // Recheck after registration so sends and last-sender drops
++                // racing with registration cannot strand the receiver.
++                match self.inner.queue.readable() {
++                    Ok(()) => {
++                        self.inner.receiver_signal.unregister();
++                        Poll::Ready(true)
++                    }
++                    Err(PopError::Closed) => {
++                        self.inner.receiver_signal.unregister();
++                        Poll::Ready(false)
++                    }
++                    Err(PopError::Empty) => Poll::Pending,
++                }
++            }
++        })
++        .await
++    }
++
+     /// Receives a message asynchronously, if necessary waiting until one
+     /// becomes available.
+     pub async fn recv(&mut self) -> Result<T, RecvError> {
+diff --git a/src/queue.rs b/src/queue.rs
+--- a/src/queue.rs
++++ b/src/queue.rs
+@@ -198,6 +198,29 @@
+         }
+     }
+ 
++    /// Checks the next slot without popping it or releasing capacity.
++    ///
++    /// # Safety
++    ///
++    /// Like pop, this must not run concurrently with another consumer.
++    pub(super) unsafe fn readable(&self) -> Result<(), PopError> {
++        let dequeue_pos = self.dequeue_pos.with(|p| *p);
++        let slot = &self.buffer[dequeue_pos & self.right_mask];
++        let stamp = slot.stamp.load(Ordering::Acquire);
++
++        if dequeue_pos != stamp {
++            Ok(())
++        } else if self.enqueue_pos.load(Ordering::Relaxed)
++            == (dequeue_pos | self.closed_channel_mask)
++        {
++            // As in pop, closure is terminal only after any producer that
++            // reserved this slot has published its value.
++            Err(PopError::Closed)
++        } else {
++            Err(PopError::Empty)
++        }
++    }
++
+     /// Closes the queue.
+     pub(super) fn close(&self) {
+         // Set the closed-channel flag.

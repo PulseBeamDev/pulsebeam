@@ -1,7 +1,5 @@
-use pulsebeam_runtime::{
-    mailbox,
-    net::{self, UnifiedSocket},
-};
+use pulsebeam_queue as mailbox;
+use pulsebeam_runtime::net::{self, UnifiedSocket};
 use slotmap::SecondaryMap;
 use tokio::time::Instant;
 
@@ -121,7 +119,7 @@ impl ShardCore {
         self.updates.apply(&mut self.execution, budget)
     }
 
-    pub(crate) async fn update_readable(&mut self) -> Option<()> {
+    pub(crate) async fn update_readable(&mut self) -> bool {
         self.updates.readable().await
     }
 

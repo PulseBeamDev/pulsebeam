@@ -1,5 +1,5 @@
 use crate::shard::metrics::MetricsSnapshot;
-use pulsebeam_runtime::mailbox::{self};
+use pulsebeam_queue as mailbox;
 use pulsebeam_runtime::rand::RngCore;
 use std::hash::{BuildHasher, Hash, Hasher};
 

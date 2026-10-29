@@ -20,7 +20,7 @@ rust_library(
     rustc_env_files = [":cargo_env"],
     lint_config = ":lints",
     aliases = aliases(),
-    deps = all_crate_deps(normal = True) + ["//crates/pulsebeam-core:pulsebeam-core", "//crates/pulsebeam-routing:pulsebeam-routing"],
+    deps = all_crate_deps(normal = True) + ["//crates/pulsebeam-queue:pulsebeam-queue", "//crates/pulsebeam-core:pulsebeam-core", "//crates/pulsebeam-routing:pulsebeam-routing"],
     proc_macro_deps = all_crate_deps(proc_macro = True),
 )
 
@@ -36,7 +36,7 @@ rust_library(
     rustc_env_files = [":cargo_env"],
     lint_config = ":lints",
     aliases = aliases(),
-    deps = all_crate_deps(normal = True) + ["//crates/pulsebeam-core:pulsebeam-core-sim", "//crates/pulsebeam-routing:pulsebeam-routing"],
+    deps = all_crate_deps(normal = True) + ["//crates/pulsebeam-queue:pulsebeam-queue", "//crates/pulsebeam-core:pulsebeam-core-sim", "//crates/pulsebeam-routing:pulsebeam-routing"],
     proc_macro_deps = all_crate_deps(proc_macro = True),
 )
 

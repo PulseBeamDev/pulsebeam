@@ -11,6 +11,7 @@ members = [
   "crates/pulsebeam-libwebrtc-sys",
   "crates/pulsebeam-rtc/simulation",
   "crates/pulsebeam-runtime",
+  "crates/pulsebeam-queue",
   "crates/pulsebeam-simulator",
   "crates/pulsebeam-testdata",
   "agents/pulsebeam-agent-core",

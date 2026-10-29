@@ -26,8 +26,8 @@ use pulsebeam_core::auth::{
     AuthorizationExpiry, KeyRegistry, MAX_COMPACT_TOKEN_LEN, TokenError, VerifiedAuthorization,
     verify_participant_token,
 };
+use pulsebeam_queue as mailbox;
 use pulsebeam_rtc::LocalCandidate;
-use pulsebeam_runtime::mailbox;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
@@ -332,14 +332,14 @@ impl ControllerActor {
                     _ = tokio::time::sleep_until(
                         authorization_deadline.unwrap_or_else(tokio::time::Instant::now)
                     ), if authorization_deadline.is_some() => false,
-                    Some(_) = shard_event_rx.readable() => false,
+                    true = shard_event_rx.readable() => false,
                     Some(result) = self.renewal_rx.recv() => {
                         self.finish_renewal(result);
                         false
                     },
                     _ = poll_interval.tick() => true,
-                    Some(_) = pending_rx.readable() => false,
-                    Some(_) = command_rx.readable() => false,
+                    true = pending_rx.readable() => false,
+                    true = command_rx.readable() => false,
                 }
             };
 
@@ -1436,7 +1436,8 @@ mod replacement_tests {
         reason = "the production ShardContext owns the sanctioned shared occupancy counters"
     )]
     fn actor() -> ControllerActor {
-        let (command_tx, _command_rx) = mailbox::new(4);
+        let (command_tx, _command_rx) =
+            mailbox::bounded(const { core::num::NonZeroUsize::new(4).unwrap() });
         let (renewal_tx, renewal_rx) = tokio::sync::mpsc::channel(MAX_PENDING_RENEWALS);
         let context = ShardContext {
             command_tx,

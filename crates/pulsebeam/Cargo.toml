@@ -37,6 +37,7 @@ pprof = { version = "0.15.0", features = [
   "protobuf",
 ] }
 pulsebeam-core = { path = "../pulsebeam-core" }
+pulsebeam-queue = { path = "../pulsebeam-queue" }
 pulsebeam-rtc = { path = "../pulsebeam-rtc" }
 pulsebeam-proto = { path = "../pulsebeam-proto" }
 pulsebeam-routing = { path = "../pulsebeam-routing" }

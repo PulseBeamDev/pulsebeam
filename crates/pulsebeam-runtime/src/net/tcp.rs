@@ -8,9 +8,10 @@
 
 use super::{ReceiveTime, RecvPacketBatch, SendPacketBatch};
 use crate::net::Transport;
-use crate::{mailbox, net::SendPacket, sync::Arc};
+use crate::{net::SendPacket, sync::Arc};
 use bytes::{Buf, BufMut, BytesMut};
 use pulsebeam_core::net::{TcpReadHalf, TcpStream, TcpWriteHalf, split_tcp};
+use pulsebeam_queue as mailbox;
 use std::{
     collections::{HashMap, VecDeque},
     io,
@@ -382,7 +383,8 @@ pub struct TcpTransport {
 
 impl TcpTransport {
     pub fn new(local_addr: SocketAddr) -> Self {
-        let (event_tx, event_rx) = mailbox::new(TCP_EVENT_CAPACITY);
+        let (event_tx, event_rx) =
+            mailbox::bounded(const { core::num::NonZeroUsize::new(TCP_EVENT_CAPACITY).unwrap() });
         Self {
             local_addr,
             conns: HashMap::new(),

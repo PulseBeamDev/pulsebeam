@@ -24,7 +24,8 @@ use std::{
 };
 
 use pulsebeam_core::net::TcpListener;
-use pulsebeam_runtime::{mailbox, net::tcp::BufferedTcpStream};
+use pulsebeam_queue as mailbox;
+use pulsebeam_runtime::net::tcp::BufferedTcpStream;
 use tokio::sync::mpsc::Sender;
 use tokio_util::sync::CancellationToken;
 
@@ -88,7 +89,8 @@ impl TcpAcceptor {
         config: TcpAcceptorConfig,
         shutdown: CancellationToken,
     ) -> Self {
-        let (event_tx, event_rx) = mailbox::new(256);
+        let (event_tx, event_rx) =
+            mailbox::bounded(const { core::num::NonZeroUsize::new(256).unwrap() });
         tokio::task::spawn(acceptor_loop(listener, config, event_tx, shutdown));
         Self { event_rx }
     }

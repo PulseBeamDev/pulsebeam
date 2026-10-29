@@ -1,0 +1,45 @@
+load("@crates//:defs.bzl", "aliases", "all_crate_deps", "crate_edition")
+load("@rules_rust//cargo:defs.bzl", "cargo_toml_env_vars", "extract_cargo_lints")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_clippy_test", "rust_library", "rust_test", "rustfmt_test")
+
+package(default_visibility = ["//visibility:public"])
+filegroup(name = "workflow_inputs", srcs = glob(["*.md"]))
+exports_files(["Cargo.toml"])
+filegroup(name = "cargo_metadata_inputs", srcs = glob(["Cargo.toml", "src/**/*.rs", "benches/**/*.rs"]))
+
+cargo_toml_env_vars(name = "cargo_env", src = "Cargo.toml", workspace = "//:Cargo.toml")
+extract_cargo_lints(name = "lints", manifest = "Cargo.toml", workspace = "//:Cargo.toml")
+
+rust_library(
+    name = "pulsebeam-queue",
+    crate_root = "src/lib.rs",
+    srcs = glob(["src/**/*.rs"]),
+    edition = crate_edition(),
+    rustc_env_files = [":cargo_env"],
+    lint_config = ":lints",
+    aliases = aliases(),
+    deps = all_crate_deps(normal = True),
+)
+
+rust_test(
+    name = "unit_tests",
+    crate = ":pulsebeam-queue",
+    lint_config = ":lints",
+    aliases = aliases(normal_dev = True),
+    deps = all_crate_deps(normal_dev = True),
+)
+
+rust_binary(
+    name = "benchmark",
+    testonly = True,
+    crate_root = "benches/handoff.rs",
+    srcs = ["benches/handoff.rs"],
+    edition = crate_edition(),
+    lint_config = ":lints",
+    rustc_env_files = [":cargo_env"],
+    aliases = aliases(normal_dev = True),
+    deps = all_crate_deps(normal = True, normal_dev = True) + [":pulsebeam-queue"],
+)
+
+rustfmt_test(name = "format", targets = [":pulsebeam-queue", ":benchmark"])
+rust_clippy_test(name = "clippy", targets = [":pulsebeam-queue", ":unit_tests", ":benchmark"])

@@ -24,7 +24,6 @@
 pub mod buggify;
 pub mod collections;
 pub mod fatal;
-pub mod mailbox;
 pub mod net;
 pub mod prelude;
 pub mod rand;

@@ -6,7 +6,7 @@
 
 use std::collections::BTreeMap;
 
-use pulsebeam_runtime::mailbox;
+use pulsebeam_queue as mailbox;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 

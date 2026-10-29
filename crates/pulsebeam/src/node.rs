@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use core_affinity::get_core_ids;
 use pulsebeam_core::auth::KeyRegistry;
 use pulsebeam_core::net::TcpListener;
-use pulsebeam_runtime::mailbox;
+use pulsebeam_queue as mailbox;
 use pulsebeam_runtime::net;
 use pulsebeam_runtime::net::UdpMode;
 use pulsebeam_runtime::rand;
@@ -853,12 +853,18 @@ impl NodeBuilder {
         let mut shard_executor =
             shard_executor::Executor::new(shard_runtime, data_threads, cpu_cores.clone())?;
 
-        let (shard_event_tx, shard_event_rx) =
-            mailbox::new(crate::shard::worker::SHARD_EVENT_CAPACITY);
+        let (shard_event_tx, shard_event_rx) = mailbox::bounded(
+            const { core::num::NonZeroUsize::new(crate::shard::worker::SHARD_EVENT_CAPACITY).unwrap() },
+        );
         let mut frame_txs = Vec::with_capacity(shard_count);
         let mut frame_rxs = Vec::with_capacity(shard_count);
         for _ in 0..shard_count {
-            let (tx, rx) = mailbox::new(crate::shard::worker::SHARD_FRAME_CAPACITY);
+            let (tx, rx) = mailbox::bounded(
+                const {
+                    core::num::NonZeroUsize::new(crate::shard::worker::SHARD_FRAME_CAPACITY)
+                        .unwrap()
+                },
+            );
             frame_txs.push(tx);
             frame_rxs.push(rx);
         }
@@ -879,11 +885,18 @@ impl NodeBuilder {
 
         // Only built when something will scrape it, so a node without the
         // internal server never pays for a snapshot it would throw away.
-        let stats_lane = internal_ctx.is_some().then(|| {
-            mailbox::new::<Box<crate::shard::recorder::ShardStatsReport>>(
-                crate::shard::worker::STATS_CAPACITY.saturating_mul(shard_count.max(1)),
-            )
-        });
+        let stats_lane = if internal_ctx.is_some() {
+            Some(mailbox::bounded::<
+                Box<crate::shard::recorder::ShardStatsReport>,
+            >(
+                core::num::NonZeroUsize::new(
+                    crate::shard::worker::STATS_CAPACITY.saturating_mul(shard_count.max(1)),
+                )
+                .ok_or_else(|| anyhow::anyhow!("stats queue capacity must be nonzero"))?,
+            ))
+        } else {
+            None
+        };
         let (stats_tx, stats_rx) = match stats_lane {
             Some((tx, rx)) => (Some(tx), Some(rx)),
             None => (None, None),
@@ -900,8 +913,12 @@ impl NodeBuilder {
             let shard_id = ShardId::new(shard_idx);
             let (update_writer, update_reader) = crate::shard_update::new_shard_update(shard_id);
             view_writers.push(update_writer);
-            let (shard_command_tx, shard_command_rx) =
-                mailbox::new(crate::shard::worker::SHARD_COMMAND_CAPACITY);
+            let (shard_command_tx, shard_command_rx) = mailbox::bounded(
+                const {
+                    core::num::NonZeroUsize::new(crate::shard::worker::SHARD_COMMAND_CAPACITY)
+                        .unwrap()
+                },
+            );
             let shard_event_tx = shard_event_tx.clone();
             let frame_txs = frame_txs.clone();
             #[allow(
@@ -964,7 +981,8 @@ impl NodeBuilder {
         controller.set_key_registry(self.key_registry.clone());
         // intentionally small so backpressure is applied early
         // with 62.5 ms pacing rate, at most we get 1s latency here.
-        let (controller_command_tx, controller_command_rx) = mailbox::new(16);
+        let (controller_command_tx, controller_command_rx) =
+            mailbox::bounded(const { core::num::NonZeroUsize::new(16).unwrap() });
         #[cfg(feature = "sim")]
         if let Some(reply) = self.sim_observer {
             let _ = reply.try_send(crate::sim_observation::Observer::new(
@@ -1300,7 +1318,8 @@ mod internal {
 
             // One scrape at a time is plenty; a queue here would only serve
             // several callers the same numbers a moment apart.
-            let (scrape_tx, scrape_rx) = mailbox::new(1);
+            let (scrape_tx, scrape_rx) =
+                mailbox::bounded(const { core::num::NonZeroUsize::new(1).unwrap() });
             let aggregator_join = tokio::spawn(crate::control::stats_aggregator::run(
                 shard_count,
                 stats_rx,

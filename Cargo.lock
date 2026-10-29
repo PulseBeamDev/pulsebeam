@@ -3504,6 +3504,7 @@ dependencies = [
  "pulsebeam-agent-native",
  "pulsebeam-core",
  "pulsebeam-proto",
+ "pulsebeam-queue",
  "pulsebeam-routing",
  "pulsebeam-rtc",
  "pulsebeam-runtime",
@@ -3673,6 +3674,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "pulsebeam-queue"
+version = "0.3.2"
+dependencies = [
+ "futures-lite",
+ "libc",
+ "tachyonix",
+ "tokio",
+]
+
+[[package]]
 name = "pulsebeam-routing"
 version = "0.3.2"
 dependencies = [
@@ -3725,11 +3736,11 @@ dependencies = [
  "once_cell",
  "parking_lot",
  "pulsebeam-core",
+ "pulsebeam-queue",
  "pulsebeam-routing",
  "rand 0.10.2",
  "socket2",
  "systemstat",
- "tachyonix",
  "thiserror 2.0.20",
  "tokio",
  "tokio-util",

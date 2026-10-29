@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 
-use pulsebeam_runtime::mailbox;
+use pulsebeam_queue as mailbox;
 
 use crate::entity::ParticipantId;
 use crate::participant::ParticipantEffect;
@@ -120,7 +120,7 @@ impl ShardUpdateApplication {
         applied
     }
 
-    pub(crate) async fn readable(&mut self) -> Option<()> {
+    pub(crate) async fn readable(&mut self) -> bool {
         self.update_rx.readable().await
     }
 

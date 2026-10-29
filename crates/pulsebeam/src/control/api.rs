@@ -13,7 +13,7 @@ use hyper::header::{ALLOW, AUTHORIZATION, CONTENT_TYPE, LOCATION, WWW_AUTHENTICA
 use pulsebeam_core::auth::{
     KeyRegistry, TokenError, VerifiedAuthorization, verify_participant_token,
 };
-use pulsebeam_runtime::mailbox::TrySendError;
+use pulsebeam_queue::TrySendError;
 use serde::{Deserialize, Serialize};
 use tokio::time::Instant;
 use utoipa::{OpenApi, ToSchema};
@@ -983,7 +983,8 @@ mod tests {
 
     #[tokio::test]
     async fn native_post_returns_claim_identity_answer_and_absolute_location() {
-        let (controller, mut commands) = pulsebeam_runtime::mailbox::new(4);
+        let (controller, mut commands) =
+            pulsebeam_queue::bounded(const { core::num::NonZeroUsize::new(4).unwrap() });
         let app = router(controller, cfg(), auth_registry());
         let token = live_token();
         let offer = valid_offer();
@@ -1033,7 +1034,8 @@ mod tests {
 
     #[tokio::test]
     async fn malformed_offer_is_a_negotiation_error_response() {
-        let (controller, mut commands) = pulsebeam_runtime::mailbox::new(1);
+        let (controller, mut commands) =
+            pulsebeam_queue::bounded(const { core::num::NonZeroUsize::new(1).unwrap() });
         let app = router(controller, cfg(), auth_registry());
         let offer = "not SDP\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=sendonly\r\n";
         let body = serde_json::to_vec(&serde_json::json!({"offer": offer})).unwrap();
@@ -1083,7 +1085,8 @@ mod tests {
             vec![b' '; MAX_SIGNALING_BODY_BYTES + 1],
         ];
         for body in cases {
-            let (controller, mut commands) = pulsebeam_runtime::mailbox::new(1);
+            let (controller, mut commands) =
+                pulsebeam_queue::bounded(const { core::num::NonZeroUsize::new(1).unwrap() });
             let response = router(controller, cfg(), auth_registry())
                 .oneshot(native_post(&token, body))
                 .await
@@ -1100,7 +1103,8 @@ mod tests {
             assert!(commands.try_recv().is_err());
         }
 
-        let (controller, _) = pulsebeam_runtime::mailbox::new(1);
+        let (controller, _) =
+            pulsebeam_queue::bounded(const { core::num::NonZeroUsize::new(1).unwrap() });
         let request = Request::builder()
             .method("POST")
             .uri("/api/v1/native")
@@ -1116,7 +1120,8 @@ mod tests {
 
     #[tokio::test]
     async fn native_delete_uses_claim_identity_profile_and_path_connection() {
-        let (controller, mut commands) = pulsebeam_runtime::mailbox::new(1);
+        let (controller, mut commands) =
+            pulsebeam_queue::bounded(const { core::num::NonZeroUsize::new(1).unwrap() });
         let token = live_token();
         let connection_id = ConnectionId::new();
         let request = Request::builder()
@@ -1138,7 +1143,8 @@ mod tests {
         assert_eq!(message.connection_id, connection_id);
         assert_eq!(message.profile, ConnectionProfile::Native);
 
-        let (controller, _) = pulsebeam_runtime::mailbox::new(1);
+        let (controller, _) =
+            pulsebeam_queue::bounded(const { core::num::NonZeroUsize::new(1).unwrap() });
         let malformed = Request::builder()
             .method("DELETE")
             .uri("/api/v1/native/not-a-connection")
@@ -1159,7 +1165,8 @@ mod tests {
             ("whip", Direction::SendOnly, ConnectionProfile::Whip),
             ("whep", Direction::RecvOnly, ConnectionProfile::Whep),
         ] {
-            let (controller, mut commands) = pulsebeam_runtime::mailbox::new(1);
+            let (controller, mut commands) =
+                pulsebeam_queue::bounded(const { core::num::NonZeroUsize::new(1).unwrap() });
             let app = router(controller, cfg(), auth_registry());
             let token = live_token();
             let offer = directional_offer(direction);
@@ -1207,7 +1214,8 @@ mod tests {
             sdp_post(&token, "whep", vec![b' '; MAX_SIGNALING_BODY_BYTES + 1]),
         ];
         for request in cases {
-            let (controller, mut commands) = pulsebeam_runtime::mailbox::new(1);
+            let (controller, mut commands) =
+                pulsebeam_queue::bounded(const { core::num::NonZeroUsize::new(1).unwrap() });
             let response = router(controller, cfg(), auth_registry())
                 .oneshot(request)
                 .await
@@ -1227,7 +1235,8 @@ mod tests {
             ("whip", ConnectionProfile::Whip),
             ("whep", ConnectionProfile::Whep),
         ] {
-            let (controller, mut commands) = pulsebeam_runtime::mailbox::new(1);
+            let (controller, mut commands) =
+                pulsebeam_queue::bounded(const { core::num::NonZeroUsize::new(1).unwrap() });
             let token = live_token();
             let connection_id = ConnectionId::new();
             let request = Request::builder()
@@ -1252,7 +1261,8 @@ mod tests {
 
         let token = live_token();
         for resource in ["whip", "whep"] {
-            let (controller, _) = pulsebeam_runtime::mailbox::new(1);
+            let (controller, _) =
+                pulsebeam_queue::bounded(const { core::num::NonZeroUsize::new(1).unwrap() });
             let malformed = Request::builder()
                 .method("DELETE")
                 .uri(format!("/api/v1/{resource}/not-a-connection"))
@@ -1421,7 +1431,8 @@ mod tests {
 
     #[tokio::test]
     async fn strict_profile_discovery_has_exact_methods_and_authentication() {
-        let (controller, _) = pulsebeam_runtime::mailbox::new(1);
+        let (controller, _) =
+            pulsebeam_queue::bounded(const { core::num::NonZeroUsize::new(1).unwrap() });
         let app = router(controller, cfg(), auth_registry());
         let token = live_token();
         for uri in [
@@ -1552,7 +1563,8 @@ mod tests {
 
     #[tokio::test]
     async fn router_serves_embedded_swagger_assets() {
-        let (controller, _) = pulsebeam_runtime::mailbox::new(1);
+        let (controller, _) =
+            pulsebeam_queue::bounded(const { core::num::NonZeroUsize::new(1).unwrap() });
         let app = router(controller, cfg(), auth_registry());
         let redirect = app
             .clone()
@@ -1597,7 +1609,8 @@ mod tests {
 
     #[tokio::test]
     async fn router_exposes_native_without_legacy_signaling_routes() {
-        let (controller, _) = pulsebeam_runtime::mailbox::new(1);
+        let (controller, _) =
+            pulsebeam_queue::bounded(const { core::num::NonZeroUsize::new(1).unwrap() });
         let app = router(controller, cfg(), auth_registry());
         let native = Request::builder()
             .method("POST")
@@ -1626,7 +1639,8 @@ mod tests {
 
     #[tokio::test]
     async fn native_options_remains_available_through_cors() {
-        let (controller, _) = pulsebeam_runtime::mailbox::new(1);
+        let (controller, _) =
+            pulsebeam_queue::bounded(const { core::num::NonZeroUsize::new(1).unwrap() });
         let app = router(controller, cfg(), auth_registry()).layer(
             CorsLayer::new()
                 .allow_origin(Any)
