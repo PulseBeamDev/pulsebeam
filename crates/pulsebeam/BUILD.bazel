@@ -21,7 +21,7 @@ rust_library(
     rustc_env_files = [":cargo_env"],
     lint_config = ":lints",
     aliases = aliases(),
-    deps = all_crate_deps(normal = True) + ["//crates/pulsebeam-tcp:pulsebeam-tcp", "//crates/pulsebeam-queue:pulsebeam-queue", "//crates/pulsebeam-core:pulsebeam-core", "//crates/pulsebeam-proto:pulsebeam-proto", "//crates/pulsebeam-rtc:pulsebeam-rtc", "//crates/pulsebeam-steer:pulsebeam-steer", "//crates/pulsebeam-runtime:pulsebeam-runtime"],
+    deps = all_crate_deps(normal = True) + ["//crates/pulsebeam-tcp:pulsebeam-tcp", "//crates/pulsebeam-udp:pulsebeam-udp", "//crates/pulsebeam-queue:pulsebeam-queue", "//crates/pulsebeam-core:pulsebeam-core", "//crates/pulsebeam-proto:pulsebeam-proto", "//crates/pulsebeam-rtc:pulsebeam-rtc", "//crates/pulsebeam-steer:pulsebeam-steer", "//crates/pulsebeam-runtime:pulsebeam-runtime"],
     proc_macro_deps = all_crate_deps(proc_macro = True),
 )
 
@@ -42,7 +42,7 @@ sfu_variant_sources(glob(["README.md", "src/**"], exclude = ["src/bin/**"]))
     rustc_env_files = [":cargo_env"],
     lint_config = ":lints",
     aliases = aliases(),
-    deps = all_crate_deps(normal = True) + ["//crates/pulsebeam-tcp:pulsebeam-tcp", "//crates/pulsebeam-queue:pulsebeam-queue", "//crates/pulsebeam-core:pulsebeam-core-sim", "//crates/pulsebeam-proto:pulsebeam-proto", "//crates/pulsebeam-rtc:pulsebeam-rtc", "//crates/pulsebeam-steer:pulsebeam-steer", "//crates/pulsebeam-runtime:pulsebeam-runtime-sim"],
+    deps = all_crate_deps(normal = True) + ["//crates/pulsebeam-tcp:pulsebeam-tcp", "//crates/pulsebeam-udp:pulsebeam-udp-sim", "//crates/pulsebeam-queue:pulsebeam-queue", "//crates/pulsebeam-core:pulsebeam-core-sim", "//crates/pulsebeam-proto:pulsebeam-proto", "//crates/pulsebeam-rtc:pulsebeam-rtc", "//crates/pulsebeam-steer:pulsebeam-steer", "//crates/pulsebeam-runtime:pulsebeam-runtime-sim"],
     proc_macro_deps = all_crate_deps(proc_macro = True),
 ) for variant in ["control"] + VARIANTS]
 
@@ -68,7 +68,7 @@ rust_binary(
     rustc_env_files = [":cargo_env"],
     lint_config = ":lints",
     aliases = aliases(),
-    deps = all_crate_deps(normal = True) + ["//crates/pulsebeam-tcp:pulsebeam-tcp", "//crates/pulsebeam-queue:pulsebeam-queue", "//crates/pulsebeam-core:pulsebeam-core", "//crates/pulsebeam-proto:pulsebeam-proto", "//crates/pulsebeam-rtc:pulsebeam-rtc", "//crates/pulsebeam-steer:pulsebeam-steer", "//crates/pulsebeam-runtime:pulsebeam-runtime"] + [":pulsebeam"],
+    deps = all_crate_deps(normal = True) + ["//crates/pulsebeam-tcp:pulsebeam-tcp", "//crates/pulsebeam-udp:pulsebeam-udp", "//crates/pulsebeam-queue:pulsebeam-queue", "//crates/pulsebeam-core:pulsebeam-core", "//crates/pulsebeam-proto:pulsebeam-proto", "//crates/pulsebeam-rtc:pulsebeam-rtc", "//crates/pulsebeam-steer:pulsebeam-steer", "//crates/pulsebeam-runtime:pulsebeam-runtime"] + [":pulsebeam"],
     proc_macro_deps = all_crate_deps(proc_macro = True),
 )
 

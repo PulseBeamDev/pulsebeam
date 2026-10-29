@@ -67,6 +67,16 @@ since 1900 without truncating to the NTP 32.32 wire era. Packet receive samples
 remain separate and unchanged
 through queueing and shard handoffs.
 
+UDP sockets use [`pulsebeam-udp`](../pulsebeam-udp/README.md). Advertised ICE
+candidates belong to the node, not to physical socket identity or destination
+metadata. The host accepts the full legal UDP payload range and copies compatible
+logical datagrams into bounded owned batches for shard handoff, preserving source,
+destination and arrival identity without charging the shard budget per GRO segment.
+The host accounts only the exact submitted prefix of a UDP batch;
+unsubmitted irrevocable RTC output is discarded as local loss, never retried or
+credited as a UDP submission. RTC remains decoupled and assumes its emitted
+output will be sent; there is no socket receipt or rollback API into RTC.
+
 Run focused crate tests while iterating. Before handoff, run root `./bazel test //:check`
 and `./bazel test //:test`. The production-configured owner target
 `//crates/pulsebeam:transport_conformance` uses one once-bound dual-stack UDP

@@ -1,7 +1,7 @@
-use super::{ReceiveTime, UdpMode, UnifiedSocket, udp_batch_sim, udp_scalar};
+use super::{ReceiveTime, UdpMode};
 use crate::sync::Arc;
-use pulsebeam_core::net::UdpSocket;
 use pulsebeam_steer::{FlowKey, FlowLookup, Verdict, steer_flow};
+use pulsebeam_udp::{BindOptions, BoundUdpSocket, Mode};
 
 const SIM_FLOW_CAPACITY: usize = 4096;
 use std::cell::{Cell, RefCell};
@@ -12,40 +12,17 @@ use std::{
     io,
     net::{IpAddr, SocketAddr},
 };
+use turmoil::net::UdpSocket;
 
-pub struct BoundUdpSocket {
-    socket: SimUdpTransport,
-    local_addr: SocketAddr,
-}
-
-enum SimUdpTransport {
-    Batch(udp_batch_sim::UdpTransport),
-    Scalar(udp_scalar::UdpTransport),
-}
-
-impl BoundUdpSocket {
-    pub fn local_addr(&self) -> SocketAddr {
-        self.local_addr
-    }
-    pub fn into_unified_socket(self) -> io::Result<UnifiedSocket> {
-        Ok(match self.socket {
-            SimUdpTransport::Batch(socket) => UnifiedSocket::Udp(socket),
-            SimUdpTransport::Scalar(socket) => UnifiedSocket::UdpScalar(socket),
-        })
-    }
-}
-
-type ReuseportKey = (SocketAddr, Option<SocketAddr>);
+type ReuseportKey = (IpAddr, SocketAddr);
 
 thread_local! {
     static WRONG_OWNER_INJECTIONS_CONSUMED: Cell<u64> = const { Cell::new(0) };
     /// Reuseport groups already bound on this host, so a second bind to the
     /// same address joins one instead of failing.
     ///
-    /// Keyed by the advertised address as well as the bind address: every host
-    /// in a simulation binds `0.0.0.0:3478`, and only the advertised address
-    /// tells them apart. `Weak`, so a finished simulation's sockets unbind and
-    /// the next one starts clean.
+    /// Host interface identity separates identical wildcard binds without
+    /// consulting advertisement policy. Weak groups unbind between simulations.
     static REUSEPORT_GROUPS: RefCell<HashMap<ReuseportKey, Weak<ReuseportGroup>>> =
         RefCell::new(HashMap::new());
 }
@@ -75,7 +52,7 @@ fn wrong_owner_injection_state_enabled() -> Option<IpAddr> {
 /// One member's queue of datagrams the group has already decided belong to it.
 #[derive(Default)]
 struct Inbox {
-    queue: VecDeque<(Vec<u8>, SocketAddr, ReceiveTime)>,
+    queue: VecDeque<(Vec<u8>, SocketAddr, SocketAddr, ReceiveTime)>,
     /// Woken when `queue` goes from empty to non-empty. `notify_one` stores a
     /// permit when nobody is waiting, so a member that is between `readable`
     /// calls does not miss the wakeup.
@@ -247,7 +224,12 @@ impl SimSteering {
             );
             return;
         };
-        inbox.queue.push_back((payload, src, received_at));
+        // Bounded simulated receive device. Overflow is post-submission
+        // network loss, independent of the sender's accepted-prefix report.
+        if inbox.queue.len() >= pulsebeam_udp::BATCH_SIZE * pulsebeam_udp::MAX_GSO_SEGMENTS {
+            return;
+        }
+        inbox.queue.push_back((payload, src, dst, received_at));
         let ready = inbox.ready.clone();
         // Release the borrow before waking: the woken member reads the same
         // RefCell as soon as it runs.
@@ -264,25 +246,32 @@ impl SimSteering {
 /// tuple hash puts it and userspace keeps forwarding it.
 pub fn install_steering_flow(source: SocketAddr, destination: SocketAddr, shard: u16) -> bool {
     REUSEPORT_GROUPS.with(|groups| {
-        for ((bind, advertised), group) in groups.borrow().iter() {
-            let serves = advertised.map_or(*bind == destination, |addr| addr == destination);
-            if !serves {
+        for ((host, _bind), group) in groups.borrow().iter() {
+            if *host != turmoil::current_ip() {
                 continue;
             }
             let Some(group) = group.upgrade() else {
                 continue;
             };
-            // The receive pump keys arrivals on the socket's own local address,
-            // not on the candidate the client dialled. Installing under
-            // anything else produces an entry nothing will ever match.
             let Ok(local) = group.socket.local_addr() else {
                 continue;
             };
+            let serves_ip = if local.ip().is_unspecified() {
+                destination.ip() == *host || destination.ip().is_loopback()
+            } else {
+                local.ip() == destination.ip()
+            };
+            if local.port() != destination.port()
+                || local.is_ipv4() != destination.is_ipv4()
+                || !serves_ip
+            {
+                continue;
+            }
             group
                 .steering
                 .flow_table
                 .borrow_mut()
-                .insert(flow_key(source, local), shard);
+                .insert(flow_key(source, destination), shard);
             return true;
         }
         false
@@ -408,7 +397,7 @@ impl ReuseportMember {
 
     /// Take the next datagram, or `WouldBlock` — the readiness contract the
     /// caller already expects from a socket.
-    pub(crate) fn try_recv(&self) -> io::Result<(Vec<u8>, SocketAddr, ReceiveTime)> {
+    pub(crate) fn try_recv(&self) -> io::Result<(Vec<u8>, SocketAddr, SocketAddr, ReceiveTime)> {
         self.group
             .steering
             .inboxes
@@ -452,28 +441,24 @@ fn spawn_pump(group: &Rc<ReuseportGroup>) {
             let Some(group) = weak.upgrade() else {
                 return;
             };
-            let Ok(dst) = socket.local_addr() else {
-                return;
-            };
-            // Drain to WouldBlock: readability is edge-triggered, so leaving a
-            // datagram behind can park the pump with work outstanding.
-            loop {
-                match socket.try_recv_from(&mut buf) {
-                    Ok((n, src)) => {
-                        let received_at = ReceiveTime::now();
-                        match buf.get(..n) {
-                            Some(datagram) => {
-                                group
-                                    .steering
-                                    .deliver(src, dst, datagram.to_vec(), received_at);
-                            }
-                            None => return,
+            // A bounded device-read batch has one captured arrival sample,
+            // matching native recvmmsg and allowing GRO within this batch.
+            let received_at = ReceiveTime::now();
+            for _ in 0..pulsebeam_udp::BATCH_SIZE {
+                match socket.try_recv_from_with_destination(&mut buf) {
+                    Ok((n, src, dst)) => match buf.get(..n) {
+                        Some(datagram) => {
+                            group
+                                .steering
+                                .deliver(src, dst, datagram.to_vec(), received_at);
                         }
-                    }
+                        None => return,
+                    },
                     Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
                     Err(_) => return,
                 }
             }
+            tokio::task::yield_now().await;
         }
     });
 }
@@ -497,10 +482,10 @@ fn spawn_pump(group: &Rc<ReuseportGroup>) {
 pub async fn bind_udp_socket(
     addr: SocketAddr,
     mode: UdpMode,
-    external_addr: Option<SocketAddr>,
+    _external_addr: Option<SocketAddr>,
     shard_index: u16,
 ) -> io::Result<BoundUdpSocket> {
-    let key = (addr, external_addr);
+    let key = (turmoil::current_ip(), addr);
     let existing =
         REUSEPORT_GROUPS.with(|groups| groups.borrow().get(&key).and_then(Weak::upgrade));
 
@@ -511,6 +496,7 @@ pub async fn bind_udp_socket(
                 socket: Arc::new(UdpSocket::bind(addr).await?),
                 steering: SimSteering::new(),
             });
+            let key = (key.0, group.socket.local_addr()?);
             REUSEPORT_GROUPS.with(|groups| groups.borrow_mut().insert(key, Rc::downgrade(&group)));
             spawn_pump(&group);
             group
@@ -524,23 +510,15 @@ pub async fn bind_udp_socket(
         group,
         index: usize::from(shard_index),
     };
-    let socket = match mode {
-        UdpMode::Batch => SimUdpTransport::Batch(udp_batch_sim::from_reuseport_member(
-            socket,
-            external_addr,
-            member,
-        )?),
-        UdpMode::Scalar => SimUdpTransport::Scalar(udp_scalar::from_reuseport_member(
-            socket,
-            external_addr,
-            member,
-        )?),
+    let mut options = BindOptions::new(socket.local_addr()?);
+    options.mode = match mode {
+        UdpMode::Batch => Mode::Batch,
+        UdpMode::Scalar => Mode::Scalar,
     };
-    let local_addr = match &socket {
-        SimUdpTransport::Batch(socket) => socket.local_addr(),
-        SimUdpTransport::Scalar(socket) => socket.local_addr(),
-    };
-    Ok(BoundUdpSocket { socket, local_addr })
+    options.reuse_port = true;
+    options.max_datagram_bytes = pulsebeam_udp::MAX_DATAGRAM_BYTES;
+    let io = super::udp_sim::HostIo::new(socket, member, mode)?;
+    pulsebeam_udp::simulation::from_io(options, Box::new(io))
 }
 
 #[cfg(test)]
@@ -705,7 +683,8 @@ mod tests {
             })
             .expect("packet must land somewhere");
         assert_ne!(landed, usize::from(owner));
-        assert_eq!(inboxes[landed].as_ref().unwrap().queue[0].2, received_at);
+        assert_eq!(inboxes[landed].as_ref().unwrap().queue[0].2, dst_addr());
+        assert_eq!(inboxes[landed].as_ref().unwrap().queue[0].3, received_at);
     }
 
     /// A datagram that names no route cannot be diverted: a shard that has

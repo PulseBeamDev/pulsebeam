@@ -20,7 +20,7 @@ rust_library(
     rustc_env_files = [":cargo_env"],
     lint_config = ":lints",
     aliases = aliases(),
-    deps = all_crate_deps(normal = True) + ["//crates/pulsebeam-queue:pulsebeam-queue", "//crates/pulsebeam-core:pulsebeam-core"],
+    deps = all_crate_deps(normal = True) + ["//crates/pulsebeam-queue:pulsebeam-queue", "//crates/pulsebeam-core:pulsebeam-core", "//crates/pulsebeam-udp:pulsebeam-udp"],
     proc_macro_deps = all_crate_deps(proc_macro = True),
 )
 
@@ -36,14 +36,13 @@ rust_library(
     rustc_env_files = [":cargo_env"],
     lint_config = ":lints",
     aliases = aliases(),
-    deps = all_crate_deps(normal = True) + ["//crates/pulsebeam-queue:pulsebeam-queue", "//crates/pulsebeam-core:pulsebeam-core-sim", "//crates/pulsebeam-steer:pulsebeam-steer"],
+    deps = all_crate_deps(normal = True) + ["//crates/pulsebeam-queue:pulsebeam-queue", "//crates/pulsebeam-core:pulsebeam-core-sim", "//crates/pulsebeam-steer:pulsebeam-steer", "//crates/pulsebeam-udp:pulsebeam-udp-sim"],
     proc_macro_deps = all_crate_deps(proc_macro = True),
 )
 
 rust_test(
     name = "unit_tests",
     crate = ":pulsebeam-runtime",
-    args = ["--skip=gso_gro_preserves_a_full_segment_batch", "--skip=dual_stack_reader_preserves_actual_ipv4_and_ipv6_destinations"],
     crate_features = ["parking_lot"],
     lint_config = ":lints",
     aliases = aliases(normal_dev = True, proc_macro_dev = True),
@@ -56,23 +55,13 @@ rust_test(
     name = "steering_tests",
     crate = ":pulsebeam-runtime-sim",
     crate_features = ["parking_lot", "sim"],
-    args = ["net::bound_udp::tests::", "net::udp_scalar::batch_shape_tests::"],
+    args = ["net::bound_udp::tests::", "net::udp_sim::tests::"],
     lint_config = ":lints",
     aliases = aliases(normal_dev = True, proc_macro_dev = True),
     deps = all_crate_deps(normal_dev = True),
     proc_macro_deps = all_crate_deps(proc_macro_dev = True),
 )
 
-rust_test(
-    name = "transport_conformance",
-    crate = ":pulsebeam-runtime",
-    crate_features = ["parking_lot"],
-    args = ["gso_gro_preserves_a_full_segment_batch", "dual_stack_reader_preserves_actual_ipv4_and_ipv6_destinations", "--nocapture"],
-    lint_config = ":lints",
-    aliases = aliases(normal_dev = True, proc_macro_dev = True),
-    deps = all_crate_deps(normal_dev = True),
-    proc_macro_deps = all_crate_deps(proc_macro_dev = True),
-)
 
 rustfmt_test(name = "format", targets = [":pulsebeam-runtime"])
-rust_clippy_test(name = "clippy", targets = [":pulsebeam-runtime", ":unit_tests", ":steering_tests", ":transport_conformance"])
+rust_clippy_test(name = "clippy", targets = [":pulsebeam-runtime", ":unit_tests", ":steering_tests"])

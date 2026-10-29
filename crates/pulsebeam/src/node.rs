@@ -425,7 +425,7 @@ mod shard_executor {
 pub(crate) use platform::bind_tcp_listener;
 
 type SteeringFactory =
-    Box<dyn FnOnce(&[pulsebeam_runtime::net::BoundUdpSocket]) -> Result<Box<dyn Steering>> + Send>;
+    Box<dyn FnOnce(&[pulsebeam_udp::BoundUdpSocket]) -> Result<Box<dyn Steering>> + Send>;
 
 pub use crate::ice_tcp::Limits as IceTcpLimits;
 
@@ -676,9 +676,7 @@ impl NodeBuilder {
     /// the bound reuseport sockets and consumes the generic `Steering` trait.
     pub fn with_steering<F>(mut self, attach: F) -> Self
     where
-        F: FnOnce(&[pulsebeam_runtime::net::BoundUdpSocket]) -> Result<Box<dyn Steering>>
-            + Send
-            + 'static,
+        F: FnOnce(&[pulsebeam_udp::BoundUdpSocket]) -> Result<Box<dyn Steering>> + Send + 'static,
     {
         self.steering = Some(Box::new(attach));
         self
@@ -779,7 +777,7 @@ impl NodeBuilder {
 
     async fn run_bound(
         self,
-        udp_sockets: Vec<net::BoundUdpSocket>,
+        udp_sockets: Vec<pulsebeam_udp::BoundUdpSocket>,
         advertised_addrs: Vec<SocketAddr>,
         shutdown: CancellationToken,
     ) -> Result<()> {
@@ -973,7 +971,7 @@ impl NodeBuilder {
             let shard_stats_tx = stats_tx.clone();
 
             let launch = move || -> Result<ShardWorker> {
-                let udp_sock = udp_sock.into_unified_socket()?;
+                let udp_sock = udp_sock.activate()?;
                 Ok(ShardWorker::new(
                     shard_id,
                     udp_sock,
@@ -1122,41 +1120,64 @@ pub struct NodeContext {
     pub rng: pulsebeam_runtime::rand::Rng,
 }
 
+async fn bind_udp_socket(
+    local_addr: SocketAddr,
+    mode: UdpMode,
+    advertised_addr: Option<SocketAddr>,
+    shard_index: u16,
+) -> std::io::Result<pulsebeam_udp::BoundUdpSocket> {
+    #[cfg(feature = "sim")]
+    {
+        net::bind_udp_socket(local_addr, mode, advertised_addr, shard_index).await
+    }
+    #[cfg(not(feature = "sim"))]
+    {
+        let _ = (advertised_addr, shard_index);
+        let mut options = pulsebeam_udp::BindOptions::new(local_addr);
+        options.reuse_port = true;
+        options.max_datagram_bytes = pulsebeam_udp::MAX_DATAGRAM_BYTES;
+        options.mode = match mode {
+            UdpMode::Batch => pulsebeam_udp::Mode::Auto,
+            UdpMode::Scalar => pulsebeam_udp::Mode::Scalar,
+        };
+        pulsebeam_udp::bind(options).await
+    }
+}
+
 async fn bind_udp_sockets(
     local_addr: SocketAddr,
     advertised_addr: Option<SocketAddr>,
     shards: usize,
     mode: UdpMode,
-) -> Result<Vec<net::BoundUdpSocket>> {
+) -> Result<Vec<pulsebeam_udp::BoundUdpSocket>> {
     let mut sockets = Vec::with_capacity(shards);
 
     for shard_index in 0..shards {
         let shard_index = u16::try_from(shard_index).unwrap_or(u16::MAX);
-        let socket =
-            match net::bind_udp_socket(local_addr, mode, advertised_addr, shard_index).await {
-                Ok(s) => s,
-                Err(e) if sockets.is_empty() => {
-                    return Err(anyhow::Error::new(e).context("failed to bind first udp socket"));
-                }
-                Err(e) => {
-                    // Shedding workers here is not a capacity trade-off: a
-                    // single-shard node never executes a cross-shard path at all.
-                    tracing::warn!(
-                        requested = shards,
-                        running = sockets.len(),
-                        "SO_REUSEPORT unavailable or failed after the first bind; running fewer \
+        let socket = match bind_udp_socket(local_addr, mode, advertised_addr, shard_index).await {
+            Ok(s) => s,
+            Err(e) if sockets.is_empty() => {
+                return Err(anyhow::Error::new(e).context("failed to bind first udp socket"));
+            }
+            Err(e) => {
+                // Shedding workers here is not a capacity trade-off: a
+                // single-shard node never executes a cross-shard path at all.
+                tracing::warn!(
+                    requested = shards,
+                    running = sockets.len(),
+                    "SO_REUSEPORT unavailable or failed after the first bind; running fewer \
                      shards than requested: {e}"
-                    );
-                    break;
-                }
-            };
+                );
+                break;
+            }
+        };
         sockets.push(socket);
     }
     Ok(sockets)
 }
 
 fn sockets_to_candidates(
-    sockets: &[net::BoundUdpSocket],
+    sockets: &[pulsebeam_udp::BoundUdpSocket],
     advertised_addrs: &[SocketAddr],
 ) -> Vec<LocalCandidate> {
     let candidate_addrs = if advertised_addrs.is_empty() {

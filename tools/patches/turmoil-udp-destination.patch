@@ -1,0 +1,128 @@
+diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -287,6 +287,12 @@
+     .flatten()
+ }
+ 
++/// The current simulated host's interface address, separate from socket binds.
++/// Must be called from within a Turmoil simulation.
++pub fn current_ip() -> IpAddr {
++    World::current(|world| world.current_host().addr)
++}
++
+ /// Lookup an IP address by host name.
+ ///
+ /// Must be called from within a Turmoil simulation.
+diff --git a/src/host.rs b/src/host.rs
+--- a/src/host.rs
++++ b/src/host.rs
+@@ -215,7 +215,7 @@
+     target_addr: Option<SocketAddr>,
+     broadcast: bool,
+     multicast_loop: bool,
+-    queue: mpsc::Sender<(Datagram, SocketAddr)>,
++    queue: mpsc::Sender<(Datagram, SocketAddr, SocketAddr)>,
+ }
+ 
+ impl Udp {
+@@ -298,13 +298,13 @@
+                 tracing::trace!(target: TRACING_TARGET, ?src, ?dst, protocol = %Protocol::Udp(datagram), "Dropped (Addr not bound)");
+                 return;
+             }
+-            if let Err(err) = bind.queue.try_send((datagram, src)) {
++            if let Err(err) = bind.queue.try_send((datagram, src, dst)) {
+                 // drop any packets that exceed the capacity
+                 match err {
+-                    mpsc::error::TrySendError::Full((datagram, _)) => {
++                    mpsc::error::TrySendError::Full((datagram, _, _)) => {
+                         tracing::trace!(target: TRACING_TARGET, ?src, ?dst, protocol = %Protocol::Udp(datagram), "Dropped (Full buffer)");
+                     }
+-                    mpsc::error::TrySendError::Closed((datagram, _)) => {
++                    mpsc::error::TrySendError::Closed((datagram, _, _)) => {
+                         tracing::trace!(target: TRACING_TARGET, ?src, ?dst, protocol = %Protocol::Udp(datagram), "Dropped (Receiver closed)");
+                     }
+                 }
+diff --git a/src/net/udp.rs b/src/net/udp.rs
+--- a/src/net/udp.rs
++++ b/src/net/udp.rs
+@@ -88,18 +88,18 @@
+ }
+ 
+ struct Rx {
+-    recv: mpsc::Receiver<(Datagram, SocketAddr)>,
++    recv: mpsc::Receiver<(Datagram, SocketAddr, SocketAddr)>,
+     /// A buffered received message.
+     ///
+     /// This is used to support the `readable` method, as [`mpsc::Receiver`]
+     /// doesn't expose a way to query channel readiness.
+-    buffer: Option<(Datagram, SocketAddr)>,
++    buffer: Option<(Datagram, SocketAddr, SocketAddr)>,
+ }
+ 
+ impl Rx {
+     /// Tries to receive from either the buffered message or the mpsc channel
+-    pub fn try_recv_from(&mut self, buf: &mut [u8]) -> Result<(usize, Datagram, SocketAddr)> {
+-        let (datagram, origin) = if let Some(datagram) = self.buffer.take() {
++    pub fn try_recv_from(&mut self, buf: &mut [u8]) -> Result<(usize, Datagram, SocketAddr, SocketAddr)> {
++        let (datagram, origin, destination) = if let Some(datagram) = self.buffer.take() {
+             datagram
+         } else {
+             self.recv.try_recv().map_err(|_| {
+@@ -112,7 +112,7 @@
+ 
+         buf[..limit].copy_from_slice(&bytes[..limit]);
+ 
+-        Ok((limit, datagram, origin))
++        Ok((limit, datagram, origin, destination))
+     }
+ 
+     /// Waits for the socket to become readable.
+@@ -147,7 +147,7 @@
+ }
+ 
+ impl UdpSocket {
+-    pub(crate) fn new(local_addr: SocketAddr, rx: mpsc::Receiver<(Datagram, SocketAddr)>) -> Self {
++    pub(crate) fn new(local_addr: SocketAddr, rx: mpsc::Receiver<(Datagram, SocketAddr, SocketAddr)>) -> Self {
+         Self {
+             local_addr,
+             rx: Mutex::new(Rx {
+@@ -267,7 +267,7 @@
+         let mut rx = self.rx.lock().await;
+         rx.readable().await?;
+ 
+-        let (limit, datagram, origin) = rx
++        let (limit, datagram, origin, _destination) = rx
+             .try_recv_from(buf)
+             .expect("queue should be ready after readable yields");
+ 
+@@ -286,6 +286,12 @@
+     /// When there is no pending data, `Err(io::ErrorKind::WouldBlock)` is
+     /// returned. This function is usually paired with `readable()`.
+     pub fn try_recv_from(&self, buf: &mut [u8]) -> Result<(usize, SocketAddr)> {
++        self.try_recv_from_with_destination(buf).map(|(len, source, _)| (len, source))
++    }
++
++    /// Receive payload, source and actual envelope destination, including for
++    /// wildcard binds. Buffer truncation follows `try_recv_from` semantics.
++    pub fn try_recv_from_with_destination(&self, buf: &mut [u8]) -> Result<(usize, SocketAddr, SocketAddr)> {
+         let mut rx = self.rx.try_lock().map_err(|_| {
+             io::Error::new(
+                 io::ErrorKind::WouldBlock,
+@@ -293,13 +299,13 @@
+             )
+         })?;
+ 
+-        let (limit, datagram, origin) = rx.try_recv_from(buf).map_err(|_| {
++        let (limit, datagram, origin, destination) = rx.try_recv_from(buf).map_err(|_| {
+             io::Error::new(io::ErrorKind::WouldBlock, "socket receive queue is empty")
+         })?;
+ 
+-        tracing::trace!(target: TRACING_TARGET, src = ?origin, dst = ?self.local_addr, protocol = %datagram, "Recv");
++        tracing::trace!(target: TRACING_TARGET, src = ?origin, dst = ?destination, protocol = %datagram, "Recv");
+ 
+-        Ok((limit, origin))
++        Ok((limit, origin, destination))
+     }
+     /// Tries to receive a single datagram message on the socket from the remote
+     /// address to which it is connected. On success, returns the number of

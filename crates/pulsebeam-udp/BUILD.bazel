@@ -1,0 +1,66 @@
+load("@crates//:defs.bzl", "aliases", "all_crate_deps", "crate_edition")
+load("@rules_rust//cargo:defs.bzl", "cargo_toml_env_vars", "extract_cargo_lints")
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test", "rust_binary", "rust_clippy_test", "rustfmt_test")
+
+package(default_visibility = ["//visibility:public"])
+filegroup(name = "workflow_inputs", srcs = glob(["*.md"]))
+exports_files(["Cargo.toml"])
+filegroup(name = "cargo_metadata_inputs", srcs = glob(["Cargo.toml", "src/**/*.rs", "benches/**/*.rs"], allow_empty = True))
+cargo_toml_env_vars(name = "cargo_env", src = "Cargo.toml", workspace = "//:Cargo.toml")
+extract_cargo_lints(name = "lints", manifest = "Cargo.toml", workspace = "//:Cargo.toml")
+
+rust_library(
+    name = "pulsebeam-udp",
+    crate_root = "src/lib.rs",
+    srcs = glob(["src/**/*.rs"]),
+    compile_data = ["README.md"],
+    edition = crate_edition(),
+    rustc_env_files = [":cargo_env"],
+    lint_config = ":lints",
+    aliases = aliases(),
+    deps = all_crate_deps(normal = True),
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+)
+rust_library(
+    name = "pulsebeam-udp-sim",
+    crate_name = "pulsebeam_udp",
+    crate_root = "src/lib.rs",
+    srcs = glob(["src/**/*.rs"]),
+    compile_data = ["README.md"],
+    edition = crate_edition(),
+    crate_features = ["sim"],
+    rustc_flags = ["-Copt-level=2", "-Cdebug-assertions=yes", "-Coverflow-checks=yes"],
+    rustc_env_files = [":cargo_env"],
+    lint_config = ":lints",
+    aliases = aliases(),
+    deps = all_crate_deps(normal = True),
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+)
+rust_test(
+    name = "unit_tests",
+    crate = ":pulsebeam-udp",
+    args = ["--skip=gso_gro_preserves_a_full_segment_batch", "--skip=dual_stack_reader_preserves_actual_ipv4_and_ipv6_destinations"],
+    lint_config = ":lints",
+)
+rust_test(
+    name = "simulation_tests",
+    crate = ":pulsebeam-udp-sim",
+    crate_features = ["sim"],
+    lint_config = ":lints",
+)
+rust_test(
+    name = "transport_conformance",
+    crate = ":pulsebeam-udp",
+    args = ["gso_gro_preserves_a_full_segment_batch", "dual_stack_reader_preserves_actual_ipv4_and_ipv6_destinations", "--nocapture"],
+    lint_config = ":lints",
+)
+rust_binary(
+    name = "benchmark",
+    crate_root = "benches/io.rs",
+    srcs = ["benches/io.rs"],
+    edition = crate_edition(),
+    lint_config = ":lints",
+    deps = [":pulsebeam-udp"] + all_crate_deps(normal = True),
+)
+rustfmt_test(name = "format", targets = [":pulsebeam-udp", ":benchmark"])
+rust_clippy_test(name = "clippy", targets = [":pulsebeam-udp", ":unit_tests", ":simulation_tests", ":transport_conformance", ":benchmark"])

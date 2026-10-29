@@ -13,7 +13,7 @@ filegroup(
 RUST_OWNERS = [
     "crates/pulsebeam", "crates/pulsebeam-cli", "crates/pulsebeam-auth", "crates/pulsebeam-core",
     "crates/pulsebeam-proto", "crates/pulsebeam-steer", "crates/pulsebeam-rtc", "crates/pulsebeam-libwebrtc-sys",
-    "crates/pulsebeam-runtime", "crates/pulsebeam-queue", "crates/pulsebeam-tcp", "crates/pulsebeam-testdata",
+    "crates/pulsebeam-runtime", "crates/pulsebeam-queue", "crates/pulsebeam-tcp", "crates/pulsebeam-udp", "crates/pulsebeam-testdata",
     "agents/pulsebeam-agent-core", "agents/pulsebeam-agent-native", "agents/pulsebeam-agent-web",
 ]
 
@@ -26,14 +26,14 @@ build_test(
         "//apps/meet:export", "//docs:site",
         "//server/typescript:package.pack", "//server/go:package", "//server/python:package", "//server/rust:package",
         "//crates/pulsebeam-simulator:replay", "//crates/pulsebeam-simulator:sweep",
-        "//crates/pulsebeam-simulator:scoreboard", "//crates/pulsebeam-rtc:benchmark",
+        "//crates/pulsebeam-simulator:scoreboard", "//crates/pulsebeam-rtc:benchmark", "//crates/pulsebeam-udp:benchmark",
     ],
 )
 
 test_suite(
     name = "check",
     tests = ["//%s:%s" % (owner, check) for owner in RUST_OWNERS + ["crates/pulsebeam-simulator"] for check in ["format", "clippy"]] + [
-        "//crates/pulsebeam:transport_conformance", "//crates/pulsebeam-runtime:transport_conformance",
+        "//crates/pulsebeam:transport_conformance", "//crates/pulsebeam-udp:transport_conformance",
         ":artifacts", "//agents/pulsebeam-agent-web:js_format", "//agents/pulsebeam-agent-web:js_unit_tests", "//agents/pulsebeam-agent-web:public_contract",
         "//agents/pulsebeam-agent-web:uniffi_types", "//agents/pulsebeam-agent-web:node_runtime_tests",
         "//agents/react:format", "//agents/react:fast", "//apps/meet:check", "//tools:workflow_contract", "//tools:simulation_runner_contract", "//tools:calibration_contract", "//tools:scoreboard_contract", "//tools:ide_contract", "//tools:launcher_contract", "//tools:rust_pins_contract", "//tools:clippy_fix_contract", "//tools:fix_contract",
@@ -47,6 +47,7 @@ test_suite(
     tests = ["//%s:unit_tests" % owner for owner in RUST_OWNERS] + [
         "//crates/pulsebeam-rtc:integration_tests",
         "//crates/pulsebeam-runtime:steering_tests",
+        "//crates/pulsebeam-udp:simulation_tests",
         "//crates/pulsebeam-cli:production_native",
         "//crates/pulsebeam-simulator:fast",
         "//server/auth:contract", "//server/go:conformance",

@@ -43,6 +43,7 @@ pulsebeam-proto = { path = "../pulsebeam-proto" }
 pulsebeam-steer = { path = "../pulsebeam-steer" }
 pulsebeam-runtime = { path = "../pulsebeam-runtime" }
 pulsebeam-tcp = { path = "../pulsebeam-tcp" }
+pulsebeam-udp = { path = "../pulsebeam-udp" }
 rand = { workspace = true }
 # Swagger's generated folder must resolve the compiler action's OUT_DIR.
 rust-embed = { version = "8", features = ["interpolate-folder-path"] }
@@ -102,5 +103,5 @@ tower = { version = "0.5.3", features = ["util"] }
 default = []
 unpace = []
 parking_lot = ["pulsebeam-runtime/parking_lot"]
-sim = ["pulsebeam-core/sim", "pulsebeam-runtime/sim"]
+sim = ["pulsebeam-core/sim", "pulsebeam-runtime/sim", "pulsebeam-udp/sim"]
 transport-conformance = []

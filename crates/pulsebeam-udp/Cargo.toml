@@ -1,0 +1,28 @@
+[package]
+name = "pulsebeam-udp"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+documentation.workspace = true
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+socket2 = { version = "0.6", features = ["all"] }
+turmoil = { workspace = true, optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+nix = { version = "0.31", default-features = false, features = ["socket", "uio", "net"] }
+
+[features]
+sim = ["dep:turmoil"]
+
+[[bench]]
+name = "io"
+harness = false

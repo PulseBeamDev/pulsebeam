@@ -1,4 +1,4 @@
-use pulsebeam_runtime::net::BoundUdpSocket;
+use pulsebeam_udp::BoundUdpSocket;
 
 use crate::control::steering::Steering;
 pub struct SimSteering;

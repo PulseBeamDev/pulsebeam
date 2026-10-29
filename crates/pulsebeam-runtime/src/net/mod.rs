@@ -1,49 +1,23 @@
-#[cfg_attr(feature = "sim", path = "bound_udp_sim.rs")]
+#[cfg(feature = "sim")]
+#[path = "bound_udp_sim.rs"]
 mod bound_udp;
 #[cfg(feature = "sim")]
 pub mod shaper;
 #[cfg(feature = "sim")]
-pub mod udp_batch_sim;
-pub mod udp_scalar;
-
-#[cfg(target_os = "linux")]
-pub mod udp;
-#[cfg(not(target_os = "linux"))]
-#[path = "udp_fallback.rs"]
-pub mod udp;
-
-pub use bound_udp::{BoundUdpSocket, bind_udp_socket};
+mod udp_sim;
 #[cfg(feature = "sim")]
 pub use bound_udp::{
-    install_steering_flow, set_wrong_owner_injection, wrong_owner_injections_consumed,
+    bind_udp_socket, install_steering_flow, set_wrong_owner_injection,
+    wrong_owner_injections_consumed,
 };
 
-use std::{io, net::SocketAddr};
+pub use pulsebeam_udp::{BATCH_SIZE, ReceiveTime};
+use std::net::SocketAddr;
 
-/// Maximum datagrams submitted to one `recvmmsg`/`sendmmsg` syscall.
-///
-/// This keeps interactive-media burst latency and syscall scratch bounded;
-/// UDP GSO uses its independent 64-segment limit for aggregation.
-pub const BATCH_SIZE: usize = 32;
 pub const CHUNK_SIZE: usize = 64 * 1024;
 pub const MAX_UDP_PAYLOAD_SIZE: usize = 1500;
 pub const MAX_UDP_GSO_PAYLOAD_SIZE: usize = u16::MAX as usize;
-pub const UDP_MAX_GSO_SEGMENTS: usize = 64;
-
-#[cfg(not(feature = "sim"))]
-fn bind_scalar_socket(addr: SocketAddr) -> io::Result<socket2::Socket> {
-    let socket = socket2::Socket::new(
-        socket2::Domain::for_address(addr),
-        socket2::Type::DGRAM,
-        Some(socket2::Protocol::UDP),
-    )?;
-    if addr.is_ipv6() {
-        socket.set_only_v6(false)?;
-    }
-    socket.set_nonblocking(true)?;
-    socket.bind(&addr.into())?;
-    Ok(socket)
-}
+pub const UDP_MAX_GSO_SEGMENTS: usize = pulsebeam_udp::MAX_GSO_SEGMENTS;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum UdpMode {
@@ -56,23 +30,6 @@ pub enum UdpMode {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Transport {
     Udp(UdpMode),
-}
-
-/// Clock samples taken when a complete datagram or RFC 4571 frame is received.
-/// Queueing and shard handoffs must preserve both samples.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ReceiveTime {
-    pub monotonic: tokio::time::Instant,
-    pub wall: std::time::SystemTime,
-}
-
-impl ReceiveTime {
-    pub fn now() -> Self {
-        Self {
-            monotonic: tokio::time::Instant::now(),
-            wall: std::time::SystemTime::now(),
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -102,7 +59,7 @@ impl RecvPacketBatch {
     pub fn next_packet(&mut self) -> Option<&[u8]> {
         debug_assert_ne!(self.stride, 0);
         debug_assert!(self.len <= self.buf.len());
-        debug_assert!(self.stride <= self.len);
+        debug_assert!(self.stride <= self.len.max(1));
         debug_assert!(self.offset <= self.len);
         if self.offset == self.len {
             return None;
@@ -138,111 +95,6 @@ pub struct SendPacket<'a> {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SendPacketBatch<'a> {
     pub packets: &'a [SendPacket<'a>],
-}
-
-pub async fn bind(
-    addr: SocketAddr,
-    transport: Transport,
-    external_addr: Option<SocketAddr>,
-    shard_index: u16,
-) -> io::Result<UnifiedSocket> {
-    let sock = match transport {
-        Transport::Udp(mode) => bind_udp_socket(addr, mode, external_addr, shard_index)
-            .await?
-            .into_unified_socket()?,
-    };
-    tracing::debug!("bound to {addr} ({transport:?})");
-    Ok(sock)
-}
-
-pub enum UnifiedSocket {
-    #[cfg(feature = "sim")]
-    Udp(udp_batch_sim::UdpTransport),
-    #[cfg(not(feature = "sim"))]
-    Udp(udp::UdpTransport),
-    UdpScalar(udp_scalar::UdpTransport),
-}
-
-impl UnifiedSocket {
-    pub fn close_peer(&mut self, peer_addr: &SocketAddr) {
-        match self {
-            Self::Udp(inner) => inner.close_peer(peer_addr),
-            Self::UdpScalar(inner) => inner.close_peer(peer_addr),
-        }
-    }
-
-    pub fn local_addr(&self) -> SocketAddr {
-        match self {
-            Self::Udp(inner) => inner.local_addr(),
-            Self::UdpScalar(inner) => inner.local_addr(),
-        }
-    }
-
-    #[inline]
-    pub async fn readable(&self) -> io::Result<()> {
-        match self {
-            Self::Udp(inner) => inner.readable().await,
-            Self::UdpScalar(inner) => inner.readable().await,
-        }
-    }
-
-    #[inline]
-    pub async fn writable(&self) -> io::Result<()> {
-        match self {
-            Self::Udp(inner) => inner.writable().await,
-            Self::UdpScalar(inner) => inner.writable().await,
-        }
-    }
-
-    #[inline]
-    pub fn try_recv_batch(&mut self, packets: &mut Vec<RecvPacketBatch>) -> std::io::Result<usize> {
-        match self {
-            Self::Udp(inner) => inner.try_recv_batch(packets),
-            Self::UdpScalar(inner) => inner.try_recv_batch(packets),
-        }
-    }
-
-    /// Attempts to send every packet in `batch`. Returns the number of
-    /// packets accepted by the kernel (packets dropped because the socket
-    /// buffer was full count as "accepted" — this transport is lossy by
-    /// design and never queues).
-    #[inline]
-    pub fn try_send_batch(&mut self, batch: &SendPacketBatch) -> std::io::Result<usize> {
-        match self {
-            Self::Udp(inner) => inner.try_send_batch(batch),
-            Self::UdpScalar(inner) => inner.try_send_batch(batch),
-        }
-    }
-
-    pub fn max_gso_segments(&self) -> usize {
-        match self {
-            Self::Udp(inner) => inner.max_gso_segments(),
-            Self::UdpScalar(inner) => inner.max_gso_segments(),
-        }
-    }
-
-    pub fn transport(&self) -> Transport {
-        match self {
-            #[cfg(feature = "sim")]
-            Self::Udp(_) => Transport::Udp(UdpMode::Batch),
-            #[cfg(not(feature = "sim"))]
-            Self::Udp(_) => Transport::Udp(udp::MODE),
-            Self::UdpScalar(_) => Transport::Udp(UdpMode::Scalar),
-        }
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn fmt_bytes(b: usize) -> String {
-    const KB: usize = 1024;
-    const MB: usize = 1024 * 1024;
-    if b >= MB {
-        format!("{}MB", b / MB)
-    } else if b >= KB {
-        format!("{}KB", b / KB)
-    } else {
-        format!("{b}B")
-    }
 }
 
 #[cfg(test)]
@@ -295,8 +147,8 @@ mod tests {
     }
 
     #[test]
-    fn recv_packet_batch_data_excludes_receive_arena_tail() {
-        let batch = RecvPacketBatch {
+    fn recv_packet_batch_handles_receive_arena_tail_and_empty_payload() {
+        let mut batch = RecvPacketBatch {
             src: test_addr(),
             dst: test_addr(),
             buf: vec![1, 2, 3, 4],
@@ -308,11 +160,11 @@ mod tests {
         };
 
         assert_eq!(batch.data(), &[1, 2]);
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    #[test]
-    fn batch_backend_uses_scalar_mode_outside_linux() {
-        assert_eq!(udp::MODE, UdpMode::Scalar);
+        batch.buf.clear();
+        batch.len = 0;
+        batch.stride = 1;
+        assert!(batch.data().is_empty());
+        assert_eq!(batch.next_packet(), None);
+        assert_eq!(batch.next_packet(), None);
     }
 }

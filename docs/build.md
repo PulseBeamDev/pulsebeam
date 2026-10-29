@@ -223,8 +223,8 @@ SFU/assets, but no Meet export or React acceptance fixture.
 ### Required Linux transport host
 
 Root `//:check` and complete `//:test` require IPv4/IPv6 loopback, dual-stack
-UDP and actual UDP segmentation/GRO payload exercise. The runtime
-`//crates/pulsebeam-runtime:transport_conformance` owner covers raw packet
+UDP and actual UDP segmentation/GRO payload exercise. The UDP
+`//crates/pulsebeam-udp:transport_conformance` owner covers raw packet
 contracts. `//crates/pulsebeam:transport_conformance` adds one production SFU
 with concurrent threaded native IPv4/IPv6 selected pairs and bidirectional
 recipient application payloads. Missing capability, missing evidence or failed
@@ -354,13 +354,17 @@ Remote caches and execution are optional optimizations, never correctness inputs
 ./bazel run //:sweep -- --seeds 24 --from-seed 1 --filter tests::bwe
 ./bazel run //:scoreboard
 ./bazel run //:benchmark -- --save-baseline main
+./bazel run --config=profile //crates/pulsebeam-udp:benchmark -- 100000
 ./bazel build --config=profile //:server
 ```
 
 Replay and sweeps select explicit seed windows. Sweeps are advisory, print
 reproduction commands, and do not weaken committed merge gates. `scoreboard`
 explicitly updates `bwe-baseline.txt`; review its diff. Criterion reports remain
-under `target/criterion`. Profiling builds retain optimized code, symbols and
+under `target/criterion`. The UDP benchmark prints fixed-workload throughput,
+thread CPU, allocation counts and I/O-processing latency percentiles; see its
+[measurement boundaries](https://github.com/PulseBeamDev/pulsebeam/blob/main/crates/pulsebeam-udp/README.md#measure-io-cost).
+Profiling builds retain optimized code, symbols and
 frame pointers. The server's `:6060` metrics/pprof endpoints remain available.
 Capture a profile with an OS HTTP client and inspect it using:
 

@@ -72,9 +72,18 @@ struct GsoPacketMeta {
     end: usize,
 }
 
+#[derive(Default)]
+struct UdpEgressCounters {
+    submitted_datagrams: u64,
+    submitted_bytes: u64,
+    discarded_datagrams: u64,
+    discarded_bytes: u64,
+}
+
 pub struct GsoSendBatch {
     arena: Vec<u8>,
     packets: ArrayVec<GsoPacketMeta, { net::BATCH_SIZE }>,
+    counters: UdpEgressCounters,
 }
 
 impl GsoSendBatch {
@@ -82,6 +91,7 @@ impl GsoSendBatch {
         Self {
             arena: Vec::with_capacity(net::BATCH_SIZE * net::MAX_UDP_GSO_PAYLOAD_SIZE),
             packets: ArrayVec::new(),
+            counters: UdpEgressCounters::default(),
         }
     }
 
@@ -153,12 +163,12 @@ impl GsoSendBatch {
         true
     }
 
-    pub fn flush(&mut self, socket: &mut net::UnifiedSocket) -> bool {
+    pub fn flush(&mut self, socket: &mut pulsebeam_udp::UdpSocket) -> bool {
         if self.packets.is_empty() {
             return false;
         }
         debug_assert!(self.packets.len() <= net::BATCH_SIZE);
-        let mut packets = ArrayVec::<net::SendPacket<'_>, { net::BATCH_SIZE }>::new();
+        let mut packets = ArrayVec::<pulsebeam_udp::SendDatagram<'_>, { net::BATCH_SIZE }>::new();
         for packet in &self.packets {
             debug_assert!(packet.start < packet.end);
             debug_assert!(packet.end <= self.arena.len());
@@ -167,29 +177,52 @@ impl GsoSendBatch {
                 debug_assert!(false, "queued packet escapes the arena");
                 continue;
             };
-            packets.push(net::SendPacket {
-                dst: packet.dst,
-                buf,
-                segment_size: packet.segment_size,
+            packets.push(pulsebeam_udp::SendDatagram {
+                destination: packet.dst,
+                payload: buf,
+                gso_segment_size: (packet.segment_size < buf.len())
+                    .then(|| {
+                        u16::try_from(packet.segment_size)
+                            .ok()
+                            .and_then(std::num::NonZeroU16::new)
+                    })
+                    .flatten(),
             });
         }
-        let result = {
-            let batch = net::SendPacketBatch { packets: &packets };
-            socket.try_send_batch(&batch)
-        };
+        let report = socket.try_send_batch(&packets);
         drop(packets);
-        match result {
-            Ok(sent) => {
-                debug_assert!(sent <= self.packets.len());
-                self.packets.clear();
-                self.arena.clear();
-                sent != 0
-            }
-            Err(err) => {
-                tracing::trace!(error = ?err, "error writing UDP egress batch");
-                self.packets.clear();
-                self.arena.clear();
-                false
+        self.account_submission(report.accepted);
+        if report.accepted < self.packets.len() {
+            tracing::trace!(
+                accepted = report.accepted,
+                offered = self.packets.len(),
+                stop = ?report.stop,
+                "UDP egress suffix discarded"
+            );
+        }
+        // RTC output is irrevocable. The host discards the unsubmitted suffix
+        // as local loss, never credits it as submitted and never replays it.
+        self.packets.clear();
+        self.arena.clear();
+        report.accepted != 0
+    }
+
+    fn account_submission(&mut self, accepted: usize) {
+        debug_assert!(accepted <= self.packets.len());
+        for (index, packet) in self.packets.iter().enumerate() {
+            let bytes = packet.end.saturating_sub(packet.start) as u64;
+            let datagrams = packet
+                .end
+                .saturating_sub(packet.start)
+                .div_ceil(packet.segment_size) as u64;
+            if index < accepted {
+                self.counters.submitted_bytes = self.counters.submitted_bytes.saturating_add(bytes);
+                self.counters.submitted_datagrams =
+                    self.counters.submitted_datagrams.saturating_add(datagrams);
+            } else {
+                self.counters.discarded_bytes = self.counters.discarded_bytes.saturating_add(bytes);
+                self.counters.discarded_datagrams =
+                    self.counters.discarded_datagrams.saturating_add(datagrams);
             }
         }
     }
@@ -198,7 +231,25 @@ impl GsoSendBatch {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::{IpAddr, Ipv4Addr};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    #[test]
+    fn udp_submission_accounts_only_accepted_entries_including_gso_short_tail() {
+        let mut queue = OwnedPacketQueue::with_capacity(64);
+        let first: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let second: SocketAddr = "127.0.0.1:2".parse().unwrap();
+        assert!(queue.push_back(first, vec![1; 800]));
+        assert!(queue.push_back(first, vec![2; 237]));
+        assert!(queue.push_back(second, vec![3; 400]));
+        let mut batch = GsoSendBatch::preallocated();
+        assert!(batch.append_from(&mut queue));
+        assert!(batch.append_from(&mut queue));
+        batch.account_submission(1);
+        assert_eq!(batch.counters.submitted_datagrams, 2);
+        assert_eq!(batch.counters.submitted_bytes, 1037);
+        assert_eq!(batch.counters.discarded_datagrams, 1);
+        assert_eq!(batch.counters.discarded_bytes, 400);
+    }
 
     fn create_test_addr() -> SocketAddr {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080)

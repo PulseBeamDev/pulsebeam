@@ -1,5 +1,5 @@
 use pulsebeam_queue as mailbox;
-use pulsebeam_runtime::net::{self, UnifiedSocket};
+use pulsebeam_runtime::net;
 use slotmap::SecondaryMap;
 use tokio::time::Instant;
 
@@ -41,7 +41,7 @@ fn record_routing_drop(lane: &'static str, stage: &'static str, origin: &'static
 
 struct ShardNetworkEgress<'a> {
     udp: &'a mut GsoSendBatch,
-    udp_socket: &'a mut UnifiedSocket,
+    udp_socket: &'a mut pulsebeam_udp::UdpSocket,
 }
 
 impl NetworkEgress for ShardNetworkEgress<'_> {
@@ -247,7 +247,7 @@ impl ShardCore {
 
     pub(crate) fn poll_and_flush_dirty(
         &mut self,
-        udp_socket: &mut UnifiedSocket,
+        udp_socket: &mut pulsebeam_udp::UdpSocket,
         budget: usize,
     ) -> usize {
         self.execution.poll_and_flush_dirty(udp_socket, budget)
@@ -292,7 +292,7 @@ impl ShardExecution {
     fn drain_participant_network(
         &mut self,
         key: ParticipantHandle,
-        udp_socket: &mut UnifiedSocket,
+        udp_socket: &mut pulsebeam_udp::UdpSocket,
     ) {
         let registry = &mut self.registry;
         let udp = &mut self.udp_send_batch;
@@ -860,7 +860,7 @@ impl ShardExecution {
 
     pub(crate) fn poll_and_flush_dirty(
         &mut self,
-        udp_socket: &mut UnifiedSocket,
+        udp_socket: &mut pulsebeam_udp::UdpSocket,
         budget: usize,
     ) -> usize {
         // Commands and update retirements can create transports after the
@@ -1212,13 +1212,12 @@ mod wrong_owner_tests {
                     .is_empty()
             );
 
-            let mut udp = net::bind(
-                "0.0.0.0:0".parse().unwrap(),
-                Transport::Udp(UdpMode::Scalar),
-                None,
-                0,
-            )
+            let mut udp = pulsebeam_udp::bind(pulsebeam_udp::BindOptions::new(
+                "127.0.0.1:0".parse().unwrap(),
+            ))
             .await
+            .unwrap()
+            .activate()
             .unwrap();
             let wall_now = Instant::now();
             assert!(wall_now > turn_started + pulsebeam_runtime::SHARD_TIMER_QUANTUM);

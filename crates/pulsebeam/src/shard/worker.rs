@@ -14,7 +14,7 @@ use crate::clock::WallAnchor;
 use crate::route::Envelope;
 
 use pulsebeam_queue as mailbox;
-use pulsebeam_runtime::net::{self, RecvPacketBatch, UnifiedSocket};
+use pulsebeam_runtime::net::{self, RecvPacketBatch};
 use tokio::time::{Instant, Sleep};
 
 use crate::{
@@ -313,7 +313,7 @@ pub(crate) struct ShardWorker {
     core: ShardCore,
     recv_batch: Vec<RecvPacketBatch>,
     tcp_inbox: Option<crate::ice_tcp::Inbox>,
-    udp_socket: UnifiedSocket,
+    udp_socket: pulsebeam_udp::UdpSocket,
     command_rx: mailbox::Receiver<ShardCommand>,
     event_tx: mailbox::Sender<ShardEventMessage>,
     shard_event_backlog: VecDeque<ShardEvent>,
@@ -379,7 +379,7 @@ impl ShardWorker {
     )]
     pub(crate) fn new(
         shard_id: ShardId,
-        udp_socket: UnifiedSocket,
+        udp_socket: pulsebeam_udp::UdpSocket,
         tcp_inbox: Option<crate::ice_tcp::Inbox>,
         command_rx: mailbox::Receiver<ShardCommand>,
         update_rx: mailbox::Receiver<Box<crate::shard_update::ShardUpdate>>,
@@ -393,7 +393,7 @@ impl ShardWorker {
         let shard_count = frame_txs.len();
         let core = ShardCore::new(
             shard_id,
-            udp_socket.max_gso_segments(),
+            udp_socket.capabilities().max_gso_segments,
             shard_count,
             wall,
             update_rx,
@@ -581,7 +581,20 @@ impl ShardWorker {
         if frames == SHARD_FRAME_BUDGET {
             self.tick_budget_hit("frames");
         }
-        let _ = self.udp_socket.try_recv_batch(&mut self.recv_batch);
+        if self.recv_batch.is_empty() {
+            let mode = if self.udp_socket.capabilities().max_batch_messages > 1 {
+                net::UdpMode::Batch
+            } else {
+                net::UdpMode::Scalar
+            };
+            if let Ok(batch) = self.udp_socket.try_recv_batch() {
+                // Routing can transfer packets to another shard. Ownership is
+                // materialized here, not imposed on immediate socket inspection.
+                for datagram in batch.iter() {
+                    append_owned_udp(&mut self.recv_batch, mode, datagram);
+                }
+            }
+        }
         let received = self.recv_batch.len();
         for batch in self
             .recv_batch
@@ -622,11 +635,7 @@ impl ShardWorker {
             self.tick_budget_hit("participant_events");
         }
 
-        for (_, peers) in self.core.drain_pending_close() {
-            for peer in peers {
-                self.udp_socket.close_peer(&peer);
-            }
-        }
+        self.core.drain_pending_close().for_each(drop);
 
         // TCP is deliberately last. Charge every item at its configured maximum
         // so even hostile full-size frames fit the fixed 64 KiB per-tick budget.
@@ -682,10 +691,88 @@ impl ShardWorker {
     }
 }
 
+fn append_owned_udp(
+    out: &mut Vec<RecvPacketBatch>,
+    mode: net::UdpMode,
+    datagram: pulsebeam_udp::ReceivedDatagram<'_>,
+) {
+    let len = datagram.payload.len();
+    if mode == net::UdpMode::Batch
+        && len > 0
+        && let Some(previous) = out.last_mut()
+        && previous.src == datagram.source
+        && previous.dst == datagram.destination
+        && previous.transport == net::Transport::Udp(mode)
+        && previous.received_at == datagram.received_at
+        && previous.offset == 0
+        && previous.stride == len
+        && previous.len.div_ceil(previous.stride) < net::UDP_MAX_GSO_SEGMENTS
+        && previous.len.saturating_add(len) <= net::MAX_UDP_GSO_PAYLOAD_SIZE
+    {
+        previous.buf.extend_from_slice(datagram.payload);
+        previous.len = previous.len.saturating_add(len);
+        return;
+    }
+    out.push(RecvPacketBatch {
+        src: datagram.source,
+        dst: datagram.destination,
+        buf: datagram.payload.to_vec(),
+        stride: len.max(1),
+        len,
+        transport: net::Transport::Udp(mode),
+        received_at: datagram.received_at,
+        offset: 0,
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::shard::recorder::MetricSeries;
+
+    #[test]
+    fn owned_udp_handoff_preserves_bounded_batches_and_arrival_identity() {
+        let mut out = Vec::new();
+        let payload = [7; 800];
+        let datagram = pulsebeam_udp::ReceivedDatagram {
+            source: "127.0.0.1:1000".parse().unwrap(),
+            destination: "127.0.0.1:2000".parse().unwrap(),
+            payload: &payload,
+            received_at: net::ReceiveTime::now(),
+        };
+        for _ in 0..=net::UDP_MAX_GSO_SEGMENTS {
+            append_owned_udp(&mut out, net::UdpMode::Batch, datagram);
+        }
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].len, payload.len() * net::UDP_MAX_GSO_SEGMENTS);
+        assert_eq!(out[1].len, payload.len());
+        assert_eq!(out[0].received_at, datagram.received_at);
+        for _ in 0..net::UDP_MAX_GSO_SEGMENTS {
+            assert_eq!(out[0].next_packet().unwrap(), payload);
+        }
+        assert!(out[0].next_packet().is_none());
+        let later = pulsebeam_udp::ReceivedDatagram {
+            received_at: net::ReceiveTime {
+                monotonic: datagram.received_at.monotonic + std::time::Duration::from_nanos(1),
+                ..datagram.received_at
+            },
+            ..datagram
+        };
+        append_owned_udp(&mut out, net::UdpMode::Batch, later);
+        assert_eq!(out.len(), 3);
+        append_owned_udp(
+            &mut out,
+            net::UdpMode::Batch,
+            pulsebeam_udp::ReceivedDatagram {
+                destination: "127.0.0.1:3000".parse().unwrap(),
+                ..later
+            },
+        );
+        assert_eq!(out.len(), 4);
+        append_owned_udp(&mut out, net::UdpMode::Scalar, later);
+        append_owned_udp(&mut out, net::UdpMode::Scalar, later);
+        assert_eq!(out.len(), 6);
+    }
 
     fn find(keys: &[MetricSeries], name: &str) -> usize {
         for (idx, key) in keys.iter().enumerate() {

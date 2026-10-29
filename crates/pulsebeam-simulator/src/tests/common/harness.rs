@@ -2172,6 +2172,13 @@ async fn execute_plan(
                                     && observer.media_kinds_of(&id)
                                         == Some((subject.publishes_video, subject.publishes_audio))
                             })
+                            // The room oracle needs every present client's admission
+                            // and first coherent snapshot, not only this publication.
+                            && handles.values().all(|handle| {
+                                !handle.present
+                                    || (handle.participant_id().is_some()
+                                        && handle.shared.observation.lock().unwrap().is_some())
+                            })
                         {
                             assert_room_state_consistent(handles, description);
                             if !disturbances.is_empty() {

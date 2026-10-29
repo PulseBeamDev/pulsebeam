@@ -3511,6 +3511,7 @@ dependencies = [
  "pulsebeam-steer",
  "pulsebeam-tcp",
  "pulsebeam-testdata",
+ "pulsebeam-udp",
  "rand 0.10.2",
  "reqwest",
  "rust-embed",
@@ -3725,14 +3726,13 @@ dependencies = [
  "futures-test",
  "libc",
  "metrics",
- "nix 0.31.3",
  "once_cell",
  "parking_lot",
  "pulsebeam-core",
  "pulsebeam-queue",
  "pulsebeam-steer",
+ "pulsebeam-udp",
  "rand 0.10.2",
- "socket2",
  "systemstat",
  "thiserror 2.0.20",
  "tokio",
@@ -3814,6 +3814,16 @@ version = "0.3.2"
 dependencies = [
  "sha2",
  "zstd",
+]
+
+[[package]]
+name = "pulsebeam-udp"
+version = "0.3.2"
+dependencies = [
+ "nix 0.31.3",
+ "socket2",
+ "tokio",
+ "turmoil",
 ]
 
 [[package]]

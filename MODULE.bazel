@@ -164,7 +164,10 @@ crate.annotation(
 crate.annotation(
     crate = "turmoil",
     repositories = ["crates"],
-    patches = ["//tools:patches/turmoil-established-tcp-retransmit.patch"],
+    patches = [
+        "//tools:patches/turmoil-established-tcp-retransmit.patch",
+        "//tools:patches/turmoil-udp-destination.patch",
+    ],
     patch_args = ["-p1"],
 )
 # Upstream emits an absolute build-script sandbox path into its RustEmbed derive.

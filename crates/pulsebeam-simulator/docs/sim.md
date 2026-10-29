@@ -62,13 +62,13 @@ that owns the common values.
 
 ### Transport and address-family coverage
 
-Production selects the Linux batched UDP transport, including `recvmmsg`,
-`sendmmsg`, GRO and GSO. Turmoil cannot provide those kernel APIs, so the
-simulator selects `udp_batch_sim.rs`: a separate adapter that uses the shared
-batched packet representation and shaper while delegating datagram mechanics to
-the simulator socket. Production code above the runtime transport interface has
-no simulator branches. A runtime unit test verifies GRO-shaped strided batches,
-and an end-to-end plan verifies GSO batching plus reassembled media.
+Production uses `pulsebeam-udp` for Linux batched UDP I/O, including `recvmmsg`,
+`sendmmsg`, GRO and GSO. Simulation uses the same borrowed-datagram and exact
+send-prefix API with a host-owned device adapter in `pulsebeam-runtime`. The host
+owns reuseport steering and network shaping; the I/O crate owns bounded receive
+storage and logical GSO/GRO boundaries. I/O conformance tests verify those
+boundaries, host tests verify steering and handoff metadata, and end-to-end plans
+verify GSO batching plus reassembled media.
 
 TCP simulation uses the same RFC 4571 framing and connection handoff path as
 production. The length field is the full 16-bit range; a valid 5,635-byte first
