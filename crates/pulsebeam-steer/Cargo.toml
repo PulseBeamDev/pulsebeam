@@ -1,5 +1,5 @@
 [package]
-name = "pulsebeam-routing"
+name = "pulsebeam-steer"
 license = "AGPL-3.0"
 publish = false
 
@@ -12,9 +12,6 @@ authors.workspace = true
 
 [lints]
 workspace = true
-
-[dependencies]
-zerocopy = { version = "0.8.56", features = ["derive"] }
 
 [dev-dependencies]
 base32 = "0.5.1"

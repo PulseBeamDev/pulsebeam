@@ -62,7 +62,8 @@ const _: () = assert!(
 /// This is the one place route bits are packed and unpacked. The two route
 /// families ([`TransportRoute`] and [`RouteId`]) wrap it rather than
 /// re-deriving the layout, so a change to the widths cannot leave one family
-/// disagreeing with the other, with the ufrag, or with the eBPF classifier.
+/// disagreeing with the other. The shared client ufrag layout is independently
+/// pinned by conversion and wire-fixture tests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct PackedRoute(u32);
 
@@ -264,16 +265,14 @@ impl std::fmt::Display for NodeTransportAddress {
     }
 }
 
-pub use pulsebeam_routing::envelope::{
-    ENVELOPE_LEN, ENVELOPE_VERSION, EnvelopeError, EnvelopeType, ROUTE_OFFSET,
-};
+mod envelope;
 
-/// Read the destination shard out of an encoded frame without parsing the
-/// payload — the same fixed-offset read the eBPF steering program does, so a
-/// userspace fallback cannot disagree with the kernel about where a datagram
-/// belongs.
+pub use envelope::{ENVELOPE_LEN, ENVELOPE_VERSION, EnvelopeError, EnvelopeType, ROUTE_OFFSET};
+
+/// Read a plaintext frame's destination shard without validating its header.
+/// This is not suitable for classifying encrypted link traffic.
 pub fn peek_shard(buf: &[u8]) -> Option<ShardId> {
-    pulsebeam_routing::envelope::peek_shard(buf).map(|shard| ShardId::new(usize::from(shard)))
+    envelope::peek_route(buf).map(RouteId::shard)
 }
 
 /// The one typed view of the fixed wire header.
@@ -318,20 +317,20 @@ impl Envelope {
     }
 
     pub fn encode(self) -> [u8; ENVELOPE_LEN] {
-        pulsebeam_routing::envelope::Envelope {
+        envelope::Envelope {
             ty: self.ty,
             epoch: self.address.epoch,
-            route: to_wire_route(self.address.route),
+            route: self.address.route,
             extension: self.extension,
         }
         .encode()
     }
 
     pub fn decode(buf: &[u8]) -> Result<Self, EnvelopeError> {
-        let wire = pulsebeam_routing::envelope::Envelope::decode(buf)?;
+        let wire = envelope::Envelope::decode(buf)?;
         Ok(Self {
             ty: wire.ty,
-            address: NodeRouteAddress::new(from_wire_route(wire.route), wire.epoch),
+            address: NodeRouteAddress::new(wire.route, wire.epoch),
             extension: wire.extension,
         })
     }
@@ -357,14 +356,6 @@ pub fn decode_frame(buf: &[u8]) -> Result<(Envelope, FrameBody), EnvelopeError> 
 /// its `extension` and its payload.
 pub fn peek_type(buf: &[u8]) -> Result<EnvelopeType, EnvelopeError> {
     Envelope::decode(buf).map(|env| env.ty)
-}
-
-fn to_wire_route(route: RouteId) -> pulsebeam_routing::RouteId {
-    pulsebeam_routing::RouteId::from_raw(route.get())
-}
-
-fn from_wire_route(route: pulsebeam_routing::RouteId) -> RouteId {
-    RouteId::from_raw(route.get())
 }
 
 /// What the destination does with a frame that arrives on a route.

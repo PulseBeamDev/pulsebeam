@@ -214,7 +214,7 @@ fn validate_and_route(
         tracing::warn!(
             %peer_addr,
             frame_bytes = payload.len(),
-            valid_stun_header = pulsebeam_routing::stun::is_stun(payload),
+            valid_stun_header = pulsebeam_steer::stun::is_stun(payload),
             "TCP first frame carries no STUN ufrag, dropping"
         );
         return None; // stream dropped here, OS socket closed

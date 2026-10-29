@@ -14,8 +14,8 @@ extract_cargo_lints(
 )
 
 rust_library(
-    name = "pulsebeam-routing",
-    crate_name = "pulsebeam_routing",
+    name = "pulsebeam-steer",
+    crate_name = "pulsebeam_steer",
     crate_root = "src/lib.rs",
     srcs = glob(["src/**/*.rs"]),
     compile_data = ["README.md"],
@@ -29,7 +29,7 @@ rust_library(
 
 rust_test(
     name = "unit_tests",
-    crate = ":pulsebeam-routing",
+    crate = ":pulsebeam-steer",
     lint_config = ":lints",
     aliases = aliases(normal_dev = True, proc_macro_dev = True),
     deps = all_crate_deps(normal_dev = True),
@@ -38,10 +38,10 @@ rust_test(
 
 rustfmt_test(
     name = "format",
-    targets = [":pulsebeam-routing"],
+    targets = [":pulsebeam-steer"],
 )
 
 rust_clippy_test(
     name = "clippy",
-    targets = [":pulsebeam-routing", ":unit_tests"],
+    targets = [":pulsebeam-steer", ":unit_tests"],
 )

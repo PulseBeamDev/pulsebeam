@@ -5,7 +5,7 @@
 //! ver(4) | cluster_id(12) | node_id(16) | transport_route(32) | epoch(16)
 //! ```
 //!
-//! Mirrors `pulsebeam/src/control/ufrag.rs`'s byte layout exactly. The
+//! Shared with the SFU's typed ICE credential adapter. The
 //! Crockford base32 codec here is a fixed-size, allocation-free
 //! reimplementation of the `base32` crate's `Alphabet::Crockford` — see
 //! `differential` tests for the equivalence proof.
@@ -20,20 +20,26 @@ const CROCKFORD_ALPHABET: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IceUfrag {
-    pub cluster_id: u16,
-    pub node_id: u16,
-    pub transport: TransportRoute,
-    pub epoch: u16,
+    cluster_id: u16,
+    node_id: u16,
+    transport: TransportRoute,
+    epoch: u16,
 }
 
-pub(crate) enum UfragDecodeError {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UfragError {
+    InvalidCluster,
     BadEncoding,
     BadVersion,
 }
 
 impl IceUfrag {
+    /// Constructs trusted fields. Use `try_new` for untrusted cluster ids.
+    ///
+    /// # Panics
+    /// Panics if the cluster id exceeds 12 bits.
     pub const fn new(cluster_id: u16, node_id: u16, transport: TransportRoute, epoch: u16) -> Self {
-        debug_assert!(
+        assert!(
             cluster_id <= 0x0FFF,
             "cluster_id must fit in 12 bits (max 4095)"
         );
@@ -43,6 +49,36 @@ impl IceUfrag {
             transport,
             epoch,
         }
+    }
+
+    pub const fn try_new(
+        cluster_id: u16,
+        node_id: u16,
+        transport: TransportRoute,
+        epoch: u16,
+    ) -> Result<Self, UfragError> {
+        if cluster_id > 0x0FFF {
+            return Err(UfragError::InvalidCluster);
+        }
+        Ok(Self {
+            cluster_id,
+            node_id,
+            transport,
+            epoch,
+        })
+    }
+
+    pub const fn cluster_id(self) -> u16 {
+        self.cluster_id
+    }
+    pub const fn node_id(self) -> u16 {
+        self.node_id
+    }
+    pub const fn transport(self) -> TransportRoute {
+        self.transport
+    }
+    pub const fn epoch(self) -> u16 {
+        self.epoch
     }
 
     pub fn encode_raw(&self) -> [u8; RAW_LEN] {
@@ -78,8 +114,8 @@ impl IceUfrag {
     }
 }
 
-pub(crate) fn decode_ascii_detailed(s: &[u8]) -> Result<IceUfrag, UfragDecodeError> {
-    let arr: [u8; ENCODED_LEN] = s.try_into().map_err(|_| UfragDecodeError::BadEncoding)?;
+pub(crate) fn decode_ascii_detailed(s: &[u8]) -> Result<IceUfrag, UfragError> {
+    let arr: [u8; ENCODED_LEN] = s.try_into().map_err(|_| UfragError::BadEncoding)?;
     let [
         c0,
         c1,
@@ -98,22 +134,22 @@ pub(crate) fn decode_ascii_detailed(s: &[u8]) -> Result<IceUfrag, UfragDecodeErr
         c14,
         c15,
     ] = arr;
-    let v0 = crockford_value(c0).ok_or(UfragDecodeError::BadEncoding)?;
-    let v1 = crockford_value(c1).ok_or(UfragDecodeError::BadEncoding)?;
-    let v2 = crockford_value(c2).ok_or(UfragDecodeError::BadEncoding)?;
-    let v3 = crockford_value(c3).ok_or(UfragDecodeError::BadEncoding)?;
-    let v4 = crockford_value(c4).ok_or(UfragDecodeError::BadEncoding)?;
-    let v5 = crockford_value(c5).ok_or(UfragDecodeError::BadEncoding)?;
-    let v6 = crockford_value(c6).ok_or(UfragDecodeError::BadEncoding)?;
-    let v7 = crockford_value(c7).ok_or(UfragDecodeError::BadEncoding)?;
-    let v8 = crockford_value(c8).ok_or(UfragDecodeError::BadEncoding)?;
-    let v9 = crockford_value(c9).ok_or(UfragDecodeError::BadEncoding)?;
-    let v10 = crockford_value(c10).ok_or(UfragDecodeError::BadEncoding)?;
-    let v11 = crockford_value(c11).ok_or(UfragDecodeError::BadEncoding)?;
-    let v12 = crockford_value(c12).ok_or(UfragDecodeError::BadEncoding)?;
-    let v13 = crockford_value(c13).ok_or(UfragDecodeError::BadEncoding)?;
-    let v14 = crockford_value(c14).ok_or(UfragDecodeError::BadEncoding)?;
-    let v15 = crockford_value(c15).ok_or(UfragDecodeError::BadEncoding)?;
+    let v0 = crockford_value(c0).ok_or(UfragError::BadEncoding)?;
+    let v1 = crockford_value(c1).ok_or(UfragError::BadEncoding)?;
+    let v2 = crockford_value(c2).ok_or(UfragError::BadEncoding)?;
+    let v3 = crockford_value(c3).ok_or(UfragError::BadEncoding)?;
+    let v4 = crockford_value(c4).ok_or(UfragError::BadEncoding)?;
+    let v5 = crockford_value(c5).ok_or(UfragError::BadEncoding)?;
+    let v6 = crockford_value(c6).ok_or(UfragError::BadEncoding)?;
+    let v7 = crockford_value(c7).ok_or(UfragError::BadEncoding)?;
+    let v8 = crockford_value(c8).ok_or(UfragError::BadEncoding)?;
+    let v9 = crockford_value(c9).ok_or(UfragError::BadEncoding)?;
+    let v10 = crockford_value(c10).ok_or(UfragError::BadEncoding)?;
+    let v11 = crockford_value(c11).ok_or(UfragError::BadEncoding)?;
+    let v12 = crockford_value(c12).ok_or(UfragError::BadEncoding)?;
+    let v13 = crockford_value(c13).ok_or(UfragError::BadEncoding)?;
+    let v14 = crockford_value(c14).ok_or(UfragError::BadEncoding)?;
+    let v15 = crockford_value(c15).ok_or(UfragError::BadEncoding)?;
 
     let [b0, b1, b2, b3, b4] = decode_chunk([v0, v1, v2, v3, v4, v5, v6, v7]);
     let [b5, b6, b7, b8, b9] = decode_chunk([v8, v9, v10, v11, v12, v13, v14, v15]);
@@ -129,10 +165,10 @@ pub(crate) fn encode_ascii_raw_bytes(raw: &[u8; RAW_LEN]) -> [u8; ENCODED_LEN] {
     ]
 }
 
-fn decode_raw_detailed(raw: &[u8; RAW_LEN]) -> Result<IceUfrag, UfragDecodeError> {
+fn decode_raw_detailed(raw: &[u8; RAW_LEN]) -> Result<IceUfrag, UfragError> {
     let [c_hi, c_lo, n0, n1, r0, r1, r2, r3, e0, e1] = *raw;
     if c_hi >> 4 != VERSION {
-        return Err(UfragDecodeError::BadVersion);
+        return Err(UfragError::BadVersion);
     }
     let cluster_id = (u16::from(c_hi & 0x0F) << 8) | u16::from(c_lo);
     let node_id = u16::from_be_bytes([n0, n1]);
@@ -223,11 +259,30 @@ mod tests {
     use std::vec::Vec;
 
     fn transport(shard: u16, slot: u32) -> TransportRoute {
-        TransportRoute::new(shard, slot)
+        TransportRoute::try_new(shard, slot).unwrap()
     }
 
     fn ascii_to_string(bytes: [u8; ENCODED_LEN]) -> String {
         String::from_utf8(Vec::from(bytes)).unwrap()
+    }
+
+    #[test]
+    fn checked_constructor_rejects_cluster_overflow_without_truncation() {
+        let route = transport(0, 0);
+        assert_eq!(
+            IceUfrag::try_new(0x1000, 0, route, 0),
+            Err(UfragError::InvalidCluster)
+        );
+        assert_eq!(
+            IceUfrag::try_new(u16::MAX, 0, route, 0),
+            Err(UfragError::InvalidCluster)
+        );
+        assert_eq!(
+            IceUfrag::try_new(0xFFF, u16::MAX, route, u16::MAX)
+                .unwrap()
+                .cluster_id(),
+            0xFFF
+        );
     }
 
     #[test]
@@ -243,10 +298,11 @@ mod tests {
             IceUfrag::new(
                 0x0FFF,
                 u16::MAX,
-                TransportRoute::new(
+                TransportRoute::try_new(
                     u16::try_from(TransportRoute::MAX_SHARD).unwrap(),
                     TransportRoute::MAX_SLOT,
-                ),
+                )
+                .unwrap(),
                 u16::MAX,
             ),
             IceUfrag::new(0xabc, 0x1234, transport(7, 12345), 42),

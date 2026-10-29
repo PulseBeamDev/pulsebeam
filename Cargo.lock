@@ -3505,10 +3505,10 @@ dependencies = [
  "pulsebeam-core",
  "pulsebeam-proto",
  "pulsebeam-queue",
- "pulsebeam-routing",
  "pulsebeam-rtc",
  "pulsebeam-runtime",
  "pulsebeam-server",
+ "pulsebeam-steer",
  "pulsebeam-testdata",
  "rand 0.10.2",
  "reqwest",
@@ -3684,14 +3684,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "pulsebeam-routing"
-version = "0.3.2"
-dependencies = [
- "base32",
- "zerocopy",
-]
-
-[[package]]
 name = "pulsebeam-rtc"
 version = "0.3.2"
 dependencies = [
@@ -3737,7 +3729,7 @@ dependencies = [
  "parking_lot",
  "pulsebeam-core",
  "pulsebeam-queue",
- "pulsebeam-routing",
+ "pulsebeam-steer",
  "rand 0.10.2",
  "socket2",
  "systemstat",
@@ -3798,6 +3790,13 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "turmoil",
+]
+
+[[package]]
+name = "pulsebeam-steer"
+version = "0.3.2"
+dependencies = [
+ "base32",
 ]
 
 [[package]]

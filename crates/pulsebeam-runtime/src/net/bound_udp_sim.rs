@@ -1,7 +1,9 @@
 use super::{ReceiveTime, UdpMode, UnifiedSocket, udp_batch_sim, udp_scalar};
 use crate::sync::Arc;
 use pulsebeam_core::net::UdpSocket;
-use pulsebeam_routing::steer::{self, FlowKey, SteerEnv, Verdict};
+use pulsebeam_steer::{FlowKey, FlowLookup, Verdict, steer_flow};
+
+const SIM_FLOW_CAPACITY: usize = 4096;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::rc::{Rc, Weak};
@@ -34,16 +36,6 @@ impl BoundUdpSocket {
 }
 
 type ReuseportKey = (SocketAddr, Option<SocketAddr>);
-
-/// Neither `pulsebeam/src/node.rs` nor anything below it currently threads a
-/// cluster/node identity down to bind time — that lives in the control plane
-/// (`pulsebeam/src/control/{controller,ufrag}.rs`), assigned after sockets are
-/// already bound. Until that is wired through, every simulated group
-/// classifies as this identity. A multi-cluster or multi-node simulation that
-/// assigns real non-zero ids will see every client STUN packet dropped as
-/// `WrongCluster` / `WrongNode` until that wiring lands.
-const DEFAULT_SIM_CLUSTER_ID: u16 = 0;
-const DEFAULT_SIM_NODE_ID: u16 = 0;
 
 thread_local! {
     static WRONG_OWNER_INJECTIONS_CONSUMED: Cell<u64> = const { Cell::new(0) };
@@ -92,10 +84,8 @@ struct Inbox {
 
 type FlowTuple = FlowKey;
 
-/// Bounded `(src, dst) -> member index` cache, standing in for the kernel's
-/// `SO_REUSEPORT` BPF map. It uses deterministic LRU eviction: a hot call is
-/// touched by every established packet and therefore survives churn just as
-/// it does in the kernel's LRU map.
+/// Bounded `(src, dst) -> member index` cache modeling SO_REUSEPORT affinity.
+/// Deterministic LRU eviction lets established flows survive cold-flow churn.
 #[derive(Default)]
 struct FlowTable {
     members: HashMap<FlowTuple, u16>,
@@ -122,32 +112,24 @@ impl FlowTable {
             debug_assert_eq!(self.arrival_order.len(), self.members.len());
             return;
         }
-        if self.arrival_order.len() >= steer::SIM_FLOW_CAPACITY
+        if self.arrival_order.len() >= SIM_FLOW_CAPACITY
             && let Some(oldest) = self.arrival_order.pop_front()
         {
             self.members.remove(&oldest);
         }
         self.arrival_order.push_back(tuple);
-        debug_assert!(self.arrival_order.len() <= steer::SIM_FLOW_CAPACITY);
+        debug_assert!(self.arrival_order.len() <= SIM_FLOW_CAPACITY);
         debug_assert_eq!(self.members.len(), self.arrival_order.len());
     }
 }
 
-/// The deterministic simulation adapter for `SO_REUSEPORT` steering: makes the
-/// exact same delivery decision the Aya program makes on Linux, by calling the
-/// shared `pulsebeam-routing` classifier on the datagram bytes rather than
-/// extracting a route from a Rust object the BPF path would never see on the
-/// wire.
-///
-/// Holds no socket, so it is directly unit-testable: classification and
-/// delivery are pure bookkeeping over `(cluster_id, node_id)`, a bounded flow
-/// table, and one queue per shard.
+/// Deterministic SO_REUSEPORT affinity with caller-owned tables and queues.
+/// Unknown tuples fall back to userspace bootstrap, as on production sockets.
 struct SimSteering {
     /// Indexed by shard index, not join order. A slot is `None` until that
     /// shard's socket has bound.
     inboxes: RefCell<Vec<Option<Inbox>>>,
     flow_table: RefCell<FlowTable>,
-    counters: RefCell<[u64; steer::counters::COUNT as usize]>,
     /// Test-only: when set, delivery lands on a different member than the
     /// classifier selected, so the userspace defensive drop (the
     /// shard-ownership check downstream of this adapter) has something to
@@ -156,12 +138,10 @@ struct SimSteering {
 }
 
 impl SimSteering {
-    fn new(cluster_id: u16, node_id: u16) -> Self {
-        let _ = (cluster_id, node_id);
+    fn new() -> Self {
         Self {
             inboxes: RefCell::new(Vec::new()),
             flow_table: RefCell::new(FlowTable::default()),
-            counters: RefCell::new([0; steer::counters::COUNT as usize]),
             wrong_owner_injection: Cell::new(false),
         }
     }
@@ -201,46 +181,11 @@ impl SimSteering {
     /// known flow is selected from the map; a miss follows the socket group's
     /// ordinary tuple hash so userspace can perform bootstrap classification.
     fn classify(&self, tuple: FlowTuple, _payload: &[u8], shard_count: u16) -> Option<usize> {
-        let mut env = SimSteerEnv {
-            flow_table: &self.flow_table,
-            counters: &self.counters,
-        };
-        let verdict = steer::steer_client(&mut env, tuple, shard_count, steer::MAX_SHARDS);
-        match verdict {
-            Verdict::Select { shard } => {
-                env.bump(steer::counters::SELECTED);
-                Some(usize::from(shard))
-            }
+        let lookup = SimFlowLookup(&self.flow_table);
+        match steer_flow(&lookup, &tuple, shard_count) {
+            Verdict::Select { shard } => Some(usize::from(shard)),
             Verdict::Pass | Verdict::Drop(_) => Some(default_member(tuple, shard_count)),
         }
-    }
-
-    #[cfg(test)]
-    fn classify_node(&self, payload: &[u8], shard_count: u16) -> Option<usize> {
-        let mut env = SimSteerEnv {
-            flow_table: &self.flow_table,
-            counters: &self.counters,
-        };
-        match steer::steer_node(&mut env, payload, shard_count, steer::MAX_SHARDS) {
-            Verdict::Select { shard } => {
-                env.bump(steer::counters::SELECTED);
-                Some(usize::from(shard))
-            }
-            // A node-lane datagram the program will not steer is not
-            // delivered here either: `Pass` means "no opinion", and there is no
-            // default hash to fall back to on this lane the way there is for
-            // clients.
-            Verdict::Pass | Verdict::Drop(_) => None,
-        }
-    }
-
-    #[cfg(test)]
-    fn counter(&self, counter: u32) -> u64 {
-        self.counters
-            .borrow()
-            .get(counter as usize)
-            .copied()
-            .unwrap_or_default()
     }
 
     fn deliver(
@@ -311,9 +256,8 @@ impl SimSteering {
     }
 }
 
-/// Pin an authenticated flow to the shard that owns its route, the way the
-/// controller pins one in the kernel's `FLOWS` map once str0m authenticates a
-/// source address.
+/// Pin an authenticated flow to the shard that owns its route after ICE
+/// authenticates its source address.
 ///
 /// Returns whether a reuseport group serving `destination` was found. Steering
 /// is a cache, so a miss is not an error: the flow keeps arriving wherever the
@@ -346,12 +290,12 @@ pub fn install_steering_flow(source: SocketAddr, destination: SocketAddr, shard:
 }
 
 fn route_owner(payload: &[u8]) -> Option<u16> {
-    match pulsebeam_routing::classify::classify_client(payload) {
-        pulsebeam_routing::classify::ClientVerdict::Bootstrap { address, .. } => {
-            Some(address.route.shard())
-        }
-        _ => None,
-    }
+    let token = pulsebeam_steer::stun::server_ufrag(payload)?;
+    Some(
+        pulsebeam_steer::IceUfrag::decode_ascii(token)?
+            .transport()
+            .shard(),
+    )
 }
 
 pub fn set_wrong_owner_injection(source: IpAddr) {
@@ -361,23 +305,11 @@ pub fn set_wrong_owner_injection(source: IpAddr) {
     }
 }
 
-struct SimSteerEnv<'a> {
-    flow_table: &'a RefCell<FlowTable>,
-    counters: &'a RefCell<[u64; steer::counters::COUNT as usize]>,
-}
+struct SimFlowLookup<'a>(&'a RefCell<FlowTable>);
 
-impl SteerEnv for SimSteerEnv<'_> {
-    fn flow_lookup(&self, flow: FlowKey) -> Option<u16> {
-        self.flow_table.borrow_mut().get(flow)
-    }
-
-    fn bump(&mut self, counter: u32) {
-        let mut counters = self.counters.borrow_mut();
-        let Some(value) = counters.get_mut(counter as usize) else {
-            debug_assert!(false, "steering counter index must be valid");
-            return;
-        };
-        *value = value.saturating_add(1);
+impl FlowLookup for SimFlowLookup<'_> {
+    fn get(&self, flow: &FlowKey) -> Option<u16> {
+        self.0.borrow_mut().get(*flow)
     }
 }
 
@@ -561,8 +493,7 @@ fn spawn_pump(group: &Rc<ReuseportGroup>) {
 /// already resolved a route for it would be a race the real kernel map doesn't
 /// have either.
 ///
-/// Delivery is steered by [`SimSteering`], the same classifier the Aya program
-/// runs. See [`ReuseportGroup`].
+/// Delivery uses shared client affinity in [`SimSteering`]. See [`ReuseportGroup`].
 pub async fn bind_udp_socket(
     addr: SocketAddr,
     mode: UdpMode,
@@ -578,7 +509,7 @@ pub async fn bind_udp_socket(
         None => {
             let group = Rc::new(ReuseportGroup {
                 socket: Arc::new(UdpSocket::bind(addr).await?),
-                steering: SimSteering::new(DEFAULT_SIM_CLUSTER_ID, DEFAULT_SIM_NODE_ID),
+                steering: SimSteering::new(),
             });
             REUSEPORT_GROUPS.with(|groups| groups.borrow_mut().insert(key, Rc::downgrade(&group)));
             spawn_pump(&group);
@@ -615,8 +546,6 @@ pub async fn bind_udp_socket(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pulsebeam_routing::RouteId;
-    use pulsebeam_routing::envelope::{Envelope, EnvelopeType};
 
     fn addr(port: u16) -> SocketAddr {
         format!("192.168.1.10:{port}").parse().unwrap()
@@ -629,10 +558,10 @@ mod tests {
     /// A STUN binding request whose USERNAME names `shard`'s route, which is
     /// the only kind of datagram a shard can classify without prior state.
     fn bootstrap_for(shard: u16, slot: u32) -> Vec<u8> {
-        let ufrag = pulsebeam_routing::ufrag::IceUfrag::new(
-            DEFAULT_SIM_CLUSTER_ID,
-            DEFAULT_SIM_NODE_ID,
-            pulsebeam_routing::TransportRoute::new(shard, slot),
+        let ufrag = pulsebeam_steer::ufrag::IceUfrag::new(
+            0,
+            0,
+            pulsebeam_steer::TransportRoute::try_new(shard, slot).unwrap(),
             0,
         );
         let mut username = ufrag.encode_ascii().to_vec();
@@ -646,7 +575,7 @@ mod tests {
                 .expect("fixture length fits")
                 .to_be_bytes(),
         );
-        buf.extend_from_slice(&pulsebeam_routing::stun::MAGIC_COOKIE.to_be_bytes());
+        buf.extend_from_slice(&pulsebeam_steer::stun::MAGIC_COOKIE.to_be_bytes());
         buf.extend_from_slice(&[0u8; 12]);
         buf.extend_from_slice(&0x0006u16.to_be_bytes());
         buf.extend_from_slice(
@@ -660,11 +589,39 @@ mod tests {
     }
 
     fn new_steering(shard_count: u16) -> SimSteering {
-        let steering = SimSteering::new(DEFAULT_SIM_CLUSTER_ID, DEFAULT_SIM_NODE_ID);
+        let steering = SimSteering::new();
         for shard in 0..shard_count {
             steering.bind_shard(shard).unwrap();
         }
         steering
+    }
+
+    #[test]
+    fn bootstrap_bytes_agree_with_userspace_but_do_not_install_affinity() {
+        let steering = new_steering(4);
+        let payload = bootstrap_for(3, 12345);
+        assert_eq!(route_owner(&payload), Some(3));
+        assert_eq!(
+            pulsebeam_steer::classify_bootstrap(
+                &payload,
+                pulsebeam_steer::NodeScope {
+                    cluster_id: 0,
+                    node_id: 0,
+                    shard_count: 4,
+                }
+            ),
+            pulsebeam_steer::Bootstrap::Route {
+                shard: 3,
+                slot: 12345,
+                epoch: 0
+            },
+        );
+        let tuple = flow_key(addr(1024), dst_addr());
+        assert_eq!(
+            steering.classify(tuple, &payload, 4),
+            Some(default_member(tuple, 4))
+        );
+        assert!(steering.flow_table.borrow_mut().get(tuple).is_none());
     }
 
     #[test]
@@ -673,7 +630,6 @@ mod tests {
         let tuple = flow_key(addr(1024), dst_addr());
         let first = steering.classify(tuple, b"not-stun", 4);
         assert_eq!(first, steering.classify(tuple, b"garbage", 4));
-        assert_eq!(steering.counter(steer::counters::UNKNOWN_FLOW), 2);
     }
 
     #[test]
@@ -682,7 +638,6 @@ mod tests {
         let tuple = flow_key(addr(1024), dst_addr());
         steering.flow_table.borrow_mut().insert(tuple, 3);
         assert_eq!(steering.classify(tuple, b"media", 4), Some(3));
-        assert_eq!(steering.counter(steer::counters::SELECTED), 1);
     }
 
     #[test]
@@ -691,11 +646,10 @@ mod tests {
         let tuple = flow_key(addr(1024), dst_addr());
         let selected = steering.classify(tuple, &[0; 3], 4);
         assert_eq!(selected, steering.classify(tuple, b"media", 4));
-        assert_eq!(steering.counter(steer::counters::MALFORMED_STUN), 0);
     }
 
     #[test]
-    fn stale_map_entries_fall_through_and_are_counted() {
+    fn stale_map_entries_fall_through() {
         let steering = new_steering(4);
         let tuple = flow_key(addr(1024), dst_addr());
         steering.flow_table.borrow_mut().insert(tuple, 3);
@@ -703,24 +657,23 @@ mod tests {
             steering.classify(tuple, b"media", 3),
             Some(default_member(tuple, 3))
         );
-        assert_eq!(steering.counter(steer::counters::STALE_ROUTE), 1);
     }
 
     #[test]
     fn flow_table_eviction_preserves_a_hot_flow() {
         let mut table = FlowTable::default();
-        for i in 0..steer::SIM_FLOW_CAPACITY {
+        for i in 0..SIM_FLOW_CAPACITY {
             let tuple = flow_key(addr(u16::try_from(1024 + i).unwrap()), dst_addr());
             table.insert(tuple, u16::try_from(i % 4).unwrap());
         }
         let hot_tuple = flow_key(addr(1024), dst_addr());
         let cold_tuple = flow_key(addr(1025), dst_addr());
         assert_eq!(table.get(hot_tuple), Some(0));
-        let overflow_port = u16::try_from(1024 + steer::SIM_FLOW_CAPACITY).expect("fits a port");
+        let overflow_port = u16::try_from(1024 + SIM_FLOW_CAPACITY).expect("fits a port");
         table.insert(flow_key(addr(overflow_port), dst_addr()), 0);
         assert_eq!(table.get(hot_tuple), Some(0));
         assert_eq!(table.get(cold_tuple), None);
-        assert_eq!(table.members.len(), steer::SIM_FLOW_CAPACITY);
+        assert_eq!(table.members.len(), SIM_FLOW_CAPACITY);
     }
 
     /// A bootstrap datagram delivered to a shard that does not own its route.
@@ -785,23 +738,8 @@ mod tests {
     }
 
     #[test]
-    fn node_envelope_drop_taxonomy_remains_kernel_owned() {
-        let steering = new_steering(4);
-        assert_eq!(steering.classify_node(&[0; 3], 4), None);
-        assert_eq!(steering.counter(steer::counters::MALFORMED_ENVELOPE), 1);
-        let envelope = Envelope {
-            ty: EnvelopeType::Media,
-            epoch: 1,
-            route: RouteId::new(1, 1),
-            extension: 0,
-        }
-        .encode();
-        assert_eq!(steering.classify_node(&envelope, 4), Some(1));
-    }
-
-    #[test]
     fn binding_the_same_shard_twice_fails() {
-        let steering = SimSteering::new(DEFAULT_SIM_CLUSTER_ID, DEFAULT_SIM_NODE_ID);
+        let steering = SimSteering::new();
         steering.bind_shard(0).unwrap();
         assert!(steering.bind_shard(0).is_err());
     }

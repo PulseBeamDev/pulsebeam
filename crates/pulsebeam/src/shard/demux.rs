@@ -1,6 +1,7 @@
 use arrayvec::ArrayVec;
 use pulsebeam_runtime::net;
 
+use crate::id::ShardId;
 use crate::route::{NodeTransportAddress, TransportRoute};
 
 use ahash::{HashMap, HashMapExt};
@@ -57,7 +58,7 @@ impl Demuxer {
         Self::for_node(
             0,
             0,
-            u16::try_from(pulsebeam_routing::steer::MAX_SHARDS).unwrap_or(u16::MAX),
+            u16::try_from(pulsebeam_steer::steer::MAX_SHARDS).unwrap_or(u16::MAX),
         )
     }
 
@@ -295,7 +296,7 @@ impl Demuxer {
         }
         #[cfg(feature = "sim")]
         crate::sim_metrics::record_routing_work("stun_sniffs", 1);
-        if !pulsebeam_routing::stun::is_stun(batch.data()) {
+        if !pulsebeam_steer::stun::is_stun(batch.data()) {
             return self.cached(src);
         }
 
@@ -305,14 +306,19 @@ impl Demuxer {
         }
         #[cfg(feature = "sim")]
         crate::sim_metrics::record_routing_work("stun_parses", 1);
-        match pulsebeam_routing::classify::classify_client_for_node(
+        match pulsebeam_steer::classify_bootstrap(
             batch.data(),
-            self.cluster_id,
-            self.node_id,
-            self.shard_count,
+            pulsebeam_steer::NodeScope {
+                cluster_id: self.cluster_id,
+                node_id: self.node_id,
+                shard_count: self.shard_count,
+            },
         ) {
-            pulsebeam_routing::classify::ClientVerdict::Bootstrap { address, .. } => {
-                let address = to_local_address(address);
+            pulsebeam_steer::Bootstrap::Route { shard, slot, epoch } => {
+                let address = NodeTransportAddress::new(
+                    TransportRoute::new(ShardId::new(usize::from(shard)), slot),
+                    epoch,
+                );
                 if self
                     .addr_map
                     .get(&src)
@@ -325,8 +331,9 @@ impl Demuxer {
                 self.admit(src, address, false);
                 Some(address)
             }
-            pulsebeam_routing::classify::ClientVerdict::Established
-            | pulsebeam_routing::classify::ClientVerdict::Drop(_) => self.cached(src),
+            pulsebeam_steer::Bootstrap::NotStun | pulsebeam_steer::Bootstrap::Reject(_) => {
+                self.cached(src)
+            }
         }
     }
 
@@ -429,18 +436,8 @@ impl Default for Demuxer {
     }
 }
 
-fn to_local_address(address: pulsebeam_routing::NodeTransportAddress) -> NodeTransportAddress {
-    let route = TransportRoute::from_raw(address.route.get());
-    debug_assert_eq!(
-        route.shard().index(),
-        usize::from(address.route.shard()),
-        "shard must survive the pulsebeam-routing <-> pulsebeam TransportRoute conversion"
-    );
-    NodeTransportAddress::new(route, address.epoch)
-}
-
 pub(crate) fn extract_stun_server_ufrag(data: &[u8]) -> Option<String> {
-    pulsebeam_routing::stun::server_ufrag(data)
+    pulsebeam_steer::stun::server_ufrag(data)
         .and_then(|raw| std::str::from_utf8(raw).ok())
         .map(str::to_owned)
 }
@@ -495,6 +492,40 @@ mod tests {
             IceUfrag::new(0, 0, route, epoch),
             NodeTransportAddress::new(route, epoch),
         )
+    }
+
+    #[test]
+    fn shared_raw_fixture_preserves_bootstrap_scope_and_cached_fallback() {
+        let packet = stun_with_ufrag("1AY14D00E0R3J01A");
+        let expected = NodeTransportAddress::new(TransportRoute::new(ShardId::new(7), 12345), 42);
+        for (cluster, node, shards, accepted) in [
+            (0xABC, 0x1234, 8, true),
+            (1, 0x1234, 8, false),
+            (0xABC, 1, 8, false),
+            (0xABC, 0x1234, 7, false),
+        ] {
+            let mut demux = Demuxer::for_node(cluster, node, shards);
+            let candidate = demux.demux(&batch(src(1234), packet.clone()));
+            assert_eq!(candidate, accepted.then_some(expected));
+            let shared = pulsebeam_steer::classify_bootstrap(
+                &packet,
+                pulsebeam_steer::NodeScope {
+                    cluster_id: cluster,
+                    node_id: node,
+                    shard_count: shards,
+                },
+            );
+            assert_eq!(
+                matches!(shared, pulsebeam_steer::Bootstrap::Route { .. }),
+                accepted
+            );
+            // A rejected bootstrap is still allowed to use previously learned affinity.
+            demux.learn(src(1234), expected);
+            assert_eq!(
+                demux.demux(&batch(src(1234), packet.clone())),
+                Some(expected)
+            );
+        }
     }
 
     #[test]

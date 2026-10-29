@@ -12,7 +12,7 @@ filegroup(
 
 RUST_OWNERS = [
     "crates/pulsebeam", "crates/pulsebeam-cli", "crates/pulsebeam-auth", "crates/pulsebeam-core",
-    "crates/pulsebeam-proto", "crates/pulsebeam-routing", "crates/pulsebeam-rtc", "crates/pulsebeam-libwebrtc-sys",
+    "crates/pulsebeam-proto", "crates/pulsebeam-steer", "crates/pulsebeam-rtc", "crates/pulsebeam-libwebrtc-sys",
     "crates/pulsebeam-runtime", "crates/pulsebeam-queue", "crates/pulsebeam-testdata",
     "agents/pulsebeam-agent-core", "agents/pulsebeam-agent-native", "agents/pulsebeam-agent-web",
 ]

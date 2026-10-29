@@ -40,7 +40,7 @@ pulsebeam-core = { path = "../pulsebeam-core" }
 pulsebeam-queue = { path = "../pulsebeam-queue" }
 pulsebeam-rtc = { path = "../pulsebeam-rtc" }
 pulsebeam-proto = { path = "../pulsebeam-proto" }
-pulsebeam-routing = { path = "../pulsebeam-routing" }
+pulsebeam-steer = { path = "../pulsebeam-steer" }
 pulsebeam-runtime = { path = "../pulsebeam-runtime" }
 rand = { workspace = true }
 # Swagger's generated folder must resolve the compiler action's OUT_DIR.

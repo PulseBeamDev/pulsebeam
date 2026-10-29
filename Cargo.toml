@@ -6,7 +6,7 @@ members = [
   "crates/pulsebeam-auth",
   "crates/pulsebeam-core",
   "crates/pulsebeam-proto",
-  "crates/pulsebeam-routing",
+  "crates/pulsebeam-steer",
   "crates/pulsebeam-rtc",
   "crates/pulsebeam-libwebrtc-sys",
   "crates/pulsebeam-rtc/simulation",

@@ -1,9 +1,7 @@
 //! The fixed 16-byte inter-node Envelope: `version | type | epoch | route |
-//! extension`, all big-endian. `route` sits at a fixed offset so the Aya
-//! program (and [`peek_route`]) can read the destination shard without
-//! parsing the rest of the packet.
+//! extension`, all big-endian. Only plaintext frames can be inspected.
 
-use crate::RouteId;
+use super::RouteId;
 
 pub const ENVELOPE_LEN: usize = 16;
 pub const ROUTE_OFFSET: usize = 4;
@@ -99,18 +97,11 @@ impl Envelope {
     }
 }
 
-/// Bounds-checked fixed-offset route read for the steering path. Does not
-/// validate version or type — the eBPF program only needs to know which
-/// shard socket to hand the datagram to, not whether userspace will
-/// ultimately accept it.
+/// Bounds-checked route hint from a plaintext frame, without header validation.
 pub fn peek_route(buf: &[u8]) -> Option<RouteId> {
     let route_end = ROUTE_OFFSET.checked_add(4)?;
     let bytes: [u8; 4] = buf.get(ROUTE_OFFSET..route_end)?.try_into().ok()?;
     Some(RouteId::from_raw(u32::from_be_bytes(bytes)))
-}
-
-pub fn peek_shard(buf: &[u8]) -> Option<u16> {
-    peek_route(buf).map(RouteId::shard)
 }
 
 #[cfg(test)]
@@ -196,7 +187,6 @@ mod tests {
             let bytes = env.encode();
             let decoded = Envelope::decode(&bytes).unwrap();
             assert_eq!(peek_route(&bytes), Some(decoded.route));
-            assert_eq!(peek_shard(&bytes), Some(decoded.route.shard()));
         }
     }
 
@@ -205,7 +195,6 @@ mod tests {
         for len in 0..ROUTE_OFFSET.checked_add(4).unwrap() {
             let bytes = std::vec![0u8; len];
             assert_eq!(peek_route(&bytes), None);
-            assert_eq!(peek_shard(&bytes), None);
         }
     }
 
