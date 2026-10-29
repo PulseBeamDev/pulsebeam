@@ -24,7 +24,9 @@ UDP is the optimized dataplane. Passive ICE-TCP uses one optional
 admitted connection. The thread uses Linux `SCHED_IDLE` and a spare non-dataplane
 core when available. Startup fails rather than advertising TCP if binding or
 the required scheduling policy fails. Thread separation does not isolate kernel,
-cache or NIC work; qualify interference on deployment hardware.
+cache or NIC work. `CAP_SYS_NICE` is not required: the dataplane's
+`SCHED_FIFO` promotion is a best-effort optimization, and the TCP executor's
+`SCHED_IDLE` policy does not require that capability.
 
 `NodeBuilder::ice_tcp(IceTcpConfig::Disabled)` and `udp_only()` create no media
 TCP listener, executor, tasks, shard inboxes or candidate. HTTP signaling and
@@ -40,8 +42,8 @@ TCP inbox drained after UDP and normal shard work, with at most eight items and
 processing, so removing an inbox item cannot escape its byte limit. Initial
 limits use a 1,500-byte frame cap and 32-frame ingress/outbound queues. Configure
 a larger frame cap explicitly for endpoints that require it. These are finite
-defaults, not deployment capacity guarantees; size them using simulation and
-measured host workloads.
+defaults, not deployment capacity guarantees; configure them to fit the
+node's resource budget.
 
 The controller is not in the connection or packet path. First-STUN ufrags are
 untrusted routing hints; the destination shard checks the current route epoch

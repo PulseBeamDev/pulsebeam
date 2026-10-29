@@ -35,6 +35,13 @@ The deterministic simulator provides its own steering implementation so tests
 can exercise the same ownership and flow-pinning behavior without kernel
 dependencies.
 
+## CPU scheduling
+
+`CAP_SYS_NICE` is not required to run the server. Dataplane `SCHED_FIFO`
+promotion is a best-effort optimization; startup continues if it is unavailable.
+The optional ICE-TCP executor lowers its priority to `SCHED_IDLE`, which does not
+require that capability.
+
 ## CI
 
 Complete acceptance requires a Linux host with working IPv4 and IPv6 loopback,
@@ -49,11 +56,8 @@ Root `./bazel test //:check` includes
 contracts and `//crates/pulsebeam:transport_conformance` for concurrent
 dual-family SDK/SFU witnesses over UDP and passive ICE-TCP. Each supplies
 explicit loopback interfaces but retains real native OS sockets. The TCP witness
-also exercises the required low-priority executor startup. These do not certify stock deployed
-interface discovery, global IPv6 or UDP isolation under TCP floods. Deployment
-qualification must measure UDP forwarding CPU, loss and latency percentiles and
-control/API responsiveness against a UDP-only baseline, with actual CPU policy
-and affinity recorded on the target Linux hardware. Connection/family evidence, recipient
+also exercises the low-priority executor startup. These do not certify stock
+deployed interface discovery or global IPv6. Connection/family evidence, recipient
 payloads and cleanup have bounded event-driven operation deadlines of 30, 30
 and 10 seconds; these are infrastructure limits, not application SLAs.
 
