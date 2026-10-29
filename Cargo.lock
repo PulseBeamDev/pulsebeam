@@ -3800,6 +3800,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "pulsebeam-tcp"
+version = "0.3.2"
+dependencies = [
+ "bytes",
+ "tokio",
+]
+
+[[package]]
 name = "pulsebeam-testdata"
 version = "0.3.2"
 dependencies = [

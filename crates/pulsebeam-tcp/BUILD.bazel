@@ -1,0 +1,30 @@
+load("@crates//:defs.bzl", "aliases", "all_crate_deps", "crate_edition")
+load("@rules_rust//cargo:defs.bzl", "cargo_toml_env_vars")
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test", "rust_clippy_test", "rustfmt_test")
+
+package(default_visibility = ["//visibility:public"])
+exports_files(["Cargo.toml"])
+filegroup(name = "workflow_inputs", srcs = ["README.md", "Cargo.toml"])
+filegroup(name = "cargo_metadata_inputs", srcs = ["Cargo.toml"] + glob(["src/**/*.rs"]))
+cargo_toml_env_vars(name = "cargo_env", src = "Cargo.toml", workspace = "//:Cargo.toml")
+
+rust_library(
+    name = "pulsebeam-tcp",
+    crate_root = "src/lib.rs",
+    srcs = glob(["src/**/*.rs"]),
+    edition = crate_edition(),
+    rustc_env_files = [":cargo_env"],
+    lint_config = "//crates/pulsebeam-core:lints",
+    aliases = aliases(),
+    deps = all_crate_deps(normal = True),
+)
+
+rust_test(
+    name = "unit_tests",
+    crate = ":pulsebeam-tcp",
+    lint_config = "//crates/pulsebeam-core:lints",
+    aliases = aliases(normal_dev = True),
+    deps = all_crate_deps(normal_dev = True),
+)
+rustfmt_test(name = "format", targets = [":pulsebeam-tcp"])
+rust_clippy_test(name = "clippy", targets = [":pulsebeam-tcp", ":unit_tests"])

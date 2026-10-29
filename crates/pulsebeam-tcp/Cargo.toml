@@ -1,0 +1,16 @@
+[package]
+name = "pulsebeam-tcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+bytes.workspace = true
+tokio = { version = "1", default-features = false, features = ["io-util"] }
+
+[dev-dependencies]
+tokio = { workspace = true }
+
+[lints]
+workspace = true
