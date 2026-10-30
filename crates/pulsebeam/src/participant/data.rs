@@ -1,7 +1,7 @@
 use crate::media::ChannelId;
 use ahash::{HashMap, HashMapExt};
 
-use crate::track::{DataTopicChannel, DataTrackDirection, TrackMeta, TrackSelector};
+use crate::track::{DataTopicChannel, DataTrackDirection, Topic, TrackMeta, TrackSelector};
 
 #[derive(thiserror::Error, Debug)]
 pub enum DataOpenError {
@@ -16,10 +16,12 @@ pub enum DataOpenError {
 pub(super) struct DataChannelState {
     pub(super) channel: DataTopicChannel,
     pub(super) publication: Option<TrackMeta>,
+    pub(super) seed: Option<u64>,
 }
 
 pub(super) struct DataState {
     channels: HashMap<ChannelId, DataChannelState>,
+    pending_seeds: HashMap<Topic, u64>,
     next_publication: u64,
 }
 
@@ -27,6 +29,7 @@ impl DataState {
     pub(super) fn new() -> Self {
         Self {
             channels: HashMap::new(),
+            pending_seeds: HashMap::new(),
             next_publication: 0,
         }
     }
@@ -49,7 +52,7 @@ impl DataState {
         cid: ChannelId,
         channel: DataTopicChannel,
         publication: Option<TrackMeta>,
-    ) -> Result<(), DataOpenError> {
+    ) -> Result<Option<(TrackSelector, u64)>, DataOpenError> {
         if self.channels.len() >= crate::track::MAX_DATA_TOPIC_CHANNELS {
             return Err(DataOpenError::TooManyDataTopicChannels);
         }
@@ -67,14 +70,82 @@ impl DataState {
             publication.is_some(),
             channel.direction == DataTrackDirection::Publish
         );
+        let seed = if channel.direction == DataTrackDirection::Subscribe
+            && channel.lane == crate::track::DataLane::Ordered
+        {
+            self.pending_seeds.remove(&channel.topic)
+        } else {
+            None
+        };
+        let seeded = seed.map(|token| (Self::selector(&channel), token));
         self.channels.insert(
             cid,
             DataChannelState {
                 channel,
                 publication,
+                seed,
             },
         );
-        Ok(())
+        Ok(seeded)
+    }
+
+    pub(super) fn seed(
+        &mut self,
+        request: &pulsebeam_proto::signaling_v1::SubscriptionSeed,
+    ) -> Result<Option<TrackSelector>, ()> {
+        if request.seed_id == 0
+            || request.mode != pulsebeam_proto::signaling_v1::TopicMode::Ordered as i32
+        {
+            return Err(());
+        }
+        let topic = Topic::parse(&request.topic).map_err(|_| ())?;
+        if self
+            .channels
+            .values()
+            .any(|state| state.seed == Some(request.seed_id) && state.channel.topic != topic)
+            || self
+                .pending_seeds
+                .iter()
+                .any(|(other, token)| *token == request.seed_id && *other != topic)
+        {
+            return Err(());
+        }
+        let state = self.channels.values_mut().find(|state| {
+            state.channel.direction == DataTrackDirection::Subscribe
+                && state.channel.lane == crate::track::DataLane::Ordered
+                && state.channel.topic.as_ref() == request.topic
+        });
+        let Some(state) = state else {
+            if let Some(token) = self.pending_seeds.get(&topic) {
+                return if *token == request.seed_id {
+                    Ok(None)
+                } else {
+                    Err(())
+                };
+            }
+            if self.pending_seeds.len() >= crate::track::MAX_DATA_TOPIC_CHANNELS {
+                return Err(());
+            }
+            // DCEP OPEN and signaling use different SCTP streams. A locally open
+            // subscription can send its seed before its DCEP reaches this endpoint.
+            self.pending_seeds.insert(topic, request.seed_id);
+            return Ok(None);
+        };
+        if let Some(token) = state.seed {
+            return if token == request.seed_id {
+                Ok(None)
+            } else {
+                Err(())
+            };
+        }
+        state.seed = Some(request.seed_id);
+        Ok(Some(Self::selector(&state.channel)))
+    }
+
+    pub(super) fn has_seed(&self, token: u64) -> bool {
+        self.channels
+            .values()
+            .any(|state| state.seed == Some(token))
     }
 
     pub(super) fn close(&mut self, cid: ChannelId) -> Option<DataChannelState> {
@@ -187,9 +258,12 @@ mod tests {
         };
 
         let mut state = DataState::new();
-        state
-            .open(cid, channel.clone(), Some(meta.clone()))
-            .unwrap();
+        assert!(
+            state
+                .open(cid, channel.clone(), Some(meta.clone()))
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(state.channel(cid), Some(&channel));
         use pulsebeam_proto::topic::{
             TopicFrame, TopicFrontier, TopicMessage, TopicNack, topic_frame::Body,
@@ -233,9 +307,104 @@ mod tests {
         replacement.id = state
             .allocate_publication(connection_id, meta.label.as_deref().unwrap())
             .unwrap();
-        state.open(cid, channel, Some(replacement.clone())).unwrap();
+        assert!(
+            state
+                .open(cid, channel, Some(replacement.clone()))
+                .unwrap()
+                .is_none()
+        );
         assert!(!state.accepts_publisher_frame(cid, &message(meta.id)));
         assert!(state.accepts_publisher_frame(cid, &message(replacement.id)));
+    }
+
+    #[test]
+    fn seed_waits_for_dcep_and_tokens_are_scoped_to_live_ordered_subscriptions() {
+        use pulsebeam_proto::signaling_v1::{SubscriptionSeed, TopicMode};
+        let mut state = DataState::new();
+        let cid = ChannelId::from_value(1);
+        let channel = DataTopicChannel {
+            direction: DataTrackDirection::Subscribe,
+            topic: Topic::for_test("events"),
+            lane: DataLane::Ordered,
+        };
+        let mut request = SubscriptionSeed {
+            seed_id: 7,
+            topic: "events".into(),
+            mode: TopicMode::Ordered as i32,
+        };
+        assert!(state.seed(&request).unwrap().is_none());
+        assert!(state.seed(&request).unwrap().is_none());
+        assert!(!state.has_seed(7));
+        let (selector, token) = state.open(cid, channel.clone(), None).unwrap().unwrap();
+        assert_eq!(selector, DataState::selector(&channel));
+        assert_eq!(token, 7);
+        assert!(state.has_seed(7));
+        assert!(
+            state.seed(&request).unwrap().is_none(),
+            "duplicate seed is idempotent"
+        );
+        request.seed_id = 8;
+        assert!(state.seed(&request).is_err());
+        assert!(state.has_seed(7));
+        state.close(cid);
+        assert!(!state.has_seed(7));
+        assert!(state.open(cid, channel, None).unwrap().is_none());
+        assert!(state.seed(&request).unwrap().is_some());
+        request.seed_id = 0;
+        assert!(state.seed(&request).is_err());
+    }
+
+    #[test]
+    fn pending_seeds_validate_identity_and_bound_unopened_subscriptions() {
+        use pulsebeam_proto::signaling_v1::{SubscriptionSeed, TopicMode};
+        let mut state = DataState::new();
+        let request = |seed_id, topic: String| SubscriptionSeed {
+            seed_id,
+            topic,
+            mode: TopicMode::Ordered as i32,
+        };
+        for topic in ["".to_string(), "bad/topic".to_string(), "x".repeat(86)] {
+            assert!(state.seed(&request(1, topic)).is_err());
+        }
+        assert!(state.seed(&request(0, "events".into())).is_err());
+        let mut wrong_mode = request(1, "events".into());
+        wrong_mode.mode = TopicMode::Latest as i32;
+        assert!(state.seed(&wrong_mode).is_err());
+        for index in 0..crate::track::MAX_DATA_TOPIC_CHANNELS {
+            let token = u64::try_from(index).unwrap().saturating_add(1);
+            assert!(
+                state
+                    .seed(&request(token, format!("events-{index}")))
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        assert!(
+            state
+                .seed(&request(1, "events-0".into()))
+                .unwrap()
+                .is_none()
+        );
+        assert!(state.seed(&request(1, "different".into())).is_err());
+        assert!(state.seed(&request(u64::MAX, "events-0".into())).is_err());
+        assert!(state.seed(&request(u64::MAX, "extra".into())).is_err());
+        let channel = DataTopicChannel {
+            direction: DataTrackDirection::Subscribe,
+            topic: Topic::for_test("events-0"),
+            lane: DataLane::Ordered,
+        };
+        let (_, token) = state
+            .open(ChannelId::from_value(1), channel, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(token, 1);
+        assert!(state.seed(&request(1, "different".into())).is_err());
+        assert!(
+            state
+                .seed(&request(u64::MAX, "extra".into()))
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -247,7 +416,7 @@ mod tests {
             lane: DataLane::Ordered,
         };
         let mut state = DataState::new();
-        state.open(cid, channel.clone(), None).unwrap();
+        assert!(state.open(cid, channel.clone(), None).unwrap().is_none());
         let closed = state.close(cid).unwrap();
         assert_eq!(closed.channel, channel);
         assert!(closed.publication.is_none());

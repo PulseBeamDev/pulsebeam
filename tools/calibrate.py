@@ -196,7 +196,8 @@ def main():
             args = argparse.Namespace(binary=binary, candidate=options.candidate, artifacts_dir=options.artifacts_dir,
                                       replay_bundle=options.replay_bundle, mode="all", filter="tests::calibration::" + CASES[claim],
                                       exact=True, skip=[], run_skipped=False, seeds=1, from_seed=options.seed, jobs=1,
-                                      discovery_timeout=30, case_timeout=options.case_timeout, show_output=False)
+                                      discovery_timeout=30, case_timeout=options.case_timeout, show_output=False,
+                                      history_search="off")
             bundle = CalibrationBundle(args, identity)
             bundle.prepare(args)
             if args.filter != "tests::calibration::" + CASES[claim] or not args.exact or args.seeds != 1 or args.jobs != 1:

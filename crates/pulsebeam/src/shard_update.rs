@@ -35,7 +35,12 @@ impl TrackPlan {
             values.iter().copied().all(|value| seen.insert(value))
         }
 
-        distinct(&self.local) && distinct(&self.remote)
+        let mut remote_shards = HashSet::with_capacity(self.remote.len());
+        distinct(&self.local)
+            && self
+                .remote
+                .iter()
+                .all(|address| remote_shards.insert(address.shard()))
     }
 }
 
@@ -151,8 +156,6 @@ impl ShardUpdate {
 }
 
 pub(crate) struct ShardUpdateWriter {
-    #[cfg(feature = "sim")]
-    observed_generation: u64,
     shard: ShardId,
     tx: mailbox::Sender<Box<ShardUpdate>>,
     staged: Option<Box<ShardUpdate>>,
@@ -161,13 +164,6 @@ pub(crate) struct ShardUpdateWriter {
 }
 
 impl ShardUpdateWriter {
-    #[cfg(feature = "sim")]
-    pub(crate) fn observed_generation(&self) -> u64 {
-        self.staged
-            .as_ref()
-            .map_or(self.observed_generation, |update| update.generation)
-    }
-
     pub fn stage(&mut self, generation: u64, op: ShardUpdateOp) {
         let commit = self
             .staged
@@ -212,10 +208,6 @@ impl ShardUpdateWriter {
             return None;
         }
         let generation = commit.generation;
-        #[cfg(feature = "sim")]
-        {
-            self.observed_generation = generation;
-        }
         if self.closed || !self.flush_backlog() {
             self.backlog.push_back(commit);
             return None;
@@ -300,8 +292,6 @@ pub(crate) fn new_shard_update(
     );
     (
         ShardUpdateWriter {
-            #[cfg(feature = "sim")]
-            observed_generation: 0,
             shard,
             tx,
             staged: None,
@@ -340,6 +330,20 @@ mod tests {
             plan: Some(TrackPlan::default()),
         }];
         (track_id, plans)
+    }
+
+    #[test]
+    fn one_track_has_at_most_one_remote_route_per_destination_shard() {
+        let route = |shard, slot| {
+            NodeRouteAddress::new(crate::route::RouteId::new(ShardId::new(shard), slot), 1)
+        };
+        let mut plan = TrackPlan {
+            remote: vec![route(1, 0), route(1, 1)],
+            ..Default::default()
+        };
+        assert!(!plan.is_valid());
+        plan.remote[1] = route(2, 0);
+        assert!(plan.is_valid());
     }
 
     #[test]

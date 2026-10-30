@@ -42,7 +42,8 @@ package pulsebeam.media.v1;
 //     cause an explicit Reconnect, subject to the video request-count invariant
 //     documented on VideoIntent.
 //   - Intent is reconciled to feasible, authorized media state. Only permission
-//     failures cause non-fatal Intent rejection. Exceeding the VideoIntent
+//     failures and unsupported negotiated receive policies cause non-fatal Intent
+//     rejection. Exceeding the VideoIntent
 //     receiver-count limit or changing an established SendIntent label binding
 //     is a fatal PROTOCOL_ERROR. Other intent-level faults are reconciled and
 //     answered with complete Mapping state.
@@ -773,6 +774,9 @@ message VideoIntent {
 // `playout_delay` uses tag 15 for the same numbering convention as
 // VideoOptions.
 message AudioOptions {
+  // A fixed policy requires negotiated audio playout-delay support on all audio
+  // receivers. Otherwise the entire candidate Intent is non-fatally rejected as
+  // UNSUPPORTED_INTENT. Stock native libwebrtc does not negotiate this capability.
   optional PlayoutDelay playout_delay = 15;
 }
 
@@ -887,7 +891,8 @@ message ReceiveIntent {
 // Mapping MUST only reference currently visible tracks and MUST obey Catalog
 // causal ordering. The reply is complete Mapping state, not correction reasons.
 //
-// Only permission failures cause non-fatal Intent rejection. Exceeding the
+// Permission failures and unsupported negotiated receive policies cause non-fatal
+// Intent rejection. Exceeding the
 // VideoIntent receiver-count limit or violating established SendIntent label
 // bindings is a fatal PROTOCOL_ERROR, as specified on those messages. Other
 // structural and option faults in a decoded Intent are
@@ -1046,6 +1051,10 @@ enum ErrorCode {
 
   PROTOCOL_ERROR = 7;
   INTERNAL = 8;
+
+  // Candidate receive policy requires a capability absent from negotiation.
+  // Nonfatal; accepted Intent and Mapping remain unchanged.
+  UNSUPPORTED_INTENT = 9;
 }
 
 
@@ -1057,8 +1066,9 @@ enum ErrorCode {
 //
 // `intent_revision` MUST be present when an Error rejects a specific candidate
 // Intent and MUST be absent when the error is unrelated to one candidate Intent.
-// Only AUTHORIZATION_REJECTED may non-fatally reject a candidate Intent. Such
-// a permission rejection never modifies accepted Intent or Mapping. Exceeding
+// AUTHORIZATION_REJECTED and UNSUPPORTED_INTENT may non-fatally reject a candidate
+// Intent. Neither rejection modifies accepted Intent or Mapping. UNSUPPORTED_INTENT
+// requires fatal=false and the rejected intent_revision. Exceeding
 // the VideoIntent receiver-count limit or changing an established SendIntent
 // label binding requires fatal PROTOCOL_ERROR without applying the candidate. Other intent-level faults are reconciled and answered
 // with complete Mapping state, not relabeled as protocol or internal failures.
@@ -1127,6 +1137,25 @@ message Error {
 // their respective HTTP/SDP protocols.
 message Reconnect {}
 
+// Starts the initial ordered-publication seed for an already-open subscriber.
+// seed_id is a nonzero client-generated token scoped to this subscription and
+// native connection. It is not an application cursor or publication identity.
+message SubscriptionSeed {
+  uint64 seed_id = 1;
+  string topic = 2;
+  TopicMode mode = 3;
+}
+
+// Sent only after the initial matching publications have been projected through
+// the ordered shard update lane and the covering nonzero Catalog has been sent.
+// DCEP open, Mapping and a point-in-time Catalog do not complete a seed.
+// Matching duplicates are idempotent. Unknown tokens and zero/future covering
+// revisions are protocol errors. Replacement connections retire all seed tokens.
+message SubscriptionSeedComplete {
+  uint64 seed_id = 1;
+  uint64 catalog_revision = 2;
+}
+
 
 // One native client-to-server signaling message.
 //
@@ -1137,6 +1166,7 @@ message ClientMessage {
   oneof payload {
     Intent intent = 1;
     RenewAuthorization renew_authorization = 2;
+    SubscriptionSeed subscription_seed = 3;
   }
 }
 
@@ -1153,5 +1183,6 @@ message ServerMessage {
     Authorization authorization = 3;
     Error error = 4;
     Reconnect reconnect = 5;
+    SubscriptionSeedComplete subscription_seed_complete = 6;
   }
 }

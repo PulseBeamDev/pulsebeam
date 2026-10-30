@@ -279,7 +279,6 @@ impl UpstreamTrackLayer {
     }
 
     fn process_normalized(&mut self, pkt: &RtpPacket, facts: StreamFacts) {
-        self.monitor.process_packet(pkt);
         if let Some(count) = facts.decode_targets {
             self.monitor.set_decode_target_count(count);
         }
@@ -289,6 +288,7 @@ impl UpstreamTrackLayer {
         if let Some(temporal_only) = facts.temporal_only {
             self.monitor.set_temporal_only(temporal_only);
         }
+        self.monitor.process_packet(pkt);
     }
 
     #[cfg(test)]
@@ -1073,8 +1073,22 @@ mod data_track {
     pub struct Topic(String);
 
     impl Topic {
-        /// Production builds a `Topic` only by parsing a channel label; tests
-        /// need one without going through the label grammar.
+        pub(crate) fn parse(value: &str) -> Result<Self, DataTrackIntentError> {
+            if value.is_empty() {
+                return Err(DataTrackIntentError::MissingLabel);
+            }
+            if value.len() > 85 {
+                return Err(DataTrackIntentError::LabelTooLong);
+            }
+            if !value
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+            {
+                return Err(DataTrackIntentError::IllegalCharacters);
+            }
+            Ok(Self(value.to_string()))
+        }
+
         #[cfg(test)]
         pub fn for_test(topic: &str) -> Self {
             Self(topic.to_string())
@@ -1245,20 +1259,7 @@ mod data_track {
                     };
 
                     let topic_slice = parts.next().ok_or(DataTrackIntentError::MissingLabel)?;
-                    if topic_slice.is_empty() {
-                        return Err(DataTrackIntentError::MissingLabel);
-                    }
-                    if topic_slice.len() > 85 {
-                        return Err(DataTrackIntentError::LabelTooLong);
-                    }
-
-                    let is_valid = topic_slice
-                        .bytes()
-                        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
-
-                    if !is_valid {
-                        return Err(DataTrackIntentError::IllegalCharacters);
-                    }
+                    let topic = Topic::parse(topic_slice)?;
 
                     if parts.next().is_some() {
                         return Err(DataTrackIntentError::ScopeNotAllowed);
@@ -1266,7 +1267,7 @@ mod data_track {
 
                     let topic = DataTopicChannel {
                         direction,
-                        topic: Topic(topic_slice.to_string()),
+                        topic,
                         lane,
                     };
                     Ok(Self::UserTopic(topic))

@@ -681,17 +681,15 @@ impl Scenario {
                 targets: TARGETS,
             },
             Step::WaitForVideo {
-                description: "First viewer decodes its allocated origin",
+                description: "First viewer decodes its selected origin",
                 participant: "viewer",
                 publishers: &["publisher"],
-                min_quality: 1,
                 timeout: self.path.settle() + Duration::from_secs(20),
             },
             Step::WaitForVideo {
-                description: "Second viewer independently decodes its allocated origin",
+                description: "Second viewer independently decodes its selected origin",
                 participant: "viewer2",
                 publishers: &["publisher"],
-                min_quality: 1,
                 timeout: self.path.settle() + Duration::from_secs(20),
             },
         ];

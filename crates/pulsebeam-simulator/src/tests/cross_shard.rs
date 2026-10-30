@@ -8,7 +8,7 @@ use super::common::{LocalNodeSim, Participant, Room, Step};
 use std::time::Duration;
 
 #[test]
-fn video_candidates_do_not_cross_shards_until_allocated_test() {
+fn unselected_video_candidates_do_not_reach_the_receiver_test() {
     LocalNodeSim::new()
         .with_room(
             Room::new("room-candidates")
@@ -20,8 +20,10 @@ fn video_candidates_do_not_cross_shards_until_allocated_test() {
                 description: "Discover the remote video candidate without selecting it",
                 duration: Duration::from_secs(5),
             },
-            Step::CheckNoCrossShardMedia {
-                description: "candidate discovery does not compile forwarding",
+            Step::CheckVideoNotReceivedFrom {
+                description: "An unselected source delivers no video to the receiver",
+                participant: "subscriber",
+                publisher: "publisher",
             },
             Step::SubscribeTo {
                 description: "Select the discovered candidate",
@@ -32,12 +34,15 @@ fn video_candidates_do_not_cross_shards_until_allocated_test() {
                 description: "Activate and forward the selected track",
                 duration: Duration::from_secs(20),
             },
-            Step::CheckCrossShardMedia {
-                description: "allocated video crosses the shard boundary",
-                min_frames: 100,
+            Step::CheckVideoDecodedFromInterval {
+                description: "The selected 180p fixture independently decodes across owner shards",
+                participant: "subscriber",
+                publisher: "publisher",
+                min_frames: 1,
+                min_resolution: (1, 180),
             },
             Step::CheckRxBytes {
-                description: "the active binding delivers media",
+                description: "The active receiver also clears the existing traffic floor",
                 participant: "subscriber",
                 min_bytes: 1_000,
             },

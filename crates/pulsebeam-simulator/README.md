@@ -77,6 +77,22 @@ A new public observation needs a concrete production consumer and action,
 inadequate existing alternatives, a minimal stable semantic surface and
 justified compatibility, portability, privacy and maintenance costs.
 
+## Cross-lane histories and source service
+
+Concrete histories compose media/data ownership and bounded application input
+with outstanding fault/recovery work. They check progress before repair as well
+as final convergence through public delivery and decode.
+See [semantic histories](docs/simulation.md#replay-semantic-intent-histories)
+for supported policies, replay, budgets and opt-in equal-budget discovery.
+
+Strict source service uses independent application source-event ledgers joined
+to actual encoded and native decoded output. Its complete-window deadline is
+derived from declared cadence, explicit normalized fixed playout and the clean
+link allowance. Sparse uniform content and intentional silence are legitimate;
+adaptive playout does not acquire a fabricated fixed age bound. The native ICE
+report correlation used to identify active fixture admissions is qualified
+against the pinned backend, not a new portable SDK statistics schema.
+
 ## Build profile
 
 Simulator runners apply the workspace's Cargo `sim` optimization and safety
@@ -103,6 +119,8 @@ focused controlled proof does not replace shared browser or production evidence.
 - `./bazel run //:replay -- --replay-bundle /absolute/path/to/run-or-case`
   replays retained selection, settings and captured inputs on the recorded source
   candidate. Move the whole run directory when transporting a case bundle.
+- `./bazel run //:replay -- --seed <seed> --exact --filter tests::histories::required_intent_histories --history-search compare --show-output`
+  runs opt-in guided/unguided discovery at equal per-arm budgets, not a merge gate.
 - `./bazel run //:scoreboard` explicitly regenerates the diffable BWE scoreboard.
 
 See [failure retention and replay](docs/simulation.md#retain-and-replay-generated-failures)

@@ -218,6 +218,14 @@ impl NativeHost {
             .map_err(|error| anyhow::anyhow!(error.to_string()))
     }
 
+    pub fn solid_fixture(
+        &self,
+    ) -> anyhow::Result<Vec<pulsebeam_rtc_simulation::NativeH264AccessUnit>> {
+        let services = self.0.io.services.borrow();
+        pulsebeam_rtc_simulation::stock_h264_solid_fixture(&services.bridge.world)
+            .map_err(|error| anyhow::anyhow!(error.to_string()))
+    }
+
     pub fn runtime(&self) -> Result<(ManagedRuntime, Rc<RuntimeLease>), Error> {
         let existing = self.0.io.active.borrow().upgrade();
         let owner = existing.unwrap_or_else(|| {

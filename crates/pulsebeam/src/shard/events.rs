@@ -215,6 +215,20 @@ impl<'a> ParticipantSink for PipelineSinkRef<'a> {
     }
 
     #[inline]
+    fn seed_subscription(&mut self, selector: TrackSelector, seed_id: u64) {
+        self.pipeline
+            .participant_events
+            .push_back(ParticipantEvent::Control(
+                ShardEvent::SubscriptionSeedRequested {
+                    room_id: self.room_id,
+                    subscriber: self.id,
+                    connection_id: self.connection_id,
+                    selector,
+                    seed_id,
+                },
+            ));
+    }
+
     fn unsubscribe_tracks(&mut self, selector: TrackSelector) {
         self.pipeline
             .participant_events

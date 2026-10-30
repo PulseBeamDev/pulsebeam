@@ -17,6 +17,7 @@ pub(crate) trait ParticipantSink {
     fn publish_track(&mut self, track: Track);
     fn unpublish_track(&mut self, meta: TrackMeta);
     fn subscribe_tracks(&mut self, selector: TrackSelector, selection: SelectionPolicy);
+    fn seed_subscription(&mut self, selector: TrackSelector, seed_id: u64);
     fn unsubscribe_tracks(&mut self, selector: TrackSelector);
     fn request_reverse(&mut self, stream: TrackHandle, packet: ReversePacket);
     fn renew_authorization(&mut self, token: String);
@@ -82,6 +83,7 @@ pub mod test_utils {
         }
 
         fn subscribe_tracks(&mut self, _selector: TrackSelector, _selection: SelectionPolicy) {}
+        fn seed_subscription(&mut self, _selector: TrackSelector, _seed_id: u64) {}
 
         fn unsubscribe_tracks(&mut self, _selector: TrackSelector) {}
 

@@ -7,73 +7,30 @@
     clippy::string_slice,
     clippy::indexing_slicing
 )] // test / simulation support
-//! Test-only observation points for the simulator.
+//! Internal diagnostics and fault controls for deterministic simulation.
 //!
-//! The simulator runs the SFU in-process under turmoil, so a task-local sink is enough to get
-//! internal state out to an assertion without threading a handle through every layer.
+//! Adaptation and forwarding samples are diagnostic, not correctness oracles. Application-facing
+//! tests use public SDK observations and native decoded output. Fault-consumption evidence
+//! qualifies injected input, independently of SUT correctness.
 //!
-//! The sink is thread-local rather than process-global because `cargo test` runs test functions
-//! in parallel while turmoil drives each simulation on its own thread. A process-global would let
-//! plans observe each other's participants - a plan making 303 allocation passes would see 665,
-//! with another plan's estimates folded into its minimum - which is both wrong and flaky.
-//!
-//! This exists because the interesting congestion-control failures are not visible in received
-//! byte counts. A bandwidth estimate can be poisoned - pulled far below what the link carries -
-//! while throughput still looks acceptable, because the allocator simply picks a lower simulcast
-//! layer and the viewer keeps receiving *something*. Asserting on bytes alone lets that regress
-//! silently; asserting on the estimate catches it directly.
-//!
+//! Thread-local storage isolates parallel simulations driven on separate threads.
 //! Compiled only under the `sim` feature.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::time::Duration;
-use tokio::time::Instant;
+use tokio::{sync::oneshot, time::Instant};
 
-use crate::entity::{AudioOrigin, ParticipantId};
+use crate::entity::ParticipantId;
 
 /// Downstream bandwidth estimate observations, since the last [`reset`].
 #[derive(Debug, Default, Clone)]
 struct Samples {
-    min_bwe_bps: Option<u64>,
-    max_bwe_bps: Option<u64>,
-    last_bwe_bps: Option<u64>,
-    /// Number of allocation passes observed. Distinguishes "estimate stayed high" from
-    /// "nothing was ever recorded", which would otherwise both satisfy a minimum.
-    count: u64,
-    /// Allocation passes and passes whose selected media rate exceeded the estimate.
-    /// Below-minimum native producer service can legitimately exceed the estimate.
-    allocation_budget: HashMap<ParticipantId, (u64, u64)>,
-    /// Media payload bytes the SFU handed to str0m for forwarding, keyed by the *subscriber*
-    /// receiving them.
-    ///
-    /// Per subscriber because the only use is comparing it against what one participant received.
-    /// A single total is not merely imprecise with several subscribers, it is meaningless: a
-    /// two-viewer plan measured 1024% "efficiency", being everyone's forwarded bytes over one
-    /// viewer's received bytes.
+    /// SFU media payload bytes per subscriber, excluding transport-generated overhead.
     forwarded_media_bytes: HashMap<ParticipantId, u64>,
-    /// Successful audio enqueues, not wire delivery or buffered PCM provenance.
-    /// Reset with the measured window and scoped to the actual subscriber.
-    queued_audio_packets: HashMap<(ParticipantId, AudioOrigin), AudioEnqueues>,
-    /// Last-seen forwarded quality per track origin (the publisher's participant id, as a
-    /// string), across every subscriber and slot forwarding from that origin. 0 = paused, else
-    /// [`pulsebeam_core::simulcast::LayerQuality`] as its numeric rank (Low=1 .. High=3).
-    ///
-    /// Keyed by origin rather than by (subscriber, slot) because the failure this exists to
-    /// catch - a stream regressing even as bandwidth grows - is about the *publisher's* track,
-    /// and a test only needs "what is this origin's viewer(s) currently getting" to check it.
+    /// Last forwarding rank per publisher, aggregated across subscribers for diagnostics.
+    /// Zero is paused; other ranks use [`pulsebeam_core::simulcast::LayerQuality`].
     forwarded_quality: HashMap<ParticipantId, u8>,
-    /// Highest forwarded quality observed for each track origin since the last reset.
-    max_forwarded_quality: HashMap<ParticipantId, u8>,
-    /// Media frames that actually crossed a shard boundary, counted where they
-    /// are resolved.
-    ///
-    /// A cross-shard test cannot assert this from received bytes: a room whose
-    /// participants happen to be co-located delivers exactly the same video
-    /// while reaching none of the route, envelope or restamping code the test
-    /// exists for. Placement is a hash, so that co-location is luck, and
-    /// without this the test passes either way.
-    cross_shard_media_frames: u64,
     /// How many times each origin's forwarded layer changed since the last reset.
     ///
     /// Switching layer is not free: the receiver needs a keyframe and the picture stutters. A
@@ -113,10 +70,15 @@ struct Samples {
     series_origin: Option<Instant>,
 }
 
+// Fault requests cross hosts; their deadline uses the process-wide shimmed clock.
+struct ControllerStall {
+    until: std::time::Instant,
+    begun: oneshot::Sender<()>,
+}
+
 thread_local! {
     static SAMPLES: RefCell<Samples> = RefCell::new(Samples::default());
-    static CONTROLLER_STALLS_CONSUMED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-    static CONTROLLER_STALL_UNTIL: RefCell<Option<Instant>> = const { RefCell::new(None) };
+    static CONTROLLER_STALL: RefCell<Option<ControllerStall>> = const { RefCell::new(None) };
     static FAIL_NEXT_MATERIALIZATION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
@@ -128,49 +90,28 @@ pub fn take_materialization_failure() -> bool {
     FAIL_NEXT_MATERIALIZATION.with(std::cell::Cell::take)
 }
 
-pub fn request_controller_stall(duration: Duration) {
-    let until = Instant::now()
+pub fn request_controller_stall(duration: Duration) -> (std::time::Instant, oneshot::Receiver<()>) {
+    let until = std::time::Instant::now()
         .checked_add(duration)
-        .unwrap_or_else(Instant::now);
-    CONTROLLER_STALL_UNTIL.with_borrow_mut(|deadline| *deadline = Some(until));
+        .unwrap_or_else(std::time::Instant::now);
+    let (begun, receipt) = oneshot::channel();
+    CONTROLLER_STALL.with_borrow_mut(|pending| {
+        assert!(pending.replace(ControllerStall { until, begun }).is_none());
+    });
+    (until, receipt)
 }
 
 pub async fn wait_controller_stall() {
-    let deadline = CONTROLLER_STALL_UNTIL.with_borrow_mut(Option::take);
-    if let Some(deadline) = deadline {
-        CONTROLLER_STALLS_CONSUMED.with(|count| count.set(count.get().saturating_add(1)));
-        tokio::time::sleep_until(deadline).await;
+    let request = CONTROLLER_STALL.with_borrow_mut(Option::take);
+    if let Some(ControllerStall { until, begun }) = request {
+        let _ = begun.send(());
+        tokio::time::sleep(until.saturating_duration_since(std::time::Instant::now())).await;
     }
-}
-
-pub fn controller_stalls_consumed() -> u64 {
-    CONTROLLER_STALLS_CONSUMED.with(std::cell::Cell::get)
 }
 
 /// Record one downstream allocation pass. Called from the allocator's reporting path.
 ///
 /// `subscriber` is the participant whose downstream link this estimate describes.
-pub fn record_downstream_bwe(subscriber: &str, bwe_bps: u64, desired_bps: u64) {
-    let Ok(subscriber) = subscriber.parse() else {
-        return;
-    };
-    record_downstream_bwe_for(subscriber, bwe_bps, desired_bps);
-}
-
-pub fn record_allocation_budget_for(subscriber: ParticipantId, allocated_bps: u64, bwe_bps: u64) {
-    SAMPLES.with_borrow_mut(|s| {
-        let counts = s.allocation_budget.entry(subscriber).or_default();
-        counts.0 = counts.0.saturating_add(1);
-        counts.1 = counts.1.saturating_add(u64::from(allocated_bps > bwe_bps));
-    });
-}
-
-/// Window-scoped `(passes, above_estimate_passes)`, or `None` without observations.
-pub fn allocation_budget(subscriber: &str) -> Option<(u64, u64)> {
-    let subscriber = subscriber.parse().ok()?;
-    SAMPLES.with_borrow(|s| s.allocation_budget.get(&subscriber).copied())
-}
-
 pub fn record_downstream_bwe_for(subscriber: ParticipantId, bwe_bps: u64, desired_bps: u64) {
     let now = Instant::now();
     SAMPLES.with_borrow_mut(|s| {
@@ -180,28 +121,10 @@ pub fn record_downstream_bwe_for(subscriber: ParticipantId, bwe_bps: u64, desire
             bwe_bps,
             desired_bps,
         ));
-        s.min_bwe_bps = Some(match s.min_bwe_bps {
-            Some(m) => m.min(bwe_bps),
-            None => bwe_bps,
-        });
-        s.max_bwe_bps = Some(match s.max_bwe_bps {
-            Some(m) => m.max(bwe_bps),
-            None => bwe_bps,
-        });
-        s.last_bwe_bps = Some(bwe_bps);
-        s.count += 1;
     });
 }
 
-/// One media frame arrived from another shard and resolved to a live route.
-pub fn record_cross_shard_media() {
-    SAMPLES.with_borrow_mut(|s| s.cross_shard_media_frames += 1);
-}
-
-pub fn cross_shard_media_frames() -> u64 {
-    SAMPLES.with_borrow(|s| s.cross_shard_media_frames)
-}
-
+/// Record a named diagnostic or fault-consumption event.
 pub fn record_routing_counter(name: &'static str) {
     SAMPLES.with_borrow_mut(|s| {
         *s.routing_counters.entry(name.to_owned()).or_default() += 1;
@@ -225,35 +148,12 @@ pub fn routing_counter(name: &'static str) -> u64 {
     SAMPLES.with_borrow(|s| s.routing_counters.get(name).copied().unwrap_or(0))
 }
 
-pub fn routing_work(name: &'static str) -> u64 {
-    routing_counter(name)
-}
-
-pub fn routing_drop(lane: &'static str, stage: &'static str, origin: &'static str) -> u64 {
-    let key = format!("routing_drop:{lane}:{stage}:{origin}");
-    SAMPLES.with_borrow(|s| s.routing_counters.get(&key).copied().unwrap_or(0))
-}
-
-/// Clear observations. The harness calls this at the start of each timed step so assertions
-/// describe the window just run, matching the byte-counter semantics.
+/// Start a new diagnostic measurement window.
 pub fn reset() {
     SAMPLES.with_borrow_mut(|s| *s = Samples::default());
 }
 
-/// Record media payload handed to str0m for forwarding.
-///
-/// Everything else that reaches the subscriber - RTX, padding, probe bursts, RTCP - is generated
-/// below this point, so comparing this against what the subscriber actually received measures how
-/// much of the link carried video rather than overhead. That is the quantity Chrome reports as
-/// `retransmittedBytesReceived` against `bytesReceived`, and a capture showing 54% of payload
-/// being retransmission with zero packet loss is the failure this exists to catch.
-pub fn record_forwarded_media(subscriber: &str, bytes: u64) {
-    let Ok(subscriber) = subscriber.parse() else {
-        return;
-    };
-    record_forwarded_media_for(subscriber, bytes);
-}
-
+/// Record diagnostic media payload bytes handed to str0m for forwarding.
 pub fn record_forwarded_media_for(subscriber: ParticipantId, bytes: u64) {
     SAMPLES.with_borrow_mut(|s| {
         *s.forwarded_media_bytes.entry(subscriber).or_default() += bytes;
@@ -277,59 +177,9 @@ pub fn forwarded_media_bytes_for(subscriber: ParticipantId) -> u64 {
     })
 }
 
-/// Actual queueing extent in one measured window, not decoded PCM provenance.
-#[derive(Clone, Copy, Debug)]
-pub struct AudioEnqueues {
-    pub packets: u64,
-    first_at: Instant,
-    last_at: Instant,
-}
-impl AudioEnqueues {
-    pub fn span(&self) -> Duration {
-        self.last_at.saturating_duration_since(self.first_at)
-    }
-}
-
-/// Record a successful audio enqueue after slot selection and timeline rewrite.
-pub fn record_queued_audio(subscriber: ParticipantId, origin: AudioOrigin) {
-    SAMPLES.with_borrow_mut(|samples| {
-        let now = Instant::now();
-        let observation = samples
-            .queued_audio_packets
-            .entry((subscriber, origin))
-            .or_insert(AudioEnqueues {
-                packets: 0,
-                first_at: now,
-                last_at: now,
-            });
-        observation.packets += 1;
-        observation.last_at = now;
-    });
-}
-
-/// Audio enqueues since [`reset`], never an attribution of native PCM samples.
-pub fn queued_audio_for(subscriber: ParticipantId) -> HashMap<AudioOrigin, AudioEnqueues> {
-    SAMPLES.with_borrow(|samples| {
-        samples
-            .queued_audio_packets
-            .iter()
-            .filter_map(|((receiver, origin), count)| {
-                (*receiver == subscriber).then_some((*origin, *count))
-            })
-            .collect()
-    })
-}
-
 /// Record the layer currently forwarded to a subscriber from `origin`'s track. `None` means the
 /// slot is paused. Called from every allocation pass, not only ones that change anything, so the
 /// last value always reflects the current steady state.
-pub fn record_forwarded_quality(origin: &str, quality: Option<u8>) {
-    let Ok(origin) = origin.parse() else {
-        return;
-    };
-    record_forwarded_quality_for(origin, quality);
-}
-
 pub fn record_forwarded_quality_for(origin: ParticipantId, quality: Option<u8>) {
     let rank = quality.unwrap_or(0);
     SAMPLES.with_borrow_mut(|s| {
@@ -348,10 +198,6 @@ pub fn record_forwarded_quality_for(origin: ParticipantId, quality: Option<u8>) 
             }
         }
         s.forwarded_quality.insert(origin, rank);
-        s.max_forwarded_quality
-            .entry(origin)
-            .and_modify(|max| *max = (*max).max(rank))
-            .or_insert(rank);
     });
 }
 
@@ -393,30 +239,8 @@ pub fn quality_reversals_for(origin: ParticipantId) -> u64 {
     SAMPLES.with_borrow(|s| s.quality_reversals.get(&origin).copied().unwrap_or(0))
 }
 
-/// Highest forwarded quality rank observed for `origin` since [`reset`]. `None` means no
-/// allocation pass recorded that origin during the window; `Some(0)` means it was only paused.
-pub fn max_forwarded_quality(origin: &str) -> Option<u8> {
-    let origin = origin.parse().ok()?;
-    max_forwarded_quality_for(origin)
-}
-
-pub fn max_forwarded_quality_for(origin: ParticipantId) -> Option<u8> {
-    SAMPLES.with_borrow(|s| s.max_forwarded_quality.get(&origin).copied())
-}
-
-/// Downstream estimate summary since [`reset`]: `(min, max, last, sample_count)`.
-///
-/// Returns `None` when nothing was recorded, so a test can tell an untested path from a healthy
-/// one rather than vacuously passing. The spread matters as much as the minimum: an estimate
-/// pinned at one value across hundreds of passes is a different failure from one that dips.
-pub fn downstream_bwe_summary() -> Option<(u64, u64, u64, u64)> {
-    SAMPLES.with_borrow(|s| Some((s.min_bwe_bps?, s.max_bwe_bps?, s.last_bwe_bps?, s.count)))
-}
-
-/// Full estimate trace for one subscriber since [`reset`], as `(elapsed, estimate, desired)`.
-///
-/// Empty when that subscriber ran no allocation passes in the window, which a caller should
-/// treat as "untested" rather than "passed".
+/// Diagnostic estimate trace since [`reset`], as `(elapsed, estimate, desired)`.
+/// Empty when no allocation pass recorded this subscriber in the window.
 pub fn bwe_series(subscriber: &str) -> Vec<(Duration, u64, u64)> {
     let Ok(subscriber) = subscriber.parse() else {
         return Vec::new();
@@ -426,32 +250,4 @@ pub fn bwe_series(subscriber: &str) -> Vec<(Duration, u64, u64)> {
 
 pub fn bwe_series_for(subscriber: ParticipantId) -> Vec<(Duration, u64, u64)> {
     SAMPLES.with_borrow(|s| s.bwe_series.get(&subscriber).cloned().unwrap_or_default())
-}
-
-/// Subscribers that recorded at least one estimate since [`reset`].
-pub fn bwe_subscribers() -> Vec<String> {
-    SAMPLES.with_borrow(|s| s.bwe_series.keys().map(ToString::to_string).collect())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn allocation_budget_counts_only_windowed_subscriber_samples() {
-        reset();
-        let a = ParticipantId::new();
-        let b = ParticipantId::new();
-        assert_eq!(allocation_budget(&a.to_string()), None);
-        record_allocation_budget_for(a, 100, 100);
-        record_allocation_budget_for(a, 99, 100);
-        record_allocation_budget_for(b, 101, 100);
-        assert_eq!(allocation_budget(&a.to_string()), Some((2, 0)));
-        assert_eq!(allocation_budget(&b.to_string()), Some((1, 1)));
-        record_allocation_budget_for(a, 101, 100);
-        assert_eq!(allocation_budget(&a.to_string()), Some((3, 1)));
-        reset();
-        assert_eq!(allocation_budget(&a.to_string()), None);
-        assert_eq!(allocation_budget(&b.to_string()), None);
-    }
 }

@@ -81,7 +81,8 @@ impl NativeDecodedVideoLog {
             receiver.format_budget_exhausted = true;
             return false;
         }
-        // All-zero/constant placeholder buffers cannot establish media delivery.
+        // Contrast belongs to the old animated-source witness. Source-event
+        // proof instead checks uniform native pixels against supplied content.
         let luma = &pixels.data[..w * h];
         let mut minimum = u8::MAX;
         let mut maximum = u8::MIN;
@@ -251,17 +252,11 @@ impl NativeDecodedVideoLog {
         Ok(())
     }
 
-    pub fn observed_tracks(&self) -> impl Iterator<Item = &RemoteTrack> {
-        self.receivers
-            .values()
-            .filter_map(|receiver| receiver.track.as_ref())
-    }
-
     pub fn callback_failure_counter(&self) -> Arc<AtomicU64> {
         self.callback_failures.clone()
     }
 
-    fn require_callback_collector(&self) -> Result<()> {
+    pub(super) fn require_callback_collector(&self) -> Result<()> {
         let failures = self.callback_failures.load(Ordering::Acquire);
         ensure!(
             failures == 0,

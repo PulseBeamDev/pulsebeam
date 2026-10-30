@@ -6,10 +6,7 @@ pub mod shaper;
 #[cfg(feature = "sim")]
 mod udp_sim;
 #[cfg(feature = "sim")]
-pub use bound_udp::{
-    bind_udp_socket, install_steering_flow, set_wrong_owner_injection,
-    wrong_owner_injections_consumed,
-};
+pub use bound_udp::{bind_udp_socket, install_steering_flow, set_wrong_owner_injection};
 
 pub use pulsebeam_udp::{BATCH_SIZE, ReceiveTime};
 use std::net::SocketAddr;

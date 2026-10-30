@@ -6,7 +6,6 @@ use core_affinity::get_core_ids;
 use pulsebeam_core::auth::KeyRegistry;
 use pulsebeam_core::net::TcpListener;
 use pulsebeam_queue as mailbox;
-use pulsebeam_runtime::net;
 use pulsebeam_runtime::net::UdpMode;
 use pulsebeam_runtime::rand;
 use pulsebeam_runtime::rand::{RngCore, SeedableRng};
@@ -441,7 +440,7 @@ pub enum IceTcpConfig {
 
 pub struct NodeBuilder {
     #[cfg(feature = "sim")]
-    sim_observer: Option<tokio::sync::mpsc::Sender<crate::sim_observation::Observer>>,
+    sim_startup_notification: Option<tokio::sync::mpsc::Sender<()>>,
     // Data-plane topology
     //
     // `data_threads` is physical executor width. Logical shard count is derived
@@ -492,7 +491,7 @@ impl NodeBuilder {
     pub fn new() -> Self {
         Self {
             #[cfg(feature = "sim")]
-            sim_observer: None,
+            sim_startup_notification: None,
             data_threads: 1,
             shard_runtime: ShardRuntime::ThreadPerCore,
             local_addr: None,
@@ -521,12 +520,13 @@ impl NodeBuilder {
         }
     }
 
+    /// Notify when the controller mailbox exists, before controller spawn and HTTP binding.
     #[cfg(feature = "sim")]
-    pub fn with_sim_observer(
+    pub fn with_sim_startup_notification(
         mut self,
-        reply: tokio::sync::mpsc::Sender<crate::sim_observation::Observer>,
+        notification: tokio::sync::mpsc::Sender<()>,
     ) -> Self {
-        self.sim_observer = Some(reply);
+        self.sim_startup_notification = Some(notification);
         self
     }
 
@@ -1024,10 +1024,8 @@ impl NodeBuilder {
         let (controller_command_tx, controller_command_rx) =
             mailbox::bounded(const { core::num::NonZeroUsize::new(16).unwrap() });
         #[cfg(feature = "sim")]
-        if let Some(reply) = self.sim_observer {
-            let _ = reply.try_send(crate::sim_observation::Observer::new(
-                controller_command_tx.clone(),
-            ));
+        if let Some(notification) = self.sim_startup_notification {
+            let _ = notification.try_send(());
         }
 
         control_tasks.spawn(ignore(controller.run(
@@ -1128,7 +1126,8 @@ async fn bind_udp_socket(
 ) -> std::io::Result<pulsebeam_udp::BoundUdpSocket> {
     #[cfg(feature = "sim")]
     {
-        net::bind_udp_socket(local_addr, mode, advertised_addr, shard_index).await
+        pulsebeam_runtime::net::bind_udp_socket(local_addr, mode, advertised_addr, shard_index)
+            .await
     }
     #[cfg(not(feature = "sim"))]
     {
@@ -1739,7 +1738,7 @@ mod tests {
                 .await
                 .unwrap();
             let media = occupied.local_addr().unwrap();
-            let (observer, mut ready) = tokio::sync::mpsc::channel(1);
+            let (notification, mut ready) = tokio::sync::mpsc::channel(1);
             let shutdown = CancellationToken::new();
             let builder = NodeBuilder::new()
                 .with_current_runtime()
@@ -1747,10 +1746,10 @@ mod tests {
                 .external_addrs(vec![media])
                 .ice_tcp(IceTcpConfig::Disabled)
                 .rng(rand::Rng::seed_from_u64(9))
-                .with_sim_observer(observer);
+                .with_sim_startup_notification(notification);
             let mut node = tokio::task::spawn_local(builder.run(shutdown.clone()));
             tokio::select! {
-                observer = ready.recv() => assert!(observer.is_some()),
+                notification = ready.recv() => assert!(notification.is_some()),
                 result = &mut node => panic!("disabled node failed startup: {result:?}"),
             }
             shutdown.cancel();

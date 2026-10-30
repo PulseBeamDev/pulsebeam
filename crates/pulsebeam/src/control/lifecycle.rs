@@ -227,30 +227,6 @@ pub(crate) struct TrackLifecycle {
 }
 
 impl TrackLifecycle {
-    #[cfg(feature = "sim")]
-    pub(crate) fn observation(&self) -> crate::sim_observation::ControlObservation {
-        let (tracks, subscriptions) = self.topology.observation();
-        crate::sim_observation::ControlObservation {
-            generation: self.generation,
-            shard_generations: Vec::new(),
-            tracks,
-            subscriptions,
-            placements: self
-                .placements
-                .iter()
-                .map(
-                    |((ancestry, _), destination)| crate::sim_observation::PlacementObservation {
-                        track: ancestry.track_id,
-                        address: destination.placement.route,
-                        resident: destination.resident,
-                        route_installed: destination.route_installed,
-                    },
-                )
-                .collect(),
-            participants: Vec::new(),
-        }
-    }
-
     pub(crate) fn new(shard_count: usize) -> Self {
         Self {
             topology: TrackTopology::default(),
@@ -488,7 +464,63 @@ impl TrackLifecycle {
 
         self.candidates.insert(identity, desired.candidates);
         self.bindings.insert(identity, desired.bindings);
+        #[cfg(debug_assertions)]
+        self.assert_committed_track(identity, registry);
         stager.finish()
+    }
+
+    #[cfg(debug_assertions)]
+    #[allow(
+        clippy::expect_used,
+        reason = "a completed reconciliation retains the published track and its bound participants"
+    )]
+    fn assert_committed_track(&self, identity: TrackAncestry, registry: &RoomRegistry) {
+        let track = self.topology.track(identity).expect("committed track");
+        let candidates = self
+            .candidates
+            .get(&identity)
+            .expect("committed candidates");
+        let bindings = self.bindings.get(&identity).expect("committed bindings");
+        debug_assert!(
+            bindings.is_subset(candidates),
+            "bindings must be candidates"
+        );
+        debug_assert!(!candidates.contains(&identity.publisher));
+        let origin =
+            ParticipantLocation::bound_in_room(registry, &identity.publisher, identity.room_id)
+                .expect("published track must retain a bound publisher");
+        let mut candidate_shards = HashSet::from([origin.shard]);
+        let mut active_shards = HashSet::new();
+        for participant in candidates {
+            let location =
+                ParticipantLocation::bound_in_room(registry, participant, identity.room_id)
+                    .expect("retained candidate must remain bound in the track room");
+            candidate_shards.insert(location.shard);
+            if bindings.contains(participant) {
+                active_shards.insert(location.shard);
+            }
+        }
+        for shard in candidate_shards {
+            let destination = self
+                .placements
+                .get(&(identity, shard))
+                .expect("committed candidate shard must retain its placement");
+            debug_assert_eq!(destination.placement.track_id, identity.track_id);
+            debug_assert_eq!(destination.placement.route.shard(), shard);
+            debug_assert!(
+                destination.resident,
+                "candidate runtime must remain resident"
+            );
+            debug_assert_eq!(
+                destination.route_installed,
+                if shard == origin.shard {
+                    track.requires_reverse_route()
+                } else {
+                    active_shards.contains(&shard)
+                },
+                "route residency must match origin semantics or active bindings"
+            );
+        }
     }
 
     #[allow(
@@ -1001,6 +1033,10 @@ impl TrackLifecycle {
     }
 
     fn release_placements(&mut self, identity: TrackAncestry, now: Instant) {
+        debug_assert!(
+            !self.topology.contains(identity),
+            "placement release follows committed publication removal"
+        );
         let placements = self
             .placements
             .extract_if(|(held, _), _| *held == identity)
@@ -1355,6 +1391,30 @@ mod tests {
             .placements
             .get(&(identity, ShardId::new(shard)))
             .expect("destination placement must exist")
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "bindings must be candidates")]
+    fn committed_track_rejects_a_binding_without_a_candidate() {
+        let (mut lifecycle, registry) = setup(2, &[(1, 1, 0), (2, 1, 1)]);
+        let (identity, _) = publish_audio(&mut lifecycle, &registry, 1, 1);
+        lifecycle
+            .bindings
+            .get_mut(&identity)
+            .unwrap()
+            .insert(participant(2));
+        lifecycle.assert_committed_track(identity, &registry);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "committed candidate shard must retain its placement")]
+    fn committed_track_rejects_a_missing_origin_placement() {
+        let (mut lifecycle, registry) = setup(1, &[(1, 1, 0)]);
+        let (identity, _) = publish_audio(&mut lifecycle, &registry, 1, 1);
+        lifecycle.placements.remove(&(identity, ShardId::new(0)));
+        lifecycle.assert_committed_track(identity, &registry);
     }
 
     fn assert_internal_invariants(lifecycle: &TrackLifecycle, registry: &RoomRegistry) {

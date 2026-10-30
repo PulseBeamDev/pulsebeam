@@ -124,26 +124,16 @@ pub async fn start_sfu_node_with(
     shards: usize,
     tcp_only: bool,
 ) -> anyhow::Result<()> {
-    start_observed_sfu_node(ip, rng, shards, tcp_only, None).await
+    start_sfu_node_with_transport(ip, rng, shards, tcp_only, false, None).await
 }
 
-pub async fn start_observed_sfu_node(
-    ip: IpAddr,
-    rng: pulsebeam_runtime::rand::Rng,
-    shards: usize,
-    tcp_only: bool,
-    observer: Option<tokio::sync::mpsc::Sender<pulsebeam::sim_observation::Observer>>,
-) -> anyhow::Result<()> {
-    start_observed_sfu_node_with_transport(ip, rng, shards, tcp_only, false, observer).await
-}
-
-pub async fn start_observed_sfu_node_with_transport(
+pub async fn start_sfu_node_with_transport(
     ip: IpAddr,
     rng: pulsebeam_runtime::rand::Rng,
     shards: usize,
     tcp_only: bool,
     udp_only: bool,
-    observer: Option<tokio::sync::mpsc::Sender<pulsebeam::sim_observation::Observer>>,
+    startup_notification: Option<tokio::sync::mpsc::Sender<()>>,
 ) -> anyhow::Result<()> {
     let rtc_port = 3478;
     let external_addr = SocketAddr::new(ip, rtc_port);
@@ -168,8 +158,8 @@ pub async fn start_observed_sfu_node_with_transport(
             .expect("development registry is valid"),
         )
         .with_current_runtime();
-    if let Some(observer) = observer {
-        builder = builder.with_sim_observer(observer);
+    if let Some(notification) = startup_notification {
+        builder = builder.with_sim_startup_notification(notification);
     }
     if shards > 1 {
         builder = builder.room_partition_size(1).round_robin_rooms();

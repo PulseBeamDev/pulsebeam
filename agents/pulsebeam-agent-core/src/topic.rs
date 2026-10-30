@@ -192,7 +192,13 @@ enum ChannelRegistration {
     Subscriber(TopicSubscriber),
 }
 
+struct SubscriptionSeedState {
+    token: u64,
+    completed_revision: Option<u64>,
+}
+
 struct ActiveTopics {
+    seeds: BTreeMap<TopicSubscriber, SubscriptionSeedState>,
     generation: Generation,
     canonical_participant_id: String,
     channels: BTreeMap<ChannelId, ChannelRegistration>,
@@ -319,18 +325,57 @@ impl Topics {
         self.unbind(TopicDropReason::ChannelClosed, snapshot, notifications);
     }
 
-    #[cfg(feature = "sim")]
-    pub(crate) fn simulation_ordered_cursors(&self) -> Vec<(TopicSubscriber, String, u64)> {
-        self.subscribers
-            .iter()
-            .flat_map(|(subscriber, state)| {
-                state.ordered.iter().filter_map(|(id, delivery)| {
-                    delivery
-                        .next_sequence
-                        .map(|next| (subscriber.clone(), id.clone(), next))
-                })
+    pub(crate) fn seed_requests(&self) -> Vec<wire::SubscriptionSeed> {
+        self.active
+            .as_ref()
+            .into_iter()
+            .flat_map(|active| {
+                active
+                    .seeds
+                    .iter()
+                    .map(|(subscriber, seed)| wire::SubscriptionSeed {
+                        seed_id: seed.token,
+                        topic: subscriber.topic.clone(),
+                        mode: wire::TopicMode::Ordered as i32,
+                    })
             })
             .collect()
+    }
+
+    pub(crate) fn seeding(&self) -> bool {
+        self.active.as_ref().is_some_and(|active| {
+            active.seeds.iter().any(|(subscriber, seed)| {
+                self.subscribers.contains_key(subscriber) && seed.completed_revision.is_none()
+            })
+        })
+    }
+
+    pub(crate) fn complete_seed(
+        &mut self,
+        generation: Generation,
+        completion: &wire::SubscriptionSeedComplete,
+        catalog_revision: u64,
+    ) -> Result<(), TopicError> {
+        let active = self
+            .active
+            .as_mut()
+            .filter(|active| active.generation == generation)
+            .ok_or(TopicError::InvalidControl)?;
+        let seed = active
+            .seeds
+            .values_mut()
+            .find(|seed| seed.token == completion.seed_id)
+            .ok_or(TopicError::InvalidControl)?;
+        if completion.catalog_revision == 0
+            || completion.catalog_revision > catalog_revision
+            || seed
+                .completed_revision
+                .is_some_and(|revision| revision != completion.catalog_revision)
+        {
+            return Err(TopicError::InvalidControl);
+        }
+        seed.completed_revision = Some(completion.catalog_revision);
+        Ok(())
     }
 
     pub(crate) fn has_ordered_subscriptions(&self) -> bool {
@@ -410,11 +455,17 @@ impl Topics {
                     .get(id)
                     .is_some_and(|binding| binding.matches(subscriber))
             });
-            state.ordered.retain(|id, _| {
-                self.catalog
-                    .get(id)
-                    .is_some_and(|binding| binding.matches(subscriber))
-            });
+            if active
+                .seeds
+                .get(subscriber)
+                .is_none_or(|seed| seed.completed_revision.is_some())
+            {
+                state.ordered.retain(|id, _| {
+                    self.catalog
+                        .get(id)
+                        .is_some_and(|binding| binding.matches(subscriber))
+                });
+            }
         }
         let publishers = self.publishers.keys().cloned().collect::<Vec<_>>();
         for publisher in publishers {
@@ -437,7 +488,12 @@ impl Topics {
             let ChannelRegistration::Subscriber(subscriber) = registration else {
                 continue;
             };
-            if subscriber.mode != TopicMode::Ordered {
+            if subscriber.mode != TopicMode::Ordered
+                || active
+                    .seeds
+                    .get(subscriber)
+                    .is_some_and(|seed| seed.completed_revision.is_none())
+            {
                 continue;
             }
             for (id, binding) in &self.catalog {
@@ -519,6 +575,8 @@ impl Topics {
             self.subscribers.entry(subscriber.clone()).or_default();
         }
         if let Some(active) = &mut self.active {
+            // Retired tokens remain fenced within this generation, not their
+            // publication frontiers. The initial channel limit bounds tombstones.
             active
                 .channels
                 .retain(|_, registration| match registration {
@@ -564,7 +622,7 @@ impl Topics {
         canonical_participant_id: String,
         registrations: &TopicRegistrations,
         bindings: Vec<DataChannelBinding>,
-        _ids: &mut IdGenerator,
+        ids: &mut IdGenerator,
         _effects: &mut VecDeque<Effect>,
         snapshot: &mut Snapshot,
         notifications: &mut VecDeque<Notification>,
@@ -588,7 +646,22 @@ impl Topics {
                 );
             }
         }
+        let seeds = registrations
+            .subscribers
+            .iter()
+            .filter(|subscriber| subscriber.mode == TopicMode::Ordered)
+            .map(|subscriber| {
+                (
+                    subscriber.clone(),
+                    SubscriptionSeedState {
+                        token: ids.operation().get(),
+                        completed_revision: None,
+                    },
+                )
+            })
+            .collect();
         self.active = Some(ActiveTopics {
+            seeds,
             generation,
             canonical_participant_id,
             channels,
@@ -885,6 +958,15 @@ impl Topics {
                 }
             }
             ChannelRegistration::Subscriber(subscriber) => {
+                if active
+                    .seeds
+                    .get(&subscriber)
+                    .is_some_and(|seed| seed.completed_revision.is_none())
+                {
+                    // Probes after completion recover bounded history, including gaps.
+                    // Incomplete generations cannot advance the established frontier.
+                    return Ok(true);
+                }
                 // Unknown/retired identities are never guessed or buffered. Once
                 // established, ordered cursors survive this loss and probes recover it.
                 let Some(binding) = self
@@ -1097,8 +1179,8 @@ impl Topics {
         for state in self.subscribers.values_mut() {
             if reason == TopicDropReason::TransportReplaced {
                 // A transport fence is not an unsubscription. Keep the delivery
-                // frontier, not payload buffers. Catalog pruning is unchanged;
-                // see ORDERED_RECOVERY_CHECKPOINT.md for the bootstrap blocker.
+                // frontier, not payload buffers. Only a completed replacement
+                // subscription seed can authoritatively prune that frontier.
                 state.latest.clear();
                 state.lossy.clear();
                 for delivery in state.ordered.values_mut() {
@@ -1446,6 +1528,7 @@ mod tests {
         let channel = ChannelId::new(1).unwrap();
         let mut topics = Topics {
             active: Some(ActiveTopics {
+                seeds: BTreeMap::new(),
                 generation,
                 canonical_participant_id: "local".into(),
                 channels: BTreeMap::from([(
@@ -1533,9 +1616,53 @@ mod tests {
             &mut snapshot,
             &mut notifications,
         );
-        // This unit restores the known catalog directly, not through signaling
-        // bootstrap. The on-wire gap is recorded in ORDERED_RECOVERY_CHECKPOINT.md.
-        // Catalog removal is separately checked below, not inferred from unbind.
+        topics.sync_catalog(
+            replacement,
+            &crate::signaling_v1::CatalogState::default(),
+            &mut snapshot,
+            &mut notifications,
+            &mut ids,
+            &mut effects,
+        );
+        assert_eq!(
+            topics.subscribers[&subscriber].ordered["authoritative"].next_sequence,
+            Some(4)
+        );
+        topics.probe_remote_publishers(&mut ids, &mut effects);
+        assert!(effects.is_empty(), "DCEP open does not complete the seed");
+        let seed_id = topics.seed_requests()[0].seed_id;
+        let completion = wire::SubscriptionSeedComplete {
+            seed_id,
+            catalog_revision: 1,
+        };
+        assert!(topics.complete_seed(generation, &completion, 1).is_err());
+        assert!(topics.complete_seed(replacement, &completion, 0).is_err());
+        assert!(
+            topics
+                .complete_seed(
+                    replacement,
+                    &wire::SubscriptionSeedComplete {
+                        seed_id: 0,
+                        catalog_revision: 1,
+                    },
+                    1
+                )
+                .is_err()
+        );
+        assert!(
+            topics
+                .complete_seed(
+                    replacement,
+                    &wire::SubscriptionSeedComplete {
+                        seed_id,
+                        catalog_revision: 0,
+                    },
+                    1
+                )
+                .is_err()
+        );
+        topics.complete_seed(replacement, &completion, 1).unwrap();
+        topics.complete_seed(replacement, &completion, 1).unwrap();
         topics.catalog = catalog;
         topics.probe_remote_publishers(&mut ids, &mut effects);
         let Some(Effect::DataChannel(DataChannelEffect::Send {
@@ -1589,6 +1716,103 @@ mod tests {
                 "boundary {boundary} must discard the old publication cursor"
             );
         }
+    }
+
+    #[test]
+    fn incomplete_seeds_never_accumulate_frontiers_and_unsubscribe_fences_completion() {
+        let mut ids = IdGenerator::new();
+        let (mut topics, subscriber, _) = ordered_topics(&mut ids);
+        let mut snapshot = Snapshot::default();
+        let mut notifications = VecDeque::new();
+        let mut effects = VecDeque::new();
+        let mut previous = None;
+        for _ in 0..8 {
+            let generation = ids.generation();
+            topics.bind(
+                generation,
+                "local".into(),
+                &TopicRegistrations {
+                    subscribers: alloc::vec![subscriber.clone()],
+                    ..TopicRegistrations::default()
+                },
+                alloc::vec![DataChannelBinding {
+                    label: subscriber_label(&subscriber),
+                    channel: ChannelId::new(2).unwrap()
+                }],
+                &mut ids,
+                &mut effects,
+                &mut snapshot,
+                &mut notifications,
+            );
+            let seed_id = topics.seed_requests()[0].seed_id;
+            topics.sync_catalog(
+                generation,
+                &crate::signaling_v1::CatalogState::default(),
+                &mut snapshot,
+                &mut notifications,
+                &mut ids,
+                &mut effects,
+            );
+            assert_eq!(topics.subscribers[&subscriber].ordered.len(), 1);
+            assert_eq!(
+                topics.subscribers[&subscriber].ordered["authoritative"].next_sequence,
+                Some(4)
+            );
+            if let Some((old_generation, old_seed)) = previous {
+                assert!(
+                    topics
+                        .complete_seed(
+                            old_generation,
+                            &wire::SubscriptionSeedComplete {
+                                seed_id: old_seed,
+                                catalog_revision: 1,
+                            },
+                            1
+                        )
+                        .is_err()
+                );
+                assert!(
+                    topics
+                        .complete_seed(
+                            generation,
+                            &wire::SubscriptionSeedComplete {
+                                seed_id: old_seed,
+                                catalog_revision: 1,
+                            },
+                            1
+                        )
+                        .is_err()
+                );
+            }
+            previous = Some((generation, seed_id));
+        }
+        let (generation, seed_id) = previous.unwrap();
+        topics.reconcile(
+            &TopicRegistrations::default(),
+            &mut snapshot,
+            &mut notifications,
+        );
+        assert!(
+            topics.subscribers.is_empty(),
+            "unsubscribe releases the frontier immediately"
+        );
+        assert!(!topics.seeding());
+        topics
+            .complete_seed(
+                generation,
+                &wire::SubscriptionSeedComplete {
+                    seed_id,
+                    catalog_revision: 1,
+                },
+                1,
+            )
+            .unwrap();
+        assert!(
+            topics.subscribers.is_empty(),
+            "late completion cannot recreate an owner"
+        );
+        topics.probe_remote_publishers(&mut ids, &mut effects);
+        assert!(effects.is_empty());
     }
 
     #[test]
@@ -1650,6 +1874,7 @@ mod tests {
             let channel = ChannelId::new(1).unwrap();
             let mut topics = Topics {
                 active: Some(ActiveTopics {
+                    seeds: BTreeMap::new(),
                     generation,
                     canonical_participant_id: "local".into(),
                     channels: BTreeMap::from([(

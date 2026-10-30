@@ -186,32 +186,13 @@ pub struct Participant {
 pub type ParticipantCore = Participant;
 
 impl Participant {
-    #[cfg(feature = "sim")]
-    pub(crate) fn video_observation(&self) -> crate::sim_observation::VideoAllocationObservation {
-        self.downstream.video.observation()
-    }
-
-    #[cfg(feature = "sim")]
-    pub(crate) fn audio_observation(&self) -> Vec<crate::sim_observation::AudioSlotObservation> {
-        self.downstream
-            .audio_assignments()
-            .into_iter()
-            .map(|heard| crate::sim_observation::AudioSlotObservation {
-                track: heard.origin.track,
-                origin: heard.origin.participant,
-                mid: heard.mid.to_string(),
-                level_dbov: heard.level_dbov,
-            })
-            .collect()
-    }
-
     pub fn new(cfg: ParticipantConfig, shard_id: ShardId, udp_gso_size: usize) -> Self {
         let rtc = cfg.rtc;
         let ctx = LogCtx {
             room_id: cfg.room_id,
             participant_id: cfg.participant_id,
         };
-        let signaling = NativeSession::default();
+        let signaling = NativeSession::new(&rtc.session);
         let now = Instant::now();
         #[cfg(feature = "sim")]
         let sim_span = tracing::info_span!(
@@ -279,6 +260,14 @@ impl Participant {
 
     pub fn apply(&mut self, effect: ParticipantEffect, track_handle: Option<TrackHandle>) {
         match effect {
+            ParticipantEffect::SubscriptionSeedComplete {
+                connection_id,
+                seed_id,
+            } => {
+                if connection_id == self.connection_id && self.data.has_seed(seed_id) {
+                    self.signaling.complete_seed(seed_id);
+                }
+            }
             ParticipantEffect::ParticipantsChanged { added, removed } => {
                 self.signaling.apply_participants(added, removed);
             }
@@ -992,22 +981,29 @@ impl Participant {
                             None
                         };
                         let meta = publication.as_ref().map(|track| track.meta().clone());
-                        if let Err(error) = self.data.open(cid, channel.clone(), meta) {
-                            self.disconnect(match error {
-                                DataOpenError::DuplicateDataChannelLabel(channel) => {
-                                    DisconnectReason::DuplicateDataChannelLabel(channel)
-                                }
-                                DataOpenError::TooManyDataTopicChannels => {
-                                    DisconnectReason::TooManyDataTopicChannels
-                                }
-                            });
-                            return;
-                        }
+                        let seeded = match self.data.open(cid, channel.clone(), meta) {
+                            Ok(seeded) => seeded,
+                            Err(error) => {
+                                self.disconnect(match error {
+                                    DataOpenError::DuplicateDataChannelLabel(channel) => {
+                                        DisconnectReason::DuplicateDataChannelLabel(channel)
+                                    }
+                                    DataOpenError::TooManyDataTopicChannels => {
+                                        DisconnectReason::TooManyDataTopicChannels
+                                    }
+                                });
+                                return;
+                            }
+                        };
                         if let Some(track) = publication {
                             self.upstream.data.publish(cid, &track);
                             events.publish_track(track);
                             self.signaling.mark_dirty();
-                        } else {
+                        } else if let Some((selector, token)) = seeded {
+                            events.seed_subscription(selector, token);
+                        } else if channel.lane != DataLane::Ordered {
+                            // Ordered subscriptions start with their identity-bearing
+                            // seed request, not an additional anonymous registration.
                             events.subscribe_tracks(
                                 DataState::selector(&channel),
                                 crate::track::SelectionPolicy::All,
@@ -1151,6 +1147,11 @@ impl Participant {
                     self.send_playout_reconnect();
                 }
             }
+            Ok(AppliedInput::SubscriptionSeed(seed)) => match self.data.seed(&seed) {
+                Ok(Some(selector)) => events.seed_subscription(selector, seed.seed_id),
+                Ok(None) => {}
+                Err(()) => self.disconnect(DisconnectReason::SignalingInput),
+            },
             Ok(AppliedInput::Replay) => {}
             Ok(AppliedInput::RenewAuthorization(token)) => {
                 if self.renewal_pending {
@@ -1161,14 +1162,20 @@ impl Participant {
                 }
             }
             Err(error) => {
-                if let Ok(bytes) = pulsebeam_proto::codec::encode_server(&error.response())
+                let sent = if let Ok(bytes) =
+                    pulsebeam_proto::codec::encode_server(&error.response())
                     && let Some(cid) = self.signaling.cid
                 {
-                    self.transport.write_channel(cid, true, &bytes);
-                    self.transport.mark_needs_drain();
-                }
+                    self.transport.write_channel(cid, true, &bytes)
+                } else {
+                    false
+                };
                 plog_warn!(self.log_ctx(), ?error, "native signaling input rejected");
-                self.disconnect(DisconnectReason::SignalingInput);
+                if error.is_fatal() {
+                    self.disconnect(DisconnectReason::SignalingInput);
+                } else if !sent {
+                    self.disconnect(DisconnectReason::SignalingOutput);
+                }
             }
         }
     }
@@ -1215,6 +1222,9 @@ impl Participant {
     }
 
     fn release_data_channel(&mut self, state: DataChannelState, events: &mut impl ParticipantSink) {
+        if let Some(seed) = state.seed {
+            self.signaling.retire_seed(seed);
+        }
         if let Some(meta) = state.publication {
             events.unpublish_track(meta);
         } else {

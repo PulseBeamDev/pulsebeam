@@ -83,7 +83,6 @@ fn video_does_not_loop_back_to_publisher_test() {
                 description: "Pre-fault frames cannot prove recovery",
                 participant: "viewer",
                 publishers: &["publisher"],
-                min_quality: 1,
                 timeout: Duration::from_secs(3),
             },
         ]);
@@ -196,14 +195,12 @@ fn each_viewer_must_report_decoded_selected_source_independently_test() {
                 description: "The selected source still reaches the healthy recipient",
                 participant: "viewer-a",
                 publishers: &["source-one"],
-                min_quality: 1,
                 timeout: Duration::from_secs(5),
             },
             Step::WaitForVideo {
                 description: "A corrupt recipient cannot prove recovery",
                 participant: "viewer-b",
                 publishers: &["source-zero"],
-                min_quality: 1,
                 timeout: Duration::from_secs(1),
             },
         ]);
@@ -367,7 +364,7 @@ fn remote_bench_room_joiners_render_every_other_participant() {
 
 #[test]
 /// Replays a failing run with `PULSEBEAM_SIM_SEED=<seed>` from the test output.
-fn cross_shard_stats_reach_the_subscriber_allocator() {
+fn cross_shard_video_decodes_from_the_requested_source() {
     super::common::LocalNodeSim::new()
         .with_room(cross_shard_video_room())
         .run(vec![
@@ -375,10 +372,12 @@ fn cross_shard_stats_reach_the_subscriber_allocator() {
                 description: "converge publisher telemetry across the shard boundary",
                 duration: Duration::from_secs(12),
             },
-            super::common::Step::CheckForwardedQualityReached {
-                description: "subscriber quality responds to publisher stats",
-                origin: "publisher",
-                min_quality: 1,
+            super::common::Step::CheckVideoDecodedFromInterval {
+                description: "the subscriber independently decodes the requested source",
+                participant: "subscriber",
+                publisher: "publisher",
+                min_frames: 1,
+                min_resolution: (1, 180),
             },
         ]);
 }
@@ -409,9 +408,12 @@ fn cross_shard_keyframe_reaches_the_publisher() {
                 description: "allow the reverse feedback route to carry the request",
                 duration: Duration::from_secs(8),
             },
-            super::common::Step::CheckCrossShardMedia {
-                description: "the request belongs to a genuinely cross-shard stream",
-                min_frames: 100,
+            super::common::Step::CheckVideoDecodedFromInterval {
+                description: "subscriber independently decodes the requested source across owner shards",
+                participant: "subscriber",
+                publisher: "publisher",
+                min_frames: 1,
+                min_resolution: (1, 180),
             },
             super::common::Step::CheckKeyframeRequestsAtLeast {
                 description: "the publisher receives the cross-shard keyframe request",
@@ -970,9 +972,12 @@ fn cross_shard_stream_survives_congestion_test() {
                 description: "Let the allocator degrade on measurements sent between shards",
                 duration: Duration::from_secs(12),
             },
-            Step::CheckCrossShardMedia {
-                description: "the stream really did cross a shard boundary",
-                min_frames: 100,
+            Step::CheckVideoDecodedFromInterval {
+                description: "bob independently decodes the requested source across owner shards",
+                participant: "bob",
+                publisher: "alice",
+                min_frames: 1,
+                min_resolution: (1, 180),
             },
             Step::CheckVideoQuality {
                 description: "Bob keeps receiving renderable frames through the squeeze",
@@ -1019,9 +1024,12 @@ fn cross_shard_simulcast_switching_stays_decodable_test() {
                 description: "Settle on a higher layer",
                 duration: Duration::from_secs(10),
             },
-            Step::CheckCrossShardMedia {
-                description: "the switching stream crossed a shard boundary",
-                min_frames: 100,
+            Step::CheckVideoDecodedFromInterval {
+                description: "bob independently decodes the requested source across owner shards",
+                participant: "bob",
+                publisher: "alice",
+                min_frames: 1,
+                min_resolution: (1, 720),
             },
             Step::CheckVideoQuality {
                 description: "Bob decodes across every switch",

@@ -41,11 +41,99 @@ pub struct DecodedVideo {
     pub reference_error: ReferenceError,
 }
 
+/// Fixed spatial samples of fixture Y/U/V, not a general perceptual score.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct PixelSample([u8; 96]);
+
+impl std::fmt::Debug for PixelSample {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PixelSample")
+            .finish_non_exhaustive()
+    }
+}
+
+impl PixelSample {
+    pub fn solid(y: u8, u: u8, v: u8) -> Self {
+        let mut values = [y; 96];
+        values[64..80].fill(u);
+        values[80..].fill(v);
+        Self(values)
+    }
+
+    pub fn planes(
+        width: usize,
+        height: usize,
+        strides: (usize, usize, usize),
+        planes: [&[u8]; 3],
+    ) -> Option<Self> {
+        if width == 0 || height == 0 {
+            return None;
+        }
+        let mut values = [0; 96];
+        let mut offset = 0;
+        for (plane, (w, h, stride, side)) in planes.into_iter().zip([
+            (width, height, strides.0, 8),
+            (width.div_ceil(2), height.div_ceil(2), strides.1, 4),
+            (width.div_ceil(2), height.div_ceil(2), strides.2, 4),
+        ]) {
+            if stride < w {
+                return None;
+            }
+            for y in 0..side {
+                for x in 0..side {
+                    let row = ((2usize * y + 1).checked_mul(h)? / (2 * side)).min(h - 1);
+                    let col = ((2usize * x + 1).checked_mul(w)? / (2 * side)).min(w - 1);
+                    values[offset] = *plane.get(row.checked_mul(stride)?.checked_add(col)?)?;
+                    offset += 1;
+                }
+            }
+        }
+        Some(Self(values))
+    }
+
+    pub fn packed_i420(width: u32, height: u32, pixels: &[u8]) -> Option<Self> {
+        let w = usize::try_from(width).ok()?;
+        let h = usize::try_from(height).ok()?;
+        let y = w.checked_mul(h)?;
+        let uv = w.div_ceil(2).checked_mul(h.div_ceil(2))?;
+        if pixels.len() != y.checked_add(uv.checked_mul(2)?)? {
+            return None;
+        }
+        Self::planes(
+            w,
+            h,
+            (w, w.div_ceil(2), w.div_ceil(2)),
+            [
+                pixels.get(..y)?,
+                pixels.get(y..y + uv)?,
+                pixels.get(y + uv..)?,
+            ],
+        )
+    }
+
+    pub fn require_fixture(self, expected: Self) -> anyhow::Result<()> {
+        let peak = self
+            .0
+            .into_iter()
+            .zip(expected.0)
+            .map(|(actual, expected)| u16::from(actual.abs_diff(expected)))
+            .max()
+            .unwrap();
+        anyhow::ensure!(
+            peak <= MAX_REFERENCE_PEAK,
+            "native fixture pixels differ from supplied event: peak={peak}"
+        );
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DecodedVideoObservation {
     pub width: usize,
     pub height: usize,
     pub reference_error: Option<ReferenceError>,
+    pub pixel_sample: PixelSample,
 }
 
 pub struct H264ReferenceDecoder {
@@ -142,10 +230,18 @@ impl H264ReferenceDecoder {
             })?),
             None => None,
         };
+        let pixel_sample = PixelSample::planes(
+            width,
+            height,
+            image.strides(),
+            [image.y(), image.u(), image.v()],
+        )
+        .ok_or_else(|| DecodeError::Decoder("invalid fixture YUV planes".into()))?;
         Ok(DecodedVideoObservation {
             width,
             height,
             reference_error,
+            pixel_sample,
         })
     }
 }
@@ -349,6 +445,26 @@ fn combine_errors(errors: [ReferenceError; 3]) -> ReferenceError {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn uniform_i420_is_valid_but_substituted_fixture_content_is_not() {
+        use super::PixelSample;
+        let pixels = vec![96; 27]; // 3x5 Y plus two 2x3 chroma planes.
+        let supplied = PixelSample::packed_i420(3, 5, &pixels).unwrap();
+        supplied.require_fixture(supplied).unwrap();
+        assert!(PixelSample::packed_i420(3, 5, &[0; 27]).is_some());
+        assert!(PixelSample::packed_i420(0, 5, &[]).is_none());
+        assert!(PixelSample::packed_i420(3, 5, &pixels[..26]).is_none());
+        assert!(PixelSample::packed_i420(u32::MAX, u32::MAX, &[]).is_none());
+        let changed = PixelSample::packed_i420(3, 5, &[192; 27]).unwrap();
+        assert!(changed.require_fixture(supplied).is_err());
+        assert!(
+            PixelSample::packed_i420(3, 5, &[0; 27])
+                .unwrap()
+                .require_fixture(supplied)
+                .is_err()
+        );
+    }
+
     use super::{H264ReferenceDecoder, OpusReferenceDecoder};
     use pulsebeam_testdata::{
         QualityVideoLayer, QualityVideoSource, RAW_H264_FULL_CBR, RAW_H264_HALF_CBR,

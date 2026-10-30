@@ -48,8 +48,6 @@ pub mod shard;
 pub(crate) mod shard_update;
 #[cfg(feature = "sim")]
 pub mod sim_metrics;
-#[cfg(feature = "sim")]
-pub mod sim_observation;
 pub mod track;
 
 #[cfg(test)]

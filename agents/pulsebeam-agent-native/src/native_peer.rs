@@ -247,7 +247,7 @@ impl<R: rtc::SessionRuntime> NativePeer<R> {
             transceivers.insert(slot, transceiver);
         }
         let operation = session.create_offer(peer, false)?;
-        Ok(Self {
+        let value = Self {
             generation,
             session,
             peer,
@@ -264,7 +264,60 @@ impl<R: rtc::SessionRuntime> NativePeer<R> {
             bindings: BTreeMap::new(),
             sources,
             receivers: BTreeMap::new(),
-        })
+        };
+        #[cfg(debug_assertions)]
+        value.assert_slot_ownership();
+        Ok(value)
+    }
+
+    #[cfg(debug_assertions)]
+    fn assert_slot_ownership(&self) {
+        for slot in self.transceivers.keys() {
+            debug_assert_eq!(
+                self.sources.contains_key(slot),
+                slot.direction() == agent_core::MediaDirection::SendOnly,
+                "local slots own sources; remote slots do not"
+            );
+        }
+        for (slot, source) in &self.sources {
+            debug_assert_eq!(self.transceivers.get(slot), Some(&source.transceiver));
+            debug_assert!(matches!(
+                (slot, source.kind),
+                (MediaSlot::LocalAudio(_), SourceKind::Audio(_))
+                    | (MediaSlot::LocalVideo(_), SourceKind::Video(_))
+            ));
+        }
+        if !self.bindings.is_empty() {
+            debug_assert_eq!(self.bindings.len(), self.transceivers.len());
+        }
+        for (slot, binding) in &self.bindings {
+            debug_assert!(self.transceivers.contains_key(slot));
+            debug_assert_eq!(slot, &binding.slot);
+            debug_assert_eq!(slot.kind(), binding.kind);
+            debug_assert_eq!(slot.direction(), binding.direction);
+        }
+        for (slot, receiver) in &self.receivers {
+            debug_assert_eq!(slot.direction(), agent_core::MediaDirection::ReceiveOnly);
+            let Some(binding) = self.bindings.get(slot) else {
+                debug_assert!(false, "a receiver must retain its negotiated binding");
+                continue;
+            };
+            debug_assert_eq!(
+                receiver.track.generation,
+                self.generation.get(),
+                "receiver generation must match its owner"
+            );
+            debug_assert_eq!(receiver.track.receiver, receiver.id.get());
+            debug_assert_eq!(receiver.track.mid, binding.mid);
+            debug_assert_eq!(receiver.track.media_index, binding.media_index);
+            debug_assert_eq!(
+                receiver.kind,
+                match slot.kind() {
+                    agent_core::MediaKind::Audio => rtc::MediaType::Audio,
+                    agent_core::MediaKind::Video => rtc::MediaType::Video,
+                }
+            );
+        }
     }
 
     pub fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<()> {
@@ -542,6 +595,8 @@ impl<R: rtc::SessionRuntime> NativePeer<R> {
                 let receiver = self.session.receiver(transceiver)?;
                 self.refresh_receiver(transceiver, receiver, &mut progress.observations)?;
             }
+            #[cfg(debug_assertions)]
+            self.assert_slot_ownership();
             progress.events.push(HostEvent::Rtc(RtcEvent::OfferCreated {
                 generation: self.generation,
                 offer,
@@ -687,18 +742,12 @@ impl<R: rtc::SessionRuntime> NativePeer<R> {
             track: value.track.clone(),
         });
         self.receivers.insert(slot, value);
+        #[cfg(debug_assertions)]
+        self.assert_slot_ownership();
         Ok(())
     }
 
-    #[cfg(feature = "sim")]
-    pub fn media_indices(&self) -> BTreeMap<MediaSlot, u32> {
-        self.bindings
-            .iter()
-            .map(|(slot, binding)| (slot.clone(), binding.media_index))
-            .collect()
-    }
-
-    #[cfg(test)]
+    #[cfg(any(test, debug_assertions))]
     pub fn source_identity(&self, slot: &MediaSlot) -> Option<SourceIdentity> {
         self.sources
             .get(slot)
@@ -990,6 +1039,20 @@ mod tests {
         assert_eq!(resources.slots.len(), 4);
         assert_eq!(peer.sources.len(), 2);
         assert_eq!(peer.receivers.len(), 2);
+        #[cfg(debug_assertions)]
+        {
+            let remote = MediaSlot::RemoteVideo(0);
+            let generation = peer.receivers[&remote].track.generation;
+            peer.receivers.get_mut(&remote).unwrap().track.generation = 0;
+            let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                peer.assert_slot_ownership();
+            }));
+            peer.receivers.get_mut(&remote).unwrap().track.generation = generation;
+            assert!(
+                rejected.is_err(),
+                "owner must reject a foreign receiver generation"
+            );
+        }
         let local = MediaSlot::LocalVideo("v0".into());
         let old = peer.source_identity(&local).unwrap();
         let before = peer

@@ -16,8 +16,12 @@ use turmoil::net::UdpSocket;
 
 type ReuseportKey = (IpAddr, SocketAddr);
 
+struct WrongOwnerInjection {
+    source: IpAddr,
+    applied: tokio::sync::oneshot::Sender<()>,
+}
+
 thread_local! {
-    static WRONG_OWNER_INJECTIONS_CONSUMED: Cell<u64> = const { Cell::new(0) };
     /// Reuseport groups already bound on this host, so a second bind to the
     /// same address joins one instead of failing.
     ///
@@ -31,21 +35,17 @@ thread_local! {
     clippy::disallowed_types,
     reason = "one-shot simulator control must cross turmoil host threads; it is not shard state"
 )]
-fn wrong_owner_injection_state() -> &'static Mutex<Option<IpAddr>> {
-    static STATE: OnceLock<Mutex<Option<IpAddr>>> = OnceLock::new();
+fn wrong_owner_injection_state() -> &'static Mutex<Option<WrongOwnerInjection>> {
+    static STATE: OnceLock<Mutex<Option<WrongOwnerInjection>>> = OnceLock::new();
     STATE.get_or_init(|| Mutex::new(None))
-}
-
-pub fn wrong_owner_injections_consumed() -> u64 {
-    WRONG_OWNER_INJECTIONS_CONSUMED.with(Cell::get)
 }
 
 fn wrong_owner_injection_state_enabled() -> Option<IpAddr> {
     // A poisoned lock means a test thread panicked while holding it; that test
     // is already failing, and steering must not take the process down with it.
     match wrong_owner_injection_state().lock() {
-        Ok(state) => *state,
-        Err(poisoned) => *poisoned.into_inner(),
+        Ok(state) => state.as_ref().map(|request| request.source),
+        Err(poisoned) => poisoned.into_inner().as_ref().map(|request| request.source),
     }
 }
 
@@ -194,17 +194,24 @@ impl SimSteering {
         // performs. Naming the route is also what makes the diversion land
         // somewhere that is definitely not the owner, rather than one shard
         // over from whatever the hash happened to pick.
+        let mut applied = None;
         if members > 1
             && let Some(owner) = route_owner(&payload)
             && (self.wrong_owner_injection.get()
                 || wrong_owner_injection_state_enabled().is_some_and(|source| source == src.ip()))
         {
-            WRONG_OWNER_INJECTIONS_CONSUMED.with(|count| count.set(count.get().saturating_add(1)));
             self.wrong_owner_injection.set(false);
-            match wrong_owner_injection_state().lock() {
-                Ok(mut state) => *state = None,
-                Err(poisoned) => *poisoned.into_inner() = None,
+            let mut pending = match wrong_owner_injection_state().lock() {
+                Ok(state) => state,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if pending
+                .as_ref()
+                .is_some_and(|request| request.source == src.ip())
+            {
+                applied = pending.take().map(|request| request.applied);
             }
+            drop(pending);
             idx = usize::from(owner)
                 .saturating_add(1)
                 .checked_rem(members)
@@ -235,6 +242,9 @@ impl SimSteering {
         // RefCell as soon as it runs.
         drop(inboxes);
         ready.notify_one();
+        if let Some(applied) = applied {
+            let _ = applied.send(());
+        }
     }
 }
 
@@ -287,11 +297,18 @@ fn route_owner(payload: &[u8]) -> Option<u16> {
     )
 }
 
-pub fn set_wrong_owner_injection(source: IpAddr) {
-    match wrong_owner_injection_state().lock() {
-        Ok(mut state) => *state = Some(source),
-        Err(poisoned) => *poisoned.into_inner() = Some(source),
-    }
+pub fn set_wrong_owner_injection(source: IpAddr) -> tokio::sync::oneshot::Receiver<()> {
+    let (applied, receipt) = tokio::sync::oneshot::channel();
+    let mut pending = match wrong_owner_injection_state().lock() {
+        Ok(state) => state,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    assert!(
+        pending
+            .replace(WrongOwnerInjection { source, applied })
+            .is_none()
+    );
+    receipt
 }
 
 struct SimFlowLookup<'a>(&'a RefCell<FlowTable>);
@@ -663,13 +680,19 @@ mod tests {
     #[test]
     fn wrong_owner_injection_lands_on_a_shard_that_does_not_own_the_route() {
         let steering = new_steering(4);
-        steering.set_wrong_owner_injection(true);
+        let source: SocketAddr = "203.0.113.254:49999".parse().unwrap();
+        let mut receipt = set_wrong_owner_injection(source.ip());
+        assert!(matches!(
+            receipt.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
         let owner = 2u16;
         let received_at = ReceiveTime {
             monotonic: tokio::time::Instant::now() - std::time::Duration::from_secs(1),
             wall: std::time::UNIX_EPOCH,
         };
-        steering.deliver(addr(1024), dst_addr(), bootstrap_for(owner, 7), received_at);
+        steering.deliver(source, dst_addr(), bootstrap_for(owner, 7), received_at);
+        assert_eq!(receipt.try_recv(), Ok(()));
 
         let inboxes = steering.inboxes.borrow();
         let landed = inboxes

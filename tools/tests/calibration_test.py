@@ -169,7 +169,7 @@ class CalibrationContract(unittest.TestCase):
             external.write_text("not an owned artifact")
             args = argparse.Namespace(binary="fake-libtest", candidate=str(candidate), artifacts_dir=None, show_output=False,
                 replay_bundle=None, mode="all", filter="tests::calibration::local_fanout", exact=True,
-                skip=[], run_skipped=False, seeds=1, from_seed=1, jobs=1, discovery_timeout=30, case_timeout=120)
+                skip=[], run_skipped=False, seeds=1, from_seed=1, jobs=1, discovery_timeout=30, case_timeout=120, history_search="off")
             bundle = runner.Bundle(args)
             bundle.prepare(args)
 
@@ -201,7 +201,7 @@ class CalibrationContract(unittest.TestCase):
             root = Path(temp)
             candidate = root / "candidate"
             candidate.write_text("STABLE_SIM_REVISION " + "a" * 40 + "\nSTABLE_SIM_DIRTY false\nSTABLE_SIM_FINGERPRINT " + "b" * 64 + "\n")
-            args = argparse.Namespace(candidate=str(candidate), artifacts_dir=None, replay_bundle=None, mode="all", filter="tests::calibration::local_fanout", exact=True, skip=[], run_skipped=False, seeds=1, from_seed=1, jobs=1, discovery_timeout=30, case_timeout=120)
+            args = argparse.Namespace(candidate=str(candidate), artifacts_dir=None, replay_bundle=None, mode="all", filter="tests::calibration::local_fanout", exact=True, skip=[], run_skipped=False, seeds=1, from_seed=1, jobs=1, discovery_timeout=30, case_timeout=120, history_search="off")
             identity = {"id": "local-fanout", "binary_sha256": "exact-binary", "transform": "exact-transform"}
             bundle = CALIBRATE.CalibrationBundle(args, identity)
             bundle.prepare(args)
@@ -219,7 +219,9 @@ class CalibrationContract(unittest.TestCase):
             args.replay_bundle = None
             ordinary = runner.Bundle(args)
             ordinary.prepare(args)
-            self.assertEqual(json.loads((ordinary.root / "replay.json").read_text())["version"], 1)
+            ordinary_replay = json.loads((ordinary.root / "replay.json").read_text())
+            self.assertEqual(ordinary_replay["version"], 1)
+            self.assertEqual(ordinary_replay["selection"]["history_search"], "off")
 
 
 if __name__ == "__main__":

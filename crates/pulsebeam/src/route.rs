@@ -594,22 +594,6 @@ const ROUTE_TABLE_PREALLOCATED_SLOTS: usize = 1 << 14;
 const REVERSE_DEDUP_CAPACITY: usize = 32;
 
 impl RouteRuntime {
-    #[cfg(feature = "sim")]
-    pub(crate) fn observation(&self) -> Vec<(NodeRouteAddress, RouteAction)> {
-        self.slots
-            .iter()
-            .enumerate()
-            .filter_map(|(slot, entry)| {
-                let entry = entry.as_ref()?;
-                let slot = u32::try_from(slot).ok()?;
-                Some((
-                    NodeRouteAddress::new(RouteId::new(self.shard_id, slot), entry.epoch),
-                    entry.action,
-                ))
-            })
-            .collect()
-    }
-
     pub fn new(shard_id: ShardId) -> Self {
         Self {
             shard_id,

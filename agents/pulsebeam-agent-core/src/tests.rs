@@ -336,6 +336,14 @@ fn subscriber(topic: &str, mode: TopicMode) -> TopicSubscriber {
 fn connect_with_topics(
     registrations: TopicRegistrations,
 ) -> (Agent, Generation, ChannelId, BTreeMap<String, ChannelId>) {
+    connect_with_topic_seed(registrations, true, &mut Vec::new())
+}
+
+fn connect_with_topic_seed(
+    registrations: TopicRegistrations,
+    complete_seed: bool,
+    timers: &mut Vec<(TimerId, Duration)>,
+) -> (Agent, Generation, ChannelId, BTreeMap<String, ChannelId>) {
     let mut agent = Agent::new(config()).unwrap();
     let mut state = desired(1);
     let has_ordered_subscriber = registrations
@@ -410,24 +418,52 @@ fn connect_with_topics(
             }))
             .unwrap();
     }
-    let signaling = match next_effect(&mut agent) {
-        Effect::DataChannel(DataChannelEffect::Send {
-            operation, channel, ..
-        }) => {
-            assert_eq!(channel, signal);
-            operation
-        }
-        effect => panic!("expected signaling intent, got {effect:?}"),
-    };
-    acknowledge_send(&mut agent, generation, signal, signaling);
-    if has_ordered_subscriber {
-        assert!(matches!(
-            next_effect(&mut agent),
-            Effect::Timer(TimerEffect::Schedule { .. })
-        ));
-    }
-    inject_topic_catalog(&mut agent, generation, signal, &registrations, 1, "first");
+    let mut seeds = Vec::new();
     while let Some(effect) = agent.next_effect() {
+        match effect {
+            Effect::DataChannel(DataChannelEffect::Send {
+                operation,
+                channel,
+                payload,
+                ..
+            }) => {
+                assert_eq!(channel, signal);
+                if let Some(v1::client_message::Payload::SubscriptionSeed(seed)) =
+                    pulsebeam_proto::codec::decode_client(&payload)
+                        .unwrap()
+                        .payload
+                {
+                    seeds.push(seed.seed_id);
+                }
+                acknowledge_send(&mut agent, generation, signal, operation);
+            }
+            Effect::Timer(TimerEffect::Schedule { timer, after }) => timers.push((timer, after)),
+            effect => panic!("unexpected activation effect: {effect:?}"),
+        }
+    }
+    assert_eq!(!seeds.is_empty(), has_ordered_subscriber);
+    inject_topic_catalog(&mut agent, generation, signal, &registrations, 1, "first");
+    for seed_id in seeds.into_iter().filter(|_| complete_seed) {
+        agent
+            .handle(HostEvent::DataChannel(DataChannelEvent::Message {
+                generation,
+                channel: signal,
+                payload: pulsebeam_proto::codec::encode_server(&v1::ServerMessage {
+                    payload: Some(v1::server_message::Payload::SubscriptionSeedComplete(
+                        v1::SubscriptionSeedComplete {
+                            seed_id,
+                            catalog_revision: 1,
+                        },
+                    )),
+                })
+                .unwrap(),
+            }))
+            .unwrap();
+    }
+    while let Some(effect) = agent.next_effect() {
+        if matches!(effect, Effect::Timer(TimerEffect::Cancel { .. })) {
+            continue;
+        }
         let Effect::DataChannel(DataChannelEffect::Send {
             operation,
             channel,
@@ -713,7 +749,8 @@ fn decode_intent(payload: &[u8]) -> v1::Intent {
     let message = pulsebeam_proto::codec::decode_client(payload).unwrap();
     match message.payload.unwrap() {
         client_message::Payload::Intent(intent) => intent,
-        client_message::Payload::RenewAuthorization(_) => panic!("expected media intent"),
+        client_message::Payload::RenewAuthorization(_)
+        | client_message::Payload::SubscriptionSeed(_) => panic!("expected media intent"),
     }
 }
 
@@ -766,6 +803,50 @@ fn disconnected_credential_update_is_used_for_next_http_admission() {
         header.name == "Authorization" && header.value == "Bearer replacement-token"
     }));
     assert!(!format!("{request:?}").contains("replacement-token"));
+}
+
+#[test]
+fn unsupported_intent_is_nonfatal_without_advancing_accepted_state() {
+    for (fatal, intent_revision, valid) in [
+        (false, Some(2), true),
+        (true, Some(2), false),
+        (false, None, false),
+    ] {
+        let (mut agent, generation, channel, send) = connected_agent();
+        acknowledge_send(&mut agent, generation, channel, send);
+        drain_notifications(&mut agent);
+        let before = agent.snapshot().clone();
+        let result = agent.handle(HostEvent::DataChannel(DataChannelEvent::Message {
+            generation,
+            channel,
+            payload: server_payload(server_message::Payload::Error(v1::Error {
+                code: v1::ErrorCode::UnsupportedIntent.into(),
+                message: "unsupported receive policy".into(),
+                fatal,
+                intent_revision,
+            })),
+        }));
+        assert_eq!(result.is_ok(), valid);
+        assert_eq!(
+            agent.snapshot().accepted_intent_revision,
+            before.accepted_intent_revision
+        );
+        assert_eq!(agent.snapshot().audio_mapping, before.audio_mapping);
+        if valid {
+            assert_eq!(agent.snapshot().connection, before.connection);
+            assert_eq!(agent.snapshot().generation, before.generation);
+            assert!(
+                drain_notifications(&mut agent).contains(&Notification::ServerError(
+                    "unsupported receive policy".into()
+                ))
+            );
+        } else {
+            assert_eq!(
+                agent.snapshot().connection,
+                ConnectionState::TerminalFailure
+            );
+        }
+    }
 }
 
 #[test]
@@ -2555,78 +2636,30 @@ fn complete_intent_retracts_omitted_state_and_allows_per_track_playout_changes()
 }
 
 #[test]
-fn simulation_successful_wire_revision_is_not_a_queued_or_failed_send() {
+fn pending_signaling_coalesces_superseded_state_and_fences_retired_completion() {
     let (mut agent, generation, cid, first_send) = connected_agent();
-    assert_eq!(
-        agent.simulation_last_successfully_sent_wire_revision(),
-        None
-    );
-    let mut replacement = desired(2);
-    replacement.video[0].height = 360;
-    agent
-        .command(AgentCommand::ReplaceDesired(replacement))
-        .unwrap();
-    assert_eq!(
-        agent.simulation_last_successfully_sent_wire_revision(),
-        None
-    );
+    for (revision, height) in [(2, 360), (3, 1080)] {
+        let mut replacement = desired(revision);
+        replacement.video[0].height = height;
+        agent
+            .command(AgentCommand::ReplaceDesired(replacement))
+            .unwrap();
+        assert!(agent.next_effect().is_none());
+    }
     acknowledge_send(&mut agent, generation, cid, first_send);
-    assert_eq!(
-        agent.simulation_last_successfully_sent_wire_revision(),
-        Some(1)
-    );
-    let second_send = match next_effect(&mut agent) {
+    let (operation, intent) = match next_effect(&mut agent) {
         Effect::DataChannel(DataChannelEffect::Send {
             operation, payload, ..
-        }) => {
-            assert_eq!(decode_intent(&payload).revision, 2);
-            operation
-        }
-        effect => panic!("expected queued successor, got {effect:?}"),
-    };
-    let mut latest = desired(3);
-    latest.video[0].height = 720;
-    agent.command(AgentCommand::ReplaceDesired(latest)).unwrap();
-    assert_eq!(
-        agent.simulation_last_successfully_sent_wire_revision(),
-        Some(1)
-    );
-    agent
-        .handle(HostEvent::DataChannel(DataChannelEvent::SendFailed {
-            operation: second_send,
-            generation,
-            channel: cid,
-            message: "full".into(),
-        }))
-        .unwrap();
-    assert_eq!(
-        agent.simulation_last_successfully_sent_wire_revision(),
-        Some(1)
-    );
-    let timer = match next_effect(&mut agent) {
-        Effect::Timer(TimerEffect::Schedule { timer, .. }) => timer,
-        effect => panic!("expected retry, got {effect:?}"),
-    };
-    agent
-        .handle(HostEvent::Timer(TimerEvent::Fired { timer }))
-        .unwrap();
-    let third_send = match next_effect(&mut agent) {
-        Effect::DataChannel(DataChannelEffect::Send {
-            operation, payload, ..
-        }) => {
-            assert_eq!(decode_intent(&payload).revision, 3);
-            operation
-        }
-        effect => panic!("expected latest retry, got {effect:?}"),
+        }) => (operation, decode_intent(&payload)),
+        effect => panic!("expected latest complete intent, got {effect:?}"),
     };
     assert_eq!(
-        agent.simulation_last_successfully_sent_wire_revision(),
-        Some(1)
-    );
-    acknowledge_send(&mut agent, generation, cid, third_send);
-    assert_eq!(
-        agent.simulation_last_successfully_sent_wire_revision(),
-        Some(3)
+        intent.receive.unwrap().video.unwrap().tracks[0]
+            .options
+            .as_ref()
+            .unwrap()
+            .height,
+        1080
     );
     agent
         .command(AgentCommand::ReplaceDesired(DesiredState {
@@ -2634,15 +2667,10 @@ fn simulation_successful_wire_revision_is_not_a_queued_or_failed_send() {
             ..DesiredState::default()
         }))
         .unwrap();
-    assert_eq!(
-        agent.simulation_last_successfully_sent_wire_revision(),
-        None
-    );
-    acknowledge_send(&mut agent, generation, cid, third_send);
-    assert_eq!(
-        agent.simulation_last_successfully_sent_wire_revision(),
-        None
-    );
+    while agent.next_effect().is_some() {}
+    acknowledge_send(&mut agent, generation, cid, operation);
+    assert!(agent.next_effect().is_none());
+    assert_eq!(agent.snapshot().desired_revision, 4);
 }
 
 #[test]
@@ -2751,6 +2779,43 @@ fn topic_registrations_validate_declare_and_retract_complete_channels() {
             ValidationError::Duplicate { .. }
         ))
     ));
+}
+
+#[test]
+fn connected_subscription_bootstrap_is_bounded_and_completed_timers_are_retired() {
+    for complete in [false, true] {
+        let mut timers = Vec::new();
+        let (mut agent, generation, _, _) = connect_with_topic_seed(
+            TopicRegistrations {
+                subscribers: vec![subscriber("events", TopicMode::Ordered)],
+                ..TopicRegistrations::default()
+            },
+            complete,
+            &mut timers,
+        );
+        let timer = timers
+            .iter()
+            .find_map(|(timer, after)| (*after == Duration::from_secs(30)).then_some(*timer))
+            .expect("connected bootstrap has a bounded deadline");
+        agent
+            .handle(HostEvent::Timer(TimerEvent::Fired { timer }))
+            .unwrap();
+        assert!(agent.snapshot().terminal_failure.is_none());
+        if complete {
+            assert!(
+                agent.next_effect().is_none(),
+                "retired completion deadline cannot reset a call"
+            );
+            assert_eq!(agent.snapshot().generation, Some(generation));
+        } else {
+            assert!(
+                matches!(next_effect(&mut agent), Effect::Rtc(RtcEffect::CreateOffer { generation: next, .. }) if next != generation)
+            );
+            assert!(drain_notifications(&mut agent).iter().any(|notification|
+                matches!(notification, Notification::Failure(failure) if failure.message.contains("subscription seed"))
+            ));
+        }
+    }
 }
 
 #[test]
@@ -3853,6 +3918,25 @@ fn reconnect_starts_fresh_publications_without_old_history_or_generation_output(
             generation: old_generation,
         })
     );
+    assert!(
+        matches!(next_effect(&mut agent), Effect::Timer(TimerEffect::Schedule { after, .. }) if after == Duration::from_secs(30))
+    );
+    let (operation, seed_id) = match next_effect(&mut agent) {
+        Effect::DataChannel(DataChannelEffect::Send {
+            operation, payload, ..
+        }) => {
+            let Some(v1::client_message::Payload::SubscriptionSeed(seed)) =
+                pulsebeam_proto::codec::decode_client(&payload)
+                    .unwrap()
+                    .payload
+            else {
+                panic!("expected replacement subscription seed");
+            };
+            (operation, seed.seed_id)
+        }
+        effect => panic!("expected subscription seed, got {effect:?}"),
+    };
+    acknowledge_send(&mut agent, generation, signal, operation);
     let signaling = match next_effect(&mut agent) {
         Effect::DataChannel(DataChannelEffect::Send {
             operation, channel, ..
@@ -3863,7 +3947,6 @@ fn reconnect_starts_fresh_publications_without_old_history_or_generation_output(
         effect => panic!("expected replacement signaling intent, got {effect:?}"),
     };
     acknowledge_send(&mut agent, generation, signal, signaling);
-
     assert!(agent.next_effect().is_none());
     assert_eq!(agent.snapshot().topics.publishers[0].data_track_id, None);
     assert_eq!(agent.snapshot().topics.publishers[0].next_sequence, 0);
@@ -3878,7 +3961,22 @@ fn reconnect_starts_fresh_publications_without_old_history_or_generation_output(
         )))
     ));
     inject_topic_catalog(&mut agent, generation, signal, &registrations, 1, "second");
+    agent
+        .handle(HostEvent::DataChannel(DataChannelEvent::Message {
+            generation,
+            channel: signal,
+            payload: server_payload(v1::server_message::Payload::SubscriptionSeedComplete(
+                v1::SubscriptionSeedComplete {
+                    seed_id,
+                    catalog_revision: 1,
+                },
+            )),
+        }))
+        .unwrap();
     while let Some(effect) = agent.next_effect() {
+        if matches!(effect, Effect::Timer(TimerEffect::Cancel { .. })) {
+            continue;
+        }
         let Effect::DataChannel(DataChannelEffect::Send {
             operation, channel, ..
         }) = effect

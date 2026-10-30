@@ -95,13 +95,12 @@ struct Session {
     observed: CatalogState,
     intent_revision: u64,
     publication_bindings: BTreeMap<String, String>,
-    #[cfg(any(test, feature = "sim"))]
-    last_successfully_sent_wire_revision: Option<u64>,
     authorization_expires_at: Option<i64>,
     pending_renewal: Option<String>,
     renewal_send: Option<OperationId>,
     signaling_terminal: bool,
     signaling_channel: ChannelId,
+    seed_requests: VecDeque<wire::SubscriptionSeed>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -164,6 +163,7 @@ struct Retry {
 }
 
 struct PendingSignal {
+    seed: bool,
     operation: OperationId,
     generation: Generation,
     channel: ChannelId,
@@ -195,6 +195,7 @@ pub struct Agent {
     pending_signal: Option<PendingSignal>,
     signal_retry: Option<TimerId>,
     topic_probe: Option<TimerId>,
+    seed_timeout: Option<(TimerId, Generation)>,
     intent_dirty: bool,
     closing: Option<Closing>,
     orphaned_creates: BTreeSet<OperationId>,
@@ -225,6 +226,7 @@ impl Agent {
             pending_signal: None,
             signal_retry: None,
             topic_probe: None,
+            seed_timeout: None,
             intent_dirty: false,
             closing: None,
             orphaned_creates: BTreeSet::new(),
@@ -449,30 +451,6 @@ impl Agent {
 
     pub fn snapshot(&self) -> &Snapshot {
         &self.snapshot
-    }
-
-    #[cfg(feature = "sim")]
-    pub fn simulation_ordered_cursors(&self) -> Vec<(crate::TopicSubscriber, String, u64)> {
-        self.topics.simulation_ordered_cursors()
-    }
-
-    #[cfg(feature = "sim")]
-    pub fn simulation_sent_intent_revision(&self) -> Option<u64> {
-        if self.intent_dirty || self.pending_signal.is_some() || self.signal_retry.is_some() {
-            return None;
-        }
-        self.active.as_ref().map(|active| active.intent_revision)
-    }
-
-    /// Last intent accepted for transmission by the native data-channel host.
-    /// Unlike the convergence observation, dirty/pending/retrying successors
-    /// do not hide an earlier successful send. Never expose a merely queued
-    /// revision as proof of transmission. This state is generation-local.
-    #[cfg(any(test, feature = "sim"))]
-    pub fn simulation_last_successfully_sent_wire_revision(&self) -> Option<u64> {
-        self.active
-            .as_ref()
-            .and_then(|active| active.last_successfully_sent_wire_revision)
     }
 
     /// Whether accepted desired state publishes this local sender slot.
@@ -749,6 +727,9 @@ impl Agent {
                 &mut self.notifications,
             );
             self.schedule_topic_probe();
+            if !self.topics.seeding() {
+                self.cancel_seed_timeout();
+            }
         }
         if intent_changed {
             self.intent_dirty = true;
@@ -940,6 +921,7 @@ impl Agent {
     }
 
     fn fence_signaling(&mut self, generation: Generation) {
+        self.cancel_seed_timeout();
         if let Some(active) = self.active.as_mut() {
             active.signaling_terminal = true;
         }
@@ -1097,6 +1079,16 @@ impl Agent {
                 } else if self.signal_retry == Some(timer) {
                     self.signal_retry = None;
                     self.send_intent_if_ready();
+                } else if let Some((pending, generation)) = self.seed_timeout
+                    && pending == timer
+                {
+                    self.seed_timeout = None;
+                    if self.topics.seeding() {
+                        self.handle_rtc(RtcEvent::Failed {
+                            generation,
+                            message: "subscription seed did not complete within 30 seconds".into(),
+                        })?;
+                    }
                 } else if self.topic_probe == Some(timer) {
                     self.topic_probe = None;
                     if self.active.is_some() && self.desired.connected {
@@ -1320,6 +1312,33 @@ impl Agent {
                             self.intent_dirty = true;
                         }
                     }
+                    ServerOutput::SeedComplete(completion) => {
+                        if self
+                            .topics
+                            .complete_seed(generation, &completion, active.observed.revision)
+                            .is_err()
+                        {
+                            self.fail_terminal(Failure::protocol(
+                                "invalid subscription seed completion",
+                            ));
+                            return Err(
+                                SignalingError::Invalid("subscription seed completion").into()
+                            );
+                        }
+                        self.topics.sync_catalog(
+                            generation,
+                            &active.observed,
+                            &mut self.snapshot,
+                            &mut self.notifications,
+                            &mut self.ids,
+                            &mut self.effects,
+                        );
+                        self.topics
+                            .probe_remote_publishers(&mut self.ids, &mut self.effects);
+                        if !self.topics.seeding() {
+                            self.cancel_seed_timeout();
+                        }
+                    }
                     ServerOutput::Authorization(expires_at) => {
                         if active.pending_renewal.is_some()
                             && active
@@ -1375,6 +1394,7 @@ impl Agent {
                         active.signaling_terminal = true;
                         self.pending_signal = None;
                         self.cancel_signal_retry();
+                        self.cancel_seed_timeout();
                         if self.desired.connected && self.attempt.is_none() {
                             self.topics.unbind_generation(
                                 generation,
@@ -1413,13 +1433,15 @@ impl Agent {
                         operation.get(),
                         channel.get(),
                     );
-                    #[cfg(any(test, feature = "sim"))]
-                    if let Some(active) = self.active.as_mut().filter(|active| {
-                        active.generation == generation && active.signaling_channel == channel
-                    }) {
-                        active.last_successfully_sent_wire_revision = Some(active.intent_revision);
+                    let seed = self
+                        .pending_signal
+                        .take()
+                        .is_some_and(|pending| pending.seed);
+                    if let Some(active) = self.active.as_mut()
+                        && seed
+                    {
+                        active.seed_requests.pop_front();
                     }
-                    self.pending_signal = None;
                     self.send_intent_if_ready();
                 } else {
                     let _ = self.topics.handle_sent(
@@ -1532,13 +1554,12 @@ impl Agent {
             observed: CatalogState::default(),
             intent_revision: 0,
             publication_bindings: BTreeMap::new(),
-            #[cfg(any(test, feature = "sim"))]
-            last_successfully_sent_wire_revision: None,
             authorization_expires_at: None,
             pending_renewal: None,
             renewal_send: None,
             signaling_terminal: false,
             signaling_channel: resources.signaling_channel,
+            seed_requests: VecDeque::new(),
         }) && previous.generation != attempt.generation
         {
             self.effects.push_back(Effect::Rtc(RtcEffect::Close {
@@ -1573,6 +1594,18 @@ impl Agent {
             );
             self.topics
                 .probe_remote_publishers(&mut self.ids, &mut self.effects);
+        }
+        if let Some(active) = self.active.as_mut() {
+            active.seed_requests = self.topics.seed_requests().into();
+        }
+        self.cancel_seed_timeout();
+        if self.topics.seeding() {
+            let timer = self.ids.timer();
+            self.seed_timeout = Some((timer, attempt.generation));
+            self.effects.push_back(Effect::Timer(TimerEffect::Schedule {
+                timer,
+                after: Duration::from_secs(30),
+            }));
         }
         self.set_connection_state(ConnectionState::Connected);
         for payload in attempt.early_signaling {
@@ -1759,6 +1792,37 @@ impl Agent {
         if active.signaling_terminal {
             return;
         }
+        if let Some(seed) = active.seed_requests.front() {
+            let message = wire::ClientMessage {
+                payload: Some(wire::client_message::Payload::SubscriptionSeed(
+                    seed.clone(),
+                )),
+            };
+            let Ok(payload) = pulsebeam_proto::codec::encode_client(&message) else {
+                self.fail_terminal(Failure::protocol(
+                    "subscription seed exceeds signaling limit",
+                ));
+                return;
+            };
+            let operation = self.ids.operation();
+            let generation = active.generation;
+            let channel = active.signaling_channel;
+            self.effects
+                .push_back(Effect::DataChannel(DataChannelEffect::Send {
+                    operation,
+                    generation,
+                    channel,
+                    binary: true,
+                    payload,
+                }));
+            self.pending_signal = Some(PendingSignal {
+                seed: true,
+                operation,
+                generation,
+                channel,
+            });
+            return;
+        }
         let Some(revision) = active.intent_revision.checked_add(1) else {
             return;
         };
@@ -1819,6 +1883,7 @@ impl Agent {
                 payload,
             }));
         self.pending_signal = Some(PendingSignal {
+            seed: false,
             operation,
             generation,
             channel,
@@ -1862,6 +1927,13 @@ impl Agent {
         }));
     }
 
+    fn cancel_seed_timeout(&mut self) {
+        if let Some((timer, _)) = self.seed_timeout.take() {
+            self.effects
+                .push_back(Effect::Timer(TimerEffect::Cancel { timer }));
+        }
+    }
+
     fn cancel_signal_retry(&mut self) {
         if let Some(timer) = self.signal_retry.take() {
             self.effects
@@ -1870,6 +1942,7 @@ impl Agent {
     }
 
     fn begin_close(&mut self) {
+        self.cancel_seed_timeout();
         if self.closing.is_some() {
             return;
         }

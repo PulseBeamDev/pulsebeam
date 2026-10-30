@@ -35,15 +35,6 @@ impl ShardUpdateApplication {
         }
     }
 
-    #[cfg(feature = "sim")]
-    pub(crate) fn observation(&self) -> (u64, Option<u64>, usize) {
-        (
-            self.generation,
-            self.pending_update.as_ref().map(|update| update.generation),
-            self.pending_participant_effects.len(),
-        )
-    }
-
     pub(crate) fn apply(&mut self, execution: &mut ShardExecution, budget: usize) -> usize {
         debug_assert!(budget > 0);
         let mut applied = 0;

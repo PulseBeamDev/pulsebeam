@@ -4,7 +4,7 @@ use pulsebeam_testdata::QualityVideoSource;
 use std::time::Duration;
 
 #[test]
-fn crashed_publications_retire_from_every_owner_and_observer() {
+fn crashed_publications_retire_from_every_public_catalog() {
     let mut plan = vec![Step::Run {
         description: "admit all observers and negotiate every lane",
         duration: Duration::from_secs(5),
@@ -67,8 +67,8 @@ fn crashed_publications_retire_from_every_owner_and_observer() {
                 publisher: "publisher",
                 min_frames: 1,
             },
-            Step::CheckAudioQueuedFrom {
-                description: "every intended listener was queued publisher audio",
+            Step::CheckAudioCatalogFrom {
+                description: "every intended listener is assigned the publisher",
                 participant,
                 expected: &["publisher"],
             },
@@ -106,8 +106,8 @@ fn crashed_publications_retire_from_every_owner_and_observer() {
                 participant,
                 publisher: "publisher",
             },
-            Step::CheckAudioQueuedFrom {
-                description: "intentional bystanders heard no audio",
+            Step::CheckAudioCatalogFrom {
+                description: "intentional bystanders have no audio assignment",
                 participant,
                 expected: &[],
             },

@@ -309,10 +309,6 @@ fn all_topic_modes_share_a_name_without_cross_delivery_or_publisher_collapse() {
         topic: TOPIC,
         expected: 8,
     });
-    plan.push(Step::CheckCrossShardMedia {
-        description: "the real data routes cross shard ownership",
-        min_frames: 1,
-    });
     LocalNodeSim::new()
         .with_link(LinkProfile::fiber())
         .with_room(room)
@@ -673,10 +669,6 @@ fn ordered_topic_reconfiguration(publisher_first: bool) {
             expected: PREFIX,
         });
     }
-    plan.push(Step::CheckCrossShardMedia {
-        description: "Data-only agents delivered the ordered prefix across shards",
-        min_frames: 1,
-    });
     plan.extend([
         Step::Disconnect {
             description: "Retire the original publisher connection",
@@ -756,290 +748,7 @@ fn ordered_topic_reconfiguration(publisher_first: bool) {
 }
 
 #[test]
-#[ignore = "Reconnect catalog pruning loses the ordered cursor; see agents/pulsebeam-agent-core/ORDERED_RECOVERY_CHECKPOINT.md"]
 fn ordered_recovery_reports_retention_gaps_without_replaying_late_history() {
-    const RETAINED: usize = pulsebeam_agent_native::agent_core::TOPIC_HISTORY_CAPACITY;
-    const SENT: usize = RETAINED + 44;
-    static RECOVERED: [&[u8]; RETAINED + 5] = {
-        let mut values = [b"window".as_slice(); RETAINED + 5];
-        values[0] = b"first";
-        values[1] = b"lost-tail";
-        values[2] = b"later";
-        values[3] = b"live";
-        values[RETAINED + 4] = b"continued";
-        values
-    };
-    static LATE: [&[u8]; SENT + 2] = {
-        let mut values = [b"window".as_slice(); SENT + 2];
-        values[0] = b"live";
-        values[SENT + 1] = b"continued";
-        values
-    };
-    let mut plan = vec![
-        Step::DeclarePublishTopic {
-            mode: TopicMode::Ordered,
-            description: "Declare ordered publisher",
-            participant: "pub",
-            topic: "state",
-        },
-        Step::DeclareSubscribeTopic {
-            mode: TopicMode::Ordered,
-            description: "Declare subscriber A",
-            participant: "sub_a",
-            topic: "state",
-        },
-        Step::DeclareSubscribeTopic {
-            mode: TopicMode::Ordered,
-            description: "Declare subscriber B",
-            participant: "sub_b",
-            topic: "state",
-        },
-        Step::DeclareSubscribeTopic {
-            mode: TopicMode::Ordered,
-            description: "Reserve late subscriber transport topology",
-            participant: "late",
-            topic: "state",
-        },
-        Step::Run {
-            description: "Establish ordered live frontiers across worker shards",
-            duration: Duration::from_secs(3),
-        },
-        Step::PublishData {
-            mode: TopicMode::Ordered,
-            description: "Send first payload",
-            participant: "pub",
-            topic: "state",
-            data: b"first",
-        },
-        Step::WaitForDataSequence {
-            participant: "sub_a",
-            topic: "state",
-            expected: &[b"first"],
-        },
-        Step::WaitForDataSequence {
-            participant: "sub_b",
-            topic: "state",
-            expected: &[b"first"],
-        },
-        Step::SetLoss {
-            description: "Drop subscriber A's data without replacing its track",
-            participant: "sub_a",
-            loss: Loss::Independent(1.0),
-        },
-        Step::SetLoss {
-            description: "Drop subscriber B's data without replacing its track",
-            participant: "sub_b",
-            loss: Loss::Independent(1.0),
-        },
-        Step::PublishData {
-            mode: TopicMode::Ordered,
-            description: "Admit a distinct tail while both downlinks drop it",
-            participant: "pub",
-            topic: "state",
-            data: b"lost-tail",
-        },
-        Step::WaitForTopicPublisher {
-            mode: TopicMode::Ordered,
-            participant: "pub",
-            topic: "state",
-            next_sequence: 2,
-        },
-        Step::Run {
-            description: "Consume the tail's actual transport attempt under complete loss",
-            duration: Duration::from_millis(100),
-        },
-        Step::CheckDataSequence {
-            description: "The admitted tail is outstanding at subscriber A",
-            participant: "sub_a",
-            topic: "state",
-            expected: &[b"first"],
-        },
-        Step::CheckDataSequence {
-            description: "The admitted tail is outstanding at subscriber B",
-            participant: "sub_b",
-            topic: "state",
-            expected: &[b"first"],
-        },
-        Step::SetLoss {
-            description: "Restore subscriber A without replacing its publication",
-            participant: "sub_a",
-            loss: Loss::wifi(),
-        },
-        Step::SetLoss {
-            description: "Restore subscriber B without replacing its publication",
-            participant: "sub_b",
-            loss: Loss::wifi(),
-        },
-        Step::WaitForDataSequence {
-            participant: "sub_a",
-            topic: "state",
-            expected: &[b"first", b"lost-tail"],
-        },
-        Step::WaitForDataSequence {
-            participant: "sub_b",
-            topic: "state",
-            expected: &[b"first", b"lost-tail"],
-        },
-        Step::PublishData {
-            mode: TopicMode::Ordered,
-            description: "Only after tail recovery send a later payload",
-            participant: "pub",
-            topic: "state",
-            data: b"later",
-        },
-        Step::WaitForDataSequence {
-            participant: "sub_a",
-            topic: "state",
-            expected: &[b"first", b"lost-tail", b"later"],
-        },
-        Step::WaitForDataSequence {
-            participant: "sub_b",
-            topic: "state",
-            expected: &[b"first", b"lost-tail", b"later"],
-        },
-        Step::Join {
-            description: "Join after history exists",
-            participant: "late",
-        },
-        Step::WaitForOrderedSubscriber {
-            participant: "late",
-            publisher: "pub",
-            topic: "state",
-            next_sequence: 3,
-        },
-        Step::PublishData {
-            mode: TopicMode::Ordered,
-            description: "Live marker is an ordered-processing barrier after the history floor",
-            participant: "pub",
-            topic: "state",
-            data: b"live",
-        },
-        Step::WaitForDataSequence {
-            participant: "late",
-            topic: "state",
-            expected: &[b"live"],
-        },
-        Step::WaitForDataSequence {
-            participant: "sub_a",
-            topic: "state",
-            expected: &[b"first", b"lost-tail", b"later", b"live"],
-        },
-        Step::WaitForDataSequence {
-            participant: "sub_b",
-            topic: "state",
-            expected: &[b"first", b"lost-tail", b"later", b"live"],
-        },
-        Step::Run {
-            description: "Rejoined control, shard and native client state converge",
-            duration: Duration::from_secs(2),
-        },
-        Step::CheckDataSequence {
-            description: "Late receiver has only the live marker",
-            participant: "late",
-            topic: "state",
-            expected: &[b"live"],
-        },
-    ];
-    for participant in ["sub_a", "sub_b", "late"] {
-        plan.push(Step::CheckTopicIdentity {
-            description: "retained tail recovery does not report a historical gap",
-            participant,
-            topic: "state",
-            mode: TopicMode::Ordered,
-            publishers: &["pub"],
-            gap: None,
-        });
-    }
-    for participant in ["sub_a", "sub_b"] {
-        plan.push(Step::SetLoss {
-            description: "keep the same live track while falling behind retention",
-            participant,
-            loss: Loss::Independent(1.0),
-        });
-    }
-    for sequence in 0..SENT {
-        plan.push(Step::PublishData {
-            description: "advance finite production history",
-            participant: "pub",
-            topic: "state",
-            mode: TopicMode::Ordered,
-            data: b"window",
-        });
-        plan.push(Step::WaitForTopicPublisher {
-            participant: "pub",
-            topic: "state",
-            mode: TopicMode::Ordered,
-            next_sequence: u64::try_from(sequence).unwrap().saturating_add(5),
-        });
-    }
-    plan.push(Step::Run {
-        description: "consume the final impaired data attempt",
-        duration: Duration::from_millis(100),
-    });
-    for participant in ["sub_a", "sub_b"] {
-        plan.push(Step::CheckDataSequence {
-            description: "an admitted missing range was actually lost",
-            participant,
-            topic: "state",
-            expected: &[b"first", b"lost-tail", b"later", b"live"],
-        });
-        plan.push(Step::SetLoss {
-            description: "resume the same track after retained history is exhausted",
-            participant,
-            loss: Loss::wifi(),
-        });
-    }
-    for participant in ["sub_a", "sub_b"] {
-        plan.push(Step::WaitForDataSequence {
-            participant,
-            topic: "state",
-            expected: &RECOVERED[..RETAINED + 4],
-        });
-    }
-    plan.push(Step::WaitForDataSequence {
-        participant: "late",
-        topic: "state",
-        expected: &LATE[..SENT + 1],
-    });
-    plan.push(Step::PublishData {
-        description: "continue only after replayed-window recovery",
-        participant: "pub",
-        topic: "state",
-        mode: TopicMode::Ordered,
-        data: b"continued",
-    });
-    for participant in ["sub_a", "sub_b"] {
-        plan.push(Step::WaitForDataSequence {
-            participant,
-            topic: "state",
-            expected: &RECOVERED,
-        });
-        plan.push(Step::CheckTopicIdentity {
-            description: "one exact inline gap precedes increasing resumed delivery",
-            participant,
-            topic: "state",
-            mode: TopicMode::Ordered,
-            publishers: &["pub"],
-            gap: Some((4, u64::try_from(SENT + 4 - RETAINED).unwrap())),
-        });
-    }
-    plan.push(Step::WaitForDataSequence {
-        participant: "late",
-        topic: "state",
-        expected: &LATE,
-    });
-    plan.push(Step::CheckTopicIdentity {
-        description: "another subscriber's recovery floor never skips a healthy track",
-        participant: "late",
-        topic: "state",
-        mode: TopicMode::Ordered,
-        publishers: &["pub"],
-        gap: None,
-    });
-    plan.push(Step::Run {
-        description: "recovered control and shard state converge",
-        duration: Duration::from_millis(500),
-    });
     LocalNodeSim::new()
         .with_udp_only()
         .with_room(
@@ -1049,7 +758,38 @@ fn ordered_recovery_reports_retention_gaps_without_replaying_late_history() {
                 .with_participant(Participant::data_participant("sub_b"))
                 .with_participant(Participant::data_participant("late").starts_disconnected()),
         )
-        .run(plan);
+        .run(vec![
+            Step::DeclarePublishTopic {
+                mode: TopicMode::Ordered,
+                description: "Declare ordered publisher",
+                participant: "pub",
+                topic: "state",
+            },
+            Step::DeclareSubscribeTopic {
+                mode: TopicMode::Ordered,
+                description: "Declare subscriber A",
+                participant: "sub_a",
+                topic: "state",
+            },
+            Step::DeclareSubscribeTopic {
+                mode: TopicMode::Ordered,
+                description: "Declare subscriber B",
+                participant: "sub_b",
+                topic: "state",
+            },
+            Step::DeclareSubscribeTopic {
+                mode: TopicMode::Ordered,
+                description: "Reserve late subscriber transport topology",
+                participant: "late",
+                topic: "state",
+            },
+            Step::OrderedTopicRecovery {
+                publisher: "pub",
+                topic: "state",
+                recovering: ["sub_a", "sub_b"],
+                late: "late",
+            },
+        ]);
 }
 
 /// Data crossing a shard boundary.
@@ -1108,19 +848,12 @@ fn cross_shard_data_channel_forwarding_test() {
                 topic: "xshard_topic",
                 expected: b"hello-across-shards",
             },
-            // Both, not either. Which shard each subscriber lands on is decided
-            // by the 4-tuple hash, so asserting on one of them passes whenever
-            // that one happens to win - and a fanout serving only the first
-            // subscriber on a shard looked healthy for exactly that reason.
+            // Both recipients must receive: success on one route cannot prove fanout.
             Step::CheckDataReceived {
                 description: "So did the second subscriber, wherever it landed",
                 participant: "sub2",
                 topic: "xshard_topic",
                 expected: b"hello-across-shards",
-            },
-            Step::CheckCrossShardMedia {
-                description: "the payload genuinely crossed a shard boundary",
-                min_frames: 1,
             },
         ]);
 }

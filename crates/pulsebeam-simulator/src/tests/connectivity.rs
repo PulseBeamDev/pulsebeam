@@ -113,7 +113,6 @@ fn owned_publication_relabel_uses_a_fresh_wire_session() {
                 description: "initial owned publication reaches Bob",
                 participant: "bob",
                 publishers: &["alice"],
-                min_quality: 1,
                 timeout: Duration::from_secs(20),
             },
             Step::RelabelOwnedVideo {
@@ -264,24 +263,42 @@ fn controller_stall_keeps_established_media_alive() {
                 description: "establish media before the controller stall",
                 duration: Duration::from_secs(5),
             },
-            Step::StallController {
+            Step::CheckVideoDecodedFromInterval {
+                description: "The source decodes before the controller hold",
+                participant: "subscriber",
+                publisher: "publisher",
+                min_frames: 1,
+                min_resolution: (1, 180),
+            },
+            Step::BeginControllerStall {
                 duration: Duration::from_secs(5),
+            },
+            Step::Run {
+                description: "measure established source service inside the held interval",
+                duration: Duration::from_secs(1),
+            },
+            Step::CheckVideoDecodedFromInterval {
+                description: "Fresh source video decodes while control is held",
+                participant: "subscriber",
+                publisher: "publisher",
+                min_frames: 1,
+                min_resolution: (1, 180),
             },
             Step::CheckRxBytesInterval {
                 description: "media continues while control is stalled",
                 participant: "subscriber",
                 min_bytes: 1,
             },
+            Step::WaitForControllerStallEnd,
         ]);
-    assert_eq!(pulsebeam::sim_metrics::controller_stalls_consumed(), 1);
 }
 
-/// A datagram delivered to a shard that does not own its route reaches the
-/// owner instead of being dropped.
+/// A foreign-shard bootstrap supports readmission and fresh source delivery.
+/// Exact packet forwarding is protected in the shard owner's unit tests.
 ///
 /// Replays a failing run with `PULSEBEAM_SIM_SEED=<seed>` from the test output.
 #[test]
-fn wrong_owner_forwards_and_media_continues() {
+fn foreign_shard_bootstrap_recovers_to_fresh_source_video() {
     LocalNodeSim::new()
         .with_room(cross_shard_media_room())
         .run(vec![
@@ -289,57 +306,30 @@ fn wrong_owner_forwards_and_media_continues() {
                 description: "establish the media path",
                 duration: Duration::from_secs(5),
             },
-            Step::CheckRoutingCounterSettles {
-                description: "steering has pinned the flows, so forwarding has stopped",
-                name: "shard_wrong_owner_forward",
-                over: Duration::from_secs(2),
+            Step::Run {
+                description: "measure established source delivery before readmission",
+                duration: Duration::from_secs(2),
             },
-            Step::SendToWrongShard {
-                description: "inject one datagram into a foreign shard",
+            Step::CheckVideoDecodedFromInterval {
+                description: "The source independently decodes before the forced bootstrap",
+                participant: "subscriber",
+                publisher: "publisher",
+                min_frames: 1,
+                min_resolution: (1, 180),
+            },
+            Step::ReconnectThroughForeignShard {
+                description: "redirect one bootstrap datagram and establish a new source incarnation",
                 participant: "publisher",
             },
-            Step::CheckRoutingCounterAtLeast {
-                description: "the foreign datagram is forwarded to its owner",
-                name: "shard_wrong_owner_forward",
-                min: 1,
+            Step::WaitForVideoAtResolution {
+                description: "The readmitted source independently decodes after foreign-shard bootstrap",
+                participant: "subscriber",
+                publishers: &["publisher"],
+                min_resolution: (1, 180),
+                timeout: Duration::from_secs(30),
             },
             Step::CheckRxBytes {
-                description: "the participant's own media remains unaffected",
-                participant: "subscriber",
-                min_bytes: 1,
-            },
-        ]);
-    assert_eq!(pulsebeam_runtime::net::wrong_owner_injections_consumed(), 1);
-}
-
-/// Cross-shard forwarding is a bootstrap cost, not a steady-state one.
-///
-/// Steering is a cache: a miss lands on whatever the kernel's tuple hash picked
-/// and userspace forwards it to the route's owner. Once the flow authenticates,
-/// control pins it and the forwarding stops. Nothing else notices if that
-/// pinning never happens — media still arrives, just across a core boundary on
-/// every packet — so the property worth holding is that the rate reaches zero.
-#[test]
-fn steering_stops_cross_shard_forwarding_once_flows_authenticate() {
-    LocalNodeSim::new()
-        .with_room(cross_shard_media_room())
-        .run(vec![
-            Step::Run {
-                description: "let every flow authenticate",
-                duration: Duration::from_secs(8),
-            },
-            Step::CheckRoutingCounterAtLeast {
-                description: "the source shard receives the owner authentication acknowledgment",
-                name: "demux_flow_authenticated",
-                min: 1,
-            },
-            Step::CheckRoutingCounterSettles {
-                description: "no packet crosses a shard boundary at steady state",
-                name: "shard_wrong_owner_forward",
-                over: Duration::from_secs(3),
-            },
-            Step::CheckRxBytesInterval {
-                description: "and media is still flowing while it does not",
+                description: "received traffic remains nonempty after readmission",
                 participant: "subscriber",
                 min_bytes: 1,
             },
@@ -363,23 +353,18 @@ fn failed_materialization_does_not_connect_the_participant() {
             Step::FailNextMaterialization {
                 description: "fail the next participant materialization",
             },
-            Step::Join {
-                description: "attempt the failed materialization",
+            Step::JoinOnce {
+                description: "attempt admission without automatic retry after failure",
                 participant: "subscriber",
             },
             Step::Run {
                 description: "allow the failed command to drain",
                 duration: Duration::from_secs(2),
             },
-            Step::CheckRoutingCounter {
-                description: "the injected failure was consumed",
-                name: "materialization_failed",
-                exact: 1,
-            },
-            Step::CheckRoutingCounter {
-                description: "failed materialization leaves no participant key behind",
-                name: "materialization_orphan",
-                exact: 0,
+            Step::CheckAdmissionFailed {
+                description: "the application receives one failed admission without an identity",
+                participant: "subscriber",
+                expected: 1,
             },
             Step::Reconnect {
                 description: "Retry admission after the one-shot materialization failure",
@@ -397,6 +382,13 @@ fn failed_materialization_does_not_connect_the_participant() {
                 description: "Measure media within the fresh admitted generation",
                 duration: Duration::from_secs(2),
             },
+            Step::CheckVideoDecodedFromInterval {
+                description: "Fresh source video decodes after the explicit admission retry",
+                participant: "subscriber",
+                publisher: "publisher",
+                min_frames: 1,
+                min_resolution: (1, 180),
+            },
             Step::CheckRxBytesInterval {
                 description: "Fresh media reaches the recovered subscriber",
                 participant: "subscriber",
@@ -407,7 +399,7 @@ fn failed_materialization_does_not_connect_the_participant() {
 
 /// Replays a failing run with `PULSEBEAM_SIM_SEED=<seed>` from the test output.
 #[test]
-fn track_observation_is_not_forwarded_before_plan() {
+fn track_publication_converges_to_decoded_delivery() {
     LocalNodeSim::new()
         .with_room(cross_shard_media_room())
         .run(vec![
@@ -415,28 +407,14 @@ fn track_observation_is_not_forwarded_before_plan() {
                 description: "settle observation, publication, and plan in order",
                 duration: Duration::from_secs(8),
             },
-            Step::CheckMediaRouted {
-                description: "steady-state forwarding uses a compiled plan",
+            Step::CheckVideoDecodedFromInterval {
+                description: "the current publisher reaches actual decoded video after publication and plan startup",
                 participant: "subscriber",
+                publisher: "publisher",
+                min_frames: 1,
+                min_resolution: (1, 1),
             },
         ]);
-
-    for (lane, stage, origin) in [
-        ("video", "plan", "local"),
-        ("video", "plan", "remote"),
-        ("audio", "plan", "local"),
-        ("audio", "plan", "remote"),
-        ("data", "plan", "local"),
-        ("data", "plan", "remote"),
-        ("reliable", "plan", "local"),
-        ("reliable", "plan", "remote"),
-    ] {
-        assert_eq!(
-            pulsebeam::sim_metrics::routing_drop(lane, stage, origin),
-            0,
-            "steady-state routing must not observe {lane} before the {stage}"
-        );
-    }
 }
 
 #[test]
@@ -953,9 +931,19 @@ fn cross_shard_video_is_forwarded_decodably_test() {
                 description: "Alice publishes; Bob and Carol subscribe from other shards",
                 duration: Duration::from_secs(20),
             },
-            Step::CheckCrossShardMedia {
-                description: "media genuinely crossed a shard boundary",
-                min_frames: 100,
+            Step::CheckVideoDecodedFromInterval {
+                description: "Bob independently decodes Alice across owner shards",
+                participant: "bob",
+                publisher: "alice",
+                min_frames: 1,
+                min_resolution: (1, 180),
+            },
+            Step::CheckVideoDecodedFromInterval {
+                description: "Carol independently decodes Alice over her own route",
+                participant: "carol",
+                publisher: "alice",
+                min_frames: 1,
+                min_resolution: (1, 180),
             },
             Step::CheckVideoQuality {
                 description: "Bob decodes a stream that crossed a shard boundary",
@@ -1037,10 +1025,6 @@ fn a_rejoining_publisher_is_shown_to_an_existing_viewer_test() {
                 },
                 same_receiver: false,
             },
-            Step::CheckMediaRouted {
-                description: "And nothing was thrown away on the way in",
-                participant: "viewer",
-            },
         ]);
 }
 
@@ -1088,10 +1072,6 @@ fn a_dropped_connection_recovers_as_the_same_participant_test() {
                 description: "And the viewer can see her again",
                 participant: "viewer",
                 quality: VideoQuality::min_frames(50).allow_gaps(3),
-            },
-            Step::CheckMediaRouted {
-                description: "The recovered publication is routed through the SFU",
-                participant: "viewer",
             },
         ]);
 }
@@ -1160,10 +1140,6 @@ fn native_video_reacquires_sources_and_observers_after_reconnect_test() {
                 dimensions: (320, 180),
                 min_fresh_frames: 50,
             },
-            Step::CheckMediaRouted {
-                description: "The restored native media still traverses the SFU",
-                participant: "viewer",
-            },
         ]);
 }
 
@@ -1208,10 +1184,6 @@ fn a_tcp_connection_recovers_as_the_same_participant_test() {
                 participant: "viewer",
                 quality: VideoQuality::min_frames(50).allow_gaps(3),
             },
-            Step::CheckMediaRouted {
-                description: "TCP recovery routes media through the SFU",
-                participant: "viewer",
-            },
         ]);
 }
 
@@ -1255,10 +1227,6 @@ fn an_ipv6_connection_recovers_as_the_same_participant_test() {
                 description: "The viewer sees Alice again over IPv6",
                 participant: "viewer",
                 quality: VideoQuality::min_frames(50).allow_gaps(3),
-            },
-            Step::CheckMediaRouted {
-                description: "IPv6 recovery routes media through the SFU",
-                participant: "viewer",
             },
         ]);
 }

@@ -1,0 +1,14 @@
+pulsebeam-history-v2
+seed 3735928559
+case tests::histories::required_intent_histories
+claim materialization
+op declare-data ordered
+op send-data ordered 0
+op fail-admission
+op replace-data ordered
+op send-data ordered 1
+op retry
+op join 2
+op crash 2
+op join 0
+op readmit 2

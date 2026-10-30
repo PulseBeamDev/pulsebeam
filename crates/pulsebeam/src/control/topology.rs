@@ -81,44 +81,6 @@ pub(crate) struct TrackTopology {
 }
 
 impl TrackTopology {
-    #[cfg(feature = "sim")]
-    pub(crate) fn observation(
-        &self,
-    ) -> (
-        Vec<crate::sim_observation::TrackObservation>,
-        Vec<crate::sim_observation::SubscriptionObservation>,
-    ) {
-        let tracks = self
-            .rooms
-            .values()
-            .flat_map(|room| {
-                room.tracks.values().map(|publication| {
-                    let id = publication.track.id();
-                    crate::sim_observation::TrackObservation {
-                        meta: publication.track.meta().clone(),
-                        candidates: room.candidate_subscribers(id).collect(),
-                        active: room.active_subscribers(id).collect(),
-                    }
-                })
-            })
-            .collect();
-        let subscriptions = self
-            .rooms
-            .iter()
-            .flat_map(|(room, topology)| {
-                topology.subscriptions.values().map(|subscription| {
-                    crate::sim_observation::SubscriptionObservation {
-                        room: *room,
-                        subscriber: subscription.subscriber,
-                        selector: (&subscription.selector).into(),
-                        selection: subscription.selection,
-                    }
-                })
-            })
-            .collect();
-        (tracks, subscriptions)
-    }
-
     pub(crate) fn publish(&mut self, track: Track) -> Option<TrackAncestry> {
         let identity = TrackAncestry::from_track(&track);
         let label = track.publication_label();

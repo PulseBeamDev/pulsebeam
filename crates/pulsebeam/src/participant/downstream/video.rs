@@ -569,11 +569,6 @@ impl VideoAllocator {
                 crate::bitrate::saturating_bps(available_bandwidth.as_f64()),
                 crate::bitrate::saturating_bps(desired.as_f64()),
             );
-            crate::sim_metrics::record_allocation_budget_for(
-                self.ctx.participant_id,
-                crate::bitrate::saturating_bps(self.current_allocation.as_f64()),
-                crate::bitrate::saturating_bps(available_bandwidth.as_f64()),
-            );
             for view in &views {
                 if tracing::enabled!(target: "pulsebeam_sim_qos", tracing::Level::DEBUG) {
                     let layers: Vec<_> = view
@@ -652,31 +647,6 @@ impl VideoAllocator {
         }
 
         (desired, changed, unfunded)
-    }
-
-    #[cfg(feature = "sim")]
-    pub(crate) fn observation(&self) -> crate::sim_observation::VideoAllocationObservation {
-        crate::sim_observation::VideoAllocationObservation {
-            pass: self.allocation_pass,
-            slots: self
-                .slots
-                .values()
-                .filter_map(|slot| {
-                    let track = slot.assignment?;
-                    let handle = self.track_handles.get(&track)?;
-                    let meta = self.tracks.get(*handle)?.meta();
-                    Some(crate::sim_observation::VideoSlotObservation {
-                        track,
-                        origin: meta.origin,
-                        quality: if slot.paused {
-                            0
-                        } else {
-                            slot.desired.as_ref().map_or(0, |layer| layer.quality as u8)
-                        },
-                    })
-                })
-                .collect(),
-        }
     }
 
     #[cfg(test)]
@@ -1462,9 +1432,9 @@ impl AllocationEngine {
         self.snap(layer).decode_targets
     }
 
-    /// Cost (bps) of forwarding this encoding at decode target `dt`. Uses the
-    /// sender's declared per-temporal VLA when present; otherwise estimates from
-    /// the full cost with a nested fraction (base ~half, top = full).
+    /// Cost (bps) at decode target `dt`. Mature measured partial-target costs
+    /// take precedence over VLA; the full-rate reference stays declared. With
+    /// neither, estimate a nested fraction of the full encoding cost.
     fn decode_target_cost(&self, layer: &TrackLayer, dt: usize) -> f64 {
         let snap = self.snap(layer);
         let count = usize::from(snap.decode_targets.max(1));

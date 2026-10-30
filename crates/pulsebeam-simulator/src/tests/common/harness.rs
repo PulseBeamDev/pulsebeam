@@ -2,16 +2,16 @@ use super::media::FixtureEncoding;
 pub use super::native_video::{Playback, PlaybackExpectation};
 use super::provenance::FixturePublishers;
 use crate::tests::common::client::{
-    AudioReceiveLog, ClientObservation, NativeTrafficBaseline, NativeTrafficStatistics,
-    QualityVideoReference, RequestedVideo, SimClientBuilder, VideoReceiveLog, VideoReceiveStats,
+    AudioReceiveLog, ClientObservation, DecodedVideoSizes, NativeTrafficBaseline,
+    NativeTrafficStatistics, QualityVideoReference, RequestedVideo, SimClientBuilder,
+    VideoReceiveLog, VideoReceiveStats,
 };
 use crate::tests::common::decoder::{
     MAX_AUDIO_REFERENCE_PEAK, MAX_REFERENCE_MEAN_ABSOLUTE, MAX_REFERENCE_PEAK,
 };
 use crate::tests::common::media::{KeyframeRecoveryProbe, VbrProfile};
 use crate::tests::common::{
-    DEFAULT_SIM_SHARDS, reserve_subnet, start_observed_sfu_node_with_transport, subnet_ip,
-    subnet_ip_v6,
+    DEFAULT_SIM_SHARDS, reserve_subnet, start_sfu_node_with_transport, subnet_ip, subnet_ip_v6,
 };
 use anyhow::Context;
 use pulsebeam_agent_native::agent_core::{
@@ -21,6 +21,7 @@ pub use pulsebeam_runtime::net::shaper::{Capacity, Loss, Reorder};
 use pulsebeam_testdata::{QualityVideoLayer, QualityVideoSource};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -30,6 +31,7 @@ use tokio::sync::mpsc;
 use std::time::Instant;
 
 mod histories;
+mod ordered_recovery;
 
 #[derive(Clone, Copy, Debug)]
 pub enum Role {
@@ -79,6 +81,8 @@ pub struct Participant {
     pub opaque_payload: bool,
     pub corrupt_video_payload: bool,
     pub native_playback_only: bool,
+    pub solid_picture: Option<Arc<super::media::SolidVideoInput>>,
+    pub native_video_fixture: Option<Arc<super::media::NativeVideoFixture>>,
     pub corrupt_audio_payload: bool,
     pub suppress_natural_keyframe_repeats: bool,
     /// Model a legacy peer that never negotiates the Dependency Descriptor
@@ -98,6 +102,7 @@ impl Participant {
             name,
             role: Role::Publisher,
             rids: rids.to_vec(),
+            native_video_fixture: None,
             video_receive_mode: pulsebeam_agent_native::ReceiveMode::Encoded,
             audio_receive_mode: pulsebeam_agent_native::ReceiveMode::Decoded,
             audio_input: pulsebeam_agent_native::AudioInput::Pcm,
@@ -114,6 +119,7 @@ impl Participant {
             opaque_payload: false,
             corrupt_video_payload: false,
             native_playback_only: false,
+            solid_picture: None,
             corrupt_audio_payload: false,
             suppress_natural_keyframe_repeats: false,
             marker_only: false,
@@ -123,6 +129,7 @@ impl Participant {
     pub fn single_publisher(name: &'static str) -> Self {
         Self {
             name,
+            native_video_fixture: None,
             role: Role::Publisher,
             video_receive_mode: pulsebeam_agent_native::ReceiveMode::Encoded,
             audio_receive_mode: pulsebeam_agent_native::ReceiveMode::Decoded,
@@ -141,6 +148,7 @@ impl Participant {
             opaque_payload: false,
             corrupt_video_payload: false,
             native_playback_only: false,
+            solid_picture: None,
             corrupt_audio_payload: false,
             suppress_natural_keyframe_repeats: false,
             marker_only: false,
@@ -173,6 +181,7 @@ impl Participant {
     pub fn subscriber(name: &'static str) -> Self {
         Self {
             name,
+            native_video_fixture: None,
             role: Role::Subscriber,
             video_receive_mode: pulsebeam_agent_native::ReceiveMode::Encoded,
             audio_receive_mode: pulsebeam_agent_native::ReceiveMode::Decoded,
@@ -191,6 +200,7 @@ impl Participant {
             opaque_payload: false,
             corrupt_video_payload: false,
             native_playback_only: false,
+            solid_picture: None,
             corrupt_audio_payload: false,
             suppress_natural_keyframe_repeats: false,
             marker_only: false,
@@ -201,6 +211,7 @@ impl Participant {
     pub fn multi_subscriber(name: &'static str, slots: usize) -> Self {
         Self {
             name,
+            native_video_fixture: None,
             role: Role::Subscriber,
             video_receive_mode: pulsebeam_agent_native::ReceiveMode::Encoded,
             audio_receive_mode: pulsebeam_agent_native::ReceiveMode::Decoded,
@@ -219,6 +230,7 @@ impl Participant {
             opaque_payload: false,
             corrupt_video_payload: false,
             native_playback_only: false,
+            solid_picture: None,
             corrupt_audio_payload: false,
             suppress_natural_keyframe_repeats: false,
             marker_only: false,
@@ -237,6 +249,7 @@ impl Participant {
     pub fn data_participant(name: &'static str) -> Self {
         Self {
             name,
+            native_video_fixture: None,
             role: Role::DataOnly,
             video_receive_mode: pulsebeam_agent_native::ReceiveMode::Encoded,
             audio_receive_mode: pulsebeam_agent_native::ReceiveMode::Decoded,
@@ -255,6 +268,7 @@ impl Participant {
             opaque_payload: false,
             corrupt_video_payload: false,
             native_playback_only: false,
+            solid_picture: None,
             corrupt_audio_payload: false,
             suppress_natural_keyframe_repeats: false,
             marker_only: false,
@@ -356,6 +370,15 @@ impl Participant {
         self
     }
 
+    pub fn with_native_video_fixture(
+        mut self,
+        fixture: Arc<super::media::NativeVideoFixture>,
+    ) -> Self {
+        self.temporal_dd = Some(fixture.temporal_layers());
+        self.native_video_fixture = Some(fixture);
+        self
+    }
+
     pub fn with_temporal_dd(mut self, layers: u8) -> Self {
         self.temporal_dd = Some(layers);
         self
@@ -370,6 +393,15 @@ impl Participant {
 
     /// End-user native playback: encoded samples authenticate origin only.
     /// No independent decoder or observer-driven keyframe retry controls RTC.
+    pub fn with_solid_video(mut self, picture: Arc<super::media::SolidVideoInput>) -> Self {
+        self.solid_picture = Some(picture);
+        self.rids = vec!["q"];
+        self.vbr = None;
+        self.temporal_dd = None;
+        self.quality_video = None;
+        self
+    }
+
     pub fn with_native_playback(mut self) -> Self {
         self.video_receive_mode = pulsebeam_agent_native::ReceiveMode::EncodedAndDecoded;
         self.native_playback_only = true;
@@ -470,6 +502,12 @@ impl VideoQuality {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+pub enum SourceInputTier {
+    Full,
+    T0T1,
+}
+
 #[allow(dead_code)]
 pub enum Step {
     IntentHistory {
@@ -484,11 +522,11 @@ pub enum Step {
         mode: TopicMode,
         next_sequence: u64,
     },
-    WaitForOrderedSubscriber {
-        participant: &'static str,
+    OrderedTopicRecovery {
         publisher: &'static str,
         topic: &'static str,
-        next_sequence: u64,
+        recovering: [&'static str; 2],
+        late: &'static str,
     },
     WaitForDataSequence {
         participant: &'static str,
@@ -515,11 +553,10 @@ pub enum Step {
         description: &'static str,
         participant: &'static str,
         publishers: &'static [&'static str],
-        min_quality: u8,
         timeout: Duration,
     },
-    /// Keep the same bounded convergence deadline, but require fresh decoded
-    /// pixels at this size instead of an unavailable lone native RID label.
+    /// Require fresh source-specific independent decode at the supplied fixture size.
+    /// This is encoded delivery evidence, not native playout or an allocation rank.
     WaitForVideoAtResolution {
         description: &'static str,
         participant: &'static str,
@@ -527,17 +564,11 @@ pub enum Step {
         min_resolution: (usize, usize),
         timeout: Duration,
     },
-    /// Require an owned slot observation for every origin and at least one
-    /// currently paused assignment before attempting recovery.
-    CheckVideoPaused {
-        description: &'static str,
-        participant: &'static str,
-        publishers: &'static [&'static str],
-    },
-    StallController {
+    BeginControllerStall {
         duration: Duration,
     },
-    SendToWrongShard {
+    WaitForControllerStallEnd,
+    ReconnectThroughForeignShard {
         description: &'static str,
         participant: &'static str,
     },
@@ -574,6 +605,11 @@ pub enum Step {
         description: &'static str,
         participant: &'static str,
     },
+    /// Abort on the first public admission failure instead of retrying automatically.
+    JoinOnce {
+        description: &'static str,
+        participant: &'static str,
+    },
     /// Gracefully disconnect: sends HTTP DELETE + RTC disconnect.
     Disconnect {
         description: &'static str,
@@ -588,6 +624,21 @@ pub enum Step {
     Reconnect {
         description: &'static str,
         participant: &'static str,
+    },
+    BeginHeldReconnect {
+        description: &'static str,
+        participant: &'static str,
+        timeout: Duration,
+    },
+    ReleaseHeldReconnect {
+        description: &'static str,
+        participant: &'static str,
+        held_for: Duration,
+    },
+    WaitSinceBootstrapRelease {
+        description: &'static str,
+        participant: &'static str,
+        duration: Duration,
     },
 
     // ── Subscriptions ─────────────────────────────────────────────────────
@@ -620,6 +671,12 @@ pub enum Step {
         description: &'static str,
         participant: &'static str,
         targets: &'static [(&'static str, u32, u32, u32)],
+    },
+    /// Configured requests use plan names; the driver submits resolved public IDs.
+    SubscribeToConfigured {
+        description: &'static str,
+        participant: &'static str,
+        targets: Vec<VideoSubscription>,
     },
     /// Subscribe the participant to ALL currently discovered video tracks.
     /// `heights` is applied round-robin to discovered tracks (sorted ascending).
@@ -683,6 +740,30 @@ pub enum Step {
         participant: &'static str,
         after_pause: bool,
     },
+    UpdateSolidVideo {
+        description: &'static str,
+        participant: &'static str,
+    },
+    QuietSolidVideo {
+        description: &'static str,
+        participant: &'static str,
+    },
+    /// Actual supplied capture and native pixels, including uniform content.
+    WaitForSourceVideo {
+        description: &'static str,
+        participant: &'static str,
+        publisher: &'static str,
+        min_resolution: (u32, u32),
+        timeout: Duration,
+    },
+    /// Complete fixed-full-rate input interval, followed only by its event deadlines.
+    MeasureSourceWindow {
+        description: &'static str,
+        participant: &'static str,
+        publisher: &'static str,
+        encodings: &'static [&'static str],
+        duration: Duration,
+    },
     /// Bounded first-visible-output contract, anchored at this step's start.
     WaitForNativeVideo {
         description: &'static str,
@@ -716,6 +797,25 @@ pub enum Step {
         publisher: &'static str,
         min_frames: u64,
         min_resolution: (u32, u32),
+    },
+    /// Source-authenticated native progress over the entire last Run. This is
+    /// not a cadence, deadline or all-frame fidelity assertion under contention.
+    CheckNativeSourceProgress {
+        description: &'static str,
+        participant: &'static str,
+        publisher: &'static str,
+        min_frames: u64,
+        min_resolution: (u32, u32),
+    },
+    /// Hard input-only premise for the controlled T3 policy witnesses.
+    CheckSourceInputLoad {
+        description: &'static str,
+        participant: &'static str,
+        protected: &'static [(&'static str, &'static str)],
+        competing: &'static [(&'static str, &'static str)],
+        competing_tier: SourceInputTier,
+        capacity_bps: u64,
+        max_backlog: Duration,
     },
     CheckVideoQuality {
         description: &'static str,
@@ -789,15 +889,6 @@ pub enum Step {
         participant: &'static str,
         expected: &'static [&'static str],
     },
-    /// Nothing this participant received was thrown away for want of somewhere to put it.
-    ///
-    /// Silent loss inside the client, which is invisible from both ends: the frames are missing at
-    /// the application and present at the wire. Finding 34 such packets once took hand-rolled
-    /// probes at every hop, because nothing measured in between.
-    CheckMediaRouted {
-        description: &'static str,
-        participant: &'static str,
-    },
     /// Assert the publisher has received at most `max` keyframe (PLI) requests.
     /// A constantly climbing count means downstream cannot decode the forwarded
     /// stream — the signature of a broken DD/reassembly path (the "PLI storm").
@@ -824,27 +915,13 @@ pub enum Step {
         subscriber: &'static str,
         encoding: &'static str,
     },
-    CheckRoutingCounter {
+    /// Settled application admission errors, not server materialization events.
+    CheckAdmissionFailed {
         description: &'static str,
-        name: &'static str,
-        exact: u64,
+        participant: &'static str,
+        expected: u64,
     },
-    CheckRoutingCounterAtLeast {
-        description: &'static str,
-        name: &'static str,
-        min: u64,
-    },
-    /// Assert a routing counter stops climbing over `over`.
-    ///
-    /// Steering is a cache, so cross-shard forwarding is expected while a flow
-    /// bootstraps and expected to stop once the flow is pinned. A rate that
-    /// never reaches zero means the map is not being populated, which no
-    /// total-count assertion can distinguish from ordinary bootstrap traffic.
-    CheckRoutingCounterSettles {
-        description: &'static str,
-        name: &'static str,
-        over: Duration,
-    },
+
     /// Assert the participant has an active peer connection.
     CheckConnected {
         description: &'static str,
@@ -861,13 +938,6 @@ pub enum Step {
         participant: &'static str,
         min_bytes: u64,
     },
-    /// Sustained successful server queueing, not PCM publication attribution.
-    /// Negative expectations reject any queueing, including short transients.
-    CheckAudioQueuedFrom {
-        description: &'static str,
-        participant: &'static str,
-        expected: &'static [&'static str],
-    },
     CheckNativeAudioDecoded {
         description: &'static str,
         participant: &'static str,
@@ -881,6 +951,12 @@ pub enum Step {
         min_samples: u64,
         timeout: Duration,
     },
+    CheckNativeAudioQuiet {
+        description: &'static str,
+        participant: &'static str,
+        min_blocks: u64,
+        timeout: Duration,
+    },
     CheckNativeAudioSilent {
         description: &'static str,
         participant: &'static str,
@@ -891,35 +967,22 @@ pub enum Step {
         participant: &'static str,
         corrupt: bool,
     },
+    CheckEncodedAudioInterval {
+        description: &'static str,
+        participant: &'static str,
+        corrupt: bool,
+    },
+    /// Publicly observed source assignments and the actual encoded receiver stream bound.
     CheckAudioSlotStreams {
         description: &'static str,
         participant: &'static str,
-        min_sources: usize,
+        expected_sources: &'static [&'static str],
         max_streams: usize,
     },
     CheckAudioCatalogFrom {
         description: &'static str,
         participant: &'static str,
         expected: &'static [&'static str],
-    },
-    /// Actual active-source selector ordering. The wire does not carry speaker rank.
-    WaitForAudioSelectionRank {
-        description: &'static str,
-        participant: &'static str,
-        expected: &'static [(&'static str, u32)],
-        timeout: Duration,
-    },
-    /// At least this many media frames actually crossed a shard boundary.
-    ///
-    /// Guards a cross-shard plan against passing by accident. Placement is a
-    /// hash, so a room can land co-located; delivery then looks identical while
-    /// reaching none of the route or envelope code the plan exists to cover.
-    CheckCrossShardMedia {
-        description: &'static str,
-        min_frames: u64,
-    },
-    CheckNoCrossShardMedia {
-        description: &'static str,
     },
     /// Cumulative bytes sent ≥ min_bytes.
     CheckTxBytes {
@@ -932,42 +995,6 @@ pub enum Step {
         description: &'static str,
         participant: &'static str,
         min_bytes: u64,
-    },
-    /// At least `min_percent` of what a participant received was actual media.
-    ///
-    /// Compares the media payload the SFU forwarded against what the subscriber's RTP stats
-    /// report receiving. The difference is retransmission and padding generated below the SFU -
-    /// so a low ratio means the link is carrying overhead instead of video. Chrome shows the same
-    /// quantity as `retransmittedBytesReceived` against `bytesReceived`.
-    ///
-    /// Only meaningful with a single subscribing participant, since the forwarded counter is
-    /// per-simulation rather than per-participant.
-    CheckMediaEfficiency {
-        description: &'static str,
-        participant: &'static str,
-        min_percent: u64,
-    },
-    /// At least `min_quality` is currently being forwarded to subscribers of `origin`'s track.
-    ///
-    /// `min_quality` uses `LayerQuality`'s numeric rank: 1=Low, 2=Medium, 3=High. Reads the last
-    /// allocation pass's decision, so it describes the current steady state rather than a window
-    /// - unlike the byte checks, there is no reset between `Step::Run`s.
-    ///
-    /// Only meaningful when `origin` has exactly one subscriber in the plan; the metric is keyed
-    /// by origin because the question this exists to ask - "is this stream regressing" - is about
-    /// the publisher's track, not about any one viewer.
-    CheckForwardedQuality {
-        description: &'static str,
-        origin: &'static str,
-        min_quality: u8,
-    },
-    /// Assert that `origin` reached at least `min_quality` at some point during the last
-    /// [`Step::Run`]. This is useful for a transition whose final allocation may legitimately
-    /// rebalance afterward.
-    CheckForwardedQualityReached {
-        description: &'static str,
-        origin: &'static str,
-        min_quality: u8,
     },
     /// Change a participant's downlink capacity mid-plan.
     ///
@@ -987,6 +1014,7 @@ pub enum Step {
         description: &'static str,
         participant: &'static str,
         capacity: Capacity,
+        max_backlog: Duration,
     },
     /// Configure UDP datagram loss for a participant's downlink.
     ///
@@ -1037,16 +1065,6 @@ pub enum Step {
         description: &'static str,
         participant: &'static str,
         max_bytes: u64,
-    },
-    /// The downstream bandwidth estimate on every participant stayed at or above `min_bps`
-    /// during the last `Step::Run`.
-    ///
-    /// Distinct from the byte checks: a poisoned estimate does not necessarily reduce throughput,
-    /// because the allocator just drops to a lower simulcast layer and the viewer keeps receiving
-    /// something. This asserts the estimate itself.
-    CheckMinBwe {
-        description: &'static str,
-        min_bps: u64,
     },
     /// Bytes sent since the last Step::Run ≥ min_bytes (per-window rate check).
     CheckTxBytesInterval {
@@ -1113,21 +1131,19 @@ enum ParticipantCmd {
 enum PendingDriverOp {
     SetSubscriptions(Vec<VideoSubscription>),
     RelabelOwnedVideo(String),
+    ReplaceVideoSource(Arc<AtomicBool>),
+    ReleaseReplacedVideoSource(Arc<AtomicBool>),
+    ApplicationAgent(Arc<Mutex<Option<pulsebeam_agent_native::Agent>>>),
     DeclarePublishTopic(String, TopicMode),
     DeclareSubscribeTopic(String, TopicMode),
     PublishData(String, TopicMode, Vec<u8>),
     /// (pinned participant ids, auto)
     SetAudioIntent(Vec<String>, bool),
+    SetAudioRequest(Vec<String>, bool, Option<u16>, Arc<AtomicBool>),
+    ProducerPressure(Arc<Mutex<Option<(usize, usize)>>>),
 }
 
-#[derive(Clone, Debug)]
-pub struct VideoSubscription {
-    pub participant_id: String,
-    pub publication: Option<String>,
-    pub height: u32,
-    pub min_height: u32,
-    pub priority: u32,
-}
+pub type VideoSubscription = RequestedVideo;
 
 #[derive(Clone, Default)]
 struct PlanIntent {
@@ -1170,7 +1186,8 @@ impl OperationQueue {
                 self.pending
                     .retain(|(_, op)| !matches!(op, PendingDriverOp::SetSubscriptions(_)));
             }
-            PendingDriverOp::SetAudioIntent(pinned, automatic) => {
+            PendingDriverOp::SetAudioIntent(pinned, automatic)
+            | PendingDriverOp::SetAudioRequest(pinned, automatic, _, _) => {
                 self.intent.audio.clone_from(pinned);
                 self.intent.automatic_audio = *automatic;
             }
@@ -1192,7 +1209,12 @@ impl OperationQueue {
                     self.intent.topics.subscribers.push(registration);
                 }
             }
-            PendingDriverOp::RelabelOwnedVideo(_) | PendingDriverOp::PublishData(..) => {}
+            PendingDriverOp::RelabelOwnedVideo(_)
+            | PendingDriverOp::ReplaceVideoSource(_)
+            | PendingDriverOp::ReleaseReplacedVideoSource(_)
+            | PendingDriverOp::ApplicationAgent(_)
+            | PendingDriverOp::ProducerPressure(_)
+            | PendingDriverOp::PublishData(..) => {}
         }
         self.pending.push((self.sequence, operation));
         self.sequence
@@ -1216,10 +1238,8 @@ fn driver_restart_restores_initial_intent() {
     assert_eq!(queue.intent.topics, TopicRegistrations::default());
     queue.push(PendingDriverOp::SetSubscriptions(vec![VideoSubscription {
         participant_id: "old".into(),
-        publication: None,
         height: 180,
-        min_height: 0,
-        priority: 0,
+        ..Default::default()
     }]));
     queue.push(PendingDriverOp::SetSubscriptions(Vec::new()));
     assert_eq!(
@@ -1233,13 +1253,16 @@ fn driver_restart_restores_initial_intent() {
 // ── Per-participant shared state ────────────────────────────────────────────
 
 struct ParticipantShared {
+    bootstrap_hold: super::client::BootstrapHold,
     driver_admission_retry: Mutex<bool>,
     failed_admissions: Mutex<u64>,
     observation: Mutex<Option<ClientObservation>>,
+    interval_audio_sources: Mutex<BTreeSet<String>>,
     video_rx: Arc<Mutex<VideoReceiveLog>>,
     audio_rx: Arc<Mutex<AudioReceiveLog>>,
     quality_references: Arc<Mutex<BTreeMap<String, &'static QualityVideoReference>>>,
     h264_publishers: Arc<Mutex<FixturePublishers>>,
+    solid_picture: Option<Arc<super::media::SolidVideoInput>>,
     statistics: Mutex<Option<NativeTrafficStatistics>>,
     interval_statistics: Mutex<NativeTrafficBaseline>,
     connected: Mutex<bool>,
@@ -1259,6 +1282,24 @@ struct ParticipantShared {
 }
 
 impl ParticipantShared {
+    fn record_observation(&self, observation: ClientObservation) -> anyhow::Result<()> {
+        let mut sources = self.interval_audio_sources.lock().unwrap();
+        for id in observation.snapshot.audio_mapping.values() {
+            let publication = observation
+                .snapshot
+                .publications
+                .get(id)
+                .context("public audio assignment has no publication")?;
+            anyhow::ensure!(
+                publication.kind == pulsebeam_agent_native::agent_core::MediaKind::Audio,
+                "public audio assignment has the wrong kind"
+            );
+            sources.insert(publication.participant_id.clone());
+        }
+        *self.observation.lock().unwrap() = Some(observation);
+        Ok(())
+    }
+
     fn record_statistics(&self, sample: Option<NativeTrafficStatistics>) -> anyhow::Result<()> {
         if let Some(stats) = &sample {
             let at = super::native::callback_clock()?.project(stats.timestamp_us)?;
@@ -1271,16 +1312,20 @@ impl ParticipantShared {
     fn new(
         quality_references: Arc<Mutex<BTreeMap<String, &'static QualityVideoReference>>>,
         h264_publishers: Arc<Mutex<FixturePublishers>>,
+        solid_picture: Option<Arc<super::media::SolidVideoInput>>,
         topics: TopicRegistrations,
     ) -> Self {
         Self {
+            bootstrap_hold: super::client::BootstrapHold::default(),
             driver_admission_retry: Mutex::new(false),
             failed_admissions: Mutex::new(0),
             observation: Mutex::new(None),
+            interval_audio_sources: Mutex::new(BTreeSet::new()),
             video_rx: Arc::new(Mutex::new(VideoReceiveLog::default())),
             audio_rx: Arc::new(Mutex::new(AudioReceiveLog::default())),
             quality_references,
             h264_publishers,
+            solid_picture,
             statistics: Mutex::new(None),
             interval_statistics: Mutex::new(NativeTrafficBaseline::default()),
             connected: Mutex::new(false),
@@ -1306,6 +1351,7 @@ struct ParticipantHandle {
     subscribed_at: Option<Instant>,
     interval_video_baseline: VideoReceiveStats,
     interval_decoded_video_baseline: BTreeMap<String, u64>,
+    interval_decoded_size_baseline: BTreeMap<String, DecodedVideoSizes>,
     native_video_baseline: super::native_video::NativeDecodedVideoLog,
     native_playback_track: Option<pulsebeam_agent_native::RemoteTrack>,
     native_playback_started: bool,
@@ -1402,51 +1448,6 @@ impl ParticipantHandle {
             .copied()
     }
 
-    fn check_native_media_routes(&self) {
-        let guard = self.shared.observation.lock().unwrap();
-        let observation = guard
-            .as_ref()
-            .expect("native media routing needs a graph observation");
-        let generation = observation
-            .snapshot
-            .generation
-            .map(pulsebeam_agent_native::agent_core::Generation::get);
-        let video = self.video_rx();
-        // Routing is about advertised slots, not best-effort polling retention.
-        // Native playback/encoded component oracles own their respective loss.
-        for track in video.native_decoded.observed_tracks() {
-            if Some(track.generation) == generation {
-                video
-                    .native_decoded
-                    .require_valid_receiver(track.generation, track.receiver)
-                    .expect("native route observer is invalid");
-                assert!(
-                    observation.video_receivers.contains(&track.media_index),
-                    "native decoded output belongs to an unadvertised slot"
-                );
-            }
-        }
-        for timeline in video.by_receiver.values() {
-            if let Some(track) = &timeline.track
-                && Some(track.generation) == generation
-            {
-                assert!(
-                    observation.video_receivers.contains(&track.media_index),
-                    "observed video belongs to an unadvertised native slot"
-                );
-            }
-        }
-        for track in self.audio_rx().tracks.values() {
-            if Some(track.generation) == generation {
-                assert!(
-                    observation.audio_receivers.contains(&track.media_index),
-                    "observed audio belongs to an unadvertised native slot"
-                );
-            }
-        }
-        // This checks real callback ownership and observer loss, not an
-        // unavailable SDK-internal packet-demux discard counter.
-    }
     fn connected(&self) -> bool {
         *self.shared.connected.lock().unwrap()
     }
@@ -1475,6 +1476,7 @@ impl ParticipantHandle {
     }
 
     fn snapshot_interval(&mut self) {
+        self.shared.interval_audio_sources.lock().unwrap().clear();
         self.native_origin_interval = Instant::now();
         let sample = self.shared.statistics.lock().unwrap().clone();
         let generation = self
@@ -1490,19 +1492,19 @@ impl ParticipantHandle {
             generation,
             self.native_origin_interval,
         );
-        self.shared
-            .audio_rx
-            .lock()
-            .unwrap()
-            .native_pcm
-            .begin_window();
-        let video = self.shared.video_rx.lock().unwrap();
+        self.shared.audio_rx.lock().unwrap().begin_window();
+        let mut video = self.shared.video_rx.lock().unwrap();
+        video
+            .native_origin
+            .begin_progress(self.native_origin_interval);
         self.interval_video_baseline = video.stats();
         self.interval_decoded_video_baseline = video
             .decoded_by_publisher
             .iter()
             .map(|(publisher, decoded)| (publisher.clone(), decoded.frames))
             .collect();
+        self.interval_decoded_size_baseline
+            .clone_from(&video.decoded_sizes_by_publisher);
     }
 }
 
@@ -1546,6 +1548,7 @@ async fn run_participant(
         } else {
             SimClientBuilder::bind(ip, server_ip).await?
         }
+        .with_bootstrap_hold(shared.bootstrap_hold.clone())
         .with_quality_references(shared.quality_references.clone())
         .with_h264_publishers(shared.h264_publishers.clone())
         .with_video_receive_mode(config.video_receive_mode)
@@ -1558,6 +1561,9 @@ async fn run_participant(
         .with_initial_topics(initial_topics.clone())
         .with_driver_admission_retry(*shared.driver_admission_retry.lock().unwrap());
 
+        if let Some(picture) = &config.solid_picture {
+            builder = builder.with_solid_video(picture.clone());
+        }
         if config.suppress_natural_keyframe_repeats {
             builder = builder.suppress_natural_keyframe_repeats();
         }
@@ -1578,6 +1584,9 @@ async fn run_participant(
                 } else {
                     builder.publish_video(layers)
                 };
+                if let Some(fixture) = &config.native_video_fixture {
+                    builder = builder.with_native_video_fixture(fixture.clone());
+                }
                 if let Some((source, layer)) = config.quality_video {
                     builder = builder.publish_quality_video(source, layer);
                 } else {
@@ -1621,7 +1630,9 @@ async fn run_participant(
 
         let mut client = match builder.connect(room_name).await {
             Ok(client) => client,
-            Err(error) if config.starts_disconnected => {
+            Err(error)
+                if config.starts_disconnected || *shared.driver_admission_retry.lock().unwrap() =>
+            {
                 *shared.connected.lock().unwrap() = false;
                 *shared.failed_admissions.lock().unwrap() += 1;
                 tracing::debug!(%error, "participant materialization failed");
@@ -1650,18 +1661,26 @@ async fn run_participant(
                         let complete = match operation.clone() {
                             PendingDriverOp::SetSubscriptions(subscriptions) => client
                                 .ctx
-                                .set_video_subscriptions(subscriptions.into_iter().map(|subscription| RequestedVideo {
-                                    participant_id: subscription.participant_id,
-                                    publication: subscription.publication,
-                                    height: subscription.height,
-                                    min_height: subscription.min_height,
-                                    priority: subscription.priority,
-                                }).collect(), sequence)
+                                .set_video_subscriptions(subscriptions, sequence)
                                 .await?,
                             PendingDriverOp::RelabelOwnedVideo(label) => {
                                 let complete = client.ctx.relabel_owned_video(label.clone()).await?;
                                 if complete { *shared.video_label.lock().unwrap() = label; }
                                 complete
+                            }
+                            PendingDriverOp::ReplaceVideoSource(receipt) => {
+                                let complete = client.replace_video_source().await?;
+                                if complete { receipt.store(true, Ordering::Release); }
+                                complete
+                            }
+                            PendingDriverOp::ReleaseReplacedVideoSource(receipt) => {
+                                let complete = client.release_replaced_video_source().await?;
+                                if complete { receipt.store(true, Ordering::Release); }
+                                complete
+                            }
+                            PendingDriverOp::ApplicationAgent(receipt) => {
+                                *receipt.lock().unwrap() = Some(client.ctx.agent.clone());
+                                true
                             }
                             PendingDriverOp::DeclarePublishTopic(topic, mode) => {
                                 client.ctx.register_publisher(topic, mode).await?
@@ -1674,6 +1693,16 @@ async fn run_participant(
                             }
                             PendingDriverOp::SetAudioIntent(participants, automatic) => {
                                 client.ctx.set_audio_intent(&participants, automatic).await?
+                            }
+                            PendingDriverOp::SetAudioRequest(participants, automatic, delay, receipt) => {
+                                let complete = client.ctx.set_audio_request(&participants, automatic, delay).await?;
+                                if complete { receipt.store(true, Ordering::Release); }
+                                complete
+                            }
+                            PendingDriverOp::ProducerPressure(receipt) => {
+                                let settled = client.producer_pressure().await?;
+                                if let Some(counts) = settled { *receipt.lock().unwrap() = Some(counts); }
+                                settled.is_some()
                             }
                         };
                         if !complete {
@@ -1691,8 +1720,8 @@ async fn run_participant(
                     }
 
                     client.tick().await?;
-                    let observation = client.ctx.observation().await?;
-                    *shared.observation.lock().unwrap() = Some(observation);
+                    let observation = client.ctx.observation();
+                    shared.record_observation(observation)?;
                     {
                         let mut received = shared.topic_events.lock().unwrap();
                         for event in client.ctx.topic_events.drain(..) {
@@ -1751,23 +1780,32 @@ fn step_name(step: &Step) -> &'static str {
         Step::WaitForPublication { .. } => "WaitForPublication",
         Step::WaitForVideo { .. } => "WaitForVideo",
         Step::WaitForVideoAtResolution { .. } => "WaitForVideoAtResolution",
-        Step::CheckVideoPaused { .. } => "CheckVideoPaused",
-        Step::StallController { .. } => "StallController",
-        Step::SendToWrongShard { .. } => "SendToWrongShard",
+        Step::BeginControllerStall { .. } => "BeginControllerStall",
+        Step::WaitForControllerStallEnd => "WaitForControllerStallEnd",
+        Step::ReconnectThroughForeignShard { .. } => "ReconnectThroughForeignShard",
         Step::FailNextMaterialization { .. } => "FailNextMaterialization",
         Step::Partition { .. } => "Partition",
         Step::Repair { .. } => "Repair",
         Step::Hold { .. } => "Hold",
         Step::Release { .. } => "Release",
         Step::Join { .. } => "Join",
+        Step::JoinOnce { .. } => "JoinOnce",
         Step::Disconnect { .. } => "Disconnect",
         Step::AbruptExit { .. } => "AbruptExit",
         Step::Reconnect { .. } => "Reconnect",
+        Step::BeginHeldReconnect { .. } => "BeginHeldReconnect",
+        Step::ReleaseHeldReconnect { .. } => "ReleaseHeldReconnect",
+        Step::WaitSinceBootstrapRelease { .. } => "WaitSinceBootstrapRelease",
         Step::SetSubscriptions { .. } => "SetSubscriptions",
         Step::RelabelOwnedVideo { .. } => "RelabelOwnedVideo",
         Step::SubscribeAll { .. } => "SubscribeAll",
         Step::SubscribeTo { .. } => "SubscribeTo",
         Step::SubscribeToQos { .. } => "SubscribeToQos",
+        Step::SubscribeToConfigured { .. } => "SubscribeToConfigured",
+        Step::WaitForSourceVideo { .. } => "WaitForSourceVideo",
+        Step::UpdateSolidVideo { .. } => "UpdateSolidVideo",
+        Step::QuietSolidVideo { .. } => "QuietSolidVideo",
+        Step::MeasureSourceWindow { .. } => "MeasureSourceWindow",
         Step::DeclarePublishTopic { .. } => "DeclarePublishTopic",
         Step::DeclareSubscribeTopic { .. } => "DeclareSubscribeTopic",
         Step::PublishData { .. } => "PublishData",
@@ -1776,6 +1814,8 @@ fn step_name(step: &Step) -> &'static str {
         Step::CheckNativePlayback { .. } => "CheckNativePlayback",
         Step::CheckNativeDecodedVideo { .. } => "CheckNativeDecodedVideo",
         Step::CheckNativeVideoDecodedFromInterval { .. } => "CheckNativeVideoDecodedFromInterval",
+        Step::CheckNativeSourceProgress { .. } => "CheckNativeSourceProgress",
+        Step::CheckSourceInputLoad { .. } => "CheckSourceInputLoad",
         Step::CheckVideoQuality { .. } => "CheckVideoQuality",
         Step::CheckVideoQualityInterval { .. } => "CheckVideoQualityInterval",
         Step::CheckVideoNotReceivedFrom { .. } => "CheckVideoNotReceivedFrom",
@@ -1788,25 +1828,20 @@ fn step_name(step: &Step) -> &'static str {
         Step::CheckKeyframeRequestsAtLeast { .. } => "CheckKeyframeRequestsAtLeast",
         Step::RecoverVideoAfterLostKeyframe { .. } => "RecoverVideoAfterLostKeyframe",
         Step::CheckKeyframeRecovery { .. } => "CheckKeyframeRecovery",
-        Step::CheckRoutingCounter { .. } => "CheckRoutingCounter",
-        Step::CheckRoutingCounterAtLeast { .. } => "CheckRoutingCounterAtLeast",
-        Step::CheckRoutingCounterSettles { .. } => "CheckRoutingCounterSettles",
-        Step::CheckMediaRouted { .. } => "CheckMediaRouted",
+        Step::CheckAdmissionFailed { .. } => "CheckAdmissionFailed",
         Step::CheckParticipantsKnown { .. } => "CheckParticipantsKnown",
         Step::CheckIdentityStable { .. } => "CheckIdentityStable",
         Step::CheckConnected { .. } => "CheckConnected",
         Step::CheckNotConnected { .. } => "CheckNotConnected",
         Step::CheckRxBytes { .. } => "CheckRxBytes",
-        Step::CheckAudioQueuedFrom { .. } => "CheckAudioQueuedFrom",
         Step::CheckNativeAudioDecoded { .. } => "CheckNativeAudioDecoded",
         Step::WaitForNativeAudioRecovery { .. } => "WaitForNativeAudioRecovery",
+        Step::CheckNativeAudioQuiet { .. } => "CheckNativeAudioQuiet",
         Step::CheckNativeAudioSilent { .. } => "CheckNativeAudioSilent",
         Step::CheckEncodedAudio { .. } => "CheckEncodedAudio",
+        Step::CheckEncodedAudioInterval { .. } => "CheckEncodedAudioInterval",
         Step::CheckAudioCatalogFrom { .. } => "CheckAudioCatalogFrom",
-        Step::WaitForAudioSelectionRank { .. } => "WaitForAudioSelectionRank",
         Step::CheckAudioSlotStreams { .. } => "CheckAudioSlotStreams",
-        Step::CheckCrossShardMedia { .. } => "CheckCrossShardMedia",
-        Step::CheckNoCrossShardMedia { .. } => "CheckNoCrossShardMedia",
         Step::CheckTxBytes { .. } => "CheckTxBytes",
         Step::CheckRxBytesInterval { .. } => "CheckRxBytesInterval",
         Step::CheckMaxRxBytesInterval { .. } => "CheckMaxRxBytesInterval",
@@ -1816,11 +1851,7 @@ fn step_name(step: &Step) -> &'static str {
         Step::SetReorder { .. } => "SetReorder",
         Step::Expect { .. } => "Expect",
         Step::Report { .. } => "Report",
-        Step::CheckMediaEfficiency { .. } => "CheckMediaEfficiency",
-        Step::CheckForwardedQuality { .. } => "CheckForwardedQuality",
-        Step::CheckForwardedQualityReached { .. } => "CheckForwardedQualityReached",
         Step::CheckTxBytesInterval { .. } => "CheckTxBytesInterval",
-        Step::CheckMinBwe { .. } => "CheckMinBwe",
         Step::CheckDataReceived { .. } => "CheckDataReceived",
         Step::CheckDataNotReceived { .. } => "CheckDataNotReceived",
         Step::CheckDataCount { .. } => "CheckDataCount",
@@ -1829,7 +1860,7 @@ fn step_name(step: &Step) -> &'static str {
         Step::StopServer => "StopServer",
         Step::RestartServer => "RestartServer",
         Step::WaitForTopicPublisher { .. } => "WaitForTopicPublisher",
-        Step::WaitForOrderedSubscriber { .. } => "WaitForOrderedSubscriber",
+        Step::OrderedTopicRecovery { .. } => "OrderedTopicRecovery",
         Step::WaitForDataSequence { .. } => "WaitForDataSequence",
         Step::SetAudioIntent { .. } => "SetAudioIntent",
         Step::CheckSpeakerHeld { .. } => "CheckSpeakerHeld",
@@ -1839,13 +1870,11 @@ fn step_name(step: &Step) -> &'static str {
 type PlanHandles = BTreeMap<&'static str, ParticipantHandle>;
 type PlanIps = BTreeMap<&'static str, IpAddr>;
 
-fn native_source_proof(
+fn source_context(
     handles: &PlanHandles,
     participant: &str,
     publisher: &str,
-    min_frames: u64,
-    min_resolution: (u32, u32),
-) -> anyhow::Result<super::native_origin::NativeOriginProof> {
+) -> anyhow::Result<(String, u64)> {
     let source = handles
         .get(publisher)
         .context("native publisher unavailable")?;
@@ -1857,7 +1886,12 @@ fn native_source_proof(
         .as_ref()
         .and_then(|observation| observation.admission)
         .context("native publisher admission unavailable")?;
-    let origin = super::provenance::source_key(&admission.to_string(), "v0");
+    let origin = super::provenance::current_source_key(
+        &source.shared.h264_publishers.lock().unwrap(),
+        &admission.to_string(),
+        "v0",
+    )
+    .context("native publisher has no constructed fixture source")?;
     let handle = handles
         .get(participant)
         .context("native viewer unavailable")?;
@@ -1870,6 +1904,75 @@ fn native_source_proof(
         .and_then(|observation| observation.snapshot.generation)
         .context("native viewer generation unavailable")?
         .get();
+    Ok((origin, generation))
+}
+
+fn source_request(
+    handles: &PlanHandles,
+    participant: &str,
+    publisher: &str,
+) -> anyhow::Result<VideoSubscription> {
+    let id = handles
+        .get(publisher)
+        .context("publisher unavailable")?
+        .shared
+        .participant_id
+        .lock()
+        .unwrap()
+        .clone()
+        .context("publisher not admitted")?;
+    handles
+        .get(participant)
+        .context("viewer unavailable")?
+        .shared
+        .pending_ops
+        .lock()
+        .unwrap()
+        .intent
+        .video
+        .iter()
+        .find(|request| request.participant_id == id)
+        .cloned()
+        .context("source phase needs an explicit application request")
+}
+
+fn current_source_proof(
+    handles: &PlanHandles,
+    participant: &str,
+    publisher: &str,
+    since: Instant,
+) -> anyhow::Result<super::native_origin::NativeOriginProof> {
+    let (origin, generation) = source_context(handles, participant, publisher)?;
+    let log = handles
+        .get(participant)
+        .context("viewer unavailable")?
+        .shared
+        .video_rx
+        .lock()
+        .unwrap();
+    let expected = handles
+        .get(publisher)
+        .and_then(|source| source.shared.solid_picture.as_ref())
+        .map(|picture| picture.expected());
+    let proof = log
+        .native_origin
+        .require_current_content(&origin, generation, since, expected)?;
+    log.native_decoded
+        .require_valid_receiver(generation, proof.track.receiver)?;
+    Ok(proof)
+}
+
+fn native_source_proof(
+    handles: &PlanHandles,
+    participant: &str,
+    publisher: &str,
+    min_frames: u64,
+    min_resolution: (u32, u32),
+) -> anyhow::Result<super::native_origin::NativeOriginProof> {
+    let (origin, generation) = source_context(handles, participant, publisher)?;
+    let handle = handles
+        .get(participant)
+        .context("native viewer unavailable")?;
     let log = handle.shared.video_rx.lock().unwrap();
     let proof = log.native_origin.require_since(
         &origin,
@@ -1878,6 +1981,8 @@ fn native_source_proof(
         min_frames,
         min_resolution,
     )?;
+    // Lossy legacy playback permits decoder concealment. Exact fixture pixels
+    // and event deadlines belong to explicit clean-source phases.
     log.native_decoded
         .require_valid_receiver(generation, proof.track.receiver)?;
     let statistics = handle.shared.statistics.lock().unwrap();
@@ -1913,8 +2018,7 @@ enum ServerCommand {
 
 struct ServerControl {
     commands: mpsc::Sender<ServerCommand>,
-    observations: mpsc::Receiver<pulsebeam::sim_observation::Observer>,
-    observer: pulsebeam::sim_observation::Observer,
+    startup_notifications: mpsc::Receiver<()>,
 }
 
 async fn execute_plan(
@@ -1923,20 +2027,31 @@ async fn execute_plan(
     name_to_ip: &PlanIps,
     reports: &Mutex<HashMap<&'static str, LinkReport>>,
     server: &mut ServerControl,
+    link: LinkProfile,
 ) -> anyhow::Result<()> {
     let total = plan.len();
     // Duration of the most recent Run, so interval properties know what window they describe.
     let mut window = Duration::ZERO;
+    let mut controller_stall_until = None;
     let mut disturbances = BTreeSet::new();
+    let mut changed_paths = BTreeSet::new();
 
     for (idx, step) in plan.iter().enumerate() {
         let n = idx + 1;
         let kind = step_name(step);
-        let observer = &server.observer;
+        match step {
+            Step::SetCapacity { participant, .. }
+            | Step::SetBandwidth { participant, .. }
+            | Step::SetLoss { participant, .. }
+            | Step::SetReorder { participant, .. } => {
+                changed_paths.insert(*participant);
+            }
+            _ => {}
+        }
 
         match step {
             Step::IntentHistory { history, witness } => {
-                histories::execute(history, witness, handles, name_to_ip, observer).await?;
+                histories::execute(history, witness, handles, name_to_ip).await?;
             }
             Step::StopServer => {
                 let (stopped, complete) = tokio::sync::oneshot::channel();
@@ -1946,10 +2061,9 @@ async fn execute_plan(
             }
             Step::RestartServer => {
                 server.commands.send(ServerCommand::Restart).await?;
-                server.observer =
-                    server.observations.recv().await.ok_or_else(|| {
-                        anyhow::anyhow!("restarted server did not supply observer")
-                    })?;
+                server.startup_notifications.recv().await.ok_or_else(|| {
+                    anyhow::anyhow!("restarted server did not supply startup acknowledgment")
+                })?;
                 disturbances.remove(&(2, "server", "server"));
             }
             Step::WaitForTopicPublisher {
@@ -1993,80 +2107,15 @@ async fn execute_plan(
                     anyhow::anyhow!("{participant} did not transmit topic sequence {next_sequence}")
                 })?;
             }
-            Step::WaitForOrderedSubscriber {
-                participant,
+            Step::OrderedTopicRecovery {
                 publisher,
                 topic,
-                next_sequence,
+                recovering,
+                late,
             } => {
-                let publisher_shared = get_handle(handles, publisher, kind)?.shared.clone();
-                let handle = get_handle(handles, participant, kind)?;
-                tokio::time::timeout(Duration::from_secs(30), async {
-                    loop {
-                        let expected_data_track = publisher_shared
-                            .observation
-                            .lock()
-                            .unwrap()
-                            .as_ref()
-                            .and_then(|publisher| {
-                                publisher
-                                    .snapshot
-                                    .topics
-                                    .publishers
-                                    .iter()
-                                    .find(|status| {
-                                        status.registration.topic == *topic
-                                            && status.registration.mode == TopicMode::Ordered
-                                    })
-                                    .and_then(|status| status.data_track_id.clone())
-                            });
-                        // Before the first live send, only a processed publisher boundary can
-                        // create this delivery state without delivering a historical payload.
-                        let ready =
-                            handle
-                                .shared
-                                .observation
-                                .lock()
-                                .unwrap()
-                                .as_ref()
-                                .is_some_and(|observation| {
-                                    observation.snapshot.topics.subscribers.iter().any(
-                                        |subscriber| {
-                                            subscriber.registration.topic == *topic
-                                                && subscriber.channel.is_some()
-                                                && subscriber.publishers == 1
-                                                && subscriber.buffered_messages == 0
-                                                && observation.ordered_cursors.iter().any(
-                                                    |(registration, id, cursor)| {
-                                                        registration == &subscriber.registration
-                                                            && expected_data_track.as_ref()
-                                                                == Some(id)
-                                                            && cursor == next_sequence
-                                                    },
-                                                )
-                                        },
-                                    )
-                                });
-                        if ready {
-                            break;
-                        }
-                        tokio::time::sleep(Duration::from_millis(10)).await;
-                    }
-                })
-                .await
-                .map_err(|_| {
-                    anyhow::anyhow!("{participant} did not process ordered publisher boundary")
-                })?;
-                anyhow::ensure!(
-                    handle
-                        .shared
-                        .topic_events
-                        .lock()
-                        .unwrap()
-                        .get(*topic)
-                        .is_none_or(Vec::is_empty),
-                    "late subscriber received history before live marker"
-                );
+                ordered_recovery::execute(handles, name_to_ip, publisher, topic, *recovering, late)
+                    .await?;
+                changed_paths.extend(recovering);
             }
             Step::WaitForDataSequence {
                 participant,
@@ -2105,8 +2154,7 @@ async fn execute_plan(
                     let generation = observation.as_ref().and_then(|state| state.snapshot.generation).map(pulsebeam_agent_native::agent_core::Generation::get);
                     let connection = observation.as_ref().map(|state| &state.snapshot.connection);
                     let subscribers = observation.as_ref().map(|state| state.snapshot.topics.subscribers.iter().filter(|status| status.registration.topic == *topic).take(16).collect::<Vec<_>>());
-                    let cursors = observation.as_ref().map(|state| state.ordered_cursors.iter().filter(|(registration, _, _)| registration.topic == *topic).take(16).collect::<Vec<_>>());
-                    anyhow::anyhow!("{participant} did not receive ordered sequence on {topic}: actual_len={actual_len} expected_len={} first_sequences={first:?} last_sequences={last:?} gaps={gaps:?} generation={generation:?} connection={connection:?} subscribers={subscribers:?} cursors={cursors:?}", expected.len())
+                    anyhow::anyhow!("{participant} did not receive ordered sequence on {topic}: actual_len={actual_len} expected_len={} first_sequences={first:?} last_sequences={last:?} gaps={gaps:?} generation={generation:?} connection={connection:?} subscribers={subscribers:?}", expected.len())
                 })??;
             }
             Step::Run {
@@ -2129,7 +2177,7 @@ async fn execute_plan(
                 if *duration >= ROOM_SETTLE_FLOOR {
                     assert_room_state_consistent(handles, description);
                     if disturbances.is_empty() {
-                        assert_convergence(handles, observer, description).await?;
+                        assert_convergence(handles, description).await?;
                     }
                 }
             }
@@ -2185,8 +2233,8 @@ async fn execute_plan(
                                 break;
                             }
                             // Receiver discovery is not an all-client barrier: publish-only
-                            // catalogs and wire-intent acknowledgments progress independently.
-                            match assert_convergence(handles, observer, description).await {
+                            // catalogs and other clients' public assignments progress independently.
+                            match assert_convergence(handles, description).await {
                                 Ok(()) => break,
                                 Err(error) => pending_convergence = Some(error),
                             }
@@ -2212,17 +2260,11 @@ async fn execute_plan(
                 timeout,
                 ..
             } => {
-                let (min_quality, min_resolution) = match step {
-                    Step::WaitForVideo { min_quality, .. } => (*min_quality, None),
-                    Step::WaitForVideoAtResolution { min_resolution, .. } => {
-                        (1, Some(*min_resolution))
-                    }
+                let min_resolution = match step {
+                    Step::WaitForVideo { .. } => None,
+                    Step::WaitForVideoAtResolution { min_resolution, .. } => Some(*min_resolution),
                     _ => unreachable!(),
                 };
-                anyhow::ensure!(
-                    (1..=3).contains(&min_quality),
-                    "{description}: invalid video quality {min_quality}"
-                );
                 tracing::info!(
                     "[step {n}/{total}: {kind}] \"{description}\" ({participant}, {publishers:?}, {timeout:?})"
                 );
@@ -2231,9 +2273,6 @@ async fn execute_plan(
                     "{description}: no video origins requested"
                 );
                 let subscriber = get_handle(handles, participant, description)?;
-                let subscriber_id = subscriber.participant_id().ok_or_else(|| {
-                    anyhow::anyhow!("{description}: {participant} is not admitted")
-                })?;
                 let received = subscriber.video_rx();
                 let origins = publishers
                     .iter()
@@ -2258,28 +2297,22 @@ async fn execute_plan(
                 let mut last = Vec::new();
                 let mut pending_convergence = None;
                 tokio::time::timeout(*timeout, async {
-                    let baseline = observe_video(observer, &subscriber_id).await?;
                     loop {
-                        let owned = observe_video(observer, &subscriber_id).await?;
-                        let fresh = owned.connection != baseline.connection
-                            || owned.video.pass > baseline.video.pass;
                         last = {
                             let log = get_handle(handles, participant, description)?.shared.video_rx.lock().unwrap();
                             origins.iter().map(|(publisher, id, before)| {
-                                let quality = owned.video.slots.iter()
-                                    .find(|slot| slot.origin.as_str() == id.as_str())
-                                    .map(|slot| slot.quality);
-                                let frames = log.decoded_from(id).map_or(0, |decoded| decoded.frames)
+                                let decoded = log.decoded_from(id);
+                                let frames = decoded.map_or(0, |decoded| decoded.frames)
                                     .saturating_sub(*before);
-                                let resolution = log.decoded_from(id).map(|decoded| (decoded.width, decoded.height));
-                                (*publisher, quality, frames, resolution)
+                                let resolution = decoded.map(|decoded| (decoded.width, decoded.height));
+                                (*publisher, frames, resolution)
                             }).collect()
                         };
-                        if fresh && last.iter().all(|(_, quality, frames, resolution)| {
-                            quality.is_some_and(|quality| quality >= min_quality) && *frames > 0
+                        if last.iter().all(|(_, frames, resolution)| {
+                            *frames > 0
                                 && min_resolution.is_none_or(|minimum| resolution.is_some_and(|actual| actual.0 >= minimum.0 && actual.1 >= minimum.1))
                         }) {
-                            match assert_convergence(handles, observer, description).await {
+                            match assert_convergence(handles, description).await {
                                 Ok(()) => break Ok::<_, anyhow::Error>(()),
                                 Err(error) => pending_convergence = Some(error),
                             }
@@ -2292,77 +2325,68 @@ async fn execute_plan(
                 window = started.elapsed();
             }
 
-            Step::CheckVideoPaused {
-                description,
-                participant,
-                publishers,
-            } => {
-                anyhow::ensure!(
-                    !publishers.is_empty(),
-                    "{description}: no video origins requested"
-                );
-                let subscriber = get_handle(handles, participant, description)?
-                    .participant_id()
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("{description}: {participant} is not admitted")
-                    })?;
-                let owned = tokio::time::timeout(
-                    Duration::from_secs(1),
-                    observe_video(observer, &subscriber),
-                )
-                .await
-                .map_err(|_| {
-                    anyhow::anyhow!("{description}: {subscriber} observation timed out")
-                })??;
-                let allocations = publishers
-                    .iter()
-                    .map(|publisher| {
-                        let origin = get_handle(handles, publisher, description)?
-                            .participant_id()
-                            .ok_or_else(|| {
-                                anyhow::anyhow!("{description}: {publisher} is not admitted")
-                            })?;
-                        let allocation = owned.video.slots.iter()
-                            .find(|slot| slot.origin.as_str() == origin)
-                            .ok_or_else(|| anyhow::anyhow!(
-                                "{description}: {participant} <- {publisher} had no owned slot observation"
-                            ))?;
-                        Ok((*publisher, allocation))
-                    })
-                    .collect::<anyhow::Result<Vec<_>>>()?;
-                anyhow::ensure!(
-                    allocations
-                        .iter()
-                        .any(|(_, allocation)| allocation.quality == 0),
-                    "{description}: no intended stream was paused: {allocations:?}"
-                );
-                tracing::info!(
-                    "[step {n}/{total}: {kind}] \"{description}\" ({participant}, {allocations:?})"
-                );
-            }
-
-            Step::StallController { duration } => {
+            Step::BeginControllerStall { duration } => {
                 tracing::info!("[step {n}/{total}: {kind}] controller stalled for {duration:?}");
-                for handle in handles.values_mut() {
-                    handle.snapshot_interval();
-                }
-                pulsebeam::sim_metrics::request_controller_stall(*duration);
-                tokio::time::sleep(*duration).await;
+                anyhow::ensure!(
+                    controller_stall_until.is_none(),
+                    "controller hold already pending"
+                );
+                let (until, begun) = pulsebeam::sim_metrics::request_controller_stall(*duration);
+                tokio::time::timeout(*duration, begun).await??;
+                anyhow::ensure!(
+                    Instant::now() < until,
+                    "controller did not enter the declared hold"
+                );
+                controller_stall_until = Some(until);
             }
 
-            Step::SendToWrongShard {
+            Step::WaitForControllerStallEnd => {
+                let until = controller_stall_until
+                    .take()
+                    .context("no controller hold pending")?;
+                anyhow::ensure!(
+                    Instant::now() < until,
+                    "media checkpoint did not precede hold end"
+                );
+                tokio::time::sleep(until.saturating_duration_since(Instant::now())).await;
+            }
+
+            Step::ReconnectThroughForeignShard {
                 description,
                 participant,
             } => {
                 tracing::info!("[step {n}/{total}: {kind}] \"{description}\" ({participant})");
-                let _ = get_handle(handles, participant, description)?;
+                // Count completed application builds; readmission may preserve the member ID.
+                let previous = get_handle(handles, participant, description)?
+                    .shared
+                    .incarnations
+                    .lock()
+                    .unwrap()
+                    .len();
                 let source = resolve(name_to_ip, participant, description)?;
-                pulsebeam_runtime::net::set_wrong_owner_injection(source);
+                let injected = pulsebeam_runtime::net::set_wrong_owner_injection(source);
                 handles
                     .get(participant)
                     .expect("participant was resolved above")
                     .send_command(ParticipantCmd::Reconnect);
-                tokio::time::sleep(Duration::from_millis(100)).await;
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    injected
+                        .await
+                        .context("foreign-shard bootstrap input cancelled")?;
+                    loop {
+                        let handle = get_handle(handles, participant, description)?;
+                        if handle.connected()
+                            && handle.shared.incarnations.lock().unwrap().len() > previous
+                        {
+                            break Ok::<_, anyhow::Error>(());
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .context(
+                    "foreign-shard bootstrap did not settle within the initial admission horizon",
+                )??;
             }
 
             Step::FailNextMaterialization { description } => {
@@ -2388,16 +2412,13 @@ async fn execute_plan(
                 description,
                 participant,
                 capacity,
+                max_backlog,
             } => {
                 tracing::info!(
                     "[step {n}/{total}: {kind}] \"{description}\" ({participant}, {capacity:?})"
                 );
                 let ip = resolve(name_to_ip, participant, description)?;
-                pulsebeam_runtime::net::shaper::set_capacity(
-                    ip,
-                    *capacity,
-                    Duration::from_millis(200),
-                );
+                pulsebeam_runtime::net::shaper::set_capacity(ip, *capacity, *max_backlog);
             }
 
             Step::SetReorder {
@@ -2436,7 +2457,7 @@ async fn execute_plan(
                 let handle = handles.get(participant).ok_or_else(|| {
                     anyhow::anyhow!("step \"{description}\": unknown participant {participant}")
                 })?;
-                if let Err(reason) = check_property(property, handle, ip, window, handles) {
+                if let Err(reason) = check_property(property, handle, ip) {
                     // Print the full picture alongside the failure: the one number that broke
                     // rarely explains why on its own.
                     tracing::error!("  context: {}", report_metrics(handle, ip, window));
@@ -2499,9 +2520,15 @@ async fn execute_plan(
             Step::Join {
                 description,
                 participant,
+            }
+            | Step::JoinOnce {
+                description,
+                participant,
             } => {
                 tracing::info!("[step {n}/{total}: {kind}] \"{description}\" ({participant})");
                 let handle = get_handle(handles, participant, description)?;
+                *handle.shared.driver_admission_retry.lock().unwrap() =
+                    matches!(step, Step::JoinOnce { .. });
                 if !handle.shared.incarnations.lock().unwrap().is_empty() {
                     handle.shared.pending_ops.lock().unwrap().restart();
                 }
@@ -2537,15 +2564,126 @@ async fn execute_plan(
             Step::Reconnect {
                 description,
                 participant,
+            }
+            | Step::BeginHeldReconnect {
+                description,
+                participant,
+                ..
             } => {
                 tracing::info!("[step {n}/{total}: {kind}] \"{description}\" ({participant})");
                 let handle = get_handle(handles, participant, description)?;
+                if matches!(step, Step::BeginHeldReconnect { .. }) {
+                    handle.shared.bootstrap_hold.arm()?;
+                }
                 // This command rebuilds the harness driver, unlike native ICE reconnection.
                 handle.shared.pending_ops.lock().unwrap().restart();
                 handle.present = true;
                 handle.send_command(ParticipantCmd::Reconnect);
+                if let Step::BeginHeldReconnect { timeout, .. } = step {
+                    let deadline = Instant::now() + *timeout;
+                    while handle.shared.bootstrap_hold.started().is_none() {
+                        anyhow::ensure!(
+                            Instant::now() < deadline,
+                            "replacement bootstrap never entered hold"
+                        );
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                    anyhow::ensure!(
+                        handle.shared.bootstrap_hold.pending(),
+                        "replacement bootstrap was cancelled"
+                    );
+                }
             }
 
+            Step::ReleaseHeldReconnect {
+                description,
+                participant,
+                held_for,
+            } => {
+                let handle = get_handle(handles, participant, description)?;
+                let hold = &handle.shared.bootstrap_hold;
+                let started = hold
+                    .started()
+                    .context("replacement bootstrap never entered hold")?;
+                let deadline = started
+                    .checked_add(*held_for)
+                    .context("bootstrap hold overflow")?;
+                anyhow::ensure!(
+                    Instant::now() <= deadline,
+                    "source proof exceeded bootstrap hold"
+                );
+                tokio::time::sleep(deadline.saturating_duration_since(Instant::now())).await;
+                anyhow::ensure!(
+                    Instant::now() == deadline,
+                    "bootstrap release missed declared hold deadline"
+                );
+                hold.release()?;
+                tracing::info!(
+                    ?started,
+                    ?held_for,
+                    "released pending replacement bootstrap after source proof"
+                );
+            }
+
+            Step::WaitSinceBootstrapRelease {
+                description,
+                participant,
+                duration,
+            } => {
+                let handle = get_handle(handles, participant, description)?;
+                let released = handle
+                    .shared
+                    .bootstrap_hold
+                    .released()
+                    .context("bootstrap hold was not released")?;
+                let deadline = released
+                    .checked_add(*duration)
+                    .context("recovery budget overflow")?;
+                anyhow::ensure!(
+                    Instant::now() <= deadline,
+                    "native service missed restoration budget"
+                );
+                tokio::time::sleep(deadline.saturating_duration_since(Instant::now())).await;
+                tracing::info!(
+                    ?released,
+                    ?deadline,
+                    "declared bootstrap recovery budget ended"
+                );
+            }
+
+            Step::SubscribeToConfigured {
+                description,
+                participant,
+                targets,
+            } => {
+                let subscriptions = targets
+                    .iter()
+                    .map(|request| {
+                        let publisher = handles
+                            .get(request.participant_id.as_str())
+                            .context("configured publisher unavailable")?;
+                        let id = publisher
+                            .shared
+                            .participant_id
+                            .lock()
+                            .unwrap()
+                            .clone()
+                            .context("configured publisher not admitted")?;
+                        Ok(VideoSubscription {
+                            participant_id: id,
+                            ..request.clone()
+                        })
+                    })
+                    .collect::<anyhow::Result<Vec<_>>>()?;
+                let handle = get_handle(handles, participant, description)?;
+                handle.subscribed_at.get_or_insert_with(Instant::now);
+                handle
+                    .shared
+                    .pending_ops
+                    .lock()
+                    .unwrap()
+                    .push(PendingDriverOp::SetSubscriptions(subscriptions));
+            }
             Step::SetSubscriptions {
                 description,
                 participant,
@@ -2601,8 +2739,7 @@ async fn execute_plan(
                         participant_id: id,
                         publication: None,
                         height: *height,
-                        min_height: 0,
-                        priority: 0,
+                        ..Default::default()
                     });
                 }
                 let handle = get_handle(handles, participant, description)?;
@@ -2639,6 +2776,7 @@ async fn execute_plan(
                         height: *height,
                         min_height: *min_height,
                         priority: *priority,
+                        ..Default::default()
                     });
                 }
                 let handle = get_handle(handles, participant, description)?;
@@ -2718,8 +2856,7 @@ async fn execute_plan(
                         participant_id: participant_id.clone(),
                         publication: None,
                         height: heights_slice[i % heights_slice.len()],
-                        min_height: 0,
-                        priority: 0,
+                        ..Default::default()
                     })
                     .collect();
                 handle
@@ -2843,6 +2980,154 @@ async fn execute_plan(
                 handle.native_video_baseline = log.native_decoded.checkpoint();
             }
 
+            Step::UpdateSolidVideo {
+                description,
+                participant,
+            }
+            | Step::QuietSolidVideo {
+                description,
+                participant,
+            } => {
+                let handle = get_handle(handles, participant, description)?;
+                let input = handle
+                    .shared
+                    .solid_picture
+                    .as_ref()
+                    .context("source has no solid-picture input")?;
+                if matches!(step, Step::QuietSolidVideo { .. }) {
+                    input.pause();
+                } else {
+                    input.update();
+                }
+            }
+            Step::WaitForSourceVideo {
+                description,
+                participant,
+                publisher,
+                min_resolution,
+                timeout,
+            } => {
+                let start = Instant::now();
+                get_handle(handles, participant, description)?.native_origin_interval = start;
+                let request = source_request(handles, participant, publisher)?;
+                let buffer = match request.playout_delay {
+                    pulsebeam_agent_native::agent_core::PlayoutDelay::Adaptive => Duration::ZERO,
+                    fixed => super::native_origin::SourceTiming {
+                        period: Duration::from_secs(1),
+                        playout: fixed,
+                        fiber_message_latency: Duration::ZERO,
+                    }
+                    .fixed_buffer()?,
+                };
+                let mut pending = None;
+                tokio::time::timeout(*timeout + buffer, async {
+                    loop {
+                        match current_source_proof(handles, participant, publisher, start).and_then(|proof| {
+                            anyhow::ensure!(proof.dimensions.0 >= min_resolution.0 && proof.dimensions.1 >= min_resolution.1, "source representation not visible yet: {:?}, required {min_resolution:?}", proof.dimensions);
+                            Ok(proof)
+                        }) {
+                            Ok(proof) => {
+                                tracing::info!(?proof, ?start, "new supplied capture reached actual native I420");
+                                break;
+                            }
+                            Err(error) => pending = Some(error),
+                        }
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                }).await.with_context(|| format!("{description}: no genuine new source output within {timeout:?} plus {buffer:?}: {pending:?}"))?;
+            }
+            Step::MeasureSourceWindow {
+                description,
+                participant,
+                publisher,
+                encodings,
+                duration,
+            } => {
+                anyhow::ensure!(
+                    link.loss == 0.0
+                        && link.loss_model.is_none()
+                        && link.duplicate == 0.0
+                        && link.reorder.probability == 0.0
+                        && link.bandwidth_bps.is_none()
+                        && link.feedback.is_none(),
+                    "strict source window requires clean unshaped fiber"
+                );
+                anyhow::ensure!(
+                    !changed_paths.contains(participant) && !changed_paths.contains(publisher),
+                    "strict path was reconfigured"
+                );
+                anyhow::ensure!(
+                    !disturbances.iter().any(|(kind, a, b)| *kind == 2
+                        || a == participant
+                        || a == publisher
+                        || b == participant
+                        || b == publisher),
+                    "strict source path is held or unavailable"
+                );
+                let (origin, generation) = source_context(handles, participant, publisher)?;
+                let request = source_request(handles, participant, publisher)?;
+                anyhow::ensure!(request.height > 0, "strict source was intentionally hidden");
+                let handle = handles.get(participant).context("viewer unavailable")?;
+                let proof = current_source_proof(
+                    handles,
+                    participant,
+                    publisher,
+                    handle.native_origin_interval,
+                )?;
+                let ledger = handle
+                    .shared
+                    .h264_publishers
+                    .lock()
+                    .unwrap()
+                    .get(&origin)
+                    .and_then(|source| source.ledger.clone())
+                    .context("actual source ledger unavailable")?;
+                let period = ledger.lock().unwrap().period;
+                let start = Instant::now();
+                let phase = super::native_origin::SourceWindow {
+                    source: origin,
+                    track: proof.track,
+                    encodings: encodings
+                        .iter()
+                        .map(|encoding| (*encoding).to_owned())
+                        .collect(),
+                    start,
+                    end: start
+                        .checked_add(*duration)
+                        .context("source interval overflow")?,
+                    timing: super::native_origin::SourceTiming {
+                        period,
+                        playout: request.playout_delay,
+                        fiber_message_latency: link.max_latency,
+                    },
+                };
+                handle
+                    .shared
+                    .video_rx
+                    .lock()
+                    .unwrap()
+                    .native_origin
+                    .begin_source_window(phase.clone())?;
+                tokio::time::sleep(*duration).await;
+                loop {
+                    let drain = phase.drain_until(&ledger.lock().unwrap())?.max(phase.end);
+                    let now = Instant::now();
+                    if now >= drain {
+                        break;
+                    }
+                    tokio::time::sleep(drain.duration_since(now)).await;
+                }
+                let mut log = handle.shared.video_rx.lock().unwrap();
+                log.native_decoded
+                    .require_valid_receiver(generation, phase.track.receiver)?;
+                let proof = log
+                    .native_origin
+                    .finish_source_window(&ledger.lock().unwrap(), Instant::now())
+                    .with_context(|| {
+                        format!("{description}: complete supplied/native source interval")
+                    })?;
+                tracing::info!(?proof, ?phase, deadline = ?phase.timing.deadline()?, "complete source interval verified");
+            }
             Step::BeginNativePlayback {
                 description,
                 participant,
@@ -2879,7 +3164,7 @@ async fn execute_plan(
                                 log.native_decoded.require_recent(&proof.track, Instant::now())?;
                                 Ok(proof)
                             }) {
-                            Ok(_) => match assert_convergence(handles, observer, description).await {
+                            Ok(_) => match assert_convergence(handles, description).await {
                                 Ok(()) => break,
                                 Err(error) => pending = Some(error),
                             },
@@ -2974,6 +3259,182 @@ async fn execute_plan(
                     "authenticated admission-specific native I420 progress verified");
             }
 
+            Step::CheckNativeSourceProgress {
+                description,
+                participant,
+                publisher,
+                min_frames,
+                min_resolution,
+            } => {
+                let (source, generation) = source_context(handles, participant, publisher)?;
+                let handle = handles
+                    .get(participant)
+                    .with_context(|| format!("{description}: participant unavailable"))?;
+                let log = handle.shared.video_rx.lock().unwrap();
+                log.native_decoded.require_callback_collector()?;
+                let proof = log
+                    .native_origin
+                    .require_progress(
+                        &source,
+                        generation,
+                        handle.native_origin_interval,
+                        *min_frames,
+                        *min_resolution,
+                    )
+                    .inspect_err(|_| {
+                        tracing::error!(
+                            participant,
+                            publisher,
+                            decoded = ?log.native_decoded,
+                            "native callback facts at source-progress failure"
+                        );
+                        for owner in [participant, publisher] {
+                            if let Some(peer) = handles.get(owner)
+                                && let Some(stats) = peer.shared.statistics.lock().unwrap().as_ref()
+                            {
+                                tracing::error!(
+                                    owner,
+                                    participant,
+                                    publisher,
+                                    generation = stats.generation,
+                                    timestamp_us = stats.timestamp_us,
+                                    report = %String::from_utf8_lossy(
+                                        &stats.report_json[..stats.report_json.len().min(65_536)]
+                                    ),
+                                    "native peer statistics at source-progress failure"
+                                );
+                            }
+                        }
+                    })
+                    .with_context(|| format!("{description}: {participant} <- {publisher}"))?;
+                log.native_decoded
+                    .require_valid_receiver(generation, proof.track.receiver)?;
+                tracing::info!(
+                    description,
+                    participant,
+                    publisher,
+                    ?proof.track,
+                    ?proof.min_dimensions,
+                    native_frames = proof.frames,
+                    "phase-wide source-correlated native I420 progress verified"
+                );
+            }
+            Step::CheckSourceInputLoad {
+                description,
+                participant,
+                protected,
+                competing,
+                competing_tier,
+                capacity_bps,
+                max_backlog,
+            } => {
+                let handle = handles
+                    .get(participant)
+                    .context("input load viewer unavailable")?;
+                let start = handle.native_origin_interval;
+                let end = Instant::now();
+                let elapsed = end.duration_since(start).as_secs_f64();
+                let load = |publisher, encoding, max_temporal| -> anyhow::Result<_> {
+                    let (source, _) = source_context(handles, participant, publisher)?;
+                    let ledger = handle
+                        .shared
+                        .h264_publishers
+                        .lock()
+                        .unwrap()
+                        .get(&source)
+                        .and_then(|source| source.ledger.clone())
+                        .context("source input ledger unavailable")?;
+                    let ledger = ledger.lock().unwrap();
+                    let input = ledger.input_load(encoding, max_temporal, start, end)?;
+                    let period = ledger
+                        .period
+                        .checked_mul(if max_temporal == Some(1) { 2 } else { 1 })
+                        .context("input cadence period overflow")?;
+                    anyhow::ensure!(!period.is_zero(), "input cadence period is zero");
+                    let required = end.duration_since(start).as_nanos() / period.as_nanos();
+                    anyhow::ensure!(
+                        input.offers.len() as u128 >= required,
+                        "{description}: {publisher}/{encoding} supplied {} captures, needs {required} for declared cadence",
+                        input.offers.len()
+                    );
+                    Ok(input)
+                };
+                let mut protected_wire = 0;
+                let mut offers = Vec::new();
+                for (publisher, encoding) in *protected {
+                    let input = load(publisher, encoding, Some(1))?;
+                    tracing::info!(
+                        publisher,
+                        encoding,
+                        admitted = input.offers.len(),
+                        elapsed,
+                        wire_bps = input.wire_bytes as f64 * 8.0 / elapsed,
+                        vcl_bps = input.vcl_bytes as f64 * 8.0 / elapsed,
+                        "actual admitted T0/T1 source input"
+                    );
+                    protected_wire += input.wire_bytes;
+                    offers.extend(input.offers);
+                }
+                // Reserve steady control capacity plus an entire control burst.
+                // The phase has constant service, no held path or injected outage.
+                let service_bps = capacity_bps
+                    .checked_sub(8192)
+                    .context("capacity below control reserve")?;
+                let control_burst =
+                    Duration::from_nanos(8_192_000_000_000u64.div_ceil(service_bps));
+                let required_backlog =
+                    super::provenance::required_input_backlog(&mut offers, service_bps)?
+                        .checked_add(control_burst)
+                        .context("input/control burst overflow")?;
+                anyhow::ensure!(
+                    required_backlog < *max_backlog,
+                    "{description}: protected input train requires {required_backlog:?}, exceeds {max_backlog:?}"
+                );
+                let temporal_limit = match competing_tier {
+                    SourceInputTier::Full => None,
+                    SourceInputTier::T0T1 => Some(1),
+                };
+                let mut competing_vcl = 0;
+                let mut burst = 1024;
+                for (publisher, encoding) in *competing {
+                    let input = load(publisher, encoding, temporal_limit)?;
+                    tracing::info!(
+                        publisher,
+                        encoding,
+                        ?competing_tier,
+                        admitted = input.offers.len(),
+                        elapsed,
+                        "actual admitted competing source input"
+                    );
+                    competing_vcl += input.vcl_bytes;
+                    burst += input.max_wire_au;
+                }
+                // Egress rotates a 60-byte SR/SDES once/second. Reserve 1KiB/s
+                // for SRTCP, ICE and steady signaling too; padding is optional.
+                let minimum_bps = protected_wire as f64 * 8.0 / elapsed + 8192.0;
+                let competing_bps = competing_vcl as f64 * 8.0 / elapsed;
+                anyhow::ensure!(
+                    minimum_bps < *capacity_bps as f64,
+                    "{description}: actual supplied protected upper load {minimum_bps} does not fit {capacity_bps}"
+                );
+                anyhow::ensure!(
+                    competing_bps > *capacity_bps as f64,
+                    "{description}: competing {competing_tier:?} coded slices alone {competing_bps} do not exceed {capacity_bps}"
+                );
+                anyhow::ensure!(
+                    burst as f64 * 8.0 / (*capacity_bps as f64) < max_backlog.as_secs_f64(),
+                    "{description}: synchronized competing AU burst does not fit declared backlog"
+                );
+                tracing::info!(
+                    minimum_bps,
+                    competing_bps,
+                    ?competing_tier,
+                    burst,
+                    ?required_backlog,
+                    capacity_bps,
+                    "supplied-input-only joint feasibility verified"
+                );
+            }
             Step::CheckVideoQuality {
                 description,
                 participant,
@@ -3178,6 +3639,7 @@ async fn execute_plan(
                         anyhow::anyhow!("step \"{description}\": publisher has no admission")
                     })?;
                 let label = publisher.shared.video_label.lock().unwrap().clone();
+                let source_inputs = publisher.shared.h264_publishers.clone();
                 let track_id = connection
                     .derive_track_id(pulsebeam::entity::TrackKind::Video, &label)
                     .as_str();
@@ -3201,11 +3663,15 @@ async fn execute_plan(
                         "{description}: receiver is not bound to publication {track_id} ({label})"
                     );
                 }
-                // Native track IDs identify receiver bindings, not publications.
-                // This fixture has one v0 source; authenticate its actual coded
-                // bytes and decode under the current admission independently
+                // Native track IDs identify receiver bindings, not supplied pictures.
+                // Authenticate the caller's current source lifetime independently
                 // of the separately checked catalog/mapping.
-                let origin = super::provenance::source_key(&connection.to_string(), "v0");
+                let origin = super::provenance::current_source_key(
+                    &source_inputs.lock().unwrap(),
+                    &connection.to_string(),
+                    "v0",
+                )
+                .context("publication has no constructed fixture source")?;
                 receiver
                     .video_rx()
                     .require_decoded_from_incarnation(&origin, 0, *min_frames)
@@ -3246,20 +3712,31 @@ async fn execute_plan(
                 } else {
                     0
                 };
-                let decoded = handle
-                    .video_rx()
+                let observed = handle.video_rx();
+                let decoded = observed
                     .require_decoded_from(&publisher_id, baseline, *min_frames)
                     .unwrap_or_else(|error| {
                         panic!("step {n}/{total} {kind}: {description} ({participant} <- {publisher_id}): {error}")
                     });
-                assert!(
-                    decoded.width >= min_resolution.0 && decoded.height >= min_resolution.1,
-                    "step {n}/{total} {kind}: {description} ({participant} <- {publisher_id}) decoded {}x{}, expected at least {}x{}",
-                    decoded.width,
-                    decoded.height,
-                    min_resolution.0,
-                    min_resolution.1
-                );
+                if matches!(step, Step::CheckVideoDecodedFromInterval { .. }) {
+                    observed.require_decoded_size_since(
+                        &publisher_id,
+                        handle.interval_decoded_size_baseline.get(&publisher_id),
+                        *min_frames,
+                        *min_resolution,
+                    ).unwrap_or_else(|error| {
+                        panic!("step {n}/{total} {kind}: {description} ({participant} <- {publisher_id}): {error}")
+                    });
+                } else {
+                    assert!(
+                        decoded.width >= min_resolution.0 && decoded.height >= min_resolution.1,
+                        "step {n}/{total} {kind}: {description} ({participant} <- {publisher_id}) decoded {}x{}, expected at least {}x{}",
+                        decoded.width,
+                        decoded.height,
+                        min_resolution.0,
+                        min_resolution.1
+                    );
+                }
                 assert_eq!(
                     decoded.decoder_errors, 0,
                     "step {n}/{total} {kind}: {description} ({participant} <- {publisher_id}) observed {} decoder errors",
@@ -3400,24 +3877,10 @@ async fn execute_plan(
                     })?;
                 let handle = get_handle(handles, participant, description)?;
                 let catalog = current_audio_catalog(handle)?;
-                let subscriber = handle
-                    .participant_id()
-                    .context("audio subscriber identity unavailable")?;
-                let owned = observe_video(observer, &subscriber).await?;
                 assert!(
-                    catalog.values().any(|origin| origin == &want)
-                        && owned.audio.iter().any(|slot| slot.origin.as_str() == want),
+                    catalog.values().any(|origin| origin == &want),
                     "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  participant:  {participant}\n  expected:     {speaker} to hold a slot\n  signalled:    {catalog:?}"
                 );
-            }
-
-            Step::CheckMediaRouted {
-                description,
-                participant,
-            } => {
-                tracing::info!("[step {n}/{total}: {kind}] \"{description}\" ({participant})");
-                let handle = get_handle(handles, participant, description)?;
-                handle.check_native_media_routes();
             }
 
             Step::CheckConnected {
@@ -3552,49 +4015,25 @@ async fn execute_plan(
                 );
             }
 
-            Step::CheckRoutingCounter {
+            Step::CheckAdmissionFailed {
                 description,
-                name,
-                exact,
+                participant,
+                expected,
             } => {
-                tracing::info!("[step {n}/{total}: {kind}] \"{description}\" ({name})");
-                let actual = pulsebeam::sim_metrics::routing_counter(name);
+                tracing::info!("[step {n}/{total}: {kind}] \"{description}\" ({participant})");
+                let handle = get_handle(handles, participant, description)?;
                 assert_eq!(
-                    actual, *exact,
-                    "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  counter:     {name}\n  expected:     exactly {exact}\n  actual:       {actual}"
+                    *handle.shared.failed_admissions.lock().unwrap(),
+                    *expected,
+                    "{description}: failed application admission results"
                 );
-            }
-
-            Step::CheckRoutingCounterAtLeast {
-                description,
-                name,
-                min,
-            } => {
-                tracing::info!("[step {n}/{total}: {kind}] \"{description}\" ({name})");
-                let actual = pulsebeam::sim_metrics::routing_counter(name);
                 assert!(
-                    actual >= *min,
-                    "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  counter:     {name}\n  expected:     at least {min}\n  actual:       {actual}"
+                    !handle.connected(),
+                    "{description}: failed admission connected"
                 );
-            }
-
-            Step::CheckRoutingCounterSettles {
-                description,
-                name,
-                over,
-            } => {
-                tracing::info!("[step {n}/{total}: {kind}] \"{description}\" ({name}, {over:?})");
-                for handle in handles.values_mut() {
-                    handle.snapshot_interval();
-                }
-                let before = pulsebeam::sim_metrics::routing_counter(name);
-                tokio::time::sleep(*over).await;
-                let after = pulsebeam::sim_metrics::routing_counter(name);
-                assert_eq!(
-                    before,
-                    after,
-                    "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  counter:     {name}\n  expected:     no change over {over:?}\n  actual:       climbed by {}",
-                    after.saturating_sub(before)
+                assert!(
+                    handle.participant_id().is_none(),
+                    "{description}: failed admission has an identity"
                 );
             }
 
@@ -3611,46 +4050,6 @@ async fn execute_plan(
                 assert!(
                     actual >= *min_bytes,
                     "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  participant:  {participant}\n  expected:     ≥ {min_bytes} bytes (cumulative)\n  actual:       {actual} bytes"
-                );
-            }
-
-            Step::CheckAudioQueuedFrom {
-                description,
-                participant,
-                expected,
-            } => {
-                let subscriber = handles
-                    .get(participant)
-                    .context("unknown audio subscriber")?
-                    .participant_id()
-                    .context("audio subscriber has no runtime identity")?;
-                let queued = pulsebeam::sim_metrics::queued_audio_for(subscriber.parse()?);
-                let actual = if expected.is_empty() {
-                    queued
-                        .keys()
-                        .map(|origin| origin.participant.as_str())
-                        .collect()
-                } else {
-                    sustained_audio_sources(&subscriber)?
-                };
-                let want: BTreeSet<_> = expected
-                    .iter()
-                    .map(|name| {
-                        handles
-                            .get(name)
-                            .context("unknown expected audio publisher")?
-                            .participant_id()
-                            .context("audio publisher has no runtime identity")
-                    })
-                    .collect::<anyhow::Result<_>>()?;
-                anyhow::ensure!(
-                    actual == want,
-                    "{description} ({participant}): server queued audio from {actual:?}, expected {want:?}; enqueues={queued:?}"
-                );
-                tracing::info!(
-                    participant,
-                    ?queued,
-                    "actual server audio queueing; not native PCM attribution"
                 );
             }
 
@@ -3695,6 +4094,46 @@ async fn execute_plan(
                 waiting.with_context(|| format!("{description}: native PCM recovery timed out"))?;
             }
 
+            Step::CheckNativeAudioQuiet {
+                description,
+                participant,
+                min_blocks,
+                timeout,
+            } => {
+                let handle = get_handle(handles, participant, description)?;
+                let generation = audio_generation(handle)?;
+                let before = {
+                    let statistics = handle.shared.statistics.lock().unwrap();
+                    let stats = statistics
+                        .as_ref()
+                        .context("quiet audio baseline statistics unavailable")?;
+                    anyhow::ensure!(
+                        stats.generation == generation,
+                        "quiet audio baseline belongs to an old generation"
+                    );
+                    stats.report_json.clone()
+                };
+                handle
+                    .shared
+                    .audio_rx
+                    .lock()
+                    .unwrap()
+                    .native_pcm
+                    .begin_window();
+                let waiting = tokio::time::timeout(*timeout, async {
+                    while require_native_quiet_audio(handle, generation, &before, *min_blocks)
+                        .is_err()
+                    {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                })
+                .await;
+                require_native_quiet_audio(handle, generation, &before, *min_blocks).with_context(
+                    || format!("{description}: fresh quiet PCM and decode progress"),
+                )?;
+                waiting.with_context(|| format!("{description}: quiet PCM window timed out"))?;
+            }
+
             Step::CheckNativeAudioSilent {
                 description,
                 participant,
@@ -3717,7 +4156,13 @@ async fn execute_plan(
                 description,
                 participant,
                 corrupt,
+            }
+            | Step::CheckEncodedAudioInterval {
+                description,
+                participant,
+                corrupt,
             } => {
+                let interval = matches!(step, Step::CheckEncodedAudioInterval { .. });
                 let handle = get_handle(handles, participant, description)?;
                 let generation = audio_generation(handle)?;
                 let audio = handle.audio_rx();
@@ -3736,9 +4181,14 @@ async fn execute_plan(
                     "{description}: no actual encoded Opus receiver packets"
                 );
                 anyhow::ensure!(
-                    streams
-                        .iter()
-                        .all(|stream| stream.packet_span() >= Duration::from_millis(300)),
+                    streams.iter().all(|stream| {
+                        let span = if interval {
+                            stream.packet_interval_span()
+                        } else {
+                            stream.packet_span()
+                        };
+                        span >= Duration::from_millis(300)
+                    }),
                     "{description}: encoded receiver observation is only a startup transient"
                 );
                 if *corrupt {
@@ -3749,11 +4199,16 @@ async fn execute_plan(
                     );
                 } else {
                     anyhow::ensure!(
-                        streams
-                            .iter()
-                            .all(|stream| stream.decoded_span() >= Duration::from_millis(300)
+                        streams.iter().all(|stream| {
+                            let span = if interval {
+                                stream.decoded_interval_span()
+                            } else {
+                                stream.decoded_span()
+                            };
+                            span >= Duration::from_millis(300)
                                 && stream.decoder_errors == 0
-                                && stream.reference_mismatches == 0),
+                                && stream.reference_mismatches == 0
+                        }),
                         "{description}: receiver-scoped independent Opus decode failed: {streams:?}"
                     );
                 }
@@ -3780,19 +4235,16 @@ async fn execute_plan(
             Step::CheckAudioSlotStreams {
                 description,
                 participant,
-                min_sources,
+                expected_sources,
                 max_streams,
             } => {
+                let want = audio_expected(handles, expected_sources)?;
                 let handle = get_handle(handles, participant, description)?;
                 let generation = audio_generation(handle)?;
-                let subscriber = handle
-                    .participant_id()
-                    .context("audio subscriber identity unavailable")?;
-                let sources = sustained_audio_sources(&subscriber)?;
+                let sources = handle.shared.interval_audio_sources.lock().unwrap().clone();
                 anyhow::ensure!(
-                    sources.len() >= *min_sources,
-                    "{description}: only {} sustained queued sources, expected {min_sources}: {sources:?}",
-                    sources.len()
+                    sources == want,
+                    "{description}: public audio assignments {sources:?}, expected {want:?}"
                 );
                 let audio = handle.audio_rx();
                 anyhow::ensure!(
@@ -3839,68 +4291,6 @@ async fn execute_plan(
                 );
             }
 
-            Step::WaitForAudioSelectionRank {
-                description,
-                participant,
-                expected,
-                timeout,
-            } => {
-                let want = expected
-                    .iter()
-                    .map(|(name, rank)| {
-                        Ok((
-                            get_handle(handles, name, description)?
-                                .participant_id()
-                                .context("speaker identity unavailable")?,
-                            *rank,
-                        ))
-                    })
-                    .collect::<anyhow::Result<BTreeMap<_, _>>>()?;
-                let handle = get_handle(handles, participant, description)?;
-                let subscriber = handle
-                    .participant_id()
-                    .context("audio subscriber identity unavailable")?;
-                tokio::time::timeout(*timeout, async {
-                    loop {
-                        let owned = observe_video(observer, &subscriber).await?;
-                        let ranked: BTreeMap<_, _> = owned.audio.iter().enumerate().map(|(rank, slot)| (slot.origin.as_str(), u32::try_from(rank).unwrap())).collect();
-                        let catalog = current_audio_catalog(handle)?;
-                        let current = owned.audio.iter().all(|slot| catalog.get(&slot.track.as_str()).is_some_and(|origin| origin == &slot.origin.as_str()));
-                        let talking = owned.audio.iter().all(|slot| slot.level_dbov > -60);
-                        if current && talking && ranked == want {
-                            tracing::info!(?ranked, slots = ?owned.audio, "actual SFU selector ordering, not a client-visible rank");
-                            break Ok::<_, anyhow::Error>(());
-                        }
-                        tokio::time::sleep(Duration::from_millis(20)).await;
-                    }
-                }).await.with_context(|| format!("{description}: actual active-source selector rank did not converge to {want:?}"))??;
-            }
-
-            Step::CheckCrossShardMedia {
-                description,
-                min_frames,
-            } => {
-                tracing::info!(
-                    "[step {n}/{total}: {kind}] \"{description}\" (min {min_frames} frames)"
-                );
-                let actual = pulsebeam::sim_metrics::cross_shard_media_frames();
-                assert!(
-                    actual >= *min_frames,
-                    "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  expected:     ≥ {min_frames} frames resolved from another shard\n  actual:       {actual}\n  note:         zero means the room was co-located, so no cross-shard\n                path ran at all — the plan proved nothing"
-                );
-            }
-
-            Step::CheckNoCrossShardMedia { description } => {
-                tracing::info!(
-                    "[step {n}/{total}: {kind}] \"{description}\" (exactly zero frames)"
-                );
-                let actual = pulsebeam::sim_metrics::cross_shard_media_frames();
-                assert_eq!(
-                    actual, 0,
-                    "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  expected:     no media resolved from another shard\n  actual:       {actual}"
-                );
-            }
-
             Step::CheckTxBytes {
                 description,
                 participant,
@@ -3914,105 +4304,6 @@ async fn execute_plan(
                 assert!(
                     actual >= *min_bytes,
                     "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  participant:  {participant}\n  expected:     ≥ {min_bytes} bytes (cumulative)\n  actual:       {actual} bytes"
-                );
-            }
-
-            Step::CheckMinBwe {
-                description,
-                min_bps,
-            } => {
-                tracing::info!("[step {n}/{total}: {kind}] \"{description}\" (min {min_bps} bps)");
-                let observed = pulsebeam::sim_metrics::downstream_bwe_summary();
-                let Some((min_seen, max_seen, last_seen, count)) = observed else {
-                    panic!(
-                        "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  expected:     >= {min_bps} bps\n  actual:       no allocation passes observed - the check would pass vacuously"
-                    );
-                };
-                assert!(
-                    min_seen >= *min_bps,
-                    "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  expected:     >= {min_bps} bps on every participant\n  actual:       min {min_seen} / max {max_seen} / last {last_seen} bps over {count} allocation passes"
-                );
-            }
-            Step::CheckMediaEfficiency {
-                description,
-                participant,
-                min_percent,
-            } => {
-                tracing::info!(
-                    "[step {n}/{total}: {kind}] \"{description}\" ({participant}, min {min_percent}%)"
-                );
-                let handle = get_handle(handles, participant, description)?;
-                let received = handle.rx_bytes();
-                let forwarded = handle.forwarded_media();
-                assert!(
-                    received > 0,
-                    "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  participant:  {participant}\n  nothing was received, so the ratio would be meaningless"
-                );
-                let percent = forwarded.saturating_mul(100) / received;
-                assert!(
-                    percent >= *min_percent,
-                    "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  participant:  {participant}\n  expected:     >= {min_percent}% of received bytes to be media\n  actual:       {percent}% ({forwarded} media forwarded / {received} received)"
-                );
-            }
-
-            Step::CheckForwardedQuality {
-                description,
-                origin,
-                min_quality,
-            } => {
-                tracing::info!(
-                    "[step {n}/{total}: {kind}] \"{description}\" ({origin}, min quality {min_quality})"
-                );
-                let handle = get_handle(handles, origin, description)?;
-                let id = handle.shared.participant_id.lock().unwrap().clone();
-                let id = id.ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "step \"{description}\": {origin} has no runtime participant id yet; add a Step::Run before this step"
-                    )
-                })?;
-                let actual = pulsebeam::sim_metrics::forwarded_quality(&id);
-                let bwe = pulsebeam::sim_metrics::downstream_bwe_summary();
-                if !actual.is_some_and(|q| q >= *min_quality) {
-                    let statistics = handle.shared.statistics.lock().unwrap();
-                    match statistics.as_ref() {
-                        Some(stats) => tracing::error!(
-                            participant = origin,
-                            generation = stats.generation,
-                            timestamp_us = stats.timestamp_us,
-                            report = %String::from_utf8_lossy(&stats.report_json),
-                            "native publisher statistics at forwarded-quality failure"
-                        ),
-                        None => tracing::error!(
-                            participant = origin,
-                            "native publisher statistics unavailable at forwarded-quality failure"
-                        ),
-                    }
-                }
-                assert!(
-                    actual.is_some_and(|q| q >= *min_quality),
-                    "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  origin:       {origin}\n  expected:     >= quality {min_quality}\n  actual:       {actual:?} (0=paused, None=never observed)\n  BWE window:   {bwe:?} (min, max, last, samples)"
-                );
-            }
-
-            Step::CheckForwardedQualityReached {
-                description,
-                origin,
-                min_quality,
-            } => {
-                tracing::info!(
-                    "[step {n}/{total}: {kind}] \"{description}\" ({origin}, min quality {min_quality})"
-                );
-                let handle = get_handle(handles, origin, description)?;
-                let id = handle.shared.participant_id.lock().unwrap().clone();
-                let id = id.ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "step \"{description}\": {origin} has no runtime participant id yet; add a Step::Run before this step"
-                    )
-                })?;
-                let actual = pulsebeam::sim_metrics::max_forwarded_quality(&id);
-                assert!(
-                    actual.is_some_and(|q| q >= *min_quality),
-                    "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  origin:       {origin}\n  expected:     reached >= quality {min_quality} during the last Run\n  actual:       {actual:?} (0=paused, None=never observed)"
                 );
             }
 
@@ -4393,7 +4684,7 @@ fn get_handle<'a>(
         .ok_or_else(|| anyhow::anyhow!("step \"{step_desc}\": unknown participant \"{name}\""))
 }
 
-fn expected_state(handles: &PlanHandles) -> anyhow::Result<super::oracle::ControlStateOracle> {
+fn expected_state(handles: &PlanHandles) -> anyhow::Result<super::oracle::ApplicationStateOracle> {
     let mut participants = Vec::new();
     for (name, handle) in handles {
         let allowed = handle.present
@@ -4414,55 +4705,21 @@ fn expected_state(handles: &PlanHandles) -> anyhow::Result<super::oracle::Contro
             .unwrap()
             .clone()
             .ok_or_else(|| anyhow::anyhow!("{name} has no complete client observation"))?;
+        let intent = handle.shared.pending_ops.lock().unwrap().intent.clone();
         participants.push(super::oracle::ExpectedParticipant {
             id: id.parse()?,
             room: handle.room_name,
             video: handle.publishes_video,
             video_label: handle.shared.video_label.lock().unwrap().clone(),
             audio: handle.publishes_audio,
+            audio_pinned: intent.audio,
+            automatic_audio: intent.automatic_audio,
             required: handle.present,
-            video_targets: HashSet::new(),
             connection: observation.admission,
-            topics: handle
-                .shared
-                .pending_ops
-                .lock()
-                .unwrap()
-                .intent
-                .topics
-                .clone(),
+            topics: intent.topics,
         });
     }
-    let targets = participants
-        .iter()
-        .map(|participant| {
-            let handle = handles
-                .values()
-                .find(|handle| handle.participant_id().as_deref() == Some(&participant.id.as_str()))
-                .expect("bound plan identity");
-            let observation = handle
-                .shared
-                .observation
-                .lock()
-                .unwrap()
-                .clone()
-                .expect("admission observation");
-            planned_video(&participants, participant, handle, &observation)
-                .into_iter()
-                .map(|id| {
-                    let peer = participants
-                        .iter()
-                        .find(|peer| peer.id.as_str() == id)
-                        .expect("admitted video publisher");
-                    peer.track_id(pulsebeam::entity::TrackKind::Video, &peer.video_label)
-                })
-                .collect()
-        })
-        .collect::<Vec<_>>();
-    for (participant, targets) in participants.iter_mut().zip(targets) {
-        participant.video_targets = targets;
-    }
-    Ok(super::oracle::ControlStateOracle { participants })
+    Ok(super::oracle::ApplicationStateOracle { participants })
 }
 
 fn planned_video(
@@ -4573,6 +4830,40 @@ fn require_native_audio(
     Ok(())
 }
 
+fn require_native_quiet_audio(
+    handle: &ParticipantHandle,
+    generation: u64,
+    before: &[u8],
+    min_blocks: u64,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        audio_generation(handle)? == generation,
+        "quiet audio generation changed within measurement window"
+    );
+    let tracks =
+        handle
+            .audio_rx()
+            .native_pcm
+            .require_quiet(generation, min_blocks, 1, Instant::now())?;
+    let statistics = handle.shared.statistics.lock().unwrap();
+    let stats = statistics
+        .as_ref()
+        .context("quiet audio statistics unavailable")?;
+    anyhow::ensure!(
+        stats.generation == generation,
+        "quiet audio statistics belong to an old generation"
+    );
+    for track in tracks {
+        super::native_audio::require_decoder_progress(before, &stats.report_json, &track.mid)?;
+        tracing::info!(
+            ?track,
+            min_blocks,
+            "fresh quiet PCM with non-concealed native decode progress, without per-block publication attribution"
+        );
+    }
+    Ok(())
+}
+
 fn audio_generation(handle: &ParticipantHandle) -> anyhow::Result<u64> {
     handle
         .shared
@@ -4598,22 +4889,6 @@ fn audio_expected(handles: &PlanHandles, expected: &[&str]) -> anyhow::Result<BT
         .collect()
 }
 
-fn sustained_audio_sources(subscriber: &str) -> anyhow::Result<BTreeSet<String>> {
-    let queued = pulsebeam::sim_metrics::queued_audio_for(subscriber.parse()?);
-    // Preserve the old transient exclusion, but claim queueing, not attributed PCM.
-    let longest = queued
-        .values()
-        .map(pulsebeam::sim_metrics::AudioEnqueues::span)
-        .max()
-        .unwrap_or_default();
-    let floor = (longest / 2).max(Duration::from_millis(300));
-    Ok(queued
-        .into_iter()
-        .filter(|(_, queued)| queued.span() >= floor)
-        .map(|(origin, _)| origin.participant.as_str())
-        .collect())
-}
-
 fn current_audio_catalog(handle: &ParticipantHandle) -> anyhow::Result<BTreeMap<String, String>> {
     let observation = handle.shared.observation.lock().unwrap();
     let snapshot = &observation
@@ -4636,108 +4911,45 @@ fn current_audio_catalog(handle: &ParticipantHandle) -> anyhow::Result<BTreeMap<
         .collect()
 }
 
-async fn observe_video(
-    observer: &pulsebeam::sim_observation::Observer,
-    participant: &str,
-) -> anyhow::Result<pulsebeam::sim_observation::ShardParticipantObservation> {
-    let owners = observer.observe().await.map_err(anyhow::Error::msg)?;
-    owners
-        .shards
-        .into_iter()
-        .flat_map(|shard| shard.participants)
-        .find(|owned| owned.id.as_str() == participant)
-        .ok_or_else(|| anyhow::anyhow!("{participant}: no shard-owned participant observation"))
-}
-
-async fn assert_convergence(
-    handles: &PlanHandles,
-    observer: &pulsebeam::sim_observation::Observer,
-    after: &str,
-) -> anyhow::Result<()> {
-    let expected = expected_state(handles)?;
-    let owners = tokio::time::timeout(Duration::from_secs(1), async {
+async fn assert_convergence(handles: &PlanHandles, after: &str) -> anyhow::Result<()> {
+    let check = || -> anyhow::Result<()> {
+        let expected = expected_state(handles)?;
+        for (name, handle) in handles.iter().filter(|(_, handle)| handle.present) {
+            let observation = handle
+                .shared
+                .observation
+                .lock()
+                .unwrap()
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("{name} has no client snapshot"))?;
+            let id = handle
+                .participant_id()
+                .context("client has no public admission")?;
+            let participant = expected
+                .participants
+                .iter()
+                .find(|participant| participant.id.as_str() == id)
+                .context("client has no bound application participant")?;
+            let requested =
+                planned_video(&expected.participants, participant, handle, &observation);
+            expected
+                .check_client(participant, &observation, &requested)
+                .with_context(|| format!("public application state at {name}"))?;
+        }
+        Ok(())
+    };
+    let mut last = None;
+    tokio::time::timeout(Duration::from_secs(1), async {
         loop {
-            let owners = observer.observe().await.map_err(anyhow::Error::msg)?;
-            if super::oracle::ControlStateOracle::projections_ready(&owners) {
-                break Ok::<_, anyhow::Error>(owners);
+            match check() {
+                Ok(()) => break,
+                Err(error) => last = Some(error),
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
-    .map_err(|_| {
-        anyhow::anyhow!("owner projections did not finish bounded protocol progress after {after}")
-    })??;
-    expected
-        .check_owners(&owners)
-        .map_err(|error| {
-            let clients: Vec<_> = handles.iter().filter(|(_, handle)| handle.present)
-                .map(|(name, handle)| {
-                    let observation = handle.shared.observation.lock().unwrap().clone();
-                    (*name, handle.participant_id(), handle.connected(), observation.map(|value| (
-                        value.admission,
-                        value.snapshot.connection,
-                        value.snapshot.generation,
-                        value.snapshot.participant_id,
-                        value.snapshot.version,
-                        value.snapshot.terminal_failure,
-                    )))
-                }).collect();
-            anyhow::anyhow!("owner convergence after {after}: {error:#}; client(name, expected_id, connected, admission/connection/generation/id/version/failure)={clients:?}; control={:?}", owners.control)
-        })?;
-    for (name, handle) in handles.iter().filter(|(_, handle)| handle.present) {
-        let observation = handle
-            .shared
-            .observation
-            .lock()
-            .unwrap()
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("{name} has no client snapshot"))?;
-        let id = handle.participant_id().expect("admitted model participant");
-        let participant = expected
-            .participants
-            .iter()
-            .find(|participant| participant.id.as_str() == id)
-            .expect("plan participant");
-        let intent = handle.shared.pending_ops.lock().unwrap().intent.clone();
-        let requested = planned_video(&expected.participants, participant, handle, &observation);
-        expected
-            .check_client(
-                &owners.control.tracks,
-                participant,
-                &observation,
-                &requested,
-            )
-            .map_err(|error| {
-                anyhow::anyhow!("client convergence after {after}, observer {name}: {error:#}")
-            })?;
-        let accepted = observation
-            .accepted
-            .as_ref()
-            .expect("checked accepted intent");
-        let pinned = intent
-            .audio
-            .iter()
-            .map(|participant| {
-                let peer = expected
-                    .participants
-                    .iter()
-                    .find(|peer| peer.id.as_str() == *participant)
-                    .expect("admitted audio publisher");
-                peer.track_id(pulsebeam::entity::TrackKind::Audio, "audio")
-                    .as_str()
-            })
-            .collect::<Vec<_>>();
-        anyhow::ensure!(
-            accepted.audio.pinned == pinned && accepted.audio.automatic == intent.automatic_audio,
-            "audio intent differs from plan for {name}"
-        );
-        anyhow::ensure!(
-            accepted.topics == intent.topics,
-            "topic intent differs from plan for {name}"
-        );
-    }
-    Ok(())
+    .map_err(|_| anyhow::anyhow!("application state did not converge after {after}: {last:?}"))
 }
 
 /// A `Step::Run` shorter than this is a pause mid-transition, not a settled room, so the state
@@ -4851,144 +5063,19 @@ fn assert_video_quality(
 
 // ── LocalNodeSim ────────────────────────────────────────────────────────────
 
-/// A high-level claim about behaviour, stated against ground truth.
-///
-/// Byte-count assertions (`min_bytes: 3_000_000`) fold link rate, codec, fixture length and
-/// current behaviour into one number. They go stale silently — shrinking the screenshare fixture
-/// in `8263602` invalidated a batch of them and nothing failed — and being one-sided floors they
-/// cannot express collapse, overuse, or instability at all.
-///
-/// These are stated against what the simulator *configured*, so they survive changes to the
-/// fixture, the codec, or the ladder, and they fail when behaviour actually regresses.
-///
-/// The properties that reference capacity require a `Fixed` link: on a ramp or an oscillation
-/// "the capacity" is not a single number, and silently comparing against its instantaneous value
-/// would be exactly the kind of quietly-wrong assertion this type exists to remove. Use
-/// [`Property::EstimateStable`] and [`Property::QueueingDelayBelow`] on scheduled links.
+/// Receiver decoding or imposed-link queue/drop measurements.
+/// Source identity, native I420 and presentation require their own proof.
 #[derive(Clone, Copy, Debug)]
-// A vocabulary of assertions a plan may make, not a set of call sites. Each
-// variant is implemented and documented with the regime it is fair in; a
-// variant no current plan happens to use is a claim available to the next one,
-// which is the opposite of dead code. Deleting the unused ones would leave the
-// suite able to express only what it already asserts.
-#[allow(dead_code)]
 pub enum Property {
     /// Video frames decoded during the last run after a complete, parameterized keyframe.
     VideoDecodes,
-    /// Delivered throughput was at least this percent of the link's capacity.
-    ///
-    /// Only meaningful when demand meets or exceeds capacity; a plan whose sources cannot fill
-    /// the link will fail this for reasons that are not the controller's fault.
-    UtilisationAtLeast(u8),
-    /// The estimate ended within `within_percent` of true capacity, in *both* directions.
-    ///
-    /// Two-sided on purpose: an estimate far above capacity is a controller that will overshoot
-    /// and drive loss, which a floor-style assertion silently permits.
-    ///
-    /// Only fair under saturation. When the application asks for less than the link can carry,
-    /// a delay-based estimator correctly settles near demand — it cannot measure bandwidth it is
-    /// not using. Use [`Property::EstimateMeetsNeed`] unless the plan deliberately overloads the
-    /// link.
-    EstimateTracksCapacity { within_percent: u8 },
-    /// The estimate reached `percent` of whatever is smaller: what the allocator asked for, or
-    /// what the link can actually carry.
-    ///
-    /// The claim that holds in every regime, and the one that matches what a user notices. Below
-    /// saturation it means "found enough for what was wanted"; above it, "saturated the link
-    /// trying". It cannot be satisfied by an estimate that quietly gave up, and unlike a byte
-    /// floor it does not have to be re-tuned when the ladder or the fixture changes.
-    EstimateMeetsNeed { percent: u8 },
-    /// The estimate never fell more than `max_drop_percent` below its running maximum.
-    ///
-    /// The collapse detector, and the most valuable property here: it states the production
-    /// failure — stable link, estimate falls away and does not recover — directly.
-    EstimateStable { max_drop_percent: u8 },
-    /// The estimate reached `percent` of capacity within `within` of the window starting.
-    EstimateConverges { percent: u8, within: Duration },
-    /// The estimate ended within `of_peak_percent` of the highest value it reached.
-    ///
-    /// A dip is not by itself a defect. A bursty source moves the estimate around, and a
-    /// controller that never dips is one that is not responding to anything. What distinguishes
-    /// working from broken is whether it comes *back*: the production failure was not that the
-    /// estimate fell, it was that it fell and stayed there while the link was fine.
-    ///
-    /// Prefer this to [`Property::EstimateStable`] wherever the source is bursty. Bounding peak
-    /// drawdown there asserts something stronger than the system owes - and, being tuned to
-    /// whatever the current dip happens to be, is the kind of threshold that gets quietly relaxed
-    /// until it means nothing.
-    EstimateRecovers { of_peak_percent: u8 },
-    /// Standing queue at the bottleneck stayed below this.
-    ///
-    /// Bufferbloat: a controller can hold a link perfectly full while parking hundreds of
-    /// milliseconds of queue. That looks healthy in throughput and is unusable for a call.
-    ///
-    /// The *standing* queue, not the deepest moment. A peak is one sample, and every link that
-    /// ever filled has a high one - so bounding it fails a controller that dipped into the buffer
-    /// once on the way to behaving well, and passes one that sits at 90ms forever. Those are
-    /// opposite verdicts on the thing this property exists to catch. Use
-    /// [`Property::PeakQueueingDelayBelow`] where the transient genuinely is the claim.
+    /// Mean bottleneck queueing delay measured by the imposed link shaper.
     QueueingDelayBelow(Duration),
-    /// The deepest queue occupancy reached, at any instant.
-    ///
-    /// A strictly stronger and much noisier claim than [`Property::QueueingDelayBelow`]: fair
-    /// only where a plan holds capacity steady, since a controller cannot shed rate before
-    /// observing a capacity it has not yet been told about.
-    PeakQueueingDelayBelow(Duration),
     /// At most this percent of offered packets were dropped by a full bottleneck buffer.
     ///
     /// Congestion drops only, distinct from configured link loss: this is the controller
     /// overusing the link.
     CongestionLossBelow(u8),
-    /// A publisher's forwarded layer changed at most this many times per minute.
-    ///
-    /// The instability check, and the one the rest of this vocabulary cannot express. Every other
-    /// property here is an average or an endpoint, and a stream flipping between two layers many
-    /// times a second satisfies all of them: the final layer is right, the byte count is right,
-    /// the estimate is right. Only the *count of changes* shows it.
-    ///
-    /// It matters because switching is not free. Each change needs a keyframe and stutters the
-    /// picture, so a stream that never holds a layer long enough to decode a run of frames shows
-    /// the viewer nothing at all. That is how it presented in production - "the screen share
-    /// never appeared" - rather than as visibly poor quality.
-    ///
-    /// Named per minute because that is the scale a human judges it on. A settled stream changes
-    /// a handful of times a minute as conditions move; the production failure was doing it
-    /// several times a second.
-    QualityChangesPerMinuteBelow { origin: &'static str, max: u64 },
-    /// At most this many direction reversals in the origin's forwarded layer.
-    ///
-    /// Climbing through layers as bandwidth is discovered is correct, so a raw change count cannot
-    /// separate a healthy ramp from a stream oscillating between two layers - it fails both. A
-    /// reversal can reveal flapping when budget and intent are stable. Optional streams can
-    /// legitimately reverse direction when their available budget changes.
-    ///
-    /// A monotonic q -> h -> f climb reports zero however many layers it passes through.
-    QualityReversalsBelow { origin: &'static str, max: u64 },
-    /// Every observed selected media rate fits the estimate. Use in feasible-budget
-    /// windows, not below-minimum native producer-service scenarios.
-    AllocationWithinEstimate,
-    /// The origin's forwarded layer never rose above this rank at any point in the window.
-    ///
-    /// `target_height` is a ceiling as much as a request: a viewer showing a 180p tile is asking
-    /// not to be sent 720p, and sending it anyway wastes the link on pixels nobody will see. Every
-    /// other layer assertion here is a floor, and the byte-rate ceiling that stood in for this one
-    /// cannot tell a stream forwarded at the wrong rung from one forwarded at the right rung with
-    /// a busier picture. This reads the highest rank actually forwarded.
-    NeverForwardedAbove {
-        origin: &'static str,
-        max_quality: u8,
-    },
-    /// At least this percent of the bytes the viewer received were media payload.
-    ///
-    /// Measured as media forwarded by the SFU over bytes received by the viewer, which is only a
-    /// true efficiency ratio on a lossless path: packets dropped in flight shrink the denominator
-    /// without shrinking the numerator, so it can exceed 100% (measured at 103.5% on a link
-    /// dropping 7%). Use it to catch overhead — RTX and padding crowding out video — on links
-    /// that are not dropping, and disregard it where congestion loss is significant.
-    ///
-    /// A loss-proof version needs the receiver to report media bytes separately from total bytes;
-    /// `VideoReceiveLog` is the place that would come from.
-    MediaEfficiencyAtLeast(u8),
 }
 
 fn pct(part: f64, whole: f64) -> f64 {
@@ -5197,8 +5284,8 @@ impl LinkReport {
         pct(self.congestion_drops as f64, offered as f64)
     }
 
-    /// Media payload as a percentage of bytes received. Exceeds 100% under loss - see
-    /// [`Property::MediaEfficiencyAtLeast`].
+    /// SFU forwarded-byte / received-transport-byte ratio, for diagnostics only.
+    /// This is not receiver efficiency and can exceed 100% under loss.
     #[allow(dead_code)] // Report accessor, kept alongside the rest of the surface.
     pub fn media_percent(&self) -> Option<f64> {
         Some(pct(
@@ -5381,7 +5468,7 @@ fn report_metrics(handle: &ParticipantHandle, ip: IpAddr, window: Duration) -> S
 
     let offered = stats.delivered + stats.dropped_overflow;
     out.push_str(&format!(
-        " | qoe {} fps={:.1} key={} undecodable={} torn={} ttff={:?} freeze={:?}/{:.0}% | queue standing {:?} max {:?} | congestion loss {:.2}% ({}/{offered}) | link loss {}          | media {}",
+        " | qoe {} fps={:.1} key={} undecodable={} torn={} ttff={:?} freeze={:?}/{:.0}% | queue standing {:?} max {:?} | congestion loss {:.2}% ({}/{offered}) | link loss {} | forwarded/rx {}",
         qoe_now.frames,
         qoe_now.mean_fps,
         qoe_now.keyframes,
@@ -5408,46 +5495,13 @@ fn check_property(
     property: &Property,
     handle: &ParticipantHandle,
     ip: IpAddr,
-    window: Duration,
-    handles: &PlanHandles,
 ) -> Result<(), String> {
-    let now = tokio::time::Instant::now();
     let stats = pulsebeam_runtime::net::shaper::stats(ip);
-
-    let capacity = || -> Result<f64, String> {
-        if !pulsebeam_runtime::net::shaper::capacity_is_fixed(ip) {
-            return Err(
-                "this property needs a fixed capacity, but the link is on a schedule".to_string(),
-            );
-        }
-        pulsebeam_runtime::net::shaper::capacity_at(ip, now)
-            .map(|c| c as f64)
-            .ok_or_else(|| "this property needs a shaped link, but none is configured".to_string())
-    };
-
-    let series = || -> Result<Vec<(Duration, u64, u64)>, String> {
-        let id = handle
-            .shared
-            .participant_id
-            .lock()
-            .unwrap()
-            .clone()
-            .ok_or_else(|| "participant never connected".to_string())?;
-        let s = pulsebeam::sim_metrics::bwe_series(&id);
-        if s.is_empty() {
-            // Distinguishing this from "passed" matters: a subscriber that ran no allocation
-            // passes satisfies every bound vacuously.
-            return Err(format!(
-                "no allocation passes recorded for {id}; the check would pass vacuously"
-            ));
-        }
-        Ok(s)
-    };
 
     match *property {
         Property::VideoDecodes => {
-            let video = handle.video_stats_since_interval();
             let total = handle.video_rx().stats();
+            let video = total.since(handle.interval_video_baseline);
             if video.frames == 0 {
                 return Err("no video frames were decoded during the run".to_string());
             }
@@ -5461,131 +5515,6 @@ fn check_property(
                 ));
             }
         }
-        Property::UtilisationAtLeast(min) => {
-            let capacity = capacity()?;
-            let received = handle.interval_delta(|stats| stats.bytes_received)?;
-            let deliverable = capacity * window.as_secs_f64() / 8.0;
-            let got = pct(received as f64, deliverable);
-            if got + 0.5 < min as f64 {
-                return Err(format!(
-                    "used {got:.1}% of the link ({received} B of ~{deliverable:.0} B deliverable \
-                     at {capacity:.0} bps over {window:?}); expected >= {min}%"
-                ));
-            }
-        }
-        Property::EstimateMeetsNeed { percent } => {
-            let series = series()?;
-            // Steady-state demand, not the transient early value: the allocator's `desired`
-            // starts at a floor and rises as it learns the ladder, so the last sample is the
-            // honest statement of what was wanted.
-            let (_, last_bwe, last_desired) = *series.last().expect("non-empty");
-            let capacity = pulsebeam_runtime::net::shaper::capacity_at(ip, now).unwrap_or(u64::MAX);
-            let need = last_desired.min(capacity);
-            if need == 0 {
-                return Err("nothing was demanded, so the claim would be vacuous".to_string());
-            }
-            let got = pct(last_bwe as f64, need as f64);
-            if got + 0.5 < percent as f64 {
-                return Err(format!(
-                    "estimate ended at {last_bwe} bps against a need of {need} bps \
-                     (demand {last_desired}, capacity {capacity}) — {got:.1}%; expected \
-                     >= {percent}%"
-                ));
-            }
-        }
-        Property::EstimateTracksCapacity { within_percent } => {
-            let capacity = capacity()?;
-            let series = series()?;
-            let last = series.last().expect("non-empty").1 as f64;
-            let off = (last - capacity).abs() / capacity * 100.0;
-            if off > within_percent as f64 {
-                return Err(format!(
-                    "estimate ended at {last:.0} bps against {capacity:.0} bps of capacity \
-                     ({off:.1}% off); expected within {within_percent}%"
-                ));
-            }
-        }
-        Property::EstimateStable { max_drop_percent } => {
-            // A plan that delivered nothing satisfies "the estimate did not fall" for the worst
-            // possible reason: a frozen estimate never moves. Caught in practice - a plan whose
-            // publisher went dead reported a 0.0% drawdown over 600 samples having received 0
-            // bytes, and passed.
-            let received = handle.interval_delta(|stats| stats.bytes_received)?;
-            if received == 0 {
-                return Err(
-                    "nothing was received, so a stable estimate means nothing moved at all"
-                        .to_string(),
-                );
-            }
-            let series = series()?;
-            let mut peak = 0.0f64;
-            let mut worst = 0.0f64;
-            let mut worst_at = Duration::ZERO;
-            let mut worst_from = 0.0f64;
-            let mut worst_to = 0.0f64;
-            for (at, bps, _) in &series {
-                let bps = *bps as f64;
-                peak = peak.max(bps);
-                if peak > 0.0 {
-                    let drop = (peak - bps) / peak * 100.0;
-                    if drop > worst {
-                        worst = drop;
-                        worst_at = *at;
-                        worst_from = peak;
-                        worst_to = bps;
-                    }
-                }
-            }
-            if worst > max_drop_percent as f64 {
-                return Err(format!(
-                    "estimate fell {worst:.1}% ({worst_from:.0} -> {worst_to:.0} bps) at \
-                     {worst_at:?} into the window; expected no drop over {max_drop_percent}%"
-                ));
-            }
-        }
-        Property::EstimateRecovers { of_peak_percent } => {
-            let received = handle.interval_delta(|stats| stats.bytes_received)?;
-            if received == 0 {
-                return Err(
-                    "nothing was received, so a recovered estimate means nothing moved at all"
-                        .to_string(),
-                );
-            }
-            let series = series()?;
-            let last = series.last().expect("non-empty").1 as f64;
-            let peak = series.iter().map(|(_, b, _)| *b).max().unwrap_or(0) as f64;
-            if peak <= 0.0 {
-                return Err("the estimate never rose above zero".to_string());
-            }
-            let got = last / peak * 100.0;
-            if got + 0.5 < of_peak_percent as f64 {
-                return Err(format!(
-                    "estimate ended at {last:.0} bps against a peak of {peak:.0} ({got:.1}% of \
-                     it); expected to recover to within {of_peak_percent}%"
-                ));
-            }
-        }
-        Property::EstimateConverges { percent, within } => {
-            let capacity = capacity()?;
-            let series = series()?;
-            let target = capacity * percent as f64 / 100.0;
-            match series.iter().find(|(_, bps, _)| *bps as f64 >= target) {
-                Some((at, _, _)) if *at <= within => {}
-                Some((at, _, _)) => {
-                    return Err(format!(
-                        "reached {percent}% of capacity ({target:.0} bps) only after {at:?}; \
-                         expected within {within:?}"
-                    ));
-                }
-                None => {
-                    let best = series.iter().map(|(_, b, _)| *b).max().unwrap_or(0);
-                    return Err(format!(
-                        "never reached {percent}% of capacity ({target:.0} bps); best was \
-                         {best} bps against {capacity:.0} bps of link"
-                    ));
-                }
-            }
-        }
         Property::QueueingDelayBelow(max) => {
             let standing = stats.mean_backlog();
             if standing > max {
@@ -5593,16 +5522,6 @@ fn check_property(
                     "bottleneck queue stood at {standing:?}; expected below {max:?} \
                      (peaked at {:?})",
                     stats.max_backlog
-                ));
-            }
-        }
-        Property::PeakQueueingDelayBelow(max) => {
-            if stats.max_backlog > max {
-                return Err(format!(
-                    "bottleneck queue reached {:?}; expected below {max:?} \
-                     (standing at {:?})",
-                    stats.max_backlog,
-                    stats.mean_backlog()
                 ));
             }
         }
@@ -5614,102 +5533,6 @@ fn check_property(
                     "{got:.1}% of offered packets were dropped by a full buffer \
                      ({} of {offered}); expected below {max}%",
                     stats.dropped_overflow
-                ));
-            }
-        }
-        Property::QualityChangesPerMinuteBelow { origin, max } => {
-            // Resolved here rather than read off the report: the report's map is filled by the
-            // end-of-plan scoreboard, which has not run yet mid-plan.
-            let Some(id) = handles
-                .get(origin)
-                .and_then(ParticipantHandle::participant_id)
-            else {
-                return Err(format!(
-                    "{origin} has no runtime participant id yet; add a Step::Run before this step"
-                ));
-            };
-            let changes = pulsebeam::sim_metrics::quality_changes(&id);
-            let minutes = window.as_secs_f64() / 60.0;
-            if minutes <= 0.0 {
-                return Err("the window has no duration to rate-limit against".to_string());
-            }
-            let rate = changes as f64 / minutes;
-            if rate > max as f64 {
-                return Err(format!(
-                    "{origin}'s layer changed {changes} times in {window:?} ({rate:.0}/min);                      expected at most {max}/min. Each change costs a keyframe and stutters the                      picture, so at this rate the stream never holds a layer long enough to                      decode and the viewer sees nothing at all"
-                ));
-            }
-        }
-        Property::AllocationWithinEstimate => {
-            let id = handle
-                .participant_id()
-                .ok_or_else(|| "participant never connected".to_string())?;
-            let (passes, above) = pulsebeam::sim_metrics::allocation_budget(&id)
-                .filter(|(passes, _)| *passes > 0)
-                .ok_or_else(|| "no allocation budget observations in this window".to_string())?;
-            if above > 0 {
-                return Err(format!(
-                    "selected media rate exceeded the estimate in {above}/{passes} allocation passes"
-                ));
-            }
-        }
-        Property::QualityReversalsBelow { origin, max } => {
-            let Some(id) = handles
-                .get(origin)
-                .and_then(ParticipantHandle::participant_id)
-            else {
-                return Err(format!(
-                    "{origin} has no runtime participant id yet; add a Step::Run before this step"
-                ));
-            };
-            let reversals = pulsebeam::sim_metrics::quality_reversals(&id);
-            if reversals > max {
-                let changes = pulsebeam::sim_metrics::quality_changes(&id);
-                return Err(format!(
-                    "{origin}'s layer reversed direction {reversals}x in {window:?} \
-                     ({changes} changes total); expected at most {max}. Climbing through layers is \
-                     fine, but reversing means the stream is oscillating rather than settling, and \
-                     every switch costs a keyframe and stutters the picture"
-                ));
-            }
-        }
-        Property::NeverForwardedAbove {
-            origin,
-            max_quality,
-        } => {
-            let Some(id) = handles
-                .get(origin)
-                .and_then(ParticipantHandle::participant_id)
-            else {
-                return Err(format!(
-                    "{origin} has no runtime participant id yet; add a Step::Run before this step"
-                ));
-            };
-            let Some(peak) = pulsebeam::sim_metrics::max_forwarded_quality(&id) else {
-                return Err(format!(
-                    "no allocation pass recorded {origin}, so nothing was measured and this \
-                     would pass vacuously"
-                ));
-            };
-            if peak > max_quality {
-                return Err(format!(
-                    "{origin} was forwarded at layer {peak}, above the requested ceiling of \
-                     {max_quality}. A viewer asking for a short tile is asking not to be sent a \
-                     taller one; sending it spends the link on pixels that will never be shown"
-                ));
-            }
-        }
-        Property::MediaEfficiencyAtLeast(min) => {
-            let received = handle.interval_delta(|stats| stats.bytes_received)?;
-            if received == 0 {
-                return Err("nothing was received, so the ratio would be meaningless".to_string());
-            }
-            let forwarded = handle.forwarded_media();
-            let got = pct(forwarded as f64, received as f64);
-            if got < min as f64 {
-                return Err(format!(
-                    "only {got:.1}% of received bytes were media ({forwarded} media / \
-                     {received} received); expected >= {min}%"
                 ));
             }
         }
@@ -6096,8 +5919,16 @@ impl LocalNodeSim {
         let sim_duration = plan
             .iter()
             .filter_map(|s| match s {
-                Step::Run { duration, .. } => Some(*duration),
-                Step::WaitForPublication { timeout, .. }
+                Step::Run { duration, .. } | Step::WaitSinceBootstrapRelease { duration, .. } => {
+                    Some(*duration)
+                }
+                Step::ReleaseHeldReconnect { held_for, .. } => Some(*held_for),
+                Step::MeasureSourceWindow { duration, .. } => {
+                    Some(*duration + Duration::from_secs(5))
+                }
+                Step::WaitForSourceVideo { timeout, .. } => Some(*timeout + Duration::from_secs(2)),
+                Step::BeginHeldReconnect { timeout, .. }
+                | Step::WaitForPublication { timeout, .. }
                 | Step::WaitForVideo { timeout, .. }
                 | Step::WaitForVideoAtResolution { timeout, .. } => Some(*timeout),
                 _ => None,
@@ -6139,19 +5970,19 @@ impl LocalNodeSim {
             BTreeMap::new()
         };
 
-        let (observation_tx, mut observation_rx) = mpsc::channel(1);
+        let (startup_tx, mut startup_rx) = mpsc::channel(1);
         let (server_tx, mut server_rx) = mpsc::channel(1);
         sim.host(server_ip, move || {
-            let observation_tx = observation_tx.clone();
+            let startup_tx = startup_tx.clone();
             async move {
                 let rng = pulsebeam_runtime::rand::seeded_rng(seed);
-                start_observed_sfu_node_with_transport(
+                start_sfu_node_with_transport(
                     server_ip,
                     rng,
                     num_shards,
                     tcp_only,
                     udp_only,
-                    Some(observation_tx),
+                    Some(startup_tx),
                 )
                 .await
                 .map_err(Into::into)
@@ -6211,6 +6042,7 @@ impl LocalNodeSim {
                 let shared = Arc::new(ParticipantShared::new(
                     quality_references.clone(),
                     h264_publishers.clone(),
+                    participant.solid_picture.clone(),
                     initial_topics
                         .get(participant.name)
                         .cloned()
@@ -6227,6 +6059,7 @@ impl LocalNodeSim {
                         subscribed_at: None,
                         interval_video_baseline: VideoReceiveStats::default(),
                         interval_decoded_video_baseline: BTreeMap::new(),
+                        interval_decoded_size_baseline: BTreeMap::new(),
                         native_video_baseline: Default::default(),
                         native_playback_track: None,
                         native_playback_started: false,
@@ -6272,18 +6105,24 @@ impl LocalNodeSim {
         let reports_inner = reports.clone();
         sim.client(coordinator_ip, async move {
             let mut handles = handles;
-            let observer = observation_rx
+            startup_rx
                 .recv()
                 .await
-                .expect("server supplies observer");
+                .expect("server startup acknowledgment");
             let mut server = ServerControl {
                 commands: server_tx,
-                observations: observation_rx,
-                observer,
+                startup_notifications: startup_rx,
             };
-            execute_plan(plan, &mut handles, &name_to_ip, &reports_inner, &mut server)
-                .await
-                .map_err(Into::into)
+            execute_plan(
+                plan,
+                &mut handles,
+                &name_to_ip,
+                &reports_inner,
+                &mut server,
+                self.link,
+            )
+            .await
+            .map_err(Into::into)
         });
 
         let wall_budget = sim_duration * 3 + Duration::from_secs(120);

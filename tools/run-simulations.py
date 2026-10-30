@@ -26,7 +26,7 @@ SETTINGS = ("RUST_LOG", "PROPTEST_CASES", "PROPTEST_MAX_LOCAL_REJECTS",
             "PROPTEST_RNG_SEED", "PROPTEST_VERBOSE", "PROPTEST_FORK",
             "PROPTEST_TIMEOUT", "PROPTEST_DISABLE_FAILURE_PERSISTENCE")
 SELECTION = ("mode", "filter", "exact", "skip", "run_skipped", "seeds", "from_seed",
-             "jobs", "discovery_timeout", "case_timeout")
+             "jobs", "discovery_timeout", "case_timeout", "history_search")
 REPLAY_LIMITS = ("Requires the same actual source candidate and supported toolchain. "
                  "Dirty fingerprints attribute sources but do not package them. "
                  "Regression RNG states use the current strategy, not historical scenarios.")
@@ -139,9 +139,11 @@ class Bundle:
         self.save()
         self.replay(self.root, self.manifest["selection"])
         self.env = os.environ.copy()
-        for key in (*SETTINGS, "PULSEBEAM_SIM_SEED", "PULSEBEAM_SIM_REGRESSIONS", "PULSEBEAM_SIM_HISTORY"):
+        for key in (*SETTINGS, "PULSEBEAM_SIM_SEED", "PULSEBEAM_SIM_REGRESSIONS", "PULSEBEAM_SIM_HISTORY", "PULSEBEAM_HISTORY_SEARCH"):
             self.env.pop(key, None)
         self.env.update(settings)
+        if args.history_search != "off":
+            self.env["PULSEBEAM_HISTORY_SEARCH"] = args.history_search
         if captured:
             self.env["PULSEBEAM_SIM_REGRESSIONS"] = str(self.root / captured["path"])
         if captured_history:
@@ -340,6 +342,8 @@ def main():
     parser.add_argument("--mode", choices=["fast", "slow", "all"], default="fast")
     parser.add_argument("--filter", default="")
     parser.add_argument("--exact", action="store_true", help="match the complete filtered case name")
+    parser.add_argument("--history-search", choices=["off", "guided", "unguided", "compare"], default="off",
+                        help="opt-in bounded advisory history search; compare uses equal per-arm budgets")
     parser.add_argument("--skip", action="append", default=[], help="exact documented gate exception")
     parser.add_argument("--run-skipped", action="store_true", help="explicitly execute documented gate exceptions")
     parser.add_argument("--seeds", type=int, default=1)
@@ -353,6 +357,8 @@ def main():
     def validate():
         if any(not math.isfinite(value) or value <= 0 for value in [args.discovery_timeout, args.case_timeout]):
             parser.error("host deadlines must be finite and positive")
+        if args.history_search != "off" and args.seeds != 1:
+            parser.error("advisory history search requires exactly one seed per invocation")
         if args.seeds < 1 or args.jobs < 1:
             parser.error("--seeds and --jobs must be positive")
         if args.from_seed is not None and not (0 <= args.from_seed <= args.from_seed + args.seeds - 1 < 2**64):

@@ -1,14 +1,17 @@
-use super::super::oracle::{ControlStateOracle, ExpectedParticipant};
+use super::super::oracle::{ApplicationStateOracle, ExpectedParticipant};
 use super::*;
-use crate::tests::histories::{CAST, Claim, History, Op, Witness};
+use crate::tests::histories::{CAST, Claim, Delivery, History, Op, Witness};
 use anyhow::{Context, Result, ensure};
+
+mod data;
+use data::DataLane;
+mod audio;
 
 struct Bound {
     name: &'static str,
     expected: ExpectedParticipant,
     retired: Option<Instant>,
     crashed: bool,
-    retirement_generation: Option<u64>,
 }
 
 struct HeldNativeMedia {
@@ -25,23 +28,59 @@ struct Transition {
     holds: BTreeMap<u8, Instant>,
     desired: Vec<String>,
     desired_tracks: Vec<String>,
-    outstanding_changes: Vec<(u64, u64)>,
+    continuing_logical: bool,
     admitting: BTreeSet<&'static str>,
     unresolved: BTreeSet<(&'static str, String)>,
     unresolved_publications: BTreeSet<(&'static str, String, String)>,
     stall: Option<Instant>,
-    stall_count: u64,
-    failed_count: u64,
-    orphan_count: u64,
+    stall_receipts: u64,
+    failed_receipts: u64,
     failed: bool,
     recovery_at: Instant,
+}
+
+fn publication_ids(expected: &ExpectedParticipant) -> BTreeSet<String> {
+    [
+        (expected.video, pulsebeam::entity::TrackKind::Video, "video"),
+        (expected.audio, pulsebeam::entity::TrackKind::Audio, "audio"),
+    ]
+    .into_iter()
+    .filter(|(present, _, _)| *present)
+    .map(|(_, kind, label)| expected.track_id(kind, label).as_str())
+    .collect()
 }
 
 fn observation(handle: &ParticipantHandle) -> Option<ClientObservation> {
     handle.shared.observation.lock().unwrap().clone()
 }
 
-fn name(index: u8) -> &'static str {
+fn requested_tracks(observed: &ClientObservation) -> BTreeSet<String> {
+    observed
+        .submitted
+        .video
+        .iter()
+        .map(|video| video.track_id.clone())
+        .collect()
+}
+
+fn mapped_tracks(observed: &ClientObservation) -> BTreeSet<String> {
+    observed.snapshot.video_mapping.values().cloned().collect()
+}
+
+fn request_changes(
+    previous_requested: &BTreeSet<String>,
+    previous_mapped: &BTreeSet<String>,
+    requested: &BTreeSet<String>,
+    mapped: &BTreeSet<String>,
+) -> (bool, bool) {
+    let changed = requested != previous_requested;
+    (
+        changed && previous_requested != previous_mapped,
+        changed && requested.is_empty() && !mapped.is_empty(),
+    )
+}
+
+fn fault_target(index: u8) -> &'static str {
     if index == 0 {
         "viewer"
     } else {
@@ -50,15 +89,6 @@ fn name(index: u8) -> &'static str {
 }
 
 impl Transition {
-    fn publication(&self, track: pulsebeam::entity::TrackId) -> Option<&Bound> {
-        self.bindings.iter().find(|b| {
-            b.expected.video
-                && b.expected
-                    .track_id(pulsebeam::entity::TrackKind::Video, "video")
-                    == track
-        })
-    }
-
     fn bind(&mut self, handles: &PlanHandles) -> Result<()> {
         for (name, handle) in handles.iter().filter(|(_, h)| h.present) {
             let Some(observed) = observation(handle) else {
@@ -77,30 +107,24 @@ impl Transition {
             {
                 continue;
             }
+            let intent = handle.shared.pending_ops.lock().unwrap().intent.clone();
             let expected = ExpectedParticipant {
                 id: id.parse()?,
                 room: handle.room_name,
                 video: handle.publishes_video,
                 video_label: handle.shared.video_label.lock().unwrap().clone(),
                 audio: handle.publishes_audio,
+                audio_pinned: intent.audio,
+                automatic_audio: intent.automatic_audio,
                 required: true,
                 connection: Some(connection),
-                topics: handle
-                    .shared
-                    .pending_ops
-                    .lock()
-                    .unwrap()
-                    .intent
-                    .topics
-                    .clone(),
-                video_targets: HashSet::new(),
+                topics: intent.topics,
             };
             self.bindings.push(Bound {
                 name,
                 expected,
                 retired: None,
                 crashed: false,
-                retirement_generation: None,
             });
             self.admitting.remove(name);
         }
@@ -115,11 +139,7 @@ impl Transition {
                 !self.bindings.iter().any(|b| {
                     b.expected.room == *room
                         && b.expected.id.as_str() == *origin
-                        && b.expected.video
-                        && b.expected
-                            .track_id(pulsebeam::entity::TrackKind::Video, "video")
-                            .as_str()
-                            == *track
+                        && publication_ids(&b.expected).contains(track)
                 })
             });
         ensure!(
@@ -135,34 +155,12 @@ impl Transition {
         Ok(())
     }
 
-    fn causal(
-        &mut self,
-        source: String,
-        present: BTreeSet<String>,
-        applied: Option<u64>,
-    ) -> Result<()> {
+    fn causal(&mut self, source: String, present: BTreeSet<String>) -> Result<()> {
         let retired = self
             .bindings
             .iter()
-            .filter(|b| {
-                b.retired.is_some()
-                    && applied.is_none_or(|generation| {
-                        b.retirement_generation
-                            .is_some_and(|fence| generation >= fence)
-                    })
-            })
-            .flat_map(|b| {
-                [
-                    format!(
-                        "{}:{:?}",
-                        b.expected.id.as_str(),
-                        b.expected.connection.unwrap()
-                    ),
-                    b.expected
-                        .track_id(pulsebeam::entity::TrackKind::Video, "video")
-                        .as_str(),
-                ]
-            })
+            .filter(|b| b.retired.is_some())
+            .flat_map(|b| publication_ids(&b.expected))
             .collect::<BTreeSet<_>>();
         let seen = self.seen.entry(source.clone()).or_default();
         let dead = self.tombstones.entry(source.clone()).or_default();
@@ -209,19 +207,30 @@ impl Transition {
                 }
             }
             for publication in observed.snapshot.publications.values() {
+                let (kind, label) = match publication.kind {
+                    pulsebeam_agent_native::agent_core::MediaKind::Video => {
+                        (pulsebeam::entity::TrackKind::Video, "video")
+                    }
+                    pulsebeam_agent_native::agent_core::MediaKind::Audio => {
+                        (pulsebeam::entity::TrackKind::Audio, "audio")
+                    }
+                };
                 ensure!(
-                    publication.kind == pulsebeam_agent_native::agent_core::MediaKind::Video
-                        && publication.label == "video",
-                    "unexpected history publication kind/label"
+                    publication.label == label,
+                    "unexpected history publication label"
                 );
                 if !self.bindings.iter().any(|b| {
                     b.expected.room == handle.room_name
                         && b.expected.id.as_str() == publication.participant_id
-                        && b.expected.video
-                        && b.expected
-                            .track_id(pulsebeam::entity::TrackKind::Video, "video")
-                            .as_str()
-                            == publication.id
+                        && (match publication.kind {
+                            pulsebeam_agent_native::agent_core::MediaKind::Video => {
+                                b.expected.video
+                            }
+                            pulsebeam_agent_native::agent_core::MediaKind::Audio => {
+                                b.expected.audio
+                            }
+                        })
+                        && b.expected.track_id(kind, label).as_str() == publication.id
                 }) {
                     ensure!(
                         !self.admitting.is_empty(),
@@ -234,21 +243,19 @@ impl Transition {
                     ));
                 }
             }
-            ControlStateOracle::check_client_safety(&observed, &allowed)
+            ApplicationStateOracle::check_client_safety(&observed, &allowed)
                 .with_context(|| format!("transition observer={name}"))?;
             for bound in self.bindings.iter().filter(|b| {
                 b.crashed
                     && b.retired
                         .is_some_and(|at| at.elapsed() >= CRASH_RETIREMENT_BUDGET)
             }) {
-                let track = bound
-                    .expected
-                    .track_id(pulsebeam::entity::TrackKind::Video, "video")
-                    .as_str();
-                ensure!(
-                    !observed.snapshot.publications.contains_key(&track),
-                    "crashed publication exceeded client retirement bound at {name}: {track}"
-                );
+                for track in publication_ids(&bound.expected) {
+                    ensure!(
+                        !observed.snapshot.publications.contains_key(&track),
+                        "crashed publication exceeded client retirement bound at {name}: {track}"
+                    );
+                }
                 if !self
                     .bindings
                     .iter()
@@ -268,196 +275,12 @@ impl Transition {
             self.causal(
                 format!("client:{name}:{:?}", observed.admission),
                 observed.snapshot.publications.keys().cloned().collect(),
-                None,
             )?;
         }
         for (index, since) in &self.holds {
             ensure!(
                 since.elapsed() <= Duration::from_secs(5),
                 "link hold exceeded five seconds: {index}"
-            );
-        }
-        Ok(())
-    }
-
-    async fn owners_safe(&mut self, observer: &pulsebeam::sim_observation::Observer) -> Result<()> {
-        let owners = tokio::time::timeout(Duration::from_secs(1), observer.observe())
-            .await
-            .context("transition owner observation deadline")?
-            .map_err(anyhow::Error::msg)?;
-        for bound in self
-            .bindings
-            .iter_mut()
-            .filter(|b| b.retired.is_some() && b.retirement_generation.is_none())
-        {
-            if !owners.control.participants.iter().any(|p| {
-                p.id == bound.expected.id && Some(p.connection) == bound.expected.connection
-            }) {
-                bound.retirement_generation = Some(owners.control.generation);
-            }
-        }
-        let known = self
-            .bindings
-            .iter()
-            .map(|b| (b.expected.id, &b.expected))
-            .collect::<BTreeMap<_, _>>();
-        for p in &owners.control.participants {
-            let expected = known
-                .get(&p.id)
-                .ok_or_else(|| anyhow::anyhow!("unplanned control admission: {p:?}"))?;
-            ensure!(
-                self.bindings
-                    .iter()
-                    .any(|b| b.expected.id == p.id && b.expected.connection == Some(p.connection))
-                    && p.room == expected.room_id()?,
-                "invalid control generation or room: {p:?}"
-            );
-        }
-        for track in &owners.control.tracks {
-            let expected = known
-                .get(&track.meta.origin)
-                .ok_or_else(|| anyhow::anyhow!("unplanned publication: {:?}", track.meta))?;
-            ensure!(
-                track.meta.room_id == expected.room_id()?
-                    && self
-                        .bindings
-                        .iter()
-                        .any(|b| b.expected.id == track.meta.origin
-                            && b.expected.connection == Some(track.meta.connection_id)
-                            && b.expected
-                                .track_id(pulsebeam::entity::TrackKind::Video, "video")
-                                == track.meta.id),
-                "foreign-room track"
-            );
-            for destination in track.candidates.iter().chain(&track.active) {
-                ensure!(
-                    known
-                        .get(destination)
-                        .is_some_and(|peer| peer.room == expected.room),
-                    "foreign-room forwarding origin"
-                );
-            }
-        }
-        let control = owners
-            .control
-            .participants
-            .iter()
-            .map(|p| format!("{}:{:?}", p.id.as_str(), p.connection))
-            .chain(owners.control.tracks.iter().map(|t| t.meta.id.as_str()))
-            .collect();
-        self.causal("control".into(), control, Some(owners.control.generation))?;
-        for shard in &owners.shards {
-            for p in &shard.participants {
-                let expected = self
-                    .bindings
-                    .iter()
-                    .find(|b| b.expected.id == p.id && b.expected.connection == Some(p.connection))
-                    .ok_or_else(|| anyhow::anyhow!("unplanned shard participant"))?;
-                ensure!(
-                    Some(p.connection) == expected.expected.connection,
-                    "invalid shard connection generation"
-                );
-            }
-            for participant in &shard.participants {
-                let destination = self
-                    .bindings
-                    .iter()
-                    .find(|b| {
-                        b.expected.id == participant.id
-                            && b.expected.connection == Some(participant.connection)
-                    })
-                    .context("unbound shard destination")?;
-                for slot in &participant.video.slots {
-                    let source = self
-                        .publication(slot.track)
-                        .context("unbound shard video assignment")?;
-                    ensure!(
-                        source.expected.id == slot.origin
-                            && source.expected.room == destination.expected.room,
-                        "invalid current shard video origin/room"
-                    );
-                }
-            }
-            for track in &shard.tracks {
-                ensure!(
-                    self.publication(*track).is_some(),
-                    "unbound shard track: {track}"
-                );
-            }
-            for plan in &shard.plans {
-                if let Some(track) = plan.track {
-                    let source = self
-                        .publication(track)
-                        .context("unbound shard plan track")?;
-                    for destination in plan.local.iter().flatten() {
-                        ensure!(
-                            self.bindings.iter().any(|b| b.expected.id == *destination
-                                && b.expected.room == source.expected.room),
-                            "foreign-room local plan destination"
-                        );
-                    }
-                }
-            }
-            for route in &shard.routes {
-                if let Some(track) = route.track {
-                    ensure!(
-                        self.publication(track).is_some(),
-                        "unbound shard route track"
-                    );
-                }
-            }
-            if shard.pending_generation.is_none() && shard.pending_effects == 0 {
-                self.causal(
-                    format!("shard:{:?}", shard.shard),
-                    shard
-                        .participants
-                        .iter()
-                        .map(|p| format!("{}:{:?}", p.id.as_str(), p.connection))
-                        .chain(shard.tracks.iter().map(pulsebeam::entity::TrackId::as_str))
-                        .chain(
-                            shard
-                                .participants
-                                .iter()
-                                .flat_map(|p| p.video.slots.iter().map(|slot| slot.track.as_str())),
-                        )
-                        .collect(),
-                    Some(shard.generation),
-                )?;
-            }
-        }
-        // The retirement deadline is anchored to the crash, never to the last failed checkpoint.
-        for bound in self.bindings.iter().filter(|b| {
-            b.crashed
-                && b.retired
-                    .is_some_and(|at| at.elapsed() >= CRASH_RETIREMENT_BUDGET)
-        }) {
-            let id = bound.expected.id;
-            let track = bound
-                .expected
-                .track_id(pulsebeam::entity::TrackKind::Video, "video");
-            ensure!(
-                !owners
-                    .control
-                    .participants
-                    .iter()
-                    .any(|p| p.id == id && Some(p.connection) == bound.expected.connection)
-                    && !owners.control.tracks.iter().any(|t| t.meta.id == track)
-                    && !owners
-                        .shards
-                        .iter()
-                        .any(|s| s.participants.iter().any(|p| p.id == id
-                            && Some(p.connection) == bound.expected.connection
-                            || p.video.slots.iter().any(|slot| slot.track == track))
-                            || s.tracks.contains(&track)
-                            || s.plans.iter().any(|p| p.track == Some(track))
-                            || s.routes.iter().any(|r| r.track == Some(track)))
-                    && !owners.control.placements.iter().any(|p| p.track == track)
-                    && !owners
-                        .control
-                        .subscriptions
-                        .iter()
-                        .any(|s| s.selector.track == Some(track)),
-                "crashed generation exceeded retirement bound: {id}"
             );
         }
         Ok(())
@@ -527,19 +350,8 @@ impl Transition {
                 })
                 .collect::<Result<Vec<_>>>()?
         };
-        self.outstanding_changes
-            .retain(|(_, baseline)| before.snapshot.accepted_intent_revision <= *baseline);
-        let predecessor = self
-            .outstanding_changes
-            .iter()
-            .copied()
-            .find(|(_, baseline)| {
-                before
-                    .last_successfully_sent_wire_revision
-                    .is_some_and(|sent| {
-                        sent > *baseline && sent > before.snapshot.accepted_intent_revision
-                    })
-            });
+        let previous_requested = requested_tracks(&before);
+        let previous_mapped = mapped_tracks(&before);
         self.recovery_at = self.recovery_at.max(Instant::now());
         let command =
             handle
@@ -553,10 +365,12 @@ impl Transition {
                         .zip(&tracks)
                         .map(|(id, track)| VideoSubscription {
                             participant_id: id.clone(),
-                            publication: Some(track.clone()),
+                            // The continuing call follows its logical publisher across
+                            // legitimate transport replacement. Viewer requests pin lifetimes.
+                            publication: (who != "continuing" || !self.continuing_logical)
+                                .then(|| track.clone()),
                             height: 180,
-                            min_height: 0,
-                            priority: 0,
+                            ..Default::default()
                         })
                         .collect(),
                 ));
@@ -564,21 +378,27 @@ impl Transition {
             loop {
                 self.clients_safe(handles)?;
                 if let Some(after) = observation(&handles[who]) && after.video_operation == command {
+                    let requested = requested_tracks(&after);
+                    let mapped = mapped_tracks(&after);
                     if who == "viewer" {
                         self.desired = targets.clone();
                         self.desired_tracks = tracks.clone();
-                        if self.holds.contains_key(&0) && predecessor.is_some_and(|(prior, _)| prior < command) && before.accepted.is_none() && after.submitted.revision > before.submitted.revision && after.accepted.is_none() {
-                            witness.reach("outstanding-replacement");
-                            if targets.is_empty() { witness.reach("outstanding-withdrawal"); }
+                        if self.holds.contains_key(&0) {
+                            let (replaces_pending, withdraws_pending) = request_changes(
+                                &previous_requested, &previous_mapped, &requested, &mapped,
+                            );
+                            if replaces_pending {
+                                witness.reach("outstanding-replacement");
+                            }
+                            if withdraws_pending {
+                                witness.reach("outstanding-withdrawal");
+                            }
                         }
                         if self.stall.is_some_and(|until| Instant::now() < until) && after.submitted.revision > before.submitted.revision {
                             witness.reach("issued-during-consumed-stall");
                         }
                     }
-                    if who == "viewer" && after.submitted.revision > before.submitted.revision {
-                        self.outstanding_changes.push((command, before.last_successfully_sent_wire_revision.unwrap_or(before.snapshot.accepted_intent_revision)));
-                    }
-                    witness.record(format!("issued receiver={who} command={command} predecessor={predecessor:?} app_revision={} wire_revision={:?} successful_wire_revision={:?} accepted_revision={} accepted={} targets={targets:?}", after.submitted.revision, after.sent_intent_revision, after.last_successfully_sent_wire_revision, after.snapshot.accepted_intent_revision, after.accepted.is_some()));
+                    witness.record(format!("issued receiver={who} command={command} app_revision={} previous_requested={previous_requested:?} previous_mapped={previous_mapped:?} requested={requested:?} mapped={mapped:?} targets={targets:?}", after.submitted.revision));
                     return Ok::<_, anyhow::Error>(());
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -600,17 +420,15 @@ pub(super) async fn execute(
     shared: &Mutex<Witness>,
     handles: &mut PlanHandles,
     ips: &PlanIps,
-    observer: &pulsebeam::sim_observation::Observer,
 ) -> Result<()> {
     let mut witness = shared.lock().unwrap().clone();
     use futures::FutureExt;
-    let result =
-        std::panic::AssertUnwindSafe(execute_inner(history, &mut witness, handles, ips, observer))
-            .catch_unwind()
-            .await;
+    let result = std::panic::AssertUnwindSafe(execute_inner(history, &mut witness, handles, ips))
+        .catch_unwind()
+        .await;
     for op in &history.ops {
         if let Op::Hold(i) = op {
-            turmoil::release(ips[name(*i)], ips["server"]);
+            turmoil::release(ips[fault_target(*i)], ips["server"]);
         }
     }
     *shared.lock().unwrap() = witness;
@@ -625,7 +443,6 @@ async fn execute_inner(
     witness: &mut Witness,
     handles: &mut PlanHandles,
     ips: &PlanIps,
-    observer: &pulsebeam::sim_observation::Observer,
 ) -> Result<()> {
     witness.phase = "establish".into();
     let mut state = Transition {
@@ -635,18 +452,22 @@ async fn execute_inner(
         holds: BTreeMap::new(),
         desired: Vec::new(),
         desired_tracks: Vec::new(),
-        outstanding_changes: Vec::new(),
+        continuing_logical: history
+            .ops
+            .iter()
+            .any(|op| matches!(op, Op::DeclareData(_))),
         admitting: BTreeSet::new(),
         unresolved: BTreeSet::new(),
         unresolved_publications: BTreeSet::new(),
         stall: None,
-        stall_count: pulsebeam::sim_metrics::controller_stalls_consumed(),
-        failed_count: pulsebeam::sim_metrics::routing_counter("materialization_failed"),
-        orphan_count: pulsebeam::sim_metrics::routing_counter("materialization_orphan"),
+        stall_receipts: 0,
+        failed_receipts: 0,
         failed: false,
         recovery_at: Instant::now(),
     };
-    state.bind(handles)?;
+    for who in ["anchor", "viewer", "continuing", "foreign", "bystander"] {
+        state.admitted(handles, who, None).await?;
+    }
     let anchor = handles["anchor"]
         .participant_id()
         .context("anchor admission")?;
@@ -656,9 +477,10 @@ async fn execute_inner(
     state
         .receive(handles, "continuing", vec![anchor.clone()], None, witness)
         .await?;
-    recover(&mut state, handles, observer, false).await?;
+    recover(&mut state, handles, false).await?;
     let mut continuing_before = decoded(handles, "continuing", &anchor);
     let mut held_media = BTreeMap::<u8, HeldNativeMedia>::new();
+    let mut data_lanes = BTreeMap::<Delivery, DataLane>::new();
     for (index, op) in history.ops.iter().enumerate() {
         witness.phase = format!("operation:{op:?}");
         witness.record(format!("operation={index} program={op:?}"));
@@ -816,7 +638,7 @@ async fn execute_inner(
                     .await?;
             }
             Op::Hold(i) => {
-                let who = name(*i);
+                let who = fault_target(*i);
                 let held_at_us = super::super::native::now_us()?;
                 state.holds.insert(*i, Instant::now());
                 turmoil::hold(ips[who], ips["server"]);
@@ -859,7 +681,7 @@ async fn execute_inner(
                 }
             }
             Op::Release(i) => {
-                let who = name(*i);
+                let who = fault_target(*i);
                 turmoil::release(ips[who], ips["server"]);
                 state.holds.remove(i);
                 held_media.remove(i);
@@ -875,28 +697,155 @@ async fn execute_inner(
                     witness.reach("explicit-readmission");
                 }
             }
+            Op::DeclareData(mode) => {
+                let lane = DataLane::declare(*mode, &mut state, handles).await?;
+                data_lanes.insert(*mode, lane);
+                witness.reach(&format!(
+                    "topic-{}-established-payload-service",
+                    mode.name()
+                ));
+            }
+            Op::ReplaceData(mode) => {
+                data_lanes
+                    .get_mut(mode)
+                    .context("declared data lane")?
+                    .replace()
+                    .await?;
+                witness.reach(&format!("topic-{}-old-owner-released", mode.name()));
+            }
+            Op::SendData(mode, tag) => {
+                let lane = data_lanes.get_mut(mode).context("declared data lane")?;
+                lane.send(*tag, &mut state, handles).await?;
+                witness.reach(&format!("topic-{}-mode-delivery", mode.name()));
+                if lane.replaced {
+                    witness.reach(&format!(
+                        "topic-{}-fresh-replacement-owner-delivery",
+                        mode.name()
+                    ));
+                    if !state.holds.is_empty()
+                        || state.stall.is_some_and(|until| Instant::now() < until)
+                    {
+                        witness.reach(&format!(
+                            "topic-{}-fresh-replacement-owner-delivery-during-pending",
+                            mode.name()
+                        ));
+                    }
+                }
+            }
+            Op::Audio {
+                pinned,
+                automatic,
+                fixed_ms,
+            } => {
+                audio::request(&mut state, handles, pinned, *automatic, *fixed_ms, witness).await?;
+            }
+            Op::AudioProgress => audio::progress(&mut state, handles, witness).await?,
+            Op::Pressure => audio::pressure(&mut state, handles, witness).await?,
+            Op::ReplaceSource(i) | Op::ReleaseSource(i) => {
+                let who = CAST[usize::from(*i)];
+                let admission = observation(&handles[who])
+                    .and_then(|o| o.admission)
+                    .context("source operation admission")?;
+                let before_source = tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        state.clients_safe(handles)?;
+                        if let Ok((source, _)) = source_context(handles, "viewer", who)
+                            && handles["viewer"]
+                                .video_rx()
+                                .decoded_from_incarnation(&source)
+                                .is_some_and(|decoded| decoded.frames > 0)
+                        {
+                            return Ok::<_, anyhow::Error>(source);
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .context("source service did not become visible before owner operation")??;
+                witness.reach("source-service-established-before-owner-operation");
+                let completed = Arc::new(AtomicBool::new(false));
+                let operation = if matches!(op, Op::ReplaceSource(_)) {
+                    PendingDriverOp::ReplaceVideoSource(completed.clone())
+                } else {
+                    PendingDriverOp::ReleaseReplacedVideoSource(completed.clone())
+                };
+                handles[who]
+                    .shared
+                    .pending_ops
+                    .lock()
+                    .unwrap()
+                    .push(operation);
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while !completed.load(Ordering::Acquire) {
+                        state.clients_safe(handles)?;
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    Ok::<_, anyhow::Error>(())
+                })
+                .await
+                .context("source input operation did not settle")??;
+                ensure!(
+                    observation(&handles[who]).and_then(|o| o.admission) == Some(admission),
+                    "local producer operation replaced its HTTP admission"
+                );
+                let (source, _) = source_context(handles, "viewer", who)?;
+                if matches!(op, Op::ReplaceSource(_)) {
+                    ensure!(
+                        source != before_source,
+                        "replacement reused source/capture namespace"
+                    );
+                    witness.reach("source-input-replaced-same-admission");
+                } else {
+                    ensure!(
+                        source == before_source,
+                        "retired close changed current source construction"
+                    );
+                    let before = handles["viewer"]
+                        .video_rx()
+                        .decoded_from_incarnation(&source)
+                        .map_or(0, |decoded| decoded.frames);
+                    tokio::time::timeout(Duration::from_secs(5), async {
+                        loop {
+                            state.clients_safe(handles)?;
+                            if handles["viewer"]
+                                .video_rx()
+                                .require_decoded_from_incarnation(&source, before, 1)
+                                .is_ok()
+                            {
+                                return Ok::<_, anyhow::Error>(());
+                            }
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                    })
+                    .await
+                    .context("replacement source did not decode after retired close")??;
+                    witness.reach("fresh-replacement-source-after-retired-close");
+                }
+                state.recovery_at = state.recovery_at.max(Instant::now());
+            }
             Op::Pause(ms) => {
                 state
                     .wait(handles, Duration::from_millis(u64::from(*ms)))
                     .await?;
             }
             Op::Stall => {
-                let before = pulsebeam::sim_metrics::controller_stalls_consumed();
-                pulsebeam::sim_metrics::request_controller_stall(Duration::from_secs(5));
-                state.stall = Some(Instant::now() + Duration::from_secs(5));
+                let (until, mut begun) =
+                    pulsebeam::sim_metrics::request_controller_stall(Duration::from_secs(5));
+                state.stall = Some(until);
                 state.recovery_at = state.recovery_at.max(state.stall.unwrap());
                 tokio::time::timeout(Duration::from_secs(1), async {
-                    while pulsebeam::sim_metrics::controller_stalls_consumed() == before {
+                    while let Err(error) = begun.try_recv() {
+                        ensure!(
+                            matches!(error, tokio::sync::oneshot::error::TryRecvError::Empty),
+                            "controller stall input cancelled"
+                        );
                         state.wait(handles, Duration::from_millis(10)).await?;
                     }
                     Ok::<_, anyhow::Error>(())
                 })
                 .await
                 .context("controller stall not consumed")??;
-                ensure!(
-                    pulsebeam::sim_metrics::controller_stalls_consumed() - before == 1,
-                    "stall consumption delta"
-                );
+                state.stall_receipts = state.stall_receipts.saturating_add(1);
                 continuing_before = decoded(handles, "continuing", &anchor);
                 witness.reach("controller-stall-consumed-once");
             }
@@ -910,35 +859,25 @@ async fn execute_inner(
                 pulsebeam::sim_metrics::fail_next_materialization();
                 handles["retry"].send_command(ParticipantCmd::Reconnect);
                 tokio::time::timeout(Duration::from_secs(5), async {
-                    while pulsebeam::sim_metrics::routing_counter("materialization_failed")
-                        == state.failed_count
-                        || *handles["retry"].shared.failed_admissions.lock().unwrap() == before
-                    {
+                    while *handles["retry"].shared.failed_admissions.lock().unwrap() == before {
                         state.wait(handles, Duration::from_millis(10)).await?;
                     }
                     Ok::<_, anyhow::Error>(())
                 })
                 .await
-                .context("materialization fault not consumed")??;
+                .context("application admission did not fail")??;
                 ensure!(
-                    pulsebeam::sim_metrics::routing_counter("materialization_failed")
-                        - state.failed_count
-                        == 1,
-                    "materialization consumption delta"
+                    *handles["retry"].shared.failed_admissions.lock().unwrap() - before == 1,
+                    "application admission failure count"
                 );
+                state.failed_receipts = state.failed_receipts.saturating_add(1);
                 state.failed = true;
-                witness.reach("materialization-consumed-once");
-                state.owners_safe(observer).await?;
+                witness.reach("application-admission-failed-once");
                 ensure!(
                     !handles["retry"].connected() && handles["retry"].participant_id().is_none(),
-                    "failed materialization admitted a client"
+                    "failed admission exposed a connected identity"
                 );
-                ensure!(
-                    pulsebeam::sim_metrics::routing_counter("materialization_orphan")
-                        == state.orphan_count,
-                    "materialization orphan"
-                );
-                witness.reach("no-materialization-orphan");
+                witness.reach("failed-admission-has-no-identity");
             }
             Op::Retry => {
                 ensure!(state.failed, "retry requires consumed failure");
@@ -956,9 +895,6 @@ async fn execute_inner(
         }
         witness.applied += 1;
         state.clients_safe(handles)?;
-        if state.holds.is_empty() && state.stall.is_none_or(|until| Instant::now() >= until) {
-            state.owners_safe(observer).await?;
-        }
         if state.stall.is_some_and(|until| Instant::now() < until)
             && decoded(handles, "continuing", &anchor) > continuing_before
         {
@@ -972,16 +908,15 @@ async fn execute_inner(
             .wait(handles, until.saturating_duration_since(Instant::now()))
             .await?;
     }
-    let stalls = pulsebeam::sim_metrics::controller_stalls_consumed() - state.stall_count;
-    let failures =
-        pulsebeam::sim_metrics::routing_counter("materialization_failed") - state.failed_count;
+    let stalls = state.stall_receipts;
+    let failures = state.failed_receipts;
     ensure!(
         stalls == u64::from(history.claim == Claim::Stall),
-        "per-history stall consumption mismatch"
+        "per-history stall input acknowledgment mismatch"
     );
     ensure!(
         failures == u64::from(history.claim == Claim::Materialization),
-        "per-history materialization consumption mismatch"
+        "per-history failed application admission mismatch"
     );
     let required: &[&str] = match history.claim {
         Claim::Exploration => &[],
@@ -993,8 +928,8 @@ async fn execute_inner(
             "unrelated-fresh-during-stall",
         ],
         Claim::Materialization => &[
-            "materialization-consumed-once",
-            "no-materialization-orphan",
+            "application-admission-failed-once",
+            "failed-admission-has-no-identity",
             "planned-admission-retry",
         ],
     };
@@ -1004,19 +939,24 @@ async fn execute_inner(
         witness.reached
     );
     witness.phase = "recovery".into();
-    recover(&mut state, handles, observer, true).await?;
+    recover(&mut state, handles, true).await?;
     witness.reach("converged-fresh-all-receivers-and-bystander");
     Ok(())
 }
 
-async fn recover(
-    state: &mut Transition,
-    handles: &PlanHandles,
-    observer: &pulsebeam::sim_observation::Observer,
-    final_check: bool,
-) -> Result<()> {
+async fn recover(state: &mut Transition, handles: &PlanHandles, final_check: bool) -> Result<()> {
     // Baselines are taken after the later of repair and the last recovery command.
     let started = Instant::now();
+    let current = state
+        .bindings
+        .iter()
+        .filter(|bound| {
+            bound.retired.is_none()
+                && observation(&handles[bound.name])
+                    .is_some_and(|observed| observed.admission == bound.expected.connection)
+        })
+        .map(|bound| bound.expected.clone())
+        .collect::<Vec<_>>();
     let mut intended = vec![
         ("continuing", handles["anchor"].participant_id().unwrap()),
         ("bystander", handles["foreign"].participant_id().unwrap()),
@@ -1026,11 +966,10 @@ async fn recover(
             .desired
             .iter()
             .filter(|id| {
-                state.bindings.iter().any(|b| {
-                    b.expected.id.as_str() == **id
-                        && b.retired.is_none()
+                current.iter().any(|binding| {
+                    binding.id.as_str() == **id
                         && state.desired_tracks.contains(
-                            &b.expected
+                            &binding
                                 .track_id(pulsebeam::entity::TrackKind::Video, "video")
                                 .as_str(),
                         )
@@ -1044,25 +983,24 @@ async fn recover(
     }
     // Withdrawal is valid, but the final positive claim must not be vacuous.
     ensure!(!intended.is_empty(), "empty final media oracle");
-    // Bind data-plane freshness to the SAME independent admission that
-    // supplies the expected publication ID, not a reusable logical publisher.
+    // Bind freshness to the independent admission and actual caller-created
+    // source lifetime, not a reusable logical publisher or restarted capture counter.
     let origins = intended
         .iter()
         .map(|(_, id)| {
-            let binding = state
-                .bindings
+            let binding = current
                 .iter()
-                .rev()
-                .find(|binding| binding.expected.id.as_str() == *id && binding.retired.is_none())
-                .context("intended media admission binding")?;
+                .find(|binding| binding.id.as_str() == *id)
+                .context("intended media current admission binding")?;
             let admission = binding
-                .expected
                 .connection
                 .context("intended media HTTP admission")?;
-            Ok(super::super::provenance::source_key(
+            super::super::provenance::current_source_key(
+                &handles["anchor"].shared.h264_publishers.lock().unwrap(),
                 &admission.to_string(),
                 "v0",
-            ))
+            )
+            .context("intended media source construction")
         })
         .collect::<Result<Vec<_>>>()?;
     let before = intended
@@ -1079,10 +1017,9 @@ async fn recover(
         .desired_tracks
         .iter()
         .filter(|track| {
-            state.bindings.iter().any(|b| {
-                b.retired.is_none()
-                    && b.expected.video
-                    && b.expected
+            current.iter().any(|binding| {
+                binding.video
+                    && binding
                         .track_id(pulsebeam::entity::TrackKind::Video, "video")
                         .as_str()
                         == **track
@@ -1103,20 +1040,11 @@ async fn recover(
     tokio::time::timeout(budget, async {
         loop {
             state.clients_safe(handles)?;
-            state.owners_safe(observer).await?;
-            match assert_convergence(handles, observer, "intent history recovery").await {
+            match assert_convergence(handles, "intent history recovery").await {
                 Ok(())
                     if (!final_check
                         || observation(&handles["viewer"])
-                            .and_then(|o| o.accepted)
-                            .is_some_and(|intent| {
-                                intent
-                                    .video
-                                    .into_iter()
-                                    .map(|v| v.track_id)
-                                    .collect::<BTreeSet<_>>()
-                                    == expected_tracks
-                            }))
+                            .is_some_and(|observed| mapped_tracks(&observed) == expected_tracks))
                         && intended.iter().zip(&origins).zip(&before).all(|(((receiver, _), origin), count)| {
                             handles[*receiver].video_rx().require_decoded_from_incarnation(origin, *count, 1).is_ok()
                         }) =>
@@ -1175,32 +1103,11 @@ async fn recover(
             .map(|v| v.participant_id.clone())
             .collect::<Vec<_>>();
         ensure!(actual == state.desired, "latest semantic intent lost");
-        let expected_tracks = state
-            .desired_tracks
-            .iter()
-            .filter(|track| {
-                state.bindings.iter().any(|b| {
-                    b.retired.is_none()
-                        && b.expected.video
-                        && b.expected
-                            .track_id(pulsebeam::entity::TrackKind::Video, "video")
-                            .as_str()
-                            == **track
-                })
-            })
-            .cloned()
-            .collect::<BTreeSet<_>>();
         let observed = observation(&handles["viewer"]).context("final receiver observation")?;
-        let accepted_tracks = observed
-            .accepted
-            .context("final intent not accepted")?
-            .video
-            .into_iter()
-            .map(|v| v.track_id)
-            .collect::<BTreeSet<_>>();
+        let mapped = mapped_tracks(&observed);
         ensure!(
-            accepted_tracks == expected_tracks,
-            "latest incarnation-specific intent lost: expected={expected_tracks:?}, accepted={accepted_tracks:?}"
+            mapped == expected_tracks,
+            "latest incarnation-specific request lost: expected={expected_tracks:?}, mapped={mapped:?}"
         );
         println!(
             "[history-recovery] simulated_ms={} intended={intended:?}",
@@ -1208,4 +1115,40 @@ async fn recover(
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::request_changes;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn request_claims_allow_cancellation_to_visible_state_and_idempotence() {
+        let tracks = |names: &[&str]| {
+            names
+                .iter()
+                .map(|name| (*name).to_owned())
+                .collect::<BTreeSet<_>>()
+        };
+        for (before, mapped, after, expected) in [
+            (vec!["y"], vec!["x"], vec!["x"], (true, false)),
+            (vec!["x"], vec!["x"], vec![], (false, true)),
+            (vec!["y"], vec!["x"], vec![], (true, true)),
+            (vec![], vec!["x"], vec![], (false, false)),
+            (vec!["x"], vec!["x"], vec!["y"], (false, false)),
+            (vec!["y"], vec!["x"], vec!["y"], (false, false)),
+            (vec!["y"], vec!["x"], vec!["z"], (true, false)),
+            (vec![], vec![], vec![], (false, false)),
+        ] {
+            assert_eq!(
+                request_changes(
+                    &tracks(&before),
+                    &tracks(&mapped),
+                    &tracks(&after),
+                    &tracks(&mapped)
+                ),
+                expected
+            );
+        }
+    }
 }

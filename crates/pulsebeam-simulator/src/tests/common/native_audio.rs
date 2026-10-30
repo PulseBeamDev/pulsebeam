@@ -90,15 +90,7 @@ impl NativePcmLog {
             if *observed_generation != generation || receiver.nontrivial_samples < min_samples {
                 continue;
             }
-            ensure!(
-                now.duration_since(receiver.last_at) <= Duration::from_millis(50),
-                "native PCM playout is stale"
-            );
-            ensure!(
-                receiver.max_gap <= Duration::from_millis(50),
-                "native PCM playout gap {:?}",
-                receiver.max_gap
-            );
+            Self::require_fresh(receiver, now)?;
             if let Some(limit) = max_silence {
                 ensure!(
                     receiver
@@ -113,6 +105,63 @@ impl NativePcmLog {
         ensure!(
             tracks.len() >= min_receivers,
             "generation {generation}: expected {min_receivers} native PCM receivers with {min_samples} nontrivial samples, got {}: {:?}",
+            tracks.len(),
+            self.receivers
+        );
+        Ok(tracks)
+    }
+
+    fn require_fresh(receiver: &Receiver, now: Instant) -> Result<()> {
+        ensure!(
+            now.duration_since(receiver.last_at) <= Duration::from_millis(50),
+            "native PCM playout is stale"
+        );
+        ensure!(
+            receiver.max_gap <= Duration::from_millis(50),
+            "native PCM playout gap {:?}",
+            receiver.max_gap
+        );
+        Ok(())
+    }
+
+    pub fn require_quiet(
+        &self,
+        generation: u64,
+        min_blocks: u64,
+        min_receivers: usize,
+        now: Instant,
+    ) -> Result<Vec<RemoteTrack>> {
+        self.require_silent(generation)?;
+        self.require_progress(generation, min_blocks, min_receivers, now)
+    }
+
+    pub fn require_progress(
+        &self,
+        generation: u64,
+        min_blocks: u64,
+        min_receivers: usize,
+        now: Instant,
+    ) -> Result<Vec<RemoteTrack>> {
+        ensure!(
+            min_blocks > 0 && min_receivers > 0,
+            "PCM progress requires actual blocks and receivers"
+        );
+        ensure!(
+            self.invalid.is_none(),
+            "invalid native PCM observation: {:?}",
+            self.invalid
+        );
+        let mut tracks = Vec::new();
+        for ((observed, _), receiver) in &self.receivers {
+            if *observed != generation || receiver.blocks < min_blocks {
+                continue;
+            }
+            Self::require_fresh(receiver, now)?;
+            tracks.push(receiver.track.clone());
+        }
+        ensure!(
+            tracks.len() >= min_receivers,
+            "generation {generation}: expected {min_receivers} PCM receivers with {min_blocks} actual blocks, got {}: {:?}",
             tracks.len(),
             self.receivers
         );
@@ -145,14 +194,22 @@ fn entries(report: &serde_json::Value) -> Result<Vec<&serde_json::Value>> {
     }
 }
 
-pub fn require_decoder_report(report: &[u8], mid: &str) -> Result<()> {
+fn decoder_counts(report: &[u8], mid: &str) -> Result<(u64, u64, u64)> {
     let report = serde_json::from_slice(report)?;
-    let inbound = entries(&report)?
-        .into_iter()
+    let records = entries(&report)?;
+    let inbound = records
+        .iter()
+        .copied()
         .find(|entry| {
             entry["type"] == "inbound-rtp" && entry["kind"] == "audio" && entry["mid"] == mid
         })
-        .context("native inbound audio report unavailable")?;
+        .with_context(|| {
+            let mids = records.iter()
+                .filter(|entry| entry["type"] == "inbound-rtp" && entry["kind"] == "audio")
+                .map(|entry| &entry["mid"])
+                .collect::<Vec<_>>();
+            format!("native inbound audio report unavailable for MID {mid:?}; reported audio MIDs={mids:?}")
+        })?;
     let received = inbound["totalSamplesReceived"]
         .as_u64()
         .context("native received sample count unavailable")?;
@@ -162,6 +219,11 @@ pub fn require_decoder_report(report: &[u8], mid: &str) -> Result<()> {
     let emitted = inbound["jitterBufferEmittedCount"]
         .as_u64()
         .context("native jitter-buffer emitted count unavailable")?;
+    Ok((received, concealed, emitted))
+}
+
+pub fn require_decoder_report(report: &[u8], mid: &str) -> Result<()> {
+    let (received, concealed, emitted) = decoder_counts(report, mid)?;
     ensure!(
         emitted > 0 && received > concealed,
         "native audio has no non-concealed decode progress: received={received}, concealed={concealed}, emitted={emitted}"
@@ -172,6 +234,49 @@ pub fn require_decoder_report(report: &[u8], mid: &str) -> Result<()> {
         concealed,
         emitted,
         "actual native audio receive/decode readback"
+    );
+    Ok(())
+}
+
+pub fn require_decoder_progress(before: &[u8], after: &[u8], mid: &str) -> Result<()> {
+    let (before_received, before_concealed, before_emitted) = decoder_counts(before, mid)?;
+    let (received, concealed, emitted) = decoder_counts(after, mid)?;
+    ensure!(
+        received >= before_received && concealed >= before_concealed && emitted >= before_emitted,
+        "native audio counters regressed within the measurement window"
+    );
+    ensure!(
+        received - before_received > concealed - before_concealed && emitted > before_emitted,
+        "native audio window has no new non-concealed decode progress: received={before_received}->{received}, concealed={before_concealed}->{concealed}, emitted={before_emitted}->{emitted}"
+    );
+    Ok(())
+}
+
+pub fn require_decoder_receivers(
+    before: Option<&[u8]>,
+    after: &[u8],
+    tracks: &[RemoteTrack],
+    required: usize,
+) -> Result<()> {
+    ensure!(required > 0, "audio decode requires actual receivers");
+    let mut decoded = std::collections::BTreeSet::new();
+    let mut failures = Vec::new();
+    for track in tracks {
+        let result = match before {
+            Some(before) => require_decoder_progress(before, after, &track.mid),
+            None => require_decoder_report(after, &track.mid),
+        };
+        match result {
+            Ok(()) => {
+                decoded.insert(&track.mid);
+            }
+            Err(error) => failures.push(format!("MID {:?}: {error:#}", track.mid)),
+        }
+    }
+    ensure!(
+        decoded.len() >= required,
+        "expected {required} distinct decoded audio receivers, got {}; candidates={failures:?}",
+        decoded.len()
     );
     Ok(())
 }
@@ -240,6 +345,10 @@ mod tests {
         assert!(log.require_silent(1).is_err());
         log.observe(&pcm(1, false), now + Duration::from_millis(20));
         assert!(
+            log.require(1, 480, 1, None, now + Duration::from_millis(20))
+                .is_ok()
+        );
+        assert!(
             log.require(
                 1,
                 480,
@@ -293,6 +402,101 @@ mod tests {
         let mut concealed = report;
         concealed[0]["concealedSamples"] = 9600.into();
         assert!(require_decoder_report(&serde_json::to_vec(&concealed).unwrap(), "2").is_err());
+    }
+
+    #[test]
+    fn quiet_pcm_requires_actual_fresh_complete_blocks_in_the_current_generation() {
+        let now = Instant::now();
+        let mut log = NativePcmLog::default();
+        assert!(log.require_quiet(1, 2, 1, now).is_err());
+        log.observe(&pcm(1, false), now);
+        assert!(log.require_quiet(1, 2, 1, now).is_err());
+        log.observe(&pcm(1, false), now + Duration::from_millis(10));
+        assert!(
+            log.require_quiet(1, 2, 1, now + Duration::from_millis(10))
+                .is_ok()
+        );
+        assert!(
+            log.require_quiet(2, 2, 1, now + Duration::from_millis(10))
+                .is_err()
+        );
+        assert!(
+            log.require_quiet(1, 2, 2, now + Duration::from_millis(10))
+                .is_err()
+        );
+        assert!(
+            log.require_quiet(1, 2, 1, now + Duration::from_secs(1))
+                .is_err()
+        );
+        log.observe(&pcm(1, false), now + Duration::from_secs(1));
+        assert!(
+            log.require_quiet(1, 2, 1, now + Duration::from_secs(1))
+                .is_err()
+        );
+        log.begin_window();
+        assert!(
+            log.require_quiet(1, 1, 1, now + Duration::from_secs(1))
+                .is_err()
+        );
+        log.observe(&pcm(1, true), now + Duration::from_secs(1));
+        assert!(
+            log.require_quiet(1, 1, 1, now + Duration::from_secs(1))
+                .is_err()
+        );
+        assert!(
+            log.require_progress(1, 1, 1, now + Duration::from_secs(1))
+                .is_ok()
+        );
+        log.begin_window();
+        let mut invalid = pcm(1, false);
+        invalid.metadata.samples_per_channel = None;
+        log.observe(&invalid, now + Duration::from_secs(1));
+        assert!(
+            log.require_quiet(1, 1, 1, now + Duration::from_secs(1))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn decoder_progress_rejects_old_success_and_concealment_only_windows() {
+        let before = serde_json::json!([{"type":"inbound-rtp","kind":"audio","mid":"2","totalSamplesReceived":9600,"concealedSamples":480,"jitterBufferEmittedCount":9600}]);
+        let bytes = |report: &serde_json::Value| serde_json::to_vec(report).unwrap();
+        assert!(require_decoder_progress(&bytes(&before), &bytes(&before), "2").is_err());
+        let mut after = before.clone();
+        after[0]["totalSamplesReceived"] = 10080.into();
+        after[0]["jitterBufferEmittedCount"] = 10080.into();
+        assert!(require_decoder_progress(&bytes(&before), &bytes(&after), "2").is_ok());
+        after[0]["concealedSamples"] = 960.into();
+        assert!(require_decoder_progress(&bytes(&before), &bytes(&after), "2").is_err());
+        after[0]["totalSamplesReceived"] = 9000.into();
+        assert!(require_decoder_progress(&bytes(&before), &bytes(&after), "2").is_err());
+        assert!(require_decoder_progress(&bytes(&before), &bytes(&before), "missing").is_err());
+    }
+
+    #[test]
+    fn receiver_progress_counts_distinct_active_mids_not_idle_surplus_slots() {
+        let before = serde_json::json!([
+            {"type":"inbound-rtp","kind":"audio","mid":"2","totalSamplesReceived":9600,"concealedSamples":480,"jitterBufferEmittedCount":9600},
+            {"type":"inbound-rtp","kind":"audio","mid":"3","totalSamplesReceived":9600,"concealedSamples":480,"jitterBufferEmittedCount":9600}
+        ]);
+        let mut after = before.clone();
+        after[0]["totalSamplesReceived"] = 10080.into();
+        after[0]["jitterBufferEmittedCount"] = 10080.into();
+        let before = serde_json::to_vec(&before).unwrap();
+        let after = serde_json::to_vec(&after).unwrap();
+        let active = pcm(1, true).track;
+        let mut idle = active.clone();
+        idle.mid = "3".into();
+        idle.receiver += 1;
+        let tracks = [active.clone(), idle.clone()];
+        assert!(require_decoder_receivers(Some(&before), &after, &tracks, 1).is_ok());
+        assert!(require_decoder_receivers(Some(&before), &after, &tracks, 2).is_err());
+        assert!(require_decoder_receivers(Some(&before), &after, &[idle], 1).is_err());
+        assert!(
+            require_decoder_receivers(Some(&before), &after, &[active.clone(), active], 2).is_err()
+        );
+        assert!(require_decoder_receivers(Some(&before), &before, &tracks, 1).is_err());
+        assert!(require_decoder_receivers(None, &before, &tracks, 2).is_ok());
     }
 
     #[test]

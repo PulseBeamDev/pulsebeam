@@ -107,8 +107,9 @@ signaling update.
 
 ## State invariants
 
-Every settled assertion must be expressible as an equality or a monotonicity
-claim over these sets:
+Production owners enforce structural invariants locally. Simulation proves the
+corresponding public lifecycle and recipient-output contracts, not these private
+sets through exported snapshots:
 
 1. **Control authority.** A live participant has exactly one current
    connection generation, room and owner shard. A retired generation cannot
@@ -138,33 +139,30 @@ claim over these sets:
    prove traffic moved; a negative assertion must prove the bystander did not
    receive it.
 
-The shard owns its state. The oracle may compare snapshots only after they have
-crossed the same value-message boundary as production; it must not read shard
-internals through shared mutable state or combine independent counters into a
-fake snapshot.
+The shard owns its state. Keep its slot, epoch, route and projection invariants
+inline with production ownership transitions. Exporting private values through
+messages or SDK wrappers does not make them public correctness observations.
 
 ## Required harness assertions
 
-The common harness uses one reusable `ControlStateOracle`, not test-specific
-maps of discovered IDs. It models participant, publication, subscription,
-assignment and topic intent from plan operations, binds opaque admission IDs,
-and compares coherent control, shard and native-client values. Each owner
-produces its own value; collection does not require a global atomic snapshot.
+The common harness uses `ApplicationStateOracle` for intent derived from plan
+operations, not server-selected expectations. It binds opaque active admission
+IDs through public HTTP/native facts and compares SDK catalog, bindings and
+recipient output. It does not read control/shard state, wire acknowledgements,
+private route counters or server allocation estimates.
 
 Settled and post-recovery checkpoints assert:
 
 - exact live participant and publication sets for every observer;
 - exact video and audio assignments, including origin and kind, independently of forwarding state;
 - no duplicate publication, group member, slot binding or data delivery;
-- no stale participant, track, assignment, route, topic or epoch after removal;
-- all live control objects have a corresponding shard projection;
-- all required shard projections have a live control owner;
-- pending subscriptions are either still valid and bounded or have been
-  consumed/released exactly once;
+- no stale participant, track, assignment or delivered topic after removal;
+- pending intent remains legal while bounded; repaired intent converges;
+- retired producer and receiver generations cannot credit replacement output;
 - established unrelated media stays live while control catches up;
 - every intended recipient and every intentional bystander is checked;
-- at least one positive frame/message/hop occurred before a success oracle can
-  pass.
+- positive actual decoded frames or exact messages occur before a delivery
+  assertion passes; source-age claims additionally cover the complete window.
 
 `assert_room_state_consistent` remains a fast safety check. Settled checkpoints
 also run the independent convergence oracle. Discovery alone, global frame

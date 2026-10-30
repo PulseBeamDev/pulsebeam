@@ -29,6 +29,66 @@ function signalingWire(protobuf) {
   }
   return join([Math.min(protobuf.length, 15) * 16], lengths, protobuf);
 }
+// Decode controlled peer requests, including the actual opaque seed token.
+// The fixture must not guess SDK-private token allocation or cursor state.
+function signalingPayload(block) {
+  let offset = 0;
+  const output = [];
+  const length = (initial) => {
+    let size = initial;
+    if (size === 15) {
+      let extra;
+      do {
+        assert.ok(offset < block.length);
+        extra = block[offset++];
+        size += extra;
+      } while (extra === 255);
+    }
+    return size;
+  };
+  while (offset < block.length) {
+    const token = block[offset++];
+    const literals = length(token >> 4);
+    assert.ok(offset + literals <= block.length);
+    output.push(...block.subarray(offset, offset + literals));
+    offset += literals;
+    if (offset === block.length) break;
+    assert.ok(offset + 2 <= block.length);
+    const distance = block[offset++] | (block[offset++] << 8);
+    assert.ok(distance > 0 && distance <= output.length);
+    const matched = length(token & 15) + 4;
+    for (let index = 0; index < matched; index++)
+      output.push(output[output.length - distance]);
+    assert.ok(output.length <= 65_536);
+  }
+  return Uint8Array.from(output);
+}
+function fields(message) {
+  let offset = 0;
+  const read = () => {
+    let value = 0n;
+    for (let shift = 0n; shift < 70n; shift += 7n) {
+      assert.ok(offset < message.length);
+      const byte = message[offset++];
+      value |= BigInt(byte & 127) << shift;
+      if (byte < 128) return value;
+    }
+    assert.fail("invalid controlled protobuf varint");
+  };
+  const result = new Map();
+  while (offset < message.length) {
+    const tag = Number(read());
+    if ((tag & 7) === 0) result.set(tag >> 3, read());
+    else {
+      assert.equal(tag & 7, 2);
+      const size = Number(read());
+      assert.ok(offset + size <= message.length);
+      result.set(tag >> 3, message.subarray(offset, offset + size));
+      offset += size;
+    }
+  }
+  return result;
+}
 const participant = (canonical, external) =>
   bytes(1, join(text(1, canonical), text(2, external)));
 const track = (id, owner) =>
@@ -231,6 +291,16 @@ export async function topicContract(pulsebeam) {
         agent.getSnapshot().catalog.revision === 1 &&
         agent.getSnapshot().mapping.acceptedIntentRevision === 1,
       "initial signaling state was not applied",
+    );
+    let seed;
+    await until(() => {
+      seed = signaling.sent
+        .map((wire) => fields(signalingPayload(wire)).get(3))
+        .find((request) => request !== undefined);
+      return seed !== undefined;
+    }, "ordered subscription seed was not requested");
+    signaling.receive(
+      signalingWire(bytes(6, join(uint(1, fields(seed).get(1)), uint(2, 1)))),
     );
     return peer;
   }

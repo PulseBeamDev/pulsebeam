@@ -112,8 +112,6 @@ struct AuthorizationExpiryWork {
 
 #[derive(Debug, derive_more::From)]
 pub enum ControllerCommand {
-    #[cfg(feature = "sim")]
-    Observe(oneshot::Sender<crate::sim_observation::PendingObservation>),
     CreateParticipant(
         CreateParticipant,
         oneshot::Sender<Result<CreateParticipantReply, ControllerError>>,
@@ -379,25 +377,6 @@ impl ControllerActor {
 
     fn process_command(&mut self, command: ControllerCommand) -> Option<RequiredAction> {
         match command {
-            #[cfg(feature = "sim")]
-            ControllerCommand::Observe(reply) => {
-                let mut control = self.lifecycle.observation();
-                control.participants = self.core.registry.observation();
-                control.shard_generations = self
-                    .updates
-                    .iter()
-                    .map(crate::shard_update::ShardUpdateWriter::observed_generation)
-                    .collect();
-                let mut shards = Vec::with_capacity(self.router.shard_count());
-                for index in 0..self.router.shard_count() {
-                    let (send, receive) = oneshot::channel();
-                    self.command_backlog
-                        .push_back((ShardId::new(index), ShardCommand::Observe(send)));
-                    shards.push(receive);
-                }
-                let _ = reply.send(crate::sim_observation::PendingObservation { control, shards });
-                None
-            }
             ControllerCommand::CreateParticipant(message, reply) => {
                 match self.begin_create_participant(message.state, message.offer) {
                     Ok(pending) => Some(RequiredAction::Materialize {
@@ -610,6 +589,46 @@ impl ControllerActor {
                 );
                 for outcome in outcomes {
                     self.publish_track_lifecycle(outcome);
+                }
+            }
+            ShardEvent::SubscriptionSeedRequested {
+                room_id,
+                subscriber,
+                connection_id,
+                selector,
+                seed_id,
+            } => {
+                if !self.current_incarnation(subscriber, connection_id) {
+                    return;
+                }
+                let outcomes = self.lifecycle.subscribe(
+                    room_id,
+                    subscriber,
+                    selector,
+                    SelectionPolicy::All,
+                    &self.core.registry,
+                    tokio::time::Instant::now(),
+                );
+                for outcome in outcomes {
+                    self.publish_track_lifecycle(outcome);
+                }
+                if let Some(shard) = self
+                    .core
+                    .registry
+                    .get_participant(&subscriber)
+                    .map(|meta| meta.shard_id)
+                {
+                    let generation = self.lifecycle.next_generation();
+                    self.stage_participant_at(
+                        shard,
+                        generation,
+                        subscriber,
+                        crate::participant::ParticipantEffect::SubscriptionSeedComplete {
+                            connection_id,
+                            seed_id,
+                        },
+                    );
+                    self.publish_staged();
                 }
             }
             ShardEvent::TrackSubscriptionRemoved {
@@ -1382,32 +1401,41 @@ mod replacement_tests {
         shard::metrics::ShardMetrics, shard_update::new_shard_update,
     };
 
+    fn actor() -> ControllerActor {
+        actor_with_shards(1)
+    }
+
     #[allow(
         clippy::disallowed_types,
         reason = "the production ShardContext owns the sanctioned shared occupancy counters"
     )]
-    fn actor() -> ControllerActor {
-        let (command_tx, _command_rx) =
-            mailbox::bounded(const { core::num::NonZeroUsize::new(4).unwrap() });
+    fn actor_with_shards(shard_count: usize) -> ControllerActor {
         let (renewal_tx, renewal_rx) = tokio::sync::mpsc::channel(MAX_PENDING_RENEWALS);
-        let context = ShardContext {
-            command_tx,
-            metrics: std::sync::Arc::new(ShardMetrics::new()),
-        };
-        let (update, _update_rx) = new_shard_update(ShardId::new(0));
+        let mut contexts = Vec::new();
+        let mut updates = Vec::new();
+        for index in 0..shard_count {
+            let (command_tx, _command_rx) =
+                mailbox::bounded(const { core::num::NonZeroUsize::new(4).unwrap() });
+            contexts.push(ShardContext {
+                command_tx,
+                metrics: std::sync::Arc::new(ShardMetrics::new()),
+            });
+            let (update, _update_rx) = new_shard_update(ShardId::new(index));
+            updates.push(update);
+        }
         ControllerActor {
-            router: crate::control::router::ShardRouter::new(vec![context]),
-            core: ControllerCore::with_shards(1, 1, RoomPartitionPlacement::Hashed),
+            router: crate::control::router::ShardRouter::new(contexts),
+            core: ControllerCore::with_shards(shard_count, 1, RoomPartitionPlacement::Hashed),
             negotiator: Negotiator::new(Vec::new()),
             clock: crate::clock::WallAnchor::from(pulsebeam_runtime::net::ReceiveTime::now()),
             cluster_id: 0,
             node_id: 0,
-            updates: vec![update],
-            update_touched: vec![false],
+            updates,
+            update_touched: vec![false; shard_count],
             pending_updates: VecDeque::new(),
-            update_queued: vec![false],
+            update_queued: vec![false; shard_count],
             egress_ready: false,
-            lifecycle: TrackLifecycle::new(1),
+            lifecycle: TrackLifecycle::new(shard_count),
             command_backlog: VecDeque::new(),
             authorization_expiries: BTreeSet::new(),
             key_registry: None,
@@ -1415,6 +1443,60 @@ mod replacement_tests {
             renewal_rx,
             renewals_inflight: 0,
             steering: None,
+        }
+    }
+
+    struct RecordingSteering(
+        tokio::sync::mpsc::Sender<(std::net::SocketAddr, std::net::SocketAddr, u16)>,
+    );
+
+    impl Steering for RecordingSteering {
+        fn pin_flow_to_owner(
+            &mut self,
+            source: std::net::SocketAddr,
+            destination: std::net::SocketAddr,
+            shard: u16,
+        ) {
+            self.0.try_send((source, destination, shard)).unwrap();
+        }
+    }
+
+    #[test]
+    fn authenticated_transport_pins_the_exact_flow_and_queues_source_authentication() {
+        let source = "203.0.113.7:40000".parse().unwrap();
+        let destination = "198.51.100.1:3478".parse().unwrap();
+        for (owner, ingress) in [(0, 1), (1, 0)] {
+            let mut actor = actor_with_shards(2);
+            let owner_shard = ShardId::new(owner);
+            let source_shard = ShardId::new(ingress);
+            let address = crate::route::NodeTransportAddress::new(
+                crate::route::TransportRoute::new(owner_shard, 51),
+                7,
+            );
+            let (pins, mut received) = tokio::sync::mpsc::channel(2);
+            actor.set_steering(Some(Box::new(RecordingSteering(pins))));
+            actor.handle_shard_event((
+                owner_shard,
+                ShardEvent::TransportAuthenticated {
+                    source,
+                    destination,
+                    source_shard,
+                    address,
+                    shard: owner_shard,
+                },
+            ));
+
+            assert_eq!(
+                received.try_recv().unwrap(),
+                (source, destination, u16::try_from(owner).unwrap())
+            );
+            assert!(received.try_recv().is_err(), "one flow must be pinned once");
+            assert!(matches!(
+                actor.command_backlog.pop_front(),
+                Some((target, ShardCommand::AuthenticateTransport { source: actual_source, address: actual_address }))
+                    if target == source_shard && actual_source == source && actual_address == address
+            ));
+            assert!(actor.command_backlog.is_empty());
         }
     }
 

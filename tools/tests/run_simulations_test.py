@@ -32,6 +32,7 @@ PROVENANCE = "STABLE_SIM_REVISION " + "a" * 40 + "\nSTABLE_SIM_DIRTY true\nSTABL
 class SimulationRunnerContract(unittest.TestCase):
     def invoke(self, *args, failing=()):
         executed = []
+        self.search_modes = []
         output = StringIO()
 
         def run(command, trace, **kwargs):
@@ -40,6 +41,7 @@ class SimulationRunnerContract(unittest.TestCase):
                 trace.write("".join(f"{name}: test\n" for name in names))
                 return 0, None
             name = command[2]
+            self.search_modes.append(kwargs["env"].get("PULSEBEAM_HISTORY_SEARCH"))
             executed.append((name, kwargs["env"].get("PULSEBEAM_SIM_SEED"), command))
             trace.write(f"complete trace for {name}\n")
             trace.write("[simulation-generated] budget=20 accepted=28 rejected=0 failed=0\n")
@@ -61,6 +63,20 @@ class SimulationRunnerContract(unittest.TestCase):
             self.replays = [json.loads(path.read_text()) for path in Path(temp).glob("simulations/run-*/case-*/replay.json")]
             self.results = [json.loads(path.read_text()) for path in Path(temp).glob("simulations/run-*/case-*/result.json")]
         return status, executed, output.getvalue()
+
+    def test_advisory_search_is_explicit_captured_and_does_not_leak_from_environment(self):
+        with patch.dict(os.environ, {"PULSEBEAM_HISTORY_SEARCH": "wrong"}):
+            status, _, output = self.invoke("--filter", FAST, "--history-search", "guided")
+            self.assertEqual(status, 0, output)
+            self.assertEqual(self.search_modes, ["guided"])
+            self.assertEqual(self.manifest["selection"]["history_search"], "guided")
+            self.assertEqual(self.replays[0]["selection"]["history_search"], "guided")
+            status, _, output = self.invoke("--filter", FAST)
+            self.assertEqual(status, 0, output)
+            self.assertEqual(self.search_modes, [None])
+            self.assertEqual(self.manifest["selection"]["history_search"], "off")
+        status, _, _ = self.invoke("--history-search", "guided", "--seeds", "2")
+        self.assertEqual(status, 2)
 
     def test_success_keeps_host_timings_after_trace_cleanup(self):
         status, _, output = self.invoke("--filter", FAST)
@@ -359,12 +375,13 @@ class SimulationProcessesContract(unittest.TestCase):
                 env = {"PULSEBEAM_SIM_REGRESSIONS": str(corpus), "EXPECT_CORPUS": corpus.read_text(),
                        "RUST_LOG": "off", "PROPTEST_CASES": "3", "PRIVATE_TOKEN": "never retain this",
                        "FAIL_CASE": "tests::first", "MUTATE_CORPUS": str(corpus)}
-                result = self.run_fixture(root, "--filter", "tests::first", "--exact", "--seed", "73", env=env)
+                result = self.run_fixture(root, "--filter", "tests::first", "--exact", "--seed", "73", "--history-search", "guided", env=env)
                 self.assertEqual(result.returncode, 1, result.stderr)
                 bundle = next(root.glob("simulations/run-*"))
                 manifest = json.loads((bundle / "manifest.json").read_text())
                 self.assertEqual(manifest["candidate"]["dirty"], True)
                 self.assertEqual(manifest["selection"]["from_seed"], 73)
+                self.assertEqual(manifest["selection"]["history_search"], "guided")
                 self.assertEqual(manifest["settings"], {"RUST_LOG": "off", "PROPTEST_CASES": "3"})
                 self.assertEqual(corpus.read_text(), "changed after capture")
                 case = bundle / "case-0000"
@@ -382,6 +399,7 @@ class SimulationProcessesContract(unittest.TestCase):
             new = next(fresh.glob("simulations/run-*"))
             record = json.loads((new / "manifest.json").read_text())["cases"][0]
             self.assertEqual(record["seed"], 73)
+            self.assertEqual(json.loads((new / "manifest.json").read_text())["selection"]["history_search"], "guided")
             self.assertEqual(record["exit_status"], 7)
             self.assertIn("captured corpus=retained RNG input", (new / "case-0000/trace.log").read_text())
             wrong = fresh / "other-candidate"

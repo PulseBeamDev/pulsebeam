@@ -1,15 +1,14 @@
 use super::client::ClientObservation;
 use anyhow::{Result, ensure};
 use pulsebeam::entity::{ConnectionId, ParticipantId, RoomExternalId, RoomId, TrackId, TrackKind};
-use pulsebeam::sim_observation::{ControlObservation, Observation, SelectorObservation};
-use pulsebeam::track::SelectionPolicy;
-use pulsebeam_agent_native::agent_core::{MediaKind, Publication, TopicMode, TopicRegistrations};
+use pulsebeam_agent_native::agent_core::{
+    ConnectionState, MediaKind, Publication, TopicRegistrations,
+};
 use pulsebeam_core::auth::DEVELOPMENT_PROJECT_ID;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 
-/// Plan identities are bound at admission. Media identities are derived by the
-/// canonical owner; data identities are allocated by the server at channel open.
-/// Neither is learned from a receiver or forwarded application payload.
+/// Application declarations bound to the producer's public admission. Expected
+/// media identities never come from a receiver or its decoded output.
 #[derive(Clone, Debug)]
 pub struct ExpectedParticipant {
     pub id: ParticipantId,
@@ -17,10 +16,11 @@ pub struct ExpectedParticipant {
     pub video: bool,
     pub video_label: String,
     pub audio: bool,
+    pub audio_pinned: Vec<String>,
+    pub automatic_audio: bool,
     pub required: bool,
     pub connection: Option<ConnectionId>,
     pub topics: TopicRegistrations,
-    pub video_targets: HashSet<TrackId>,
 }
 
 impl ExpectedParticipant {
@@ -35,44 +35,6 @@ impl ExpectedParticipant {
         self.connection
             .expect("admitted plan participant")
             .derive_track_id(kind, label)
-    }
-
-    fn tracks(&self, control: &ControlObservation) -> Result<Vec<(TrackId, String)>> {
-        let mut tracks = self
-            .publications()
-            .map(|publication| {
-                (
-                    publication.id.parse().expect("canonical publication"),
-                    publication.label,
-                )
-            })
-            .collect::<Vec<_>>();
-        for publisher in &self.topics.publishers {
-            let lane = match publisher.mode {
-                TopicMode::Latest => "latest",
-                TopicMode::Lossy => "lossy",
-                TopicMode::Ordered => "ordered",
-            };
-            let label = format!("v2/{lane}/{}", publisher.topic);
-            let mut publications = control.tracks.iter().filter(|track| {
-                track.meta.origin == self.id
-                    && track.meta.id.kind() == TrackKind::Data
-                    && track.meta.label.as_ref() == Some(&label)
-            });
-            let publication = publications.next();
-            ensure!(
-                publications.next().is_none(),
-                "duplicate data publication for {label}"
-            );
-            ensure!(
-                !self.required || publication.is_some(),
-                "missing required data publication {label}"
-            );
-            if let Some(publication) = publication {
-                tracks.push((publication.meta.id, label));
-            }
-        }
-        Ok(tracks)
     }
 
     fn publications(&self) -> impl Iterator<Item = Publication> + '_ {
@@ -96,12 +58,12 @@ impl ExpectedParticipant {
     }
 }
 
-pub struct ControlStateOracle {
+pub struct ApplicationStateOracle {
     pub participants: Vec<ExpectedParticipant>,
 }
 
-impl ControlStateOracle {
-    /// Safety within a coherent client value, without requiring latest-intent convergence.
+impl ApplicationStateOracle {
+    /// Safety within a coherent public value, without requiring pending requests to finish.
     pub fn check_client_safety(
         observation: &ClientObservation,
         allowed_origins: &BTreeSet<String>,
@@ -125,14 +87,12 @@ impl ControlStateOracle {
             &snapshot.video_mapping,
             &snapshot.publications,
             MediaKind::Video,
-            &observation.video_receivers,
             observation.video_capacity,
         )?;
         check_mapping(
             &snapshot.audio_mapping,
             &snapshot.publications,
             MediaKind::Audio,
-            &observation.audio_receivers,
             observation.audio_capacity,
         )?;
         Ok(())
@@ -140,12 +100,15 @@ impl ControlStateOracle {
 
     pub fn check_client(
         &self,
-        data_tracks: &[pulsebeam::sim_observation::TrackObservation],
         observer: &ExpectedParticipant,
         observation: &ClientObservation,
         requested_video: &[String],
     ) -> Result<()> {
         let snapshot = &observation.snapshot;
+        ensure!(
+            snapshot.connection == ConnectionState::Connected,
+            "required application client is not connected"
+        );
         ensure!(
             snapshot.participant_id.as_deref() == Some(&observer.id.as_str()),
             "wrong observer identity"
@@ -196,105 +159,20 @@ impl ControlStateOracle {
                 );
             }
         }
-        let label = |mode, topic: &str| {
-            let mode = match mode {
-                TopicMode::Latest => "latest",
-                TopicMode::Lossy => "lossy",
-                TopicMode::Ordered => "ordered",
-            };
-            format!("v2/{mode}/{topic}")
-        };
-        for publisher in &snapshot.topics.publishers {
-            let expected_label = label(publisher.registration.mode, &publisher.registration.topic);
-            let expected = data_tracks.iter().find(|track| {
-                track.meta.origin == observer.id
-                    && track.meta.id.kind() == TrackKind::Data
-                    && track.meta.label.as_ref() == Some(&expected_label)
-            });
-            ensure!(
-                publisher.data_track_id == expected.map(|track| track.meta.id.as_str()),
-                "publisher binding differs from authoritative owner track"
-            );
-        }
-        for subscriber in &snapshot.topics.subscribers {
-            let expected_label =
-                label(subscriber.registration.mode, &subscriber.registration.topic);
-            let expected = data_tracks
-                .iter()
-                .filter(|track| {
-                    track.meta.origin != observer.id
-                        && track.meta.room_id == observer.room_id().expect("valid plan room")
-                        && track.meta.id.kind() == TrackKind::Data
-                        && track.meta.label.as_ref() == Some(&expected_label)
-                })
-                .count();
-            ensure!(
-                subscriber.publishers == expected,
-                "subscriber binding count differs from owner tracks"
-            );
-        }
-        for (registration, id, _) in &observation.ordered_cursors {
-            let expected_label = label(registration.mode, &registration.topic);
-            ensure!(
-                data_tracks.iter().any(|track| track.meta.id.as_str() == *id
-                    && track.meta.origin != observer.id
-                    && track.meta.room_id == observer.room_id().expect("valid plan room")
-                    && track.meta.label.as_ref() == Some(&expected_label)),
-                "ordered cursor does not belong to the bound data track"
-            );
-        }
-        ensure!(
-            observation.sent_intent_revision == Some(snapshot.accepted_intent_revision),
-            "latest transmitted wire intent not accepted: sent={:?} accepted={} desired={} submitted={} pending_acceptance={}",
-            observation.sent_intent_revision,
-            snapshot.accepted_intent_revision,
-            snapshot.desired_revision,
-            observation.submitted.revision,
-            observation.accepted.is_none(),
-        );
-        let accepted = observation.accepted.as_ref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "no independently recorded accepted intent revision {}",
-                snapshot.accepted_intent_revision
-            )
-        })?;
-        ensure!(
-            accepted.revision == snapshot.desired_revision,
-            "desired revision mismatch"
-        );
-        ensure!(
-            accepted == &observation.submitted,
-            "latest complete intent not accepted"
-        );
         let expected_video = requested_video
             .iter()
             .map(|id| {
-                let participant: ParticipantId = id.parse()?;
                 let peer = peers
                     .iter()
-                    .find(|peer| peer.id == participant)
-                    .ok_or_else(|| anyhow::anyhow!("requested video has no plan participant"))?;
+                    .find(|peer| peer.id.as_str() == *id && peer.video)
+                    .ok_or_else(|| anyhow::anyhow!("requested video has no plan publisher"))?;
                 Ok(peer.track_id(TrackKind::Video, &peer.video_label).as_str())
             })
             .collect::<Result<BTreeSet<_>>>()?;
-        let desired_video = accepted
-            .video
-            .iter()
-            .map(|request| request.track_id.clone())
-            .collect::<BTreeSet<_>>();
-        ensure!(
-            accepted.video.len() == desired_video.len(),
-            "duplicate desired video track"
-        );
-        ensure!(
-            expected_video == desired_video,
-            "submitted video intent differs from plan: expected={expected_video:?}, desired={desired_video:?}"
-        );
         check_mapping(
             &snapshot.video_mapping,
             &snapshot.publications,
             MediaKind::Video,
-            &observation.video_receivers,
             observation.video_capacity,
         )?;
         ensure!(
@@ -310,7 +188,6 @@ impl ControlStateOracle {
             &snapshot.audio_mapping,
             &snapshot.publications,
             MediaKind::Audio,
-            &observation.audio_receivers,
             observation.audio_capacity,
         )?;
         let audio = snapshot
@@ -324,18 +201,22 @@ impl ControlStateOracle {
             .filter(|publication| publication.kind == MediaKind::Audio)
             .map(|publication| publication.id.clone())
             .collect::<BTreeSet<_>>();
-        let pinned = accepted
-            .audio
-            .pinned
+        let pinned = observer
+            .audio_pinned
             .iter()
-            .filter(|id| available_audio.contains(*id))
-            .cloned()
+            .filter_map(|id| {
+                peers
+                    .iter()
+                    .find(|peer| peer.id.as_str() == *id && peer.audio)
+            })
+            .map(|peer| peer.track_id(TrackKind::Audio, "audio").as_str())
+            .filter(|id| available_audio.contains(id))
             .collect::<BTreeSet<_>>();
         ensure!(
             pinned.len() <= observation.audio_capacity && pinned.is_subset(&audio),
             "pinned audio assignment missing"
         );
-        if accepted.audio.automatic {
+        if observer.automatic_audio {
             let expected_automatic = peers
                 .iter()
                 .filter(|peer| peer.required && peer.audio)
@@ -343,9 +224,7 @@ impl ControlStateOracle {
                 .filter(|track| !pinned.contains(track))
                 .collect::<BTreeSet<_>>();
             let automatic_capacity = observation.audio_capacity - pinned.len();
-            // Packet timing, power decay and immunity choose the contended subset.
-            // Every live source must be assigned when it fits; otherwise live sources
-            // must fill the remaining slots, independently of the observed mapping.
+            // Timing chooses the contended subset, not whether available slots are filled.
             ensure!(
                 audio.intersection(&expected_automatic).count()
                     == expected_automatic.len().min(automatic_capacity),
@@ -370,8 +249,8 @@ impl ControlStateOracle {
             .map(|status| &status.registration)
             .collect::<Vec<_>>();
         ensure!(
-            publishers.len() == accepted.topics.publishers.len()
-                && accepted
+            publishers.len() == observer.topics.publishers.len()
+                && observer
                     .topics
                     .publishers
                     .iter()
@@ -383,8 +262,8 @@ impl ControlStateOracle {
             "topic publisher registrations differ from intent"
         );
         ensure!(
-            subscribers.len() == accepted.topics.subscribers.len()
-                && accepted
+            subscribers.len() == observer.topics.subscribers.len()
+                && observer
                     .topics
                     .subscribers
                     .iter()
@@ -395,439 +274,31 @@ impl ControlStateOracle {
                         == 1),
             "topic subscriber registrations differ from intent"
         );
-        Ok(())
-    }
-}
-
-impl ControlStateOracle {
-    pub fn projections_ready(observation: &Observation) -> bool {
-        let control = &observation.control;
-        observation.shards.len() == control.shard_generations.len()
-            && observation.shards.iter().all(|shard| {
-                shard.pending_generation.is_none()
-                    && shard.pending_effects == 0
-                    && control.shard_generations.get(shard.shard.index()) == Some(&shard.generation)
-            })
-    }
-
-    pub fn check_owners(&self, observation: &Observation) -> Result<()> {
-        ensure!(
-            Self::projections_ready(observation),
-            "owner generations have not settled"
-        );
-        let control = &observation.control;
-        self.check_control(control)?;
-        let participants = control
-            .participants
-            .iter()
-            .map(|participant| (participant.id, participant))
-            .collect::<HashMap<_, _>>();
-        let tracks = control
-            .tracks
-            .iter()
-            .map(|track| (track.meta.id, track))
-            .collect::<HashMap<_, _>>();
-        let mut shards = HashSet::new();
-        for shard in &observation.shards {
-            ensure!(shards.insert(shard.shard), "duplicate shard observation");
-            let expected_participants = participants
-                .values()
-                .filter(|participant| participant.shard == shard.shard)
-                .map(|participant| participant.id)
-                .collect::<HashSet<_>>();
-            let actual_participants = shard
-                .participants
+        let mut data_ids = BTreeSet::new();
+        for publisher in &snapshot.topics.publishers {
+            let id = publisher
+                .data_track_id
+                .as_ref()
+                .filter(|id| !id.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("publisher has no public data binding"))?;
+            ensure!(data_ids.insert(id), "duplicate publisher data binding");
+        }
+        for subscriber in &snapshot.topics.subscribers {
+            let publishing = peers
                 .iter()
-                .map(|participant| participant.id)
-                .collect::<HashSet<_>>();
-            ensure!(
-                shard.participants.len() == actual_participants.len()
-                    && actual_participants == expected_participants,
-                "shard participant projection differs from control on {:?}",
-                shard.shard
-            );
-            for participant in &shard.participants {
-                let owner = participants[&participant.id];
-                ensure!(
-                    participant.connection == owner.connection
-                        && Some(participant.transport) == owner.transport,
-                    "stale shard incarnation or transport"
-                );
-            }
-            let expected_transports = shard
-                .participants
-                .iter()
-                .map(|participant| (participant.transport, Some(participant.id)))
-                .collect::<HashSet<_>>();
-            ensure!(
-                shard.transports.len() == expected_transports.len()
-                    && shard.transports.iter().copied().collect::<HashSet<_>>()
-                        == expected_transports,
-                "stale or missing transport binding"
-            );
-            let placements = control
-                .placements
-                .iter()
-                .filter(|placement| placement.address.shard() == shard.shard)
+                .filter(|peer| {
+                    peer.topics.publishers.iter().any(|publisher| {
+                        publisher.topic == subscriber.registration.topic
+                            && publisher.mode == subscriber.registration.mode
+                    })
+                })
                 .collect::<Vec<_>>();
-            let resident = placements
-                .iter()
-                .filter(|placement| placement.resident)
-                .map(|placement| placement.track)
-                .collect::<HashSet<_>>();
+            let required = publishing.iter().filter(|peer| peer.required).count();
             ensure!(
-                shard.tracks.len() == resident.len()
-                    && shard.tracks.iter().copied().collect::<HashSet<_>>() == resident,
-                "missing or stale shard runtime"
-            );
-            ensure!(
-                shard.plans.len() == resident.len()
-                    && shard
-                        .plans
-                        .iter()
-                        .map(|plan| plan.track)
-                        .collect::<HashSet<_>>()
-                        == resident.iter().map(|track| Some(*track)).collect(),
-                "missing, duplicate or stale shard plan"
-            );
-            for plan in &shard.plans {
-                let id = plan
-                    .track
-                    .ok_or_else(|| anyhow::anyhow!("plan references retired runtime"))?;
-                let track = tracks
-                    .get(&id)
-                    .ok_or_else(|| anyhow::anyhow!("plan has no live publication"))?;
-                // Topology can match self. Runtime delivery is only to bound, non-self peers.
-                let bindings = track
-                    .active
-                    .iter()
-                    .filter(|id| {
-                        **id != track.meta.origin
-                            && participants
-                                .get(id)
-                                .is_some_and(|participant| participant.transport.is_some())
-                    })
-                    .copied()
-                    .collect::<HashSet<_>>();
-                let expected_local = bindings
-                    .iter()
-                    .filter(|participant| {
-                        participants
-                            .get(participant)
-                            .is_some_and(|participant| participant.shard == shard.shard)
-                    })
-                    .map(|participant| Some(*participant))
-                    .collect::<HashSet<_>>();
-                ensure!(
-                    plan.local.len() == expected_local.len()
-                        && plan.local.iter().copied().collect::<HashSet<_>>() == expected_local,
-                    "missing, duplicate or stale local binding: track={id:?} shard={:?} expected={expected_local:?} actual={:?}",
-                    shard.shard,
-                    plan.local
-                );
-                let expected_remote = if shard.shard == track.meta.shard_id {
-                    control
-                        .placements
-                        .iter()
-                        .filter(|placement| {
-                            placement.track == id
-                                && placement.resident
-                                && placement.address.shard() != shard.shard
-                                && bindings.iter().any(|id| {
-                                    participants.get(id).is_some_and(|participant| {
-                                        participant.shard == placement.address.shard()
-                                    })
-                                })
-                        })
-                        .map(|placement| placement.address)
-                        .collect::<HashSet<_>>()
-                } else {
-                    HashSet::new()
-                };
-                ensure!(
-                    plan.remote.len() == expected_remote.len()
-                        && plan.remote.iter().copied().collect::<HashSet<_>>() == expected_remote,
-                    "missing, duplicate or stale remote route"
-                );
-                let expected_reverse = control
-                    .placements
-                    .iter()
-                    .find(|placement| {
-                        placement.track == id
-                            && placement.route_installed
-                            && placement.address.shard() == track.meta.shard_id
-                    })
-                    .map(|placement| placement.address);
-                ensure!(
-                    plan.reverse == expected_reverse,
-                    "missing or stale reverse route/epoch"
-                );
-            }
-            let expected_routes = placements
-                .iter()
-                .filter(|placement| placement.route_installed)
-                .map(|placement| {
-                    (
-                        placement.address,
-                        Some(placement.track),
-                        tracks
-                            .get(&placement.track)
-                            .is_some_and(|track| track.meta.shard_id == shard.shard),
-                    )
-                })
-                .collect::<HashSet<_>>();
-            let actual_routes = shard
-                .routes
-                .iter()
-                .map(|route| (route.address, route.track, route.reverse))
-                .collect::<HashSet<_>>();
-            ensure!(
-                shard.routes.len() == expected_routes.len() && actual_routes == expected_routes,
-                "missing, duplicate or stale route/epoch"
-            );
-        }
-        Ok(())
-    }
-
-    fn check_control(&self, control: &ControlObservation) -> Result<()> {
-        let allowed = self
-            .participants
-            .iter()
-            .map(|participant| (participant.id, participant))
-            .collect::<HashMap<_, _>>();
-        let actual = control
-            .participants
-            .iter()
-            .map(|participant| participant.id)
-            .collect::<HashSet<_>>();
-        ensure!(
-            actual.len() == control.participants.len(),
-            "duplicate control participant"
-        );
-        for participant in &self.participants {
-            ensure!(
-                !participant.required || actual.contains(&participant.id),
-                "missing live control participant {}",
-                participant.id
-            );
-        }
-        for participant in &control.participants {
-            let expected = allowed.get(&participant.id).ok_or_else(|| {
-                anyhow::anyhow!("stale or unknown control participant {}", participant.id)
-            })?;
-            ensure!(
-                participant.room == expected.room_id()?,
-                "control participant crossed rooms"
-            );
-            ensure!(
-                Some(participant.connection) == expected.connection,
-                "stale control connection generation"
-            );
-            ensure!(
-                participant
-                    .transport
-                    .is_some_and(|transport| transport.shard() == participant.shard),
-                "control owner/transport mismatch"
-            );
-        }
-        let mut expected_tracks = HashMap::new();
-        for participant in &self.participants {
-            for (id, label) in participant.tracks(control)? {
-                ensure!(
-                    expected_tracks.insert(id, (participant, label)).is_none(),
-                    "publication identity reused across owners"
-                );
-            }
-        }
-        let track_ids = control
-            .tracks
-            .iter()
-            .map(|track| track.meta.id)
-            .collect::<HashSet<_>>();
-        ensure!(
-            control.tracks.len() == track_ids.len(),
-            "duplicate publication"
-        );
-        for (id, (participant, _)) in &expected_tracks {
-            ensure!(
-                !participant.required || track_ids.contains(id),
-                "missing required publication {id}"
-            );
-        }
-        for track in &control.tracks {
-            let (expected, label) = expected_tracks
-                .get(&track.meta.id)
-                .ok_or_else(|| anyhow::anyhow!("stale or invented publication {:?}", track.meta))?;
-            ensure!(
-                track.meta.origin == expected.id
-                    && Some(track.meta.connection_id) == expected.connection
-                    && track.meta.room_id == expected.room_id()?
-                    && track.meta.label.as_ref() == Some(label),
-                "publication owner, room, kind or label mismatch"
-            );
-            ensure!(
-                control
-                    .participants
-                    .iter()
-                    .any(|participant| participant.id == expected.id
-                        && participant.shard == track.meta.shard_id),
-                "publication has no current owner"
-            );
-            ensure!(
-                control
-                    .placements
-                    .iter()
-                    .any(|placement| placement.track == track.meta.id
-                        && placement.address.shard() == track.meta.shard_id
-                        && placement.resident),
-                "publication lost its origin runtime placement"
-            );
-            for subscriber in &track.active {
-                let shard = control
-                    .participants
-                    .iter()
-                    .find(|participant| participant.id == *subscriber)
-                    .map(|participant| participant.shard)
-                    .ok_or_else(|| anyhow::anyhow!("active subscription has no owner"))?;
-                ensure!(
-                    control
-                        .placements
-                        .iter()
-                        .any(|placement| placement.track == track.meta.id
-                            && placement.address.shard() == shard
-                            && placement.resident
-                            && (shard == track.meta.shard_id || placement.route_installed)),
-                    "active subscription lost its destination placement/route"
-                );
-            }
-            let candidates = track.candidates.iter().copied().collect::<HashSet<_>>();
-            let active = track.active.iter().copied().collect::<HashSet<_>>();
-            ensure!(
-                candidates.len() == track.candidates.len()
-                    && active.len() == track.active.len()
-                    && active.is_subset(&candidates),
-                "duplicate or unowned subscription binding"
-            );
-            let expected_candidates = control
-                .participants
-                .iter()
-                .filter(|participant| participant.room == track.meta.room_id)
-                .filter(|participant| {
-                    if track.meta.id.kind() != TrackKind::Data {
-                        return true;
-                    }
-                    allowed[&participant.id]
-                        .topics
-                        .subscribers
-                        .iter()
-                        .any(|subscription| {
-                            let lane = match subscription.mode {
-                                TopicMode::Latest => "latest",
-                                TopicMode::Lossy => "lossy",
-                                TopicMode::Ordered => "ordered",
-                            };
-                            track.meta.label.as_deref()
-                                == Some(format!("v2/{lane}/{}", subscription.topic).as_str())
-                        })
-                })
-                .map(|participant| participant.id)
-                .collect::<HashSet<_>>();
-            ensure!(
-                candidates == expected_candidates,
-                "candidate membership differs from plan selector semantics"
-            );
-            if track.meta.id.kind() == TrackKind::Video {
-                ensure!(
-                    active.iter().all(|subscriber| allowed[subscriber]
-                        .video_targets
-                        .contains(&track.meta.id)),
-                    "video binding contradicts complete receive intent"
-                );
-            } else {
-                ensure!(
-                    active == expected_candidates,
-                    "all-match audio/topic binding missing or duplicated"
-                );
-            }
-            for subscriber in candidates {
-                ensure!(
-                    allowed
-                        .get(&subscriber)
-                        .is_some_and(|subscriber| subscriber.room == expected.room)
-                        && actual.contains(&subscriber),
-                    "stale or cross-room subscriber"
-                );
-            }
-        }
-        let mut expected_subscriptions = HashSet::new();
-        for participant in &control.participants {
-            for kind in [TrackKind::Audio, TrackKind::Video] {
-                expected_subscriptions.insert((
-                    participant.room,
-                    participant.id,
-                    SelectorObservation {
-                        track: None,
-                        publisher: None,
-                        kind: Some(kind),
-                        label: None,
-                    },
-                    kind == TrackKind::Video,
-                ));
-            }
-            for subscription in &allowed[&participant.id].topics.subscribers {
-                let lane = match subscription.mode {
-                    TopicMode::Latest => "latest",
-                    TopicMode::Lossy => "lossy",
-                    TopicMode::Ordered => "ordered",
-                };
-                expected_subscriptions.insert((
-                    participant.room,
-                    participant.id,
-                    SelectorObservation {
-                        track: None,
-                        publisher: None,
-                        kind: Some(TrackKind::Data),
-                        label: Some(format!("v2/{lane}/{}", subscription.topic)),
-                    },
-                    false,
-                ));
-            }
-        }
-        let mut subscriptions = std::collections::HashSet::new();
-        for subscription in &control.subscriptions {
-            ensure!(
-                subscriptions.insert((
-                    subscription.room,
-                    subscription.subscriber,
-                    subscription.selector.clone(),
-                    subscription.selection == SelectionPolicy::Allocated
-                )),
-                "duplicate pending subscription"
-            );
-            ensure!(
-                allowed
-                    .get(&subscription.subscriber)
-                    .is_some_and(|subscriber| subscriber
-                        .room_id()
-                        .is_ok_and(|room| room == subscription.room))
-                    && actual.contains(&subscription.subscriber),
-                "pending subscription outlived its owner"
-            );
-        }
-        ensure!(
-            subscriptions == expected_subscriptions,
-            "pending or installed selectors differ from complete plan intent"
-        );
-        let mut placements = HashSet::new();
-        for placement in &control.placements {
-            ensure!(
-                placements.insert((placement.track, placement.address.shard()))
-                    && track_ids.contains(&placement.track),
-                "duplicate or stale placement"
-            );
-            ensure!(
-                !placement.route_installed || placement.resident,
-                "route without resident runtime"
+                (required..=publishing.len()).contains(&subscriber.publishers),
+                "subscriber bindings differ from declared room publishers: required={required}, allowed={}, actual={}",
+                publishing.len(),
+                subscriber.publishers
             );
         }
         Ok(())
@@ -836,29 +307,21 @@ impl ControlStateOracle {
 
 fn check_mapping(
     mapping: &BTreeMap<u32, String>,
-    publications: &BTreeMap<String, Publication>,
+    catalog: &BTreeMap<String, Publication>,
     kind: MediaKind,
-    receivers: &BTreeSet<u32>,
     capacity: usize,
 ) -> Result<()> {
-    let tracks = mapping.values().collect::<BTreeSet<_>>();
     ensure!(
-        tracks.len() == mapping.len(),
-        "duplicate receiver assignment"
+        mapping.len() <= capacity,
+        "receiver exceeds requested capacity"
     );
-    ensure!(
-        receivers.len() == capacity
-            && mapping.len() <= capacity
-            && mapping.keys().all(|index| receivers.contains(index)),
-        "receiver exceeds negotiated capacity"
-    );
-    for track in tracks {
-        ensure!(
-            publications
-                .get(track)
-                .is_some_and(|publication| publication.kind == kind),
-            "assignment has stale track or wrong kind: {track}"
-        );
+    let mut tracks = BTreeSet::new();
+    for id in mapping.values() {
+        ensure!(tracks.insert(id), "duplicate media assignment");
+        let publication = catalog
+            .get(id)
+            .ok_or_else(|| anyhow::anyhow!("assignment references missing publication {id}"))?;
+        ensure!(publication.kind == kind, "assignment has wrong media kind");
     }
     Ok(())
 }

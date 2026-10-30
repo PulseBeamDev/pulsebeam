@@ -344,7 +344,7 @@ fn audio_selection_does_not_cross_rooms_test() {
         .with_room(
             Room::new("room-beta")
                 .with_participant(Participant::data_participant("beta_speaker").speaking_at(-70))
-                .with_participant(Participant::subscriber("beta_listener").hearing(3)),
+                .with_participant(Participant::subscriber("beta_listener").hearing(3).with_encoded_audio()),
         )
         .run(vec![
             Step::Run {
@@ -355,13 +355,13 @@ fn audio_selection_does_not_cross_rooms_test() {
                 description: "Steady state: alpha is saturated and stays that way",
                 duration: Duration::from_secs(10),
             },
-            Step::CheckRxBytesInterval {
-                description: "Beta is still hearing its own speaker",
+            Step::CheckEncodedAudioInterval {
+                description: "Beta independently decodes actual Opus during the steady-state window, including valid quiet samples",
                 participant: "beta_listener",
-                min_bytes: 1,
+                corrupt: false,
             },
-            Step::CheckAudioQueuedFrom {
-                description: "The selected and queued source belongs to its own room",
+            Step::CheckAudioCatalogFrom {
+                description: "The public source assignment belongs to its own room",
                 participant: "beta_listener",
                 expected: &["beta_speaker"],
             },

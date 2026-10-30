@@ -38,7 +38,10 @@ rust_library(
     crate_name = "pulsebeam_simulator",
     crate_root = "src/main.rs",
     srcs = glob(["src/**/*.rs"]),
-    compile_data = ["src/tests/properties.regressions"],
+    compile_data = [
+        "src/tests/histories/admission-replacement.history",
+        "src/tests/properties.regressions",
+    ],
     edition = crate_edition(),
     crate_features = ["parking_lot"],
     lint_config = ":lints",

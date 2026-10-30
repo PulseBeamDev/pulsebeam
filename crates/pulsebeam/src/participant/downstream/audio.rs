@@ -167,6 +167,19 @@ impl AudioAllocator {
     ) {
         self.fixed_receivers = fixed_receivers;
         self.fixed_tracks = fixed_tracks;
+        // A default track cannot remain assigned to a fixed-delay receiver.
+        // Retire it at this policy commit, before a packet can move it elsewhere.
+        for slot in self.slots.iter_mut().flatten() {
+            if self.fixed_receivers.contains(&slot.mid)
+                && slot
+                    .occupant
+                    .is_some_and(|occupant| !self.fixed_tracks.contains(&occupant.origin.track))
+            {
+                slot.occupant = None;
+                slot.pending_marker = true;
+                self.speakers_changed = true;
+            }
+        }
     }
 
     pub(crate) fn mark_fixed_receiver(&mut self, mid: Mid) {
@@ -360,8 +373,6 @@ impl AudioAllocator {
             slot.pending_marker = false;
         }
         writer.write_audio_owned(pkt, origin.track, slot.mid, slot.ssrc, slot.pt);
-        #[cfg(feature = "sim")]
-        crate::sim_metrics::record_queued_audio(self.ctx.participant_id, origin);
         Some(())
     }
 
@@ -522,6 +533,49 @@ mod tests {
         alloc.on_rtp(origin(1), &speaking(-30), &mut StreamWriter::new());
         assert_eq!(alloc.assignments()[0].mid, Mid::from("a1"));
         assert!(!alloc.default_needs_reconnect());
+
+        let mut downstream = super::super::Downstream::new(test_ctx(), false);
+        downstream.audio.add_slot(slot_config("a0", 1000));
+        downstream.audio.add_slot(slot_config("a1", 1001));
+        let speaker = origin(2);
+        let fixed = HashSet::from_iter([Mid::from("a0")]);
+        downstream
+            .audio
+            .set_playout_compatibility(fixed.clone(), HashSet::from_iter([speaker.track]));
+        downstream
+            .audio
+            .on_rtp(speaker, &speaking(-30), &mut StreamWriter::new());
+        assert_eq!(
+            downstream.native_assignments().1,
+            vec![(1000, speaker.track)]
+        );
+        assert!(downstream.audio.take_speakers_changed());
+        downstream
+            .audio
+            .set_playout_compatibility(fixed.clone(), HashSet::new());
+        assert!(
+            downstream.native_assignments().1.is_empty(),
+            "the incompatible old assignment retires before migration"
+        );
+        assert!(downstream.audio.take_speakers_changed());
+        downstream
+            .audio
+            .on_rtp(speaker, &speaking(-30), &mut StreamWriter::new());
+        assert_eq!(heard_origins(&downstream.audio), vec![speaker]);
+        assert_eq!(
+            downstream.native_assignments().1,
+            vec![(1001, speaker.track)],
+            "one track must never occupy two native receiver indices"
+        );
+        assert!(downstream.audio.take_speakers_changed());
+        downstream
+            .audio
+            .set_playout_compatibility(fixed, HashSet::new());
+        assert!(
+            !downstream.audio.take_speakers_changed(),
+            "an unchanged compatible assignment is stable"
+        );
+
         let mut only_fixed = allocator_with(1);
         only_fixed.mark_fixed_receiver(Mid::from("a0"));
         assert!(only_fixed.default_needs_reconnect());
@@ -530,38 +584,6 @@ mod tests {
                 .on_rtp(origin(1), &speaking(-30), &mut StreamWriter::new())
                 .is_none()
         );
-    }
-
-    #[cfg(feature = "sim")]
-    #[test]
-    fn audio_queue_observation_counts_only_accepted_subscriber_writes_and_resets() {
-        crate::sim_metrics::reset();
-        let mut alloc = allocator_with(1);
-        let subscriber = alloc.ctx.participant_id;
-        let source = origin(1);
-        let mut writer = StreamWriter::new();
-        assert!(
-            alloc
-                .on_rtp(source, &RtpPacket::default(), &mut writer)
-                .is_none()
-        );
-        assert!(crate::sim_metrics::queued_audio_for(subscriber).is_empty());
-        assert!(alloc.on_rtp(source, &speaking(-20), &mut writer).is_some());
-        assert_eq!(
-            crate::sim_metrics::queued_audio_for(subscriber)
-                .get(&source)
-                .map(|queued| queued.packets),
-            Some(1)
-        );
-        assert!(crate::sim_metrics::queued_audio_for(origin(9).participant).is_empty());
-        assert!(
-            alloc
-                .on_rtp(origin(2), &speaking(-70), &mut writer)
-                .is_none()
-        );
-        assert_eq!(crate::sim_metrics::queued_audio_for(subscriber).len(), 1);
-        crate::sim_metrics::reset();
-        assert!(crate::sim_metrics::queued_audio_for(subscriber).is_empty());
     }
 
     #[test]

@@ -18,6 +18,22 @@ SANS-I/O PulseBeam client agent.
 * Production diagnostics and per-agent filtering through the `log` facade
 * Shared UniFFI-compatible domain types
 
+## Receive policy support
+
+Use adaptive audio playout with the stock native and browser WebRTC profiles.
+They do not negotiate the audio RTP playout-delay extension, so per-track or
+selector-resolved fixed audio policies are rejected as `UNSUPPORTED_INTENT`.
+The existing `ServerError` notification reports the rejection; accepted media
+state stays live and its revision does not advance. Application-owned desired
+state is not rewritten: submit a supported replacement before reconnecting or
+changing other parts of that complete intent.
+
+The native receiver-local minimum-delay setter cannot enforce the full
+`Fixed { min_ms, max_ms }` interval and is not used as a substitute. Fixed video
+playout remains supported through its negotiated extension. A receiver that
+actually negotiates audio playout-delay on every provisioned audio receiver can
+use the corresponding wire policy.
+
 ## Track resources
 
 `TrackSpec` identifies media by kind and label, and data by label and delivery
@@ -171,9 +187,20 @@ signaling protocol or media-routing policy.
 Run `./bazel test //agents/pulsebeam-agent-core:unit_tests` while iterating.
 The repository gates are `./bazel test //:check` and `./bazel test //:test`.
 
-## Native cutover checkpoint
+## Ordered subscription recovery
 
-Native ordered recovery across reconnects remains blocked, despite passing Core
-component tests. See the [ordered-recovery checkpoint](ORDERED_RECOVERY_CHECKPOINT.md)
-for the partial repair, exact reproducer, evidence, and unresolved catalog lifecycle
-boundary. This is not final native MVP qualification.
+Ordered subscriptions wait for an internal, subscription-lifetime seed
+completion covering a committed Catalog revision. A temporary empty Catalog
+during reconnect is truthful discovery state, not publication retirement.
+While seeding, Core retains only the previous completed frontiers and gates
+ordered probes and delivery. Completion removes genuinely absent IDs and resumes
+same-publication recovery. New IDs start live without inheriting old cursors.
+
+Transport replacement clears queued payloads and retires seed tokens.
+Unsubscribe and session close immediately release frontiers. Late completion for
+a known retired token is harmless and cannot reconstruct its subscription or
+frontiers; unknown tokens remain protocol errors. A connected seed
+that does not complete within 30 seconds triggers connection recovery. Retrying
+incomplete seeds cannot accumulate publication frontiers. Applications do not
+manage seed tokens or wire cursors; ordered gaps retain their normal bounded
+history semantics.

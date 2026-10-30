@@ -59,15 +59,17 @@ decision repeatedly.
 
 ## Compare intent with coherent observations
 
-`ControlStateOracle` models participants, publications and complete receive/topic
+`ApplicationStateOracle` models participants, publications and complete receive/topic
 intent from plan operations. Admission observations bind opaque IDs to plan
 identities; server mappings and forwarded packets are not the source of
 expected intent.
 
-Control, each shard and the native client actor produce immutable values through
-their owned command boundaries. Compare their connection generations, revisions,
-assignments and route epochs after bounded protocol progress. This is not a
-global atomic snapshot, and separately sampled counters cannot reconstruct one.
+Compare application inputs with documented SDK snapshots and actual recipient
+output after bounded protocol progress. Active admission correlation uses the
+HTTP offer's ICE identity and active native statistics from the pinned backend;
+missing or ambiguous identity fails instead of selecting the latest HTTP reply.
+Private control/shard projections are not correctness observations. Their
+structural invariants belong inline in their production owners.
 
 Automatic audio must cover every live source when it fits, or fill the remaining
 unpinned slots with live sources under contention. Packet timing, power decay
@@ -75,10 +77,11 @@ and slot immunity can change the contended subset, so the common oracle does not
 invent a unique ordering. Explicit speaker-selection assertions retain the
 scenario's loudness and origin claims.
 
-A publication-discovery barrier must also wait for applicable full-client
-convergence: receiving a catalog entry does not prove that publish-only peers
-have updated catalogs or that every latest wire intent has been acknowledged.
-Keep that work inside the existing bounded deadline, not a fixed extra sleep.
+At a settled publication-discovery checkpoint, also require the applicable
+full-client convergence: one catalog entry does not establish every client's
+current roster or bindings. Keep that work inside the existing bounded deadline,
+not a fixed extra sleep. Do not make global quiescence a prerequisite for
+established service while unrelated intent or fault work is still outstanding.
 
 Graceful departure and transport crashes have different retirement deadlines.
 Before crash detection, a server may legitimately retain the connection; after
@@ -191,9 +194,9 @@ scratch files are retained diagnostics, not replay selectors. Ambiguous reductio
 or unavailable artifact checksums fail evidence retention as infrastructure;
 `evidence_error` records that problem without replacing the original child exit,
 launch or timeout failure. Artifact links outside the owned output boundary are
-not followed. Existing version-1 replay bundles remain valid; unsupported replay
-versions are rejected before discovery.
-These are versioned concrete programs, not RNG states. They contain the
+not followed. Replay requires the current selection fields and a supported
+bundle format; incompatible evidence is rejected before discovery.
+These are concrete programs, not RNG states. They contain the
 whole-run seed, replay selection, symbolic operations and actual phase/fault
 witnesses. The failed case's portable replay bundle selects the reduced concrete
 input and checks its checksum and candidate identity. A supplied
@@ -219,6 +222,52 @@ decoded intended-origin delivery must complete within the existing 30-second
 simulated recovery window. Crash retirement remains bounded from the crash by
 20 simulated seconds. Holds and controller stalls last at most five simulated
 seconds. These are recovery proof bounds, not new media-quality SLOs.
+
+### Cross-lane inputs and bounded discovery
+
+Concrete inputs declare source ownership, data ownership/delivery modes and
+audio requests. Audio selects pinned speakers and automatic fill with supported
+adaptive playout; fresh native decode is a separate operation, not inferred from
+Mapping. The native profile does not negotiate audio RTP playout-delay. Fixed
+audio requests are rejected before changing accepted state, rather than dropping
+media or treating a minimum-only setter as a full min/max policy. The existing
+native runtime world checks per-track and selector-policy rejection followed by
+real audio decode; fixed-buffer service proof remains on video. Known quiet fixtures use fresh decoded sample progress without a
+universal energy floor or invented PCM source attribution.
+
+Pressure is bounded application work: four actual desired-state submissions
+(coalescing is allowed), or eight actual native PCM producer submissions with
+every public result settled as accepted or backpressured. It is not a claim
+that four packets reached the wire or that a private queue saturated. These
+operations can precede repair while independent media/data must still progress.
+Fresh-process replay covers a composed cross-lane program and the exact retained
+admission-replacement regression.
+
+The required gate retains its four forced cases, eight corpus-derived cases and
+24 novel cases. Advisory search is off by default and never rerolls a failed
+world. Opt in with one seed:
+
+```sh
+./bazel run //:replay -- --seed 17 --exact \
+  --filter tests::histories::required_intent_histories \
+  --history-search compare --show-output
+```
+
+Each arm evaluates 24 histories with 96 deterministic proposals, at most 32
+operations per history and eight failure reductions. The main operation budget
+is 768; including reductions it is at most 1,024. Both arms use the same seed
+and generator budget. Guided selection adds deterministic novelty selection and
+bounded mutation using only executed public-input/fault-phase features; it has
+no private state, coverage counters or observer API. The unguided arm selects
+without feedback. Search mode is an explicit captured/replayed runner selection,
+not an ambient environment setting. Exact failures and reductions use the same
+checksum-verified concrete replay path as the required gate.
+
+Output records actual operations, reductions, reached public claims and novelty.
+Only the outer runner measures host wall time; clocks inside simulation are not
+host timing evidence. Input novelty differences are not proof of system coverage,
+correctness or performance benefit. Use runner child timings separately from
+Bazel compilation/cache cost; the opt-in comparison is not a new merge matrix.
 
 ## Check ordered-topic reconfiguration
 

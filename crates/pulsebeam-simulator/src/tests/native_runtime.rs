@@ -659,6 +659,78 @@ async fn run_peer(
     let events = TopicProbe::start(agent.events(), name, &latest, &ordered, 1);
     prime_ordered_topic(&agent, &ordered, &events, &barriers.before_media).await?;
 
+    let accepted = agent.snapshot();
+    let errors = agent.events();
+    let mut unsupported = desired.clone();
+    // Earlier valid work may still settle. A conflicting withdrawal tests
+    // rejection without treating an older observed revision as an input ACK.
+    unsupported.video.clear();
+    let fixed = core_ffi::PlayoutDelay::Fixed {
+        min_ms: 100,
+        max_ms: 100,
+    };
+    if reconnect {
+        unsupported.audio.playout_delays = vec![core_ffi::AudioTrackDelay {
+            track_id: remote_audio_id.clone(),
+            playout_delay: fixed,
+        }];
+    } else {
+        let publication = initial
+            .catalog
+            .publications
+            .iter()
+            .find(|publication| publication.id == remote_audio_id)
+            .unwrap();
+        let selector = core_ffi::TrackSelector {
+            participant_id: publication.participant_id.clone(),
+            label: publication.label.clone(),
+        };
+        unsupported.audio.pinned.clear();
+        unsupported.audio.selected = vec![selector.clone()];
+        unsupported.audio.selector_delays = vec![core_ffi::SelectorDelay {
+            selector,
+            playout_delay: fixed,
+        }];
+    }
+    agent.replace_desired(unsupported).await?;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match errors.next().await {
+                EventUpdate::Event {
+                    event:
+                        NativeEvent::Core {
+                            notification: core_ffi::Notification::ServerError { .. },
+                        },
+                } => return anyhow::Ok(()),
+                EventUpdate::Event { .. } => {}
+                EventUpdate::Lagged { skipped } => {
+                    anyhow::bail!("rejection observation lost {skipped} events")
+                }
+                EventUpdate::Closed => anyhow::bail!("rejection observation closed"),
+            }
+        }
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("unsupported fixed audio was not rejected"))??;
+    let rejected = agent.snapshot();
+    anyhow::ensure!(
+        rejected.desired_revision == accepted.desired_revision + 1,
+        "candidate desired revision was not retained"
+    );
+    anyhow::ensure!(
+        rejected.generation == accepted.generation
+            && rejected.connection == core_ffi::ConnectionState::Connected,
+        "unsupported audio reset the established session"
+    );
+    anyhow::ensure!(
+        rejected
+            .mapping
+            .video
+            .iter()
+            .any(|binding| binding.publication_id == remote_video_id),
+        "unsupported audio applied the candidate's video withdrawal"
+    );
+    // The existing exchange must decode fresh audio and video after rejection.
     let first = exchange(
         &barriers.before_reconnect,
         &agent,
@@ -674,6 +746,7 @@ async fn run_peer(
     )
     .await?;
     drop(events);
+    agent.replace_desired(desired.clone()).await?;
 
     let first_expected = first.retained.clone();
     let final_generation = if reconnect {

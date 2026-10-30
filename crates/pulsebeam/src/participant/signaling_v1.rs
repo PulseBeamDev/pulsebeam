@@ -94,6 +94,16 @@ pub(crate) enum InputError {
 }
 
 impl InputError {
+    pub(crate) fn is_fatal(self) -> bool {
+        !matches!(
+            self,
+            Self::Intent {
+                cause: IntentError::UnsupportedAudioPlayout,
+                ..
+            }
+        )
+    }
+
     pub(crate) fn response(self) -> pulsebeam_proto::signaling_v1::ServerMessage {
         use pulsebeam_proto::signaling_v1::{Error, ErrorCode, ServerMessage, server_message};
         let (code, message, intent_revision) = match self {
@@ -103,10 +113,15 @@ impl InputError {
                 None,
             ),
             Self::Intent { revision, cause } => (
-                ErrorCode::ProtocolError,
+                if cause == IntentError::UnsupportedAudioPlayout {
+                    ErrorCode::UnsupportedIntent
+                } else {
+                    ErrorCode::ProtocolError
+                },
                 match cause {
                     IntentError::VideoReceiverCapacity => "video receiver capacity exceeded",
                     IntentError::SendBinding(_) => "sender binding changed",
+                    IntentError::UnsupportedAudioPlayout => "fixed audio playout is not negotiated",
                 },
                 Some(revision),
             ),
@@ -120,7 +135,7 @@ impl InputError {
             payload: Some(server_message::Payload::Error(Error {
                 code: code.into(),
                 message: message.into(),
-                fatal: true,
+                fatal: self.is_fatal(),
                 intent_revision,
             })),
         }
@@ -128,11 +143,13 @@ impl InputError {
 }
 
 pub(crate) enum NativeInput {
+    SubscriptionSeed(pulsebeam_proto::signaling_v1::SubscriptionSeed),
     Intent(IntentDecision),
     RenewAuthorization(String),
 }
 
 pub(crate) enum AppliedInput {
+    SubscriptionSeed(pulsebeam_proto::signaling_v1::SubscriptionSeed),
     Intent {
         published: Vec<LocalTrack>,
         receive: Option<pulsebeam_proto::signaling_v1::ReceiveIntent>,
@@ -157,6 +174,7 @@ pub(crate) fn decode_input(
                 revision: intent.revision,
                 cause,
             }),
+        Some(Payload::SubscriptionSeed(seed)) => Ok(NativeInput::SubscriptionSeed(seed)),
         Some(Payload::RenewAuthorization(renewal)) => {
             Ok(NativeInput::RenewAuthorization(renewal.token))
         }
@@ -168,12 +186,14 @@ pub(crate) fn decode_input(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum IntentError {
+    UnsupportedAudioPlayout,
     VideoReceiverCapacity,
     SendBinding(SendBindingError),
 }
 
 #[derive(Default)]
 pub(crate) struct IntentState {
+    audio_playout_supported: bool,
     revision: u64,
     senders: SenderBindings,
     receive: Option<pulsebeam_proto::signaling_v1::ReceiveIntent>,
@@ -219,6 +239,23 @@ impl IntentState {
             .senders
             .plan(intent.send.as_ref(), negotiated_senders)
             .map_err(IntentError::SendBinding)?;
+        if !self.audio_playout_supported
+            && intent
+                .receive
+                .as_ref()
+                .and_then(|receive| receive.audio.as_ref())
+                .into_iter()
+                .flat_map(|audio| &audio.tracks)
+                .filter(|track| !track.track_id.is_empty() && track.track_id.len() <= 128)
+                .any(|track| {
+                    track
+                        .options
+                        .as_ref()
+                        .is_some_and(|options| options.playout_delay.is_some())
+                })
+        {
+            return Err(IntentError::UnsupportedAudioPlayout);
+        }
         let mut receive = intent.receive.clone();
         if let Some(receive) = &mut receive {
             if let Some(video) = &mut receive.video {
@@ -554,6 +591,7 @@ pub(crate) struct NativeOutput {
 }
 
 enum PendingOutput {
+    SeedComplete(pulsebeam_proto::signaling_v1::SubscriptionSeedComplete),
     Catalog(Box<CatalogPlan>),
     Mapping(pulsebeam_proto::signaling_v1::Mapping),
 }
@@ -568,14 +606,33 @@ pub(crate) struct NativeSession {
     pending: Option<PendingOutput>,
     dirty: bool,
     force_mapping: bool,
+    seeds: std::collections::VecDeque<u64>,
 }
 
 impl NativeSession {
+    pub(crate) fn new(session: &pulsebeam_rtc::SessionInfo) -> Self {
+        let audio = || {
+            session
+                .senders
+                .iter()
+                .filter(|sender| sender.kind == pulsebeam_rtc::MediaKind::Audio)
+        };
+        Self {
+            intents: IntentState {
+                audio_playout_supported: audio().next().is_some()
+                    && audio().all(|sender| sender.signals_playout_delay),
+                ..IntentState::default()
+            },
+            ..Self::default()
+        }
+    }
+
     pub(crate) fn set_cid(&mut self, cid: crate::media::ChannelId) {
         self.cid = Some(cid);
         self.catalog = CatalogState::default();
         self.mapping = None;
         self.pending = None;
+        self.seeds.clear();
         self.dirty = true;
         self.force_mapping = true;
     }
@@ -641,6 +698,24 @@ impl NativeSession {
                 Ok(AppliedInput::Intent { published, receive })
             }
             NativeInput::RenewAuthorization(token) => Ok(AppliedInput::RenewAuthorization(token)),
+            NativeInput::SubscriptionSeed(seed) => Ok(AppliedInput::SubscriptionSeed(seed)),
+        }
+    }
+
+    pub(crate) fn complete_seed(&mut self, token: u64) {
+        if !self.seeds.contains(&token) {
+            // One token per live ordered subscriber, bounded by DataState.
+            debug_assert!(self.seeds.len() < crate::track::MAX_DATA_TOPIC_CHANNELS);
+            self.seeds.push_back(token);
+        }
+        self.dirty = true;
+    }
+
+    pub(crate) fn retire_seed(&mut self, token: u64) {
+        self.seeds.retain(|pending| *pending != token);
+        if matches!(&self.pending, Some(PendingOutput::SeedComplete(completion)) if completion.seed_id == token)
+        {
+            self.pending = None;
         }
     }
 
@@ -705,6 +780,22 @@ impl NativeSession {
             self.pending = Some(PendingOutput::Catalog(Box::new(plan)));
             return Ok(Some(NativeOutput { cid, bytes }));
         }
+        if let Some(&seed_id) = self.seeds.front() {
+            debug_assert_ne!(self.catalog.revision, 0);
+            let completion = pulsebeam_proto::signaling_v1::SubscriptionSeedComplete {
+                seed_id,
+                catalog_revision: self.catalog.revision,
+            };
+            let message = ServerMessage {
+                payload: Some(server_message::Payload::SubscriptionSeedComplete(
+                    completion,
+                )),
+            };
+            let bytes =
+                pulsebeam_proto::codec::encode_server(&message).map_err(OutputError::Encode)?;
+            self.pending = Some(PendingOutput::SeedComplete(completion));
+            return Ok(Some(NativeOutput { cid, bytes }));
+        }
         let video = assignments
             .0
             .into_iter()
@@ -731,6 +822,9 @@ impl NativeSession {
 
     pub(crate) fn commit_sent(&mut self) {
         match self.pending.take() {
+            Some(PendingOutput::SeedComplete(completion)) => {
+                self.seeds.retain(|token| *token != completion.seed_id);
+            }
             Some(PendingOutput::Catalog(plan)) => self.catalog.commit(*plan),
             Some(PendingOutput::Mapping(mapping)) => {
                 self.mapping = Some(mapping);
@@ -926,6 +1020,125 @@ mod tests {
             next_upstream.track_for_sender_index(0),
             Some(next_connection.derive_track_id(TrackKind::Audio, "speaker"))
         );
+    }
+
+    #[test]
+    fn unsupported_audio_playout_rejects_the_candidate_without_committing() {
+        use pulsebeam_proto::signaling_v1::{
+            AudioIntent, AudioOptions, AudioTrackIntent, ClientMessage, Intent, PlayoutDelay,
+            ReceiveIntent, VideoIntent, VideoOptions, VideoTrackIntent, client_message,
+            server_message,
+        };
+        let encode = |intent: Intent| {
+            pulsebeam_proto::codec::encode_client(&ClientMessage {
+                payload: Some(client_message::Payload::Intent(intent)),
+            })
+            .unwrap()
+        };
+        let ctx = crate::log::LogCtx {
+            room_id: crate::entity::RoomId::from_external(
+                &crate::entity::RoomExternalId::new("unsupported-audio").unwrap(),
+            ),
+            participant_id: crate::entity::ParticipantId::new(),
+        };
+        let mut upstream =
+            super::super::upstream::Upstream::new(ctx, crate::entity::ConnectionId::new());
+        let mut session = NativeSession::default();
+        let mut candidate = Intent {
+            revision: 1,
+            receive: Some(ReceiveIntent {
+                audio: Some(AudioIntent {
+                    tracks: vec![AudioTrackIntent {
+                        track_id: "mic".into(),
+                        options: None,
+                    }],
+                    ..Default::default()
+                }),
+                video: Some(VideoIntent {
+                    tracks: vec![VideoTrackIntent {
+                        track_id: "camera".into(),
+                        options: Some(VideoOptions {
+                            playout_delay: Some(PlayoutDelay {
+                                min_ms: 100,
+                                max_ms: 100,
+                            }),
+                            ..Default::default()
+                        }),
+                    }],
+                }),
+            }),
+            ..Default::default()
+        };
+        assert!(
+            session
+                .apply_input(&encode(candidate.clone()), &media(), 1, &mut upstream)
+                .is_ok()
+        );
+        let accepted = session.intents.receive.clone();
+        candidate.revision = 2;
+        candidate.send = Some(SendIntent {
+            tracks: vec![track(0, WireTrackKind::Audio, "new-label")],
+        });
+        for delay in [0, 100] {
+            candidate
+                .receive
+                .as_mut()
+                .unwrap()
+                .audio
+                .as_mut()
+                .unwrap()
+                .tracks[0]
+                .options = Some(AudioOptions {
+                playout_delay: Some(PlayoutDelay {
+                    min_ms: delay,
+                    max_ms: delay,
+                }),
+            });
+            let Err(error) =
+                session.apply_input(&encode(candidate.clone()), &media(), 1, &mut upstream)
+            else {
+                panic!("unnegotiated fixed audio must be rejected");
+            };
+            assert!(!error.is_fatal());
+            let Some(server_message::Payload::Error(response)) = error.response().payload else {
+                panic!("expected error");
+            };
+            assert_eq!(
+                response.code,
+                pulsebeam_proto::signaling_v1::ErrorCode::UnsupportedIntent as i32
+            );
+            assert!(!response.fatal);
+            assert_eq!(response.intent_revision, Some(2));
+            assert_eq!(session.intents.revision(), 1);
+            assert_eq!(session.intents.receive, accepted);
+            assert!(session.intents.senders.by_index.is_empty());
+            assert!(upstream.track_for_sender_index(0).is_none());
+        }
+        candidate.send = None;
+        let capable = IntentState {
+            audio_playout_supported: true,
+            ..IntentState::default()
+        };
+        assert!(matches!(
+            capable.plan(&candidate, &media(), 1),
+            Ok(IntentDecision::Accept(_))
+        ));
+        candidate.revision = 3;
+        candidate
+            .receive
+            .as_mut()
+            .unwrap()
+            .audio
+            .as_mut()
+            .unwrap()
+            .tracks[0]
+            .options = None;
+        assert!(
+            session
+                .apply_input(&encode(candidate), &media(), 1, &mut upstream)
+                .is_ok()
+        );
+        assert_eq!(session.intents.revision(), 3);
     }
 
     #[test]
@@ -1222,6 +1435,65 @@ mod tests {
     }
 
     #[test]
+    fn seed_completion_cannot_overtake_unsent_catalog_or_survive_channel_retirement() {
+        use pulsebeam_proto::{codec::decode_server, signaling_v1::server_message::Payload};
+        let recipient = crate::entity::ParticipantId::new();
+        let publisher = crate::entity::ParticipantId::new();
+        let publication = remote_audio(publisher, crate::entity::ConnectionId::new(), "mic");
+        let mut session = NativeSession::default();
+        session.set_cid(crate::media::ChannelId::from_value(1));
+        session.apply_participants([peer(publisher, "publisher")], []);
+        session.complete_seed(7);
+        let first = session
+            .poll(&[publication.clone()], (vec![], vec![]), recipient, "self")
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            decode_server(&first.bytes).unwrap().payload,
+            Some(Payload::Catalog(_))
+        ));
+        assert!(
+            session
+                .poll(&[publication.clone()], (vec![], vec![]), recipient, "self")
+                .unwrap()
+                .is_none()
+        );
+        session.retry_pending();
+        let retry = session
+            .poll(&[publication.clone()], (vec![], vec![]), recipient, "self")
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.bytes, retry.bytes);
+        session.commit_sent();
+        let complete = session
+            .poll(&[publication.clone()], (vec![], vec![]), recipient, "self")
+            .unwrap()
+            .unwrap();
+        let Some(Payload::SubscriptionSeedComplete(completion)) =
+            decode_server(&complete.bytes).unwrap().payload
+        else {
+            panic!("Catalog must precede seed completion");
+        };
+        assert_eq!(completion.seed_id, 7);
+        assert_eq!(completion.catalog_revision, 1);
+        session.retry_pending();
+        let retry = session
+            .poll(&[publication.clone()], (vec![], vec![]), recipient, "self")
+            .unwrap()
+            .unwrap();
+        assert_eq!(complete.bytes, retry.bytes);
+        session.retire_seed(7);
+        let next = session
+            .poll(&[publication], (vec![], vec![]), recipient, "self")
+            .unwrap()
+            .unwrap();
+        assert!(!matches!(
+            decode_server(&next.bytes).unwrap().payload,
+            Some(Payload::SubscriptionSeedComplete(_))
+        ));
+    }
+
+    #[test]
     fn catalog_refuses_identity_reuse_after_removal() {
         let recipient = crate::entity::ParticipantId::new();
         let publisher = crate::entity::ParticipantId::new();
@@ -1400,6 +1672,37 @@ mod tests {
             Err(SendBindingError::MovedLabel)
         ));
         assert_eq!(state.plan(Some(&first), &media()).unwrap().tracks.len(), 1);
+        use pulsebeam_proto::signaling_v1 as wire;
+        let accepted = IntentState {
+            senders: state,
+            ..IntentState::default()
+        };
+        let mixed = wire::Intent {
+            revision: 1,
+            send: Some(relabel),
+            receive: Some(wire::ReceiveIntent {
+                audio: Some(wire::AudioIntent {
+                    tracks: vec![wire::AudioTrackIntent {
+                        track_id: "remote-mic".into(),
+                        options: Some(wire::AudioOptions {
+                            playout_delay: Some(wire::PlayoutDelay {
+                                min_ms: 100,
+                                max_ms: 100,
+                            }),
+                        }),
+                    }],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        };
+        assert!(
+            matches!(
+                accepted.plan(&mixed, &media(), 0),
+                Err(IntentError::SendBinding(SendBindingError::RelabeledSender))
+            ),
+            "an unsupported policy cannot downgrade a fatal binding violation"
+        );
     }
 
     #[test]

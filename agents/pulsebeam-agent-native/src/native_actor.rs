@@ -216,16 +216,6 @@ impl Drop for AgentLease {
     }
 }
 
-#[cfg(feature = "sim")]
-#[derive(Clone, Debug)]
-pub struct SimulationObservation {
-    pub ordered_cursors: Vec<(agent_core::TopicSubscriber, String, u64)>,
-    pub snapshot: Snapshot,
-    pub sent_intent_revision: Option<u64>,
-    pub last_successfully_sent_wire_revision: Option<u64>,
-    pub media_indices: BTreeMap<MediaSlot, u32>,
-}
-
 enum Command {
     ForeignDesired {
         desired: agent_core::ffi::DesiredState,
@@ -285,8 +275,6 @@ enum Command {
         command: agent_core::ResourceCommand,
         response: oneshot::Sender<Result<agent_core::ResourceResult, Error>>,
     },
-    #[cfg(feature = "sim")]
-    SimulationObservation(oneshot::Sender<SimulationObservation>),
 }
 struct Submission {
     slot: MediaSlot,
@@ -519,15 +507,6 @@ impl Agent {
         self.lease.abort.close();
         self.lease.finished.wait().await;
         Ok(())
-    }
-    #[cfg(feature = "sim")]
-    pub async fn simulation_observation(&self) -> Result<SimulationObservation, Error> {
-        let (response, result) = oneshot::channel();
-        self.commands
-            .send(Command::SimulationObservation(response))
-            .await
-            .map_err(|_| Error::Closed)?;
-        result.await.map_err(|_| Error::Closed)
     }
 }
 
@@ -1064,23 +1043,6 @@ where
                 let result = self.core.resource(command).map_err(Error::Core);
                 let _ = response.send(result);
             }
-            #[cfg(feature = "sim")]
-            Command::SimulationObservation(response) => {
-                let media_indices = self
-                    .peer
-                    .as_ref()
-                    .map(NativePeer::media_indices)
-                    .unwrap_or_default();
-                let _ = response.send(SimulationObservation {
-                    ordered_cursors: self.core.simulation_ordered_cursors(),
-                    snapshot: self.core.snapshot().clone(),
-                    sent_intent_revision: self.core.simulation_sent_intent_revision(),
-                    last_successfully_sent_wire_revision: self
-                        .core
-                        .simulation_last_successfully_sent_wire_revision(),
-                    media_indices,
-                });
-            }
         }
     }
 
@@ -1108,6 +1070,20 @@ where
                 last_rates: None,
             },
         );
+        #[cfg(debug_assertions)]
+        {
+            debug_assert_eq!(
+                self.peer
+                    .as_ref()
+                    .and_then(|peer| peer.source_identity(&inner.slot)),
+                Some(inner.identity.clone()),
+                "an admitted source lease must name the current native source"
+            );
+            debug_assert!(self.sources.get(&inner.slot).is_some_and(|source| {
+                source.identity == inner.identity
+                    && std::ptr::eq(source.lease.as_ptr(), Arc::as_ptr(&inner))
+            }));
+        }
         Ok(LocalSource { inner })
     }
     fn close_source_observation(&mut self, slot: &MediaSlot) {
@@ -1161,6 +1137,10 @@ where
             receiver: Mutex::new(receiver),
         });
         stream.leases.push(Arc::downgrade(&lease));
+        debug_assert_eq!(stream.generation, track.generation);
+        debug_assert_eq!(stream.receiver, track.receiver);
+        debug_assert_eq!(stream.mode, mode);
+        debug_assert!(stream.leases.len() <= OBSERVERS);
         let _ = stream.sender.send(MediaStreamUpdate::Track { track });
         let generation = stream.generation;
         let receiver = stream.receiver;

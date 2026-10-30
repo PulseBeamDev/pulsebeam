@@ -9,6 +9,10 @@ use crate::track::Track;
 
 #[derive(Debug, Clone)]
 pub enum ParticipantEffect {
+    SubscriptionSeedComplete {
+        connection_id: crate::entity::ConnectionId,
+        seed_id: u64,
+    },
     ParticipantsChanged {
         added: Vec<RoomPeer>,
         removed: Vec<ParticipantId>,
@@ -36,7 +40,7 @@ pub enum ParticipantEffect {
 impl ParticipantEffect {
     pub(crate) fn track_id(&self) -> Option<crate::entity::TrackId> {
         match self {
-            Self::ParticipantsChanged { .. } => None,
+            Self::ParticipantsChanged { .. } | Self::SubscriptionSeedComplete { .. } => None,
             Self::TrackCandidateAdded { track } => Some(track.id()),
             Self::TrackCandidateRemoved { track_id }
             | Self::TrackSubscribed { track_id }

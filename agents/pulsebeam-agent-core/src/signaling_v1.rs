@@ -282,6 +282,7 @@ impl CatalogState {
 }
 
 pub(crate) enum ServerOutput {
+    SeedComplete(wire::SubscriptionSeedComplete),
     StateChanged,
     Authorization(i64),
     ServerError(wire::Error),
@@ -325,6 +326,9 @@ pub(crate) fn decode_and_apply(
                     | wire::ErrorCode::ProtocolError,
                 ) => error.fatal,
                 Ok(wire::ErrorCode::AuthorizationRejected) => !error.fatal,
+                Ok(wire::ErrorCode::UnsupportedIntent) => {
+                    !error.fatal && error.intent_revision.is_some()
+                }
                 Ok(wire::ErrorCode::Internal) => true,
                 _ => false,
             };
@@ -334,6 +338,9 @@ pub(crate) fn decode_and_apply(
             Ok(ServerOutput::ServerError(error))
         }
         wire::server_message::Payload::Reconnect(_) => Ok(ServerOutput::Reconnect),
+        wire::server_message::Payload::SubscriptionSeedComplete(completion) => {
+            Ok(ServerOutput::SeedComplete(completion))
+        }
     }
 }
 
@@ -706,6 +713,13 @@ mod tests {
             ),
             Err(CatalogError::MappingShape)
         );
+        let mut unnegotiated = valid.clone();
+        unnegotiated.audio.as_mut().unwrap().tracks[0].receiver_index = 4;
+        assert_eq!(
+            state.apply_mapping(unnegotiated, &coordinates),
+            Err(CatalogError::MappingShape)
+        );
+        assert!(state.audio.is_empty());
         state.apply_mapping(valid.clone(), &coordinates).unwrap();
         assert_eq!(state.audio.get(&3).map(String::as_str), Some("opaque"));
         assert_eq!(

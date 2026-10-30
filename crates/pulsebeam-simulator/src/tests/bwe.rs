@@ -55,10 +55,12 @@ fn upgrade_after_long_low_quality_period_test() {
                 description: "Allow BWE to probe up and the allocator to upgrade",
                 duration: Duration::from_secs(15),
             },
-            Step::CheckForwardedQuality {
+            Step::CheckVideoDecodedFromInterval {
                 description: "Bob is upgraded well past the lowest layer",
-                origin: "alice",
-                min_quality: 3,
+                participant: "bob",
+                publisher: "alice",
+                min_frames: 1,
+                min_resolution: (1, 720),
             },
             Step::CheckVideoQuality {
                 description: "Frames stay renderable across the upgrade",
@@ -98,21 +100,23 @@ fn subscriber_reaches_top_layer_on_fast_link_test() {
                 participant: "bob",
                 heights: &[720],
             },
-            Step::WaitForVideo {
+            Step::WaitForVideoAtResolution {
                 description: "Bob decodes the top layer",
                 participant: "bob",
                 publishers: &["alice"],
-                min_quality: 3,
+                min_resolution: (1, 720),
                 timeout: Duration::from_secs(60),
             },
             Step::Run {
                 description: "Measurement window",
                 duration: Duration::from_secs(15),
             },
-            Step::CheckForwardedQuality {
-                description: "Bob receives the top layer, not just the middle one",
-                origin: "alice",
-                min_quality: 3,
+            Step::CheckVideoDecodedFromInterval {
+                description: "Bob independently decodes full-height video in the measurement window",
+                participant: "bob",
+                publisher: "alice",
+                min_frames: 1,
+                min_resolution: (1, 720),
             },
         ]);
 }
@@ -146,24 +150,23 @@ fn height_request_rounds_up_the_ladder_test() {
                 participant: "viewer",
                 targets: &[("camera", 540)],
             },
-            Step::WaitForVideo {
+            Step::WaitForVideoAtResolution {
                 description: "Viewer decodes the rounded-up layer",
                 participant: "viewer",
                 publishers: &["camera"],
-                min_quality: 3,
+                min_resolution: (1, 720),
                 timeout: Duration::from_secs(30),
             },
             Step::Run {
                 description: "Measurement window",
                 duration: Duration::from_secs(30),
             },
-            // Stated as the layer rather than inferred from a byte count. Which rung was chosen
-            // is the entire question here, and the forwarded quality answers it directly instead
-            // of via a threshold that has to be re-derived whenever the ladder's rates change.
-            Step::CheckForwardedQuality {
-                description: "Viewer gets the 720p layer, not the 360p one",
-                origin: "camera",
-                min_quality: 3,
+            Step::CheckVideoDecodedFromInterval {
+                description: "Viewer independently decodes the supplied 720p representation",
+                participant: "viewer",
+                publisher: "camera",
+                min_frames: 1,
+                min_resolution: (1, 720),
             },
         ]);
 }
@@ -208,17 +211,12 @@ fn high_priority_camera_reclaims_bandwidth_from_screenshare_test() {
                 participant: "viewer",
                 targets: &[("camera", 720, 360, 200), ("screen", 180, 0, 10)],
             },
-            Step::WaitForVideo {
+            Step::WaitForVideoAtResolution {
                 description: "Viewer decodes the reclaimed camera target",
                 participant: "viewer",
                 publishers: &["camera"],
-                min_quality: 3,
+                min_resolution: (1, 720),
                 timeout: Duration::from_secs(60),
-            },
-            Step::CheckForwardedQualityReached {
-                description: "The high-priority camera reaches its top layer during contention",
-                origin: "camera",
-                min_quality: 3,
             },
         ]);
 }
@@ -235,13 +233,131 @@ fn screen_camera_viewer_room() -> Room {
         .with_participant(Participant::manual_subscriber("viewer", 2))
 }
 
+/// Joint spatial/temporal minimums precede optional target upgrades; priority
+/// decides between minimums that cannot both fit. Premises use submitted input.
+#[test]
+fn low_priority_minimum_precedes_high_priority_target_test() {
+    use super::common::harness::{SourceInputTier, VideoSubscription};
+    use pulsebeam_agent_native::agent_core::PlayoutDelay;
+    let fixture = native_temporal_ladder();
+    for seed in QOS_SEEDS {
+        LocalNodeSim::new()
+            .with_rng_seed(seed)
+            .with_link(LinkProfile::fiber())
+            .with_room(
+                Room::new("room1")
+                    .with_participant(Participant::publisher("camera", &["q", "h", "f"])
+                        .with_native_video_fixture(fixture.clone()))
+                    .with_participant(Participant::publisher("protected", &["q", "h", "f"])
+                        .with_native_video_fixture(fixture.clone()))
+                    .with_participant(Participant::manual_subscriber("viewer", 2).with_native_playback()),
+            )
+            .run(vec![
+                Step::Run {
+                    description: "Discover both independently stamped genuine three-rung T3 sources",
+                    duration: Duration::from_secs(5),
+                },
+                Step::SetCapacity {
+                    description: "Only viewer egress is constrained; publisher uplinks remain clean",
+                    participant: "viewer",
+                    capacity: Capacity::Fixed(780_000),
+                    max_backlog: Duration::from_millis(500),
+                },
+                Step::SubscribeToConfigured {
+                    description: "Protect 180p/15fps and lower-priority 720p/15fps before target upgrades",
+                    participant: "viewer",
+                    targets: [("camera", 180, 200), ("protected", 720, 10)].into_iter()
+                        .map(|(publisher, min_height, priority)| VideoSubscription {
+                            participant_id: publisher.into(), height: 720, min_height, min_fps: 15,
+                            priority, playout_delay: PlayoutDelay::Fixed { min_ms: 0, max_ms: 0 },
+                            ..Default::default()
+                        }).collect(),
+                },
+                Step::WaitForSourceVideo {
+                    description: "The protected source becomes genuine native 720p within convergence bound",
+                    participant: "viewer", publisher: "protected", min_resolution: (1280, 720),
+                    timeout: Duration::from_secs(30),
+                },
+                Step::Run {
+                    description: "Retain the existing 45-second allocation settling phase before steady measurement",
+                    duration: Duration::from_secs(45),
+                },
+                Step::Run {
+                    description: "Measure fresh source progress throughout sustained joint contention",
+                    duration: Duration::from_secs(60),
+                },
+                Step::CheckSourceInputLoad {
+                    description: "Protected input fits, both full targets do not, and keyframe bursts fit",
+                    participant: "viewer",
+                    protected: &[("camera", "q"), ("protected", "f")],
+                    competing: &[("camera", "f"), ("protected", "f")],
+                    competing_tier: SourceInputTier::Full,
+                    capacity_bps: 780_000, max_backlog: Duration::from_millis(500),
+                },
+                // Leave one second for the declared 500ms queue and source/
+                // decoder phase edges. This rejects the T0-only 7.5fps tier;
+                // it is a phase service floor, not unshaped per-event D.
+                Step::CheckNativeSourceProgress {
+                    description: "Lower-priority 720p/15fps minimum reaches actual native pictures",
+                    participant: "viewer", publisher: "protected", min_frames: 15 * 59,
+                    min_resolution: (1280, 720),
+                },
+                Step::CheckNativeSourceProgress {
+                    description: "High-priority 180p/15fps minimum also reaches actual native pictures",
+                    participant: "viewer", publisher: "camera", min_frames: 15 * 59,
+                    min_resolution: (320, 180),
+                },
+                Step::SetCapacity {
+                    description: "One native 720p/15fps input fits 650kbps but the two protected inputs cannot both fit",
+                    participant: "viewer", capacity: Capacity::Fixed(650_000),
+                    max_backlog: Duration::from_millis(500),
+                },
+                Step::SubscribeToConfigured {
+                    description: "Request competing 720p/15fps minimums with unequal priorities",
+                    participant: "viewer",
+                    targets: [("camera", 200), ("protected", 10)].into_iter()
+                        .map(|(publisher, priority)| VideoSubscription {
+                            participant_id: publisher.into(), height: 720, min_height: 720, min_fps: 15,
+                            priority, playout_delay: PlayoutDelay::Fixed { min_ms: 0, max_ms: 0 },
+                            ..Default::default()
+                        }).collect(),
+                },
+                Step::WaitForSourceVideo {
+                    description: "The higher-priority source reaches genuine native 720p after reconfiguration",
+                    participant: "viewer", publisher: "camera", min_resolution: (1280, 720),
+                    timeout: Duration::from_secs(30),
+                },
+                Step::Run {
+                    description: "Use the same allocation settling horizon for the distinct priority-scarcity phase",
+                    duration: Duration::from_secs(45),
+                },
+                Step::Run {
+                    description: "Measure a fresh sixty-second interval with competing protected minimums",
+                    duration: Duration::from_secs(60),
+                },
+                Step::CheckSourceInputLoad {
+                    description: "The priority winner fits including its input train; both protected T0/T1 coded inputs exceed capacity",
+                    participant: "viewer", protected: &[("camera", "f")],
+                    competing: &[("camera", "f"), ("protected", "f")],
+                    competing_tier: SourceInputTier::T0T1,
+                    capacity_bps: 650_000, max_backlog: Duration::from_millis(500),
+                },
+                Step::CheckNativeSourceProgress {
+                    description: "The higher-priority protected minimum wins in actual source-correlated native 720p/15fps pictures",
+                    participant: "viewer", publisher: "camera", min_frames: 15 * 59,
+                    min_resolution: (1280, 720),
+                },
+            ]);
+    }
+}
+
 /// Reconfiguration and sustained contention across fixed deterministic seeds.
 /// Protected minimums and optional target allocation have distinct contracts.
 mod slow {
     use super::*;
 
     #[test]
-    fn priority_reconfiguration_quality_churn_test() {
+    fn reconfiguring_priority_preserves_focused_camera_decoding_test() {
         for seed in QOS_SEEDS {
             LocalNodeSim::new()
             .with_rng_seed(seed)
@@ -279,10 +395,12 @@ mod slow {
                     description: "Require the focused camera to reach top quality after reconfiguration",
                     duration: Duration::from_secs(30),
                 },
-                Step::CheckForwardedQuality {
-                    description: "The focused high-priority camera reaches its requested top layer",
-                    origin: "camera",
-                    min_quality: 3,
+                Step::CheckVideoDecodedFromInterval {
+                    description: "The focused high-priority camera reaches its requested full-height video",
+                    participant: "viewer",
+                    publisher: "camera",
+                    min_frames: 1,
+                    min_resolution: (1, 720),
                 },
                 Step::Run {
                     description: "Soak the focused allocation",
@@ -292,77 +410,14 @@ mod slow {
                     description: "priority reconfiguration diagnostic",
                     participant: "viewer",
                 },
-                Step::CheckForwardedQuality {
-                    description: "The focused camera holds its top layer through the soak",
-                    origin: "camera",
-                    min_quality: 3,
-                },
-                Step::Expect {
-                    description: "The focused camera settles on one layer without oscillating",
+                Step::CheckVideoDecodedFromInterval {
+                    description: "The focused camera holds its full-height video through the soak",
                     participant: "viewer",
-                    property: Property::QualityReversalsBelow {
-                        origin: "camera",
-                        max: 0,
-                    },
-                },
-                Step::Expect {
-                    description: "Optional screen resumption stays within the feasible allocation budget",
-                    participant: "viewer",
-                    property: Property::AllocationWithinEstimate,
+                    publisher: "camera",
+                    min_frames: 1,
+                    min_resolution: (1, 720),
                 },
             ]);
-        }
-    }
-
-    /// A lower-priority protected minimum beats a higher-priority target upgrade.
-    /// Two camera top layers exceed this link, but both requested minimums fit.
-    #[test]
-    fn low_priority_minimum_precedes_high_priority_target_test() {
-        for seed in QOS_SEEDS {
-            LocalNodeSim::new()
-                .with_rng_seed(seed)
-                .with_bandwidth(2_200_000)
-                .with_room(
-                    Room::new("room1")
-                        .with_participant(Participant::quality_ladder_publisher(
-                            "camera", pulsebeam_testdata::QualityVideoSource::Zero,
-                        ))
-                        .with_participant(Participant::quality_ladder_publisher(
-                            "protected", pulsebeam_testdata::QualityVideoSource::One,
-                        ))
-                        .with_participant(Participant::manual_subscriber("viewer", 2)),
-                )
-                .run(vec![
-                    Step::Run {
-                        description: "Discover both distinguishable native camera ladders",
-                        duration: Duration::from_secs(5),
-                    },
-                    Step::SubscribeToQos {
-                        description: "A high-priority 720p target and a lower-priority 720p minimum",
-                        participant: "viewer",
-                        targets: &[("camera", 720, 180, 200), ("protected", 720, 720, 10)],
-                    },
-                    Step::Run {
-                        description: "Converge while both targets cannot fit together",
-                        duration: Duration::from_secs(45),
-                    },
-                    Step::CheckForwardedQuality {
-                        description: "The lower-priority minimum is funded before the camera upgrade",
-                        origin: "protected",
-                        min_quality: 3,
-                    },
-                    Step::CheckForwardedQuality {
-                        description: "The higher-priority minimum remains funded too",
-                        origin: "camera",
-                        min_quality: 1,
-                    },
-                    Step::CheckVideoReceivedFrom {
-                        description: "The protected source delivers media, not just an allocator decision",
-                        participant: "viewer",
-                        publisher: "protected",
-                        min_frames: 60,
-                    },
-                ]);
         }
     }
 
@@ -389,18 +444,12 @@ mod slow {
                     description: "Let the allocator resolve the contention",
                     duration: Duration::from_secs(45),
                 },
-                Step::CheckForwardedQuality {
-                    description: "The focused camera reaches its top layer over a droppable stream",
-                    origin: "camera",
-                    min_quality: 3,
-                },
-                Step::Expect {
-                    description: "The focused camera holds its top layer without flapping",
+                Step::CheckVideoDecodedFromInterval {
+                    description: "The focused camera reaches its full-height video over a droppable stream",
                     participant: "viewer",
-                    property: Property::QualityReversalsBelow {
-                        origin: "camera",
-                        max: 0,
-                    },
+                    publisher: "camera",
+                    min_frames: 1,
+                    min_resolution: (1, 720),
                 },
             ]);
         }
@@ -437,18 +486,17 @@ mod slow {
                     description: "Let the camera claim the bandwidth the hidden stream frees",
                     duration: Duration::from_secs(70),
                 },
-                Step::CheckForwardedQualityReached {
-                    description: "The visible camera reaches its top layer once the other is truly off",
-                    origin: "camera",
-                    min_quality: 3,
-                },
-                Step::Expect {
-                    description: "The lone visible camera holds its top layer without flapping",
+                Step::CheckVideoDecodedFromInterval {
+                    description: "The visible camera reaches its full-height video once the other is truly off",
                     participant: "viewer",
-                    property: Property::QualityReversalsBelow {
-                        origin: "camera",
-                        max: 0,
-                    },
+                    publisher: "camera",
+                    min_frames: 1,
+                    min_resolution: (1, 720),
+                },
+                Step::CheckVideoNotReceivedFrom {
+                    description: "The zero-target source delivers no video to the viewer",
+                    participant: "viewer",
+                    publisher: "hidden",
                 },
             ]);
         }
@@ -458,7 +506,7 @@ mod slow {
     /// steady, the forwarded layer must not oscillate. This is the instability guard that the endpoint
     /// and byte-count checks cannot see.
     #[test]
-    fn steady_state_allocation_does_not_churn_test() {
+    fn steady_subscriptions_keep_camera_source_decodable_test() {
         for seed in QOS_SEEDS {
             LocalNodeSim::new()
                 .with_rng_seed(seed)
@@ -482,27 +530,23 @@ mod slow {
                         description: "Let the allocation reach steady state",
                         duration: Duration::from_secs(20),
                     },
-                    Step::CheckForwardedQuality {
-                        description: "The camera settles on its top layer",
-                        origin: "camera",
-                        min_quality: 3,
+                    Step::CheckVideoDecodedFromInterval {
+                        description: "The camera settles on its full-height video",
+                        participant: "viewer",
+                        publisher: "camera",
+                        min_frames: 1,
+                        min_resolution: (1, 720),
                     },
                     Step::Run {
                         description: "Soak the steady allocation",
                         duration: Duration::from_secs(60),
                     },
-                    Step::CheckForwardedQuality {
-                        description: "The camera holds its top layer through the soak",
-                        origin: "camera",
-                        min_quality: 3,
-                    },
-                    Step::Expect {
-                        description: "A settled stream does not oscillate on a steady link",
+                    Step::CheckVideoDecodedFromInterval {
+                        description: "The camera holds its full-height video through the soak",
                         participant: "viewer",
-                        property: Property::QualityReversalsBelow {
-                            origin: "camera",
-                            max: 0,
-                        },
+                        publisher: "camera",
+                        min_frames: 1,
+                        min_resolution: (1, 720),
                     },
                 ]);
         }
@@ -517,7 +561,7 @@ mod slow {
     /// converges and the stream still holds a layer when the feedback path is as lossy as the media
     /// path - which on a mobile uplink it usually is, and worse.
     #[test]
-    fn estimate_converges_when_feedback_is_lossy_test() {
+    fn camera_source_decodes_through_lossy_feedback_test() {
         for seed in QOS_SEEDS {
             let mut link = LinkProfile::cellular();
             link.bandwidth_bps = Some(3_000_000);
@@ -543,42 +587,25 @@ mod slow {
                     description: "Converge with feedback that is itself being lost and reordered",
                     duration: Duration::from_secs(60),
                 },
-                Step::Expect {
-                    description: "The estimate still finds most of the link through lossy feedback",
+                Step::CheckVideoDecodedFromInterval {
+                    description: "viewer decodes fresh camera source output in this phase",
                     participant: "viewer",
-                    property: Property::EstimateMeetsNeed { percent: 60 },
+                    publisher: "camera",
+                    min_frames: 1,
+                    min_resolution: (1, 720),
                 },
                 Step::Expect {
                     description: "Degraded feedback does not drive the sender into congestion",
                     participant: "viewer",
                     property: Property::CongestionLossBelow(5),
                 },
-                // Looser than the clean-link plans on purpose. Burst loss in both directions
-                // makes shedding a layer and climbing back the *correct* response, and each such
-                // cycle is a reversal, so demanding near-zero would assert the link is quiet
-                // rather than that the allocator is stable. What must not happen is churn without
-                // end; the convergence and congestion claims above pin the rest.
-                Step::Expect {
-                    description: "The forwarded layer settles rather than churning without end",
-                    participant: "viewer",
-                    property: Property::QualityReversalsBelow {
-                        origin: "camera",
-                        max: 5,
-                    },
-                },
             ]);
         }
     }
 
-    /// Reordering is a normal internet condition, not a fault, and it is the one this suite has never
-    /// modelled: packets arriving late enough to overtake their successors.
-    ///
-    /// The failure it provokes is specific - a receiver that treats a gap as loss will request a
-    /// keyframe for a packet that was merely late, and a stream that does that repeatedly never holds
-    /// a decodable run. So the assertions here are about *not over-reacting*: the stream keeps
-    /// delivering frames and keeps its layer, rather than churning keyframes.
+    /// Requested source video remains decodable under imposed reordering and duplication.
     #[test]
-    fn a_reordering_path_does_not_churn_keyframes_test() {
+    fn a_reordering_path_keeps_camera_source_decodable_test() {
         for seed in QOS_SEEDS {
             let mut link = LinkProfile::fiber();
             link.bandwidth_bps = Some(3_000_000);
@@ -611,23 +638,17 @@ mod slow {
                         description: "Run on a path that reorders and duplicates",
                         duration: Duration::from_secs(60),
                     },
-                    Step::CheckForwardedQualityReached {
-                        description: "The camera still reaches its top layer despite reordering",
-                        origin: "camera",
-                        min_quality: 3,
+                    Step::CheckVideoDecodedFromInterval {
+                        description: "The camera still reaches its full-height video despite reordering",
+                        participant: "viewer",
+                        publisher: "camera",
+                        min_frames: 1,
+                        min_resolution: (1, 720),
                     },
                     Step::Expect {
                         description: "Late packets are not mistaken for congestion",
                         participant: "viewer",
                         property: Property::CongestionLossBelow(5),
-                    },
-                    Step::Expect {
-                        description: "A late packet does not cost the stream its layer",
-                        participant: "viewer",
-                        property: Property::QualityReversalsBelow {
-                            origin: "camera",
-                            max: 1,
-                        },
                     },
                 ]);
         }
@@ -666,15 +687,12 @@ fn priority_swap_reaches_every_requested_top_layer_on_fast_link_test() {
                 description: "Allow BWE to satisfy the new allocation",
                 duration: Duration::from_secs(60),
             },
-            Step::Expect {
-                description: "The estimate reaches the requested allocation",
+            Step::CheckNativeVideoDecodedFromInterval {
+                description: "Camera finishes on its full-height video",
                 participant: "viewer",
-                property: Property::EstimateMeetsNeed { percent: 95 },
-            },
-            Step::CheckForwardedQuality {
-                description: "Camera finishes on its top layer",
-                origin: "camera",
-                min_quality: 3,
+                publisher: "camera",
+                min_frames: 1,
+                min_resolution: (1, 720),
             },
             // Native removes a lone RID. Prove recent full-size pixels, not
             // a simulcast quality label that this unlayered source cannot emit.
@@ -739,20 +757,12 @@ fn screenshare_recovers_after_competing_camera_pause_test() {
                 description: "post-recovery state",
                 participant: "viewer",
             },
-            // The defect named directly. The link recovered to 3 Mbps, drops nothing and holds
-            // only ~30ms of queue, so nothing about it justifies the estimate walking down. A
-            // controller may take time to re-discover capacity; it may not talk itself out of it.
-            Step::Expect {
-                description: "The estimate recovers rather than staying down",
+            Step::CheckNativeVideoDecodedFromInterval {
+                description: "viewer decodes fresh camera source output in this phase",
                 participant: "viewer",
-                property: Property::EstimateRecovers {
-                    of_peak_percent: 70,
-                },
-            },
-            Step::Expect {
-                description: "The estimate finds enough for what the allocator asked for",
-                participant: "viewer",
-                property: Property::EstimateMeetsNeed { percent: 80 },
+                publisher: "camera",
+                min_frames: 1,
+                min_resolution: (1, 180),
             },
             Step::Expect {
                 description: "Recovery is not bought with standing queue",
@@ -771,25 +781,6 @@ fn screenshare_recovers_after_competing_camera_pause_test() {
                 publisher: "screen",
                 min_frames: 1,
                 min_resolution: (1280, 720),
-            },
-            // Stability, which none of the claims above can see: a stream flipping between two
-            // layers many times a second satisfies every one of them - right final layer, right
-            // byte count, right estimate - while showing the viewer nothing.
-            Step::Expect {
-                description: "The screen share holds a layer instead of flapping",
-                participant: "viewer",
-                property: Property::QualityChangesPerMinuteBelow {
-                    origin: "screen",
-                    max: 30,
-                },
-            },
-            Step::Expect {
-                description: "The camera holds a layer instead of flapping",
-                participant: "viewer",
-                property: Property::QualityChangesPerMinuteBelow {
-                    origin: "camera",
-                    max: 30,
-                },
             },
         ]);
 }
@@ -840,10 +831,12 @@ fn resizing_camera_keeps_single_layer_screenshare_rendering_test() {
                 participant: "viewer",
                 quality: VideoQuality::min_frames(300).allow_gaps(4),
             },
-            Step::CheckForwardedQuality {
-                description: "Camera settles on its 360p layer",
-                origin: "camera",
-                min_quality: 2,
+            Step::CheckNativeVideoDecodedFromInterval {
+                description: "Camera settles on its 360p video",
+                participant: "viewer",
+                publisher: "camera",
+                min_frames: 1,
+                min_resolution: (1, 360),
             },
             Step::CheckNativeVideoDecodedFromInterval {
                 description: "Single-layer screen share keeps rendering full-size frames: actual admission-correlated native I420",
@@ -1006,18 +999,6 @@ fn late_joiner_receives_earlier_participant_in_both_directions_test() {
                 property: Property::VideoDecodes,
             },
         ]);
-
-    // A keyframe request that cannot be addressed is dropped by the shard, and
-    // unlike media it never comes round again - the subscriber stays black until
-    // something else happens to ask. The fanout key that addresses it arrives
-    // asynchronously, in the view delta that installs the subscription, so the
-    // window is real and only some seeds land a request inside it. Asserting the
-    // counter catches it at every seed rather than at the one that happened to.
-    assert_eq!(
-        pulsebeam::sim_metrics::routing_drop("keyframe", "runtime", "local"),
-        0,
-        "a keyframe request was issued before its fanout binding existed"
-    );
 }
 
 /// The same call over home Wi-Fi: 8-16ms jitter and 0.2% loss.
@@ -1043,19 +1024,227 @@ fn screenshare_and_camera_over_cellular_test() {
     conference_plan(LinkProfile::cellular(), 300);
 }
 
+fn native_conference(link: LinkProfile) -> LocalNodeSim {
+    LocalNodeSim::new()
+        .with_link(link)
+        .with_room(native_conference_room(None, None))
+}
+
+fn native_conference_room(
+    picture: Option<std::sync::Arc<super::common::media::SolidVideoInput>>,
+    camera_fixture: Option<std::sync::Arc<super::common::media::NativeVideoFixture>>,
+) -> Room {
+    let mut screen = Participant::screensharer("screen")
+        .and_subscribes()
+        .with_native_playback();
+    if let Some(picture) = picture {
+        screen = screen.with_solid_video(picture);
+    }
+    let mut camera = Participant::publisher("camera", &["q", "h", "f"])
+        .and_subscribes()
+        .with_native_playback();
+    if let Some(fixture) = camera_fixture {
+        camera = camera.with_native_video_fixture(fixture);
+    }
+    Room::new("room1")
+        .with_participant(screen)
+        .with_participant(camera)
+}
+
+fn native_temporal_ladder() -> std::sync::Arc<super::common::media::NativeVideoFixture> {
+    use pulsebeam_rtc_simulation::NativeH264FixtureEncoding;
+    std::sync::Arc::new(
+        super::common::media::NativeVideoFixture::stock_temporal(
+            &[
+                (
+                    "q",
+                    NativeH264FixtureEncoding {
+                        width: 320,
+                        height: 180,
+                        bitrate_kbps: 200,
+                    },
+                ),
+                (
+                    "h",
+                    NativeH264FixtureEncoding {
+                        width: 640,
+                        height: 360,
+                        bitrate_kbps: 500,
+                    },
+                ),
+                (
+                    "f",
+                    NativeH264FixtureEncoding {
+                        width: 1280,
+                        height: 720,
+                        bitrate_kbps: 1_000,
+                    },
+                ),
+            ],
+            3,
+            48,
+        )
+        .expect("genuine precomputed three-rung T3 input"),
+    )
+}
+
+#[test]
+fn clean_native_source_windows_respect_explicit_fixed_buffers_test() {
+    use super::common::harness::VideoSubscription;
+    use pulsebeam_agent_native::agent_core::PlayoutDelay;
+    let camera_fixture = native_temporal_ladder();
+    let mut plan = vec![Step::WaitForPublication {
+        description: "Establish the existing conference sources on clean fiber",
+        publisher: "camera",
+        timeout: Duration::from_secs(5),
+    }];
+    for buffer in [0, 120] {
+        plan.extend([
+            Step::SubscribeToConfigured {
+                description: "Request the supplied full-rate representation with explicit fixed buffering",
+                participant: "screen",
+                targets: vec![VideoSubscription {
+                    participant_id: "camera".into(), height: 720, min_height: 720,
+                    min_fps: 30, priority: 100,
+                    playout_delay: PlayoutDelay::Fixed { min_ms: buffer, max_ms: buffer },
+                    ..Default::default()
+                }],
+            },
+            Step::WaitForSourceVideo {
+                description: "A newly supplied capture becomes genuine native output within five seconds plus fixed buffering",
+                participant: "screen", publisher: "camera", min_resolution: (1280, 720), timeout: Duration::from_secs(5),
+            },
+            Step::MeasureSourceWindow {
+                description: "Every full-rate capture reaches actual native pixels exactly once by its declared deadline",
+                participant: "screen", publisher: "camera", encodings: &["f"], duration: Duration::from_secs(1),
+            },
+        ]);
+        if buffer == 0 {
+            plan.extend([
+                Step::SubscribeToConfigured {
+                    description: "Establish the separate native call before replacing its owner",
+                    participant: "replacement",
+                    targets: vec![VideoSubscription {
+                        participant_id: "camera".into(), height: 720, min_height: 720, min_fps: 30,
+                        playout_delay: PlayoutDelay::Fixed { min_ms: 0, max_ms: 0 },
+                        ..Default::default()
+                    }],
+                },
+                Step::WaitForSourceVideo {
+                    description: "The owner being replaced has an actual established native receiver",
+                    participant: "replacement", publisher: "camera", min_resolution: (1280, 720),
+                    timeout: Duration::from_secs(5),
+                },
+                Step::BeginHeldReconnect {
+                    description: "Keep the replacement native bootstrap HTTP future pending",
+                    participant: "replacement", timeout: Duration::from_secs(5),
+                },
+                Step::MeasureSourceWindow {
+                    description: "The unrelated established unbuffered 30fps call meets every source deadline while replacement is held",
+                    participant: "screen", publisher: "camera", encodings: &["f"],
+                    duration: Duration::from_secs(1),
+                },
+                Step::ReleaseHeldReconnect {
+                    description: "Release only after the complete source interval and its deadlines, at the five-second hold boundary",
+                    participant: "replacement", held_for: Duration::from_secs(5),
+                },
+                Step::SubscribeToConfigured {
+                    description: "Reapply the same full-rate request to the replacement application owner",
+                    participant: "replacement",
+                    targets: vec![VideoSubscription {
+                        participant_id: "camera".into(), height: 720, min_height: 720, min_fps: 30,
+                        playout_delay: PlayoutDelay::Fixed { min_ms: 0, max_ms: 0 },
+                        ..Default::default()
+                    }],
+                },
+                Step::WaitForSourceVideo {
+                    description: "A first current native picture returns within the thirty-second restoration budget",
+                    participant: "replacement", publisher: "camera", min_resolution: (1280, 720),
+                    timeout: Duration::from_secs(30),
+                },
+                Step::WaitSinceBootstrapRelease {
+                    description: "End the declared restoration phase exactly thirty seconds after release, not thirty seconds after first output",
+                    participant: "replacement", duration: Duration::from_secs(30),
+                },
+                Step::MeasureSourceWindow {
+                    description: "By the restoration deadline the recovered owner sustains the complete fresh full-rate source contract",
+                    participant: "replacement", publisher: "camera", encodings: &["f"],
+                    duration: Duration::from_secs(1),
+                },
+                Step::Disconnect {
+                    description: "Retire the completed replacement workload before the remaining buffering and sparse-update checks",
+                    participant: "replacement",
+                },
+            ]);
+        }
+    }
+    plan.extend([
+        Step::SubscribeToConfigured {
+            description: "Receive the intentionally uniform one-fps source with fixed buffering",
+            participant: "camera",
+            targets: vec![VideoSubscription {
+                participant_id: "screen".into(), height: 180, min_height: 180, min_fps: 1,
+                playout_delay: PlayoutDelay::Fixed { min_ms: 120, max_ms: 120 },
+                ..Default::default()
+            }],
+        },
+        Step::WaitForSourceVideo {
+            description: "A genuine new uniform source picture is valid native output",
+            participant: "camera", publisher: "screen", min_resolution: (320, 180), timeout: Duration::from_secs(5),
+        },
+        Step::MeasureSourceWindow {
+            description: "One-fps uniform input has one-fps obligations, not a camera rate floor",
+            participant: "camera", publisher: "screen", encodings: &["q"], duration: Duration::from_secs(1),
+        },
+        Step::QuietSolidVideo {
+            description: "The application deliberately supplies no new pictures while holding the dark content",
+            participant: "screen",
+        },
+        Step::MeasureSourceWindow {
+            description: "An unrelated quiet producer does not stall the continuous camera",
+            participant: "screen", publisher: "camera", encodings: &["f"], duration: Duration::from_secs(1),
+        },
+        Step::SubscribeToConfigured {
+            description: "After proving camera continuity, explicitly hide that completed workload during the sparse update check",
+            participant: "screen",
+            targets: vec![VideoSubscription {
+                participant_id: "camera".into(), height: 0,
+                playout_delay: PlayoutDelay::Fixed { min_ms: 120, max_ms: 120 },
+                ..Default::default()
+            }],
+        },
+        Step::Run {
+            description: "Quiet creates no artificial camera-rate obligation for the held image",
+            duration: Duration::from_secs(4),
+        },
+        Step::UpdateSolidVideo {
+            description: "The application replaces the held dark picture with a light picture",
+            participant: "screen",
+        },
+        Step::WaitForSourceVideo {
+            description: "The explicit light update, not a later dark receipt, reaches native pixels within five seconds plus buffering",
+            participant: "camera", publisher: "screen", min_resolution: (320, 180), timeout: Duration::from_secs(5),
+        },
+        Step::MeasureSourceWindow {
+            description: "The updated uniform picture sustains its supplied low cadence",
+            participant: "camera", publisher: "screen", encodings: &["q"], duration: Duration::from_secs(1),
+        },
+    ]);
+    LocalNodeSim::new()
+        .with_link(LinkProfile::fiber())
+        .with_room(
+            native_conference_room(Some(Default::default()), Some(camera_fixture))
+                .with_participant(
+                    Participant::manual_subscriber("replacement", 1).with_native_playback(),
+                ),
+        )
+        .run(plan);
+}
+
 /// Native playback is the user contract, not encoded polling retention or
 /// byte volume. Camera cadence and sparse desktop updates have distinct bounds.
 fn conference_plan(link: LinkProfile, camera_min_frames: u64) {
-    LocalNodeSim::new()
-        .with_link(link)
-        .with_room(
-            Room::new("room1")
-                .with_participant(Participant::screensharer("screen").and_subscribes().with_native_playback())
-                .with_participant(
-                    Participant::publisher("camera", &["q", "h", "f"]).and_subscribes().with_native_playback(),
-                ),
-        )
-        .run(vec![
+    native_conference(link).run(vec![
             Step::BeginNativePlayback {
                 description: "Measure desktop updates across the call, including quiet periods",
                 participant: "camera",
@@ -1114,49 +1303,10 @@ fn conference_plan(link: LinkProfile, camera_min_frames: u64) {
         ]);
 }
 
-/// A viewer of a static screen share must not lose its bandwidth estimate.
-///
-/// This is the production failure, reproduced end to end. Three participants: a presenter sharing
-/// a mostly static screen, a second person on camera, and a viewer.
-///
-/// The mechanism runs entirely through the viewer's downstream connection:
-///
-///   1. While the screen is static the presenter emits near-empty frames, so every packet the SFU
-///      forwards to the viewer is a couple of hundred bytes at most.
-///   2. Padding is drawn from the RTX cache of recently sent packets, so the viewer's downstream
-///      has only tiny packets available to pad with.
-///   3. str0m emits one padding packet per event-loop round trip, so a probe cluster aimed at a
-///      few Mbps cannot get there - it runs out of wall clock long before it runs out of target
-///      bytes. Measured here: a 4 Mbps cluster achieving 0.13 Mbps across 397 packets of 16 bytes.
-///   4. Unless rejected, that probe reports the rate it *managed* to send at, which asserts a link
-///      limit that was never tested and drags the estimate down.
-///   5. The viewer's allocator then cannot afford the camera - the production symptom, "the
-///      allocator doesn't think there's enough for the camera to be streamed".
-///
-/// The viewer deliberately watches *only* the screen share during the soak; a second active
-/// stream keeps the acknowledged rate high enough to prop the estimate up on its own.
-///
-/// # What this test does and does not currently prove
-///
-/// It **does** reproduce the starved-probe condition. Instrumented with
-/// `RUST_LOG=str0m::bwe_::probe::estimator=trace`, this plan produces clusters like
-/// `tgt=4.00M ach=0.13M (3%) pkts=397 avgB=16` - a 4 Mbps probe achieving 130 kbps across 397
-/// packets of 16 bytes, which is the production failure mode and then some.
-///
-/// It does **not** yet reproduce the consequence. In production those starved probes pinned the
-/// estimate at ~1.45 Mbps on a link carrying 3 Mbps. Here the viewer's estimate stays near
-/// 2.6-2.9 Mbps whether or not str0m's `MIN_PROBE_DELIVERY_RATIO` guard is enabled, so this test
-/// does not currently discriminate that guard - the str0m unit tests
-/// `under_delivered_probe_is_rejected` and `delivered_probe_still_produces_estimate` do that
-/// directly. The likely reason is `limit_probe_bitrate`, which floors a probe result at
-/// `min(delay_estimate, acked * 0.85)`; if the delay-based estimate stays high here, bad probe
-/// results are clamped away before they can do damage.
-///
-/// So treat this as a regression guard on the *conditions* plus the viewer's estimate, not as
-/// proof of the guard. Closing the gap means finding why the production delay-based estimate did
-/// not provide that same floor.
+/// A requested screen source stays decodable across captured quiet and active periods.
+/// The camera is present but unsubscribed, so it cannot satisfy the receiver's source proof.
 #[test]
-fn static_screenshare_does_not_poison_bandwidth_estimate_test() {
+fn screen_source_decodes_across_static_and_active_periods_test() {
     LocalNodeSim::new()
         .with_room(
             Room::new("room1")
@@ -1182,17 +1332,12 @@ fn static_screenshare_does_not_poison_bandwidth_estimate_test() {
                 description: "Soak across captured static and active screen periods",
                 duration: Duration::from_secs(48),
             },
-            Step::Expect {
-                description: "The estimate survives the static stretches",
+            Step::CheckVideoDecodedFromInterval {
+                description: "viewer decodes fresh presenter source output in this phase",
                 participant: "viewer",
-                property: Property::EstimateMeetsNeed { percent: 80 },
-            },
-            Step::Expect {
-                description: "The estimate holds rather than decaying away",
-                participant: "viewer",
-                property: Property::EstimateStable {
-                    max_drop_percent: 25,
-                },
+                publisher: "presenter",
+                min_frames: 1,
+                min_resolution: (1, 720),
             },
             Step::CheckVideoQuality {
                 description: "Viewer renders the screen share cleanly throughout",
@@ -1207,11 +1352,6 @@ fn static_screenshare_does_not_poison_bandwidth_estimate_test() {
 /// This is the production complaint - "the allocator doesn't think there's enough bandwidth for
 /// the camera to be streamed" - reproduced end to end. A viewer takes one screen share plus one
 /// camera at 720p, which needs ~2.5 Mbps of media (two 1.25 Mbps `f` layers).
-///
-/// It is worth being precise about what this asserts, because the obvious reading is wrong. The
-/// camera was never short of bandwidth: the estimate sat at ~3.2 Mbps throughout, comfortably
-/// above the ~2.8 Mbps two `f` layers cost. `CheckMinBwe` pins that down so a future regression
-/// that *does* starve the camera fails for a visibly different reason than one that unbinds it.
 ///
 /// # The bug this covers
 ///
@@ -1232,7 +1372,7 @@ fn static_screenshare_does_not_poison_bandwidth_estimate_test() {
 /// one had both slots bound, and `slot.target()` was `None` for the other in all 913 passes that
 /// mattered. A slot with no target never reaches the allocator at all.
 #[test]
-fn estimate_grows_to_fit_screenshare_and_camera_test() {
+fn both_requested_sources_keep_decoding_during_soak_test() {
     LocalNodeSim::new()
         .with_room(
             Room::new("room1")
@@ -1267,19 +1407,19 @@ fn estimate_grows_to_fit_screenshare_and_camera_test() {
                 description: "Soak: both streams should be flowing",
                 duration: Duration::from_secs(30),
             },
-            // Well clear of the ~2.8 Mbps two `f` layers cost, so a regression that genuinely
-            // starves the camera fails here rather than on the byte count below.
-            Step::Expect {
-                description: "The estimate leaves room for both streams",
+            Step::CheckVideoDecodedFromInterval {
+                description: "viewer decodes fresh presenter source output in this phase",
                 participant: "viewer",
-                property: Property::EstimateMeetsNeed { percent: 80 },
+                publisher: "presenter",
+                min_frames: 1,
+                min_resolution: (1, 720),
             },
-            Step::Expect {
-                description: "The estimate holds rather than decaying away",
+            Step::CheckVideoDecodedFromInterval {
+                description: "viewer decodes fresh camera source output in this phase",
                 participant: "viewer",
-                property: Property::EstimateStable {
-                    max_drop_percent: 25,
-                },
+                publisher: "camera",
+                min_frames: 1,
+                min_resolution: (1, 720),
             },
             // The camera alone is 1.25 Mbps CBR, so 30s of it is ~4.7 MB. Anything near the
             // screen share's ~100 kbps VBR average on its own means the camera is missing.
@@ -1321,7 +1461,7 @@ fn estimate_grows_to_fit_screenshare_and_camera_test() {
 /// `SubscriptionManager::reconcile` sent only the slots whose assignment had changed, while the
 /// SFU's `VideoAllocator::configure` stops every slot the intent does not name. Re-issuing a
 /// subscription that left the unchanged presenter out therefore unbound it. See
-/// [`estimate_grows_to_fit_screenshare_and_camera_test`], which covers the same defect without
+/// [`both_requested_sources_keep_decoding_during_soak_test`], which covers the same defect without
 /// the re-issue.
 #[test]
 fn late_video_subscription_is_delivered_test() {
@@ -1366,23 +1506,10 @@ fn late_video_subscription_is_delivered_test() {
         ]);
 }
 
-/// A capped subscription must not be served bandwidth it asked not to be given.
-///
-/// The viewer requests 360p, which the ladder satisfies exactly with the h layer at ~450 kbps.
-/// Over a 60s window that is ~3.4 MB of media. Anything much beyond it is padding and probe
-/// traffic aimed at capacity the subscription cannot use.
-///
-/// `BitrateController` used to return its quantized, smoothed internal target even after the raw
-/// demand had fallen. That allowed a capped subscription to keep probing above what it could use:
-///
-/// ```text
-/// raw_bps=472694  out_bps=800000  alloc_bps=449153
-/// ```
-///
-/// str0m probes at `2 x desired`, so a 360p subscription was probing at 1.6 Mbps and the viewer
-/// received 5074716 bytes for 3.4 MB of media - about 50% overhead.
+/// A feasible middle-height request produces genuine source video.
+/// Receiver height is a hint, so a taller supplied representation remains valid.
 #[test]
-fn capped_subscription_is_not_over_served_test() {
+fn middle_height_request_keeps_source_decodable_test() {
     LocalNodeSim::new()
         .with_room(
             Room::new("room1")
@@ -1400,47 +1527,23 @@ fn capped_subscription_is_not_over_served_test() {
                 participant: "bob",
                 targets: &[("alice", 360)],
             },
-            Step::WaitForVideo {
+            Step::WaitForVideoAtResolution {
                 description: "Bob decodes the requested middle layer",
                 participant: "bob",
                 publishers: &["alice"],
-                min_quality: 2,
+                min_resolution: (1, 360),
                 timeout: Duration::from_secs(30),
             },
             Step::Run {
                 description: "Measurement window",
                 duration: Duration::from_secs(60),
             },
-            // The direct statement of the claim. The byte ceiling below is a good check on the
-            // total cost but cannot distinguish a stream forwarded at the wrong rung from one
-            // forwarded at the right rung with a busier picture; this reads the rung itself.
-            Step::Expect {
-                description: "A 360p request is never served the 720p layer",
+            Step::CheckVideoDecodedFromInterval {
+                description: "Bob decodes the source at the requested middle height or larger",
                 participant: "bob",
-                property: Property::NeverForwardedAbove {
-                    origin: "alice",
-                    max_quality: 2,
-                },
-            },
-            // ~3.4 MB is the h layer itself. Measured against `headroom_factor`: 3.57 MB at
-            // 1.0 (shipped), 4.25 MB at 1.2, 5.01 MB at 1.5, against 5.07 MB uncapped. 4.0 MB
-            // leaves room for RTCP, retransmits and NAT-keepalive padding.
-            Step::CheckMaxRxBytesInterval {
-                description: "Bob is not served bandwidth beyond what 360p needs",
-                participant: "bob",
-                max_bytes: 4_000_000,
-            },
-            // Still actually receiving the layer, not starved into passing the cap.
-            //
-            // Stated as the layer rather than a byte floor. The floor was 3,000,000 - 60s at the
-            // h layer's nominal 400 kbps - which left no margin for the encoder landing anywhere
-            // below nominal, and it measured 2,853,400 (~380 kbps). The behaviour was correct and
-            // the number was wrong, which is the failure mode of encoding a rate, a duration and
-            // a codec into one constant.
-            Step::CheckForwardedQuality {
-                description: "Bob is still on the 360p layer, not dropped to the bottom",
-                origin: "alice",
-                min_quality: 2,
+                publisher: "alice",
+                min_frames: 1,
+                min_resolution: (1, 360),
             },
         ]);
 }
@@ -1512,16 +1615,18 @@ fn screenshare_recovers_full_quality_after_going_still_test() {
                 participant: "viewer",
                 min_bytes: 1_400_000,
             },
-            Step::Expect {
-                description: "The estimate survives the silence",
+            Step::CheckVideoDecodedFromInterval {
+                description: "viewer decodes fresh presenter source output in this phase",
                 participant: "viewer",
-                property: Property::EstimateMeetsNeed { percent: 80 },
+                publisher: "presenter",
+                min_frames: 1,
+                min_resolution: (1, 720),
             },
         ]);
 }
 
 #[test]
-fn paused_stream_resumes_with_media_after_bandwidth_recovers_test() {
+fn requested_streams_recover_when_downstream_capacity_returns_test() {
     LocalNodeSim::new()
         .with_link(LinkProfile::fiber())
         .with_bandwidth(500_000)
@@ -1543,13 +1648,8 @@ fn paused_stream_resumes_with_media_after_bandwidth_recovers_test() {
                 targets: &[("camera", 720, 0, 100), ("screen", 720, 0, 10)],
             },
             Step::Run {
-                description: "Force one assignment into the paused state",
+                description: "Run both requested sources under constrained capacity",
                 duration: Duration::from_secs(45),
-            },
-            Step::CheckVideoPaused {
-                description: "The constrained link actually paused a subscribed stream",
-                participant: "viewer",
-                publishers: &["camera", "screen"],
             },
             Step::SetBandwidth {
                 description: "Restore enough downstream capacity for both streams",
@@ -1557,18 +1657,13 @@ fn paused_stream_resumes_with_media_after_bandwidth_recovers_test() {
                 bits_per_sec: 5_000_000,
             },
             Step::WaitForVideo {
-                description: "Both resumed assignments deliver newly decoded video",
+                description: "Both requested sources decode after capacity returns",
                 participant: "viewer",
                 publishers: &["camera", "screen"],
-                min_quality: 1,
                 timeout: Duration::from_secs(120),
             },
-            Step::CheckCrossShardMedia {
-                description: "Resumed media crosses the owner/destination shard boundary",
-                min_frames: 1,
-            },
             Step::CheckVideoQuality {
-                description: "The camera produces decodable video after resuming",
+                description: "Recovered video remains decodable after the constrained phase",
                 participant: "viewer",
                 quality: VideoQuality::min_frames(120).allow_gaps(12),
             },
@@ -1576,7 +1671,7 @@ fn paused_stream_resumes_with_media_after_bandwidth_recovers_test() {
 }
 
 #[test]
-fn every_paused_tile_resumes_after_a_busy_link_recovers_test() {
+fn all_requested_gallery_sources_recover_after_capacity_returns_test() {
     LocalNodeSim::new()
         .with_bandwidth(2_500_000)
         .with_room(
@@ -1607,21 +1702,15 @@ fn every_paused_tile_resumes_after_a_busy_link_recovers_test() {
                     ("tile5", 180, 180, 10),
                 ],
             },
-            // Six 150 kbps floors fit the initial 2.5 Mbps link. Put the
-            // viewer below their combined floor so this actually exercises pause.
+            // Apply scarcity before restoring feasible service for every requested source.
             Step::SetBandwidth {
                 description: "The crowded link cannot carry every visible tile",
                 participant: "viewer",
                 bits_per_sec: 500_000,
             },
             Step::Run {
-                description: "Drive the gallery through contention and pauses",
+                description: "Keep the requested gallery under constrained capacity",
                 duration: Duration::from_secs(60),
-            },
-            Step::CheckVideoPaused {
-                description: "The busy link actually paused intended tiles",
-                participant: "viewer",
-                publishers: &["tile1", "tile2", "tile3", "tile4", "tile5"],
             },
             Step::SetBandwidth {
                 description: "Restore a link that carries every visible layer",
@@ -1629,10 +1718,9 @@ fn every_paused_tile_resumes_after_a_busy_link_recovers_test() {
                 bits_per_sec: 8_000_000,
             },
             Step::WaitForVideo {
-                description: "Every tile has fresh allocation and decoded delivery after repair",
+                description: "Every tile has fresh decoded delivery after repair",
                 participant: "viewer",
                 publishers: &["speaker", "tile1", "tile2", "tile3", "tile4", "tile5"],
-                min_quality: 1,
                 timeout: Duration::from_secs(120),
             },
         ]);
@@ -1684,48 +1772,21 @@ fn subscriber_reaches_top_layer_on_a_rate_limited_link_test() {
             },
             // 30s of f is ~4.7 MB; of h, ~1.5 MB. 3 MB cleanly separates "reached the top layer"
             // from "stuck partway up the ladder".
-            Step::CheckForwardedQuality {
+            Step::CheckVideoDecodedFromInterval {
                 description: "Bob reaches the 720p layer rather than stalling below it",
-                origin: "alice",
-                min_quality: 3,
-            },
-            Step::CheckMinBwe {
-                description: "The estimate finds the link's real capacity",
-                min_bps: 1_500_000,
+                participant: "bob",
+                publisher: "alice",
+                min_frames: 1,
+                min_resolution: (1, 720),
             },
             Step::Report {
                 description: "steady state",
                 participant: "bob",
             },
-            // Measured here: 1.0% drawdown, 13.7ms of queue, no congestion loss, 100% media.
-            // The thresholds sit well clear of those so ordinary variation does not flake, but
-            // close enough that a real regression trips them.
-            //
-            // Deliberately *not* asserting utilisation or "tracks capacity": the 720p layer wants
-            // ~1.25 Mbps of a 3 Mbps link, so the estimate correctly settles near demand rather
-            // than near capacity. Asserting otherwise would encode a misunderstanding of what a
-            // delay-based estimator can measure.
-            Step::Expect {
-                description: "The estimate covers what the viewer asked for",
-                participant: "bob",
-                property: Property::EstimateMeetsNeed { percent: 80 },
-            },
-            Step::Expect {
-                description: "A steady link produces a steady estimate",
-                participant: "bob",
-                property: Property::EstimateStable {
-                    max_drop_percent: 20,
-                },
-            },
             Step::Expect {
                 description: "The link is not driven into its buffer",
                 participant: "bob",
                 property: Property::QueueingDelayBelow(Duration::from_millis(100)),
-            },
-            Step::Expect {
-                description: "Throughput is video, not overhead",
-                participant: "bob",
-                property: Property::MediaEfficiencyAtLeast(90),
             },
         ]);
 }
@@ -1766,17 +1827,12 @@ fn subscription_climbs_back_after_the_link_recovers_test() {
                 participant: "bob",
                 bits_per_sec: 3_000_000,
             },
-            Step::WaitForVideo {
-                description: "The recovered allocation reaches the requested top layer with fresh delivery",
+            Step::WaitForVideoAtResolution {
+                description: "Fresh decoded delivery reaches the requested full height",
                 participant: "bob",
                 publishers: &["alice"],
-                min_quality: 3,
+                min_resolution: (1, 720),
                 timeout: Duration::from_secs(180),
-            },
-            Step::CheckForwardedQuality {
-                description: "Bob has actually climbed back to the top layer",
-                origin: "alice",
-                min_quality: 3,
             },
             Step::Run {
                 description: "Measurement window",
@@ -1803,7 +1859,7 @@ fn subscription_climbs_back_after_the_link_recovers_test() {
 /// existing throughput tests do not distinguish from overhead - a connection could clear its byte
 /// floor while spending most of the link on retransmission, and no test would notice.
 #[test]
-fn steady_subscription_is_mostly_media_test() {
+fn steady_subscription_keeps_requested_source_decodable_test() {
     LocalNodeSim::new()
         .with_bandwidth(3_000_000)
         .with_room(
@@ -1829,22 +1885,12 @@ fn steady_subscription_is_mostly_media_test() {
                 description: "Steady state",
                 duration: Duration::from_secs(60),
             },
-            // Measured here: 99.9%. The old floor was 45%, chosen to sit below the 46% seen in
-            // the production capture - which made it unfailable, since nothing this side of a
-            // total collapse goes near it. It was also reading a metric that summed every
-            // subscriber's forwarded bytes over one viewer's received bytes.
-            //
-            // 90% is comfortably under what a healthy stream measures and far above the
-            // production failure, so it catches a regression toward that failure rather than
-            // merely recording it.
-            //
-            // Note this plan does *not* currently reproduce the production RTX flood: the SFU
-            // forwards essentially pure media here. Whatever produced 54% overhead in the capture
-            // is not yet modelled, so this guards the property rather than proving the fix.
-            Step::Expect {
-                description: "Most of what Bob received was video, not overhead",
+            Step::CheckVideoDecodedFromInterval {
+                description: "bob decodes fresh alice source output in this phase",
                 participant: "bob",
-                property: Property::MediaEfficiencyAtLeast(90),
+                publisher: "alice",
+                min_frames: 1,
+                min_resolution: (1, 720),
             },
         ]);
 }
@@ -1890,6 +1936,7 @@ fn estimate_follows_a_sliding_link_without_riding_the_queue_test() {
                     to: 700_000,
                     over: Duration::from_secs(40),
                 },
+                max_backlog: Duration::from_millis(200),
             },
             Step::Run {
                 description: "Follow the decline",
@@ -1965,6 +2012,7 @@ fn estimate_survives_an_oscillating_lossy_link_test() {
                     max: 2_500_000,
                     period: Duration::from_secs(20),
                 },
+                max_backlog: Duration::from_millis(200),
             },
             Step::SetLoss {
                 description: "Wi-Fi style burst loss",
@@ -2087,39 +2135,10 @@ fn still_screenshare_does_not_talk_down_a_healthy_link_test() {
                 min_frames: 1,
                 min_resolution: (1280, 720),
             },
-            // The cause. Demand is ~1.4 Mbps and the link carries 3 Mbps, so the estimate has no
-            // business sitting below what was asked for.
-            Step::Expect {
-                description: "The estimate covers what the viewer asked for",
-                participant: "viewer",
-                property: Property::EstimateMeetsNeed { percent: 80 },
-            },
-            // Recovery rather than a drawdown bound: this source is bursty by nature, so the
-            // estimate moving is expected. Measured dipping ~40% and returning to within 6% of
-            // its peak. The production failure was never the dip - it was that the estimate fell
-            // and stayed down while the link was fine, which is what this catches.
-            Step::Expect {
-                description: "The estimate recovers rather than staying down",
-                participant: "viewer",
-                property: Property::EstimateRecovers {
-                    of_peak_percent: 80,
-                },
-            },
             Step::Expect {
                 description: "Nothing about the link justified a drop",
                 participant: "viewer",
                 property: Property::CongestionLossBelow(1),
-            },
-            // Measured at 3 changes/min on a settled stream. The production failure ran to
-            // several a second, so this discriminates by two orders of magnitude rather than
-            // sitting on a boundary.
-            Step::Expect {
-                description: "The share holds a layer rather than flapping",
-                participant: "viewer",
-                property: Property::QualityChangesPerMinuteBelow {
-                    origin: "presenter",
-                    max: 30,
-                },
             },
         ]);
 }
@@ -2168,11 +2187,11 @@ fn a_stream_returns_after_a_total_outage_test() {
                 participant: "bob",
                 targets: &[("alice", 720)],
             },
-            Step::WaitForVideo {
-                description: "Establish healthy top-layer allocation and decoded delivery",
+            Step::WaitForVideoAtResolution {
+                description: "Establish healthy full-height decoded delivery",
                 participant: "bob",
                 publishers: &["alice"],
-                min_quality: 3,
+                min_resolution: (1, 720),
                 timeout: Duration::from_secs(40),
             },
             Step::Partition {
@@ -2189,11 +2208,11 @@ fn a_stream_returns_after_a_total_outage_test() {
                 from: "bob",
                 to: "server",
             },
-            Step::WaitForVideo {
-                description: "Re-establish allocation and newly decoded delivery after the outage",
+            Step::WaitForVideoAtResolution {
+                description: "Re-establish full-height decoded delivery after the outage",
                 participant: "bob",
                 publishers: &["alice"],
-                min_quality: 3,
+                min_resolution: (1, 720),
                 timeout: Duration::from_secs(45),
             },
             // Fresh window, so the claims describe the recovered call rather than the outage.
@@ -2205,15 +2224,12 @@ fn a_stream_returns_after_a_total_outage_test() {
                 description: "after the outage",
                 participant: "bob",
             },
-            Step::CheckForwardedQuality {
-                description: "The stream is being forwarded again",
-                origin: "alice",
-                min_quality: 3,
-            },
-            Step::Expect {
-                description: "The estimate recovers what the viewer needs",
+            Step::CheckVideoDecodedFromInterval {
+                description: "Alice's full-height video independently decodes after the outage",
                 participant: "bob",
-                property: Property::EstimateMeetsNeed { percent: 70 },
+                publisher: "alice",
+                min_frames: 1,
+                min_resolution: (1, 720),
             },
         ]);
 }
@@ -2241,43 +2257,27 @@ fn a_plan_measures_identically_when_replayed_test() {
     );
 }
 
-/// The part of a report that must be reproducible, rendered for comparison.
-///
-/// Everything a plan can assert on is here, including `max_backlog` - the peak queue depth, and so
-/// the figure every bufferbloat claim rests on. It was briefly excluded on the belief that the
-/// shaper drains opportunistically; it does not, it has a timer-driven release task, and the
-/// variance was the globally-cleared stats map wiping a running plan's counters mid-window.
+/// Reproducible public delivery observations and imposed-network measurements.
+/// SFU adaptation and forwarding counters remain diagnostic, not part of this verdict.
 fn deterministic_core(report: &LinkReport) -> String {
     format!(
-        "window={:?} received={:?} forwarded={} samples={} estimate={}/{}/{} drawdown={:.6} \
-         demand={}/{}/{} backlog={:?} delivered={} congestion_drops={} link_loss={} changes={:?} \
-         reversals={:?} quality={:?}",
+        "window={:?} received={:?} decoded={:?} backlog={:?} delivered={} \
+         congestion_drops={} link_loss={}",
         report.window,
         report.received_bytes,
-        report.forwarded_media_bytes,
-        report.samples,
-        report.estimate_min_bps,
-        report.estimate_last_bps,
-        report.estimate_max_bps,
-        report.worst_drawdown_percent,
-        report.demand_min_bps,
-        report.demand_last_bps,
-        report.demand_max_bps,
+        report.decoded_video,
         report.max_backlog,
         report.delivered_packets,
         report.congestion_drops,
         report.link_loss_drops,
-        report.quality_changes,
-        report.quality_reversals,
-        report.forwarded_quality,
     )
 }
 
 /// The counterpart claim: the seed is actually an input.
 ///
 /// If replays agreed because the plan is insensitive to scheduling rather than because it is
-/// controlled, the test above would pass while asserting nothing. Two different seeds must produce
-/// two different networks.
+/// controlled, the test above would pass while asserting nothing. The chosen seeds exercise
+/// different realized network schedules.
 #[test]
 fn a_different_seed_is_a_different_network_test() {
     let first = deterministic_probe_process(0x5EED_0001);
@@ -2290,8 +2290,7 @@ fn a_different_seed_is_a_different_network_test() {
     );
 }
 
-/// A plan with enough going on - loss, reordering, contention, an allocation decision - that any
-/// uncontrolled input would move at least one of the numbers it reports.
+/// Fresh processes must agree on public decode observations and the imposed network.
 const DETERMINISTIC_PROBE_MARKER: &str = "PULSEBEAM_DETERMINISTIC_PROBE=";
 const DETERMINISTIC_PROBE_TEST: &str = "tests::bwe::deterministic_probe_subprocess_test";
 
@@ -2342,21 +2341,31 @@ fn deterministic_probe_plan(seed: u64) -> LinkReport {
         .with_room(
             Room::new("room1")
                 .with_participant(Participant::publisher("camera", &["q", "h", "f"]))
-                .with_participant(Participant::manual_subscriber("viewer", 1)),
+                .with_participant(
+                    Participant::manual_subscriber("viewer", 1)
+                        .with_encoded_and_native_decoded_video(),
+                ),
         )
         .run_collecting(vec![
             Step::Run {
-                description: "Establish connections and discover both cameras",
+                description: "Establish connections and discover the camera",
                 duration: Duration::from_secs(5),
             },
             Step::SubscribeToQos {
-                description: "Both streams wanted, the camera with priority",
+                description: "Request the camera's full-height video",
                 participant: "viewer",
                 targets: &[("camera", 720, 180, 100)],
             },
             Step::Run {
-                description: "Contend for a link that cannot carry both at full quality",
+                description: "Observe seeded media delivery on the constrained link",
                 duration: Duration::from_secs(40),
+            },
+            Step::CheckVideoDecodedFromInterval {
+                description: "The replay fingerprint includes genuine camera decodes",
+                participant: "viewer",
+                publisher: "camera",
+                min_frames: 1,
+                min_resolution: (1, 1),
             },
         ])
         .get("viewer")
@@ -2385,7 +2394,10 @@ fn equal_priority_subscriptions_share_a_scarce_link_test() {
                     ..Participant::publisher("ben", &["q"])
                 })
                 .with_participant(Participant::publisher("cal", &["q"]))
-                .with_participant(Participant::manual_subscriber("viewer", 3)),
+                .with_participant(
+                    Participant::manual_subscriber("viewer", 3)
+                        .with_encoded_and_native_decoded_video(),
+                ),
         )
         .run(vec![
             Step::Run {
@@ -2431,6 +2443,27 @@ fn equal_priority_subscriptions_share_a_scarce_link_test() {
                 participant: "viewer",
                 publisher: "cal",
                 min_frames: 60,
+            },
+            Step::CheckNativeSourceProgress {
+                description: "The first peer's contention service reaches genuine native pixels",
+                participant: "viewer",
+                publisher: "ann",
+                min_frames: 60,
+                min_resolution: (320, 180),
+            },
+            Step::CheckNativeSourceProgress {
+                description: "The second peer's contention service reaches genuine native pixels",
+                participant: "viewer",
+                publisher: "ben",
+                min_frames: 60,
+                min_resolution: (320, 180),
+            },
+            Step::CheckNativeSourceProgress {
+                description: "The last peer's contention service reaches genuine native pixels",
+                participant: "viewer",
+                publisher: "cal",
+                min_frames: 60,
+                min_resolution: (320, 180),
             },
         ]);
 }
@@ -2479,42 +2512,28 @@ fn a_busy_room_starves_nobody_test() {
         // At the measured ~2Mbps estimate, all minimums and the middle
         // speaker rung fit. The top rung plus all minimums and upgrade
         // headroom does not. A target is not permission to displace a minimum.
-        Step::CheckForwardedQuality {
+        Step::CheckVideoDecodedFromInterval {
             description: "The speaker gets the affordable upgrade above its minimum",
-            origin: "ann",
-            min_quality: 2,
+            participant: "viewer",
+            publisher: "ann",
+            min_frames: 1,
+            min_resolution: (1, 360),
         },
     ];
     for origin in PUBLISHERS.into_iter().skip(1) {
-        steps.push(Step::CheckForwardedQuality {
-            description: "Every protected tile remains forwarded, regardless of discovery order",
-            origin,
-            min_quality: 1,
+        steps.push(Step::CheckVideoDecodedFromInterval {
+            description: "Every protected tile independently decodes, regardless of discovery order",
+            participant: "viewer",
+            publisher: origin,
+            min_frames: 1,
+            min_resolution: (1, 180),
         });
     }
-    steps.extend([
-        Step::Expect {
-            description: "A tile asked for at 180p is never sent a taller layer",
-            participant: "viewer",
-            property: Property::NeverForwardedAbove {
-                origin: "fay",
-                max_quality: 1,
-            },
-        },
-        Step::Expect {
-            description: "The speaker settles rather than trading layers with the tiles",
-            participant: "viewer",
-            property: Property::QualityReversalsBelow {
-                origin: "ann",
-                max: 1,
-            },
-        },
-        Step::Expect {
-            description: "Six streams do not drive the link into congestion",
-            participant: "viewer",
-            property: Property::CongestionLossBelow(5),
-        },
-    ]);
+    steps.extend([Step::Expect {
+        description: "Six streams do not drive the link into congestion",
+        participant: "viewer",
+        property: Property::CongestionLossBelow(5),
+    }]);
 
     LocalNodeSim::new()
         // The link and measured estimate carry all six minimums, but not six

@@ -116,42 +116,6 @@ impl ShardCore {
         cmd: ShardCommand,
         router: &impl ShardTransport,
     ) -> Option<()> {
-        #[cfg(feature = "sim")]
-        let cmd = match cmd {
-            ShardCommand::Observe(reply) => {
-                let (generation, pending_generation, pending_effects) = self.updates.observation();
-                let (participants, transports) = self.execution.registry.observation();
-                let (tracks, routes) = self.execution.runtime.observation();
-                let plans = self
-                    .execution
-                    .plans
-                    .iter()
-                    .map(|(handle, plan)| crate::sim_observation::PlanObservation {
-                        track: self.execution.runtime.track_id(handle),
-                        local: plan
-                            .local
-                            .iter()
-                            .map(|handle| self.execution.registry.identity(*handle))
-                            .collect(),
-                        remote: plan.remote.clone(),
-                        reverse: plan.reverse_route,
-                    })
-                    .collect();
-                let _ = reply.send(crate::sim_observation::ShardObservation {
-                    shard: self.execution.shard_id,
-                    generation,
-                    pending_generation,
-                    pending_effects,
-                    participants,
-                    transports,
-                    tracks,
-                    plans,
-                    routes,
-                });
-                return Some(());
-            }
-            command => command,
-        };
         let result = self.execution.on_command(cmd, router);
         self.updates
             .apply_pending_participant_effects(&mut self.execution);
@@ -385,6 +349,12 @@ impl ShardExecution {
                 }
             }
             crate::shard_update::ShardUpdateOp::RemoveTrackRuntime { track_id } => {
+                debug_assert!(
+                    self.runtime
+                        .track_handle(*track_id)
+                        .is_none_or(|handle| !self.plans.contains_key(handle)),
+                    "track plan removal must precede runtime retirement"
+                );
                 self.runtime.retire_track(*track_id);
             }
         }
@@ -467,8 +437,6 @@ impl ShardExecution {
         let Some(action) = self.runtime.routes.resolve(address) else {
             return;
         };
-        #[cfg(feature = "sim")]
-        crate::sim_metrics::record_cross_shard_media();
         let entry = self.runtime.routes.accounting_mut(address, self.wall.ntp());
         entry.observe(link_seq);
         let Ok(playout) = entry.expander.expand(playout_ntp32) else {
@@ -696,10 +664,6 @@ impl ShardExecution {
         router: &impl ShardTransport,
     ) -> Option<()> {
         match cmd {
-            #[cfg(feature = "sim")]
-            ShardCommand::Observe(_) => {
-                debug_assert!(false, "observation is consumed by ShardCore");
-            }
             ShardCommand::MaterializeParticipant {
                 transport,
                 config,
@@ -1066,6 +1030,102 @@ mod wrong_owner_tests {
     }
 
     #[test]
+    fn connected_flow_reports_its_registered_transport_and_owner() {
+        use crate::participant::event::ParticipantSink;
+        use crate::shard::events::ParticipantBinding;
+
+        let host_ip = pulsebeam_runtime::testing::test_host_ip("192.168.250.13");
+        pulsebeam_runtime::testing::run_local(host_ip, async move {
+            #[cfg(not(feature = "sim"))]
+            tokio::time::pause();
+
+            let owner = ShardId::new(2);
+            let (_writer, update_rx) = crate::shard_update::new_shard_update(owner);
+            let mut core = ShardCore::new(
+                owner,
+                4,
+                1,
+                WallAnchor::new(std::time::SystemTime::UNIX_EPOCH, Instant::now()),
+                update_rx,
+            );
+            let router = CaptureTransport {
+                frames: std::cell::RefCell::new(Vec::new()),
+            };
+            let participant_id = crate::entity::ParticipantId::new();
+            let connection_id = crate::entity::ConnectionId::new();
+            let room_id = crate::entity::RoomId::from_external(
+                &crate::entity::RoomExternalId::new("connected-flow").unwrap(),
+            );
+            let address = NodeTransportAddress::new(TransportRoute::new(owner, 51), 7);
+            let materialize = |core: &mut ShardCore| {
+                let (ack, received) = tokio::sync::oneshot::channel();
+                core.on_command(
+                    ShardCommand::MaterializeParticipant {
+                        transport: address,
+                        config: Box::new(ParticipantConfig {
+                            manual_sub: false,
+                            room_id,
+                            participant_id,
+                            participant_external_id: crate::entity::ParticipantExternalId::new(
+                                "peer",
+                            )
+                            .unwrap(),
+                            connection_id,
+                            profile: crate::control::controller::ConnectionProfile::Native,
+                            authorization_expiry: None,
+                            rtc: crate::control::application_only_test_connection(),
+                            resources: crate::control::NegotiatedResources::empty_for_test(),
+                        }),
+                        ack,
+                    },
+                    &router,
+                );
+                received
+            };
+            #[cfg(feature = "sim")]
+            {
+                crate::sim_metrics::fail_next_materialization();
+                assert!(!materialize(&mut core).await.unwrap());
+                assert_eq!(core.participant_count(), 0);
+                assert!(core.execution.registry.resolve(&participant_id).is_none());
+                assert!(core.execution.registry.resolve_transport(address).is_none());
+            }
+            assert!(materialize(&mut core).await.unwrap());
+            let handle = core.execution.registry.resolve(&participant_id).unwrap();
+            assert_eq!(
+                core.execution.registry.resolve_transport(address),
+                Some(handle)
+            );
+            let source = "203.0.113.7:40000".parse().unwrap();
+            let destination = "198.51.100.1:3478".parse().unwrap();
+            let ingress = ShardId::new(0);
+            core.execution.registry.learn_addr(source, address);
+            core.execution
+                .pipeline
+                .participant_sink(ParticipantBinding {
+                    participant_id,
+                    connection_id,
+                    handle,
+                    room_id,
+                })
+                .connected(source, destination, ingress);
+            assert_eq!(core.flush_participant_events(&router, 1), 1);
+            assert!(matches!(
+                core.pop_shard_event(),
+                Some(ShardEvent::TransportAuthenticated {
+                    source: actual_source,
+                    destination: actual_destination,
+                    source_shard,
+                    address: actual_address,
+                    shard,
+                }) if actual_source == source && actual_destination == destination
+                    && source_shard == ingress && actual_address == address && shard == owner
+            ));
+            assert!(core.pop_shard_event().is_none());
+        });
+    }
+
+    #[test]
     fn replacement_waits_for_old_plans_to_release_the_participant_handle() {
         use crate::route::NodeTransportAddress;
         use crate::shard_update::{ShardUpdateOp, TrackPlan, TrackPlanUpdate, TrackRuntime};
@@ -1243,6 +1303,34 @@ mod wrong_owner_tests {
         });
     }
 
+    #[cfg(debug_assertions)]
+    #[tokio::test(start_paused = true)]
+    #[should_panic(expected = "track plan removal must precede runtime retirement")]
+    async fn runtime_retirement_rejects_a_live_plan() {
+        let shard = ShardId::new(0);
+        let (_, update_rx) = crate::shard_update::new_shard_update(shard);
+        let mut core = ShardCore::new(
+            shard,
+            4,
+            1,
+            WallAnchor::new(std::time::SystemTime::UNIX_EPOCH, Instant::now()),
+            update_rx,
+        );
+        let track_id = crate::entity::ConnectionId::new()
+            .derive_track_id(crate::entity::TrackKind::Audio, "audio");
+        core.execution
+            .runtime
+            .install_track(track_id, None, None, None);
+        core.execution
+            .apply_plan(&crate::shard_update::TrackPlanUpdate {
+                track_id,
+                plan: Some(crate::shard_update::TrackPlan::default()),
+            });
+        core.execution.apply_lifecycle_op(
+            &crate::shard_update::ShardUpdateOp::RemoveTrackRuntime { track_id },
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn route_retirement_waits_for_the_bounded_plan_cursor() {
         let shard = ShardId::new(0);
@@ -1299,5 +1387,55 @@ mod wrong_owner_tests {
 
         assert_eq!(core.apply_updates(1), 1);
         assert!(core.execution.runtime.routes.resolve(route).is_none());
+
+        writer.stage(
+            2,
+            crate::shard_update::ShardUpdateOp::InstallRoute {
+                address: route,
+                action: crate::shard_update::TrackRouteAction::Forward {
+                    track_id: track_ids[0],
+                },
+            },
+        );
+        writer.stage_plans(
+            2,
+            track_ids
+                .iter()
+                .map(|track_id| crate::shard_update::TrackPlanUpdate {
+                    track_id: *track_id,
+                    plan: None,
+                })
+                .collect(),
+        );
+        writer.stage(
+            2,
+            crate::shard_update::ShardUpdateOp::RetireRoute { address: route },
+        );
+        for track_id in &track_ids {
+            writer.stage(
+                2,
+                crate::shard_update::ShardUpdateOp::RemoveTrackRuntime {
+                    track_id: *track_id,
+                },
+            );
+        }
+        assert_eq!(writer.publish(), Some(2));
+        assert_eq!(core.apply_updates(1), 0);
+        assert_eq!(core.execution.plans.len(), 1);
+        assert!(core.execution.runtime.routes.resolve(route).is_some());
+        assert!(
+            track_ids
+                .iter()
+                .all(|id| core.execution.runtime.track_handle(*id).is_some())
+        );
+
+        assert_eq!(core.apply_updates(1), 1);
+        assert!(core.execution.plans.is_empty());
+        assert!(core.execution.runtime.routes.resolve(route).is_none());
+        assert!(
+            track_ids
+                .iter()
+                .all(|id| core.execution.runtime.track_handle(*id).is_none())
+        );
     }
 }

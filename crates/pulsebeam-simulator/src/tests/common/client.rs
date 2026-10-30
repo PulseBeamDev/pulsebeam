@@ -4,6 +4,7 @@ use super::media::{
 };
 use super::native::NativeHost;
 use super::provenance::{self, FixturePublisher, FixturePublishers};
+use anyhow::Context;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper_util::{client::legacy::Client, rt::TokioExecutor};
@@ -30,8 +31,8 @@ use std::time::Instant;
 
 pub struct SimClientBuilder {
     ip: IpAddr,
-    admission: Arc<Mutex<Option<pulsebeam::entity::ConnectionId>>>,
-    host: Host,
+    admission: Arc<Mutex<AdmissionRecords>>,
+    bootstrap_hold: BootstrapHold,
     native_host: NativeHost,
     endpoint: String,
     video_layers: Option<Vec<FixtureEncoding>>,
@@ -45,6 +46,8 @@ pub struct SimClientBuilder {
     owned_video_label: Option<String>,
     /// When set, publish with a variable-bitrate source instead of the constant-rate looper.
     vbr_profile: Option<VbrProfile>,
+    solid_picture: Option<Arc<super::media::SolidVideoInput>>,
+    native_video_fixture: Option<Arc<super::media::NativeVideoFixture>>,
     /// Request an actual stock-encoder temporal fixture. Zero disables DD.
     temporal_dd: Option<u8>,
     video_receive_mode: pulsebeam_agent_native::ReceiveMode,
@@ -207,14 +210,11 @@ fn http_base_uri(ip: IpAddr, port: u16) -> String {
 impl SimClientBuilder {
     pub async fn bind(ip: IpAddr, server_ip: IpAddr) -> anyhow::Result<Self> {
         let native_host = NativeHost::bind(ip)?;
-        let admission = Arc::new(Mutex::new(None));
+        let admission = Arc::new(Mutex::new(AdmissionRecords::default()));
         Ok(Self {
             ip,
-            admission: admission.clone(),
-            host: Host::new(Box::new(AdmissionClient {
-                inner: create_http_client(),
-                admission,
-            })),
+            admission,
+            bootstrap_hold: BootstrapHold::default(),
             native_host,
             endpoint: http_base_uri(server_ip, 7070),
             video_layers: None,
@@ -227,6 +227,8 @@ impl SimClientBuilder {
             publishes_video: false,
             owned_video_label: None,
             vbr_profile: None,
+            solid_picture: None,
+            native_video_fixture: None,
             temporal_dd: None,
             video_receive_mode: pulsebeam_agent_native::ReceiveMode::Encoded,
             native_playback_only: false,
@@ -244,6 +246,11 @@ impl SimClientBuilder {
             quality_references: Arc::new(Mutex::new(BTreeMap::new())),
             h264_publishers: Arc::new(Mutex::new(BTreeMap::new())),
         })
+    }
+
+    pub fn with_bootstrap_hold(mut self, hold: BootstrapHold) -> Self {
+        self.bootstrap_hold = hold;
+        self
     }
 
     /// The native ICE agent selects the TCP candidates advertised by the
@@ -298,6 +305,11 @@ impl SimClientBuilder {
     }
 
     /// Attach a synthetic L1T{layers} temporal Dependency Descriptor per frame.
+    pub fn with_solid_video(mut self, picture: Arc<super::media::SolidVideoInput>) -> Self {
+        self.solid_picture = Some(picture);
+        self
+    }
+
     pub fn with_audio_input(mut self, input: AudioInput) -> Self {
         self.audio_input = input;
         self
@@ -315,6 +327,15 @@ impl SimClientBuilder {
 
     pub fn with_temporal_dd(mut self, layers: u8) -> Self {
         self.temporal_dd = Some(layers);
+        self
+    }
+
+    pub fn with_native_video_fixture(
+        mut self,
+        fixture: Arc<super::media::NativeVideoFixture>,
+    ) -> Self {
+        self.temporal_dd = Some(fixture.temporal_layers());
+        self.native_video_fixture = Some(fixture);
         self
     }
 
@@ -442,7 +463,33 @@ impl SimClientBuilder {
             temporal_layers == 1 || (self.quality_video.is_none() && self.vbr_profile.is_none()),
             "temporal fixtures need actual stock-encoder output, not relabelled corpus units"
         );
-        let native_fixture = if self.publishes_video && temporal_layers > 1 {
+        anyhow::ensure!(
+            self.solid_picture.is_none()
+                || (self.publishes_video
+                    && temporal_layers == 1
+                    && encodings.len() == 1
+                    && self.vbr_profile.is_none()
+                    && self.quality_video.is_none()
+                    && !self.opaque_payload),
+            "solid input needs its own decodable single-encoding fixture"
+        );
+        if let Some(fixture) = &self.native_video_fixture {
+            anyhow::ensure!(
+                self.publishes_video
+                    && self.solid_picture.is_none()
+                    && self.quality_video.is_none()
+                    && self.vbr_profile.is_none()
+                    && !self.opaque_payload
+                    && fixture.temporal_layers() == temporal_layers,
+                "provided native input cannot be mixed with other fixture kinds or temporal declarations"
+            );
+            fixture.validate_rids(&encodings)?;
+        }
+        let native_fixture = if self.native_video_fixture.is_some() {
+            None
+        } else if self.solid_picture.is_some() {
+            Some(self.native_host.solid_fixture()?)
+        } else if self.publishes_video && temporal_layers > 1 {
             Some(self.native_host.h264_fixture(temporal_layers)?)
         } else {
             None
@@ -461,8 +508,19 @@ impl SimClientBuilder {
             encodings
                 .iter()
                 .map(|encoding| {
-                    let mut source = if let Some(fixture) = &native_fixture {
-                        VideoSource::from_native(fixture, 30)
+                    let supplied = self
+                        .native_video_fixture
+                        .as_ref()
+                        .and_then(|fixture| {
+                            encoding.as_deref().and_then(|rid| fixture.encoding(rid))
+                        })
+                        .or(native_fixture.as_deref());
+                    let mut source = if let Some(fixture) = supplied {
+                        match &self.solid_picture {
+                            Some(picture) => VideoSource::from_native(fixture, 1)
+                                .with_solid_picture(picture.clone()),
+                            None => VideoSource::from_native(fixture, 30),
+                        }
                     } else if let Some((source, layer)) = self.quality_video {
                         let layer = if encodings.len() > 1 {
                             use pulsebeam_testdata::QualityVideoLayer::*;
@@ -538,7 +596,7 @@ impl SimClientBuilder {
                 "native playback needs dual observations and cannot corrupt only a probe"
             );
             log.native_callback_enabled = true;
-            log.native_encoded_callback_enabled = self.native_playback_only;
+            log.native_encoded_callback_enabled = dual;
             log.native_origin_enabled = dual;
             log.native_playback_only = self.native_playback_only;
         }
@@ -550,7 +608,7 @@ impl SimClientBuilder {
             .unwrap()
             .native_decoded
             .callback_failure_counter();
-        if self.native_playback_only {
+        if dual {
             let callback_log = video_rx.clone();
             let publishers = self.h264_publishers.clone();
             let failures = callback_failures.clone();
@@ -574,8 +632,16 @@ impl SimClientBuilder {
                                 failures.fetch_add(1, std::sync::atomic::Ordering::Release);
                                 return;
                             };
-                            let origin = authenticated_fixture_origin(payload, &publishers);
-                            log.native_origin.encoded(&frame, origin.as_deref());
+                            match authenticated_fixture_event(
+                                payload,
+                                &publishers,
+                                frame.metadata.temporal_index,
+                            ) {
+                                Ok(event) => log.native_origin.encoded_event(&frame, event),
+                                Err(_) => {
+                                    failures.fetch_add(1, std::sync::atomic::Ordering::Release);
+                                }
+                            }
                         }
                         pulsebeam_agent_native::EncodedVideoObservation::Dropped { .. } => {
                             log.native_origin.encoded_observation_lost();
@@ -622,9 +688,17 @@ impl SimClientBuilder {
         };
 
         let join_set = JoinSet::new();
-        let (agent, actor) =
-            Agent::managed_with_services(config, self.host, move || self.native_host.runtime())?;
+        let (agent, actor) = Agent::managed_with_services(
+            config,
+            Host::new(Box::new(AdmissionClient {
+                inner: create_http_client(),
+                admission: self.admission.clone(),
+                bootstrap_hold: self.bootstrap_hold,
+            })),
+            move || self.native_host.runtime(),
+        )?;
         let actor = tokio::task::spawn_local(actor);
+        let events = NativeEventCollector::new(agent.events());
         let owned_video = if let Some(label) = &self.owned_video_label {
             let ResourceResult::Publication { owner, slot, .. } = agent
                 .resource(ResourceCommand::ClaimPublication {
@@ -716,6 +790,7 @@ impl SimClientBuilder {
         let ctx = ClientContext {
             agent: agent.clone(),
             admission: self.admission,
+            current_admission: None,
             desired,
             video_capacity: self.video_slots,
             audio_capacity: self.audio_slots,
@@ -737,7 +812,7 @@ impl SimClientBuilder {
                 snapshots.mark_changed();
                 snapshots
             },
-            events: agent.events(),
+            events,
             owned_video,
         };
         let mut client = SimClient {
@@ -745,6 +820,10 @@ impl SimClientBuilder {
             join_set,
             actor: Some(actor),
             media_generation: None,
+            audio_pressure: None,
+            video_source_incarnation: 0,
+            video_feed: None,
+            retired_video_sources: Vec::new(),
             media: ClientMediaPlan {
                 video_slots: self.video_slots,
                 audio_slots: self.audio_slots,
@@ -766,6 +845,8 @@ impl SimClientBuilder {
     }
 }
 
+pub type DecodedVideoSizes = BTreeMap<(usize, usize), u64>;
+
 /// Actual native frame observations and independent decode/reference facts.
 /// Publisher attribution is recorded only for unambiguous fixture content,
 /// never inferred from a receiver's current catalog mapping.
@@ -779,6 +860,8 @@ pub struct VideoReceiveLog {
     native_playback_only: bool,
     pub by_publisher: BTreeMap<String, u64>,
     pub decoded_by_publisher: BTreeMap<String, DecodedVideoStream>,
+    // Distinct sizes of the finite supplied fixture corpus, not per-frame history.
+    pub decoded_sizes_by_publisher: BTreeMap<String, DecodedVideoSizes>,
     /// Successful real decodes keyed by the wire-proven source admission/slot.
     pub decoded_by_incarnation: BTreeMap<String, DecodedVideoStream>,
     /// Native frames without unambiguous content-origin evidence. They cannot
@@ -866,8 +949,7 @@ pub struct DecodedVideoStream {
     pub reference_error: ReferenceError,
 }
 
-/// Native audio progress or a separately observed speaker rank. Receiver
-/// records carry media; catalog rank records do not assert sample provenance.
+/// Actual encoded receiver packets and independent Opus decode, without sample-source identity.
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AudioStream {
     pub packets: u64,
@@ -886,6 +968,10 @@ pub struct AudioStream {
     last_at: Option<Instant>,
     decoded_first_at: Option<Instant>,
     decoded_last_at: Option<Instant>,
+    interval_first_at: Option<Instant>,
+    interval_last_at: Option<Instant>,
+    interval_decoded_first_at: Option<Instant>,
+    interval_decoded_last_at: Option<Instant>,
 }
 
 impl DecodedVideoStream {
@@ -917,6 +1003,30 @@ impl DecodedVideoStream {
 }
 
 impl AudioStream {
+    fn begin_window(&mut self) {
+        self.interval_first_at = None;
+        self.interval_last_at = None;
+        self.interval_decoded_first_at = None;
+        self.interval_decoded_last_at = None;
+    }
+
+    pub fn decoded_interval_span(&self) -> Duration {
+        match (
+            self.interval_decoded_first_at,
+            self.interval_decoded_last_at,
+        ) {
+            (Some(first), Some(last)) => last.saturating_duration_since(first),
+            _ => Duration::ZERO,
+        }
+    }
+
+    pub fn packet_interval_span(&self) -> Duration {
+        match (self.interval_first_at, self.interval_last_at) {
+            (Some(first), Some(last)) => last.saturating_duration_since(first),
+            _ => Duration::ZERO,
+        }
+    }
+
     /// Actual independent decoded progress span for this receiver.
     pub fn decoded_span(&self) -> Duration {
         match (self.decoded_first_at, self.decoded_last_at) {
@@ -933,6 +1043,8 @@ impl AudioStream {
     }
 
     fn record(&mut self, bytes: usize, now: Instant) {
+        self.interval_first_at.get_or_insert(now);
+        self.interval_last_at = Some(now);
         self.first_at.get_or_insert(now);
         if let Some(previous) = self.last_at {
             self.longest_gap = self
@@ -946,6 +1058,8 @@ impl AudioStream {
 
     fn record_decoded(&mut self, samples: usize, now: Instant, reference: Option<ReferenceError>) {
         debug_assert!(samples > 0);
+        self.interval_decoded_first_at.get_or_insert(now);
+        self.interval_decoded_last_at = Some(now);
         self.decoded_first_at.get_or_insert(now);
         self.decoded_last_at = Some(now);
         self.decoded_samples = self.decoded_samples.saturating_add(samples as u64);
@@ -990,6 +1104,13 @@ pub struct AudioStreamContinuity {
 }
 
 impl AudioReceiveLog {
+    pub fn begin_window(&mut self) {
+        self.native_pcm.begin_window();
+        for stream in self.by_receiver.values_mut() {
+            stream.begin_window();
+        }
+    }
+
     fn record(
         &mut self,
         receiver: &NativeAudioStream,
@@ -1164,6 +1285,36 @@ impl VideoReceiveLog {
             "{publisher}: decoded {frames} frames since baseline {baseline_frames}, expected at least {min_frames}"
         );
         Ok(decoded)
+    }
+
+    pub fn require_decoded_size_since(
+        &self,
+        publisher: &str,
+        baseline: Option<&DecodedVideoSizes>,
+        min_frames: u64,
+        minimum: (usize, usize),
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(min_frames > 0, "decoded size needs a positive minimum");
+        let sizes = self.decoded_sizes_by_publisher.get(publisher);
+        let frames = sizes
+            .into_iter()
+            .flat_map(|sizes| sizes.iter())
+            .filter(|((width, height), _)| *width >= minimum.0 && *height >= minimum.1)
+            .fold(0u64, |total, (size, count)| {
+                total.saturating_add(
+                    count.saturating_sub(
+                        baseline
+                            .and_then(|before| before.get(size))
+                            .copied()
+                            .unwrap_or(0),
+                    ),
+                )
+            });
+        anyhow::ensure!(
+            frames >= min_frames,
+            "{publisher}: independently decoded {frames} fresh frames at least {minimum:?}, expected {min_frames}; sizes={sizes:?}, baseline={baseline:?}"
+        );
+        Ok(())
     }
 
     pub fn decoded_from_incarnation(&self, origin: &str) -> Option<DecodedVideoStream> {
@@ -1358,6 +1509,13 @@ impl VideoReceiveLog {
                 .entry(publisher.to_owned())
                 .or_default()
                 .record(width, height, reference, quality_identity);
+            let count = self
+                .decoded_sizes_by_publisher
+                .entry(publisher.to_owned())
+                .or_default()
+                .entry((width, height))
+                .or_default();
+            *count = count.saturating_add(1);
         }
     }
 
@@ -1405,6 +1563,8 @@ impl VideoReceiveLog {
     }
 }
 
+type PressureInput = tokio::sync::oneshot::Sender<anyhow::Result<(usize, usize)>>;
+
 struct QualityAudioLooper {
     level_dbov: i8,
     phase_offset: u64,
@@ -1416,6 +1576,7 @@ impl QualityAudioLooper {
         input: AudioInput,
         mut snapshots: tokio::sync::watch::Receiver<pulsebeam_agent_native::agent_core::Snapshot>,
         sender: pulsebeam_agent_native::LocalSource,
+        pressure: Option<tokio::sync::mpsc::Receiver<PressureInput>>,
     ) {
         while snapshots.borrow().connection != ConnectionState::Connected {
             if snapshots.changed().await.is_err() || sender.is_closed() {
@@ -1427,7 +1588,9 @@ impl QualityAudioLooper {
             "fixture level must be negative dBov"
         );
         if input == AudioInput::Pcm {
-            return self.run_pcm(sender).await;
+            return self
+                .run_pcm(sender, pressure.expect("PCM fixture pressure input"))
+                .await;
         }
         let corpus = &quality_audio_reference().corpus;
         debug_assert!(!corpus.is_empty());
@@ -1488,14 +1651,23 @@ impl QualityAudioLooper {
 }
 
 impl QualityAudioLooper {
-    async fn run_pcm(self, sender: pulsebeam_agent_native::LocalSource) {
+    async fn run_pcm(
+        self,
+        sender: pulsebeam_agent_native::LocalSource,
+        mut pressure: tokio::sync::mpsc::Receiver<PressureInput>,
+    ) {
         let prepared = quality_audio_reference();
         let mut interval = tokio::time::interval(Duration::from_millis(10));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let target_rms = 32768.0 * 10_f64.powf(f64::from(self.level_dbov) / 20.0);
         let mut counter = 0_u64;
+        let mut pending: Option<PressureInput> = None;
+        let mut captured = Vec::new();
         loop {
             interval.tick().await;
+            if pending.is_none() {
+                pending = pressure.try_recv().ok();
+            }
             if sender.is_closed() {
                 return;
             }
@@ -1544,17 +1716,41 @@ impl QualityAudioLooper {
                 .capture_time_us()
                 .await
                 .expect("native PCM capture clock");
-            sender
-                .submit(InputFrame::Pcm {
-                    frame: pulsebeam_agent_native::PcmFrame {
-                        sample_rate_hz: 48_000,
-                        channels: 1,
-                        samples,
-                        timestamp_us,
-                    },
-                })
-                .await
-                .expect("native PCM fixture admission");
+            let frame = InputFrame::Pcm {
+                frame: pulsebeam_agent_native::PcmFrame {
+                    sample_rate_hz: 48_000,
+                    channels: 1,
+                    samples,
+                    timestamp_us,
+                },
+            };
+            if pending.is_some() {
+                // Capture actual successive blocks before bursting them. Never
+                // invent future capture timestamps to fill the admission queue.
+                captured.push(frame);
+                if captured.len() == 8 {
+                    let results = futures::future::join_all(
+                        captured.drain(..).map(|frame| sender.submit(frame)),
+                    )
+                    .await;
+                    let result =
+                        results
+                            .into_iter()
+                            .try_fold((0, 0), |(accepted, refused), result| match result {
+                                Ok(()) => Ok((accepted + 1, refused)),
+                                Err(pulsebeam_agent_native::Error::Backpressure) => {
+                                    Ok((accepted, refused + 1))
+                                }
+                                Err(error) => Err(anyhow::Error::from(error)),
+                            });
+                    let _ = pending.take().expect("pressure input").send(result);
+                }
+            } else {
+                sender
+                    .submit(frame)
+                    .await
+                    .expect("native PCM fixture admission");
+            }
             counter += 1;
         }
     }
@@ -1649,6 +1845,39 @@ fn authenticated_fixture_origin(payload: &[u8], publishers: &FixturePublishers) 
         .then_some(origin)
 }
 
+fn authenticated_fixture_event(
+    payload: &[u8],
+    publishers: &FixturePublishers,
+    native_temporal_index: Option<i32>,
+) -> anyhow::Result<Option<provenance::AuthenticatedSourceEvent>> {
+    let (event, canonical) = provenance::inspect_event(payload)
+        .map_err(|()| anyhow::anyhow!("malformed fixture source event"))?;
+    let Some(event) = event else {
+        return Ok(None);
+    };
+    let publisher = publishers
+        .get(&event.source)
+        .ok_or_else(|| anyhow::anyhow!("source event has no registered incarnation"))?;
+    let ledger = publisher
+        .ledger
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("source event has no submission ledger"))?;
+    let ledger = ledger
+        .try_lock()
+        .map_err(|_| anyhow::anyhow!("source event collector contention"))?;
+    ledger.require_healthy()?;
+    let supplied = ledger
+        .authenticate(&event, &canonical)
+        .ok_or_else(|| anyhow::anyhow!("source event/encoding/bytes were not supplied"))?;
+    Ok(Some(provenance::AuthenticatedSourceEvent {
+        event,
+        captured: supplied.captured,
+        dimensions: supplied.dimensions,
+        pixel_sample: supplied.pixel_sample,
+        native_temporal_index,
+    }))
+}
+
 fn record_native_fixture_sample(
     log: &Arc<Mutex<VideoReceiveLog>>,
     publishers: &FixturePublishers,
@@ -1718,7 +1947,7 @@ fn record_fixture_video_frame(
         .or(retained_publisher.as_deref());
     let missing_dependency = {
         let mut observed = log.lock().unwrap();
-        if observed.native_origin_enabled {
+        if observed.native_origin_enabled && !observed.native_encoded_callback_enabled {
             observed
                 .native_origin
                 .encoded(&frame, marker.filter(|_| authenticated.is_some()));
@@ -1816,7 +2045,97 @@ fn record_fixture_video_frame(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn bootstrap_hold_distinguishes_pending_released_and_cancelled_io() {
+        let hold = super::BootstrapHold::default();
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        hold.arm().unwrap();
+        let mut pending = Box::pin(hold.wait());
+        assert!(std::future::Future::poll(pending.as_mut(), &mut context).is_pending());
+        assert!(hold.started().is_some());
+        assert!(hold.pending());
+        assert!(hold.arm().is_err());
+        hold.release().unwrap();
+        assert!(hold.released().is_some());
+        assert!(matches!(
+            std::future::Future::poll(pending.as_mut(), &mut context),
+            std::task::Poll::Ready(Ok(()))
+        ));
+        assert!(!hold.pending());
+        drop(pending);
+
+        hold.arm().unwrap();
+        let mut cancelled = Box::pin(hold.wait());
+        assert!(std::future::Future::poll(cancelled.as_mut(), &mut context).is_pending());
+        drop(cancelled);
+        assert!(!hold.pending());
+        assert!(hold.release().is_err());
+        assert!(hold.released().is_none());
+    }
+
     use super::*;
+
+    #[test]
+    fn decoded_size_interval_requires_matching_fresh_source_frames() {
+        let mut log = VideoReceiveLog::default();
+        log.record_decoded(Some("source"), 1280, 720, None, true, None);
+        let baseline = log.decoded_sizes_by_publisher["source"].clone();
+        log.record_decoded(Some("source"), 320, 180, None, true, None);
+        log.record_decoded(Some("other"), 1280, 720, None, true, None);
+        assert!(
+            log.require_decoded_size_since("source", Some(&baseline), 1, (1280, 720))
+                .is_err()
+        );
+        log.record_decoded(Some("source"), 1280, 720, None, true, None);
+        log.record_decoded(Some("source"), 320, 180, None, true, None);
+        assert_eq!(log.decoded_from("source").unwrap().height, 180);
+        assert!(
+            log.require_decoded_size_since("source", Some(&baseline), 1, (1280, 720))
+                .is_ok()
+        );
+        assert!(
+            log.require_decoded_size_since("source", Some(&baseline), 2, (1280, 720))
+                .is_err()
+        );
+        assert!(
+            log.require_decoded_size_since("source", Some(&baseline), 3, (320, 180))
+                .is_ok()
+        );
+        assert!(
+            log.require_decoded_size_since("missing", None, 1, (320, 180))
+                .is_err()
+        );
+        assert!(
+            log.require_decoded_size_since("source", None, 0, (320, 180))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn audio_interval_requires_fresh_decode_without_erasing_prior_failures() {
+        let now = Instant::now();
+        let mut stream = AudioStream::default();
+        for at in [now, now + Duration::from_secs(1)] {
+            stream.record(20, at);
+            stream.record_decoded(480, at, None);
+        }
+        assert_eq!(stream.decoded_span(), Duration::from_secs(1));
+        stream.decoder_errors = 1;
+        stream.reference_mismatches = 1;
+        stream.begin_window();
+        assert_eq!(stream.packet_interval_span(), Duration::ZERO);
+        assert_eq!(stream.decoded_interval_span(), Duration::ZERO);
+        assert_eq!(stream.decoder_errors, 1);
+        assert_eq!(stream.reference_mismatches, 1);
+        stream.record(20, now + Duration::from_secs(2));
+        stream.record_decoded(480, now + Duration::from_secs(2), None);
+        stream.record(20, now + Duration::from_secs(3));
+        assert_eq!(stream.packet_interval_span(), Duration::from_secs(1));
+        assert_eq!(stream.decoded_interval_span(), Duration::ZERO);
+        stream.record_decoded(480, now + Duration::from_secs(3), None);
+        assert_eq!(stream.decoded_interval_span(), Duration::from_secs(1));
+        assert_eq!(stream.decoded_span(), Duration::from_secs(3));
+    }
 
     // Synthetic owned values for oracle checks only, never injected as RTC input.
     fn owned_video(
@@ -2078,6 +2397,7 @@ mod tests {
                 FixturePublisher {
                     participant_id: "left".into(),
                     frames: codebook.clone(),
+                    ..Default::default()
                 },
             ),
             (
@@ -2085,6 +2405,7 @@ mod tests {
                 FixturePublisher {
                     participant_id: "right".into(),
                     frames: codebook,
+                    ..Default::default()
                 },
             ),
         ]);
@@ -2178,6 +2499,7 @@ mod tests {
                 FixturePublisher {
                     participant_id: "source".into(),
                     frames: frames.clone(),
+                    ..Default::default()
                 },
             ),
             (
@@ -2185,6 +2507,7 @@ mod tests {
                 FixturePublisher {
                     participant_id: "source".into(),
                     frames,
+                    ..Default::default()
                 },
             ),
         ]);
@@ -2264,6 +2587,7 @@ mod tests {
                     .iter()
                     .map(|frame| canonical_annex_b(frame))
                     .collect(),
+                ..Default::default()
             },
         )]);
         for (payload, corrupt) in [
@@ -2773,13 +3097,15 @@ impl OpusReceiver {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RequestedVideo {
     pub participant_id: String,
     pub publication: Option<String>,
     pub height: u32,
     pub min_height: u32,
+    pub min_fps: u32,
     pub priority: u32,
+    pub playout_delay: pulsebeam_agent_native::agent_core::PlayoutDelay,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -3000,25 +3326,77 @@ impl NativeTrafficStatistics {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct ClientObservation {
-    pub ordered_cursors: Vec<(TopicSubscriber, String, u64)>,
     pub admission: Option<pulsebeam::entity::ConnectionId>,
-    pub video_receivers: BTreeSet<u32>,
-    pub audio_receivers: BTreeSet<u32>,
     pub snapshot: pulsebeam_agent_native::agent_core::Snapshot,
-    pub sent_intent_revision: Option<u64>,
-    pub last_successfully_sent_wire_revision: Option<u64>,
     pub video_operation: u64,
-    pub accepted: Option<DesiredState>,
     pub submitted: DesiredState,
     pub video_capacity: usize,
     pub audio_capacity: usize,
 }
 
+#[derive(Default)]
+struct NativeEventLog {
+    topics: Vec<TopicNotification>,
+    failure: Option<String>,
+    closed: bool,
+}
+
+struct NativeEventCollector {
+    log: Arc<Mutex<NativeEventLog>>,
+    changed: Arc<tokio::sync::Notify>,
+    task: JoinSet<()>,
+}
+
+impl NativeEventCollector {
+    fn new(events: pulsebeam_agent_native::ObservationStream<AgentEvent>) -> Self {
+        let log = Arc::new(Mutex::new(NativeEventLog::default()));
+        let changed = Arc::new(tokio::sync::Notify::new());
+        let mut task = JoinSet::new();
+        let output = log.clone();
+        let notify = changed.clone();
+        // Driver commands can await this same actor while a recovery input
+        // releases a full history. Consume the ordinary bounded public stream
+        // independently; do not increase its capacity or hide actual loss.
+        task.spawn(async move {
+            loop {
+                let update = events.next().await;
+                let mut log = output.lock().unwrap();
+                match update {
+                    pulsebeam_agent_native::StreamUpdate::Value(AgentEvent::Core(
+                        pulsebeam_agent_native::agent_core::Notification::Topic(
+                            notification @ (TopicNotification::Message(_)
+                            | TopicNotification::RecoveryGap { .. }),
+                        ),
+                    )) => log.topics.push(notification),
+                    pulsebeam_agent_native::StreamUpdate::Value(AgentEvent::RuntimeFailed(
+                        message,
+                    )) => {
+                        log.failure.get_or_insert(message);
+                    }
+                    pulsebeam_agent_native::StreamUpdate::Lagged { skipped } => {
+                        log.failure.get_or_insert_with(|| {
+                            format!("native fixture events lagged by {skipped}")
+                        });
+                    }
+                    pulsebeam_agent_native::StreamUpdate::Closed => log.closed = true,
+                    _ => continue,
+                }
+                notify.notify_one();
+                if log.closed {
+                    break;
+                }
+            }
+        });
+        Self { log, changed, task }
+    }
+}
+
 pub struct ClientContext {
     pub agent: Agent,
-    admission: Arc<Mutex<Option<pulsebeam::entity::ConnectionId>>>,
+    admission: Arc<Mutex<AdmissionRecords>>,
+    current_admission: Option<(u64, pulsebeam::entity::ConnectionId)>,
     desired: DesiredState,
     video_capacity: usize,
     audio_capacity: usize,
@@ -3036,53 +3414,30 @@ pub struct ClientContext {
     pub topic_events: Vec<TopicNotification>,
     pub media_kinds: HashMap<String, (bool, bool)>,
     snapshots: tokio::sync::watch::Receiver<pulsebeam_agent_native::agent_core::Snapshot>,
-    events: pulsebeam_agent_native::ObservationStream<AgentEvent>,
+    events: NativeEventCollector,
     owned_video: Option<u64>,
 }
 
 impl ClientContext {
-    pub async fn observation(&self) -> anyhow::Result<ClientObservation> {
-        let observed = self.agent.simulation_observation().await?;
-        let snapshot = observed.snapshot;
-        // Wire revisions can advance when catalog removal changes the encoded intent without
-        // a new application revision. Correlate both namespaces at the native owner boundary.
-        let accepted = (observed.sent_intent_revision == Some(snapshot.accepted_intent_revision)
-            && snapshot.desired_revision == self.desired.revision)
-            .then(|| self.desired.clone());
-        Ok(ClientObservation {
-            ordered_cursors: observed.ordered_cursors,
-            admission: *self.admission.lock().unwrap(),
-            video_receivers: observed
-                .media_indices
-                .iter()
-                .filter_map(|(slot, index)| {
-                    matches!(
-                        slot,
-                        pulsebeam_agent_native::agent_core::MediaSlot::RemoteVideo(_)
-                    )
-                    .then_some(*index)
-                })
-                .collect(),
-            audio_receivers: observed
-                .media_indices
-                .iter()
-                .filter_map(|(slot, index)| {
-                    matches!(
-                        slot,
-                        pulsebeam_agent_native::agent_core::MediaSlot::RemoteAudio(_)
-                    )
-                    .then_some(*index)
-                })
-                .collect(),
+    pub fn observation(&self) -> ClientObservation {
+        let snapshot = self.agent.snapshot();
+        let admission = self
+            .current_admission
+            .filter(|(generation, _)| {
+                snapshot
+                    .generation
+                    .map(pulsebeam_agent_native::agent_core::Generation::get)
+                    == Some(*generation)
+            })
+            .map(|(_, connection)| connection);
+        ClientObservation {
+            admission,
             snapshot,
-            sent_intent_revision: observed.sent_intent_revision,
-            last_successfully_sent_wire_revision: observed.last_successfully_sent_wire_revision,
-            accepted,
             submitted: self.desired.clone(),
             video_operation: self.video_operation,
             video_capacity: self.video_capacity,
             audio_capacity: self.audio_capacity,
-        })
+        }
     }
 
     pub fn participant_id(&self) -> Option<String> {
@@ -3103,49 +3458,59 @@ impl ClientContext {
     }
 
     pub fn events_closed(&self) -> bool {
-        self.events.is_closed()
-    }
-
-    fn record_event(
-        &mut self,
-        update: pulsebeam_agent_native::StreamUpdate<AgentEvent>,
-    ) -> anyhow::Result<()> {
-        let event = match update {
-            pulsebeam_agent_native::StreamUpdate::Value(event) => event,
-            pulsebeam_agent_native::StreamUpdate::Lagged { skipped } => {
-                anyhow::bail!("native fixture events lagged by {skipped}")
-            }
-            pulsebeam_agent_native::StreamUpdate::Closed => return Ok(()),
-        };
-        match event {
-            AgentEvent::Core(pulsebeam_agent_native::agent_core::Notification::Topic(
-                notification @ (TopicNotification::Message(_)
-                | TopicNotification::RecoveryGap { .. }),
-            )) => self.topic_events.push(notification),
-            AgentEvent::RuntimeFailed(message) => anyhow::bail!(message),
-            _ => {}
-        }
-        Ok(())
+        self.events.log.lock().unwrap().closed
     }
 
     pub async fn receive_event(&mut self) -> anyhow::Result<()> {
-        let update = self.events.next().await;
-        self.record_event(update)
+        self.events.changed.notified().await;
+        self.drain_events()
     }
 
     pub fn drain_events(&mut self) -> anyhow::Result<()> {
-        while let Some(update) = self.events.try_next() {
-            let closed = matches!(update, pulsebeam_agent_native::StreamUpdate::Closed);
-            self.record_event(update)?;
-            if closed {
-                break;
-            }
+        while let Some(result) = self.events.task.try_join_next() {
+            result?;
         }
+        let mut log = self.events.log.lock().unwrap();
+        if let Some(failure) = &log.failure {
+            anyhow::bail!("{failure}");
+        }
+        self.topic_events.append(&mut log.topics);
+        Ok(())
+    }
+
+    fn refresh_admission(&mut self) -> anyhow::Result<()> {
+        let snapshot = self.agent.snapshot();
+        let Some(generation) = snapshot
+            .generation
+            .filter(|_| snapshot.connection == ConnectionState::Connected)
+            .map(pulsebeam_agent_native::agent_core::Generation::get)
+        else {
+            self.current_admission = None;
+            return Ok(());
+        };
+        if self
+            .current_admission
+            .is_some_and(|(current, _)| current == generation)
+        {
+            return Ok(());
+        }
+        self.current_admission = None;
+        let statistics = self.agent.statistics();
+        let report = statistics.borrow();
+        let Some(report) = report
+            .as_ref()
+            .filter(|report| report.generation == generation)
+        else {
+            return Ok(());
+        };
+        let connection = self.admission.lock().unwrap().active(&report.report_json)?;
+        self.current_admission = Some((generation, connection));
         Ok(())
     }
 
     pub async fn refresh(&mut self) -> anyhow::Result<()> {
         self.drain_events()?;
+        self.refresh_admission()?;
 
         if !self.snapshots.has_changed()? {
             return Ok(());
@@ -3241,8 +3606,7 @@ impl ClientContext {
                 participant_id,
                 publication: None,
                 height: 720,
-                min_height: 0,
-                priority: 0,
+                ..Default::default()
             }));
         }
         let mut resolved = Vec::with_capacity(requests.len());
@@ -3273,9 +3637,9 @@ impl ClientContext {
                 selector: None,
                 height: request.height,
                 min_height: request.min_height,
-                min_fps: 0,
+                min_fps: request.min_fps,
                 priority: request.priority,
-                playout_delay: Default::default(),
+                playout_delay: request.playout_delay,
             });
         }
         if self.desired.video != resolved {
@@ -3291,6 +3655,15 @@ impl ClientContext {
         participants: &[String],
         automatic: bool,
     ) -> anyhow::Result<bool> {
+        self.set_audio_request(participants, automatic, None).await
+    }
+
+    pub async fn set_audio_request(
+        &mut self,
+        participants: &[String],
+        automatic: bool,
+        fixed_ms: Option<u16>,
+    ) -> anyhow::Result<bool> {
         let snapshot = self.agent.snapshot();
         let mut pinned = Vec::new();
         for participant in participants {
@@ -3301,9 +3674,24 @@ impl ClientContext {
             };
             pinned.push(publication.id.clone());
         }
+        let playout_delays = pinned
+            .iter()
+            .filter_map(|track| {
+                fixed_ms.map(|delay| {
+                    (
+                        track.clone(),
+                        pulsebeam_agent_native::agent_core::PlayoutDelay::Fixed {
+                            min_ms: u32::from(delay),
+                            max_ms: u32::from(delay),
+                        },
+                    )
+                })
+            })
+            .collect();
         let audio = AudioSubscription {
             pinned,
             automatic,
+            playout_delays,
             ..Default::default()
         };
         if self.desired.audio != audio {
@@ -3413,11 +3801,37 @@ struct ClientMediaPlan {
     corrupt_audio_payload: bool,
 }
 
+struct VideoFeed {
+    source: pulsebeam_agent_native::LocalSource,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for VideoFeed {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+impl VideoFeed {
+    async fn stop(mut self) -> anyhow::Result<()> {
+        self.task.abort();
+        match (&mut self.task).await {
+            Ok(()) => Ok(()),
+            Err(error) if error.is_cancelled() => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+}
+
 pub struct SimClient {
     pub ctx: ClientContext,
     join_set: JoinSet<()>,
     actor: Option<tokio::task::JoinHandle<()>>,
     media_generation: Option<u64>,
+    audio_pressure: Option<tokio::sync::mpsc::Sender<PressureInput>>,
+    video_source_incarnation: u64,
+    video_feed: Option<VideoFeed>,
+    retired_video_sources: Vec<pulsebeam_agent_native::LocalSource>,
     media: ClientMediaPlan,
 }
 
@@ -3441,11 +3855,19 @@ impl SimClient {
                 .map(pulsebeam_agent_native::agent_core::Generation::get)
                 .ok_or_else(|| anyhow::anyhow!("connected native graph has no generation"))?
         };
-        if self.media_generation == Some(generation) {
+        if self.media_generation == Some(generation)
+            || self
+                .ctx
+                .current_admission
+                .is_none_or(|(current, _)| current != generation)
+        {
             return Ok(());
         }
         // The actor owns retirement. Cancel only application feeds/observers;
         // never carry an old handle or capture clock into its replacement.
+        if let Some(feed) = self.video_feed.take() {
+            feed.stop().await?;
+        }
         self.join_set.abort_all();
         while let Some(result) = self.join_set.join_next().await {
             match result {
@@ -3551,7 +3973,68 @@ impl SimClient {
                 }
             });
         }
+        self.audio_pressure = None;
+        if let Some(level) = plan.audio_level_dbov {
+            let requests = if plan.audio_input == AudioInput::Pcm {
+                let (pressure, requests) = tokio::sync::mpsc::channel(1);
+                self.audio_pressure = Some(pressure);
+                Some(requests)
+            } else {
+                None
+            };
+            self.join_set.spawn(
+                QualityAudioLooper {
+                    level_dbov: level,
+                    phase_offset: plan.audio_phase_offset,
+                }
+                .run(
+                    plan.audio_input,
+                    agent.snapshots(),
+                    agent
+                        .source(pulsebeam_agent_native::agent_core::MediaSlot::LocalAudio(
+                            "a0".into(),
+                        ))
+                        .await?,
+                    requests,
+                ),
+            );
+        }
+        self.attach_video_source().await?;
+        tracing::debug!(target: "pulsebeam_sim_recovery", generation, "application media attached to connected native generation");
+        self.media_generation = Some(generation);
+        Ok(())
+    }
+
+    pub async fn producer_pressure(&mut self) -> anyhow::Result<Option<(usize, usize)>> {
+        let generation = self
+            .ctx
+            .agent
+            .snapshot()
+            .generation
+            .map(pulsebeam_agent_native::agent_core::Generation::get);
+        if generation != self.media_generation {
+            return Ok(None);
+        }
+        let Some(input) = &self.audio_pressure else {
+            return Ok(None);
+        };
+        let (reply, result) = tokio::sync::oneshot::channel();
+        input
+            .send(reply)
+            .await
+            .context("PCM pressure producer closed")?;
+        Ok(Some(result.await.context("PCM pressure input canceled")??))
+    }
+
+    async fn attach_video_source(&mut self) -> anyhow::Result<()> {
+        let ctx = &self.ctx;
+        let agent = ctx.agent.clone();
+        let plan = &self.media;
         if plan.publishes_video {
+            let source_incarnation = self.video_source_incarnation;
+            self.video_source_incarnation = source_incarnation
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("application video source incarnation overflow"))?;
             let mut sources = plan
                 .video_sources
                 .iter()
@@ -3567,34 +4050,37 @@ impl SimClient {
                         .ok_or_else(|| {
                             anyhow::anyhow!("connected source has no participant identity")
                         })?;
-                let admission = (*ctx.admission.lock().unwrap()).ok_or_else(|| {
-                    anyhow::anyhow!("connected source has no HTTP admission identity")
+                let (_, admission) = ctx.current_admission.ok_or_else(|| {
+                    anyhow::anyhow!("connected source has no correlated active HTTP admission")
                 })?;
-                let origin = provenance::source_key(&admission.to_string(), "v0");
+                let origin = provenance::source_instance_key(
+                    &admission.to_string(),
+                    "v0",
+                    source_incarnation,
+                );
+                let period = sources
+                    .first()
+                    .map(|(_, source)| source.period())
+                    .unwrap_or_else(|| vbr.as_ref().expect("video source").period());
+                let ledger = Arc::new(Mutex::new(provenance::SourceLedger::new(&origin, period)));
                 let mut frames = BTreeSet::new();
                 for (_, source) in &mut sources {
-                    frames.extend(source.reference_frames().map(|frame| {
-                        provenance::inspect(frame)
-                            .expect("valid source access unit")
-                            .1
-                    }));
                     source.identify_as(&origin);
+                    source.record_in(ledger.clone());
+                    frames.extend(source.reference_coded_frames().map(<[u8]>::to_vec));
                 }
                 if let Some(source) = &mut vbr {
-                    frames.extend(
-                        source.reference_frames().map(|frame| {
-                            provenance::inspect(frame).expect("valid VBR access unit").1
-                        }),
-                    );
                     source.identify_as(&origin);
+                    source.record_in(ledger.clone());
+                    frames.extend(source.reference_coded_frames().map(<[u8]>::to_vec));
                 }
-                // Register actual input bytes for THIS source admission. Rearm
-                // may reuse the logical participant, but never its old marker.
+                // Rearm may reuse an admission, but not its source/capture namespace.
                 ctx.h264_publishers.lock().unwrap().insert(
                     origin,
                     FixturePublisher {
                         participant_id,
                         frames,
+                        ledger: Some(ledger),
                     },
                 );
             }
@@ -3603,35 +4089,69 @@ impl SimClient {
                     "v0".into(),
                 ))
                 .await?;
-            if let Some(source) = vbr {
-                self.join_set.spawn(source.run(media));
+            let task = if let Some(source) = vbr {
+                tokio::spawn(source.run(media.clone()))
             } else {
-                self.join_set.spawn(VideoSource::run_batch(sources, media));
-            }
+                tokio::spawn(VideoSource::run_batch(sources, media.clone()))
+            };
+            self.video_feed = Some(VideoFeed {
+                source: media,
+                task,
+            });
         }
-        if let Some(level) = plan.audio_level_dbov {
-            self.join_set.spawn(
-                QualityAudioLooper {
-                    level_dbov: level,
-                    phase_offset: plan.audio_phase_offset,
-                }
-                .run(
-                    plan.audio_input,
-                    agent.snapshots(),
-                    agent
-                        .source(pulsebeam_agent_native::agent_core::MediaSlot::LocalAudio(
-                            "a0".into(),
-                        ))
-                        .await?,
-                ),
-            );
-        }
-        tracing::debug!(target: "pulsebeam_sim_recovery", generation, "application media attached to connected native generation");
-        self.media_generation = Some(generation);
         Ok(())
     }
 
+    pub async fn replace_video_source(&mut self) -> anyhow::Result<bool> {
+        if self.ctx.agent.snapshot().connection != ConnectionState::Connected
+            || self
+                .video_feed
+                .as_ref()
+                .is_none_or(|feed| feed.source.is_closed())
+        {
+            return Ok(false);
+        }
+        let feed = self.video_feed.take().expect("checked attached video feed");
+        self.retired_video_sources.push(feed.source.clone());
+        feed.stop().await?;
+        self.attach_video_source().await?;
+        Ok(true)
+    }
+
+    pub async fn release_replaced_video_source(&mut self) -> anyhow::Result<bool> {
+        let retired = self
+            .retired_video_sources
+            .last()
+            .ok_or_else(|| anyhow::anyhow!("no replaced application video source"))?;
+        retired.close().await?;
+        anyhow::ensure!(
+            matches!(
+                retired.set_enabled(false).await,
+                Err(pulsebeam_agent_native::Error::Closed)
+            ),
+            "retired video source still accepts producer configuration"
+        );
+        anyhow::ensure!(
+            self.video_feed
+                .as_ref()
+                .is_some_and(|feed| !feed.source.is_closed()),
+            "closing retired source closed its replacement"
+        );
+        Ok(true)
+    }
+
     pub async fn tick(&mut self) -> anyhow::Result<()> {
+        if self
+            .video_feed
+            .as_ref()
+            .is_some_and(|feed| feed.task.is_finished())
+        {
+            self.video_feed
+                .take()
+                .expect("finished video feed")
+                .stop()
+                .await?;
+        }
         while let Some(result) = self.join_set.try_join_next() {
             result?;
         }
@@ -3650,6 +4170,9 @@ impl SimClient {
     }
 
     pub async fn close(mut self) -> anyhow::Result<()> {
+        if let Some(feed) = self.video_feed.take() {
+            feed.stop().await?;
+        }
         self.join_set.abort_all();
         // Do not abort the actor alongside application feeds before it can
         // acknowledge the core's graceful close and retire its native graph.
@@ -3662,6 +4185,9 @@ impl SimClient {
     }
 
     pub async fn abort(mut self) -> anyhow::Result<()> {
+        if let Some(feed) = self.video_feed.take() {
+            feed.stop().await?;
+        }
         self.join_set.abort_all();
         self.ctx.agent.abort().await?;
         if let Some(actor) = self.actor.take() {
@@ -3963,14 +4489,248 @@ fn create_vbr_source(encoding: Option<&str>, profile: VbrProfile) -> VbrSource {
     )
 }
 
+#[derive(Clone, Default)]
+pub struct BootstrapHold {
+    state: Arc<Mutex<BootstrapHoldState>>,
+}
+
+#[derive(Default)]
+struct BootstrapHoldState {
+    receive: Option<tokio::sync::oneshot::Receiver<()>>,
+    release: Option<tokio::sync::oneshot::Sender<()>>,
+    started: Option<Instant>,
+    released: Option<Instant>,
+    pending: bool,
+}
+
+struct HeldBootstrap(BootstrapHold);
+
+impl Drop for HeldBootstrap {
+    fn drop(&mut self) {
+        self.0.state.lock().unwrap().pending = false;
+    }
+}
+
+impl BootstrapHold {
+    pub fn arm(&self) -> anyhow::Result<()> {
+        let mut state = self.state.lock().unwrap();
+        anyhow::ensure!(
+            state.release.is_none() && !state.pending,
+            "bootstrap hold already armed"
+        );
+        let (release, receive) = tokio::sync::oneshot::channel();
+        *state = BootstrapHoldState {
+            receive: Some(receive),
+            release: Some(release),
+            ..Default::default()
+        };
+        Ok(())
+    }
+
+    pub fn started(&self) -> Option<Instant> {
+        self.state.lock().unwrap().started
+    }
+
+    pub fn pending(&self) -> bool {
+        self.state.lock().unwrap().pending
+    }
+
+    pub fn released(&self) -> Option<Instant> {
+        self.state.lock().unwrap().released
+    }
+
+    pub fn release(&self) -> anyhow::Result<()> {
+        let mut state = self.state.lock().unwrap();
+        anyhow::ensure!(
+            state.pending,
+            "held bootstrap was cancelled or never started"
+        );
+        state
+            .release
+            .take()
+            .context("bootstrap hold was already released")?
+            .send(())
+            .map_err(|_| anyhow::anyhow!("held bootstrap receiver disappeared"))?;
+        state.released = Some(Instant::now());
+        Ok(())
+    }
+
+    async fn wait(&self) -> Result<(), std::io::Error> {
+        let receive = {
+            let mut state = self.state.lock().unwrap();
+            state.receive.take().inspect(|_| {
+                state.started = Some(Instant::now());
+                state.pending = true;
+            })
+        };
+        if let Some(receive) = receive {
+            let _held = HeldBootstrap(self.clone());
+            receive
+                .await
+                .map_err(|_| std::io::Error::other("bootstrap hold sender disappeared"))?;
+        }
+        Ok(())
+    }
+}
+
+// A successful response can belong to an abandoned candidate. Associate the
+// supplied offer with the active native SDK report, never response arrival order.
+// This is a qualified pinned-libwebrtc fixture adapter, not a portable statistics
+// schema. Missing/ambiguous ICE identity fails instead of guessing an admission.
+#[derive(Default)]
+struct AdmissionRecords {
+    by_offer: BTreeMap<String, pulsebeam::entity::ConnectionId>,
+}
+
+impl AdmissionRecords {
+    fn record(
+        &mut self,
+        offer: &str,
+        connection: pulsebeam::entity::ConnectionId,
+    ) -> anyhow::Result<()> {
+        let fragments = offer
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("a=ice-ufrag:"))
+            .filter(|fragment| !fragment.is_empty())
+            .collect::<BTreeSet<_>>();
+        anyhow::ensure!(
+            !fragments.is_empty() && fragments.len() <= 32,
+            "native offer has missing or oversized ICE identity set"
+        );
+        let additional = fragments
+            .iter()
+            .filter(|fragment| !self.by_offer.contains_key(**fragment))
+            .count();
+        anyhow::ensure!(
+            self.by_offer.len() + additional <= 64 * 32,
+            "HTTP admission stored-fragment budget exhausted"
+        );
+        let admissions = self.by_offer.values().copied().collect::<BTreeSet<_>>();
+        anyhow::ensure!(
+            admissions.len() < 64 || admissions.contains(&connection),
+            "HTTP admission input-record budget exhausted"
+        );
+        for fragment in &fragments {
+            anyhow::ensure!(
+                self.by_offer
+                    .get(*fragment)
+                    .is_none_or(|previous| *previous == connection),
+                "different admissions reused an offer ICE identity"
+            );
+        }
+        for fragment in fragments {
+            self.by_offer.insert(fragment.to_owned(), connection);
+        }
+        Ok(())
+    }
+
+    fn active(&self, report: &[u8]) -> anyhow::Result<pulsebeam::entity::ConnectionId> {
+        let report: serde_json::Value = serde_json::from_slice(report)?;
+        let entries = match &report {
+            serde_json::Value::Array(entries) => entries.iter().collect::<Vec<_>>(),
+            serde_json::Value::Object(entries) => entries.values().collect(),
+            _ => anyhow::bail!("native SDK transport report has no records"),
+        };
+        let fragments = entries
+            .into_iter()
+            .filter(|entry| entry["type"] == "transport")
+            .filter_map(|entry| entry["iceLocalUsernameFragment"].as_str())
+            .filter(|fragment| !fragment.is_empty())
+            .collect::<BTreeSet<_>>();
+        anyhow::ensure!(
+            !fragments.is_empty(),
+            "native SDK report has no active ICE identity"
+        );
+        let mut admissions = BTreeSet::new();
+        for fragment in fragments {
+            admissions.insert(*self.by_offer.get(fragment).ok_or_else(|| {
+                anyhow::anyhow!("active native ICE identity has no supplied HTTP admission")
+            })?);
+        }
+        anyhow::ensure!(
+            admissions.len() == 1,
+            "native SDK report has ambiguous active admission"
+        );
+        Ok(*admissions.first().expect("one active admission"))
+    }
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+
+    #[test]
+    fn repeated_offers_for_one_admission_cannot_escape_storage_budget() {
+        let connection = "c_0065WZSBA3DRZ12SEBDSTC0DHA0".parse().unwrap();
+        let mut records = AdmissionRecords::default();
+        let offer = |index| {
+            (0..32)
+                .map(|fragment| format!("a=ice-ufrag:{index}-{fragment}\r\n"))
+                .collect::<String>()
+        };
+        for index in 0..64 {
+            records.record(&offer(index), connection).unwrap();
+        }
+        assert_eq!(records.by_offer.len(), 64 * 32);
+        assert!(records.record(&offer(64), connection).is_err());
+        assert_eq!(records.by_offer.len(), 64 * 32);
+        records.record(&offer(0), connection).unwrap();
+    }
+
+    #[test]
+    fn candidate_response_does_not_replace_the_reported_active_offer() {
+        let incumbent = "c_0065WZSBA3DRZ12SEBDSTC0DHA0".parse().unwrap();
+        let candidate = "c_0065WZSB8ENS0727ZKNJVMDGCTM".parse().unwrap();
+        let mut records = AdmissionRecords::default();
+        records
+            .record(
+                "v=0\r\na=ice-ufrag:old\r\na=ice-ufrag:old-audio\r\n",
+                incumbent,
+            )
+            .unwrap();
+        records
+            .record("v=0\r\na=ice-ufrag:new\r\n", candidate)
+            .unwrap();
+        let report = |fragment: &str| {
+            serde_json::to_vec(&serde_json::json!([
+                {"type":"transport","iceLocalUsernameFragment":fragment}
+            ]))
+            .unwrap()
+        };
+        assert_eq!(records.active(&report("old")).unwrap(), incumbent);
+        assert_eq!(records.active(&report("old-audio")).unwrap(), incumbent);
+        assert_eq!(records.active(&report("new")).unwrap(), candidate);
+        assert!(records.active(&report("unknown")).is_err());
+        assert!(records.active(br#"[{"type":"transport"}]"#).is_err());
+        assert!(records.active(br#"[{"type":"transport","iceLocalUsernameFragment":"old"},{"type":"transport","iceLocalUsernameFragment":"new"}]"#).is_err());
+        assert!(records.record("a=ice-ufrag:old", candidate).is_err());
+        assert!(records.record("v=0", candidate).is_err());
+        assert_eq!(records.active(&report("old")).unwrap(), incumbent);
+    }
+}
+
 struct AdmissionClient {
     inner: Box<dyn AsyncHttpClient>,
-    admission: Arc<Mutex<Option<pulsebeam::entity::ConnectionId>>>,
+    admission: Arc<Mutex<AdmissionRecords>>,
+    bootstrap_hold: BootstrapHold,
 }
 
 impl AsyncHttpClient for AdmissionClient {
     fn execute(&self, request: HttpRequest) -> HttpResult<'_> {
         Box::pin(async move {
+            let offer = if request.method() == http::Method::POST {
+                self.bootstrap_hold.wait().await?;
+                let body: serde_json::Value =
+                    serde_json::from_slice(request.body()).expect("native HTTP request is JSON");
+                Some(
+                    body["offer"]
+                        .as_str()
+                        .expect("native HTTP request supplies SDP offer")
+                        .to_owned(),
+                )
+            } else {
+                None
+            };
             let response = self.inner.execute(request).await?;
             if response.status() == http::StatusCode::CREATED {
                 let location = response
@@ -3985,7 +4745,16 @@ impl AsyncHttpClient for AdmissionClient {
                     .expect("connection resource")
                     .parse()
                     .expect("admission names a canonical connection");
-                *self.admission.lock().unwrap() = Some(connection);
+                self.admission
+                    .lock()
+                    .unwrap()
+                    .record(
+                        offer
+                            .as_deref()
+                            .expect("native admission follows supplied offer"),
+                        connection,
+                    )
+                    .expect("record native HTTP admission input identity");
             }
             Ok(response)
         })

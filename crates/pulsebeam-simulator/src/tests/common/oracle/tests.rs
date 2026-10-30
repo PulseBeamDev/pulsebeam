@@ -1,199 +1,44 @@
 use super::*;
 use pulsebeam::entity::ParticipantExternalId;
-use pulsebeam::id::ShardId;
-use pulsebeam::route::{NodeRouteAddress, NodeTransportAddress, RouteId, TransportRoute};
-use pulsebeam::sim_observation::*;
-use pulsebeam::track::TrackMeta;
-use pulsebeam_agent_native::agent_core::{DesiredState, Participant, Snapshot, VideoSubscription};
+use pulsebeam_agent_native::agent_core::{
+    Participant, Snapshot, TopicMode, TopicPublisher, TopicPublisherStatus, TopicSubscriber,
+    TopicSubscriberStatus,
+};
 
 type Mutation<T> = (&'static str, fn(&mut T));
 
-fn fixture() -> (ControlStateOracle, Observation, ClientObservation) {
+fn fixture() -> (ApplicationStateOracle, ClientObservation) {
     let room = RoomId::derive(
         &DEVELOPMENT_PROJECT_ID,
         &RoomExternalId::new("room").unwrap(),
     );
     let publisher = ParticipantId::derive(&room, &ParticipantExternalId::new("publisher").unwrap());
     let viewer = ParticipantId::derive(&room, &ParticipantExternalId::new("viewer").unwrap());
-    let shard0 = ShardId::new(0);
-    let shard1 = ShardId::new(1);
-    let origin = NodeRouteAddress::new(RouteId::new(shard0, 0), 1);
-    let destination = NodeRouteAddress::new(RouteId::new(shard1, 0), 1);
-    let source_transport = NodeTransportAddress::new(TransportRoute::new(shard0, 0), 1);
-    let receiver_transport = NodeTransportAddress::new(TransportRoute::new(shard1, 0), 1);
     let source_connection = ConnectionId::new();
     let receiver_connection = ConnectionId::new();
-    let track = source_connection.derive_track_id(TrackKind::Video, "video");
-    let model = ControlStateOracle {
-        participants: vec![
-            ExpectedParticipant {
-                id: publisher,
-                room: "room",
-                video: true,
-                video_label: "video".into(),
-                audio: false,
-                required: true,
-                connection: Some(source_connection),
-                topics: Default::default(),
-                video_targets: HashSet::new(),
-            },
-            ExpectedParticipant {
-                id: viewer,
-                room: "room",
-                video: false,
-                video_label: "video".into(),
-                audio: false,
-                required: true,
-                connection: Some(receiver_connection),
-                topics: Default::default(),
-                video_targets: HashSet::from([track]),
-            },
-        ],
+    let model = ApplicationStateOracle {
+        participants: [
+            (publisher, true, source_connection),
+            (viewer, false, receiver_connection),
+        ]
+        .into_iter()
+        .map(|(id, video, connection)| ExpectedParticipant {
+            id,
+            room: "room",
+            video,
+            video_label: "video".into(),
+            audio: false,
+            audio_pinned: Vec::new(),
+            automatic_audio: true,
+            required: true,
+            connection: Some(connection),
+            topics: Default::default(),
+        })
+        .collect(),
     };
-    let control = ControlObservation {
-        generation: 1,
-        shard_generations: vec![1, 1],
-        participants: vec![
-            ParticipantObservation {
-                id: publisher,
-                room,
-                connection: source_connection,
-                shard: shard0,
-                transport: Some(source_transport),
-            },
-            ParticipantObservation {
-                id: viewer,
-                room,
-                connection: receiver_connection,
-                shard: shard1,
-                transport: Some(receiver_transport),
-            },
-        ],
-        tracks: vec![TrackObservation {
-            meta: TrackMeta {
-                room_id: room,
-                shard_id: shard0,
-                id: track,
-                origin: publisher,
-                connection_id: source_connection,
-                label: Some("video".into()),
-            },
-            candidates: vec![publisher, viewer],
-            active: vec![viewer],
-        }],
-        subscriptions: [publisher, viewer]
-            .into_iter()
-            .flat_map(|subscriber| {
-                [TrackKind::Audio, TrackKind::Video]
-                    .into_iter()
-                    .map(move |kind| SubscriptionObservation {
-                        room,
-                        subscriber,
-                        selector: SelectorObservation {
-                            track: None,
-                            publisher: None,
-                            kind: Some(kind),
-                            label: None,
-                        },
-                        selection: if kind == TrackKind::Video {
-                            SelectionPolicy::Allocated
-                        } else {
-                            SelectionPolicy::All
-                        },
-                    })
-            })
-            .collect(),
-        placements: vec![
-            PlacementObservation {
-                track,
-                address: origin,
-                resident: true,
-                route_installed: true,
-            },
-            PlacementObservation {
-                track,
-                address: destination,
-                resident: true,
-                route_installed: true,
-            },
-        ],
-    };
-    let shards = vec![
-        ShardObservation {
-            shard: shard0,
-            generation: 1,
-            pending_generation: None,
-            pending_effects: 0,
-            participants: vec![ShardParticipantObservation {
-                id: publisher,
-                connection: source_connection,
-                transport: source_transport,
-                video: Default::default(),
-                audio: Vec::new(),
-            }],
-            transports: vec![(source_transport, Some(publisher))],
-            tracks: vec![track],
-            plans: vec![PlanObservation {
-                track: Some(track),
-                local: vec![],
-                remote: vec![destination],
-                reverse: Some(origin),
-            }],
-            routes: vec![RouteObservation {
-                address: origin,
-                track: Some(track),
-                reverse: true,
-            }],
-        },
-        ShardObservation {
-            shard: shard1,
-            generation: 1,
-            pending_generation: None,
-            pending_effects: 0,
-            participants: vec![ShardParticipantObservation {
-                id: viewer,
-                connection: receiver_connection,
-                transport: receiver_transport,
-                video: Default::default(),
-                audio: Vec::new(),
-            }],
-            transports: vec![(receiver_transport, Some(viewer))],
-            tracks: vec![track],
-            plans: vec![PlanObservation {
-                track: Some(track),
-                local: vec![Some(viewer)],
-                remote: vec![],
-                reverse: Some(origin),
-            }],
-            routes: vec![RouteObservation {
-                address: destination,
-                track: Some(track),
-                reverse: false,
-            }],
-        },
-    ];
-    let desired = DesiredState {
-        revision: 1,
-        connected: true,
-        video: vec![VideoSubscription {
-            slot: 0,
-            track_id: track.as_str(),
-            selector: None,
-            height: 720,
-            min_height: 0,
-            min_fps: 0,
-            priority: 0,
-            playout_delay: Default::default(),
-        }],
-        ..Default::default()
-    };
-    let publication = Publication {
-        id: track.as_str(),
-        participant_id: publisher.as_str(),
-        kind: MediaKind::Video,
-        label: "video".into(),
-    };
+    let publication = model.participants[0].publications().next().unwrap();
     let snapshot = Snapshot {
+        connection: ConnectionState::Connected,
         participant_id: Some(viewer.as_str()),
         room_external_id: Some("room".into()),
         participants: BTreeMap::from([(
@@ -203,34 +48,23 @@ fn fixture() -> (ControlStateOracle, Observation, ClientObservation) {
                 external_id: "publisher".into(),
             },
         )]),
-        publications: BTreeMap::from([(track.as_str(), publication)]),
-        accepted_intent_revision: 1,
-        desired_revision: 1,
-        video_mapping: BTreeMap::from([(0, track.as_str())]),
+        video_mapping: BTreeMap::from([(0, publication.id.clone())]),
+        publications: BTreeMap::from([(publication.id.clone(), publication)]),
         ..Default::default()
     };
     (
         model,
-        Observation { control, shards },
         ClientObservation {
-            ordered_cursors: Vec::new(),
             admission: Some(receiver_connection),
             snapshot,
-            sent_intent_revision: Some(1),
-            last_successfully_sent_wire_revision: Some(1),
-            video_operation: 0,
-            accepted: Some(desired.clone()),
-            submitted: desired,
-            video_receivers: BTreeSet::from([0]),
-            audio_receivers: BTreeSet::new(),
             video_capacity: 1,
-            audio_capacity: 0,
+            ..Default::default()
         },
     )
 }
 
-fn audio_fixture(capacity: u32) -> (ControlStateOracle, ClientObservation) {
-    let (mut model, _, mut client) = fixture();
+fn audio_fixture(capacity: u32) -> (ApplicationStateOracle, ClientObservation) {
+    let (mut model, mut client) = fixture();
     for name in ["audio-first", "audio-second", "audio-third"] {
         let source = ExpectedParticipant {
             id: ParticipantId::derive(
@@ -257,7 +91,6 @@ fn audio_fixture(capacity: u32) -> (ControlStateOracle, ClientObservation) {
         model.participants.push(source);
     }
     client.audio_capacity = usize::try_from(capacity).unwrap();
-    client.audio_receivers = (0..capacity).collect();
     client.snapshot.audio_mapping = (0..capacity)
         .zip(
             model
@@ -267,8 +100,6 @@ fn audio_fixture(capacity: u32) -> (ControlStateOracle, ClientObservation) {
                 .map(|peer| peer.track_id(TrackKind::Audio, "audio").as_str()),
         )
         .collect();
-    client.accepted.as_mut().unwrap().audio.automatic = true;
-    client.submitted.audio.automatic = true;
     (model, client)
 }
 
@@ -277,12 +108,12 @@ fn automatic_audio_oracle_requires_every_uncontended_live_source() {
     let (mut model, mut client) = audio_fixture(3);
     let requested = [model.participants[0].id.as_str()];
     model
-        .check_client(&[], &model.participants[1], &client, &requested)
+        .check_client(&model.participants[1], &client, &requested)
         .unwrap();
     model.participants.last_mut().unwrap().required = false;
     client.snapshot.audio_mapping.remove(&2);
     model
-        .check_client(&[], &model.participants[1], &client, &requested)
+        .check_client(&model.participants[1], &client, &requested)
         .unwrap();
 
     let mutations: &[Mutation<ClientObservation>] = &[
@@ -304,7 +135,6 @@ fn automatic_audio_oracle_requires_every_uncontended_live_source() {
         assert!(
             model
                 .check_client(
-                    &[],
                     &model.participants[1],
                     &client,
                     &[model.participants[0].id.as_str()],
@@ -317,10 +147,10 @@ fn automatic_audio_oracle_requires_every_uncontended_live_source() {
 
 #[test]
 fn automatic_audio_oracle_allows_contended_choices_but_requires_full_slots_and_pins() {
-    let (model, mut client) = audio_fixture(2);
+    let (mut model, mut client) = audio_fixture(2);
     let requested = [model.participants[0].id.as_str()];
     model
-        .check_client(&[], &model.participants[1], &client, &requested)
+        .check_client(&model.participants[1], &client, &requested)
         .unwrap();
     let first = client.snapshot.audio_mapping.get(&0).unwrap().clone();
     let third = model
@@ -331,162 +161,64 @@ fn automatic_audio_oracle_allows_contended_choices_but_requires_full_slots_and_p
         .as_str();
     client.snapshot.audio_mapping.insert(0, third);
     model
-        .check_client(&[], &model.participants[1], &client, &requested)
+        .check_client(&model.participants[1], &client, &requested)
         .unwrap();
     let second = client.snapshot.audio_mapping.remove(&1).unwrap();
     assert!(
         model
-            .check_client(&[], &model.participants[1], &client, &requested)
+            .check_client(&model.participants[1], &client, &requested)
             .is_err()
     );
     client.snapshot.audio_mapping.insert(1, second);
-    client.accepted.as_mut().unwrap().audio.pinned = vec![first.clone()];
-    client.submitted.audio.pinned = vec![first.clone()];
+    model.participants[1].audio_pinned =
+        vec![client.snapshot.publications[&first].participant_id.clone()];
     assert!(
         model
-            .check_client(&[], &model.participants[1], &client, &requested)
+            .check_client(&model.participants[1], &client, &requested)
             .is_err()
     );
     client.snapshot.audio_mapping.insert(0, first);
     model
-        .check_client(&[], &model.participants[1], &client, &requested)
+        .check_client(&model.participants[1], &client, &requested)
         .unwrap();
 }
 
 #[test]
-fn transition_safety_allows_outstanding_intent_but_rejects_invalid_assignments() {
-    let (model, _, mut client) = fixture();
+fn transition_safety_allows_pending_withdrawal_but_rejects_invalid_assignments() {
+    let (model, mut client) = fixture();
     let allowed = model.participants.iter().map(|p| p.id.as_str()).collect();
-    client.sent_intent_revision = Some(2);
-    client.accepted = None;
-    ControlStateOracle::check_client_safety(&client, &allowed).unwrap();
+    ApplicationStateOracle::check_client_safety(&client, &allowed).unwrap();
     assert!(
         model
-            .check_client(
-                &[],
-                &model.participants[1],
-                &client,
-                &[model.participants[0].id.as_str()]
-            )
+            .check_client(&model.participants[1], &client, &[])
             .is_err()
     );
+    client.snapshot.video_mapping.clear();
+    model
+        .check_client(&model.participants[1], &client, &[])
+        .unwrap();
     client
         .snapshot
         .video_mapping
         .insert(0, "retired-track".into());
-    assert!(ControlStateOracle::check_client_safety(&client, &allowed).is_err());
-    let (_, _, client) = fixture();
-    assert!(ControlStateOracle::check_client_safety(&client, &BTreeSet::new()).is_err());
+    assert!(ApplicationStateOracle::check_client_safety(&client, &allowed).is_err());
+    let (_, client) = fixture();
+    assert!(ApplicationStateOracle::check_client_safety(&client, &BTreeSet::new()).is_err());
 }
 
 #[test]
-fn application_and_wire_revisions_are_independent() {
-    let (model, _, mut client) = fixture();
-    client.sent_intent_revision = Some(4);
-    client.snapshot.accepted_intent_revision = 4;
+fn client_oracle_rejects_wrong_missing_duplicate_and_stale_assignments() {
+    let (model, client) = fixture();
     model
         .check_client(
-            &[],
             &model.participants[1],
             &client,
             &[model.participants[0].id.as_str()],
         )
         .unwrap();
-}
-
-#[test]
-fn complete_plan_and_owner_values_agree() {
-    let (model, owners, client) = fixture();
-    model.check_owners(&owners).unwrap();
-    model
-        .check_client(
-            &[],
-            &model.participants[1],
-            &client,
-            &[model.participants[0].id.as_str()],
-        )
-        .unwrap();
-}
-
-#[test]
-fn owner_oracle_rejects_missing_duplicate_cross_room_and_retired_values() {
-    let mutations: &[Mutation<Observation>] = &[
-        ("missing publication", |state| {
-            state.control.tracks.clear();
-        }),
-        ("duplicate publication", |state| {
-            state.control.tracks.push(state.control.tracks[0].clone());
-        }),
-        ("wrong publication kind", |state| {
-            let meta = &mut state.control.tracks[0].meta;
-            meta.id = meta
-                .connection_id
-                .derive_track_id(TrackKind::Audio, "video");
-        }),
-        ("stale publication connection", |state| {
-            state.control.tracks[0].meta.connection_id = ConnectionId::new();
-        }),
-        ("cross room", |state| {
-            state.control.participants[0].room = RoomId::derive(
-                &DEVELOPMENT_PROJECT_ID,
-                &RoomExternalId::new("other").unwrap(),
-            );
-        }),
-        ("missing control owner", |state| {
-            state.control.participants.pop();
-        }),
-        ("missing shard participant", |state| {
-            state.shards[1].participants.clear();
-        }),
-        ("stale connection", |state| {
-            state.shards[1].participants[0].connection = ConnectionId::new();
-        }),
-        ("stale transport", |state| {
-            state.shards[1].transports[0].0 =
-                NodeTransportAddress::new(TransportRoute::new(ShardId::new(1), 0), 2);
-        }),
-        ("missing runtime", |state| {
-            state.shards[1].tracks.clear();
-        }),
-        ("missing binding", |state| {
-            state.shards[1].plans[0].local.clear();
-        }),
-        ("duplicate binding", |state| {
-            let member = state.shards[1].plans[0].local[0];
-            state.shards[1].plans[0].local.push(member);
-        }),
-        ("missing remote route", |state| {
-            state.shards[0].plans[0].remote.clear();
-        }),
-        ("stale epoch", |state| {
-            let route = &mut state.shards[1].routes[0];
-            route.address = NodeRouteAddress::new(route.address.route, 2);
-        }),
-        ("missing reverse route", |state| {
-            state.shards[1].plans[0].reverse = None;
-        }),
-        ("missing destination placement", |state| {
-            state.control.placements.pop();
-        }),
-        ("incomplete generation", |state| {
-            state.shards[1].pending_generation = Some(2);
-        }),
-        ("stale applied generation", |state| {
-            state.shards[1].generation = 0;
-        }),
-    ];
-    for (name, mutate) in mutations {
-        let (model, mut state, _) = fixture();
-        mutate(&mut state);
-        assert!(model.check_owners(&state).is_err(), "accepted {name}");
-    }
-}
-
-#[test]
-fn client_oracle_rejects_wrong_missing_duplicate_and_unrequested_assignments() {
     let mutations: &[Mutation<ClientObservation>] = &[
-        ("wrong desired revision", |state| {
-            state.snapshot.desired_revision += 1;
+        ("disconnected client", |state| {
+            state.snapshot.connection = ConnectionState::Disconnected;
         }),
         ("missing participant", |state| {
             state.snapshot.participants.clear();
@@ -519,7 +251,6 @@ fn client_oracle_rejects_wrong_missing_duplicate_and_unrequested_assignments() {
             let track = state.snapshot.video_mapping[&0].clone();
             state.snapshot.video_mapping.insert(1, track);
             state.video_capacity = 2;
-            state.video_receivers.insert(1);
         }),
         ("stale assignment", |state| {
             state
@@ -527,31 +258,144 @@ fn client_oracle_rejects_wrong_missing_duplicate_and_unrequested_assignments() {
                 .video_mapping
                 .insert(0, "retired-track".into());
         }),
-        ("unnegotiated receiver", |state| {
-            let track = state.snapshot.video_mapping.remove(&0).unwrap();
-            state.snapshot.video_mapping.insert(5, track);
-        }),
-        ("unaccepted revision", |state| {
-            state.snapshot.accepted_intent_revision = 2;
-        }),
-        ("unrequested assignment", |state| {
-            state.accepted.as_mut().unwrap().video.clear();
-            state.submitted.video.clear();
-        }),
     ];
     for (name, mutate) in mutations {
-        let (model, _, mut state) = fixture();
-        mutate(&mut state);
+        let (model, mut client) = fixture();
+        mutate(&mut client);
         assert!(
             model
                 .check_client(
-                    &[],
                     &model.participants[1],
-                    &state,
+                    &client,
                     &[model.participants[0].id.as_str()]
                 )
                 .is_err(),
             "accepted {name}"
         );
     }
+}
+
+#[test]
+fn subscriber_bindings_follow_declared_room_topic_and_mode() {
+    let (mut model, mut client) = fixture();
+    model.participants[0]
+        .topics
+        .publishers
+        .push(TopicPublisher {
+            topic: "updates".into(),
+            mode: TopicMode::Ordered,
+        });
+    let registration = TopicSubscriber {
+        topic: "updates".into(),
+        mode: TopicMode::Ordered,
+    };
+    model.participants[1]
+        .topics
+        .subscribers
+        .push(registration.clone());
+    client
+        .snapshot
+        .topics
+        .subscribers
+        .push(TopicSubscriberStatus {
+            registration,
+            channel: None,
+            publishers: 1,
+            buffered_messages: 0,
+        });
+    let requested = [model.participants[0].id.as_str()];
+    model
+        .check_client(&model.participants[1], &client, &requested)
+        .unwrap();
+    client.snapshot.topics.subscribers[0].publishers = 0;
+    assert!(
+        model
+            .check_client(&model.participants[1], &client, &requested)
+            .is_err()
+    );
+    model.participants[0].required = false;
+    model
+        .check_client(&model.participants[1], &client, &requested)
+        .unwrap();
+    client.snapshot.topics.subscribers[0].publishers = 2;
+    assert!(
+        model
+            .check_client(&model.participants[1], &client, &requested)
+            .is_err()
+    );
+    client.snapshot.topics.subscribers[0].publishers = 1;
+    model.participants[0].topics.publishers[0].mode = TopicMode::Latest;
+    assert!(
+        model
+            .check_client(&model.participants[1], &client, &requested)
+            .is_err()
+    );
+    model.participants[0].topics.publishers[0].mode = TopicMode::Ordered;
+    model.participants[0].room = "other-room";
+    client.snapshot.participants.clear();
+    client.snapshot.publications.clear();
+    client.snapshot.video_mapping.clear();
+    assert!(
+        model
+            .check_client(&model.participants[1], &client, &[])
+            .is_err()
+    );
+    client.snapshot.topics.subscribers[0].publishers = 0;
+    model
+        .check_client(&model.participants[1], &client, &[])
+        .unwrap();
+}
+
+#[test]
+fn publishers_expose_distinct_public_bindings_for_declared_registrations() {
+    let (mut model, mut client) = fixture();
+    for (mode, id) in [
+        (TopicMode::Latest, "latest-id"),
+        (TopicMode::Ordered, "ordered-id"),
+    ] {
+        let registration = TopicPublisher {
+            topic: "updates".into(),
+            mode,
+        };
+        model.participants[1]
+            .topics
+            .publishers
+            .push(registration.clone());
+        client
+            .snapshot
+            .topics
+            .publishers
+            .push(TopicPublisherStatus {
+                registration,
+                channel: None,
+                data_track_id: Some(id.into()),
+                next_sequence: 0,
+                accepted_history: 0,
+                queued_messages: 0,
+                send_pending: false,
+            });
+    }
+    let requested = [model.participants[0].id.as_str()];
+    model
+        .check_client(&model.participants[1], &client, &requested)
+        .unwrap();
+    client.snapshot.topics.publishers[0].data_track_id = None;
+    assert!(
+        model
+            .check_client(&model.participants[1], &client, &requested)
+            .is_err()
+    );
+    client.snapshot.topics.publishers[0].data_track_id = Some("ordered-id".into());
+    assert!(
+        model
+            .check_client(&model.participants[1], &client, &requested)
+            .is_err()
+    );
+    client.snapshot.topics.publishers[0].data_track_id = Some("latest-id".into());
+    client.snapshot.topics.publishers[0].registration.mode = TopicMode::Lossy;
+    assert!(
+        model
+            .check_client(&model.participants[1], &client, &requested)
+            .is_err()
+    );
 }
